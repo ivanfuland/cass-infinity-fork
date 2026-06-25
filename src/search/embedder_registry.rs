@@ -208,6 +208,20 @@ pub static EMBEDDERS: &[RegisteredEmbedder] = &[
         size_bytes: 280_000_000,
         is_baseline: false,
     },
+    // === M4-pre spike: Infinity HTTP embedder (no local model files) ===
+    #[cfg(feature = "infinity")]
+    RegisteredEmbedder {
+        name: "bge-m3",
+        id: "bge-m3",
+        dimension: 1024,
+        is_semantic: true,
+        description: "BAAI/bge-m3 via local Infinity HTTP (Chinese-capable, ORT-free)",
+        requires_model_files: false,
+        release_date: "2024-01-30",
+        huggingface_id: "BAAI/bge-m3",
+        size_bytes: 0,
+        is_baseline: false,
+    },
     // === Fallback (always available) ===
     RegisteredEmbedder {
         name: "hash",

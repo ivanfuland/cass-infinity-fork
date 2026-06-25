@@ -594,6 +594,99 @@ pub fn load_hash_semantic_context(data_dir: &Path, db_path: &Path) -> SemanticSe
     }
 }
 
+/// Load Infinity-backed semantic context (M4-pre spike).
+///
+/// Mirrors [`load_hash_semantic_context`] but uses the HTTP `InfinityEmbedder`
+/// (bge-m3, 1024-dim) — no local model files / ONNX / cache-state machinery.
+/// The query is embedded via the daemon path (Infinity) at search time; this
+/// in-proc embedder supplies the matching id/dimension for the `bge-m3` index.
+#[cfg(feature = "infinity")]
+pub fn load_infinity_semantic_context(data_dir: &Path, db_path: &Path) -> SemanticSetup {
+    let embedder = match crate::search::infinity::InfinityEmbedder::new() {
+        Ok(e) => e,
+        Err(err) => {
+            return SemanticSetup {
+                availability: SemanticAvailability::LoadFailed {
+                    context: format!("infinity embedder: {err}"),
+                },
+                context: None,
+            };
+        }
+    };
+    let embedder_id = embedder.id().to_string();
+    let index_path = vector_index_path(data_dir, &embedder_id);
+    let monolithic_present = index_path.is_file();
+    let shard_indexes = if monolithic_present
+        || complete_shard_generation_candidate_exists(data_dir, &embedder_id)
+    {
+        load_complete_shard_indexes_for_current_db(data_dir, db_path, &embedder_id, "infinity semantic")
+    } else {
+        None
+    };
+    if !monolithic_present && shard_indexes.is_none() {
+        return SemanticSetup {
+            availability: SemanticAvailability::IndexMissing { index_path },
+            context: None,
+        };
+    }
+
+    let storage = match FrankenStorage::open_readonly(db_path) {
+        Ok(storage) => storage,
+        Err(err) => {
+            return SemanticSetup {
+                availability: SemanticAvailability::DatabaseUnavailable {
+                    db_path: db_path.to_path_buf(),
+                    error: err.to_string(),
+                },
+                context: None,
+            };
+        }
+    };
+
+    let filter_maps = match SemanticFilterMaps::from_storage(&storage) {
+        Ok(maps) => maps,
+        Err(err) => {
+            return SemanticSetup {
+                availability: SemanticAvailability::LoadFailed {
+                    context: format!("filter maps: {err}"),
+                },
+                context: None,
+            };
+        }
+    };
+
+    let (index, additional_indexes) = if let Some(mut indexes) = shard_indexes {
+        let index = indexes.remove(0);
+        (index, indexes)
+    } else {
+        match VectorIndex::open(&index_path) {
+            Ok(index) => (index, Vec::new()),
+            Err(err) => {
+                return SemanticSetup {
+                    availability: SemanticAvailability::LoadFailed {
+                        context: format!("vector index: {err}"),
+                    },
+                    context: None,
+                };
+            }
+        }
+    };
+
+    let roles = Some(HashSet::from([ROLE_USER, ROLE_ASSISTANT]));
+    let embedder = Arc::new(embedder) as Arc<dyn Embedder>;
+
+    SemanticSetup {
+        availability: SemanticAvailability::Ready { embedder_id },
+        context: Some(SemanticContext {
+            embedder,
+            index,
+            additional_indexes,
+            filter_maps,
+            roles,
+        }),
+    }
+}
+
 /// Load semantic context without version checking.
 ///
 /// Use this when you've already acknowledged an update and want to load

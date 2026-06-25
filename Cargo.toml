@@ -23,7 +23,7 @@ anyhow = "1.0.102"
 thiserror = "2.0.18"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "ansi"] }
-asupersync = { version = "=0.3.5", path = "/dp/asupersync", features = ["test-internals", "tls-native-roots"] }
+asupersync = { version = "=0.3.5", path = "/home/ivan/projects/asupersync", features = ["test-internals", "tls-native-roots"] }
 clap = { version = "4.6.1", features = ["derive", "cargo", "env", "unicode", "wrap_help"] }
 clap_complete = "4.6.5"
 clap_mangen = "0.3.0"
@@ -145,6 +145,12 @@ default = ["qr", "encryption", "semantic"]
 qr = ["dep:qrcode", "dep:image"]
 encryption = []  # Enables HTML export encryption (deps already included for ChatGPT)
 backtrace = []
+# M4-pre spike: route semantic embedding + rerank through a local Infinity HTTP
+# engine (bge-m3 / bge-reranker-v2-m3) instead of in-process ONNX. `reqwest` is
+# already a non-optional dep, so this pulls in NO ONNX runtime — combine with
+# `--no-default-features --features qr,encryption,infinity` for an ORT-free yet
+# semantic-capable (and Chinese-capable) build.
+infinity = []
 # `semantic` enables ONNX-runtime-backed embedding/reranking via fastembed +
 # frankensearch/fastembed-reranker. Disabling it (e.g. via `--no-default-features
 # --features qr,encryption`) builds the `-baseline` artifact that does not pull

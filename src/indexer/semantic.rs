@@ -1521,6 +1521,11 @@ impl SemanticIndexer {
                 )
             }
             "hash" => Box::new(HashEmbedder::default()),
+            #[cfg(feature = "infinity")]
+            "infinity" => Box::new(
+                crate::search::infinity::InfinityEmbedder::new()
+                    .map_err(|e| anyhow::anyhow!("infinity embedder unavailable: {e}"))?,
+            ),
             other => bail!("unknown embedder: {other}"),
         };
 

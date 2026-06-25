@@ -22372,6 +22372,8 @@ fn run_cli_search(
     use crate::search::model_manager::{
         load_hash_semantic_context, load_semantic_context, load_semantic_context_for_embedder,
     };
+    #[cfg(feature = "infinity")]
+    use crate::search::model_manager::load_infinity_semantic_context;
     use crate::search::query::{
         QueryExplanation, SearchClient, SearchClientOptions, SearchFilters, SearchMode,
     };
@@ -22650,7 +22652,17 @@ fn run_cli_search(
         };
         let prefer_hash = embedder_info.is_some_and(|e| e.name == HASH_EMBEDDER);
 
-        let setup = if prefer_hash {
+        // M4-pre spike: route the bge-m3 / infinity embedder through the
+        // Infinity HTTP context loader (no ONNX / model-file machinery).
+        #[cfg(feature = "infinity")]
+        let setup_infinity = matches!(requested_model, Some("bge-m3") | Some("infinity"))
+            .then(|| load_infinity_semantic_context(&data_dir, &db_path));
+        #[cfg(not(feature = "infinity"))]
+        let setup_infinity: Option<crate::search::model_manager::SemanticSetup> = None;
+
+        let setup = if let Some(setup_infinity) = setup_infinity {
+            setup_infinity
+        } else if prefer_hash {
             load_hash_semantic_context(&data_dir, &db_path)
         } else if let Some(model_name) = requested_model {
             load_semantic_context_for_embedder(&data_dir, &db_path, model_name)
@@ -22670,6 +22682,18 @@ fn run_cli_search(
 
                 #[cfg(unix)]
                 {
+                    // M4-pre spike: route query embedding through Infinity HTTP
+                    // when built with `--features infinity` (baseline is ORT-free,
+                    // so the UDS daemon's ONNX embedder is unavailable anyway).
+                    #[cfg(feature = "infinity")]
+                    let daemon: Arc<dyn crate::search::daemon_client::DaemonClient> =
+                        match crate::search::infinity::InfinityDaemonClient::new() {
+                            Ok(c) => Arc::new(c),
+                            Err(_) => Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
+                                "infinity-unavailable",
+                            )),
+                        };
+                    #[cfg(not(feature = "infinity"))]
                     let daemon = crate::daemon::client::try_connect()
                         .map(|d| d as Arc<dyn crate::search::daemon_client::DaemonClient>)
                         .unwrap_or_else(|| {
@@ -22848,7 +22872,7 @@ fn run_cli_search(
             // CLI envelope rather than reaching code that would expect a
             // working ORT runtime. Hybrid degrades to lexical via the
             // existing fail-open path; lexical-only mode is unaffected.
-            #[cfg(not(feature = "semantic"))]
+            #[cfg(not(any(feature = "semantic", feature = "infinity")))]
             {
                 // Suppress unused-binding warnings in the baseline arm:
                 // every input is consumed by the documented error envelope.
@@ -22875,7 +22899,7 @@ fn run_cli_search(
                     retryable: false,
                 })?
             }
-            #[cfg(feature = "semantic")]
+            #[cfg(any(feature = "semantic", feature = "infinity"))]
             {
                 let (hits, ann_stats) = client
                     .search_semantic_with_tier(
@@ -23023,6 +23047,18 @@ fn run_cli_search(
 
             #[cfg(unix)]
             {
+                // M4-pre spike: route rerank through Infinity HTTP (bge-reranker-v2-m3)
+                // when built with `--features infinity`. Baseline's local ONNX
+                // reranker is unavailable, so this is what revives reranking.
+                #[cfg(feature = "infinity")]
+                let daemon: Arc<dyn crate::search::daemon_client::DaemonClient> =
+                    match crate::search::infinity::InfinityDaemonClient::new() {
+                        Ok(c) => Arc::new(c),
+                        Err(_) => Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
+                            "infinity-unavailable",
+                        )),
+                    };
+                #[cfg(not(feature = "infinity"))]
                 let daemon = crate::daemon::client::try_connect()
                     .map(|d| d as Arc<dyn crate::search::daemon_client::DaemonClient>)
                     .unwrap_or_else(|| {
@@ -96908,6 +96944,7 @@ fn run_models_backfill(
         });
     let embedder_type = resolve_semantic_index_embedder(&embedder_type);
     let embedder_valid = embedder_type == "hash"
+        || (cfg!(feature = "infinity") && embedder_type == "infinity")
         || crate::search::fastembed_embedder::FastEmbedder::canonical_name(&embedder_type)
             .is_some();
     if !embedder_valid {
@@ -97020,6 +97057,8 @@ fn run_models_backfill(
             .unwrap_or_else(ModelManifest::minilm_v2);
     let model_revision = if embedder_type == "hash" {
         "hash".to_string()
+    } else if embedder_type == "infinity" {
+        "infinity-bge-m3".to_string()
     } else {
         model_manifest.revision.clone()
     };
