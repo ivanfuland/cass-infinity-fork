@@ -186,6 +186,41 @@ fn http_rerank(
     Ok(scores)
 }
 
+// ---- pure helpers -----------------------------------------------------------
+
+/// Returns the number of chunks needed to cover `len` items with at most `max`
+/// items per chunk (ceiling division). `max=0` is treated as "no split" (returns
+/// 0 when len=0, else 1) — defensive guard so callers never divide by zero.
+fn n_chunks(len: usize, max: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    if max == 0 {
+        return 1;
+    }
+    len.div_ceil(max)
+}
+
+/// Retry `f` up to `max_retries` additional times when it returns a *transient*
+/// error (connection / timeout / refused / broken pipe). Non-transient errors
+/// are returned immediately without retrying.
+fn retry_n<T>(max_retries: u32, mut f: impl FnMut() -> Result<T, String>) -> Result<T, String> {
+    let mut last = String::new();
+    for _ in 0..=max_retries {
+        match f() {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                let lo = e.to_ascii_lowercase();
+                let transient = lo.contains("connection") || lo.contains("timed out")
+                    || lo.contains("timeout") || lo.contains("refused") || lo.contains("broken pipe");
+                if !transient { return Err(e); }
+                last = e;
+            }
+        }
+    }
+    Err(format!("exhausted retries: {last}"))
+}
+
 // ---- index side: Embedder -------------------------------------------------
 
 /// In-process [`Embedder`] backed by Infinity's `/embeddings` over blocking HTTP.
@@ -250,14 +285,14 @@ impl Embedder for InfinityEmbedder {
                 });
             }
         }
-        http_embed(
-            &self.client,
-            &self.config.base_url,
-            &self.config.embed_model,
-            texts,
-            self.dimension,
-        )
-        .map_err(|m| self.fail(m))
+        let mut out = Vec::with_capacity(texts.len());
+        for chunk in texts.chunks(self.config.max_batch) {
+            let mut part = retry_n(2, || {
+                http_embed(&self.client, &self.config.base_url, &self.config.embed_model, chunk, self.dimension)
+            }).map_err(|m| self.fail(m))?;
+            out.append(&mut part);
+        }
+        Ok(out)
     }
 
     fn dimension(&self) -> usize {
@@ -381,5 +416,33 @@ mod tests {
             _ => None,
         });
         assert_eq!(ovr.base_url, "http://x:9"); // 去尾斜杠
+    }
+
+    #[test]
+    fn n_chunks_is_ceil() {
+        assert_eq!(n_chunks(0, 64), 0);
+        assert_eq!(n_chunks(1, 64), 1);
+        assert_eq!(n_chunks(64, 64), 1);
+        assert_eq!(n_chunks(65, 64), 2);
+        assert_eq!(n_chunks(130, 64), 3);
+        assert_eq!(n_chunks(10, 0), 1); // max=0 防御
+    }
+
+    #[test]
+    fn retry_n_retries_transient_then_succeeds() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let attempts = AtomicU32::new(0);
+        let r = retry_n(2, || {
+            let n = attempts.fetch_add(1, Ordering::SeqCst);
+            if n < 2 { Err("connection refused".to_string()) } else { Ok(7u32) }
+        });
+        assert_eq!(r.unwrap(), 7);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3); // 2 retries + 初次
+
+        // 非瞬时错误不重试
+        let a2 = AtomicU32::new(0);
+        let e = retry_n(2, || { a2.fetch_add(1, Ordering::SeqCst); Err::<u32,_>("dim mismatch".to_string()) });
+        assert!(e.is_err());
+        assert_eq!(a2.load(Ordering::SeqCst), 1);
     }
 }
