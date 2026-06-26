@@ -25,25 +25,48 @@ use serde::Deserialize;
 use crate::search::daemon_client::{DaemonClient, DaemonError};
 use crate::search::embedder::{Embedder, EmbedderError, EmbedderResult};
 
-const DEFAULT_URL: &str = "http://127.0.0.1:7997";
-const DEFAULT_EMBED_MODEL: &str = "BAAI/bge-m3";
-const DEFAULT_RERANK_MODEL: &str = "BAAI/bge-reranker-v2-m3";
 /// bge-m3 embedding dimension.
 const DIMENSION: usize = 1024;
 /// Stable embedder id — written into index shard headers; index and search
 /// must agree on it. Keep distinct from `embedder_type` ("infinity").
 const EMBEDDER_ID: &str = "bge-m3";
+/// Default batch size cap for HTTP embed calls.
+pub const MAX_BATCH: usize = 64;
 
-fn base_url_from_env() -> String {
-    std::env::var("CASS_INFINITY_URL")
-        .unwrap_or_else(|_| DEFAULT_URL.to_string())
-        .trim_end_matches('/')
-        .to_string()
+// ---- centralized config -----------------------------------------------------
+
+pub struct InfinityConfig {
+    pub base_url: String,
+    pub embed_model: String,
+    pub rerank_model: String,
+    pub timeout: Duration,
+    pub max_batch: usize,
 }
 
-fn build_client(timeout_secs: u64) -> Result<reqwest::blocking::Client, String> {
+impl InfinityConfig {
+    pub fn from_env() -> Self {
+        Self::from_env_with(|k| std::env::var(k).ok())
+    }
+
+    pub fn from_env_with(get: impl Fn(&str) -> Option<String>) -> Self {
+        Self {
+            base_url: get("CASS_INFINITY_URL")
+                .unwrap_or_else(|| "http://127.0.0.1:7997".into())
+                .trim_end_matches('/')
+                .to_string(),
+            embed_model: get("CASS_INFINITY_EMBED_MODEL")
+                .unwrap_or_else(|| "BAAI/bge-m3".into()),
+            rerank_model: get("CASS_INFINITY_RERANK_MODEL")
+                .unwrap_or_else(|| "BAAI/bge-reranker-v2-m3".into()),
+            timeout: Duration::from_secs(60),
+            max_batch: MAX_BATCH,
+        }
+    }
+}
+
+fn build_client(timeout: Duration) -> Result<reqwest::blocking::Client, String> {
     reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(timeout_secs))
+        .timeout(timeout)
         .build()
         .map_err(|e| format!("failed to build HTTP client: {e}"))
 }
@@ -168,24 +191,21 @@ fn http_rerank(
 /// In-process [`Embedder`] backed by Infinity's `/embeddings` over blocking HTTP.
 pub struct InfinityEmbedder {
     client: reqwest::blocking::Client,
-    base_url: String,
-    model: String,
+    config: InfinityConfig,
     id: String,
     dimension: usize,
 }
 
 impl InfinityEmbedder {
     pub fn new() -> EmbedderResult<Self> {
-        let model = std::env::var("CASS_INFINITY_EMBED_MODEL")
-            .unwrap_or_else(|_| DEFAULT_EMBED_MODEL.to_string());
-        let client = build_client(60).map_err(|msg| EmbedderError::SubsystemError {
+        let config = InfinityConfig::from_env();
+        let client = build_client(config.timeout).map_err(|msg| EmbedderError::SubsystemError {
             subsystem: "infinity-embedder",
             source: Box::new(io::Error::other(msg)),
         })?;
         Ok(Self {
             client,
-            base_url: base_url_from_env(),
-            model,
+            config,
             id: EMBEDDER_ID.to_string(),
             dimension: DIMENSION,
         })
@@ -208,8 +228,14 @@ impl Embedder for InfinityEmbedder {
                 reason: "empty text".to_string(),
             });
         }
-        let mut out = http_embed(&self.client, &self.base_url, &self.model, &[text], self.dimension)
-            .map_err(|m| self.fail(m))?;
+        let mut out = http_embed(
+            &self.client,
+            &self.config.base_url,
+            &self.config.embed_model,
+            &[text],
+            self.dimension,
+        )
+        .map_err(|m| self.fail(m))?;
         out.pop()
             .ok_or_else(|| self.fail("infinity returned no embedding".to_string()))
     }
@@ -224,8 +250,14 @@ impl Embedder for InfinityEmbedder {
                 });
             }
         }
-        http_embed(&self.client, &self.base_url, &self.model, texts, self.dimension)
-            .map_err(|m| self.fail(m))
+        http_embed(
+            &self.client,
+            &self.config.base_url,
+            &self.config.embed_model,
+            texts,
+            self.dimension,
+        )
+        .map_err(|m| self.fail(m))
     }
 
     fn dimension(&self) -> usize {
@@ -237,7 +269,7 @@ impl Embedder for InfinityEmbedder {
     }
 
     fn model_name(&self) -> &str {
-        &self.model
+        &self.config.embed_model
     }
 
     fn is_semantic(&self) -> bool {
@@ -259,24 +291,17 @@ impl Embedder for InfinityEmbedder {
 /// HTTP, replacing the UDS daemon. Used as the daemon in `DaemonFallback*`.
 pub struct InfinityDaemonClient {
     client: reqwest::blocking::Client,
-    base_url: String,
-    embed_model: String,
-    rerank_model: String,
+    config: InfinityConfig,
     dimension: usize,
 }
 
 impl InfinityDaemonClient {
     pub fn new() -> Result<Self, DaemonError> {
-        let embed_model = std::env::var("CASS_INFINITY_EMBED_MODEL")
-            .unwrap_or_else(|_| DEFAULT_EMBED_MODEL.to_string());
-        let rerank_model = std::env::var("CASS_INFINITY_RERANK_MODEL")
-            .unwrap_or_else(|_| DEFAULT_RERANK_MODEL.to_string());
-        let client = build_client(30).map_err(DaemonError::Unavailable)?;
+        let config = InfinityConfig::from_env();
+        let client = build_client(config.timeout).map_err(DaemonError::Unavailable)?;
         Ok(Self {
             client,
-            base_url: base_url_from_env(),
-            embed_model,
-            rerank_model,
+            config,
             dimension: DIMENSION,
         })
     }
@@ -290,7 +315,7 @@ impl DaemonClient for InfinityDaemonClient {
     fn is_available(&self) -> bool {
         // Cheap liveness probe; on failure the DaemonFallback* path falls back.
         self.client
-            .get(format!("{}/health", self.base_url))
+            .get(format!("{}/health", self.config.base_url))
             .timeout(Duration::from_secs(2))
             .send()
             .map(|r| r.status().is_success())
@@ -300,8 +325,8 @@ impl DaemonClient for InfinityDaemonClient {
     fn embed(&self, text: &str, _request_id: &str) -> Result<Vec<f32>, DaemonError> {
         let mut out = http_embed(
             &self.client,
-            &self.base_url,
-            &self.embed_model,
+            &self.config.base_url,
+            &self.config.embed_model,
             &[text],
             self.dimension,
         )
@@ -313,8 +338,8 @@ impl DaemonClient for InfinityDaemonClient {
     fn embed_batch(&self, texts: &[&str], _request_id: &str) -> Result<Vec<Vec<f32>>, DaemonError> {
         http_embed(
             &self.client,
-            &self.base_url,
-            &self.embed_model,
+            &self.config.base_url,
+            &self.config.embed_model,
             texts,
             self.dimension,
         )
@@ -329,11 +354,32 @@ impl DaemonClient for InfinityDaemonClient {
     ) -> Result<Vec<f32>, DaemonError> {
         http_rerank(
             &self.client,
-            &self.base_url,
-            &self.rerank_model,
+            &self.config.base_url,
+            &self.config.rerank_model,
             query,
             documents,
         )
         .map_err(DaemonError::Failed)
+    }
+}
+
+// ---- tests ------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_from_env_defaults_and_overrides() {
+        let def = InfinityConfig::from_env_with(|_| None);
+        assert_eq!(def.base_url, "http://127.0.0.1:7997");
+        assert_eq!(def.embed_model, "BAAI/bge-m3");
+        assert_eq!(def.rerank_model, "BAAI/bge-reranker-v2-m3");
+        assert_eq!(def.max_batch, 64);
+        let ovr = InfinityConfig::from_env_with(|k| match k {
+            "CASS_INFINITY_URL" => Some("http://x:9/".into()),
+            _ => None,
+        });
+        assert_eq!(ovr.base_url, "http://x:9"); // 去尾斜杠
     }
 }
