@@ -191,6 +191,11 @@ fn http_rerank(
 /// Returns the number of chunks needed to cover `len` items with at most `max`
 /// items per chunk (ceiling division). `max=0` is treated as "no split" (returns
 /// 0 when len=0, else 1) — defensive guard so callers never divide by zero.
+///
+/// Only exercised by the unit test; production batching uses
+/// `slice::chunks(max)` directly. `#[cfg(test)]` keeps the infinity-feature
+/// release build warning-clean (no dead_code).
+#[cfg(test)]
 fn n_chunks(len: usize, max: usize) -> usize {
     if len == 0 {
         return 0;
