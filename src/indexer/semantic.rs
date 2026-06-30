@@ -41,11 +41,24 @@ use crate::search::vector_index::{
 };
 use crate::storage::sqlite::FrankenStorage;
 
-/// Default embedder batch size. 128 is a sweet spot for ONNX MiniLM models on
-/// modern CPUs: big enough to amortize dispatch overhead and keep the tensor
-/// kernels saturated, small enough that one batch fits comfortably in L2 and
-/// memory reservation stays bounded for large corpora.
+/// Default embedder batch size — the **maximum row count** per embed batch.
+/// 128 is a sweet spot for short messages: big enough to amortize dispatch
+/// overhead and keep the tensor kernels saturated. It is no longer the sole
+/// bound on a batch: [`DEFAULT_SEMANTIC_EMBED_BATCH_CHAR_BUDGET`] additionally
+/// caps `row_count × max_canonical_len` so a batch that happens to contain a
+/// long message holds proportionally fewer rows (cass #309).
 const DEFAULT_SEMANTIC_BATCH_SIZE: usize = 128;
+/// Default per-batch canonical-character budget for length-aware embed
+/// batching (cass #309). A fixed-size batch (128) padded to its longest member
+/// makes the ONNX embedder allocate a `batch × max_seq²` attention tensor, so a
+/// single long message in the batch blows RSS to multiple GB (#309 observed
+/// 4.7–9.9 GB on a 67 MB corpus, flat RSS + 1000–1200% CPU = ort inference, not
+/// FSVI staging). Capping `row_count × max_canonical_len ≤ this` bounds that
+/// padded working set; with `MAX_EMBED_CHARS`-capped (~2 KB) messages the worst
+/// case is ≈8 rows — the regime that embeds cleanly (<1 GB) in practice. Set
+/// `CASS_SEMANTIC_EMBED_BATCH_CHAR_BUDGET=0` to disable (fixed `batch_size`
+/// chunks, pre-#309 behavior).
+const DEFAULT_SEMANTIC_EMBED_BATCH_CHAR_BUDGET: usize = 16 * 1024;
 const DEFAULT_SEMANTIC_PREP_MEMO_CAPACITY: usize = 4_096;
 const DEFAULT_SEMANTIC_EMBED_BATCH_WARN_AFTER_MS: u64 = 30_000;
 const DEFAULT_SEMANTIC_EMBED_BATCH_FAIL_AFTER_MS: u64 = 300_000;
@@ -82,6 +95,13 @@ fn resolved_semantic_prep_memo_capacity() -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(DEFAULT_SEMANTIC_PREP_MEMO_CAPACITY)
+}
+
+fn resolved_semantic_embed_batch_char_budget() -> usize {
+    resolved_env_usize(
+        "CASS_SEMANTIC_EMBED_BATCH_CHAR_BUDGET",
+        DEFAULT_SEMANTIC_EMBED_BATCH_CHAR_BUDGET,
+    )
 }
 
 fn resolved_semantic_embed_batch_warn_after_ms() -> u64 {
@@ -1451,6 +1471,50 @@ fn prepare_window<'a>(window: &'a [EmbeddingInput], serial: bool) -> Vec<Prepare
     }
 }
 
+/// Split a prepared window into contiguous, length-aware embed batches (cass
+/// #309).
+///
+/// Each returned batch holds at most `max_count` rows AND keeps
+/// `row_count × max_canonical_len ≤ char_budget`, so a batch that contains a
+/// long message stays small and the embedder's padded `batch × max_seq²`
+/// working set stays bounded regardless of corpus content. A single message
+/// longer than `char_budget` becomes its own one-row batch (never dropped).
+/// Order is preserved — callers still zip results back to inputs positionally.
+/// `char_budget == 0` disables the byte bound (fixed `max_count` chunks,
+/// pre-#309 behavior).
+fn length_aware_batches<'p, 'a>(
+    prepared: &'p [Prepared<'a>],
+    max_count: usize,
+    char_budget: usize,
+) -> Vec<&'p [Prepared<'a>]> {
+    let max_count = max_count.max(1);
+    let mut batches: Vec<&'p [Prepared<'a>]> = Vec::new();
+    if prepared.is_empty() {
+        return batches;
+    }
+    let mut start = 0usize;
+    let mut max_len = 0usize;
+    for (i, item) in prepared.iter().enumerate() {
+        let len = item.canonical.len();
+        let count = i - start + 1;
+        let prospective_max = max_len.max(len);
+        // Keep at least one row per batch: only split on the budget once the
+        // in-progress batch already holds a row (`count > 1`), so a lone
+        // over-budget message still forms its own batch rather than looping.
+        let over_budget =
+            char_budget > 0 && count > 1 && count.saturating_mul(prospective_max) > char_budget;
+        if count > max_count || over_budget {
+            batches.push(&prepared[start..i]);
+            start = i;
+            max_len = len;
+        } else {
+            max_len = prospective_max;
+        }
+    }
+    batches.push(&prepared[start..]);
+    batches
+}
+
 fn flush_prepared_batch(
     batch: &[Prepared<'_>],
     embeddings: &mut Vec<EmbeddedMessage>,
@@ -1602,6 +1666,10 @@ impl SemanticIndexer {
         let rows_total = u64::try_from(messages.len()).ok();
         let warn_after_ms = resolved_semantic_embed_batch_warn_after_ms();
         let fail_after_ms = resolved_semantic_embed_batch_fail_after_ms();
+        // cass #309: bound `row_count × max_canonical_len` per embed batch so a
+        // long message can't inflate a fixed-128 batch's padded tensor to
+        // multiple GB. Resolved once per call (not per batch).
+        let embed_char_budget = resolved_semantic_embed_batch_char_budget();
         for (window_index, window_slice) in messages.chunks(window).enumerate() {
             let prepared_window = match prep_memo.as_mut() {
                 Some(cache) => {
@@ -1624,7 +1692,8 @@ impl SemanticIndexer {
                 pb.inc(saturating_u64_from_usize(skipped_in_window));
             }
 
-            for batch in prepared_window.chunks(self.batch_size) {
+            for batch in length_aware_batches(&prepared_window, self.batch_size, embed_char_budget)
+            {
                 let batch_rows = u64::try_from(batch.len()).unwrap_or(u64::MAX);
                 // Sum the canonicalized byte count so an operator can
                 // distinguish a stalled inference from a stalled query —
@@ -2554,6 +2623,58 @@ mod tests {
     use serde_json::json;
     use std::path::Path;
     use tempfile::tempdir;
+
+    /// cass #309: length-aware embed batching must cap both row count and
+    /// `row_count × max_canonical_len` per batch, never drop or reorder rows,
+    /// and keep a single over-budget message as its own one-row batch.
+    #[test]
+    fn length_aware_batches_bounds_count_and_chars() {
+        fn rows<'a>(inputs: &'a [EmbeddingInput], lens: &[usize]) -> Vec<Prepared<'a>> {
+            lens.iter()
+                .enumerate()
+                .map(|(i, &len)| Prepared {
+                    msg: &inputs[i],
+                    canonical: "a".repeat(len),
+                    hash: [0u8; 32],
+                })
+                .collect()
+        }
+        let inputs: Vec<EmbeddingInput> =
+            (0..6).map(|i| EmbeddingInput::new(i as u64, "")).collect();
+
+        // 1) Count cap only (budget disabled): fixed chunks of max_count.
+        let r = rows(&inputs, &[10, 10, 10, 10, 10]);
+        assert_eq!(
+            length_aware_batches(&r, 2, 0)
+                .iter()
+                .map(|b| b.len())
+                .collect::<Vec<_>>(),
+            vec![2, 2, 1]
+        );
+
+        // 2) Char budget caps batches that hold longer rows (50 each, budget
+        //    100 -> at most 2 rows/batch); order is preserved.
+        let r = rows(&inputs, &[50, 50, 50, 50, 50]);
+        let b = length_aware_batches(&r, 128, 100);
+        assert!(b.iter().all(|s| s.len() <= 2));
+        let flat: Vec<u64> = b
+            .iter()
+            .flat_map(|s| s.iter().map(|p| p.msg.message_id))
+            .collect();
+        assert_eq!(flat, vec![0, 1, 2, 3, 4]);
+
+        // 3) A single over-budget row forms its own batch; nothing is dropped.
+        let r = rows(&inputs, &[10, 500, 10]);
+        let b = length_aware_batches(&r, 128, 100);
+        assert_eq!(b.iter().map(|s| s.len()).sum::<usize>(), 3);
+        assert!(
+            b.iter()
+                .any(|s| s.len() == 1 && s[0].canonical.len() == 500)
+        );
+
+        // 4) Empty input -> no batches.
+        assert!(length_aware_batches(&[], 8, 100).is_empty());
+    }
 
     #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
     struct ComparableSemanticInput {

@@ -84723,6 +84723,11 @@ struct IndexStallWatchdog {
     threshold: Option<Duration>,
     abort_threshold: Option<Duration>,
     abort_policy: IndexStallAbortPolicy,
+    /// True when supervising a long-lived `cass index --watch` daemon. In
+    /// watch mode the post-publish quiescent resting state (phase 0,
+    /// `current >= total`) is normal idle between rescans, not a wedge, so the
+    /// finalize-wedge detect/abort is suppressed (cass #311).
+    is_watch: bool,
     last_phase: usize,
     last_current: usize,
     last_progress_advance: std::time::Instant,
@@ -84748,6 +84753,17 @@ impl IndexStallWatchdog {
         )
     }
 
+    /// Mark this watchdog as supervising a long-lived `cass index --watch`
+    /// daemon. In watch mode the post-publish, fully-quiescent resting state
+    /// (phase 0 "preparing", `current >= total`) is the NORMAL idle between
+    /// rescans — it is not a wedge. Without this flag the #297 finalize-wedge
+    /// abort fires after `abort_threshold` of that normal idle and crash-loops
+    /// the daemon with exit(70) (cass #311). Set on the watch path only.
+    fn watch_aware(mut self, is_watch: bool) -> Self {
+        self.is_watch = is_watch;
+        self
+    }
+
     fn data_dir(&self) -> &Path {
         &self.data_dir
     }
@@ -84764,6 +84780,7 @@ impl IndexStallWatchdog {
             threshold,
             abort_threshold,
             abort_policy,
+            is_watch: false,
             last_phase: usize::MAX,
             last_current: 0,
             last_progress_advance: std::time::Instant::now(),
@@ -84803,6 +84820,25 @@ impl IndexStallWatchdog {
 
         let threshold = self.threshold?;
         let stall_elapsed = self.last_progress_advance.elapsed();
+        // cass #311: in `--watch` mode the daemon legitimately rests in a
+        // quiescent, fully-published state (phase 0 "preparing",
+        // `current >= total`) between rescans. That resting state matches the
+        // #297 finalize-wedge shape, so the watchdog used to emit a spurious
+        // `stall_detected` and then abort the long-lived watch process with
+        // exit(70) after `abort_threshold` of perfectly normal idle — a
+        // crash-loop (systemd restart -> repeat). Treat the quiescent resting
+        // state as healthy idle in watch mode (no detect, no abort). A genuine
+        // watch wedge in active work — phase 2, or phase 0 with `current < total`
+        // or a non-quiescent rebuild pipeline — does not match and is still
+        // detected and aborted below.
+        if self.is_watch && phase_code == 0 {
+            let total = index_progress
+                .total
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if total > 0 && current >= total && index_progress.rebuild_pipeline_is_quiescent() {
+                return None;
+            }
+        }
         // Historically this gated on `phase_code != 0` so the watchdog
         // never fired during the "preparing" phase (phase=0). Issue #258
         // is exactly that: the v0.6.2 watcher wedged at startup before
@@ -84844,8 +84880,13 @@ impl IndexStallWatchdog {
         let total = index_progress
             .total
             .load(std::sync::atomic::Ordering::Relaxed);
-        let finalize_wedge =
-            total > 0 && current >= total && index_progress.rebuild_pipeline_is_quiescent();
+        // `!self.is_watch`: in watch mode the quiescent `current >= total`
+        // resting state is normal idle (handled by the early return above), so
+        // it must never be treated as a finalize wedge (cass #311).
+        let finalize_wedge = !self.is_watch
+            && total > 0
+            && current >= total
+            && index_progress.rebuild_pipeline_is_quiescent();
         let abort_eligible = phase_code == 2 || finalize_wedge;
         if self.abort_policy != IndexStallAbortPolicy::AbortPhaseTwo
             || !abort_eligible
@@ -85170,6 +85211,70 @@ mod stall_diagnostics_tests {
         })?;
         assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
         assert_eq!(abort["abort_process"], serde_json::json!(true));
+        assert_eq!(abort["exit_code"], serde_json::json!(70));
+        Ok(())
+    }
+
+    /// Regression for #311: in `cass index --watch` mode the post-publish
+    /// quiescent resting state (phase 0, `current == total`, pipeline idle) is
+    /// NORMAL idle between rescans, not a wedge. A watch-aware watchdog must
+    /// neither report a stall nor abort the long-lived daemon with exit(70)
+    /// (the bug: a deterministic exit-70 crash-loop, systemd restart, repeat).
+    /// A genuine phase-2 wedge must still abort even in watch mode.
+    #[test]
+    fn watchdog_does_not_abort_watch_idle_resting_state() -> anyhow::Result<()> {
+        use super::{IndexStallAbortPolicy, IndexStallWatchdog};
+        use crate::indexer::IndexingProgress;
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let tmp = TempDir::new()?;
+        let mut watchdog = IndexStallWatchdog::with_abort_policy(
+            tmp.path().to_path_buf(),
+            Duration::from_millis(50),
+            IndexStallAbortPolicy::AbortPhaseTwo,
+        )
+        .watch_aware(true);
+        watchdog.threshold = Some(Duration::from_millis(1));
+        watchdog.abort_threshold = Some(Duration::from_millis(2));
+        watchdog.last_phase = 0;
+        watchdog.last_current = 100;
+        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
+
+        let progress = Arc::new(IndexingProgress::default());
+        // Identical state to the #297 finalize-wedge test, but in watch mode
+        // this is healthy idle: the daemon published and awaits the next rescan.
+        progress.phase.store(0, Ordering::Relaxed);
+        progress.total.store(100, Ordering::Relaxed);
+        progress.current.store(100, Ordering::Relaxed);
+        assert!(progress.rebuild_pipeline_is_quiescent());
+
+        // Well past both detect and abort thresholds: a non-watch watchdog
+        // would emit stall_detected then stall_aborting(exit 70) here (see
+        // `watchdog_aborts_on_quiescent_finalize_wedge`). Watch-aware: silent.
+        assert!(
+            watchdog.observe(&progress, 100).is_none(),
+            "watch idle resting state must not be reported as a stall (#311)"
+        );
+        assert!(
+            watchdog.observe(&progress, 200).is_none(),
+            "watch idle resting state must never trigger exit(70) abort (#311)"
+        );
+
+        // A genuine phase-2 wedge in watch mode is still aborted.
+        progress.phase.store(2, Ordering::Relaxed);
+        // The phase change resets the watchdog's progress clock; re-arm it.
+        let _ = watchdog.observe(&progress, 250);
+        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
+        let detected = watchdog
+            .observe(&progress, 300)
+            .ok_or_else(|| anyhow::anyhow!("phase-2 watch stall did not report"))?;
+        assert_eq!(detected["event"], serde_json::json!("stall_detected"));
+        let abort = watchdog
+            .observe(&progress, 400)
+            .ok_or_else(|| anyhow::anyhow!("phase-2 watch stall did not abort"))?;
+        assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
         assert_eq!(abort["exit_code"], serde_json::json!(70));
         Ok(())
     }
@@ -85513,7 +85618,8 @@ fn run_index_with_data(
         let mut last_agents = usize::MAX;
         let mut last_update = std::time::Instant::now();
         let mut stall_watchdog =
-            IndexStallWatchdog::aborting_phase_two(data_dir.clone(), progress_interval);
+            IndexStallWatchdog::aborting_phase_two(data_dir.clone(), progress_interval)
+                .watch_aware(watch);
 
         loop {
             // Check if indexer finished
@@ -85625,7 +85731,8 @@ fn run_index_with_data(
         let mut last_current = 0;
         let mut last_scan_current = 0;
         let mut stall_watchdog =
-            IndexStallWatchdog::aborting_phase_two(data_dir.clone(), progress_interval);
+            IndexStallWatchdog::aborting_phase_two(data_dir.clone(), progress_interval)
+                .watch_aware(watch);
 
         loop {
             if index_handle.is_finished() {
@@ -85695,7 +85802,8 @@ fn run_index_with_data(
             .checked_sub(progress_interval)
             .unwrap_or_else(std::time::Instant::now);
         let mut stall_watchdog =
-            IndexStallWatchdog::aborting_phase_two(data_dir.clone(), progress_interval);
+            IndexStallWatchdog::aborting_phase_two(data_dir.clone(), progress_interval)
+                .watch_aware(watch);
 
         // Finish-aware poll cadence: 100ms for snappy shutdown, but only emit a
         // `progress` event at `progress_interval`.
@@ -85746,7 +85854,8 @@ fn run_index_with_data(
         // No progress display (json mode with events disabled, or plain=none):
         // just wait for completion.
         let mut stall_watchdog =
-            IndexStallWatchdog::aborting_phase_two(data_dir.clone(), progress_interval);
+            IndexStallWatchdog::aborting_phase_two(data_dir.clone(), progress_interval)
+                .watch_aware(watch);
         while !index_handle.is_finished() {
             if let Some(payload) =
                 stall_watchdog.observe(&index_progress, start.elapsed().as_millis())
