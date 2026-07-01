@@ -1,9 +1,9 @@
 name: Fuzzing
 
 on:
-  schedule:
-    # Run daily at midnight UTC
-    - cron: '0 0 * * *'
+  # 每晚定时 fuzz 已停(fork 维护铁律:我们只维护 Infinity 搜索后端,上游的加密/分块
+  # fuzz 不是我们的活;GitHub 免费跑机上重编译 + fuzz 每晚必被 runner shutdown 掐(exit 143)
+  # 徒发报错邮件,零价值。保留 workflow_dispatch 以便需要时手动跑。
   workflow_dispatch:
     inputs:
       duration:
