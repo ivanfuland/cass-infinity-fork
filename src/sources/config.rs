@@ -161,6 +161,15 @@ pub struct SourceDefinition {
     /// Platform hint for default paths (macos, linux).
     #[serde(default)]
     pub platform: Option<Platform>,
+
+    /// Force a full (watermark-ignoring) scan of this source's roots on every
+    /// index pass. For cross-machine sources delivered by a third-party transport
+    /// (NAS / cloud sync) whose files keep their *origin* mtime — which would
+    /// otherwise fall below the connector watermark and be skipped. Canonical
+    /// dedupe (UNIQUE(source_id, agent_id, external_id)) prevents repeats, the
+    /// same protection configured remote mirror roots already rely on.
+    #[serde(default)]
+    pub full_scan: bool,
 }
 
 impl SourceDefinition {
@@ -999,6 +1008,7 @@ impl SourceConfigGenerator {
             sync_schedule: SyncSchedule::Manual,
             path_mappings,
             platform,
+            full_scan: false,
         }
     }
 
@@ -1423,6 +1433,31 @@ fn unique_atomic_sidecar_path(path: &Path, suffix: &str, fallback_name: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_definition_parses_full_scan_flag() {
+        let toml_src = r#"
+[[sources]]
+name = "test-machine"
+type = "local"
+paths = ["/mnt/histories/test-machine"]
+full_scan = true
+"#;
+        let config: SourcesConfig = toml::from_str(toml_src).unwrap();
+        assert!(config.sources[0].full_scan, "full_scan=true must parse");
+    }
+
+    #[test]
+    fn source_definition_full_scan_defaults_false() {
+        let toml_src = r#"
+[[sources]]
+name = "laptop"
+type = "local"
+paths = ["/mnt/histories/laptop"]
+"#;
+        let config: SourcesConfig = toml::from_str(toml_src).unwrap();
+        assert!(!config.sources[0].full_scan, "omitted full_scan must default false");
+    }
 
     #[test]
     fn test_empty_config_default() {
@@ -2090,6 +2125,7 @@ paths = ["~/.claude/projects"]
             sync_schedule: SyncSchedule::Daily,
             path_mappings: vec![PathMapping::new("/home/user", "/Users/me")],
             platform: Some(Platform::Linux),
+            full_scan: false,
         });
 
         let serialized = toml::to_string_pretty(&config).unwrap();
@@ -2117,6 +2153,7 @@ paths = ["~/.claude/projects"]
                 PathMapping::with_agents("/opt/work", "/Volumes/Work", vec!["claude-code".into()]),
             ],
             platform: None,
+            full_scan: false,
         });
 
         let serialized = toml::to_string_pretty(&config).unwrap();

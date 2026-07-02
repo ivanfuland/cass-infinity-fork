@@ -11451,6 +11451,7 @@ struct StreamingProducerConfig {
     additional_scan_roots: Vec<ScanRoot>,
     since_ts: Option<i64>,
     local_since_ts_by_connector: Arc<HashMap<&'static str, Option<i64>>>,
+    full_scan_source_ids: Arc<HashSet<String>>,
     progress: Option<Arc<IndexingProgress>>,
     active_source_filter: Arc<ActiveSessionSourceFilter>,
 }
@@ -11579,7 +11580,12 @@ fn spawn_connector_producer(
                 .get(name)
                 .copied()
                 .unwrap_or(config.since_ts);
-            let root_since_ts = explicit_scan_root_since_ts(root, &config.data_dir, local_since_ts);
+            let root_since_ts = explicit_scan_root_since_ts(
+                root,
+                &config.data_dir,
+                local_since_ts,
+                &config.full_scan_source_ids,
+            );
             if config.since_ts.is_some() && root_since_ts.is_none() {
                 tracing::debug!(
                     connector = name,
@@ -12288,6 +12294,7 @@ fn run_streaming_index_with_connector_factories(
             since_ts,
             &connector_factories,
         )?),
+        full_scan_source_ids: Arc::new(full_scan_source_ids()),
         progress: opts.progress.clone(),
         active_source_filter: Arc::new(ActiveSessionSourceFilter::new(
             opts.watch && opts.watch_once_paths.as_ref().is_none_or(Vec::is_empty),
@@ -12451,6 +12458,7 @@ fn run_batch_index_with_connector_factories(
         since_ts,
         &connector_factories,
     )?);
+    let full_scan_source_ids = full_scan_source_ids();
 
     // Keep scan completion state with each connector so watermarks are only
     // advanced for connectors whose full scan scope completed successfully.
@@ -12536,7 +12544,7 @@ fn run_batch_index_with_connector_factories(
                             .copied()
                             .unwrap_or(since_ts);
                         let root_since_ts =
-                            explicit_scan_root_since_ts(root, &data_dir, local_since_ts);
+                            explicit_scan_root_since_ts(root, &data_dir, local_since_ts, &full_scan_source_ids);
                         if since_ts.is_some() && root_since_ts.is_none() {
                             tracing::debug!(
                                 connector = name,
@@ -12811,11 +12819,40 @@ fn connector_local_scan_since_ts_map(
         .collect()
 }
 
+/// Collect source_ids that opt into full (watermark-ignoring) scans.
+/// Reads the same sources.toml as build_scan_roots; missing/invalid config
+/// yields an empty set (no source forced to full scan), never an error path.
+fn full_scan_source_ids() -> HashSet<String> {
+    // Mirror build_scan_roots: when CASS_IGNORE_SOURCES_CONFIG is set the sources
+    // config is short-circuited, so full_scan must not take effect either
+    // (otherwise an "ignored" config still steers scan behavior).
+    if dotenvy::var("CASS_IGNORE_SOURCES_CONFIG").is_ok() {
+        return HashSet::new();
+    }
+    match SourcesConfig::load() {
+        Ok(config) => config
+            .sources
+            .iter()
+            .filter(|s| s.full_scan)
+            .map(|s| s.name.clone())
+            .collect(),
+        Err(_) => HashSet::new(),
+    }
+}
+
 fn explicit_scan_root_since_ts(
     root: &ScanRoot,
     built_in_local_root: &Path,
     fallback_since_ts: Option<i64>,
+    full_scan_source_ids: &HashSet<String>,
 ) -> Option<i64> {
+    // full_scan sources bypass the incremental watermark so third-party-transported
+    // cross-machine history (files carrying an origin mtime older than the connector
+    // watermark) is still promoted to canonical. Canonical dedupe protects repeats —
+    // the same guarantee configured remote mirror roots already rely on.
+    if full_scan_source_ids.contains(&root.origin.source_id) {
+        return None;
+    }
     // Configured local roots are local history, including opt-in backup
     // directories. They must honor the incremental cutoff; otherwise a normal
     // `cass index` can replay multi-GB backup archives on every run.
@@ -38227,6 +38264,7 @@ mod tests {
 
     #[test]
     fn configured_scan_root_watermark_policy_matches_source_kind() -> Result<()> {
+        let no_full_scan = std::collections::HashSet::new();
         ensure_since_ts_matches(
             explicit_scan_root_since_ts(
                 &ScanRoot::remote(
@@ -38236,6 +38274,7 @@ mod tests {
                 ),
                 Path::new("/tmp/cass-data"),
                 Some(1234),
+                &no_full_scan,
             ),
             None,
             "configured remote roots may contain already-transferred files older than the global scan watermark; canonical dedupe protects repeats, but the scan must not skip never-promoted mirror sessions",
@@ -38245,6 +38284,7 @@ mod tests {
                 &ScanRoot::local(PathBuf::from("/tmp/cass-data")),
                 Path::new("/tmp/cass-data"),
                 Some(1234),
+                &no_full_scan,
             ),
             Some(1234),
             "the built-in local root should keep normal incremental filtering",
@@ -38254,6 +38294,7 @@ mod tests {
                 &ScanRoot::local(PathBuf::from("/tmp/backup-root")),
                 Path::new("/tmp/cass-data"),
                 Some(1234),
+                &no_full_scan,
             ),
             Some(1234),
             "configured local roots are local history sources and must honor the normal incremental watermark",
@@ -38263,9 +38304,29 @@ mod tests {
                 &ScanRoot::local(PathBuf::from("/tmp/backup-root")),
                 Path::new("/tmp/cass-data"),
                 None,
+                &no_full_scan,
             ),
             None,
             "full rebuilds still scan configured local roots from the beginning",
+        )?;
+
+        // full_scan-marked sources bypass the watermark even as local roots;
+        // a local source NOT in the set keeps normal incremental filtering.
+        let mut full_scan = std::collections::HashSet::new();
+        full_scan.insert("test-machine".to_string());
+        let mut fs_root = ScanRoot::local(PathBuf::from("/mnt/histories/test-machine"));
+        fs_root.origin.source_id = "test-machine".to_string();
+        ensure_since_ts_matches(
+            explicit_scan_root_since_ts(&fs_root, Path::new("/tmp/cass-data"), Some(1234), &full_scan),
+            None,
+            "a full_scan-marked local source must bypass the watermark (full scan)",
+        )?;
+        let mut other_root = ScanRoot::local(PathBuf::from("/mnt/histories/other"));
+        other_root.origin.source_id = "other".to_string();
+        ensure_since_ts_matches(
+            explicit_scan_root_since_ts(&other_root, Path::new("/tmp/cass-data"), Some(1234), &full_scan),
+            Some(1234),
+            "a non-full_scan local source keeps normal incremental filtering",
         )?;
         Ok(())
     }
@@ -38921,6 +38982,7 @@ mod tests {
                 )],
                 since_ts: None,
                 local_since_ts_by_connector: Arc::new(HashMap::new()),
+                full_scan_source_ids: Arc::new(HashSet::new()),
                 progress: Some(progress.clone()),
                 active_source_filter: Arc::new(ActiveSessionSourceFilter::default()),
             },
@@ -39057,6 +39119,7 @@ mod tests {
                 &configured_local_scan_root(local_root_path.clone()),
                 &data_dir,
                 local_since_by_connector.get("claude").copied().flatten(),
+                &std::collections::HashSet::new(),
             ),
             Some(i64::MAX - 1),
             "configured local roots must preserve the connector-specific cutoff"
@@ -39250,6 +39313,7 @@ mod tests {
                 &configured_local_scan_root(local_root_path.clone()),
                 &data_dir,
                 local_since_by_connector.get("claude").copied().flatten(),
+                &std::collections::HashSet::new(),
             ),
             Some(i64::MAX - 1),
             "configured local roots must preserve the connector-specific cutoff"
@@ -39455,6 +39519,7 @@ mod tests {
                 )],
                 since_ts: None,
                 local_since_ts_by_connector: Arc::new(HashMap::new()),
+                full_scan_source_ids: Arc::new(HashSet::new()),
                 progress: None,
                 active_source_filter: Arc::new(ActiveSessionSourceFilter::default()),
             },
