@@ -1083,8 +1083,9 @@ pub enum Commands {
         #[arg(long)]
         data_dir: Option<PathBuf>,
     },
-    /// Resolve a session path into a ready-to-run resume command for
-    /// its native harness (Claude Code, Codex, OpenCode, pi_agent, Gemini).
+    /// Resolve a session path into a ready-to-run resume command for its
+    /// native harness (Claude Code, Codex, OpenCode, pi_agent, Gemini,
+    /// Antigravity).
     ///
     /// By default, the resolved command is printed to stdout, one
     /// argv token per line, so the caller can wrap it however they like:
@@ -1108,7 +1109,8 @@ pub enum Commands {
                 \x20 pi_agent | pi-agent     (let path inference pick `pi` vs `omp`)\n\
                 \x20 pi                      (force the pi-mono binary)\n\
                 \x20 omp | oh-my-pi | ohmypi (force the Oh My Pi binary)\n\
-                \x20 gemini"
+                \x20 gemini\n\
+                \x20 antigravity | agy       (resume via `agy --conversation <uuid>`)"
         )]
         agent: Option<String>,
         /// Replace the current process with the resolved resume command.
@@ -20137,7 +20139,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  (global) --verbose/-v  Enable debug logs (overrides auto-quiet)".to_string(),
             "  Tip: `--robot-docs=<topic>` is normalized to `robot-docs <topic>`; globals can appear before/after subcommands.".to_string(),
             "  cass search <query> [OPTIONS]".to_string(),
-            "    --agent A         Filter by agent (codex, claude_code, gemini, vibe, opencode, amp, cline)".to_string(),
+            "    --agent A         Filter by agent (e.g. codex, claude_code, gemini, opencode, antigravity; run `cass capabilities --json | jq .connectors` for the full 22-connector inventory)".to_string(),
             "    --workspace W     Filter by workspace path".to_string(),
             "    --limit N         Max results (default: 0 = no limit)".to_string(),
             "    --offset N        Pagination offset (default: 0)".to_string(),
@@ -72350,7 +72352,9 @@ mod cli_read_db_tests {
         let target = resolve_resume_target(&path, None).expect("resolve");
         assert_eq!(target.agent, "opencode");
         assert_eq!(target.session_id.as_deref(), Some("sess-42"));
-        assert_eq!(target.argv, vec!["opencode", "resume", "sess-42"]);
+        // Current OpenCode continues a session via `--session <id>`, not the
+        // removed `opencode resume <id>` subcommand (cass#316).
+        assert_eq!(target.argv, vec!["opencode", "--session", "sess-42"]);
     }
 
     #[test]
@@ -72358,7 +72362,7 @@ mod cli_read_db_tests {
         // `~/.config/opencode/config.json` matches the opencode detection
         // heuristic but is NOT a session path. We must refuse to produce
         // a resume command rather than synthesize a plausible-but-wrong
-        // `opencode resume config.json` invocation.
+        // `opencode --session config.json` invocation.
         let path = PathBuf::from("/Users/ellis/.config/opencode/config.json");
         let err = resolve_resume_target(&path, None).expect_err("must reject non-session path");
         assert_eq!(err.code, 5);
@@ -72387,7 +72391,7 @@ mod cli_read_db_tests {
             .expect("explicit override must bypass parent-directory check");
         assert_eq!(target.agent, "opencode");
         assert_eq!(target.session_id.as_deref(), Some("sess-xyz"));
-        assert_eq!(target.argv, vec!["opencode", "resume", "sess-xyz"]);
+        assert_eq!(target.argv, vec!["opencode", "--session", "sess-xyz"]);
     }
 
     #[test]
@@ -72444,6 +72448,51 @@ mod cli_read_db_tests {
         assert_eq!(target.argv[0], "gemini");
         assert_eq!(target.argv[1], "session");
         assert_eq!(target.argv[2], "restore");
+    }
+
+    #[test]
+    fn resume_detects_antigravity_from_transcript_path() {
+        // cass#314: an Antigravity transcript source path resolves to
+        // `agy --conversation <uuid>`, where <uuid> is the `brain/<uuid>`
+        // directory name. The path also contains `.gemini/`, so this proves
+        // antigravity detection wins over the gemini arm.
+        let uuid = "f1e2d3c4-b5a6-4789-9abc-def012345678";
+        let path = PathBuf::from(format!(
+            "/home/dev/.gemini/antigravity-cli/brain/{uuid}/.system_generated/logs/transcript.jsonl"
+        ));
+        let target = resolve_resume_target(&path, None).expect("resolve");
+        assert_eq!(target.agent, "antigravity");
+        assert_eq!(target.session_id.as_deref(), Some(uuid));
+        assert_eq!(
+            target.argv,
+            vec!["agy", "--conversation", uuid],
+            "antigravity must resume via `agy --conversation <uuid>`"
+        );
+    }
+
+    #[test]
+    fn resume_antigravity_override_and_agy_alias() {
+        // Both `--agent antigravity` and `--agent agy` map to the antigravity
+        // slug; the UUID is recovered from the transcript path in either case.
+        let uuid = "11111111-2222-3333-4444-555555555555";
+        let path = PathBuf::from(format!(
+            "/mnt/mirror/antigravity-cli/brain/{uuid}/.system_generated/logs/transcript_full.jsonl"
+        ));
+        for alias in ["antigravity", "agy"] {
+            let target = resolve_resume_target(&path, Some(alias)).expect("resolve");
+            assert_eq!(target.agent, "antigravity");
+            assert_eq!(target.argv, vec!["agy", "--conversation", uuid]);
+        }
+    }
+
+    #[test]
+    fn resume_antigravity_rejects_path_without_uuid() {
+        // A path with no `brain/<uuid>` / `.system_generated` ancestry cannot
+        // yield a conversation id — fail explicitly rather than fabricate one.
+        let path = PathBuf::from("/home/dev/.gemini/antigravity-cli/notes.txt");
+        let err = resolve_resume_target(&path, Some("agy")).expect_err("must reject");
+        assert_eq!(err.code, 5);
+        assert_eq!(err.kind, "session-id-not-found");
     }
 
     #[test]
@@ -84728,6 +84777,16 @@ struct IndexStallWatchdog {
     /// `current >= total`) is normal idle between rescans, not a wedge, so the
     /// finalize-wedge detect/abort is suppressed (cass #311).
     is_watch: bool,
+    /// True when this run is building semantic (vector) assets. The native
+    /// MiniLM embed + HNSW build + vector publish all run AFTER the lexical
+    /// rebuild has already parked the progress atomics in the quiescent
+    /// finalize state (phase 0 "preparing", `current >= total`), and they never
+    /// advance those atomics — so that multi-minute CPU-heavy work looks
+    /// identical to a #297 finalize wedge. Without this flag the abort fires
+    /// mid-embed and kills the process with exit(70) before any vector file is
+    /// published, so the next run starts over and semantic search never becomes
+    /// available (cass #315). Set on the semantic index path only.
+    semantic_build: bool,
     last_phase: usize,
     last_current: usize,
     last_progress_advance: std::time::Instant,
@@ -84764,6 +84823,22 @@ impl IndexStallWatchdog {
         self
     }
 
+    /// Mark this watchdog as supervising a one-shot semantic (vector) index
+    /// build. The native embedding pass, HNSW build, and vector publish all run
+    /// while the progress atomics are already parked in the quiescent finalize
+    /// state (phase 0 "preparing", `current >= total`) left by the preceding
+    /// lexical rebuild, and never advance them — so that legitimate multi-minute
+    /// work matches the #297 finalize-wedge shape exactly. Without this flag the
+    /// #297 abort fires after `abort_threshold` and kills the process with
+    /// exit(70) before any vector file is published (cass #315). Treating the
+    /// quiescent finalize state as healthy active work (like watch-mode idle)
+    /// lets the semantic build run to completion and publish. A genuine phase-2
+    /// (lexical indexing) wedge does not match and is still detected + aborted.
+    fn semantic_aware(mut self, semantic_build: bool) -> Self {
+        self.semantic_build = semantic_build;
+        self
+    }
+
     fn data_dir(&self) -> &Path {
         &self.data_dir
     }
@@ -84781,6 +84856,7 @@ impl IndexStallWatchdog {
             abort_threshold,
             abort_policy,
             is_watch: false,
+            semantic_build: false,
             last_phase: usize::MAX,
             last_current: 0,
             last_progress_advance: std::time::Instant::now(),
@@ -84831,7 +84907,18 @@ impl IndexStallWatchdog {
         // watch wedge in active work — phase 2, or phase 0 with `current < total`
         // or a non-quiescent rebuild pipeline — does not match and is still
         // detected and aborted below.
-        if self.is_watch && phase_code == 0 {
+        //
+        // cass #315: a one-shot `cass index --semantic` build has the same
+        // healthy-idle shape here for the entire semantic pass. The lexical
+        // rebuild finishes and parks progress at phase 0 / `current == total` /
+        // quiescent, then the native MiniLM embed + HNSW build + vector publish
+        // run for minutes WITHOUT ever advancing those atomics. That legitimate
+        // work is indistinguishable from a finalize wedge, so the abort used to
+        // kill the process (exit 70) before publishing any vector index. Treat
+        // the quiescent finalize state as healthy active work for semantic
+        // builds too, so the embed/publish runs to completion. A genuine phase-2
+        // lexical wedge does not match (phase_code != 0) and is still caught.
+        if (self.is_watch || self.semantic_build) && phase_code == 0 {
             let total = index_progress
                 .total
                 .load(std::sync::atomic::Ordering::Relaxed);
@@ -84883,7 +84970,13 @@ impl IndexStallWatchdog {
         // `!self.is_watch`: in watch mode the quiescent `current >= total`
         // resting state is normal idle (handled by the early return above), so
         // it must never be treated as a finalize wedge (cass #311).
+        // `!self.semantic_build`: for a one-shot semantic build the same
+        // quiescent state is the active embed/publish window (also handled by
+        // the early return above); belt-and-suspenders so an off-by-one phase
+        // never resurrects the exit(70) that killed the build pre-publish (cass
+        // #315).
         let finalize_wedge = !self.is_watch
+            && !self.semantic_build
             && total > 0
             && current >= total
             && index_progress.rebuild_pipeline_is_quiescent();
@@ -85279,6 +85372,72 @@ mod stall_diagnostics_tests {
         Ok(())
     }
 
+    /// Regression for #315: a one-shot `cass index --semantic` build finishes
+    /// the lexical rebuild (parking progress at phase 0, `current == total`,
+    /// pipeline quiescent) and then runs the native embed + HNSW build + vector
+    /// publish for minutes WITHOUT advancing the progress atomics. That work is
+    /// shaped exactly like a #297 finalize wedge, so a non-semantic watchdog
+    /// used to abort mid-embed with exit(70) before publishing any vector index
+    /// — leaving semantic search permanently unavailable. A semantic-aware
+    /// watchdog must treat that quiescent finalize state as healthy active work
+    /// (no exit-70 abort), while a genuine phase-2 lexical wedge still aborts.
+    #[test]
+    fn watchdog_does_not_abort_semantic_finalize_build() -> anyhow::Result<()> {
+        use super::{IndexStallAbortPolicy, IndexStallWatchdog};
+        use crate::indexer::IndexingProgress;
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let tmp = TempDir::new()?;
+        let mut watchdog = IndexStallWatchdog::with_abort_policy(
+            tmp.path().to_path_buf(),
+            Duration::from_millis(50),
+            IndexStallAbortPolicy::AbortPhaseTwo,
+        )
+        .semantic_aware(true);
+        watchdog.threshold = Some(Duration::from_millis(1));
+        watchdog.abort_threshold = Some(Duration::from_millis(2));
+        watchdog.last_phase = 0;
+        watchdog.last_current = 100;
+        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
+
+        let progress = Arc::new(IndexingProgress::default());
+        // Identical state to the #297 finalize-wedge test, but this is the
+        // semantic embed/publish window: the lexical rebuild published and the
+        // native embedder is now grinding through vectors without touching the
+        // atomics. Well past both detect and abort thresholds.
+        progress.phase.store(0, Ordering::Relaxed);
+        progress.total.store(100, Ordering::Relaxed);
+        progress.current.store(100, Ordering::Relaxed);
+        assert!(progress.rebuild_pipeline_is_quiescent());
+
+        assert!(
+            watchdog.observe(&progress, 100).is_none(),
+            "semantic finalize build must not be reported as a stall (#315)"
+        );
+        assert!(
+            watchdog.observe(&progress, 200).is_none(),
+            "semantic finalize build must never trigger exit(70) before publish (#315)"
+        );
+
+        // A genuine phase-2 lexical wedge during a semantic run is still aborted.
+        progress.phase.store(2, Ordering::Relaxed);
+        // The phase change resets the watchdog's progress clock; re-arm it.
+        let _ = watchdog.observe(&progress, 250);
+        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
+        let detected = watchdog
+            .observe(&progress, 300)
+            .ok_or_else(|| anyhow::anyhow!("phase-2 semantic stall did not report"))?;
+        assert_eq!(detected["event"], serde_json::json!("stall_detected"));
+        let abort = watchdog
+            .observe(&progress, 400)
+            .ok_or_else(|| anyhow::anyhow!("phase-2 semantic stall did not abort"))?;
+        assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
+        assert_eq!(abort["exit_code"], serde_json::json!(70));
+        Ok(())
+    }
+
     /// A legitimately slow but *active* rebuild (#294) must never be
     /// aborted outside phase 2, even when `current == total` and the stall
     /// threshold has elapsed: as long as the pipeline reports in-flight
@@ -85619,7 +85778,8 @@ fn run_index_with_data(
         let mut last_update = std::time::Instant::now();
         let mut stall_watchdog =
             IndexStallWatchdog::aborting_phase_two(data_dir.clone(), progress_interval)
-                .watch_aware(watch);
+                .watch_aware(watch)
+                .semantic_aware(semantic);
 
         loop {
             // Check if indexer finished
@@ -85732,7 +85892,8 @@ fn run_index_with_data(
         let mut last_scan_current = 0;
         let mut stall_watchdog =
             IndexStallWatchdog::aborting_phase_two(data_dir.clone(), progress_interval)
-                .watch_aware(watch);
+                .watch_aware(watch)
+                .semantic_aware(semantic);
 
         loop {
             if index_handle.is_finished() {
@@ -85803,7 +85964,8 @@ fn run_index_with_data(
             .unwrap_or_else(std::time::Instant::now);
         let mut stall_watchdog =
             IndexStallWatchdog::aborting_phase_two(data_dir.clone(), progress_interval)
-                .watch_aware(watch);
+                .watch_aware(watch)
+                .semantic_aware(semantic);
 
         // Finish-aware poll cadence: 100ms for snappy shutdown, but only emit a
         // `progress` event at `progress_interval`.
@@ -85855,7 +86017,8 @@ fn run_index_with_data(
         // just wait for completion.
         let mut stall_watchdog =
             IndexStallWatchdog::aborting_phase_two(data_dir.clone(), progress_interval)
-                .watch_aware(watch);
+                .watch_aware(watch)
+                .semantic_aware(semantic);
         while !index_handle.is_finished() {
             if let Some(payload) =
                 stall_watchdog.observe(&index_progress, start.elapsed().as_millis())
@@ -86776,12 +86939,15 @@ fn detect_resume_agent(path: &Path, agent_override: Option<&str>) -> CliResult<D
             // Oh My Pi: user explicitly selected the `omp` binary.
             "omp" | "oh-my-pi" | "ohmypi" | "oh_my_pi" => ("pi_agent", Some("omp")),
             "gemini" => ("gemini", None),
+            // Antigravity resumes via `agy --conversation <uuid>`; `agy` is
+            // the binary name, so accept it as an alias for the slug.
+            "antigravity" | "agy" => ("antigravity", None),
             other => {
                 return Err(CliError {
                     code: 2,
                     kind: CliErrorKind::InvalidAgent.kind_str(),
                     message: format!(
-                        "unknown --agent value '{other}'; expected one of: claude, codex, opencode, pi_agent, pi, omp, gemini"
+                        "unknown --agent value '{other}'; expected one of: claude, codex, opencode, pi_agent, pi, omp, gemini, antigravity"
                     ),
                     hint: None,
                     retryable: false,
@@ -86849,6 +87015,20 @@ fn detect_resume_agent(path: &Path, agent_override: Option<&str>) -> CliResult<D
             reason: "path contains .pi/agent".to_string(),
         });
     }
+    // Antigravity (`agy`) stores its transcripts under
+    // `~/.gemini/antigravity-cli/brain/<uuid>/.system_generated/logs/transcript.jsonl`.
+    // That path ALSO contains `.gemini/`, so it must be matched BEFORE the
+    // gemini arm below or an antigravity session would be misrouted to the
+    // Gemini harness. (probe.rs / fleet_archive_coverage.rs enforce the same
+    // antigravity-before-gemini ordering.)
+    if path_str.contains("antigravity-cli") || path_str.contains(".system_generated") {
+        return Ok(DetectedAgent {
+            slug: "antigravity",
+            binary_hint: None,
+            is_override: false,
+            reason: "path contains antigravity-cli storage".to_string(),
+        });
+    }
     if path_str.contains(".gemini/") || path_str.contains("/gemini/sessions") {
         return Ok(DetectedAgent {
             slug: "gemini",
@@ -86866,7 +87046,8 @@ fn detect_resume_agent(path: &Path, agent_override: Option<&str>) -> CliResult<D
             path.display()
         ),
         hint: Some(
-            "Pass --agent <name> to override (claude, codex, opencode, pi, omp, gemini).".into(),
+            "Pass --agent <name> to override (claude, codex, opencode, pi, omp, gemini, antigravity)."
+                .into(),
         ),
         retryable: false,
     })
@@ -87107,6 +87288,62 @@ fn extract_opencode_session_id(path: &Path, strict: bool) -> CliResult<String> {
     Ok(decoded)
 }
 
+/// Extract the Antigravity conversation UUID from a transcript source path.
+///
+/// Antigravity records each conversation under
+/// `<...>/antigravity-cli/brain/<uuid>/.system_generated/logs/transcript.jsonl`
+/// (a `transcript_full.jsonl` sibling may also appear). The `<uuid>` — the same
+/// id `agy --conversation <uuid>` resumes by, and the connector's normalized
+/// `external_id` — is the name of the directory that contains
+/// `.system_generated`. We locate that segment structurally rather than by a
+/// fixed depth so extraction still works when a remote mirror adds leading path
+/// components, and fall back to the component immediately after a `brain`
+/// segment when the path points straight at the conversation directory.
+fn extract_antigravity_conversation_id(path: &Path) -> CliResult<String> {
+    // Primary: the directory whose immediate child is `.system_generated`.
+    let mut cursor = path;
+    while let Some(parent) = cursor.parent() {
+        if parent.file_name().is_some_and(|n| n == ".system_generated")
+            && let Some(uuid) = parent
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|n| n.to_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        {
+            return Ok(uuid.to_string());
+        }
+        cursor = parent;
+    }
+    // Fallback: the path component right after a `brain` segment is the <uuid>
+    // (covers a path that already points at `brain/<uuid>` or below).
+    let names: Vec<&str> = path
+        .components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .collect();
+    if let Some(pos) = names.iter().position(|n| *n == "brain")
+        && let Some(uuid) = names
+            .get(pos + 1)
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+    {
+        return Ok(uuid.to_string());
+    }
+    Err(CliError {
+        code: 5,
+        kind: CliErrorKind::SessionIdNotFound.kind_str(),
+        message: format!(
+            "cannot derive Antigravity conversation id from '{}'",
+            path.display()
+        ),
+        hint: Some(
+            "Expected an Antigravity transcript path like '<...>/antigravity-cli/brain/<uuid>/.system_generated/logs/transcript.jsonl'."
+                .into(),
+        ),
+        retryable: false,
+    })
+}
+
 /// Build the ready-to-run resume target for a session path. Does not
 /// touch the filesystem unless the agent requires file-based id
 /// extraction (pi-agent).
@@ -87197,9 +87434,15 @@ fn resolve_resume_target(path: &Path, agent_override: Option<&str>) -> CliResult
             // Strict mode only when we auto-detected. An explicit
             // `--agent opencode` bypasses the parent-directory check.
             let id = extract_opencode_session_id(path, !is_override)?;
+            // Current OpenCode (1.16.x) continues a session via the
+            // top-level `--session <id>` flag (`-s` for short); the old
+            // `opencode resume <id>` subcommand was removed and is no
+            // longer discoverable via `--help` (cass#316). Emit the
+            // documented flag form so the generated command actually
+            // resumes on a current OpenCode install.
             Ok(ResumeTarget {
                 agent: "opencode",
-                argv: vec!["opencode".into(), "resume".into(), id.clone()],
+                argv: vec!["opencode".into(), "--session".into(), id.clone()],
                 session_id: Some(id),
                 detection_reason,
             })
@@ -87239,6 +87482,22 @@ fn resolve_resume_target(path: &Path, agent_override: Option<&str>) -> CliResult
                     path_str,
                 ],
                 session_id: None,
+                detection_reason,
+            })
+        }
+        "antigravity" => {
+            // Antigravity resumes by conversation UUID: `agy --conversation
+            // <uuid>` (verified against agy 1.0.x `--help`: "--conversation
+            // Resume a previous conversation by ID"). The UUID is the
+            // `brain/<uuid>` directory name, recoverable from the transcript
+            // source path cass stores — the same id the connector keys both
+            // `conversations/<uuid>.db` and `brain/<uuid>/` by, and the
+            // normalized `external_id` (cass#314).
+            let uuid = extract_antigravity_conversation_id(path)?;
+            Ok(ResumeTarget {
+                agent: "antigravity",
+                argv: vec!["agy".into(), "--conversation".into(), uuid.clone()],
+                session_id: Some(uuid),
                 detection_reason,
             })
         }
@@ -96102,7 +96361,9 @@ fn print_fleet_upgrade_rehearsal_human(output: &FleetUpgradeRehearsalOutput) {
             "  - {} [{}] {}",
             host.host_alias,
             host.disposition.as_str(),
-            host.observed_version.as_deref().unwrap_or("version-unknown"),
+            host.observed_version
+                .as_deref()
+                .unwrap_or("version-unknown"),
         );
         for cmd in &host.safe_next_commands {
             println!("      next: {cmd}");
