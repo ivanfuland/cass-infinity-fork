@@ -8774,6 +8774,56 @@ fn count_total_messages_exact(storage: &FrankenStorage) -> Result<usize> {
     Ok(usize::try_from(total_messages.max(0)).unwrap_or(usize::MAX))
 }
 
+/// Count the tantivy docs a *healthy* live lexical index should hold for the
+/// current canonical data: one per reachable (live-conversation) message that
+/// the authoritative rebuild sink does NOT drop as hard-noise.
+///
+/// The lexical sink (`prebuilt_docs`) emits no doc for a hard-noise message —
+/// empty content or a tool-ack (`is_hard_message_noise`) — so the true expected
+/// doc count is `reachable_messages - hard_noise`, never the raw
+/// `COUNT(*) FROM messages`. cass#317: comparing the observed doc count against
+/// the raw message count made any corpus carrying tool-ack traffic look
+/// permanently sparse, firing a full authoritative rebuild on every index/watch
+/// run (the run then preserves `last_scan_ts`, so the same rebuild repeats).
+///
+/// Exactness comes from reusing the sink's own inputs rather than a SQL
+/// approximation that could drift from Rust trim semantics:
+///   - iterate live conversations only, via `fetch_messages_for_lexical_rebuild`
+///     — orphaned `messages` rows (no live conversation) are never indexed by
+///     the sink, so they must not inflate the expectation;
+///   - that fetch already applies the #290 per-conversation content cap
+///     (`truncate_lexical_rebuild_conversation_content`), so a conversation whose
+///     trailing body is cleared to empty is classified as hard-noise exactly as
+///     the sink drops it;
+///   - classify with the same `is_hard_message_noise(lexical_rebuild_noise_role(
+///     is_tool_role), content)` predicate and precise tool-role mapping the sink
+///     uses.
+///
+/// Content is read one conversation at a time, so peak memory is bounded to a
+/// single conversation regardless of corpus size. Only called on the
+/// sparse-looking branch (observed already below the cheap raw upper bound), so
+/// the extra scan is paid lazily.
+fn expected_live_lexical_doc_count(storage: &FrankenStorage) -> Result<usize> {
+    let conversation_ids: Vec<i64> = storage
+        .raw()
+        .query_map_collect(
+            "SELECT id FROM conversations",
+            &[] as &[ParamValue],
+            |row: &frankensqlite::Row| row.get_typed::<i64>(0),
+        )
+        .context("listing conversations for the noise-adjusted lexical doc expectation")?;
+    let mut expected_docs = 0usize;
+    for conversation_id in conversation_ids {
+        for message in storage.fetch_messages_for_lexical_rebuild(conversation_id)? {
+            let is_tool_role = matches!(message.role, crate::model::types::MessageRole::Tool);
+            if !is_hard_message_noise(lexical_rebuild_noise_role(is_tool_role), &message.content) {
+                expected_docs += 1;
+            }
+        }
+    }
+    Ok(expected_docs)
+}
+
 fn max_conversation_id_exact(storage: &FrankenStorage) -> Result<Option<i64>> {
     let max_conversation_id: i64 = storage
         .raw()
@@ -8801,6 +8851,18 @@ struct IncrementalCanonicalLexicalRepairContext {
     targeted_watch_once_only: bool,
     salvage_messages_imported: usize,
     canonical_messages: usize,
+    /// Noise-adjusted expected live tantivy doc count: the number of docs a
+    /// healthy live index holds for this canonical data. The lexical rebuild
+    /// sink emits NO doc for a hard-noise message (empty content / tool-ack —
+    /// `is_hard_message_noise`), so a healthy index has fewer docs than
+    /// `COUNT(*) FROM messages`. Comparing the observed doc count against the raw
+    /// `canonical_messages` made any corpus with tool-ack traffic look
+    /// permanently sparse and triggered a full authoritative rebuild on every
+    /// index/watch run (cass#317). This is the correct sparseness threshold; it
+    /// equals `canonical_messages` only when no reachable message is hard-noise
+    /// (and when it was not separately computed because the raw count already
+    /// looked covered). Always `<= canonical_messages`.
+    expected_lexical_docs: usize,
     tantivy_requires_rebuild: bool,
     observed_tantivy_docs: Option<usize>,
     /// True when a completed lexical-rebuild checkpoint records this exact
@@ -8858,12 +8920,18 @@ fn choose_incremental_canonical_lexical_repair_plan(
     }
 
     let observed_tantivy_docs = context.observed_tantivy_docs?;
-    if observed_tantivy_docs < context.canonical_messages {
+    // cass#317: compare against the noise-adjusted expected doc count, not the
+    // raw `canonical_messages`. The sink drops hard-noise messages (empty /
+    // tool-acks), so a healthy live index holds `expected_lexical_docs` docs
+    // (<= canonical_messages). Using the raw message count made any corpus with
+    // tool-ack traffic look permanently sparse and rebuilt every run.
+    if observed_tantivy_docs < context.expected_lexical_docs {
         if context.published_index_validated_for_current_data {
             tracing::warn!(
                 canonical_messages = context.canonical_messages,
+                expected_lexical_docs = context.expected_lexical_docs,
                 observed_tantivy_docs,
-                "completed lexical checkpoint matches the canonical DB, but the live lexical index is sparse; repairing derived search assets from SQLite"
+                "completed lexical checkpoint matches the canonical DB, but the live lexical index is sparse below the noise-adjusted expectation; repairing derived search assets from SQLite"
             );
         }
         return Some(IncrementalCanonicalLexicalRepairPlan {
@@ -13806,6 +13874,10 @@ pub fn run_index(
             targeted_watch_once_only,
             salvage_messages_imported: historical_salvage.messages_imported,
             canonical_messages: 0,
+            // Placeholder: the noise-adjusted expectation is a per-conversation
+            // content scan, computed lazily below only when the live index looks
+            // sparse against the cheap raw message-count upper bound (cass#317).
+            expected_lexical_docs: 0,
             tantivy_requires_rebuild,
             observed_tantivy_docs,
             // Placeholder: validating the published index opens the DB read-only
@@ -13831,16 +13903,31 @@ pub fn run_index(
         {
             preflight_phase!("watch_startup:count_total_messages");
             let canonical_messages = count_total_messages_exact(&storage)?;
+            // cass#317: the true sparseness threshold is the noise-adjusted
+            // expected doc count (reachable messages the sink actually indexes),
+            // not the raw `canonical_messages`. Only pay for that per-conversation
+            // content scan when the index looks sparse against the cheap raw upper
+            // bound — if `observed >= canonical_messages` it certainly covers the
+            // smaller noise-adjusted expectation, so no repair and no scan needed.
+            // Computed under the same `count_total_messages` preflight phase so
+            // the scan stays watchdog-covered without a new taxonomy sub-phase.
+            let expected_lexical_docs =
+                if observed_tantivy_docs.is_some_and(|docs| docs < canonical_messages) {
+                    expected_live_lexical_doc_count(&storage)?
+                } else {
+                    canonical_messages
+                };
             complete_preflight_phase!();
             // #248 (coding_agent_session_search-raoug): only pay for the
             // published-index validation (a read-only DB open + fingerprint COUNT
-            // scans) when the live index actually looks sparse — i.e. when it would
-            // otherwise trigger a from-scratch rebuild. A genuinely missing/invalid
-            // index rebuilds regardless (handled in
+            // scans) when the live index actually looks sparse — i.e. below the
+            // noise-adjusted expectation, when it would otherwise trigger a
+            // from-scratch rebuild. A genuinely missing/invalid index rebuilds
+            // regardless (handled in
             // choose_incremental_canonical_lexical_repair_plan via
             // tantivy_requires_rebuild), so skip the check then.
             let published_index_validated_for_current_data = !tantivy_requires_rebuild
-                && observed_tantivy_docs.is_some_and(|docs| docs < canonical_messages)
+                && observed_tantivy_docs.is_some_and(|docs| docs < expected_lexical_docs)
                 && !preflight_skip("watch_startup:published_index_validate")
                 && {
                     preflight_phase!("watch_startup:published_index_validate");
@@ -13854,6 +13941,7 @@ pub fn run_index(
             choose_incremental_canonical_lexical_repair_plan(
                 IncrementalCanonicalLexicalRepairContext {
                     canonical_messages,
+                    expected_lexical_docs,
                     published_index_validated_for_current_data,
                     ..repair_context
                 },
@@ -27095,6 +27183,7 @@ pub mod persist {
                 targeted_watch_once_only: false,
                 salvage_messages_imported: 0,
                 canonical_messages: 0,
+                expected_lexical_docs: 0,
                 tantivy_requires_rebuild: true,
                 observed_tantivy_docs: None,
                 published_index_validated_for_current_data: false,
@@ -27155,6 +27244,7 @@ pub mod persist {
                         targeted_watch_once_only: false,
                         salvage_messages_imported: 0,
                         canonical_messages: 42,
+                        expected_lexical_docs: 42,
                         tantivy_requires_rebuild: true,
                         observed_tantivy_docs: None,
                         published_index_validated_for_current_data: false,
@@ -27179,6 +27269,7 @@ pub mod persist {
                         targeted_watch_once_only: false,
                         salvage_messages_imported: 0,
                         canonical_messages: 42,
+                        expected_lexical_docs: 42,
                         tantivy_requires_rebuild: false,
                         observed_tantivy_docs: Some(3),
                         published_index_validated_for_current_data: false,
@@ -27246,12 +27337,72 @@ pub mod persist {
                         targeted_watch_once_only: false,
                         salvage_messages_imported: 0,
                         canonical_messages: 42,
+                        expected_lexical_docs: 42,
                         tantivy_requires_rebuild: false,
                         observed_tantivy_docs: Some(42),
                         published_index_validated_for_current_data: false,
                     },
                 ),
                 None
+            );
+        }
+
+        #[test]
+        fn incremental_canonical_lexical_repair_plan_healthy_when_gap_is_only_hard_noise() {
+            // cass#317: the lexical sink drops hard-noise messages (empty /
+            // tool-acks), so a perfectly healthy live index has
+            // `expected_lexical_docs` docs (< raw `canonical_messages`). The
+            // observed doc count matching that noise-adjusted expectation must
+            // NOT be treated as sparse — otherwise a corpus with any tool-ack
+            // traffic rebuilds authoritatively on every index/watch run.
+            assert_eq!(
+                crate::indexer::choose_incremental_canonical_lexical_repair_plan(
+                    crate::indexer::IncrementalCanonicalLexicalRepairContext {
+                        full_refresh: false,
+                        force_rebuild: false,
+                        resume_lexical_rebuild: false,
+                        targeted_watch_once_only: false,
+                        salvage_messages_imported: 0,
+                        // 100 messages, 37 of them hard-noise → 63 expected docs.
+                        canonical_messages: 100,
+                        expected_lexical_docs: 63,
+                        tantivy_requires_rebuild: false,
+                        // The live index holds exactly the non-noise docs.
+                        observed_tantivy_docs: Some(63),
+                        published_index_validated_for_current_data: false,
+                    },
+                ),
+                None,
+                "a doc count equal to the noise-adjusted expectation is healthy, not sparse (#317)"
+            );
+        }
+
+        #[test]
+        fn incremental_canonical_lexical_repair_plan_repairs_real_loss_below_noise_expectation() {
+            // A genuine loss — observed BELOW the noise-adjusted expectation —
+            // must still repair. Subtracting hard-noise must not mask real doc
+            // loss: 63 expected, only 40 observed → repair.
+            assert_eq!(
+                crate::indexer::choose_incremental_canonical_lexical_repair_plan(
+                    crate::indexer::IncrementalCanonicalLexicalRepairContext {
+                        full_refresh: false,
+                        force_rebuild: false,
+                        resume_lexical_rebuild: false,
+                        targeted_watch_once_only: false,
+                        salvage_messages_imported: 0,
+                        canonical_messages: 100,
+                        expected_lexical_docs: 63,
+                        tantivy_requires_rebuild: false,
+                        observed_tantivy_docs: Some(40),
+                        published_index_validated_for_current_data: false,
+                    },
+                ),
+                Some(crate::indexer::IncrementalCanonicalLexicalRepairPlan {
+                    canonical_messages: 100,
+                    observed_tantivy_docs: Some(40),
+                    reason: "incremental_index_repairs_sparse_tantivy_from_authoritative_canonical_db_before_scan",
+                }),
+                "loss below the noise-adjusted expectation must still repair (#317)"
             );
         }
 
@@ -27267,6 +27418,7 @@ pub mod persist {
                         targeted_watch_once_only: false,
                         salvage_messages_imported: 0,
                         canonical_messages: 42,
+                        expected_lexical_docs: 42,
                         tantivy_requires_rebuild: false,
                         observed_tantivy_docs: Some(3),
                         published_index_validated_for_current_data: true,
@@ -27291,6 +27443,7 @@ pub mod persist {
                         targeted_watch_once_only: false,
                         salvage_messages_imported: 0,
                         canonical_messages: 42,
+                        expected_lexical_docs: 42,
                         tantivy_requires_rebuild: true,
                         observed_tantivy_docs: None,
                         published_index_validated_for_current_data: true,
