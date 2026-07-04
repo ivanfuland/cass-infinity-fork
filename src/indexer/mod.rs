@@ -15072,7 +15072,13 @@ fn close_storage_after_index(storage: FrankenStorage, db_path: &Path, context: &
             db_path.display()
         )
     })?;
-    run_final_wal_checkpoint(db_path, context)
+    // The storage handle is already closed here, so the checkpoint should not be
+    // blocked; a `Blocked` outcome (e.g. another cass process holds a reader) is
+    // already surfaced via the WARN inside `query_final_wal_checkpoint`. Preserve
+    // the historically-lenient contract of this normal-close path (Ok even if the
+    // checkpoint could not fully truncate) — the abort path (#321) is the one that
+    // must branch on the outcome.
+    run_final_wal_checkpoint(db_path, context).map(|_outcome| ())
 }
 
 fn prepare_storage_for_final_checkpoint(storage: &FrankenStorage, db_path: &Path, context: &str) {
@@ -15089,6 +15095,53 @@ fn prepare_storage_for_final_checkpoint(storage: &FrankenStorage, db_path: &Path
     }
 }
 
+/// Result of a `PRAGMA wal_checkpoint(TRUNCATE)` issued during index finalize
+/// or the bounded stall-abort path.
+///
+/// The distinction is load-bearing for #321: a checkpoint that SQLite reports
+/// as `busy=1` (or that backfilled fewer frames than the WAL held) did **not**
+/// truncate the WAL, so the canonical DB is still a replay dependency on a
+/// large `*.db-wal` and stock `PRAGMA integrity_check` will fail. Callers must
+/// not report such a checkpoint as success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinalWalCheckpointOutcome {
+    /// The WAL was fully checkpointed and truncated (`busy == 0` and every
+    /// logged frame was backfilled).
+    Completed,
+    /// The checkpoint was blocked by active readers/writers (`busy != 0`) or
+    /// left un-backfilled frames. The canonical WAL was NOT truncated.
+    Blocked {
+        busy: i64,
+        log_frames: i64,
+        checkpointed_frames: i64,
+    },
+}
+
+/// Classify a `wal_checkpoint` status row `(busy, log_frames, checkpointed)`.
+///
+/// A checkpoint only counts as [`FinalWalCheckpointOutcome::Completed`] when
+/// SQLite reports `busy == 0` AND every frame in the WAL log was backfilled
+/// (`checkpointed_frames >= log_frames`). Anything else — the #321 case of
+/// `busy=1, log_frames=289842, checkpointed_frames=0` being the canonical
+/// example — is [`FinalWalCheckpointOutcome::Blocked`] and must never be logged
+/// or reported as a successful checkpoint.
+fn classify_final_wal_checkpoint(
+    busy: i64,
+    log_frames: i64,
+    checkpointed_frames: i64,
+) -> FinalWalCheckpointOutcome {
+    let left_frames_uncheckpointed = log_frames > 0 && checkpointed_frames < log_frames;
+    if busy > 0 || left_frames_uncheckpointed {
+        FinalWalCheckpointOutcome::Blocked {
+            busy,
+            log_frames,
+            checkpointed_frames,
+        }
+    } else {
+        FinalWalCheckpointOutcome::Completed
+    }
+}
+
 /// Best-effort canonical-WAL checkpoint before a bounded abort/exit (#296).
 ///
 /// The `cass index` stall-abort path exits via `std::process::exit(70)`, which
@@ -15102,16 +15155,40 @@ fn prepare_storage_for_final_checkpoint(storage: &FrankenStorage, db_path: &Path
 /// the abort still proceeds. Stale index-run locks are already reaped on the
 /// next startup by `read_search_maintenance_snapshot` (flock-based), so this
 /// focuses on the WAL.
+///
+/// #321: the abort races the still-running `run_index` thread, which holds the
+/// canonical storage handle open while it performs its own slow finalize
+/// checkpoint of the (deferred, multi-GB) WAL. That open handle makes this
+/// fresh-connection checkpoint report `busy=1 / checkpointed_frames=0` — a
+/// no-op. We must NOT log success in that case: the WAL is left un-truncated
+/// and stock SQLite integrity checks fail. Report the truth instead so the
+/// operator (and the next startup's recovery) know the WAL is still stranded.
 pub fn best_effort_abort_wal_checkpoint(data_dir: &Path) {
     let db_path = data_dir.join("agent_search.db");
     if !db_path.exists() {
         return;
     }
     match run_final_wal_checkpoint(&db_path, "stall abort") {
-        Ok(()) => {
+        Ok(FinalWalCheckpointOutcome::Completed) => {
             tracing::info!(
                 db_path = %db_path.display(),
                 "checkpointed canonical WAL before stall abort (#296)"
+            );
+        }
+        Ok(FinalWalCheckpointOutcome::Blocked {
+            busy,
+            log_frames,
+            checkpointed_frames,
+        }) => {
+            tracing::warn!(
+                db_path = %db_path.display(),
+                busy,
+                log_frames,
+                checkpointed_frames,
+                "WAL checkpoint before stall abort was blocked (busy or frames left \
+                 un-truncated); the canonical DB is left depending on an un-checkpointed \
+                 WAL and stock SQLite integrity checks will fail until the next clean run \
+                 checkpoints it (#296/#321)"
             );
         }
         Err(err) => {
@@ -15124,7 +15201,7 @@ pub fn best_effort_abort_wal_checkpoint(data_dir: &Path) {
     }
 }
 
-fn run_final_wal_checkpoint(db_path: &Path, context: &str) -> Result<()> {
+fn run_final_wal_checkpoint(db_path: &Path, context: &str) -> Result<FinalWalCheckpointOutcome> {
     // Run this after closing the indexing storage handle: frankensqlite flushes
     // retained autocommit writes during close, and TRUNCATE avoids leaving the
     // completed bulk-ingest WAL for the next opener to replay.
@@ -15143,16 +15220,16 @@ fn run_final_wal_checkpoint(db_path: &Path, context: &str) -> Result<()> {
             db_path.display()
         )
     });
-    checkpoint_result?;
+    let outcome = checkpoint_result?;
     close_result?;
-    Ok(())
+    Ok(outcome)
 }
 
 fn query_final_wal_checkpoint(
     conn: &frankensqlite::Connection,
     db_path: &Path,
     context: &str,
-) -> Result<()> {
+) -> Result<FinalWalCheckpointOutcome> {
     let rows = conn
         .query("PRAGMA wal_checkpoint(TRUNCATE);")
         .with_context(|| {
@@ -15177,28 +15254,32 @@ fn query_final_wal_checkpoint(
         .get_typed(2)
         .with_context(|| "reading final WAL checkpoint backfilled frame count")?;
 
+    let outcome = classify_final_wal_checkpoint(busy, log_frames, checkpointed_frames);
     if log_frames >= 0 {
-        if busy > 0 {
-            tracing::warn!(
-                db_path = %db_path.display(),
-                context,
-                busy,
-                log_frames,
-                checkpointed_frames,
-                "final WAL checkpoint was blocked by active readers"
-            );
-        } else {
-            tracing::info!(
-                db_path = %db_path.display(),
-                context,
-                log_frames,
-                checkpointed_frames,
-                "final WAL checkpoint completed after index run"
-            );
+        match outcome {
+            FinalWalCheckpointOutcome::Blocked { .. } => {
+                tracing::warn!(
+                    db_path = %db_path.display(),
+                    context,
+                    busy,
+                    log_frames,
+                    checkpointed_frames,
+                    "final WAL checkpoint was blocked by active readers or left frames un-truncated"
+                );
+            }
+            FinalWalCheckpointOutcome::Completed => {
+                tracing::info!(
+                    db_path = %db_path.display(),
+                    context,
+                    log_frames,
+                    checkpointed_frames,
+                    "final WAL checkpoint completed after index run"
+                );
+            }
         }
     }
 
-    Ok(())
+    Ok(outcome)
 }
 
 fn restore_watch_steady_state_checkpoint_policy(storage: &FrankenStorage, watch_enabled: bool) {
@@ -38395,6 +38476,53 @@ mod tests {
         let _ = conn.query("PRAGMA quick_check;");
         conn.close().ok();
         Ok(())
+    }
+
+    /// #321: a `wal_checkpoint(TRUNCATE)` that SQLite reports as blocked
+    /// (`busy != 0`) or that leaves frames un-backfilled did NOT truncate the
+    /// WAL, so it must never be classified as a completed checkpoint. The
+    /// canonical reproducer from the field is `busy=1, log_frames=289842,
+    /// checkpointed_frames=0` — the abort path used to log
+    /// "checkpointed canonical WAL before stall abort (#296)" success on
+    /// exactly that no-op, masking a 1.1 GB stranded WAL and a malformed DB.
+    #[test]
+    fn final_wal_checkpoint_blocked_status_is_not_completed() {
+        // The exact field reproducer: blocked by an active reader, nothing moved.
+        assert_eq!(
+            classify_final_wal_checkpoint(1, 289_842, 0),
+            FinalWalCheckpointOutcome::Blocked {
+                busy: 1,
+                log_frames: 289_842,
+                checkpointed_frames: 0,
+            },
+            "busy=1 checkpoint must classify as Blocked, never Completed"
+        );
+
+        // A clean TRUNCATE: not busy, every logged frame backfilled.
+        assert_eq!(
+            classify_final_wal_checkpoint(0, 128, 128),
+            FinalWalCheckpointOutcome::Completed,
+            "busy=0 with all frames backfilled is the only Completed case"
+        );
+
+        // Not busy, but a partial backfill still means the WAL was not fully
+        // truncated -> Blocked (do not report success).
+        assert_eq!(
+            classify_final_wal_checkpoint(0, 128, 40),
+            FinalWalCheckpointOutcome::Blocked {
+                busy: 0,
+                log_frames: 128,
+                checkpointed_frames: 40,
+            },
+            "a partial checkpoint must not be reported as completed"
+        );
+
+        // An empty WAL (nothing to do) is trivially completed.
+        assert_eq!(
+            classify_final_wal_checkpoint(0, 0, 0),
+            FinalWalCheckpointOutcome::Completed,
+            "an already-empty WAL is a completed no-op"
+        );
     }
 
     #[test]
