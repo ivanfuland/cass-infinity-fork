@@ -20936,6 +20936,42 @@ fn ingest_non_watch_oom_retry_or_quarantine(
     }
 
     let conv = &convs[0];
+
+    // #298: mirror the watch-path plausibility gate. frankensqlite raises the
+    // same typed `FrankenError::OutOfMemory` for per-statement bounded
+    // allocation guards, so a NoMem on a small conversation with no real host
+    // memory pressure is not evidence of a poisoned conversation. Defer it
+    // (retried by the next index run) instead of quarantining.
+    let indexed_text_bytes = conversation_indexed_text_bytes(conv);
+    let small_conversation = indexed_text_bytes <= watch_oom_small_conversation_bytes();
+    let real_pressure = watch_oom_under_real_memory_pressure();
+    let should_quarantine = match real_pressure {
+        Some(true) => true,
+        Some(false) | None => !small_conversation,
+    };
+    if !should_quarantine {
+        tracing::warn!(
+            agent = %conv.agent_slug,
+            external_id = conv.external_id.as_deref().unwrap_or(""),
+            source_path = %conv.source_path.display(),
+            indexed_text_bytes,
+            real_memory_pressure = ?real_pressure,
+            error = %error,
+            "single non-watch conversation hit a bounded-allocation NoMem with no real memory pressure; deferring (not quarantining) so the next index run retries it (#298)"
+        );
+        if let Some(progress) = progress {
+            progress.current.fetch_add(1, Ordering::Relaxed);
+        }
+        bump_index_run_lock_progress_if_present(progress_bump);
+        return Ok(NonWatchIngestOutcome {
+            canonical_mutations: CanonicalMutationCounts::default(),
+            quarantined_conversations: 0,
+            lexical_update_deferred: true,
+            scanned_connectors: BTreeSet::new(),
+            scan_had_errors: false,
+        });
+    }
+
     record_index_poison_conversation(data_dir, conv, &error)?;
     if let Some(progress) = progress {
         progress.current.fetch_add(1, Ordering::Relaxed);
@@ -20945,6 +20981,8 @@ fn ingest_non_watch_oom_retry_or_quarantine(
         agent = %conv.agent_slug,
         external_id = conv.external_id.as_deref().unwrap_or(""),
         source_path = %conv.source_path.display(),
+        indexed_text_bytes,
+        real_memory_pressure = ?real_pressure,
         error = %error,
         "single non-watch conversation ran out of memory after deferred lexical retry; quarantined and continuing index refresh"
     );
@@ -21049,6 +21087,20 @@ impl WatchIngestBatchOutcome {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// How a watch ingest call should treat a single-conversation OOM (#298).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchOomIngestMode {
+    /// Normal batch ingest: the typed-OOM test injection may fire, and a
+    /// single-conversation OOM goes through the solo isolate-retry plus the
+    /// pressure/size gate before any quarantine decision.
+    Standard,
+    /// Solo isolate-retry re-entry: test injection is disabled and a
+    /// single-conversation OOM propagates as `Err` so the Standard-mode
+    /// caller's gate — not this re-entry — decides between deferring and
+    /// quarantining (and its logs stay truthful about what happened).
+    SoloIsolatedRetry,
+}
+
 fn ingest_watch_batch_with_oom_split(
     storage: &FrankenStorage,
     t_index: &mut TantivyIndex,
@@ -21066,12 +21118,7 @@ fn ingest_watch_batch_with_oom_split(
         progress,
         defer_checkpoints,
         capture_semantic_delta,
-        // Top-level batch ingest: the typed-OOM test injection is allowed to
-        // fire so batch-path tests exercise the downcast classification. The
-        // solo isolate-retry (#298) re-enters with this set to `false` so that
-        // a conversation which "fails in batch but succeeds solo" is modeled
-        // faithfully and is NOT quarantined.
-        true,
+        WatchOomIngestMode::Standard,
     )
 }
 
@@ -21084,11 +21131,13 @@ fn ingest_watch_batch_with_oom_split_inner(
     progress: &Option<Arc<IndexingProgress>>,
     defer_checkpoints: bool,
     capture_semantic_delta: bool,
-    allow_test_oom_injection: bool,
+    mode: WatchOomIngestMode,
 ) -> Result<WatchIngestBatchOutcome> {
     debug_assert!(!convs.is_empty());
 
-    let batch_result = if allow_test_oom_injection && should_inject_watch_ingest_test_oom(convs) {
+    let batch_result = if mode == WatchOomIngestMode::Standard
+        && should_inject_watch_ingest_test_oom(convs)
+    {
         // Use the typed `FrankenError::OutOfMemory` variant so the OOM detector
         // exercises the downcast path that real frankensqlite OOMs hit, instead
         // of relying on the plain-string fallback.
@@ -21131,7 +21180,7 @@ fn ingest_watch_batch_with_oom_split_inner(
                 progress,
                 defer_checkpoints,
                 capture_semantic_delta,
-                allow_test_oom_injection,
+                mode,
             )?;
             let right = ingest_watch_batch_with_oom_split_inner(
                 storage,
@@ -21141,12 +21190,20 @@ fn ingest_watch_batch_with_oom_split_inner(
                 progress,
                 defer_checkpoints,
                 capture_semantic_delta,
-                allow_test_oom_injection,
+                mode,
             )?;
             merged.merge(right);
             Ok(merged)
         }
         Err(error) if error_is_out_of_memory(&error) => {
+            // Solo isolate-retry re-entry: propagate the OOM so the
+            // Standard-mode caller's pressure/size gate decides between
+            // deferring and quarantining. Quarantining here would bypass that
+            // gate and make the caller's "ingested cleanly solo" log lie.
+            if mode == WatchOomIngestMode::SoloIsolatedRetry {
+                return Err(error);
+            }
+
             let conv = &convs[0];
 
             // #298: a typed `FrankenError::OutOfMemory` (NoMem) on the batch
@@ -21157,111 +21214,99 @@ fn ingest_watch_batch_with_oom_split_inner(
             // confirmed succeeds) and only quarantine on a genuine, repeated
             // failure under real memory pressure or for a genuinely large
             // conversation.
-            if allow_test_oom_injection {
-                let indexed_text_bytes = conversation_indexed_text_bytes(conv);
-                let small_conversation = indexed_text_bytes <= watch_oom_small_conversation_bytes();
-                let real_pressure = watch_oom_under_real_memory_pressure();
+            let indexed_text_bytes = conversation_indexed_text_bytes(conv);
+            let small_conversation = indexed_text_bytes <= watch_oom_small_conversation_bytes();
+            let real_pressure = watch_oom_under_real_memory_pressure();
 
-                // Isolate-retry the single conversation solo. We disable the
-                // typed-OOM test injection on this retry so a "fails in batch,
-                // succeeds solo" conversation is reproduced faithfully. Tests
-                // that need to model a *genuinely* poisoned conversation (solo
-                // ingest also OOMs) set `CASS_TEST_WATCH_SOLO_RETRY_OOM=1`.
-                let solo_retry = if should_force_watch_solo_retry_oom() {
-                    Err(anyhow::Error::new(frankensqlite::FrankenError::OutOfMemory))
-                } else {
-                    ingest_watch_batch_with_oom_split_inner(
-                        storage,
-                        t_index,
-                        data_dir,
-                        std::slice::from_ref(conv),
-                        progress,
-                        defer_checkpoints,
-                        capture_semantic_delta,
-                        false,
-                    )
-                };
+            // Isolate-retry the single conversation solo. The retry runs in
+            // `SoloIsolatedRetry` mode so the typed-OOM test injection cannot
+            // re-fire and a repeated OOM comes back as `Err` for the gate
+            // below. Tests that need to model a *genuinely* poisoned
+            // conversation (solo ingest also OOMs) set
+            // `CASS_TEST_WATCH_SOLO_RETRY_OOM=1`.
+            let solo_retry = if should_force_watch_solo_retry_oom() {
+                Err(anyhow::Error::new(frankensqlite::FrankenError::OutOfMemory))
+            } else {
+                ingest_watch_batch_with_oom_split_inner(
+                    storage,
+                    t_index,
+                    data_dir,
+                    std::slice::from_ref(conv),
+                    progress,
+                    defer_checkpoints,
+                    capture_semantic_delta,
+                    WatchOomIngestMode::SoloIsolatedRetry,
+                )
+            };
 
-                match solo_retry {
-                    Ok(outcome) => {
-                        // Solo ingest succeeded — the batch-path NoMem was a
-                        // bounded-guard false positive. Do not quarantine.
-                        tracing::info!(
+            match solo_retry {
+                Ok(outcome) => {
+                    // Solo ingest succeeded — the batch-path NoMem was a
+                    // bounded-guard false positive. Do not quarantine.
+                    tracing::info!(
+                        agent = %conv.agent_slug,
+                        external_id = conv.external_id.as_deref().unwrap_or(""),
+                        source_path = %conv.source_path.display(),
+                        indexed_text_bytes,
+                        "watch conversation hit a bounded-allocation NoMem in batch but ingested cleanly solo; not quarantining (#298)"
+                    );
+                    Ok(outcome)
+                }
+                Err(solo_error) if !error_is_out_of_memory(&solo_error) => {
+                    // The solo retry surfaced a *different* (non-OOM) error
+                    // — propagate it rather than mislabel it as OOM.
+                    Err(solo_error)
+                }
+                Err(solo_error) => {
+                    // Solo retry still hit OOM. Only quarantine if this is
+                    // real memory pressure or a genuinely large
+                    // conversation; otherwise keep it eligible for a later
+                    // retry instead of poisoning a small, replayable
+                    // conversation on a transient bounded-guard hit.
+                    let should_quarantine = match real_pressure {
+                        // Real host pressure: quarantine is justified.
+                        Some(true) => true,
+                        // Ample memory reported: only quarantine large
+                        // conversations; small ones stay eligible.
+                        Some(false) => !small_conversation,
+                        // Pressure unknowable (e.g. macOS): fall back to the
+                        // size gate — never quarantine a small conversation
+                        // on a typed NoMem we cannot attribute to real
+                        // pressure.
+                        None => !small_conversation,
+                    };
+                    if !should_quarantine {
+                        tracing::warn!(
                             agent = %conv.agent_slug,
                             external_id = conv.external_id.as_deref().unwrap_or(""),
                             source_path = %conv.source_path.display(),
                             indexed_text_bytes,
-                            "watch conversation hit a bounded-allocation NoMem in batch but ingested cleanly solo; not quarantining (#298)"
+                            real_memory_pressure = ?real_pressure,
+                            error = %solo_error,
+                            "watch conversation hit repeated bounded-allocation NoMem with no real memory pressure; deferring (not quarantining) for later retry (#298)"
                         );
-                        return Ok(outcome);
-                    }
-                    Err(solo_error) if !error_is_out_of_memory(&solo_error) => {
-                        // The solo retry surfaced a *different* (non-OOM) error
-                        // — propagate it rather than mislabel it as OOM.
-                        return Err(solo_error);
-                    }
-                    Err(solo_error) => {
-                        // Solo retry still hit OOM. Only quarantine if this is
-                        // real memory pressure or a genuinely large
-                        // conversation; otherwise keep it eligible for a later
-                        // retry instead of poisoning a small, replayable
-                        // conversation on a transient bounded-guard hit.
-                        let should_quarantine = match real_pressure {
-                            // Real host pressure: quarantine is justified.
-                            Some(true) => true,
-                            // Ample memory reported: only quarantine large
-                            // conversations; small ones stay eligible.
-                            Some(false) => !small_conversation,
-                            // Pressure unknowable (e.g. macOS): fall back to the
-                            // size gate — never quarantine a small conversation
-                            // on a typed NoMem we cannot attribute to real
-                            // pressure.
-                            None => !small_conversation,
-                        };
-                        if !should_quarantine {
-                            tracing::warn!(
-                                agent = %conv.agent_slug,
-                                external_id = conv.external_id.as_deref().unwrap_or(""),
-                                source_path = %conv.source_path.display(),
-                                indexed_text_bytes,
-                                real_memory_pressure = ?real_pressure,
-                                error = %solo_error,
-                                "watch conversation hit repeated bounded-allocation NoMem with no real memory pressure; deferring (not quarantining) for later retry (#298)"
-                            );
-                            if let Some(progress) = progress {
-                                progress.current.fetch_add(1, Ordering::Relaxed);
-                            }
-                            return Ok(WatchIngestBatchOutcome {
-                                batch_outcome: persist::PersistBatchOutcome::default(),
-                                processed_conversations: 1,
-                                quarantined_conversations: 0,
-                                max_payload_watermark_ms: None,
-                            });
+                        if let Some(progress) = progress {
+                            progress.current.fetch_add(1, Ordering::Relaxed);
                         }
-                        // Fall through to quarantine with the solo error so the
-                        // record reflects the genuine repeated failure.
-                        return quarantine_single_watch_conversation(
-                            data_dir,
-                            conv,
-                            &solo_error,
-                            progress,
-                            indexed_text_bytes,
-                            real_pressure,
-                        );
+                        return Ok(WatchIngestBatchOutcome {
+                            batch_outcome: persist::PersistBatchOutcome::default(),
+                            processed_conversations: 1,
+                            quarantined_conversations: 0,
+                            max_payload_watermark_ms: None,
+                        });
                     }
+                    // Quarantine with the solo error so the record reflects
+                    // the genuine repeated failure.
+                    quarantine_single_watch_conversation(
+                        data_dir,
+                        conv,
+                        &solo_error,
+                        progress,
+                        indexed_text_bytes,
+                        real_pressure,
+                    )
                 }
             }
-
-            // Test-injection disabled (solo isolate-retry re-entry) or pressure
-            // path: record and quarantine the single conversation directly.
-            quarantine_single_watch_conversation(
-                data_dir,
-                conv,
-                &error,
-                progress,
-                conversation_indexed_text_bytes(conv),
-                watch_oom_under_real_memory_pressure(),
-            )
         }
         Err(error) => Err(error),
     }
@@ -38219,6 +38264,10 @@ mod tests {
     #[serial]
     fn streaming_consumer_quarantines_single_non_watch_oom_and_dedupes_record() {
         let _oom_guard = set_env("CASS_TEST_NON_WATCH_INGEST_OOM_MIN_CONVS", "1");
+        // #298: this test models a *genuinely* poisoned conversation, so the
+        // small-conversation plausibility gate must be disabled — otherwise a
+        // tiny fixture conversation is deferred instead of quarantined.
+        let _small_gate_guard = set_env("CASS_WATCH_OOM_SMALL_CONVERSATION_BYTES", "0");
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -38286,6 +38335,57 @@ mod tests {
             assert_eq!(summary.quarantined_conversations, 1);
             assert_eq!(summary.status, "degraded");
         }
+    }
+
+    /// #298 gate (non-watch): a small conversation that hits a typed NoMem
+    /// with no real host memory pressure is deferred to the next index run —
+    /// never quarantined — because frankensqlite's bounded allocation guards
+    /// raise the same typed error without the host being out of memory.
+    #[test]
+    #[serial]
+    fn streaming_consumer_defers_small_non_watch_oom_without_quarantine() {
+        let _oom_guard = set_env("CASS_TEST_NON_WATCH_INGEST_OOM_MIN_CONVS", "1");
+        // Pin the pressure probe to "never real pressure" so the size gate is
+        // what decides, deterministically, on any host.
+        let _reserve_guard = set_env("CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES", "0");
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let db_path = data_dir.join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
+        let progress = Arc::new(IndexingProgress::default());
+        let conv = norm_conv(Some("defer-single"), vec![norm_msg(0, 1_700_000_000_000)]);
+
+        let (tx, rx) = bounded(STREAMING_CHANNEL_SIZE);
+        send_conversation_batches(&tx, "codex", vec![conv], true);
+        send_done(&tx, "codex", true);
+        drop(tx);
+
+        let (_discovered, outcome) = run_streaming_consumer(
+            rx,
+            1,
+            &storage,
+            &data_dir,
+            Some(&mut index),
+            Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
+            &Some(progress.clone()),
+            LexicalPopulationStrategy::IncrementalInline,
+            Some(FrankenStorage::now_millis()),
+            None,
+        )
+        .expect("small-conversation NoMem without real pressure should defer, not fail");
+
+        assert_eq!(outcome.quarantined_conversations, 0);
+        assert!(outcome.lexical_update_deferred);
+        assert!(
+            !data_dir
+                .join("quarantine/index_ingest_poison.jsonl")
+                .exists(),
+            "a small conversation with no real memory pressure must be deferred, not quarantined (#298)"
+        );
     }
 
     /// #290: a stable, already-triaged backlog of *same-version* irreducible
@@ -46071,6 +46171,87 @@ mod tests {
                 .join("quarantine/watch_ingest_poison.jsonl")
                 .exists(),
             "watch OOM should still be recorded for operator visibility"
+        );
+    }
+
+    /// #298 gate: a small conversation whose solo isolate-retry also OOMs must
+    /// be deferred — not quarantined — when there is no real host memory
+    /// pressure, so a bounded-allocation false positive can never poison a
+    /// small, replayable conversation.
+    #[test]
+    #[serial]
+    fn watch_reindex_defers_small_conversation_when_solo_retry_also_ooms() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("watch-oom-defer-small");
+        let amp_dir = data_dir.join("amp");
+        std::fs::create_dir_all(&amp_dir).unwrap();
+        let now_u128 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let created_at = i64::try_from(now_u128)
+            .unwrap_or(i64::MAX)
+            .saturating_add(10_000);
+        let amp_file = amp_dir.join("thread-watch-oom-defer-small.json");
+        std::fs::write(
+            &amp_file,
+            format!(
+                r#"{{"id":"thread-watch-oom-defer-small","messages":[{{"role":"user","text":"defer me","createdAt":{created_at}}}]}}"#
+            ),
+        )
+        .unwrap();
+
+        let _oom_guard = set_env("CASS_TEST_WATCH_INGEST_OOM_MIN_CONVS", "1");
+        let _solo_oom_guard = set_env("CASS_TEST_WATCH_SOLO_RETRY_OOM", "1");
+        // Pin the pressure probe to "never real pressure" so the size gate is
+        // what decides, deterministically, on any host.
+        let _reserve_guard = set_env("CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES", "0");
+        let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
+        let opts = super::IndexOptions {
+            full: false,
+            watch: true,
+            force_rebuild: false,
+            db_path: data_dir.join("agent_search.db"),
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_once_paths: None,
+            watch_interval_secs: 30,
+        };
+
+        let storage = FrankenStorage::open(&opts.db_path).unwrap();
+        storage.run_migrations().unwrap();
+        let index_path = index_dir(&opts.data_dir).unwrap();
+        let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
+        let state = std::sync::Mutex::new(std::collections::HashMap::new());
+        let storage = std::sync::Mutex::new(storage);
+        let t_index = std::sync::Mutex::new(Some(t_index));
+        let roots = vec![(ConnectorKind::Amp, ScanRoot::local(amp_dir))];
+
+        let indexed = reindex_paths(
+            &opts,
+            vec![amp_file],
+            &roots,
+            &state,
+            &storage,
+            &t_index,
+            &index_path,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(indexed, 1);
+        assert!(
+            load_watch_state(&data_dir).is_empty(),
+            "deferred watch sources must remain eligible for later retry"
+        );
+        assert!(
+            !data_dir
+                .join("quarantine/watch_ingest_poison.jsonl")
+                .exists(),
+            "a small conversation with no real memory pressure must be deferred, not quarantined (#298)"
         );
     }
 

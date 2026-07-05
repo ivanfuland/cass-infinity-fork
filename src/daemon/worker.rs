@@ -5,9 +5,9 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
 
 use tracing::{debug, error, info, warn};
 
@@ -23,6 +23,18 @@ use crate::storage::sqlite::FrankenStorage;
 
 const HASH_EMBEDDER_MODEL: &str = "hash";
 const DEFAULT_SEMANTIC_MODEL: &str = "minilm";
+
+/// How many documents to embed per progress/cancellation checkpoint. Matches
+/// the healthy MiniLM batch size observed in cass#257 telemetry.
+const EMBED_PROGRESS_CHUNK_SIZE: usize = 128;
+
+/// How an embedding pass ended: normally, or via a user cancel (which must be
+/// recorded as cancelled, not failed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmbeddingPassOutcome {
+    Completed,
+    Cancelled,
+}
 
 /// Configuration for a single embedding job.
 #[derive(Debug, Clone)]
@@ -69,6 +81,15 @@ pub enum WorkerMessage {
     Shutdown,
 }
 
+/// The (db_path, model) pass the worker thread is currently embedding, used
+/// by the handle to decide whether a cancel targets the running job or only
+/// needs database-level cleanup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunningEmbeddingPass {
+    db_path: String,
+    model: String,
+}
+
 /// Handle for sending messages to the background worker.
 #[derive(Clone)]
 pub struct EmbeddingWorkerHandle {
@@ -76,6 +97,8 @@ pub struct EmbeddingWorkerHandle {
     /// Shared cancel flag — set directly from the handle so cancellation
     /// takes effect even while `process_job` is running on the worker thread.
     cancel_flag: Arc<AtomicBool>,
+    /// The pass currently running on the worker thread, if any.
+    running_pass: Arc<Mutex<Option<RunningEmbeddingPass>>>,
 }
 
 impl EmbeddingWorkerHandle {
@@ -88,10 +111,25 @@ impl EmbeddingWorkerHandle {
 
     /// Cancel embedding jobs for a db_path.
     ///
-    /// Sets the cancel flag directly (so the running job sees it immediately)
-    /// AND sends a Cancel message for database-level cleanup.
+    /// Sets the cancel flag directly — but only when the worker is currently
+    /// running a pass for that `db_path` (and `model_id`, when given) — so a
+    /// cancel aimed at one data dir can never abort another client's job.
+    /// Always sends a Cancel message for database-level cleanup.
     pub fn cancel(&self, db_path: String, model_id: Option<String>) -> Result<(), String> {
-        self.cancel_flag.store(true, Ordering::SeqCst);
+        let targets_running_job = self
+            .running_pass
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .is_some_and(|running| {
+                running.db_path == db_path
+                    && model_id
+                        .as_deref()
+                        .is_none_or(|model| running.model == model)
+            });
+        if targets_running_job {
+            self.cancel_flag.store(true, Ordering::SeqCst);
+        }
         self.sender
             .send(WorkerMessage::Cancel { db_path, model_id })
             .map_err(|e| format!("worker channel closed: {e}"))
@@ -109,6 +147,7 @@ impl EmbeddingWorkerHandle {
 pub struct EmbeddingWorker {
     receiver: Receiver<WorkerMessage>,
     cancel_flag: Arc<AtomicBool>,
+    running_pass: Arc<Mutex<Option<RunningEmbeddingPass>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,13 +201,16 @@ impl EmbeddingWorker {
     pub fn new() -> (Self, EmbeddingWorkerHandle) {
         let (sender, receiver) = std::sync::mpsc::channel();
         let cancel_flag = Arc::new(AtomicBool::new(false));
+        let running_pass = Arc::new(Mutex::new(None));
         let handle = EmbeddingWorkerHandle {
             sender,
             cancel_flag: Arc::clone(&cancel_flag),
+            running_pass: Arc::clone(&running_pass),
         };
         let worker = Self {
             receiver,
             cancel_flag,
+            running_pass,
         };
         (worker, handle)
     }
@@ -244,17 +286,35 @@ impl EmbeddingWorker {
             let job_id = storage.upsert_embedding_job(&config.db_path, model_name, total_docs)?;
             storage.start_embedding_job(job_id)?;
 
-            match self.generate_embeddings_and_save(
+            if let Ok(mut guard) = self.running_pass.lock() {
+                *guard = Some(RunningEmbeddingPass {
+                    db_path: config.db_path.clone(),
+                    model: model_name.clone(),
+                });
+            }
+            let pass_result = self.generate_embeddings_and_save(
                 &storage,
                 &messages,
                 model_name,
                 *use_semantic,
                 job_id,
                 index_path,
-            ) {
-                Ok(()) => {
+            );
+            if let Ok(mut guard) = self.running_pass.lock() {
+                *guard = None;
+            }
+
+            match pass_result {
+                Ok(EmbeddingPassOutcome::Completed) => {
                     storage.complete_embedding_job(job_id)?;
                     info!(model = model_name, "Embedding pass completed");
+                }
+                Ok(EmbeddingPassOutcome::Cancelled) => {
+                    // A user cancel is not a failure — record it as cancelled
+                    // so job status matches what actually happened.
+                    let _ = storage.cancel_embedding_jobs(&config.db_path, Some(model_name));
+                    info!(model = model_name, "Embedding pass cancelled");
+                    return Ok(());
                 }
                 Err(e) => {
                     let err_msg = format!("{e:#}");
@@ -298,7 +358,7 @@ impl EmbeddingWorker {
         use_semantic: bool,
         job_id: i64,
         index_path: &Path,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<EmbeddingPassOutcome> {
         let embedder_kind = resolve_embedder_kind(model_name, use_semantic)?;
 
         // Load existing index to check for unchanged documents
@@ -311,7 +371,7 @@ impl EmbeddingWorker {
 
         for msg in messages {
             if self.cancel_flag.load(Ordering::SeqCst) {
-                return Err(anyhow::anyhow!("job cancelled"));
+                return Ok(EmbeddingPassOutcome::Cancelled);
             }
 
             let canonical = canonicalize_for_embedding(&msg.content);
@@ -356,13 +416,14 @@ impl EmbeddingWorker {
                 chunk_idx: 0,
                 content: canonical,
             });
-
-            completed += 1;
-            if completed % 100 == 0 {
-                let _ = storage.update_job_progress(job_id, completed);
-                debug!(job_id, completed, "Embedding progress");
-            }
         }
+
+        // `completed` so far counts only documents that are genuinely done
+        // (empty, invalid, or unchanged). Documents queued for embedding are
+        // counted as their chunk finishes, so job progress reflects the
+        // expensive embedding work instead of racing to ~100% during the
+        // cheap scan phase.
+        let _ = storage.update_job_progress(job_id, completed);
 
         if inputs.is_empty() {
             let final_completed = saturating_i64_from_usize(messages.len());
@@ -372,7 +433,7 @@ impl EmbeddingWorker {
                 skipped = skipped_count,
                 "No documents to embed - all unchanged"
             );
-            return Ok(());
+            return Ok(EmbeddingPassOutcome::Completed);
         }
 
         info!(
@@ -390,8 +451,19 @@ impl EmbeddingWorker {
             }
         };
 
-        // Embed messages
-        let embedded = indexer.embed_messages(&inputs)?;
+        // Embed in bounded chunks so a long semantic pass reports progress
+        // and honors cancellation between chunks instead of running as one
+        // opaque, uncancellable block.
+        let mut embedded = Vec::with_capacity(inputs.len());
+        for chunk in inputs.chunks(EMBED_PROGRESS_CHUNK_SIZE) {
+            if self.cancel_flag.load(Ordering::SeqCst) {
+                return Ok(EmbeddingPassOutcome::Cancelled);
+            }
+            embedded.extend(indexer.embed_messages(chunk)?);
+            completed += saturating_i64_from_usize(chunk.len());
+            let _ = storage.update_job_progress(job_id, completed);
+            debug!(job_id, completed, "Embedding progress");
+        }
 
         // Update final progress
         let final_completed = saturating_i64_from_usize(messages.len());
@@ -415,7 +487,7 @@ impl EmbeddingWorker {
             "Saved vector index"
         );
 
-        Ok(())
+        Ok(EmbeddingPassOutcome::Completed)
     }
 
     /// Load content hashes from an existing vector index for dedup.
@@ -492,6 +564,46 @@ mod tests {
             model_name: model_name.to_string(),
             embedder_id: embedder_id.to_string(),
         }
+    }
+
+    #[test]
+    fn cancel_only_flags_matching_running_pass() {
+        let (worker, handle) = EmbeddingWorker::new();
+        if let Ok(mut guard) = worker.running_pass.lock() {
+            *guard = Some(RunningEmbeddingPass {
+                db_path: "/data/a.db".to_string(),
+                model: "minilm".to_string(),
+            });
+        }
+
+        // Different db_path: must not abort the running job.
+        assert!(handle.cancel("/data/b.db".to_string(), None).is_ok());
+        assert!(
+            !worker.cancel_flag.load(Ordering::SeqCst),
+            "cancel for another db_path must not flag the running job"
+        );
+
+        // Same db_path but different model: must not abort the running pass.
+        assert!(
+            handle
+                .cancel("/data/a.db".to_string(), Some("hash".to_string()))
+                .is_ok()
+        );
+        assert!(
+            !worker.cancel_flag.load(Ordering::SeqCst),
+            "cancel for another model must not flag the running pass"
+        );
+
+        // Matching target: flags the running job.
+        assert!(
+            handle
+                .cancel("/data/a.db".to_string(), Some("minilm".to_string()))
+                .is_ok()
+        );
+        assert!(
+            worker.cancel_flag.load(Ordering::SeqCst),
+            "cancel matching the running pass must set the flag"
+        );
     }
 
     #[test]
