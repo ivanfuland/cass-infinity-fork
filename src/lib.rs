@@ -84726,7 +84726,10 @@ const INDEX_STALL_HINT: &str = concat!(
     "and/or `sudo gdb -batch -ex 'thread apply all bt' -p $(pgrep -f 'cass index') 2>/dev/null | head -200` ",
     "and attach to issue #244 (indexing-phase wedges) or #258 (watch_startup wedges where the lock-file ",
     "heartbeat keeps refreshing while one thread spins). Set CASS_INDEX_STALL_DETECT_SECS=0 to disable detection; ",
-    "set CASS_INDEX_STALL_ABORT_SECS=0 to keep phase-2 stalls report-only."
+    "set CASS_INDEX_STALL_ABORT_SECS=0 to keep phase-2 stalls report-only. ",
+    "If `finalizing` is true in the diagnostics the indexer is inside the final WAL checkpoint of a large ",
+    "deferred bulk-ingest WAL (slow on macOS); CASS_INDEX_FINALIZE_ABORT_SECS (default 1800) bounds that window, ",
+    "and CASS_INDEX_WRITER_WAL_AUTOCHECKPOINT_PAGES=1000 caps WAL growth so the final checkpoint stays small."
 );
 
 fn index_stall_threshold(progress_interval: Duration) -> Option<Duration> {
@@ -84760,6 +84763,40 @@ fn index_stall_abort_threshold(
     Some(Duration::from_secs(abort_threshold_secs).max(min_after_report))
 }
 
+/// Bounded-but-generous abort grace for the post-publish *finalize* window
+/// (#319/#321).
+///
+/// A non-watch, non-semantic `cass index --full` ends by checkpointing the
+/// deferred bulk-ingest WAL inside `close_storage_after_index` — a synchronous,
+/// `!Send` frankensqlite `conn.close()` + `wal_checkpoint(TRUNCATE)` that runs
+/// on the indexer thread and cannot advance the progress atomics. On a large
+/// corpus (the #319 report: a ~1.1 GB / ~290k-frame WAL) that checkpoint
+/// legitimately takes minutes, especially on macOS where Darwin fsync/flock is
+/// slow. The generic finalize-wedge abort (`CASS_INDEX_STALL_ABORT_SECS`,
+/// default 300 s) misreads that active checkpoint as a #297 wedge and kills the
+/// process with `exit(70)` mid-checkpoint — stranding the un-truncated WAL and
+/// leaving the DB malformed to stock SQLite (#296/#321).
+///
+/// While the indexer signals `IndexingProgress::finalizing`, the watchdog uses
+/// this larger threshold instead, so a slow-but-progressing final checkpoint
+/// completes. Because the checkpoint is a single blocking `!Send` call on the
+/// indexer thread, it cannot be heartbeated — so a bound is the only liveness
+/// guard against a genuinely stuck finalize: once it elapses the abort still
+/// fires. `CASS_INDEX_FINALIZE_ABORT_SECS=0` makes the finalize window
+/// report-only (never abort). The floor is the ordinary abort threshold, so
+/// this can only ever *lengthen* the finalize grace, never shorten it.
+fn index_finalize_abort_threshold(abort_threshold: Option<Duration>) -> Option<Duration> {
+    let abort_threshold = abort_threshold?;
+    let finalize_secs = dotenvy::var("CASS_INDEX_FINALIZE_ABORT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(1800);
+    if finalize_secs == 0 {
+        return None;
+    }
+    Some(Duration::from_secs(finalize_secs).max(abort_threshold))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IndexStallAbortPolicy {
     #[cfg(test)]
@@ -84771,6 +84808,10 @@ struct IndexStallWatchdog {
     data_dir: PathBuf,
     threshold: Option<Duration>,
     abort_threshold: Option<Duration>,
+    /// Larger abort grace used only while `IndexingProgress::finalizing` is set
+    /// (the post-publish WAL-checkpoint window). `None` = never abort during
+    /// finalize (report-only). See `index_finalize_abort_threshold` (#319/#321).
+    finalize_abort_threshold: Option<Duration>,
     abort_policy: IndexStallAbortPolicy,
     /// True when supervising a long-lived `cass index --watch` daemon. In
     /// watch mode the post-publish quiescent resting state (phase 0,
@@ -84850,10 +84891,12 @@ impl IndexStallWatchdog {
     ) -> Self {
         let threshold = index_stall_threshold(progress_interval);
         let abort_threshold = index_stall_abort_threshold(progress_interval, threshold);
+        let finalize_abort_threshold = index_finalize_abort_threshold(abort_threshold);
         Self {
             data_dir,
             threshold,
             abort_threshold,
+            finalize_abort_threshold,
             abort_policy,
             is_watch: false,
             semantic_build: false,
@@ -84981,10 +85024,37 @@ impl IndexStallWatchdog {
             && current >= total
             && index_progress.rebuild_pipeline_is_quiescent();
         let abort_eligible = phase_code == 2 || finalize_wedge;
+        // #319/#321: while the indexer signals `finalizing`, the phase-0 /
+        // current==total / quiescent shape is the post-publish WAL-checkpoint
+        // window, not a #297 wedge. The checkpoint is a synchronous, `!Send`
+        // frankensqlite call on the indexer thread that cannot advance the
+        // progress atomics, so it can only be recognised via this flag. Give it
+        // the larger `finalize_abort_threshold` so a slow-but-active checkpoint
+        // of a large deferred WAL completes instead of being killed mid-write
+        // (which strands the WAL and leaves the DB malformed). A genuine phase-2
+        // wedge (phase_code == 2) is unaffected and still aborts at the normal
+        // threshold. Because the checkpoint blocks a single thread and cannot be
+        // heartbeated, the bound is the only liveness guard: once it elapses the
+        // finalize is aborted too.
+        let effective_abort_threshold = if finalize_wedge
+            && phase_code != 2
+            && index_progress
+                .finalizing
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            match self.finalize_abort_threshold {
+                Some(threshold) => threshold,
+                // Finalize aborts disabled (CASS_INDEX_FINALIZE_ABORT_SECS=0):
+                // treat the finalize window as report-only.
+                None => return None,
+            }
+        } else {
+            abort_threshold
+        };
         if self.abort_policy != IndexStallAbortPolicy::AbortPhaseTwo
             || !abort_eligible
             || self.stall_abort_reported_for_phase == Some(phase_code)
-            || stall_elapsed < abort_threshold
+            || stall_elapsed < effective_abort_threshold
         {
             return None;
         }
@@ -85433,6 +85503,107 @@ mod stall_diagnostics_tests {
         let abort = watchdog
             .observe(&progress, 400)
             .ok_or_else(|| anyhow::anyhow!("phase-2 semantic stall did not abort"))?;
+        assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
+        assert_eq!(abort["exit_code"], serde_json::json!(70));
+        Ok(())
+    }
+
+    /// Regression for #319/#321: the post-publish finalize WAL checkpoint of a
+    /// large deferred bulk-ingest WAL runs as a synchronous, `!Send`
+    /// frankensqlite call on the indexer thread (inside
+    /// `close_storage_after_index`). It cannot advance the progress atomics, so
+    /// it looks exactly like a #297 finalize wedge — phase 0, `current == total`,
+    /// pipeline quiescent — while the process is actually alive and checkpointing
+    /// (minutes on macOS). Before this fix the watchdog aborted it at the normal
+    /// 300 s threshold with `exit(70)`, killing the checkpoint mid-write and
+    /// stranding the un-truncated ~1.1 GB WAL (leaving the DB malformed to stock
+    /// SQLite). The indexer now sets `IndexingProgress::finalizing`; the watchdog
+    /// must (a) NOT abort while finalizing until the larger
+    /// `finalize_abort_threshold` elapses, yet (b) still abort a genuinely stuck
+    /// finalize once that bound passes, and (c) still abort a normal phase-2
+    /// wedge at the ordinary threshold.
+    #[test]
+    fn watchdog_defers_abort_during_final_wal_checkpoint_finalize() -> anyhow::Result<()> {
+        use super::{IndexStallAbortPolicy, IndexStallWatchdog};
+        use crate::indexer::IndexingProgress;
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let tmp = TempDir::new()?;
+        let mut watchdog = IndexStallWatchdog::with_abort_policy(
+            tmp.path().to_path_buf(),
+            Duration::from_millis(50),
+            IndexStallAbortPolicy::AbortPhaseTwo,
+        );
+        watchdog.threshold = Some(Duration::from_millis(1));
+        watchdog.abort_threshold = Some(Duration::from_millis(2));
+        // Generous finalize grace: much larger than the ordinary abort threshold.
+        watchdog.finalize_abort_threshold = Some(Duration::from_millis(500));
+        watchdog.last_phase = 0;
+        watchdog.last_current = 100;
+        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
+
+        let progress = Arc::new(IndexingProgress::default());
+        // The exact #297 finalize-wedge shape, but the indexer has signalled it
+        // is inside the final WAL checkpoint.
+        progress.phase.store(0, Ordering::Relaxed);
+        progress.total.store(100, Ordering::Relaxed);
+        progress.current.store(100, Ordering::Relaxed);
+        progress.finalizing.store(true, Ordering::Relaxed);
+        assert!(progress.rebuild_pipeline_is_quiescent());
+
+        // Well past the ordinary abort threshold (2 ms) but under the finalize
+        // grace (500 ms): the first observe reports the stall, but the watchdog
+        // must NOT abort — the checkpoint is legitimate active work.
+        let detected = watchdog
+            .observe(&progress, 100)
+            .ok_or_else(|| anyhow::anyhow!("finalize stall did not report"))?;
+        assert_eq!(detected["event"], serde_json::json!("stall_detected"));
+        assert!(
+            detected.get("exit_code").is_none(),
+            "the stall_detected report must not carry an abort during finalize"
+        );
+        assert_eq!(detected["finalizing"], serde_json::json!(true));
+        for elapsed in [200_u128, 300, 400] {
+            assert!(
+                watchdog.observe(&progress, elapsed).is_none(),
+                "the finalize WAL checkpoint must not be aborted before the finalize grace elapses (#319/#321)"
+            );
+        }
+
+        // Liveness bound: once the finalize grace itself elapses, a genuinely
+        // stuck finalize is still aborted (the checkpoint blocks one thread and
+        // cannot be heartbeated, so this bound is the only guard).
+        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(600);
+        let abort = watchdog
+            .observe(&progress, 500)
+            .ok_or_else(|| anyhow::anyhow!("stuck finalize past the grace did not abort"))?;
+        assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
+        assert_eq!(abort["exit_code"], serde_json::json!(70));
+
+        // Control: with `finalizing` cleared, the identical quiescent shape is a
+        // #297 wedge again and aborts at the ordinary threshold.
+        let mut wedge_watchdog = IndexStallWatchdog::with_abort_policy(
+            tmp.path().to_path_buf(),
+            Duration::from_millis(50),
+            IndexStallAbortPolicy::AbortPhaseTwo,
+        );
+        wedge_watchdog.threshold = Some(Duration::from_millis(1));
+        wedge_watchdog.abort_threshold = Some(Duration::from_millis(2));
+        wedge_watchdog.finalize_abort_threshold = Some(Duration::from_millis(500));
+        wedge_watchdog.last_phase = 0;
+        wedge_watchdog.last_current = 100;
+        wedge_watchdog.last_progress_advance =
+            std::time::Instant::now() - Duration::from_millis(100);
+        progress.finalizing.store(false, Ordering::Relaxed);
+        let detected = wedge_watchdog
+            .observe(&progress, 100)
+            .ok_or_else(|| anyhow::anyhow!("non-finalizing wedge did not report"))?;
+        assert_eq!(detected["event"], serde_json::json!("stall_detected"));
+        let abort = wedge_watchdog
+            .observe(&progress, 200)
+            .ok_or_else(|| anyhow::anyhow!("non-finalizing wedge did not abort at the ordinary threshold"))?;
         assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
         assert_eq!(abort["exit_code"], serde_json::json!(70));
         Ok(())

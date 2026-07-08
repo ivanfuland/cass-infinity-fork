@@ -960,6 +960,18 @@ pub struct IndexingProgress {
     // Simple phase indicator: 0=Idle, 1=Scanning, 2=Indexing
     pub phase: AtomicUsize,
     pub is_rebuilding: AtomicBool,
+    /// Set by `run_index` while it is inside the post-publish finalize window —
+    /// specifically `close_storage_after_index`, which runs the (deferred,
+    /// possibly multi-GB) bulk-ingest WAL checkpoint via a synchronous,
+    /// `!Send` frankensqlite `conn.close()` + `wal_checkpoint(TRUNCATE)` on the
+    /// indexer thread. That checkpoint cannot report progress and, on a large
+    /// corpus (esp. macOS, where Darwin fsync/flock is slow), legitimately
+    /// takes minutes. The stall watchdog reads this flag so it does not misread
+    /// that active checkpoint as a #297 finalize wedge and kill the process
+    /// (exit 70) mid-write — which strands the un-truncated WAL and leaves the
+    /// canonical DB malformed to stock SQLite (#296/#321). Liveness is still
+    /// bounded: see `index_finalize_abort_threshold` (#319).
+    pub finalizing: AtomicBool,
     /// Number of coding agents discovered so far during scanning
     pub discovered_agents: AtomicUsize,
     /// Names of discovered agents (protected by mutex for concurrent access)
@@ -1142,6 +1154,7 @@ impl IndexingProgress {
         let current = self.current.load(Ordering::Relaxed);
         let agents = self.discovered_agents.load(Ordering::Relaxed);
         let is_rebuilding = self.is_rebuilding.load(Ordering::Relaxed);
+        let finalizing = self.finalizing.load(Ordering::Relaxed);
         let agent_names: Vec<String> = self
             .discovered_agent_names
             .lock()
@@ -1324,6 +1337,11 @@ impl IndexingProgress {
             "discovered_agents": agents,
             "agent_names": agent_names,
             "is_rebuilding": is_rebuilding,
+            // #319: true while the indexer is inside the post-publish finalize
+            // WAL checkpoint (close_storage_after_index). A quiescent, phase-0,
+            // current==total snapshot with `finalizing: true` is an active
+            // final checkpoint, NOT a #297 wedge.
+            "finalizing": finalizing,
             "elapsed_ms": elapsed_ms,
             "rate_per_sec": rate_per_sec,
             "eta_seconds": eta_seconds,
@@ -15061,6 +15079,20 @@ pub fn run_index(
         return Ok(());
     }
 
+    // #319/#321: `close_storage_after_index` runs the final WAL checkpoint of
+    // the deferred bulk-ingest WAL — a synchronous, `!Send` frankensqlite
+    // `conn.close()` + `wal_checkpoint(TRUNCATE)` that executes on THIS thread
+    // and cannot report progress. On a large corpus (the report: ~1.1 GB /
+    // ~290k-frame WAL) it legitimately takes minutes, especially on macOS.
+    // Signal the stall watchdog that we have entered that finalize window so it
+    // does not misread the quiescent, phase-0, current==total state as a #297
+    // finalize wedge and kill the process (exit 70) mid-checkpoint — which would
+    // strand the un-truncated WAL and leave the DB malformed (#296/#321). The
+    // watchdog still bounds this window (see `index_finalize_abort_threshold`),
+    // so a genuinely stuck finalize is still aborted.
+    if let Some(progress) = opts.progress.as_ref() {
+        progress.finalizing.store(true, Ordering::Relaxed);
+    }
     close_storage_after_index(storage, &opts.db_path, "index run")
 }
 
