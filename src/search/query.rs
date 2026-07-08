@@ -3639,7 +3639,20 @@ impl SearchClient {
             target_hits.saturating_mul(3).div_ceil(2)
         };
         let session_path_filter_active = !filters.session_paths.is_empty();
-        let fallback_fetch_limit = if session_path_filter_active {
+        // `--role` is a post-hoc filter applied in `postprocess_hits_page`
+        // (Tantivy carries no role field). A too-small fetch window can rank the
+        // only role-matching hit below it, so `search X --role tool --limit 1`
+        // wrongly returns empty even though the tool_result exists. Mirror the
+        // session-path treatment: over-fetch a large window (capped at
+        // `no_limit_result_cap()`) so role recall is correct. The Tantivy paths
+        // reach this via the dedup/shortfall retry; the SQLite-FTS fallback
+        // fetches `fallback_fetch_limit` directly — both are covered here.
+        // Kept off the no-role fast path so the common case is not slowed.
+        let role_filter_active = filters
+            .roles
+            .as_ref()
+            .is_some_and(|roles| !roles.is_empty());
+        let fallback_fetch_limit = if session_path_filter_active || role_filter_active {
             self.total_docs()
                 .min(no_limit_result_cap())
                 .max(target_hits.saturating_mul(3))

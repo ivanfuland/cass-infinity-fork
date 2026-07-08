@@ -83883,6 +83883,33 @@ fn role_to_export_string(role: &crate::model::types::MessageRole) -> String {
     crate::model::types::role_as_str(role).to_string()
 }
 
+#[cfg(test)]
+mod export_role_string_tests {
+    use super::role_to_export_string;
+    use crate::model::types::MessageRole;
+
+    /// Lock the intentional unified-codec JSON export behavior (codex Phase-2
+    /// P2 #3): `role_to_export_string` returns the truthful canonical role, so
+    /// legacy `MessageRole::Agent` exports as `"agent"` (NOT the historical
+    /// `"assistant"` coalescing). This guards against a silent regression back
+    /// to lossy role coalescing in the JSON export path.
+    ///
+    /// NOTE: the TUI HTML export (`src/ui/app.rs`) still maps both
+    /// Agent/Assistant -> "assistant"; that is a separate domain flagged for
+    /// the Phase 4 adapter decision and is intentionally NOT covered here.
+    #[test]
+    fn json_export_role_string_is_truthful_canonical() {
+        assert_eq!(role_to_export_string(&MessageRole::Agent), "agent");
+        assert_eq!(role_to_export_string(&MessageRole::Assistant), "assistant");
+        assert_eq!(role_to_export_string(&MessageRole::User), "user");
+        assert_eq!(role_to_export_string(&MessageRole::Tool), "tool");
+        assert_eq!(
+            role_to_export_string(&MessageRole::Other("tool_result".to_string())),
+            "tool_result"
+        );
+    }
+}
+
 fn conversation_view_to_raw_messages(
     view: &crate::ui::data::ConversationView,
 ) -> Vec<serde_json::Value> {

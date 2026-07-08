@@ -118,6 +118,107 @@ fn role_filter_tool_matches_tool_result_not_user_message() {
     println!("ROLE_CLI_OK");
 }
 
+/// Regression (codex Phase-2 P1 #1): `--role` recall in the lexical path must
+/// survive the role-matching hit ranking BELOW the default small fetch window.
+///
+/// `--role` is applied post-hoc in `postprocess_hits_page` (Tantivy has no role
+/// field), operating on an already-fetched hit window sized ~2-3x
+/// `offset+limit`. The dedup/shortfall retry previously only widened its fetch
+/// for `session_paths`, NOT `roles`. So when many higher-BM25 user/assistant
+/// hits outrank the single `tool_result` hit, `search X --role tool --limit 1`
+/// returned EMPTY even though the tool_result exists. The fix makes
+/// `fallback_fetch_limit` role-aware (over-fetch capped at
+/// `no_limit_result_cap()`), mirroring the session-path treatment.
+///
+/// This fixture forces the `tool_result` to the bottom of the ranking: six
+/// short user messages repeat the query token (high term frequency) while the
+/// lone `tool_result` carries the token once buried in long filler (low BM25),
+/// so it ranks well below the old 3-hit fallback window. RED before the fix
+/// (empty result), GREEN after.
+#[test]
+fn role_filter_lexical_recalls_tool_result_ranked_below_default_window() {
+    let dir = TempDir::new().unwrap();
+    let unique_token = "rankbelowmarkerq4w8e2rst";
+
+    let data_dir = dir.path();
+    let db_path = data_dir.join("agent_search.db");
+    let index_path = index_dir(data_dir).expect("index path");
+    let storage = FrankenStorage::open(&db_path).unwrap();
+    let mut index = TantivyIndex::open_or_create(&index_path).unwrap();
+
+    // Six short, high-TF user messages that will outrank the tool_result.
+    let mut messages: Vec<NormalizedMessage> = (0..6)
+        .map(|i| NormalizedMessage {
+            idx: i,
+            role: "user".into(),
+            author: Some("user".into()),
+            created_at: Some(4000 + i),
+            content: format!(
+                "{unique_token} {unique_token} {unique_token} {unique_token} short high frequency hit {i}"
+            ),
+            extra: json!({}),
+            snippets: vec![],
+            invocations: Vec::new(),
+        })
+        .collect();
+
+    // One tool_result with the token buried once in long low-signal filler, so
+    // BM25 ranks it last — below the default fallback window.
+    let filler = "output line diagnostics build cache pipeline step artifact log trace metric \
+                  status queue worker retry backoff timeout heartbeat scan watermark ingest "
+        .repeat(6);
+    messages.push(NormalizedMessage {
+        idx: 6,
+        role: "tool_result".into(),
+        author: Some("tool".into()),
+        created_at: Some(4100),
+        content: format!("Command output. {filler} {unique_token} {filler} end of output."),
+        extra: json!({}),
+        snippets: vec![],
+        invocations: Vec::new(),
+    });
+
+    let normalized = NormalizedConversation {
+        agent_slug: "tester".into(),
+        external_id: Some("role-rank".into()),
+        title: Some("role rank test".into()),
+        workspace: None,
+        source_path: data_dir.join("role-rank.jsonl"),
+        started_at: Some(4000),
+        ended_at: Some(4101),
+        metadata: json!({}),
+        messages,
+    };
+    persist_conversation(&storage, &mut index, &normalized).unwrap();
+    index.commit().unwrap();
+
+    let client = SearchClient::open(&index_path, Some(&db_path))
+        .unwrap()
+        .expect("client");
+
+    // Sanity: without a role filter, limit=1 returns a (high-ranking user) hit.
+    let baseline = client
+        .search(unique_token, SearchFilters::default(), 1, 0, FieldMask::FULL)
+        .unwrap();
+    assert_eq!(baseline.len(), 1, "baseline limit=1 should return one hit");
+
+    // The crux: --role tool --limit 1 must still recall the low-ranked
+    // tool_result (RED before the over-fetch fix: empty).
+    let mut tool_filters = SearchFilters::default();
+    tool_filters.roles = Some(HashSet::from([role_code_from_str("tool").unwrap()]));
+    let tool_hits = client
+        .search(unique_token, tool_filters, 1, 0, FieldMask::FULL)
+        .unwrap();
+    assert_eq!(
+        tool_hits.len(),
+        1,
+        "--role tool --limit 1 must recall the tool_result even when it ranks \
+         below the default fetch window"
+    );
+
+    println!("ROLE_RANK_OK");
+}
+
 /// Semantic-path regression coverage for the `--role` override (Task 2.2b
 /// review finding: the shipped test only covered the lexical path).
 ///

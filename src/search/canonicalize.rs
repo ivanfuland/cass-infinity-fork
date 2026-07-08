@@ -180,10 +180,6 @@ pub fn content_hash_hex(text: &str) -> String {
     hex::encode(hash)
 }
 
-fn role_is(role: Option<&str>, expected: &str) -> bool {
-    role.is_some_and(|role| role.trim().eq_ignore_ascii_case(expected))
-}
-
 fn is_short_acknowledgement(lower: &str) -> bool {
     matches!(
         lower,
@@ -228,7 +224,20 @@ pub fn is_tool_acknowledgement(role: Option<&str>, text: &str) -> bool {
         return true;
     }
 
-    let toolish = role_is(role, "tool");
+    // Tool-class classification must recognize the canonical 6-role
+    // `"tool_result"` output role (and the legacy `"toolResult"` spelling), not
+    // just the literal `"tool"`. The real-time lexical ingest path
+    // (`search::tantivy::cass_document_for_message` /
+    // `cass_document_for_packet_message`) passes the RAW `msg.role.as_str()`
+    // here, which is `"tool_result"` after the unified codec. If this only
+    // matched `"tool"`, real-time ingest would KEEP a `tool_result` ack that
+    // the force-rebuild sink drops (it routes tool-class roles through
+    // `is_lexical_rebuild_tool_class_role` and remaps to `"tool"`), diverging
+    // observed vs. `expected_live_lexical_doc_count` and re-triggering the
+    // cass#244/#258 sparse-repair false-positive loop. Share the SINGLE
+    // source-of-truth classifier so all three sites (real-time ingest,
+    // force-rebuild sink, expected-count) agree on which roles are tool output.
+    let toolish = role.is_some_and(crate::storage::sqlite::is_lexical_rebuild_tool_class_role);
     let short_tool_ack = lower == "no matches found"
         || lower == "no changes made"
         || lower == "no changes"
@@ -525,6 +534,47 @@ mod tests {
         assert!(!is_tool_acknowledgement(
             Some("tool"),
             "Compilation failed with an auth refresh error"
+        ));
+    }
+
+    #[test]
+    fn test_is_tool_acknowledgement_recognizes_tool_result_role() {
+        // Regression (codex Phase-2 P1 #2): the real-time lexical ingest path
+        // passes the raw `"tool_result"` role (unified 6-role codec) here. Both
+        // the canonical `"tool_result"` and legacy `"toolResult"` spellings must
+        // be treated as tool-class, identically to
+        // `storage::sqlite::is_lexical_rebuild_tool_class_role`, so real-time
+        // ingest DROPS the same tool acks the force-rebuild sink drops.
+        assert!(is_tool_acknowledgement(
+            Some("tool_result"),
+            "already up to date"
+        ));
+        assert!(is_tool_acknowledgement(Some("toolResult"), "up to date"));
+        assert!(is_tool_acknowledgement(
+            Some("tool_result"),
+            "Successfully wrote to /tmp/output.rs"
+        ));
+        // `"tool_call"` is the assistant-side invocation, NOT tool output — it
+        // must NOT be treated as tool-class (parity with the shared helper).
+        assert!(!is_tool_acknowledgement(
+            Some("tool_call"),
+            "already up to date"
+        ));
+        // Non-tool roles are unchanged: a bare "already up to date" from a
+        // non-tool role (and lacking file/match keywords) is not an ack.
+        assert!(!is_tool_acknowledgement(
+            Some("assistant"),
+            "already up to date"
+        ));
+    }
+
+    #[test]
+    fn test_is_hard_message_noise_drops_tool_result_ack() {
+        // Parity with the force-rebuild path: a `tool_result` ack is hard noise
+        // that real-time ingest (`is_hard_message_noise`) must skip.
+        assert!(is_hard_message_noise(
+            Some("tool_result"),
+            "already up to date"
         ));
     }
 
