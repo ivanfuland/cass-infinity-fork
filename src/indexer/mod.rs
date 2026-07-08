@@ -3766,6 +3766,12 @@ fn lexical_rebuild_grouped_message_from_normalized(
 ) -> crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
     crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
         idx: message.idx,
+        // Out of scope for Task 2.3 (only the streaming grouped-row path in
+        // `lexical_rebuild_contract_from_grouped_messages` is fixed here):
+        // left unpopulated so this stays byte-for-byte comparable against
+        // `from_canonical_replay_messages`'s grouped rows in the canonical
+        // vs normalized equivalence test below.
+        role: String::new(),
         is_tool_role: message.role.eq_ignore_ascii_case("tool"),
         created_at: message.created_at,
         content: message.content.clone(),
@@ -3792,11 +3798,12 @@ fn lexical_rebuild_contract_from_grouped_messages(
         .map(|message| crate::model::types::Message {
             id: None,
             idx: message.idx,
-            role: if message.is_tool_role {
-                crate::model::types::MessageRole::Tool
-            } else {
-                crate::model::types::MessageRole::Agent
-            },
+            // Preserve the full 6-role string via the unified codec instead
+            // of collapsing every non-tool row to `MessageRole::Agent`
+            // (spec 5.2(c)): `assistant`/`tool_call`/`tool_result`/
+            // `reasoning`/`system` all round-trip through their own role,
+            // not just `tool` vs "everything else".
+            role: crate::model::types::role_from_str(&message.role),
             author: None,
             created_at: message.created_at,
             content: message.content.clone(),
@@ -3879,6 +3886,16 @@ impl LexicalRebuildConversationPacket {
             last_message_id = Some(last_message_id.unwrap_or(0).max(message_id));
             grouped_rows.push(crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
                 idx: message.idx,
+                // Out of scope for Task 2.3 (only the streaming grouped-row
+                // path is fixed here): this batch path already preserves the
+                // full role via `messages.clone()` feeding the contract
+                // above, so `self.messages` here is only consumed by
+                // `is_tool_role`-based hard-noise filtering; left
+                // unpopulated to stay byte-for-byte comparable against
+                // `lexical_rebuild_grouped_message_from_normalized`'s
+                // grouped rows in the canonical vs normalized equivalence
+                // test below.
+                role: String::new(),
                 is_tool_role: matches!(message.role, crate::model::types::MessageRole::Tool),
                 created_at: message.created_at,
                 content: message.content,
@@ -31121,6 +31138,179 @@ mod tests {
         );
     }
 
+    /// Task 2.3 (spec 5.2(c)): the streaming grouped-row lexical rebuild
+    /// projection must not collapse 6-role messages to `MessageRole::Agent`,
+    /// and `is_tool_role` must recognize `tool_result` (not just the literal
+    /// `"tool"` role string) so tool output is correctly classified during
+    /// `--force-rebuild`.
+    #[test]
+    fn lexical_rebuild_grouped_projection_preserves_six_role_and_classifies_tool_result_as_tool()
+    {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("six-role-rebuild.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("1.0.0".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        let workspace_id = storage
+            .ensure_workspace(Path::new("/tmp/six-role-workspace"), None)
+            .unwrap();
+
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/six-role-workspace")),
+            external_id: Some("six-role-rebuild".into()),
+            title: Some("Six role rebuild".into()),
+            source_path: PathBuf::from("/tmp/six-role-rebuild.jsonl"),
+            started_at: Some(1_700_001_000_000),
+            ended_at: Some(1_700_001_000_500),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![
+                Message {
+                    id: None,
+                    idx: 0,
+                    role: crate::model::types::role_from_str("user"),
+                    author: Some("user".into()),
+                    created_at: Some(1_700_001_000_010),
+                    content: "user turn".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                },
+                Message {
+                    id: None,
+                    idx: 1,
+                    role: crate::model::types::role_from_str("assistant"),
+                    author: Some("assistant".into()),
+                    created_at: Some(1_700_001_000_020),
+                    content: "assistant turn".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                },
+                Message {
+                    id: None,
+                    idx: 2,
+                    role: crate::model::types::role_from_str("tool_call"),
+                    author: Some("assistant".into()),
+                    created_at: Some(1_700_001_000_030),
+                    content: "tool call turn".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                },
+                Message {
+                    id: None,
+                    idx: 3,
+                    role: crate::model::types::role_from_str("tool_result"),
+                    author: Some("tool".into()),
+                    created_at: Some(1_700_001_000_040),
+                    content: "tool result turn".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                },
+                Message {
+                    id: None,
+                    idx: 4,
+                    role: crate::model::types::role_from_str("reasoning"),
+                    author: None,
+                    created_at: Some(1_700_001_000_050),
+                    content: "reasoning turn".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                },
+            ],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+
+        let inserted = storage
+            .insert_conversation_tree(agent_id, Some(workspace_id), &conversation)
+            .unwrap();
+
+        // Exercise the real streaming grouped-row rebuild path (the
+        // `--force-rebuild` projection) instead of hand-building
+        // `LexicalRebuildGroupedMessageRow`s, so the sqlite.rs `is_tool_role`
+        // fix is covered end-to-end too.
+        let mut grouped_pages: Vec<crate::storage::sqlite::LexicalRebuildGroupedMessageRows> =
+            Vec::new();
+        storage
+            .stream_grouped_messages_for_lexical_rebuild_between_conversation_ids(
+                inserted.conversation_id,
+                inserted.conversation_id,
+                |_conversation_id, messages, _last_message_id| {
+                    grouped_pages.push(messages);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(grouped_pages.len(), 1, "expected exactly one conversation page");
+        let grouped_messages = grouped_pages.into_iter().next().unwrap();
+        assert_eq!(grouped_messages.len(), 5);
+
+        let tool_result_row = grouped_messages
+            .iter()
+            .find(|row| row.role == "tool_result")
+            .expect("tool_result row present in grouped projection");
+        assert!(
+            tool_result_row.is_tool_role,
+            "is_tool_role must recognize tool_result (not just the literal \"tool\" role)"
+        );
+        let tool_call_row = grouped_messages
+            .iter()
+            .find(|row| row.role == "tool_call")
+            .expect("tool_call row present in grouped projection");
+        assert!(
+            !tool_call_row.is_tool_role,
+            "tool_call is the assistant-side invocation, not tool output"
+        );
+
+        let conversation_row = crate::storage::sqlite::LexicalRebuildConversationRow {
+            id: Some(inserted.conversation_id),
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/six-role-workspace")),
+            external_id: Some("six-role-rebuild".into()),
+            title: Some("Six role rebuild".into()),
+            source_path: PathBuf::from("/tmp/six-role-rebuild.jsonl"),
+            started_at: Some(1_700_001_000_000),
+            ended_at: Some(1_700_001_000_500),
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+
+        let packet = LexicalRebuildConversationPacket::from_canonical_replay(
+            conversation_row,
+            grouped_messages,
+            None,
+            &HashMap::new(),
+        );
+
+        // The rebuilt packet's roles must not all collapse to `Agent`: the
+        // analytics projection must bucket each 6-role message by its own
+        // role instead of lumping everything (including `user`!) into the
+        // legacy "agent" bucket the old `is_tool_role ? Tool : Agent`
+        // mapping produced.
+        let analytics = &packet.contract_projections.analytics;
+        assert_eq!(analytics.user_messages, 1, "user must not collapse to agent");
+        assert_eq!(analytics.assistant_messages, 1, "assistant stays assistant");
+        assert_eq!(
+            analytics.tool_messages, 0,
+            "tool_call/tool_result are not the literal `tool` role"
+        );
+        assert_eq!(analytics.system_messages, 0);
+        assert_eq!(
+            analytics.other_messages, 3,
+            "tool_call/tool_result/reasoning round-trip via their own role, not collapsed to agent"
+        );
+
+        println!("LEXICAL_6ROLE_OK");
+    }
+
     #[test]
     fn lexical_rebuild_packet_empty_conversation_has_zero_budget_and_no_docs() {
         let packet = LexicalRebuildConversationPacket::from_canonical_replay(
@@ -31152,6 +31342,7 @@ mod tests {
         let mut grouped = crate::storage::sqlite::LexicalRebuildGroupedMessageRows::new();
         grouped.push(crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
             idx: 0,
+            role: String::new(),
             is_tool_role: false,
             created_at: Some(1_700_000_300_010),
             content: "missing-id packet body".into(),
@@ -31187,12 +31378,14 @@ mod tests {
         let mut grouped = crate::storage::sqlite::LexicalRebuildGroupedMessageRows::new();
         grouped.push(crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
             idx: 0,
+            role: String::new(),
             is_tool_role: false,
             created_at: None,
             content: large_body.clone(),
         });
         grouped.push(crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
             idx: 1,
+            role: String::new(),
             is_tool_role: false,
             created_at: Some(1_700_000_400_020),
             content: "tail".into(),
@@ -31627,6 +31820,7 @@ mod tests {
             } else {
                 vec![crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
                     idx: 0,
+                    role: String::new(),
                     is_tool_role: false,
                     created_at: Some(1_700_000_600_000 + conversation_id),
                     content: content.to_string(),
@@ -31712,6 +31906,7 @@ mod tests {
                 },
                 vec![crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
                     idx: 0,
+                    role: String::new(),
                     is_tool_role: false,
                     created_at: Some(1_700_000_700_010),
                     content: "alpha".into(),
@@ -31736,6 +31931,7 @@ mod tests {
                 },
                 vec![crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
                     idx: 0,
+                    role: String::new(),
                     is_tool_role: false,
                     created_at: Some(1_700_000_700_210),
                     content: "beta".into(),
@@ -31812,6 +32008,7 @@ mod tests {
                 },
                 vec![crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
                     idx: 0,
+                    role: String::new(),
                     is_tool_role: false,
                     created_at: Some(1_700_000_800_010),
                     content: "alpha".into(),
@@ -31836,6 +32033,7 @@ mod tests {
                 },
                 vec![crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
                     idx: 0,
+                    role: String::new(),
                     is_tool_role: false,
                     created_at: Some(1_700_000_800_210),
                     content: "beta".into(),
@@ -31923,12 +32121,14 @@ mod tests {
                     vec![
                         crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
                             idx: 0,
+                            role: String::new(),
                             is_tool_role: false,
                             created_at: Some(1_700_000_900_010 + conversation_id),
                             content: message_a.into(),
                         },
                         crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
                             idx: 1,
+                            role: String::new(),
                             is_tool_role: false,
                             created_at: Some(1_700_000_900_020 + conversation_id),
                             content: message_b.into(),
@@ -31995,12 +32195,14 @@ mod tests {
             vec![
                 crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
                     idx: 0,
+                    role: String::new(),
                     is_tool_role: false,
                     created_at: Some(1_700_000_935_010),
                     content: "validated alpha".into(),
                 },
                 crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
                     idx: 1,
+                    role: String::new(),
                     is_tool_role: false,
                     created_at: Some(1_700_000_935_020),
                     content: "validated beta".into(),
@@ -32078,12 +32280,14 @@ mod tests {
             vec![
                 crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
                     idx: 0,
+                    role: String::new(),
                     is_tool_role: false,
                     created_at: Some(1_700_000_936_010),
                     content: "mismatch alpha".into(),
                 },
                 crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
                     idx: 1,
+                    role: String::new(),
                     is_tool_role: false,
                     created_at: Some(1_700_000_936_020),
                     content: "mismatch beta".into(),
@@ -32162,12 +32366,14 @@ mod tests {
             vec![
                 crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
                     idx: 0,
+                    role: String::new(),
                     is_tool_role: false,
                     created_at: Some(1_700_000_940_010),
                     content: "filter alpha".into(),
                 },
                 crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
                     idx: 1,
+                    role: String::new(),
                     is_tool_role: false,
                     created_at: Some(1_700_000_940_020),
                     content: "filter beta".into(),
@@ -32266,12 +32472,14 @@ mod tests {
             vec![
                 crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
                     idx: 0,
+                    role: String::new(),
                     is_tool_role: false,
                     created_at: Some(1_700_000_950_010),
                     content: "inflation alpha".into(),
                 },
                 crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
                     idx: 1,
+                    role: String::new(),
                     is_tool_role: false,
                     created_at: Some(1_700_000_950_020),
                     content: "inflation beta".into(),
@@ -32346,12 +32554,14 @@ mod tests {
                     vec![
                         crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
                             idx: 0,
+                            role: String::new(),
                             is_tool_role: false,
                             created_at: Some(1_700_000_910_010 + conversation_id),
                             content: message_a.into(),
                         },
                         crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
                             idx: 1,
+                            role: String::new(),
                             is_tool_role: false,
                             created_at: Some(1_700_000_910_020 + conversation_id),
                             content: message_b.into(),
@@ -32420,12 +32630,14 @@ mod tests {
             vec![
                 crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
                     idx: 0,
+                    role: String::new(),
                     is_tool_role: false,
                     created_at: Some(1_700_000_915_010),
                     content: "alpha".into(),
                 },
                 crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
                     idx: 1,
+                    role: String::new(),
                     is_tool_role: false,
                     created_at: Some(1_700_000_915_020),
                     content: "beta".into(),
@@ -32484,12 +32696,14 @@ mod tests {
                     vec![
                         crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
                             idx: 0,
+                            role: String::new(),
                             is_tool_role: false,
                             created_at: Some(1_700_000_916_010 + conversation_id),
                             content: message_a.into(),
                         },
                         crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
                             idx: 1,
+                            role: String::new(),
                             is_tool_role: false,
                             created_at: Some(1_700_000_916_020 + conversation_id),
                             content: message_b.into(),
@@ -32575,12 +32789,14 @@ mod tests {
                     vec![
                         crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
                             idx: 0,
+                            role: String::new(),
                             is_tool_role: false,
                             created_at: Some(1_700_000_918_010 + conversation_id),
                             content: message_a.into(),
                         },
                         crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
                             idx: 1,
+                            role: String::new(),
                             is_tool_role: false,
                             created_at: Some(1_700_000_918_020 + conversation_id),
                             content: message_b.into(),
@@ -32653,12 +32869,14 @@ mod tests {
                     vec![
                         crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
                             idx: 0,
+                            role: String::new(),
                             is_tool_role: false,
                             created_at: Some(1_700_000_930_010 + conversation_id),
                             content: message_a.into(),
                         },
                         crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
                             idx: 1,
+                            role: String::new(),
                             is_tool_role: false,
                             created_at: Some(1_700_000_930_020 + conversation_id),
                             content: message_b.into(),
@@ -32757,12 +32975,14 @@ mod tests {
                     vec![
                         crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
                             idx: 0,
+                            role: String::new(),
                             is_tool_role: false,
                             created_at: Some(1_700_000_920_010 + conversation_id),
                             content: message_a.into(),
                         },
                         crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
                             idx: 1,
+                            role: String::new(),
                             is_tool_role: false,
                             created_at: Some(1_700_000_920_020 + conversation_id),
                             content: message_b.into(),

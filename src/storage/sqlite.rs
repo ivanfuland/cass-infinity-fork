@@ -3705,15 +3705,32 @@ pub struct LexicalRebuildMessageRow {
 /// Even lighter message projection used only by the grouped lexical rebuild
 /// stream hot path. It keeps just the per-message fields the rebuild consumes
 /// and tracks the final message id at conversation scope instead.
+///
+/// `role` carries the full persisted role string (6-role safe, see
+/// `role_from_str`/`role_as_str` in `model::types`) so downstream packet
+/// reconstruction can preserve it instead of collapsing to a single bucket.
+/// `is_tool_role` is a fast tool-classification flag derived from `role`
+/// (recognizes `"tool"` and `"tool_result"`, plus the legacy `"toolResult"`
+/// spelling) used for hard-noise filtering.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LexicalRebuildGroupedMessageRow {
     pub idx: i64,
+    pub role: String,
     pub is_tool_role: bool,
     pub created_at: Option<i64>,
     pub content: String,
 }
 
 pub type LexicalRebuildGroupedMessageRows = SmallVec<[LexicalRebuildGroupedMessageRow; 32]>;
+
+/// Tool-class classification for the grouped lexical rebuild hot path
+/// (spec 5.2(c)). Recognizes the canonical 6-role `"tool"`/`"tool_result"`
+/// strings plus the legacy `"toolResult"` spelling — mirrors the sibling
+/// classification in `search::vector_index` (minus `"tool_call"`, which is
+/// the assistant-side invocation, not tool output).
+fn is_lexical_rebuild_tool_class_role(role: &str) -> bool {
+    matches!(role, "tool" | "tool_result" | "toolResult")
+}
 
 /// Default per-conversation lexical-content byte ceiling (#290).
 ///
@@ -8672,9 +8689,11 @@ impl FrankenStorage {
                     current_conversation_id = Some(row.conversation_id);
                 }
                 current_last_message_id = row.id;
+                let is_tool_role = is_lexical_rebuild_tool_class_role(&row.role);
                 current_messages.push(LexicalRebuildGroupedMessageRow {
                     idx: row.idx,
-                    is_tool_role: row.role == "tool",
+                    role: row.role,
+                    is_tool_role,
                     created_at: row.created_at,
                     content: row.content,
                 });
