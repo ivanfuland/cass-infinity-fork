@@ -404,6 +404,13 @@ pub enum Commands {
         /// Filter by workspace path (can be specified multiple times)
         #[arg(long)]
         workspace: Vec<String>,
+        /// Filter by message role: user, assistant, tool, or system (can be
+        /// specified multiple times). Legacy aliases (agent, developer,
+        /// tool_call, tool_result, toolResult, reasoning) are also accepted.
+        /// When given, overrides the semantic engine's default user+assistant
+        /// role filter instead of intersecting with it.
+        #[arg(long)]
+        role: Vec<String>,
         /// Max results. 0 = "no limit" but is auto-capped to a RAM-proportional ceiling
         /// (1/16 of MemAvailable, clamped to [256 MiB, 16 GiB] of result-heap) so a single
         /// query can't tie up the whole machine. Override with CASS_SEARCH_NO_LIMIT_CAP=<hits>
@@ -6551,6 +6558,7 @@ async fn execute_cli(
                     query,
                     agent,
                     workspace,
+                    role,
                     limit,
                     offset,
                     json,
@@ -6669,6 +6677,7 @@ async fn execute_cli(
                         &query,
                         &agent,
                         &workspace,
+                        &role,
                         &eff_limit,
                         &offset,
                         &json,
@@ -22342,6 +22351,7 @@ fn run_cli_search(
     query: &str,
     agents: &[String],
     workspaces: &[String],
+    roles: &[String],
     limit: &usize,
     offset: &usize,
     json: &bool,
@@ -22396,6 +22406,22 @@ fn run_cli_search(
     }
     if !workspaces.is_empty() {
         filters.workspaces = HashSet::from_iter(workspaces.iter().cloned());
+    }
+    if !roles.is_empty() {
+        filters.roles = Some(
+            crate::search::vector_index::parse_role_codes(roles.iter().cloned()).map_err(
+                |e| CliError {
+                    code: 2,
+                    kind: CliErrorKind::Usage.kind_str(),
+                    message: format!("invalid --role: {e}"),
+                    hint: Some(
+                        "Use one of: user, assistant, tool, system (legacy aliases: agent, developer, tool_call, tool_result, toolResult, reasoning)"
+                            .to_string(),
+                    ),
+                    retryable: false,
+                },
+            )?,
+        );
     }
     filters.created_from = time_filter.since;
     filters.created_to = time_filter.until;

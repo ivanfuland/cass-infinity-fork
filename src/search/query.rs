@@ -236,6 +236,70 @@ fn hydrate_message_content_by_conversation(
     Ok(hydrated)
 }
 
+/// Look up a `SearchHit`'s (conversation_id, message idx) key, used to join
+/// back to the `messages` table for post-hoc filters (e.g. `--role`) that
+/// aren't available on the hit itself (lexical/Tantivy has no role field).
+fn message_role_lookup_key(hit: &SearchHit) -> Option<TantivyContentExactKey> {
+    let conversation_id = hit.conversation_id?;
+    let line_idx = i64::try_from(hit.line_number?.checked_sub(1)?).ok()?;
+    Some((conversation_id, line_idx))
+}
+
+/// Batch-hydrate message role codes for a set of (conversation_id, idx) keys.
+///
+/// Mirrors [`hydrate_message_content_by_conversation`]'s per-conversation
+/// chunked-IN query shape, but reads `role` instead of `content` and maps
+/// the stored role string to its compact code via `role_code_from_str` (so
+/// the 6-role normalization stays in one place).
+fn hydrate_message_roles_by_conversation(
+    conn: &Connection,
+    requests: &[TantivyContentExactKey],
+) -> Result<HashMap<TantivyContentExactKey, u8>> {
+    if requests.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut wanted_by_conversation: HashMap<i64, HashSet<i64>> = HashMap::new();
+    for &(conversation_id, line_idx) in requests {
+        wanted_by_conversation
+            .entry(conversation_id)
+            .or_default()
+            .insert(line_idx);
+    }
+
+    let mut conversation_ids = wanted_by_conversation.keys().copied().collect::<Vec<_>>();
+    conversation_ids.sort_unstable();
+    let mut hydrated = HashMap::with_capacity(requests.len());
+
+    for conversation_id in conversation_ids {
+        let Some(wanted_indices) = wanted_by_conversation.get(&conversation_id) else {
+            continue;
+        };
+        let mut wanted_indices = wanted_indices.iter().copied().collect::<Vec<_>>();
+        wanted_indices.sort_unstable();
+        let placeholders = sql_placeholders(wanted_indices.len());
+        let sql = format!(
+            "SELECT m.conversation_id, m.idx, m.role
+             FROM messages m INDEXED BY sqlite_autoindex_messages_1
+             WHERE m.conversation_id = ? AND m.idx IN ({placeholders})"
+        );
+        let mut params = Vec::with_capacity(wanted_indices.len() + 1);
+        params.push(ParamValue::from(conversation_id));
+        params.extend(wanted_indices.iter().copied().map(ParamValue::from));
+        let rows: Vec<(i64, i64, String)> =
+            franken_query_map_collect_retry(conn, &sql, &params, |row| {
+                Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?))
+            })?;
+        for (conversation_id, line_idx, role_str) in rows {
+            if let Some(code) = role_code_from_str(&role_str) {
+                hydrated.insert((conversation_id, line_idx), code);
+            }
+        }
+    }
+
+    Ok(hydrated)
+}
+
 fn semantic_message_id_from_db(message_id: i64) -> std::io::Result<u64> {
     u64::try_from(message_id).map_err(|_| std::io::Error::other("negative message_id"))
 }
@@ -375,6 +439,11 @@ pub struct SearchFilters {
     /// Filter to specific session source paths (for chained searches)
     #[serde(skip_serializing_if = "HashSet::is_empty")]
     pub session_paths: HashSet<String>,
+    /// Filter by message role code(s) (see `role_code_from_str` for the
+    /// name->code mapping). When set, this is an explicit user request and
+    /// overrides the semantic engine's default user+assistant role filter
+    /// (see `search_semantic_candidates`) instead of intersecting with it.
+    pub roles: Option<HashSet<u8>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, clap::ValueEnum)]
@@ -4253,7 +4322,13 @@ impl SearchClient {
     )> {
         let mut semantic_filter =
             SemanticFilter::from_search_filters(filters, &context.filter_maps)?;
-        if let Some(roles) = context.roles.clone() {
+        // `filters.roles` (from an explicit `--role`) overrides the semantic
+        // engine's default user+assistant role filter rather than
+        // intersecting with it: only fall back to the context default when
+        // the caller didn't ask for specific roles.
+        if semantic_filter.roles.is_none()
+            && let Some(roles) = context.roles.clone()
+        {
             semantic_filter = semantic_filter.with_roles(Some(roles));
         }
 
@@ -5600,9 +5675,47 @@ impl SearchClient {
         if !filters.session_paths.is_empty() {
             hits.retain(|hit| filters.session_paths.contains(&hit.source_path));
         }
+        if let Some(roles) = &filters.roles {
+            hits = self.filter_hits_by_role(hits, roles);
+        }
         let available_hits = hits.len();
         let paged_hits = hits.into_iter().skip(offset).take(limit).collect();
         (available_hits, paged_hits)
+    }
+
+    /// Post-hoc `--role` filter applied uniformly across lexical (Tantivy +
+    /// SQLite FTS5 fallback) and semantic hit paths in `postprocess_hits_page`.
+    ///
+    /// Lexical hits have no role stored in the Tantivy schema (adding one is
+    /// out of scope: zero-schema, no frankensearch fork), so role is
+    /// hydrated from SQLite via each hit's (conversation_id, message idx).
+    /// Semantic hits are already role-filtered upstream by
+    /// `search_semantic_candidates`, so this is a cheap, correctness-safety-net
+    /// re-check for them, not their primary enforcement.
+    fn filter_hits_by_role(&self, mut hits: Vec<SearchHit>, roles: &HashSet<u8>) -> Vec<SearchHit> {
+        let keys: Vec<TantivyContentExactKey> =
+            hits.iter().filter_map(message_role_lookup_key).collect();
+
+        let role_map: HashMap<TantivyContentExactKey, u8> = if keys.is_empty() {
+            HashMap::new()
+        } else {
+            match self.sqlite_guard() {
+                Ok(guard) => match guard.as_ref() {
+                    Some(conn) => {
+                        hydrate_message_roles_by_conversation(conn, &keys).unwrap_or_default()
+                    }
+                    None => HashMap::new(),
+                },
+                Err(_) => HashMap::new(),
+            }
+        };
+
+        hits.retain(|hit| {
+            message_role_lookup_key(hit)
+                .and_then(|key| role_map.get(&key))
+                .is_some_and(|code| roles.contains(code))
+        });
+        hits
     }
 
     /// Search with automatic wildcard fallback for sparse results.
@@ -8291,6 +8404,13 @@ fn filters_fingerprint(filters: &SearchFilters) -> String {
         let mut v: Vec<_> = filters.session_paths.iter().cloned().collect();
         v.sort();
         parts.push(format!("sp:{v:?}"));
+    }
+    // Include roles in cache key so a `--role`-filtered query never reuses
+    // (or pollutes) a cache entry computed for a different role filter.
+    if let Some(roles) = &filters.roles {
+        let mut v: Vec<_> = roles.iter().copied().collect();
+        v.sort_unstable();
+        parts.push(format!("r:{v:?}"));
     }
     parts.join("|")
 }

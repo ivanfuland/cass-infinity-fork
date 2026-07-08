@@ -244,7 +244,7 @@ impl SemanticFilter {
             agents,
             workspaces,
             sources,
-            roles: None,
+            roles: filters.roles.clone(),
             created_from: filters.created_from,
             created_to: filters.created_to,
         })
