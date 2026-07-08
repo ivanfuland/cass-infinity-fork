@@ -33,10 +33,13 @@ pub const ROLE_TOOL: u8 = 3;
 pub fn role_code_from_str(role: &str) -> Option<u8> {
     match role {
         "user" => Some(ROLE_USER),
-        // cass historically used both "agent" and "assistant" for model responses.
-        "assistant" | "agent" => Some(ROLE_ASSISTANT),
-        "system" => Some(ROLE_SYSTEM),
-        "tool" => Some(ROLE_TOOL),
+        // cass historically used both "agent" and "assistant" for model responses;
+        // 6-role franken adds "reasoning" (model-authored thinking).
+        "assistant" | "agent" | "reasoning" => Some(ROLE_ASSISTANT),
+        // "developer" is the legacy pre-6-role name for system-authored codex messages.
+        "system" | "developer" => Some(ROLE_SYSTEM),
+        // legacy "tool"/"toolResult" + 6-role "tool_call"/"tool_result" all filter as TOOL.
+        "tool" | "toolResult" | "tool_call" | "tool_result" => Some(ROLE_TOOL),
         _ => None,
     }
 }
@@ -470,6 +473,14 @@ mod tests {
             ("agent", Some(ROLE_ASSISTANT)),
             ("system", Some(ROLE_SYSTEM)),
             ("tool", Some(ROLE_TOOL)),
+            // 6-role franken connector contract (Task 2.2).
+            ("tool_call", Some(ROLE_TOOL)),
+            ("tool_result", Some(ROLE_TOOL)),
+            ("reasoning", Some(ROLE_ASSISTANT)),
+            // Legacy strings that predate the 6-role rename; must still
+            // filter correctly for old rows already in the DB.
+            ("toolResult", Some(ROLE_TOOL)),
+            ("developer", Some(ROLE_SYSTEM)),
             ("unknown", None),
         ];
 
