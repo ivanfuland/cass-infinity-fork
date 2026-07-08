@@ -5701,12 +5701,34 @@ impl SearchClient {
         } else {
             match self.sqlite_guard() {
                 Ok(guard) => match guard.as_ref() {
-                    Some(conn) => {
-                        hydrate_message_roles_by_conversation(conn, &keys).unwrap_or_default()
+                    Some(conn) => hydrate_message_roles_by_conversation(conn, &keys)
+                        .unwrap_or_else(|err| {
+                            tracing::warn!(
+                                error = %err,
+                                hit_count = hits.len(),
+                                "role filter active but SQLite role hydration failed; \
+                                 dropping all hits (fail-closed)"
+                            );
+                            HashMap::new()
+                        }),
+                    None => {
+                        tracing::warn!(
+                            hit_count = hits.len(),
+                            "role filter active but SQLite connection unavailable; \
+                             dropping all hits (fail-closed)"
+                        );
+                        HashMap::new()
                     }
-                    None => HashMap::new(),
                 },
-                Err(_) => HashMap::new(),
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        hit_count = hits.len(),
+                        "role filter active but SQLite guard unavailable; \
+                         dropping all hits (fail-closed)"
+                    );
+                    HashMap::new()
+                }
             }
         };
 

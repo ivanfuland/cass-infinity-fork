@@ -3,6 +3,7 @@
 //! Tests for the --model, --rerank, --reranker, --daemon, and --no-daemon flags
 //! added to the search command.
 
+use assert_cmd::cargo::cargo_bin_cmd;
 use clap::Parser;
 use coding_agent_search::search::query::SearchMode;
 use coding_agent_search::{Cli, Commands};
@@ -280,4 +281,89 @@ fn search_combines_mode_hybrid_and_approximate() {
         }
         other => panic!("expected search command, got {other:?}"),
     }
+}
+
+// =============================================================================
+// --role flag parsing (Task 2.2b)
+// =============================================================================
+
+#[test]
+fn search_parses_role_flag() {
+    let cli = parse_cli(["cass", "search", "query", "--role", "tool"]);
+
+    match cli.command {
+        Some(Commands::Search { role, .. }) => {
+            assert_eq!(role, vec!["tool".to_string()]);
+        }
+        other => panic!("expected search command, got {other:?}"),
+    }
+}
+
+#[test]
+fn search_parses_multiple_role_flags() {
+    // `--role` is repeatable (`Vec<String>`), like `--agent`/`--workspace`;
+    // each occurrence should accumulate rather than the last one winning.
+    let cli = parse_cli([
+        "cass", "search", "query", "--role", "tool", "--role", "user",
+    ]);
+
+    match cli.command {
+        Some(Commands::Search { role, .. }) => {
+            assert_eq!(role, vec!["tool".to_string(), "user".to_string()]);
+        }
+        other => panic!("expected search command, got {other:?}"),
+    }
+}
+
+#[test]
+fn search_role_default_is_empty() {
+    let cli = parse_cli(["cass", "search", "query"]);
+
+    match cli.command {
+        Some(Commands::Search { role, .. }) => {
+            assert!(role.is_empty(), "role should default to an empty Vec");
+        }
+        other => panic!("expected search command, got {other:?}"),
+    }
+}
+
+/// `--role` isn't validated by clap itself (the field is a plain
+/// `Vec<String>`, exactly like `--agent`/`--workspace`) -- any string
+/// parses fine at this layer. Role-code validation happens at runtime in
+/// `run_cli_search` via `parse_role_codes` (see
+/// `src/search/vector_index.rs::parse_role_codes_rejects_unknown_roles`
+/// for its own unit coverage). This test pins both halves so a regression
+/// in either layer is caught: clap must still accept the raw string, and
+/// the CLI as a whole must reject it with a clear, actionable error
+/// instead of silently dropping the filter or matching every role.
+#[test]
+fn search_unknown_role_is_accepted_by_clap_but_rejected_at_runtime() {
+    let cli = parse_cli(["cass", "search", "query", "--role", "bogus"]);
+    match cli.command {
+        Some(Commands::Search { role, .. }) => {
+            assert_eq!(role, vec!["bogus".to_string()]);
+        }
+        other => panic!("expected search command, got {other:?}"),
+    }
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let data_dir = tmp.path().join("cass_data");
+    std::fs::create_dir_all(&data_dir).expect("create data dir");
+
+    let output = cargo_bin_cmd!("cass")
+        .args(["search", "query", "--role", "bogus", "--data-dir"])
+        .arg(&data_dir)
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .output()
+        .expect("run cass search --role bogus");
+
+    assert!(
+        !output.status.success(),
+        "an unknown --role value must fail, not silently pass"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid --role") && stderr.contains("bogus"),
+        "error should clearly name the bad --role value. Got: {stderr}"
+    );
 }

@@ -495,6 +495,57 @@ mod tests {
         assert!(err.to_string().contains("unknown role"));
     }
 
+    /// Regression coverage for Task 2.2b's riskiest untested logic: an
+    /// explicit `--role` must override the semantic engine's default
+    /// user+assistant role filter rather than being silently dropped or
+    /// merged with it.
+    ///
+    /// `SemanticFilter::from_search_filters` is the first of two production
+    /// sites in that override: it must carry `filters.roles` through
+    /// unchanged (`Some` stays `Some`, `None` stays `None`) so that the
+    /// caller-side guard in `search_semantic_candidates`
+    /// (`src/search/query.rs`, `if semantic_filter.roles.is_none() && let
+    /// Some(roles) = context.roles.clone() { ... }`) can tell "explicit
+    /// roles given" apart from "apply the default". If this function ever
+    /// started overwriting or dropping explicit roles, that guard would
+    /// silently clobber every `--role` query with the user+assistant
+    /// default. The guard itself (the second site) is exercised
+    /// end-to-end, offline, via the `--embedder hash` harness in
+    /// `tests/role_filter.rs::role_filter_semantic_mode_role_overrides_default`.
+    #[test]
+    fn semantic_filter_from_search_filters_preserves_explicit_role_override() {
+        let maps = SemanticFilterMaps::for_tests(
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashSet::new(),
+        );
+
+        // Explicit `--role tool` must survive untouched, not be overwritten.
+        let mut explicit_filters = SearchFilters::default();
+        explicit_filters.roles = Some(HashSet::from([ROLE_TOOL]));
+        let explicit = SemanticFilter::from_search_filters(&explicit_filters, &maps)
+            .expect("from_search_filters with explicit roles");
+        assert_eq!(
+            explicit.roles,
+            Some(HashSet::from([ROLE_TOOL])),
+            "explicit --role must be carried through, not overwritten by the semantic default"
+        );
+
+        // Default case: no explicit --role -> roles must stay None so the
+        // `search_semantic_candidates` guard falls through to the engine's
+        // user+assistant default instead of misreading "no roles" as
+        // "filter to nothing".
+        let default_filters = SearchFilters::default();
+        let default = SemanticFilter::from_search_filters(&default_filters, &maps)
+            .expect("from_search_filters with no roles");
+        assert_eq!(
+            default.roles, None,
+            "absent --role must leave roles as None, not Some(empty set) or the default, \
+             so the caller can distinguish \"apply default\" from \"explicit filter\""
+        );
+    }
+
     #[test]
     fn vector_index_path_points_to_fsvi() {
         let dir = Path::new("/tmp/cass");
