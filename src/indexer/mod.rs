@@ -3644,6 +3644,32 @@ fn lexical_rebuild_noise_role(is_tool_role: bool) -> Option<&'static str> {
     is_tool_role.then_some("tool")
 }
 
+/// Tool-class classification for the canonical-replay live lexical rebuild
+/// path, on `MessageRole` (post Task 2.1 codec) rather than a raw string.
+///
+/// Routes through the canonical role codec (`role_as_str`) into the single
+/// string classifier (`is_lexical_rebuild_tool_class_role`) so there is ONE
+/// source of truth: `MessageRole::Tool` ("tool") and the `Other` variants for
+/// `"tool_result"`/`"toolResult"` are tool-class; `"tool_call"` (the
+/// assistant-side invocation, not tool output) is not. After the Task 2.1
+/// unified codec, `role_from_str("tool_result")` is `Other("tool_result")`, so
+/// a bare `matches!(role, MessageRole::Tool)` is blind to tool_result output —
+/// this helper is not.
+///
+/// INVARIANT: the canonical-replay sink (`from_canonical_replay_messages`) and
+/// the healthy-doc-count expectation (`expected_live_lexical_doc_count`) MUST
+/// call this identical predicate. If the sink drops a message as tool-ack noise
+/// that the counter still expects (or vice versa), observed-vs-expected doc
+/// counts diverge and re-trigger the cass#244/#258 sparse-repair false-positive
+/// rebuild loop.
+fn is_lexical_rebuild_tool_class_message_role(
+    role: &crate::model::types::MessageRole,
+) -> bool {
+    crate::storage::sqlite::is_lexical_rebuild_tool_class_role(
+        crate::model::types::role_as_str(role),
+    )
+}
+
 fn lexical_rebuild_packet_provenance_from_canonical(
     conv: &crate::storage::sqlite::LexicalRebuildConversationRow,
     source_map: &HashMap<String, (SourceKind, Option<String>)>,
@@ -3772,7 +3798,11 @@ fn lexical_rebuild_grouped_message_from_normalized(
         // `from_canonical_replay_messages`'s grouped rows in the canonical
         // vs normalized equivalence test below.
         role: String::new(),
-        is_tool_role: message.role.eq_ignore_ascii_case("tool"),
+        // Mirror the canonical-replay sink's tool-class predicate (via the same
+        // single source of truth) so this normalized test-builder stays
+        // byte-equivalent against `from_canonical_replay_messages` for
+        // tool_result rows too, not just the literal `"tool"` role.
+        is_tool_role: crate::storage::sqlite::is_lexical_rebuild_tool_class_role(&message.role),
         created_at: message.created_at,
         content: message.content.clone(),
     }
@@ -3896,7 +3926,7 @@ impl LexicalRebuildConversationPacket {
                 // grouped rows in the canonical vs normalized equivalence
                 // test below.
                 role: String::new(),
-                is_tool_role: matches!(message.role, crate::model::types::MessageRole::Tool),
+                is_tool_role: is_lexical_rebuild_tool_class_message_role(&message.role),
                 created_at: message.created_at,
                 content: message.content,
             });
@@ -8832,7 +8862,7 @@ fn expected_live_lexical_doc_count(storage: &FrankenStorage) -> Result<usize> {
     let mut expected_docs = 0usize;
     for conversation_id in conversation_ids {
         for message in storage.fetch_messages_for_lexical_rebuild(conversation_id)? {
-            let is_tool_role = matches!(message.role, crate::model::types::MessageRole::Tool);
+            let is_tool_role = is_lexical_rebuild_tool_class_message_role(&message.role);
             if !is_hard_message_noise(lexical_rebuild_noise_role(is_tool_role), &message.content) {
                 expected_docs += 1;
             }
@@ -31309,6 +31339,161 @@ mod tests {
         );
 
         println!("LEXICAL_6ROLE_OK");
+    }
+
+    /// Task 2.3 follow-up: the *live* `--force-rebuild` canonical-replay path
+    /// (`fetch_messages_for_lexical_rebuild_batch` -> `from_canonical_replay_messages`,
+    /// the sink at `is_tool_role: ...`) must classify a `tool_result`-role
+    /// message as tool-class. Before the fix it computed
+    /// `matches!(role, MessageRole::Tool)`, which — after the Task 2.1 codec
+    /// maps `"tool_result"` to `Other("tool_result")` — is blind to tool
+    /// output, so a genuine tool-result acknowledgement ("already up to date")
+    /// leaked into the lexical index. This drives the real sink and also
+    /// asserts the sink and the `expected_live_lexical_doc_count` counter agree
+    /// on the doc count for the same corpus (the cass#244/#258 invariant).
+    #[test]
+    fn live_force_rebuild_classifies_tool_result_ack_as_tool_and_sink_matches_counter() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("tool-result-live-rebuild.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("1.0.0".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        let workspace_id = storage
+            .ensure_workspace(Path::new("/tmp/tool-result-live-workspace"), None)
+            .unwrap();
+
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/tool-result-live-workspace")),
+            external_id: Some("tool-result-live-rebuild".into()),
+            title: Some("Tool result live rebuild".into()),
+            source_path: PathBuf::from("/tmp/tool-result-live-rebuild.jsonl"),
+            started_at: Some(1_700_002_000_000),
+            ended_at: Some(1_700_002_000_500),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![
+                Message {
+                    id: None,
+                    idx: 0,
+                    role: crate::model::types::role_from_str("user"),
+                    author: Some("user".into()),
+                    created_at: Some(1_700_002_000_010),
+                    content: "please refresh the dependency lockfile".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                },
+                Message {
+                    id: None,
+                    idx: 1,
+                    role: crate::model::types::role_from_str("assistant"),
+                    author: Some("assistant".into()),
+                    created_at: Some(1_700_002_000_020),
+                    content: "running the refresh now".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                },
+                Message {
+                    id: None,
+                    idx: 2,
+                    // "already up to date" is a tool-result acknowledgement that
+                    // `is_tool_acknowledgement` drops ONLY when the role is
+                    // recognized as tool-class (it carries no "file"/"match"
+                    // fallback token). It is the discriminator: pre-fix
+                    // is_tool_role=false leaves it in the index; post-fix
+                    // is_tool_role=true drops it.
+                    role: crate::model::types::role_from_str("tool_result"),
+                    author: Some("tool".into()),
+                    created_at: Some(1_700_002_000_030),
+                    content: "already up to date".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                },
+            ],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+
+        let inserted = storage
+            .insert_conversation_tree(agent_id, Some(workspace_id), &conversation)
+            .unwrap();
+
+        // Drive the real live canonical-replay sink used by `--force-rebuild`:
+        // batch-fetch the persisted messages (roles round-trip through the
+        // Task 2.1 codec, so `tool_result` comes back as `Other("tool_result")`)
+        // and build the packet exactly as `prepare_lexical_rebuild_packet_batch`
+        // does.
+        let mut fetched = storage
+            .fetch_messages_for_lexical_rebuild_batch(&[inserted.conversation_id], None, None)
+            .unwrap();
+        let replay_messages = fetched
+            .remove(&inserted.conversation_id)
+            .expect("canonical replay messages");
+        let replay_row = crate::storage::sqlite::LexicalRebuildConversationRow {
+            id: Some(inserted.conversation_id),
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/tool-result-live-workspace")),
+            external_id: Some("tool-result-live-rebuild".into()),
+            title: Some("Tool result live rebuild".into()),
+            source_path: PathBuf::from("/tmp/tool-result-live-rebuild.jsonl"),
+            started_at: Some(1_700_002_000_000),
+            ended_at: Some(1_700_002_000_500),
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+
+        let packet = LexicalRebuildConversationPacket::from_canonical_replay_messages(
+            replay_row,
+            replay_messages,
+            &HashMap::new(),
+        )
+        .unwrap();
+
+        // (a) RED before / GREEN after: the sink must flag the tool_result row
+        // as tool-class. The canonical-replay path leaves `role` empty, so match
+        // by idx.
+        let tool_result_row = packet
+            .messages
+            .iter()
+            .find(|row| row.idx == 2)
+            .expect("tool_result row present in canonical-replay projection");
+        assert!(
+            tool_result_row.is_tool_role,
+            "live force-rebuild sink must classify tool_result as tool-class (Other(\"tool_result\") is not MessageRole::Tool)"
+        );
+
+        // (b) Behavioral RED before / GREEN after: the tool-result ack must be
+        // dropped as hard noise, leaving only the user + assistant docs.
+        let docs = packet.prebuilt_docs();
+        assert_eq!(
+            docs.len(),
+            2,
+            "tool_result ack must be dropped from the lexical index, leaving user + assistant"
+        );
+        assert!(
+            !docs.iter().any(|doc| doc.content == "already up to date"),
+            "the tool_result acknowledgement must not leak into the lexical index"
+        );
+
+        // (c) Invariant guard (holds pre- and post-fix, but MUST never
+        // diverge): the healthy-doc-count expectation used by the sparse-repair
+        // check must agree with what the sink actually emits for this corpus.
+        let expected = expected_live_lexical_doc_count(&storage).unwrap();
+        assert_eq!(
+            expected,
+            docs.len(),
+            "expected_live_lexical_doc_count (counter) must match prebuilt_docs (sink) for a tool_result corpus"
+        );
+
+        println!("LEXICAL_TOOL_RESULT_LIVE_OK");
     }
 
     #[test]

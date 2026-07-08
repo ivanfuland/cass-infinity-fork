@@ -3728,7 +3728,14 @@ pub type LexicalRebuildGroupedMessageRows = SmallVec<[LexicalRebuildGroupedMessa
 /// strings plus the legacy `"toolResult"` spelling — mirrors the sibling
 /// classification in `search::vector_index` (minus `"tool_call"`, which is
 /// the assistant-side invocation, not tool output).
-fn is_lexical_rebuild_tool_class_role(role: &str) -> bool {
+///
+/// This is the single source of truth for lexical-rebuild tool-class
+/// classification. The canonical-replay live path in `indexer` routes its
+/// `MessageRole`-typed sites through this via `role_as_str` (see
+/// `indexer::is_lexical_rebuild_tool_class_message_role`) so the streaming
+/// grouped-row path here and the canonical-replay sink/counter there can
+/// never drift on which roles count as tool output.
+pub(crate) fn is_lexical_rebuild_tool_class_role(role: &str) -> bool {
     matches!(role, "tool" | "tool_result" | "toolResult")
 }
 
