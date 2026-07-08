@@ -2983,7 +2983,7 @@ Update check state is stored in the data directory:
 | Dependency | Pinned source |
 |------------|-----------------|
 | `frankensqlite` / `fsqlite-types` | `=0.1.11` (crates.io; #95 BtCursor + #106 MVCC grow + FTS5 shadow-table persistence/lazy-reopen + MAX/MIN(rowid) leaf-seek + 0.1.11 FTS5 merge/finalize O(N²)→O(N) spin fix [cass#301] + composite-UNIQUE FK INSERT [#116] + correlated NOT EXISTS planner [#117] fixes) |
-| `franken-agent-detection` | `3c30766` |
+| `franken-agent-detection` | `cfea5b1` (fork: ivanfuland/my_franken_agent_detection, six-role-normalization) |
 | `asupersync` | `=0.3.5` |
 | `frankensearch` | `2cad158f` |
 | `frankentui` | `5f78cfa0` |
