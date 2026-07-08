@@ -41062,12 +41062,14 @@ fn doctor_candidate_message_role(value: &serde_json::Value) -> crate::model::typ
         .trim()
         .to_ascii_lowercase();
     match role.as_str() {
-        "user" | "human" => crate::model::types::MessageRole::User,
-        "assistant" | "agent" | "model" => crate::model::types::MessageRole::Agent,
-        "tool" | "function" => crate::model::types::MessageRole::Tool,
-        "system" => crate::model::types::MessageRole::System,
+        "human" => crate::model::types::MessageRole::User,
+        "model" => crate::model::types::MessageRole::Agent,
+        "function" => crate::model::types::MessageRole::Tool,
         "" | "other" => crate::model::types::MessageRole::Other("raw_mirror".to_string()),
-        other => crate::model::types::MessageRole::Other(other.to_string()),
+        // "user"/"assistant"/"agent"/"tool"/"system"/anything else: route
+        // through the shared codec so "assistant" doesn't collapse into
+        // the legacy `Agent` variant.
+        other => crate::model::types::role_from_str(other),
     }
 }
 
@@ -83852,13 +83854,7 @@ mod response_schema_tests {
 }
 
 fn role_to_export_string(role: &crate::model::types::MessageRole) -> String {
-    match role {
-        crate::model::types::MessageRole::User => "user".to_string(),
-        crate::model::types::MessageRole::Agent => "assistant".to_string(),
-        crate::model::types::MessageRole::Tool => "tool".to_string(),
-        crate::model::types::MessageRole::System => "system".to_string(),
-        crate::model::types::MessageRole::Other(s) => s.clone(),
-    }
+    crate::model::types::role_as_str(role).to_string()
 }
 
 fn conversation_view_to_raw_messages(

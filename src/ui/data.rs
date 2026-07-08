@@ -811,7 +811,7 @@ pub fn log_conversation_cache_stats() {
 pub fn role_style(role: &MessageRole, palette: ThemePalette) -> ftui::Style {
     match role {
         MessageRole::User => ftui::Style::new().fg(palette.user),
-        MessageRole::Agent => ftui::Style::new().fg(palette.agent),
+        MessageRole::Agent | MessageRole::Assistant => ftui::Style::new().fg(palette.agent),
         MessageRole::Tool => ftui::Style::new().fg(palette.tool),
         MessageRole::System => ftui::Style::new().fg(palette.system),
         MessageRole::Other(_) => ftui::Style::new().fg(palette.hint),

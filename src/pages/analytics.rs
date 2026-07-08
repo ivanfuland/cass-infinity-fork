@@ -122,17 +122,12 @@ impl Statistics {
             }
 
             // Role counts mirror the SQL path's raw GROUP BY role
-            // surface. Packet canonical replay normalizes Agent turns to
-            // "assistant", while storage writes MessageRole::Agent as
-            // "agent"; map that spelling back and preserve every other
-            // role string instead of collapsing it into "other".
+            // surface. Packet canonical replay (`canonical_role`) now
+            // routes through the same codec storage uses to persist the
+            // role column, so the packet's role string already matches
+            // the raw DB text verbatim — no compensating remap needed.
             for message in &payload.messages {
-                let role = if message.role == "assistant" {
-                    "agent"
-                } else {
-                    message.role.as_str()
-                };
-                *roles.entry(role.to_string()).or_insert(0) += 1;
+                *roles.entry(message.role.clone()).or_insert(0) += 1;
             }
 
             if let Some(started_at) = payload.timestamps.started_at {
@@ -1085,7 +1080,7 @@ mod tests {
             // here, only the projections + identity + timestamps fields
             // the analytics derivation reads.
             use crate::model::types::{
-                Conversation, Message, MessageRole, Snippet as CanonicalSnippet,
+                Conversation, Message, Snippet as CanonicalSnippet, role_from_str,
             };
             let _ = CanonicalSnippet {
                 id: None,
@@ -1115,13 +1110,7 @@ mod tests {
                     .map(|(idx, role, content, created_at)| Message {
                         id: None,
                         idx,
-                        role: match role.as_str() {
-                            "user" => MessageRole::User,
-                            "agent" | "assistant" => MessageRole::Agent,
-                            "tool" => MessageRole::Tool,
-                            "system" => MessageRole::System,
-                            other => MessageRole::Other(other.to_string()),
-                        },
+                        role: role_from_str(&role),
                         author: None,
                         created_at,
                         content,

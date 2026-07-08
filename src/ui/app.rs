@@ -9311,7 +9311,9 @@ impl CassApp {
     fn role_style(role: &MessageRole, styles: &StyleContext) -> ftui::Style {
         match role {
             MessageRole::User => styles.style(style_system::STYLE_ROLE_USER),
-            MessageRole::Agent => styles.style(style_system::STYLE_ROLE_ASSISTANT),
+            MessageRole::Agent | MessageRole::Assistant => {
+                styles.style(style_system::STYLE_ROLE_ASSISTANT)
+            }
             MessageRole::Tool => styles.style(style_system::STYLE_ROLE_TOOL),
             MessageRole::System => styles.style(style_system::STYLE_ROLE_SYSTEM),
             MessageRole::Other(_) => styles.style(style_system::STYLE_TEXT_MUTED),
@@ -9322,7 +9324,9 @@ impl CassApp {
     fn role_gutter_style(role: &MessageRole, styles: &StyleContext) -> ftui::Style {
         match role {
             MessageRole::User => styles.style(style_system::STYLE_ROLE_GUTTER_USER),
-            MessageRole::Agent => styles.style(style_system::STYLE_ROLE_GUTTER_ASSISTANT),
+            MessageRole::Agent | MessageRole::Assistant => {
+                styles.style(style_system::STYLE_ROLE_GUTTER_ASSISTANT)
+            }
             MessageRole::Tool => styles.style(style_system::STYLE_ROLE_GUTTER_TOOL),
             MessageRole::System => styles.style(style_system::STYLE_ROLE_GUTTER_SYSTEM),
             MessageRole::Other(_) => styles.style(style_system::STYLE_TEXT_MUTED),
@@ -9333,7 +9337,7 @@ impl CassApp {
     fn role_prefix(role: &MessageRole) -> &'static str {
         match role {
             MessageRole::User => "\u{f061} ",     // arrow-right →
-            MessageRole::Agent => "\u{2713} ",    // checkmark ✓
+            MessageRole::Agent | MessageRole::Assistant => "\u{2713} ", // checkmark ✓
             MessageRole::Tool => "\u{2699} ",     // gear ⚙
             MessageRole::System => "\u{2139} ",   // info ℹ
             MessageRole::Other(_) => "\u{2022} ", // bullet •
@@ -9481,7 +9485,8 @@ impl CassApp {
             for m in &cv.messages {
                 match m.role {
                     crate::model::types::MessageRole::User => n_user += 1,
-                    crate::model::types::MessageRole::Agent => n_agent += 1,
+                    crate::model::types::MessageRole::Agent
+                    | crate::model::types::MessageRole::Assistant => n_agent += 1,
                     crate::model::types::MessageRole::Tool => n_tool += 1,
                     crate::model::types::MessageRole::System => n_sys += 1,
                     _ => {}
@@ -10519,7 +10524,8 @@ impl CassApp {
         for m in &cv.messages {
             match m.role {
                 crate::model::types::MessageRole::User => n_user += 1,
-                crate::model::types::MessageRole::Agent => n_agent += 1,
+                crate::model::types::MessageRole::Agent
+                | crate::model::types::MessageRole::Assistant => n_agent += 1,
                 crate::model::types::MessageRole::Tool => n_tool += 1,
                 crate::model::types::MessageRole::System => n_sys += 1,
                 crate::model::types::MessageRole::Other(_) => n_other += 1,
@@ -22814,7 +22820,8 @@ fn export_session_task(
 
                 let role = match msg.role {
                     crate::model::types::MessageRole::User => "user",
-                    crate::model::types::MessageRole::Agent => "assistant",
+                    crate::model::types::MessageRole::Agent
+                    | crate::model::types::MessageRole::Assistant => "assistant",
                     crate::model::types::MessageRole::System => "system",
                     crate::model::types::MessageRole::Tool => "tool",
                     crate::model::types::MessageRole::Other(_) => "unknown",

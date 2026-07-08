@@ -24455,7 +24455,9 @@ pub mod persist {
         EmbeddingInput, packet_embedding_inputs_from_storage_for_message_ids,
     };
     use crate::model::conversation_packet::{ConversationPacket, ConversationPacketProvenance};
-    use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole, Snippet};
+    use crate::model::types::{
+        Agent, AgentKind, Conversation, Message, MessageRole, Snippet, role_from_str,
+    };
     use crate::search::tantivy::TantivyIndex;
     #[cfg(test)]
     use crate::sources::provenance::{Source, SourceKind};
@@ -26021,13 +26023,7 @@ pub mod persist {
     }
 
     fn map_role(role: &str) -> MessageRole {
-        match role {
-            "user" => MessageRole::User,
-            "assistant" | "agent" => MessageRole::Agent,
-            "tool" => MessageRole::Tool,
-            "system" => MessageRole::System,
-            other => MessageRole::Other(other.to_string()),
-        }
+        role_from_str(role)
     }
 
     #[cfg(test)]

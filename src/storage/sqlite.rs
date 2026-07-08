@@ -1,6 +1,8 @@
 //! `SQLite` backend: schema, pragmas, and migrations.
 
-use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole, Snippet};
+use crate::model::types::{
+    Agent, AgentKind, Conversation, Message, MessageRole, Snippet, role_as_str, role_from_str,
+};
 use crate::sources::provenance::{LOCAL_SOURCE_ID, Source, SourceKind};
 use anyhow::{Context, Result, anyhow, bail};
 use frankensqlite::{
@@ -6337,16 +6339,6 @@ fn borrowed_messages_tail_state(messages: &[&Message]) -> (Option<i64>, Option<i
     )
 }
 
-fn role_from_str(role: &str) -> MessageRole {
-    match role {
-        "user" => MessageRole::User,
-        "agent" | "assistant" => MessageRole::Agent,
-        "tool" => MessageRole::Tool,
-        "system" => MessageRole::System,
-        other => MessageRole::Other(other.to_string()),
-    }
-}
-
 fn message_merge_fingerprint(msg: &Message) -> MessageMergeFingerprint {
     MessageMergeFingerprint {
         idx: msg.idx,
@@ -8371,13 +8363,7 @@ impl FrankenStorage {
                 Ok(Message {
                     id: Some(row.get_typed(0)?),
                     idx: row.get_typed(1)?,
-                    role: match role.as_str() {
-                        "user" => MessageRole::User,
-                        "agent" | "assistant" => MessageRole::Agent,
-                        "tool" => MessageRole::Tool,
-                        "system" => MessageRole::System,
-                        other => MessageRole::Other(other.to_string()),
-                    },
+                    role: role_from_str(&role),
                     author: row.get_typed(3)?,
                     created_at: row.get_typed(4)?,
                     content: row.get_typed(5)?,
@@ -8398,13 +8384,7 @@ impl FrankenStorage {
                             Ok(Message {
                                 id: Some(row.get_typed(0)?),
                                 idx: row.get_typed(1)?,
-                                role: match role.as_str() {
-                                    "user" => MessageRole::User,
-                                    "agent" | "assistant" => MessageRole::Agent,
-                                    "tool" => MessageRole::Tool,
-                                    "system" => MessageRole::System,
-                                    other => MessageRole::Other(other.to_string()),
-                                },
+                                role: role_from_str(&role),
                                 author: row.get_typed(3)?,
                                 created_at: row.get_typed(4)?,
                                 content: row.get_typed(5)?,
@@ -8491,13 +8471,7 @@ impl FrankenStorage {
                 Ok(Message {
                     id: Some(row.get_typed(0)?),
                     idx: row.get_typed(1)?,
-                    role: match role.as_str() {
-                        "user" => MessageRole::User,
-                        "agent" | "assistant" => MessageRole::Agent,
-                        "tool" => MessageRole::Tool,
-                        "system" => MessageRole::System,
-                        other => MessageRole::Other(other.to_string()),
-                    },
+                    role: role_from_str(&role),
                     author: row.get_typed(3)?,
                     created_at: row.get_typed(4)?,
                     content: row.get_typed(5)?,
@@ -8518,13 +8492,7 @@ impl FrankenStorage {
                             Ok(Message {
                                 id: Some(row.get_typed(0)?),
                                 idx: row.get_typed(1)?,
-                                role: match role.as_str() {
-                                    "user" => MessageRole::User,
-                                    "agent" | "assistant" => MessageRole::Agent,
-                                    "tool" => MessageRole::Tool,
-                                    "system" => MessageRole::System,
-                                    other => MessageRole::Other(other.to_string()),
-                                },
+                                role: role_from_str(&role),
                                 author: row.get_typed(3)?,
                                 created_at: row.get_typed(4)?,
                                 content: row.get_typed(5)?,
@@ -9464,13 +9432,7 @@ impl FrankenStorage {
                     Ok(Message {
                         id: None,
                         idx: msg_row.get_typed(0)?,
-                        role: match role.as_str() {
-                            "user" => MessageRole::User,
-                            "agent" | "assistant" => MessageRole::Agent,
-                            "tool" => MessageRole::Tool,
-                            "system" => MessageRole::System,
-                            other => MessageRole::Other(other.to_string()),
-                        },
+                        role: role_from_str(&role),
                         author: msg_row.get_typed(2)?,
                         created_at: msg_row.get_typed(3)?,
                         content: msg_row.get_typed(4)?,
@@ -16129,16 +16091,6 @@ fn path_to_string<P: AsRef<Path>>(p: P) -> String {
 
 fn role_str(role: &MessageRole) -> String {
     role_as_str(role).to_owned()
-}
-
-fn role_as_str(role: &MessageRole) -> &str {
-    match role {
-        MessageRole::User => "user",
-        MessageRole::Agent => "agent",
-        MessageRole::Tool => "tool",
-        MessageRole::System => "system",
-        MessageRole::Other(v) => v.as_str(),
-    }
 }
 
 fn agent_kind_str(kind: AgentKind) -> String {
@@ -23001,6 +22953,207 @@ mod tests {
         assert!(lexical[0].extra_json.is_null());
     }
 
+    /// franken 6-role normalization contract (task 2.1): `"assistant"` must
+    /// survive the store->read round-trip as its own role string, not
+    /// collapse into the legacy `"agent"` spelling. Covers both production
+    /// read paths (`fetch_messages` and the lexical-rebuild projection) plus
+    /// a direct check of the raw DB `role` TEXT column.
+    #[test]
+    fn assistant_roundtrips_not_collapsed_to_agent() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("assistant-roundtrip.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("0.2.3".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: Some("assistant-roundtrip-test".into()),
+            title: Some("6-role roundtrip".into()),
+            source_path: PathBuf::from("/tmp/assistant-roundtrip.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_300),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![
+                Message {
+                    id: None,
+                    idx: 0,
+                    role: role_from_str("user"),
+                    author: None,
+                    created_at: Some(1_700_000_000_010),
+                    content: "hello".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                },
+                Message {
+                    id: None,
+                    idx: 1,
+                    role: role_from_str("assistant"),
+                    author: None,
+                    created_at: Some(1_700_000_000_020),
+                    content: "hi there".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                },
+                Message {
+                    id: None,
+                    idx: 2,
+                    role: role_from_str("tool_result"),
+                    author: None,
+                    created_at: Some(1_700_000_000_030),
+                    content: "result payload".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                },
+            ],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+
+        let inserted = storage
+            .insert_conversation_tree(agent_id, None, &conversation)
+            .unwrap();
+        let conversation_id = inserted.conversation_id;
+
+        // Direct read path.
+        let stored = storage.fetch_messages(conversation_id).unwrap();
+        assert_eq!(stored.len(), 3);
+        assert_eq!(
+            role_as_str(&stored[1].role),
+            "assistant",
+            "assistant role must round-trip as \"assistant\", not collapse to \"agent\""
+        );
+        assert_ne!(
+            stored[1].role,
+            MessageRole::Agent,
+            "assistant-tagged message must not be read back as the legacy Agent variant"
+        );
+        assert_eq!(
+            role_as_str(&stored[2].role),
+            "tool_result",
+            "tool_result must survive the store->read round-trip unchanged"
+        );
+
+        // The other production read path (lexical-rebuild projection) must
+        // agree — it shares the same `role_from_str` call, but assert it
+        // directly since it used to be an independently hand-rolled parser.
+        let lexical = storage
+            .fetch_messages_for_lexical_rebuild_uncapped(conversation_id)
+            .unwrap();
+        assert_eq!(lexical.len(), 3);
+        assert_eq!(role_as_str(&lexical[1].role), "assistant");
+        assert_eq!(role_as_str(&lexical[2].role), "tool_result");
+
+        // The raw DB TEXT column itself must never have collapsed either —
+        // this is the ground truth downstream consumers (e.g. search) read.
+        let raw_role: String = storage
+            .conn
+            .query_row_map(
+                "SELECT role FROM messages WHERE conversation_id = ?1 AND idx = ?2",
+                fparams![conversation_id, 1_i64],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(raw_role, "assistant");
+    }
+
+    /// franken 6-role normalization contract (task 2.1): a non-empty `extra`
+    /// payload serializes into `extra_bin` (msgpack), leaving `extra_json`
+    /// NULL (see `franken_message_insert_payload`). SQL `json_extract` on
+    /// `extra_json` is therefore always NULL for this shape — only
+    /// `fetch_messages` (via `franken_read_message_extra_compat`) decodes
+    /// `extra_bin` back, so it is the only path that can prove a
+    /// `tool_call_id` pairing key survives the round-trip.
+    #[test]
+    fn tool_result_pairing_survives_extra_bin_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("tool-result-pairing.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("0.2.3".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: Some("tool-result-pairing-test".into()),
+            title: Some("tool_result pairing".into()),
+            source_path: PathBuf::from("/tmp/tool-result-pairing.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_200),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: role_from_str("tool_result"),
+                author: None,
+                created_at: Some(1_700_000_000_010),
+                content: "tool ran".into(),
+                extra_json: serde_json::json!({ "tool_call_id": "tu_1" }),
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+
+        let inserted = storage
+            .insert_conversation_tree(agent_id, None, &conversation)
+            .unwrap();
+        let conversation_id = inserted.conversation_id;
+
+        // Confirm this row actually took the extra_bin (msgpack) path, not
+        // extra_json, so the assertion below genuinely exercises the
+        // msgpack decode rather than the plain-JSON shortcut.
+        let (extra_json_col, extra_bin_col): (Option<String>, Option<Vec<u8>>) = storage
+            .conn
+            .query_row_map(
+                "SELECT extra_json, extra_bin FROM messages WHERE conversation_id = ?1 AND idx = ?2",
+                fparams![conversation_id, 0_i64],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )
+            .unwrap();
+        assert!(
+            extra_json_col.is_none(),
+            "non-empty extra must serialize into extra_bin, leaving extra_json NULL"
+        );
+        assert!(
+            extra_bin_col.is_some(),
+            "tool_call_id payload must be present in extra_bin (msgpack)"
+        );
+
+        let stored = storage.fetch_messages(conversation_id).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(role_as_str(&stored[0].role), "tool_result");
+        let tool_call_id = stored[0]
+            .extra_json
+            .get("tool_call_id")
+            .and_then(|v| v.as_str());
+        assert_eq!(
+            tool_call_id,
+            Some("tu_1"),
+            "tool_call_id must survive the extra_bin msgpack round-trip via fetch_messages"
+        );
+        println!("TOOLRESULT_PAIRED_ROUNDTRIP_OK");
+    }
+
     #[test]
     fn fetch_messages_for_lexical_rebuild_batch_groups_and_orders_messages() {
         let dir = TempDir::new().unwrap();
@@ -23646,13 +23799,7 @@ mod tests {
                         (
                             conversation_id,
                             idx,
-                            match role {
-                                MessageRole::User => "user".to_string(),
-                                MessageRole::Agent => "agent".to_string(),
-                                MessageRole::Tool => "tool".to_string(),
-                                MessageRole::System => "system".to_string(),
-                                MessageRole::Other(other) => other,
-                            },
+                            role_as_str(&role).to_string(),
                             author,
                             created_at,
                             content,

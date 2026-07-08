@@ -12,7 +12,7 @@ use serde_json::Value;
 use std::{borrow::Cow, ops::Range, path::Path};
 
 use crate::connectors::{NormalizedConversation, NormalizedMessage, NormalizedSnippet};
-use crate::model::types::{Conversation, Message, MessageRole, Snippet};
+use crate::model::types::{Conversation, Message, MessageRole, Snippet, role_as_str, role_from_str};
 
 pub const CONVERSATION_PACKET_VERSION: u32 = 1;
 
@@ -552,24 +552,24 @@ fn path_to_packet_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+/// Normalize a raw connector role string to the same spelling the canonical
+/// storage round-trip would produce for it. Routes through the shared
+/// [`role_from_str`]/[`role_as_str`] codec so the `RawConnectorScan` packet
+/// builder agrees with the `CanonicalReplay` builder ([`canonical_role`])
+/// on every role string, including `"assistant"` vs. legacy `"agent"` —
+/// previously this collapsed both into `"assistant"`, which contradicted
+/// storage's `Agent => "agent"` and broke store->read equivalence.
 fn normalize_role(role: &str) -> String {
-    match role.trim().to_ascii_lowercase().as_str() {
-        "agent" | "assistant" => "assistant".to_string(),
-        "user" => "user".to_string(),
-        "tool" => "tool".to_string(),
-        "system" => "system".to_string(),
-        other => other.to_string(),
-    }
+    let lowered = role.trim().to_ascii_lowercase();
+    role_as_str(&role_from_str(&lowered)).to_string()
 }
 
+/// Canonical [`MessageRole`] -> packet role string. Delegates to the shared
+/// codec ([`role_as_str`]) instead of a separate `Agent => "assistant"`
+/// mapping, so canonical-replay packets no longer disagree with what
+/// storage actually persisted for the same message.
 fn canonical_role(role: &MessageRole) -> String {
-    match role {
-        MessageRole::User => "user".to_string(),
-        MessageRole::Agent => "assistant".to_string(),
-        MessageRole::Tool => "tool".to_string(),
-        MessageRole::System => "system".to_string(),
-        MessageRole::Other(other) => normalize_role(other),
-    }
+    role_as_str(role).to_string()
 }
 
 fn packet_message_from_normalized(message: &NormalizedMessage) -> ConversationPacketMessage {
@@ -668,7 +668,11 @@ fn packet_projections(messages: &[ConversationPacketMessage]) -> ConversationPac
     for message in messages {
         match message.role.as_str() {
             "user" => analytics.user_messages += 1,
-            "assistant" => analytics.assistant_messages += 1,
+            // Legacy "agent" (non-target connectors, historical rows) still
+            // counts as an assistant turn for this aggregate bucket, even
+            // though it now round-trips as its own distinct role string
+            // (see `canonical_role`/`role_as_str`).
+            "assistant" | "agent" => analytics.assistant_messages += 1,
             "tool" => analytics.tool_messages += 1,
             "system" => analytics.system_messages += 1,
             _ => analytics.other_messages += 1,
@@ -932,7 +936,10 @@ mod tests {
                 Message {
                     id: Some(101),
                     idx: 1,
-                    role: MessageRole::Agent,
+                    // Post-fix, an ingested "assistant" turn is stored (and
+                    // replayed) as `MessageRole::Assistant`, not the legacy
+                    // `Agent` variant — see `canonical_role`/`role_as_str`.
+                    role: MessageRole::Assistant,
                     author: None,
                     created_at: Some(1_700_000_001_000),
                     content: "packet built".to_string(),

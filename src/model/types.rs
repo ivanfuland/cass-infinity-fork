@@ -4,10 +4,18 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Roles seen across source agents.
+///
+/// `Agent` is kept for legacy/non-target-agent data (historical rows and
+/// connectors like gemini/pi that still emit a bare `"agent"` role).
+/// `Assistant` is the dedicated variant for the 6-role connector contract's
+/// `"assistant"` string, so it no longer collapses into `Agent` on the
+/// store->read path. See [`role_from_str`]/[`role_as_str`] for the single
+/// codec every site must route through.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum MessageRole {
     User,
     Agent,
+    Assistant,
     Tool,
     System,
     Other(String),
@@ -18,10 +26,45 @@ impl std::fmt::Display for MessageRole {
         match self {
             MessageRole::User => write!(f, "User"),
             MessageRole::Agent => write!(f, "Agent"),
+            MessageRole::Assistant => write!(f, "Assistant"),
             MessageRole::Tool => write!(f, "Tool"),
             MessageRole::System => write!(f, "System"),
             MessageRole::Other(s) => write!(f, "{}", s),
         }
+    }
+}
+
+/// Canonical string -> [`MessageRole`] codec. This is the single source of
+/// truth for parsing a persisted/connector role string: every site across
+/// storage, indexer, and analytics that used to hand-roll
+/// `"assistant" | "agent" => MessageRole::Agent` must call this instead, so
+/// `"assistant"` maps to the dedicated [`MessageRole::Assistant`] variant
+/// instead of collapsing into the legacy `Agent` variant. Bare `"agent"`
+/// (historical rows, non-target connectors) still maps to `Agent`. Any
+/// other 6-role string (`tool_call`/`tool_result`/`reasoning`/anything else)
+/// falls through to `Other`, whose `role_as_str` round-trips the literal
+/// string unchanged.
+pub fn role_from_str(role: &str) -> MessageRole {
+    match role {
+        "user" => MessageRole::User,
+        "assistant" => MessageRole::Assistant,
+        "agent" => MessageRole::Agent,
+        "tool" => MessageRole::Tool,
+        "system" => MessageRole::System,
+        other => MessageRole::Other(other.to_string()),
+    }
+}
+
+/// Canonical [`MessageRole`] -> string codec. Pairs with [`role_from_str`]:
+/// `role_as_str(&role_from_str(s)) == s` for every role string cass persists.
+pub fn role_as_str(role: &MessageRole) -> &str {
+    match role {
+        MessageRole::User => "user",
+        MessageRole::Assistant => "assistant",
+        MessageRole::Agent => "agent",
+        MessageRole::Tool => "tool",
+        MessageRole::System => "system",
+        MessageRole::Other(s) => s.as_str(),
     }
 }
 
@@ -147,6 +190,7 @@ mod tests {
         let cases = [
             (MessageRole::User, "User"),
             (MessageRole::Agent, "Agent"),
+            (MessageRole::Assistant, "Assistant"),
             (MessageRole::Tool, "Tool"),
             (MessageRole::System, "System"),
             (MessageRole::Other("Custom".to_string()), "Custom"),
@@ -165,6 +209,7 @@ mod tests {
         let roles = vec![
             MessageRole::User,
             MessageRole::Agent,
+            MessageRole::Assistant,
             MessageRole::Tool,
             MessageRole::System,
             MessageRole::Other("CustomRole".to_string()),
@@ -189,6 +234,36 @@ mod tests {
             MessageRole::Other("x".to_string()),
             MessageRole::Other("y".to_string())
         );
+    }
+
+    #[test]
+    fn role_codec_assistant_is_distinct_from_legacy_agent() {
+        assert_eq!(role_from_str("assistant"), MessageRole::Assistant);
+        assert_eq!(role_from_str("agent"), MessageRole::Agent);
+        assert_ne!(MessageRole::Assistant, MessageRole::Agent);
+        assert_eq!(role_as_str(&MessageRole::Assistant), "assistant");
+        assert_eq!(role_as_str(&MessageRole::Agent), "agent");
+    }
+
+    #[test]
+    fn role_codec_six_role_strings_roundtrip_unchanged() {
+        for role_str in [
+            "user",
+            "assistant",
+            "agent",
+            "tool",
+            "system",
+            "tool_call",
+            "tool_result",
+            "reasoning",
+        ] {
+            let parsed = role_from_str(role_str);
+            assert_eq!(
+                role_as_str(&parsed),
+                role_str,
+                "role string must round-trip unchanged: {role_str}"
+            );
+        }
     }
 
     // =========================

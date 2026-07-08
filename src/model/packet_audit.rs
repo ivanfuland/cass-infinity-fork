@@ -381,7 +381,11 @@ mod tests {
                 Message {
                     id: Some(71),
                     idx: 1,
-                    role: MessageRole::Agent,
+                    // Post-fix, an ingested "assistant" turn is stored (and
+                    // replayed) as `MessageRole::Assistant`, not the legacy
+                    // `Agent` variant — see `canonical_role`/`role_as_str`
+                    // in `model::types`.
+                    role: MessageRole::Assistant,
                     author: None,
                     created_at: Some(1_700_000_001_000),
                     content: "auditing".to_string(),
