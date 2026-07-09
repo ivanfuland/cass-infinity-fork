@@ -97,6 +97,11 @@ type BatchClassificationMap =
 
 const LEXICAL_REBUILD_PACKET_VERSION: u32 = CONVERSATION_PACKET_VERSION;
 const CODEX_INDEXER_EXTRA_COMPACT_THRESHOLD_BYTES: u64 = 16 * 1024 * 1024;
+/// Top-level `extra` keys the franken connector normalizes out of the raw event
+/// (pairing ids, tool arguments, opaque reasoning blobs). Compaction drops the
+/// duplicated raw payload but must never drop these.
+const FRANKEN_NORMALIZED_EXTRA_KEYS: &[&str] =
+    &["tool_call_id", "tool_call_args", "encrypted_content"];
 const PREPARSE_PRIMARY_SOURCE_CAPTURE_LIMIT: usize = 256;
 const WATCH_INGEST_DEFAULT_CHUNK_SIZE: usize = 32;
 const WATCH_INGEST_CHUNK_SIZE_MAX: usize = 512;
@@ -24413,13 +24418,28 @@ fn compact_indexer_message_extra(raw: &serde_json::Value) -> serde_json::Value {
         cass.insert("attachments".to_string(), attachments);
     }
 
-    if cass.is_empty() {
-        serde_json::json!({})
-    } else {
-        let mut out = serde_json::Map::new();
-        out.insert("cass".to_string(), serde_json::Value::Object(cass));
-        serde_json::Value::Object(out)
+    let mut out = serde_json::Map::new();
+    for key in FRANKEN_NORMALIZED_EXTRA_KEYS {
+        if let Some(value) = raw.get(*key) {
+            out.insert((*key).to_string(), value.clone());
+        }
     }
+
+    // franken only lifts `encrypted_content` to the top level when its own
+    // compaction ran; below that threshold the blob is still nested under the
+    // raw payload this function drops. Lift it so a reasoning message keeps its
+    // opaque blob regardless of which compaction fired.
+    if !out.contains_key("encrypted_content")
+        && let Some(blob) = raw.pointer("/payload/encrypted_content")
+    {
+        out.insert("encrypted_content".to_string(), blob.clone());
+    }
+
+    if !cass.is_empty() {
+        out.insert("cass".to_string(), serde_json::Value::Object(cass));
+    }
+
+    serde_json::Value::Object(out)
 }
 
 /// Apply workspace path rewriting to a conversation.
@@ -47070,6 +47090,132 @@ mod tests {
         assert!(extra.get("payload").is_none());
         assert!(extra.get("response").is_none());
         assert!(extra.get("attachment_refs").is_none());
+    }
+
+    #[test]
+    fn large_codex_extra_compaction_preserves_franken_normalized_keys() {
+        // franken writes `tool_call_id` / `tool_call_args` (and, on its own
+        // compact path, `encrypted_content`) as top-level keys of the emitted
+        // message `extra`. Indexer-side compaction must not drop them: they are
+        // the normalized pairing/argument data, not duplicated raw payload.
+        let mut conv = norm_conv(
+            Some("codex-large"),
+            vec![norm_msg(0, 100), norm_msg(1, 200), norm_msg(2, 300)],
+        );
+        conv.agent_slug = "codex".to_string();
+
+        conv.messages[0].role = "tool_call".to_string();
+        conv.messages[0].extra = serde_json::json!({
+            "payload": { "delta": "duplicated raw codex event payload" },
+            "tool_call_id": "call_abc123",
+            "tool_call_args": { "cmd": "echo hi", "workdir": "/w" }
+        });
+
+        conv.messages[1].role = "tool_result".to_string();
+        conv.messages[1].extra = serde_json::json!({
+            "payload": { "delta": "duplicated raw codex event payload" },
+            "tool_call_id": "call_abc123"
+        });
+
+        conv.messages[2].role = "reasoning".to_string();
+        conv.messages[2].extra = serde_json::json!({
+            "payload": { "delta": "duplicated raw codex event payload" },
+            "encrypted_content": "opaque-encrypted-blob"
+        });
+
+        compact_large_connector_extras_for_size(
+            "codex",
+            &mut conv,
+            Some(CODEX_INDEXER_EXTRA_COMPACT_THRESHOLD_BYTES),
+        );
+
+        let call = &conv.messages[0].extra;
+        assert_eq!(
+            call.get("tool_call_id").and_then(serde_json::Value::as_str),
+            Some("call_abc123"),
+            "tool_call must keep its pairing id"
+        );
+        assert_eq!(
+            call.pointer("/tool_call_args/cmd")
+                .and_then(serde_json::Value::as_str),
+            Some("echo hi"),
+            "tool_call must keep its normalized arguments"
+        );
+        assert!(
+            call.get("payload").is_none(),
+            "raw payload must still be dropped"
+        );
+
+        let result = &conv.messages[1].extra;
+        assert_eq!(
+            result.get("tool_call_id").and_then(serde_json::Value::as_str),
+            Some("call_abc123"),
+            "tool_result must keep its pairing id"
+        );
+        assert!(result.get("payload").is_none());
+
+        let reasoning = &conv.messages[2].extra;
+        assert_eq!(
+            reasoning
+                .get("encrypted_content")
+                .and_then(serde_json::Value::as_str),
+            Some("opaque-encrypted-blob"),
+            "franken-preserved encrypted_content must survive compaction"
+        );
+        assert!(reasoning.get("payload").is_none());
+    }
+
+    #[test]
+    fn large_codex_extra_compaction_lifts_nested_encrypted_content() {
+        // Sessions between the indexer threshold (16 MiB) and franken's own
+        // compact threshold (32 MiB) never get the blob lifted to the top level
+        // by franken, so it is still nested under the raw payload. Compaction
+        // must lift it rather than drop it with the payload.
+        let mut conv = norm_conv(Some("codex-large"), vec![norm_msg(0, 100)]);
+        conv.agent_slug = "codex".to_string();
+        conv.messages[0].role = "reasoning".to_string();
+        conv.messages[0].extra = serde_json::json!({
+            "payload": {
+                "type": "reasoning",
+                "encrypted_content": "opaque-encrypted-blob",
+                "delta": "duplicated raw codex event payload"
+            }
+        });
+
+        compact_large_connector_extras_for_size(
+            "codex",
+            &mut conv,
+            Some(CODEX_INDEXER_EXTRA_COMPACT_THRESHOLD_BYTES),
+        );
+
+        let extra = &conv.messages[0].extra;
+        assert_eq!(
+            extra
+                .get("encrypted_content")
+                .and_then(serde_json::Value::as_str),
+            Some("opaque-encrypted-blob"),
+            "nested encrypted_content must be lifted, not dropped with the payload"
+        );
+        assert!(extra.get("payload").is_none());
+    }
+
+    #[test]
+    fn large_codex_extra_compaction_still_empties_plain_messages() {
+        // Messages carrying nothing but duplicated raw payload still compact to
+        // an empty object -- that is the point of the size guard.
+        let mut conv = norm_conv(Some("codex-large"), vec![norm_msg(0, 100)]);
+        conv.agent_slug = "codex".to_string();
+        conv.messages[0].extra = serde_json::json!({
+            "payload": { "delta": "duplicated raw codex event payload" }
+        });
+
+        compact_large_connector_extras_for_size(
+            "codex",
+            &mut conv,
+            Some(CODEX_INDEXER_EXTRA_COMPACT_THRESHOLD_BYTES),
+        );
+
+        assert_eq!(conv.messages[0].extra, serde_json::json!({}));
     }
 
     #[test]
