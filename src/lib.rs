@@ -36442,6 +36442,16 @@ const DOCTOR_RAW_MIRROR_HASH_ALGORITHM: &str = "blake3";
 const DOCTOR_RAW_MIRROR_BLOB_EXTENSION: &str = "raw";
 const DOCTOR_RAW_MIRROR_DIR_MODE: &str = "0700";
 const DOCTOR_RAW_MIRROR_FILE_MODE: &str = "0600";
+const CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY: &str = "CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY";
+const CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY_MANIFEST_LIMIT: &str =
+    "CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY_MANIFEST_LIMIT";
+const DOCTOR_RAW_MIRROR_DEFAULT_FULL_VERIFY_MANIFEST_LIMIT: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DoctorRawMirrorVerificationMode {
+    Full,
+    Bounded { manifest_limit: usize },
+}
 
 #[derive(Debug, Clone, Serialize)]
 struct DoctorRawMirrorReport {
@@ -37313,16 +37323,67 @@ fn doctor_raw_mirror_size_warning(total_blob_bytes: u64, threshold_bytes: u64) -
     })
 }
 
-fn collect_doctor_raw_mirror_report(data_dir: &Path) -> DoctorRawMirrorReport {
-    collect_doctor_raw_mirror_report_with_threshold(
+fn doctor_raw_mirror_full_verify_requested() -> bool {
+    dotenvy::var(CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY)
+        .ok()
+        .is_some_and(|raw| {
+            matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+}
+
+fn doctor_raw_mirror_full_verify_manifest_limit() -> usize {
+    dotenvy::var(CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY_MANIFEST_LIMIT)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|&limit| limit > 0)
+        .unwrap_or(DOCTOR_RAW_MIRROR_DEFAULT_FULL_VERIFY_MANIFEST_LIMIT)
+}
+
+fn collect_doctor_raw_mirror_report_for_doctor(
+    data_dir: &Path,
+    mutating_repair_requested: bool,
+) -> DoctorRawMirrorReport {
+    let mode = if mutating_repair_requested || doctor_raw_mirror_full_verify_requested() {
+        DoctorRawMirrorVerificationMode::Full
+    } else {
+        DoctorRawMirrorVerificationMode::Bounded {
+            manifest_limit: doctor_raw_mirror_full_verify_manifest_limit(),
+        }
+    };
+    collect_doctor_raw_mirror_report_with_threshold_and_mode(
         data_dir,
         doctor_raw_mirror_size_warn_threshold_bytes(),
+        mode,
     )
 }
 
+fn collect_doctor_raw_mirror_report(data_dir: &Path) -> DoctorRawMirrorReport {
+    collect_doctor_raw_mirror_report_with_threshold_and_mode(
+        data_dir,
+        doctor_raw_mirror_size_warn_threshold_bytes(),
+        DoctorRawMirrorVerificationMode::Full,
+    )
+}
+
+#[cfg(test)]
 fn collect_doctor_raw_mirror_report_with_threshold(
     data_dir: &Path,
     size_warn_threshold_bytes: u64,
+) -> DoctorRawMirrorReport {
+    collect_doctor_raw_mirror_report_with_threshold_and_mode(
+        data_dir,
+        size_warn_threshold_bytes,
+        DoctorRawMirrorVerificationMode::Full,
+    )
+}
+
+fn collect_doctor_raw_mirror_report_with_threshold_and_mode(
+    data_dir: &Path,
+    size_warn_threshold_bytes: u64,
+    verification_mode: DoctorRawMirrorVerificationMode,
 ) -> DoctorRawMirrorReport {
     let root = doctor_raw_mirror_root(data_dir);
     let root_path = root.display().to_string();
@@ -37368,6 +37429,13 @@ fn collect_doctor_raw_mirror_report_with_threshold(
     }
 
     let manifest_root = root.join("manifests");
+    let bounded_manifest_limit = match verification_mode {
+        DoctorRawMirrorVerificationMode::Full => None,
+        DoctorRawMirrorVerificationMode::Bounded { manifest_limit } => Some(manifest_limit),
+    };
+    let mut manifest_entries: Vec<(PathBuf, bool)> = Vec::new();
+    let mut manifest_entry_count = 0usize;
+    let mut full_verification_deferred = false;
     if manifest_root.exists() {
         for entry in walkdir::WalkDir::new(&manifest_root)
             .follow_links(false)
@@ -37379,28 +37447,12 @@ fn collect_doctor_raw_mirror_report_with_threshold(
                     if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
                         continue;
                     }
-                    let report_entry = if entry.file_type().is_symlink() {
-                        doctor_raw_mirror_invalid_manifest_report(
-                            data_dir,
-                            path,
-                            "manifest path is a symlink".to_string(),
-                        )
-                    } else {
-                        match std::fs::read_to_string(path)
-                            .ok()
-                            .and_then(|content| serde_json::from_str(&content).ok())
-                        {
-                            Some(manifest) => {
-                                doctor_verify_raw_mirror_manifest(data_dir, &root, path, manifest)
-                            }
-                            None => doctor_raw_mirror_invalid_manifest_report(
-                                data_dir,
-                                path,
-                                "manifest is not parseable JSON".to_string(),
-                            ),
-                        }
-                    };
-                    report.manifests.push(report_entry);
+                    manifest_entry_count += 1;
+                    if bounded_manifest_limit.is_some_and(|limit| manifest_entry_count > limit) {
+                        full_verification_deferred = true;
+                        continue;
+                    }
+                    manifest_entries.push((path.to_path_buf(), entry.file_type().is_symlink()));
                 }
                 Ok(_) => {}
                 Err(err) => report
@@ -37408,6 +37460,45 @@ fn collect_doctor_raw_mirror_report_with_threshold(
                     .push(format!("failed to scan raw mirror manifest entry: {err}")),
             }
         }
+    }
+
+    if full_verification_deferred {
+        report.summary.manifest_count = manifest_entry_count;
+        report.status = "verification_deferred".to_string();
+        let limit = bounded_manifest_limit.unwrap_or(0);
+        report.warnings.push(format!(
+            "Raw mirror verification deferred: {manifest_entry_count} manifest(s) exceed the bounded doctor limit of {limit}; set {CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY}=1 to run a full blob checksum verification."
+        ));
+        report.notes.push(
+            "Bounded doctor mode does not claim raw mirror blobs are verified until full checksum verification runs."
+                .to_string(),
+        );
+        return report;
+    }
+
+    for (path, is_symlink) in manifest_entries {
+        let report_entry = if is_symlink {
+            doctor_raw_mirror_invalid_manifest_report(
+                data_dir,
+                &path,
+                "manifest path is a symlink".to_string(),
+            )
+        } else {
+            match std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|content| serde_json::from_str(&content).ok())
+            {
+                Some(manifest) => {
+                    doctor_verify_raw_mirror_manifest(data_dir, &root, &path, manifest)
+                }
+                None => doctor_raw_mirror_invalid_manifest_report(
+                    data_dir,
+                    &path,
+                    "manifest is not parseable JSON".to_string(),
+                ),
+            }
+        };
+        report.manifests.push(report_entry);
     }
 
     report
@@ -73832,7 +73923,7 @@ pub(crate) fn run_doctor_impl(
     }
 
     let raw_mirror_scan_started = Instant::now();
-    let mut raw_mirror = collect_doctor_raw_mirror_report(&data_dir);
+    let mut raw_mirror = collect_doctor_raw_mirror_report_for_doctor(&data_dir, fix_can_mutate);
     doctor_push_timing_span(
         &mut timing_spans,
         "raw_mirror_scan",
@@ -73856,7 +73947,7 @@ pub(crate) fn run_doctor_impl(
             raw_mirror_backfill.captured_live_source_count,
             raw_mirror_backfill.existing_raw_manifest_link_count
         ));
-        raw_mirror = collect_doctor_raw_mirror_report(&data_dir);
+        raw_mirror = collect_doctor_raw_mirror_report_for_doctor(&data_dir, fix_can_mutate);
     }
     doctor_push_timing_span(
         &mut timing_spans,
@@ -73895,6 +73986,17 @@ pub(crate) fn run_doctor_impl(
                 format!(
                     "Raw mirror verified ({} manifest(s), {} blob byte(s))",
                     raw_mirror.summary.manifest_count, raw_mirror.summary.total_blob_bytes
+                ),
+                false
+            );
+        }
+        "verification_deferred" => {
+            add_check!(
+                "raw_mirror",
+                "warn",
+                format!(
+                    "Raw mirror verification deferred for bounded read-only doctor check ({} manifest(s)); set {CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY}=1 to run full blob checksum verification",
+                    raw_mirror.summary.manifest_count
                 ),
                 false
             );
