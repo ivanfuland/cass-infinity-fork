@@ -8714,19 +8714,25 @@ fn system_time_to_epoch_millis(time: SystemTime) -> Option<i64> {
 
 fn semantic_tier_for_embedder_id(embedder_id: &str) -> Option<SemanticTierKind> {
     match embedder_id {
-        "minilm-384" => Some(SemanticTierKind::Quality),
+        // fork: Infinity 的 `bge-m3`（src/search/infinity.rs EMBEDDER_ID）与上游 `minilm-384`
+        // 同属 quality tier。少了这一行，`index --semantic --watch-once` 的**增量追加**路径会以
+        // "semantic watch-once cannot publish unknown embedder tier for bge-m3" 失败，
+        // 于是只能退回 `models backfill` 的全量重建——每加一条会话就重嵌整个语料。
+        "bge-m3" | "minilm-384" => Some(SemanticTierKind::Quality),
         "fnv1a-384" => Some(SemanticTierKind::Fast),
         _ => None,
     }
 }
 
 fn semantic_model_revision_for_embedder_id(embedder_id: &str) -> String {
-    if embedder_id == "fnv1a-384" {
-        "hash".to_string()
-    } else {
-        crate::search::model_download::ModelManifest::minilm_v2()
+    match embedder_id {
+        "fnv1a-384" => "hash".to_string(),
+        // fork: 与 lib.rs backfill 路径写进 manifest 的 `infinity-bge-m3` 保持一致；
+        // 否则 watch-once 发布的 manifest 会带上 minilm 的 revision。
+        "bge-m3" => "infinity-bge-m3".to_string(),
+        _ => crate::search::model_download::ModelManifest::minilm_v2()
             .revision
-            .clone()
+            .clone(),
     }
 }
 
@@ -29801,6 +29807,30 @@ mod tests {
             Some(super::SemanticTierKind::Fast)
         );
         assert_eq!(super::semantic_tier_for_embedder_id("unknown"), None);
+    }
+
+    /// fork: Infinity 的 `bge-m3` 必须映射到 quality tier。不映射会让
+    /// `index --semantic --watch-once` 的**增量追加**路径以
+    /// "semantic watch-once cannot publish unknown embedder tier for bge-m3" 失败，
+    /// 只能退回 `models backfill` 的全量重建——每加一条会话就把整个语料重嵌一遍
+    /// （实测 176669 doc / ~2h，而追加只需 ~16s）。
+    #[test]
+    fn semantic_tier_for_embedder_id_maps_infinity_bge_m3_to_quality() {
+        assert_eq!(
+            super::semantic_tier_for_embedder_id("bge-m3"),
+            Some(super::SemanticTierKind::Quality),
+            "bge-m3 must resolve to the quality tier or the incremental append path bails"
+        );
+    }
+
+    /// fork: `bge-m3` 的 model_revision 必须与 lib.rs backfill 路径写进 manifest 的
+    /// `infinity-bge-m3` 一致；否则 watch-once 发布的 manifest 会带上 minilm 的 revision。
+    #[test]
+    fn semantic_model_revision_for_embedder_id_maps_bge_m3_to_infinity_revision() {
+        assert_eq!(
+            super::semantic_model_revision_for_embedder_id("bge-m3"),
+            "infinity-bge-m3"
+        );
     }
 
     /// Regression for issue #203: hash embedder must report a stable
