@@ -1076,6 +1076,12 @@ pub enum Commands {
         /// Maximum sessions to return (defaults: 10, or 1 with --current)
         #[arg(long)]
         limit: Option<usize>,
+        /// Only sessions active since this ISO date (YYYY-MM-DD or
+        /// YYYY-MM-DDTHH:MM:SS), keyword (`today`, `yesterday`), or relative
+        /// offset (`-7d`, `-24h`). Filters on the session's recorded
+        /// last-activity timestamp (ended_at, falling back to started_at).
+        #[arg(long, allow_hyphen_values = true)]
+        since: Option<String>,
         /// Output as JSON (for automation)
         #[arg(long, visible_alias = "robot")]
         json: bool,
@@ -7801,6 +7807,7 @@ async fn execute_cli(
                     workspace,
                     current,
                     limit,
+                    since,
                     json,
                     data_dir,
                 } => {
@@ -7809,6 +7816,7 @@ async fn execute_cli(
                         workspace.as_ref(),
                         current,
                         limit,
+                        since.as_deref(),
                         &data_dir,
                         cli.db.clone(),
                         structured_format,
@@ -20189,7 +20197,8 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "    Aliases: ready, preflight.".to_string(),
             "  cass status [--json] [--stale-threshold N] [--data-dir DIR]".to_string(),
             "  cass diag [--json] [--verbose] [--data-dir DIR]".to_string(),
-            "  cass sessions [--workspace DIR] [--current] [--limit N] [--json]".to_string(),
+            "  cass sessions [--workspace DIR] [--current] [--limit N] [--since WHEN] [--json]"
+                .to_string(),
             "  cass view <path> [-n LINE] [-C CONTEXT] [--json]".to_string(),
             "  cass index [--full] [--watch] [--json] [--robot-trace-ingest] [--data-dir DIR]"
                 .to_string(),
@@ -33593,6 +33602,26 @@ fn doctor_storage_relative_components(relative_path: &Path) -> Vec<String> {
         .collect()
 }
 
+/// GH#324: crash-orphaned lexical staging roots (`cass-lexical-shards.*`,
+/// `cass-lexical-merge.*`, `cass-federated-materialize-*`,
+/// `cass-empty-lexical-repair-*`, and their interrupted-reclaim rename
+/// markers). These are derived scratch space — rebuildable by definition —
+/// so they classify as reclaimable instead of falling through to the
+/// fail-closed Unknown/protected bucket that used to shield the debris from
+/// cleanup. The name must strictly extend a prefix: tempfile always appends
+/// a random suffix, so a bare prefix is never a cass-created name.
+fn doctor_storage_component_is_lexical_staging_dir(component: &str) -> bool {
+    const STAGING_PREFIXES: [&str; 4] = [
+        "cass-lexical-shards.",
+        "cass-lexical-merge.",
+        "cass-federated-materialize-",
+        "cass-empty-lexical-repair-",
+    ];
+    STAGING_PREFIXES
+        .iter()
+        .any(|prefix| component.len() > prefix.len() && component.starts_with(prefix))
+}
+
 fn doctor_classify_storage_relative_path(relative_path: &Path) -> DoctorAssetClass {
     let components = doctor_storage_relative_components(relative_path);
     let Some(first) = components.first().map(String::as_str) else {
@@ -33644,7 +33673,16 @@ fn doctor_classify_storage_relative_path(relative_path: &Path) -> DoctorAssetCla
             _ => DoctorAssetClass::ForensicBundle,
         };
     }
+    if doctor_storage_component_is_lexical_staging_dir(first) {
+        return DoctorAssetClass::ReclaimableDerivedCache;
+    }
     if first == "index" {
+        if components
+            .get(1)
+            .is_some_and(|part| doctor_storage_component_is_lexical_staging_dir(part))
+        {
+            return DoctorAssetClass::ReclaimableDerivedCache;
+        }
         if components
             .iter()
             .any(|part| part == ".lexical-publish-backups")
@@ -57511,6 +57549,55 @@ mod doctor_asset_taxonomy_tests {
         DoctorSourceAuthorityKind::SupportBundle,
     ];
 
+    /// GH#324: crash-orphaned lexical staging dirs must classify as
+    /// reclaimable derived cache (safe_to_gc, auto-delete allowed) instead of
+    /// falling into a protected class that shields the debris from cleanup.
+    #[test]
+    fn doctor_classifies_orphaned_lexical_staging_dirs_as_reclaimable() {
+        for relative in [
+            "index/cass-lexical-shards.k1eHZJ/shard-0/meta.json",
+            "index/cass-lexical-merge.2qwt8l",
+            "index/cass-lexical-merge.2qwt8l.reclaim-42-0/index/meta.json",
+            "index/cass-federated-materialize-r4nd0m/index/meta.json",
+            "index/cass-empty-lexical-repair-q1w2e3/file",
+            // Historical top-level layout.
+            "cass-lexical-shards.abc123/shard-0/meta.json",
+            "cass-lexical-merge.abc123",
+        ] {
+            assert_eq!(
+                doctor_classify_storage_relative_path(Path::new(relative)),
+                DoctorAssetClass::ReclaimableDerivedCache,
+                "{relative} should classify as reclaimable staging debris"
+            );
+        }
+        let reclaimable_safety = doctor_asset_safety(DoctorAssetClass::ReclaimableDerivedCache);
+        assert!(reclaimable_safety.safe_to_gc_allowed);
+        assert!(reclaimable_safety.auto_delete_allowed);
+        assert!(!reclaimable_safety.precious);
+
+        // Live/published assets must keep their protective classes.
+        for (relative, expected) in [
+            ("index/v8/meta.json", DoctorAssetClass::DerivedLexicalIndex),
+            (
+                "index/.lexical-publish-backups/gen-1/meta.json",
+                DoctorAssetClass::RetainedPublishBackup,
+            ),
+            ("agent_search.db", DoctorAssetClass::CanonicalArchiveDb),
+            // Bare prefixes (no tempfile suffix) are not cass-created names;
+            // they stay in the fail-closed lexical-index bucket.
+            (
+                "index/cass-lexical-shards.",
+                DoctorAssetClass::DerivedLexicalIndex,
+            ),
+        ] {
+            assert_eq!(
+                doctor_classify_storage_relative_path(Path::new(relative)),
+                expected,
+                "{relative} must not be classified as reclaimable"
+            );
+        }
+    }
+
     #[test]
     fn doctor_asset_taxonomy_explicitly_covers_every_class_and_operation() {
         let policy_classes: HashSet<_> = DOCTOR_ASSET_POLICY_TABLE
@@ -75910,6 +75997,7 @@ fn run_sessions(
     workspace: Option<&PathBuf>,
     current: bool,
     limit: Option<usize>,
+    since: Option<&str>,
     data_dir_override: &Option<PathBuf>,
     db_override: Option<PathBuf>,
     output_format: Option<RobotFormat>,
@@ -75934,10 +76022,62 @@ fn run_sessions(
         None if current_determined_workspace => Some(1),
         None => Some(10),
     };
+    let since_ms: Option<i64> = match since {
+        None => None,
+        Some(raw) => Some(parse_datetime_flexible(raw).ok_or_else(|| CliError {
+            code: 2,
+            kind: CliErrorKind::Usage.kind_str(),
+            message: format!(
+                "Invalid --since value '{raw}'. Use YYYY-MM-DD, YYYY-MM-DDTHH:MM:SS, \
+                 'today', 'yesterday', or a relative offset like -7d / -24h."
+            ),
+            hint: Some("Example: cass sessions --since -7d".into()),
+            retryable: false,
+        })?),
+    };
 
-    let params: &[ParamValue] = &[];
+    // cass#323: enumerate conversations WITHOUT joining messages. The old
+    // single query LEFT JOINed the full messages table and GROUP BYed over
+    // it just to compute per-session message/human-turn counts, which made
+    // `sessions --limit 5` cost a full corpus aggregation (minutes of CPU
+    // and multi-GB peaks on large indexes). Counts are now backfilled after
+    // limit truncation, so only the N returned sessions ever touch the
+    // messages table (served by the (conversation_id, idx) unique index).
+    let since_filter = if since_ms.is_some() {
+        // Sessions whose recorded activity window is unknown (both
+        // timestamps NULL) are retained here and re-checked against file
+        // mtime below, so a legacy undated-but-active session is not
+        // silently dropped by --since.
+        "WHERE COALESCE(c.ended_at, c.started_at) >= ?1
+              OR (c.ended_at IS NULL AND c.started_at IS NULL)"
+    } else {
+        ""
+    };
+    let sessions_sql = format!(
+        // LEFT JOIN + COALESCE on agents so list_sessions still reports
+        // legacy conversations with NULL agent_id.
+        "SELECT c.id,
+                COALESCE(a.slug, 'unknown') AS agent_slug,
+                w.path,
+                c.title,
+                c.source_path,
+                COALESCE(c.source_id, 'local'),
+                c.origin_host,
+                s.kind,
+                c.started_at,
+                c.ended_at
+         FROM conversations c
+         LEFT JOIN agents a ON c.agent_id = a.id
+         LEFT JOIN workspaces w ON c.workspace_id = w.id
+         LEFT JOIN sources s ON c.source_id = s.id
+         {since_filter}
+         ORDER BY CASE WHEN c.started_at IS NULL THEN 1 ELSE 0 END, c.started_at DESC, c.id DESC"
+    );
+    let since_params: Vec<ParamValue> = since_ms.map(ParamValue::from).into_iter().collect();
+    let params: &[ParamValue] = &since_params;
     #[allow(clippy::type_complexity)]
     let rows: Vec<(
+        i64,
         String,
         Option<String>,
         Option<String>,
@@ -75946,47 +76086,22 @@ fn run_sessions(
         Option<String>,
         Option<String>,
         Option<i64>,
-        i64,
-        i64,
+        Option<i64>,
     )> = conn
-        .query_map_collect(
-            // LEFT JOIN + COALESCE on agents so list_sessions still reports
-            // legacy conversations with NULL agent_id.  GROUP BY must use the
-            // same COALESCE expression so those rows group into a single
-            // 'unknown' bucket.
-            "SELECT COALESCE(a.slug, 'unknown') AS agent_slug,
-                    w.path,
-                    c.title,
-                    c.source_path,
-                    COALESCE(c.source_id, 'local'),
-                    c.origin_host,
-                    s.kind,
-                    c.started_at,
-                    COUNT(m.id) AS message_count,
-                    COALESCE(SUM(CASE WHEN m.role = 'user' THEN 1 ELSE 0 END), 0) AS human_turns
-             FROM conversations c
-             LEFT JOIN agents a ON c.agent_id = a.id
-             LEFT JOIN workspaces w ON c.workspace_id = w.id
-             LEFT JOIN sources s ON c.source_id = s.id
-             LEFT JOIN messages m ON m.conversation_id = c.id
-             GROUP BY c.id, COALESCE(a.slug, 'unknown'), w.path, c.title, c.source_path, COALESCE(c.source_id, 'local'), c.origin_host, s.kind, c.started_at
-             ORDER BY CASE WHEN c.started_at IS NULL THEN 1 ELSE 0 END, c.started_at DESC, c.id DESC",
-            params,
-            |row: &frankensqlite::Row| {
-                Ok((
-                    row.get_typed(0)?,
-                    row.get_typed(1)?,
-                    row.get_typed(2)?,
-                    row.get_typed(3)?,
-                    row.get_typed(4)?,
-                    row.get_typed(5)?,
-                    row.get_typed(6)?,
-                    row.get_typed(7)?,
-                    row.get_typed(8)?,
-                    row.get_typed(9)?,
-                ))
-            },
-        )
+        .query_map_collect(&sessions_sql, params, |row: &frankensqlite::Row| {
+            Ok((
+                row.get_typed(0)?,
+                row.get_typed(1)?,
+                row.get_typed(2)?,
+                row.get_typed(3)?,
+                row.get_typed(4)?,
+                row.get_typed(5)?,
+                row.get_typed(6)?,
+                row.get_typed(7)?,
+                row.get_typed(8)?,
+                row.get_typed(9)?,
+            ))
+        })
         .map_err(|e| CliError {
             code: 9,
             kind: CliErrorKind::DbQuery.kind_str(),
@@ -75995,10 +76110,11 @@ fn run_sessions(
             retryable: false,
         })?;
 
-    let mut sessions: Vec<SessionSummaryRecord> = rows
+    let mut sessions: Vec<(i64, bool, SessionSummaryRecord)> = rows
         .into_iter()
         .map(
             |(
+                conversation_id,
                 agent,
                 workspace,
                 title,
@@ -76007,8 +76123,7 @@ fn run_sessions(
                 origin_host,
                 origin_kind,
                 started_at,
-                message_count,
-                human_turns,
+                ended_at,
             )| {
                 let source_path_buf = PathBuf::from(&source_path);
                 let origin_host = normalized_provenance_origin_host(origin_host.as_deref());
@@ -76027,33 +76142,55 @@ fn run_sessions(
                     .and_then(|m| m.modified().ok())
                     .map(|ts| chrono::DateTime::<Utc>::from(ts).timestamp_millis());
 
-                SessionSummaryRecord {
-                    agent,
-                    workspace: workspace.map(PathBuf::from),
-                    workspace_match_distance: None,
-                    title,
-                    source_path: source_path_buf,
-                    source_id,
-                    origin_host,
-                    started_at,
-                    modified_at,
-                    size_bytes: metadata.as_ref().map(std::fs::Metadata::len),
-                    message_count,
-                    human_turns,
-                }
+                let has_recorded_timestamp = started_at.is_some() || ended_at.is_some();
+                (
+                    conversation_id,
+                    has_recorded_timestamp,
+                    SessionSummaryRecord {
+                        agent,
+                        workspace: workspace.map(PathBuf::from),
+                        workspace_match_distance: None,
+                        title,
+                        source_path: source_path_buf,
+                        source_id,
+                        origin_host,
+                        started_at,
+                        modified_at,
+                        size_bytes: metadata.as_ref().map(std::fs::Metadata::len),
+                        message_count: 0,
+                        human_turns: 0,
+                    },
+                )
             },
         )
         .collect();
 
+    if let Some(since_ms) = since_ms {
+        // Rows with a recorded timestamp already satisfied the SQL window
+        // filter. Undated conversations passed it unconditionally; resolve
+        // them against file mtime where one is available. Rows with no
+        // recorded timestamps AND no statable file are kept (fail open:
+        // --since must never hide a session it cannot date).
+        sessions.retain(|(_, has_recorded_timestamp, session)| {
+            if *has_recorded_timestamp {
+                return true;
+            }
+            match session.modified_at {
+                Some(modified_at) => modified_at >= since_ms,
+                None => true,
+            }
+        });
+    }
+
     if let Some(target) = target_workspace.as_deref() {
-        for session in &mut sessions {
+        for (_, _, session) in &mut sessions {
             session.workspace_match_distance =
                 workspace_match_distance(session.workspace.as_deref(), target);
         }
-        sessions.retain(|session| session.workspace_match_distance.is_some());
+        sessions.retain(|(_, _, session)| session.workspace_match_distance.is_some());
     }
 
-    sessions.sort_by(|left, right| {
+    sessions.sort_by(|(_, _, left), (_, _, right)| {
         left.workspace_match_distance
             .unwrap_or(usize::MAX)
             .cmp(&right.workspace_match_distance.unwrap_or(usize::MAX))
@@ -76065,6 +76202,37 @@ fn run_sessions(
     if let Some(limit) = effective_limit {
         sessions.truncate(limit);
     }
+
+    // Backfill message/human-turn counts for the surviving sessions only.
+    // Each lookup is an indexed range scan on messages(conversation_id, idx)
+    // via sqlite_autoindex_messages_1, so the cost scales with the returned
+    // page, not the corpus.
+    let sessions: Vec<SessionSummaryRecord> = sessions
+        .into_iter()
+        .map(|(conversation_id, _, mut session)| {
+            let (message_count, human_turns) = conn
+                .query_row_map(
+                    "SELECT COUNT(id),
+                            COALESCE(SUM(CASE WHEN role = 'user' THEN 1 ELSE 0 END), 0)
+                     FROM messages
+                     WHERE conversation_id = ?1",
+                    &[ParamValue::from(conversation_id)],
+                    |row: &frankensqlite::Row| {
+                        Ok((row.get_typed::<i64>(0)?, row.get_typed::<i64>(1)?))
+                    },
+                )
+                .map_err(|e| CliError {
+                    code: 9,
+                    kind: CliErrorKind::DbQuery.kind_str(),
+                    message: format!("Failed to count session messages: {e}"),
+                    hint: None,
+                    retryable: false,
+                })?;
+            session.message_count = message_count;
+            session.human_turns = human_turns;
+            Ok(session)
+        })
+        .collect::<CliResult<Vec<_>>>()?;
 
     let entries: Vec<SessionSummaryEntry> = sessions
         .into_iter()

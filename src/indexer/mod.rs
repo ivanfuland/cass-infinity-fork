@@ -8,6 +8,7 @@ pub mod refresh_ledger;
 pub(crate) mod responsiveness;
 pub mod semantic;
 pub mod semantic_progress;
+pub(crate) mod staging_reclaim;
 
 use self::quarantine::{QuarantineKey, QuarantineState};
 use self::refresh_ledger::{
@@ -13039,6 +13040,13 @@ pub fn run_index(
         Arc::clone(&index_run_lock.metadata_write_lock),
         Arc::clone(&index_run_lock.last_progress_at_ms_atomic),
     );
+    // GH#324: reclaim staging debris stranded by previous hard-crashed runs
+    // now that we hold the exclusive index-run lock, and BEFORE the
+    // disk-headroom preflight below — otherwise a crash/restart loop's own
+    // debris trips the headroom guard and wedges indexing hard-down on a
+    // full disk it could have freed itself.
+    staging_reclaim::reclaim_orphaned_staging_dirs_for_data_dir(&opts.data_dir, SystemTime::now())
+        .log();
     // F4: clone the atomic so deeply nested batch loops can bump progress
     // without holding a `&mut IndexRunLockGuard`. The clone is cheap
     // (single Arc bump) and lives only inside this function.
@@ -16522,6 +16530,9 @@ pub(crate) fn repair_lexical_index_from_canonical_db_for_search(
         Arc::clone(&index_run_lock.metadata_write_lock),
         Arc::clone(&index_run_lock.last_progress_at_ms_atomic),
     );
+    // GH#324: this repair path also stages under the index root; sweep
+    // debris from previous crashed runs while we hold the exclusive lock.
+    staging_reclaim::reclaim_orphaned_staging_dirs_for_data_dir(data_dir, SystemTime::now()).log();
 
     let storage = FrankenStorage::open_readonly(db_path).with_context(|| {
         format!(
@@ -20763,6 +20774,11 @@ fn ingest_batch_detailed(
             "SQLite ingest succeeded but inline lexical update was deferred; scheduling authoritative lexical rebuild"
         );
     }
+
+    // GH#320: bound the bulk-ingest WAL (and the pager memory plus finalize
+    // checkpoint debt that scale with it) at a safe between-transactions
+    // boundary.
+    persist::maybe_checkpoint_bulk_ingest_wal(storage, defer_checkpoints);
 
     // Update progress counter for all conversations at once
     if let Some(p) = progress {
@@ -25093,12 +25109,30 @@ pub mod persist {
             .unwrap_or(60_000)
     }
 
+    /// WAL autocheckpoint threshold (pages) for the index writer.
+    ///
+    /// GH#320: bulk-import mode used to disable autocheckpoints entirely
+    /// (`0`), deferring the whole checkpoint to post-publish. That let the
+    /// WAL grow with the corpus (1 GB+ on large fleets) and — because the
+    /// frankensqlite pager keeps WAL-resident state in memory — drove the
+    /// ingest-phase physical footprint to roughly 3.5-4x the WAL size
+    /// (13-14 GB peaks on 16 GB hosts). A bounded-but-large threshold keeps
+    /// bulk import's amortized-checkpoint intent (one checkpoint per
+    /// ~256 MB of WAL at the default 4 KiB page size) while capping the
+    /// WAL-proportional memory. Operators can restore the old unbounded
+    /// behavior with `CASS_INDEX_WRITER_WAL_AUTOCHECKPOINT_PAGES=0`.
+    const BULK_IMPORT_WAL_AUTOCHECKPOINT_PAGES: i64 = 65_536;
+
     fn index_writer_wal_autocheckpoint_pages(defer_checkpoints: bool) -> i64 {
         dotenvy::var("CASS_INDEX_WRITER_WAL_AUTOCHECKPOINT_PAGES")
             .ok()
             .and_then(|v| v.parse::<i64>().ok())
             .filter(|v| *v >= 0)
-            .unwrap_or(if defer_checkpoints { 0 } else { 1000 })
+            .unwrap_or(if defer_checkpoints {
+                BULK_IMPORT_WAL_AUTOCHECKPOINT_PAGES
+            } else {
+                1000
+            })
     }
 
     fn defer_lexical_updates_enabled() -> bool {
@@ -25134,6 +25168,89 @@ pub mod persist {
             );
         } else {
             storage.mark_index_writer_busy_timeout_ms(busy_timeout_ms);
+        }
+    }
+
+    /// GH#320: WAL-size threshold (bytes) above which bulk ingest issues a
+    /// passive checkpoint between batches. `0` disables the bound and
+    /// restores the fully-deferred pre-#320 behavior.
+    ///
+    /// Rationale: bulk-import mode defers checkpoints so the hot insert loop
+    /// never stalls on backfill I/O, but a corpus-sized WAL (1-2 GB+ on
+    /// large fleets) drags a proportional slice of pager state into memory
+    /// and makes the single post-publish TRUNCATE checkpoint — the #319/#321
+    /// wedge window — enormous. A passive checkpoint at a batch boundary
+    /// never blocks on readers or writers (it backfills what it safely can
+    /// and returns), so this bounds both costs while keeping checkpoint I/O
+    /// amortized to once per ~half-GB of WAL.
+    pub(super) const BULK_INGEST_WAL_CHECKPOINT_DEFAULT_BYTES: u64 = 512 * 1024 * 1024;
+
+    fn bulk_ingest_wal_checkpoint_threshold_bytes() -> u64 {
+        dotenvy::var("CASS_INDEX_INGEST_WAL_CHECKPOINT_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(BULK_INGEST_WAL_CHECKPOINT_DEFAULT_BYTES)
+    }
+
+    /// Issue a best-effort `PRAGMA wal_checkpoint(PASSIVE)` on the primary
+    /// storage connection when the bulk-ingest WAL has outgrown the
+    /// configured threshold. Only active in deferred-checkpoint (non-watch)
+    /// mode; watch mode already runs with a small autocheckpoint. Failures
+    /// are logged and swallowed: a missed checkpoint only means the WAL
+    /// stays large until the next boundary or the finalize TRUNCATE.
+    pub(super) fn maybe_checkpoint_bulk_ingest_wal(
+        storage: &FrankenStorage,
+        defer_checkpoints: bool,
+    ) {
+        if !defer_checkpoints {
+            return;
+        }
+        let threshold = bulk_ingest_wal_checkpoint_threshold_bytes();
+        if threshold == 0 {
+            return;
+        }
+        let Ok(db_path) = storage.database_path() else {
+            return;
+        };
+        let mut wal_path = db_path.clone().into_os_string();
+        wal_path.push("-wal");
+        let wal_bytes = match std::fs::metadata(std::path::Path::new(&wal_path)) {
+            Ok(metadata) => metadata.len(),
+            Err(_) => return,
+        };
+        if wal_bytes < threshold {
+            return;
+        }
+        let started = std::time::Instant::now();
+        match storage.raw().query("PRAGMA wal_checkpoint(PASSIVE);") {
+            Ok(rows) => {
+                let status = rows.first().map(|row| {
+                    (
+                        row.get_typed::<i64>(0).unwrap_or(-1),
+                        row.get_typed::<i64>(1).unwrap_or(-1),
+                        row.get_typed::<i64>(2).unwrap_or(-1),
+                    )
+                });
+                let (busy, log_frames, checkpointed_frames) = status.unwrap_or((-1, -1, -1));
+                tracing::info!(
+                    db_path = %db_path.display(),
+                    wal_bytes,
+                    threshold_bytes = threshold,
+                    busy,
+                    log_frames,
+                    checkpointed_frames,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "bulk ingest passive WAL checkpoint (#320 memory/WAL bound)"
+                );
+            }
+            Err(err) => {
+                tracing::debug!(
+                    db_path = %db_path.display(),
+                    wal_bytes,
+                    error = %err,
+                    "bulk ingest passive WAL checkpoint failed; will retry at a later batch boundary"
+                );
+            }
         }
     }
 
@@ -26392,7 +26509,13 @@ pub mod persist {
         #[serial]
         fn wal_autocheckpoint_defaults_follow_bulk_import_mode() {
             let _guard = set_env("CASS_INDEX_WRITER_WAL_AUTOCHECKPOINT_PAGES", "-1");
-            assert_eq!(index_writer_wal_autocheckpoint_pages(true), 0);
+            // GH#320: bulk import is bounded (not 0/unbounded) so the WAL —
+            // and the pager memory that scales with it — cannot grow with
+            // the corpus during a full ingest.
+            assert_eq!(
+                index_writer_wal_autocheckpoint_pages(true),
+                BULK_IMPORT_WAL_AUTOCHECKPOINT_PAGES
+            );
             assert_eq!(index_writer_wal_autocheckpoint_pages(false), 1000);
         }
 
