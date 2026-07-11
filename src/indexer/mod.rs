@@ -25171,7 +25171,7 @@ pub mod persist {
     /// ~256 MB of WAL at the default 4 KiB page size) while capping the
     /// WAL-proportional memory. Operators can restore the old unbounded
     /// behavior with `CASS_INDEX_WRITER_WAL_AUTOCHECKPOINT_PAGES=0`.
-    const BULK_IMPORT_WAL_AUTOCHECKPOINT_PAGES: i64 = 65_536;
+    pub(super) const BULK_IMPORT_WAL_AUTOCHECKPOINT_PAGES: i64 = 65_536;
 
     fn index_writer_wal_autocheckpoint_pages(defer_checkpoints: bool) -> i64 {
         dotenvy::var("CASS_INDEX_WRITER_WAL_AUTOCHECKPOINT_PAGES")
@@ -26786,8 +26786,14 @@ pub mod persist {
             apply_index_writer_checkpoint_policy(&storage, true);
             let rows = storage.raw().query("PRAGMA wal_autocheckpoint;").unwrap();
             assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(0));
-            assert_eq!(storage.index_writer_checkpoint_pages(), Some(0));
+            assert_eq!(
+                rows[0].get(0).unwrap(),
+                &SqliteValue::Integer(BULK_IMPORT_WAL_AUTOCHECKPOINT_PAGES)
+            );
+            assert_eq!(
+                storage.index_writer_checkpoint_pages(),
+                Some(BULK_IMPORT_WAL_AUTOCHECKPOINT_PAGES)
+            );
 
             apply_index_writer_checkpoint_policy(&storage, false);
             let rows = storage.raw().query("PRAGMA wal_autocheckpoint;").unwrap();
@@ -39463,8 +39469,9 @@ mod tests {
             }
         );
         assert_eq!(
-            wal_autocheckpoint, 0,
-            "startup watch ingest should defer WAL auto-checkpoints"
+            wal_autocheckpoint,
+            persist::BULK_IMPORT_WAL_AUTOCHECKPOINT_PAGES,
+            "startup watch ingest should use the bounded bulk-import WAL checkpoint cadence"
         );
     }
 
@@ -39497,7 +39504,10 @@ mod tests {
 
         let rows = storage.raw().query("PRAGMA wal_autocheckpoint;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(0));
+        assert_eq!(
+            rows[0].get(0).unwrap(),
+            &SqliteValue::Integer(persist::BULK_IMPORT_WAL_AUTOCHECKPOINT_PAGES)
+        );
 
         let second = vec![norm_conv(Some("checkpoint-b"), vec![norm_msg(0, 2_000)])];
         ingest_batch(
@@ -39538,7 +39548,10 @@ mod tests {
 
         let rows = storage.raw().query("PRAGMA wal_autocheckpoint;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(0));
+        assert_eq!(
+            rows[0].get(0).unwrap(),
+            &SqliteValue::Integer(persist::BULK_IMPORT_WAL_AUTOCHECKPOINT_PAGES)
+        );
     }
 
     #[test]
@@ -39552,7 +39565,10 @@ mod tests {
 
         persist::apply_index_writer_checkpoint_policy(&storage, true);
         let rows = storage.raw().query("PRAGMA wal_autocheckpoint;").unwrap();
-        assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(0));
+        assert_eq!(
+            rows[0].get(0).unwrap(),
+            &SqliteValue::Integer(persist::BULK_IMPORT_WAL_AUTOCHECKPOINT_PAGES)
+        );
 
         prepare_storage_for_final_checkpoint(&storage, &db_path, "test index close");
 
