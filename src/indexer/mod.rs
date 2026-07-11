@@ -9219,6 +9219,7 @@ fn should_repair_fallback_fts_after_full_index_run(
 enum FallbackFtsRepairOutcome {
     SkippedKnownHealthyForFingerprint { archive_fingerprint: String },
     SkippedUnsupportedPopulatedShadowReload { detail: String },
+    SkippedCorruptDerivedIndex { detail: String },
     Repaired(FtsConsistencyRepair),
 }
 
@@ -9232,6 +9233,18 @@ enum DailyStatsRepairOutcome {
         rows_created: i64,
         total_sessions: i64,
     },
+}
+
+fn nonfatal_fallback_fts_repair_outcome(detail: String) -> Option<FallbackFtsRepairOutcome> {
+    if crate::storage::sqlite::error_message_indicates_populated_fts_shadow_without_rowid_reload(
+        &detail,
+    ) {
+        return Some(FallbackFtsRepairOutcome::SkippedUnsupportedPopulatedShadowReload { detail });
+    }
+    if crate::storage::sqlite::fts_messages_integrity_error_from_message(&detail).is_some() {
+        return Some(FallbackFtsRepairOutcome::SkippedCorruptDerivedIndex { detail });
+    }
+    None
 }
 
 fn repair_fallback_fts_after_full_index_run(
@@ -9272,12 +9285,8 @@ fn repair_fallback_fts_after_full_index_run(
         Ok(storage) => storage,
         Err(err) => {
             let detail = format!("{err:#}");
-            if crate::storage::sqlite::error_message_indicates_populated_fts_shadow_without_rowid_reload(
-                &detail,
-            ) {
-                return Ok(Some(
-                    FallbackFtsRepairOutcome::SkippedUnsupportedPopulatedShadowReload { detail },
-                ));
+            if let Some(outcome) = nonfatal_fallback_fts_repair_outcome(detail) {
+                return Ok(Some(outcome));
             }
             return Err(err).with_context(|| {
                 format!(
@@ -9303,12 +9312,8 @@ fn repair_fallback_fts_after_full_index_run(
         Ok(repair) => repair,
         Err(err) => {
             let detail = format!("{err:#}");
-            if crate::storage::sqlite::error_message_indicates_populated_fts_shadow_without_rowid_reload(
-                &detail,
-            ) {
-                return Ok(Some(
-                    FallbackFtsRepairOutcome::SkippedUnsupportedPopulatedShadowReload { detail },
-                ));
+            if let Some(outcome) = nonfatal_fallback_fts_repair_outcome(detail) {
+                return Ok(Some(outcome));
             }
             return Err(err);
         }
@@ -14728,6 +14733,13 @@ pub fn run_index(
                     "skipping derived fallback FTS repair because frankensqlite cannot yet reload populated FTS shadow WITHOUT ROWID tables; canonical SQLite rows and Tantivy remain authoritative"
                 );
             }
+            FallbackFtsRepairOutcome::SkippedCorruptDerivedIndex { detail } => {
+                tracing::warn!(
+                    db_path = %opts.db_path.display(),
+                    error = %detail,
+                    "derived fallback FTS remains corrupt after its best-effort repair; preserving the successful canonical SQLite and Tantivy build. Run 'cass doctor check --json' before an explicit fallback-FTS rebuild"
+                );
+            }
             FallbackFtsRepairOutcome::Repaired(FtsConsistencyRepair::AlreadyHealthy { rows }) => {
                 tracing::info!(
                     db_path = %opts.db_path.display(),
@@ -16056,25 +16068,63 @@ fn anyhow_chain_indicates_retryable_storage_contention(err: &anyhow::Error) -> b
         .any(|cause| crate::storage::sqlite::retryable_storage_error_message(&cause.to_string()))
 }
 
+const DEFAULT_INDEX_INTEGRITY_PREFLIGHT_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+fn index_integrity_preflight_max_bytes() -> u64 {
+    dotenvy::var("CASS_INDEX_INTEGRITY_PREFLIGHT_MAX_BYTES")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_INDEX_INTEGRITY_PREFLIGHT_MAX_BYTES)
+}
+
+fn should_run_full_archive_quick_check(bundle_bytes: Option<u64>, max_bytes: u64) -> bool {
+    if max_bytes == 0 {
+        return true;
+    }
+    match bundle_bytes {
+        Some(bytes) => bytes <= max_bytes,
+        None => true,
+    }
+}
+
+fn archive_bundle_size_for_integrity_preflight(storage: &FrankenStorage) -> Option<u64> {
+    let db_path = storage.database_path().ok()?;
+    // A missing or unreadable main file must fail safe into the integrity walk.
+    // Sidecars are optional, and database_bundle_size_bytes already treats an
+    // absent WAL/SHM as zero while preserving filename bytes.
+    fs::metadata(&db_path).ok()?;
+    Some(database_bundle_size_bytes(&db_path))
+}
+
 fn full_rebuild_existing_storage_integrity_problem(
     storage: &FrankenStorage,
 ) -> Result<Option<String>> {
-    let quick_check = match storage.raw().query_row_map(
-        "PRAGMA quick_check(1)",
-        &[] as &[ParamValue],
-        |row| row.get_typed::<String>(0),
-    ) {
-        Ok(status) => status,
-        Err(err) if crate::storage::sqlite::retryable_franken_error(&err) => {
-            return Err(anyhow::anyhow!(
-                "full rebuild archive integrity preflight hit transient storage contention: {err}"
-            ));
-        }
-        Err(err) => return Ok(Some(format!("quick_check failed: {err}"))),
-    };
+    let bundle_bytes = archive_bundle_size_for_integrity_preflight(storage);
+    let max_bytes = index_integrity_preflight_max_bytes();
+    if should_run_full_archive_quick_check(bundle_bytes, max_bytes) {
+        let quick_check = match storage.raw().query_row_map(
+            "PRAGMA quick_check(1)",
+            &[] as &[ParamValue],
+            |row| row.get_typed::<String>(0),
+        ) {
+            Ok(status) => status,
+            Err(err) if crate::storage::sqlite::retryable_franken_error(&err) => {
+                return Err(anyhow::anyhow!(
+                    "full rebuild archive integrity preflight hit transient storage contention: {err}"
+                ));
+            }
+            Err(err) => return Ok(Some(format!("quick_check failed: {err}"))),
+        };
 
-    if !quick_check.trim().eq_ignore_ascii_case("ok") {
-        return Ok(Some(format!("quick_check reported {quick_check:?}")));
+        if !quick_check.trim().eq_ignore_ascii_case("ok") {
+            return Ok(Some(format!("quick_check reported {quick_check:?}")));
+        }
+    } else {
+        tracing::warn!(
+            bundle_bytes = bundle_bytes.unwrap_or_default(),
+            max_bytes,
+            "skipping the O(database-size) PRAGMA quick_check before a large full rebuild; core-table canaries still run. Use 'cass doctor check --json' for the exhaustive scan, or set CASS_INDEX_INTEGRITY_PREFLIGHT_MAX_BYTES=0 to force it here"
+        );
     }
 
     for (table, sql) in [
@@ -40718,6 +40768,19 @@ mod tests {
     }
 
     #[test]
+    fn full_rebuild_integrity_preflight_size_gate_is_bounded_and_fail_safe() {
+        let gib = 1024_u64 * 1024 * 1024;
+
+        assert!(should_run_full_archive_quick_check(Some(2 * gib), 2 * gib));
+        assert!(!should_run_full_archive_quick_check(
+            Some(2 * gib + 1),
+            2 * gib
+        ));
+        assert!(should_run_full_archive_quick_check(Some(64 * gib), 0));
+        assert!(should_run_full_archive_quick_check(None, 2 * gib));
+    }
+
+    #[test]
     fn full_rebuild_integrity_preflight_accepts_healthy_current_schema() {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("healthy-current-schema.db");
@@ -41582,6 +41645,26 @@ mod tests {
         assert!(!should_repair_fallback_fts_after_full_index_run(
             false, true
         ));
+    }
+
+    #[test]
+    fn fallback_fts_repair_classifies_missing_shadow_as_nonfatal_derived_damage() {
+        let outcome = nonfatal_fallback_fts_repair_outcome(
+            "inserting 10000 fallback rows: table not found: fts_messages_data".to_string(),
+        );
+        assert!(matches!(
+            outcome,
+            Some(FallbackFtsRepairOutcome::SkippedCorruptDerivedIndex { detail })
+                if detail.contains("fts_messages_data")
+        ));
+
+        assert_eq!(
+            nonfatal_fallback_fts_repair_outcome(
+                "disk I/O error while opening canonical messages".to_string()
+            ),
+            None,
+            "canonical I/O failures must remain fatal"
+        );
     }
 
     #[test]

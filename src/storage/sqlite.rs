@@ -1206,12 +1206,17 @@ pub fn fts_messages_integrity_error_from_message(
         return None;
     }
 
+    let mentions_required_shadow_table = FTS_MESSAGES_REQUIRED_SHADOW_TABLES
+        .iter()
+        .any(|table| lower.contains(&table.to_ascii_lowercase()));
     let mentions_structural_fts_failure = lower.contains("shadow table")
         || lower.contains("vtable constructor failed")
         || lower.contains("sqlite_corrupt")
         || lower.contains("databasecorrupt")
         || lower.contains("database corrupt")
-        || lower.contains("missing required");
+        || lower.contains("missing required")
+        || (mentions_required_shadow_table
+            && (lower.contains("table not found") || lower.contains("no such table")));
     if !mentions_structural_fts_failure {
         return None;
     }
@@ -13822,12 +13827,56 @@ fn franken_update_daily_stats_batched_in_tx(
     tx: &FrankenTransaction<'_>,
     entries: &[(i64, String, String, StatsDelta)],
 ) -> Result<usize> {
+    franken_update_daily_stats_batched_in_tx_for_target(
+        tx,
+        entries,
+        DailyStatsBatchTarget::Canonical,
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DailyStatsBatchTarget {
+    Canonical,
+    RebuildStage,
+}
+
+impl DailyStatsBatchTarget {
+    fn upsert_sql(self) -> &'static str {
+        match self {
+            Self::Canonical => {
+                "INSERT INTO daily_stats (day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7)
+                 ON CONFLICT(day_id, agent_slug, source_id) DO UPDATE SET
+                     session_count = session_count + excluded.session_count,
+                     message_count = message_count + excluded.message_count,
+                     total_chars = total_chars + excluded.total_chars,
+                     last_updated = excluded.last_updated"
+            }
+            Self::RebuildStage => {
+                "INSERT INTO daily_stats_rebuild_stage (day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7)
+                 ON CONFLICT(day_id, agent_slug, source_id) DO UPDATE SET
+                     session_count = session_count + excluded.session_count,
+                     message_count = message_count + excluded.message_count,
+                     total_chars = total_chars + excluded.total_chars,
+                     last_updated = excluded.last_updated"
+            }
+        }
+    }
+}
+
+fn franken_update_daily_stats_batched_in_tx_for_target(
+    tx: &FrankenTransaction<'_>,
+    entries: &[(i64, String, String, StatsDelta)],
+    target: DailyStatsBatchTarget,
+) -> Result<usize> {
     if entries.is_empty() {
         return Ok(0);
     }
 
     let now = FrankenStorage::now_millis();
     let mut total_affected = 0;
+    let upsert_sql = target.upsert_sql();
 
     // Keep frankensqlite UPSERTs row-wise inside the transaction. The
     // multi-row VALUES ... ON CONFLICT form still falls back through
@@ -13835,13 +13884,7 @@ fn franken_update_daily_stats_batched_in_tx(
     // real cass indexing.
     for (day_id, agent, source, delta) in entries {
         total_affected += tx.execute_compat(
-            "INSERT INTO daily_stats (day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
-             VALUES(?1,?2,?3,?4,?5,?6,?7)
-             ON CONFLICT(day_id, agent_slug, source_id) DO UPDATE SET
-                 session_count = session_count + excluded.session_count,
-                 message_count = message_count + excluded.message_count,
-                 total_chars = total_chars + excluded.total_chars,
-                 last_updated = excluded.last_updated",
+            upsert_sql,
             fparams![
                 *day_id,
                 agent.as_str(),
@@ -14663,8 +14706,25 @@ impl FrankenStorage {
             "daily_stats rebuild selected message source"
         );
 
-        let mut tx = self.conn.transaction()?;
-        tx.execute("DELETE FROM daily_stats")?;
+        // Build into a connection-local staging table and commit every bounded
+        // aggregate batch. Holding one write transaction for the entire archive
+        // makes the engine retain transaction state proportional to the full
+        // message corpus, defeating the bounded query batches above. The live
+        // materialization remains untouched until the final atomic publish, so
+        // an interrupted rebuild leaves the last known-good stats available.
+        self.conn.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS daily_stats_rebuild_stage (
+                day_id INTEGER NOT NULL,
+                agent_slug TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                session_count INTEGER NOT NULL DEFAULT 0,
+                message_count INTEGER NOT NULL DEFAULT 0,
+                total_chars INTEGER NOT NULL DEFAULT 0,
+                last_updated INTEGER NOT NULL,
+                PRIMARY KEY (day_id, agent_slug, source_id)
+            )",
+        )?;
+        self.conn.execute("DELETE FROM daily_stats_rebuild_stage")?;
 
         let mut last_conversation_id = 0_i64;
         let mut conversation_batch_count = 0_usize;
@@ -14747,7 +14807,13 @@ impl FrankenStorage {
             let entries = aggregate.expand();
             expanded_entries_flushed += entries.len();
             if !entries.is_empty() {
-                franken_update_daily_stats_batched_in_tx(&tx, &entries)?;
+                let mut batch_tx = self.conn.transaction()?;
+                franken_update_daily_stats_batched_in_tx_for_target(
+                    &batch_tx,
+                    &entries,
+                    DailyStatsBatchTarget::RebuildStage,
+                )?;
+                batch_tx.commit()?;
             }
             if conversation_batch_count.is_multiple_of(25) {
                 tracing::info!(
@@ -14807,7 +14873,13 @@ impl FrankenStorage {
                     let entries = aggregate.expand();
                     expanded_entries_flushed += entries.len();
                     if !entries.is_empty() {
-                        franken_update_daily_stats_batched_in_tx(&tx, &entries)?;
+                        let mut batch_tx = self.conn.transaction()?;
+                        franken_update_daily_stats_batched_in_tx_for_target(
+                            &batch_tx,
+                            &entries,
+                            DailyStatsBatchTarget::RebuildStage,
+                        )?;
+                        batch_tx.commit()?;
                     }
                     if message_batch_count.is_multiple_of(50) {
                         tracing::info!(
@@ -14829,17 +14901,28 @@ impl FrankenStorage {
             }
         }
 
-        let rows_created: i64 =
-            tx.query_row_map("SELECT COUNT(*) FROM daily_stats", fparams![], |row| {
-                row.get_typed(0)
-            })?;
-        let total_sessions: i64 = tx.query_row_map(
-            "SELECT COALESCE(SUM(session_count), 0) FROM daily_stats WHERE agent_slug = 'all' AND source_id = 'all'",
+        let rows_created: i64 = self.conn.query_row_map(
+            "SELECT COUNT(*) FROM daily_stats_rebuild_stage",
+            fparams![],
+            |row| row.get_typed(0),
+        )?;
+        let total_sessions: i64 = self.conn.query_row_map(
+            "SELECT COALESCE(SUM(session_count), 0) FROM daily_stats_rebuild_stage WHERE agent_slug = 'all' AND source_id = 'all'",
             fparams![],
             |row| row.get_typed(0),
         )?;
 
-        tx.commit()?;
+        let mut publish_tx = self.conn.transaction()?;
+        publish_tx.execute("DELETE FROM daily_stats")?;
+        publish_tx.execute(
+            "INSERT INTO daily_stats (
+                day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated
+             )
+             SELECT day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated
+             FROM daily_stats_rebuild_stage",
+        )?;
+        publish_tx.commit()?;
+        self.conn.execute("DELETE FROM daily_stats_rebuild_stage")?;
 
         tracing::info!(
             target: "cass::perf::daily_stats",
@@ -19496,7 +19579,11 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn rebuild_daily_stats_recomputes_materialized_totals_without_monolithic_group_by() {
+        let _conversation_batch =
+            set_env_var("CASS_DAILY_STATS_REBUILD_CONVERSATION_BATCH_SIZE", "1");
+        let _message_batch = set_env_var("CASS_DAILY_STATS_REBUILD_MESSAGE_BATCH_SIZE", "1");
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test.db");
         let storage = SqliteStorage::open(&db_path).unwrap();
@@ -19641,7 +19728,15 @@ mod tests {
                 .unwrap();
         }
 
-        storage.conn.execute("DELETE FROM daily_stats").unwrap();
+        storage
+            .conn
+            .execute_compat(
+                "INSERT INTO daily_stats (
+                    day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                fparams![999_i64, "stale", "stale", 99_i64, 99_i64, 99_i64, 0_i64],
+            )
+            .unwrap();
 
         let rebuilt = storage.rebuild_daily_stats().unwrap();
         assert_eq!(rebuilt.total_sessions, 2);
@@ -19657,9 +19752,32 @@ mod tests {
                 "SELECT message_count FROM daily_stats WHERE agent_slug = 'all' AND source_id = 'all'",
                 fparams![],
                 |row| row.get_typed(0),
-            )
+        )
             .unwrap();
         assert_eq!(total_messages, 3);
+
+        let stale_rows: i64 = storage
+            .conn
+            .query_row_map(
+                "SELECT COUNT(*) FROM daily_stats WHERE agent_slug = 'stale'",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stale_rows, 0,
+            "atomic publish must replace stale live stats"
+        );
+
+        let staged_rows: i64 = storage
+            .conn
+            .query_row_map(
+                "SELECT COUNT(*) FROM daily_stats_rebuild_stage",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(staged_rows, 0, "successful publish must clear staging rows");
     }
 
     #[test]
@@ -27044,6 +27162,15 @@ mod tests {
 
     #[test]
     fn fts_messages_integrity_reports_missing_shadow_tables() {
+        let direct_missing_shadow = fts_messages_integrity_error_from_message(
+            "inserting 10000 rows into fallback FTS: table not found: fts_messages_data",
+        )
+        .expect("a missing required shadow table must be classified as derived FTS damage");
+        assert_eq!(
+            direct_missing_shadow.missing_shadow_tables(),
+            &["fts_messages_data"]
+        );
+
         let dir = TempDir::new().unwrap();
         let healthy_db_path = dir.path().join("healthy_fts.db");
 
