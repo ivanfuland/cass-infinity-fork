@@ -4709,7 +4709,7 @@ impl LexicalRebuildShardBuildTelemetry {
         if let Some(amplification_milli) = result.amplification_milli {
             let conservative_amplification = amplification_milli
                 .max(LEXICAL_REBUILD_STAGED_SHARD_BUILD_AMPLIFICATION_FLOOR_MILLI);
-            let _ = self.observed_amplification_milli.fetch_update(
+            let _ = self.observed_amplification_milli.try_update(
                 Ordering::Relaxed,
                 Ordering::Relaxed,
                 |current| Some(current.max(conservative_amplification)),
@@ -7844,7 +7844,7 @@ struct LexicalRebuildProducerTelemetry {
 
 impl LexicalRebuildProducerTelemetry {
     fn saturating_add(counter: &AtomicUsize, value: usize) {
-        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             Some(current.saturating_add(value))
         });
     }

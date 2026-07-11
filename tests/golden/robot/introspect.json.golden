@@ -1988,6 +1988,13 @@
           "required": false
         },
         {
+          "name": "since",
+          "description": "Only sessions active since this ISO date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS), keyword (`today`, `yesterday`), or relative offset (`-7d`, `-24h`). Filters on the session's recorded last-activity timestamp (ended_at, falling back to started_at)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
           "name": "json",
           "description": "Output as JSON (for automation)",
           "arg_type": "flag",

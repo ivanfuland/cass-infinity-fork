@@ -76204,24 +76204,32 @@ fn run_sessions(
     }
 
     // Backfill message/human-turn counts for the surviving sessions only.
-    // Each lookup is an indexed range scan on messages(conversation_id, idx)
-    // via sqlite_autoindex_messages_1, so the cost scales with the returned
-    // page, not the corpus.
+    // Deliberately NOT a SQL aggregate: the frankensqlite planner executes
+    // `SELECT COUNT(..) WHERE conversation_id = ?` as a full messages-table
+    // scan even under an INDEXED BY hint (verified via live backtraces on a
+    // 26 GB index). The plain indexed row-fetch shape below is the same one
+    // the hot per-conversation message paths use (see the EXPLAIN QUERY
+    // PLAN contract test in storage::sqlite), so each lookup is an indexed
+    // range scan on messages(conversation_id, idx) and the roles are
+    // tallied in Rust — cost scales with the returned page, not the corpus.
+    let count_session_messages =
+        |conversation_id: i64| -> Result<(i64, i64), frankensqlite::FrankenError> {
+            let roles: Vec<String> = conn.query_map_collect(
+                "SELECT role
+                 FROM messages INDEXED BY sqlite_autoindex_messages_1
+                 WHERE conversation_id = ?1",
+                &[ParamValue::from(conversation_id)],
+                |row: &frankensqlite::Row| row.get_typed::<String>(0),
+            )?;
+            let message_count = roles.len() as i64;
+            let human_turns = roles.iter().filter(|role| role.as_str() == "user").count() as i64;
+            Ok((message_count, human_turns))
+        };
     let sessions: Vec<SessionSummaryRecord> = sessions
         .into_iter()
         .map(|(conversation_id, _, mut session)| {
-            let (message_count, human_turns) = conn
-                .query_row_map(
-                    "SELECT COUNT(id),
-                            COALESCE(SUM(CASE WHEN role = 'user' THEN 1 ELSE 0 END), 0)
-                     FROM messages
-                     WHERE conversation_id = ?1",
-                    &[ParamValue::from(conversation_id)],
-                    |row: &frankensqlite::Row| {
-                        Ok((row.get_typed::<i64>(0)?, row.get_typed::<i64>(1)?))
-                    },
-                )
-                .map_err(|e| CliError {
+            let (message_count, human_turns) =
+                count_session_messages(conversation_id).map_err(|e| CliError {
                     code: 9,
                     kind: CliErrorKind::DbQuery.kind_str(),
                     message: format!("Failed to count session messages: {e}"),
@@ -85312,12 +85320,9 @@ impl IndexStallWatchdog {
                 .finalizing
                 .load(std::sync::atomic::Ordering::Relaxed)
         {
-            match self.finalize_abort_threshold {
-                Some(threshold) => threshold,
-                // Finalize aborts disabled (CASS_INDEX_FINALIZE_ABORT_SECS=0):
-                // treat the finalize window as report-only.
-                None => return None,
-            }
+            // Finalize aborts disabled (CASS_INDEX_FINALIZE_ABORT_SECS=0):
+            // treat the finalize window as report-only.
+            self.finalize_abort_threshold?
         } else {
             abort_threshold
         };
@@ -85871,9 +85876,9 @@ mod stall_diagnostics_tests {
             .observe(&progress, 100)
             .ok_or_else(|| anyhow::anyhow!("non-finalizing wedge did not report"))?;
         assert_eq!(detected["event"], serde_json::json!("stall_detected"));
-        let abort = wedge_watchdog
-            .observe(&progress, 200)
-            .ok_or_else(|| anyhow::anyhow!("non-finalizing wedge did not abort at the ordinary threshold"))?;
+        let abort = wedge_watchdog.observe(&progress, 200).ok_or_else(|| {
+            anyhow::anyhow!("non-finalizing wedge did not abort at the ordinary threshold")
+        })?;
         assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
         assert_eq!(abort["exit_code"], serde_json::json!(70));
         Ok(())
