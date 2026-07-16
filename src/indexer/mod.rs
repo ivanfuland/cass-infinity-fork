@@ -23135,6 +23135,9 @@ fn reindex_paths_with_semantic_delta(
                 scan_root = %root.path.display(),
                 "skipping active explicit watch source without advancing watermarks"
             );
+            // An active file-root has no ledger either: poison the kind so a
+            // sibling root's pending watermark cannot publish past this file.
+            watch_preserve_by_kind.insert(kind, true);
             publish_watch_watermark_if_kind_complete(
                 &opts.data_dir,
                 state,
@@ -46758,8 +46761,11 @@ mod tests {
 
     /// Multi-ROOT ordering (codex R3): watch_state is shared per ConnectorKind
     /// while triggers iterate per (kind, root). A successful root must not
-    /// publish the shared watermark past another root's deferred conversation,
-    /// regardless of root execution order.
+    /// publish the shared watermark past another root's deferred conversation.
+    /// NOTE: trigger iteration order is hash-nondeterministic, so this test
+    /// exercises an arbitrary root order per run; order-independence itself is
+    /// structural (publication only at kind completion + preserve poisoning),
+    /// not something an input ordering can pin down.
     #[test]
     #[serial]
     fn watch_reindex_success_root_does_not_advance_past_other_roots_deferred() {
@@ -46849,18 +46855,19 @@ mod tests {
         );
     }
 
-    /// Same as above with the ROOT ORDER REVERSED: the successful root runs
-    /// FIRST (before the deferring root has even been scanned), so a naive
-    /// "block if the kind has deferred so far" check would still publish.
+    /// An ACTIVE file-root (recently written) is pre-scan skipped with no
+    /// ledger (codex R5): a sibling root's success must not publish the kind
+    /// watermark past it. Deterministic in either hash order: the active root
+    /// poisons the kind whether it runs before or after the successful root.
     #[test]
     #[serial]
-    fn watch_reindex_success_root_first_still_preserves_for_later_deferred_root() {
+    fn watch_reindex_active_file_root_blocks_sibling_watermark_publication() {
         let tmp = TempDir::new().unwrap();
-        let data_dir = tmp.path().join("watch-oom-defer-multiroot-rev");
-        let deferred_dir = data_dir.join("amp-deferred");
-        let later_dir = data_dir.join("amp-later");
-        std::fs::create_dir_all(&deferred_dir).unwrap();
-        std::fs::create_dir_all(&later_dir).unwrap();
+        let data_dir = tmp.path().join("watch-active-file-root");
+        let done_dir = data_dir.join("amp-done");
+        let active_dir = data_dir.join("amp-active");
+        std::fs::create_dir_all(&done_dir).unwrap();
+        std::fs::create_dir_all(&active_dir).unwrap();
         let now = i64::try_from(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -46870,32 +46877,34 @@ mod tests {
         .unwrap_or(i64::MAX)
         .saturating_add(10_000);
 
-        let deferred = deferred_dir.join("thread-00-deferred.json");
-        let later = later_dir.join("thread-01-later.json");
+        let done_file = done_dir.join("thread-10-done.json");
+        let active_file = active_dir.join("thread-11-active.json");
         std::fs::write(
-            &deferred,
+            &done_file,
             format!(
-                r#"{{"id":"thread-00-deferred","messages":[{{"role":"user","text":"defer me","createdAt":{now}}}]}}"#
+                r#"{{"id":"thread-10-done","messages":[{{"role":"user","text":"index me","createdAt":{now}}}]}}"#
             ),
         )
         .unwrap();
         std::fs::write(
-            &later,
+            &active_file,
             format!(
-                r#"{{"id":"thread-01-later","messages":[{{"role":"user","text":"index me","createdAt":{}}}]}}"#,
+                r#"{{"id":"thread-11-active","messages":[{{"role":"user","text":"still being written","createdAt":{}}}]}}"#,
                 now + 1
             ),
         )
         .unwrap();
+        // done_file is cold (mtime 2h ago); active_file keeps its fresh mtime
+        // and falls inside the recent-write window below.
+        let cold = std::time::SystemTime::now() - std::time::Duration::from_secs(7_200);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&done_file)
+            .unwrap()
+            .set_modified(cold)
+            .unwrap();
 
-        let _selective_oom = set_env(
-            "CASS_TEST_WATCH_INGEST_OOM_EXTERNAL_ID",
-            "thread-00-deferred",
-        );
-        let _solo_oom = set_env("CASS_TEST_WATCH_SOLO_RETRY_OOM", "1");
-        let _chunk = set_env("CASS_WATCH_INGEST_CHUNK_SIZE", "1");
-        let _reserve = set_env("CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES", "0");
-        let _window = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
+        let _window = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "600");
         let opts = super::IndexOptions {
             full: false,
             watch: true,
@@ -46918,13 +46927,13 @@ mod tests {
         let storage = std::sync::Mutex::new(storage);
         let t_index = std::sync::Mutex::new(Some(t_index));
         let roots = vec![
-            (ConnectorKind::Amp, ScanRoot::local(later_dir)),
-            (ConnectorKind::Amp, ScanRoot::local(deferred_dir)),
+            (ConnectorKind::Amp, ScanRoot::local(done_dir)),
+            (ConnectorKind::Amp, ScanRoot::local(active_file.clone())),
         ];
 
         let indexed = reindex_paths(
             &opts,
-            vec![later, deferred],
+            vec![done_file, active_file],
             &roots,
             &state,
             &storage,
@@ -46934,10 +46943,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(indexed, 2);
+        assert_eq!(indexed, 1);
         assert!(
             load_watch_state(&data_dir).is_empty(),
-            "a successful root that runs first must not have published past a root that defers later"
+            "an active file-root has no ledger, so another root's pending watermark must not publish"
         );
     }
 
