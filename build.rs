@@ -50,11 +50,15 @@ const CONTRACTS: &[DependencyContract] = &[
         // crates.io-only exact pin: fsqlite 0.1.16 carries everything from the
         // 0.1.11 line (#95 BtCursor forward-progress, #106 MVCC grow, FTS5
         // shadow-table persistence + lazy reopen [cass#282], FTS5 merge/finalize
-        // O(N^2)->O(N) spin fix [cass#301]) plus the contentless-FTS5
-        // reopen-mutate hydration + incremental segment append + averages
-        // rebuild fixes (fsqlite bd-sf8dx) that unblock cass's contentless
-        // fts_messages incremental catch-up and legacy-schema repair paths
-        // (cass y8n3i/cljkz). Empty `expected_git` signals
+        // O(N^2)->O(N) spin fix [cass#301]) plus the durability fixes for the
+        // lost-root-page-write corruption class (#124/#127/#128/#133) that
+        // motivated this bump. NOTE (verified 2026-07-16): the contentless-FTS
+        // incremental catch-up and legacy duplicate-schema repair paths are
+        // still NOT delivered on 0.1.16 — the three #[ignore]d gates in
+        // src/storage/sqlite.rs (cass y8n3i/cljkz) still fail when force-run
+        // (catch-up degrades to a full rebuild; legacy repair still reports
+        // "database disk image is malformed"). Keep them ignored, same as
+        // upstream at fsqlite 0.1.13. Empty `expected_git` signals
         // `validate_manifest_dependency_spec` to skip git/rev checks.
         expected_git: "",
         expected_rev: "",

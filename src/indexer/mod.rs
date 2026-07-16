@@ -21163,6 +21163,11 @@ struct WatchIngestBatchOutcome {
     batch_outcome: persist::PersistBatchOutcome,
     processed_conversations: usize,
     quarantined_conversations: usize,
+    /// Conversations skipped this pass by the #298 plausibility gate (bounded
+    /// NoMem, no real pressure). Not quarantined — but the watch watermark
+    /// must not advance past them or they would be silently dropped until
+    /// their source file changes again.
+    deferred_conversations: usize,
     max_payload_watermark_ms: Option<i64>,
 }
 
@@ -21175,6 +21180,9 @@ impl WatchIngestBatchOutcome {
         self.quarantined_conversations = self
             .quarantined_conversations
             .saturating_add(other.quarantined_conversations);
+        self.deferred_conversations = self
+            .deferred_conversations
+            .saturating_add(other.deferred_conversations);
         if let Some(ts) = other.max_payload_watermark_ms {
             self.max_payload_watermark_ms = Some(
                 self.max_payload_watermark_ms
@@ -21184,7 +21192,6 @@ impl WatchIngestBatchOutcome {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 /// How a watch ingest call should treat a single-conversation OOM (#298).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WatchOomIngestMode {
@@ -21199,6 +21206,7 @@ enum WatchOomIngestMode {
     SoloIsolatedRetry,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ingest_watch_batch_with_oom_split(
     storage: &FrankenStorage,
     t_index: &mut TantivyIndex,
@@ -21259,6 +21267,7 @@ fn ingest_watch_batch_with_oom_split_inner(
             batch_outcome,
             processed_conversations: convs.len(),
             quarantined_conversations: 0,
+            deferred_conversations: 0,
             max_payload_watermark_ms: conversations_payload_watermark_ms(convs),
         }),
         Err(error) if error_is_out_of_memory(&error) && convs.len() > 1 => {
@@ -21390,6 +21399,7 @@ fn ingest_watch_batch_with_oom_split_inner(
                             batch_outcome: persist::PersistBatchOutcome::default(),
                             processed_conversations: 1,
                             quarantined_conversations: 0,
+                            deferred_conversations: 1,
                             max_payload_watermark_ms: None,
                         });
                     }
@@ -21437,6 +21447,7 @@ fn quarantine_single_watch_conversation(
         batch_outcome: persist::PersistBatchOutcome::default(),
         processed_conversations: 1,
         quarantined_conversations: 1,
+        deferred_conversations: 0,
         max_payload_watermark_ms: None,
     })
 }
@@ -23149,6 +23160,7 @@ fn reindex_paths_with_semantic_delta(
         let mut inserted_messages = 0usize;
         let mut processed_conversations = 0usize;
         let mut quarantined_conversations = 0usize;
+        let mut deferred_conversations = 0usize;
         {
             let storage = storage
                 .lock()
@@ -23190,6 +23202,8 @@ fn reindex_paths_with_semantic_delta(
                     processed_conversations.saturating_add(chunk_outcome.processed_conversations);
                 quarantined_conversations = quarantined_conversations
                     .saturating_add(chunk_outcome.quarantined_conversations);
+                deferred_conversations =
+                    deferred_conversations.saturating_add(chunk_outcome.deferred_conversations);
                 if let Some(delta) = semantic_delta.as_deref_mut() {
                     delta.extend_from_batch(
                         chunk_outcome.batch_outcome.semantic_delta_inputs,
@@ -23231,14 +23245,18 @@ fn reindex_paths_with_semantic_delta(
                 if !explicit_watch_once
                     && !preserve_this_watch_watermark
                     && chunk_outcome.quarantined_conversations == 0
+                    && chunk_outcome.deferred_conversations == 0
                     && let Some(ts_val) = chunk_outcome.max_payload_watermark_ms
                 {
                     save_watch_state_watermark(&opts.data_dir, state, kind, ts_val)?;
-                } else if chunk_outcome.quarantined_conversations > 0 {
+                } else if chunk_outcome.quarantined_conversations > 0
+                    || chunk_outcome.deferred_conversations > 0
+                {
                     tracing::info!(
                         ?kind,
                         quarantined_conversations = chunk_outcome.quarantined_conversations,
-                        "preserving partial watch watermark so quarantined source can be retried"
+                        deferred_conversations = chunk_outcome.deferred_conversations,
+                        "preserving partial watch watermark so quarantined/deferred source can be retried"
                     );
                 } else if preserve_this_watch_watermark {
                     tracing::debug!(
@@ -23299,6 +23317,7 @@ fn reindex_paths_with_semantic_delta(
             && conv_count > 0
             && !preserve_this_watch_watermark
             && quarantined_conversations == 0
+            && deferred_conversations == 0
             && let Some(ts_val) = max_ts
         {
             // Once every chunk for this trigger has persisted without poison
@@ -23307,11 +23326,14 @@ fn reindex_paths_with_semantic_delta(
             // timestamps so an unexpected later failure cannot hide
             // unprocessed conversations that share the same source file.
             save_watch_state_watermark(&opts.data_dir, state, kind, ts_val)?;
-        } else if !explicit_watch_once && quarantined_conversations > 0 {
+        } else if !explicit_watch_once
+            && (quarantined_conversations > 0 || deferred_conversations > 0)
+        {
             tracing::info!(
                 ?kind,
                 quarantined_conversations,
-                "preserving final watch watermark so quarantined source can be retried"
+                deferred_conversations,
+                "preserving final watch watermark so quarantined/deferred source can be retried"
             );
         } else if !explicit_watch_once && conv_count > 0 && preserve_this_watch_watermark {
             tracing::info!(
