@@ -46950,6 +46950,67 @@ mod tests {
         );
     }
 
+    /// Direct unit coverage for the per-kind publication gate (codex R6 P2),
+    /// independent of trigger iteration order: no publish while triggers
+    /// remain; a poisoned kind's candidate is consumed unpublished; a clean
+    /// sibling kind publishes independently.
+    #[test]
+    #[serial]
+    fn publish_watch_watermark_helper_gates_on_remaining_and_preserve() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let state = std::sync::Mutex::new(std::collections::HashMap::new());
+        let mut pending: HashMap<ConnectorKind, i64> = HashMap::new();
+        let mut remaining: HashMap<ConnectorKind, usize> = HashMap::new();
+        let mut preserve: HashMap<ConnectorKind, bool> = HashMap::new();
+
+        // Triggers remaining: candidate untouched, nothing published.
+        pending.insert(ConnectorKind::Amp, 111);
+        remaining.insert(ConnectorKind::Amp, 1);
+        publish_watch_watermark_if_kind_complete(
+            &data_dir,
+            &state,
+            ConnectorKind::Amp,
+            &remaining,
+            &mut pending,
+            &preserve,
+        )
+        .unwrap();
+        assert_eq!(pending.get(&ConnectorKind::Amp), Some(&111));
+        assert!(load_watch_state(&data_dir).is_empty());
+
+        // Kind complete but poisoned: candidate consumed, nothing published.
+        remaining.insert(ConnectorKind::Amp, 0);
+        preserve.insert(ConnectorKind::Amp, true);
+        publish_watch_watermark_if_kind_complete(
+            &data_dir,
+            &state,
+            ConnectorKind::Amp,
+            &remaining,
+            &mut pending,
+            &preserve,
+        )
+        .unwrap();
+        assert!(pending.get(&ConnectorKind::Amp).is_none());
+        assert!(load_watch_state(&data_dir).is_empty());
+
+        // A clean sibling kind publishes independently of the poisoned one.
+        pending.insert(ConnectorKind::Claude, 222);
+        remaining.insert(ConnectorKind::Claude, 0);
+        publish_watch_watermark_if_kind_complete(
+            &data_dir,
+            &state,
+            ConnectorKind::Claude,
+            &remaining,
+            &mut pending,
+            &preserve,
+        )
+        .unwrap();
+        let published = load_watch_state(&data_dir);
+        assert_eq!(published.get(&ConnectorKind::Claude), Some(&222));
+        assert!(published.get(&ConnectorKind::Amp).is_none());
+    }
+
     /// #298 differential: a conversation that OOMs in batch ingest but ingests
     /// cleanly when isolated solo must NOT be quarantined. This is the exact
     /// false-positive the reporter hit — small/medium conversations that index
