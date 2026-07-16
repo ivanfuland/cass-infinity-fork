@@ -412,6 +412,14 @@
           "repeatable": true
         },
         {
+          "name": "role",
+          "description": "Filter by message role: user, assistant, tool, or system (can be specified multiple times). Legacy aliases (agent, developer, tool_call, tool_result, toolResult, reasoning) are also accepted. When given, overrides the semantic engine's default user+assistant role filter instead of intersecting with it",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "repeatable": true
+        },
+        {
           "name": "limit",
           "description": "Max results. 0 = \"no limit\" but is auto-capped to a RAM-proportional ceiling (1/16 of MemAvailable, clamped to [256 MiB, 16 GiB] of result-heap) so a single query can't tie up the whole machine. Override with CASS_SEARCH_NO_LIMIT_CAP=<hits> or CASS_SEARCH_NO_LIMIT_BYTES=<bytes>",
           "arg_type": "option",
@@ -2030,7 +2038,7 @@
     },
     {
       "name": "resume",
-      "description": "Resolve a session path into a ready-to-run resume command for its native harness (Claude Code, Codex, OpenCode, pi_agent, Gemini)",
+      "description": "Resolve a session path into a ready-to-run resume command for its native harness (Claude Code, Codex, OpenCode, pi_agent, Gemini, Antigravity)",
       "arguments": [
         {
           "name": "path",
