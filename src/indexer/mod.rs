@@ -22539,6 +22539,16 @@ fn ingest_quarantine_circuit_limit() -> usize {
 
 #[cfg(test)]
 fn should_inject_watch_ingest_test_oom(convs: &[NormalizedConversation]) -> bool {
+    // Selective variant: OOM only the chunk containing this external id, so
+    // multi-chunk ordering tests can defer one conversation while letting
+    // later chunks succeed.
+    if let Ok(target) = dotenvy::var("CASS_TEST_WATCH_INGEST_OOM_EXTERNAL_ID")
+        && !target.is_empty()
+    {
+        return convs
+            .iter()
+            .any(|conv| conv.external_id.as_deref() == Some(target.as_str()));
+    }
     dotenvy::var("CASS_TEST_WATCH_INGEST_OOM_MIN_CONVS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -23242,20 +23252,25 @@ fn reindex_paths_with_semantic_delta(
                     )?;
                 }
 
+                // Deferred check is CUMULATIVE, not per-chunk: once any earlier
+                // chunk deferred a conversation, a later successful chunk must
+                // not advance the partial watermark past it — the watermark is
+                // a deferred conversation's only retry protection (unlike
+                // quarantine, which has its own ledger and is designed to be
+                // skipped over so watch mode does not wedge on a poison file).
                 if !explicit_watch_once
                     && !preserve_this_watch_watermark
                     && chunk_outcome.quarantined_conversations == 0
-                    && chunk_outcome.deferred_conversations == 0
+                    && deferred_conversations == 0
                     && let Some(ts_val) = chunk_outcome.max_payload_watermark_ms
                 {
                     save_watch_state_watermark(&opts.data_dir, state, kind, ts_val)?;
-                } else if chunk_outcome.quarantined_conversations > 0
-                    || chunk_outcome.deferred_conversations > 0
+                } else if chunk_outcome.quarantined_conversations > 0 || deferred_conversations > 0
                 {
                     tracing::info!(
                         ?kind,
                         quarantined_conversations = chunk_outcome.quarantined_conversations,
-                        deferred_conversations = chunk_outcome.deferred_conversations,
+                        deferred_conversations,
                         "preserving partial watch watermark so quarantined/deferred source can be retried"
                     );
                 } else if preserve_this_watch_watermark {
@@ -46528,6 +46543,94 @@ mod tests {
                 .join("quarantine/watch_ingest_poison.jsonl")
                 .exists(),
             "a small conversation with no real memory pressure must be deferred, not quarantined (#298)"
+        );
+    }
+
+    /// Multi-chunk ordering: a chunk that defers must pin the watermark for the
+    /// whole run — a LATER successful chunk must not advance past the earlier
+    /// deferred conversation, or it is silently skipped until its source file
+    /// changes again (same silent-loss class as the single-chunk case above).
+    #[test]
+    #[serial]
+    fn watch_reindex_later_chunk_does_not_advance_past_deferred_conversation() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("watch-oom-defer-multichunk");
+        let amp_dir = data_dir.join("amp");
+        std::fs::create_dir_all(&amp_dir).unwrap();
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap_or(i64::MAX)
+        .saturating_add(10_000);
+
+        let deferred = amp_dir.join("thread-00-deferred.json");
+        let later = amp_dir.join("thread-01-later.json");
+        std::fs::write(
+            &deferred,
+            format!(
+                r#"{{"id":"thread-00-deferred","messages":[{{"role":"user","text":"defer me","createdAt":{now}}}]}}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &later,
+            format!(
+                r#"{{"id":"thread-01-later","messages":[{{"role":"user","text":"index me","createdAt":{}}}]}}"#,
+                now + 1
+            ),
+        )
+        .unwrap();
+
+        let _selective_oom = set_env(
+            "CASS_TEST_WATCH_INGEST_OOM_EXTERNAL_ID",
+            "thread-00-deferred",
+        );
+        let _solo_oom = set_env("CASS_TEST_WATCH_SOLO_RETRY_OOM", "1");
+        let _chunk = set_env("CASS_WATCH_INGEST_CHUNK_SIZE", "1");
+        let _reserve = set_env("CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES", "0");
+        let _window = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
+        let opts = super::IndexOptions {
+            full: false,
+            watch: true,
+            force_rebuild: false,
+            db_path: data_dir.join("agent_search.db"),
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_once_paths: None,
+            watch_interval_secs: 30,
+        };
+
+        let storage = FrankenStorage::open(&opts.db_path).unwrap();
+        storage.run_migrations().unwrap();
+        let index_path = index_dir(&opts.data_dir).unwrap();
+        let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
+        let state = std::sync::Mutex::new(std::collections::HashMap::new());
+        let storage = std::sync::Mutex::new(storage);
+        let t_index = std::sync::Mutex::new(Some(t_index));
+        let roots = vec![(ConnectorKind::Amp, ScanRoot::local(amp_dir))];
+
+        let indexed = reindex_paths(
+            &opts,
+            vec![deferred, later],
+            &roots,
+            &state,
+            &storage,
+            &t_index,
+            &index_path,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(indexed, 2);
+        assert!(
+            load_watch_state(&data_dir).is_empty(),
+            "a later successful chunk must not advance past an earlier deferred conversation"
         );
     }
 
