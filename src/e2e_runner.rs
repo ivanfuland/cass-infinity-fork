@@ -358,8 +358,11 @@ fn execute_bounded(spec: &RunSpec) -> std::io::Result<RawRun> {
 #[cfg(unix)]
 fn kill_process_group(pid: u32) {
     let group = format!("-{pid}");
+    // "--" is required: procps kill 3.3.17 (Ubuntu 22.04) misparses a bare
+    // negative pid and degenerates to kill(0, sig), SIGKILLing the CALLER's
+    // own process group (cargo test / the daemon itself).
     let _ = Command::new("/bin/kill")
-        .args(["-KILL", &group])
+        .args(["-KILL", "--", &group])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
