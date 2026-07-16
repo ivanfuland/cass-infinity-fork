@@ -21480,6 +21480,35 @@ fn conversation_payload_watermark_ms(conv: &NormalizedConversation) -> Option<i6
         .max()
 }
 
+/// Publish a kind's buffered watch watermark once its LAST trigger has run,
+/// unless any of its roots recorded a no-ledger holdback (OOM deferral,
+/// active-session skip, swallowed scan failure) — those conversations have no
+/// quarantine ledger, so the shared watermark is their only retry protection.
+fn publish_watch_watermark_if_kind_complete(
+    data_dir: &Path,
+    state: &Mutex<HashMap<ConnectorKind, i64>>,
+    kind: ConnectorKind,
+    remaining_triggers_by_kind: &HashMap<ConnectorKind, usize>,
+    pending_watch_watermarks: &mut HashMap<ConnectorKind, i64>,
+    watch_preserve_by_kind: &HashMap<ConnectorKind, bool>,
+) -> Result<()> {
+    if remaining_triggers_by_kind.get(&kind).copied().unwrap_or(0) > 0 {
+        return Ok(());
+    }
+    let Some(ts_val) = pending_watch_watermarks.remove(&kind) else {
+        return Ok(());
+    };
+    if watch_preserve_by_kind.get(&kind).copied().unwrap_or(false) {
+        tracing::info!(
+            ?kind,
+            "preserving watch watermark across roots so deferred/skipped/failed sources can be retried"
+        );
+    } else {
+        save_watch_state_watermark(data_dir, state, kind, ts_val)?;
+    }
+    Ok(())
+}
+
 fn save_watch_state_watermark(
     data_dir: &Path,
     state: &Mutex<HashMap<ConnectorKind, i64>>,
@@ -22994,22 +23023,42 @@ fn reindex_paths_with_semantic_delta(
 
     // Watch watermarks are shared per ConnectorKind while triggers iterate per
     // (kind, root): publishing inside the loop would let one root's success
-    // advance the shared watermark past ANOTHER root's deferred conversation
-    // (which has no quarantine ledger — the watermark is its only retry
-    // protection), regardless of root ordering. Buffer candidate advances here
-    // and publish after ALL roots have run, skipping every kind that deferred.
-    // Trade-off: a mid-run crash now replays this run's backlog instead of
-    // resuming mid-run — replaying is safe, silently skipping is not.
+    // advance the shared watermark past ANOTHER root's conversations that were
+    // held back WITHOUT a durable ledger — OOM deferrals, active-session
+    // skips, or a swallowed scan failure (quarantine is the deliberate
+    // exception: it has its own ledger + retry mechanism). Buffer candidate
+    // advances per kind and publish as soon as that kind's LAST root finishes
+    // (per-kind, not end-of-run, so one deterministically bad root of another
+    // kind cannot starve healthy kinds into unbounded rescans). A kind with
+    // any no-ledger holdback keeps its watermark so the holdback is rescanned
+    // next cycle. Trade-off: an error/crash mid-run replays the affected
+    // kinds' backlog instead of resuming mid-run — replaying is safe,
+    // silently skipping is not.
     let mut pending_watch_watermarks: HashMap<ConnectorKind, i64> = HashMap::new();
-    let mut watch_deferred_by_kind: HashMap<ConnectorKind, usize> = HashMap::new();
+    let mut watch_preserve_by_kind: HashMap<ConnectorKind, bool> = HashMap::new();
+    let mut remaining_triggers_by_kind: HashMap<ConnectorKind, usize> = HashMap::new();
+    for (kind, _, _, _) in &triggers {
+        *remaining_triggers_by_kind.entry(*kind).or_default() += 1;
+    }
 
     for (kind, root, min_ts, max_ts) in triggers {
+        if let Some(remaining) = remaining_triggers_by_kind.get_mut(&kind) {
+            *remaining = remaining.saturating_sub(1);
+        }
         let conn = kind.create_connector();
         let detect = conn.detect();
         if !detect.detected && root.origin.source_id == "local" && !root.path.exists() {
             // For local roots, if detection fails and the root is gone, skip.
             // For remote roots, detection might fail but we should still try scanning
             // if it's a brute-force attempt.
+            publish_watch_watermark_if_kind_complete(
+                &opts.data_dir,
+                state,
+                kind,
+                &remaining_triggers_by_kind,
+                &mut pending_watch_watermarks,
+                &watch_preserve_by_kind,
+            )?;
             continue;
         }
 
@@ -23045,6 +23094,14 @@ fn reindex_paths_with_semantic_delta(
                     scan_root = %root.path.display(),
                     "skipping unchanged explicit watch-once root already covered by last_indexed_at"
                 );
+                publish_watch_watermark_if_kind_complete(
+                    &opts.data_dir,
+                    state,
+                    kind,
+                    &remaining_triggers_by_kind,
+                    &mut pending_watch_watermarks,
+                    &watch_preserve_by_kind,
+                )?;
                 continue;
             }
         }
@@ -23078,6 +23135,14 @@ fn reindex_paths_with_semantic_delta(
                 scan_root = %root.path.display(),
                 "skipping active explicit watch source without advancing watermarks"
             );
+            publish_watch_watermark_if_kind_complete(
+                &opts.data_dir,
+                state,
+                kind,
+                &remaining_triggers_by_kind,
+                &mut pending_watch_watermarks,
+                &watch_preserve_by_kind,
+            )?;
             continue;
         }
 
@@ -23100,6 +23165,7 @@ fn reindex_paths_with_semantic_delta(
 
         // SCAN PHASE: IO-heavy, no locks held
         let scan_start = Instant::now();
+        let mut scan_failed = false;
         let mut convs = match conn.scan(&ctx) {
             Ok(c) => c,
             Err(e) => {
@@ -23109,6 +23175,10 @@ fn reindex_paths_with_semantic_delta(
                     root.path.display(),
                     e
                 );
+                // A failed scan yields an empty batch, indistinguishable from
+                // "nothing new" — flag it so this kind's shared watermark is
+                // not advanced past whatever the scan failed to see.
+                scan_failed = true;
                 Vec::new()
             }
         };
@@ -23132,6 +23202,11 @@ fn reindex_paths_with_semantic_delta(
             );
         }
         let preserve_this_watch_watermark = preserve_watch_watermark || active_sources_skipped > 0;
+        // No-ledger holdbacks poison the whole kind's watermark publication
+        // (deferrals are added at the end of the iteration when known).
+        if !explicit_watch_once && (scan_failed || active_sources_skipped > 0) {
+            watch_preserve_by_kind.insert(kind, true);
+        }
 
         // Provenance injection and path rewriting
         for conv in &mut convs {
@@ -23171,6 +23246,14 @@ fn reindex_paths_with_semantic_delta(
         // `last_indexed_at`, and must not trigger downstream optimize/merge.
         // See issue #194.
         if conv_count == 0 {
+            publish_watch_watermark_if_kind_complete(
+                &opts.data_dir,
+                state,
+                kind,
+                &remaining_triggers_by_kind,
+                &mut pending_watch_watermarks,
+                &watch_preserve_by_kind,
+            )?;
             continue;
         }
 
@@ -23371,23 +23454,30 @@ fn reindex_paths_with_semantic_delta(
             );
         }
 
-        *watch_deferred_by_kind.entry(kind).or_default() += deferred_conversations;
+        if !explicit_watch_once && deferred_conversations > 0 {
+            watch_preserve_by_kind.insert(kind, true);
+        }
+        publish_watch_watermark_if_kind_complete(
+            &opts.data_dir,
+            state,
+            kind,
+            &remaining_triggers_by_kind,
+            &mut pending_watch_watermarks,
+            &watch_preserve_by_kind,
+        )?;
     }
 
-    // Publish buffered watermark advances now that every root of every kind
-    // has run: a kind with ANY deferred conversation keeps its watermark so
-    // the deferral is rescanned next cycle, regardless of which of its roots
-    // succeeded or in what order.
+    // Fallback: every trigger exit path above publishes when its kind
+    // completes, so this should be empty; drain defensively with the same
+    // preserve gate in case a future exit path forgets to.
     for (kind, ts_val) in pending_watch_watermarks {
-        let deferred_total = watch_deferred_by_kind.get(&kind).copied().unwrap_or(0);
-        if deferred_total == 0 {
-            save_watch_state_watermark(&opts.data_dir, state, kind, ts_val)?;
-        } else {
+        if watch_preserve_by_kind.get(&kind).copied().unwrap_or(false) {
             tracing::info!(
                 ?kind,
-                deferred_conversations = deferred_total,
-                "preserving watch watermark across roots so deferred conversations can be retried"
+                "preserving watch watermark across roots so deferred/skipped/failed sources can be retried"
             );
+        } else {
+            save_watch_state_watermark(&opts.data_dir, state, kind, ts_val)?;
         }
     }
 
@@ -46756,6 +46846,98 @@ mod tests {
         assert!(
             load_watch_state(&data_dir).is_empty(),
             "a successful root must not advance the shared watermark past another root's deferred conversation"
+        );
+    }
+
+    /// Same as above with the ROOT ORDER REVERSED: the successful root runs
+    /// FIRST (before the deferring root has even been scanned), so a naive
+    /// "block if the kind has deferred so far" check would still publish.
+    #[test]
+    #[serial]
+    fn watch_reindex_success_root_first_still_preserves_for_later_deferred_root() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("watch-oom-defer-multiroot-rev");
+        let deferred_dir = data_dir.join("amp-deferred");
+        let later_dir = data_dir.join("amp-later");
+        std::fs::create_dir_all(&deferred_dir).unwrap();
+        std::fs::create_dir_all(&later_dir).unwrap();
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap_or(i64::MAX)
+        .saturating_add(10_000);
+
+        let deferred = deferred_dir.join("thread-00-deferred.json");
+        let later = later_dir.join("thread-01-later.json");
+        std::fs::write(
+            &deferred,
+            format!(
+                r#"{{"id":"thread-00-deferred","messages":[{{"role":"user","text":"defer me","createdAt":{now}}}]}}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &later,
+            format!(
+                r#"{{"id":"thread-01-later","messages":[{{"role":"user","text":"index me","createdAt":{}}}]}}"#,
+                now + 1
+            ),
+        )
+        .unwrap();
+
+        let _selective_oom = set_env(
+            "CASS_TEST_WATCH_INGEST_OOM_EXTERNAL_ID",
+            "thread-00-deferred",
+        );
+        let _solo_oom = set_env("CASS_TEST_WATCH_SOLO_RETRY_OOM", "1");
+        let _chunk = set_env("CASS_WATCH_INGEST_CHUNK_SIZE", "1");
+        let _reserve = set_env("CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES", "0");
+        let _window = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
+        let opts = super::IndexOptions {
+            full: false,
+            watch: true,
+            force_rebuild: false,
+            db_path: data_dir.join("agent_search.db"),
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_once_paths: None,
+            watch_interval_secs: 30,
+        };
+
+        let storage = FrankenStorage::open(&opts.db_path).unwrap();
+        storage.run_migrations().unwrap();
+        let index_path = index_dir(&opts.data_dir).unwrap();
+        let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
+        let state = std::sync::Mutex::new(std::collections::HashMap::new());
+        let storage = std::sync::Mutex::new(storage);
+        let t_index = std::sync::Mutex::new(Some(t_index));
+        let roots = vec![
+            (ConnectorKind::Amp, ScanRoot::local(later_dir)),
+            (ConnectorKind::Amp, ScanRoot::local(deferred_dir)),
+        ];
+
+        let indexed = reindex_paths(
+            &opts,
+            vec![later, deferred],
+            &roots,
+            &state,
+            &storage,
+            &t_index,
+            &index_path,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(indexed, 2);
+        assert!(
+            load_watch_state(&data_dir).is_empty(),
+            "a successful root that runs first must not have published past a root that defers later"
         );
     }
 
