@@ -51,9 +51,10 @@ const CONTRACTS: &[DependencyContract] = &[
         // 0.1.11 line (#95 BtCursor forward-progress, #106 MVCC grow, FTS5
         // shadow-table persistence + lazy reopen [cass#282], FTS5 merge/finalize
         // O(N^2)->O(N) spin fix [cass#301]) plus the correctness/durability
-        // hardening that motivated this bump: #127/#128 (page-image authority /
-        // freelist), #124 (snapshot-consistency "mixing generations"), and the
-        // #133 lock-byte integrity-check false positive fix. NOTE (verified 2026-07-16): the contentless-FTS
+        // hardening that motivated this bump: #127 (overflow-chain
+        // rollback/failure atomicity), #128 (freelist conflict surface),
+        // #124 (snapshot-consistency "mixing generations"), and the #133
+        // lock-byte integrity-check false positive fix. NOTE (verified 2026-07-16): the contentless-FTS
         // incremental catch-up and legacy duplicate-schema repair paths are
         // still NOT delivered on 0.1.16 — the three #[ignore]d gates in
         // src/storage/sqlite.rs (cass y8n3i/cljkz) still fail when force-run
