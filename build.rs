@@ -47,7 +47,7 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "frankensqlite",
         crate_package_name: "fsqlite",
         manifest_package_field: Some("fsqlite"),
-        // crates.io-only exact pin: fsqlite 0.1.13 carries everything from the
+        // crates.io-only exact pin: fsqlite 0.1.16 carries everything from the
         // 0.1.11 line (#95 BtCursor forward-progress, #106 MVCC grow, FTS5
         // shadow-table persistence + lazy reopen [cass#282], FTS5 merge/finalize
         // O(N^2)->O(N) spin fix [cass#301]) plus the contentless-FTS5
@@ -58,7 +58,7 @@ const CONTRACTS: &[DependencyContract] = &[
         // `validate_manifest_dependency_spec` to skip git/rev checks.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.1.13",
+        expected_version: "0.1.16",
         expected_features: &["fts5"],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
@@ -73,10 +73,10 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "fsqlite-types",
         crate_package_name: "fsqlite-types",
         manifest_package_field: Some("fsqlite-types"),
-        // crates.io-only exact pin aligned with the frankensqlite facade at 0.1.13.
+        // crates.io-only exact pin aligned with the frankensqlite facade at 0.1.16.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.1.13",
+        expected_version: "0.1.16",
         expected_features: &[],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
