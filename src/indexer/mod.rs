@@ -13038,8 +13038,12 @@ fn restore_scan_watermarks_with_fresh_writer(
     })
 }
 
-/// Drop guard that restores the pre-run scan watermarks on ANY early exit
-/// from `run_index` (`?`, panic) between the snapshot and normal finalization.
+/// Drop guard that restores the pre-run scan watermarks on any early exit
+/// from `run_index` between the snapshot and normal finalization: every
+/// `Result` early return, plus panics in unwind builds. NOT covered (same as
+/// a hard crash, documented window): panics under release `panic = "abort"`,
+/// `process::exit`, SIGKILL — recovery there is the next `--full` reindex or
+/// a source-file touch.
 /// The streaming per-connector watermarks and the 10s periodic global saves
 /// are written before ingest outcomes (deferrals, errors) are known; exiting
 /// early with them advanced silently skips whatever the rest of the run never
@@ -38989,6 +38993,81 @@ mod tests {
             storage.get_connector_last_scan_ts("codex").unwrap(),
             Some(1_100),
             "a post-scan error must not strand the streaming connector watermark past a deferred conversation"
+        );
+    }
+
+    /// Guard-pinning test (codex R10 P2): with ZERO deferrals the explicit
+    /// restore never runs, so only the Drop guard can revert the watermarks
+    /// when a post-scan phase errors. Deleting the guard turns this red.
+    #[test]
+    #[serial]
+    fn early_exit_without_deferral_still_restores_scan_watermarks_via_guard() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let codex_home = home.join(".codex");
+        let session = codex_home.join("sessions/2026/07/17/rollout-guard-pin.jsonl");
+        std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+        std::fs::write(
+            &session,
+            r#"{"timestamp":"2026-07-17T01:00:00.000Z","type":"session_meta","payload":{"id":"guard-pin","cwd":"/tmp/project"}}
+{"timestamp":"2026-07-17T01:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"index me normally"}]}}
+"#,
+        )
+        .unwrap();
+
+        let _home_guard = set_env("HOME", home.to_str().unwrap());
+        let _codex_guard = set_env("CODEX_HOME", codex_home.to_str().unwrap());
+        let _xdg_data_guard = set_env(
+            "XDG_DATA_HOME",
+            tmp.path().join("xdg-data").to_str().unwrap(),
+        );
+        let _xdg_config_guard = set_env(
+            "XDG_CONFIG_HOME",
+            tmp.path().join("xdg-config").to_str().unwrap(),
+        );
+        let _ignore_sources_guard = set_env("CASS_IGNORE_SOURCES_CONFIG", "1");
+        let _streaming_guard = set_env("CASS_STREAMING_INDEX", "1");
+
+        let data_dir = tmp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("db.sqlite");
+        {
+            let storage = FrankenStorage::open(&db_path).unwrap();
+            storage.set_last_scan_ts(1_000).unwrap();
+            storage.set_connector_last_scan_ts("codex", 1_100).unwrap();
+        }
+
+        let result = run_index(
+            super::IndexOptions {
+                full: false,
+                watch: false,
+                force_rebuild: false,
+                db_path: db_path.clone(),
+                data_dir: data_dir.clone(),
+                semantic: true,
+                build_hnsw: false,
+                embedder: "definitely-invalid".to_string(),
+                progress: None,
+                watch_once_paths: None,
+                watch_interval_secs: 30,
+            },
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "the invalid semantic embedder must fail after scan"
+        );
+
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        assert_eq!(
+            storage.get_last_scan_ts().unwrap(),
+            Some(1_000),
+            "guard must restore the global watermark on a zero-deferral early exit"
+        );
+        assert_eq!(
+            storage.get_connector_last_scan_ts("codex").unwrap(),
+            Some(1_100),
+            "guard must restore streaming connector watermarks on a zero-deferral early exit"
         );
     }
 
