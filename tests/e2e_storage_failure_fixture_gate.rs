@@ -1887,8 +1887,7 @@ fn run_one_doctor_state_fixture(
 ) -> DoctorStateRunOutcome {
     let phase = tracker.start(fixture.id, Some("doctor --check storage_state"));
     let fixture_dd = home.join(format!("doctor-state-{}", fixture.id));
-    let outcome =
-        probe_doctor_storage_state(home, codex_home, template_dd, &fixture_dd, fixture);
+    let outcome = probe_doctor_storage_state(home, codex_home, template_dd, &fixture_dd, fixture);
     tracker.end(fixture.id, None, phase);
     match outcome {
         DoctorStateOutcome::TimedOut => {
@@ -1957,7 +1956,8 @@ fn doctor_check_projects_storage_state_per_fixture() -> Result<(), String> {
     let mut timeouts = 0usize;
 
     for fixture in &suite {
-        let run = run_one_doctor_state_fixture(&tracker, home.path(), &codex_home, &template_dd, fixture);
+        let run =
+            run_one_doctor_state_fixture(&tracker, home.path(), &codex_home, &template_dd, fixture);
         if run.evaluated {
             evaluated += 1;
         }

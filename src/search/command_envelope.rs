@@ -23,7 +23,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::search::readiness::{ArchiveRiskLevel, DerivedAssetTruthTable, SafeNextAction};
+use crate::search::readiness::{DerivedAssetTruthTable, SafeNextAction};
 
 /// What running a command would mutate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -172,9 +172,9 @@ fn command_for(action: SafeNextAction) -> String {
 mod tests {
     use super::*;
     use crate::search::readiness::{
-        CanonicalDbAvailability, LexicalMetadata, LexicalReadinessState, MaintenanceActivity,
-        QuarantineSummary, ReadinessSnapshot, SemanticReadinessState, SourceCoverageState,
-        fleet_fixtures,
+        ArchiveRiskLevel, CanonicalDbAvailability, LexicalMetadata, LexicalReadinessState,
+        MaintenanceActivity, QuarantineSummary, ReadinessSnapshot, SemanticReadinessState,
+        SourceCoverageState, fleet_fixtures,
     };
 
     fn fixture(name: &str) -> DerivedAssetTruthTable {

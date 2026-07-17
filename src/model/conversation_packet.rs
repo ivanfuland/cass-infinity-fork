@@ -12,7 +12,9 @@ use serde_json::Value;
 use std::{borrow::Cow, ops::Range, path::Path};
 
 use crate::connectors::{NormalizedConversation, NormalizedMessage, NormalizedSnippet};
-use crate::model::types::{Conversation, Message, MessageRole, Snippet, role_as_str, role_from_str};
+use crate::model::types::{
+    Conversation, Message, MessageRole, Snippet, role_as_str, role_from_str,
+};
 
 pub const CONVERSATION_PACKET_VERSION: u32 = 1;
 

@@ -202,7 +202,11 @@ fn hit_with_path<'a>(hits: &'a [Value], needle: &str) -> Option<&'a Value> {
 /// Ordered list of hit source paths (for ordering-stability checks).
 fn source_paths(hits: &[Value]) -> Vec<String> {
     hits.iter()
-        .filter_map(|h| h.get("source_path").and_then(Value::as_str).map(str::to_string))
+        .filter_map(|h| {
+            h.get("source_path")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
         .collect()
 }
 
@@ -217,16 +221,24 @@ fn check_trust_shape(hit: &Value, label: &str) -> TestResult {
         trust.get("schema_version").and_then(Value::as_u64) == Some(1),
         || format!("{label}: trust.schema_version must be 1"),
     )?;
-    let tier = trust.get("trust_tier").and_then(Value::as_str).unwrap_or_default();
+    let tier = trust
+        .get("trust_tier")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     ensure(
-        matches!(tier, "trusted" | "likely" | "unverified" | "stale" | "failed"),
+        matches!(
+            tier,
+            "trusted" | "likely" | "unverified" | "stale" | "failed"
+        ),
         || format!("{label}: unexpected trust_tier `{tier}`"),
     )?;
-    let confidence = trust.get("confidence").and_then(Value::as_str).unwrap_or_default();
-    ensure(
-        matches!(confidence, "low" | "medium" | "high"),
-        || format!("{label}: unexpected confidence `{confidence}`"),
-    )?;
+    let confidence = trust
+        .get("confidence")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    ensure(matches!(confidence, "low" | "medium" | "high"), || {
+        format!("{label}: unexpected confidence `{confidence}`")
+    })?;
     // Commit/bead/release correlation (q4pau) is project-scoped: it only fires
     // for hits whose workspace is the project the agent is in now. This fixture
     // runs from a throwaway tempdir that is not a git repo and whose seeded
@@ -241,7 +253,10 @@ fn check_trust_shape(hit: &Value, label: &str) -> TestResult {
     })?;
     // Not fully trusted in the live layer → an advisory follow-up is set.
     ensure(
-        trust.get("recommended_followup").and_then(Value::as_str).is_some(),
+        trust
+            .get("recommended_followup")
+            .and_then(Value::as_str)
+            .is_some(),
         || format!("{label}: recommended_followup should be present for a non-trusted verdict"),
     )?;
     Ok(())
@@ -251,7 +266,10 @@ fn check_trust_shape(hit: &Value, label: &str) -> TestResult {
 /// allocation stays out of the caller's loop body.
 fn ensure_no_trust(hit: &Value, context: &str) -> TestResult {
     ensure(hit.get("trust").is_none(), || {
-        format!("{context}: must not carry a trust key: {}", head(&hit.to_string()))
+        format!(
+            "{context}: must not carry a trust key: {}",
+            head(&hit.to_string())
+        )
     })
 }
 
@@ -279,14 +297,23 @@ fn search_robot_meta_carries_trust_and_default_paths_do_not() -> TestResult {
         &data_dir,
     );
     let index_cmd = cass_cmd(&home, &codex_home, &index_args);
-    let index_out =
-        spawn_with_timeout_or_diag(index_cmd, "trust_fixture_index", Some(&data_dir), INDEX_TIMEOUT);
+    let index_out = spawn_with_timeout_or_diag(
+        index_cmd,
+        "trust_fixture_index",
+        Some(&data_dir),
+        INDEX_TIMEOUT,
+    );
     let index_stdout = String::from_utf8_lossy(&index_out.stdout);
     let index_json: Value = serde_json::from_str(index_stdout.trim())
         .map_err(|e| format!("index stdout not JSON: {e}; head: {}", head(&index_stdout)))?;
     ensure(
         index_json.get("success").and_then(Value::as_bool) == Some(true),
-        || format!("index did not report success=true: {}", head(&index_json.to_string())),
+        || {
+            format!(
+                "index did not report success=true: {}",
+                head(&index_json.to_string())
+            )
+        },
     )?;
 
     // --- with --robot-meta: every hit carries a well-formed trust verdict -----
@@ -317,7 +344,10 @@ fn search_robot_meta_carries_trust_and_default_paths_do_not() -> TestResult {
     let old_hit = hit_with_path(&meta_hits, "trust-old")
         .ok_or_else(|| format!("old session hit not found in {}", head(&meta.to_string())))?;
     ensure(tier_of(old_hit) == "stale", || {
-        format!("aged session should score `stale`, got `{}`", tier_of(old_hit))
+        format!(
+            "aged session should score `stale`, got `{}`",
+            tier_of(old_hit)
+        )
     })?;
     let old_reason = old_hit
         .get("trust")
@@ -328,8 +358,12 @@ fn search_robot_meta_carries_trust_and_default_paths_do_not() -> TestResult {
         format!("aged session stale_reason should be `aged_out`, got `{old_reason}`")
     })?;
 
-    let recent_hit = hit_with_path(&meta_hits, "recent-trust")
-        .ok_or_else(|| format!("recent session hit not found in {}", head(&meta.to_string())))?;
+    let recent_hit = hit_with_path(&meta_hits, "recent-trust").ok_or_else(|| {
+        format!(
+            "recent session hit not found in {}",
+            head(&meta.to_string())
+        )
+    })?;
     ensure(tier_of(recent_hit) == "unverified", || {
         format!(
             "fresh unlinked session should score `unverified`, got `{}`",
@@ -347,7 +381,10 @@ fn search_robot_meta_carries_trust_and_default_paths_do_not() -> TestResult {
     )?;
     let plain_hits = hits(&plain);
     ensure(!plain_hits.is_empty(), || {
-        format!("plain search returned no hits: {}", head(&plain.to_string()))
+        format!(
+            "plain search returned no hits: {}",
+            head(&plain.to_string())
+        )
     })?;
     for hit in &plain_hits {
         ensure_no_trust(hit, "default (no --robot-meta) output")?;
@@ -359,18 +396,29 @@ fn search_robot_meta_carries_trust_and_default_paths_do_not() -> TestResult {
         &codex_home,
         &data_dir,
         &[
-            "search", KEYWORD, "--json", "--robot-meta", "--fields", "minimal", "--limit", "10",
+            "search",
+            KEYWORD,
+            "--json",
+            "--robot-meta",
+            "--fields",
+            "minimal",
+            "--limit",
+            "10",
         ],
         "search_minimal_meta",
     )?;
     for hit in &hits(&minimal) {
-        ensure_no_trust(hit, "minimal projection (source_path/line_number/agent only)")?;
+        ensure_no_trust(
+            hit,
+            "minimal projection (source_path/line_number/agent only)",
+        )?;
     }
 
     // --- ordering is identical with and without the advisory verdict ----------
-    ensure(source_paths(&meta_hits) == source_paths(&plain_hits), || {
-        "trust verdict must not change hit ordering".to_string()
-    })?;
+    ensure(
+        source_paths(&meta_hits) == source_paths(&plain_hits),
+        || "trust verdict must not change hit ordering".to_string(),
+    )?;
 
     Ok(())
 }

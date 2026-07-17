@@ -22,7 +22,6 @@
 //! and the diagnosis/provenance contract they build on.
 
 use crate::search::source_provenance::ProvenanceSignals;
-use crate::search::zero_result_diagnosis::diagnose_zero_result;
 
 /// One frozen workspace/source-mismatch scenario from the report.
 pub(crate) struct WorkspaceSourceScenario {
@@ -149,7 +148,7 @@ pub(crate) fn scenarios() -> Vec<WorkspaceSourceScenario> {
 mod tests {
     use super::*;
     use crate::search::source_provenance::ProvenanceKind;
-    use crate::search::zero_result_diagnosis::ZeroResultDiagnosis;
+    use crate::search::zero_result_diagnosis::{ZeroResultDiagnosis, diagnose_zero_result};
 
     fn scenario(name: &str) -> WorkspaceSourceScenario {
         scenarios()

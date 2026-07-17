@@ -54,8 +54,7 @@ impl InfinityConfig {
                 .unwrap_or_else(|| "http://127.0.0.1:7997".into())
                 .trim_end_matches('/')
                 .to_string(),
-            embed_model: get("CASS_INFINITY_EMBED_MODEL")
-                .unwrap_or_else(|| "BAAI/bge-m3".into()),
+            embed_model: get("CASS_INFINITY_EMBED_MODEL").unwrap_or_else(|| "BAAI/bge-m3".into()),
             rerank_model: get("CASS_INFINITY_RERANK_MODEL")
                 .unwrap_or_else(|| "BAAI/bge-reranker-v2-m3".into()),
             timeout: Duration::from_secs(60),
@@ -216,9 +215,14 @@ fn retry_n<T>(max_retries: u32, mut f: impl FnMut() -> Result<T, String>) -> Res
             Ok(v) => return Ok(v),
             Err(e) => {
                 let lo = e.to_ascii_lowercase();
-                let transient = lo.contains("connection") || lo.contains("timed out")
-                    || lo.contains("timeout") || lo.contains("refused") || lo.contains("broken pipe");
-                if !transient { return Err(e); }
+                let transient = lo.contains("connection")
+                    || lo.contains("timed out")
+                    || lo.contains("timeout")
+                    || lo.contains("refused")
+                    || lo.contains("broken pipe");
+                if !transient {
+                    return Err(e);
+                }
                 last = e;
             }
         }
@@ -293,8 +297,15 @@ impl Embedder for InfinityEmbedder {
         let mut out = Vec::with_capacity(texts.len());
         for chunk in texts.chunks(self.config.max_batch) {
             let mut part = retry_n(2, || {
-                http_embed(&self.client, &self.config.base_url, &self.config.embed_model, chunk, self.dimension)
-            }).map_err(|m| self.fail(m))?;
+                http_embed(
+                    &self.client,
+                    &self.config.base_url,
+                    &self.config.embed_model,
+                    chunk,
+                    self.dimension,
+                )
+            })
+            .map_err(|m| self.fail(m))?;
             out.append(&mut part);
         }
         Ok(out)
@@ -439,14 +450,21 @@ mod tests {
         let attempts = AtomicU32::new(0);
         let r = retry_n(2, || {
             let n = attempts.fetch_add(1, Ordering::SeqCst);
-            if n < 2 { Err("connection refused".to_string()) } else { Ok(7u32) }
+            if n < 2 {
+                Err("connection refused".to_string())
+            } else {
+                Ok(7u32)
+            }
         });
         assert_eq!(r.unwrap(), 7);
         assert_eq!(attempts.load(Ordering::SeqCst), 3); // 2 retries + 初次
 
         // 非瞬时错误不重试
         let a2 = AtomicU32::new(0);
-        let e = retry_n(2, || { a2.fetch_add(1, Ordering::SeqCst); Err::<u32,_>("dim mismatch".to_string()) });
+        let e = retry_n(2, || {
+            a2.fetch_add(1, Ordering::SeqCst);
+            Err::<u32, _>("dim mismatch".to_string())
+        });
         assert!(e.is_err());
         assert_eq!(a2.load(Ordering::SeqCst), 1);
     }

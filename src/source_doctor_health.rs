@@ -676,7 +676,10 @@ mod tests {
         o.cass_current = None;
         apply_remote_binary(&mut o, RemoteBinaryOutcome::Missing);
         assert_eq!(o.cass_present, Some(false));
-        assert_eq!(classify_source_doctor_state(&o), SourceDoctorState::CassMissing);
+        assert_eq!(
+            classify_source_doctor_state(&o),
+            SourceDoctorState::CassMissing
+        );
 
         // Old binary -> old_cass.
         let mut o = reachable_healthy("h");
@@ -692,7 +695,10 @@ mod tests {
         apply_remote_binary(&mut o, RemoteBinaryOutcome::Current);
         assert_eq!(o.cass_present, Some(true));
         assert_eq!(o.cass_current, Some(true));
-        assert_eq!(classify_source_doctor_state(&o), SourceDoctorState::Reachable);
+        assert_eq!(
+            classify_source_doctor_state(&o),
+            SourceDoctorState::Reachable
+        );
 
         // Unparseable version -> presence recorded, currency left unknown (no
         // false old_cass).
@@ -702,7 +708,10 @@ mod tests {
         apply_remote_binary(&mut o, RemoteBinaryOutcome::PresentUnknownVersion);
         assert_eq!(o.cass_present, Some(true));
         assert_eq!(o.cass_current, None);
-        assert_eq!(classify_source_doctor_state(&o), SourceDoctorState::Reachable);
+        assert_eq!(
+            classify_source_doctor_state(&o),
+            SourceDoctorState::Reachable
+        );
     }
 
     #[test]
@@ -722,7 +731,10 @@ mod tests {
         assert!(o.remote_pruned);
         assert!(!o.mirror_behind, "prune must suppress mirror_behind");
         assert!(!o.mirror_ahead);
-        assert_eq!(classify_source_doctor_state(&o), SourceDoctorState::RemotePruned);
+        assert_eq!(
+            classify_source_doctor_state(&o),
+            SourceDoctorState::RemotePruned
+        );
 
         // A vanished remote with no retained local data is NOT a prune we own.
         let mut o = reachable_healthy("h");
@@ -750,7 +762,10 @@ mod tests {
             },
         );
         assert!(o.mirror_ahead);
-        assert_eq!(classify_source_doctor_state(&o), SourceDoctorState::MirrorAhead);
+        assert_eq!(
+            classify_source_doctor_state(&o),
+            SourceDoctorState::MirrorAhead
+        );
 
         // Incomplete last sync -> mirror_behind.
         let mut o = reachable_healthy("h");
@@ -763,7 +778,10 @@ mod tests {
             },
         );
         assert!(o.mirror_behind);
-        assert_eq!(classify_source_doctor_state(&o), SourceDoctorState::MirrorBehind);
+        assert_eq!(
+            classify_source_doctor_state(&o),
+            SourceDoctorState::MirrorBehind
+        );
 
         // Index trails the last sync -> stale_index.
         let mut o = reachable_healthy("h");
@@ -776,13 +794,19 @@ mod tests {
             },
         );
         assert!(o.index_stale);
-        assert_eq!(classify_source_doctor_state(&o), SourceDoctorState::StaleIndex);
+        assert_eq!(
+            classify_source_doctor_state(&o),
+            SourceDoctorState::StaleIndex
+        );
 
         // No drift signals -> nothing flipped.
         let mut o = reachable_healthy("h");
         apply_sync_evidence(&mut o, &SourceSyncEvidence::default());
         assert!(!o.mirror_ahead && !o.mirror_behind && !o.index_stale && !o.remote_pruned);
-        assert_eq!(classify_source_doctor_state(&o), SourceDoctorState::Reachable);
+        assert_eq!(
+            classify_source_doctor_state(&o),
+            SourceDoctorState::Reachable
+        );
     }
 
     #[test]

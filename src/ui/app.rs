@@ -9336,10 +9336,10 @@ impl CassApp {
     /// Role prefix symbol for message rendering.
     fn role_prefix(role: &MessageRole) -> &'static str {
         match role {
-            MessageRole::User => "\u{f061} ",     // arrow-right →
+            MessageRole::User => "\u{f061} ", // arrow-right →
             MessageRole::Agent | MessageRole::Assistant => "\u{2713} ", // checkmark ✓
-            MessageRole::Tool => "\u{2699} ",     // gear ⚙
-            MessageRole::System => "\u{2139} ",   // info ℹ
+            MessageRole::Tool => "\u{2699} ", // gear ⚙
+            MessageRole::System => "\u{2139} ", // info ℹ
             MessageRole::Other(_) => "\u{2022} ", // bullet •
         }
     }

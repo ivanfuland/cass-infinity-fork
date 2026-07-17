@@ -1076,6 +1076,12 @@ pub enum Commands {
         /// Maximum sessions to return (defaults: 10, or 1 with --current)
         #[arg(long)]
         limit: Option<usize>,
+        /// Only sessions active since this ISO date (YYYY-MM-DD or
+        /// YYYY-MM-DDTHH:MM:SS), keyword (`today`, `yesterday`), or relative
+        /// offset (`-7d`, `-24h`). Filters on the session's recorded
+        /// last-activity timestamp (ended_at, falling back to started_at).
+        #[arg(long, allow_hyphen_values = true)]
+        since: Option<String>,
         /// Output as JSON (for automation)
         #[arg(long, visible_alias = "robot")]
         json: bool,
@@ -1083,8 +1089,9 @@ pub enum Commands {
         #[arg(long)]
         data_dir: Option<PathBuf>,
     },
-    /// Resolve a session path into a ready-to-run resume command for
-    /// its native harness (Claude Code, Codex, OpenCode, pi_agent, Gemini).
+    /// Resolve a session path into a ready-to-run resume command for its
+    /// native harness (Claude Code, Codex, OpenCode, pi_agent, Gemini,
+    /// Antigravity).
     ///
     /// By default, the resolved command is printed to stdout, one
     /// argv token per line, so the caller can wrap it however they like:
@@ -1108,7 +1115,8 @@ pub enum Commands {
                 \x20 pi_agent | pi-agent     (let path inference pick `pi` vs `omp`)\n\
                 \x20 pi                      (force the pi-mono binary)\n\
                 \x20 omp | oh-my-pi | ohmypi (force the Oh My Pi binary)\n\
-                \x20 gemini"
+                \x20 gemini\n\
+                \x20 antigravity | agy       (resume via `agy --conversation <uuid>`)"
         )]
         agent: Option<String>,
         /// Replace the current process with the resolved resume command.
@@ -7799,6 +7807,7 @@ async fn execute_cli(
                     workspace,
                     current,
                     limit,
+                    since,
                     json,
                     data_dir,
                 } => {
@@ -7807,6 +7816,7 @@ async fn execute_cli(
                         workspace.as_ref(),
                         current,
                         limit,
+                        since.as_deref(),
                         &data_dir,
                         cli.db.clone(),
                         structured_format,
@@ -20137,7 +20147,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  (global) --verbose/-v  Enable debug logs (overrides auto-quiet)".to_string(),
             "  Tip: `--robot-docs=<topic>` is normalized to `robot-docs <topic>`; globals can appear before/after subcommands.".to_string(),
             "  cass search <query> [OPTIONS]".to_string(),
-            "    --agent A         Filter by agent (codex, claude_code, gemini, vibe, opencode, amp, cline)".to_string(),
+            "    --agent A         Filter by agent (e.g. codex, claude_code, gemini, opencode, antigravity; run `cass capabilities --json | jq .connectors` for the full 22-connector inventory)".to_string(),
             "    --workspace W     Filter by workspace path".to_string(),
             "    --limit N         Max results (default: 0 = no limit)".to_string(),
             "    --offset N        Pagination offset (default: 0)".to_string(),
@@ -20187,7 +20197,8 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "    Aliases: ready, preflight.".to_string(),
             "  cass status [--json] [--stale-threshold N] [--data-dir DIR]".to_string(),
             "  cass diag [--json] [--verbose] [--data-dir DIR]".to_string(),
-            "  cass sessions [--workspace DIR] [--current] [--limit N] [--json]".to_string(),
+            "  cass sessions [--workspace DIR] [--current] [--limit N] [--since WHEN] [--json]"
+                .to_string(),
             "  cass view <path> [-n LINE] [-C CONTEXT] [--json]".to_string(),
             "  cass index [--full] [--watch] [--json] [--robot-trace-ingest] [--data-dir DIR]"
                 .to_string(),
@@ -22379,11 +22390,11 @@ fn run_cli_search(
     mode: Option<crate::search::query::SearchMode>,
     semantic_opts: SemanticSearchOptions,
 ) -> CliResult<()> {
+    #[cfg(feature = "infinity")]
+    use crate::search::model_manager::load_infinity_semantic_context;
     use crate::search::model_manager::{
         load_hash_semantic_context, load_semantic_context, load_semantic_context_for_embedder,
     };
-    #[cfg(feature = "infinity")]
-    use crate::search::model_manager::load_infinity_semantic_context;
     use crate::search::query::{
         QueryExplanation, SearchClient, SearchClientOptions, SearchFilters, SearchMode,
     };
@@ -22712,13 +22723,14 @@ fn run_cli_search(
                     // when built with `--features infinity` (baseline is ORT-free,
                     // so the UDS daemon's ONNX embedder is unavailable anyway).
                     #[cfg(feature = "infinity")]
-                    let daemon: Arc<dyn crate::search::daemon_client::DaemonClient> =
-                        match crate::search::infinity::InfinityDaemonClient::new() {
-                            Ok(c) => Arc::new(c),
-                            Err(_) => Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
-                                "infinity-unavailable",
-                            )),
-                        };
+                    let daemon: Arc<
+                        dyn crate::search::daemon_client::DaemonClient,
+                    > = match crate::search::infinity::InfinityDaemonClient::new() {
+                        Ok(c) => Arc::new(c),
+                        Err(_) => Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
+                            "infinity-unavailable",
+                        )),
+                    };
                     #[cfg(not(feature = "infinity"))]
                     let daemon = crate::daemon::client::try_connect()
                         .map(|d| d as Arc<dyn crate::search::daemon_client::DaemonClient>)
@@ -33591,6 +33603,26 @@ fn doctor_storage_relative_components(relative_path: &Path) -> Vec<String> {
         .collect()
 }
 
+/// GH#324: crash-orphaned lexical staging roots (`cass-lexical-shards.*`,
+/// `cass-lexical-merge.*`, `cass-federated-materialize-*`,
+/// `cass-empty-lexical-repair-*`, and their interrupted-reclaim rename
+/// markers). These are derived scratch space — rebuildable by definition —
+/// so they classify as reclaimable instead of falling through to the
+/// fail-closed Unknown/protected bucket that used to shield the debris from
+/// cleanup. The name must strictly extend a prefix: tempfile always appends
+/// a random suffix, so a bare prefix is never a cass-created name.
+fn doctor_storage_component_is_lexical_staging_dir(component: &str) -> bool {
+    const STAGING_PREFIXES: [&str; 4] = [
+        "cass-lexical-shards.",
+        "cass-lexical-merge.",
+        "cass-federated-materialize-",
+        "cass-empty-lexical-repair-",
+    ];
+    STAGING_PREFIXES
+        .iter()
+        .any(|prefix| component.len() > prefix.len() && component.starts_with(prefix))
+}
+
 fn doctor_classify_storage_relative_path(relative_path: &Path) -> DoctorAssetClass {
     let components = doctor_storage_relative_components(relative_path);
     let Some(first) = components.first().map(String::as_str) else {
@@ -33642,7 +33674,16 @@ fn doctor_classify_storage_relative_path(relative_path: &Path) -> DoctorAssetCla
             _ => DoctorAssetClass::ForensicBundle,
         };
     }
+    if doctor_storage_component_is_lexical_staging_dir(first) {
+        return DoctorAssetClass::ReclaimableDerivedCache;
+    }
     if first == "index" {
+        if components
+            .get(1)
+            .is_some_and(|part| doctor_storage_component_is_lexical_staging_dir(part))
+        {
+            return DoctorAssetClass::ReclaimableDerivedCache;
+        }
         if components
             .iter()
             .any(|part| part == ".lexical-publish-backups")
@@ -36440,6 +36481,16 @@ const DOCTOR_RAW_MIRROR_HASH_ALGORITHM: &str = "blake3";
 const DOCTOR_RAW_MIRROR_BLOB_EXTENSION: &str = "raw";
 const DOCTOR_RAW_MIRROR_DIR_MODE: &str = "0700";
 const DOCTOR_RAW_MIRROR_FILE_MODE: &str = "0600";
+const CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY: &str = "CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY";
+const CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY_MANIFEST_LIMIT: &str =
+    "CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY_MANIFEST_LIMIT";
+const DOCTOR_RAW_MIRROR_DEFAULT_FULL_VERIFY_MANIFEST_LIMIT: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DoctorRawMirrorVerificationMode {
+    Full,
+    Bounded { manifest_limit: usize },
+}
 
 #[derive(Debug, Clone, Serialize)]
 struct DoctorRawMirrorReport {
@@ -37311,16 +37362,67 @@ fn doctor_raw_mirror_size_warning(total_blob_bytes: u64, threshold_bytes: u64) -
     })
 }
 
-fn collect_doctor_raw_mirror_report(data_dir: &Path) -> DoctorRawMirrorReport {
-    collect_doctor_raw_mirror_report_with_threshold(
+fn doctor_raw_mirror_full_verify_requested() -> bool {
+    dotenvy::var(CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY)
+        .ok()
+        .is_some_and(|raw| {
+            matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+}
+
+fn doctor_raw_mirror_full_verify_manifest_limit() -> usize {
+    dotenvy::var(CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY_MANIFEST_LIMIT)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|&limit| limit > 0)
+        .unwrap_or(DOCTOR_RAW_MIRROR_DEFAULT_FULL_VERIFY_MANIFEST_LIMIT)
+}
+
+fn collect_doctor_raw_mirror_report_for_doctor(
+    data_dir: &Path,
+    mutating_repair_requested: bool,
+) -> DoctorRawMirrorReport {
+    let mode = if mutating_repair_requested || doctor_raw_mirror_full_verify_requested() {
+        DoctorRawMirrorVerificationMode::Full
+    } else {
+        DoctorRawMirrorVerificationMode::Bounded {
+            manifest_limit: doctor_raw_mirror_full_verify_manifest_limit(),
+        }
+    };
+    collect_doctor_raw_mirror_report_with_threshold_and_mode(
         data_dir,
         doctor_raw_mirror_size_warn_threshold_bytes(),
+        mode,
     )
 }
 
+fn collect_doctor_raw_mirror_report(data_dir: &Path) -> DoctorRawMirrorReport {
+    collect_doctor_raw_mirror_report_with_threshold_and_mode(
+        data_dir,
+        doctor_raw_mirror_size_warn_threshold_bytes(),
+        DoctorRawMirrorVerificationMode::Full,
+    )
+}
+
+#[cfg(test)]
 fn collect_doctor_raw_mirror_report_with_threshold(
     data_dir: &Path,
     size_warn_threshold_bytes: u64,
+) -> DoctorRawMirrorReport {
+    collect_doctor_raw_mirror_report_with_threshold_and_mode(
+        data_dir,
+        size_warn_threshold_bytes,
+        DoctorRawMirrorVerificationMode::Full,
+    )
+}
+
+fn collect_doctor_raw_mirror_report_with_threshold_and_mode(
+    data_dir: &Path,
+    size_warn_threshold_bytes: u64,
+    verification_mode: DoctorRawMirrorVerificationMode,
 ) -> DoctorRawMirrorReport {
     let root = doctor_raw_mirror_root(data_dir);
     let root_path = root.display().to_string();
@@ -37366,6 +37468,13 @@ fn collect_doctor_raw_mirror_report_with_threshold(
     }
 
     let manifest_root = root.join("manifests");
+    let bounded_manifest_limit = match verification_mode {
+        DoctorRawMirrorVerificationMode::Full => None,
+        DoctorRawMirrorVerificationMode::Bounded { manifest_limit } => Some(manifest_limit),
+    };
+    let mut manifest_entries: Vec<(PathBuf, bool)> = Vec::new();
+    let mut manifest_entry_count = 0usize;
+    let mut full_verification_deferred = false;
     if manifest_root.exists() {
         for entry in walkdir::WalkDir::new(&manifest_root)
             .follow_links(false)
@@ -37377,28 +37486,12 @@ fn collect_doctor_raw_mirror_report_with_threshold(
                     if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
                         continue;
                     }
-                    let report_entry = if entry.file_type().is_symlink() {
-                        doctor_raw_mirror_invalid_manifest_report(
-                            data_dir,
-                            path,
-                            "manifest path is a symlink".to_string(),
-                        )
-                    } else {
-                        match std::fs::read_to_string(path)
-                            .ok()
-                            .and_then(|content| serde_json::from_str(&content).ok())
-                        {
-                            Some(manifest) => {
-                                doctor_verify_raw_mirror_manifest(data_dir, &root, path, manifest)
-                            }
-                            None => doctor_raw_mirror_invalid_manifest_report(
-                                data_dir,
-                                path,
-                                "manifest is not parseable JSON".to_string(),
-                            ),
-                        }
-                    };
-                    report.manifests.push(report_entry);
+                    manifest_entry_count += 1;
+                    if bounded_manifest_limit.is_some_and(|limit| manifest_entry_count > limit) {
+                        full_verification_deferred = true;
+                        continue;
+                    }
+                    manifest_entries.push((path.to_path_buf(), entry.file_type().is_symlink()));
                 }
                 Ok(_) => {}
                 Err(err) => report
@@ -37406,6 +37499,45 @@ fn collect_doctor_raw_mirror_report_with_threshold(
                     .push(format!("failed to scan raw mirror manifest entry: {err}")),
             }
         }
+    }
+
+    if full_verification_deferred {
+        report.summary.manifest_count = manifest_entry_count;
+        report.status = "verification_deferred".to_string();
+        let limit = bounded_manifest_limit.unwrap_or(0);
+        report.warnings.push(format!(
+            "Raw mirror verification deferred: {manifest_entry_count} manifest(s) exceed the bounded doctor limit of {limit}; set {CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY}=1 to run a full blob checksum verification."
+        ));
+        report.notes.push(
+            "Bounded doctor mode does not claim raw mirror blobs are verified until full checksum verification runs."
+                .to_string(),
+        );
+        return report;
+    }
+
+    for (path, is_symlink) in manifest_entries {
+        let report_entry = if is_symlink {
+            doctor_raw_mirror_invalid_manifest_report(
+                data_dir,
+                &path,
+                "manifest path is a symlink".to_string(),
+            )
+        } else {
+            match std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|content| serde_json::from_str(&content).ok())
+            {
+                Some(manifest) => {
+                    doctor_verify_raw_mirror_manifest(data_dir, &root, &path, manifest)
+                }
+                None => doctor_raw_mirror_invalid_manifest_report(
+                    data_dir,
+                    &path,
+                    "manifest is not parseable JSON".to_string(),
+                ),
+            }
+        };
+        report.manifests.push(report_entry);
     }
 
     report
@@ -57418,6 +57550,55 @@ mod doctor_asset_taxonomy_tests {
         DoctorSourceAuthorityKind::SupportBundle,
     ];
 
+    /// GH#324: crash-orphaned lexical staging dirs must classify as
+    /// reclaimable derived cache (safe_to_gc, auto-delete allowed) instead of
+    /// falling into a protected class that shields the debris from cleanup.
+    #[test]
+    fn doctor_classifies_orphaned_lexical_staging_dirs_as_reclaimable() {
+        for relative in [
+            "index/cass-lexical-shards.k1eHZJ/shard-0/meta.json",
+            "index/cass-lexical-merge.2qwt8l",
+            "index/cass-lexical-merge.2qwt8l.reclaim-42-0/index/meta.json",
+            "index/cass-federated-materialize-r4nd0m/index/meta.json",
+            "index/cass-empty-lexical-repair-q1w2e3/file",
+            // Historical top-level layout.
+            "cass-lexical-shards.abc123/shard-0/meta.json",
+            "cass-lexical-merge.abc123",
+        ] {
+            assert_eq!(
+                doctor_classify_storage_relative_path(Path::new(relative)),
+                DoctorAssetClass::ReclaimableDerivedCache,
+                "{relative} should classify as reclaimable staging debris"
+            );
+        }
+        let reclaimable_safety = doctor_asset_safety(DoctorAssetClass::ReclaimableDerivedCache);
+        assert!(reclaimable_safety.safe_to_gc_allowed);
+        assert!(reclaimable_safety.auto_delete_allowed);
+        assert!(!reclaimable_safety.precious);
+
+        // Live/published assets must keep their protective classes.
+        for (relative, expected) in [
+            ("index/v8/meta.json", DoctorAssetClass::DerivedLexicalIndex),
+            (
+                "index/.lexical-publish-backups/gen-1/meta.json",
+                DoctorAssetClass::RetainedPublishBackup,
+            ),
+            ("agent_search.db", DoctorAssetClass::CanonicalArchiveDb),
+            // Bare prefixes (no tempfile suffix) are not cass-created names;
+            // they stay in the fail-closed lexical-index bucket.
+            (
+                "index/cass-lexical-shards.",
+                DoctorAssetClass::DerivedLexicalIndex,
+            ),
+        ] {
+            assert_eq!(
+                doctor_classify_storage_relative_path(Path::new(relative)),
+                expected,
+                "{relative} must not be classified as reclaimable"
+            );
+        }
+    }
+
     #[test]
     fn doctor_asset_taxonomy_explicitly_covers_every_class_and_operation() {
         let policy_classes: HashSet<_> = DOCTOR_ASSET_POLICY_TABLE
@@ -72350,7 +72531,9 @@ mod cli_read_db_tests {
         let target = resolve_resume_target(&path, None).expect("resolve");
         assert_eq!(target.agent, "opencode");
         assert_eq!(target.session_id.as_deref(), Some("sess-42"));
-        assert_eq!(target.argv, vec!["opencode", "resume", "sess-42"]);
+        // Current OpenCode continues a session via `--session <id>`, not the
+        // removed `opencode resume <id>` subcommand (cass#316).
+        assert_eq!(target.argv, vec!["opencode", "--session", "sess-42"]);
     }
 
     #[test]
@@ -72358,7 +72541,7 @@ mod cli_read_db_tests {
         // `~/.config/opencode/config.json` matches the opencode detection
         // heuristic but is NOT a session path. We must refuse to produce
         // a resume command rather than synthesize a plausible-but-wrong
-        // `opencode resume config.json` invocation.
+        // `opencode --session config.json` invocation.
         let path = PathBuf::from("/Users/ellis/.config/opencode/config.json");
         let err = resolve_resume_target(&path, None).expect_err("must reject non-session path");
         assert_eq!(err.code, 5);
@@ -72387,7 +72570,7 @@ mod cli_read_db_tests {
             .expect("explicit override must bypass parent-directory check");
         assert_eq!(target.agent, "opencode");
         assert_eq!(target.session_id.as_deref(), Some("sess-xyz"));
-        assert_eq!(target.argv, vec!["opencode", "resume", "sess-xyz"]);
+        assert_eq!(target.argv, vec!["opencode", "--session", "sess-xyz"]);
     }
 
     #[test]
@@ -72444,6 +72627,51 @@ mod cli_read_db_tests {
         assert_eq!(target.argv[0], "gemini");
         assert_eq!(target.argv[1], "session");
         assert_eq!(target.argv[2], "restore");
+    }
+
+    #[test]
+    fn resume_detects_antigravity_from_transcript_path() {
+        // cass#314: an Antigravity transcript source path resolves to
+        // `agy --conversation <uuid>`, where <uuid> is the `brain/<uuid>`
+        // directory name. The path also contains `.gemini/`, so this proves
+        // antigravity detection wins over the gemini arm.
+        let uuid = "f1e2d3c4-b5a6-4789-9abc-def012345678";
+        let path = PathBuf::from(format!(
+            "/home/dev/.gemini/antigravity-cli/brain/{uuid}/.system_generated/logs/transcript.jsonl"
+        ));
+        let target = resolve_resume_target(&path, None).expect("resolve");
+        assert_eq!(target.agent, "antigravity");
+        assert_eq!(target.session_id.as_deref(), Some(uuid));
+        assert_eq!(
+            target.argv,
+            vec!["agy", "--conversation", uuid],
+            "antigravity must resume via `agy --conversation <uuid>`"
+        );
+    }
+
+    #[test]
+    fn resume_antigravity_override_and_agy_alias() {
+        // Both `--agent antigravity` and `--agent agy` map to the antigravity
+        // slug; the UUID is recovered from the transcript path in either case.
+        let uuid = "11111111-2222-3333-4444-555555555555";
+        let path = PathBuf::from(format!(
+            "/mnt/mirror/antigravity-cli/brain/{uuid}/.system_generated/logs/transcript_full.jsonl"
+        ));
+        for alias in ["antigravity", "agy"] {
+            let target = resolve_resume_target(&path, Some(alias)).expect("resolve");
+            assert_eq!(target.agent, "antigravity");
+            assert_eq!(target.argv, vec!["agy", "--conversation", uuid]);
+        }
+    }
+
+    #[test]
+    fn resume_antigravity_rejects_path_without_uuid() {
+        // A path with no `brain/<uuid>` / `.system_generated` ancestry cannot
+        // yield a conversation id — fail explicitly rather than fabricate one.
+        let path = PathBuf::from("/home/dev/.gemini/antigravity-cli/notes.txt");
+        let err = resolve_resume_target(&path, Some("agy")).expect_err("must reject");
+        assert_eq!(err.code, 5);
+        assert_eq!(err.kind, "session-id-not-found");
     }
 
     #[test]
@@ -73783,7 +74011,7 @@ pub(crate) fn run_doctor_impl(
     }
 
     let raw_mirror_scan_started = Instant::now();
-    let mut raw_mirror = collect_doctor_raw_mirror_report(&data_dir);
+    let mut raw_mirror = collect_doctor_raw_mirror_report_for_doctor(&data_dir, fix_can_mutate);
     doctor_push_timing_span(
         &mut timing_spans,
         "raw_mirror_scan",
@@ -73807,7 +74035,7 @@ pub(crate) fn run_doctor_impl(
             raw_mirror_backfill.captured_live_source_count,
             raw_mirror_backfill.existing_raw_manifest_link_count
         ));
-        raw_mirror = collect_doctor_raw_mirror_report(&data_dir);
+        raw_mirror = collect_doctor_raw_mirror_report_for_doctor(&data_dir, fix_can_mutate);
     }
     doctor_push_timing_span(
         &mut timing_spans,
@@ -73846,6 +74074,17 @@ pub(crate) fn run_doctor_impl(
                 format!(
                     "Raw mirror verified ({} manifest(s), {} blob byte(s))",
                     raw_mirror.summary.manifest_count, raw_mirror.summary.total_blob_bytes
+                ),
+                false
+            );
+        }
+        "verification_deferred" => {
+            add_check!(
+                "raw_mirror",
+                "warn",
+                format!(
+                    "Raw mirror verification deferred for bounded read-only doctor check ({} manifest(s)); set {CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY}=1 to run full blob checksum verification",
+                    raw_mirror.summary.manifest_count
                 ),
                 false
             );
@@ -75759,6 +75998,7 @@ fn run_sessions(
     workspace: Option<&PathBuf>,
     current: bool,
     limit: Option<usize>,
+    since: Option<&str>,
     data_dir_override: &Option<PathBuf>,
     db_override: Option<PathBuf>,
     output_format: Option<RobotFormat>,
@@ -75783,10 +76023,62 @@ fn run_sessions(
         None if current_determined_workspace => Some(1),
         None => Some(10),
     };
+    let since_ms: Option<i64> = match since {
+        None => None,
+        Some(raw) => Some(parse_datetime_flexible(raw).ok_or_else(|| CliError {
+            code: 2,
+            kind: CliErrorKind::Usage.kind_str(),
+            message: format!(
+                "Invalid --since value '{raw}'. Use YYYY-MM-DD, YYYY-MM-DDTHH:MM:SS, \
+                 'today', 'yesterday', or a relative offset like -7d / -24h."
+            ),
+            hint: Some("Example: cass sessions --since -7d".into()),
+            retryable: false,
+        })?),
+    };
 
-    let params: &[ParamValue] = &[];
+    // cass#323: enumerate conversations WITHOUT joining messages. The old
+    // single query LEFT JOINed the full messages table and GROUP BYed over
+    // it just to compute per-session message/human-turn counts, which made
+    // `sessions --limit 5` cost a full corpus aggregation (minutes of CPU
+    // and multi-GB peaks on large indexes). Counts are now backfilled after
+    // limit truncation, so only the N returned sessions ever touch the
+    // messages table (served by the (conversation_id, idx) unique index).
+    let since_filter = if since_ms.is_some() {
+        // Sessions whose recorded activity window is unknown (both
+        // timestamps NULL) are retained here and re-checked against file
+        // mtime below, so a legacy undated-but-active session is not
+        // silently dropped by --since.
+        "WHERE COALESCE(c.ended_at, c.started_at) >= ?1
+              OR (c.ended_at IS NULL AND c.started_at IS NULL)"
+    } else {
+        ""
+    };
+    let sessions_sql = format!(
+        // LEFT JOIN + COALESCE on agents so list_sessions still reports
+        // legacy conversations with NULL agent_id.
+        "SELECT c.id,
+                COALESCE(a.slug, 'unknown') AS agent_slug,
+                w.path,
+                c.title,
+                c.source_path,
+                COALESCE(c.source_id, 'local'),
+                c.origin_host,
+                s.kind,
+                c.started_at,
+                c.ended_at
+         FROM conversations c
+         LEFT JOIN agents a ON c.agent_id = a.id
+         LEFT JOIN workspaces w ON c.workspace_id = w.id
+         LEFT JOIN sources s ON c.source_id = s.id
+         {since_filter}
+         ORDER BY CASE WHEN c.started_at IS NULL THEN 1 ELSE 0 END, c.started_at DESC, c.id DESC"
+    );
+    let since_params: Vec<ParamValue> = since_ms.map(ParamValue::from).into_iter().collect();
+    let params: &[ParamValue] = &since_params;
     #[allow(clippy::type_complexity)]
     let rows: Vec<(
+        i64,
         String,
         Option<String>,
         Option<String>,
@@ -75795,47 +76087,22 @@ fn run_sessions(
         Option<String>,
         Option<String>,
         Option<i64>,
-        i64,
-        i64,
+        Option<i64>,
     )> = conn
-        .query_map_collect(
-            // LEFT JOIN + COALESCE on agents so list_sessions still reports
-            // legacy conversations with NULL agent_id.  GROUP BY must use the
-            // same COALESCE expression so those rows group into a single
-            // 'unknown' bucket.
-            "SELECT COALESCE(a.slug, 'unknown') AS agent_slug,
-                    w.path,
-                    c.title,
-                    c.source_path,
-                    COALESCE(c.source_id, 'local'),
-                    c.origin_host,
-                    s.kind,
-                    c.started_at,
-                    COUNT(m.id) AS message_count,
-                    COALESCE(SUM(CASE WHEN m.role = 'user' THEN 1 ELSE 0 END), 0) AS human_turns
-             FROM conversations c
-             LEFT JOIN agents a ON c.agent_id = a.id
-             LEFT JOIN workspaces w ON c.workspace_id = w.id
-             LEFT JOIN sources s ON c.source_id = s.id
-             LEFT JOIN messages m ON m.conversation_id = c.id
-             GROUP BY c.id, COALESCE(a.slug, 'unknown'), w.path, c.title, c.source_path, COALESCE(c.source_id, 'local'), c.origin_host, s.kind, c.started_at
-             ORDER BY CASE WHEN c.started_at IS NULL THEN 1 ELSE 0 END, c.started_at DESC, c.id DESC",
-            params,
-            |row: &frankensqlite::Row| {
-                Ok((
-                    row.get_typed(0)?,
-                    row.get_typed(1)?,
-                    row.get_typed(2)?,
-                    row.get_typed(3)?,
-                    row.get_typed(4)?,
-                    row.get_typed(5)?,
-                    row.get_typed(6)?,
-                    row.get_typed(7)?,
-                    row.get_typed(8)?,
-                    row.get_typed(9)?,
-                ))
-            },
-        )
+        .query_map_collect(&sessions_sql, params, |row: &frankensqlite::Row| {
+            Ok((
+                row.get_typed(0)?,
+                row.get_typed(1)?,
+                row.get_typed(2)?,
+                row.get_typed(3)?,
+                row.get_typed(4)?,
+                row.get_typed(5)?,
+                row.get_typed(6)?,
+                row.get_typed(7)?,
+                row.get_typed(8)?,
+                row.get_typed(9)?,
+            ))
+        })
         .map_err(|e| CliError {
             code: 9,
             kind: CliErrorKind::DbQuery.kind_str(),
@@ -75844,10 +76111,11 @@ fn run_sessions(
             retryable: false,
         })?;
 
-    let mut sessions: Vec<SessionSummaryRecord> = rows
+    let mut sessions: Vec<(i64, bool, SessionSummaryRecord)> = rows
         .into_iter()
         .map(
             |(
+                conversation_id,
                 agent,
                 workspace,
                 title,
@@ -75856,8 +76124,7 @@ fn run_sessions(
                 origin_host,
                 origin_kind,
                 started_at,
-                message_count,
-                human_turns,
+                ended_at,
             )| {
                 let source_path_buf = PathBuf::from(&source_path);
                 let origin_host = normalized_provenance_origin_host(origin_host.as_deref());
@@ -75876,33 +76143,55 @@ fn run_sessions(
                     .and_then(|m| m.modified().ok())
                     .map(|ts| chrono::DateTime::<Utc>::from(ts).timestamp_millis());
 
-                SessionSummaryRecord {
-                    agent,
-                    workspace: workspace.map(PathBuf::from),
-                    workspace_match_distance: None,
-                    title,
-                    source_path: source_path_buf,
-                    source_id,
-                    origin_host,
-                    started_at,
-                    modified_at,
-                    size_bytes: metadata.as_ref().map(std::fs::Metadata::len),
-                    message_count,
-                    human_turns,
-                }
+                let has_recorded_timestamp = started_at.is_some() || ended_at.is_some();
+                (
+                    conversation_id,
+                    has_recorded_timestamp,
+                    SessionSummaryRecord {
+                        agent,
+                        workspace: workspace.map(PathBuf::from),
+                        workspace_match_distance: None,
+                        title,
+                        source_path: source_path_buf,
+                        source_id,
+                        origin_host,
+                        started_at,
+                        modified_at,
+                        size_bytes: metadata.as_ref().map(std::fs::Metadata::len),
+                        message_count: 0,
+                        human_turns: 0,
+                    },
+                )
             },
         )
         .collect();
 
+    if let Some(since_ms) = since_ms {
+        // Rows with a recorded timestamp already satisfied the SQL window
+        // filter. Undated conversations passed it unconditionally; resolve
+        // them against file mtime where one is available. Rows with no
+        // recorded timestamps AND no statable file are kept (fail open:
+        // --since must never hide a session it cannot date).
+        sessions.retain(|(_, has_recorded_timestamp, session)| {
+            if *has_recorded_timestamp {
+                return true;
+            }
+            match session.modified_at {
+                Some(modified_at) => modified_at >= since_ms,
+                None => true,
+            }
+        });
+    }
+
     if let Some(target) = target_workspace.as_deref() {
-        for session in &mut sessions {
+        for (_, _, session) in &mut sessions {
             session.workspace_match_distance =
                 workspace_match_distance(session.workspace.as_deref(), target);
         }
-        sessions.retain(|session| session.workspace_match_distance.is_some());
+        sessions.retain(|(_, _, session)| session.workspace_match_distance.is_some());
     }
 
-    sessions.sort_by(|left, right| {
+    sessions.sort_by(|(_, _, left), (_, _, right)| {
         left.workspace_match_distance
             .unwrap_or(usize::MAX)
             .cmp(&right.workspace_match_distance.unwrap_or(usize::MAX))
@@ -75914,6 +76203,45 @@ fn run_sessions(
     if let Some(limit) = effective_limit {
         sessions.truncate(limit);
     }
+
+    // Backfill message/human-turn counts for the surviving sessions only.
+    // Deliberately NOT a SQL aggregate: the frankensqlite planner executes
+    // `SELECT COUNT(..) WHERE conversation_id = ?` as a full messages-table
+    // scan even under an INDEXED BY hint (verified via live backtraces on a
+    // 26 GB index). The plain indexed row-fetch shape below is the same one
+    // the hot per-conversation message paths use (see the EXPLAIN QUERY
+    // PLAN contract test in storage::sqlite), so each lookup is an indexed
+    // range scan on messages(conversation_id, idx) and the roles are
+    // tallied in Rust — cost scales with the returned page, not the corpus.
+    let count_session_messages =
+        |conversation_id: i64| -> Result<(i64, i64), frankensqlite::FrankenError> {
+            let roles: Vec<String> = conn.query_map_collect(
+                "SELECT role
+                 FROM messages INDEXED BY sqlite_autoindex_messages_1
+                 WHERE conversation_id = ?1",
+                &[ParamValue::from(conversation_id)],
+                |row: &frankensqlite::Row| row.get_typed::<String>(0),
+            )?;
+            let message_count = roles.len() as i64;
+            let human_turns = roles.iter().filter(|role| role.as_str() == "user").count() as i64;
+            Ok((message_count, human_turns))
+        };
+    let sessions: Vec<SessionSummaryRecord> = sessions
+        .into_iter()
+        .map(|(conversation_id, _, mut session)| {
+            let (message_count, human_turns) =
+                count_session_messages(conversation_id).map_err(|e| CliError {
+                    code: 9,
+                    kind: CliErrorKind::DbQuery.kind_str(),
+                    message: format!("Failed to count session messages: {e}"),
+                    hint: None,
+                    retryable: false,
+                })?;
+            session.message_count = message_count;
+            session.human_turns = human_turns;
+            Ok(session)
+        })
+        .collect::<CliResult<Vec<_>>>()?;
 
     let entries: Vec<SessionSummaryEntry> = sessions
         .into_iter()
@@ -84677,7 +85005,10 @@ const INDEX_STALL_HINT: &str = concat!(
     "and/or `sudo gdb -batch -ex 'thread apply all bt' -p $(pgrep -f 'cass index') 2>/dev/null | head -200` ",
     "and attach to issue #244 (indexing-phase wedges) or #258 (watch_startup wedges where the lock-file ",
     "heartbeat keeps refreshing while one thread spins). Set CASS_INDEX_STALL_DETECT_SECS=0 to disable detection; ",
-    "set CASS_INDEX_STALL_ABORT_SECS=0 to keep phase-2 stalls report-only."
+    "set CASS_INDEX_STALL_ABORT_SECS=0 to keep phase-2 stalls report-only. ",
+    "If `finalizing` is true in the diagnostics the indexer is inside the final WAL checkpoint of a large ",
+    "deferred bulk-ingest WAL (slow on macOS); CASS_INDEX_FINALIZE_ABORT_SECS (default 1800) bounds that window, ",
+    "and CASS_INDEX_WRITER_WAL_AUTOCHECKPOINT_PAGES=1000 caps WAL growth so the final checkpoint stays small."
 );
 
 fn index_stall_threshold(progress_interval: Duration) -> Option<Duration> {
@@ -84711,6 +85042,40 @@ fn index_stall_abort_threshold(
     Some(Duration::from_secs(abort_threshold_secs).max(min_after_report))
 }
 
+/// Bounded-but-generous abort grace for the post-publish *finalize* window
+/// (#319/#321).
+///
+/// A non-watch, non-semantic `cass index --full` ends by checkpointing the
+/// deferred bulk-ingest WAL inside `close_storage_after_index` — a synchronous,
+/// `!Send` frankensqlite `conn.close()` + `wal_checkpoint(TRUNCATE)` that runs
+/// on the indexer thread and cannot advance the progress atomics. On a large
+/// corpus (the #319 report: a ~1.1 GB / ~290k-frame WAL) that checkpoint
+/// legitimately takes minutes, especially on macOS where Darwin fsync/flock is
+/// slow. The generic finalize-wedge abort (`CASS_INDEX_STALL_ABORT_SECS`,
+/// default 300 s) misreads that active checkpoint as a #297 wedge and kills the
+/// process with `exit(70)` mid-checkpoint — stranding the un-truncated WAL and
+/// leaving the DB malformed to stock SQLite (#296/#321).
+///
+/// While the indexer signals `IndexingProgress::finalizing`, the watchdog uses
+/// this larger threshold instead, so a slow-but-progressing final checkpoint
+/// completes. Because the checkpoint is a single blocking `!Send` call on the
+/// indexer thread, it cannot be heartbeated — so a bound is the only liveness
+/// guard against a genuinely stuck finalize: once it elapses the abort still
+/// fires. `CASS_INDEX_FINALIZE_ABORT_SECS=0` makes the finalize window
+/// report-only (never abort). The floor is the ordinary abort threshold, so
+/// this can only ever *lengthen* the finalize grace, never shorten it.
+fn index_finalize_abort_threshold(abort_threshold: Option<Duration>) -> Option<Duration> {
+    let abort_threshold = abort_threshold?;
+    let finalize_secs = dotenvy::var("CASS_INDEX_FINALIZE_ABORT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(1800);
+    if finalize_secs == 0 {
+        return None;
+    }
+    Some(Duration::from_secs(finalize_secs).max(abort_threshold))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IndexStallAbortPolicy {
     #[cfg(test)]
@@ -84722,7 +85087,26 @@ struct IndexStallWatchdog {
     data_dir: PathBuf,
     threshold: Option<Duration>,
     abort_threshold: Option<Duration>,
+    /// Larger abort grace used only while `IndexingProgress::finalizing` is set
+    /// (the post-publish WAL-checkpoint window). `None` = never abort during
+    /// finalize (report-only). See `index_finalize_abort_threshold` (#319/#321).
+    finalize_abort_threshold: Option<Duration>,
     abort_policy: IndexStallAbortPolicy,
+    /// True when supervising a long-lived `cass index --watch` daemon. In
+    /// watch mode the post-publish quiescent resting state (phase 0,
+    /// `current >= total`) is normal idle between rescans, not a wedge, so the
+    /// finalize-wedge detect/abort is suppressed (cass #311).
+    is_watch: bool,
+    /// True when this run is building semantic (vector) assets. The native
+    /// MiniLM embed + HNSW build + vector publish all run AFTER the lexical
+    /// rebuild has already parked the progress atomics in the quiescent
+    /// finalize state (phase 0 "preparing", `current >= total`), and they never
+    /// advance those atomics — so that multi-minute CPU-heavy work looks
+    /// identical to a #297 finalize wedge. Without this flag the abort fires
+    /// mid-embed and kills the process with exit(70) before any vector file is
+    /// published, so the next run starts over and semantic search never becomes
+    /// available (cass #315). Set on the semantic index path only.
+    semantic_build: bool,
     last_phase: usize,
     last_current: usize,
     last_progress_advance: std::time::Instant,
@@ -84748,6 +85132,33 @@ impl IndexStallWatchdog {
         )
     }
 
+    /// Mark this watchdog as supervising a long-lived `cass index --watch`
+    /// daemon. In watch mode the post-publish, fully-quiescent resting state
+    /// (phase 0 "preparing", `current >= total`) is the NORMAL idle between
+    /// rescans — it is not a wedge. Without this flag the #297 finalize-wedge
+    /// abort fires after `abort_threshold` of that normal idle and crash-loops
+    /// the daemon with exit(70) (cass #311). Set on the watch path only.
+    fn watch_aware(mut self, is_watch: bool) -> Self {
+        self.is_watch = is_watch;
+        self
+    }
+
+    /// Mark this watchdog as supervising a one-shot semantic (vector) index
+    /// build. The native embedding pass, HNSW build, and vector publish all run
+    /// while the progress atomics are already parked in the quiescent finalize
+    /// state (phase 0 "preparing", `current >= total`) left by the preceding
+    /// lexical rebuild, and never advance them — so that legitimate multi-minute
+    /// work matches the #297 finalize-wedge shape exactly. Without this flag the
+    /// #297 abort fires after `abort_threshold` and kills the process with
+    /// exit(70) before any vector file is published (cass #315). Treating the
+    /// quiescent finalize state as healthy active work (like watch-mode idle)
+    /// lets the semantic build run to completion and publish. A genuine phase-2
+    /// (lexical indexing) wedge does not match and is still detected + aborted.
+    fn semantic_aware(mut self, semantic_build: bool) -> Self {
+        self.semantic_build = semantic_build;
+        self
+    }
+
     fn data_dir(&self) -> &Path {
         &self.data_dir
     }
@@ -84759,11 +85170,15 @@ impl IndexStallWatchdog {
     ) -> Self {
         let threshold = index_stall_threshold(progress_interval);
         let abort_threshold = index_stall_abort_threshold(progress_interval, threshold);
+        let finalize_abort_threshold = index_finalize_abort_threshold(abort_threshold);
         Self {
             data_dir,
             threshold,
             abort_threshold,
+            finalize_abort_threshold,
             abort_policy,
+            is_watch: false,
+            semantic_build: false,
             last_phase: usize::MAX,
             last_current: 0,
             last_progress_advance: std::time::Instant::now(),
@@ -84803,6 +85218,36 @@ impl IndexStallWatchdog {
 
         let threshold = self.threshold?;
         let stall_elapsed = self.last_progress_advance.elapsed();
+        // cass #311: in `--watch` mode the daemon legitimately rests in a
+        // quiescent, fully-published state (phase 0 "preparing",
+        // `current >= total`) between rescans. That resting state matches the
+        // #297 finalize-wedge shape, so the watchdog used to emit a spurious
+        // `stall_detected` and then abort the long-lived watch process with
+        // exit(70) after `abort_threshold` of perfectly normal idle — a
+        // crash-loop (systemd restart -> repeat). Treat the quiescent resting
+        // state as healthy idle in watch mode (no detect, no abort). A genuine
+        // watch wedge in active work — phase 2, or phase 0 with `current < total`
+        // or a non-quiescent rebuild pipeline — does not match and is still
+        // detected and aborted below.
+        //
+        // cass #315: a one-shot `cass index --semantic` build has the same
+        // healthy-idle shape here for the entire semantic pass. The lexical
+        // rebuild finishes and parks progress at phase 0 / `current == total` /
+        // quiescent, then the native MiniLM embed + HNSW build + vector publish
+        // run for minutes WITHOUT ever advancing those atomics. That legitimate
+        // work is indistinguishable from a finalize wedge, so the abort used to
+        // kill the process (exit 70) before publishing any vector index. Treat
+        // the quiescent finalize state as healthy active work for semantic
+        // builds too, so the embed/publish runs to completion. A genuine phase-2
+        // lexical wedge does not match (phase_code != 0) and is still caught.
+        if (self.is_watch || self.semantic_build) && phase_code == 0 {
+            let total = index_progress
+                .total
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if total > 0 && current >= total && index_progress.rebuild_pipeline_is_quiescent() {
+                return None;
+            }
+        }
         // Historically this gated on `phase_code != 0` so the watchdog
         // never fired during the "preparing" phase (phase=0). Issue #258
         // is exactly that: the v0.6.2 watcher wedged at startup before
@@ -84844,13 +85289,48 @@ impl IndexStallWatchdog {
         let total = index_progress
             .total
             .load(std::sync::atomic::Ordering::Relaxed);
-        let finalize_wedge =
-            total > 0 && current >= total && index_progress.rebuild_pipeline_is_quiescent();
+        // `!self.is_watch`: in watch mode the quiescent `current >= total`
+        // resting state is normal idle (handled by the early return above), so
+        // it must never be treated as a finalize wedge (cass #311).
+        // `!self.semantic_build`: for a one-shot semantic build the same
+        // quiescent state is the active embed/publish window (also handled by
+        // the early return above); belt-and-suspenders so an off-by-one phase
+        // never resurrects the exit(70) that killed the build pre-publish (cass
+        // #315).
+        let finalize_wedge = !self.is_watch
+            && !self.semantic_build
+            && total > 0
+            && current >= total
+            && index_progress.rebuild_pipeline_is_quiescent();
         let abort_eligible = phase_code == 2 || finalize_wedge;
+        // #319/#321: while the indexer signals `finalizing`, the phase-0 /
+        // current==total / quiescent shape is the post-publish WAL-checkpoint
+        // window, not a #297 wedge. The checkpoint is a synchronous, `!Send`
+        // frankensqlite call on the indexer thread that cannot advance the
+        // progress atomics, so it can only be recognised via this flag. Give it
+        // the larger `finalize_abort_threshold` so a slow-but-active checkpoint
+        // of a large deferred WAL completes instead of being killed mid-write
+        // (which strands the WAL and leaves the DB malformed). A genuine phase-2
+        // wedge (phase_code == 2) is unaffected and still aborts at the normal
+        // threshold. Because the checkpoint blocks a single thread and cannot be
+        // heartbeated, the bound is the only liveness guard: once it elapses the
+        // finalize is aborted too.
+        let effective_abort_threshold = if finalize_wedge
+            && phase_code != 2
+            && index_progress
+                .finalizing
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            // Finalize aborts disabled (CASS_INDEX_FINALIZE_ABORT_SECS=0):
+            // treat the finalize window as report-only.
+            self.finalize_abort_threshold?
+        } else {
+            abort_threshold
+        };
         if self.abort_policy != IndexStallAbortPolicy::AbortPhaseTwo
             || !abort_eligible
             || self.stall_abort_reported_for_phase == Some(phase_code)
-            || stall_elapsed < abort_threshold
+            || stall_elapsed < effective_abort_threshold
         {
             return None;
         }
@@ -85170,6 +85650,237 @@ mod stall_diagnostics_tests {
         })?;
         assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
         assert_eq!(abort["abort_process"], serde_json::json!(true));
+        assert_eq!(abort["exit_code"], serde_json::json!(70));
+        Ok(())
+    }
+
+    /// Regression for #311: in `cass index --watch` mode the post-publish
+    /// quiescent resting state (phase 0, `current == total`, pipeline idle) is
+    /// NORMAL idle between rescans, not a wedge. A watch-aware watchdog must
+    /// neither report a stall nor abort the long-lived daemon with exit(70)
+    /// (the bug: a deterministic exit-70 crash-loop, systemd restart, repeat).
+    /// A genuine phase-2 wedge must still abort even in watch mode.
+    #[test]
+    fn watchdog_does_not_abort_watch_idle_resting_state() -> anyhow::Result<()> {
+        use super::{IndexStallAbortPolicy, IndexStallWatchdog};
+        use crate::indexer::IndexingProgress;
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let tmp = TempDir::new()?;
+        let mut watchdog = IndexStallWatchdog::with_abort_policy(
+            tmp.path().to_path_buf(),
+            Duration::from_millis(50),
+            IndexStallAbortPolicy::AbortPhaseTwo,
+        )
+        .watch_aware(true);
+        watchdog.threshold = Some(Duration::from_millis(1));
+        watchdog.abort_threshold = Some(Duration::from_millis(2));
+        watchdog.last_phase = 0;
+        watchdog.last_current = 100;
+        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
+
+        let progress = Arc::new(IndexingProgress::default());
+        // Identical state to the #297 finalize-wedge test, but in watch mode
+        // this is healthy idle: the daemon published and awaits the next rescan.
+        progress.phase.store(0, Ordering::Relaxed);
+        progress.total.store(100, Ordering::Relaxed);
+        progress.current.store(100, Ordering::Relaxed);
+        assert!(progress.rebuild_pipeline_is_quiescent());
+
+        // Well past both detect and abort thresholds: a non-watch watchdog
+        // would emit stall_detected then stall_aborting(exit 70) here (see
+        // `watchdog_aborts_on_quiescent_finalize_wedge`). Watch-aware: silent.
+        assert!(
+            watchdog.observe(&progress, 100).is_none(),
+            "watch idle resting state must not be reported as a stall (#311)"
+        );
+        assert!(
+            watchdog.observe(&progress, 200).is_none(),
+            "watch idle resting state must never trigger exit(70) abort (#311)"
+        );
+
+        // A genuine phase-2 wedge in watch mode is still aborted.
+        progress.phase.store(2, Ordering::Relaxed);
+        // The phase change resets the watchdog's progress clock; re-arm it.
+        let _ = watchdog.observe(&progress, 250);
+        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
+        let detected = watchdog
+            .observe(&progress, 300)
+            .ok_or_else(|| anyhow::anyhow!("phase-2 watch stall did not report"))?;
+        assert_eq!(detected["event"], serde_json::json!("stall_detected"));
+        let abort = watchdog
+            .observe(&progress, 400)
+            .ok_or_else(|| anyhow::anyhow!("phase-2 watch stall did not abort"))?;
+        assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
+        assert_eq!(abort["exit_code"], serde_json::json!(70));
+        Ok(())
+    }
+
+    /// Regression for #315: a one-shot `cass index --semantic` build finishes
+    /// the lexical rebuild (parking progress at phase 0, `current == total`,
+    /// pipeline quiescent) and then runs the native embed + HNSW build + vector
+    /// publish for minutes WITHOUT advancing the progress atomics. That work is
+    /// shaped exactly like a #297 finalize wedge, so a non-semantic watchdog
+    /// used to abort mid-embed with exit(70) before publishing any vector index
+    /// — leaving semantic search permanently unavailable. A semantic-aware
+    /// watchdog must treat that quiescent finalize state as healthy active work
+    /// (no exit-70 abort), while a genuine phase-2 lexical wedge still aborts.
+    #[test]
+    fn watchdog_does_not_abort_semantic_finalize_build() -> anyhow::Result<()> {
+        use super::{IndexStallAbortPolicy, IndexStallWatchdog};
+        use crate::indexer::IndexingProgress;
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let tmp = TempDir::new()?;
+        let mut watchdog = IndexStallWatchdog::with_abort_policy(
+            tmp.path().to_path_buf(),
+            Duration::from_millis(50),
+            IndexStallAbortPolicy::AbortPhaseTwo,
+        )
+        .semantic_aware(true);
+        watchdog.threshold = Some(Duration::from_millis(1));
+        watchdog.abort_threshold = Some(Duration::from_millis(2));
+        watchdog.last_phase = 0;
+        watchdog.last_current = 100;
+        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
+
+        let progress = Arc::new(IndexingProgress::default());
+        // Identical state to the #297 finalize-wedge test, but this is the
+        // semantic embed/publish window: the lexical rebuild published and the
+        // native embedder is now grinding through vectors without touching the
+        // atomics. Well past both detect and abort thresholds.
+        progress.phase.store(0, Ordering::Relaxed);
+        progress.total.store(100, Ordering::Relaxed);
+        progress.current.store(100, Ordering::Relaxed);
+        assert!(progress.rebuild_pipeline_is_quiescent());
+
+        assert!(
+            watchdog.observe(&progress, 100).is_none(),
+            "semantic finalize build must not be reported as a stall (#315)"
+        );
+        assert!(
+            watchdog.observe(&progress, 200).is_none(),
+            "semantic finalize build must never trigger exit(70) before publish (#315)"
+        );
+
+        // A genuine phase-2 lexical wedge during a semantic run is still aborted.
+        progress.phase.store(2, Ordering::Relaxed);
+        // The phase change resets the watchdog's progress clock; re-arm it.
+        let _ = watchdog.observe(&progress, 250);
+        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
+        let detected = watchdog
+            .observe(&progress, 300)
+            .ok_or_else(|| anyhow::anyhow!("phase-2 semantic stall did not report"))?;
+        assert_eq!(detected["event"], serde_json::json!("stall_detected"));
+        let abort = watchdog
+            .observe(&progress, 400)
+            .ok_or_else(|| anyhow::anyhow!("phase-2 semantic stall did not abort"))?;
+        assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
+        assert_eq!(abort["exit_code"], serde_json::json!(70));
+        Ok(())
+    }
+
+    /// Regression for #319/#321: the post-publish finalize WAL checkpoint of a
+    /// large deferred bulk-ingest WAL runs as a synchronous, `!Send`
+    /// frankensqlite call on the indexer thread (inside
+    /// `close_storage_after_index`). It cannot advance the progress atomics, so
+    /// it looks exactly like a #297 finalize wedge — phase 0, `current == total`,
+    /// pipeline quiescent — while the process is actually alive and checkpointing
+    /// (minutes on macOS). Before this fix the watchdog aborted it at the normal
+    /// 300 s threshold with `exit(70)`, killing the checkpoint mid-write and
+    /// stranding the un-truncated ~1.1 GB WAL (leaving the DB malformed to stock
+    /// SQLite). The indexer now sets `IndexingProgress::finalizing`; the watchdog
+    /// must (a) NOT abort while finalizing until the larger
+    /// `finalize_abort_threshold` elapses, yet (b) still abort a genuinely stuck
+    /// finalize once that bound passes, and (c) still abort a normal phase-2
+    /// wedge at the ordinary threshold.
+    #[test]
+    fn watchdog_defers_abort_during_final_wal_checkpoint_finalize() -> anyhow::Result<()> {
+        use super::{IndexStallAbortPolicy, IndexStallWatchdog};
+        use crate::indexer::IndexingProgress;
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let tmp = TempDir::new()?;
+        let mut watchdog = IndexStallWatchdog::with_abort_policy(
+            tmp.path().to_path_buf(),
+            Duration::from_millis(50),
+            IndexStallAbortPolicy::AbortPhaseTwo,
+        );
+        watchdog.threshold = Some(Duration::from_millis(1));
+        watchdog.abort_threshold = Some(Duration::from_millis(2));
+        // Generous finalize grace: much larger than the ordinary abort threshold.
+        watchdog.finalize_abort_threshold = Some(Duration::from_millis(500));
+        watchdog.last_phase = 0;
+        watchdog.last_current = 100;
+        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
+
+        let progress = Arc::new(IndexingProgress::default());
+        // The exact #297 finalize-wedge shape, but the indexer has signalled it
+        // is inside the final WAL checkpoint.
+        progress.phase.store(0, Ordering::Relaxed);
+        progress.total.store(100, Ordering::Relaxed);
+        progress.current.store(100, Ordering::Relaxed);
+        progress.finalizing.store(true, Ordering::Relaxed);
+        assert!(progress.rebuild_pipeline_is_quiescent());
+
+        // Well past the ordinary abort threshold (2 ms) but under the finalize
+        // grace (500 ms): the first observe reports the stall, but the watchdog
+        // must NOT abort — the checkpoint is legitimate active work.
+        let detected = watchdog
+            .observe(&progress, 100)
+            .ok_or_else(|| anyhow::anyhow!("finalize stall did not report"))?;
+        assert_eq!(detected["event"], serde_json::json!("stall_detected"));
+        assert!(
+            detected.get("exit_code").is_none(),
+            "the stall_detected report must not carry an abort during finalize"
+        );
+        assert_eq!(detected["finalizing"], serde_json::json!(true));
+        for elapsed in [200_u128, 300, 400] {
+            assert!(
+                watchdog.observe(&progress, elapsed).is_none(),
+                "the finalize WAL checkpoint must not be aborted before the finalize grace elapses (#319/#321)"
+            );
+        }
+
+        // Liveness bound: once the finalize grace itself elapses, a genuinely
+        // stuck finalize is still aborted (the checkpoint blocks one thread and
+        // cannot be heartbeated, so this bound is the only guard).
+        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(600);
+        let abort = watchdog
+            .observe(&progress, 500)
+            .ok_or_else(|| anyhow::anyhow!("stuck finalize past the grace did not abort"))?;
+        assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
+        assert_eq!(abort["exit_code"], serde_json::json!(70));
+
+        // Control: with `finalizing` cleared, the identical quiescent shape is a
+        // #297 wedge again and aborts at the ordinary threshold.
+        let mut wedge_watchdog = IndexStallWatchdog::with_abort_policy(
+            tmp.path().to_path_buf(),
+            Duration::from_millis(50),
+            IndexStallAbortPolicy::AbortPhaseTwo,
+        );
+        wedge_watchdog.threshold = Some(Duration::from_millis(1));
+        wedge_watchdog.abort_threshold = Some(Duration::from_millis(2));
+        wedge_watchdog.finalize_abort_threshold = Some(Duration::from_millis(500));
+        wedge_watchdog.last_phase = 0;
+        wedge_watchdog.last_current = 100;
+        wedge_watchdog.last_progress_advance =
+            std::time::Instant::now() - Duration::from_millis(100);
+        progress.finalizing.store(false, Ordering::Relaxed);
+        let detected = wedge_watchdog
+            .observe(&progress, 100)
+            .ok_or_else(|| anyhow::anyhow!("non-finalizing wedge did not report"))?;
+        assert_eq!(detected["event"], serde_json::json!("stall_detected"));
+        let abort = wedge_watchdog.observe(&progress, 200).ok_or_else(|| {
+            anyhow::anyhow!("non-finalizing wedge did not abort at the ordinary threshold")
+        })?;
+        assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
         assert_eq!(abort["exit_code"], serde_json::json!(70));
         Ok(())
     }
@@ -85513,7 +86224,9 @@ fn run_index_with_data(
         let mut last_agents = usize::MAX;
         let mut last_update = std::time::Instant::now();
         let mut stall_watchdog =
-            IndexStallWatchdog::aborting_phase_two(data_dir.clone(), progress_interval);
+            IndexStallWatchdog::aborting_phase_two(data_dir.clone(), progress_interval)
+                .watch_aware(watch)
+                .semantic_aware(semantic);
 
         loop {
             // Check if indexer finished
@@ -85625,7 +86338,9 @@ fn run_index_with_data(
         let mut last_current = 0;
         let mut last_scan_current = 0;
         let mut stall_watchdog =
-            IndexStallWatchdog::aborting_phase_two(data_dir.clone(), progress_interval);
+            IndexStallWatchdog::aborting_phase_two(data_dir.clone(), progress_interval)
+                .watch_aware(watch)
+                .semantic_aware(semantic);
 
         loop {
             if index_handle.is_finished() {
@@ -85695,7 +86410,9 @@ fn run_index_with_data(
             .checked_sub(progress_interval)
             .unwrap_or_else(std::time::Instant::now);
         let mut stall_watchdog =
-            IndexStallWatchdog::aborting_phase_two(data_dir.clone(), progress_interval);
+            IndexStallWatchdog::aborting_phase_two(data_dir.clone(), progress_interval)
+                .watch_aware(watch)
+                .semantic_aware(semantic);
 
         // Finish-aware poll cadence: 100ms for snappy shutdown, but only emit a
         // `progress` event at `progress_interval`.
@@ -85746,7 +86463,9 @@ fn run_index_with_data(
         // No progress display (json mode with events disabled, or plain=none):
         // just wait for completion.
         let mut stall_watchdog =
-            IndexStallWatchdog::aborting_phase_two(data_dir.clone(), progress_interval);
+            IndexStallWatchdog::aborting_phase_two(data_dir.clone(), progress_interval)
+                .watch_aware(watch)
+                .semantic_aware(semantic);
         while !index_handle.is_finished() {
             if let Some(payload) =
                 stall_watchdog.observe(&index_progress, start.elapsed().as_millis())
@@ -86667,12 +87386,15 @@ fn detect_resume_agent(path: &Path, agent_override: Option<&str>) -> CliResult<D
             // Oh My Pi: user explicitly selected the `omp` binary.
             "omp" | "oh-my-pi" | "ohmypi" | "oh_my_pi" => ("pi_agent", Some("omp")),
             "gemini" => ("gemini", None),
+            // Antigravity resumes via `agy --conversation <uuid>`; `agy` is
+            // the binary name, so accept it as an alias for the slug.
+            "antigravity" | "agy" => ("antigravity", None),
             other => {
                 return Err(CliError {
                     code: 2,
                     kind: CliErrorKind::InvalidAgent.kind_str(),
                     message: format!(
-                        "unknown --agent value '{other}'; expected one of: claude, codex, opencode, pi_agent, pi, omp, gemini"
+                        "unknown --agent value '{other}'; expected one of: claude, codex, opencode, pi_agent, pi, omp, gemini, antigravity"
                     ),
                     hint: None,
                     retryable: false,
@@ -86740,6 +87462,20 @@ fn detect_resume_agent(path: &Path, agent_override: Option<&str>) -> CliResult<D
             reason: "path contains .pi/agent".to_string(),
         });
     }
+    // Antigravity (`agy`) stores its transcripts under
+    // `~/.gemini/antigravity-cli/brain/<uuid>/.system_generated/logs/transcript.jsonl`.
+    // That path ALSO contains `.gemini/`, so it must be matched BEFORE the
+    // gemini arm below or an antigravity session would be misrouted to the
+    // Gemini harness. (probe.rs / fleet_archive_coverage.rs enforce the same
+    // antigravity-before-gemini ordering.)
+    if path_str.contains("antigravity-cli") || path_str.contains(".system_generated") {
+        return Ok(DetectedAgent {
+            slug: "antigravity",
+            binary_hint: None,
+            is_override: false,
+            reason: "path contains antigravity-cli storage".to_string(),
+        });
+    }
     if path_str.contains(".gemini/") || path_str.contains("/gemini/sessions") {
         return Ok(DetectedAgent {
             slug: "gemini",
@@ -86757,7 +87493,8 @@ fn detect_resume_agent(path: &Path, agent_override: Option<&str>) -> CliResult<D
             path.display()
         ),
         hint: Some(
-            "Pass --agent <name> to override (claude, codex, opencode, pi, omp, gemini).".into(),
+            "Pass --agent <name> to override (claude, codex, opencode, pi, omp, gemini, antigravity)."
+                .into(),
         ),
         retryable: false,
     })
@@ -86998,6 +87735,62 @@ fn extract_opencode_session_id(path: &Path, strict: bool) -> CliResult<String> {
     Ok(decoded)
 }
 
+/// Extract the Antigravity conversation UUID from a transcript source path.
+///
+/// Antigravity records each conversation under
+/// `<...>/antigravity-cli/brain/<uuid>/.system_generated/logs/transcript.jsonl`
+/// (a `transcript_full.jsonl` sibling may also appear). The `<uuid>` — the same
+/// id `agy --conversation <uuid>` resumes by, and the connector's normalized
+/// `external_id` — is the name of the directory that contains
+/// `.system_generated`. We locate that segment structurally rather than by a
+/// fixed depth so extraction still works when a remote mirror adds leading path
+/// components, and fall back to the component immediately after a `brain`
+/// segment when the path points straight at the conversation directory.
+fn extract_antigravity_conversation_id(path: &Path) -> CliResult<String> {
+    // Primary: the directory whose immediate child is `.system_generated`.
+    let mut cursor = path;
+    while let Some(parent) = cursor.parent() {
+        if parent.file_name().is_some_and(|n| n == ".system_generated")
+            && let Some(uuid) = parent
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|n| n.to_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        {
+            return Ok(uuid.to_string());
+        }
+        cursor = parent;
+    }
+    // Fallback: the path component right after a `brain` segment is the <uuid>
+    // (covers a path that already points at `brain/<uuid>` or below).
+    let names: Vec<&str> = path
+        .components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .collect();
+    if let Some(pos) = names.iter().position(|n| *n == "brain")
+        && let Some(uuid) = names
+            .get(pos + 1)
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+    {
+        return Ok(uuid.to_string());
+    }
+    Err(CliError {
+        code: 5,
+        kind: CliErrorKind::SessionIdNotFound.kind_str(),
+        message: format!(
+            "cannot derive Antigravity conversation id from '{}'",
+            path.display()
+        ),
+        hint: Some(
+            "Expected an Antigravity transcript path like '<...>/antigravity-cli/brain/<uuid>/.system_generated/logs/transcript.jsonl'."
+                .into(),
+        ),
+        retryable: false,
+    })
+}
+
 /// Build the ready-to-run resume target for a session path. Does not
 /// touch the filesystem unless the agent requires file-based id
 /// extraction (pi-agent).
@@ -87088,9 +87881,15 @@ fn resolve_resume_target(path: &Path, agent_override: Option<&str>) -> CliResult
             // Strict mode only when we auto-detected. An explicit
             // `--agent opencode` bypasses the parent-directory check.
             let id = extract_opencode_session_id(path, !is_override)?;
+            // Current OpenCode (1.16.x) continues a session via the
+            // top-level `--session <id>` flag (`-s` for short); the old
+            // `opencode resume <id>` subcommand was removed and is no
+            // longer discoverable via `--help` (cass#316). Emit the
+            // documented flag form so the generated command actually
+            // resumes on a current OpenCode install.
             Ok(ResumeTarget {
                 agent: "opencode",
-                argv: vec!["opencode".into(), "resume".into(), id.clone()],
+                argv: vec!["opencode".into(), "--session".into(), id.clone()],
                 session_id: Some(id),
                 detection_reason,
             })
@@ -87130,6 +87929,22 @@ fn resolve_resume_target(path: &Path, agent_override: Option<&str>) -> CliResult
                     path_str,
                 ],
                 session_id: None,
+                detection_reason,
+            })
+        }
+        "antigravity" => {
+            // Antigravity resumes by conversation UUID: `agy --conversation
+            // <uuid>` (verified against agy 1.0.x `--help`: "--conversation
+            // Resume a previous conversation by ID"). The UUID is the
+            // `brain/<uuid>` directory name, recoverable from the transcript
+            // source path cass stores — the same id the connector keys both
+            // `conversations/<uuid>.db` and `brain/<uuid>/` by, and the
+            // normalized `external_id` (cass#314).
+            let uuid = extract_antigravity_conversation_id(path)?;
+            Ok(ResumeTarget {
+                agent: "antigravity",
+                argv: vec!["agy".into(), "--conversation".into(), uuid.clone()],
+                session_id: Some(uuid),
                 detection_reason,
             })
         }
@@ -95993,7 +96808,9 @@ fn print_fleet_upgrade_rehearsal_human(output: &FleetUpgradeRehearsalOutput) {
             "  - {} [{}] {}",
             host.host_alias,
             host.disposition.as_str(),
-            host.observed_version.as_deref().unwrap_or("version-unknown"),
+            host.observed_version
+                .as_deref()
+                .unwrap_or("version-unknown"),
         );
         for cmd in &host.safe_next_commands {
             println!("      next: {cmd}");

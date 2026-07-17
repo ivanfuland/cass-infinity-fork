@@ -2115,6 +2115,139 @@ fn sessions_json_reports_recent_and_current_workspace_sessions() {
     );
 }
 
+/// cass#323: `--limit` must truncate the result (counts are backfilled only
+/// for surviving sessions) and `--since` must bound the enumeration window
+/// by recorded activity timestamps.
+#[test]
+fn sessions_json_since_bounds_window_and_limit_truncates() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    let db_path = data_dir.join("agent_search.db");
+    let storage = coding_agent_search::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
+
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+
+    let session_old = tmp.path().join("since-old.jsonl");
+    let session_new = tmp.path().join("since-new.jsonl");
+    fs::write(&session_old, "{\"session\":\"old\"}\n").unwrap();
+    std::thread::sleep(Duration::from_millis(5));
+    fs::write(&session_new, "{\"session\":\"new\"}\n").unwrap();
+
+    let claude_id = storage
+        .ensure_agent(&sample_agent("claude_code", "Claude Code"))
+        .unwrap();
+    let workspace_id = storage
+        .ensure_workspace(&workspace, Some("workspace"))
+        .unwrap();
+
+    // Old session: started/ended 2023-11-14.
+    let old_started = 1_700_000_000_000_i64;
+    storage
+        .insert_conversation_tree(
+            claude_id,
+            Some(workspace_id),
+            &sample_conversation(
+                "claude_code",
+                &workspace,
+                &session_old,
+                "since-old",
+                "Old Session",
+                old_started,
+                vec![
+                    sample_message(0, MessageRole::User, old_started, "old question"),
+                    sample_message(1, MessageRole::Agent, old_started + 1, "old answer"),
+                ],
+            ),
+        )
+        .unwrap();
+    // New session: started/ended 2024-12-24.
+    let new_started = 1_735_000_000_000_i64;
+    storage
+        .insert_conversation_tree(
+            claude_id,
+            Some(workspace_id),
+            &sample_conversation(
+                "claude_code",
+                &workspace,
+                &session_new,
+                "since-new",
+                "New Session",
+                new_started,
+                vec![
+                    sample_message(0, MessageRole::User, new_started, "new question"),
+                    sample_message(1, MessageRole::Agent, new_started + 1, "new answer"),
+                    sample_message(2, MessageRole::User, new_started + 2, "follow-up"),
+                ],
+            ),
+        )
+        .unwrap();
+
+    // --since between the two sessions keeps only the newer one.
+    let mut since_cmd = base_cmd(tmp.path());
+    since_cmd.args([
+        "sessions",
+        "--json",
+        "--since",
+        "2024-06-01",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+    ]);
+    let since_output = since_cmd.assert().success().get_output().clone();
+    let since_json: Value =
+        serde_json::from_slice(&since_output.stdout).expect("valid sessions json");
+    let since_sessions = since_json["sessions"].as_array().expect("sessions array");
+    assert_eq!(
+        since_sessions.len(),
+        1,
+        "--since should exclude the session that ended before the cutoff"
+    );
+    assert_eq!(
+        since_sessions[0]["path"].as_str().unwrap(),
+        session_new.to_string_lossy()
+    );
+    // Counts are backfilled after the limit push-down; they must stay exact.
+    assert_eq!(since_sessions[0]["message_count"], 3);
+    assert_eq!(since_sessions[0]["human_turns"], 2);
+
+    // --limit 1 returns exactly one session, with exact counts.
+    let mut limit_cmd = base_cmd(tmp.path());
+    limit_cmd.args([
+        "sessions",
+        "--json",
+        "--limit",
+        "1",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+    ]);
+    let limit_output = limit_cmd.assert().success().get_output().clone();
+    let limit_json: Value =
+        serde_json::from_slice(&limit_output.stdout).expect("valid sessions json");
+    let limit_sessions = limit_json["sessions"].as_array().expect("sessions array");
+    assert_eq!(limit_sessions.len(), 1, "--limit 1 should truncate to one");
+    assert_eq!(
+        limit_sessions[0]["path"].as_str().unwrap(),
+        session_new.to_string_lossy(),
+        "most recently modified session should win the single slot"
+    );
+    assert_eq!(limit_sessions[0]["message_count"], 3);
+    assert_eq!(limit_sessions[0]["human_turns"], 2);
+
+    // An unparseable --since is a usage error, not a silent full scan.
+    let mut bad_cmd = base_cmd(tmp.path());
+    bad_cmd.args([
+        "sessions",
+        "--json",
+        "--since",
+        "not-a-date",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+    ]);
+    bad_cmd.assert().failure();
+}
+
 #[test]
 fn sessions_json_keeps_local_file_metadata_for_trimmed_local_source_id() {
     let tmp = TempDir::new().unwrap();

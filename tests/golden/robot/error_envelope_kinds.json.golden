@@ -70,6 +70,7 @@
     },
     "db-open": {
       "exit_codes": [
+        3,
         9
       ]
     },
@@ -429,6 +430,7 @@
     },
     "unknown": {
       "exit_codes": [
+        1,
         9
       ]
     },

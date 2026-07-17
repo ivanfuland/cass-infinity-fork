@@ -619,7 +619,12 @@ pub fn load_infinity_semantic_context(data_dir: &Path, db_path: &Path) -> Semant
     let shard_indexes = if monolithic_present
         || complete_shard_generation_candidate_exists(data_dir, &embedder_id)
     {
-        load_complete_shard_indexes_for_current_db(data_dir, db_path, &embedder_id, "infinity semantic")
+        load_complete_shard_indexes_for_current_db(
+            data_dir,
+            db_path,
+            &embedder_id,
+            "infinity semantic",
+        )
     } else {
         None
     };

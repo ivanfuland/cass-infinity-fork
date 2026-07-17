@@ -1,6 +1,8 @@
 use anyhow::Result;
 
-use super::{Connector, DetectionResult, DiscoveredSourceFile, NormalizedConversation, ScanContext};
+use super::{
+    Connector, DetectionResult, DiscoveredSourceFile, NormalizedConversation, ScanContext,
+};
 
 /// Thin wrapper over the upstream franken Codex connector.
 ///

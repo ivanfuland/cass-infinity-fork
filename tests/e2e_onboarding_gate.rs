@@ -160,7 +160,10 @@ fn onboarding_empty_machine_is_readonly_and_recommends_discovery() -> TestResult
         )
     })?;
     ensure(
-        report.get("indexed_conversation_count").and_then(Value::as_u64) == Some(0),
+        report
+            .get("indexed_conversation_count")
+            .and_then(Value::as_u64)
+            == Some(0),
         || "empty machine should report 0 indexed conversations".to_string(),
     )?;
 
@@ -185,14 +188,23 @@ fn onboarding_indexed_machine_is_ready_to_search() -> TestResult {
         &data_dir,
     );
     let index_cmd = cass_cmd(&home, Some(&codex_home), &index_args);
-    let index_out =
-        spawn_with_timeout_or_diag(index_cmd, "onboarding_index", Some(&data_dir), INDEX_TIMEOUT);
+    let index_out = spawn_with_timeout_or_diag(
+        index_cmd,
+        "onboarding_index",
+        Some(&data_dir),
+        INDEX_TIMEOUT,
+    );
     let index_stdout = String::from_utf8_lossy(&index_out.stdout);
     let index_json: Value = serde_json::from_str(index_stdout.trim())
         .map_err(|e| format!("index stdout not JSON: {e}; head: {}", head(&index_stdout)))?;
     ensure(
         index_json.get("success").and_then(Value::as_bool) == Some(true),
-        || format!("index did not report success=true: {}", head(&index_json.to_string())),
+        || {
+            format!(
+                "index did not report success=true: {}",
+                head(&index_json.to_string())
+            )
+        },
     )?;
 
     let report = run_onboarding(&home, Some(&codex_home), &data_dir)?;

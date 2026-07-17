@@ -190,8 +190,11 @@ fn configure_child_process_group(_cmd: &mut Command) {}
 #[cfg(unix)]
 fn kill_child_process_group(pid: u32) {
     let process_group = format!("-{pid}");
+    // "--" is required: procps kill 3.3.17 (Ubuntu 22.04) misparses a bare
+    // negative pid and degenerates to kill(0, sig), SIGKILLing the CALLER's
+    // own process group (cargo test / the daemon itself).
     let _ = Command::new("/bin/kill")
-        .args(["-KILL", &process_group])
+        .args(["-KILL", "--", &process_group])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

@@ -8,6 +8,7 @@ pub mod refresh_ledger;
 pub(crate) mod responsiveness;
 pub mod semantic;
 pub mod semantic_progress;
+pub(crate) mod staging_reclaim;
 
 use self::quarantine::{QuarantineKey, QuarantineState};
 use self::refresh_ledger::{
@@ -916,6 +917,10 @@ impl CanonicalMutationCounts {
 struct NonWatchIngestOutcome {
     canonical_mutations: CanonicalMutationCounts,
     quarantined_conversations: usize,
+    /// #298 OOM deferrals: conversations intentionally NOT persisted this run,
+    /// with no quarantine ledger — scan watermarks must not advance past them
+    /// or "the next index run retries it" becomes a silent permanent skip.
+    deferred_conversations: usize,
     lexical_update_deferred: bool,
     scanned_connectors: BTreeSet<String>,
     scan_had_errors: bool,
@@ -932,6 +937,9 @@ impl NonWatchIngestOutcome {
             quarantined_conversations: self
                 .quarantined_conversations
                 .saturating_add(other.quarantined_conversations),
+            deferred_conversations: self
+                .deferred_conversations
+                .saturating_add(other.deferred_conversations),
             lexical_update_deferred: self.lexical_update_deferred || other.lexical_update_deferred,
             scanned_connectors,
             scan_had_errors: self.scan_had_errors || other.scan_had_errors,
@@ -960,6 +968,18 @@ pub struct IndexingProgress {
     // Simple phase indicator: 0=Idle, 1=Scanning, 2=Indexing
     pub phase: AtomicUsize,
     pub is_rebuilding: AtomicBool,
+    /// Set by `run_index` while it is inside the post-publish finalize window —
+    /// specifically `close_storage_after_index`, which runs the (deferred,
+    /// possibly multi-GB) bulk-ingest WAL checkpoint via a synchronous,
+    /// `!Send` frankensqlite `conn.close()` + `wal_checkpoint(TRUNCATE)` on the
+    /// indexer thread. That checkpoint cannot report progress and, on a large
+    /// corpus (esp. macOS, where Darwin fsync/flock is slow), legitimately
+    /// takes minutes. The stall watchdog reads this flag so it does not misread
+    /// that active checkpoint as a #297 finalize wedge and kill the process
+    /// (exit 70) mid-write — which strands the un-truncated WAL and leaves the
+    /// canonical DB malformed to stock SQLite (#296/#321). Liveness is still
+    /// bounded: see `index_finalize_abort_threshold` (#319).
+    pub finalizing: AtomicBool,
     /// Number of coding agents discovered so far during scanning
     pub discovered_agents: AtomicUsize,
     /// Names of discovered agents (protected by mutex for concurrent access)
@@ -1142,6 +1162,7 @@ impl IndexingProgress {
         let current = self.current.load(Ordering::Relaxed);
         let agents = self.discovered_agents.load(Ordering::Relaxed);
         let is_rebuilding = self.is_rebuilding.load(Ordering::Relaxed);
+        let finalizing = self.finalizing.load(Ordering::Relaxed);
         let agent_names: Vec<String> = self
             .discovered_agent_names
             .lock()
@@ -1324,6 +1345,11 @@ impl IndexingProgress {
             "discovered_agents": agents,
             "agent_names": agent_names,
             "is_rebuilding": is_rebuilding,
+            // #319: true while the indexer is inside the post-publish finalize
+            // WAL checkpoint (close_storage_after_index). A quiescent, phase-0,
+            // current==total snapshot with `finalizing: true` is an active
+            // final checkpoint, NOT a #297 wedge.
+            "finalizing": finalizing,
             "elapsed_ms": elapsed_ms,
             "rate_per_sec": rate_per_sec,
             "eta_seconds": eta_seconds,
@@ -3667,12 +3693,10 @@ fn lexical_rebuild_noise_role(is_tool_role: bool) -> Option<&'static str> {
 /// that the counter still expects (or vice versa), observed-vs-expected doc
 /// counts diverge and re-trigger the cass#244/#258 sparse-repair false-positive
 /// rebuild loop.
-fn is_lexical_rebuild_tool_class_message_role(
-    role: &crate::model::types::MessageRole,
-) -> bool {
-    crate::storage::sqlite::is_lexical_rebuild_tool_class_role(
-        crate::model::types::role_as_str(role),
-    )
+fn is_lexical_rebuild_tool_class_message_role(role: &crate::model::types::MessageRole) -> bool {
+    crate::storage::sqlite::is_lexical_rebuild_tool_class_role(crate::model::types::role_as_str(
+        role,
+    ))
 }
 
 fn lexical_rebuild_packet_provenance_from_canonical(
@@ -4690,7 +4714,7 @@ impl LexicalRebuildShardBuildTelemetry {
         if let Some(amplification_milli) = result.amplification_milli {
             let conservative_amplification = amplification_milli
                 .max(LEXICAL_REBUILD_STAGED_SHARD_BUILD_AMPLIFICATION_FLOOR_MILLI);
-            let _ = self.observed_amplification_milli.fetch_update(
+            let _ = self.observed_amplification_milli.try_update(
                 Ordering::Relaxed,
                 Ordering::Relaxed,
                 |current| Some(current.max(conservative_amplification)),
@@ -7825,7 +7849,7 @@ struct LexicalRebuildProducerTelemetry {
 
 impl LexicalRebuildProducerTelemetry {
     fn saturating_add(counter: &AtomicUsize, value: usize) {
-        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             Some(current.saturating_add(value))
         });
     }
@@ -9200,6 +9224,7 @@ fn should_repair_fallback_fts_after_full_index_run(
 enum FallbackFtsRepairOutcome {
     SkippedKnownHealthyForFingerprint { archive_fingerprint: String },
     SkippedUnsupportedPopulatedShadowReload { detail: String },
+    SkippedCorruptDerivedIndex { detail: String },
     Repaired(FtsConsistencyRepair),
 }
 
@@ -9213,6 +9238,18 @@ enum DailyStatsRepairOutcome {
         rows_created: i64,
         total_sessions: i64,
     },
+}
+
+fn nonfatal_fallback_fts_repair_outcome(detail: String) -> Option<FallbackFtsRepairOutcome> {
+    if crate::storage::sqlite::error_message_indicates_populated_fts_shadow_without_rowid_reload(
+        &detail,
+    ) {
+        return Some(FallbackFtsRepairOutcome::SkippedUnsupportedPopulatedShadowReload { detail });
+    }
+    if crate::storage::sqlite::fts_messages_integrity_error_from_message(&detail).is_some() {
+        return Some(FallbackFtsRepairOutcome::SkippedCorruptDerivedIndex { detail });
+    }
+    None
 }
 
 fn repair_fallback_fts_after_full_index_run(
@@ -9253,12 +9290,8 @@ fn repair_fallback_fts_after_full_index_run(
         Ok(storage) => storage,
         Err(err) => {
             let detail = format!("{err:#}");
-            if crate::storage::sqlite::error_message_indicates_populated_fts_shadow_without_rowid_reload(
-                &detail,
-            ) {
-                return Ok(Some(
-                    FallbackFtsRepairOutcome::SkippedUnsupportedPopulatedShadowReload { detail },
-                ));
+            if let Some(outcome) = nonfatal_fallback_fts_repair_outcome(detail) {
+                return Ok(Some(outcome));
             }
             return Err(err).with_context(|| {
                 format!(
@@ -9284,12 +9317,8 @@ fn repair_fallback_fts_after_full_index_run(
         Ok(repair) => repair,
         Err(err) => {
             let detail = format!("{err:#}");
-            if crate::storage::sqlite::error_message_indicates_populated_fts_shadow_without_rowid_reload(
-                &detail,
-            ) {
-                return Ok(Some(
-                    FallbackFtsRepairOutcome::SkippedUnsupportedPopulatedShadowReload { detail },
-                ));
+            if let Some(outcome) = nonfatal_fallback_fts_repair_outcome(detail) {
+                return Ok(Some(outcome));
             }
             return Err(err);
         }
@@ -12989,6 +13018,70 @@ fn explicit_scan_root_since_ts(
     }
 }
 
+/// Restore scan watermarks through a DEDICATED short-lived writer connection
+/// (never the cached ephemeral writer: a failed COMMIT leaves the transaction
+/// active, and a cached writer with an open transaction poisons the next
+/// `BEGIN IMMEDIATE`). Retries are classified — only Busy/Conflict-style
+/// transient errors are retried, per the project's retryable whitelist.
+fn restore_scan_watermarks_with_fresh_writer(
+    db_path: &Path,
+    snapshot: &[(String, String)],
+) -> Result<()> {
+    persist::with_concurrent_retry(2, || {
+        let writer = FrankenStorage::open(db_path)
+            .with_context(|| "opening dedicated writer for scan-watermark restore")?;
+        let result = writer.restore_scan_watermarks(snapshot);
+        let close_result = writer
+            .close()
+            .with_context(|| "closing dedicated scan-watermark restore writer");
+        result.and(close_result)
+    })
+}
+
+/// Drop guard that restores the pre-run scan watermarks on any early exit
+/// from `run_index` between the snapshot and normal finalization: every
+/// `Result` early return, plus panics in unwind builds. NOT covered (same as
+/// a hard crash, documented window): panics under release `panic = "abort"`,
+/// `process::exit`, SIGKILL — recovery there is the next `--full` reindex or
+/// a source-file touch.
+/// The streaming per-connector watermarks and the 10s periodic global saves
+/// are written before ingest outcomes (deferrals, errors) are known; exiting
+/// early with them advanced silently skips whatever the rest of the run never
+/// persisted. Restoring on early exit is always replay-safe.
+struct ScanWatermarkRestoreGuard {
+    db_path: PathBuf,
+    snapshot: Vec<(String, String)>,
+    disarmed: bool,
+}
+
+impl ScanWatermarkRestoreGuard {
+    fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for ScanWatermarkRestoreGuard {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        tracing::warn!(
+            db_path = %self.db_path.display(),
+            "early exit before watermark finalization: restoring pre-run scan watermarks (replay-safe)"
+        );
+        if let Err(e) = restore_scan_watermarks_with_fresh_writer(&self.db_path, &self.snapshot) {
+            // Drop cannot propagate: log loudly. The stranded-watermark window
+            // this leaves is the same one a hard crash leaves, and the next
+            // `--full` or source-file touch recovers it.
+            tracing::error!(
+                db_path = %self.db_path.display(),
+                error = %e,
+                "FAILED to restore pre-run scan watermarks on early exit; deferred/unpersisted sources may be skipped until a full reindex"
+            );
+        }
+    }
+}
+
 pub fn run_index(
     opts: IndexOptions,
     event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
@@ -13021,6 +13114,13 @@ pub fn run_index(
         Arc::clone(&index_run_lock.metadata_write_lock),
         Arc::clone(&index_run_lock.last_progress_at_ms_atomic),
     );
+    // GH#324: reclaim staging debris stranded by previous hard-crashed runs
+    // now that we hold the exclusive index-run lock, and BEFORE the
+    // disk-headroom preflight below — otherwise a crash/restart loop's own
+    // debris trips the headroom guard and wedges indexing hard-down on a
+    // full disk it could have freed itself.
+    staging_reclaim::reclaim_orphaned_staging_dirs_for_data_dir(&opts.data_dir, SystemTime::now())
+        .log();
     // F4: clone the atomic so deeply nested batch loops can bump progress
     // without holding a `&mut IndexRunLockGuard`. The clone is cheap
     // (single Arc bump) and lives only inside this function.
@@ -13589,6 +13689,19 @@ pub fn run_index(
     let mut scan_lexical_update_deferred = false;
     let mut scanned_connectors = BTreeSet::new();
     let mut scan_had_errors = false;
+    let mut scan_deferred_conversations = 0usize;
+    // Pre-run watermark snapshot: streaming connector watermarks and the
+    // 10s-periodic global saves are written BEFORE ingest knows whether any
+    // conversation gets #298-deferred. If this run defers anything, every
+    // scan watermark is restored to this snapshot at finalization — deferred
+    // conversations have no quarantine ledger, so the watermark is their only
+    // retry protection. Replaying a run is safe; silently skipping is not.
+    let pre_run_scan_watermarks = storage.snapshot_scan_watermarks()?;
+    let mut scan_watermark_restore_guard = ScanWatermarkRestoreGuard {
+        db_path: opts.db_path.clone(),
+        snapshot: pre_run_scan_watermarks.clone(),
+        disarmed: false,
+    };
     let mut stale_index_ingest_quarantine_retry_attempted = false;
 
     let mut tantivy_requires_rebuild = false;
@@ -14271,6 +14384,8 @@ pub fn run_index(
                     scan_lexical_update_deferred |= scan_outcome.lexical_update_deferred;
                     scanned_connectors.extend(scan_outcome.scanned_connectors);
                     scan_had_errors |= scan_outcome.scan_had_errors;
+                    scan_deferred_conversations = scan_deferred_conversations
+                        .saturating_add(scan_outcome.deferred_conversations);
                 } else {
                     tracing::info!(
                         "using batch indexing (streaming disabled via CASS_STREAMING_INDEX=0)"
@@ -14291,10 +14406,31 @@ pub fn run_index(
                     scan_lexical_update_deferred |= scan_outcome.lexical_update_deferred;
                     scanned_connectors.extend(scan_outcome.scanned_connectors);
                     scan_had_errors |= scan_outcome.scan_had_errors;
+                    scan_deferred_conversations = scan_deferred_conversations
+                        .saturating_add(scan_outcome.deferred_conversations);
                 }
                 performed_scan = true;
                 stale_index_ingest_quarantine_retry_attempted =
                     stale_index_ingest_quarantine_retry.is_some();
+
+                if scan_deferred_conversations > 0 {
+                    // Restore IMMEDIATELY after the scan, not at finalization:
+                    // the lexical-rebuild and semantic phases below have many
+                    // `?` early returns, and an error there must not strand
+                    // the already-advanced streaming/periodic watermarks past
+                    // the deferred conversations (codex R8 P0). Bounded retry
+                    // absorbs transient writer contention; a hard crash inside
+                    // this window remains a narrow documented gap.
+                    tracing::warn!(
+                        db_path = %opts.db_path.display(),
+                        scan_deferred_conversations,
+                        "restoring pre-run scan watermarks so deferred conversations are rescanned next run (#298)"
+                    );
+                    restore_scan_watermarks_with_fresh_writer(
+                        &opts.db_path,
+                        &pre_run_scan_watermarks,
+                    )?;
+                }
 
                 if scan_lexical_update_deferred {
                     tracing::warn!(
@@ -14575,9 +14711,12 @@ pub fn run_index(
     } else {
         let now_ms = FrankenStorage::now_millis();
         let preserve_scan_watermark = scan_watermark_preservation_active();
-        let performed_scan_for_global_watermark =
-            performed_scan && !preserve_scan_watermark && !scan_had_errors;
-        let performed_scan_for_connector_watermarks = performed_scan && !preserve_scan_watermark;
+        let performed_scan_for_global_watermark = performed_scan
+            && !preserve_scan_watermark
+            && !scan_had_errors
+            && scan_deferred_conversations == 0;
+        let performed_scan_for_connector_watermarks =
+            performed_scan && !preserve_scan_watermark && scan_deferred_conversations == 0;
         if performed_scan && preserve_scan_watermark {
             tracing::info!(
                 db_path = %opts.db_path.display(),
@@ -14605,6 +14744,10 @@ pub fn run_index(
             )?;
         }
     }
+    // Watermark state is now final for this run (advanced for clean runs,
+    // restored/preserved for deferred ones): the early-exit guard has nothing
+    // left to protect.
+    scan_watermark_restore_guard.disarm();
     let exact_total_counts = exact_total_counts_from_progress(opts.progress.as_ref());
     if exact_completed_lexical_checkpoint && exact_total_counts.is_some() {
         tracing::info!(
@@ -14700,6 +14843,13 @@ pub fn run_index(
                     db_path = %opts.db_path.display(),
                     error = %detail,
                     "skipping derived fallback FTS repair because frankensqlite cannot yet reload populated FTS shadow WITHOUT ROWID tables; canonical SQLite rows and Tantivy remain authoritative"
+                );
+            }
+            FallbackFtsRepairOutcome::SkippedCorruptDerivedIndex { detail } => {
+                tracing::warn!(
+                    db_path = %opts.db_path.display(),
+                    error = %detail,
+                    "derived fallback FTS remains corrupt after its best-effort repair; preserving the successful canonical SQLite and Tantivy build. Run 'cass doctor check --json' before an explicit fallback-FTS rebuild"
                 );
             }
             FallbackFtsRepairOutcome::Repaired(FtsConsistencyRepair::AlreadyHealthy { rows }) => {
@@ -15061,6 +15211,20 @@ pub fn run_index(
         return Ok(());
     }
 
+    // #319/#321: `close_storage_after_index` runs the final WAL checkpoint of
+    // the deferred bulk-ingest WAL — a synchronous, `!Send` frankensqlite
+    // `conn.close()` + `wal_checkpoint(TRUNCATE)` that executes on THIS thread
+    // and cannot report progress. On a large corpus (the report: ~1.1 GB /
+    // ~290k-frame WAL) it legitimately takes minutes, especially on macOS.
+    // Signal the stall watchdog that we have entered that finalize window so it
+    // does not misread the quiescent, phase-0, current==total state as a #297
+    // finalize wedge and kill the process (exit 70) mid-checkpoint — which would
+    // strand the un-truncated WAL and leave the DB malformed (#296/#321). The
+    // watchdog still bounds this window (see `index_finalize_abort_threshold`),
+    // so a genuinely stuck finalize is still aborted.
+    if let Some(progress) = opts.progress.as_ref() {
+        progress.finalizing.store(true, Ordering::Relaxed);
+    }
     close_storage_after_index(storage, &opts.db_path, "index run")
 }
 
@@ -15072,7 +15236,13 @@ fn close_storage_after_index(storage: FrankenStorage, db_path: &Path, context: &
             db_path.display()
         )
     })?;
-    run_final_wal_checkpoint(db_path, context)
+    // The storage handle is already closed here, so the checkpoint should not be
+    // blocked; a `Blocked` outcome (e.g. another cass process holds a reader) is
+    // already surfaced via the WARN inside `query_final_wal_checkpoint`. Preserve
+    // the historically-lenient contract of this normal-close path (Ok even if the
+    // checkpoint could not fully truncate) — the abort path (#321) is the one that
+    // must branch on the outcome.
+    run_final_wal_checkpoint(db_path, context).map(|_outcome| ())
 }
 
 fn prepare_storage_for_final_checkpoint(storage: &FrankenStorage, db_path: &Path, context: &str) {
@@ -15089,6 +15259,53 @@ fn prepare_storage_for_final_checkpoint(storage: &FrankenStorage, db_path: &Path
     }
 }
 
+/// Result of a `PRAGMA wal_checkpoint(TRUNCATE)` issued during index finalize
+/// or the bounded stall-abort path.
+///
+/// The distinction is load-bearing for #321: a checkpoint that SQLite reports
+/// as `busy=1` (or that backfilled fewer frames than the WAL held) did **not**
+/// truncate the WAL, so the canonical DB is still a replay dependency on a
+/// large `*.db-wal` and stock `PRAGMA integrity_check` will fail. Callers must
+/// not report such a checkpoint as success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinalWalCheckpointOutcome {
+    /// The WAL was fully checkpointed and truncated (`busy == 0` and every
+    /// logged frame was backfilled).
+    Completed,
+    /// The checkpoint was blocked by active readers/writers (`busy != 0`) or
+    /// left un-backfilled frames. The canonical WAL was NOT truncated.
+    Blocked {
+        busy: i64,
+        log_frames: i64,
+        checkpointed_frames: i64,
+    },
+}
+
+/// Classify a `wal_checkpoint` status row `(busy, log_frames, checkpointed)`.
+///
+/// A checkpoint only counts as [`FinalWalCheckpointOutcome::Completed`] when
+/// SQLite reports `busy == 0` AND every frame in the WAL log was backfilled
+/// (`checkpointed_frames >= log_frames`). Anything else — the #321 case of
+/// `busy=1, log_frames=289842, checkpointed_frames=0` being the canonical
+/// example — is [`FinalWalCheckpointOutcome::Blocked`] and must never be logged
+/// or reported as a successful checkpoint.
+fn classify_final_wal_checkpoint(
+    busy: i64,
+    log_frames: i64,
+    checkpointed_frames: i64,
+) -> FinalWalCheckpointOutcome {
+    let left_frames_uncheckpointed = log_frames > 0 && checkpointed_frames < log_frames;
+    if busy > 0 || left_frames_uncheckpointed {
+        FinalWalCheckpointOutcome::Blocked {
+            busy,
+            log_frames,
+            checkpointed_frames,
+        }
+    } else {
+        FinalWalCheckpointOutcome::Completed
+    }
+}
+
 /// Best-effort canonical-WAL checkpoint before a bounded abort/exit (#296).
 ///
 /// The `cass index` stall-abort path exits via `std::process::exit(70)`, which
@@ -15102,16 +15319,40 @@ fn prepare_storage_for_final_checkpoint(storage: &FrankenStorage, db_path: &Path
 /// the abort still proceeds. Stale index-run locks are already reaped on the
 /// next startup by `read_search_maintenance_snapshot` (flock-based), so this
 /// focuses on the WAL.
+///
+/// #321: the abort races the still-running `run_index` thread, which holds the
+/// canonical storage handle open while it performs its own slow finalize
+/// checkpoint of the (deferred, multi-GB) WAL. That open handle makes this
+/// fresh-connection checkpoint report `busy=1 / checkpointed_frames=0` — a
+/// no-op. We must NOT log success in that case: the WAL is left un-truncated
+/// and stock SQLite integrity checks fail. Report the truth instead so the
+/// operator (and the next startup's recovery) know the WAL is still stranded.
 pub fn best_effort_abort_wal_checkpoint(data_dir: &Path) {
     let db_path = data_dir.join("agent_search.db");
     if !db_path.exists() {
         return;
     }
     match run_final_wal_checkpoint(&db_path, "stall abort") {
-        Ok(()) => {
+        Ok(FinalWalCheckpointOutcome::Completed) => {
             tracing::info!(
                 db_path = %db_path.display(),
                 "checkpointed canonical WAL before stall abort (#296)"
+            );
+        }
+        Ok(FinalWalCheckpointOutcome::Blocked {
+            busy,
+            log_frames,
+            checkpointed_frames,
+        }) => {
+            tracing::warn!(
+                db_path = %db_path.display(),
+                busy,
+                log_frames,
+                checkpointed_frames,
+                "WAL checkpoint before stall abort was blocked (busy or frames left \
+                 un-truncated); the canonical DB is left depending on an un-checkpointed \
+                 WAL and stock SQLite integrity checks will fail until the next clean run \
+                 checkpoints it (#296/#321)"
             );
         }
         Err(err) => {
@@ -15124,7 +15365,7 @@ pub fn best_effort_abort_wal_checkpoint(data_dir: &Path) {
     }
 }
 
-fn run_final_wal_checkpoint(db_path: &Path, context: &str) -> Result<()> {
+fn run_final_wal_checkpoint(db_path: &Path, context: &str) -> Result<FinalWalCheckpointOutcome> {
     // Run this after closing the indexing storage handle: frankensqlite flushes
     // retained autocommit writes during close, and TRUNCATE avoids leaving the
     // completed bulk-ingest WAL for the next opener to replay.
@@ -15143,16 +15384,16 @@ fn run_final_wal_checkpoint(db_path: &Path, context: &str) -> Result<()> {
             db_path.display()
         )
     });
-    checkpoint_result?;
+    let outcome = checkpoint_result?;
     close_result?;
-    Ok(())
+    Ok(outcome)
 }
 
 fn query_final_wal_checkpoint(
     conn: &frankensqlite::Connection,
     db_path: &Path,
     context: &str,
-) -> Result<()> {
+) -> Result<FinalWalCheckpointOutcome> {
     let rows = conn
         .query("PRAGMA wal_checkpoint(TRUNCATE);")
         .with_context(|| {
@@ -15177,28 +15418,32 @@ fn query_final_wal_checkpoint(
         .get_typed(2)
         .with_context(|| "reading final WAL checkpoint backfilled frame count")?;
 
+    let outcome = classify_final_wal_checkpoint(busy, log_frames, checkpointed_frames);
     if log_frames >= 0 {
-        if busy > 0 {
-            tracing::warn!(
-                db_path = %db_path.display(),
-                context,
-                busy,
-                log_frames,
-                checkpointed_frames,
-                "final WAL checkpoint was blocked by active readers"
-            );
-        } else {
-            tracing::info!(
-                db_path = %db_path.display(),
-                context,
-                log_frames,
-                checkpointed_frames,
-                "final WAL checkpoint completed after index run"
-            );
+        match outcome {
+            FinalWalCheckpointOutcome::Blocked { .. } => {
+                tracing::warn!(
+                    db_path = %db_path.display(),
+                    context,
+                    busy,
+                    log_frames,
+                    checkpointed_frames,
+                    "final WAL checkpoint was blocked by active readers or left frames un-truncated"
+                );
+            }
+            FinalWalCheckpointOutcome::Completed => {
+                tracing::info!(
+                    db_path = %db_path.display(),
+                    context,
+                    log_frames,
+                    checkpointed_frames,
+                    "final WAL checkpoint completed after index run"
+                );
+            }
         }
     }
 
-    Ok(())
+    Ok(outcome)
 }
 
 fn restore_watch_steady_state_checkpoint_policy(storage: &FrankenStorage, watch_enabled: bool) {
@@ -15935,25 +16180,63 @@ fn anyhow_chain_indicates_retryable_storage_contention(err: &anyhow::Error) -> b
         .any(|cause| crate::storage::sqlite::retryable_storage_error_message(&cause.to_string()))
 }
 
+const DEFAULT_INDEX_INTEGRITY_PREFLIGHT_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+fn index_integrity_preflight_max_bytes() -> u64 {
+    dotenvy::var("CASS_INDEX_INTEGRITY_PREFLIGHT_MAX_BYTES")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_INDEX_INTEGRITY_PREFLIGHT_MAX_BYTES)
+}
+
+fn should_run_full_archive_quick_check(bundle_bytes: Option<u64>, max_bytes: u64) -> bool {
+    if max_bytes == 0 {
+        return true;
+    }
+    match bundle_bytes {
+        Some(bytes) => bytes <= max_bytes,
+        None => true,
+    }
+}
+
+fn archive_bundle_size_for_integrity_preflight(storage: &FrankenStorage) -> Option<u64> {
+    let db_path = storage.database_path().ok()?;
+    // A missing or unreadable main file must fail safe into the integrity walk.
+    // Sidecars are optional, and database_bundle_size_bytes already treats an
+    // absent WAL/SHM as zero while preserving filename bytes.
+    fs::metadata(&db_path).ok()?;
+    Some(database_bundle_size_bytes(&db_path))
+}
+
 fn full_rebuild_existing_storage_integrity_problem(
     storage: &FrankenStorage,
 ) -> Result<Option<String>> {
-    let quick_check = match storage.raw().query_row_map(
-        "PRAGMA quick_check(1)",
-        &[] as &[ParamValue],
-        |row| row.get_typed::<String>(0),
-    ) {
-        Ok(status) => status,
-        Err(err) if crate::storage::sqlite::retryable_franken_error(&err) => {
-            return Err(anyhow::anyhow!(
-                "full rebuild archive integrity preflight hit transient storage contention: {err}"
-            ));
-        }
-        Err(err) => return Ok(Some(format!("quick_check failed: {err}"))),
-    };
+    let bundle_bytes = archive_bundle_size_for_integrity_preflight(storage);
+    let max_bytes = index_integrity_preflight_max_bytes();
+    if should_run_full_archive_quick_check(bundle_bytes, max_bytes) {
+        let quick_check = match storage.raw().query_row_map(
+            "PRAGMA quick_check(1)",
+            &[] as &[ParamValue],
+            |row| row.get_typed::<String>(0),
+        ) {
+            Ok(status) => status,
+            Err(err) if crate::storage::sqlite::retryable_franken_error(&err) => {
+                return Err(anyhow::anyhow!(
+                    "full rebuild archive integrity preflight hit transient storage contention: {err}"
+                ));
+            }
+            Err(err) => return Ok(Some(format!("quick_check failed: {err}"))),
+        };
 
-    if !quick_check.trim().eq_ignore_ascii_case("ok") {
-        return Ok(Some(format!("quick_check reported {quick_check:?}")));
+        if !quick_check.trim().eq_ignore_ascii_case("ok") {
+            return Ok(Some(format!("quick_check reported {quick_check:?}")));
+        }
+    } else {
+        tracing::warn!(
+            bundle_bytes = bundle_bytes.unwrap_or_default(),
+            max_bytes,
+            "skipping the O(database-size) PRAGMA quick_check before a large full rebuild; core-table canaries still run. Use 'cass doctor check --json' for the exhaustive scan, or set CASS_INDEX_INTEGRITY_PREFLIGHT_MAX_BYTES=0 to force it here"
+        );
     }
 
     for (table, sql) in [
@@ -16409,6 +16692,9 @@ pub(crate) fn repair_lexical_index_from_canonical_db_for_search(
         Arc::clone(&index_run_lock.metadata_write_lock),
         Arc::clone(&index_run_lock.last_progress_at_ms_atomic),
     );
+    // GH#324: this repair path also stages under the index root; sweep
+    // debris from previous crashed runs while we hold the exclusive lock.
+    staging_reclaim::reclaim_orphaned_staging_dirs_for_data_dir(data_dir, SystemTime::now()).log();
 
     let storage = FrankenStorage::open_readonly(db_path).with_context(|| {
         format!(
@@ -20651,6 +20937,11 @@ fn ingest_batch_detailed(
         );
     }
 
+    // GH#320: bound the bulk-ingest WAL (and the pager memory plus finalize
+    // checkpoint debt that scale with it) at a safe between-transactions
+    // boundary.
+    persist::maybe_checkpoint_bulk_ingest_wal(storage, defer_checkpoints);
+
     // Update progress counter for all conversations at once
     if let Some(p) = progress {
         p.current.fetch_add(convs.len(), Ordering::Relaxed);
@@ -20669,6 +20960,7 @@ fn ingest_batch_detailed(
             inserted_messages: batch_outcome.inserted_messages,
         },
         quarantined_conversations: 0,
+        deferred_conversations: 0,
         lexical_update_deferred: batch_outcome.lexical_update_deferred,
         scanned_connectors: BTreeSet::new(),
         scan_had_errors: false,
@@ -20855,6 +21147,43 @@ fn ingest_non_watch_oom_retry_or_quarantine(
     }
 
     let conv = &convs[0];
+
+    // #298: mirror the watch-path plausibility gate. frankensqlite raises the
+    // same typed `FrankenError::OutOfMemory` for per-statement bounded
+    // allocation guards, so a NoMem on a small conversation with no real host
+    // memory pressure is not evidence of a poisoned conversation. Defer it
+    // (retried by the next index run) instead of quarantining.
+    let indexed_text_bytes = conversation_indexed_text_bytes(conv);
+    let small_conversation = indexed_text_bytes <= watch_oom_small_conversation_bytes();
+    let real_pressure = watch_oom_under_real_memory_pressure();
+    let should_quarantine = match real_pressure {
+        Some(true) => true,
+        Some(false) | None => !small_conversation,
+    };
+    if !should_quarantine {
+        tracing::warn!(
+            agent = %conv.agent_slug,
+            external_id = conv.external_id.as_deref().unwrap_or(""),
+            source_path = %conv.source_path.display(),
+            indexed_text_bytes,
+            real_memory_pressure = ?real_pressure,
+            error = %error,
+            "single non-watch conversation hit a bounded-allocation NoMem with no real memory pressure; deferring (not quarantining) so the next index run retries it (#298)"
+        );
+        if let Some(progress) = progress {
+            progress.current.fetch_add(1, Ordering::Relaxed);
+        }
+        bump_index_run_lock_progress_if_present(progress_bump);
+        return Ok(NonWatchIngestOutcome {
+            canonical_mutations: CanonicalMutationCounts::default(),
+            quarantined_conversations: 0,
+            deferred_conversations: 1,
+            lexical_update_deferred: true,
+            scanned_connectors: BTreeSet::new(),
+            scan_had_errors: false,
+        });
+    }
+
     record_index_poison_conversation(data_dir, conv, &error)?;
     if let Some(progress) = progress {
         progress.current.fetch_add(1, Ordering::Relaxed);
@@ -20864,12 +21193,15 @@ fn ingest_non_watch_oom_retry_or_quarantine(
         agent = %conv.agent_slug,
         external_id = conv.external_id.as_deref().unwrap_or(""),
         source_path = %conv.source_path.display(),
+        indexed_text_bytes,
+        real_memory_pressure = ?real_pressure,
         error = %error,
         "single non-watch conversation ran out of memory after deferred lexical retry; quarantined and continuing index refresh"
     );
     Ok(NonWatchIngestOutcome {
         canonical_mutations: CanonicalMutationCounts::default(),
         quarantined_conversations: 1,
+        deferred_conversations: 0,
         lexical_update_deferred: true,
         scanned_connectors: BTreeSet::new(),
         scan_had_errors: false,
@@ -20946,6 +21278,11 @@ struct WatchIngestBatchOutcome {
     batch_outcome: persist::PersistBatchOutcome,
     processed_conversations: usize,
     quarantined_conversations: usize,
+    /// Conversations skipped this pass by the #298 plausibility gate (bounded
+    /// NoMem, no real pressure). Not quarantined — but the watch watermark
+    /// must not advance past them or they would be silently dropped until
+    /// their source file changes again.
+    deferred_conversations: usize,
     max_payload_watermark_ms: Option<i64>,
 }
 
@@ -20958,6 +21295,9 @@ impl WatchIngestBatchOutcome {
         self.quarantined_conversations = self
             .quarantined_conversations
             .saturating_add(other.quarantined_conversations);
+        self.deferred_conversations = self
+            .deferred_conversations
+            .saturating_add(other.deferred_conversations);
         if let Some(ts) = other.max_payload_watermark_ms {
             self.max_payload_watermark_ms = Some(
                 self.max_payload_watermark_ms
@@ -20965,6 +21305,20 @@ impl WatchIngestBatchOutcome {
             );
         }
     }
+}
+
+/// How a watch ingest call should treat a single-conversation OOM (#298).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchOomIngestMode {
+    /// Normal batch ingest: the typed-OOM test injection may fire, and a
+    /// single-conversation OOM goes through the solo isolate-retry plus the
+    /// pressure/size gate before any quarantine decision.
+    Standard,
+    /// Solo isolate-retry re-entry: test injection is disabled and a
+    /// single-conversation OOM propagates as `Err` so the Standard-mode
+    /// caller's gate — not this re-entry — decides between deferring and
+    /// quarantining (and its logs stay truthful about what happened).
+    SoloIsolatedRetry,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -20985,12 +21339,7 @@ fn ingest_watch_batch_with_oom_split(
         progress,
         defer_checkpoints,
         capture_semantic_delta,
-        // Top-level batch ingest: the typed-OOM test injection is allowed to
-        // fire so batch-path tests exercise the downcast classification. The
-        // solo isolate-retry (#298) re-enters with this set to `false` so that
-        // a conversation which "fails in batch but succeeds solo" is modeled
-        // faithfully and is NOT quarantined.
-        true,
+        WatchOomIngestMode::Standard,
     )
 }
 
@@ -21003,34 +21352,36 @@ fn ingest_watch_batch_with_oom_split_inner(
     progress: &Option<Arc<IndexingProgress>>,
     defer_checkpoints: bool,
     capture_semantic_delta: bool,
-    allow_test_oom_injection: bool,
+    mode: WatchOomIngestMode,
 ) -> Result<WatchIngestBatchOutcome> {
     debug_assert!(!convs.is_empty());
 
-    let batch_result = if allow_test_oom_injection && should_inject_watch_ingest_test_oom(convs) {
-        // Use the typed `FrankenError::OutOfMemory` variant so the OOM detector
-        // exercises the downcast path that real frankensqlite OOMs hit, instead
-        // of relying on the plain-string fallback.
-        Err(anyhow::Error::new(frankensqlite::FrankenError::OutOfMemory))
-    } else {
-        let mut semantic_delta = WatchSemanticDelta::default();
-        ingest_batch_with_semantic_delta(
-            storage,
-            Some(t_index),
-            data_dir,
-            convs,
-            progress,
-            LexicalPopulationStrategy::IncrementalInline,
-            defer_checkpoints,
-            capture_semantic_delta.then_some(&mut semantic_delta),
-        )
-    };
+    let batch_result =
+        if mode == WatchOomIngestMode::Standard && should_inject_watch_ingest_test_oom(convs) {
+            // Use the typed `FrankenError::OutOfMemory` variant so the OOM detector
+            // exercises the downcast path that real frankensqlite OOMs hit, instead
+            // of relying on the plain-string fallback.
+            Err(anyhow::Error::new(frankensqlite::FrankenError::OutOfMemory))
+        } else {
+            let mut semantic_delta = WatchSemanticDelta::default();
+            ingest_batch_with_semantic_delta(
+                storage,
+                Some(t_index),
+                data_dir,
+                convs,
+                progress,
+                LexicalPopulationStrategy::IncrementalInline,
+                defer_checkpoints,
+                capture_semantic_delta.then_some(&mut semantic_delta),
+            )
+        };
 
     match batch_result {
         Ok(batch_outcome) => Ok(WatchIngestBatchOutcome {
             batch_outcome,
             processed_conversations: convs.len(),
             quarantined_conversations: 0,
+            deferred_conversations: 0,
             max_payload_watermark_ms: conversations_payload_watermark_ms(convs),
         }),
         Err(error) if error_is_out_of_memory(&error) && convs.len() > 1 => {
@@ -21050,7 +21401,7 @@ fn ingest_watch_batch_with_oom_split_inner(
                 progress,
                 defer_checkpoints,
                 capture_semantic_delta,
-                allow_test_oom_injection,
+                mode,
             )?;
             let right = ingest_watch_batch_with_oom_split_inner(
                 storage,
@@ -21060,12 +21411,20 @@ fn ingest_watch_batch_with_oom_split_inner(
                 progress,
                 defer_checkpoints,
                 capture_semantic_delta,
-                allow_test_oom_injection,
+                mode,
             )?;
             merged.merge(right);
             Ok(merged)
         }
         Err(error) if error_is_out_of_memory(&error) => {
+            // Solo isolate-retry re-entry: propagate the OOM so the
+            // Standard-mode caller's pressure/size gate decides between
+            // deferring and quarantining. Quarantining here would bypass that
+            // gate and make the caller's "ingested cleanly solo" log lie.
+            if mode == WatchOomIngestMode::SoloIsolatedRetry {
+                return Err(error);
+            }
+
             let conv = &convs[0];
 
             // #298: a typed `FrankenError::OutOfMemory` (NoMem) on the batch
@@ -21076,111 +21435,100 @@ fn ingest_watch_batch_with_oom_split_inner(
             // confirmed succeeds) and only quarantine on a genuine, repeated
             // failure under real memory pressure or for a genuinely large
             // conversation.
-            if allow_test_oom_injection {
-                let indexed_text_bytes = conversation_indexed_text_bytes(conv);
-                let small_conversation = indexed_text_bytes <= watch_oom_small_conversation_bytes();
-                let real_pressure = watch_oom_under_real_memory_pressure();
+            let indexed_text_bytes = conversation_indexed_text_bytes(conv);
+            let small_conversation = indexed_text_bytes <= watch_oom_small_conversation_bytes();
+            let real_pressure = watch_oom_under_real_memory_pressure();
 
-                // Isolate-retry the single conversation solo. We disable the
-                // typed-OOM test injection on this retry so a "fails in batch,
-                // succeeds solo" conversation is reproduced faithfully. Tests
-                // that need to model a *genuinely* poisoned conversation (solo
-                // ingest also OOMs) set `CASS_TEST_WATCH_SOLO_RETRY_OOM=1`.
-                let solo_retry = if should_force_watch_solo_retry_oom() {
-                    Err(anyhow::Error::new(frankensqlite::FrankenError::OutOfMemory))
-                } else {
-                    ingest_watch_batch_with_oom_split_inner(
-                        storage,
-                        t_index,
-                        data_dir,
-                        std::slice::from_ref(conv),
-                        progress,
-                        defer_checkpoints,
-                        capture_semantic_delta,
-                        false,
-                    )
-                };
+            // Isolate-retry the single conversation solo. The retry runs in
+            // `SoloIsolatedRetry` mode so the typed-OOM test injection cannot
+            // re-fire and a repeated OOM comes back as `Err` for the gate
+            // below. Tests that need to model a *genuinely* poisoned
+            // conversation (solo ingest also OOMs) set
+            // `CASS_TEST_WATCH_SOLO_RETRY_OOM=1`.
+            let solo_retry = if should_force_watch_solo_retry_oom() {
+                Err(anyhow::Error::new(frankensqlite::FrankenError::OutOfMemory))
+            } else {
+                ingest_watch_batch_with_oom_split_inner(
+                    storage,
+                    t_index,
+                    data_dir,
+                    std::slice::from_ref(conv),
+                    progress,
+                    defer_checkpoints,
+                    capture_semantic_delta,
+                    WatchOomIngestMode::SoloIsolatedRetry,
+                )
+            };
 
-                match solo_retry {
-                    Ok(outcome) => {
-                        // Solo ingest succeeded — the batch-path NoMem was a
-                        // bounded-guard false positive. Do not quarantine.
-                        tracing::info!(
+            match solo_retry {
+                Ok(outcome) => {
+                    // Solo ingest succeeded — the batch-path NoMem was a
+                    // bounded-guard false positive. Do not quarantine.
+                    tracing::info!(
+                        agent = %conv.agent_slug,
+                        external_id = conv.external_id.as_deref().unwrap_or(""),
+                        source_path = %conv.source_path.display(),
+                        indexed_text_bytes,
+                        "watch conversation hit a bounded-allocation NoMem in batch but ingested cleanly solo; not quarantining (#298)"
+                    );
+                    Ok(outcome)
+                }
+                Err(solo_error) if !error_is_out_of_memory(&solo_error) => {
+                    // The solo retry surfaced a *different* (non-OOM) error
+                    // — propagate it rather than mislabel it as OOM.
+                    Err(solo_error)
+                }
+                Err(solo_error) => {
+                    // Solo retry still hit OOM. Only quarantine if this is
+                    // real memory pressure or a genuinely large
+                    // conversation; otherwise keep it eligible for a later
+                    // retry instead of poisoning a small, replayable
+                    // conversation on a transient bounded-guard hit.
+                    let should_quarantine = match real_pressure {
+                        // Real host pressure: quarantine is justified.
+                        Some(true) => true,
+                        // Ample memory reported: only quarantine large
+                        // conversations; small ones stay eligible.
+                        Some(false) => !small_conversation,
+                        // Pressure unknowable (e.g. macOS): fall back to the
+                        // size gate — never quarantine a small conversation
+                        // on a typed NoMem we cannot attribute to real
+                        // pressure.
+                        None => !small_conversation,
+                    };
+                    if !should_quarantine {
+                        tracing::warn!(
                             agent = %conv.agent_slug,
                             external_id = conv.external_id.as_deref().unwrap_or(""),
                             source_path = %conv.source_path.display(),
                             indexed_text_bytes,
-                            "watch conversation hit a bounded-allocation NoMem in batch but ingested cleanly solo; not quarantining (#298)"
+                            real_memory_pressure = ?real_pressure,
+                            error = %solo_error,
+                            "watch conversation hit repeated bounded-allocation NoMem with no real memory pressure; deferring (not quarantining) for later retry (#298)"
                         );
-                        return Ok(outcome);
-                    }
-                    Err(solo_error) if !error_is_out_of_memory(&solo_error) => {
-                        // The solo retry surfaced a *different* (non-OOM) error
-                        // — propagate it rather than mislabel it as OOM.
-                        return Err(solo_error);
-                    }
-                    Err(solo_error) => {
-                        // Solo retry still hit OOM. Only quarantine if this is
-                        // real memory pressure or a genuinely large
-                        // conversation; otherwise keep it eligible for a later
-                        // retry instead of poisoning a small, replayable
-                        // conversation on a transient bounded-guard hit.
-                        let should_quarantine = match real_pressure {
-                            // Real host pressure: quarantine is justified.
-                            Some(true) => true,
-                            // Ample memory reported: only quarantine large
-                            // conversations; small ones stay eligible.
-                            Some(false) => !small_conversation,
-                            // Pressure unknowable (e.g. macOS): fall back to the
-                            // size gate — never quarantine a small conversation
-                            // on a typed NoMem we cannot attribute to real
-                            // pressure.
-                            None => !small_conversation,
-                        };
-                        if !should_quarantine {
-                            tracing::warn!(
-                                agent = %conv.agent_slug,
-                                external_id = conv.external_id.as_deref().unwrap_or(""),
-                                source_path = %conv.source_path.display(),
-                                indexed_text_bytes,
-                                real_memory_pressure = ?real_pressure,
-                                error = %solo_error,
-                                "watch conversation hit repeated bounded-allocation NoMem with no real memory pressure; deferring (not quarantining) for later retry (#298)"
-                            );
-                            if let Some(progress) = progress {
-                                progress.current.fetch_add(1, Ordering::Relaxed);
-                            }
-                            return Ok(WatchIngestBatchOutcome {
-                                batch_outcome: persist::PersistBatchOutcome::default(),
-                                processed_conversations: 1,
-                                quarantined_conversations: 0,
-                                max_payload_watermark_ms: None,
-                            });
+                        if let Some(progress) = progress {
+                            progress.current.fetch_add(1, Ordering::Relaxed);
                         }
-                        // Fall through to quarantine with the solo error so the
-                        // record reflects the genuine repeated failure.
-                        return quarantine_single_watch_conversation(
-                            data_dir,
-                            conv,
-                            &solo_error,
-                            progress,
-                            indexed_text_bytes,
-                            real_pressure,
-                        );
+                        return Ok(WatchIngestBatchOutcome {
+                            batch_outcome: persist::PersistBatchOutcome::default(),
+                            processed_conversations: 1,
+                            quarantined_conversations: 0,
+                            deferred_conversations: 1,
+                            max_payload_watermark_ms: None,
+                        });
                     }
+                    // Quarantine with the solo error so the record reflects
+                    // the genuine repeated failure.
+                    quarantine_single_watch_conversation(
+                        data_dir,
+                        conv,
+                        &solo_error,
+                        progress,
+                        indexed_text_bytes,
+                        real_pressure,
+                    )
                 }
             }
-
-            // Test-injection disabled (solo isolate-retry re-entry) or pressure
-            // path: record and quarantine the single conversation directly.
-            quarantine_single_watch_conversation(
-                data_dir,
-                conv,
-                &error,
-                progress,
-                conversation_indexed_text_bytes(conv),
-                watch_oom_under_real_memory_pressure(),
-            )
         }
         Err(error) => Err(error),
     }
@@ -21213,6 +21561,7 @@ fn quarantine_single_watch_conversation(
         batch_outcome: persist::PersistBatchOutcome::default(),
         processed_conversations: 1,
         quarantined_conversations: 1,
+        deferred_conversations: 0,
         max_payload_watermark_ms: None,
     })
 }
@@ -21243,6 +21592,35 @@ fn conversation_payload_watermark_ms(conv: &NormalizedConversation) -> Option<i6
                 .filter_map(|message| message.created_at),
         )
         .max()
+}
+
+/// Publish a kind's buffered watch watermark once its LAST trigger has run,
+/// unless any of its roots recorded a no-ledger holdback (OOM deferral,
+/// active-session skip, swallowed scan failure) — those conversations have no
+/// quarantine ledger, so the shared watermark is their only retry protection.
+fn publish_watch_watermark_if_kind_complete(
+    data_dir: &Path,
+    state: &Mutex<HashMap<ConnectorKind, i64>>,
+    kind: ConnectorKind,
+    remaining_triggers_by_kind: &HashMap<ConnectorKind, usize>,
+    pending_watch_watermarks: &mut HashMap<ConnectorKind, i64>,
+    watch_preserve_by_kind: &HashMap<ConnectorKind, bool>,
+) -> Result<()> {
+    if remaining_triggers_by_kind.get(&kind).copied().unwrap_or(0) > 0 {
+        return Ok(());
+    }
+    let Some(ts_val) = pending_watch_watermarks.remove(&kind) else {
+        return Ok(());
+    };
+    if watch_preserve_by_kind.get(&kind).copied().unwrap_or(false) {
+        tracing::info!(
+            ?kind,
+            "preserving watch watermark across roots so deferred/skipped/failed sources can be retried"
+        );
+    } else {
+        save_watch_state_watermark(data_dir, state, kind, ts_val)?;
+    }
+    Ok(())
 }
 
 fn save_watch_state_watermark(
@@ -22304,6 +22682,16 @@ fn ingest_quarantine_circuit_limit() -> usize {
 
 #[cfg(test)]
 fn should_inject_watch_ingest_test_oom(convs: &[NormalizedConversation]) -> bool {
+    // Selective variant: OOM only the chunk containing this external id, so
+    // multi-chunk ordering tests can defer one conversation while letting
+    // later chunks succeed.
+    if let Ok(target) = dotenvy::var("CASS_TEST_WATCH_INGEST_OOM_EXTERNAL_ID")
+        && !target.is_empty()
+    {
+        return convs
+            .iter()
+            .any(|conv| conv.external_id.as_deref() == Some(target.as_str()));
+    }
     dotenvy::var("CASS_TEST_WATCH_INGEST_OOM_MIN_CONVS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -22747,13 +23135,44 @@ fn reindex_paths_with_semantic_delta(
         opts.watch && opts.watch_once_paths.as_ref().is_none_or(Vec::is_empty),
     );
 
+    // Watch watermarks are shared per ConnectorKind while triggers iterate per
+    // (kind, root): publishing inside the loop would let one root's success
+    // advance the shared watermark past ANOTHER root's conversations that were
+    // held back WITHOUT a durable ledger — OOM deferrals, active-session
+    // skips, or a swallowed scan failure (quarantine is the deliberate
+    // exception: it has its own ledger + retry mechanism). Buffer candidate
+    // advances per kind and publish as soon as that kind's LAST root finishes
+    // (per-kind, not end-of-run, so one deterministically bad root of another
+    // kind cannot starve healthy kinds into unbounded rescans). A kind with
+    // any no-ledger holdback keeps its watermark so the holdback is rescanned
+    // next cycle. Trade-off: an error/crash mid-run replays the affected
+    // kinds' backlog instead of resuming mid-run — replaying is safe,
+    // silently skipping is not.
+    let mut pending_watch_watermarks: HashMap<ConnectorKind, i64> = HashMap::new();
+    let mut watch_preserve_by_kind: HashMap<ConnectorKind, bool> = HashMap::new();
+    let mut remaining_triggers_by_kind: HashMap<ConnectorKind, usize> = HashMap::new();
+    for (kind, _, _, _) in &triggers {
+        *remaining_triggers_by_kind.entry(*kind).or_default() += 1;
+    }
+
     for (kind, root, min_ts, max_ts) in triggers {
+        if let Some(remaining) = remaining_triggers_by_kind.get_mut(&kind) {
+            *remaining = remaining.saturating_sub(1);
+        }
         let conn = kind.create_connector();
         let detect = conn.detect();
         if !detect.detected && root.origin.source_id == "local" && !root.path.exists() {
             // For local roots, if detection fails and the root is gone, skip.
             // For remote roots, detection might fail but we should still try scanning
             // if it's a brute-force attempt.
+            publish_watch_watermark_if_kind_complete(
+                &opts.data_dir,
+                state,
+                kind,
+                &remaining_triggers_by_kind,
+                &mut pending_watch_watermarks,
+                &watch_preserve_by_kind,
+            )?;
             continue;
         }
 
@@ -22789,6 +23208,14 @@ fn reindex_paths_with_semantic_delta(
                     scan_root = %root.path.display(),
                     "skipping unchanged explicit watch-once root already covered by last_indexed_at"
                 );
+                publish_watch_watermark_if_kind_complete(
+                    &opts.data_dir,
+                    state,
+                    kind,
+                    &remaining_triggers_by_kind,
+                    &mut pending_watch_watermarks,
+                    &watch_preserve_by_kind,
+                )?;
                 continue;
             }
         }
@@ -22822,6 +23249,17 @@ fn reindex_paths_with_semantic_delta(
                 scan_root = %root.path.display(),
                 "skipping active explicit watch source without advancing watermarks"
             );
+            // An active file-root has no ledger either: poison the kind so a
+            // sibling root's pending watermark cannot publish past this file.
+            watch_preserve_by_kind.insert(kind, true);
+            publish_watch_watermark_if_kind_complete(
+                &opts.data_dir,
+                state,
+                kind,
+                &remaining_triggers_by_kind,
+                &mut pending_watch_watermarks,
+                &watch_preserve_by_kind,
+            )?;
             continue;
         }
 
@@ -22844,6 +23282,7 @@ fn reindex_paths_with_semantic_delta(
 
         // SCAN PHASE: IO-heavy, no locks held
         let scan_start = Instant::now();
+        let mut scan_failed = false;
         let mut convs = match conn.scan(&ctx) {
             Ok(c) => c,
             Err(e) => {
@@ -22853,6 +23292,10 @@ fn reindex_paths_with_semantic_delta(
                     root.path.display(),
                     e
                 );
+                // A failed scan yields an empty batch, indistinguishable from
+                // "nothing new" — flag it so this kind's shared watermark is
+                // not advanced past whatever the scan failed to see.
+                scan_failed = true;
                 Vec::new()
             }
         };
@@ -22876,6 +23319,11 @@ fn reindex_paths_with_semantic_delta(
             );
         }
         let preserve_this_watch_watermark = preserve_watch_watermark || active_sources_skipped > 0;
+        // No-ledger holdbacks poison the whole kind's watermark publication
+        // (deferrals are added at the end of the iteration when known).
+        if !explicit_watch_once && (scan_failed || active_sources_skipped > 0) {
+            watch_preserve_by_kind.insert(kind, true);
+        }
 
         // Provenance injection and path rewriting
         for conv in &mut convs {
@@ -22915,6 +23363,14 @@ fn reindex_paths_with_semantic_delta(
         // `last_indexed_at`, and must not trigger downstream optimize/merge.
         // See issue #194.
         if conv_count == 0 {
+            publish_watch_watermark_if_kind_complete(
+                &opts.data_dir,
+                state,
+                kind,
+                &remaining_triggers_by_kind,
+                &mut pending_watch_watermarks,
+                &watch_preserve_by_kind,
+            )?;
             continue;
         }
 
@@ -22925,6 +23381,7 @@ fn reindex_paths_with_semantic_delta(
         let mut inserted_messages = 0usize;
         let mut processed_conversations = 0usize;
         let mut quarantined_conversations = 0usize;
+        let mut deferred_conversations = 0usize;
         {
             let storage = storage
                 .lock()
@@ -22966,6 +23423,8 @@ fn reindex_paths_with_semantic_delta(
                     processed_conversations.saturating_add(chunk_outcome.processed_conversations);
                 quarantined_conversations = quarantined_conversations
                     .saturating_add(chunk_outcome.quarantined_conversations);
+                deferred_conversations =
+                    deferred_conversations.saturating_add(chunk_outcome.deferred_conversations);
                 if let Some(delta) = semantic_delta.as_deref_mut() {
                     delta.extend_from_batch(
                         chunk_outcome.batch_outcome.semantic_delta_inputs,
@@ -23004,17 +23463,27 @@ fn reindex_paths_with_semantic_delta(
                     )?;
                 }
 
+                // Deferred check is CUMULATIVE, not per-chunk: once any earlier
+                // chunk deferred a conversation, a later successful chunk must
+                // not advance the partial watermark past it — the watermark is
+                // a deferred conversation's only retry protection (unlike
+                // quarantine, which has its own ledger and is designed to be
+                // skipped over so watch mode does not wedge on a poison file).
                 if !explicit_watch_once
                     && !preserve_this_watch_watermark
                     && chunk_outcome.quarantined_conversations == 0
+                    && deferred_conversations == 0
                     && let Some(ts_val) = chunk_outcome.max_payload_watermark_ms
                 {
-                    save_watch_state_watermark(&opts.data_dir, state, kind, ts_val)?;
-                } else if chunk_outcome.quarantined_conversations > 0 {
+                    let entry = pending_watch_watermarks.entry(kind).or_insert(ts_val);
+                    *entry = (*entry).max(ts_val);
+                } else if chunk_outcome.quarantined_conversations > 0 || deferred_conversations > 0
+                {
                     tracing::info!(
                         ?kind,
                         quarantined_conversations = chunk_outcome.quarantined_conversations,
-                        "preserving partial watch watermark so quarantined source can be retried"
+                        deferred_conversations,
+                        "preserving partial watch watermark so quarantined/deferred source can be retried"
                     );
                 } else if preserve_this_watch_watermark {
                     tracing::debug!(
@@ -23075,6 +23544,7 @@ fn reindex_paths_with_semantic_delta(
             && conv_count > 0
             && !preserve_this_watch_watermark
             && quarantined_conversations == 0
+            && deferred_conversations == 0
             && let Some(ts_val) = max_ts
         {
             // Once every chunk for this trigger has persisted without poison
@@ -23082,12 +23552,16 @@ fn reindex_paths_with_semantic_delta(
             // Partial per-chunk updates above deliberately use payload
             // timestamps so an unexpected later failure cannot hide
             // unprocessed conversations that share the same source file.
-            save_watch_state_watermark(&opts.data_dir, state, kind, ts_val)?;
-        } else if !explicit_watch_once && quarantined_conversations > 0 {
+            let entry = pending_watch_watermarks.entry(kind).or_insert(ts_val);
+            *entry = (*entry).max(ts_val);
+        } else if !explicit_watch_once
+            && (quarantined_conversations > 0 || deferred_conversations > 0)
+        {
             tracing::info!(
                 ?kind,
                 quarantined_conversations,
-                "preserving final watch watermark so quarantined source can be retried"
+                deferred_conversations,
+                "preserving final watch watermark so quarantined/deferred source can be retried"
             );
         } else if !explicit_watch_once && conv_count > 0 && preserve_this_watch_watermark {
             tracing::info!(
@@ -23095,6 +23569,32 @@ fn reindex_paths_with_semantic_delta(
                 active_sources_skipped,
                 "preserving final watch watermark because scan exclusions or active source skips are active"
             );
+        }
+
+        if !explicit_watch_once && deferred_conversations > 0 {
+            watch_preserve_by_kind.insert(kind, true);
+        }
+        publish_watch_watermark_if_kind_complete(
+            &opts.data_dir,
+            state,
+            kind,
+            &remaining_triggers_by_kind,
+            &mut pending_watch_watermarks,
+            &watch_preserve_by_kind,
+        )?;
+    }
+
+    // Fallback: every trigger exit path above publishes when its kind
+    // completes, so this should be empty; drain defensively with the same
+    // preserve gate in case a future exit path forgets to.
+    for (kind, ts_val) in pending_watch_watermarks {
+        if watch_preserve_by_kind.get(&kind).copied().unwrap_or(false) {
+            tracing::info!(
+                ?kind,
+                "preserving watch watermark across roots so deferred/skipped/failed sources can be retried"
+            );
+        } else {
+            save_watch_state_watermark(&opts.data_dir, state, kind, ts_val)?;
         }
     }
 
@@ -24935,12 +25435,30 @@ pub mod persist {
             .unwrap_or(60_000)
     }
 
+    /// WAL autocheckpoint threshold (pages) for the index writer.
+    ///
+    /// GH#320: bulk-import mode used to disable autocheckpoints entirely
+    /// (`0`), deferring the whole checkpoint to post-publish. That let the
+    /// WAL grow with the corpus (1 GB+ on large fleets) and — because the
+    /// frankensqlite pager keeps WAL-resident state in memory — drove the
+    /// ingest-phase physical footprint to roughly 3.5-4x the WAL size
+    /// (13-14 GB peaks on 16 GB hosts). A bounded-but-large threshold keeps
+    /// bulk import's amortized-checkpoint intent (one checkpoint per
+    /// ~256 MB of WAL at the default 4 KiB page size) while capping the
+    /// WAL-proportional memory. Operators can restore the old unbounded
+    /// behavior with `CASS_INDEX_WRITER_WAL_AUTOCHECKPOINT_PAGES=0`.
+    pub(super) const BULK_IMPORT_WAL_AUTOCHECKPOINT_PAGES: i64 = 65_536;
+
     fn index_writer_wal_autocheckpoint_pages(defer_checkpoints: bool) -> i64 {
         dotenvy::var("CASS_INDEX_WRITER_WAL_AUTOCHECKPOINT_PAGES")
             .ok()
             .and_then(|v| v.parse::<i64>().ok())
             .filter(|v| *v >= 0)
-            .unwrap_or(if defer_checkpoints { 0 } else { 1000 })
+            .unwrap_or(if defer_checkpoints {
+                BULK_IMPORT_WAL_AUTOCHECKPOINT_PAGES
+            } else {
+                1000
+            })
     }
 
     fn defer_lexical_updates_enabled() -> bool {
@@ -24976,6 +25494,89 @@ pub mod persist {
             );
         } else {
             storage.mark_index_writer_busy_timeout_ms(busy_timeout_ms);
+        }
+    }
+
+    /// GH#320: WAL-size threshold (bytes) above which bulk ingest issues a
+    /// passive checkpoint between batches. `0` disables the bound and
+    /// restores the fully-deferred pre-#320 behavior.
+    ///
+    /// Rationale: bulk-import mode defers checkpoints so the hot insert loop
+    /// never stalls on backfill I/O, but a corpus-sized WAL (1-2 GB+ on
+    /// large fleets) drags a proportional slice of pager state into memory
+    /// and makes the single post-publish TRUNCATE checkpoint — the #319/#321
+    /// wedge window — enormous. A passive checkpoint at a batch boundary
+    /// never blocks on readers or writers (it backfills what it safely can
+    /// and returns), so this bounds both costs while keeping checkpoint I/O
+    /// amortized to once per ~half-GB of WAL.
+    pub(super) const BULK_INGEST_WAL_CHECKPOINT_DEFAULT_BYTES: u64 = 512 * 1024 * 1024;
+
+    fn bulk_ingest_wal_checkpoint_threshold_bytes() -> u64 {
+        dotenvy::var("CASS_INDEX_INGEST_WAL_CHECKPOINT_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(BULK_INGEST_WAL_CHECKPOINT_DEFAULT_BYTES)
+    }
+
+    /// Issue a best-effort `PRAGMA wal_checkpoint(PASSIVE)` on the primary
+    /// storage connection when the bulk-ingest WAL has outgrown the
+    /// configured threshold. Only active in deferred-checkpoint (non-watch)
+    /// mode; watch mode already runs with a small autocheckpoint. Failures
+    /// are logged and swallowed: a missed checkpoint only means the WAL
+    /// stays large until the next boundary or the finalize TRUNCATE.
+    pub(super) fn maybe_checkpoint_bulk_ingest_wal(
+        storage: &FrankenStorage,
+        defer_checkpoints: bool,
+    ) {
+        if !defer_checkpoints {
+            return;
+        }
+        let threshold = bulk_ingest_wal_checkpoint_threshold_bytes();
+        if threshold == 0 {
+            return;
+        }
+        let Ok(db_path) = storage.database_path() else {
+            return;
+        };
+        let mut wal_path = db_path.clone().into_os_string();
+        wal_path.push("-wal");
+        let wal_bytes = match std::fs::metadata(std::path::Path::new(&wal_path)) {
+            Ok(metadata) => metadata.len(),
+            Err(_) => return,
+        };
+        if wal_bytes < threshold {
+            return;
+        }
+        let started = std::time::Instant::now();
+        match storage.raw().query("PRAGMA wal_checkpoint(PASSIVE);") {
+            Ok(rows) => {
+                let status = rows.first().map(|row| {
+                    (
+                        row.get_typed::<i64>(0).unwrap_or(-1),
+                        row.get_typed::<i64>(1).unwrap_or(-1),
+                        row.get_typed::<i64>(2).unwrap_or(-1),
+                    )
+                });
+                let (busy, log_frames, checkpointed_frames) = status.unwrap_or((-1, -1, -1));
+                tracing::info!(
+                    db_path = %db_path.display(),
+                    wal_bytes,
+                    threshold_bytes = threshold,
+                    busy,
+                    log_frames,
+                    checkpointed_frames,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "bulk ingest passive WAL checkpoint (#320 memory/WAL bound)"
+                );
+            }
+            Err(err) => {
+                tracing::debug!(
+                    db_path = %db_path.display(),
+                    wal_bytes,
+                    error = %err,
+                    "bulk ingest passive WAL checkpoint failed; will retry at a later batch boundary"
+                );
+            }
         }
     }
 
@@ -26234,7 +26835,13 @@ pub mod persist {
         #[serial]
         fn wal_autocheckpoint_defaults_follow_bulk_import_mode() {
             let _guard = set_env("CASS_INDEX_WRITER_WAL_AUTOCHECKPOINT_PAGES", "-1");
-            assert_eq!(index_writer_wal_autocheckpoint_pages(true), 0);
+            // GH#320: bulk import is bounded (not 0/unbounded) so the WAL —
+            // and the pager memory that scales with it — cannot grow with
+            // the corpus during a full ingest.
+            assert_eq!(
+                index_writer_wal_autocheckpoint_pages(true),
+                BULK_IMPORT_WAL_AUTOCHECKPOINT_PAGES
+            );
             assert_eq!(index_writer_wal_autocheckpoint_pages(false), 1000);
         }
 
@@ -26455,8 +27062,14 @@ pub mod persist {
             apply_index_writer_checkpoint_policy(&storage, true);
             let rows = storage.raw().query("PRAGMA wal_autocheckpoint;").unwrap();
             assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(0));
-            assert_eq!(storage.index_writer_checkpoint_pages(), Some(0));
+            assert_eq!(
+                rows[0].get(0).unwrap(),
+                &SqliteValue::Integer(BULK_IMPORT_WAL_AUTOCHECKPOINT_PAGES)
+            );
+            assert_eq!(
+                storage.index_writer_checkpoint_pages(),
+                Some(BULK_IMPORT_WAL_AUTOCHECKPOINT_PAGES)
+            );
 
             apply_index_writer_checkpoint_policy(&storage, false);
             let rows = storage.raw().query("PRAGMA wal_autocheckpoint;").unwrap();
@@ -31224,8 +31837,7 @@ mod tests {
     /// `"tool"` role string) so tool output is correctly classified during
     /// `--force-rebuild`.
     #[test]
-    fn lexical_rebuild_grouped_projection_preserves_six_role_and_classifies_tool_result_as_tool()
-    {
+    fn lexical_rebuild_grouped_projection_preserves_six_role_and_classifies_tool_result_as_tool() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("six-role-rebuild.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
@@ -31329,7 +31941,11 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(grouped_pages.len(), 1, "expected exactly one conversation page");
+        assert_eq!(
+            grouped_pages.len(),
+            1,
+            "expected exactly one conversation page"
+        );
         let grouped_messages = grouped_pages.into_iter().next().unwrap();
         assert_eq!(grouped_messages.len(), 5);
 
@@ -31376,7 +31992,10 @@ mod tests {
         // legacy "agent" bucket the old `is_tool_role ? Tool : Agent`
         // mapping produced.
         let analytics = &packet.contract_projections.analytics;
-        assert_eq!(analytics.user_messages, 1, "user must not collapse to agent");
+        assert_eq!(
+            analytics.user_messages, 1,
+            "user must not collapse to agent"
+        );
         assert_eq!(analytics.assistant_messages, 1, "assistant stays assistant");
         assert_eq!(
             analytics.tool_messages, 0,
@@ -38138,6 +38757,10 @@ mod tests {
     #[serial]
     fn streaming_consumer_quarantines_single_non_watch_oom_and_dedupes_record() {
         let _oom_guard = set_env("CASS_TEST_NON_WATCH_INGEST_OOM_MIN_CONVS", "1");
+        // #298: this test models a *genuinely* poisoned conversation, so the
+        // small-conversation plausibility gate must be disabled — otherwise a
+        // tiny fixture conversation is deferred instead of quarantined.
+        let _small_gate_guard = set_env("CASS_WATCH_OOM_SMALL_CONVERSATION_BYTES", "0");
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -38205,6 +38828,322 @@ mod tests {
             assert_eq!(summary.quarantined_conversations, 1);
             assert_eq!(summary.status, "degraded");
         }
+    }
+
+    /// #298 gate (non-watch): a small conversation that hits a typed NoMem
+    /// with no real host memory pressure is deferred to the next index run —
+    /// never quarantined — because frankensqlite's bounded allocation guards
+    /// raise the same typed error without the host being out of memory.
+    #[test]
+    #[serial]
+    fn streaming_consumer_defers_small_non_watch_oom_without_quarantine() {
+        let _oom_guard = set_env("CASS_TEST_NON_WATCH_INGEST_OOM_MIN_CONVS", "1");
+        // Pin the pressure probe to "never real pressure" so the size gate is
+        // what decides, deterministically, on any host.
+        let _reserve_guard = set_env("CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES", "0");
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let db_path = data_dir.join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
+        let progress = Arc::new(IndexingProgress::default());
+        let conv = norm_conv(Some("defer-single"), vec![norm_msg(0, 1_700_000_000_000)]);
+
+        let (tx, rx) = bounded(STREAMING_CHANNEL_SIZE);
+        send_conversation_batches(&tx, "codex", vec![conv], true);
+        send_done(&tx, "codex", true);
+        drop(tx);
+
+        let (_discovered, outcome) = run_streaming_consumer(
+            rx,
+            1,
+            &storage,
+            &data_dir,
+            Some(&mut index),
+            Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
+            &Some(progress.clone()),
+            LexicalPopulationStrategy::IncrementalInline,
+            Some(FrankenStorage::now_millis()),
+            None,
+        )
+        .expect("small-conversation NoMem without real pressure should defer, not fail");
+
+        assert_eq!(outcome.quarantined_conversations, 0);
+        assert!(outcome.lexical_update_deferred);
+        assert_eq!(
+            outcome.deferred_conversations, 1,
+            "the deferral must be visible in the outcome so scan watermarks are preserved"
+        );
+        assert!(
+            !data_dir
+                .join("quarantine/index_ingest_poison.jsonl")
+                .exists(),
+            "a small conversation with no real memory pressure must be deferred, not quarantined (#298)"
+        );
+    }
+
+    /// The pre-run scan-watermark snapshot/restore pair must revert BOTH the
+    /// global `last_scan_ts` and per-connector rows verbatim, including
+    /// deleting rows that only appeared after the snapshot — otherwise a run
+    /// that deferred a conversation still leaves some watermark advanced past
+    /// it (#298 non-watch silent-skip).
+    #[test]
+    #[serial]
+    fn scan_watermark_snapshot_restore_reverts_global_and_connector_rows() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        storage.run_migrations().unwrap();
+
+        storage.set_last_scan_ts(1_000).unwrap();
+        storage.set_connector_last_scan_ts("codex", 1_100).unwrap();
+        let snapshot = storage.snapshot_scan_watermarks().unwrap();
+
+        // Simulate what a run does before deferral is known: advance both,
+        // and add a connector row that did not exist at snapshot time.
+        storage.set_last_scan_ts(2_000).unwrap();
+        storage.set_connector_last_scan_ts("codex", 2_100).unwrap();
+        storage.set_connector_last_scan_ts("claude", 2_200).unwrap();
+
+        storage.restore_scan_watermarks(&snapshot).unwrap();
+
+        assert_eq!(storage.get_last_scan_ts().unwrap(), Some(1_000));
+        assert_eq!(
+            storage.get_connector_last_scan_ts("codex").unwrap(),
+            Some(1_100)
+        );
+        assert_eq!(
+            storage.get_connector_last_scan_ts("claude").unwrap(),
+            None,
+            "rows created after the snapshot must be removed on restore"
+        );
+    }
+
+    /// Top-level run_index closure (codex R8): a #298 deferral must restore
+    /// the scan watermarks even when a LATER phase (here: semantic embedder
+    /// setup) errors out — the restore runs right after the scan, before the
+    /// lexical/semantic phases' `?` early returns can skip it.
+    #[test]
+    #[serial]
+    fn deferred_non_watch_scan_restores_watermarks_before_later_semantic_error() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let codex_home = home.join(".codex");
+        let session = codex_home.join("sessions/2026/07/17/rollout-deferred-watermark.jsonl");
+        std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+        std::fs::write(
+            &session,
+            r#"{"timestamp":"2026-07-17T01:00:00.000Z","type":"session_meta","payload":{"id":"deferred-watermark","cwd":"/tmp/project"}}
+{"timestamp":"2026-07-17T01:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"defer this small conversation"}]}}
+"#,
+        )
+        .unwrap();
+
+        let _home_guard = set_env("HOME", home.to_str().unwrap());
+        let _codex_guard = set_env("CODEX_HOME", codex_home.to_str().unwrap());
+        let _xdg_data_guard = set_env(
+            "XDG_DATA_HOME",
+            tmp.path().join("xdg-data").to_str().unwrap(),
+        );
+        let _xdg_config_guard = set_env(
+            "XDG_CONFIG_HOME",
+            tmp.path().join("xdg-config").to_str().unwrap(),
+        );
+        let _ignore_sources_guard = set_env("CASS_IGNORE_SOURCES_CONFIG", "1");
+        let _streaming_guard = set_env("CASS_STREAMING_INDEX", "1");
+        let _oom_guard = set_env("CASS_TEST_NON_WATCH_INGEST_OOM_MIN_CONVS", "1");
+        let _reserve_guard = set_env("CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES", "0");
+
+        let data_dir = tmp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("db.sqlite");
+        {
+            let storage = FrankenStorage::open(&db_path).unwrap();
+            storage.set_last_scan_ts(1_000).unwrap();
+            storage.set_connector_last_scan_ts("codex", 1_100).unwrap();
+        }
+
+        let result = run_index(
+            super::IndexOptions {
+                full: false,
+                watch: false,
+                force_rebuild: false,
+                db_path: db_path.clone(),
+                data_dir: data_dir.clone(),
+                semantic: true,
+                build_hnsw: false,
+                embedder: "definitely-invalid".to_string(),
+                progress: None,
+                watch_once_paths: None,
+                watch_interval_secs: 30,
+            },
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "the invalid semantic embedder must fail after scan"
+        );
+
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        assert_eq!(storage.get_last_scan_ts().unwrap(), Some(1_000));
+        assert_eq!(
+            storage.get_connector_last_scan_ts("codex").unwrap(),
+            Some(1_100),
+            "a post-scan error must not strand the streaming connector watermark past a deferred conversation"
+        );
+    }
+
+    /// Guard-pinning test (codex R10 P2): with ZERO deferrals the explicit
+    /// restore never runs, so only the Drop guard can revert the watermarks
+    /// when a post-scan phase errors. Deleting the guard turns this red.
+    #[test]
+    #[serial]
+    fn early_exit_without_deferral_still_restores_scan_watermarks_via_guard() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let codex_home = home.join(".codex");
+        let session = codex_home.join("sessions/2026/07/17/rollout-guard-pin.jsonl");
+        std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+        std::fs::write(
+            &session,
+            r#"{"timestamp":"2026-07-17T01:00:00.000Z","type":"session_meta","payload":{"id":"guard-pin","cwd":"/tmp/project"}}
+{"timestamp":"2026-07-17T01:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"index me normally"}]}}
+"#,
+        )
+        .unwrap();
+
+        let _home_guard = set_env("HOME", home.to_str().unwrap());
+        let _codex_guard = set_env("CODEX_HOME", codex_home.to_str().unwrap());
+        let _xdg_data_guard = set_env(
+            "XDG_DATA_HOME",
+            tmp.path().join("xdg-data").to_str().unwrap(),
+        );
+        let _xdg_config_guard = set_env(
+            "XDG_CONFIG_HOME",
+            tmp.path().join("xdg-config").to_str().unwrap(),
+        );
+        let _ignore_sources_guard = set_env("CASS_IGNORE_SOURCES_CONFIG", "1");
+        let _streaming_guard = set_env("CASS_STREAMING_INDEX", "1");
+
+        let data_dir = tmp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("db.sqlite");
+        {
+            let storage = FrankenStorage::open(&db_path).unwrap();
+            storage.set_last_scan_ts(1_000).unwrap();
+            storage.set_connector_last_scan_ts("codex", 1_100).unwrap();
+        }
+
+        let result = run_index(
+            super::IndexOptions {
+                full: false,
+                watch: false,
+                force_rebuild: false,
+                db_path: db_path.clone(),
+                data_dir: data_dir.clone(),
+                semantic: true,
+                build_hnsw: false,
+                embedder: "definitely-invalid".to_string(),
+                progress: None,
+                watch_once_paths: None,
+                watch_interval_secs: 30,
+            },
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "the invalid semantic embedder must fail after scan"
+        );
+
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        assert_eq!(
+            storage.get_last_scan_ts().unwrap(),
+            Some(1_000),
+            "guard must restore the global watermark on a zero-deferral early exit"
+        );
+        assert_eq!(
+            storage.get_connector_last_scan_ts("codex").unwrap(),
+            Some(1_100),
+            "guard must restore streaming connector watermarks on a zero-deferral early exit"
+        );
+    }
+
+    /// Success-path twin of the test above: when the run completes normally,
+    /// a #298 deferral must still leave every scan watermark at its pre-run
+    /// value (finalization advancement is gated off and mid-run writes are
+    /// rolled back).
+    #[test]
+    #[serial]
+    fn deferred_non_watch_scan_restores_watermarks_on_successful_run() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let codex_home = home.join(".codex");
+        let session = codex_home.join("sessions/2026/07/17/rollout-deferred-success.jsonl");
+        std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+        std::fs::write(
+            &session,
+            r#"{"timestamp":"2026-07-17T01:00:00.000Z","type":"session_meta","payload":{"id":"deferred-success","cwd":"/tmp/project"}}
+{"timestamp":"2026-07-17T01:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"defer this small conversation"}]}}
+"#,
+        )
+        .unwrap();
+
+        let _home_guard = set_env("HOME", home.to_str().unwrap());
+        let _codex_guard = set_env("CODEX_HOME", codex_home.to_str().unwrap());
+        let _xdg_data_guard = set_env(
+            "XDG_DATA_HOME",
+            tmp.path().join("xdg-data").to_str().unwrap(),
+        );
+        let _xdg_config_guard = set_env(
+            "XDG_CONFIG_HOME",
+            tmp.path().join("xdg-config").to_str().unwrap(),
+        );
+        let _ignore_sources_guard = set_env("CASS_IGNORE_SOURCES_CONFIG", "1");
+        let _streaming_guard = set_env("CASS_STREAMING_INDEX", "1");
+        let _oom_guard = set_env("CASS_TEST_NON_WATCH_INGEST_OOM_MIN_CONVS", "1");
+        let _reserve_guard = set_env("CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES", "0");
+
+        let data_dir = tmp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("db.sqlite");
+        {
+            let storage = FrankenStorage::open(&db_path).unwrap();
+            storage.set_last_scan_ts(1_000).unwrap();
+            storage.set_connector_last_scan_ts("codex", 1_100).unwrap();
+        }
+
+        run_index(
+            super::IndexOptions {
+                full: false,
+                watch: false,
+                force_rebuild: false,
+                db_path: db_path.clone(),
+                data_dir: data_dir.clone(),
+                semantic: false,
+                build_hnsw: false,
+                embedder: "fastembed".to_string(),
+                progress: None,
+                watch_once_paths: None,
+                watch_interval_secs: 30,
+            },
+            None,
+        )
+        .expect("a run that defers a small conversation still completes");
+
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        assert_eq!(
+            storage.get_last_scan_ts().unwrap(),
+            Some(1_000),
+            "a successful run with a deferral must not advance the global watermark"
+        );
+        assert_eq!(
+            storage.get_connector_last_scan_ts("codex").unwrap(),
+            Some(1_100),
+            "a successful run with a deferral must not advance connector watermarks"
+        );
     }
 
     /// #290: a stable, already-triaged backlog of *same-version* irreducible
@@ -38395,6 +39334,53 @@ mod tests {
         let _ = conn.query("PRAGMA quick_check;");
         conn.close().ok();
         Ok(())
+    }
+
+    /// #321: a `wal_checkpoint(TRUNCATE)` that SQLite reports as blocked
+    /// (`busy != 0`) or that leaves frames un-backfilled did NOT truncate the
+    /// WAL, so it must never be classified as a completed checkpoint. The
+    /// canonical reproducer from the field is `busy=1, log_frames=289842,
+    /// checkpointed_frames=0` — the abort path used to log
+    /// "checkpointed canonical WAL before stall abort (#296)" success on
+    /// exactly that no-op, masking a 1.1 GB stranded WAL and a malformed DB.
+    #[test]
+    fn final_wal_checkpoint_blocked_status_is_not_completed() {
+        // The exact field reproducer: blocked by an active reader, nothing moved.
+        assert_eq!(
+            classify_final_wal_checkpoint(1, 289_842, 0),
+            FinalWalCheckpointOutcome::Blocked {
+                busy: 1,
+                log_frames: 289_842,
+                checkpointed_frames: 0,
+            },
+            "busy=1 checkpoint must classify as Blocked, never Completed"
+        );
+
+        // A clean TRUNCATE: not busy, every logged frame backfilled.
+        assert_eq!(
+            classify_final_wal_checkpoint(0, 128, 128),
+            FinalWalCheckpointOutcome::Completed,
+            "busy=0 with all frames backfilled is the only Completed case"
+        );
+
+        // Not busy, but a partial backfill still means the WAL was not fully
+        // truncated -> Blocked (do not report success).
+        assert_eq!(
+            classify_final_wal_checkpoint(0, 128, 40),
+            FinalWalCheckpointOutcome::Blocked {
+                busy: 0,
+                log_frames: 128,
+                checkpointed_frames: 40,
+            },
+            "a partial checkpoint must not be reported as completed"
+        );
+
+        // An empty WAL (nothing to do) is trivially completed.
+        assert_eq!(
+            classify_final_wal_checkpoint(0, 0, 0),
+            FinalWalCheckpointOutcome::Completed,
+            "an already-empty WAL is a completed no-op"
+        );
     }
 
     #[test]
@@ -38921,14 +39907,24 @@ mod tests {
         let mut fs_root = ScanRoot::local(PathBuf::from("/mnt/histories/test-machine"));
         fs_root.origin.source_id = "test-machine".to_string();
         ensure_since_ts_matches(
-            explicit_scan_root_since_ts(&fs_root, Path::new("/tmp/cass-data"), Some(1234), &full_scan),
+            explicit_scan_root_since_ts(
+                &fs_root,
+                Path::new("/tmp/cass-data"),
+                Some(1234),
+                &full_scan,
+            ),
             None,
             "a full_scan-marked local source must bypass the watermark (full scan)",
         )?;
         let mut other_root = ScanRoot::local(PathBuf::from("/mnt/histories/other"));
         other_root.origin.source_id = "other".to_string();
         ensure_since_ts_matches(
-            explicit_scan_root_since_ts(&other_root, Path::new("/tmp/cass-data"), Some(1234), &full_scan),
+            explicit_scan_root_since_ts(
+                &other_root,
+                Path::new("/tmp/cass-data"),
+                Some(1234),
+                &full_scan,
+            ),
             Some(1234),
             "a non-full_scan local source keeps normal incremental filtering",
         )?;
@@ -39030,8 +40026,9 @@ mod tests {
             }
         );
         assert_eq!(
-            wal_autocheckpoint, 0,
-            "startup watch ingest should defer WAL auto-checkpoints"
+            wal_autocheckpoint,
+            persist::BULK_IMPORT_WAL_AUTOCHECKPOINT_PAGES,
+            "startup watch ingest should use the bounded bulk-import WAL checkpoint cadence"
         );
     }
 
@@ -39064,7 +40061,10 @@ mod tests {
 
         let rows = storage.raw().query("PRAGMA wal_autocheckpoint;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(0));
+        assert_eq!(
+            rows[0].get(0).unwrap(),
+            &SqliteValue::Integer(persist::BULK_IMPORT_WAL_AUTOCHECKPOINT_PAGES)
+        );
 
         let second = vec![norm_conv(Some("checkpoint-b"), vec![norm_msg(0, 2_000)])];
         ingest_batch(
@@ -39105,7 +40105,10 @@ mod tests {
 
         let rows = storage.raw().query("PRAGMA wal_autocheckpoint;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(0));
+        assert_eq!(
+            rows[0].get(0).unwrap(),
+            &SqliteValue::Integer(persist::BULK_IMPORT_WAL_AUTOCHECKPOINT_PAGES)
+        );
     }
 
     #[test]
@@ -39119,7 +40122,10 @@ mod tests {
 
         persist::apply_index_writer_checkpoint_policy(&storage, true);
         let rows = storage.raw().query("PRAGMA wal_autocheckpoint;").unwrap();
-        assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(0));
+        assert_eq!(
+            rows[0].get(0).unwrap(),
+            &SqliteValue::Integer(persist::BULK_IMPORT_WAL_AUTOCHECKPOINT_PAGES)
+        );
 
         prepare_storage_for_final_checkpoint(&storage, &db_path, "test index close");
 
@@ -40335,6 +41341,19 @@ mod tests {
     }
 
     #[test]
+    fn full_rebuild_integrity_preflight_size_gate_is_bounded_and_fail_safe() {
+        let gib = 1024_u64 * 1024 * 1024;
+
+        assert!(should_run_full_archive_quick_check(Some(2 * gib), 2 * gib));
+        assert!(!should_run_full_archive_quick_check(
+            Some(2 * gib + 1),
+            2 * gib
+        ));
+        assert!(should_run_full_archive_quick_check(Some(64 * gib), 0));
+        assert!(should_run_full_archive_quick_check(None, 2 * gib));
+    }
+
+    #[test]
     fn full_rebuild_integrity_preflight_accepts_healthy_current_schema() {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("healthy-current-schema.db");
@@ -41199,6 +42218,26 @@ mod tests {
         assert!(!should_repair_fallback_fts_after_full_index_run(
             false, true
         ));
+    }
+
+    #[test]
+    fn fallback_fts_repair_classifies_missing_shadow_as_nonfatal_derived_damage() {
+        let outcome = nonfatal_fallback_fts_repair_outcome(
+            "inserting 10000 fallback rows: table not found: fts_messages_data".to_string(),
+        );
+        assert!(matches!(
+            outcome,
+            Some(FallbackFtsRepairOutcome::SkippedCorruptDerivedIndex { detail })
+                if detail.contains("fts_messages_data")
+        ));
+
+        assert_eq!(
+            nonfatal_fallback_fts_repair_outcome(
+                "disk I/O error while opening canonical messages".to_string()
+            ),
+            None,
+            "canonical I/O failures must remain fatal"
+        );
     }
 
     #[test]
@@ -45946,6 +46985,427 @@ mod tests {
         );
     }
 
+    /// #298 gate: a small conversation whose solo isolate-retry also OOMs must
+    /// be deferred — not quarantined — when there is no real host memory
+    /// pressure, so a bounded-allocation false positive can never poison a
+    /// small, replayable conversation.
+    #[test]
+    #[serial]
+    fn watch_reindex_defers_small_conversation_when_solo_retry_also_ooms() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("watch-oom-defer-small");
+        let amp_dir = data_dir.join("amp");
+        std::fs::create_dir_all(&amp_dir).unwrap();
+        let now_u128 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let created_at = i64::try_from(now_u128)
+            .unwrap_or(i64::MAX)
+            .saturating_add(10_000);
+        let amp_file = amp_dir.join("thread-watch-oom-defer-small.json");
+        std::fs::write(
+            &amp_file,
+            format!(
+                r#"{{"id":"thread-watch-oom-defer-small","messages":[{{"role":"user","text":"defer me","createdAt":{created_at}}}]}}"#
+            ),
+        )
+        .unwrap();
+
+        let _oom_guard = set_env("CASS_TEST_WATCH_INGEST_OOM_MIN_CONVS", "1");
+        let _solo_oom_guard = set_env("CASS_TEST_WATCH_SOLO_RETRY_OOM", "1");
+        // Pin the pressure probe to "never real pressure" so the size gate is
+        // what decides, deterministically, on any host.
+        let _reserve_guard = set_env("CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES", "0");
+        let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
+        let opts = super::IndexOptions {
+            full: false,
+            watch: true,
+            force_rebuild: false,
+            db_path: data_dir.join("agent_search.db"),
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_once_paths: None,
+            watch_interval_secs: 30,
+        };
+
+        let storage = FrankenStorage::open(&opts.db_path).unwrap();
+        storage.run_migrations().unwrap();
+        let index_path = index_dir(&opts.data_dir).unwrap();
+        let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
+        let state = std::sync::Mutex::new(std::collections::HashMap::new());
+        let storage = std::sync::Mutex::new(storage);
+        let t_index = std::sync::Mutex::new(Some(t_index));
+        let roots = vec![(ConnectorKind::Amp, ScanRoot::local(amp_dir))];
+
+        let indexed = reindex_paths(
+            &opts,
+            vec![amp_file],
+            &roots,
+            &state,
+            &storage,
+            &t_index,
+            &index_path,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(indexed, 1);
+        assert!(
+            load_watch_state(&data_dir).is_empty(),
+            "deferred watch sources must remain eligible for later retry"
+        );
+        assert!(
+            !data_dir
+                .join("quarantine/watch_ingest_poison.jsonl")
+                .exists(),
+            "a small conversation with no real memory pressure must be deferred, not quarantined (#298)"
+        );
+    }
+
+    /// Multi-chunk ordering: a chunk that defers must pin the watermark for the
+    /// whole run — a LATER successful chunk must not advance past the earlier
+    /// deferred conversation, or it is silently skipped until its source file
+    /// changes again (same silent-loss class as the single-chunk case above).
+    #[test]
+    #[serial]
+    fn watch_reindex_later_chunk_does_not_advance_past_deferred_conversation() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("watch-oom-defer-multichunk");
+        let amp_dir = data_dir.join("amp");
+        std::fs::create_dir_all(&amp_dir).unwrap();
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap_or(i64::MAX)
+        .saturating_add(10_000);
+
+        let deferred = amp_dir.join("thread-00-deferred.json");
+        let later = amp_dir.join("thread-01-later.json");
+        std::fs::write(
+            &deferred,
+            format!(
+                r#"{{"id":"thread-00-deferred","messages":[{{"role":"user","text":"defer me","createdAt":{now}}}]}}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &later,
+            format!(
+                r#"{{"id":"thread-01-later","messages":[{{"role":"user","text":"index me","createdAt":{}}}]}}"#,
+                now + 1
+            ),
+        )
+        .unwrap();
+
+        let _selective_oom = set_env(
+            "CASS_TEST_WATCH_INGEST_OOM_EXTERNAL_ID",
+            "thread-00-deferred",
+        );
+        let _solo_oom = set_env("CASS_TEST_WATCH_SOLO_RETRY_OOM", "1");
+        let _chunk = set_env("CASS_WATCH_INGEST_CHUNK_SIZE", "1");
+        let _reserve = set_env("CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES", "0");
+        let _window = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
+        let opts = super::IndexOptions {
+            full: false,
+            watch: true,
+            force_rebuild: false,
+            db_path: data_dir.join("agent_search.db"),
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_once_paths: None,
+            watch_interval_secs: 30,
+        };
+
+        let storage = FrankenStorage::open(&opts.db_path).unwrap();
+        storage.run_migrations().unwrap();
+        let index_path = index_dir(&opts.data_dir).unwrap();
+        let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
+        let state = std::sync::Mutex::new(std::collections::HashMap::new());
+        let storage = std::sync::Mutex::new(storage);
+        let t_index = std::sync::Mutex::new(Some(t_index));
+        let roots = vec![(ConnectorKind::Amp, ScanRoot::local(amp_dir))];
+
+        let indexed = reindex_paths(
+            &opts,
+            vec![deferred, later],
+            &roots,
+            &state,
+            &storage,
+            &t_index,
+            &index_path,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(indexed, 2);
+        assert!(
+            load_watch_state(&data_dir).is_empty(),
+            "a later successful chunk must not advance past an earlier deferred conversation"
+        );
+    }
+
+    /// Multi-ROOT ordering (codex R3): watch_state is shared per ConnectorKind
+    /// while triggers iterate per (kind, root). A successful root must not
+    /// publish the shared watermark past another root's deferred conversation.
+    /// NOTE: trigger iteration order is hash-nondeterministic, so this test
+    /// exercises an arbitrary root order per run; order-independence itself is
+    /// structural (publication only at kind completion + preserve poisoning),
+    /// not something an input ordering can pin down.
+    #[test]
+    #[serial]
+    fn watch_reindex_success_root_does_not_advance_past_other_roots_deferred() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("watch-oom-defer-multiroot");
+        let deferred_dir = data_dir.join("amp-deferred");
+        let later_dir = data_dir.join("amp-later");
+        std::fs::create_dir_all(&deferred_dir).unwrap();
+        std::fs::create_dir_all(&later_dir).unwrap();
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap_or(i64::MAX)
+        .saturating_add(10_000);
+
+        let deferred = deferred_dir.join("thread-00-deferred.json");
+        let later = later_dir.join("thread-01-later.json");
+        std::fs::write(
+            &deferred,
+            format!(
+                r#"{{"id":"thread-00-deferred","messages":[{{"role":"user","text":"defer me","createdAt":{now}}}]}}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &later,
+            format!(
+                r#"{{"id":"thread-01-later","messages":[{{"role":"user","text":"index me","createdAt":{}}}]}}"#,
+                now + 1
+            ),
+        )
+        .unwrap();
+
+        let _selective_oom = set_env(
+            "CASS_TEST_WATCH_INGEST_OOM_EXTERNAL_ID",
+            "thread-00-deferred",
+        );
+        let _solo_oom = set_env("CASS_TEST_WATCH_SOLO_RETRY_OOM", "1");
+        let _chunk = set_env("CASS_WATCH_INGEST_CHUNK_SIZE", "1");
+        let _reserve = set_env("CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES", "0");
+        let _window = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
+        let opts = super::IndexOptions {
+            full: false,
+            watch: true,
+            force_rebuild: false,
+            db_path: data_dir.join("agent_search.db"),
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_once_paths: None,
+            watch_interval_secs: 30,
+        };
+
+        let storage = FrankenStorage::open(&opts.db_path).unwrap();
+        storage.run_migrations().unwrap();
+        let index_path = index_dir(&opts.data_dir).unwrap();
+        let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
+        let state = std::sync::Mutex::new(std::collections::HashMap::new());
+        let storage = std::sync::Mutex::new(storage);
+        let t_index = std::sync::Mutex::new(Some(t_index));
+        let roots = vec![
+            (ConnectorKind::Amp, ScanRoot::local(deferred_dir)),
+            (ConnectorKind::Amp, ScanRoot::local(later_dir)),
+        ];
+
+        let indexed = reindex_paths(
+            &opts,
+            vec![deferred, later],
+            &roots,
+            &state,
+            &storage,
+            &t_index,
+            &index_path,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(indexed, 2);
+        assert!(
+            load_watch_state(&data_dir).is_empty(),
+            "a successful root must not advance the shared watermark past another root's deferred conversation"
+        );
+    }
+
+    /// An ACTIVE file-root (recently written) is pre-scan skipped with no
+    /// ledger (codex R5): a sibling root's success must not publish the kind
+    /// watermark past it. Deterministic in either hash order: the active root
+    /// poisons the kind whether it runs before or after the successful root.
+    #[test]
+    #[serial]
+    fn watch_reindex_active_file_root_blocks_sibling_watermark_publication() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("watch-active-file-root");
+        let done_dir = data_dir.join("amp-done");
+        let active_dir = data_dir.join("amp-active");
+        std::fs::create_dir_all(&done_dir).unwrap();
+        std::fs::create_dir_all(&active_dir).unwrap();
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap_or(i64::MAX)
+        .saturating_add(10_000);
+
+        let done_file = done_dir.join("thread-10-done.json");
+        let active_file = active_dir.join("thread-11-active.json");
+        std::fs::write(
+            &done_file,
+            format!(
+                r#"{{"id":"thread-10-done","messages":[{{"role":"user","text":"index me","createdAt":{now}}}]}}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &active_file,
+            format!(
+                r#"{{"id":"thread-11-active","messages":[{{"role":"user","text":"still being written","createdAt":{}}}]}}"#,
+                now + 1
+            ),
+        )
+        .unwrap();
+        // done_file is cold (mtime 2h ago); active_file keeps its fresh mtime
+        // and falls inside the recent-write window below.
+        let cold = std::time::SystemTime::now() - std::time::Duration::from_secs(7_200);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&done_file)
+            .unwrap()
+            .set_modified(cold)
+            .unwrap();
+
+        let _window = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "600");
+        let opts = super::IndexOptions {
+            full: false,
+            watch: true,
+            force_rebuild: false,
+            db_path: data_dir.join("agent_search.db"),
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_once_paths: None,
+            watch_interval_secs: 30,
+        };
+
+        let storage = FrankenStorage::open(&opts.db_path).unwrap();
+        storage.run_migrations().unwrap();
+        let index_path = index_dir(&opts.data_dir).unwrap();
+        let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
+        let state = std::sync::Mutex::new(std::collections::HashMap::new());
+        let storage = std::sync::Mutex::new(storage);
+        let t_index = std::sync::Mutex::new(Some(t_index));
+        let roots = vec![
+            (ConnectorKind::Amp, ScanRoot::local(done_dir)),
+            (ConnectorKind::Amp, ScanRoot::local(active_file.clone())),
+        ];
+
+        let indexed = reindex_paths(
+            &opts,
+            vec![done_file, active_file],
+            &roots,
+            &state,
+            &storage,
+            &t_index,
+            &index_path,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(indexed, 1);
+        assert!(
+            load_watch_state(&data_dir).is_empty(),
+            "an active file-root has no ledger, so another root's pending watermark must not publish"
+        );
+    }
+
+    /// Direct unit coverage for the per-kind publication gate (codex R6 P2),
+    /// independent of trigger iteration order: no publish while triggers
+    /// remain; a poisoned kind's candidate is consumed unpublished; a clean
+    /// sibling kind publishes independently.
+    #[test]
+    #[serial]
+    fn publish_watch_watermark_helper_gates_on_remaining_and_preserve() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let state = std::sync::Mutex::new(std::collections::HashMap::new());
+        let mut pending: HashMap<ConnectorKind, i64> = HashMap::new();
+        let mut remaining: HashMap<ConnectorKind, usize> = HashMap::new();
+        let mut preserve: HashMap<ConnectorKind, bool> = HashMap::new();
+
+        // Triggers remaining: candidate untouched, nothing published.
+        pending.insert(ConnectorKind::Amp, 111);
+        remaining.insert(ConnectorKind::Amp, 1);
+        publish_watch_watermark_if_kind_complete(
+            &data_dir,
+            &state,
+            ConnectorKind::Amp,
+            &remaining,
+            &mut pending,
+            &preserve,
+        )
+        .unwrap();
+        assert_eq!(pending.get(&ConnectorKind::Amp), Some(&111));
+        assert!(load_watch_state(&data_dir).is_empty());
+
+        // Kind complete but poisoned: candidate consumed, nothing published.
+        remaining.insert(ConnectorKind::Amp, 0);
+        preserve.insert(ConnectorKind::Amp, true);
+        publish_watch_watermark_if_kind_complete(
+            &data_dir,
+            &state,
+            ConnectorKind::Amp,
+            &remaining,
+            &mut pending,
+            &preserve,
+        )
+        .unwrap();
+        assert!(!pending.contains_key(&ConnectorKind::Amp));
+        assert!(load_watch_state(&data_dir).is_empty());
+
+        // A clean sibling kind publishes independently of the poisoned one.
+        pending.insert(ConnectorKind::Claude, 222);
+        remaining.insert(ConnectorKind::Claude, 0);
+        publish_watch_watermark_if_kind_complete(
+            &data_dir,
+            &state,
+            ConnectorKind::Claude,
+            &remaining,
+            &mut pending,
+            &preserve,
+        )
+        .unwrap();
+        let published = load_watch_state(&data_dir);
+        assert_eq!(published.get(&ConnectorKind::Claude), Some(&222));
+        assert!(!published.contains_key(&ConnectorKind::Amp));
+    }
+
     /// #298 differential: a conversation that OOMs in batch ingest but ingests
     /// cleanly when isolated solo must NOT be quarantined. This is the exact
     /// false-positive the reporter hit — small/medium conversations that index
@@ -47178,7 +48638,9 @@ mod tests {
 
         let result = &conv.messages[1].extra;
         assert_eq!(
-            result.get("tool_call_id").and_then(serde_json::Value::as_str),
+            result
+                .get("tool_call_id")
+                .and_then(serde_json::Value::as_str),
             Some("call_abc123"),
             "tool_result must keep its pairing id"
         );
