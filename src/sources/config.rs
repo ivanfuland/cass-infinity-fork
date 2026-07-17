@@ -1456,7 +1456,10 @@ type = "local"
 paths = ["/mnt/histories/laptop"]
 "#;
         let config: SourcesConfig = toml::from_str(toml_src).unwrap();
-        assert!(!config.sources[0].full_scan, "omitted full_scan must default false");
+        assert!(
+            !config.sources[0].full_scan,
+            "omitted full_scan must default false"
+        );
     }
 
     #[test]

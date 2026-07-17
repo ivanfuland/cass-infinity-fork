@@ -22390,11 +22390,11 @@ fn run_cli_search(
     mode: Option<crate::search::query::SearchMode>,
     semantic_opts: SemanticSearchOptions,
 ) -> CliResult<()> {
+    #[cfg(feature = "infinity")]
+    use crate::search::model_manager::load_infinity_semantic_context;
     use crate::search::model_manager::{
         load_hash_semantic_context, load_semantic_context, load_semantic_context_for_embedder,
     };
-    #[cfg(feature = "infinity")]
-    use crate::search::model_manager::load_infinity_semantic_context;
     use crate::search::query::{
         QueryExplanation, SearchClient, SearchClientOptions, SearchFilters, SearchMode,
     };
@@ -22723,13 +22723,14 @@ fn run_cli_search(
                     // when built with `--features infinity` (baseline is ORT-free,
                     // so the UDS daemon's ONNX embedder is unavailable anyway).
                     #[cfg(feature = "infinity")]
-                    let daemon: Arc<dyn crate::search::daemon_client::DaemonClient> =
-                        match crate::search::infinity::InfinityDaemonClient::new() {
-                            Ok(c) => Arc::new(c),
-                            Err(_) => Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
-                                "infinity-unavailable",
-                            )),
-                        };
+                    let daemon: Arc<
+                        dyn crate::search::daemon_client::DaemonClient,
+                    > = match crate::search::infinity::InfinityDaemonClient::new() {
+                        Ok(c) => Arc::new(c),
+                        Err(_) => Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
+                            "infinity-unavailable",
+                        )),
+                    };
                     #[cfg(not(feature = "infinity"))]
                     let daemon = crate::daemon::client::try_connect()
                         .map(|d| d as Arc<dyn crate::search::daemon_client::DaemonClient>)

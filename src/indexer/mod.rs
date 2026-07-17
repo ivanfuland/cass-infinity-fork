@@ -917,6 +917,10 @@ impl CanonicalMutationCounts {
 struct NonWatchIngestOutcome {
     canonical_mutations: CanonicalMutationCounts,
     quarantined_conversations: usize,
+    /// #298 OOM deferrals: conversations intentionally NOT persisted this run,
+    /// with no quarantine ledger — scan watermarks must not advance past them
+    /// or "the next index run retries it" becomes a silent permanent skip.
+    deferred_conversations: usize,
     lexical_update_deferred: bool,
     scanned_connectors: BTreeSet<String>,
     scan_had_errors: bool,
@@ -933,6 +937,9 @@ impl NonWatchIngestOutcome {
             quarantined_conversations: self
                 .quarantined_conversations
                 .saturating_add(other.quarantined_conversations),
+            deferred_conversations: self
+                .deferred_conversations
+                .saturating_add(other.deferred_conversations),
             lexical_update_deferred: self.lexical_update_deferred || other.lexical_update_deferred,
             scanned_connectors,
             scan_had_errors: self.scan_had_errors || other.scan_had_errors,
@@ -3686,12 +3693,10 @@ fn lexical_rebuild_noise_role(is_tool_role: bool) -> Option<&'static str> {
 /// that the counter still expects (or vice versa), observed-vs-expected doc
 /// counts diverge and re-trigger the cass#244/#258 sparse-repair false-positive
 /// rebuild loop.
-fn is_lexical_rebuild_tool_class_message_role(
-    role: &crate::model::types::MessageRole,
-) -> bool {
-    crate::storage::sqlite::is_lexical_rebuild_tool_class_role(
-        crate::model::types::role_as_str(role),
-    )
+fn is_lexical_rebuild_tool_class_message_role(role: &crate::model::types::MessageRole) -> bool {
+    crate::storage::sqlite::is_lexical_rebuild_tool_class_role(crate::model::types::role_as_str(
+        role,
+    ))
 }
 
 fn lexical_rebuild_packet_provenance_from_canonical(
@@ -13620,6 +13625,14 @@ pub fn run_index(
     let mut scan_lexical_update_deferred = false;
     let mut scanned_connectors = BTreeSet::new();
     let mut scan_had_errors = false;
+    let mut scan_deferred_conversations = 0usize;
+    // Pre-run watermark snapshot: streaming connector watermarks and the
+    // 10s-periodic global saves are written BEFORE ingest knows whether any
+    // conversation gets #298-deferred. If this run defers anything, every
+    // scan watermark is restored to this snapshot at finalization — deferred
+    // conversations have no quarantine ledger, so the watermark is their only
+    // retry protection. Replaying a run is safe; silently skipping is not.
+    let pre_run_scan_watermarks = storage.snapshot_scan_watermarks()?;
     let mut stale_index_ingest_quarantine_retry_attempted = false;
 
     let mut tantivy_requires_rebuild = false;
@@ -14302,6 +14315,8 @@ pub fn run_index(
                     scan_lexical_update_deferred |= scan_outcome.lexical_update_deferred;
                     scanned_connectors.extend(scan_outcome.scanned_connectors);
                     scan_had_errors |= scan_outcome.scan_had_errors;
+                    scan_deferred_conversations = scan_deferred_conversations
+                        .saturating_add(scan_outcome.deferred_conversations);
                 } else {
                     tracing::info!(
                         "using batch indexing (streaming disabled via CASS_STREAMING_INDEX=0)"
@@ -14322,6 +14337,8 @@ pub fn run_index(
                     scan_lexical_update_deferred |= scan_outcome.lexical_update_deferred;
                     scanned_connectors.extend(scan_outcome.scanned_connectors);
                     scan_had_errors |= scan_outcome.scan_had_errors;
+                    scan_deferred_conversations = scan_deferred_conversations
+                        .saturating_add(scan_outcome.deferred_conversations);
                 }
                 performed_scan = true;
                 stale_index_ingest_quarantine_retry_attempted =
@@ -14606,9 +14623,28 @@ pub fn run_index(
     } else {
         let now_ms = FrankenStorage::now_millis();
         let preserve_scan_watermark = scan_watermark_preservation_active();
-        let performed_scan_for_global_watermark =
-            performed_scan && !preserve_scan_watermark && !scan_had_errors;
-        let performed_scan_for_connector_watermarks = performed_scan && !preserve_scan_watermark;
+        let performed_scan_for_global_watermark = performed_scan
+            && !preserve_scan_watermark
+            && !scan_had_errors
+            && scan_deferred_conversations == 0;
+        let performed_scan_for_connector_watermarks =
+            performed_scan && !preserve_scan_watermark && scan_deferred_conversations == 0;
+        if performed_scan && scan_deferred_conversations > 0 {
+            // Undo the streaming per-connector watermarks and any periodic
+            // global saves this run already wrote: they were committed before
+            // ingest knew about the deferral.
+            tracing::warn!(
+                db_path = %opts.db_path.display(),
+                scan_deferred_conversations,
+                "restoring pre-run scan watermarks so deferred conversations are rescanned next run (#298)"
+            );
+            persist::with_ephemeral_writer(
+                &storage,
+                false,
+                "restoring pre-run scan watermarks after deferral",
+                |writer| writer.restore_scan_watermarks(&pre_run_scan_watermarks),
+            )?;
+        }
         if performed_scan && preserve_scan_watermark {
             tracing::info!(
                 db_path = %opts.db_path.display(),
@@ -20848,6 +20884,7 @@ fn ingest_batch_detailed(
             inserted_messages: batch_outcome.inserted_messages,
         },
         quarantined_conversations: 0,
+        deferred_conversations: 0,
         lexical_update_deferred: batch_outcome.lexical_update_deferred,
         scanned_connectors: BTreeSet::new(),
         scan_had_errors: false,
@@ -21064,6 +21101,7 @@ fn ingest_non_watch_oom_retry_or_quarantine(
         return Ok(NonWatchIngestOutcome {
             canonical_mutations: CanonicalMutationCounts::default(),
             quarantined_conversations: 0,
+            deferred_conversations: 1,
             lexical_update_deferred: true,
             scanned_connectors: BTreeSet::new(),
             scan_had_errors: false,
@@ -21087,6 +21125,7 @@ fn ingest_non_watch_oom_retry_or_quarantine(
     Ok(NonWatchIngestOutcome {
         canonical_mutations: CanonicalMutationCounts::default(),
         quarantined_conversations: 1,
+        deferred_conversations: 0,
         lexical_update_deferred: true,
         scanned_connectors: BTreeSet::new(),
         scan_had_errors: false,
@@ -21241,26 +21280,25 @@ fn ingest_watch_batch_with_oom_split_inner(
 ) -> Result<WatchIngestBatchOutcome> {
     debug_assert!(!convs.is_empty());
 
-    let batch_result = if mode == WatchOomIngestMode::Standard
-        && should_inject_watch_ingest_test_oom(convs)
-    {
-        // Use the typed `FrankenError::OutOfMemory` variant so the OOM detector
-        // exercises the downcast path that real frankensqlite OOMs hit, instead
-        // of relying on the plain-string fallback.
-        Err(anyhow::Error::new(frankensqlite::FrankenError::OutOfMemory))
-    } else {
-        let mut semantic_delta = WatchSemanticDelta::default();
-        ingest_batch_with_semantic_delta(
-            storage,
-            Some(t_index),
-            data_dir,
-            convs,
-            progress,
-            LexicalPopulationStrategy::IncrementalInline,
-            defer_checkpoints,
-            capture_semantic_delta.then_some(&mut semantic_delta),
-        )
-    };
+    let batch_result =
+        if mode == WatchOomIngestMode::Standard && should_inject_watch_ingest_test_oom(convs) {
+            // Use the typed `FrankenError::OutOfMemory` variant so the OOM detector
+            // exercises the downcast path that real frankensqlite OOMs hit, instead
+            // of relying on the plain-string fallback.
+            Err(anyhow::Error::new(frankensqlite::FrankenError::OutOfMemory))
+        } else {
+            let mut semantic_delta = WatchSemanticDelta::default();
+            ingest_batch_with_semantic_delta(
+                storage,
+                Some(t_index),
+                data_dir,
+                convs,
+                progress,
+                LexicalPopulationStrategy::IncrementalInline,
+                defer_checkpoints,
+                capture_semantic_delta.then_some(&mut semantic_delta),
+            )
+        };
 
     match batch_result {
         Ok(batch_outcome) => Ok(WatchIngestBatchOutcome {
@@ -31723,8 +31761,7 @@ mod tests {
     /// `"tool"` role string) so tool output is correctly classified during
     /// `--force-rebuild`.
     #[test]
-    fn lexical_rebuild_grouped_projection_preserves_six_role_and_classifies_tool_result_as_tool()
-    {
+    fn lexical_rebuild_grouped_projection_preserves_six_role_and_classifies_tool_result_as_tool() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("six-role-rebuild.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
@@ -31828,7 +31865,11 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(grouped_pages.len(), 1, "expected exactly one conversation page");
+        assert_eq!(
+            grouped_pages.len(),
+            1,
+            "expected exactly one conversation page"
+        );
         let grouped_messages = grouped_pages.into_iter().next().unwrap();
         assert_eq!(grouped_messages.len(), 5);
 
@@ -31875,7 +31916,10 @@ mod tests {
         // legacy "agent" bucket the old `is_tool_role ? Tool : Agent`
         // mapping produced.
         let analytics = &packet.contract_projections.analytics;
-        assert_eq!(analytics.user_messages, 1, "user must not collapse to agent");
+        assert_eq!(
+            analytics.user_messages, 1,
+            "user must not collapse to agent"
+        );
         assert_eq!(analytics.assistant_messages, 1, "assistant stays assistant");
         assert_eq!(
             analytics.tool_messages, 0,
@@ -38753,11 +38797,52 @@ mod tests {
 
         assert_eq!(outcome.quarantined_conversations, 0);
         assert!(outcome.lexical_update_deferred);
+        assert_eq!(
+            outcome.deferred_conversations, 1,
+            "the deferral must be visible in the outcome so scan watermarks are preserved"
+        );
         assert!(
             !data_dir
                 .join("quarantine/index_ingest_poison.jsonl")
                 .exists(),
             "a small conversation with no real memory pressure must be deferred, not quarantined (#298)"
+        );
+    }
+
+    /// The pre-run scan-watermark snapshot/restore pair must revert BOTH the
+    /// global `last_scan_ts` and per-connector rows verbatim, including
+    /// deleting rows that only appeared after the snapshot — otherwise a run
+    /// that deferred a conversation still leaves some watermark advanced past
+    /// it (#298 non-watch silent-skip).
+    #[test]
+    #[serial]
+    fn scan_watermark_snapshot_restore_reverts_global_and_connector_rows() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        storage.run_migrations().unwrap();
+
+        storage.set_last_scan_ts(1_000).unwrap();
+        storage.set_connector_last_scan_ts("codex", 1_100).unwrap();
+        let snapshot = storage.snapshot_scan_watermarks().unwrap();
+
+        // Simulate what a run does before deferral is known: advance both,
+        // and add a connector row that did not exist at snapshot time.
+        storage.set_last_scan_ts(2_000).unwrap();
+        storage.set_connector_last_scan_ts("codex", 2_100).unwrap();
+        storage.set_connector_last_scan_ts("claude", 2_200).unwrap();
+
+        storage.restore_scan_watermarks(&snapshot).unwrap();
+
+        assert_eq!(storage.get_last_scan_ts().unwrap(), Some(1_000));
+        assert_eq!(
+            storage.get_connector_last_scan_ts("codex").unwrap(),
+            Some(1_100)
+        );
+        assert_eq!(
+            storage.get_connector_last_scan_ts("claude").unwrap(),
+            None,
+            "rows created after the snapshot must be removed on restore"
         );
     }
 
@@ -39522,14 +39607,24 @@ mod tests {
         let mut fs_root = ScanRoot::local(PathBuf::from("/mnt/histories/test-machine"));
         fs_root.origin.source_id = "test-machine".to_string();
         ensure_since_ts_matches(
-            explicit_scan_root_since_ts(&fs_root, Path::new("/tmp/cass-data"), Some(1234), &full_scan),
+            explicit_scan_root_since_ts(
+                &fs_root,
+                Path::new("/tmp/cass-data"),
+                Some(1234),
+                &full_scan,
+            ),
             None,
             "a full_scan-marked local source must bypass the watermark (full scan)",
         )?;
         let mut other_root = ScanRoot::local(PathBuf::from("/mnt/histories/other"));
         other_root.origin.source_id = "other".to_string();
         ensure_since_ts_matches(
-            explicit_scan_root_since_ts(&other_root, Path::new("/tmp/cass-data"), Some(1234), &full_scan),
+            explicit_scan_root_since_ts(
+                &other_root,
+                Path::new("/tmp/cass-data"),
+                Some(1234),
+                &full_scan,
+            ),
             Some(1234),
             "a non-full_scan local source keeps normal incremental filtering",
         )?;
@@ -46991,7 +47086,7 @@ mod tests {
             &preserve,
         )
         .unwrap();
-        assert!(pending.get(&ConnectorKind::Amp).is_none());
+        assert!(!pending.contains_key(&ConnectorKind::Amp));
         assert!(load_watch_state(&data_dir).is_empty());
 
         // A clean sibling kind publishes independently of the poisoned one.
@@ -47008,7 +47103,7 @@ mod tests {
         .unwrap();
         let published = load_watch_state(&data_dir);
         assert_eq!(published.get(&ConnectorKind::Claude), Some(&222));
-        assert!(published.get(&ConnectorKind::Amp).is_none());
+        assert!(!published.contains_key(&ConnectorKind::Amp));
     }
 
     /// #298 differential: a conversation that OOMs in batch ingest but ingests
@@ -48243,7 +48338,9 @@ mod tests {
 
         let result = &conv.messages[1].extra;
         assert_eq!(
-            result.get("tool_call_id").and_then(serde_json::Value::as_str),
+            result
+                .get("tool_call_id")
+                .and_then(serde_json::Value::as_str),
             Some("call_abc123"),
             "tool_result must keep its pairing id"
         );

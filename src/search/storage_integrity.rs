@@ -272,7 +272,10 @@ impl DoctorStorageSignals {
                 // The DB opened but a read failed mid-probe; treat as an
                 // integrity failure with an unreadable verdict rather than
                 // claiming health we never confirmed.
-                (StorageState::IntegrityFailed, ArchiveReadability::Unreadable)
+                (
+                    StorageState::IntegrityFailed,
+                    ArchiveReadability::Unreadable,
+                )
             } else if self.lexical_index_drifted {
                 (StorageState::DerivedOnlyDrift, ArchiveReadability::Readable)
             } else {
@@ -290,7 +293,10 @@ impl DoctorStorageSignals {
         } else {
             // Expected but missing — missing != corrupt, so do not claim a
             // failure state. The verdict is deferred until an archive exists.
-            (StorageState::UnknownDeferred, ArchiveReadability::NotChecked)
+            (
+                StorageState::UnknownDeferred,
+                ArchiveReadability::NotChecked,
+            )
         }
     }
 }
@@ -598,7 +604,10 @@ mod tests {
         };
         assert_eq!(
             unverified.classify(),
-            (StorageState::IntegrityFailed, ArchiveReadability::Unreadable)
+            (
+                StorageState::IntegrityFailed,
+                ArchiveReadability::Unreadable
+            )
         );
 
         // Healthy DB, drifted derived lexical index.
@@ -649,7 +658,10 @@ mod tests {
         };
         assert_eq!(
             missing.classify(),
-            (StorageState::UnknownDeferred, ArchiveReadability::NotChecked)
+            (
+                StorageState::UnknownDeferred,
+                ArchiveReadability::NotChecked
+            )
         );
     }
 

@@ -7330,6 +7330,36 @@ impl FrankenStorage {
         Ok(())
     }
 
+    /// Snapshot every scan watermark (global `last_scan_ts` + all per-connector
+    /// rows) as raw meta rows, so a run that deferred conversations can restore
+    /// them verbatim instead of advancing past unindexed sources.
+    pub fn snapshot_scan_watermarks(&self) -> Result<Vec<(String, String)>> {
+        let rows: Vec<(String, String)> = self.conn.query_map_collect(
+            "SELECT key, value FROM meta
+             WHERE key = 'last_scan_ts' OR key LIKE 'last_scan_ts:connector:%'",
+            fparams![],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+        )?;
+        Ok(rows)
+    }
+
+    /// Restore scan watermarks to a prior [`snapshot_scan_watermarks`] state:
+    /// rows added since the snapshot are removed, changed rows are reverted.
+    pub fn restore_scan_watermarks(&self, snapshot: &[(String, String)]) -> Result<()> {
+        self.conn.execute_compat(
+            "DELETE FROM meta
+             WHERE key = 'last_scan_ts' OR key LIKE 'last_scan_ts:connector:%'",
+            fparams![],
+        )?;
+        for (key, value) in snapshot {
+            self.conn.execute_compat(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                fparams![key.as_str(), value.as_str()],
+            )?;
+        }
+        Ok(())
+    }
+
     /// Load per-connector scan watermarks and archived-row presence in one
     /// explicit transaction.
     ///
