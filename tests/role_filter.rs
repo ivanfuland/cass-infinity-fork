@@ -198,7 +198,13 @@ fn role_filter_lexical_recalls_tool_result_ranked_below_default_window() {
 
     // Sanity: without a role filter, limit=1 returns a (high-ranking user) hit.
     let baseline = client
-        .search(unique_token, SearchFilters::default(), 1, 0, FieldMask::FULL)
+        .search(
+            unique_token,
+            SearchFilters::default(),
+            1,
+            0,
+            FieldMask::FULL,
+        )
         .unwrap();
     assert_eq!(baseline.len(), 1, "baseline limit=1 should return one hit");
 

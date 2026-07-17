@@ -7345,19 +7345,39 @@ impl FrankenStorage {
 
     /// Restore scan watermarks to a prior [`snapshot_scan_watermarks`] state:
     /// rows added since the snapshot are removed, changed rows are reverted.
+    /// Runs in one explicit transaction so a failure cannot leave the delete
+    /// applied without the reinserts (a half-restore would erase watermarks
+    /// entirely instead of reverting them).
     pub fn restore_scan_watermarks(&self, snapshot: &[(String, String)]) -> Result<()> {
-        self.conn.execute_compat(
-            "DELETE FROM meta
-             WHERE key = 'last_scan_ts' OR key LIKE 'last_scan_ts:connector:%'",
-            fparams![],
-        )?;
-        for (key, value) in snapshot {
+        self.conn
+            .execute("BEGIN IMMEDIATE;")
+            .with_context(|| "starting scan-watermark restore transaction")?;
+        let result = (|| -> Result<()> {
             self.conn.execute_compat(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
-                fparams![key.as_str(), value.as_str()],
+                "DELETE FROM meta
+                 WHERE key = 'last_scan_ts' OR key LIKE 'last_scan_ts:connector:%'",
+                fparams![],
             )?;
+            for (key, value) in snapshot {
+                self.conn.execute_compat(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                    fparams![key.as_str(), value.as_str()],
+                )?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.conn
+                    .execute("COMMIT;")
+                    .with_context(|| "committing scan-watermark restore transaction")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute("ROLLBACK;");
+                Err(e)
+            }
         }
-        Ok(())
     }
 
     /// Load per-connector scan watermarks and archived-row presence in one

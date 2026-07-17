@@ -56,7 +56,10 @@ fn minilm_acquisition(status: &Value) -> Result<Value, String> {
         .and_then(Value::as_array)
         .and_then(|models| {
             models.iter().find(|m| {
-                matches!(m.get("registry_name").and_then(Value::as_str), Some("minilm"))
+                matches!(
+                    m.get("registry_name").and_then(Value::as_str),
+                    Some("minilm")
+                )
             })
         })
         .and_then(|m| m.get("model_acquisition").cloned())
@@ -70,7 +73,10 @@ fn minilm_model_dir(status: &Value) -> Result<String, String> {
         .and_then(Value::as_array)
         .and_then(|models| {
             models.iter().find(|m| {
-                matches!(m.get("registry_name").and_then(Value::as_str), Some("minilm"))
+                matches!(
+                    m.get("registry_name").and_then(Value::as_str),
+                    Some("minilm")
+                )
             })
         })
         .and_then(|m| m.get("model_dir").and_then(Value::as_str))
@@ -85,7 +91,10 @@ fn minilm_model_dir(status: &Value) -> Result<String, String> {
 /// hard block, which legitimately has no skipped-download story — still a
 /// no-download outcome, accepted.
 fn check_no_auto_download(acq: &Value) -> Result<(), String> {
-    let runtime = acq.get("runtime").and_then(Value::as_str).unwrap_or_default();
+    let runtime = acq
+        .get("runtime")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let state = acq.get("state").and_then(Value::as_str).unwrap_or_default();
     let skipped = acq.get("skipped_network_reason").and_then(Value::as_str);
 
@@ -109,12 +118,20 @@ fn check_no_auto_download(acq: &Value) -> Result<(), String> {
              skipped_network_reason=explicit_install_required; got {skipped:?}; acq: {acq}"
         ));
     }
-    if !matches!(acq.get("fallback_mode").and_then(Value::as_str), Some("lexical")) {
-        return Err(format!("an absent semantic model must fail open to lexical; acq: {acq}"));
+    if !matches!(
+        acq.get("fallback_mode").and_then(Value::as_str),
+        Some("lexical")
+    ) {
+        return Err(format!(
+            "an absent semantic model must fail open to lexical; acq: {acq}"
+        ));
     }
     // Model-name-agnostic: status reports `minilm`, verify reports
     // `all-minilm-l6-v2`; both must point at the explicit install command.
-    let next_cmd = acq.get("next_command").and_then(Value::as_str).unwrap_or_default();
+    let next_cmd = acq
+        .get("next_command")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     if !(next_cmd.starts_with("cass models install --model ") && next_cmd.ends_with(" --json")) {
         return Err(format!(
             "an absent model's next_command must be the explicit install; got {next_cmd:?}; acq: {acq}"
@@ -140,7 +157,9 @@ fn check_model_identity(acq: &Value) -> Result<String, String> {
         .filter(|s| !s.is_empty())
         .ok_or_else(|| format!("fingerprint missing marker_token: {fp}"))?;
     if !token.starts_with(&format!("{revision}:")) {
-        return Err(format!("marker_token must be <revision>:<digest>; got {token}"));
+        return Err(format!(
+            "marker_token must be <revision>:<digest>; got {token}"
+        ));
     }
     Ok(token.to_string())
 }
@@ -154,7 +173,9 @@ fn status_and_verify_emit_acquisition_block_and_prove_no_auto_download() -> Resu
     let (code, stdout, stderr, _ms) =
         run_isolated_cass(tmp.path(), &["models", "status", "--json"])?;
     if !matches!(code, Some(0)) {
-        return Err(format!("models status --json exit {code:?}; stderr: {stderr}"));
+        return Err(format!(
+            "models status --json exit {code:?}; stderr: {stderr}"
+        ));
     }
     let status: Value = serde_json::from_str(&stdout)
         .map_err(|e| format!("models status stdout is not JSON: {e}; stdout: {stdout}"))?;
@@ -184,7 +205,9 @@ fn status_and_verify_emit_acquisition_block_and_prove_no_auto_download() -> Resu
     let (vcode, vstdout, vstderr, _vms) =
         run_isolated_cass(tmp.path(), &["models", "verify", "--json"])?;
     if !matches!(vcode, Some(0)) {
-        return Err(format!("models verify --json exit {vcode:?}; stderr: {vstderr}"));
+        return Err(format!(
+            "models verify --json exit {vcode:?}; stderr: {vstderr}"
+        ));
     }
     let verify: Value = serde_json::from_str(&vstdout)
         .map_err(|e| format!("models verify stdout is not JSON: {e}; stdout: {vstdout}"))?;
@@ -227,7 +250,9 @@ fn no_download_proof_emits_redaction_safe_proof_log_artifact() -> Result<(), Str
     let (code, stdout, stderr, elapsed_ms) =
         run_isolated_cass(tmp.path(), &["models", "status", "--json"])?;
     if !matches!(code, Some(0)) {
-        return Err(format!("models status --json exit {code:?}; stderr: {stderr}"));
+        return Err(format!(
+            "models status --json exit {code:?}; stderr: {stderr}"
+        ));
     }
     let status: Value = serde_json::from_str(&stdout)
         .map_err(|e| format!("models status stdout is not JSON: {e}; stdout: {stdout}"))?;
@@ -247,15 +272,23 @@ fn no_download_proof_emits_redaction_safe_proof_log_artifact() -> Result<(), Str
     let stderr_path = artifact_dir.join("models_status.stderr.log");
     std::fs::write(&stdout_path, &stdout).map_err(|e| format!("write stdout artifact: {e}"))?;
     std::fs::write(&stderr_path, &stderr).map_err(|e| format!("write stderr artifact: {e}"))?;
-    let stdout_path_str = stdout_path.to_str().ok_or("stdout artifact path not UTF-8")?;
-    let stderr_path_str = stderr_path.to_str().ok_or("stderr artifact path not UTF-8")?;
+    let stdout_path_str = stdout_path
+        .to_str()
+        .ok_or("stdout artifact path not UTF-8")?;
+    let stderr_path_str = stderr_path
+        .to_str()
+        .ok_or("stderr artifact path not UTF-8")?;
 
     // sanitized_env: only the safe, non-secret variables this harness sets.
     let sanitized_env = json!({
         "CASS_IGNORE_SOURCES_CONFIG": "1",
         "CODING_AGENT_SEARCH_NO_UPDATE_PROMPT": "1",
     });
-    let outcome = if matches!(code, Some(0)) { "passed" } else { "failed" };
+    let outcome = if matches!(code, Some(0)) {
+        "passed"
+    } else {
+        "failed"
+    };
     let record = json!({
         "run_id": "models-no-download-proof",
         "scenario_id": "model_acquisition_no_auto_download",
@@ -295,7 +328,8 @@ fn no_download_proof_emits_redaction_safe_proof_log_artifact() -> Result<(), Str
     });
 
     let log_path = artifact_dir.join("acquisition-proof.jsonl");
-    let line = serde_json::to_string(&record).map_err(|e| format!("serialize proof record: {e}"))?;
+    let line =
+        serde_json::to_string(&record).map_err(|e| format!("serialize proof record: {e}"))?;
     std::fs::write(&log_path, format!("{line}\n")).map_err(|e| format!("write proof log: {e}"))?;
 
     // Read it back and prove the wire form satisfies the .12.3 contract.
@@ -315,22 +349,47 @@ fn no_download_proof_emits_redaction_safe_proof_log_artifact() -> Result<(), Str
         "artifacts",
         "outcome",
     ];
-    let missing: Vec<&str> = required.iter().copied().filter(|k| parsed.get(*k).is_none()).collect();
+    let missing: Vec<&str> = required
+        .iter()
+        .copied()
+        .filter(|k| parsed.get(*k).is_none())
+        .collect();
     if !missing.is_empty() {
-        return Err(format!(".12.3 proof record missing required fields {missing:?}: {parsed}"));
+        return Err(format!(
+            ".12.3 proof record missing required fields {missing:?}: {parsed}"
+        ));
     }
 
-    if !matches!(parsed.get("outcome").and_then(Value::as_str), Some("passed")) {
-        return Err(format!("a clean no-download run must record outcome=passed: {parsed}"));
+    if !matches!(
+        parsed.get("outcome").and_then(Value::as_str),
+        Some("passed")
+    ) {
+        return Err(format!(
+            "a clean no-download run must record outcome=passed: {parsed}"
+        ));
     }
-    if parsed.get("model_fingerprint").and_then(Value::as_str).is_none_or(str::is_empty) {
-        return Err(format!("proof record must carry the model identity: {parsed}"));
+    if parsed
+        .get("model_fingerprint")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        return Err(format!(
+            "proof record must carry the model identity: {parsed}"
+        ));
     }
-    if parsed.get("skipped_network_reason").and_then(Value::as_str).is_none_or(str::is_empty) {
-        return Err(format!("proof record must carry the skipped_network_reason: {parsed}"));
+    if parsed
+        .get("skipped_network_reason")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        return Err(format!(
+            "proof record must carry the skipped_network_reason: {parsed}"
+        ));
     }
     if parsed.get("elapsed_ms").and_then(Value::as_i64).is_none() {
-        return Err(format!("proof record must carry numeric elapsed_ms: {parsed}"));
+        return Err(format!(
+            "proof record must carry numeric elapsed_ms: {parsed}"
+        ));
     }
 
     // Redaction guard: no sanitized_env key may carry a secret marker.
@@ -348,7 +407,9 @@ fn no_download_proof_emits_redaction_safe_proof_log_artifact() -> Result<(), Str
         .cloned()
         .collect();
     if !leaked.is_empty() {
-        return Err(format!("proof log retained secret-bearing env keys: {leaked:?}"));
+        return Err(format!(
+            "proof log retained secret-bearing env keys: {leaked:?}"
+        ));
     }
 
     // Artifact paths must stay inside the temp artifact dir (no home leakage).

@@ -98,7 +98,10 @@ fn indexed_fixture() -> Result<Fixture, String> {
         codex_home: Some(codex_home),
     };
 
-    let argv = build_argv(&fixture, &["index", "--full", "--json", "--no-progress-events"]);
+    let argv = build_argv(
+        &fixture,
+        &["index", "--full", "--json", "--no-progress-events"],
+    );
     let out = run(&fixture, &argv, "indexed_fixture_index", INDEX_TIMEOUT);
     let value = parse_json(&out, "indexed_fixture_index")?;
     if value.get("success").and_then(Value::as_bool) != Some(true) {
@@ -156,8 +159,8 @@ fn run(fixture: &Fixture, argv: &[String], label: &str, timeout: Duration) -> Ou
 
 /// Parse a surface's pure-JSON stdout into a `Value`.
 fn parse_json(out: &Output, label: &str) -> Result<Value, String> {
-    let stdout = std::str::from_utf8(&out.stdout)
-        .map_err(|e| format!("{label} stdout not UTF-8: {e}"))?;
+    let stdout =
+        std::str::from_utf8(&out.stdout).map_err(|e| format!("{label} stdout not UTF-8: {e}"))?;
     serde_json::from_str(stdout.trim())
         .map_err(|e| format!("{label} stdout not JSON: {e}; head: {}", head(stdout)))
 }
@@ -221,7 +224,9 @@ fn expect_triple(
 ) -> Result<(), String> {
     let got_state = block_str(block, "storage_state", label)?;
     if got_state != state {
-        return Err(format!("{label}: storage_state = {got_state:?}, want {state:?}"));
+        return Err(format!(
+            "{label}: storage_state = {got_state:?}, want {state:?}"
+        ));
     }
     let got_risk = block_str(block, "source_of_truth_risk", label)?;
     if got_risk != risk {
@@ -283,7 +288,10 @@ fn indexed_archive_storage_state_agrees_across_doctor_status_search() -> Result<
 
     // Honest provenance: the lightweight surfaces ran `db_open` and NEVER claim
     // the deep integrity probe ran; the doctor (which does run it) records it.
-    for (label, block) in [("status/indexed", status_block), ("search/indexed", search_block)] {
+    for (label, block) in [
+        ("status/indexed", status_block),
+        ("search/indexed", search_block),
+    ] {
         if !has_check_named(block, "db_open") {
             return Err(missing_db_open_check_msg(label));
         }
@@ -333,7 +341,9 @@ fn fresh_data_dir_storage_state_agrees_between_doctor_and_status() -> Result<(),
     let ds = block_str(doctor_block, "storage_state", "doctor/fresh")?;
     let ss = block_str(status_block, "storage_state", "status/fresh")?;
     if ds != ss {
-        return Err(format!("fresh: doctor storage_state {ds:?} != status {ss:?}"));
+        return Err(format!(
+            "fresh: doctor storage_state {ds:?} != status {ss:?}"
+        ));
     }
 
     Ok(())

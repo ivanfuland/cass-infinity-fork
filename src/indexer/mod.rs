@@ -14344,6 +14344,35 @@ pub fn run_index(
                 stale_index_ingest_quarantine_retry_attempted =
                     stale_index_ingest_quarantine_retry.is_some();
 
+                if scan_deferred_conversations > 0 {
+                    // Restore IMMEDIATELY after the scan, not at finalization:
+                    // the lexical-rebuild and semantic phases below have many
+                    // `?` early returns, and an error there must not strand
+                    // the already-advanced streaming/periodic watermarks past
+                    // the deferred conversations (codex R8 P0). Bounded retry
+                    // absorbs transient writer contention; a hard crash inside
+                    // this window remains a narrow documented gap.
+                    tracing::warn!(
+                        db_path = %opts.db_path.display(),
+                        scan_deferred_conversations,
+                        "restoring pre-run scan watermarks so deferred conversations are rescanned next run (#298)"
+                    );
+                    let mut restore_result = Ok(());
+                    for attempt in 0..3u64 {
+                        restore_result = persist::with_ephemeral_writer(
+                            &storage,
+                            false,
+                            "restoring pre-run scan watermarks after deferral",
+                            |writer| writer.restore_scan_watermarks(&pre_run_scan_watermarks),
+                        );
+                        if restore_result.is_ok() {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(50 * (attempt + 1)));
+                    }
+                    restore_result?;
+                }
+
                 if scan_lexical_update_deferred {
                     tracing::warn!(
                         db_path = %opts.db_path.display(),
@@ -14629,22 +14658,6 @@ pub fn run_index(
             && scan_deferred_conversations == 0;
         let performed_scan_for_connector_watermarks =
             performed_scan && !preserve_scan_watermark && scan_deferred_conversations == 0;
-        if performed_scan && scan_deferred_conversations > 0 {
-            // Undo the streaming per-connector watermarks and any periodic
-            // global saves this run already wrote: they were committed before
-            // ingest knew about the deferral.
-            tracing::warn!(
-                db_path = %opts.db_path.display(),
-                scan_deferred_conversations,
-                "restoring pre-run scan watermarks so deferred conversations are rescanned next run (#298)"
-            );
-            persist::with_ephemeral_writer(
-                &storage,
-                false,
-                "restoring pre-run scan watermarks after deferral",
-                |writer| writer.restore_scan_watermarks(&pre_run_scan_watermarks),
-            )?;
-        }
         if performed_scan && preserve_scan_watermark {
             tracing::info!(
                 db_path = %opts.db_path.display(),
@@ -38843,6 +38856,155 @@ mod tests {
             storage.get_connector_last_scan_ts("claude").unwrap(),
             None,
             "rows created after the snapshot must be removed on restore"
+        );
+    }
+
+    /// Top-level run_index closure (codex R8): a #298 deferral must restore
+    /// the scan watermarks even when a LATER phase (here: semantic embedder
+    /// setup) errors out — the restore runs right after the scan, before the
+    /// lexical/semantic phases' `?` early returns can skip it.
+    #[test]
+    #[serial]
+    fn deferred_non_watch_scan_restores_watermarks_before_later_semantic_error() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let codex_home = home.join(".codex");
+        let session = codex_home.join("sessions/2026/07/17/rollout-deferred-watermark.jsonl");
+        std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+        std::fs::write(
+            &session,
+            r#"{"timestamp":"2026-07-17T01:00:00.000Z","type":"session_meta","payload":{"id":"deferred-watermark","cwd":"/tmp/project"}}
+{"timestamp":"2026-07-17T01:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"defer this small conversation"}]}}
+"#,
+        )
+        .unwrap();
+
+        let _home_guard = set_env("HOME", home.to_str().unwrap());
+        let _codex_guard = set_env("CODEX_HOME", codex_home.to_str().unwrap());
+        let _xdg_data_guard = set_env(
+            "XDG_DATA_HOME",
+            tmp.path().join("xdg-data").to_str().unwrap(),
+        );
+        let _xdg_config_guard = set_env(
+            "XDG_CONFIG_HOME",
+            tmp.path().join("xdg-config").to_str().unwrap(),
+        );
+        let _ignore_sources_guard = set_env("CASS_IGNORE_SOURCES_CONFIG", "1");
+        let _streaming_guard = set_env("CASS_STREAMING_INDEX", "1");
+        let _oom_guard = set_env("CASS_TEST_NON_WATCH_INGEST_OOM_MIN_CONVS", "1");
+        let _reserve_guard = set_env("CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES", "0");
+
+        let data_dir = tmp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("db.sqlite");
+        {
+            let storage = FrankenStorage::open(&db_path).unwrap();
+            storage.set_last_scan_ts(1_000).unwrap();
+            storage.set_connector_last_scan_ts("codex", 1_100).unwrap();
+        }
+
+        let result = run_index(
+            super::IndexOptions {
+                full: false,
+                watch: false,
+                force_rebuild: false,
+                db_path: db_path.clone(),
+                data_dir: data_dir.clone(),
+                semantic: true,
+                build_hnsw: false,
+                embedder: "definitely-invalid".to_string(),
+                progress: None,
+                watch_once_paths: None,
+                watch_interval_secs: 30,
+            },
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "the invalid semantic embedder must fail after scan"
+        );
+
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        assert_eq!(storage.get_last_scan_ts().unwrap(), Some(1_000));
+        assert_eq!(
+            storage.get_connector_last_scan_ts("codex").unwrap(),
+            Some(1_100),
+            "a post-scan error must not strand the streaming connector watermark past a deferred conversation"
+        );
+    }
+
+    /// Success-path twin of the test above: when the run completes normally,
+    /// a #298 deferral must still leave every scan watermark at its pre-run
+    /// value (finalization advancement is gated off and mid-run writes are
+    /// rolled back).
+    #[test]
+    #[serial]
+    fn deferred_non_watch_scan_restores_watermarks_on_successful_run() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let codex_home = home.join(".codex");
+        let session = codex_home.join("sessions/2026/07/17/rollout-deferred-success.jsonl");
+        std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+        std::fs::write(
+            &session,
+            r#"{"timestamp":"2026-07-17T01:00:00.000Z","type":"session_meta","payload":{"id":"deferred-success","cwd":"/tmp/project"}}
+{"timestamp":"2026-07-17T01:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"defer this small conversation"}]}}
+"#,
+        )
+        .unwrap();
+
+        let _home_guard = set_env("HOME", home.to_str().unwrap());
+        let _codex_guard = set_env("CODEX_HOME", codex_home.to_str().unwrap());
+        let _xdg_data_guard = set_env(
+            "XDG_DATA_HOME",
+            tmp.path().join("xdg-data").to_str().unwrap(),
+        );
+        let _xdg_config_guard = set_env(
+            "XDG_CONFIG_HOME",
+            tmp.path().join("xdg-config").to_str().unwrap(),
+        );
+        let _ignore_sources_guard = set_env("CASS_IGNORE_SOURCES_CONFIG", "1");
+        let _streaming_guard = set_env("CASS_STREAMING_INDEX", "1");
+        let _oom_guard = set_env("CASS_TEST_NON_WATCH_INGEST_OOM_MIN_CONVS", "1");
+        let _reserve_guard = set_env("CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES", "0");
+
+        let data_dir = tmp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("db.sqlite");
+        {
+            let storage = FrankenStorage::open(&db_path).unwrap();
+            storage.set_last_scan_ts(1_000).unwrap();
+            storage.set_connector_last_scan_ts("codex", 1_100).unwrap();
+        }
+
+        run_index(
+            super::IndexOptions {
+                full: false,
+                watch: false,
+                force_rebuild: false,
+                db_path: db_path.clone(),
+                data_dir: data_dir.clone(),
+                semantic: false,
+                build_hnsw: false,
+                embedder: "fastembed".to_string(),
+                progress: None,
+                watch_once_paths: None,
+                watch_interval_secs: 30,
+            },
+            None,
+        )
+        .expect("a run that defers a small conversation still completes");
+
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        assert_eq!(
+            storage.get_last_scan_ts().unwrap(),
+            Some(1_000),
+            "a successful run with a deferral must not advance the global watermark"
+        );
+        assert_eq!(
+            storage.get_connector_last_scan_ts("codex").unwrap(),
+            Some(1_100),
+            "a successful run with a deferral must not advance connector watermarks"
         );
     }
 
