@@ -13018,6 +13018,66 @@ fn explicit_scan_root_since_ts(
     }
 }
 
+/// Restore scan watermarks through a DEDICATED short-lived writer connection
+/// (never the cached ephemeral writer: a failed COMMIT leaves the transaction
+/// active, and a cached writer with an open transaction poisons the next
+/// `BEGIN IMMEDIATE`). Retries are classified — only Busy/Conflict-style
+/// transient errors are retried, per the project's retryable whitelist.
+fn restore_scan_watermarks_with_fresh_writer(
+    db_path: &Path,
+    snapshot: &[(String, String)],
+) -> Result<()> {
+    persist::with_concurrent_retry(2, || {
+        let writer = FrankenStorage::open(db_path)
+            .with_context(|| "opening dedicated writer for scan-watermark restore")?;
+        let result = writer.restore_scan_watermarks(snapshot);
+        let close_result = writer
+            .close()
+            .with_context(|| "closing dedicated scan-watermark restore writer");
+        result.and(close_result)
+    })
+}
+
+/// Drop guard that restores the pre-run scan watermarks on ANY early exit
+/// from `run_index` (`?`, panic) between the snapshot and normal finalization.
+/// The streaming per-connector watermarks and the 10s periodic global saves
+/// are written before ingest outcomes (deferrals, errors) are known; exiting
+/// early with them advanced silently skips whatever the rest of the run never
+/// persisted. Restoring on early exit is always replay-safe.
+struct ScanWatermarkRestoreGuard {
+    db_path: PathBuf,
+    snapshot: Vec<(String, String)>,
+    disarmed: bool,
+}
+
+impl ScanWatermarkRestoreGuard {
+    fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for ScanWatermarkRestoreGuard {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        tracing::warn!(
+            db_path = %self.db_path.display(),
+            "early exit before watermark finalization: restoring pre-run scan watermarks (replay-safe)"
+        );
+        if let Err(e) = restore_scan_watermarks_with_fresh_writer(&self.db_path, &self.snapshot) {
+            // Drop cannot propagate: log loudly. The stranded-watermark window
+            // this leaves is the same one a hard crash leaves, and the next
+            // `--full` or source-file touch recovers it.
+            tracing::error!(
+                db_path = %self.db_path.display(),
+                error = %e,
+                "FAILED to restore pre-run scan watermarks on early exit; deferred/unpersisted sources may be skipped until a full reindex"
+            );
+        }
+    }
+}
+
 pub fn run_index(
     opts: IndexOptions,
     event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
@@ -13633,6 +13693,11 @@ pub fn run_index(
     // conversations have no quarantine ledger, so the watermark is their only
     // retry protection. Replaying a run is safe; silently skipping is not.
     let pre_run_scan_watermarks = storage.snapshot_scan_watermarks()?;
+    let mut scan_watermark_restore_guard = ScanWatermarkRestoreGuard {
+        db_path: opts.db_path.clone(),
+        snapshot: pre_run_scan_watermarks.clone(),
+        disarmed: false,
+    };
     let mut stale_index_ingest_quarantine_retry_attempted = false;
 
     let mut tantivy_requires_rebuild = false;
@@ -14357,20 +14422,10 @@ pub fn run_index(
                         scan_deferred_conversations,
                         "restoring pre-run scan watermarks so deferred conversations are rescanned next run (#298)"
                     );
-                    let mut restore_result = Ok(());
-                    for attempt in 0..3u64 {
-                        restore_result = persist::with_ephemeral_writer(
-                            &storage,
-                            false,
-                            "restoring pre-run scan watermarks after deferral",
-                            |writer| writer.restore_scan_watermarks(&pre_run_scan_watermarks),
-                        );
-                        if restore_result.is_ok() {
-                            break;
-                        }
-                        std::thread::sleep(Duration::from_millis(50 * (attempt + 1)));
-                    }
-                    restore_result?;
+                    restore_scan_watermarks_with_fresh_writer(
+                        &opts.db_path,
+                        &pre_run_scan_watermarks,
+                    )?;
                 }
 
                 if scan_lexical_update_deferred {
@@ -14685,6 +14740,10 @@ pub fn run_index(
             )?;
         }
     }
+    // Watermark state is now final for this run (advanced for clean runs,
+    // restored/preserved for deferred ones): the early-exit guard has nothing
+    // left to protect.
+    scan_watermark_restore_guard.disarm();
     let exact_total_counts = exact_total_counts_from_progress(opts.progress.as_ref());
     if exact_completed_lexical_checkpoint && exact_total_counts.is_some() {
         tracing::info!(

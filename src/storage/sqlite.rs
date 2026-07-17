@@ -7368,9 +7368,17 @@ impl FrankenStorage {
         })();
         match result {
             Ok(()) => {
-                self.conn
+                if let Err(commit_err) = self
+                    .conn
                     .execute("COMMIT;")
-                    .with_context(|| "committing scan-watermark restore transaction")?;
+                    .with_context(|| "committing scan-watermark restore transaction")
+                {
+                    // fsqlite keeps the transaction ACTIVE after a failed
+                    // COMMIT — roll it back explicitly so this connection is
+                    // not returned to any pool with an open transaction.
+                    let _ = self.conn.execute("ROLLBACK;");
+                    return Err(commit_err);
+                }
                 Ok(())
             }
             Err(e) => {
