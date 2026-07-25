@@ -102,7 +102,11 @@ fn claude_connector_parses_message_type_entries() {
     fs::create_dir_all(&projects).unwrap();
     let file = projects.join("session.jsonl");
 
-    let sample = r#"{"type":"message","role":"user","content":"Hello from message type","timestamp":"2025-11-12T18:31:18.000Z"}
+    // 两条都用 `type=message` + 内层 `message.role` 的受支持形态。
+    // 顶层 `role`（无内层 `message` 对象）自 connector storage contract 起不再产生
+    // canonical 消息：结构角色白名单只认 `type=user|assistant` 与
+    // `type=message + message.role`，其余保持白名单式拒绝。
+    let sample = r#"{"type":"message","message":{"role":"user","content":"Hello from message type"},"timestamp":"2025-11-12T18:31:18.000Z"}
 {"type":"message","message":{"role":"assistant","content":"Reply from message type"},"timestamp":"2025-11-12T18:31:20.000Z"}
 "#;
     fs::write(&file, sample).unwrap();

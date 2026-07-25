@@ -312,7 +312,7 @@ fn codex_connector_ignores_unmatched_token_count() {
     let sample = r#"{"timestamp":"2025-09-30T15:42:34.559Z","type":"session_meta","payload":{"id":"test-id","cwd":"/test"}}
 {"timestamp":"2025-09-30T15:42:36.190Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}
 {"timestamp":"2025-09-30T15:42:37.000Z","type":"event_msg","payload":{"type":"token_count","input_tokens":10,"output_tokens":20}}
-{"timestamp":"2025-09-30T15:42:38.000Z","type":"turn_context","payload":{"turn":1}}
+{"timestamp":"2025-09-30T15:42:38.000Z","type":"turn_context","payload":{"turn":1,"model":"gpt-5-codex"}}
 {"timestamp":"2025-09-30T15:42:39.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"text","text":"world"}]}}
 "#;
     fs::write(&file, sample).unwrap();
@@ -763,10 +763,10 @@ fn codex_connector_handles_empty_sessions() {
     assert!(convs.is_empty());
 }
 
-/// Test integer (milliseconds) timestamp format
+/// Test integer (milliseconds) timestamp format is rejected
 #[test]
 #[serial]
-fn codex_connector_parses_millis_timestamp() {
+fn codex_connector_rejects_millis_timestamp() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/2025/12/03");
     fs::create_dir_all(&sessions).unwrap();
@@ -789,16 +789,18 @@ fn codex_connector_parses_millis_timestamp() {
         scan_roots: Vec::new(),
         since_ts: None,
     };
-    let convs = connector.scan(&ctx).unwrap();
-    assert_eq!(convs.len(), 1);
 
-    let c = &convs[0];
-    assert_eq!(c.messages.len(), 2);
-    // Verify timestamps were parsed from i64 millis
-    // started_at comes from session_meta timestamp (1700000000000)
-    assert_eq!(c.started_at, Some(1700000000000));
-    // ended_at comes from the last message timestamp (1700000002000)
-    assert_eq!(c.ended_at, Some(1700000002000));
+    // connector storage contract 起，modern Codex 的 `session_meta` 必须有 string 型
+    // 顶层 `timestamp`。数字型（i64 毫秒）属类型漂移，进结构异常门 fail loud，
+    // 不再静默按毫秒解析——静默接受会让未知 schema 变体混进 canonical 层。
+    let err = connector
+        .scan(&ctx)
+        .expect_err("numeric session_meta timestamp must fail loud, not parse as millis");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("session_meta") && msg.contains("timestamp"),
+        "error must name the offending field, got: {msg}"
+    );
 }
 
 /// Test `tool_use` blocks in content are flattened properly
@@ -842,7 +844,7 @@ fn codex_connector_flattens_tool_use_blocks() {
 /// Test missing cwd in `session_meta` results in None workspace
 #[test]
 #[serial]
-fn codex_connector_handles_missing_cwd() {
+fn codex_connector_rejects_missing_cwd() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/2025/12/05");
     fs::create_dir_all(&sessions).unwrap();
@@ -864,13 +866,17 @@ fn codex_connector_handles_missing_cwd() {
         scan_roots: Vec::new(),
         since_ts: None,
     };
-    let convs = connector.scan(&ctx).unwrap();
-    assert_eq!(convs.len(), 1);
 
-    let c = &convs[0];
+    // connector storage contract 起，modern Codex 的 `session_meta` 必须带 string 型
+    // `payload.cwd`；缺字段不再按 metadata-only 放过，而是进入结构异常门 fail loud。
+    // 此前的行为（照常解析、workspace 留 None）会让 schema 漂移静默通过。
+    let err = connector
+        .scan(&ctx)
+        .expect_err("session_meta without cwd must fail loud, not parse silently");
+    let msg = err.to_string();
     assert!(
-        c.workspace.is_none(),
-        "workspace should be None when cwd missing"
+        msg.contains("session_meta") && msg.contains("cwd"),
+        "error must name the offending field, got: {msg}"
     );
 }
 
