@@ -99,10 +99,16 @@ type BatchClassificationMap =
 const LEXICAL_REBUILD_PACKET_VERSION: u32 = CONVERSATION_PACKET_VERSION;
 const CODEX_INDEXER_EXTRA_COMPACT_THRESHOLD_BYTES: u64 = 16 * 1024 * 1024;
 /// Top-level `extra` keys the franken connector normalizes out of the raw event
-/// (pairing ids, tool arguments, opaque reasoning blobs). Compaction drops the
+/// (pairing ids, tool arguments, opaque reasoning blobs, the harness structural
+/// role and the explicit unpaired-tool-result marker). Compaction drops the
 /// duplicated raw payload but must never drop these.
-const FRANKEN_NORMALIZED_EXTRA_KEYS: &[&str] =
-    &["tool_call_id", "tool_call_args", "encrypted_content"];
+const FRANKEN_NORMALIZED_EXTRA_KEYS: &[&str] = &[
+    "tool_call_id",
+    "tool_call_args",
+    "encrypted_content",
+    "raw_role",
+    "unpaired",
+];
 const PREPARSE_PRIMARY_SOURCE_CAPTURE_LIMIT: usize = 256;
 const WATCH_INGEST_DEFAULT_CHUNK_SIZE: usize = 32;
 const WATCH_INGEST_CHUNK_SIZE_MAX: usize = 512;
@@ -48655,6 +48661,66 @@ mod tests {
             "franken-preserved encrypted_content must survive compaction"
         );
         assert!(reasoning.get("payload").is_none());
+    }
+
+    #[test]
+    fn large_codex_extra_compaction_preserves_raw_role_and_unpaired() {
+        // Phase 1 的 connector storage contract 让每条 retained message 带上顶层
+        // `raw_role`，让无法配对的 tool_result 带上 `unpaired=true`。这两个键是
+        // normalized 数据，不是 duplicated raw payload：indexer 侧的 16 MiB
+        // compaction 丢 payload 时必须留下它们，否则大 Codex 会话在落库后既认不出
+        // harness 原始角色，也分不清「真的没配上」和「字段被压掉了」。
+        let mut conv = norm_conv(
+            Some("codex-large-raw-role"),
+            vec![norm_msg(0, 100), norm_msg(1, 200)],
+        );
+        conv.agent_slug = "codex".to_string();
+
+        conv.messages[0].role = "user".to_string();
+        conv.messages[0].extra = serde_json::json!({
+            "payload": { "delta": "duplicated raw codex event payload" },
+            "raw_role": "agent_message"
+        });
+
+        conv.messages[1].role = "tool_result".to_string();
+        conv.messages[1].extra = serde_json::json!({
+            "payload": { "delta": "duplicated raw codex event payload" },
+            "raw_role": "function_call_output",
+            "unpaired": true
+        });
+
+        compact_large_connector_extras_for_size(
+            "codex",
+            &mut conv,
+            Some(CODEX_INDEXER_EXTRA_COMPACT_THRESHOLD_BYTES),
+        );
+
+        let user = &conv.messages[0].extra;
+        assert_eq!(
+            user.get("raw_role").and_then(serde_json::Value::as_str),
+            Some("agent_message"),
+            "compaction must keep the harness structural role"
+        );
+        assert!(
+            user.get("payload").is_none(),
+            "raw payload must still be dropped"
+        );
+
+        let result = &conv.messages[1].extra;
+        assert_eq!(
+            result.get("raw_role").and_then(serde_json::Value::as_str),
+            Some("function_call_output"),
+            "tool_result must keep its raw_role"
+        );
+        assert_eq!(
+            result.get("unpaired").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "explicit unpaired degradation marker must survive compaction"
+        );
+        assert!(
+            result.get("payload").is_none(),
+            "raw payload must still be dropped"
+        );
     }
 
     #[test]
