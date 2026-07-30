@@ -116,7 +116,6 @@ const NON_WATCH_INGEST_DEFAULT_CHUNK_SIZE: usize = DEFAULT_STREAMING_BATCH_LIMIT
 const NON_WATCH_INGEST_CHUNK_SIZE_MAX: usize = 128;
 static ROBOT_TRACE_INGEST_ENABLED: AtomicBool = AtomicBool::new(false);
 static ROBOT_TRACE_INGEST_BATCH_N: AtomicU64 = AtomicU64::new(0);
-static ACTIVE_SESSION_SOURCE_SKIP_OBSERVED: AtomicBool = AtomicBool::new(false);
 /// Clock-skew allowance subtracted from a skipped source's mtime before it
 /// bounds a connector watermark. FAD's `file_modified_since` already tolerates
 /// 1000ms; this additionally covers small backward clock steps (NTP) landing
@@ -127,20 +126,27 @@ const ACTIVE_SOURCE_SKIP_MTIME_SKEW_ALLOWANCE_MS: i64 = 60_000;
 /// specific connector. A skip recorded under it bounds every connector.
 const ACTIVE_SOURCE_SKIP_ALL_CONNECTORS: &str = "*";
 
-/// Per-connector record of the session sources this run skipped because they
-/// looked actively written.
+/// Per-run, per-connector record of the session sources skipped because they
+/// looked actively written. **Run-owned, never a process-wide static**:
+/// concurrent `run_index` calls (same process, different `data_dir`s, each
+/// holding its own run lock) must not observe or reset each other's records —
+/// a wiped record lets a watermark advance past a skipped file, which is
+/// #251-class silent data loss.
 ///
 /// Skipping an active source must not advance that connector's watermark past
-/// the source, or the next delta scan would never revisit it (#251-class
-/// silent data loss). Freezing every watermark is the blunt version of that
-/// rule: on a host that always has a live session the watermark never moves at
-/// all and every run rescans an ever-widening window. Recording the earliest
-/// skipped mtime per connector lets each watermark advance right up to the
-/// oldest thing that connector still owes a rescan — without letting one
-/// long-open idle source (e.g. a daemon holding a days-old rollout file)
-/// pin every other connector's watermark to its age.
-#[derive(Default)]
-struct ActiveSessionSourceSkipState {
+/// the source, or the next delta scan would never revisit it. Freezing every
+/// watermark is the blunt version of that rule: on a host that always has a
+/// live session the watermark never moves at all and every run rescans an
+/// ever-widening window. Recording the earliest skipped mtime per connector
+/// lets each watermark advance right up to the oldest thing that connector
+/// still owes a rescan — without letting one long-open idle source (e.g. a
+/// daemon holding a days-old rollout file) pin every other connector's
+/// watermark to its age.
+#[derive(Debug, Default)]
+struct ActiveSessionSourceSkips {
+    /// Whether any source was skipped this run (gates the legacy global
+    /// watermark and streaming early-persist paths).
+    observed: bool,
     /// Earliest skipped mtime (epoch ms) per connector.
     min_mtime_by_connector: HashMap<String, i64>,
     /// Connectors that skipped a source whose mtime could not be read. The
@@ -149,12 +155,12 @@ struct ActiveSessionSourceSkipState {
     unknown_mtime_connectors: HashSet<String>,
 }
 
-static ACTIVE_SESSION_SOURCE_SKIPS: std::sync::LazyLock<Mutex<ActiveSessionSourceSkipState>> =
-    std::sync::LazyLock::new(|| Mutex::new(ActiveSessionSourceSkipState::default()));
+type SharedActiveSessionSourceSkips = Arc<Mutex<ActiveSessionSourceSkips>>;
 
-fn active_session_source_skips_lock() -> std::sync::MutexGuard<'static, ActiveSessionSourceSkipState>
-{
-    ACTIVE_SESSION_SOURCE_SKIPS
+fn lock_active_session_source_skips(
+    skips: &Mutex<ActiveSessionSourceSkips>,
+) -> std::sync::MutexGuard<'_, ActiveSessionSourceSkips> {
+    skips
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -177,13 +183,30 @@ enum ActiveSessionSourceReason {
 struct ActiveSessionSourceFilter {
     writable_file_ids: HashSet<SourceFileId>,
     recent_write_window: Option<Duration>,
+    /// The owning run's skip records. Skips detected through this filter are
+    /// recorded here; the run that built the filter reads them back when
+    /// deciding which watermarks are safe to persist.
+    skips: SharedActiveSessionSourceSkips,
 }
 
 impl ActiveSessionSourceFilter {
     fn new(enable_recent_write_window: bool) -> Self {
+        Self::with_shared_skips(
+            enable_recent_write_window,
+            SharedActiveSessionSourceSkips::default(),
+        )
+    }
+
+    /// Build a filter whose skip records land in the caller's run-owned state
+    /// (several filters built for different phases of one run share it).
+    fn with_shared_skips(
+        enable_recent_write_window: bool,
+        skips: SharedActiveSessionSourceSkips,
+    ) -> Self {
         Self {
             writable_file_ids: collect_writable_open_session_file_ids(),
             recent_write_window: active_session_recent_write_window(enable_recent_write_window),
+            skips,
         }
     }
 
@@ -192,6 +215,7 @@ impl ActiveSessionSourceFilter {
         Self {
             writable_file_ids: HashSet::new(),
             recent_write_window,
+            skips: SharedActiveSessionSourceSkips::default(),
         }
     }
 
@@ -289,8 +313,11 @@ fn should_skip_active_session_source(
     let Some(reason) = active_source_filter.active_writer_reason(source_path) else {
         return false;
     };
-    ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(true, Ordering::Relaxed);
-    note_active_session_source_skip(connector, source_file_modified_ms(source_path));
+    note_active_session_source_skip(
+        &active_source_filter.skips,
+        connector,
+        source_file_modified_ms(source_path),
+    );
     tracing::info!(
         source_path = %source_path.display(),
         connector,
@@ -11605,27 +11632,25 @@ fn scan_path_exclusions_active() -> bool {
     scan_path_exclusions_value_active(dotenvy::var("CASS_EXCLUDE_PATHS").ok().as_deref())
 }
 
-fn active_session_source_skip_observed() -> bool {
-    ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.load(Ordering::Relaxed)
+fn active_session_source_skip_observed(skips: &Mutex<ActiveSessionSourceSkips>) -> bool {
+    lock_active_session_source_skips(skips).observed
 }
 
-fn scan_watermark_preservation_active() -> bool {
-    scan_path_exclusions_active() || active_session_source_skip_observed()
-}
-
-fn reset_active_session_source_skips() {
-    ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(false, Ordering::Relaxed);
-    let mut state = active_session_source_skips_lock();
-    state.min_mtime_by_connector.clear();
-    state.unknown_mtime_connectors.clear();
+fn scan_watermark_preservation_active(skips: &Mutex<ActiveSessionSourceSkips>) -> bool {
+    scan_path_exclusions_active() || active_session_source_skip_observed(skips)
 }
 
 /// Record that a session source of `connector` was skipped as actively
 /// written, keeping the earliest mtime seen so far for that connector.
 /// `None` means the mtime was unreadable. Sites that cannot attribute the
 /// source pass `ACTIVE_SOURCE_SKIP_ALL_CONNECTORS`, which bounds everyone.
-fn note_active_session_source_skip(connector: &str, mtime_ms: Option<i64>) {
-    let mut state = active_session_source_skips_lock();
+fn note_active_session_source_skip(
+    skips: &Mutex<ActiveSessionSourceSkips>,
+    connector: &str,
+    mtime_ms: Option<i64>,
+) {
+    let mut state = lock_active_session_source_skips(skips);
+    state.observed = true;
     match mtime_ms {
         Some(ms) => {
             let entry = state
@@ -11653,6 +11678,7 @@ fn note_active_session_source_skip(connector: &str, mtime_ms: Option<i64>) {
 /// `mtime >= since_ts - 1s`). Other connectors are unaffected unless the skip
 /// could not be attributed.
 fn connector_scan_watermark_to_persist(
+    skips: &Mutex<ActiveSessionSourceSkips>,
     connector: &str,
     performed_scan: bool,
     scan_deferred_conversations: usize,
@@ -11661,14 +11687,18 @@ fn connector_scan_watermark_to_persist(
     if !performed_scan || scan_deferred_conversations != 0 {
         return None;
     }
-    effective_connector_scan_watermark_ts(connector, scan_start_ts)
+    effective_connector_scan_watermark_ts(skips, connector, scan_start_ts)
 }
 
-fn effective_connector_scan_watermark_ts(connector: &str, scan_start_ts: i64) -> Option<i64> {
+fn effective_connector_scan_watermark_ts(
+    skips: &Mutex<ActiveSessionSourceSkips>,
+    connector: &str,
+    scan_start_ts: i64,
+) -> Option<i64> {
     if scan_path_exclusions_active() {
         return None;
     }
-    let state = active_session_source_skips_lock();
+    let state = lock_active_session_source_skips(skips);
     if state
         .unknown_mtime_connectors
         .contains(ACTIVE_SOURCE_SKIP_ALL_CONNECTORS)
@@ -12089,6 +12119,7 @@ fn run_streaming_consumer(
     lexical_strategy: LexicalPopulationStrategy,
     scan_start_ts: Option<i64>,
     progress_bump: Option<&Arc<AtomicI64>>,
+    active_session_source_skips: &SharedActiveSessionSourceSkips,
 ) -> Result<(Vec<String>, NonWatchIngestOutcome)> {
     use std::collections::HashMap;
 
@@ -12284,7 +12315,7 @@ fn run_streaming_consumer(
                     // make that global watermark unsafe for legacy fallback.
                     // Successful connector-specific markers are persisted when
                     // each producer's Done message is processed.
-                    if scan_watermark_preservation_active() {
+                    if scan_watermark_preservation_active(active_session_source_skips) {
                         tracing::debug!(
                             "preserving streaming incremental last_scan_ts because scan exclusions or active source skips are active"
                         );
@@ -12348,7 +12379,7 @@ fn run_streaming_consumer(
                         .scanned_connectors
                         .insert(connector_name.to_string());
                     if let Some(ts) = scan_start_ts
-                        && !scan_watermark_preservation_active()
+                        && !scan_watermark_preservation_active(active_session_source_skips)
                         && let Err(e) = persist::with_ephemeral_writer(
                             storage,
                             true,
@@ -12456,6 +12487,7 @@ fn run_streaming_index(
     additional_scan_roots: Vec<ScanRoot>,
     scan_start_ts: i64,
     progress_bump: Option<&Arc<AtomicI64>>,
+    active_session_source_skips: &SharedActiveSessionSourceSkips,
 ) -> Result<NonWatchIngestOutcome> {
     run_streaming_index_with_connector_factories(
         storage,
@@ -12467,6 +12499,7 @@ fn run_streaming_index(
         configured_connector_factories(),
         scan_start_ts,
         progress_bump,
+        active_session_source_skips,
     )
 }
 
@@ -12524,6 +12557,7 @@ fn run_streaming_index_with_connector_factories(
     connector_factories: Vec<(&'static str, ConnectorFactory)>,
     scan_start_ts: i64,
     progress_bump: Option<&Arc<AtomicI64>>,
+    active_session_source_skips: &SharedActiveSessionSourceSkips,
 ) -> Result<NonWatchIngestOutcome> {
     if connector_factories.is_empty() {
         tracing::warn!("no enabled connectors are configured for indexing; skipping scan");
@@ -12580,8 +12614,9 @@ fn run_streaming_index_with_connector_factories(
         )?),
         full_scan_source_ids: Arc::new(full_scan_source_ids()),
         progress: opts.progress.clone(),
-        active_source_filter: Arc::new(ActiveSessionSourceFilter::new(
+        active_source_filter: Arc::new(ActiveSessionSourceFilter::with_shared_skips(
             opts.watch && opts.watch_once_paths.as_ref().is_none_or(Vec::is_empty),
+            Arc::clone(active_session_source_skips),
         )),
     };
 
@@ -12611,6 +12646,7 @@ fn run_streaming_index_with_connector_factories(
         lexical_strategy,
         Some(scan_start_ts),
         progress_bump,
+        active_session_source_skips,
     );
 
     if consumer_result.is_err() {
@@ -12678,6 +12714,7 @@ fn run_batch_index(
     additional_scan_roots: Vec<ScanRoot>,
     scan_start_ts: i64,
     progress_bump: Option<&Arc<AtomicI64>>,
+    active_session_source_skips: &SharedActiveSessionSourceSkips,
 ) -> Result<NonWatchIngestOutcome> {
     run_batch_index_with_connector_factories(
         storage,
@@ -12689,6 +12726,7 @@ fn run_batch_index(
         configured_connector_factories(),
         scan_start_ts,
         progress_bump,
+        active_session_source_skips,
     )
 }
 
@@ -12703,6 +12741,7 @@ fn run_batch_index_with_connector_factories(
     connector_factories: Vec<(&'static str, ConnectorFactory)>,
     scan_start_ts: i64,
     progress_bump: Option<&Arc<AtomicI64>>,
+    active_session_source_skips: &SharedActiveSessionSourceSkips,
 ) -> Result<NonWatchIngestOutcome> {
     let scan_start = std::time::Instant::now();
 
@@ -12734,8 +12773,9 @@ fn run_batch_index_with_connector_factories(
 
     let progress_ref = opts.progress.as_ref();
     let data_dir = opts.data_dir.clone();
-    let active_source_filter = Arc::new(ActiveSessionSourceFilter::new(
+    let active_source_filter = Arc::new(ActiveSessionSourceFilter::with_shared_skips(
         opts.watch && opts.watch_once_paths.as_ref().is_none_or(Vec::is_empty),
+        Arc::clone(active_session_source_skips),
     ));
     let local_since_ts_by_connector = Arc::new(connector_local_scan_since_ts_map(
         storage,
@@ -12985,7 +13025,8 @@ fn run_batch_index_with_connector_factories(
     let index_start = std::time::Instant::now();
     let mut last_scan_ts_save = std::time::Instant::now();
     let mut ingest_outcome = NonWatchIngestOutcome::default();
-    let preserve_scan_watermark = scan_watermark_preservation_active() || scan_had_errors;
+    let preserve_scan_watermark =
+        scan_watermark_preservation_active(active_session_source_skips) || scan_had_errors;
     for pending in pending_batches {
         let batch_outcome = ingest_non_watch_batch_with_oom_split(
             storage,
@@ -13238,11 +13279,12 @@ pub fn run_index(
     };
     let mut index_run_lock =
         acquire_index_run_lock(&opts.data_dir, &opts.db_path, initial_lock_mode)?;
-    // Reset the shared skip state only after this run owns the run lock: a
-    // second in-process run that loses the lock race must not wipe the skip
-    // records the winning run is still accumulating (watermark-past-skipped
-    // data loss otherwise).
-    reset_active_session_source_skips();
+    // Run-owned skip state: fresh per run, shared by every phase of *this*
+    // run and by nobody else. Concurrent runs (same process, different
+    // data_dirs, each holding its own run lock) cannot observe or reset each
+    // other's records — a wiped record would let a watermark advance past a
+    // skipped file (#251-class silent data loss).
+    let active_session_source_skips = SharedActiveSessionSourceSkips::default();
     let _index_run_lock_heartbeat = IndexRunLockHeartbeat::start(
         opts.data_dir.clone(),
         index_run_lock_heartbeat_interval(),
@@ -14506,6 +14548,7 @@ pub fn run_index(
                         additional_scan_roots.clone(),
                         scan_start_ts,
                         Some(&progress_bump),
+                        &active_session_source_skips,
                     )?;
                     // F4 (cass tech debt): a completed scan is a real
                     // forward-progress boundary; bump the atomic so the
@@ -14534,6 +14577,7 @@ pub fn run_index(
                         additional_scan_roots.clone(),
                         scan_start_ts,
                         Some(&progress_bump),
+                        &active_session_source_skips,
                     )?;
                     bump_index_run_lock_progress_atomic(&progress_bump);
                     scan_canonical_mutations =
@@ -14685,7 +14729,9 @@ pub fn run_index(
         t_index
     };
 
-    if stale_index_ingest_quarantine_retry_attempted && scan_watermark_preservation_active() {
+    if stale_index_ingest_quarantine_retry_attempted
+        && scan_watermark_preservation_active(&active_session_source_skips)
+    {
         tracing::info!(
             data_dir = %opts.data_dir.display(),
             "leaving stale index-ingest quarantine retry records unchanged because this scan preserved the source watermark"
@@ -14845,7 +14891,8 @@ pub fn run_index(
         );
     } else {
         let now_ms = FrankenStorage::now_millis();
-        let preserve_scan_watermark = scan_watermark_preservation_active();
+        let preserve_scan_watermark =
+            scan_watermark_preservation_active(&active_session_source_skips);
         let performed_scan_for_global_watermark = performed_scan
             && !preserve_scan_watermark
             && !scan_had_errors
@@ -14854,6 +14901,7 @@ pub fn run_index(
             .iter()
             .filter_map(|connector| {
                 connector_scan_watermark_to_persist(
+                    &active_session_source_skips,
                     connector,
                     performed_scan,
                     scan_deferred_conversations,
@@ -30527,6 +30575,7 @@ mod tests {
             vec![("codex", failing_explicit_file_root_connector_factory)],
             FrankenStorage::now_millis(),
             None,
+            &SharedActiveSessionSourceSkips::default(),
         )
         .expect("failed scan should not abort batch indexing");
         *FAILING_EXPLICIT_FILE_ROOT
@@ -30655,32 +30704,24 @@ mod tests {
         }
     }
 
-    struct ActiveSessionSkipReset;
-
-    impl Drop for ActiveSessionSkipReset {
-        fn drop(&mut self) {
-            reset_active_session_source_skips();
-        }
-    }
-
-    const SKEW: i64 = ACTIVE_SOURCE_SKIP_MTIME_SKEW_ALLOWANCE_MS;
+    /// Intentionally a literal, not an alias of the production constant: if
+    /// the allowance drifts from 60s these tests must go red (codex R2 P2-1).
+    const SKEW: i64 = 60_000;
 
     #[test]
     #[serial]
     fn effective_connector_watermark_advances_to_earliest_skipped_source_mtime() {
-        let _active_skip_reset = ActiveSessionSkipReset;
         let _exclusions = unset_env_var("CASS_EXCLUDE_PATHS");
-        reset_active_session_source_skips();
+        let skips = SharedActiveSessionSourceSkips::default();
 
         // Two codex sources were deferred this run. The older one is the one we
         // still owe a rescan, so it (minus the clock-skew allowance) — not the
         // scan start — bounds the watermark.
-        ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(true, Ordering::Relaxed);
-        note_active_session_source_skip("codex", Some(1_800_000));
-        note_active_session_source_skip("codex", Some(1_500_000));
+        note_active_session_source_skip(&skips, "codex", Some(1_800_000));
+        note_active_session_source_skip(&skips, "codex", Some(1_500_000));
 
         assert_eq!(
-            effective_connector_scan_watermark_ts("codex", 2_000_000),
+            effective_connector_scan_watermark_ts(&skips, "codex", 2_000_000),
             Some(1_500_000 - SKEW),
             "watermark must advance up to the earliest deferred source instead of freezing"
         );
@@ -30689,22 +30730,20 @@ mod tests {
     #[test]
     #[serial]
     fn skipped_source_bounds_only_its_own_connector() {
-        let _active_skip_reset = ActiveSessionSkipReset;
         let _exclusions = unset_env_var("CASS_EXCLUDE_PATHS");
-        reset_active_session_source_skips();
+        let skips = SharedActiveSessionSourceSkips::default();
 
         // A daemon holding one codex rollout open must not pin every other
         // connector's watermark to that file's age.
-        ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(true, Ordering::Relaxed);
-        note_active_session_source_skip("codex", Some(1_500_000));
+        note_active_session_source_skip(&skips, "codex", Some(1_500_000));
 
         assert_eq!(
-            effective_connector_scan_watermark_ts("codex", 2_000_000),
+            effective_connector_scan_watermark_ts(&skips, "codex", 2_000_000),
             Some(1_500_000 - SKEW),
             "the owning connector is bounded by its own skipped source"
         );
         assert_eq!(
-            effective_connector_scan_watermark_ts("claude", 2_000_000),
+            effective_connector_scan_watermark_ts(&skips, "claude", 2_000_000),
             Some(2_000_000),
             "other connectors advance to scan start, unaffected by codex's skip"
         );
@@ -30712,16 +30751,43 @@ mod tests {
 
     #[test]
     #[serial]
-    fn unattributed_skip_bounds_every_connector() {
-        let _active_skip_reset = ActiveSessionSkipReset;
+    fn concurrent_runs_do_not_share_or_reset_skip_state() {
         let _exclusions = unset_env_var("CASS_EXCLUDE_PATHS");
-        reset_active_session_source_skips();
 
-        ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(true, Ordering::Relaxed);
-        note_active_session_source_skip(ACTIVE_SOURCE_SKIP_ALL_CONNECTORS, Some(1_500_000));
+        // Run A records a skip; run B starts fresh afterwards (the run-owned
+        // replacement for the old process-global reset). B's existence must
+        // not erase A's record, and B must not inherit it (codex R2 P0-1).
+        let run_a = SharedActiveSessionSourceSkips::default();
+        note_active_session_source_skip(&run_a, "codex", Some(1_500_000));
+        let run_b = SharedActiveSessionSourceSkips::default();
 
         assert_eq!(
-            effective_connector_scan_watermark_ts("claude", 2_000_000),
+            effective_connector_scan_watermark_ts(&run_a, "codex", 2_000_000),
+            Some(1_500_000 - SKEW),
+            "run A's watermark stays bounded by its own skip record"
+        );
+        assert!(
+            active_session_source_skip_observed(&run_a),
+            "run A still knows it skipped something"
+        );
+        assert_eq!(
+            effective_connector_scan_watermark_ts(&run_b, "codex", 2_000_000),
+            Some(2_000_000),
+            "run B starts clean and is not bounded by run A's skip"
+        );
+        assert!(!active_session_source_skip_observed(&run_b));
+    }
+
+    #[test]
+    #[serial]
+    fn unattributed_skip_bounds_every_connector() {
+        let _exclusions = unset_env_var("CASS_EXCLUDE_PATHS");
+        let skips = SharedActiveSessionSourceSkips::default();
+
+        note_active_session_source_skip(&skips, ACTIVE_SOURCE_SKIP_ALL_CONNECTORS, Some(1_500_000));
+
+        assert_eq!(
+            effective_connector_scan_watermark_ts(&skips, "claude", 2_000_000),
             Some(1_500_000 - SKEW),
             "a skip that cannot be attributed must conservatively bound everyone"
         );
@@ -30730,17 +30796,15 @@ mod tests {
     #[test]
     #[serial]
     fn future_skipped_mtime_clamps_to_scan_start() {
-        let _active_skip_reset = ActiveSessionSkipReset;
         let _exclusions = unset_env_var("CASS_EXCLUDE_PATHS");
-        reset_active_session_source_skips();
+        let skips = SharedActiveSessionSourceSkips::default();
 
         // A skipped source with a (clock-skewed) future mtime must not push
         // the watermark past the scan start.
-        ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(true, Ordering::Relaxed);
-        note_active_session_source_skip("codex", Some(9_000_000));
+        note_active_session_source_skip(&skips, "codex", Some(9_000_000));
 
         assert_eq!(
-            effective_connector_scan_watermark_ts("codex", 2_000_000),
+            effective_connector_scan_watermark_ts(&skips, "codex", 2_000_000),
             Some(2_000_000),
             "scan start is always an upper bound on the persisted watermark"
         );
@@ -30749,15 +30813,13 @@ mod tests {
     #[test]
     #[serial]
     fn connector_watermark_to_persist_advances_to_earliest_skipped_mtime() {
-        let _active_skip_reset = ActiveSessionSkipReset;
         let _exclusions = unset_env_var("CASS_EXCLUDE_PATHS");
-        reset_active_session_source_skips();
+        let skips = SharedActiveSessionSourceSkips::default();
 
-        ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(true, Ordering::Relaxed);
-        note_active_session_source_skip("codex", Some(1_500_000));
+        note_active_session_source_skip(&skips, "codex", Some(1_500_000));
 
         assert_eq!(
-            connector_scan_watermark_to_persist("codex", true, 0, 2_000_000),
+            connector_scan_watermark_to_persist(&skips, "codex", true, 0, 2_000_000),
             Some(1_500_000 - SKEW),
             "a finished run must still advance connector watermarks up to the earliest deferred source"
         );
@@ -30766,12 +30828,11 @@ mod tests {
     #[test]
     #[serial]
     fn connector_watermark_to_persist_stays_frozen_under_path_exclusions() {
-        let _active_skip_reset = ActiveSessionSkipReset;
         let _exclusions = set_env_var("CASS_EXCLUDE_PATHS", "/some/excluded/root");
-        reset_active_session_source_skips();
+        let skips = SharedActiveSessionSourceSkips::default();
 
         assert_eq!(
-            connector_scan_watermark_to_persist("codex", true, 0, 2_000_000),
+            connector_scan_watermark_to_persist(&skips, "codex", true, 0, 2_000_000),
             None,
             "excluded paths are invisible rather than deferred, so no advance is provably safe"
         );
@@ -30780,20 +30841,18 @@ mod tests {
     #[test]
     #[serial]
     fn connector_watermark_to_persist_stays_frozen_when_a_skipped_mtime_is_unreadable() {
-        let _active_skip_reset = ActiveSessionSkipReset;
         let _exclusions = unset_env_var("CASS_EXCLUDE_PATHS");
-        reset_active_session_source_skips();
+        let skips = SharedActiveSessionSourceSkips::default();
 
-        ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(true, Ordering::Relaxed);
-        note_active_session_source_skip("codex", None);
+        note_active_session_source_skip(&skips, "codex", None);
 
         assert_eq!(
-            connector_scan_watermark_to_persist("codex", true, 0, 2_000_000),
+            connector_scan_watermark_to_persist(&skips, "codex", true, 0, 2_000_000),
             None,
             "an unreadable mtime makes the safe bound unknowable; freeze that connector"
         );
         assert_eq!(
-            connector_scan_watermark_to_persist("claude", true, 0, 2_000_000),
+            connector_scan_watermark_to_persist(&skips, "claude", true, 0, 2_000_000),
             Some(2_000_000),
             "the unknown-mtime freeze is scoped to the owning connector"
         );
@@ -30802,9 +30861,7 @@ mod tests {
     #[test]
     #[serial]
     fn skipping_an_active_session_source_bounds_the_watermark_by_its_mtime() {
-        let _active_skip_reset = ActiveSessionSkipReset;
         let _exclusions = unset_env_var("CASS_EXCLUDE_PATHS");
-        reset_active_session_source_skips();
 
         let tmp = TempDir::new().unwrap();
         let source_path = tmp.path().join("rollout-still-writing.jsonl");
@@ -30834,7 +30891,7 @@ mod tests {
         );
 
         assert_eq!(
-            effective_connector_scan_watermark_ts("codex", mtime_ms + 600_000),
+            effective_connector_scan_watermark_ts(&filter.skips, "codex", mtime_ms + 600_000),
             Some(mtime_ms - SKEW),
             "the skipped source's mtime must bound the watermark so the next scan revisits it"
         );
@@ -38825,6 +38882,7 @@ mod tests {
             LexicalPopulationStrategy::IncrementalInline,
             None,
             None,
+            &SharedActiveSessionSourceSkips::default(),
         )
         .unwrap();
 
@@ -38880,6 +38938,7 @@ mod tests {
             LexicalPopulationStrategy::IncrementalInline,
             None,
             None,
+            &SharedActiveSessionSourceSkips::default(),
         )?;
 
         assert_eq!(discovered, vec!["claude".to_string()]);
@@ -38940,6 +38999,7 @@ mod tests {
             LexicalPopulationStrategy::IncrementalInline,
             None,
             None,
+            &SharedActiveSessionSourceSkips::default(),
         )?;
 
         assert_eq!(discovered, vec!["claude".to_string()]);
@@ -38989,6 +39049,7 @@ mod tests {
             LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
             Some(FrankenStorage::now_millis()),
             None,
+            &SharedActiveSessionSourceSkips::default(),
         )
         .expect("deferred streaming ingest should not require a Tantivy writer");
 
@@ -39057,6 +39118,7 @@ mod tests {
             LexicalPopulationStrategy::IncrementalInline,
             Some(FrankenStorage::now_millis()),
             None,
+            &SharedActiveSessionSourceSkips::default(),
         )
         .expect("lexical OOM after SQLite ingest should defer repair, not fail the scan");
 
@@ -39118,6 +39180,7 @@ mod tests {
                 LexicalPopulationStrategy::IncrementalInline,
                 Some(FrankenStorage::now_millis()),
                 None,
+                &SharedActiveSessionSourceSkips::default(),
             )
             .expect("single deferred ingest OOM should quarantine and continue");
 
@@ -39197,6 +39260,7 @@ mod tests {
             LexicalPopulationStrategy::IncrementalInline,
             Some(FrankenStorage::now_millis()),
             None,
+            &SharedActiveSessionSourceSkips::default(),
         )
         .expect("small-conversation NoMem without real pressure should defer, not fail");
 
@@ -40318,6 +40382,7 @@ mod tests {
             LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
             Some(FrankenStorage::now_millis()),
             None,
+            &SharedActiveSessionSourceSkips::default(),
         )
         .expect("mixed startup ingest should not violate foreign keys");
 
@@ -40567,6 +40632,7 @@ mod tests {
             LexicalPopulationStrategy::IncrementalInline,
             None,
             None,
+            &SharedActiveSessionSourceSkips::default(),
         )
         .unwrap();
 
@@ -40672,6 +40738,7 @@ mod tests {
                 LexicalPopulationStrategy::IncrementalInline,
                 None,
                 None,
+                &SharedActiveSessionSourceSkips::default(),
             )
             .unwrap();
 
@@ -40751,6 +40818,7 @@ mod tests {
             LexicalPopulationStrategy::IncrementalInline,
             None,
             None,
+            &SharedActiveSessionSourceSkips::default(),
         )
         .unwrap();
         assert_eq!(discovered, vec!["codex".to_string()]);
@@ -40798,6 +40866,7 @@ mod tests {
             LexicalPopulationStrategy::IncrementalInline,
             None,
             None,
+            &SharedActiveSessionSourceSkips::default(),
         )
         .unwrap();
         assert_eq!(mutations.inserted_conversations, 3);
@@ -40938,6 +41007,7 @@ mod tests {
             LexicalPopulationStrategy::IncrementalInline,
             None,
             None,
+            &SharedActiveSessionSourceSkips::default(),
         )
         .unwrap();
         handle.join().unwrap();
@@ -41008,6 +41078,7 @@ mod tests {
             vec![("claude", watermark_sensitive_remote_connector_factory)],
             FrankenStorage::now_millis(),
             None,
+            &SharedActiveSessionSourceSkips::default(),
         )
         .context(
             "configured remote roots should scan from the root despite the global watermark",
@@ -41090,6 +41161,7 @@ mod tests {
             vec![("claude", watermark_sensitive_remote_connector_factory)],
             FrankenStorage::now_millis(),
             None,
+            &SharedActiveSessionSourceSkips::default(),
         )
         .context("configured local roots should keep the connector incremental watermark")?;
 
@@ -41136,6 +41208,7 @@ mod tests {
             vec![("claude", panic_connector_factory)],
             FrankenStorage::now_millis(),
             None,
+            &SharedActiveSessionSourceSkips::default(),
         )
         .expect_err("producer panic should abort streaming indexing");
         let message = error.to_string();
@@ -41202,6 +41275,7 @@ mod tests {
             vec![("claude", watermark_sensitive_remote_connector_factory)],
             FrankenStorage::now_millis(),
             None,
+            &SharedActiveSessionSourceSkips::default(),
         )
         .context(
             "configured remote roots should scan from the root despite the global watermark",
@@ -41282,6 +41356,7 @@ mod tests {
             vec![("claude", watermark_sensitive_remote_connector_factory)],
             FrankenStorage::now_millis(),
             None,
+            &SharedActiveSessionSourceSkips::default(),
         )
         .context("configured local roots should keep the connector incremental watermark")?;
 
@@ -41334,6 +41409,7 @@ mod tests {
                 vec![("codex", failing_explicit_file_root_connector_factory)],
                 FrankenStorage::now_millis(),
                 None,
+                &SharedActiveSessionSourceSkips::default(),
             )?;
 
             assert_eq!(
@@ -41398,6 +41474,7 @@ mod tests {
             vec![("codex", deferred_batch_connector_factory)],
             FrankenStorage::now_millis(),
             None,
+            &SharedActiveSessionSourceSkips::default(),
         )
         .expect("deferred batch ingest should not require a Tantivy writer");
 
@@ -47945,7 +48022,6 @@ mod tests {
     #[test]
     #[serial]
     fn explicit_watch_once_skips_active_session_source_without_watermarking() {
-        let _active_skip_reset = ActiveSessionSkipReset;
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("active-source-skip");
         let amp_dir = data_dir.join("amp");
@@ -48038,7 +48114,6 @@ mod tests {
     #[test]
     #[serial]
     fn watch_mode_recent_session_source_skips_without_quarantine_or_watermarking() {
-        let _active_skip_reset = ActiveSessionSkipReset;
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("recent-active-source-skip");
         let amp_dir = data_dir.join("amp");
