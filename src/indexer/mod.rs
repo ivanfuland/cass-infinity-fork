@@ -117,6 +117,21 @@ const NON_WATCH_INGEST_CHUNK_SIZE_MAX: usize = 128;
 static ROBOT_TRACE_INGEST_ENABLED: AtomicBool = AtomicBool::new(false);
 static ROBOT_TRACE_INGEST_BATCH_N: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_SESSION_SOURCE_SKIP_OBSERVED: AtomicBool = AtomicBool::new(false);
+/// Earliest mtime (epoch ms) among the session sources this run skipped because
+/// they looked actively written. `i64::MAX` means "nothing skipped yet".
+///
+/// Skipping an active source must not advance the connector watermark past that
+/// source, or the next delta scan would never revisit it (#251-class silent
+/// data loss). Freezing the watermark entirely is the blunt version of that
+/// rule: on a host that always has a live session the watermark never moves at
+/// all, every run rescans an ever-widening window, and scan cost grows without
+/// bound. Recording the earliest skipped mtime lets the watermark advance right
+/// up to the oldest thing we still owe a rescan.
+static ACTIVE_SESSION_SOURCE_SKIP_MIN_MTIME: AtomicI64 = AtomicI64::new(i64::MAX);
+/// Set when a source was skipped but its mtime could not be read. The safe
+/// watermark is unknowable in that case, so we fall back to the old
+/// freeze-everything behavior.
+static ACTIVE_SESSION_SOURCE_SKIP_MTIME_UNKNOWN: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct SourceFileId {
@@ -248,12 +263,19 @@ fn should_skip_active_session_source(
         return false;
     };
     ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(true, Ordering::Relaxed);
+    note_active_session_source_skip_mtime(source_file_modified_ms(source_path));
     tracing::info!(
         source_path = %source_path.display(),
         ?reason,
         "skipping session source that appears to be actively written"
     );
     true
+}
+
+fn source_file_modified_ms(path: &Path) -> Option<i64> {
+    let modified = fs::metadata(path).and_then(|meta| meta.modified()).ok()?;
+    let since_epoch = modified.duration_since(SystemTime::UNIX_EPOCH).ok()?;
+    i64::try_from(since_epoch.as_millis()).ok()
 }
 
 /// Whether `CASS_SKIP_SUBAGENTS` is enabled (#292). Subagent transcripts
@@ -11572,6 +11594,60 @@ fn scan_watermark_preservation_active() -> bool {
     scan_path_exclusions_active() || active_session_source_skip_observed()
 }
 
+fn reset_active_session_source_skips() {
+    ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(false, Ordering::Relaxed);
+    ACTIVE_SESSION_SOURCE_SKIP_MIN_MTIME.store(i64::MAX, Ordering::Relaxed);
+    ACTIVE_SESSION_SOURCE_SKIP_MTIME_UNKNOWN.store(false, Ordering::Relaxed);
+}
+
+/// Record that a session source was skipped as actively written, keeping the
+/// earliest mtime seen so far. `None` means the mtime was unreadable.
+fn note_active_session_source_skip_mtime(mtime_ms: Option<i64>) {
+    match mtime_ms {
+        Some(ms) => {
+            ACTIVE_SESSION_SOURCE_SKIP_MIN_MTIME.fetch_min(ms, Ordering::Relaxed);
+        }
+        None => ACTIVE_SESSION_SOURCE_SKIP_MTIME_UNKNOWN.store(true, Ordering::Relaxed),
+    }
+}
+
+fn active_session_source_skip_min_mtime() -> Option<i64> {
+    let value = ACTIVE_SESSION_SOURCE_SKIP_MIN_MTIME.load(Ordering::Relaxed);
+    (value != i64::MAX).then_some(value)
+}
+
+/// The connector watermark this run may safely persist.
+///
+/// `None` keeps the previous watermark untouched. Path exclusions still force
+/// that: an excluded path is not "deferred to the next run", it is invisible,
+/// so no advance is provably safe. An actively-written source *is* deferred, so
+/// the watermark may advance to that source's mtime — the next delta scan still
+/// picks it up (`file_modified_since` admits `mtime >= since_ts - 1s`).
+/// The connector watermark a finished run should persist, or `None` to leave
+/// the stored watermarks untouched.
+fn connector_scan_watermark_to_persist(
+    performed_scan: bool,
+    scan_deferred_conversations: usize,
+    scan_start_ts: i64,
+) -> Option<i64> {
+    if !performed_scan || scan_deferred_conversations != 0 {
+        return None;
+    }
+    effective_connector_scan_watermark_ts(scan_start_ts)
+}
+
+fn effective_connector_scan_watermark_ts(scan_start_ts: i64) -> Option<i64> {
+    if scan_path_exclusions_active()
+        || ACTIVE_SESSION_SOURCE_SKIP_MTIME_UNKNOWN.load(Ordering::Relaxed)
+    {
+        return None;
+    }
+    Some(match active_session_source_skip_min_mtime() {
+        Some(earliest_skipped) => scan_start_ts.min(earliest_skipped),
+        None => scan_start_ts,
+    })
+}
+
 fn panic_payload_message(payload: Box<dyn Any + Send>) -> String {
     match payload.downcast::<String>() {
         Ok(message) => *message,
@@ -13092,7 +13168,7 @@ pub fn run_index(
     opts: IndexOptions,
     event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
 ) -> Result<()> {
-    ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(false, Ordering::Relaxed);
+    reset_active_session_source_skips();
     let _progress_reset = RunIndexProgressReset::new(opts.progress.clone());
     // Analytics tables are derived assets and can be rebuilt by doctor/rebuild
     // flows. Keep routine indexing focused on the canonical conversation store
@@ -14721,8 +14797,11 @@ pub fn run_index(
             && !preserve_scan_watermark
             && !scan_had_errors
             && scan_deferred_conversations == 0;
-        let performed_scan_for_connector_watermarks =
-            performed_scan && !preserve_scan_watermark && scan_deferred_conversations == 0;
+        let connector_watermark_to_persist = connector_scan_watermark_to_persist(
+            performed_scan,
+            scan_deferred_conversations,
+            scan_start_ts,
+        );
         if performed_scan && preserve_scan_watermark {
             tracing::info!(
                 db_path = %opts.db_path.display(),
@@ -14741,12 +14820,12 @@ pub fn run_index(
             scan_start_ts,
             now_ms,
         )?;
-        if performed_scan_for_connector_watermarks {
+        if let Some(connector_watermark_ts) = connector_watermark_to_persist {
             persist_connector_scan_watermarks(
                 &storage,
                 &opts.db_path,
                 &scanned_connectors,
-                scan_start_ts,
+                connector_watermark_ts,
             )?;
         }
     }
@@ -30513,8 +30592,116 @@ mod tests {
 
     impl Drop for ActiveSessionSkipReset {
         fn drop(&mut self) {
-            ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(false, Ordering::Relaxed);
+            reset_active_session_source_skips();
         }
+    }
+
+    #[test]
+    #[serial]
+    fn effective_connector_watermark_advances_to_earliest_skipped_source_mtime() {
+        let _active_skip_reset = ActiveSessionSkipReset;
+        let _exclusions = unset_env_var("CASS_EXCLUDE_PATHS");
+        reset_active_session_source_skips();
+
+        // Two sources were deferred this run. The older one is the one we still
+        // owe a rescan, so it — not the scan start — bounds the watermark.
+        ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(true, Ordering::Relaxed);
+        note_active_session_source_skip_mtime(Some(1_800_000));
+        note_active_session_source_skip_mtime(Some(1_500_000));
+
+        assert_eq!(
+            effective_connector_scan_watermark_ts(2_000_000),
+            Some(1_500_000),
+            "watermark must advance up to the earliest deferred source instead of freezing"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn connector_watermark_to_persist_advances_to_earliest_skipped_mtime() {
+        let _active_skip_reset = ActiveSessionSkipReset;
+        let _exclusions = unset_env_var("CASS_EXCLUDE_PATHS");
+        reset_active_session_source_skips();
+
+        ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(true, Ordering::Relaxed);
+        note_active_session_source_skip_mtime(Some(1_500_000));
+
+        assert_eq!(
+            connector_scan_watermark_to_persist(true, 0, 2_000_000),
+            Some(1_500_000),
+            "a finished run must still advance connector watermarks up to the earliest deferred source"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn connector_watermark_to_persist_stays_frozen_under_path_exclusions() {
+        let _active_skip_reset = ActiveSessionSkipReset;
+        let _exclusions = set_env_var("CASS_EXCLUDE_PATHS", "/some/excluded/root");
+        reset_active_session_source_skips();
+
+        assert_eq!(
+            connector_scan_watermark_to_persist(true, 0, 2_000_000),
+            None,
+            "excluded paths are invisible rather than deferred, so no advance is provably safe"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn connector_watermark_to_persist_stays_frozen_when_a_skipped_mtime_is_unreadable() {
+        let _active_skip_reset = ActiveSessionSkipReset;
+        let _exclusions = unset_env_var("CASS_EXCLUDE_PATHS");
+        reset_active_session_source_skips();
+
+        ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(true, Ordering::Relaxed);
+        note_active_session_source_skip_mtime(None);
+
+        assert_eq!(
+            connector_scan_watermark_to_persist(true, 0, 2_000_000),
+            None,
+            "an unreadable mtime makes the safe bound unknowable; fall back to freezing"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn skipping_an_active_session_source_bounds_the_watermark_by_its_mtime() {
+        let _active_skip_reset = ActiveSessionSkipReset;
+        let _exclusions = unset_env_var("CASS_EXCLUDE_PATHS");
+        reset_active_session_source_skips();
+
+        let tmp = TempDir::new().unwrap();
+        let source_path = tmp.path().join("rollout-still-writing.jsonl");
+        std::fs::write(&source_path, "{}\n").unwrap();
+        let mtime_ms = i64::try_from(
+            std::fs::metadata(&source_path)
+                .unwrap()
+                .modified()
+                .unwrap()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+
+        let filter = ActiveSessionSourceFilter::with_recent_write_window_for_test(Some(
+            Duration::from_secs(3_600),
+        ));
+        assert!(
+            should_skip_active_session_source(
+                &filter,
+                crate::sources::provenance::LOCAL_SOURCE_ID,
+                &source_path,
+            ),
+            "a just-written session source must be treated as actively written"
+        );
+
+        assert_eq!(
+            effective_connector_scan_watermark_ts(mtime_ms + 600_000),
+            Some(mtime_ms),
+            "the skipped source's mtime must bound the watermark so the next scan revisits it"
+        );
     }
 
     fn set_env_var(key: &'static str, value: impl AsRef<str>) -> EnvGuard {
