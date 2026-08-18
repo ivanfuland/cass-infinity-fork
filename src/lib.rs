@@ -99824,6 +99824,251 @@ pub fn mirror_relink(options: &MirrorRelinkOptions) -> Result<MirrorRelinkReport
     })
 }
 
+// ── Task E3 Step 4 · relink 自己的 journal ────────────────────────────────
+//
+// `--apply` 跨两个提交域：DB（receipt）与 manifest publish。任一边界崩溃后，
+// **全新进程**必须只凭磁盘上的 journal + receipt 幂等收敛。
+//
+// journal 落 repo 外私有 run root 的文件（`0600`），**不落库**；
+// 落库的只有 receipt，且与 DB 侧动作同事务。
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RelinkJournalState {
+    Planned,
+    DbCommitted,
+    ManifestPartial,
+    ClosureVerified,
+    Committed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RelinkPlannedManifest {
+    pub manifest_relative_path: String,
+    pub after: Vec<raw_mirror::RawMirrorDbLink>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RelinkJournal {
+    pub operation_id: String,
+    pub state: RelinkJournalState,
+    pub data_dir: PathBuf,
+    pub planned: Vec<RelinkPlannedManifest>,
+    /// 已确认落盘的 manifest 相对路径。恢复时据它跳过已完成项。
+    pub published: Vec<String>,
+}
+
+fn relink_journal_write(path: &Path, journal: &RelinkJournal) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(journal)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+pub fn relink_journal_read(path: &Path) -> Result<Option<RelinkJournal>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// 崩溃注入用的确定性握手点。
+///
+/// **不用 sleep 赌进度**：到达指定边界时写哨兵文件，然后原地阻塞等父进程
+/// SIGKILL。时序赌博会让注入点漂移，测的就不是那个边界了。
+fn relink_pause_if_requested(boundary: &str) {
+    let Ok(target) = std::env::var("CASS_RELINK_PAUSE_AT") else {
+        return;
+    };
+    if target != boundary {
+        return;
+    }
+    if let Ok(sentinel) = std::env::var("CASS_RELINK_PAUSE_SENTINEL") {
+        let _ = std::fs::write(&sentinel, boundary.as_bytes());
+    }
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// 在一个事务里写 receipt。receipt 是 DB 侧唯一的提交事实。
+fn relink_write_receipt(db_path: &Path, operation_id: &str, state: &str) -> Result<()> {
+    use frankensqlite::compat::{ConnectionExt as _, ParamValue};
+    let storage = crate::storage::sqlite::FrankenStorage::open(db_path)
+        .map_err(|e| anyhow::anyhow!("open db for relink receipt {}: {e}", db_path.display()))?;
+    let raw = storage.raw();
+    raw.execute("BEGIN IMMEDIATE;")
+        .map_err(|e| anyhow::anyhow!("begin relink receipt tx: {e}"))?;
+    let result = raw.execute_compat(
+        "INSERT INTO operation_commit_receipt \
+         (idempotency_key, operation, state, committed_at_ms) VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT(idempotency_key) DO UPDATE SET state = excluded.state",
+        &[
+            ParamValue::from(operation_id),
+            ParamValue::from("mirror-relink"),
+            ParamValue::from(state),
+            ParamValue::from(0i64),
+        ],
+    );
+    match result {
+        Ok(_) => {
+            raw.execute("COMMIT;")
+                .map_err(|e| anyhow::anyhow!("commit relink receipt: {e}"))?;
+            Ok(())
+        }
+        Err(err) => {
+            let _ = raw.execute("ROLLBACK;");
+            Err(anyhow::anyhow!("write relink receipt: {err}"))
+        }
+    }
+}
+
+pub fn relink_receipt_state(db_path: &Path, operation_id: &str) -> Result<Option<String>> {
+    use frankensqlite::compat::RowExt as _;
+    let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(db_path)
+        .map_err(|e| anyhow::anyhow!("open db for receipt read {}: {e}", db_path.display()))?;
+    let rows = storage
+        .raw()
+        .query_with_params(
+            "SELECT state FROM operation_commit_receipt WHERE idempotency_key = ?1",
+            &[frankensqlite::SqliteValue::from(operation_id)],
+        )
+        .map_err(|e| anyhow::anyhow!("read relink receipt: {e}"))?;
+    let out = rows
+        .first()
+        .and_then(|row| row.get_typed::<String>(0).ok());
+    storage.close_best_effort_in_place();
+    Ok(out)
+}
+
+/// 带 journal 的 `--apply`。崩溃后用 [`relink_recover`] 收敛。
+pub fn relink_apply_journaled(
+    options: &MirrorRelinkOptions,
+    journal_path: &Path,
+    operation_id: &str,
+) -> Result<MirrorRelinkReport> {
+    let plan = mirror_relink(&MirrorRelinkOptions {
+        data_dir: options.data_dir.clone(),
+        apply: false,
+    })?;
+    let mut journal = RelinkJournal {
+        operation_id: operation_id.to_string(),
+        state: RelinkJournalState::Planned,
+        data_dir: options.data_dir.clone(),
+        planned: plan
+            .changes
+            .iter()
+            .map(|c| RelinkPlannedManifest {
+                manifest_relative_path: c.manifest_relative_path.clone(),
+                after: c.after.clone(),
+            })
+            .collect(),
+        published: Vec::new(),
+    };
+    relink_journal_write(journal_path, &journal)?;
+    relink_pause_if_requested("planned");
+
+    let db_path = options.data_dir.join("agent_search.db");
+    relink_write_receipt(&db_path, operation_id, "db-committed")?;
+    journal.state = RelinkJournalState::DbCommitted;
+    relink_journal_write(journal_path, &journal)?;
+    relink_pause_if_requested("db-committed");
+
+    relink_drive_manifest_phase(&mut journal, journal_path)?;
+    relink_finalize(&mut journal, journal_path, &db_path)?;
+    relink_report_after(&journal)
+}
+
+fn relink_drive_manifest_phase(journal: &mut RelinkJournal, journal_path: &Path) -> Result<()> {
+    for item in journal.planned.clone() {
+        if journal.published.contains(&item.manifest_relative_path) {
+            continue;
+        }
+        raw_mirror::rebuild_manifest_db_links(
+            &journal.data_dir,
+            &item.manifest_relative_path,
+            &item.after,
+        )?;
+        journal.published.push(item.manifest_relative_path.clone());
+        journal.state = RelinkJournalState::ManifestPartial;
+        relink_journal_write(journal_path, journal)?;
+        relink_pause_if_requested("manifest-partial");
+    }
+    Ok(())
+}
+
+fn relink_finalize(
+    journal: &mut RelinkJournal,
+    journal_path: &Path,
+    db_path: &Path,
+) -> Result<()> {
+    let verify = mirror_relink(&MirrorRelinkOptions {
+        data_dir: journal.data_dir.clone(),
+        apply: false,
+    })?;
+    if !verify.changes.is_empty() {
+        anyhow::bail!(
+            "relink closure verification failed: {} manifest(s) still differ",
+            verify.changes.len()
+        );
+    }
+    journal.state = RelinkJournalState::ClosureVerified;
+    relink_journal_write(journal_path, journal)?;
+    relink_pause_if_requested("closure-verified");
+
+    relink_write_receipt(db_path, &journal.operation_id, "committed")?;
+    journal.state = RelinkJournalState::Committed;
+    relink_journal_write(journal_path, journal)?;
+    Ok(())
+}
+
+fn relink_report_after(journal: &RelinkJournal) -> Result<MirrorRelinkReport> {
+    let mut report = mirror_relink(&MirrorRelinkOptions {
+        data_dir: journal.data_dir.clone(),
+        apply: false,
+    })?;
+    report.applied = true;
+    report.manifests_written = journal.published.len();
+    Ok(report)
+}
+
+/// 崩溃恢复：**输入只有磁盘上的 journal + receipt**，不接受任何内存态提示。
+pub fn relink_recover(journal_path: &Path) -> Result<MirrorRelinkReport> {
+    let Some(mut journal) = relink_journal_read(journal_path)? else {
+        anyhow::bail!("no relink journal at {}", journal_path.display());
+    };
+    let db_path = journal.data_dir.join("agent_search.db");
+    let receipt = relink_receipt_state(&db_path, &journal.operation_id)?;
+
+    match journal.state {
+        // 计划已写但 DB 侧未提交 —— 什么都没发生过，不做半步恢复。
+        RelinkJournalState::Planned if receipt.is_none() => {
+            return relink_report_after(&journal);
+        }
+        RelinkJournalState::Committed => return relink_report_after(&journal),
+        _ => {}
+    }
+    if receipt.is_none() {
+        anyhow::bail!(
+            "relink journal at state {:?} but no receipt for {} — refusing to guess",
+            journal.state,
+            journal.operation_id
+        );
+    }
+    relink_drive_manifest_phase(&mut journal, journal_path)?;
+    relink_finalize(&mut journal, journal_path, &db_path)?;
+    relink_report_after(&journal)
+}
+
 #[cfg(test)]
 mod mirror_relink_tests {
     use super::*;
@@ -100080,6 +100325,248 @@ mod mirror_relink_tests {
             views[0].db_links.is_empty(),
             "dry-run 之后 manifest 的 db_links 必须仍为空"
         );
+    }
+
+    /// 完整 write-set 快照：data_dir 下每个常规文件的
+    /// (相对路径, 字节数, sha256)，外加候选 DB 的强摘要。
+    ///
+    /// **刻意覆盖整棵 data_dir 而不只是 DB**：relink 的主要写对象正是
+    /// manifest，只比 DB 会漏掉 manifest 被误写；journal / marker 目录、
+    /// blob 目录、以及任何**新增或消失**的文件也都在这份清单里。
+    fn write_set_snapshot(data_dir: &Path) -> Vec<(String, u64, String)> {
+        fn walk(dir: &Path, base: &Path, out: &mut Vec<(String, u64, String)>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                if meta.is_dir() {
+                    walk(&path, base, out);
+                } else if meta.is_file() {
+                    let bytes = std::fs::read(&path).unwrap_or_default();
+                    let digest = blake3::hash(&bytes).to_hex().to_string();
+                    out.push((
+                        path.strip_prefix(base)
+                            .unwrap_or(&path)
+                            .display()
+                            .to_string(),
+                        meta.len(),
+                        digest,
+                    ));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(data_dir, data_dir, &mut out);
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn relink_dry_run_leaves_the_entire_write_set_unchanged() {
+        let (_tmp, data_dir, _rel, _conv_id, _src) = fixture(false);
+
+        let before = write_set_snapshot(&data_dir);
+        assert!(
+            before.iter().any(|(p, _, _)| p.contains("manifests/")),
+            "快照必须真的覆盖到 manifest，否则这道断言是空的"
+        );
+
+        let report = run(&data_dir, false);
+        assert!(!report.changes.is_empty(), "本 fixture 确有待重建项，否则 dry-run 不变性是废断言");
+
+        let after = write_set_snapshot(&data_dir);
+        assert_eq!(
+            before, after,
+            "dry-run 之后完整 write-set 必须逐项相等（含 manifest / blob / journal / marker 与文件增删）"
+        );
+
+        // ── 阳性对照：证明这份快照**能**看见写 ───────────────────────
+        // 不做这一步的话，一个根本不敏感的快照同样会让上面的断言通过。
+        let applied = run(&data_dir, true);
+        assert_eq!(applied.manifests_written, 1);
+        let after_apply = write_set_snapshot(&data_dir);
+        assert_ne!(
+            before, after_apply,
+            "快照必须能检出 --apply 的写入；检不出说明快照本身失效，上面的 dry-run 断言不算数"
+        );
+
+        // 差异必须恰好落在 manifest 上，不该波及 blob。
+        let changed: Vec<&String> = after_apply
+            .iter()
+            .zip(before.iter())
+            .filter(|(a, b)| a != b)
+            .map(|(a, _)| &a.0)
+            .collect();
+        assert!(
+            changed.iter().all(|p| p.contains("manifests/")),
+            "relink 的写对象只应是 manifest，实得变化项 {changed:?}"
+        );
+    }
+
+    // ── Step 4：journal 状态机 + 每个边界的 SIGKILL 注入 ─────────────
+    //
+    // 注入用**测试二进制的子进程**：判据是「全新进程按 journal + receipt 幂等
+    // 收敛」，子进程天然满足「全新」（零内存态继承）。边界同步是**确定性握手**
+    // ——子进程到达边界写哨兵文件后原地阻塞，父进程见哨兵才 kill；
+    // 不用 sleep 赌进度。SIGKILL 只打**显式记录的子进程 pid**，不杀进程组。
+
+    /// 子进程入口：由父进程用 `--ignored --exact` 拉起。
+    #[test]
+    #[ignore]
+    fn relink_crash_child_entrypoint() {
+        let data_dir = PathBuf::from(std::env::var("CASS_RELINK_CHILD_DATA_DIR").unwrap());
+        let journal = PathBuf::from(std::env::var("CASS_RELINK_CHILD_JOURNAL").unwrap());
+        let op = std::env::var("CASS_RELINK_CHILD_OP").unwrap();
+        let _ = relink_apply_journaled(
+            &MirrorRelinkOptions {
+                data_dir,
+                apply: true,
+            },
+            &journal,
+            &op,
+        );
+    }
+
+    fn spawn_child_and_kill_at(
+        boundary: &str,
+        data_dir: &Path,
+        journal: &Path,
+        op: &str,
+        sentinel: &Path,
+    ) -> (u32, bool) {
+        let exe = std::env::current_exe().expect("test binary path");
+        let mut child = std::process::Command::new(exe)
+            .args([
+                "--ignored",
+                "--exact",
+                "mirror_relink_tests::relink_crash_child_entrypoint",
+            ])
+            .env("CASS_RELINK_CHILD_DATA_DIR", data_dir)
+            .env("CASS_RELINK_CHILD_JOURNAL", journal)
+            .env("CASS_RELINK_CHILD_OP", op)
+            .env("CASS_RELINK_PAUSE_AT", boundary)
+            .env("CASS_RELINK_PAUSE_SENTINEL", sentinel)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn crash child");
+        let pid = child.id();
+
+        // 确定性握手：等哨兵出现，不按时间赌。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut handshaken = false;
+        while std::time::Instant::now() < deadline {
+            if sentinel.exists() {
+                handshaken = true;
+                break;
+            }
+            if let Ok(Some(_)) = child.try_wait() {
+                break; // 子进程自己结束了（该边界不可达）
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if handshaken {
+            // 只杀**这个显式持有的子进程句柄**（Unix 上 Child::kill 即 SIGKILL），
+            // 不杀进程组、不按名字模式匹配、不引入新依赖。
+            child.kill().expect("SIGKILL the recorded child");
+        }
+        let _ = child.wait();
+        (pid, handshaken)
+    }
+
+    fn boundary_case(boundary: &str, expected_state: RelinkJournalState, work_pending: bool) {
+        let (_tmp, data_dir, _rel, conv_id, _src) = fixture(false);
+        let journal = data_dir.parent().unwrap().join("relink-journal.json");
+        let sentinel = data_dir.parent().unwrap().join(format!("sentinel-{boundary}"));
+        let op = format!("relink-crash-{boundary}");
+
+        let (pid, handshaken) = spawn_child_and_kill_at(
+            boundary, &data_dir, &journal, &op, &sentinel,
+        );
+        assert!(
+            handshaken,
+            "边界 {boundary} 未被子进程到达（哨兵未出现）——注入点不可达，不能算通过"
+        );
+        assert!(
+            !sentinel_pid_alive(pid),
+            "SIGKILL 之后子进程 {pid} 必须已死"
+        );
+
+        // 崩溃现场：journal 必须停在该边界或更早，且绝不是 Committed。
+        let mid = relink_journal_read(&journal)
+            .expect("journal readable")
+            .expect("journal must exist after the boundary was reached");
+        assert_ne!(
+            mid.state,
+            RelinkJournalState::Committed,
+            "在 {boundary} 被杀，journal 不该已经是 Committed"
+        );
+        // 注入必须**落在预期边界**，否则测的不是这个边界。
+        assert_eq!(
+            mid.state, expected_state,
+            "在 {boundary} 注入，崩溃现场的 journal 状态应为 {expected_state:?}"
+        );
+        // 崩溃时确有未竟工作，否则「恢复后收敛」是个无事可做的假绿。
+        let mid_views = crate::raw_mirror::manifest_views(&data_dir).unwrap();
+        if work_pending {
+            assert!(
+                mid_views[0].db_links.is_empty(),
+                "在 {boundary} 崩溃时 manifest 还不该被发布——否则恢复无事可做"
+            );
+        } else {
+            assert!(
+                !mid_views[0].db_links.is_empty(),
+                "在 {boundary} 崩溃时 manifest 应已发布，剩下的是收尾"
+            );
+        }
+
+        // 恢复：**另一个全新进程语义** —— 输入只有磁盘上的 journal + receipt。
+        let recovered = relink_recover(&journal).expect("recovery must converge");
+        let final_journal = relink_journal_read(&journal).unwrap().unwrap();
+        assert_eq!(
+            final_journal.state,
+            RelinkJournalState::Committed,
+            "恢复后 journal 必须收敛到 Committed"
+        );
+        assert!(
+            recovered.changes.is_empty(),
+            "收敛后不该还有待重建项，实得 {:?}",
+            recovered.changes
+        );
+        let views = crate::raw_mirror::manifest_views(&data_dir).unwrap();
+        assert_eq!(
+            views[0].db_links.len(),
+            1,
+            "恢复后 manifest 的 db_links 必须已重建"
+        );
+        assert_eq!(views[0].db_links[0].conversation_id, Some(conv_id));
+
+        // 幂等：再恢复一次不得改变任何东西。
+        let again = relink_recover(&journal).expect("second recovery is a no-op");
+        assert!(again.changes.is_empty());
+    }
+
+    fn sentinel_pid_alive(pid: u32) -> bool {
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }
+
+    #[test]
+    fn relink_crash_at_db_committed_boundary_converges() {
+        boundary_case("db-committed", RelinkJournalState::DbCommitted, true);
+    }
+
+    #[test]
+    fn relink_crash_at_manifest_partial_boundary_converges() {
+        boundary_case("manifest-partial", RelinkJournalState::ManifestPartial, false);
+    }
+
+    #[test]
+    fn relink_crash_at_closure_verified_boundary_converges() {
+        boundary_case("closure-verified", RelinkJournalState::ClosureVerified, false);
     }
 
     #[test]
