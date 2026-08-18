@@ -40,9 +40,9 @@ pub mod metric_integrity;
 pub mod model;
 pub mod pages;
 pub mod perf_evidence;
-pub mod policy_registry;
 pub mod phase3_bundle;
 pub mod phase3_restore;
+pub mod policy_registry;
 pub mod privacy_exposure;
 pub mod proof_artifact;
 pub mod query_cost_planner;
@@ -99945,9 +99945,7 @@ pub fn relink_receipt_state(db_path: &Path, operation_id: &str) -> Result<Option
             &[frankensqlite::SqliteValue::from(operation_id)],
         )
         .map_err(|e| anyhow::anyhow!("read relink receipt: {e}"))?;
-    let out = rows
-        .first()
-        .and_then(|row| row.get_typed::<String>(0).ok());
+    let out = rows.first().and_then(|row| row.get_typed::<String>(0).ok());
     storage.close_best_effort_in_place();
     Ok(out)
 }
@@ -100008,11 +100006,7 @@ fn relink_drive_manifest_phase(journal: &mut RelinkJournal, journal_path: &Path)
     Ok(())
 }
 
-fn relink_finalize(
-    journal: &mut RelinkJournal,
-    journal_path: &Path,
-    db_path: &Path,
-) -> Result<()> {
+fn relink_finalize(journal: &mut RelinkJournal, journal_path: &Path, db_path: &Path) -> Result<()> {
     let verify = mirror_relink(&MirrorRelinkOptions {
         data_dir: journal.data_dir.clone(),
         apply: false,
@@ -100085,7 +100079,11 @@ mod mirror_relink_tests {
         std::fs::create_dir_all(&data_dir).unwrap();
 
         let source_file = tmp.path().join("session-alpha.jsonl");
-        std::fs::write(&source_file, b"{\"role\":\"user\"}\n{\"role\":\"assistant\"}\n").unwrap();
+        std::fs::write(
+            &source_file,
+            b"{\"role\":\"user\"}\n{\"role\":\"assistant\"}\n",
+        )
+        .unwrap();
 
         // DB：一条会话 + 两条消息，身份与 manifest 对齐。
         let db_path = data_dir.join("agent_search.db");
@@ -100165,7 +100163,11 @@ mod mirror_relink_tests {
         assert_eq!(change.after.len(), 1, "按身份该匹配到恰好一条会话");
         let link = &change.after[0];
         assert_eq!(link.conversation_id, Some(conv_id));
-        assert_eq!(link.message_count, Some(2), "message_count 必须取自真实消息数");
+        assert_eq!(
+            link.message_count,
+            Some(2),
+            "message_count 必须取自真实消息数"
+        );
         assert_eq!(link.started_at_ms, Some(1_710_000_000_000));
     }
 
@@ -100378,7 +100380,10 @@ mod mirror_relink_tests {
         );
 
         let report = run(&data_dir, false);
-        assert!(!report.changes.is_empty(), "本 fixture 确有待重建项，否则 dry-run 不变性是废断言");
+        assert!(
+            !report.changes.is_empty(),
+            "本 fixture 确有待重建项，否则 dry-run 不变性是废断言"
+        );
 
         let after = write_set_snapshot(&data_dir);
         assert_eq!(
@@ -100483,12 +100488,14 @@ mod mirror_relink_tests {
     fn boundary_case(boundary: &str, expected_state: RelinkJournalState, work_pending: bool) {
         let (_tmp, data_dir, _rel, conv_id, _src) = fixture(false);
         let journal = data_dir.parent().unwrap().join("relink-journal.json");
-        let sentinel = data_dir.parent().unwrap().join(format!("sentinel-{boundary}"));
+        let sentinel = data_dir
+            .parent()
+            .unwrap()
+            .join(format!("sentinel-{boundary}"));
         let op = format!("relink-crash-{boundary}");
 
-        let (pid, handshaken) = spawn_child_and_kill_at(
-            boundary, &data_dir, &journal, &op, &sentinel,
-        );
+        let (pid, handshaken) =
+            spawn_child_and_kill_at(boundary, &data_dir, &journal, &op, &sentinel);
         assert!(
             handshaken,
             "边界 {boundary} 未被子进程到达（哨兵未出现）——注入点不可达，不能算通过"
@@ -100563,12 +100570,20 @@ mod mirror_relink_tests {
 
     #[test]
     fn relink_crash_at_manifest_partial_boundary_converges() {
-        boundary_case("manifest-partial", RelinkJournalState::ManifestPartial, false);
+        boundary_case(
+            "manifest-partial",
+            RelinkJournalState::ManifestPartial,
+            false,
+        );
     }
 
     #[test]
     fn relink_crash_at_closure_verified_boundary_converges() {
-        boundary_case("closure-verified", RelinkJournalState::ClosureVerified, false);
+        boundary_case(
+            "closure-verified",
+            RelinkJournalState::ClosureVerified,
+            false,
+        );
     }
 
     #[test]
