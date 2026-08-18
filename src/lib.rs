@@ -41,6 +41,7 @@ pub mod model;
 pub mod pages;
 pub mod perf_evidence;
 pub mod policy_registry;
+pub mod phase3_bundle;
 pub mod privacy_exposure;
 pub mod proof_artifact;
 pub mod query_cost_planner;

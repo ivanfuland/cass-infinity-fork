@@ -1,0 +1,37 @@
+{
+ "appendix_section": "§B.2",
+ "cases": [
+  {
+   "case_id": "v05.tombstone",
+   "expect": "accept",
+   "expected": {
+    "root": "3f4289806ca43b6699fbea135da5d907625718506a2243d91b98d469c0e44a6f",
+    "sorted_keys": [
+     "base_payload_hash",
+     "canonical_path",
+     "object_kind",
+     "observed_missing_at_ms",
+     "origin"
+    ],
+    "tree_hash": "b362d4c4db3f7ea6f582c46f82cdaf57e929cdf682c79ed1661858f4d5d48461"
+   },
+   "input": {
+    "base_payload_hash": "d6ad880bbbc7a3ae5fd70f89943828911cf1d4fe6f9abfed65b9245e86e9893c",
+    "canonical_path": "/home/u/.openclaw/sessions/s.jsonl",
+    "object_kind": "seal.tombstone",
+    "observed_missing_at_ms": 1754400000000,
+    "origin": "openclaw"
+   },
+   "input_tags": {
+    "base_payload_hash": "x",
+    "canonical_path": "p",
+    "object_kind": "s",
+    "observed_missing_at_ms": "i",
+    "origin": "s"
+   },
+   "object_kind": "seal.tombstone"
+  }
+ ],
+ "note": "文件消失，base payload 仍在 bundle 内（tombstone 不删 payload）",
+ "vector_group": "v05"
+}

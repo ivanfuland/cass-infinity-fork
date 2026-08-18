@@ -1,0 +1,246 @@
+{
+ "appendix_section": "§B.5/§A.3.1",
+ "cases": [
+  {
+   "case_id": "v07.hold.unreadable",
+   "expect": "accept",
+   "expected": {
+    "root": "f1b4145bff0040bd56a7a958b813538be3473c4c3fdc927d0b11672b6cf80c97",
+    "sorted_keys": [
+     "canonical_path",
+     "detail",
+     "object_kind",
+     "origin",
+     "reason"
+    ],
+    "tree_hash": "c84875fda8da8ec2246a619f9bcef0f4984dc9c8552ca37f354b5199203258a9"
+   },
+   "input": {
+    "canonical_path": "/home/u/.codex/sessions/rollout-z.jsonl",
+    "detail": null,
+    "object_kind": "seal.hold",
+    "origin": "codex",
+    "reason": "unreadable"
+   },
+   "input_tags": {
+    "canonical_path": "p",
+    "detail": "n",
+    "object_kind": "s",
+    "origin": "s",
+    "reason": "s"
+   },
+   "object_kind": "seal.hold"
+  },
+  {
+   "case_id": "v07.hold.fd-unavailable",
+   "expect": "accept",
+   "expected": {
+    "root": "2b4ce6812d419f3729fb541e0f8d72e452a4f0c707ded04f5a8a06747ff38a8c",
+    "sorted_keys": [
+     "canonical_path",
+     "detail",
+     "object_kind",
+     "origin",
+     "reason"
+    ],
+    "tree_hash": "f4c7e65e27ac48aa5b91a970754870fda0e0daa6c20f14d5eb4635a1dc13d69f"
+   },
+   "input": {
+    "canonical_path": "/home/u/.codex/sessions/rollout-z.jsonl",
+    "detail": null,
+    "object_kind": "seal.hold",
+    "origin": "codex",
+    "reason": "fd-unavailable"
+   },
+   "input_tags": {
+    "canonical_path": "p",
+    "detail": "n",
+    "object_kind": "s",
+    "origin": "s",
+    "reason": "s"
+   },
+   "object_kind": "seal.hold"
+  },
+  {
+   "case_id": "v07.hold.prefix-rewritten",
+   "expect": "accept",
+   "expected": {
+    "root": "9a78950afdbce77d6fb28f5e399f426b830bfb4b4942852320f4db401721199e",
+    "sorted_keys": [
+     "canonical_path",
+     "detail",
+     "object_kind",
+     "origin",
+     "reason"
+    ],
+    "tree_hash": "305a1f76f3fc02e3b75eec2b29537dc22ca49de71fa56f918c5e187e9794f9e6"
+   },
+   "input": {
+    "canonical_path": "/home/u/.codex/sessions/rollout-z.jsonl",
+    "detail": null,
+    "object_kind": "seal.hold",
+    "origin": "codex",
+    "reason": "prefix-rewritten"
+   },
+   "input_tags": {
+    "canonical_path": "p",
+    "detail": "n",
+    "object_kind": "s",
+    "origin": "s",
+    "reason": "s"
+   },
+   "object_kind": "seal.hold"
+  },
+  {
+   "case_id": "v07.hold.stability-timeout",
+   "expect": "accept",
+   "expected": {
+    "root": "9de5b8eaa3bc569d24d3aa56013e7dfd5161c60c3fa859ac46bc87b9461c17c2",
+    "sorted_keys": [
+     "canonical_path",
+     "detail",
+     "object_kind",
+     "origin",
+     "reason"
+    ],
+    "tree_hash": "849b2a669919c179b43f3ba3f2a31c1828332d15a590b549b071995fda6b10fc"
+   },
+   "input": {
+    "canonical_path": "/home/u/.codex/sessions/rollout-z.jsonl",
+    "detail": null,
+    "object_kind": "seal.hold",
+    "origin": "codex",
+    "reason": "stability-timeout"
+   },
+   "input_tags": {
+    "canonical_path": "p",
+    "detail": "n",
+    "object_kind": "s",
+    "origin": "s",
+    "reason": "s"
+   },
+   "object_kind": "seal.hold"
+  },
+  {
+   "case_id": "v07.hold.out-of-scope-format",
+   "expect": "accept",
+   "expected": {
+    "root": "e91bec98900674608d56027ae96297cb4ac989fda5b7715b5f0ee098f5384ffb",
+    "sorted_keys": [
+     "canonical_path",
+     "detail",
+     "object_kind",
+     "origin",
+     "reason"
+    ],
+    "tree_hash": "50e2f9455ccfd4b7598ef890889bbfa8904dcce8aff8a02f18af2b57f8e605c3"
+   },
+   "input": {
+    "canonical_path": "/home/u/.codex/sessions/rollout-legacy.json",
+    "detail": "codex-rollout-json",
+    "object_kind": "seal.hold",
+    "origin": "codex",
+    "reason": "out-of-scope-format"
+   },
+   "input_tags": {
+    "canonical_path": "p",
+    "detail": "s",
+    "object_kind": "s",
+    "origin": "s",
+    "reason": "s"
+   },
+   "note": "上位契约 §2.2「任意 Codex rollout-*.json ... 本轮立即 HOLD 并另立范围」的编码。detail 在本类下不可空、必须记 W0-1 §B.3 的 bucket 名。解除条件是范围决策（属控制面决策点，见附录 §B.5.1），不是故障恢复——在范围裁定存在前，Phase 4 资格门必须把它计为 unresolved",
+   "object_kind": "seal.hold"
+  },
+  {
+   "case_id": "v07.holds-set-3seg",
+   "expect": "accept",
+   "expected": {
+    "count": 5,
+    "holds_set_root": "4041ccc309d75254cda4bd9b0fca82b447747442726fab2d2f48897163b4b7dd",
+    "item_roots": [
+     "e91bec98900674608d56027ae96297cb4ac989fda5b7715b5f0ee098f5384ffb",
+     "2b4ce6812d419f3729fb541e0f8d72e452a4f0c707ded04f5a8a06747ff38a8c",
+     "9a78950afdbce77d6fb28f5e399f426b830bfb4b4942852320f4db401721199e",
+     "9de5b8eaa3bc569d24d3aa56013e7dfd5161c60c3fa859ac46bc87b9461c17c2",
+     "f1b4145bff0040bd56a7a958b813538be3473c4c3fdc927d0b11672b6cf80c97"
+    ],
+    "sort_key_order": [
+     "out-of-scope-format",
+     "fd-unavailable",
+     "prefix-rewritten",
+     "stability-timeout",
+     "unreadable"
+    ],
+    "sort_key_tuples": [
+     [
+      "codex",
+      "/home/u/.codex/sessions/rollout-legacy.json",
+      "out-of-scope-format"
+     ],
+     [
+      "codex",
+      "/home/u/.codex/sessions/rollout-z.jsonl",
+      "fd-unavailable"
+     ],
+     [
+      "codex",
+      "/home/u/.codex/sessions/rollout-z.jsonl",
+      "prefix-rewritten"
+     ],
+     [
+      "codex",
+      "/home/u/.codex/sessions/rollout-z.jsonl",
+      "stability-timeout"
+     ],
+     [
+      "codex",
+      "/home/u/.codex/sessions/rollout-z.jsonl",
+      "unreadable"
+     ]
+    ]
+   },
+   "input_items": [
+    {
+     "canonical_path": "/home/u/.codex/sessions/rollout-legacy.json",
+     "detail": "codex-rollout-json",
+     "object_kind": "seal.hold",
+     "origin": "codex",
+     "reason": "out-of-scope-format"
+    },
+    {
+     "canonical_path": "/home/u/.codex/sessions/rollout-z.jsonl",
+     "detail": null,
+     "object_kind": "seal.hold",
+     "origin": "codex",
+     "reason": "fd-unavailable"
+    },
+    {
+     "canonical_path": "/home/u/.codex/sessions/rollout-z.jsonl",
+     "detail": null,
+     "object_kind": "seal.hold",
+     "origin": "codex",
+     "reason": "prefix-rewritten"
+    },
+    {
+     "canonical_path": "/home/u/.codex/sessions/rollout-z.jsonl",
+     "detail": null,
+     "object_kind": "seal.hold",
+     "origin": "codex",
+     "reason": "stability-timeout"
+    },
+    {
+     "canonical_path": "/home/u/.codex/sessions/rollout-z.jsonl",
+     "detail": null,
+     "object_kind": "seal.hold",
+     "origin": "codex",
+     "reason": "unreadable"
+    }
+   ],
+   "note": "共 5 条 HOLD，跨 **两个** canonical_path：其中 4 条同在 rollout-z.jsonl 上（钉三段排序键——两段实现会把这 4 条误撞 E-ARRAY-DUPKEY），另 1 条 out-of-scope-format 在 rollout-legacy.json 上、且因路径字节序更小而排在最前。该条的 detail 记合法 bucket，使 E-HOLD-DETAIL 在多 HOLD 场景下同样被钉住。item_roots 按 (origin, canonical_path, reason) 三段升序排列后喂 set_root，**不按 item_root 字节序**（§B.7）",
+   "set_name": "holds"
+  }
+ ],
+ "note": "六类 reason 里 v06(path-reincarnation) 之外的五类各一条 + holds 三段排序键的多 HOLD 集合用例",
+ "vector_group": "v07"
+}

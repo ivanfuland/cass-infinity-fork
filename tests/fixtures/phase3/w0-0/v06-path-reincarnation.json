@@ -1,0 +1,37 @@
+{
+ "appendix_section": "§B.4/§B.5",
+ "cases": [
+  {
+   "case_id": "v06.reincarnation",
+   "expect": "accept",
+   "expected": {
+    "root": "55ae730da0beb9455c0ac80b02f092047433cb2826209e141cd4e501c70932af",
+    "sorted_keys": [
+     "canonical_path",
+     "detail",
+     "object_kind",
+     "origin",
+     "reason"
+    ],
+    "tree_hash": "f969291d1dedbcd10c6353494c0573f1d589987a6c872f9a2a2bcef5c85ff72c"
+   },
+   "input": {
+    "canonical_path": "/home/u/.claude/projects/p/a.jsonl",
+    "detail": "content_identity unchanged, incarnation changed (ino 1234567 -> 7654321)",
+    "object_kind": "seal.hold",
+    "origin": "claude_code",
+    "reason": "path-reincarnation"
+   },
+   "input_tags": {
+    "canonical_path": "p",
+    "detail": "s",
+    "object_kind": "s",
+    "origin": "s",
+    "reason": "s"
+   },
+   "object_kind": "seal.hold"
+  }
+ ],
+ "note": "content_identity 相同而 incarnation 变 -> HOLD(path-reincarnation)",
+ "vector_group": "v06"
+}

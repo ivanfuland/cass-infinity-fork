@@ -1,0 +1,173 @@
+{
+ "appendix_section": "§B.1/§B.5",
+ "cases": [
+  {
+   "case_id": "v03b.zero-byte",
+   "expect": "accept",
+   "expected": {
+    "root": "b3af84c3bf6f35a049245e9583d1c63c32194556ea9a2bd8f707ca01b849c155",
+    "sorted_keys": [
+     "boundary_t",
+     "canonical_path",
+     "dev",
+     "empty_reason",
+     "ino",
+     "object_kind",
+     "origin",
+     "payload_hash",
+     "prefix_digest",
+     "session_id"
+    ],
+    "tree_hash": "65dcac042a6d6649028909a5c0b832233816838761ad8578d8e6e43e3c4d0f6c"
+   },
+   "input": {
+    "boundary_t": 0,
+    "canonical_path": "/home/u/.codex/sessions/rollout-x.jsonl",
+    "dev": 66306,
+    "empty_reason": "zero-byte-file",
+    "ino": 1234567,
+    "object_kind": "seal.entry",
+    "origin": "codex",
+    "payload_hash": "c9e96a4e2c491581fa6b02b82a67741b4f36438c89dbdb9889209c86068297a8",
+    "prefix_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "session_id": null
+   },
+   "input_tags": {
+    "boundary_t": "i",
+    "canonical_path": "p",
+    "dev": "i",
+    "empty_reason": "s",
+    "ino": "i",
+    "object_kind": "s",
+    "origin": "s",
+    "payload_hash": "x",
+    "prefix_digest": "x",
+    "session_id": "n"
+   },
+   "object_kind": "seal.entry"
+  },
+  {
+   "case_id": "v03b.no-complete-record",
+   "expect": "accept",
+   "expected": {
+    "root": "5c52e6e1fab14d4aa611784db6ebfacec8d44455a1d272b942a1d5f4f7703a18",
+    "sorted_keys": [
+     "boundary_t",
+     "canonical_path",
+     "dev",
+     "empty_reason",
+     "ino",
+     "object_kind",
+     "origin",
+     "payload_hash",
+     "prefix_digest",
+     "session_id"
+    ],
+    "tree_hash": "d2d396a1df004e65cc4cb270a4fc37866fd019ed58cf79be1fdc7aeba67e71e4"
+   },
+   "input": {
+    "boundary_t": 0,
+    "canonical_path": "/home/u/.codex/sessions/rollout-y.jsonl",
+    "dev": 66306,
+    "empty_reason": "no-complete-record",
+    "ino": 1234567,
+    "object_kind": "seal.entry",
+    "origin": "codex",
+    "payload_hash": "c9e96a4e2c491581fa6b02b82a67741b4f36438c89dbdb9889209c86068297a8",
+    "prefix_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "session_id": null
+   },
+   "input_tags": {
+    "boundary_t": "i",
+    "canonical_path": "p",
+    "dev": "i",
+    "empty_reason": "s",
+    "ino": "i",
+    "object_kind": "s",
+    "origin": "s",
+    "payload_hash": "x",
+    "prefix_digest": "x",
+    "session_id": "n"
+   },
+   "object_kind": "seal.entry"
+  },
+  {
+   "case_id": "v03b.roots-differ",
+   "expect": "accept",
+   "expected": {
+    "must_differ": true,
+    "no_complete_record_root": "5c52e6e1fab14d4aa611784db6ebfacec8d44455a1d272b942a1d5f4f7703a18",
+    "zero_byte_root": "b3af84c3bf6f35a049245e9583d1c63c32194556ea9a2bd8f707ca01b849c155"
+   },
+   "input_case_refs": [
+    "v03b.zero-byte",
+    "v03b.no-complete-record"
+   ],
+   "note": "两条 payload_hash 与 prefix_digest 完全相同（都是空串），唯一差别是 empty_reason —— 归因字段进 leaf，故 root 必须不同"
+  },
+  {
+   "case_id": "v03b.reject.empty-reason-on-nonzero",
+   "expect": "reject",
+   "expected_error": "E-EMPTY-REASON",
+   "input": {
+    "boundary_t": 8,
+    "canonical_path": "/home/u/.claude/projects/p/a.jsonl",
+    "dev": 66306,
+    "empty_reason": "zero-byte-file",
+    "ino": 1234567,
+    "object_kind": "seal.entry",
+    "origin": "claude_code",
+    "payload_hash": "d6ad880bbbc7a3ae5fd70f89943828911cf1d4fe6f9abfed65b9245e86e9893c",
+    "prefix_digest": "e346432021b04179518d9614f3560ccd71354a4ee101ddcb893d6959a9d6301c",
+    "session_id": "sess-1"
+   },
+   "input_tags": {
+    "boundary_t": "i",
+    "canonical_path": "p",
+    "dev": "i",
+    "empty_reason": "s",
+    "ino": "i",
+    "object_kind": "s",
+    "origin": "s",
+    "payload_hash": "x",
+    "prefix_digest": "x",
+    "session_id": "s"
+   },
+   "note": "boundary_t = 8 > 0 却带 empty_reason，违反当且仅当关系",
+   "object_kind": "seal.entry"
+  },
+  {
+   "case_id": "v03b.reject.null-reason-on-zero",
+   "expect": "reject",
+   "expected_error": "E-EMPTY-REASON",
+   "input": {
+    "boundary_t": 0,
+    "canonical_path": "/home/u/.codex/sessions/rollout-x.jsonl",
+    "dev": 66306,
+    "empty_reason": null,
+    "ino": 1234567,
+    "object_kind": "seal.entry",
+    "origin": "codex",
+    "payload_hash": "c9e96a4e2c491581fa6b02b82a67741b4f36438c89dbdb9889209c86068297a8",
+    "prefix_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "session_id": null
+   },
+   "input_tags": {
+    "boundary_t": "i",
+    "canonical_path": "p",
+    "dev": "i",
+    "empty_reason": "n",
+    "ino": "i",
+    "object_kind": "s",
+    "origin": "s",
+    "payload_hash": "x",
+    "prefix_digest": "x",
+    "session_id": "n"
+   },
+   "note": "boundary_t == 0 却把 empty_reason 记为 null，违反当且仅当关系",
+   "object_kind": "seal.entry"
+  }
+ ],
+ "note": "附录 §B.5：无完整 record 是 boundary_t=0 的正常 entry，不是 HOLD。归因字段 empty_reason 区分两种成因",
+ "vector_group": "v03b"
+}

@@ -1,0 +1,54 @@
+{
+ "appendix_section": "§B.1",
+ "cases": [
+  {
+   "case_id": "v03.single",
+   "expect": "accept",
+   "expected": {
+    "boundary_t_ne_len": true,
+    "root": "f88b333d1e7c190de80ac1fc2428fbd0a307dbad7f0eea924f312b3b4cf4e117",
+    "sorted_keys": [
+     "boundary_t",
+     "canonical_path",
+     "dev",
+     "empty_reason",
+     "ino",
+     "object_kind",
+     "origin",
+     "payload_hash",
+     "prefix_digest",
+     "session_id"
+    ],
+    "tree_hash": "3b73def96ac6671d8b16fa91431f7a6827644356078090babc880d23679e014c"
+   },
+   "input": {
+    "boundary_t": 8,
+    "canonical_path": "/home/u/.claude/projects/p/a.jsonl",
+    "dev": 66306,
+    "empty_reason": null,
+    "ino": 1234567,
+    "object_kind": "seal.entry",
+    "origin": "claude_code",
+    "payload_hash": "d6ad880bbbc7a3ae5fd70f89943828911cf1d4fe6f9abfed65b9245e86e9893c",
+    "prefix_digest": "e346432021b04179518d9614f3560ccd71354a4ee101ddcb893d6959a9d6301c",
+    "session_id": "sess-1"
+   },
+   "input_tags": {
+    "boundary_t": "i",
+    "canonical_path": "p",
+    "dev": "i",
+    "empty_reason": "n",
+    "ino": "i",
+    "object_kind": "s",
+    "origin": "s",
+    "payload_hash": "x",
+    "prefix_digest": "x",
+    "session_id": "s"
+   },
+   "live_file_len": 13,
+   "object_kind": "seal.entry"
+  }
+ ],
+ "note": "单文件正常封存，boundary_t < len（退化实现鉴别：断言 boundary_t != len）",
+ "vector_group": "v03"
+}

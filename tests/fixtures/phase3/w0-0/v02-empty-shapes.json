@@ -1,0 +1,86 @@
+{
+ "appendix_section": "§A.9/§B.7",
+ "cases": [
+  {
+   "case_id": "v02.empty-sets",
+   "expect": "accept",
+   "expected": {
+    "set_roots": {
+     "entries": "3ee347e2ccd29dee8a4a46ba7f086ee6876a2cd08b5e3b60999e0c1eced102d0",
+     "holds": "6e151783d761f25a77c04f9026df029d3ada11cf9a280e73c2d66e3fd3d826a2",
+     "observed_after_cut": "4e1e2e82296bb756358ac76a2a3235a30a794461de0321ae59ba125292b0d593",
+     "tombstones": "8d06ceb2f24c04bc8c72c11f88e5bb222a5915c75233a46774a5ca96af4641d0"
+    }
+   },
+   "input_items": [],
+   "note": "本例**无 input 是定义性的**：空集合的输入就是空 item 序列。四个 set_root 各自等于 SHA-256(域串 || 0x00 || §A.1 空树常量)，走 §A.6 的 n=0 特例。列出 set_names 是为了让 runner 知道要算哪四个",
+   "set_names": [
+    "entries",
+    "holds",
+    "observed_after_cut",
+    "tombstones"
+   ]
+  },
+  {
+   "case_id": "v02.seal-result-empty",
+   "expect": "accept",
+   "expected": {
+    "root": "05f778e463412b238dbfd9a7fbd12a70f935e9135e8c18cc628580ce8b9b0687",
+    "sorted_keys": [
+     "entries_count",
+     "entries_root",
+     "holds_count",
+     "holds_root",
+     "object_kind",
+     "observed_after_cut_count",
+     "observed_after_cut_root",
+     "schema_version",
+     "tombstones_count",
+     "tombstones_root"
+    ],
+    "tree_hash": "157b5a9d40a726d1cfc2f5571a7c35fbfa230c9a1eeb3fecdfc96ee3f8573b55"
+   },
+   "input": {
+    "entries_count": 0,
+    "entries_root": "3ee347e2ccd29dee8a4a46ba7f086ee6876a2cd08b5e3b60999e0c1eced102d0",
+    "holds_count": 0,
+    "holds_root": "6e151783d761f25a77c04f9026df029d3ada11cf9a280e73c2d66e3fd3d826a2",
+    "object_kind": "seal.result",
+    "observed_after_cut_count": 0,
+    "observed_after_cut_root": "4e1e2e82296bb756358ac76a2a3235a30a794461de0321ae59ba125292b0d593",
+    "schema_version": "w0-0/v1",
+    "tombstones_count": 0,
+    "tombstones_root": "8d06ceb2f24c04bc8c72c11f88e5bb222a5915c75233a46774a5ca96af4641d0"
+   },
+   "object_kind": "seal.result"
+  },
+  {
+   "case_id": "v02.bundle-zero-payload",
+   "expect": "accept",
+   "expected": {
+    "root": "085b45a2821519ab855b5deffe16cc56cf512a83d047accf675352eeb2c11455",
+    "sorted_keys": [
+     "mirror_fingerprint",
+     "object_kind",
+     "payloads",
+     "promotable",
+     "schema_version",
+     "seal_result_root"
+    ],
+    "tree_hash": "f40750f5d74151b83c9ec1d38464a2dc8deb2d57d1e3a93a60fbaa221336863b"
+   },
+   "input": {
+    "mirror_fingerprint": null,
+    "object_kind": "bundle.manifest",
+    "payloads": [],
+    "promotable": false,
+    "schema_version": "w0-0/v1",
+    "seal_result_root": "05f778e463412b238dbfd9a7fbd12a70f935e9135e8c18cc628580ce8b9b0687"
+   },
+   "note": "payloads 为空 -> 容器自身产生 a leaf；mirror_fingerprint 必须为 null（E-FINGERPRINT-NULL 的正例）",
+   "object_kind": "bundle.manifest"
+  }
+ ],
+ "note": "空形态：四个空 set root、零 payload 的 bundle（payloads 产 a leaf、mirror_fingerprint 为 null）",
+ "vector_group": "v02"
+}
