@@ -1647,24 +1647,41 @@ pub struct PayloadRef {
     pub byte_length: i64,
 }
 
-/// 把 vectors / 落盘 manifest 用的**扁平 leaf key** JSON 对象还原成 [`RawObject`]。
+/// 把落盘 JSON 对象还原成 [`RawObject`]。**读取适配层**，不参与任何 root 计算。
 ///
-/// 扁平形态里数组元素写成 `payloads[000000].payload_hash`；本函数按此语法归组。
-/// 下标必须是 6 位零填充且从 `000000` 起连续——否则 `E-KEY-FORM`。
+/// 数组字段接受**两种等价落盘形态**，两者 canonical 化到同一字段集、因而同一 root：
+///
+/// 1. **扁平 leaf key**（golden vectors 的 `input` 形态）：
+///    `"payloads[000000].payload_hash"`。下标必须是 6 位零填充且从 `000000` 起连续，
+///    否则 `E-KEY-FORM`。
+/// 2. **嵌套对象数组**（Stage D5 产物的落盘形态）：
+///    `"payloads": [{"payload_hash": …, "byte_length": …}, …]`，顺序即下标序。
+///
+/// §A.11 与 §B.7 都明写落盘格式不由附录规定，附录只规定「字段集 → root」这条映射；
+/// 所以两种形态之间没有对错之分，读取层两种都得认。**同一个数组名同时以两种形态出现即拒**
+/// （`E-VALUE-FORM`）——那是无法判定顺序的畸形输入，不是可合并的两半。
 pub fn raw_object_from_flat_map(map: &serde_json::Map<String, JsonValue>) -> WireResult<RawObject> {
     let mut scalars: Vec<(String, RawField)> = Vec::new();
     let mut arrays: Vec<(String, Vec<(usize, ScalarFields)>)> = Vec::new();
+    // 记下每个数组名是由哪种形态供给的，用来拒绝两种形态混用。
+    let mut nested_arrays: Vec<String> = Vec::new();
+    let mut indexed_arrays: Vec<String> = Vec::new();
 
     for (key, value) in map {
         let Some(open) = key.find('[') else {
-            if let JsonValue::Array(a) = value {
-                if !a.is_empty() {
-                    return err(
-                        ErrorCode::ValueForm,
-                        format!("{key} 的非空数组必须写成带下标的元素 key"),
-                    );
+            if let JsonValue::Array(items) = value {
+                nested_arrays.push(key.clone());
+                let mut elements: Vec<(usize, ScalarFields)> = Vec::with_capacity(items.len());
+                for (idx, item) in items.iter().enumerate() {
+                    let JsonValue::Object(fields) = item else {
+                        return err(ErrorCode::ValueForm, format!("{key}[{idx}] 不是 JSON 对象"));
+                    };
+                    elements.push((
+                        idx,
+                        fields.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                    ));
                 }
-                arrays.push((key.clone(), Vec::new()));
+                arrays.push((key.clone(), elements));
             } else {
                 scalars.push((key.clone(), RawField::Scalar(value.clone())));
             }
@@ -1691,6 +1708,9 @@ pub fn raw_object_from_flat_map(map: &serde_json::Map<String, JsonValue>) -> Wir
                 format!("leaf key {key:?} 的 `]` 之后不是 `.`"),
             );
         };
+        if !indexed_arrays.iter().any(|n| n == name) {
+            indexed_arrays.push(name.to_string());
+        }
         let slot = match arrays.iter_mut().find(|(n, _)| n == name) {
             Some(s) => s,
             None => {
@@ -1703,6 +1723,15 @@ pub fn raw_object_from_flat_map(map: &serde_json::Map<String, JsonValue>) -> Wir
             None => slot
                 .1
                 .push((idx, vec![(member.to_string(), value.clone())])),
+        }
+    }
+
+    for name in &indexed_arrays {
+        if nested_arrays.contains(name) {
+            return err(
+                ErrorCode::ValueForm,
+                format!("数组 {name} 同时以嵌套形态与带下标 leaf key 形态出现，无法判定顺序"),
+            );
         }
     }
 
@@ -1763,6 +1792,43 @@ pub fn manifest_payloads(object: &RawObject) -> WireResult<Vec<PayloadRef>> {
     Ok(out)
 }
 
+/// 一次 `verify_bundle_root` **实际验到了什么**。
+///
+/// bundle 目录里 `seal.result` 与四个集合 sidecar 是否在场，取决于产出方的落盘选择
+/// （D5 的产物就只有 manifest / payloads / candidate-db sidecar 三项）。「不在场就跳过」
+/// 如果不留痕，就是一次静默降级——调用方会以为验了全套。**所以跳过必须是可观测的**：
+/// 本结构把每一项是否真跑过如实记下来，由调用方决定这个覆盖面够不够。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerificationScope {
+    /// manifest 的字段集校验与 root 重算。恒为 `true`——它是 `verify_bundle_root` 的前提。
+    pub manifest_verified: bool,
+    /// 是否按 `seal.result` 重算并比对了 `seal_result_root`（盘上有该文件才做）。
+    pub seal_result_verified: bool,
+    /// 是否按四个 sidecar 重算了 set root / 计数并查了引用完整性（四份都在场才做）。
+    pub sidecars_verified: bool,
+    /// 是否逐个重算了 payload 的 hash 与长度。
+    pub payload_bytes_verified: bool,
+}
+
+/// `verify_bundle_root` 的可选行为。
+#[derive(Debug, Clone, Copy)]
+pub struct VerifyOptions {
+    /// 是否逐个重算 payload 的 hash。
+    ///
+    /// 关掉它**不会**让内容寻址失守：[`Bundle::read_payload`] 每次读仍然重算，
+    /// 检查只是从「打开时一次性全量」移到「读到哪条验哪条」。数 GB 级 bundle 上全量重算
+    /// 要读完整个语料，多数调用方并不需要。关掉时 [`VerificationScope`] 会如实记下来。
+    pub verify_payload_bytes: bool,
+}
+
+impl Default for VerifyOptions {
+    fn default() -> Self {
+        VerifyOptions {
+            verify_payload_bytes: true,
+        }
+    }
+}
+
 /// 一个已通过 root 校验的 bundle。
 ///
 /// **只按 hash 读**（§A.8）：没有按活路径读的 API，[`Bundle::read_payload`] 是唯一读取入口。
@@ -1771,6 +1837,7 @@ pub struct Bundle {
     dir: PathBuf,
     root: [u8; 32],
     payloads: Vec<PayloadRef>,
+    scope: VerificationScope,
 }
 
 impl Bundle {
@@ -1782,6 +1849,11 @@ impl Bundle {
     /// manifest 声明的 payload 清单。
     pub fn payloads(&self) -> &[PayloadRef] {
         &self.payloads
+    }
+
+    /// 这次校验**实际覆盖到了哪些项**。
+    pub fn scope(&self) -> VerificationScope {
+        self.scope
     }
 
     /// §A.8 的唯一读取入口：按内容寻址读一份 payload。
@@ -1939,11 +2011,29 @@ fn declared_int_field(object: &RawObject, name: &str, path: &Path) -> Result<i64
 ///
 /// `expected_root_hex` 就是 §A.11 说的那个「manifest 之外的权威副本」——它来自 seal 编排
 /// 事务的 read-receipt 或 W4 marker 的 `snapshot_root`，不可能装在 manifest 自己里（自指）。
+///
+/// 用默认 [`VerifyOptions`]（逐个重算 payload hash）。数 GB 级 bundle 上想跳过那一步用
+/// [`verify_bundle_root_with`]，跳过与否会记进 [`Bundle::scope`]。
 pub fn verify_bundle_root(
     bundle_dir: &Path,
     expected_root_hex: &str,
 ) -> Result<Bundle, BundleError> {
+    verify_bundle_root_with(bundle_dir, expected_root_hex, VerifyOptions::default())
+}
+
+/// 同 [`verify_bundle_root`]，但由调用方指定可选行为。
+pub fn verify_bundle_root_with(
+    bundle_dir: &Path,
+    expected_root_hex: &str,
+    options: VerifyOptions,
+) -> Result<Bundle, BundleError> {
     let expected_root = hex32(expected_root_hex)?;
+    let mut scope = VerificationScope {
+        manifest_verified: false,
+        seal_result_verified: false,
+        sidecars_verified: false,
+        payload_bytes_verified: false,
+    };
 
     // ---- manifest ----
     let manifest_path = bundle_dir.join(MANIFEST_FILE);
@@ -1951,76 +2041,104 @@ pub fn verify_bundle_root(
     let manifest = raw_object_from_flat_map(&manifest_map)?;
     let manifest_outcome = compute_object_root("bundle.manifest", &manifest)?;
     let payloads = manifest_payloads(&manifest)?;
+    scope.manifest_verified = true;
 
-    // ---- seal.result ----
+    // ---- seal.result（可选：产出方可以只在 manifest 里留 seal_result_root 哈希引用）----
     let seal_result_path = bundle_dir.join(SEAL_RESULT_FILE);
-    let seal_result_map = read_json_object(&seal_result_path)?;
-    let seal_result = raw_object_from_flat_map(&seal_result_map)?;
-    let seal_result_outcome = compute_object_root("seal.result", &seal_result)?;
+    let seal_result = if seal_result_path.exists() {
+        let seal_result_map = read_json_object(&seal_result_path)?;
+        let seal_result = raw_object_from_flat_map(&seal_result_map)?;
+        let seal_result_outcome = compute_object_root("seal.result", &seal_result)?;
 
-    let declared_seal_result_root =
-        declared_hex_field(&manifest, "seal_result_root", &manifest_path)?;
-    if declared_seal_result_root != seal_result_outcome.root {
-        // 附录没有为这一条给码（§B.8 只到 set root 与 payload），故按 §D-7 第 2 条的同款处置
-        // 走非 E-* 错误：它是落盘形态的内部不一致，不是本附录定义的对象校验失败。
-        return Err(BundleError::Malformed {
-            path: manifest_path,
-            detail: format!(
-                "seal_result_root 声明 {}，按盘上 {SEAL_RESULT_FILE} 重算 {}",
-                hex_lower(&declared_seal_result_root),
-                hex_lower(&seal_result_outcome.root)
-            ),
-        });
-    }
+        let declared_seal_result_root =
+            declared_hex_field(&manifest, "seal_result_root", &manifest_path)?;
+        if declared_seal_result_root != seal_result_outcome.root {
+            // 附录没有为这一条给码（§B.8 只到 set root 与 payload），故按 §D-7 第 2 条的同款处置
+            // 走非 E-* 错误：它是落盘形态的内部不一致，不是本附录定义的对象校验失败。
+            return Err(BundleError::Malformed {
+                path: manifest_path,
+                detail: format!(
+                    "seal_result_root 声明 {}，按盘上 {SEAL_RESULT_FILE} 重算 {}",
+                    hex_lower(&declared_seal_result_root),
+                    hex_lower(&seal_result_outcome.root)
+                ),
+            });
+        }
+        scope.seal_result_verified = true;
+        Some(seal_result)
+    } else {
+        None
+    };
 
-    // ---- 四个 sidecar ----
-    let mut sidecar_refs: Vec<([u8; 32], String)> = Vec::new();
-    for set_name in SET_NAMES {
-        let path = bundle_dir.join(sidecar_file_name(set_name));
-        let items = read_sidecar_items(&path)?;
-        let declared_root =
-            declared_hex_field(&seal_result, &format!("{set_name}_root"), &seal_result_path)?;
-        let declared_count = declared_int_field(
-            &seal_result,
-            &format!("{set_name}_count"),
-            &seal_result_path,
-        )?;
-        verify_declared_set(set_name, &items, declared_root, declared_count)?;
+    // ---- 四个 sidecar（可选，且必须四份齐全：缺一份就没有「全套集合」可谈）----
+    if let Some(seal_result) = &seal_result {
+        let present: Vec<bool> = SET_NAMES
+            .iter()
+            .map(|n| bundle_dir.join(sidecar_file_name(n)).exists())
+            .collect();
+        if present.iter().all(|p| *p) {
+            let mut sidecar_refs: Vec<([u8; 32], String)> = Vec::new();
+            for set_name in SET_NAMES {
+                let path = bundle_dir.join(sidecar_file_name(set_name));
+                let items = read_sidecar_items(&path)?;
+                let declared_root = declared_hex_field(
+                    seal_result,
+                    &format!("{set_name}_root"),
+                    &seal_result_path,
+                )?;
+                let declared_count = declared_int_field(
+                    seal_result,
+                    &format!("{set_name}_count"),
+                    &seal_result_path,
+                )?;
+                verify_declared_set(set_name, &items, declared_root, declared_count)?;
 
-        // §B.8 第 12 步的引用来源。
-        let ref_field = match set_name {
-            "entries" => Some("payload_hash"),
-            "tombstones" => Some("base_payload_hash"),
-            _ => None,
-        };
-        if let Some(field) = ref_field {
-            for (i, fields) in items.iter().enumerate() {
-                match fields.iter().find(|(k, _)| k == field) {
-                    Some((_, JsonValue::String(s))) => {
-                        sidecar_refs.push((hex32(s)?, format!("{set_name}[{i}].{field}")));
-                    }
-                    _ => {
-                        return Err(BundleError::Malformed {
-                            path,
-                            detail: format!("items[{i}] 缺 {field}"),
-                        });
+                // §B.8 第 12 步的引用来源。
+                let ref_field = match set_name {
+                    "entries" => Some("payload_hash"),
+                    "tombstones" => Some("base_payload_hash"),
+                    _ => None,
+                };
+                if let Some(field) = ref_field {
+                    for (i, fields) in items.iter().enumerate() {
+                        match fields.iter().find(|(k, _)| k == field) {
+                            Some((_, JsonValue::String(s))) => {
+                                sidecar_refs.push((hex32(s)?, format!("{set_name}[{i}].{field}")));
+                            }
+                            _ => {
+                                return Err(BundleError::Malformed {
+                                    path,
+                                    detail: format!("items[{i}] 缺 {field}"),
+                                });
+                            }
+                        }
                     }
                 }
             }
+
+            // ---- 第 12 步：引用完整性 ----
+            let manifest_hashes: Vec<[u8; 32]> = payloads.iter().map(|p| p.payload_hash).collect();
+            check_referential_integrity(&manifest_hashes, &sidecar_refs)?;
+            scope.sidecars_verified = true;
+        } else if present.iter().any(|p| *p) {
+            // 部分在场：这是残缺输入，不是「产出方选择不落 sidecar」。不许当没看见。
+            return Err(BundleError::Malformed {
+                path: bundle_dir.to_path_buf(),
+                detail: "四个集合 sidecar 只有部分在场，无法按集合口径校验".to_string(),
+            });
         }
     }
 
-    // ---- 第 12 步：引用完整性 ----
-    let manifest_hashes: Vec<[u8; 32]> = payloads.iter().map(|p| p.payload_hash).collect();
-    check_referential_integrity(&manifest_hashes, &sidecar_refs)?;
-
     // ---- 第 14 步：payload 重算 ----
-    for declared in &payloads {
-        let path = bundle_dir
-            .join(PAYLOAD_DIR)
-            .join(hex_lower(&declared.payload_hash));
-        let bytes = read_payload_file(&path)?;
-        verify_payload_bytes(&path, declared, &bytes)?;
+    if options.verify_payload_bytes {
+        for declared in &payloads {
+            let path = bundle_dir
+                .join(PAYLOAD_DIR)
+                .join(hex_lower(&declared.payload_hash));
+            let bytes = read_payload_file(&path)?;
+            verify_payload_bytes(&path, declared, &bytes)?;
+        }
+        scope.payload_bytes_verified = true;
     }
 
     // ---- 第 15 步：与外部期望 root 比对 ----
@@ -2039,6 +2157,7 @@ pub fn verify_bundle_root(
         dir: bundle_dir.to_path_buf(),
         root: manifest_outcome.root,
         payloads,
+        scope,
     })
 }
 
@@ -3798,6 +3917,233 @@ mod w0_0_surface_tests {
 
         let e = verify_bundle_root(tmp.path(), &hex_lower(&new_root)).expect_err("必须失败");
         assert_eq!(e.wire_code(), Some(ErrorCode::DanglingPayload));
+    }
+
+    // ---- 读取适配层：两种落盘形态 canonical 化到同一字段集 -----------------
+
+    /// 合成的 D5 profile manifest（嵌套 `payloads` 对象数组）。
+    fn nested_manifest_json(payloads: &[(String, i64)]) -> serde_json::Map<String, Value> {
+        let mut m = serde_json::Map::new();
+        m.insert("object_kind".into(), json!("bundle.manifest"));
+        m.insert("schema_version".into(), json!(SCHEMA_VERSION));
+        m.insert(
+            "seal_result_root".into(),
+            json!("05f778e463412b238dbfd9a7fbd12a70f935e9135e8c18cc628580ce8b9b0687"),
+        );
+        if payloads.is_empty() {
+            m.insert("mirror_fingerprint".into(), Value::Null);
+        } else {
+            m.insert(
+                "mirror_fingerprint".into(),
+                json!("27b9515405b9e7236a33d5174a6dcb27c6770c66cc506e554956681e0ca72f41"),
+            );
+        }
+        m.insert("promotable".into(), json!(false));
+        m.insert(
+            "payloads".into(),
+            Value::Array(
+                payloads
+                    .iter()
+                    .map(|(h, len)| json!({"payload_hash": h, "byte_length": len}))
+                    .collect(),
+            ),
+        );
+        m
+    }
+
+    fn flat_manifest_json(payloads: &[(String, i64)]) -> serde_json::Map<String, Value> {
+        let mut m = nested_manifest_json(payloads);
+        m.remove("payloads");
+        if payloads.is_empty() {
+            m.insert("payloads".into(), json!([]));
+        } else {
+            for (i, (h, len)) in payloads.iter().enumerate() {
+                m.insert(format!("payloads[{i:06}].payload_hash"), json!(h));
+                m.insert(format!("payloads[{i:06}].byte_length"), json!(len));
+            }
+        }
+        m
+    }
+
+    /// 三条 payload，已按 32 原始字节升序（与合成字节的真实 hash 一致）。
+    fn synthetic_sorted_payloads() -> Vec<(Vec<u8>, String, i64)> {
+        let mut v: Vec<(Vec<u8>, String, i64)> = [
+            b"{\"a\":1}\n".to_vec(),
+            b"{\"b\":2}\n".to_vec(),
+            b"{\"c\":3}\n".to_vec(),
+        ]
+        .into_iter()
+        .map(|b| {
+            let h = payload_hash(&b);
+            let len = b.len() as i64;
+            (b, hex_lower(&h), len)
+        })
+        .collect();
+        v.sort_by(|a, b| a.1.cmp(&b.1));
+        v
+    }
+
+    /// 嵌套形态与扁平形态必须 canonical 化到同一字段集，因而同一 root。
+    #[test]
+    fn nested_and_flat_payload_forms_produce_the_same_root() {
+        let refs: Vec<(String, i64)> = synthetic_sorted_payloads()
+            .into_iter()
+            .map(|(_, h, len)| (h, len))
+            .collect();
+
+        let nested =
+            raw_object_from_flat_map(&nested_manifest_json(&refs)).expect("嵌套形态可还原");
+        let flat = raw_object_from_flat_map(&flat_manifest_json(&refs)).expect("扁平形态可还原");
+
+        let a = compute_object_root("bundle.manifest", &nested).expect("合法");
+        let b = compute_object_root("bundle.manifest", &flat).expect("合法");
+        assert_eq!(a.root, b.root, "两种落盘形态的 root 必须相同");
+        assert_eq!(
+            a.sorted_keys, b.sorted_keys,
+            "两种形态的 leaf key 集必须相同"
+        );
+        // 空数组两种形态同样等价（都产容器自身的 a leaf）。
+        let empty_nested = raw_object_from_flat_map(&nested_manifest_json(&[])).expect("可还原");
+        let empty_flat = raw_object_from_flat_map(&flat_manifest_json(&[])).expect("可还原");
+        assert_eq!(
+            compute_object_root("bundle.manifest", &empty_nested)
+                .expect("合法")
+                .root,
+            compute_object_root("bundle.manifest", &empty_flat)
+                .expect("合法")
+                .root
+        );
+    }
+
+    #[test]
+    fn mixed_payload_forms_are_rejected() {
+        let refs: Vec<(String, i64)> = synthetic_sorted_payloads()
+            .into_iter()
+            .map(|(_, h, len)| (h, len))
+            .collect();
+        let mut mixed = nested_manifest_json(&refs);
+        mixed.insert("payloads[000000].payload_hash".into(), json!(refs[0].0));
+        let e = raw_object_from_flat_map(&mixed).expect_err("两种形态混用必须被拒");
+        assert_eq!(e.code, ErrorCode::ValueForm);
+        assert!(e.detail.contains("payloads"), "detail 要能定位：{e}");
+    }
+
+    #[test]
+    fn nested_array_element_must_be_an_object() {
+        let mut bad = nested_manifest_json(&[]);
+        bad.insert("payloads".into(), json!([1, 2, 3]));
+        let e = raw_object_from_flat_map(&bad).expect_err("元素不是对象必须被拒");
+        assert_eq!(e.code, ErrorCode::ValueForm);
+    }
+
+    /// D5 profile：目录里只有 `manifest.json`（嵌套形态）、`payloads/`，
+    /// 外加一个本附录不认识的 candidate-db sidecar。没有 `seal-result.json`、
+    /// 没有四个集合 sidecar——`seal.result` 只以 `seal_result_root` 哈希引用存在。
+    #[test]
+    fn d5_profile_bundle_verifies_and_reports_its_scope() {
+        let tmp = tempfile::tempdir().expect("临时目录");
+        let dir = tmp.path();
+        fs::create_dir_all(dir.join(PAYLOAD_DIR)).expect("建 payloads 目录");
+
+        let payloads = synthetic_sorted_payloads();
+        for (bytes, h, _) in &payloads {
+            fs::write(dir.join(PAYLOAD_DIR).join(h), bytes).expect("写 payload");
+        }
+        let refs: Vec<(String, i64)> = payloads.iter().map(|(_, h, l)| (h.clone(), *l)).collect();
+        let manifest_map = nested_manifest_json(&refs);
+        fs::write(
+            dir.join(MANIFEST_FILE),
+            serde_json::to_string(&Value::Object(manifest_map.clone())).expect("序列化"),
+        )
+        .expect("写 manifest");
+        // 产出方自己的 sidecar：本附录不认识它，读取层也不该因为它在场就改变行为。
+        fs::write(
+            dir.join("sidecar.candidate-db.json"),
+            serde_json::to_string(&json!({
+                "name": "candidate.db",
+                "object_kind": "d5.candidate_db",
+                "payload": refs[0].0,
+                "snapshot_root": "00000000000000000000000000000000000000000000000000000000000000ff"
+            }))
+            .expect("序列化"),
+        )
+        .expect("写 candidate-db sidecar");
+
+        let expected = compute_object_root(
+            "bundle.manifest",
+            &raw_object_from_flat_map(&manifest_map).expect("可还原"),
+        )
+        .expect("合法")
+        .root;
+
+        let bundle = verify_bundle_root(dir, &hex_lower(&expected)).expect("D5 profile 必须能开");
+        assert_eq!(bundle.root(), expected);
+        assert_eq!(bundle.payloads().len(), 3);
+
+        // **跳过必须是可观测的**：没有 seal.result / sidecar 就如实记 false，不静默降级。
+        let scope = bundle.scope();
+        assert!(scope.manifest_verified);
+        assert!(scope.payload_bytes_verified);
+        assert!(
+            !scope.seal_result_verified,
+            "盘上没有 seal.result，不得声称验过"
+        );
+        assert!(
+            !scope.sidecars_verified,
+            "盘上没有四个 sidecar，不得声称验过"
+        );
+
+        // 只按 hash 读仍然照常工作。
+        let got = bundle
+            .read_payload(&payload_hash(&payloads[0].0))
+            .expect("按 hash 读得到");
+        assert_eq!(got, payloads[0].0);
+
+        // 期望 root 不对时照样报 E-BUNDLE-ROOT-MISMATCH。
+        let e = verify_bundle_root(dir, &hex_lower(&[0u8; 32])).expect_err("必须失败");
+        assert_eq!(e.wire_code(), Some(ErrorCode::BundleRootMismatch));
+    }
+
+    /// 四个 sidecar 只到场一部分 = 残缺输入，必须报错而不是当没看见。
+    #[test]
+    fn partial_sidecar_set_is_rejected_not_skipped() {
+        let tmp = tempfile::tempdir().expect("临时目录");
+        let root = build_bundle(tmp.path(), &[b"{\"a\":1}\n".to_vec()]);
+        fs::remove_file(tmp.path().join(sidecar_file_name("holds"))).expect("删一份 sidecar");
+        let e = verify_bundle_root(tmp.path(), &hex_lower(&root)).expect_err("必须失败");
+        assert_eq!(e.wire_code(), None);
+        assert!(matches!(e, BundleError::Malformed { .. }), "实得 {e}");
+    }
+
+    /// 关掉全量 payload 重算不削弱内容寻址：检查只是移到读时，且跳过被如实记下来。
+    #[test]
+    fn skipping_bulk_payload_verification_is_recorded_and_read_still_verifies() {
+        let tmp = tempfile::tempdir().expect("临时目录");
+        let bytes = b"{\"a\":1}\n".to_vec();
+        let root = build_bundle(tmp.path(), std::slice::from_ref(&bytes));
+        let h = payload_hash(&bytes);
+
+        // 先把盘上的字节换掉：全量重算档必须当场报错。
+        fs::write(
+            tmp.path().join(PAYLOAD_DIR).join(hex_lower(&h)),
+            b"{\"a\":9}\n",
+        )
+        .expect("换字节");
+        let e = verify_bundle_root(tmp.path(), &hex_lower(&root)).expect_err("全量档必须抓住");
+        assert_eq!(e.wire_code(), Some(ErrorCode::PayloadHashMismatch));
+
+        // 跳过档能开，但 scope 如实记 false，且读到那条时仍然报错。
+        let bundle = verify_bundle_root_with(
+            tmp.path(),
+            &hex_lower(&root),
+            VerifyOptions {
+                verify_payload_bytes: false,
+            },
+        )
+        .expect("跳过档可以开");
+        assert!(!bundle.scope().payload_bytes_verified);
+        let e = bundle.read_payload(&h).expect_err("读时必须抓住");
+        assert_eq!(e.wire_code(), Some(ErrorCode::PayloadHashMismatch));
     }
 }
 
