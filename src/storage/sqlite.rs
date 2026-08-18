@@ -1124,6 +1124,50 @@ const DAILY_STATS_HEALTH_META_KEY: &str = "daily_stats_archive_fingerprint";
 const DAILY_STATS_HEALTH_GENERATION_META_KEY: &str = "daily_stats_health_generation";
 const DAILY_STATS_HEALTH_GENERATION: i64 = 1;
 
+/// `meta` 表的 source content generation 保留 key（上位契约 §20.1(b) 的 D2）。
+///
+/// 命名刻意与既有两个含 `generation` 的 key 区分开：
+/// `fts_frankensqlite_rebuild_generation` 是 FTS 重建代际、
+/// `daily_stats_health_generation` 是日统计健康代际，**两者都不是内容代际**。
+/// 本 key 承载的是「这份 DB 的内容属于哪一代」，由 W1 写入、并向两个
+/// manifest 传播，供索引产物判自己属于哪一代内容。
+pub const SOURCE_CONTENT_GENERATION_META_KEY: &str = "source_content_generation";
+
+/// 索引产物（manifest）持有的内容代际与 DB 当前内容代际的比对结论。
+///
+/// 三个 variant 都必须有真实构造点与回归测试（Global Constraints 的发射点判据）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceContentGenerationVerdict {
+    /// manifest 记的代际与期望一致，产物可用。
+    Match,
+    /// manifest 记了代际但与期望不符，产物属于另一代内容。
+    Mismatch,
+    /// manifest 根本没有记代际（pre-W1 binary 写出的旧产物）。
+    ///
+    /// **必须与 `Mismatch` 分开**：这一档表示「无从判断」，
+    /// 它绝不得被当成 `Match`，判据见上位契约 §20.1(c) 的 V4。
+    Unknown,
+}
+
+impl SourceContentGenerationVerdict {
+    /// 只有 `Match` 允许沿用既有产物；其余两档一律要求重建。
+    pub fn requires_rebuild(self) -> bool {
+        !matches!(self, Self::Match)
+    }
+
+    /// 由 manifest 侧的 `Option<String>` 字段与期望代际算出结论。
+    ///
+    /// 缺字段（`None`）判 `Unknown`，**不得** default 成空串再与期望比 —— 那样
+    /// 一个期望为空串的调用方会拿到 `Match`，正是 V4 要挡的那种静默等价。
+    pub fn evaluate(recorded: Option<&str>, expected: &str) -> Self {
+        match recorded {
+            None => Self::Unknown,
+            Some(value) if value == expected => Self::Match,
+            Some(_) => Self::Mismatch,
+        }
+    }
+}
+
 /// SQL to clear all rows from the contentless `fts_messages` table.
 ///
 /// Contentless FTS5 tables reject ordinary `DELETE FROM ...` statements.
@@ -2992,7 +3036,7 @@ fn has_db_sidecar_suffix(name: &str) -> bool {
 }
 
 /// Public schema version constant for external checks.
-pub const CURRENT_SCHEMA_VERSION: i64 = 20;
+pub const CURRENT_SCHEMA_VERSION: i64 = 21;
 const MIN_IN_PLACE_MIGRATION_SCHEMA_VERSION: i64 = 13;
 
 /// Result of checking schema compatibility.
@@ -3619,6 +3663,28 @@ SELECT
      WHERE ts.conversation_id = c.id)
 FROM conversations c
 WHERE c.external_id IS NOT NULL;
+";
+
+const MIGRATION_V21: &str = r"
+-- W1 operation commit receipt（上位契约 §20.1(b) 的 D1）。
+--
+-- 记的是「一次 DB 事务是否已提交」这个事实，崩溃重启后据 idempotency_key
+-- 判幂等，避免同一次 relink / restore 被重复施加。
+--
+-- ⚠ 与基线的 DoctorAssetClass::OperationReceipt（其 asset_class 字符串值）
+-- 语义完全不同：那个是 doctor 的**文件资产分类**，指向 <data_dir>/doctor/receipts/
+-- 目录下的文件；本表是**DB 事务的提交事实**。两者不得混名，故本表取名
+-- operation_commit_receipt（区分点是 commit），且字符串上不含 operation_receipt
+-- 子串，基线那批的 grep 普查不会被本表污染。
+CREATE TABLE IF NOT EXISTS operation_commit_receipt (
+    id INTEGER PRIMARY KEY,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    operation TEXT NOT NULL,
+    state TEXT NOT NULL,
+    snapshot_root TEXT,
+    committed_at_ms INTEGER NOT NULL,
+    detail TEXT
+);
 ";
 
 /// Row from the embedding_jobs table.
@@ -4811,6 +4877,7 @@ fn build_cass_migrations_after_tail_cache() -> MigrationRunner {
         .add(18, "conversation_tail_state_hot_table", MIGRATION_V18)
         .add(19, "conversation_external_lookup", MIGRATION_V19)
         .add(20, "conversation_external_tail_lookup", MIGRATION_V20)
+        .add(21, "operation_commit_receipt", MIGRATION_V21)
 }
 
 fn schema_migration_is_applied(conn: &FrankenConnection, version: i64) -> Result<bool> {
@@ -5659,7 +5726,7 @@ fn current_schema_repair_batches_for_missing_tables(
 }
 
 /// Migration name lookup for backfilling `_schema_migrations` during transition.
-const MIGRATION_NAMES: [(i64, &str); 20] = [
+const MIGRATION_NAMES: [(i64, &str); 21] = [
     (1, "core_tables"),
     (2, "fts_messages"),
     (3, "fts_messages_rebuild"),
@@ -5680,6 +5747,7 @@ const MIGRATION_NAMES: [(i64, &str); 20] = [
     (18, "conversation_tail_state_hot_table"),
     (19, "conversation_external_lookup"),
     (20, "conversation_external_tail_lookup"),
+    (21, "operation_commit_receipt"),
 ];
 
 /// Transitions an existing database from `meta` table schema versioning to the
@@ -28272,5 +28340,116 @@ mod tests {
             })
             .unwrap();
         assert_eq!(metrics_after, 0);
+    }
+    // =========================================================================
+    // Task E1 · W1 migration delta (上位契约 §20.1(b) D1 / D2)
+    //
+    // D1: operation receipt 表 + 幂等 key 唯一约束
+    // D2: meta 表的 source content generation 保留 key
+    // =========================================================================
+
+    #[test]
+    fn migration_creates_operation_commit_receipt_table() {
+        let storage = franken_storage_in_memory();
+
+        // 表必须存在且可查。表不存在时这一步返回 Err，正是 Step 1 的红。
+        storage
+            .raw()
+            .query("SELECT idempotency_key FROM operation_commit_receipt LIMIT 1;")
+            .expect("operation_commit_receipt table must exist after migrations");
+
+        assert_eq!(
+            storage.schema_version().unwrap(),
+            CURRENT_SCHEMA_VERSION,
+            "migration 跑完必须停在 CURRENT_SCHEMA_VERSION"
+        );
+    }
+
+    #[test]
+    fn operation_commit_receipt_rejects_duplicate_idempotency_key() {
+        let storage = franken_storage_in_memory();
+
+        let insert = |key: &str| {
+            storage.raw().execute_compat(
+                "INSERT INTO operation_commit_receipt \
+                 (idempotency_key, operation, state, committed_at_ms) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                fparams![key, "mirror-relink", "committed", 1_710_000_000_000i64],
+            )
+        };
+
+        insert("w1-relink-0001").expect("first insert must succeed");
+
+        // 唯一约束必须以它自己的名义拒绝——断言具体错误文本，不用宽接。
+        let err = insert("w1-relink-0001")
+            .expect_err("duplicate idempotency_key must be rejected by the unique constraint");
+        let text = format!("{err:#}").to_ascii_lowercase();
+        assert!(
+            text.contains("unique") || text.contains("constraint"),
+            "拒绝理由必须是唯一约束违反，实得: {err:#}"
+        );
+
+        // 拒绝之后表里只能有第一条，不得留下半条。
+        let count: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM operation_commit_receipt WHERE idempotency_key = ?1",
+                fparams!["w1-relink-0001"],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "唯一约束拒绝后不得多出行");
+    }
+
+    #[test]
+    fn source_content_generation_meta_key_roundtrips_and_survives_runtime_clears() {
+        let storage = franken_storage_in_memory();
+
+        // 保留 key 的字面量由静态常量定义，调用方只能引用不得自由构造
+        // （矩阵配套条：声明侧的取值域必须封闭且静态）。
+        let key = SOURCE_CONTENT_GENERATION_META_KEY;
+        assert_eq!(key, "source_content_generation");
+
+        storage
+            .raw()
+            .execute_compat(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                fparams![key, "gen-2026-08-18-abc"],
+            )
+            .unwrap();
+
+        let read_back = |storage: &FrankenStorage| -> Option<String> {
+            storage
+                .raw()
+                .query_row_map(
+                    "SELECT value FROM meta WHERE key = ?1",
+                    fparams![SOURCE_CONTENT_GENERATION_META_KEY],
+                    |row| row.get_typed::<String>(0),
+                )
+                .ok()
+        };
+
+        assert_eq!(
+            read_back(&storage).as_deref(),
+            Some("gen-2026-08-18-abc"),
+            "写入后必须原样读回"
+        );
+
+        // 它是「保留」key：既有两条运行时清理路径都不得把它抹掉。
+        clear_seeded_runtime_meta(storage.raw()).unwrap();
+        assert_eq!(
+            read_back(&storage).as_deref(),
+            Some("gen-2026-08-18-abc"),
+            "clear_seeded_runtime_meta 不得清掉内容代际保留 key"
+        );
+
+        storage
+            .restore_scan_watermarks(&[("last_scan_ts".to_string(), "17".to_string())])
+            .unwrap();
+        assert_eq!(
+            read_back(&storage).as_deref(),
+            Some("gen-2026-08-18-abc"),
+            "restore_scan_watermarks 不得清掉内容代际保留 key"
+        );
     }
 }

@@ -32,6 +32,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 
+use crate::storage::sqlite::SourceContentGenerationVerdict;
+
 use super::policy::{
     CHUNKING_STRATEGY_VERSION, InvalidationAction, SEMANTIC_SCHEMA_VERSION,
     SemanticAssetManifest as PolicyManifest, SemanticPolicy,
@@ -736,6 +738,14 @@ pub struct SemanticManifest {
     pub checkpoint: Option<BuildCheckpoint>,
     /// Unix timestamp (ms) when this manifest was last written.
     pub updated_at_ms: i64,
+    /// Source content generation these assets were built against
+    /// (上位契约 §20.1(b) 的 D3).
+    ///
+    /// `None` 表示这份 manifest 由 pre-W1 binary 写出、根本没记代际 ——
+    /// 判 `Unknown` 要求重建，**不得当成匹配**。用 `serde(default)` 是为了让
+    /// 旧 manifest 仍能解析：判「未知代际」是一个裁定，不是解析失败。
+    #[serde(default)]
+    pub source_content_generation: Option<String>,
 }
 
 impl Default for SemanticManifest {
@@ -754,11 +764,25 @@ impl Default for SemanticManifest {
             },
             checkpoint: None,
             updated_at_ms: 0,
+            source_content_generation: None,
         }
     }
 }
 
 impl SemanticManifest {
+    /// 这份 manifest 记的内容代际与 `expected` 的比对结论。
+    ///
+    /// 缺字段判 [`SourceContentGenerationVerdict::Unknown`]，要求重建。
+    pub fn source_content_generation_verdict(
+        &self,
+        expected: &str,
+    ) -> SourceContentGenerationVerdict {
+        SourceContentGenerationVerdict::evaluate(
+            self.source_content_generation.as_deref(),
+            expected,
+        )
+    }
+
     // ── Path helpers ───────────────────────────────────────────────────
 
     /// Path to the manifest file.
@@ -2320,5 +2344,86 @@ mod tests {
         assert_eq!(invalidated, 1);
         assert_eq!(shards.shards.len(), 1);
         assert_eq!(shards.total_size_bytes(), 4096);
+    }
+    // ── Task E1 · D3: source content generation（上位契约 §20.1(b)）────────
+
+    #[test]
+    fn legacy_semantic_manifest_without_generation_is_unknown_and_requires_rebuild() {
+        // 旧 manifest 由 pre-W1 binary 写出，整份 JSON 里没有该字段。
+        let legacy = serde_json::json!({
+            "manifest_version": MANIFEST_FORMAT_VERSION,
+            "fast_tier": null,
+            "quality_tier": null,
+            "hnsw": null,
+            "backlog": {
+                "total_conversations": 0,
+                "fast_tier_processed": 0,
+                "quality_tier_processed": 0,
+                "db_fingerprint": "",
+                "computed_at_ms": 0
+            },
+            "checkpoint": null,
+            "updated_at_ms": 0
+        });
+        let manifest: SemanticManifest = serde_json::from_value(legacy)
+            .expect("旧 manifest 必须仍能解析——判『未知代际』是个裁定，不是解析失败");
+
+        assert_eq!(
+            manifest.source_content_generation, None,
+            "缺字段必须落到 None，不得被 default 成某个会当成匹配的值"
+        );
+
+        let verdict = manifest.source_content_generation_verdict("gen-A");
+        assert_eq!(
+            verdict,
+            SourceContentGenerationVerdict::Unknown,
+            "无字段的旧 manifest 必须判未知代际"
+        );
+        assert!(verdict.requires_rebuild(), "未知代际必须要求重建");
+        assert_ne!(
+            verdict,
+            SourceContentGenerationVerdict::Match,
+            "未知代际绝不得当成匹配"
+        );
+    }
+
+    #[test]
+    fn semantic_manifest_generation_verdict_covers_all_three_variants() {
+        // E-7 发射点判据：三个 variant 都要有真实输入能走到。
+        let mut manifest = SemanticManifest::default();
+
+        assert_eq!(
+            manifest.source_content_generation_verdict("gen-A"),
+            SourceContentGenerationVerdict::Unknown
+        );
+
+        manifest.source_content_generation = Some("gen-A".to_owned());
+        let m = manifest.source_content_generation_verdict("gen-A");
+        assert_eq!(m, SourceContentGenerationVerdict::Match);
+        assert!(!m.requires_rebuild(), "代际相符不该要求重建");
+
+        manifest.source_content_generation = Some("gen-B".to_owned());
+        let mm = manifest.source_content_generation_verdict("gen-A");
+        assert_eq!(mm, SourceContentGenerationVerdict::Mismatch);
+        assert!(mm.requires_rebuild(), "代际不符必须要求重建");
+    }
+
+    #[test]
+    fn semantic_manifest_generation_survives_save_load_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manifest = SemanticManifest::default();
+        manifest.source_content_generation = Some("gen-roundtrip".to_owned());
+        manifest.save(dir.path()).unwrap();
+
+        let loaded = SemanticManifest::load(dir.path()).unwrap().unwrap();
+        assert_eq!(
+            loaded.source_content_generation.as_deref(),
+            Some("gen-roundtrip"),
+            "producer 写出的代际必须被 reader 原样读回"
+        );
+        assert_eq!(
+            loaded.source_content_generation_verdict("gen-roundtrip"),
+            SourceContentGenerationVerdict::Match
+        );
     }
 }

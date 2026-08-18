@@ -44,6 +44,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::storage::sqlite::SourceContentGenerationVerdict;
+
 /// Current manifest format version. Bump whenever the struct layout changes
 /// in a way that older or newer readers cannot ignore.
 pub(crate) const LEXICAL_GENERATION_MANIFEST_VERSION: u32 = 3;
@@ -1078,9 +1080,33 @@ pub(crate) struct LexicalGenerationManifest {
     /// Append-only history of attempts that failed under this
     /// `generation_id`. Latest entry is the most recent failure.
     pub failure_history: Vec<LexicalGenerationFailure>,
+    /// Source content generation this lexical generation was built against
+    /// (上位契约 §20.1(b) 的 D3).
+    ///
+    /// **与上面的 `generation_id` 是两回事**：`generation_id` 是本次词法索引
+    /// 构建的身份，本字段是「被索引的内容属于哪一代」。`None` 表示这份 manifest
+    /// 由 pre-W1 binary 写出、没记内容代际 —— 判 `Unknown` 要求重建，
+    /// **不得当成匹配**。`serde(default)` 让旧 manifest 仍能解析：
+    /// 判「未知代际」是一个裁定，不是解析失败。
+    #[serde(default)]
+    pub source_content_generation: Option<String>,
 }
 
 impl LexicalGenerationManifest {
+    /// 这份 manifest 记的**内容代际**与 `expected` 的比对结论。
+    ///
+    /// 与 `generation_id`（构建代际）无关。缺字段判
+    /// [`SourceContentGenerationVerdict::Unknown`]，要求重建。
+    pub(crate) fn source_content_generation_verdict(
+        &self,
+        expected: &str,
+    ) -> SourceContentGenerationVerdict {
+        SourceContentGenerationVerdict::evaluate(
+            self.source_content_generation.as_deref(),
+            expected,
+        )
+    }
+
     /// Create a fresh manifest in Scratch/Staged state for the given
     /// generation id, attempt id, and source db fingerprint. Caller fills
     /// in counts as the build progresses.
@@ -1108,6 +1134,7 @@ impl LexicalGenerationManifest {
             build_state: LexicalGenerationBuildState::Scratch,
             publish_state: LexicalGenerationPublishState::Staged,
             failure_history: Vec::new(),
+            source_content_generation: None,
         }
     }
 
@@ -4062,5 +4089,102 @@ mod tests {
                 );
             }
         }
+    }
+    // ── Task E1 · D3: source content generation（上位契约 §20.1(b)）────────
+
+    #[test]
+    fn legacy_lexical_manifest_without_generation_is_unknown_and_requires_rebuild() {
+        // pre-W1 binary 写出的 manifest：JSON 里没有 source_content_generation。
+        // 注意本结构体已有一个含义不同的 generation_id（词法索引的构建代际），
+        // 这里验的是新增的内容代际字段，两者不得混为一谈。
+        let legacy = serde_json::json!({
+            "manifest_version": LEXICAL_GENERATION_MANIFEST_VERSION,
+            "generation_id": "gen-00000001-abc",
+            "attempt_id": "attempt-00000001",
+            "created_at_ms": 1_700_000_000_000i64,
+            "updated_at_ms": 1_700_000_000_000i64,
+            "source_db_fingerprint": "fp-deadbeef",
+            "conversation_count": 0,
+            "message_count": 0,
+            "indexed_doc_count": 0,
+            "equivalence_manifest_fingerprint": null,
+            "build_state": "scratch",
+            "publish_state": "staged",
+            "failure_history": []
+        });
+        let manifest: LexicalGenerationManifest = serde_json::from_value(legacy)
+            .expect("旧 manifest 必须仍能解析——判『未知代际』是个裁定，不是解析失败");
+
+        assert_eq!(
+            manifest.source_content_generation, None,
+            "缺字段必须落到 None，不得被 default 成某个会当成匹配的值"
+        );
+        assert_eq!(
+            manifest.generation_id, "gen-00000001-abc",
+            "既有的构建代际字段不受影响"
+        );
+
+        let verdict = manifest.source_content_generation_verdict("gen-A");
+        assert_eq!(
+            verdict,
+            SourceContentGenerationVerdict::Unknown,
+            "无字段的旧 manifest 必须判未知代际"
+        );
+        assert!(verdict.requires_rebuild(), "未知代际必须要求重建");
+        assert_ne!(
+            verdict,
+            SourceContentGenerationVerdict::Match,
+            "未知代际绝不得当成匹配"
+        );
+    }
+
+    #[test]
+    fn lexical_manifest_generation_verdict_covers_all_three_variants() {
+        // E-7 发射点判据：三个 variant 都要有真实输入能走到。
+        let mut manifest = LexicalGenerationManifest::new_scratch(
+            "gen-00000002-def",
+            "attempt-00000001",
+            "fp-deadbeef",
+            1_700_000_000_000,
+        );
+
+        assert_eq!(
+            manifest.source_content_generation_verdict("gen-A"),
+            SourceContentGenerationVerdict::Unknown
+        );
+
+        manifest.source_content_generation = Some("gen-A".to_owned());
+        let m = manifest.source_content_generation_verdict("gen-A");
+        assert_eq!(m, SourceContentGenerationVerdict::Match);
+        assert!(!m.requires_rebuild(), "代际相符不该要求重建");
+
+        manifest.source_content_generation = Some("gen-B".to_owned());
+        let mm = manifest.source_content_generation_verdict("gen-A");
+        assert_eq!(mm, SourceContentGenerationVerdict::Mismatch);
+        assert!(mm.requires_rebuild(), "代际不符必须要求重建");
+    }
+
+    #[test]
+    fn lexical_manifest_generation_survives_store_load_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let mut manifest = LexicalGenerationManifest::new_scratch(
+            "gen-00000003-ghi",
+            "attempt-00000001",
+            "fp-deadbeef",
+            1_700_000_000_000,
+        );
+        manifest.source_content_generation = Some("gen-roundtrip".to_owned());
+        store_manifest(dir.path(), &manifest).unwrap();
+
+        let loaded = load_manifest(dir.path()).unwrap().unwrap();
+        assert_eq!(
+            loaded.source_content_generation.as_deref(),
+            Some("gen-roundtrip"),
+            "producer 写出的代际必须被 reader 原样读回"
+        );
+        assert_eq!(
+            loaded.source_content_generation_verdict("gen-roundtrip"),
+            SourceContentGenerationVerdict::Match
+        );
     }
 }
