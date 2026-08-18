@@ -649,6 +649,21 @@ pub enum Commands {
         timeout: Option<u64>,
     },
     /// Show statistics about indexed data
+    /// Rebuild raw-mirror manifest `db_links` from real identity (dry-run by default)
+    MirrorRelink {
+        /// Override data dir
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+
+        /// Actually write the rebuilt db_links. Without this flag nothing is written.
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+    },
+
     Stats {
         /// Override data dir
         #[arg(long)]
@@ -6507,6 +6522,7 @@ async fn execute_cli(
         | Commands::Search { .. }
         | Commands::Pack { .. }
         | Commands::Stats { .. }
+        | Commands::MirrorRelink { .. }
         | Commands::Diag { .. }
         | Commands::Storage { .. }
         | Commands::Dedup { .. }
@@ -6793,6 +6809,48 @@ async fn execute_cli(
                         eff_timeout,
                         wrap,
                     )?;
+                }
+                Commands::MirrorRelink {
+                    data_dir,
+                    apply,
+                    json,
+                } => {
+                    let resolved = data_dir.clone().unwrap_or_else(default_data_dir);
+                    let report = mirror_relink(&MirrorRelinkOptions {
+                        data_dir: resolved,
+                        apply,
+                    })
+                    .map_err(|err| CliError {
+                        code: 1,
+                        kind: "mirror_relink_failed",
+                        message: err.to_string(),
+                        hint: None,
+                        retryable: false,
+                    })?;
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "scanned_manifests": report.scanned_manifests,
+                                "changes": report.changes.len(),
+                                "findings": report.findings.len(),
+                                "applied": report.applied,
+                                "manifests_written": report.manifests_written,
+                            })
+                        );
+                    } else {
+                        println!(
+                            "scanned {} manifest(s); {} would change; {} finding(s); applied={} written={}",
+                            report.scanned_manifests,
+                            report.changes.len(),
+                            report.findings.len(),
+                            report.applied,
+                            report.manifests_written,
+                        );
+                        for finding in &report.findings {
+                            println!("  finding: {finding:?}");
+                        }
+                    }
                 }
                 Commands::Stats {
                     data_dir,
@@ -19463,6 +19521,7 @@ fn describe_command(cli: &Cli) -> String {
         Some(Commands::Index { .. }) => "index".to_string(),
         Some(Commands::Search { .. }) => "search".to_string(),
         Some(Commands::Pack { .. }) => "pack".to_string(),
+        Some(Commands::MirrorRelink { .. }) => "mirror-relink".to_string(),
         Some(Commands::Stats { .. }) => "stats".to_string(),
         Some(Commands::Diag { .. }) => "diag".to_string(),
         Some(Commands::Storage { .. }) => "storage".to_string(),
@@ -99481,5 +99540,561 @@ mod cli_models_resolution_tests {
                  loader agree on the on-disk directory"
             );
         }
+    }
+}
+
+// ===========================================================================
+// Task E3 · mirror-relink
+//
+// 按真实身份（`original_path` / source identity / blob hash）重建 raw mirror
+// manifest 的 `db_links`，并报出闭合破损。默认 dry-run，`--apply` 才写盘。
+//
+// 编排留在本层、落盘走 `raw_mirror` 的公开面（控制面裁定 16 的方案 ①）。
+// ===========================================================================
+
+/// relink 的一次运行参数。
+#[derive(Debug, Clone)]
+pub struct MirrorRelinkOptions {
+    pub data_dir: PathBuf,
+    /// 默认 `false` = dry-run，只算不写。
+    pub apply: bool,
+}
+
+/// relink 期间发现的问题。**每一类都必须有构造点与回归测试**
+/// （Global Constraints 的发射点判据）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MirrorRelinkFinding {
+    /// manifest 记的 db_link 指向 DB 里不存在的 conversation。
+    DanglingDbLink {
+        manifest_id: String,
+        conversation_id: i64,
+    },
+    /// DB 侧有会话按身份归属该 manifest，但 manifest 没有记回来 —— 闭合缺一半。
+    MissingBackLink {
+        manifest_id: String,
+        conversation_id: i64,
+    },
+    /// manifest 的 `original_path` 落在 raw mirror 自己的 `tmp/` 暂存区，
+    /// 那是被杀的索引跑留下的残件，不是真实来源。
+    StagingPath {
+        manifest_id: String,
+        original_path: String,
+    },
+    /// 落盘记录的 manifest 自摘要与重算值不符。
+    ManifestIdentityMismatch { manifest_id: String },
+    /// 落盘 manifest 根本没记自摘要（旧格式）。
+    ///
+    /// **与 `Mismatch` 分开是有意的**：「没记」不等于「校验通过」，
+    /// 合并成一类会让旧 manifest 静默混过 identity 门。
+    ManifestIdentityUnrecorded { manifest_id: String },
+    /// blob 文件缺失，或其 blake3 与 manifest 记录不符。
+    BlobChecksumMismatch {
+        manifest_id: String,
+        blob_relative_path: String,
+    },
+}
+
+/// 一份 manifest 的 `db_links` 重建前后。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MirrorRelinkChange {
+    pub manifest_id: String,
+    pub manifest_relative_path: String,
+    pub before: Vec<raw_mirror::RawMirrorDbLink>,
+    pub after: Vec<raw_mirror::RawMirrorDbLink>,
+}
+
+/// relink 的一次运行结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MirrorRelinkReport {
+    pub scanned_manifests: usize,
+    pub changes: Vec<MirrorRelinkChange>,
+    pub findings: Vec<MirrorRelinkFinding>,
+    /// 是否真的写了盘。dry-run 恒为 `false`。
+    pub applied: bool,
+    /// 实际写盘的 manifest 数。dry-run 恒为 0。
+    pub manifests_written: usize,
+}
+
+/// DB 侧按身份归属到某个 manifest 的一条会话。
+#[derive(Debug, Clone)]
+struct RelinkConversationRow {
+    conversation_id: i64,
+    source_id: String,
+    origin_host: Option<String>,
+    source_path: String,
+    started_at_ms: Option<i64>,
+    message_count: usize,
+}
+
+fn relink_identity_key(
+    source_id: &str,
+    origin_host: Option<&str>,
+    source_path: &str,
+) -> (String, String, String) {
+    (
+        source_id.to_string(),
+        origin_host.unwrap_or_default().to_string(),
+        source_path.to_string(),
+    )
+}
+
+/// 读出 DB 里全部会话的身份投影。只读打开，绝不写。
+fn relink_load_conversations(db_path: &Path) -> Result<Vec<RelinkConversationRow>> {
+    use frankensqlite::compat::RowExt as _;
+
+    let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(db_path)
+        .map_err(|e| anyhow::anyhow!("open readonly db for relink {}: {e}", db_path.display()))?;
+    let rows = storage
+        .raw()
+        .query(
+            "SELECT c.id, c.source_id, c.origin_host, c.source_path, c.started_at, \
+             (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) \
+             FROM conversations c",
+        )
+        .map_err(|e| anyhow::anyhow!("query conversations for relink: {e}"))?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        out.push(RelinkConversationRow {
+            conversation_id: row.get_typed::<i64>(0)?,
+            source_id: row.get_typed::<String>(1)?,
+            origin_host: row.get_typed::<String>(2).ok(),
+            source_path: row.get_typed::<String>(3)?,
+            started_at_ms: row.get_typed::<i64>(4).ok(),
+            message_count: usize::try_from(row.get_typed::<i64>(5).unwrap_or(0).max(0))
+                .unwrap_or(0),
+        });
+    }
+    storage.close_best_effort_in_place();
+    Ok(out)
+}
+
+/// 判定一条 `original_path` 是否落在 raw mirror 自己的暂存区。
+fn relink_path_is_staging(original_path: &str) -> bool {
+    original_path.contains("/raw-mirror/v1/tmp/") || original_path.contains("/tmp/capture.")
+}
+
+/// mirror-relink 主入口。默认 dry-run。
+pub fn mirror_relink(options: &MirrorRelinkOptions) -> Result<MirrorRelinkReport> {
+    let views = raw_mirror::manifest_views(&options.data_dir)?;
+    let db_path = options.data_dir.join("agent_search.db");
+    let conversations = if db_path.exists() {
+        relink_load_conversations(&db_path)?
+    } else {
+        Vec::new()
+    };
+
+    let mut by_identity: std::collections::HashMap<
+        (String, String, String),
+        Vec<&RelinkConversationRow>,
+    > = std::collections::HashMap::new();
+    for row in &conversations {
+        by_identity
+            .entry(relink_identity_key(
+                &row.source_id,
+                row.origin_host.as_deref(),
+                &row.source_path,
+            ))
+            .or_default()
+            .push(row);
+    }
+    let known_conversation_ids: std::collections::HashSet<i64> = conversations
+        .iter()
+        .map(|row| row.conversation_id)
+        .collect();
+
+    let mut findings = Vec::new();
+    let mut changes = Vec::new();
+    let root = options.data_dir.join("raw-mirror").join("v1");
+
+    for view in &views {
+        // ── checksum 与 manifest identity ────────────────────────────
+        match view.manifest_identity_matches(&raw_mirror::recompute_manifest_blake3(
+            &options.data_dir,
+            &view.manifest_relative_path,
+        )?) {
+            Some(true) => {}
+            Some(false) => findings.push(MirrorRelinkFinding::ManifestIdentityMismatch {
+                manifest_id: view.manifest_id.clone(),
+            }),
+            None => findings.push(MirrorRelinkFinding::ManifestIdentityUnrecorded {
+                manifest_id: view.manifest_id.clone(),
+            }),
+        }
+
+        let blob_path = root.join(&view.blob_relative_path);
+        let blob_ok = match std::fs::read(&blob_path) {
+            Ok(bytes) => blake3::hash(&bytes).to_hex().to_string() == view.blob_blake3,
+            Err(_) => false,
+        };
+        if !blob_ok {
+            findings.push(MirrorRelinkFinding::BlobChecksumMismatch {
+                manifest_id: view.manifest_id.clone(),
+                blob_relative_path: view.blob_relative_path.clone(),
+            });
+        }
+
+        // ── staging path ─────────────────────────────────────────────
+        if relink_path_is_staging(&view.original_path) {
+            findings.push(MirrorRelinkFinding::StagingPath {
+                manifest_id: view.manifest_id.clone(),
+                original_path: view.original_path.clone(),
+            });
+        }
+
+        // ── 按真实身份重建 db_links ──────────────────────────────────
+        // provider 刻意不参与匹配：它只是诊断字段，错标不得影响分桶。
+        let key = relink_identity_key(
+            &view.source_id,
+            view.origin_host.as_deref(),
+            &view.original_path,
+        );
+        let mut rebuilt: Vec<raw_mirror::RawMirrorDbLink> = by_identity
+            .get(&key)
+            .map(|rows| {
+                rows.iter()
+                    .map(|row| raw_mirror::RawMirrorDbLink {
+                        conversation_id: Some(row.conversation_id),
+                        message_count: Some(row.message_count),
+                        source_path: Some(row.source_path.clone()),
+                        started_at_ms: row.started_at_ms,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        rebuilt.sort_by_key(|link| link.conversation_id);
+
+        // ── 双向闭合 ─────────────────────────────────────────────────
+        // manifest → DB：记着的 conversation 在 DB 里必须存在。
+        for link in &view.db_links {
+            if let Some(id) = link.conversation_id
+                && !known_conversation_ids.contains(&id)
+            {
+                findings.push(MirrorRelinkFinding::DanglingDbLink {
+                    manifest_id: view.manifest_id.clone(),
+                    conversation_id: id,
+                });
+            }
+        }
+        // DB → manifest：按身份该归属它的会话，manifest 必须记着。
+        let recorded: std::collections::HashSet<i64> = view
+            .db_links
+            .iter()
+            .filter_map(|link| link.conversation_id)
+            .collect();
+        for link in &rebuilt {
+            if let Some(id) = link.conversation_id
+                && !recorded.contains(&id)
+            {
+                findings.push(MirrorRelinkFinding::MissingBackLink {
+                    manifest_id: view.manifest_id.clone(),
+                    conversation_id: id,
+                });
+            }
+        }
+
+        if rebuilt != view.db_links {
+            changes.push(MirrorRelinkChange {
+                manifest_id: view.manifest_id.clone(),
+                manifest_relative_path: view.manifest_relative_path.clone(),
+                before: view.db_links.clone(),
+                after: rebuilt,
+            });
+        }
+    }
+
+    let mut manifests_written = 0usize;
+    if options.apply {
+        for change in &changes {
+            if raw_mirror::rebuild_manifest_db_links(
+                &options.data_dir,
+                &change.manifest_relative_path,
+                &change.after,
+            )? {
+                manifests_written += 1;
+            }
+        }
+    }
+
+    Ok(MirrorRelinkReport {
+        scanned_manifests: views.len(),
+        changes,
+        findings,
+        applied: options.apply,
+        manifests_written,
+    })
+}
+
+#[cfg(test)]
+mod mirror_relink_tests {
+    use super::*;
+    use crate::raw_mirror::{RawMirrorCaptureInput, RawMirrorDbLink};
+    use tempfile::TempDir;
+
+    /// 造一个隔离小库 + raw mirror：一份 manifest、一条会话、两条消息。
+    /// 返回 (tempdir, data_dir, manifest_relative_path, conversation_id, source_file)。
+    fn fixture(with_link: bool) -> (TempDir, PathBuf, String, i64, PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let source_file = tmp.path().join("session-alpha.jsonl");
+        std::fs::write(&source_file, b"{\"role\":\"user\"}\n{\"role\":\"assistant\"}\n").unwrap();
+
+        // DB：一条会话 + 两条消息，身份与 manifest 对齐。
+        let db_path = data_dir.join("agent_search.db");
+        let storage = crate::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
+        let raw = storage.raw();
+        use frankensqlite::compat::{ConnectionExt as _, ParamValue};
+        raw.execute_compat(
+            "INSERT INTO agents(id, slug, name, kind, created_at, updated_at) \
+             VALUES(1,'codex','Codex','cli',0,0)",
+            &[] as &[ParamValue],
+        )
+        .unwrap();
+        raw.execute_compat(
+            "INSERT OR IGNORE INTO sources(id, kind, created_at, updated_at) \
+             VALUES('local','local',0,0)",
+            &[] as &[ParamValue],
+        )
+        .unwrap();
+        let src_path = source_file.display().to_string();
+        raw.execute_compat(
+            "INSERT INTO conversations(id, agent_id, source_id, source_path, started_at) \
+             VALUES(7, 1, 'local', ?1, 1710000000000)",
+            &[ParamValue::from(src_path.as_str())],
+        )
+        .unwrap();
+        for idx in 0..2i64 {
+            raw.execute_compat(
+                "INSERT INTO messages(conversation_id, idx, role, content) VALUES(7, ?1, 'user', 'x')",
+                &[ParamValue::from(idx)],
+            )
+            .unwrap();
+        }
+
+        let links: Vec<RawMirrorDbLink> = if with_link {
+            vec![RawMirrorDbLink {
+                conversation_id: Some(7),
+                message_count: Some(2),
+                source_path: Some(src_path.clone()),
+                started_at_ms: Some(1_710_000_000_000),
+            }]
+        } else {
+            Vec::new()
+        };
+        let record = crate::raw_mirror::capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_file,
+            db_links: &links,
+        })
+        .unwrap();
+
+        (tmp, data_dir, record.manifest_relative_path, 7, source_file)
+    }
+
+    fn run(data_dir: &Path, apply: bool) -> MirrorRelinkReport {
+        mirror_relink(&MirrorRelinkOptions {
+            data_dir: data_dir.to_path_buf(),
+            apply,
+        })
+        .expect("relink must succeed")
+    }
+
+    #[test]
+    fn relink_rebuilds_db_links_from_real_identity() {
+        let (_tmp, data_dir, rel, conv_id, _src) = fixture(false);
+        let report = run(&data_dir, false);
+        assert_eq!(report.scanned_manifests, 1);
+        let change = report
+            .changes
+            .iter()
+            .find(|c| c.manifest_relative_path == rel)
+            .expect("缺链接的 manifest 必须被认定为需要重建");
+        assert!(change.before.is_empty(), "重建前该 manifest 没有 db_links");
+        assert_eq!(change.after.len(), 1, "按身份该匹配到恰好一条会话");
+        let link = &change.after[0];
+        assert_eq!(link.conversation_id, Some(conv_id));
+        assert_eq!(link.message_count, Some(2), "message_count 必须取自真实消息数");
+        assert_eq!(link.started_at_ms, Some(1_710_000_000_000));
+    }
+
+    #[test]
+    fn relink_reports_missing_back_link_as_closure_violation() {
+        let (_tmp, data_dir, _rel, conv_id, _src) = fixture(false);
+        let report = run(&data_dir, false);
+        assert!(
+            report.findings.iter().any(|f| matches!(
+                f,
+                MirrorRelinkFinding::MissingBackLink { conversation_id, .. }
+                    if *conversation_id == conv_id
+            )),
+            "DB 侧有会话而 manifest 没记回来 = 闭合缺一半，必须报出；实得 {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn relink_reports_broken_db_link_pointing_at_missing_conversation() {
+        let (_tmp, data_dir, rel, _conv_id, _src) = fixture(true);
+        // 破坏一条 db_links：指向一个 DB 里不存在的 conversation。
+        crate::raw_mirror::rebuild_manifest_db_links(
+            &data_dir,
+            &rel,
+            &[RawMirrorDbLink {
+                conversation_id: Some(4242),
+                message_count: Some(1),
+                source_path: Some("/nowhere".into()),
+                started_at_ms: None,
+            }],
+        )
+        .unwrap();
+        let report = run(&data_dir, false);
+        assert!(
+            report.findings.iter().any(|f| matches!(
+                f,
+                MirrorRelinkFinding::DanglingDbLink { conversation_id, .. } if *conversation_id == 4242
+            )),
+            "被破坏的 db_link 必须报出；实得 {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn relink_healthy_fixture_has_no_checksum_or_identity_finding() {
+        let (_tmp, data_dir, _rel, _conv_id, _src) = fixture(true);
+        let report = run(&data_dir, false);
+        for finding in &report.findings {
+            assert!(
+                !matches!(
+                    finding,
+                    MirrorRelinkFinding::BlobChecksumMismatch { .. }
+                        | MirrorRelinkFinding::ManifestIdentityMismatch { .. }
+                        | MirrorRelinkFinding::ManifestIdentityUnrecorded { .. }
+                        | MirrorRelinkFinding::StagingPath { .. }
+                ),
+                "健康 fixture 不该有 checksum / identity / staging 类 finding，实得 {finding:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn relink_reports_blob_checksum_mismatch_when_blob_is_tampered() {
+        let (_tmp, data_dir, _rel, _conv_id, _src) = fixture(true);
+        let views = crate::raw_mirror::manifest_views(&data_dir).unwrap();
+        let blob = data_dir
+            .join("raw-mirror")
+            .join("v1")
+            .join(&views[0].blob_relative_path);
+        let mut perms = std::fs::metadata(&blob).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&blob, perms).unwrap();
+        std::fs::write(&blob, b"tampered").unwrap();
+        let report = run(&data_dir, false);
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| matches!(f, MirrorRelinkFinding::BlobChecksumMismatch { .. })),
+            "被篡改的 blob 必须报 checksum 不符；实得 {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn relink_ignores_provider_when_matching() {
+        // provider 只作诊断：把它错标成别的值，重建结果必须完全不变。
+        let (_tmp, data_dir, rel, _conv_id, _src) = fixture(false);
+        let baseline = run(&data_dir, false);
+        let baseline_change = baseline
+            .changes
+            .iter()
+            .find(|c| c.manifest_relative_path == rel)
+            .unwrap()
+            .after
+            .clone();
+
+        let manifest_path = data_dir.join("raw-mirror").join("v1").join(&rel);
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        json["provider"] = serde_json::Value::String("wildly-wrong-provider".into());
+        let mut perms = std::fs::metadata(&manifest_path).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&manifest_path, perms).unwrap();
+        std::fs::write(&manifest_path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+
+        let after = run(&data_dir, false);
+        let after_change = after
+            .changes
+            .iter()
+            .find(|c| c.manifest_relative_path == rel)
+            .expect("provider 错标不该让 manifest 从重建清单里消失")
+            .after
+            .clone();
+        assert_eq!(
+            baseline_change, after_change,
+            "provider 错标不得改变按身份的匹配结果"
+        );
+    }
+
+    #[test]
+    fn relink_reports_staging_path() {
+        let (_tmp, data_dir, rel, _conv_id, _src) = fixture(true);
+        let manifest_path = data_dir.join("raw-mirror").join("v1").join(&rel);
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        json["original_path"] =
+            serde_json::Value::String("/x/raw-mirror/v1/tmp/capture.abc/session.jsonl".into());
+        let mut perms = std::fs::metadata(&manifest_path).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&manifest_path, perms).unwrap();
+        std::fs::write(&manifest_path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+
+        let report = run(&data_dir, false);
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| matches!(f, MirrorRelinkFinding::StagingPath { .. })),
+            "落在暂存区的 original_path 必须报出；实得 {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn relink_defaults_to_dry_run_and_writes_nothing() {
+        let (_tmp, data_dir, _rel, _conv_id, _src) = fixture(false);
+        let report = run(&data_dir, false);
+        assert!(!report.applied, "默认必须是 dry-run");
+        assert_eq!(report.manifests_written, 0, "dry-run 不得写盘");
+        assert!(!report.changes.is_empty(), "本 fixture 确实有待重建项");
+        // 盘上 db_links 必须原样未动。
+        let views = crate::raw_mirror::manifest_views(&data_dir).unwrap();
+        assert!(
+            views[0].db_links.is_empty(),
+            "dry-run 之后 manifest 的 db_links 必须仍为空"
+        );
+    }
+
+    #[test]
+    fn relink_apply_writes_and_is_idempotent() {
+        let (_tmp, data_dir, _rel, conv_id, _src) = fixture(false);
+        let first = run(&data_dir, true);
+        assert!(first.applied);
+        assert_eq!(first.manifests_written, 1);
+        let views = crate::raw_mirror::manifest_views(&data_dir).unwrap();
+        assert_eq!(views[0].db_links.len(), 1);
+        assert_eq!(views[0].db_links[0].conversation_id, Some(conv_id));
+
+        // 再跑一次：已经收敛，不该再有变更也不该再写盘。
+        let second = run(&data_dir, true);
+        assert!(second.changes.is_empty(), "第二遍不该还有待重建项");
+        assert_eq!(second.manifests_written, 0, "已收敛就不得重复写盘");
     }
 }
