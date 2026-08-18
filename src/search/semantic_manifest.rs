@@ -352,6 +352,21 @@ pub struct SemanticShardManifest {
     pub manifest_version: u32,
     pub shards: Vec<SemanticShardRecord>,
     pub updated_at_ms: i64,
+    /// Source content generation these shards were built against
+    /// (上位契约 §20.1(b) 的 D3).
+    ///
+    /// **落点选在本结构体而非 `SemanticManifest`，是因为执法在这里**：
+    /// `summary()` + `SemanticShardRecord::matches_generation()` 是
+    /// `model_manager` 与 `asset_state` 两处生产路径真正据以取舍分片的判据，
+    /// 指纹不符即整组分片被排除；而 `SemanticManifest` 的 `readiness()` /
+    /// `TierReadiness` 在本 crate 内没有生产消费者。把代际放在不执法的
+    /// 那一份上，等于写了个没人看的判据。
+    ///
+    /// `None` 表示这份 manifest 由 pre-W1 binary 写出、根本没记代际 ——
+    /// 判 `Unknown` 要求重建，**不得当成匹配**。`serde(default)` 是为了让
+    /// 旧 manifest 仍能解析：判「未知代际」是一个裁定，不是解析失败。
+    #[serde(default)]
+    pub source_content_generation: Option<String>,
 }
 
 impl Default for SemanticShardManifest {
@@ -360,11 +375,25 @@ impl Default for SemanticShardManifest {
             manifest_version: MANIFEST_FORMAT_VERSION,
             shards: Vec::new(),
             updated_at_ms: 0,
+            source_content_generation: None,
         }
     }
 }
 
 impl SemanticShardManifest {
+    /// 这批分片记的内容代际与 `expected` 的比对结论。
+    ///
+    /// 缺字段判 [`SourceContentGenerationVerdict::Unknown`]，要求重建。
+    pub fn source_content_generation_verdict(
+        &self,
+        expected: &str,
+    ) -> SourceContentGenerationVerdict {
+        SourceContentGenerationVerdict::evaluate(
+            self.source_content_generation.as_deref(),
+            expected,
+        )
+    }
+
     pub fn path(data_dir: &Path) -> PathBuf {
         data_dir.join("vector_index").join(SHARD_MANIFEST_FILENAME)
     }
@@ -738,14 +767,6 @@ pub struct SemanticManifest {
     pub checkpoint: Option<BuildCheckpoint>,
     /// Unix timestamp (ms) when this manifest was last written.
     pub updated_at_ms: i64,
-    /// Source content generation these assets were built against
-    /// (上位契约 §20.1(b) 的 D3).
-    ///
-    /// `None` 表示这份 manifest 由 pre-W1 binary 写出、根本没记代际 ——
-    /// 判 `Unknown` 要求重建，**不得当成匹配**。用 `serde(default)` 是为了让
-    /// 旧 manifest 仍能解析：判「未知代际」是一个裁定，不是解析失败。
-    #[serde(default)]
-    pub source_content_generation: Option<String>,
 }
 
 impl Default for SemanticManifest {
@@ -764,25 +785,11 @@ impl Default for SemanticManifest {
             },
             checkpoint: None,
             updated_at_ms: 0,
-            source_content_generation: None,
         }
     }
 }
 
 impl SemanticManifest {
-    /// 这份 manifest 记的内容代际与 `expected` 的比对结论。
-    ///
-    /// 缺字段判 [`SourceContentGenerationVerdict::Unknown`]，要求重建。
-    pub fn source_content_generation_verdict(
-        &self,
-        expected: &str,
-    ) -> SourceContentGenerationVerdict {
-        SourceContentGenerationVerdict::evaluate(
-            self.source_content_generation.as_deref(),
-            expected,
-        )
-    }
-
     // ── Path helpers ───────────────────────────────────────────────────
 
     /// Path to the manifest file.
@@ -2348,24 +2355,14 @@ mod tests {
     // ── Task E1 · D3: source content generation（上位契约 §20.1(b)）────────
 
     #[test]
-    fn legacy_semantic_manifest_without_generation_is_unknown_and_requires_rebuild() {
+    fn legacy_shard_manifest_without_generation_is_unknown_and_requires_rebuild() {
         // 旧 manifest 由 pre-W1 binary 写出，整份 JSON 里没有该字段。
         let legacy = serde_json::json!({
             "manifest_version": MANIFEST_FORMAT_VERSION,
-            "fast_tier": null,
-            "quality_tier": null,
-            "hnsw": null,
-            "backlog": {
-                "total_conversations": 0,
-                "fast_tier_processed": 0,
-                "quality_tier_processed": 0,
-                "db_fingerprint": "",
-                "computed_at_ms": 0
-            },
-            "checkpoint": null,
+            "shards": [],
             "updated_at_ms": 0
         });
-        let manifest: SemanticManifest = serde_json::from_value(legacy)
+        let manifest: SemanticShardManifest = serde_json::from_value(legacy)
             .expect("旧 manifest 必须仍能解析——判『未知代际』是个裁定，不是解析失败");
 
         assert_eq!(
@@ -2388,9 +2385,9 @@ mod tests {
     }
 
     #[test]
-    fn semantic_manifest_generation_verdict_covers_all_three_variants() {
-        // E-7 发射点判据：三个 variant 都要有真实输入能走到。
-        let mut manifest = SemanticManifest::default();
+    fn shard_manifest_generation_verdict_covers_all_three_variants() {
+        // 发射点判据：三个 variant 都要有真实输入能走到。
+        let mut manifest = SemanticShardManifest::default();
 
         assert_eq!(
             manifest.source_content_generation_verdict("gen-A"),
@@ -2409,13 +2406,13 @@ mod tests {
     }
 
     #[test]
-    fn semantic_manifest_generation_survives_save_load_roundtrip() {
+    fn shard_manifest_generation_survives_save_load_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
-        let mut manifest = SemanticManifest::default();
+        let mut manifest = SemanticShardManifest::default();
         manifest.source_content_generation = Some("gen-roundtrip".to_owned());
         manifest.save(dir.path()).unwrap();
 
-        let loaded = SemanticManifest::load(dir.path()).unwrap().unwrap();
+        let loaded = SemanticShardManifest::load(dir.path()).unwrap().unwrap();
         assert_eq!(
             loaded.source_content_generation.as_deref(),
             Some("gen-roundtrip"),
