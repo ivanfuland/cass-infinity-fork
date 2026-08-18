@@ -26945,7 +26945,7 @@ pub mod persist {
             ENV_LOCK_DEPTH.with(|depth| {
                 let current = depth.get();
                 if current == 0 {
-                    guard = Some(ENV_LOCK.lock().expect("env mutation lock"));
+                    guard = Some(ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
                 }
                 depth.set(current + 1);
             });
