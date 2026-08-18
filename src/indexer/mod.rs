@@ -24637,6 +24637,39 @@ fn prepare_conversation_for_ingest(
     attach_raw_mirror_capture(data_dir, conv);
 }
 
+/// restore / oracle 侧的 ③ —— 与上面的 [`prepare_conversation_for_ingest`] 是一对，
+/// **差别全部写在这里**，不散在调用方（Task E5，控制面裁定 R-E-35）。
+///
+/// 与 ingest 版的两处差别，逐条对应附录 `W1-0` §A.1.1：
+///
+/// 1. **compact 判据不读活路径，由调用方按封存的 `source_size_bytes` 传入。**
+///    ingest 版走 `compact_large_connector_extras`，它对 `fs::metadata(&conv.source_path)`
+///    取 `len()`；路径已消失时 `Err → None → should_compact_connector_extra` 直接
+///    `return false`，**16 MiB compact 静默不执行**；路径存在但封存后被改动时，投影结果
+///    取决于封存之后的文件系统状态。restore 的投影必须是封存件的纯变换，故换源。
+/// 2. **`attach_raw_mirror_capture` 整步不跑。** 它调 `capture_source_file` 产生文件系统
+///    写副作用，再改写 `metadata.cass.raw_mirror`。restore 的输入本来就来自 mirror，
+///    重新 capture 一次既无意义又是生产写；`metadata.cass.raw_mirror` 由调用方按被消费的
+///    那份 manifest 直接填写。**这条约束焊在被调用侧**——调用方漏跑或多跑都不可能。
+///
+/// 前三步（`inject_provenance` / `canonicalize_claude_external_id` /
+/// `apply_workspace_rewrite`）与 ingest 版逐字相同：三者只读 `conv` 自身与封存的 root
+/// 集合，是纯函数。
+pub(crate) fn prepare_conversation_for_restore(
+    connector_name: &str,
+    origin: &Origin,
+    workspace_rewrite_root: Option<&ScanRoot>,
+    sealed_source_size_bytes: u64,
+    conv: &mut NormalizedConversation,
+) {
+    inject_provenance(conv, origin);
+    canonicalize_claude_external_id(connector_name, conv);
+    if let Some(root) = workspace_rewrite_root {
+        apply_workspace_rewrite(conv, root);
+    }
+    compact_large_connector_extras_for_size(connector_name, conv, Some(sealed_source_size_bytes));
+}
+
 fn capture_connector_sources_before_parse(
     connector: &(dyn crate::connectors::Connector + Send),
     ctx: &crate::connectors::ScanContext,

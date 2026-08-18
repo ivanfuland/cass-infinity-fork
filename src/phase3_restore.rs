@@ -1804,3 +1804,832 @@ mod e4_winner_and_decision_tests {
         );
     }
 }
+
+// ===========================================================================
+// E5 · 封存投影（sealed projection）
+//
+// 规范来源：附录 `W1-0` §A.1.1（restore 的投影是纯变换）、§B.0（两段投影管线与六个符号
+// 锚）、§B.0.1（范围门，凌驾 B.2–B.4 的分支表）；控制面裁定 **R-E-34**（投影定义域三样
+// + `since_ts = None`）。
+//
+// ## 为什么定义域是三样而不是附录字面的两样（R-E-34）
+//
+// 附录 §A.1.1 写的是「定义域只有 sealed bundle 里的两样东西：blob bytes 与 manifest 的
+// `source_size_bytes`」。**按字面实现会让 §B.0.1 的范围门整个失效**，因为 pin parser 的
+// 入口是**路径**不是字节：
+//
+// - `FAD: connectors/mod.rs::Connector` 只有 `scan(&ScanContext)` 与
+//   `scan_with_callback(...)`，没有任何吃 `&[u8]` 的入口；
+// - `FAD: connectors/scan.rs::ScanContext` 三个字段 `data_dir` / `scan_roots` / `since_ts`，
+//   解析对象一律靠 roots 走文件系统发现；
+// - 多处分支**由路径决定**：`FAD: claude_code.rs::path_is_desktop_sidecar` 按**路径分量**
+//   判 Desktop sidecar、`FAD: codex.rs::is_rollout_file` 按文件名判、whole-file 与 JSONL 的
+//   分野按扩展名。
+//
+// 于是一个用随机临时名物化的投影会把 `rollout-*.json` 当普通 JSONL、让 sidecar 检测永不
+// 触发。**裁定 R-E-34 采纳的读法**：定义域 = `{blob bytes, manifest.original_path 的
+// canonical 形状, manifest.source_size_bytes}`，实现约束 `since_ts = None`。
+// 本注释是该裁定的实现侧落点；附录不重开，勘误挂 plan H2 第 10 条。
+//
+// ## `since_ts` 必须钉死 `None`
+//
+// `ScanContext.since_ts` 经 `FAD: utils.rs::file_modified_since` 按 **mtime** 过滤。物化
+// 文件的 mtime 是我们造出来的、与封存内容无关；不钉死就是把投影结果挂到「物化那一刻的
+// 时钟」上——与环境失败矩阵 E-4 那条「`st_mtime_ns` 不得进身份元组」同源。
+//
+// ## compact 判据怎么换源（§A.1.1 第 2 条）
+//
+// 附录要求把 CASS 侧 `should_compact_connector_extra` 与 FAD 侧两家同名私有方法的
+// `Option<u64>` 入参换成 manifest 的 `source_size_bytes`。FAD 是 pin 死的外部 crate，
+// **改不了也不该改**。本实现改用等价且可断言的路线：
+//
+// - **物化的字节就是封存的字节**，故物化文件的 `metadata().len()` 恒等于
+//   `source_size_bytes` —— 这不是假设，是 [`materialize_sealed_blob`] 里一条硬断言
+//   （[`ProjectionFault::SealedSizeMismatch`]）的直接后果，两侧不等即拒绝投影；
+// - CASS 侧不走读活路径的 `compact_large_connector_extras`，改走已存在的
+//   `compact_large_connector_extras_for_size(_, _, Some(sealed_size))`，**显式传封存值**。
+//
+// 净效果与附录要求的语义相同：判据来自封存值，不来自「投影时刻文件系统长什么样」。
+// 差异是机制而非语义，记入 E9 的类②表。
+// ===========================================================================
+
+use std::path::{Component, Path, PathBuf};
+
+use franken_agent_detection::types::NormalizedConversation;
+
+/// 一条被恢复对象的封存输入 —— **这就是投影的定义域**（R-E-34）。
+///
+/// 三个字段全部来自 sealed manifest 与它引用的 blob，**没有任何一项来自活文件系统**。
+#[derive(Debug, Clone, Copy)]
+pub struct SealedSource<'a> {
+    /// 三家之一。决定用哪个 pin parser、以及 §B.0.1 的哪一行范围门。
+    pub agent: Origin,
+    /// manifest 的 `original_path`（canonical 捕获路径）。**形状进定义域**：
+    /// 文件名决定 whole-file/JSONL 与 rollout 判别，祖先分量决定 Desktop sidecar 判别。
+    pub canonical_original_path: &'a str,
+    /// manifest 的 `source_size_bytes`。**`u64` 非 `Option`**——§A.1.1 明写 restore 侧
+    /// 不存在「取不到大小 → 不 compact」这条分支。
+    pub source_size_bytes: u64,
+    /// 封存的 blob 字节。
+    pub blob: &'a [u8],
+}
+
+/// 投影过程中的硬失败。**每一层以自己的名义拒绝**，不靠下层兜住（七类矩阵 E-6）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectionFault {
+    /// blob 长度与 manifest 记的 `source_size_bytes` 不等。
+    ///
+    /// 这一条同时是 compact 判据换源的**承重断言**：两者相等，物化文件的 `len()` 才
+    /// 恒等于封存值。不等即拒绝投影，而不是「取小的那个继续跑」。
+    SealedSizeMismatch { manifest: u64, blob: u64 },
+    /// `original_path` 不可用于重建形状（空、含 `..` 等）。
+    UnsafeOriginalPath { detail: String },
+    /// 物化到 scratch 根时的 I/O 失败。**不与其他 I/O 合并归类**（E-6）。
+    Materialize { detail: String },
+    /// pin parser 报错。
+    ParserFailed { detail: String },
+    /// 一个 source 文件投影出的会话数不是 1。
+    ///
+    /// 三家的现代生产 JSONL 都是「一个文件一个会话」；不是 1 说明形态超出 §B.0.1 的
+    /// 有效定义域，**硬失败而不是取第一个**。
+    UnexpectedConversationCount { count: usize },
+    /// pin parser 扫出来的会话，其 `source_path` 不是我们物化的那个文件。
+    ///
+    /// 这一条防的是「聚合忽略旁路残缺项」（七类矩阵 E-5）的一个具体形态：scratch 根里出现
+    /// 了预期外的文件（上一次投影的残留、connector 的默认根兜底逻辑捡到别处的文件），
+    /// 于是投影出的会话根本不是被恢复的那一份，而后续每一步都自洽。
+    /// **判据是「扫到的就是刚物化的那一个」，不是「扫到了至少一个」。**
+    ScannedDifferentFile { expected: String, got: String },
+}
+
+impl fmt::Display for ProjectionFault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SealedSizeMismatch { manifest, blob } => write!(
+                f,
+                "sealed size mismatch: manifest source_size_bytes={manifest} but blob is {blob} bytes"
+            ),
+            Self::UnsafeOriginalPath { detail } => {
+                write!(f, "unsafe canonical original_path: {detail}")
+            }
+            Self::Materialize { detail } => write!(f, "materializing sealed blob failed: {detail}"),
+            Self::ParserFailed { detail } => write!(f, "pinned parser failed: {detail}"),
+            Self::UnexpectedConversationCount { count } => write!(
+                f,
+                "sealed source projected {count} conversations; exactly 1 is required"
+            ),
+            Self::ScannedDifferentFile { expected, got } => write!(
+                f,
+                "pinned parser scanned {got} but the materialized sealed blob is {expected}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ProjectionFault {}
+
+/// Claude Desktop sidecar 的路径分量判据。
+///
+/// **与 `FAD: claude_code.rs::path_is_desktop_sidecar` 同构，逐字对齐它的两个分量字面量。**
+/// 之所以要在本层再判一次而不是靠 parser：§B.0.1 第一行要求这类输入**立即 HOLD 并另立
+/// 范围**，而 pin parser 对它是正常产消息的分支——靠下层兜住等于这一层没有守卫。
+///
+/// **判的是分量不是子串**：`claude-code-sessions-backup/` 这种名字不该命中。
+fn path_is_claude_desktop_sidecar(path: &Path) -> bool {
+    path.components().any(|component| {
+        matches!(
+            component.as_os_str().to_str(),
+            Some("claude-code-sessions" | "local-agent-mode-sessions")
+        )
+    })
+}
+
+/// 把 canonical 原始路径重建成 scratch 根下的相对形状。
+///
+/// **物化根本身不进任何判定**（R-E-34 条件 2）：本函数只把 `original_path` 的分量序列
+/// 原样接到根后面，绝对路径的前导 `/` 被剥掉。拒绝 `..`——否则物化会逃出 scratch 根。
+fn rebuild_relative_shape(canonical_original_path: &str) -> Result<PathBuf, ProjectionFault> {
+    let raw = Path::new(canonical_original_path);
+    let mut rebuilt = PathBuf::new();
+    for component in raw.components() {
+        match component {
+            // 绝对路径的前导 `/` 与盘符：剥掉，形状从它后面开始。
+            Component::RootDir | Component::Prefix(_) | Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(ProjectionFault::UnsafeOriginalPath {
+                    detail: format!("`..` component in {canonical_original_path:?}"),
+                });
+            }
+            Component::Normal(part) => rebuilt.push(part),
+        }
+    }
+    if rebuilt.as_os_str().is_empty() {
+        return Err(ProjectionFault::UnsafeOriginalPath {
+            detail: format!("no usable component in {canonical_original_path:?}"),
+        });
+    }
+    Ok(rebuilt)
+}
+
+/// 把封存的 blob 物化到 scratch 根下、按 `original_path` 重建的位置。
+///
+/// 返回物化后的绝对路径。**长度断言做两次，且判据是「落盘后的最终字节数」**
+/// （控制面裁定 R-E-35 的附加条件）：
+///
+/// 1. **落盘前**比 `blob.len()` 与 `source_size_bytes` —— 入参侧的第一道拒绝。
+///    `SealedSource.blob` 的契约是**解压后的最终字节**；若上游把压缩形态的 blob 原样递
+///    进来（manifest 的 `compression` 不是 `none` 而没走解压路径），这里立刻 `SealedSizeMismatch`，
+///    而不是让一个短了的文件混过去让 compact 判据读到错的大小。
+/// 2. **落盘后**回读 `metadata().len()` 再比一次 —— 防的是短写（`ENOSPC`、被截断）。
+///    只比入参不比产物，等于把「写成功了」当成「写全了」，正是七类矩阵 E-1
+///    「短读 / 部分读当完整」的写侧同构。
+fn materialize_sealed_blob(
+    scratch_root: &Path,
+    input: &SealedSource<'_>,
+) -> Result<PathBuf, ProjectionFault> {
+    let blob_len = input.blob.len() as u64;
+    if blob_len != input.source_size_bytes {
+        return Err(ProjectionFault::SealedSizeMismatch {
+            manifest: input.source_size_bytes,
+            blob: blob_len,
+        });
+    }
+    let relative = rebuild_relative_shape(input.canonical_original_path)?;
+    let target = scratch_root.join(&relative);
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| ProjectionFault::Materialize {
+            detail: format!("create_dir_all {}: {err}", parent.display()),
+        })?;
+    }
+    std::fs::write(&target, input.blob).map_err(|err| ProjectionFault::Materialize {
+        detail: format!("write {}: {err}", target.display()),
+    })?;
+
+    let written = std::fs::metadata(&target)
+        .map_err(|err| ProjectionFault::Materialize {
+            detail: format!("stat back {}: {err}", target.display()),
+        })?
+        .len();
+    if written != input.source_size_bytes {
+        return Err(ProjectionFault::SealedSizeMismatch {
+            manifest: input.source_size_bytes,
+            blob: written,
+        });
+    }
+    Ok(target)
+}
+
+/// 一次封存投影的处置。
+///
+/// **范围门那几档直接转达 E2 已冻结分类器的结论，不做第二定义**（同 R-E-28 的理由）。
+///
+/// **刻意不 derive `PartialEq`**：`NormalizedConversation` 是 pin 死的上游类型、没有
+/// `PartialEq`，而「为了下游方便去给冻结的上游加 trait」正是 E4 记档过的那个口子
+/// （消费者的便利不构成动上游的理由）。测试用模式匹配比对，不用 `==`。
+#[derive(Debug, Clone)]
+pub enum SealedProjection {
+    /// 落在有效定义域内（三家的现代生产 JSONL），投影完成。
+    Projected(Box<NormalizedConversation>),
+    /// §B.0.1 命中：立即 HOLD 并另立范围。**census 侧仍须枚举它**，这里只管处置。
+    Held {
+        reason: crate::phase3_bundle::HoldReason,
+        detail: Option<String>,
+    },
+    /// 零消息 + 已知 metadata 形态：记 `excluded_known_metadata`，**不得 HOLD**。
+    ExcludedKnownMetadata,
+    /// whole-file 前置守卫命中（> 100 MiB）。
+    SkippedOversize { byte_len: u64 },
+    /// pin parser 对 whole-file 解析失败：debug + continue。
+    SkippedUnparsable { detail: String },
+}
+
+/// 用 pin parser 数一份 whole-file 文档里的消息条数（E2 那个注入点的真实实现）。
+///
+/// **它扫的是已物化的 scratch 根**，不是活路径：投影的定义域里没有活文件系统。
+struct PinnedWholeFileCounter<'a> {
+    materialized: &'a Path,
+    agent: Origin,
+}
+
+impl crate::phase3_bundle::WholeFileMessageCounter for PinnedWholeFileCounter<'_> {
+    fn count_messages(
+        &self,
+        _path: &Path,
+        _bytes: &[u8],
+    ) -> Result<usize, crate::phase3_bundle::PinParseError> {
+        let conversations =
+            scan_materialized_file(self.materialized, self.agent).map_err(|fault| {
+                crate::phase3_bundle::PinParseError {
+                    detail: fault.to_string(),
+                }
+            })?;
+        Ok(conversations
+            .iter()
+            .map(|conv| conv.messages.len())
+            .sum::<usize>())
+    }
+}
+
+/// 三家 pin parser 的 connector name（`canonicalize_claude_external_id` 等按它分支）。
+const fn connector_name_for(agent: Origin) -> &'static str {
+    match agent {
+        Origin::ClaudeCode => "claude",
+        Origin::Codex => "codex",
+        Origin::Openclaw => "openclaw",
+    }
+}
+
+/// 拿 pin parser 扫**恰好一个已物化的文件**。
+///
+/// **root 指到文件本身而不是 scratch 目录**，三家都支持这条显式文件路径
+/// （`FAD: claude_code.rs:451 explicit_file_root` / `codex.rs:311 explicit_file` /
+/// `openclaw.rs:276`）。这样 scratch 目录里若有别的残留文件也进不来——把「扫到别人的会话」
+/// 这一整类（E-5）从结构上消掉，而不是靠事后比对兜。
+///
+/// **注意这条显式文件路径同时是 `external_id` 推导的依据**：三家都要从该文件往上找各自的
+/// 根（`projects_root_for_explicit_file` / `sessions_dir_for_explicit_file`），再取相对路径。
+/// 这是裁定 R-E-34「祖先形状进定义域」的又一处机械依据——祖先没重建对，`external_id` 就错。
+///
+/// **`since_ts` 恒为 `None`**（R-E-34 的实现约束）：`ScanContext.since_ts` 经
+/// `FAD: utils.rs::file_modified_since` 按 mtime 过滤，而物化文件的 mtime 是我们造出来的、
+/// 与封存内容无关。给它任何非 `None` 值，投影结果就挂到了「物化那一刻的时钟」上。
+fn scan_materialized_file(
+    materialized: &Path,
+    agent: Origin,
+) -> Result<Vec<NormalizedConversation>, ProjectionFault> {
+    use crate::connectors::{Connector, ScanContext, ScanRoot};
+
+    let data_dir = materialized.parent().unwrap_or(materialized).to_path_buf();
+    let root = ScanRoot::local(materialized.to_path_buf());
+    let ctx = ScanContext::with_roots(data_dir, vec![root], None);
+
+    let connector: Box<dyn Connector + Send> = match agent {
+        Origin::ClaudeCode => Box::new(crate::connectors::claude_code::ClaudeCodeConnector::new()),
+        Origin::Codex => Box::new(crate::connectors::codex::CodexConnector::new()),
+        Origin::Openclaw => Box::new(crate::connectors::openclaw::OpenClawConnector::new()),
+    };
+
+    connector
+        .scan(&ctx)
+        .map_err(|err| ProjectionFault::ParserFailed {
+            detail: format!("{err:#}"),
+        })
+}
+
+/// 把一条封存输入投影成 canonical 会话 —— **E5 投影的唯一入口**。
+///
+/// 步骤顺序不可交换，每一步的理由见各自注释：
+///
+/// 1. **物化**（含两道长度断言）——后面每一步都建立在「盘上的字节就是封存的字节」之上；
+/// 2. **Desktop sidecar 路径门**——§B.0.1 第一行，判据是路径分量，必须先于 parser；
+/// 3. **whole-file 形态分类**——复用 E2 冻结的分类器，零第二定义；
+/// 4. **JSONL 主路径**：pin parser 扫 → 恰好一个会话 → 跑 restore 侧的 ③。
+pub fn project_sealed_source(
+    scratch_root: &Path,
+    input: &SealedSource<'_>,
+) -> Result<SealedProjection, ProjectionFault> {
+    let materialized = materialize_sealed_blob(scratch_root, input)?;
+    project_from_materialized(&materialized, input)
+}
+
+/// [`project_sealed_source`] 的后半段：输入是**已经物化好的**那个文件。
+///
+/// 拆出来的理由是可测性，而且这个可测性是必须的：`since_ts = None` 那条约束要被真正验到，
+/// 测试必须能在「物化之后、扫描之前」插手改 mtime。若只暴露一体的
+/// [`project_sealed_source`]，任何改 mtime 的尝试都会被它内部的重新物化覆盖掉 —— 那样的
+/// 测试会绿，但它什么都没测（本函数的存在就是为了让那种失效探针不可能写出来）。
+fn project_from_materialized(
+    materialized: &Path,
+    input: &SealedSource<'_>,
+) -> Result<SealedProjection, ProjectionFault> {
+    use crate::phase3_bundle::{HoldReason, WholeFileDisposition, classify_whole_file};
+
+    // §B.0.1 第一行：会发消息的 Claude Desktop sidecar 立即 HOLD 并另立范围。
+    // **必须先于 parser**——parser 对它是正常产消息的分支，靠下层兜住等于本层没有守卫。
+    if matches!(input.agent, Origin::ClaudeCode)
+        && path_is_claude_desktop_sidecar(Path::new(input.canonical_original_path))
+    {
+        return Ok(SealedProjection::Held {
+            reason: HoldReason::OutOfScopeFormat,
+            detail: Some("claude-desktop-sidecar".to_owned()),
+        });
+    }
+
+    let counter = PinnedWholeFileCounter {
+        materialized,
+        agent: input.agent,
+    };
+    match classify_whole_file(
+        input.agent,
+        Path::new(input.canonical_original_path),
+        input.blob,
+        &counter,
+    ) {
+        WholeFileDisposition::Hold { reason, detail } => {
+            return Ok(SealedProjection::Held { reason, detail });
+        }
+        WholeFileDisposition::ExcludedKnownMetadata => {
+            return Ok(SealedProjection::ExcludedKnownMetadata);
+        }
+        WholeFileDisposition::SkippedOversize { byte_len } => {
+            return Ok(SealedProjection::SkippedOversize { byte_len });
+        }
+        WholeFileDisposition::SkippedUnparsable { detail } => {
+            return Ok(SealedProjection::SkippedUnparsable { detail });
+        }
+        // 精确小写 `.jsonl`：落到下面的 JSONL 主路径。
+        WholeFileDisposition::NotWholeFile => {}
+    }
+
+    let mut conversations = scan_materialized_file(materialized, input.agent)?;
+    if conversations.len() != 1 {
+        return Err(ProjectionFault::UnexpectedConversationCount {
+            count: conversations.len(),
+        });
+    }
+    let mut conv = conversations.remove(0);
+
+    // 扫到的必须**就是刚物化的那一个文件**。「扫到了至少一个」不构成证据：scratch 根里
+    // 出现预期外的文件时，投影出的会话会是别人的，而后续每一步都自洽（E-5）。
+    if conv.source_path != materialized {
+        return Err(ProjectionFault::ScannedDifferentFile {
+            expected: materialized.display().to_string(),
+            got: conv.source_path.display().to_string(),
+        });
+    }
+
+    // `source_path` 必须是**封存记的那条**，不是我们物化出来的 scratch 路径。
+    // 附录 §A.4 与 plan Step 1 都点名「`source_path` 逐条 == manifest `original_path`」。
+    conv.source_path = PathBuf::from(input.canonical_original_path);
+
+    crate::indexer::prepare_conversation_for_restore(
+        connector_name_for(input.agent),
+        &franken_agent_detection::types::Origin::local(),
+        None,
+        input.source_size_bytes,
+        &mut conv,
+    );
+
+    Ok(SealedProjection::Projected(Box::new(conv)))
+}
+
+#[cfg(test)]
+mod e5_materialization_tests {
+    use super::*;
+
+    /// 这几条**是实现先于测试**写的（物化脚手架，不是 plan Step 1 点名的逐字段判据）。
+    /// 故它们的断言力**不以「先红后绿」背书**，而由 E5 台账里的变异对照单独证明。
+    /// Step 1 点名的那批（逐字段比对 / `source_path` / `external_id` 重推导）与范围门
+    /// 三件套一律红相在先。
+    const _DISCIPLINE_NOTE: () = ();
+
+    fn scratch(tag: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!("cc-cass-e5-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    fn source<'a>(path: &'a str, blob: &'a [u8]) -> SealedSource<'a> {
+        SealedSource {
+            agent: Origin::ClaudeCode,
+            canonical_original_path: path,
+            source_size_bytes: blob.len() as u64,
+            blob,
+        }
+    }
+
+    #[test]
+    fn rebuild_shape_strips_absolute_prefix_and_keeps_every_component() {
+        let rebuilt = rebuild_relative_shape("/home/u/.claude/projects/ws/abc.jsonl").unwrap();
+        assert_eq!(
+            rebuilt,
+            // **只剥前导 `/`，一个分量都不许多剥。** 祖先分量进定义域（R-E-34 条件 1③），
+            // 而 sidecar 判据正是靠祖先分量 —— 「顺手把 home/u 也去掉」会让
+            // `/home/u/claude-code-sessions/...` 这类路径失去它的判据分量。
+            PathBuf::from("home/u/.claude/projects/ws/abc.jsonl"),
+            "前导 `/` 剥掉，其余分量必须逐个原样保留 —— 祖先分量进定义域（R-E-34 条件 1③）"
+        );
+    }
+
+    #[test]
+    fn rebuild_shape_rejects_parent_dir_escape_by_its_own_name() {
+        let err = rebuild_relative_shape("/a/../../etc/passwd").unwrap_err();
+        match err {
+            ProjectionFault::UnsafeOriginalPath { detail } => {
+                assert!(
+                    detail.contains(".."),
+                    "拒绝理由要指名 `..`，不用宽接：{detail}"
+                );
+            }
+            other => panic!("期望 UnsafeOriginalPath，实得 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rebuild_shape_rejects_component_less_path() {
+        assert!(matches!(
+            rebuild_relative_shape("/").unwrap_err(),
+            ProjectionFault::UnsafeOriginalPath { .. }
+        ));
+        assert!(matches!(
+            rebuild_relative_shape("").unwrap_err(),
+            ProjectionFault::UnsafeOriginalPath { .. }
+        ));
+    }
+
+    #[test]
+    fn materialize_refuses_when_blob_length_disagrees_with_sealed_size() {
+        let root = scratch("sizecheck");
+        let blob = b"{}\n";
+        let input = SealedSource {
+            agent: Origin::ClaudeCode,
+            canonical_original_path: "/home/u/s.jsonl",
+            // manifest 说 99 字节，blob 只有 3 —— compact 判据换源的承重断言必须在这里咬住。
+            source_size_bytes: 99,
+            blob,
+        };
+        let err = materialize_sealed_blob(&root, &input).unwrap_err();
+        assert_eq!(
+            err,
+            ProjectionFault::SealedSizeMismatch {
+                manifest: 99,
+                blob: 3
+            }
+        );
+        assert!(
+            !root.join("home/u/s.jsonl").exists(),
+            "长度不一致时必须在落盘之前拒绝，不得先写再报"
+        );
+    }
+
+    #[test]
+    fn materialize_refuses_a_compressed_blob_handed_in_without_decompression() {
+        // R-E-35 附加条件：断言对象是「落盘的最终字节」，故上游若把压缩形态的 blob 原样
+        // 递进来（manifest 的 compression 不是 none 却没走解压），必须在这里被咬住。
+        // 合成一个：source_size_bytes 记的是**解压后**的大小，blob 是压缩后的短字节串。
+        let root = scratch("compressed");
+        let uncompressed_len: u64 = 4096;
+        let compressed_blob = b"\x28\xb5\x2f\xfd\x00\x58\x2d\x00\x00compressed-payload";
+        let input = SealedSource {
+            agent: Origin::ClaudeCode,
+            canonical_original_path: "/home/u/.claude/projects/ws/big.jsonl",
+            source_size_bytes: uncompressed_len,
+            blob: compressed_blob,
+        };
+        let err = materialize_sealed_blob(&root, &input).unwrap_err();
+        assert_eq!(
+            err,
+            ProjectionFault::SealedSizeMismatch {
+                manifest: uncompressed_len,
+                blob: compressed_blob.len() as u64,
+            },
+            "压缩形态未解压就递进来必须被拒；放过它 = compact 判据读到压缩后的大小"
+        );
+        assert!(!root.join("home/u/.claude/projects/ws/big.jsonl").exists());
+    }
+
+    #[test]
+    fn materialize_writes_exact_bytes_so_file_len_equals_sealed_size() {
+        let root = scratch("exactbytes");
+        let blob = b"{\"a\":1}\n{\"b\":2}\n";
+        let input = source("/home/u/.claude/projects/ws/abc.jsonl", blob);
+        let path = materialize_sealed_blob(&root, &input).unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), blob);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            input.source_size_bytes,
+            "物化文件的 len() 必须恒等于封存值 —— 这是 compact 判据换源成立的全部依据"
+        );
+    }
+
+    #[test]
+    fn materialization_root_prefix_does_not_leak_into_the_rebuilt_shape() {
+        // R-E-34 条件 2：物化根本身不进任何判定。两个不同的根，重建出的**相对**形状必须逐字节同。
+        let blob = b"x\n";
+        let input = source("/home/u/.claude/projects/ws/abc.jsonl", blob);
+        let root_a = scratch("root-a");
+        let root_b = scratch("root-b-with-a-much-longer-name");
+
+        let a = materialize_sealed_blob(&root_a, &input).unwrap();
+        let b = materialize_sealed_blob(&root_b, &input).unwrap();
+
+        assert_eq!(
+            a.strip_prefix(&root_a).unwrap(),
+            b.strip_prefix(&root_b).unwrap()
+        );
+        assert_eq!(std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap());
+    }
+
+    /// 一份真实形状的 Claude 现代生产 JSONL（形状取自 pin 侧 `claude_code.rs` 的真语料样本，
+    /// 不是我凭想象编的键集）。
+    const CLAUDE_JSONL: &[u8] = br#"{"type":"user","timestamp":"2025-12-01T10:00:00Z","message":{"role":"user","content":"Hello Claude"}}
+{"type":"assistant","timestamp":"2025-12-01T10:00:01Z","message":{"role":"assistant","content":"Hello! How can I help?"}}
+"#;
+
+    fn claude_source<'a>(path: &'a str, blob: &'a [u8]) -> SealedSource<'a> {
+        SealedSource {
+            agent: Origin::ClaudeCode,
+            canonical_original_path: path,
+            source_size_bytes: blob.len() as u64,
+            blob,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // R-E-34 条件 1：同一份字节、三种路径形状 → 三种处置。
+    //
+    // 这三条焊的是「路径形状进投影定义域」这个裁定本身。任何把物化优化成「只保文件名」
+    // 或「用随机临时名」的改动都会让其中至少一条转红。
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn same_bytes_as_codex_rollout_json_is_held_out_of_scope() {
+        let root = scratch("shape-rollout");
+        let input = SealedSource {
+            agent: Origin::Codex,
+            canonical_original_path: "/home/u/.codex/sessions/rollout-2025-12-01T10-00-00.json",
+            source_size_bytes: CLAUDE_JSONL.len() as u64,
+            blob: CLAUDE_JSONL,
+        };
+        match project_sealed_source(&root, &input).unwrap() {
+            SealedProjection::Held { reason, .. } => assert_eq!(
+                reason,
+                crate::phase3_bundle::HoldReason::OutOfScopeFormat,
+                "任意 codex `rollout-*.json` 按 §B.0.1 第三行立即 HOLD 并另立范围"
+            ),
+            other => panic!("期望 Held(out-of-scope-format)，实得 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn same_bytes_as_plain_jsonl_projects_normally() {
+        let root = scratch("shape-jsonl");
+        let input = claude_source(
+            "/home/u/.claude/projects/myapp/11111111-2222-3333-4444-555555555555.jsonl",
+            CLAUDE_JSONL,
+        );
+        match project_sealed_source(&root, &input).unwrap() {
+            SealedProjection::Projected(conv) => {
+                assert_eq!(conv.messages.len(), 2, "两条消息都要在");
+            }
+            other => panic!("精确小写 `.jsonl` 是 JSONL 主路径，期望 Projected，实得 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn same_bytes_under_a_desktop_sidecar_ancestor_component_is_held() {
+        // R-E-34 条件 1③：sidecar 判据靠的是**祖先分量**不是文件名。文件名与上一条完全同，
+        // 只有祖先分量不同 —— 处置必须不同。把物化改成「只保文件名」时这条会红。
+        let root = scratch("shape-sidecar");
+        let input = claude_source(
+            "/home/u/Library/Application Support/Claude/claude-code-sessions/11111111-2222-3333-4444-555555555555.jsonl",
+            CLAUDE_JSONL,
+        );
+        match project_sealed_source(&root, &input).unwrap() {
+            SealedProjection::Held { reason, detail } => {
+                assert_eq!(reason, crate::phase3_bundle::HoldReason::OutOfScopeFormat);
+                assert_eq!(detail.as_deref(), Some("claude-desktop-sidecar"));
+            }
+            other => panic!("期望 Held(claude-desktop-sidecar)，实得 {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 纯变换对照三条（§A.1.1 + R-E-34 条件 2/3）
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn projection_is_invariant_to_the_materialization_root() {
+        // R-E-34 条件 2：物化根不进任何判定。两个不同的根，投影结果的所有可观察字段必须同。
+        let path = "/home/u/.claude/projects/myapp/aaaa1111-2222-3333-4444-555555555555.jsonl";
+        let a = project_sealed_source(&scratch("inv-root-a"), &claude_source(path, CLAUDE_JSONL))
+            .unwrap();
+        let b = project_sealed_source(
+            &scratch("inv-root-b-considerably-longer"),
+            &claude_source(path, CLAUDE_JSONL),
+        )
+        .unwrap();
+
+        let (a, b) = match (a, b) {
+            (SealedProjection::Projected(a), SealedProjection::Projected(b)) => (a, b),
+            other => panic!("两侧都该 Projected，实得 {other:?}"),
+        };
+        assert_eq!(a.source_path, b.source_path);
+        assert_eq!(a.external_id, b.external_id);
+        assert_eq!(a.workspace, b.workspace);
+        assert_eq!(a.agent_slug, b.agent_slug);
+        assert_eq!(a.messages.len(), b.messages.len());
+        for (x, y) in a.messages.iter().zip(b.messages.iter()) {
+            assert_eq!(
+                (&x.role, &x.content, &x.extra),
+                (&y.role, &y.content, &y.extra)
+            );
+        }
+    }
+
+    #[test]
+    fn projection_is_invariant_to_the_materialized_file_mtime() {
+        // R-E-34 条件 3：`since_ts = None` 必须真的把时钟摘出去。
+        //
+        // **这条测试的写法本身有一段账**：第一版是「物化 → 改 mtime → 调
+        // `project_sealed_source`」，它绿了，但它什么都没测 —— `project_sealed_source`
+        // 内部会重新物化、把刚设的 mtime 覆盖成「现在」。故必须走
+        // `project_from_materialized`，才能真的把手插在「物化之后、扫描之前」。
+        let path = "/home/u/.claude/projects/myapp/bbbb1111-2222-3333-4444-555555555555.jsonl";
+        let input = claude_source(path, CLAUDE_JSONL);
+        let root = scratch("mtime-invariance");
+        let materialized = materialize_sealed_blob(&root, &input).unwrap();
+
+        let mut seen = Vec::new();
+        for mtime in [1_000_000_000i64, 1_900_000_000] {
+            std::fs::File::options()
+                .write(true)
+                .open(&materialized)
+                .and_then(|f| f.set_times(filetime_like(mtime)))
+                .expect("set mtime");
+            assert_eq!(
+                std::fs::metadata(&materialized)
+                    .unwrap()
+                    .modified()
+                    .unwrap()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+                u64::try_from(mtime).unwrap(),
+                "先证明 mtime 真的被改了 —— 不然这条测试又是个失效探针"
+            );
+            match project_from_materialized(&materialized, &input).unwrap() {
+                SealedProjection::Projected(conv) => seen.push(conv),
+                other => panic!("期望 Projected，实得 {other:?}"),
+            }
+        }
+        let (a, b) = (&seen[0], &seen[1]);
+        assert_eq!(a.external_id, b.external_id);
+        assert_eq!(a.messages.len(), b.messages.len());
+        for (x, y) in a.messages.iter().zip(b.messages.iter()) {
+            assert_eq!(
+                (&x.role, &x.content, &x.created_at),
+                (&y.role, &y.content, &y.created_at),
+                "投影结果不得随物化文件的 mtime 变化"
+            );
+        }
+    }
+
+    /// **这条是 R-E-35 那条等价性论证的唯一承重测试。**
+    ///
+    /// 论证是：「物化的字节就是封存的字节，所以读物化文件的 `len()` 与读 manifest 的
+    /// `source_size_bytes` 等价」。但那个论证只在**物化文件真的是 compact 判据的读取对象**
+    /// 时才需要；本实现选的是**显式传封存值**，所以真正要证的是「传进去的那个值就是判据」。
+    ///
+    /// 手法：同一个已物化的文件（字节完全不变、只物化一次），用两个不同的
+    /// `source_size_bytes` 各投影一次 —— 唯一变量就是那个值。跨过 16 MiB 阈值的那次必须
+    /// compact，没跨过的那次必须不 compact。
+    ///
+    /// **它同时是「不跑活路径版本」的守卫**：活路径版本读的是
+    /// `fs::metadata(&conv.source_path)`，而 restore 侧 `conv.source_path` 已被改写成
+    /// manifest 的 `original_path`（那条路径在恢复现场根本不存在）→ `None` → **compact 静默
+    /// 不执行**，正是附录 §A.1.1 点名的第一个后果。改回活路径版本，本条立刻转红。
+    #[test]
+    fn compact_criterion_reads_the_sealed_size_not_the_filesystem() {
+        const THRESHOLD: u64 = 16 * 1024 * 1024;
+        // 允许出现在 compact 之后的 extra 顶层键：`cass` 加上 franken 归一化出来的那五个
+        // （`FRANKEN_NORMALIZED_EXTRA_KEYS`，compact 明令不得丢它们）。
+        const KEPT: &[&str] = &[
+            "cass",
+            "tool_call_id",
+            "tool_call_args",
+            "encrypted_content",
+            "raw_role",
+            "unpaired",
+        ];
+
+        let mut blob = Vec::with_capacity(THRESHOLD as usize + 4096);
+        blob.extend_from_slice(
+            br#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"cwd":"/tmp/codex-demo"}}
+"#,
+        );
+        let mut i = 0u64;
+        while (blob.len() as u64) < THRESHOLD {
+            blob.extend_from_slice(
+                format!(
+                    r#"{{"timestamp":"2026-01-01T00:00:0{}Z","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"filler {} {}"}}]}}}}
+"#,
+                    i % 10,
+                    i,
+                    "x".repeat(512)
+                )
+                .as_bytes(),
+            );
+            i += 1;
+        }
+        assert!(blob.len() as u64 >= THRESHOLD);
+
+        let path = "/home/u/.codex/sessions/2026/01/01/rollout-not-a-json.jsonl";
+        let root = scratch("compact-sealed-size");
+        let big = SealedSource {
+            agent: Origin::Codex,
+            canonical_original_path: path,
+            source_size_bytes: blob.len() as u64,
+            blob: &blob,
+        };
+        // 只物化一次；后面两次投影读的是同一个文件、同一批字节。
+        let materialized = materialize_sealed_blob(&root, &big).unwrap();
+
+        let extras_outside_kept = |proj: SealedProjection| -> usize {
+            match proj {
+                SealedProjection::Projected(conv) => conv
+                    .messages
+                    .iter()
+                    .filter_map(|m| m.extra.as_object())
+                    .flat_map(|o| o.keys())
+                    .filter(|k| !KEPT.contains(&k.as_str()))
+                    .count(),
+                other => panic!("期望 Projected，实得 {other:?}"),
+            }
+        };
+
+        let below = SealedSource {
+            source_size_bytes: 1024,
+            ..big
+        };
+        let kept_when_below =
+            extras_outside_kept(project_from_materialized(&materialized, &below).unwrap());
+        assert!(
+            kept_when_below > 0,
+            "先证探针有分辨力：封存值低于阈值时，extra 里必须仍留着会被 compact 丢掉的键；\
+             一个都没有说明这份语料压根不产可 compact 的 extra，本测试就分不出两种行为"
+        );
+
+        let kept_when_above =
+            extras_outside_kept(project_from_materialized(&materialized, &big).unwrap());
+        assert_eq!(
+            kept_when_above, 0,
+            "封存值跨过 16 MiB 阈值时必须 compact —— 判据是传进去的封存值，\
+             不是 `fs::metadata(conv.source_path)`（那条路径在恢复现场不存在，会静默不 compact）"
+        );
+    }
+
+    fn filetime_like(secs: i64) -> std::fs::FileTimes {
+        let ts = std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(u64::try_from(secs).unwrap());
+        std::fs::FileTimes::new().set_modified(ts).set_accessed(ts)
+    }
+
+    #[test]
+    fn desktop_sidecar_detection_matches_components_not_substrings() {
+        assert!(path_is_claude_desktop_sidecar(Path::new(
+            "/home/u/claude-code-sessions/ws/x.jsonl"
+        )));
+        assert!(path_is_claude_desktop_sidecar(Path::new(
+            "/home/u/local-agent-mode-sessions/x.jsonl"
+        )));
+        // 子串命中但分量不等 —— 必须**不**命中，否则一个正常会话会被误判成 sidecar 而 HOLD。
+        assert!(!path_is_claude_desktop_sidecar(Path::new(
+            "/home/u/claude-code-sessions-backup/ws/x.jsonl"
+        )));
+        assert!(!path_is_claude_desktop_sidecar(Path::new(
+            "/home/u/.claude/projects/ws/x.jsonl"
+        )));
+    }
+}

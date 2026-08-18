@@ -1842,6 +1842,15 @@ pub struct RawMirrorManifestView {
     pub original_path: String,
     pub original_path_blake3: String,
     pub captured_at_ms: i64,
+    /// 封存时记录的源文件字节数（`RawMirrorManifestFile.source_size_bytes`）。
+    ///
+    /// **类型是 `u64` 而不是 `Option<u64>`，这是一条防退化约束。** 附录 `W1-0` §A.1.1
+    /// 规定 restore 侧的 compact 判据改读本字段，并明写「`source_size_bytes` 是 `u64`
+    /// 非 `Option`，故 restore 侧**不存在**『取不到大小 → 不 compact』这条分支」。
+    /// doctor 侧那份报告（`DoctorRawMirrorManifestReport.source_size_bytes`）是
+    /// `Option<u64>`，**不得**拿它当本字段的来源 —— 那会把被明令消掉的分支重新引回来，
+    /// 于是一份大 codex 会话在恢复时会静默地不 compact，与索引侧行为分叉。
+    pub source_size_bytes: u64,
     pub db_links: Vec<RawMirrorDbLink>,
     /// 落盘时记录的 manifest 自摘要；`None` 表示该 manifest 是在引入该字段之前写的。
     pub manifest_blake3: Option<String>,
@@ -1937,6 +1946,7 @@ pub fn manifest_views(data_dir: &Path) -> Result<Vec<RawMirrorManifestView>> {
             original_path: manifest.original_path.clone(),
             original_path_blake3: manifest.original_path_blake3.clone(),
             captured_at_ms: manifest.captured_at_ms,
+            source_size_bytes: manifest.source_size_bytes,
             db_links: manifest.db_links.clone(),
             manifest_blake3: manifest.manifest_blake3.clone(),
         });
