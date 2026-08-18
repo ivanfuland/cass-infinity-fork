@@ -24660,6 +24660,7 @@ pub(crate) fn prepare_conversation_for_restore(
     origin: &Origin,
     workspace_rewrite_root: Option<&ScanRoot>,
     sealed_source_size_bytes: u64,
+    consumed_manifest: &crate::raw_mirror::RawMirrorCaptureRecord,
     conv: &mut NormalizedConversation,
 ) {
     inject_provenance(conv, origin);
@@ -24668,6 +24669,14 @@ pub(crate) fn prepare_conversation_for_restore(
         apply_workspace_rewrite(conv, root);
     }
     compact_large_connector_extras_for_size(connector_name, conv, Some(sealed_source_size_bytes));
+    // §A.1.1 第 3 条是**两句话**：排除 `attach_raw_mirror_capture`（它会 `capture_source_file`
+    // 产生文件系统写副作用），**并且**「`metadata.cass.raw_mirror` 由 restore 按被消费的那份
+    // manifest 直接填写，字段取值以该 manifest 为准」。只做前半句会让恢复出来的会话查不出
+    // 自己来自哪份 manifest —— 而那正是 F1 交叉核对与 W4 谱系链要顺的那根线。
+    //
+    // **复用既有的 `attach_raw_mirror_metadata`，不在消费侧重拼那八个键**：那八个键的形状
+    // 只能有一处定义，否则基线下次加一个键时两处静默分叉。
+    attach_raw_mirror_metadata(conv, consumed_manifest);
 }
 
 fn capture_connector_sources_before_parse(

@@ -1851,6 +1851,16 @@ pub struct RawMirrorManifestView {
     /// `Option<u64>`，**不得**拿它当本字段的来源 —— 那会把被明令消掉的分支重新引回来，
     /// 于是一份大 codex 会话在恢复时会静默地不 compact，与索引侧行为分叉。
     pub source_size_bytes: u64,
+    /// 封存时记录的源文件 mtime（毫秒）；`None` 表示该 manifest 落盘时就没记。
+    ///
+    /// **restore 侧填 `metadata.cass.raw_mirror` 的八个键之一必须取自这里。** 不暴露它
+    /// 就只能写 `null`，而那是一种**静默的保真度损失** —— 它伪装成「这份 manifest 本来
+    /// 就没记 mtime」，比缺键更难被发现。E4 的 `manifest_fields::SOURCE_MTIME_MS`
+    /// 同样消费该字段（winner 选择的时间倒挂交叉检查），故这个缺口是三方的。
+    ///
+    /// **注意它不进任何身份元组**：环境失败矩阵 E-4 明写 mtime 类字段靠时钟粒度生效的
+    /// 守卫等于没有守卫。它只作裁定材料与 provenance 记录。
+    pub source_mtime_ms: Option<i64>,
     pub db_links: Vec<RawMirrorDbLink>,
     /// 落盘时记录的 manifest 自摘要；`None` 表示该 manifest 是在引入该字段之前写的。
     pub manifest_blake3: Option<String>,
@@ -1947,6 +1957,7 @@ pub fn manifest_views(data_dir: &Path) -> Result<Vec<RawMirrorManifestView>> {
             original_path_blake3: manifest.original_path_blake3.clone(),
             captured_at_ms: manifest.captured_at_ms,
             source_size_bytes: manifest.source_size_bytes,
+            source_mtime_ms: manifest.source_mtime_ms,
             db_links: manifest.db_links.clone(),
             manifest_blake3: manifest.manifest_blake3.clone(),
         });

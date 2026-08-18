@@ -1874,6 +1874,36 @@ pub struct SealedSource<'a> {
     pub blob: &'a [u8],
 }
 
+// **本结构体刻意只有这三样，不吸收 manifest 的 provenance 字段**（控制面确认，R-E-37）：
+// 它表达的是**投影的定义域**。`manifest_id` / `blob_blake3` / `captured_at_ms` 这些不参与
+// 投影、只是要被记录下来的出处，混进来会让读定义域的人以为它们也影响投影结果。
+// provenance 走 [`provenance_from_manifest_view`] 产出的独立入参。**别顺手合并。**
+
+/// 把一份 manifest 的只读投影转成 `metadata.cass.raw_mirror` 的写入载荷。
+///
+/// **唯一的转换点。** 那八个键的形状由 `indexer::attach_raw_mirror_metadata` 单独定义，
+/// 本函数只负责把字段搬过去，不重拼 JSON。
+///
+/// `already_present` 填 `true` 并**不声称发生过一次 capture** —— restore 全程不调
+/// `capture_source_file`（§A.1.1 第 3 条）。它在这里的含义只是「该 blob 已在 mirror 里」，
+/// 这是封存事实；而且 `attach_raw_mirror_metadata` 写的八个键里根本不含它，故它对落盘内容
+/// 零影响。留 `true` 而不是 `false` 是为了让任何将来去读它的人不会得到「这次 restore 新建了
+/// 一份 blob」这个错觉。
+pub fn provenance_from_manifest_view(
+    view: &crate::raw_mirror::RawMirrorManifestView,
+) -> crate::raw_mirror::RawMirrorCaptureRecord {
+    crate::raw_mirror::RawMirrorCaptureRecord {
+        manifest_id: view.manifest_id.clone(),
+        manifest_relative_path: view.manifest_relative_path.clone(),
+        blob_relative_path: view.blob_relative_path.clone(),
+        blob_blake3: view.blob_blake3.clone(),
+        blob_size_bytes: view.blob_size_bytes,
+        captured_at_ms: view.captured_at_ms,
+        source_mtime_ms: view.source_mtime_ms,
+        already_present: true,
+    }
+}
+
 /// 投影过程中的硬失败。**每一层以自己的名义拒绝**，不靠下层兜住（七类矩阵 E-6）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectionFault {
@@ -2127,9 +2157,10 @@ fn scan_materialized_file(
 pub fn project_sealed_source(
     scratch_root: &Path,
     input: &SealedSource<'_>,
+    consumed_manifest: &crate::raw_mirror::RawMirrorCaptureRecord,
 ) -> Result<SealedProjection, ProjectionFault> {
     let materialized = materialize_sealed_blob(scratch_root, input)?;
-    project_from_materialized(&materialized, input)
+    project_from_materialized(&materialized, input, consumed_manifest)
 }
 
 /// [`project_sealed_source`] 的后半段：输入是**已经物化好的**那个文件。
@@ -2141,6 +2172,7 @@ pub fn project_sealed_source(
 fn project_from_materialized(
     materialized: &Path,
     input: &SealedSource<'_>,
+    consumed_manifest: &crate::raw_mirror::RawMirrorCaptureRecord,
 ) -> Result<SealedProjection, ProjectionFault> {
     use crate::phase3_bundle::{HoldReason, WholeFileDisposition, classify_whole_file};
 
@@ -2207,6 +2239,7 @@ fn project_from_materialized(
         &franken_agent_detection::types::Origin::local(),
         None,
         input.source_size_bytes,
+        consumed_manifest,
         &mut conv,
     );
 
@@ -2376,6 +2409,35 @@ mod e5_materialization_tests {
         }
     }
 
+    /// 一份**取值全部互不相同**的 manifest 只读投影，经唯一转换点变成 provenance 载荷。
+    ///
+    /// 取值刻意各不相同（不同长度、不同前缀、`source_mtime_ms` 与 `captured_at_ms` 不等）：
+    /// 逐键断言若把两个键接错，用值相同的 fixture 是看不出来的。
+    fn test_manifest_view() -> crate::raw_mirror::RawMirrorManifestView {
+        crate::raw_mirror::RawMirrorManifestView {
+            manifest_id: "mid-7f3a".to_owned(),
+            manifest_relative_path: "manifests/7f/3a/mid-7f3a.json".to_owned(),
+            blob_relative_path: "blobs/ab/cd/abcd1234.bin".to_owned(),
+            blob_blake3: "abcd1234".repeat(8),
+            blob_size_bytes: CLAUDE_JSONL.len() as u64,
+            provider: "claude_code".to_owned(),
+            source_id: "local".to_owned(),
+            origin_kind: "local".to_owned(),
+            origin_host: None,
+            original_path: "/home/u/.claude/projects/myapp/x.jsonl".to_owned(),
+            original_path_blake3: "ffff0000".repeat(8),
+            captured_at_ms: 1_766_000_000_111,
+            source_size_bytes: CLAUDE_JSONL.len() as u64,
+            source_mtime_ms: Some(1_755_000_000_222),
+            db_links: Vec::new(),
+            manifest_blake3: Some("9999aaaa".repeat(8)),
+        }
+    }
+
+    fn test_provenance() -> crate::raw_mirror::RawMirrorCaptureRecord {
+        provenance_from_manifest_view(&test_manifest_view())
+    }
+
     // -----------------------------------------------------------------------
     // R-E-34 条件 1：同一份字节、三种路径形状 → 三种处置。
     //
@@ -2392,7 +2454,7 @@ mod e5_materialization_tests {
             source_size_bytes: CLAUDE_JSONL.len() as u64,
             blob: CLAUDE_JSONL,
         };
-        match project_sealed_source(&root, &input).unwrap() {
+        match project_sealed_source(&root, &input, &test_provenance()).unwrap() {
             SealedProjection::Held { reason, .. } => assert_eq!(
                 reason,
                 crate::phase3_bundle::HoldReason::OutOfScopeFormat,
@@ -2409,7 +2471,7 @@ mod e5_materialization_tests {
             "/home/u/.claude/projects/myapp/11111111-2222-3333-4444-555555555555.jsonl",
             CLAUDE_JSONL,
         );
-        match project_sealed_source(&root, &input).unwrap() {
+        match project_sealed_source(&root, &input, &test_provenance()).unwrap() {
             SealedProjection::Projected(conv) => {
                 assert_eq!(conv.messages.len(), 2, "两条消息都要在");
             }
@@ -2426,7 +2488,7 @@ mod e5_materialization_tests {
             "/home/u/Library/Application Support/Claude/claude-code-sessions/11111111-2222-3333-4444-555555555555.jsonl",
             CLAUDE_JSONL,
         );
-        match project_sealed_source(&root, &input).unwrap() {
+        match project_sealed_source(&root, &input, &test_provenance()).unwrap() {
             SealedProjection::Held { reason, detail } => {
                 assert_eq!(reason, crate::phase3_bundle::HoldReason::OutOfScopeFormat);
                 assert_eq!(detail.as_deref(), Some("claude-desktop-sidecar"));
@@ -2443,11 +2505,16 @@ mod e5_materialization_tests {
     fn projection_is_invariant_to_the_materialization_root() {
         // R-E-34 条件 2：物化根不进任何判定。两个不同的根，投影结果的所有可观察字段必须同。
         let path = "/home/u/.claude/projects/myapp/aaaa1111-2222-3333-4444-555555555555.jsonl";
-        let a = project_sealed_source(&scratch("inv-root-a"), &claude_source(path, CLAUDE_JSONL))
-            .unwrap();
+        let a = project_sealed_source(
+            &scratch("inv-root-a"),
+            &claude_source(path, CLAUDE_JSONL),
+            &test_provenance(),
+        )
+        .unwrap();
         let b = project_sealed_source(
             &scratch("inv-root-b-considerably-longer"),
             &claude_source(path, CLAUDE_JSONL),
+            &test_provenance(),
         )
         .unwrap();
 
@@ -2499,7 +2566,7 @@ mod e5_materialization_tests {
                 u64::try_from(mtime).unwrap(),
                 "先证明 mtime 真的被改了 —— 不然这条测试又是个失效探针"
             );
-            match project_from_materialized(&materialized, &input).unwrap() {
+            match project_from_materialized(&materialized, &input, &test_provenance()).unwrap() {
                 SealedProjection::Projected(conv) => seen.push(conv),
                 other => panic!("期望 Projected，实得 {other:?}"),
             }
@@ -2593,16 +2660,18 @@ mod e5_materialization_tests {
             source_size_bytes: 1024,
             ..big
         };
-        let kept_when_below =
-            extras_outside_kept(project_from_materialized(&materialized, &below).unwrap());
+        let kept_when_below = extras_outside_kept(
+            project_from_materialized(&materialized, &below, &test_provenance()).unwrap(),
+        );
         assert!(
             kept_when_below > 0,
             "先证探针有分辨力：封存值低于阈值时，extra 里必须仍留着会被 compact 丢掉的键；\
              一个都没有说明这份语料压根不产可 compact 的 extra，本测试就分不出两种行为"
         );
 
-        let kept_when_above =
-            extras_outside_kept(project_from_materialized(&materialized, &big).unwrap());
+        let kept_when_above = extras_outside_kept(
+            project_from_materialized(&materialized, &big, &test_provenance()).unwrap(),
+        );
         assert_eq!(
             kept_when_above, 0,
             "封存值跨过 16 MiB 阈值时必须 compact —— 判据是传进去的封存值，\
@@ -2614,6 +2683,76 @@ mod e5_materialization_tests {
         let ts = std::time::SystemTime::UNIX_EPOCH
             + std::time::Duration::from_secs(u64::try_from(secs).unwrap());
         std::fs::FileTimes::new().set_modified(ts).set_accessed(ts)
+    }
+
+    /// **红相在先（plan Step 1 / 附录 §B.11 的 P15 末条）**：`metadata.cass.raw_mirror` 必须
+    /// 指向**本次被消费的那份 manifest**。
+    ///
+    /// §A.1.1 第 3 条把 `attach_raw_mirror_capture` 整步排除（它会 `capture_source_file` 产生
+    /// 文件系统写副作用），同时明写「`metadata.cass.raw_mirror` 由 restore 按被消费的那份
+    /// manifest 直接填写，字段取值以该 manifest 为准」。**当前实现只做了前半句**——排除了
+    /// capture，却没有填那个字段，于是恢复出来的会话查不出它来自哪份 manifest。
+    ///
+    /// 这条测试现在应当是红的；转绿要靠把 provenance 接进投影（见 E5 台账 Phase 1 待批项）。
+    #[test]
+    fn projected_conversation_records_the_consumed_manifest_provenance() {
+        let root = scratch("provenance");
+        let input = claude_source(
+            "/home/u/.claude/projects/myapp/cccc1111-2222-3333-4444-555555555555.jsonl",
+            CLAUDE_JSONL,
+        );
+        let conv = match project_sealed_source(&root, &input, &test_provenance()).unwrap() {
+            SealedProjection::Projected(conv) => conv,
+            other => panic!("期望 Projected，实得 {other:?}"),
+        };
+
+        let rm = conv
+            .metadata
+            .get("cass")
+            .and_then(|c| c.get("raw_mirror"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "metadata.cass.raw_mirror 必须在场（§A.1.1 第 3 条）；实得 metadata = {}",
+                    conv.metadata
+                )
+            });
+
+        // R-E-37 条件 2：把「指向本次被消费的那份」从语义要求变成**逐键断言**。
+        // 八个键与 `attach_raw_mirror_metadata` 写出的形状逐一对齐 —— 不另造第二套形状。
+        let view = test_manifest_view();
+        assert_eq!(rm.get("schema_version").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(
+            rm.get("manifest_id").and_then(|v| v.as_str()),
+            Some(view.manifest_id.as_str())
+        );
+        assert_eq!(
+            rm.get("manifest_relative_path").and_then(|v| v.as_str()),
+            Some(view.manifest_relative_path.as_str())
+        );
+        assert_eq!(
+            rm.get("blob_relative_path").and_then(|v| v.as_str()),
+            Some(view.blob_relative_path.as_str())
+        );
+        assert_eq!(
+            rm.get("blob_blake3").and_then(|v| v.as_str()),
+            Some(view.blob_blake3.as_str())
+        );
+        assert_eq!(
+            rm.get("blob_size_bytes").and_then(|v| v.as_u64()),
+            Some(view.blob_size_bytes)
+        );
+        assert_eq!(
+            rm.get("captured_at_ms").and_then(|v| v.as_i64()),
+            Some(view.captured_at_ms)
+        );
+        assert_eq!(
+            rm.get("source_mtime_ms").and_then(|v| v.as_i64()),
+            view.source_mtime_ms,
+            "`source_mtime_ms` 必须取自 manifest 的封存值 —— 写 null 会伪装成\
+             「这份 manifest 本来就没记」，比缺键更难发现（R-E-37(a) 的立条理由）"
+        );
+        // 封存长度与 provenance 记的 blob 长度是同一个事实的两处表达，必须一致。
+        assert_eq!(view.blob_size_bytes, input.source_size_bytes);
     }
 
     #[test]
