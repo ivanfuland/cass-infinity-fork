@@ -3645,6 +3645,194 @@ mod e5_materialization_tests {
         );
     }
 
+    // ---- §B.4 OpenClaw 家族的契约批 ----------------------------------------
+    //
+    // 附录点名了「与 Claude 的三处对照差异」，那三处正是逐字段验收时最容易写错的地方：
+    // ① Claude 的 ToolCall/ToolResult/Thinking 各有一道 `role != …` guard，**OpenClaw 三者
+    //    都没有**；② Claude 的 tool_call author 沿用 envelope 算出的 author（只在 assistant
+    //    时非空），**OpenClaw 直接用 `message.model`**，user envelope 里的 toolCall 也带
+    //    author；③ `type=session` 的 timestamp 是**赋值**而非取 min。
+    //
+    // 另外 OpenClaw 是三家里历史最脏的一个：上位 §16 那条 thinking 缺陷就出在它身上
+    // （只认 `text`，而真实语料 3713 个 thinking 块里带 `text` 的是 0 个），已在 pin
+    // `068f423b` 修掉。故本批把「thinking 真的产出 reasoning」当成必须成立的判据。
+
+    /// **会话文件必须直接躺在一个名叫 `sessions` 的目录下**，且整条路径含 `openclaw`：
+    /// `session_root_from_candidate` 要求候选目录的 `file_name()` 恰为 `sessions`（或其下有
+    /// `sessions/` 子目录），`looks_like_openclaw_storage` 再要求路径同时含 `openclaw` 与
+    /// `sessions`。把文件放进 `sessions/<日期>/` 这种多一层的形状会让 root 集为空、
+    /// **扫出 0 个会话**（本批第一版就是这么红的）。这是「路径形状进投影定义域」（R-E-34）
+    /// 的第五处机械依据。
+    const OPENCLAW_PATH: &str = "/home/u/.openclaw/agents/main/sessions/sess-1.jsonl";
+
+    const OPENCLAW_ALL_BRANCHES: &str = concat!(
+        r#"{"type":"session","timestamp":"2026-01-01T00:00:00Z","cwd":"/w/oc"}"#,
+        "\n",
+        r#"{"type":"message","timestamp":"2026-01-01T00:00:01Z","message":{"role":"assistant","model":"oc-model-1","content":[{"type":"text","text":"working"},{"type":"thinking","thinking":"deliberating"},{"type":"toolCall","name":"bash","id":"tc_1","arguments":{"cmd":"ls"}}]}}"#,
+        "\n",
+        // user envelope 里同样放 toolCall 与 thinking —— Claude 侧这两块会被 role guard 跳过，
+        // OpenClaw 侧必须产出。这一行就是对照差异 ① 与 ② 的载体。
+        r#"{"type":"message","timestamp":"2026-01-01T00:00:02Z","message":{"role":"user","model":"oc-model-1","content":[{"type":"toolCall","name":"grep","id":"tc_2","arguments":{"q":"x"}},{"type":"thinking","thinking":"user side"}]}}"#,
+        "\n",
+        r#"{"type":"message","timestamp":"2026-01-01T00:00:03Z","message":{"role":"toolResult","id":"tc_1","content":[{"type":"toolResult","id":"tc_1","text":"a.txt"}]}}"#,
+        "\n",
+        // role 缺失：上位 §5.4「缺 role 不再默认成 assistant」，整条 continue。
+        r#"{"type":"message","timestamp":"2026-01-01T00:00:04Z","message":{"model":"oc-model-1","content":[{"type":"text","text":"roleless line"}]}}"#,
+        "\n",
+        // 白名单丢弃项之一。
+        r#"{"type":"model_change","timestamp":"2026-01-01T00:00:05Z","model":"oc-model-2"}"#,
+        "\n",
+        r#"{"type":"compaction","timestamp":"2026-01-01T00:00:06Z","summary":"rolled up"}"#,
+        "\n",
+    );
+
+    fn project_openclaw(tag: &str, bytes: &[u8]) -> Box<NormalizedConversation> {
+        let root = scratch(tag);
+        let input = SealedSource {
+            agent: Origin::Openclaw,
+            canonical_original_path: OPENCLAW_PATH,
+            source_size_bytes: bytes.len() as u64,
+            blob: bytes,
+        };
+        match project_sealed_source(&root, &input, &test_provenance()).unwrap() {
+            SealedProjection::Projected(conv) => conv,
+            other => panic!("期望 Projected，实得 {other:?}"),
+        }
+    }
+
+    /// 对照差异 ①：OpenClaw 的 ToolCall / Thinking **没有 role guard** ——
+    /// user envelope 里的这两块同样产消息。照 Claude 的写法加 guard 会静默丢掉它们。
+    #[test]
+    fn contract_openclaw_tool_call_and_thinking_have_no_role_guard() {
+        let conv = project_openclaw("b11-oc-noguard", OPENCLAW_ALL_BRANCHES.as_bytes());
+        let has = |content: &str| conv.messages.iter().any(|m| m.content.contains(content));
+
+        // 分辨力前置：assistant envelope 侧的块确实产出了，说明解析本身没坏。
+        assert!(has("working"), "样本没产出任何消息，后面的断言分不出成因");
+
+        let user_tool_call = conv
+            .messages
+            .iter()
+            .find(|m| m.role == "tool_call" && m.content.contains("grep"));
+        assert!(
+            user_tool_call.is_some(),
+            "对照差异 ①：user envelope 里的 toolCall 必须产消息（OpenClaw 无 role guard）"
+        );
+        assert!(
+            has("user side"),
+            "对照差异 ①：user envelope 里的 thinking 必须产消息（OpenClaw 无 role guard）"
+        );
+    }
+
+    /// 对照差异 ②：tool_call 的 author 直接取 `message.model`，**不看 envelope 是 user
+    /// 还是 assistant**。Claude 侧 user envelope 的 tool_call author 会是空。
+    #[test]
+    fn contract_openclaw_tool_call_author_comes_from_message_model_even_in_user_envelope() {
+        let conv = project_openclaw("b11-oc-author", OPENCLAW_ALL_BRANCHES.as_bytes());
+        let user_call = conv
+            .messages
+            .iter()
+            .find(|m| m.role == "tool_call" && m.content.contains("grep"))
+            .expect("user envelope 里的 toolCall");
+        assert_eq!(
+            user_call.author.as_deref(),
+            Some("oc-model-1"),
+            "对照差异 ②：OpenClaw 的 tool_call author 取 `message.model`，与 envelope role 无关"
+        );
+    }
+
+    /// 上位 §16 那条历史缺陷的守卫：**thinking 必须真的产出 `reasoning`**。
+    ///
+    /// 该缺陷（只认 `text`、而真实语料里带 `text` 的 thinking 块是 0 个）已在 pin
+    /// `068f423b` 修掉；本条钉住它不再回归。**若它红了，先看分辨力前置**——同一样本里
+    /// 别的分支若也没产出，那是样本问题；别的分支产出了而只有 reasoning 没有，那是回归。
+    #[test]
+    fn contract_openclaw_thinking_block_yields_reasoning() {
+        let conv = project_openclaw("b11-oc-thinking", OPENCLAW_ALL_BRANCHES.as_bytes());
+        let roles: Vec<&str> = conv.messages.iter().map(|m| m.role.as_str()).collect();
+        assert!(
+            roles.contains(&"assistant") || roles.contains(&"tool_call"),
+            "分辨力前置：样本别的分支也没产出，说明是样本问题不是 reasoning 回归：{roles:?}"
+        );
+        // **断言到具体内容，不止「存在某个 reasoning」。** 样本里有两个 thinking 块
+        // （assistant 与 user envelope 各一），只断言 role 存在时，改坏其中一个另一个仍能
+        // 让断言通过 —— 扰动对照 FX9 实测正是这样溜过去的，故收紧到逐块。
+        let reasoning_bodies: Vec<&str> = conv
+            .messages
+            .iter()
+            .filter(|m| m.role == "reasoning")
+            .map(|m| m.content.as_str())
+            .collect();
+        for expected in ["deliberating", "user side"] {
+            assert!(
+                reasoning_bodies.iter().any(|b| b.contains(expected)),
+                "OpenClaw 的 thinking 块必须逐块产出 reasoning（上位 §16 的历史缺陷已在 pin \
+                 修掉）：缺 `{expected}`，实得 {reasoning_bodies:?}"
+            );
+        }
+        let _ = &roles;
+    }
+
+    /// 上位 §5.4：`message.role` **缺失或不在白名单**时整条 `continue` ——
+    /// 不再默认成 assistant。默认化会把一整类来源不明的内容混进 assistant 语料。
+    #[test]
+    fn contract_openclaw_missing_role_drops_the_whole_line() {
+        let conv = project_openclaw("b11-oc-norole", OPENCLAW_ALL_BRANCHES.as_bytes());
+        assert!(
+            !conv
+                .messages
+                .iter()
+                .any(|m| m.content.contains("roleless line")),
+            "上位 §5.4：缺 role 的行整条 drop，不得默认成 assistant"
+        );
+        // 白名单丢弃项同样不该留下痕迹。
+        assert!(
+            !conv
+                .messages
+                .iter()
+                .any(|m| m.content.contains("oc-model-2")),
+            "`model_change` 属白名单丢弃项"
+        );
+    }
+
+    /// `type=compaction` 且 `summary` 非空白 → `assistant` 消息、`raw_role = "compaction"`。
+    /// 这是三家里唯一一个 canonical role 与 raw_role 完全不同源的分支。
+    #[test]
+    fn contract_openclaw_compaction_becomes_assistant_with_its_own_raw_role() {
+        let conv = project_openclaw("b11-oc-compaction", OPENCLAW_ALL_BRANCHES.as_bytes());
+        let compaction = conv
+            .messages
+            .iter()
+            .find(|m| m.content.contains("rolled up"))
+            .expect("compaction 行应产出一条消息");
+        assert_eq!(compaction.role, "assistant");
+        assert_eq!(
+            compaction.extra.get("raw_role").and_then(|v| v.as_str()),
+            Some("compaction")
+        );
+    }
+
+    /// §B.4 末条 + P12/P3 在 OpenClaw 侧的复核：workspace 来自 `type=session` 的 `cwd`；
+    /// 每条 retained 消息仍有 string 型 `raw_role`。
+    #[test]
+    fn contract_openclaw_session_cwd_and_raw_role_hold_across_the_family() {
+        let conv = project_openclaw("b11-oc-session", OPENCLAW_ALL_BRANCHES.as_bytes());
+        assert_eq!(
+            conv.workspace.as_deref(),
+            Some(std::path::Path::new("/w/oc")),
+            "§B.4：`type=session` 的 `cwd` 成为 workspace"
+        );
+        for m in &conv.messages {
+            let rr = m.extra.get("raw_role");
+            assert!(
+                rr.and_then(|v| v.as_str()).is_some(),
+                "P3 在 OpenClaw 侧同样无例外：idx={} 缺 string 型 raw_role，extra={}",
+                m.idx,
+                m.extra
+            );
+        }
+    }
+
     #[test]
     fn desktop_sidecar_detection_matches_components_not_substrings() {
         assert!(path_is_claude_desktop_sidecar(Path::new(
