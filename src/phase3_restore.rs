@@ -4541,4 +4541,138 @@ mod e5_p30_blob_read_tests {
              热表、legacy 三列留着陈旧值，这里读到的就是那个陈旧值，重放随之按错游标规划"
         );
     }
+
+    /// 陈旧 / legacy 形态的 tail 之下，重放的去重仍然成立。
+    ///
+    /// **记账为契约验证，不是 TDD 红转绿**（与 §B.11 那三批同一口径）：它锁的是**基线**
+    /// 的两道结构性保证，不是本棒实现的行为 ——
+    ///
+    /// 1. `messages` 有 `UNIQUE(conversation_id, idx)`，而 append 路径走
+    ///    `franken_insert_new_message_ignore_duplicate` —— 重复行**结构上插不进去**；
+    /// 2. 两个 no-op 捷径（`collect_existing_conversation_noop_from_idx_tail` 与
+    ///    `..._from_conversation_ended_at`）对**非空**会话一律返回 `None`，源码注释写明
+    ///    「一个 max idx / 一个会话级 ended_at 都不能证明更早的行还在」，于是必然落到
+    ///    逐条比对既有消息行的 bounded lookup。
+    ///
+    /// 两条合起来：陈旧 tail 能让规划器**挑错捷径**，但既不会重复插入（① 挡住），
+    /// 也不会静默漏插（② 兜住）。本用例把这个结论钉成回归门 —— 将来基线若把 ② 那条
+    /// 兜底去掉，或把 ① 的 UNIQUE / ignore-duplicate 改掉，这条会红。
+    ///
+    /// **模拟手法**：手工把 tail 行的 `last_message_created_at` 与 `ended_at` 置 NULL、
+    /// `last_message_idx` 留在**陈旧的高位**，模拟一条只记了 idx 的 legacy tail 行。
+    /// 真实来源假设：生产库跨多个 schema 版本迁移攒成，早期版本的 tail 列不齐全；
+    /// 这不是本棒代码会写出来的形态，所以只能手工造。
+    #[test]
+    #[serial]
+    fn e5_p33_replay_still_dedupes_under_a_stale_legacy_tail_row() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let scratch = tmp.path().join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let live = write_session(&tmp.path().join("live"), "rollout-legacy.jsonl", "legacy");
+
+        crate::indexer::run_index(index_opts(&data_dir, &live, false), None).unwrap();
+        let db_path = data_dir.join("db.sqlite");
+
+        let (conv_id, agent_id) = {
+            let storage = crate::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
+            storage
+                .raw()
+                .query_row_map("SELECT id, agent_id FROM conversations", &[], |row| {
+                    Ok((row.get_typed(0)?, row.get_typed(1)?))
+                })
+                .unwrap()
+        };
+
+        let replacement = projected_from_live(&scratch, &live, 3);
+        assert_eq!(replacement.messages.len(), 2, "前置断言：替换内容是真前缀");
+
+        {
+            let storage = crate::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
+            let pricing =
+                crate::storage::sqlite::PricingTable::franken_load(storage.raw()).unwrap();
+            let mut tx = storage.raw().transaction().unwrap();
+            crate::storage::sqlite::franken_replace_conversation_messages_in_tx(
+                &tx,
+                conv_id,
+                agent_id,
+                None,
+                &replacement,
+                &pricing,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+
+            // 造 legacy 形态：热表清掉（逼回落），legacy 三列只留一个**陈旧高位** idx。
+            let conn = storage.raw();
+            conn.execute_compat(
+                "DELETE FROM conversation_tail_state WHERE conversation_id = ?1",
+                &[ParamValue::from(conv_id)],
+            )
+            .unwrap();
+            conn.execute_compat(
+                "UPDATE conversations
+                 SET last_message_idx = 99, last_message_created_at = NULL, ended_at = NULL
+                 WHERE id = ?1",
+                &[ParamValue::from(conv_id)],
+            )
+            .unwrap();
+
+            // 分辨力前置断言：形态确实造出来了 —— 热表无行（必然回落）、legacy 三列
+            // 只剩一个陈旧高位 idx。读取器本身是 `sqlite.rs` 的私有函数，这里不为了
+            // 测试方便去给它开一个 pub 口子（消费者的便利不构成动既有代码的理由）；
+            // 「热表无行时会回落读这三列」这条基线行为已由上面那条回落用例立住。
+            let hot_rows: i64 = conn
+                .query_row_map(
+                    "SELECT COUNT(*) FROM conversation_tail_state WHERE conversation_id = ?1",
+                    &[ParamValue::from(conv_id)],
+                    |row| row.get_typed(0),
+                )
+                .unwrap();
+            assert_eq!(hot_rows, 0, "分辨力前置断言：热表必须为空，否则走不到回落");
+            let legacy: (Option<i64>, Option<i64>, Option<i64>) = conn
+                .query_row_map(
+                    "SELECT last_message_idx, last_message_created_at, ended_at
+                     FROM conversations WHERE id = ?1",
+                    &[ParamValue::from(conv_id)],
+                    |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                legacy,
+                (Some(99), None, None),
+                "分辨力前置断言：legacy 行必须是「只记了一个陈旧 idx」的形态"
+            );
+        }
+
+        {
+            let f = std::fs::File::options().write(true).open(&live).unwrap();
+            let ahead = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+            f.set_times(std::fs::FileTimes::new().set_modified(ahead))
+                .unwrap();
+        }
+        crate::indexer::run_index(index_opts(&data_dir, &live, false), None).unwrap();
+
+        let storage = crate::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
+        let (convs, msgs) = counts(&storage);
+        assert_eq!(
+            convs, 1,
+            "陈旧 legacy tail 之下同样不得产生重复 conversation"
+        );
+        assert_eq!(
+            msgs, 3,
+            "陈旧 legacy tail 之下同样应当**恰好**补回一条：重复插不进去（UNIQUE + \
+             ignore-duplicate），漏插被 bounded lookup 兜住"
+        );
+        let idxs: Vec<i64> = storage
+            .raw()
+            .query_map_collect(
+                "SELECT idx FROM messages WHERE conversation_id = ?1 ORDER BY idx",
+                &[ParamValue::from(conv_id)],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(idxs, vec![0, 1, 2], "idx 必须是 0..2 各恰一条，不重不漏");
+    }
 }
