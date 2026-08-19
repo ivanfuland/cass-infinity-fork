@@ -5044,6 +5044,96 @@ pub(crate) fn commit_replace_in_tx(
     })
 }
 
+/// 新建分支的 `operation` 取值。与 replace 分支分开，两者的幂等 key 不得互相碰撞。
+#[allow(dead_code)]
+pub(crate) const RESTORE_NEW_OPERATION: &str = "mirror-restore-new";
+
+/// 新建分支的幂等 key，构成与 replace 支同型（三个分量全部来自入参）。
+#[allow(dead_code)]
+pub(crate) fn restore_new_idempotency_key(
+    snapshot_root: &str,
+    identity: &RestoreIdentity,
+) -> String {
+    format!("{RESTORE_NEW_OPERATION}:{snapshot_root}:{identity}")
+}
+
+/// `commit_restore_new` 的入参。**没有 `conversation_id`** —— 这一支的会话还不存在，
+/// 「保留原 ID」在这里无定义（裁定 R-E-44）。
+#[allow(dead_code)]
+pub(crate) struct RestoreNewCommitInput<'a> {
+    pub agent_id: i64,
+    pub workspace_id: Option<i64>,
+    pub conv: &'a crate::model::types::Conversation,
+    pub identity: &'a RestoreIdentity,
+    pub snapshot_root: &'a str,
+    pub generation: &'a str,
+}
+
+/// `commit_restore_new` 的产出。
+#[allow(dead_code)]
+pub(crate) struct RestoreNewCommitOutcome {
+    pub idempotency_key: String,
+    /// `true` = 本次真的写了；`false` = 查到 receipt，判「已提交」直接短路。
+    pub applied: bool,
+}
+
+/// 新建分支：candidate 缺失 → 建一条会话。
+///
+/// **原子边界是「一条会话」，不是「整批」**（裁定 R-E-47 选 (a)）。理由是这一支按
+/// R-E-44 走基线 `insert_conversations_batched`，而**那个入口自己开事务**，塞不进
+/// 外层事务；给新建另写一个收外部 tx 的存储函数会引入第二份派生行构造，代价更大。
+///
+/// **崩溃窗与它为什么安全**：插入已提交、receipt 未写之间存在一个窗。安全性不来自
+/// 「窗很窄」，而来自**重做幂等**：恢复时按幂等 key 查不到 receipt → 判未提交 →
+/// 重走一遍插入 → 既有行被 tail 规划器与 `UNIQUE(conversation_id, idx)` +
+/// ignore-duplicate 收敛，不重不漏。新建这一支**没有「删旧」那一半**，所以不存在
+/// replace 那种「旧的已删、新的没进」的半截状态。
+///
+/// 与 replace 支的另一处不同：**receipt 与插入不在同一个事务里**（做不到，见上），
+/// 所以这里先查 receipt 再动手 —— 幂等靠**先查后做**，不靠「重复写入被吞掉」。
+#[allow(dead_code)]
+pub(crate) fn commit_restore_new(
+    storage: &crate::storage::sqlite::FrankenStorage,
+    input: &RestoreNewCommitInput<'_>,
+    committed_at_ms: i64,
+) -> anyhow::Result<RestoreNewCommitOutcome> {
+    let idempotency_key = restore_new_idempotency_key(input.snapshot_root, input.identity);
+
+    if crate::storage::sqlite::franken_operation_commit_receipt_exists(
+        storage.raw(),
+        &idempotency_key,
+    )? {
+        return Ok(RestoreNewCommitOutcome {
+            idempotency_key,
+            applied: false,
+        });
+    }
+
+    // 第一个原子步：基线入口自带事务。重跑时既有行被去重路径收敛。
+    storage.insert_conversations_batched(&[(input.agent_id, input.workspace_id, input.conv)])?;
+
+    // 第二个原子步：generation 与 receipt 一起提交 —— 它们之间不能再有窗，
+    // 否则会出现「代际已推进、却查不到 receipt」这种更难判读的状态。
+    use frankensqlite::compat::TransactionExt as _;
+    let mut tx = storage.raw().transaction()?;
+    crate::storage::sqlite::franken_set_source_content_generation_in_tx(&tx, input.generation)?;
+    crate::storage::sqlite::franken_insert_operation_commit_receipt_in_tx(
+        &tx,
+        &idempotency_key,
+        RESTORE_NEW_OPERATION,
+        "committed",
+        Some(input.snapshot_root),
+        committed_at_ms,
+        None,
+    )?;
+    tx.commit()?;
+
+    Ok(RestoreNewCommitOutcome {
+        idempotency_key,
+        applied: true,
+    })
+}
+
 // ===========================================================================
 // E6 · replace 编排（plan Task E6 Step 1 的 Replace 支）
 //
@@ -5384,5 +5474,177 @@ mod e6_replace_commit_tests {
             .unwrap()
             .flatten();
         assert_eq!(generation, None, "generation 必须一起回滚");
+    }
+
+    // -------------------------------------------------------------------
+    // Restore（新建）支 —— 裁定 R-E-47 走 (a)：每会话独立事务
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn e6_restore_new_creates_the_conversation_and_records_generation_and_receipt() {
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open(&dir);
+        let conv = conversation_titled(
+            "新建标题",
+            vec![
+                message(0, MessageRole::User, "新建 0"),
+                message(1, MessageRole::Assistant, "新建 1"),
+            ],
+        );
+        let id = identity();
+
+        let before: Option<i64> = storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(
+            before,
+            Some(0),
+            "前置断言：库里必须是空的，这一支是「新建」"
+        );
+
+        let outcome = commit_restore_new(
+            &storage,
+            &RestoreNewCommitInput {
+                agent_id,
+                workspace_id: None,
+                conv: &conv,
+                identity: &id,
+                snapshot_root: "snap-root-new",
+                generation: "gen-e6-new-1",
+            },
+            TS + 60_000,
+        )
+        .unwrap();
+        assert!(outcome.applied, "第一次必须真的写");
+
+        let (convs, msgs): (i64, i64) = storage
+            .raw()
+            .query_row_map(
+                "SELECT (SELECT COUNT(*) FROM conversations), (SELECT COUNT(*) FROM messages)",
+                &[],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )
+            .unwrap();
+        assert_eq!((convs, msgs), (1, 2));
+
+        let (key, operation): (String, String) = storage
+            .raw()
+            .query_row_map(
+                "SELECT idempotency_key, operation FROM operation_commit_receipt",
+                &[],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )
+            .unwrap();
+        assert_eq!(key, outcome.idempotency_key);
+        assert_eq!(
+            operation, "mirror-restore-new",
+            "新建支的 operation 必须与 replace 支分开 —— 两支的幂等 key 不得碰撞"
+        );
+    }
+
+    /// 崩溃窗的**状态级**证据（裁定 R-E-47 的条件）。
+    ///
+    /// **它证到什么、没证到什么，写清楚**：本用例构造的是崩溃**留下的状态**
+    /// （插入已提交、receipt 未写），证的是**重做幂等** —— 重跑之后不重不漏、
+    /// receipt 恰一条。它**没有**证「恢复器判窗正确」：那需要真 `SIGKILL` + 全新进程
+    /// 只读 journal 与 receipt 做判断，而恢复器本身是 **plan Task E7** 的交付，
+    /// E6 阶段还没有它可跑。**「Restore 支的 SIGKILL 注入」已作为具名用例登记进
+    /// E7 的电池清单**，不要因为本用例是绿的就以为那一半也证完了。
+    #[test]
+    fn e6_restore_new_redo_after_a_lost_receipt_is_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open(&dir);
+        let conv = conversation_titled(
+            "新建标题",
+            vec![
+                message(0, MessageRole::User, "新建 0"),
+                message(1, MessageRole::Assistant, "新建 1"),
+            ],
+        );
+        let id = identity();
+        let input = || RestoreNewCommitInput {
+            agent_id,
+            workspace_id: None,
+            conv: &conv,
+            identity: &id,
+            snapshot_root: "snap-root-new",
+            generation: "gen-e6-new-1",
+        };
+
+        commit_restore_new(&storage, &input(), TS + 60_000).unwrap();
+
+        // 造崩溃窗留下的状态：插入已提交，receipt 没写成。
+        storage
+            .raw()
+            .execute_compat("DELETE FROM operation_commit_receipt", &[])
+            .unwrap();
+        let receipts: Option<i64> = storage
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM operation_commit_receipt",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            receipts,
+            Some(0),
+            "分辨力前置断言：必须真的处在「插入已提交、receipt 未写」这个状态"
+        );
+
+        // 恢复：查不到 receipt → 判未提交 → 重做。
+        let redo = commit_restore_new(&storage, &input(), TS + 120_000).unwrap();
+        assert!(redo.applied, "查不到 receipt 就必须重做，不能当已完成跳过");
+
+        let (convs, msgs, receipts): (i64, i64, i64) = storage
+            .raw()
+            .query_row_map(
+                "SELECT (SELECT COUNT(*) FROM conversations),
+                        (SELECT COUNT(*) FROM messages),
+                        (SELECT COUNT(*) FROM operation_commit_receipt)",
+                &[],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+            )
+            .unwrap();
+        assert_eq!(convs, 1, "重做不得建出第二条会话");
+        assert_eq!(msgs, 2, "重做不得重复插入消息，也不得漏掉");
+        assert_eq!(receipts, 1, "重做之后 receipt 恰一条");
+    }
+
+    #[test]
+    fn e6_restore_new_short_circuits_when_the_receipt_is_already_there() {
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open(&dir);
+        let conv = conversation_titled("新建标题", vec![message(0, MessageRole::User, "新建 0")]);
+        let id = identity();
+        let input = || RestoreNewCommitInput {
+            agent_id,
+            workspace_id: None,
+            conv: &conv,
+            identity: &id,
+            snapshot_root: "snap-root-new",
+            generation: "gen-e6-new-1",
+        };
+
+        let first = commit_restore_new(&storage, &input(), TS + 60_000).unwrap();
+        assert!(first.applied);
+        let second = commit_restore_new(&storage, &input(), TS + 120_000).unwrap();
+        assert!(
+            !second.applied,
+            "receipt 在就必须短路 —— 幂等靠**先查后做**，不靠重复写入被吞掉"
+        );
+
+        let receipts: Option<i64> = storage
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM operation_commit_receipt",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(receipts, Some(1));
     }
 }
