@@ -3812,6 +3812,75 @@ mod e5_materialization_tests {
 
     /// 对照差异 ①：OpenClaw 的 ToolCall / Thinking **没有 role guard** ——
     /// user envelope 里的这两块同样产消息。照 Claude 的写法加 guard 会静默丢掉它们。
+
+    // =======================================================================
+    // §B.11 P9 · reasoning 的**三种空值语义**（§B.7）各造一个样本
+    //
+    // §B.7 明写这三种语义各不相同，「这是 §10.2 逐字段验收里必须各造一个样本的三个点」：
+    //   1. Claude `thinking` 块           → **保留**（无 trim 判空）
+    //   2. Codex `response_item/reasoning` → summary 空且**无** `encrypted_content` → 跳过；
+    //                                        **encrypted-only → 保留空结构消息**
+    //   3. Codex `event_msg/agent_reasoning` → **trim 后**为空 → 跳过
+    //
+    // 第 1 种已由 `contract_empty_thinking_is_kept_while_empty_prose_is_dropped` 覆盖；
+    // 本组补齐 codex 侧的两支三态。仍是契约验证，不是红转绿。
+    // =======================================================================
+
+    /// 三条 reasoning，逐条对应 §B.7 的一种空值形态；末尾放一条普通 user 消息，
+    /// 让「整份样本产了几条消息」这件事有个稳定的锚。
+    const CODEX_REASONING_EMPTY_FORMS: &str = concat!(
+        r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"cwd":"/w/repo"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-01-01T00:00:01Z","type":"turn_context","payload":{"model":"gpt-5.5"}}"#,
+        "\n",
+        // (a) response_item/reasoning：summary 空、**无** encrypted_content → 跳过
+        r#"{"timestamp":"2026-01-01T00:00:02Z","type":"response_item","payload":{"type":"reasoning","summary":[]}}"#,
+        "\n",
+        // (b) response_item/reasoning：summary 空、**有** encrypted_content → 保留空结构消息
+        r#"{"timestamp":"2026-01-01T00:00:03Z","type":"response_item","payload":{"type":"reasoning","summary":[],"encrypted_content":"BASE64BLOB"}}"#,
+        "\n",
+        // (c) event_msg/agent_reasoning：text 只有空白 → trim 后为空 → 跳过
+        r#"{"timestamp":"2026-01-01T00:00:04Z","type":"event_msg","payload":{"type":"agent_reasoning","text":"   "}}"#,
+        "\n",
+        r#"{"timestamp":"2026-01-01T00:00:05Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"锚"}]}}"#,
+        "\n",
+    );
+
+    #[test]
+    fn contract_p9_codex_reasoning_three_empty_forms_behave_differently() {
+        let conv = project_codex("b11-p9", CODEX_REASONING_EMPTY_FORMS.as_bytes());
+        let reasoning: Vec<&_> = conv
+            .messages
+            .iter()
+            .filter(|m| m.role == "reasoning")
+            .collect();
+
+        // 三条 reasoning 形态里只有 (b) 该活下来 —— 若三种语义被实现成同一种，
+        // 这里要么是 0 条（全跳过）要么是 3 条（全保留），两种都会红。
+        assert_eq!(
+            reasoning.len(),
+            1,
+            "§B.7 的三种空值语义必须**各不相同**：只有 encrypted-only 那条保留。\
+             实得 {} 条：{:?}",
+            reasoning.len(),
+            reasoning.iter().map(|m| &m.content).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            reasoning[0].content, "",
+            "encrypted-only 保留的是一条**空结构消息**：内容为空但消息在，\
+             它承载的是「这一轮有加密推理」这个事实"
+        );
+
+        // 分辨力前置：整份样本确实被解析出来了（否则「只有 1 条 reasoning」可能是
+        // 因为整份都没扫出来）。
+        let users: Vec<&_> = conv.messages.iter().filter(|m| m.role == "user").collect();
+        assert_eq!(
+            users.len(),
+            1,
+            "前置断言：锚消息必须在，否则本用例可能是在一份空投影上做断言"
+        );
+    }
+
     #[test]
     fn contract_openclaw_tool_call_and_thinking_have_no_role_guard() {
         let conv = project_openclaw("b11-oc-noguard", OPENCLAW_ALL_BRANCHES.as_bytes());
@@ -3941,6 +4010,73 @@ mod e5_materialization_tests {
                 m.extra
             );
         }
+    }
+
+    /// §B.11 P14 · compact 面：**OpenClaw 未被 compact**。
+    ///
+    /// `should_compact_connector_extra` 的最后一行是
+    /// `connector_name == "codex" || conv.agent_slug == "codex"` —— 门只对 codex 开。
+    /// 本用例把同一份 OpenClaw 语料分别按「阈值以下」与「阈值以上」的封存大小投影，
+    /// 断言两侧 extra 完全一样。
+    ///
+    /// **对照物**：codex 侧的 `..._reads_the_sealed_size_not_the_filesystem` 与摘要
+    /// 不变性用例已经证明「阈值以上时 extra 确实会缩水」。所以这里的「两侧相等」
+    /// 不是因为 compact 对谁都不生效，而是因为它对 OpenClaw 不生效。
+    ///
+    /// 断言对象刻意选**非白名单键**（`payload`）：compact 只保 `cass` / `model` /
+    /// `attachments` 那几样，`payload` 一旦被 compact 就会消失。P14 同时要求
+    /// 「断言不依赖 `payload` / `response` 存活」—— 那句话约束的是 **codex 侧**的
+    /// 断言（compact 之后它们本就该没了）；OpenClaw 侧恰恰相反，它们必须还在。
+    #[test]
+    fn contract_p14_openclaw_extras_survive_a_size_above_the_codex_compact_threshold() {
+        const THRESHOLD: u64 = 16 * 1024 * 1024;
+        let bytes = OPENCLAW_ALL_BRANCHES.as_bytes();
+        let root = scratch("b11-p14-oc");
+        let input = SealedSource {
+            agent: Origin::Openclaw,
+            canonical_original_path: OPENCLAW_PATH,
+            source_size_bytes: bytes.len() as u64,
+            blob: bytes,
+        };
+        // 物化一次，之后只改「封存大小」这一个入参 —— 与 codex 侧那组用例同法，
+        // 免得 `SealedSizeMismatch` 把用例挡在门外。
+        let materialized = materialize_sealed_blob(&root, &input).unwrap();
+
+        let extras_at = |sealed: u64| -> Vec<serde_json::Value> {
+            let sized = SealedSource {
+                source_size_bytes: sealed,
+                ..input
+            };
+            match project_from_materialized(&materialized, &sized, &test_provenance()).unwrap() {
+                SealedProjection::Projected(conv) => {
+                    conv.messages.iter().map(|m| m.extra.clone()).collect()
+                }
+                other => panic!("期望 Projected，实得 {other:?}"),
+            }
+        };
+
+        let below = extras_at(1024);
+        let above = extras_at(THRESHOLD);
+
+        // 分辨力前置：样本里必须真有**非白名单**键，否则「两侧相等」是空转 ——
+        // 一份只含 `cass` 的 extra 在 compact 前后本来就一样。
+        let non_allowlist_keys = below
+            .iter()
+            .filter_map(serde_json::Value::as_object)
+            .flat_map(|o| o.keys())
+            .filter(|k| !matches!(k.as_str(), "cass" | "model" | "attachments"))
+            .count();
+        assert!(
+            non_allowlist_keys > 0,
+            "分辨力前置断言：样本的 extra 必须含非白名单键，否则本用例证明不了「没被 compact」"
+        );
+
+        assert_eq!(
+            below, above,
+            "OpenClaw 的 extra 在跨过 codex 的 compact 阈值之后必须**逐字不变** —— \
+             compact 门只对 codex 开（`should_compact_connector_extra` 末行），\
+             对 OpenClaw 生效就是把另一家的语料按 codex 的口径削了"
+        );
     }
 
     #[test]
