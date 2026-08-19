@@ -14411,6 +14411,322 @@ fn franken_update_conversation_token_summaries_in_tx(
     Ok(())
 }
 
+// -------------------------------------------------------------------------
+// E5 · replace 专用存储函数（plan Task E5 Step 2，裁定 R1 选 A）
+//
+// 基线的三个候选入口都不能当 replace 用（现读复核见 E5b 台账 P2.0.2）：
+// `insert_conversation_tree` 不写 `token_usage` / `message_metrics`；
+// `insert_conversations_batched` 先读缓存 tail 做 append/no-op 规划、且自带事务；
+// `rebuild_analytics` 把 `message_metrics` 的删除与三张 rollup 捆进一次全量重建。
+// -------------------------------------------------------------------------
+
+/// replace 侧显式绑 `id` 的单行 INSERT。
+///
+/// 列表相对基线批量 INSERT（`message_insert_batch_sql`）只多打头一个 `id` ——
+/// 显式绑 `id` 是必接② 的落地（新 id 必须越过 replace 之前的全局 max，
+/// 否则 `messages.id` 无 `AUTOINCREMENT`、删后 id 会被回收复用，
+/// 而 `content-v1` 指纹的第三分量取 `MAX(messages.id)`，复用即指纹不动）。
+/// 两份列表的同步由 `e5_replace_message_insert_column_list_tracks_baseline` 机器守卫。
+// ⚠ 下面四个符号在 E6 把 replace 编排接上之前，非测试构建里没有调用方，
+// 故显式 `allow(dead_code)`。**这是 staged landing 的记账，不是把死代码放行**：
+// E6 Step 1 会把 `FrankenTransaction` 传进来成为真调用方，届时这些 allow 应当移除。
+// E9 的 clippy 门以「相对基线零新增告警」为判据，这四条属本 PR 新增，故在此消掉。
+#[allow(dead_code)]
+const REPLACE_MESSAGE_INSERT_SQL: &str = "INSERT INTO messages(id, conversation_id, idx, role, author, created_at, content, extra_json, extra_bin) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)";
+
+/// `franken_replace_conversation_messages_in_tx` 的产出。
+#[allow(dead_code)]
+pub(crate) struct ReplaceConversationMessagesOutcome {
+    /// 本次插入的 message id，按 `conv.messages` 顺序。
+    pub inserted_message_ids: Vec<i64>,
+    /// 被删掉的旧消息行数。
+    pub deleted_message_count: usize,
+}
+
+/// 把一个既有 conversation 的消息集整体替换成 `conv` 的内容。
+///
+/// 五条硬语义（plan Task E5 Step 2）：
+/// ① 接受调用方传入的 `FrankenTransaction`，**自己不开事务**；
+/// ② 在任何规划成形之前重置两处 tail（热表 + `conversations` 三列），且是赋值不是抬高；
+/// ③ 无条件全量插入，绕过 tail 规划器；
+/// ④ 事务内写 `token_usage` / `message_metrics` 与 `conversations` 的 11 个汇总列；
+/// ⑤ 保留 conversation ID。
+#[allow(dead_code)]
+pub(crate) fn franken_replace_conversation_messages_in_tx(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+    agent_id: i64,
+    workspace_id: Option<i64>,
+    conv: &Conversation,
+    pricing_table: &PricingTable,
+) -> Result<ReplaceConversationMessagesOutcome> {
+    let normalized_conv = normalized_conversation_for_storage(conv);
+    let conv = normalized_conv.as_ref();
+
+    // 语义②：在任何规划成形之前重置两处 tail，且必须是**赋值**而不是单调抬高。
+    // 基线的两个更新器（`franken_update_conversation_tail_state` 与看似赋值的
+    // `franken_set_conversation_tail_state_after_append`）对 `conversations` 三列
+    // 都走单调抬高的 `franken_update_conversation_tail_columns`，**没有任何一个能把
+    // tail 降下来**；而缓存读取器 `franken_cached_existing_conversation_tail_metadata`
+    // 在热表未命中时会**回落**读这三列，所以只清热表会留下陈旧 legacy 值。
+    tx.execute_compat(
+        "DELETE FROM conversation_tail_state WHERE conversation_id = ?1",
+        fparams![conversation_id],
+    )?;
+    tx.execute_compat(
+        "UPDATE conversations
+         SET last_message_idx = NULL, last_message_created_at = NULL, ended_at = NULL
+         WHERE id = ?1",
+        fparams![conversation_id],
+    )?;
+
+    // 必接②：先记下 replace 之前的**全局** message id 水位。现算量，不持久化
+    // （Phase 0.2 已核：`messages` 无 `AUTOINCREMENT`、全仓无 `sqlite_sequence`）。
+    let old_global_max_message_id: i64 = tx.query_row_map(
+        "SELECT COALESCE(MAX(id), 0) FROM messages",
+        fparams![],
+        |row| row.get_typed(0),
+    )?;
+
+    // 删旧。`message_metrics` / `snippets` / `token_usage` 的 `message_id` 都带
+    // `ON DELETE CASCADE`；`token_usage` 另有一列 `conversation_id` 无外键，
+    // 故按基线 `cleanup_external_id_duplicates` 的做法再显式删一次（不依赖 cascade）。
+    let deleted_message_count = tx.execute_compat(
+        "DELETE FROM messages WHERE conversation_id = ?1",
+        fparams![conversation_id],
+    )?;
+    tx.execute_compat(
+        "DELETE FROM token_usage WHERE conversation_id = ?1",
+        fparams![conversation_id],
+    )?;
+
+    // 语义③：无条件全量插入，不查缓存 tail、不做 append/no-op 规划。
+    let conv_day_id = conversation_effective_started_at(conv)
+        .map(FrankenStorage::day_id_from_millis)
+        .unwrap_or(0);
+    let mut inserted_message_ids = Vec::with_capacity(conv.messages.len());
+    let mut token_entries: Vec<TokenUsageEntry> = Vec::with_capacity(conv.messages.len());
+    let mut metrics_entries: Vec<MessageMetricsEntry> = Vec::with_capacity(conv.messages.len());
+    for (offset, msg) in conv.messages.iter().enumerate() {
+        let message_id = old_global_max_message_id + 1 + offset as i64;
+        let (extra_json_str, extra_bin) = franken_message_insert_payload(msg)?;
+        tx.execute_compat(
+            REPLACE_MESSAGE_INSERT_SQL,
+            fparams![
+                message_id,
+                conversation_id,
+                msg.idx,
+                role_as_str(&msg.role),
+                msg.author.as_deref(),
+                msg.created_at,
+                msg.content.as_str(),
+                extra_json_str.as_deref(),
+                extra_bin.as_deref()
+            ],
+        )?;
+        franken_insert_snippets(tx, message_id, &msg.snippets)?;
+        inserted_message_ids.push(message_id);
+
+        let (token_entry, metrics_entry) = replace_derived_rows_for_message(
+            conv,
+            conversation_id,
+            agent_id,
+            workspace_id,
+            conv_day_id,
+            pricing_table,
+            message_id,
+            msg,
+        );
+        token_entries.push(token_entry);
+        metrics_entries.push(metrics_entry);
+    }
+
+    // 语义④：事务内写两张逐消息派生表与 `conversations` 的 11 个 token 汇总列。
+    // **五张累加型物化聚合表不在这一步**（`daily_stats` / `token_daily_stats` /
+    // `usage_hourly` / `usage_daily` / `usage_models_daily`）—— 按 E6 Step 1b
+    // 它们在事务**提交之后**失效并全量重算，本函数一行都不许碰。
+    franken_insert_token_usage_batched_in_tx(tx, &token_entries)?;
+    franken_insert_message_metrics_batched_in_tx(tx, &metrics_entries)?;
+
+    // 【选择】D-6（`appendix-w2-1.md` §D.5）：**无条件**重算 11 列，
+    // 不复制基线 append 路径上的 `has_any_tokens` 门 —— 旧行已被级联删除，
+    // 跳过重算会留下「汇总值来自已经不存在的行」的自相矛盾记录，且无约束报错。
+    // 顺序按规定 D-2 / D-3：必须排在级联删除之后、`token_usage` 落库之后。
+    franken_update_conversation_token_summaries_in_tx(tx, conversation_id)?;
+
+    // 语义② 的后半：两处 tail 都已被清成空，所以这里写什么就是什么 —— 既有的
+    // 「单调抬高」写法从 NULL 起等价于赋值，且因此能降下来（这正是先清后写的意义）。
+    //
+    // 用**收 `Option` 的**那对既有写入器，不用收三个 `i64` 的
+    // `franken_set_conversation_tail_state_after_append`：后者要求 idx 与 created_at
+    // 同时已知，而「消息没有时间戳」是本仓明确处理过的真实形态（`timestamp_data_incomplete`
+    // 那条分支）。用它会在那种输入上整段跳过，把已知的 idx 与 ended_at 一并丢掉。
+    let (tail_last_idx, tail_last_created_at) = conversation_tail_state(conv);
+    let tail_ended_at = conversation_tail_ended_at_candidate(conv);
+    franken_insert_conversation_tail_state(
+        tx,
+        conversation_id,
+        tail_ended_at,
+        tail_last_idx,
+        tail_last_created_at,
+    )?;
+    franken_update_conversation_tail_columns(
+        tx,
+        conversation_id,
+        tail_ended_at,
+        tail_last_idx,
+        tail_last_created_at,
+    )?;
+
+    Ok(ReplaceConversationMessagesOutcome {
+        inserted_message_ids,
+        deleted_message_count,
+    })
+}
+
+/// replace 侧逐消息派生 `token_usage` / `message_metrics` 两行。
+///
+/// **这是基线派生逻辑的第二份定义**（裁定 R-E-41 选 A′）。基线那份是
+/// `insert_conversations_batched` 的内联块，且同时喂 `AnalyticsRollupAggregator` /
+/// `TokenStatsAggregator` / `PricingDiagnostics` —— 那三者写的是五张累加型物化聚合表
+/// 与 `token_daily_stats`，按 E6 Step 1b **不进 replace 的事务**，所以整块复用不可能。
+/// 两份定义的漂移由 `e5_replace_derived_rows_match_baseline_path` 逐列等价门守住。
+///
+/// 逐列口径出处：`appendix-w2-0.md` §C.4（`token_usage`）与 §C.5（`message_metrics`）。
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+fn replace_derived_rows_for_message(
+    conv: &Conversation,
+    conversation_id: i64,
+    agent_id: i64,
+    workspace_id: Option<i64>,
+    conv_day_id: i64,
+    pricing_table: &PricingTable,
+    message_id: i64,
+    msg: &Message,
+) -> (TokenUsageEntry, MessageMetricsEntry) {
+    let role_s = role_str(&msg.role);
+
+    // W2-0 §C.4：抽取器之前的那道闸必须照搬 —— 命中历史 raw-line 信封时传 Null，
+    // 且第一个实参是投影产出的 `conv.agent_slug`，不是回查 `agents` 表的值。
+    let usage = if historical_raw_json(&msg.extra_json).is_some() {
+        crate::connectors::extract_tokens_for_agent(
+            &conv.agent_slug,
+            &serde_json::Value::Null,
+            &msg.content,
+            &role_s,
+        )
+    } else {
+        crate::connectors::extract_tokens_for_agent(
+            &conv.agent_slug,
+            &msg.extra_json,
+            &msg.content,
+            &role_s,
+        )
+    };
+
+    let msg_ts = msg
+        .created_at
+        .or(conversation_effective_started_at(conv))
+        .unwrap_or(0);
+    let msg_day_id = if msg_ts > 0 {
+        FrankenStorage::day_id_from_millis(msg_ts)
+    } else {
+        conv_day_id
+    };
+
+    let model_info = usage
+        .model_name
+        .as_deref()
+        .map(crate::connectors::normalize_model);
+
+    let model_family = model_info
+        .as_ref()
+        .map(|i| i.family.clone())
+        .unwrap_or_else(|| "unknown".into());
+    let model_tier = model_info
+        .as_ref()
+        .map(|i| i.tier.clone())
+        .unwrap_or_else(|| "unknown".into());
+    let provider = usage
+        .provider
+        .clone()
+        .or_else(|| model_info.as_ref().map(|i| i.provider.clone()))
+        .unwrap_or_else(|| "unknown".into());
+
+    let estimated_cost = pricing_table.compute_cost(
+        usage.model_name.as_deref(),
+        msg_day_id,
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.cache_read_tokens,
+        usage.cache_creation_tokens,
+    );
+
+    let content_chars = msg.content.len() as i64;
+    let content_tokens_est = content_chars / 4;
+    let msg_hour_id = FrankenStorage::hour_id_from_millis(msg_ts);
+    let has_plan = has_plan_for_role(&role_s, &msg.content);
+
+    let token_entry = TokenUsageEntry {
+        message_id,
+        conversation_id,
+        agent_id,
+        workspace_id,
+        source_id: conv.source_id.clone(),
+        timestamp_ms: msg_ts,
+        day_id: msg_day_id,
+        model_name: usage.model_name.clone(),
+        model_family: Some(model_family.clone()),
+        model_tier: Some(model_tier.clone()),
+        service_tier: usage.service_tier.clone(),
+        provider: Some(provider.clone()),
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cache_read_tokens: usage.cache_read_tokens,
+        cache_creation_tokens: usage.cache_creation_tokens,
+        thinking_tokens: usage.thinking_tokens,
+        total_tokens: usage.total_tokens(),
+        estimated_cost_usd: estimated_cost,
+        role: role_s.to_string(),
+        content_chars,
+        has_tool_calls: usage.has_tool_calls,
+        tool_call_count: usage.tool_call_count,
+        data_source: usage.data_source.as_str().to_string(),
+    };
+
+    let metrics_entry = MessageMetricsEntry {
+        message_id,
+        created_at_ms: msg_ts,
+        hour_id: msg_hour_id,
+        day_id: msg_day_id,
+        agent_slug: conv.agent_slug.clone(),
+        // W2-0 §C.5：本表 `workspace_id` 是 `NOT NULL DEFAULT 0`，NULL 折叠成 0；
+        // `token_usage.workspace_id` 可空不折叠。两表不可复用同一份空值处置。
+        workspace_id: workspace_id.unwrap_or(0),
+        source_id: conv.source_id.clone(),
+        role: role_s.to_string(),
+        content_chars,
+        content_tokens_est,
+        model_name: usage.model_name.clone(),
+        model_family,
+        model_tier,
+        provider,
+        api_input_tokens: usage.input_tokens,
+        api_output_tokens: usage.output_tokens,
+        api_cache_read_tokens: usage.cache_read_tokens,
+        api_cache_creation_tokens: usage.cache_creation_tokens,
+        api_thinking_tokens: usage.thinking_tokens,
+        api_service_tier: usage.service_tier.clone(),
+        api_data_source: usage.data_source.as_str().to_string(),
+        tool_call_count: usage.tool_call_count as i64,
+        has_tool_calls: usage.has_tool_calls,
+        has_plan,
+    };
+
+    (token_entry, metrics_entry)
+}
+
 impl FrankenStorage {
     /// Rebuild token_daily_stats from the token_usage ledger.
     pub fn rebuild_token_daily_stats(&self) -> Result<usize> {
@@ -28451,5 +28767,951 @@ mod tests {
             Some("gen-2026-08-18-abc"),
             "restore_scan_watermarks 不得清掉内容代际保留 key"
         );
+    }
+}
+
+// =========================================================================
+// E5 Phase 2 · replace 专用存储函数的五条硬语义 + 必接②
+//
+// plan Task E5 Step 2 的五条语义逐条一测；「新 message id 越全局 max +
+// replace 后指纹必变」为必接②。测试口径出处：
+//   - `token_usage` / `message_metrics` 逐列 → `appendix-w2-0.md` §C.4 / §C.5
+//   - `conversations` 11 个 token 汇总列   → `appendix-w2-1.md` §D.4（含规定 D-0）
+// =========================================================================
+#[cfg(test)]
+mod e5_replace_tests {
+    use super::*;
+    use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+    use std::collections::{HashMap, HashSet};
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    const TS: i64 = 1_770_551_400_000; // 2026-02-06 10:30:00 UTC
+
+    fn open_storage(dir: &TempDir) -> (FrankenStorage, i64) {
+        let db_path = dir.path().join("e5-replace.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        let agent = Agent {
+            id: None,
+            slug: "claude_code".into(),
+            name: "Claude Code".into(),
+            version: Some("1.0".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        (storage, agent_id)
+    }
+
+    fn msg(idx: i64, role: MessageRole, content: &str, extra: serde_json::Value) -> Message {
+        Message {
+            id: None,
+            idx,
+            role,
+            author: None,
+            created_at: Some(TS + idx * 1_000),
+            content: content.into(),
+            extra_json: extra,
+            snippets: vec![],
+        }
+    }
+
+    fn conversation(external_id: &str, messages: Vec<Message>) -> Conversation {
+        Conversation {
+            id: None,
+            agent_slug: "claude_code".into(),
+            workspace: None,
+            external_id: Some(external_id.into()),
+            title: Some("E5 replace fixture".into()),
+            source_path: PathBuf::from("/fixtures/e5-replace.jsonl"),
+            started_at: Some(TS),
+            ended_at: Some(TS + 60_000),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages,
+            source_id: "local".into(),
+            origin_host: None,
+        }
+    }
+
+    fn conv_id_of(storage: &FrankenStorage, external_id: &str) -> i64 {
+        storage
+            .raw()
+            .query_row_map(
+                "SELECT id FROM conversations WHERE external_id = ?1",
+                fparams![external_id],
+                |row| row.get_typed::<i64>(0),
+            )
+            .unwrap()
+    }
+
+    fn message_rows(storage: &FrankenStorage, conv_id: i64) -> Vec<(i64, i64, String)> {
+        storage
+            .raw()
+            .query_map_collect(
+                "SELECT id, idx, content FROM messages WHERE conversation_id = ?1 ORDER BY idx",
+                fparams![conv_id],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+            )
+            .unwrap()
+    }
+
+    /// 指纹三分量（`content-v1:{会话数}:{MAX(conv.id)}:{MAX(msg.id)}`）。
+    /// 格式串本身锚在 `src/indexer/mod.rs::lexical_rebuild_content_fingerprint_value`；
+    /// 本测试只取它的三个输入分量，**不复刻格式串**（避免第二定义）。
+    fn fingerprint_components(storage: &FrankenStorage) -> (i64, i64, i64) {
+        let conn = storage.raw();
+        let total: i64 = conn
+            .query_row_map("SELECT COUNT(*) FROM conversations", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        let max_conv: i64 = conn
+            .query_row_map(
+                "SELECT COALESCE(MAX(id), 0) FROM conversations",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        let max_msg: i64 = conn
+            .query_row_map(
+                "SELECT COALESCE(MAX(id), 0) FROM messages",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        (total, max_conv, max_msg)
+    }
+
+    fn seed_original(storage: &FrankenStorage, agent_id: i64, external_id: &str) -> i64 {
+        let conv = conversation(
+            external_id,
+            vec![
+                msg(0, MessageRole::User, "旧消息 0", serde_json::Value::Null),
+                msg(1, MessageRole::Agent, "旧消息 1", serde_json::Value::Null),
+                msg(2, MessageRole::User, "旧消息 2", serde_json::Value::Null),
+            ],
+        );
+        let outcomes = storage
+            .insert_conversations_batched(&[(agent_id, None, &conv)])
+            .unwrap();
+        assert_eq!(outcomes.len(), 1);
+        conv_id_of(storage, external_id)
+    }
+
+    fn replacement(external_id: &str) -> Conversation {
+        conversation(
+            external_id,
+            vec![
+                msg(0, MessageRole::User, "新消息 0", serde_json::Value::Null),
+                msg(1, MessageRole::Agent, "新消息 1", serde_json::Value::Null),
+            ],
+        )
+    }
+
+    // ---------------------------------------------------------------------
+    // 语义 ①：接受外部事务，自己不开事务
+    // ---------------------------------------------------------------------
+    #[test]
+    fn e5_replace_runs_inside_caller_transaction_and_is_undone_by_its_rollback() {
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open_storage(&dir);
+        let conv_id = seed_original(&storage, agent_id, "tx-scope");
+        let before = message_rows(&storage, conv_id);
+        assert_eq!(before.len(), 3, "前置：原会话应有 3 条消息");
+
+        let new_conv = replacement("tx-scope");
+        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+        {
+            let mut tx = storage.raw().transaction().unwrap();
+            franken_replace_conversation_messages_in_tx(
+                &tx, conv_id, agent_id, None, &new_conv, &pricing,
+            )
+            .unwrap();
+
+            // 同一事务内可见：证明写确实发生了（否则下面的回滚断言是空转）。
+            let in_tx: i64 = tx
+                .query_row_map(
+                    "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1",
+                    fparams![conv_id],
+                    |row| row.get_typed(0),
+                )
+                .unwrap();
+            assert_eq!(in_tx, 2, "事务内应看得到 replace 后的 2 条新消息");
+
+            tx.rollback().unwrap();
+        }
+
+        // 若函数自带事务（自己 commit 了），外层回滚就撤不掉它。
+        let after = message_rows(&storage, conv_id);
+        assert_eq!(
+            after, before,
+            "外层事务回滚后必须回到原状——不回到原状即说明函数自己开了事务并提交"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // 语义 ③：无条件全量插入，绕过 tail 规划器
+    // ---------------------------------------------------------------------
+    #[test]
+    fn e5_replace_inserts_full_set_where_tail_planner_would_plan_nothing() {
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open_storage(&dir);
+        let conv_id = seed_original(&storage, agent_id, "planner-noop");
+        let new_conv = replacement("planner-noop");
+
+        // 分辨力前置断言：同一份输入喂给基线的 tail 规划器，它计划插入 0 条。
+        // 不先证这一点，本测试就分不出「绕过了规划器」与「规划器本来就会插满」。
+        {
+            let mut tx = storage.raw().transaction().unwrap();
+            let mut by_idx: HashMap<i64, HashMap<i64, MessageMergeFingerprint>> = HashMap::new();
+            let mut replay: HashMap<i64, HashSet<MessageReplayFingerprint>> = HashMap::new();
+            let (plan, _, _) = franken_collect_batched_existing_new_messages(
+                &tx,
+                conv_id,
+                &new_conv,
+                &mut by_idx,
+                &mut replay,
+                "e5 planner probe",
+            )
+            .unwrap();
+            assert!(
+                plan.messages.is_empty(),
+                "前置断言失败：基线规划器并非计划插 0 条，本用例分辨不出语义 ③"
+            );
+            tx.rollback().unwrap();
+        }
+
+        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+        let mut tx = storage.raw().transaction().unwrap();
+        franken_replace_conversation_messages_in_tx(
+            &tx, conv_id, agent_id, None, &new_conv, &pricing,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let rows = message_rows(&storage, conv_id);
+        assert_eq!(rows.len(), 2, "必须全量插入 2 条，而不是按规划器判 no-op");
+        assert_eq!(rows[0].2, "新消息 0");
+        assert_eq!(rows[1].2, "新消息 1");
+    }
+
+    // ---------------------------------------------------------------------
+    // 语义 ⑤：保留 conversation ID，且不留孤儿
+    // ---------------------------------------------------------------------
+    #[test]
+    fn e5_replace_preserves_conversation_id_and_leaves_no_orphans() {
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open_storage(&dir);
+        let conv_id = seed_original(&storage, agent_id, "id-kept");
+        let new_conv = replacement("id-kept");
+
+        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+        let mut tx = storage.raw().transaction().unwrap();
+        franken_replace_conversation_messages_in_tx(
+            &tx, conv_id, agent_id, None, &new_conv, &pricing,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(
+            conv_id_of(&storage, "id-kept"),
+            conv_id,
+            "conversation ID 必须保留（与 E6 Step 1 的 ID 保留是同一条要求）"
+        );
+
+        let conn = storage.raw();
+        let conv_rows: i64 = conn
+            .query_row_map(
+                "SELECT COUNT(*) FROM conversations WHERE external_id = 'id-kept'",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(conv_rows, 1, "不得复制出第二行 conversation");
+
+        for (table, sql) in [
+            (
+                "message_metrics",
+                "SELECT COUNT(*) FROM message_metrics mm \
+                 WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.id = mm.message_id)",
+            ),
+            (
+                "token_usage",
+                "SELECT COUNT(*) FROM token_usage tu \
+                 WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.id = tu.message_id)",
+            ),
+            (
+                "snippets",
+                "SELECT COUNT(*) FROM snippets s \
+                 WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.id = s.message_id)",
+            ),
+        ] {
+            let orphans: i64 = conn
+                .query_row_map(sql, fparams![], |row| row.get_typed(0))
+                .unwrap();
+            assert_eq!(orphans, 0, "{table} 不得留下孤儿行");
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // 语义 ②：两处都重置 tail，且是赋值不是单调抬高
+    // ---------------------------------------------------------------------
+    #[test]
+    fn e5_replace_resets_hot_tail_table_and_legacy_columns_downward() {
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open_storage(&dir);
+        let conv_id = seed_original(&storage, agent_id, "tail-hot");
+
+        // 把两处 tail 都推到一个**高于**新内容的陈旧值。基线的两个更新器都是单调抬高，
+        // 所以只要 replace 之后这两处降下来了，就证明它做的是赋值而不是抬高。
+        {
+            let conn = storage.raw();
+            conn.execute_compat(
+                "UPDATE conversation_tail_state
+                 SET last_message_idx = 99, last_message_created_at = ?1, ended_at = ?1
+                 WHERE conversation_id = ?2",
+                fparams![TS + 900_000, conv_id],
+            )
+            .unwrap();
+            conn.execute_compat(
+                "UPDATE conversations
+                 SET last_message_idx = 99, last_message_created_at = ?1, ended_at = ?1
+                 WHERE id = ?2",
+                fparams![TS + 900_000, conv_id],
+            )
+            .unwrap();
+        }
+
+        let new_conv = replacement("tail-hot");
+        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+        let mut tx = storage.raw().transaction().unwrap();
+        franken_replace_conversation_messages_in_tx(
+            &tx, conv_id, agent_id, None, &new_conv, &pricing,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let conn = storage.raw();
+        let hot: (i64, i64) = conn
+            .query_row_map(
+                "SELECT last_message_idx, last_message_created_at
+                 FROM conversation_tail_state WHERE conversation_id = ?1",
+                fparams![conv_id],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )
+            .unwrap();
+        assert_eq!(hot.0, 1, "热表 last_message_idx 必须降到新内容的 max idx");
+        assert_eq!(hot.1, TS + 1_000);
+
+        let legacy: (i64, i64) = conn
+            .query_row_map(
+                "SELECT last_message_idx, last_message_created_at
+                 FROM conversations WHERE id = ?1",
+                fparams![conv_id],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            legacy.0, 1,
+            "`conversations` 的 legacy tail 列同样必须降下来——只重置热表会留下陈旧回落值"
+        );
+        assert_eq!(legacy.1, TS + 1_000);
+    }
+
+    #[test]
+    fn e5_replace_resets_legacy_columns_when_hot_tail_row_is_absent() {
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open_storage(&dir);
+        let conv_id = seed_original(&storage, agent_id, "tail-fallback");
+
+        // 回落路径：热表无行时 `franken_cached_existing_conversation_tail_metadata`
+        // 读 `conversations` 的三列。构造「热表空 + legacy 列陈旧」。
+        {
+            let conn = storage.raw();
+            conn.execute_compat(
+                "DELETE FROM conversation_tail_state WHERE conversation_id = ?1",
+                fparams![conv_id],
+            )
+            .unwrap();
+            conn.execute_compat(
+                "UPDATE conversations
+                 SET last_message_idx = 99, last_message_created_at = ?1, ended_at = ?1
+                 WHERE id = ?2",
+                fparams![TS + 900_000, conv_id],
+            )
+            .unwrap();
+        }
+
+        let new_conv = replacement("tail-fallback");
+        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+        let mut tx = storage.raw().transaction().unwrap();
+        franken_replace_conversation_messages_in_tx(
+            &tx, conv_id, agent_id, None, &new_conv, &pricing,
+        )
+        .unwrap();
+
+        // ⚠ 这里必须把 replace **写回的**热表行再删一次，否则读取器读的是热表、
+        // 根本走不到回落分支 —— 那样这条测试测的就是「热表被写回」而不是它名字声称的
+        // 「legacy 三列被重置」。（本棒实测：不删这一行时，去掉 legacy 重置的变异
+        // M2b 在这条测试上不转红，恰恰暴露了它没走回落。）
+        tx.execute_compat(
+            "DELETE FROM conversation_tail_state WHERE conversation_id = ?1",
+            fparams![conv_id],
+        )
+        .unwrap();
+
+        // 用真正的回落读取器判，而不是自己再写一遍 SQL。
+        let seen = franken_cached_existing_conversation_tail_metadata(&tx, conv_id).unwrap();
+        assert_eq!(
+            seen.last_message_idx,
+            Some(1),
+            "回落读取器必须读到重置后的新值；读到 99 即说明 legacy 三列没被重置"
+        );
+        assert_eq!(seen.last_message_created_at, Some(TS + 1_000));
+        tx.commit().unwrap();
+    }
+
+    // ---------------------------------------------------------------------
+    // 必接②：新 message id 越过全局 max，指纹分量必移动
+    // ---------------------------------------------------------------------
+    #[test]
+    fn e5_replace_assigns_message_ids_above_global_max_and_moves_fingerprint() {
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open_storage(&dir);
+        // 先放一个别的会话，再放被 replace 的那个——于是被 replace 的会话持有全局 max
+        // message id，这正是「删旧插新会复用回收 id」的引爆条件。
+        let _other = seed_original(&storage, agent_id, "other");
+        let conv_id = seed_original(&storage, agent_id, "fingerprint");
+
+        let before = fingerprint_components(&storage);
+        let old_global_max = before.2;
+        let old_ids: Vec<i64> = message_rows(&storage, conv_id)
+            .iter()
+            .map(|r| r.0)
+            .collect();
+        assert_eq!(
+            *old_ids.iter().max().unwrap(),
+            old_global_max,
+            "前置断言失败：被 replace 的会话没有持有全局 max message id，本用例分辨不出 id 复用"
+        );
+
+        let new_conv = replacement("fingerprint");
+        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+        let mut tx = storage.raw().transaction().unwrap();
+        franken_replace_conversation_messages_in_tx(
+            &tx, conv_id, agent_id, None, &new_conv, &pricing,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let new_ids: Vec<i64> = message_rows(&storage, conv_id)
+            .iter()
+            .map(|r| r.0)
+            .collect();
+        assert!(
+            new_ids.iter().all(|id| *id > old_global_max),
+            "新 message id 必须全部越过 replace 之前的全局 max（{old_global_max}），实得 {new_ids:?}"
+        );
+
+        let after = fingerprint_components(&storage);
+        assert_eq!(after.0, before.0, "会话数不变（replace 不新增会话）");
+        assert_eq!(after.1, before.1, "MAX(conversation_id) 不变（ID 保留）");
+        assert!(
+            after.2 > before.2,
+            "MAX(message_id) 必须严格增大——指纹是这三个分量的纯函数\
+             （锚 `src/indexer/mod.rs::lexical_rebuild_content_fingerprint_value`），\
+             三分量都不动则指纹逐字节相同、回滚保护失效"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // 第二定义守卫：显式 id 的 INSERT 列表必须与基线批量 INSERT 保持同步
+    // ---------------------------------------------------------------------
+    #[test]
+    fn e5_replace_message_insert_column_list_tracks_baseline() {
+        fn columns_of(sql: &str) -> Vec<String> {
+            let open = sql.find('(').expect("INSERT 语句里应有列表左括号");
+            let close = sql[open..].find(')').expect("列表右括号") + open;
+            sql[open + 1..close]
+                .split(',')
+                .map(|c| c.trim().to_string())
+                .collect()
+        }
+
+        let baseline = columns_of(message_insert_batch_sql(1));
+        let ours = columns_of(REPLACE_MESSAGE_INSERT_SQL);
+
+        assert_eq!(
+            ours.first().map(String::as_str),
+            Some("id"),
+            "replace 侧的唯一列差异应当是打头的显式 `id`"
+        );
+        assert_eq!(
+            &ours[1..],
+            baseline.as_slice(),
+            "replace 侧的 INSERT 列表除多一个 `id` 外必须与基线逐列一致——\
+             基线加列而这里没跟上即为静默漂移"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // 语义 ④：事务内写 token_usage / message_metrics / 11 个汇总列
+    // ---------------------------------------------------------------------
+
+    /// 逐列 digest。**排除口径（裁定 R-E-41 条件 2）**：
+    /// - `token_usage.id` 是自增代理键，replace 删旧插新必然分配新值，按
+    ///   `appendix-w2-0.md` §C.4 显式排除；
+    /// - `message_id` / `conversation_id` 是身份列，两条路径的取值按构造就不同，
+    ///   对齐方式是**按 `messages.idx` 排序**（见下方 JOIN），不进逐列比对。
+    const TOKEN_USAGE_DIGEST_SQL: &str = "SELECT COALESCE(CAST(tu.agent_id AS TEXT),'~') || '|' \
+         || COALESCE(CAST(tu.workspace_id AS TEXT),'~') || '|' || COALESCE(tu.source_id,'~') || '|' \
+         || COALESCE(CAST(tu.timestamp_ms AS TEXT),'~') || '|' || COALESCE(CAST(tu.day_id AS TEXT),'~') || '|' \
+         || COALESCE(tu.model_name,'~') || '|' || COALESCE(tu.model_family,'~') || '|' \
+         || COALESCE(tu.model_tier,'~') || '|' || COALESCE(tu.service_tier,'~') || '|' \
+         || COALESCE(tu.provider,'~') || '|' || COALESCE(CAST(tu.input_tokens AS TEXT),'~') || '|' \
+         || COALESCE(CAST(tu.output_tokens AS TEXT),'~') || '|' || COALESCE(CAST(tu.cache_read_tokens AS TEXT),'~') || '|' \
+         || COALESCE(CAST(tu.cache_creation_tokens AS TEXT),'~') || '|' || COALESCE(CAST(tu.thinking_tokens AS TEXT),'~') || '|' \
+         || COALESCE(CAST(tu.total_tokens AS TEXT),'~') || '|' || COALESCE(CAST(tu.estimated_cost_usd AS TEXT),'~') || '|' \
+         || COALESCE(tu.role,'~') || '|' || COALESCE(CAST(tu.content_chars AS TEXT),'~') || '|' \
+         || COALESCE(CAST(tu.has_tool_calls AS TEXT),'~') || '|' || COALESCE(CAST(tu.tool_call_count AS TEXT),'~') || '|' \
+         || COALESCE(tu.data_source,'~') \
+         FROM token_usage tu JOIN messages m ON m.id = tu.message_id ORDER BY m.idx";
+
+    const MESSAGE_METRICS_DIGEST_SQL: &str = "SELECT COALESCE(CAST(mm.created_at_ms AS TEXT),'~') || '|' \
+         || COALESCE(CAST(mm.hour_id AS TEXT),'~') || '|' || COALESCE(CAST(mm.day_id AS TEXT),'~') || '|' \
+         || COALESCE(mm.agent_slug,'~') || '|' || COALESCE(CAST(mm.workspace_id AS TEXT),'~') || '|' \
+         || COALESCE(mm.source_id,'~') || '|' || COALESCE(mm.role,'~') || '|' \
+         || COALESCE(CAST(mm.content_chars AS TEXT),'~') || '|' || COALESCE(CAST(mm.content_tokens_est AS TEXT),'~') || '|' \
+         || COALESCE(mm.model_name,'~') || '|' || COALESCE(mm.model_family,'~') || '|' \
+         || COALESCE(mm.model_tier,'~') || '|' || COALESCE(mm.provider,'~') || '|' \
+         || COALESCE(CAST(mm.api_input_tokens AS TEXT),'~') || '|' || COALESCE(CAST(mm.api_output_tokens AS TEXT),'~') || '|' \
+         || COALESCE(CAST(mm.api_cache_read_tokens AS TEXT),'~') || '|' || COALESCE(CAST(mm.api_cache_creation_tokens AS TEXT),'~') || '|' \
+         || COALESCE(CAST(mm.api_thinking_tokens AS TEXT),'~') || '|' || COALESCE(mm.api_service_tier,'~') || '|' \
+         || COALESCE(mm.api_data_source,'~') || '|' || COALESCE(CAST(mm.tool_call_count AS TEXT),'~') || '|' \
+         || COALESCE(CAST(mm.has_tool_calls AS TEXT),'~') || '|' || COALESCE(CAST(mm.has_plan AS TEXT),'~') \
+         FROM message_metrics mm JOIN messages m ON m.id = mm.message_id ORDER BY m.idx";
+
+    fn digest_rows(storage: &FrankenStorage, sql: &str) -> Vec<String> {
+        storage
+            .raw()
+            .query_map_collect(sql, fparams![], |row| row.get_typed::<String>(0))
+            .unwrap()
+    }
+
+    fn api_usage(
+        model: &str,
+        input: i64,
+        output: i64,
+        cache_read: i64,
+        cache_create: i64,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "message": {
+                "model": model,
+                "usage": {
+                    "input_tokens": input,
+                    "output_tokens": output,
+                    "cache_read_input_tokens": cache_read,
+                    "cache_creation_input_tokens": cache_create,
+                    "service_tier": "standard"
+                }
+            }
+        })
+    }
+
+    /// 分支覆盖样本（裁定 R-E-41 条件 1）。每条覆盖派生逻辑的一个分支：
+    ///
+    /// | idx | 分支 |
+    /// |---|---|
+    /// | 0 | 无 extra 的 user 消息 → 抽取器兜底 `estimate_tokens_from_content`（`data_source=estimated`、`model_name` NULL） |
+    /// | 1 | 带 API usage 的 assistant 消息（模型 A）→ `data_source=api`、`normalize_model` 走通 |
+    /// | 2 | 另一个模型（模型 B）→ `primary_model` 众数与 `model_family`/`tier` 的第二取值 |
+    /// | 3 | **`historical_raw_json` 信封** → 抽取器必须收到 `Value::Null`（W2-0 §C.4 那道闸） |
+    /// | 4 | `content` 为空且无 usage → `has_token_data()` 为假、五个 token 列全 NULL |
+    /// | 5 | `created_at` 缺失 → `msg_ts` 回落到会话 effective started_at（§B.2 回退规则 A） |
+    /// | 6 | assistant 且 content 含计划 → `has_plan` 为真 |
+    fn branch_coverage_messages() -> Vec<Message> {
+        let mut m3 = msg(
+            3,
+            MessageRole::Assistant,
+            "信封消息",
+            serde_json::Value::Null,
+        );
+        m3.extra_json = wrap_historical_raw_json("{\"raw\":\"line\"}".to_string());
+
+        let mut m5 = msg(
+            5,
+            MessageRole::User,
+            "缺时间戳的消息",
+            serde_json::Value::Null,
+        );
+        m5.created_at = None;
+
+        vec![
+            msg(
+                0,
+                MessageRole::User,
+                "0123456789abcdefghij",
+                serde_json::Value::Null,
+            ),
+            msg(
+                1,
+                MessageRole::Assistant,
+                "模型 A 的回答",
+                api_usage("claude-opus-4-6", 100, 50, 200, 30),
+            ),
+            msg(
+                2,
+                MessageRole::Assistant,
+                "模型 B 的回答",
+                api_usage("claude-sonnet-4-5", 7, 3, 0, 0),
+            ),
+            m3,
+            msg(4, MessageRole::Assistant, "", serde_json::Value::Null),
+            m5,
+            msg(
+                6,
+                MessageRole::Assistant,
+                "## Plan\n\n1. First step\n2. Second step\n3. Third step",
+                serde_json::Value::Null,
+            ),
+        ]
+    }
+
+    #[test]
+    fn e5_replace_derived_rows_match_baseline_path() {
+        // 第二定义等价门（裁定 R-E-41 A′）：同一份消息集，一侧走基线
+        // `insert_conversations_batched`，一侧走 replace 函数，两张派生表逐列相等。
+        let base_dir = TempDir::new().unwrap();
+        let (base_storage, base_agent) = open_storage(&base_dir);
+        // 两侧都带一个真实 workspace_id：`message_metrics.workspace_id` 是
+        // NOT NULL DEFAULT 0（NULL 折叠成 0），`token_usage.workspace_id` 可空不折叠
+        // —— 两套相反口径只有在 workspace 非 None 时才分辨得出来（W2-0 §C.5）。
+        let base_ws = base_storage
+            .ensure_workspace(std::path::Path::new("/fixtures/ws"), Some("ws"))
+            .unwrap();
+        let base_conv = conversation("equiv", branch_coverage_messages());
+        base_storage
+            .insert_conversations_batched(&[(base_agent, Some(base_ws), &base_conv)])
+            .unwrap();
+
+        let repl_dir = TempDir::new().unwrap();
+        let (repl_storage, repl_agent) = open_storage(&repl_dir);
+        let repl_conv_id = seed_original(&repl_storage, repl_agent, "equiv");
+        let repl_ws = repl_storage
+            .ensure_workspace(std::path::Path::new("/fixtures/ws"), Some("ws"))
+            .unwrap();
+        assert_eq!(
+            repl_ws, base_ws,
+            "两侧 workspace_id 必须相同，否则等价门比的是两个身份"
+        );
+        let repl_conv = conversation("equiv", branch_coverage_messages());
+        let pricing = PricingTable::franken_load(repl_storage.raw()).unwrap();
+        let mut tx = repl_storage.raw().transaction().unwrap();
+        franken_replace_conversation_messages_in_tx(
+            &tx,
+            repl_conv_id,
+            repl_agent,
+            Some(repl_ws),
+            &repl_conv,
+            &pricing,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let base_tu = digest_rows(&base_storage, TOKEN_USAGE_DIGEST_SQL);
+        let repl_tu = digest_rows(&repl_storage, TOKEN_USAGE_DIGEST_SQL);
+        assert_eq!(
+            base_tu.len(),
+            branch_coverage_messages().len(),
+            "前置断言：基线侧必须为每条消息各产一行 token_usage，否则本门比的是空集"
+        );
+        assert_eq!(repl_tu, base_tu, "token_usage 逐列必须与基线路径一致");
+
+        let base_mm = digest_rows(&base_storage, MESSAGE_METRICS_DIGEST_SQL);
+        let repl_mm = digest_rows(&repl_storage, MESSAGE_METRICS_DIGEST_SQL);
+        assert_eq!(
+            base_mm.len(),
+            branch_coverage_messages().len(),
+            "前置断言：基线侧必须为每条消息各产一行 message_metrics"
+        );
+        assert_eq!(repl_mm, base_mm, "message_metrics 逐列必须与基线路径一致");
+
+        // 分支确实被覆盖到了（否则等价门可能只比了一堆同形状的行）。
+        let distinct_sources: HashSet<&str> = base_tu
+            .iter()
+            .map(|d| d.rsplit('|').next().unwrap())
+            .collect();
+        assert!(
+            distinct_sources.contains("api") && distinct_sources.contains("estimated"),
+            "样本必须同时覆盖 api 与 estimated 两条抽取分支，实得 {distinct_sources:?}"
+        );
+    }
+
+    #[test]
+    fn e5_replace_writes_eleven_token_summary_columns_unconditionally() {
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open_storage(&dir);
+        let conv_id = seed_original(&storage, agent_id, "summaries");
+
+        // expected 按 `appendix-w2-1.md` §D.4 从**样本**独立算，不从被测库读回
+        // （规定 D-0：读回会让「投影错 blob」与「conversation_id 写错」两类
+        // 自洽错误一起判绿）。样本：
+        //   idx0 user  无 usage、content 20 字节 → 兜底估算 input=5（20/4）
+        //   idx1 assistant model A：input 100 / output 50 / cache_read 200 / cache_create 30
+        //   idx2 assistant model B：input 7 / output 3
+        //   idx3 assistant model B：input 1 / output 1
+        let messages = vec![
+            msg(
+                0,
+                MessageRole::User,
+                "0123456789abcdefghij",
+                serde_json::Value::Null,
+            ),
+            msg(
+                1,
+                MessageRole::Assistant,
+                "A",
+                api_usage("claude-opus-4-6", 100, 50, 200, 30),
+            ),
+            msg(
+                2,
+                MessageRole::Assistant,
+                "B",
+                api_usage("claude-sonnet-4-5", 7, 3, 0, 0),
+            ),
+            msg(
+                3,
+                MessageRole::Assistant,
+                "B2",
+                api_usage("claude-sonnet-4-5", 1, 1, 0, 0),
+            ),
+        ];
+        let new_conv = conversation("summaries", messages);
+
+        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+        let mut tx = storage.raw().transaction().unwrap();
+        franken_replace_conversation_messages_in_tx(
+            &tx, conv_id, agent_id, None, &new_conv, &pricing,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        #[allow(clippy::type_complexity)]
+        let got: (
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+            i64,
+            Option<i64>,
+            i64,
+            i64,
+        ) = storage
+            .raw()
+            .query_row_map(
+                "SELECT total_input_tokens, total_output_tokens, total_cache_read_tokens,
+                        total_cache_creation_tokens, grand_total_tokens, primary_model,
+                        api_call_count, tool_call_count, user_message_count,
+                        assistant_message_count
+                 FROM conversations WHERE id = ?1",
+                fparams![conv_id],
+                |row| {
+                    Ok((
+                        row.get_typed(0)?,
+                        row.get_typed(1)?,
+                        row.get_typed(2)?,
+                        row.get_typed(3)?,
+                        row.get_typed(4)?,
+                        row.get_typed(5)?,
+                        row.get_typed(6)?,
+                        row.get_typed(7)?,
+                        row.get_typed(8)?,
+                        row.get_typed(9)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(got.0, Some(5 + 100 + 7 + 1), "total_input_tokens");
+        assert_eq!(got.1, Some(50 + 3 + 1), "total_output_tokens");
+        assert_eq!(got.2, Some(200), "total_cache_read_tokens");
+        assert_eq!(got.3, Some(30), "total_cache_creation_tokens");
+        assert_eq!(
+            got.4,
+            Some(5 + 380 + 10 + 2),
+            "grand_total_tokens（四类之和，不含 thinking）"
+        );
+        // 【选择】D-5：众数并列时 SQL 无第二排序键，故判 argmax **集合**成员资格。
+        // 本样本 model B 出现两次、model A 一次，argmax 集合是单元素集。
+        let argmax: HashSet<&str> = ["claude-sonnet-4-5"].into_iter().collect();
+        assert!(
+            argmax.contains(got.5.as_deref().unwrap_or("")),
+            "primary_model 必须落在 argmax 集合内，实得 {:?}",
+            got.5
+        );
+        assert_eq!(got.6, 3, "api_call_count 是 COUNT，空集时为 0 不为 NULL");
+        assert_eq!(
+            got.7,
+            Some(0),
+            "tool_call_count 是 SUM 且列 NOT NULL，U 非空即非 NULL"
+        );
+        assert_eq!(got.8, 1, "user_message_count");
+        assert_eq!(got.9, 3, "assistant_message_count");
+    }
+
+    #[test]
+    fn e5_replace_leaves_the_five_accumulating_aggregate_tables_untouched() {
+        // E6 Step 1b 的边界：五张累加型物化聚合表在事务**提交之后**才重算，
+        // 本函数一行都不许碰。边界只写在文档里、没有断言，实现漂过去时不会有东西红。
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open_storage(&dir);
+        let conv_id = seed_original(&storage, agent_id, "aggregates");
+
+        const TABLES: [&str; 5] = [
+            "daily_stats",
+            "token_daily_stats",
+            "usage_hourly",
+            "usage_daily",
+            "usage_models_daily",
+        ];
+        let snapshot = |storage: &FrankenStorage| -> Vec<(String, i64, String)> {
+            TABLES
+                .iter()
+                .map(|t| {
+                    let conn = storage.raw();
+                    let count: i64 = conn
+                        .query_row_map(&format!("SELECT COUNT(*) FROM {t}"), fparams![], |row| {
+                            row.get_typed(0)
+                        })
+                        .unwrap();
+                    // 行数之外再取一份内容摘要，否则「删一行加一行」会看不出来。
+                    let digest: String = conn
+                        .query_row_map(
+                            &format!("SELECT COALESCE(GROUP_CONCAT(x, ';'), '') FROM (SELECT CAST(rowid AS TEXT) || ':' || COALESCE(CAST(last_updated AS TEXT),'~') AS x FROM {t} ORDER BY rowid)"),
+                            fparams![],
+                            |row| row.get_typed(0),
+                        )
+                        .unwrap();
+                    ((*t).to_string(), count, digest)
+                })
+                .collect()
+        };
+
+        let before = snapshot(&storage);
+        assert!(
+            before.iter().any(|(_, count, _)| *count > 0),
+            "前置断言：五张表里至少有一张非空，否则本用例在比两组空集"
+        );
+
+        let new_conv = replacement("aggregates");
+        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+        let mut tx = storage.raw().transaction().unwrap();
+        franken_replace_conversation_messages_in_tx(
+            &tx, conv_id, agent_id, None, &new_conv, &pricing,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(
+            snapshot(&storage),
+            before,
+            "五张累加型物化聚合表必须逐行不变 —— 它们归 E6 Step 1b 的提交后重算"
+        );
+    }
+
+    #[test]
+    fn e5_replace_keeps_partial_tail_when_new_messages_have_no_timestamps() {
+        // 「消息没有 created_at」是本仓明确处理过的形态（`timestamp_data_incomplete`）。
+        // 这条用例锁住：tail 回写必须走收 Option 的写入器 —— 换成要求
+        // (idx, created_at) 同时已知的那个，本用例会看到热表整行缺失。
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open_storage(&dir);
+        let conv_id = seed_original(&storage, agent_id, "no-ts");
+
+        let mut messages = replacement("no-ts").messages;
+        for m in messages.iter_mut() {
+            m.created_at = None;
+        }
+        let new_conv = conversation("no-ts", messages);
+
+        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+        let mut tx = storage.raw().transaction().unwrap();
+        franken_replace_conversation_messages_in_tx(
+            &tx, conv_id, agent_id, None, &new_conv, &pricing,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let seen: (Option<i64>, Option<i64>) = storage
+            .raw()
+            .query_row_map(
+                "SELECT last_message_idx, last_message_created_at
+                 FROM conversation_tail_state WHERE conversation_id = ?1",
+                fparams![conv_id],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            seen.0,
+            Some(1),
+            "已知的 last_message_idx 不得因为 created_at 缺失而一并丢掉"
+        );
+        assert_eq!(
+            seen.1, None,
+            "未知的 created_at 应当是 NULL，而不是被编造一个值"
+        );
+    }
+
+    #[test]
+    fn e5_replace_clears_the_hot_tail_row_for_a_fully_empty_replacement() {
+        // 这是热表 DELETE **唯一**承重的输入形态：新内容既无消息也无 ended_at，
+        // 于是回写侧三个值全 None、`franken_insert_conversation_tail_state` 直接早退，
+        // 没有任何写回能覆盖掉重置前的陈旧行。去掉热表 DELETE，本用例即红。
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open_storage(&dir);
+        let conv_id = seed_original(&storage, agent_id, "empty-replacement");
+
+        {
+            let conn = storage.raw();
+            conn.execute_compat(
+                "UPDATE conversation_tail_state
+                 SET last_message_idx = 99, last_message_created_at = ?1, ended_at = ?1
+                 WHERE conversation_id = ?2",
+                fparams![TS + 900_000, conv_id],
+            )
+            .unwrap();
+        }
+        let stale: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM conversation_tail_state WHERE conversation_id = ?1",
+                fparams![conv_id],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(stale, 1, "前置断言：重置之前热表确实有一行陈旧 tail");
+
+        let mut empty = conversation("empty-replacement", vec![]);
+        empty.started_at = None;
+        empty.ended_at = None;
+
+        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+        let mut tx = storage.raw().transaction().unwrap();
+        franken_replace_conversation_messages_in_tx(&tx, conv_id, agent_id, None, &empty, &pricing)
+            .unwrap();
+        tx.commit().unwrap();
+
+        let remaining: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM conversation_tail_state WHERE conversation_id = ?1",
+                fparams![conv_id],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0, "热表的陈旧 tail 行必须被重置掉");
     }
 }
