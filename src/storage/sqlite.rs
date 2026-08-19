@@ -29905,4 +29905,80 @@ mod e5_replace_tests {
             "第一次 replace 写的 token_usage 旧行必须已被删除"
         );
     }
+
+    // ---------------------------------------------------------------------
+    // §B.11 P13 · extra 编码：在**解码后的 JSON 值域**比对，不用文本探针
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn e5_p13_extra_round_trips_in_the_decoded_json_domain_not_as_text() {
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open_storage(&dir);
+        let conv_id = seed_original(&storage, agent_id, "p13");
+
+        // 样本刻意含一个 **NUL**（`\u{0000}`）：msgpack 编码后它是一个真实的 0 字节，
+        // 而 SQL 侧的 `CAST(extra_bin AS TEXT)` 会在那里截断 —— 本仓已经因为这个
+        // 截断报过一次错误的统计数字。下面同时断言两件事：解码域比对相等，
+        // **且**文本探针在这份样本上确实是有损的（给「为什么 P13 禁文本探针」留实证）。
+        let extra = serde_json::json!({
+            "raw_role": "assistant",
+            "nested": { "b": 2, "a": [1, "二", null] },
+            "with_nul": "before\u{0000}after",
+            "unicode": "中文与 emoji 🌱",
+        });
+        let new_conv = conversation(
+            "p13",
+            vec![msg(
+                0,
+                MessageRole::Assistant,
+                "带复杂 extra 的一条",
+                extra.clone(),
+            )],
+        );
+
+        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+        let mut tx = storage.raw().transaction().unwrap();
+        franken_replace_conversation_messages_in_tx(
+            &tx, conv_id, agent_id, None, &new_conv, &pricing,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        // 用**生产的解码器**读回，不自己再写一遍解码规则。
+        let decoded: serde_json::Value = storage
+            .raw()
+            .query_row_map(
+                "SELECT extra_json, extra_bin FROM messages WHERE conversation_id = ?1",
+                fparams![conv_id],
+                |row| Ok(franken_read_message_extra_compat(row, 0, 1)),
+            )
+            .unwrap();
+        assert_eq!(
+            decoded, extra,
+            "extra 必须在**解码后的 JSON 值域**上与投影产物相等（含键序无关的结构相等、\
+             NUL 与非 ASCII 原样保真）"
+        );
+
+        // 分辨力旁证：同一行用文本探针看，长度会短一截（NUL 处截断），
+        // 也就是说「用 CAST 比对」在这份样本上会得出错误结论 —— P13 禁它不是洁癖。
+        let (bin_len, text_len): (i64, i64) = storage
+            .raw()
+            .query_row_map(
+                "SELECT LENGTH(extra_bin), LENGTH(CAST(extra_bin AS TEXT))
+                 FROM messages WHERE conversation_id = ?1",
+                fparams![conv_id],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )
+            .unwrap();
+        assert!(
+            bin_len > 0,
+            "前置断言：这条消息的 extra 必须真的以 msgpack 落在 `extra_bin` 上，\
+             否则下面这条文本探针的对照没有意义"
+        );
+        assert!(
+            text_len < bin_len,
+            "分辨力断言：文本探针必须在这份含 NUL 的样本上**丢字节**（{text_len} < {bin_len}）；\
+             若两者相等，说明这份样本压根没触发截断，本条旁证不成立"
+        );
+    }
 }

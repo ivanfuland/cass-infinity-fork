@@ -3493,6 +3493,116 @@ mod e5_materialization_tests {
     /// 这条不是「过滤噪声」这种可商量的优化，是上位 §5.2 的硬约束由 parser 的 guard 实现。
     /// 若哪天它开始产消息，canonical 语料会静默多出一整类系统提示词，而下游画像会把它
     /// 当成用户内容——正是上位那条约束要防的东西。
+
+    // =======================================================================
+    // §B.11 P4 · content 的**字节级**格式（§B.1.1）
+    //
+    // 仍是契约验证，不是红转绿。P4 的判据是「与 §B.1.1 钉死的字节格式逐字节相等
+    // （含 compact JSON 的 `Display` 形式与 `\n` 连接规则）」，所以这一组一律断言
+    // **完整字符串**，不写 `contains`。
+    // =======================================================================
+
+    /// 一条 tool_use，`input` 的键在源文本里是 `zebra` 在前、`alpha` 在后。
+    ///
+    /// **这份样本的键序是刻意反字典序的**：§B.1.1 明写 object 键序 = 源 JSON 文本里的
+    /// 出现顺序（插入序），而这一点**由 `serde_json` 的 `preserve_order` feature 决定**
+    /// —— 附录同时警告「若将来某次构建把该 feature 解析掉，`Display` 会**静默**改回
+    /// 字典序、content 字节随之全变」。字典序下这条会渲染成 `{"alpha":2,"zebra":1}`，
+    /// 于是本用例立刻转红。**这就是给那条 feature 依赖装的机器守卫。**
+    const CLAUDE_TOOL_ARGS_KEY_ORDER: &str = concat!(
+        r#"{"type":"assistant","timestamp":"2025-12-01T10:00:00Z","message":{"role":"assistant","model":"claude-opus-5","content":[{"type":"tool_use","id":"toolu_key","name":"Grep","input":{"zebra":1,"alpha":2}}]}}"#,
+        "\n",
+    );
+
+    /// `input` 为 JSON `null` 的 tool_use：§B.1.1 规定「args 是 null」与「无 args」
+    /// 渲染结果相同 —— 都是 bare name。
+    const CLAUDE_TOOL_NULL_ARGS: &str = concat!(
+        r#"{"type":"assistant","timestamp":"2025-12-01T10:00:00Z","message":{"role":"assistant","model":"claude-opus-5","content":[{"type":"tool_use","id":"toolu_null","name":"Bash","input":null}]}}"#,
+        "\n",
+    );
+
+    /// **tool_result** 的 content 数组里夹一个空片段与一个非白名单块。
+    ///
+    /// 走的是 `render_tool_result_content(Some(Array)) → flatten_content(该数组)` 这条路
+    /// （§B.1.1 点名），于是「丢弃 `None` 与空串、其余用**单个** `\n` 连接」这条规则
+    /// 才是本用例的判据。
+    ///
+    /// **⚠ 这里刻意不用 user 消息的 content 数组**：那条路走的是
+    /// `split_content_blocks` 的 typed 分支，不是 `flatten_content`，两者对空片段的
+    /// 处置不同（本棒第一版就把样本放在 user 消息上，实测拿到 `"first\n\nsecond"`
+    /// —— 差点据此报「附录写错了」，回去读 pin 上的 `flatten_content` 才发现它确实
+    /// 丢空串，是我把判据挂到了另一个函数上）。
+    const CLAUDE_FLATTEN_JOIN: &str = concat!(
+        r#"{"type":"assistant","timestamp":"2025-12-01T10:00:00Z","message":{"role":"assistant","model":"claude-opus-5","content":[{"type":"tool_use","id":"toolu_fl","name":"Read","input":{"path":"/x"}}]}}"#,
+        "\n",
+        r#"{"type":"user","timestamp":"2025-12-01T10:00:01Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_fl","content":[{"type":"text","text":"first"},{"type":"text","text":""},{"type":"image","source":{"data":"zz"}},{"type":"text","text":"second"}]}]}}"#,
+        "\n",
+    );
+
+    fn project_claude_bytes(tag: &str, raw: &str) -> Box<NormalizedConversation> {
+        let root = scratch(tag);
+        let bytes = raw.as_bytes();
+        let input = claude_source(CLAUDE_PATH, bytes);
+        match project_sealed_source(&root, &input, &test_provenance()).unwrap() {
+            SealedProjection::Projected(conv) => conv,
+            other => panic!("期望 Projected，实得 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn contract_p4_tool_call_content_is_compact_json_in_source_key_order() {
+        let conv = project_claude_bytes("b11-p4-keyorder", CLAUDE_TOOL_ARGS_KEY_ORDER);
+        let tool_calls: Vec<&_> = conv
+            .messages
+            .iter()
+            .filter(|m| m.role == "tool_call")
+            .collect();
+        assert_eq!(
+            tool_calls.len(),
+            1,
+            "前置断言：样本必须恰好产一条 tool_call，否则下面断的可能是别的消息"
+        );
+        assert_eq!(
+            tool_calls[0].content, r#"Grep({"zebra":1,"alpha":2})"#,
+            "content 必须是 `name(compact JSON)`，且 object 键序 = **源文本出现顺序**。\
+             读到 `{{\"alpha\":2,\"zebra\":1}}` 说明 `serde_json` 的 `preserve_order` \
+             feature 在本次构建里没生效 —— 那会让全部 content 字节静默改变，\
+             此前算出的 content hash 全部作废（§B.1.1 明写该规则是 feature 的函数）"
+        );
+    }
+
+    #[test]
+    fn contract_p4_null_args_render_as_the_bare_name() {
+        let conv = project_claude_bytes("b11-p4-nullargs", CLAUDE_TOOL_NULL_ARGS);
+        let tool_calls: Vec<&_> = conv
+            .messages
+            .iter()
+            .filter(|m| m.role == "tool_call")
+            .collect();
+        assert_eq!(tool_calls.len(), 1, "前置断言：恰一条 tool_call");
+        assert_eq!(
+            tool_calls[0].content, "Bash",
+            "`args` 为 JSON `null` 时必须渲染成 bare name（与「无 args」同形）；\
+             渲染成 `Bash(null)` 即违反 §B.1.1"
+        );
+    }
+
+    #[test]
+    fn contract_p4_flatten_content_joins_with_a_single_newline_and_drops_empties() {
+        let conv = project_claude_bytes("b11-p4-flatten", CLAUDE_FLATTEN_JOIN);
+        let results: Vec<&_> = conv
+            .messages
+            .iter()
+            .filter(|m| m.role == "tool_result")
+            .collect();
+        assert_eq!(results.len(), 1, "前置断言：恰一条 tool_result 消息");
+        assert_eq!(
+            results[0].content, "first\nsecond",
+            "空串片段与非白名单块（`image`）必须被丢弃，其余用**单个** `\\n` 连接；\
+             读到 `first\\n\\nsecond` 说明空片段没丢，读到 `first second` 说明连接符不对"
+        );
+    }
+
     #[test]
     fn contract_codex_developer_role_produces_no_message() {
         let conv = project_codex("b11-codex-dev", CODEX_ALL_BRANCHES.as_bytes());
