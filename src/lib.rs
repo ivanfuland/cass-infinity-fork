@@ -666,6 +666,68 @@ pub enum Commands {
         json: bool,
     },
 
+    /// Plan (and optionally apply) a restore from the sealed raw-mirror into a
+    /// candidate database. **Dry-run by default: nothing is written.**
+    MirrorRestore {
+        /// mirror 面的根。**入参而非常量** —— E8 给封存件只读面，
+        /// E8b 换 materialize 出来的可写工作树。
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+
+        /// 候选 DB 的稳定副本。dry-run 只读它。
+        ///
+        /// **叫 `--candidate-db` 不叫 `--db`**：顶层 `Cli` 已经有一个全局 `--db`
+        /// （`src/lib.rs` 的 `pub struct Cli`），同名会被参数恢复层提到最前、
+        /// 让整个子命令解析崩掉（本棒实测：报的是「unexpected argument '--scratch'」，
+        /// 与真因隔着两层）。全局名复用成另一个含义，是日后必然咬人的歧义。
+        #[arg(long)]
+        candidate_db: PathBuf,
+
+        /// 投影物化用的隔离根。**不进任何判定**。
+        #[arg(long)]
+        scratch: PathBuf,
+
+        /// 本轮消费的封存件根。
+        #[arg(long)]
+        snapshot_root: String,
+
+        /// 六类计数与 HOLD 清单的落点（JSON）。不给则只打印摘要。
+        #[arg(long)]
+        out: Option<PathBuf>,
+
+        /// 真正执行计划。**不给这个 flag 什么都不写。**
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+
+        /// 崩溃后收敛：**输入只有磁盘上的 journal + receipt**。
+        /// 没有这个入口，七态恢复器就只有测试能调 —— 而操作者在真崩之后无路可走。
+        #[arg(long, default_value_t = false)]
+        recover: bool,
+
+        /// 只跑**解析级资格门**（不写任何东西）：解析 W1 commit marker 并逐层复核
+        /// journal 终态 / closure verdict / 双身份 / receipt 交叉核 / 代际。
+        #[arg(long, default_value_t = false)]
+        qualify: bool,
+
+        /// `--apply` 的 journal 落点（七态状态机的真源）。`--apply` 时必需。
+        #[arg(long)]
+        journal: Option<PathBuf>,
+
+        /// W1 commit marker 的落点。**不给则默认与候选 DB 同居**
+        /// （`<db 所在目录>/w1-commit-marker.json`）—— wire 说明定的就是这个约定，
+        /// 由 CLI 兑现它，而不是让每个调用方自己拼一遍。
+        #[arg(long)]
+        marker: Option<PathBuf>,
+
+        /// 本次 restore 推进到的内容代际。`--apply` 时必需。
+        #[arg(long)]
+        generation: Option<String>,
+
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+    },
+
     Stats {
         /// Override data dir
         #[arg(long)]
@@ -3140,6 +3202,70 @@ fn recover_robot_docs_topic_shorthands(rest: &mut Vec<String>, corrections: &mut
     corrections.push(format!(
         "'{alias}' → 'robot-docs {topic}' (robot-docs topic shorthand)"
     ));
+}
+
+/// 裁定 R-E-63 的回归钉死：两个 `mirror-*` 子命令带 `--json` 必须**直解析到位**，
+/// 不经参数恢复层重排。
+///
+/// 起因是实测：`mirror-restore --json` 被恢复层在前面插了个 `search`
+/// （`normalized_attempt`: `search mirror-restore …`），报错却报在下一个不认识的 flag 上，
+/// 与真因隔着一层重写。`mirror-relink` 当时能过，是因为它与表里的 `"mirror"`
+/// **模糊匹配**上了 —— **能用但脆**：这张表再多一个近似词就可能改变匹配结果。
+#[cfg(test)]
+mod mirror_subcommand_recovery_regression_tests {
+    use super::*;
+
+    #[test]
+    fn mirror_subcommands_with_json_are_not_rewritten_to_search() {
+        for sub in ["mirror-relink", "mirror-restore"] {
+            let mut rest = vec![
+                sub.to_string(),
+                "--data-dir".to_string(),
+                "/tmp/x".to_string(),
+                "--json".to_string(),
+            ];
+            let before = rest.clone();
+            let mut corrections = Vec::new();
+            recover_implicit_robot_search_query(&mut rest, &mut corrections);
+            assert_eq!(
+                rest, before,
+                "`{sub} --json` 不得被恢复层改写 —— 它是真子命令，不是隐式查询"
+            );
+            assert!(
+                corrections.is_empty(),
+                "`{sub} --json` 不该产生任何 correction，实得 {corrections:?}"
+            );
+        }
+    }
+
+    /// **阳性对照**：真正的隐式查询仍必须被恢复。
+    /// 没有这一条，上面那条可能只是因为这个函数什么都不做而恒绿。
+    #[test]
+    fn an_actual_implicit_query_is_still_recovered() {
+        let mut rest = vec!["kubernetes crash loop".to_string(), "--json".to_string()];
+        let mut corrections = Vec::new();
+        recover_implicit_robot_search_query(&mut rest, &mut corrections);
+        assert!(
+            !corrections.is_empty(),
+            "隐式查询必须仍被恢复，否则上面那条用例证明不了任何事"
+        );
+        assert_ne!(
+            rest.first().map(String::as_str),
+            Some("kubernetes crash loop"),
+            "恢复后首个 token 应当是被插入的命令名"
+        );
+    }
+
+    /// 两个子命令都必须在 canonical 命令表里 —— **不靠模糊匹配**。
+    #[test]
+    fn both_mirror_subcommands_are_canonical() {
+        for sub in ["mirror-relink", "mirror-restore"] {
+            assert!(
+                CANONICAL_TOP_LEVEL_COMMANDS.contains(&sub),
+                "{sub} 必须显式在 CANONICAL_TOP_LEVEL_COMMANDS 内（裁定 R-E-63）"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -5856,6 +5982,14 @@ const CANONICAL_TOP_LEVEL_COMMANDS: &[&str] = &[
     "swarm",
     "timeline",
     "mirror",
+    // 裁定 R-E-63：两个 `mirror-*` 子命令都要显式在表内。
+    //
+    // `mirror-relink` 今天不在表里也能用 —— 它靠与 `"mirror"` 的**模糊匹配**侥幸过关；
+    // `mirror-restore` 距离更远就匹配不上，于是带 `--json` 时被参数恢复层当成搜索查询、
+    // 在前面插了个 `search`（实测 `normalized_attempt`：`search mirror-restore …`）。
+    // **把正确性押在模糊匹配的当前形状上，等于给下一个改这张表的人留雷。**
+    "mirror-relink",
+    "mirror-restore",
     "export",
     "export-html",
     "pages",
@@ -6525,6 +6659,7 @@ async fn execute_cli(
         | Commands::Pack { .. }
         | Commands::Stats { .. }
         | Commands::MirrorRelink { .. }
+        | Commands::MirrorRestore { .. }
         | Commands::Diag { .. }
         | Commands::Storage { .. }
         | Commands::Dedup { .. }
@@ -6811,6 +6946,223 @@ async fn execute_cli(
                         eff_timeout,
                         wrap,
                     )?;
+                }
+                Commands::MirrorRestore {
+                    data_dir,
+                    candidate_db,
+                    scratch,
+                    snapshot_root,
+                    out,
+                    apply,
+                    recover,
+                    qualify,
+                    journal,
+                    marker,
+                    generation,
+                    json,
+                } => {
+                    let resolved = data_dir.clone().unwrap_or_else(default_data_dir);
+                    let options = crate::phase3_restore::MirrorRestorePlanOptions {
+                        data_dir: resolved,
+                        db_path: candidate_db.clone(),
+                        scratch_dir: scratch.clone(),
+                        snapshot_root: snapshot_root.clone(),
+                    };
+                    let fail = |kind: &'static str, err: String| CliError {
+                        code: 1,
+                        kind,
+                        message: err,
+                        hint: None,
+                        retryable: false,
+                    };
+                    // ── --qualify：只解析、只复核，**不产计划也不写任何东西** ──
+                    if qualify {
+                        let marker_path = default_w1_marker_path(marker.as_ref(), &options.db_path);
+                        let journal_path = journal.clone().ok_or_else(|| {
+                            fail(
+                                "mirror_restore_qualify_needs_journal",
+                                "--qualify requires --journal".to_string(),
+                            )
+                        })?;
+                        let verdict = crate::phase3_restore::qualify_w1_candidate(
+                            &crate::phase3_restore::W1QualificationInput {
+                                marker_path: &marker_path,
+                                journal_path: &journal_path,
+                                db_path: &options.db_path,
+                                data_dir: &options.data_dir,
+                            },
+                        );
+                        return match verdict {
+                            Ok(marker) => {
+                                if json {
+                                    println!(
+                                        "{}",
+                                        serde_json::json!({
+                                            "qualified": true,
+                                            "operation_id": marker.operation_id,
+                                            "snapshot_root": marker.snapshot_root,
+                                            "content_generation": marker.content_generation,
+                                            "planned_count": marker.planned_count,
+                                        })
+                                    );
+                                } else {
+                                    println!(
+                                        "qualified: operation={} snapshot_root={} generation={}",
+                                        marker.operation_id,
+                                        marker.snapshot_root,
+                                        marker.content_generation
+                                    );
+                                }
+                                Ok(())
+                            }
+                            // **每层以自己的名义拒绝**：错误码原样带出，不折叠成一句「不合格」。
+                            Err(err) => Err(CliError {
+                                code: 1,
+                                kind: "mirror_restore_not_qualified",
+                                message: format!("{}: {err}", err.code()),
+                                hint: None,
+                                retryable: false,
+                            }),
+                        };
+                    }
+
+                    // ── --recover：入参只有 journal 路径（R-E-19 第三条）──────
+                    if recover {
+                        let journal_path = journal.clone().ok_or_else(|| {
+                            fail(
+                                "mirror_restore_recover_needs_journal",
+                                "--recover requires --journal".to_string(),
+                            )
+                        })?;
+                        let outcome = crate::phase3_restore::restore_recover(&journal_path)
+                            .map_err(|err| {
+                                fail("mirror_restore_recover_failed", err.to_string())
+                            })?;
+                        let state = crate::phase3_restore::restore_journal_read(&journal_path)
+                            .map_err(|err| {
+                                fail("mirror_restore_recover_failed", err.to_string())
+                            })?
+                            .map(|j| format!("{:?}", j.state))
+                            .unwrap_or_else(|| "missing".to_string());
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "recovered": true,
+                                    "journal_state": state,
+                                    "restored": outcome.restored,
+                                    "replaced": outcome.replaced,
+                                    "published": outcome.published,
+                                    "receipt_keys": outcome.receipt_keys,
+                                })
+                            );
+                        } else {
+                            println!(
+                                "recovered: journal_state={state} restored={} replaced={} published={}",
+                                outcome.restored, outcome.replaced, outcome.published
+                            );
+                        }
+                        return Ok(());
+                    }
+
+                    let report = crate::phase3_restore::plan_mirror_restore(&options)
+                        .map_err(|err| fail("mirror_restore_plan_failed", err.to_string()))?;
+
+                    let summary = serde_json::json!({
+                        "identities_considered": report.identities_considered,
+                        "skip": report.census.skip,
+                        "restore": report.census.restore,
+                        "replace": report.census.replace,
+                        "hold_superset": report.census.hold_superset,
+                        "hold_diverged": report.census.hold_diverged,
+                        "hold_multiple_candidates": report.census.hold_multiple_candidates,
+                        "non_relation_holds": report.non_relation_holds,
+                        "candidate_versions_seen": report.candidate_versions_seen,
+                        "holds": report.holds.len(),
+                        "planned_actions": report.plan.len(),
+                        "non_promotable": true,
+                    });
+                    if let Some(path) = out.as_ref() {
+                        if let Some(parent) = path.parent() {
+                            std::fs::create_dir_all(parent)
+                                .map_err(|e| fail("mirror_restore_out_failed", e.to_string()))?;
+                        }
+                        let bytes = serde_json::to_vec_pretty(&summary)
+                            .map_err(|e| fail("mirror_restore_out_failed", e.to_string()))?;
+                        std::fs::write(path, bytes)
+                            .map_err(|e| fail("mirror_restore_out_failed", e.to_string()))?;
+                    }
+
+                    if apply {
+                        let journal_path = journal.clone().ok_or_else(|| {
+                            fail(
+                                "mirror_restore_apply_needs_journal",
+                                "--apply requires --journal".to_string(),
+                            )
+                        })?;
+                        let marker_path = default_w1_marker_path(marker.as_ref(), &options.db_path);
+                        let generation = generation.clone().ok_or_else(|| {
+                            fail(
+                                "mirror_restore_apply_needs_generation",
+                                "--apply requires --generation".to_string(),
+                            )
+                        })?;
+                        let plan = crate::phase3_restore::RestoreRunPlan {
+                            operation_id: format!("mirror-restore:{snapshot_root}"),
+                            data_dir: options.data_dir.clone(),
+                            scratch_dir: options.scratch_dir.clone(),
+                            db_path: options.db_path.clone(),
+                            marker_path,
+                            snapshot_root: options.snapshot_root.clone(),
+                            generation,
+                            planned: report.plan.clone(),
+                        };
+                        let outcome =
+                            crate::phase3_restore::restore_apply_journaled(plan, &journal_path)
+                                .map_err(|err| {
+                                    fail("mirror_restore_apply_failed", err.to_string())
+                                })?;
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "applied": true,
+                                    "restored": outcome.restored,
+                                    "replaced": outcome.replaced,
+                                    "published": outcome.published,
+                                    "messages_inserted": outcome.messages_inserted,
+                                    "messages_deleted": outcome.messages_deleted,
+                                    "receipt_keys": outcome.receipt_keys,
+                                })
+                            );
+                        } else {
+                            println!(
+                                "applied: restored={} replaced={} published={} \
+                                 messages(+{}/-{}) receipts={}",
+                                outcome.restored,
+                                outcome.replaced,
+                                outcome.published,
+                                outcome.messages_inserted,
+                                outcome.messages_deleted,
+                                outcome.receipt_keys.len()
+                            );
+                        }
+                    } else if json {
+                        println!("{summary}");
+                    } else {
+                        println!(
+                            "dry-run: {} identities; skip={} restore={} replace={} holds={} \
+                             other-holds={} candidate-versions={} planned={} (non-promotable)",
+                            report.identities_considered,
+                            report.census.skip,
+                            report.census.restore,
+                            report.census.replace,
+                            report.holds.len(),
+                            report.non_relation_holds,
+                            report.candidate_versions_seen,
+                            report.plan.len(),
+                        );
+                    }
                 }
                 Commands::MirrorRelink {
                     data_dir,
@@ -19517,6 +19869,19 @@ mod watch_once_resolution_tests {
     }
 }
 
+/// W1 commit marker 的落点：显式给了就用，没给就与候选 DB 同居。
+///
+/// **文件名常量只有这一处消费方**——把约定写在一处、由这里兑现，
+/// 比让每个调用方各拼一遍字符串安全（拼错了是静默产生第二份 marker）。
+fn default_w1_marker_path(explicit: Option<&PathBuf>, db_path: &std::path::Path) -> PathBuf {
+    explicit.cloned().unwrap_or_else(|| {
+        db_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join(crate::phase3_restore::W1_COMMIT_MARKER_FILENAME)
+    })
+}
+
 fn describe_command(cli: &Cli) -> String {
     match &cli.command {
         Some(Commands::Tui { .. }) => "tui".to_string(),
@@ -19524,6 +19889,7 @@ fn describe_command(cli: &Cli) -> String {
         Some(Commands::Search { .. }) => "search".to_string(),
         Some(Commands::Pack { .. }) => "pack".to_string(),
         Some(Commands::MirrorRelink { .. }) => "mirror-relink".to_string(),
+        Some(Commands::MirrorRestore { .. }) => "mirror-restore".to_string(),
         Some(Commands::Stats { .. }) => "stats".to_string(),
         Some(Commands::Diag { .. }) => "diag".to_string(),
         Some(Commands::Storage { .. }) => "storage".to_string(),

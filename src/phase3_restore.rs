@@ -93,6 +93,13 @@ pub enum VersionSource {
     Sealed,
     /// raw-mirror manifest 指向的 blob，字节范围是整个 blob。
     Mirror,
+    /// **候选 DB 侧**由 `reconstruct_source_jsonl_for_conversation` 重建出来的字节
+    /// （裁定 R-E-57）。
+    ///
+    /// 加这一格而不是复用 `Sealed`/`Mirror`：本字段只作诊断（`compare_bytes_layer`
+    /// 与 `select_winner` 都不读它），但**诊断字段说谎的代价会在歧义表被人读的时候才付**
+    /// —— 一条标着 `Mirror` 的 DB 侧版本，会让读表的人去 mirror 里找一个不存在的东西。
+    CandidateDb,
 }
 
 /// 一个已归一化的内容版本。
@@ -2212,8 +2219,34 @@ const COMPACT_INVARIANT_EXTRA_KEYS: [&str; 5] = [
 ];
 
 /// 一条 canonical 消息的 compact 不变摘要。
-fn compact_invariant_message_digest(
+/// 摘要的字段范围。**两侧必须用同一个 scope 才可比。**
+///
+/// 存在的理由是一个结构性事实（裁定 R-E-59）：**候选 DB 里没有 `invocations` 这一格**
+/// —— `crate::model::types::Message` 的字段集是
+/// `{id, idx, role, author, created_at, content, extra_json, snippets}`，
+/// `map_to_internal` 在那一步就把 `invocations` 丢了。拿它做比较等于比一个
+/// **双方都无法表达**的字段，含工具调用的会话会被判成假分叉，污染六类计数。
+///
+/// **`invocations` 不参与比较，损失的到底是什么（R-E-59 义务 ④）**：
+/// invocation 的身份**大部分经由 `extra` 幸存** —— `COMPACT_INVARIANT_EXTRA_KEYS`
+/// 里含 `tool_call_args` 与 `tool_call_id`，两者都进摘要，且 E5 的契约用例 P7 断言
+/// 「args 非缺失时 `extra.tool_call_args` 与 `invocations[0].arguments` 是同一个 JSON 值」。
+/// 真正落在比较之外的只有 **`kind` 与 `name`** 这一层粒度。
+/// **所以这句不能被读宽成「工具调用不比了」** —— 调用参数与 call_id 照比不误。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DigestScope {
+    /// 投影侧全字段（含 `invocations`），W1-0 §B 的完整口径。
+    Projection,
+    /// 候选 DB 可复原的字段集：全字段**减去** `invocations`。
+    CandidateComparable,
+}
+
+/// **唯一的摘要定义**（R-E-59 义务 ①）：两个 scope 共用这一个函数体，
+/// 差别只有末尾那一格进不进。复制一份「候选侧专用实现」就是第二定义，
+/// 而两份实现「算得一样」本身还要再验一次。
+fn compact_invariant_message_digest_scoped(
     message: &franken_agent_detection::types::NormalizedMessage,
+    scope: DigestScope,
 ) -> CanonicalMessageDigest {
     let mut hasher = blake3::Hasher::new();
     let mut field = |label: &str, bytes: &[u8]| {
@@ -2239,20 +2272,24 @@ fn compact_invariant_message_digest(
             ),
         }
     }
-    field(
-        "invocations",
-        serde_json::to_string(&message.invocations)
-            .unwrap_or_default()
-            .as_bytes(),
-    );
+    if matches!(scope, DigestScope::Projection) {
+        field(
+            "invocations",
+            serde_json::to_string(&message.invocations)
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+    }
     CanonicalMessageDigest(*hasher.finalize().as_bytes())
 }
 
-impl MessageSequenceProjector for SealedMessageProjector<'_> {
-    fn project(
+impl SealedMessageProjector<'_> {
+    /// 投影并按指定 scope 出摘要。**trait 入口与候选可比入口共用这一条路径**
+    /// —— 分解点选在这里，是为了不动本结构体的公开字段（冻结面零改动）。
+    fn project_with_scope(
         &self,
-        _origin: &OriginNamespace,
         normalized_bytes: &[u8],
+        scope: DigestScope,
     ) -> Result<Vec<CanonicalMessageDigest>, ProjectionError> {
         // 每次投影落在一个由**字节内容**定名的子目录里。
         //
@@ -2317,8 +2354,36 @@ impl MessageSequenceProjector for SealedMessageProjector<'_> {
         Ok(conv
             .messages
             .iter()
-            .map(compact_invariant_message_digest)
+            .map(|m| compact_invariant_message_digest_scoped(m, scope))
             .collect())
+    }
+}
+
+impl MessageSequenceProjector for SealedMessageProjector<'_> {
+    fn project(
+        &self,
+        _origin: &OriginNamespace,
+        normalized_bytes: &[u8],
+    ) -> Result<Vec<CanonicalMessageDigest>, ProjectionError> {
+        self.project_with_scope(normalized_bytes, DigestScope::Projection)
+    }
+}
+
+/// 与候选 DB 可比的投影器：同一条投影路径，只是摘要按
+/// [`DigestScope::CandidateComparable`] 取（裁定 R-E-59）。
+///
+/// **不是另一个投影实现**——它转调 [`SealedMessageProjector::project_with_scope`]，
+/// 差别只有一个 scope 值。
+pub(crate) struct CandidateComparableProjector<'a>(pub SealedMessageProjector<'a>);
+
+impl MessageSequenceProjector for CandidateComparableProjector<'_> {
+    fn project(
+        &self,
+        _origin: &OriginNamespace,
+        normalized_bytes: &[u8],
+    ) -> Result<Vec<CanonicalMessageDigest>, ProjectionError> {
+        self.0
+            .project_with_scope(normalized_bytes, DigestScope::CandidateComparable)
     }
 }
 
@@ -4115,7 +4180,6 @@ mod e5_materialization_tests {
 // **移除义务已从 E6 改挂 E8**（本棒实测更正）：E6 落了编排之后这三个符号**仍然**不可达
 // —— dead-code 从可达根传递判定，而编排自己也还没有调用方。真正的根是 E8 把
 // `mirror-restore --apply` 的 CLI 接上那一刻。
-#[allow(dead_code)]
 pub(crate) enum SealedBlobOutcome {
     /// 读到了，且已通过 doctor 侧的强校验（blake3 + 长度）。
     Loaded(Vec<u8>),
@@ -4129,7 +4193,6 @@ pub(crate) enum SealedBlobOutcome {
 ///
 /// 复用 doctor 侧的收集器而不是自己走一遍目录：manifest 的磁盘格式、校验口径、
 /// 「什么叫 verified」这三件事只能有一个定义。
-#[allow(dead_code)]
 pub(crate) fn collect_sealed_manifest_reports(
     data_dir: &Path,
 ) -> Vec<crate::DoctorRawMirrorManifestReport> {
@@ -4143,7 +4206,6 @@ pub(crate) fn collect_sealed_manifest_reports(
 /// 本函数只做一件它做不了的事：**把「blob 不在」从它那个扁平的 `Err(String)` 里分出来**。
 /// 分法不是匹配错误文本，而是读 doctor 校验阶段已经定好的 `blob_checksum_status`
 /// —— 缺 blob 在那一层就是一个具名状态（`Missing` + `status = "missing_blob"`）。
-#[allow(dead_code)]
 pub(crate) fn read_sealed_blob(
     data_dir: &Path,
     manifest: &crate::DoctorRawMirrorManifestReport,
@@ -4941,7 +5003,6 @@ mod e5_p30_blob_read_tests {
 // 一层编排 —— 编排本身在非测试构建里仍无调用方，于是它下面整条链（含 E5 那四个符号）
 // 依旧不可达。真正的根是 E8 把 `mirror-restore --apply` 的 CLI 接上那一刻。
 // 判据仍是「删掉 allow 之后 clippy 不报 never-used」，不是「删掉能编译」。
-#[allow(dead_code)]
 pub(crate) struct ReplaceCommitInput<'a> {
     /// 被替换的会话，**ID 保留**（§5.2.4 首行）。
     pub conversation_id: i64,
@@ -4958,17 +5019,18 @@ pub(crate) struct ReplaceCommitInput<'a> {
 }
 
 /// `commit_replace_in_tx` 的产出。
-#[allow(dead_code)]
 pub(crate) struct ReplaceCommitOutcome {
     /// 本次写入 receipt 用的幂等 key；恢复器据它判「已提交」。
     pub idempotency_key: String,
     /// 新插入的 message id（按 `conv.messages` 顺序）。
     pub inserted_message_ids: Vec<i64>,
+    /// 删旧那一半的条数。**与插入条数一起进 `--apply` 的输出** ——
+    /// 「替换了什么」对操作者不是可选信息。
+    pub deleted_message_count: usize,
 }
 
 /// replace 分支的 `operation` 取值。**字面量集中在一处**，避免写 receipt 与查 receipt
 /// 两侧各写一份字符串。
-#[allow(dead_code)]
 pub(crate) const REPLACE_OPERATION: &str = "mirror-restore-replace";
 
 /// 幂等 key = `{operation}:{snapshot_root}:{identity}`。
@@ -4979,7 +5041,6 @@ pub(crate) const REPLACE_OPERATION: &str = "mirror-restore-replace";
 ///
 /// `RestoreIdentity` 的 `Display` 已经把 `{agent}@{host}:{source_id} {canonical_path}`
 /// 拼好，这里直接用它，不在第二处重拼身份的字符串形式。
-#[allow(dead_code)]
 pub(crate) fn replace_idempotency_key(snapshot_root: &str, identity: &RestoreIdentity) -> String {
     format!("{REPLACE_OPERATION}:{snapshot_root}:{identity}")
 }
@@ -4991,7 +5052,6 @@ pub(crate) fn replace_idempotency_key(snapshot_root: &str, identity: &RestoreIde
 /// 删旧、插新、两张派生表、11 列重算、tail 回写）；
 /// 8 重建第三处 tail 载体；9 conversation 级字段按 §B.1.2；10 推进 generation；
 /// 11 写 receipt。
-#[allow(dead_code)]
 pub(crate) fn commit_replace_in_tx(
     tx: &frankensqlite::compat::Transaction<'_>,
     input: &ReplaceCommitInput<'_>,
@@ -5040,6 +5100,7 @@ pub(crate) fn commit_replace_in_tx(
 
     Ok(ReplaceCommitOutcome {
         idempotency_key,
+        deleted_message_count: replaced.deleted_message_count,
         inserted_message_ids: replaced.inserted_message_ids,
     })
 }
@@ -5057,7 +5118,6 @@ pub(crate) fn commit_replace_in_tx(
 /// **必须绕开 `rebuild_analytics`**（裁定 D-A3-4）：它会把 `message_metrics` 的 DELETE
 /// 与三张 rollup 的 DELETE 捆进同一次全量重建，而 `message_metrics` 是事务内逐消息写、
 /// 用另一套分桶公式的表 —— 照字面调用会让它被两套公式各写一遍。
-#[allow(dead_code)]
 pub(crate) fn recompute_materialized_aggregates_after_commit(
     storage: &crate::storage::sqlite::FrankenStorage,
 ) -> anyhow::Result<()> {
@@ -5068,11 +5128,9 @@ pub(crate) fn recompute_materialized_aggregates_after_commit(
 }
 
 /// 新建分支的 `operation` 取值。与 replace 分支分开，两者的幂等 key 不得互相碰撞。
-#[allow(dead_code)]
 pub(crate) const RESTORE_NEW_OPERATION: &str = "mirror-restore-new";
 
 /// 新建分支的幂等 key，构成与 replace 支同型（三个分量全部来自入参）。
-#[allow(dead_code)]
 pub(crate) fn restore_new_idempotency_key(
     snapshot_root: &str,
     identity: &RestoreIdentity,
@@ -5082,7 +5140,6 @@ pub(crate) fn restore_new_idempotency_key(
 
 /// `commit_restore_new` 的入参。**没有 `conversation_id`** —— 这一支的会话还不存在，
 /// 「保留原 ID」在这里无定义（裁定 R-E-44）。
-#[allow(dead_code)]
 pub(crate) struct RestoreNewCommitInput<'a> {
     pub agent_id: i64,
     pub workspace_id: Option<i64>,
@@ -5093,7 +5150,6 @@ pub(crate) struct RestoreNewCommitInput<'a> {
 }
 
 /// `commit_restore_new` 的产出。
-#[allow(dead_code)]
 pub(crate) struct RestoreNewCommitOutcome {
     pub idempotency_key: String,
     /// `true` = 本次真的写了；`false` = 查到 receipt，判「已提交」直接短路。
@@ -5114,7 +5170,6 @@ pub(crate) struct RestoreNewCommitOutcome {
 ///
 /// 与 replace 支的另一处不同：**receipt 与插入不在同一个事务里**（做不到，见上），
 /// 所以这里先查 receipt 再动手 —— 幂等靠**先查后做**，不靠「重复写入被吞掉」。
-#[allow(dead_code)]
 pub(crate) fn commit_restore_new(
     storage: &crate::storage::sqlite::FrankenStorage,
     input: &RestoreNewCommitInput<'_>,
@@ -5858,7 +5913,6 @@ mod e6_replace_commit_tests {
 /// §5.2.5 七态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
-#[allow(dead_code)]
 pub(crate) enum RestoreJournalState {
     Planned,
     DbCommitted,
@@ -5889,14 +5943,12 @@ impl RestoreJournalState {
 /// journal 是「计划与进度」的真源，计划本身就该在里面。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case", tag = "kind")]
-#[allow(dead_code)]
 pub(crate) enum PlannedAction {
     RestoreNew,
     Replace { conversation_id: i64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[allow(dead_code)]
 pub(crate) struct RestorePlanItem {
     /// 只存 manifest_id：**写什么**由磁盘上的封存件重新推导，不在 journal 里落第二份。
     pub manifest_id: String,
@@ -5904,7 +5956,6 @@ pub(crate) struct RestorePlanItem {
 }
 
 /// 一次 restore 运行的计划（planner 产出，E8 的 CLI 是它未来的真调用方）。
-#[allow(dead_code)]
 pub(crate) struct RestoreRunPlan {
     pub operation_id: String,
     pub data_dir: PathBuf,
@@ -5918,7 +5969,6 @@ pub(crate) struct RestoreRunPlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[allow(dead_code)]
 pub(crate) struct RestoreJournal {
     pub operation_id: String,
     pub state: RestoreJournalState,
@@ -5936,14 +5986,17 @@ pub(crate) struct RestoreJournal {
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) struct RestoreRunOutcome {
     pub restored: usize,
     pub replaced: usize,
     pub published: usize,
+    /// 本次写下的 receipt 幂等 key。**操作者据它去 DB 里对账**，
+    /// 也是「哪几条真的提交了」的唯一可查凭据。
+    pub receipt_keys: Vec<String>,
+    pub messages_inserted: usize,
+    pub messages_deleted: usize,
 }
 
-#[allow(dead_code)]
 pub(crate) fn restore_journal_from_plan(plan: RestoreRunPlan) -> RestoreJournal {
     RestoreJournal {
         operation_id: plan.operation_id,
@@ -5987,7 +6040,6 @@ pub(crate) fn journal_trace_take() -> Vec<&'static str> {
     RESTORE_JOURNAL_TRACE.with(|t| std::mem::take(&mut *t.borrow_mut()))
 }
 
-#[allow(dead_code)]
 pub(crate) fn restore_journal_write(path: &Path, journal: &RestoreJournal) -> anyhow::Result<()> {
     use std::io::Write as _;
     if let Some(parent) = path.parent() {
@@ -6016,7 +6068,6 @@ pub(crate) fn restore_journal_write(path: &Path, journal: &RestoreJournal) -> an
     Ok(())
 }
 
-#[allow(dead_code)]
 pub(crate) fn restore_journal_read(path: &Path) -> anyhow::Result<Option<RestoreJournal>> {
     match std::fs::read(path) {
         Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
@@ -6057,7 +6108,6 @@ pub(crate) fn restore_pause_if_requested(boundary: &str) {
 
 /// 从 manifest view 推出恢复身份。**只有这一处定义**——测试与恢复器都用它，
 /// 免得「首跑算出来的 key」与「恢复算出来的 key」两处各写一份而悄悄分叉。
-#[allow(dead_code)]
 pub(crate) fn restore_identity_from_view(
     view: &crate::raw_mirror::RawMirrorManifestView,
 ) -> anyhow::Result<RestoreIdentity> {
@@ -6187,12 +6237,14 @@ fn restore_run_db_phase(
                 )?;
                 if out.applied {
                     outcome.restored += 1;
+                    outcome.messages_inserted += conv.messages.len();
                 }
+                outcome.receipt_keys.push(out.idempotency_key);
             }
             PlannedAction::Replace { conversation_id } => {
                 use frankensqlite::compat::TransactionExt as _;
                 let mut tx = storage.raw().transaction()?;
-                commit_replace_in_tx(
+                let replaced = commit_replace_in_tx(
                     &tx,
                     &ReplaceCommitInput {
                         conversation_id,
@@ -6208,6 +6260,9 @@ fn restore_run_db_phase(
                 )?;
                 tx.commit()?;
                 outcome.replaced += 1;
+                outcome.messages_inserted += replaced.inserted_message_ids.len();
+                outcome.messages_deleted += replaced.deleted_message_count;
+                outcome.receipt_keys.push(replaced.idempotency_key);
             }
         }
         journal.committed.push(item.manifest_id.clone());
@@ -6378,7 +6433,6 @@ fn restore_verify_closure(journal: &RestoreJournal) -> anyhow::Result<()> {
 }
 
 /// 首跑：写计划 → 驱动。
-#[allow(dead_code)]
 pub(crate) fn restore_apply_journaled(
     plan: RestoreRunPlan,
     journal_path: &Path,
@@ -6391,7 +6445,6 @@ pub(crate) fn restore_apply_journaled(
 }
 
 /// 崩溃恢复：**入参只有 journal 路径**，其余一切从磁盘取（R-E-19 第三条）。
-#[allow(dead_code)]
 pub(crate) fn restore_recover(journal_path: &Path) -> anyhow::Result<RestoreRunOutcome> {
     let Some(mut journal) = restore_journal_read(journal_path)? else {
         anyhow::bail!("no restore journal at {}", journal_path.display());
@@ -6467,7 +6520,6 @@ pub(crate) const W1_COMMIT_MARKER_SCHEMA_VERSION: i64 = 1;
 // ⚠ staged landing 记账（同 E5/E6 惯例，不是把死代码放行）：非测试构建里它的调用方
 // 要到 **E8 接 `mirror-restore` CLI** 那一刻才出现（解析 marker 落点）。判据仍是
 // 「删掉 allow 之后 clippy 不报 never-used」，移除义务挂在 E8 验收面。
-#[allow(dead_code)]
 pub(crate) const W1_COMMIT_MARKER_FILENAME: &str = "w1-commit-marker.json";
 
 /// 候选 DB 稳定副本的强身份。
@@ -6865,7 +6917,6 @@ fn db_identity_of(db_path: &Path, generation: &str) -> anyhow::Result<W1DbIdenti
 }
 
 /// 由 journal（**必须是终态**）产出 marker 的内容。
-#[allow(dead_code)]
 pub(crate) fn build_w1_commit_marker(
     journal: &RestoreJournal,
     journal_path: &Path,
@@ -6914,7 +6965,6 @@ pub(crate) fn build_w1_commit_marker(
 
 /// 写 marker：**先查后做，绝不覆盖**（不变量 I1）。
 /// 已存在且逐字段相等 → no-op；不等 → 硬失败。
-#[allow(dead_code)]
 pub(crate) fn write_w1_commit_marker(
     marker: &W1CommitMarker,
     marker_path: &Path,
@@ -6952,7 +7002,6 @@ pub(crate) fn write_w1_commit_marker(
 }
 
 /// 资格门的输入：**候选侧的四个磁盘对象**，没有第五个入参。
-#[allow(dead_code)]
 pub(crate) struct W1QualificationInput<'a> {
     pub marker_path: &'a Path,
     pub journal_path: &'a Path,
@@ -6962,7 +7011,6 @@ pub(crate) struct W1QualificationInput<'a> {
 
 /// **解析级机器门**（plan Task E7 Step 3），七步检查序见 wire 说明 §4。
 /// 每层以自己的名义拒绝，先到先报。
-#[allow(dead_code)]
 pub(crate) fn qualify_w1_candidate(
     input: &W1QualificationInput<'_>,
 ) -> Result<W1CommitMarker, W1MarkerError> {
@@ -8192,5 +8240,797 @@ mod e7_restore_journal_tests {
             ),
             other => panic!("错误变体不对：{other:?}"),
         }
+    }
+}
+
+
+// ===========================================================================
+// E8 · dry-run planner（plan Task E8 Step 1/2）
+//
+// 形状：**winner 从 mirror 侧选 → candidate 从候选 DB 重建 → `decide_action` → 六类计数**。
+// 六类口径**直接复用 E4 的 `RelationCensus`**，不另立一套。
+//
+// **mirror 面的来源是入参**（`data_dir`）：E8 给封存件只读面，E8b 换 materialize 出来的
+// 可写工作树。写死成「就是候选包那棵」会让 E8b 只能回头改这里。
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub(crate) struct MirrorRestorePlanOptions {
+    /// mirror 面的根。**入参而非常量**（见上）。
+    pub data_dir: PathBuf,
+    /// 候选 DB 的稳定副本。dry-run 只读它。
+    pub db_path: PathBuf,
+    /// 投影物化用的隔离根。**不进任何判定**（R-E-34 条件 2）。
+    pub scratch_dir: PathBuf,
+    /// 本轮消费的封存件根，进计划项的幂等 key。
+    pub snapshot_root: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct MirrorRestorePlanReport {
+    /// 六类关系计数（§5.2.1 决策表）。
+    pub census: RelationCensus,
+    /// 参与判定的 identity 数。
+    pub identities_considered: usize,
+    /// **不进六类表**的 HOLD 数（版本类 / 身份类 / 输入损坏类）。
+    ///
+    /// 单独记这一格的理由：`RelationCensus::record` 对这三类返回 `false`，
+    /// 若不接住，`census.total()` 与 `identities_considered` 的差额就会**无声吞掉**
+    /// 一批身份 —— 而那正是 Step 2 那条验证条件要抓的东西。
+    pub non_relation_holds: usize,
+    /// 真正构造出来的 candidate 侧版本数。
+    ///
+    /// 存在的意义是**证伪**：若六类判定只看了 mirror 一侧，这个数会是 0，
+    /// 而「四类都有」照样成立 —— 计数不为 0 才说明另一侧真的参与了。
+    pub candidate_versions_seen: usize,
+    /// 全部 HOLD，交人裁定（Phase 4 开工资格的输入）。
+    pub holds: Vec<HoldRecord>,
+    /// 可执行计划（`--apply` 消费；dry-run 只产不跑）。
+    pub plan: Vec<RestorePlanItem>,
+}
+
+/// 候选侧的一条版本：**摘要来自 DB 的 canonical 消息**，字节只作裁定材料。
+///
+/// 为什么不是「重建字节 → 重解析」（该路线已被证伪，裁定 R-E-58）：
+/// verbatim 原始行的唯一写入方是 `doctor_recover.rs` 的损坏恢复路径，正常索引产物存的是
+/// **规范化事件**，喂回 pinned parser 必撞守卫（`raw envelope already contains reserved
+/// key raw_role`）。而 spec §5.2.1 的比较对象本就是 canonical tuple，不是源字节。
+pub(crate) struct CandidateSideVersion {
+    pub conversation_id: i64,
+    /// 仅作 [`VersionSummary`] 的裁定材料 —— **从不喂给 parser**。
+    pub evidence: ContentVersion,
+    /// 与投影侧同 scope 的摘要序列。
+    pub digests: Vec<CanonicalMessageDigest>,
+}
+
+/// 把 DB 的一条 canonical 消息还原成 `NormalizedMessage`，**只用既有符号**：
+/// role 走 `crate::model::types::role_as_str`（C 组冻结锚里的那一个），
+/// 其余字段原样搬；`invocations` 恒空 —— **DB 没有这一格，这是事实不是简化**。
+fn normalized_from_db_message(
+    message: &crate::model::types::Message,
+) -> franken_agent_detection::types::NormalizedMessage {
+    franken_agent_detection::types::NormalizedMessage {
+        idx: message.idx,
+        role: crate::model::types::role_as_str(&message.role).to_string(),
+        author: message.author.clone(),
+        created_at: message.created_at,
+        content: message.content.clone(),
+        extra: message.extra_json.clone(),
+        snippets: Vec::new(),
+        invocations: Vec::new(),
+    }
+}
+
+/// 从候选 DB 重建某条 identity 的版本集合。
+///
+/// cass 把逐条源事件存在 `extra_json` / `extra_bin` 里，所以 canonical 库**自带重建源文件
+/// 的能力**（`reconstruct_source_jsonl_for_conversation`）。**重建字节与原文件不必逐字节
+/// 相同** —— `compare_versions` 的第二层（投影后的消息序列）正是为这种情形存在的。
+fn candidate_versions_from_db(
+    storage: &crate::storage::sqlite::FrankenStorage,
+    identity: &RestoreIdentity,
+) -> anyhow::Result<Vec<CandidateSideVersion>> {
+    use frankensqlite::compat::{ConnectionExt as _, ParamValue, RowExt as _};
+    let ids: Vec<i64> = storage.raw().query_map_collect(
+        "SELECT id FROM conversations WHERE source_path = ?1 ORDER BY id",
+        &[ParamValue::from(identity.canonical_path.as_str())],
+        |row| row.get_typed(0),
+    )?;
+    let mut out = Vec::with_capacity(ids.len());
+    for conversation_id in ids {
+        let messages = storage.fetch_messages(conversation_id)?;
+        let digests: Vec<CanonicalMessageDigest> = messages
+            .iter()
+            .map(|m| {
+                compact_invariant_message_digest_scoped(
+                    &normalized_from_db_message(m),
+                    DigestScope::CandidateComparable,
+                )
+            })
+            .collect();
+        // 裁定材料：把 DB 侧那份重建字节的长度等元数据留给歧义表读者。
+        // 它**不参与判定**，也从不被解析 —— 判定完全由上面的摘要序列承担。
+        let lines = storage.reconstruct_source_jsonl_for_conversation(conversation_id)?;
+        let mut raw = Vec::new();
+        for line in &lines {
+            raw.extend_from_slice(line.as_bytes());
+            raw.push(b'\n');
+        }
+        out.push(CandidateSideVersion {
+            conversation_id,
+            evidence: ContentVersion::new(
+                VersionSource::CandidateDb,
+                &raw,
+                0,
+                0,
+                format!("db:conversation:{conversation_id}"),
+            ),
+            digests,
+        });
+    }
+    Ok(out)
+}
+
+/// 摘要级的关系判定（裁定 R-E-58 的 (A) 入口）。
+///
+/// **既有 `decide_action` 签名零改动**；本入口只服务「候选侧没有源字节」这一种形态：
+/// 字节层对 DB 侧本就不适用（它没有源字节），于是这里直接从第二层（canonical 消息序列）判。
+pub(crate) fn decide_action_with_candidate_digests(
+    identity: &RestoreIdentity,
+    candidates: &[CandidateSideVersion],
+    winner: &ContentVersion,
+    winner_digests: &[CanonicalMessageDigest],
+) -> RestoreAction {
+    let summaries_of = |c: &CandidateSideVersion| {
+        vec![VersionSummary::of(&c.evidence), VersionSummary::of(winner)]
+    };
+    if candidates.len() > 1 {
+        return RestoreAction::Hold(HoldRecord {
+            identity: identity.clone(),
+            reason: HoldReason::MultipleCandidates,
+            evidence: HoldEvidence::Versions {
+                versions: candidates
+                    .iter()
+                    .map(|c| VersionSummary::of(&c.evidence))
+                    .collect(),
+            },
+            consumed_manifest_fields: manifest_fields::CONSUMED_BY_WINNER_SELECTION.to_vec(),
+        });
+    }
+    let Some(candidate) = candidates.first() else {
+        return RestoreAction::Restore;
+    };
+    match digest_prefix_relation(&candidate.digests, winner_digests) {
+        Some(Relation::Equal) => RestoreAction::Skip,
+        Some(Relation::StrictlyBefore) => RestoreAction::Replace,
+        Some(Relation::StrictlyAfter) => RestoreAction::Hold(HoldRecord {
+            identity: identity.clone(),
+            reason: HoldReason::CandidateSuperset,
+            evidence: HoldEvidence::Versions {
+                versions: summaries_of(candidate),
+            },
+            consumed_manifest_fields: manifest_fields::CONSUMED_BY_WINNER_SELECTION.to_vec(),
+        }),
+        Some(Relation::Diverged) | None => RestoreAction::Hold(HoldRecord {
+            identity: identity.clone(),
+            reason: HoldReason::CandidateDiverged,
+            evidence: HoldEvidence::MessageLayer {
+                versions: summaries_of(candidate),
+                first_divergent_index: first_divergent_index(&candidate.digests, winner_digests),
+            },
+            consumed_manifest_fields: manifest_fields::CONSUMED_BY_WINNER_SELECTION.to_vec(),
+        }),
+    }
+}
+
+/// dry-run planner：**只读**，产六类计数 + 歧义表 + HOLD 清单 + 可执行计划。
+pub(crate) fn plan_mirror_restore(
+    options: &MirrorRestorePlanOptions,
+) -> anyhow::Result<MirrorRestorePlanReport> {
+    let views = crate::raw_mirror::manifest_views(&options.data_dir)?;
+    let doctor_reports = collect_sealed_manifest_reports(&options.data_dir);
+    let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(&options.db_path)
+        .map_err(|e| anyhow::anyhow!("open candidate db {}: {e}", options.db_path.display()))?;
+
+    // 同一 identity 可能有多份 manifest（同一路径被捕获过多次）—— 那是 §5.2.3 的版本集合，
+    // 必须先聚起来再选 winner，逐 manifest 独立判会把「同一条会话的两个版本」
+    // 当成两条身份分别计数。
+    let mut groups: std::collections::BTreeMap<String, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (index, view) in views.iter().enumerate() {
+        let identity = restore_identity_from_view(view)?;
+        groups.entry(identity.to_string()).or_default().push(index);
+    }
+
+    let mut report = MirrorRestorePlanReport::default();
+    for indices in groups.values() {
+        report.identities_considered += 1;
+        let head = &views[indices[0]];
+        let identity = restore_identity_from_view(head)?;
+        let projector = SealedMessageProjector {
+            scratch_root: &options.scratch_dir,
+            canonical_original_path: &identity.canonical_path,
+            agent: identity.origin.agent,
+            sealed_source_size_bytes: head.source_size_bytes,
+        };
+        // winner 选择仍按投影侧全字段口径（mirror 两侧都有源字节，没有理由降口径）。
+        // **与候选比时**才切到 candidate-comparable scope —— 两侧同 scope 才可比。
+        let comparable = CandidateComparableProjector(SealedMessageProjector {
+            scratch_root: &options.scratch_dir,
+            canonical_original_path: &identity.canonical_path,
+            agent: identity.origin.agent,
+            sealed_source_size_bytes: head.source_size_bytes,
+        });
+
+        // ── mirror 侧的版本集合 ────────────────────────────────────────
+        let mut versions = Vec::with_capacity(indices.len());
+        let mut input_fault: Option<HoldRecord> = None;
+        for &index in indices {
+            let view = &views[index];
+            let Some(doctor) = doctor_reports
+                .iter()
+                .find(|r| r.manifest_id == view.manifest_id)
+            else {
+                input_fault = Some(hold_for_manifest_reference_missing(
+                    identity.clone(),
+                    Vec::new(),
+                ));
+                break;
+            };
+            match read_sealed_blob(&options.data_dir, doctor) {
+                SealedBlobOutcome::Loaded(bytes) => versions.push(ContentVersion::new(
+                    VersionSource::Mirror,
+                    &bytes,
+                    view.source_mtime_ms.unwrap_or_default(),
+                    view.captured_at_ms,
+                    view.blob_blake3.clone(),
+                )),
+                // blob 读不到 = 输入损坏类 HOLD，**不是**「这条身份不存在」。
+                SealedBlobOutcome::ReferenceMissing | SealedBlobOutcome::Unreadable { .. } => {
+                    input_fault = Some(hold_for_manifest_reference_missing(
+                        identity.clone(),
+                        Vec::new(),
+                    ));
+                    break;
+                }
+            }
+        }
+        if let Some(hold) = input_fault {
+            report.non_relation_holds += 1;
+            report.holds.push(hold);
+            continue;
+        }
+
+        // ── winner（§5.2.3；选不出来 = 版本类 HOLD，不进六类表）────────
+        let winner_index = match select_winner(&identity, &versions, &projector)
+            .map_err(|e| anyhow::anyhow!("winner selection failed: {e:?}"))?
+        {
+            WinnerOutcome::Winner { index, .. } => index,
+            WinnerOutcome::Hold(hold) => {
+                report.non_relation_holds += 1;
+                report.holds.push(hold);
+                continue;
+            }
+        };
+
+        // ── candidate 侧 ──────────────────────────────────────────────
+        let candidates = candidate_versions_from_db(&storage, &identity)?;
+        report.candidate_versions_seen += candidates.len();
+        let winner_digests = comparable
+            .project(&identity.origin, versions[winner_index].normalized())
+            .map_err(|e| anyhow::anyhow!("winner projection failed: {e:?}"))?;
+
+        let action = decide_action_with_candidate_digests(
+            &identity,
+            &candidates,
+            &versions[winner_index],
+            &winner_digests,
+        );
+
+        if !report.census.record(&action) {
+            // 六类之外的 HOLD：`record` 返回 false 就是它在说「我没计」。
+            report.non_relation_holds += 1;
+        }
+        match &action {
+            RestoreAction::Skip => {}
+            RestoreAction::Restore => report.plan.push(RestorePlanItem {
+                manifest_id: views[indices[winner_index]].manifest_id.clone(),
+                action: PlannedAction::RestoreNew,
+            }),
+            RestoreAction::Replace => {
+                let conversation_id = candidates
+                    .first()
+                    .map(|c| c.conversation_id)
+                    .ok_or_else(|| anyhow::anyhow!("replace without a candidate conversation"))?;
+                report.plan.push(RestorePlanItem {
+                    manifest_id: views[indices[winner_index]].manifest_id.clone(),
+                    action: PlannedAction::Replace { conversation_id },
+                });
+            }
+            RestoreAction::Hold(hold) => report.holds.push(hold.clone()),
+        }
+    }
+
+    storage.close_best_effort_in_place();
+    Ok(report)
+}
+
+// ===========================================================================
+// E8 · dry-run planner（plan Task E8 Step 1/2）
+//
+// 形状：**winner 从 mirror 侧选 → candidate 从候选 DB 重建 → `decide_action` → 六类计数**。
+// 六类口径**直接复用 E4 已落地的 `RelationCensus`**，不另立一套。
+//
+// candidate 侧的字节由 `reconstruct_source_jsonl_for_conversation` 重建（cass 把逐条源事件
+// 存在 `extra_json`/`extra_bin` 里，canonical 库自带重建源文件的能力）。**重建字节与原文件
+// 不必逐字节相同** —— `compare_versions` 的第二层（投影后的消息序列）正是为这种情形存在的。
+//
+// **mirror 面的来源是入参**（`data_dir`）：E8 给的是封存件只读面，E8b 换成 materialize 出来的
+// 可写工作树。写死成「就是候选包那棵」会让 E8b 只能回头改这里。
+// ===========================================================================
+#[cfg(test)]
+mod e8_dry_run_planner_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn capture(data_dir: &Path, source: &Path) -> crate::raw_mirror::RawMirrorCaptureRecord {
+        crate::raw_mirror::capture_source_file(crate::raw_mirror::RawMirrorCaptureInput {
+            data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: source,
+            db_links: &[],
+        })
+        .expect("capture source into raw mirror")
+    }
+
+    /// `n` 条消息的合成 codex 会话。**消息条数可变**是这里的关键 —— 六类关系里的
+    /// 「真前缀」「超集」都靠它造。
+    fn write_session_n(root: &Path, name: &str, session_id: &str, n: usize) -> PathBuf {
+        let dir = root.join(".codex").join("sessions").join("2026").join("08");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        let mut text = format!(
+            "{{\"timestamp\":\"2026-08-18T00:00:00.000Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session_id}\",\"cwd\":\"/fixtures/ws\"}}}}\n"
+        );
+        for i in 0..n {
+            text.push_str(&format!(
+                "{{\"timestamp\":\"2026-08-18T00:00:0{}.000Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"{session_id} 第 {i} 条\"}}]}}}}\n",
+                (i % 9) + 1
+            ));
+        }
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
+    struct Bench {
+        _tmp: TempDir,
+        data_dir: PathBuf,
+        scratch: PathBuf,
+        db_path: PathBuf,
+        expected_identities: usize,
+    }
+
+    fn report_of(b: &Bench) -> MirrorRestorePlanReport {
+        plan_mirror_restore(&MirrorRestorePlanOptions {
+            data_dir: b.data_dir.clone(),
+            db_path: b.db_path.clone(),
+            scratch_dir: b.scratch.clone(),
+            snapshot_root: "e8-bench-root".into(),
+        })
+        .expect("dry-run planner must run")
+    }
+
+    // ── Step 2 的验证条件写进代码断言：能被机器判的不留给人眼 ────────────
+    #[test]
+    fn e8_six_class_counts_sum_to_the_identities_considered() {
+        let b = bench();
+        let report = report_of(&b);
+        assert_eq!(
+            report.identities_considered, b.expected_identities,
+            "参与判定的 identity 数必须等于 mirror 侧的身份数"
+        );
+        assert_eq!(
+            report.census.total() + report.non_relation_holds,
+            report.identities_considered,
+            "六类计数之和 + 非关系类 HOLD == 参与判定的 identity 数 —— \
+             差额意味着有身份被静默丢掉（plan Task E8 Step 2 的验证条件）"
+        );
+    }
+
+    #[test]
+    fn e8_dry_run_reports_each_of_the_four_reachable_relations() {
+        let b = bench();
+        let report = report_of(&b);
+        assert_eq!(report.census.skip, 1, "相等 → Skip");
+        assert_eq!(report.census.restore, 1, "candidate 缺失 → Restore");
+        assert_eq!(report.census.replace, 1, "candidate 是真前缀 → Replace");
+        assert_eq!(report.census.hold_superset, 1, "candidate 是超集 → HOLD");
+    }
+
+    // ── HOLD 清单必须完整落盘（Phase 4 开工资格的输入）──────────────────
+    #[test]
+    fn e8_dry_run_persists_every_hold_with_its_identity_and_reason() {
+        let b = bench();
+        let report = report_of(&b);
+        assert_eq!(
+            report.holds.len(),
+            report.census.hold_superset
+                + report.census.hold_diverged
+                + report.census.hold_multiple_candidates
+                + report.non_relation_holds,
+            "落盘的 HOLD 条数必须与计数吻合 —— 少一条就是静默丢一条待人裁的东西"
+        );
+        assert!(report.holds.iter().all(|h| !h.identity.canonical_path.is_empty()));
+    }
+
+    // ── candidate 侧真的参与了判定（否则「四类都有」可能是巧合）──────────
+    #[test]
+    fn e8_candidate_side_versions_are_tagged_as_candidate_db() {
+        let b = bench();
+        let report = report_of(&b);
+        assert!(
+            report.candidate_versions_seen > 0,
+            "candidate 侧必须真的被构造过 —— 计数为 0 说明六类判定只看了 mirror 一侧"
+        );
+        assert_eq!(
+            report.candidate_versions_seen, 3,
+            "四条身份里有三条在库里有对应会话（equal / prefix / superset）"
+        );
+    }
+
+    // ── dry-run 必须零写：mirror 写集与 DB 大小前后不变 ──────────────────
+    #[test]
+    fn e8_dry_run_writes_nothing() {
+        let b = bench();
+        let before = write_set_snapshot(&b.data_dir);
+        let db_before = std::fs::metadata(&b.db_path).unwrap().len();
+        let _ = report_of(&b);
+        let after = write_set_snapshot(&b.data_dir);
+        assert_eq!(before, after, "dry-run 不得写 mirror 面");
+        assert_eq!(
+            db_before,
+            std::fs::metadata(&b.db_path).unwrap().len(),
+            "dry-run 不得写候选 DB"
+        );
+    }
+
+    fn write_set_snapshot(root: &Path) -> Vec<(String, u64)> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if let Ok(meta) = entry.metadata() {
+                    out.push((
+                        path.strip_prefix(root).unwrap().display().to_string(),
+                        meta.len(),
+                    ));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// 造决策表里能在隔离小库造出来的四类：Skip / Restore / Replace / HOLD(超集)。
+    ///
+    /// 「分叉」与「多 candidate」要靠同一 identity 上的多份版本，属 §5.2.3 的版本集合形态，
+    /// 归 winner 选择那条线；本演练场只覆盖决策表这一侧，**并把它显式写下来**，
+    /// 免得「四类都在」被误读成「六类全覆盖」。
+    fn bench() -> Bench {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("cass-data");
+        let live = tmp.path().join("live");
+        let scratch = tmp.path().join("scratch");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        let equal = write_session_n(&live, "rollout-equal.jsonl", "e8-equal", 3);
+        let missing = write_session_n(&live, "rollout-missing.jsonl", "e8-missing", 3);
+        let prefix = write_session_n(&live, "rollout-prefix.jsonl", "e8-prefix", 3);
+        let superset = write_session_n(&live, "rollout-superset.jsonl", "e8-superset", 2);
+        for p in [&equal, &missing, &prefix, &superset] {
+            capture(&data_dir, p);
+        }
+
+        let db_path = data_dir.join("candidate.sqlite");
+        let storage = crate::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
+        seed_from(&storage, &data_dir, &scratch, "rollout-equal.jsonl", None);
+        seed_from(&storage, &data_dir, &scratch, "rollout-prefix.jsonl", Some(2));
+        seed_superset(&storage, &data_dir, &scratch, "rollout-superset.jsonl");
+        drop(storage);
+
+        Bench {
+            _tmp: tmp,
+            data_dir,
+            scratch,
+            db_path,
+            expected_identities: 4,
+        }
+    }
+
+    /// 按**文件名**定位 manifest。会话 id（`e8-equal` 等）只出现在**内容**里，
+    /// `original_path` 里没有它 —— 第一版拿会话 id 当锚点，五条用例全部倒在这里。
+    /// 把演练场**落到指定目录**，给 CLI 的真观测用（strace 那一跑需要一个盘上的
+    /// mirror 树 + 候选 DB）。形态沿用 E7 的子进程入口：`#[ignore]` + env 传参，
+    /// 由外部显式拉起，常规跑不执行。
+    #[test]
+    #[ignore]
+    fn e8_materialize_bench_for_observation() {
+        let root = PathBuf::from(std::env::var("CASS_E8_BENCH_DIR").unwrap());
+        let data_dir = root.join("cass-data");
+        let live = root.join("live");
+        let scratch = root.join("scratch");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        let equal = write_session_n(&live, "rollout-equal.jsonl", "e8-equal", 3);
+        let missing = write_session_n(&live, "rollout-missing.jsonl", "e8-missing", 3);
+        let prefix = write_session_n(&live, "rollout-prefix.jsonl", "e8-prefix", 3);
+        let superset = write_session_n(&live, "rollout-superset.jsonl", "e8-superset", 2);
+        for p in [&equal, &missing, &prefix, &superset] {
+            capture(&data_dir, p);
+        }
+        let db_path = data_dir.join("candidate.sqlite");
+        let storage = crate::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
+        seed_from(&storage, &data_dir, &scratch, "rollout-equal.jsonl", None);
+        seed_from(&storage, &data_dir, &scratch, "rollout-prefix.jsonl", Some(2));
+        seed_superset(&storage, &data_dir, &scratch, "rollout-superset.jsonl");
+        drop(storage);
+        // live 源文件删掉：投影的定义域里没有活文件系统，留着会让「零 HOME 读取」
+        // 这条观测失去意义（读的是 bench 自己的 live 目录也算读，但那不是 HOME）。
+        for p in [&equal, &missing, &prefix, &superset] {
+            std::fs::remove_file(p).unwrap();
+        }
+        println!("BENCH-READY data_dir={} db={}", data_dir.display(), db_path.display());
+    }
+
+    fn view_for<'a>(
+        views: &'a [crate::raw_mirror::RawMirrorManifestView],
+        file_name: &str,
+    ) -> &'a crate::raw_mirror::RawMirrorManifestView {
+        let hits: Vec<_> = views
+            .iter()
+            .filter(|v| v.original_path.ends_with(file_name))
+            .collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "fixture 锚点必须恰命中 1 份 manifest（实得 {}）—— 命中 0 是锚点错，\
+             命中多份是 fixture 造重了，两种都不能继续",
+            hits.len()
+        );
+        hits[0]
+    }
+
+    fn seed_from(
+        storage: &crate::storage::sqlite::FrankenStorage,
+        data_dir: &Path,
+        scratch: &Path,
+        session: &str,
+        truncate_to: Option<usize>,
+    ) {
+        let views = crate::raw_mirror::manifest_views(data_dir).unwrap();
+        let view = view_for(&views, session);
+        let mut conv = project_view_for_bench(data_dir, scratch, view);
+        if let Some(n) = truncate_to {
+            conv.messages.truncate(n);
+        }
+        insert_conv(storage, &conv);
+    }
+
+    fn seed_superset(
+        storage: &crate::storage::sqlite::FrankenStorage,
+        data_dir: &Path,
+        scratch: &Path,
+        session: &str,
+    ) {
+        let views = crate::raw_mirror::manifest_views(data_dir).unwrap();
+        let view = view_for(&views, session);
+        let mut conv = project_view_for_bench(data_dir, scratch, view);
+        let mut extra = conv.messages.last().cloned().expect("至少一条");
+        extra.idx = conv.messages.len() as i64;
+        extra.content = format!("{} 多出来的一条", extra.content);
+        conv.messages.push(extra);
+        insert_conv(storage, &conv);
+    }
+
+    fn insert_conv(
+        storage: &crate::storage::sqlite::FrankenStorage,
+        conv: &crate::model::types::Conversation,
+    ) {
+        let agent_id = storage
+            .ensure_agent(&crate::model::types::Agent {
+                id: None,
+                slug: conv.agent_slug.clone(),
+                name: conv.agent_slug.clone(),
+                version: None,
+                kind: crate::model::types::AgentKind::Cli,
+            })
+            .unwrap();
+        let workspace_id = conv
+            .workspace
+            .as_ref()
+            .map(|ws| storage.ensure_workspace(ws, None).unwrap());
+        storage
+            .insert_conversations_batched(&[(agent_id, workspace_id, conv)])
+            .unwrap();
+    }
+
+    fn project_view_for_bench(
+        data_dir: &Path,
+        scratch: &Path,
+        view: &crate::raw_mirror::RawMirrorManifestView,
+    ) -> crate::model::types::Conversation {
+        let reports = collect_sealed_manifest_reports(data_dir);
+        let report = reports
+            .iter()
+            .find(|r| r.manifest_id == view.manifest_id)
+            .expect("doctor report");
+        let blob = match read_sealed_blob(data_dir, report) {
+            SealedBlobOutcome::Loaded(bytes) => bytes,
+            other => panic!("fixture blob 必须读得到：{other:?}"),
+        };
+        let provenance = provenance_from_manifest_view(view);
+        let sealed = SealedSource {
+            agent: Origin::Codex,
+            canonical_original_path: &view.original_path,
+            source_size_bytes: view.source_size_bytes,
+            blob: &blob,
+        };
+        match project_sealed_source(scratch, &sealed, &provenance) {
+            Ok(SealedProjection::Projected(conv)) => {
+                crate::indexer::persist::map_to_internal(&conv)
+            }
+            other => panic!("投影未产出会话：{other:?}"),
+        }
+    }
+
+    // ── R-E-59 条件 ③：DB canonical 空间 == 投影 canonical 空间（限 scope）──
+    //
+    // 这条是 (A2) 引入的**唯一新前提**的直接机器断言。两条断言缺一不可：
+    //   ① `CandidateComparable` scope 下两侧摘要序列**相等** —— 前提成立；
+    //   ② `Projection` scope 下两侧**不等** —— 把「DB 丢了 `invocations`」这个空间差异
+    //      钉成机器可见的事实。只有 ① 的话，将来谁把 scope 悄悄改回全字段，
+    //      测试会红得莫名其妙；有了 ②，红的位置直接指向「这个字段 DB 没有」。
+    //
+    // **fixture 必须含 tool_call**：纯文本会话的 `invocations` 恒空，两个 scope 算出来一样，
+    // ① 会绿而 ② 会红 —— 那种「绿」证明的不是空间一致，是样本恰好不含有分歧的那个字段。
+    const CLAUDE_WITH_TOOL_CALL: &str = concat!(
+        r#"{"type":"user","timestamp":"2025-12-01T10:00:00Z","message":{"role":"user","content":"kick off"}}"#,
+        "\n",
+        r#"{"type":"assistant","timestamp":"2025-12-01T10:00:01Z","message":{"role":"assistant","model":"claude-opus-5","content":[{"type":"text","text":"let me look"},{"type":"tool_use","id":"toolu_01","name":"Read","input":{"path":"/x"}}]}}"#,
+        "\n",
+        r#"{"type":"user","timestamp":"2025-12-01T10:00:02Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"file body"}]}}"#,
+        "\n",
+    );
+
+    #[test]
+    fn e8_db_canonical_space_matches_projection_space_within_the_candidate_scope() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("cass-data");
+        let live = tmp.path().join("live");
+        let scratch = tmp.path().join("scratch");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        let dir = live.join(".claude").join("projects").join("myapp");
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("dddd1111-2222-3333-4444-555555555555.jsonl");
+        std::fs::write(&source, CLAUDE_WITH_TOOL_CALL).unwrap();
+        crate::raw_mirror::capture_source_file(crate::raw_mirror::RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "claude_code",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source,
+            db_links: &[],
+        })
+        .unwrap();
+
+        let views = crate::raw_mirror::manifest_views(&data_dir).unwrap();
+        assert_eq!(views.len(), 1, "前置断言：fixture 恰一份 manifest");
+        let view = &views[0];
+        let reports = collect_sealed_manifest_reports(&data_dir);
+        let doctor = reports
+            .iter()
+            .find(|r| r.manifest_id == view.manifest_id)
+            .expect("doctor report");
+        let blob = match read_sealed_blob(&data_dir, doctor) {
+            SealedBlobOutcome::Loaded(bytes) => bytes,
+            other => panic!("blob 必须读得到：{other:?}"),
+        };
+        let provenance = provenance_from_manifest_view(view);
+        let sealed = SealedSource {
+            agent: Origin::ClaudeCode,
+            canonical_original_path: &view.original_path,
+            source_size_bytes: view.source_size_bytes,
+            blob: &blob,
+        };
+        let projected = match project_sealed_source(&scratch, &sealed, &provenance) {
+            Ok(SealedProjection::Projected(conv)) => *conv,
+            other => panic!("投影未产出会话：{other:?}"),
+        };
+
+        // **存在型断言先数可满足元素**：没有这一条，下面两条断言可能是在一个
+        // 「根本没有 invocation」的样本上空转。
+        let with_invocations = projected
+            .messages
+            .iter()
+            .filter(|m| !m.invocations.is_empty())
+            .count();
+        assert!(
+            with_invocations >= 1,
+            "fixture 必须至少有一条带 invocation 的消息，否则两个 scope 恒等、本用例空转"
+        );
+
+        let projection_side = |scope| -> Vec<CanonicalMessageDigest> {
+            projected
+                .messages
+                .iter()
+                .map(|m| compact_invariant_message_digest_scoped(m, scope))
+                .collect()
+        };
+
+        let internal = crate::indexer::persist::map_to_internal(&projected);
+        let db_path = data_dir.join("closure.sqlite");
+        let storage = crate::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&crate::model::types::Agent {
+                id: None,
+                slug: internal.agent_slug.clone(),
+                name: internal.agent_slug.clone(),
+                version: None,
+                kind: crate::model::types::AgentKind::Cli,
+            })
+            .unwrap();
+        let workspace_id = internal
+            .workspace
+            .as_ref()
+            .map(|ws| storage.ensure_workspace(ws, None).unwrap());
+        storage
+            .insert_conversations_batched(&[(agent_id, workspace_id, &internal)])
+            .unwrap();
+        let identity = restore_identity_from_view(view).unwrap();
+        let candidates = candidate_versions_from_db(&storage, &identity).unwrap();
+        assert_eq!(candidates.len(), 1, "库里恰有一条对应会话");
+
+        // ① 限 scope 相等 —— (A2) 的前提成立。
+        assert_eq!(
+            candidates[0].digests,
+            projection_side(DigestScope::CandidateComparable),
+            "候选可比 scope 下，DB canonical 空间必须与投影 canonical 空间逐条相等 —— \
+             不等说明两个空间有漂移，那是比本次更大的发现"
+        );
+
+        // ② 全字段 scope 下**必须不等** —— DB 丢了 `invocations`，把它钉成机器事实。
+        let db_full: Vec<CanonicalMessageDigest> = {
+            let messages = storage.fetch_messages(candidates[0].conversation_id).unwrap();
+            messages
+                .iter()
+                .map(|m| {
+                    compact_invariant_message_digest_scoped(
+                        &normalized_from_db_message(m),
+                        DigestScope::Projection,
+                    )
+                })
+                .collect()
+        };
+        assert_ne!(
+            db_full,
+            projection_side(DigestScope::Projection),
+            "全字段 scope 下两侧必须不等：DB 的 Message 没有 `invocations` 这一格。\
+             这条若变绿，说明要么样本没有工具调用（用例空转），要么 DB 真开始存 invocations 了 —— \
+             两种都必须有人看一眼"
+        );
     }
 }

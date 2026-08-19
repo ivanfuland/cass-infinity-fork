@@ -1776,7 +1776,6 @@ struct HistoricalBundleProbe {
 }
 
 #[cfg(test)]
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SqliteDatabaseHealthProbe {
     pub schema_version: Option<i64>,
@@ -2651,7 +2650,6 @@ fn franken_fts_limit_probe(conn: &FrankenConnection) -> bool {
 }
 
 #[cfg(test)]
-#[allow(dead_code)]
 pub(crate) fn probe_database_health_via_frankensqlite(
     db_path: &Path,
 ) -> Result<SqliteDatabaseHealthProbe> {
@@ -3284,7 +3282,6 @@ LEFT JOIN workspaces w ON c.workspace_id = w.id;
 ";
 
 #[cfg(test)]
-#[allow(dead_code)]
 const MIGRATION_V3: &str = r"
 DROP TABLE IF EXISTS fts_messages;
 CREATE VIRTUAL TABLE fts_messages USING fts5(
@@ -14434,11 +14431,9 @@ fn franken_update_conversation_token_summaries_in_tx(
 // 传了进来，但**编排自己也还没有调用方**，dead-code 从可达根传递判定，于是整条链
 // 依旧不可达。真正的根是 E8 把 `mirror-restore --apply` 的 CLI 接上那一刻。
 // E9 的 clippy 门以「相对基线零新增告警」为判据，这几条属本 PR 新增，故在此消掉。
-#[allow(dead_code)]
 const REPLACE_MESSAGE_INSERT_SQL: &str = "INSERT INTO messages(id, conversation_id, idx, role, author, created_at, content, extra_json, extra_bin) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)";
 
 /// `franken_replace_conversation_messages_in_tx` 的产出。
-#[allow(dead_code)]
 pub(crate) struct ReplaceConversationMessagesOutcome {
     /// 本次插入的 message id，按 `conv.messages` 顺序。
     pub inserted_message_ids: Vec<i64>,
@@ -14454,7 +14449,6 @@ pub(crate) struct ReplaceConversationMessagesOutcome {
 /// ③ 无条件全量插入，绕过 tail 规划器；
 /// ④ 事务内写 `token_usage` / `message_metrics` 与 `conversations` 的 11 个汇总列；
 /// ⑤ 保留 conversation ID。
-#[allow(dead_code)]
 pub(crate) fn franken_replace_conversation_messages_in_tx(
     tx: &FrankenTransaction<'_>,
     conversation_id: i64,
@@ -14603,7 +14597,6 @@ pub(crate) fn franken_replace_conversation_messages_in_tx(
 ///
 /// 行不存在时（该会话没有 external id，或从未走过 append）本函数是 no-op ——
 /// 那张表是缓存，缺行时读取器自会回落，凭空补一行反而是在替基线做决定。
-#[allow(dead_code)]
 pub(crate) fn franken_rebuild_external_conversation_tail_lookup_in_tx(
     tx: &FrankenTransaction<'_>,
     agent_id: i64,
@@ -14643,7 +14636,6 @@ pub(crate) fn franken_rebuild_external_conversation_tail_lookup_in_tx(
 ///
 /// **不碰的列**：`id`（保留原值）、11 个 token 汇总列（E5 已重算）、三个 tail 列
 /// （E5 的语义② 已经写过；这里再写一次会把它们从赋值语义打回抬高语义）。
-#[allow(dead_code)]
 pub(crate) fn franken_update_conversation_projection_fields_in_tx(
     tx: &FrankenTransaction<'_>,
     conversation_id: i64,
@@ -14675,7 +14667,6 @@ pub(crate) fn franken_update_conversation_projection_fields_in_tx(
 /// 推进 DB 的内容代际（`meta` 表的 `source_content_generation`）。
 ///
 /// key 常量由 E1 落，**调用方只能引用不得自由构造**（声明侧取值域封闭且静态）。
-#[allow(dead_code)]
 pub(crate) fn franken_set_source_content_generation_in_tx(
     tx: &FrankenTransaction<'_>,
     generation: &str,
@@ -14692,7 +14683,6 @@ pub(crate) fn franken_set_source_content_generation_in_tx(
 ///
 /// `idempotency_key` 上有 UNIQUE：同一 key 二次插入会硬失败，而不是静默覆盖。
 /// 这是有意的 —— 幂等的实现方式是**先查后做**，不是「重复写入被吞掉」。
-#[allow(dead_code)]
 pub(crate) fn franken_insert_operation_commit_receipt_in_tx(
     tx: &FrankenTransaction<'_>,
     idempotency_key: &str,
@@ -14722,7 +14712,6 @@ pub(crate) fn franken_insert_operation_commit_receipt_in_tx(
 ///
 /// **恢复器要能在崩溃后由全新进程只读判「已提交」**，所以这条查询只依赖
 /// `idempotency_key` 一个入参，不依赖任何内存状态。
-#[allow(dead_code)]
 pub(crate) fn franken_operation_commit_receipt_exists(
     conn: &FrankenConnection,
     idempotency_key: &str,
@@ -14750,7 +14739,6 @@ pub(crate) fn franken_operation_commit_receipt_exists(
 ///
 /// 规模说明：它扫全表 `message_metrics`。restore 的量级下可接受；若将来要按会话增量
 /// 重算，那是另一个函数，不是把这个改成半增量 —— 半增量会重新引入「删旧没扣干净」。
-#[allow(dead_code)]
 pub(crate) fn franken_recompute_usage_rollups_from_message_metrics(
     storage: &FrankenStorage,
 ) -> Result<usize> {
@@ -14817,7 +14805,6 @@ pub(crate) fn franken_recompute_usage_rollups_from_message_metrics(
 /// 两份定义的漂移由 `e5_replace_derived_rows_match_baseline_path` 逐列等价门守住。
 ///
 /// 逐列口径出处：`appendix-w2-0.md` §C.4（`token_usage`）与 §C.5（`message_metrics`）。
-#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 fn replace_derived_rows_for_message(
     conv: &Conversation,
