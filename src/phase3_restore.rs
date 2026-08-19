@@ -5044,6 +5044,29 @@ pub(crate) fn commit_replace_in_tx(
     })
 }
 
+/// Step 1b · 五张累加型物化聚合表的**提交后**重算。
+///
+/// 名单与顺序：`daily_stats` / `token_daily_stats`（各有既有的全量重建入口）+
+/// 三张 usage rollup（走 E6 新增的、只碰这三张的重算）。
+///
+/// **为什么在事务之外**：它们是提交后重算的对象（plan Task E6 Step 1b），而不是
+/// replace 事务的一部分。「提交与重算之间的崩溃窗」归 E7 的 journal 状态机覆盖 ——
+/// 恢复器按幂等 key 查到 receipt 判「已提交」并**补做**这一步，
+/// **不得靠「刚好没崩」成立**。
+///
+/// **必须绕开 `rebuild_analytics`**（裁定 D-A3-4）：它会把 `message_metrics` 的 DELETE
+/// 与三张 rollup 的 DELETE 捆进同一次全量重建，而 `message_metrics` 是事务内逐消息写、
+/// 用另一套分桶公式的表 —— 照字面调用会让它被两套公式各写一遍。
+#[allow(dead_code)]
+pub(crate) fn recompute_materialized_aggregates_after_commit(
+    storage: &crate::storage::sqlite::FrankenStorage,
+) -> anyhow::Result<()> {
+    storage.rebuild_daily_stats()?;
+    storage.rebuild_token_daily_stats()?;
+    crate::storage::sqlite::franken_recompute_usage_rollups_from_message_metrics(storage)?;
+    Ok(())
+}
+
 /// 新建分支的 `operation` 取值。与 replace 分支分开，两者的幂等 key 不得互相碰撞。
 #[allow(dead_code)]
 pub(crate) const RESTORE_NEW_OPERATION: &str = "mirror-restore-new";
@@ -5155,6 +5178,7 @@ mod e6_replace_commit_tests {
 
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
     use crate::storage::sqlite::{FrankenStorage, PricingTable};
+    use serial_test::serial;
 
     const TS: i64 = 1_770_551_400_000;
     const EXTERNAL_ID: &str = "e6-conv-1";
@@ -5646,5 +5670,160 @@ mod e6_replace_commit_tests {
             )
             .unwrap();
         assert_eq!(receipts, Some(1));
+    }
+
+    // -------------------------------------------------------------------
+    // Step 1b · 五张累加型物化聚合表的提交后重算
+    // -------------------------------------------------------------------
+
+    fn message_metrics_digest(storage: &FrankenStorage) -> Vec<String> {
+        storage
+            .raw()
+            .query_map_collect(
+                "SELECT CAST(message_id AS TEXT) || '|' || CAST(hour_id AS TEXT) || '|'
+                        || CAST(day_id AS TEXT) || '|' || agent_slug || '|'
+                        || CAST(content_tokens_est AS TEXT) || '|' || api_data_source
+                        || '|' || provider
+                 FROM message_metrics ORDER BY message_id",
+                &[],
+                |row| row.get_typed::<String>(0),
+            )
+            .unwrap()
+    }
+
+    fn rollup_digest(storage: &FrankenStorage, table: &str) -> Vec<String> {
+        storage
+            .raw()
+            .query_map_collect(
+                &format!(
+                    "SELECT agent_slug || '|' || CAST(message_count AS TEXT) || '|'
+                            || CAST(user_message_count AS TEXT) || '|'
+                            || CAST(assistant_message_count AS TEXT) || '|'
+                            || CAST(api_tokens_total AS TEXT)
+                     FROM {table} ORDER BY agent_slug, message_count"
+                ),
+                &[],
+                |row| row.get_typed::<String>(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    #[serial]
+    fn e6_step1b_recomputes_the_five_tables_without_touching_message_metrics() {
+        // ⚠ 「基线入口会不会顺手写三张 rollup」由一个**进程级默认开关**决定，而
+        // `run_index` 会把它翻成「延后」。本用例第一版没管这个开关：单独跑绿、
+        // 跟着全量 `--lib phase3_` 跑就红（前置断言读到空的 usage_hourly）——
+        // 典型的**依赖执行顺序**的脆弱用例。处置是把开关**显式钉死**，不靠环境巧合；
+        // `#[serial]` 只是额外的一道保险，不是判据本身。
+        let _analytics_inline =
+            crate::storage::sqlite::default_defer_analytics_updates_guard(false);
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open(&dir);
+        let conv_id = seed(&storage, agent_id);
+        let new_conv = replacement();
+        let id = identity();
+        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+
+        {
+            let mut tx = storage.raw().transaction().unwrap();
+            commit_replace_in_tx(
+                &tx,
+                &ReplaceCommitInput {
+                    conversation_id: conv_id,
+                    agent_id,
+                    workspace_id: None,
+                    conv: &new_conv,
+                    identity: &id,
+                    snapshot_root: "snap-root-abc",
+                    generation: "gen-e6-0001",
+                },
+                &pricing,
+                TS + 60_000,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        // ⚠ 「没被触碰」这件事，光比**值**是判不出来的：另一条路径（`rebuild_analytics`）
+        // 会重写 message_metrics，但在这份语料上两套分桶公式给出的值恰好相同，
+        // 于是「值没变」既可能是「没写」也可能是「写了一样的」——本棒实测过，
+        // 照字面调 `rebuild_analytics` 的变异**不转红**。
+        // 处置：往其中一行打一个**篡改标记**（`provider` 置哨兵值）。任何重写都会把它
+        // 覆盖掉，于是「没被触碰」从「值相等」变成了可观测的事实。
+        storage
+            .raw()
+            .execute_compat(
+                "UPDATE message_metrics SET provider = 'sentinel-untouched'
+                 WHERE message_id = (SELECT MIN(message_id) FROM message_metrics)",
+                &[],
+            )
+            .unwrap();
+
+        // ② 的取证面：重算**前**的 message_metrics 摘要。replace 的事务里它已经被
+        // 逐消息重写过一遍（E5 语义④），这里取的是那之后的状态。
+        let metrics_before = message_metrics_digest(&storage);
+        assert_eq!(
+            metrics_before.len(),
+            2,
+            "前置断言：replace 之后 message_metrics 应当是新内容的 2 行"
+        );
+
+        // 重算前三张 rollup 里还留着**旧内容**贡献的行（replace 的事务不碰它们），
+        // 先证这一点，否则「重算后对了」可能只是它本来就对。
+        let hourly_before = rollup_digest(&storage, "usage_hourly");
+        assert!(
+            hourly_before
+                .iter()
+                .any(|row| row.contains("|3|") || row.contains("|1|2|")),
+            "前置断言：重算前 usage_hourly 应当还带着旧内容（3 条消息）的贡献，实得 {hourly_before:?}"
+        );
+
+        recompute_materialized_aggregates_after_commit(&storage).unwrap();
+
+        // ① 五张表按新内容重算：新内容是 2 条消息（1 user + 1 assistant）。
+        let hourly_after = rollup_digest(&storage, "usage_hourly");
+        assert_eq!(
+            hourly_after,
+            vec!["codex|2|1|1|0".to_string()],
+            "usage_hourly 必须只反映新内容：2 条消息 = 1 user + 1 assistant，\
+             且旧内容那一条的贡献必须被**扣掉**（累加型表的重算判据就在这个「扣掉」上）"
+        );
+        assert_eq!(
+            rollup_digest(&storage, "usage_daily"),
+            vec!["codex|2|1|1|0".to_string()],
+            "usage_daily 同理"
+        );
+        let daily_rows: Vec<String> = storage
+            .raw()
+            .query_map_collect(
+                "SELECT CAST(day_id AS TEXT) || '/' || agent_slug || '/' || source_id || '='
+                        || CAST(session_count AS TEXT) || ',' || CAST(message_count AS TEXT)
+                 FROM daily_stats ORDER BY day_id, agent_slug, source_id",
+                &[],
+                |row| row.get_typed::<String>(0),
+            )
+            .unwrap();
+        // `daily_stats` 是**带汇总维度**的：同一天同时有 `agent/source`、`agent/all`、
+        // `all/source`、`all/all` 四行（所以不能拿 SUM 当判据 —— 那会把同一份数据数四遍，
+        // 本棒第一版正是这么写的，读到 8 才发现）。逐行断言四个维度都重算到 2。
+        assert_eq!(
+            daily_rows,
+            vec![
+                "2230/all/all=1,2".to_string(),
+                "2230/all/local=1,2".to_string(),
+                "2230/codex/all=1,2".to_string(),
+                "2230/codex/local=1,2".to_string(),
+            ],
+            "`daily_stats` 的四个汇总维度都必须重算到 2 条消息；留在 3 即为旧贡献没被扣掉"
+        );
+
+        // ② 全程 message_metrics 不被触碰。
+        assert_eq!(
+            message_metrics_digest(&storage),
+            metrics_before,
+            "重算全程 `message_metrics` 必须逐行不变（含那个哨兵值）—— 它是事务内逐消息写、\
+             用另一套分桶公式的表，被重算路径顺手重写就等于让它被两套公式各写一遍"
+        );
     }
 }

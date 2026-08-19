@@ -14737,6 +14737,77 @@ pub(crate) fn franken_operation_commit_receipt_exists(
     Ok(found.is_some())
 }
 
+/// Step 1b · 只重算三张 usage rollup，**不碰 `message_metrics`**。
+///
+/// plan Task E6 Step 1b 明令**不得经 `rebuild_analytics`** —— 它在同一事务里把
+/// `message_metrics` 的 DELETE 与三张 rollup 的 DELETE 捆成一次全量重建，而
+/// `message_metrics` 按 E5 语义④ 是**事务内、逐消息写、用另一套分桶公式**，
+/// 照字面调用会让它被两套公式各写一遍。
+///
+/// **不自己写 GROUP BY**：rollup 的聚合口径已经有唯一定义（`AnalyticsRollupAggregator`
+/// 的 `record` + `franken_flush_analytics_rollups_in_tx`），这里把 `message_metrics`
+/// 的行读回来重新喂给它，于是三张 rollup 仍然是那一份定义的产物，没有第二份。
+///
+/// 规模说明：它扫全表 `message_metrics`。restore 的量级下可接受；若将来要按会话增量
+/// 重算，那是另一个函数，不是把这个改成半增量 —— 半增量会重新引入「删旧没扣干净」。
+#[allow(dead_code)]
+pub(crate) fn franken_recompute_usage_rollups_from_message_metrics(
+    storage: &FrankenStorage,
+) -> Result<usize> {
+    let entries: Vec<MessageMetricsEntry> = storage.conn.query_map_collect(
+        "SELECT message_id, created_at_ms, hour_id, day_id, agent_slug, workspace_id,
+                source_id, role, content_chars, content_tokens_est, model_name,
+                model_family, model_tier, provider, api_input_tokens, api_output_tokens,
+                api_cache_read_tokens, api_cache_creation_tokens, api_thinking_tokens,
+                api_service_tier, api_data_source, tool_call_count, has_tool_calls, has_plan
+         FROM message_metrics
+         ORDER BY message_id",
+        fparams![],
+        |row| {
+            Ok(MessageMetricsEntry {
+                message_id: row.get_typed(0)?,
+                created_at_ms: row.get_typed(1)?,
+                hour_id: row.get_typed(2)?,
+                day_id: row.get_typed(3)?,
+                agent_slug: row.get_typed(4)?,
+                workspace_id: row.get_typed(5)?,
+                source_id: row.get_typed(6)?,
+                role: row.get_typed(7)?,
+                content_chars: row.get_typed(8)?,
+                content_tokens_est: row.get_typed(9)?,
+                model_name: row.get_typed(10)?,
+                model_family: row.get_typed(11)?,
+                model_tier: row.get_typed(12)?,
+                provider: row.get_typed(13)?,
+                api_input_tokens: row.get_typed(14)?,
+                api_output_tokens: row.get_typed(15)?,
+                api_cache_read_tokens: row.get_typed(16)?,
+                api_cache_creation_tokens: row.get_typed(17)?,
+                api_thinking_tokens: row.get_typed(18)?,
+                api_service_tier: row.get_typed(19)?,
+                api_data_source: row.get_typed(20)?,
+                tool_call_count: row.get_typed(21)?,
+                has_tool_calls: row.get_typed::<i64>(22)? != 0,
+                has_plan: row.get_typed::<i64>(23)? != 0,
+            })
+        },
+    )?;
+
+    let mut agg = AnalyticsRollupAggregator::new();
+    for entry in &entries {
+        agg.record(entry);
+    }
+
+    let mut tx = storage.conn.transaction()?;
+    for table in ["usage_hourly", "usage_daily", "usage_models_daily"] {
+        tx.execute_compat(&format!("DELETE FROM {table}"), fparams![])?;
+    }
+    let (hourly, daily, models_daily) = franken_flush_analytics_rollups_in_tx(&tx, &agg)?;
+    tx.commit()?;
+
+    Ok(hourly + daily + models_daily)
+}
+
 /// replace 侧逐消息派生 `token_usage` / `message_metrics` 两行。
 ///
 /// **这是基线派生逻辑的第二份定义**（裁定 R-E-41 选 A′）。基线那份是
