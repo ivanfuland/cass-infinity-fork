@@ -3445,6 +3445,206 @@ mod e5_materialization_tests {
         );
     }
 
+    // ---- §B.3 Codex 家族的契约批 -------------------------------------------
+    //
+    // 同样是**契约验证**。选这几条是因为它们是三家差异最大、也最容易被实现者「顺手统一」
+    // 掉的地方——统一了就会静默改变 canonical 语料的构成。
+
+    const CODEX_PATH: &str = "/home/u/.codex/sessions/2026/01/01/rollout-2026-01-01t00-00-00.jsonl";
+
+    /// 一份走全 §B.3.1/§B.3.2 主要分支的 codex 样本。
+    const CODEX_ALL_BRANCHES: &str = concat!(
+        r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"cwd":"/w/repo"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-01-01T00:00:01Z","type":"turn_context","payload":{"model":"gpt-5.5"}}"#,
+        "\n",
+        // developer：§B.3.1 明写整条 continue（上位 §5.2「developer 整条永久 drop」）
+        r#"{"timestamp":"2026-01-01T00:00:02Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"you are codex"}]}}"#,
+        "\n",
+        r#"{"timestamp":"2026-01-01T00:00:03Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"list files"}]}}"#,
+        "\n",
+        r#"{"timestamp":"2026-01-01T00:00:04Z","type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"plan it"}]}}"#,
+        "\n",
+        r#"{"timestamp":"2026-01-01T00:00:05Z","type":"response_item","payload":{"type":"function_call","name":"shell","call_id":"call_1","arguments":"{\"cmd\":\"ls\"}"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-01-01T00:00:06Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_1","output":"a.txt"}}"#,
+        "\n",
+        // event_msg 的 agent_message：§B.3.2 第一行，最先判、直接 continue（去重）
+        r#"{"timestamp":"2026-01-01T00:00:07Z","type":"event_msg","payload":{"type":"agent_message","message":"dup of response_item"}}"#,
+        "\n",
+    );
+
+    fn project_codex(tag: &str, bytes: &[u8]) -> Box<NormalizedConversation> {
+        let root = scratch(tag);
+        let input = SealedSource {
+            agent: Origin::Codex,
+            canonical_original_path: CODEX_PATH,
+            source_size_bytes: bytes.len() as u64,
+            blob: bytes,
+        };
+        match project_sealed_source(&root, &input, &test_provenance()).unwrap() {
+            SealedProjection::Projected(conv) => conv,
+            other => panic!("期望 Projected，实得 {other:?}"),
+        }
+    }
+
+    /// §B.3.1：`role=developer` 的 message **整条不产消息**。
+    ///
+    /// 这条不是「过滤噪声」这种可商量的优化，是上位 §5.2 的硬约束由 parser 的 guard 实现。
+    /// 若哪天它开始产消息，canonical 语料会静默多出一整类系统提示词，而下游画像会把它
+    /// 当成用户内容——正是上位那条约束要防的东西。
+    #[test]
+    fn contract_codex_developer_role_produces_no_message() {
+        let conv = project_codex("b11-codex-dev", CODEX_ALL_BRANCHES.as_bytes());
+        let contents: Vec<&str> = conv.messages.iter().map(|m| m.content.as_str()).collect();
+        assert!(
+            !contents.iter().any(|c| c.contains("you are codex")),
+            "§B.3.1：developer 整条 drop，实得 {contents:?}"
+        );
+        // 先证探针有分辨力：同一份样本里**其他**分支确实产出了消息。
+        assert!(
+            contents.iter().any(|c| c.contains("list files")),
+            "样本没产出任何消息，本断言就分不出「被 drop」与「压根没解析」"
+        );
+    }
+
+    /// §B.3.1/§B.3.2：`raw_role` 是**分支名**而不是 canonical role —— 三家里只有 codex 这样，
+    /// 把它「顺手统一成 canonical role」会让 W2 侧再也认不出这条消息出自哪个分支。
+    #[test]
+    fn contract_codex_raw_role_records_the_branch_not_the_canonical_role() {
+        let conv = project_codex("b11-codex-rawrole", CODEX_ALL_BRANCHES.as_bytes());
+        let pairs: Vec<(&str, &str)> = conv
+            .messages
+            .iter()
+            .map(|m| {
+                (
+                    m.role.as_str(),
+                    m.extra
+                        .get("raw_role")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("<missing>"),
+                )
+            })
+            .collect();
+
+        for (role, raw) in &pairs {
+            assert_ne!(
+                *raw, "<missing>",
+                "P3：codex 侧同样每条都要有 raw_role：{pairs:?}"
+            );
+            match *role {
+                "tool_call" => assert_eq!(
+                    *raw, "function_call",
+                    "§B.3.1：`function_call` 的 raw_role 是分支名，不是 canonical role"
+                ),
+                "tool_result" => assert_eq!(*raw, "function_call_output"),
+                "reasoning" => assert_eq!(*raw, "reasoning"),
+                _ => {}
+            }
+        }
+        assert!(
+            pairs.iter().any(|(r, _)| *r == "tool_call"),
+            "样本应覆盖 function_call 分支：{pairs:?}"
+        );
+    }
+
+    /// §B.3.2 第一行：`event_msg` 的 `agent_message` **最先判、直接 continue**。
+    ///
+    /// 它与 `response_item` 的可见回复是同一条内容的两次出现；不去重就会让每条 assistant
+    /// 回复在 canonical 语料里出现两遍。
+    #[test]
+    fn contract_codex_event_msg_agent_message_is_deduplicated() {
+        let conv = project_codex("b11-codex-dedup", CODEX_ALL_BRANCHES.as_bytes());
+        let dup_hits = conv
+            .messages
+            .iter()
+            .filter(|m| m.content.contains("dup of response_item"))
+            .count();
+        assert_eq!(
+            dup_hits, 0,
+            "§B.3.2：event_msg 的 agent_message 必须被丢弃（与 response_item 重复）"
+        );
+    }
+
+    /// §B.3.3：`turn_context.model` 是**滚动值** —— 它之后的 assistant / reasoning /
+    /// tool_call 的 author 全靠它；`session_meta.cwd` 成为 workspace。
+    #[test]
+    fn contract_codex_rolling_model_and_session_cwd_become_author_and_workspace() {
+        let conv = project_codex("b11-codex-rolling", CODEX_ALL_BRANCHES.as_bytes());
+        assert_eq!(
+            conv.workspace.as_deref(),
+            Some(std::path::Path::new("/w/repo")),
+            "§B.3.3：session_meta 的 cwd 成为 workspace"
+        );
+        for m in conv
+            .messages
+            .iter()
+            .filter(|m| matches!(m.role.as_str(), "reasoning" | "tool_call"))
+        {
+            assert_eq!(
+                m.author.as_deref(),
+                Some("gpt-5.5"),
+                "§B.3.3：turn_context 之后的消息 author 取滚动的 current_model（idx={}）",
+                m.idx
+            );
+        }
+        // user 侧不得被伪造成模型。
+        for m in conv.messages.iter().filter(|m| m.role == "user") {
+            assert!(
+                m.author.is_none(),
+                "§B.3.1：user 的 author 为 None，不伪造模型"
+            );
+        }
+    }
+
+    /// §B.3.1 里最锋利的一条不对称：**`function_call` 的 id 回退 `call_id → id`，
+    /// 而 `function_call_output` 的配对 id 只认 `call_id`、不回退 `id`。**
+    ///
+    /// 附录点名这条是因为它看起来像笔误、极易被「顺手对齐成一样」。真对齐了会发生什么：
+    /// 一条只带 `id` 的 output 会被配上一个**它并不对应**的 tool_call，于是 pairing 从
+    /// 「诚实的 unpaired」变成「错误的已配对」——后者在任何下游都不会再报警。
+    #[test]
+    fn contract_codex_tool_output_pairing_does_not_fall_back_to_id() {
+        let bytes = concat!(
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"turn_context","payload":{"model":"gpt-5.5"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-01-01T00:00:01Z","type":"response_item","payload":{"type":"function_call","name":"shell","id":"only_id_1","arguments":"{}"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-01-01T00:00:02Z","type":"response_item","payload":{"type":"function_call_output","id":"only_id_1","output":"done"}}"#,
+            "\n",
+        )
+        .as_bytes();
+        let conv = project_codex("b11-codex-pairing", bytes);
+
+        let call = conv
+            .messages
+            .iter()
+            .find(|m| m.role == "tool_call")
+            .expect("样本含一个 function_call");
+        assert_eq!(
+            call.extra.get("tool_call_id").and_then(|v| v.as_str()),
+            Some("only_id_1"),
+            "§B.3.1：function_call 的 id 回退到 `id`（`call_id` 缺失时）"
+        );
+
+        let output = conv
+            .messages
+            .iter()
+            .find(|m| m.role == "tool_result")
+            .expect("样本含一个 function_call_output");
+        assert!(
+            output.extra.get("tool_call_id").is_none(),
+            "§B.3.1：function_call_output **只认 `call_id`**，不得回退到 `id`；\
+             回退会把「诚实的 unpaired」变成「错误的已配对」，实得 {}",
+            output.extra
+        );
+        assert!(
+            output.extra.get("unpaired").is_some(),
+            "配不上时必须显式标 unpaired（P8 的异或另一侧），实得 {}",
+            output.extra
+        );
+    }
+
     #[test]
     fn desktop_sidecar_detection_matches_components_not_substrings() {
         assert!(path_is_claude_desktop_sidecar(Path::new(
