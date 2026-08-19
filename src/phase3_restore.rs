@@ -5910,6 +5910,8 @@ pub(crate) struct RestoreRunPlan {
     pub data_dir: PathBuf,
     pub scratch_dir: PathBuf,
     pub db_path: PathBuf,
+    /// W1 commit marker 的落点。**文件单源**（裁定 R-E-51）；DB 侧不落第二份。
+    pub marker_path: PathBuf,
     pub snapshot_root: String,
     pub generation: String,
     pub planned: Vec<RestorePlanItem>,
@@ -5923,6 +5925,7 @@ pub(crate) struct RestoreJournal {
     pub data_dir: PathBuf,
     pub scratch_dir: PathBuf,
     pub db_path: PathBuf,
+    pub marker_path: PathBuf,
     pub snapshot_root: String,
     pub generation: String,
     pub planned: Vec<RestorePlanItem>,
@@ -5948,6 +5951,7 @@ pub(crate) fn restore_journal_from_plan(plan: RestoreRunPlan) -> RestoreJournal 
         data_dir: plan.data_dir,
         scratch_dir: plan.scratch_dir,
         db_path: plan.db_path,
+        marker_path: plan.marker_path,
         snapshot_root: plan.snapshot_root,
         generation: plan.generation,
         planned: plan.planned,
@@ -6439,7 +6443,655 @@ fn restore_drive(
         restore_journal_advance(journal, journal_path, RestoreJournalState::ClosureVerified)?;
         restore_pause_if_requested("closure-verified");
     }
+
+    // 第 7 格 · 「直接写 commit marker」（§5.2.5）。**无条件调用、靠先查后做幂等**：
+    // 恢复器会在终态上被反复唤醒，marker 已存在且内容相同即 no-op，不同则硬失败不覆盖。
+    let marker = build_w1_commit_marker(journal, journal_path)?;
+    write_w1_commit_marker(&marker, &journal.marker_path)?;
     Ok(outcome)
+}
+
+
+// ===========================================================================
+// E7 Step 3 · W1 commit marker 与**解析级**资格门
+//
+// wire 说明见 run root 的 `e7-w1-commit-marker-wire.md`（裁定 R-E-51 落点单源、
+// R-E-53 编码走 canonical JSON + 单 BLAKE3、**有意不与 A5 同构**，理由三条在说明 §5）。
+//
+// 承重的一句话：**资格门不是文件存在判定**。marker 说「我提交了这些」，
+// receipt 说「这些确实提交过」—— 两个独立真源对上才算数。
+// ===========================================================================
+
+pub(crate) const W1_COMMIT_MARKER_SCHEMA: &str = "marker.w1-commit";
+pub(crate) const W1_COMMIT_MARKER_SCHEMA_VERSION: i64 = 1;
+// ⚠ staged landing 记账（同 E5/E6 惯例，不是把死代码放行）：非测试构建里它的调用方
+// 要到 **E8 接 `mirror-restore` CLI** 那一刻才出现（解析 marker 落点）。判据仍是
+// 「删掉 allow 之后 clippy 不报 never-used」，移除义务挂在 E8 验收面。
+#[allow(dead_code)]
+pub(crate) const W1_COMMIT_MARKER_FILENAME: &str = "w1-commit-marker.json";
+
+/// 候选 DB 稳定副本的强身份。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct W1DbIdentity {
+    pub sqlite_digest: String,
+    pub sqlite_size_bytes: u64,
+    pub schema_version: i64,
+    pub generation: String,
+}
+
+/// mirror 工作树的身份。**与 DB 侧一起才构成绑定**：只钉一侧时换掉另一侧照样过门，
+/// 而 manifest 恰恰是 W1 自己的写对象之一（relink 写的就是它）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct W1MirrorIdentity {
+    pub manifest_count: u64,
+    pub manifest_root: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct W1CommitMarker {
+    pub schema: String,
+    pub schema_version: i64,
+    pub operation_id: String,
+    pub snapshot_root: String,
+    pub content_generation: String,
+    pub journal_state: String,
+    pub journal_digest: String,
+    pub closure_verdict: String,
+    pub planned_count: i64,
+    /// **升序去重**（set 语义）：否则同一批内容因枚举顺序不同算出不同摘要。
+    pub receipt_keys: Vec<String>,
+    pub db_identity: W1DbIdentity,
+    pub mirror_identity: W1MirrorIdentity,
+}
+
+/// 资格门的拒绝理由。**每层以自己的名义拒绝**，错误码沿用 A5 的 `E-*` 命名，
+/// 好让 F4 的实现者在两族之间迁移直觉。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum W1MarkerError {
+    MarkerMissing,
+    Unparsable(String),
+    UnknownField(String),
+    MissingField(String),
+    TypeMismatch(String),
+    SchemaMismatch { got: String },
+    JournalNotTerminal { detail: String },
+    ClosureNotPass { got: String },
+    IdentityMismatch { field: String },
+    ReceiptMissing { key: String },
+    GenerationMismatch { marker: String, db: String },
+}
+
+impl W1MarkerError {
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            W1MarkerError::MarkerMissing => "E-MARKER-MISSING",
+            W1MarkerError::Unparsable(_) => "E-MARKER-UNPARSABLE",
+            W1MarkerError::UnknownField(_) => "E-UNKNOWN-FIELD",
+            W1MarkerError::MissingField(_) => "E-MISSING-FIELD",
+            W1MarkerError::TypeMismatch(_) => "E-TYPE-MISMATCH",
+            W1MarkerError::SchemaMismatch { .. } => "E-SCHEMA-MISMATCH",
+            W1MarkerError::JournalNotTerminal { .. } => "E-JOURNAL-NOT-TERMINAL",
+            W1MarkerError::ClosureNotPass { .. } => "E-CLOSURE-NOT-PASS",
+            W1MarkerError::IdentityMismatch { .. } => "E-IDENTITY-MISMATCH",
+            W1MarkerError::ReceiptMissing { .. } => "E-RECEIPT-MISSING",
+            W1MarkerError::GenerationMismatch { .. } => "E-GENERATION-MISMATCH",
+        }
+    }
+}
+
+impl std::fmt::Display for W1MarkerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {:?}", self.code(), self)
+    }
+}
+
+// ── canonical bytes（wire 说明 §5.1，形制钉死）─────────────────────────────
+//
+// UTF-8 无 BOM / 键按字节序升序 / 零多余空白 / 仅整数十进制 / 非 ASCII 不转义 /
+// 无 null / 结尾无换行。**摘要的意义完全取决于这套形制的唯一性**，所以它有一条
+// vector 式固定测试：期望字节与期望摘要是手工钉死的常量，不由编码器自己算。
+
+fn canon_push_str(out: &mut String, s: &str) {
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+fn canon_kv_str(out: &mut String, key: &str, value: &str, first: &mut bool) {
+    if !*first {
+        out.push(',');
+    }
+    *first = false;
+    canon_push_str(out, key);
+    out.push(':');
+    canon_push_str(out, value);
+}
+
+fn canon_kv_int(out: &mut String, key: &str, value: i64, first: &mut bool) {
+    if !*first {
+        out.push(',');
+    }
+    *first = false;
+    canon_push_str(out, key);
+    out.push(':');
+    out.push_str(&value.to_string());
+}
+
+impl W1CommitMarker {
+    pub(crate) fn canonical_bytes(&self) -> Vec<u8> {
+        let mut out = String::new();
+        out.push('{');
+        let mut first = true;
+        canon_kv_str(&mut out, "closure_verdict", &self.closure_verdict, &mut first);
+        canon_kv_str(
+            &mut out,
+            "content_generation",
+            &self.content_generation,
+            &mut first,
+        );
+        // db_identity
+        out.push(',');
+        canon_push_str(&mut out, "db_identity");
+        out.push_str(":{");
+        {
+            let mut inner = true;
+            canon_kv_str(&mut out, "generation", &self.db_identity.generation, &mut inner);
+            canon_kv_int(
+                &mut out,
+                "schema_version",
+                self.db_identity.schema_version,
+                &mut inner,
+            );
+            canon_kv_str(
+                &mut out,
+                "sqlite_digest",
+                &self.db_identity.sqlite_digest,
+                &mut inner,
+            );
+            canon_kv_int(
+                &mut out,
+                "sqlite_size_bytes",
+                self.db_identity.sqlite_size_bytes as i64,
+                &mut inner,
+            );
+        }
+        out.push('}');
+        canon_kv_str(&mut out, "journal_digest", &self.journal_digest, &mut first);
+        canon_kv_str(&mut out, "journal_state", &self.journal_state, &mut first);
+        // mirror_identity
+        out.push(',');
+        canon_push_str(&mut out, "mirror_identity");
+        out.push_str(":{");
+        {
+            let mut inner = true;
+            canon_kv_int(
+                &mut out,
+                "manifest_count",
+                self.mirror_identity.manifest_count as i64,
+                &mut inner,
+            );
+            canon_kv_str(
+                &mut out,
+                "manifest_root",
+                &self.mirror_identity.manifest_root,
+                &mut inner,
+            );
+        }
+        out.push('}');
+        canon_kv_str(&mut out, "operation_id", &self.operation_id, &mut first);
+        canon_kv_int(&mut out, "planned_count", self.planned_count, &mut first);
+        // receipt_keys（set 语义：升序去重由构造方保证，这里只做序列化）
+        out.push(',');
+        canon_push_str(&mut out, "receipt_keys");
+        out.push_str(":[");
+        for (i, key) in self.receipt_keys.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            canon_push_str(&mut out, key);
+        }
+        out.push(']');
+        canon_kv_str(&mut out, "schema", &self.schema, &mut first);
+        canon_kv_int(&mut out, "schema_version", self.schema_version, &mut first);
+        canon_kv_str(&mut out, "snapshot_root", &self.snapshot_root, &mut first);
+        out.push('}');
+        out.into_bytes()
+    }
+
+    /// 闭世界解析：未声明字段 → `E-UNKNOWN-FIELD`；缺字段 → `E-MISSING-FIELD`。
+    pub(crate) fn parse(bytes: &[u8]) -> Result<W1CommitMarker, W1MarkerError> {
+        let value: serde_json::Value = serde_json::from_slice(bytes)
+            .map_err(|e| W1MarkerError::Unparsable(e.to_string()))?;
+        let obj = value
+            .as_object()
+            .ok_or_else(|| W1MarkerError::Unparsable("top level is not an object".into()))?;
+
+        const TOP: &[&str] = &[
+            "closure_verdict",
+            "content_generation",
+            "db_identity",
+            "journal_digest",
+            "journal_state",
+            "mirror_identity",
+            "operation_id",
+            "planned_count",
+            "receipt_keys",
+            "schema",
+            "schema_version",
+            "snapshot_root",
+        ];
+        for key in obj.keys() {
+            if !TOP.contains(&key.as_str()) {
+                return Err(W1MarkerError::UnknownField(key.clone()));
+            }
+        }
+        let want_str = |k: &str| -> Result<String, W1MarkerError> {
+            let v = obj
+                .get(k)
+                .ok_or_else(|| W1MarkerError::MissingField(k.to_string()))?;
+            v.as_str()
+                .map(|s| s.to_string())
+                .ok_or_else(|| W1MarkerError::TypeMismatch(k.to_string()))
+        };
+        let want_int = |k: &str| -> Result<i64, W1MarkerError> {
+            let v = obj
+                .get(k)
+                .ok_or_else(|| W1MarkerError::MissingField(k.to_string()))?;
+            v.as_i64()
+                .ok_or_else(|| W1MarkerError::TypeMismatch(k.to_string()))
+        };
+        let want_obj = |k: &str,
+                        allowed: &[&str]|
+         -> Result<serde_json::Map<String, serde_json::Value>, W1MarkerError> {
+            let v = obj
+                .get(k)
+                .ok_or_else(|| W1MarkerError::MissingField(k.to_string()))?;
+            let m = v
+                .as_object()
+                .ok_or_else(|| W1MarkerError::TypeMismatch(k.to_string()))?;
+            for key in m.keys() {
+                if !allowed.contains(&key.as_str()) {
+                    return Err(W1MarkerError::UnknownField(format!("{k}.{key}")));
+                }
+            }
+            Ok(m.clone())
+        };
+
+        let db = want_obj(
+            "db_identity",
+            &[
+                "generation",
+                "schema_version",
+                "sqlite_digest",
+                "sqlite_size_bytes",
+            ],
+        )?;
+        let mirror = want_obj("mirror_identity", &["manifest_count", "manifest_root"])?;
+        let nested_str = |m: &serde_json::Map<String, serde_json::Value>,
+                          parent: &str,
+                          k: &str|
+         -> Result<String, W1MarkerError> {
+            m.get(k)
+                .ok_or_else(|| W1MarkerError::MissingField(format!("{parent}.{k}")))?
+                .as_str()
+                .map(|s| s.to_string())
+                .ok_or_else(|| W1MarkerError::TypeMismatch(format!("{parent}.{k}")))
+        };
+        let nested_int = |m: &serde_json::Map<String, serde_json::Value>,
+                          parent: &str,
+                          k: &str|
+         -> Result<i64, W1MarkerError> {
+            m.get(k)
+                .ok_or_else(|| W1MarkerError::MissingField(format!("{parent}.{k}")))?
+                .as_i64()
+                .ok_or_else(|| W1MarkerError::TypeMismatch(format!("{parent}.{k}")))
+        };
+
+        let receipt_keys_value = obj
+            .get("receipt_keys")
+            .ok_or_else(|| W1MarkerError::MissingField("receipt_keys".into()))?;
+        let arr = receipt_keys_value
+            .as_array()
+            .ok_or_else(|| W1MarkerError::TypeMismatch("receipt_keys".into()))?;
+        let mut receipt_keys = Vec::with_capacity(arr.len());
+        for item in arr {
+            receipt_keys.push(
+                item.as_str()
+                    .ok_or_else(|| W1MarkerError::TypeMismatch("receipt_keys[]".into()))?
+                    .to_string(),
+            );
+        }
+        // set 语义：升序且无重复。乱序/重复的 marker 直接判不可解析形态，
+        // 否则「摘要是内容的函数」这条就不成立了。
+        let mut sorted = receipt_keys.clone();
+        sorted.sort();
+        sorted.dedup();
+        if sorted != receipt_keys {
+            return Err(W1MarkerError::Unparsable(
+                "receipt_keys must be sorted and unique (set semantics)".into(),
+            ));
+        }
+
+        Ok(W1CommitMarker {
+            schema: want_str("schema")?,
+            schema_version: want_int("schema_version")?,
+            operation_id: want_str("operation_id")?,
+            snapshot_root: want_str("snapshot_root")?,
+            content_generation: want_str("content_generation")?,
+            journal_state: want_str("journal_state")?,
+            journal_digest: want_str("journal_digest")?,
+            closure_verdict: want_str("closure_verdict")?,
+            planned_count: want_int("planned_count")?,
+            receipt_keys,
+            db_identity: W1DbIdentity {
+                sqlite_digest: nested_str(&db, "db_identity", "sqlite_digest")?,
+                sqlite_size_bytes: nested_int(&db, "db_identity", "sqlite_size_bytes")? as u64,
+                schema_version: nested_int(&db, "db_identity", "schema_version")?,
+                generation: nested_str(&db, "db_identity", "generation")?,
+            },
+            mirror_identity: W1MirrorIdentity {
+                manifest_count: nested_int(&mirror, "mirror_identity", "manifest_count")? as u64,
+                manifest_root: nested_str(&mirror, "mirror_identity", "manifest_root")?,
+            },
+        })
+    }
+}
+
+/// 读 DB 里的内容代际（`meta` 保留 key）。key 常量与写侧共用一个，**不在两处各写一份**。
+fn read_content_generation(db_path: &Path) -> anyhow::Result<Option<String>> {
+    use frankensqlite::compat::{ConnectionExt as _, OptionalExtension as _, RowExt as _};
+    let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(db_path)
+        .map_err(|e| anyhow::anyhow!("open db for generation read: {e}"))?;
+    let got: Option<String> = storage
+        .raw()
+        .query_row_map(
+            "SELECT value FROM meta WHERE key = ?1",
+            &[frankensqlite::compat::ParamValue::from(
+                crate::storage::sqlite::SOURCE_CONTENT_GENERATION_META_KEY,
+            )],
+            |row| row.get_typed(0),
+        )
+        .optional()?
+        .flatten();
+    storage.close_best_effort_in_place();
+    Ok(got)
+}
+
+fn file_digest(path: &Path) -> anyhow::Result<String> {
+    let bytes = std::fs::read(path)?;
+    Ok(blake3::hash(&bytes).to_hex().to_string())
+}
+
+/// mirror 工作树身份：manifest 相对路径与内容摘要**排序后**的聚合摘要。
+fn mirror_identity_of(data_dir: &Path) -> anyhow::Result<W1MirrorIdentity> {
+    let views = crate::raw_mirror::manifest_views(data_dir)?;
+    let mut rows: Vec<String> = views
+        .iter()
+        .map(|v| format!("{}\u{1f}{}", v.manifest_relative_path, v.blob_blake3))
+        .collect();
+    rows.sort();
+    let mut hasher = blake3::Hasher::new();
+    for row in &rows {
+        hasher.update(row.as_bytes());
+        hasher.update(b"\x1e");
+    }
+    Ok(W1MirrorIdentity {
+        manifest_count: rows.len() as u64,
+        manifest_root: hasher.finalize().to_hex().to_string(),
+    })
+}
+
+fn db_identity_of(db_path: &Path, generation: &str) -> anyhow::Result<W1DbIdentity> {
+    let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(db_path)
+        .map_err(|e| anyhow::anyhow!("open db for identity: {e}"))?;
+    let schema_version = storage.schema_version()?;
+    storage.close_best_effort_in_place();
+    Ok(W1DbIdentity {
+        sqlite_digest: file_digest(db_path)?,
+        sqlite_size_bytes: std::fs::metadata(db_path)?.len(),
+        schema_version,
+        generation: generation.to_string(),
+    })
+}
+
+/// 由 journal（**必须是终态**）产出 marker 的内容。
+#[allow(dead_code)]
+pub(crate) fn build_w1_commit_marker(
+    journal: &RestoreJournal,
+    journal_path: &Path,
+) -> anyhow::Result<W1CommitMarker> {
+    if journal.state != RestoreJournalState::ClosureVerified {
+        anyhow::bail!(
+            "refusing to build a W1 commit marker from a non-terminal journal ({:?})",
+            journal.state
+        );
+    }
+    let views = crate::raw_mirror::manifest_views(&journal.data_dir)?;
+    let mut receipt_keys = Vec::new();
+    for item in &journal.planned {
+        let view = views
+            .iter()
+            .find(|v| v.manifest_id == item.manifest_id)
+            .ok_or_else(|| anyhow::anyhow!("planned manifest {} not in mirror", item.manifest_id))?;
+        let identity = restore_identity_from_view(view)?;
+        receipt_keys.push(restore_idempotency_key_for(
+            item.action,
+            &journal.snapshot_root,
+            &identity,
+        ));
+    }
+    receipt_keys.sort();
+    receipt_keys.dedup();
+
+    let generation = read_content_generation(&journal.db_path)?
+        .ok_or_else(|| anyhow::anyhow!("candidate db carries no source content generation"))?;
+
+    Ok(W1CommitMarker {
+        schema: W1_COMMIT_MARKER_SCHEMA.to_string(),
+        schema_version: W1_COMMIT_MARKER_SCHEMA_VERSION,
+        operation_id: journal.operation_id.clone(),
+        snapshot_root: journal.snapshot_root.clone(),
+        content_generation: generation.clone(),
+        journal_state: "closure-verified".to_string(),
+        journal_digest: file_digest(journal_path)?,
+        closure_verdict: "pass".to_string(),
+        planned_count: journal.planned.len() as i64,
+        receipt_keys,
+        db_identity: db_identity_of(&journal.db_path, &generation)?,
+        mirror_identity: mirror_identity_of(&journal.data_dir)?,
+    })
+}
+
+/// 写 marker：**先查后做，绝不覆盖**（不变量 I1）。
+/// 已存在且逐字段相等 → no-op；不等 → 硬失败。
+#[allow(dead_code)]
+pub(crate) fn write_w1_commit_marker(
+    marker: &W1CommitMarker,
+    marker_path: &Path,
+) -> anyhow::Result<bool> {
+    if let Ok(existing) = std::fs::read(marker_path) {
+        let parsed = W1CommitMarker::parse(&existing)
+            .map_err(|e| anyhow::anyhow!("existing marker is unparsable: {e}"))?;
+        if &parsed == marker {
+            return Ok(false);
+        }
+        anyhow::bail!(
+            "existing W1 commit marker disagrees with the one we would write — refusing to overwrite"
+        );
+    }
+    use std::io::Write as _;
+    if let Some(parent) = marker_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = marker_path.with_extension("tmp");
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(&marker.canonical_bytes())?;
+        file.sync_all()?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(&tmp, marker_path)?;
+    if let Some(parent) = marker_path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(true)
+}
+
+/// 资格门的输入：**候选侧的四个磁盘对象**，没有第五个入参。
+#[allow(dead_code)]
+pub(crate) struct W1QualificationInput<'a> {
+    pub marker_path: &'a Path,
+    pub journal_path: &'a Path,
+    pub db_path: &'a Path,
+    pub data_dir: &'a Path,
+}
+
+/// **解析级机器门**（plan Task E7 Step 3），七步检查序见 wire 说明 §4。
+/// 每层以自己的名义拒绝，先到先报。
+#[allow(dead_code)]
+pub(crate) fn qualify_w1_candidate(
+    input: &W1QualificationInput<'_>,
+) -> Result<W1CommitMarker, W1MarkerError> {
+    // 1 · marker 存在且可解析为闭世界 JSON
+    let bytes = match std::fs::read(input.marker_path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(W1MarkerError::MarkerMissing);
+        }
+        Err(err) => return Err(W1MarkerError::Unparsable(err.to_string())),
+    };
+    let marker = W1CommitMarker::parse(&bytes)?;
+
+    // 2 · schema 与版本
+    if marker.schema != W1_COMMIT_MARKER_SCHEMA
+        || marker.schema_version != W1_COMMIT_MARKER_SCHEMA_VERSION
+    {
+        return Err(W1MarkerError::SchemaMismatch {
+            got: format!("{}@{}", marker.schema, marker.schema_version),
+        });
+    }
+
+    // 3 · journal 终态：**既看 marker 自称，也看磁盘上的 journal 本体**
+    if marker.journal_state != "closure-verified" {
+        return Err(W1MarkerError::JournalNotTerminal {
+            detail: format!("marker claims {}", marker.journal_state),
+        });
+    }
+    let journal = match restore_journal_read(input.journal_path) {
+        Ok(Some(journal)) => journal,
+        Ok(None) => {
+            return Err(W1MarkerError::JournalNotTerminal {
+                detail: "journal file missing".into(),
+            });
+        }
+        Err(err) => {
+            return Err(W1MarkerError::JournalNotTerminal {
+                detail: format!("journal unreadable: {err}"),
+            });
+        }
+    };
+    if journal.state != RestoreJournalState::ClosureVerified {
+        return Err(W1MarkerError::JournalNotTerminal {
+            detail: format!("journal on disk is {:?}", journal.state),
+        });
+    }
+    let journal_digest = file_digest(input.journal_path).map_err(|e| {
+        W1MarkerError::JournalNotTerminal {
+            detail: format!("journal digest failed: {e}"),
+        }
+    })?;
+    if journal_digest != marker.journal_digest {
+        return Err(W1MarkerError::JournalNotTerminal {
+            detail: "journal digest does not match the marker".into(),
+        });
+    }
+
+    // 4 · closure verdict
+    if marker.closure_verdict != "pass" {
+        return Err(W1MarkerError::ClosureNotPass {
+            got: marker.closure_verdict.clone(),
+        });
+    }
+
+    // 5 · 双身份逐项相符
+    let generation = read_content_generation(input.db_path)
+        .map_err(|e| W1MarkerError::IdentityMismatch {
+            field: format!("db.generation unreadable: {e}"),
+        })?
+        .ok_or(W1MarkerError::IdentityMismatch {
+            field: "db.generation absent".into(),
+        })?;
+    let db_identity = db_identity_of(input.db_path, &generation).map_err(|e| {
+        W1MarkerError::IdentityMismatch {
+            field: format!("db identity unreadable: {e}"),
+        }
+    })?;
+    if db_identity != marker.db_identity {
+        return Err(W1MarkerError::IdentityMismatch {
+            field: "db_identity".into(),
+        });
+    }
+    let mirror_identity =
+        mirror_identity_of(input.data_dir).map_err(|e| W1MarkerError::IdentityMismatch {
+            field: format!("mirror identity unreadable: {e}"),
+        })?;
+    if mirror_identity != marker.mirror_identity {
+        return Err(W1MarkerError::IdentityMismatch {
+            field: "mirror_identity".into(),
+        });
+    }
+
+    // 6 · receipt 交叉核：marker 说「我提交了这些」，DB 副本里的 receipt 说「确实提交过」
+    let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(input.db_path)
+        .map_err(|e| W1MarkerError::ReceiptMissing {
+            key: format!("db unreadable: {e}"),
+        })?;
+    for key in &marker.receipt_keys {
+        let found = crate::storage::sqlite::franken_operation_commit_receipt_exists(
+            storage.raw(),
+            key,
+        )
+        .map_err(|e| W1MarkerError::ReceiptMissing {
+            key: format!("{key} (query failed: {e})"),
+        })?;
+        if !found {
+            storage.close_best_effort_in_place();
+            return Err(W1MarkerError::ReceiptMissing { key: key.clone() });
+        }
+    }
+    storage.close_best_effort_in_place();
+    if marker.receipt_keys.len() as i64 != marker.planned_count {
+        return Err(W1MarkerError::ReceiptMissing {
+            key: format!(
+                "receipt_keys={} != planned_count={}",
+                marker.receipt_keys.len(),
+                marker.planned_count
+            ),
+        });
+    }
+
+    // 7 · 代际
+    if marker.content_generation != generation {
+        return Err(W1MarkerError::GenerationMismatch {
+            marker: marker.content_generation.clone(),
+            db: generation,
+        });
+    }
+    Ok(marker)
 }
 
 // ===========================================================================
@@ -6772,6 +7424,7 @@ mod e7_restore_journal_tests {
             data_dir: d.data_dir.clone(),
             scratch_dir: d.scratch.clone(),
             db_path: d.db_path.clone(),
+            marker_path: d.db_path.parent().unwrap().join(W1_COMMIT_MARKER_FILENAME),
             snapshot_root: SNAPSHOT_ROOT.into(),
             generation: GENERATION.into(),
             planned: vec![
@@ -6970,6 +7623,10 @@ mod e7_restore_journal_tests {
             data_dir: PathBuf::from(std::env::var("CASS_E7_DATA_DIR").unwrap()),
             scratch_dir: PathBuf::from(std::env::var("CASS_E7_SCRATCH").unwrap()),
             db_path: PathBuf::from(std::env::var("CASS_E7_DB").unwrap()),
+            marker_path: PathBuf::from(std::env::var("CASS_E7_DB").unwrap())
+                .parent()
+                .unwrap()
+                .join(W1_COMMIT_MARKER_FILENAME),
             snapshot_root: SNAPSHOT_ROOT.into(),
             generation: GENERATION.into(),
             planned,
@@ -7252,6 +7909,7 @@ mod e7_restore_journal_tests {
             data_dir: dir.path().to_path_buf(),
             scratch_dir: dir.path().to_path_buf(),
             db_path: dir.path().join("x.sqlite"),
+            marker_path: dir.path().join(W1_COMMIT_MARKER_FILENAME),
             snapshot_root: SNAPSHOT_ROOT.into(),
             generation: GENERATION.into(),
             planned: Vec::new(),
@@ -7272,5 +7930,267 @@ mod e7_restore_journal_tests {
             "临时文件不得残留"
         );
         assert!(restore_journal_read(&path).unwrap().is_some());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Step 3 · W1 commit marker 与**解析级**资格门
+    //
+    // plan 原文：「资格检查是**解析级机器门，不是文件存在判定**」。四种非法候选全拒
+    // （缺 marker / journal 未终态 / closure 红 / 身份不符），外加一条**合法候选判 PASS
+    // 的阳性对照** —— 没有它，「全拒」有可能只是接口恒拒的假绿。
+    // ═══════════════════════════════════════════════════════════════════════
+
+    fn marker_path_of(d: &Drill) -> PathBuf {
+        d.db_path.parent().unwrap().join(W1_COMMIT_MARKER_FILENAME)
+    }
+
+    fn qualify(d: &Drill) -> Result<W1CommitMarker, W1MarkerError> {
+        let marker_path = marker_path_of(d);
+        qualify_w1_candidate(&W1QualificationInput {
+            marker_path: &marker_path,
+            journal_path: &d.journal_path,
+            db_path: &d.db_path,
+            data_dir: &d.data_dir,
+        })
+    }
+
+    /// 跑完一次完整 restore，得到一个**真候选**（marker 由恢复器自己在终态写出）。
+    fn qualified_candidate() -> Drill {
+        let d = drill();
+        plant_post_commit_sentinels(&d.data_dir, &d.db_path);
+        restore_apply_journaled(plan_for(&d), &d.journal_path).unwrap();
+        assert!(
+            marker_path_of(&d).exists(),
+            "前置断言：终态必须产出 marker，否则下面的拒绝用例分辨不出「拒对了」还是「本来就没有」"
+        );
+        d
+    }
+
+    fn rewrite_marker(d: &Drill, edit: impl FnOnce(&mut W1CommitMarker)) {
+        let bytes = std::fs::read(marker_path_of(d)).unwrap();
+        let mut marker = W1CommitMarker::parse(&bytes).unwrap();
+        edit(&mut marker);
+        std::fs::write(marker_path_of(d), marker.canonical_bytes()).unwrap();
+    }
+
+    // ── 阳性对照：合法候选必须判 PASS ────────────────────────────────────
+    #[test]
+    fn e7_qualification_accepts_a_real_candidate() {
+        let d = qualified_candidate();
+        let marker = qualify(&d).expect("合法候选必须过门");
+        assert_eq!(marker.schema, W1_COMMIT_MARKER_SCHEMA);
+        assert_eq!(marker.journal_state, "closure-verified");
+        assert_eq!(marker.closure_verdict, "pass");
+        assert_eq!(marker.planned_count, 2);
+        assert_eq!(marker.receipt_keys.len(), 2);
+    }
+
+    // ── 非法候选 ①：缺 marker ───────────────────────────────────────────
+    #[test]
+    fn e7_qualification_rejects_a_missing_marker() {
+        let d = qualified_candidate();
+        std::fs::remove_file(marker_path_of(&d)).unwrap();
+        let err = qualify(&d).expect_err("缺 marker 必须拒");
+        assert_eq!(err.code(), "E-MARKER-MISSING");
+    }
+
+    // ── 非法候选 ②：marker 在，但磁盘上的 journal **未终态** ─────────────
+    //
+    // 这条正是「文件存在判定」与「解析级机器门」的分水岭：marker 文件好端端在那儿，
+    // 只有把 journal 解析开、看它停在哪一格，才拒得掉。
+    #[test]
+    fn e7_qualification_rejects_a_non_terminal_journal() {
+        let d = qualified_candidate();
+        let mut journal = restore_journal_read(&d.journal_path).unwrap().unwrap();
+        journal.state = RestoreJournalState::AnalyticsRebuilt;
+        restore_journal_write(&d.journal_path, &journal).unwrap();
+        let err = qualify(&d).expect_err("journal 未终态必须拒");
+        assert_eq!(err.code(), "E-JOURNAL-NOT-TERMINAL");
+    }
+
+    // ── 非法候选 ③：closure 红 ──────────────────────────────────────────
+    #[test]
+    fn e7_qualification_rejects_a_red_closure() {
+        let d = qualified_candidate();
+        rewrite_marker(&d, |m| m.closure_verdict = "fail".into());
+        let err = qualify(&d).expect_err("closure 红必须拒");
+        assert_eq!(err.code(), "E-CLOSURE-NOT-PASS");
+    }
+
+    // ── 非法候选 ④：marker 与候选**身份不符** ───────────────────────────
+    //
+    // 用**真的身份漂移**构造，不是改 marker 字段：marker 写完之后往 mirror 里再封一条
+    // 会话 —— 候选那棵 mirror 工作树变了，而 marker 记的是旧身份。
+    // 这比「手改一个摘要字段」更贴近真实误用（换一棵 mirror 配一个 DB 副本）。
+    #[test]
+    fn e7_qualification_rejects_an_identity_mismatch() {
+        let d = qualified_candidate();
+        let extra_live = d.data_dir.parent().unwrap().join("extra-live");
+        let extra = write_session(&extra_live, "rollout-e7-extra.jsonl", "e7-extra");
+        capture(&d.data_dir, &extra);
+
+        let err = qualify(&d).expect_err("mirror 身份漂移必须拒");
+        assert_eq!(err.code(), "E-IDENTITY-MISMATCH");
+    }
+
+    // ── 闭世界：未声明字段 ──────────────────────────────────────────────
+    #[test]
+    fn e7_qualification_rejects_an_unknown_field() {
+        let d = qualified_candidate();
+        let bytes = std::fs::read(marker_path_of(&d)).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        let injected = format!("{{\"extra_field\":1,{}", &text[1..]);
+        std::fs::write(marker_path_of(&d), injected).unwrap();
+        let err = qualify(&d).expect_err("闭世界：未声明字段必须拒");
+        assert_eq!(err.code(), "E-UNKNOWN-FIELD");
+    }
+
+    // ── receipt 交叉核：marker 自称的 key 在 DB 副本里查不到 ─────────────
+    #[test]
+    fn e7_qualification_rejects_a_receipt_that_the_db_does_not_have() {
+        let d = qualified_candidate();
+        rewrite_marker(&d, |m| {
+            m.receipt_keys.push("zzz-nonexistent-receipt-key".into());
+            m.receipt_keys.sort();
+            m.planned_count += 1;
+        });
+        let err = qualify(&d).expect_err("marker 说提交了、DB 里没有 receipt，必须拒");
+        assert_eq!(err.code(), "E-RECEIPT-MISSING");
+    }
+
+    // ── 写 marker 是先查后做，绝不覆盖（不变量 I1）──────────────────────
+    #[test]
+    fn e7_marker_write_is_check_then_act_and_never_overwrites() {
+        let d = qualified_candidate();
+        let journal = restore_journal_read(&d.journal_path).unwrap().unwrap();
+        let marker = build_w1_commit_marker(&journal, &d.journal_path).unwrap();
+
+        // 同样内容再写一次 = no-op（返回 false），而不是覆盖。
+        assert!(
+            !write_w1_commit_marker(&marker, &marker_path_of(&d)).unwrap(),
+            "内容相同的重写必须是 no-op"
+        );
+
+        // 内容不同 → 硬失败，**不覆盖**。覆盖会把「marker 与候选身份不符」这种矛盾抹平，
+        // 而那正是资格门要抓的东西。
+        let mut tampered = marker.clone();
+        tampered.operation_id = "someone-elses-operation".into();
+        let err = write_w1_commit_marker(&tampered, &marker_path_of(&d))
+            .expect_err("内容不同必须硬失败");
+        assert!(format!("{err:#}").contains("refusing to overwrite"));
+
+        // 硬失败之后磁盘上仍是原来那份。
+        let on_disk = W1CommitMarker::parse(&std::fs::read(marker_path_of(&d)).unwrap()).unwrap();
+        assert_eq!(on_disk.operation_id, marker.operation_id);
+    }
+
+    // ── canonical 编码的 vector 式固定测试（R-E-53 条件 2）──────────────
+    //
+    // **期望字节是手工钉死的字面量，不由编码器算** —— 否则这条测试只证明
+    // 「编码器等于它自己」。摘要那条是从这份字面量派生的**变更探测**，
+    // 不是独立实现交叉校验（后者是 G1 Step 3 两实现对照那道门的事）。
+    #[test]
+    fn e7_marker_canonical_encoding_matches_the_pinned_vector() {
+        let marker = W1CommitMarker {
+            schema: W1_COMMIT_MARKER_SCHEMA.into(),
+            schema_version: 1,
+            operation_id: "op-1".into(),
+            snapshot_root: "root-1".into(),
+            content_generation: "gen-1".into(),
+            journal_state: "closure-verified".into(),
+            journal_digest: "aa".into(),
+            closure_verdict: "pass".into(),
+            planned_count: 2,
+            receipt_keys: vec!["k1".into(), "k2".into()],
+            db_identity: W1DbIdentity {
+                sqlite_digest: "bb".into(),
+                sqlite_size_bytes: 4096,
+                schema_version: 21,
+                generation: "gen-1".into(),
+            },
+            mirror_identity: W1MirrorIdentity {
+                manifest_count: 2,
+                manifest_root: "cc".into(),
+            },
+        };
+
+        const PINNED: &str = concat!(
+            "{\"closure_verdict\":\"pass\"",
+            ",\"content_generation\":\"gen-1\"",
+            ",\"db_identity\":{\"generation\":\"gen-1\",\"schema_version\":21,",
+            "\"sqlite_digest\":\"bb\",\"sqlite_size_bytes\":4096}",
+            ",\"journal_digest\":\"aa\"",
+            ",\"journal_state\":\"closure-verified\"",
+            ",\"mirror_identity\":{\"manifest_count\":2,\"manifest_root\":\"cc\"}",
+            ",\"operation_id\":\"op-1\"",
+            ",\"planned_count\":2",
+            ",\"receipt_keys\":[\"k1\",\"k2\"]",
+            ",\"schema\":\"marker.w1-commit\"",
+            ",\"schema_version\":1",
+            ",\"snapshot_root\":\"root-1\"}"
+        );
+
+        assert_eq!(
+            String::from_utf8(marker.canonical_bytes()).unwrap(),
+            PINNED,
+            "canonical 形制漂移：键序 / 空白 / 数字形制 任一变化都会让摘要失去意义"
+        );
+        assert_eq!(
+            blake3::hash(&marker.canonical_bytes()).to_hex().to_string(),
+            blake3::hash(PINNED.as_bytes()).to_hex().to_string(),
+            "摘要只对 canonical bytes 取 —— Rust 侧不另包一层 `digest()`：
+             wire 说明 §5 明写 `marker_digest` 不进 marker 自身、**由消费方算**，
+             而消费方是 F4（Python）。多包一层就是没被要求的 API。"
+        );
+
+        // 阳性：多一个空格就是另一份字节，摘要必须不等。
+        let with_space = PINNED.replacen("{\"closure_verdict\"", "{ \"closure_verdict\"", 1);
+        assert_ne!(
+            blake3::hash(with_space.as_bytes()).to_hex().to_string(),
+            blake3::hash(&marker.canonical_bytes()).to_hex().to_string(),
+            "空白敏感性：多一个空格摘要就该不同，否则 canonical 形制没有约束力"
+        );
+        // 阳性：改一个字段，摘要必须不等。
+        let mut other = marker.clone();
+        other.planned_count = 3;
+        assert_ne!(
+            blake3::hash(&other.canonical_bytes()).to_hex().to_string(),
+            blake3::hash(&marker.canonical_bytes()).to_hex().to_string()
+        );
+    }
+
+    // ── 非法候选 ②b：journal 未终态，**且 marker 的摘要与它一致** ────────
+    //
+    // 为什么要有这一条：②那条用「把 journal 改回非终态」构造，可它同时改了 journal 文件，
+    // 于是**下一层的 `journal_digest` 比对**也会拒 —— 两层共用同一个错误码，用例分辨不出
+    // 是谁拒的。M4 变异（把「必须终态」那层整个跳过）实测让②**照样绿**，就是这个缘故。
+    //
+    // 本条把摘要那层的兜底拿掉：改完 journal 之后，把 marker 的 `journal_digest`
+    // 改成这份**非终态** journal 的真实摘要。于是只有「状态必须是终态」那一层能拒它，
+    // 并且断言 detail 指向 `journal on disk is`，让两层在断言层面可分辨。
+    //
+    // 判据出处：D5 已入库的那条 —— **每一层必须以自己的名义拒绝；靠别的层兜住，
+    // 等于这一层没有守卫、只有运气。**
+    #[test]
+    fn e7_qualification_rejects_a_non_terminal_journal_even_when_the_digest_agrees() {
+        let d = qualified_candidate();
+        let mut journal = restore_journal_read(&d.journal_path).unwrap().unwrap();
+        journal.state = RestoreJournalState::AnalyticsRebuilt;
+        restore_journal_write(&d.journal_path, &journal).unwrap();
+
+        let agreeing = blake3::hash(&std::fs::read(&d.journal_path).unwrap())
+            .to_hex()
+            .to_string();
+        rewrite_marker(&d, |m| m.journal_digest = agreeing);
+
+        let err = qualify(&d).expect_err("非终态 journal 必须被**这一层**拒掉");
+        assert_eq!(err.code(), "E-JOURNAL-NOT-TERMINAL");
+        match err {
+            W1MarkerError::JournalNotTerminal { detail } => assert!(
+                detail.contains("journal on disk is"),
+                "必须是「状态非终态」那一层拒的，不是摘要那一层；实得 detail={detail}"
+            ),
+            other => panic!("错误变体不对：{other:?}"),
+        }
     }
 }
