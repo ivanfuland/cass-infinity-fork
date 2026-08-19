@@ -29714,4 +29714,195 @@ mod e5_replace_tests {
             .unwrap();
         assert_eq!(remaining, 0, "热表的陈旧 tail 行必须被重置掉");
     }
+
+    // ---------------------------------------------------------------------
+    // §B.11 的 P10 / P15 契约批（Phase 2 落库之后才有断言对象的那三项）
+    //
+    // **记账为契约验证，不是 TDD 红转绿**（与三家家族批同一口径）。
+    //
+    // 分项表 —— 哪些在这里闭、哪些必须留给 E6，逐行写清楚，不出现裸的「P10/P15 已过」：
+    //
+    // | P15 / §B.1.2 行 | 动作 | 落点 |
+    // |---|---|---|
+    // | `conversations.id` | 保留原 ID | **本批**（`..._preserves_conversation_id_...`） |
+    // | 11 个 token 汇总列 | 重算 | **本批**（下面的「二次 replace 必须跟着新内容走」） |
+    // | `metadata` 的 `cass.raw_mirror` | relink 到本次消费的 manifest | 已在 Phase 1 闭（八键逐一断言，commit `b9ed25bc`） |
+    // | `title` / `workspace` / `started_at` / `ended_at` / `metadata` 投影部分 / `approx_tokens` | 重算 / 替换 | **不在本批，归 E6** —— replace 专用存储函数按 plan 只管消息集、两处 tail、两张派生表与 11 列，**不碰 conversation 级的这几列**；它们由 E6 的编排在同一事务里更新 |
+    //
+    // | P10 项 | 落点 |
+    // |---|---|
+    // | `token_usage` 行存在且字段齐 | **本批** + Phase 2 的逐列等价门 |
+    // | `data_source` 如实 | **本批**（api / estimated 两支各断言，不只断言「非空」） |
+    // | `conversations` 11 列已更新 | **本批** |
+    // | `message_metrics` 已产 | **本批** |
+    // | 三张 rollup 已产 | **不在本批**：按 E6 Step 1b，五张累加型物化聚合表在事务**提交之后**重算，replace 函数一行不碰（已有边界守卫测试）。P10 那句「三张 rollup 已产」描述的是**整条 restore 完成后**的状态，不是 replace 函数的义务 —— 这条口径差别记档，归 E6 兑现 |
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn e5_p10_derived_rows_are_one_per_message_with_faithful_data_source() {
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open_storage(&dir);
+        let conv_id = seed_original(&storage, agent_id, "p10");
+
+        // 两支各一条：带 API usage 的 → `api`；无 usage 的 → 抽取器兜底 → `estimated`。
+        let new_conv = conversation(
+            "p10",
+            vec![
+                msg(
+                    0,
+                    MessageRole::User,
+                    "没有 usage 的一条",
+                    serde_json::Value::Null,
+                ),
+                msg(
+                    1,
+                    MessageRole::Assistant,
+                    "带 usage 的一条",
+                    api_usage("claude-opus-4-6", 11, 7, 0, 0),
+                ),
+            ],
+        );
+
+        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+        let mut tx = storage.raw().transaction().unwrap();
+        franken_replace_conversation_messages_in_tx(
+            &tx, conv_id, agent_id, None, &new_conv, &pricing,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let conn = storage.raw();
+        let msg_count: i64 = conn
+            .query_row_map(
+                "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1",
+                fparams![conv_id],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(msg_count, 2, "前置断言：样本落库应当是 2 条消息");
+
+        // 「一条消息一行」用**逐消息 JOIN 计数**判，不用两张表各自的总行数比 ——
+        // 总行数相等可以由「一条消息两行 + 另一条零行」凑出来。
+        let paired: i64 = conn
+            .query_row_map(
+                "SELECT COUNT(*) FROM messages m
+                 WHERE m.conversation_id = ?1
+                   AND (SELECT COUNT(*) FROM token_usage tu WHERE tu.message_id = m.id) = 1
+                   AND (SELECT COUNT(*) FROM message_metrics mm WHERE mm.message_id = m.id) = 1",
+                fparams![conv_id],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            paired, msg_count,
+            "每条消息都必须**恰好**各有一行 token_usage 与 message_metrics"
+        );
+
+        let sources: Vec<(i64, String, String)> = conn
+            .query_map_collect(
+                "SELECT m.idx, tu.data_source, mm.api_data_source
+                 FROM messages m
+                 JOIN token_usage tu ON tu.message_id = m.id
+                 JOIN message_metrics mm ON mm.message_id = m.id
+                 WHERE m.conversation_id = ?1 ORDER BY m.idx",
+                fparams![conv_id],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            sources,
+            vec![
+                (0, "estimated".to_string(), "estimated".to_string()),
+                (1, "api".to_string(), "api".to_string()),
+            ],
+            "`data_source` 必须如实分档：无 usage 的走兜底估算、带 usage 的走 api；\
+             两张表对同一条消息的取值必须一致"
+        );
+    }
+
+    #[test]
+    fn e5_p15_eleven_summary_columns_follow_the_second_replace_not_the_first() {
+        // 11 列的动作是**重算**，不是「有值就行」。分辨这两者要连做两次 replace：
+        // 第二次的内容 token 更少，若实现是「累加」或「首次写入后不再更新」，
+        // 这里读到的就会是第一次的值。
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open_storage(&dir);
+        let conv_id = seed_original(&storage, agent_id, "p15");
+
+        let first = conversation(
+            "p15",
+            vec![msg(
+                0,
+                MessageRole::Assistant,
+                "第一版",
+                api_usage("claude-opus-4-6", 100, 50, 0, 0),
+            )],
+        );
+        let second = conversation(
+            "p15",
+            vec![msg(
+                0,
+                MessageRole::Assistant,
+                "第二版",
+                api_usage("claude-sonnet-4-5", 3, 1, 0, 0),
+            )],
+        );
+
+        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+        for conv in [&first, &second] {
+            let mut tx = storage.raw().transaction().unwrap();
+            franken_replace_conversation_messages_in_tx(
+                &tx, conv_id, agent_id, None, conv, &pricing,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        let got: (Option<i64>, Option<i64>, Option<String>, i64) = storage
+            .raw()
+            .query_row_map(
+                "SELECT total_input_tokens, total_output_tokens, primary_model, api_call_count
+                 FROM conversations WHERE id = ?1",
+                fparams![conv_id],
+                |row| {
+                    Ok((
+                        row.get_typed(0)?,
+                        row.get_typed(1)?,
+                        row.get_typed(2)?,
+                        row.get_typed(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            got.0,
+            Some(3),
+            "`total_input_tokens` 必须只反映第二次 replace 的内容（3）；\
+             读到 103 说明在累加，读到 100 说明写过一次就不再重算"
+        );
+        assert_eq!(got.1, Some(1), "`total_output_tokens` 同理");
+        assert_eq!(
+            got.2.as_deref(),
+            Some("claude-sonnet-4-5"),
+            "`primary_model` 必须跟着新内容走，而不是留着第一版的模型"
+        );
+        assert_eq!(got.3, 1, "`api_call_count` 必须是 1，不是两次之和");
+
+        // 顺带把「旧行确实被级联删干净」钉住：11 列是从 `token_usage` 聚合出来的，
+        // 若旧行没删掉，上面四条会同时变成累加值 —— 但那样就分不清「没删干净」与
+        // 「重算写成了累加」。这条直接数行。
+        let usage_rows: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM token_usage WHERE conversation_id = ?1",
+                fparams![conv_id],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            usage_rows, 1,
+            "第一次 replace 写的 token_usage 旧行必须已被删除"
+        );
+    }
 }
