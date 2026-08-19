@@ -5135,6 +5135,14 @@ pub(crate) fn commit_restore_new(
     // 第一个原子步：基线入口自带事务。重跑时既有行被去重路径收敛。
     storage.insert_conversations_batched(&[(input.agent_id, input.workspace_id, input.conv)])?;
 
+    // ── E7 的崩溃注入点（env 门控，生产路径 env 未设即 no-op；形态同 E3 的
+    // `relink_pause_if_requested`，裁定放行）───────────────────────────────
+    //
+    // **这个位置就是本支唯一的真实崩溃窗**：插入已提交、receipt 还没写。注入点只能在
+    // 函数体内部 —— 让编排层把这两半拆开自己调，等于给 E6 的语义造第二份定义。
+    // 本行不改变任何语义，只让「插了没记」这个窗可以被真 SIGKILL 打中。
+    restore_pause_if_requested("restore-new-inserted-not-receipted");
+
     // 第二个原子步：generation 与 receipt 一起提交 —— 它们之间不能再有窗，
     // 否则会出现「代际已推进、却查不到 receipt」这种更难判读的状态。
     use frankensqlite::compat::TransactionExt as _;
@@ -5825,5 +5833,1444 @@ mod e6_replace_commit_tests {
             "重算全程 `message_metrics` 必须逐行不变（含那个哨兵值）—— 它是事务内逐消息写、\
              用另一套分桶公式的表，被重算路径顺手重写就等于让它被两套公式各写一遍"
         );
+    }
+}
+
+
+// ===========================================================================
+// E7 · restore 的七态 journal 与恢复器（plan Task E7 Step 1/2）
+//
+// 状态集 = spec §5.2.5 的七态，**不新增第八态**：`closure-verified` 即终态，
+// 写 commit marker 是它之上的幂等动作（Step 3）。
+//
+// 三条承重纪律（详见 run root 的 `e7-journal-state-machine.md`）：
+//   · **journal 是「计划与进度」的真源，receipt 是「DB 事务是否已提交」的真源**；
+//     两者合起来才唯一确定恢复动作。
+//   · `planned` **且无 receipt** → **重放事务**（§5.2.5 原文）。⚠ 与 E3 relink 的
+//     「不做半步恢复」**相反**，不得跨任务搬运：relink 崩在计划态什么都不做也不丢东西，
+//     restore 的计划是**还没做的写库工作**，不重放 = 把这批会话永久丢掉。
+//   · 状态已过 `db-committed` 却查不到 receipt = 两个真源互相矛盾 → **硬失败，不猜**。
+//
+// journal 落 run root 之外由调用方指定的文件（0600），**不落库**；落库的只有 receipt，
+// 且与 DB 动作同事务（replace 支）或紧随其后的小事务（restore-new 支，见 R-E-47）。
+// ---------------------------------------------------------------------------
+
+/// §5.2.5 七态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[allow(dead_code)]
+pub(crate) enum RestoreJournalState {
+    Planned,
+    DbCommitted,
+    ReadinessInvalidated,
+    EmbeddingsInvalidated,
+    AnalyticsRebuilt,
+    ManifestPartial,
+    ClosureVerified,
+}
+
+impl RestoreJournalState {
+    /// 单调序号。恢复器用它判「这一格做没做过」，**不用来定义状态集**。
+    fn rank(self) -> u8 {
+        match self {
+            RestoreJournalState::Planned => 0,
+            RestoreJournalState::DbCommitted => 1,
+            RestoreJournalState::ReadinessInvalidated => 2,
+            RestoreJournalState::EmbeddingsInvalidated => 3,
+            RestoreJournalState::AnalyticsRebuilt => 4,
+            RestoreJournalState::ManifestPartial => 5,
+            RestoreJournalState::ClosureVerified => 6,
+        }
+    }
+}
+
+/// 计划里每条身份的动作。**由 planner 决定并落进 journal**——恢复器**不重新判定**：
+/// 恢复时库已经变了（部分已提交），重跑关系判定会把已完成项判成 `Skip` 而静默丢工作。
+/// journal 是「计划与进度」的真源，计划本身就该在里面。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case", tag = "kind")]
+#[allow(dead_code)]
+pub(crate) enum PlannedAction {
+    RestoreNew,
+    Replace { conversation_id: i64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[allow(dead_code)]
+pub(crate) struct RestorePlanItem {
+    /// 只存 manifest_id：**写什么**由磁盘上的封存件重新推导，不在 journal 里落第二份。
+    pub manifest_id: String,
+    pub action: PlannedAction,
+}
+
+/// 一次 restore 运行的计划（planner 产出，E8 的 CLI 是它未来的真调用方）。
+#[allow(dead_code)]
+pub(crate) struct RestoreRunPlan {
+    pub operation_id: String,
+    pub data_dir: PathBuf,
+    pub scratch_dir: PathBuf,
+    pub db_path: PathBuf,
+    pub snapshot_root: String,
+    pub generation: String,
+    pub planned: Vec<RestorePlanItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[allow(dead_code)]
+pub(crate) struct RestoreJournal {
+    pub operation_id: String,
+    pub state: RestoreJournalState,
+    pub data_dir: PathBuf,
+    pub scratch_dir: PathBuf,
+    pub db_path: PathBuf,
+    pub snapshot_root: String,
+    pub generation: String,
+    pub planned: Vec<RestorePlanItem>,
+    /// 已确认提交的 manifest_id（进度）。
+    pub committed: Vec<String>,
+    /// 已完成 db_links publish 的 manifest 相对路径（差集续做用）。
+    pub published: Vec<String>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct RestoreRunOutcome {
+    pub restored: usize,
+    pub replaced: usize,
+    pub published: usize,
+}
+
+#[allow(dead_code)]
+pub(crate) fn restore_journal_from_plan(plan: RestoreRunPlan) -> RestoreJournal {
+    RestoreJournal {
+        operation_id: plan.operation_id,
+        state: RestoreJournalState::Planned,
+        data_dir: plan.data_dir,
+        scratch_dir: plan.scratch_dir,
+        db_path: plan.db_path,
+        snapshot_root: plan.snapshot_root,
+        generation: plan.generation,
+        planned: plan.planned,
+        committed: Vec::new(),
+        published: Vec::new(),
+    }
+}
+
+// ── fsync 顺序的可观测化 ────────────────────────────────────────────────
+//
+// §5.2.5 写死：写临时文件 → `fsync` 文件 → `rename` → `fsync` 目录 → 再推进 journal。
+// 顺序在进程内不可观测（strace 旁证按 R-E-18 移到 E9 的 CLI 真跑），所以在写路径上
+// 埋一条 **cfg(test) 记录带**：release 下是 `#[inline]` 空函数，零成本；测试下推进
+// 线程局部序列，用例逐项断言。被断言的就是生产路径自己走过的那几步，不是影子实现。
+
+#[cfg(test)]
+thread_local! {
+    static RESTORE_JOURNAL_TRACE: std::cell::RefCell<Vec<&'static str>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn journal_trace(step: &'static str) {
+    RESTORE_JOURNAL_TRACE.with(|t| t.borrow_mut().push(step));
+}
+
+#[cfg(not(test))]
+#[inline]
+fn journal_trace(_step: &'static str) {}
+
+#[cfg(test)]
+pub(crate) fn journal_trace_take() -> Vec<&'static str> {
+    RESTORE_JOURNAL_TRACE.with(|t| std::mem::take(&mut *t.borrow_mut()))
+}
+
+#[allow(dead_code)]
+pub(crate) fn restore_journal_write(path: &Path, journal: &RestoreJournal) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(&serde_json::to_vec_pretty(journal)?)?;
+        journal_trace("write-tmp");
+        file.sync_all()?;
+        journal_trace("fsync-file");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(&tmp, path)?;
+    journal_trace("rename");
+    if let Some(parent) = path.parent() {
+        let dir = std::fs::File::open(parent)?;
+        dir.sync_all()?;
+    }
+    journal_trace("fsync-dir");
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub(crate) fn restore_journal_read(path: &Path) -> anyhow::Result<Option<RestoreJournal>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// 推进一格：**先把新状态落盘并 fsync，再让它对后续动作生效**。
+fn restore_journal_advance(
+    journal: &mut RestoreJournal,
+    path: &Path,
+    state: RestoreJournalState,
+) -> anyhow::Result<()> {
+    journal.state = state;
+    restore_journal_write(path, journal)?;
+    journal_trace("state-visible");
+    Ok(())
+}
+
+/// 崩溃注入用的**确定性握手点**：到达边界时写哨兵文件，然后原地阻塞等父进程 SIGKILL。
+/// **不用 sleep 赌时序** —— 时序赌博会让注入点漂移，测的就不是那个边界了。
+/// 生产路径上 env 未设即 no-op（形态与 E3 的 `relink_pause_if_requested` 一致）。
+pub(crate) fn restore_pause_if_requested(boundary: &str) {
+    let Ok(target) = std::env::var("CASS_RESTORE_PAUSE_AT") else {
+        return;
+    };
+    if target != boundary {
+        return;
+    }
+    if let Ok(sentinel) = std::env::var("CASS_RESTORE_PAUSE_SENTINEL") {
+        let _ = std::fs::write(&sentinel, boundary.as_bytes());
+    }
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// 从 manifest view 推出恢复身份。**只有这一处定义**——测试与恢复器都用它，
+/// 免得「首跑算出来的 key」与「恢复算出来的 key」两处各写一份而悄悄分叉。
+#[allow(dead_code)]
+pub(crate) fn restore_identity_from_view(
+    view: &crate::raw_mirror::RawMirrorManifestView,
+) -> anyhow::Result<RestoreIdentity> {
+    let agent = Origin::parse(&view.provider)
+        .ok_or_else(|| anyhow::anyhow!("unknown provider in manifest: {}", view.provider))?;
+    Ok(RestoreIdentity {
+        origin: OriginNamespace {
+            agent,
+            source_id: view.source_id.clone(),
+            origin_host: view
+                .origin_host
+                .clone()
+                .unwrap_or_else(|| "local".to_string()),
+        },
+        canonical_path: view.original_path.clone(),
+    })
+}
+
+fn restore_idempotency_key_for(
+    action: PlannedAction,
+    snapshot_root: &str,
+    identity: &RestoreIdentity,
+) -> String {
+    match action {
+        PlannedAction::RestoreNew => restore_new_idempotency_key(snapshot_root, identity),
+        PlannedAction::Replace { .. } => replace_idempotency_key(snapshot_root, identity),
+    }
+}
+
+fn restore_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// 把一条计划项从磁盘重新推导成可落库的会话。
+///
+/// **首跑与恢复共用这一个函数** —— 「恢复做的事与首跑一致」不是靠两处代码写得像来保证的，
+/// 是靠只有一处代码来保证的。
+fn restore_project_plan_item(
+    journal: &RestoreJournal,
+    view: &crate::raw_mirror::RawMirrorManifestView,
+) -> anyhow::Result<crate::model::types::Conversation> {
+    let reports = collect_sealed_manifest_reports(&journal.data_dir);
+    let report = reports
+        .iter()
+        .find(|r| r.manifest_id == view.manifest_id)
+        .ok_or_else(|| anyhow::anyhow!("no doctor report for manifest {}", view.manifest_id))?;
+    let blob = match read_sealed_blob(&journal.data_dir, report) {
+        SealedBlobOutcome::Loaded(bytes) => bytes,
+        SealedBlobOutcome::ReferenceMissing => {
+            anyhow::bail!("sealed blob missing for manifest {}", view.manifest_id)
+        }
+        SealedBlobOutcome::Unreadable { detail } => {
+            anyhow::bail!("sealed blob unreadable for {}: {detail}", view.manifest_id)
+        }
+    };
+    let agent = Origin::parse(&view.provider)
+        .ok_or_else(|| anyhow::anyhow!("unknown provider in manifest: {}", view.provider))?;
+    let provenance = provenance_from_manifest_view(view);
+    let sealed = SealedSource {
+        agent,
+        canonical_original_path: &view.original_path,
+        source_size_bytes: view.source_size_bytes,
+        blob: &blob,
+    };
+    match project_sealed_source(&journal.scratch_dir, &sealed, &provenance) {
+        Ok(SealedProjection::Projected(conv)) => Ok(crate::indexer::persist::map_to_internal(&conv)),
+        Ok(other) => anyhow::bail!("sealed projection produced no conversation: {other:?}"),
+        Err(err) => anyhow::bail!("sealed projection failed: {err:?}"),
+    }
+}
+
+/// DB 阶段：逐条**先查 receipt 再做**。
+fn restore_run_db_phase(
+    journal: &mut RestoreJournal,
+    outcome: &mut RestoreRunOutcome,
+) -> anyhow::Result<()> {
+    let views = crate::raw_mirror::manifest_views(&journal.data_dir)?;
+    let storage = crate::storage::sqlite::FrankenStorage::open(&journal.db_path)
+        .map_err(|e| anyhow::anyhow!("open candidate db {}: {e}", journal.db_path.display()))?;
+    let pricing = crate::storage::sqlite::PricingTable::franken_load(storage.raw())?;
+
+    for item in journal.planned.clone() {
+        let view = views
+            .iter()
+            .find(|v| v.manifest_id == item.manifest_id)
+            .ok_or_else(|| anyhow::anyhow!("planned manifest {} not in mirror", item.manifest_id))?;
+        let identity = restore_identity_from_view(view)?;
+        let key = restore_idempotency_key_for(item.action, &journal.snapshot_root, &identity);
+
+        // 先查后做：查到 receipt = 这一条已提交，跳过（幂等的定义）。
+        if crate::storage::sqlite::franken_operation_commit_receipt_exists(storage.raw(), &key)? {
+            if !journal.committed.contains(&item.manifest_id) {
+                journal.committed.push(item.manifest_id.clone());
+            }
+            continue;
+        }
+
+        let conv = restore_project_plan_item(journal, view)?;
+        let agent_id = storage.ensure_agent(&crate::model::types::Agent {
+            id: None,
+            slug: conv.agent_slug.clone(),
+            name: conv.agent_slug.clone(),
+            version: None,
+            kind: crate::model::types::AgentKind::Cli,
+        })?;
+        let workspace_id = match conv.workspace.as_ref() {
+            Some(ws) => Some(storage.ensure_workspace(ws, None)?),
+            None => None,
+        };
+
+        match item.action {
+            PlannedAction::RestoreNew => {
+                let out = commit_restore_new(
+                    &storage,
+                    &RestoreNewCommitInput {
+                        agent_id,
+                        workspace_id,
+                        conv: &conv,
+                        identity: &identity,
+                        snapshot_root: &journal.snapshot_root,
+                        generation: &journal.generation,
+                    },
+                    restore_now_ms(),
+                )?;
+                if out.applied {
+                    outcome.restored += 1;
+                }
+            }
+            PlannedAction::Replace { conversation_id } => {
+                use frankensqlite::compat::TransactionExt as _;
+                let mut tx = storage.raw().transaction()?;
+                commit_replace_in_tx(
+                    &tx,
+                    &ReplaceCommitInput {
+                        conversation_id,
+                        agent_id,
+                        workspace_id,
+                        conv: &conv,
+                        identity: &identity,
+                        snapshot_root: &journal.snapshot_root,
+                        generation: &journal.generation,
+                    },
+                    &pricing,
+                    restore_now_ms(),
+                )?;
+                tx.commit()?;
+                outcome.replaced += 1;
+            }
+        }
+        journal.committed.push(item.manifest_id.clone());
+    }
+    Ok(())
+}
+
+/// 过了 `db-committed` 的状态必须有 receipt 佐证；没有就是两个真源矛盾。
+fn restore_assert_receipts_present(journal: &RestoreJournal) -> anyhow::Result<()> {
+    let views = crate::raw_mirror::manifest_views(&journal.data_dir)?;
+    let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(&journal.db_path)
+        .map_err(|e| anyhow::anyhow!("open candidate db readonly: {e}"))?;
+    let mut missing = Vec::new();
+    for item in &journal.planned {
+        let Some(view) = views.iter().find(|v| v.manifest_id == item.manifest_id) else {
+            missing.push(item.manifest_id.clone());
+            continue;
+        };
+        let identity = restore_identity_from_view(view)?;
+        let key = restore_idempotency_key_for(item.action, &journal.snapshot_root, &identity);
+        if !crate::storage::sqlite::franken_operation_commit_receipt_exists(storage.raw(), &key)? {
+            missing.push(item.manifest_id.clone());
+        }
+    }
+    storage.close_best_effort_in_place();
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "restore journal at state {:?} but no operation receipt for {} — refusing to guess",
+            journal.state,
+            missing.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// 第 2 格 · readiness 失效（幂等）。
+///
+/// 删掉词法重建 checkpoint = 让索引不再自称「对当前指纹新鲜」。入口是既有的
+/// `clear_lexical_rebuild_state`（R-E-50-b 只放宽可见性、函数体逐字节不变），
+/// 路径用 `expected_index_dir`（纯拼接、**无副作用**）——不用会创建目录的 `index_dir`，
+/// 恢复器不该自己产副作用。
+fn restore_invalidate_readiness(journal: &RestoreJournal) -> anyhow::Result<()> {
+    let index_dir = crate::search::tantivy::expected_index_dir(&journal.data_dir);
+    crate::indexer::clear_lexical_rebuild_state(&index_dir)
+}
+
+/// 第 3 格 · embedding 作废（幂等）。
+///
+/// 走的是**生产唯一写者那条链**（`src/indexer/semantic.rs` 的
+/// `load_or_default → replace_shards_for_generation → save`），零第二定义。
+fn restore_invalidate_embeddings(journal: &RestoreJournal) -> anyhow::Result<()> {
+    use crate::search::semantic_manifest::{SemanticManifest, SemanticShardManifest};
+    let data_dir = journal.data_dir.as_path();
+
+    if let Some(mut shard) = SemanticShardManifest::load(data_dir)
+        .map_err(|e| anyhow::anyhow!("load semantic shard manifest: {e}"))?
+    {
+        let triples: Vec<(_, String, String)> = shard
+            .shards
+            .iter()
+            .map(|s| (s.tier, s.embedder_id.clone(), s.db_fingerprint.clone()))
+            .collect();
+        let mut seen = std::collections::BTreeSet::new();
+        for (tier, embedder, fingerprint) in triples {
+            if !seen.insert((tier.as_str(), embedder.clone(), fingerprint.clone())) {
+                continue;
+            }
+            shard.replace_shards_for_generation(tier, &embedder, &fingerprint, Vec::new());
+        }
+        shard
+            .save(data_dir)
+            .map_err(|e| anyhow::anyhow!("save semantic shard manifest: {e}"))?;
+    }
+
+    if let Some(mut manifest) = SemanticManifest::load(data_dir)
+        .map_err(|e| anyhow::anyhow!("load semantic manifest: {e}"))?
+    {
+        manifest.fast_tier = None;
+        manifest.quality_tier = None;
+        manifest.hnsw = None;
+        manifest.clear_checkpoint();
+        manifest
+            .save(data_dir)
+            .map_err(|e| anyhow::anyhow!("save semantic manifest: {e}"))?;
+    }
+    Ok(())
+}
+
+/// 第 4 格 · analytics 失效并重算（幂等）。**直接用 E6 Step 1b 那个函数**，
+/// 不在这里另写一份重算（它已经处理了「绕开 `rebuild_analytics`」那条裁定）。
+fn restore_rebuild_analytics(journal: &RestoreJournal) -> anyhow::Result<()> {
+    let storage = crate::storage::sqlite::FrankenStorage::open(&journal.db_path)
+        .map_err(|e| anyhow::anyhow!("open candidate db for analytics: {e}"))?;
+    recompute_materialized_aggregates_after_commit(&storage)
+}
+
+/// 第 5/6 格 · manifest publish，**按差集续做**。
+fn restore_publish_manifests(
+    journal: &mut RestoreJournal,
+    journal_path: &Path,
+    outcome: &mut RestoreRunOutcome,
+) -> anyhow::Result<()> {
+    let views = crate::raw_mirror::manifest_views(&journal.data_dir)?;
+    let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(&journal.db_path)
+        .map_err(|e| anyhow::anyhow!("open candidate db for publish: {e}"))?;
+
+    for item in journal.planned.clone() {
+        let view = views
+            .iter()
+            .find(|v| v.manifest_id == item.manifest_id)
+            .ok_or_else(|| anyhow::anyhow!("planned manifest {} not in mirror", item.manifest_id))?;
+        if journal.published.contains(&view.manifest_relative_path) {
+            continue;
+        }
+        let conversation_id = match item.action {
+            PlannedAction::Replace { conversation_id } => Some(conversation_id),
+            PlannedAction::RestoreNew => {
+                use frankensqlite::compat::{ConnectionExt as _, OptionalExtension as _, RowExt as _};
+                storage
+                    .raw()
+                    .query_row_map(
+                        "SELECT id FROM conversations WHERE source_path = ?1",
+                        &[frankensqlite::compat::ParamValue::from(
+                            view.original_path.as_str(),
+                        )],
+                        |row| row.get_typed(0),
+                    )
+                    .optional()?
+            }
+        };
+        let link = crate::raw_mirror::RawMirrorDbLink {
+            conversation_id,
+            message_count: None,
+            source_path: Some(view.original_path.clone()),
+            started_at_ms: None,
+        };
+        crate::raw_mirror::merge_manifest_db_links(
+            &journal.data_dir,
+            &view.manifest_relative_path,
+            std::slice::from_ref(&link),
+        )?;
+        journal.published.push(view.manifest_relative_path.clone());
+        outcome.published += 1;
+        restore_journal_advance(journal, journal_path, RestoreJournalState::ManifestPartial)?;
+        restore_pause_if_requested("manifest-partial");
+    }
+    storage.close_best_effort_in_place();
+    Ok(())
+}
+
+/// 第 7 格前的闭合校验：每条计划项都要有 receipt、且 manifest 已 publish。
+fn restore_verify_closure(journal: &RestoreJournal) -> anyhow::Result<()> {
+    restore_assert_receipts_present(journal)?;
+    let views = crate::raw_mirror::manifest_views(&journal.data_dir)?;
+    for item in &journal.planned {
+        let view = views
+            .iter()
+            .find(|v| v.manifest_id == item.manifest_id)
+            .ok_or_else(|| anyhow::anyhow!("planned manifest {} not in mirror", item.manifest_id))?;
+        if !journal.published.contains(&view.manifest_relative_path) {
+            anyhow::bail!(
+                "closure verification failed: manifest {} not published",
+                view.manifest_relative_path
+            );
+        }
+    }
+    Ok(())
+}
+
+/// 首跑：写计划 → 驱动。
+#[allow(dead_code)]
+pub(crate) fn restore_apply_journaled(
+    plan: RestoreRunPlan,
+    journal_path: &Path,
+) -> anyhow::Result<RestoreRunOutcome> {
+    let mut journal = restore_journal_from_plan(plan);
+    restore_journal_write(journal_path, &journal)?;
+    journal_trace("state-visible");
+    restore_pause_if_requested("planned");
+    restore_drive(&mut journal, journal_path)
+}
+
+/// 崩溃恢复：**入参只有 journal 路径**，其余一切从磁盘取（R-E-19 第三条）。
+#[allow(dead_code)]
+pub(crate) fn restore_recover(journal_path: &Path) -> anyhow::Result<RestoreRunOutcome> {
+    let Some(mut journal) = restore_journal_read(journal_path)? else {
+        anyhow::bail!("no restore journal at {}", journal_path.display());
+    };
+    restore_drive(&mut journal, journal_path)
+}
+
+/// 首跑与恢复的**同一条驱动路径**。每一格都先判「做没做过」再做，故重跑幂等。
+fn restore_drive(
+    journal: &mut RestoreJournal,
+    journal_path: &Path,
+) -> anyhow::Result<RestoreRunOutcome> {
+    let mut outcome = RestoreRunOutcome::default();
+
+    if journal.state.rank() == RestoreJournalState::Planned.rank() {
+        // §5.2.5：`planned` 时按幂等 key 查 receipt —— 无则重放事务，有则等同 db-committed。
+        // 逐条判在 `restore_run_db_phase` 内部（先查后做），所以两种情形共用一条路径。
+        restore_run_db_phase(journal, &mut outcome)?;
+        restore_journal_advance(journal, journal_path, RestoreJournalState::DbCommitted)?;
+        restore_pause_if_requested("db-committed");
+    } else {
+        restore_assert_receipts_present(journal)?;
+    }
+
+    if journal.state.rank() < RestoreJournalState::ReadinessInvalidated.rank() {
+        restore_invalidate_readiness(journal)?;
+        restore_journal_advance(journal, journal_path, RestoreJournalState::ReadinessInvalidated)?;
+        restore_pause_if_requested("readiness-invalidated");
+    }
+    if journal.state.rank() < RestoreJournalState::EmbeddingsInvalidated.rank() {
+        restore_invalidate_embeddings(journal)?;
+        restore_journal_advance(
+            journal,
+            journal_path,
+            RestoreJournalState::EmbeddingsInvalidated,
+        )?;
+        restore_pause_if_requested("embeddings-invalidated");
+    }
+    if journal.state.rank() < RestoreJournalState::AnalyticsRebuilt.rank() {
+        restore_rebuild_analytics(journal)?;
+        restore_journal_advance(journal, journal_path, RestoreJournalState::AnalyticsRebuilt)?;
+        restore_pause_if_requested("analytics-rebuilt");
+    }
+
+    restore_publish_manifests(journal, journal_path, &mut outcome)?;
+
+    if journal.state.rank() < RestoreJournalState::ClosureVerified.rank() {
+        restore_verify_closure(journal)?;
+        restore_journal_advance(journal, journal_path, RestoreJournalState::ClosureVerified)?;
+        restore_pause_if_requested("closure-verified");
+    }
+    Ok(outcome)
+}
+
+// ===========================================================================
+// E7 · restore 七态 journal、恢复器与崩溃注入（plan Task E7）
+//
+// 状态集 = spec §5.2.5 七态。本组测试锁的是那张表里「崩在此处的唯一恢复动作」
+// 逐格成立，外加两条从 E6 结转的欠账：
+//   欠账① Restore 支「插入已提交 / receipt 未写」窗的**真 SIGKILL 注入 + 全新进程恢复**
+//         （E6 只落了状态级证据，证的是重做幂等，没证恢复器判窗正确）；
+//   欠账② **receipt 顺序断言** —— 锁「receipt 必须写在插入之后」。把它提前，
+//         E6 现有三条用例都不会红，而「记了没插」在重做时查到 receipt 直接短路跳过
+//         = 静默丢一条会话，且没有任何约束会报错。
+//
+// 落点说明见 run root 的 `e7-journal-state-machine.md`（先写说明再动代码，照 E6 先例）。
+// ===========================================================================
+#[cfg(test)]
+mod e7_restore_journal_tests {
+    use super::*;
+    use frankensqlite::compat::{ConnectionExt, OptionalExtension, ParamValue, RowExt};
+    use tempfile::TempDir;
+
+    const SNAPSHOT_ROOT: &str = "e7-snapshot-root-0001";
+    const GENERATION: &str = "gen-e7-0001";
+
+    /// 用**真的** `capture_source_file` 造 mirror（与 E5 同一条纪律：不手写 manifest JSON，
+    /// 手写等于对磁盘格式造第二定义，且格式漂移后 fixture 会一直绿着）。
+    fn capture(data_dir: &Path, source: &Path) -> crate::raw_mirror::RawMirrorCaptureRecord {
+        crate::raw_mirror::capture_source_file(crate::raw_mirror::RawMirrorCaptureInput {
+            data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: source,
+            db_links: &[],
+        })
+        .expect("capture source into raw mirror")
+    }
+
+    /// 三条消息的合成 codex 会话。内容逐份不同 —— blob 是内容寻址的，
+    /// 字节相同的两份源会共用同一个 blob。
+    fn write_session(root: &Path, name: &str, session_id: &str) -> PathBuf {
+        let dir = root.join(".codex").join("sessions").join("2026").join("08");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"timestamp\":\"2026-08-18T00:00:00.000Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session_id}\",\"cwd\":\"/fixtures/ws\"}}}}\n\
+                 {{\"timestamp\":\"2026-08-18T00:00:01.000Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"{session_id} 的第一条消息\"}}]}}}}\n\
+                 {{\"timestamp\":\"2026-08-18T00:00:02.000Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"{session_id} 的第二条消息\"}}]}}}}\n\
+                 {{\"timestamp\":\"2026-08-18T00:00:03.000Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"{session_id} 的第三条消息\"}}]}}}}\n"
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    struct Drill {
+        _tmp: TempDir,
+        data_dir: PathBuf,
+        scratch: PathBuf,
+        db_path: PathBuf,
+        journal_path: PathBuf,
+        /// 库里没有 → 走新建支。
+        new_manifest_id: String,
+        /// 库里有一条真前缀 → 走 replace 支。
+        replace_manifest_id: String,
+        replace_conv_id: i64,
+        replace_external_id: String,
+    }
+
+    fn conv_count(db_path: &Path) -> i64 {
+        let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(db_path).unwrap();
+        let n = storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        storage.close_best_effort_in_place();
+        n
+    }
+
+    fn msg_count(db_path: &Path, conversation_external: &str) -> i64 {
+        let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(db_path).unwrap();
+        let n = storage
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM messages m JOIN conversations c ON c.id = m.conversation_id
+                 WHERE c.external_id = ?1",
+                &[ParamValue::from(conversation_external)],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        storage.close_best_effort_in_place();
+        n
+    }
+
+    fn receipt_count(db_path: &Path) -> i64 {
+        let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(db_path).unwrap();
+        let n = storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM operation_commit_receipt", &[], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        storage.close_best_effort_in_place();
+        n
+    }
+
+    /// 三组事务外动作的**可观测哨兵**：每一组都先造出一个「任何重做都会抹掉」的现场，
+    /// 否则「恢复后收敛」可能只是无事可做的假绿（part5 判据 ⑤）。
+    fn plant_post_commit_sentinels(data_dir: &Path, db_path: &Path) {
+        // ① readiness：词法重建 checkpoint 存在 = 「索引自称对当前指纹新鲜」。
+        let index_dir = crate::search::tantivy::expected_index_dir(data_dir);
+        std::fs::create_dir_all(&index_dir).unwrap();
+        std::fs::write(index_dir.join(".lexical-rebuild-state.json"), b"{}").unwrap();
+
+        // ② embeddings：语义 sidecar 里放一条分片记录 + 一个 tier 产物。
+        let mut shard = crate::search::semantic_manifest::SemanticShardManifest::load_or_default(
+            data_dir,
+        )
+        .unwrap();
+        shard.shards.push(sentinel_shard_record());
+        shard.save(data_dir).unwrap();
+
+        // ③ analytics：daily_stats 里放一条谁都算不出来的哨兵行；重算必然抹掉它。
+        let storage = crate::storage::sqlite::FrankenStorage::open(db_path).unwrap();
+        storage
+            .raw()
+            .execute_compat(
+                "INSERT OR REPLACE INTO daily_stats
+                 (day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                &[
+                    ParamValue::from(999_999i64),
+                    ParamValue::from("e7-sentinel"),
+                    ParamValue::from("e7-sentinel"),
+                    ParamValue::from(7i64),
+                    ParamValue::from(7i64),
+                    ParamValue::from(7i64),
+                    ParamValue::from(0i64),
+                ],
+            )
+            .unwrap();
+    }
+
+    fn sentinel_shard_record() -> crate::search::semantic_manifest::SemanticShardRecord {
+        crate::search::semantic_manifest::SemanticShardRecord {
+            tier: crate::search::semantic_manifest::TierKind::Fast,
+            embedder_id: "e7-sentinel-embedder".into(),
+            model_revision: "hash".into(),
+            schema_version: 1,
+            chunking_version: 1,
+            dimension: 8,
+            shard_index: 0,
+            shard_count: 1,
+            doc_count: 1,
+            total_conversations: 1,
+            db_fingerprint: "e7-sentinel-fingerprint".into(),
+            index_path: "vector_index/e7-sentinel.bin".into(),
+            quantization: "none".into(),
+            mmap_ready: false,
+            ann_index_path: None,
+            ann_size_bytes: 0,
+            ann_ready: false,
+            size_bytes: 1,
+            started_at_ms: 0,
+            completed_at_ms: 0,
+            ready: true,
+        }
+    }
+
+    fn lexical_checkpoint_present(data_dir: &Path) -> bool {
+        crate::search::tantivy::expected_index_dir(data_dir)
+            .join(".lexical-rebuild-state.json")
+            .exists()
+    }
+
+    fn semantic_shards_present(data_dir: &Path) -> bool {
+        crate::search::semantic_manifest::SemanticShardManifest::load(data_dir)
+            .unwrap()
+            .map(|m| !m.shards.is_empty())
+            .unwrap_or(false)
+    }
+
+    fn analytics_sentinel_present(db_path: &Path) -> bool {
+        let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(db_path).unwrap();
+        let found: Option<i64> = storage
+            .raw()
+            .query_row_map(
+                "SELECT 1 FROM daily_stats WHERE agent_slug = 'e7-sentinel'",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .optional()
+            .unwrap()
+            .flatten();
+        storage.close_best_effort_in_place();
+        found.is_some()
+    }
+
+    /// 建演练场：mirror 里两条身份，库里给其中一条种上「真前缀」。
+    fn drill() -> Drill {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("cass-data");
+        let live = tmp.path().join("live");
+        let scratch = tmp.path().join("scratch");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        let a = write_session(&live, "rollout-e7-new.jsonl", "e7-new");
+        let b = write_session(&live, "rollout-e7-replace.jsonl", "e7-replace");
+        let ca = capture(&data_dir, &a);
+        let cb = capture(&data_dir, &b);
+        assert_ne!(
+            ca.blob_relative_path, cb.blob_relative_path,
+            "前置断言：两条身份必须落在不同 blob 上（内容寻址，同字节会共用）"
+        );
+        // 「live 无」做到字面：投影的定义域里没有活文件系统。
+        std::fs::remove_file(&a).unwrap();
+        std::fs::remove_file(&b).unwrap();
+
+        let db_path = data_dir.join("e7.sqlite");
+        let storage = crate::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
+
+        // 给 replace 支种一条真前缀：投影出三条消息的会话，截到两条再落库。
+        let views = crate::raw_mirror::manifest_views(&data_dir).unwrap();
+        let view = views
+            .iter()
+            .find(|v| v.manifest_id == cb.manifest_id)
+            .expect("replace 支的 manifest 应当在 view 列表里");
+        let mut truncated = project_view_for_test(&data_dir, &scratch, view);
+        truncated.messages.truncate(2);
+        let agent_id = storage
+            .ensure_agent(&crate::model::types::Agent {
+                id: None,
+                slug: truncated.agent_slug.clone(),
+                name: truncated.agent_slug.clone(),
+                version: None,
+                kind: crate::model::types::AgentKind::Cli,
+            })
+            .unwrap();
+        let workspace_id = truncated
+            .workspace
+            .as_ref()
+            .map(|ws| storage.ensure_workspace(ws, None).unwrap());
+        storage
+            .insert_conversations_batched(&[(agent_id, workspace_id, &truncated)])
+            .unwrap();
+        let external_id = truncated
+            .external_id
+            .clone()
+            .expect("前置断言：投影产物必须带 external_id —— 没有它就无从判定同一条身份");
+        let replace_conv_id: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT id FROM conversations WHERE external_id = ?1",
+                &[ParamValue::from(external_id.as_str())],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            conv_count(&db_path),
+            1,
+            "前置断言：演练开始时库里恰有一条（replace 支的真前缀），新建支那条必须不在"
+        );
+
+        Drill {
+            _tmp: tmp,
+            data_dir,
+            scratch,
+            db_path,
+            journal_path: tmp_journal_path(),
+            new_manifest_id: ca.manifest_id,
+            replace_manifest_id: cb.manifest_id,
+            replace_conv_id,
+            replace_external_id: external_id,
+        }
+    }
+
+    fn tmp_journal_path() -> PathBuf {
+        // journal 落 run root 之外的临时目录：测试不碰任何生产路径。
+        let dir = std::env::temp_dir().join(format!("cc-cass-e7-journal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(format!(
+            "restore-journal-{}.json",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    /// 测试侧投影：走的仍是生产那条 `read_sealed_blob → project_sealed_source → map_to_internal`，
+    /// 不另写一份投影。
+    fn project_view_for_test(
+        data_dir: &Path,
+        scratch: &Path,
+        view: &crate::raw_mirror::RawMirrorManifestView,
+    ) -> crate::model::types::Conversation {
+        let reports = collect_sealed_manifest_reports(data_dir);
+        let report = reports
+            .iter()
+            .find(|r| r.manifest_id == view.manifest_id)
+            .expect("每份 manifest 都应有一份 doctor 报告");
+        let blob = match read_sealed_blob(data_dir, report) {
+            SealedBlobOutcome::Loaded(bytes) => bytes,
+            other => panic!("fixture 的 blob 必须读得到：{other:?}"),
+        };
+        let provenance = provenance_from_manifest_view(view);
+        let sealed = SealedSource {
+            agent: Origin::Codex,
+            canonical_original_path: &view.original_path,
+            source_size_bytes: view.source_size_bytes,
+            blob: &blob,
+        };
+        match project_sealed_source(scratch, &sealed, &provenance) {
+            Ok(SealedProjection::Projected(conv)) => {
+                crate::indexer::persist::map_to_internal(&conv)
+            }
+            other => panic!("封存投影未产出会话：{other:?}"),
+        }
+    }
+
+    fn plan_for(d: &Drill) -> RestoreRunPlan {
+        RestoreRunPlan {
+            operation_id: "e7-op-0001".into(),
+            data_dir: d.data_dir.clone(),
+            scratch_dir: d.scratch.clone(),
+            db_path: d.db_path.clone(),
+            snapshot_root: SNAPSHOT_ROOT.into(),
+            generation: GENERATION.into(),
+            planned: vec![
+                RestorePlanItem {
+                    manifest_id: d.new_manifest_id.clone(),
+                    action: PlannedAction::RestoreNew,
+                },
+                RestorePlanItem {
+                    manifest_id: d.replace_manifest_id.clone(),
+                    action: PlannedAction::Replace {
+                        conversation_id: d.replace_conv_id,
+                    },
+                },
+            ],
+        }
+    }
+
+    // ── T1：happy path，七态走到终态，三组事务外动作都真的做了 ──────────────
+    #[test]
+    fn e7_apply_walks_the_seven_states_and_does_all_three_post_commit_actions() {
+        let d = drill();
+        plant_post_commit_sentinels(&d.data_dir, &d.db_path);
+        assert!(
+            lexical_checkpoint_present(&d.data_dir)
+                && semantic_shards_present(&d.data_dir)
+                && analytics_sentinel_present(&d.db_path),
+            "前置断言：三个哨兵必须都在，否则「恢复后收敛」是无事可做的假绿"
+        );
+
+        let outcome = restore_apply_journaled(plan_for(&d), &d.journal_path).unwrap();
+
+        assert_eq!(outcome.restored, 1, "新建支恰一条");
+        assert_eq!(outcome.replaced, 1, "replace 支恰一条");
+        assert_eq!(conv_count(&d.db_path), 2, "库里应当恰有两条会话");
+        assert_eq!(receipt_count(&d.db_path), 2, "两条身份各恰一条 receipt");
+
+        let journal = restore_journal_read(&d.journal_path).unwrap().unwrap();
+        assert_eq!(
+            journal.state,
+            RestoreJournalState::ClosureVerified,
+            "journal 终态 = closure-verified（§5.2.5 七态，不新增第八态）"
+        );
+        assert!(
+            !lexical_checkpoint_present(&d.data_dir),
+            "readiness 必须已失效：词法重建 checkpoint 应当被删掉"
+        );
+        assert!(
+            !semantic_shards_present(&d.data_dir),
+            "embedding 必须已作废：语义分片记录应当被清空"
+        );
+        assert!(
+            !analytics_sentinel_present(&d.db_path),
+            "analytics 必须已重算：daily_stats 的哨兵行应当被抹掉"
+        );
+    }
+
+    // ── T2：`planned` + **无 receipt** → 必须**重放事务** ─────────────────
+    //
+    // §5.2.5 原文：「无 receipt 则重放事务」。⚠ 这与 E3 relink 的「不做半步恢复」**相反**，
+    // 不得跨任务搬运：relink 崩在计划态什么都不做也不丢东西（重跑 dry-run 即收敛），
+    // 而 restore 的计划是**还没做的写库工作**，不重放 = 把这批会话永久丢掉。
+    #[test]
+    fn e7_planned_without_receipt_replays_the_transaction() {
+        let d = drill();
+        plant_post_commit_sentinels(&d.data_dir, &d.db_path);
+        let mut journal = restore_journal_from_plan(plan_for(&d));
+        journal.state = RestoreJournalState::Planned;
+        restore_journal_write(&d.journal_path, &journal).unwrap();
+
+        assert_eq!(receipt_count(&d.db_path), 0, "前置断言：现场必须没有 receipt");
+        assert_eq!(conv_count(&d.db_path), 1, "前置断言：新建支那条还没进库");
+
+        let outcome = restore_recover(&d.journal_path).unwrap();
+
+        assert_eq!(
+            outcome.restored, 1,
+            "无 receipt = 事务没提交过 → 必须重放，把新建支那条写进去"
+        );
+        assert_eq!(conv_count(&d.db_path), 2, "重放后库里应当有两条");
+        assert_eq!(receipt_count(&d.db_path), 2);
+        assert_eq!(
+            restore_journal_read(&d.journal_path).unwrap().unwrap().state,
+            RestoreJournalState::ClosureVerified
+        );
+    }
+
+    // ── T3：DB 已提交而 journal 仍停 `planned` → 必须**前进**，不得丢弃 ────
+    #[test]
+    fn e7_planned_with_receipt_advances_instead_of_discarding() {
+        let d = drill();
+        plant_post_commit_sentinels(&d.data_dir, &d.db_path);
+        // 先完整跑一遍，把 DB 侧做完（receipt 落库）。
+        restore_apply_journaled(plan_for(&d), &d.journal_path).unwrap();
+        let conv_after_first = conv_count(&d.db_path);
+        let receipts_after_first = receipt_count(&d.db_path);
+
+        // 再把现场倒回那个**必然存在**的窗：journal 退回 `planned`，
+        // 三组事务外动作的哨兵重新种上（模拟「DB 提交了、journal 没推进就崩了」）。
+        plant_post_commit_sentinels(&d.data_dir, &d.db_path);
+        let mut journal = restore_journal_read(&d.journal_path).unwrap().unwrap();
+        journal.state = RestoreJournalState::Planned;
+        journal.committed.clear();
+        journal.published.clear();
+        restore_journal_write(&d.journal_path, &journal).unwrap();
+
+        let outcome = restore_recover(&d.journal_path).unwrap();
+
+        assert_eq!(
+            conv_count(&d.db_path),
+            conv_after_first,
+            "查到 receipt = 已提交 → **不得**重放 DB 事务，会话数不许变"
+        );
+        assert_eq!(
+            receipt_count(&d.db_path),
+            receipts_after_first,
+            "receipt 也不许多出来"
+        );
+        assert_eq!(
+            outcome.restored + outcome.replaced,
+            0,
+            "这一轮不该有任何新的写库动作"
+        );
+        // 「前进」的观测量：三组事务外动作**必须真的补做**。
+        assert!(
+            !lexical_checkpoint_present(&d.data_dir),
+            "前进 = 续做 readiness 失效；当无副作用丢弃的话这个哨兵会留着"
+        );
+        assert!(!semantic_shards_present(&d.data_dir));
+        assert!(!analytics_sentinel_present(&d.db_path));
+        assert_eq!(
+            restore_journal_read(&d.journal_path).unwrap().unwrap().state,
+            RestoreJournalState::ClosureVerified
+        );
+    }
+
+    // ── T4：过了 `db-committed` 却查不到 receipt = 两个真源互相矛盾 → 硬失败 ──
+    #[test]
+    fn e7_state_past_db_committed_without_receipt_is_a_hard_failure() {
+        let d = drill();
+        restore_apply_journaled(plan_for(&d), &d.journal_path).unwrap();
+        // 把 receipt 抹掉，制造矛盾现场。
+        let storage = crate::storage::sqlite::FrankenStorage::open(&d.db_path).unwrap();
+        storage
+            .raw()
+            .execute("DELETE FROM operation_commit_receipt;")
+            .unwrap();
+        drop(storage);
+
+        let mut journal = restore_journal_read(&d.journal_path).unwrap().unwrap();
+        journal.state = RestoreJournalState::ReadinessInvalidated;
+        restore_journal_write(&d.journal_path, &journal).unwrap();
+
+        let err = restore_recover(&d.journal_path)
+            .expect_err("状态已过 db-committed 却无 receipt，必须硬失败而不是猜");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("receipt"),
+            "错误必须点名 receipt 缺失，实得：{text}"
+        );
+    }
+
+    // ── T5：重跑幂等 —— 收敛后再恢复一次必须是 no-op ────────────────────
+    #[test]
+    fn e7_second_recovery_is_a_no_op() {
+        let d = drill();
+        restore_apply_journaled(plan_for(&d), &d.journal_path).unwrap();
+        let convs = conv_count(&d.db_path);
+        let receipts = receipt_count(&d.db_path);
+
+        let again = restore_recover(&d.journal_path).unwrap();
+
+        assert_eq!(again.restored + again.replaced, 0, "第二次恢复不得再写库");
+        assert_eq!(conv_count(&d.db_path), convs);
+        assert_eq!(receipt_count(&d.db_path), receipts);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // 崩溃注入（R-E-19 三要求逐条兑现）
+    //
+    // ① **确定性握手定边界**：子进程到达边界写哨兵文件后原地阻塞，父进程见哨兵才 kill。
+    //    禁 sleep 赌时序 —— 赌时序会让注入点漂移，测的就不是那个边界。
+    // ② **kill 只打显式持有的子进程句柄**（`Child::kill`，Unix 上即 SIGKILL）。
+    //    不杀进程组、不按名字模式匹配。
+    // ③ **恢复跑为另一个全新子进程**，输入仅磁盘 journal + receipt。
+    //    （E3 的恢复是进程内调用；本任务把它抬到真·跨进程。）
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// 崩溃子进程入口：由父进程用 `--ignored --exact` 拉起。
+    #[test]
+    #[ignore]
+    fn e7_crash_child_entrypoint() {
+        let planned: Vec<RestorePlanItem> =
+            serde_json::from_str(&std::env::var("CASS_E7_PLAN_JSON").unwrap()).unwrap();
+        let plan = RestoreRunPlan {
+            operation_id: "e7-op-crash".into(),
+            data_dir: PathBuf::from(std::env::var("CASS_E7_DATA_DIR").unwrap()),
+            scratch_dir: PathBuf::from(std::env::var("CASS_E7_SCRATCH").unwrap()),
+            db_path: PathBuf::from(std::env::var("CASS_E7_DB").unwrap()),
+            snapshot_root: SNAPSHOT_ROOT.into(),
+            generation: GENERATION.into(),
+            planned,
+        };
+        let journal = PathBuf::from(std::env::var("CASS_E7_JOURNAL").unwrap());
+        let _ = restore_apply_journaled(plan, &journal);
+    }
+
+    /// 恢复子进程入口：**全新进程**，入参只有 journal 路径。
+    #[test]
+    #[ignore]
+    fn e7_recover_child_entrypoint() {
+        let journal = PathBuf::from(std::env::var("CASS_E7_JOURNAL").unwrap());
+        let out = restore_recover(&journal).expect("recovery must converge");
+        std::fs::write(
+            std::env::var("CASS_E7_RESULT").unwrap(),
+            format!("{} {}", out.restored, out.replaced),
+        )
+        .unwrap();
+    }
+
+    fn child_command(test_name: &str, d: &Drill) -> std::process::Command {
+        let exe = std::env::current_exe().expect("test binary path");
+        let mut cmd = std::process::Command::new(exe);
+        cmd.args(["--ignored", "--exact", test_name])
+            .env("CASS_E7_DATA_DIR", &d.data_dir)
+            .env("CASS_E7_SCRATCH", &d.scratch)
+            .env("CASS_E7_DB", &d.db_path)
+            .env("CASS_E7_JOURNAL", &d.journal_path)
+            // 双 env 隔离兜底：子进程一旦有任何一步回落到「按 env 找产物目录」，
+            // 也只会落在本用例的 tempdir 里，碰不到生产。
+            .env("CASS_DATA_DIR", &d.data_dir)
+            .env("XDG_DATA_HOME", d.data_dir.parent().unwrap())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        cmd
+    }
+
+    fn pid_alive(pid: u32) -> bool {
+        Path::new(&format!("/proc/{pid}")).exists()
+    }
+
+    /// 在 `boundary` 处注入 SIGKILL。返回 (pid, 是否真的握手到那个边界)。
+    fn crash_at(boundary: &str, d: &Drill) -> (u32, bool) {
+        let sentinel = d
+            .db_path
+            .parent()
+            .unwrap()
+            .join(format!("e7-sentinel-{boundary}"));
+        let plan_json = serde_json::to_string(&plan_for(d).planned).unwrap();
+        let mut child = child_command("phase3_restore::e7_restore_journal_tests::e7_crash_child_entrypoint", d)
+            .env("CASS_E7_PLAN_JSON", plan_json)
+            .env("CASS_RESTORE_PAUSE_AT", boundary)
+            .env("CASS_RESTORE_PAUSE_SENTINEL", &sentinel)
+            .spawn()
+            .expect("spawn crash child");
+        let pid = child.id();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let mut handshaken = false;
+        while std::time::Instant::now() < deadline {
+            if sentinel.exists() {
+                handshaken = true;
+                break;
+            }
+            if let Ok(Some(status)) = child.try_wait() {
+                // 子进程自己结束了。**这里必须留下退出状态** —— 否则「哨兵未出现」
+                // 会把两种完全不同的原因混成一句话：真·边界不可达，
+                // 与「子进程根本没跑起来」（本棒实测：`--exact` 少写模块前缀 →
+                // 零匹配、立即退出）。
+                eprintln!("crash child exited before boundary {boundary}: {status:?}");
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if handshaken {
+            child.kill().expect("SIGKILL the recorded child");
+        }
+        let _ = child.wait();
+        (pid, handshaken)
+    }
+
+    /// 恢复：**另一个全新子进程**，输入只有磁盘上的 journal + receipt。
+    fn recover_in_fresh_child(d: &Drill) -> (usize, usize) {
+        let result = d.db_path.parent().unwrap().join("e7-recover-result.txt");
+        let _ = std::fs::remove_file(&result);
+        let status = child_command("phase3_restore::e7_restore_journal_tests::e7_recover_child_entrypoint", d)
+            .env("CASS_E7_RESULT", &result)
+            .status()
+            .expect("spawn recovery child");
+        assert!(status.success(), "恢复子进程必须成功退出，实得 {status:?}");
+        let text = std::fs::read_to_string(&result).expect("恢复子进程必须写出结果");
+        let mut parts = text.split_whitespace();
+        (
+            parts.next().unwrap().parse().unwrap(),
+            parts.next().unwrap().parse().unwrap(),
+        )
+    }
+
+    /// 崩溃现场应有的样子：崩在这个边界时，**哪些活还没干**。
+    /// 三重断言的第二重靠它 —— 没有未竟工作，「恢复后收敛」就是无事可做的假绿。
+    fn assert_work_pending_at(boundary: &str, d: &Drill) {
+        match boundary {
+            "planned" => {
+                assert_eq!(receipt_count(&d.db_path), 0, "崩在 planned：不该有 receipt");
+                assert_eq!(conv_count(&d.db_path), 1, "崩在 planned：新建支还没进库");
+            }
+            // ── 欠账②的机器判据：receipt 必须写在插入**之后** ──────────────
+            // 把 receipt 提前，这里就会变成「receipt 在、消息不在」，本断言立刻红。
+            // 「记了没插」为什么更糟：重做时查到 receipt → 直接短路跳过 → **静默丢一条
+            // 会话**，而且没有任何约束会报错（UNIQUE 只拦重复 receipt，拦不住会话没进来）。
+            "restore-new-inserted-not-receipted" => {
+                assert_eq!(
+                    conv_count(&d.db_path),
+                    2,
+                    "崩在这个窗：插入已提交，会话必须在库里"
+                );
+                assert_eq!(
+                    receipt_count(&d.db_path),
+                    0,
+                    "崩在这个窗：receipt 必须**还没**写 —— 若它先于插入落库，这条即红"
+                );
+            }
+            "db-committed" => {
+                assert_eq!(receipt_count(&d.db_path), 2, "DB 阶段已完成");
+                assert!(
+                    lexical_checkpoint_present(&d.data_dir)
+                        && semantic_shards_present(&d.data_dir)
+                        && analytics_sentinel_present(&d.db_path),
+                    "三组事务外动作都还没做"
+                );
+            }
+            "readiness-invalidated" => {
+                assert!(!lexical_checkpoint_present(&d.data_dir), "readiness 已失效");
+                assert!(semantic_shards_present(&d.data_dir), "embedding 还没作废");
+            }
+            "embeddings-invalidated" => {
+                assert!(!semantic_shards_present(&d.data_dir), "embedding 已作废");
+                assert!(analytics_sentinel_present(&d.db_path), "analytics 还没重算");
+            }
+            "analytics-rebuilt" => {
+                assert!(!analytics_sentinel_present(&d.db_path), "analytics 已重算");
+                assert!(
+                    restore_journal_read(&d.journal_path)
+                        .unwrap()
+                        .unwrap()
+                        .published
+                        .is_empty(),
+                    "manifest 一份都还没 publish"
+                );
+            }
+            "manifest-partial" => {
+                let j = restore_journal_read(&d.journal_path).unwrap().unwrap();
+                assert_eq!(
+                    j.published.len(),
+                    1,
+                    "崩在第一份 publish 之后：恰有一份完成，剩下的靠差集续做"
+                );
+            }
+            "closure-verified" => {
+                let j = restore_journal_read(&d.journal_path).unwrap().unwrap();
+                assert_eq!(j.published.len(), 2, "publish 已全部完成");
+            }
+            other => panic!("未登记的边界：{other}"),
+        }
+    }
+
+    fn assert_converged(d: &Drill) {
+        assert_eq!(conv_count(&d.db_path), 2, "收敛后库里恰两条会话，不重不漏");
+        assert_eq!(receipt_count(&d.db_path), 2, "两条身份各恰一条 receipt");
+        assert_eq!(
+            msg_count(&d.db_path, &d.replace_external_id),
+            3,
+            "replace 支收敛后必须是三条消息（真前缀被换成完整版）"
+        );
+        assert!(!lexical_checkpoint_present(&d.data_dir));
+        assert!(!semantic_shards_present(&d.data_dir));
+        assert!(!analytics_sentinel_present(&d.db_path));
+        let j = restore_journal_read(&d.journal_path).unwrap().unwrap();
+        assert_eq!(j.state, RestoreJournalState::ClosureVerified);
+        assert_eq!(j.published.len(), 2);
+    }
+
+    /// 一个边界的完整三重断言 + 跨进程恢复。
+    fn boundary_case(boundary: &str, expected_state: RestoreJournalState) {
+        let d = drill();
+        plant_post_commit_sentinels(&d.data_dir, &d.db_path);
+
+        let (pid, handshaken) = crash_at(boundary, &d);
+        assert!(
+            handshaken,
+            "边界 {boundary} 未被子进程到达（哨兵未出现）—— 注入点不可达，不能算通过"
+        );
+        assert!(!pid_alive(pid), "SIGKILL 之后子进程 {pid} 必须已死");
+
+        // 第一重：崩溃现场的 journal **恰为**该边界的状态。
+        let mid = restore_journal_read(&d.journal_path)
+            .unwrap()
+            .expect("journal 必须已落盘");
+        assert_eq!(
+            mid.state, expected_state,
+            "在 {boundary} 注入，崩溃现场的 journal 状态应为 {expected_state:?}"
+        );
+        // 第二重：崩溃时确有未竟工作。
+        assert_work_pending_at(boundary, &d);
+
+        // 第三重：全新子进程恢复后收敛，再恢复一次是 no-op。
+        recover_in_fresh_child(&d);
+        assert_converged(&d);
+        let (again_restored, again_replaced) = recover_in_fresh_child(&d);
+        assert_eq!(
+            (again_restored, again_replaced),
+            (0, 0),
+            "第二次恢复必须是 no-op"
+        );
+        assert_converged(&d);
+    }
+
+    #[test]
+    fn e7_crash_at_planned_boundary_converges() {
+        boundary_case("planned", RestoreJournalState::Planned);
+    }
+
+    // ── 欠账①：Restore 支「插入已提交 / receipt 未写」窗的真 SIGKILL 注入 ──
+    //
+    // E6 只落了**状态级**证据（事后构造那个状态 → 重做 → 不重不漏、receipt 恰一条），
+    // 证的是**重做幂等**；**没证**「恢复器判窗正确」—— 那要真 SIGKILL + 全新进程
+    // 只读 journal 与 receipt，而恢复器是本任务的交付。这条用例补的就是那一层。
+    #[test]
+    fn e7_crash_between_restore_new_insert_and_receipt_converges() {
+        boundary_case(
+            "restore-new-inserted-not-receipted",
+            RestoreJournalState::Planned,
+        );
+    }
+
+    #[test]
+    fn e7_crash_at_db_committed_boundary_converges() {
+        boundary_case("db-committed", RestoreJournalState::DbCommitted);
+    }
+
+    #[test]
+    fn e7_crash_at_readiness_invalidated_boundary_converges() {
+        boundary_case(
+            "readiness-invalidated",
+            RestoreJournalState::ReadinessInvalidated,
+        );
+    }
+
+    #[test]
+    fn e7_crash_at_embeddings_invalidated_boundary_converges() {
+        boundary_case(
+            "embeddings-invalidated",
+            RestoreJournalState::EmbeddingsInvalidated,
+        );
+    }
+
+    #[test]
+    fn e7_crash_at_analytics_rebuilt_boundary_converges() {
+        boundary_case("analytics-rebuilt", RestoreJournalState::AnalyticsRebuilt);
+    }
+
+    #[test]
+    fn e7_crash_at_manifest_partial_boundary_converges() {
+        boundary_case("manifest-partial", RestoreJournalState::ManifestPartial);
+    }
+
+    #[test]
+    fn e7_crash_at_closure_verified_boundary_converges() {
+        boundary_case("closure-verified", RestoreJournalState::ClosureVerified);
+    }
+
+    // ── fsync 顺序（§5.2.5：写 tmp → fsync 文件 → rename → fsync 目录 → 再推进）──
+    #[test]
+    fn e7_journal_write_follows_the_spec_fsync_order() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("j.json");
+        let journal = restore_journal_from_plan(RestoreRunPlan {
+            operation_id: "e7-fsync".into(),
+            data_dir: dir.path().to_path_buf(),
+            scratch_dir: dir.path().to_path_buf(),
+            db_path: dir.path().join("x.sqlite"),
+            snapshot_root: SNAPSHOT_ROOT.into(),
+            generation: GENERATION.into(),
+            planned: Vec::new(),
+        });
+
+        let _ = journal_trace_take();
+        restore_journal_write(&path, &journal).unwrap();
+        let trace = journal_trace_take();
+
+        assert_eq!(
+            trace,
+            vec!["write-tmp", "fsync-file", "rename", "fsync-dir"],
+            "§5.2.5 的顺序是硬规定：写临时文件 → fsync 文件 → rename → fsync 目录"
+        );
+        // 顺序之外的两条可观测配套：临时文件不得残留；落盘的是完整 JSON（rename 原子性）。
+        assert!(
+            !path.with_extension("tmp").exists(),
+            "临时文件不得残留"
+        );
+        assert!(restore_journal_read(&path).unwrap().is_some());
     }
 }

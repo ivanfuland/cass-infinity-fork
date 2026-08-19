@@ -8243,7 +8243,12 @@ fn persist_lexical_rebuild_state(index_path: &Path, state: &LexicalRebuildState)
     write_json_pretty_atomically(&path, state)
 }
 
-fn clear_lexical_rebuild_state(index_path: &Path) -> Result<()> {
+/// 删掉词法重建 checkpoint = 让索引不再自称「对当前指纹新鲜」。
+///
+/// **可见性由 `fn` 放宽到 `pub(crate) fn`（裁定 R-E-50-b），函数体逐字节不变**：
+/// 唯一新增消费者是 E7 的 restore 恢复器（`phase3_restore::restore_invalidate_readiness`），
+/// 它要在「readiness 失效」那一格续做这个幂等动作。既有调用点与语义零改动。
+pub(crate) fn clear_lexical_rebuild_state(index_path: &Path) -> Result<()> {
     let path = lexical_rebuild_state_path(index_path);
     match fs::remove_file(&path) {
         Ok(()) => Ok(()),
