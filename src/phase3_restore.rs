@@ -2146,6 +2146,176 @@ fn scan_materialized_file(
         })
 }
 
+/// E4 第二层的**真实**投影实现（必接⑤ / 裁定 R-E-26 的兑现）。
+///
+/// E4 只依赖「同一份逻辑内容投影出同一串摘要」这一个性质，因此它当时用受控替身把判定逻辑
+/// （前缀 / 分叉 / 多极大元）先测死了，并把状态记成「逻辑闭、投影挂」。本结构体把挂着的
+/// 那一半接上：**摘要由 pin parser 的真实投影产出**。
+///
+/// 构造它需要 canonical 路径，而 trait 只给 [`OriginNamespace`] —— 这不是接口设计失误，是
+/// 裁定 R-E-34 的直接后果：**路径形状进投影定义域**（parser 按路径分支）。故路径由本结构体
+/// 在构造时持有，一个 identity 一个 projector。
+///
+/// # 摘要口径：对 compact **不变**（这是一处有意识的解释，不是附录原文直述）
+///
+/// 附录 §D.2.1 只说第二层比「消息序列」，没定义「同一条消息」的判据。若把整条
+/// `NormalizedMessage`（含 `extra` 全部键）纳入摘要，会撞上一个真实的误判：
+///
+/// - 版本 A 是版本 B 的真前缀，但 A 只有 12 MiB 而 B 有 18 MiB；
+/// - codex 的 compact 阈值是 16 MiB（`CODEX_INDEXER_EXTRA_COMPACT_THRESHOLD_BYTES`），
+///   于是 **B 的每条消息被 compact 掉了重复的原始 payload，而 A 的没有**；
+/// - 两侧共享前缀的同一条消息因此摘要不同 → 第二层判 `Diverged` → HOLD。
+///
+/// 那正是 §10.2 点名「截断超集用例必过、不得以 HOLD 蒙混」要挡的东西，只是成因从「字节
+/// 层键序差异」换成了「compact 阈值跨越」。故摘要**只取 compact 永远不会动的那些面**：
+/// `role` / `author` / `created_at` / `content` / `invocations`，加上
+/// `FRANKEN_NORMALIZED_EXTRA_KEYS` 那五个 —— compact 的实现明令**不得**丢它们
+/// （`indexer/mod.rs` 那个常量的 doc 原话：「Compaction drops the duplicated raw payload
+/// but must never drop these」）。
+///
+/// **`idx` 不进摘要**：序列比较本来就是按位置的，把位置再编进摘要只会让「同一条消息挪了
+/// 位置」变成两条不同消息，对前缀判定毫无帮助。
+pub struct SealedMessageProjector<'a> {
+    /// 物化用的隔离根。**不进任何判定**（R-E-34 条件 2）。
+    pub scratch_root: &'a Path,
+    /// 该 identity 的 canonical 捕获路径。**形状进定义域**。
+    pub canonical_original_path: &'a str,
+    /// 三家之一。
+    pub agent: Origin,
+    /// 该版本对应 manifest 的 `source_size_bytes`，喂给 compact 判据。
+    ///
+    /// **注意它对摘要不产生影响**（摘要口径对 compact 不变），保留它是为了让这条投影链
+    /// 与 restore 侧**逐字同构**——两条链若在 compact 输入上分叉，将来任何一处改动都会让
+    /// 「E5 与 F1 的投影差异只可能来自实现 bug」这句话失效。
+    pub sealed_source_size_bytes: u64,
+}
+
+/// compact 明令不得丢的五个 `extra` 顶层键。
+///
+/// 值取自 `indexer::FRANKEN_NORMALIZED_EXTRA_KEYS`（该常量私有，故此处是同值副本，
+/// 未改其可见性）。**同步不靠人记得**：`compact_criterion_reads_the_sealed_size_not_the_filesystem`
+/// 里有一条正向断言——跨过 compact 阈值之后，这五个键**仍然在场**。基线哪天真把其中一个
+/// 丢掉，那条断言会红；只做「compact 后剩下的键 ⊆ 允许集」这种反向断言是锁不住的
+/// （少掉一个键照样满足子集关系）。
+const COMPACT_INVARIANT_EXTRA_KEYS: [&str; 5] = [
+    "encrypted_content",
+    "raw_role",
+    "tool_call_args",
+    "tool_call_id",
+    "unpaired",
+];
+
+/// 一条 canonical 消息的 compact 不变摘要。
+fn compact_invariant_message_digest(
+    message: &franken_agent_detection::types::NormalizedMessage,
+) -> CanonicalMessageDigest {
+    let mut hasher = blake3::Hasher::new();
+    let mut field = |label: &str, bytes: &[u8]| {
+        // 长度前缀，避免相邻字段拼接产生歧义（`"ab"+"c"` 与 `"a"+"bc"` 必须不同摘要）。
+        hasher.update(label.as_bytes());
+        hasher.update(&(bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    };
+    field("role", message.role.as_bytes());
+    field("author", message.author.as_deref().unwrap_or("").as_bytes());
+    field(
+        "created_at",
+        &message.created_at.unwrap_or(i64::MIN).to_le_bytes(),
+    );
+    field("content", message.content.as_bytes());
+    for key in COMPACT_INVARIANT_EXTRA_KEYS {
+        // 键**缺失**与键**值为 null** 必须可区分：前者写 `-`，后者写 `null` 的 JSON 文本。
+        match message.extra.get(key) {
+            None => field(key, b"-"),
+            Some(value) => field(
+                key,
+                serde_json::to_string(value).unwrap_or_default().as_bytes(),
+            ),
+        }
+    }
+    field(
+        "invocations",
+        serde_json::to_string(&message.invocations)
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    CanonicalMessageDigest(*hasher.finalize().as_bytes())
+}
+
+impl MessageSequenceProjector for SealedMessageProjector<'_> {
+    fn project(
+        &self,
+        _origin: &OriginNamespace,
+        normalized_bytes: &[u8],
+    ) -> Result<Vec<CanonicalMessageDigest>, ProjectionError> {
+        // 每次投影落在一个由**字节内容**定名的子目录里。
+        //
+        // **诚实说明其力度**：当前调用形态是「物化 → 立刻扫 → 返回摘要」，即使两个版本共用
+        // 一条重建路径也不会串味（后写的覆盖先写的，但扫描紧跟其后）。所以这不是在修一个
+        // 现存 bug，而是把「两个版本的物化件同时存在且互不覆盖」变成结构性事实——将来若有人
+        // 把物化与扫描拆开、或并发投影两个版本，共用路径就会让二者互相覆盖，而覆盖的表现是
+        // 「两个版本读到同一份字节」= 差异被抹平成相等，属于最难发现的一类静默错误。
+        // 用内容定名而不是序号，顺带让同一份字节的重复投影命中同一个目录。
+        let slot = self
+            .scratch_root
+            .join(format!("v-{}", blake3::hash(normalized_bytes).to_hex()));
+
+        let input = SealedSource {
+            agent: self.agent,
+            canonical_original_path: self.canonical_original_path,
+            // 这里必须用**本次被投影字节**的长度：`materialize_sealed_blob` 的长度断言比的是
+            // 落盘字节，而归一化后的字节比封存 blob 短（尾巴被切掉）。
+            source_size_bytes: normalized_bytes.len() as u64,
+            blob: normalized_bytes,
+        };
+        let materialized =
+            materialize_sealed_blob(&slot, &input).map_err(|fault| ProjectionError {
+                detail: fault.to_string(),
+            })?;
+
+        let conversations =
+            scan_materialized_file(&materialized, self.agent).map_err(|fault| ProjectionError {
+                detail: fault.to_string(),
+            })?;
+        if conversations.len() != 1 {
+            return Err(ProjectionError {
+                detail: format!(
+                    "sealed projection produced {} conversations; exactly 1 is required",
+                    conversations.len()
+                ),
+            });
+        }
+        let mut conv = conversations.into_iter().next().expect("len checked above");
+
+        // 与 restore 侧走**同一条**准备链（含 compact 判据取封存值），差异只可能来自实现 bug。
+        // provenance 在比较场景无意义，用一份指向本次被投影版本的最小记录。
+        let provenance = crate::raw_mirror::RawMirrorCaptureRecord {
+            manifest_id: String::new(),
+            manifest_relative_path: String::new(),
+            blob_relative_path: String::new(),
+            blob_blake3: blake3::hash(normalized_bytes).to_hex().to_string(),
+            blob_size_bytes: normalized_bytes.len() as u64,
+            captured_at_ms: 0,
+            source_mtime_ms: None,
+            already_present: true,
+        };
+        crate::indexer::prepare_conversation_for_restore(
+            connector_name_for(self.agent),
+            &franken_agent_detection::types::Origin::local(),
+            None,
+            self.sealed_source_size_bytes,
+            &provenance,
+            &mut conv,
+        );
+
+        Ok(conv
+            .messages
+            .iter()
+            .map(compact_invariant_message_digest)
+            .collect())
+    }
+}
+
 /// 把一条封存输入投影成 canonical 会话 —— **E5 投影的唯一入口**。
 ///
 /// 步骤顺序不可交换，每一步的理由见各自注释：
@@ -2669,9 +2839,26 @@ mod e5_materialization_tests {
              一个都没有说明这份语料压根不产可 compact 的 extra，本测试就分不出两种行为"
         );
 
-        let kept_when_above = extras_outside_kept(
-            project_from_materialized(&materialized, &big, &test_provenance()).unwrap(),
-        );
+        // 正向断言：compact 之后那五个「明令不得丢」的键**仍然在场**。
+        // 只做反向的「剩下的键 ⊆ 允许集」锁不住基线——少掉一个键照样满足子集关系。
+        // 本断言同时是 `COMPACT_INVARIANT_EXTRA_KEYS` 与基线私有常量的同步锁。
+        let above = project_from_materialized(&materialized, &big, &test_provenance()).unwrap();
+        if let SealedProjection::Projected(conv) = &above {
+            let present: std::collections::BTreeSet<&str> = conv
+                .messages
+                .iter()
+                .filter_map(|m| m.extra.as_object())
+                .flat_map(|o| o.keys().map(String::as_str))
+                .collect();
+            assert!(
+                COMPACT_INVARIANT_EXTRA_KEYS
+                    .iter()
+                    .any(|k| present.contains(k)),
+                "compact 之后 `FRANKEN_NORMALIZED_EXTRA_KEYS` 里的键必须仍在场；实得 {present:?}"
+            );
+        }
+
+        let kept_when_above = extras_outside_kept(above);
         assert_eq!(
             kept_when_above, 0,
             "封存值跨过 16 MiB 阈值时必须 compact —— 判据是传进去的封存值，\
@@ -2753,6 +2940,287 @@ mod e5_materialization_tests {
         );
         // 封存长度与 provenance 记的 blob 长度是同一个事实的两处表达，必须一致。
         assert_eq!(view.blob_size_bytes, input.source_size_bytes);
+    }
+
+    // =======================================================================
+    // 必接⑤（裁定 R-E-26）：用**真实投影**重跑 E4 第二层的关系判定
+    //
+    // E4 当时用受控替身把判定逻辑测死了，状态记作「逻辑闭、投影挂」。这一组把挂着的那半
+    // 接上：同样的关系形态，改由 pin parser 的真实投影产出摘要。
+    //
+    // 造第二层用例的手法：**同样的逻辑消息、不同的字节**（键序不同）。字节层因此判不出
+    // 关系（既不相等也不是字节前缀），必须落到第二层；而第二层若实现正确，应当把它们看成
+    // 同一批消息。这正是 §D.2.1 说「第二层不是可选优化」的那个场景。
+    // =======================================================================
+
+    fn ns() -> OriginNamespace {
+        OriginNamespace {
+            agent: Origin::ClaudeCode,
+            source_id: "local".to_owned(),
+            origin_host: "h1".to_owned(),
+        }
+    }
+
+    const CLAUDE_PATH: &str =
+        "/home/u/.claude/projects/myapp/dddd1111-2222-3333-4444-555555555555.jsonl";
+
+    /// 同一条消息的两种字节写法：键序不同，逻辑内容相同。
+    fn line_key_order_a(text: &str, ts: &str) -> String {
+        format!(
+            r#"{{"type":"user","timestamp":"{ts}","message":{{"role":"user","content":"{text}"}}}}"#
+        )
+    }
+    fn line_key_order_b(text: &str, ts: &str) -> String {
+        format!(
+            r#"{{"message":{{"content":"{text}","role":"user"}},"timestamp":"{ts}","type":"user"}}"#
+        )
+    }
+
+    fn version(bytes: &[u8], mtime: i64, blob_id: &str) -> ContentVersion {
+        ContentVersion::new(
+            VersionSource::Mirror,
+            bytes,
+            mtime,
+            1_700_000_000_000,
+            blob_id,
+        )
+    }
+
+    #[test]
+    fn real_projection_resolves_a_message_layer_prefix_as_strictly_before() {
+        let root = scratch("real-prefix");
+        let projector = SealedMessageProjector {
+            scratch_root: &root,
+            canonical_original_path: CLAUDE_PATH,
+            agent: Origin::ClaudeCode,
+            sealed_source_size_bytes: 4096,
+        };
+
+        let a_bytes = format!(
+            "{}\n{}\n",
+            line_key_order_a("one", "2025-12-01T10:00:00Z"),
+            line_key_order_a("two", "2025-12-01T10:00:01Z")
+        );
+        // B：同样两条消息但键序不同（故字节层判不出前缀），再多一条。
+        let b_bytes = format!(
+            "{}\n{}\n{}\n",
+            line_key_order_b("one", "2025-12-01T10:00:00Z"),
+            line_key_order_b("two", "2025-12-01T10:00:01Z"),
+            line_key_order_b("three", "2025-12-01T10:00:02Z")
+        );
+
+        let a = version(a_bytes.as_bytes(), 1_000, "blob-a");
+        let b = version(b_bytes.as_bytes(), 2_000, "blob-b");
+
+        // 先证明这一对**确实落到第二层**：字节层必须判不出来，否则本用例测的是字节层。
+        assert!(
+            !b_bytes.as_bytes().starts_with(a_bytes.as_bytes()),
+            "构造失误：B 的字节以 A 开头，那样第一层就结束了，第二层根本不会被调用"
+        );
+
+        let verdict = compare_versions(&ns(), &a, &b, &projector).unwrap();
+        assert_eq!(verdict.relation, Relation::StrictlyBefore);
+        assert_eq!(
+            verdict.layer,
+            RelationLayer::MessageSequence,
+            "必须由第二层判出——落在字节层说明用例没造对"
+        );
+
+        // 决策表：真前缀 → replace，不是 HOLD（§5.2.1 与 §10.2 都点名这条）。
+        let identity = RestoreIdentity {
+            origin: ns(),
+            canonical_path: CLAUDE_PATH.to_owned(),
+        };
+        let action = decide_action(&identity, &[a], &b, &projector).unwrap();
+        assert!(
+            matches!(action, RestoreAction::Replace { .. }),
+            "真前缀必须判 replace，实得 {action:?}"
+        );
+    }
+
+    #[test]
+    fn real_projection_treats_different_bytes_with_equal_message_sequences_as_equal() {
+        let root = scratch("real-equal");
+        let projector = SealedMessageProjector {
+            scratch_root: &root,
+            canonical_original_path: CLAUDE_PATH,
+            agent: Origin::ClaudeCode,
+            sealed_source_size_bytes: 4096,
+        };
+        let a_bytes = format!("{}\n", line_key_order_a("same", "2025-12-01T10:00:00Z"));
+        let b_bytes = format!("{}\n", line_key_order_b("same", "2025-12-01T10:00:00Z"));
+        assert_ne!(a_bytes, b_bytes, "两侧字节必须不同，否则测的是字节层");
+
+        let a = version(a_bytes.as_bytes(), 1_000, "blob-a");
+        let b = version(b_bytes.as_bytes(), 2_000, "blob-b");
+        let verdict = compare_versions(&ns(), &a, &b, &projector).unwrap();
+        assert_eq!(verdict.relation, Relation::Equal);
+        assert_eq!(verdict.layer, RelationLayer::MessageSequence);
+    }
+
+    #[test]
+    fn real_projection_reports_genuine_content_divergence_as_diverged() {
+        let root = scratch("real-diverged");
+        let projector = SealedMessageProjector {
+            scratch_root: &root,
+            canonical_original_path: CLAUDE_PATH,
+            agent: Origin::ClaudeCode,
+            sealed_source_size_bytes: 4096,
+        };
+        let a_bytes = format!(
+            "{}\n{}\n",
+            line_key_order_a("one", "2025-12-01T10:00:00Z"),
+            line_key_order_a("left", "2025-12-01T10:00:01Z")
+        );
+        let b_bytes = format!(
+            "{}\n{}\n",
+            line_key_order_b("one", "2025-12-01T10:00:00Z"),
+            line_key_order_b("right", "2025-12-01T10:00:01Z")
+        );
+        let a = version(a_bytes.as_bytes(), 1_000, "blob-a");
+        let b = version(b_bytes.as_bytes(), 2_000, "blob-b");
+        let verdict = compare_versions(&ns(), &a, &b, &projector).unwrap();
+        assert_eq!(
+            verdict.relation,
+            Relation::Diverged,
+            "第二条消息内容真的不同 —— 这必须是分叉，不能被摘要口径抹平"
+        );
+    }
+
+    #[test]
+    fn real_projection_n_way_fork_reports_every_maximal_element() {
+        let root = scratch("real-fork");
+        let projector = SealedMessageProjector {
+            scratch_root: &root,
+            canonical_original_path: CLAUDE_PATH,
+            agent: Origin::ClaudeCode,
+            sealed_source_size_bytes: 4096,
+        };
+        let base = line_key_order_a("shared", "2025-12-01T10:00:00Z");
+        let mk = |tail: &str| {
+            format!(
+                "{base}\n{}\n",
+                line_key_order_b(tail, "2025-12-01T10:00:01Z")
+            )
+        };
+        let (x, y, z) = (mk("alpha"), mk("beta"), mk("gamma"));
+        let identity = RestoreIdentity {
+            origin: ns(),
+            canonical_path: CLAUDE_PATH.to_owned(),
+        };
+        let versions = vec![
+            version(x.as_bytes(), 1_000, "blob-x"),
+            version(y.as_bytes(), 2_000, "blob-y"),
+            version(z.as_bytes(), 3_000, "blob-z"),
+        ];
+        match select_winner(&identity, &versions, &projector).unwrap() {
+            WinnerOutcome::Hold(record) => {
+                assert_eq!(record.class(), HoldClass::Version);
+                // §D.5：证据必须带出**全部** N 个极大元，不能只表达两两分叉。
+                let text = format!("{record:?}");
+                for id in ["blob-x", "blob-y", "blob-z"] {
+                    assert!(text.contains(id), "分叉证据缺极大元 {id}：{text}");
+                }
+            }
+            other => panic!("三路互不可比必须判 content fork HOLD，实得 {other:?}"),
+        }
+    }
+
+    /// **这条是「摘要口径对 compact 不变」这个解释的承重测试。**
+    ///
+    /// 附录 §D.2.1 只说第二层比「消息序列」，没定义「同一条消息」的判据。若把整条
+    /// `NormalizedMessage`（含 `extra` 全部键）编进摘要，就会出现这样一对：A 是 B 的真前缀，
+    /// 但 A 只有 12 MiB、B 有 18 MiB，于是 **B 被 compact 而 A 没有**，两侧共享前缀的同一条
+    /// 消息摘要不同 → 第二层判分叉 → HOLD。那正是 §10.2 点名「截断超集用例必过、不得以
+    /// HOLD 蒙混」要挡的东西，只是成因从字节层键序换成了 compact 阈值跨越。
+    ///
+    /// 手法：**同一份字节投影两次**，唯一变量是喂给 compact 判据的封存值（一次低于 16 MiB
+    /// 阈值、一次高于），断言两次的摘要串逐条相同。先证探针有分辨力：两次投影的
+    /// `extra` 键集必须真的不同，否则这条测试没测到 compact 发生与否。
+    #[test]
+    fn message_digests_are_invariant_across_the_compact_threshold() {
+        const THRESHOLD: u64 = 16 * 1024 * 1024;
+        let mut blob = Vec::with_capacity(THRESHOLD as usize + 8192);
+        blob.extend_from_slice(
+            br#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"cwd":"/tmp/codex-demo"}}
+"#,
+        );
+        let mut i = 0u64;
+        while (blob.len() as u64) < THRESHOLD {
+            blob.extend_from_slice(
+                format!(
+                    r#"{{"timestamp":"2026-01-01T00:00:0{}Z","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"pad {} {}"}}]}}}}
+"#,
+                    i % 10,
+                    i,
+                    "y".repeat(512)
+                )
+                .as_bytes(),
+            );
+            i += 1;
+        }
+
+        // 文件名必须是 codex 认得的 `rollout-*` 形态（`.jsonl` 故走 JSONL 主路径，不是
+        // whole-file），且**全小写**：用普通名字 connector 扫出 0 个会话，带大写字母则被 E2
+        // 的分类器判 `filename-case-variant` 而 HOLD（§B.0.1「及其大小写变体」）。
+        // 两次都是「路径形状进投影定义域」（R-E-34）的实证，代价是两次红。
+        let path = "/home/u/.codex/sessions/2026/01/01/rollout-2026-01-01t00-00-00.jsonl";
+        let root = scratch("digest-compact-invariance");
+
+        let digests_at = |sealed: u64, tag: &str| -> Vec<CanonicalMessageDigest> {
+            let projector = SealedMessageProjector {
+                scratch_root: &root.join(tag),
+                canonical_original_path: path,
+                agent: Origin::Codex,
+                sealed_source_size_bytes: sealed,
+            };
+            projector.project(&ns(), &blob).expect("projection")
+        };
+
+        // 分辨力前置：先证「compact 到底有没有发生」这件事在两侧真的不同。
+        let extras_at = |sealed: u64, tag: &str| -> usize {
+            let slot = root.join(tag);
+            let input = SealedSource {
+                agent: Origin::Codex,
+                canonical_original_path: path,
+                source_size_bytes: blob.len() as u64,
+                blob: &blob,
+            };
+            let m = materialize_sealed_blob(&slot, &input).unwrap();
+            let below = SealedSource {
+                source_size_bytes: sealed,
+                ..input
+            };
+            match project_from_materialized(&m, &below, &test_provenance()).unwrap() {
+                SealedProjection::Projected(conv) => conv
+                    .messages
+                    .iter()
+                    .filter_map(|m| m.extra.as_object())
+                    .map(serde_json::Map::len)
+                    .sum(),
+                other => panic!("期望 Projected，实得 {other:?}"),
+            }
+        };
+        let keys_below = extras_at(1024, "probe-below");
+        let keys_above = extras_at(THRESHOLD, "probe-above");
+        assert!(
+            keys_below > keys_above,
+            "探针无分辨力：跨阈值前后 extra 键总数没变（{keys_below} vs {keys_above}），\
+             说明这份语料压根没被 compact，本测试证明不了摘要对 compact 不变"
+        );
+
+        let below = digests_at(1024, "below");
+        let above = digests_at(THRESHOLD, "above");
+        assert_eq!(
+            below.len(),
+            above.len(),
+            "compact 不该改变消息条数（它只动 extra）"
+        );
+        assert_eq!(
+            below, above,
+            "摘要必须对 compact 不变 —— 否则一对跨 16 MiB 阈值的真前缀会被第二层误判成分叉，\
+             撞上 §10.2「截断超集用例必过、不得以 HOLD 蒙混」"
+        );
     }
 
     #[test]
