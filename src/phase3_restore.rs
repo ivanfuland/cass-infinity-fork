@@ -2175,6 +2175,12 @@ fn scan_materialized_file(
 ///
 /// **`idx` 不进摘要**：序列比较本来就是按位置的，把位置再编进摘要只会让「同一条消息挪了
 /// 位置」变成两条不同消息，对前缀判定毫无帮助。
+///
+/// **`snippets` 也不进摘要**（裁定 R-E-38 要求把理由写在这里）：它是从 `content` **派生**的
+/// 预览物。把派生物放进等价判据，等于让同一份内容因为派生时机 / 派生实现不同而判不等价 ——
+/// 与全量 `extra` 同病。**这条注释同时是重议触发器**：若上游哪天给 `snippets` 灌**非派生**
+/// 的内容（即它开始携带 `content` 里没有的信息），本条排除就必须重新裁定。
+/// 当前三家的所有 push 点都是 `snippets: Vec::new()`（§B.11 的 P12），故排除它零信息损失。
 pub struct SealedMessageProjector<'a> {
     /// 物化用的隔离根。**不进任何判定**（R-E-34 条件 2）。
     pub scratch_root: &'a Path,
@@ -3220,6 +3226,222 @@ mod e5_materialization_tests {
             below, above,
             "摘要必须对 compact 不变 —— 否则一对跨 16 MiB 阈值的真前缀会被第二层误判成分叉，\
              撞上 §10.2「截断超集用例必过、不得以 HOLD 蒙混」"
+        );
+    }
+
+    // =======================================================================
+    // §B.11 逐字段 checklist —— **契约验证，不是 TDD 红转绿**
+    //
+    // 这一组锁的是「经 E5 这条投影链看过去，pin parser 的行为符合附录 §B.2 分支表」。
+    // 绝大多数判据是 **parser 既有的行为**，不是本任务新写的逻辑，故它们的绿**不构成
+    // 「我实现对了」的证据**，只构成「这条链没有把 parser 的正确行为破坏掉，且将来 pin
+    // 升级若改了这些行为会被立刻发现」。台账按契约验证记账，与红转绿分开。
+    //
+    // 覆盖面按 §B.11 的编号标注；**P10 与 P15 的 11 个 token 汇总列不在本组**——它们要
+    // 落库之后才能断言，归写入半（Phase 2）。Phase 1 收口时出分项表，不写裸的「B.11 已过」。
+    // =======================================================================
+
+    /// 一份把 §B.2 四种 content 块一次走全的真实形状样本。
+    ///
+    /// 结构取自附录 §B.2 分支表：assistant envelope 里放 text / tool_use / thinking 三块，
+    /// user envelope 里放 tool_result（表里明写 `role != "user"` 时 ToolResult 块被跳过，
+    /// 故必须分两个 envelope）。
+    const CLAUDE_ALL_BLOCKS: &str = concat!(
+        r#"{"type":"user","timestamp":"2025-12-01T10:00:00Z","message":{"role":"user","content":"kick off"}}"#,
+        "\n",
+        r#"{"type":"assistant","timestamp":"2025-12-01T10:00:01Z","message":{"role":"assistant","model":"claude-opus-5","content":[{"type":"text","text":"let me look"},{"type":"thinking","thinking":"weighing options"},{"type":"tool_use","id":"toolu_01","name":"Read","input":{"path":"/x"}}]}}"#,
+        "\n",
+        r#"{"type":"user","timestamp":"2025-12-01T10:00:02Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"file body"}]}}"#,
+        "\n",
+    );
+
+    fn project_all_blocks(tag: &str) -> Box<NormalizedConversation> {
+        let root = scratch(tag);
+        let bytes = CLAUDE_ALL_BLOCKS.as_bytes();
+        let input = claude_source(CLAUDE_PATH, bytes);
+        match project_sealed_source(&root, &input, &test_provenance()).unwrap() {
+            SealedProjection::Projected(conv) => conv,
+            other => panic!("期望 Projected，实得 {other:?}"),
+        }
+    }
+
+    /// P1 `idx` 连续 `0..N`；P2 role 取值在 6-role 内且 `assistant`/`agent` 不混、
+    /// `tool_call`/`tool_result`/`reasoning` 以字面串存。
+    #[test]
+    fn contract_p1_p2_idx_is_dense_and_roles_are_canonical() {
+        let conv = project_all_blocks("b11-p1p2");
+        let idxs: Vec<i64> = conv.messages.iter().map(|m| m.idx).collect();
+        assert_eq!(
+            idxs,
+            (0..idxs.len() as i64).collect::<Vec<_>>(),
+            "P1：块拆分后 idx 必须重编成连续 0..N"
+        );
+
+        let roles: Vec<&str> = conv.messages.iter().map(|m| m.role.as_str()).collect();
+        const SIX_ROLE: [&str; 6] = [
+            "user",
+            "assistant",
+            "tool_call",
+            "tool_result",
+            "reasoning",
+            "system",
+        ];
+        for role in &roles {
+            assert!(SIX_ROLE.contains(role), "P2：role `{role}` 不在 6-role 内");
+        }
+        assert!(
+            !roles.contains(&"agent"),
+            "P2：`agent` 是非规范 role，只出现在已被范围门 HOLD 的 `.json` 路径上"
+        );
+        // 四种块各产出了它该产的那条。
+        for expected in ["user", "assistant", "reasoning", "tool_call", "tool_result"] {
+            assert!(
+                roles.contains(&expected),
+                "样本应覆盖 role `{expected}`，实得 {roles:?}"
+            );
+        }
+    }
+
+    /// P3 `raw_role`：**每条** retained 消息都有、是 string、同 envelope 多消息值相同。
+    #[test]
+    fn contract_p3_every_retained_message_carries_a_string_raw_role() {
+        let conv = project_all_blocks("b11-p3");
+        for m in &conv.messages {
+            let rr = m.extra.get("raw_role").unwrap_or_else(|| {
+                panic!(
+                    "P3：消息 idx={} 缺 extra.raw_role（上位 §3.6 无例外）",
+                    m.idx
+                )
+            });
+            assert!(rr.is_string(), "P3：raw_role 必须是 string，实得 {rr}");
+        }
+        // 同 envelope 拆出的多条复制同一个 raw_role：assistant envelope 拆出
+        // text / reasoning / tool_call 三条，raw_role 应当都是 "assistant"。
+        let from_assistant_envelope: Vec<&str> = conv
+            .messages
+            .iter()
+            .filter(|m| matches!(m.role.as_str(), "assistant" | "reasoning" | "tool_call"))
+            .filter_map(|m| m.extra.get("raw_role").and_then(|v| v.as_str()))
+            .collect();
+        assert!(
+            from_assistant_envelope.iter().all(|r| *r == "assistant"),
+            "P3：同一 envelope 拆出的消息必须复制同一个 raw_role，实得 {from_assistant_envelope:?}"
+        );
+    }
+
+    /// P7 tool args **两处表示不同**：`extra.tool_call_args` 键始终存在（缺失写 JSON null）；
+    /// `invocations[0].arguments` 缺失时**键不存在**（`skip_serializing_if`）。
+    /// P11 tool_call 消息有一条 invocation，`kind="tool"`、`name`、`call_id` 齐。
+    #[test]
+    fn contract_p7_p11_tool_args_have_two_distinct_representations() {
+        let conv = project_all_blocks("b11-p7p11");
+        let call = conv
+            .messages
+            .iter()
+            .find(|m| m.role == "tool_call")
+            .expect("样本里有一个 tool_use 块");
+
+        assert!(
+            call.extra.get("tool_call_args").is_some(),
+            "P7：`extra.tool_call_args` 键必须始终存在（args 缺失时值为 JSON null）"
+        );
+        assert_eq!(
+            call.invocations.len(),
+            1,
+            "P11：tool_call 消息应恰有一条 invocation"
+        );
+        let inv = &call.invocations[0];
+        assert_eq!(inv.kind, "tool");
+        assert_eq!(inv.name, "Read");
+        assert_eq!(inv.call_id.as_deref(), Some("toolu_01"));
+        // args 非缺失时两处是同一个 JSON 值。
+        assert_eq!(
+            call.extra.get("tool_call_args"),
+            inv.arguments.as_ref(),
+            "P7：args 非缺失时 `extra.tool_call_args` 与 `invocations[0].arguments` 必须同值"
+        );
+    }
+
+    /// P8 pairing：`extra.tool_call_id` 与 `extra.unpaired` **恰有一个**存在。
+    #[test]
+    fn contract_p8_pairing_has_exactly_one_of_id_or_unpaired() {
+        let conv = project_all_blocks("b11-p8");
+        for m in conv
+            .messages
+            .iter()
+            .filter(|m| matches!(m.role.as_str(), "tool_call" | "tool_result"))
+        {
+            let has_id = m.extra.get("tool_call_id").is_some();
+            let has_unpaired = m.extra.get("unpaired").is_some();
+            assert!(
+                has_id ^ has_unpaired,
+                "P8：idx={} 的 pairing 键必须恰有一个（id={has_id}, unpaired={has_unpaired}）：{}",
+                m.idx,
+                m.extra
+            );
+        }
+    }
+
+    /// P5 author 符合 §B.2 表：`assistant` 取 `message.model`；`user` / `tool_result` 为空；
+    /// **不伪造模型**。P6 `created_at` 由 `parse_timestamp` 得出、非空。
+    #[test]
+    fn contract_p5_p6_author_and_timestamps_follow_the_branch_table() {
+        let conv = project_all_blocks("b11-p5p6");
+        for m in &conv.messages {
+            match m.role.as_str() {
+                "user" | "tool_result" => assert!(
+                    m.author.is_none(),
+                    "P5：role={} 的 author 必须为空，实得 {:?}",
+                    m.role,
+                    m.author
+                ),
+                "assistant" | "reasoning" | "tool_call" => assert_eq!(
+                    m.author.as_deref(),
+                    Some("claude-opus-5"),
+                    "P5：assistant envelope 拆出的消息 author 取 message.model"
+                ),
+                other => panic!("样本不该产出 role={other}"),
+            }
+            assert!(
+                m.created_at.is_some(),
+                "P6：样本每行都有 timestamp，created_at 不该为空"
+            );
+        }
+    }
+
+    /// P12 `snippets` 三家均产空 —— **restore 场景下为空不是漏字段**。
+    #[test]
+    fn contract_p12_snippets_are_empty_by_construction_not_by_omission() {
+        let conv = project_all_blocks("b11-p12");
+        assert!(
+            conv.messages.iter().all(|m| m.snippets.is_empty()),
+            "P12：三家所有 push 点都是 `snippets: Vec::new()`，非空说明形态超出附录定义域"
+        );
+    }
+
+    /// §B.2 的两个非对称之一：**空 thinking 保留、空 prose 丢弃**。
+    /// 这条是上位 §3.5 / §16.4 的锚点，也是 §D.2.1 第二层存在意义的语料来源。
+    #[test]
+    fn contract_empty_thinking_is_kept_while_empty_prose_is_dropped() {
+        let root = scratch("b11-empty-asym");
+        let bytes = concat!(
+            r#"{"type":"assistant","timestamp":"2025-12-01T10:00:00Z","message":{"role":"assistant","content":[{"type":"text","text":"   "},{"type":"thinking","thinking":""}]}}"#,
+            "\n",
+        )
+        .as_bytes();
+        let input = claude_source(CLAUDE_PATH, bytes);
+        let conv = match project_sealed_source(&root, &input, &test_provenance()).unwrap() {
+            SealedProjection::Projected(conv) => conv,
+            other => panic!("期望 Projected，实得 {other:?}"),
+        };
+        let roles: Vec<&str> = conv.messages.iter().map(|m| m.role.as_str()).collect();
+        assert!(
+            roles.contains(&"reasoning"),
+            "空 thinking 必须保留（不做 trim 判空），实得 {roles:?}"
+        );
+        assert!(
+            !roles.contains(&"assistant"),
+            "只有空白的 text 块 trim 后为空，必须不产消息，实得 {roles:?}"
         );
     }
 
