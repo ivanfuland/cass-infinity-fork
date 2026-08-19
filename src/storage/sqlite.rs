@@ -14427,10 +14427,13 @@ fn franken_update_conversation_token_summaries_in_tx(
 /// 否则 `messages.id` 无 `AUTOINCREMENT`、删后 id 会被回收复用，
 /// 而 `content-v1` 指纹的第三分量取 `MAX(messages.id)`，复用即指纹不动）。
 /// 两份列表的同步由 `e5_replace_message_insert_column_list_tracks_baseline` 机器守卫。
-// ⚠ 下面四个符号在 E6 把 replace 编排接上之前，非测试构建里没有调用方，
-// 故显式 `allow(dead_code)`。**这是 staged landing 的记账，不是把死代码放行**：
-// E6 Step 1 会把 `FrankenTransaction` 传进来成为真调用方，届时这些 allow 应当移除。
-// E9 的 clippy 门以「相对基线零新增告警」为判据，这四条属本 PR 新增，故在此消掉。
+// ⚠ 下面四个符号在非测试构建里还没有调用方，故显式 `allow(dead_code)`。
+// **这是 staged landing 的记账，不是把死代码放行。**
+//
+// **移除义务已从 E6 改挂 E8**（本棒实测更正）：E6 的编排确实把 `FrankenTransaction`
+// 传了进来，但**编排自己也还没有调用方**，dead-code 从可达根传递判定，于是整条链
+// 依旧不可达。真正的根是 E8 把 `mirror-restore --apply` 的 CLI 接上那一刻。
+// E9 的 clippy 门以「相对基线零新增告警」为判据，这几条属本 PR 新增，故在此消掉。
 #[allow(dead_code)]
 const REPLACE_MESSAGE_INSERT_SQL: &str = "INSERT INTO messages(id, conversation_id, idx, role, author, created_at, content, extra_json, extra_bin) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)";
 
@@ -14582,6 +14585,156 @@ pub(crate) fn franken_replace_conversation_messages_in_tx(
         inserted_message_ids,
         deleted_message_count,
     })
+}
+
+// -------------------------------------------------------------------------
+// E6 · restore 编排要用的四个存储原语（裁定 R-E-48：存储写点落本文件，
+// 编排留 `phase3_restore`；既有符号零改动，本批全部是新增 `pub(crate)`）
+// -------------------------------------------------------------------------
+
+/// 重建**第三处** tail 载体 `conversation_external_tail_lookup`。
+///
+/// E5 的 replace 函数按 plan 语义② 只管热表与 `conversations` 三列；这一张是
+/// External key 的直达缓存（`franken_find_existing_conversation_with_tail_by_key`
+/// 对 External key 直接从它取 tail），**留旧值会让下一次 append 插错位置**。
+///
+/// 与前两处同样的形态：**先清后写**。既有的两个写入器一个单调抬高、一个虽是赋值
+/// 但只在行存在时生效，都降不下来；清成 NULL 之后再走既有写入器，抬高即等于赋值。
+///
+/// 行不存在时（该会话没有 external id，或从未走过 append）本函数是 no-op ——
+/// 那张表是缓存，缺行时读取器自会回落，凭空补一行反而是在替基线做决定。
+#[allow(dead_code)]
+pub(crate) fn franken_rebuild_external_conversation_tail_lookup_in_tx(
+    tx: &FrankenTransaction<'_>,
+    agent_id: i64,
+    conv: &Conversation,
+) -> Result<()> {
+    let Some(lookup_key) = conversation_external_lookup_key_for_conv(agent_id, conv) else {
+        return Ok(());
+    };
+
+    tx.execute_compat(
+        "UPDATE conversation_external_tail_lookup
+         SET ended_at = NULL, last_message_idx = NULL, last_message_created_at = NULL
+         WHERE lookup_key = ?1",
+        fparams![lookup_key.as_str()],
+    )?;
+
+    let (last_idx, last_created_at) = conversation_tail_state(conv);
+    let ended_at = conversation_tail_ended_at_candidate(conv);
+    franken_update_external_conversation_tail_lookup_key(
+        tx,
+        &lookup_key,
+        ended_at,
+        last_idx,
+        last_created_at,
+    )
+}
+
+/// 按附录 §B.1.2 的逐行动作更新 conversation 级字段。
+///
+/// 逐列动作：`title` / `started_at` / `ended_at` **重算**（取投影产物的值 ——
+/// 推导规则在 connector 侧，**本函数不重推导**，重推导即第二定义）、
+/// `workspace_id` / `metadata` **替换**、`approx_tokens` **置 NULL**
+/// （§B.1.2 末行：与 ingest 行为一致，`map_to_internal_with_redactor` 恒写 `None`）。
+///
+/// `metadata` 的落盘形态复用既有的 `franken_metadata_insert_payload`，不在这里重拼
+/// json/msgpack 的二选一规则。
+///
+/// **不碰的列**：`id`（保留原值）、11 个 token 汇总列（E5 已重算）、三个 tail 列
+/// （E5 的语义② 已经写过；这里再写一次会把它们从赋值语义打回抬高语义）。
+#[allow(dead_code)]
+pub(crate) fn franken_update_conversation_projection_fields_in_tx(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+    workspace_id: Option<i64>,
+    conv: &Conversation,
+) -> Result<()> {
+    let (metadata_json_str, metadata_bin) = franken_metadata_insert_payload(&conv.metadata_json)?;
+    tx.execute_compat(
+        "UPDATE conversations
+         SET title = ?1,
+             workspace_id = ?2,
+             started_at = ?3,
+             approx_tokens = NULL,
+             metadata_json = ?4,
+             metadata_bin = ?5
+         WHERE id = ?6",
+        fparams![
+            conv.title.as_deref(),
+            workspace_id,
+            conv.started_at,
+            metadata_json_str.as_deref(),
+            metadata_bin.as_deref(),
+            conversation_id
+        ],
+    )?;
+    Ok(())
+}
+
+/// 推进 DB 的内容代际（`meta` 表的 `source_content_generation`）。
+///
+/// key 常量由 E1 落，**调用方只能引用不得自由构造**（声明侧取值域封闭且静态）。
+#[allow(dead_code)]
+pub(crate) fn franken_set_source_content_generation_in_tx(
+    tx: &FrankenTransaction<'_>,
+    generation: &str,
+) -> Result<()> {
+    tx.execute_compat(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+        fparams![SOURCE_CONTENT_GENERATION_META_KEY, generation],
+    )?;
+    Ok(())
+}
+
+/// 写一条 operation commit receipt。**必须与 DB 动作同事务**——它记的是
+/// 「这次事务已提交」这个事实，跨事务写就失去了它存在的理由。
+///
+/// `idempotency_key` 上有 UNIQUE：同一 key 二次插入会硬失败，而不是静默覆盖。
+/// 这是有意的 —— 幂等的实现方式是**先查后做**，不是「重复写入被吞掉」。
+#[allow(dead_code)]
+pub(crate) fn franken_insert_operation_commit_receipt_in_tx(
+    tx: &FrankenTransaction<'_>,
+    idempotency_key: &str,
+    operation: &str,
+    state: &str,
+    snapshot_root: Option<&str>,
+    committed_at_ms: i64,
+    detail: Option<&str>,
+) -> Result<()> {
+    tx.execute_compat(
+        "INSERT INTO operation_commit_receipt
+             (idempotency_key, operation, state, snapshot_root, committed_at_ms, detail)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+        fparams![
+            idempotency_key,
+            operation,
+            state,
+            snapshot_root,
+            committed_at_ms,
+            detail
+        ],
+    )?;
+    Ok(())
+}
+
+/// 查一条 receipt 是否已存在（幂等判据的读侧）。
+///
+/// **恢复器要能在崩溃后由全新进程只读判「已提交」**，所以这条查询只依赖
+/// `idempotency_key` 一个入参，不依赖任何内存状态。
+#[allow(dead_code)]
+pub(crate) fn franken_operation_commit_receipt_exists(
+    conn: &FrankenConnection,
+    idempotency_key: &str,
+) -> Result<bool> {
+    let found: Option<i64> = conn
+        .query_row_map(
+            "SELECT 1 FROM operation_commit_receipt WHERE idempotency_key = ?1",
+            fparams![idempotency_key],
+            |row| row.get_typed(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
 }
 
 /// replace 侧逐消息派生 `token_usage` / `message_metrics` 两行。

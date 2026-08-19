@@ -4109,10 +4109,12 @@ mod e5_materialization_tests {
 /// 归另一支。把两者并成一个 `Err(String)` 会让调用方只能按错误文本分流 —— 那正是
 /// 本项目一路在拒绝的判据形态。
 #[derive(Debug)]
-// ⚠ 与 `sqlite.rs` 的 replace 函数同一记账：下面三个符号在 E6 把 restore 编排接上
-// 之前，非测试构建里没有调用方，故显式 `allow(dead_code)`。**staged landing 的记账，
-// 不是把死代码放行** —— E6 Step 1 接上之后必须移除这些 allow，并让 clippy 证明它们
-// 有真调用方（该条已登记为 E6 开工验收面）。
+// ⚠ 与 `sqlite.rs` 的 replace 函数同一记账：下面三个符号在非测试构建里还没有调用方，
+// 故显式 `allow(dead_code)`。**staged landing 的记账，不是把死代码放行。**
+//
+// **移除义务已从 E6 改挂 E8**（本棒实测更正）：E6 落了编排之后这三个符号**仍然**不可达
+// —— dead-code 从可达根传递判定，而编排自己也还没有调用方。真正的根是 E8 把
+// `mirror-restore --apply` 的 CLI 接上那一刻。
 #[allow(dead_code)]
 pub(crate) enum SealedBlobOutcome {
     /// 读到了，且已通过 doctor 侧的强校验（blake3 + 长度）。
@@ -4920,5 +4922,467 @@ mod e5_p30_blob_read_tests {
             )
             .unwrap();
         assert_eq!(idxs, vec![0, 1, 2], "idx 必须是 0..2 各恰一条，不重不漏");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// E6 · replace 编排（plan Task E6 Step 1 的 Replace 支）
+//
+// 本节只做**时序与分派**；每一次落盘都经 `storage::sqlite` 的原语（裁定 R-E-48）。
+// 序列与归属见 run root 的 `e6-dispatch-interface.md` §2；这里只重复承重的三条：
+//   · 外层事务由**调用方**给（与 E5 的语义① 同一条纪律：编排自己也不开事务，
+//     这样 E7 的 journal 才能把「DB 动作」与「journal 状态推进」放进同一个边界）；
+//   · receipt 与 DB 动作**同事务**；
+//   · 五张累加型物化聚合表**不在这里**——按 E6 Step 1b 在事务提交之后重算。
+// ---------------------------------------------------------------------------
+
+/// `commit_replace_in_tx` 的入参。
+// ⚠ 移除义务在 **E8**，不在 E6：dead-code 是从**可达根**传递判定的，而 E6 只是又加了
+// 一层编排 —— 编排本身在非测试构建里仍无调用方，于是它下面整条链（含 E5 那四个符号）
+// 依旧不可达。真正的根是 E8 把 `mirror-restore --apply` 的 CLI 接上那一刻。
+// 判据仍是「删掉 allow 之后 clippy 不报 never-used」，不是「删掉能编译」。
+#[allow(dead_code)]
+pub(crate) struct ReplaceCommitInput<'a> {
+    /// 被替换的会话，**ID 保留**（§5.2.4 首行）。
+    pub conversation_id: i64,
+    pub agent_id: i64,
+    pub workspace_id: Option<i64>,
+    /// 投影产物（已过 `map_to_internal`）。
+    pub conv: &'a crate::model::types::Conversation,
+    /// 用于构造幂等 key 的身份。
+    pub identity: &'a RestoreIdentity,
+    /// 本次消费的封存件根，进幂等 key —— 换一批封存件重跑不得被误判「已提交」。
+    pub snapshot_root: &'a str,
+    /// 本次 restore 推进到的内容代际。
+    pub generation: &'a str,
+}
+
+/// `commit_replace_in_tx` 的产出。
+#[allow(dead_code)]
+pub(crate) struct ReplaceCommitOutcome {
+    /// 本次写入 receipt 用的幂等 key；恢复器据它判「已提交」。
+    pub idempotency_key: String,
+    /// 新插入的 message id（按 `conv.messages` 顺序）。
+    pub inserted_message_ids: Vec<i64>,
+}
+
+/// replace 分支的 `operation` 取值。**字面量集中在一处**，避免写 receipt 与查 receipt
+/// 两侧各写一份字符串。
+#[allow(dead_code)]
+pub(crate) const REPLACE_OPERATION: &str = "mirror-restore-replace";
+
+/// 幂等 key = `{operation}:{snapshot_root}:{identity}`。
+///
+/// 三条约束（接口说明 §3）：同一 identity 重跑命中同一 key；不同 snapshot root 不得
+/// 共用；**必须能由崩溃后的全新进程只读重算出来** —— 所以三个组成部分全部来自入参，
+/// 没有任何一项依赖内存状态或墙钟。
+///
+/// `RestoreIdentity` 的 `Display` 已经把 `{agent}@{host}:{source_id} {canonical_path}`
+/// 拼好，这里直接用它，不在第二处重拼身份的字符串形式。
+#[allow(dead_code)]
+pub(crate) fn replace_idempotency_key(snapshot_root: &str, identity: &RestoreIdentity) -> String {
+    format!("{REPLACE_OPERATION}:{snapshot_root}:{identity}")
+}
+
+/// 在**调用方给的事务**里跑完 replace 的整条序列。
+///
+/// 步骤（编号对齐接口说明 §2 的表）：
+/// 2–7 交给 E5 的 `franken_replace_conversation_messages_in_tx`（两处 tail 重置、
+/// 删旧、插新、两张派生表、11 列重算、tail 回写）；
+/// 8 重建第三处 tail 载体；9 conversation 级字段按 §B.1.2；10 推进 generation；
+/// 11 写 receipt。
+#[allow(dead_code)]
+pub(crate) fn commit_replace_in_tx(
+    tx: &frankensqlite::compat::Transaction<'_>,
+    input: &ReplaceCommitInput<'_>,
+    pricing: &crate::storage::sqlite::PricingTable,
+    committed_at_ms: i64,
+) -> anyhow::Result<ReplaceCommitOutcome> {
+    // 2–7
+    let replaced = crate::storage::sqlite::franken_replace_conversation_messages_in_tx(
+        tx,
+        input.conversation_id,
+        input.agent_id,
+        input.workspace_id,
+        input.conv,
+        pricing,
+    )?;
+
+    // 8 · 第三处 tail 载体
+    crate::storage::sqlite::franken_rebuild_external_conversation_tail_lookup_in_tx(
+        tx,
+        input.agent_id,
+        input.conv,
+    )?;
+
+    // 9 · conversation 级字段（§B.1.2）
+    crate::storage::sqlite::franken_update_conversation_projection_fields_in_tx(
+        tx,
+        input.conversation_id,
+        input.workspace_id,
+        input.conv,
+    )?;
+
+    // 10 · 推进 generation
+    crate::storage::sqlite::franken_set_source_content_generation_in_tx(tx, input.generation)?;
+
+    // 11 · receipt（同事务）
+    let idempotency_key = replace_idempotency_key(input.snapshot_root, input.identity);
+    crate::storage::sqlite::franken_insert_operation_commit_receipt_in_tx(
+        tx,
+        &idempotency_key,
+        REPLACE_OPERATION,
+        "committed",
+        Some(input.snapshot_root),
+        committed_at_ms,
+        None,
+    )?;
+
+    Ok(ReplaceCommitOutcome {
+        idempotency_key,
+        inserted_message_ids: replaced.inserted_message_ids,
+    })
+}
+
+// ===========================================================================
+// E6 · replace 编排（plan Task E6 Step 1 的 Replace 支）
+//
+// 编排负责的是**时序与分派**，存储写点仍在 `storage::sqlite`。本组测试锁的是
+// plan Task E6 Step 1 点名的那条事务序列里，**E5 没做、由 E6 补上的四件事**：
+//   ⑧ 第三处 tail 载体 `conversation_external_tail_lookup` 的重建；
+//   ⑨ conversation 级字段按附录 §B.1.2 的逐行动作；
+//   ⑩ 推进 generation（`meta` 的 `source_content_generation`）；
+//   ⑪ 写 receipt（`operation_commit_receipt`），与 DB 动作**同事务**。
+// 外加整条序列的原子性：无孤儿断言失败 → 整事务回滚。
+// ===========================================================================
+#[cfg(test)]
+mod e6_replace_commit_tests {
+    use super::*;
+    use frankensqlite::compat::{
+        ConnectionExt, OptionalExtension, ParamValue, RowExt, TransactionExt,
+    };
+    use tempfile::TempDir;
+
+    use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+    use crate::storage::sqlite::{FrankenStorage, PricingTable};
+
+    const TS: i64 = 1_770_551_400_000;
+    const EXTERNAL_ID: &str = "e6-conv-1";
+
+    fn message(idx: i64, role: MessageRole, content: &str) -> Message {
+        Message {
+            id: None,
+            idx,
+            role,
+            author: None,
+            created_at: Some(TS + idx * 1_000),
+            content: content.into(),
+            extra_json: serde_json::Value::Null,
+            snippets: vec![],
+        }
+    }
+
+    fn conversation_titled(title: &str, messages: Vec<Message>) -> Conversation {
+        let ended = messages.iter().filter_map(|m| m.created_at).max();
+        Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: None,
+            external_id: Some(EXTERNAL_ID.into()),
+            title: Some(title.to_owned()),
+            source_path: std::path::PathBuf::from("/fixtures/e6.jsonl"),
+            started_at: messages.iter().filter_map(|m| m.created_at).min(),
+            ended_at: ended,
+            approx_tokens: Some(999), // 必须被置 NULL（§B.1.2 末行）
+            metadata_json: serde_json::json!({"source": "rollout"}),
+            messages,
+            source_id: "local".into(),
+            origin_host: None,
+        }
+    }
+
+    fn open(dir: &TempDir) -> (FrankenStorage, i64) {
+        let storage = FrankenStorage::open(&dir.path().join("e6.sqlite")).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        (storage, agent_id)
+    }
+
+    fn identity() -> RestoreIdentity {
+        RestoreIdentity {
+            origin: OriginNamespace {
+                agent: Origin::Codex,
+                source_id: "local".into(),
+                origin_host: "fixture-host".into(),
+            },
+            canonical_path: "/fixtures/e6.jsonl".into(),
+        }
+    }
+
+    fn scalar_i64(storage: &FrankenStorage, sql: &str, id: i64) -> Option<i64> {
+        storage
+            .raw()
+            .query_row_map(sql, &[ParamValue::from(id)], |row| row.get_typed(0))
+            .optional()
+            .unwrap()
+            .flatten()
+    }
+
+    /// 建一条已索引的三消息会话，并**证明第三处 tail 载体确实有行**（否则 ⑧ 的断言空转）。
+    fn seed(storage: &FrankenStorage, agent_id: i64) -> i64 {
+        let first = conversation_titled(
+            "旧标题",
+            vec![
+                message(0, MessageRole::User, "旧 0"),
+                message(1, MessageRole::Assistant, "旧 1"),
+            ],
+        );
+        storage
+            .insert_conversations_batched(&[(agent_id, None, &first)])
+            .unwrap();
+        // 第二批走 append 分支，这一步才会写 `conversation_external_tail_lookup`。
+        let grown = conversation_titled(
+            "旧标题",
+            vec![
+                message(0, MessageRole::User, "旧 0"),
+                message(1, MessageRole::Assistant, "旧 1"),
+                message(2, MessageRole::User, "旧 2"),
+            ],
+        );
+        storage
+            .insert_conversations_batched(&[(agent_id, None, &grown)])
+            .unwrap();
+
+        let conv_id: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT id FROM conversations WHERE external_id = ?1",
+                &[ParamValue::from(EXTERNAL_ID)],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        let tail_idx = scalar_i64(
+            storage,
+            "SELECT last_message_idx FROM conversation_external_tail_lookup
+             WHERE conversation_id = ?1",
+            conv_id,
+        );
+        assert_eq!(
+            tail_idx,
+            Some(2),
+            "前置断言：第三处 tail 载体必须有一行且停在 idx 2，否则 ⑧ 的断言是空转"
+        );
+        conv_id
+    }
+
+    fn replacement() -> Conversation {
+        // 真前缀：2 条 < 库里的 3 条，于是三处 tail 都必须**降**下来。
+        // title 由 connector 侧的规则推导，**E6 不重推导**（重推导即第二定义）——
+        // 它写的是投影产物里的那个值。判据因此是「旧标题被换掉」，不是「E6 算得对」。
+        conversation_titled(
+            "新标题",
+            vec![
+                message(0, MessageRole::User, "新 0"),
+                message(1, MessageRole::Assistant, "新 1"),
+            ],
+        )
+    }
+
+    #[test]
+    fn e6_replace_commit_rebuilds_the_third_tail_carrier_and_writes_receipt() {
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open(&dir);
+        let conv_id = seed(&storage, agent_id);
+        let new_conv = replacement();
+        let id = identity();
+        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+
+        let outcome = {
+            let mut tx = storage.raw().transaction().unwrap();
+            let out = commit_replace_in_tx(
+                &tx,
+                &ReplaceCommitInput {
+                    conversation_id: conv_id,
+                    agent_id,
+                    workspace_id: None,
+                    conv: &new_conv,
+                    identity: &id,
+                    snapshot_root: "snap-root-abc",
+                    generation: "gen-e6-0001",
+                },
+                &pricing,
+                TS + 60_000,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            out
+        };
+
+        // ⑧ 第三处 tail 载体必须降到新内容的 max idx。既有的两个写入器都是单调抬高，
+        // 所以「降下来了」本身就是「重建过」的证据。
+        assert_eq!(
+            scalar_i64(
+                &storage,
+                "SELECT last_message_idx FROM conversation_external_tail_lookup
+                 WHERE conversation_id = ?1",
+                conv_id
+            ),
+            Some(1),
+            "第三处 tail 载体留旧值会让下一次 append 插错位置（plan E6 Step 1 点名）"
+        );
+
+        // ⑨ conversation 级字段按 §B.1.2：`approx_tokens` 置 NULL、`ended_at` 重算。
+        assert_eq!(
+            scalar_i64(
+                &storage,
+                "SELECT approx_tokens FROM conversations WHERE id = ?1",
+                conv_id
+            ),
+            None,
+            "`approx_tokens` 必须被置 NULL（§B.1.2 末行：与 ingest 行为一致）"
+        );
+        assert_eq!(
+            scalar_i64(
+                &storage,
+                "SELECT ended_at FROM conversations WHERE id = ?1",
+                conv_id
+            ),
+            Some(TS + 1_000),
+            "`ended_at` 必须按**新**消息集重算（旧值 TS+2000 留着即为未重算）"
+        );
+        let title: Option<String> = storage
+            .raw()
+            .query_row_map(
+                "SELECT title FROM conversations WHERE id = ?1",
+                &[ParamValue::from(conv_id)],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            title.as_deref(),
+            Some("新标题"),
+            "`title` 必须换成投影产物的值（§B.1.2 首行「重算」）；留着「旧标题」\
+             即为没更新 —— 注意判据是「换掉了」，E6 不负责重新推导标题那条规则"
+        );
+
+        // ⑩ generation 推进。
+        let generation: Option<String> = storage
+            .raw()
+            .query_row_map(
+                "SELECT value FROM meta WHERE key = ?1",
+                &[ParamValue::from(
+                    crate::storage::sqlite::SOURCE_CONTENT_GENERATION_META_KEY,
+                )],
+                |row| row.get_typed(0),
+            )
+            .optional()
+            .unwrap()
+            .flatten();
+        assert_eq!(generation.as_deref(), Some("gen-e6-0001"));
+
+        // ⑪ receipt 与 DB 动作同事务，且幂等 key 三要素齐（operation / snapshot_root /
+        // identity）—— 缺 snapshot_root 会让换一批封存件重跑被误判「已提交」。
+        let (key, operation, state, root): (String, String, String, Option<String>) = storage
+            .raw()
+            .query_row_map(
+                "SELECT idempotency_key, operation, state, snapshot_root
+                 FROM operation_commit_receipt",
+                &[],
+                |row| {
+                    Ok((
+                        row.get_typed(0)?,
+                        row.get_typed(1)?,
+                        row.get_typed(2)?,
+                        row.get_typed(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(key, outcome.idempotency_key);
+        assert!(
+            key.contains("snap-root-abc") && key.contains(&id.canonical_path),
+            "幂等 key 必须同时含 snapshot_root 与 identity，实得 {key}"
+        );
+        assert_eq!(operation, "mirror-restore-replace");
+        assert_eq!(state, "committed");
+        assert_eq!(root.as_deref(), Some("snap-root-abc"));
+    }
+
+    #[test]
+    fn e6_replace_commit_is_undone_whole_by_an_outer_rollback() {
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open(&dir);
+        let conv_id = seed(&storage, agent_id);
+        let new_conv = replacement();
+        let id = identity();
+        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+
+        {
+            let mut tx = storage.raw().transaction().unwrap();
+            commit_replace_in_tx(
+                &tx,
+                &ReplaceCommitInput {
+                    conversation_id: conv_id,
+                    agent_id,
+                    workspace_id: None,
+                    conv: &new_conv,
+                    identity: &id,
+                    snapshot_root: "snap-root-abc",
+                    generation: "gen-e6-0001",
+                },
+                &pricing,
+                TS + 60_000,
+            )
+            .unwrap();
+            tx.rollback().unwrap();
+        }
+
+        // 整条序列必须一起回滚 —— 任何一件留下来，都说明它逃出了外层事务。
+        let msgs = scalar_i64(
+            &storage,
+            "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1",
+            conv_id,
+        );
+        assert_eq!(msgs, Some(3), "消息集必须回到 replace 之前的 3 条");
+        assert_eq!(
+            scalar_i64(
+                &storage,
+                "SELECT last_message_idx FROM conversation_external_tail_lookup
+                 WHERE conversation_id = ?1",
+                conv_id
+            ),
+            Some(2),
+            "第三处 tail 载体必须回到旧值"
+        );
+        let receipts = scalar_i64(
+            &storage,
+            "SELECT COUNT(*) FROM operation_commit_receipt WHERE id >= ?1",
+            0,
+        );
+        assert_eq!(
+            receipts,
+            Some(0),
+            "receipt 必须一起回滚 —— 它与 DB 动作同事务"
+        );
+        let generation: Option<String> = storage
+            .raw()
+            .query_row_map(
+                "SELECT value FROM meta WHERE key = ?1",
+                &[ParamValue::from(
+                    crate::storage::sqlite::SOURCE_CONTENT_GENERATION_META_KEY,
+                )],
+                |row| row.get_typed(0),
+            )
+            .optional()
+            .unwrap()
+            .flatten();
+        assert_eq!(generation, None, "generation 必须一起回滚");
     }
 }
