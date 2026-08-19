@@ -3850,3 +3850,695 @@ mod e5_materialization_tests {
         )));
     }
 }
+
+// ---------------------------------------------------------------------------
+// E5 Phase 3.0 · 封存 blob 的读取接线
+// ---------------------------------------------------------------------------
+
+/// 从 mirror 读一份封存 blob 的三分结论。
+///
+/// **三分而不是 `Result` 两分，是因为中间那一档的处置完全不同**：manifest 指到的 blob
+/// 不在 mirror 里，说明**这份候选不合格**（封存不完整 / 被裁剪过），要按输入损坏类
+/// 产 HOLD 交人；而校验和不符、路径不安全、manifest 未 verified 这些是**读不动**，
+/// 归另一支。把两者并成一个 `Err(String)` 会让调用方只能按错误文本分流 —— 那正是
+/// 本项目一路在拒绝的判据形态。
+#[derive(Debug)]
+// ⚠ 与 `sqlite.rs` 的 replace 函数同一记账：下面三个符号在 E6 把 restore 编排接上
+// 之前，非测试构建里没有调用方，故显式 `allow(dead_code)`。**staged landing 的记账，
+// 不是把死代码放行** —— E6 Step 1 接上之后必须移除这些 allow，并让 clippy 证明它们
+// 有真调用方（该条已登记为 E6 开工验收面）。
+#[allow(dead_code)]
+pub(crate) enum SealedBlobOutcome {
+    /// 读到了，且已通过 doctor 侧的强校验（blake3 + 长度）。
+    Loaded(Vec<u8>),
+    /// manifest 在、它指的 blob 不在。→ `manifest-reference-missing`。
+    ReferenceMissing,
+    /// 其余读取/校验失败。`detail` 原样保留 doctor 侧的措辞，不二次归类。
+    Unreadable { detail: String },
+}
+
+/// 扫出 `data_dir` 下 raw mirror 的全部 manifest 报告（含强校验结论）。
+///
+/// 复用 doctor 侧的收集器而不是自己走一遍目录：manifest 的磁盘格式、校验口径、
+/// 「什么叫 verified」这三件事只能有一个定义。
+#[allow(dead_code)]
+pub(crate) fn collect_sealed_manifest_reports(
+    data_dir: &Path,
+) -> Vec<crate::DoctorRawMirrorManifestReport> {
+    crate::collect_doctor_raw_mirror_report(data_dir).manifests
+}
+
+/// 按一份 manifest 报告读回封存 blob。
+///
+/// blob 的定位、路径安全检查与强校验全部复用
+/// `doctor_candidate_read_verified_raw_mirror_blob`（plan Task E5 Step 2 点名复用的那个）。
+/// 本函数只做一件它做不了的事：**把「blob 不在」从它那个扁平的 `Err(String)` 里分出来**。
+/// 分法不是匹配错误文本，而是读 doctor 校验阶段已经定好的 `blob_checksum_status`
+/// —— 缺 blob 在那一层就是一个具名状态（`Missing` + `status = "missing_blob"`）。
+#[allow(dead_code)]
+pub(crate) fn read_sealed_blob(
+    data_dir: &Path,
+    manifest: &crate::DoctorRawMirrorManifestReport,
+) -> SealedBlobOutcome {
+    if manifest.blob_checksum_status == crate::DoctorArtifactChecksumStatus::Missing {
+        return SealedBlobOutcome::ReferenceMissing;
+    }
+    match crate::doctor_candidate_read_verified_raw_mirror_blob(data_dir, manifest) {
+        Ok(bytes) => SealedBlobOutcome::Loaded(bytes),
+        Err(detail) => SealedBlobOutcome::Unreadable { detail },
+    }
+}
+
+/// `manifest-reference-missing` 的发射点（第二棒交接件 §2.3 挂在 E5 名下的那一条）。
+///
+/// E4 侧只定义了这个 reason，**零发射**；发射点在这里，因为只有读 blob 的这一步才
+/// 知道「manifest 指到的内容不在了」。`versions` 由调用方给出（可能为空 —— 读不到
+/// blob 时本来就摘不出版本摘要），`class` 由 reason 静态决定，调用方无从指定。
+pub fn hold_for_manifest_reference_missing(
+    identity: RestoreIdentity,
+    versions: Vec<VersionSummary>,
+) -> HoldRecord {
+    HoldRecord {
+        identity,
+        reason: HoldReason::ManifestReferenceMissing,
+        evidence: HoldEvidence::Versions { versions },
+        // 这条裁定读的是「`blob_blake3` 指向的内容还在不在」，以及用于定位身份的
+        // `original_path`。**清单是静态的，不自由构造**（R-E-27 第 3 条）。
+        consumed_manifest_fields: vec![
+            manifest_fields::BLOB_BLAKE3,
+            manifest_fields::ORIGINAL_PATH,
+        ],
+    }
+}
+
+// ===========================================================================
+// E5 Phase 3.0 · 封存 blob 的读取接线与 `manifest-reference-missing` 的真实发射点
+//
+// 第二棒交接件 §2.3 明写：「输入损坏类在 E4 侧零发射，`manifest-reference-missing`
+// 归 E5，你负责给它真实发射点。」本组测试锁的就是那个发射点：**blob 不在 mirror 里
+// 是「这份候选不合格」，不是「这台机器出毛病了」**，所以它产 HOLD 而不是 Err 冒泡。
+// ===========================================================================
+#[cfg(test)]
+mod e5_p30_blob_read_tests {
+    use super::*;
+    use frankensqlite::compat::{
+        ConnectionExt, OptionalExtension, ParamValue, RowExt, TransactionExt,
+    };
+    use serial_test::serial;
+    use tempfile::TempDir;
+
+    /// 用**真的** `raw_mirror::capture_source_file` 造 mirror，不手写 manifest JSON。
+    /// 手写等于对 manifest 磁盘格式造第二定义 —— 这正是本项目一路在拒绝的东西，
+    /// 而且格式一旦漂移，手写的 fixture 会「一直绿着」。
+    fn capture(data_dir: &Path, source: &Path) -> crate::raw_mirror::RawMirrorCaptureRecord {
+        crate::raw_mirror::capture_source_file(crate::raw_mirror::RawMirrorCaptureInput {
+            data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: source,
+            db_links: &[],
+        })
+        .expect("capture source into raw mirror")
+    }
+
+    fn write_session(root: &Path, name: &str, session_id: &str) -> std::path::PathBuf {
+        // 合成根（裁定 (c)）：前缀刻意不像真实家目录，但**进定义域的形状片段一个不少**
+        // —— `.codex/sessions/<日期分段>/rollout-*.jsonl`，因为 codex 的 whole-file 判别
+        // 靠文件名前缀与扩展名，`external_id` 推导又要往上找 `sessions` 根。
+        let dir = root.join(".codex").join("sessions").join("2026").join("08");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        // 内容必须逐份不同：blob 是**内容寻址**的，两份字节相同的源会共用同一个 blob，
+        // 于是「删掉其中一份的 blob」实际上把两条身份的 blob 一起删了。
+        // 只放 `session_meta` 会扫出 0 个会话（codex 的消息来自 `response_item`），
+        // 于是投影会以 `UnexpectedConversationCount { count: 0 }` 硬失败 —— 本棒实测撞过。
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"timestamp\":\"2026-08-18T00:00:00.000Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session_id}\",\"cwd\":\"/fixtures/ws\"}}}}\n\
+                 {{\"timestamp\":\"2026-08-18T00:00:01.000Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"{session_id} 的第一条消息\"}}]}}}}\n\
+                 {{\"timestamp\":\"2026-08-18T00:00:02.000Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"{session_id} 的第二条消息\"}}]}}}}\n\
+                 {{\"timestamp\":\"2026-08-18T00:00:03.000Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"{session_id} 的第三条消息\"}}]}}}}\n"
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    fn manifest_report_for<'a>(
+        reports: &'a [crate::DoctorRawMirrorManifestReport],
+        manifest_id: &str,
+    ) -> &'a crate::DoctorRawMirrorManifestReport {
+        reports
+            .iter()
+            .find(|r| r.manifest_id == manifest_id)
+            .unwrap_or_else(|| panic!("no doctor report for manifest {manifest_id}"))
+    }
+
+    #[test]
+    fn e5_p30_reads_a_present_blob_and_reports_a_missing_one_as_reference_missing() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let live = tmp.path().join("live");
+
+        let kept = capture(
+            &data_dir,
+            &write_session(&live, "rollout-kept.jsonl", "kept"),
+        );
+        let dropped = capture(
+            &data_dir,
+            &write_session(&live, "rollout-dropped.jsonl", "dropped"),
+        );
+        assert_ne!(
+            kept.manifest_id, dropped.manifest_id,
+            "前置断言：两份 manifest 必须是不同的两条身份"
+        );
+        // ⚠ 承重的前置断言是这一条，不是上面那条。blob 内容寻址：两份字节相同的源
+        // **共用同一个 blob**，manifest_id 不同也没用 —— 删一份就把两条一起删了。
+        // 本棒实测：第一版只断言 manifest_id 不同，结果「blob 还在」的那份也被判
+        // ReferenceMissing，因为两份 fixture 内容一模一样。
+        assert_ne!(
+            kept.blob_relative_path, dropped.blob_relative_path,
+            "前置断言：两条身份必须落在不同的 blob 上，否则删一份等于删两份"
+        );
+
+        // 删掉其中一份的 blob（manifest 留着）—— 这就是「mirror 里 manifest 指到的
+        // 内容不在了」这个形态。
+        // 不复刻路径规则：用 doctor 侧那个**唯一**的根函数定位（读 blob 的那条链
+        // 用的也是它），再拼 manifest 自己记的相对路径。
+        let dropped_blob =
+            crate::doctor_raw_mirror_root(&data_dir).join(&dropped.blob_relative_path);
+        assert!(dropped_blob.is_file(), "前置断言：删之前那份 blob 确实在");
+        std::fs::remove_file(&dropped_blob).unwrap();
+
+        let reports = collect_sealed_manifest_reports(&data_dir);
+        let kept_report = manifest_report_for(&reports, &kept.manifest_id);
+        let dropped_report = manifest_report_for(&reports, &dropped.manifest_id);
+
+        match read_sealed_blob(&data_dir, kept_report) {
+            SealedBlobOutcome::Loaded(bytes) => {
+                assert_eq!(
+                    bytes.len() as u64,
+                    kept.blob_size_bytes,
+                    "读回的字节数必须等于 manifest 记的 blob_size_bytes"
+                );
+            }
+            other => panic!("blob 在的那份应当读得回来，实得 {other:?}"),
+        }
+
+        assert!(
+            matches!(
+                read_sealed_blob(&data_dir, dropped_report),
+                SealedBlobOutcome::ReferenceMissing
+            ),
+            "blob 被删的那份必须判 ReferenceMissing —— 判成 Unreadable 会把\
+             「候选不合格」误报成「本机读不动」，两者的处置完全不同"
+        );
+    }
+
+    #[test]
+    fn e5_p30_emits_a_manifest_reference_missing_hold_in_the_input_corruption_class() {
+        let identity = RestoreIdentity {
+            origin: OriginNamespace {
+                agent: Origin::Codex,
+                source_id: "local".to_owned(),
+                origin_host: "fixture-host".to_owned(),
+            },
+            canonical_path: "/fixtures/.codex/sessions/2026/08/rollout-x.jsonl".to_owned(),
+        };
+        let hold = hold_for_manifest_reference_missing(identity.clone(), Vec::new());
+
+        assert_eq!(hold.reason, HoldReason::ManifestReferenceMissing);
+        assert_eq!(hold.identity, identity);
+        assert_eq!(
+            hold.class(),
+            HoldReason::ManifestReferenceMissing.class(),
+            "class 由 reason 静态决定，调用方无从指定"
+        );
+        assert!(
+            hold.consumed_manifest_fields
+                .contains(&manifest_fields::BLOB_BLAKE3),
+            "provenance 必须记下这条裁定读了 blob_blake3 —— 缺 blob 的判定正是靠它\
+             所指向的内容不在了"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 3 ·「839 缩微版」隔离小库演练
+    //
+    // plan Task E5 Step 3 原文：「mirror 有、live 无 → restore；删掉一份 blob → 必须报出」。
+    //
+    // **写入口的分派按裁定 R-E-44**：库里没有这条会话 = 全新会话，走基线
+    // `insert_conversations_batched`；E5 新增的 replace 专用函数只服务「真前缀替换」
+    // 那一支（它的五条硬语义全都以「已有一个 conversation 行」为前提，
+    // 「保留 conversation ID」在新建场景下根本无定义）。**两支的分派归 E6 编排**，
+    // 本演练在测试里手工分派。
+    // -----------------------------------------------------------------------
+    #[test]
+    fn e5_p31_mini_drill_restores_from_mirror_and_reports_the_missing_blob() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let live = tmp.path().join("live");
+        let scratch = tmp.path().join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        let kept_live = write_session(&live, "rollout-kept.jsonl", "drill-kept");
+        let dropped_live = write_session(&live, "rollout-dropped.jsonl", "drill-dropped");
+        let kept = capture(&data_dir, &kept_live);
+        let dropped = capture(&data_dir, &dropped_live);
+        assert_ne!(
+            kept.blob_relative_path, dropped.blob_relative_path,
+            "前置断言：两条身份必须落在不同 blob 上（内容寻址，同字节会共用）"
+        );
+
+        std::fs::remove_file(
+            crate::doctor_raw_mirror_root(&data_dir).join(&dropped.blob_relative_path),
+        )
+        .unwrap();
+
+        // 「live 无」做到字面：把两个活文件都删掉。投影的定义域里没有活文件系统，
+        // 所以恢复必须在源文件已经不存在时照样走得通 —— 若哪一步偷偷回读活路径，
+        // 这里就会红。
+        std::fs::remove_file(&kept_live).unwrap();
+        std::fs::remove_file(&dropped_live).unwrap();
+
+        let db_path = data_dir.join("drill.sqlite");
+        let storage = crate::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
+        let conv_count = |s: &crate::storage::sqlite::FrankenStorage| -> i64 {
+            s.raw()
+                .query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| {
+                    row.get_typed(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(
+            conv_count(&storage),
+            0,
+            "前置断言：演练开始时库里必须是空的 —— 否则「恢复成功」可能只是它本来就在"
+        );
+
+        let views = crate::raw_mirror::manifest_views(&data_dir).unwrap();
+        let reports = collect_sealed_manifest_reports(&data_dir);
+        assert_eq!(views.len(), 2, "前置断言：mirror 里应当恰有两份 manifest");
+        let original_path_of = |manifest_id: &str| -> String {
+            views
+                .iter()
+                .find(|v| v.manifest_id == manifest_id)
+                .expect("manifest 应当在 view 列表里")
+                .original_path
+                .clone()
+        };
+        let kept_original = original_path_of(&kept.manifest_id);
+        let dropped_original = original_path_of(&dropped.manifest_id);
+
+        let mut holds: Vec<HoldRecord> = Vec::new();
+        let mut restored = 0usize;
+
+        for view in &views {
+            let report = reports
+                .iter()
+                .find(|r| r.manifest_id == view.manifest_id)
+                .expect("每份 manifest 都应有一份 doctor 报告");
+
+            let identity = RestoreIdentity {
+                origin: OriginNamespace {
+                    agent: Origin::Codex,
+                    source_id: view.source_id.clone(),
+                    origin_host: view.origin_host.clone().unwrap_or_else(|| "local".into()),
+                },
+                canonical_path: view.original_path.clone(),
+            };
+
+            let blob = match read_sealed_blob(&data_dir, report) {
+                SealedBlobOutcome::Loaded(bytes) => bytes,
+                SealedBlobOutcome::ReferenceMissing => {
+                    holds.push(hold_for_manifest_reference_missing(identity, Vec::new()));
+                    continue;
+                }
+                SealedBlobOutcome::Unreadable { detail } => {
+                    panic!("本演练里不应出现读不动的 blob：{detail}")
+                }
+            };
+
+            let provenance = provenance_from_manifest_view(view);
+            let sealed = SealedSource {
+                agent: Origin::Codex,
+                canonical_original_path: &view.original_path,
+                source_size_bytes: view.source_size_bytes,
+                blob: &blob,
+            };
+            let projected = match project_sealed_source(&scratch, &sealed, &provenance) {
+                Ok(SealedProjection::Projected(conv)) => *conv,
+                other => panic!("封存投影未产出会话：{other:?}"),
+            };
+
+            // 裁定 R-E-44：新建走基线入口。
+            let internal = crate::indexer::persist::map_to_internal(&projected);
+            let agent_id = storage
+                .ensure_agent(&crate::model::types::Agent {
+                    id: None,
+                    slug: internal.agent_slug.clone(),
+                    name: internal.agent_slug.clone(),
+                    version: None,
+                    kind: crate::model::types::AgentKind::Cli,
+                })
+                .unwrap();
+            let workspace_id = internal
+                .workspace
+                .as_ref()
+                .map(|ws| storage.ensure_workspace(ws, None).unwrap());
+            storage
+                .insert_conversations_batched(&[(agent_id, workspace_id, &internal)])
+                .unwrap();
+            restored += 1;
+        }
+
+        assert_eq!(restored, 1, "blob 还在的那一条必须被恢复");
+        assert_eq!(conv_count(&storage), 1, "库里应当恰多出一条会话");
+        assert_eq!(
+            holds.len(),
+            1,
+            "blob 被删的那一条必须**报出来**，不是静默跳过"
+        );
+        assert_eq!(holds[0].reason, HoldReason::ManifestReferenceMissing);
+        assert_eq!(
+            holds[0].identity.canonical_path, dropped_original,
+            "报出来的必须是 blob 被删的**那一条**身份，不是随便一条"
+        );
+
+        let (source_path, metadata_json, metadata_bin): (String, String, Option<Vec<u8>>) = storage
+            .raw()
+            .query_row_map(
+                "SELECT source_path, COALESCE(metadata_json, ''), metadata_bin FROM conversations",
+                &[],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            source_path, kept_original,
+            "恢复出来的 source_path 必须逐字等于 manifest 记的 original_path"
+        );
+        // metadata 走 msgpack 落 `metadata_bin` 时 `metadata_json` 是空的，所以两列都要看。
+        // **在 Rust 侧判子串，不在 SQL 里 `CAST(... AS TEXT)`** —— msgpack 里的 NUL 会让
+        // SQL 侧的字符串比较提前截断（这条坑本仓已经栽过一次）。
+        let metadata_blob = String::from_utf8_lossy(metadata_bin.as_deref().unwrap_or(&[]));
+        assert!(
+            metadata_json.contains("raw_mirror") || metadata_blob.contains("raw_mirror"),
+            "恢复出来的会话必须带 metadata.cass.raw_mirror 的出处；\
+             metadata_json={metadata_json:?} metadata_bin_len={}",
+            metadata_bin.as_deref().unwrap_or(&[]).len()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 4 · 重放去重实测（§15.1 升级为必测）
+    //
+    // plan 原文：「对已 restore 的会话把对应 live 源文件重新过一遍 connector 增量索引
+    // （模拟上位 §9.4 watermark 置 0 的 cutover 后全量 rescan），断言不产生重复
+    // conversation/消息、tail 定位正确」，且「用例必须覆盖 `conversation_tail_state`
+    // 命中与未命中（回落 `conversations` 三列）**两条路径**」。
+    //
+    // **走真 `run_index`**（裁定 (b)）：不走真入口的话，「重放去重」测的就只是我自己
+    // 拼出来的 Conversation，而 plan 特意点名这一步的被测对象是新函数「两处都重置 tail」
+    // 与 connector 增量路径的**配合**。
+    // -----------------------------------------------------------------------
+
+    fn index_opts(data_dir: &Path, session: &Path, full: bool) -> crate::indexer::IndexOptions {
+        crate::indexer::IndexOptions {
+            full,
+            watch: false,
+            force_rebuild: false,
+            watch_once_paths: Some(vec![session.to_path_buf()]),
+            db_path: data_dir.join("db.sqlite"),
+            data_dir: data_dir.to_path_buf(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_interval_secs: 30,
+        }
+    }
+
+    fn counts(storage: &crate::storage::sqlite::FrankenStorage) -> (i64, i64) {
+        let conn = storage.raw();
+        (
+            conn.query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| {
+                row.get_typed(0)
+            })
+            .unwrap(),
+            conn.query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0))
+                .unwrap(),
+        )
+    }
+
+    /// 把 live 文件的字节当封存 blob 过一遍**同一条投影链**，产出 restore 侧会写进库的
+    /// 那份会话。这样「replace 写进去的内容」与「connector 从同一个文件读出来的内容」
+    /// 同源，重放去重才是在测去重，而不是在测两份内容碰巧不一样。
+    fn projected_from_live(
+        scratch: &Path,
+        live: &Path,
+        keep_lines: usize,
+    ) -> crate::model::types::Conversation {
+        // `keep_lines` 用来造**真前缀**：restore 的触发条件就是「候选是 winner 的真前缀」，
+        // 所以恢复写进去的内容比库里现有的**短**。拿全量去 replace 等于把这一步测成
+        // 「内容没变」，那样 tail 重置有没有生效根本看不出来。
+        let full = std::fs::read_to_string(live).unwrap();
+        let blob: Vec<u8> = full
+            .lines()
+            .take(keep_lines)
+            .flat_map(|l| l.as_bytes().iter().copied().chain(std::iter::once(b'\n')))
+            .collect();
+        let provenance = crate::raw_mirror::RawMirrorCaptureRecord {
+            manifest_id: "p32-manifest".into(),
+            manifest_relative_path: "manifests/p32.json".into(),
+            blob_relative_path: "blobs/p32.bin".into(),
+            blob_blake3: "0".repeat(64),
+            blob_size_bytes: blob.len() as u64,
+            captured_at_ms: 1_770_551_400_000,
+            source_mtime_ms: Some(1_770_551_400_000),
+            already_present: true,
+        };
+        let canonical = live.display().to_string();
+        let sealed = SealedSource {
+            agent: Origin::Codex,
+            canonical_original_path: &canonical,
+            source_size_bytes: blob.len() as u64,
+            blob: &blob,
+        };
+        match project_sealed_source(scratch, &sealed, &provenance) {
+            Ok(SealedProjection::Projected(conv)) => {
+                crate::indexer::persist::map_to_internal(&conv)
+            }
+            other => panic!("live 文件的投影未产出会话：{other:?}"),
+        }
+    }
+
+    /// 公共骨架：建库 → 索引一遍 → 用 replace 函数替换该会话 →（可选）删热表行 →
+    /// 对同一个 live 文件再跑一遍索引 → 返回收尾状态。
+    fn replay_after_replace(drop_hot_tail_row: bool) -> (i64, i64, Option<i64>, Option<i64>) {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let scratch = tmp.path().join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let live = write_session(&tmp.path().join("live"), "rollout-replay.jsonl", "replay");
+
+        crate::indexer::run_index(index_opts(&data_dir, &live, false), None).unwrap();
+
+        let db_path = data_dir.join("db.sqlite");
+        let (conv_id, agent_id, old_global_max) = {
+            let storage = crate::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
+            let (convs, msgs) = counts(&storage);
+            assert_eq!(convs, 1, "前置断言：第一遍索引后应当恰有一条会话");
+            assert_eq!(msgs, 3, "前置断言：第一遍索引后应当有 3 条消息");
+            let row: (i64, i64, i64) = storage
+                .raw()
+                .query_row_map(
+                    "SELECT c.id, c.agent_id, (SELECT COALESCE(MAX(id), 0) FROM messages)
+                     FROM conversations c",
+                    &[],
+                    |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+                )
+                .unwrap();
+            row
+        };
+
+        // 模拟 restore 落库：走 E5 的 replace 专用存储函数（两处 tail 重置、
+        // 新 message id 越过全局 max）。
+        let replacement = projected_from_live(&scratch, &live, 3);
+        assert_eq!(
+            replacement.messages.len(),
+            2,
+            "前置断言：替换内容必须是**真前缀**（2 条 < 库里的 3 条）——\
+             等长替换测不出 tail 重置有没有生效"
+        );
+        {
+            let storage = crate::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
+            let pricing =
+                crate::storage::sqlite::PricingTable::franken_load(storage.raw()).unwrap();
+            let mut tx = storage.raw().transaction().unwrap();
+            crate::storage::sqlite::franken_replace_conversation_messages_in_tx(
+                &tx,
+                conv_id,
+                agent_id,
+                None,
+                &replacement,
+                &pricing,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+
+            let new_min: i64 = storage
+                .raw()
+                .query_row_map(
+                    "SELECT MIN(id) FROM messages WHERE conversation_id = ?1",
+                    &[ParamValue::from(conv_id)],
+                    |row| row.get_typed(0),
+                )
+                .unwrap();
+            assert!(
+                new_min > old_global_max,
+                "前置断言：replace 之后的 message id 必须越过旧全局 max（{old_global_max}），\
+                 否则这一遍重放测不到「id 移动之后还能去重」"
+            );
+
+            if drop_hot_tail_row {
+                storage
+                    .raw()
+                    .execute_compat(
+                        "DELETE FROM conversation_tail_state WHERE conversation_id = ?1",
+                        &[ParamValue::from(conv_id)],
+                    )
+                    .unwrap();
+                let hot: i64 = storage
+                    .raw()
+                    .query_row_map(
+                        "SELECT COUNT(*) FROM conversation_tail_state WHERE conversation_id = ?1",
+                        &[ParamValue::from(conv_id)],
+                        |row| row.get_typed(0),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    hot, 0,
+                    "分辨力前置断言：这一支必须真的走回落路径，热表里不能还留着行"
+                );
+            }
+        }
+
+        // 重放前把 scan watermark 清空 —— 这正是 plan 要模拟的东西：上位 §9.4 的
+        // cutover 会把 watermark 置 0，随后是一次全量 rescan。不清的话第二遍索引会
+        // 因为「这个文件自上次扫描以来没变过」直接跳过，那样本用例测的就只是
+        // 「跳过了所以没重复」，与去重逻辑无关。
+        {
+            let storage = crate::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
+            storage.restore_scan_watermarks(&[]).unwrap();
+            let left: i64 = storage
+                .raw()
+                .query_row_map(
+                    "SELECT COUNT(*) FROM meta
+                     WHERE key = 'last_scan_ts' OR key LIKE 'last_scan_ts:connector:%'",
+                    &[],
+                    |row| row.get_typed(0),
+                )
+                .unwrap();
+            assert_eq!(left, 0, "分辨力前置断言：watermark 必须真的被清空");
+        }
+
+        // 让这一趟真的重读那个文件：增量档会因为「自上次索引以来没变过」整趟跳过
+        // （`should_skip_unchanged_explicit_watch_once_paths`），跳过的话本用例测的
+        // 就是「跳过了所以没重复」，与去重逻辑无关。
+        //
+        // **不用 `full: true` 去绕过那道跳过**：`full` 会离开 targeted-watch-once，
+        // 走 `build_watch_roots` → 每个 connector 的 `detect()`，而 detect 是按
+        // **真实家目录**找根的（`dirs::home_dir()`）—— `CASS_DATA_DIR` / `XDG_DATA_HOME`
+        // 管的是产物落在哪，管不住输入从哪来。本棒实测过一次：那趟开始扫真实会话目录，
+        // 十分钟被 timeout 掐掉时临时库已经 3.3G。
+        //
+        // 改为把 mtime 往前推：内容一个字节不改，只让扫描器认为这个文件需要重看。
+        // plan 那句「watermark 置 0 后全量 rescan」按**语义**实现（让它被真正重读一遍），
+        // 不按 `full` 这个开关的字面实现 —— 字面实现的代价是扫全机。
+        {
+            let f = std::fs::File::options().write(true).open(&live).unwrap();
+            let ahead = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+            f.set_times(std::fs::FileTimes::new().set_modified(ahead))
+                .unwrap();
+        }
+        crate::indexer::run_index(index_opts(&data_dir, &live, false), None).unwrap();
+
+        let storage = crate::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
+        let (convs, msgs) = counts(&storage);
+        // 两处 tail 分开取：热表是缓存，`conversations` 三列是回落源。回落用例里
+        // 热表本来就该继续空着（重放没有新消息可插，也就没有什么会去重建那行缓存），
+        // 「tail 定位正确」在那一支上必须由**回落源**作证。
+        let hot_tail_idx: Option<i64> = storage
+            .raw()
+            .query_row_map(
+                "SELECT last_message_idx FROM conversation_tail_state WHERE conversation_id = ?1",
+                &[ParamValue::from(conv_id)],
+                |row| row.get_typed(0),
+            )
+            .optional()
+            .unwrap()
+            .flatten();
+        let legacy_tail_idx: Option<i64> = storage
+            .raw()
+            .query_row_map(
+                "SELECT last_message_idx FROM conversations WHERE id = ?1",
+                &[ParamValue::from(conv_id)],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        (convs, msgs, hot_tail_idx, legacy_tail_idx)
+    }
+
+    #[test]
+    #[serial]
+    fn e5_p32_replay_after_restore_dedupes_on_the_hot_tail_path() {
+        let (convs, msgs, hot_tail_idx, legacy_tail_idx) = replay_after_replace(false);
+        assert_eq!(convs, 1, "重放不得产生重复 conversation");
+        assert_eq!(
+            msgs, 3,
+            "重放应当把 replace 掉的那条尾部消息**恰好补回一条**：少了是丢数据，多了是重复"
+        );
+        assert_eq!(
+            hot_tail_idx,
+            Some(2),
+            "热表 tail 必须定位在补录之后的最后一条消息 idx 上；定位错会让下一次 append 插错位置"
+        );
+        assert_eq!(legacy_tail_idx, Some(2), "回落源同样必须是正确的 tail");
+    }
+
+    #[test]
+    #[serial]
+    fn e5_p32_replay_after_restore_dedupes_on_the_legacy_fallback_tail_path() {
+        // 热表无行 → 读取器回落读 `conversations` 三列。**这一支是承重的**：
+        // 若 replace 只重置了热表而没重置 legacy 三列，回落读到的就是陈旧 tail，
+        // 重放会按错误的游标规划，去重随之失效。
+        let (convs, msgs, hot_tail_idx, legacy_tail_idx) = replay_after_replace(true);
+        assert_eq!(convs, 1, "回落路径上同样不得产生重复 conversation");
+        assert_eq!(
+            msgs, 3,
+            "回落路径上同样应当恰好补回一条 —— 若 legacy 三列没被重置，回落读到的是\
+             replace 之前的旧 tail，重放会判「已经到尾了」而**静默丢掉**那条补录"
+        );
+        // 走过回落之后，重放确实插了一条新消息，于是热表缓存被重建 —— 这是对的，
+        // 不该断言它「仍为空」。**这一支走没走回落，由 helper 里那条事前断言作证**
+        // （replace 之后、重放之前，热表计数必须为 0）；事后再去要求热表为空，
+        // 等于要求重放什么都别做，那正好和本用例要证的事情相反。
+        assert_eq!(
+            hot_tail_idx,
+            Some(2),
+            "补录之后热表缓存应当被重建到正确的 tail"
+        );
+        assert_eq!(
+            legacy_tail_idx,
+            Some(2),
+            "回落源（`conversations` 三列）必须是补录之后的正确 tail —— 若 replace 只重置了\
+             热表、legacy 三列留着陈旧值，这里读到的就是那个陈旧值，重放随之按错游标规划"
+        );
+    }
+}
