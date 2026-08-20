@@ -6418,23 +6418,61 @@ pub(crate) fn journal_trace_take() -> Vec<&'static str> {
     RESTORE_JOURNAL_TRACE.with(|t| std::mem::take(&mut *t.borrow_mut()))
 }
 
+/// 本进程内单调递增的临时文件序号（FIND-10 / 裁定 R-E-87）。
+static PRIVATE_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 给 `final_path` 造一个**本次调用独占**的同目录临时路径。
+///
+/// 修前是 `final_path.with_extension("tmp")` —— **固定且可预测**：
+/// ① 两个并发写者会写进同一个 inode，`write_all` 交错出撕裂的字节
+///    （实测 2000 轮里 63% 的「成功」发布，盘上是不可解析的内容）；
+/// ② 一个与本操作毫无关系、只是恰好同名的既有文件会被 `File::create` 无条件截断并
+///    rename 走，字节不可恢复。
+///
+/// 名字里同时带 **pid** 与**进程内序号**：前者分开不同进程，后者分开同进程内的并发调用。
+pub(crate) fn unique_sibling_tmp_path(final_path: &Path) -> anyhow::Result<PathBuf> {
+    let name = final_path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("cannot derive a tmp path for {}", final_path.display()))?
+        .to_string_lossy()
+        .into_owned();
+    let seq = PRIVATE_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(final_path.with_file_name(format!("{name}.tmp.{}.{seq}", std::process::id())))
+}
+
+/// **创建时即私有**地新建一个文件（FIND-14 / 裁定 R-E-90）。
+///
+/// 修前的形态是「先建、先写满、再 chmod 0600」，于是产物在窗口里以 umask 决定的模式
+/// 挂在盘上（本机 umask 0002 → **0664，同组可读可写、其他人可读**）。
+/// **「窗口很短」不是辩护**：POSIX 的权限检查发生在 `open()` 那一刻，之后只认描述符 ——
+/// 窗口里被 open 到的 fd **不会因为随后的 chmod 或 rename 而失效**，而 rename 不换 inode，
+/// 那个 fd 指的就是最终产物。所以唯一站得住的修法是创建时就带上 0600。
+///
+/// `create_new` 同时兑现 R-E-87 的另一半：**不复用、也不截断任何既有文件**。
+pub(crate) fn create_private_new(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+}
+
 pub(crate) fn restore_journal_write(path: &Path, journal: &RestoreJournal) -> anyhow::Result<()> {
     use std::io::Write as _;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("tmp");
+    // 唯一 tmp 名 + 创建时即私有（裁定 R-E-87 / R-E-90）。
+    let tmp = unique_sibling_tmp_path(path)?;
     {
-        let mut file = std::fs::File::create(&tmp)?;
+        let mut file = create_private_new(&tmp)?;
         file.write_all(&serde_json::to_vec_pretty(journal)?)?;
         journal_trace("write-tmp");
         file.sync_all()?;
         journal_trace("fsync-file");
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
     }
     std::fs::rename(&tmp, path)?;
     journal_trace("rename");
@@ -7503,36 +7541,67 @@ pub(crate) fn write_w1_commit_marker(
     marker: &W1CommitMarker,
     marker_path: &Path,
 ) -> anyhow::Result<bool> {
-    if let Ok(existing) = std::fs::read(marker_path) {
+    use std::io::Write as _;
+    if let Some(parent) = marker_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    // 内容先写进一个**本次调用独占**的 tmp（创建时即 0600），fsync 之后再发布。
+    let tmp = unique_sibling_tmp_path(marker_path)?;
+    {
+        let mut file = create_private_new(&tmp)?;
+        file.write_all(&marker.canonical_bytes())?;
+        file.sync_all()?;
+    }
+
+    // **发布是一次内核级原子的 create-new**（裁定 R-E-87）：`hard_link` 在目标已存在时
+    // 以 `EEXIST` 失败，没有「先查后做」的窗口。
+    //
+    // 修前是 `read()` 判存在 → 写 tmp → `rename()`。那个「判存在」与「rename」之间零互斥：
+    // 2000 轮并发实测里 **`refusing to overwrite` 分支一次都没走到**（TOCTOU 2000/2000 全中），
+    // 挡住第二个调用方的是它 rename 时撞到的裸 `ENOENT`；而自报发布成功的那一方，
+    // 盘上只有 24% 是它自己的字节（13% 是另一方的 marker，63% 是撕裂的不可解析内容）。
+    let published = match std::fs::hard_link(&tmp, marker_path) {
+        Ok(()) => true,
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(err) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(err.into());
+        }
+    };
+    let _ = std::fs::remove_file(&tmp);
+
+    if !published {
+        // 已经有一份了：读回来逐字段比对。相等 = 幂等 no-op；不等 = **以自己的名义拒绝**。
+        let existing = std::fs::read(marker_path)?;
         let parsed = W1CommitMarker::parse(&existing)
             .map_err(|e| anyhow::anyhow!("existing marker is unparsable: {e}"))?;
         if &parsed == marker {
             return Ok(false);
         }
+        // 错误文本带**两个身份摘要**，否则操作者还得自己去翻两份文件才知道差在哪。
         anyhow::bail!(
-            "existing W1 commit marker disagrees with the one we would write — refusing to overwrite"
+            "existing W1 commit marker disagrees with the one we would write — \
+             refusing to overwrite (on disk: operation_id={} generation={} digest={}; \
+             incoming: operation_id={} generation={} digest={})",
+            parsed.operation_id,
+            parsed.content_generation,
+            short_marker_digest(&existing),
+            marker.operation_id,
+            marker.content_generation,
+            short_marker_digest(&marker.canonical_bytes()),
         );
     }
-    use std::io::Write as _;
-    if let Some(parent) = marker_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = marker_path.with_extension("tmp");
-    {
-        let mut file = std::fs::File::create(&tmp)?;
-        file.write_all(&marker.canonical_bytes())?;
-        file.sync_all()?;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    }
-    std::fs::rename(&tmp, marker_path)?;
+
     if let Some(parent) = marker_path.parent() {
         std::fs::File::open(parent)?.sync_all()?;
     }
     Ok(true)
+}
+
+/// marker canonical 字节的短摘要，只用于把「不等」这件事说清楚。
+fn short_marker_digest(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()[..16].to_string()
 }
 
 /// 资格门的输入：**候选侧的四个磁盘对象**，没有第五个入参。
@@ -9216,6 +9285,284 @@ mod e7_restore_journal_tests {
             other => panic!("错误变体不对：{other:?}"),
         }
     }
+
+    // ============ R1 Finding 10 / 裁定 R-E-87 的判据 ============
+
+    /// 发布 marker 用的临时文件**不得**落在固定可预测的路径上、把同名的既有文件毁掉。
+    ///
+    /// 修前形态：tmp 恒为 `<marker>.tmp`，且用 `File::create`（截断）打开 ——
+    /// 一个与本操作毫无关系、只是恰好同名的文件会被无条件截断并 rename 走，字节不可恢复。
+    #[test]
+    fn f10_marker_publish_must_not_destroy_a_foreign_file_at_a_predictable_tmp_path() {
+        let d = qualified_candidate();
+        let mp = marker_path_of(&d);
+        let journal = restore_journal_read(&d.journal_path).unwrap().unwrap();
+        let marker = build_w1_commit_marker(&journal, &d.journal_path).unwrap();
+        std::fs::remove_file(&mp).unwrap(); // 让 write 走「不存在」分支
+        let tmp = mp.with_extension("tmp");
+        let foreign = b"FOREIGN-FILE-THAT-SHOULD-NOT-BE-DESTROYED".to_vec();
+        std::fs::write(&tmp, &foreign).unwrap();
+
+        let published = write_w1_commit_marker(&marker, &mp).unwrap();
+        assert!(published, "前置断言：marker 不存在时这一次必须真的发布");
+
+        assert!(
+            tmp.exists(),
+            "写 marker 不该动一个与它无关、只是恰好落在固定 tmp 路径上的既有文件（{}）",
+            tmp.display()
+        );
+        assert_eq!(
+            std::fs::read(&tmp).unwrap(),
+            foreign,
+            "外来文件的字节必须原样还在"
+        );
+    }
+
+    /// 并发发布必须**原子**且**具名**：两个调用方拿不同的 marker 抢同一个路径时，
+    /// 恰好一个 publish 成功、盘上就是它写的字节，另一个以**具名**错误
+    /// （`refusing to overwrite`）被拒。
+    ///
+    /// 修前形态（2000 轮实测）：`err_refuse=0`（I1 的拒绝分支一次都没走到，
+    /// TOCTOU 2000/2000 全中，挡住第二个的是裸 `ENOENT`）、
+    /// `published_other=264`（13% 盘上是另一个调用方的 marker，而赢家自报成功）、
+    /// `published_corrupt=1255`（63% 盘上是两个写者交错出来的不可解析字节）。
+    #[test]
+    fn f10_concurrent_marker_publish_is_atomic_and_refuses_by_name() {
+        use std::sync::{Arc, Barrier};
+        let d = qualified_candidate();
+        let journal = restore_journal_read(&d.journal_path).unwrap().unwrap();
+        let m1 = build_w1_commit_marker(&journal, &d.journal_path).unwrap();
+        let mut m2 = m1.clone();
+        m2.operation_id = "someone-elses-operation".into();
+
+        let rounds = 2000usize;
+        let mut both_published = 0usize;
+        let mut neither = 0usize;
+        let mut one_ok_one_err = 0usize;
+        let mut one_ok_one_noop = 0usize;
+        let mut err_refuse = 0usize;
+        let mut err_other = 0usize;
+        let mut published_self = 0usize;
+        let mut published_other = 0usize;
+        let mut published_corrupt = 0usize;
+        let mut published_missing = 0usize;
+        for _ in 0..rounds {
+            let dir = TempDir::new().unwrap();
+            let mp = dir.path().join("w1-commit-marker.json");
+            let barrier = Arc::new(Barrier::new(2));
+            let handles: Vec<_> = [m1.clone(), m2.clone()]
+                .into_iter()
+                .enumerate()
+                .map(|(i, m)| {
+                    let b = Arc::clone(&barrier);
+                    let path = mp.clone();
+                    let want = m.operation_id.clone();
+                    std::thread::spawn(move || {
+                        b.wait();
+                        (i, want, write_w1_commit_marker(&m, &path))
+                    })
+                })
+                .collect();
+            let raw: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            // 赢家（返回 Ok(true) 的那个）发布的字节，真的是它自己的吗？
+            if let Some((_, want, _)) = raw.iter().find(|(_, _, r)| matches!(r, Ok(true))) {
+                if mp.exists() {
+                    let on_disk = W1CommitMarker::parse(&std::fs::read(&mp).unwrap());
+                    match on_disk {
+                        Ok(parsed) if &parsed.operation_id != want => published_other += 1,
+                        Ok(_) => published_self += 1,
+                        Err(_) => published_corrupt += 1,
+                    }
+                } else {
+                    published_missing += 1;
+                }
+            }
+            let results: Vec<_> = raw.into_iter().map(|(_, _, r)| r).collect();
+            for r in &results {
+                if let Err(e) = r {
+                    let t = format!("{e:#}");
+                    if t.contains("refusing to overwrite") {
+                        err_refuse += 1;
+                    } else {
+                        err_other += 1;
+                        if err_other <= 3 {
+                            println!("PROBE-B-OTHER-ERR: {t}");
+                        }
+                    }
+                }
+            }
+            let ok_true = results.iter().filter(|r| matches!(r, Ok(true))).count();
+            if ok_true == 2 {
+                both_published += 1;
+            }
+            if ok_true == 0 {
+                neither += 1;
+            }
+            if ok_true == 1 {
+                if results.iter().any(|r| matches!(r, Ok(false))) {
+                    one_ok_one_noop += 1;
+                } else {
+                    one_ok_one_err += 1;
+                }
+            }
+        }
+        // 先把分布打出来 —— 「没复现」和「探针没跑到点子上」必须分得开。
+        println!(
+            "PROBE-B-DIST rounds={rounds} both_published={both_published} \
+             one_ok_one_err={one_ok_one_err} one_ok_one_noop={one_ok_one_noop} neither={neither} \
+             err_refuse={err_refuse} err_other={err_other} \
+             published_self={published_self} published_other={published_other} \
+             published_corrupt={published_corrupt} published_missing={published_missing}"
+        );
+        assert_eq!(
+            both_published, 0,
+            "I1「绝不覆盖」被破：{rounds} 轮里有 {both_published} 轮两个都报 publish 成功"
+        );
+        assert_eq!(
+            neither, 0,
+            "每一轮都必须恰好有一个发布成功，实测有 {neither} 轮一个都没成功"
+        );
+        assert_eq!(
+            err_other, 0,
+            "被拒的一方必须以**具名**错误被拒（refusing to overwrite），\
+             实测有 {err_other} 次拿到的是别的错（修前是裸 ENOENT）"
+        );
+        assert_eq!(
+            err_refuse, rounds,
+            "{rounds} 轮里应当恰好有 {rounds} 次具名拒绝，实得 {err_refuse}"
+        );
+        assert_eq!(
+            published_other, 0,
+            "有 {published_other} 轮：自报 publish 成功的那一方，盘上却是**另一个调用方**的 marker"
+        );
+        assert_eq!(
+            published_corrupt, 0,
+            "有 {published_corrupt} 轮：盘上的 marker **不可解析**（两个写者交错写同一个 tmp）"
+        );
+        assert_eq!(
+            published_self, rounds,
+            "每一轮盘上的字节都必须属于自报成功的那一方，实得 {published_self}/{rounds}"
+        );
+    }
+    // =============== R1 Finding 10 判据结束 ===============
+
+    // ============ R1 Finding 14 / 裁定 R-E-90 的判据 ============
+    //
+    // 「owner-only 的产物」必须**从出生起**就只有属主可读写，不能「先写满再 chmod」。
+    // 判据形态：在写入器跑的同时用观察线程扫目标目录，任何**新出现**的文件在任何一刻
+    // 都不得带非属主位。修前实测（`write_private_file`，本机 umask 0002）：`0o64`。
+    //
+    // ⚠ 「窗口很短所以没事」不是辩护：POSIX 的权限检查发生在 `open()` 那一刻，
+    // 之后只认描述符 —— 窗口里 open 到的 fd，**不会因为随后的 chmod 或 rename 而失效**
+    // （已实证，evidence/r1f14-probes.patch 的探针 B；它测的是内核语义故不转正）。
+    // 所以唯一站得住的修法是**创建时即私有**，而不是把窗口做小。
+
+    /// 在 `f` 执行期间盯住 `dir`，返回 (新出现文件里最坏的非属主位, 是否看到过新文件)。
+    fn worst_non_owner_bits_during(dir: &Path, f: impl FnOnce()) -> (u32, bool) {
+        use std::collections::HashSet;
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+        fn names(dir: &Path) -> HashSet<PathBuf> {
+            std::fs::read_dir(dir)
+                .map(|rd| rd.flatten().map(|e| e.path()).collect())
+                .unwrap_or_default()
+        }
+
+        let before = names(dir);
+        let worst = Arc::new(AtomicU32::new(0));
+        let saw = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = {
+            let dir = dir.to_path_buf();
+            let before = before.clone();
+            let (worst, saw, stop) = (Arc::clone(&worst), Arc::clone(&saw), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                loop {
+                    for path in names(&dir) {
+                        if before.contains(&path) {
+                            continue;
+                        }
+                        if let Ok(md) = std::fs::symlink_metadata(&path) {
+                            if md.is_file() {
+                                saw.store(true, Ordering::Relaxed);
+                                worst.fetch_max(
+                                    md.permissions().mode() & 0o077,
+                                    Ordering::Relaxed,
+                                );
+                            }
+                        }
+                    }
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    std::hint::spin_loop();
+                }
+            })
+        };
+        f();
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+        (worst.load(Ordering::Relaxed), saw.load(Ordering::Relaxed))
+    }
+
+    #[test]
+    fn f14_restore_journal_write_is_private_from_birth() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let d = qualified_candidate();
+        let mut journal = restore_journal_read(&d.journal_path).unwrap().unwrap();
+        // 把计划撑大，让「写 + fsync」这个窗口足够被观察到（真语料是 5574 条身份）。
+        let seed = journal.planned.clone();
+        while journal.planned.len() < 20_000 {
+            journal.planned.extend(seed.iter().cloned());
+        }
+        let dir = d.journal_path.parent().unwrap().to_path_buf();
+        let path = dir.join("big-restore-journal.json");
+        let (worst, saw) = worst_non_owner_bits_during(&dir, || {
+            restore_journal_write(&path, &journal).unwrap();
+        });
+        assert!(saw, "前置断言：观察线程必须看到过新文件，否则本用例没有分辨力");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "前置断言：收尾必须是 0600"
+        );
+        assert_eq!(
+            worst, 0,
+            "restore journal 在写入过程中出现过带非属主位的文件（{worst:#o}）—— \
+             owner-only 的产物必须创建时即私有，不能先写满再 chmod"
+        );
+    }
+
+    #[test]
+    fn f14_marker_publish_is_private_from_birth() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let d = qualified_candidate();
+        let journal = restore_journal_read(&d.journal_path).unwrap().unwrap();
+        let mut marker = build_w1_commit_marker(&journal, &d.journal_path).unwrap();
+        let seed = marker.receipt_keys.clone();
+        while marker.receipt_keys.len() < 200_000 {
+            marker.receipt_keys.extend(seed.iter().cloned());
+        }
+        let dir = d.db_path.parent().unwrap().to_path_buf();
+        let path = dir.join("big-w1-commit-marker.json");
+        let (worst, saw) = worst_non_owner_bits_during(&dir, || {
+            write_w1_commit_marker(&marker, &path).unwrap();
+        });
+        assert!(saw, "前置断言：观察线程必须看到过新文件，否则本用例没有分辨力");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "前置断言：收尾必须是 0600"
+        );
+        assert_eq!(
+            worst, 0,
+            "W1 marker 在发布过程中出现过带非属主位的文件（{worst:#o}）"
+        );
+    }
+    // =============== R1 Finding 14 判据结束 ===============
+
 }
 
 

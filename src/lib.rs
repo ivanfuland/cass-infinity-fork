@@ -20078,7 +20078,31 @@ mod watch_once_resolution_tests {
 /// HOLD 清单与歧义表带家目录全路径与 agent 名。它们落在 repo 外的 run root 里，但
 /// 「目录是 0700」不该是这些文件唯一的保护——产物自己带住权限，搬到别处也还带着。
 fn write_private_file(path: &std::path::Path, bytes: &[u8]) -> std::result::Result<(), String> {
-    std::fs::write(path, bytes).map_err(|e| format!("write {}: {e}", path.display()))?;
+    // **创建时即私有**（FIND-14 / 裁定 R-E-90）。修前是 `std::fs::write` 直写最终路径、
+    // 写完才 chmod —— 窗口开在**真产物**上（本机 umask 0002 实测窗口内是 0664：
+    // 同组可读可写、其他人可读），而这两份产物带家目录全路径与 agent 名。
+    //
+    // **站点语义 = 重写**（`--out` 指向的落点每轮都会被重写，操作者也可能指到既有文件），
+    // 所以用 `create(true).truncate(true)` 而不是 `create_new`：
+    // `.mode()` **只在真正创建时生效**，既有文件走 truncate 复用它自己的模式 ——
+    // 若那已经是 0600（我们上一轮建的），复用不开窗；若是历史遗留的宽权限文件，
+    // 下面的 chmod 作为 **belt** 把它收紧。**belt 不是门**：门是 `.mode(0o600)`，
+    // 它保证新建的产物从出生起就是私有的；chmod 只兜「文件早就存在且权限不对」这一种。
+    {
+        use std::io::Write as _;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+        let mut file = opts
+            .open(path)
+            .map_err(|e| format!("open {}: {e}", path.display()))?;
+        file.write_all(bytes)
+            .map_err(|e| format!("write {}: {e}", path.display()))?;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -100521,12 +100545,14 @@ fn relink_journal_write(path: &Path, journal: &RelinkJournal) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(journal)?)?;
-    #[cfg(unix)]
+    // 唯一 tmp 名 + 创建时即私有（裁定 R-E-87 / R-E-90）。两个原语与 restore 侧
+    // **共用一份定义**（`phase3_restore`），不在这里写第二份。
+    use std::io::Write as _;
+    let tmp = crate::phase3_restore::unique_sibling_tmp_path(path)?;
     {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        let mut file = crate::phase3_restore::create_private_new(&tmp)?;
+        file.write_all(&serde_json::to_vec_pretty(journal)?)?;
+        file.sync_all()?;
     }
     std::fs::rename(&tmp, path)?;
     Ok(())
@@ -100888,6 +100914,115 @@ mod mirror_relink_tests {
         })
         .expect("relink must succeed")
     }
+
+    // ============ R1 Finding 14 / 裁定 R-E-90 的判据（relink 侧两站点）============
+    //
+    // 与 `phase3_restore` 那两条同形：owner-only 的产物必须**从出生起**就只有属主可读写。
+    // 「窗口很短」不构成辩护 —— 窗口里 `open()` 到的 fd 不会因随后的 chmod/rename 失效
+    // （内核语义，实证见 evidence/r1f14-probes.patch 的探针 B，故不转正为回归测试）。
+
+    fn worst_non_owner_bits_during(dir: &Path, f: impl FnOnce()) -> (u32, bool) {
+        use std::collections::HashSet;
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+        fn names(dir: &Path) -> HashSet<PathBuf> {
+            std::fs::read_dir(dir)
+                .map(|rd| rd.flatten().map(|e| e.path()).collect())
+                .unwrap_or_default()
+        }
+        let before = names(dir);
+        let worst = Arc::new(AtomicU32::new(0));
+        let saw = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = {
+            let dir = dir.to_path_buf();
+            let before = before.clone();
+            let (worst, saw, stop) = (Arc::clone(&worst), Arc::clone(&saw), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                loop {
+                    for path in names(&dir) {
+                        if before.contains(&path) {
+                            continue;
+                        }
+                        if let Ok(md) = std::fs::symlink_metadata(&path)
+                            && md.is_file()
+                        {
+                            saw.store(true, Ordering::Relaxed);
+                            worst.fetch_max(md.permissions().mode() & 0o077, Ordering::Relaxed);
+                        }
+                    }
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    std::hint::spin_loop();
+                }
+            })
+        };
+        f();
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+        (worst.load(Ordering::Relaxed), saw.load(Ordering::Relaxed))
+    }
+
+    #[test]
+    fn f14_relink_journal_write_is_private_from_birth() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let path = dir.join("relink-journal.json");
+        let journal = RelinkJournal {
+            operation_id: "op-f14".into(),
+            state: RelinkJournalState::Planned,
+            data_dir: dir.clone(),
+            planned: (0..40_000)
+                .map(|i| RelinkPlannedManifest {
+                    manifest_relative_path: format!("manifests/aa/{i:08}.json"),
+                    after: Vec::new(),
+                })
+                .collect(),
+            published: Vec::new(),
+        };
+        let (worst, saw) = worst_non_owner_bits_during(&dir, || {
+            relink_journal_write(&path, &journal).unwrap();
+        });
+        assert!(saw, "前置断言：观察线程必须看到过新文件，否则本用例没有分辨力");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "前置断言：收尾必须是 0600"
+        );
+        assert_eq!(
+            worst, 0,
+            "relink journal 在写入过程中出现过带非属主位的文件（{worst:#o}）"
+        );
+    }
+
+    #[test]
+    fn f14_write_private_file_is_private_from_birth() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        // 这一站点最狠：它**直写最终路径**，窗口开在真产物上，而它的消费方是
+        // mirror-restore 的 HOLD 清单与歧义表（带家目录全路径与 agent 名）。
+        let path = dir.join("hold-ledger.json");
+        let payload = vec![b'x'; 48 * 1024 * 1024];
+        let (worst, saw) = worst_non_owner_bits_during(&dir, || {
+            crate::write_private_file(&path, &payload).unwrap();
+        });
+        assert!(saw, "前置断言：观察线程必须看到过新文件，否则本用例没有分辨力");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "前置断言：收尾必须是 0600"
+        );
+        assert_eq!(
+            worst, 0,
+            "HOLD 清单/歧义表在写入过程中对属主之外可读或可写（{worst:#o}）"
+        );
+    }
+    // =============== R1 Finding 14 判据结束（relink 侧）===============
 
     #[test]
     fn relink_rebuilds_db_links_from_real_identity() {
