@@ -7060,6 +7060,7 @@ async fn execute_cli(
                                     "journal_state": state,
                                     "restored": outcome.restored,
                                     "deduplicated": outcome.deduplicated,
+                                    "already_committed": outcome.already_committed,
                                     "replaced": outcome.replaced,
                                     "published": outcome.published,
                                     "receipt_keys": outcome.receipt_keys,
@@ -7068,9 +7069,10 @@ async fn execute_cli(
                         } else {
                             println!(
                                 "recovered: journal_state={state} restored={} deduplicated={} \
-                                 replaced={} published={}",
+                                 already_committed={} replaced={} published={}",
                                 outcome.restored,
                                 outcome.deduplicated,
+                                outcome.already_committed,
                                 outcome.replaced,
                                 outcome.published
                             );
@@ -7302,6 +7304,10 @@ async fn execute_cli(
                                     // 去重收敛的条数：动作做过了，库里没多行。
                                     // **不并进 `restored`**（FIND-7 / 裁定 R-E-76）。
                                     "deduplicated": outcome.deduplicated,
+                                    // 已提交、本轮跳过（R-E-83）。归宿守恒的第四格：
+                                    // restored + replaced + deduplicated
+                                    //   + already_committed == planned
+                                    "already_committed": outcome.already_committed,
                                     "replaced": outcome.replaced,
                                     "published": outcome.published,
                                     "messages_inserted": outcome.messages_inserted,
@@ -7311,10 +7317,11 @@ async fn execute_cli(
                             );
                         } else {
                             println!(
-                                "applied: restored={} deduplicated={} replaced={} published={} \
-                                 messages(+{}/-{}) receipts={}",
+                                "applied: restored={} deduplicated={} already_committed={} \
+                                 replaced={} published={} messages(+{}/-{}) receipts={}",
                                 outcome.restored,
                                 outcome.deduplicated,
+                                outcome.already_committed,
                                 outcome.replaced,
                                 outcome.published,
                                 outcome.messages_inserted,
@@ -100153,6 +100160,16 @@ pub enum MirrorRelinkFinding {
         manifest_id: String,
         blob_relative_path: String,
     },
+    /// manifest 的 `provider` 映射不出受支持的 agent（R-E-82）。
+    ///
+    /// **这一条不是「坏了」，是「本轮不动它」**：身份键含 agent 之后，
+    /// 映射不出来就无从匹配；若照常重建，`db_links` 会被算成空并在 `--apply` 时清掉。
+    /// 所以这份 manifest 原样保留、只记录在案。真语料里是 `gemini` 与 `pi_agent`
+    /// 那批（R-E-67 定案：不属受保护三家，永久具名 HOLD）。
+    ProviderUnmapped {
+        manifest_id: String,
+        provider: String,
+    },
 }
 
 /// 一份 manifest 的 `db_links` 重建前后。
@@ -100185,14 +100202,43 @@ struct RelinkConversationRow {
     source_path: String,
     started_at_ms: Option<i64>,
     message_count: usize,
+    /// DB 侧的 agent slug（`agents.slug`）。**身份键的一部分**，见
+    /// [`relink_identity_key`]。
+    agent_slug: String,
 }
 
+/// relink 的分桶键。
+///
+/// # 为什么现在含 agent（R-E-82，推翻一条写了理由的旧决定）
+///
+/// 这里原本**刻意不含 provider**，理由写在调用点上：「它只是诊断字段，错标不得影响分桶」。
+/// 那个顾虑是真的，但两侧代价不对等，实测之后推翻：
+///
+/// * **不含 agent 的代价**：同 `source_path`、同 `source_id`、不同 agent 的身份被折叠成
+///   一条，两边的 DB 行互相串成 backlink。真语料实测 **83 条**（5491 个去重路径中，
+///   且 83/83 差的正是 agent 这一维）。**假 backlink 看起来是闭合的，没人会去查。**
+/// * **含 agent 的代价**：manifest 的 provider 映射不出来时匹配不上。真语料实测
+///   **31 条**（`gemini` 2 / `pi_agent` 29）。
+///
+/// 83 > 31，且**错链比不链坏**。另外 R-E-67 之后 provider 的归一已有纪律
+/// （`normalize_provider_to_origin`，未知一律 `None` 不猜不兜底），
+/// 「错标」的面比当初写下那条注释时小得多。
+///
+/// **但光加 agent 是不够的**：那 31 条 unmapped 会在 slug 上永远匹配不到行，
+/// 查询空 → `--apply` 把它们**既有的 db_links 清成空** —— 那正是 R-E-81 刚堵完的
+/// 「把没看见当没有」，在 unmapped 这批上重新打开一次。所以配一条具名降级路径：
+/// **映射不出来的 manifest 不匹配、不清空、原样保留，并记 `ProviderUnmapped` finding**。
+///
+/// **残余风险**（记为已知缺口）：provider **错标但映射得出**（映射到错的 agent）
+/// 这一类检测不了 —— 它会以一个合法 slug 参与分桶，与正确标注无从区分。
 fn relink_identity_key(
+    agent_slug: &str,
     source_id: &str,
     origin_host: Option<&str>,
     source_path: &str,
-) -> (String, String, String) {
+) -> (String, String, String, String) {
     (
+        agent_slug.to_string(),
         source_id.to_string(),
         origin_host.unwrap_or_default().to_string(),
         source_path.to_string(),
@@ -100209,8 +100255,8 @@ fn relink_load_conversations(db_path: &Path) -> Result<Vec<RelinkConversationRow
         .raw()
         .query(
             "SELECT c.id, c.source_id, c.origin_host, c.source_path, c.started_at, \
-             (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) \
-             FROM conversations c",
+             (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id), a.slug \
+             FROM conversations c JOIN agents a ON a.id = c.agent_id",
         )
         .map_err(|e| anyhow::anyhow!("query conversations for relink: {e}"))?;
     let mut out = Vec::with_capacity(rows.len());
@@ -100223,6 +100269,7 @@ fn relink_load_conversations(db_path: &Path) -> Result<Vec<RelinkConversationRow
             started_at_ms: row.get_typed::<i64>(4).ok(),
             message_count: usize::try_from(row.get_typed::<i64>(5).unwrap_or(0).max(0))
                 .unwrap_or(0),
+            agent_slug: row.get_typed::<String>(6)?,
         });
     }
     storage.close_best_effort_in_place();
@@ -100238,19 +100285,37 @@ fn relink_path_is_staging(original_path: &str) -> bool {
 pub fn mirror_relink(options: &MirrorRelinkOptions) -> Result<MirrorRelinkReport> {
     let views = raw_mirror::manifest_views(&options.data_dir)?;
     let db_path = options.data_dir.join("agent_search.db");
-    let conversations = if db_path.exists() {
-        relink_load_conversations(&db_path)?
-    } else {
-        Vec::new()
-    };
+    // ── R-E-81：库不存在是**错误**，不是「空库」────────────────────────
+    //
+    // 修前这里是 `if db_path.exists() { load } else { Vec::new() }`。把「库不在」
+    // 读成「库是空的」的后果是：每一份 manifest 的 db_links 都被算成空，
+    // `--apply` 把它们**全部清掉**，而命令退出码 0（R1 Finding 4，实测坐实：
+    // 同一棵 132 份 manifest 的树，库在时 changes=15，库挪走后 changes=132）。
+    //
+    // 触发条件一点都不刁钻：库没拷过来、被挪走、或 `--data-dir` 指向一棵**只有镜像的
+    // 树** —— 最后这种正是物化树的形态。
+    //
+    // 不给「显式空库 flag」：没有已知场景需要「就是没有库」的语义，
+    // 不为假想的灵活性开口子。真需要时再立案。
+    if !db_path.exists() {
+        anyhow::bail!(
+            "E-CANDIDATE-DB-MISSING: no candidate database at {} — refusing to treat a missing \
+             database as an empty one (that would recompute every manifest's db_links as empty \
+             and, under --apply, erase them all while exiting successfully)",
+            db_path.display()
+        );
+    }
+    let conversations = relink_load_conversations(&db_path)?;
 
+    // 键是四元组（agent_slug, source_id, origin_host, source_path）—— R-E-82 加了第一格。
     let mut by_identity: std::collections::HashMap<
-        (String, String, String),
+        (String, String, String, String),
         Vec<&RelinkConversationRow>,
     > = std::collections::HashMap::new();
     for row in &conversations {
         by_identity
             .entry(relink_identity_key(
+                &row.agent_slug,
                 &row.source_id,
                 row.origin_host.as_deref(),
                 &row.source_path,
@@ -100302,9 +100367,27 @@ pub fn mirror_relink(options: &MirrorRelinkOptions) -> Result<MirrorRelinkReport
             });
         }
 
-        // ── 按真实身份重建 db_links ──────────────────────────────────
-        // provider 刻意不参与匹配：它只是诊断字段，错标不得影响分桶。
+        // ── 按真实身份重建 db_links（R-E-82：键含 agent）──────────────
+        //
+        // 旧注释是「provider 刻意不参与匹配：它只是诊断字段，错标不得影响分桶」。
+        // 推翻的理由写在 `relink_identity_key` 的 doc 上（83 条实测折叠 vs 31 条
+        // unmapped，且错链比不链坏）。这里只处理它的**必要前提**：
+        //
+        // provider 映射不出 agent 时（真语料 31 条：`gemini` 2 / `pi_agent` 29），
+        // 键里的 slug 无从取得，硬匹配必然落空 → `rebuilt` 为空 → `--apply` 会把这些
+        // manifest **既有的 db_links 清成空**。那正是 R-E-81 刚堵完的「把没看见当没有」
+        // 在 unmapped 这批上重开一次。所以走**具名降级**：不匹配、不清空、原样保留。
+        let Some(agent) = crate::phase3_restore::normalize_provider_to_origin(&view.provider)
+        else {
+            findings.push(MirrorRelinkFinding::ProviderUnmapped {
+                manifest_id: view.manifest_id.clone(),
+                provider: view.provider.clone(),
+            });
+            // **原样保留**：不进 changes，这一份 manifest 本轮不被改写。
+            continue;
+        };
         let key = relink_identity_key(
+            agent.as_str(),
             &view.source_id,
             view.origin_host.as_deref(),
             &view.original_path,
@@ -100630,6 +100713,89 @@ mod mirror_relink_tests {
     use crate::raw_mirror::{RawMirrorCaptureInput, RawMirrorDbLink};
     use tempfile::TempDir;
 
+    // ── R-E-81：候选库不存在 = 具名硬错误，不是「空库」──────────────────
+    //
+    // 缺陷原样（R1 Finding 4，实测坐实）：`if db_path.exists() { load } else { Vec::new() }`
+    // 把「库不在」读成「库是空的」。于是每一份 manifest 的 db_links 都被算成空、
+    // `--apply` 把它们**全部清掉**，命令**退出码 0**。实测同一棵 132 份 manifest 的树：
+    // 库在时 changes=15，库挪走后 changes=132（那 132 份当时共带 132 条 db_links）。
+    //
+    // 触发条件一点都不刁钻：库没拷过来、被挪走、或 `--data-dir` 指向一棵**只有镜像的树**
+    // —— 最后这种正是物化树的形态。
+    //
+    // 不做「显式空库 flag」：没有已知场景需要「就是没有库」的语义，
+    // 不为假想的灵活性开口子。
+    #[test]
+    fn relink_refuses_when_the_candidate_db_is_absent_instead_of_treating_it_as_empty() {
+        let (_tmp, data_dir, manifest_rel, _conv, _src) = fixture(true);
+
+        // 前置断言：库在时这棵树是「已闭合」的 —— 没有这一条，下面的对照没有意义。
+        let before = mirror_relink(&MirrorRelinkOptions {
+            data_dir: data_dir.clone(),
+            apply: false,
+        })
+        .unwrap();
+        assert_eq!(
+            before.changes.len(),
+            0,
+            "前置断言：库在且 db_links 已对齐时不该有变更，实得 {:?}",
+            before.changes
+        );
+        let links_before = manifest_db_link_count(&data_dir, &manifest_rel);
+        assert!(links_before > 0, "前置断言：manifest 上本来就该有 db_links");
+
+        // 把库挪走（不是删——留着好证明「内容还在，只是这次没看见」）。
+        let parked = data_dir.parent().unwrap().join("parked.db");
+        std::fs::rename(data_dir.join("agent_search.db"), &parked).unwrap();
+
+        let err = mirror_relink(&MirrorRelinkOptions {
+            data_dir: data_dir.clone(),
+            apply: false,
+        })
+        .expect_err("库不存在必须是错误，不许当成空库");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("E-CANDIDATE-DB-MISSING"),
+            "必须以具名错误码拒，实得：{text}"
+        );
+        assert!(
+            text.contains("agent_search.db"),
+            "错误必须带上查过的路径，否则操作者不知道去哪儿找：{text}"
+        );
+
+        // `--apply` 同样必须拒，且**一份 manifest 都不许碰**。
+        let err = mirror_relink(&MirrorRelinkOptions {
+            data_dir: data_dir.clone(),
+            apply: true,
+        })
+        .expect_err("--apply 也必须拒");
+        assert!(format!("{err:#}").contains("E-CANDIDATE-DB-MISSING"));
+        assert_eq!(
+            manifest_db_link_count(&data_dir, &manifest_rel),
+            links_before,
+            "被拒的那一轮不许改动任何 manifest —— 清空 db_links 正是本条要防的事"
+        );
+
+        // 库放回去 → 回到原样，证明拒绝是「这次看不见」而不是把树弄坏了。
+        std::fs::rename(&parked, data_dir.join("agent_search.db")).unwrap();
+        let after = mirror_relink(&MirrorRelinkOptions {
+            data_dir: data_dir.clone(),
+            apply: false,
+        })
+        .unwrap();
+        assert_eq!(after.changes.len(), 0, "库放回去必须回到「无变更」");
+    }
+
+    /// 读一份 manifest 上的 `db_links` 条数。
+    fn manifest_db_link_count(data_dir: &Path, manifest_rel: &str) -> usize {
+        let p = data_dir.join("raw-mirror").join("v1").join(manifest_rel);
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        v.get("db_links")
+            .and_then(|l| l.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0)
+    }
+
     /// 造一个隔离小库 + raw mirror：一份 manifest、一条会话、两条消息。
     /// 返回 (tempdir, data_dir, manifest_relative_path, conversation_id, source_file)。
     fn fixture(with_link: bool) -> (TempDir, PathBuf, String, i64, PathBuf) {
@@ -100813,40 +100979,123 @@ mod mirror_relink_tests {
         );
     }
 
+    // ── R-E-82：这条测试取代了原来的 `relink_ignores_provider_when_matching` ──
+    //
+    // 原测试锁的是「provider 只作诊断，错标不得改变匹配结果」——那是当时那条
+    // `// provider 刻意不参与匹配` 决定的测试化身。R-E-82 推翻了那条决定（理由写在
+    // `relink_identity_key` 的 doc 上：83 条实测折叠 vs 31 条 unmapped，错链比不链坏），
+    // 所以这条测试也必须跟着换契约——**留着它就是把旧契约钉死，改代码必红**。
+    //
+    // 新契约：provider 映射不出 agent 时**走具名降级**，manifest 原样不动、记 finding。
+    // 这同时是 R-E-82 条件 3 的判据：它防的是「加了 agent 之后，unmapped 那批在
+    // slug 上永远匹配不上 → db_links 被清空」——即 R-E-81 那个洞在 unmapped 上重开。
     #[test]
-    fn relink_ignores_provider_when_matching() {
-        // provider 只作诊断：把它错标成别的值，重建结果必须完全不变。
-        let (_tmp, data_dir, rel, _conv_id, _src) = fixture(false);
-        let baseline = run(&data_dir, false);
-        let baseline_change = baseline
-            .changes
-            .iter()
-            .find(|c| c.manifest_relative_path == rel)
-            .unwrap()
-            .after
-            .clone();
-
+    fn relink_leaves_unmapped_provider_manifests_untouched() {
+        // 带既有 db_links 的 fixture —— 没有它就证不出「保留」。
+        let (_tmp, data_dir, rel, _conv_id, _src) = fixture(true);
         let manifest_path = data_dir.join("raw-mirror").join("v1").join(&rel);
+
+        let links_before = manifest_db_link_count(&data_dir, &rel);
+        assert!(
+            links_before > 0,
+            "前置断言：manifest 上必须本来就有 db_links，否则「保留」无从证明"
+        );
+
+        // 把 provider 改成映射不出来的值（真语料里 `gemini` / `pi_agent` 就是这一类）。
         let mut json: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
-        json["provider"] = serde_json::Value::String("wildly-wrong-provider".into());
+        json["provider"] = serde_json::Value::String("pi_agent".into());
         let mut perms = std::fs::metadata(&manifest_path).unwrap().permissions();
         #[allow(clippy::permissions_set_readonly_false)]
         perms.set_readonly(false);
         std::fs::set_permissions(&manifest_path, perms).unwrap();
         std::fs::write(&manifest_path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
 
-        let after = run(&data_dir, false);
-        let after_change = after
+        // **真 apply**：dry-run 不改盘，证不出「不清空」。
+        let report = run(&data_dir, true);
+
+        assert!(
+            report.findings.iter().any(|f| matches!(
+                f,
+                MirrorRelinkFinding::ProviderUnmapped { provider, .. } if provider == "pi_agent"
+            )),
+            "映射不出来的 provider 必须以自己的名义记录在案；实得 {:?}",
+            report.findings
+        );
+        assert!(
+            !report
+                .changes
+                .iter()
+                .any(|c| c.manifest_relative_path == rel),
+            "降级的 manifest 不得进 changes —— 进了就意味着它会被改写"
+        );
+        assert_eq!(
+            manifest_db_link_count(&data_dir, &rel),
+            links_before,
+            "**既有 db_links 必须一条不少**：清空它正是本条要防的事"
+        );
+    }
+
+    // ── R-E-82 主判据：同路径异 agent 不得互相串成 backlink ────────────────
+    //
+    // 真语料实测：5491 个去重路径里 83 个带多于一个 origin，且 83/83 差在 agent。
+    // 修前那个三元组键会把它们折叠成一条，两边的 DB 行互相串进对方的 manifest——
+    // **假 backlink 看起来是闭合的，没人会去查。**
+    #[test]
+    fn relink_does_not_cross_link_two_agents_sharing_one_path() {
+        let (_tmp, data_dir, rel, conv_id, source_file) = fixture(true);
+
+        // 往同一条 source_path 上再加一条**另一个 agent** 的会话。
+        let db_path = data_dir.join("agent_search.db");
+        {
+            let storage = crate::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
+            let raw = storage.raw();
+            use frankensqlite::compat::{ConnectionExt as _, ParamValue};
+            raw.execute_compat(
+                "INSERT INTO agents(id, slug, name, kind, created_at, updated_at) \
+                 VALUES(2,'claude_code','Claude Code','cli',0,0)",
+                &[] as &[ParamValue],
+            )
+            .unwrap();
+            let src_path = source_file.display().to_string();
+            raw.execute_compat(
+                "INSERT INTO conversations(id, agent_id, source_id, source_path, started_at) \
+                 VALUES(99, 2, 'local', ?1, 1710000000000)",
+                &[ParamValue::from(src_path.as_str())],
+            )
+            .unwrap();
+        }
+
+        // 前置断言：库里确实是两条共用同一路径。
+        {
+            let mut storage =
+                crate::storage::sqlite::FrankenStorage::open_readonly(&db_path).unwrap();
+            use frankensqlite::compat::{ConnectionExt as _, ParamValue, RowExt as _};
+            let n: Option<i64> = storage
+                .raw()
+                .query_row_map(
+                    "SELECT COUNT(*) FROM conversations WHERE source_path = ?1",
+                    &[ParamValue::from(source_file.display().to_string().as_str())],
+                    |row| row.get_typed(0),
+                )
+                .unwrap();
+            storage.close_best_effort_in_place();
+            assert_eq!(n, Some(2), "前置断言：两条会话必须共用同一路径");
+        }
+
+        let report = run(&data_dir, false);
+
+        // 这份 manifest 的 provider 是 `codex`，所以它只该认 codex 那条（id=7）。
+        let after: Vec<i64> = report
             .changes
             .iter()
             .find(|c| c.manifest_relative_path == rel)
-            .expect("provider 错标不该让 manifest 从重建清单里消失")
-            .after
-            .clone();
+            .map(|c| c.after.iter().filter_map(|l| l.conversation_id).collect())
+            .unwrap_or_else(|| vec![conv_id]); // 无变更 = 保持原样的那一条
         assert_eq!(
-            baseline_change, after_change,
-            "provider 错标不得改变按身份的匹配结果"
+            after,
+            vec![conv_id],
+            "codex 的 manifest 只该链到 codex 那条会话；含 99 = 两个 agent 被折叠成一条身份"
         );
     }
 

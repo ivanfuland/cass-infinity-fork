@@ -5651,6 +5651,88 @@ mod e6_replace_commit_tests {
         assert_eq!(generation, None, "generation 必须一起回滚");
     }
 
+    // ── R-E-80′ / R1 Finding 3：身份必须整条参与候选查询 ──────────────────
+    //
+    // 缺陷原样：`candidate_versions_from_db` 只绑 `canonical_path`，把 `identity.origin`
+    // 整个丢掉。而 `OriginNamespace` 的 doc 正上方就写着「必须是**带 host 的命名空间**，
+    // 否则 §5.2.1 点名的『跨 host 同路径不折叠』做不到」——**类型被特意设计成带 host 的
+    // 命名空间，用的时候却只取了路径那一半。**
+    //
+    // 可达性不是假想：真语料 5491 个去重路径里有 **83 个**带多于一个 origin，
+    // 且 83/83 差在 **agent** 这一维。最重的后果是跨来源静默覆盖
+    // （A 的行被当成 B 的候选，判成 replace 后用 B 的内容盖掉 A）。
+    #[test]
+    fn e6_candidate_lookup_does_not_fold_two_agents_sharing_one_path() {
+        use frankensqlite::compat::ConnectionExt as _;
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("fold.sqlite")).unwrap();
+
+        // 同一条 source_path、同一个 source_id，**两个不同 agent** 各一条会话。
+        const SHARED_PATH: &str = "/fixtures/shared-by-two-agents.jsonl";
+        let mut ids = Vec::new();
+        for (slug, agent) in [
+            ("codex", Origin::Codex),
+            ("claude_code", Origin::ClaudeCode),
+        ] {
+            let agent_id = storage
+                .ensure_agent(&Agent {
+                    id: None,
+                    slug: slug.into(),
+                    name: slug.into(),
+                    version: None,
+                    kind: AgentKind::Cli,
+                })
+                .unwrap();
+            let conv = {
+                let mut c = conversation_titled(
+                    slug,
+                    vec![message(0, MessageRole::User, &format!("{slug} 的内容"))],
+                );
+                c.agent_slug = slug.into();
+                c.external_id = Some(format!("{slug}-external"));
+                c.source_path = std::path::PathBuf::from(SHARED_PATH);
+                c
+            };
+            storage
+                .insert_conversations_batched(&[(agent_id, None, &conv)])
+                .unwrap();
+            ids.push((agent, slug));
+        }
+
+        // 前置断言：库里确实是**两条**共用同一路径 —— 否则本用例在测一个不存在的形态。
+        let at_path: Option<i64> = storage
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM conversations WHERE source_path = ?1",
+                &[ParamValue::from(SHARED_PATH)],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            at_path,
+            Some(2),
+            "前置断言：必须真有两条会话共用同一路径，否则折叠测不出来"
+        );
+
+        // 每个 agent 的身份都只该取到**自己那一条**。
+        for (agent, slug) in ids {
+            let identity = RestoreIdentity {
+                origin: OriginNamespace {
+                    agent,
+                    source_id: "local".into(),
+                    origin_host: "fixture-host".into(),
+                },
+                canonical_path: SHARED_PATH.into(),
+            };
+            let got = candidate_versions_from_db(&storage, &identity).unwrap();
+            assert_eq!(
+                got.len(),
+                1,
+                "{slug} 的身份必须恰取到它自己那一条；取到 2 条 = 两个 agent 被折叠成了一条身份"
+            );
+        }
+    }
+
     // -------------------------------------------------------------------
     // Restore（新建）支 —— 裁定 R-E-47 走 (a)：每会话独立事务
     // -------------------------------------------------------------------
@@ -6116,6 +6198,14 @@ pub(crate) struct RestoreRunOutcome {
     /// 插入真的执行了、但被存储层按**内容**去重的条数（FIND-7 / R-E-76）。
     /// **绝不并入 `restored`** —— 并进去就等于报出没发生过的工作量。
     pub deduplicated: usize,
+    /// 本轮**跳过**的条数：查到 receipt，判「已提交」直接短路（R-E-83 / R1 Finding 9）。
+    ///
+    /// 加这一格的理由与 `deduplicated` 同源：**处置的种类比计数器的格子多。**
+    /// 修前这条分支 `continue` 时 `outcome` 一格没动，于是归宿守恒式
+    /// `restored + replaced + deduplicated == planned` 在**恢复路径上直接断裂**
+    /// ——恢复一轮全是已提交项时左边是 0、右边是 planned。
+    /// 而那条等式正是 runbook 给操作者的对账判据，**恢复路径恰恰是最需要对账的时候**。
+    pub already_committed: usize,
     pub replaced: usize,
     pub published: usize,
     /// 本次写下的 receipt 幂等 key。**操作者据它去 DB 里对账**，
@@ -6393,6 +6483,13 @@ fn restore_run_db_phase(
             if !journal.committed.contains(&item.manifest_id) {
                 journal.committed.push(item.manifest_id.clone());
             }
+            // ── R-E-83：跳过也是一种**处置**，必须计数 ──────────────────
+            // 修前这里直接 `continue`，`outcome` 一格没动，于是归宿守恒式在恢复
+            // 路径上断裂（全是已提交项时左边为 0、右边为 planned）。
+            // receipt key 也一并带出：receipt 明明在库里，摘要不报的话操作者连
+            // 对账的凭据都拿不到。
+            outcome.already_committed += 1;
+            outcome.receipt_keys.push(key);
             continue;
         }
 
@@ -8611,6 +8708,63 @@ mod e7_restore_journal_tests {
         assert_eq!(err.code(), "E-RECEIPT-MISSING");
     }
 
+    // ── R-E-83：归宿守恒必须在**首跑与恢复两条路径上都成立** ────────────────
+    //
+    // 这条不变式（runbook 给操作者的对账判据）修前**在恢复路径上是假的**：
+    // 先查后做那一支查到 receipt 就 `continue`，`outcome` 一格没动，于是
+    // 「全是已提交项」的一轮左边是 0、右边是 planned。
+    //
+    // 更该记的是它当初怎么漏掉的：**没有任何一条测试以这条不变式为断言**。
+    // 与此同时 `e7_planned_with_receipt_advances_instead_of_discarding` 断言
+    // `restored + replaced == 0` 而 `planned` 是 2 —— **守恒式在一条从没红过的
+    // 绿测试眼皮底下断裂，却没人问**。不变式没有以它为断言的测试，就只是文档修辞。
+    #[test]
+    fn e7_disposition_conservation_holds_on_both_first_run_and_recovery() {
+        let d = drill();
+        let planned = plan_for(&d).planned.len();
+        assert_eq!(planned, 2, "前置断言：本 fixture 恰有两条计划项");
+
+        // ── 首跑 ────────────────────────────────────────────────────────
+        let first = restore_apply_journaled(plan_for(&d), &d.journal_path).unwrap();
+        assert_eq!(
+            first.restored + first.replaced + first.deduplicated + first.already_committed,
+            planned,
+            "首跑：四项和必须等于 planned，实得 {first:?}"
+        );
+        assert_eq!(
+            first.already_committed, 0,
+            "首跑没有任何一条是「已提交」，这一格必须是 0 —— 否则它在冒充工作量"
+        );
+
+        // ── 恢复：把 journal 退回 planned，receipt 全在 ──────────────────
+        let mut journal = restore_journal_read(&d.journal_path).unwrap().unwrap();
+        journal.state = RestoreJournalState::Planned;
+        journal.committed.clear();
+        journal.published.clear();
+        restore_journal_write(&d.journal_path, &journal).unwrap();
+
+        let again = restore_recover(&d.journal_path).unwrap();
+        assert_eq!(
+            again.restored + again.replaced + again.deduplicated + again.already_committed,
+            planned,
+            "恢复：四项和同样必须等于 planned —— 修前这里左边是 0，实得 {again:?}"
+        );
+        assert_eq!(
+            again.already_committed, planned,
+            "这一轮每条都是「已提交、跳过」，该格必须等于 planned"
+        );
+        assert_eq!(
+            (again.restored, again.replaced, again.deduplicated),
+            (0, 0, 0),
+            "恢复轮不该有任何新的写库动作"
+        );
+        assert_eq!(
+            again.receipt_keys.len(),
+            planned,
+            "跳过的那些 receipt key 也要带出来 —— 不然操作者拿不到对账凭据"
+        );
+    }
+
     // ── R-E-79 补充：旧 journal 必须死在**具名版本错误**上，不是 serde 字段错 ──
     //
     // 判据的关键不是「拒不拒」（两种写法都会拒），而是**哪一层在说话**。
@@ -9016,14 +9170,34 @@ fn normalized_from_db_message(
 /// cass 把逐条源事件存在 `extra_json` / `extra_bin` 里，所以 canonical 库**自带重建源文件
 /// 的能力**（`reconstruct_source_jsonl_for_conversation`）。**重建字节与原文件不必逐字节
 /// 相同** —— `compare_versions` 的第二层（投影后的消息序列）正是为这种情形存在的。
+///
+/// # 身份必须整条参与查询（R-E-80′ / R1 Finding 3）
+///
+/// 修前这条查询只绑 `canonical_path`，把 `identity.origin` 整个丢掉了 —— 而
+/// `OriginNamespace` 的 doc 正上方就写着「必须是**带 host 的命名空间**，否则 §5.2.1
+/// 点名的『跨 host 同路径不折叠』做不到」。**类型被特意设计成带 host 的命名空间，
+/// 用的时候却只取了路径那一半。**
+///
+/// 真语料实测：5491 个去重路径里有 **83 个**带多于一个 origin，且 83/83 差在 **agent**
+/// 这一维。折叠它们的后果最重的一种是**跨来源静默覆盖**（A 的行被当成 B 的候选，
+/// 判成 replace 后用 B 的内容盖掉 A）。
+///
+/// `origin_host` 这一维**当前不可判**：`conversations` 侧没有对应列。
+/// 这一点记为已知缺口如实披露，**不假装判了**（本语料里该维差异为 0，
+/// 但那是数据形状，不是保证）。
 fn candidate_versions_from_db(
     storage: &crate::storage::sqlite::FrankenStorage,
     identity: &RestoreIdentity,
 ) -> anyhow::Result<Vec<CandidateSideVersion>> {
     use frankensqlite::compat::{ConnectionExt as _, ParamValue, RowExt as _};
     let ids: Vec<i64> = storage.raw().query_map_collect(
-        "SELECT id FROM conversations WHERE source_path = ?1 ORDER BY id",
-        &[ParamValue::from(identity.canonical_path.as_str())],
+        "SELECT c.id FROM conversations c JOIN agents a ON a.id = c.agent_id \
+         WHERE c.source_path = ?1 AND c.source_id = ?2 AND a.slug = ?3 ORDER BY c.id",
+        &[
+            ParamValue::from(identity.canonical_path.as_str()),
+            ParamValue::from(identity.origin.source_id.as_str()),
+            ParamValue::from(identity.origin.agent.as_str()),
+        ],
         |row| row.get_typed(0),
     )?;
     let mut out = Vec::with_capacity(ids.len());
