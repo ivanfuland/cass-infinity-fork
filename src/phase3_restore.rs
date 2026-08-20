@@ -2074,6 +2074,33 @@ fn rebuild_relative_shape(canonical_original_path: &str) -> Result<PathBuf, Proj
 /// 2. **落盘后**回读 `metadata().len()` 再比一次 —— 防的是短写（`ENOSPC`、被截断）。
 ///    只比入参不比产物，等于把「写成功了」当成「写全了」，正是七类矩阵 E-1
 ///    「短读 / 部分读当完整」的写侧同构。
+/// R-E-84 (c) 的写后前缀断言，**单独一个函数**是为了能被直接进入。
+///
+/// 这一格只有在 (a) 漏判时才会被走到（(a) 逐分量拒 symlink，正常形态到不了这里），
+/// 所以经由 `materialize_sealed_blob` 去构造它需要一个竞态窗——那没法做成确定性判据。
+/// 抽出来之后，用例可以拿一个真的「根外文件」直接问它，走的仍是生产这一条分支。
+fn assert_materialized_inside_root(
+    canonical_root: &Path,
+    canonical_target: &Path,
+) -> Result<(), ProjectionFault> {
+    if canonical_target.starts_with(canonical_root) {
+        return Ok(());
+    }
+    // **只判，不删**（R2 第 1 条 / R-E-98 H2）。原先这里 `remove_file` 掉那个文件，
+    // 而 canonicalize 之后的它就是**受害者真身** —— 于是「覆盖」被升级成「覆盖+删除」。
+    // 删了也换不回什么：覆盖若已发生，发生在这条断言之前（见 (c) 自己的说明），
+    // 删除只是在既成损失上再加一笔，还抹掉了操作者据以定损的现场。
+    Err(ProjectionFault::UnsafeOriginalPath {
+        detail: format!(
+            "E-SCRATCH-SYMLINK-ESCAPE: materialized file resolved to {} which is outside the \
+             scratch root {} — refusing; the file was left as-is on purpose (it may not be ours, \
+             and it is the evidence of what this run touched)",
+            canonical_target.display(),
+            canonical_root.display()
+        ),
+    })
+}
+
 fn materialize_sealed_blob(
     scratch_root: &Path,
     input: &SealedSource<'_>,
@@ -2147,17 +2174,7 @@ fn materialize_sealed_blob(
         std::fs::canonicalize(&target).map_err(|err| ProjectionFault::Materialize {
             detail: format!("canonicalize materialized {}: {err}", target.display()),
         })?;
-    if !canonical_target.starts_with(&canonical_root) {
-        let _ = std::fs::remove_file(&canonical_target);
-        return Err(ProjectionFault::UnsafeOriginalPath {
-            detail: format!(
-                "E-SCRATCH-SYMLINK-ESCAPE: materialized file resolved to {} which is outside the \
-                 scratch root {} — removed it and refusing",
-                canonical_target.display(),
-                canonical_root.display()
-            ),
-        });
-    }
+    assert_materialized_inside_root(&canonical_root, &canonical_target)?;
 
     let written = std::fs::metadata(&canonical_target)
         .map_err(|err| ProjectionFault::Materialize {
@@ -2738,6 +2755,59 @@ mod e5_materialization_tests {
         );
 
         std::fs::remove_file(&planted).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    // ── H2 · #1c（R-E-98 H2 / R2 第 1 条新增的那半）────────────────────
+    //
+    // (c) 兜底在判出逃逸时**不得删掉那个文件**。
+    //
+    // R-E-84 议过 TOCTOU 要不要修（裁不修，记已知加固项），**没议过兜底那句
+    // `remove_file`**：它删的是 canonicalize 之后的**受害者真身**，于是「覆盖」被升级成
+    // 「覆盖+删除」。而且删了也换不回什么——覆盖若已发生，发生在这条断言之前（(c) 自己
+    // 的注释就这么写着），删除只是在已经造成的损失上再加一笔，还抹掉了操作者据以定损的现场。
+    #[test]
+    fn materialize_postwrite_assertion_refuses_without_deleting_the_victim() {
+        let root = scratch("postwrite-assert");
+        let canonical_root = std::fs::canonicalize(&root).unwrap();
+        let outside = std::env::temp_dir().join(format!(
+            "cc-cass-h2-postwrite-outside-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&outside).unwrap();
+        let victim = outside.join("victim.jsonl");
+        let original = b"victim content that must survive the refusal\n";
+        std::fs::write(&victim, original).unwrap();
+        let canonical_victim = std::fs::canonicalize(&victim).unwrap();
+
+        let err = assert_materialized_inside_root(&canonical_root, &canonical_victim)
+            .expect_err("落在根外时必须拒");
+        match &err {
+            ProjectionFault::UnsafeOriginalPath { detail } => assert!(
+                detail.contains("E-SCRATCH-SYMLINK-ESCAPE"),
+                "必须以具名错误码拒，实得：{detail}"
+            ),
+            other => panic!("期望 UnsafeOriginalPath，实得 {other:?}"),
+        }
+
+        // **本条的判据**：受害者必须还在，且逐字节不变。
+        assert!(
+            canonical_victim.exists(),
+            "兜底把受害者的文件删了 —— 那是把「覆盖」升级成「覆盖+删除」"
+        );
+        assert_eq!(
+            std::fs::read(&canonical_victim).unwrap(),
+            original,
+            "受害者文件的字节被动过"
+        );
+
+        // 阳性对照：根内的目标必须放行，否则上面那条可能是恒拒的假绿。
+        let inside = canonical_root.join("inside.jsonl");
+        std::fs::write(&inside, b"x").unwrap();
+        assert_materialized_inside_root(&canonical_root, &std::fs::canonicalize(&inside).unwrap())
+            .expect("根内的目标必须放行");
+
         std::fs::remove_dir_all(&outside).ok();
     }
 
@@ -7652,9 +7722,25 @@ fn read_content_generation(db_path: &Path) -> anyhow::Result<Option<String>> {
     Ok(got)
 }
 
+/// 文件字节的 blake3。**流式**，不把整份读进内存（R2 第 10 条 / R-E-98 H2）。
+///
+/// 修前是 `std::fs::read` 全量读入：候选库 7.2 GiB 时那是一次 7.2 GiB 连续分配，
+/// 而本函数**同时被 marker 构建与 qualify 调用**——一道自称「解析级」的资格门不该
+/// 按库的大小吃内存。两处调用共用这一个定义，不另造第二份。
 fn file_digest(path: &Path) -> anyhow::Result<String> {
-    let bytes = std::fs::read(path)?;
-    Ok(blake3::hash(&bytes).to_hex().to_string())
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    // 64 KiB：与 raw_mirror 那条拷贝链同一档，别在同一个仓里散落多个「块大小」。
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 /// mirror 工作树身份：每份 manifest 的相对路径、**声明的** blob 哈希、以及 **manifest
@@ -8984,6 +9070,104 @@ mod e7_restore_journal_tests {
             );
         }
         storage.close_best_effort_in_place();
+    }
+
+    // ── H2 · #10（R-E-98 H2 / R2 第 10 条）──────────────────────────────
+    //
+    // `file_digest` 曾是 `std::fs::read` 全量读进内存再哈希。候选库 7.2 GiB 时那是一次
+    // 7.2 GiB 连续分配，与「解析级资格门」的定位矛盾（它同时被 marker 构建与 qualify 调用）。
+    //
+    // 这一条先锁**正确性**：改成流式之后，分块边界上不能算错。取 0 / 1 / 恰好一块 /
+    // 一块少一字节 / 一块多一字节 / 多块 六个尺寸，逐个与一次性哈希对比。
+    // 边界那几个尺寸不是凑数——分块实现最典型的错法就是丢最后一个不满块，或在整除时多走一轮。
+    #[test]
+    fn file_digest_matches_one_shot_across_chunk_boundaries() {
+        let tmp = TempDir::new().unwrap();
+        const CHUNK: usize = 64 * 1024;
+        for (i, size) in [0usize, 1, CHUNK - 1, CHUNK, CHUNK + 1, 3 * CHUNK + 7]
+            .into_iter()
+            .enumerate()
+        {
+            let path = tmp.path().join(format!("blob-{i}.bin"));
+            // 内容不能是全同字节：那样「块序搞错」也算得出同一个值，用例就没有分辨力。
+            let bytes: Vec<u8> = (0..size).map(|n| (n % 251) as u8).collect();
+            std::fs::write(&path, &bytes).unwrap();
+            assert_eq!(
+                file_digest(&path).unwrap(),
+                blake3::hash(&bytes).to_hex().to_string(),
+                "size={size} 的摘要与一次性哈希不符"
+            );
+        }
+    }
+
+    /// #10 的**内存**判据用的子进程入口：只做「摘一个文件」这一件事。
+    #[test]
+    #[ignore = "由 file_digest_does_not_slurp_the_whole_file_into_memory 以受限地址空间拉起"]
+    fn h2_file_digest_child_entrypoint() {
+        let path = PathBuf::from(std::env::var("CASS_H2_DIGEST_PATH").unwrap());
+        let digest = file_digest(&path).expect("child: file_digest must succeed");
+        std::fs::write(std::env::var("CASS_H2_RESULT").unwrap(), digest).unwrap();
+    }
+
+    // ── H2 · #10 的真判据：受限地址空间下必须摘得完 ──────────────────────
+    //
+    // 只测「分块算得对」是不够的——那种用例对「一次性读进内存」同样是绿的，等于没有门。
+    // 这里用**稀疏**大文件（`set_len`，占 0 个块，不吃磁盘）配 `ulimit -v` 把子进程的
+    // 地址空间卡在远低于文件尺寸、又远高于二进制自身需求的地方：
+    // 流式摘要过得去，一次性 `fs::read` 必然分配失败。
+    //
+    // 带**宽松上限的阳性对照**：先证明这套子进程机制本身跑得通，否则「紧上限下失败」
+    // 可能只是机制没搭对，而不是被测行为。
+    #[test]
+    fn file_digest_does_not_slurp_the_whole_file_into_memory() {
+        const FILE_BYTES: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB，稀疏
+        const TIGHT_KIB: u64 = 2 * 1024 * 1024; // 2 GiB 地址空间上限
+        const LOOSE_KIB: u64 = 16 * 1024 * 1024; // 16 GiB，阳性对照
+
+        let tmp = TempDir::new().unwrap();
+        let sparse = tmp.path().join("sparse-4g.bin");
+        std::fs::File::create(&sparse)
+            .unwrap()
+            .set_len(FILE_BYTES)
+            .unwrap();
+        // 前置断言：它必须真的是稀疏的，否则这条用例在偷偷吃 4 GiB 磁盘。
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let meta = std::fs::metadata(&sparse).unwrap();
+            assert_eq!(meta.size(), FILE_BYTES, "前置断言：逻辑尺寸必须是 4 GiB");
+            assert!(
+                meta.blocks() * 512 < 1024 * 1024,
+                "前置断言：必须是稀疏文件（实占 {} 字节）—— 否则本用例在吃磁盘",
+                meta.blocks() * 512
+            );
+        }
+
+        let run = |limit_kib: u64| -> std::process::ExitStatus {
+            let result = tmp.path().join(format!("digest-{limit_kib}.txt"));
+            let exe = std::env::current_exe().expect("test binary path");
+            std::process::Command::new("bash")
+                .arg("-c")
+                .arg(format!(
+                    "ulimit -v {limit_kib}; exec \"$0\" --ignored --exact \"$1\"",
+                ))
+                .arg(exe)
+                .arg("phase3_restore::e7_restore_journal_tests::h2_file_digest_child_entrypoint")
+                .env("CASS_H2_DIGEST_PATH", &sparse)
+                .env("CASS_H2_RESULT", &result)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("spawn digest child")
+        };
+
+        assert!(
+            run(LOOSE_KIB).success(),
+            "阳性对照：地址空间宽松时子进程必须跑得通 —— 不通说明是机制没搭对，不是被测行为"
+        );
+        assert!(
+            run(TIGHT_KIB).success(),
+            "地址空间卡在 2 GiB、文件 4 GiB：流式摘要必须过得去，整份读进内存必然过不去"
+        );
     }
 
     // ── T2：`planned` + **无 receipt** → 必须**重放事务** ─────────────────

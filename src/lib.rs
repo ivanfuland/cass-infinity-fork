@@ -7305,8 +7305,10 @@ async fn execute_cli(
                         });
                         let bytes = serde_json::to_vec_pretty(&summary)
                             .map_err(|e| fail("mirror_restore_out_failed", e.to_string()))?;
-                        std::fs::write(path, bytes)
-                            .map_err(|e| fail("mirror_restore_out_failed", e.to_string()))?;
+                        // 主报告走与 HOLD 清单同一条写路径：它同样带家目录全路径与
+                        // agent 名，凭什么它可以世界可读、还可以顺着 symlink 截断别人的文件。
+                        write_private_file(path, &bytes)
+                            .map_err(|e| fail("mirror_restore_out_failed", e))?;
                     }
 
                     if apply {
@@ -20120,20 +20122,74 @@ fn write_private_file(path: &std::path::Path, bytes: &[u8]) -> std::result::Resu
     // 若那已经是 0600（我们上一轮建的），复用不开窗；若是历史遗留的宽权限文件，
     // 下面的 chmod 作为 **belt** 把它收紧。**belt 不是门**：门是 `.mode(0o600)`，
     // 它保证新建的产物从出生起就是私有的；chmod 只兜「文件早就存在且权限不对」这一种。
+    // ── 落点是符号链接就停手（FIND-12 / 裁定 R-E-98 H2）────────────────
+    //
+    // 修前是 `create(true).truncate(true)` 直开最终路径：**跟随符号链接并截断**。
+    // 于是 `--out`（以及 HOLD 清单、歧义表）指到一个 symlink 上时，被截断被改写的是
+    // 链接指向的**别人的文件**——又一条 dry-run 数据丢失路径。R-E-84 只覆盖了 scratch
+    // 物化那一条，R-E-90 只议权限不议跟随。
+    //
+    // 拒绝而不是「顶掉链接」：操作者把落点做成链接可能是有意的，替他决定不是这里的事。
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(format!(
+                "E-OUT-SYMLINK: refusing to write through the symlink at {} — following it would \
+                 truncate and overwrite whatever it points at",
+                path.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("stat {}: {e}", path.display())),
+    }
+
+    // ── 同目录临时件 + `rename` 顶上 ──────────────────────────────────
+    //
+    // 两个收益，都不是顺手：
+    // ① **出生即私有真正成立**：`.mode()` 只在真正创建时生效，而 `truncate` 会复用
+    //    既有文件的模式——那条路上「出生即 0600」对既有文件根本不成立，只能靠事后
+    //    chmod 这条 belt 收尾。`create_new` 让门自己立住。
+    // ② 上面那次判定与写入之间仍有 TOCTOU 窗（R-E-84 已裁这半不修）：即便那一瞬被人
+    //    塞进一个 symlink，`rename` 顶掉的也是**那个链接本身**，写不进它指向的文件。
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let stem = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "out".to_string());
+    let temp = parent.join(format!(".{stem}.tmp-{}", std::process::id()));
+    let _ = std::fs::remove_file(&temp);
     {
         use std::io::Write as _;
         let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
+        opts.write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
             opts.mode(0o600);
         }
         let mut file = opts
-            .open(path)
-            .map_err(|e| format!("open {}: {e}", path.display()))?;
-        file.write_all(bytes)
-            .map_err(|e| format!("write {}: {e}", path.display()))?;
+            .open(&temp)
+            .map_err(|e| format!("open {}: {e}", temp.display()))?;
+        if let Err(e) = file.write_all(bytes) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(format!("write {}: {e}", temp.display()));
+        }
+        if let Err(e) = file.sync_all() {
+            let _ = std::fs::remove_file(&temp);
+            return Err(format!("sync {}: {e}", temp.display()));
+        }
+    }
+    if let Err(e) = std::fs::rename(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(format!(
+            "rename {} -> {}: {e}",
+            temp.display(),
+            path.display()
+        ));
     }
     #[cfg(unix)]
     {
@@ -101254,6 +101310,109 @@ mod mirror_relink_tests {
             "HOLD 清单/歧义表在写入过程中对属主之外可读或可写（{worst:#o}）"
         );
     }
+
+    // ── H2 · #12（R-E-98 H2 / R2 第 12 条）──────────────────────────────
+    //
+    // `write_private_file` 曾用 `create(true).truncate(true)` 直开最终路径：**跟随符号
+    // 链接并截断**。于是 `--out`（以及 HOLD 清单、歧义表）指到一个 symlink 上时，被截断
+    // 被改写的是链接指向的那个**别人的文件**——又一条 dry-run 数据丢失路径。
+    // R-E-84 只覆盖了 scratch 物化那一条，R-E-90 只议权限不议跟随，这一面此前没人管。
+    #[test]
+    fn f12_write_private_file_refuses_to_write_through_a_symlink() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = TempDir::new().unwrap();
+        let victim = tmp.path().join("victim.json");
+        let original = b"victim payload that must survive\n";
+        std::fs::write(&victim, original).unwrap();
+
+        let link = tmp.path().join("report.json");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+
+        let err = crate::write_private_file(&link, b"{\"new\":true}")
+            .expect_err("落点是符号链接时必须拒写，而不是顺着它去截断别人的文件");
+        assert!(
+            err.contains("E-OUT-SYMLINK"),
+            "必须以具名错误码拒，操作者才知道是哪一类问题：{err}"
+        );
+
+        // **本条的判据**：被指向的那个文件必须逐字节不变。
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            original,
+            "顺着符号链接把别人的文件改了 —— 这正是本条要防的事"
+        );
+        // 链接本身也不许被顶掉：拒绝就是拒绝，不做「替操作者决定」的事。
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "拒写时不该顺手把符号链接换成普通文件"
+        );
+
+        // 阳性对照 1：普通新路径照常写，且出生即 0600。
+        let fresh = tmp.path().join("fresh.json");
+        crate::write_private_file(&fresh, b"ok").unwrap();
+        assert_eq!(std::fs::read(&fresh).unwrap(), b"ok");
+        assert_eq!(
+            std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        // 阳性对照 2：**重写既有普通文件**是本站点的正常语义，不能被这道防护误伤，
+        // 且重写之后权限仍须是 0600（历史遗留的宽权限文件也要被收紧）。
+        std::fs::set_permissions(&fresh, std::fs::Permissions::from_mode(0o664)).unwrap();
+        crate::write_private_file(&fresh, b"rewritten").unwrap();
+        assert_eq!(std::fs::read(&fresh).unwrap(), b"rewritten");
+        assert_eq!(
+            std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "重写路径也必须收紧到 0600"
+        );
+    }
+
+    // ── H2 · #12 的另一半：重写走 rename，旧 inode 从不被截断 ──────────
+    //
+    // symlink 预检是**判断**，判断与写入之间有窗（R-E-84 已裁这半不修）。所以写法本身
+    // 也得站得住：写同目录临时件再 `rename` 顶上，最终路径上的旧 inode **一次都没被打开过**。
+    // 这条用硬链接把旧 inode 拴住来验——就地截断会让拴住的那一份跟着变，`rename` 则不会。
+    // 它同时也是「出生即 0600 对重写路径也成立」的判据：`.mode()` 只在真正创建时生效，
+    // 复用既有文件的那条路上这道门是不立的，只能靠事后 chmod 兜。
+    #[test]
+    fn f12_write_private_file_replaces_by_rename_instead_of_truncating_the_old_inode() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("report.json");
+        let before = b"the previous run's report\n";
+        std::fs::write(&target, before).unwrap();
+        // 历史遗留的宽权限：重写路径必须也把它收紧。
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o664)).unwrap();
+        let old_ino = std::fs::metadata(&target).unwrap().ino();
+
+        // 硬链接把**旧 inode** 拴住：它是本条的观测点。
+        let keeper = tmp.path().join("keeper.json");
+        std::fs::hard_link(&target, &keeper).unwrap();
+
+        crate::write_private_file(&target, b"the new report\n").unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"the new report\n");
+        assert_ne!(
+            std::fs::metadata(&target).unwrap().ino(),
+            old_ino,
+            "重写必须是 rename 顶上（换 inode），不是就地截断"
+        );
+        assert_eq!(
+            std::fs::read(&keeper).unwrap(),
+            before,
+            "旧 inode 被截断改写了 —— 落点若是链接，被改的就是别人的文件"
+        );
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "重写后的产物必须是 0600"
+        );
+    }
+
     // =============== R1 Finding 14 判据结束（relink 侧）===============
 
     /// 锚定的声称原文：`mirror-relink` 的 `--apply` help（`src/lib.rs` 的
