@@ -681,6 +681,12 @@ pub enum Commands {
 
         /// 候选 DB 的稳定副本。dry-run 只读它。
         ///
+        /// **前提（不是保证）：这个库在整轮运行期间必须没有别的写者。**
+        /// `PlannedAction::Replace` 只记 `conversation_id`、不落任何内容前置条件，
+        /// 规划与施加之间也没有针对候选库的锁或 CAS —— 前提不成立时工具**不会替你发现**，
+        /// 它只会照计划施加（R2 第 2 条 / R-E-98 I）。要不要把这条前提升级成运行时强制，
+        /// 是 merge 后的决定项：加锁会改变本命令的并发语义。
+        ///
         /// **叫 `--candidate-db` 不叫 `--db`**：顶层 `Cli` 已经有一个全局 `--db`
         /// （`src/lib.rs` 的 `pub struct Cli`），同名会被参数恢复层提到最前、
         /// 让整个子命令解析崩掉（本棒实测：报的是「unexpected argument '--scratch'」，
@@ -100084,6 +100090,40 @@ mod mirror_restore_deep_verify_flag_tests {
     /// 判据不是「能不能解析」，是**不在场时会不会被静默忽略**：一个被静默吞掉的
     /// `--deep-verify` 会让操作者以为自己跑了深度校验，而实际上跑的是默认档 ——
     /// 那正是本仓一路在反对的那种「不在场就跳过」。
+    #[test]
+    fn candidate_db_help_states_the_quiesced_copy_precondition() {
+        // R2 第 2 条：这条前提是**操作前提**，工具不强制，所以它只活在 help 里 ——
+        // 而只活在文字里的东西最容易在日后被顺手删掉或软化。钉成机器判据。
+        run_on_large_stack(|| {
+            use clap::CommandFactory as _;
+            let cmd = Cli::command();
+            let sub = cmd
+                .get_subcommands()
+                .find(|c| c.get_name() == "mirror-restore")
+                .expect("mirror-restore 子命令必须在");
+            let arg = sub
+                .get_arguments()
+                .find(|a| a.get_id() == "candidate_db")
+                .expect("--candidate-db 必须在");
+            let help = format!(
+                "{}{}",
+                arg.get_help().map(|h| h.to_string()).unwrap_or_default(),
+                arg.get_long_help()
+                    .map(|h| h.to_string())
+                    .unwrap_or_default(),
+            );
+            assert!(
+                help.contains("没有别的写者"),
+                "--candidate-db 的 help 必须写明「整轮运行期间没有别的写者」这条前提，实得：{help}"
+            );
+            assert!(
+                help.contains("不会替你发现"),
+                "help 还必须写明工具**不强制**这条前提 —— 只说前提不说「不强制」，\
+                 读者会以为工具替他把着门。实得：{help}"
+            );
+        });
+    }
+
     #[test]
     fn deep_verify_without_qualify_is_refused_not_ignored() {
         // 这个 CLI 的 clap 命令树大到能把默认测试线程栈撑爆（实测 stack overflow）。
