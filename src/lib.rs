@@ -7003,14 +7003,22 @@ async fn execute_cli(
                                             "snapshot_root": marker.snapshot_root,
                                             "content_generation": marker.content_generation,
                                             "planned_count": marker.planned_count,
+                                            // 只报不判：`qualified` 的判定不因这两格
+                                            // 改变（带 HOLD 的部分恢复可以是合法的，
+                                            // 硬拒会误杀），但消费者有权看见再决定。
+                                            "holds_count": marker.holds_count,
+                                            "origin_unmapped_count": marker.origin_unmapped_count,
                                         })
                                     );
                                 } else {
                                     println!(
-                                        "qualified: operation={} snapshot_root={} generation={}",
+                                        "qualified: operation={} snapshot_root={} \
+                                         generation={} holds={} origin_unmapped={}",
                                         marker.operation_id,
                                         marker.snapshot_root,
-                                        marker.content_generation
+                                        marker.content_generation,
+                                        marker.holds_count,
+                                        marker.origin_unmapped_count
                                     );
                                 }
                                 Ok(())
@@ -7275,6 +7283,10 @@ async fn execute_cli(
                             snapshot_root: options.snapshot_root.clone(),
                             generation,
                             planned: report.plan.clone(),
+                            // R-E-79 (a) 条件 4：两格取自**同一次 run 的 report**。
+                            // 事后另数一遍就是第二定义，而两份「数得一样」还要再验一次。
+                            holds_count: report.holds.len() as i64,
+                            origin_unmapped_count: report.origin_unmapped.len() as i64,
                         };
                         let outcome =
                             crate::phase3_restore::restore_apply_journaled(plan, &journal_path)

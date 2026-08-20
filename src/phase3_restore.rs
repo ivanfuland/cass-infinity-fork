@@ -6077,10 +6077,17 @@ pub(crate) struct RestoreRunPlan {
     pub snapshot_root: String,
     pub generation: String,
     pub planned: Vec<RestorePlanItem>,
+    /// 本轮的 HOLD 条数与 origin-unmapped 条数（R-E-79 (a) 条件 4）。
+    /// **来源必须是同一次 run 的 report**，不是事后另数一遍——另数一遍就是第二定义，
+    /// 而两份「数得一样」本身还要再验一次。
+    pub holds_count: i64,
+    pub origin_unmapped_count: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct RestoreJournal {
+    /// 先于一切字段被校验（见 `restore_journal_read`）。
+    pub schema_version: i64,
     pub operation_id: String,
     pub state: RestoreJournalState,
     pub data_dir: PathBuf,
@@ -6090,6 +6097,12 @@ pub(crate) struct RestoreJournal {
     pub snapshot_root: String,
     pub generation: String,
     pub planned: Vec<RestorePlanItem>,
+    /// 随计划一起落盘的两个计数（R-E-79 (a)）。**不给 `serde(default)`**：
+    /// 缺省会把旧 journal 读成「零 HOLD」，与 marker 那边同一个理由。
+    /// 代价是跨版本恢复一份旧 journal 会解析失败——那是**要的**行为，
+    /// 静默报零比明确失败糟得多。
+    pub holds_count: i64,
+    pub origin_unmapped_count: i64,
     /// 已确认提交的 manifest_id（进度）。
     pub committed: Vec<String>,
     /// 已完成 db_links publish 的 manifest 相对路径（差集续做用）。
@@ -6114,6 +6127,7 @@ pub(crate) struct RestoreRunOutcome {
 
 pub(crate) fn restore_journal_from_plan(plan: RestoreRunPlan) -> RestoreJournal {
     RestoreJournal {
+        schema_version: RESTORE_JOURNAL_SCHEMA_VERSION,
         operation_id: plan.operation_id,
         state: RestoreJournalState::Planned,
         data_dir: plan.data_dir,
@@ -6123,6 +6137,8 @@ pub(crate) fn restore_journal_from_plan(plan: RestoreRunPlan) -> RestoreJournal 
         snapshot_root: plan.snapshot_root,
         generation: plan.generation,
         planned: plan.planned,
+        holds_count: plan.holds_count,
+        origin_unmapped_count: plan.origin_unmapped_count,
         committed: Vec::new(),
         published: Vec::new(),
     }
@@ -6184,11 +6200,40 @@ pub(crate) fn restore_journal_write(path: &Path, journal: &RestoreJournal) -> an
 }
 
 pub(crate) fn restore_journal_read(path: &Path) -> anyhow::Result<Option<RestoreJournal>> {
-    match std::fs::read(path) {
-        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(err.into()),
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+
+    // ── 先验版本，后进字段解析（R-E-79 补充裁定）────────────────────────
+    //
+    // **每层以自己的名义拒绝。** 若直接 `serde_json::from_slice` 进结构体，一份旧版
+    // journal 会死在「缺字段 `holds_count`」上——那是**错误的层在说话**：操作者读到
+    // 字段解析错会去查文件损坏，而真相是版本不对。所以版本这一层自己先开口。
+    //
+    // 这一层买的是**错误的可读性**，不是兼容性：旧 journal 照样不能用，只是死得明白。
+    let probe: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| anyhow::anyhow!("restore journal at {} is not JSON: {e}", path.display()))?;
+    let got = probe.get("schema_version").and_then(|v| v.as_i64());
+    match got {
+        Some(v) if v == RESTORE_JOURNAL_SCHEMA_VERSION => {}
+        other => {
+            anyhow::bail!(
+                "E-JOURNAL-SCHEMA-MISMATCH: restore journal at {} declares schema version {} \
+                 but this binary requires {} — refusing to read it (a journal written before \
+                 the hold-count fields existed would otherwise be read as if it had zero HOLDs)",
+                path.display(),
+                match other {
+                    Some(v) => v.to_string(),
+                    None => "<absent>".to_string(),
+                },
+                RESTORE_JOURNAL_SCHEMA_VERSION
+            );
+        }
     }
+
+    Ok(Some(serde_json::from_slice(&bytes)?))
 }
 
 /// 推进一格：**先把新状态落盘并 fsync，再让它对后续动作生效**。
@@ -6678,8 +6723,22 @@ fn restore_drive(
 // receipt 说「这些确实提交过」—— 两个独立真源对上才算数。
 // ===========================================================================
 
+/// restore journal 的 schema 版本（R-E-79 补充裁定）。
+///
+/// **2** = 随 marker 一起加了 `holds_count` / `origin_unmapped_count` 两格。
+/// 这个常量存在的理由不是兼容性（rehearsal 之前没有生产 journal），
+/// 而是**错误的可读性**：没有它，一份旧 journal 会死在 serde 的字段解析上，
+/// 那是错误的层在说话——操作者会去查文件损坏，而真相是版本不对。
+pub(crate) const RESTORE_JOURNAL_SCHEMA_VERSION: i64 = 2;
+
 pub(crate) const W1_COMMIT_MARKER_SCHEMA: &str = "marker.w1-commit";
-pub(crate) const W1_COMMIT_MARKER_SCHEMA_VERSION: i64 = 1;
+/// **2**（R-E-79 (a)）：新增 `holds_count` / `origin_unmapped_count` 两格。
+///
+/// 升版而不是「加两个可选字段」：可选就等于**今天可缺省、明天成旁路**——
+/// 一份没有这两格的 marker 会被读成「零 HOLD」，而那恰好是本次要杜绝的谎。
+/// 闭世界解析对缺字段报 `MissingField`，所以升版之后旧 marker **必然被拒**，
+/// 这是有意的（同 R-E-55 的反滥用形状）。
+pub(crate) const W1_COMMIT_MARKER_SCHEMA_VERSION: i64 = 2;
 // ⚠ staged landing 记账（同 E5/E6 惯例，不是把死代码放行）：非测试构建里它的调用方
 // 要到 **E8 接 `mirror-restore` CLI** 那一刻才出现（解析 marker 落点）。判据仍是
 // 「删掉 allow 之后 clippy 不报 never-used」，移除义务挂在 E8 验收面。
@@ -6724,6 +6783,15 @@ pub(crate) struct W1CommitMarker {
     pub journal_digest: String,
     pub closure_verdict: String,
     pub planned_count: i64,
+    /// 本轮判为 HOLD 的身份条数（R-E-79 (a)）。
+    ///
+    /// **为什么它必须在证书里**：修前 marker 与 journal 里 HOLD 零痕迹，于是一份
+    /// `qualified: true` 的候选可以静默携带成百上千条未解决身份——rehearsal 交出去的
+    /// 两份各带 12 条，而证书上看不出来。**`qualified` 的判定不因这一格改变**
+    /// （带 HOLD 的部分恢复可以是合法的，硬拒会误杀），但消费者有权看见它再自己决定。
+    pub holds_count: i64,
+    /// 本轮 provider 未能映射到 origin 的记录条数（R-E-79 (a)）。同上，只报不判。
+    pub origin_unmapped_count: i64,
     /// **升序去重**（set 语义）：否则同一批内容因枚举顺序不同算出不同摘要。
     pub receipt_keys: Vec<String>,
     pub db_identity: W1DbIdentity,
@@ -6852,6 +6920,7 @@ impl W1CommitMarker {
             );
         }
         out.push('}');
+        canon_kv_int(&mut out, "holds_count", self.holds_count, &mut first);
         canon_kv_str(&mut out, "journal_digest", &self.journal_digest, &mut first);
         canon_kv_str(&mut out, "journal_state", &self.journal_state, &mut first);
         // mirror_identity
@@ -6875,6 +6944,12 @@ impl W1CommitMarker {
         }
         out.push('}');
         canon_kv_str(&mut out, "operation_id", &self.operation_id, &mut first);
+        canon_kv_int(
+            &mut out,
+            "origin_unmapped_count",
+            self.origin_unmapped_count,
+            &mut first,
+        );
         canon_kv_int(&mut out, "planned_count", self.planned_count, &mut first);
         // receipt_keys（set 语义：升序去重由构造方保证，这里只做序列化）
         out.push(',');
@@ -6906,10 +6981,12 @@ impl W1CommitMarker {
             "closure_verdict",
             "content_generation",
             "db_identity",
+            "holds_count",
             "journal_digest",
             "journal_state",
             "mirror_identity",
             "operation_id",
+            "origin_unmapped_count",
             "planned_count",
             "receipt_keys",
             "schema",
@@ -7018,6 +7095,12 @@ impl W1CommitMarker {
             journal_digest: want_str("journal_digest")?,
             closure_verdict: want_str("closure_verdict")?,
             planned_count: want_int("planned_count")?,
+            // **必填、无缺省**（R-E-79 (a) 条件 2）：`want_int` 对缺字段报
+            // `MissingField`，所以 schema 1 的旧 marker 到这里就被拒了。
+            // 给它们一个 `unwrap_or(0)` 等于把「没记录」读成「零 HOLD」——
+            // 那正是本次要杜绝的那句谎。
+            holds_count: want_int("holds_count")?,
+            origin_unmapped_count: want_int("origin_unmapped_count")?,
             receipt_keys,
             db_identity: W1DbIdentity {
                 sqlite_digest: nested_str(&db, "db_identity", "sqlite_digest")?,
@@ -7121,6 +7204,27 @@ pub(crate) fn build_w1_commit_marker(
     let generation = read_content_generation(&journal.db_path)?
         .ok_or_else(|| anyhow::anyhow!("candidate db carries no source content generation"))?;
 
+    // ── R-E-79 (b)：库侧代际必须与 journal 声称的一致 ────────────────────
+    //
+    // 这一格是**读库**得来的，而 journal 记的是本轮**打算**推进到的代际。两者不一致，
+    // 意味着「本轮没能把代际推上去」——最典型的来路是 `planned` 为空的那一轮：
+    // 代际是逐条在 commit 函数里写的，一条都没提交就没人推进它，于是 marker 会
+    // attest 一个**本次运行并未建立**的代际，而 `--qualify` 拿 marker 与库两侧一比
+    // 两边都是那个旧值、自洽，照过不误（R1 Finding 2 的子缺陷，实测坐实）。
+    //
+    // 判**硬失败**而不是「以 journal 为准改写」：这是两个真源互相矛盾，与
+    // `restore_assert_receipts_present` 面对的是同一类情形，那里的口径就是停手不猜。
+    // 同一个文件里对同类矛盾给两套口径，才是真正会咬人的地方。
+    if generation != journal.generation {
+        anyhow::bail!(
+            "E-GENERATION-DISAGREES: candidate db is at content generation {:?} but the journal \
+             says this run advanced it to {:?} — refusing to attest a generation this run did \
+             not establish (a run with an empty plan advances nothing)",
+            generation,
+            journal.generation
+        );
+    }
+
     Ok(W1CommitMarker {
         schema: W1_COMMIT_MARKER_SCHEMA.to_string(),
         schema_version: W1_COMMIT_MARKER_SCHEMA_VERSION,
@@ -7131,6 +7235,8 @@ pub(crate) fn build_w1_commit_marker(
         journal_digest: file_digest(journal_path)?,
         closure_verdict: "pass".to_string(),
         planned_count: journal.planned.len() as i64,
+        holds_count: journal.holds_count,
+        origin_unmapped_count: journal.origin_unmapped_count,
         receipt_keys,
         db_identity: db_identity_of(&journal.db_path, &generation)?,
         mirror_identity: mirror_identity_of(&journal.data_dir)?,
@@ -7659,6 +7765,10 @@ mod e7_restore_journal_tests {
             marker_path: d.db_path.parent().unwrap().join(W1_COMMIT_MARKER_FILENAME),
             snapshot_root: SNAPSHOT_ROOT.into(),
             generation: GENERATION.into(),
+            // 取**互不相同且非零**的值：两格都填 0 的话，一次串位（把 holds 写进
+            // unmapped 那一格）在所有断言下都看不出来。
+            holds_count: 3,
+            origin_unmapped_count: 1,
             planned: vec![
                 RestorePlanItem {
                     manifest_id: d.new_manifest_id.clone(),
@@ -8068,6 +8178,8 @@ mod e7_restore_journal_tests {
                 .join(W1_COMMIT_MARKER_FILENAME),
             snapshot_root: SNAPSHOT_ROOT.into(),
             generation: GENERATION.into(),
+            holds_count: 3,
+            origin_unmapped_count: 1,
             planned,
         };
         let journal = PathBuf::from(std::env::var("CASS_E7_JOURNAL").unwrap());
@@ -8351,6 +8463,8 @@ mod e7_restore_journal_tests {
             marker_path: dir.path().join(W1_COMMIT_MARKER_FILENAME),
             snapshot_root: SNAPSHOT_ROOT.into(),
             generation: GENERATION.into(),
+            holds_count: 0,
+            origin_unmapped_count: 0,
             planned: Vec::new(),
         });
 
@@ -8497,6 +8611,160 @@ mod e7_restore_journal_tests {
         assert_eq!(err.code(), "E-RECEIPT-MISSING");
     }
 
+    // ── R-E-79 补充：旧 journal 必须死在**具名版本错误**上，不是 serde 字段错 ──
+    //
+    // 判据的关键不是「拒不拒」（两种写法都会拒），而是**哪一层在说话**。
+    // 死于 `missing field holds_count` 会让操作者去查文件损坏；死于
+    // `E-JOURNAL-SCHEMA-MISMATCH` 才会让他去看版本。这条测试锁的就是这个区别。
+    #[test]
+    fn e7_old_journal_dies_on_the_named_version_error_not_on_a_serde_field_error() {
+        let d = drill();
+        let journal = restore_journal_from_plan(plan_for(&d));
+        restore_journal_write(&d.journal_path, &journal).unwrap();
+
+        // 前置断言：当前版本读得回来，否则这条用例恒红、没有分辨力。
+        assert!(
+            restore_journal_read(&d.journal_path).unwrap().is_some(),
+            "前置断言：当前版本的 journal 必须读得回来"
+        );
+
+        // 造一份「旧版」：降版本号，并把两个新格摘掉（旧 journal 本来就没有它们）。
+        let mut obj: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(&d.journal_path).unwrap()).unwrap();
+        obj.insert("schema_version".into(), serde_json::json!(1));
+        assert!(obj.remove("holds_count").is_some(), "前置断言：新格本来在");
+        assert!(
+            obj.remove("origin_unmapped_count").is_some(),
+            "前置断言：新格本来在"
+        );
+        std::fs::write(&d.journal_path, serde_json::to_vec(&obj).unwrap()).unwrap();
+
+        let err = restore_journal_read(&d.journal_path).expect_err("旧版 journal 必须被拒");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("E-JOURNAL-SCHEMA-MISMATCH"),
+            "必须以版本这一层的名义拒，实得：{text}"
+        );
+        assert!(
+            text.contains("1") && text.contains(&RESTORE_JOURNAL_SCHEMA_VERSION.to_string()),
+            "错误要同时点出「见到哪个版本」与「需要哪个版本」，实得：{text}"
+        );
+        // 反面：**不得**是 serde 的字段错在说话。
+        assert!(
+            !text.contains("missing field"),
+            "版本这一层必须先开口 —— 让 serde 的字段错先报，就是错误的层在说话：{text}"
+        );
+
+        // 版本号完全缺失（更旧的形态）同样走具名错误。
+        obj.remove("schema_version");
+        std::fs::write(&d.journal_path, serde_json::to_vec(&obj).unwrap()).unwrap();
+        let text = format!("{:#}", restore_journal_read(&d.journal_path).unwrap_err());
+        assert!(
+            text.contains("E-JOURNAL-SCHEMA-MISMATCH") && text.contains("<absent>"),
+            "版本号缺失也必须走同一条具名错误并说明是「缺失」，实得：{text}"
+        );
+    }
+
+    // ── R-E-79 (a) 条件 2：反滥用 —— 新 schema 下两格必填，缺了必须被拒 ──
+    //
+    // 「可选字段」的问题不在今天，在明天：一份没有 `holds_count` 的 marker 会被读成
+    // 「零 HOLD」，而那正是本次要杜绝的谎。所以升 schema 版本 + 闭世界解析报
+    // `MissingField`，让旧 marker **必然被拒**而不是被默默读成 0。
+    #[test]
+    fn e7_marker_without_the_hold_counts_is_refused_not_defaulted_to_zero() {
+        let d = qualified_candidate();
+        let journal = restore_journal_read(&d.journal_path).unwrap().unwrap();
+        let marker = build_w1_commit_marker(&journal, &d.journal_path).unwrap();
+
+        // 前置断言：完整的 marker 必须解析得回来，否则下面测的是别的东西。
+        let full = marker.canonical_bytes();
+        assert_eq!(
+            W1CommitMarker::parse(&full).unwrap(),
+            marker,
+            "前置断言：完整 marker 必须往返一致"
+        );
+
+        // 造 schema 1 形态：把两格逐一摘掉，各自都必须以 `MissingField` 被拒。
+        for field in ["holds_count", "origin_unmapped_count"] {
+            let mut obj: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_slice(&full).unwrap();
+            assert!(
+                obj.remove(field).is_some(),
+                "前置断言：{field} 本来就该在 marker 里"
+            );
+            let bytes = serde_json::to_vec(&obj).unwrap();
+            let err = W1CommitMarker::parse(&bytes).expect_err("缺了必填格必须被拒，不许缺省成 0");
+            match err {
+                W1MarkerError::MissingField(ref got) => assert_eq!(got, field),
+                other => panic!("必须以 MissingField 的名义拒，实得 {other:?}"),
+            }
+        }
+
+        // 另一半：版本号还停在 1 的 marker，即使两格齐全也必须被资格门拒。
+        // 光靠「字段缺失」拦不住一个手工补齐了两格却仍自称 schema 1 的东西。
+        let mut stale = marker.clone();
+        stale.schema_version = 1;
+        let err = qualify_w1_candidate(&W1QualificationInput {
+            marker_path: &{
+                let p = d.db_path.parent().unwrap().join("stale-marker.json");
+                std::fs::write(&p, stale.canonical_bytes()).unwrap();
+                p
+            },
+            journal_path: &d.journal_path,
+            db_path: &d.db_path,
+            data_dir: &d.data_dir,
+        })
+        .expect_err("schema 版本不对必须被拒");
+        assert_eq!(err.code(), "E-SCHEMA-MISMATCH", "实得 {err:?}");
+    }
+
+    // ── R-E-79 (b)：marker 的 `content_generation` 不许与 journal 说的不一致 ──
+    //
+    // 缺陷原样（R1 Finding 2 的子缺陷，实测带出）：`build_w1_commit_marker` 读的是
+    // **库里**的 generation，不是 `journal.generation`。零动作那一轮（`planned` 为空）
+    // 没有任何一条 commit 去推进库里的代际，于是 marker attest 的是**上一轮**的代际
+    // —— 一个本次运行并未建立的值。而 `--qualify` 拿 marker 与库两侧一比，
+    // **两边都是那个旧值、自洽**，于是照过。
+    //
+    // 为什么判硬失败而不是「以 journal 为准改写」：这是**两个真源互相矛盾**，
+    // 与 `restore_assert_receipts_present` 遇到的是同一类情形，那里的口径就是停手不猜。
+    // 同一个文件里对同类矛盾给两套口径，才是真正会咬人的地方。
+    #[test]
+    fn e7_marker_refuses_when_db_generation_disagrees_with_the_journal() {
+        let d = qualified_candidate();
+        let mut journal = restore_journal_read(&d.journal_path).unwrap().unwrap();
+
+        // 前置断言：现在两侧是一致的，否则下面测的是别的东西。
+        let db_generation = read_content_generation(&d.db_path)
+            .unwrap()
+            .expect("前置断言：库里必须已有 generation");
+        assert_eq!(
+            db_generation, journal.generation,
+            "前置断言：动手之前 journal 与库必须一致"
+        );
+        assert!(
+            build_w1_commit_marker(&journal, &d.journal_path).is_ok(),
+            "前置断言：一致时必须能正常产出 marker —— 否则这条用例恒红、没有分辨力"
+        );
+
+        // 造矛盾：journal 声称本轮推进到了另一个代际，而库里还是旧的。
+        // 这正是「零动作 + 库已带 generation」那条真实路径留下的状态。
+        journal.generation = format!("{db_generation}-but-the-journal-says-otherwise");
+
+        let err = build_w1_commit_marker(&journal, &d.journal_path)
+            .expect_err("库与 journal 的代际不一致，必须硬失败而不是替操作者猜一个");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("E-GENERATION-DISAGREES"),
+            "错误必须带具名错误码 E-GENERATION-DISAGREES，实得：{text}"
+        );
+        // 两个值都要出现在错误里 —— 只说「不一致」的报错，操作者还得自己去翻两边。
+        assert!(
+            text.contains(&db_generation) && text.contains(&journal.generation),
+            "错误必须同时点出库侧与 journal 侧的值，实得：{text}"
+        );
+    }
+
     // ── 写 marker 是先查后做，绝不覆盖（不变量 I1）──────────────────────
     #[test]
     fn e7_marker_write_is_check_then_act_and_never_overwrites() {
@@ -8532,7 +8800,7 @@ mod e7_restore_journal_tests {
     fn e7_marker_canonical_encoding_matches_the_pinned_vector() {
         let marker = W1CommitMarker {
             schema: W1_COMMIT_MARKER_SCHEMA.into(),
-            schema_version: 1,
+            schema_version: 2,
             operation_id: "op-1".into(),
             snapshot_root: "root-1".into(),
             content_generation: "gen-1".into(),
@@ -8540,6 +8808,9 @@ mod e7_restore_journal_tests {
             journal_digest: "aa".into(),
             closure_verdict: "pass".into(),
             planned_count: 2,
+            // 两格取不同值：串位就会被下面的钉死字面量抓到。
+            holds_count: 7,
+            origin_unmapped_count: 5,
             receipt_keys: vec!["k1".into(), "k2".into()],
             db_identity: W1DbIdentity {
                 sqlite_digest: "bb".into(),
@@ -8558,14 +8829,16 @@ mod e7_restore_journal_tests {
             ",\"content_generation\":\"gen-1\"",
             ",\"db_identity\":{\"generation\":\"gen-1\",\"schema_version\":21,",
             "\"sqlite_digest\":\"bb\",\"sqlite_size_bytes\":4096}",
+            ",\"holds_count\":7",
             ",\"journal_digest\":\"aa\"",
             ",\"journal_state\":\"closure-verified\"",
             ",\"mirror_identity\":{\"manifest_count\":2,\"manifest_root\":\"cc\"}",
             ",\"operation_id\":\"op-1\"",
+            ",\"origin_unmapped_count\":5",
             ",\"planned_count\":2",
             ",\"receipt_keys\":[\"k1\",\"k2\"]",
             ",\"schema\":\"marker.w1-commit\"",
-            ",\"schema_version\":1",
+            ",\"schema_version\":2",
             ",\"snapshot_root\":\"root-1\"}"
         );
 
