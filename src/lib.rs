@@ -100236,6 +100236,12 @@ pub struct MirrorRelinkReport {
     pub applied: bool,
     /// 实际写盘的 manifest 数。dry-run 恒为 0。
     pub manifests_written: usize,
+    /// 完整性不可信而被**具名跳过**的 manifest 数（FIND-12 / 裁定 R-E-89）：
+    /// 自摘要与重算值不符、或 blob 缺失/校验不符。
+    ///
+    /// **顶层单独一格**，不是让操作者去 findings 列表里数 —— 这一格为零与不为零，
+    /// 是「这次 relink 的输入可不可信」这个问题的答案。
+    pub integrity_findings: usize,
     /// 因「规划之后被改过」而**跳过没写**的 manifest 数（FIND-6 / 裁定 R-E-88）。
     /// dry-run 恒为 0。**与 `manifests_written` 分开报**：把跳过折进「没写」
     /// 就等于让操作者分不出「内容一样所以没写」和「有人动过所以不敢写」。
@@ -100383,14 +100389,31 @@ pub fn mirror_relink(options: &MirrorRelinkOptions) -> Result<MirrorRelinkReport
 
     for view in &views {
         // ── checksum 与 manifest identity ────────────────────────────
+        // ── 三档分治（FIND-12 / 裁定 R-E-89）────────────────────────
+        //
+        // 修前这三类只做提示，apply 循环照样重写它们并返回成功。真正的伤害不是
+        // 「照写」而是**祝福**：写盘会重算并写入新的自摘要，把「记录值与重算值不符」
+        // 这个篡改证据抹掉，此后再也报不出来。实测一次 `--apply` 的净效果是
+        // 篡改留着、合法 backlink 清零、自摘要刷新成一致、`findings=[]`。
+        //
+        // 现在按定性分治：**不可信**的两类具名跳过、原样保留、计数进报告
+        // （与 `ProviderUnmapped` 同形：不是「坏了」，是「本轮不动它」）；
+        // **无从判断**的那一类允许继续，但不得声称校验通过、也不补记自摘要。
+        let mut integrity_blocked = false;
         match view.manifest_identity_matches(&raw_mirror::recompute_manifest_blake3(
             &options.data_dir,
             &view.manifest_relative_path,
         )?) {
             Some(true) => {}
-            Some(false) => findings.push(MirrorRelinkFinding::ManifestIdentityMismatch {
-                manifest_id: view.manifest_id.clone(),
-            }),
+            Some(false) => {
+                findings.push(MirrorRelinkFinding::ManifestIdentityMismatch {
+                    manifest_id: view.manifest_id.clone(),
+                });
+                integrity_blocked = true;
+            }
+            // 「没记自摘要」≠「校验通过」，但它也不是篡改 —— 落「无从判断」档，
+            // 与 `SourceContentGenerationVerdict::Unknown` 同一纪律：记录在案、继续处理，
+            // 但下游不得把它读成已认证。
             None => findings.push(MirrorRelinkFinding::ManifestIdentityUnrecorded {
                 manifest_id: view.manifest_id.clone(),
             }),
@@ -100406,14 +100429,23 @@ pub fn mirror_relink(options: &MirrorRelinkOptions) -> Result<MirrorRelinkReport
                 manifest_id: view.manifest_id.clone(),
                 blob_relative_path: view.blob_relative_path.clone(),
             });
+            integrity_blocked = true;
         }
 
         // ── staging path ─────────────────────────────────────────────
+        // 来源可疑但**不是完整性问题**（manifest 与 blob 都自洽），维持提示 + 计数，
+        // 不挡本轮处理（裁定 R-E-89 ③）。
         if relink_path_is_staging(&view.original_path) {
             findings.push(MirrorRelinkFinding::StagingPath {
                 manifest_id: view.manifest_id.clone(),
                 original_path: view.original_path.clone(),
             });
+        }
+
+        // 不可信的输入到此为止：**不算计划、更不写盘**。
+        // 「不静默替换，也不静默跳过」—— 上面已经各记了一条具名 finding。
+        if integrity_blocked {
+            continue;
         }
 
         // ── 按真实身份重建 db_links（R-E-82：键含 agent）──────────────
@@ -100519,10 +100551,21 @@ pub fn mirror_relink(options: &MirrorRelinkOptions) -> Result<MirrorRelinkReport
         }
     }
 
+    let integrity_findings = findings
+        .iter()
+        .filter(|f| {
+            matches!(
+                f,
+                MirrorRelinkFinding::ManifestIdentityMismatch { .. }
+                    | MirrorRelinkFinding::BlobChecksumMismatch { .. }
+            )
+        })
+        .count();
     Ok(MirrorRelinkReport {
         scanned_manifests: views.len(),
         changes,
         findings,
+        integrity_findings,
         applied: options.apply,
         manifests_written,
         manifests_skipped_stale,
@@ -101153,6 +101196,149 @@ mod mirror_relink_tests {
         );
     }
 
+    // ============ R1 Finding 12 / 裁定 R-E-89 的判据 ============
+    //
+    // 三类 finding 修前只做提示，apply 循环照样重写并返回成功。**真正的伤害不是
+    // 「照写」而是「祝福」**：写盘会重算并写入新的自摘要，把「记录值与重算值不符」
+    // 这个篡改证据抹掉，此后任何一次 relink / doctor 都再也报不出它。
+    // 一次 `--apply` 的净效果实测：篡改留着、合法 backlink 清零、自摘要刷新成一致、
+    // `findings=[]` —— 系统收敛到一个「看起来完全健康」的被篡改状态。
+
+    /// 把 fixture 的 manifest 篡改成「自摘要与内容不符」，返回 manifest 文件路径。
+    fn f12_tamper(data_dir: &Path, rel: &str) -> PathBuf {
+        let manifest_path = data_dir.join("raw-mirror").join("v1").join(rel);
+        let raw = std::fs::read_to_string(&manifest_path).unwrap();
+        let mut json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        json["original_path"] =
+            serde_json::Value::String("/tampered/by/someone-else.jsonl".into());
+        std::fs::write(&manifest_path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+        manifest_path
+    }
+
+    fn f12_has_identity_mismatch(report: &MirrorRelinkReport) -> bool {
+        report
+            .findings
+            .iter()
+            .any(|f| matches!(f, MirrorRelinkFinding::ManifestIdentityMismatch { .. }))
+    }
+
+    #[test]
+    fn f12_apply_must_not_bless_a_tampered_manifest() {
+        let (_tmp, data_dir, rel, _conv, _src) = fixture(true);
+        let manifest_path = f12_tamper(&data_dir, &rel);
+        let links_before = std::fs::read_to_string(&manifest_path).unwrap();
+
+        let dry = run(&data_dir, false);
+        assert!(
+            f12_has_identity_mismatch(&dry),
+            "前置断言：dry-run 必须报出 ManifestIdentityMismatch；实得 {:?}",
+            dry.findings
+        );
+        assert_eq!(
+            dry.integrity_findings, 1,
+            "顶层完整性计数必须为 1，不能让操作者去 findings 里数"
+        );
+        assert!(
+            dry.changes.is_empty(),
+            "不可信的输入不得进入计划 —— 计划里有它，apply 就会写它"
+        );
+
+        let applied = run(&data_dir, true);
+        assert_eq!(applied.manifests_written, 0, "一份都不该写");
+        assert!(f12_has_identity_mismatch(&applied));
+
+        // ① 盘上字节一行没动。
+        assert_eq!(
+            std::fs::read_to_string(&manifest_path).unwrap(),
+            links_before,
+            "被跳过的 manifest 必须原样保留"
+        );
+        // ② 篡改证据还在 —— 这是本条唯一不可逆的那一半。
+        let after = run(&data_dir, false);
+        assert!(
+            f12_has_identity_mismatch(&after),
+            "apply 之后必须仍然报得出 ManifestIdentityMismatch；\
+             修前这里是 findings=[]（证据被那一次写抹掉了）"
+        );
+    }
+
+    #[test]
+    fn f12_storage_layer_refuses_to_write_a_tampered_manifest_by_name() {
+        // 独立防线：不依赖上游有没有跳过它。上游的跳过逻辑可能漏、可能被重构绕开，
+        // 而这里守的是不可逆的那一半。
+        let (_tmp, data_dir, rel, _conv, _src) = fixture(true);
+        f12_tamper(&data_dir, &rel);
+
+        let err = crate::raw_mirror::rebuild_manifest_db_links(&data_dir, &rel, &[], &[])
+            .expect_err("identity 不符时不得写盘");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("E-MANIFEST-IDENTITY-MISMATCH"),
+            "必须带具名错误码，实得：{text}"
+        );
+
+        let err = crate::raw_mirror::merge_manifest_db_links(
+            &data_dir,
+            &rel,
+            &[RawMirrorDbLink {
+                conversation_id: Some(4242),
+                message_count: Some(1),
+                source_path: Some("/nowhere".into()),
+                started_at_ms: None,
+            }],
+        )
+        .expect_err("merge 路径同样不得写盘");
+        assert!(
+            format!("{err:#}").contains("E-MANIFEST-IDENTITY-MISMATCH"),
+            "merge 路径也必须带具名错误码"
+        );
+    }
+
+    #[test]
+    fn f12_unrecorded_manifest_is_not_handed_its_first_certificate() {
+        // 「没记自摘要」是**无从判断**档，不是篡改：允许写，但**不补记** ——
+        // 给一份从未被校验过的 manifest 发第一张证书，等于把「无从判断」洗成「已认证」。
+        let (_tmp, data_dir, rel, _conv, _src) = fixture(true);
+        let manifest_path = data_dir.join("raw-mirror").join("v1").join(&rel);
+        let raw = std::fs::read_to_string(&manifest_path).unwrap();
+        let mut json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        json.as_object_mut().unwrap().remove("manifest_blake3");
+        std::fs::write(&manifest_path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+
+        let dry = run(&data_dir, false);
+        assert!(
+            dry.findings.iter().any(|f| matches!(
+                f,
+                MirrorRelinkFinding::ManifestIdentityUnrecorded { .. }
+            )),
+            "前置断言：必须落在 Unrecorded 档"
+        );
+        assert_eq!(
+            dry.integrity_findings, 0,
+            "「无从判断」不计入完整性阻断计数 —— 它不是篡改"
+        );
+
+        let current: Vec<RawMirrorDbLink> = crate::raw_mirror::manifest_views(&data_dir)
+            .unwrap()
+            .into_iter()
+            .find(|v| v.manifest_relative_path == rel)
+            .unwrap()
+            .db_links;
+        assert!(!current.is_empty(), "前置断言：得有东西可改，否则写不发生");
+        assert_eq!(
+            crate::raw_mirror::rebuild_manifest_db_links(&data_dir, &rel, &current, &[]).unwrap(),
+            crate::raw_mirror::RebuildManifestDbLinksOutcome::Written,
+            "Unrecorded 不阻断写入"
+        );
+
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        assert!(
+            after.get("manifest_blake3").is_none_or(serde_json::Value::is_null),
+            "写入不得给一份从未被校验过的 manifest 补记自摘要；实得 {:?}",
+            after.get("manifest_blake3")
+        );
+    }
     // ============ R1 Finding 6 / 裁定 R-E-88 的判据（relink 侧）============
 
     /// 崩溃重放**不得**拿一份前提已经不成立的计划盲写 —— 必须以具名错误停下来。
@@ -101363,6 +101549,16 @@ mod mirror_relink_tests {
         #[allow(clippy::permissions_set_readonly_false)]
         perms.set_readonly(false);
         std::fs::set_permissions(&manifest_path, perms).unwrap();
+        std::fs::write(&manifest_path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+        // ⚠ 自摘要必须跟着改（FIND-12 / 裁定 R-E-89 之后新增的要求）。
+        // 本用例要模拟的是「一份**合法自洽**、只是 provider 映射不出来」的 manifest；
+        // 只改 provider 不改自摘要造出来的是一份**被篡改**的 manifest，
+        // 那会先被完整性层具名跳过，根本走不到 ProviderUnmapped 那一支 ——
+        // 于是用例会因为**错误的理由**红（或者更糟：因为错误的理由绿）。
+        // 「变异 fixture 必须除待测维度之外哪儿都对」。
+        json["manifest_blake3"] = serde_json::Value::String(
+            crate::raw_mirror::recompute_manifest_blake3(&data_dir, &rel).unwrap(),
+        );
         std::fs::write(&manifest_path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
 
         // **真 apply**：dry-run 不改盘，证不出「不清空」。

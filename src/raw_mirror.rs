@@ -1220,6 +1220,9 @@ fn merge_raw_mirror_manifest_db_links(
         ));
     }
 
+    ensure_manifest_identity_before_write(&manifest, manifest_path)?;
+    let had_self_digest = manifest.manifest_blake3.is_some();
+
     let mut merged_links = manifest.db_links.clone();
     merged_links.extend_from_slice(links);
     let merged_links = unique_db_links(&merged_links);
@@ -1228,7 +1231,11 @@ fn merge_raw_mirror_manifest_db_links(
     }
 
     manifest.db_links = merged_links;
-    manifest.manifest_blake3 = Some(raw_mirror_manifest_blake3(&manifest));
+    // 换发新证书**只对本来就有证书的**。没记自摘要的旧件维持 `None`：
+    // 「无从判断」不得被一次无关的写入洗成「已认证」（裁定 R-E-89 ②）。
+    if had_self_digest {
+        manifest.manifest_blake3 = Some(raw_mirror_manifest_blake3(&manifest));
+    }
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
     replace_manifest_bytes(root, manifest_path, &manifest_bytes)
 }
@@ -1513,6 +1520,41 @@ fn raw_mirror_manifest_id(
             "blob_blake3": blob_blake3,
         }),
     )
+}
+
+/// 落盘前的**独立防线**（FIND-12 / 裁定 R-E-89）：identity 不符的 manifest 一律不写。
+///
+/// 这一条不依赖上游有没有跳过它 —— 上游的跳过逻辑可能漏、可能被将来的重构绕开，
+/// 而这里守的是**不可逆**的那一半：写盘会 `manifest_blake3 = recompute(...)`，
+/// 于是「记录的自摘要与重算值不符」这个**篡改证据被这一次写抹掉**，
+/// 此后任何一次 relink / doctor 都再也报不出它。实测过一次 `--apply` 的净效果：
+/// 篡改留着、合法 backlink 清零、自摘要刷新成一致、`findings=[]`
+/// —— 系统收敛到一个「看起来完全健康」的被篡改状态。
+///
+/// 三档处置与上游一致（裁定 R-E-89）：
+/// * 记了自摘要且**不符** → 具名拒绝，一行不写；
+/// * 记了自摘要且相符 → 正常写，写完换发新证书；
+/// * **没记**自摘要（旧格式，「无从判断」档）→ 允许写，但**不补记** ——
+///   给一份从未被校验过的 manifest 发第一张证书，等于把「无从判断」洗成「已认证」。
+fn ensure_manifest_identity_before_write(
+    manifest: &RawMirrorManifestFile,
+    manifest_path: &Path,
+) -> Result<()> {
+    let Some(recorded) = manifest.manifest_blake3.as_deref() else {
+        return Ok(());
+    };
+    let actual = raw_mirror_manifest_blake3(manifest);
+    if recorded != actual {
+        return Err(anyhow!(
+            "E-MANIFEST-IDENTITY-MISMATCH: raw mirror manifest {} records self-digest {} \
+             but its bytes hash to {} - refusing to write it (writing would recompute the \
+             self-digest and destroy the only evidence that it was tampered with)",
+            manifest_path.display(),
+            recorded,
+            actual
+        ));
+    }
+    Ok(())
 }
 
 fn raw_mirror_manifest_blake3(manifest: &RawMirrorManifestFile) -> String {
@@ -2014,6 +2056,11 @@ pub fn rebuild_manifest_db_links(
 
     let mut manifest = read_raw_mirror_manifest(&manifest_path)?;
 
+    // 身份防线排在新鲜度 CAS **之前**：输入本身不可信时，「我的计划还新不新鲜」
+    // 根本不是该讨论的问题，而且先答那个问题会让操作者拿到一个误导的结论
+    // （「规划之后被改过」听起来是并发，实际是篡改）。
+    ensure_manifest_identity_before_write(&manifest, &manifest_path)?;
+
     // ── 新鲜度 CAS（FIND-6 / 裁定 R-E-88）────────────────────────────────
     //
     // 本函数是**整体替换**，而 `links` 是调用方**更早**算出来的计划。
@@ -2036,12 +2083,17 @@ pub fn rebuild_manifest_db_links(
         return Ok(RebuildManifestDbLinksOutcome::ChangedSincePlan);
     }
 
+    let had_self_digest = manifest.manifest_blake3.is_some();
+
     let rebuilt = unique_db_links(links);
     if rebuilt == manifest.db_links {
         return Ok(RebuildManifestDbLinksOutcome::Unchanged);
     }
     manifest.db_links = rebuilt;
-    manifest.manifest_blake3 = Some(raw_mirror_manifest_blake3(&manifest));
+    // 同 merge：只给本来就有证书的换发新证书（裁定 R-E-89 ②）。
+    if had_self_digest {
+        manifest.manifest_blake3 = Some(raw_mirror_manifest_blake3(&manifest));
+    }
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
     replace_manifest_bytes(&root, &manifest_path, &manifest_bytes)?;
     Ok(RebuildManifestDbLinksOutcome::Written)
