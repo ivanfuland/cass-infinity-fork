@@ -1923,15 +1923,120 @@ fn verify_payload_bytes(
     Ok(())
 }
 
+/// 与 `JsonValue` 等价的解析结果，但**对象里出现重复键就报错**，不折叠。
+///
+/// `serde_json` 的 `Value` 把 `{"a":1,"a":2}` 读成 `{"a":2}` —— 后者覆盖前者，静悄悄。
+/// 于是 wire 层那道 `E-DUP-KEY`（`finish_leaves` / 第 6 步）**对真实 JSON 文件形同虚设**：
+/// 它查的是一个已经没有重复键的结构，永远查不出东西（R2 第 14 条 / R-E-98 H3）。
+///
+/// 危害不止「少报一个错」：`{"a":1,"a":2}` 与 `{"a":2}` 会被读成同一份内容，
+/// 而在一个按**字节**摘要定身份的系统里，两份不同字节读出同一份含义 = 身份判据被绕过。
+///
+/// 查重放在解析器里而不是解析后扫一遍，是因为**解析后就已经晚了**：那时重复键已经没了。
+/// 深度不限：折叠发生在解析器里，不分顶层还是嵌套，所以数组元素里的对象也一并覆盖。
+struct StrictJson(JsonValue);
+
+impl<'de> serde::Deserialize<'de> for StrictJson {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct StrictVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for StrictVisitor {
+            type Value = JsonValue;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("任意 JSON 值")
+            }
+
+            fn visit_unit<E>(self) -> Result<JsonValue, E> {
+                Ok(JsonValue::Null)
+            }
+            fn visit_none<E>(self) -> Result<JsonValue, E> {
+                Ok(JsonValue::Null)
+            }
+            fn visit_some<D>(self, d: D) -> Result<JsonValue, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                <StrictJson as serde::Deserialize>::deserialize(d).map(|s| s.0)
+            }
+            fn visit_bool<E>(self, v: bool) -> Result<JsonValue, E> {
+                Ok(JsonValue::Bool(v))
+            }
+            fn visit_i64<E>(self, v: i64) -> Result<JsonValue, E> {
+                Ok(JsonValue::from(v))
+            }
+            fn visit_u64<E>(self, v: u64) -> Result<JsonValue, E> {
+                Ok(JsonValue::from(v))
+            }
+            fn visit_f64<E>(self, v: f64) -> Result<JsonValue, E> {
+                Ok(JsonValue::from(v))
+            }
+            fn visit_str<E>(self, v: &str) -> Result<JsonValue, E> {
+                Ok(JsonValue::String(v.to_string()))
+            }
+            fn visit_string<E>(self, v: String) -> Result<JsonValue, E> {
+                Ok(JsonValue::String(v))
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<JsonValue, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut out = Vec::new();
+                while let Some(StrictJson(v)) = seq.next_element()? {
+                    out.push(v);
+                }
+                Ok(JsonValue::Array(out))
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<JsonValue, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut out = serde_json::Map::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    let StrictJson(value) = map.next_value()?;
+                    if out.contains_key(&key) {
+                        return Err(serde::de::Error::custom(format!(
+                            "E-DUP-KEY: 键 {key} 在同一个对象里出现两次"
+                        )));
+                    }
+                    out.insert(key, value);
+                }
+                Ok(JsonValue::Object(out))
+            }
+        }
+
+        deserializer.deserialize_any(StrictVisitor).map(StrictJson)
+    }
+}
+
 fn read_json_object(path: &Path) -> Result<serde_json::Map<String, JsonValue>, BundleError> {
     let text = fs::read_to_string(path).map_err(|e| BundleError::Io {
         path: path.to_path_buf(),
         source: e,
     })?;
-    let value: JsonValue = serde_json::from_str(&text).map_err(|e| BundleError::Malformed {
-        path: path.to_path_buf(),
-        detail: format!("JSON 不可解：{e}"),
-    })?;
+    // happy path 只解析一次。出错时才回头用 `JsonValue` 再解一次，**只为分辨**
+    // 「根本不是合法 JSON」与「合法但顶层不是对象」这两句既有诊断措辞 —— 那两句是
+    // 操作者认路用的，不该因为换了解析器就变。
+    let value = match serde_json::from_str::<StrictJson>(&text) {
+        Ok(StrictJson(v)) => v,
+        Err(strict_err) => {
+            return Err(BundleError::Malformed {
+                path: path.to_path_buf(),
+                detail: match serde_json::from_str::<JsonValue>(&text) {
+                    Ok(other) if !matches!(other, JsonValue::Object(_)) => {
+                        format!("顶层不是 JSON 对象，实得 {}", json_type_name(&other))
+                    }
+                    // 宽松解析器读得出来、严格解析器读不出来 —— 差别只可能是重复键。
+                    _ => format!("JSON 不可解：{strict_err}"),
+                },
+            });
+        }
+    };
     match value {
         JsonValue::Object(m) => Ok(m),
         other => Err(BundleError::Malformed {
@@ -2330,7 +2435,20 @@ pub fn classify_whole_file(
             }
             if buckets.is_empty() {
                 // 精确小写 `rollout-*.jsonl`：逐行 record，不归本分类器。
-                debug_assert!(lower.ends_with(".jsonl"));
+                //
+                // 这里此前是 `debug_assert!(lower.ends_with(".jsonl"))`，而
+                // **`debug_assert!` 在 release 里被整条编译掉**（R2 第 15 条 / R-E-98 H3）：
+                // 小写的 `rollout-x.txt` / `.yaml` / 无扩展名走到这一格时被判 `NotWholeFile`
+                // 当逐行 record 处理，**从闭世界分类里逃了出去**。而 release 恰恰是唯一
+                // 会真跑语料的档（debug 跑批量嵌入是被明令禁止的），于是那道断言在
+                // 唯一要紧的档里等于不存在。
+                //
+                // **断言是判断，不是防线。** 一旦分类结论依赖它，它就必须是真分支。
+                if !lower.ends_with(".jsonl") {
+                    return WholeFileDisposition::hold_bucket(
+                        OutOfScopeBucket::UnknownWholeFileSchema,
+                    );
+                }
                 WholeFileDisposition::NotWholeFile
             } else {
                 WholeFileDisposition::hold_buckets(buckets)
@@ -4152,6 +4270,94 @@ mod w0_0_surface_tests {
 // ===========================================================================
 
 #[cfg(test)]
+mod h3_read_json_object_tests {
+    use super::*;
+
+    fn write(dir: &std::path::Path, name: &str, text: &str) -> std::path::PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, text).unwrap();
+        p
+    }
+
+    // ── H3 · #14（R-E-98 H3 / R2 第 14 条）──────────────────────────
+    //
+    // 落盘读取先 `serde_json::from_str` 进 `Value::Object`，**重复键在那一步就被
+    // 后者覆盖前者地折叠掉了**，于是 wire 层那道 `E-DUP-KEY` 对真实 JSON 文件形同虚设：
+    // 它查的是一个**已经没有重复键**的结构，永远查不出东西来。
+    //
+    // 危害不是「少报一个错」：`{"a":1,"a":2}` 与 `{"a":2}` 会被读成同一份内容，
+    // 而在一个按字节摘要定身份的系统里，两份不同字节读出同一份含义 = 身份判据被绕过。
+    #[test]
+    fn h3_read_json_object_rejects_duplicate_keys_instead_of_folding_them() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let dup = write(tmp.path(), "dup.json", r#"{"a": 1, "b": 2, "a": 3}"#);
+        let err = read_json_object(&dup).expect_err("顶层重复键必须被拒，不能静默折叠");
+        let text = format!("{err:?}");
+        assert!(
+            text.contains("E-DUP-KEY"),
+            "必须以具名错误码拒，实得：{text}"
+        );
+        assert!(text.contains('a'), "错误要点出是哪个键：{text}");
+
+        // 嵌套层同样不许折叠 —— 折叠发生在解析器里，不分深浅。
+        let nested = write(tmp.path(), "nested.json", r#"{"outer": {"k": 1, "k": 2}}"#);
+        let err = read_json_object(&nested).expect_err("嵌套对象里的重复键同样必须被拒");
+        assert!(
+            format!("{err:?}").contains("E-DUP-KEY"),
+            "嵌套层也必须走同一个具名错误码"
+        );
+
+        // 数组元素里的对象也一样（sidecar 的 items[] 正是这个形状）。
+        let in_array = write(
+            tmp.path(),
+            "array.json",
+            r#"{"items": [{"id": 1, "id": 2}]}"#,
+        );
+        assert!(
+            format!(
+                "{:?}",
+                read_json_object(&in_array).expect_err("数组里的对象同样不许折叠")
+            )
+            .contains("E-DUP-KEY")
+        );
+
+        // 阳性对照 1：没有重复键的正常文件必须照常读得出来，且值没被动过。
+        let clean = write(
+            tmp.path(),
+            "clean.json",
+            r#"{"a": 1, "nested": {"k": [1, 2, {"z": true}]}, "s": "x", "f": 1.5, "n": null}"#,
+        );
+        let map = read_json_object(&clean).expect("干净文件必须照常读出来");
+        assert_eq!(map.get("a").unwrap(), &serde_json::json!(1));
+        assert_eq!(
+            map.get("nested").unwrap(),
+            &serde_json::json!({"k": [1, 2, {"z": true}]})
+        );
+        assert_eq!(map.get("f").unwrap(), &serde_json::json!(1.5));
+        assert!(map.get("n").unwrap().is_null());
+
+        // 阳性对照 2：两条既有的诊断措辞不能被这次改动带跑偏。
+        let not_object = write(tmp.path(), "arr.json", "[1, 2, 3]");
+        assert!(
+            format!(
+                "{:?}",
+                read_json_object(&not_object).expect_err("顶层不是对象必须拒")
+            )
+            .contains("顶层不是 JSON 对象")
+        );
+        let broken = write(tmp.path(), "broken.json", "{not json");
+        assert!(
+            format!(
+                "{:?}",
+                read_json_object(&broken).expect_err("坏 JSON 必须拒")
+            )
+            .contains("JSON 不可解")
+        );
+    }
+}
+
+#[cfg(test)]
 mod whole_file_disposition_tests {
     use super::*;
     use serde_json::{Value, json};
@@ -4189,6 +4395,52 @@ mod whole_file_disposition_tests {
                 _ => Ok(0),
             }
         }
+    }
+
+    // ── H3 · #15（R-E-98 H3 / R2 第 15 条）──────────────────────────
+    //
+    // 小写 `rollout-*` 分支的收尾处此前是 `debug_assert!(lower.ends_with(".jsonl"))`。
+    // **`debug_assert!` 在 release 里被整条编译掉** —— 于是小写的 `rollout-x.txt` /
+    // `.yaml` / 无扩展名走到这里时，判成 `NotWholeFile` 当作逐行 record 处理，
+    // **从闭世界分类里逃了出去**。而 release 正是唯一会真跑语料的档
+    //（debug 跑批量嵌入是被明令禁止的）。
+    //
+    // 断言是**判断**不是防线：它只在开发档存在，一旦被当成分类逻辑的一部分，
+    // 生产档就是无门。
+    #[test]
+    fn h3_lowercase_rollout_with_a_foreign_extension_stays_inside_the_closed_world() {
+        let counter = FixedCounter(0);
+        for name in [
+            "rollout-2026-08-20.txt",
+            "rollout-2026-08-20.yaml",
+            "rollout-2026-08-20",
+            "rollout-2026-08-20.jsonl.bak",
+        ] {
+            let d = classify_whole_file(
+                Origin::Codex,
+                Path::new(name),
+                b"not really jsonl\n",
+                &counter,
+            );
+            assert!(
+                matches!(d, WholeFileDisposition::Hold { .. }),
+                "{name}：小写 rollout-* 但扩展名不是 .jsonl，必须留在闭世界里（HOLD），\
+                 实得 {d:?}"
+            );
+        }
+
+        // 阳性对照：真正的小写 `rollout-*.jsonl` 仍须照常判 NotWholeFile，
+        // 否则上面那条可能只是把整个分支改成了恒 HOLD。
+        let d = classify_whole_file(
+            Origin::Codex,
+            Path::new("rollout-2026-08-20.jsonl"),
+            b"{}\n",
+            &counter,
+        );
+        assert!(
+            matches!(d, WholeFileDisposition::NotWholeFile),
+            "精确小写 rollout-*.jsonl 必须仍然走逐行 record 路径，实得 {d:?}"
+        );
     }
 
     fn hold_detail(d: &WholeFileDisposition) -> Option<&str> {

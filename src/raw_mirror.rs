@@ -2038,6 +2038,16 @@ pub enum RebuildManifestDbLinksOutcome {
     Written,
     /// **规划之后这份 manifest 被别人改过**：一行都没写，交调用方以自己的名义处置。
     ChangedSincePlan,
+    /// **盘上已经是本计划的 `after`**：一行都没写，因为该写的上一轮已经写完了。
+    ///
+    /// 与 `ChangedSincePlan` 分开，是因为它们对调用方是两件相反的事：那个说「前提没了，
+    /// 停手」，这个说「做过了，往前走」。合在一起报，崩溃重放就会把**自己上一轮的成果**
+    /// 当成别人的改动（R2 第 13 条 / R-E-98 H3）—— 而那条路上重放多少次都是同一句错，
+    /// 恢复永久卡死。
+    ///
+    /// 判定放在这里而不是交调用方重读：本函数此刻正持着锁、两个值都在手上，
+    /// 调用方再读一次就是另一个时刻的事实了。
+    AlreadyApplied,
 }
 
 pub fn rebuild_manifest_db_links(
@@ -2079,13 +2089,19 @@ pub fn rebuild_manifest_db_links(
     //
     // 残留窗口如实说：这只把窗口从「分钟级」压到「锁内重读到 rename 之间」，
     // 跨进程仍不是原子的。彻底关掉要跨进程锁或 manifest 级 CAS 落盘原语，记 E9 已知边界。
+    let rebuilt = unique_db_links(links);
     if manifest.db_links != unique_db_links(expected_current) {
+        // 前提不成立时还要再分一次：盘上恰好**就是本计划的 after**，说明这一步上一轮
+        // 已经做完了（写临时件 → rename 已落，而调用方记 `published` 在本函数返回之后，
+        // 两者之间那一段就是这个窗）。那不是「被别人改过」，是「我自己做过了」。
+        if manifest.db_links == rebuilt {
+            return Ok(RebuildManifestDbLinksOutcome::AlreadyApplied);
+        }
         return Ok(RebuildManifestDbLinksOutcome::ChangedSincePlan);
     }
 
     let had_self_digest = manifest.manifest_blake3.is_some();
 
-    let rebuilt = unique_db_links(links);
     if rebuilt == manifest.db_links {
         return Ok(RebuildManifestDbLinksOutcome::Unchanged);
     }

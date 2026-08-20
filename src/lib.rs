@@ -100685,7 +100685,11 @@ pub fn mirror_relink(options: &MirrorRelinkOptions) -> Result<MirrorRelinkReport
                 &change.after,
             )? {
                 raw_mirror::RebuildManifestDbLinksOutcome::Written => manifests_written += 1,
-                raw_mirror::RebuildManifestDbLinksOutcome::Unchanged => {}
+                // 这条路上 `before` 是本次调用内刚算出来的，所以 `AlreadyApplied` 意味着
+                // 有并发写入方恰好把它写成了我们要的样子——目标态已经在盘上，无事可做。
+                // 不记 stale：那一格说的是「计划过期被跳过」，与这里不是一回事。
+                raw_mirror::RebuildManifestDbLinksOutcome::Unchanged
+                | raw_mirror::RebuildManifestDbLinksOutcome::AlreadyApplied => {}
                 raw_mirror::RebuildManifestDbLinksOutcome::ChangedSincePlan => {
                     manifests_skipped_stale += 1;
                     findings.push(MirrorRelinkFinding::ManifestChangedSincePlan {
@@ -100950,8 +100954,11 @@ fn relink_drive_manifest_phase(journal: &mut RelinkJournal, journal_path: &Path)
             &item.before,
             &item.after,
         )? {
+            // `AlreadyApplied` 与前两者同一处置：该写的已经在盘上了，幂等前进。
+            // 它**必须**与 `ChangedSincePlan` 分开——见那个变体的说明。
             raw_mirror::RebuildManifestDbLinksOutcome::Written
-            | raw_mirror::RebuildManifestDbLinksOutcome::Unchanged => {}
+            | raw_mirror::RebuildManifestDbLinksOutcome::Unchanged
+            | raw_mirror::RebuildManifestDbLinksOutcome::AlreadyApplied => {}
             raw_mirror::RebuildManifestDbLinksOutcome::ChangedSincePlan => {
                 anyhow::bail!(
                     "E-MANIFEST-CHANGED-SINCE-PLAN: manifest {} changed between planning and \
@@ -101647,6 +101654,82 @@ mod mirror_relink_tests {
         );
     }
     // ============ R1 Finding 6 / 裁定 R-E-88 的判据（relink 侧）============
+
+    // ── H3 · #13（R-E-98 H3 / R2 第 13 条）──────────────────────────
+    //
+    // manifest 已经 rename 落盘、`journal.published` 还没写就崩 —— 重放时盘上是
+    // `after`，既不等于 `before`，于是新鲜度 CAS 判 `ChangedSincePlan`、调用方硬失败。
+    // **已施加项被当成「被别人改过」，恢复从此永久卡死**：重放多少次都是同一句错。
+    //
+    // 这个窗不是理论上的：`rebuild_manifest_db_links` 内部是「写临时件 → rename」，
+    // 而 `journal.published.push` + 写 journal 发生在它返回**之后**，两者之间必然有一段。
+    //
+    // 正解与 restore 侧 receipt 的形状同族：**`current == after` 判成「已施加」并幂等前进**。
+    // 与它互为镜像的是下面 f6 那条 —— `current` 既不等于 `before` 也不等于 `after` 时，
+    // 仍然必须硬失败。两条一起才说明这里分辨的是「谁改的」，不是「变没变」。
+    #[test]
+    fn f13_journal_replay_treats_an_already_applied_manifest_as_done() {
+        let (_tmp, data_dir, rel, _conv, _src) = fixture(true);
+        let journal_path = data_dir.join("relink-journal.json");
+
+        let on_disk = crate::raw_mirror::manifest_views(&data_dir)
+            .unwrap()
+            .into_iter()
+            .find(|v| v.manifest_relative_path == rel)
+            .unwrap()
+            .db_links;
+        assert!(
+            !on_disk.is_empty(),
+            "前置断言：盘上必须有 db_links，否则「已施加」和「空计划」分不开"
+        );
+
+        // 崩在 rename 之后、写 journal 之前：盘上已经是 `after`，而 `before` 是规划态。
+        let stale_before = vec![RawMirrorDbLink {
+            conversation_id: Some(999_013),
+            message_count: Some(1),
+            source_path: Some("/what/the/plan/was/built/on".into()),
+            started_at_ms: None,
+        }];
+        let mut journal = RelinkJournal {
+            schema_version: RELINK_JOURNAL_SCHEMA_VERSION,
+            operation_id: "op-f13".into(),
+            state: RelinkJournalState::DbCommitted,
+            data_dir: data_dir.clone(),
+            planned: vec![RelinkPlannedManifest {
+                manifest_relative_path: rel.clone(),
+                before: stale_before,
+                after: on_disk.clone(),
+            }],
+            published: Vec::new(),
+        };
+        relink_journal_write(&journal_path, &journal).unwrap();
+
+        relink_drive_manifest_phase(&mut journal, &journal_path)
+            .expect("盘上已经是 after —— 那是本轮自己施加的结果，必须幂等前进而不是硬失败");
+
+        assert!(
+            journal.published.contains(&rel),
+            "已施加项必须记进 published，否则下一次重放还会再来一遍"
+        );
+        assert_eq!(
+            journal.state,
+            RelinkJournalState::ManifestPartial,
+            "前进之后 journal 状态必须跟上"
+        );
+        let after_disk = crate::raw_mirror::manifest_views(&data_dir)
+            .unwrap()
+            .into_iter()
+            .find(|v| v.manifest_relative_path == rel)
+            .unwrap()
+            .db_links;
+        assert_eq!(
+            on_disk, after_disk,
+            "「已施加」这条路上一行都不该再写 —— 盘上必须逐条不变"
+        );
+
+        // 幂等：再跑一遍仍然必须过，且仍然不写盘。
+        relink_drive_manifest_phase(&mut journal, &journal_path).expect("重跑必须仍然收敛");
+    }
 
     /// 崩溃重放**不得**拿一份前提已经不成立的计划盲写 —— 必须以具名错误停下来。
     ///
