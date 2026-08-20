@@ -7068,6 +7068,99 @@ async fn execute_cli(
                     let report = crate::phase3_restore::plan_mirror_restore(&options)
                         .map_err(|err| fail("mirror_restore_plan_failed", err.to_string()))?;
 
+                    // 按 slug 分组报，不只报一个总数：操作者要知道**是哪些** slug 没映上，
+                    // 一个 3443 只能告诉他「有问题」，告诉不了他去改什么。
+                    let mut unmapped_provider_tally: std::collections::BTreeMap<&str, usize> =
+                        std::collections::BTreeMap::new();
+                    for record in &report.origin_unmapped {
+                        *unmapped_provider_tally
+                            .entry(record.provider.as_str())
+                            .or_default() += 1;
+                    }
+
+                    // 按 **reason** 细分，不只按 class 汇总（R-E-69 条件 3a）。
+                    // `projection-empty` 与 `payload-hash-mismatch` 同属 input-corruption 类，
+                    // 但前者绝大多数是「会话树里的非会话文件」而不是坏字节；只报 class 会让
+                    // 读报告的人把几千条好文件读成「损坏」。
+                    let mut holds_by_reason: std::collections::BTreeMap<&str, usize> =
+                        std::collections::BTreeMap::new();
+                    let mut holds_by_class: std::collections::BTreeMap<&str, usize> =
+                        std::collections::BTreeMap::new();
+                    for hold in &report.holds {
+                        *holds_by_reason.entry(hold.reason.as_str()).or_default() += 1;
+                        *holds_by_class
+                            .entry(hold.reason.class().as_str())
+                            .or_default() += 1;
+                    }
+
+                    // R-E-72：dry-run 产**三件**（plan Task E8 §4）——计数、HOLD 清单、歧义表。
+                    // 在此之前只落了计数，`report.holds` 里那 5574 条记录**从未落盘**，而
+                    // HOLD 清单正是 Phase 4 开工资格的输入。
+                    //
+                    // 两份新文件**只在 `--out` 语境下写**，`0600`，且**永不进 repo**：
+                    // `identity.canonical_path` 是家目录全路径、`origin` 带 agent 名。仓里
+                    // 只引计数，脱敏由取材方各自负责。
+                    //
+                    // 歧义表是 HOLD 清单的**呈现**而不是第二份事实：两者由同一个 `Vec` 在同
+                    // 一次遍历里产出，TSV 只是给人读的那一面。
+                    let holds_json: Vec<serde_json::Value> = report
+                        .holds
+                        .iter()
+                        .map(|h| {
+                            let (evidence_kind, evidence_detail) = match &h.evidence {
+                                crate::phase3_restore::HoldEvidence::ByteLayer { versions } => {
+                                    ("byte-layer", format!("{} versions", versions.len()))
+                                }
+                                crate::phase3_restore::HoldEvidence::MessageLayer {
+                                    versions,
+                                    first_divergent_index,
+                                } => (
+                                    "message-layer",
+                                    format!(
+                                        "{} versions, first divergence at {:?}",
+                                        versions.len(),
+                                        first_divergent_index
+                                    ),
+                                ),
+                                crate::phase3_restore::HoldEvidence::WholeFileExcluded {
+                                    detail,
+                                } => ("whole-file-excluded", detail.clone()),
+                                crate::phase3_restore::HoldEvidence::Versions { versions } => {
+                                    ("versions", format!("{} versions", versions.len()))
+                                }
+                            };
+                            serde_json::json!({
+                                "identity": h.identity.to_string(),
+                                "agent": h.identity.origin.agent.as_str(),
+                                "source_id": h.identity.origin.source_id,
+                                "origin_host": h.identity.origin.origin_host,
+                                "canonical_path": h.identity.canonical_path,
+                                "reason": h.reason.as_str(),
+                                "class": h.reason.class().as_str(),
+                                "evidence_kind": evidence_kind,
+                                "evidence_detail": evidence_detail,
+                                "consumed_manifest_fields": h.consumed_manifest_fields,
+                            })
+                        })
+                        .collect();
+
+                    // 反截断断言：清单条数必须等于 HOLD 数，且等于按 reason 分解之和。
+                    // **写进代码而不是留给人对**——一份被静默截断的 HOLD 清单，读的人
+                    // 只会以为「就这么多」。
+                    let by_reason_sum: usize = holds_by_reason.values().sum();
+                    if holds_json.len() != report.holds.len() || by_reason_sum != report.holds.len()
+                    {
+                        return Err(fail(
+                            "mirror_restore_hold_ledger_truncated",
+                            format!(
+                                "hold ledger accounting is off: {} records rendered, {} holds in                                  the report, {} summed across reasons",
+                                holds_json.len(),
+                                report.holds.len(),
+                                by_reason_sum
+                            ),
+                        ));
+                    }
+
                     let summary = serde_json::json!({
                         "identities_considered": report.identities_considered,
                         "skip": report.census.skip,
@@ -7079,14 +7172,75 @@ async fn execute_cli(
                         "non_relation_holds": report.non_relation_holds,
                         "candidate_versions_seen": report.candidate_versions_seen,
                         "holds": report.holds.len(),
+                        "holds_by_reason": holds_by_reason,
+                        "holds_by_class": holds_by_class,
                         "planned_actions": report.plan.len(),
                         "non_promotable": true,
+                        // R-E-67：manifest 分类层与 planner 层**分开报数，不合并成一个
+                        // 「接受率」**。前者的分母是 manifest，后者的分母是 identity 组；
+                        // 揉成一个数就没人能说清那个百分比在讲什么。
+                        "manifests_seen": report.manifests_seen,
+                        "origin_unmapped": report.origin_unmapped.len(),
+                        "origin_unmapped_providers": unmapped_provider_tally,
+                        // FIND-1（Ivan 2026-08-19 裁 B 案）：不加代际字段，改把操作规约写进
+                        // 工具自己的嘴里——靠人记得的规约迟早会被忘掉一次。
+                        "post_apply_requirement":
+                            "after --apply you must re-ingest in full; until that re-ingest \
+                             completes, watch-once incremental decisions are not trustworthy",
                     });
+                    let mut summary = summary;
                     if let Some(path) = out.as_ref() {
                         if let Some(parent) = path.parent() {
                             std::fs::create_dir_all(parent)
                                 .map_err(|e| fail("mirror_restore_out_failed", e.to_string()))?;
                         }
+                        let holds_path = path.with_extension("holds.json");
+                        let table_path = path.with_extension("ambiguity.tsv");
+                        let holds_bytes = serde_json::to_vec_pretty(&holds_json)
+                            .map_err(|e| fail("mirror_restore_out_failed", e.to_string()))?;
+                        let mut table = String::from(
+                            "identity\treason\tclass\tevidence_kind\tevidence_detail\n",
+                        );
+                        for row in &holds_json {
+                            let field = |k: &str| {
+                                row.get(k)
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .replace(['\t', '\n'], " ")
+                            };
+                            table.push_str(&format!(
+                                "{}\t{}\t{}\t{}\t{}\n",
+                                field("identity"),
+                                field("reason"),
+                                field("class"),
+                                field("evidence_kind"),
+                                field("evidence_detail")
+                            ));
+                        }
+                        write_private_file(&holds_path, &holds_bytes)
+                            .map_err(|e| fail("mirror_restore_out_failed", e))?;
+                        write_private_file(&table_path, table.as_bytes())
+                            .map_err(|e| fail("mirror_restore_out_failed", e))?;
+                        // 指纹进计数报告：Phase 4 拿到清单时能验它就是这一轮产的那一份。
+                        // 路径记**文件名**而不是绝对路径（R-E-72 ④）：绝对路径带家目录，
+                        // 会让计数报告本身也不能被引用。指纹覆盖的是文件**内容**，与这里
+                        // 记什么路径无关，所以换写法不动指纹。
+                        let rel = |p: &std::path::Path| {
+                            p.file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| p.display().to_string())
+                        };
+                        summary["hold_ledger"] = serde_json::json!({
+                            "holds_file": rel(&holds_path),
+                            "holds_blake3": blake3::hash(&holds_bytes).to_hex().to_string(),
+                            "ambiguity_table_file": rel(&table_path),
+                            "ambiguity_table_blake3":
+                                blake3::hash(table.as_bytes()).to_hex().to_string(),
+                            "location": "beside this report, in the run root",
+                            "records": holds_json.len(),
+                            "never_commit": "contains home-directory paths and agent names; \
+                                             run-root only, never into the repository",
+                        });
                         let bytes = serde_json::to_vec_pretty(&summary)
                             .map_err(|e| fail("mirror_restore_out_failed", e.to_string()))?;
                         std::fs::write(path, bytes)
@@ -7151,9 +7305,12 @@ async fn execute_cli(
                         println!("{summary}");
                     } else {
                         println!(
-                            "dry-run: {} identities; skip={} restore={} replace={} holds={} \
-                             other-holds={} candidate-versions={} planned={} (non-promotable)",
+                            "dry-run: {} manifests -> {} identities ({} origin-unmapped); \
+                             skip={} restore={} replace={} holds={} other-holds={} \
+                             candidate-versions={} planned={} (non-promotable)",
+                            report.manifests_seen,
                             report.identities_considered,
+                            report.origin_unmapped.len(),
                             report.census.skip,
                             report.census.restore,
                             report.census.replace,
@@ -19873,6 +20030,21 @@ mod watch_once_resolution_tests {
 ///
 /// **文件名常量只有这一处消费方**——把约定写在一处、由这里兑现，
 /// 比让每个调用方各拼一遍字符串安全（拼错了是静默产生第二份 marker）。
+/// 写一份**只有属主可读**的产物（R-E-72）。
+///
+/// HOLD 清单与歧义表带家目录全路径与 agent 名。它们落在 repo 外的 run root 里，但
+/// 「目录是 0700」不该是这些文件唯一的保护——产物自己带住权限，搬到别处也还带着。
+fn write_private_file(path: &std::path::Path, bytes: &[u8]) -> std::result::Result<(), String> {
+    std::fs::write(path, bytes).map_err(|e| format!("write {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("chmod {}: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
 fn default_w1_marker_path(explicit: Option<&PathBuf>, db_path: &std::path::Path) -> PathBuf {
     explicit.cloned().unwrap_or_else(|| {
         db_path

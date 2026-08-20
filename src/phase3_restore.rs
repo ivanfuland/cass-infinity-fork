@@ -171,6 +171,46 @@ pub struct CanonicalMessageDigest(pub [u8; 32]);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectionError {
     pub detail: String,
+    /// 下层已经**具名**的故障，原样透上来（R-E-68）。
+    ///
+    /// 在这一格存在之前，`SealedMessageProjector::project` 把 [`ProjectionFault`] 拍成
+    /// `fault.to_string()` 就扔了，于是上层想区分「零会话投影」与其他投影失败，只剩下
+    /// 匹配错误文案一条路——而错误文案是写给人看的、随时会被改写，拿它做控制流等于把
+    /// 行为挂在措辞上。`mirror_seal` 分 HOLD 时为同一理由拒绝按文本分类，改读校验阶段
+    /// **已经定好的具名状态**；这里是同一条纪律：下层早就具名了，别在上层重新猜一遍。
+    ///
+    /// `None` 表示这个投影实现没有具名故障可给（E4 的受控替身就是这样），**不表示
+    /// 「没出错」**——它出现在 `Err` 里。
+    pub fault: Option<ProjectionFault>,
+}
+
+impl ProjectionError {
+    /// 没有具名故障可透的投影失败。
+    pub fn other(detail: impl Into<String>) -> Self {
+        ProjectionError {
+            detail: detail.into(),
+            fault: None,
+        }
+    }
+
+    /// 把下层的具名故障原样带上来。`detail` 由它自己的 `Display` 产生，人机各读一格。
+    pub fn from_fault(fault: ProjectionFault) -> Self {
+        ProjectionError {
+            detail: fault.to_string(),
+            fault: Some(fault),
+        }
+    }
+
+    /// 投影结果为**零**会话——`projection-empty` HOLD 的唯一判据。
+    ///
+    /// 只认 0。会话数为 2 是另一回事（一个文件里有多条会话），压成同一个判据会让接住它的
+    /// 人以为自己在处理「这份文件不是会话」。
+    pub fn is_empty_projection(&self) -> bool {
+        matches!(
+            self.fault,
+            Some(ProjectionFault::UnexpectedConversationCount { count: 0 })
+        )
+    }
 }
 
 /// 注入点：把一段已归一化的字节投影成 canonical 消息序列的摘要串。
@@ -375,10 +415,19 @@ pub enum HoldReason {
     PayloadHashMismatch,
     /// manifest 引用缺失（输入损坏类）。
     ManifestReferenceMissing,
+    /// winner 的字节投影出**零**条会话（输入损坏类，R-E-68）。
+    ///
+    /// 归到「输入损坏类」是四类闭世界（§5.2.1，第五类判非法）下的最近落点，**但类名比事实
+    /// 重**：绝大多数这样的 blob 并没有坏，它们是会话树里的**非会话文件**（备份、迁移残留、
+    /// agent 状态、图片）——D3 封存侧把同一批东西判成 `out-of-scope-format` HOLD（该次实测
+    /// 3008 条，其中 2745 条 origin=openclaw），而 raw-mirror 捕获侧照收不误。所以真正的
+    /// 根因是**捕获口径宽于处理口径**，不是字节损坏。看到这条 HOLD 的人该去核的是
+    /// 「这份文件本来就不该进 mirror」，不是「磁盘坏了」。
+    ProjectionEmpty,
 }
 
 impl HoldReason {
-    pub const ALL: [HoldReason; 9] = [
+    pub const ALL: [HoldReason; 10] = [
         HoldReason::CandidateSuperset,
         HoldReason::CandidateDiverged,
         HoldReason::MultipleCandidates,
@@ -388,6 +437,7 @@ impl HoldReason {
         HoldReason::WholeFileJsonNoPartialOrder,
         HoldReason::PayloadHashMismatch,
         HoldReason::ManifestReferenceMissing,
+        HoldReason::ProjectionEmpty,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -401,6 +451,7 @@ impl HoldReason {
             HoldReason::WholeFileJsonNoPartialOrder => "whole-file-json-no-partial-order",
             HoldReason::PayloadHashMismatch => "payload-hash-mismatch",
             HoldReason::ManifestReferenceMissing => "manifest-reference-missing",
+            HoldReason::ProjectionEmpty => "projection-empty",
         }
     }
 
@@ -413,9 +464,9 @@ impl HoldReason {
             HoldReason::VersionTimeConflict
             | HoldReason::VersionDiverged
             | HoldReason::WholeFileJsonNoPartialOrder => HoldClass::Version,
-            HoldReason::PayloadHashMismatch | HoldReason::ManifestReferenceMissing => {
-                HoldClass::InputCorruption
-            }
+            HoldReason::PayloadHashMismatch
+            | HoldReason::ManifestReferenceMissing
+            | HoldReason::ProjectionEmpty => HoldClass::InputCorruption,
         }
     }
 
@@ -1046,9 +1097,8 @@ mod e4_winner_and_decision_tests {
             _origin: &OriginNamespace,
             bytes: &[u8],
         ) -> Result<Vec<CanonicalMessageDigest>, ProjectionError> {
-            let text = std::str::from_utf8(bytes).map_err(|e| ProjectionError {
-                detail: format!("非 UTF-8：{e}"),
-            })?;
+            let text = std::str::from_utf8(bytes)
+                .map_err(|e| ProjectionError::other(format!("非 UTF-8：{e}")))?;
             Ok(text
                 .lines()
                 .filter(|l| !l.trim().is_empty())
@@ -1066,15 +1116,12 @@ mod e4_winner_and_decision_tests {
             _origin: &OriginNamespace,
             bytes: &[u8],
         ) -> Result<Vec<CanonicalMessageDigest>, ProjectionError> {
-            let text = std::str::from_utf8(bytes).map_err(|e| ProjectionError {
-                detail: format!("非 UTF-8：{e}"),
-            })?;
+            let text = std::str::from_utf8(bytes)
+                .map_err(|e| ProjectionError::other(format!("非 UTF-8：{e}")))?;
             let mut out = Vec::new();
             for line in text.lines().filter(|l| !l.trim().is_empty()) {
-                let v: serde_json::Value =
-                    serde_json::from_str(line).map_err(|e| ProjectionError {
-                        detail: format!("行不可解：{e}"),
-                    })?;
+                let v: serde_json::Value = serde_json::from_str(line)
+                    .map_err(|e| ProjectionError::other(format!("行不可解：{e}")))?;
                 let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("");
                 out.push(CanonicalMessageDigest(
                     *blake3::hash(id.as_bytes()).as_bytes(),
@@ -1092,9 +1139,7 @@ mod e4_winner_and_decision_tests {
             _origin: &OriginNamespace,
             _bytes: &[u8],
         ) -> Result<Vec<CanonicalMessageDigest>, ProjectionError> {
-            Err(ProjectionError {
-                detail: "投影不可用".to_string(),
-            })
+            Err(ProjectionError::other("投影不可用"))
         }
     }
 
@@ -1294,7 +1339,10 @@ mod e4_winner_and_decision_tests {
             assert!(HoldClass::ALL.contains(&r.class()));
             assert_eq!(HoldReason::parse(r.as_str()), Some(r));
         }
-        assert_eq!(seen.len(), 9);
+        // 9 → 10：R-E-68 加了 `projection-empty`。**类数仍是四**（§5.2.1 的闭世界没动，
+        // 新 reason 归到 input-corruption），变的只是 reason 全集的大小。这条断言是
+        // 覆盖面自检，它红在这里正是它该做的事——加 reason 的人必须来这里说明一次。
+        assert_eq!(seen.len(), 10);
         assert_eq!(HoldReason::parse("no-record-boundary"), None);
     }
 
@@ -2312,21 +2360,18 @@ impl SealedMessageProjector<'_> {
             blob: normalized_bytes,
         };
         let materialized =
-            materialize_sealed_blob(&slot, &input).map_err(|fault| ProjectionError {
-                detail: fault.to_string(),
-            })?;
+            materialize_sealed_blob(&slot, &input).map_err(ProjectionError::from_fault)?;
 
-        let conversations =
-            scan_materialized_file(&materialized, self.agent).map_err(|fault| ProjectionError {
-                detail: fault.to_string(),
-            })?;
+        let conversations = scan_materialized_file(&materialized, self.agent)
+            .map_err(ProjectionError::from_fault)?;
         if conversations.len() != 1 {
-            return Err(ProjectionError {
-                detail: format!(
-                    "sealed projection produced {} conversations; exactly 1 is required",
-                    conversations.len()
-                ),
-            });
+            // 同一个条件在下层已经具名为 `UnexpectedConversationCount`；这里复用它而不是
+            // 再造一个平行说法，否则「会话数不为 1」在同一个文件里就有两套词汇。
+            return Err(ProjectionError::from_fault(
+                ProjectionFault::UnexpectedConversationCount {
+                    count: conversations.len(),
+                },
+            ));
         }
         let mut conv = conversations.into_iter().next().expect("len checked above");
 
@@ -6108,10 +6153,38 @@ pub(crate) fn restore_pause_if_requested(boundary: &str) {
 
 /// 从 manifest view 推出恢复身份。**只有这一处定义**——测试与恢复器都用它，
 /// 免得「首跑算出来的 key」与「恢复算出来的 key」两处各写一份而悄悄分叉。
+/// raw-mirror 的 `provider` → `W0-0` §B 的 origin 三族。**归一的唯一定义**（R-E-67）。
+///
+/// 两侧值空间本来就不一样，这不是命名手误：raw-mirror 捕获侧存的是 CASS 的 **agent slug**
+/// （`src/indexer/mod.rs` 那三个捕获点，其中一个直接传 `&conv.agent_slug`），按 agent 实例
+/// 细分、开放集合；而 `Origin` 是 `W0-0` §B 的**封闭三族**，封存侧（D3/D5）早已按三族归一。
+/// 实测这个 9488 份 manifest 的真语料，**3443 份（36.3%）的 provider 不在三族里**，九个取值
+/// 见 run root 的 `evidence/find-2-provider-space.txt`；而在此之前 `Origin::parse` 直接 `None`
+/// → 调用方 `bail`，**撞上第一份就打死整轮**，planner 在真语料上一条都判不出来。
+///
+/// 三条映射，之外一律不归一：
+/// * 三个正名 `claude_code` / `codex` / `openclaw` 恒等（走 `Origin::parse`，不在这里抄一遍）；
+/// * `claude` → `ClaudeCode`（同一家的另一个 slug 写法）；
+/// * `openclaw/<agent>` 前缀 → `Openclaw`（`main` / `wood` / `javich` … 是同一家的 agent 实例）。
+///
+/// **未知 slug 返回 `None`，不猜、不兜底。** `pi_agent` 与 `gemini` 落在这里且**是定案**
+/// （Ivan 2026-08-19 确认）：它们不属受保护资产的三家，永久具名 HOLD，不入三族。
+/// 放宽 `Origin` 本身的取值空间是被否掉的路（R-E-67 (a)）——那是为读侧方便去改封存契约。
+pub(crate) fn normalize_provider_to_origin(provider: &str) -> Option<Origin> {
+    if let Some(origin) = Origin::parse(provider) {
+        return Some(origin);
+    }
+    match provider {
+        "claude" => Some(Origin::ClaudeCode),
+        other if other.starts_with("openclaw/") => Some(Origin::Openclaw),
+        _ => None,
+    }
+}
+
 pub(crate) fn restore_identity_from_view(
     view: &crate::raw_mirror::RawMirrorManifestView,
 ) -> anyhow::Result<RestoreIdentity> {
-    let agent = Origin::parse(&view.provider)
+    let agent = normalize_provider_to_origin(&view.provider)
         .ok_or_else(|| anyhow::anyhow!("unknown provider in manifest: {}", view.provider))?;
     Ok(RestoreIdentity {
         origin: OriginNamespace {
@@ -6166,7 +6239,7 @@ fn restore_project_plan_item(
             anyhow::bail!("sealed blob unreadable for {}: {detail}", view.manifest_id)
         }
     };
-    let agent = Origin::parse(&view.provider)
+    let agent = normalize_provider_to_origin(&view.provider)
         .ok_or_else(|| anyhow::anyhow!("unknown provider in manifest: {}", view.provider))?;
     let provenance = provenance_from_manifest_view(view);
     let sealed = SealedSource {
@@ -8287,7 +8360,33 @@ pub(crate) struct MirrorRestorePlanReport {
     pub holds: Vec<HoldRecord>,
     /// 可执行计划（`--apply` 消费；dry-run 只产不跑）。
     pub plan: Vec<RestorePlanItem>,
+    /// provider 归一不了、**因此连 identity 都构造不出来**的 manifest（R-E-67）。
+    ///
+    /// 为什么不塞进 `holds`：`HoldRecord` 的 `identity` 是非可选的，四类 HOLD taxonomy
+    /// 描述的是「candidate 与 winner 的关系出了什么问题」，**前提就是身份已经成立**。
+    /// 这批是**身份成立之前**就挡住的故障，硬塞进去只有两条路——给 `Origin` 编一个假值，
+    /// 或者把 `identity` 放松成可选——前者是伪造、后者让所有下游都得处理一个几乎不会出现
+    /// 的 `None`。单开一格，两样都不用做。
+    pub origin_unmapped: Vec<UnmappedOriginRecord>,
+    /// 本轮读到的 manifest 总数。**存在的意义是对账**：
+    /// `manifests_seen == 进入分组的 manifest 数 + origin_unmapped.len()`，
+    /// 否则「有多少条被无声丢掉了」这个问题没有机器答案。
+    pub manifests_seen: usize,
 }
+
+/// 一条 provider 归一不了的 manifest（R-E-67）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnmappedOriginRecord {
+    pub manifest_id: String,
+    /// 原始 slug **原样带出**——不带它，操作者就只知道「有东西没映上」而不知道是什么，
+    /// 而「哪些 slug 需要被映射」正是这条记录唯一要回答的问题。
+    pub provider: String,
+}
+
+// 这里**不放路径**，两个理由各自都够：`RawMirrorManifestView` 根本不暴露脱敏路径，自己
+// 用 `format!("[{provider}]/{name}")` 拼一份就是 `raw_mirror::redacted_original_path`
+// 的第二定义；而 `original_path` 是家目录全路径，会随报告落盘。`manifest_id` 已经唯一定位
+// 到 `manifests/<id>.json`，需要细节的人打开它就是。
 
 /// 候选侧的一条版本：**摘要来自 DB 的 canonical 消息**，字节只作裁定材料。
 ///
@@ -8437,14 +8536,64 @@ pub(crate) fn plan_mirror_restore(
     // 当成两条身份分别计数。
     let mut groups: std::collections::BTreeMap<String, Vec<usize>> =
         std::collections::BTreeMap::new();
+    let mut report = MirrorRestorePlanReport {
+        manifests_seen: views.len(),
+        ..MirrorRestorePlanReport::default()
+    };
     for (index, view) in views.iter().enumerate() {
+        // R-E-67：provider 归一不了的**不再 bail**。旧行为是撞上第一份未知 slug 就
+        // `?` 出去，于是真语料里 36.3% 的 manifest 让整轮一条都判不出来——一条读不懂的
+        // 输入不该打死整轮，而「读不懂」与「不存在」必须能分辨。
+        if normalize_provider_to_origin(&view.provider).is_none() {
+            report.origin_unmapped.push(UnmappedOriginRecord {
+                manifest_id: view.manifest_id.clone(),
+                provider: view.provider.clone(),
+            });
+            continue;
+        }
+        // 归一成功才走这里，所以此处的 `?` 只可能被将来新增的失败原因触发，
+        // 而不是被 provider ——「已知会发生的事」在上面被具名接住了。
         let identity = restore_identity_from_view(view)?;
         groups.entry(identity.to_string()).or_default().push(index);
     }
 
-    let mut report = MirrorRestorePlanReport::default();
+    // FIND-5 mitigation (R-E-71'): reopen the read-only candidate handle every
+    // REOPEN_EVERY_IDENTITIES identities.
+    //
+    // **The defect being worked around is not here.** Measured: reading one
+    // conversation through this handle costs milliseconds for the first ~1650
+    // conversations of a process and then roughly ten seconds each -- about
+    // 1500x, on the *same* conversations (200 identities that take 1.1 s alone
+    // took ~1600 s once 1647 conversations had already been read through the
+    // same handle). The accumulating thing lives below `FrankenStorage`, was not
+    // located, and is filed as an open defect: any long-running consumer that
+    // reads enough conversations through one handle will hit the same wall.
+    // This bounds how many any single handle reads; it does not fix anything.
+    //
+    // **A property does change and it is stated rather than buried**: the run is
+    // no longer one continuous read through a single handle. That is safe here
+    // because the candidate database is a *stable copy* produced by D5 with no
+    // writer, and because each identity's queries are independent -- no
+    // transaction spans identities. On a live database it would not be.
+    //
+    // 500 rather than 250 or 1000: measured over the 0:2200 prefix, wall clock
+    // was 108 s / 107 s / 108 s at 250 / 500 / 1000 -- reopening costs nothing
+    // measurable, so the interval is chosen for margin, not for speed. 500 keeps
+    // better than 3x headroom under the observed knee; 250 buys no measured
+    // benefit for triple the reopens. The same prefix without reopening: 1705 s.
+    const REOPEN_EVERY_IDENTITIES: usize = 500;
+    let mut since_reopen = 0usize;
     for indices in groups.values() {
         report.identities_considered += 1;
+        since_reopen += 1;
+        if since_reopen >= REOPEN_EVERY_IDENTITIES {
+            storage.close_best_effort_in_place();
+            storage = crate::storage::sqlite::FrankenStorage::open_readonly(&options.db_path)
+                .map_err(|e| {
+                    anyhow::anyhow!("reopen candidate db {}: {e}", options.db_path.display())
+                })?;
+            since_reopen = 0;
+        }
         let head = &views[indices[0]];
         let identity = restore_identity_from_view(head)?;
         let projector = SealedMessageProjector {
@@ -8516,9 +8665,32 @@ pub(crate) fn plan_mirror_restore(
         // ── candidate 侧 ──────────────────────────────────────────────
         let candidates = candidate_versions_from_db(&storage, &identity)?;
         report.candidate_versions_seen += candidates.len();
-        let winner_digests = comparable
-            .project(&identity.origin, versions[winner_index].normalized())
-            .map_err(|e| anyhow::anyhow!("winner projection failed: {e:?}"))?;
+        // R-E-68：**零会话投影**降为具名 HOLD，不再打死整轮。判据读的是 `ProjectionFault`
+        // 这个具名类别，**不是** `detail` 的错误文案——文案是给人看的、随时会改，拿它做
+        // 控制流等于把行为挂在措辞上。其余投影失败仍然上抛：不假装分得清的，就别分。
+        let winner_digests =
+            match comparable.project(&identity.origin, versions[winner_index].normalized()) {
+                Ok(digests) => digests,
+                Err(fault) if fault.is_empty_projection() => {
+                    report.non_relation_holds += 1;
+                    report.holds.push(HoldRecord {
+                        identity: identity.clone(),
+                        reason: HoldReason::ProjectionEmpty,
+                        evidence: HoldEvidence::WholeFileExcluded {
+                            detail: format!(
+                                "manifest {} ({} bytes) projected to zero conversations: {}",
+                                views[indices[winner_index]].manifest_id,
+                                views[indices[winner_index]].blob_size_bytes,
+                                fault.detail
+                            ),
+                        },
+                        consumed_manifest_fields: manifest_fields::CONSUMED_BY_WINNER_SELECTION
+                            .to_vec(),
+                    });
+                    continue;
+                }
+                Err(fault) => return Err(anyhow::anyhow!("winner projection failed: {fault:?}")),
+            };
 
         let action = decide_action_with_candidate_digests(
             &identity,
@@ -8552,6 +8724,19 @@ pub(crate) fn plan_mirror_restore(
     }
 
     storage.close_best_effort_in_place();
+
+    // 对账：每一份读到的 manifest 要么进了某个 identity 组，要么被 `origin_unmapped`
+    // 具名接住，**没有第三条去处**。R-E-67 加了一条 `continue`，而 `continue` 正是
+    // 「无声丢掉一批输入」最常见的入口——把它变成机器判据，就不用指望有人去对两个数。
+    let grouped_manifests: usize = groups.values().map(|indices| indices.len()).sum();
+    if grouped_manifests + report.origin_unmapped.len() != report.manifests_seen {
+        anyhow::bail!(
+            "manifest accounting is off: {} read, {} grouped into identities, {} origin-unmapped",
+            report.manifests_seen,
+            grouped_manifests,
+            report.origin_unmapped.len()
+        );
+    }
     Ok(report)
 }
 
@@ -8754,6 +8939,69 @@ mod e8_dry_run_planner_tests {
             scratch,
             db_path,
             expected_identities: 4,
+        }
+    }
+
+    /// 用**指定 provider** 捕获一条会话。既有的 `capture` 写死 `"codex"`，而这一组用例
+    /// 存在的全部理由就是让 fixture 长出真语料的 provider 形状（R-E-67 条件 3）。
+    fn capture_as(data_dir: &Path, source: &Path, provider: &str) {
+        crate::raw_mirror::capture_source_file(crate::raw_mirror::RawMirrorCaptureInput {
+            data_dir,
+            provider,
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: source,
+            db_links: &[],
+        })
+        .expect("capture source into raw mirror");
+    }
+
+    /// 一条会话、一个 provider 的最小演练场。
+    ///
+    /// 内容仍是 codex 形态的 JSONL —— 本组用例问的是「provider 归一之后这条 manifest 能不能
+    /// 被规划」，不是「三家的解析器各自对不对」；把内容也换掉会同时动两个变量。
+    fn bench_with_provider(provider: &str) -> Bench {
+        bench_with_providers(&[provider])
+    }
+
+    fn bench_with_two_providers(first: &str, second: &str) -> Bench {
+        bench_with_providers(&[first, second])
+    }
+
+    fn bench_with_providers(providers: &[&str]) -> Bench {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("cass-data");
+        let live = tmp.path().join("live");
+        let scratch = tmp.path().join("scratch");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        for (index, provider) in providers.iter().enumerate() {
+            let path = write_session_n(
+                &live,
+                &format!("rollout-provider-{index}.jsonl"),
+                &format!("e8-provider-{index}"),
+                3,
+            );
+            capture_as(&data_dir, &path, provider);
+        }
+
+        // 空候选库：本组问的是归一与记账，不是六类关系。DB 里没有对应会话时每条身份判
+        // `Restore`，计数照样进 `identities_considered`。
+        let db_path = data_dir.join("candidate.sqlite");
+        drop(crate::storage::sqlite::FrankenStorage::open(&db_path).unwrap());
+
+        let expected = providers
+            .iter()
+            .filter(|p| normalize_provider_to_origin(p).is_some())
+            .count();
+        Bench {
+            _tmp: tmp,
+            data_dir,
+            scratch,
+            db_path,
+            expected_identities: expected,
         }
     }
 
@@ -9031,6 +9279,166 @@ mod e8_dry_run_planner_tests {
             "全字段 scope 下两侧必须不等：DB 的 Message 没有 `invocations` 这一格。\
              这条若变绿，说明要么样本没有工具调用（用例空转），要么 DB 真开始存 invocations 了 —— \
              两种都必须有人看一眼"
+        );
+    }
+
+    // ======================================================================
+    // R-E-67 / R-E-68：真语料形态。
+    //
+    // 这一组存在的理由，是这个文件里既有的 fixture **全部**用 `codex` / `claude_code`
+    // 两个 provider —— 都落在 `Origin::parse` 的接受集里。于是六个 E8 用例全绿，而真语料
+    // 里 36.3% 的 manifest 让 planner 一条都判不出来。fixture 造的是代码假设的形状，就只能
+    // 印证假设：`mirror_seal.py` 的 F-7 记着同一个失效模式（0/7640 manifest 带
+    // `blob_checksum`，而它的 fixture 全都带，于是测试永远说不出「一条都没封上」）。
+    // 修法不是多写几个断言，是让 fixture 长出真实语料的形状。
+    // ======================================================================
+
+    /// 九个取值全部来自实测（run root 的 `evidence/find-2-provider-space.txt`，
+    /// 9488 份真 manifest 的 provider 全集），**不是想出来的**。
+    ///
+    /// 表里带上三个正名与两个「定案不映射」的值：前者防归一把恒等映射写坏，后者把
+    /// 「`pi_agent` / `gemini` 不入三族」（Ivan 2026-08-19 确认）钉成机器事实 —— 哪天有人
+    /// 顺手给它们加一条映射，这里会红。
+    #[test]
+    fn r_e_67_provider_normalization_covers_every_measured_value() {
+        let table: [(&str, Option<Origin>); 12] = [
+            // 三个正名，恒等。
+            ("claude_code", Some(Origin::ClaudeCode)),
+            ("codex", Some(Origin::Codex)),
+            ("openclaw", Some(Origin::Openclaw)),
+            // 同一家的另一个 slug 写法（实测 2387 份）。
+            ("claude", Some(Origin::ClaudeCode)),
+            // openclaw 的 agent 实例（实测 609/335/61/16/2/2 份）。
+            ("openclaw/main", Some(Origin::Openclaw)),
+            ("openclaw/wood", Some(Origin::Openclaw)),
+            ("openclaw/javich", Some(Origin::Openclaw)),
+            ("openclaw/justin", Some(Origin::Openclaw)),
+            ("openclaw/alice", Some(Origin::Openclaw)),
+            ("openclaw/clawra", Some(Origin::Openclaw)),
+            // 不属受保护资产三家 —— 永久具名 HOLD，不入三族。
+            ("pi_agent", None),
+            ("gemini", None),
+        ];
+        for (provider, expected) in table {
+            assert_eq!(
+                normalize_provider_to_origin(provider),
+                expected,
+                "provider {provider:?} 的归一结果与实测契约不符"
+            );
+        }
+
+        // 覆盖面自检：清单型断言必须连「查了几条」一起断言，否则一次手滑就把它缩成空门
+        // 而全程绿灯（第五棒 §6.2）。
+        assert_eq!(table.len(), 12, "表被改动过，请同时更新实测出处");
+
+        // 未知 slug 一律不归一，**不猜不兜底**：前缀像而不是的、空串、大小写变体都不放行。
+        for unknown in [
+            "",
+            "openclaw",
+            "openclawx/main",
+            "OpenClaw/main",
+            "Claude",
+            "vscode",
+        ] {
+            if unknown == "openclaw" {
+                continue; // 正名，上表已覆盖
+            }
+            assert_eq!(
+                normalize_provider_to_origin(unknown),
+                None,
+                "未知 slug {unknown:?} 必须不归一"
+            );
+        }
+    }
+
+    /// `openclaw/<agent>` 与 `claude` 两种真实形状进 planner，**必须被规划、不再 bail**。
+    ///
+    /// 断言的是「被规划了」而不只是「没报错」：`identities_considered` 计到，且
+    /// `origin_unmapped` 为空。只断言 `is_ok()` 的话，一个把所有 manifest 都判成
+    /// unmapped 的实现同样能过。
+    #[test]
+    fn r_e_67_real_world_provider_shapes_are_planned_not_rejected() {
+        for provider in ["claude", "openclaw/wood"] {
+            let bench = bench_with_provider(provider);
+            let report = report_of(&bench);
+            assert!(
+                report.origin_unmapped.is_empty(),
+                "provider {provider:?} 应当被归一，却落进了 origin_unmapped"
+            );
+            assert!(
+                report.identities_considered > 0,
+                "provider {provider:?} 一条身份都没进入判定 —— 归一成功但没被规划，\
+                 说明挡在了另一层"
+            );
+            assert_eq!(
+                report.manifests_seen,
+                report.identities_considered + report.origin_unmapped.len(),
+                "manifest 对账：读到的每一份要么成组、要么被具名接住"
+            );
+        }
+    }
+
+    /// 不可归一的 slug **不再打死整轮**：它被具名记下，同一轮里其余身份照常判完。
+    ///
+    /// 这条是 R-E-67 (c) 的机器判据。旧行为下这个用例会在第一份 `pi_agent` manifest 上
+    /// `Err` 出来，一条计数都拿不到。
+    #[test]
+    fn r_e_67_unmapped_slug_is_named_and_does_not_kill_the_run() {
+        let bench = bench_with_two_providers("codex", "pi_agent");
+        let report = report_of(&bench);
+        assert_eq!(
+            report.origin_unmapped.len(),
+            1,
+            "恰有一份 manifest 的 provider 不可归一"
+        );
+        assert_eq!(
+            report.origin_unmapped[0].provider, "pi_agent",
+            "原始 slug 必须原样带出 —— 不带它，看报告的人不知道该去映射什么"
+        );
+        assert!(
+            report.identities_considered > 0,
+            "另一份可归一的 manifest 必须照常被判定：一条读不懂的输入不该打死整轮"
+        );
+        assert_eq!(
+            report.manifests_seen,
+            report.identities_considered + report.origin_unmapped.len()
+        );
+    }
+
+    /// R-E-68：投影出零会话的 blob 判 `projection-empty` HOLD，而不是 bail。
+    ///
+    /// 判据读的是具名的 [`ProjectionFault::UnexpectedConversationCount`]，不是错误文案 ——
+    /// 这条断言同时钉死「会话数为 2 不走这条路」：`is_empty_projection` 只认 0。
+    #[test]
+    fn r_e_68_zero_conversation_projection_is_a_named_hold() {
+        assert!(
+            ProjectionError::from_fault(ProjectionFault::UnexpectedConversationCount { count: 0 })
+                .is_empty_projection(),
+            "零会话必须被判为 projection-empty"
+        );
+        assert!(
+            !ProjectionError::from_fault(ProjectionFault::UnexpectedConversationCount { count: 2 })
+                .is_empty_projection(),
+            "两条会话是另一回事（一个文件里有多条会话），不得走同一条 HOLD"
+        );
+        assert!(
+            !ProjectionError::other("非 UTF-8").is_empty_projection(),
+            "没有具名故障的投影失败不得被当成零会话"
+        );
+        assert_eq!(
+            HoldReason::ProjectionEmpty.as_str(),
+            "projection-empty",
+            "wire 上的字面量是下游解析的契约"
+        );
+        assert_eq!(
+            HoldReason::parse("projection-empty"),
+            Some(HoldReason::ProjectionEmpty),
+            "新增 reason 必须能从 wire 解析回来 —— 只加不解析等于下游读不懂"
+        );
+        assert_eq!(
+            HoldReason::ALL.len(),
+            10,
+            "reason 全集变了就要同时更新解析与分类，这条是覆盖面自检"
         );
     }
 }
