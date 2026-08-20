@@ -7199,7 +7199,9 @@ async fn execute_cli(
                             };
                             serde_json::json!({
                                 "identity": h.identity.to_string(),
-                                "agent": h.identity.origin.agent.as_str(),
+                                // R-E-103：这里报的是**保真的原始 provider 串**（含 openclaw 实例），
+                                // 不是闭世界折叠值 —— 折叠值会让 HOLD 台账认不出是哪个实例。
+                                "agent": h.identity.origin.agent_slug.clone(),
                                 "source_id": h.identity.origin.source_id,
                                 "origin_host": h.identity.origin.origin_host,
                                 "canonical_path": h.identity.canonical_path,
@@ -100652,8 +100654,13 @@ pub fn mirror_relink(options: &MirrorRelinkOptions) -> Result<MirrorRelinkReport
             // **原样保留**：不进 changes，这一份 manifest 本轮不被改写。
             continue;
         };
+        // 分类判定用 `agent`（上面那条 unmapped 降级），**身份匹配用原始 provider 串**
+        // （R3 #1 / R-E-103）：DB 侧 `agents.slug` 存的是连接器契约产的实例 slug
+        // （`openclaw/<inst>`），拿闭世界折叠值 `"openclaw"` 去比永远不相等，
+        // 而 `ProviderUnmapped` 那道闸只认「映射失败」、不认「映射有损」，拦不住它。
+        let _classification_only = agent;
         let key = relink_identity_key(
-            agent.as_str(),
+            &view.provider,
             &view.source_id,
             view.origin_host.as_deref(),
             &view.original_path,
@@ -101167,6 +101174,17 @@ mod mirror_relink_tests {
     /// 造一个隔离小库 + raw mirror：一份 manifest、一条会话、两条消息。
     /// 返回 (tempdir, data_dir, manifest_relative_path, conversation_id, source_file)。
     fn fixture(with_link: bool) -> (TempDir, PathBuf, String, i64, PathBuf) {
+        fixture_as(with_link, "codex", "codex")
+    }
+
+    /// `agent_slug` = DB 侧 `agents.slug`；`provider` = manifest 侧 provider。
+    /// 两者在真实数据里**不一定相等**（openclaw 实例：DB 存 `openclaw/<inst>`，
+    /// manifest 也存 `openclaw/<inst>`，而闭世界枚举会把后者折成 `openclaw`）。
+    fn fixture_as(
+        with_link: bool,
+        agent_slug: &str,
+        provider: &str,
+    ) -> (TempDir, PathBuf, String, i64, PathBuf) {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -101185,8 +101203,8 @@ mod mirror_relink_tests {
         use frankensqlite::compat::{ConnectionExt as _, ParamValue};
         raw.execute_compat(
             "INSERT INTO agents(id, slug, name, kind, created_at, updated_at) \
-             VALUES(1,'codex','Codex','cli',0,0)",
-            &[] as &[ParamValue],
+             VALUES(1, ?1, 'Agent', 'cli', 0, 0)",
+            &[ParamValue::from(agent_slug)],
         )
         .unwrap();
         raw.execute_compat(
@@ -101222,7 +101240,7 @@ mod mirror_relink_tests {
         };
         let record = crate::raw_mirror::capture_source_file(RawMirrorCaptureInput {
             data_dir: &data_dir,
-            provider: "codex",
+            provider,
             source_id: "local",
             origin_kind: "local",
             origin_host: None,
@@ -101232,6 +101250,82 @@ mod mirror_relink_tests {
         .unwrap();
 
         (tmp, data_dir, record.manifest_relative_path, 7, source_file)
+    }
+
+    // ── J1 · R3 #1（R-E-103）：openclaw 实例 slug 不得被折叠成 family ──
+    //
+    // `normalize_provider_to_origin("openclaw/<inst>")` 返回闭世界 family
+    // `Origin::Openclaw`，其 `as_str()` 是 `"openclaw"`；而 DB 侧 `agents.slug` 存的是
+    // 连接器契约产的**实例** slug `openclaw/<inst>`。两边永不相等 → `rebuilt` 为空 →
+    // `--apply` 把这份 manifest **有效的 db_links 清成空**。
+    //
+    // 而那条本该拦住它的 `ProviderUnmapped` 降级**不会触发**——provider 是「映射成功」的。
+    // 闸在，bug 从它旁边走过去。真语料实测受影响 1025/9488 份，且那 1025 份**全部带 db_links**。
+    #[test]
+    fn j1_relink_keeps_backlinks_for_openclaw_instance_manifests() {
+        let (_tmp, data_dir, rel, conv, _src) =
+            fixture_as(true, "openclaw/inst-a", "openclaw/inst-a");
+
+        let before = crate::raw_mirror::manifest_views(&data_dir)
+            .unwrap()
+            .into_iter()
+            .find(|v| v.manifest_relative_path == rel)
+            .unwrap()
+            .db_links;
+        assert_eq!(
+            before.first().and_then(|l| l.conversation_id),
+            Some(conv),
+            "前置断言：盘上必须先有一条指向该会话的有效 backlink"
+        );
+
+        let report = run(&data_dir, false);
+        assert!(
+            report.changes.is_empty(),
+            "身份一致的 manifest 不该被规划任何改动，实得 {:?}",
+            report.changes
+        );
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| matches!(f, MirrorRelinkFinding::ProviderUnmapped { .. })),
+            "provider 是映射得出的，不该走 unmapped 降级 —— 那会掩盖真正的不匹配"
+        );
+    }
+
+    /// family 形态（真语料 1090 份）**不得回归**：DB 侧就是裸 `openclaw` 时照旧匹配。
+    #[test]
+    fn j1_relink_still_matches_the_bare_family_slug() {
+        let (_tmp, data_dir, rel, conv, _src) = fixture_as(true, "openclaw", "openclaw");
+        let before = crate::raw_mirror::manifest_views(&data_dir)
+            .unwrap()
+            .into_iter()
+            .find(|v| v.manifest_relative_path == rel)
+            .unwrap()
+            .db_links;
+        assert_eq!(before.first().and_then(|l| l.conversation_id), Some(conv));
+        assert!(
+            run(&data_dir, false).changes.is_empty(),
+            "family 形态本来就能匹配，修 instance 那一维不得把它弄坏"
+        );
+    }
+
+    /// **反方向臂**：family manifest 不得被错配到 instance 会话上。
+    ///
+    /// 这条不是「修完才绿」的红测试，是**守卫**——它在修前修后都必须绿。
+    /// 留它的理由：本批的修法是「把折叠值换成保真值去比较」，最容易写过头的方向
+    /// 就是把两者当成可互换，于是 family 与 instance 互相错配。
+    #[test]
+    fn j1_family_manifest_must_not_be_matched_to_an_instance_conversation() {
+        let (_tmp, data_dir, _rel, _conv, _src) = fixture_as(false, "openclaw/inst-a", "openclaw");
+        let report = run(&data_dir, false);
+        for change in &report.changes {
+            assert!(
+                change.after.is_empty(),
+                "family manifest 不该被链到 instance 会话上，实得 {:?}",
+                change.after
+            );
+        }
     }
 
     fn run(data_dir: &Path, apply: bool) -> MirrorRelinkReport {

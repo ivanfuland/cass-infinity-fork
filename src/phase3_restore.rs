@@ -36,9 +36,29 @@ use crate::phase3_bundle::Origin;
 /// **写入身份**，要按五段管线复算，归 E5；E4 不做那件事。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct OriginNamespace {
-    pub agent: Origin,
+    /// **manifest 侧的原始 provider 串**，保真到实例（如 `openclaw/<agent>`）。
+    ///
+    /// 这里**刻意不存 [`Origin`]**（R3 #1 / 裁定 R-E-103）。闭世界三族是为**分类可判**
+    /// 存在的：`openclaw/<agent>` 折成 `Openclaw` 让 parser 选得出来。但一旦这个折叠值
+    /// 被拿去当「身份的一维」参与**相等比较**，折叠掉的实例信息就变成**静默的不匹配**——
+    /// manifest 侧交出 `"openclaw"`，而 DB 侧 `agents.slug` 存的是连接器契约产的
+    /// `"openclaw/<inst>"`，两边永不相等。真语料实测 **1025/9488** 份 manifest 落在这个
+    /// 形态上，且它们**全部带着有效 `db_links`**，`relink --apply` 会把它们清空。
+    ///
+    /// **存字符串、按需派生枚举**，而不是两个字段并存：并存就多一个「两者不一致」的缺陷面，
+    /// 而派生让它**构造上不可能**；同时 `PartialEq`/`Ord` 自动只比字符串，
+    /// **枚举从类型上就进不了相等比较**——这比靠纪律约束强一档。
+    pub agent_slug: String,
     pub source_id: String,
     pub origin_host: String,
+}
+
+impl OriginNamespace {
+    /// 闭世界三族，**只用于分类判定**（选 parser、判 admissible），
+    /// **绝不参与任何相等比较**。未知 provider 返回 `None`（不猜、不兜底）。
+    pub fn family(&self) -> Option<Origin> {
+        normalize_provider_to_origin(&self.agent_slug)
+    }
 }
 
 impl fmt::Display for OriginNamespace {
@@ -46,9 +66,7 @@ impl fmt::Display for OriginNamespace {
         write!(
             f,
             "{}@{}:{}",
-            self.agent.as_str(),
-            self.origin_host,
-            self.source_id
+            self.agent_slug, self.origin_host, self.source_id
         )
     }
 }
@@ -631,7 +649,13 @@ pub fn select_winner(
     projector: &dyn MessageSequenceProjector,
 ) -> Result<WinnerOutcome, ProjectionError> {
     // §D.2.0 第二条排除规则先于一切：这些形态无论几个版本都不进 winner 流程（§D.4）。
-    if !admissible_to_version_set(identity.origin.agent, &identity.canonical_path) {
+    // 分类判定用 family（这是闭世界枚举**唯一**该出现的地方）；
+    // 未知 provider 走不到这里（planner 侧已按 R-E-67 具名 HOLD），保守起见按不可进处理。
+    let admissible = identity
+        .origin
+        .family()
+        .is_some_and(|family| admissible_to_version_set(family, &identity.canonical_path));
+    if !admissible {
         return Ok(WinnerOutcome::Hold(HoldRecord {
             identity: identity.clone(),
             reason: HoldReason::WholeFileJsonNoPartialOrder,
@@ -1031,16 +1055,18 @@ pub fn read_override_ledger(
         };
 
         let agent_text = text("agent")?;
-        let Some(agent) = Origin::parse(&agent_text) else {
+        // 台账里记的是**原始 provider 串**（R-E-103）：只要求它能归一到三族（分类可判），
+        // 但存进身份的是原串本身，不是归一结果。
+        if normalize_provider_to_origin(&agent_text).is_none() {
             return Err(LedgerError::Malformed {
                 line,
-                detail: format!("agent {agent_text:?} 不在三值内"),
+                detail: format!("agent {agent_text:?} 归一不到三族"),
             });
-        };
+        }
         let entry = OverrideEntry {
             identity: RestoreIdentity {
                 origin: OriginNamespace {
-                    agent,
+                    agent_slug: agent_text,
                     source_id: text("source_id")?,
                     origin_host: text("origin_host")?,
                 },
@@ -1153,7 +1179,7 @@ mod e4_winner_and_decision_tests {
 
     fn origin(agent: Origin, host: &str) -> OriginNamespace {
         OriginNamespace {
-            agent,
+            agent_slug: agent.as_str().to_string(),
             source_id: format!("src-{host}"),
             origin_host: host.to_string(),
         }
@@ -3304,7 +3330,7 @@ mod e5_materialization_tests {
 
     fn ns() -> OriginNamespace {
         OriginNamespace {
-            agent: Origin::ClaudeCode,
+            agent_slug: Origin::ClaudeCode.as_str().to_string(),
             source_id: "local".to_owned(),
             origin_host: "h1".to_owned(),
         }
@@ -4651,7 +4677,7 @@ mod e5_p30_blob_read_tests {
     fn e5_p30_emits_a_manifest_reference_missing_hold_in_the_input_corruption_class() {
         let identity = RestoreIdentity {
             origin: OriginNamespace {
-                agent: Origin::Codex,
+                agent_slug: Origin::Codex.as_str().to_string(),
                 source_id: "local".to_owned(),
                 origin_host: "fixture-host".to_owned(),
             },
@@ -4754,7 +4780,7 @@ mod e5_p30_blob_read_tests {
 
             let identity = RestoreIdentity {
                 origin: OriginNamespace {
-                    agent: Origin::Codex,
+                    agent_slug: Origin::Codex.as_str().to_string(),
                     source_id: view.source_id.clone(),
                     origin_host: view.origin_host.clone().unwrap_or_else(|| "local".into()),
                 },
@@ -5309,6 +5335,28 @@ pub(crate) struct ReplaceCommitOutcome {
 
 /// replace 分支的 `operation` 取值。**字面量集中在一处**，避免写 receipt 与查 receipt
 /// 两侧各写一份字符串。
+/// 幂等 key 的**版本前缀**。key 的构成一变就必须换代（R-E-103）——
+/// 不换代的话，旧 receipt 与新算出来的 key 对不上会被读成「这条还没做过」而重做一遍，
+/// 或者反过来被 marker 的逐项比对读成「候选被人动过」（R-E-91 立的那条理由）。
+pub(crate) const IDEMPOTENCY_KEY_VERSION: &str = "v2";
+
+/// 把一串分量拼成**无歧义**的 key 片段：每段前置它的字节长度。
+///
+/// R3 #2：原来的构成是 `{OP}:{snapshot_root}:{agent}@{host}:{source_id} {path}`，
+/// 分隔符不转义也不框长度，于是 `(host="a:b", source_id="c")` 与
+/// `(host="a", source_id="b:c")` 拼出同一个串 —— 两条不同身份共用一个幂等 key，
+/// 一条的 receipt 会把另一条短路掉。带长度框之后这个面从构成上消失。
+pub(crate) fn framed_key_parts(parts: &[&str]) -> String {
+    let mut out = String::new();
+    for part in parts {
+        out.push_str(&part.len().to_string());
+        out.push(':');
+        out.push_str(part);
+        out.push('|');
+    }
+    out
+}
+
 pub(crate) const REPLACE_OPERATION: &str = "mirror-restore-replace";
 
 /// 幂等 key = `{operation}:{snapshot_root}:{identity}`。
@@ -5320,7 +5368,16 @@ pub(crate) const REPLACE_OPERATION: &str = "mirror-restore-replace";
 /// `RestoreIdentity` 的 `Display` 已经把 `{agent}@{host}:{source_id} {canonical_path}`
 /// 拼好，这里直接用它，不在第二处重拼身份的字符串形式。
 pub(crate) fn replace_idempotency_key(snapshot_root: &str, identity: &RestoreIdentity) -> String {
-    format!("{REPLACE_OPERATION}:{snapshot_root}:{identity}")
+    format!(
+        "{REPLACE_OPERATION}:{IDEMPOTENCY_KEY_VERSION}:{}",
+        framed_key_parts(&[
+            snapshot_root,
+            &identity.origin.agent_slug,
+            &identity.origin.origin_host,
+            &identity.origin.source_id,
+            &identity.canonical_path,
+        ])
+    )
 }
 
 /// 在**调用方给的事务**里跑完 replace 的整条序列。
@@ -5413,7 +5470,16 @@ pub(crate) fn restore_new_idempotency_key(
     snapshot_root: &str,
     identity: &RestoreIdentity,
 ) -> String {
-    format!("{RESTORE_NEW_OPERATION}:{snapshot_root}:{identity}")
+    format!(
+        "{RESTORE_NEW_OPERATION}:{IDEMPOTENCY_KEY_VERSION}:{}",
+        framed_key_parts(&[
+            snapshot_root,
+            &identity.origin.agent_slug,
+            &identity.origin.origin_host,
+            &identity.origin.source_id,
+            &identity.canonical_path,
+        ])
+    )
 }
 
 /// `commit_restore_new` 的入参。**没有 `conversation_id`** —— 这一支的会话还不存在，
@@ -5616,7 +5682,7 @@ mod e6_replace_commit_tests {
     fn identity() -> RestoreIdentity {
         RestoreIdentity {
             origin: OriginNamespace {
-                agent: Origin::Codex,
+                agent_slug: Origin::Codex.as_str().to_string(),
                 source_id: "local".into(),
                 origin_host: "fixture-host".into(),
             },
@@ -5951,7 +6017,7 @@ mod e6_replace_commit_tests {
         for (agent, slug) in ids {
             let identity = RestoreIdentity {
                 origin: OriginNamespace {
-                    agent,
+                    agent_slug: agent.as_str().to_string(),
                     source_id: "local".into(),
                     origin_host: "fixture-host".into(),
                 },
@@ -6726,7 +6792,7 @@ fn conversation_ids_for_identity(
     let mut params = vec![
         ParamValue::from(identity.canonical_path.as_str()),
         ParamValue::from(identity.origin.source_id.as_str()),
-        ParamValue::from(identity.origin.agent.as_str()),
+        ParamValue::from(identity.origin.agent_slug.as_str()),
     ];
     if let Some(host) = stored_host.as_deref() {
         params.push(ParamValue::from(host));
@@ -6740,11 +6806,13 @@ fn conversation_ids_for_identity(
 pub(crate) fn restore_identity_from_view(
     view: &crate::raw_mirror::RawMirrorManifestView,
 ) -> anyhow::Result<RestoreIdentity> {
-    let agent = normalize_provider_to_origin(&view.provider)
+    // 仍然要求 provider 能归一 —— 那是**分类可判**的前提（未知 slug 具名 HOLD，R-E-67）。
+    // 但身份里存的是**原始串**，不是归一结果（R-E-103）。
+    normalize_provider_to_origin(&view.provider)
         .ok_or_else(|| anyhow::anyhow!("unknown provider in manifest: {}", view.provider))?;
     Ok(RestoreIdentity {
         origin: OriginNamespace {
-            agent,
+            agent_slug: view.provider.clone(),
             source_id: view.source_id.clone(),
             origin_host: view
                 .origin_host
@@ -7243,7 +7311,7 @@ fn restore_drive(
 /// 这个常量存在的理由不是兼容性（rehearsal 之前没有生产 journal），
 /// 而是**错误的可读性**：没有它，一份旧 journal 会死在 serde 的字段解析上，
 /// 那是错误的层在说话——操作者会去查文件损坏，而真相是版本不对。
-pub(crate) const RESTORE_JOURNAL_SCHEMA_VERSION: i64 = 2;
+pub(crate) const RESTORE_JOURNAL_SCHEMA_VERSION: i64 = 3;
 
 pub(crate) const W1_COMMIT_MARKER_SCHEMA: &str = "marker.w1-commit";
 /// **3**（R-E-91）：字段全集没变，变的是 `mirror_identity.manifest_root` 的**派生定义**
@@ -7260,7 +7328,7 @@ pub(crate) const W1_COMMIT_MARKER_SCHEMA: &str = "marker.w1-commit";
 /// 一份没有这两格的 marker 会被读成「零 HOLD」，而那恰好是本次要杜绝的谎。
 /// 闭世界解析对缺字段报 `MissingField`，所以升版之后旧 marker **必然被拒**，
 /// 这是有意的（同 R-E-55 的反滥用形状）。
-pub(crate) const W1_COMMIT_MARKER_SCHEMA_VERSION: i64 = 3;
+pub(crate) const W1_COMMIT_MARKER_SCHEMA_VERSION: i64 = 4;
 // ⚠ staged landing 记账（同 E5/E6 惯例，不是把死代码放行）：非测试构建里它的调用方
 // 要到 **E8 接 `mirror-restore` CLI** 那一刻才出现（解析 marker 落点）。判据仍是
 // 「删掉 allow 之后 clippy 不报 never-used」，移除义务挂在 E8 验收面。
@@ -8260,9 +8328,19 @@ mod e7_restore_journal_tests {
     /// 用**真的** `capture_source_file` 造 mirror（与 E5 同一条纪律：不手写 manifest JSON，
     /// 手写等于对磁盘格式造第二定义，且格式漂移后 fixture 会一直绿着）。
     fn capture(data_dir: &Path, source: &Path) -> crate::raw_mirror::RawMirrorCaptureRecord {
+        capture_as(data_dir, source, "codex")
+    }
+
+    /// 带 provider 的版本。openclaw 的实例形态（`openclaw/<inst>`）是 R3 #1 的现场，
+    /// 而闭世界枚举会把它折成 family —— 夹具必须能造出这个形态才谈得上判据。
+    fn capture_as(
+        data_dir: &Path,
+        source: &Path,
+        provider: &str,
+    ) -> crate::raw_mirror::RawMirrorCaptureRecord {
         crate::raw_mirror::capture_source_file(crate::raw_mirror::RawMirrorCaptureInput {
             data_dir,
-            provider: "codex",
+            provider,
             source_id: "local",
             origin_kind: "local",
             origin_host: None,
@@ -8540,7 +8618,7 @@ mod e7_restore_journal_tests {
     fn identity_for(source_path: &str, source_id: &str, origin_host: &str) -> RestoreIdentity {
         RestoreIdentity {
             origin: OriginNamespace {
-                agent: Origin::Codex,
+                agent_slug: Origin::Codex.as_str().to_string(),
                 source_id: source_id.to_string(),
                 origin_host: origin_host.to_string(),
             },
@@ -9167,6 +9245,206 @@ mod e7_restore_journal_tests {
         assert!(
             run(TIGHT_KIB).success(),
             "地址空间卡在 2 GiB、文件 4 GiB：流式摘要必须过得去，整份读进内存必然过不去"
+        );
+    }
+
+    // ── J1 · R3 #2：Display 串不得再当键用 ─────────────────────────────
+    //
+    // 原来的构成是 `{agent}@{host}:{source_id} {path}`，分隔符**既不转义也不带长度框**。
+    // 于是 `(host="a:b", source_id="c")` 与 `(host="a", source_id="b:c")` 拼出**同一个串**：
+    // 分组时两条身份会被并成一条（后者的 manifest 进前者的版本集合），
+    // 幂等 key 也会撞车——一条的 receipt 把另一条短路掉。
+    //
+    // 真语料上目前不可达（实测 `source_id`/`origin_host` 含空格或冒号的行 0），
+    // 但那两个字段的取值来自**外部**（远端 source 命名），不该靠「现在没人这么起名」立着。
+    #[test]
+    fn j1_ambiguous_display_strings_do_not_collide_as_keys() {
+        let a = RestoreIdentity {
+            origin: OriginNamespace {
+                agent_slug: "codex".to_string(),
+                source_id: "c".to_string(),
+                origin_host: "a:b".to_string(),
+            },
+            canonical_path: "/x".to_string(),
+        };
+        let b = RestoreIdentity {
+            origin: OriginNamespace {
+                agent_slug: "codex".to_string(),
+                source_id: "b:c".to_string(),
+                origin_host: "a".to_string(),
+            },
+            canonical_path: "/x".to_string(),
+        };
+
+        assert_eq!(
+            a.to_string(),
+            b.to_string(),
+            "前置断言：这两条身份的 Display 串必须真的相同 —— 否则本例证不到「键会撞」"
+        );
+        assert_ne!(a, b, "它们是两条不同的身份（结构上不等）");
+
+        for op in ["snap-1", "snap-2"] {
+            assert_ne!(
+                restore_new_idempotency_key(op, &a),
+                restore_new_idempotency_key(op, &b),
+                "新建支的幂等 key 不得因 Display 撞车而相同"
+            );
+            assert_ne!(
+                replace_idempotency_key(op, &a),
+                replace_idempotency_key(op, &b),
+                "replace 支同理"
+            );
+        }
+
+        // 阳性对照：同一条身份的 key 必须稳定可复现，否则「不撞」可以靠随机达成。
+        assert_eq!(
+            restore_new_idempotency_key("snap-1", &a),
+            restore_new_idempotency_key("snap-1", &a)
+        );
+    }
+
+    // ── J1 · R3 #1：候选查询这一路 ────────────────────────────────────
+    //
+    // 身份的 agent 维带的是闭世界折叠值 `"openclaw"`，而 DB 侧 `agents.slug` 是
+    // `"openclaw/<inst>"` —— 于是 openclaw 实例的会话**永远查不到候选**，
+    // 一律被判成 `RestoreNew`，重复插入。
+    #[test]
+    fn j1_candidate_lookup_finds_an_openclaw_instance_conversation() {
+        let d = drill();
+        let path = "/home/u/.openclaw/inst-a/sessions/s.jsonl";
+        let id = plant_decoy_conversation(&d, &d.new_manifest_id, |conv| {
+            conv.source_path = std::path::PathBuf::from(path);
+            conv.agent_slug = "openclaw/inst-a".to_string();
+            conv.external_id = Some("j1-openclaw-inst".to_string());
+            conv.messages[0].content.push_str(" -- openclaw instance");
+        });
+
+        let mut storage =
+            crate::storage::sqlite::FrankenStorage::open_readonly(&d.db_path).unwrap();
+        let identity = RestoreIdentity {
+            origin: OriginNamespace {
+                // **实例形态**，不是 `Origin::Openclaw.as_str()`（那是 family `"openclaw"`）。
+                // 批量改名时我一度把这里也机械换成了 family 值，用例当场红 —— 那正是本条要防的错。
+                agent_slug: "openclaw/inst-a".to_string(),
+                source_id: "local".to_string(),
+                origin_host: RESTORE_LOCAL_ORIGIN_HOST.to_string(),
+            },
+            canonical_path: path.to_string(),
+        };
+        let hits = conversation_ids_for_identity(&storage, &identity).unwrap();
+        storage.close_best_effort_in_place();
+
+        assert_eq!(
+            hits,
+            vec![id],
+            "openclaw 实例的会话必须查得到 —— 折叠成 family 之后 a.slug 绑的是 \"openclaw\"，\
+             而库里存的是 \"openclaw/inst-a\"，于是永远查不到、判成 RestoreNew 重复插入"
+        );
+    }
+
+    // ── J1 · R3 #1：publish backlink 这一路 ───────────────────────────
+    //
+    // 与上一条同根。H1 之前 publish 只绑 `source_path`，openclaw 实例靠路径**能**查到；
+    // H1 把整条身份绑上去之后，agent 维带着折叠值参与匹配，**backlink 从正确变成 None**。
+    // 这一条是我 H1 引入的回归，用例锁它。
+    #[test]
+    fn j1_publish_backlink_resolves_for_an_openclaw_instance_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("cass-data");
+        let live = tmp.path().join("live");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let src = write_session(&live, "rollout-j1-openclaw.jsonl", "j1-openclaw");
+        let rec = capture_as(&data_dir, &src, "openclaw/inst-a");
+        let views = crate::raw_mirror::manifest_views(&data_dir).unwrap();
+        let view = views
+            .iter()
+            .find(|v| v.manifest_id == rec.manifest_id)
+            .expect("manifest 必须在 view 列表里");
+
+        // 库里种一条**身份完全对得上**的会话：同路径、同 source_id、agent slug 是实例形态。
+        let db_path = data_dir.join("j1.sqlite");
+        let storage = crate::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&crate::model::types::Agent {
+                id: None,
+                slug: "openclaw/inst-a".into(),
+                name: "openclaw/inst-a".into(),
+                version: None,
+                kind: crate::model::types::AgentKind::Cli,
+            })
+            .unwrap();
+        let conv = crate::model::types::Conversation {
+            id: None,
+            agent_slug: "openclaw/inst-a".into(),
+            workspace: None,
+            external_id: Some("j1-openclaw-conv".into()),
+            title: None,
+            source_path: std::path::PathBuf::from(&view.original_path),
+            started_at: Some(1),
+            ended_at: Some(2),
+            approx_tokens: None,
+            metadata_json: serde_json::json!({}),
+            messages: vec![crate::model::types::Message {
+                id: None,
+                idx: 0,
+                role: crate::model::types::MessageRole::User,
+                author: None,
+                created_at: Some(1),
+                content: "j1 openclaw body".into(),
+                extra_json: serde_json::json!({}),
+                snippets: Vec::new(),
+            }],
+            source_id: "local".into(),
+            origin_host: None,
+        };
+        storage
+            .insert_conversations_batched(&[(agent_id, None, &conv)])
+            .unwrap();
+        let expected: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT id FROM conversations WHERE external_id = ?1",
+                &[ParamValue::from("j1-openclaw-conv")],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        drop(storage);
+
+        let plan = RestoreRunPlan {
+            operation_id: "j1-op".into(),
+            data_dir: data_dir.clone(),
+            scratch_dir: tmp.path().join("scratch"),
+            db_path: db_path.clone(),
+            marker_path: db_path.parent().unwrap().join(W1_COMMIT_MARKER_FILENAME),
+            snapshot_root: SNAPSHOT_ROOT.into(),
+            generation: GENERATION.into(),
+            holds_count: 0,
+            origin_unmapped_count: 0,
+            planned: vec![RestorePlanItem {
+                manifest_id: rec.manifest_id.clone(),
+                action: PlannedAction::RestoreNew,
+            }],
+        };
+        let mut journal = restore_journal_from_plan(plan);
+        let mut outcome = RestoreRunOutcome::default();
+        restore_publish_manifests(&mut journal, &tmp_journal_path(), &mut outcome).unwrap();
+
+        let linked = crate::raw_mirror::manifest_views(&data_dir)
+            .unwrap()
+            .into_iter()
+            .find(|v| v.manifest_id == rec.manifest_id)
+            .unwrap()
+            .db_links
+            .first()
+            .and_then(|l| l.conversation_id);
+        assert_eq!(
+            linked,
+            Some(expected),
+            "openclaw 实例 manifest 的 backlink 必须解析得出 —— 这条在 H1 之前是对的"
+        );
+        assert_eq!(
+            outcome.published_without_backlink, 0,
+            "身份对得上就不该计进「发布了但没配上回链」那一格"
         );
     }
 
@@ -10175,8 +10453,8 @@ mod e7_restore_journal_tests {
         assert_eq!(err.code(), "E-SCHEMA-MISMATCH");
         let text = err.to_string();
         assert!(
-            text.contains("@2") && text.contains('3'),
-            "错误文本必须同时带见到的（2）与需要的（3）两个版本；实得 {text}"
+            text.contains("@2") && text.contains('4'),
+            "错误文本必须同时带见到的（2）与需要的（4）两个版本；实得 {text}"
         );
     }
 
@@ -11139,7 +11417,11 @@ pub(crate) fn plan_mirror_restore(
     // 同一 identity 可能有多份 manifest（同一路径被捕获过多次）—— 那是 §5.2.3 的版本集合，
     // 必须先聚起来再选 winner，逐 manifest 独立判会把「同一条会话的两个版本」
     // 当成两条身份分别计数。
-    let mut groups: std::collections::BTreeMap<String, Vec<usize>> =
+    // R3 #2 / R-E-103：键用 `RestoreIdentity` **本体**，不用它的 Display 串。
+    // 那个串是 `{agent}@{host}:{source_id} {path}`，分隔符既不转义也不带长度框，
+    // 于是含 `:` 或空格的合法取值可以撞成同一个键、把两条身份并成一条。
+    // 结构化元组没有这个面（`RestoreIdentity` 已 derive `Ord`/`Eq`）。
+    let mut groups: std::collections::BTreeMap<RestoreIdentity, Vec<usize>> =
         std::collections::BTreeMap::new();
     let mut report = MirrorRestorePlanReport {
         manifests_seen: views.len(),
@@ -11159,7 +11441,7 @@ pub(crate) fn plan_mirror_restore(
         // 归一成功才走这里，所以此处的 `?` 只可能被将来新增的失败原因触发，
         // 而不是被 provider ——「已知会发生的事」在上面被具名接住了。
         let identity = restore_identity_from_view(view)?;
-        groups.entry(identity.to_string()).or_default().push(index);
+        groups.entry(identity.clone()).or_default().push(index);
     }
 
     // FIND-5 mitigation (R-E-71'): reopen the read-only candidate handle every
@@ -11201,10 +11483,20 @@ pub(crate) fn plan_mirror_restore(
         }
         let head = &views[indices[0]];
         let identity = restore_identity_from_view(head)?;
+        // 投影器要的是**分类**（选哪家 pin parser），不是身份 —— 用 family。
+        let Some(family) = identity.origin.family() else {
+            // provider 归一不出三族：planner 侧本就按 R-E-67 具名 HOLD，这里兜同一档，
+            // 不让一条读不懂的 provider 把整轮打死。
+            report.holds.push(hold_for_manifest_reference_missing(
+                identity.clone(),
+                Vec::new(),
+            ));
+            continue;
+        };
         let projector = SealedMessageProjector {
             scratch_root: &options.scratch_dir,
             canonical_original_path: &identity.canonical_path,
-            agent: identity.origin.agent,
+            agent: family,
             sealed_source_size_bytes: head.source_size_bytes,
         };
         // winner 选择仍按投影侧全字段口径（mirror 两侧都有源字节，没有理由降口径）。
@@ -11212,7 +11504,7 @@ pub(crate) fn plan_mirror_restore(
         let comparable = CandidateComparableProjector(SealedMessageProjector {
             scratch_root: &options.scratch_dir,
             canonical_original_path: &identity.canonical_path,
-            agent: identity.origin.agent,
+            agent: family,
             sealed_source_size_bytes: head.source_size_bytes,
         });
 
