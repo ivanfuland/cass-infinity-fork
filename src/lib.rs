@@ -7096,9 +7096,7 @@ async fn execute_cli(
                                 fail("mirror_restore_recover_failed", err.to_string())
                             })?;
                         let state = crate::phase3_restore::restore_journal_read(&journal_path)
-                            .map_err(|err| {
-                                fail("mirror_restore_recover_failed", err.to_string())
-                            })?
+                            .map_err(|err| fail("mirror_restore_recover_failed", err.to_string()))?
                             .map(|j| format!("{:?}", j.state))
                             .unwrap_or_else(|| "missing".to_string());
                         if json {
@@ -100035,44 +100033,44 @@ mod mirror_restore_deep_verify_flag_tests {
         // 这个 CLI 的 clap 命令树大到能把默认测试线程栈撑爆（实测 stack overflow）。
         // 与被测行为无关，纯环境事实 —— 与仓里既有的 clap 解析测试同一处置。
         run_on_large_stack(|| {
-        let base = [
-            "cass",
-            "mirror-restore",
-            "--candidate-db",
-            "/tmp/x.sqlite",
-            "--scratch",
-            "/tmp/scratch",
-            "--snapshot-root",
-            "root-1",
-        ];
+            let base = [
+                "cass",
+                "mirror-restore",
+                "--candidate-db",
+                "/tmp/x.sqlite",
+                "--scratch",
+                "/tmp/scratch",
+                "--snapshot-root",
+                "root-1",
+            ];
 
-        let mut lone: Vec<&str> = base.to_vec();
-        lone.push("--deep-verify");
-        Cli::try_parse_from(lone).expect_err("--deep-verify 不带 --qualify 必须被拒");
+            let mut lone: Vec<&str> = base.to_vec();
+            lone.push("--deep-verify");
+            Cli::try_parse_from(lone).expect_err("--deep-verify 不带 --qualify 必须被拒");
 
-        let mut paired: Vec<&str> = base.to_vec();
-        paired.push("--qualify");
-        paired.push("--deep-verify");
-        let cli = Cli::try_parse_from(paired).expect("--qualify --deep-verify 必须解析得了");
-        let Some(Commands::MirrorRestore {
-            qualify,
-            deep_verify,
-            ..
-        }) = cli.command
-        else {
-            panic!("expected mirror-restore command");
-        };
-        assert!(qualify && deep_verify);
+            let mut paired: Vec<&str> = base.to_vec();
+            paired.push("--qualify");
+            paired.push("--deep-verify");
+            let cli = Cli::try_parse_from(paired).expect("--qualify --deep-verify 必须解析得了");
+            let Some(Commands::MirrorRestore {
+                qualify,
+                deep_verify,
+                ..
+            }) = cli.command
+            else {
+                panic!("expected mirror-restore command");
+            };
+            assert!(qualify && deep_verify);
 
-        // 阳性对照：不给 `--deep-verify` 时它必须是 false —— 否则上面那条断言
-        // 在一个恒为 true 的字段上也会通过。
-        let mut only_qualify: Vec<&str> = base.to_vec();
-        only_qualify.push("--qualify");
-        let cli = Cli::try_parse_from(only_qualify).expect("只给 --qualify 必须解析得了");
-        let Some(Commands::MirrorRestore { deep_verify, .. }) = cli.command else {
-            panic!("expected mirror-restore command");
-        };
-        assert!(!deep_verify, "深度档必须是显式 opt-in");
+            // 阳性对照：不给 `--deep-verify` 时它必须是 false —— 否则上面那条断言
+            // 在一个恒为 true 的字段上也会通过。
+            let mut only_qualify: Vec<&str> = base.to_vec();
+            only_qualify.push("--qualify");
+            let cli = Cli::try_parse_from(only_qualify).expect("只给 --qualify 必须解析得了");
+            let Some(Commands::MirrorRestore { deep_verify, .. }) = cli.command else {
+                panic!("expected mirror-restore command");
+            };
+            assert!(!deep_verify, "深度档必须是显式 opt-in");
         });
     }
 }
@@ -100748,7 +100746,9 @@ pub fn relink_journal_read(path: &Path) -> Result<Option<RelinkJournal>> {
     // 旧 journal 照样不能用，只是死得明白，且错误里同时给出**见到的**与**需要的**版本。
     let probe: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|e| anyhow::anyhow!("relink journal at {} is not JSON: {e}", path.display()))?;
-    let got = probe.get("schema_version").and_then(serde_json::Value::as_i64);
+    let got = probe
+        .get("schema_version")
+        .and_then(serde_json::Value::as_i64);
     match got {
         Some(v) if v == RELINK_JOURNAL_SCHEMA_VERSION => {}
         other => {
@@ -101213,7 +101213,10 @@ mod mirror_relink_tests {
         let (worst, saw) = worst_non_owner_bits_during(&dir, || {
             relink_journal_write(&path, &journal).unwrap();
         });
-        assert!(saw, "前置断言：观察线程必须看到过新文件，否则本用例没有分辨力");
+        assert!(
+            saw,
+            "前置断言：观察线程必须看到过新文件，否则本用例没有分辨力"
+        );
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600,
@@ -101237,7 +101240,10 @@ mod mirror_relink_tests {
         let (worst, saw) = worst_non_owner_bits_during(&dir, || {
             crate::write_private_file(&path, &payload).unwrap();
         });
-        assert!(saw, "前置断言：观察线程必须看到过新文件，否则本用例没有分辨力");
+        assert!(
+            saw,
+            "前置断言：观察线程必须看到过新文件，否则本用例没有分辨力"
+        );
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600,
@@ -101288,7 +101294,9 @@ mod mirror_relink_tests {
             control
                 .iter()
                 .any(|(n, _)| n.contains("positive-control.txt"))
-                && !before.iter().any(|(n, _)| n.contains("positive-control.txt")),
+                && !before
+                    .iter()
+                    .any(|(n, _)| n.contains("positive-control.txt")),
             "阳性对照失败：快照抓不到刚写进去的文件，下面的结论作废"
         );
 
@@ -101349,8 +101357,7 @@ mod mirror_relink_tests {
         let manifest_path = data_dir.join("raw-mirror").join("v1").join(rel);
         let raw = std::fs::read_to_string(&manifest_path).unwrap();
         let mut json: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        json["original_path"] =
-            serde_json::Value::String("/tampered/by/someone-else.jsonl".into());
+        json["original_path"] = serde_json::Value::String("/tampered/by/someone-else.jsonl".into());
         std::fs::write(&manifest_path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
         manifest_path
     }
@@ -101447,10 +101454,9 @@ mod mirror_relink_tests {
 
         let dry = run(&data_dir, false);
         assert!(
-            dry.findings.iter().any(|f| matches!(
-                f,
-                MirrorRelinkFinding::ManifestIdentityUnrecorded { .. }
-            )),
+            dry.findings
+                .iter()
+                .any(|f| matches!(f, MirrorRelinkFinding::ManifestIdentityUnrecorded { .. })),
             "前置断言：必须落在 Unrecorded 档"
         );
         assert_eq!(
@@ -101474,7 +101480,9 @@ mod mirror_relink_tests {
         let after: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
         assert!(
-            after.get("manifest_blake3").is_none_or(serde_json::Value::is_null),
+            after
+                .get("manifest_blake3")
+                .is_none_or(serde_json::Value::is_null),
             "写入不得给一份从未被校验过的 manifest 补记自摘要；实得 {:?}",
             after.get("manifest_blake3")
         );
@@ -101523,8 +101531,8 @@ mod mirror_relink_tests {
             "前置断言：盘上必须有 db_links，否则「有没有被抹掉」无从分辨"
         );
 
-        let err = relink_drive_manifest_phase(&mut journal, &journal_path)
-            .expect_err("陈旧计划必须被拒");
+        let err =
+            relink_drive_manifest_phase(&mut journal, &journal_path).expect_err("陈旧计划必须被拒");
         let text = format!("{err:#}");
         assert!(
             text.contains("E-MANIFEST-CHANGED-SINCE-PLAN"),

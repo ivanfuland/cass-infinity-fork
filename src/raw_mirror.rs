@@ -3185,8 +3185,7 @@ mod tests {
     }
 
     fn f6_links_on_disk(data_dir: &Path, rel: &str) -> Vec<RawMirrorDbLink> {
-        let path =
-            raw_mirror_manifest_path_from_relative(&raw_mirror_root(data_dir), rel).unwrap();
+        let path = raw_mirror_manifest_path_from_relative(&raw_mirror_root(data_dir), rel).unwrap();
         read_raw_mirror_manifest(&path).unwrap().db_links
     }
 
@@ -3208,7 +3207,11 @@ mod tests {
         merge_manifest_db_links(&data_dir, &rel, std::slice::from_ref(&link_b))
             .expect("并发索引器的 merge");
         let mid = f6_links_on_disk(&data_dir, &rel);
-        assert_eq!(mid.len(), 2, "前置断言：B 必须真的并进去了，否则本用例没有分辨力");
+        assert_eq!(
+            mid.len(),
+            2,
+            "前置断言：B 必须真的并进去了，否则本用例没有分辨力"
+        );
 
         // ③ 施加陈旧计划：必须一行都不写，并如实回报「前提变了」。
         let outcome =

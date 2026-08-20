@@ -6241,7 +6241,6 @@ mod e6_replace_commit_tests {
     }
 }
 
-
 // ===========================================================================
 // E7 · restore 的七态 journal 与恢复器（plan Task E7 Step 1/2）
 //
@@ -6649,7 +6648,9 @@ fn restore_project_plan_item(
         blob: &blob,
     };
     match project_sealed_source(&journal.scratch_dir, &sealed, &provenance) {
-        Ok(SealedProjection::Projected(conv)) => Ok(crate::indexer::persist::map_to_internal(&conv)),
+        Ok(SealedProjection::Projected(conv)) => {
+            Ok(crate::indexer::persist::map_to_internal(&conv))
+        }
         Ok(other) => anyhow::bail!("sealed projection produced no conversation: {other:?}"),
         Err(err) => anyhow::bail!("sealed projection failed: {err:?}"),
     }
@@ -6669,7 +6670,9 @@ fn restore_run_db_phase(
         let view = views
             .iter()
             .find(|v| v.manifest_id == item.manifest_id)
-            .ok_or_else(|| anyhow::anyhow!("planned manifest {} not in mirror", item.manifest_id))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("planned manifest {} not in mirror", item.manifest_id)
+            })?;
         let identity = restore_identity_from_view(view)?;
         let key = restore_idempotency_key_for(item.action, &journal.snapshot_root, &identity);
 
@@ -6857,14 +6860,18 @@ fn restore_publish_manifests(
         let view = views
             .iter()
             .find(|v| v.manifest_id == item.manifest_id)
-            .ok_or_else(|| anyhow::anyhow!("planned manifest {} not in mirror", item.manifest_id))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("planned manifest {} not in mirror", item.manifest_id)
+            })?;
         if journal.published.contains(&view.manifest_relative_path) {
             continue;
         }
         let conversation_id = match item.action {
             PlannedAction::Replace { conversation_id } => Some(conversation_id),
             PlannedAction::RestoreNew => {
-                use frankensqlite::compat::{ConnectionExt as _, OptionalExtension as _, RowExt as _};
+                use frankensqlite::compat::{
+                    ConnectionExt as _, OptionalExtension as _, RowExt as _,
+                };
                 storage
                     .raw()
                     .query_row_map(
@@ -6921,7 +6928,9 @@ fn restore_verify_closure(journal: &RestoreJournal) -> anyhow::Result<()> {
         let view = views
             .iter()
             .find(|v| v.manifest_id == item.manifest_id)
-            .ok_or_else(|| anyhow::anyhow!("planned manifest {} not in mirror", item.manifest_id))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("planned manifest {} not in mirror", item.manifest_id)
+            })?;
         if !journal.published.contains(&view.manifest_relative_path) {
             anyhow::bail!(
                 "closure verification failed: manifest {} not published",
@@ -6971,7 +6980,11 @@ fn restore_drive(
 
     if journal.state.rank() < RestoreJournalState::ReadinessInvalidated.rank() {
         restore_invalidate_readiness(journal)?;
-        restore_journal_advance(journal, journal_path, RestoreJournalState::ReadinessInvalidated)?;
+        restore_journal_advance(
+            journal,
+            journal_path,
+            RestoreJournalState::ReadinessInvalidated,
+        )?;
         restore_pause_if_requested("readiness-invalidated");
     }
     if journal.state.rank() < RestoreJournalState::EmbeddingsInvalidated.rank() {
@@ -7003,7 +7016,6 @@ fn restore_drive(
     write_w1_commit_marker(&marker, &journal.marker_path)?;
     Ok(outcome)
 }
-
 
 // ===========================================================================
 // E7 Step 3 · W1 commit marker 与**解析级**资格门
@@ -7121,14 +7133,31 @@ pub(crate) enum W1MarkerError {
     TypeMismatch(String),
     /// **两个版本都带**（同 R-E-88 给 restore journal 立的口径）：只报「见到的」，
     /// 操作者不知道该升到哪一版；两个都给，`E-SCHEMA-MISMATCH` 才是可行动的错误。
-    SchemaMismatch { got: String, expected: String },
-    JournalNotTerminal { detail: String },
-    ClosureNotPass { got: String },
-    IdentityMismatch { field: String },
-    ReceiptMissing { key: String },
-    GenerationMismatch { marker: String, db: String },
+    SchemaMismatch {
+        got: String,
+        expected: String,
+    },
+    JournalNotTerminal {
+        detail: String,
+    },
+    ClosureNotPass {
+        got: String,
+    },
+    IdentityMismatch {
+        field: String,
+    },
+    ReceiptMissing {
+        key: String,
+    },
+    GenerationMismatch {
+        marker: String,
+        db: String,
+    },
     /// 档 2（R-E-91）：manifest 指向的 blob 文件根本不在盘上。
-    MirrorBlobMissing { manifest_relative_path: String, blob_relative_path: String },
+    MirrorBlobMissing {
+        manifest_relative_path: String,
+        blob_relative_path: String,
+    },
     /// 档 2（R-E-91）：blob 在，但盘上的字节数与 manifest 声称的 `blob_size_bytes` 不符。
     MirrorBlobSizeMismatch {
         blob_relative_path: String,
@@ -7163,9 +7192,7 @@ impl W1MarkerError {
             W1MarkerError::GenerationMismatch { .. } => "E-GENERATION-MISMATCH",
             W1MarkerError::MirrorBlobMissing { .. } => "E-MIRROR-BLOB-MISSING",
             W1MarkerError::MirrorBlobSizeMismatch { .. } => "E-MIRROR-BLOB-SIZE-MISMATCH",
-            W1MarkerError::MirrorBlobChecksumMismatch { .. } => {
-                "E-MIRROR-BLOB-CHECKSUM-MISMATCH"
-            }
+            W1MarkerError::MirrorBlobChecksumMismatch { .. } => "E-MIRROR-BLOB-CHECKSUM-MISMATCH",
             W1MarkerError::MirrorUnreadable(_) => "E-MIRROR-UNREADABLE",
         }
     }
@@ -7224,7 +7251,12 @@ impl W1CommitMarker {
         let mut out = String::new();
         out.push('{');
         let mut first = true;
-        canon_kv_str(&mut out, "closure_verdict", &self.closure_verdict, &mut first);
+        canon_kv_str(
+            &mut out,
+            "closure_verdict",
+            &self.closure_verdict,
+            &mut first,
+        );
         canon_kv_str(
             &mut out,
             "content_generation",
@@ -7237,7 +7269,12 @@ impl W1CommitMarker {
         out.push_str(":{");
         {
             let mut inner = true;
-            canon_kv_str(&mut out, "generation", &self.db_identity.generation, &mut inner);
+            canon_kv_str(
+                &mut out,
+                "generation",
+                &self.db_identity.generation,
+                &mut inner,
+            );
             canon_kv_int(
                 &mut out,
                 "schema_version",
@@ -7309,8 +7346,8 @@ impl W1CommitMarker {
 
     /// 闭世界解析：未声明字段 → `E-UNKNOWN-FIELD`；缺字段 → `E-MISSING-FIELD`。
     pub(crate) fn parse(bytes: &[u8]) -> Result<W1CommitMarker, W1MarkerError> {
-        let value: serde_json::Value = serde_json::from_slice(bytes)
-            .map_err(|e| W1MarkerError::Unparsable(e.to_string()))?;
+        let value: serde_json::Value =
+            serde_json::from_slice(bytes).map_err(|e| W1MarkerError::Unparsable(e.to_string()))?;
         let obj = value
             .as_object()
             .ok_or_else(|| W1MarkerError::Unparsable("top level is not an object".into()))?;
@@ -7351,22 +7388,23 @@ impl W1CommitMarker {
             v.as_i64()
                 .ok_or_else(|| W1MarkerError::TypeMismatch(k.to_string()))
         };
-        let want_obj = |k: &str,
-                        allowed: &[&str]|
-         -> Result<serde_json::Map<String, serde_json::Value>, W1MarkerError> {
-            let v = obj
-                .get(k)
-                .ok_or_else(|| W1MarkerError::MissingField(k.to_string()))?;
-            let m = v
-                .as_object()
-                .ok_or_else(|| W1MarkerError::TypeMismatch(k.to_string()))?;
-            for key in m.keys() {
-                if !allowed.contains(&key.as_str()) {
-                    return Err(W1MarkerError::UnknownField(format!("{k}.{key}")));
+        let want_obj =
+            |k: &str,
+             allowed: &[&str]|
+             -> Result<serde_json::Map<String, serde_json::Value>, W1MarkerError> {
+                let v = obj
+                    .get(k)
+                    .ok_or_else(|| W1MarkerError::MissingField(k.to_string()))?;
+                let m = v
+                    .as_object()
+                    .ok_or_else(|| W1MarkerError::TypeMismatch(k.to_string()))?;
+                for key in m.keys() {
+                    if !allowed.contains(&key.as_str()) {
+                        return Err(W1MarkerError::UnknownField(format!("{k}.{key}")));
+                    }
                 }
-            }
-            Ok(m.clone())
-        };
+                Ok(m.clone())
+            };
 
         let db = want_obj(
             "db_identity",
@@ -7495,7 +7533,10 @@ fn mirror_identity_of(data_dir: &Path) -> anyhow::Result<W1MirrorIdentity> {
     for view in &views {
         let manifest_path = root.join(&view.manifest_relative_path);
         let manifest_bytes_blake3 = file_digest(&manifest_path).map_err(|e| {
-            anyhow::anyhow!("digest raw mirror manifest {}: {e}", manifest_path.display())
+            anyhow::anyhow!(
+                "digest raw mirror manifest {}: {e}",
+                manifest_path.display()
+            )
         })?;
         rows.push(format!(
             "{}\u{1f}{}\u{1f}{}",
@@ -7635,7 +7676,9 @@ pub(crate) fn build_w1_commit_marker(
         let view = views
             .iter()
             .find(|v| v.manifest_id == item.manifest_id)
-            .ok_or_else(|| anyhow::anyhow!("planned manifest {} not in mirror", item.manifest_id))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("planned manifest {} not in mirror", item.manifest_id)
+            })?;
         let identity = restore_identity_from_view(view)?;
         receipt_keys.push(restore_idempotency_key_for(
             item.action,
@@ -7839,11 +7882,10 @@ pub(crate) fn qualify_w1_candidate(
             detail: format!("journal on disk is {:?}", journal.state),
         });
     }
-    let journal_digest = file_digest(input.journal_path).map_err(|e| {
-        W1MarkerError::JournalNotTerminal {
+    let journal_digest =
+        file_digest(input.journal_path).map_err(|e| W1MarkerError::JournalNotTerminal {
             detail: format!("journal digest failed: {e}"),
-        }
-    })?;
+        })?;
     if journal_digest != marker.journal_digest {
         return Err(W1MarkerError::JournalNotTerminal {
             detail: "journal digest does not match the marker".into(),
@@ -7901,13 +7943,11 @@ pub(crate) fn qualify_w1_candidate(
             key: format!("db unreadable: {e}"),
         })?;
     for key in &marker.receipt_keys {
-        let found = crate::storage::sqlite::franken_operation_commit_receipt_exists(
-            storage.raw(),
-            key,
-        )
-        .map_err(|e| W1MarkerError::ReceiptMissing {
-            key: format!("{key} (query failed: {e})"),
-        })?;
+        let found =
+            crate::storage::sqlite::franken_operation_commit_receipt_exists(storage.raw(), key)
+                .map_err(|e| W1MarkerError::ReceiptMissing {
+                    key: format!("{key} (query failed: {e})"),
+                })?;
         if !found {
             storage.close_best_effort_in_place();
             return Err(W1MarkerError::ReceiptMissing { key: key.clone() });
@@ -8070,9 +8110,11 @@ mod e7_restore_journal_tests {
         let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(db_path).unwrap();
         let n = storage
             .raw()
-            .query_row_map("SELECT COUNT(*) FROM operation_commit_receipt", &[], |row| {
-                row.get_typed(0)
-            })
+            .query_row_map(
+                "SELECT COUNT(*) FROM operation_commit_receipt",
+                &[],
+                |row| row.get_typed(0),
+            )
             .unwrap();
         storage.close_best_effort_in_place();
         n
@@ -8087,10 +8129,9 @@ mod e7_restore_journal_tests {
         std::fs::write(index_dir.join(".lexical-rebuild-state.json"), b"{}").unwrap();
 
         // ② embeddings：语义 sidecar 里放一条分片记录 + 一个 tier 产物。
-        let mut shard = crate::search::semantic_manifest::SemanticShardManifest::load_or_default(
-            data_dir,
-        )
-        .unwrap();
+        let mut shard =
+            crate::search::semantic_manifest::SemanticShardManifest::load_or_default(data_dir)
+                .unwrap();
         shard.shards.push(sentinel_shard_record());
         shard.save(data_dir).unwrap();
 
@@ -8373,7 +8414,11 @@ mod e7_restore_journal_tests {
         journal.state = RestoreJournalState::Planned;
         restore_journal_write(&d.journal_path, &journal).unwrap();
 
-        assert_eq!(receipt_count(&d.db_path), 0, "前置断言：现场必须没有 receipt");
+        assert_eq!(
+            receipt_count(&d.db_path),
+            0,
+            "前置断言：现场必须没有 receipt"
+        );
         assert_eq!(conv_count(&d.db_path), 1, "前置断言：新建支那条还没进库");
 
         let outcome = restore_recover(&d.journal_path).unwrap();
@@ -8385,7 +8430,10 @@ mod e7_restore_journal_tests {
         assert_eq!(conv_count(&d.db_path), 2, "重放后库里应当有两条");
         assert_eq!(receipt_count(&d.db_path), 2);
         assert_eq!(
-            restore_journal_read(&d.journal_path).unwrap().unwrap().state,
+            restore_journal_read(&d.journal_path)
+                .unwrap()
+                .unwrap()
+                .state,
             RestoreJournalState::ClosureVerified
         );
     }
@@ -8434,7 +8482,10 @@ mod e7_restore_journal_tests {
         assert!(!semantic_shards_present(&d.data_dir));
         assert!(!analytics_sentinel_present(&d.db_path));
         assert_eq!(
-            restore_journal_read(&d.journal_path).unwrap().unwrap().state,
+            restore_journal_read(&d.journal_path)
+                .unwrap()
+                .unwrap()
+                .state,
             RestoreJournalState::ClosureVerified
         );
     }
@@ -8765,12 +8816,15 @@ mod e7_restore_journal_tests {
             .unwrap()
             .join(format!("e7-sentinel-{boundary}"));
         let plan_json = serde_json::to_string(&plan_for(d).planned).unwrap();
-        let mut child = child_command("phase3_restore::e7_restore_journal_tests::e7_crash_child_entrypoint", d)
-            .env("CASS_E7_PLAN_JSON", plan_json)
-            .env("CASS_RESTORE_PAUSE_AT", boundary)
-            .env("CASS_RESTORE_PAUSE_SENTINEL", &sentinel)
-            .spawn()
-            .expect("spawn crash child");
+        let mut child = child_command(
+            "phase3_restore::e7_restore_journal_tests::e7_crash_child_entrypoint",
+            d,
+        )
+        .env("CASS_E7_PLAN_JSON", plan_json)
+        .env("CASS_RESTORE_PAUSE_AT", boundary)
+        .env("CASS_RESTORE_PAUSE_SENTINEL", &sentinel)
+        .spawn()
+        .expect("spawn crash child");
         let pid = child.id();
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
@@ -8801,10 +8855,13 @@ mod e7_restore_journal_tests {
     fn recover_in_fresh_child(d: &Drill) -> (usize, usize) {
         let result = d.db_path.parent().unwrap().join("e7-recover-result.txt");
         let _ = std::fs::remove_file(&result);
-        let status = child_command("phase3_restore::e7_restore_journal_tests::e7_recover_child_entrypoint", d)
-            .env("CASS_E7_RESULT", &result)
-            .status()
-            .expect("spawn recovery child");
+        let status = child_command(
+            "phase3_restore::e7_restore_journal_tests::e7_recover_child_entrypoint",
+            d,
+        )
+        .env("CASS_E7_RESULT", &result)
+        .status()
+        .expect("spawn recovery child");
         assert!(status.success(), "恢复子进程必须成功退出，实得 {status:?}");
         let text = std::fs::read_to_string(&result).expect("恢复子进程必须写出结果");
         let mut parts = text.split_whitespace();
@@ -9015,10 +9072,7 @@ mod e7_restore_journal_tests {
             "§5.2.5 的顺序是硬规定：写临时文件 → fsync 文件 → rename → fsync 目录"
         );
         // 顺序之外的两条可观测配套：临时文件不得残留；落盘的是完整 JSON（rename 原子性）。
-        assert!(
-            !path.with_extension("tmp").exists(),
-            "临时文件不得残留"
-        );
+        assert!(!path.with_extension("tmp").exists(), "临时文件不得残留");
         assert!(restore_journal_read(&path).unwrap().is_some());
     }
 
@@ -9155,7 +9209,10 @@ mod e7_restore_journal_tests {
         let views = crate::raw_mirror::manifest_views(&d.data_dir).unwrap();
         let victim = views.first().expect("至少一份 manifest").clone();
         let blob = root.join(&victim.blob_relative_path);
-        assert!(blob.exists(), "前置断言：blob 必须真的在，否则本用例恒红、没有分辨力");
+        assert!(
+            blob.exists(),
+            "前置断言：blob 必须真的在，否则本用例恒红、没有分辨力"
+        );
         std::fs::remove_file(&blob).unwrap();
 
         let err = qualify(&d).expect_err("blob 已经被删掉，资格门必须察觉");
@@ -9384,7 +9441,10 @@ mod e7_restore_journal_tests {
 
         let after_data = test_tree_snapshot(&d.data_dir);
         let after_db = test_tree_snapshot(&db_dir);
-        let new_data: Vec<_> = after_data.iter().filter(|x| !before_data.contains(x)).collect();
+        let new_data: Vec<_> = after_data
+            .iter()
+            .filter(|x| !before_data.contains(x))
+            .collect();
         let new_db: Vec<_> = after_db.iter().filter(|x| !before_db.contains(x)).collect();
         assert!(
             new_data.is_empty() && new_db.is_empty(),
@@ -9658,8 +9718,8 @@ mod e7_restore_journal_tests {
         // 而那正是资格门要抓的东西。
         let mut tampered = marker.clone();
         tampered.operation_id = "someone-elses-operation".into();
-        let err = write_w1_commit_marker(&tampered, &marker_path_of(&d))
-            .expect_err("内容不同必须硬失败");
+        let err =
+            write_w1_commit_marker(&tampered, &marker_path_of(&d)).expect_err("内容不同必须硬失败");
         assert!(format!("{err:#}").contains("refusing to overwrite"));
 
         // 硬失败之后磁盘上仍是原来那份。
@@ -9989,10 +10049,7 @@ mod e7_restore_journal_tests {
                         if let Ok(md) = std::fs::symlink_metadata(&path) {
                             if md.is_file() {
                                 saw.store(true, Ordering::Relaxed);
-                                worst.fetch_max(
-                                    md.permissions().mode() & 0o077,
-                                    Ordering::Relaxed,
-                                );
+                                worst.fetch_max(md.permissions().mode() & 0o077, Ordering::Relaxed);
                             }
                         }
                     }
@@ -10024,7 +10081,10 @@ mod e7_restore_journal_tests {
         let (worst, saw) = worst_non_owner_bits_during(&dir, || {
             restore_journal_write(&path, &journal).unwrap();
         });
-        assert!(saw, "前置断言：观察线程必须看到过新文件，否则本用例没有分辨力");
+        assert!(
+            saw,
+            "前置断言：观察线程必须看到过新文件，否则本用例没有分辨力"
+        );
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600,
@@ -10052,7 +10112,10 @@ mod e7_restore_journal_tests {
         let (worst, saw) = worst_non_owner_bits_during(&dir, || {
             write_w1_commit_marker(&marker, &path).unwrap();
         });
-        assert!(saw, "前置断言：观察线程必须看到过新文件，否则本用例没有分辨力");
+        assert!(
+            saw,
+            "前置断言：观察线程必须看到过新文件，否则本用例没有分辨力"
+        );
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600,
@@ -10064,9 +10127,7 @@ mod e7_restore_journal_tests {
         );
     }
     // =============== R1 Finding 14 判据结束 ===============
-
 }
-
 
 // ===========================================================================
 // E8 · dry-run planner（plan Task E8 Step 1/2）
@@ -10666,7 +10727,12 @@ mod e8_dry_run_planner_tests {
                 + report.non_relation_holds,
             "落盘的 HOLD 条数必须与计数吻合 —— 少一条就是静默丢一条待人裁的东西"
         );
-        assert!(report.holds.iter().all(|h| !h.identity.canonical_path.is_empty()));
+        assert!(
+            report
+                .holds
+                .iter()
+                .all(|h| !h.identity.canonical_path.is_empty())
+        );
     }
 
     // ── candidate 侧真的参与了判定（否则「四类都有」可能是巧合）──────────
@@ -10747,7 +10813,13 @@ mod e8_dry_run_planner_tests {
         let db_path = data_dir.join("candidate.sqlite");
         let storage = crate::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
         seed_from(&storage, &data_dir, &scratch, "rollout-equal.jsonl", None);
-        seed_from(&storage, &data_dir, &scratch, "rollout-prefix.jsonl", Some(2));
+        seed_from(
+            &storage,
+            &data_dir,
+            &scratch,
+            "rollout-prefix.jsonl",
+            Some(2),
+        );
         seed_superset(&storage, &data_dir, &scratch, "rollout-superset.jsonl");
         drop(storage);
 
@@ -10848,7 +10920,13 @@ mod e8_dry_run_planner_tests {
         let db_path = data_dir.join("candidate.sqlite");
         let storage = crate::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
         seed_from(&storage, &data_dir, &scratch, "rollout-equal.jsonl", None);
-        seed_from(&storage, &data_dir, &scratch, "rollout-prefix.jsonl", Some(2));
+        seed_from(
+            &storage,
+            &data_dir,
+            &scratch,
+            "rollout-prefix.jsonl",
+            Some(2),
+        );
         seed_superset(&storage, &data_dir, &scratch, "rollout-superset.jsonl");
         drop(storage);
         // live 源文件删掉：投影的定义域里没有活文件系统，留着会让「零 HOME 读取」
@@ -10856,7 +10934,11 @@ mod e8_dry_run_planner_tests {
         for p in [&equal, &missing, &prefix, &superset] {
             std::fs::remove_file(p).unwrap();
         }
-        println!("BENCH-READY data_dir={} db={}", data_dir.display(), db_path.display());
+        println!(
+            "BENCH-READY data_dir={} db={}",
+            data_dir.display(),
+            db_path.display()
+        );
     }
 
     fn view_for<'a>(
@@ -11080,7 +11162,9 @@ mod e8_dry_run_planner_tests {
 
         // ② 全字段 scope 下**必须不等** —— DB 丢了 `invocations`，把它钉成机器事实。
         let db_full: Vec<CanonicalMessageDigest> = {
-            let messages = storage.fetch_messages(candidates[0].conversation_id).unwrap();
+            let messages = storage
+                .fetch_messages(candidates[0].conversation_id)
+                .unwrap();
             messages
                 .iter()
                 .map(|m| {
