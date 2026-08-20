@@ -5195,10 +5195,32 @@ pub(crate) struct RestoreNewCommitInput<'a> {
 }
 
 /// `commit_restore_new` 的产出。
+///
+/// **三态，不是两态**（FIND-7 / 裁定 R-E-76）：修前只有一格 `applied`，值是
+/// 「receipt 查不到」的同义反复 —— 它描述的是**本函数决定去做什么**，而不是
+/// **库里实际发生了什么**。存储层按内容判定这条会话已经在库里、一行都没插时，
+/// 修前照样报 `applied: true`，编排层据此报出没发生过的工作量。
 pub(crate) struct RestoreNewCommitOutcome {
     pub idempotency_key: String,
-    /// `true` = 本次真的写了；`false` = 查到 receipt，判「已提交」直接短路。
+    /// `true` = 本次真的**在库里新建了一条会话行**（据
+    /// `InsertOutcome::conversation_inserted` 判）。
+    ///
+    /// **这一格是库侧事实，不是流程状态。** 它回答的是「库里多了一行吗」，
+    /// **不是**「这次没走短路 / 流程跑完了吗」—— 后者是修前的旧语义，也正是
+    /// FIND-7 的病根：流程走完 ≠ 工作发生。想知道「本次有没有真的动手」，
+    /// 看 `applied || deduplicated`；想知道「这条恢复动作做完了没有」，
+    /// 看 receipt，不看这里。
     pub applied: bool,
+    /// `true` = 插入调用**真的执行了**，但存储层按**内容**判定这条会话已在库里，
+    /// 一条会话行都没新建。
+    ///
+    /// **与 `applied` 互斥**。两者同为 `false` 的唯一情形是 receipt 已存在的短路
+    /// —— 那时连插入调用都没发生。
+    pub deduplicated: bool,
+    /// 本次**真实插入**的消息条数（`InsertOutcome::inserted_indices` 的长度），
+    /// **不是 `conv.messages.len()`**。去重命中时通常为 0；但「会话已在库、尾部
+    /// 有新消息」时可以非 0，那些是真写进去的行。
+    pub messages_inserted: usize,
 }
 
 /// 新建分支：candidate 缺失 → 建一条会话。
@@ -5229,11 +5251,30 @@ pub(crate) fn commit_restore_new(
         return Ok(RestoreNewCommitOutcome {
             idempotency_key,
             applied: false,
+            deduplicated: false,
+            messages_inserted: 0,
         });
     }
 
     // 第一个原子步：基线入口自带事务。重跑时既有行被去重路径收敛。
-    storage.insert_conversations_batched(&[(input.agent_id, input.workspace_id, input.conv)])?;
+    //
+    // **返回值必须接住**（FIND-7 / R-E-76）：这个入口对「会话已在库」的处理是
+    // **按内容去重后收敛**，而不是报错 —— 所以「调用没出错」离「库里多了一行」
+    // 还差一整个判断。`conversation_inserted` 与 `inserted_indices` 才是库侧
+    // 实际发生了什么的唯一凭据。
+    let insert_outcomes = storage.insert_conversations_batched(&[(
+        input.agent_id,
+        input.workspace_id,
+        input.conv,
+    )])?;
+    let insert_outcome = insert_outcomes.first().ok_or_else(|| {
+        anyhow::anyhow!(
+            "insert_conversations_batched returned no outcome for a one-conversation batch \
+             — refusing to report a restore that cannot be accounted for"
+        )
+    })?;
+    let conversation_inserted = insert_outcome.conversation_inserted;
+    let messages_inserted = insert_outcome.inserted_indices.len();
 
     // ── E7 的崩溃注入点（env 门控，生产路径 env 未设即 no-op；形态同 E3 的
     // `relink_pause_if_requested`，裁定放行）───────────────────────────────
@@ -5261,7 +5302,9 @@ pub(crate) fn commit_restore_new(
 
     Ok(RestoreNewCommitOutcome {
         idempotency_key,
-        applied: true,
+        applied: conversation_inserted,
+        deduplicated: !conversation_inserted,
+        messages_inserted,
     })
 }
 
@@ -5729,7 +5772,22 @@ mod e6_replace_commit_tests {
 
         // 恢复：查不到 receipt → 判未提交 → 重做。
         let redo = commit_restore_new(&storage, &input(), TS + 120_000).unwrap();
-        assert!(redo.applied, "查不到 receipt 就必须重做，不能当已完成跳过");
+        // `applied` 修后据实判「库里真新建了一行」（FIND-7 / R-E-76），而重做撞上的
+        // 正是**去重收敛**那条路径：插入调用真的又跑了一遍，存储层按内容判定这条会话
+        // 已经在库里。所以这里断言的是 `deduplicated` —— 它同时证到两件事：
+        // ① **没有**走 receipt 短路（短路时 `applied` 与 `deduplicated` 同为 false）；
+        // ② 重做没有建出第二条会话。下面三条计数断言把「不重不漏」补完。
+        assert!(
+            !redo.applied && redo.deduplicated,
+            "查不到 receipt 就必须重做（不能当已完成跳过），而重做必然被内容去重收敛 —— \
+             实得 applied={} deduplicated={}",
+            redo.applied,
+            redo.deduplicated
+        );
+        assert_eq!(
+            redo.messages_inserted, 0,
+            "重做一条消息都不该真插入 —— 报数必须与库侧实际发生的事一致"
+        );
 
         let (convs, msgs, receipts): (i64, i64, i64) = storage
             .raw()
@@ -5768,6 +5826,14 @@ mod e6_replace_commit_tests {
             !second.applied,
             "receipt 在就必须短路 —— 幂等靠**先查后做**，不靠重复写入被吞掉"
         );
+        // 三态的不变量（FIND-7 / R-E-76）：短路 = 连插入调用都没发生，
+        // 所以 `deduplicated` 也必须是 false。把它写成 `!applied` 的话这条即红 ——
+        // 那样会让「什么都没做」被报成「去重收敛了一条」，又是一次凭空的工作量。
+        assert!(
+            !second.deduplicated,
+            "短路态不是去重态：一次插入调用都没发生，不许占 `deduplicated` 这一格"
+        );
+        assert_eq!(second.messages_inserted, 0, "短路态不许报出插入条数");
 
         let receipts: Option<i64> = storage
             .raw()
@@ -6032,7 +6098,11 @@ pub(crate) struct RestoreJournal {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct RestoreRunOutcome {
+    /// 真的在库里**新建了会话行**的条数。
     pub restored: usize,
+    /// 插入真的执行了、但被存储层按**内容**去重的条数（FIND-7 / R-E-76）。
+    /// **绝不并入 `restored`** —— 并进去就等于报出没发生过的工作量。
+    pub deduplicated: usize,
     pub replaced: usize,
     pub published: usize,
     /// 本次写下的 receipt 幂等 key。**操作者据它去 DB 里对账**，
@@ -6308,10 +6378,14 @@ fn restore_run_db_phase(
                     },
                     restore_now_ms(),
                 )?;
+                // 三态各计各的格；`messages_inserted` 用存储层报的真实条数，
+                // 不用 `conv.messages.len()`（FIND-7 / R-E-76）。
                 if out.applied {
                     outcome.restored += 1;
-                    outcome.messages_inserted += conv.messages.len();
+                } else if out.deduplicated {
+                    outcome.deduplicated += 1;
                 }
+                outcome.messages_inserted += out.messages_inserted;
                 outcome.receipt_keys.push(out.idempotency_key);
             }
             PlannedAction::Replace { conversation_id } => {
@@ -6487,6 +6561,22 @@ fn restore_publish_manifests(
 }
 
 /// 第 7 格前的闭合校验：每条计划项都要有 receipt、且 manifest 已 publish。
+///
+/// # ⚠ 边界：**closure 绿 ≠ 库里新增了行**（FIND-7 / 裁定 R-E-76）
+///
+/// 本函数核的是两件事：**每条计划项都有 receipt**、**每份 manifest 都已 publish**。
+/// 它**不核库侧存在性** —— 一条会话被存储层按内容去重（内容早已在库）时，receipt
+/// 照写、manifest 照 publish，于是这道闭合校验、以及依赖它的 `--qualify`，
+/// **全都是绿的，而库里一行没多**。
+///
+/// 这不是缺陷，是分工：receipt 回答的是「这条身份的恢复动作**做完了**」（幂等凭据），
+/// 不是「这次**写进去了多少**」。工作量的真相在 `RestoreRunOutcome` 的分格数字里 ——
+/// `restored`（真新建）与 `deduplicated`（去重收敛）是两个数，别读成一个。
+///
+/// **操作者的真验证法**：apply 之后重跑一次 planner 的 dry-run。`planned == 0`
+/// 是幂等完成信号（该做的都做到位了，无论是新建还是本来就在）；而
+/// `restored` / `deduplicated` 的分格数字才告诉你这次实际写了多少。
+/// 不要拿 closure 或 `--qualify` 的绿去回答「库里多了多少」这个问题。
 fn restore_verify_closure(journal: &RestoreJournal) -> anyhow::Result<()> {
     restore_assert_receipts_present(journal)?;
     let views = crate::raw_mirror::manifest_views(&journal.data_dir)?;
@@ -6612,6 +6702,17 @@ pub(crate) struct W1MirrorIdentity {
     pub manifest_root: String,
 }
 
+/// W1 提交标记：候选侧「这次恢复走完了」的可移植凭据。
+///
+/// # ⚠ 它证到什么、**没有**证到什么（FIND-7 / 裁定 R-E-76）
+///
+/// marker 里的 `closure_verdict` / `planned_count` / `receipt_keys` 说的是
+/// **计划项都拿到了 receipt、manifest 都已 publish**。它们**不表示库里新增了行**：
+/// 一条会话的内容早已在库时，存储层按内容去重，receipt 照写、marker 照齐全，
+/// 而库侧一行没多。`planned_count` 是**计划了几条**，不是**写进去几条**。
+///
+/// 想知道这次实际写了多少，看 apply/recover 摘要里的 `restored`（真新建）与
+/// `deduplicated`（去重收敛）两个**分格**数字，别把它们读成一个。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct W1CommitMarker {
     pub schema: String,
@@ -7084,6 +7185,16 @@ pub(crate) struct W1QualificationInput<'a> {
 
 /// **解析级机器门**（plan Task E7 Step 3），七步检查序见 wire 说明 §4。
 /// 每层以自己的名义拒绝，先到先报。
+///
+/// # ⚠ `qualified: true` 的边界（FIND-7 / 裁定 R-E-76）
+///
+/// 这道门核的是**候选侧四个磁盘对象自洽**：marker 可解析、schema 对、journal
+/// 到终态、身份绑定成立。它**不核库里有没有因这次恢复而新增行** —— 这是设计分工，
+/// 不是缺口：资格门回答「这份候选能不能被下游接手」，回答不了「这次写了多少」。
+///
+/// 所以 **`qualified: true` 与 closure 绿一样，都不蕴含库里多了行**。操作者要确认
+/// 恢复真的到位，用两个独立读法：① apply 之后**重跑一次 planner 的 dry-run**，
+/// `planned == 0` 是幂等完成信号；② 看 `restored` / `deduplicated` 分格数字判工作量。
 pub(crate) fn qualify_w1_candidate(
     input: &W1QualificationInput<'_>,
 ) -> Result<W1CommitMarker, W1MarkerError> {
@@ -7720,6 +7831,213 @@ mod e7_restore_journal_tests {
         assert_eq!(again.restored + again.replaced, 0, "第二次恢复不得再写库");
         assert_eq!(conv_count(&d.db_path), convs);
         assert_eq!(receipt_count(&d.db_path), receipts);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // FIND-7 · 新建支的报数据实（裁定 R-E-76）
+    //
+    // 缺陷原样：`commit_restore_new` 丢掉 `insert_conversations_batched` 返回的
+    // `Vec<InsertOutcome>`，无条件 `applied: true` —— 存储层按**内容**判定这条会话
+    // 已经在库里、一行都没插时，编排层照样报 `restored += 1` 与
+    // `messages_inserted += conv.messages.len()`。
+    //
+    // 为什么既有电池全绿还是漏了它：既有用例覆盖的全是「插入成功」那条路径，
+    // **没有一条断言「插入被去重时的报数」**。查测试盲区要问的不只是「后态怎么读」，
+    // 还有「**哪条分支的报数**从没被断言过」。
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// 只留新建支那一项的计划 —— 两条判据用例都只关心新建支的报数。
+    fn restore_new_only_plan(d: &Drill) -> RestoreRunPlan {
+        let mut plan = plan_for(d);
+        plan.planned
+            .retain(|item| matches!(item.action, PlannedAction::RestoreNew));
+        assert_eq!(
+            plan.planned.len(),
+            1,
+            "前置断言：裁剪后计划里必须恰剩新建支那一项"
+        );
+        plan
+    }
+
+    /// 把新建支那条身份的**完整投影**原样种进库，返回它的消息条数。
+    ///
+    /// 走的是生产那条 `read_sealed_blob → project_sealed_source → map_to_internal`，
+    /// 所以种进去的字节与 restore 稍后自己投影出来的**逐字段同一**——
+    /// 去重是按内容判的，内容不同一就测不到去重。
+    fn seed_restore_new_content(d: &Drill) -> usize {
+        let views = crate::raw_mirror::manifest_views(&d.data_dir).unwrap();
+        let view = views
+            .iter()
+            .find(|v| v.manifest_id == d.new_manifest_id)
+            .expect("新建支的 manifest 应当在 view 列表里");
+        let conv = project_view_for_test(&d.data_dir, &d.scratch, view);
+        let message_total = conv.messages.len();
+        assert!(
+            message_total > 0,
+            "前置断言：fixture 必须真的带消息，否则「messages_inserted == 0」是无分辨力的假绿"
+        );
+
+        let storage = crate::storage::sqlite::FrankenStorage::open(&d.db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&crate::model::types::Agent {
+                id: None,
+                slug: conv.agent_slug.clone(),
+                name: conv.agent_slug.clone(),
+                version: None,
+                kind: crate::model::types::AgentKind::Cli,
+            })
+            .unwrap();
+        let workspace_id = conv
+            .workspace
+            .as_ref()
+            .map(|ws| storage.ensure_workspace(ws, None).unwrap());
+        let seeded = storage
+            .insert_conversations_batched(&[(agent_id, workspace_id, &conv)])
+            .unwrap();
+        assert!(
+            seeded[0].conversation_inserted,
+            "前置断言：种入这一步自己必须是真插入 —— 否则后面测的根本不是「去重」"
+        );
+        assert_eq!(
+            seeded[0].inserted_indices.len(),
+            message_total,
+            "前置断言：种入必须把消息全插进去"
+        );
+        drop(storage);
+        message_total
+    }
+
+    /// 判据①：**内容已经在库里** → `restored == 0` / `deduplicated == 1` /
+    /// `messages_inserted == 0`。
+    ///
+    /// 造这条案例的判据是「**内容指纹**不在库里」而不是「路径不在库里」：去重按内容判，
+    /// 「同一份会话换个路径」在库里就是同一条。这里把这个判据反过来用。
+    #[test]
+    fn e7_restore_new_reports_deduplicated_not_restored_when_the_content_is_already_there() {
+        let d = drill();
+        let message_total = seed_restore_new_content(&d);
+
+        let convs_before = conv_count(&d.db_path);
+        assert_eq!(
+            convs_before, 2,
+            "前置断言：replace 支的真前缀 + 刚种进去的新建支内容"
+        );
+
+        let outcome = restore_apply_journaled(restore_new_only_plan(&d), &d.journal_path).unwrap();
+
+        assert_eq!(
+            outcome.deduplicated, 1,
+            "去重命中必须计入具名的 `deduplicated` 格 —— 它是「动作做过了、但库里没多行」\
+             这件事的唯一出口，并进 `restored` 就等于把它藏起来"
+        );
+        assert_eq!(
+            (outcome.restored, outcome.messages_inserted),
+            (0, 0),
+            "一行会话、一条消息都没插进去（fixture 共 {message_total} 条消息），\
+             `restored` 就不许是 1、`messages_inserted` 也不许是 `conv.messages.len()` \
+             —— 这两个数字一起构成 FIND-7 的形状"
+        );
+        assert_eq!(
+            conv_count(&d.db_path),
+            convs_before,
+            "末端对账：库里的会话数一条都不许变"
+        );
+        assert_eq!(
+            outcome.receipt_keys.len(),
+            1,
+            "去重不改变幂等语义：receipt 照写，重跑仍然短路"
+        );
+    }
+
+    /// 判据②：**全新内容** → `restored == 1`，且**全新进程读回**的计数真的增长了。
+    ///
+    /// **自读不算数。** 写路径自己报的成功、以及同进程/同连接读回的后态，
+    /// 都可能看得见还没落到别人眼里的东西；FIND-7 的全部代价就在这一句里。
+    #[test]
+    fn e7_restore_new_restored_count_is_confirmed_by_a_fresh_process_readback() {
+        let d = drill();
+        let views = crate::raw_mirror::manifest_views(&d.data_dir).unwrap();
+        let view = views
+            .iter()
+            .find(|v| v.manifest_id == d.new_manifest_id)
+            .expect("新建支的 manifest 应当在 view 列表里");
+        let message_total = project_view_for_test(&d.data_dir, &d.scratch, view)
+            .messages
+            .len();
+        assert!(message_total > 0, "前置断言：fixture 必须真的带消息");
+
+        let (convs_before, msgs_before) = readback_in_fresh_child(&d);
+        assert_eq!(
+            (convs_before, msgs_before),
+            (1, 2),
+            "前置断言：全新进程读回时库里只有 replace 支那条两消息的真前缀"
+        );
+
+        let outcome = restore_apply_journaled(restore_new_only_plan(&d), &d.journal_path).unwrap();
+
+        assert_eq!(
+            (outcome.restored, outcome.deduplicated),
+            (1, 0),
+            "内容全新 → 必须真插入，报 restored=1、deduplicated=0"
+        );
+        assert_eq!(
+            outcome.messages_inserted, message_total,
+            "全新内容下真实插入条数应当等于投影出来的消息条数"
+        );
+
+        let (convs_after, msgs_after) = readback_in_fresh_child(&d);
+        assert_eq!(
+            convs_after - convs_before,
+            1,
+            "**新进程读回**的会话数必须恰好增长 1 —— 自读不算数"
+        );
+        assert_eq!(
+            msgs_after - msgs_before,
+            message_total as i64,
+            "**新进程读回**的消息数必须恰好增长 {message_total} 条"
+        );
+    }
+
+    /// **全新进程**读回 `(会话数, 消息数)`。
+    fn readback_in_fresh_child(d: &Drill) -> (i64, i64) {
+        let result = d.db_path.parent().unwrap().join("e7-readback-result.txt");
+        let _ = std::fs::remove_file(&result);
+        let status = child_command(
+            "phase3_restore::e7_restore_journal_tests::e7_readback_child_entrypoint",
+            d,
+        )
+        .env("CASS_E7_RESULT", &result)
+        .status()
+        .expect("spawn readback child");
+        assert!(status.success(), "读回子进程必须成功退出，实得 {status:?}");
+        let text = std::fs::read_to_string(&result).expect("读回子进程必须写出结果");
+        let mut parts = text.split_whitespace();
+        (
+            parts.next().unwrap().parse().unwrap(),
+            parts.next().unwrap().parse().unwrap(),
+        )
+    }
+
+    /// 读回子进程入口：**全新进程**，只读打开候选库数两张表。
+    #[test]
+    #[ignore]
+    fn e7_readback_child_entrypoint() {
+        let db = PathBuf::from(std::env::var("CASS_E7_DB").unwrap());
+        let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(&db).unwrap();
+        let (convs, msgs): (i64, i64) = storage
+            .raw()
+            .query_row_map(
+                "SELECT (SELECT COUNT(*) FROM conversations), (SELECT COUNT(*) FROM messages)",
+                &[],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )
+            .unwrap();
+        storage.close_best_effort_in_place();
+        std::fs::write(
+            std::env::var("CASS_E7_RESULT").unwrap(),
+            format!("{convs} {msgs}"),
+        )
+        .unwrap();
     }
 
     // ═══════════════════════════════════════════════════════════════════════

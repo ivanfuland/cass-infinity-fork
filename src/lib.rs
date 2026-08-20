@@ -7051,6 +7051,7 @@ async fn execute_cli(
                                     "recovered": true,
                                     "journal_state": state,
                                     "restored": outcome.restored,
+                                    "deduplicated": outcome.deduplicated,
                                     "replaced": outcome.replaced,
                                     "published": outcome.published,
                                     "receipt_keys": outcome.receipt_keys,
@@ -7058,8 +7059,12 @@ async fn execute_cli(
                             );
                         } else {
                             println!(
-                                "recovered: journal_state={state} restored={} replaced={} published={}",
-                                outcome.restored, outcome.replaced, outcome.published
+                                "recovered: journal_state={state} restored={} deduplicated={} \
+                                 replaced={} published={}",
+                                outcome.restored,
+                                outcome.deduplicated,
+                                outcome.replaced,
+                                outcome.published
                             );
                         }
                         return Ok(());
@@ -7282,6 +7287,9 @@ async fn execute_cli(
                                 serde_json::json!({
                                     "applied": true,
                                     "restored": outcome.restored,
+                                    // 去重收敛的条数：动作做过了，库里没多行。
+                                    // **不并进 `restored`**（FIND-7 / 裁定 R-E-76）。
+                                    "deduplicated": outcome.deduplicated,
                                     "replaced": outcome.replaced,
                                     "published": outcome.published,
                                     "messages_inserted": outcome.messages_inserted,
@@ -7291,9 +7299,10 @@ async fn execute_cli(
                             );
                         } else {
                             println!(
-                                "applied: restored={} replaced={} published={} \
+                                "applied: restored={} deduplicated={} replaced={} published={} \
                                  messages(+{}/-{}) receipts={}",
                                 outcome.restored,
+                                outcome.deduplicated,
                                 outcome.replaced,
                                 outcome.published,
                                 outcome.messages_inserted,
