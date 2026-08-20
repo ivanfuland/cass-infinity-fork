@@ -6370,6 +6370,14 @@ pub(crate) struct RestoreRunOutcome {
     pub already_committed: usize,
     pub replaced: usize,
     pub published: usize,
+    /// 发布出去了、但**没能给它配上 backlink** 的份数（R-E-98 H1 / R2 第 4 条）。
+    ///
+    /// 加这一格与 `deduplicated` / `already_committed` 同源：**处置的种类比计数器的
+    /// 格子多**。查不到候选行本身不必然是错 —— 内容去重把行收敛到另一条 `source_path`
+    /// 上时就查不到，而那是 FIND-7 / R-E-76 已裁定的合法归宿。所以口径不是硬失败，
+    /// 是记账：修前这种情形照发布、照计入 `published`，操作者读到的是「都发布好了」，
+    /// 而那几份 manifest 的回链其实是空的。
+    pub published_without_backlink: usize,
     /// 本次写下的 receipt 幂等 key。**操作者据它去 DB 里对账**，
     /// 也是「哪几条真的提交了」的唯一可查凭据。
     pub receipt_keys: Vec<String>,
@@ -6586,6 +6594,79 @@ pub(crate) fn normalize_provider_to_origin(provider: &str) -> Option<Origin> {
     }
 }
 
+/// manifest 侧 `origin_host: None` 归一到的那个值。
+///
+/// `restore_identity_from_view` 与 `conversation_ids_for_identity` **必须用同一个**
+/// ——两处各写一个字面量就是第二定义，而这一维正是 R2 第 5 条咬人的地方。
+pub(crate) const RESTORE_LOCAL_ORIGIN_HOST: &str = "local";
+
+/// 按**整条身份**把候选行捞出来：`source_path` + `source_id` + agent + `origin_host`。
+///
+/// **候选查询与 publish 的 backlink 查询共用这一处定义。** 此前它们是两条各写各的 SQL：
+/// 一条绑三维（漏 `origin_host`，R2 第 5 条），一条只绑路径（R2 第 4 条）——同一个问题
+/// 两个答案。「同一份身份，查的时候是一回事、发布的时候是另一回事」正是那两条 finding
+/// 的共同形状，所以修法也只有一个：让它们问同一句话。
+///
+/// # host 这一维怎么比：按**它存进去会长什么样**比，不按 manifest 上的字面量比
+///
+/// 直接拿 `identity.origin.origin_host` 去等值比对是错的，而且错得会**丢候选**：
+/// 存储层落盘前跑 `normalized_storage_source_parts`，而那个归一化里
+/// **`source_id` 是本机时，`origin_host` 会被丢成 `NULL`**（实测：`(local, "h1")`
+/// 存进去是 `(local, NULL)`；`(work-laptop, "h1"/"h2")` 则原样保留、互相可分）。
+/// 于是一份 `source_id=local, origin_host=Some("h1")` 的 manifest 若按字面量比，
+/// 永远匹配不上它自己那一行 → 判成 `RestoreNew` → 重复插入。**比漏绑更糟。**
+///
+/// 所以这里先用**生产那一个**归一化函数把身份换算成「存储层会存的那个 host」，
+/// 再与列比对。零第二定义：那个函数就是 `insert_conversations_batched` 落盘走的那个。
+///
+/// **由此而来的一条真实边界，明写在这里**：本机源（`source_id` 归一后为 local）的
+/// host 存储层根本不保留，所以这一维**对本机源不具区分力**。这与原注释说的
+/// 「没有对应列」不是一回事 —— 列在，能绑，只是本机那一档的信息在写库时就没了。
+///
+/// `ORDER BY c.id` 不是装饰：多行命中时调用方要么全要（候选侧），要么取头一条
+/// （publish 侧），无序会让后者在同一份数据上给出不同答案。
+fn conversation_ids_for_identity(
+    storage: &crate::storage::sqlite::FrankenStorage,
+    identity: &RestoreIdentity,
+) -> anyhow::Result<Vec<i64>> {
+    use frankensqlite::compat::{ConnectionExt as _, ParamValue, RowExt as _};
+
+    // manifest 侧 `origin_host: None` 在身份里被写成 `RESTORE_LOCAL_ORIGIN_HOST`
+    // 这个哨兵；换算回 `Option` 再喂给生产归一化，别让哨兵被当成一个真的主机名。
+    let raw_host = if identity.origin.origin_host == RESTORE_LOCAL_ORIGIN_HOST {
+        None
+    } else {
+        Some(identity.origin.origin_host.as_str())
+    };
+    let (_, _, stored_host) = crate::storage::sqlite::normalized_storage_source_parts(
+        Some(identity.origin.source_id.as_str()),
+        None,
+        raw_host,
+    );
+
+    let host_clause = match stored_host {
+        Some(_) => "AND TRIM(COALESCE(c.origin_host, '')) = ?4",
+        None => "AND TRIM(COALESCE(c.origin_host, '')) = ''",
+    };
+    let sql = format!(
+        "SELECT c.id FROM conversations c JOIN agents a ON a.id = c.agent_id \
+         WHERE c.source_path = ?1 AND c.source_id = ?2 AND a.slug = ?3 {host_clause} \
+         ORDER BY c.id"
+    );
+    let mut params = vec![
+        ParamValue::from(identity.canonical_path.as_str()),
+        ParamValue::from(identity.origin.source_id.as_str()),
+        ParamValue::from(identity.origin.agent.as_str()),
+    ];
+    if let Some(host) = stored_host.as_deref() {
+        params.push(ParamValue::from(host));
+    }
+    let ids: Vec<i64> = storage
+        .raw()
+        .query_map_collect(&sql, &params, |row| row.get_typed(0))?;
+    Ok(ids)
+}
+
 pub(crate) fn restore_identity_from_view(
     view: &crate::raw_mirror::RawMirrorManifestView,
 ) -> anyhow::Result<RestoreIdentity> {
@@ -6598,7 +6679,7 @@ pub(crate) fn restore_identity_from_view(
             origin_host: view
                 .origin_host
                 .clone()
-                .unwrap_or_else(|| "local".to_string()),
+                .unwrap_or_else(|| RESTORE_LOCAL_ORIGIN_HOST.to_string()),
         },
         canonical_path: view.original_path.clone(),
     })
@@ -6764,7 +6845,21 @@ fn restore_run_db_phase(
 }
 
 /// 过了 `db-committed` 的状态必须有 receipt 佐证；没有就是两个真源矛盾。
+/// 只断言、**不记账**的那个入口。
+///
+/// `restore_verify_closure` 要的就是「每条计划项都有 receipt」这一句断言，它跑在同一轮
+/// 的更后面一格 —— 让它也往 outcome 里加数，同一批已提交项就会被计两遍。
+/// 两个入口分开写，是为了让「谁记账」这件事在调用点上看得见，而不是靠调用顺序心照不宣。
 fn restore_assert_receipts_present(journal: &RestoreJournal) -> anyhow::Result<()> {
+    let mut discarded = RestoreRunOutcome::default();
+    restore_account_receipts_present(journal, &mut discarded)
+}
+
+/// 断言 + 记账：post-`db-committed` 的恢复走这一个。
+fn restore_account_receipts_present(
+    journal: &RestoreJournal,
+    outcome: &mut RestoreRunOutcome,
+) -> anyhow::Result<()> {
     let views = crate::raw_mirror::manifest_views(&journal.data_dir)?;
     let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(&journal.db_path)
         .map_err(|e| anyhow::anyhow!("open candidate db readonly: {e}"))?;
@@ -6776,7 +6871,16 @@ fn restore_assert_receipts_present(journal: &RestoreJournal) -> anyhow::Result<(
         };
         let identity = restore_identity_from_view(view)?;
         let key = restore_idempotency_key_for(item.action, &journal.snapshot_root, &identity);
-        if !crate::storage::sqlite::franken_operation_commit_receipt_exists(storage.raw(), &key)? {
+        if crate::storage::sqlite::franken_operation_commit_receipt_exists(storage.raw(), &key)? {
+            // 这一格此前只 assert 不记账（R2 第 8 条）：崩在 `db-committed` 之后再
+            // `--recover`，四格全 0、`receipt_keys` 空——而那正是操作者对账用的东西。
+            // R-E-83 修的是 `Planned` 支**内部**那一分支，**这一支从没被覆盖**。
+            //
+            // 归到 `already_committed`：receipt 是「这条身份的恢复动作做完了」的唯一
+            // 持久凭据，它回答不了「当初是新建还是去重」，所以也不许往那两格里猜。
+            outcome.already_committed += 1;
+            outcome.receipt_keys.push(key);
+        } else {
             missing.push(item.manifest_id.clone());
         }
     }
@@ -6791,6 +6895,35 @@ fn restore_assert_receipts_present(journal: &RestoreJournal) -> anyhow::Result<(
     Ok(())
 }
 
+/// 索引 / embedding 状态属于**被改的那个库所在的那棵树**，不属于 mirror 的 `--data-dir`。
+///
+/// CLI 把 `--data-dir`（mirror 面的根）与 `--candidate-db`（候选库的稳定副本）定义成
+/// 两个独立参数——拆开跑不是异常形态，是设计用法。而 readiness / embedding 这两格
+/// 作废的对象是「谁在自称对当前指纹新鲜」，那份状态按 cass 自己的目录约定躺在
+/// **库所在的那棵树**里（`default_db_path() = default_data_dir()/agent_search.db`；
+/// `doctor_recover::resolve_db_path` 同形；本文件的 `plan_for` 取 marker 路径时
+/// 用的也早就是 `db_path.parent()`）。
+///
+/// 修前两格都读 `journal.data_dir`（R2 第 3 条）：拆开跑时**清掉的是 mirror 那棵树**
+/// ——在真实操作里那往往就是生产 data_dir——而**被改的候选库那棵树照旧自称新鲜**，
+/// 于是资格门（它不看索引产物）照过不误。
+///
+/// 拿不到父目录时**停手不猜**：本文件对「两个真源互相矛盾 / 手上材料不足以判定」
+/// 的一贯口径就是硬失败，不是挑一个默认值继续。
+fn restore_index_root(journal: &RestoreJournal) -> anyhow::Result<&Path> {
+    journal
+        .db_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "candidate db path {} has no parent directory — cannot locate the index and \
+                 embedding state that belongs to it, refusing to guess",
+                journal.db_path.display()
+            )
+        })
+}
+
 /// 第 2 格 · readiness 失效（幂等）。
 ///
 /// 删掉词法重建 checkpoint = 让索引不再自称「对当前指纹新鲜」。入口是既有的
@@ -6798,7 +6931,7 @@ fn restore_assert_receipts_present(journal: &RestoreJournal) -> anyhow::Result<(
 /// 路径用 `expected_index_dir`（纯拼接、**无副作用**）——不用会创建目录的 `index_dir`，
 /// 恢复器不该自己产副作用。
 fn restore_invalidate_readiness(journal: &RestoreJournal) -> anyhow::Result<()> {
-    let index_dir = crate::search::tantivy::expected_index_dir(&journal.data_dir);
+    let index_dir = crate::search::tantivy::expected_index_dir(restore_index_root(journal)?);
     crate::indexer::clear_lexical_rebuild_state(&index_dir)
 }
 
@@ -6808,7 +6941,7 @@ fn restore_invalidate_readiness(journal: &RestoreJournal) -> anyhow::Result<()> 
 /// `load_or_default → replace_shards_for_generation → save`），零第二定义。
 fn restore_invalidate_embeddings(journal: &RestoreJournal) -> anyhow::Result<()> {
     use crate::search::semantic_manifest::{SemanticManifest, SemanticShardManifest};
-    let data_dir = journal.data_dir.as_path();
+    let data_dir = restore_index_root(journal)?;
 
     if let Some(mut shard) = SemanticShardManifest::load(data_dir)
         .map_err(|e| anyhow::anyhow!("load semantic shard manifest: {e}"))?
@@ -6875,19 +7008,13 @@ fn restore_publish_manifests(
         let conversation_id = match item.action {
             PlannedAction::Replace { conversation_id } => Some(conversation_id),
             PlannedAction::RestoreNew => {
-                use frankensqlite::compat::{
-                    ConnectionExt as _, OptionalExtension as _, RowExt as _,
-                };
-                storage
-                    .raw()
-                    .query_row_map(
-                        "SELECT id FROM conversations WHERE source_path = ?1",
-                        &[frankensqlite::compat::ParamValue::from(
-                            view.original_path.as_str(),
-                        )],
-                        |row| row.get_typed(0),
-                    )
-                    .optional()?
+                // 绑**整条身份**，与候选侧同一处定义（R2 第 4 条 / 第 5 条互为镜像）。
+                // 修前这里只绑 `source_path`：库里另一条同路径、异来源的会话会先被选中，
+                // 于是 manifest 的 backlink 指向一条根本不是它的会话，且指错了不报错。
+                let identity = restore_identity_from_view(view)?;
+                conversation_ids_for_identity(&storage, &identity)?
+                    .into_iter()
+                    .next()
             }
         };
         let link = crate::raw_mirror::RawMirrorDbLink {
@@ -6903,6 +7030,13 @@ fn restore_publish_manifests(
         )?;
         journal.published.push(view.manifest_relative_path.clone());
         outcome.published += 1;
+        if conversation_id.is_none() {
+            // 查不到候选行本身不必然是错——内容去重把行收敛到另一条 `source_path` 上时
+            // 就查不到，那是 FIND-7 / R-E-76 已裁定的合法归宿。所以口径不是硬失败，
+            // 是**记账**：修前这种情形照发布、照计入 `published`，操作者读到的是
+            // 「都发布好了」，而那几份 manifest 的回链其实是空的。
+            outcome.published_without_backlink += 1;
+        }
         restore_journal_advance(journal, journal_path, RestoreJournalState::ManifestPartial)?;
         restore_pause_if_requested("manifest-partial");
     }
@@ -6981,7 +7115,7 @@ fn restore_drive(
         restore_journal_advance(journal, journal_path, RestoreJournalState::DbCommitted)?;
         restore_pause_if_requested("db-committed");
     } else {
-        restore_assert_receipts_present(journal)?;
+        restore_account_receipts_present(journal, &mut outcome)?;
     }
 
     if journal.state.rank() < RestoreJournalState::ReadinessInvalidated.rank() {
@@ -7707,7 +7841,7 @@ pub(crate) fn build_w1_commit_marker(
     // 两边都是那个旧值、自洽，照过不误（R1 Finding 2 的子缺陷，实测坐实）。
     //
     // 判**硬失败**而不是「以 journal 为准改写」：这是两个真源互相矛盾，与
-    // `restore_assert_receipts_present` 面对的是同一类情形，那里的口径就是停手不猜。
+    // `restore_account_receipts_present` 面对的是同一类情形，那里的口径就是停手不猜。
     // 同一个文件里对同类矛盾给两套口径，才是真正会咬人的地方。
     if generation != journal.generation {
         anyhow::bail!(
@@ -8217,8 +8351,128 @@ mod e7_restore_journal_tests {
         found.is_some()
     }
 
+    /// 取某份 manifest 的 `original_path`（= 该条身份的 canonical 路径）。
+    fn view_original_path(d: &Drill, manifest_id: &str) -> String {
+        crate::raw_mirror::manifest_views(&d.data_dir)
+            .unwrap()
+            .into_iter()
+            .find(|v| v.manifest_id == manifest_id)
+            .expect("manifest 必须在 view 列表里")
+            .original_path
+    }
+
+    /// 造一条与真身份同 `source_path`、但身份其余维度不同的「诱饵」会话。
+    ///
+    /// **不手写 INSERT** —— 走 drill 自己那条 `insert_conversations_batched`，
+    /// 免得对「一行会话长什么样」造第二定义。`mutate` 里必须让内容与既有行不同，
+    /// 否则存储层按内容去重会把它收敛掉（那样前置断言就会红，不会静默假绿）。
+    fn plant_decoy_conversation(
+        d: &Drill,
+        manifest_id: &str,
+        mutate: impl FnOnce(&mut crate::model::types::Conversation),
+    ) -> i64 {
+        let views = crate::raw_mirror::manifest_views(&d.data_dir).unwrap();
+        let view = views
+            .iter()
+            .find(|v| v.manifest_id == manifest_id)
+            .expect("manifest 必须在 view 列表里");
+        let mut conv = project_view_for_test(&d.data_dir, &d.scratch, view);
+        mutate(&mut conv);
+        let external_id = conv
+            .external_id
+            .clone()
+            .expect("诱饵必须带 external_id —— 没有它就没法把它捞回来");
+
+        let mut storage = crate::storage::sqlite::FrankenStorage::open(&d.db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&crate::model::types::Agent {
+                id: None,
+                slug: conv.agent_slug.clone(),
+                name: conv.agent_slug.clone(),
+                version: None,
+                kind: crate::model::types::AgentKind::Cli,
+            })
+            .unwrap();
+        let workspace_id = conv
+            .workspace
+            .as_ref()
+            .map(|ws| storage.ensure_workspace(ws, None).unwrap());
+        storage
+            .insert_conversations_batched(&[(agent_id, workspace_id, &conv)])
+            .unwrap();
+        let id: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT id FROM conversations WHERE external_id = ?1",
+                &[ParamValue::from(external_id.as_str())],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        storage.close_best_effort_in_place();
+        id
+    }
+
+    /// 读某份 manifest 已发布的 backlink（`db_links` 第一条的 `conversation_id`）。
+    fn published_backlink_for(d: &Drill, manifest_id: &str) -> Option<i64> {
+        crate::raw_mirror::manifest_views(&d.data_dir)
+            .unwrap()
+            .into_iter()
+            .find(|v| v.manifest_id == manifest_id)
+            .expect("manifest 必须在 view 列表里")
+            .db_links
+            .first()
+            .and_then(|link| link.conversation_id)
+    }
+
+    /// 测试侧的**独立** oracle：按四维身份把候选行捞出来。
+    ///
+    /// 刻意不复用被测的 `candidate_versions_from_db` —— 用被测物给被测物当判据，
+    /// 两边一起错时会一起绿。
+    fn conversation_ids_by_full_identity(d: &Drill, source_path: &str) -> Vec<i64> {
+        let mut storage =
+            crate::storage::sqlite::FrankenStorage::open_readonly(&d.db_path).unwrap();
+        let found: Vec<i64> = storage
+            .raw()
+            .query_map_collect(
+                "SELECT c.id FROM conversations c JOIN agents a ON a.id = c.agent_id \
+                 WHERE c.source_path = ?1 AND c.source_id = ?2 AND a.slug = ?3 \
+                   AND COALESCE(NULLIF(TRIM(COALESCE(c.origin_host, '')), ''), 'local') = ?4",
+                &[
+                    ParamValue::from(source_path),
+                    ParamValue::from("local"),
+                    ParamValue::from(Origin::Codex.as_str()),
+                    ParamValue::from("local"),
+                ],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        storage.close_best_effort_in_place();
+        found
+    }
+
+    /// 造一条身份，`source_id` 与 `origin_host` 都可指定。
+    fn identity_for(source_path: &str, source_id: &str, origin_host: &str) -> RestoreIdentity {
+        RestoreIdentity {
+            origin: OriginNamespace {
+                agent: Origin::Codex,
+                source_id: source_id.to_string(),
+                origin_host: origin_host.to_string(),
+            },
+            canonical_path: source_path.to_string(),
+        }
+    }
+
     /// 建演练场：mirror 里两条身份，库里给其中一条种上「真前缀」。
     fn drill() -> Drill {
+        drill_with_db_under(None)
+    }
+
+    /// `db_subdir = Some(name)`：把候选 DB 放到 `data_dir` **之外**的一棵独立树下。
+    ///
+    /// 这不是造一个假形态 —— CLI 把 `--data-dir`（mirror 面的根）与 `--candidate-db`
+    /// （候选库的稳定副本）定义成**两个独立参数**，拆开正是设计用法。`None` 时逐字节
+    /// 等价于原来的 `drill()`（库落在 `data_dir` 下），旧用例的现场一点没变。
+    fn drill_with_db_under(db_subdir: Option<&str>) -> Drill {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("cass-data");
         let live = tmp.path().join("live");
@@ -8238,7 +8492,14 @@ mod e7_restore_journal_tests {
         std::fs::remove_file(&a).unwrap();
         std::fs::remove_file(&b).unwrap();
 
-        let db_path = data_dir.join("e7.sqlite");
+        let db_path = match db_subdir {
+            None => data_dir.join("e7.sqlite"),
+            Some(name) => {
+                let dir = tmp.path().join(name);
+                std::fs::create_dir_all(&dir).unwrap();
+                dir.join("e7.sqlite")
+            }
+        };
         let storage = crate::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
 
         // 给 replace 支种一条真前缀：投影出三条消息的会话，截到两条再落库。
@@ -8405,6 +8666,324 @@ mod e7_restore_journal_tests {
             !analytics_sentinel_present(&d.db_path),
             "analytics 必须已重算：daily_stats 的哨兵行应当被抹掉"
         );
+    }
+
+    // ── H1 · #3（R-E-98 H1 / R2 第 3 条）────────────────────────────────
+    //
+    // 索引作废这两格必须跟着**被改的那个库**走，不能跟着 mirror 的 `--data-dir` 走。
+    //
+    // CLI 把 `--data-dir`（mirror 面的根）与 `--candidate-db`（候选库的稳定副本）
+    // 定义成两个**独立**参数 —— 拆开跑不是异常形态，是设计用法。而 readiness /
+    // embedding 这两格作废的对象是「谁在自称对当前指纹新鲜」，那份状态按 cass 自己的
+    // 目录约定躺在**库所在的那棵树**里（`default_db_path() = default_data_dir()/agent_search.db`；
+    // `plan_for` 里 marker 路径也早就是从 `db_path.parent()` 取的）。
+    //
+    // 修前两格都读 `journal.data_dir`：拆开跑时**清掉的是 mirror 那棵树**（真实操作里
+    // 那往往就是生产 data_dir），而**被改的候选库那棵树照旧自称新鲜**。两个方向都要
+    // 断言 —— 只断言「候选那棵被清了」会被一个「反正两棵都清」的实现蒙混过去。
+    #[test]
+    fn e7_index_invalidation_follows_the_candidate_db_not_the_mirror_data_dir() {
+        let d = drill_with_db_under(Some("candidate-tree"));
+        let candidate_dir = d.db_path.parent().unwrap().to_path_buf();
+        assert_ne!(
+            candidate_dir, d.data_dir,
+            "前置断言：两棵树必须真的不同，否则本例什么都证不了"
+        );
+
+        // 两棵树各种一份哨兵。第三格（analytics）落在库里，与树无关，种一次即可。
+        plant_post_commit_sentinels(&d.data_dir, &d.db_path);
+        plant_post_commit_sentinels(&candidate_dir, &d.db_path);
+        assert!(
+            lexical_checkpoint_present(&d.data_dir) && lexical_checkpoint_present(&candidate_dir),
+            "前置断言：两棵树都得先有 readiness 哨兵"
+        );
+        assert!(
+            semantic_shards_present(&d.data_dir) && semantic_shards_present(&candidate_dir),
+            "前置断言：两棵树都得先有 embedding 哨兵"
+        );
+
+        restore_apply_journaled(plan_for(&d), &d.journal_path).unwrap();
+
+        assert!(
+            !lexical_checkpoint_present(&candidate_dir),
+            "被改的是候选库 —— 它那棵树的 readiness 必须失效"
+        );
+        assert!(
+            !semantic_shards_present(&candidate_dir),
+            "被改的是候选库 —— 它那棵树的 embedding 必须作废"
+        );
+        assert!(
+            lexical_checkpoint_present(&d.data_dir),
+            "mirror 的 data_dir 不是被改的那个库：动它的 readiness 是在动一个本轮没碰过的库"
+        );
+        assert!(
+            semantic_shards_present(&d.data_dir),
+            "同上：mirror data_dir 的 embedding 不得被作废"
+        );
+    }
+
+    // ── H1 · #8（R-E-98 H1 / R2 第 8 条）────────────────────────────────
+    //
+    // 崩在 `db-committed` **之后**再 `--recover`，归宿仍必须对得上账。
+    //
+    // `restore_drive` 只在 `state == Planned` 时跑 `restore_run_db_phase` —— 那是全仓
+    // **唯一**填 outcome 的地方（定义一处、调用一处）。其余状态只 assert receipt 在不在，
+    // 于是恢复一轮四格全 0、`receipt_keys` 空，而那正是操作者对账用的东西。
+    // R-E-83 修的是 `Planned` 支**内部**那一分支，**post-`DbCommitted` 这一支从没被覆盖**。
+    #[test]
+    fn e7_recover_after_db_committed_still_accounts_the_committed_work() {
+        let d = drill();
+        plant_post_commit_sentinels(&d.data_dir, &d.db_path);
+        let first = restore_apply_journaled(plan_for(&d), &d.journal_path).unwrap();
+        assert_eq!(
+            first.restored + first.replaced + first.deduplicated + first.already_committed,
+            2,
+            "前置断言：首跑必须把两条都归进某一格"
+        );
+
+        // 倒回那个真实存在的窗：DB 提交了、journal 也已推进到 db-committed，
+        // 后面几格还没做完就崩了。
+        let mut journal = restore_journal_read(&d.journal_path).unwrap().unwrap();
+        journal.state = RestoreJournalState::DbCommitted;
+        journal.published.clear();
+        restore_journal_write(&d.journal_path, &journal).unwrap();
+
+        let outcome = restore_recover(&d.journal_path).unwrap();
+
+        assert_eq!(
+            outcome.already_committed, 2,
+            "两条都已提交过 → 必须落进 already_committed 这一格，而不是消失"
+        );
+        assert_eq!(
+            outcome.restored + outcome.replaced + outcome.deduplicated,
+            0,
+            "恢复这一轮没有真写库，那三格必须是 0（别把已提交的工作量重报一遍）"
+        );
+        assert_eq!(
+            outcome.already_committed + outcome.restored + outcome.replaced + outcome.deduplicated,
+            journal.planned.len(),
+            "归宿守恒：四格之和 == planned，恢复路径恰恰是最需要对账的时候"
+        );
+        let mut keys = outcome.receipt_keys.clone();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(
+            keys.len(),
+            2,
+            "receipt_keys 是「哪几条真的提交了」的唯一可查凭据，恢复路径不得交空"
+        );
+    }
+
+    // ── H1 · #4（R-E-98 H1 / R2 第 4 条）────────────────────────────────
+    //
+    // 发布 backlink 时的候选行查询必须绑**整条身份**，不能只绑路径。
+    //
+    // 与 #5 互为镜像：同一份身份，查候选时绑了三维（还漏了 host），发布时只绑一维。
+    //
+    // ⚠ 实测把 R2 对本条后果的描述补全了：只绑路径时，库里存在**另一条同路径异来源**
+    // 的会话，命中就是两行，而那句查询是 `query_row_map(..).optional()` ——
+    // 多行不是「挑一条」，是 `Err("query returned more than one row")`，`?` 一路抛上去，
+    // **apply 在 publish 这一格硬失败**。此时 DB 已提交、journal 已过 `db-committed`，
+    // 于是一条同路径的邻居就能把整轮恢复卡在半路。R2 只写了「照发布」那一半
+    // （那是恰好一行、而那一行不是本条身份时的形状，由下半那条用例锁）。
+    #[test]
+    fn e7_publish_backlink_binds_the_whole_identity_not_the_path_alone() {
+        let d = drill();
+        let new_path = view_original_path(&d, &d.new_manifest_id);
+
+        // 诱饵：**同 source_path**，但 source_id 与 host 都不是新建支那条身份。
+        let decoy_id = plant_decoy_conversation(&d, &d.replace_manifest_id, |conv| {
+            conv.source_path = std::path::PathBuf::from(&new_path);
+            conv.source_id = "some-other-machine".to_string();
+            conv.origin_host = Some("some-other-host".to_string());
+            conv.external_id = Some("e7-decoy-external-id".to_string());
+            conv.messages[0].content.push_str(" -- decoy body");
+        });
+
+        // 修前这一行就抛 `query returned more than one row`。
+        restore_apply_journaled(plan_for(&d), &d.journal_path)
+            .expect("同路径异来源的邻居不该把整轮恢复卡死在 publish 这一格");
+
+        let real = conversation_ids_by_full_identity(&d, &new_path);
+        assert_eq!(
+            real.len(),
+            1,
+            "前置断言：四维全等的行必须恰有一条（诱饵不在这个集合里）"
+        );
+        let linked = published_backlink_for(&d, &d.new_manifest_id);
+        assert_ne!(
+            linked,
+            Some(decoy_id),
+            "backlink 不得指向同路径异来源的那一条"
+        );
+        assert_eq!(
+            linked,
+            Some(real[0]),
+            "backlink 必须指向与本条身份四维全等的那一行"
+        );
+    }
+
+    // ── H1 · #4 下半：查不到候选行时，publish 不得**静默**发一条空 backlink ──
+    //
+    // 查不到本身不必然是错（内容去重把行收敛到另一条 source_path 上时就查不到，
+    // FIND-7 / R-E-76 已裁定那是合法归宿），所以口径不是硬失败 —— 是**记账**：
+    // 空 backlink 必须有它自己的一格，别混进「已发布」里让操作者以为回链建好了。
+    #[test]
+    fn e7_publish_without_a_backlink_is_counted_not_silent() {
+        let d = drill();
+        // 只跑 publish 这一格：库里此时**没有**新建支那条会话（drill 的前置断言就是
+        // 「库里恰有一条 = replace 支的真前缀」），于是新建支必然查不到候选行。
+        //
+        // 顺带锁住**静默指错**那一形态：库里放一条同路径、异来源的诱饵。恰好一行命中
+        // 时那句只绑路径的查询不会报「多行」，它会**安静地把诱饵的 id 当成回链发出去**。
+        let new_path = view_original_path(&d, &d.new_manifest_id);
+        let decoy_id = plant_decoy_conversation(&d, &d.replace_manifest_id, |conv| {
+            conv.source_path = std::path::PathBuf::from(&new_path);
+            conv.source_id = "some-other-machine".to_string();
+            conv.origin_host = Some("some-other-host".to_string());
+            conv.external_id = Some("e7-decoy-external-id".to_string());
+            conv.messages[0].content.push_str(" -- decoy body");
+        });
+        assert!(
+            conversation_ids_by_full_identity(&d, &new_path).is_empty(),
+            "前置断言：四维全等的行此刻必须一条都没有 —— 否则本例证不到「查不到」那一支"
+        );
+
+        let mut journal = restore_journal_from_plan(plan_for(&d));
+        let mut outcome = RestoreRunOutcome::default();
+        restore_publish_manifests(&mut journal, &d.journal_path, &mut outcome).unwrap();
+
+        assert_eq!(outcome.published, 2, "两份 manifest 都该发布出去");
+        assert_eq!(
+            outcome.published_without_backlink, 1,
+            "恰有一条（新建支）查不到候选行 —— 必须记账，不许静默"
+        );
+        let linked = published_backlink_for(&d, &d.new_manifest_id);
+        assert_ne!(
+            linked,
+            Some(decoy_id),
+            "静默指错：只绑路径时，恰好一行命中的诱饵会被当成本条身份的回链发出去"
+        );
+        assert_eq!(linked, None, "查不到就是 None，不许凭路径猜一个填进去");
+        assert_eq!(
+            published_backlink_for(&d, &d.replace_manifest_id),
+            Some(d.replace_conv_id),
+            "阳性对照：replace 支的 backlink 由计划显式带着，必须照常建立且不进那一格"
+        );
+    }
+
+    // ── H1 · #5（R-E-98 H1 / R2 第 5 条）────────────────────────────────
+    //
+    // 候选查询必须把 `origin_host` 也绑上 —— 且要按**它存进去会长什么样**绑。
+    //
+    // 修前那条查询绑 path / source_id / agent 三维，漏掉 host；而代码注释声称
+    // 「`conversations` 侧没有对应列」——那句是假的（建表处三处 `origin_host TEXT`，
+    // relink 自己就在 `SELECT c.origin_host`）。漏掉这一维的后果与 R1 Finding 3 同族：
+    // 跨 host 同路径的两条身份被折进同一堆候选，判成 replace 后互相覆盖。
+    #[test]
+    fn e7_candidate_lookup_binds_origin_host_too() {
+        let d = drill();
+        let new_path = view_original_path(&d, &d.new_manifest_id);
+
+        // 同 path、同 source_id、同 agent，**只差 host**。用远端 source_id：本机源的
+        // host 存储层不保留（下一条用例锁的就是那件事），拿本机源做这条会证不到东西。
+        let h1 = plant_decoy_conversation(&d, &d.new_manifest_id, |conv| {
+            conv.source_path = std::path::PathBuf::from(&new_path);
+            conv.source_id = "work-laptop".to_string();
+            conv.origin_host = Some("h1".to_string());
+            conv.external_id = Some("e7-host-h1".to_string());
+            conv.messages[0].content.push_str(" -- body h1");
+        });
+        let h2 = plant_decoy_conversation(&d, &d.new_manifest_id, |conv| {
+            conv.source_path = std::path::PathBuf::from(&new_path);
+            conv.source_id = "work-laptop".to_string();
+            conv.origin_host = Some("h2".to_string());
+            conv.external_id = Some("e7-host-h2".to_string());
+            conv.messages[0].content.push_str(" -- body h2");
+        });
+        assert_ne!(h1, h2, "前置断言：两条必须真的是两行，没被按内容去重合并");
+
+        let mut storage =
+            crate::storage::sqlite::FrankenStorage::open_readonly(&d.db_path).unwrap();
+        let hits = |host: &str| {
+            conversation_ids_for_identity(&storage, &identity_for(&new_path, "work-laptop", host))
+                .unwrap()
+        };
+        assert_eq!(
+            hits("h1"),
+            vec![h1],
+            "h1 那条身份只该看见 h1 那一行 —— 漏绑 host 会把 h2 也拖进候选堆"
+        );
+        assert_eq!(
+            hits("h2"),
+            vec![h2],
+            "反向同理：h2 的身份不该看见 h1 那一行"
+        );
+        storage.close_best_effort_in_place();
+    }
+
+    // ── H1 · #5 的另一半：本机源的 host 存储层**不保留**，这一维对它不具区分力 ──
+    //
+    // 这条用例存在的意义是把一条**真实边界**钉成机器判据，而不是留在注释里。
+    // 原注释说的「不可判」结论有一半是对的，但理由（「没有对应列」）是错的：
+    // 列在、能绑，只是 `normalized_storage_source_parts` 在写库时就把本机源的
+    // `origin_host` 丢成了 `NULL`（实测：`(local, "h1")` 落盘成 `(local, NULL)`）。
+    //
+    // 于是查询必须按「存进去的样子」比 —— 拿 manifest 上的字面量硬比会**丢候选**：
+    // 一份 `source_id=local, origin_host=Some("h1")` 的 manifest 永远匹配不上它自己
+    // 那一行，判成 `RestoreNew` 重复插入，比漏绑更糟。
+    #[test]
+    fn e7_candidate_lookup_cannot_discriminate_host_for_local_sources() {
+        let d = drill();
+        let new_path = view_original_path(&d, &d.new_manifest_id);
+
+        let with_host = plant_decoy_conversation(&d, &d.new_manifest_id, |conv| {
+            conv.source_path = std::path::PathBuf::from(&new_path);
+            conv.source_id = "local".to_string();
+            conv.origin_host = Some("h1".to_string());
+            conv.external_id = Some("e7-local-with-host".to_string());
+            conv.messages[0].content.push_str(" -- local with host");
+        });
+        let without_host = plant_decoy_conversation(&d, &d.new_manifest_id, |conv| {
+            conv.source_path = std::path::PathBuf::from(&new_path);
+            conv.source_id = "local".to_string();
+            conv.origin_host = None;
+            conv.external_id = Some("e7-local-no-host".to_string());
+            conv.messages[0].content.push_str(" -- local no host");
+        });
+
+        // 前置断言：落盘之后这两行的 host 列**都是空的** —— 这就是「存储层不保留」的字面证据。
+        let mut storage =
+            crate::storage::sqlite::FrankenStorage::open_readonly(&d.db_path).unwrap();
+        let stored_hosts: Vec<String> = storage
+            .raw()
+            .query_map_collect(
+                "SELECT COALESCE(c.origin_host, '<NULL>') FROM conversations c \
+                 WHERE c.external_id IN ('e7-local-with-host', 'e7-local-no-host') ORDER BY c.id",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stored_hosts,
+            vec!["<NULL>".to_string(), "<NULL>".to_string()],
+            "前置断言：本机源那两行的 origin_host 落盘后必须都是 NULL"
+        );
+
+        // 于是两条身份都只能看见同一对行 —— 这不是漏绑，是信息在写库时就没了。
+        let mut expected = vec![with_host, without_host];
+        expected.sort();
+        for host in ["h1", RESTORE_LOCAL_ORIGIN_HOST] {
+            let mut hits =
+                conversation_ids_for_identity(&storage, &identity_for(&new_path, "local", host))
+                    .unwrap();
+            hits.sort();
+            assert_eq!(
+                hits, expected,
+                "本机源：host={host} 这条身份必须仍然看见那两行 —— 按字面量硬比会丢掉自己的行"
+            );
+        }
+        storage.close_best_effort_in_place();
     }
 
     // ── T2：`planned` + **无 receipt** → 必须**重放事务** ─────────────────
@@ -10255,24 +10834,28 @@ fn normalized_from_db_message(
 /// 这一维。折叠它们的后果最重的一种是**跨来源静默覆盖**（A 的行被当成 B 的候选，
 /// 判成 replace 后用 B 的内容盖掉 A）。
 ///
-/// `origin_host` 这一维**当前不可判**：`conversations` 侧没有对应列。
-/// 这一点记为已知缺口如实披露，**不假装判了**（本语料里该维差异为 0，
-/// 但那是数据形状，不是保证）。
+/// # `origin_host` 这一维也绑上了（R-E-98 H1 / R2 第 5 条）
+///
+/// 这里原先写着「`origin_host` 当前不可判：`conversations` 侧没有对应列」，并据此把它
+/// 记成一条如实披露的已知缺口。**那句话是假的**：`conversations.origin_host` 建表时就在
+/// （`src/storage/sqlite.rs` 三处 `origin_host TEXT`），relink 侧自己就在
+/// `SELECT c.origin_host`。R-E-80′ 接受了这个前提而没有回源核，于是一条本来就能关掉的
+/// 缺口被当成设计约束记了三轮，注释还替它作了证。
+///
+/// **推翻一个写了理由的决定，新理由至少要一样清楚**（R-E-82）：新理由是——列存在，
+/// 且全仓早已有它的读法与归一化，没有任何东西挡着这一维被绑上。查询本身移到
+/// [`conversation_ids_for_identity`]，与 publish 侧共用同一处定义。
+///
+/// **原结论里有一半是对的，但理由是错的，所以那一半也得重说**：这一维确实对
+/// **本机源**不具区分力 —— 不是「没有列」，而是存储层归一化在写库时就把本机源的
+/// `origin_host` 丢成了 `NULL`（实测坐实，见 `conversation_ids_for_identity` 的
+/// doc 与两条对照用例）。远端源（`source_id` 非 local）的 host 原样保留、可分，
+/// 那一档从此真的被绑上了。
 fn candidate_versions_from_db(
     storage: &crate::storage::sqlite::FrankenStorage,
     identity: &RestoreIdentity,
 ) -> anyhow::Result<Vec<CandidateSideVersion>> {
-    use frankensqlite::compat::{ConnectionExt as _, ParamValue, RowExt as _};
-    let ids: Vec<i64> = storage.raw().query_map_collect(
-        "SELECT c.id FROM conversations c JOIN agents a ON a.id = c.agent_id \
-         WHERE c.source_path = ?1 AND c.source_id = ?2 AND a.slug = ?3 ORDER BY c.id",
-        &[
-            ParamValue::from(identity.canonical_path.as_str()),
-            ParamValue::from(identity.origin.source_id.as_str()),
-            ParamValue::from(identity.origin.agent.as_str()),
-        ],
-        |row| row.get_typed(0),
-    )?;
+    let ids = conversation_ids_for_identity(storage, identity)?;
     let mut out = Vec::with_capacity(ids.len());
     for conversation_id in ids {
         let messages = storage.fetch_messages(conversation_id)?;

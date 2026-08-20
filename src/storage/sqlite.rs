@@ -12174,7 +12174,12 @@ impl FrankenStorage {
     }
 }
 
-fn normalized_storage_source_parts(
+/// 把一份来源三元组归一成**存储层真正会落盘的那个形态**。
+///
+/// `pub(crate)` 是 R-E-98 H1 放宽的：restore 侧要按「这行如果存进来会长什么样」去
+/// 匹配候选行，而那个映射只能有一处定义 —— 复制一份到 restore 里，两边一漂移就是
+/// 「查不到自己刚写的行」。函数体逐字节未动。
+pub(crate) fn normalized_storage_source_parts(
     source_id: Option<&str>,
     origin_kind: Option<&str>,
     origin_host: Option<&str>,
