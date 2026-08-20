@@ -1983,11 +1983,27 @@ pub fn recompute_manifest_blake3(data_dir: &Path, manifest_relative_path: &str) 
 /// relink 需要的是后者 —— 「按真实身份匹配重建」必然包含把错的链接去掉。
 /// 落盘沿用与 merge 相同的 publish 序列（临时文件 → `fsync` → `rename` →
 /// `fsync` 文件与父目录），不另写第二套。
+/// [`rebuild_manifest_db_links`] 的三态结果。
+///
+/// **三态而不是 `bool`**：第三态「规划之后 manifest 变了」既不是「写了」也不是
+/// 「内容一样所以没写」，把它折进 `bool` 就等于让调用方在两种完全不同的情形上
+/// 做同一件事 —— 而这两种情形一个要沉默、一个必须出声。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RebuildManifestDbLinksOutcome {
+    /// 盘上内容与计划一致，没写盘。
+    Unchanged,
+    /// 按计划整体替换并落盘了。
+    Written,
+    /// **规划之后这份 manifest 被别人改过**：一行都没写，交调用方以自己的名义处置。
+    ChangedSincePlan,
+}
+
 pub fn rebuild_manifest_db_links(
     data_dir: &Path,
     manifest_relative_path: &str,
+    expected_current: &[RawMirrorDbLink],
     links: &[RawMirrorDbLink],
-) -> Result<bool> {
+) -> Result<RebuildManifestDbLinksOutcome> {
     let root = raw_mirror_root(data_dir);
     let manifest_path = raw_mirror_manifest_path_from_relative(&root, manifest_relative_path)?;
 
@@ -1997,15 +2013,38 @@ pub fn rebuild_manifest_db_links(
         .map_err(|_| anyhow!("raw mirror manifest update lock poisoned"))?;
 
     let mut manifest = read_raw_mirror_manifest(&manifest_path)?;
+
+    // ── 新鲜度 CAS（FIND-6 / 裁定 R-E-88）────────────────────────────────
+    //
+    // 本函数是**整体替换**，而 `links` 是调用方**更早**算出来的计划。
+    // 修前它在锁内重读了 manifest、却把读到的内容整个丢掉 —— 于是规划与施加之间
+    // 任何一次合法的并发写入都会被静默抹掉。实测（确定性，不需要制造竞态）：
+    // 规划态是 `[A]`，其间索引器 merge 进了 `B`，施加陈旧计划之后盘上只剩 `[A]`。
+    //
+    // 窗口不是毫秒级：`mirror_relink()` 在同一次调用内先算完**全部** manifest 的计划
+    // 再逐个施加，规划要读全库（真语料 4567 会话实测 900s 未完）；崩溃重放路径
+    // （`relink_drive_manifest_phase`）用的计划更可能是几小时前的。
+    // 而并发写入方是常态：索引器每落一条会话就 `merge_manifest_db_links` 一次。
+    //
+    // **锁救不了这件事** —— 进程内 `Mutex` 保护的是写序，而计划早在取锁之前就算好了。
+    // 所以这里在**锁内、重读之后、写之前**比一次：不等就一行都不写，
+    // 由调用方以自己的名义拒绝或跳过。
+    //
+    // 残留窗口如实说：这只把窗口从「分钟级」压到「锁内重读到 rename 之间」，
+    // 跨进程仍不是原子的。彻底关掉要跨进程锁或 manifest 级 CAS 落盘原语，记 E9 已知边界。
+    if manifest.db_links != unique_db_links(expected_current) {
+        return Ok(RebuildManifestDbLinksOutcome::ChangedSincePlan);
+    }
+
     let rebuilt = unique_db_links(links);
     if rebuilt == manifest.db_links {
-        return Ok(false);
+        return Ok(RebuildManifestDbLinksOutcome::Unchanged);
     }
     manifest.db_links = rebuilt;
     manifest.manifest_blake3 = Some(raw_mirror_manifest_blake3(&manifest));
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
     replace_manifest_bytes(&root, &manifest_path, &manifest_bytes)?;
-    Ok(true)
+    Ok(RebuildManifestDbLinksOutcome::Written)
 }
 
 #[cfg(test)]
@@ -3060,4 +3099,90 @@ mod tests {
             "unexpected error: {err:#}"
         );
     }
+
+    // ============ R1 Finding 6 / 裁定 R-E-88 的判据（存储侧）============
+    //
+    // `rebuild_manifest_db_links` 是**整体替换**，而 `links` 是调用方更早算出来的计划。
+    // 修前它在锁内重读了 manifest 却把读到的内容整个丢掉 —— 规划与施加之间任何一次
+    // 合法的并发写入都会被静默抹掉。**不需要制造竞态就能演示**：缺陷的本体是
+    // 「规划态与施加态之间的差异被无条件丢弃」，并发只是产生差异的一种方式。
+
+    fn f6_fixture() -> (tempfile::TempDir, PathBuf, String, RawMirrorDbLink) {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("rollout-fixture.jsonl");
+        fs::write(&source_path, b"{\"type\":\"message\"}\n").expect("write source");
+        let link_a = RawMirrorDbLink {
+            conversation_id: Some(1),
+            message_count: Some(1),
+            source_path: Some(source_path.display().to_string()),
+            started_at_ms: Some(1_733_000_000_000),
+        };
+        let captured = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: std::slice::from_ref(&link_a),
+        })
+        .expect("capture");
+        let rel = captured.manifest_relative_path.clone();
+        (temp, data_dir, rel, link_a)
+    }
+
+    fn f6_links_on_disk(data_dir: &Path, rel: &str) -> Vec<RawMirrorDbLink> {
+        let path =
+            raw_mirror_manifest_path_from_relative(&raw_mirror_root(data_dir), rel).unwrap();
+        read_raw_mirror_manifest(&path).unwrap().db_links
+    }
+
+    #[test]
+    fn f6_rebuild_refuses_a_plan_whose_premise_changed_and_writes_nothing() {
+        let (_t, data_dir, rel, link_a) = f6_fixture();
+
+        // ① 规划态：此刻盘上是 [A]，计划也是 [A]。
+        let planned_before = vec![link_a.clone()];
+        let planned_after = vec![link_a.clone()];
+
+        // ② 规划与施加之间，索引器落了一条新会话，把 B 并进同一份 manifest。
+        let link_b = RawMirrorDbLink {
+            conversation_id: Some(2),
+            message_count: Some(3),
+            source_path: link_a.source_path.clone(),
+            started_at_ms: Some(1_733_000_100_000),
+        };
+        merge_manifest_db_links(&data_dir, &rel, std::slice::from_ref(&link_b))
+            .expect("并发索引器的 merge");
+        let mid = f6_links_on_disk(&data_dir, &rel);
+        assert_eq!(mid.len(), 2, "前置断言：B 必须真的并进去了，否则本用例没有分辨力");
+
+        // ③ 施加陈旧计划：必须一行都不写，并如实回报「前提变了」。
+        let outcome =
+            rebuild_manifest_db_links(&data_dir, &rel, &planned_before, &planned_after).unwrap();
+        assert_eq!(outcome, RebuildManifestDbLinksOutcome::ChangedSincePlan);
+        assert_eq!(
+            f6_links_on_disk(&data_dir, &rel),
+            mid,
+            "被拒之后盘上必须逐条不变 —— 规划之后并进来的合法 backlink 不得被抹掉"
+        );
+    }
+
+    #[test]
+    fn f6_rebuild_still_writes_when_the_premise_holds() {
+        // 分辨力对照：CAS 不能把正常路径也一起挡掉。
+        let (_t, data_dir, rel, link_a) = f6_fixture();
+        let current = f6_links_on_disk(&data_dir, &rel);
+        assert_eq!(current.len(), 1);
+        let outcome = rebuild_manifest_db_links(&data_dir, &rel, &current, &[]).unwrap();
+        assert_eq!(outcome, RebuildManifestDbLinksOutcome::Written);
+        assert!(f6_links_on_disk(&data_dir, &rel).is_empty());
+
+        // 计划与现状一致时是 no-op，既不是「写了」也不是「被改过」。
+        let outcome = rebuild_manifest_db_links(&data_dir, &rel, &[], &[]).unwrap();
+        assert_eq!(outcome, RebuildManifestDbLinksOutcome::Unchanged);
+        let _ = link_a;
+    }
+    // =============== R1 Finding 6 判据结束（存储侧）===============
 }

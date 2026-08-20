@@ -100199,6 +100199,12 @@ pub enum MirrorRelinkFinding {
         manifest_id: String,
         blob_relative_path: String,
     },
+    /// **规划之后这份 manifest 被别人改过**，本轮不动它（FIND-6 / 裁定 R-E-88）。
+    ///
+    /// 与 `ProviderUnmapped` 同形：不是「坏了」，是「本轮不动它」。
+    /// 静默按陈旧计划整体替换会把并发写入方合法的新增抹掉 —— 索引器每落一条会话
+    /// 就往 manifest 里 merge 一条 db_link，而 relink 的规划与施加之间隔着一次全库扫描。
+    ManifestChangedSincePlan { manifest_id: String },
     /// manifest 的 `provider` 映射不出受支持的 agent（R-E-82）。
     ///
     /// **这一条不是「坏了」，是「本轮不动它」**：身份键含 agent 之后，
@@ -100230,6 +100236,10 @@ pub struct MirrorRelinkReport {
     pub applied: bool,
     /// 实际写盘的 manifest 数。dry-run 恒为 0。
     pub manifests_written: usize,
+    /// 因「规划之后被改过」而**跳过没写**的 manifest 数（FIND-6 / 裁定 R-E-88）。
+    /// dry-run 恒为 0。**与 `manifests_written` 分开报**：把跳过折进「没写」
+    /// 就等于让操作者分不出「内容一样所以没写」和「有人动过所以不敢写」。
+    pub manifests_skipped_stale: usize,
 }
 
 /// DB 侧按身份归属到某个 manifest 的一条会话。
@@ -100486,14 +100496,25 @@ pub fn mirror_relink(options: &MirrorRelinkOptions) -> Result<MirrorRelinkReport
     }
 
     let mut manifests_written = 0usize;
+    let mut manifests_skipped_stale = 0usize;
     if options.apply {
         for change in &changes {
-            if raw_mirror::rebuild_manifest_db_links(
+            // CAS：把**规划时看到的** db_links 一起传下去，让写入方在锁内比一次。
+            // 不等就一行都不写，这里以具名 finding 记账并跳过 —— 不静默替换，也不静默跳过。
+            match raw_mirror::rebuild_manifest_db_links(
                 &options.data_dir,
                 &change.manifest_relative_path,
+                &change.before,
                 &change.after,
             )? {
-                manifests_written += 1;
+                raw_mirror::RebuildManifestDbLinksOutcome::Written => manifests_written += 1,
+                raw_mirror::RebuildManifestDbLinksOutcome::Unchanged => {}
+                raw_mirror::RebuildManifestDbLinksOutcome::ChangedSincePlan => {
+                    manifests_skipped_stale += 1;
+                    findings.push(MirrorRelinkFinding::ManifestChangedSincePlan {
+                        manifest_id: change.manifest_id.clone(),
+                    });
+                }
             }
         }
     }
@@ -100504,6 +100525,7 @@ pub fn mirror_relink(options: &MirrorRelinkOptions) -> Result<MirrorRelinkReport
         findings,
         applied: options.apply,
         manifests_written,
+        manifests_skipped_stale,
     })
 }
 
@@ -100528,11 +100550,26 @@ pub enum RelinkJournalState {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RelinkPlannedManifest {
     pub manifest_relative_path: String,
+    /// 规划时盘上的 `db_links`。重放时拿它做新鲜度 CAS（FIND-6 / 裁定 R-E-88）。
+    ///
+    /// **不给 `serde(default)`**：缺省会把旧 journal 读成「规划时是空的」，
+    /// 于是 CAS 在任何非空 manifest 上都判「被改过」—— 一个恒亮的假警报，
+    /// 比没有 CAS 更糟。缺这一格的旧 journal 由版本层以自己的名义拒掉。
+    pub before: Vec<raw_mirror::RawMirrorDbLink>,
     pub after: Vec<raw_mirror::RawMirrorDbLink>,
 }
 
+/// relink journal 的 schema 版本（FIND-6 / 裁定 R-E-88）。
+///
+/// **1 = 无版本号的旧格式**（`planned` 只有 `after`）。2 起 `RelinkPlannedManifest`
+/// 多一格 `before`，崩溃重放时用它做新鲜度 CAS。旧件不做兼容读，见
+/// [`relink_journal_read`] 的版本层。
+pub const RELINK_JOURNAL_SCHEMA_VERSION: i64 = 2;
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RelinkJournal {
+    /// 先于一切字段被校验（见 [`relink_journal_read`]）。
+    pub schema_version: i64,
     pub operation_id: String,
     pub state: RelinkJournalState,
     pub data_dir: PathBuf,
@@ -100542,6 +100579,10 @@ pub struct RelinkJournal {
 }
 
 fn relink_journal_write(path: &Path, journal: &RelinkJournal) -> Result<()> {
+    debug_assert_eq!(
+        journal.schema_version, RELINK_JOURNAL_SCHEMA_VERSION,
+        "写出的 relink journal 必须带当前 schema 版本"
+    );
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -100559,11 +100600,41 @@ fn relink_journal_write(path: &Path, journal: &RelinkJournal) -> Result<()> {
 }
 
 pub fn relink_journal_read(path: &Path) -> Result<Option<RelinkJournal>> {
-    match std::fs::read(path) {
-        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(err.into()),
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+
+    // 先验版本，后进字段解析（与 restore journal 同一纪律，R-E-79 / R-E-88）。
+    //
+    // **每层以自己的名义拒绝。** 直接 `from_slice` 的话，一份 v1 journal 会死在
+    // 「缺字段 `before`」上 —— 那是**错误的层在说话**：操作者读到字段解析错会去查
+    // 文件损坏，而真相是版本不对。这一层买的是错误的可读性，不是兼容性：
+    // 旧 journal 照样不能用，只是死得明白，且错误里同时给出**见到的**与**需要的**版本。
+    let probe: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| anyhow::anyhow!("relink journal at {} is not JSON: {e}", path.display()))?;
+    let got = probe.get("schema_version").and_then(serde_json::Value::as_i64);
+    match got {
+        Some(v) if v == RELINK_JOURNAL_SCHEMA_VERSION => {}
+        other => {
+            anyhow::bail!(
+                "E-RELINK-JOURNAL-SCHEMA-MISMATCH: relink journal at {} declares schema \
+                 version {} but this binary requires {} - refusing to read it (a journal \
+                 written before the per-manifest `before` snapshot existed would otherwise \
+                 be replayed without the staleness check that keeps a concurrent indexer's \
+                 backlinks alive)",
+                path.display(),
+                match other {
+                    Some(v) => v.to_string(),
+                    None => "<absent>".to_string(),
+                },
+                RELINK_JOURNAL_SCHEMA_VERSION
+            );
+        }
     }
+
+    Ok(Some(serde_json::from_slice(&bytes)?))
 }
 
 /// 崩溃注入用的确定性握手点。
@@ -100644,6 +100715,7 @@ pub fn relink_apply_journaled(
         apply: false,
     })?;
     let mut journal = RelinkJournal {
+        schema_version: RELINK_JOURNAL_SCHEMA_VERSION,
         operation_id: operation_id.to_string(),
         state: RelinkJournalState::Planned,
         data_dir: options.data_dir.clone(),
@@ -100652,6 +100724,8 @@ pub fn relink_apply_journaled(
             .iter()
             .map(|c| RelinkPlannedManifest {
                 manifest_relative_path: c.manifest_relative_path.clone(),
+                // 规划时盘上的样子一并落 journal —— 崩溃重放时没有它就只能盲写。
+                before: c.before.clone(),
                 after: c.after.clone(),
             })
             .collect(),
@@ -100676,11 +100750,27 @@ fn relink_drive_manifest_phase(journal: &mut RelinkJournal, journal_path: &Path)
         if journal.published.contains(&item.manifest_relative_path) {
             continue;
         }
-        raw_mirror::rebuild_manifest_db_links(
+        // 重放路径与 CLI 的 apply 循环处置**不同**：那边是「本轮不动它、记账继续」，
+        // 这边是**硬失败**。重放的语义是「把当初那份计划照原样施加完」——
+        // 前提已经不成立时继续施加，等于拿一份过期的世界观改盘；崩溃恢复本来
+        // 就该由操作者重新规划，不该由恢复器替他决定。
+        match raw_mirror::rebuild_manifest_db_links(
             &journal.data_dir,
             &item.manifest_relative_path,
+            &item.before,
             &item.after,
-        )?;
+        )? {
+            raw_mirror::RebuildManifestDbLinksOutcome::Written
+            | raw_mirror::RebuildManifestDbLinksOutcome::Unchanged => {}
+            raw_mirror::RebuildManifestDbLinksOutcome::ChangedSincePlan => {
+                anyhow::bail!(
+                    "E-MANIFEST-CHANGED-SINCE-PLAN: manifest {} changed between planning and \
+                     replay - refusing to apply a stale plan over it (re-run planning; \
+                     applying it would silently drop whatever was written in between)",
+                    item.manifest_relative_path
+                );
+            }
+        }
         journal.published.push(item.manifest_relative_path.clone());
         journal.state = RelinkJournalState::ManifestPartial;
         relink_journal_write(journal_path, journal)?;
@@ -100973,12 +101063,14 @@ mod mirror_relink_tests {
         let dir = tmp.path().to_path_buf();
         let path = dir.join("relink-journal.json");
         let journal = RelinkJournal {
+            schema_version: RELINK_JOURNAL_SCHEMA_VERSION,
             operation_id: "op-f14".into(),
             state: RelinkJournalState::Planned,
             data_dir: dir.clone(),
             planned: (0..40_000)
                 .map(|i| RelinkPlannedManifest {
                     manifest_relative_path: format!("manifests/aa/{i:08}.json"),
+                    before: Vec::new(),
                     after: Vec::new(),
                 })
                 .collect(),
@@ -101061,21 +101153,133 @@ mod mirror_relink_tests {
         );
     }
 
+    // ============ R1 Finding 6 / 裁定 R-E-88 的判据（relink 侧）============
+
+    /// 崩溃重放**不得**拿一份前提已经不成立的计划盲写 —— 必须以具名错误停下来。
+    ///
+    /// 修前形态：`relink_drive_manifest_phase` 把 journal 里的 `after` 无条件整体替换
+    /// 上去；而那份计划可能是几小时前崩溃前算的，其间索引器每落一条会话就往同一份
+    /// manifest 里 merge 一条 db_link。
+    #[test]
+    fn f6_journal_replay_refuses_a_stale_plan_by_name() {
+        let (_tmp, data_dir, rel, _conv, _src) = fixture(true);
+        let journal_path = data_dir.join("relink-journal.json");
+
+        // journal 里记的「规划时的样子」与盘上现状不符 —— 正是并发写入之后的形状。
+        let stale_before = vec![RawMirrorDbLink {
+            conversation_id: Some(999_001),
+            message_count: Some(1),
+            source_path: Some("/planned/when/the/world/looked/different".into()),
+            started_at_ms: None,
+        }];
+        let mut journal = RelinkJournal {
+            schema_version: RELINK_JOURNAL_SCHEMA_VERSION,
+            operation_id: "op-f6".into(),
+            state: RelinkJournalState::DbCommitted,
+            data_dir: data_dir.clone(),
+            planned: vec![RelinkPlannedManifest {
+                manifest_relative_path: rel.clone(),
+                before: stale_before,
+                after: Vec::new(),
+            }],
+            published: Vec::new(),
+        };
+        relink_journal_write(&journal_path, &journal).unwrap();
+
+        let before_disk = crate::raw_mirror::manifest_views(&data_dir)
+            .unwrap()
+            .into_iter()
+            .find(|v| v.manifest_relative_path == rel)
+            .unwrap()
+            .db_links;
+        assert!(
+            !before_disk.is_empty(),
+            "前置断言：盘上必须有 db_links，否则「有没有被抹掉」无从分辨"
+        );
+
+        let err = relink_drive_manifest_phase(&mut journal, &journal_path)
+            .expect_err("陈旧计划必须被拒");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("E-MANIFEST-CHANGED-SINCE-PLAN"),
+            "必须带具名错误码，实得：{text}"
+        );
+
+        let after_disk = crate::raw_mirror::manifest_views(&data_dir)
+            .unwrap()
+            .into_iter()
+            .find(|v| v.manifest_relative_path == rel)
+            .unwrap()
+            .db_links;
+        assert_eq!(
+            before_disk, after_disk,
+            "被拒之后盘上必须一行都没动 —— 否则「拒绝」只是个说法"
+        );
+    }
+
+    /// 旧版 journal 必须死在**版本**这一层，而不是「缺字段 `before`」。
+    ///
+    /// 「每层以自己的名义拒绝」：操作者读到字段解析错会去查文件损坏，而真相是版本不对。
+    #[test]
+    fn f6_old_relink_journal_dies_on_version_not_on_a_missing_field() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("v1-relink-journal.json");
+        // v1 的形状：没有 schema_version，planned 只有 after。
+        std::fs::write(
+            &path,
+            // ⚠ 这份 fixture 必须是一份**除了版本之外哪儿都对**的 v1 journal，
+            // 否则它会死在别的层上、让本用例因为错误的理由通过（变异验证 M-B2 抓到过：
+            // `state` 误写成 PascalCase 时，撤掉版本层之后它死在「unknown variant」而不是
+            // 「missing field」，而本用例断言的正是「不得红在字段解析层」）。
+            br#"{"operation_id":"old","state":"planned","data_dir":"/tmp/x",
+                 "planned":[{"manifest_relative_path":"manifests/aa/0.json","after":[]}],
+                 "published":[]}"#,
+        )
+        .unwrap();
+
+        let err = relink_journal_read(&path).expect_err("v1 journal 必须被拒");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("E-RELINK-JOURNAL-SCHEMA-MISMATCH"),
+            "必须带具名错误码，实得：{text}"
+        );
+        assert!(
+            text.contains("<absent>") && text.contains(&RELINK_JOURNAL_SCHEMA_VERSION.to_string()),
+            "错误必须同时给出**见到的**与**需要的**版本，实得：{text}"
+        );
+        assert!(
+            !text.contains("missing field"),
+            "不得红在字段解析层 —— 那是错误的层在说话；实得：{text}"
+        );
+    }
+    // =============== R1 Finding 6 判据结束（relink 侧）===============
+
     #[test]
     fn relink_reports_broken_db_link_pointing_at_missing_conversation() {
         let (_tmp, data_dir, rel, _conv_id, _src) = fixture(true);
         // 破坏一条 db_links：指向一个 DB 里不存在的 conversation。
-        crate::raw_mirror::rebuild_manifest_db_links(
-            &data_dir,
-            &rel,
-            &[RawMirrorDbLink {
-                conversation_id: Some(4242),
-                message_count: Some(1),
-                source_path: Some("/nowhere".into()),
-                started_at_ms: None,
-            }],
-        )
-        .unwrap();
+        // CAS 的 `expected_current` = 此刻盘上的样子（本用例是「刚建好、还没人动过」）。
+        let current_links = crate::raw_mirror::manifest_views(&data_dir)
+            .unwrap()
+            .into_iter()
+            .find(|v| v.manifest_relative_path == rel)
+            .expect("fixture 的 manifest")
+            .db_links;
+        assert_eq!(
+            crate::raw_mirror::rebuild_manifest_db_links(
+                &data_dir,
+                &rel,
+                &current_links,
+                &[RawMirrorDbLink {
+                    conversation_id: Some(4242),
+                    message_count: Some(1),
+                    source_path: Some("/nowhere".into()),
+                    started_at_ms: None,
+                }],
+            )
+            .unwrap(),
+            crate::raw_mirror::RebuildManifestDbLinksOutcome::Written
+        );
         let report = run(&data_dir, false);
         assert!(
             report.findings.iter().any(|f| matches!(
