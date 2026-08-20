@@ -269,7 +269,25 @@ static MESSAGE_LOOKUP_EXACT_IDX_PROBES: AtomicU64 = AtomicU64::new(0);
 static MESSAGE_LOOKUP_BOUNDED_QUERIES: AtomicU64 = AtomicU64::new(0);
 static MESSAGE_LOOKUP_FULL_SCAN_QUERIES: AtomicU64 = AtomicU64::new(0);
 static MESSAGE_LOOKUP_ROWS_MATERIALIZED: AtomicU64 = AtomicU64::new(0);
-static DEFAULT_DEFER_ANALYTICS_UPDATES: AtomicBool = AtomicBool::new(false);
+/// 进程级「默认延后分析写入」开关的**初始值**（没有任何 guard 在持有时的取值）。
+///
+/// 提成具名常量是 FIND-11 修复的一部分：栈空时要还原到**它**，
+/// 而不是还原到「最后一个 guard 进门时碰巧看到的值」。
+const DEFAULT_DEFER_ANALYTICS_UPDATES_INITIAL: bool = false;
+
+/// 读侧的快取。真源是下面的持有者栈；这里只是让
+/// `defer_analytics_updates_enabled()` 保持一次原子读的成本
+/// （它在每次插入批的路径上被调用，不能去抢锁）。
+static DEFAULT_DEFER_ANALYTICS_UPDATES: AtomicBool =
+    AtomicBool::new(DEFAULT_DEFER_ANALYTICS_UPDATES_INITIAL);
+
+/// 仍然活着的 guard 的**持有者栈**：`(guard_id, 该 guard 请求的值)`。
+///
+/// 用 `parking_lot::Mutex` 而不是 `std::sync::Mutex`：它不带毒化语义，
+/// 一次无关的 panic 不会把这条路径变成 `PoisonError` 连带源。
+static DEFER_ANALYTICS_GUARD_STACK: parking_lot::Mutex<Vec<(u64, bool)>> =
+    parking_lot::Mutex::new(Vec::new());
+static DEFER_ANALYTICS_GUARD_NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 pub(crate) struct MessageLookupTraceCounters {
@@ -315,21 +333,58 @@ pub(crate) fn message_lookup_trace_snapshot() -> MessageLookupTraceCounters {
     }
 }
 
+/// 进程级「默认延后分析写入」开关的 RAII 持有者。
+///
+/// # FIND-11 / 裁定 R-E-86 ②：为什么不是 `swap` + `Drop{store(previous)}`
+///
+/// 旧实现每个 guard 进门 `swap` 出旧值、出门把旧值写回。**那套 save-and-restore
+/// 只在严格嵌套下成立**：两个 guard 在不同线程上**交错**持有时，后释放者把
+/// 「它进门时看到的值」写回全局，于是全局停在一个谁都没有请求的值上，
+/// 而且**没有任何代码会把它纠正回来**。`true` 一旦滞留，本进程此后所有受该开关
+/// 门控的分析写入（`daily_stats` / `token_usage` / `token_daily_stats` /
+/// `message_metrics` / 三张 usage rollup）全部静默跳过 —— 没有日志、没有报错、
+/// 没有自愈路径。生产上这条路走得通：`run_doctor_impl` 会起后台线程跑 `run_index`，
+/// 而 `run_index` 一进门就取本 guard，且取在 index-run 锁**之前**，锁挡不住它。
+///
+/// 现在改成**持有者栈**：进门 push `(id, 请求值)`，出门按 **id** 摘掉自己那一条
+/// （不是弹栈顶），有效值 = 栈里最后一个仍然活着的条目，栈空则回到
+/// `DEFAULT_DEFER_ANALYTICS_UPDATES_INITIAL`。于是
+/// ① 全部释放之后必然回到初始值（**永久滞留被消掉**）；
+/// ② 同线程严格嵌套的语义原样保留（内层出门后恢复外层的值）——
+/// 这一条挡的是「用纯深度计数去修交错」那种改法，那样改会把嵌套弄坏。
+///
+/// # ⚠ 没修的那一半，如实写在这里
+///
+/// **交错期间「后来者把前一个的窗口提前改掉」依然会发生。** 一个进程级单值
+/// 无法同时满足两个线程各自要的值 —— 这是载体的问题，不是还原逻辑的问题。
+/// 要根治得把这个开关沿调用链传参（动 `insert_conversations_batched` 等
+/// 基线入口的签名），属基线冻结面，记 E9 已知加固选项，不在本 PR。
 pub(crate) struct DefaultDeferAnalyticsUpdatesGuard {
-    previous: bool,
+    id: u64,
 }
 
 impl Drop for DefaultDeferAnalyticsUpdatesGuard {
     fn drop(&mut self) {
-        DEFAULT_DEFER_ANALYTICS_UPDATES.store(self.previous, Ordering::Relaxed);
+        let mut stack = DEFER_ANALYTICS_GUARD_STACK.lock();
+        if let Some(pos) = stack.iter().rposition(|(id, _)| *id == self.id) {
+            stack.remove(pos);
+        }
+        let effective = stack
+            .last()
+            .map(|(_, value)| *value)
+            .unwrap_or(DEFAULT_DEFER_ANALYTICS_UPDATES_INITIAL);
+        DEFAULT_DEFER_ANALYTICS_UPDATES.store(effective, Ordering::Relaxed);
     }
 }
 
 pub(crate) fn default_defer_analytics_updates_guard(
     enabled: bool,
 ) -> DefaultDeferAnalyticsUpdatesGuard {
-    let previous = DEFAULT_DEFER_ANALYTICS_UPDATES.swap(enabled, Ordering::Relaxed);
-    DefaultDeferAnalyticsUpdatesGuard { previous }
+    let id = DEFER_ANALYTICS_GUARD_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let mut stack = DEFER_ANALYTICS_GUARD_STACK.lock();
+    stack.push((id, enabled));
+    DEFAULT_DEFER_ANALYTICS_UPDATES.store(enabled, Ordering::Relaxed);
+    DefaultDeferAnalyticsUpdatesGuard { id }
 }
 
 fn record_message_lookup_bounded_queries(query_count: u64, rows: usize) {
@@ -17008,6 +17063,58 @@ mod tests {
         }
     }
 
+    /// FIND-11 / 裁定 R-E-86 ②：**交错持有的两个 guard 不得留下谁都没请求的值**。
+    ///
+    /// 这条是**确定性**判据，不靠竞态复现：在同一个线程里手工把两个 guard 的
+    /// 持有区间**交错**开（先进的先出，而不是后进先出），旧实现
+    /// （`swap` + `Drop{store(previous)}`）会在最后一个 guard 释放之后
+    /// 把 `true` 永久留在进程级全局里 —— 此后本进程所有受该开关门控的分析写入
+    /// （`daily_stats` / `token_usage` / `token_daily_stats` / `message_metrics` /
+    /// 三张 usage rollup）全部静默跳过，没有日志、没有报错、没有自愈路径。
+    ///
+    /// 第二段是**非回归**断言：同线程严格嵌套的语义必须原样保留（内层出门后恢复外层的值）。
+    /// 它挡的是「用一个纯深度计数去修交错」那种改法 —— 那样改会让内层 guard 的
+    /// `Drop` 不再恢复外层的值，交错修好了、嵌套坏了。
+    #[test]
+    #[serial]
+    fn defer_analytics_guards_never_leak_a_value_nobody_requested() {
+        let _defer_env = unset_env_var("CASS_DEFER_ANALYTICS_UPDATES");
+        let _inline_env = unset_env_var("CASS_INLINE_ANALYTICS_UPDATES");
+        assert!(
+            !defer_analytics_updates_enabled(),
+            "前置断言：本用例的起点必须是 inline（两个 env 已 unset、无 guard 在持有）"
+        );
+
+        // ── 交错：g_true 先进先出，g_false 后进后出 ──────────────────────
+        let g_true = default_defer_analytics_updates_guard(true);
+        let g_false = default_defer_analytics_updates_guard(false);
+        drop(g_true);
+        drop(g_false);
+        assert!(
+            !defer_analytics_updates_enabled(),
+            "全部 guard 释放之后必须回到初始值；旧实现在这里留下 true 并且再也不会自己回来"
+        );
+
+        // ── 非回归：同线程严格嵌套的语义不变 ────────────────────────────
+        let outer = default_defer_analytics_updates_guard(true);
+        {
+            let _inner = default_defer_analytics_updates_guard(false);
+            assert!(
+                !defer_analytics_updates_enabled(),
+                "内层 guard 持有期间以内层的值为准"
+            );
+        }
+        assert!(
+            defer_analytics_updates_enabled(),
+            "内层释放之后必须恢复外层请求的 true —— 纯深度计数的改法会在这里红"
+        );
+        drop(outer);
+        assert!(
+            !defer_analytics_updates_enabled(),
+            "外层也释放之后回到初始值"
+        );
+    }
+
     fn frontier_test_conversation(idx_created_at: &[(i64, Option<i64>)]) -> Conversation {
         Conversation {
             id: None,
@@ -18908,7 +19015,22 @@ mod tests {
     // =========================================================================
 
     #[test]
+    #[serial]
     fn analytics_ingest_populates_metrics_and_rollups() {
+        // FIND-10 / 裁定 R-E-86 ①：本用例断言分析表**有行**，而分析写入受一个
+        // **进程级**开关 `DEFAULT_DEFER_ANALYTICS_UPDATES` 门控，`run_index()`
+        // 一进门就把它翻成「延后」。所以本用例不能与任何跑索引的测试并发 ——
+        // `#[serial]` 就是干这个的：`--lib` 里所有能进 `run_index` 的测试都带
+        // `#[serial]`，入组即与它们互斥。
+        //
+        // **这里曾经还有一行 `default_defer_analytics_updates_guard(false)` 钉死，
+        // 已按实验撤掉**，三个实验各否掉它的一种「保护」说法：
+        //   M2 · 只留 `#[serial]`、撤钉死 → 定向复现 **0/8**（serial 一道就够）；
+        //   M1 · 只留钉死、撤 `#[serial]` → 仍然 **8/8 红**（持有者栈后 push 者生效，
+        //        索引测试的 guard 铺完 fixture 才 push，总比本用例开头的钉死来得晚）；
+        //   J2′ · 带钉死 + `CASS_DEFER_ANALYTICS_UPDATES=1` → **5/5 红**
+        //        （`defer_analytics_updates_enabled()` 里 env 判在 guard 之前，钉死管不着）。
+        // 留一个读起来像保护、实测不保护的东西在测试里，与写一条恒亮的假警报同罪。
         use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
         use std::path::PathBuf;
 
@@ -20039,7 +20161,22 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn insert_conversation_tree_recreates_daily_stats_after_manual_clear() {
+        // FIND-10 / 裁定 R-E-86 ①：本用例断言分析表**有行**，而分析写入受一个
+        // **进程级**开关 `DEFAULT_DEFER_ANALYTICS_UPDATES` 门控，`run_index()`
+        // 一进门就把它翻成「延后」。所以本用例不能与任何跑索引的测试并发 ——
+        // `#[serial]` 就是干这个的：`--lib` 里所有能进 `run_index` 的测试都带
+        // `#[serial]`，入组即与它们互斥。
+        //
+        // **这里曾经还有一行 `default_defer_analytics_updates_guard(false)` 钉死，
+        // 已按实验撤掉**，三个实验各否掉它的一种「保护」说法：
+        //   M2 · 只留 `#[serial]`、撤钉死 → 定向复现 **0/8**（serial 一道就够）；
+        //   M1 · 只留钉死、撤 `#[serial]` → 仍然 **8/8 红**（持有者栈后 push 者生效，
+        //        索引测试的 guard 铺完 fixture 才 push，总比本用例开头的钉死来得晚）；
+        //   J2′ · 带钉死 + `CASS_DEFER_ANALYTICS_UPDATES=1` → **5/5 红**
+        //        （`defer_analytics_updates_enabled()` 里 env 判在 guard 之前，钉死管不着）。
+        // 留一个读起来像保护、实测不保护的东西在测试里，与写一条恒亮的假警报同罪。
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test.db");
         let storage = SqliteStorage::open(&db_path).unwrap();
@@ -28063,7 +28200,22 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn franken_insert_conversations_batched_populates_analytics_rollups() {
+        // FIND-10 / 裁定 R-E-86 ①：本用例断言分析表**有行**，而分析写入受一个
+        // **进程级**开关 `DEFAULT_DEFER_ANALYTICS_UPDATES` 门控，`run_index()`
+        // 一进门就把它翻成「延后」。所以本用例不能与任何跑索引的测试并发 ——
+        // `#[serial]` 就是干这个的：`--lib` 里所有能进 `run_index` 的测试都带
+        // `#[serial]`，入组即与它们互斥。
+        //
+        // **这里曾经还有一行 `default_defer_analytics_updates_guard(false)` 钉死，
+        // 已按实验撤掉**，三个实验各否掉它的一种「保护」说法：
+        //   M2 · 只留 `#[serial]`、撤钉死 → 定向复现 **0/8**（serial 一道就够）；
+        //   M1 · 只留钉死、撤 `#[serial]` → 仍然 **8/8 红**（持有者栈后 push 者生效，
+        //        索引测试的 guard 铺完 fixture 才 push，总比本用例开头的钉死来得晚）；
+        //   J2′ · 带钉死 + `CASS_DEFER_ANALYTICS_UPDATES=1` → **5/5 红**
+        //        （`defer_analytics_updates_enabled()` 里 env 判在 guard 之前，钉死管不着）。
+        // 留一个读起来像保护、实测不保护的东西在测试里，与写一条恒亮的假警报同罪。
         use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
         use frankensqlite::compat::{ConnectionExt, RowExt};
         use std::path::PathBuf;
@@ -28993,6 +29145,7 @@ mod tests {
 mod e5_replace_tests {
     use super::*;
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+    use serial_test::serial;
     use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -29590,7 +29743,22 @@ mod e5_replace_tests {
     }
 
     #[test]
+    #[serial]
     fn e5_replace_derived_rows_match_baseline_path() {
+        // FIND-10 / 裁定 R-E-86 ①：本用例断言分析表**有行**，而分析写入受一个
+        // **进程级**开关 `DEFAULT_DEFER_ANALYTICS_UPDATES` 门控，`run_index()`
+        // 一进门就把它翻成「延后」。所以本用例不能与任何跑索引的测试并发 ——
+        // `#[serial]` 就是干这个的：`--lib` 里所有能进 `run_index` 的测试都带
+        // `#[serial]`，入组即与它们互斥。
+        //
+        // **这里曾经还有一行 `default_defer_analytics_updates_guard(false)` 钉死，
+        // 已按实验撤掉**，三个实验各否掉它的一种「保护」说法：
+        //   M2 · 只留 `#[serial]`、撤钉死 → 定向复现 **0/8**（serial 一道就够）；
+        //   M1 · 只留钉死、撤 `#[serial]` → 仍然 **8/8 红**（持有者栈后 push 者生效，
+        //        索引测试的 guard 铺完 fixture 才 push，总比本用例开头的钉死来得晚）；
+        //   J2′ · 带钉死 + `CASS_DEFER_ANALYTICS_UPDATES=1` → **5/5 红**
+        //        （`defer_analytics_updates_enabled()` 里 env 判在 guard 之前，钉死管不着）。
+        // 留一个读起来像保护、实测不保护的东西在测试里，与写一条恒亮的假警报同罪。
         // 第二定义等价门（裁定 R-E-41 A′）：同一份消息集，一侧走基线
         // `insert_conversations_batched`，一侧走 replace 函数，两张派生表逐列相等。
         let base_dir = TempDir::new().unwrap();
@@ -29774,7 +29942,22 @@ mod e5_replace_tests {
     }
 
     #[test]
+    #[serial]
     fn e5_replace_leaves_the_five_accumulating_aggregate_tables_untouched() {
+        // FIND-10 / 裁定 R-E-86 ①：本用例断言分析表**有行**，而分析写入受一个
+        // **进程级**开关 `DEFAULT_DEFER_ANALYTICS_UPDATES` 门控，`run_index()`
+        // 一进门就把它翻成「延后」。所以本用例不能与任何跑索引的测试并发 ——
+        // `#[serial]` 就是干这个的：`--lib` 里所有能进 `run_index` 的测试都带
+        // `#[serial]`，入组即与它们互斥。
+        //
+        // **这里曾经还有一行 `default_defer_analytics_updates_guard(false)` 钉死，
+        // 已按实验撤掉**，三个实验各否掉它的一种「保护」说法：
+        //   M2 · 只留 `#[serial]`、撤钉死 → 定向复现 **0/8**（serial 一道就够）；
+        //   M1 · 只留钉死、撤 `#[serial]` → 仍然 **8/8 红**（持有者栈后 push 者生效，
+        //        索引测试的 guard 铺完 fixture 才 push，总比本用例开头的钉死来得晚）；
+        //   J2′ · 带钉死 + `CASS_DEFER_ANALYTICS_UPDATES=1` → **5/5 红**
+        //        （`defer_analytics_updates_enabled()` 里 env 判在 guard 之前，钉死管不着）。
+        // 留一个读起来像保护、实测不保护的东西在测试里，与写一条恒亮的假警报同罪。
         // E6 Step 1b 的边界：五张累加型物化聚合表在事务**提交之后**才重算，
         // 本函数一行都不许碰。边界只写在文档里、没有断言，实现漂过去时不会有东西红。
         let dir = TempDir::new().unwrap();
