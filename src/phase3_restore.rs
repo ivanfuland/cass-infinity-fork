@@ -877,7 +877,13 @@ impl RelationCensus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OverrideEntry {
     pub identity: RestoreIdentity,
-    /// 裁定人。
+    /// 裁定人的**角色标识**。
+    ///
+    /// ⚠ **不得落真实人名**（R2 Finding 16）：这个字段的值会随 manifest / 台账进入
+    /// **公开仓**的 diff 与测试 fixture。本仓曾在这里落过一个真名，9 条模式的隐私扫描
+    /// 没抓到——因为那几条模式锚在**路径**与**账号**面，裸名不在集合里。
+    /// **洞在字段不在那一次的值**：口径没钉住，下一次同样会有人顺手填真名。
+    /// 用角色标识（`adj-1` / `release-owner` 这类），不用人名。
     pub adjudicator: String,
     /// 选中哪个 blob——**按内容 hash**，不是按路径或序号。
     pub chosen_blob_hash: String,
@@ -1756,7 +1762,7 @@ mod e4_winner_and_decision_tests {
             "source_id": "src-h1",
             "origin_host": "h1",
             "canonical_path": path,
-            "adjudicator": "ivan",
+            "adjudicator": "adj-1",
             "chosen_blob_hash": blob,
             "reason": "手工裁定：取更长的那份",
             "snapshot_root": root,
@@ -1773,7 +1779,7 @@ mod e4_winner_and_decision_tests {
         let id = identity(Origin::ClaudeCode, "h1", PATH);
         let e = ledger.effective_for(&id).expect("当前 root 下该裁定有效");
         assert_eq!(e.chosen_blob_hash, "blob-1");
-        assert_eq!(e.adjudicator, "ivan");
+        assert_eq!(e.adjudicator, "adj-1");
         assert!(e.covers_w1_winner && e.covers_w2_winner);
         assert_eq!(ledger.snapshot_root(), ROOT_A);
     }
@@ -6567,7 +6573,7 @@ pub(crate) fn restore_pause_if_requested(boundary: &str) {
 /// * `openclaw/<agent>` 前缀 → `Openclaw`（`main` / `wood` / `javich` … 是同一家的 agent 实例）。
 ///
 /// **未知 slug 返回 `None`，不猜、不兜底。** `pi_agent` 与 `gemini` 落在这里且**是定案**
-/// （Ivan 2026-08-19 确认）：它们不属受保护资产的三家，永久具名 HOLD，不入三族。
+/// （2026-08-19 上位裁定确认）：它们不属受保护资产的三家，永久具名 HOLD，不入三族。
 /// 放宽 `Origin` 本身的取值空间是被否掉的路（R-E-67 (a)）——那是为读侧方便去改封存契约。
 pub(crate) fn normalize_provider_to_origin(provider: &str) -> Option<Origin> {
     if let Some(origin) = Origin::parse(provider) {
@@ -11199,7 +11205,7 @@ mod e8_dry_run_planner_tests {
     /// 9488 份真 manifest 的 provider 全集），**不是想出来的**。
     ///
     /// 表里带上三个正名与两个「定案不映射」的值：前者防归一把恒等映射写坏，后者把
-    /// 「`pi_agent` / `gemini` 不入三族」（Ivan 2026-08-19 确认）钉成机器事实 —— 哪天有人
+    /// 「`pi_agent` / `gemini` 不入三族」（2026-08-19 上位裁定确认）钉成机器事实 —— 哪天有人
     /// 顺手给它们加一条映射，这里会红。
     #[test]
     fn r_e_67_provider_normalization_covers_every_measured_value() {

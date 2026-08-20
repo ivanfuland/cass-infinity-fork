@@ -7244,7 +7244,7 @@ async fn execute_cli(
                         "manifests_seen": report.manifests_seen,
                         "origin_unmapped": report.origin_unmapped.len(),
                         "origin_unmapped_providers": unmapped_provider_tally,
-                        // FIND-1（Ivan 2026-08-19 裁 B 案）：不加代际字段，改把操作规约写进
+                        // FIND-1（2026-08-19 上位裁定：B 案）：不加代际字段，改把操作规约写进
                         // 工具自己的嘴里——靠人记得的规约迟早会被忘掉一次。
                         "post_apply_requirement":
                             "after --apply you must re-ingest in full; until that re-ingest \
