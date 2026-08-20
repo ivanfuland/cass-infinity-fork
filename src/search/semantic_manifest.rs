@@ -365,6 +365,11 @@ pub struct SemanticShardManifest {
     /// `None` 表示这份 manifest 由 pre-W1 binary 写出、根本没记代际 ——
     /// 判 `Unknown` 要求重建，**不得当成匹配**。`serde(default)` 是为了让
     /// 旧 manifest 仍能解析：判「未知代际」是一个裁定，不是解析失败。
+    ///
+    /// ⚠ **生产侧目前没有写入者，但它不是死代码，不得清理**（裁定 R-E-93）：
+    /// 契约 D3 的索引产物侧这一半是「已定义未接线」——判据、verdict 与回归测试都在，
+    /// 缺的只是发射点，接线登记为 merge 后事项（建议随一次全量重摄入一批做）。
+    /// 把它当 never-used 删掉，等于把接线的地基一并拆了。
     #[serde(default)]
     pub source_content_generation: Option<String>,
 }

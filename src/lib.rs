@@ -101250,6 +101250,55 @@ mod mirror_relink_tests {
     }
     // =============== R1 Finding 14 判据结束（relink 侧）===============
 
+    /// 锚定的声称原文：`mirror-relink` 的 `--apply` help（`src/lib.rs` 的
+    /// `Commands::MirrorRelink`）——「Actually write the rebuilt db_links.
+    /// **Without this flag nothing is written.**」
+    ///
+    /// R1 Finding 15 揭出的是「关于代码行为的一句话变假了而没人发现」这一类缺陷
+    /// （restore 那边的同型声称就是假的）。这条把 relink 侧的这句变成机器判据：
+    /// dry-run 跑完，现场文件树必须**逐条不变**——新增、大小变化都算变。
+    #[test]
+    fn relink_dry_run_writes_nothing_as_its_help_claims() {
+        let (_tmp, data_dir, _rel, _conv, _src) = fixture(false);
+        let before = crate::phase3_restore::test_tree_snapshot(&data_dir);
+        assert!(!before.is_empty(), "前置断言：现场必须非空");
+
+        let report = run(&data_dir, false);
+        assert!(
+            !report.changes.is_empty(),
+            "前置断言：dry-run 必须真的算出了 change —— 一个什么都没算出来的 relink \
+             当然也什么都不写，那样这条测试就在替一句它没验过的话背书"
+        );
+
+        let after = crate::phase3_restore::test_tree_snapshot(&data_dir);
+        let new: Vec<_> = after.iter().filter(|x| !before.contains(x)).collect();
+        let changed: Vec<_> = after
+            .iter()
+            .filter(|(name, size)| {
+                before
+                    .iter()
+                    .any(|(bname, bsize)| bname == name && bsize != size)
+            })
+            .collect();
+
+        // 阳性对照先跑：空结果 ≠ 不存在，先证明快照抓得到新增文件。
+        std::fs::write(data_dir.join("positive-control.txt"), b"x").unwrap();
+        let control = crate::phase3_restore::test_tree_snapshot(&data_dir);
+        assert!(
+            control
+                .iter()
+                .any(|(n, _)| n.contains("positive-control.txt"))
+                && !before.iter().any(|(n, _)| n.contains("positive-control.txt")),
+            "阳性对照失败：快照抓不到刚写进去的文件，下面的结论作废"
+        );
+
+        assert!(
+            new.is_empty() && changed.is_empty(),
+            "relink 的 --apply help 说不给它就什么都不写，实测 dry-run 之后现场变了：\
+             新增 {new:?}；大小变化 {changed:?}"
+        );
+    }
+
     #[test]
     fn relink_rebuilds_db_links_from_real_identity() {
         let (_tmp, data_dir, rel, conv_id, _src) = fixture(false);

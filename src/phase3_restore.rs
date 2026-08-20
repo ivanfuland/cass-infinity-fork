@@ -7951,6 +7951,37 @@ pub(crate) fn qualify_w1_candidate(
 //
 // 落点说明见 run root 的 `e7-journal-state-machine.md`（先写说明再动代码，照 E6 先例）。
 // ===========================================================================
+/// 递归快照一棵树的「相对路径 → 字节数」（目录记成以 `/` 结尾、大小 0）。
+///
+/// **三条 F15 判据共用这一个定义**（裁定 R-E-92）：复制三份等于给同一句「不写」
+/// 造三套口径，日后改一份漏两份。符号链接按自身记（`symlink_metadata`），
+/// 不跟随——跟随会让「链接指向的东西变了」冒充成「本树变了」。
+#[cfg(test)]
+pub(crate) fn test_tree_snapshot(root: &Path) -> Vec<(String, u64)> {
+    fn walk(dir: &Path, base: &Path, out: &mut Vec<(String, u64)>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            let rel = path.strip_prefix(base).unwrap().display().to_string();
+            if meta.is_dir() {
+                out.push((format!("{rel}/"), 0));
+                walk(&path, base, out);
+            } else {
+                out.push((rel, meta.len()));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort();
+    out
+}
+
 #[cfg(test)]
 mod e7_restore_journal_tests {
     use super::*;
@@ -9323,6 +9354,56 @@ mod e7_restore_journal_tests {
         );
     }
 
+    // ══ R1 Finding 15 实质半 / 裁定 R-E-92：三句「不写」的声称转正为机器判据 ══
+    //
+    // 本条 finding 的成因不是某段代码写错了，是**一句关于代码行为的话变假了而没人发现**
+    // （`--apply` 的 help 曾写「不给它就什么都不写」，而规划本身总会往 `--scratch` 下
+    // 物化文件）。所以处置也不是改代码，是把这类声称**变成会红的东西**：
+    // 声称一旦变假，测试立刻红，而不是等下一次对抗审来读文档。
+    //
+    // 三条判据分别锚定三句声称，出处逐条写在各自的注释里。
+
+    /// 锚定的声称原文：`--qualify` 的 help（`src/lib.rs` 的 `Commands::MirrorRestore`）——
+    /// 「只跑**解析级资格门**（不写任何东西）」。
+    ///
+    /// 把它变成机器判据：跑一次 qualify，`data_dir` 与候选 DB 所在目录必须逐条不变。
+    /// （part6 §3 教训 8 提示过「用 cass 读库会在旁边造出 `doctor/locks/`」——
+    /// 在这条路径上没有发生，而「没发生」这件事本身现在有测试守着了。）
+    #[test]
+    fn e7_qualify_writes_nothing_as_its_help_claims() {
+        let d = qualified_candidate();
+        let db_dir = d.db_path.parent().unwrap().to_path_buf();
+        let before_data = test_tree_snapshot(&d.data_dir);
+        let before_db = test_tree_snapshot(&db_dir);
+        assert!(
+            !before_data.is_empty(),
+            "前置断言：现场必须非空，否则「零新增」是在对一棵空树说话"
+        );
+
+        qualify(&d).expect("前置断言：这一份必须是合格的，否则门在第一层就退出了、走不到后面");
+
+        let after_data = test_tree_snapshot(&d.data_dir);
+        let after_db = test_tree_snapshot(&db_dir);
+        let new_data: Vec<_> = after_data.iter().filter(|x| !before_data.contains(x)).collect();
+        let new_db: Vec<_> = after_db.iter().filter(|x| !before_db.contains(x)).collect();
+        assert!(
+            new_data.is_empty() && new_db.is_empty(),
+            "`--qualify` 的 help 说它不写任何东西，实测跑完之后现场多出了东西：\
+             data_dir 新增 {new_data:?}；db 目录新增 {new_db:?}"
+        );
+
+        // 阳性对照：**空结果 ≠ 不存在**。先证明这个快照抓得到新增文件，
+        // 上面那句「零新增」才是结论而不是探针失灵。
+        std::fs::write(d.data_dir.join("positive-control.txt"), b"x").unwrap();
+        let control = test_tree_snapshot(&d.data_dir);
+        assert!(
+            control
+                .iter()
+                .any(|(name, _)| name.contains("positive-control.txt")),
+            "阳性对照失败：快照连一个刚写进去的文件都抓不到，上面的「零新增」作废"
+        );
+    }
+
     // ── 闭世界：未声明字段 ──────────────────────────────────────────────
     #[test]
     fn e7_qualification_rejects_an_unknown_field() {
@@ -10496,6 +10577,53 @@ mod e8_dry_run_planner_tests {
             snapshot_root: "e8-bench-root".into(),
         })
         .expect("dry-run planner must run")
+    }
+
+    /// 锚定的声称原文：`mirror-restore` 子命令的 doc（`src/lib.rs`）——
+    /// 「**Dry-run by default: neither the mirror nor the candidate database is
+    /// written.** Planning still materializes projections under `--scratch`, and
+    /// `--out` writes report files — so this is not a no-write mode.」
+    /// （这句是 F11 那批把原来的「什么都不写」改成的如实措辞，R1 Finding 15 / R-E-84。）
+    ///
+    /// **两半都要判，缺一半这条测试就会替另一句谎话背书**：
+    /// 前半句「不写 mirror、不写候选库」判零变化；后半句「不是 no-write 模式」判
+    /// scratch 下**确实**多了东西。只判前半句的话，一个真的什么都不做的 planner
+    /// 也能让它绿；只判后半句的话，一个顺手改了 mirror 的 planner 同样能绿。
+    #[test]
+    fn e8_dry_run_writes_only_under_scratch_exactly_as_the_doc_claims() {
+        let b = bench();
+        let before_data = crate::phase3_restore::test_tree_snapshot(&b.data_dir);
+        let before_scratch = crate::phase3_restore::test_tree_snapshot(&b.scratch);
+        assert!(
+            !before_data.is_empty(),
+            "前置断言：mirror 与候选库必须先在盘上，否则「逐条不变」是在对空树说话"
+        );
+
+        let report = report_of(&b);
+        assert!(
+            report.identities_considered > 0,
+            "前置断言：planner 必须真的判过身份，否则它什么都没做、下面两半都没意义"
+        );
+
+        let after_data = crate::phase3_restore::test_tree_snapshot(&b.data_dir);
+        let after_scratch = crate::phase3_restore::test_tree_snapshot(&b.scratch);
+
+        // 前半句：mirror 面与候选库**逐条**不变（新增、消失、大小变化都算变）。
+        assert_eq!(
+            after_data, before_data,
+            "dry-run 说它不写 mirror、也不写候选库，实测 data_dir 变了"
+        );
+
+        // 后半句：scratch 下确实多了东西 —— 「这不是 no-write 模式」同样是被声称的事实。
+        let new_scratch: Vec<_> = after_scratch
+            .iter()
+            .filter(|x| !before_scratch.contains(x))
+            .collect();
+        assert!(
+            !new_scratch.is_empty(),
+            "doc 明写规划会把投影物化到 --scratch 下，实测 scratch 一个新条目都没有 —— \
+             要么 planner 没走到物化，要么那句如实措辞又变假了"
+        );
     }
 
     // ── Step 2 的验证条件写进代码断言：能被机器判的不留给人眼 ────────────
