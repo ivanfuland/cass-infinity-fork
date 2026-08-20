@@ -2080,7 +2080,49 @@ fn materialize_sealed_blob(
         });
     }
     let relative = rebuild_relative_shape(input.canonical_original_path)?;
-    let target = scratch_root.join(&relative);
+
+    // ── R-E-84 (a)：逐分量拒 symlink ────────────────────────────────────
+    //
+    // `rebuild_relative_shape` 拒的是**路径字符串里的 `..`**；这里拒的是
+    // **文件系统里的 symlink**。两者是两层：字符串再干净，只要落地的某一级分量是
+    // 指向外面的 symlink，`create_dir_all` 与 `std::fs::write` 都会跟着走出去，
+    // 而后者带截断语义——实测一次 dry-run 把 scratch 之外的既有文件
+    // 从 61 字节覆盖成 378367 字节（R1 Finding 11）。
+    //
+    // 为什么校验从**根**开始逐级下降而不是只看最后一级：中间任何一级是 symlink
+    // 就已经出去了，最后一级看起来仍然「在根下」。
+    std::fs::create_dir_all(scratch_root).map_err(|err| ProjectionFault::Materialize {
+        detail: format!("create_dir_all {}: {err}", scratch_root.display()),
+    })?;
+    let canonical_root =
+        std::fs::canonicalize(scratch_root).map_err(|err| ProjectionFault::Materialize {
+            detail: format!(
+                "canonicalize scratch root {}: {err}",
+                scratch_root.display()
+            ),
+        })?;
+    let mut walk = canonical_root.clone();
+    for component in relative.components() {
+        walk.push(component);
+        match std::fs::symlink_metadata(&walk) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(ProjectionFault::UnsafeOriginalPath {
+                    detail: format!(
+                        "E-SCRATCH-SYMLINK-ESCAPE: component {} under the scratch root is a \
+                         symlink — refusing to materialize through it (following it would write, \
+                         and possibly truncate, a file outside {})",
+                        walk.display(),
+                        canonical_root.display()
+                    ),
+                });
+            }
+            // 不存在 = 本轮要新建，正常；其他 stat 错误一并放行给后面的 create/write 去报，
+            // 那里的错误信息更贴近真正失败的那一步。
+            _ => {}
+        }
+    }
+
+    let target = canonical_root.join(&relative);
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent).map_err(|err| ProjectionFault::Materialize {
             detail: format!("create_dir_all {}: {err}", parent.display()),
@@ -2090,9 +2132,30 @@ fn materialize_sealed_blob(
         detail: format!("write {}: {err}", target.display()),
     })?;
 
-    let written = std::fs::metadata(&target)
+    // ── R-E-84 (c)：写后前缀断言兜底 ────────────────────────────────────
+    //
+    // (a) 是判断，判断可能有漏（竞态、我没想到的形态）。这一层直接问文件系统
+    // 「刚写的这个东西最终在哪」，不在根下就删掉再拒——**兜的是 (a) 的判断漏，
+    // 不是替代它**：覆盖若已发生，发生在这条断言之前，所以两层必须合用。
+    let canonical_target =
+        std::fs::canonicalize(&target).map_err(|err| ProjectionFault::Materialize {
+            detail: format!("canonicalize materialized {}: {err}", target.display()),
+        })?;
+    if !canonical_target.starts_with(&canonical_root) {
+        let _ = std::fs::remove_file(&canonical_target);
+        return Err(ProjectionFault::UnsafeOriginalPath {
+            detail: format!(
+                "E-SCRATCH-SYMLINK-ESCAPE: materialized file resolved to {} which is outside the \
+                 scratch root {} — removed it and refusing",
+                canonical_target.display(),
+                canonical_root.display()
+            ),
+        });
+    }
+
+    let written = std::fs::metadata(&canonical_target)
         .map_err(|err| ProjectionFault::Materialize {
-            detail: format!("stat back {}: {err}", target.display()),
+            detail: format!("stat back {}: {err}", canonical_target.display()),
         })?
         .len();
     if written != input.source_size_bytes {
@@ -2101,7 +2164,7 @@ fn materialize_sealed_blob(
             blob: written,
         });
     }
-    Ok(target)
+    Ok(canonical_target)
 }
 
 /// 一次封存投影的处置。
@@ -2594,6 +2657,100 @@ mod e5_materialization_tests {
             rebuild_relative_shape("").unwrap_err(),
             ProjectionFault::UnsafeOriginalPath { .. }
         ));
+    }
+
+    // ── R-E-84 / R1 Finding 11：symlink 越界写 ────────────────────────────
+    //
+    // `rebuild_relative_shape` 只拒 `..`，注释还明写「否则物化会逃出 scratch 根」——
+    // **但它防的是路径里的 `..`，防不了文件系统里的 symlink**。
+    // `create_dir_all` 与 `std::fs::write` 都跟随 symlink，后者还带截断语义：
+    // **路径清洗做在字符串层，逃逸发生在 inode 层。**
+    //
+    // 实测（修前）：一次 dry-run 把 scratch 之外的一个既有文件从 61 字节
+    // **覆盖成 378367 字节**，退出码 0、无任何警告。
+    //
+    // 可达性：物化根是 `scratch/v-<内容 blake3>/`，所以在 `scratch/` 顶层放 symlink 打不中。
+    // **但 slot 名在第一轮之后就都在盘上了**——scratch 复用时，把某个已知 slot 里的
+    // 分量换成 symlink，下一轮就跟着走出去。scratch 复用是常态。
+    #[test]
+    fn materialize_refuses_to_follow_a_symlink_out_of_the_scratch_root() {
+        let root = scratch("symlink-escape");
+        let outside = std::env::temp_dir().join(format!(
+            "cc-cass-e5-symlink-escape-outside-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&outside).unwrap();
+
+        // scratch 之外的一个**既有**文件 —— 没有它就只能证「写出去了」，
+        // 证不了更重的那半：「把别人的东西盖掉了」。
+        let victim = outside.join("u").join("s.jsonl");
+        std::fs::create_dir_all(victim.parent().unwrap()).unwrap();
+        let original = b"outside content that must survive\n";
+        std::fs::write(&victim, original).unwrap();
+
+        // 把 scratch 里的 `home` 分量换成指向外部的 symlink（模拟复用残留）。
+        let planted = root.join("home");
+        let _ = std::fs::remove_dir_all(&planted);
+        let _ = std::fs::remove_file(&planted);
+        std::os::unix::fs::symlink(&outside, &planted).unwrap();
+
+        let blob = b"{\"role\":\"user\"}\n";
+        let input = SealedSource {
+            agent: Origin::ClaudeCode,
+            canonical_original_path: "/home/u/s.jsonl",
+            source_size_bytes: blob.len() as u64,
+            blob,
+        };
+        let err = materialize_sealed_blob(&root, &input)
+            .expect_err("路径经由 symlink 走出 scratch 根时必须拒绝");
+        match &err {
+            ProjectionFault::UnsafeOriginalPath { detail } => {
+                assert!(
+                    detail.contains("E-SCRATCH-SYMLINK-ESCAPE"),
+                    "必须以具名错误码拒，实得：{detail}"
+                );
+                assert!(
+                    detail.contains("home"),
+                    "错误要点出**是哪个分量**是 symlink，否则操作者无从下手：{detail}"
+                );
+            }
+            other => panic!("期望 UnsafeOriginalPath，实得 {other:?}"),
+        }
+
+        // **最要紧的一条**：外部既有文件必须逐字节不变。
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            original,
+            "scratch 之外的既有文件被改动 —— 这正是本条要防的事"
+        );
+        // 也不许在外面新建东西。
+        assert_eq!(
+            std::fs::read_dir(&outside).unwrap().count(),
+            1,
+            "scratch 之外不得多出任何条目"
+        );
+
+        std::fs::remove_file(&planted).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    /// 正常路径不受影响：没有 symlink 时照常物化（否则上面那条可能是恒拒的假绿）。
+    #[test]
+    fn materialize_still_works_when_no_component_is_a_symlink() {
+        let root = scratch("symlink-negative");
+        let blob = b"{\"role\":\"user\"}\n";
+        let input = SealedSource {
+            agent: Origin::ClaudeCode,
+            canonical_original_path: "/home/u/plain.jsonl",
+            source_size_bytes: blob.len() as u64,
+            blob,
+        };
+        let target = materialize_sealed_blob(&root, &input).expect("无 symlink 时必须照常物化");
+        assert!(target.starts_with(&root), "物化件必须落在 scratch 根下");
+        assert_eq!(std::fs::read(&target).unwrap(), blob);
+        // 复用同一 slot 再来一次也必须照常（复用是常态，不能被防护误伤）。
+        materialize_sealed_blob(&root, &input).expect("复用同一 scratch 必须仍然可用");
     }
 
     #[test]

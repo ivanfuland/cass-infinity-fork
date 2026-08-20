@@ -667,7 +667,12 @@ pub enum Commands {
     },
 
     /// Plan (and optionally apply) a restore from the sealed raw-mirror into a
-    /// candidate database. **Dry-run by default: nothing is written.**
+    /// candidate database.
+    ///
+    /// **Dry-run by default: neither the mirror nor the candidate database is
+    /// written.** Planning still materializes projections under `--scratch`, and
+    /// `--out` writes report files — so this is not a no-write mode. The earlier
+    /// wording ("nothing is written") was inaccurate (R1 Finding 15 / R-E-84).
     MirrorRestore {
         /// mirror 面的根。**入参而非常量** —— E8 给封存件只读面，
         /// E8b 换 materialize 出来的可写工作树。
@@ -684,6 +689,12 @@ pub enum Commands {
         candidate_db: PathBuf,
 
         /// 投影物化用的隔离根。**不进任何判定**。
+        ///
+        /// **应当是本次运行独占的目录。** 复用一棵旧 scratch 有风险：物化件按内容定名
+        /// 落在 `<scratch>/v-<hash>/` 下，这些目录名在第一轮之后就都在盘上了；
+        /// 若其中某一级分量被换成指向外部的 symlink，物化就会跟着走出去。
+        /// 工具已加双层防护（写前逐分量拒 symlink + 写后前缀断言，R-E-84），
+        /// 但独占目录仍是更省事的那条路。
         #[arg(long)]
         scratch: PathBuf,
 
@@ -695,7 +706,11 @@ pub enum Commands {
         #[arg(long)]
         out: Option<PathBuf>,
 
-        /// 真正执行计划。**不给这个 flag 什么都不写。**
+        /// 真正执行计划。
+        ///
+        /// **不给这个 flag 时，不写 mirror、也不写候选库**——但**不是「什么都不写」**：
+        /// 规划过程本身会把投影物化到 `--scratch` 下，给了 `--out` 还会写报告文件。
+        /// 原先那句「什么都不写」是不准的（R1 Finding 15 / R-E-84）。
         #[arg(long, default_value_t = false)]
         apply: bool,
 
