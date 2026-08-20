@@ -724,6 +724,17 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         qualify: bool,
 
+        /// `--qualify` 的**深度档**：把每个 blob 的真实字节全读一遍重算 blake3。
+        ///
+        /// 两档各保证什么（裁定 R-E-91）：
+        /// **默认档**摘 manifest 的文件字节进 mirror 身份，并逐份核 blob 的存在性与
+        /// 字节数 —— 挡得住 manifest 被改、blob 被删被截被换成不同长度的东西，
+        /// **挡不住等长改写**。
+        /// **深度档**额外重算 blob 字节，等长改写也挡得住；代价是一次全量顺序读
+        /// （真语料约 9 GiB），所以它是开关而不是默认。
+        #[arg(long, default_value_t = false, requires = "qualify")]
+        deep_verify: bool,
+
         /// `--apply` 的 journal 落点（七态状态机的真源）。`--apply` 时必需。
         #[arg(long)]
         journal: Option<PathBuf>,
@@ -6971,6 +6982,7 @@ async fn execute_cli(
                     apply,
                     recover,
                     qualify,
+                    deep_verify,
                     journal,
                     marker,
                     generation,
@@ -6999,16 +7011,31 @@ async fn execute_cli(
                                 "--qualify requires --journal".to_string(),
                             )
                         })?;
+                        let depth = if deep_verify {
+                            crate::phase3_restore::MirrorVerifyDepth::Deep
+                        } else {
+                            crate::phase3_restore::MirrorVerifyDepth::Default
+                        };
                         let verdict = crate::phase3_restore::qualify_w1_candidate(
                             &crate::phase3_restore::W1QualificationInput {
                                 marker_path: &marker_path,
                                 journal_path: &journal_path,
                                 db_path: &options.db_path,
                                 data_dir: &options.data_dir,
+                                mirror_verify_depth: depth,
                             },
                         );
                         return match verdict {
-                            Ok(marker) => {
+                            Ok(qualification) => {
+                                let marker = &qualification.marker;
+                                // 覆盖面随判定一起报（R-E-91）：一道跑在空 mirror 上的门
+                                // 与一道查完全过的门，退出码一模一样。查了几份必须看得见，
+                                // 否则「过了」这两个字没有分辨力。
+                                let blobs = qualification.mirror_blobs;
+                                let depth_label = match qualification.mirror_verify_depth {
+                                    crate::phase3_restore::MirrorVerifyDepth::Default => "default",
+                                    crate::phase3_restore::MirrorVerifyDepth::Deep => "deep",
+                                };
                                 if json {
                                     println!(
                                         "{}",
@@ -7023,17 +7050,24 @@ async fn execute_cli(
                                             // 硬拒会误杀），但消费者有权看见再决定。
                                             "holds_count": marker.holds_count,
                                             "origin_unmapped_count": marker.origin_unmapped_count,
+                                            "mirror_verify_depth": depth_label,
+                                            "mirror_manifests_checked": blobs.manifests_checked,
+                                            "mirror_blobs_digested": blobs.blobs_digested,
                                         })
                                     );
                                 } else {
                                     println!(
                                         "qualified: operation={} snapshot_root={} \
-                                         generation={} holds={} origin_unmapped={}",
+                                         generation={} holds={} origin_unmapped={} \
+                                         mirror_verify={} manifests_checked={} blobs_digested={}",
                                         marker.operation_id,
                                         marker.snapshot_root,
                                         marker.content_generation,
                                         marker.holds_count,
-                                        marker.origin_unmapped_count
+                                        marker.origin_unmapped_count,
+                                        depth_label,
+                                        blobs.manifests_checked,
+                                        blobs.blobs_digested
                                     );
                                 }
                                 Ok(())
@@ -99982,6 +100016,63 @@ mod subcommand_robot_output_tests {
                 panic!("expected search command without refresh");
             };
             assert!(!refresh, "refresh should stay opt-in");
+        });
+    }
+}
+
+#[cfg(test)]
+mod mirror_restore_deep_verify_flag_tests {
+    use super::*;
+    use clap::Parser;
+
+    /// `--deep-verify` 是 `--qualify` 的深度档（R-E-91），**单独给它必须报错**。
+    ///
+    /// 判据不是「能不能解析」，是**不在场时会不会被静默忽略**：一个被静默吞掉的
+    /// `--deep-verify` 会让操作者以为自己跑了深度校验，而实际上跑的是默认档 ——
+    /// 那正是本仓一路在反对的那种「不在场就跳过」。
+    #[test]
+    fn deep_verify_without_qualify_is_refused_not_ignored() {
+        // 这个 CLI 的 clap 命令树大到能把默认测试线程栈撑爆（实测 stack overflow）。
+        // 与被测行为无关，纯环境事实 —— 与仓里既有的 clap 解析测试同一处置。
+        run_on_large_stack(|| {
+        let base = [
+            "cass",
+            "mirror-restore",
+            "--candidate-db",
+            "/tmp/x.sqlite",
+            "--scratch",
+            "/tmp/scratch",
+            "--snapshot-root",
+            "root-1",
+        ];
+
+        let mut lone: Vec<&str> = base.to_vec();
+        lone.push("--deep-verify");
+        Cli::try_parse_from(lone).expect_err("--deep-verify 不带 --qualify 必须被拒");
+
+        let mut paired: Vec<&str> = base.to_vec();
+        paired.push("--qualify");
+        paired.push("--deep-verify");
+        let cli = Cli::try_parse_from(paired).expect("--qualify --deep-verify 必须解析得了");
+        let Some(Commands::MirrorRestore {
+            qualify,
+            deep_verify,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected mirror-restore command");
+        };
+        assert!(qualify && deep_verify);
+
+        // 阳性对照：不给 `--deep-verify` 时它必须是 false —— 否则上面那条断言
+        // 在一个恒为 true 的字段上也会通过。
+        let mut only_qualify: Vec<&str> = base.to_vec();
+        only_qualify.push("--qualify");
+        let cli = Cli::try_parse_from(only_qualify).expect("只给 --qualify 必须解析得了");
+        let Some(Commands::MirrorRestore { deep_verify, .. }) = cli.command else {
+            panic!("expected mirror-restore command");
+        };
+        assert!(!deep_verify, "深度档必须是显式 opt-in");
         });
     }
 }

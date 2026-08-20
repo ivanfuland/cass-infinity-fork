@@ -7024,13 +7024,21 @@ fn restore_drive(
 pub(crate) const RESTORE_JOURNAL_SCHEMA_VERSION: i64 = 2;
 
 pub(crate) const W1_COMMIT_MARKER_SCHEMA: &str = "marker.w1-commit";
+/// **3**（R-E-91）：字段全集没变，变的是 `mirror_identity.manifest_root` 的**派生定义**
+/// —— 它现在把每份 manifest 的**文件字节摘要**也摘进去（见 [`W1MirrorIdentity`]）。
+///
+/// **为什么派生定义变了也要升版号**：schema 2 的 marker 里那个 `manifest_root` 是按旧口径
+/// 算的，拿新口径重算必然不等。不升版号的话，一份完全正常的旧候选会以
+/// `E-IDENTITY-MISMATCH` 被拒 —— 那是把「版本旧」报成「候选被人动过」，是最坏的一种
+/// 错误归因：操作者会去查安全事件，而真相是升级。**版本差异必须由版本号来说话。**
+///
 /// **2**（R-E-79 (a)）：新增 `holds_count` / `origin_unmapped_count` 两格。
 ///
 /// 升版而不是「加两个可选字段」：可选就等于**今天可缺省、明天成旁路**——
 /// 一份没有这两格的 marker 会被读成「零 HOLD」，而那恰好是本次要杜绝的谎。
 /// 闭世界解析对缺字段报 `MissingField`，所以升版之后旧 marker **必然被拒**，
 /// 这是有意的（同 R-E-55 的反滥用形状）。
-pub(crate) const W1_COMMIT_MARKER_SCHEMA_VERSION: i64 = 2;
+pub(crate) const W1_COMMIT_MARKER_SCHEMA_VERSION: i64 = 3;
 // ⚠ staged landing 记账（同 E5/E6 惯例，不是把死代码放行）：非测试构建里它的调用方
 // 要到 **E8 接 `mirror-restore` CLI** 那一刻才出现（解析 marker 落点）。判据仍是
 // 「删掉 allow 之后 clippy 不报 never-used」，移除义务挂在 E8 验收面。
@@ -7050,6 +7058,18 @@ pub(crate) struct W1DbIdentity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct W1MirrorIdentity {
     pub manifest_count: u64,
+    /// **schema 3 的派生定义**（R-E-91）：每份 manifest 出一行
+    /// `<相对路径> US <声明的 blob_blake3> US <manifest 文件字节的 blake3>`，
+    /// 升序排序后以 RS 分隔逐行喂进一个 BLAKE3。
+    ///
+    /// 第三样是 schema 3 新加的，理由见 R1 Finding 7：schema 2 只摘前两样，而那两样
+    /// **全都是 manifest 自己声称的东西**——改 manifest 的内容（`db_links` 清空、
+    /// `original_path` 换掉）而不动路径与声明哈希，重算出的根值**一位都不变**。
+    /// 摘文件字节的成本接近零（这些文件刚被读过一遍），却把「被声称的东西还是不是那个
+    /// 东西」这一整类改动纳入了视野。
+    ///
+    /// **它仍然不覆盖 blob 的真实字节**——那是[`verify_mirror_blobs`]的职责，分两档：
+    /// 默认档只验存在性与大小，`--deep-verify` 才全读重算。
     pub manifest_root: String,
 }
 
@@ -7099,12 +7119,32 @@ pub(crate) enum W1MarkerError {
     UnknownField(String),
     MissingField(String),
     TypeMismatch(String),
-    SchemaMismatch { got: String },
+    /// **两个版本都带**（同 R-E-88 给 restore journal 立的口径）：只报「见到的」，
+    /// 操作者不知道该升到哪一版；两个都给，`E-SCHEMA-MISMATCH` 才是可行动的错误。
+    SchemaMismatch { got: String, expected: String },
     JournalNotTerminal { detail: String },
     ClosureNotPass { got: String },
     IdentityMismatch { field: String },
     ReceiptMissing { key: String },
     GenerationMismatch { marker: String, db: String },
+    /// 档 2（R-E-91）：manifest 指向的 blob 文件根本不在盘上。
+    MirrorBlobMissing { manifest_relative_path: String, blob_relative_path: String },
+    /// 档 2（R-E-91）：blob 在，但盘上的字节数与 manifest 声称的 `blob_size_bytes` 不符。
+    MirrorBlobSizeMismatch {
+        blob_relative_path: String,
+        declared: u64,
+        actual: u64,
+    },
+    /// 档 3（R-E-91，只在 `--deep-verify` 下可能出现）：blob 的**真实字节**重算出的
+    /// blake3 与 manifest 声称的 `blob_blake3` 不符。
+    MirrorBlobChecksumMismatch {
+        blob_relative_path: String,
+        declared: String,
+        actual: String,
+    },
+    /// 读 mirror 时的 I/O 失败。**与上面三条分开**：读不动是环境问题，读到了但不对是
+    /// 完整性问题，混在一码里会让操作者按错方向排查（同「退出码分档不许非 0 即 FAIL」）。
+    MirrorUnreadable(String),
 }
 
 impl W1MarkerError {
@@ -7121,6 +7161,12 @@ impl W1MarkerError {
             W1MarkerError::IdentityMismatch { .. } => "E-IDENTITY-MISMATCH",
             W1MarkerError::ReceiptMissing { .. } => "E-RECEIPT-MISSING",
             W1MarkerError::GenerationMismatch { .. } => "E-GENERATION-MISMATCH",
+            W1MarkerError::MirrorBlobMissing { .. } => "E-MIRROR-BLOB-MISSING",
+            W1MarkerError::MirrorBlobSizeMismatch { .. } => "E-MIRROR-BLOB-SIZE-MISMATCH",
+            W1MarkerError::MirrorBlobChecksumMismatch { .. } => {
+                "E-MIRROR-BLOB-CHECKSUM-MISMATCH"
+            }
+            W1MarkerError::MirrorUnreadable(_) => "E-MIRROR-UNREADABLE",
         }
     }
 }
@@ -7433,13 +7479,29 @@ fn file_digest(path: &Path) -> anyhow::Result<String> {
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
-/// mirror 工作树身份：manifest 相对路径与内容摘要**排序后**的聚合摘要。
+/// mirror 工作树身份：每份 manifest 的相对路径、**声明的** blob 哈希、以及 **manifest
+/// 文件字节的摘要**，三样排序后的聚合摘要（schema 3 口径，裁定 R-E-91）。
+///
+/// 第三样是 schema 3 加的。schema 2 只摘前两样，而那两样**都是 manifest 自己声称的**——
+/// 改它的内容不动路径与声明哈希，根值一位都不变（R1 Finding 7 实证）。
+///
+/// **摘的是文件字节，不是落盘记录的 `manifest_blake3`。** 后者是 manifest 自己写下的
+/// 一行字：篡改者只要不动它，它就还是原值；F12 之前 relink 甚至会替他刷新它。
+/// 字节摘要不依赖被测物的自述，这是它与自摘要的根本区别。
 fn mirror_identity_of(data_dir: &Path) -> anyhow::Result<W1MirrorIdentity> {
+    let root = crate::doctor_raw_mirror_root(data_dir);
     let views = crate::raw_mirror::manifest_views(data_dir)?;
-    let mut rows: Vec<String> = views
-        .iter()
-        .map(|v| format!("{}\u{1f}{}", v.manifest_relative_path, v.blob_blake3))
-        .collect();
+    let mut rows: Vec<String> = Vec::with_capacity(views.len());
+    for view in &views {
+        let manifest_path = root.join(&view.manifest_relative_path);
+        let manifest_bytes_blake3 = file_digest(&manifest_path).map_err(|e| {
+            anyhow::anyhow!("digest raw mirror manifest {}: {e}", manifest_path.display())
+        })?;
+        rows.push(format!(
+            "{}\u{1f}{}\u{1f}{}",
+            view.manifest_relative_path, view.blob_blake3, manifest_bytes_blake3
+        ));
+    }
     rows.sort();
     let mut hasher = blake3::Hasher::new();
     for row in &rows {
@@ -7449,6 +7511,97 @@ fn mirror_identity_of(data_dir: &Path) -> anyhow::Result<W1MirrorIdentity> {
     Ok(W1MirrorIdentity {
         manifest_count: rows.len() as u64,
         manifest_root: hasher.finalize().to_hex().to_string(),
+    })
+}
+
+/// mirror 完整性校验的深度（R-E-91 三档口径里的档 2 与档 3）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum MirrorVerifyDepth {
+    /// **默认档**：只验 blob 的存在性与字节数。纯元数据操作（每份一次 `stat`），
+    /// 与 `--qualify`「只解析、只复核」的定位相称。
+    ///
+    /// 保证面：能挡住 blob 被删、被截、被换成不同长度的东西。
+    /// **挡不住等长改写**——那要档 3。
+    #[default]
+    Default,
+    /// **深度档**（`--deep-verify`）：额外把每个 blob 的真实字节全读一遍重算 blake3，
+    /// 与 manifest 声称的 `blob_blake3` 比对。
+    ///
+    /// 保证面：等长改写也挡得住。代价是真语料上一次 9.0 GiB 的顺序读，
+    /// **所以它是开关而不是默认**（在一道解析级的门里塞全量重读与它的定位冲突）。
+    Deep,
+}
+
+/// 档 2 / 档 3 的产出：**查了多少**。
+///
+/// 之所以把计数带出来而不是返回 `()`：一道「什么都没查」的门与一道「查完全过」的门，
+/// 退出码长得一模一样。零 manifest 的候选在这里必须看得出来是零。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MirrorBlobVerification {
+    pub manifests_checked: u64,
+    /// 深度档下真正重算过字节的 blob 数（默认档恒为 0）。
+    ///
+    /// **按 blob 路径去重**：内容寻址下多份 manifest 会共用同一个 blob，
+    /// 不去重就会把同一份 9 GiB 语料读上好几遍。大小校验不去重（每份 manifest 各自
+    /// 声称一个 `blob_size_bytes`，逐份核才挡得住「某份声称错了」）。
+    pub blobs_digested: u64,
+}
+
+/// 按深度档校验 mirror 里 blob 的**现实**（R-E-91 档 2 / 档 3）。
+///
+/// **为什么它不折进 `manifest_root`**：身份回答的是「这棵树是不是 marker attest 的那棵」，
+/// 一个可比的摘要就够；而 blob 缺失 / 被截 / 被改回答的是「这棵树自己坏没坏」，要的是
+/// **指名道姓的错误**。折进摘要只会得到一句 `E-IDENTITY-MISMATCH`，操作者拿着它分不出
+/// 「配错了 mirror」与「盘上少了东西」——那正是本仓一路在反对的那种折叠。
+fn verify_mirror_blobs(
+    data_dir: &Path,
+    depth: MirrorVerifyDepth,
+) -> Result<MirrorBlobVerification, W1MarkerError> {
+    let root = crate::doctor_raw_mirror_root(data_dir);
+    let views = crate::raw_mirror::manifest_views(data_dir)
+        .map_err(|e| W1MarkerError::MirrorUnreadable(format!("manifest views: {e}")))?;
+    let mut digested: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for view in &views {
+        let blob = root.join(&view.blob_relative_path);
+        let meta = match std::fs::metadata(&blob) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(W1MarkerError::MirrorBlobMissing {
+                    manifest_relative_path: view.manifest_relative_path.clone(),
+                    blob_relative_path: view.blob_relative_path.clone(),
+                });
+            }
+            Err(err) => {
+                return Err(W1MarkerError::MirrorUnreadable(format!(
+                    "stat {}: {err}",
+                    blob.display()
+                )));
+            }
+        };
+        if meta.len() != view.blob_size_bytes {
+            return Err(W1MarkerError::MirrorBlobSizeMismatch {
+                blob_relative_path: view.blob_relative_path.clone(),
+                declared: view.blob_size_bytes,
+                actual: meta.len(),
+            });
+        }
+        if depth == MirrorVerifyDepth::Deep && !digested.contains(&view.blob_relative_path) {
+            let actual = file_digest(&blob).map_err(|e| {
+                W1MarkerError::MirrorUnreadable(format!("read {}: {e}", blob.display()))
+            })?;
+            if actual != view.blob_blake3 {
+                return Err(W1MarkerError::MirrorBlobChecksumMismatch {
+                    blob_relative_path: view.blob_relative_path.clone(),
+                    declared: view.blob_blake3.clone(),
+                    actual,
+                });
+            }
+            digested.insert(view.blob_relative_path.clone());
+        }
+    }
+    Ok(MirrorBlobVerification {
+        manifests_checked: views.len() as u64,
+        blobs_digested: digested.len() as u64,
     })
 }
 
@@ -7610,6 +7763,21 @@ pub(crate) struct W1QualificationInput<'a> {
     pub journal_path: &'a Path,
     pub db_path: &'a Path,
     pub data_dir: &'a Path,
+    /// mirror 完整性校验的深度（R-E-91）。**默认档不读 blob 字节**；
+    /// `MirrorVerifyDepth::Deep` 由 CLI 的 `--deep-verify` 显式打开。
+    pub mirror_verify_depth: MirrorVerifyDepth,
+}
+
+/// 过门的产出：**marker 本身 + 这一遍到底查了多少**。
+///
+/// 不是只把 marker 返回出去，是因为「档 2/3 查了几份」必须能被消费者看见。
+/// 一道跑在空 mirror 上的门与一道查完全过的门，退出码一模一样；
+/// 把覆盖面带出来，`--qualify` 的输出才有分辨力（同第五棒立的清单型探针规矩）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct W1Qualification {
+    pub marker: W1CommitMarker,
+    pub mirror_blobs: MirrorBlobVerification,
+    pub mirror_verify_depth: MirrorVerifyDepth,
 }
 
 /// **解析级机器门**（plan Task E7 Step 3），七步检查序见 wire 说明 §4。
@@ -7626,7 +7794,7 @@ pub(crate) struct W1QualificationInput<'a> {
 /// `planned == 0` 是幂等完成信号；② 看 `restored` / `deduplicated` 分格数字判工作量。
 pub(crate) fn qualify_w1_candidate(
     input: &W1QualificationInput<'_>,
-) -> Result<W1CommitMarker, W1MarkerError> {
+) -> Result<W1Qualification, W1MarkerError> {
     // 1 · marker 存在且可解析为闭世界 JSON
     let bytes = match std::fs::read(input.marker_path) {
         Ok(bytes) => bytes,
@@ -7643,6 +7811,7 @@ pub(crate) fn qualify_w1_candidate(
     {
         return Err(W1MarkerError::SchemaMismatch {
             got: format!("{}@{}", marker.schema, marker.schema_version),
+            expected: format!("{W1_COMMIT_MARKER_SCHEMA}@{W1_COMMIT_MARKER_SCHEMA_VERSION}"),
         });
     }
 
@@ -7716,6 +7885,16 @@ pub(crate) fn qualify_w1_candidate(
         });
     }
 
+    // 5b · mirror 里 blob 的**现实**（R-E-91 档 2；`--deep-verify` 再加档 3）
+    //
+    // **排在身份之后是有意的**（同 R-E-89 给 relink 定的那条顺序纪律）：身份不符意味着
+    // 手上这棵树压根不是 marker attest 的那棵，此时报「blob 少了一个」会把「配错了 mirror」
+    // 说成「盘坏了」，让操作者朝错误的方向排查。先答「是不是那棵树」，再答「那棵树坏没坏」。
+    //
+    // 反过来说，身份对得上**不蕴含** blob 还在：身份摘的是 manifest 侧的三样东西，
+    // blob 文件被删被截，它一位都不变（R1 Finding 7 探针 A 实证）。这一步是独立防线。
+    let mirror_blobs = verify_mirror_blobs(input.data_dir, input.mirror_verify_depth)?;
+
     // 6 · receipt 交叉核：marker 说「我提交了这些」，DB 副本里的 receipt 说「确实提交过」
     let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(input.db_path)
         .map_err(|e| W1MarkerError::ReceiptMissing {
@@ -7752,7 +7931,11 @@ pub(crate) fn qualify_w1_candidate(
             db: generation,
         });
     }
-    Ok(marker)
+    Ok(W1Qualification {
+        marker,
+        mirror_blobs,
+        mirror_verify_depth: input.mirror_verify_depth,
+    })
 }
 
 // ===========================================================================
@@ -8820,14 +9003,26 @@ mod e7_restore_journal_tests {
         d.db_path.parent().unwrap().join(W1_COMMIT_MARKER_FILENAME)
     }
 
-    fn qualify(d: &Drill) -> Result<W1CommitMarker, W1MarkerError> {
+    fn qualify_at(d: &Drill, depth: MirrorVerifyDepth) -> Result<W1Qualification, W1MarkerError> {
         let marker_path = marker_path_of(d);
         qualify_w1_candidate(&W1QualificationInput {
             marker_path: &marker_path,
             journal_path: &d.journal_path,
             db_path: &d.db_path,
             data_dir: &d.data_dir,
+            mirror_verify_depth: depth,
         })
+    }
+
+    /// 默认档（档 1+2）。既有用例全部走它 —— 默认路径的行为不因 R-E-91 而改变，
+    /// 变的只是它多看见了哪些东西。
+    fn qualify(d: &Drill) -> Result<W1CommitMarker, W1MarkerError> {
+        qualify_at(d, MirrorVerifyDepth::Default).map(|q| q.marker)
+    }
+
+    /// 深度档（档 3，`--deep-verify`）。
+    fn qualify_deep(d: &Drill) -> Result<W1Qualification, W1MarkerError> {
+        qualify_at(d, MirrorVerifyDepth::Deep)
     }
 
     /// 跑完一次完整 restore，得到一个**真候选**（marker 由恢复器自己在终态写出）。
@@ -8907,6 +9102,225 @@ mod e7_restore_journal_tests {
 
         let err = qualify(&d).expect_err("mirror 身份漂移必须拒");
         assert_eq!(err.code(), "E-IDENTITY-MISMATCH");
+    }
+
+    // ══ R1 Finding 7 / 裁定 R-E-91：身份口径必须覆盖「被声称的东西还是不是那个东西」══
+    //
+    // 修前 `mirror_identity_of` 只摘 (manifest 相对路径, manifest 里**声明**的 blob_blake3)
+    // 这一对。于是 marker 立好之后：blob 被删、被截、被改，或 manifest 的字节被改而路径与
+    // 声明哈希不变 —— 重算出的 `manifest_root` **一位都不变**，`--qualify` 照过。
+    //
+    // 三档口径（R-E-91）：档 1（manifest 字节摘要入 rows）+ 档 2（blob 存在性与大小）进默认；
+    // 档 3（blob 真实字节全读重算）做 `--deep-verify` 开关 —— 在这道「只解析、只复核」的门里
+    // 放一次全量重读（真语料 9488 manifest / 9.0 GiB）与它的定位冲突，所以不进默认路径。
+
+    /// 档 2 上半：marker 立好之后**删掉 blob 文件**，资格门必须以自己的名义拒。
+    #[test]
+    fn e7_qualification_notices_a_deleted_blob() {
+        let d = qualified_candidate();
+        assert!(qualify(&d).is_ok(), "前置断言：动手之前必须是合格的");
+
+        let root = crate::doctor_raw_mirror_root(&d.data_dir);
+        let views = crate::raw_mirror::manifest_views(&d.data_dir).unwrap();
+        let victim = views.first().expect("至少一份 manifest").clone();
+        let blob = root.join(&victim.blob_relative_path);
+        assert!(blob.exists(), "前置断言：blob 必须真的在，否则本用例恒红、没有分辨力");
+        std::fs::remove_file(&blob).unwrap();
+
+        let err = qualify(&d).expect_err("blob 已经被删掉，资格门必须察觉");
+        assert_eq!(err.code(), "E-MIRROR-BLOB-MISSING");
+    }
+
+    /// 档 2 下半：blob 还在，但盘上的字节数与 manifest 声称的 `blob_size_bytes` 不符。
+    ///
+    /// **为什么单独一条**：删文件与改文件是两个不同的失败面，共用一条用例就分不出
+    /// 「存在性查了、大小没查」这种半拉子实现。
+    #[test]
+    fn e7_qualification_notices_a_truncated_blob() {
+        let d = qualified_candidate();
+        assert!(qualify(&d).is_ok(), "前置断言：动手之前必须是合格的");
+
+        let root = crate::doctor_raw_mirror_root(&d.data_dir);
+        let views = crate::raw_mirror::manifest_views(&d.data_dir).unwrap();
+        let victim = views.first().expect("至少一份 manifest").clone();
+        let blob = root.join(&victim.blob_relative_path);
+        let on_disk = std::fs::metadata(&blob).unwrap().len();
+        assert_eq!(
+            on_disk, victim.blob_size_bytes,
+            "前置断言：动手之前盘上的大小必须与 manifest 声称的一致"
+        );
+        assert!(on_disk > 0, "前置断言：blob 非空，否则截不动");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&blob)
+            .unwrap()
+            .set_len(on_disk - 1)
+            .unwrap();
+
+        let err = qualify(&d).expect_err("blob 被截短，资格门必须察觉");
+        assert_eq!(err.code(), "E-MIRROR-BLOB-SIZE-MISMATCH");
+    }
+
+    /// 档 1：改 manifest 的**字节**（相对路径与声明的 blob 哈希都不动），mirror 身份必须变。
+    #[test]
+    fn e7_mirror_identity_covers_manifest_bytes() {
+        let d = qualified_candidate();
+        let before = mirror_identity_of(&d.data_dir).unwrap();
+
+        let root = crate::doctor_raw_mirror_root(&d.data_dir);
+        let views = crate::raw_mirror::manifest_views(&d.data_dir).unwrap();
+        let victim = views.first().expect("至少一份 manifest").clone();
+        let mpath = root.join(&victim.manifest_relative_path);
+        let raw = std::fs::read_to_string(&mpath).unwrap();
+        let mut json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        json["original_path"] = serde_json::Value::String("/tampered/by/someone-else.jsonl".into());
+        std::fs::write(&mpath, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+
+        // 前置断言：这次改动**没有**碰路径与声明哈希 —— 否则测的就不是「字节进不进身份」，
+        // 而是旧口径里那两样东西自己变了，用例会因为错误的理由通过。
+        let after_views = crate::raw_mirror::manifest_views(&d.data_dir).unwrap();
+        let after_victim = after_views
+            .iter()
+            .find(|v| v.manifest_id == victim.manifest_id)
+            .expect("篡改之后这份 manifest 仍应在 view 列表里");
+        assert_eq!(
+            after_victim.manifest_relative_path, victim.manifest_relative_path,
+            "前置断言：相对路径不变"
+        );
+        assert_eq!(
+            after_victim.blob_blake3, victim.blob_blake3,
+            "前置断言：manifest 里**声明**的 blob 哈希不变"
+        );
+
+        let after = mirror_identity_of(&d.data_dir).unwrap();
+        assert_ne!(
+            before.manifest_root, after.manifest_root,
+            "manifest 的字节被改了，而 mirror 身份**一位都没变** —— 身份口径只摘路径与声明哈希"
+        );
+    }
+
+    /// 端到端：**放行链断裂**（R1 #12 与 #7 串起来的那条链，R-E-91 判据第三条）。
+    ///
+    /// 链的形状是：篡改 manifest → 一次 relink apply 把它**重新祝福成自洽的**
+    /// （`manifest_blake3` 被刷新，篡改证据被抹掉）→ 资格门对这种形状完全失明 →
+    /// 候选一路绿到底交给下游。F12（`c75ddc09`）已经堵死了「relink 替攻击者刷新自摘要」
+    /// 那一步，所以这里**手工造出同一形状**：本条要证的是**即便证据被抹干净、manifest
+    /// 自己看起来完全自洽，资格门也必须拒**——即这条链上两道防线彼此独立。
+    #[test]
+    fn e7_qualification_breaks_the_blessed_tamper_chain() {
+        let d = qualified_candidate();
+        assert!(qualify(&d).is_ok(), "前置断言：动手之前必须是合格的");
+
+        let root = crate::doctor_raw_mirror_root(&d.data_dir);
+        let views = crate::raw_mirror::manifest_views(&d.data_dir).unwrap();
+        let victim = views.first().expect("至少一份 manifest").clone();
+        let rel = victim.manifest_relative_path.clone();
+        let mpath = root.join(&rel);
+
+        // ① 篡改内容 —— 与 R1 #12 探针同一处字段。
+        let raw = std::fs::read_to_string(&mpath).unwrap();
+        let mut json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        json["original_path"] = serde_json::Value::String("/tampered/by/someone-else.jsonl".into());
+        std::fs::write(&mpath, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+
+        // ② 把自摘要刷新成自洽的 —— 即「被祝福」之后的形状。
+        let refreshed = crate::raw_mirror::recompute_manifest_blake3(&d.data_dir, &rel).unwrap();
+        let raw = std::fs::read_to_string(&mpath).unwrap();
+        let mut json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        json["manifest_blake3"] = serde_json::Value::String(refreshed);
+        std::fs::write(&mpath, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+
+        // ③ 前置断言：它确实是一份**自洽的**被改件 —— F12 那道线在它身上不会响。
+        //    少了这一条，用例可能是被 F12 挡住的，而不是被本条要证的身份口径挡住的。
+        let recomputed = crate::raw_mirror::recompute_manifest_blake3(&d.data_dir, &rel).unwrap();
+        let after_views = crate::raw_mirror::manifest_views(&d.data_dir).unwrap();
+        let after_victim = after_views
+            .iter()
+            .find(|v| v.manifest_id == victim.manifest_id)
+            .expect("篡改之后这份 manifest 仍应在 view 列表里");
+        assert_eq!(
+            after_victim.manifest_identity_matches(&recomputed),
+            Some(true),
+            "前置断言：篡改件必须自洽，否则挡住它的是 F12 那道线、不是本条要证的身份口径"
+        );
+
+        // ④ 判据：链在这里断掉。
+        let err = qualify(&d).expect_err("自洽的被改件仍然必须被资格门拒");
+        assert_eq!(err.code(), "E-IDENTITY-MISMATCH");
+    }
+
+    /// 档 3（`--deep-verify`，R-E-91）：blob 被**等字节数**改写。
+    ///
+    /// **「保持字节数不变」不是随手选的写法**：它把档 2 的大小校验隔离掉，于是这条用例
+    /// 只可能由档 3 判红。若随便改几个字节让长度变了，红的会是
+    /// `E-MIRROR-BLOB-SIZE-MISMATCH` —— 用例照样绿，但它证明的是档 2 还活着，
+    /// 一句都没证到档 3。同族教训见「变异 fixture 必须除待测维度之外哪儿都对」。
+    #[test]
+    fn e7_deep_verify_catches_an_equal_length_blob_rewrite() {
+        let d = qualified_candidate();
+
+        // 阳性对照：动手**之前**深度档必须绿，且必须真的重算过 blob。
+        // 少了这一条，一个「永远红」或「什么都没读」的档 3 同样能让下面的断言通过。
+        let clean = qualify_deep(&d).expect("前置断言：干净候选在深度档下必须过门");
+        assert!(
+            clean.mirror_blobs.blobs_digested > 0,
+            "前置断言：深度档必须真的重算过 blob 字节，实得 {:?}",
+            clean.mirror_blobs
+        );
+
+        let root = crate::doctor_raw_mirror_root(&d.data_dir);
+        let views = crate::raw_mirror::manifest_views(&d.data_dir).unwrap();
+        let victim = views.first().expect("至少一份 manifest").clone();
+        let blob = root.join(&victim.blob_relative_path);
+        let mut bytes = std::fs::read(&blob).unwrap();
+        assert!(!bytes.is_empty(), "前置断言：blob 非空，否则无处可改");
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        std::fs::write(&blob, &bytes).unwrap();
+        assert_eq!(
+            std::fs::metadata(&blob).unwrap().len(),
+            victim.blob_size_bytes,
+            "前置断言：字节数必须一位没变，否则挡住它的是档 2 而不是档 3"
+        );
+
+        // 默认档对等长改写失明 —— **这是设计，不是缺口**：档 2 只验存在性与大小。
+        // 把这一句写成断言，是为了让「默认档的保证面到哪为止」有一条测试守着，
+        // 而不是只活在 help 文本里。
+        let shallow = qualify_at(&d, MirrorVerifyDepth::Default)
+            .expect("默认档只验存在性与大小，等长改写它看不见（设计如此）");
+        assert_eq!(
+            shallow.mirror_blobs.blobs_digested, 0,
+            "默认档一个 blob 字节都不该读，实得 {:?}",
+            shallow.mirror_blobs
+        );
+        assert_eq!(
+            shallow.mirror_blobs.manifests_checked,
+            views.len() as u64,
+            "默认档仍要逐份核 manifest 的 blob 现实，覆盖面不能缩水"
+        );
+
+        let err = qualify_deep(&d).expect_err("深度档必须抓到等长改写");
+        assert_eq!(err.code(), "E-MIRROR-BLOB-CHECKSUM-MISMATCH");
+    }
+
+    /// marker schema 2 → 3（R-E-91）：`manifest_root` 的**派生定义**变了，旧 marker 里的
+    /// 那个值按新口径重算必然对不上。靠版本号说话，不靠「重算发现不等」——后者会把
+    /// 「版本旧」误报成「候选被动过」，是最坏的一种错误归因。
+    ///
+    /// 错误文本要同时带**见到的**与**需要的**两个版本：只报 got，操作者不知道该升到哪一版
+    /// （与 R-E-88 给 restore journal 立的口径同一条）。
+    #[test]
+    fn e7_qualification_rejects_a_previous_schema_marker() {
+        let d = qualified_candidate();
+        assert!(qualify(&d).is_ok(), "前置断言：动手之前必须是合格的");
+        rewrite_marker(&d, |m| m.schema_version = 2);
+        let err = qualify(&d).expect_err("schema 2 的 marker 必须被拒");
+        assert_eq!(err.code(), "E-SCHEMA-MISMATCH");
+        let text = err.to_string();
+        assert!(
+            text.contains("@2") && text.contains('3'),
+            "错误文本必须同时带见到的（2）与需要的（3）两个版本；实得 {text}"
+        );
     }
 
     // ── 闭世界：未声明字段 ──────────────────────────────────────────────
@@ -9093,6 +9507,7 @@ mod e7_restore_journal_tests {
             journal_path: &d.journal_path,
             db_path: &d.db_path,
             data_dir: &d.data_dir,
+            mirror_verify_depth: MirrorVerifyDepth::Default,
         })
         .expect_err("schema 版本不对必须被拒");
         assert_eq!(err.code(), "E-SCHEMA-MISMATCH", "实得 {err:?}");
@@ -9176,6 +9591,12 @@ mod e7_restore_journal_tests {
     // **期望字节是手工钉死的字面量，不由编码器算** —— 否则这条测试只证明
     // 「编码器等于它自己」。摘要那条是从这份字面量派生的**变更探测**，
     // 不是独立实现交叉校验（后者是 G1 Step 3 两实现对照那道门的事）。
+    //
+    // ⚠ 这份 vector 里的 `schema_version: 2` 是**字面量的一部分**，故意不跟着
+    // `W1_COMMIT_MARKER_SCHEMA_VERSION` 走（其余字段同理，`manifest_root: "cc"`
+    // 也不是真值）。它锁的是**编码形制**，不是当前版本号；挂上常量就等于让编码器
+    // 自己算期望值，把这条测试退化成同义反复。当前版本号由
+    // `e7_qualification_rejects_a_previous_schema_marker` 那条守。
     #[test]
     fn e7_marker_canonical_encoding_matches_the_pinned_vector() {
         let marker = W1CommitMarker {
