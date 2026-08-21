@@ -658,8 +658,29 @@ pub enum Commands {
         data_dir: Option<PathBuf>,
 
         /// Actually write the rebuilt db_links. Without this flag nothing is written.
-        #[arg(long, default_value_t = false)]
+        ///
+        /// **不带 `--journal` 时这一轮没有崩溃恢复记录**（R4 第 7 条 / 裁定 R-E-110 K3）：
+        /// SIGKILL 落在几份 manifest 写完之后，盘上是一棵**半重链接**的树，
+        /// 而没有 journal 就没有 `--recover` 可走。要 crash-safe 就给 `--journal`。
+        #[arg(long, default_value_t = false, conflicts_with = "recover")]
         apply: bool,
+
+        /// 本轮的 journal 落点。给了它，`--apply` 走**带 journal 的**那条路
+        /// （七态推进 + receipt），崩溃后可以 `--recover --journal <同一路径>` 收敛。
+        ///
+        /// **落点必须与候选库（含 sidecar）、W1 commit marker、raw-mirror 树互异**
+        /// —— 与 `mirror-restore --journal` 同一套校验（R3 第 4 条 / R-E-103 J2）。
+        /// 新开的写面照同一套走，免得又长出一张「兄弟路上缺同一道检查」的脸。
+        #[arg(long)]
+        journal: Option<PathBuf>,
+
+        /// 崩溃后收敛：**输入只有磁盘上的 journal**。
+        ///
+        /// 修好的恢复逻辑此前**没有 CLI 面**：`relink_apply_journaled` 与 `relink_recover`
+        /// 全仓只有测试调用方，而 crash-safe relink 是本 PR 迁移用途的核心承诺 ——
+        /// **不通电的恢复逻辑等于装饰品**（R4 第 7 条）。
+        #[arg(long, default_value_t = false, requires = "journal")]
+        recover: bool,
 
         /// Output as JSON (`--robot` also works)
         #[arg(long, visible_alias = "robot")]
@@ -717,14 +738,17 @@ pub enum Commands {
         /// 都是家目录全路径与工作区名。复用一棵旧 scratch 时，被放宽过的既有目录与文件
         /// 会在本轮被收紧。
         ///
-        /// **`--recover` 时允许缺席**（同 `--candidate-db`，R3 第 13 条）。
-        #[arg(long, required_unless_present = "recover")]
+        /// **`--recover` 与 `--qualify` 时都允许缺席**（R3 第 13 条 + R4 第 8 条）：
+        /// 资格门只读**四个对象**（候选库 / data-dir / marker / journal），
+        /// 它**从不读** scratch 与 snapshot-root。**R3 第 13 条只修在 `--recover` 那一维上，
+        /// 而 `--qualify` 是同一形状的第二面** —— 逼操作者为一道只读的门编两个假值。
+        #[arg(long, required_unless_present_any = ["recover", "qualify"])]
         scratch: Option<PathBuf>,
 
         /// 本轮消费的封存件根。
         ///
-        /// **`--recover` 时允许缺席**（同 `--candidate-db`，R3 第 13 条）。
-        #[arg(long, required_unless_present = "recover")]
+        /// **`--recover` 与 `--qualify` 时都允许缺席**（同 `--scratch`，R4 第 8 条）。
+        #[arg(long, required_unless_present_any = ["recover", "qualify"])]
         snapshot_root: Option<String>,
 
         /// 六类计数与 HOLD 清单的落点（JSON）。不给则只打印摘要。
@@ -7074,39 +7098,22 @@ async fn execute_cli(
                         return Ok(());
                     }
 
-                    // ── 三个入参取值：不给 `--recover` 时 clap 已在解析阶段把门 ──
-                    //
-                    // 这里的具名错误是 **belt**：门是 `required_unless_present`。
-                    // 万一日后有人动了那个属性，这里保证死在一句说得清的话上，
-                    // 而不是 `unwrap` 的 panic 或一个空路径。
+                    // ── 候选库：`--recover` 之外一律必需（clap 已把门，这里是 belt）──
                     let candidate_db = candidate_db.clone().ok_or_else(|| {
                         fail(
                             "mirror_restore_needs_candidate_db",
                             "--candidate-db is required unless --recover is given".to_string(),
                         )
                     })?;
-                    let scratch = scratch.clone().ok_or_else(|| {
-                        fail(
-                            "mirror_restore_needs_scratch",
-                            "--scratch is required unless --recover is given".to_string(),
-                        )
-                    })?;
-                    let snapshot_root = snapshot_root.clone().ok_or_else(|| {
-                        fail(
-                            "mirror_restore_needs_snapshot_root",
-                            "--snapshot-root is required unless --recover is given".to_string(),
-                        )
-                    })?;
-                    let options = crate::phase3_restore::MirrorRestorePlanOptions {
-                        data_dir: resolved,
-                        db_path: candidate_db,
-                        scratch_dir: scratch,
-                        snapshot_root: snapshot_root.clone(),
-                    };
 
                     // ── --qualify：只解析、只复核，**不产计划也不写任何东西** ──
+                    //
+                    // **这一支排在 `options` 构造之前**（R4 第 8 条 / 裁定 R-E-110 K3）：
+                    // 资格门只读四个对象，`scratch` 与 `snapshot_root` 它从不读，
+                    // 于是那两个在 `--qualify` 下允许缺席 —— 而 `options` 要用它们。
+                    // 与 J3 把 `--recover` 支前移是同一件事的第二面。
                     if qualify {
-                        let marker_path = default_w1_marker_path(marker.as_ref(), &options.db_path);
+                        let marker_path = default_w1_marker_path(marker.as_ref(), &candidate_db);
                         let journal_path = journal.clone().ok_or_else(|| {
                             fail(
                                 "mirror_restore_qualify_needs_journal",
@@ -7122,8 +7129,8 @@ async fn execute_cli(
                             &crate::phase3_restore::W1QualificationInput {
                                 marker_path: &marker_path,
                                 journal_path: &journal_path,
-                                db_path: &options.db_path,
-                                data_dir: &options.data_dir,
+                                db_path: &candidate_db,
+                                data_dir: &resolved,
                                 mirror_verify_depth: depth,
                             },
                         );
@@ -7184,6 +7191,32 @@ async fn execute_cli(
                             }),
                         };
                     }
+
+                    // ── 规划路径还要那两件（`--recover` / `--qualify` 之外 clap 已把门）──
+                    //
+                    // 这里的具名错误是 **belt**：门是 `required_unless_present_any`。
+                    // 万一日后有人动了那个属性，这里保证死在一句说得清的话上，
+                    // 而不是 `unwrap` 的 panic 或一个空路径。
+                    let scratch = scratch.clone().ok_or_else(|| {
+                        fail(
+                            "mirror_restore_needs_scratch",
+                            "--scratch is required unless --recover or --qualify is given"
+                                .to_string(),
+                        )
+                    })?;
+                    let snapshot_root = snapshot_root.clone().ok_or_else(|| {
+                        fail(
+                            "mirror_restore_needs_snapshot_root",
+                            "--snapshot-root is required unless --recover or --qualify is given"
+                                .to_string(),
+                        )
+                    })?;
+                    let options = crate::phase3_restore::MirrorRestorePlanOptions {
+                        data_dir: resolved,
+                        db_path: candidate_db,
+                        scratch_dir: scratch,
+                        snapshot_root: snapshot_root.clone(),
+                    };
 
                     let report = crate::phase3_restore::plan_mirror_restore(&options)
                         .map_err(|err| fail("mirror_restore_plan_failed", err.to_string()))?;
@@ -7395,9 +7428,97 @@ async fn execute_cli(
                 Commands::MirrorRelink {
                     data_dir,
                     apply,
+                    journal,
+                    recover,
                     json,
                 } => {
                     let resolved = data_dir.clone().unwrap_or_else(default_data_dir);
+                    let relink_fail = |kind: &'static str, err: String| CliError {
+                        code: 1,
+                        kind,
+                        message: err,
+                        hint: None,
+                        retryable: false,
+                    };
+
+                    // ── journal 落点的互异性：与 `mirror-restore --journal` 同一套 ──
+                    //
+                    // 新开一个写面而不给它同等防护，就是**亲手长出第四张脸**
+                    // （symlink → 别名 → 硬链接 → 这里）。受保护输入按 relink 的现场取：
+                    // 候选库是 `<data-dir>/agent_search.db`（`relink_recover` 自己就这么取），
+                    // marker 落点按 restore 的默认约定（与它同居）。
+                    if let Some(journal_path) = journal.as_ref() {
+                        validate_relink_journal_target(&resolved, journal_path)
+                            .map_err(|e| relink_fail("mirror_relink_journal_path_unsafe", e))?;
+                    }
+
+                    // ── --recover：入参只有 journal 路径 ──────────────────────
+                    //
+                    // 修前 `relink_recover` **全仓只有测试调用方** —— 崩在几份 manifest
+                    // 写完之后，操作者手上是一棵半重链接的树，没有任何收敛入口（R4 第 7 条）。
+                    if recover {
+                        let journal_path = journal.clone().ok_or_else(|| {
+                            relink_fail(
+                                "mirror_relink_recover_needs_journal",
+                                "--recover requires --journal".to_string(),
+                            )
+                        })?;
+                        let report = relink_recover(&journal_path).map_err(|err| {
+                            relink_fail("mirror_relink_recover_failed", err.to_string())
+                        })?;
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "recovered": true,
+                                    "scanned_manifests": report.scanned_manifests,
+                                    "changes": report.changes.len(),
+                                })
+                            );
+                        } else {
+                            println!(
+                                "recovered: scanned_manifests={} changes={}",
+                                report.scanned_manifests,
+                                report.changes.len()
+                            );
+                        }
+                        return Ok(());
+                    }
+
+                    // ── `--apply --journal`：走带 journal 的那条路 ────────────
+                    if apply && let Some(journal_path) = journal.as_ref() {
+                        let operation_id = format!("mirror-relink:{}", resolved.display());
+                        let report = relink_apply_journaled(
+                            &MirrorRelinkOptions {
+                                data_dir: resolved.clone(),
+                                apply: true,
+                            },
+                            journal_path,
+                            &operation_id,
+                        )
+                        .map_err(|err| {
+                            relink_fail("mirror_relink_apply_failed", err.to_string())
+                        })?;
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "applied": true,
+                                    "journaled": true,
+                                    "scanned_manifests": report.scanned_manifests,
+                                    "changes": report.changes.len(),
+                                })
+                            );
+                        } else {
+                            println!(
+                                "applied (journaled): scanned_manifests={} changes={}",
+                                report.scanned_manifests,
+                                report.changes.len()
+                            );
+                        }
+                        return Ok(());
+                    }
+
                     let report = mirror_relink(&MirrorRelinkOptions {
                         data_dir: resolved,
                         apply,
@@ -20356,6 +20477,32 @@ fn mirror_restore_recover_report(
         outcome.published_without_backlink
     );
     (as_json, as_text)
+}
+
+/// `mirror-relink --journal` 的落点校验（R4 第 7 条 / 裁定 R-E-110 K3）。
+///
+/// **抽成函数是为了让它进得去判据**：留在 `match` 分支里的守卫没有用例，
+/// 而一道没有判据的守卫与一道不存在的守卫，在报表上长得一模一样 ——
+/// 那正是 R4 第 7 条（「修好的恢复逻辑不通电等于装饰品」）的同型。
+/// **变异矩阵的 W4 臂第一次没红，就是因为它当时还没被抽出来。**
+///
+/// 受保护输入按 relink 的现场取：候选库是 `<data-dir>/agent_search.db`
+/// （`relink_recover` 自己就这么取），marker 落点按 restore 的默认约定（与库同居）。
+/// 校验本体复用 `mirror-restore --journal` 那一套，**不在这里写第二份**。
+fn validate_relink_journal_target(
+    data_dir: &std::path::Path,
+    journal_path: &std::path::Path,
+) -> std::result::Result<(), String> {
+    let db_path = data_dir.join("agent_search.db");
+    let marker_path = default_w1_marker_path(None, &db_path);
+    crate::phase3_restore::validate_restore_write_targets(
+        &crate::phase3_restore::RestoreProtectedInputs {
+            db_path: &db_path,
+            marker_path: &marker_path,
+            data_dir,
+        },
+        &[("--journal", journal_path)],
+    )
 }
 
 fn default_w1_marker_path(explicit: Option<&PathBuf>, db_path: &std::path::Path) -> PathBuf {
@@ -100482,6 +100629,174 @@ mod mirror_restore_deep_verify_flag_tests {
     /// 判据不是「能不能解析」，是**不在场时会不会被静默忽略**：一个被静默吞掉的
     /// `--deep-verify` 会让操作者以为自己跑了深度校验，而实际上跑的是默认档 ——
     /// 那正是本仓一路在反对的那种「不在场就跳过」。
+    // ── R4 第 7 条 / 裁定 R-E-110 K3：修好的恢复逻辑必须通电 ──────────
+    //
+    // `relink_apply_journaled` 与 `relink_recover` **只有测试调用方**：CLI 的
+    // `mirror-relink` 分支调的是不带 journal 的 `mirror_relink`，而该子命令
+    // 连 `--journal` / `--recover` 两个参数都没有。
+    //
+    // 后果：SIGKILL 落在几份 manifest 写完之后，盘上是一棵**半重链接**的树，
+    // **没有 journal、没有 receipt、没有 `--recover`** —— 操作者只能另起一个
+    // 无从追踪的新计划。crash-safe relink 是本 PR 迁移用途的核心承诺，
+    // **修好的恢复逻辑不通电等于装饰品**（与 R2 第 18 条「造好了没接线」同型）。
+    #[test]
+    fn mirror_relink_exposes_journal_and_recover() {
+        run_on_large_stack(|| {
+            let cli = Cli::try_parse_from([
+                "cass",
+                "mirror-relink",
+                "--recover",
+                "--journal",
+                "relink.json",
+            ])
+            .expect("`mirror-relink --recover --journal <p>` 必须解析得了");
+            let Some(Commands::MirrorRelink {
+                recover, journal, ..
+            }) = cli.command
+            else {
+                panic!("expected mirror-relink command");
+            };
+            assert!(recover, "--recover 必须被解析到");
+            assert_eq!(
+                journal.as_deref(),
+                Some(std::path::Path::new("relink.json")),
+                "--journal 必须被解析到"
+            );
+        });
+    }
+
+    /// `--recover` 与 `--apply` 互斥，且 `--recover` 必须带 `--journal` ——
+    /// 这两条是 K1 在 `mirror-restore` 上刚立的口径，**新开的面照同一套走**，
+    /// 免得又长出一张「兄弟路上缺同一道检查」的脸。
+    #[test]
+    fn mirror_relink_recover_is_exclusive_and_needs_a_journal() {
+        run_on_large_stack(|| {
+            let err = Cli::try_parse_from(["cass", "mirror-relink", "--apply", "--recover"])
+                .err()
+                .expect("--apply 与 --recover 必须互斥");
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "必须死在参数冲突上，实得 {:?}",
+                err.kind()
+            );
+
+            let err = Cli::try_parse_from(["cass", "mirror-relink", "--recover"])
+                .err()
+                .expect("--recover 缺 --journal 必须在解析阶段被拒");
+            assert!(
+                format!("{err}").contains("journal"),
+                "错误必须点名缺的是 --journal，实得：{err}"
+            );
+        });
+    }
+
+    /// 反方向臂：**既有用法一个字节不改**。`mirror-relink --apply`（不带 journal）
+    /// 必须照常解析 —— 新面是**加上去的**，不是把旧路堵死。
+    #[test]
+    fn mirror_relink_keeps_its_existing_shape() {
+        run_on_large_stack(|| {
+            let cli = Cli::try_parse_from(["cass", "mirror-relink", "--apply"])
+                .expect("既有用法必须照常解析");
+            let Some(Commands::MirrorRelink {
+                apply,
+                recover,
+                journal,
+                ..
+            }) = cli.command
+            else {
+                panic!("expected mirror-relink command");
+            };
+            assert!(
+                apply && !recover && journal.is_none(),
+                "新面是**加上去的**，不是把旧路堵死"
+            );
+        });
+    }
+
+    // ── R4 第 8 条 / 裁定 R-E-110 K3：`--qualify` 不该要它用不上的入参 ──
+    //
+    // 资格门实际只读 `--candidate-db` / `--data-dir` / `--marker` / `--journal`
+    // 四件（`phase3_restore` 里那份四对象接口说明写的就是这四件），
+    // 却被 clap 逼着还要给 `--scratch` 与 `--snapshot-root`。
+    //
+    // **这是 R3 第 13 条的同族第二面，而我修 #13 时没问「还有哪个模式也忽略入参」**
+    // —— 又一次「只修在它被发现的那一维上」。
+    #[test]
+    fn qualify_parses_with_only_the_four_objects_it_reads() {
+        run_on_large_stack(|| {
+            let cli = Cli::try_parse_from([
+                "cass",
+                "mirror-restore",
+                "--qualify",
+                "--candidate-db",
+                "db",
+                "--journal",
+                "run.json",
+            ])
+            .expect("`--qualify` 只该要它真读的那四件（这里给了两件必需的）");
+            let Some(Commands::MirrorRestore {
+                qualify,
+                scratch,
+                snapshot_root,
+                ..
+            }) = cli.command
+            else {
+                panic!("expected mirror-restore command");
+            };
+            assert!(qualify);
+            assert!(
+                scratch.is_none() && snapshot_root.is_none(),
+                "两个用不上的入参必须允许缺席 —— 逼操作者编假值正是这条缺陷的形态"
+            );
+        });
+    }
+
+    /// 反方向臂：**dry-run / `--apply` 仍然要那两件**，别把免除写成谁都不用给。
+    #[test]
+    fn a_planning_run_still_requires_scratch_and_snapshot_root() {
+        run_on_large_stack(|| {
+            let err = Cli::try_parse_from(["cass", "mirror-restore", "--candidate-db", "db"])
+                .err()
+                .expect("不给 --qualify / --recover 时缺 --scratch 必须被拒");
+            let rendered = format!("{err}");
+            assert!(
+                rendered.contains("scratch") && rendered.contains("snapshot-root"),
+                "错误必须点名缺的是哪两个，实得：{rendered}"
+            );
+        });
+    }
+
+    /// 新开的 `mirror-relink --journal` 面必须与 `mirror-restore --journal` **同规**。
+    ///
+    /// 不给新写面同等防护，就是**亲手长出第四张脸**（symlink → 别名 → 硬链接 → 这里）。
+    #[test]
+    fn relink_journal_target_is_checked_like_the_restore_one() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_dir = tmp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let db = data_dir.join("agent_search.db");
+        let bytes = b"SQLite format 3\x00-- must survive --\n";
+        std::fs::write(&db, bytes).unwrap();
+
+        let err = validate_relink_journal_target(&data_dir, &db)
+            .err()
+            .expect("--journal 指到候选库必须拒");
+        assert!(
+            err.contains("E-RESTORE-WRITE-PATH-ALIAS"),
+            "必须具名拒，实得：{err}"
+        );
+        assert_eq!(
+            std::fs::read(&db).unwrap(),
+            &bytes[..],
+            "校验发生在任何一次写之前，候选库必须逐位不变"
+        );
+
+        // 反方向臂：正常落点照常放行。
+        validate_relink_journal_target(&data_dir, &tmp.path().join("relink-run.json"))
+            .expect("一个全新的普通落点必须照常放行");
+    }
+
     // ── R4 第 3 条 / 裁定 R-E-110 K1：三个模式必须互斥 ────────────────
     //
     // `apply` / `recover` / `qualify` 三个 flag **没有任何 `conflicts_with`**，
