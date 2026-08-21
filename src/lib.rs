@@ -743,12 +743,22 @@ pub enum Commands {
         /// **不给这个 flag 时，不写 mirror、也不写候选库**——但**不是「什么都不写」**：
         /// 规划过程本身会把投影物化到 `--scratch` 下，给了 `--out` 还会写报告文件。
         /// 原先那句「什么都不写」是不准的（R1 Finding 15 / R-E-84）。
-        #[arg(long, default_value_t = false)]
+        ///
+        /// **与 `--recover` / `--qualify` 互斥**（R4 第 3 条 / 裁定 R-E-110 K1）：
+        /// 三者此前零冲突声明，而分派顺序是 `recover` → `qualify` → `apply`，
+        /// 于是 `--recover --qualify` 跑的是**会写库的恢复**且永不资格校验 ——
+        /// 与 `--qualify` 自己的 help「不写任何东西」直接冲突。
+        /// 判据钉在**解析层**：做成运行时的优先级判断，等于让操作者先按下回车，
+        /// 才知道自己要的那件事根本没发生。
+        #[arg(long, default_value_t = false, conflicts_with_all = ["recover", "qualify"])]
         apply: bool,
 
         /// 崩溃后收敛：**输入只有磁盘上的 journal + receipt**。
         /// 没有这个入口，七态恢复器就只有测试能调 —— 而操作者在真崩之后无路可走。
-        #[arg(long, default_value_t = false)]
+        ///
+        /// **与 `--qualify` 互斥**（R4 第 3 条 / 裁定 R-E-110 K1）：分派把 `recover`
+        /// 排在最前，两个一起给时资格校验**永不发生**，而操作者以为自己只是在校验。
+        #[arg(long, default_value_t = false, conflicts_with = "qualify")]
         recover: bool,
 
         /// 只跑**解析级资格门**（不写任何东西）：解析 W1 commit marker 并逐层复核
@@ -100472,6 +100482,117 @@ mod mirror_restore_deep_verify_flag_tests {
     /// 判据不是「能不能解析」，是**不在场时会不会被静默忽略**：一个被静默吞掉的
     /// `--deep-verify` 会让操作者以为自己跑了深度校验，而实际上跑的是默认档 ——
     /// 那正是本仓一路在反对的那种「不在场就跳过」。
+    // ── R4 第 3 条 / 裁定 R-E-110 K1：三个模式必须互斥 ────────────────
+    //
+    // `apply` / `recover` / `qualify` 三个 flag **没有任何 `conflicts_with`**，
+    // 而分派顺序是 `recover` → `qualify` → `apply`。于是 `--recover --qualify`
+    // 执行的是**会写库的恢复**，且永不资格校验 —— 与 `--qualify` 自己的 help
+    // 「只跑解析级资格门（不写任何东西）」直接冲突。
+    //
+    // 判据落在**解析层**：把它做成运行时的优先级判断，等于让操作者先按下回车
+    // 才知道自己要的那件事没做。
+    #[test]
+    fn conflicting_restore_modes_are_refused_at_parse_time() {
+        run_on_large_stack(|| {
+            for args in [
+                vec![
+                    "cass",
+                    "mirror-restore",
+                    "--recover",
+                    "--qualify",
+                    "--journal",
+                    "run.json",
+                ],
+                vec![
+                    "cass",
+                    "mirror-restore",
+                    "--apply",
+                    "--qualify",
+                    "--candidate-db",
+                    "db",
+                    "--scratch",
+                    "s",
+                    "--snapshot-root",
+                    "r",
+                    "--journal",
+                    "run.json",
+                ],
+                vec![
+                    "cass",
+                    "mirror-restore",
+                    "--apply",
+                    "--recover",
+                    "--candidate-db",
+                    "db",
+                    "--scratch",
+                    "s",
+                    "--snapshot-root",
+                    "r",
+                    "--journal",
+                    "run.json",
+                ],
+            ] {
+                let rendered = format!("{args:?}");
+                let err = Cli::try_parse_from(args)
+                    .err()
+                    .unwrap_or_else(|| panic!("互斥的模式组合必须在解析阶段被拒：{rendered}"));
+                assert_eq!(
+                    err.kind(),
+                    clap::error::ErrorKind::ArgumentConflict,
+                    "必须死在「参数冲突」上（而不是缺参数之类的别的原因）：{rendered}，实得 {:?}",
+                    err.kind()
+                );
+            }
+        });
+    }
+
+    /// 反方向臂：**单个模式**必须照常解析得了，别把互斥写宽成「谁都不许带」。
+    #[test]
+    fn a_single_restore_mode_still_parses() {
+        run_on_large_stack(|| {
+            assert!(
+                Cli::try_parse_from(["cass", "mirror-restore", "--recover", "--journal", "x"])
+                    .is_ok(),
+                "--recover 单独必须照常解析"
+            );
+            assert!(
+                Cli::try_parse_from([
+                    "cass",
+                    "mirror-restore",
+                    "--qualify",
+                    "--candidate-db",
+                    "db",
+                    "--scratch",
+                    "s",
+                    "--snapshot-root",
+                    "r",
+                    "--journal",
+                    "x",
+                ])
+                .is_ok(),
+                "--qualify 单独必须照常解析"
+            );
+            assert!(
+                Cli::try_parse_from([
+                    "cass",
+                    "mirror-restore",
+                    "--qualify",
+                    "--deep-verify",
+                    "--candidate-db",
+                    "db",
+                    "--scratch",
+                    "s",
+                    "--snapshot-root",
+                    "r",
+                    "--journal",
+                    "x",
+                ])
+                .is_ok(),
+                "--qualify + --deep-verify 是既有的合法组合（R-E-91），不得被误伤"
+            );
+        });
+    }
+
     // ── R3 第 7 / 16 条：**声称必须与实现同真** ────────────────────────
     //
     // 这两条都不是功能缺陷，是**声称失真** —— 与 R1 第 15 条「nothing is written」同型。

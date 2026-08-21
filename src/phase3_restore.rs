@@ -2223,6 +2223,19 @@ fn assert_materialized_inside_root(
     })
 }
 
+/// 一个 inode 现在有几个名字。**非 unix 恒 1** —— 那边没有硬链接这个概念，
+/// 返回 1 等于「这条判据在该平台上不发射」，而不是假装它通过了。
+#[cfg(unix)]
+fn hard_link_count(meta: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt as _;
+    meta.nlink()
+}
+
+#[cfg(not(unix))]
+fn hard_link_count(_meta: &std::fs::Metadata) -> u64 {
+    1
+}
+
 fn materialize_sealed_blob(
     scratch_root: &Path,
     input: &SealedSource<'_>,
@@ -2257,8 +2270,10 @@ fn materialize_sealed_blob(
             ),
         })?;
     let mut walk = canonical_root.clone();
-    for component in relative.components() {
+    let last_index = relative.components().count().saturating_sub(1);
+    for (index, component) in relative.components().enumerate() {
         walk.push(component);
+        let is_target = index == last_index;
         match std::fs::symlink_metadata(&walk) {
             Ok(meta) if meta.file_type().is_symlink() => {
                 return Err(ProjectionFault::UnsafeOriginalPath {
@@ -2268,6 +2283,54 @@ fn materialize_sealed_blob(
                          and possibly truncate, a file outside {})",
                         walk.display(),
                         canonical_root.display()
+                    ),
+                });
+            }
+            // ── R4 第 1 条 / 裁定 R-E-110 K1：**只拒 symlink 不够** ─────────
+            //
+            // `is_symlink()` 对**硬链接**报 false —— 它在 `symlink_metadata` 眼里就是一个
+            // 普通文件，于是写路径的 `truncate(true)` 直接截断**共享 inode**。
+            // 实测：一次 dry-run 把硬链接指向的候选库截掉并改写，**返回 Ok、零告警**。
+            //
+            // **比 symlink 那一支更糟**：R-E-84 (c) 的写后前缀断言拦不住它 ——
+            // `canonicalize` 对硬链接返回的就是落点自己，`starts_with` 成立、断言通过。
+            // symlink 至少会被这里拒或被 (c) 发现，**硬链接是完全静默的**。
+            //
+            // 判据用 `nlink > 1` 而不是「与受保护输入比 `(dev,ino)`」：物化路径**没有任何
+            // 正当理由**写进一个被多处引用的 inode，而按受保护清单比对只挡得住清单里那几个
+            // —— **漏挡一条 = 毁掉那个文件，误挡一条 = 让操作者把那个硬链接删掉**，
+            // 两侧代价不对称。（`--out` / `--journal` 那条路上用的是 `(dev,ino)`，
+            // 因为那里的写目标是操作者指定的、本来就该允许指向既有文件。）
+            Ok(meta) if is_target && !meta.file_type().is_file() => {
+                return Err(ProjectionFault::UnsafeOriginalPath {
+                    detail: format!(
+                        "E-SCRATCH-NOT-REGULAR-FILE: materialization target {} exists but is not \
+                         a regular file ({:?}) — refusing to write through it",
+                        walk.display(),
+                        meta.file_type()
+                    ),
+                });
+            }
+            Ok(meta) if is_target && hard_link_count(&meta) > 1 => {
+                return Err(ProjectionFault::UnsafeOriginalPath {
+                    detail: format!(
+                        "E-SCRATCH-NOT-REGULAR-FILE: materialization target {} is a hard link \
+                         (nlink={}) — writing it would truncate every other name for that same \
+                         inode, and the post-write prefix assertion cannot see that happen",
+                        walk.display(),
+                        hard_link_count(&meta)
+                    ),
+                });
+            }
+            // 中间分量必须是目录：既有的 symlink 判拦不住 fifo / socket / 设备节点，
+            // 而 `create_dir_all` 撞上它们只会给出一句与真因隔了一层的 I/O 错。
+            Ok(meta) if !is_target && !meta.file_type().is_dir() => {
+                return Err(ProjectionFault::UnsafeOriginalPath {
+                    detail: format!(
+                        "E-SCRATCH-NOT-REGULAR-FILE: component {} under the scratch root exists \
+                         but is not a directory ({:?}) — refusing to materialize through it",
+                        walk.display(),
+                        meta.file_type()
                     ),
                 });
             }
@@ -2831,6 +2894,197 @@ mod e5_materialization_tests {
     //
     // **目录一并管**：`home/u/.claude/projects/ws/` 这几级**目录名本身**就是
     // 家目录全路径与工作区名，只把文件收紧、留一棵世界可读的目录树，等于没收紧。
+    // ── R4 第 1 条 / 裁定 R-E-110 K1：**只拒 symlink 不拒硬链接** ──────
+    //
+    // 预检用 `symlink_metadata().file_type().is_symlink()` 判，而**硬链接在它眼里
+    // 就是一个普通文件** —— 于是 `create(true).truncate(true)` 直接截断**共享 inode**。
+    //
+    // **比 symlink 那一支更糟**：R-E-84 (c) 的写后前缀断言拦不住它 ——
+    // `canonicalize` 对硬链接返回的就是落点自己，`starts_with(canonical_root)` 成立，
+    // 断言通过、**整轮零错误**。symlink 至少会被 (a) 拒或被 (c) 发现，硬链接是**完全静默**的。
+    //
+    // 这是同族第三张脸：symlink（R1 #11 / R-E-84）→ 别名（R3 #4/#5）→ **硬链接**。
+    // J2 加的 `(dev,ino)` 判只挂在 `--out` / `--journal` 的写路径校验上，
+    // **物化这条路上没有同等防护**。
+    //
+    // **判据形状**：不止断言「返回了 Err」——断言受害文件的**字节逐位不变**。
+    #[test]
+    fn materialize_refuses_a_hard_linked_target_and_leaves_the_victim_byte_identical() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = scratch("r4-hardlink");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let blob = b"{\"role\":\"user\",\"text\":\"a full session transcript\"}\n";
+        let input = source("/home/u/.claude/projects/ws/s.jsonl", blob);
+
+        // 第一轮正常物化，拿到真实落点。**scratch 复用是常态**，slot 名第一轮之后
+        // 就都在盘上了 —— 可达性与 R1 #11 那次完全同源。
+        let target = materialize_sealed_blob(&root, &input).unwrap();
+
+        // 受害者：scratch **之外**的一个「候选库」。
+        let outside = std::env::temp_dir().join(format!(
+            "cc-cass-r4-hardlink-outside-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&outside).unwrap();
+        let victim = outside.join("agent_search.db");
+        let original = b"SQLite format 3\x00-- candidate db bytes that must survive a dry run --\n";
+        std::fs::write(&victim, original).unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        // 把落点换成指向候选库的**硬链接**。
+        std::fs::remove_file(&target).unwrap();
+        std::fs::hard_link(&victim, &target).unwrap();
+        assert!(
+            !std::fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "前置断言：硬链接在 symlink_metadata 眼里**不是** symlink —— \
+             这正是既有预检漏掉它的原因，也是这条用例要证的东西"
+        );
+
+        // 第二轮：**不给 `--apply`**，这就是 dry-run 的物化那一步。
+        let err = materialize_sealed_blob(&root, &input).expect_err("落点是硬链接时必须拒绝物化");
+        match &err {
+            ProjectionFault::UnsafeOriginalPath { detail } => assert!(
+                detail.contains("E-SCRATCH-NOT-REGULAR-FILE"),
+                "必须以具名错误码拒，实得：{detail}"
+            ),
+            other => panic!("必须走 UnsafeOriginalPath 这一档，实得 {other:?}"),
+        }
+
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            &original[..],
+            "候选库必须逐位不变 —— 拒之前已经截断了，和没拒是一回事"
+        );
+        assert_eq!(
+            std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "候选库的**权限**也必须不变：写路径按 fd `set_permissions(0o600)` 收紧，\
+             在硬链接这条路上会作用到别人的 inode 上"
+        );
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// 落点存在、但**不是普通文件**（这里用目录）：必须以**具名**错误拒。
+    ///
+    /// 没有这道判也会失败 —— 但失败在 `open` 的 `EISDIR` 上，变成一句 `Materialize`
+    /// I/O 错。**「拒了」与「以自己的名义拒」是两回事**：前者让操作者去查磁盘，
+    /// 后者告诉他落点被别的东西占了。
+    #[test]
+    fn materialize_refuses_a_target_that_is_not_a_regular_file() {
+        let root = scratch("r4-not-regular");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let blob = b"{\"role\":\"user\"}\n";
+        let input = source("/home/u/.claude/projects/ws/s.jsonl", blob);
+
+        let target = materialize_sealed_blob(&root, &input).unwrap();
+        std::fs::remove_file(&target).unwrap();
+        std::fs::create_dir(&target).unwrap();
+
+        let err = materialize_sealed_blob(&root, &input).expect_err("落点是目录时必须拒");
+        match &err {
+            ProjectionFault::UnsafeOriginalPath { detail } => assert!(
+                detail.contains("E-SCRATCH-NOT-REGULAR-FILE"),
+                "必须具名拒，实得：{detail}"
+            ),
+            other => panic!("必须走 UnsafeOriginalPath 这一档，实得 {other:?}"),
+        }
+    }
+
+    /// 落点是 **Unix 域套接字**：`nlink == 1` 且**不是**普通文件 ——
+    /// 这一形态**只有**「落点必须是普通文件」那一臂挡得住。
+    ///
+    /// 为什么单开这一条：变异矩阵的 U2 臂（撤掉那道类型判）**没红**，复核发现
+    /// **目录的 `nlink` 是 2**，于是它被隔壁那道 `nlink > 1` 顺手接住了 ——
+    /// 目录用例证明不了「落点类型判」自己有牙。
+    ///
+    /// 为什么用套接字而不是 FIFO（**这条是被咬出来的**）：第一版用 `mkfifo`，
+    /// 结果撤掉判据的那一臂**直接挂住** —— 以写打开一个没有读者的 FIFO 会阻塞，
+    /// 而那正是这道判要防的危害之一。**判据本身不能是个会挂住的东西**：
+    /// 一条挂住的用例与一条跑得慢的用例在报表上长得一模一样。
+    /// 套接字给出同样的鉴别力（非普通文件、`nlink == 1`），而 `open` 对它
+    /// **立刻**以 `ENXIO` 失败，不阻塞。
+    #[test]
+    fn materialize_refuses_a_socket_target() {
+        let root = scratch("r4-socket");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let blob = b"{\"role\":\"user\"}\n";
+        let input = source("/home/u/.claude/projects/ws/s.jsonl", blob);
+
+        let target = materialize_sealed_blob(&root, &input).unwrap();
+        std::fs::remove_file(&target).unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(&target)
+            .expect("必须能在落点上建出一个 Unix 域套接字");
+
+        let meta = std::fs::symlink_metadata(&target).unwrap();
+        assert!(
+            !meta.file_type().is_file() && hard_link_count(&meta) == 1,
+            "前置断言：套接字必须是「非普通文件且 nlink == 1」—— \
+             否则它会被隔壁那道 nlink 判接住，这条用例就不鉴别任何东西了"
+        );
+
+        let err = materialize_sealed_blob(&root, &input).expect_err("落点是套接字时必须拒");
+        match &err {
+            ProjectionFault::UnsafeOriginalPath { detail } => assert!(
+                detail.contains("E-SCRATCH-NOT-REGULAR-FILE"),
+                "必须具名拒，实得：{detail}"
+            ),
+            other => panic!("必须走 UnsafeOriginalPath 这一档，实得 {other:?}"),
+        }
+    }
+
+    /// **中间分量**存在、但不是目录（这里用普通文件）：同样要具名拒。
+    ///
+    /// 既有的 symlink 判拦不住这一形态，而 `create_dir_all` 撞上它只会给出一句
+    /// 与真因隔了一层的 `NotADirectory`。
+    #[test]
+    fn materialize_refuses_a_non_directory_intermediate_component() {
+        let root = scratch("r4-bad-component");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let blob = b"{\"role\":\"user\"}\n";
+        let input = source("/home/u/.claude/projects/ws/s.jsonl", blob);
+
+        let target = materialize_sealed_blob(&root, &input).unwrap();
+        // 把 `ws` 那一级换成普通文件。
+        let ws = target.parent().unwrap().to_path_buf();
+        std::fs::remove_dir_all(&ws).unwrap();
+        std::fs::write(&ws, b"not a directory\n").unwrap();
+
+        let err = materialize_sealed_blob(&root, &input).expect_err("中间分量不是目录时必须拒");
+        match &err {
+            ProjectionFault::UnsafeOriginalPath { detail } => assert!(
+                detail.contains("E-SCRATCH-NOT-REGULAR-FILE"),
+                "必须具名拒，实得：{detail}"
+            ),
+            other => panic!("必须走 UnsafeOriginalPath 这一档，实得 {other:?}"),
+        }
+    }
+
+    /// 反方向臂：**普通的复用落点**（`nlink == 1` 的既有普通文件）必须照常物化。
+    /// 把「非常规文件即拒」写宽成「既有文件即拒」，会把 scratch 复用整个判死。
+    #[test]
+    fn materialize_still_rewrites_an_ordinary_reused_target() {
+        let root = scratch("r4-hardlink-reverse");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let blob = b"{\"role\":\"user\",\"text\":\"a full session transcript\"}\n";
+        let input = source("/home/u/.claude/projects/ws/s.jsonl", blob);
+
+        let first = materialize_sealed_blob(&root, &input).unwrap();
+        let again = materialize_sealed_blob(&root, &input)
+            .expect("普通的复用落点必须照常物化 —— scratch 复用是文档写明的常态");
+        assert_eq!(first, again, "内容寻址：两轮必须落在同一个位置");
+        assert_eq!(std::fs::read(&again).unwrap(), &blob[..]);
+    }
+
     #[test]
     fn materialize_writes_owner_only_files_and_dirs() {
         let root = scratch("private-birth");
@@ -4911,6 +5165,75 @@ mod e5_p30_blob_read_tests {
             .iter()
             .find(|r| r.manifest_id == manifest_id)
             .unwrap_or_else(|| panic!("no doctor report for manifest {manifest_id}"))
+    }
+
+    // ── R4 第 4 条 / 裁定 R-E-110 K1：资格门绕过了规范校验器 ──────────
+    //
+    // `verify_mirror_blobs` 用 `std::fs::metadata`（**跟随符号链接**），不判文件类型；
+    // 而**规范校验器** `raw_mirror::verify_existing_file` 明确用 `symlink_metadata`
+    // 并拒 symlink blob。**同一件事在两条路径上两套口径** —— 与 R4 第 1 条同族：
+    // 「一条路上有的检查，兄弟路上没有」。
+    //
+    // 后果：把 blob 换成指向外部同长度文件的符号链接，默认档资格照过；
+    // 外部文件字节若也相同，**深度档一样照过** —— 而这份 mirror 一搬走就散了。
+    #[test]
+    fn qualification_refuses_a_symlinked_mirror_blob() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("cass-data");
+        let live = tmp.path().join("live");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let source_file = write_session(&live, "rollout-symlinked.jsonl", "drill-symlinked");
+        let captured = capture(&data_dir, &source_file);
+
+        let blob = crate::doctor_raw_mirror_root(&data_dir).join(&captured.blob_relative_path);
+        let bytes = std::fs::read(&blob).unwrap();
+
+        // 外部同长度、同字节的替身 —— 连深度档都骗得过。
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let decoy = outside.join("decoy.bin");
+        std::fs::write(&decoy, &bytes).unwrap();
+
+        std::fs::remove_file(&blob).unwrap();
+        std::os::unix::fs::symlink(&decoy, &blob).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&blob)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "前置断言：落点必须真是符号链接"
+        );
+
+        for depth in [MirrorVerifyDepth::Default, MirrorVerifyDepth::Deep] {
+            let err = verify_mirror_blobs(&data_dir, depth)
+                .expect_err("符号链接 blob 必须被资格门拒掉，与规范校验器同口径");
+            assert_eq!(
+                err.code(),
+                "E-MIRROR-BLOB-NOT-REGULAR",
+                "必须具名拒（{depth:?} 档），实得：{err}"
+            );
+        }
+    }
+
+    /// 反方向臂：**普通 blob** 在两档下都必须照常过，别把整道门判死。
+    #[test]
+    fn qualification_still_accepts_ordinary_mirror_blobs() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("cass-data");
+        let live = tmp.path().join("live");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let ordinary = write_session(&live, "rollout-ordinary.jsonl", "drill-ordinary");
+        capture(&data_dir, &ordinary);
+
+        for depth in [MirrorVerifyDepth::Default, MirrorVerifyDepth::Deep] {
+            let v = verify_mirror_blobs(&data_dir, depth)
+                .unwrap_or_else(|e| panic!("普通 blob 必须过（{depth:?} 档），实得 {e}"));
+            assert!(
+                v.manifests_checked >= 1,
+                "前置断言：必须真检查过至少一份 manifest，否则这条臂在对空树说话"
+            );
+        }
     }
 
     #[test]
@@ -8036,6 +8359,14 @@ pub(crate) enum W1MarkerError {
         declared: String,
         actual: String,
     },
+    /// 档 2（R4 第 4 条 / 裁定 R-E-110 K1）：blob 在，但它**不是一个普通文件**。
+    ///
+    /// 与上面三条分开的理由同上：这既不是「不在」也不是「字节不对」，
+    /// 而是**这份 mirror 的内容不在它自己声称的地方** —— 一搬走就散。
+    MirrorBlobNotRegularFile {
+        blob_relative_path: String,
+        detail: String,
+    },
     /// 读 mirror 时的 I/O 失败。**与上面三条分开**：读不动是环境问题，读到了但不对是
     /// 完整性问题，混在一码里会让操作者按错方向排查（同「退出码分档不许非 0 即 FAIL」）。
     MirrorUnreadable(String),
@@ -8058,6 +8389,7 @@ impl W1MarkerError {
             W1MarkerError::MirrorBlobMissing { .. } => "E-MIRROR-BLOB-MISSING",
             W1MarkerError::MirrorBlobSizeMismatch { .. } => "E-MIRROR-BLOB-SIZE-MISMATCH",
             W1MarkerError::MirrorBlobChecksumMismatch { .. } => "E-MIRROR-BLOB-CHECKSUM-MISMATCH",
+            W1MarkerError::MirrorBlobNotRegularFile { .. } => "E-MIRROR-BLOB-NOT-REGULAR",
             W1MarkerError::MirrorUnreadable(_) => "E-MIRROR-UNREADABLE",
         }
     }
@@ -8485,7 +8817,16 @@ fn verify_mirror_blobs(
     let mut digested: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for view in &views {
         let blob = root.join(&view.blob_relative_path);
-        let meta = match std::fs::metadata(&blob) {
+        // ── R4 第 4 条 / 裁定 R-E-110 K1：与**规范校验器**同口径 ────────────
+        //
+        // 修前用 `std::fs::metadata`，它**跟随符号链接**且不判类型；而
+        // `raw_mirror::verify_existing_file` —— 这套 mirror 的规范校验器 ——
+        // 明确用 `symlink_metadata` 并拒 symlink blob。**同一件事两条路径两套口径**，
+        // 于是资格门绕过了它：把 blob 换成指向外部同长度文件的链接，默认档照过；
+        // 外部文件字节也相同时，**深度档一样照过**，而这份 mirror 一搬走就散了。
+        //
+        // 与 R4 第 1 条同族：**一条路上有的检查，兄弟路上没有。**
+        let meta = match std::fs::symlink_metadata(&blob) {
             Ok(meta) => meta,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 return Err(W1MarkerError::MirrorBlobMissing {
@@ -8500,6 +8841,12 @@ fn verify_mirror_blobs(
                 )));
             }
         };
+        if !meta.file_type().is_file() {
+            return Err(W1MarkerError::MirrorBlobNotRegularFile {
+                blob_relative_path: view.blob_relative_path.clone(),
+                detail: format!("{:?}", meta.file_type()),
+            });
+        }
         if meta.len() != view.blob_size_bytes {
             return Err(W1MarkerError::MirrorBlobSizeMismatch {
                 blob_relative_path: view.blob_relative_path.clone(),
