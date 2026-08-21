@@ -129,7 +129,13 @@ pub struct ContentVersion {
     pub source: VersionSource,
     normalized: Vec<u8>,
     unsealed_tail_len: u64,
-    pub source_mtime_ms: i64,
+    /// 封存时记录的源文件 mtime；`None` = **这份 manifest 落盘时就没记**。
+    ///
+    /// 是 `Option` 而不是「用 0 表示没有」：`unwrap_or_default()` 把「未知」变成
+    /// 一个**看起来完全正常的时刻**（epoch 0），而 winner 选择拿它判时间倒挂 ——
+    /// 于是缺 mtime 的新版本被判成「比旧版本早」，合法前缀链被拒成 HOLD
+    /// （R3 第 11 条 / 裁定 R-E-103 J3）。**未知就是未知，不作证据。**
+    pub source_mtime_ms: Option<i64>,
     pub captured_at_ms: i64,
     /// 人工裁定材料：mirror 侧是 `blob_blake3`，sealed 侧是 payload hash。仅诊断。
     pub blob_id: String,
@@ -140,7 +146,7 @@ impl ContentVersion {
     pub fn new(
         source: VersionSource,
         raw_bytes: &[u8],
-        source_mtime_ms: i64,
+        source_mtime_ms: Option<i64>,
         captured_at_ms: i64,
         blob_id: impl Into<String>,
     ) -> Self {
@@ -507,7 +513,8 @@ pub struct VersionSummary {
     /// **归一化后**的长度，不是 manifest 里的 `blob_size_bytes`。
     pub normalized_len: u64,
     pub unsealed_tail_len: u64,
-    pub source_mtime_ms: i64,
+    /// `None` = 未知。人读这份裁定材料时，「未知」与「1970-01-01」必须长得不一样。
+    pub source_mtime_ms: Option<i64>,
     pub captured_at_ms: i64,
 }
 
@@ -527,6 +534,13 @@ impl VersionSummary {
 /// HOLD 的来源。§D.5：E4 必须能区分三种，因为它们的人工裁定材料不同。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HoldEvidence {
+    /// 输入读不动：`detail` **原样**保留读取层的措辞。
+    ///
+    /// 单开一档而不是塞进 `Versions { versions: vec![] }`：读不动时本来就摘不出版本
+    /// 摘要，于是那一档交出的是一个**空证据**，而空证据与「查过了，没发现什么」
+    /// 长得一模一样。操作者要的恰恰是那句 detail（是哪一份、哪里不对）
+    /// —— R3 第 12 条点名的「丢弃 detail」就是这条（裁定 R-E-103 J3）。
+    InputUnreadable { detail: String },
     /// 字节层分叉：第一层失败，且第二层判定未启动或同样失败于字节形态。
     ByteLayer { versions: Vec<VersionSummary> },
     /// 消息层分叉：第一层失败、第二层也失败。**必须附两侧消息序列的差异位置**。
@@ -700,7 +714,13 @@ pub fn select_winner(
                 Relation::StrictlyAfter => (j, i),
                 _ => continue,
             };
-            if versions[earlier].source_mtime_ms > versions[later].source_mtime_ms {
+            // **两侧都有值才比较**（R3 第 11 条）。缺 mtime 不是「更早」的证据，
+            // 它什么也不是 —— 这条交叉检查因此对它保持沉默，而不是替它编一个时刻。
+            if let (Some(earlier_ms), Some(later_ms)) = (
+                versions[earlier].source_mtime_ms,
+                versions[later].source_mtime_ms,
+            ) && earlier_ms > later_ms
+            {
                 return Ok(WinnerOutcome::Hold(HoldRecord {
                     identity: identity.clone(),
                     reason: HoldReason::VersionTimeConflict,
@@ -1202,11 +1222,19 @@ mod e4_winner_and_decision_tests {
     }
 
     fn version(raw: &[u8], mtime: i64, captured: i64, id: &str) -> ContentVersion {
-        ContentVersion::new(VersionSource::Mirror, raw, mtime, captured, id)
+        ContentVersion::new(VersionSource::Mirror, raw, Some(mtime), captured, id)
     }
 
     fn sealed(raw: &[u8], mtime: i64, captured: i64, id: &str) -> ContentVersion {
-        ContentVersion::new(VersionSource::Sealed, raw, mtime, captured, id)
+        ContentVersion::new(VersionSource::Sealed, raw, Some(mtime), captured, id)
+    }
+
+    /// 允许把 `source_mtime_ms` 说成**未知**的构造器（R3 第 11 条）。
+    ///
+    /// 单开一个而不是去改上面那两个：它们有几十个调用点，
+    /// **机械改名会静默改变测试语义**，而改对的重命名和改坏的重命名长得一样。
+    fn version_opt(raw: &[u8], mtime: Option<i64>, captured: i64, id: &str) -> ContentVersion {
+        ContentVersion::new(VersionSource::Mirror, raw, mtime, captured, id)
     }
 
     const PATH: &str = "/home/u/.claude/projects/p/a.jsonl";
@@ -1462,6 +1490,74 @@ mod e4_winner_and_decision_tests {
             !manifest_fields::CONSUMED_BY_WINNER_SELECTION.contains(&"captured_at_ms"),
             "墙钟不得进判定字段集"
         );
+    }
+
+    // ── R3 第 11 条 / 裁定 R-E-103 J3：**未知就是未知，不作证据** ──────
+    //
+    // 修前：`view.source_mtime_ms.unwrap_or_default()` 把「这份 manifest 落盘时就没记
+    // mtime」变成 `0`，而 winner 选择拿它判时间倒挂 —— 于是一个**缺 mtime 的新版本**
+    // 被判成「比旧版本早」，一条合法的前缀链被拒成 HOLD。
+    //
+    // 而 `RawMirrorManifestView::source_mtime_ms` 的 doc 明写它
+    // 「**不进任何身份元组**，只作裁定材料」—— 现在它进了**判定**。按 doc 原义修：
+    // `Option` 一路带到判定处，**两侧都有值才比较**。
+    #[test]
+    fn a_missing_mtime_on_the_later_version_is_not_read_as_an_inversion() {
+        let id = identity(Origin::ClaudeCode, "h1", PATH);
+        // 短的（真前缀）记了 mtime；长的（后继）那份 manifest 落盘时没记。
+        let short = version_opt(&jsonl(&["{\"id\":\"m1\"}"]), Some(500), 1, "s");
+        let long = version_opt(
+            &jsonl(&["{\"id\":\"m1\"}", "{\"id\":\"m2\"}"]),
+            None,
+            2,
+            "l",
+        );
+        match select_winner(&id, &[short, long], &LineProjector).unwrap() {
+            // 索引 1 是那个真后继 —— 缺 mtime 不该改变序。
+            WinnerOutcome::Winner { index, .. } => assert_eq!(
+                index, 1,
+                "winner 必须是那个真后继（索引 1），缺 mtime 不该改变序"
+            ),
+            other => panic!("缺 mtime 不是「时间倒挂」的证据，不得据此 HOLD，实得 {other:?}"),
+        }
+    }
+
+    /// 对称的一侧：**较早那一份**缺 mtime 时同样不得判倒挂。
+    #[test]
+    fn a_missing_mtime_on_the_earlier_version_is_not_read_as_an_inversion() {
+        let id = identity(Origin::ClaudeCode, "h1", PATH);
+        let short = version_opt(&jsonl(&["{\"id\":\"m1\"}"]), None, 1, "s");
+        let long = version_opt(
+            &jsonl(&["{\"id\":\"m1\"}", "{\"id\":\"m2\"}"]),
+            Some(100),
+            2,
+            "l",
+        );
+        assert!(
+            matches!(
+                select_winner(&id, &[short, long], &LineProjector).unwrap(),
+                WinnerOutcome::Winner { .. }
+            ),
+            "另一侧缺 mtime 同样不得被读成倒挂"
+        );
+    }
+
+    /// 反方向臂：**两侧都有值**且真倒挂时，那条 HOLD 必须照旧打出来。
+    /// 只把比较改成 `Option` 而忘了保留「都有值就比」，会把一道真守卫悄悄拆掉。
+    #[test]
+    fn a_real_inversion_with_both_mtimes_present_still_holds() {
+        let id = identity(Origin::ClaudeCode, "h1", PATH);
+        let short = version_opt(&jsonl(&["{\"id\":\"m1\"}"]), Some(500), 1, "s");
+        let long = version_opt(
+            &jsonl(&["{\"id\":\"m1\"}", "{\"id\":\"m2\"}"]),
+            Some(100),
+            2,
+            "l",
+        );
+        match select_winner(&id, &[short, long], &LineProjector).unwrap() {
+            WinnerOutcome::Hold(h) => assert_eq!(h.reason, HoldReason::VersionTimeConflict),
+            other => panic!("两侧都有值的真倒挂必须仍然 HOLD，实得 {other:?}"),
+        }
     }
 
     /// §D.2.1 末段：真前缀却 `source_mtime_ms` 倒挂 → 版本类 HOLD，而不是拿墙钟决定胜者。
@@ -3515,7 +3611,7 @@ mod e5_materialization_tests {
         ContentVersion::new(
             VersionSource::Mirror,
             bytes,
-            mtime,
+            Some(mtime),
             1_700_000_000_000,
             blob_id,
         )
@@ -4649,7 +4745,17 @@ pub(crate) enum SealedBlobOutcome {
     Loaded(Vec<u8>),
     /// manifest 在、它指的 blob 不在。→ `manifest-reference-missing`。
     ReferenceMissing,
+    /// blob **在**，但它的字节与 manifest 记的身份对不上 → `payload-hash-mismatch`。
+    ///
+    /// 与 `ReferenceMissing` 分开是因为**操作者的下一步动作不同**：一个是去找丢失的
+    /// 内容，一个是这份 mirror 本身已经不可信（R3 第 12 条 / 裁定 R-E-103 J3）。
+    PayloadHashMismatch { detail: String },
     /// 其余读取/校验失败。`detail` 原样保留 doctor 侧的措辞，不二次归类。
+    ///
+    /// ⚠ **已披露的分桶边界**：判据取自 doctor 扫描期定好的 `blob_checksum_status`，
+    /// 所以「扫描时校验通过、读取时才发现字节变了」这个 TOCTOU 形态会落到这里，
+    /// 而不是 `PayloadHashMismatch`。**丢的只是桶名，不是信息** —— `detail` 原样
+    /// 说明发生了什么，而按错误文本反推桶名是本仓一路在拒绝的那种脆判据。
     Unreadable { detail: String },
 }
 
@@ -4679,6 +4785,13 @@ pub(crate) fn read_sealed_blob(
     }
     match crate::doctor_candidate_read_verified_raw_mirror_blob(data_dir, manifest) {
         Ok(bytes) => SealedBlobOutcome::Loaded(bytes),
+        // 分桶同样**不匹配错误文本**，读的是 doctor 校验阶段已经定好的具名状态
+        // （与上面那句分出 `ReferenceMissing` 用的是同一个字段、同一条理由）。
+        Err(detail)
+            if manifest.blob_checksum_status == crate::DoctorArtifactChecksumStatus::Mismatched =>
+        {
+            SealedBlobOutcome::PayloadHashMismatch { detail }
+        }
         Err(detail) => SealedBlobOutcome::Unreadable { detail },
     }
 }
@@ -4698,6 +4811,35 @@ pub fn hold_for_manifest_reference_missing(
         evidence: HoldEvidence::Versions { versions },
         // 这条裁定读的是「`blob_blake3` 指向的内容还在不在」，以及用于定位身份的
         // `original_path`。**清单是静态的，不自由构造**（R-E-27 第 3 条）。
+        consumed_manifest_fields: vec![
+            manifest_fields::BLOB_BLAKE3,
+            manifest_fields::ORIGINAL_PATH,
+        ],
+    }
+}
+
+/// 读不动（而不是「不在」）的封存 blob 的 HOLD 发射点（R3 第 12 条）。
+///
+/// 与 [`hold_for_manifest_reference_missing`] 分开的理由写在 `SealedBlobOutcome`
+/// 那两个变体上：**读不到 ≠ 不存在**，两者的下一步动作不同。`reason` 由调用方从
+/// 读取层的具名结论转达（`payload-hash-mismatch` / 其余输入损坏），
+/// `class` 仍由 reason 静态决定，调用方无从指定。
+pub fn hold_for_unreadable_sealed_blob(
+    identity: RestoreIdentity,
+    reason: HoldReason,
+    detail: String,
+) -> HoldRecord {
+    debug_assert_eq!(
+        reason.class(),
+        HoldClass::InputCorruption,
+        "这个发射点只发输入损坏类"
+    );
+    HoldRecord {
+        identity,
+        reason,
+        evidence: HoldEvidence::InputUnreadable { detail },
+        // 与 `manifest-reference-missing` 消费同一组字段：这条裁定读的仍是
+        // 「`blob_blake3` 指向的内容」与用于定位身份的 `original_path`。
         consumed_manifest_fields: vec![
             manifest_fields::BLOB_BLAKE3,
             manifest_fields::ORIGINAL_PATH,
@@ -4953,7 +5095,8 @@ mod e5_p30_blob_read_tests {
                     holds.push(hold_for_manifest_reference_missing(identity, Vec::new()));
                     continue;
                 }
-                SealedBlobOutcome::Unreadable { detail } => {
+                SealedBlobOutcome::PayloadHashMismatch { detail }
+                | SealedBlobOutcome::Unreadable { detail } => {
                     panic!("本演练里不应出现读不动的 blob：{detail}")
                 }
             };
@@ -7256,7 +7399,8 @@ fn restore_project_plan_item(
         SealedBlobOutcome::ReferenceMissing => {
             anyhow::bail!("sealed blob missing for manifest {}", view.manifest_id)
         }
-        SealedBlobOutcome::Unreadable { detail } => {
+        SealedBlobOutcome::PayloadHashMismatch { detail }
+        | SealedBlobOutcome::Unreadable { detail } => {
             anyhow::bail!("sealed blob unreadable for {}: {detail}", view.manifest_id)
         }
     };
@@ -7592,10 +7736,23 @@ fn restore_publish_manifests(
 /// 不是「这次**写进去了多少**」。工作量的真相在 `RestoreRunOutcome` 的分格数字里 ——
 /// `restored`（真新建）与 `deduplicated`（去重收敛）是两个数，别读成一个。
 ///
-/// **操作者的真验证法**：apply 之后重跑一次 planner 的 dry-run。`planned == 0`
-/// 是幂等完成信号（该做的都做到位了，无论是新建还是本来就在）；而
-/// `restored` / `deduplicated` 的分格数字才告诉你这次实际写了多少。
-/// 不要拿 closure 或 `--qualify` 的绿去回答「库里多了多少」这个问题。
+/// **操作者的真验证法 —— 用归宿守恒等式，不要用「重跑 dry-run 看它归零」**
+/// （FIND-8 / R3 第 16 条 / 裁定 R-E-103 J3）：
+///
+/// ```text
+/// restored + replaced + deduplicated + already_committed == planned
+/// ```
+///
+/// 读法：本轮每一条计划项都有归宿 —— 落库、替换、被去重收敛，或本来就已提交。
+///
+/// **为什么不能用那个归零信号**：planner 按**路径锚定的身份**判「库里有没有」
+/// （manifest 的 `original_path` ↔ 库里的 `source_path`），而插入器按**内容合并键**
+/// 去重（与路径无关）—— 两侧各自忠实于自己的契约。于是一条会话若已在库、却挂在
+/// **另一个路径**下（项目目录改名、家目录迁移、会话文件被复制），planner 每轮都规划、
+/// 插入器每轮都去重，**它永远规划不完**。那不是没修好，是这两个口径本来就不同一。
+///
+/// 工作量的真相仍在分格数字里：`restored`（真新建）与 `deduplicated`（去重收敛）
+/// 是两个数，别读成一个。也不要拿 closure 或 `--qualify` 的绿去回答「库里多了多少」。
 fn restore_verify_closure(journal: &RestoreJournal) -> anyhow::Result<()> {
     restore_assert_receipts_present(journal)?;
     let views = crate::raw_mirror::manifest_views(&journal.data_dir)?;
@@ -8557,8 +8714,12 @@ pub(crate) struct W1Qualification {
 /// 不是缺口：资格门回答「这份候选能不能被下游接手」，回答不了「这次写了多少」。
 ///
 /// 所以 **`qualified: true` 与 closure 绿一样，都不蕴含库里多了行**。操作者要确认
-/// 恢复真的到位，用两个独立读法：① apply 之后**重跑一次 planner 的 dry-run**，
-/// `planned == 0` 是幂等完成信号；② 看 `restored` / `deduplicated` 分格数字判工作量。
+/// 恢复真的到位，用两个独立读法：① 归宿守恒等式
+/// `restored + replaced + deduplicated + already_committed == planned`；
+/// ② 看 `restored` / `deduplicated` 分格数字判工作量。
+///
+/// **不要**用「重跑 dry-run 看 `planned` 归零」当幂等完成信号：内容去重挂在另一路径上的
+/// 会话**永远规划不完**，理由见 [`restore_verify_closure`] 的说明（FIND-8 / R3 第 16 条）。
 pub(crate) fn qualify_w1_candidate(
     input: &W1QualificationInput<'_>,
 ) -> Result<W1Qualification, W1MarkerError> {
@@ -12027,7 +12188,10 @@ fn candidate_versions_from_db(
             evidence: ContentVersion::new(
                 VersionSource::CandidateDb,
                 &raw,
-                0,
+                // 候选库侧**本来就没有**源文件 mtime。从前这里写 `0`，
+                // 那是 R3 第 11 条同一个缺陷的另一处：一个编出来的时刻，
+                // 看起来和真的一模一样。
+                None,
                 0,
                 format!("db:conversation:{conversation_id}"),
             ),
@@ -12211,15 +12375,37 @@ pub(crate) fn plan_mirror_restore(
                 SealedBlobOutcome::Loaded(bytes) => versions.push(ContentVersion::new(
                     VersionSource::Mirror,
                     &bytes,
-                    view.source_mtime_ms.unwrap_or_default(),
+                    // 原样带过去：`unwrap_or_default()` 会把「没记」变成 epoch 0，
+                    // 而下游拿它判时间倒挂（R3 第 11 条 / 裁定 R-E-103 J3）。
+                    view.source_mtime_ms,
                     view.captured_at_ms,
                     view.blob_blake3.clone(),
                 )),
-                // blob 读不到 = 输入损坏类 HOLD，**不是**「这条身份不存在」。
-                SealedBlobOutcome::ReferenceMissing | SealedBlobOutcome::Unreadable { .. } => {
+                // blob 读不到 = 输入损坏类 HOLD，**不是**「这条身份不存在」——
+                // 而修前这里选的桶名恰恰是「不存在」，注释与代码互相打脸（R3 第 12 条）。
+                SealedBlobOutcome::ReferenceMissing => {
                     input_fault = Some(hold_for_manifest_reference_missing(
                         identity.clone(),
                         Vec::new(),
+                    ));
+                    break;
+                }
+                SealedBlobOutcome::PayloadHashMismatch { detail } => {
+                    input_fault = Some(hold_for_unreadable_sealed_blob(
+                        identity.clone(),
+                        HoldReason::PayloadHashMismatch,
+                        detail,
+                    ));
+                    break;
+                }
+                SealedBlobOutcome::Unreadable { detail } => {
+                    input_fault = Some(hold_for_unreadable_sealed_blob(
+                        identity.clone(),
+                        // 读不动但不是哈希不匹配（路径不安全、非常规文件、I/O 错、
+                        // 压缩/加密态不支持）：仍是输入损坏，桶名沿用「指向的内容
+                        // 取不到」这一档，而**真正的信息在 detail 里**。
+                        HoldReason::ManifestReferenceMissing,
+                        detail,
                     ));
                     break;
                 }
@@ -12387,6 +12573,101 @@ mod e8_dry_run_planner_tests {
             snapshot_root: "e8-bench-root".into(),
         })
         .expect("dry-run planner must run")
+    }
+
+    // ── R3 第 12 条 / 裁定 R-E-103 J3：读不到 ≠ 不存在 ─────────────────
+    //
+    // `read_sealed_blob` **正确**区分 `ReferenceMissing`（blob 不在）与
+    // `Unreadable { detail }`（其余读取 / 校验失败），planner 却把两者并进
+    // `hold_for_manifest_reference_missing`，还把 `detail` 丢掉（传 `Vec::new()`）。
+    //
+    // **代码自己的注释就打脸**：那一行上面写着「blob 读不到 = 输入损坏类 HOLD，
+    // **不是**『这条身份不存在』」，而它选的桶名恰恰是「不存在」。
+    // 同时 `PayloadHashMismatch` 在分类里定义着，这条路径上**永不发射**。
+    //
+    // 判据落在 planner 的产物上（HOLD 台账正是操作者读到的那一面），
+    // 不落在 `read_sealed_blob` 的返回值上 —— 那一层本来就分得清，缺陷在收口那一步。
+    #[test]
+    fn a_corrupted_blob_holds_as_payload_hash_mismatch_not_reference_missing() {
+        let b = bench();
+
+        // 挑一份 manifest，把它的 blob **留在原地**但换掉字节。
+        // 与「blob 不在」是两种不同的输入损坏，操作者的下一步动作也不同：
+        // 一个是去找丢失的内容，一个是这份 mirror 本身已经不可信。
+        let views = crate::raw_mirror::manifest_views(&b.data_dir).unwrap();
+        let victim = views
+            .iter()
+            .find(|v| v.original_path.ends_with("rollout-missing.jsonl"))
+            .expect("前置断言：fixture 里必须有这条身份");
+        let blob = crate::doctor_raw_mirror_root(&b.data_dir).join(&victim.blob_relative_path);
+        let original = std::fs::read(&blob).unwrap();
+        std::fs::write(&blob, b"these bytes do not hash to the recorded blob id\n").unwrap();
+        assert!(
+            blob.exists(),
+            "前置断言：blob **在**，测的不是「不在」那一支"
+        );
+        assert_ne!(
+            std::fs::read(&blob).unwrap(),
+            original,
+            "前置断言：字节必须真被换掉，否则这条用例没有分辨力"
+        );
+
+        let report = report_of(&b);
+        let hold = report
+            .holds
+            .iter()
+            .find(|h| h.identity.canonical_path.ends_with("rollout-missing.jsonl"))
+            .expect("被破坏的那条身份必须产出一条 HOLD");
+
+        assert_eq!(
+            hold.reason,
+            HoldReason::PayloadHashMismatch,
+            "blob 在、字节对不上 = payload 哈希不匹配。判成\
+             `manifest-reference-missing` 会把「这份 mirror 不可信」说成\
+             「这条身份不存在」—— 两者的下一步动作完全不同"
+        );
+        assert_eq!(
+            hold.reason.class(),
+            HoldClass::InputCorruption,
+            "两条 reason 同属输入损坏类，改的是桶名不是类"
+        );
+
+        // detail 必须真的被带出来。修前这里传的是 `Vec::new()` ——
+        // 一个**空证据**，与「查过了，没发现什么」长得一模一样。
+        match &hold.evidence {
+            HoldEvidence::InputUnreadable { detail } => assert!(
+                detail.contains(&victim.manifest_id),
+                "detail 要能把操作者引到**是哪一份** manifest 上，实得：{detail}"
+            ),
+            other => panic!("读不动的证据必须走 InputUnreadable 这一档，实得 {other:?}"),
+        }
+    }
+
+    /// 反方向臂：blob **真的不在**时，仍须判 `manifest-reference-missing`。
+    /// 把两者并成一个桶是缺陷，把它们对调同样是缺陷。
+    #[test]
+    fn a_deleted_blob_still_holds_as_manifest_reference_missing() {
+        let b = bench();
+        let views = crate::raw_mirror::manifest_views(&b.data_dir).unwrap();
+        let victim = views
+            .iter()
+            .find(|v| v.original_path.ends_with("rollout-missing.jsonl"))
+            .expect("前置断言：fixture 里必须有这条身份");
+        let blob = crate::doctor_raw_mirror_root(&b.data_dir).join(&victim.blob_relative_path);
+        std::fs::remove_file(&blob).unwrap();
+        assert!(!blob.exists(), "前置断言：blob 必须真的不在了");
+
+        let report = report_of(&b);
+        let hold = report
+            .holds
+            .iter()
+            .find(|h| h.identity.canonical_path.ends_with("rollout-missing.jsonl"))
+            .expect("blob 不在的那条身份必须产出一条 HOLD");
+        assert_eq!(
+            hold.reason,
+            HoldReason::ManifestReferenceMissing,
+            "blob 真的不在时这条桶名是对的，不得被顺手改走"
+        );
     }
 
     /// 锚定的声称原文：`mirror-restore` 子命令的 doc（`src/lib.rs`）——

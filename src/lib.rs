@@ -691,27 +691,41 @@ pub enum Commands {
         /// （`src/lib.rs` 的 `pub struct Cli`），同名会被参数恢复层提到最前、
         /// 让整个子命令解析崩掉（本棒实测：报的是「unexpected argument '--scratch'」，
         /// 与真因隔着两层）。全局名复用成另一个含义，是日后必然咬人的歧义。
-        #[arg(long)]
-        candidate_db: PathBuf,
+        ///
+        /// **`--recover` 时允许缺席**（R3 第 13 条 / 裁定 R-E-103 J3）：R-E-19 第三条定的是
+        /// 「恢复的入参只有 journal 路径」，实现一直遵守（运行时忽略这三个），
+        /// **是参数层没跟上** —— 从前它是无条件必填，于是文档给的恢复命令在解析阶段
+        /// 就被拒，操作者只能编三个被忽略的假值。
+        #[arg(long, required_unless_present = "recover")]
+        candidate_db: Option<PathBuf>,
 
         /// 投影物化用的隔离根。**不进任何判定**。
         ///
         /// **应当是本次运行独占的目录。** 复用一棵旧 scratch 有风险：物化件按内容定名
         /// 落在 `<scratch>/v-<hash>/` 下，这些目录名在第一轮之后就都在盘上了；
         /// 若其中某一级分量被换成指向外部的 symlink，物化就会跟着走出去。
-        /// 工具已加双层防护（写前逐分量拒 symlink + 写后前缀断言，R-E-84），
-        /// 但独占目录仍是更省事的那条路。
+        /// 工具在这条路上做了两件事，**但只有第一件是防护**（R3 第 7 条 / 裁定 R-E-103 J3
+        /// 把措辞改成如实的）：写前逐分量拒 symlink（R-E-84 (a)）**挡得住**逃逸；
+        /// 写后的前缀断言（R-E-84 (c)）**只能事后发现** —— 覆盖若已发生，就发生在那条断言
+        /// 之前，它拦不住损坏，只负责让这一轮以具名错误停下并把现场留着
+        /// （R-E-98 H2 之后它连删都不删：删了只是在既成损失上再加一笔，还抹掉现场）。
+        /// 而 (a) 本身是 check-then-use，那个 TOCTOU 窗按 R-E-84 裁定**不修**。
+        /// **所以独占目录不是「更省事」，是这条路上唯一不依赖时序的那道保障。**
         ///
         /// 物化件**出生即私有**（目录 `0700`、文件 `0600`，R3 第 6 条 / 裁定 R-E-103 J2）——
         /// 里面是**完整会话原文**，连 `home/<u>/.claude/projects/<ws>/` 这几级目录名本身
         /// 都是家目录全路径与工作区名。复用一棵旧 scratch 时，被放宽过的既有目录与文件
         /// 会在本轮被收紧。
-        #[arg(long)]
-        scratch: PathBuf,
+        ///
+        /// **`--recover` 时允许缺席**（同 `--candidate-db`，R3 第 13 条）。
+        #[arg(long, required_unless_present = "recover")]
+        scratch: Option<PathBuf>,
 
         /// 本轮消费的封存件根。
-        #[arg(long)]
-        snapshot_root: String,
+        ///
+        /// **`--recover` 时允许缺席**（同 `--candidate-db`，R3 第 13 条）。
+        #[arg(long, required_unless_present = "recover")]
+        snapshot_root: Option<String>,
 
         /// 六类计数与 HOLD 清单的落点（JSON）。不给则只打印摘要。
         ///
@@ -7018,12 +7032,6 @@ async fn execute_cli(
                     json,
                 } => {
                     let resolved = data_dir.clone().unwrap_or_else(default_data_dir);
-                    let options = crate::phase3_restore::MirrorRestorePlanOptions {
-                        data_dir: resolved,
-                        db_path: candidate_db.clone(),
-                        scratch_dir: scratch.clone(),
-                        snapshot_root: snapshot_root.clone(),
-                    };
                     let fail = |kind: &'static str, err: String| CliError {
                         code: 1,
                         kind,
@@ -7031,6 +7039,61 @@ async fn execute_cli(
                         hint: None,
                         retryable: false,
                     };
+                    // ── --recover：入参只有 journal 路径（R-E-19 第三条）──────
+                    if recover {
+                        let journal_path = journal.clone().ok_or_else(|| {
+                            fail(
+                                "mirror_restore_recover_needs_journal",
+                                "--recover requires --journal".to_string(),
+                            )
+                        })?;
+                        let outcome = crate::phase3_restore::restore_recover(&journal_path)
+                            .map_err(|err| {
+                                fail("mirror_restore_recover_failed", err.to_string())
+                            })?;
+                        let state = crate::phase3_restore::restore_journal_read(&journal_path)
+                            .map_err(|err| fail("mirror_restore_recover_failed", err.to_string()))?
+                            .map(|j| format!("{:?}", j.state))
+                            .unwrap_or_else(|| "missing".to_string());
+                        let (as_json, as_text) = mirror_restore_recover_report(&state, &outcome);
+                        if json {
+                            println!("{as_json}");
+                        } else {
+                            println!("{as_text}");
+                        }
+                        return Ok(());
+                    }
+
+                    // ── 三个入参取值：不给 `--recover` 时 clap 已在解析阶段把门 ──
+                    //
+                    // 这里的具名错误是 **belt**：门是 `required_unless_present`。
+                    // 万一日后有人动了那个属性，这里保证死在一句说得清的话上，
+                    // 而不是 `unwrap` 的 panic 或一个空路径。
+                    let candidate_db = candidate_db.clone().ok_or_else(|| {
+                        fail(
+                            "mirror_restore_needs_candidate_db",
+                            "--candidate-db is required unless --recover is given".to_string(),
+                        )
+                    })?;
+                    let scratch = scratch.clone().ok_or_else(|| {
+                        fail(
+                            "mirror_restore_needs_scratch",
+                            "--scratch is required unless --recover is given".to_string(),
+                        )
+                    })?;
+                    let snapshot_root = snapshot_root.clone().ok_or_else(|| {
+                        fail(
+                            "mirror_restore_needs_snapshot_root",
+                            "--snapshot-root is required unless --recover is given".to_string(),
+                        )
+                    })?;
+                    let options = crate::phase3_restore::MirrorRestorePlanOptions {
+                        data_dir: resolved,
+                        db_path: candidate_db,
+                        scratch_dir: scratch,
+                        snapshot_root: snapshot_root.clone(),
+                    };
+
                     // ── --qualify：只解析、只复核，**不产计划也不写任何东西** ──
                     if qualify {
                         let marker_path = default_w1_marker_path(marker.as_ref(), &options.db_path);
@@ -7112,50 +7175,6 @@ async fn execute_cli(
                         };
                     }
 
-                    // ── --recover：入参只有 journal 路径（R-E-19 第三条）──────
-                    if recover {
-                        let journal_path = journal.clone().ok_or_else(|| {
-                            fail(
-                                "mirror_restore_recover_needs_journal",
-                                "--recover requires --journal".to_string(),
-                            )
-                        })?;
-                        let outcome = crate::phase3_restore::restore_recover(&journal_path)
-                            .map_err(|err| {
-                                fail("mirror_restore_recover_failed", err.to_string())
-                            })?;
-                        let state = crate::phase3_restore::restore_journal_read(&journal_path)
-                            .map_err(|err| fail("mirror_restore_recover_failed", err.to_string()))?
-                            .map(|j| format!("{:?}", j.state))
-                            .unwrap_or_else(|| "missing".to_string());
-                        if json {
-                            println!(
-                                "{}",
-                                serde_json::json!({
-                                    "recovered": true,
-                                    "journal_state": state,
-                                    "restored": outcome.restored,
-                                    "deduplicated": outcome.deduplicated,
-                                    "already_committed": outcome.already_committed,
-                                    "replaced": outcome.replaced,
-                                    "published": outcome.published,
-                                    "receipt_keys": outcome.receipt_keys,
-                                })
-                            );
-                        } else {
-                            println!(
-                                "recovered: journal_state={state} restored={} deduplicated={} \
-                                 already_committed={} replaced={} published={}",
-                                outcome.restored,
-                                outcome.deduplicated,
-                                outcome.already_committed,
-                                outcome.replaced,
-                                outcome.published
-                            );
-                        }
-                        return Ok(());
-                    }
-
                     let report = crate::phase3_restore::plan_mirror_restore(&options)
                         .map_err(|err| fail("mirror_restore_plan_failed", err.to_string()))?;
 
@@ -7216,6 +7235,11 @@ async fn execute_cli(
                                 crate::phase3_restore::HoldEvidence::WholeFileExcluded {
                                     detail,
                                 } => ("whole-file-excluded", detail.clone()),
+                                // R3 第 12 条：读不动时那句 detail 就是操作者要的全部
+                                // 线索（是哪一份、哪里不对）—— 它必须到得了 HOLD 台账。
+                                crate::phase3_restore::HoldEvidence::InputUnreadable { detail } => {
+                                    ("input-unreadable", detail.clone())
+                                }
                                 crate::phase3_restore::HoldEvidence::Versions { versions } => {
                                     ("versions", format!("{} versions", versions.len()))
                                 }
@@ -7332,39 +7356,11 @@ async fn execute_cli(
                                 .map_err(|err| {
                                     fail("mirror_restore_apply_failed", err.to_string())
                                 })?;
+                        let (as_json, as_text) = mirror_restore_apply_report(&outcome);
                         if json {
-                            println!(
-                                "{}",
-                                serde_json::json!({
-                                    "applied": true,
-                                    "restored": outcome.restored,
-                                    // 去重收敛的条数：动作做过了，库里没多行。
-                                    // **不并进 `restored`**（FIND-7 / 裁定 R-E-76）。
-                                    "deduplicated": outcome.deduplicated,
-                                    // 已提交、本轮跳过（R-E-83）。归宿守恒的第四格：
-                                    // restored + replaced + deduplicated
-                                    //   + already_committed == planned
-                                    "already_committed": outcome.already_committed,
-                                    "replaced": outcome.replaced,
-                                    "published": outcome.published,
-                                    "messages_inserted": outcome.messages_inserted,
-                                    "messages_deleted": outcome.messages_deleted,
-                                    "receipt_keys": outcome.receipt_keys,
-                                })
-                            );
+                            println!("{as_json}");
                         } else {
-                            println!(
-                                "applied: restored={} deduplicated={} already_committed={} \
-                                 replaced={} published={} messages(+{}/-{}) receipts={}",
-                                outcome.restored,
-                                outcome.deduplicated,
-                                outcome.already_committed,
-                                outcome.replaced,
-                                outcome.published,
-                                outcome.messages_inserted,
-                                outcome.messages_deleted,
-                                outcome.receipt_keys.len()
-                            );
+                            println!("{as_text}");
                         }
                     } else if json {
                         println!("{summary}");
@@ -20266,6 +20262,90 @@ fn mirror_restore_write_out_reports(
     // agent 名，凭什么它可以世界可读、还可以顺着 symlink 截断别人的文件。
     write_private_file(path, &bytes)?;
     Ok(())
+}
+
+/// `--apply` 收尾的两个输出面（JSON 与文本摘要）**由同一个函数产**。
+///
+/// 抽出来的理由与 `--out` 那一处同源（`match` 分支里的 `println!` 进不去测试），
+/// 但这一条另有来历，写在这里而不是只写进 commit message：
+///
+/// `published_without_backlink` 这一格加进 `RestoreRunOutcome` 时，上一棒在批次记录与
+/// 报文里写的是「随之出现在 CLI 的 JSON 与摘要两个输出面」——**那是假设，不是核实**。
+/// 实核：该计数器在全仓只有三处（字段定义、`+= 1`、以及它自己的测试），
+/// **两个 CLI 输出面一个都没报它**。而加这一格的全部意义就是让操作者看见
+/// 「发布了、但没能给它配上 backlink」；它对操作者不可见 = 这一格等于不存在。
+///
+/// 所以判据断言的是**CLI 输出真的含这一格**，不是 outcome 结构里有
+/// （R3 第 8 条 / 裁定 R-E-103 J3）。
+fn mirror_restore_apply_report(
+    outcome: &crate::phase3_restore::RestoreRunOutcome,
+) -> (serde_json::Value, String) {
+    let as_json = serde_json::json!({
+        "applied": true,
+        "restored": outcome.restored,
+        // 去重收敛的条数：动作做过了，库里没多行。
+        // **不并进 `restored`**（FIND-7 / 裁定 R-E-76）。
+        "deduplicated": outcome.deduplicated,
+        // 已提交、本轮跳过（R-E-83）。归宿守恒的第四格：
+        // restored + replaced + deduplicated + already_committed == planned
+        "already_committed": outcome.already_committed,
+        "replaced": outcome.replaced,
+        "published": outcome.published,
+        // 发布出去了、但**没能给它配上 backlink** 的份数（R2 第 4 条 / R-E-98 H1）。
+        // 与 `published` 是**两个数**：查不到候选行不必然是错（内容去重把行收敛到
+        // 另一条 `source_path` 上就查不到，那是 FIND-7 / R-E-76 已裁的合法归宿），
+        // 所以口径是记账不是硬失败 —— 而记账只有报出来才成立。
+        "published_without_backlink": outcome.published_without_backlink,
+        "messages_inserted": outcome.messages_inserted,
+        "messages_deleted": outcome.messages_deleted,
+        "receipt_keys": outcome.receipt_keys,
+    });
+    let as_text = format!(
+        "applied: restored={} deduplicated={} already_committed={} \
+         replaced={} published={} published_without_backlink={} \
+         messages(+{}/-{}) receipts={}",
+        outcome.restored,
+        outcome.deduplicated,
+        outcome.already_committed,
+        outcome.replaced,
+        outcome.published,
+        outcome.published_without_backlink,
+        outcome.messages_inserted,
+        outcome.messages_deleted,
+        outcome.receipt_keys.len()
+    );
+    (as_json, as_text)
+}
+
+/// `--recover` 收尾的两个输出面。见 [`mirror_restore_apply_report`] 的说明 ——
+/// 两个面同一条来历，所以两个都要报同一组格子。
+fn mirror_restore_recover_report(
+    journal_state: &str,
+    outcome: &crate::phase3_restore::RestoreRunOutcome,
+) -> (serde_json::Value, String) {
+    let as_json = serde_json::json!({
+        "recovered": true,
+        "journal_state": journal_state,
+        "restored": outcome.restored,
+        "deduplicated": outcome.deduplicated,
+        "already_committed": outcome.already_committed,
+        "replaced": outcome.replaced,
+        "published": outcome.published,
+        "published_without_backlink": outcome.published_without_backlink,
+        "receipt_keys": outcome.receipt_keys,
+    });
+    let as_text = format!(
+        "recovered: journal_state={journal_state} restored={} deduplicated={} \
+         already_committed={} replaced={} published={} \
+         published_without_backlink={}",
+        outcome.restored,
+        outcome.deduplicated,
+        outcome.already_committed,
+        outcome.replaced,
+        outcome.published,
+        outcome.published_without_backlink
+    );
+    (as_json, as_text)
 }
 
 fn default_w1_marker_path(explicit: Option<&PathBuf>, db_path: &std::path::Path) -> PathBuf {
@@ -100392,6 +100472,209 @@ mod mirror_restore_deep_verify_flag_tests {
     /// 判据不是「能不能解析」，是**不在场时会不会被静默忽略**：一个被静默吞掉的
     /// `--deep-verify` 会让操作者以为自己跑了深度校验，而实际上跑的是默认档 ——
     /// 那正是本仓一路在反对的那种「不在场就跳过」。
+    // ── R3 第 7 / 16 条：**声称必须与实现同真** ────────────────────────
+    //
+    // 这两条都不是功能缺陷，是**声称失真** —— 与 R1 第 15 条「nothing is written」同型。
+    // 失真的声称改回来之后，唯一能防它被改回去的就是把它钉成判据。
+    //
+    // ⚠ 判据自己**不得成为它要找的那个字符串**：裸子串匹配会把「讨论 X」当成「X 本身」，
+    // 而这两条判据要找的针恰好会出现在判据自己的源码里。所以针一律在**运行时拼**出来，
+    // 源码里找不到它的完整字面量 —— 真写成字面量时，下面 `== 0` 那条会当场变红，
+    // 判据是自保的。
+    #[test]
+    fn scratch_help_no_longer_claims_two_working_layers_of_protection() {
+        run_on_large_stack(|| {
+            use clap::CommandFactory as _;
+            let cmd = Cli::command();
+            let sub = cmd
+                .get_subcommands()
+                .find(|c| c.get_name() == "mirror-restore")
+                .expect("mirror-restore 子命令必须在");
+            let arg = sub
+                .get_arguments()
+                .find(|a| a.get_id() == "scratch")
+                .expect("--scratch 必须在");
+            let help = format!(
+                "{}{}",
+                arg.get_help().map(|h| h.to_string()).unwrap_or_default(),
+                arg.get_long_help()
+                    .map(|h| h.to_string())
+                    .unwrap_or_default(),
+            );
+
+            let overstated = format!("工具已加{}防护", "双层");
+            assert!(
+                !help.contains(overstated.as_str()),
+                "第二层只能事后发现（受害者已被截断），把它并称成「防护」就是声称失真，实得：{help}"
+            );
+            assert!(
+                help.contains("只能事后发现"),
+                "必须把第二层的真实能力写出来，实得：{help}"
+            );
+            assert!(
+                help.contains("TOCTOU"),
+                "第一层的 check-then-use 窗（R-E-84 裁定不修）也必须如实披露，实得：{help}"
+            );
+        });
+    }
+
+    #[test]
+    fn production_docs_teach_the_disposition_conservation_not_a_planned_zero_signal() {
+        let source = include_str!("phase3_restore.rs");
+
+        let stale = format!("`planned {} 0` 是幂等完成信号", "==");
+        assert_eq!(
+            source.matches(stale.as_str()).count(),
+            0,
+            "生产 doc 不得再教「重跑 dry-run 看 planned 归零」—— \
+             内容去重挂在另一路径上的会话永远规划不完（FIND-8），这句与草稿不能同真"
+        );
+
+        let conserved = format!(
+            "restored {} replaced + deduplicated + already_committed == planned",
+            "+"
+        );
+        let hits = source.matches(conserved.as_str()).count();
+        assert!(
+            hits >= 2,
+            "两处生产 doc 都要给出归宿守恒等式（closure 与 qualify 各一处），实得 {hits} 处"
+        );
+    }
+
+    // ── R3 第 8 条 / 裁定 R-E-103 J3：这一格必须真的到得了操作者眼前 ───
+    //
+    // `published_without_backlink` 在全仓只有三处：字段定义、`+= 1`、以及它自己的
+    // 测试 —— **两个 CLI 输出面一个都没报它**。上一棒在批次记录与报文里称它
+    // 「随之出现在 CLI 的 JSON 与摘要两个输出面」，那句是**假设不是核实**。
+    //
+    // **判据断言 CLI 输出真的含这一格**，不是断言 outcome 结构里有它 ——
+    // 后者从修前起就一直是真的，拿它当判据等于没有判据。
+    #[test]
+    fn both_apply_output_faces_report_published_without_backlink() {
+        let outcome = crate::phase3_restore::RestoreRunOutcome {
+            restored: 1,
+            deduplicated: 0,
+            already_committed: 0,
+            replaced: 0,
+            published: 3,
+            published_without_backlink: 2,
+            receipt_keys: vec!["k1".to_string()],
+            messages_inserted: 4,
+            messages_deleted: 0,
+        };
+
+        let (as_json, as_text) = mirror_restore_apply_report(&outcome);
+        assert_eq!(
+            as_json
+                .get("published_without_backlink")
+                .and_then(|v| v.as_u64()),
+            Some(2),
+            "--apply 的 JSON 面必须报这一格，实得：{as_json}"
+        );
+        assert!(
+            as_text.contains("published_without_backlink=2"),
+            "--apply 的文本摘要面同样必须报它 —— 只上 JSON 面等于只服务机器读者，\
+             而这一格是给人看的。实得：{as_text}"
+        );
+        // 前置断言：`published` 与这一格是**两个数**，别读成一个。
+        assert!(
+            as_text.contains("published=3"),
+            "既有的 published 必须还在，实得：{as_text}"
+        );
+    }
+
+    #[test]
+    fn both_recover_output_faces_report_published_without_backlink() {
+        let outcome = crate::phase3_restore::RestoreRunOutcome {
+            restored: 0,
+            deduplicated: 0,
+            already_committed: 2,
+            replaced: 0,
+            published: 2,
+            published_without_backlink: 1,
+            receipt_keys: vec!["k1".to_string(), "k2".to_string()],
+            messages_inserted: 0,
+            messages_deleted: 0,
+        };
+
+        let (as_json, as_text) = mirror_restore_recover_report("ClosureVerified", &outcome);
+        assert_eq!(
+            as_json
+                .get("published_without_backlink")
+                .and_then(|v| v.as_u64()),
+            Some(1),
+            "--recover 的 JSON 面必须报这一格 —— 恢复路径恰恰是最需要对账的时候。实得：{as_json}"
+        );
+        assert!(
+            as_text.contains("published_without_backlink=1"),
+            "--recover 的文本摘要面同样必须报它，实得：{as_text}"
+        );
+    }
+
+    // ── R3 第 13 条 / 裁定 R-E-103 J3：参数层要跟上 R-E-19 ─────────────
+    //
+    // `--recover` 自称「入参只有 journal 路径」，实现也确实忽略 `--candidate-db` /
+    // `--scratch` / `--snapshot-root`（R-E-19 第三条），**但 clap 把这三个定义成
+    // 无 `Option`、无 `required_unless_present` 的必填项** —— 于是文档给的恢复命令
+    // 在**解析阶段**就被拒，操作者只能编三个被忽略的假值。
+    // **实现遵守了设计裁定，参数层没跟上。**
+    #[test]
+    fn recover_parses_with_only_a_journal_path() {
+        run_on_large_stack(|| {
+            let parsed = Cli::try_parse_from([
+                "cass",
+                "mirror-restore",
+                "--recover",
+                "--journal",
+                "run.json",
+            ]);
+            let cli = parsed.expect(
+                "R-E-19 第三条：`--recover` 的入参只有 journal 路径 —— \
+                 文档给的这条命令必须解析得了",
+            );
+            let Some(Commands::MirrorRestore {
+                recover,
+                journal,
+                candidate_db,
+                scratch,
+                snapshot_root,
+                ..
+            }) = cli.command
+            else {
+                panic!("expected mirror-restore command");
+            };
+            assert!(recover, "--recover 必须被解析到");
+            assert_eq!(journal.as_deref(), Some(std::path::Path::new("run.json")));
+            assert!(
+                candidate_db.is_none() && scratch.is_none() && snapshot_root.is_none(),
+                "三个被忽略的入参必须允许缺席 —— 让操作者编三个假值正是这条缺陷的形态"
+            );
+        });
+    }
+
+    /// 反方向臂：**不给 `--recover` 时那三个仍然必填**。
+    /// 只把它们改成 `Option` 而不加 `required_unless_present`，
+    /// 会把一条解析期的硬失败变成运行期的空指针式失败 —— 那是修过头。
+    #[test]
+    fn a_normal_dry_run_still_requires_the_three_inputs() {
+        run_on_large_stack(|| {
+            let err = Cli::try_parse_from([
+                "cass",
+                "mirror-restore",
+                "--snapshot-root",
+                "snap",
+                "--scratch",
+                "/tmp/scratch",
+            ])
+            .expect_err("不给 --recover 时缺 --candidate-db 必须在解析阶段就被拒");
+            let rendered = err.to_string();
+            assert!(
+                rendered.contains("candidate-db"),
+                "错误必须点名缺的是哪一个，实得：{rendered}"
+            );
+        });
+    }
+
     /// R3 第 4/5/6 条的**操作面**：这三条前提工具是**强制**的，
     /// 但操作者只有从 help 里才知道它强制了什么、以及被拒之后该怎么走。
     /// 钉成机器判据，免得日后被顺手删掉或软化。
