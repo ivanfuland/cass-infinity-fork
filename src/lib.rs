@@ -701,6 +701,11 @@ pub enum Commands {
         /// 若其中某一级分量被换成指向外部的 symlink，物化就会跟着走出去。
         /// 工具已加双层防护（写前逐分量拒 symlink + 写后前缀断言，R-E-84），
         /// 但独占目录仍是更省事的那条路。
+        ///
+        /// 物化件**出生即私有**（目录 `0700`、文件 `0600`，R3 第 6 条 / 裁定 R-E-103 J2）——
+        /// 里面是**完整会话原文**，连 `home/<u>/.claude/projects/<ws>/` 这几级目录名本身
+        /// 都是家目录全路径与工作区名。复用一棵旧 scratch 时，被放宽过的既有目录与文件
+        /// 会在本轮被收紧。
         #[arg(long)]
         scratch: PathBuf,
 
@@ -709,6 +714,13 @@ pub enum Commands {
         snapshot_root: String,
 
         /// 六类计数与 HOLD 清单的落点（JSON）。不给则只打印摘要。
+        ///
+        /// **默认 dry-run 就会写它**，连同两个派生落点 `<out>.holds.json` 与
+        /// `<out>.ambiguity.tsv`。所以它与 `--journal` **同规**（R3 第 5 条 /
+        /// 裁定 R-E-103 J2）：这三个落点都不得与 `--candidate-db`（含 sidecar）、
+        /// W1 commit marker、raw-mirror 树同路径，彼此之间也必须互异。
+        /// 不校验的后果不是「多写一个文件」——`--out <候选库路径>`
+        /// **不给 `--apply` 也会替换候选库**。
         #[arg(long)]
         out: Option<PathBuf>,
 
@@ -742,6 +754,17 @@ pub enum Commands {
         deep_verify: bool,
 
         /// `--apply` 的 journal 落点（七态状态机的真源）。`--apply` 时必需。
+        ///
+        /// **不得与 `--candidate-db`（含与它同名打头的 sidecar）、W1 commit marker、
+        /// raw-mirror 树同路径**（R3 第 4 条 / 裁定 R-E-103 J2）。写 journal 走的是
+        /// 「同目录临时件 + `rename` 顶上」，而 `rename` **替换掉**落点上原有的普通文件 ——
+        /// 指到候选库，就是在 DB 阶段打开它之前把它换成一份 JSON，规划阶段读得通、
+        /// 第一次写 journal 当场毁库。**别名不只是符号链接**：另一条指向同一个文件的
+        /// 普通路径同样是别名，这道校验按**归约后的路径**与**同一 inode** 两面判。
+        ///
+        /// 落点**已被占用时本命令拒绝，不覆盖**：那份 journal 可能是上一轮崩在半路时
+        /// 留下的**唯一记录**。要继续那一轮，用 `--recover --journal <同一路径>`；
+        /// 要开新的一轮，换一个新路径。
         #[arg(long)]
         journal: Option<PathBuf>,
 
@@ -7260,63 +7283,20 @@ async fn execute_cli(
                     });
                     let mut summary = summary;
                     if let Some(path) = out.as_ref() {
-                        if let Some(parent) = path.parent() {
-                            std::fs::create_dir_all(parent)
-                                .map_err(|e| fail("mirror_restore_out_failed", e.to_string()))?;
-                        }
-                        let holds_path = path.with_extension("holds.json");
-                        let table_path = path.with_extension("ambiguity.tsv");
-                        let holds_bytes = serde_json::to_vec_pretty(&holds_json)
-                            .map_err(|e| fail("mirror_restore_out_failed", e.to_string()))?;
-                        let mut table = String::from(
-                            "identity\treason\tclass\tevidence_kind\tevidence_detail\n",
-                        );
-                        for row in &holds_json {
-                            let field = |k: &str| {
-                                row.get(k)
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .replace(['\t', '\n'], " ")
-                            };
-                            table.push_str(&format!(
-                                "{}\t{}\t{}\t{}\t{}\n",
-                                field("identity"),
-                                field("reason"),
-                                field("class"),
-                                field("evidence_kind"),
-                                field("evidence_detail")
-                            ));
-                        }
-                        write_private_file(&holds_path, &holds_bytes)
-                            .map_err(|e| fail("mirror_restore_out_failed", e))?;
-                        write_private_file(&table_path, table.as_bytes())
-                            .map_err(|e| fail("mirror_restore_out_failed", e))?;
-                        // 指纹进计数报告：Phase 4 拿到清单时能验它就是这一轮产的那一份。
-                        // 路径记**文件名**而不是绝对路径（R-E-72 ④）：绝对路径带家目录，
-                        // 会让计数报告本身也不能被引用。指纹覆盖的是文件**内容**，与这里
-                        // 记什么路径无关，所以换写法不动指纹。
-                        let rel = |p: &std::path::Path| {
-                            p.file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| p.display().to_string())
-                        };
-                        summary["hold_ledger"] = serde_json::json!({
-                            "holds_file": rel(&holds_path),
-                            "holds_blake3": blake3::hash(&holds_bytes).to_hex().to_string(),
-                            "ambiguity_table_file": rel(&table_path),
-                            "ambiguity_table_blake3":
-                                blake3::hash(table.as_bytes()).to_hex().to_string(),
-                            "location": "beside this report, in the run root",
-                            "records": holds_json.len(),
-                            "never_commit": "contains home-directory paths and agent names; \
-                                             run-root only, never into the repository",
-                        });
-                        let bytes = serde_json::to_vec_pretty(&summary)
-                            .map_err(|e| fail("mirror_restore_out_failed", e.to_string()))?;
-                        // 主报告走与 HOLD 清单同一条写路径：它同样带家目录全路径与
-                        // agent 名，凭什么它可以世界可读、还可以顺着 symlink 截断别人的文件。
-                        write_private_file(path, &bytes)
-                            .map_err(|e| fail("mirror_restore_out_failed", e))?;
+                        let out_marker_path =
+                            default_w1_marker_path(marker.as_ref(), &options.db_path);
+                        mirror_restore_write_out_reports(
+                            path,
+                            &crate::phase3_restore::RestoreProtectedInputs {
+                                db_path: &options.db_path,
+                                marker_path: &out_marker_path,
+                                data_dir: &options.data_dir,
+                            },
+                            journal.as_deref(),
+                            &mut summary,
+                            &holds_json,
+                        )
+                        .map_err(|e| fail("mirror_restore_out_failed", e))?;
                     }
 
                     if apply {
@@ -20205,6 +20185,86 @@ fn write_private_file(path: &std::path::Path, bytes: &[u8]) -> std::result::Resu
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
             .map_err(|e| format!("chmod {}: {e}", path.display()))?;
     }
+    Ok(())
+}
+
+/// `--out` 的三件产物（计数报告 / HOLD 清单 / 歧义表）**从 `match` 分支里抽出来**。
+///
+/// 抽的理由不是整洁：写路径互异性校验必须发生在**任何一次写之前**，而留在
+/// `match` 分支里的代码进不去测试 —— 判据就只能断言「返回了 Err」，断言不了
+/// 「候选库一个字节都没动」。**「拒绝了」和「拒绝之前已经写坏了」是两回事**
+/// （R3 第 5 条 / 裁定 R-E-103 J2）。
+fn mirror_restore_write_out_reports(
+    path: &std::path::Path,
+    protected: &crate::phase3_restore::RestoreProtectedInputs<'_>,
+    journal: Option<&std::path::Path>,
+    summary: &mut serde_json::Value,
+    holds_json: &[serde_json::Value],
+) -> std::result::Result<(), String> {
+    let holds_path = path.with_extension("holds.json");
+    let table_path = path.with_extension("ambiguity.tsv");
+
+    // ── 校验先于**任何一次写**，`--out` 的两个派生落点一并进表 ────────────
+    //
+    // 只校验 `--out` 自己而放过派生落点，等于留了一条同样毁库的路；
+    // `--journal` 也一起进来，因为写目标之间同样必须互异。
+    let mut write_targets: Vec<(&str, &std::path::Path)> = vec![
+        ("--out", path),
+        ("--out's HOLD ledger (<out>.holds.json)", &holds_path),
+        ("--out's ambiguity table (<out>.ambiguity.tsv)", &table_path),
+    ];
+    if let Some(journal_path) = journal {
+        write_targets.push(("--journal", journal_path));
+    }
+    crate::phase3_restore::validate_restore_write_targets(protected, &write_targets)?;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let holds_bytes = serde_json::to_vec_pretty(holds_json).map_err(|e| e.to_string())?;
+    let mut table = String::from("identity\treason\tclass\tevidence_kind\tevidence_detail\n");
+    for row in holds_json {
+        let field = |k: &str| {
+            row.get(k)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .replace(['\t', '\n'], " ")
+        };
+        table.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\n",
+            field("identity"),
+            field("reason"),
+            field("class"),
+            field("evidence_kind"),
+            field("evidence_detail")
+        ));
+    }
+    write_private_file(&holds_path, &holds_bytes)?;
+    write_private_file(&table_path, table.as_bytes())?;
+    // 指纹进计数报告：Phase 4 拿到清单时能验它就是这一轮产的那一份。
+    // 路径记**文件名**而不是绝对路径（R-E-72 ④）：绝对路径带家目录，
+    // 会让计数报告本身也不能被引用。指纹覆盖的是文件**内容**，与这里
+    // 记什么路径无关，所以换写法不动指纹。
+    let rel = |p: &std::path::Path| {
+        p.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| p.display().to_string())
+    };
+    summary["hold_ledger"] = serde_json::json!({
+        "holds_file": rel(&holds_path),
+        "holds_blake3": blake3::hash(&holds_bytes).to_hex().to_string(),
+        "ambiguity_table_file": rel(&table_path),
+        "ambiguity_table_blake3":
+            blake3::hash(table.as_bytes()).to_hex().to_string(),
+        "location": "beside this report, in the run root",
+        "records": holds_json.len(),
+        "never_commit": "contains home-directory paths and agent names; \
+                         run-root only, never into the repository",
+    });
+    let bytes = serde_json::to_vec_pretty(&*summary).map_err(|e| e.to_string())?;
+    // 主报告走与 HOLD 清单同一条写路径：它同样带家目录全路径与
+    // agent 名，凭什么它可以世界可读、还可以顺着 symlink 截断别人的文件。
+    write_private_file(path, &bytes)?;
     Ok(())
 }
 
@@ -100083,6 +100143,246 @@ mod subcommand_robot_output_tests {
 }
 
 #[cfg(test)]
+mod mirror_restore_out_path_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// 一处最小现场：一个受保护的候选库 + 它的 marker 落点 + 一个 mirror 面的根。
+    ///
+    /// 候选库这里不必是真 sqlite —— 本组判据问的只有一件事：
+    /// **这些字节动没动**。用一段可识别的定长内容比开一个真库更能把判据钉在那件事上。
+    struct Site {
+        _tmp: TempDir,
+        data_dir: PathBuf,
+        db_dir: PathBuf,
+        db_path: PathBuf,
+        marker_path: PathBuf,
+        run_root: PathBuf,
+    }
+
+    fn site_with_db_named(db_name: &str) -> Site {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("cass-data");
+        let db_dir = tmp.path().join("candidate");
+        let run_root = tmp.path().join("run-root");
+        for dir in [&data_dir, &db_dir, &run_root] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let db_path = db_dir.join(db_name);
+        std::fs::write(
+            &db_path,
+            b"SQLite format 3\x00-- candidate bytes that must survive a dry run --\n",
+        )
+        .unwrap();
+        let marker_path = db_dir.join(crate::phase3_restore::W1_COMMIT_MARKER_FILENAME);
+        Site {
+            _tmp: tmp,
+            data_dir,
+            db_dir,
+            db_path,
+            marker_path,
+            run_root,
+        }
+    }
+
+    fn site() -> Site {
+        site_with_db_named("candidate.sqlite")
+    }
+
+    fn protected(s: &Site) -> crate::phase3_restore::RestoreProtectedInputs<'_> {
+        crate::phase3_restore::RestoreProtectedInputs {
+            db_path: &s.db_path,
+            marker_path: &s.marker_path,
+            data_dir: &s.data_dir,
+        }
+    }
+
+    fn summary_seed() -> serde_json::Value {
+        serde_json::json!({ "planned_actions": 0, "non_promotable": true })
+    }
+
+    // ── R3 第 5 条 / 裁定 R-E-103 J2 ─────────────────────────────────────
+    //
+    // CLI **从不校验** `--out` 是否与 `--candidate-db`、marker 或 raw-mirror 同路径，
+    // 而 `--out` 在**默认 dry-run 就会写** —— 于是 `--out <候选库路径>`
+    // **不给 `--apply` 也能替换候选库**，直接与 `--candidate-db` 的 help
+    // 「dry-run 只读它」冲突。
+    //
+    // ⚠ 这一条**指望写函数兜是错的方向**：`write_private_file` 防的是**符号链接**
+    // （`symlink_metadata` 预检 + 同目录临时件 `rename` 顶上），**它不防别名**。
+    // 对一个普通文件的别名目标，`rename` 换 inode 与旧的 `std::fs::write` 原地截断
+    // 对操作者是一回事 —— 都是「候选库没了」。所以校验必须在 CLI 层。
+    #[test]
+    fn out_pointing_at_the_candidate_db_is_refused_and_leaves_it_byte_identical() {
+        let s = site();
+        let before = std::fs::read(&s.db_path).unwrap();
+        assert!(!before.is_empty(), "前置断言：候选库必须非空");
+
+        let mut summary = summary_seed();
+        let err =
+            mirror_restore_write_out_reports(&s.db_path, &protected(&s), None, &mut summary, &[])
+                .expect_err("--out 指到候选库必须拒");
+        assert!(
+            err.contains("E-RESTORE-WRITE-PATH-ALIAS"),
+            "必须以具名错误码拒，实得：{err}"
+        );
+        assert_eq!(
+            std::fs::read(&s.db_path).unwrap(),
+            before,
+            "候选库必须逐位不变 —— dry-run 不给 --apply 也能毁库，正是 R3 第 5 条"
+        );
+    }
+
+    /// `--out` 会**派生**两个兄弟落点（`.holds.json` / `.ambiguity.tsv`）。
+    /// 只校验 `--out` 自己而不校验派生落点，等于留了一条同样毁库的路。
+    #[test]
+    fn a_derived_sibling_of_out_that_lands_on_the_candidate_db_is_refused() {
+        let s = site_with_db_named("r.holds.json");
+        let before = std::fs::read(&s.db_path).unwrap();
+        // `--out <db_dir>/r.json` 的 holds 落点恰好就是候选库。
+        let out = s.db_dir.join("r.json");
+
+        let mut summary = summary_seed();
+        let err = mirror_restore_write_out_reports(&out, &protected(&s), None, &mut summary, &[])
+            .expect_err("派生落点撞上候选库必须拒");
+        assert!(
+            err.contains("E-RESTORE-WRITE-PATH-ALIAS"),
+            "必须以具名错误码拒，实得：{err}"
+        );
+        assert_eq!(
+            std::fs::read(&s.db_path).unwrap(),
+            before,
+            "候选库必须逐位不变"
+        );
+        assert!(
+            !out.exists(),
+            "任何一个写目标不合格，这一组就一件都不许写 —— 别留下半份产物"
+        );
+    }
+
+    #[test]
+    fn out_on_the_marker_or_inside_the_raw_mirror_is_refused() {
+        let s = site();
+        std::fs::write(&s.marker_path, b"{\"pre-existing\":\"marker\"}").unwrap();
+        let before = std::fs::read(&s.marker_path).unwrap();
+
+        let mut summary = summary_seed();
+        let err = mirror_restore_write_out_reports(
+            &s.marker_path,
+            &protected(&s),
+            None,
+            &mut summary,
+            &[],
+        )
+        .expect_err("--out 指到 marker 落点必须拒");
+        assert!(err.contains("E-RESTORE-WRITE-PATH-ALIAS"), "实得：{err}");
+        assert_eq!(
+            std::fs::read(&s.marker_path).unwrap(),
+            before,
+            "marker 必须逐位不变"
+        );
+
+        let inside = crate::doctor_raw_mirror_root(&s.data_dir)
+            .join("manifests")
+            .join("report.json");
+        let mut summary = summary_seed();
+        let err =
+            mirror_restore_write_out_reports(&inside, &protected(&s), None, &mut summary, &[])
+                .expect_err("--out 落在 raw-mirror 树内必须拒");
+        assert!(err.contains("E-RESTORE-WRITE-PATH-ALIAS"), "实得：{err}");
+        assert!(!inside.exists(), "拒了就不该在 raw-mirror 树里留下文件");
+    }
+
+    /// 写目标之间也必须互异：`--out` 与 `--journal` 撞在一起，
+    /// 后写的那一件会把先写的那一件顶掉，而两边都以为自己写成了。
+    #[test]
+    fn out_colliding_with_the_journal_path_is_refused() {
+        let s = site();
+        let both = s.run_root.join("same.json");
+        let mut summary = summary_seed();
+        let err =
+            mirror_restore_write_out_reports(&both, &protected(&s), Some(&both), &mut summary, &[])
+                .expect_err("--out 与 --journal 同路径必须拒");
+        assert!(
+            err.contains("E-RESTORE-WRITE-PATH-COLLISION"),
+            "写目标互撞要用它自己的码，别与「撞上受保护输入」折叠成一句，实得：{err}"
+        );
+        assert!(!both.exists(), "拒了就不该留下文件");
+    }
+
+    // ── 反方向臂：不得误伤正常用法 ────────────────────────────────────
+    #[test]
+    fn out_to_a_fresh_path_writes_all_three_products() {
+        let s = site();
+        let out = s.run_root.join("nested").join("restore-report.json");
+        let mut summary = summary_seed();
+        mirror_restore_write_out_reports(&out, &protected(&s), None, &mut summary, &[])
+            .expect("指到一个全新路径必须照常写");
+
+        assert!(out.exists(), "计数报告必须写出来");
+        assert!(
+            out.with_extension("holds.json").exists(),
+            "HOLD 清单必须写出来"
+        );
+        assert!(
+            out.with_extension("ambiguity.tsv").exists(),
+            "歧义表必须写出来"
+        );
+        assert!(
+            summary.get("hold_ledger").is_some(),
+            "指纹必须回填进计数报告 —— 只证「没报错」证不了它真跑完"
+        );
+    }
+
+    /// 指到 run root 下一份**既有**报告（第二轮 dry-run 覆盖上一轮的产物）也是正常用法。
+    #[test]
+    fn out_over_an_existing_report_in_the_run_root_is_allowed() {
+        let s = site();
+        let out = s.run_root.join("restore-report.json");
+        std::fs::write(&out, b"{\"stale\":true}").unwrap();
+
+        let mut summary = summary_seed();
+        mirror_restore_write_out_reports(&out, &protected(&s), None, &mut summary, &[])
+            .expect("覆盖上一轮自己的报告是正常用法，不得误伤");
+        let bytes = std::fs::read(&out).unwrap();
+        assert!(
+            bytes.starts_with(b"{"),
+            "必须是一份新报告，实得前几字节：{:?}",
+            &bytes[..bytes.len().min(16)]
+        );
+        assert!(
+            !bytes.windows(6).any(|w| w == b"stale\""),
+            "旧内容必须被这一轮的报告顶掉"
+        );
+    }
+
+    /// 受保护的是 raw-mirror **那棵树**，不是整个 `--data-dir`。
+    ///
+    /// 把校验放宽成「落在 data_dir 底下即拒」会把这条正常用法判死 ——
+    /// 而操作者把报告放进 data_dir 顶层是完全合理的。
+    #[test]
+    fn out_inside_data_dir_but_outside_the_raw_mirror_is_allowed() {
+        let s = site();
+        let out = s.data_dir.join("restore-report.json");
+        let mut summary = summary_seed();
+        mirror_restore_write_out_reports(&out, &protected(&s), None, &mut summary, &[])
+            .expect("data_dir 顶层不是 raw-mirror 树，必须照常写");
+        assert!(out.exists());
+    }
+
+    /// 落点与候选库**同目录、不同名**同样是正常用法 —— sidecar 前缀规则不得殃及它。
+    #[test]
+    fn out_beside_the_candidate_db_with_an_unrelated_name_is_allowed() {
+        let s = site();
+        let out = s.db_dir.join("restore-report.json");
+        let mut summary = summary_seed();
+        mirror_restore_write_out_reports(&out, &protected(&s), None, &mut summary, &[])
+            .expect("与候选库同目录、名字无关联的落点必须照常写");
+        assert!(out.exists());
+    }
+}
+
+#[cfg(test)]
 mod mirror_restore_deep_verify_flag_tests {
     use super::*;
     use clap::Parser;
@@ -100092,6 +100392,61 @@ mod mirror_restore_deep_verify_flag_tests {
     /// 判据不是「能不能解析」，是**不在场时会不会被静默忽略**：一个被静默吞掉的
     /// `--deep-verify` 会让操作者以为自己跑了深度校验，而实际上跑的是默认档 ——
     /// 那正是本仓一路在反对的那种「不在场就跳过」。
+    /// R3 第 4/5/6 条的**操作面**：这三条前提工具是**强制**的，
+    /// 但操作者只有从 help 里才知道它强制了什么、以及被拒之后该怎么走。
+    /// 钉成机器判据，免得日后被顺手删掉或软化。
+    #[test]
+    fn journal_and_out_help_state_the_write_path_exclusivity_rules() {
+        run_on_large_stack(|| {
+            use clap::CommandFactory as _;
+            let cmd = Cli::command();
+            let sub = cmd
+                .get_subcommands()
+                .find(|c| c.get_name() == "mirror-restore")
+                .expect("mirror-restore 子命令必须在");
+            let help_of = |id: &str| {
+                let arg = sub
+                    .get_arguments()
+                    .find(|a| a.get_id() == id)
+                    .unwrap_or_else(|| panic!("--{id} 必须在"));
+                format!(
+                    "{}{}",
+                    arg.get_help().map(|h| h.to_string()).unwrap_or_default(),
+                    arg.get_long_help()
+                        .map(|h| h.to_string())
+                        .unwrap_or_default(),
+                )
+            };
+
+            let journal = help_of("journal");
+            assert!(
+                journal.contains("不得与"),
+                "--journal 的 help 必须写明互异性要求，实得：{journal}"
+            );
+            assert!(
+                journal.contains("--recover"),
+                "还必须把「落点已被占用」时的出路指出来 —— 只说拒不说怎么办，\
+                 操作者会去删那份唯一的记录。实得：{journal}"
+            );
+
+            let out = help_of("out");
+            assert!(
+                out.contains("dry-run 就会写它"),
+                "--out 的 help 必须写明默认 dry-run 就会写，否则「同规」没有由头，实得：{out}"
+            );
+            assert!(
+                out.contains("同规"),
+                "--out 必须与 --journal 同规这件事要写在 help 里，实得：{out}"
+            );
+
+            let scratch = help_of("scratch");
+            assert!(
+                scratch.contains("0700") && scratch.contains("0600"),
+                "--scratch 的 help 必须写明物化件的权限口径，实得：{scratch}"
+            );
+        });
+    }
+
     #[test]
     fn candidate_db_help_states_the_quiesced_copy_precondition() {
         // R2 第 2 条：这条前提是**操作前提**，工具不强制，所以它只活在 help 里 ——

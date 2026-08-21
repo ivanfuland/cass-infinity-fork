@@ -2150,7 +2150,7 @@ fn materialize_sealed_blob(
     //
     // 为什么校验从**根**开始逐级下降而不是只看最后一级：中间任何一级是 symlink
     // 就已经出去了，最后一级看起来仍然「在根下」。
-    std::fs::create_dir_all(scratch_root).map_err(|err| ProjectionFault::Materialize {
+    create_private_dir_all(scratch_root).map_err(|err| ProjectionFault::Materialize {
         detail: format!("create_dir_all {}: {err}", scratch_root.display()),
     })?;
     let canonical_root =
@@ -2183,12 +2183,35 @@ fn materialize_sealed_blob(
 
     let target = canonical_root.join(&relative);
     if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent).map_err(|err| ProjectionFault::Materialize {
+        create_private_dir_all(parent).map_err(|err| ProjectionFault::Materialize {
             detail: format!("create_dir_all {}: {err}", parent.display()),
         })?;
     }
-    std::fs::write(&target, input.blob).map_err(|err| ProjectionFault::Materialize {
-        detail: format!("write {}: {err}", target.display()),
+
+    // ── R3 第 6 条 (belt)：逐级收紧既有目录 ─────────────────────────────
+    //
+    // 上面那句只管**新建**的目录。scratch 复用时，slot 目录早就在盘上了 ——
+    // 它们是上一轮（或操作者自己）按 umask 建的，`mode()` 一个字节也管不到。
+    // 走的是与 (a) 同一条分量序列，所以这里不会碰到根外的东西。
+    {
+        let mut walk = canonical_root.clone();
+        tighten_dir_to_owner_only(&walk).map_err(|err| ProjectionFault::Materialize {
+            detail: format!("tighten {}: {err}", walk.display()),
+        })?;
+        if let Some(rel_parent) = relative.parent() {
+            for component in rel_parent.components() {
+                walk.push(component);
+                tighten_dir_to_owner_only(&walk).map_err(|err| ProjectionFault::Materialize {
+                    detail: format!("tighten {}: {err}", walk.display()),
+                })?;
+            }
+        }
+    }
+
+    write_private_scratch_file(&target, input.blob).map_err(|err| {
+        ProjectionFault::Materialize {
+            detail: format!("write {}: {err}", target.display()),
+        }
     })?;
 
     // ── R-E-84 (c)：写后前缀断言兜底 ────────────────────────────────────
@@ -2667,6 +2690,143 @@ mod e5_materialization_tests {
             source_size_bytes: blob.len() as u64,
             blob,
         }
+    }
+
+    /// 三个权限位取自 `symlink_metadata`（不跟随链接）：跟随链接量到的是别人的模式。
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::symlink_metadata(path)
+            .unwrap_or_else(|e| panic!("stat {}: {e}", path.display()))
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    /// 从 `target` 的父目录一路上溯到 `croot`，对每一级调 `f`。
+    ///
+    /// `include_root` 分开两个用途，**因为这两级由两套机制负责**：
+    /// - **严格在根之下**的那些目录是**工具本轮新建**的 → 由「门」（`DirBuilderExt::mode`）负责；
+    /// - **根自己**通常是操作者或上一轮留下的既有目录 → 只能由「belt」（事后收紧）负责。
+    ///
+    /// 合成一条断言会让两套机制**互相掩护**：撤掉门，belt 兜住，判据照绿。
+    fn for_each_dir(target: &Path, croot: &Path, include_root: bool, mut f: impl FnMut(&Path)) {
+        let mut cur = target.parent().expect("物化落点必须有父目录").to_path_buf();
+        loop {
+            if cur != croot || include_root {
+                f(&cur);
+            }
+            if cur == croot {
+                return;
+            }
+            cur = cur
+                .parent()
+                .expect("必须能一路上溯到 scratch 根 —— 上溯不到说明落点根本不在根下")
+                .to_path_buf();
+        }
+    }
+
+    // ── R3 第 6 条 / 裁定 R-E-103 J2：scratch **出生即私有** ──────────────
+    //
+    // R-E-90 那一轮把报告 / journal / marker 都改成「出生即 0600」，
+    // **scratch 不在那张清单里** —— 而 scratch 装的恰恰是**完整会话原文**，
+    // 比报告更敏感。物化用的是 `create_dir_all` + `std::fs::write`，全程不设模式，
+    // 于是默认 dry-run 就按 umask（本机 0002 → 文件 0664、目录 0775）
+    // 把原文写到盘上**并留存**。
+    //
+    // **目录一并管**：`home/u/.claude/projects/ws/` 这几级**目录名本身**就是
+    // 家目录全路径与工作区名，只把文件收紧、留一棵世界可读的目录树，等于没收紧。
+    #[test]
+    fn materialize_writes_owner_only_files_and_dirs() {
+        let root = scratch("private-birth");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let blob = b"{\"role\":\"user\",\"text\":\"a full session transcript\"}\n";
+        let input = source("/home/u/.claude/projects/ws/s.jsonl", blob);
+        let target = materialize_sealed_blob(&root, &input).unwrap();
+
+        // 前置断言：内容必须真落盘了，否则下面的权限断言是在替一个空动作背书。
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            &blob[..],
+            "前置断言：物化必须真把原文写进去了"
+        );
+        assert_eq!(
+            mode_of(&target),
+            0o600,
+            "会话原文必须 owner-only，实得 {:#o}",
+            mode_of(&target)
+        );
+
+        // 只断言**严格在根之下**的目录：它们是本轮由工具新建的，归「门」管。
+        // 根自己归 belt 管，由下一条用例断言 —— 合在一起两套机制会互相掩护。
+        let croot = std::fs::canonicalize(&root).unwrap();
+        for_each_dir(&target, &croot, false, |dir| {
+            assert_eq!(
+                mode_of(dir),
+                0o700,
+                "工具新建的 scratch 目录必须**出生即** 0700（目录名本身就是家目录全路径）：\
+                 {} 实得 {:#o}",
+                dir.display(),
+                mode_of(dir)
+            );
+        });
+    }
+
+    /// 阳性对照：**复用一棵被放宽过的旧 scratch**。
+    ///
+    /// 这条比「把 umask 调宽」更硬，走的也正是 `.mode()` **管不到**的那条路 ——
+    /// `OpenOptions::mode()` 只在**真正创建**时生效，既有文件走 `truncate`
+    /// 复用的是它自己的模式。而 scratch 复用是常态（物化件按内容定名，
+    /// slot 目录第一轮之后就都在盘上了）。
+    ///
+    /// 不去动 umask 是有意的：umask 是**进程级全局状态**，在 `--lib`
+    /// 这种多测试并发的二进制里改它，就是 FIND-12 那一族竞态的第三个载体。
+    #[test]
+    fn materialize_tightens_a_reused_scratch_left_world_readable() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = scratch("private-birth-reuse");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let blob = b"{\"role\":\"user\",\"text\":\"a full session transcript\"}\n";
+        let input = source("/home/u/.claude/projects/ws/s.jsonl", blob);
+        let target = materialize_sealed_blob(&root, &input).unwrap();
+        let croot = std::fs::canonicalize(&root).unwrap();
+
+        // 造出「上一轮留下的宽权限现场」。
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o666)).unwrap();
+        for_each_dir(&target, &croot, true, |dir| {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        });
+        assert_eq!(
+            mode_of(&target),
+            0o666,
+            "前置断言：放宽必须真生效，否则这条用例没有分辨力"
+        );
+
+        let again = materialize_sealed_blob(&root, &input).unwrap();
+        assert_eq!(
+            again, target,
+            "前置断言：内容寻址 —— 第二轮必须落在同一个位置，否则测的不是复用"
+        );
+
+        assert_eq!(
+            mode_of(&target),
+            0o600,
+            "复用既有文件时也必须收紧到 0600，实得 {:#o}",
+            mode_of(&target)
+        );
+        for_each_dir(&target, &croot, true, |dir| {
+            assert_eq!(
+                mode_of(dir),
+                0o700,
+                "复用的目录同样必须收紧（这一条含 scratch 根本身 —— 它是 belt 的辖区）：\
+                 {} 实得 {:#o}",
+                dir.display(),
+                mode_of(dir)
+            );
+        });
     }
 
     #[test]
@@ -6598,6 +6758,76 @@ pub(crate) fn unique_sibling_tmp_path(final_path: &Path) -> anyhow::Result<PathB
 /// 那个 fd 指的就是最终产物。所以唯一站得住的修法是创建时就带上 0600。
 ///
 /// `create_new` 同时兑现 R-E-87 的另一半：**不复用、也不截断任何既有文件**。
+/// 目录**出生即私有**（R3 第 6 条 / 裁定 R-E-103 J2）。
+///
+/// R-E-90 那一轮只覆盖了报告 / journal / marker 三件产物，**scratch 不在那张清单里** ——
+/// 而 scratch 装的是**完整会话原文**，连 `home/u/.claude/projects/<ws>/` 这几级
+/// 目录名本身都是家目录全路径与工作区名。
+///
+/// 与 `lib.rs` 的 `doctor_forensic_create_private_dir_all` **不是误重复**：那一份只收紧
+/// **末级**目录并拒 symlink（取证目录是一层），这里要的是**逐级**（物化路径有好几级，
+/// 而中间任何一级宽着，目录名就摊开给别人看了），拒 symlink 那半也已由
+/// `materialize_sealed_blob` 的 R-E-84 (a) 逐分量预检负责，不在这里做第二定义。
+fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
+/// **belt**：把一个**既有**目录收紧到 0700。
+///
+/// `DirBuilder::mode()` 只在真正创建时生效 —— 而 scratch 复用是常态
+/// （物化件按内容定名，slot 目录第一轮之后就都在盘上了），那条路上
+/// 「出生即 0700」对既有目录根本不成立。**belt 不是门**：门是 `mode(0o700)`。
+///
+/// 落点是符号链接时**原地返回**：`set_permissions` 会跟随链接，跟着走就是去改别人的模式。
+#[cfg(unix)]
+fn tighten_dir_to_owner_only(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.file_type().is_dir() || meta.permissions().mode() & 0o777 == 0o700 {
+        return Ok(());
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn tighten_dir_to_owner_only(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// scratch 物化件的写入：**出生即 0600**，复用既有文件时在**写内容之前**收紧。
+///
+/// 顺序是有讲究的，不是随手排的：`OpenOptions::mode()` 只在真正创建时生效，既有文件
+/// 走 `truncate` 复用的是它自己的模式。所以先 open+truncate（**此刻文件是空的**）、
+/// 再按 fd 收紧、最后才写内容 —— 宽权限的窗口里泄不出一个字节的原文。
+/// 按 fd 而不是按路径收紧，顺带免掉一次 TOCTOU。
+///
+/// 这里**不**做 symlink 预检：调用方 `materialize_sealed_blob` 已经从根逐分量拒过
+/// symlink（R-E-84 (a)），再判一次是第二定义。
+fn write_private_scratch_file(target: &Path, blob: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(target)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(blob)
+}
+
 pub(crate) fn create_private_new(path: &Path) -> std::io::Result<std::fs::File> {
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
@@ -6607,6 +6837,173 @@ pub(crate) fn create_private_new(path: &Path) -> std::io::Result<std::fs::File> 
         opts.mode(0o600);
     }
     opts.open(path)
+}
+
+/// 一轮 `mirror-restore` 里**不能被写坏的那些输入**，打成一包传。
+///
+/// 打包而不是散着传三个 `&Path`：写路径校验要在**每一个**写目标上问同一组问题，
+/// 散着传会让下一个写目标少问一个（R3 第 4/5 条正是「某个写目标漏问了」）。
+pub(crate) struct RestoreProtectedInputs<'a> {
+    /// `--candidate-db`：dry-run 只读它，任何写目标指到它都是毁灭性的。
+    pub db_path: &'a Path,
+    /// W1 commit marker 的落点（默认与候选库同居）。
+    pub marker_path: &'a Path,
+    /// mirror 面的根 —— 受保护的是它底下的 raw-mirror 树，不是整个 `--data-dir`。
+    pub data_dir: &'a Path,
+}
+
+/// 把一个写目标归约成**可比较的身份**。
+///
+/// 两件事都必须做，缺一条校验就形同虚设：
+/// ① **绝对化 + 词法归并** `.` / `..` —— `--out ../candidate/x.sqlite` 与
+///    `--out /abs/candidate/x.sqlite` 是同一个文件，字面比较认不出；
+/// ② 对**最长的既有前缀**做 `canonicalize`，余下的按字面接上 —— 直接
+///    `canonicalize` 整条路径不行，写目标**通常还不存在**，而 `canonicalize`
+///    对不存在的路径直接失败，那样校验会在最需要它的那一刻缺席。
+fn restore_write_path_key(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut lexical = if path.is_absolute() {
+        PathBuf::new()
+    } else {
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    };
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                lexical.pop();
+            }
+            Component::RootDir => lexical.push(Component::RootDir.as_os_str()),
+            other => lexical.push(other.as_os_str()),
+        }
+    }
+
+    let mut prefix = lexical.clone();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(resolved) = std::fs::canonicalize(&prefix) {
+            let mut key = resolved;
+            for name in tail.iter().rev() {
+                key.push(name);
+            }
+            return key;
+        }
+        match prefix.file_name() {
+            Some(name) => {
+                tail.push(name.to_os_string());
+                if !prefix.pop() {
+                    return lexical;
+                }
+            }
+            None => return lexical,
+        }
+    }
+}
+
+/// 两条路径是不是**同一个 inode**。
+///
+/// 跟随符号链接是**故意的**：一条指向候选库的链接就是候选库的别名。
+/// 这一格抓的是路径归约抓不到的那类别名（硬链接、以及落点自己是链接）。
+#[cfg(unix)]
+fn same_existing_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn same_existing_file(_a: &Path, _b: &Path) -> bool {
+    false
+}
+
+/// 写路径互异性校验（R3 第 4/5 条 / 裁定 R-E-103 J2）。
+///
+/// 三条同根的缺陷是一句话：**写路径不校验它要写的是不是别人的东西**。
+/// `restore_journal_write` 一律 `rename(tmp, path)`，`--out` 走 `write_private_file`
+/// 也是同目录临时件 + `rename` —— 两者对一个**普通文件**的别名目标都是毁灭性的
+/// （前者换 inode、后者原地截断，对操作者是一回事：候选库没了）。
+///
+/// ⚠ **别指望写函数兜**：`write_private_file` 防的是**符号链接**
+/// （`symlink_metadata` 预检 + `rename` 顶上），**它不防别名**。所以这道校验必须
+/// 在调用写函数**之前**、在拿得到全部输入的那一层做。
+///
+/// 两类拒绝**各以自己的名义**（每层以自己的名义拒绝）：
+/// - `E-RESTORE-WRITE-PATH-ALIAS`：写目标解析到某个受保护输入；
+/// - `E-RESTORE-WRITE-PATH-COLLISION`：两个写目标互撞（后写的顶掉先写的，
+///   而两边都以为自己写成了）。
+///
+/// **全或无**：任何一个写目标不合格，这一组一件都不许写 —— 留下半份产物比一件
+/// 都没写更难对账。
+pub(crate) fn validate_restore_write_targets(
+    protected: &RestoreProtectedInputs<'_>,
+    targets: &[(&str, &Path)],
+) -> Result<(), String> {
+    let guarded: [(&str, &Path); 2] = [
+        ("--candidate-db", protected.db_path),
+        ("the W1 commit marker", protected.marker_path),
+    ];
+    let mirror_key = restore_write_path_key(&crate::doctor_raw_mirror_root(protected.data_dir));
+    let db_dir_key = protected.db_path.parent().map(restore_write_path_key);
+    let db_name = protected
+        .db_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(str::to_owned);
+
+    for (label, target) in targets {
+        let key = restore_write_path_key(target);
+
+        for (guard_label, guard) in guarded.iter() {
+            if key == restore_write_path_key(guard) || same_existing_file(target, guard) {
+                return Err(format!(
+                    "E-RESTORE-WRITE-PATH-ALIAS: {label} ({}) resolves to {guard_label} ({}) —                      refusing before anything is written. This run would have replaced it: a                      rename over a plain file destroys it just as surely as a truncating write.",
+                    target.display(),
+                    guard.display()
+                ));
+            }
+        }
+
+        // 候选库的 sidecar：**同目录、以候选库文件名打头**的任何名字。
+        //
+        // 用前缀规则而不是一张后缀白名单是有意的：本仓的 frankensqlite 自己就会产出
+        // 白名单里没有的 sidecar 族，而两侧代价不对称 —— **漏挡一条 = 毁库，
+        // 误挡一条 = 换个报告名**。误挡时错误信息会把出路直接说出来。
+        if let (Some(dir_key), Some(db)) = (db_dir_key.as_ref(), db_name.as_ref()) {
+            let same_dir = key.parent() == Some(dir_key.as_path());
+            let name = key.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if same_dir && name != db.as_str() && name.starts_with(db.as_str()) {
+                return Err(format!(
+                    "E-RESTORE-WRITE-PATH-ALIAS: {label} ({}) sits on a sidecar of                      --candidate-db ({db}) — anything named `{db}*` beside the candidate database                      belongs to that database, and writing it corrupts the database just as                      surely as writing the main file. Give this output a name that does not                      start with `{db}`.",
+                    target.display()
+                ));
+            }
+        }
+
+        if key.starts_with(&mirror_key) {
+            return Err(format!(
+                "E-RESTORE-WRITE-PATH-ALIAS: {label} ({}) lands inside the raw-mirror tree at {}                  — that tree is this run's input; writing into it would overwrite the very                  manifests being read. Put run outputs outside it (the rest of --data-dir is                  fine).",
+                target.display(),
+                mirror_key.display()
+            ));
+        }
+    }
+
+    for (i, (label_a, a)) in targets.iter().enumerate() {
+        for (label_b, b) in targets.iter().skip(i + 1) {
+            if restore_write_path_key(a) == restore_write_path_key(b) || same_existing_file(a, b) {
+                return Err(format!(
+                    "E-RESTORE-WRITE-PATH-COLLISION: {label_a} and {label_b} are the same file                      ({} / {}) — the later write would silently replace the earlier one while                      both report success.",
+                    a.display(),
+                    b.display()
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 pub(crate) fn restore_journal_write(path: &Path, journal: &RestoreJournal) -> anyhow::Result<()> {
@@ -7224,6 +7621,39 @@ pub(crate) fn restore_apply_journaled(
     plan: RestoreRunPlan,
     journal_path: &Path,
 ) -> anyhow::Result<RestoreRunOutcome> {
+    // ── 写路径校验必须发生在**第一次写之前**（R3 第 4 条 / 裁定 R-E-103 J2）──
+    //
+    // 修前：`--journal <候选库路径>` 在 DB 阶段打开候选库**之前**就把它替换成一份
+    // JSON —— 规划阶段读得通、第一次写 journal 当场毁库。
+    validate_restore_write_targets(
+        &RestoreProtectedInputs {
+            db_path: &plan.db_path,
+            marker_path: &plan.marker_path,
+            data_dir: &plan.data_dir,
+        },
+        &[("--journal", journal_path)],
+    )
+    .map_err(|detail| anyhow::anyhow!(detail))?;
+
+    // ── 首跑要求**一个还没被占用的路径**（R3 第 4 条的第二种形态）───────
+    //
+    // 上一轮崩在 DB 提交之后、publish 之前时，盘上那份 journal 是那一轮**唯一的记录**。
+    // 无条件写一份全新的 `planned` journal 上去就把它抹了 —— 于是新 planner 可能认为
+    // 库侧内容已相等而略过该项，让新 marker attest 一轮**从没修好那条 backlink** 的运行。
+    //
+    // 用 `symlink_metadata` 而不是 `exists()`：断链的符号链接也算占用
+    // （`rename` 顶得掉它，但那同样是在动别人放在那儿的东西）。
+    if std::fs::symlink_metadata(journal_path).is_ok() {
+        anyhow::bail!(
+            "E-JOURNAL-PATH-OCCUPIED: something already exists at {} — refusing to start a new \
+             --apply on top of it. If that is the journal of a run that crashed part-way, it is \
+             that run's only record: continue that run with `--recover --journal {}`. If that run \
+             is finished and you want a fresh one, point --journal at a new path.",
+            journal_path.display(),
+            journal_path.display()
+        );
+    }
+
     let mut journal = restore_journal_from_plan(plan);
     restore_journal_write(journal_path, &journal)?;
     journal_trace("state-visible");
@@ -11142,6 +11572,260 @@ mod e7_restore_journal_tests {
             "restore journal 在写入过程中出现过带非属主位的文件（{worst:#o}）—— \
              owner-only 的产物必须创建时即私有，不能先写满再 chmod"
         );
+    }
+
+    // ── R3 第 4 条 / 裁定 R-E-103 J2：journal 写路径必须与受保护输入互异 ──
+    //
+    // `restore_journal_write` 一律 `rename(tmp, path)` —— **替换任何既有普通文件**，
+    // 而 `restore_apply_journaled` 首次调用**既不要求新路径、也不校验路径互异**。
+    // `--journal <候选库路径>` 于是在 DB 阶段打开候选库**之前**就把它替换成一份 JSON。
+    //
+    // **判据形状**：不止断言「返回了 Err」——「拒绝了」和「拒绝之前已经写坏了」
+    // 是两回事，所以每一条都把受害文件的**全字节**读回来逐位比。
+    #[test]
+    fn e7_apply_refuses_a_journal_path_that_aliases_the_candidate_db() {
+        let d = drill();
+        let before = std::fs::read(&d.db_path).unwrap();
+        assert!(
+            !before.is_empty(),
+            "前置断言：候选库必须非空，否则「字节不变」是在替一个空文件背书"
+        );
+
+        let err = restore_apply_journaled(plan_for(&d), &d.db_path)
+            .expect_err("--journal 指到候选库必须拒");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("E-RESTORE-WRITE-PATH-ALIAS"),
+            "必须以具名错误码拒 —— 操作者要能一眼看出是写路径撞了受保护输入，\
+             而不是被打发去查 JSON 损坏。实得：{msg}"
+        );
+        assert_eq!(
+            std::fs::read(&d.db_path).unwrap(),
+            before,
+            "候选库必须逐位不变 —— 拒之前已经写坏了，和没拒是一回事"
+        );
+    }
+
+    /// 别名的**拼法**不止一种：字面比较认不出 `..` 绕一圈，也认不出符号链接。
+    #[test]
+    fn e7_apply_refuses_journal_aliases_spelled_through_dotdot_and_a_symlink() {
+        let d = drill();
+        let before = std::fs::read(&d.db_path).unwrap();
+        let dir = d.db_path.parent().unwrap().to_path_buf();
+        let file = d.db_path.file_name().unwrap().to_os_string();
+
+        // ① `..` 拼法：同一个 inode，另一种写法。
+        let dotdot = dir
+            .join("..")
+            .join(dir.file_name().expect("候选库所在目录必须有名字"))
+            .join(&file);
+        let err =
+            restore_apply_journaled(plan_for(&d), &dotdot).expect_err("`..` 拼出来的别名必须拒");
+        assert!(
+            err.to_string().contains("E-RESTORE-WRITE-PATH-ALIAS"),
+            "实得：{err}"
+        );
+        assert_eq!(
+            std::fs::read(&d.db_path).unwrap(),
+            before,
+            "① 之后候选库必须逐位不变"
+        );
+
+        // ② symlink 拼法：落点自己是一条指向候选库的链接。
+        //    这一支的**损害形态与 ① 不同**（`rename` 顶掉的是链接本身，不是它指的东西），
+        //    但它同样是「写目标解析到受保护输入」，必须被同一道校验以同一个码拒掉。
+        let link = dir.join("journal-link.json");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&d.db_path, &link).unwrap();
+        let err = restore_apply_journaled(plan_for(&d), &link)
+            .expect_err("指向候选库的 symlink 落点必须拒");
+        assert!(
+            err.to_string().contains("E-RESTORE-WRITE-PATH-ALIAS"),
+            "实得：{err}"
+        );
+        assert_eq!(
+            std::fs::read(&d.db_path).unwrap(),
+            before,
+            "② 之后候选库必须逐位不变"
+        );
+    }
+
+    /// 受保护的不止候选库主文件：sidecar 是同一个库的一部分，写坏它一样毁库。
+    ///
+    /// 判据用的是**前缀规则**（同目录下以候选库文件名打头的任何名字），不是一张后缀白名单：
+    /// 本仓的 frankensqlite 自己就会产出白名单里没有的 sidecar 族，
+    /// 而**漏挡一条 = 毁库，误挡一条 = 换个报告名**，两侧代价不对称。
+    #[test]
+    fn e7_apply_refuses_a_journal_path_that_lands_on_a_candidate_db_sidecar() {
+        let d = drill();
+        let wal = PathBuf::from(format!("{}-wal", d.db_path.display()));
+        std::fs::write(&wal, b"pretend-wal-bytes").unwrap();
+        let before = std::fs::read(&wal).unwrap();
+
+        let err = restore_apply_journaled(plan_for(&d), &wal)
+            .expect_err("sidecar 也是候选库的一部分，必须拒");
+        assert!(
+            err.to_string().contains("E-RESTORE-WRITE-PATH-ALIAS"),
+            "实得：{err}"
+        );
+        assert_eq!(std::fs::read(&wal).unwrap(), before, "sidecar 必须逐位不变");
+    }
+
+    /// marker 面与 mirror 面：同一道校验的另外两个受保护输入。
+    #[test]
+    fn e7_apply_refuses_a_journal_path_on_the_marker_or_inside_the_raw_mirror() {
+        let d = drill();
+
+        // marker 面：先种一份既有 marker，判据才分辨得出「拒对了」还是「本来就没有」。
+        let marker = marker_path_of(&d);
+        std::fs::write(&marker, b"{\"pre-existing\":\"marker\"}").unwrap();
+        let before_marker = std::fs::read(&marker).unwrap();
+        let err = restore_apply_journaled(plan_for(&d), &marker)
+            .expect_err("--journal 指到 marker 落点必须拒");
+        assert!(
+            err.to_string().contains("E-RESTORE-WRITE-PATH-ALIAS"),
+            "实得：{err}"
+        );
+        assert_eq!(
+            std::fs::read(&marker).unwrap(),
+            before_marker,
+            "marker 必须逐位不变"
+        );
+
+        // mirror 面：raw-mirror 树里的任何落点都不许当写目标。
+        // 受保护的是**那棵树**，不是整个 `--data-dir` —— 报告落在 data_dir 顶层是正常的。
+        let inside = crate::doctor_raw_mirror_root(&d.data_dir)
+            .join("manifests")
+            .join("restore-journal.json");
+        let err = restore_apply_journaled(plan_for(&d), &inside)
+            .expect_err("--journal 落在 raw-mirror 树内必须拒");
+        assert!(
+            err.to_string().contains("E-RESTORE-WRITE-PATH-ALIAS"),
+            "实得：{err}"
+        );
+        assert!(!inside.exists(), "拒了就不该在 raw-mirror 树里留下这个文件");
+    }
+
+    /// R3 第 4 条的**第二种形态**（评审原文的场景 B）：同路径重跑 `--apply`。
+    ///
+    /// 上一轮崩在 DB 提交之后、publish 之前时，盘上那份 journal 是那轮**唯一的记录**。
+    /// 首次调用无条件写一份全新的 `planned` journal 上去，就把它抹了 ——
+    /// 于是新 planner 可能认为库侧内容已相等而略过该项，
+    /// 让新 marker attest 一轮**从没修好那条 backlink** 的运行。
+    #[test]
+    fn e7_apply_refuses_to_overwrite_an_existing_journal_and_points_at_recover() {
+        let d = drill();
+        plant_post_commit_sentinels(&d.data_dir, &d.db_path);
+        restore_apply_journaled(plan_for(&d), &d.journal_path).unwrap();
+
+        // 倒回那个真实存在的窗：DB 提交了，publish 还没做完。
+        let mut journal = restore_journal_read(&d.journal_path).unwrap().unwrap();
+        journal.state = RestoreJournalState::DbCommitted;
+        journal.published.clear();
+        restore_journal_write(&d.journal_path, &journal).unwrap();
+        let before = std::fs::read(&d.journal_path).unwrap();
+
+        let err = restore_apply_journaled(plan_for(&d), &d.journal_path)
+            .expect_err("同路径重跑 --apply 必须拒，不能覆盖掉那份未完成的记录");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("E-JOURNAL-PATH-OCCUPIED"),
+            "必须以具名错误码拒，实得：{msg}"
+        );
+        assert!(
+            msg.contains("--recover"),
+            "错误信息必须把出路指给操作者（继续那一轮用 --recover），实得：{msg}"
+        );
+        assert_eq!(
+            std::fs::read(&d.journal_path).unwrap(),
+            before,
+            "那份未完成的 journal 必须逐位不变 —— 它是那一轮唯一的记录"
+        );
+    }
+
+    /// 硬链接：**路径归约认不出的那一类别名** —— 两条真实存在的不同路径，同一个 inode。
+    ///
+    /// 这条用例的存在理由就是钉住「同一 inode 判定」那一格：
+    /// 前置断言先证明两把钥匙**不同**，否则挡住它的是路径比较，这一格等于没被测到。
+    #[test]
+    fn e7_apply_refuses_a_journal_path_hard_linked_to_the_candidate_db() {
+        let d = drill();
+        let before = std::fs::read(&d.db_path).unwrap();
+        let hard = d.db_path.parent().unwrap().join("journal-hardlink.json");
+        let _ = std::fs::remove_file(&hard);
+        std::fs::hard_link(&d.db_path, &hard).unwrap();
+        assert_ne!(
+            restore_write_path_key(&hard),
+            restore_write_path_key(&d.db_path),
+            "前置断言：硬链接的路径归约必须与候选库不同 —— 相同的话挡住它的是路径比较，\
+             而不是同一 inode 判定，这条用例就没有分辨力"
+        );
+
+        let err =
+            restore_apply_journaled(plan_for(&d), &hard).expect_err("硬链接到候选库的落点必须拒");
+        assert!(
+            err.to_string().contains("E-RESTORE-WRITE-PATH-ALIAS"),
+            "实得：{err}"
+        );
+        assert_eq!(
+            std::fs::read(&d.db_path).unwrap(),
+            before,
+            "候选库必须逐位不变"
+        );
+    }
+
+    /// 路径归约本身的判据：它是上面每一条的**公共前提**，值得被单独钉住。
+    #[test]
+    fn e7_write_path_key_absolutizes_and_normalizes_before_comparing() {
+        let d = drill();
+        let dir = d.db_path.parent().unwrap().to_path_buf();
+        let file = d.db_path.file_name().unwrap().to_os_string();
+
+        assert_eq!(
+            restore_write_path_key(&dir.join(".").join(&file)),
+            restore_write_path_key(&d.db_path),
+            "`.` 绕一圈必须归约到同一把钥匙"
+        );
+        assert_eq!(
+            restore_write_path_key(&dir.join("no-such-dir").join("..").join(&file)),
+            restore_write_path_key(&d.db_path),
+            "`..` 跟在一个**不存在**的分量后面时 `canonicalize` 会断在那儿 —— \
+             只有词法归并那一趟认得出这仍是候选库"
+        );
+
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            restore_write_path_key(Path::new("some-report.json")),
+            restore_write_path_key(&cwd.join("some-report.json")),
+            "相对路径必须先绝对化，否则「同一个文件」会因为工作目录不同而比不等"
+        );
+    }
+
+    // ── 反方向臂：互异性校验**不得误伤正常用法** ──────────────────────
+    //
+    // 常规撤防线臂只证「修有用」，证不了「没修过头」，而这条修复的风险全在过头那一侧：
+    // 一道过宽的路径校验会把正常的 dry-run 直接判死。
+    #[test]
+    fn e7_apply_still_accepts_an_ordinary_new_journal_beside_the_candidate_db() {
+        let d = drill();
+        plant_post_commit_sentinels(&d.data_dir, &d.db_path);
+
+        // 与候选库**同目录、不同名**是正常用法（marker 默认就与候选库同居）。
+        let beside = d
+            .db_path
+            .parent()
+            .unwrap()
+            .join("restore-journal-beside.json");
+        let _ = std::fs::remove_file(&beside);
+
+        let outcome = restore_apply_journaled(plan_for(&d), &beside)
+            .expect("与候选库同目录、不同名的全新 journal 必须照常跑完");
+        assert_eq!(
+            outcome.restored + outcome.replaced,
+            2,
+            "反方向臂必须真跑完这一轮，不能只证明「没报错」，实得 {outcome:?}"
+        );
+        assert!(beside.exists(), "journal 必须真落在那个新路径上");
     }
 
     #[test]
