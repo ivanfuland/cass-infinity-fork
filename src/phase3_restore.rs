@@ -6033,6 +6033,7 @@ pub(crate) fn commit_replace_in_tx(
     crate::storage::sqlite::franken_rebuild_external_conversation_tail_lookup_in_tx(
         tx,
         input.agent_id,
+        input.conversation_id,
         input.conv,
     )?;
 
@@ -6040,6 +6041,7 @@ pub(crate) fn commit_replace_in_tx(
     crate::storage::sqlite::franken_update_conversation_projection_fields_in_tx(
         tx,
         input.conversation_id,
+        input.agent_id,
         input.workspace_id,
         input.conv,
     )?;
@@ -6383,6 +6385,343 @@ mod e6_replace_commit_tests {
                 message(1, MessageRole::Assistant, "新 1"),
             ],
         )
+    }
+
+    /// 与 `conversation_titled` 同形，但**外部 id 可指定** —— K2 的两条用例
+    /// 全靠「投影重算出的 `external_id` 与库里旧值不同」这一形态。
+    fn conversation_with_external_id(
+        external_id: &str,
+        title: &str,
+        messages: Vec<Message>,
+    ) -> Conversation {
+        let mut conv = conversation_titled(title, messages);
+        conv.external_id = Some(external_id.to_owned());
+        conv
+    }
+
+    fn lookup_keys_for(storage: &FrankenStorage, conversation_id: i64) -> Vec<String> {
+        storage
+            .raw()
+            .query_map_collect(
+                "SELECT lookup_key FROM conversation_external_tail_lookup \
+                 WHERE conversation_id = ?1 ORDER BY lookup_key",
+                &[ParamValue::from(conversation_id)],
+                |row| row.get_typed(0),
+            )
+            .unwrap()
+    }
+
+    // ── R4 第 2 条 / 裁定 R-E-110 K2：身份的一部分没跟着走 ────────────
+    //
+    // Replace 重算了整份投影，却**从不把重算出来的 `external_id` 写回**：
+    // `franken_update_conversation_projection_fields_in_tx` 的 `UPDATE` 列表里没有它。
+    // 而 `phase3_restore.rs` 开头明写 `external_id` 是**写入身份四元组**之一
+    // （`source_id` / `agent_slug` / `external_id` / `original_path`）。
+    //
+    // 后果：库里留着**旧**的外部 id，下一次正常摄入按**新**的 id 去查 —— 查不到，
+    // 于是插一条重复的。与 R2 第 4 条「查候选绑三维、发布只绑一维」同型。
+    #[test]
+    fn e6_replace_writes_back_the_recomputed_external_id() {
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open(&dir);
+
+        // 库里那条是「旧口径」的外部 id。
+        let legacy = conversation_with_external_id(
+            "projects/ws/legacy-uuid.jsonl",
+            "旧标题",
+            vec![
+                message(0, MessageRole::User, "旧 0"),
+                message(1, MessageRole::Assistant, "旧 1"),
+            ],
+        );
+        storage
+            .insert_conversations_batched(&[(agent_id, None, &legacy)])
+            .unwrap();
+        let conv_id: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT id FROM conversations WHERE external_id = ?1",
+                &[ParamValue::from("projects/ws/legacy-uuid.jsonl")],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+
+        // 投影重算出的是「现口径」的 id。
+        let projected = conversation_with_external_id(
+            "ws/legacy-uuid.jsonl",
+            "新标题",
+            vec![
+                message(0, MessageRole::User, "新 0"),
+                message(1, MessageRole::Assistant, "新 1"),
+            ],
+        );
+
+        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+        {
+            let mut tx = storage.raw().transaction().unwrap();
+            commit_replace_in_tx(
+                &tx,
+                &ReplaceCommitInput {
+                    conversation_id: conv_id,
+                    agent_id,
+                    workspace_id: None,
+                    conv: &projected,
+                    identity: &identity(),
+                    snapshot_root: "k2-root",
+                    generation: "k2-gen",
+                },
+                &pricing,
+                TS,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        let stored: Option<String> = storage
+            .raw()
+            .query_row_map(
+                "SELECT external_id FROM conversations WHERE id = ?1",
+                &[ParamValue::from(conv_id)],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stored.as_deref(),
+            Some("ws/legacy-uuid.jsonl"),
+            "重算出来的 external_id 必须写回 —— 它是写入身份四元组之一，\
+             留旧值会让下一次正常摄入查不到这行、插一条重复的"
+        );
+    }
+
+    /// 反方向臂 ①：投影**没有**外部 id 时，库里既有的值**不得被抹成 NULL**。
+    ///
+    /// 这条缺陷说的是「别留旧的」，不是「宁可没有」——把已有的身份信息抹掉，
+    /// 是在让下一次摄入更查不到，而不是更查得到。
+    #[test]
+    fn e6_replace_does_not_wipe_an_existing_external_id_when_the_projection_has_none() {
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open(&dir);
+        let legacy = conversation_with_external_id(
+            "projects/ws/keep-me.jsonl",
+            "旧标题",
+            vec![
+                message(0, MessageRole::User, "旧 0"),
+                message(1, MessageRole::Assistant, "旧 1"),
+            ],
+        );
+        storage
+            .insert_conversations_batched(&[(agent_id, None, &legacy)])
+            .unwrap();
+        let conv_id: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT id FROM conversations WHERE external_id = ?1",
+                &[ParamValue::from("projects/ws/keep-me.jsonl")],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+
+        let mut projected = conversation_titled(
+            "新标题",
+            vec![
+                message(0, MessageRole::User, "新 0"),
+                message(1, MessageRole::Assistant, "新 1"),
+            ],
+        );
+        projected.external_id = None;
+
+        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+        {
+            let mut tx = storage.raw().transaction().unwrap();
+            commit_replace_in_tx(
+                &tx,
+                &ReplaceCommitInput {
+                    conversation_id: conv_id,
+                    agent_id,
+                    workspace_id: None,
+                    conv: &projected,
+                    identity: &identity(),
+                    snapshot_root: "k2-root",
+                    generation: "k2-gen",
+                },
+                &pricing,
+                TS,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        let stored: Option<String> = storage
+            .raw()
+            .query_row_map(
+                "SELECT external_id FROM conversations WHERE id = ?1",
+                &[ParamValue::from(conv_id)],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stored.as_deref(),
+            Some("projects/ws/keep-me.jsonl"),
+            "投影没有外部 id 时不得抹掉库里既有的值"
+        );
+    }
+
+    /// 反方向臂 ②：新 id 被**另一行**占着时，必须死在一句说得清的话上。
+    ///
+    /// `UNIQUE(source_id, agent_id, external_id)` 会挡住它，但裸的约束错误
+    /// 让操作者分不出「哪两行在抢」。两行同时声称一份写入身份是**数据完整性状况**，
+    /// 不是这次 replace 可以顺手糊过去的东西。
+    #[test]
+    fn e6_replace_refuses_to_take_an_external_id_another_row_already_holds() {
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open(&dir);
+
+        let mut squatter = conversation_with_external_id(
+            "ws/contested.jsonl",
+            "占位的那条",
+            vec![message(0, MessageRole::User, "占位")],
+        );
+        squatter.source_path = std::path::PathBuf::from("/fixtures/e6-squatter.jsonl");
+        let legacy = conversation_with_external_id(
+            "projects/ws/contested.jsonl",
+            "旧标题",
+            vec![
+                message(0, MessageRole::User, "旧 0"),
+                message(1, MessageRole::Assistant, "旧 1"),
+            ],
+        );
+        storage
+            .insert_conversations_batched(&[(agent_id, None, &squatter), (agent_id, None, &legacy)])
+            .unwrap();
+        let conv_id: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT id FROM conversations WHERE external_id = ?1",
+                &[ParamValue::from("projects/ws/contested.jsonl")],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+
+        let projected = conversation_with_external_id(
+            "ws/contested.jsonl",
+            "新标题",
+            vec![
+                message(0, MessageRole::User, "新 0"),
+                message(1, MessageRole::Assistant, "新 1"),
+            ],
+        );
+        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+        let mut tx = storage.raw().transaction().unwrap();
+        let err = commit_replace_in_tx(
+            &tx,
+            &ReplaceCommitInput {
+                conversation_id: conv_id,
+                agent_id,
+                workspace_id: None,
+                conv: &projected,
+                identity: &identity(),
+                snapshot_root: "k2-root",
+                generation: "k2-gen",
+            },
+            &pricing,
+            TS,
+        )
+        .err()
+        .expect("外部 id 被别的行占着时必须拒");
+        assert!(
+            err.to_string().contains("E-EXTERNAL-ID-CLASH"),
+            "必须以具名错误码拒，实得：{err}"
+        );
+        drop(tx);
+    }
+
+    /// 外部键缓存里那条挂在**旧键**上的行必须被清掉。
+    ///
+    /// 留着它不是「多一行缓存」：日后若有另一条会话正当地取到那个旧 id，
+    /// 它会从这张表里读到**别人的** tail 状态 —— 一个**错的答案**，
+    /// 而不是一次回落。
+    #[test]
+    fn e6_replace_drops_the_stale_external_tail_lookup_row() {
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open(&dir);
+
+        let legacy = conversation_with_external_id(
+            "projects/ws/legacy-uuid.jsonl",
+            "旧标题",
+            vec![
+                message(0, MessageRole::User, "旧 0"),
+                message(1, MessageRole::Assistant, "旧 1"),
+            ],
+        );
+        storage
+            .insert_conversations_batched(&[(agent_id, None, &legacy)])
+            .unwrap();
+        // 第二批走 append 分支，这一步才会写 `conversation_external_tail_lookup`。
+        let grown = conversation_with_external_id(
+            "projects/ws/legacy-uuid.jsonl",
+            "旧标题",
+            vec![
+                message(0, MessageRole::User, "旧 0"),
+                message(1, MessageRole::Assistant, "旧 1"),
+                message(2, MessageRole::User, "旧 2"),
+            ],
+        );
+        storage
+            .insert_conversations_batched(&[(agent_id, None, &grown)])
+            .unwrap();
+        let conv_id: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT id FROM conversations WHERE external_id = ?1",
+                &[ParamValue::from("projects/ws/legacy-uuid.jsonl")],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        let before = lookup_keys_for(&storage, conv_id);
+        assert!(
+            before
+                .iter()
+                .any(|k| k.contains("projects/ws/legacy-uuid.jsonl")),
+            "前置断言：旧键那一行必须先真的在，否则这条用例在对空表说话。实得 {before:?}"
+        );
+
+        let projected = conversation_with_external_id(
+            "ws/legacy-uuid.jsonl",
+            "新标题",
+            vec![
+                message(0, MessageRole::User, "新 0"),
+                message(1, MessageRole::Assistant, "新 1"),
+            ],
+        );
+        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+        {
+            let mut tx = storage.raw().transaction().unwrap();
+            commit_replace_in_tx(
+                &tx,
+                &ReplaceCommitInput {
+                    conversation_id: conv_id,
+                    agent_id,
+                    workspace_id: None,
+                    conv: &projected,
+                    identity: &identity(),
+                    snapshot_root: "k2-root",
+                    generation: "k2-gen",
+                },
+                &pricing,
+                TS,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        let after = lookup_keys_for(&storage, conv_id);
+        assert!(
+            !after
+                .iter()
+                .any(|k| k.contains("projects/ws/legacy-uuid.jsonl")),
+            "挂在旧外部 id 上的缓存行必须被清掉 —— 留着它会给日后正当取到那个 id 的\
+             另一条会话一个**错的答案**。实得 {after:?}"
+        );
     }
 
     #[test]

@@ -14674,11 +14674,30 @@ pub(crate) fn franken_replace_conversation_messages_in_tx(
 pub(crate) fn franken_rebuild_external_conversation_tail_lookup_in_tx(
     tx: &FrankenTransaction<'_>,
     agent_id: i64,
+    conversation_id: i64,
     conv: &Conversation,
 ) -> Result<()> {
     let Some(lookup_key) = conversation_external_lookup_key_for_conv(agent_id, conv) else {
         return Ok(());
     };
+
+    // ── R4 第 2 条 / 裁定 R-E-110 K2：先清掉挂在**旧键**上的行 ───────────
+    //
+    // 修前这个函数只在**新键**下更新既有行，**从不动旧键那一行**。而 replace 会重算
+    // 整份投影 —— `external_id` 变了，旧键那一行就成了一条挂在这条会话身上的**陈旧缓存**。
+    //
+    // 留着它不是「多一行缓存」：日后若有另一条会话**正当地**取到那个旧 id，
+    // 它会从这张表里读到**这条**会话的 tail 状态 —— 那是一个**错的答案**，而不是一次回落。
+    // （「缺行时读取器自会回落」这条既有论证只对**没有行**成立，对**有一行但是错的**不成立。）
+    //
+    // 按 `conversation_id` 清而不是按「推算出的旧键」清：旧键要从库里的旧值反推，
+    // 而**这条会话名下就不该有第二个键** —— 按 id 清是这件事的直接表达，
+    // 也免掉一次「反推对不对」的证明义务。
+    tx.execute_compat(
+        "DELETE FROM conversation_external_tail_lookup
+         WHERE conversation_id = ?1 AND lookup_key <> ?2",
+        fparams![conversation_id, lookup_key.as_str()],
+    )?;
 
     tx.execute_compat(
         "UPDATE conversation_external_tail_lookup
@@ -14713,10 +14732,53 @@ pub(crate) fn franken_rebuild_external_conversation_tail_lookup_in_tx(
 pub(crate) fn franken_update_conversation_projection_fields_in_tx(
     tx: &FrankenTransaction<'_>,
     conversation_id: i64,
+    agent_id: i64,
     workspace_id: Option<i64>,
     conv: &Conversation,
 ) -> Result<()> {
     let (metadata_json_str, metadata_bin) = franken_metadata_insert_payload(&conv.metadata_json)?;
+
+    // ── R4 第 2 条 / 裁定 R-E-110 K2：重算出来的 `external_id` 必须写回 ──
+    //
+    // 修前这条 `UPDATE` 的列表里**没有** `external_id`，而 `phase3_restore` 开头明写
+    // 它是**写入身份四元组**之一（`source_id` / `agent_slug` / `external_id` /
+    // `original_path`）。留旧值的后果不是「一个字段旧了」：下一次正常摄入按**新**的
+    // 外部 id 去查，查不到那一行，于是**插一条重复的** —— 正是路径规范化那套机制
+    // 存在的理由被绕过。与 R2 第 4 条「同一份身份，查候选绑三维、发布只绑一维」同型。
+    //
+    // **`None` 时不写**：投影没能推出外部 id 时，把库里既有的值抹成 `NULL`
+    // 是在**减少**可用的身份信息，而这条缺陷说的是「别留旧的」，不是「宁可没有」。
+    // 这个不对称是有意的，写在这里免得下一个人把它读成漏改。
+    if let Some(external_id) = conv.external_id.as_deref() {
+        // `UNIQUE(source_id, agent_id, external_id)` 在这张表上：先查后做，
+        // 让冲突死在**一句说得清的话**上，而不是一条裸的约束错误。
+        let clashing: Option<i64> = tx
+            .query_row_map(
+                "SELECT id FROM conversations
+                 WHERE source_id = ?1 AND agent_id = ?2 AND external_id = ?3 AND id <> ?4",
+                fparams![
+                    conv.source_id.as_str(),
+                    agent_id,
+                    external_id,
+                    conversation_id
+                ],
+                |row| row.get_typed(0),
+            )
+            .optional()?;
+        if let Some(other) = clashing {
+            anyhow::bail!(
+                "E-EXTERNAL-ID-CLASH: conversation {conversation_id} would take external_id \
+                 {external_id:?} (source {}, agent {agent_id}) but row {other} already holds it \
+                 — two rows claiming one write identity is a data-integrity condition, \
+                 not something this replace may paper over",
+                conv.source_id
+            );
+        }
+        tx.execute_compat(
+            "UPDATE conversations SET external_id = ?1 WHERE id = ?2",
+            fparams![external_id, conversation_id],
+        )?;
+    }
     tx.execute_compat(
         "UPDATE conversations
          SET title = ?1,
