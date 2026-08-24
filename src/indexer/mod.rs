@@ -8243,7 +8243,12 @@ fn persist_lexical_rebuild_state(index_path: &Path, state: &LexicalRebuildState)
     write_json_pretty_atomically(&path, state)
 }
 
-fn clear_lexical_rebuild_state(index_path: &Path) -> Result<()> {
+/// 删掉词法重建 checkpoint = 让索引不再自称「对当前指纹新鲜」。
+///
+/// **可见性由 `fn` 放宽到 `pub(crate) fn`（裁定 R-E-50-b），函数体逐字节不变**：
+/// 唯一新增消费者是 E7 的 restore 恢复器（`phase3_restore::restore_invalidate_readiness`），
+/// 它要在「readiness 失效」那一格续做这个幂等动作。既有调用点与语义零改动。
+pub(crate) fn clear_lexical_rebuild_state(index_path: &Path) -> Result<()> {
     let path = lexical_rebuild_state_path(index_path);
     match fs::remove_file(&path) {
         Ok(()) => Ok(()),
@@ -24637,6 +24642,48 @@ fn prepare_conversation_for_ingest(
     attach_raw_mirror_capture(data_dir, conv);
 }
 
+/// restore / oracle 侧的 ③ —— 与上面的 [`prepare_conversation_for_ingest`] 是一对，
+/// **差别全部写在这里**，不散在调用方（Task E5，控制面裁定 R-E-35）。
+///
+/// 与 ingest 版的两处差别，逐条对应附录 `W1-0` §A.1.1：
+///
+/// 1. **compact 判据不读活路径，由调用方按封存的 `source_size_bytes` 传入。**
+///    ingest 版走 `compact_large_connector_extras`，它对 `fs::metadata(&conv.source_path)`
+///    取 `len()`；路径已消失时 `Err → None → should_compact_connector_extra` 直接
+///    `return false`，**16 MiB compact 静默不执行**；路径存在但封存后被改动时，投影结果
+///    取决于封存之后的文件系统状态。restore 的投影必须是封存件的纯变换，故换源。
+/// 2. **`attach_raw_mirror_capture` 整步不跑。** 它调 `capture_source_file` 产生文件系统
+///    写副作用，再改写 `metadata.cass.raw_mirror`。restore 的输入本来就来自 mirror，
+///    重新 capture 一次既无意义又是生产写；`metadata.cass.raw_mirror` 由调用方按被消费的
+///    那份 manifest 直接填写。**这条约束焊在被调用侧**——调用方漏跑或多跑都不可能。
+///
+/// 前三步（`inject_provenance` / `canonicalize_claude_external_id` /
+/// `apply_workspace_rewrite`）与 ingest 版逐字相同：三者只读 `conv` 自身与封存的 root
+/// 集合，是纯函数。
+pub(crate) fn prepare_conversation_for_restore(
+    connector_name: &str,
+    origin: &Origin,
+    workspace_rewrite_root: Option<&ScanRoot>,
+    sealed_source_size_bytes: u64,
+    consumed_manifest: &crate::raw_mirror::RawMirrorCaptureRecord,
+    conv: &mut NormalizedConversation,
+) {
+    inject_provenance(conv, origin);
+    canonicalize_claude_external_id(connector_name, conv);
+    if let Some(root) = workspace_rewrite_root {
+        apply_workspace_rewrite(conv, root);
+    }
+    compact_large_connector_extras_for_size(connector_name, conv, Some(sealed_source_size_bytes));
+    // §A.1.1 第 3 条是**两句话**：排除 `attach_raw_mirror_capture`（它会 `capture_source_file`
+    // 产生文件系统写副作用），**并且**「`metadata.cass.raw_mirror` 由 restore 按被消费的那份
+    // manifest 直接填写，字段取值以该 manifest 为准」。只做前半句会让恢复出来的会话查不出
+    // 自己来自哪份 manifest —— 而那正是 F1 交叉核对与 W4 谱系链要顺的那根线。
+    //
+    // **复用既有的 `attach_raw_mirror_metadata`，不在消费侧重拼那八个键**：那八个键的形状
+    // 只能有一处定义，否则基线下次加一个键时两处静默分叉。
+    attach_raw_mirror_metadata(conv, consumed_manifest);
+}
+
 fn capture_connector_sources_before_parse(
     connector: &(dyn crate::connectors::Connector + Send),
     ctx: &crate::connectors::ScanContext,
@@ -26945,7 +26992,7 @@ pub mod persist {
             ENV_LOCK_DEPTH.with(|depth| {
                 let current = depth.get();
                 if current == 0 {
-                    guard = Some(ENV_LOCK.lock().expect("env mutation lock"));
+                    guard = Some(ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
                 }
                 depth.set(current + 1);
             });

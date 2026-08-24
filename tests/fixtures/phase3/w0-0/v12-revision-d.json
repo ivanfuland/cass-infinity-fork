@@ -1,0 +1,182 @@
+{
+ "_provenance": "本文件的 root 由 tools/phase3/bundle.py 算出，**不是**独立于实现产生的。原始 65 条是先有向量、后有实现（bundle.py 冷启复现了它们，那才叫检验）；这 6 条相反，故它们对 bundle.py 只是回归基线，不构成任何交叉验证。独立复核者是 Task E2 的 Rust 实现。",
+ "appendix_section": "§D 修订（2026-08-05）",
+ "cases": [
+  {
+   "case_id": "v12.d5.test-tree-as-production-kind",
+   "expect": "reject",
+   "expected_error": "E-UNKNOWN-KIND",
+   "object_kind": "test.tree",
+   "input": {
+    "boundary_t": 8,
+    "canonical_path": "/home/u/.claude/projects/p/a.jsonl",
+    "dev": 66306,
+    "empty_reason": null,
+    "ino": 1234567,
+    "object_kind": "test.tree",
+    "origin": "claude_code",
+    "payload_hash": "d6ad880bbbc7a3ae5fd70f89943828911cf1d4fe6f9abfed65b9245e86e9893c",
+    "prefix_digest": "e346432021b04179518d9614f3560ccd71354a4ee101ddcb893d6959a9d6301c",
+    "session_id": "sess-1"
+   },
+   "note": "§D-5：test.tree 是保留域（§A.12 明令生产对象不得用它），但它在 §A.7 全集内，修订前 E-UNKNOWN-KIND 按原定义不适用、E-KIND-FORM 三条也全过 —— 一个被明令禁止的输入落不到任何码上。**本例无 input_tags 是定义性的**：带 input_tags 的 input 是裸 leaf 集（§A.12），不带则按字段表当 schema 对象处理"
+  },
+  {
+   "case_id": "v12.d6.merged-detail",
+   "expect": "accept",
+   "expected": {
+    "root": "3f5abe878d2ab39f4bd8a322fcaa21eef2214ff3ea637e4c915bd14551112535",
+    "sorted_keys": [
+     "canonical_path",
+     "detail",
+     "object_kind",
+     "origin",
+     "reason"
+    ],
+    "tree_hash": "a13c774d647a47a7784cd0c39ba0f62de6fe7d920e4d8f87394c71d71a0e45da"
+   },
+   "object_kind": "seal.hold",
+   "input": {
+    "canonical_path": "/home/u/.codex/sessions/rollout-legacy.json",
+    "detail": "codex-rollout-json,filename-case-variant",
+    "object_kind": "seal.hold",
+    "origin": "codex",
+    "reason": "out-of-scope-format"
+   },
+   "note": "§D-6：同一 (origin, canonical_path) 命中两个 bucket 时的合并形态。修订前两条路都被自己的码堵死 —— 两条并存撞 E-ARRAY-DUPKEY，按 §A.3.1 明写的补救归并成一条则串不在闭世界表内、撞 E-HOLD-DETAIL"
+  },
+  {
+   "case_id": "v12.d6.reject.descending",
+   "expect": "reject",
+   "expected_error": "E-HOLD-DETAIL",
+   "object_kind": "seal.hold",
+   "input": {
+    "canonical_path": "/home/u/.codex/sessions/rollout-legacy.json",
+    "detail": "filename-case-variant,codex-rollout-json",
+    "object_kind": "seal.hold",
+    "origin": "codex",
+    "reason": "out-of-scope-format"
+   },
+   "note": "§D-6：升序是承重的 —— 不钉死顺序，同一个子集就有多种拼法、因而多个 root"
+  },
+  {
+   "case_id": "v12.d6.reject.table-order-not-byte-order",
+   "expect": "reject",
+   "expected_error": "E-HOLD-DETAIL",
+   "object_kind": "seal.hold",
+   "input": {
+    "canonical_path": "/home/u/.codex/sessions/rollout-legacy.json",
+    "detail": "unknown-whole-file-schema,type-drift",
+    "object_kind": "seal.hold",
+    "origin": "codex",
+    "reason": "out-of-scope-format"
+   },
+   "note": "§D-6 的陷阱用例：§B.5.1 表的末两行是 unknown-whole-file-schema 在前、type-drift 在后，而字节升序相反（t < u）。**照抄表序会拼出非法串**。本例存在的理由是这个错误在起草修订时真的被写进过草稿，靠实测排序抓出"
+  },
+  {
+   "case_id": "v12.d6.reject.repeat",
+   "expect": "reject",
+   "expected_error": "E-HOLD-DETAIL",
+   "object_kind": "seal.hold",
+   "input": {
+    "canonical_path": "/home/u/.codex/sessions/rollout-legacy.json",
+    "detail": "codex-rollout-json,codex-rollout-json",
+    "object_kind": "seal.hold",
+    "origin": "codex",
+    "reason": "out-of-scope-format"
+   },
+   "note": "§D-6：严格升序蕴含无重复"
+  },
+  {
+   "case_id": "v12.d6.reject.whitespace",
+   "expect": "reject",
+   "expected_error": "E-HOLD-DETAIL",
+   "object_kind": "seal.hold",
+   "input": {
+    "canonical_path": "/home/u/.codex/sessions/rollout-legacy.json",
+    "detail": "codex-rollout-json, filename-case-variant",
+    "object_kind": "seal.hold",
+    "origin": "codex",
+    "reason": "out-of-scope-format"
+   },
+   "note": "§D-6：无空白。带空格的段落不在五值表内"
+  },
+  {
+   "case_id": "v12.d2.negative-dev-ino-accepted",
+   "expect": "accept",
+   "expected": {
+    "root": "e62d6f2491785fae9f8237c6705beab0403af516833aa30795599e4c35081105",
+    "sorted_keys": [
+     "boundary_t",
+     "canonical_path",
+     "dev",
+     "empty_reason",
+     "ino",
+     "object_kind",
+     "origin",
+     "payload_hash",
+     "prefix_digest",
+     "session_id"
+    ],
+    "tree_hash": "4a456b521c99c28b683649b61b7702ed2f06ac1c3561ce87bc44a5e30e871142"
+   },
+   "object_kind": "seal.entry",
+   "input": {
+    "boundary_t": 8,
+    "canonical_path": "/home/u/.claude/projects/p/a.jsonl",
+    "dev": -1,
+    "empty_reason": null,
+    "ino": -2,
+    "object_kind": "seal.entry",
+    "origin": "claude_code",
+    "payload_hash": "d6ad880bbbc7a3ae5fd70f89943828911cf1d4fe6f9abfed65b9245e86e9893c",
+    "prefix_digest": "e346432021b04179518d9614f3560ccd71354a4ee101ddcb893d6959a9d6301c",
+    "session_id": "sess-1"
+   },
+   "input_tags": {
+    "boundary_t": "i",
+    "canonical_path": "p",
+    "dev": "i",
+    "empty_reason": "n",
+    "ino": "i",
+    "object_kind": "s",
+    "origin": "s",
+    "payload_hash": "x",
+    "prefix_digest": "x",
+    "session_id": "s"
+   },
+   "note": "§D-2：dev / ino 允许为负，只受 int64 约束——两者的说明列只写「仅诊断」，而 E-FIELD-RANGE 的适用字段是一张穷举表、不含它们。**这是与 E2 的真实分叉点**：补了 >= 0 的实现会在这里报 E-FIELD-RANGE，而正常输入的 root 完全相同，没有这一条则互验全绿。R1 finding F2 补入"
+  },
+  {
+   "case_id": "v12.d2.reject.int64-overflow",
+   "expect": "reject",
+   "expected_error": "E-VALUE-FORM",
+   "object_kind": "seal.entry",
+   "input": {
+    "boundary_t": 8,
+    "canonical_path": "/home/u/.claude/projects/p/a.jsonl",
+    "dev": 9223372036854775808,
+    "empty_reason": null,
+    "ino": 1234567,
+    "object_kind": "seal.entry",
+    "origin": "claude_code",
+    "payload_hash": "d6ad880bbbc7a3ae5fd70f89943828911cf1d4fe6f9abfed65b9245e86e9893c",
+    "prefix_digest": "e346432021b04179518d9614f3560ccd71354a4ee101ddcb893d6959a9d6301c",
+    "session_id": "sess-1"
+   },
+   "input_tags": {
+    "boundary_t": "i",
+    "canonical_path": "p",
+    "dev": "i",
+    "empty_reason": "n",
+    "ino": "i",
+    "object_kind": "s",
+    "origin": "s",
+    "payload_hash": "x",
+    "prefix_digest": "x",
+    "session_id": "s"
+   },
+   "note": "§D-2：i 标签的 int64 范围是 **tag 级**编码约束，越界报 E-VALUE-FORM，不是 E-FIELD-RANGE。附录 §A.11 原写「范围是字段级约束」而 §A.2 把这条范围放在 tag 级表里，严格照前者读的实现者会找不到码。对照：boundary_t = -1 落在§A.11 的穷举表内，报 E-FIELD-RANGE。R1 finding F2 补入"
+  }
+ ]
+}

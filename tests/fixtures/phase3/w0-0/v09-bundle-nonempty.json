@@ -1,0 +1,66 @@
+{
+ "appendix_section": "§A.9/§A.3/§A.3.1",
+ "cases": [
+  {
+   "case_id": "v09.bundle-three-payloads",
+   "expect": "accept",
+   "expected": {
+    "payloads_sorted_order": [
+     "ae1e72bb7a3703d3c13b07c6c9d3e647c1cdb0efeab2221286f3e88fd0df36e3",
+     "d6ad880bbbc7a3ae5fd70f89943828911cf1d4fe6f9abfed65b9245e86e9893c",
+     "e7212af34b79ebc28a54bade34cbe889c3094ab2fc9529a41f6a3f3be7c4d86c"
+    ],
+    "root": "739e4d29f7b37a662af4c1513a3085f1c636afea1537a51eb19b640ca7f51d79",
+    "sorted_keys": [
+     "mirror_fingerprint",
+     "object_kind",
+     "payloads[000000].byte_length",
+     "payloads[000000].payload_hash",
+     "payloads[000001].byte_length",
+     "payloads[000001].payload_hash",
+     "payloads[000002].byte_length",
+     "payloads[000002].payload_hash",
+     "promotable",
+     "schema_version",
+     "seal_result_root"
+    ],
+    "tree_hash": "073be5ea6a99611bb38350e4bde04f9d673f30da9569a233a9e3d802a8d1d84a"
+   },
+   "input": {
+    "mirror_fingerprint": "27b9515405b9e7236a33d5174a6dcb27c6770c66cc506e554956681e0ca72f41",
+    "object_kind": "bundle.manifest",
+    "payloads[000000].byte_length": 8,
+    "payloads[000000].payload_hash": "ae1e72bb7a3703d3c13b07c6c9d3e647c1cdb0efeab2221286f3e88fd0df36e3",
+    "payloads[000001].byte_length": 8,
+    "payloads[000001].payload_hash": "d6ad880bbbc7a3ae5fd70f89943828911cf1d4fe6f9abfed65b9245e86e9893c",
+    "payloads[000002].byte_length": 8,
+    "payloads[000002].payload_hash": "e7212af34b79ebc28a54bade34cbe889c3094ab2fc9529a41f6a3f3be7c4d86c",
+    "promotable": false,
+    "schema_version": "w0-0/v1",
+    "seal_result_root": "05f778e463412b238dbfd9a7fbd12a70f935e9135e8c18cc628580ce8b9b0687"
+   },
+   "input_tags": {
+    "mirror_fingerprint": "x",
+    "object_kind": "s",
+    "payloads[000000].byte_length": "i",
+    "payloads[000000].payload_hash": "x",
+    "payloads[000001].byte_length": "i",
+    "payloads[000001].payload_hash": "x",
+    "payloads[000002].byte_length": "i",
+    "payloads[000002].payload_hash": "x",
+    "promotable": "b",
+    "schema_version": "s",
+    "seal_result_root": "x"
+   },
+   "insertion_order_payload_hashes": [
+    "d6ad880bbbc7a3ae5fd70f89943828911cf1d4fe6f9abfed65b9245e86e9893c",
+    "e7212af34b79ebc28a54bade34cbe889c3094ab2fc9529a41f6a3f3be7c4d86c",
+    "ae1e72bb7a3703d3c13b07c6c9d3e647c1cdb0efeab2221286f3e88fd0df36e3"
+   ],
+   "note": "入库序 a,b,c 的 hash 依次为 d6ad… / e721… / ae1e…，按 32 原始字节升序应重排为 c,a,b —— 入库序与排序键序刻意不同，照入库序编码的实现会算出不同 root",
+   "object_kind": "bundle.manifest"
+  }
+ ],
+ "note": "payloads 非空的 bundle.manifest —— 生产形态的 snapshot root 锚点。同时钉住 6 位零填充下标与 32 原始字节排序键两条规则",
+ "vector_group": "v09"
+}

@@ -1,0 +1,54 @@
+{
+ "appendix_section": "§B.1",
+ "cases": [
+  {
+   "case_id": "v04.append",
+   "expect": "accept",
+   "expected": {
+    "must_differ": true,
+    "prior_root": "f88b333d1e7c190de80ac1fc2428fbd0a307dbad7f0eea924f312b3b4cf4e117",
+    "root": "c8c7133dc96010bd199d5c3aad521af60551bc9a4909501a82a3f67a01faa40d",
+    "sorted_keys": [
+     "boundary_t",
+     "canonical_path",
+     "dev",
+     "empty_reason",
+     "ino",
+     "object_kind",
+     "origin",
+     "payload_hash",
+     "prefix_digest",
+     "session_id"
+    ],
+    "tree_hash": "6c87f389be0a71583a122201cf71546e47f956ec6af01eaa5c0f856af156267c"
+   },
+   "input": {
+    "boundary_t": 16,
+    "canonical_path": "/home/u/.claude/projects/p/a.jsonl",
+    "dev": 66306,
+    "empty_reason": null,
+    "ino": 1234567,
+    "object_kind": "seal.entry",
+    "origin": "claude_code",
+    "payload_hash": "d2fb18f4943fa5d28aa45504a8352f117c719bfbae0270b212d8cffa3b5e949d",
+    "prefix_digest": "3881dc2ee848fe04d776737c86afbc783e482e7c5be6431d3aab36fa8fa2c928",
+    "session_id": "sess-1"
+   },
+   "input_tags": {
+    "boundary_t": "i",
+    "canonical_path": "p",
+    "dev": "i",
+    "empty_reason": "n",
+    "ino": "i",
+    "object_kind": "s",
+    "origin": "s",
+    "payload_hash": "x",
+    "prefix_digest": "x",
+    "session_id": "s"
+   },
+   "object_kind": "seal.entry"
+  }
+ ],
+ "note": "稳定追加：同一路径两次 seal，后者 boundary_t 更大，root 必须不同",
+ "vector_group": "v04"
+}

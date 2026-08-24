@@ -433,7 +433,7 @@ mod tests {
 
     #[test]
     fn unset_env_is_noop() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: tests are serialized via ENV_LOCK; this is the
         // standard pattern in this crate for env-dependent tests.
         unsafe {
@@ -446,7 +446,7 @@ mod tests {
 
     #[test]
     fn writes_one_line_per_event() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("progress.jsonl");
         // SAFETY: tests are serialized via ENV_LOCK.
@@ -527,7 +527,7 @@ mod tests {
 
     #[test]
     fn invalid_env_var_is_safe_noop() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Whitespace-only env var should be treated as unset rather
         // than as an attempt to write to "" (which would fail). The
         // sink should silently degrade to disabled.
@@ -554,7 +554,7 @@ mod tests {
         event: SemanticProgressEvent,
         fields: SemanticProgressFields,
     ) -> serde_json::Value {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("progress.jsonl");
         // SAFETY: tests serialized via ENV_LOCK.
@@ -576,7 +576,7 @@ mod tests {
     #[test]
     fn full_backfill_lifecycle_emits_events_in_phase_order() {
         use SemanticProgressEvent::*;
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("progress.jsonl");
         // SAFETY: tests serialized via ENV_LOCK.
@@ -696,7 +696,7 @@ mod tests {
 
     #[test]
     fn open_failure_degrades_to_disabled_without_panic() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new().unwrap();
         // Point the sink at a path whose PARENT is a regular file, so
         // create_dir_all (and the open) fail: the sink must degrade to a

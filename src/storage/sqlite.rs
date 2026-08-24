@@ -269,7 +269,25 @@ static MESSAGE_LOOKUP_EXACT_IDX_PROBES: AtomicU64 = AtomicU64::new(0);
 static MESSAGE_LOOKUP_BOUNDED_QUERIES: AtomicU64 = AtomicU64::new(0);
 static MESSAGE_LOOKUP_FULL_SCAN_QUERIES: AtomicU64 = AtomicU64::new(0);
 static MESSAGE_LOOKUP_ROWS_MATERIALIZED: AtomicU64 = AtomicU64::new(0);
-static DEFAULT_DEFER_ANALYTICS_UPDATES: AtomicBool = AtomicBool::new(false);
+/// 进程级「默认延后分析写入」开关的**初始值**（没有任何 guard 在持有时的取值）。
+///
+/// 提成具名常量是 FIND-11 修复的一部分：栈空时要还原到**它**，
+/// 而不是还原到「最后一个 guard 进门时碰巧看到的值」。
+const DEFAULT_DEFER_ANALYTICS_UPDATES_INITIAL: bool = false;
+
+/// 读侧的快取。真源是下面的持有者栈；这里只是让
+/// `defer_analytics_updates_enabled()` 保持一次原子读的成本
+/// （它在每次插入批的路径上被调用，不能去抢锁）。
+static DEFAULT_DEFER_ANALYTICS_UPDATES: AtomicBool =
+    AtomicBool::new(DEFAULT_DEFER_ANALYTICS_UPDATES_INITIAL);
+
+/// 仍然活着的 guard 的**持有者栈**：`(guard_id, 该 guard 请求的值)`。
+///
+/// 用 `parking_lot::Mutex` 而不是 `std::sync::Mutex`：它不带毒化语义，
+/// 一次无关的 panic 不会把这条路径变成 `PoisonError` 连带源。
+static DEFER_ANALYTICS_GUARD_STACK: parking_lot::Mutex<Vec<(u64, bool)>> =
+    parking_lot::Mutex::new(Vec::new());
+static DEFER_ANALYTICS_GUARD_NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 pub(crate) struct MessageLookupTraceCounters {
@@ -315,21 +333,58 @@ pub(crate) fn message_lookup_trace_snapshot() -> MessageLookupTraceCounters {
     }
 }
 
+/// 进程级「默认延后分析写入」开关的 RAII 持有者。
+///
+/// # FIND-11 / 裁定 R-E-86 ②：为什么不是 `swap` + `Drop{store(previous)}`
+///
+/// 旧实现每个 guard 进门 `swap` 出旧值、出门把旧值写回。**那套 save-and-restore
+/// 只在严格嵌套下成立**：两个 guard 在不同线程上**交错**持有时，后释放者把
+/// 「它进门时看到的值」写回全局，于是全局停在一个谁都没有请求的值上，
+/// 而且**没有任何代码会把它纠正回来**。`true` 一旦滞留，本进程此后所有受该开关
+/// 门控的分析写入（`daily_stats` / `token_usage` / `token_daily_stats` /
+/// `message_metrics` / 三张 usage rollup）全部静默跳过 —— 没有日志、没有报错、
+/// 没有自愈路径。生产上这条路走得通：`run_doctor_impl` 会起后台线程跑 `run_index`，
+/// 而 `run_index` 一进门就取本 guard，且取在 index-run 锁**之前**，锁挡不住它。
+///
+/// 现在改成**持有者栈**：进门 push `(id, 请求值)`，出门按 **id** 摘掉自己那一条
+/// （不是弹栈顶），有效值 = 栈里最后一个仍然活着的条目，栈空则回到
+/// `DEFAULT_DEFER_ANALYTICS_UPDATES_INITIAL`。于是
+/// ① 全部释放之后必然回到初始值（**永久滞留被消掉**）；
+/// ② 同线程严格嵌套的语义原样保留（内层出门后恢复外层的值）——
+/// 这一条挡的是「用纯深度计数去修交错」那种改法，那样改会把嵌套弄坏。
+///
+/// # ⚠ 没修的那一半，如实写在这里
+///
+/// **交错期间「后来者把前一个的窗口提前改掉」依然会发生。** 一个进程级单值
+/// 无法同时满足两个线程各自要的值 —— 这是载体的问题，不是还原逻辑的问题。
+/// 要根治得把这个开关沿调用链传参（动 `insert_conversations_batched` 等
+/// 基线入口的签名），属基线冻结面，记 E9 已知加固选项，不在本 PR。
 pub(crate) struct DefaultDeferAnalyticsUpdatesGuard {
-    previous: bool,
+    id: u64,
 }
 
 impl Drop for DefaultDeferAnalyticsUpdatesGuard {
     fn drop(&mut self) {
-        DEFAULT_DEFER_ANALYTICS_UPDATES.store(self.previous, Ordering::Relaxed);
+        let mut stack = DEFER_ANALYTICS_GUARD_STACK.lock();
+        if let Some(pos) = stack.iter().rposition(|(id, _)| *id == self.id) {
+            stack.remove(pos);
+        }
+        let effective = stack
+            .last()
+            .map(|(_, value)| *value)
+            .unwrap_or(DEFAULT_DEFER_ANALYTICS_UPDATES_INITIAL);
+        DEFAULT_DEFER_ANALYTICS_UPDATES.store(effective, Ordering::Relaxed);
     }
 }
 
 pub(crate) fn default_defer_analytics_updates_guard(
     enabled: bool,
 ) -> DefaultDeferAnalyticsUpdatesGuard {
-    let previous = DEFAULT_DEFER_ANALYTICS_UPDATES.swap(enabled, Ordering::Relaxed);
-    DefaultDeferAnalyticsUpdatesGuard { previous }
+    let id = DEFER_ANALYTICS_GUARD_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let mut stack = DEFER_ANALYTICS_GUARD_STACK.lock();
+    stack.push((id, enabled));
+    DEFAULT_DEFER_ANALYTICS_UPDATES.store(enabled, Ordering::Relaxed);
+    DefaultDeferAnalyticsUpdatesGuard { id }
 }
 
 fn record_message_lookup_bounded_queries(query_count: u64, rows: usize) {
@@ -1124,6 +1179,64 @@ const DAILY_STATS_HEALTH_META_KEY: &str = "daily_stats_archive_fingerprint";
 const DAILY_STATS_HEALTH_GENERATION_META_KEY: &str = "daily_stats_health_generation";
 const DAILY_STATS_HEALTH_GENERATION: i64 = 1;
 
+/// `meta` 表的 source content generation 保留 key（上位契约 §20.1(b) 的 D2）。
+///
+/// 命名刻意与既有两个含 `generation` 的 key 区分开：
+/// `fts_frankensqlite_rebuild_generation` 是 FTS 重建代际、
+/// `daily_stats_health_generation` 是日统计健康代际，**两者都不是内容代际**。
+/// 本 key 承载的是「这份 DB 的内容属于哪一代」，由 W1 写入、并向两个
+/// manifest 传播，供索引产物判自己属于哪一代内容。
+pub const SOURCE_CONTENT_GENERATION_META_KEY: &str = "source_content_generation";
+
+/// 索引产物（manifest）持有的内容代际与 DB 当前内容代际的比对结论。
+///
+/// 三个 variant 都必须有真实构造点与回归测试（Global Constraints 的发射点判据）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceContentGenerationVerdict {
+    /// manifest 记的代际与期望一致，产物可用。
+    Match,
+    /// manifest 记了代际但与期望不符，产物属于另一代内容。
+    Mismatch,
+    /// manifest 根本没有记代际（pre-W1 binary 写出的旧产物）。
+    ///
+    /// **必须与 `Mismatch` 分开**：这一档表示「无从判断」，
+    /// 它绝不得被当成 `Match`，判据见上位契约 §20.1(c) 的 V4。
+    ///
+    /// # ⚠ 接线时的义务（裁定 R-E-93，写在这里就是为了防止日后被软化）
+    ///
+    /// 把这个 verdict 接进索引启动那处「能不能沿用既有产物」的判定时，
+    /// **`Unknown` 必须走重建**。接线的那一刻，机器上全部 pre-W1 索引产物都会判
+    /// `Unknown` → 触发一次全量重建，而语义索引重建是 CPU 重活。
+    ///
+    /// **那笔一次性成本不是软化本档的理由。**「太贵了，先当成 `Match` 吧」正是 V4 要挡的
+    /// 那种静默等价——它把「无从判断」偷换成「判断过了、没问题」，而这两句话在出事时
+    /// 长得一模一样。成本要用别的办法摊（随一次全量重摄入一批吸收掉），不是改判据。
+    Unknown,
+}
+
+impl SourceContentGenerationVerdict {
+    /// 只有 `Match` 允许沿用既有产物；其余两档一律要求重建。
+    ///
+    /// **不要在调用侧给 `Unknown` 另开一个例外分支**（R-E-93）：「其余两档一律重建」
+    /// 就是本函数的全部内容，例外只能出现在这里，而且要连同理由一起改。
+    /// 判据散到调用侧，等于每个调用方各持一份可以悄悄放宽的口径。
+    pub fn requires_rebuild(self) -> bool {
+        !matches!(self, Self::Match)
+    }
+
+    /// 由 manifest 侧的 `Option<String>` 字段与期望代际算出结论。
+    ///
+    /// 缺字段（`None`）判 `Unknown`，**不得** default 成空串再与期望比 —— 那样
+    /// 一个期望为空串的调用方会拿到 `Match`，正是 V4 要挡的那种静默等价。
+    pub fn evaluate(recorded: Option<&str>, expected: &str) -> Self {
+        match recorded {
+            None => Self::Unknown,
+            Some(value) if value == expected => Self::Match,
+            Some(_) => Self::Mismatch,
+        }
+    }
+}
+
 /// SQL to clear all rows from the contentless `fts_messages` table.
 ///
 /// Contentless FTS5 tables reject ordinary `DELETE FROM ...` statements.
@@ -1732,7 +1845,6 @@ struct HistoricalBundleProbe {
 }
 
 #[cfg(test)]
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SqliteDatabaseHealthProbe {
     pub schema_version: Option<i64>,
@@ -2607,7 +2719,6 @@ fn franken_fts_limit_probe(conn: &FrankenConnection) -> bool {
 }
 
 #[cfg(test)]
-#[allow(dead_code)]
 pub(crate) fn probe_database_health_via_frankensqlite(
     db_path: &Path,
 ) -> Result<SqliteDatabaseHealthProbe> {
@@ -2992,7 +3103,7 @@ fn has_db_sidecar_suffix(name: &str) -> bool {
 }
 
 /// Public schema version constant for external checks.
-pub const CURRENT_SCHEMA_VERSION: i64 = 20;
+pub const CURRENT_SCHEMA_VERSION: i64 = 21;
 const MIN_IN_PLACE_MIGRATION_SCHEMA_VERSION: i64 = 13;
 
 /// Result of checking schema compatibility.
@@ -3240,7 +3351,6 @@ LEFT JOIN workspaces w ON c.workspace_id = w.id;
 ";
 
 #[cfg(test)]
-#[allow(dead_code)]
 const MIGRATION_V3: &str = r"
 DROP TABLE IF EXISTS fts_messages;
 CREATE VIRTUAL TABLE fts_messages USING fts5(
@@ -3619,6 +3729,28 @@ SELECT
      WHERE ts.conversation_id = c.id)
 FROM conversations c
 WHERE c.external_id IS NOT NULL;
+";
+
+const MIGRATION_V21: &str = r"
+-- W1 operation commit receipt（上位契约 §20.1(b) 的 D1）。
+--
+-- 记的是「一次 DB 事务是否已提交」这个事实，崩溃重启后据 idempotency_key
+-- 判幂等，避免同一次 relink / restore 被重复施加。
+--
+-- ⚠ 与基线的 DoctorAssetClass::OperationReceipt（其 asset_class 字符串值）
+-- 语义完全不同：那个是 doctor 的**文件资产分类**，指向 <data_dir>/doctor/receipts/
+-- 目录下的文件；本表是**DB 事务的提交事实**。两者不得混名，故本表取名
+-- operation_commit_receipt（区分点是 commit），且字符串上不含 operation_receipt
+-- 子串，基线那批的 grep 普查不会被本表污染。
+CREATE TABLE IF NOT EXISTS operation_commit_receipt (
+    id INTEGER PRIMARY KEY,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    operation TEXT NOT NULL,
+    state TEXT NOT NULL,
+    snapshot_root TEXT,
+    committed_at_ms INTEGER NOT NULL,
+    detail TEXT
+);
 ";
 
 /// Row from the embedding_jobs table.
@@ -4811,6 +4943,7 @@ fn build_cass_migrations_after_tail_cache() -> MigrationRunner {
         .add(18, "conversation_tail_state_hot_table", MIGRATION_V18)
         .add(19, "conversation_external_lookup", MIGRATION_V19)
         .add(20, "conversation_external_tail_lookup", MIGRATION_V20)
+        .add(21, "operation_commit_receipt", MIGRATION_V21)
 }
 
 fn schema_migration_is_applied(conn: &FrankenConnection, version: i64) -> Result<bool> {
@@ -5659,7 +5792,7 @@ fn current_schema_repair_batches_for_missing_tables(
 }
 
 /// Migration name lookup for backfilling `_schema_migrations` during transition.
-const MIGRATION_NAMES: [(i64, &str); 20] = [
+const MIGRATION_NAMES: [(i64, &str); 21] = [
     (1, "core_tables"),
     (2, "fts_messages"),
     (3, "fts_messages_rebuild"),
@@ -5680,6 +5813,7 @@ const MIGRATION_NAMES: [(i64, &str); 20] = [
     (18, "conversation_tail_state_hot_table"),
     (19, "conversation_external_lookup"),
     (20, "conversation_external_tail_lookup"),
+    (21, "operation_commit_receipt"),
 ];
 
 /// Transitions an existing database from `meta` table schema versioning to the
@@ -12040,7 +12174,12 @@ impl FrankenStorage {
     }
 }
 
-fn normalized_storage_source_parts(
+/// 把一份来源三元组归一成**存储层真正会落盘的那个形态**。
+///
+/// `pub(crate)` 是 R-E-98 H1 放宽的：restore 侧要按「这行如果存进来会长什么样」去
+/// 匹配候选行，而那个映射只能有一处定义 —— 复制一份到 restore 里，两边一漂移就是
+/// 「查不到自己刚写的行」。函数体逐字节未动。
+pub(crate) fn normalized_storage_source_parts(
     source_id: Option<&str>,
     origin_kind: Option<&str>,
     origin_host: Option<&str>,
@@ -14343,6 +14482,598 @@ fn franken_update_conversation_token_summaries_in_tx(
     Ok(())
 }
 
+// -------------------------------------------------------------------------
+// E5 · replace 专用存储函数（plan Task E5 Step 2，裁定 R1 选 A）
+//
+// 基线的三个候选入口都不能当 replace 用（现读复核见 E5b 台账 P2.0.2）：
+// `insert_conversation_tree` 不写 `token_usage` / `message_metrics`；
+// `insert_conversations_batched` 先读缓存 tail 做 append/no-op 规划、且自带事务；
+// `rebuild_analytics` 把 `message_metrics` 的删除与三张 rollup 捆进一次全量重建。
+// -------------------------------------------------------------------------
+
+/// replace 侧显式绑 `id` 的单行 INSERT。
+///
+/// 列表相对基线批量 INSERT（`message_insert_batch_sql`）只多打头一个 `id` ——
+/// 显式绑 `id` 是必接② 的落地（新 id 必须越过 replace 之前的全局 max，
+/// 否则 `messages.id` 无 `AUTOINCREMENT`、删后 id 会被回收复用，
+/// 而 `content-v1` 指纹的第三分量取 `MAX(messages.id)`，复用即指纹不动）。
+/// 两份列表的同步由 `e5_replace_message_insert_column_list_tracks_baseline` 机器守卫。
+// ⚠ 下面四个符号在非测试构建里还没有调用方，故显式 `allow(dead_code)`。
+// **这是 staged landing 的记账，不是把死代码放行。**
+//
+// **移除义务已从 E6 改挂 E8**（本棒实测更正）：E6 的编排确实把 `FrankenTransaction`
+// 传了进来，但**编排自己也还没有调用方**，dead-code 从可达根传递判定，于是整条链
+// 依旧不可达。真正的根是 E8 把 `mirror-restore --apply` 的 CLI 接上那一刻。
+// E9 的 clippy 门以「相对基线零新增告警」为判据，这几条属本 PR 新增，故在此消掉。
+const REPLACE_MESSAGE_INSERT_SQL: &str = "INSERT INTO messages(id, conversation_id, idx, role, author, created_at, content, extra_json, extra_bin) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)";
+
+/// `franken_replace_conversation_messages_in_tx` 的产出。
+pub(crate) struct ReplaceConversationMessagesOutcome {
+    /// 本次插入的 message id，按 `conv.messages` 顺序。
+    pub inserted_message_ids: Vec<i64>,
+    /// 被删掉的旧消息行数。
+    pub deleted_message_count: usize,
+}
+
+/// 把一个既有 conversation 的消息集整体替换成 `conv` 的内容。
+///
+/// 五条硬语义（plan Task E5 Step 2）：
+/// ① 接受调用方传入的 `FrankenTransaction`，**自己不开事务**；
+/// ② 在任何规划成形之前重置两处 tail（热表 + `conversations` 三列），且是赋值不是抬高；
+/// ③ 无条件全量插入，绕过 tail 规划器；
+/// ④ 事务内写 `token_usage` / `message_metrics` 与 `conversations` 的 11 个汇总列；
+/// ⑤ 保留 conversation ID。
+pub(crate) fn franken_replace_conversation_messages_in_tx(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+    agent_id: i64,
+    workspace_id: Option<i64>,
+    conv: &Conversation,
+    pricing_table: &PricingTable,
+) -> Result<ReplaceConversationMessagesOutcome> {
+    let normalized_conv = normalized_conversation_for_storage(conv);
+    let conv = normalized_conv.as_ref();
+
+    // 语义②：在任何规划成形之前重置两处 tail，且必须是**赋值**而不是单调抬高。
+    // 基线的两个更新器（`franken_update_conversation_tail_state` 与看似赋值的
+    // `franken_set_conversation_tail_state_after_append`）对 `conversations` 三列
+    // 都走单调抬高的 `franken_update_conversation_tail_columns`，**没有任何一个能把
+    // tail 降下来**；而缓存读取器 `franken_cached_existing_conversation_tail_metadata`
+    // 在热表未命中时会**回落**读这三列，所以只清热表会留下陈旧 legacy 值。
+    tx.execute_compat(
+        "DELETE FROM conversation_tail_state WHERE conversation_id = ?1",
+        fparams![conversation_id],
+    )?;
+    tx.execute_compat(
+        "UPDATE conversations
+         SET last_message_idx = NULL, last_message_created_at = NULL, ended_at = NULL
+         WHERE id = ?1",
+        fparams![conversation_id],
+    )?;
+
+    // 必接②：先记下 replace 之前的**全局** message id 水位。现算量，不持久化
+    // （Phase 0.2 已核：`messages` 无 `AUTOINCREMENT`、全仓无 `sqlite_sequence`）。
+    let old_global_max_message_id: i64 = tx.query_row_map(
+        "SELECT COALESCE(MAX(id), 0) FROM messages",
+        fparams![],
+        |row| row.get_typed(0),
+    )?;
+
+    // 删旧。`message_metrics` / `snippets` / `token_usage` 的 `message_id` 都带
+    // `ON DELETE CASCADE`；`token_usage` 另有一列 `conversation_id` 无外键，
+    // 故按基线 `cleanup_external_id_duplicates` 的做法再显式删一次（不依赖 cascade）。
+    let deleted_message_count = tx.execute_compat(
+        "DELETE FROM messages WHERE conversation_id = ?1",
+        fparams![conversation_id],
+    )?;
+    tx.execute_compat(
+        "DELETE FROM token_usage WHERE conversation_id = ?1",
+        fparams![conversation_id],
+    )?;
+
+    // 语义③：无条件全量插入，不查缓存 tail、不做 append/no-op 规划。
+    let conv_day_id = conversation_effective_started_at(conv)
+        .map(FrankenStorage::day_id_from_millis)
+        .unwrap_or(0);
+    let mut inserted_message_ids = Vec::with_capacity(conv.messages.len());
+    let mut token_entries: Vec<TokenUsageEntry> = Vec::with_capacity(conv.messages.len());
+    let mut metrics_entries: Vec<MessageMetricsEntry> = Vec::with_capacity(conv.messages.len());
+    for (offset, msg) in conv.messages.iter().enumerate() {
+        let message_id = old_global_max_message_id + 1 + offset as i64;
+        let (extra_json_str, extra_bin) = franken_message_insert_payload(msg)?;
+        tx.execute_compat(
+            REPLACE_MESSAGE_INSERT_SQL,
+            fparams![
+                message_id,
+                conversation_id,
+                msg.idx,
+                role_as_str(&msg.role),
+                msg.author.as_deref(),
+                msg.created_at,
+                msg.content.as_str(),
+                extra_json_str.as_deref(),
+                extra_bin.as_deref()
+            ],
+        )?;
+        franken_insert_snippets(tx, message_id, &msg.snippets)?;
+        inserted_message_ids.push(message_id);
+
+        let (token_entry, metrics_entry) = replace_derived_rows_for_message(
+            conv,
+            conversation_id,
+            agent_id,
+            workspace_id,
+            conv_day_id,
+            pricing_table,
+            message_id,
+            msg,
+        );
+        token_entries.push(token_entry);
+        metrics_entries.push(metrics_entry);
+    }
+
+    // 语义④：事务内写两张逐消息派生表与 `conversations` 的 11 个 token 汇总列。
+    // **五张累加型物化聚合表不在这一步**（`daily_stats` / `token_daily_stats` /
+    // `usage_hourly` / `usage_daily` / `usage_models_daily`）—— 按 E6 Step 1b
+    // 它们在事务**提交之后**失效并全量重算，本函数一行都不许碰。
+    franken_insert_token_usage_batched_in_tx(tx, &token_entries)?;
+    franken_insert_message_metrics_batched_in_tx(tx, &metrics_entries)?;
+
+    // 【选择】D-6（`appendix-w2-1.md` §D.5）：**无条件**重算 11 列，
+    // 不复制基线 append 路径上的 `has_any_tokens` 门 —— 旧行已被级联删除，
+    // 跳过重算会留下「汇总值来自已经不存在的行」的自相矛盾记录，且无约束报错。
+    // 顺序按规定 D-2 / D-3：必须排在级联删除之后、`token_usage` 落库之后。
+    franken_update_conversation_token_summaries_in_tx(tx, conversation_id)?;
+
+    // 语义② 的后半：两处 tail 都已被清成空，所以这里写什么就是什么 —— 既有的
+    // 「单调抬高」写法从 NULL 起等价于赋值，且因此能降下来（这正是先清后写的意义）。
+    //
+    // 用**收 `Option` 的**那对既有写入器，不用收三个 `i64` 的
+    // `franken_set_conversation_tail_state_after_append`：后者要求 idx 与 created_at
+    // 同时已知，而「消息没有时间戳」是本仓明确处理过的真实形态（`timestamp_data_incomplete`
+    // 那条分支）。用它会在那种输入上整段跳过，把已知的 idx 与 ended_at 一并丢掉。
+    let (tail_last_idx, tail_last_created_at) = conversation_tail_state(conv);
+    let tail_ended_at = conversation_tail_ended_at_candidate(conv);
+    franken_insert_conversation_tail_state(
+        tx,
+        conversation_id,
+        tail_ended_at,
+        tail_last_idx,
+        tail_last_created_at,
+    )?;
+    franken_update_conversation_tail_columns(
+        tx,
+        conversation_id,
+        tail_ended_at,
+        tail_last_idx,
+        tail_last_created_at,
+    )?;
+
+    Ok(ReplaceConversationMessagesOutcome {
+        inserted_message_ids,
+        deleted_message_count,
+    })
+}
+
+// -------------------------------------------------------------------------
+// E6 · restore 编排要用的四个存储原语（裁定 R-E-48：存储写点落本文件，
+// 编排留 `phase3_restore`；既有符号零改动，本批全部是新增 `pub(crate)`）
+// -------------------------------------------------------------------------
+
+/// 重建**第三处** tail 载体 `conversation_external_tail_lookup`。
+///
+/// E5 的 replace 函数按 plan 语义② 只管热表与 `conversations` 三列；这一张是
+/// External key 的直达缓存（`franken_find_existing_conversation_with_tail_by_key`
+/// 对 External key 直接从它取 tail），**留旧值会让下一次 append 插错位置**。
+///
+/// 与前两处同样的形态：**先清后写**。既有的两个写入器一个单调抬高、一个虽是赋值
+/// 但只在行存在时生效，都降不下来；清成 NULL 之后再走既有写入器，抬高即等于赋值。
+///
+/// 行不存在时（该会话没有 external id，或从未走过 append）本函数是 no-op ——
+/// 那张表是缓存，缺行时读取器自会回落，凭空补一行反而是在替基线做决定。
+pub(crate) fn franken_rebuild_external_conversation_tail_lookup_in_tx(
+    tx: &FrankenTransaction<'_>,
+    agent_id: i64,
+    conversation_id: i64,
+    conv: &Conversation,
+) -> Result<()> {
+    let Some(lookup_key) = conversation_external_lookup_key_for_conv(agent_id, conv) else {
+        return Ok(());
+    };
+
+    // ── R4 第 2 条 / 裁定 R-E-110 K2：先清掉挂在**旧键**上的行 ───────────
+    //
+    // 修前这个函数只在**新键**下更新既有行，**从不动旧键那一行**。而 replace 会重算
+    // 整份投影 —— `external_id` 变了，旧键那一行就成了一条挂在这条会话身上的**陈旧缓存**。
+    //
+    // 留着它不是「多一行缓存」：日后若有另一条会话**正当地**取到那个旧 id，
+    // 它会从这张表里读到**这条**会话的 tail 状态 —— 那是一个**错的答案**，而不是一次回落。
+    // （「缺行时读取器自会回落」这条既有论证只对**没有行**成立，对**有一行但是错的**不成立。）
+    //
+    // 按 `conversation_id` 清而不是按「推算出的旧键」清：旧键要从库里的旧值反推，
+    // 而**这条会话名下就不该有第二个键** —— 按 id 清是这件事的直接表达，
+    // 也免掉一次「反推对不对」的证明义务。
+    tx.execute_compat(
+        "DELETE FROM conversation_external_tail_lookup
+         WHERE conversation_id = ?1 AND lookup_key <> ?2",
+        fparams![conversation_id, lookup_key.as_str()],
+    )?;
+
+    tx.execute_compat(
+        "UPDATE conversation_external_tail_lookup
+         SET ended_at = NULL, last_message_idx = NULL, last_message_created_at = NULL
+         WHERE lookup_key = ?1",
+        fparams![lookup_key.as_str()],
+    )?;
+
+    let (last_idx, last_created_at) = conversation_tail_state(conv);
+    let ended_at = conversation_tail_ended_at_candidate(conv);
+    franken_update_external_conversation_tail_lookup_key(
+        tx,
+        &lookup_key,
+        ended_at,
+        last_idx,
+        last_created_at,
+    )
+}
+
+/// 按附录 §B.1.2 的逐行动作更新 conversation 级字段。
+///
+/// 逐列动作：`title` / `started_at` / `ended_at` **重算**（取投影产物的值 ——
+/// 推导规则在 connector 侧，**本函数不重推导**，重推导即第二定义）、
+/// `workspace_id` / `metadata` **替换**、`approx_tokens` **置 NULL**
+/// （§B.1.2 末行：与 ingest 行为一致，`map_to_internal_with_redactor` 恒写 `None`）。
+///
+/// `metadata` 的落盘形态复用既有的 `franken_metadata_insert_payload`，不在这里重拼
+/// json/msgpack 的二选一规则。
+///
+/// **不碰的列**：`id`（保留原值）、11 个 token 汇总列（E5 已重算）、三个 tail 列
+/// （E5 的语义② 已经写过；这里再写一次会把它们从赋值语义打回抬高语义）。
+pub(crate) fn franken_update_conversation_projection_fields_in_tx(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+    agent_id: i64,
+    workspace_id: Option<i64>,
+    conv: &Conversation,
+) -> Result<()> {
+    let (metadata_json_str, metadata_bin) = franken_metadata_insert_payload(&conv.metadata_json)?;
+
+    // ── R4 第 2 条 / 裁定 R-E-110 K2：重算出来的 `external_id` 必须写回 ──
+    //
+    // 修前这条 `UPDATE` 的列表里**没有** `external_id`，而 `phase3_restore` 开头明写
+    // 它是**写入身份四元组**之一（`source_id` / `agent_slug` / `external_id` /
+    // `original_path`）。留旧值的后果不是「一个字段旧了」：下一次正常摄入按**新**的
+    // 外部 id 去查，查不到那一行，于是**插一条重复的** —— 正是路径规范化那套机制
+    // 存在的理由被绕过。与 R2 第 4 条「同一份身份，查候选绑三维、发布只绑一维」同型。
+    //
+    // **`None` 时不写**：投影没能推出外部 id 时，把库里既有的值抹成 `NULL`
+    // 是在**减少**可用的身份信息，而这条缺陷说的是「别留旧的」，不是「宁可没有」。
+    // 这个不对称是有意的，写在这里免得下一个人把它读成漏改。
+    if let Some(external_id) = conv.external_id.as_deref() {
+        // `UNIQUE(source_id, agent_id, external_id)` 在这张表上：先查后做，
+        // 让冲突死在**一句说得清的话**上，而不是一条裸的约束错误。
+        let clashing: Option<i64> = tx
+            .query_row_map(
+                "SELECT id FROM conversations
+                 WHERE source_id = ?1 AND agent_id = ?2 AND external_id = ?3 AND id <> ?4",
+                fparams![
+                    conv.source_id.as_str(),
+                    agent_id,
+                    external_id,
+                    conversation_id
+                ],
+                |row| row.get_typed(0),
+            )
+            .optional()?;
+        if let Some(other) = clashing {
+            anyhow::bail!(
+                "E-EXTERNAL-ID-CLASH: conversation {conversation_id} would take external_id \
+                 {external_id:?} (source {}, agent {agent_id}) but row {other} already holds it \
+                 — two rows claiming one write identity is a data-integrity condition, \
+                 not something this replace may paper over",
+                conv.source_id
+            );
+        }
+        tx.execute_compat(
+            "UPDATE conversations SET external_id = ?1 WHERE id = ?2",
+            fparams![external_id, conversation_id],
+        )?;
+    }
+    tx.execute_compat(
+        "UPDATE conversations
+         SET title = ?1,
+             workspace_id = ?2,
+             started_at = ?3,
+             approx_tokens = NULL,
+             metadata_json = ?4,
+             metadata_bin = ?5
+         WHERE id = ?6",
+        fparams![
+            conv.title.as_deref(),
+            workspace_id,
+            conv.started_at,
+            metadata_json_str.as_deref(),
+            metadata_bin.as_deref(),
+            conversation_id
+        ],
+    )?;
+    Ok(())
+}
+
+/// 推进 DB 的内容代际（`meta` 表的 `source_content_generation`）。
+///
+/// key 常量由 E1 落，**调用方只能引用不得自由构造**（声明侧取值域封闭且静态）。
+pub(crate) fn franken_set_source_content_generation_in_tx(
+    tx: &FrankenTransaction<'_>,
+    generation: &str,
+) -> Result<()> {
+    tx.execute_compat(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+        fparams![SOURCE_CONTENT_GENERATION_META_KEY, generation],
+    )?;
+    Ok(())
+}
+
+/// 写一条 operation commit receipt。**必须与 DB 动作同事务**——它记的是
+/// 「这次事务已提交」这个事实，跨事务写就失去了它存在的理由。
+///
+/// `idempotency_key` 上有 UNIQUE：同一 key 二次插入会硬失败，而不是静默覆盖。
+/// 这是有意的 —— 幂等的实现方式是**先查后做**，不是「重复写入被吞掉」。
+pub(crate) fn franken_insert_operation_commit_receipt_in_tx(
+    tx: &FrankenTransaction<'_>,
+    idempotency_key: &str,
+    operation: &str,
+    state: &str,
+    snapshot_root: Option<&str>,
+    committed_at_ms: i64,
+    detail: Option<&str>,
+) -> Result<()> {
+    tx.execute_compat(
+        "INSERT INTO operation_commit_receipt
+             (idempotency_key, operation, state, snapshot_root, committed_at_ms, detail)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+        fparams![
+            idempotency_key,
+            operation,
+            state,
+            snapshot_root,
+            committed_at_ms,
+            detail
+        ],
+    )?;
+    Ok(())
+}
+
+/// 查一条 receipt 是否已存在（幂等判据的读侧）。
+///
+/// **恢复器要能在崩溃后由全新进程只读判「已提交」**，所以这条查询只依赖
+/// `idempotency_key` 一个入参，不依赖任何内存状态。
+pub(crate) fn franken_operation_commit_receipt_exists(
+    conn: &FrankenConnection,
+    idempotency_key: &str,
+) -> Result<bool> {
+    let found: Option<i64> = conn
+        .query_row_map(
+            "SELECT 1 FROM operation_commit_receipt WHERE idempotency_key = ?1",
+            fparams![idempotency_key],
+            |row| row.get_typed(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
+}
+
+/// Step 1b · 只重算三张 usage rollup，**不碰 `message_metrics`**。
+///
+/// plan Task E6 Step 1b 明令**不得经 `rebuild_analytics`** —— 它在同一事务里把
+/// `message_metrics` 的 DELETE 与三张 rollup 的 DELETE 捆成一次全量重建，而
+/// `message_metrics` 按 E5 语义④ 是**事务内、逐消息写、用另一套分桶公式**，
+/// 照字面调用会让它被两套公式各写一遍。
+///
+/// **不自己写 GROUP BY**：rollup 的聚合口径已经有唯一定义（`AnalyticsRollupAggregator`
+/// 的 `record` + `franken_flush_analytics_rollups_in_tx`），这里把 `message_metrics`
+/// 的行读回来重新喂给它，于是三张 rollup 仍然是那一份定义的产物，没有第二份。
+///
+/// 规模说明：它扫全表 `message_metrics`。restore 的量级下可接受；若将来要按会话增量
+/// 重算，那是另一个函数，不是把这个改成半增量 —— 半增量会重新引入「删旧没扣干净」。
+pub(crate) fn franken_recompute_usage_rollups_from_message_metrics(
+    storage: &FrankenStorage,
+) -> Result<usize> {
+    let entries: Vec<MessageMetricsEntry> = storage.conn.query_map_collect(
+        "SELECT message_id, created_at_ms, hour_id, day_id, agent_slug, workspace_id,
+                source_id, role, content_chars, content_tokens_est, model_name,
+                model_family, model_tier, provider, api_input_tokens, api_output_tokens,
+                api_cache_read_tokens, api_cache_creation_tokens, api_thinking_tokens,
+                api_service_tier, api_data_source, tool_call_count, has_tool_calls, has_plan
+         FROM message_metrics
+         ORDER BY message_id",
+        fparams![],
+        |row| {
+            Ok(MessageMetricsEntry {
+                message_id: row.get_typed(0)?,
+                created_at_ms: row.get_typed(1)?,
+                hour_id: row.get_typed(2)?,
+                day_id: row.get_typed(3)?,
+                agent_slug: row.get_typed(4)?,
+                workspace_id: row.get_typed(5)?,
+                source_id: row.get_typed(6)?,
+                role: row.get_typed(7)?,
+                content_chars: row.get_typed(8)?,
+                content_tokens_est: row.get_typed(9)?,
+                model_name: row.get_typed(10)?,
+                model_family: row.get_typed(11)?,
+                model_tier: row.get_typed(12)?,
+                provider: row.get_typed(13)?,
+                api_input_tokens: row.get_typed(14)?,
+                api_output_tokens: row.get_typed(15)?,
+                api_cache_read_tokens: row.get_typed(16)?,
+                api_cache_creation_tokens: row.get_typed(17)?,
+                api_thinking_tokens: row.get_typed(18)?,
+                api_service_tier: row.get_typed(19)?,
+                api_data_source: row.get_typed(20)?,
+                tool_call_count: row.get_typed(21)?,
+                has_tool_calls: row.get_typed::<i64>(22)? != 0,
+                has_plan: row.get_typed::<i64>(23)? != 0,
+            })
+        },
+    )?;
+
+    let mut agg = AnalyticsRollupAggregator::new();
+    for entry in &entries {
+        agg.record(entry);
+    }
+
+    let mut tx = storage.conn.transaction()?;
+    for table in ["usage_hourly", "usage_daily", "usage_models_daily"] {
+        tx.execute_compat(&format!("DELETE FROM {table}"), fparams![])?;
+    }
+    let (hourly, daily, models_daily) = franken_flush_analytics_rollups_in_tx(&tx, &agg)?;
+    tx.commit()?;
+
+    Ok(hourly + daily + models_daily)
+}
+
+/// replace 侧逐消息派生 `token_usage` / `message_metrics` 两行。
+///
+/// **这是基线派生逻辑的第二份定义**（裁定 R-E-41 选 A′）。基线那份是
+/// `insert_conversations_batched` 的内联块，且同时喂 `AnalyticsRollupAggregator` /
+/// `TokenStatsAggregator` / `PricingDiagnostics` —— 那三者写的是五张累加型物化聚合表
+/// 与 `token_daily_stats`，按 E6 Step 1b **不进 replace 的事务**，所以整块复用不可能。
+/// 两份定义的漂移由 `e5_replace_derived_rows_match_baseline_path` 逐列等价门守住。
+///
+/// 逐列口径出处：`appendix-w2-0.md` §C.4（`token_usage`）与 §C.5（`message_metrics`）。
+#[allow(clippy::too_many_arguments)]
+fn replace_derived_rows_for_message(
+    conv: &Conversation,
+    conversation_id: i64,
+    agent_id: i64,
+    workspace_id: Option<i64>,
+    conv_day_id: i64,
+    pricing_table: &PricingTable,
+    message_id: i64,
+    msg: &Message,
+) -> (TokenUsageEntry, MessageMetricsEntry) {
+    let role_s = role_str(&msg.role);
+
+    // W2-0 §C.4：抽取器之前的那道闸必须照搬 —— 命中历史 raw-line 信封时传 Null，
+    // 且第一个实参是投影产出的 `conv.agent_slug`，不是回查 `agents` 表的值。
+    let usage = if historical_raw_json(&msg.extra_json).is_some() {
+        crate::connectors::extract_tokens_for_agent(
+            &conv.agent_slug,
+            &serde_json::Value::Null,
+            &msg.content,
+            &role_s,
+        )
+    } else {
+        crate::connectors::extract_tokens_for_agent(
+            &conv.agent_slug,
+            &msg.extra_json,
+            &msg.content,
+            &role_s,
+        )
+    };
+
+    let msg_ts = msg
+        .created_at
+        .or(conversation_effective_started_at(conv))
+        .unwrap_or(0);
+    let msg_day_id = if msg_ts > 0 {
+        FrankenStorage::day_id_from_millis(msg_ts)
+    } else {
+        conv_day_id
+    };
+
+    let model_info = usage
+        .model_name
+        .as_deref()
+        .map(crate::connectors::normalize_model);
+
+    let model_family = model_info
+        .as_ref()
+        .map(|i| i.family.clone())
+        .unwrap_or_else(|| "unknown".into());
+    let model_tier = model_info
+        .as_ref()
+        .map(|i| i.tier.clone())
+        .unwrap_or_else(|| "unknown".into());
+    let provider = usage
+        .provider
+        .clone()
+        .or_else(|| model_info.as_ref().map(|i| i.provider.clone()))
+        .unwrap_or_else(|| "unknown".into());
+
+    let estimated_cost = pricing_table.compute_cost(
+        usage.model_name.as_deref(),
+        msg_day_id,
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.cache_read_tokens,
+        usage.cache_creation_tokens,
+    );
+
+    let content_chars = msg.content.len() as i64;
+    let content_tokens_est = content_chars / 4;
+    let msg_hour_id = FrankenStorage::hour_id_from_millis(msg_ts);
+    let has_plan = has_plan_for_role(&role_s, &msg.content);
+
+    let token_entry = TokenUsageEntry {
+        message_id,
+        conversation_id,
+        agent_id,
+        workspace_id,
+        source_id: conv.source_id.clone(),
+        timestamp_ms: msg_ts,
+        day_id: msg_day_id,
+        model_name: usage.model_name.clone(),
+        model_family: Some(model_family.clone()),
+        model_tier: Some(model_tier.clone()),
+        service_tier: usage.service_tier.clone(),
+        provider: Some(provider.clone()),
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cache_read_tokens: usage.cache_read_tokens,
+        cache_creation_tokens: usage.cache_creation_tokens,
+        thinking_tokens: usage.thinking_tokens,
+        total_tokens: usage.total_tokens(),
+        estimated_cost_usd: estimated_cost,
+        role: role_s.to_string(),
+        content_chars,
+        has_tool_calls: usage.has_tool_calls,
+        tool_call_count: usage.tool_call_count,
+        data_source: usage.data_source.as_str().to_string(),
+    };
+
+    let metrics_entry = MessageMetricsEntry {
+        message_id,
+        created_at_ms: msg_ts,
+        hour_id: msg_hour_id,
+        day_id: msg_day_id,
+        agent_slug: conv.agent_slug.clone(),
+        // W2-0 §C.5：本表 `workspace_id` 是 `NOT NULL DEFAULT 0`，NULL 折叠成 0；
+        // `token_usage.workspace_id` 可空不折叠。两表不可复用同一份空值处置。
+        workspace_id: workspace_id.unwrap_or(0),
+        source_id: conv.source_id.clone(),
+        role: role_s.to_string(),
+        content_chars,
+        content_tokens_est,
+        model_name: usage.model_name.clone(),
+        model_family,
+        model_tier,
+        provider,
+        api_input_tokens: usage.input_tokens,
+        api_output_tokens: usage.output_tokens,
+        api_cache_read_tokens: usage.cache_read_tokens,
+        api_cache_creation_tokens: usage.cache_creation_tokens,
+        api_thinking_tokens: usage.thinking_tokens,
+        api_service_tier: usage.service_tier.clone(),
+        api_data_source: usage.data_source.as_str().to_string(),
+        tool_call_count: usage.tool_call_count as i64,
+        has_tool_calls: usage.has_tool_calls,
+        has_plan,
+    };
+
+    (token_entry, metrics_entry)
+}
+
 impl FrankenStorage {
     /// Rebuild token_daily_stats from the token_usage ledger.
     pub fn rebuild_token_daily_stats(&self) -> Result<usize> {
@@ -16413,6 +17144,58 @@ mod tests {
         }
     }
 
+    /// FIND-11 / 裁定 R-E-86 ②：**交错持有的两个 guard 不得留下谁都没请求的值**。
+    ///
+    /// 这条是**确定性**判据，不靠竞态复现：在同一个线程里手工把两个 guard 的
+    /// 持有区间**交错**开（先进的先出，而不是后进先出），旧实现
+    /// （`swap` + `Drop{store(previous)}`）会在最后一个 guard 释放之后
+    /// 把 `true` 永久留在进程级全局里 —— 此后本进程所有受该开关门控的分析写入
+    /// （`daily_stats` / `token_usage` / `token_daily_stats` / `message_metrics` /
+    /// 三张 usage rollup）全部静默跳过，没有日志、没有报错、没有自愈路径。
+    ///
+    /// 第二段是**非回归**断言：同线程严格嵌套的语义必须原样保留（内层出门后恢复外层的值）。
+    /// 它挡的是「用一个纯深度计数去修交错」那种改法 —— 那样改会让内层 guard 的
+    /// `Drop` 不再恢复外层的值，交错修好了、嵌套坏了。
+    #[test]
+    #[serial]
+    fn defer_analytics_guards_never_leak_a_value_nobody_requested() {
+        let _defer_env = unset_env_var("CASS_DEFER_ANALYTICS_UPDATES");
+        let _inline_env = unset_env_var("CASS_INLINE_ANALYTICS_UPDATES");
+        assert!(
+            !defer_analytics_updates_enabled(),
+            "前置断言：本用例的起点必须是 inline（两个 env 已 unset、无 guard 在持有）"
+        );
+
+        // ── 交错：g_true 先进先出，g_false 后进后出 ──────────────────────
+        let g_true = default_defer_analytics_updates_guard(true);
+        let g_false = default_defer_analytics_updates_guard(false);
+        drop(g_true);
+        drop(g_false);
+        assert!(
+            !defer_analytics_updates_enabled(),
+            "全部 guard 释放之后必须回到初始值；旧实现在这里留下 true 并且再也不会自己回来"
+        );
+
+        // ── 非回归：同线程严格嵌套的语义不变 ────────────────────────────
+        let outer = default_defer_analytics_updates_guard(true);
+        {
+            let _inner = default_defer_analytics_updates_guard(false);
+            assert!(
+                !defer_analytics_updates_enabled(),
+                "内层 guard 持有期间以内层的值为准"
+            );
+        }
+        assert!(
+            defer_analytics_updates_enabled(),
+            "内层释放之后必须恢复外层请求的 true —— 纯深度计数的改法会在这里红"
+        );
+        drop(outer);
+        assert!(
+            !defer_analytics_updates_enabled(),
+            "外层也释放之后回到初始值"
+        );
+    }
+
     fn frontier_test_conversation(idx_created_at: &[(i64, Option<i64>)]) -> Conversation {
         Conversation {
             id: None,
@@ -18313,7 +19096,22 @@ mod tests {
     // =========================================================================
 
     #[test]
+    #[serial]
     fn analytics_ingest_populates_metrics_and_rollups() {
+        // FIND-10 / 裁定 R-E-86 ①：本用例断言分析表**有行**，而分析写入受一个
+        // **进程级**开关 `DEFAULT_DEFER_ANALYTICS_UPDATES` 门控，`run_index()`
+        // 一进门就把它翻成「延后」。所以本用例不能与任何跑索引的测试并发 ——
+        // `#[serial]` 就是干这个的：`--lib` 里所有能进 `run_index` 的测试都带
+        // `#[serial]`，入组即与它们互斥。
+        //
+        // **这里曾经还有一行 `default_defer_analytics_updates_guard(false)` 钉死，
+        // 已按实验撤掉**，三个实验各否掉它的一种「保护」说法：
+        //   M2 · 只留 `#[serial]`、撤钉死 → 定向复现 **0/8**（serial 一道就够）；
+        //   M1 · 只留钉死、撤 `#[serial]` → 仍然 **8/8 红**（持有者栈后 push 者生效，
+        //        索引测试的 guard 铺完 fixture 才 push，总比本用例开头的钉死来得晚）；
+        //   J2′ · 带钉死 + `CASS_DEFER_ANALYTICS_UPDATES=1` → **5/5 红**
+        //        （`defer_analytics_updates_enabled()` 里 env 判在 guard 之前，钉死管不着）。
+        // 留一个读起来像保护、实测不保护的东西在测试里，与写一条恒亮的假警报同罪。
         use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
         use std::path::PathBuf;
 
@@ -19444,7 +20242,22 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn insert_conversation_tree_recreates_daily_stats_after_manual_clear() {
+        // FIND-10 / 裁定 R-E-86 ①：本用例断言分析表**有行**，而分析写入受一个
+        // **进程级**开关 `DEFAULT_DEFER_ANALYTICS_UPDATES` 门控，`run_index()`
+        // 一进门就把它翻成「延后」。所以本用例不能与任何跑索引的测试并发 ——
+        // `#[serial]` 就是干这个的：`--lib` 里所有能进 `run_index` 的测试都带
+        // `#[serial]`，入组即与它们互斥。
+        //
+        // **这里曾经还有一行 `default_defer_analytics_updates_guard(false)` 钉死，
+        // 已按实验撤掉**，三个实验各否掉它的一种「保护」说法：
+        //   M2 · 只留 `#[serial]`、撤钉死 → 定向复现 **0/8**（serial 一道就够）；
+        //   M1 · 只留钉死、撤 `#[serial]` → 仍然 **8/8 红**（持有者栈后 push 者生效，
+        //        索引测试的 guard 铺完 fixture 才 push，总比本用例开头的钉死来得晚）；
+        //   J2′ · 带钉死 + `CASS_DEFER_ANALYTICS_UPDATES=1` → **5/5 红**
+        //        （`defer_analytics_updates_enabled()` 里 env 判在 guard 之前，钉死管不着）。
+        // 留一个读起来像保护、实测不保护的东西在测试里，与写一条恒亮的假警报同罪。
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test.db");
         let storage = SqliteStorage::open(&db_path).unwrap();
@@ -27468,7 +28281,22 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn franken_insert_conversations_batched_populates_analytics_rollups() {
+        // FIND-10 / 裁定 R-E-86 ①：本用例断言分析表**有行**，而分析写入受一个
+        // **进程级**开关 `DEFAULT_DEFER_ANALYTICS_UPDATES` 门控，`run_index()`
+        // 一进门就把它翻成「延后」。所以本用例不能与任何跑索引的测试并发 ——
+        // `#[serial]` 就是干这个的：`--lib` 里所有能进 `run_index` 的测试都带
+        // `#[serial]`，入组即与它们互斥。
+        //
+        // **这里曾经还有一行 `default_defer_analytics_updates_guard(false)` 钉死，
+        // 已按实验撤掉**，三个实验各否掉它的一种「保护」说法：
+        //   M2 · 只留 `#[serial]`、撤钉死 → 定向复现 **0/8**（serial 一道就够）；
+        //   M1 · 只留钉死、撤 `#[serial]` → 仍然 **8/8 红**（持有者栈后 push 者生效，
+        //        索引测试的 guard 铺完 fixture 才 push，总比本用例开头的钉死来得晚）；
+        //   J2′ · 带钉死 + `CASS_DEFER_ANALYTICS_UPDATES=1` → **5/5 红**
+        //        （`defer_analytics_updates_enabled()` 里 env 判在 guard 之前，钉死管不着）。
+        // 留一个读起来像保护、实测不保护的东西在测试里，与写一条恒亮的假警报同罪。
         use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
         use frankensqlite::compat::{ConnectionExt, RowExt};
         use std::path::PathBuf;
@@ -28272,5 +29100,1360 @@ mod tests {
             })
             .unwrap();
         assert_eq!(metrics_after, 0);
+    }
+    // =========================================================================
+    // Task E1 · W1 migration delta (上位契约 §20.1(b) D1 / D2)
+    //
+    // D1: operation receipt 表 + 幂等 key 唯一约束
+    // D2: meta 表的 source content generation 保留 key
+    // =========================================================================
+
+    #[test]
+    fn migration_creates_operation_commit_receipt_table() {
+        let storage = franken_storage_in_memory();
+
+        // 表必须存在且可查。表不存在时这一步返回 Err，正是 Step 1 的红。
+        storage
+            .raw()
+            .query("SELECT idempotency_key FROM operation_commit_receipt LIMIT 1;")
+            .expect("operation_commit_receipt table must exist after migrations");
+
+        assert_eq!(
+            storage.schema_version().unwrap(),
+            CURRENT_SCHEMA_VERSION,
+            "migration 跑完必须停在 CURRENT_SCHEMA_VERSION"
+        );
+    }
+
+    #[test]
+    fn operation_commit_receipt_rejects_duplicate_idempotency_key() {
+        let storage = franken_storage_in_memory();
+
+        let insert = |key: &str| {
+            storage.raw().execute_compat(
+                "INSERT INTO operation_commit_receipt \
+                 (idempotency_key, operation, state, committed_at_ms) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                fparams![key, "mirror-relink", "committed", 1_710_000_000_000i64],
+            )
+        };
+
+        insert("w1-relink-0001").expect("first insert must succeed");
+
+        // 唯一约束必须以它自己的名义拒绝——断言具体错误文本，不用宽接。
+        let err = insert("w1-relink-0001")
+            .expect_err("duplicate idempotency_key must be rejected by the unique constraint");
+        let text = format!("{err:#}").to_ascii_lowercase();
+        assert!(
+            text.contains("unique") || text.contains("constraint"),
+            "拒绝理由必须是唯一约束违反，实得: {err:#}"
+        );
+
+        // 拒绝之后表里只能有第一条，不得留下半条。
+        let count: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM operation_commit_receipt WHERE idempotency_key = ?1",
+                fparams!["w1-relink-0001"],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "唯一约束拒绝后不得多出行");
+    }
+
+    #[test]
+    fn source_content_generation_meta_key_roundtrips_and_survives_runtime_clears() {
+        let storage = franken_storage_in_memory();
+
+        // 保留 key 的字面量由静态常量定义，调用方只能引用不得自由构造
+        // （矩阵配套条：声明侧的取值域必须封闭且静态）。
+        let key = SOURCE_CONTENT_GENERATION_META_KEY;
+        assert_eq!(key, "source_content_generation");
+
+        storage
+            .raw()
+            .execute_compat(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                fparams![key, "gen-2026-08-18-abc"],
+            )
+            .unwrap();
+
+        let read_back = |storage: &FrankenStorage| -> Option<String> {
+            storage
+                .raw()
+                .query_row_map(
+                    "SELECT value FROM meta WHERE key = ?1",
+                    fparams![SOURCE_CONTENT_GENERATION_META_KEY],
+                    |row| row.get_typed::<String>(0),
+                )
+                .ok()
+        };
+
+        assert_eq!(
+            read_back(&storage).as_deref(),
+            Some("gen-2026-08-18-abc"),
+            "写入后必须原样读回"
+        );
+
+        // 它是「保留」key：既有两条运行时清理路径都不得把它抹掉。
+        clear_seeded_runtime_meta(storage.raw()).unwrap();
+        assert_eq!(
+            read_back(&storage).as_deref(),
+            Some("gen-2026-08-18-abc"),
+            "clear_seeded_runtime_meta 不得清掉内容代际保留 key"
+        );
+
+        storage
+            .restore_scan_watermarks(&[("last_scan_ts".to_string(), "17".to_string())])
+            .unwrap();
+        assert_eq!(
+            read_back(&storage).as_deref(),
+            Some("gen-2026-08-18-abc"),
+            "restore_scan_watermarks 不得清掉内容代际保留 key"
+        );
+    }
+}
+
+// =========================================================================
+// E5 Phase 2 · replace 专用存储函数的五条硬语义 + 必接②
+//
+// plan Task E5 Step 2 的五条语义逐条一测；「新 message id 越全局 max +
+// replace 后指纹必变」为必接②。测试口径出处：
+//   - `token_usage` / `message_metrics` 逐列 → `appendix-w2-0.md` §C.4 / §C.5
+//   - `conversations` 11 个 token 汇总列   → `appendix-w2-1.md` §D.4（含规定 D-0）
+// =========================================================================
+#[cfg(test)]
+mod e5_replace_tests {
+    use super::*;
+    use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+    use serial_test::serial;
+    use std::collections::{HashMap, HashSet};
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    const TS: i64 = 1_770_551_400_000; // 2026-02-06 10:30:00 UTC
+
+    fn open_storage(dir: &TempDir) -> (FrankenStorage, i64) {
+        let db_path = dir.path().join("e5-replace.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        let agent = Agent {
+            id: None,
+            slug: "claude_code".into(),
+            name: "Claude Code".into(),
+            version: Some("1.0".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        (storage, agent_id)
+    }
+
+    fn msg(idx: i64, role: MessageRole, content: &str, extra: serde_json::Value) -> Message {
+        Message {
+            id: None,
+            idx,
+            role,
+            author: None,
+            created_at: Some(TS + idx * 1_000),
+            content: content.into(),
+            extra_json: extra,
+            snippets: vec![],
+        }
+    }
+
+    fn conversation(external_id: &str, messages: Vec<Message>) -> Conversation {
+        Conversation {
+            id: None,
+            agent_slug: "claude_code".into(),
+            workspace: None,
+            external_id: Some(external_id.into()),
+            title: Some("E5 replace fixture".into()),
+            source_path: PathBuf::from("/fixtures/e5-replace.jsonl"),
+            started_at: Some(TS),
+            ended_at: Some(TS + 60_000),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages,
+            source_id: "local".into(),
+            origin_host: None,
+        }
+    }
+
+    fn conv_id_of(storage: &FrankenStorage, external_id: &str) -> i64 {
+        storage
+            .raw()
+            .query_row_map(
+                "SELECT id FROM conversations WHERE external_id = ?1",
+                fparams![external_id],
+                |row| row.get_typed::<i64>(0),
+            )
+            .unwrap()
+    }
+
+    fn message_rows(storage: &FrankenStorage, conv_id: i64) -> Vec<(i64, i64, String)> {
+        storage
+            .raw()
+            .query_map_collect(
+                "SELECT id, idx, content FROM messages WHERE conversation_id = ?1 ORDER BY idx",
+                fparams![conv_id],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+            )
+            .unwrap()
+    }
+
+    /// 指纹三分量（`content-v1:{会话数}:{MAX(conv.id)}:{MAX(msg.id)}`）。
+    /// 格式串本身锚在 `src/indexer/mod.rs::lexical_rebuild_content_fingerprint_value`；
+    /// 本测试只取它的三个输入分量，**不复刻格式串**（避免第二定义）。
+    fn fingerprint_components(storage: &FrankenStorage) -> (i64, i64, i64) {
+        let conn = storage.raw();
+        let total: i64 = conn
+            .query_row_map("SELECT COUNT(*) FROM conversations", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        let max_conv: i64 = conn
+            .query_row_map(
+                "SELECT COALESCE(MAX(id), 0) FROM conversations",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        let max_msg: i64 = conn
+            .query_row_map(
+                "SELECT COALESCE(MAX(id), 0) FROM messages",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        (total, max_conv, max_msg)
+    }
+
+    fn seed_original(storage: &FrankenStorage, agent_id: i64, external_id: &str) -> i64 {
+        let conv = conversation(
+            external_id,
+            vec![
+                msg(0, MessageRole::User, "旧消息 0", serde_json::Value::Null),
+                msg(1, MessageRole::Agent, "旧消息 1", serde_json::Value::Null),
+                msg(2, MessageRole::User, "旧消息 2", serde_json::Value::Null),
+            ],
+        );
+        let outcomes = storage
+            .insert_conversations_batched(&[(agent_id, None, &conv)])
+            .unwrap();
+        assert_eq!(outcomes.len(), 1);
+        conv_id_of(storage, external_id)
+    }
+
+    fn replacement(external_id: &str) -> Conversation {
+        conversation(
+            external_id,
+            vec![
+                msg(0, MessageRole::User, "新消息 0", serde_json::Value::Null),
+                msg(1, MessageRole::Agent, "新消息 1", serde_json::Value::Null),
+            ],
+        )
+    }
+
+    // ---------------------------------------------------------------------
+    // 语义 ①：接受外部事务，自己不开事务
+    // ---------------------------------------------------------------------
+    #[test]
+    fn e5_replace_runs_inside_caller_transaction_and_is_undone_by_its_rollback() {
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open_storage(&dir);
+        let conv_id = seed_original(&storage, agent_id, "tx-scope");
+        let before = message_rows(&storage, conv_id);
+        assert_eq!(before.len(), 3, "前置：原会话应有 3 条消息");
+
+        let new_conv = replacement("tx-scope");
+        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+        {
+            let mut tx = storage.raw().transaction().unwrap();
+            franken_replace_conversation_messages_in_tx(
+                &tx, conv_id, agent_id, None, &new_conv, &pricing,
+            )
+            .unwrap();
+
+            // 同一事务内可见：证明写确实发生了（否则下面的回滚断言是空转）。
+            let in_tx: i64 = tx
+                .query_row_map(
+                    "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1",
+                    fparams![conv_id],
+                    |row| row.get_typed(0),
+                )
+                .unwrap();
+            assert_eq!(in_tx, 2, "事务内应看得到 replace 后的 2 条新消息");
+
+            tx.rollback().unwrap();
+        }
+
+        // 若函数自带事务（自己 commit 了），外层回滚就撤不掉它。
+        let after = message_rows(&storage, conv_id);
+        assert_eq!(
+            after, before,
+            "外层事务回滚后必须回到原状——不回到原状即说明函数自己开了事务并提交"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // 语义 ③：无条件全量插入，绕过 tail 规划器
+    // ---------------------------------------------------------------------
+    #[test]
+    fn e5_replace_inserts_full_set_where_tail_planner_would_plan_nothing() {
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open_storage(&dir);
+        let conv_id = seed_original(&storage, agent_id, "planner-noop");
+        let new_conv = replacement("planner-noop");
+
+        // 分辨力前置断言：同一份输入喂给基线的 tail 规划器，它计划插入 0 条。
+        // 不先证这一点，本测试就分不出「绕过了规划器」与「规划器本来就会插满」。
+        {
+            let mut tx = storage.raw().transaction().unwrap();
+            let mut by_idx: HashMap<i64, HashMap<i64, MessageMergeFingerprint>> = HashMap::new();
+            let mut replay: HashMap<i64, HashSet<MessageReplayFingerprint>> = HashMap::new();
+            let (plan, _, _) = franken_collect_batched_existing_new_messages(
+                &tx,
+                conv_id,
+                &new_conv,
+                &mut by_idx,
+                &mut replay,
+                "e5 planner probe",
+            )
+            .unwrap();
+            assert!(
+                plan.messages.is_empty(),
+                "前置断言失败：基线规划器并非计划插 0 条，本用例分辨不出语义 ③"
+            );
+            tx.rollback().unwrap();
+        }
+
+        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+        let mut tx = storage.raw().transaction().unwrap();
+        franken_replace_conversation_messages_in_tx(
+            &tx, conv_id, agent_id, None, &new_conv, &pricing,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let rows = message_rows(&storage, conv_id);
+        assert_eq!(rows.len(), 2, "必须全量插入 2 条，而不是按规划器判 no-op");
+        assert_eq!(rows[0].2, "新消息 0");
+        assert_eq!(rows[1].2, "新消息 1");
+    }
+
+    // ---------------------------------------------------------------------
+    // 语义 ⑤：保留 conversation ID，且不留孤儿
+    // ---------------------------------------------------------------------
+    #[test]
+    fn e5_replace_preserves_conversation_id_and_leaves_no_orphans() {
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open_storage(&dir);
+        let conv_id = seed_original(&storage, agent_id, "id-kept");
+        let new_conv = replacement("id-kept");
+
+        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+        let mut tx = storage.raw().transaction().unwrap();
+        franken_replace_conversation_messages_in_tx(
+            &tx, conv_id, agent_id, None, &new_conv, &pricing,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(
+            conv_id_of(&storage, "id-kept"),
+            conv_id,
+            "conversation ID 必须保留（与 E6 Step 1 的 ID 保留是同一条要求）"
+        );
+
+        let conn = storage.raw();
+        let conv_rows: i64 = conn
+            .query_row_map(
+                "SELECT COUNT(*) FROM conversations WHERE external_id = 'id-kept'",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(conv_rows, 1, "不得复制出第二行 conversation");
+
+        for (table, sql) in [
+            (
+                "message_metrics",
+                "SELECT COUNT(*) FROM message_metrics mm \
+                 WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.id = mm.message_id)",
+            ),
+            (
+                "token_usage",
+                "SELECT COUNT(*) FROM token_usage tu \
+                 WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.id = tu.message_id)",
+            ),
+            (
+                "snippets",
+                "SELECT COUNT(*) FROM snippets s \
+                 WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.id = s.message_id)",
+            ),
+        ] {
+            let orphans: i64 = conn
+                .query_row_map(sql, fparams![], |row| row.get_typed(0))
+                .unwrap();
+            assert_eq!(orphans, 0, "{table} 不得留下孤儿行");
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // 语义 ②：两处都重置 tail，且是赋值不是单调抬高
+    // ---------------------------------------------------------------------
+    #[test]
+    fn e5_replace_resets_hot_tail_table_and_legacy_columns_downward() {
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open_storage(&dir);
+        let conv_id = seed_original(&storage, agent_id, "tail-hot");
+
+        // 把两处 tail 都推到一个**高于**新内容的陈旧值。基线的两个更新器都是单调抬高，
+        // 所以只要 replace 之后这两处降下来了，就证明它做的是赋值而不是抬高。
+        {
+            let conn = storage.raw();
+            conn.execute_compat(
+                "UPDATE conversation_tail_state
+                 SET last_message_idx = 99, last_message_created_at = ?1, ended_at = ?1
+                 WHERE conversation_id = ?2",
+                fparams![TS + 900_000, conv_id],
+            )
+            .unwrap();
+            conn.execute_compat(
+                "UPDATE conversations
+                 SET last_message_idx = 99, last_message_created_at = ?1, ended_at = ?1
+                 WHERE id = ?2",
+                fparams![TS + 900_000, conv_id],
+            )
+            .unwrap();
+        }
+
+        let new_conv = replacement("tail-hot");
+        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+        let mut tx = storage.raw().transaction().unwrap();
+        franken_replace_conversation_messages_in_tx(
+            &tx, conv_id, agent_id, None, &new_conv, &pricing,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let conn = storage.raw();
+        let hot: (i64, i64) = conn
+            .query_row_map(
+                "SELECT last_message_idx, last_message_created_at
+                 FROM conversation_tail_state WHERE conversation_id = ?1",
+                fparams![conv_id],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )
+            .unwrap();
+        assert_eq!(hot.0, 1, "热表 last_message_idx 必须降到新内容的 max idx");
+        assert_eq!(hot.1, TS + 1_000);
+
+        let legacy: (i64, i64) = conn
+            .query_row_map(
+                "SELECT last_message_idx, last_message_created_at
+                 FROM conversations WHERE id = ?1",
+                fparams![conv_id],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            legacy.0, 1,
+            "`conversations` 的 legacy tail 列同样必须降下来——只重置热表会留下陈旧回落值"
+        );
+        assert_eq!(legacy.1, TS + 1_000);
+    }
+
+    #[test]
+    fn e5_replace_resets_legacy_columns_when_hot_tail_row_is_absent() {
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open_storage(&dir);
+        let conv_id = seed_original(&storage, agent_id, "tail-fallback");
+
+        // 回落路径：热表无行时 `franken_cached_existing_conversation_tail_metadata`
+        // 读 `conversations` 的三列。构造「热表空 + legacy 列陈旧」。
+        {
+            let conn = storage.raw();
+            conn.execute_compat(
+                "DELETE FROM conversation_tail_state WHERE conversation_id = ?1",
+                fparams![conv_id],
+            )
+            .unwrap();
+            conn.execute_compat(
+                "UPDATE conversations
+                 SET last_message_idx = 99, last_message_created_at = ?1, ended_at = ?1
+                 WHERE id = ?2",
+                fparams![TS + 900_000, conv_id],
+            )
+            .unwrap();
+        }
+
+        let new_conv = replacement("tail-fallback");
+        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+        let mut tx = storage.raw().transaction().unwrap();
+        franken_replace_conversation_messages_in_tx(
+            &tx, conv_id, agent_id, None, &new_conv, &pricing,
+        )
+        .unwrap();
+
+        // ⚠ 这里必须把 replace **写回的**热表行再删一次，否则读取器读的是热表、
+        // 根本走不到回落分支 —— 那样这条测试测的就是「热表被写回」而不是它名字声称的
+        // 「legacy 三列被重置」。（本棒实测：不删这一行时，去掉 legacy 重置的变异
+        // M2b 在这条测试上不转红，恰恰暴露了它没走回落。）
+        tx.execute_compat(
+            "DELETE FROM conversation_tail_state WHERE conversation_id = ?1",
+            fparams![conv_id],
+        )
+        .unwrap();
+
+        // 用真正的回落读取器判，而不是自己再写一遍 SQL。
+        let seen = franken_cached_existing_conversation_tail_metadata(&tx, conv_id).unwrap();
+        assert_eq!(
+            seen.last_message_idx,
+            Some(1),
+            "回落读取器必须读到重置后的新值；读到 99 即说明 legacy 三列没被重置"
+        );
+        assert_eq!(seen.last_message_created_at, Some(TS + 1_000));
+        tx.commit().unwrap();
+    }
+
+    // ---------------------------------------------------------------------
+    // 必接②：新 message id 越过全局 max，指纹分量必移动
+    // ---------------------------------------------------------------------
+    #[test]
+    fn e5_replace_assigns_message_ids_above_global_max_and_moves_fingerprint() {
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open_storage(&dir);
+        // 先放一个别的会话，再放被 replace 的那个——于是被 replace 的会话持有全局 max
+        // message id，这正是「删旧插新会复用回收 id」的引爆条件。
+        let _other = seed_original(&storage, agent_id, "other");
+        let conv_id = seed_original(&storage, agent_id, "fingerprint");
+
+        let before = fingerprint_components(&storage);
+        let old_global_max = before.2;
+        let old_ids: Vec<i64> = message_rows(&storage, conv_id)
+            .iter()
+            .map(|r| r.0)
+            .collect();
+        assert_eq!(
+            *old_ids.iter().max().unwrap(),
+            old_global_max,
+            "前置断言失败：被 replace 的会话没有持有全局 max message id，本用例分辨不出 id 复用"
+        );
+
+        let new_conv = replacement("fingerprint");
+        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+        let mut tx = storage.raw().transaction().unwrap();
+        franken_replace_conversation_messages_in_tx(
+            &tx, conv_id, agent_id, None, &new_conv, &pricing,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let new_ids: Vec<i64> = message_rows(&storage, conv_id)
+            .iter()
+            .map(|r| r.0)
+            .collect();
+        assert!(
+            new_ids.iter().all(|id| *id > old_global_max),
+            "新 message id 必须全部越过 replace 之前的全局 max（{old_global_max}），实得 {new_ids:?}"
+        );
+
+        let after = fingerprint_components(&storage);
+        assert_eq!(after.0, before.0, "会话数不变（replace 不新增会话）");
+        assert_eq!(after.1, before.1, "MAX(conversation_id) 不变（ID 保留）");
+        assert!(
+            after.2 > before.2,
+            "MAX(message_id) 必须严格增大——指纹是这三个分量的纯函数\
+             （锚 `src/indexer/mod.rs::lexical_rebuild_content_fingerprint_value`），\
+             三分量都不动则指纹逐字节相同、回滚保护失效"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // 第二定义守卫：显式 id 的 INSERT 列表必须与基线批量 INSERT 保持同步
+    // ---------------------------------------------------------------------
+    #[test]
+    fn e5_replace_message_insert_column_list_tracks_baseline() {
+        fn columns_of(sql: &str) -> Vec<String> {
+            let open = sql.find('(').expect("INSERT 语句里应有列表左括号");
+            let close = sql[open..].find(')').expect("列表右括号") + open;
+            sql[open + 1..close]
+                .split(',')
+                .map(|c| c.trim().to_string())
+                .collect()
+        }
+
+        let baseline = columns_of(message_insert_batch_sql(1));
+        let ours = columns_of(REPLACE_MESSAGE_INSERT_SQL);
+
+        assert_eq!(
+            ours.first().map(String::as_str),
+            Some("id"),
+            "replace 侧的唯一列差异应当是打头的显式 `id`"
+        );
+        assert_eq!(
+            &ours[1..],
+            baseline.as_slice(),
+            "replace 侧的 INSERT 列表除多一个 `id` 外必须与基线逐列一致——\
+             基线加列而这里没跟上即为静默漂移"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // 语义 ④：事务内写 token_usage / message_metrics / 11 个汇总列
+    // ---------------------------------------------------------------------
+
+    /// 逐列 digest。**排除口径（裁定 R-E-41 条件 2）**：
+    /// - `token_usage.id` 是自增代理键，replace 删旧插新必然分配新值，按
+    ///   `appendix-w2-0.md` §C.4 显式排除；
+    /// - `message_id` / `conversation_id` 是身份列，两条路径的取值按构造就不同，
+    ///   对齐方式是**按 `messages.idx` 排序**（见下方 JOIN），不进逐列比对。
+    const TOKEN_USAGE_DIGEST_SQL: &str = "SELECT COALESCE(CAST(tu.agent_id AS TEXT),'~') || '|' \
+         || COALESCE(CAST(tu.workspace_id AS TEXT),'~') || '|' || COALESCE(tu.source_id,'~') || '|' \
+         || COALESCE(CAST(tu.timestamp_ms AS TEXT),'~') || '|' || COALESCE(CAST(tu.day_id AS TEXT),'~') || '|' \
+         || COALESCE(tu.model_name,'~') || '|' || COALESCE(tu.model_family,'~') || '|' \
+         || COALESCE(tu.model_tier,'~') || '|' || COALESCE(tu.service_tier,'~') || '|' \
+         || COALESCE(tu.provider,'~') || '|' || COALESCE(CAST(tu.input_tokens AS TEXT),'~') || '|' \
+         || COALESCE(CAST(tu.output_tokens AS TEXT),'~') || '|' || COALESCE(CAST(tu.cache_read_tokens AS TEXT),'~') || '|' \
+         || COALESCE(CAST(tu.cache_creation_tokens AS TEXT),'~') || '|' || COALESCE(CAST(tu.thinking_tokens AS TEXT),'~') || '|' \
+         || COALESCE(CAST(tu.total_tokens AS TEXT),'~') || '|' || COALESCE(CAST(tu.estimated_cost_usd AS TEXT),'~') || '|' \
+         || COALESCE(tu.role,'~') || '|' || COALESCE(CAST(tu.content_chars AS TEXT),'~') || '|' \
+         || COALESCE(CAST(tu.has_tool_calls AS TEXT),'~') || '|' || COALESCE(CAST(tu.tool_call_count AS TEXT),'~') || '|' \
+         || COALESCE(tu.data_source,'~') \
+         FROM token_usage tu JOIN messages m ON m.id = tu.message_id ORDER BY m.idx";
+
+    const MESSAGE_METRICS_DIGEST_SQL: &str = "SELECT COALESCE(CAST(mm.created_at_ms AS TEXT),'~') || '|' \
+         || COALESCE(CAST(mm.hour_id AS TEXT),'~') || '|' || COALESCE(CAST(mm.day_id AS TEXT),'~') || '|' \
+         || COALESCE(mm.agent_slug,'~') || '|' || COALESCE(CAST(mm.workspace_id AS TEXT),'~') || '|' \
+         || COALESCE(mm.source_id,'~') || '|' || COALESCE(mm.role,'~') || '|' \
+         || COALESCE(CAST(mm.content_chars AS TEXT),'~') || '|' || COALESCE(CAST(mm.content_tokens_est AS TEXT),'~') || '|' \
+         || COALESCE(mm.model_name,'~') || '|' || COALESCE(mm.model_family,'~') || '|' \
+         || COALESCE(mm.model_tier,'~') || '|' || COALESCE(mm.provider,'~') || '|' \
+         || COALESCE(CAST(mm.api_input_tokens AS TEXT),'~') || '|' || COALESCE(CAST(mm.api_output_tokens AS TEXT),'~') || '|' \
+         || COALESCE(CAST(mm.api_cache_read_tokens AS TEXT),'~') || '|' || COALESCE(CAST(mm.api_cache_creation_tokens AS TEXT),'~') || '|' \
+         || COALESCE(CAST(mm.api_thinking_tokens AS TEXT),'~') || '|' || COALESCE(mm.api_service_tier,'~') || '|' \
+         || COALESCE(mm.api_data_source,'~') || '|' || COALESCE(CAST(mm.tool_call_count AS TEXT),'~') || '|' \
+         || COALESCE(CAST(mm.has_tool_calls AS TEXT),'~') || '|' || COALESCE(CAST(mm.has_plan AS TEXT),'~') \
+         FROM message_metrics mm JOIN messages m ON m.id = mm.message_id ORDER BY m.idx";
+
+    fn digest_rows(storage: &FrankenStorage, sql: &str) -> Vec<String> {
+        storage
+            .raw()
+            .query_map_collect(sql, fparams![], |row| row.get_typed::<String>(0))
+            .unwrap()
+    }
+
+    fn api_usage(
+        model: &str,
+        input: i64,
+        output: i64,
+        cache_read: i64,
+        cache_create: i64,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "message": {
+                "model": model,
+                "usage": {
+                    "input_tokens": input,
+                    "output_tokens": output,
+                    "cache_read_input_tokens": cache_read,
+                    "cache_creation_input_tokens": cache_create,
+                    "service_tier": "standard"
+                }
+            }
+        })
+    }
+
+    /// 分支覆盖样本（裁定 R-E-41 条件 1）。每条覆盖派生逻辑的一个分支：
+    ///
+    /// | idx | 分支 |
+    /// |---|---|
+    /// | 0 | 无 extra 的 user 消息 → 抽取器兜底 `estimate_tokens_from_content`（`data_source=estimated`、`model_name` NULL） |
+    /// | 1 | 带 API usage 的 assistant 消息（模型 A）→ `data_source=api`、`normalize_model` 走通 |
+    /// | 2 | 另一个模型（模型 B）→ `primary_model` 众数与 `model_family`/`tier` 的第二取值 |
+    /// | 3 | **`historical_raw_json` 信封** → 抽取器必须收到 `Value::Null`（W2-0 §C.4 那道闸） |
+    /// | 4 | `content` 为空且无 usage → `has_token_data()` 为假、五个 token 列全 NULL |
+    /// | 5 | `created_at` 缺失 → `msg_ts` 回落到会话 effective started_at（§B.2 回退规则 A） |
+    /// | 6 | assistant 且 content 含计划 → `has_plan` 为真 |
+    fn branch_coverage_messages() -> Vec<Message> {
+        let mut m3 = msg(
+            3,
+            MessageRole::Assistant,
+            "信封消息",
+            serde_json::Value::Null,
+        );
+        m3.extra_json = wrap_historical_raw_json("{\"raw\":\"line\"}".to_string());
+
+        let mut m5 = msg(
+            5,
+            MessageRole::User,
+            "缺时间戳的消息",
+            serde_json::Value::Null,
+        );
+        m5.created_at = None;
+
+        vec![
+            msg(
+                0,
+                MessageRole::User,
+                "0123456789abcdefghij",
+                serde_json::Value::Null,
+            ),
+            msg(
+                1,
+                MessageRole::Assistant,
+                "模型 A 的回答",
+                api_usage("claude-opus-4-6", 100, 50, 200, 30),
+            ),
+            msg(
+                2,
+                MessageRole::Assistant,
+                "模型 B 的回答",
+                api_usage("claude-sonnet-4-5", 7, 3, 0, 0),
+            ),
+            m3,
+            msg(4, MessageRole::Assistant, "", serde_json::Value::Null),
+            m5,
+            msg(
+                6,
+                MessageRole::Assistant,
+                "## Plan\n\n1. First step\n2. Second step\n3. Third step",
+                serde_json::Value::Null,
+            ),
+        ]
+    }
+
+    #[test]
+    #[serial]
+    fn e5_replace_derived_rows_match_baseline_path() {
+        // FIND-10 / 裁定 R-E-86 ①：本用例断言分析表**有行**，而分析写入受一个
+        // **进程级**开关 `DEFAULT_DEFER_ANALYTICS_UPDATES` 门控，`run_index()`
+        // 一进门就把它翻成「延后」。所以本用例不能与任何跑索引的测试并发 ——
+        // `#[serial]` 就是干这个的：`--lib` 里所有能进 `run_index` 的测试都带
+        // `#[serial]`，入组即与它们互斥。
+        //
+        // **这里曾经还有一行 `default_defer_analytics_updates_guard(false)` 钉死，
+        // 已按实验撤掉**，三个实验各否掉它的一种「保护」说法：
+        //   M2 · 只留 `#[serial]`、撤钉死 → 定向复现 **0/8**（serial 一道就够）；
+        //   M1 · 只留钉死、撤 `#[serial]` → 仍然 **8/8 红**（持有者栈后 push 者生效，
+        //        索引测试的 guard 铺完 fixture 才 push，总比本用例开头的钉死来得晚）；
+        //   J2′ · 带钉死 + `CASS_DEFER_ANALYTICS_UPDATES=1` → **5/5 红**
+        //        （`defer_analytics_updates_enabled()` 里 env 判在 guard 之前，钉死管不着）。
+        // 留一个读起来像保护、实测不保护的东西在测试里，与写一条恒亮的假警报同罪。
+        // 第二定义等价门（裁定 R-E-41 A′）：同一份消息集，一侧走基线
+        // `insert_conversations_batched`，一侧走 replace 函数，两张派生表逐列相等。
+        let base_dir = TempDir::new().unwrap();
+        let (base_storage, base_agent) = open_storage(&base_dir);
+        // 两侧都带一个真实 workspace_id：`message_metrics.workspace_id` 是
+        // NOT NULL DEFAULT 0（NULL 折叠成 0），`token_usage.workspace_id` 可空不折叠
+        // —— 两套相反口径只有在 workspace 非 None 时才分辨得出来（W2-0 §C.5）。
+        let base_ws = base_storage
+            .ensure_workspace(std::path::Path::new("/fixtures/ws"), Some("ws"))
+            .unwrap();
+        let base_conv = conversation("equiv", branch_coverage_messages());
+        base_storage
+            .insert_conversations_batched(&[(base_agent, Some(base_ws), &base_conv)])
+            .unwrap();
+
+        let repl_dir = TempDir::new().unwrap();
+        let (repl_storage, repl_agent) = open_storage(&repl_dir);
+        let repl_conv_id = seed_original(&repl_storage, repl_agent, "equiv");
+        let repl_ws = repl_storage
+            .ensure_workspace(std::path::Path::new("/fixtures/ws"), Some("ws"))
+            .unwrap();
+        assert_eq!(
+            repl_ws, base_ws,
+            "两侧 workspace_id 必须相同，否则等价门比的是两个身份"
+        );
+        let repl_conv = conversation("equiv", branch_coverage_messages());
+        let pricing = PricingTable::franken_load(repl_storage.raw()).unwrap();
+        let mut tx = repl_storage.raw().transaction().unwrap();
+        franken_replace_conversation_messages_in_tx(
+            &tx,
+            repl_conv_id,
+            repl_agent,
+            Some(repl_ws),
+            &repl_conv,
+            &pricing,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let base_tu = digest_rows(&base_storage, TOKEN_USAGE_DIGEST_SQL);
+        let repl_tu = digest_rows(&repl_storage, TOKEN_USAGE_DIGEST_SQL);
+        assert_eq!(
+            base_tu.len(),
+            branch_coverage_messages().len(),
+            "前置断言：基线侧必须为每条消息各产一行 token_usage，否则本门比的是空集"
+        );
+        assert_eq!(repl_tu, base_tu, "token_usage 逐列必须与基线路径一致");
+
+        let base_mm = digest_rows(&base_storage, MESSAGE_METRICS_DIGEST_SQL);
+        let repl_mm = digest_rows(&repl_storage, MESSAGE_METRICS_DIGEST_SQL);
+        assert_eq!(
+            base_mm.len(),
+            branch_coverage_messages().len(),
+            "前置断言：基线侧必须为每条消息各产一行 message_metrics"
+        );
+        assert_eq!(repl_mm, base_mm, "message_metrics 逐列必须与基线路径一致");
+
+        // 分支确实被覆盖到了（否则等价门可能只比了一堆同形状的行）。
+        let distinct_sources: HashSet<&str> = base_tu
+            .iter()
+            .map(|d| d.rsplit('|').next().unwrap())
+            .collect();
+        assert!(
+            distinct_sources.contains("api") && distinct_sources.contains("estimated"),
+            "样本必须同时覆盖 api 与 estimated 两条抽取分支，实得 {distinct_sources:?}"
+        );
+    }
+
+    #[test]
+    fn e5_replace_writes_eleven_token_summary_columns_unconditionally() {
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open_storage(&dir);
+        let conv_id = seed_original(&storage, agent_id, "summaries");
+
+        // expected 按 `appendix-w2-1.md` §D.4 从**样本**独立算，不从被测库读回
+        // （规定 D-0：读回会让「投影错 blob」与「conversation_id 写错」两类
+        // 自洽错误一起判绿）。样本：
+        //   idx0 user  无 usage、content 20 字节 → 兜底估算 input=5（20/4）
+        //   idx1 assistant model A：input 100 / output 50 / cache_read 200 / cache_create 30
+        //   idx2 assistant model B：input 7 / output 3
+        //   idx3 assistant model B：input 1 / output 1
+        let messages = vec![
+            msg(
+                0,
+                MessageRole::User,
+                "0123456789abcdefghij",
+                serde_json::Value::Null,
+            ),
+            msg(
+                1,
+                MessageRole::Assistant,
+                "A",
+                api_usage("claude-opus-4-6", 100, 50, 200, 30),
+            ),
+            msg(
+                2,
+                MessageRole::Assistant,
+                "B",
+                api_usage("claude-sonnet-4-5", 7, 3, 0, 0),
+            ),
+            msg(
+                3,
+                MessageRole::Assistant,
+                "B2",
+                api_usage("claude-sonnet-4-5", 1, 1, 0, 0),
+            ),
+        ];
+        let new_conv = conversation("summaries", messages);
+
+        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+        let mut tx = storage.raw().transaction().unwrap();
+        franken_replace_conversation_messages_in_tx(
+            &tx, conv_id, agent_id, None, &new_conv, &pricing,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        #[allow(clippy::type_complexity)]
+        let got: (
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+            i64,
+            Option<i64>,
+            i64,
+            i64,
+        ) = storage
+            .raw()
+            .query_row_map(
+                "SELECT total_input_tokens, total_output_tokens, total_cache_read_tokens,
+                        total_cache_creation_tokens, grand_total_tokens, primary_model,
+                        api_call_count, tool_call_count, user_message_count,
+                        assistant_message_count
+                 FROM conversations WHERE id = ?1",
+                fparams![conv_id],
+                |row| {
+                    Ok((
+                        row.get_typed(0)?,
+                        row.get_typed(1)?,
+                        row.get_typed(2)?,
+                        row.get_typed(3)?,
+                        row.get_typed(4)?,
+                        row.get_typed(5)?,
+                        row.get_typed(6)?,
+                        row.get_typed(7)?,
+                        row.get_typed(8)?,
+                        row.get_typed(9)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(got.0, Some(5 + 100 + 7 + 1), "total_input_tokens");
+        assert_eq!(got.1, Some(50 + 3 + 1), "total_output_tokens");
+        assert_eq!(got.2, Some(200), "total_cache_read_tokens");
+        assert_eq!(got.3, Some(30), "total_cache_creation_tokens");
+        assert_eq!(
+            got.4,
+            Some(5 + 380 + 10 + 2),
+            "grand_total_tokens（四类之和，不含 thinking）"
+        );
+        // 【选择】D-5：众数并列时 SQL 无第二排序键，故判 argmax **集合**成员资格。
+        // 本样本 model B 出现两次、model A 一次，argmax 集合是单元素集。
+        let argmax: HashSet<&str> = ["claude-sonnet-4-5"].into_iter().collect();
+        assert!(
+            argmax.contains(got.5.as_deref().unwrap_or("")),
+            "primary_model 必须落在 argmax 集合内，实得 {:?}",
+            got.5
+        );
+        assert_eq!(got.6, 3, "api_call_count 是 COUNT，空集时为 0 不为 NULL");
+        assert_eq!(
+            got.7,
+            Some(0),
+            "tool_call_count 是 SUM 且列 NOT NULL，U 非空即非 NULL"
+        );
+        assert_eq!(got.8, 1, "user_message_count");
+        assert_eq!(got.9, 3, "assistant_message_count");
+    }
+
+    #[test]
+    #[serial]
+    fn e5_replace_leaves_the_five_accumulating_aggregate_tables_untouched() {
+        // FIND-10 / 裁定 R-E-86 ①：本用例断言分析表**有行**，而分析写入受一个
+        // **进程级**开关 `DEFAULT_DEFER_ANALYTICS_UPDATES` 门控，`run_index()`
+        // 一进门就把它翻成「延后」。所以本用例不能与任何跑索引的测试并发 ——
+        // `#[serial]` 就是干这个的：`--lib` 里所有能进 `run_index` 的测试都带
+        // `#[serial]`，入组即与它们互斥。
+        //
+        // **这里曾经还有一行 `default_defer_analytics_updates_guard(false)` 钉死，
+        // 已按实验撤掉**，三个实验各否掉它的一种「保护」说法：
+        //   M2 · 只留 `#[serial]`、撤钉死 → 定向复现 **0/8**（serial 一道就够）；
+        //   M1 · 只留钉死、撤 `#[serial]` → 仍然 **8/8 红**（持有者栈后 push 者生效，
+        //        索引测试的 guard 铺完 fixture 才 push，总比本用例开头的钉死来得晚）；
+        //   J2′ · 带钉死 + `CASS_DEFER_ANALYTICS_UPDATES=1` → **5/5 红**
+        //        （`defer_analytics_updates_enabled()` 里 env 判在 guard 之前，钉死管不着）。
+        // 留一个读起来像保护、实测不保护的东西在测试里，与写一条恒亮的假警报同罪。
+        // E6 Step 1b 的边界：五张累加型物化聚合表在事务**提交之后**才重算，
+        // 本函数一行都不许碰。边界只写在文档里、没有断言，实现漂过去时不会有东西红。
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open_storage(&dir);
+        let conv_id = seed_original(&storage, agent_id, "aggregates");
+
+        const TABLES: [&str; 5] = [
+            "daily_stats",
+            "token_daily_stats",
+            "usage_hourly",
+            "usage_daily",
+            "usage_models_daily",
+        ];
+        let snapshot = |storage: &FrankenStorage| -> Vec<(String, i64, String)> {
+            TABLES
+                .iter()
+                .map(|t| {
+                    let conn = storage.raw();
+                    let count: i64 = conn
+                        .query_row_map(&format!("SELECT COUNT(*) FROM {t}"), fparams![], |row| {
+                            row.get_typed(0)
+                        })
+                        .unwrap();
+                    // 行数之外再取一份内容摘要，否则「删一行加一行」会看不出来。
+                    let digest: String = conn
+                        .query_row_map(
+                            &format!("SELECT COALESCE(GROUP_CONCAT(x, ';'), '') FROM (SELECT CAST(rowid AS TEXT) || ':' || COALESCE(CAST(last_updated AS TEXT),'~') AS x FROM {t} ORDER BY rowid)"),
+                            fparams![],
+                            |row| row.get_typed(0),
+                        )
+                        .unwrap();
+                    ((*t).to_string(), count, digest)
+                })
+                .collect()
+        };
+
+        let before = snapshot(&storage);
+        assert!(
+            before.iter().any(|(_, count, _)| *count > 0),
+            "前置断言：五张表里至少有一张非空，否则本用例在比两组空集"
+        );
+
+        let new_conv = replacement("aggregates");
+        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+        let mut tx = storage.raw().transaction().unwrap();
+        franken_replace_conversation_messages_in_tx(
+            &tx, conv_id, agent_id, None, &new_conv, &pricing,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(
+            snapshot(&storage),
+            before,
+            "五张累加型物化聚合表必须逐行不变 —— 它们归 E6 Step 1b 的提交后重算"
+        );
+    }
+
+    #[test]
+    fn e5_replace_keeps_partial_tail_when_new_messages_have_no_timestamps() {
+        // 「消息没有 created_at」是本仓明确处理过的形态（`timestamp_data_incomplete`）。
+        // 这条用例锁住：tail 回写必须走收 Option 的写入器 —— 换成要求
+        // (idx, created_at) 同时已知的那个，本用例会看到热表整行缺失。
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open_storage(&dir);
+        let conv_id = seed_original(&storage, agent_id, "no-ts");
+
+        let mut messages = replacement("no-ts").messages;
+        for m in messages.iter_mut() {
+            m.created_at = None;
+        }
+        let new_conv = conversation("no-ts", messages);
+
+        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+        let mut tx = storage.raw().transaction().unwrap();
+        franken_replace_conversation_messages_in_tx(
+            &tx, conv_id, agent_id, None, &new_conv, &pricing,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let seen: (Option<i64>, Option<i64>) = storage
+            .raw()
+            .query_row_map(
+                "SELECT last_message_idx, last_message_created_at
+                 FROM conversation_tail_state WHERE conversation_id = ?1",
+                fparams![conv_id],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            seen.0,
+            Some(1),
+            "已知的 last_message_idx 不得因为 created_at 缺失而一并丢掉"
+        );
+        assert_eq!(
+            seen.1, None,
+            "未知的 created_at 应当是 NULL，而不是被编造一个值"
+        );
+    }
+
+    #[test]
+    fn e5_replace_clears_the_hot_tail_row_for_a_fully_empty_replacement() {
+        // 这是热表 DELETE **唯一**承重的输入形态：新内容既无消息也无 ended_at，
+        // 于是回写侧三个值全 None、`franken_insert_conversation_tail_state` 直接早退，
+        // 没有任何写回能覆盖掉重置前的陈旧行。去掉热表 DELETE，本用例即红。
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open_storage(&dir);
+        let conv_id = seed_original(&storage, agent_id, "empty-replacement");
+
+        {
+            let conn = storage.raw();
+            conn.execute_compat(
+                "UPDATE conversation_tail_state
+                 SET last_message_idx = 99, last_message_created_at = ?1, ended_at = ?1
+                 WHERE conversation_id = ?2",
+                fparams![TS + 900_000, conv_id],
+            )
+            .unwrap();
+        }
+        let stale: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM conversation_tail_state WHERE conversation_id = ?1",
+                fparams![conv_id],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(stale, 1, "前置断言：重置之前热表确实有一行陈旧 tail");
+
+        let mut empty = conversation("empty-replacement", vec![]);
+        empty.started_at = None;
+        empty.ended_at = None;
+
+        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+        let mut tx = storage.raw().transaction().unwrap();
+        franken_replace_conversation_messages_in_tx(&tx, conv_id, agent_id, None, &empty, &pricing)
+            .unwrap();
+        tx.commit().unwrap();
+
+        let remaining: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM conversation_tail_state WHERE conversation_id = ?1",
+                fparams![conv_id],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0, "热表的陈旧 tail 行必须被重置掉");
+    }
+
+    // ---------------------------------------------------------------------
+    // §B.11 的 P10 / P15 契约批（Phase 2 落库之后才有断言对象的那三项）
+    //
+    // **记账为契约验证，不是 TDD 红转绿**（与三家家族批同一口径）。
+    //
+    // 分项表 —— 哪些在这里闭、哪些必须留给 E6，逐行写清楚，不出现裸的「P10/P15 已过」：
+    //
+    // | P15 / §B.1.2 行 | 动作 | 落点 |
+    // |---|---|---|
+    // | `conversations.id` | 保留原 ID | **本批**（`..._preserves_conversation_id_...`） |
+    // | 11 个 token 汇总列 | 重算 | **本批**（下面的「二次 replace 必须跟着新内容走」） |
+    // | `metadata` 的 `cass.raw_mirror` | relink 到本次消费的 manifest | 已在 Phase 1 闭（八键逐一断言，commit `b9ed25bc`） |
+    // | `title` / `workspace` / `started_at` / `ended_at` / `metadata` 投影部分 / `approx_tokens` | 重算 / 替换 | **不在本批，归 E6** —— replace 专用存储函数按 plan 只管消息集、两处 tail、两张派生表与 11 列，**不碰 conversation 级的这几列**；它们由 E6 的编排在同一事务里更新 |
+    //
+    // | P10 项 | 落点 |
+    // |---|---|
+    // | `token_usage` 行存在且字段齐 | **本批** + Phase 2 的逐列等价门 |
+    // | `data_source` 如实 | **本批**（api / estimated 两支各断言，不只断言「非空」） |
+    // | `conversations` 11 列已更新 | **本批** |
+    // | `message_metrics` 已产 | **本批** |
+    // | 三张 rollup 已产 | **不在本批**：按 E6 Step 1b，五张累加型物化聚合表在事务**提交之后**重算，replace 函数一行不碰（已有边界守卫测试）。P10 那句「三张 rollup 已产」描述的是**整条 restore 完成后**的状态，不是 replace 函数的义务 —— 这条口径差别记档，归 E6 兑现 |
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn e5_p10_derived_rows_are_one_per_message_with_faithful_data_source() {
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open_storage(&dir);
+        let conv_id = seed_original(&storage, agent_id, "p10");
+
+        // 两支各一条：带 API usage 的 → `api`；无 usage 的 → 抽取器兜底 → `estimated`。
+        let new_conv = conversation(
+            "p10",
+            vec![
+                msg(
+                    0,
+                    MessageRole::User,
+                    "没有 usage 的一条",
+                    serde_json::Value::Null,
+                ),
+                msg(
+                    1,
+                    MessageRole::Assistant,
+                    "带 usage 的一条",
+                    api_usage("claude-opus-4-6", 11, 7, 0, 0),
+                ),
+            ],
+        );
+
+        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+        let mut tx = storage.raw().transaction().unwrap();
+        franken_replace_conversation_messages_in_tx(
+            &tx, conv_id, agent_id, None, &new_conv, &pricing,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let conn = storage.raw();
+        let msg_count: i64 = conn
+            .query_row_map(
+                "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1",
+                fparams![conv_id],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(msg_count, 2, "前置断言：样本落库应当是 2 条消息");
+
+        // 「一条消息一行」用**逐消息 JOIN 计数**判，不用两张表各自的总行数比 ——
+        // 总行数相等可以由「一条消息两行 + 另一条零行」凑出来。
+        let paired: i64 = conn
+            .query_row_map(
+                "SELECT COUNT(*) FROM messages m
+                 WHERE m.conversation_id = ?1
+                   AND (SELECT COUNT(*) FROM token_usage tu WHERE tu.message_id = m.id) = 1
+                   AND (SELECT COUNT(*) FROM message_metrics mm WHERE mm.message_id = m.id) = 1",
+                fparams![conv_id],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            paired, msg_count,
+            "每条消息都必须**恰好**各有一行 token_usage 与 message_metrics"
+        );
+
+        let sources: Vec<(i64, String, String)> = conn
+            .query_map_collect(
+                "SELECT m.idx, tu.data_source, mm.api_data_source
+                 FROM messages m
+                 JOIN token_usage tu ON tu.message_id = m.id
+                 JOIN message_metrics mm ON mm.message_id = m.id
+                 WHERE m.conversation_id = ?1 ORDER BY m.idx",
+                fparams![conv_id],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            sources,
+            vec![
+                (0, "estimated".to_string(), "estimated".to_string()),
+                (1, "api".to_string(), "api".to_string()),
+            ],
+            "`data_source` 必须如实分档：无 usage 的走兜底估算、带 usage 的走 api；\
+             两张表对同一条消息的取值必须一致"
+        );
+    }
+
+    #[test]
+    fn e5_p15_eleven_summary_columns_follow_the_second_replace_not_the_first() {
+        // 11 列的动作是**重算**，不是「有值就行」。分辨这两者要连做两次 replace：
+        // 第二次的内容 token 更少，若实现是「累加」或「首次写入后不再更新」，
+        // 这里读到的就会是第一次的值。
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open_storage(&dir);
+        let conv_id = seed_original(&storage, agent_id, "p15");
+
+        let first = conversation(
+            "p15",
+            vec![msg(
+                0,
+                MessageRole::Assistant,
+                "第一版",
+                api_usage("claude-opus-4-6", 100, 50, 0, 0),
+            )],
+        );
+        let second = conversation(
+            "p15",
+            vec![msg(
+                0,
+                MessageRole::Assistant,
+                "第二版",
+                api_usage("claude-sonnet-4-5", 3, 1, 0, 0),
+            )],
+        );
+
+        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+        for conv in [&first, &second] {
+            let mut tx = storage.raw().transaction().unwrap();
+            franken_replace_conversation_messages_in_tx(
+                &tx, conv_id, agent_id, None, conv, &pricing,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        let got: (Option<i64>, Option<i64>, Option<String>, i64) = storage
+            .raw()
+            .query_row_map(
+                "SELECT total_input_tokens, total_output_tokens, primary_model, api_call_count
+                 FROM conversations WHERE id = ?1",
+                fparams![conv_id],
+                |row| {
+                    Ok((
+                        row.get_typed(0)?,
+                        row.get_typed(1)?,
+                        row.get_typed(2)?,
+                        row.get_typed(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            got.0,
+            Some(3),
+            "`total_input_tokens` 必须只反映第二次 replace 的内容（3）；\
+             读到 103 说明在累加，读到 100 说明写过一次就不再重算"
+        );
+        assert_eq!(got.1, Some(1), "`total_output_tokens` 同理");
+        assert_eq!(
+            got.2.as_deref(),
+            Some("claude-sonnet-4-5"),
+            "`primary_model` 必须跟着新内容走，而不是留着第一版的模型"
+        );
+        assert_eq!(got.3, 1, "`api_call_count` 必须是 1，不是两次之和");
+
+        // 顺带把「旧行确实被级联删干净」钉住：11 列是从 `token_usage` 聚合出来的，
+        // 若旧行没删掉，上面四条会同时变成累加值 —— 但那样就分不清「没删干净」与
+        // 「重算写成了累加」。这条直接数行。
+        let usage_rows: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM token_usage WHERE conversation_id = ?1",
+                fparams![conv_id],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            usage_rows, 1,
+            "第一次 replace 写的 token_usage 旧行必须已被删除"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // §B.11 P13 · extra 编码：在**解码后的 JSON 值域**比对，不用文本探针
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn e5_p13_extra_round_trips_in_the_decoded_json_domain_not_as_text() {
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open_storage(&dir);
+        let conv_id = seed_original(&storage, agent_id, "p13");
+
+        // 样本刻意含一个 **NUL**（`\u{0000}`）：msgpack 编码后它是一个真实的 0 字节，
+        // 而 SQL 侧的 `CAST(extra_bin AS TEXT)` 会在那里截断 —— 本仓已经因为这个
+        // 截断报过一次错误的统计数字。下面同时断言两件事：解码域比对相等，
+        // **且**文本探针在这份样本上确实是有损的（给「为什么 P13 禁文本探针」留实证）。
+        let extra = serde_json::json!({
+            "raw_role": "assistant",
+            "nested": { "b": 2, "a": [1, "二", null] },
+            "with_nul": "before\u{0000}after",
+            "unicode": "中文与 emoji 🌱",
+        });
+        let new_conv = conversation(
+            "p13",
+            vec![msg(
+                0,
+                MessageRole::Assistant,
+                "带复杂 extra 的一条",
+                extra.clone(),
+            )],
+        );
+
+        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+        let mut tx = storage.raw().transaction().unwrap();
+        franken_replace_conversation_messages_in_tx(
+            &tx, conv_id, agent_id, None, &new_conv, &pricing,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        // 用**生产的解码器**读回，不自己再写一遍解码规则。
+        let decoded: serde_json::Value = storage
+            .raw()
+            .query_row_map(
+                "SELECT extra_json, extra_bin FROM messages WHERE conversation_id = ?1",
+                fparams![conv_id],
+                |row| Ok(franken_read_message_extra_compat(row, 0, 1)),
+            )
+            .unwrap();
+        assert_eq!(
+            decoded, extra,
+            "extra 必须在**解码后的 JSON 值域**上与投影产物相等（含键序无关的结构相等、\
+             NUL 与非 ASCII 原样保真）"
+        );
+
+        // 分辨力旁证：同一行用文本探针看，长度会短一截（NUL 处截断），
+        // 也就是说「用 CAST 比对」在这份样本上会得出错误结论 —— P13 禁它不是洁癖。
+        let (bin_len, text_len): (i64, i64) = storage
+            .raw()
+            .query_row_map(
+                "SELECT LENGTH(extra_bin), LENGTH(CAST(extra_bin AS TEXT))
+                 FROM messages WHERE conversation_id = ?1",
+                fparams![conv_id],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )
+            .unwrap();
+        assert!(
+            bin_len > 0,
+            "前置断言：这条消息的 extra 必须真的以 msgpack 落在 `extra_bin` 上，\
+             否则下面这条文本探针的对照没有意义"
+        );
+        assert!(
+            text_len < bin_len,
+            "分辨力断言：文本探针必须在这份含 NUL 的样本上**丢字节**（{text_len} < {bin_len}）；\
+             若两者相等，说明这份样本压根没触发截断，本条旁证不成立"
+        );
     }
 }

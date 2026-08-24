@@ -1,0 +1,672 @@
+{
+ "appendix_section": "§A.7/§A.11/§B.8",
+ "cases": [
+  {
+   "case_id": "v08.reject.schema-version",
+   "expect": "reject",
+   "expected_error": "E-SCHEMA-VERSION",
+   "input": {
+    "entries_count": 0,
+    "entries_root": "3ee347e2ccd29dee8a4a46ba7f086ee6876a2cd08b5e3b60999e0c1eced102d0",
+    "holds_count": 0,
+    "holds_root": "6e151783d761f25a77c04f9026df029d3ada11cf9a280e73c2d66e3fd3d826a2",
+    "object_kind": "seal.result",
+    "observed_after_cut_count": 0,
+    "observed_after_cut_root": "4e1e2e82296bb756358ac76a2a3235a30a794461de0321ae59ba125292b0d593",
+    "schema_version": "w0-0/v2",
+    "tombstones_count": 0,
+    "tombstones_root": "8d06ceb2f24c04bc8c72c11f88e5bb222a5915c75233a46774a5ca96af4641d0"
+   },
+   "note": "唯一缺陷：schema_version 值错。四个 *_root 各填其集合真实的空 set root（不是同一个值）",
+   "object_kind": "seal.result"
+  },
+  {
+   "case_id": "v08.reject.unknown-kind",
+   "expect": "reject",
+   "expected_error": "E-UNKNOWN-KIND",
+   "input": {
+    "boundary_t": 8,
+    "canonical_path": "/home/u/.claude/projects/p/a.jsonl",
+    "dev": 66306,
+    "empty_reason": null,
+    "ino": 1234567,
+    "object_kind": "seal.unknown",
+    "origin": "claude_code",
+    "payload_hash": "d6ad880bbbc7a3ae5fd70f89943828911cf1d4fe6f9abfed65b9245e86e9893c",
+    "prefix_digest": "e346432021b04179518d9614f3560ccd71354a4ee101ddcb893d6959a9d6301c",
+    "session_id": "sess-1"
+   },
+   "note": "唯一缺陷：object_kind 形态合法（含点、字符集过）但不在 §A.7 七值内",
+   "object_kind": "seal.unknown"
+  },
+  {
+   "case_id": "v08.reject.kind-form-no-dot",
+   "expect": "reject",
+   "expected_error": "E-KIND-FORM",
+   "input": {
+    "boundary_t": 8,
+    "canonical_path": "/home/u/.claude/projects/p/a.jsonl",
+    "dev": 66306,
+    "empty_reason": null,
+    "ino": 1234567,
+    "object_kind": "sealentry",
+    "origin": "claude_code",
+    "payload_hash": "d6ad880bbbc7a3ae5fd70f89943828911cf1d4fe6f9abfed65b9245e86e9893c",
+    "prefix_digest": "e346432021b04179518d9614f3560ccd71354a4ee101ddcb893d6959a9d6301c",
+    "session_id": "sess-1"
+   },
+   "note": "唯一缺陷：object_kind 无点号。**确定性**：§B.8 第 2 步定序 —— 形态违规的 kind 不是可查表的标识符，故形态先于成员性判定，E-KIND-FORM 先命中而非 E-UNKNOWN-KIND",
+   "object_kind": "sealentry"
+  },
+  {
+   "case_id": "v08.reject.kind-form-set-prefix",
+   "expect": "reject",
+   "expected_error": "E-KIND-FORM",
+   "input": {
+    "boundary_t": 8,
+    "canonical_path": "/home/u/.claude/projects/p/a.jsonl",
+    "dev": 66306,
+    "empty_reason": null,
+    "ino": 1234567,
+    "object_kind": "set/entries",
+    "origin": "claude_code",
+    "payload_hash": "d6ad880bbbc7a3ae5fd70f89943828911cf1d4fe6f9abfed65b9245e86e9893c",
+    "prefix_digest": "e346432021b04179518d9614f3560ccd71354a4ee101ddcb893d6959a9d6301c",
+    "session_id": "sess-1"
+   },
+   "note": "钉死 §A.7 裸拼接约束：set/entries 会与 set_root(\"entries\") 撞进同一域前缀。同为确定性用例（形态先判）",
+   "object_kind": "set/entries"
+  },
+  {
+   "case_id": "v08.reject.kind-mismatch",
+   "expect": "reject",
+   "expected_error": "E-KIND-MISMATCH",
+   "input": {
+    "boundary_t": 8,
+    "canonical_path": "/home/u/.claude/projects/p/a.jsonl",
+    "dev": 66306,
+    "empty_reason": null,
+    "ino": 1234567,
+    "object_kind": "seal.entry",
+    "origin": "claude_code",
+    "payload_hash": "d6ad880bbbc7a3ae5fd70f89943828911cf1d4fe6f9abfed65b9245e86e9893c",
+    "prefix_digest": "e346432021b04179518d9614f3560ccd71354a4ee101ddcb893d6959a9d6301c",
+    "session_id": "sess-1"
+   },
+   "note": "唯一缺陷：object_kind 字段值 seal.entry，却按 seal.tombstone 域算 root",
+   "object_kind": "seal.tombstone"
+  },
+  {
+   "case_id": "v08.reject.key-form",
+   "expect": "reject",
+   "expected_error": "E-KEY-FORM",
+   "input": {
+    "A": "1"
+   },
+   "input_tags": {
+    "A": "s"
+   },
+   "note": "test.tree 裸 leaf key 带大写；§A.12 规定裸 key 同受 §A.3 约束",
+   "object_kind": "test.tree"
+  },
+  {
+   "case_id": "v08.reject.unknown-field",
+   "expect": "reject",
+   "expected_error": "E-UNKNOWN-FIELD",
+   "input": {
+    "boundary_t": 8,
+    "canonical_path": "/home/u/.claude/projects/p/a.jsonl",
+    "dev": 66306,
+    "empty_reason": null,
+    "extra_field": "x",
+    "ino": 1234567,
+    "object_kind": "seal.entry",
+    "origin": "claude_code",
+    "payload_hash": "d6ad880bbbc7a3ae5fd70f89943828911cf1d4fe6f9abfed65b9245e86e9893c",
+    "prefix_digest": "e346432021b04179518d9614f3560ccd71354a4ee101ddcb893d6959a9d6301c",
+    "session_id": "sess-1"
+   },
+   "note": "唯一缺陷：多一个字段表未声明的成员",
+   "object_kind": "seal.entry"
+  },
+  {
+   "case_id": "v08.reject.missing-field",
+   "expect": "reject",
+   "expected_error": "E-MISSING-FIELD",
+   "input": {
+    "boundary_t": 8,
+    "canonical_path": "/home/u/.claude/projects/p/a.jsonl",
+    "dev": 66306,
+    "empty_reason": null,
+    "ino": 1234567,
+    "object_kind": "seal.entry",
+    "origin": "claude_code",
+    "payload_hash": "d6ad880bbbc7a3ae5fd70f89943828911cf1d4fe6f9abfed65b9245e86e9893c",
+    "prefix_digest": "e346432021b04179518d9614f3560ccd71354a4ee101ddcb893d6959a9d6301c"
+   },
+   "note": "唯一缺陷：已声明字段成员整体缺失。可空 != 可缺失（§A.10）",
+   "object_kind": "seal.entry"
+  },
+  {
+   "case_id": "v08.reject.dup-key",
+   "expect": "reject",
+   "expected_error": "E-DUP-KEY",
+   "input_leaf_list": [
+    [
+     "a",
+     "s",
+     "1"
+    ],
+    [
+     "a",
+     "s",
+     "2"
+    ]
+   ],
+   "note": "同一 leaf key 出现两次。用 input_leaf_list 形态，因为 JSON 对象无法表达重复键",
+   "object_kind": "test.tree"
+  },
+  {
+   "case_id": "v08.reject.null-not-allowed",
+   "expect": "reject",
+   "expected_error": "E-NULL-NOT-ALLOWED",
+   "input": {
+    "boundary_t": 8,
+    "canonical_path": null,
+    "dev": 66306,
+    "empty_reason": null,
+    "ino": 1234567,
+    "object_kind": "seal.entry",
+    "origin": "claude_code",
+    "payload_hash": "d6ad880bbbc7a3ae5fd70f89943828911cf1d4fe6f9abfed65b9245e86e9893c",
+    "prefix_digest": "e346432021b04179518d9614f3560ccd71354a4ee101ddcb893d6959a9d6301c",
+    "session_id": "sess-1"
+   },
+   "note": "唯一缺陷：不可空字段装显式 null。**确定性的真正来源是 §A.2 那条「显式 null 是唯一由运行时值决定 tag 的例外」**——值一旦定为 n tag，p 的路径形态校验根本不会跑，所以 E-PATH-FORM（同在第 7 步）不会与它竞争。选 canonical_path 而非 origin 是顺带避开第 9 步的 E-ORIGIN，但那不是本条确定性的主要依据（R3 的 N-3-8）",
+   "object_kind": "seal.entry"
+  },
+  {
+   "case_id": "v08.reject.value-form-uppercase-hex",
+   "expect": "reject",
+   "expected_error": "E-VALUE-FORM",
+   "input": {
+    "boundary_t": 8,
+    "canonical_path": "/home/u/.claude/projects/p/a.jsonl",
+    "dev": 66306,
+    "empty_reason": null,
+    "ino": 1234567,
+    "object_kind": "seal.entry",
+    "origin": "claude_code",
+    "payload_hash": "d6ad880bbbc7a3ae5fd70f89943828911cf1d4fe6f9abfed65b9245e86e9893c",
+    "prefix_digest": "E346432021B04179518D9614F3560CCD71354A4EE101DDCB893D6959A9D6301C",
+    "session_id": "sess-1"
+   },
+   "note": "唯一缺陷：x 标签用大写 hex，不做规范化直接拒",
+   "object_kind": "seal.entry"
+  },
+  {
+   "case_id": "v08.reject.value-form-leading-zero",
+   "expect": "reject",
+   "expected_error": "E-VALUE-FORM",
+   "input": {
+    "boundary_t": "08",
+    "canonical_path": "/home/u/.claude/projects/p/a.jsonl",
+    "dev": 66306,
+    "empty_reason": null,
+    "ino": 1234567,
+    "object_kind": "seal.entry",
+    "origin": "claude_code",
+    "payload_hash": "d6ad880bbbc7a3ae5fd70f89943828911cf1d4fe6f9abfed65b9245e86e9893c",
+    "prefix_digest": "e346432021b04179518d9614f3560ccd71354a4ee101ddcb893d6959a9d6301c",
+    "session_id": "sess-1"
+   },
+   "note": "唯一缺陷：i 标签值是带前导零的字符串",
+   "object_kind": "seal.entry"
+  },
+  {
+   "case_id": "v08.reject.value-form-bool-as-int",
+   "expect": "reject",
+   "expected_error": "E-VALUE-FORM",
+   "input": {
+    "boundary_t": true,
+    "canonical_path": "/home/u/.claude/projects/p/a.jsonl",
+    "dev": 66306,
+    "empty_reason": null,
+    "ino": 1234567,
+    "object_kind": "seal.entry",
+    "origin": "claude_code",
+    "payload_hash": "d6ad880bbbc7a3ae5fd70f89943828911cf1d4fe6f9abfed65b9245e86e9893c",
+    "prefix_digest": "e346432021b04179518d9614f3560ccd71354a4ee101ddcb893d6959a9d6301c",
+    "session_id": "sess-1"
+   },
+   "note": "唯一缺陷：布尔当整数",
+   "object_kind": "seal.entry"
+  },
+  {
+   "case_id": "v08.reject.path-form-dotdot-tail",
+   "expect": "reject",
+   "expected_error": "E-PATH-FORM",
+   "input": {
+    "boundary_t": 8,
+    "canonical_path": "/a/..",
+    "dev": 66306,
+    "empty_reason": null,
+    "ino": 1234567,
+    "object_kind": "seal.entry",
+    "origin": "claude_code",
+    "payload_hash": "d6ad880bbbc7a3ae5fd70f89943828911cf1d4fe6f9abfed65b9245e86e9893c",
+    "prefix_digest": "e346432021b04179518d9614f3560ccd71354a4ee101ddcb893d6959a9d6301c",
+    "session_id": "sess-1"
+   },
+   "note": "唯一缺陷：canonical_path = /a/..；按段判才抓得到；子串判 /../ 会放行",
+   "object_kind": "seal.entry"
+  },
+  {
+   "case_id": "v08.reject.path-form-dotdot-root",
+   "expect": "reject",
+   "expected_error": "E-PATH-FORM",
+   "input": {
+    "boundary_t": 8,
+    "canonical_path": "/..",
+    "dev": 66306,
+    "empty_reason": null,
+    "ino": 1234567,
+    "object_kind": "seal.entry",
+    "origin": "claude_code",
+    "payload_hash": "d6ad880bbbc7a3ae5fd70f89943828911cf1d4fe6f9abfed65b9245e86e9893c",
+    "prefix_digest": "e346432021b04179518d9614f3560ccd71354a4ee101ddcb893d6959a9d6301c",
+    "session_id": "sess-1"
+   },
+   "note": "唯一缺陷：canonical_path = /..；同上",
+   "object_kind": "seal.entry"
+  },
+  {
+   "case_id": "v08.reject.path-form-empty-seg",
+   "expect": "reject",
+   "expected_error": "E-PATH-FORM",
+   "input": {
+    "boundary_t": 8,
+    "canonical_path": "/a//b",
+    "dev": 66306,
+    "empty_reason": null,
+    "ino": 1234567,
+    "object_kind": "seal.entry",
+    "origin": "claude_code",
+    "payload_hash": "d6ad880bbbc7a3ae5fd70f89943828911cf1d4fe6f9abfed65b9245e86e9893c",
+    "prefix_digest": "e346432021b04179518d9614f3560ccd71354a4ee101ddcb893d6959a9d6301c",
+    "session_id": "sess-1"
+   },
+   "note": "唯一缺陷：canonical_path = /a//b；空段",
+   "object_kind": "seal.entry"
+  },
+  {
+   "case_id": "v08.reject.path-form-dot-seg",
+   "expect": "reject",
+   "expected_error": "E-PATH-FORM",
+   "input": {
+    "boundary_t": 8,
+    "canonical_path": "/a/./b",
+    "dev": 66306,
+    "empty_reason": null,
+    "ino": 1234567,
+    "object_kind": "seal.entry",
+    "origin": "claude_code",
+    "payload_hash": "d6ad880bbbc7a3ae5fd70f89943828911cf1d4fe6f9abfed65b9245e86e9893c",
+    "prefix_digest": "e346432021b04179518d9614f3560ccd71354a4ee101ddcb893d6959a9d6301c",
+    "session_id": "sess-1"
+   },
+   "note": "唯一缺陷：canonical_path = /a/./b；单点段",
+   "object_kind": "seal.entry"
+  },
+  {
+   "case_id": "v08.reject.field-range",
+   "expect": "reject",
+   "expected_error": "E-FIELD-RANGE",
+   "input": {
+    "base_payload_hash": "d6ad880bbbc7a3ae5fd70f89943828911cf1d4fe6f9abfed65b9245e86e9893c",
+    "canonical_path": "/home/u/.openclaw/sessions/s.jsonl",
+    "object_kind": "seal.tombstone",
+    "observed_missing_at_ms": -1,
+    "origin": "openclaw"
+   },
+   "note": "唯一缺陷：时刻字段为负。**刻意用 tombstone 的时刻字段而非 entry 的 boundary_t**——boundary_t=-1 会同时破坏 empty_reason 的当且仅当关系，造成双码",
+   "object_kind": "seal.tombstone"
+  },
+  {
+   "case_id": "v08.reject.origin",
+   "expect": "reject",
+   "expected_error": "E-ORIGIN",
+   "input": {
+    "boundary_t": 8,
+    "canonical_path": "/home/u/.claude/projects/p/a.jsonl",
+    "dev": 66306,
+    "empty_reason": null,
+    "ino": 1234567,
+    "object_kind": "seal.entry",
+    "origin": "gemini_cli",
+    "payload_hash": "d6ad880bbbc7a3ae5fd70f89943828911cf1d4fe6f9abfed65b9245e86e9893c",
+    "prefix_digest": "e346432021b04179518d9614f3560ccd71354a4ee101ddcb893d6959a9d6301c",
+    "session_id": "sess-1"
+   },
+   "note": "唯一缺陷：origin 不在三值内",
+   "object_kind": "seal.entry"
+  },
+  {
+   "case_id": "v08.reject.empty-reason-null-on-zero",
+   "expect": "reject",
+   "expected_error": "E-EMPTY-REASON",
+   "input": {
+    "boundary_t": 0,
+    "canonical_path": "/home/u/.claude/projects/p/a.jsonl",
+    "dev": 66306,
+    "empty_reason": null,
+    "ino": 1234567,
+    "object_kind": "seal.entry",
+    "origin": "claude_code",
+    "payload_hash": "c9e96a4e2c491581fa6b02b82a67741b4f36438c89dbdb9889209c86068297a8",
+    "prefix_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "session_id": "sess-1"
+   },
+   "note": "唯一缺陷：boundary_t == 0 却把 empty_reason 记为 null，违反当且仅当关系",
+   "object_kind": "seal.entry"
+  },
+  {
+   "case_id": "v08.reject.empty-reason-value",
+   "expect": "reject",
+   "expected_error": "E-EMPTY-REASON",
+   "input": {
+    "boundary_t": 0,
+    "canonical_path": "/home/u/.claude/projects/p/a.jsonl",
+    "dev": 66306,
+    "empty_reason": "parse-failed",
+    "ino": 1234567,
+    "object_kind": "seal.entry",
+    "origin": "claude_code",
+    "payload_hash": "c9e96a4e2c491581fa6b02b82a67741b4f36438c89dbdb9889209c86068297a8",
+    "prefix_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "session_id": "sess-1"
+   },
+   "note": "唯一缺陷：empty_reason 取值不在两类内（当且仅当关系本身满足）",
+   "object_kind": "seal.entry"
+  },
+  {
+   "case_id": "v08.reject.hold-reason",
+   "expect": "reject",
+   "expected_error": "E-HOLD-REASON",
+   "input": {
+    "canonical_path": "/home/u/.codex/sessions/rollout-z.jsonl",
+    "detail": null,
+    "object_kind": "seal.hold",
+    "origin": "codex",
+    "reason": "no-record-boundary"
+   },
+   "note": "唯一缺陷：第七个 reason 值。taxonomy 现为六类闭世界；no-record-boundary 曾被考虑作第六类，裁定后不是合法值",
+   "object_kind": "seal.hold"
+  },
+  {
+   "case_id": "v08.reject.hold-detail-null",
+   "expect": "reject",
+   "expected_error": "E-HOLD-DETAIL",
+   "input": {
+    "canonical_path": "/home/u/.codex/sessions/rollout-z.jsonl",
+    "detail": null,
+    "object_kind": "seal.hold",
+    "origin": "codex",
+    "reason": "out-of-scope-format"
+   },
+   "note": "唯一缺陷：out-of-scope-format 的 detail 为 null（本类下不可空）",
+   "object_kind": "seal.hold"
+  },
+  {
+   "case_id": "v08.reject.hold-detail-value",
+   "expect": "reject",
+   "expected_error": "E-HOLD-DETAIL",
+   "input": {
+    "canonical_path": "/home/u/.codex/sessions/rollout-z.jsonl",
+    "detail": "excluded_known_metadata",
+    "object_kind": "seal.hold",
+    "origin": "codex",
+    "reason": "out-of-scope-format"
+   },
+   "note": "唯一缺陷：detail 取了 §B.5.1 枚举之外的值。**刻意选 excluded_known_metadata**——它是 W0-1 §B.3 里明写「不 HOLD」那行的 bucket，初版曾把它列为合法值（R2 的 BLK-R2-2）",
+   "object_kind": "seal.hold"
+  },
+  {
+   "case_id": "v08.reject.fingerprint-null",
+   "expect": "reject",
+   "expected_error": "E-FINGERPRINT-NULL",
+   "input": {
+    "mirror_fingerprint": null,
+    "object_kind": "bundle.manifest",
+    "payloads[000000].byte_length": 8,
+    "payloads[000000].payload_hash": "ae1e72bb7a3703d3c13b07c6c9d3e647c1cdb0efeab2221286f3e88fd0df36e3",
+    "payloads[000001].byte_length": 8,
+    "payloads[000001].payload_hash": "d6ad880bbbc7a3ae5fd70f89943828911cf1d4fe6f9abfed65b9245e86e9893c",
+    "promotable": false,
+    "schema_version": "w0-0/v1",
+    "seal_result_root": "05f778e463412b238dbfd9a7fbd12a70f935e9135e8c18cc628580ce8b9b0687"
+   },
+   "note": "唯一缺陷：payloads 非空却把 mirror_fingerprint 记为 null",
+   "object_kind": "bundle.manifest"
+  },
+  {
+   "case_id": "v08.reject.array-unsorted",
+   "expect": "reject",
+   "expected_error": "E-ARRAY-UNSORTED",
+   "input": {
+    "mirror_fingerprint": "27b9515405b9e7236a33d5174a6dcb27c6770c66cc506e554956681e0ca72f41",
+    "object_kind": "bundle.manifest",
+    "payloads[000000].byte_length": 8,
+    "payloads[000000].payload_hash": "d6ad880bbbc7a3ae5fd70f89943828911cf1d4fe6f9abfed65b9245e86e9893c",
+    "payloads[000001].byte_length": 8,
+    "payloads[000001].payload_hash": "ae1e72bb7a3703d3c13b07c6c9d3e647c1cdb0efeab2221286f3e88fd0df36e3",
+    "promotable": false,
+    "schema_version": "w0-0/v1",
+    "seal_result_root": "05f778e463412b238dbfd9a7fbd12a70f935e9135e8c18cc628580ce8b9b0687"
+   },
+   "note": "唯一缺陷：payloads 未按 payload_hash 的 32 原始字节升序",
+   "object_kind": "bundle.manifest"
+  },
+  {
+   "case_id": "v08.reject.array-dupkey",
+   "expect": "reject",
+   "expected_error": "E-ARRAY-DUPKEY",
+   "input": {
+    "mirror_fingerprint": "27b9515405b9e7236a33d5174a6dcb27c6770c66cc506e554956681e0ca72f41",
+    "object_kind": "bundle.manifest",
+    "payloads[000000].byte_length": 8,
+    "payloads[000000].payload_hash": "d6ad880bbbc7a3ae5fd70f89943828911cf1d4fe6f9abfed65b9245e86e9893c",
+    "payloads[000001].byte_length": 8,
+    "payloads[000001].payload_hash": "d6ad880bbbc7a3ae5fd70f89943828911cf1d4fe6f9abfed65b9245e86e9893c",
+    "promotable": false,
+    "schema_version": "w0-0/v1",
+    "seal_result_root": "05f778e463412b238dbfd9a7fbd12a70f935e9135e8c18cc628580ce8b9b0687"
+   },
+   "note": "唯一缺陷：同一 payload_hash 出现两次；不许静默去重",
+   "object_kind": "bundle.manifest"
+  },
+  {
+   "case_id": "v08.reject.index-overflow",
+   "expect": "reject",
+   "expected_error": "E-INDEX-OVERFLOW",
+   "input_generator": {
+    "kind": "bundle.manifest",
+    "payload_bytes_rule": "第 i 条 payload 的字节是 ASCII 十进制的 i（无前导零），i 从 0 起；hash 按 §A.8 算，落盘前按 32 原始字节升序排",
+    "payload_count": 1000001
+   },
+   "note": "长度 1000001 超上限。**下标 1000000 在 6 位零填充下没有合法 key 形态**，因此正确实现必须在 flatten 之前就判长度 —— 这一条是该用例的实际语义"
+  },
+  {
+   "case_id": "v08.accept.index-boundary",
+   "expect": "accept",
+   "expected_error": null,
+   "input_generator": {
+    "kind": "bundle.manifest",
+    "payload_bytes_rule": "同上",
+    "payload_count": 1000000
+   },
+   "note": "长度恰为 1000000 合法（最大下标 999999，六位放得下），必须接受"
+  },
+  {
+   "case_id": "v08.reject.unknown-set",
+   "expect": "reject",
+   "expected_error": "E-UNKNOWN-SET",
+   "input_scenario": {
+    "item_roots": [],
+    "op": "set_root",
+    "set_name": "payloads"
+   },
+   "note": "set_name 不在 §B.7 四值内"
+  },
+  {
+   "case_id": "v08.reject.dangling-payload",
+   "expect": "reject",
+   "expected_error": "E-DANGLING-PAYLOAD",
+   "input_scenario": {
+    "manifest_payload_hashes": [
+     "ae1e72bb7a3703d3c13b07c6c9d3e647c1cdb0efeab2221286f3e88fd0df36e3"
+    ],
+    "op": "referential_integrity",
+    "sidecar_items": [
+     {
+      "kind": "seal.entry",
+      "payload_hash": "d6ad880bbbc7a3ae5fd70f89943828911cf1d4fe6f9abfed65b9245e86e9893c"
+     }
+    ]
+   },
+   "note": "sidecar 里 entry 引用的 payload_hash 不在 manifest payloads[] 内。这是装配层丢了一次 add_payload 而 sidecar 照写的形态 —— 其余全部检查都会通过"
+  },
+  {
+   "case_id": "v08.reject.set-root-mismatch",
+   "expect": "reject",
+   "expected_error": "E-SET-ROOT-MISMATCH",
+   "input_scenario": {
+    "declared_count": 1,
+    "declared_root": "0000000000000000000000000000000000000000000000000000000000000000",
+    "items": [
+     {
+      "boundary_t": 8,
+      "canonical_path": "/home/u/.claude/projects/p/a.jsonl",
+      "dev": 66306,
+      "empty_reason": null,
+      "ino": 1234567,
+      "object_kind": "seal.entry",
+      "origin": "claude_code",
+      "payload_hash": "d6ad880bbbc7a3ae5fd70f89943828911cf1d4fe6f9abfed65b9245e86e9893c",
+      "prefix_digest": "e346432021b04179518d9614f3560ccd71354a4ee101ddcb893d6959a9d6301c",
+      "session_id": "sess-1"
+     }
+    ],
+    "op": "set_verify",
+    "set_name": "entries"
+   },
+   "note": "声明的 entries_root 与按 sidecar item 重算不等"
+  },
+  {
+   "case_id": "v08.reject.set-count-mismatch",
+   "expect": "reject",
+   "expected_error": "E-SET-COUNT-MISMATCH",
+   "input_scenario": {
+    "declared_count": 2,
+    "declared_root": "8f3c6478b6c927d6f2211592dd2a66dcc50616a84fb24ccf47bbc26fcd2089bc",
+    "items": [
+     {
+      "boundary_t": 8,
+      "canonical_path": "/home/u/.claude/projects/p/a.jsonl",
+      "dev": 66306,
+      "empty_reason": null,
+      "ino": 1234567,
+      "object_kind": "seal.entry",
+      "origin": "claude_code",
+      "payload_hash": "d6ad880bbbc7a3ae5fd70f89943828911cf1d4fe6f9abfed65b9245e86e9893c",
+      "prefix_digest": "e346432021b04179518d9614f3560ccd71354a4ee101ddcb893d6959a9d6301c",
+      "session_id": "sess-1"
+     }
+    ],
+    "op": "set_verify",
+    "set_name": "entries"
+   },
+   "note": "唯一缺陷：declared_count=2 而 items 只有 1 条；declared_root 填的是按 items 重算的正确值。与上一条分立：一个说清单不是一份，一个说条数报错"
+  },
+  {
+   "case_id": "v08.reject.payload-hash-mismatch",
+   "expect": "reject",
+   "expected_error": "E-PAYLOAD-HASH-MISMATCH",
+   "input_scenario": {
+    "actual_payload_bytes_hex": "7b2261223a397d0a",
+    "declared_payload_hash": "d6ad880bbbc7a3ae5fd70f89943828911cf1d4fe6f9abfed65b9245e86e9893c",
+    "op": "open_bundle"
+   },
+   "note": "盘上 payload 字节被改，重算 hash 与 manifest 声明不等"
+  },
+  {
+   "case_id": "v08.reject.bundle-root-mismatch",
+   "expect": "reject",
+   "expected_error": "E-BUNDLE-ROOT-MISMATCH",
+   "input_scenario": {
+    "expected_root_arg": "1111111111111111111111111111111111111111111111111111111111111111",
+    "manifest_case_ref": "v09.bundle-three-payloads",
+    "op": "open_bundle"
+   },
+   "note": "open_bundle 传入的外部期望 root 与按盘上 manifest 重算不等"
+  },
+  {
+   "case_id": "v08.domain-separation",
+   "expect": "accept",
+   "expected": {
+    "root_seal_entry": "c575bb7cf1ae786463bec011fd44c2cb2f26659988a6267e056010b076d3d7ed",
+    "root_test_tree": "6e7b8572567957a95d7f32bf1d4d18b986104839d524626d2fae0fcbf103d0ae",
+    "roots_must_differ": true,
+    "sorted_keys": [
+     "a",
+     "a_",
+     "ab"
+    ],
+    "tree_hash": "4f257c70eddad518df8b1a70d1e489364b3ec6f4dc5b53f5b3d0d64196e7f372",
+    "tree_hash_equal": true
+   },
+   "input": {
+    "a": "1",
+    "a_": "2",
+    "ab": "3"
+   },
+   "input_tags": {
+    "a": "s",
+    "a_": "s",
+    "ab": "s"
+   },
+   "note": "同一 leaf 集、两个域：tree_hash 相同，root 必须不同 —— 证明域分离真的生效",
+   "object_kind": "test.tree"
+  }
+ ],
+ "error_code_universe": [
+  "E-SCHEMA-VERSION",
+  "E-UNKNOWN-KIND",
+  "E-KIND-FORM",
+  "E-KIND-MISMATCH",
+  "E-UNKNOWN-SET",
+  "E-UNKNOWN-FIELD",
+  "E-MISSING-FIELD",
+  "E-NULL-NOT-ALLOWED",
+  "E-VALUE-FORM",
+  "E-PATH-FORM",
+  "E-FIELD-RANGE",
+  "E-KEY-FORM",
+  "E-DUP-KEY",
+  "E-INDEX-OVERFLOW",
+  "E-ARRAY-UNSORTED",
+  "E-ARRAY-DUPKEY",
+  "E-HOLD-REASON",
+  "E-HOLD-DETAIL",
+  "E-EMPTY-REASON",
+  "E-ORIGIN",
+  "E-FINGERPRINT-NULL",
+  "E-DANGLING-PAYLOAD",
+  "E-SET-ROOT-MISMATCH",
+  "E-SET-COUNT-MISMATCH",
+  "E-PAYLOAD-HASH-MISMATCH",
+  "E-BUNDLE-ROOT-MISMATCH"
+ ],
+ "note": "拒绝用例全码覆盖 + 域分离对照。每条 reject 用例都带真 input，可直接喂给 validator",
+ "vector_group": "v08"
+}

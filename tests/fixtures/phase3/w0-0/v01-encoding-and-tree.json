@@ -1,0 +1,236 @@
+{
+ "appendix_section": "§A.4/§A.5/§A.6",
+ "cases": [
+  {
+   "case_id": "v01.leaf.schema_version",
+   "expect": "accept",
+   "expected": {
+    "leaf_digest": "0baa15a1c9e20beb2ddf67fa6fc90cd39fc35bebe5eb06959c192cfbbd819f4e",
+    "preimage_hex": "636173732d77302d302f76312f6c656166000000000e736368656d615f76657273696f6e730000000777302d302f7631"
+   },
+   "input_leaf": {
+    "key": "schema_version",
+    "tag": "s",
+    "value": "w0-0/v1"
+   }
+  },
+  {
+   "case_id": "v01.leaf.object_kind",
+   "expect": "accept",
+   "expected": {
+    "leaf_digest": "5eeb07e4131a6aac2ea8ff612c7b28c23637bc490f8e9eb57ad06fedc8d65fd6",
+    "preimage_hex": "636173732d77302d302f76312f6c656166000000000b6f626a6563745f6b696e64730000000a7365616c2e656e747279"
+   },
+   "input_leaf": {
+    "key": "object_kind",
+    "tag": "s",
+    "value": "seal.entry"
+   }
+  },
+  {
+   "case_id": "v01.tree.0",
+   "expect": "accept",
+   "expected": {
+    "leaf_count": 0,
+    "levels": [
+     []
+    ],
+    "root": "341ed4231916778e6b1dc0b944dd62260662083367be1d59d0b61b105f01559c",
+    "root_domain": "cass-w0-0/v1/root/test.tree",
+    "sorted_keys": [],
+    "tree_hash": "aef3517519d959c8b02e60076c063ed99ace2bc3d910258780064e371c5e1c8d"
+   },
+   "input": {},
+   "input_tags": {},
+   "note": "",
+   "object_kind": "test.tree"
+  },
+  {
+   "case_id": "v01.tree.1",
+   "expect": "accept",
+   "expected": {
+    "leaf_count": 1,
+    "levels": [
+     [
+      "79c0824adcec6e1f1f568ca6a26e60a771611d8f2b0a234b625cb45a54d88fdf"
+     ]
+    ],
+    "root": "5379b96afa2c1e6d52382df30be49ef9dfdd1241425b75aaa1e0c753053ab6e4",
+    "root_domain": "cass-w0-0/v1/root/test.tree",
+    "sorted_keys": [
+     "a"
+    ],
+    "tree_hash": "79c0824adcec6e1f1f568ca6a26e60a771611d8f2b0a234b625cb45a54d88fdf"
+   },
+   "input": {
+    "a": "0"
+   },
+   "input_tags": {
+    "a": "s"
+   },
+   "note": "",
+   "object_kind": "test.tree"
+  },
+  {
+   "case_id": "v01.tree.2",
+   "expect": "accept",
+   "expected": {
+    "leaf_count": 2,
+    "levels": [
+     [
+      "79c0824adcec6e1f1f568ca6a26e60a771611d8f2b0a234b625cb45a54d88fdf",
+      "2e66bc273bd0dbd7d0ee8b1175e89212da03c737b1483c39cd3f12a588dd06d2"
+     ],
+     [
+      "add9f566818cc4924a7943520edb4a60ed90c59d66abc598b20bf707d24367f7"
+     ]
+    ],
+    "root": "88349accf673b541c5637a2950842f447667321fc29495bb47c6f815408b9b96",
+    "root_domain": "cass-w0-0/v1/root/test.tree",
+    "sorted_keys": [
+     "a",
+     "b"
+    ],
+    "tree_hash": "add9f566818cc4924a7943520edb4a60ed90c59d66abc598b20bf707d24367f7"
+   },
+   "input": {
+    "a": "0",
+    "b": "1"
+   },
+   "input_tags": {
+    "a": "s",
+    "b": "s"
+   },
+   "note": "",
+   "object_kind": "test.tree"
+  },
+  {
+   "case_id": "v01.tree.3",
+   "expect": "accept",
+   "expected": {
+    "leaf_count": 3,
+    "levels": [
+     [
+      "79c0824adcec6e1f1f568ca6a26e60a771611d8f2b0a234b625cb45a54d88fdf",
+      "2e66bc273bd0dbd7d0ee8b1175e89212da03c737b1483c39cd3f12a588dd06d2",
+      "0eb4c614f9f6ec044e2e49d7bf7add52d10552c99a27f4cf96253b8191ba5b78"
+     ],
+     [
+      "add9f566818cc4924a7943520edb4a60ed90c59d66abc598b20bf707d24367f7",
+      "0eb4c614f9f6ec044e2e49d7bf7add52d10552c99a27f4cf96253b8191ba5b78"
+     ],
+     [
+      "9fba00356749733c5aec91a81751511e2ee454745d8a72ea3b2a9101b546b6c8"
+     ]
+    ],
+    "root": "0047c6701b3093d9f893c6c3ef25f16e4854c68a4b4ea3cd36ed75bd166cc37a",
+    "root_domain": "cass-w0-0/v1/root/test.tree",
+    "sorted_keys": [
+     "a",
+     "b",
+     "c"
+    ],
+    "tree_hash": "9fba00356749733c5aec91a81751511e2ee454745d8a72ea3b2a9101b546b6c8"
+   },
+   "input": {
+    "a": "0",
+    "b": "1",
+    "c": "2"
+   },
+   "input_tags": {
+    "a": "s",
+    "b": "s",
+    "c": "s"
+   },
+   "note": "奇数尾原样上提，不复制、不填零",
+   "object_kind": "test.tree"
+  },
+  {
+   "case_id": "v01.tree.5",
+   "expect": "accept",
+   "expected": {
+    "leaf_count": 5,
+    "levels": [
+     [
+      "79c0824adcec6e1f1f568ca6a26e60a771611d8f2b0a234b625cb45a54d88fdf",
+      "2e66bc273bd0dbd7d0ee8b1175e89212da03c737b1483c39cd3f12a588dd06d2",
+      "0eb4c614f9f6ec044e2e49d7bf7add52d10552c99a27f4cf96253b8191ba5b78",
+      "58ba71523f243fef33708624f23ae66e32cc9513a9409e9196e84aa88bbde990",
+      "5ec0fe3b2f13dc47861c350a52952b94a69de12feee1657efe9d157c0d6cb0a0"
+     ],
+     [
+      "add9f566818cc4924a7943520edb4a60ed90c59d66abc598b20bf707d24367f7",
+      "67aff1fc1bad76ae7cda887bf4400cd635eea7c64f76f2d3c98ac2a2e81cbc0e",
+      "5ec0fe3b2f13dc47861c350a52952b94a69de12feee1657efe9d157c0d6cb0a0"
+     ],
+     [
+      "8b60db1bcfecb6b765f6e40a97cfb914a518a8da3947412de0dabc0eb8a9fed2",
+      "5ec0fe3b2f13dc47861c350a52952b94a69de12feee1657efe9d157c0d6cb0a0"
+     ],
+     [
+      "6dfd3564f16bbfc5bdf10d2f76f5c57e05e8cb57b11b89a633bb418e2f436f02"
+     ]
+    ],
+    "root": "35e95da2ab85cd1398ce4d27b9960bb56d3c55df2c468011a657ebd60606945c",
+    "root_domain": "cass-w0-0/v1/root/test.tree",
+    "sorted_keys": [
+     "a",
+     "b",
+     "c",
+     "d",
+     "e"
+    ],
+    "tree_hash": "6dfd3564f16bbfc5bdf10d2f76f5c57e05e8cb57b11b89a633bb418e2f436f02"
+   },
+   "input": {
+    "a": "0",
+    "b": "1",
+    "c": "2",
+    "d": "3",
+    "e": "4"
+   },
+   "input_tags": {
+    "a": "s",
+    "b": "s",
+    "c": "s",
+    "d": "s",
+    "e": "s"
+   },
+   "note": "奇数尾原样上提，不复制、不填零",
+   "object_kind": "test.tree"
+  },
+  {
+   "case_id": "v01.ordering",
+   "expect": "accept",
+   "expected": {
+    "root": "fcbd1e8b998723a65031c57543d12b6646fca3115cc15a88376404fc91b47812",
+    "sorted_keys": [
+     "a",
+     "a0",
+     "a_",
+     "ab",
+     "b"
+    ],
+    "tree_hash": "58899a5f4ac38eff0fa73e990beb1c1499eecd9ef20d6f53bb057aebfefa2f2e"
+   },
+   "input": {
+    "a": "1",
+    "a0": "0",
+    "a_": "2",
+    "ab": "3",
+    "b": "4"
+   },
+   "input_tags": {
+    "a": "s",
+    "a0": "s",
+    "a_": "s",
+    "ab": "s",
+    "b": "s"
+   },
+   "note": "a < a0 < a_ < ab < b（`_`=0x5F 排在小写字母 0x61 之前）",
+   "object_kind": "test.tree"
+  }
+ ],
+ "note": "leaf digest worked example + test.tree 树形状（裸 leaf 集，input_tags 声明 tag）",
+ "vector_group": "v01"
+}

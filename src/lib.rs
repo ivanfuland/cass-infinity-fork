@@ -40,6 +40,8 @@ pub mod metric_integrity;
 pub mod model;
 pub mod pages;
 pub mod perf_evidence;
+pub mod phase3_bundle;
+pub mod phase3_restore;
 pub mod policy_registry;
 pub mod privacy_exposure;
 pub mod proof_artifact;
@@ -649,6 +651,186 @@ pub enum Commands {
         timeout: Option<u64>,
     },
     /// Show statistics about indexed data
+    /// Rebuild raw-mirror manifest `db_links` from real identity (dry-run by default)
+    MirrorRelink {
+        /// Override data dir
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+
+        /// Actually write the rebuilt db_links. Without this flag nothing is written.
+        ///
+        /// **不带 `--journal` 时这一轮没有崩溃恢复记录**（R4 第 7 条 / 裁定 R-E-110 K3）：
+        /// SIGKILL 落在几份 manifest 写完之后，盘上是一棵**半重链接**的树，
+        /// 而没有 journal 就没有 `--recover` 可走。要 crash-safe 就给 `--journal`。
+        #[arg(long, default_value_t = false, conflicts_with = "recover")]
+        apply: bool,
+
+        /// 本轮的 journal 落点。给了它，`--apply` 走**带 journal 的**那条路
+        /// （七态推进 + receipt），崩溃后可以 `--recover --journal <同一路径>` 收敛。
+        ///
+        /// **落点必须与候选库（含 sidecar）、W1 commit marker、raw-mirror 树互异**
+        /// —— 与 `mirror-restore --journal` 同一套校验（R3 第 4 条 / R-E-103 J2）。
+        /// 新开的写面照同一套走，免得又长出一张「兄弟路上缺同一道检查」的脸。
+        #[arg(long)]
+        journal: Option<PathBuf>,
+
+        /// 崩溃后收敛：**输入只有磁盘上的 journal**。
+        ///
+        /// 修好的恢复逻辑此前**没有 CLI 面**：`relink_apply_journaled` 与 `relink_recover`
+        /// 全仓只有测试调用方，而 crash-safe relink 是本 PR 迁移用途的核心承诺 ——
+        /// **不通电的恢复逻辑等于装饰品**（R4 第 7 条）。
+        #[arg(long, default_value_t = false, requires = "journal")]
+        recover: bool,
+
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+    },
+
+    /// Plan (and optionally apply) a restore from the sealed raw-mirror into a
+    /// candidate database.
+    ///
+    /// **Dry-run by default: neither the mirror nor the candidate database is
+    /// written.** Planning still materializes projections under `--scratch`, and
+    /// `--out` writes report files — so this is not a no-write mode. The earlier
+    /// wording ("nothing is written") was inaccurate (R1 Finding 15 / R-E-84).
+    MirrorRestore {
+        /// mirror 面的根。**入参而非常量** —— E8 给封存件只读面，
+        /// E8b 换 materialize 出来的可写工作树。
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+
+        /// 候选 DB 的稳定副本。dry-run 只读它。
+        ///
+        /// **前提（不是保证）：这个库在整轮运行期间必须没有别的写者。**
+        /// `PlannedAction::Replace` 只记 `conversation_id`、不落任何内容前置条件，
+        /// 规划与施加之间也没有针对候选库的锁或 CAS —— 前提不成立时工具**不会替你发现**，
+        /// 它只会照计划施加（R2 第 2 条 / R-E-98 I）。要不要把这条前提升级成运行时强制，
+        /// 是 merge 后的决定项：加锁会改变本命令的并发语义。
+        ///
+        /// **叫 `--candidate-db` 不叫 `--db`**：顶层 `Cli` 已经有一个全局 `--db`
+        /// （`src/lib.rs` 的 `pub struct Cli`），同名会被参数恢复层提到最前、
+        /// 让整个子命令解析崩掉（本棒实测：报的是「unexpected argument '--scratch'」，
+        /// 与真因隔着两层）。全局名复用成另一个含义，是日后必然咬人的歧义。
+        ///
+        /// **`--recover` 时允许缺席**（R3 第 13 条 / 裁定 R-E-103 J3）：R-E-19 第三条定的是
+        /// 「恢复的入参只有 journal 路径」，实现一直遵守（运行时忽略这三个），
+        /// **是参数层没跟上** —— 从前它是无条件必填，于是文档给的恢复命令在解析阶段
+        /// 就被拒，操作者只能编三个被忽略的假值。
+        #[arg(long, required_unless_present = "recover")]
+        candidate_db: Option<PathBuf>,
+
+        /// 投影物化用的隔离根。**不进任何判定**。
+        ///
+        /// **应当是本次运行独占的目录。** 复用一棵旧 scratch 有风险：物化件按内容定名
+        /// 落在 `<scratch>/v-<hash>/` 下，这些目录名在第一轮之后就都在盘上了；
+        /// 若其中某一级分量被换成指向外部的 symlink，物化就会跟着走出去。
+        /// 工具在这条路上做了两件事，**但只有第一件是防护**（R3 第 7 条 / 裁定 R-E-103 J3
+        /// 把措辞改成如实的）：写前逐分量拒 symlink（R-E-84 (a)）**挡得住**逃逸；
+        /// 写后的前缀断言（R-E-84 (c)）**只能事后发现** —— 覆盖若已发生，就发生在那条断言
+        /// 之前，它拦不住损坏，只负责让这一轮以具名错误停下并把现场留着
+        /// （R-E-98 H2 之后它连删都不删：删了只是在既成损失上再加一笔，还抹掉现场）。
+        /// 而 (a) 本身是 check-then-use，那个 TOCTOU 窗按 R-E-84 裁定**不修**。
+        /// **所以独占目录不是「更省事」，是这条路上唯一不依赖时序的那道保障。**
+        ///
+        /// 物化件**出生即私有**（目录 `0700`、文件 `0600`，R3 第 6 条 / 裁定 R-E-103 J2）——
+        /// 里面是**完整会话原文**，连 `home/<u>/.claude/projects/<ws>/` 这几级目录名本身
+        /// 都是家目录全路径与工作区名。复用一棵旧 scratch 时，被放宽过的既有目录与文件
+        /// 会在本轮被收紧。
+        ///
+        /// **`--recover` 与 `--qualify` 时都允许缺席**（R3 第 13 条 + R4 第 8 条）：
+        /// 资格门只读**四个对象**（候选库 / data-dir / marker / journal），
+        /// 它**从不读** scratch 与 snapshot-root。**R3 第 13 条只修在 `--recover` 那一维上，
+        /// 而 `--qualify` 是同一形状的第二面** —— 逼操作者为一道只读的门编两个假值。
+        #[arg(long, required_unless_present_any = ["recover", "qualify"])]
+        scratch: Option<PathBuf>,
+
+        /// 本轮消费的封存件根。
+        ///
+        /// **`--recover` 与 `--qualify` 时都允许缺席**（同 `--scratch`，R4 第 8 条）。
+        #[arg(long, required_unless_present_any = ["recover", "qualify"])]
+        snapshot_root: Option<String>,
+
+        /// 六类计数与 HOLD 清单的落点（JSON）。不给则只打印摘要。
+        ///
+        /// **默认 dry-run 就会写它**，连同两个派生落点 `<out>.holds.json` 与
+        /// `<out>.ambiguity.tsv`。所以它与 `--journal` **同规**（R3 第 5 条 /
+        /// 裁定 R-E-103 J2）：这三个落点都不得与 `--candidate-db`（含 sidecar）、
+        /// W1 commit marker、raw-mirror 树同路径，彼此之间也必须互异。
+        /// 不校验的后果不是「多写一个文件」——`--out <候选库路径>`
+        /// **不给 `--apply` 也会替换候选库**。
+        #[arg(long)]
+        out: Option<PathBuf>,
+
+        /// 真正执行计划。
+        ///
+        /// **不给这个 flag 时，不写 mirror、也不写候选库**——但**不是「什么都不写」**：
+        /// 规划过程本身会把投影物化到 `--scratch` 下，给了 `--out` 还会写报告文件。
+        /// 原先那句「什么都不写」是不准的（R1 Finding 15 / R-E-84）。
+        ///
+        /// **与 `--recover` / `--qualify` 互斥**（R4 第 3 条 / 裁定 R-E-110 K1）：
+        /// 三者此前零冲突声明，而分派顺序是 `recover` → `qualify` → `apply`，
+        /// 于是 `--recover --qualify` 跑的是**会写库的恢复**且永不资格校验 ——
+        /// 与 `--qualify` 自己的 help「不写任何东西」直接冲突。
+        /// 判据钉在**解析层**：做成运行时的优先级判断，等于让操作者先按下回车，
+        /// 才知道自己要的那件事根本没发生。
+        #[arg(long, default_value_t = false, conflicts_with_all = ["recover", "qualify"])]
+        apply: bool,
+
+        /// 崩溃后收敛：**输入只有磁盘上的 journal + receipt**。
+        /// 没有这个入口，七态恢复器就只有测试能调 —— 而操作者在真崩之后无路可走。
+        ///
+        /// **与 `--qualify` 互斥**（R4 第 3 条 / 裁定 R-E-110 K1）：分派把 `recover`
+        /// 排在最前，两个一起给时资格校验**永不发生**，而操作者以为自己只是在校验。
+        #[arg(long, default_value_t = false, conflicts_with = "qualify")]
+        recover: bool,
+
+        /// 只跑**解析级资格门**（不写任何东西）：解析 W1 commit marker 并逐层复核
+        /// journal 终态 / closure verdict / 双身份 / receipt 交叉核 / 代际。
+        #[arg(long, default_value_t = false)]
+        qualify: bool,
+
+        /// `--qualify` 的**深度档**：把每个 blob 的真实字节全读一遍重算 blake3。
+        ///
+        /// 两档各保证什么（裁定 R-E-91）：
+        /// **默认档**摘 manifest 的文件字节进 mirror 身份，并逐份核 blob 的存在性与
+        /// 字节数 —— 挡得住 manifest 被改、blob 被删被截被换成不同长度的东西，
+        /// **挡不住等长改写**。
+        /// **深度档**额外重算 blob 字节，等长改写也挡得住；代价是一次全量顺序读
+        /// （真语料约 9 GiB），所以它是开关而不是默认。
+        #[arg(long, default_value_t = false, requires = "qualify")]
+        deep_verify: bool,
+
+        /// `--apply` 的 journal 落点（七态状态机的真源）。`--apply` 时必需。
+        ///
+        /// **不得与 `--candidate-db`（含与它同名打头的 sidecar）、W1 commit marker、
+        /// raw-mirror 树同路径**（R3 第 4 条 / 裁定 R-E-103 J2）。写 journal 走的是
+        /// 「同目录临时件 + `rename` 顶上」，而 `rename` **替换掉**落点上原有的普通文件 ——
+        /// 指到候选库，就是在 DB 阶段打开它之前把它换成一份 JSON，规划阶段读得通、
+        /// 第一次写 journal 当场毁库。**别名不只是符号链接**：另一条指向同一个文件的
+        /// 普通路径同样是别名，这道校验按**归约后的路径**与**同一 inode** 两面判。
+        ///
+        /// 落点**已被占用时本命令拒绝，不覆盖**：那份 journal 可能是上一轮崩在半路时
+        /// 留下的**唯一记录**。要继续那一轮，用 `--recover --journal <同一路径>`；
+        /// 要开新的一轮，换一个新路径。
+        #[arg(long)]
+        journal: Option<PathBuf>,
+
+        /// W1 commit marker 的落点。**不给则默认与候选 DB 同居**
+        /// （`<db 所在目录>/w1-commit-marker.json`）—— wire 说明定的就是这个约定，
+        /// 由 CLI 兑现它，而不是让每个调用方自己拼一遍。
+        #[arg(long)]
+        marker: Option<PathBuf>,
+
+        /// 本次 restore 推进到的内容代际。`--apply` 时必需。
+        #[arg(long)]
+        generation: Option<String>,
+
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+    },
+
     Stats {
         /// Override data dir
         #[arg(long)]
@@ -3123,6 +3305,70 @@ fn recover_robot_docs_topic_shorthands(rest: &mut Vec<String>, corrections: &mut
     corrections.push(format!(
         "'{alias}' → 'robot-docs {topic}' (robot-docs topic shorthand)"
     ));
+}
+
+/// 裁定 R-E-63 的回归钉死：两个 `mirror-*` 子命令带 `--json` 必须**直解析到位**，
+/// 不经参数恢复层重排。
+///
+/// 起因是实测：`mirror-restore --json` 被恢复层在前面插了个 `search`
+/// （`normalized_attempt`: `search mirror-restore …`），报错却报在下一个不认识的 flag 上，
+/// 与真因隔着一层重写。`mirror-relink` 当时能过，是因为它与表里的 `"mirror"`
+/// **模糊匹配**上了 —— **能用但脆**：这张表再多一个近似词就可能改变匹配结果。
+#[cfg(test)]
+mod mirror_subcommand_recovery_regression_tests {
+    use super::*;
+
+    #[test]
+    fn mirror_subcommands_with_json_are_not_rewritten_to_search() {
+        for sub in ["mirror-relink", "mirror-restore"] {
+            let mut rest = vec![
+                sub.to_string(),
+                "--data-dir".to_string(),
+                "/tmp/x".to_string(),
+                "--json".to_string(),
+            ];
+            let before = rest.clone();
+            let mut corrections = Vec::new();
+            recover_implicit_robot_search_query(&mut rest, &mut corrections);
+            assert_eq!(
+                rest, before,
+                "`{sub} --json` 不得被恢复层改写 —— 它是真子命令，不是隐式查询"
+            );
+            assert!(
+                corrections.is_empty(),
+                "`{sub} --json` 不该产生任何 correction，实得 {corrections:?}"
+            );
+        }
+    }
+
+    /// **阳性对照**：真正的隐式查询仍必须被恢复。
+    /// 没有这一条，上面那条可能只是因为这个函数什么都不做而恒绿。
+    #[test]
+    fn an_actual_implicit_query_is_still_recovered() {
+        let mut rest = vec!["kubernetes crash loop".to_string(), "--json".to_string()];
+        let mut corrections = Vec::new();
+        recover_implicit_robot_search_query(&mut rest, &mut corrections);
+        assert!(
+            !corrections.is_empty(),
+            "隐式查询必须仍被恢复，否则上面那条用例证明不了任何事"
+        );
+        assert_ne!(
+            rest.first().map(String::as_str),
+            Some("kubernetes crash loop"),
+            "恢复后首个 token 应当是被插入的命令名"
+        );
+    }
+
+    /// 两个子命令都必须在 canonical 命令表里 —— **不靠模糊匹配**。
+    #[test]
+    fn both_mirror_subcommands_are_canonical() {
+        for sub in ["mirror-relink", "mirror-restore"] {
+            assert!(
+                CANONICAL_TOP_LEVEL_COMMANDS.contains(&sub),
+                "{sub} 必须显式在 CANONICAL_TOP_LEVEL_COMMANDS 内（裁定 R-E-63）"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -5839,6 +6085,14 @@ const CANONICAL_TOP_LEVEL_COMMANDS: &[&str] = &[
     "swarm",
     "timeline",
     "mirror",
+    // 裁定 R-E-63：两个 `mirror-*` 子命令都要显式在表内。
+    //
+    // `mirror-relink` 今天不在表里也能用 —— 它靠与 `"mirror"` 的**模糊匹配**侥幸过关；
+    // `mirror-restore` 距离更远就匹配不上，于是带 `--json` 时被参数恢复层当成搜索查询、
+    // 在前面插了个 `search`（实测 `normalized_attempt`：`search mirror-restore …`）。
+    // **把正确性押在模糊匹配的当前形状上，等于给下一个改这张表的人留雷。**
+    "mirror-relink",
+    "mirror-restore",
     "export",
     "export-html",
     "pages",
@@ -6507,6 +6761,8 @@ async fn execute_cli(
         | Commands::Search { .. }
         | Commands::Pack { .. }
         | Commands::Stats { .. }
+        | Commands::MirrorRelink { .. }
+        | Commands::MirrorRestore { .. }
         | Commands::Diag { .. }
         | Commands::Storage { .. }
         | Commands::Dedup { .. }
@@ -6793,6 +7049,511 @@ async fn execute_cli(
                         eff_timeout,
                         wrap,
                     )?;
+                }
+                Commands::MirrorRestore {
+                    data_dir,
+                    candidate_db,
+                    scratch,
+                    snapshot_root,
+                    out,
+                    apply,
+                    recover,
+                    qualify,
+                    deep_verify,
+                    journal,
+                    marker,
+                    generation,
+                    json,
+                } => {
+                    let resolved = data_dir.clone().unwrap_or_else(default_data_dir);
+                    let fail = |kind: &'static str, err: String| CliError {
+                        code: 1,
+                        kind,
+                        message: err,
+                        hint: None,
+                        retryable: false,
+                    };
+                    // ── --recover：入参只有 journal 路径（R-E-19 第三条）──────
+                    if recover {
+                        let journal_path = journal.clone().ok_or_else(|| {
+                            fail(
+                                "mirror_restore_recover_needs_journal",
+                                "--recover requires --journal".to_string(),
+                            )
+                        })?;
+                        let outcome = crate::phase3_restore::restore_recover(&journal_path)
+                            .map_err(|err| {
+                                fail("mirror_restore_recover_failed", err.to_string())
+                            })?;
+                        let state = crate::phase3_restore::restore_journal_read(&journal_path)
+                            .map_err(|err| fail("mirror_restore_recover_failed", err.to_string()))?
+                            .map(|j| format!("{:?}", j.state))
+                            .unwrap_or_else(|| "missing".to_string());
+                        let (as_json, as_text) = mirror_restore_recover_report(&state, &outcome);
+                        if json {
+                            println!("{as_json}");
+                        } else {
+                            println!("{as_text}");
+                        }
+                        return Ok(());
+                    }
+
+                    // ── 候选库：`--recover` 之外一律必需（clap 已把门，这里是 belt）──
+                    let candidate_db = candidate_db.clone().ok_or_else(|| {
+                        fail(
+                            "mirror_restore_needs_candidate_db",
+                            "--candidate-db is required unless --recover is given".to_string(),
+                        )
+                    })?;
+
+                    // ── --qualify：只解析、只复核，**不产计划也不写任何东西** ──
+                    //
+                    // **这一支排在 `options` 构造之前**（R4 第 8 条 / 裁定 R-E-110 K3）：
+                    // 资格门只读四个对象，`scratch` 与 `snapshot_root` 它从不读，
+                    // 于是那两个在 `--qualify` 下允许缺席 —— 而 `options` 要用它们。
+                    // 与 J3 把 `--recover` 支前移是同一件事的第二面。
+                    if qualify {
+                        let marker_path = default_w1_marker_path(marker.as_ref(), &candidate_db);
+                        let journal_path = journal.clone().ok_or_else(|| {
+                            fail(
+                                "mirror_restore_qualify_needs_journal",
+                                "--qualify requires --journal".to_string(),
+                            )
+                        })?;
+                        let depth = if deep_verify {
+                            crate::phase3_restore::MirrorVerifyDepth::Deep
+                        } else {
+                            crate::phase3_restore::MirrorVerifyDepth::Default
+                        };
+                        let verdict = crate::phase3_restore::qualify_w1_candidate(
+                            &crate::phase3_restore::W1QualificationInput {
+                                marker_path: &marker_path,
+                                journal_path: &journal_path,
+                                db_path: &candidate_db,
+                                data_dir: &resolved,
+                                mirror_verify_depth: depth,
+                            },
+                        );
+                        return match verdict {
+                            Ok(qualification) => {
+                                let marker = &qualification.marker;
+                                // 覆盖面随判定一起报（R-E-91）：一道跑在空 mirror 上的门
+                                // 与一道查完全过的门，退出码一模一样。查了几份必须看得见，
+                                // 否则「过了」这两个字没有分辨力。
+                                let blobs = qualification.mirror_blobs;
+                                let depth_label = match qualification.mirror_verify_depth {
+                                    crate::phase3_restore::MirrorVerifyDepth::Default => "default",
+                                    crate::phase3_restore::MirrorVerifyDepth::Deep => "deep",
+                                };
+                                if json {
+                                    println!(
+                                        "{}",
+                                        serde_json::json!({
+                                            "qualified": true,
+                                            "operation_id": marker.operation_id,
+                                            "snapshot_root": marker.snapshot_root,
+                                            "content_generation": marker.content_generation,
+                                            "planned_count": marker.planned_count,
+                                            // 只报不判：`qualified` 的判定不因这两格
+                                            // 改变（带 HOLD 的部分恢复可以是合法的，
+                                            // 硬拒会误杀），但消费者有权看见再决定。
+                                            "holds_count": marker.holds_count,
+                                            "origin_unmapped_count": marker.origin_unmapped_count,
+                                            "mirror_verify_depth": depth_label,
+                                            "mirror_manifests_checked": blobs.manifests_checked,
+                                            "mirror_blobs_digested": blobs.blobs_digested,
+                                        })
+                                    );
+                                } else {
+                                    println!(
+                                        "qualified: operation={} snapshot_root={} \
+                                         generation={} holds={} origin_unmapped={} \
+                                         mirror_verify={} manifests_checked={} blobs_digested={}",
+                                        marker.operation_id,
+                                        marker.snapshot_root,
+                                        marker.content_generation,
+                                        marker.holds_count,
+                                        marker.origin_unmapped_count,
+                                        depth_label,
+                                        blobs.manifests_checked,
+                                        blobs.blobs_digested
+                                    );
+                                }
+                                Ok(())
+                            }
+                            // **每层以自己的名义拒绝**：错误码原样带出，不折叠成一句「不合格」。
+                            Err(err) => Err(CliError {
+                                code: 1,
+                                kind: "mirror_restore_not_qualified",
+                                message: format!("{}: {err}", err.code()),
+                                hint: None,
+                                retryable: false,
+                            }),
+                        };
+                    }
+
+                    // ── 规划路径还要那两件（`--recover` / `--qualify` 之外 clap 已把门）──
+                    //
+                    // 这里的具名错误是 **belt**：门是 `required_unless_present_any`。
+                    // 万一日后有人动了那个属性，这里保证死在一句说得清的话上，
+                    // 而不是 `unwrap` 的 panic 或一个空路径。
+                    let scratch = scratch.clone().ok_or_else(|| {
+                        fail(
+                            "mirror_restore_needs_scratch",
+                            "--scratch is required unless --recover or --qualify is given"
+                                .to_string(),
+                        )
+                    })?;
+                    let snapshot_root = snapshot_root.clone().ok_or_else(|| {
+                        fail(
+                            "mirror_restore_needs_snapshot_root",
+                            "--snapshot-root is required unless --recover or --qualify is given"
+                                .to_string(),
+                        )
+                    })?;
+                    let options = crate::phase3_restore::MirrorRestorePlanOptions {
+                        data_dir: resolved,
+                        db_path: candidate_db,
+                        scratch_dir: scratch,
+                        snapshot_root: snapshot_root.clone(),
+                    };
+
+                    let report = crate::phase3_restore::plan_mirror_restore(&options)
+                        .map_err(|err| fail("mirror_restore_plan_failed", err.to_string()))?;
+
+                    // 按 slug 分组报，不只报一个总数：操作者要知道**是哪些** slug 没映上，
+                    // 一个 3443 只能告诉他「有问题」，告诉不了他去改什么。
+                    let mut unmapped_provider_tally: std::collections::BTreeMap<&str, usize> =
+                        std::collections::BTreeMap::new();
+                    for record in &report.origin_unmapped {
+                        *unmapped_provider_tally
+                            .entry(record.provider.as_str())
+                            .or_default() += 1;
+                    }
+
+                    // 按 **reason** 细分，不只按 class 汇总（R-E-69 条件 3a）。
+                    // `projection-empty` 与 `payload-hash-mismatch` 同属 input-corruption 类，
+                    // 但前者绝大多数是「会话树里的非会话文件」而不是坏字节；只报 class 会让
+                    // 读报告的人把几千条好文件读成「损坏」。
+                    let mut holds_by_reason: std::collections::BTreeMap<&str, usize> =
+                        std::collections::BTreeMap::new();
+                    let mut holds_by_class: std::collections::BTreeMap<&str, usize> =
+                        std::collections::BTreeMap::new();
+                    for hold in &report.holds {
+                        *holds_by_reason.entry(hold.reason.as_str()).or_default() += 1;
+                        *holds_by_class
+                            .entry(hold.reason.class().as_str())
+                            .or_default() += 1;
+                    }
+
+                    // R-E-72：dry-run 产**三件**（plan Task E8 §4）——计数、HOLD 清单、歧义表。
+                    // 在此之前只落了计数，`report.holds` 里那 5574 条记录**从未落盘**，而
+                    // HOLD 清单正是 Phase 4 开工资格的输入。
+                    //
+                    // 两份新文件**只在 `--out` 语境下写**，`0600`，且**永不进 repo**：
+                    // `identity.canonical_path` 是家目录全路径、`origin` 带 agent 名。仓里
+                    // 只引计数，脱敏由取材方各自负责。
+                    //
+                    // 歧义表是 HOLD 清单的**呈现**而不是第二份事实：两者由同一个 `Vec` 在同
+                    // 一次遍历里产出，TSV 只是给人读的那一面。
+                    let holds_json: Vec<serde_json::Value> = report
+                        .holds
+                        .iter()
+                        .map(|h| {
+                            let (evidence_kind, evidence_detail) = match &h.evidence {
+                                crate::phase3_restore::HoldEvidence::ByteLayer { versions } => {
+                                    ("byte-layer", format!("{} versions", versions.len()))
+                                }
+                                crate::phase3_restore::HoldEvidence::MessageLayer {
+                                    versions,
+                                    first_divergent_index,
+                                } => (
+                                    "message-layer",
+                                    format!(
+                                        "{} versions, first divergence at {:?}",
+                                        versions.len(),
+                                        first_divergent_index
+                                    ),
+                                ),
+                                crate::phase3_restore::HoldEvidence::WholeFileExcluded {
+                                    detail,
+                                } => ("whole-file-excluded", detail.clone()),
+                                // R3 第 12 条：读不动时那句 detail 就是操作者要的全部
+                                // 线索（是哪一份、哪里不对）—— 它必须到得了 HOLD 台账。
+                                crate::phase3_restore::HoldEvidence::InputUnreadable { detail } => {
+                                    ("input-unreadable", detail.clone())
+                                }
+                                crate::phase3_restore::HoldEvidence::Versions { versions } => {
+                                    ("versions", format!("{} versions", versions.len()))
+                                }
+                            };
+                            serde_json::json!({
+                                "identity": h.identity.to_string(),
+                                // R-E-103：这里报的是**保真的原始 provider 串**（含 openclaw 实例），
+                                // 不是闭世界折叠值 —— 折叠值会让 HOLD 台账认不出是哪个实例。
+                                "agent": h.identity.origin.agent_slug.clone(),
+                                "source_id": h.identity.origin.source_id,
+                                "origin_host": h.identity.origin.origin_host,
+                                "canonical_path": h.identity.canonical_path,
+                                "reason": h.reason.as_str(),
+                                "class": h.reason.class().as_str(),
+                                "evidence_kind": evidence_kind,
+                                "evidence_detail": evidence_detail,
+                                "consumed_manifest_fields": h.consumed_manifest_fields,
+                            })
+                        })
+                        .collect();
+
+                    // 反截断断言：清单条数必须等于 HOLD 数，且等于按 reason 分解之和。
+                    // **写进代码而不是留给人对**——一份被静默截断的 HOLD 清单，读的人
+                    // 只会以为「就这么多」。
+                    let by_reason_sum: usize = holds_by_reason.values().sum();
+                    if holds_json.len() != report.holds.len() || by_reason_sum != report.holds.len()
+                    {
+                        return Err(fail(
+                            "mirror_restore_hold_ledger_truncated",
+                            format!(
+                                "hold ledger accounting is off: {} records rendered, {} holds in                                  the report, {} summed across reasons",
+                                holds_json.len(),
+                                report.holds.len(),
+                                by_reason_sum
+                            ),
+                        ));
+                    }
+
+                    let summary = serde_json::json!({
+                        "identities_considered": report.identities_considered,
+                        "skip": report.census.skip,
+                        "restore": report.census.restore,
+                        "replace": report.census.replace,
+                        "hold_superset": report.census.hold_superset,
+                        "hold_diverged": report.census.hold_diverged,
+                        "hold_multiple_candidates": report.census.hold_multiple_candidates,
+                        "non_relation_holds": report.non_relation_holds,
+                        "candidate_versions_seen": report.candidate_versions_seen,
+                        "holds": report.holds.len(),
+                        "holds_by_reason": holds_by_reason,
+                        "holds_by_class": holds_by_class,
+                        "planned_actions": report.plan.len(),
+                        "non_promotable": true,
+                        // R-E-67：manifest 分类层与 planner 层**分开报数，不合并成一个
+                        // 「接受率」**。前者的分母是 manifest，后者的分母是 identity 组；
+                        // 揉成一个数就没人能说清那个百分比在讲什么。
+                        "manifests_seen": report.manifests_seen,
+                        "origin_unmapped": report.origin_unmapped.len(),
+                        "origin_unmapped_providers": unmapped_provider_tally,
+                        // FIND-1（2026-08-19 上位裁定：B 案）：不加代际字段，改把操作规约写进
+                        // 工具自己的嘴里——靠人记得的规约迟早会被忘掉一次。
+                        "post_apply_requirement":
+                            "after --apply you must re-ingest in full; until that re-ingest \
+                             completes, watch-once incremental decisions are not trustworthy",
+                    });
+                    let mut summary = summary;
+                    if let Some(path) = out.as_ref() {
+                        let out_marker_path =
+                            default_w1_marker_path(marker.as_ref(), &options.db_path);
+                        mirror_restore_write_out_reports(
+                            path,
+                            &crate::phase3_restore::RestoreProtectedInputs {
+                                db_path: &options.db_path,
+                                marker_path: &out_marker_path,
+                                data_dir: &options.data_dir,
+                            },
+                            journal.as_deref(),
+                            &mut summary,
+                            &holds_json,
+                        )
+                        .map_err(|e| fail("mirror_restore_out_failed", e))?;
+                    }
+
+                    if apply {
+                        let journal_path = journal.clone().ok_or_else(|| {
+                            fail(
+                                "mirror_restore_apply_needs_journal",
+                                "--apply requires --journal".to_string(),
+                            )
+                        })?;
+                        let marker_path = default_w1_marker_path(marker.as_ref(), &options.db_path);
+                        let generation = generation.clone().ok_or_else(|| {
+                            fail(
+                                "mirror_restore_apply_needs_generation",
+                                "--apply requires --generation".to_string(),
+                            )
+                        })?;
+                        let plan = crate::phase3_restore::RestoreRunPlan {
+                            operation_id: format!("mirror-restore:{snapshot_root}"),
+                            data_dir: options.data_dir.clone(),
+                            scratch_dir: options.scratch_dir.clone(),
+                            db_path: options.db_path.clone(),
+                            marker_path,
+                            snapshot_root: options.snapshot_root.clone(),
+                            generation,
+                            planned: report.plan.clone(),
+                            // R-E-79 (a) 条件 4：两格取自**同一次 run 的 report**。
+                            // 事后另数一遍就是第二定义，而两份「数得一样」还要再验一次。
+                            holds_count: report.holds.len() as i64,
+                            origin_unmapped_count: report.origin_unmapped.len() as i64,
+                        };
+                        let outcome =
+                            crate::phase3_restore::restore_apply_journaled(plan, &journal_path)
+                                .map_err(|err| {
+                                    fail("mirror_restore_apply_failed", err.to_string())
+                                })?;
+                        let (as_json, as_text) = mirror_restore_apply_report(&outcome);
+                        if json {
+                            println!("{as_json}");
+                        } else {
+                            println!("{as_text}");
+                        }
+                    } else if json {
+                        println!("{summary}");
+                    } else {
+                        println!(
+                            "dry-run: {} manifests -> {} identities ({} origin-unmapped); \
+                             skip={} restore={} replace={} holds={} other-holds={} \
+                             candidate-versions={} planned={} (non-promotable)",
+                            report.manifests_seen,
+                            report.identities_considered,
+                            report.origin_unmapped.len(),
+                            report.census.skip,
+                            report.census.restore,
+                            report.census.replace,
+                            report.holds.len(),
+                            report.non_relation_holds,
+                            report.candidate_versions_seen,
+                            report.plan.len(),
+                        );
+                    }
+                }
+                Commands::MirrorRelink {
+                    data_dir,
+                    apply,
+                    journal,
+                    recover,
+                    json,
+                } => {
+                    let resolved = data_dir.clone().unwrap_or_else(default_data_dir);
+                    let relink_fail = |kind: &'static str, err: String| CliError {
+                        code: 1,
+                        kind,
+                        message: err,
+                        hint: None,
+                        retryable: false,
+                    };
+
+                    // ── journal 落点的互异性：与 `mirror-restore --journal` 同一套 ──
+                    //
+                    // 新开一个写面而不给它同等防护，就是**亲手长出第四张脸**
+                    // （symlink → 别名 → 硬链接 → 这里）。受保护输入按 relink 的现场取：
+                    // 候选库是 `<data-dir>/agent_search.db`（`relink_recover` 自己就这么取），
+                    // marker 落点按 restore 的默认约定（与它同居）。
+                    if let Some(journal_path) = journal.as_ref() {
+                        validate_relink_journal_target(&resolved, journal_path)
+                            .map_err(|e| relink_fail("mirror_relink_journal_path_unsafe", e))?;
+                    }
+
+                    // ── --recover：入参只有 journal 路径 ──────────────────────
+                    //
+                    // 修前 `relink_recover` **全仓只有测试调用方** —— 崩在几份 manifest
+                    // 写完之后，操作者手上是一棵半重链接的树，没有任何收敛入口（R4 第 7 条）。
+                    if recover {
+                        let journal_path = journal.clone().ok_or_else(|| {
+                            relink_fail(
+                                "mirror_relink_recover_needs_journal",
+                                "--recover requires --journal".to_string(),
+                            )
+                        })?;
+                        let report = relink_recover(&journal_path).map_err(|err| {
+                            relink_fail("mirror_relink_recover_failed", err.to_string())
+                        })?;
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "recovered": true,
+                                    "scanned_manifests": report.scanned_manifests,
+                                    "changes": report.changes.len(),
+                                })
+                            );
+                        } else {
+                            println!(
+                                "recovered: scanned_manifests={} changes={}",
+                                report.scanned_manifests,
+                                report.changes.len()
+                            );
+                        }
+                        return Ok(());
+                    }
+
+                    // ── `--apply --journal`：走带 journal 的那条路 ────────────
+                    if apply && let Some(journal_path) = journal.as_ref() {
+                        let operation_id = format!("mirror-relink:{}", resolved.display());
+                        let report = relink_apply_journaled(
+                            &MirrorRelinkOptions {
+                                data_dir: resolved.clone(),
+                                apply: true,
+                            },
+                            journal_path,
+                            &operation_id,
+                        )
+                        .map_err(|err| {
+                            relink_fail("mirror_relink_apply_failed", err.to_string())
+                        })?;
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "applied": true,
+                                    "journaled": true,
+                                    "scanned_manifests": report.scanned_manifests,
+                                    "changes": report.changes.len(),
+                                })
+                            );
+                        } else {
+                            println!(
+                                "applied (journaled): scanned_manifests={} changes={}",
+                                report.scanned_manifests,
+                                report.changes.len()
+                            );
+                        }
+                        return Ok(());
+                    }
+
+                    let report = mirror_relink(&MirrorRelinkOptions {
+                        data_dir: resolved,
+                        apply,
+                    })
+                    .map_err(|err| CliError {
+                        code: 1,
+                        kind: "mirror_relink_failed",
+                        message: err.to_string(),
+                        hint: None,
+                        retryable: false,
+                    })?;
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "scanned_manifests": report.scanned_manifests,
+                                "changes": report.changes.len(),
+                                "findings": report.findings.len(),
+                                "applied": report.applied,
+                                "manifests_written": report.manifests_written,
+                            })
+                        );
+                    } else {
+                        println!(
+                            "scanned {} manifest(s); {} would change; {} finding(s); applied={} written={}",
+                            report.scanned_manifests,
+                            report.changes.len(),
+                            report.findings.len(),
+                            report.applied,
+                            report.manifests_written,
+                        );
+                        for finding in &report.findings {
+                            println!("  finding: {finding:?}");
+                        }
+                    }
                 }
                 Commands::Stats {
                     data_dir,
@@ -19457,12 +20218,310 @@ mod watch_once_resolution_tests {
     }
 }
 
+/// W1 commit marker 的落点：显式给了就用，没给就与候选 DB 同居。
+///
+/// **文件名常量只有这一处消费方**——把约定写在一处、由这里兑现，
+/// 比让每个调用方各拼一遍字符串安全（拼错了是静默产生第二份 marker）。
+/// 写一份**只有属主可读**的产物（R-E-72）。
+///
+/// HOLD 清单与歧义表带家目录全路径与 agent 名。它们落在 repo 外的 run root 里，但
+/// 「目录是 0700」不该是这些文件唯一的保护——产物自己带住权限，搬到别处也还带着。
+fn write_private_file(path: &std::path::Path, bytes: &[u8]) -> std::result::Result<(), String> {
+    // **创建时即私有**（FIND-14 / 裁定 R-E-90）。修前是 `std::fs::write` 直写最终路径、
+    // 写完才 chmod —— 窗口开在**真产物**上（本机 umask 0002 实测窗口内是 0664：
+    // 同组可读可写、其他人可读），而这两份产物带家目录全路径与 agent 名。
+    //
+    // **站点语义 = 重写**（`--out` 指向的落点每轮都会被重写，操作者也可能指到既有文件），
+    // 所以用 `create(true).truncate(true)` 而不是 `create_new`：
+    // `.mode()` **只在真正创建时生效**，既有文件走 truncate 复用它自己的模式 ——
+    // 若那已经是 0600（我们上一轮建的），复用不开窗；若是历史遗留的宽权限文件，
+    // 下面的 chmod 作为 **belt** 把它收紧。**belt 不是门**：门是 `.mode(0o600)`，
+    // 它保证新建的产物从出生起就是私有的；chmod 只兜「文件早就存在且权限不对」这一种。
+    // ── 落点是符号链接就停手（FIND-12 / 裁定 R-E-98 H2）────────────────
+    //
+    // 修前是 `create(true).truncate(true)` 直开最终路径：**跟随符号链接并截断**。
+    // 于是 `--out`（以及 HOLD 清单、歧义表）指到一个 symlink 上时，被截断被改写的是
+    // 链接指向的**别人的文件**——又一条 dry-run 数据丢失路径。R-E-84 只覆盖了 scratch
+    // 物化那一条，R-E-90 只议权限不议跟随。
+    //
+    // 拒绝而不是「顶掉链接」：操作者把落点做成链接可能是有意的，替他决定不是这里的事。
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(format!(
+                "E-OUT-SYMLINK: refusing to write through the symlink at {} — following it would \
+                 truncate and overwrite whatever it points at",
+                path.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("stat {}: {e}", path.display())),
+    }
+
+    // ── 同目录临时件 + `rename` 顶上 ──────────────────────────────────
+    //
+    // 两个收益，都不是顺手：
+    // ① **出生即私有真正成立**：`.mode()` 只在真正创建时生效，而 `truncate` 会复用
+    //    既有文件的模式——那条路上「出生即 0600」对既有文件根本不成立，只能靠事后
+    //    chmod 这条 belt 收尾。`create_new` 让门自己立住。
+    // ② 上面那次判定与写入之间仍有 TOCTOU 窗（R-E-84 已裁这半不修）：即便那一瞬被人
+    //    塞进一个 symlink，`rename` 顶掉的也是**那个链接本身**，写不进它指向的文件。
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let stem = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "out".to_string());
+    let temp = parent.join(format!(".{stem}.tmp-{}", std::process::id()));
+    let _ = std::fs::remove_file(&temp);
+    {
+        use std::io::Write as _;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+        let mut file = opts
+            .open(&temp)
+            .map_err(|e| format!("open {}: {e}", temp.display()))?;
+        if let Err(e) = file.write_all(bytes) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(format!("write {}: {e}", temp.display()));
+        }
+        if let Err(e) = file.sync_all() {
+            let _ = std::fs::remove_file(&temp);
+            return Err(format!("sync {}: {e}", temp.display()));
+        }
+    }
+    if let Err(e) = std::fs::rename(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(format!(
+            "rename {} -> {}: {e}",
+            temp.display(),
+            path.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("chmod {}: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// `--out` 的三件产物（计数报告 / HOLD 清单 / 歧义表）**从 `match` 分支里抽出来**。
+///
+/// 抽的理由不是整洁：写路径互异性校验必须发生在**任何一次写之前**，而留在
+/// `match` 分支里的代码进不去测试 —— 判据就只能断言「返回了 Err」，断言不了
+/// 「候选库一个字节都没动」。**「拒绝了」和「拒绝之前已经写坏了」是两回事**
+/// （R3 第 5 条 / 裁定 R-E-103 J2）。
+fn mirror_restore_write_out_reports(
+    path: &std::path::Path,
+    protected: &crate::phase3_restore::RestoreProtectedInputs<'_>,
+    journal: Option<&std::path::Path>,
+    summary: &mut serde_json::Value,
+    holds_json: &[serde_json::Value],
+) -> std::result::Result<(), String> {
+    let holds_path = path.with_extension("holds.json");
+    let table_path = path.with_extension("ambiguity.tsv");
+
+    // ── 校验先于**任何一次写**，`--out` 的两个派生落点一并进表 ────────────
+    //
+    // 只校验 `--out` 自己而放过派生落点，等于留了一条同样毁库的路；
+    // `--journal` 也一起进来，因为写目标之间同样必须互异。
+    let mut write_targets: Vec<(&str, &std::path::Path)> = vec![
+        ("--out", path),
+        ("--out's HOLD ledger (<out>.holds.json)", &holds_path),
+        ("--out's ambiguity table (<out>.ambiguity.tsv)", &table_path),
+    ];
+    if let Some(journal_path) = journal {
+        write_targets.push(("--journal", journal_path));
+    }
+    crate::phase3_restore::validate_restore_write_targets(protected, &write_targets)?;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let holds_bytes = serde_json::to_vec_pretty(holds_json).map_err(|e| e.to_string())?;
+    let mut table = String::from("identity\treason\tclass\tevidence_kind\tevidence_detail\n");
+    for row in holds_json {
+        let field = |k: &str| {
+            row.get(k)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .replace(['\t', '\n'], " ")
+        };
+        table.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\n",
+            field("identity"),
+            field("reason"),
+            field("class"),
+            field("evidence_kind"),
+            field("evidence_detail")
+        ));
+    }
+    write_private_file(&holds_path, &holds_bytes)?;
+    write_private_file(&table_path, table.as_bytes())?;
+    // 指纹进计数报告：Phase 4 拿到清单时能验它就是这一轮产的那一份。
+    // 路径记**文件名**而不是绝对路径（R-E-72 ④）：绝对路径带家目录，
+    // 会让计数报告本身也不能被引用。指纹覆盖的是文件**内容**，与这里
+    // 记什么路径无关，所以换写法不动指纹。
+    let rel = |p: &std::path::Path| {
+        p.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| p.display().to_string())
+    };
+    summary["hold_ledger"] = serde_json::json!({
+        "holds_file": rel(&holds_path),
+        "holds_blake3": blake3::hash(&holds_bytes).to_hex().to_string(),
+        "ambiguity_table_file": rel(&table_path),
+        "ambiguity_table_blake3":
+            blake3::hash(table.as_bytes()).to_hex().to_string(),
+        "location": "beside this report, in the run root",
+        "records": holds_json.len(),
+        "never_commit": "contains home-directory paths and agent names; \
+                         run-root only, never into the repository",
+    });
+    let bytes = serde_json::to_vec_pretty(&*summary).map_err(|e| e.to_string())?;
+    // 主报告走与 HOLD 清单同一条写路径：它同样带家目录全路径与
+    // agent 名，凭什么它可以世界可读、还可以顺着 symlink 截断别人的文件。
+    write_private_file(path, &bytes)?;
+    Ok(())
+}
+
+/// `--apply` 收尾的两个输出面（JSON 与文本摘要）**由同一个函数产**。
+///
+/// 抽出来的理由与 `--out` 那一处同源（`match` 分支里的 `println!` 进不去测试），
+/// 但这一条另有来历，写在这里而不是只写进 commit message：
+///
+/// `published_without_backlink` 这一格加进 `RestoreRunOutcome` 时，上一棒在批次记录与
+/// 报文里写的是「随之出现在 CLI 的 JSON 与摘要两个输出面」——**那是假设，不是核实**。
+/// 实核：该计数器在全仓只有三处（字段定义、`+= 1`、以及它自己的测试），
+/// **两个 CLI 输出面一个都没报它**。而加这一格的全部意义就是让操作者看见
+/// 「发布了、但没能给它配上 backlink」；它对操作者不可见 = 这一格等于不存在。
+///
+/// 所以判据断言的是**CLI 输出真的含这一格**，不是 outcome 结构里有
+/// （R3 第 8 条 / 裁定 R-E-103 J3）。
+fn mirror_restore_apply_report(
+    outcome: &crate::phase3_restore::RestoreRunOutcome,
+) -> (serde_json::Value, String) {
+    let as_json = serde_json::json!({
+        "applied": true,
+        "restored": outcome.restored,
+        // 去重收敛的条数：动作做过了，库里没多行。
+        // **不并进 `restored`**（FIND-7 / 裁定 R-E-76）。
+        "deduplicated": outcome.deduplicated,
+        // 已提交、本轮跳过（R-E-83）。归宿守恒的第四格：
+        // restored + replaced + deduplicated + already_committed == planned
+        "already_committed": outcome.already_committed,
+        "replaced": outcome.replaced,
+        "published": outcome.published,
+        // 发布出去了、但**没能给它配上 backlink** 的份数（R2 第 4 条 / R-E-98 H1）。
+        // 与 `published` 是**两个数**：查不到候选行不必然是错（内容去重把行收敛到
+        // 另一条 `source_path` 上就查不到，那是 FIND-7 / R-E-76 已裁的合法归宿），
+        // 所以口径是记账不是硬失败 —— 而记账只有报出来才成立。
+        "published_without_backlink": outcome.published_without_backlink,
+        "messages_inserted": outcome.messages_inserted,
+        "messages_deleted": outcome.messages_deleted,
+        "receipt_keys": outcome.receipt_keys,
+    });
+    let as_text = format!(
+        "applied: restored={} deduplicated={} already_committed={} \
+         replaced={} published={} published_without_backlink={} \
+         messages(+{}/-{}) receipts={}",
+        outcome.restored,
+        outcome.deduplicated,
+        outcome.already_committed,
+        outcome.replaced,
+        outcome.published,
+        outcome.published_without_backlink,
+        outcome.messages_inserted,
+        outcome.messages_deleted,
+        outcome.receipt_keys.len()
+    );
+    (as_json, as_text)
+}
+
+/// `--recover` 收尾的两个输出面。见 [`mirror_restore_apply_report`] 的说明 ——
+/// 两个面同一条来历，所以两个都要报同一组格子。
+fn mirror_restore_recover_report(
+    journal_state: &str,
+    outcome: &crate::phase3_restore::RestoreRunOutcome,
+) -> (serde_json::Value, String) {
+    let as_json = serde_json::json!({
+        "recovered": true,
+        "journal_state": journal_state,
+        "restored": outcome.restored,
+        "deduplicated": outcome.deduplicated,
+        "already_committed": outcome.already_committed,
+        "replaced": outcome.replaced,
+        "published": outcome.published,
+        "published_without_backlink": outcome.published_without_backlink,
+        "receipt_keys": outcome.receipt_keys,
+    });
+    let as_text = format!(
+        "recovered: journal_state={journal_state} restored={} deduplicated={} \
+         already_committed={} replaced={} published={} \
+         published_without_backlink={}",
+        outcome.restored,
+        outcome.deduplicated,
+        outcome.already_committed,
+        outcome.replaced,
+        outcome.published,
+        outcome.published_without_backlink
+    );
+    (as_json, as_text)
+}
+
+/// `mirror-relink --journal` 的落点校验（R4 第 7 条 / 裁定 R-E-110 K3）。
+///
+/// **抽成函数是为了让它进得去判据**：留在 `match` 分支里的守卫没有用例，
+/// 而一道没有判据的守卫与一道不存在的守卫，在报表上长得一模一样 ——
+/// 那正是 R4 第 7 条（「修好的恢复逻辑不通电等于装饰品」）的同型。
+/// **变异矩阵的 W4 臂第一次没红，就是因为它当时还没被抽出来。**
+///
+/// 受保护输入按 relink 的现场取：候选库是 `<data-dir>/agent_search.db`
+/// （`relink_recover` 自己就这么取），marker 落点按 restore 的默认约定（与库同居）。
+/// 校验本体复用 `mirror-restore --journal` 那一套，**不在这里写第二份**。
+fn validate_relink_journal_target(
+    data_dir: &std::path::Path,
+    journal_path: &std::path::Path,
+) -> std::result::Result<(), String> {
+    let db_path = data_dir.join("agent_search.db");
+    let marker_path = default_w1_marker_path(None, &db_path);
+    crate::phase3_restore::validate_restore_write_targets(
+        &crate::phase3_restore::RestoreProtectedInputs {
+            db_path: &db_path,
+            marker_path: &marker_path,
+            data_dir,
+        },
+        &[("--journal", journal_path)],
+    )
+}
+
+fn default_w1_marker_path(explicit: Option<&PathBuf>, db_path: &std::path::Path) -> PathBuf {
+    explicit.cloned().unwrap_or_else(|| {
+        db_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join(crate::phase3_restore::W1_COMMIT_MARKER_FILENAME)
+    })
+}
+
 fn describe_command(cli: &Cli) -> String {
     match &cli.command {
         Some(Commands::Tui { .. }) => "tui".to_string(),
         Some(Commands::Index { .. }) => "index".to_string(),
         Some(Commands::Search { .. }) => "search".to_string(),
         Some(Commands::Pack { .. }) => "pack".to_string(),
+        Some(Commands::MirrorRelink { .. }) => "mirror-relink".to_string(),
+        Some(Commands::MirrorRestore { .. }) => "mirror-restore".to_string(),
         Some(Commands::Stats { .. }) => "stats".to_string(),
         Some(Commands::Diag { .. }) => "diag".to_string(),
         Some(Commands::Storage { .. }) => "storage".to_string(),
@@ -99320,6 +100379,874 @@ mod subcommand_robot_output_tests {
     }
 }
 
+#[cfg(test)]
+mod mirror_restore_out_path_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// 一处最小现场：一个受保护的候选库 + 它的 marker 落点 + 一个 mirror 面的根。
+    ///
+    /// 候选库这里不必是真 sqlite —— 本组判据问的只有一件事：
+    /// **这些字节动没动**。用一段可识别的定长内容比开一个真库更能把判据钉在那件事上。
+    struct Site {
+        _tmp: TempDir,
+        data_dir: PathBuf,
+        db_dir: PathBuf,
+        db_path: PathBuf,
+        marker_path: PathBuf,
+        run_root: PathBuf,
+    }
+
+    fn site_with_db_named(db_name: &str) -> Site {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("cass-data");
+        let db_dir = tmp.path().join("candidate");
+        let run_root = tmp.path().join("run-root");
+        for dir in [&data_dir, &db_dir, &run_root] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let db_path = db_dir.join(db_name);
+        std::fs::write(
+            &db_path,
+            b"SQLite format 3\x00-- candidate bytes that must survive a dry run --\n",
+        )
+        .unwrap();
+        let marker_path = db_dir.join(crate::phase3_restore::W1_COMMIT_MARKER_FILENAME);
+        Site {
+            _tmp: tmp,
+            data_dir,
+            db_dir,
+            db_path,
+            marker_path,
+            run_root,
+        }
+    }
+
+    fn site() -> Site {
+        site_with_db_named("candidate.sqlite")
+    }
+
+    fn protected(s: &Site) -> crate::phase3_restore::RestoreProtectedInputs<'_> {
+        crate::phase3_restore::RestoreProtectedInputs {
+            db_path: &s.db_path,
+            marker_path: &s.marker_path,
+            data_dir: &s.data_dir,
+        }
+    }
+
+    fn summary_seed() -> serde_json::Value {
+        serde_json::json!({ "planned_actions": 0, "non_promotable": true })
+    }
+
+    // ── R3 第 5 条 / 裁定 R-E-103 J2 ─────────────────────────────────────
+    //
+    // CLI **从不校验** `--out` 是否与 `--candidate-db`、marker 或 raw-mirror 同路径，
+    // 而 `--out` 在**默认 dry-run 就会写** —— 于是 `--out <候选库路径>`
+    // **不给 `--apply` 也能替换候选库**，直接与 `--candidate-db` 的 help
+    // 「dry-run 只读它」冲突。
+    //
+    // ⚠ 这一条**指望写函数兜是错的方向**：`write_private_file` 防的是**符号链接**
+    // （`symlink_metadata` 预检 + 同目录临时件 `rename` 顶上），**它不防别名**。
+    // 对一个普通文件的别名目标，`rename` 换 inode 与旧的 `std::fs::write` 原地截断
+    // 对操作者是一回事 —— 都是「候选库没了」。所以校验必须在 CLI 层。
+    #[test]
+    fn out_pointing_at_the_candidate_db_is_refused_and_leaves_it_byte_identical() {
+        let s = site();
+        let before = std::fs::read(&s.db_path).unwrap();
+        assert!(!before.is_empty(), "前置断言：候选库必须非空");
+
+        let mut summary = summary_seed();
+        let err =
+            mirror_restore_write_out_reports(&s.db_path, &protected(&s), None, &mut summary, &[])
+                .expect_err("--out 指到候选库必须拒");
+        assert!(
+            err.contains("E-RESTORE-WRITE-PATH-ALIAS"),
+            "必须以具名错误码拒，实得：{err}"
+        );
+        assert_eq!(
+            std::fs::read(&s.db_path).unwrap(),
+            before,
+            "候选库必须逐位不变 —— dry-run 不给 --apply 也能毁库，正是 R3 第 5 条"
+        );
+    }
+
+    /// `--out` 会**派生**两个兄弟落点（`.holds.json` / `.ambiguity.tsv`）。
+    /// 只校验 `--out` 自己而不校验派生落点，等于留了一条同样毁库的路。
+    #[test]
+    fn a_derived_sibling_of_out_that_lands_on_the_candidate_db_is_refused() {
+        let s = site_with_db_named("r.holds.json");
+        let before = std::fs::read(&s.db_path).unwrap();
+        // `--out <db_dir>/r.json` 的 holds 落点恰好就是候选库。
+        let out = s.db_dir.join("r.json");
+
+        let mut summary = summary_seed();
+        let err = mirror_restore_write_out_reports(&out, &protected(&s), None, &mut summary, &[])
+            .expect_err("派生落点撞上候选库必须拒");
+        assert!(
+            err.contains("E-RESTORE-WRITE-PATH-ALIAS"),
+            "必须以具名错误码拒，实得：{err}"
+        );
+        assert_eq!(
+            std::fs::read(&s.db_path).unwrap(),
+            before,
+            "候选库必须逐位不变"
+        );
+        assert!(
+            !out.exists(),
+            "任何一个写目标不合格，这一组就一件都不许写 —— 别留下半份产物"
+        );
+    }
+
+    #[test]
+    fn out_on_the_marker_or_inside_the_raw_mirror_is_refused() {
+        let s = site();
+        std::fs::write(&s.marker_path, b"{\"pre-existing\":\"marker\"}").unwrap();
+        let before = std::fs::read(&s.marker_path).unwrap();
+
+        let mut summary = summary_seed();
+        let err = mirror_restore_write_out_reports(
+            &s.marker_path,
+            &protected(&s),
+            None,
+            &mut summary,
+            &[],
+        )
+        .expect_err("--out 指到 marker 落点必须拒");
+        assert!(err.contains("E-RESTORE-WRITE-PATH-ALIAS"), "实得：{err}");
+        assert_eq!(
+            std::fs::read(&s.marker_path).unwrap(),
+            before,
+            "marker 必须逐位不变"
+        );
+
+        let inside = crate::doctor_raw_mirror_root(&s.data_dir)
+            .join("manifests")
+            .join("report.json");
+        let mut summary = summary_seed();
+        let err =
+            mirror_restore_write_out_reports(&inside, &protected(&s), None, &mut summary, &[])
+                .expect_err("--out 落在 raw-mirror 树内必须拒");
+        assert!(err.contains("E-RESTORE-WRITE-PATH-ALIAS"), "实得：{err}");
+        assert!(!inside.exists(), "拒了就不该在 raw-mirror 树里留下文件");
+    }
+
+    /// 写目标之间也必须互异：`--out` 与 `--journal` 撞在一起，
+    /// 后写的那一件会把先写的那一件顶掉，而两边都以为自己写成了。
+    #[test]
+    fn out_colliding_with_the_journal_path_is_refused() {
+        let s = site();
+        let both = s.run_root.join("same.json");
+        let mut summary = summary_seed();
+        let err =
+            mirror_restore_write_out_reports(&both, &protected(&s), Some(&both), &mut summary, &[])
+                .expect_err("--out 与 --journal 同路径必须拒");
+        assert!(
+            err.contains("E-RESTORE-WRITE-PATH-COLLISION"),
+            "写目标互撞要用它自己的码，别与「撞上受保护输入」折叠成一句，实得：{err}"
+        );
+        assert!(!both.exists(), "拒了就不该留下文件");
+    }
+
+    // ── 反方向臂：不得误伤正常用法 ────────────────────────────────────
+    #[test]
+    fn out_to_a_fresh_path_writes_all_three_products() {
+        let s = site();
+        let out = s.run_root.join("nested").join("restore-report.json");
+        let mut summary = summary_seed();
+        mirror_restore_write_out_reports(&out, &protected(&s), None, &mut summary, &[])
+            .expect("指到一个全新路径必须照常写");
+
+        assert!(out.exists(), "计数报告必须写出来");
+        assert!(
+            out.with_extension("holds.json").exists(),
+            "HOLD 清单必须写出来"
+        );
+        assert!(
+            out.with_extension("ambiguity.tsv").exists(),
+            "歧义表必须写出来"
+        );
+        assert!(
+            summary.get("hold_ledger").is_some(),
+            "指纹必须回填进计数报告 —— 只证「没报错」证不了它真跑完"
+        );
+    }
+
+    /// 指到 run root 下一份**既有**报告（第二轮 dry-run 覆盖上一轮的产物）也是正常用法。
+    #[test]
+    fn out_over_an_existing_report_in_the_run_root_is_allowed() {
+        let s = site();
+        let out = s.run_root.join("restore-report.json");
+        std::fs::write(&out, b"{\"stale\":true}").unwrap();
+
+        let mut summary = summary_seed();
+        mirror_restore_write_out_reports(&out, &protected(&s), None, &mut summary, &[])
+            .expect("覆盖上一轮自己的报告是正常用法，不得误伤");
+        let bytes = std::fs::read(&out).unwrap();
+        assert!(
+            bytes.starts_with(b"{"),
+            "必须是一份新报告，实得前几字节：{:?}",
+            &bytes[..bytes.len().min(16)]
+        );
+        assert!(
+            !bytes.windows(6).any(|w| w == b"stale\""),
+            "旧内容必须被这一轮的报告顶掉"
+        );
+    }
+
+    /// 受保护的是 raw-mirror **那棵树**，不是整个 `--data-dir`。
+    ///
+    /// 把校验放宽成「落在 data_dir 底下即拒」会把这条正常用法判死 ——
+    /// 而操作者把报告放进 data_dir 顶层是完全合理的。
+    #[test]
+    fn out_inside_data_dir_but_outside_the_raw_mirror_is_allowed() {
+        let s = site();
+        let out = s.data_dir.join("restore-report.json");
+        let mut summary = summary_seed();
+        mirror_restore_write_out_reports(&out, &protected(&s), None, &mut summary, &[])
+            .expect("data_dir 顶层不是 raw-mirror 树，必须照常写");
+        assert!(out.exists());
+    }
+
+    /// 落点与候选库**同目录、不同名**同样是正常用法 —— sidecar 前缀规则不得殃及它。
+    #[test]
+    fn out_beside_the_candidate_db_with_an_unrelated_name_is_allowed() {
+        let s = site();
+        let out = s.db_dir.join("restore-report.json");
+        let mut summary = summary_seed();
+        mirror_restore_write_out_reports(&out, &protected(&s), None, &mut summary, &[])
+            .expect("与候选库同目录、名字无关联的落点必须照常写");
+        assert!(out.exists());
+    }
+}
+
+#[cfg(test)]
+mod mirror_restore_deep_verify_flag_tests {
+    use super::*;
+    use clap::Parser;
+
+    /// `--deep-verify` 是 `--qualify` 的深度档（R-E-91），**单独给它必须报错**。
+    ///
+    /// 判据不是「能不能解析」，是**不在场时会不会被静默忽略**：一个被静默吞掉的
+    /// `--deep-verify` 会让操作者以为自己跑了深度校验，而实际上跑的是默认档 ——
+    /// 那正是本仓一路在反对的那种「不在场就跳过」。
+    // ── R4 第 7 条 / 裁定 R-E-110 K3：修好的恢复逻辑必须通电 ──────────
+    //
+    // `relink_apply_journaled` 与 `relink_recover` **只有测试调用方**：CLI 的
+    // `mirror-relink` 分支调的是不带 journal 的 `mirror_relink`，而该子命令
+    // 连 `--journal` / `--recover` 两个参数都没有。
+    //
+    // 后果：SIGKILL 落在几份 manifest 写完之后，盘上是一棵**半重链接**的树，
+    // **没有 journal、没有 receipt、没有 `--recover`** —— 操作者只能另起一个
+    // 无从追踪的新计划。crash-safe relink 是本 PR 迁移用途的核心承诺，
+    // **修好的恢复逻辑不通电等于装饰品**（与 R2 第 18 条「造好了没接线」同型）。
+    #[test]
+    fn mirror_relink_exposes_journal_and_recover() {
+        run_on_large_stack(|| {
+            let cli = Cli::try_parse_from([
+                "cass",
+                "mirror-relink",
+                "--recover",
+                "--journal",
+                "relink.json",
+            ])
+            .expect("`mirror-relink --recover --journal <p>` 必须解析得了");
+            let Some(Commands::MirrorRelink {
+                recover, journal, ..
+            }) = cli.command
+            else {
+                panic!("expected mirror-relink command");
+            };
+            assert!(recover, "--recover 必须被解析到");
+            assert_eq!(
+                journal.as_deref(),
+                Some(std::path::Path::new("relink.json")),
+                "--journal 必须被解析到"
+            );
+        });
+    }
+
+    /// `--recover` 与 `--apply` 互斥，且 `--recover` 必须带 `--journal` ——
+    /// 这两条是 K1 在 `mirror-restore` 上刚立的口径，**新开的面照同一套走**，
+    /// 免得又长出一张「兄弟路上缺同一道检查」的脸。
+    #[test]
+    fn mirror_relink_recover_is_exclusive_and_needs_a_journal() {
+        run_on_large_stack(|| {
+            let err = Cli::try_parse_from(["cass", "mirror-relink", "--apply", "--recover"])
+                .err()
+                .expect("--apply 与 --recover 必须互斥");
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "必须死在参数冲突上，实得 {:?}",
+                err.kind()
+            );
+
+            let err = Cli::try_parse_from(["cass", "mirror-relink", "--recover"])
+                .err()
+                .expect("--recover 缺 --journal 必须在解析阶段被拒");
+            assert!(
+                format!("{err}").contains("journal"),
+                "错误必须点名缺的是 --journal，实得：{err}"
+            );
+        });
+    }
+
+    /// 反方向臂：**既有用法一个字节不改**。`mirror-relink --apply`（不带 journal）
+    /// 必须照常解析 —— 新面是**加上去的**，不是把旧路堵死。
+    #[test]
+    fn mirror_relink_keeps_its_existing_shape() {
+        run_on_large_stack(|| {
+            let cli = Cli::try_parse_from(["cass", "mirror-relink", "--apply"])
+                .expect("既有用法必须照常解析");
+            let Some(Commands::MirrorRelink {
+                apply,
+                recover,
+                journal,
+                ..
+            }) = cli.command
+            else {
+                panic!("expected mirror-relink command");
+            };
+            assert!(
+                apply && !recover && journal.is_none(),
+                "新面是**加上去的**，不是把旧路堵死"
+            );
+        });
+    }
+
+    // ── R4 第 8 条 / 裁定 R-E-110 K3：`--qualify` 不该要它用不上的入参 ──
+    //
+    // 资格门实际只读 `--candidate-db` / `--data-dir` / `--marker` / `--journal`
+    // 四件（`phase3_restore` 里那份四对象接口说明写的就是这四件），
+    // 却被 clap 逼着还要给 `--scratch` 与 `--snapshot-root`。
+    //
+    // **这是 R3 第 13 条的同族第二面，而我修 #13 时没问「还有哪个模式也忽略入参」**
+    // —— 又一次「只修在它被发现的那一维上」。
+    #[test]
+    fn qualify_parses_with_only_the_four_objects_it_reads() {
+        run_on_large_stack(|| {
+            let cli = Cli::try_parse_from([
+                "cass",
+                "mirror-restore",
+                "--qualify",
+                "--candidate-db",
+                "db",
+                "--journal",
+                "run.json",
+            ])
+            .expect("`--qualify` 只该要它真读的那四件（这里给了两件必需的）");
+            let Some(Commands::MirrorRestore {
+                qualify,
+                scratch,
+                snapshot_root,
+                ..
+            }) = cli.command
+            else {
+                panic!("expected mirror-restore command");
+            };
+            assert!(qualify);
+            assert!(
+                scratch.is_none() && snapshot_root.is_none(),
+                "两个用不上的入参必须允许缺席 —— 逼操作者编假值正是这条缺陷的形态"
+            );
+        });
+    }
+
+    /// 反方向臂：**dry-run / `--apply` 仍然要那两件**，别把免除写成谁都不用给。
+    #[test]
+    fn a_planning_run_still_requires_scratch_and_snapshot_root() {
+        run_on_large_stack(|| {
+            let err = Cli::try_parse_from(["cass", "mirror-restore", "--candidate-db", "db"])
+                .err()
+                .expect("不给 --qualify / --recover 时缺 --scratch 必须被拒");
+            let rendered = format!("{err}");
+            assert!(
+                rendered.contains("scratch") && rendered.contains("snapshot-root"),
+                "错误必须点名缺的是哪两个，实得：{rendered}"
+            );
+        });
+    }
+
+    /// 新开的 `mirror-relink --journal` 面必须与 `mirror-restore --journal` **同规**。
+    ///
+    /// 不给新写面同等防护，就是**亲手长出第四张脸**（symlink → 别名 → 硬链接 → 这里）。
+    #[test]
+    fn relink_journal_target_is_checked_like_the_restore_one() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_dir = tmp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let db = data_dir.join("agent_search.db");
+        let bytes = b"SQLite format 3\x00-- must survive --\n";
+        std::fs::write(&db, bytes).unwrap();
+
+        let err = validate_relink_journal_target(&data_dir, &db)
+            .err()
+            .expect("--journal 指到候选库必须拒");
+        assert!(
+            err.contains("E-RESTORE-WRITE-PATH-ALIAS"),
+            "必须具名拒，实得：{err}"
+        );
+        assert_eq!(
+            std::fs::read(&db).unwrap(),
+            &bytes[..],
+            "校验发生在任何一次写之前，候选库必须逐位不变"
+        );
+
+        // 反方向臂：正常落点照常放行。
+        validate_relink_journal_target(&data_dir, &tmp.path().join("relink-run.json"))
+            .expect("一个全新的普通落点必须照常放行");
+    }
+
+    // ── R4 第 3 条 / 裁定 R-E-110 K1：三个模式必须互斥 ────────────────
+    //
+    // `apply` / `recover` / `qualify` 三个 flag **没有任何 `conflicts_with`**，
+    // 而分派顺序是 `recover` → `qualify` → `apply`。于是 `--recover --qualify`
+    // 执行的是**会写库的恢复**，且永不资格校验 —— 与 `--qualify` 自己的 help
+    // 「只跑解析级资格门（不写任何东西）」直接冲突。
+    //
+    // 判据落在**解析层**：把它做成运行时的优先级判断，等于让操作者先按下回车
+    // 才知道自己要的那件事没做。
+    #[test]
+    fn conflicting_restore_modes_are_refused_at_parse_time() {
+        run_on_large_stack(|| {
+            for args in [
+                vec![
+                    "cass",
+                    "mirror-restore",
+                    "--recover",
+                    "--qualify",
+                    "--journal",
+                    "run.json",
+                ],
+                vec![
+                    "cass",
+                    "mirror-restore",
+                    "--apply",
+                    "--qualify",
+                    "--candidate-db",
+                    "db",
+                    "--scratch",
+                    "s",
+                    "--snapshot-root",
+                    "r",
+                    "--journal",
+                    "run.json",
+                ],
+                vec![
+                    "cass",
+                    "mirror-restore",
+                    "--apply",
+                    "--recover",
+                    "--candidate-db",
+                    "db",
+                    "--scratch",
+                    "s",
+                    "--snapshot-root",
+                    "r",
+                    "--journal",
+                    "run.json",
+                ],
+            ] {
+                let rendered = format!("{args:?}");
+                let err = Cli::try_parse_from(args)
+                    .err()
+                    .unwrap_or_else(|| panic!("互斥的模式组合必须在解析阶段被拒：{rendered}"));
+                assert_eq!(
+                    err.kind(),
+                    clap::error::ErrorKind::ArgumentConflict,
+                    "必须死在「参数冲突」上（而不是缺参数之类的别的原因）：{rendered}，实得 {:?}",
+                    err.kind()
+                );
+            }
+        });
+    }
+
+    /// 反方向臂：**单个模式**必须照常解析得了，别把互斥写宽成「谁都不许带」。
+    #[test]
+    fn a_single_restore_mode_still_parses() {
+        run_on_large_stack(|| {
+            assert!(
+                Cli::try_parse_from(["cass", "mirror-restore", "--recover", "--journal", "x"])
+                    .is_ok(),
+                "--recover 单独必须照常解析"
+            );
+            assert!(
+                Cli::try_parse_from([
+                    "cass",
+                    "mirror-restore",
+                    "--qualify",
+                    "--candidate-db",
+                    "db",
+                    "--scratch",
+                    "s",
+                    "--snapshot-root",
+                    "r",
+                    "--journal",
+                    "x",
+                ])
+                .is_ok(),
+                "--qualify 单独必须照常解析"
+            );
+            assert!(
+                Cli::try_parse_from([
+                    "cass",
+                    "mirror-restore",
+                    "--qualify",
+                    "--deep-verify",
+                    "--candidate-db",
+                    "db",
+                    "--scratch",
+                    "s",
+                    "--snapshot-root",
+                    "r",
+                    "--journal",
+                    "x",
+                ])
+                .is_ok(),
+                "--qualify + --deep-verify 是既有的合法组合（R-E-91），不得被误伤"
+            );
+        });
+    }
+
+    // ── R3 第 7 / 16 条：**声称必须与实现同真** ────────────────────────
+    //
+    // 这两条都不是功能缺陷，是**声称失真** —— 与 R1 第 15 条「nothing is written」同型。
+    // 失真的声称改回来之后，唯一能防它被改回去的就是把它钉成判据。
+    //
+    // ⚠ 判据自己**不得成为它要找的那个字符串**：裸子串匹配会把「讨论 X」当成「X 本身」，
+    // 而这两条判据要找的针恰好会出现在判据自己的源码里。所以针一律在**运行时拼**出来，
+    // 源码里找不到它的完整字面量 —— 真写成字面量时，下面 `== 0` 那条会当场变红，
+    // 判据是自保的。
+    #[test]
+    fn scratch_help_no_longer_claims_two_working_layers_of_protection() {
+        run_on_large_stack(|| {
+            use clap::CommandFactory as _;
+            let cmd = Cli::command();
+            let sub = cmd
+                .get_subcommands()
+                .find(|c| c.get_name() == "mirror-restore")
+                .expect("mirror-restore 子命令必须在");
+            let arg = sub
+                .get_arguments()
+                .find(|a| a.get_id() == "scratch")
+                .expect("--scratch 必须在");
+            let help = format!(
+                "{}{}",
+                arg.get_help().map(|h| h.to_string()).unwrap_or_default(),
+                arg.get_long_help()
+                    .map(|h| h.to_string())
+                    .unwrap_or_default(),
+            );
+
+            let overstated = format!("工具已加{}防护", "双层");
+            assert!(
+                !help.contains(overstated.as_str()),
+                "第二层只能事后发现（受害者已被截断），把它并称成「防护」就是声称失真，实得：{help}"
+            );
+            assert!(
+                help.contains("只能事后发现"),
+                "必须把第二层的真实能力写出来，实得：{help}"
+            );
+            assert!(
+                help.contains("TOCTOU"),
+                "第一层的 check-then-use 窗（R-E-84 裁定不修）也必须如实披露，实得：{help}"
+            );
+        });
+    }
+
+    #[test]
+    fn production_docs_teach_the_disposition_conservation_not_a_planned_zero_signal() {
+        let source = include_str!("phase3_restore.rs");
+
+        let stale = format!("`planned {} 0` 是幂等完成信号", "==");
+        assert_eq!(
+            source.matches(stale.as_str()).count(),
+            0,
+            "生产 doc 不得再教「重跑 dry-run 看 planned 归零」—— \
+             内容去重挂在另一路径上的会话永远规划不完（FIND-8），这句与草稿不能同真"
+        );
+
+        let conserved = format!(
+            "restored {} replaced + deduplicated + already_committed == planned",
+            "+"
+        );
+        let hits = source.matches(conserved.as_str()).count();
+        assert!(
+            hits >= 2,
+            "两处生产 doc 都要给出归宿守恒等式（closure 与 qualify 各一处），实得 {hits} 处"
+        );
+    }
+
+    // ── R3 第 8 条 / 裁定 R-E-103 J3：这一格必须真的到得了操作者眼前 ───
+    //
+    // `published_without_backlink` 在全仓只有三处：字段定义、`+= 1`、以及它自己的
+    // 测试 —— **两个 CLI 输出面一个都没报它**。上一棒在批次记录与报文里称它
+    // 「随之出现在 CLI 的 JSON 与摘要两个输出面」，那句是**假设不是核实**。
+    //
+    // **判据断言 CLI 输出真的含这一格**，不是断言 outcome 结构里有它 ——
+    // 后者从修前起就一直是真的，拿它当判据等于没有判据。
+    #[test]
+    fn both_apply_output_faces_report_published_without_backlink() {
+        let outcome = crate::phase3_restore::RestoreRunOutcome {
+            restored: 1,
+            deduplicated: 0,
+            already_committed: 0,
+            replaced: 0,
+            published: 3,
+            published_without_backlink: 2,
+            receipt_keys: vec!["k1".to_string()],
+            messages_inserted: 4,
+            messages_deleted: 0,
+        };
+
+        let (as_json, as_text) = mirror_restore_apply_report(&outcome);
+        assert_eq!(
+            as_json
+                .get("published_without_backlink")
+                .and_then(|v| v.as_u64()),
+            Some(2),
+            "--apply 的 JSON 面必须报这一格，实得：{as_json}"
+        );
+        assert!(
+            as_text.contains("published_without_backlink=2"),
+            "--apply 的文本摘要面同样必须报它 —— 只上 JSON 面等于只服务机器读者，\
+             而这一格是给人看的。实得：{as_text}"
+        );
+        // 前置断言：`published` 与这一格是**两个数**，别读成一个。
+        assert!(
+            as_text.contains("published=3"),
+            "既有的 published 必须还在，实得：{as_text}"
+        );
+    }
+
+    #[test]
+    fn both_recover_output_faces_report_published_without_backlink() {
+        let outcome = crate::phase3_restore::RestoreRunOutcome {
+            restored: 0,
+            deduplicated: 0,
+            already_committed: 2,
+            replaced: 0,
+            published: 2,
+            published_without_backlink: 1,
+            receipt_keys: vec!["k1".to_string(), "k2".to_string()],
+            messages_inserted: 0,
+            messages_deleted: 0,
+        };
+
+        let (as_json, as_text) = mirror_restore_recover_report("ClosureVerified", &outcome);
+        assert_eq!(
+            as_json
+                .get("published_without_backlink")
+                .and_then(|v| v.as_u64()),
+            Some(1),
+            "--recover 的 JSON 面必须报这一格 —— 恢复路径恰恰是最需要对账的时候。实得：{as_json}"
+        );
+        assert!(
+            as_text.contains("published_without_backlink=1"),
+            "--recover 的文本摘要面同样必须报它，实得：{as_text}"
+        );
+    }
+
+    // ── R3 第 13 条 / 裁定 R-E-103 J3：参数层要跟上 R-E-19 ─────────────
+    //
+    // `--recover` 自称「入参只有 journal 路径」，实现也确实忽略 `--candidate-db` /
+    // `--scratch` / `--snapshot-root`（R-E-19 第三条），**但 clap 把这三个定义成
+    // 无 `Option`、无 `required_unless_present` 的必填项** —— 于是文档给的恢复命令
+    // 在**解析阶段**就被拒，操作者只能编三个被忽略的假值。
+    // **实现遵守了设计裁定，参数层没跟上。**
+    #[test]
+    fn recover_parses_with_only_a_journal_path() {
+        run_on_large_stack(|| {
+            let parsed = Cli::try_parse_from([
+                "cass",
+                "mirror-restore",
+                "--recover",
+                "--journal",
+                "run.json",
+            ]);
+            let cli = parsed.expect(
+                "R-E-19 第三条：`--recover` 的入参只有 journal 路径 —— \
+                 文档给的这条命令必须解析得了",
+            );
+            let Some(Commands::MirrorRestore {
+                recover,
+                journal,
+                candidate_db,
+                scratch,
+                snapshot_root,
+                ..
+            }) = cli.command
+            else {
+                panic!("expected mirror-restore command");
+            };
+            assert!(recover, "--recover 必须被解析到");
+            assert_eq!(journal.as_deref(), Some(std::path::Path::new("run.json")));
+            assert!(
+                candidate_db.is_none() && scratch.is_none() && snapshot_root.is_none(),
+                "三个被忽略的入参必须允许缺席 —— 让操作者编三个假值正是这条缺陷的形态"
+            );
+        });
+    }
+
+    /// 反方向臂：**不给 `--recover` 时那三个仍然必填**。
+    /// 只把它们改成 `Option` 而不加 `required_unless_present`，
+    /// 会把一条解析期的硬失败变成运行期的空指针式失败 —— 那是修过头。
+    #[test]
+    fn a_normal_dry_run_still_requires_the_three_inputs() {
+        run_on_large_stack(|| {
+            let err = Cli::try_parse_from([
+                "cass",
+                "mirror-restore",
+                "--snapshot-root",
+                "snap",
+                "--scratch",
+                "/tmp/scratch",
+            ])
+            .expect_err("不给 --recover 时缺 --candidate-db 必须在解析阶段就被拒");
+            let rendered = err.to_string();
+            assert!(
+                rendered.contains("candidate-db"),
+                "错误必须点名缺的是哪一个，实得：{rendered}"
+            );
+        });
+    }
+
+    /// R3 第 4/5/6 条的**操作面**：这三条前提工具是**强制**的，
+    /// 但操作者只有从 help 里才知道它强制了什么、以及被拒之后该怎么走。
+    /// 钉成机器判据，免得日后被顺手删掉或软化。
+    #[test]
+    fn journal_and_out_help_state_the_write_path_exclusivity_rules() {
+        run_on_large_stack(|| {
+            use clap::CommandFactory as _;
+            let cmd = Cli::command();
+            let sub = cmd
+                .get_subcommands()
+                .find(|c| c.get_name() == "mirror-restore")
+                .expect("mirror-restore 子命令必须在");
+            let help_of = |id: &str| {
+                let arg = sub
+                    .get_arguments()
+                    .find(|a| a.get_id() == id)
+                    .unwrap_or_else(|| panic!("--{id} 必须在"));
+                format!(
+                    "{}{}",
+                    arg.get_help().map(|h| h.to_string()).unwrap_or_default(),
+                    arg.get_long_help()
+                        .map(|h| h.to_string())
+                        .unwrap_or_default(),
+                )
+            };
+
+            let journal = help_of("journal");
+            assert!(
+                journal.contains("不得与"),
+                "--journal 的 help 必须写明互异性要求，实得：{journal}"
+            );
+            assert!(
+                journal.contains("--recover"),
+                "还必须把「落点已被占用」时的出路指出来 —— 只说拒不说怎么办，\
+                 操作者会去删那份唯一的记录。实得：{journal}"
+            );
+
+            let out = help_of("out");
+            assert!(
+                out.contains("dry-run 就会写它"),
+                "--out 的 help 必须写明默认 dry-run 就会写，否则「同规」没有由头，实得：{out}"
+            );
+            assert!(
+                out.contains("同规"),
+                "--out 必须与 --journal 同规这件事要写在 help 里，实得：{out}"
+            );
+
+            let scratch = help_of("scratch");
+            assert!(
+                scratch.contains("0700") && scratch.contains("0600"),
+                "--scratch 的 help 必须写明物化件的权限口径，实得：{scratch}"
+            );
+        });
+    }
+
+    #[test]
+    fn candidate_db_help_states_the_quiesced_copy_precondition() {
+        // R2 第 2 条：这条前提是**操作前提**，工具不强制，所以它只活在 help 里 ——
+        // 而只活在文字里的东西最容易在日后被顺手删掉或软化。钉成机器判据。
+        run_on_large_stack(|| {
+            use clap::CommandFactory as _;
+            let cmd = Cli::command();
+            let sub = cmd
+                .get_subcommands()
+                .find(|c| c.get_name() == "mirror-restore")
+                .expect("mirror-restore 子命令必须在");
+            let arg = sub
+                .get_arguments()
+                .find(|a| a.get_id() == "candidate_db")
+                .expect("--candidate-db 必须在");
+            let help = format!(
+                "{}{}",
+                arg.get_help().map(|h| h.to_string()).unwrap_or_default(),
+                arg.get_long_help()
+                    .map(|h| h.to_string())
+                    .unwrap_or_default(),
+            );
+            assert!(
+                help.contains("没有别的写者"),
+                "--candidate-db 的 help 必须写明「整轮运行期间没有别的写者」这条前提，实得：{help}"
+            );
+            assert!(
+                help.contains("不会替你发现"),
+                "help 还必须写明工具**不强制**这条前提 —— 只说前提不说「不强制」，\
+                 读者会以为工具替他把着门。实得：{help}"
+            );
+        });
+    }
+
+    #[test]
+    fn deep_verify_without_qualify_is_refused_not_ignored() {
+        // 这个 CLI 的 clap 命令树大到能把默认测试线程栈撑爆（实测 stack overflow）。
+        // 与被测行为无关，纯环境事实 —— 与仓里既有的 clap 解析测试同一处置。
+        run_on_large_stack(|| {
+            let base = [
+                "cass",
+                "mirror-restore",
+                "--candidate-db",
+                "/tmp/x.sqlite",
+                "--scratch",
+                "/tmp/scratch",
+                "--snapshot-root",
+                "root-1",
+            ];
+
+            let mut lone: Vec<&str> = base.to_vec();
+            lone.push("--deep-verify");
+            Cli::try_parse_from(lone).expect_err("--deep-verify 不带 --qualify 必须被拒");
+
+            let mut paired: Vec<&str> = base.to_vec();
+            paired.push("--qualify");
+            paired.push("--deep-verify");
+            let cli = Cli::try_parse_from(paired).expect("--qualify --deep-verify 必须解析得了");
+            let Some(Commands::MirrorRestore {
+                qualify,
+                deep_verify,
+                ..
+            }) = cli.command
+            else {
+                panic!("expected mirror-restore command");
+            };
+            assert!(qualify && deep_verify);
+
+            // 阳性对照：不给 `--deep-verify` 时它必须是 false —— 否则上面那条断言
+            // 在一个恒为 true 的字段上也会通过。
+            let mut only_qualify: Vec<&str> = base.to_vec();
+            only_qualify.push("--qualify");
+            let cli = Cli::try_parse_from(only_qualify).expect("只给 --qualify 必须解析得了");
+            let Some(Commands::MirrorRestore { deep_verify, .. }) = cli.command else {
+                panic!("expected mirror-restore command");
+            };
+            assert!(!deep_verify, "深度档必须是显式 opt-in");
+        });
+    }
+}
+
 // Tests for `--include-attachments` removed: the flag was accepted
 // but unimplemented and has been removed from the pages CLI surface
 // (bead adyyt). Any future attachment-bundling work will add a new
@@ -99481,5 +101408,2153 @@ mod cli_models_resolution_tests {
                  loader agree on the on-disk directory"
             );
         }
+    }
+}
+
+// ===========================================================================
+// Task E3 · mirror-relink
+//
+// 按真实身份（`original_path` / source identity / blob hash）重建 raw mirror
+// manifest 的 `db_links`，并报出闭合破损。默认 dry-run，`--apply` 才写盘。
+//
+// 编排留在本层、落盘走 `raw_mirror` 的公开面（控制面裁定 16 的方案 ①）。
+// ===========================================================================
+
+/// relink 的一次运行参数。
+#[derive(Debug, Clone)]
+pub struct MirrorRelinkOptions {
+    pub data_dir: PathBuf,
+    /// 默认 `false` = dry-run，只算不写。
+    pub apply: bool,
+}
+
+/// relink 期间发现的问题。**每一类都必须有构造点与回归测试**
+/// （Global Constraints 的发射点判据）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MirrorRelinkFinding {
+    /// manifest 记的 db_link 指向 DB 里不存在的 conversation。
+    DanglingDbLink {
+        manifest_id: String,
+        conversation_id: i64,
+    },
+    /// DB 侧有会话按身份归属该 manifest，但 manifest 没有记回来 —— 闭合缺一半。
+    MissingBackLink {
+        manifest_id: String,
+        conversation_id: i64,
+    },
+    /// manifest 的 `original_path` 落在 raw mirror 自己的 `tmp/` 暂存区，
+    /// 那是被杀的索引跑留下的残件，不是真实来源。
+    StagingPath {
+        manifest_id: String,
+        original_path: String,
+    },
+    /// 落盘记录的 manifest 自摘要与重算值不符。
+    ManifestIdentityMismatch { manifest_id: String },
+    /// 落盘 manifest 根本没记自摘要（旧格式）。
+    ///
+    /// **与 `Mismatch` 分开是有意的**：「没记」不等于「校验通过」，
+    /// 合并成一类会让旧 manifest 静默混过 identity 门。
+    ManifestIdentityUnrecorded { manifest_id: String },
+    /// blob 文件缺失，或其 blake3 与 manifest 记录不符。
+    BlobChecksumMismatch {
+        manifest_id: String,
+        blob_relative_path: String,
+    },
+    /// **规划之后这份 manifest 被别人改过**，本轮不动它（FIND-6 / 裁定 R-E-88）。
+    ///
+    /// 与 `ProviderUnmapped` 同形：不是「坏了」，是「本轮不动它」。
+    /// 静默按陈旧计划整体替换会把并发写入方合法的新增抹掉 —— 索引器每落一条会话
+    /// 就往 manifest 里 merge 一条 db_link，而 relink 的规划与施加之间隔着一次全库扫描。
+    ManifestChangedSincePlan { manifest_id: String },
+    /// manifest 的 `provider` 映射不出受支持的 agent（R-E-82）。
+    ///
+    /// **这一条不是「坏了」，是「本轮不动它」**：身份键含 agent 之后，
+    /// 映射不出来就无从匹配；若照常重建，`db_links` 会被算成空并在 `--apply` 时清掉。
+    /// 所以这份 manifest 原样保留、只记录在案。真语料里是 `gemini` 与 `pi_agent`
+    /// 那批（R-E-67 定案：不属受保护三家，永久具名 HOLD）。
+    ProviderUnmapped {
+        manifest_id: String,
+        provider: String,
+    },
+}
+
+/// 一份 manifest 的 `db_links` 重建前后。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MirrorRelinkChange {
+    pub manifest_id: String,
+    pub manifest_relative_path: String,
+    pub before: Vec<raw_mirror::RawMirrorDbLink>,
+    pub after: Vec<raw_mirror::RawMirrorDbLink>,
+}
+
+/// relink 的一次运行结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MirrorRelinkReport {
+    pub scanned_manifests: usize,
+    pub changes: Vec<MirrorRelinkChange>,
+    pub findings: Vec<MirrorRelinkFinding>,
+    /// 是否真的写了盘。dry-run 恒为 `false`。
+    pub applied: bool,
+    /// 实际写盘的 manifest 数。dry-run 恒为 0。
+    pub manifests_written: usize,
+    /// 完整性不可信而被**具名跳过**的 manifest 数（FIND-12 / 裁定 R-E-89）：
+    /// 自摘要与重算值不符、或 blob 缺失/校验不符。
+    ///
+    /// **顶层单独一格**，不是让操作者去 findings 列表里数 —— 这一格为零与不为零，
+    /// 是「这次 relink 的输入可不可信」这个问题的答案。
+    pub integrity_findings: usize,
+    /// 因「规划之后被改过」而**跳过没写**的 manifest 数（FIND-6 / 裁定 R-E-88）。
+    /// dry-run 恒为 0。**与 `manifests_written` 分开报**：把跳过折进「没写」
+    /// 就等于让操作者分不出「内容一样所以没写」和「有人动过所以不敢写」。
+    pub manifests_skipped_stale: usize,
+}
+
+/// DB 侧按身份归属到某个 manifest 的一条会话。
+#[derive(Debug, Clone)]
+struct RelinkConversationRow {
+    conversation_id: i64,
+    source_id: String,
+    origin_host: Option<String>,
+    source_path: String,
+    started_at_ms: Option<i64>,
+    message_count: usize,
+    /// DB 侧的 agent slug（`agents.slug`）。**身份键的一部分**，见
+    /// [`relink_identity_key`]。
+    agent_slug: String,
+}
+
+/// relink 的分桶键。
+///
+/// # 为什么现在含 agent（R-E-82，推翻一条写了理由的旧决定）
+///
+/// 这里原本**刻意不含 provider**，理由写在调用点上：「它只是诊断字段，错标不得影响分桶」。
+/// 那个顾虑是真的，但两侧代价不对等，实测之后推翻：
+///
+/// * **不含 agent 的代价**：同 `source_path`、同 `source_id`、不同 agent 的身份被折叠成
+///   一条，两边的 DB 行互相串成 backlink。真语料实测 **83 条**（5491 个去重路径中，
+///   且 83/83 差的正是 agent 这一维）。**假 backlink 看起来是闭合的，没人会去查。**
+/// * **含 agent 的代价**：manifest 的 provider 映射不出来时匹配不上。真语料实测
+///   **31 条**（`gemini` 2 / `pi_agent` 29）。
+///
+/// 83 > 31，且**错链比不链坏**。另外 R-E-67 之后 provider 的归一已有纪律
+/// （`normalize_provider_to_origin`，未知一律 `None` 不猜不兜底），
+/// 「错标」的面比当初写下那条注释时小得多。
+///
+/// **但光加 agent 是不够的**：那 31 条 unmapped 会在 slug 上永远匹配不到行，
+/// 查询空 → `--apply` 把它们**既有的 db_links 清成空** —— 那正是 R-E-81 刚堵完的
+/// 「把没看见当没有」，在 unmapped 这批上重新打开一次。所以配一条具名降级路径：
+/// **映射不出来的 manifest 不匹配、不清空、原样保留，并记 `ProviderUnmapped` finding**。
+///
+/// **残余风险**（记为已知缺口）：provider **错标但映射得出**（映射到错的 agent）
+/// 这一类检测不了 —— 它会以一个合法 slug 参与分桶，与正确标注无从区分。
+fn relink_identity_key(
+    agent_slug: &str,
+    source_id: &str,
+    origin_host: Option<&str>,
+    source_path: &str,
+) -> (String, String, String, String) {
+    (
+        agent_slug.to_string(),
+        source_id.to_string(),
+        origin_host.unwrap_or_default().to_string(),
+        source_path.to_string(),
+    )
+}
+
+/// 读出 DB 里全部会话的身份投影。只读打开，绝不写。
+fn relink_load_conversations(db_path: &Path) -> Result<Vec<RelinkConversationRow>> {
+    use frankensqlite::compat::RowExt as _;
+
+    let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(db_path)
+        .map_err(|e| anyhow::anyhow!("open readonly db for relink {}: {e}", db_path.display()))?;
+    let rows = storage
+        .raw()
+        .query(
+            "SELECT c.id, c.source_id, c.origin_host, c.source_path, c.started_at, \
+             (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id), a.slug \
+             FROM conversations c JOIN agents a ON a.id = c.agent_id",
+        )
+        .map_err(|e| anyhow::anyhow!("query conversations for relink: {e}"))?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        out.push(RelinkConversationRow {
+            conversation_id: row.get_typed::<i64>(0)?,
+            source_id: row.get_typed::<String>(1)?,
+            origin_host: row.get_typed::<String>(2).ok(),
+            source_path: row.get_typed::<String>(3)?,
+            started_at_ms: row.get_typed::<i64>(4).ok(),
+            message_count: usize::try_from(row.get_typed::<i64>(5).unwrap_or(0).max(0))
+                .unwrap_or(0),
+            agent_slug: row.get_typed::<String>(6)?,
+        });
+    }
+    storage.close_best_effort_in_place();
+    Ok(out)
+}
+
+/// 判定一条 `original_path` 是否落在 raw mirror 自己的暂存区。
+fn relink_path_is_staging(original_path: &str) -> bool {
+    original_path.contains("/raw-mirror/v1/tmp/") || original_path.contains("/tmp/capture.")
+}
+
+/// mirror-relink 主入口。默认 dry-run。
+pub fn mirror_relink(options: &MirrorRelinkOptions) -> Result<MirrorRelinkReport> {
+    let views = raw_mirror::manifest_views(&options.data_dir)?;
+    let db_path = options.data_dir.join("agent_search.db");
+    // ── R-E-81：库不存在是**错误**，不是「空库」────────────────────────
+    //
+    // 修前这里是 `if db_path.exists() { load } else { Vec::new() }`。把「库不在」
+    // 读成「库是空的」的后果是：每一份 manifest 的 db_links 都被算成空，
+    // `--apply` 把它们**全部清掉**，而命令退出码 0（R1 Finding 4，实测坐实：
+    // 同一棵 132 份 manifest 的树，库在时 changes=15，库挪走后 changes=132）。
+    //
+    // 触发条件一点都不刁钻：库没拷过来、被挪走、或 `--data-dir` 指向一棵**只有镜像的
+    // 树** —— 最后这种正是物化树的形态。
+    //
+    // 不给「显式空库 flag」：没有已知场景需要「就是没有库」的语义，
+    // 不为假想的灵活性开口子。真需要时再立案。
+    if !db_path.exists() {
+        anyhow::bail!(
+            "E-CANDIDATE-DB-MISSING: no candidate database at {} — refusing to treat a missing \
+             database as an empty one (that would recompute every manifest's db_links as empty \
+             and, under --apply, erase them all while exiting successfully)",
+            db_path.display()
+        );
+    }
+    let conversations = relink_load_conversations(&db_path)?;
+
+    // 键是四元组（agent_slug, source_id, origin_host, source_path）—— R-E-82 加了第一格。
+    let mut by_identity: std::collections::HashMap<
+        (String, String, String, String),
+        Vec<&RelinkConversationRow>,
+    > = std::collections::HashMap::new();
+    for row in &conversations {
+        by_identity
+            .entry(relink_identity_key(
+                &row.agent_slug,
+                &row.source_id,
+                row.origin_host.as_deref(),
+                &row.source_path,
+            ))
+            .or_default()
+            .push(row);
+    }
+    let known_conversation_ids: std::collections::HashSet<i64> = conversations
+        .iter()
+        .map(|row| row.conversation_id)
+        .collect();
+
+    let mut findings = Vec::new();
+    let mut changes = Vec::new();
+    let root = options.data_dir.join("raw-mirror").join("v1");
+
+    for view in &views {
+        // ── checksum 与 manifest identity ────────────────────────────
+        // ── 三档分治（FIND-12 / 裁定 R-E-89）────────────────────────
+        //
+        // 修前这三类只做提示，apply 循环照样重写它们并返回成功。真正的伤害不是
+        // 「照写」而是**祝福**：写盘会重算并写入新的自摘要，把「记录值与重算值不符」
+        // 这个篡改证据抹掉，此后再也报不出来。实测一次 `--apply` 的净效果是
+        // 篡改留着、合法 backlink 清零、自摘要刷新成一致、`findings=[]`。
+        //
+        // 现在按定性分治：**不可信**的两类具名跳过、原样保留、计数进报告
+        // （与 `ProviderUnmapped` 同形：不是「坏了」，是「本轮不动它」）；
+        // **无从判断**的那一类允许继续，但不得声称校验通过、也不补记自摘要。
+        let mut integrity_blocked = false;
+        match view.manifest_identity_matches(&raw_mirror::recompute_manifest_blake3(
+            &options.data_dir,
+            &view.manifest_relative_path,
+        )?) {
+            Some(true) => {}
+            Some(false) => {
+                findings.push(MirrorRelinkFinding::ManifestIdentityMismatch {
+                    manifest_id: view.manifest_id.clone(),
+                });
+                integrity_blocked = true;
+            }
+            // 「没记自摘要」≠「校验通过」，但它也不是篡改 —— 落「无从判断」档，
+            // 与 `SourceContentGenerationVerdict::Unknown` 同一纪律：记录在案、继续处理，
+            // 但下游不得把它读成已认证。
+            None => findings.push(MirrorRelinkFinding::ManifestIdentityUnrecorded {
+                manifest_id: view.manifest_id.clone(),
+            }),
+        }
+
+        let blob_path = root.join(&view.blob_relative_path);
+        let blob_ok = match std::fs::read(&blob_path) {
+            Ok(bytes) => blake3::hash(&bytes).to_hex().to_string() == view.blob_blake3,
+            Err(_) => false,
+        };
+        if !blob_ok {
+            findings.push(MirrorRelinkFinding::BlobChecksumMismatch {
+                manifest_id: view.manifest_id.clone(),
+                blob_relative_path: view.blob_relative_path.clone(),
+            });
+            integrity_blocked = true;
+        }
+
+        // ── staging path ─────────────────────────────────────────────
+        // 来源可疑但**不是完整性问题**（manifest 与 blob 都自洽），维持提示 + 计数，
+        // 不挡本轮处理（裁定 R-E-89 ③）。
+        if relink_path_is_staging(&view.original_path) {
+            findings.push(MirrorRelinkFinding::StagingPath {
+                manifest_id: view.manifest_id.clone(),
+                original_path: view.original_path.clone(),
+            });
+        }
+
+        // 不可信的输入到此为止：**不算计划、更不写盘**。
+        // 「不静默替换，也不静默跳过」—— 上面已经各记了一条具名 finding。
+        if integrity_blocked {
+            continue;
+        }
+
+        // ── 按真实身份重建 db_links（R-E-82：键含 agent）──────────────
+        //
+        // 旧注释是「provider 刻意不参与匹配：它只是诊断字段，错标不得影响分桶」。
+        // 推翻的理由写在 `relink_identity_key` 的 doc 上（83 条实测折叠 vs 31 条
+        // unmapped，且错链比不链坏）。这里只处理它的**必要前提**：
+        //
+        // provider 映射不出 agent 时（真语料 31 条：`gemini` 2 / `pi_agent` 29），
+        // 键里的 slug 无从取得，硬匹配必然落空 → `rebuilt` 为空 → `--apply` 会把这些
+        // manifest **既有的 db_links 清成空**。那正是 R-E-81 刚堵完的「把没看见当没有」
+        // 在 unmapped 这批上重开一次。所以走**具名降级**：不匹配、不清空、原样保留。
+        let Some(agent) = crate::phase3_restore::normalize_provider_to_origin(&view.provider)
+        else {
+            findings.push(MirrorRelinkFinding::ProviderUnmapped {
+                manifest_id: view.manifest_id.clone(),
+                provider: view.provider.clone(),
+            });
+            // **原样保留**：不进 changes，这一份 manifest 本轮不被改写。
+            continue;
+        };
+        // 分类判定用 `agent`（上面那条 unmapped 降级），**身份匹配用原始 provider 串**
+        // （R3 #1 / R-E-103）：DB 侧 `agents.slug` 存的是连接器契约产的实例 slug
+        // （`openclaw/<inst>`），拿闭世界折叠值 `"openclaw"` 去比永远不相等，
+        // 而 `ProviderUnmapped` 那道闸只认「映射失败」、不认「映射有损」，拦不住它。
+        let _classification_only = agent;
+        let key = relink_identity_key(
+            &view.provider,
+            &view.source_id,
+            view.origin_host.as_deref(),
+            &view.original_path,
+        );
+        let mut rebuilt: Vec<raw_mirror::RawMirrorDbLink> = by_identity
+            .get(&key)
+            .map(|rows| {
+                rows.iter()
+                    .map(|row| raw_mirror::RawMirrorDbLink {
+                        conversation_id: Some(row.conversation_id),
+                        message_count: Some(row.message_count),
+                        source_path: Some(row.source_path.clone()),
+                        started_at_ms: row.started_at_ms,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        rebuilt.sort_by_key(|link| link.conversation_id);
+
+        // ── 双向闭合 ─────────────────────────────────────────────────
+        // manifest → DB：记着的 conversation 在 DB 里必须存在。
+        for link in &view.db_links {
+            if let Some(id) = link.conversation_id
+                && !known_conversation_ids.contains(&id)
+            {
+                findings.push(MirrorRelinkFinding::DanglingDbLink {
+                    manifest_id: view.manifest_id.clone(),
+                    conversation_id: id,
+                });
+            }
+        }
+        // DB → manifest：按身份该归属它的会话，manifest 必须记着。
+        let recorded: std::collections::HashSet<i64> = view
+            .db_links
+            .iter()
+            .filter_map(|link| link.conversation_id)
+            .collect();
+        for link in &rebuilt {
+            if let Some(id) = link.conversation_id
+                && !recorded.contains(&id)
+            {
+                findings.push(MirrorRelinkFinding::MissingBackLink {
+                    manifest_id: view.manifest_id.clone(),
+                    conversation_id: id,
+                });
+            }
+        }
+
+        if rebuilt != view.db_links {
+            changes.push(MirrorRelinkChange {
+                manifest_id: view.manifest_id.clone(),
+                manifest_relative_path: view.manifest_relative_path.clone(),
+                before: view.db_links.clone(),
+                after: rebuilt,
+            });
+        }
+    }
+
+    let mut manifests_written = 0usize;
+    let mut manifests_skipped_stale = 0usize;
+    if options.apply {
+        for change in &changes {
+            // CAS：把**规划时看到的** db_links 一起传下去，让写入方在锁内比一次。
+            // 不等就一行都不写，这里以具名 finding 记账并跳过 —— 不静默替换，也不静默跳过。
+            match raw_mirror::rebuild_manifest_db_links(
+                &options.data_dir,
+                &change.manifest_relative_path,
+                &change.before,
+                &change.after,
+            )? {
+                raw_mirror::RebuildManifestDbLinksOutcome::Written => manifests_written += 1,
+                // 这条路上 `before` 是本次调用内刚算出来的，所以 `AlreadyApplied` 意味着
+                // 有并发写入方恰好把它写成了我们要的样子——目标态已经在盘上，无事可做。
+                // 不记 stale：那一格说的是「计划过期被跳过」，与这里不是一回事。
+                raw_mirror::RebuildManifestDbLinksOutcome::Unchanged
+                | raw_mirror::RebuildManifestDbLinksOutcome::AlreadyApplied => {}
+                raw_mirror::RebuildManifestDbLinksOutcome::ChangedSincePlan => {
+                    manifests_skipped_stale += 1;
+                    findings.push(MirrorRelinkFinding::ManifestChangedSincePlan {
+                        manifest_id: change.manifest_id.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    let integrity_findings = findings
+        .iter()
+        .filter(|f| {
+            matches!(
+                f,
+                MirrorRelinkFinding::ManifestIdentityMismatch { .. }
+                    | MirrorRelinkFinding::BlobChecksumMismatch { .. }
+            )
+        })
+        .count();
+    Ok(MirrorRelinkReport {
+        scanned_manifests: views.len(),
+        changes,
+        findings,
+        integrity_findings,
+        applied: options.apply,
+        manifests_written,
+        manifests_skipped_stale,
+    })
+}
+
+// ── Task E3 Step 4 · relink 自己的 journal ────────────────────────────────
+//
+// `--apply` 跨两个提交域：DB（receipt）与 manifest publish。任一边界崩溃后，
+// **全新进程**必须只凭磁盘上的 journal + receipt 幂等收敛。
+//
+// journal 落 repo 外私有 run root 的文件（`0600`），**不落库**；
+// 落库的只有 receipt，且与 DB 侧动作同事务。
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RelinkJournalState {
+    Planned,
+    DbCommitted,
+    ManifestPartial,
+    ClosureVerified,
+    Committed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RelinkPlannedManifest {
+    pub manifest_relative_path: String,
+    /// 规划时盘上的 `db_links`。重放时拿它做新鲜度 CAS（FIND-6 / 裁定 R-E-88）。
+    ///
+    /// **不给 `serde(default)`**：缺省会把旧 journal 读成「规划时是空的」，
+    /// 于是 CAS 在任何非空 manifest 上都判「被改过」—— 一个恒亮的假警报，
+    /// 比没有 CAS 更糟。缺这一格的旧 journal 由版本层以自己的名义拒掉。
+    pub before: Vec<raw_mirror::RawMirrorDbLink>,
+    pub after: Vec<raw_mirror::RawMirrorDbLink>,
+}
+
+/// relink journal 的 schema 版本（FIND-6 / 裁定 R-E-88）。
+///
+/// **1 = 无版本号的旧格式**（`planned` 只有 `after`）。2 起 `RelinkPlannedManifest`
+/// 多一格 `before`，崩溃重放时用它做新鲜度 CAS。旧件不做兼容读，见
+/// [`relink_journal_read`] 的版本层。
+pub const RELINK_JOURNAL_SCHEMA_VERSION: i64 = 2;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RelinkJournal {
+    /// 先于一切字段被校验（见 [`relink_journal_read`]）。
+    pub schema_version: i64,
+    pub operation_id: String,
+    pub state: RelinkJournalState,
+    pub data_dir: PathBuf,
+    pub planned: Vec<RelinkPlannedManifest>,
+    /// 已确认落盘的 manifest 相对路径。恢复时据它跳过已完成项。
+    pub published: Vec<String>,
+}
+
+fn relink_journal_write(path: &Path, journal: &RelinkJournal) -> Result<()> {
+    debug_assert_eq!(
+        journal.schema_version, RELINK_JOURNAL_SCHEMA_VERSION,
+        "写出的 relink journal 必须带当前 schema 版本"
+    );
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // 唯一 tmp 名 + 创建时即私有（裁定 R-E-87 / R-E-90）。两个原语与 restore 侧
+    // **共用一份定义**（`phase3_restore`），不在这里写第二份。
+    use std::io::Write as _;
+    let tmp = crate::phase3_restore::unique_sibling_tmp_path(path)?;
+    {
+        let mut file = crate::phase3_restore::create_private_new(&tmp)?;
+        file.write_all(&serde_json::to_vec_pretty(journal)?)?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+pub fn relink_journal_read(path: &Path) -> Result<Option<RelinkJournal>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+
+    // 先验版本，后进字段解析（与 restore journal 同一纪律，R-E-79 / R-E-88）。
+    //
+    // **每层以自己的名义拒绝。** 直接 `from_slice` 的话，一份 v1 journal 会死在
+    // 「缺字段 `before`」上 —— 那是**错误的层在说话**：操作者读到字段解析错会去查
+    // 文件损坏，而真相是版本不对。这一层买的是错误的可读性，不是兼容性：
+    // 旧 journal 照样不能用，只是死得明白，且错误里同时给出**见到的**与**需要的**版本。
+    let probe: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| anyhow::anyhow!("relink journal at {} is not JSON: {e}", path.display()))?;
+    let got = probe
+        .get("schema_version")
+        .and_then(serde_json::Value::as_i64);
+    match got {
+        Some(v) if v == RELINK_JOURNAL_SCHEMA_VERSION => {}
+        other => {
+            anyhow::bail!(
+                "E-RELINK-JOURNAL-SCHEMA-MISMATCH: relink journal at {} declares schema \
+                 version {} but this binary requires {} - refusing to read it (a journal \
+                 written before the per-manifest `before` snapshot existed would otherwise \
+                 be replayed without the staleness check that keeps a concurrent indexer's \
+                 backlinks alive)",
+                path.display(),
+                match other {
+                    Some(v) => v.to_string(),
+                    None => "<absent>".to_string(),
+                },
+                RELINK_JOURNAL_SCHEMA_VERSION
+            );
+        }
+    }
+
+    Ok(Some(serde_json::from_slice(&bytes)?))
+}
+
+/// 崩溃注入用的确定性握手点。
+///
+/// **不用 sleep 赌进度**：到达指定边界时写哨兵文件，然后原地阻塞等父进程
+/// SIGKILL。时序赌博会让注入点漂移，测的就不是那个边界了。
+fn relink_pause_if_requested(boundary: &str) {
+    let Ok(target) = std::env::var("CASS_RELINK_PAUSE_AT") else {
+        return;
+    };
+    if target != boundary {
+        return;
+    }
+    if let Ok(sentinel) = std::env::var("CASS_RELINK_PAUSE_SENTINEL") {
+        let _ = std::fs::write(&sentinel, boundary.as_bytes());
+    }
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// 在一个事务里写 receipt。receipt 是 DB 侧唯一的提交事实。
+fn relink_write_receipt(db_path: &Path, operation_id: &str, state: &str) -> Result<()> {
+    use frankensqlite::compat::{ConnectionExt as _, ParamValue};
+    let storage = crate::storage::sqlite::FrankenStorage::open(db_path)
+        .map_err(|e| anyhow::anyhow!("open db for relink receipt {}: {e}", db_path.display()))?;
+    let raw = storage.raw();
+    raw.execute("BEGIN IMMEDIATE;")
+        .map_err(|e| anyhow::anyhow!("begin relink receipt tx: {e}"))?;
+    let result = raw.execute_compat(
+        "INSERT INTO operation_commit_receipt \
+         (idempotency_key, operation, state, committed_at_ms) VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT(idempotency_key) DO UPDATE SET state = excluded.state",
+        &[
+            ParamValue::from(operation_id),
+            ParamValue::from("mirror-relink"),
+            ParamValue::from(state),
+            ParamValue::from(0i64),
+        ],
+    );
+    match result {
+        Ok(_) => {
+            raw.execute("COMMIT;")
+                .map_err(|e| anyhow::anyhow!("commit relink receipt: {e}"))?;
+            Ok(())
+        }
+        Err(err) => {
+            let _ = raw.execute("ROLLBACK;");
+            Err(anyhow::anyhow!("write relink receipt: {err}"))
+        }
+    }
+}
+
+pub fn relink_receipt_state(db_path: &Path, operation_id: &str) -> Result<Option<String>> {
+    use frankensqlite::compat::RowExt as _;
+    let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(db_path)
+        .map_err(|e| anyhow::anyhow!("open db for receipt read {}: {e}", db_path.display()))?;
+    let rows = storage
+        .raw()
+        .query_with_params(
+            "SELECT state FROM operation_commit_receipt WHERE idempotency_key = ?1",
+            &[frankensqlite::SqliteValue::from(operation_id)],
+        )
+        .map_err(|e| anyhow::anyhow!("read relink receipt: {e}"))?;
+    let out = rows.first().and_then(|row| row.get_typed::<String>(0).ok());
+    storage.close_best_effort_in_place();
+    Ok(out)
+}
+
+/// 带 journal 的 `--apply`。崩溃后用 [`relink_recover`] 收敛。
+pub fn relink_apply_journaled(
+    options: &MirrorRelinkOptions,
+    journal_path: &Path,
+    operation_id: &str,
+) -> Result<MirrorRelinkReport> {
+    let plan = mirror_relink(&MirrorRelinkOptions {
+        data_dir: options.data_dir.clone(),
+        apply: false,
+    })?;
+    let mut journal = RelinkJournal {
+        schema_version: RELINK_JOURNAL_SCHEMA_VERSION,
+        operation_id: operation_id.to_string(),
+        state: RelinkJournalState::Planned,
+        data_dir: options.data_dir.clone(),
+        planned: plan
+            .changes
+            .iter()
+            .map(|c| RelinkPlannedManifest {
+                manifest_relative_path: c.manifest_relative_path.clone(),
+                // 规划时盘上的样子一并落 journal —— 崩溃重放时没有它就只能盲写。
+                before: c.before.clone(),
+                after: c.after.clone(),
+            })
+            .collect(),
+        published: Vec::new(),
+    };
+    relink_journal_write(journal_path, &journal)?;
+    relink_pause_if_requested("planned");
+
+    let db_path = options.data_dir.join("agent_search.db");
+    relink_write_receipt(&db_path, operation_id, "db-committed")?;
+    journal.state = RelinkJournalState::DbCommitted;
+    relink_journal_write(journal_path, &journal)?;
+    relink_pause_if_requested("db-committed");
+
+    relink_drive_manifest_phase(&mut journal, journal_path)?;
+    relink_finalize(&mut journal, journal_path, &db_path)?;
+    relink_report_after(&journal)
+}
+
+fn relink_drive_manifest_phase(journal: &mut RelinkJournal, journal_path: &Path) -> Result<()> {
+    for item in journal.planned.clone() {
+        if journal.published.contains(&item.manifest_relative_path) {
+            continue;
+        }
+        // 重放路径与 CLI 的 apply 循环处置**不同**：那边是「本轮不动它、记账继续」，
+        // 这边是**硬失败**。重放的语义是「把当初那份计划照原样施加完」——
+        // 前提已经不成立时继续施加，等于拿一份过期的世界观改盘；崩溃恢复本来
+        // 就该由操作者重新规划，不该由恢复器替他决定。
+        match raw_mirror::rebuild_manifest_db_links(
+            &journal.data_dir,
+            &item.manifest_relative_path,
+            &item.before,
+            &item.after,
+        )? {
+            // `AlreadyApplied` 与前两者同一处置：该写的已经在盘上了，幂等前进。
+            // 它**必须**与 `ChangedSincePlan` 分开——见那个变体的说明。
+            raw_mirror::RebuildManifestDbLinksOutcome::Written
+            | raw_mirror::RebuildManifestDbLinksOutcome::Unchanged
+            | raw_mirror::RebuildManifestDbLinksOutcome::AlreadyApplied => {}
+            raw_mirror::RebuildManifestDbLinksOutcome::ChangedSincePlan => {
+                anyhow::bail!(
+                    "E-MANIFEST-CHANGED-SINCE-PLAN: manifest {} changed between planning and \
+                     replay - refusing to apply a stale plan over it (re-run planning; \
+                     applying it would silently drop whatever was written in between)",
+                    item.manifest_relative_path
+                );
+            }
+        }
+        journal.published.push(item.manifest_relative_path.clone());
+        journal.state = RelinkJournalState::ManifestPartial;
+        relink_journal_write(journal_path, journal)?;
+        relink_pause_if_requested("manifest-partial");
+    }
+    Ok(())
+}
+
+fn relink_finalize(journal: &mut RelinkJournal, journal_path: &Path, db_path: &Path) -> Result<()> {
+    let verify = mirror_relink(&MirrorRelinkOptions {
+        data_dir: journal.data_dir.clone(),
+        apply: false,
+    })?;
+    if !verify.changes.is_empty() {
+        anyhow::bail!(
+            "relink closure verification failed: {} manifest(s) still differ",
+            verify.changes.len()
+        );
+    }
+    journal.state = RelinkJournalState::ClosureVerified;
+    relink_journal_write(journal_path, journal)?;
+    relink_pause_if_requested("closure-verified");
+
+    relink_write_receipt(db_path, &journal.operation_id, "committed")?;
+    journal.state = RelinkJournalState::Committed;
+    relink_journal_write(journal_path, journal)?;
+    Ok(())
+}
+
+fn relink_report_after(journal: &RelinkJournal) -> Result<MirrorRelinkReport> {
+    let mut report = mirror_relink(&MirrorRelinkOptions {
+        data_dir: journal.data_dir.clone(),
+        apply: false,
+    })?;
+    report.applied = true;
+    report.manifests_written = journal.published.len();
+    Ok(report)
+}
+
+/// 崩溃恢复：**输入只有磁盘上的 journal + receipt**，不接受任何内存态提示。
+pub fn relink_recover(journal_path: &Path) -> Result<MirrorRelinkReport> {
+    let Some(mut journal) = relink_journal_read(journal_path)? else {
+        anyhow::bail!("no relink journal at {}", journal_path.display());
+    };
+    let db_path = journal.data_dir.join("agent_search.db");
+    let receipt = relink_receipt_state(&db_path, &journal.operation_id)?;
+
+    match journal.state {
+        // 计划已写但 DB 侧未提交 —— 什么都没发生过，不做半步恢复。
+        RelinkJournalState::Planned if receipt.is_none() => {
+            return relink_report_after(&journal);
+        }
+        RelinkJournalState::Committed => return relink_report_after(&journal),
+        _ => {}
+    }
+    if receipt.is_none() {
+        anyhow::bail!(
+            "relink journal at state {:?} but no receipt for {} — refusing to guess",
+            journal.state,
+            journal.operation_id
+        );
+    }
+    relink_drive_manifest_phase(&mut journal, journal_path)?;
+    relink_finalize(&mut journal, journal_path, &db_path)?;
+    relink_report_after(&journal)
+}
+
+#[cfg(test)]
+mod mirror_relink_tests {
+    use super::*;
+    use crate::raw_mirror::{RawMirrorCaptureInput, RawMirrorDbLink};
+    use tempfile::TempDir;
+
+    // ── R-E-81：候选库不存在 = 具名硬错误，不是「空库」──────────────────
+    //
+    // 缺陷原样（R1 Finding 4，实测坐实）：`if db_path.exists() { load } else { Vec::new() }`
+    // 把「库不在」读成「库是空的」。于是每一份 manifest 的 db_links 都被算成空、
+    // `--apply` 把它们**全部清掉**，命令**退出码 0**。实测同一棵 132 份 manifest 的树：
+    // 库在时 changes=15，库挪走后 changes=132（那 132 份当时共带 132 条 db_links）。
+    //
+    // 触发条件一点都不刁钻：库没拷过来、被挪走、或 `--data-dir` 指向一棵**只有镜像的树**
+    // —— 最后这种正是物化树的形态。
+    //
+    // 不做「显式空库 flag」：没有已知场景需要「就是没有库」的语义，
+    // 不为假想的灵活性开口子。
+    #[test]
+    fn relink_refuses_when_the_candidate_db_is_absent_instead_of_treating_it_as_empty() {
+        let (_tmp, data_dir, manifest_rel, _conv, _src) = fixture(true);
+
+        // 前置断言：库在时这棵树是「已闭合」的 —— 没有这一条，下面的对照没有意义。
+        let before = mirror_relink(&MirrorRelinkOptions {
+            data_dir: data_dir.clone(),
+            apply: false,
+        })
+        .unwrap();
+        assert_eq!(
+            before.changes.len(),
+            0,
+            "前置断言：库在且 db_links 已对齐时不该有变更，实得 {:?}",
+            before.changes
+        );
+        let links_before = manifest_db_link_count(&data_dir, &manifest_rel);
+        assert!(links_before > 0, "前置断言：manifest 上本来就该有 db_links");
+
+        // 把库挪走（不是删——留着好证明「内容还在，只是这次没看见」）。
+        let parked = data_dir.parent().unwrap().join("parked.db");
+        std::fs::rename(data_dir.join("agent_search.db"), &parked).unwrap();
+
+        let err = mirror_relink(&MirrorRelinkOptions {
+            data_dir: data_dir.clone(),
+            apply: false,
+        })
+        .expect_err("库不存在必须是错误，不许当成空库");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("E-CANDIDATE-DB-MISSING"),
+            "必须以具名错误码拒，实得：{text}"
+        );
+        assert!(
+            text.contains("agent_search.db"),
+            "错误必须带上查过的路径，否则操作者不知道去哪儿找：{text}"
+        );
+
+        // `--apply` 同样必须拒，且**一份 manifest 都不许碰**。
+        let err = mirror_relink(&MirrorRelinkOptions {
+            data_dir: data_dir.clone(),
+            apply: true,
+        })
+        .expect_err("--apply 也必须拒");
+        assert!(format!("{err:#}").contains("E-CANDIDATE-DB-MISSING"));
+        assert_eq!(
+            manifest_db_link_count(&data_dir, &manifest_rel),
+            links_before,
+            "被拒的那一轮不许改动任何 manifest —— 清空 db_links 正是本条要防的事"
+        );
+
+        // 库放回去 → 回到原样，证明拒绝是「这次看不见」而不是把树弄坏了。
+        std::fs::rename(&parked, data_dir.join("agent_search.db")).unwrap();
+        let after = mirror_relink(&MirrorRelinkOptions {
+            data_dir: data_dir.clone(),
+            apply: false,
+        })
+        .unwrap();
+        assert_eq!(after.changes.len(), 0, "库放回去必须回到「无变更」");
+    }
+
+    /// 读一份 manifest 上的 `db_links` 条数。
+    fn manifest_db_link_count(data_dir: &Path, manifest_rel: &str) -> usize {
+        let p = data_dir.join("raw-mirror").join("v1").join(manifest_rel);
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        v.get("db_links")
+            .and_then(|l| l.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0)
+    }
+
+    /// 造一个隔离小库 + raw mirror：一份 manifest、一条会话、两条消息。
+    /// 返回 (tempdir, data_dir, manifest_relative_path, conversation_id, source_file)。
+    fn fixture(with_link: bool) -> (TempDir, PathBuf, String, i64, PathBuf) {
+        fixture_as(with_link, "codex", "codex")
+    }
+
+    /// `agent_slug` = DB 侧 `agents.slug`；`provider` = manifest 侧 provider。
+    /// 两者在真实数据里**不一定相等**（openclaw 实例：DB 存 `openclaw/<inst>`，
+    /// manifest 也存 `openclaw/<inst>`，而闭世界枚举会把后者折成 `openclaw`）。
+    fn fixture_as(
+        with_link: bool,
+        agent_slug: &str,
+        provider: &str,
+    ) -> (TempDir, PathBuf, String, i64, PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let source_file = tmp.path().join("session-alpha.jsonl");
+        std::fs::write(
+            &source_file,
+            b"{\"role\":\"user\"}\n{\"role\":\"assistant\"}\n",
+        )
+        .unwrap();
+
+        // DB：一条会话 + 两条消息，身份与 manifest 对齐。
+        let db_path = data_dir.join("agent_search.db");
+        let storage = crate::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
+        let raw = storage.raw();
+        use frankensqlite::compat::{ConnectionExt as _, ParamValue};
+        raw.execute_compat(
+            "INSERT INTO agents(id, slug, name, kind, created_at, updated_at) \
+             VALUES(1, ?1, 'Agent', 'cli', 0, 0)",
+            &[ParamValue::from(agent_slug)],
+        )
+        .unwrap();
+        raw.execute_compat(
+            "INSERT OR IGNORE INTO sources(id, kind, created_at, updated_at) \
+             VALUES('local','local',0,0)",
+            &[] as &[ParamValue],
+        )
+        .unwrap();
+        let src_path = source_file.display().to_string();
+        raw.execute_compat(
+            "INSERT INTO conversations(id, agent_id, source_id, source_path, started_at) \
+             VALUES(7, 1, 'local', ?1, 1710000000000)",
+            &[ParamValue::from(src_path.as_str())],
+        )
+        .unwrap();
+        for idx in 0..2i64 {
+            raw.execute_compat(
+                "INSERT INTO messages(conversation_id, idx, role, content) VALUES(7, ?1, 'user', 'x')",
+                &[ParamValue::from(idx)],
+            )
+            .unwrap();
+        }
+
+        let links: Vec<RawMirrorDbLink> = if with_link {
+            vec![RawMirrorDbLink {
+                conversation_id: Some(7),
+                message_count: Some(2),
+                source_path: Some(src_path.clone()),
+                started_at_ms: Some(1_710_000_000_000),
+            }]
+        } else {
+            Vec::new()
+        };
+        let record = crate::raw_mirror::capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider,
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_file,
+            db_links: &links,
+        })
+        .unwrap();
+
+        (tmp, data_dir, record.manifest_relative_path, 7, source_file)
+    }
+
+    // ── J1 · R3 #1（R-E-103）：openclaw 实例 slug 不得被折叠成 family ──
+    //
+    // `normalize_provider_to_origin("openclaw/<inst>")` 返回闭世界 family
+    // `Origin::Openclaw`，其 `as_str()` 是 `"openclaw"`；而 DB 侧 `agents.slug` 存的是
+    // 连接器契约产的**实例** slug `openclaw/<inst>`。两边永不相等 → `rebuilt` 为空 →
+    // `--apply` 把这份 manifest **有效的 db_links 清成空**。
+    //
+    // 而那条本该拦住它的 `ProviderUnmapped` 降级**不会触发**——provider 是「映射成功」的。
+    // 闸在，bug 从它旁边走过去。真语料实测受影响 1025/9488 份，且那 1025 份**全部带 db_links**。
+    #[test]
+    fn j1_relink_keeps_backlinks_for_openclaw_instance_manifests() {
+        let (_tmp, data_dir, rel, conv, _src) =
+            fixture_as(true, "openclaw/inst-a", "openclaw/inst-a");
+
+        let before = crate::raw_mirror::manifest_views(&data_dir)
+            .unwrap()
+            .into_iter()
+            .find(|v| v.manifest_relative_path == rel)
+            .unwrap()
+            .db_links;
+        assert_eq!(
+            before.first().and_then(|l| l.conversation_id),
+            Some(conv),
+            "前置断言：盘上必须先有一条指向该会话的有效 backlink"
+        );
+
+        let report = run(&data_dir, false);
+        assert!(
+            report.changes.is_empty(),
+            "身份一致的 manifest 不该被规划任何改动，实得 {:?}",
+            report.changes
+        );
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| matches!(f, MirrorRelinkFinding::ProviderUnmapped { .. })),
+            "provider 是映射得出的，不该走 unmapped 降级 —— 那会掩盖真正的不匹配"
+        );
+    }
+
+    /// family 形态（真语料 1090 份）**不得回归**：DB 侧就是裸 `openclaw` 时照旧匹配。
+    #[test]
+    fn j1_relink_still_matches_the_bare_family_slug() {
+        let (_tmp, data_dir, rel, conv, _src) = fixture_as(true, "openclaw", "openclaw");
+        let before = crate::raw_mirror::manifest_views(&data_dir)
+            .unwrap()
+            .into_iter()
+            .find(|v| v.manifest_relative_path == rel)
+            .unwrap()
+            .db_links;
+        assert_eq!(before.first().and_then(|l| l.conversation_id), Some(conv));
+        assert!(
+            run(&data_dir, false).changes.is_empty(),
+            "family 形态本来就能匹配，修 instance 那一维不得把它弄坏"
+        );
+    }
+
+    /// **反方向臂**：family manifest 不得被错配到 instance 会话上。
+    ///
+    /// 这条不是「修完才绿」的红测试，是**守卫**——它在修前修后都必须绿。
+    /// 留它的理由：本批的修法是「把折叠值换成保真值去比较」，最容易写过头的方向
+    /// 就是把两者当成可互换，于是 family 与 instance 互相错配。
+    #[test]
+    fn j1_family_manifest_must_not_be_matched_to_an_instance_conversation() {
+        let (_tmp, data_dir, _rel, _conv, _src) = fixture_as(false, "openclaw/inst-a", "openclaw");
+        let report = run(&data_dir, false);
+        for change in &report.changes {
+            assert!(
+                change.after.is_empty(),
+                "family manifest 不该被链到 instance 会话上，实得 {:?}",
+                change.after
+            );
+        }
+    }
+
+    fn run(data_dir: &Path, apply: bool) -> MirrorRelinkReport {
+        mirror_relink(&MirrorRelinkOptions {
+            data_dir: data_dir.to_path_buf(),
+            apply,
+        })
+        .expect("relink must succeed")
+    }
+
+    // ============ R1 Finding 14 / 裁定 R-E-90 的判据（relink 侧两站点）============
+    //
+    // 与 `phase3_restore` 那两条同形：owner-only 的产物必须**从出生起**就只有属主可读写。
+    // 「窗口很短」不构成辩护 —— 窗口里 `open()` 到的 fd 不会因随后的 chmod/rename 失效
+    // （内核语义，实证见 evidence/r1f14-probes.patch 的探针 B，故不转正为回归测试）。
+
+    fn worst_non_owner_bits_during(dir: &Path, f: impl FnOnce()) -> (u32, bool) {
+        use std::collections::HashSet;
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+        fn names(dir: &Path) -> HashSet<PathBuf> {
+            std::fs::read_dir(dir)
+                .map(|rd| rd.flatten().map(|e| e.path()).collect())
+                .unwrap_or_default()
+        }
+        let before = names(dir);
+        let worst = Arc::new(AtomicU32::new(0));
+        let saw = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = {
+            let dir = dir.to_path_buf();
+            let before = before.clone();
+            let (worst, saw, stop) = (Arc::clone(&worst), Arc::clone(&saw), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                loop {
+                    for path in names(&dir) {
+                        if before.contains(&path) {
+                            continue;
+                        }
+                        if let Ok(md) = std::fs::symlink_metadata(&path)
+                            && md.is_file()
+                        {
+                            saw.store(true, Ordering::Relaxed);
+                            worst.fetch_max(md.permissions().mode() & 0o077, Ordering::Relaxed);
+                        }
+                    }
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    std::hint::spin_loop();
+                }
+            })
+        };
+        f();
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+        (worst.load(Ordering::Relaxed), saw.load(Ordering::Relaxed))
+    }
+
+    #[test]
+    fn f14_relink_journal_write_is_private_from_birth() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let path = dir.join("relink-journal.json");
+        let journal = RelinkJournal {
+            schema_version: RELINK_JOURNAL_SCHEMA_VERSION,
+            operation_id: "op-f14".into(),
+            state: RelinkJournalState::Planned,
+            data_dir: dir.clone(),
+            planned: (0..40_000)
+                .map(|i| RelinkPlannedManifest {
+                    manifest_relative_path: format!("manifests/aa/{i:08}.json"),
+                    before: Vec::new(),
+                    after: Vec::new(),
+                })
+                .collect(),
+            published: Vec::new(),
+        };
+        let (worst, saw) = worst_non_owner_bits_during(&dir, || {
+            relink_journal_write(&path, &journal).unwrap();
+        });
+        assert!(
+            saw,
+            "前置断言：观察线程必须看到过新文件，否则本用例没有分辨力"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "前置断言：收尾必须是 0600"
+        );
+        assert_eq!(
+            worst, 0,
+            "relink journal 在写入过程中出现过带非属主位的文件（{worst:#o}）"
+        );
+    }
+
+    #[test]
+    fn f14_write_private_file_is_private_from_birth() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        // 这一站点最狠：它**直写最终路径**，窗口开在真产物上，而它的消费方是
+        // mirror-restore 的 HOLD 清单与歧义表（带家目录全路径与 agent 名）。
+        let path = dir.join("hold-ledger.json");
+        let payload = vec![b'x'; 48 * 1024 * 1024];
+        let (worst, saw) = worst_non_owner_bits_during(&dir, || {
+            crate::write_private_file(&path, &payload).unwrap();
+        });
+        assert!(
+            saw,
+            "前置断言：观察线程必须看到过新文件，否则本用例没有分辨力"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "前置断言：收尾必须是 0600"
+        );
+        assert_eq!(
+            worst, 0,
+            "HOLD 清单/歧义表在写入过程中对属主之外可读或可写（{worst:#o}）"
+        );
+    }
+
+    // ── H2 · #12（R-E-98 H2 / R2 第 12 条）──────────────────────────────
+    //
+    // `write_private_file` 曾用 `create(true).truncate(true)` 直开最终路径：**跟随符号
+    // 链接并截断**。于是 `--out`（以及 HOLD 清单、歧义表）指到一个 symlink 上时，被截断
+    // 被改写的是链接指向的那个**别人的文件**——又一条 dry-run 数据丢失路径。
+    // R-E-84 只覆盖了 scratch 物化那一条，R-E-90 只议权限不议跟随，这一面此前没人管。
+    #[test]
+    fn f12_write_private_file_refuses_to_write_through_a_symlink() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = TempDir::new().unwrap();
+        let victim = tmp.path().join("victim.json");
+        let original = b"victim payload that must survive\n";
+        std::fs::write(&victim, original).unwrap();
+
+        let link = tmp.path().join("report.json");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+
+        let err = crate::write_private_file(&link, b"{\"new\":true}")
+            .expect_err("落点是符号链接时必须拒写，而不是顺着它去截断别人的文件");
+        assert!(
+            err.contains("E-OUT-SYMLINK"),
+            "必须以具名错误码拒，操作者才知道是哪一类问题：{err}"
+        );
+
+        // **本条的判据**：被指向的那个文件必须逐字节不变。
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            original,
+            "顺着符号链接把别人的文件改了 —— 这正是本条要防的事"
+        );
+        // 链接本身也不许被顶掉：拒绝就是拒绝，不做「替操作者决定」的事。
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "拒写时不该顺手把符号链接换成普通文件"
+        );
+
+        // 阳性对照 1：普通新路径照常写，且出生即 0600。
+        let fresh = tmp.path().join("fresh.json");
+        crate::write_private_file(&fresh, b"ok").unwrap();
+        assert_eq!(std::fs::read(&fresh).unwrap(), b"ok");
+        assert_eq!(
+            std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        // 阳性对照 2：**重写既有普通文件**是本站点的正常语义，不能被这道防护误伤，
+        // 且重写之后权限仍须是 0600（历史遗留的宽权限文件也要被收紧）。
+        std::fs::set_permissions(&fresh, std::fs::Permissions::from_mode(0o664)).unwrap();
+        crate::write_private_file(&fresh, b"rewritten").unwrap();
+        assert_eq!(std::fs::read(&fresh).unwrap(), b"rewritten");
+        assert_eq!(
+            std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "重写路径也必须收紧到 0600"
+        );
+    }
+
+    // ── H2 · #12 的另一半：重写走 rename，旧 inode 从不被截断 ──────────
+    //
+    // symlink 预检是**判断**，判断与写入之间有窗（R-E-84 已裁这半不修）。所以写法本身
+    // 也得站得住：写同目录临时件再 `rename` 顶上，最终路径上的旧 inode **一次都没被打开过**。
+    // 这条用硬链接把旧 inode 拴住来验——就地截断会让拴住的那一份跟着变，`rename` 则不会。
+    // 它同时也是「出生即 0600 对重写路径也成立」的判据：`.mode()` 只在真正创建时生效，
+    // 复用既有文件的那条路上这道门是不立的，只能靠事后 chmod 兜。
+    #[test]
+    fn f12_write_private_file_replaces_by_rename_instead_of_truncating_the_old_inode() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("report.json");
+        let before = b"the previous run's report\n";
+        std::fs::write(&target, before).unwrap();
+        // 历史遗留的宽权限：重写路径必须也把它收紧。
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o664)).unwrap();
+        let old_ino = std::fs::metadata(&target).unwrap().ino();
+
+        // 硬链接把**旧 inode** 拴住：它是本条的观测点。
+        let keeper = tmp.path().join("keeper.json");
+        std::fs::hard_link(&target, &keeper).unwrap();
+
+        crate::write_private_file(&target, b"the new report\n").unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"the new report\n");
+        assert_ne!(
+            std::fs::metadata(&target).unwrap().ino(),
+            old_ino,
+            "重写必须是 rename 顶上（换 inode），不是就地截断"
+        );
+        assert_eq!(
+            std::fs::read(&keeper).unwrap(),
+            before,
+            "旧 inode 被截断改写了 —— 落点若是链接，被改的就是别人的文件"
+        );
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "重写后的产物必须是 0600"
+        );
+    }
+
+    // =============== R1 Finding 14 判据结束（relink 侧）===============
+
+    /// 锚定的声称原文：`mirror-relink` 的 `--apply` help（`src/lib.rs` 的
+    /// `Commands::MirrorRelink`）——「Actually write the rebuilt db_links.
+    /// **Without this flag nothing is written.**」
+    ///
+    /// R1 Finding 15 揭出的是「关于代码行为的一句话变假了而没人发现」这一类缺陷
+    /// （restore 那边的同型声称就是假的）。这条把 relink 侧的这句变成机器判据：
+    /// dry-run 跑完，现场文件树必须**逐条不变**——新增、大小变化都算变。
+    #[test]
+    fn relink_dry_run_writes_nothing_as_its_help_claims() {
+        let (_tmp, data_dir, _rel, _conv, _src) = fixture(false);
+        let before = crate::phase3_restore::test_tree_snapshot(&data_dir);
+        assert!(!before.is_empty(), "前置断言：现场必须非空");
+
+        let report = run(&data_dir, false);
+        assert!(
+            !report.changes.is_empty(),
+            "前置断言：dry-run 必须真的算出了 change —— 一个什么都没算出来的 relink \
+             当然也什么都不写，那样这条测试就在替一句它没验过的话背书"
+        );
+
+        let after = crate::phase3_restore::test_tree_snapshot(&data_dir);
+        let new: Vec<_> = after.iter().filter(|x| !before.contains(x)).collect();
+        let changed: Vec<_> = after
+            .iter()
+            .filter(|(name, size)| {
+                before
+                    .iter()
+                    .any(|(bname, bsize)| bname == name && bsize != size)
+            })
+            .collect();
+
+        // 阳性对照先跑：空结果 ≠ 不存在，先证明快照抓得到新增文件。
+        std::fs::write(data_dir.join("positive-control.txt"), b"x").unwrap();
+        let control = crate::phase3_restore::test_tree_snapshot(&data_dir);
+        assert!(
+            control
+                .iter()
+                .any(|(n, _)| n.contains("positive-control.txt"))
+                && !before
+                    .iter()
+                    .any(|(n, _)| n.contains("positive-control.txt")),
+            "阳性对照失败：快照抓不到刚写进去的文件，下面的结论作废"
+        );
+
+        assert!(
+            new.is_empty() && changed.is_empty(),
+            "relink 的 --apply help 说不给它就什么都不写，实测 dry-run 之后现场变了：\
+             新增 {new:?}；大小变化 {changed:?}"
+        );
+    }
+
+    #[test]
+    fn relink_rebuilds_db_links_from_real_identity() {
+        let (_tmp, data_dir, rel, conv_id, _src) = fixture(false);
+        let report = run(&data_dir, false);
+        assert_eq!(report.scanned_manifests, 1);
+        let change = report
+            .changes
+            .iter()
+            .find(|c| c.manifest_relative_path == rel)
+            .expect("缺链接的 manifest 必须被认定为需要重建");
+        assert!(change.before.is_empty(), "重建前该 manifest 没有 db_links");
+        assert_eq!(change.after.len(), 1, "按身份该匹配到恰好一条会话");
+        let link = &change.after[0];
+        assert_eq!(link.conversation_id, Some(conv_id));
+        assert_eq!(
+            link.message_count,
+            Some(2),
+            "message_count 必须取自真实消息数"
+        );
+        assert_eq!(link.started_at_ms, Some(1_710_000_000_000));
+    }
+
+    #[test]
+    fn relink_reports_missing_back_link_as_closure_violation() {
+        let (_tmp, data_dir, _rel, conv_id, _src) = fixture(false);
+        let report = run(&data_dir, false);
+        assert!(
+            report.findings.iter().any(|f| matches!(
+                f,
+                MirrorRelinkFinding::MissingBackLink { conversation_id, .. }
+                    if *conversation_id == conv_id
+            )),
+            "DB 侧有会话而 manifest 没记回来 = 闭合缺一半，必须报出；实得 {:?}",
+            report.findings
+        );
+    }
+
+    // ============ R1 Finding 12 / 裁定 R-E-89 的判据 ============
+    //
+    // 三类 finding 修前只做提示，apply 循环照样重写并返回成功。**真正的伤害不是
+    // 「照写」而是「祝福」**：写盘会重算并写入新的自摘要，把「记录值与重算值不符」
+    // 这个篡改证据抹掉，此后任何一次 relink / doctor 都再也报不出它。
+    // 一次 `--apply` 的净效果实测：篡改留着、合法 backlink 清零、自摘要刷新成一致、
+    // `findings=[]` —— 系统收敛到一个「看起来完全健康」的被篡改状态。
+
+    /// 把 fixture 的 manifest 篡改成「自摘要与内容不符」，返回 manifest 文件路径。
+    fn f12_tamper(data_dir: &Path, rel: &str) -> PathBuf {
+        let manifest_path = data_dir.join("raw-mirror").join("v1").join(rel);
+        let raw = std::fs::read_to_string(&manifest_path).unwrap();
+        let mut json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        json["original_path"] = serde_json::Value::String("/tampered/by/someone-else.jsonl".into());
+        std::fs::write(&manifest_path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+        manifest_path
+    }
+
+    fn f12_has_identity_mismatch(report: &MirrorRelinkReport) -> bool {
+        report
+            .findings
+            .iter()
+            .any(|f| matches!(f, MirrorRelinkFinding::ManifestIdentityMismatch { .. }))
+    }
+
+    #[test]
+    fn f12_apply_must_not_bless_a_tampered_manifest() {
+        let (_tmp, data_dir, rel, _conv, _src) = fixture(true);
+        let manifest_path = f12_tamper(&data_dir, &rel);
+        let links_before = std::fs::read_to_string(&manifest_path).unwrap();
+
+        let dry = run(&data_dir, false);
+        assert!(
+            f12_has_identity_mismatch(&dry),
+            "前置断言：dry-run 必须报出 ManifestIdentityMismatch；实得 {:?}",
+            dry.findings
+        );
+        assert_eq!(
+            dry.integrity_findings, 1,
+            "顶层完整性计数必须为 1，不能让操作者去 findings 里数"
+        );
+        assert!(
+            dry.changes.is_empty(),
+            "不可信的输入不得进入计划 —— 计划里有它，apply 就会写它"
+        );
+
+        let applied = run(&data_dir, true);
+        assert_eq!(applied.manifests_written, 0, "一份都不该写");
+        assert!(f12_has_identity_mismatch(&applied));
+
+        // ① 盘上字节一行没动。
+        assert_eq!(
+            std::fs::read_to_string(&manifest_path).unwrap(),
+            links_before,
+            "被跳过的 manifest 必须原样保留"
+        );
+        // ② 篡改证据还在 —— 这是本条唯一不可逆的那一半。
+        let after = run(&data_dir, false);
+        assert!(
+            f12_has_identity_mismatch(&after),
+            "apply 之后必须仍然报得出 ManifestIdentityMismatch；\
+             修前这里是 findings=[]（证据被那一次写抹掉了）"
+        );
+    }
+
+    #[test]
+    fn f12_storage_layer_refuses_to_write_a_tampered_manifest_by_name() {
+        // 独立防线：不依赖上游有没有跳过它。上游的跳过逻辑可能漏、可能被重构绕开，
+        // 而这里守的是不可逆的那一半。
+        let (_tmp, data_dir, rel, _conv, _src) = fixture(true);
+        f12_tamper(&data_dir, &rel);
+
+        let err = crate::raw_mirror::rebuild_manifest_db_links(&data_dir, &rel, &[], &[])
+            .expect_err("identity 不符时不得写盘");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("E-MANIFEST-IDENTITY-MISMATCH"),
+            "必须带具名错误码，实得：{text}"
+        );
+
+        let err = crate::raw_mirror::merge_manifest_db_links(
+            &data_dir,
+            &rel,
+            &[RawMirrorDbLink {
+                conversation_id: Some(4242),
+                message_count: Some(1),
+                source_path: Some("/nowhere".into()),
+                started_at_ms: None,
+            }],
+        )
+        .expect_err("merge 路径同样不得写盘");
+        assert!(
+            format!("{err:#}").contains("E-MANIFEST-IDENTITY-MISMATCH"),
+            "merge 路径也必须带具名错误码"
+        );
+    }
+
+    #[test]
+    fn f12_unrecorded_manifest_is_not_handed_its_first_certificate() {
+        // 「没记自摘要」是**无从判断**档，不是篡改：允许写，但**不补记** ——
+        // 给一份从未被校验过的 manifest 发第一张证书，等于把「无从判断」洗成「已认证」。
+        let (_tmp, data_dir, rel, _conv, _src) = fixture(true);
+        let manifest_path = data_dir.join("raw-mirror").join("v1").join(&rel);
+        let raw = std::fs::read_to_string(&manifest_path).unwrap();
+        let mut json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        json.as_object_mut().unwrap().remove("manifest_blake3");
+        std::fs::write(&manifest_path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+
+        let dry = run(&data_dir, false);
+        assert!(
+            dry.findings
+                .iter()
+                .any(|f| matches!(f, MirrorRelinkFinding::ManifestIdentityUnrecorded { .. })),
+            "前置断言：必须落在 Unrecorded 档"
+        );
+        assert_eq!(
+            dry.integrity_findings, 0,
+            "「无从判断」不计入完整性阻断计数 —— 它不是篡改"
+        );
+
+        let current: Vec<RawMirrorDbLink> = crate::raw_mirror::manifest_views(&data_dir)
+            .unwrap()
+            .into_iter()
+            .find(|v| v.manifest_relative_path == rel)
+            .unwrap()
+            .db_links;
+        assert!(!current.is_empty(), "前置断言：得有东西可改，否则写不发生");
+        assert_eq!(
+            crate::raw_mirror::rebuild_manifest_db_links(&data_dir, &rel, &current, &[]).unwrap(),
+            crate::raw_mirror::RebuildManifestDbLinksOutcome::Written,
+            "Unrecorded 不阻断写入"
+        );
+
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        assert!(
+            after
+                .get("manifest_blake3")
+                .is_none_or(serde_json::Value::is_null),
+            "写入不得给一份从未被校验过的 manifest 补记自摘要；实得 {:?}",
+            after.get("manifest_blake3")
+        );
+    }
+    // ============ R1 Finding 6 / 裁定 R-E-88 的判据（relink 侧）============
+
+    // ── H3 · #13（R-E-98 H3 / R2 第 13 条）──────────────────────────
+    //
+    // manifest 已经 rename 落盘、`journal.published` 还没写就崩 —— 重放时盘上是
+    // `after`，既不等于 `before`，于是新鲜度 CAS 判 `ChangedSincePlan`、调用方硬失败。
+    // **已施加项被当成「被别人改过」，恢复从此永久卡死**：重放多少次都是同一句错。
+    //
+    // 这个窗不是理论上的：`rebuild_manifest_db_links` 内部是「写临时件 → rename」，
+    // 而 `journal.published.push` + 写 journal 发生在它返回**之后**，两者之间必然有一段。
+    //
+    // 正解与 restore 侧 receipt 的形状同族：**`current == after` 判成「已施加」并幂等前进**。
+    // 与它互为镜像的是下面 f6 那条 —— `current` 既不等于 `before` 也不等于 `after` 时，
+    // 仍然必须硬失败。两条一起才说明这里分辨的是「谁改的」，不是「变没变」。
+    #[test]
+    fn f13_journal_replay_treats_an_already_applied_manifest_as_done() {
+        let (_tmp, data_dir, rel, _conv, _src) = fixture(true);
+        let journal_path = data_dir.join("relink-journal.json");
+
+        let on_disk = crate::raw_mirror::manifest_views(&data_dir)
+            .unwrap()
+            .into_iter()
+            .find(|v| v.manifest_relative_path == rel)
+            .unwrap()
+            .db_links;
+        assert!(
+            !on_disk.is_empty(),
+            "前置断言：盘上必须有 db_links，否则「已施加」和「空计划」分不开"
+        );
+
+        // 崩在 rename 之后、写 journal 之前：盘上已经是 `after`，而 `before` 是规划态。
+        let stale_before = vec![RawMirrorDbLink {
+            conversation_id: Some(999_013),
+            message_count: Some(1),
+            source_path: Some("/what/the/plan/was/built/on".into()),
+            started_at_ms: None,
+        }];
+        let mut journal = RelinkJournal {
+            schema_version: RELINK_JOURNAL_SCHEMA_VERSION,
+            operation_id: "op-f13".into(),
+            state: RelinkJournalState::DbCommitted,
+            data_dir: data_dir.clone(),
+            planned: vec![RelinkPlannedManifest {
+                manifest_relative_path: rel.clone(),
+                before: stale_before,
+                after: on_disk.clone(),
+            }],
+            published: Vec::new(),
+        };
+        relink_journal_write(&journal_path, &journal).unwrap();
+
+        relink_drive_manifest_phase(&mut journal, &journal_path)
+            .expect("盘上已经是 after —— 那是本轮自己施加的结果，必须幂等前进而不是硬失败");
+
+        assert!(
+            journal.published.contains(&rel),
+            "已施加项必须记进 published，否则下一次重放还会再来一遍"
+        );
+        assert_eq!(
+            journal.state,
+            RelinkJournalState::ManifestPartial,
+            "前进之后 journal 状态必须跟上"
+        );
+        let after_disk = crate::raw_mirror::manifest_views(&data_dir)
+            .unwrap()
+            .into_iter()
+            .find(|v| v.manifest_relative_path == rel)
+            .unwrap()
+            .db_links;
+        assert_eq!(
+            on_disk, after_disk,
+            "「已施加」这条路上一行都不该再写 —— 盘上必须逐条不变"
+        );
+
+        // 幂等：再跑一遍仍然必须过，且仍然不写盘。
+        relink_drive_manifest_phase(&mut journal, &journal_path).expect("重跑必须仍然收敛");
+    }
+
+    /// 崩溃重放**不得**拿一份前提已经不成立的计划盲写 —— 必须以具名错误停下来。
+    ///
+    /// 修前形态：`relink_drive_manifest_phase` 把 journal 里的 `after` 无条件整体替换
+    /// 上去；而那份计划可能是几小时前崩溃前算的，其间索引器每落一条会话就往同一份
+    /// manifest 里 merge 一条 db_link。
+    #[test]
+    fn f6_journal_replay_refuses_a_stale_plan_by_name() {
+        let (_tmp, data_dir, rel, _conv, _src) = fixture(true);
+        let journal_path = data_dir.join("relink-journal.json");
+
+        // journal 里记的「规划时的样子」与盘上现状不符 —— 正是并发写入之后的形状。
+        let stale_before = vec![RawMirrorDbLink {
+            conversation_id: Some(999_001),
+            message_count: Some(1),
+            source_path: Some("/planned/when/the/world/looked/different".into()),
+            started_at_ms: None,
+        }];
+        let mut journal = RelinkJournal {
+            schema_version: RELINK_JOURNAL_SCHEMA_VERSION,
+            operation_id: "op-f6".into(),
+            state: RelinkJournalState::DbCommitted,
+            data_dir: data_dir.clone(),
+            planned: vec![RelinkPlannedManifest {
+                manifest_relative_path: rel.clone(),
+                before: stale_before,
+                after: Vec::new(),
+            }],
+            published: Vec::new(),
+        };
+        relink_journal_write(&journal_path, &journal).unwrap();
+
+        let before_disk = crate::raw_mirror::manifest_views(&data_dir)
+            .unwrap()
+            .into_iter()
+            .find(|v| v.manifest_relative_path == rel)
+            .unwrap()
+            .db_links;
+        assert!(
+            !before_disk.is_empty(),
+            "前置断言：盘上必须有 db_links，否则「有没有被抹掉」无从分辨"
+        );
+
+        let err =
+            relink_drive_manifest_phase(&mut journal, &journal_path).expect_err("陈旧计划必须被拒");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("E-MANIFEST-CHANGED-SINCE-PLAN"),
+            "必须带具名错误码，实得：{text}"
+        );
+
+        let after_disk = crate::raw_mirror::manifest_views(&data_dir)
+            .unwrap()
+            .into_iter()
+            .find(|v| v.manifest_relative_path == rel)
+            .unwrap()
+            .db_links;
+        assert_eq!(
+            before_disk, after_disk,
+            "被拒之后盘上必须一行都没动 —— 否则「拒绝」只是个说法"
+        );
+    }
+
+    /// 旧版 journal 必须死在**版本**这一层，而不是「缺字段 `before`」。
+    ///
+    /// 「每层以自己的名义拒绝」：操作者读到字段解析错会去查文件损坏，而真相是版本不对。
+    #[test]
+    fn f6_old_relink_journal_dies_on_version_not_on_a_missing_field() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("v1-relink-journal.json");
+        // v1 的形状：没有 schema_version，planned 只有 after。
+        std::fs::write(
+            &path,
+            // ⚠ 这份 fixture 必须是一份**除了版本之外哪儿都对**的 v1 journal，
+            // 否则它会死在别的层上、让本用例因为错误的理由通过（变异验证 M-B2 抓到过：
+            // `state` 误写成 PascalCase 时，撤掉版本层之后它死在「unknown variant」而不是
+            // 「missing field」，而本用例断言的正是「不得红在字段解析层」）。
+            br#"{"operation_id":"old","state":"planned","data_dir":"/tmp/x",
+                 "planned":[{"manifest_relative_path":"manifests/aa/0.json","after":[]}],
+                 "published":[]}"#,
+        )
+        .unwrap();
+
+        let err = relink_journal_read(&path).expect_err("v1 journal 必须被拒");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("E-RELINK-JOURNAL-SCHEMA-MISMATCH"),
+            "必须带具名错误码，实得：{text}"
+        );
+        assert!(
+            text.contains("<absent>") && text.contains(&RELINK_JOURNAL_SCHEMA_VERSION.to_string()),
+            "错误必须同时给出**见到的**与**需要的**版本，实得：{text}"
+        );
+        assert!(
+            !text.contains("missing field"),
+            "不得红在字段解析层 —— 那是错误的层在说话；实得：{text}"
+        );
+    }
+    // =============== R1 Finding 6 判据结束（relink 侧）===============
+
+    #[test]
+    fn relink_reports_broken_db_link_pointing_at_missing_conversation() {
+        let (_tmp, data_dir, rel, _conv_id, _src) = fixture(true);
+        // 破坏一条 db_links：指向一个 DB 里不存在的 conversation。
+        // CAS 的 `expected_current` = 此刻盘上的样子（本用例是「刚建好、还没人动过」）。
+        let current_links = crate::raw_mirror::manifest_views(&data_dir)
+            .unwrap()
+            .into_iter()
+            .find(|v| v.manifest_relative_path == rel)
+            .expect("fixture 的 manifest")
+            .db_links;
+        assert_eq!(
+            crate::raw_mirror::rebuild_manifest_db_links(
+                &data_dir,
+                &rel,
+                &current_links,
+                &[RawMirrorDbLink {
+                    conversation_id: Some(4242),
+                    message_count: Some(1),
+                    source_path: Some("/nowhere".into()),
+                    started_at_ms: None,
+                }],
+            )
+            .unwrap(),
+            crate::raw_mirror::RebuildManifestDbLinksOutcome::Written
+        );
+        let report = run(&data_dir, false);
+        assert!(
+            report.findings.iter().any(|f| matches!(
+                f,
+                MirrorRelinkFinding::DanglingDbLink { conversation_id, .. } if *conversation_id == 4242
+            )),
+            "被破坏的 db_link 必须报出；实得 {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn relink_healthy_fixture_has_no_checksum_or_identity_finding() {
+        let (_tmp, data_dir, _rel, _conv_id, _src) = fixture(true);
+        let report = run(&data_dir, false);
+        for finding in &report.findings {
+            assert!(
+                !matches!(
+                    finding,
+                    MirrorRelinkFinding::BlobChecksumMismatch { .. }
+                        | MirrorRelinkFinding::ManifestIdentityMismatch { .. }
+                        | MirrorRelinkFinding::ManifestIdentityUnrecorded { .. }
+                        | MirrorRelinkFinding::StagingPath { .. }
+                ),
+                "健康 fixture 不该有 checksum / identity / staging 类 finding，实得 {finding:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn relink_reports_blob_checksum_mismatch_when_blob_is_tampered() {
+        let (_tmp, data_dir, _rel, _conv_id, _src) = fixture(true);
+        let views = crate::raw_mirror::manifest_views(&data_dir).unwrap();
+        let blob = data_dir
+            .join("raw-mirror")
+            .join("v1")
+            .join(&views[0].blob_relative_path);
+        let mut perms = std::fs::metadata(&blob).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&blob, perms).unwrap();
+        std::fs::write(&blob, b"tampered").unwrap();
+        let report = run(&data_dir, false);
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| matches!(f, MirrorRelinkFinding::BlobChecksumMismatch { .. })),
+            "被篡改的 blob 必须报 checksum 不符；实得 {:?}",
+            report.findings
+        );
+    }
+
+    // ── R-E-82：这条测试取代了原来的 `relink_ignores_provider_when_matching` ──
+    //
+    // 原测试锁的是「provider 只作诊断，错标不得改变匹配结果」——那是当时那条
+    // `// provider 刻意不参与匹配` 决定的测试化身。R-E-82 推翻了那条决定（理由写在
+    // `relink_identity_key` 的 doc 上：83 条实测折叠 vs 31 条 unmapped，错链比不链坏），
+    // 所以这条测试也必须跟着换契约——**留着它就是把旧契约钉死，改代码必红**。
+    //
+    // 新契约：provider 映射不出 agent 时**走具名降级**，manifest 原样不动、记 finding。
+    // 这同时是 R-E-82 条件 3 的判据：它防的是「加了 agent 之后，unmapped 那批在
+    // slug 上永远匹配不上 → db_links 被清空」——即 R-E-81 那个洞在 unmapped 上重开。
+    #[test]
+    fn relink_leaves_unmapped_provider_manifests_untouched() {
+        // 带既有 db_links 的 fixture —— 没有它就证不出「保留」。
+        let (_tmp, data_dir, rel, _conv_id, _src) = fixture(true);
+        let manifest_path = data_dir.join("raw-mirror").join("v1").join(&rel);
+
+        let links_before = manifest_db_link_count(&data_dir, &rel);
+        assert!(
+            links_before > 0,
+            "前置断言：manifest 上必须本来就有 db_links，否则「保留」无从证明"
+        );
+
+        // 把 provider 改成映射不出来的值（真语料里 `gemini` / `pi_agent` 就是这一类）。
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        json["provider"] = serde_json::Value::String("pi_agent".into());
+        let mut perms = std::fs::metadata(&manifest_path).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&manifest_path, perms).unwrap();
+        std::fs::write(&manifest_path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+        // ⚠ 自摘要必须跟着改（FIND-12 / 裁定 R-E-89 之后新增的要求）。
+        // 本用例要模拟的是「一份**合法自洽**、只是 provider 映射不出来」的 manifest；
+        // 只改 provider 不改自摘要造出来的是一份**被篡改**的 manifest，
+        // 那会先被完整性层具名跳过，根本走不到 ProviderUnmapped 那一支 ——
+        // 于是用例会因为**错误的理由**红（或者更糟：因为错误的理由绿）。
+        // 「变异 fixture 必须除待测维度之外哪儿都对」。
+        json["manifest_blake3"] = serde_json::Value::String(
+            crate::raw_mirror::recompute_manifest_blake3(&data_dir, &rel).unwrap(),
+        );
+        std::fs::write(&manifest_path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+
+        // **真 apply**：dry-run 不改盘，证不出「不清空」。
+        let report = run(&data_dir, true);
+
+        assert!(
+            report.findings.iter().any(|f| matches!(
+                f,
+                MirrorRelinkFinding::ProviderUnmapped { provider, .. } if provider == "pi_agent"
+            )),
+            "映射不出来的 provider 必须以自己的名义记录在案；实得 {:?}",
+            report.findings
+        );
+        assert!(
+            !report
+                .changes
+                .iter()
+                .any(|c| c.manifest_relative_path == rel),
+            "降级的 manifest 不得进 changes —— 进了就意味着它会被改写"
+        );
+        assert_eq!(
+            manifest_db_link_count(&data_dir, &rel),
+            links_before,
+            "**既有 db_links 必须一条不少**：清空它正是本条要防的事"
+        );
+    }
+
+    // ── R-E-82 主判据：同路径异 agent 不得互相串成 backlink ────────────────
+    //
+    // 真语料实测：5491 个去重路径里 83 个带多于一个 origin，且 83/83 差在 agent。
+    // 修前那个三元组键会把它们折叠成一条，两边的 DB 行互相串进对方的 manifest——
+    // **假 backlink 看起来是闭合的，没人会去查。**
+    #[test]
+    fn relink_does_not_cross_link_two_agents_sharing_one_path() {
+        let (_tmp, data_dir, rel, conv_id, source_file) = fixture(true);
+
+        // 往同一条 source_path 上再加一条**另一个 agent** 的会话。
+        let db_path = data_dir.join("agent_search.db");
+        {
+            let storage = crate::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
+            let raw = storage.raw();
+            use frankensqlite::compat::{ConnectionExt as _, ParamValue};
+            raw.execute_compat(
+                "INSERT INTO agents(id, slug, name, kind, created_at, updated_at) \
+                 VALUES(2,'claude_code','Claude Code','cli',0,0)",
+                &[] as &[ParamValue],
+            )
+            .unwrap();
+            let src_path = source_file.display().to_string();
+            raw.execute_compat(
+                "INSERT INTO conversations(id, agent_id, source_id, source_path, started_at) \
+                 VALUES(99, 2, 'local', ?1, 1710000000000)",
+                &[ParamValue::from(src_path.as_str())],
+            )
+            .unwrap();
+        }
+
+        // 前置断言：库里确实是两条共用同一路径。
+        {
+            let mut storage =
+                crate::storage::sqlite::FrankenStorage::open_readonly(&db_path).unwrap();
+            use frankensqlite::compat::{ConnectionExt as _, ParamValue, RowExt as _};
+            let n: Option<i64> = storage
+                .raw()
+                .query_row_map(
+                    "SELECT COUNT(*) FROM conversations WHERE source_path = ?1",
+                    &[ParamValue::from(source_file.display().to_string().as_str())],
+                    |row| row.get_typed(0),
+                )
+                .unwrap();
+            storage.close_best_effort_in_place();
+            assert_eq!(n, Some(2), "前置断言：两条会话必须共用同一路径");
+        }
+
+        let report = run(&data_dir, false);
+
+        // 这份 manifest 的 provider 是 `codex`，所以它只该认 codex 那条（id=7）。
+        let after: Vec<i64> = report
+            .changes
+            .iter()
+            .find(|c| c.manifest_relative_path == rel)
+            .map(|c| c.after.iter().filter_map(|l| l.conversation_id).collect())
+            .unwrap_or_else(|| vec![conv_id]); // 无变更 = 保持原样的那一条
+        assert_eq!(
+            after,
+            vec![conv_id],
+            "codex 的 manifest 只该链到 codex 那条会话；含 99 = 两个 agent 被折叠成一条身份"
+        );
+    }
+
+    #[test]
+    fn relink_reports_staging_path() {
+        let (_tmp, data_dir, rel, _conv_id, _src) = fixture(true);
+        let manifest_path = data_dir.join("raw-mirror").join("v1").join(&rel);
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        json["original_path"] =
+            serde_json::Value::String("/x/raw-mirror/v1/tmp/capture.abc/session.jsonl".into());
+        let mut perms = std::fs::metadata(&manifest_path).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&manifest_path, perms).unwrap();
+        std::fs::write(&manifest_path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+
+        let report = run(&data_dir, false);
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| matches!(f, MirrorRelinkFinding::StagingPath { .. })),
+            "落在暂存区的 original_path 必须报出；实得 {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn relink_defaults_to_dry_run_and_writes_nothing() {
+        let (_tmp, data_dir, _rel, _conv_id, _src) = fixture(false);
+        let report = run(&data_dir, false);
+        assert!(!report.applied, "默认必须是 dry-run");
+        assert_eq!(report.manifests_written, 0, "dry-run 不得写盘");
+        assert!(!report.changes.is_empty(), "本 fixture 确实有待重建项");
+        // 盘上 db_links 必须原样未动。
+        let views = crate::raw_mirror::manifest_views(&data_dir).unwrap();
+        assert!(
+            views[0].db_links.is_empty(),
+            "dry-run 之后 manifest 的 db_links 必须仍为空"
+        );
+    }
+
+    /// 完整 write-set 快照：data_dir 下每个常规文件的
+    /// (相对路径, 字节数, sha256)，外加候选 DB 的强摘要。
+    ///
+    /// **刻意覆盖整棵 data_dir 而不只是 DB**：relink 的主要写对象正是
+    /// manifest，只比 DB 会漏掉 manifest 被误写；journal / marker 目录、
+    /// blob 目录、以及任何**新增或消失**的文件也都在这份清单里。
+    fn write_set_snapshot(data_dir: &Path) -> Vec<(String, u64, String)> {
+        fn walk(dir: &Path, base: &Path, out: &mut Vec<(String, u64, String)>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                if meta.is_dir() {
+                    walk(&path, base, out);
+                } else if meta.is_file() {
+                    let bytes = std::fs::read(&path).unwrap_or_default();
+                    let digest = blake3::hash(&bytes).to_hex().to_string();
+                    out.push((
+                        path.strip_prefix(base)
+                            .unwrap_or(&path)
+                            .display()
+                            .to_string(),
+                        meta.len(),
+                        digest,
+                    ));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(data_dir, data_dir, &mut out);
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn relink_dry_run_leaves_the_entire_write_set_unchanged() {
+        let (_tmp, data_dir, _rel, _conv_id, _src) = fixture(false);
+
+        let before = write_set_snapshot(&data_dir);
+        assert!(
+            before.iter().any(|(p, _, _)| p.contains("manifests/")),
+            "快照必须真的覆盖到 manifest，否则这道断言是空的"
+        );
+
+        let report = run(&data_dir, false);
+        assert!(
+            !report.changes.is_empty(),
+            "本 fixture 确有待重建项，否则 dry-run 不变性是废断言"
+        );
+
+        let after = write_set_snapshot(&data_dir);
+        assert_eq!(
+            before, after,
+            "dry-run 之后完整 write-set 必须逐项相等（含 manifest / blob / journal / marker 与文件增删）"
+        );
+
+        // ── 阳性对照：证明这份快照**能**看见写 ───────────────────────
+        // 不做这一步的话，一个根本不敏感的快照同样会让上面的断言通过。
+        let applied = run(&data_dir, true);
+        assert_eq!(applied.manifests_written, 1);
+        let after_apply = write_set_snapshot(&data_dir);
+        assert_ne!(
+            before, after_apply,
+            "快照必须能检出 --apply 的写入；检不出说明快照本身失效，上面的 dry-run 断言不算数"
+        );
+
+        // 差异必须恰好落在 manifest 上，不该波及 blob。
+        let changed: Vec<&String> = after_apply
+            .iter()
+            .zip(before.iter())
+            .filter(|(a, b)| a != b)
+            .map(|(a, _)| &a.0)
+            .collect();
+        assert!(
+            changed.iter().all(|p| p.contains("manifests/")),
+            "relink 的写对象只应是 manifest，实得变化项 {changed:?}"
+        );
+    }
+
+    // ── Step 4：journal 状态机 + 每个边界的 SIGKILL 注入 ─────────────
+    //
+    // 注入用**测试二进制的子进程**：判据是「全新进程按 journal + receipt 幂等
+    // 收敛」，子进程天然满足「全新」（零内存态继承）。边界同步是**确定性握手**
+    // ——子进程到达边界写哨兵文件后原地阻塞，父进程见哨兵才 kill；
+    // 不用 sleep 赌进度。SIGKILL 只打**显式记录的子进程 pid**，不杀进程组。
+
+    /// 子进程入口：由父进程用 `--ignored --exact` 拉起。
+    #[test]
+    #[ignore]
+    fn relink_crash_child_entrypoint() {
+        let data_dir = PathBuf::from(std::env::var("CASS_RELINK_CHILD_DATA_DIR").unwrap());
+        let journal = PathBuf::from(std::env::var("CASS_RELINK_CHILD_JOURNAL").unwrap());
+        let op = std::env::var("CASS_RELINK_CHILD_OP").unwrap();
+        let _ = relink_apply_journaled(
+            &MirrorRelinkOptions {
+                data_dir,
+                apply: true,
+            },
+            &journal,
+            &op,
+        );
+    }
+
+    fn spawn_child_and_kill_at(
+        boundary: &str,
+        data_dir: &Path,
+        journal: &Path,
+        op: &str,
+        sentinel: &Path,
+    ) -> (u32, bool) {
+        let exe = std::env::current_exe().expect("test binary path");
+        let mut child = std::process::Command::new(exe)
+            .args([
+                "--ignored",
+                "--exact",
+                "mirror_relink_tests::relink_crash_child_entrypoint",
+            ])
+            .env("CASS_RELINK_CHILD_DATA_DIR", data_dir)
+            .env("CASS_RELINK_CHILD_JOURNAL", journal)
+            .env("CASS_RELINK_CHILD_OP", op)
+            .env("CASS_RELINK_PAUSE_AT", boundary)
+            .env("CASS_RELINK_PAUSE_SENTINEL", sentinel)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn crash child");
+        let pid = child.id();
+
+        // 确定性握手：等哨兵出现，不按时间赌。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut handshaken = false;
+        while std::time::Instant::now() < deadline {
+            if sentinel.exists() {
+                handshaken = true;
+                break;
+            }
+            if let Ok(Some(_)) = child.try_wait() {
+                break; // 子进程自己结束了（该边界不可达）
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if handshaken {
+            // 只杀**这个显式持有的子进程句柄**（Unix 上 Child::kill 即 SIGKILL），
+            // 不杀进程组、不按名字模式匹配、不引入新依赖。
+            child.kill().expect("SIGKILL the recorded child");
+        }
+        let _ = child.wait();
+        (pid, handshaken)
+    }
+
+    fn boundary_case(boundary: &str, expected_state: RelinkJournalState, work_pending: bool) {
+        let (_tmp, data_dir, _rel, conv_id, _src) = fixture(false);
+        let journal = data_dir.parent().unwrap().join("relink-journal.json");
+        let sentinel = data_dir
+            .parent()
+            .unwrap()
+            .join(format!("sentinel-{boundary}"));
+        let op = format!("relink-crash-{boundary}");
+
+        let (pid, handshaken) =
+            spawn_child_and_kill_at(boundary, &data_dir, &journal, &op, &sentinel);
+        assert!(
+            handshaken,
+            "边界 {boundary} 未被子进程到达（哨兵未出现）——注入点不可达，不能算通过"
+        );
+        assert!(
+            !sentinel_pid_alive(pid),
+            "SIGKILL 之后子进程 {pid} 必须已死"
+        );
+
+        // 崩溃现场：journal 必须停在该边界或更早，且绝不是 Committed。
+        let mid = relink_journal_read(&journal)
+            .expect("journal readable")
+            .expect("journal must exist after the boundary was reached");
+        assert_ne!(
+            mid.state,
+            RelinkJournalState::Committed,
+            "在 {boundary} 被杀，journal 不该已经是 Committed"
+        );
+        // 注入必须**落在预期边界**，否则测的不是这个边界。
+        assert_eq!(
+            mid.state, expected_state,
+            "在 {boundary} 注入，崩溃现场的 journal 状态应为 {expected_state:?}"
+        );
+        // 崩溃时确有未竟工作，否则「恢复后收敛」是个无事可做的假绿。
+        let mid_views = crate::raw_mirror::manifest_views(&data_dir).unwrap();
+        if work_pending {
+            assert!(
+                mid_views[0].db_links.is_empty(),
+                "在 {boundary} 崩溃时 manifest 还不该被发布——否则恢复无事可做"
+            );
+        } else {
+            assert!(
+                !mid_views[0].db_links.is_empty(),
+                "在 {boundary} 崩溃时 manifest 应已发布，剩下的是收尾"
+            );
+        }
+
+        // 恢复：**另一个全新进程语义** —— 输入只有磁盘上的 journal + receipt。
+        let recovered = relink_recover(&journal).expect("recovery must converge");
+        let final_journal = relink_journal_read(&journal).unwrap().unwrap();
+        assert_eq!(
+            final_journal.state,
+            RelinkJournalState::Committed,
+            "恢复后 journal 必须收敛到 Committed"
+        );
+        assert!(
+            recovered.changes.is_empty(),
+            "收敛后不该还有待重建项，实得 {:?}",
+            recovered.changes
+        );
+        let views = crate::raw_mirror::manifest_views(&data_dir).unwrap();
+        assert_eq!(
+            views[0].db_links.len(),
+            1,
+            "恢复后 manifest 的 db_links 必须已重建"
+        );
+        assert_eq!(views[0].db_links[0].conversation_id, Some(conv_id));
+
+        // 幂等：再恢复一次不得改变任何东西。
+        let again = relink_recover(&journal).expect("second recovery is a no-op");
+        assert!(again.changes.is_empty());
+    }
+
+    fn sentinel_pid_alive(pid: u32) -> bool {
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }
+
+    #[test]
+    fn relink_crash_at_db_committed_boundary_converges() {
+        boundary_case("db-committed", RelinkJournalState::DbCommitted, true);
+    }
+
+    #[test]
+    fn relink_crash_at_manifest_partial_boundary_converges() {
+        boundary_case(
+            "manifest-partial",
+            RelinkJournalState::ManifestPartial,
+            false,
+        );
+    }
+
+    #[test]
+    fn relink_crash_at_closure_verified_boundary_converges() {
+        boundary_case(
+            "closure-verified",
+            RelinkJournalState::ClosureVerified,
+            false,
+        );
+    }
+
+    #[test]
+    fn relink_apply_writes_and_is_idempotent() {
+        let (_tmp, data_dir, _rel, conv_id, _src) = fixture(false);
+        let first = run(&data_dir, true);
+        assert!(first.applied);
+        assert_eq!(first.manifests_written, 1);
+        let views = crate::raw_mirror::manifest_views(&data_dir).unwrap();
+        assert_eq!(views[0].db_links.len(), 1);
+        assert_eq!(views[0].db_links[0].conversation_id, Some(conv_id));
+
+        // 再跑一次：已经收敛，不该再有变更也不该再写盘。
+        let second = run(&data_dir, true);
+        assert!(second.changes.is_empty(), "第二遍不该还有待重建项");
+        assert_eq!(second.manifests_written, 0, "已收敛就不得重复写盘");
     }
 }

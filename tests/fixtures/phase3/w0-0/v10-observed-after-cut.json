@@ -1,0 +1,35 @@
+{
+ "appendix_section": "§B.3",
+ "cases": [
+  {
+   "case_id": "v10.observed-after-cut",
+   "expect": "accept",
+   "expected": {
+    "root": "13c296dc5acc5f3936d9a4ebbba25564b9863c9596fb7a8be4aeac348248c177",
+    "sorted_keys": [
+     "canonical_path",
+     "object_kind",
+     "observed_at_ms",
+     "origin"
+    ],
+    "tree_hash": "07040d2fd93ac8f7c82b655e879ca6c2fec61e0f2605aa6c74739bf92fa739e7"
+   },
+   "input": {
+    "canonical_path": "/home/u/.openclaw/sessions/new-after-cut.jsonl",
+    "object_kind": "seal.observed_after_cut",
+    "observed_at_ms": 1754400123000,
+    "origin": "openclaw"
+   },
+   "input_tags": {
+    "canonical_path": "p",
+    "object_kind": "s",
+    "observed_at_ms": "i",
+    "origin": "s"
+   },
+   "note": "本类不产生 payload、不进本次 seal（§15.1 后：切点后的后缀由 cutover 后 watermark 置 0 的 rescan 收编）",
+   "object_kind": "seal.observed_after_cut"
+  }
+ ],
+ "note": "切点后新建 -> observed-after-cut。补齐 §10.1 切点语义六情形里唯一缺的那格",
+ "vector_group": "v10"
+}

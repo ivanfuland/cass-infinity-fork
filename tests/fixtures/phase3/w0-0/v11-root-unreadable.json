@@ -1,0 +1,38 @@
+{
+ "appendix_section": "§B.5.2",
+ "cases": [
+  {
+   "case_id": "v11.root-unreadable",
+   "expect": "accept",
+   "expected": {
+    "root": "3d6fa0bee66f42f705330dd36d76d4a746e53dda65a5ce0c960256de06b23425",
+    "sorted_keys": [
+     "canonical_path",
+     "detail",
+     "object_kind",
+     "origin",
+     "reason"
+    ],
+    "tree_hash": "f206830255da6b9ef369c066968aeffdf06066d9c22127bcea7e11d158731a7f"
+   },
+   "input": {
+    "canonical_path": "/home/u/.claude/projects",
+    "detail": null,
+    "object_kind": "seal.hold",
+    "origin": "claude_code",
+    "reason": "unreadable"
+   },
+   "input_tags": {
+    "canonical_path": "p",
+    "detail": "n",
+    "object_kind": "s",
+    "origin": "s",
+    "reason": "s"
+   },
+   "note": "实现不得因为条目集为空就不产 HOLD —— 否则「整个 root 读不到」与「root 是空的」在 wire 上无法区分",
+   "object_kind": "seal.hold"
+  }
+ ],
+ "note": "整 root 不可读且条目集为空时的 root 级 HOLD。canonical_path 指向 root 目录本身，detail 必须为显式 null —— 它进 root，不能让自由文本承重 snapshot root",
+ "vector_group": "v11"
+}
