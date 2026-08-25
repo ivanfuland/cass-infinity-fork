@@ -587,7 +587,7 @@ fn load_keep_tag_conversation_ids(
     manifests: &[RawMirrorPruneManifest],
     keep_tags: &[String],
 ) -> Result<HashSet<i64>> {
-    use frankensqlite::compat::{ConnectionExt as _, ParamValue, RowExt as _};
+    use crate::storage::api::Value as ParamValue;
 
     let mut conversation_ids = manifests
         .iter()
@@ -611,7 +611,7 @@ fn load_keep_tag_conversation_ids(
             db_path.display()
         )
     })?;
-    let _ = conn.execute("PRAGMA query_only = 1;");
+    let _ = conn.execute("PRAGMA query_only = 1;", &[]);
 
     let mut pinned = HashSet::new();
     for id_chunk in conversation_ids.chunks(400) {
@@ -637,7 +637,7 @@ fn load_keep_tag_conversation_ids(
             .collect::<Vec<_>>();
         params.extend(id_chunk.iter().copied().map(ParamValue::from));
         let rows: Vec<i64> = conn
-            .query_map_collect(&sql, &params, |row: &frankensqlite::Row| row.get_typed(0))
+            .query_all_map(&sql, &params, |row| row.get_typed(0))
             .with_context(|| "query raw-mirror prune keep-tag conversation pins")?;
         pinned.extend(rows);
     }
@@ -2733,7 +2733,7 @@ mod tests {
 
     #[test]
     fn prune_apply_keep_tag_pins_linked_manifest_and_blob() {
-        use frankensqlite::compat::ConnectionExt as _;
+        use crate::storage::api::{Conn as FrankenConnection, Profile};
 
         let temp = tempfile::TempDir::new().expect("tempdir");
         let data_dir = temp.path().join("cass-data");
@@ -2761,26 +2761,26 @@ mod tests {
         })
         .expect("capture source");
         let db_path = data_dir.join("agent_search.db");
-        let conn = frankensqlite::Connection::open(db_path.to_string_lossy().into_owned())
+        let conn = FrankenConnection::open_writable(&db_path, Profile::Production)
             .expect("open keep-tag db");
-        conn.execute_compat(
+        conn.execute(
             "CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)",
-            frankensqlite::params![],
+            &[],
         )
         .expect("create tags");
-        conn.execute_compat(
+        conn.execute(
             "CREATE TABLE conversation_tags (conversation_id INTEGER NOT NULL, tag_id INTEGER NOT NULL, PRIMARY KEY (conversation_id, tag_id))",
-            frankensqlite::params![],
+            &[],
         )
         .expect("create conversation_tags");
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO tags (id, name) VALUES (1, 'keep')",
-            frankensqlite::params![],
+            &[],
         )
         .expect("insert tag");
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO conversation_tags (conversation_id, tag_id) VALUES (7, 1)",
-            frankensqlite::params![],
+            &[],
         )
         .expect("insert conversation tag");
         drop(conn);
