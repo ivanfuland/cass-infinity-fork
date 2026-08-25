@@ -10,7 +10,6 @@ use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message,
 use coding_agent_search::search::tantivy::TantivyIndex;
 use coding_agent_search::sources::provenance::Source;
 use coding_agent_search::storage::sqlite::SqliteStorage;
-use frankensqlite::compat::{ConnectionExt, RowExt};
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -260,7 +259,7 @@ fn index_local_and_remote_sources_preserves_provenance() {
     // Verify origin_host is preserved for remote conversations
     let remote_with_host: Vec<(String, Option<String>)> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT source_id, origin_host FROM conversations WHERE source_id != 'local'",
             &[],
             |r| Ok((r.get_typed(0)?, r.get_typed(1)?)),
@@ -324,7 +323,7 @@ fn persist_conversation_extracts_provenance_from_metadata() {
     // Verify provenance was extracted correctly
     let results: Vec<(String, String, Option<String>)> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT external_id, source_id, origin_host FROM conversations ORDER BY external_id",
             &[],
             |r| Ok((r.get_typed(0)?, r.get_typed(1)?, r.get_typed(2)?)),
@@ -427,7 +426,7 @@ fn filter_conversations_local_only() {
     // Query local only
     let local_results: Vec<String> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT external_id FROM conversations WHERE source_id = 'local' ORDER BY external_id",
             &[],
             |r| r.get_typed(0),
@@ -514,7 +513,7 @@ fn filter_conversations_remote_only() {
     // Query remote only (source_id != 'local')
     let remote_results: Vec<String> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT external_id FROM conversations WHERE source_id != 'local' ORDER BY external_id",
             &[],
             |r| r.get_typed(0),
@@ -601,7 +600,7 @@ fn filter_conversations_specific_source() {
     // Query laptop only
     let laptop_results: Vec<String> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT external_id FROM conversations WHERE source_id = 'laptop' ORDER BY external_id",
             &[],
             |r| r.get_typed(0),
@@ -615,7 +614,7 @@ fn filter_conversations_specific_source() {
     // Query server only
     let server_results: Vec<String> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT external_id FROM conversations WHERE source_id = 'server' ORDER BY external_id",
             &[],
             |r| r.get_typed(0),
@@ -903,7 +902,7 @@ fn stats_reflect_source_distribution() {
     // Query source distribution stats
     let distribution: Vec<(String, i64)> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT source_id, COUNT(*) as count FROM conversations GROUP BY source_id ORDER BY source_id",
             &[],
             |r| Ok((r.get_typed(0)?, r.get_typed(1)?)),
@@ -987,7 +986,7 @@ fn source_kind_available_via_join() {
     // Query with JOIN to get source kind
     let results: Vec<(String, String, String)> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT c.external_id, c.source_id, s.kind
              FROM conversations c
              LEFT JOIN sources s ON c.source_id = s.id
@@ -1178,7 +1177,7 @@ fn same_id_different_sources_are_distinct() {
     // Verify each source has one entry
     let by_source: Vec<(String, i64)> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT source_id, COUNT(*) FROM conversations
              WHERE external_id = 'session-001'
              GROUP BY source_id
@@ -1337,7 +1336,7 @@ fn composite_key_unique_constraint() {
     // Verify composite uniqueness via SQL
     let unique_pairs: Vec<(String, String, String)> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT source_id, agent_id, external_id FROM conversations
              WHERE external_id = 'unique-test'
              ORDER BY source_id",

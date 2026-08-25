@@ -1,10 +1,8 @@
 use assert_cmd::Command;
 use coding_agent_search::search::tantivy::{SCHEMA_HASH, expected_index_dir};
+use coding_agent_search::storage::api::Value as SqliteValue;
 use coding_agent_search::storage::sqlite::FrankenStorage;
-use frankensqlite::compat::{ConnectionExt, RowExt};
-use frankensqlite::params as fparams;
 use fs2::FileExt;
-use fsqlite_types::value::SqliteValue;
 use serde_json::{Value, json};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -425,30 +423,26 @@ fn seed_large_health_latency_db(data_dir: &Path) {
     let storage = FrankenStorage::open(&db_path).expect("open latency fixture db");
     let conn = storage.raw();
 
-    conn.execute_compat(
+    conn.execute(
         "INSERT OR IGNORE INTO agents(id, slug, name, version, kind, created_at, updated_at)
          VALUES(1, 'codex', 'Codex', '0.0.0', 'cli', 0, 0)",
-        fparams![],
+        &[],
     )
     .expect("seed latency fixture agent");
-    conn.execute("BEGIN").expect("begin latency fixture seed");
+    conn.execute("BEGIN", &[]).expect("begin latency fixture seed");
 
     {
-        let insert_conversation = conn
-            .prepare(
-                "INSERT INTO conversations(
+        // Stage A note: storage::api has no prepared-statement API yet (each
+        // execute() re-parses its SQL text), so this re-parses the same INSERT
+        // text per row instead of reusing a compiled statement across the
+        // loop. Correctness-preserving; only affects this fixture's seed time.
+        const INSERT_CONVERSATION_SQL: &str = "INSERT INTO conversations(
                     id, agent_id, source_id, external_id, title, source_path,
                     started_at, ended_at, approx_tokens, metadata_json
-                 ) VALUES (?1, 1, 'local', ?2, ?3, ?4, ?5, ?6, 12, '{}')",
-            )
-            .expect("prepare latency fixture conversation insert");
-        let insert_message = conn
-            .prepare(
-                "INSERT INTO messages(
+                 ) VALUES (?1, 1, 'local', ?2, ?3, ?4, ?5, ?6, 12, '{}')";
+        const INSERT_MESSAGE_SQL: &str = "INSERT INTO messages(
                     id, conversation_id, idx, role, author, created_at, content, extra_json
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, '{}')",
-            )
-            .expect("prepare latency fixture message insert");
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, '{}')";
 
         let payload = "x".repeat(128);
         for chunk_start in (1..=LARGE_HEALTH_DB_CONVERSATIONS)
@@ -462,21 +456,24 @@ fn seed_large_health_latency_db(data_dir: &Path) {
                 let title = format!("Health latency {conversation_id}");
                 let source_path =
                     format!("/tmp/cass-health-latency/session-{conversation_id}.jsonl");
-                insert_conversation
-                    .execute_with_params(&[
+                conn.execute(
+                    INSERT_CONVERSATION_SQL,
+                    &[
                         SqliteValue::from(conversation_id),
                         SqliteValue::from(external_id.as_str()),
                         SqliteValue::from(title.as_str()),
                         SqliteValue::from(source_path.as_str()),
                         SqliteValue::from(started_at),
                         SqliteValue::from(started_at + 1),
-                    ])
-                    .expect("seed latency fixture conversation");
+                    ],
+                )
+                .expect("seed latency fixture conversation");
 
                 let first_message_id = conversation_id * 2 - 1;
                 let user_content = format!("large health latency user {conversation_id} {payload}");
-                insert_message
-                    .execute_with_params(&[
+                conn.execute(
+                    INSERT_MESSAGE_SQL,
+                    &[
                         SqliteValue::from(first_message_id),
                         SqliteValue::from(conversation_id),
                         SqliteValue::from(0_i64),
@@ -484,13 +481,15 @@ fn seed_large_health_latency_db(data_dir: &Path) {
                         SqliteValue::from("user"),
                         SqliteValue::from(started_at),
                         SqliteValue::from(user_content.as_str()),
-                    ])
-                    .expect("seed latency fixture user message");
+                    ],
+                )
+                .expect("seed latency fixture user message");
 
                 let assistant_content =
                     format!("large health latency assistant {conversation_id} {payload}");
-                insert_message
-                    .execute_with_params(&[
+                conn.execute(
+                    INSERT_MESSAGE_SQL,
+                    &[
                         SqliteValue::from(first_message_id + 1),
                         SqliteValue::from(conversation_id),
                         SqliteValue::from(1_i64),
@@ -498,13 +497,14 @@ fn seed_large_health_latency_db(data_dir: &Path) {
                         SqliteValue::from("agent"),
                         SqliteValue::from(started_at + 1),
                         SqliteValue::from(assistant_content.as_str()),
-                    ])
-                    .expect("seed latency fixture assistant message");
+                    ],
+                )
+                .expect("seed latency fixture assistant message");
             }
         }
     }
 
-    conn.execute("COMMIT").expect("commit latency fixture seed");
+    conn.execute("COMMIT", &[]).expect("commit latency fixture seed");
 
     let conversation_count: i64 = conn
         .query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| {
