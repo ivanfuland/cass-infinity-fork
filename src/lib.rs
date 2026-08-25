@@ -76,10 +76,38 @@ use anyhow::Result;
 use base64::prelude::*;
 use chrono::Utc;
 use clap::{Arg, ArgAction, Command, CommandFactory, Parser, Subcommand, ValueEnum, ValueHint};
-use frankensqlite::compat::{
-    ConnectionExt, OpenFlags as FrankenOpenFlags, RowExt,
-    open_with_flags as open_franken_with_flags,
-};
+// w1a Task A5 (mirrors sqlite.rs Task A4a): resolve the historical
+// `frankensqlite` imports through the backend-agnostic `storage::api` facade.
+use storage::api::{Conn as FrankenConnection, Row as FrankenRow, StorageError, Value};
+type ParamValue = Value;
+type SqliteValue = Value;
+
+/// The original crate's `compat::OpenFlags` had many variants; this crate only ever
+/// requested `SQLITE_OPEN_READ_ONLY` (mirrors sqlite.rs's Task A4a shim).
+#[derive(Debug, Clone, Copy)]
+#[allow(non_camel_case_types)]
+enum FrankenOpenFlags {
+    SQLITE_OPEN_READ_ONLY,
+}
+
+fn open_franken_with_flags(
+    path: &str,
+    _flags: FrankenOpenFlags,
+) -> Result<FrankenConnection, StorageError> {
+    FrankenConnection::open_read(Path::new(path))
+}
+
+/// Stage-A-only bridge (Task A5) for `analytics::{query,validate}` call sites:
+/// that module is Task A6 batch 3 (out of this task's scope) and still takes
+/// `&frankensqlite`'s native `Connection` directly. Backed by the same
+/// `Conn::as_franken()`/`FrankenBackend::native()` escape hatch used by
+/// `run_franken_migrations`. Deleted once A6 migrates `analytics::*` to the
+/// facade and this bridge has no callers left.
+fn as_native_franken(conn: &FrankenConnection) -> &frankensqlite::Connection {
+    conn.as_franken()
+        .expect("Stage A: analytics bridge requires the franken backend")
+        .native()
+}
 use indexer::IndexOptions;
 use model::cli_error_kind::ErrorKind as CliErrorKind;
 use serde::{Deserialize, Serialize};
@@ -186,11 +214,11 @@ fn with_frankensqlite_connection<T, F>(
     db_path: &Path,
     context: &str,
     op: F,
-) -> std::result::Result<T, frankensqlite::FrankenError>
+) -> std::result::Result<T, StorageError>
 where
-    F: FnOnce(&frankensqlite::Connection) -> std::result::Result<T, frankensqlite::FrankenError>,
+    F: FnOnce(&FrankenConnection) -> std::result::Result<T, StorageError>,
 {
-    let mut conn = frankensqlite::Connection::open(db_path.to_string_lossy().as_ref())?;
+    let mut conn = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().as_ref())), crate::storage::api::Profile::Production)?;
     let result = op(&conn);
     let close_result = conn.close_in_place();
     match (result, close_result) {
@@ -16834,10 +16862,9 @@ fn analytics_build_filters(common: &AnalyticsCommon) -> Vec<String> {
 }
 
 fn resolve_analytics_workspace_ids(
-    conn: &frankensqlite::Connection,
+    conn: &FrankenConnection,
     workspace_paths: &[String],
 ) -> CliResult<Vec<i64>> {
-    use frankensqlite::compat::{ParamValue, RowExt};
 
     let requested_paths: Vec<String> = workspace_paths
         .iter()
@@ -16850,17 +16877,17 @@ fn resolve_analytics_workspace_ids(
         return Ok(Vec::new());
     }
 
-    if !analytics::query::table_exists(conn, "workspaces") {
+    if !analytics::query::table_exists(as_native_franken(conn), "workspaces") {
         return Ok(vec![-1]);
     }
 
     let mut workspace_ids = std::collections::BTreeSet::new();
     for workspace in requested_paths {
         let ids: Vec<i64> = conn
-            .query_map_collect(
+            .query_all_map(
                 "SELECT id FROM workspaces WHERE path = ?1",
                 &[ParamValue::from(workspace.as_str())],
-                |row: &frankensqlite::Row| row.get_typed(0),
+                |row: &FrankenRow| row.get_typed(0),
             )
             .map_err(|e| CliError {
                 code: 9,
@@ -16880,7 +16907,7 @@ fn resolve_analytics_workspace_ids(
 }
 
 fn analytics_query_filter(
-    conn: &frankensqlite::Connection,
+    conn: &FrankenConnection,
     common: &AnalyticsCommon,
 ) -> CliResult<analytics::AnalyticsFilter> {
     let mut filter = analytics::AnalyticsFilter::from(common);
@@ -16892,7 +16919,7 @@ fn analytics_query_filter(
 fn open_franken_analytics_db(
     data_dir: &Option<PathBuf>,
     db_path_override: Option<&PathBuf>,
-) -> CliResult<frankensqlite::Connection> {
+) -> CliResult<FrankenConnection> {
     open_franken_cli_read_db(
         analytics_db_path(data_dir, db_path_override),
         "analytics",
@@ -16911,7 +16938,7 @@ fn open_franken_cli_read_db(
     path: PathBuf,
     reason: &str,
     busy_timeout: Duration,
-) -> CliResult<frankensqlite::Connection> {
+) -> CliResult<FrankenConnection> {
     if !path.exists() {
         return Err(CliError {
             code: 3,
@@ -16962,8 +16989,8 @@ fn open_franken_cli_read_db(
     };
 
     let timeout_ms = busy_timeout.as_millis().clamp(1, u128::from(u32::MAX));
-    let _ = conn.execute(&format!("PRAGMA busy_timeout = {timeout_ms};"));
-    let _ = conn.execute("PRAGMA query_only = 1;");
+    let _ = conn.execute(&format!("PRAGMA busy_timeout = {timeout_ms};"), &[]);
+    let _ = conn.execute("PRAGMA query_only = 1;", &[]);
 
     Ok(conn)
 }
@@ -16972,7 +16999,7 @@ fn open_franken_cli_read_db_with_hard_timeout(
     path: PathBuf,
     reason: &str,
     timeout: Duration,
-) -> CliResult<frankensqlite::Connection> {
+) -> CliResult<FrankenConnection> {
     let display_path = path.display().to_string();
     let reason = reason.to_string();
     if let Some(err) = sqlite_header_preflight_error(&path, &display_path, &reason) {
@@ -17039,7 +17066,7 @@ fn receive_franken_cli_read_db_open_result_with_hard_timeout(
     display_path: String,
     reason: String,
     timeout: Duration,
-) -> CliResult<frankensqlite::Connection> {
+) -> CliResult<FrankenConnection> {
     match rx.recv_timeout(timeout) {
         Ok(Ok(conn)) => Ok(conn.into_parts().0),
         Ok(Err(err)) => Err(err),
@@ -17066,7 +17093,7 @@ fn receive_franken_cli_read_db_open_result_with_hard_timeout(
 }
 
 fn close_franken_cli_read_db(
-    mut conn: frankensqlite::Connection,
+    mut conn: FrankenConnection,
     path: &Path,
     reason: &str,
 ) -> CliResult<()> {
@@ -17093,7 +17120,7 @@ fn fts_messages_integrity_cli_error(surface: &str, err: anyhow::Error) -> CliErr
 }
 
 fn validate_fts_messages_integrity_for_cli(
-    conn: &frankensqlite::Connection,
+    conn: &FrankenConnection,
     surface: &str,
 ) -> CliResult<()> {
     crate::storage::sqlite::validate_fts_messages_integrity_for_connection(conn)
@@ -17101,13 +17128,13 @@ fn validate_fts_messages_integrity_for_cli(
 }
 
 fn franken_query_row_map_retry<T, F>(
-    conn: &frankensqlite::Connection,
+    conn: &FrankenConnection,
     sql: &str,
-    params: &[frankensqlite::compat::ParamValue],
+    params: &[ParamValue],
     map: F,
-) -> Result<T, frankensqlite::FrankenError>
+) -> Result<T, StorageError>
 where
-    F: Copy + Fn(&frankensqlite::Row) -> Result<T, frankensqlite::FrankenError>,
+    F: Copy + Fn(&FrankenRow) -> Result<T, StorageError>,
 {
     let deadline = std::time::Instant::now() + CLI_DB_QUERY_RETRY_TIMEOUT;
     let mut backoff = Duration::from_millis(4);
@@ -17132,18 +17159,18 @@ where
 }
 
 fn franken_query_map_collect_retry<T, F>(
-    conn: &frankensqlite::Connection,
+    conn: &FrankenConnection,
     sql: &str,
-    params: &[frankensqlite::compat::ParamValue],
+    params: &[ParamValue],
     map: F,
-) -> Result<Vec<T>, frankensqlite::FrankenError>
+) -> Result<Vec<T>, StorageError>
 where
-    F: Copy + Fn(&frankensqlite::Row) -> Result<T, frankensqlite::FrankenError>,
+    F: Copy + Fn(&FrankenRow) -> Result<T, StorageError>,
 {
     let deadline = std::time::Instant::now() + CLI_DB_QUERY_RETRY_TIMEOUT;
     let mut backoff = Duration::from_millis(4);
     loop {
-        match conn.query_map_collect(sql, params, |row| map(row)) {
+        match conn.query_all_map(sql, params, |row| map(row)) {
             Ok(values) => return Ok(values),
             Err(err) if crate::storage::sqlite::retryable_franken_error(&err) => {
                 let now = std::time::Instant::now();
@@ -17167,7 +17194,7 @@ fn fresh_franken_count_retry(
     reason: &str,
     busy_timeout: Duration,
     sql: &str,
-    params: &[frankensqlite::compat::ParamValue],
+    params: &[ParamValue],
 ) -> Option<i64> {
     let deadline = std::time::Instant::now() + CLI_DB_QUERY_RETRY_TIMEOUT;
     let mut backoff = Duration::from_millis(4);
@@ -17235,7 +17262,7 @@ fn run_analytics_status(
     let conn = open_franken_analytics_db(&common.data_dir, db_path_override)?;
     let filter = analytics_query_filter(&conn, common)?;
 
-    analytics::query::query_status(&conn, &filter)
+    analytics::query::query_status(as_native_franken(&conn), &filter)
         .map(|r| r.to_json())
         .map_err(analytics_query_cli_error)
 }
@@ -17253,7 +17280,7 @@ fn run_analytics_tokens(
     let conn = open_franken_analytics_db(&common.data_dir, db_path_override)?;
     let filter = analytics_query_filter(&conn, common)?;
 
-    analytics::query::query_tokens_timeseries(&conn, &filter, group_by.into())
+    analytics::query::query_tokens_timeseries(as_native_franken(&conn), &filter, group_by.into())
         .map(|r| r.to_cli_json())
         .map_err(analytics_query_cli_error)
 }
@@ -17348,7 +17375,7 @@ fn run_analytics_tools(
     let conn = open_franken_analytics_db(&common.data_dir, db_path_override)?;
     let filter = analytics_query_filter(&conn, common)?;
 
-    analytics::query::query_tools(&conn, &filter, group_by.into(), limit)
+    analytics::query::query_tools(as_native_franken(&conn), &filter, group_by.into(), limit)
         .map(|r| r.to_cli_json())
         .map_err(analytics_query_cli_error)
 }
@@ -17485,7 +17512,7 @@ fn run_analytics_validate(
     let db_path = analytics_db_path(&common.data_dir, db_path_override);
 
     let pre_conn = open_franken_analytics_db(&common.data_dir, db_path_override)?;
-    let pre_report = analytics::validate::run_validation(&pre_conn, &config);
+    let pre_report = analytics::validate::run_validation(as_native_franken(&pre_conn), &config);
     let pre_summary = analytics_validation_summary(&pre_report);
     let repair_plan = fix.then(|| analytics::validate::build_repair_plan(&pre_report));
 
@@ -17499,7 +17526,7 @@ fn run_analytics_validate(
                 analytics::validate::RepairKind::RebuildTrackA => {
                     if ["messages", "conversations", "agents"]
                         .into_iter()
-                        .all(|table| analytics::query::table_exists(&pre_conn, table))
+                        .all(|table| analytics::query::table_exists(as_native_franken(&pre_conn), table))
                     {
                         let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
                             code: 9,
@@ -17600,14 +17627,14 @@ fn run_analytics_validate(
     }
 
     let conn = open_franken_analytics_db(&common.data_dir, db_path_override)?;
-    let mut report = analytics::validate::run_validation(&conn, &config);
+    let mut report = analytics::validate::run_validation(as_native_franken(&conn), &config);
     if fix {
         annotate_deferred_analytics_failures(&mut report, &deferred_check_ids);
     }
     let summary = analytics_validation_summary(&report);
 
-    let perf_ts = analytics::validate::perf_query_guardrail(&conn);
-    let perf_bd = analytics::validate::perf_breakdown_guardrail(&conn);
+    let perf_ts = analytics::validate::perf_query_guardrail(as_native_franken(&conn));
+    let perf_bd = analytics::validate::perf_breakdown_guardrail(as_native_franken(&conn));
 
     if fix {
         emit_analytics_validate_summary("pre-fix:", &pre_summary);
@@ -17714,7 +17741,7 @@ fn run_analytics_models(
 
     // Model breakdown by API tokens.
     let by_tokens = analytics::query::query_breakdown(
-        &conn,
+        as_native_franken(&conn),
         &filter,
         analytics::Dim::Model,
         analytics::Metric::ApiTotal,
@@ -17723,7 +17750,7 @@ fn run_analytics_models(
     .map_err(analytics_query_cli_error)?;
 
     // Time series for aggregate stats.
-    let ts = analytics::query::query_tokens_timeseries(&conn, &filter, group_by.into())
+    let ts = analytics::query::query_tokens_timeseries(as_native_franken(&conn), &filter, group_by.into())
         .map_err(analytics_query_cli_error)?;
 
     // Human-readable stderr summary.
@@ -17986,14 +18013,12 @@ fn probe_state_db_modes(
         }
     };
 
-    use frankensqlite::compat::RowExt;
-    use frankensqlite::params;
 
     snapshot.opened = true;
     snapshot.last_indexed_at = franken_query_row_map_retry(
         &conn,
         "SELECT value FROM meta WHERE key = 'last_indexed_at'",
-        params![],
+        &[],
         |r| r.get_typed::<String>(0),
     )
     .ok()
@@ -18001,7 +18026,7 @@ fn probe_state_db_modes(
     snapshot.last_scan_ts = franken_query_row_map_retry(
         &conn,
         "SELECT value FROM meta WHERE key = 'last_scan_ts'",
-        params![],
+        &[],
         |r| r.get_typed::<String>(0),
     )
     .ok()
@@ -18010,12 +18035,12 @@ fn probe_state_db_modes(
         snapshot.conversation_count = franken_query_row_map_retry(
             &conn,
             "SELECT COUNT(*) FROM conversations",
-            params![],
+            &[],
             |r| r.get_typed(0),
         )
         .unwrap_or(0);
         snapshot.message_count =
-            franken_query_row_map_retry(&conn, "SELECT COUNT(*) FROM messages", params![], |r| {
+            franken_query_row_map_retry(&conn, "SELECT COUNT(*) FROM messages", &[], |r| {
                 r.get_typed(0)
             })
             .unwrap_or(0);
@@ -18025,7 +18050,7 @@ fn probe_state_db_modes(
                 reason,
                 timeout,
                 "SELECT COUNT(*) FROM conversations",
-                params![],
+                &[],
             )
             .unwrap_or(0);
         }
@@ -18035,7 +18060,7 @@ fn probe_state_db_modes(
                 reason,
                 timeout,
                 "SELECT COUNT(*) FROM messages",
-                params![],
+                &[],
             )
             .unwrap_or(0);
         }
@@ -20055,7 +20080,7 @@ fn prepare_headless_once_tui_artifacts(
     let db_path = data_dir.join("agent_search.db");
     {
         let _conn =
-            frankensqlite::Connection::open(db_path.to_string_lossy().as_ref()).map_err(|e| {
+            FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().as_ref())), crate::storage::api::Profile::Production).map_err(|e| {
                 anyhow::anyhow!(
                     "initialize SQLite database for headless --once at {}: {e}",
                     db_path.display()
@@ -20589,8 +20614,8 @@ fn analytics_requests_structured_output(cmd: &AnalyticsCommand, cli: &Cli) -> bo
 /// Default tracing directive for interactive human mode: emit INFO and above
 /// but suppress frankensqlite internal telemetry that spams at INFO level.
 ///
-/// `EnvFilter` uses `::` as the hierarchy separator, so `fsqlite=warn` covers
-/// `fsqlite::runtime`, `fsqlite::cx`, etc. Crate-level targets like
+/// `EnvFilter` uses a colon-separated hierarchy, so `fsqlite=warn` covers
+/// `fsqlite`'s `runtime`/`cx` sub-targets, etc. Crate-level targets like
 /// `fsqlite_vdbe` and `fsqlite_core` need their own directives. Custom
 /// dot-separated targets (`fsqlite.statement_reuse`, `fsqlite.compat`, etc.) are
 /// NOT matched by the hierarchical prefix, so each must be listed explicitly.
@@ -27735,7 +27760,7 @@ fn stats_workspace_count_sql(source_where: &str) -> String {
 
 fn append_source_filter_condition(
     sql: &mut String,
-    params: &mut Vec<frankensqlite::compat::ParamValue>,
+    params: &mut Vec<ParamValue>,
     source_filter: &crate::sources::provenance::SourceFilter,
 ) {
     append_source_filter_condition_with_columns(
@@ -27749,7 +27774,7 @@ fn append_source_filter_condition(
 
 fn append_source_filter_condition_with_columns(
     sql: &mut String,
-    params: &mut Vec<frankensqlite::compat::ParamValue>,
+    params: &mut Vec<ParamValue>,
     source_filter: &crate::sources::provenance::SourceFilter,
     source_id_sql: &str,
     origin_host_sql: &str,
@@ -27792,7 +27817,6 @@ fn run_stats(
 ) -> CliResult<()> {
     use crate::sources::provenance::SourceFilter;
 
-    use frankensqlite::compat::{ParamValue, RowExt};
 
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
@@ -28554,8 +28578,6 @@ fn run_diag(
     quarantine: bool,
     verbose: bool,
 ) -> CliResult<()> {
-    use frankensqlite::compat::RowExt;
-    use frankensqlite::params;
     use std::fs;
 
     let version = env!("CARGO_PKG_VERSION");
@@ -28576,14 +28598,14 @@ fn run_diag(
                 let mut convs: i64 = franken_query_row_map_retry(
                     &conn,
                     "SELECT COUNT(*) FROM conversations",
-                    params![],
+                    &[],
                     |r| r.get_typed(0),
                 )
                 .unwrap_or(0);
                 let mut msgs: i64 = franken_query_row_map_retry(
                     &conn,
                     "SELECT COUNT(*) FROM messages",
-                    params![],
+                    &[],
                     |r| r.get_typed(0),
                 )
                 .unwrap_or(0);
@@ -28593,7 +28615,7 @@ fn run_diag(
                         "diagnostics",
                         CLI_DIAG_DB_OPEN_TIMEOUT,
                         "SELECT COUNT(*) FROM conversations",
-                        params![],
+                        &[],
                     )
                     .unwrap_or(0);
                 }
@@ -28603,7 +28625,7 @@ fn run_diag(
                         "diagnostics",
                         CLI_DIAG_DB_OPEN_TIMEOUT,
                         "SELECT COUNT(*) FROM messages",
-                        params![],
+                        &[],
                     )
                     .unwrap_or(0);
                 }
@@ -29420,12 +29442,11 @@ fn doctor_anomaly_taxonomy_report() -> Vec<DoctorAnomalyTaxonomyEntry> {
 }
 
 fn doctor_database_integrity_probe(
-    conn: &frankensqlite::Connection,
+    conn: &FrankenConnection,
 ) -> Result<DoctorDatabaseIntegrityProbe, String> {
-    use frankensqlite::compat::{ConnectionExt as _, RowExt as _};
 
     let quick_check_status: String = conn
-        .query_row_map("PRAGMA quick_check(1)", &[], |row: &frankensqlite::Row| {
+        .query_row_map("PRAGMA quick_check(1)", &[], |row: &FrankenRow| {
             row.get_typed(0)
         })
         .map_err(|err| format!("running PRAGMA quick_check(1): {err}"))?;
@@ -29434,14 +29455,11 @@ fn doctor_database_integrity_probe(
     let integrity_check_diagnostics = if quick_check_ok {
         let integrity_sql =
             format!("PRAGMA integrity_check({DOCTOR_DATABASE_INTEGRITY_DIAGNOSTIC_LIMIT});");
-        let rows = conn
-            .query(&integrity_sql)
+        let rows: Vec<String> = conn
+            .query_all_map(&integrity_sql, &[], |row: &FrankenRow| row.get_typed(0))
             .map_err(|err| format!("running PRAGMA integrity_check: {err}"))?;
         let mut diagnostics = Vec::new();
-        for row in rows {
-            let detail: String = row
-                .get_typed(0)
-                .map_err(|err| format!("reading PRAGMA integrity_check output: {err}"))?;
+        for detail in rows {
             let detail = detail.trim();
             if detail.eq_ignore_ascii_case("ok") || detail.is_empty() {
                 continue;
@@ -36429,14 +36447,14 @@ fn doctor_source_inventory_stable_id(
     )
 }
 
-fn doctor_table_columns(conn: &frankensqlite::Connection, table: &str) -> HashSet<String> {
+fn doctor_table_columns(conn: &FrankenConnection, table: &str) -> HashSet<String> {
     if !table.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return HashSet::new();
     }
-    conn.query_map_collect(
+    conn.query_all_map(
         &format!("PRAGMA table_info({table})"),
         &[],
-        |row: &frankensqlite::Row| row.get_typed::<String>(1),
+        |row: &FrankenRow| row.get_typed::<String>(1),
     )
     .unwrap_or_default()
     .into_iter()
@@ -36444,9 +36462,8 @@ fn doctor_table_columns(conn: &frankensqlite::Connection, table: &str) -> HashSe
 }
 
 fn query_doctor_source_inventory_db_rows(
-    conn: &frankensqlite::Connection,
-) -> std::result::Result<Vec<DoctorSourceInventoryDbRow>, frankensqlite::FrankenError> {
-    use frankensqlite::compat::ConnectionExt as _;
+    conn: &FrankenConnection,
+) -> std::result::Result<Vec<DoctorSourceInventoryDbRow>, StorageError> {
 
     let conversation_columns = doctor_table_columns(conn, "conversations");
     if conversation_columns.is_empty() {
@@ -36500,7 +36517,7 @@ fn query_doctor_source_inventory_db_rows(
          ORDER BY 1, 3, 4, 2"
     );
 
-    conn.query_map_collect(&sql, &[], |row: &frankensqlite::Row| {
+    conn.query_all_map(&sql, &[], |row: &FrankenRow| {
         let count: i64 = row.get_typed(5)?;
         Ok(DoctorSourceInventoryDbRow {
             provider: row.get_typed(0)?,
@@ -39910,9 +39927,8 @@ pub(crate) fn run_doctor_archive_normalize_impl(
 }
 
 fn query_doctor_raw_mirror_backfill_candidates(
-    conn: &frankensqlite::Connection,
-) -> std::result::Result<Vec<DoctorRawMirrorBackfillCandidate>, frankensqlite::FrankenError> {
-    use frankensqlite::compat::ConnectionExt as _;
+    conn: &FrankenConnection,
+) -> std::result::Result<Vec<DoctorRawMirrorBackfillCandidate>, StorageError> {
 
     let conversation_columns = doctor_table_columns(conn, "conversations");
     if !conversation_columns.contains("id") {
@@ -39981,7 +39997,7 @@ fn query_doctor_raw_mirror_backfill_candidates(
          ORDER BY c.id"
     );
 
-    conn.query_map_collect(&sql, &[], |row: &frankensqlite::Row| {
+    conn.query_all_map(&sql, &[], |row: &FrankenRow| {
         let message_count: i64 = row.get_typed(7)?;
         Ok(DoctorRawMirrorBackfillCandidate {
             conversation_id: row.get_typed(0)?,
@@ -42029,7 +42045,7 @@ fn doctor_candidate_copy_to_staging(
     })
 }
 
-fn doctor_candidate_table_count(conn: &frankensqlite::Connection, table: &str) -> Option<usize> {
+fn doctor_candidate_table_count(conn: &FrankenConnection, table: &str) -> Option<usize> {
     let table = match table {
         "conversations" | "messages" => table,
         _ => return None,
@@ -42038,7 +42054,7 @@ fn doctor_candidate_table_count(conn: &frankensqlite::Connection, table: &str) -
         conn.query_row_map(
             &format!("SELECT COUNT(*) FROM {table}"),
             &[],
-            |row: &frankensqlite::Row| row.get_typed::<i64>(0),
+            |row: &FrankenRow| row.get_typed::<i64>(0),
         )
         .ok()
         .map(|count| count.max(0) as usize)
@@ -42051,20 +42067,20 @@ fn doctor_candidate_probe_frankensqlite(
     candidate_db_path: &Path,
     candidate_id: &str,
 ) -> Result<(Option<usize>, Option<usize>), String> {
-    let conn = frankensqlite::Connection::open(candidate_db_path.to_string_lossy().as_ref())
+    let conn = FrankenConnection::open_writable(std::path::Path::new(&(candidate_db_path.to_string_lossy().as_ref())), crate::storage::api::Profile::Production)
         .map_err(|err| {
             format!(
                 "failed to open candidate archive DB with frankensqlite at {}: {err}",
                 candidate_db_path.display()
             )
         })?;
-    conn.execute("PRAGMA journal_mode = WAL;").map_err(|err| {
+    conn.execute("PRAGMA journal_mode = WAL;", &[]).map_err(|err| {
         format!(
             "failed to set WAL mode on candidate archive DB {}: {err}",
             candidate_db_path.display()
         )
     })?;
-    conn.execute("PRAGMA busy_timeout = 5000;").map_err(|err| {
+    conn.execute("PRAGMA busy_timeout = 5000;", &[]).map_err(|err| {
         format!(
             "failed to set busy_timeout on candidate archive DB {}: {err}",
             candidate_db_path.display()
@@ -42076,18 +42092,18 @@ fn doctor_candidate_probe_frankensqlite(
             created_at_ms INTEGER NOT NULL,
             schema_version INTEGER NOT NULL
         );",
-    )
+    &[])
     .map_err(|err| {
         format!(
             "failed to create candidate metadata table in {}: {err}",
             candidate_db_path.display()
         )
     })?;
-    conn.execute_compat(
+    conn.execute(
         "INSERT OR REPLACE INTO cass_doctor_candidate_metadata
          (candidate_id, created_at_ms, schema_version)
          VALUES (?1, ?2, ?3)",
-        frankensqlite::params![
+        &crate::storage::api::params![
             candidate_id,
             doctor_now_ms(),
             DOCTOR_CANDIDATE_SCHEMA_VERSION as i64
@@ -42154,18 +42170,20 @@ fn doctor_candidate_live_archive_copy_probe(
             db_path.display()
         )
     })?;
-    let result: std::result::Result<(Option<usize>, Option<usize>), frankensqlite::FrankenError> =
+    let result: std::result::Result<(Option<usize>, Option<usize>), StorageError> =
         (|| {
             let conversations =
                 doctor_candidate_table_count(&conn, "conversations").ok_or_else(|| {
-                    frankensqlite::FrankenError::Internal(
-                        "live archive DB has no readable conversations table".to_string(),
-                    )
+                    StorageError::Other {
+                        code: None,
+                        detail: "live archive DB has no readable conversations table".to_string(),
+                    }
                 })?;
             let messages = doctor_candidate_table_count(&conn, "messages").ok_or_else(|| {
-                frankensqlite::FrankenError::Internal(
-                    "live archive DB has no readable messages table".to_string(),
-                )
+                StorageError::Other {
+                    code: None,
+                    detail: "live archive DB has no readable messages table".to_string(),
+                }
             })?;
             Ok((Some(conversations), Some(messages)))
         })();
@@ -53854,7 +53872,6 @@ fn run_doctor_archive_db_post_repair_probe(
     data_dir: &Path,
     db_path: &Path,
 ) -> DoctorPostRepairProbeReport {
-    use frankensqlite::compat::{ConnectionExt, RowExt};
 
     let probe_id = "archive-db-rollback-write-read";
     let target = DoctorPostRepairProbeTarget {
@@ -53944,7 +53961,7 @@ fn run_doctor_archive_db_post_repair_probe(
         }
     };
     let conn = writer.storage().raw();
-    if let Err(err) = conn.execute("BEGIN;") {
+    if let Err(err) = conn.execute("BEGIN;", &[]) {
         return doctor_post_repair_probe_report(
             target,
             doctor_post_repair_probe_outcome(
@@ -53966,8 +53983,8 @@ fn run_doctor_archive_db_post_repair_probe(
             value TEXT NOT NULL
         );"
     );
-    if let Err(err) = conn.execute(&create_sql) {
-        let _ = conn.execute("ROLLBACK;");
+    if let Err(err) = conn.execute(&create_sql, &[]) {
+        let _ = conn.execute("ROLLBACK;", &[]);
         return doctor_post_repair_probe_report(
             target,
             doctor_post_repair_probe_outcome(
@@ -53984,11 +54001,11 @@ fn run_doctor_archive_db_post_repair_probe(
     steps.push("create_doctor_owned_probe_table".to_string());
 
     let insert_sql = format!("INSERT INTO {table_name} (probe_id, value) VALUES (?1, ?2)");
-    if let Err(err) = conn.execute_compat(
+    if let Err(err) = conn.execute(
         &insert_sql,
-        frankensqlite::params![probe_id, sentinel_value.as_str()],
+        &crate::storage::api::params![probe_id, sentinel_value.as_str()],
     ) {
-        let _ = conn.execute("ROLLBACK;");
+        let _ = conn.execute("ROLLBACK;", &[]);
         return doctor_post_repair_probe_report(
             target,
             doctor_post_repair_probe_outcome(
@@ -54009,15 +54026,15 @@ fn run_doctor_archive_db_post_repair_probe(
     let select_sql = format!("SELECT value FROM {table_name} WHERE probe_id = ?1");
     let mut read_back = match conn.query_row_map(
         &select_sql,
-        frankensqlite::params![probe_id],
-        |row: &frankensqlite::Row| row.get_typed::<String>(0),
+        &crate::storage::api::params![probe_id],
+        |row: &FrankenRow| row.get_typed::<String>(0),
     ) {
         Ok(value) => {
             steps.push("read_probe_sentinel".to_string());
             value
         }
         Err(err) => {
-            let _ = conn.execute("ROLLBACK;");
+            let _ = conn.execute("ROLLBACK;", &[]);
             return doctor_post_repair_probe_report(
                 target,
                 doctor_post_repair_probe_outcome(
@@ -54038,7 +54055,7 @@ fn run_doctor_archive_db_post_repair_probe(
         read_back.push_str("-forced-mismatch");
     }
     if read_back != sentinel_value {
-        let _ = conn.execute("ROLLBACK;");
+        let _ = conn.execute("ROLLBACK;", &[]);
         return doctor_post_repair_probe_report(
             target,
             doctor_post_repair_probe_outcome(
@@ -54056,7 +54073,7 @@ fn run_doctor_archive_db_post_repair_probe(
     }
 
     if fault.as_deref() == Some("archive_db_rollback_failure") {
-        let _ = conn.execute("ROLLBACK;");
+        let _ = conn.execute("ROLLBACK;", &[]);
         return doctor_post_repair_probe_report(
             target,
             doctor_post_repair_probe_outcome(
@@ -54070,7 +54087,7 @@ fn run_doctor_archive_db_post_repair_probe(
             ),
         );
     }
-    if let Err(err) = conn.execute("ROLLBACK;") {
+    if let Err(err) = conn.execute("ROLLBACK;", &[]) {
         return doctor_post_repair_probe_report(
             target,
             doctor_post_repair_probe_outcome(
@@ -54116,8 +54133,8 @@ fn run_doctor_archive_db_post_repair_probe(
     let durable_table_count: i64 = conn
         .query_row_map(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
-            frankensqlite::params![table_name.as_str()],
-            |row: &frankensqlite::Row| row.get_typed(0),
+            &crate::storage::api::params![table_name.as_str()],
+            |row: &FrankenRow| row.get_typed(0),
         )
         .unwrap_or(1);
     let _ = close_franken_cli_read_db(conn, db_path, "doctor post-repair probe");
@@ -59437,8 +59454,8 @@ mod doctor_asset_taxonomy_tests {
         let durable_probe_tables: i64 = conn
             .query_row_map(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name LIKE 'cass_doctor_probe_%'",
-                frankensqlite::params![],
-                |row: &frankensqlite::Row| row.get_typed(0),
+                &[],
+                |row: &FrankenRow| row.get_typed(0),
             )
             .expect("count probe tables");
         let _ = close_franken_cli_read_db(conn, &db_path, "post-repair probe test");
@@ -63386,17 +63403,17 @@ mod doctor_asset_taxonomy_tests {
     }
 
     fn seed_candidate_source_db(db_path: &Path) {
-        let conn = frankensqlite::Connection::open(db_path.to_string_lossy().as_ref())
+        let conn = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().as_ref())), crate::storage::api::Profile::Production)
             .expect("open source db");
-        conn.execute("PRAGMA journal_mode = WAL;")
+        conn.execute("PRAGMA journal_mode = WAL;", &[])
             .expect("set wal mode");
-        conn.execute("CREATE TABLE conversations (id INTEGER PRIMARY KEY);")
+        conn.execute("CREATE TABLE conversations (id INTEGER PRIMARY KEY);", &[])
             .expect("create conversations");
-        conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY);")
+        conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY);", &[])
             .expect("create messages");
-        conn.execute("INSERT INTO conversations (id) VALUES (1);")
+        conn.execute("INSERT INTO conversations (id) VALUES (1);", &[])
             .expect("insert conversation");
-        conn.execute("INSERT INTO messages (id) VALUES (1);")
+        conn.execute("INSERT INTO messages (id) VALUES (1);", &[])
             .expect("insert message");
     }
 
@@ -71951,8 +71968,8 @@ enum DoctorFtsTableState {
     Missing { frankensqlite_error: String },
 }
 
-fn probe_doctor_fts_table(conn: &frankensqlite::Connection) -> DoctorFtsTableState {
-    match conn.query("SELECT rowid FROM fts_messages LIMIT 1;") {
+fn probe_doctor_fts_table(conn: &FrankenConnection) -> DoctorFtsTableState {
+    match conn.query_all_map("SELECT rowid FROM fts_messages LIMIT 1;", &[], |_row| Ok(())) {
         Ok(_) => DoctorFtsTableState::QueryableViaFrankensqlite,
         Err(frankensqlite_error) => DoctorFtsTableState::Missing {
             frankensqlite_error: frankensqlite_error.to_string(),
@@ -71965,8 +71982,8 @@ mod doctor_fts_tests {
     use super::*;
 
     fn create_search_schema(
-        conn: &frankensqlite::Connection,
-    ) -> Result<(), frankensqlite::FrankenError> {
+        conn: &FrankenConnection,
+    ) -> Result<(), StorageError> {
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
              CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
@@ -71995,7 +72012,7 @@ mod doctor_fts_tests {
         let temp_dir = tempfile::TempDir::new()?;
         let db_path = temp_dir.path().join("legacy-fts.db");
 
-        let conn = frankensqlite::Connection::open(db_path.to_string_lossy().as_ref())?;
+        let conn = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().as_ref())), crate::storage::api::Profile::Production)?;
         create_search_schema(&conn)?;
         conn.execute_batch(
             "CREATE VIRTUAL TABLE fts_messages USING fts5(
@@ -72031,7 +72048,7 @@ mod doctor_fts_tests {
         let temp_dir = tempfile::TempDir::new()?;
         let db_path = temp_dir.path().join("missing-fts.db");
 
-        let conn = frankensqlite::Connection::open(db_path.to_string_lossy().as_ref())?;
+        let conn = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().as_ref())), crate::storage::api::Profile::Production)?;
         create_search_schema(&conn)?;
         let state = probe_doctor_fts_table(&conn);
         assert!(
@@ -72087,7 +72104,7 @@ mod cli_read_db_tests {
         let conn = open_franken_analytics_db(&data_dir, None).expect("open readonly analytics db");
 
         let err = conn
-            .execute("CREATE TABLE cli_readonly_probe(id INTEGER PRIMARY KEY);")
+            .execute("CREATE TABLE cli_readonly_probe(id INTEGER PRIMARY KEY);", &[])
             .expect_err("analytics reader must not accept writes");
         let message = err.to_string().to_lowercase();
         assert!(
@@ -74125,7 +74142,7 @@ fn doctor_archive_db_probe_hard_timeout() -> Duration {
 /// final JSON verdict. The abandoned worker stays detached — the same
 /// containment contract as `open_franken_cli_read_db_with_hard_timeout`.
 fn run_bounded_doctor_archive_db_probe(
-    conn: frankensqlite::Connection,
+    conn: FrankenConnection,
     db_path: &Path,
     timeout: Duration,
 ) -> DoctorBoundedArchiveDbProbeOutcome {
@@ -74135,7 +74152,6 @@ fn run_bounded_doctor_archive_db_probe(
     let worker_db_path = db_path.to_path_buf();
     let conn = crate::storage::sqlite::SendFrankenConnection::new(conn);
     let _probe_worker = std::thread::spawn(move || {
-        use frankensqlite::compat::{ConnectionExt as _, RowExt as _};
 
         let set_phase = |value: &'static str| {
             if let Ok(mut current) = worker_phase.lock() {
@@ -74147,7 +74163,7 @@ fn run_bounded_doctor_archive_db_probe(
             .query_row_map(
                 "SELECT COUNT(*) FROM conversations",
                 &[],
-                |r: &frankensqlite::Row| r.get_typed(0),
+                |r: &FrankenRow| r.get_typed(0),
             )
             .ok();
         set_phase("row_count_messages");
@@ -74155,7 +74171,7 @@ fn run_bounded_doctor_archive_db_probe(
             .query_row_map(
                 "SELECT COUNT(*) FROM messages",
                 &[],
-                |r: &frankensqlite::Row| r.get_typed(0),
+                |r: &FrankenRow| r.get_typed(0),
             )
             .ok();
         let mut integrity = None;
@@ -75729,27 +75745,26 @@ pub(crate) fn run_doctor_impl(
                         Duration::from_secs(30),
                     ) {
                         Ok(conn) => {
-                            use frankensqlite::compat::{ConnectionExt as _, RowExt as _};
 
                             let conv_count: Option<i64> = conn
                                 .query_row_map(
                                     "SELECT COUNT(*) FROM conversations",
                                     &[],
-                                    |r: &frankensqlite::Row| r.get_typed(0),
+                                    |r: &FrankenRow| r.get_typed(0),
                                 )
                                 .ok();
                             let msg_count: Option<i64> = conn
                                 .query_row_map(
                                     "SELECT COUNT(*) FROM messages",
                                     &[],
-                                    |r: &frankensqlite::Row| r.get_typed(0),
+                                    |r: &FrankenRow| r.get_typed(0),
                                 )
                                 .ok();
                             let quick_check_status: Option<String> = conn
                                 .query_row_map(
                                     "PRAGMA quick_check(1)",
                                     &[],
-                                    |r: &frankensqlite::Row| r.get_typed(0),
+                                    |r: &FrankenRow| r.get_typed(0),
                                 )
                                 .ok();
 
@@ -77062,7 +77077,6 @@ fn run_sessions(
     db_override: Option<PathBuf>,
     output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
-    use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
 
     let conn = open_franken_analytics_db(data_dir_override, db_override.as_ref())?;
     let target_workspace = match (workspace, current) {
@@ -77148,7 +77162,7 @@ fn run_sessions(
         Option<i64>,
         Option<i64>,
     )> = conn
-        .query_map_collect(&sessions_sql, params, |row: &frankensqlite::Row| {
+        .query_all_map(&sessions_sql, params, |row: &FrankenRow| {
             Ok((
                 row.get_typed(0)?,
                 row.get_typed(1)?,
@@ -77273,13 +77287,13 @@ fn run_sessions(
     // range scan on messages(conversation_id, idx) and the roles are
     // tallied in Rust — cost scales with the returned page, not the corpus.
     let count_session_messages =
-        |conversation_id: i64| -> Result<(i64, i64), frankensqlite::FrankenError> {
-            let roles: Vec<String> = conn.query_map_collect(
+        |conversation_id: i64| -> Result<(i64, i64), StorageError> {
+            let roles: Vec<String> = conn.query_all_map(
                 "SELECT role
                  FROM messages INDEXED BY sqlite_autoindex_messages_1
                  WHERE conversation_id = ?1",
                 &[ParamValue::from(conversation_id)],
-                |row: &frankensqlite::Row| row.get_typed::<String>(0),
+                |row: &FrankenRow| row.get_typed::<String>(0),
             )?;
             let message_count = roles.len() as i64;
             let human_turns = roles.iter().filter(|role| role.as_str() == "user").count() as i64;
@@ -77378,7 +77392,7 @@ fn run_sessions(
 /// "same agent" should skip that filter when agent_id is None.
 #[allow(clippy::type_complexity)]
 fn find_context_source_conversation(
-    conn: &frankensqlite::Connection,
+    conn: &FrankenConnection,
     path_str: &str,
     source_id: Option<&str>,
 ) -> Option<(
@@ -77390,7 +77404,6 @@ fn find_context_source_conversation(
     String,
     String,
 )> {
-    use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
 
     let normalized_source_sql = normalized_source_identity_sql_expr("c.source_id", "c.origin_host");
     let source_id = canonical_followup_source_id(source_id);
@@ -77410,7 +77423,7 @@ fn find_context_source_conversation(
             .query_row_map(
                 &query,
                 &[ParamValue::from(path_str), ParamValue::from(source_id)],
-                |r: &frankensqlite::Row| {
+                |r: &FrankenRow| {
                     Ok((
                         r.get_typed(0)?,
                         r.get_typed(1)?,
@@ -77437,7 +77450,7 @@ fn find_context_source_conversation(
     conn.query_row_map(
         &query,
         &[ParamValue::from(path_str)],
-        |r: &frankensqlite::Row| {
+        |r: &FrankenRow| {
             Ok((
                 r.get_typed(0)?,
                 r.get_typed(1)?,
@@ -77460,7 +77473,6 @@ fn run_context(
     output_format: Option<RobotFormat>,
     limit: usize,
 ) -> CliResult<()> {
-    use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
 
     let conn = open_franken_analytics_db(data_dir_override, db_override.as_ref())?;
 
@@ -77495,7 +77507,7 @@ fn run_context(
         conn.query_row_map(
             "SELECT path FROM workspaces WHERE id = ?",
             &[ParamValue::from(ws_id)],
-            |r: &frankensqlite::Row| r.get_typed(0),
+            |r: &FrankenRow| r.get_typed(0),
         )
         .ok()
     });
@@ -77514,14 +77526,14 @@ fn run_context(
                  ORDER BY c.started_at DESC
                  LIMIT ?"
             );
-        conn.query_map_collect(
+        conn.query_all_map(
             &query,
             &[
                 ParamValue::from(ws_id),
                 ParamValue::from(conv_id),
                 ParamValue::from(limit as i64),
             ],
-            |r: &frankensqlite::Row| {
+            |r: &FrankenRow| {
                 Ok((
                     r.get_typed(0)?,
                     r.get_typed::<Option<String>>(1)?.unwrap_or_default(),
@@ -77549,7 +77561,7 @@ fn run_context(
                  ORDER BY c.started_at DESC
                  LIMIT ?"
         );
-        conn.query_map_collect(
+        conn.query_all_map(
             &query,
             &[
                 ParamValue::from(day_start),
@@ -77557,7 +77569,7 @@ fn run_context(
                 ParamValue::from(conv_id),
                 ParamValue::from(limit as i64),
             ],
-            |r: &frankensqlite::Row| {
+            |r: &FrankenRow| {
                 Ok((
                     r.get_typed(0)?,
                     r.get_typed::<Option<String>>(1)?.unwrap_or_default(),
@@ -77583,14 +77595,14 @@ fn run_context(
                  ORDER BY c.started_at DESC
                  LIMIT ?"
         );
-        conn.query_map_collect(
+        conn.query_all_map(
             &query,
             &[
                 ParamValue::from(agent_id),
                 ParamValue::from(conv_id),
                 ParamValue::from(limit as i64),
             ],
-            |r: &frankensqlite::Row| {
+            |r: &FrankenRow| {
                 Ok((
                     r.get_typed(0)?,
                     r.get_typed::<Option<String>>(1)?.unwrap_or_default(),
@@ -87012,7 +87024,6 @@ fn run_index_with_data(
     no_progress_events: bool,
     robot_trace_ingest: bool,
 ) -> CliResult<()> {
-    use frankensqlite::compat::{ConnectionExt, RowExt};
     use std::time::Instant;
 
     let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
@@ -87058,14 +87069,14 @@ fn run_index_with_data(
                         created_at INTEGER NOT NULL,
                         expires_at INTEGER NOT NULL
                     )",
-                ) {
+                &[]) {
                     tracing::warn!("Failed to create idempotency_keys table: {e}");
                 }
 
                 let now_ms = chrono::Utc::now().timestamp_millis();
-                if let Err(e) = conn.execute_compat(
+                if let Err(e) = conn.execute(
                     "DELETE FROM idempotency_keys WHERE expires_at < ?1",
-                    frankensqlite::params![now_ms],
+                    &crate::storage::api::params![now_ms],
                 ) {
                     tracing::warn!("Failed to clean expired idempotency keys: {e}");
                 }
@@ -87073,8 +87084,8 @@ fn run_index_with_data(
                 let cached: Option<(String, String)> = conn
                     .query_row_map(
                         "SELECT params_hash, result_json FROM idempotency_keys WHERE key = ?1 AND expires_at > ?2",
-                        frankensqlite::params![key.as_str(), now_ms],
-                        |r: &frankensqlite::Row| Ok((r.get_typed(0)?, r.get_typed(1)?)),
+                        &crate::storage::api::params![key.as_str(), now_ms],
+                        |r: &FrankenRow| Ok((r.get_typed(0)?, r.get_typed(1)?)),
                     )
                     .ok();
                 Ok(cached)
@@ -87704,9 +87715,9 @@ fn run_index_with_data(
                     let expires_ms = now_ms + 24 * 60 * 60 * 1000; // 24 hours
                     let result_json = serde_json::to_string(&payload).unwrap_or_default();
                     let hash_str = params_hash.to_string();
-                    conn.execute_compat(
+                    conn.execute(
                         "INSERT OR REPLACE INTO idempotency_keys (key, params_hash, result_json, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                        frankensqlite::params![key.as_str(), hash_str.as_str(), result_json.as_str(), now_ms, expires_ms],
+                        &crate::storage::api::params![key.as_str(), hash_str.as_str(), result_json.as_str(), now_ms, expires_ms],
                     )?;
                     Ok(())
                 },
@@ -91478,7 +91489,6 @@ mod export_timestamp_tests {
 mod legacy_source_filter_tests {
     use super::*;
     use crate::sources::provenance::SourceFilter;
-    use frankensqlite::compat::{ConnectionExt, RowExt};
     use std::path::Path;
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -91489,14 +91499,14 @@ mod legacy_source_filter_tests {
         let shared_path = PathBuf::from("/legacy/shared/session.jsonl");
 
         with_frankensqlite_connection(&db_path, "legacy source test", |conn| {
-            conn.execute("PRAGMA journal_mode = WAL;")?;
-            conn.execute("CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);")?;
+            conn.execute("PRAGMA journal_mode = WAL;", &[])?;
+            conn.execute("CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);", &[])?;
             conn.execute(
                 "CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT, display_name TEXT);",
-            )?;
+            &[])?;
             conn.execute(
                 "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT, host_label TEXT);",
-            )?;
+            &[])?;
             conn.execute(
                 "CREATE TABLE conversations (
                     id INTEGER PRIMARY KEY,
@@ -91513,7 +91523,7 @@ mod legacy_source_filter_tests {
                     metadata_json TEXT,
                     metadata_bin BLOB
                 );",
-            )?;
+            &[])?;
             conn.execute(
                 "CREATE TABLE messages (
                     id INTEGER PRIMARY KEY,
@@ -91523,11 +91533,11 @@ mod legacy_source_filter_tests {
                     created_at INTEGER,
                     content TEXT
                 );",
-            )?;
-            conn.execute("INSERT INTO agents(id, slug) VALUES (1, 'codex')")?;
+            &[])?;
+            conn.execute("INSERT INTO agents(id, slug) VALUES (1, 'codex')", &[])?;
             conn.execute(
                 "INSERT INTO sources(id, kind, host_label) VALUES ('laptop', 'ssh', 'user@laptop')",
-            )?;
+            &[])?;
             conn.execute(
                 "INSERT INTO conversations(
                     id, agent_id, workspace_id, source_id, origin_host, title,
@@ -91538,7 +91548,7 @@ mod legacy_source_filter_tests {
                     '/legacy/shared/session.jsonl', 1700000000000, NULL, 10,
                     'legacy-local', '{}', NULL
                 )",
-            )?;
+            &[])?;
             conn.execute(
                 "INSERT INTO conversations(
                     id, agent_id, workspace_id, source_id, origin_host, title,
@@ -91549,15 +91559,15 @@ mod legacy_source_filter_tests {
                     '/legacy/shared/session.jsonl', 1700000100000, NULL, 10,
                     'remote-shared', '{}', NULL
                 )",
-            )?;
+            &[])?;
             conn.execute(
                 "INSERT INTO messages(id, conversation_id, idx, role, created_at, content)
                  VALUES (1, 1, 0, 'user', 1700000000100, 'local body')",
-            )?;
+            &[])?;
             conn.execute(
                 "INSERT INTO messages(id, conversation_id, idx, role, created_at, content)
                  VALUES (2, 2, 0, 'user', 1700000100100, 'remote body')",
-            )?;
+            &[])?;
             Ok(())
         })
         .expect("create legacy db");
@@ -91565,8 +91575,8 @@ mod legacy_source_filter_tests {
         (tmp, db_path, shared_path)
     }
 
-    fn open_legacy_local_db_for_update(db_path: &Path) -> frankensqlite::Connection {
-        frankensqlite::Connection::open(db_path.to_string_lossy().to_string())
+    fn open_legacy_local_db_for_update(db_path: &Path) -> FrankenConnection {
+        FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().to_string())), crate::storage::api::Profile::Production)
             .expect("open writable legacy source test db")
     }
 
@@ -91638,7 +91648,7 @@ mod legacy_source_filter_tests {
     fn source_filter_helpers_match_blank_remote_source_id_via_origin_host() {
         let (_tmp, db_path, _shared_path) = make_legacy_local_db();
         let conn = open_legacy_local_db_for_update(&db_path);
-        conn.execute("UPDATE conversations SET source_id = '   ' WHERE id = 2")
+        conn.execute("UPDATE conversations SET source_id = '   ' WHERE id = 2", &[])
             .expect("blank remote source_id");
 
         let (where_sql, param) =
@@ -91646,7 +91656,7 @@ mod legacy_source_filter_tests {
         let sql = format!("SELECT COUNT(*) FROM conversations c{where_sql}");
         let params_vec = vec![param.expect("source id param").into()];
         let count: i64 = conn
-            .query_row_map(&sql, &params_vec, |r: &frankensqlite::Row| r.get_typed(0))
+            .query_row_map(&sql, &params_vec, |r: &FrankenRow| r.get_typed(0))
             .expect("count blank remote source rows");
         assert_eq!(count, 1);
 
@@ -91654,7 +91664,7 @@ mod legacy_source_filter_tests {
         assert!(param.is_none());
         let sql = format!("SELECT COUNT(*) FROM conversations c{where_sql}");
         let count: i64 = conn
-            .query_row_map(&sql, &[], |r: &frankensqlite::Row| r.get_typed(0))
+            .query_row_map(&sql, &[], |r: &FrankenRow| r.get_typed(0))
             .expect("count remote source rows");
         assert_eq!(count, 1);
 
@@ -91665,7 +91675,7 @@ mod legacy_source_filter_tests {
     fn source_filter_helpers_match_trimmed_local_source_id_in_db() {
         let (_tmp, db_path, _shared_path) = make_legacy_local_db();
         let conn = open_legacy_local_db_for_update(&db_path);
-        conn.execute("UPDATE conversations SET source_id = '  local  ' WHERE id = 1")
+        conn.execute("UPDATE conversations SET source_id = '  local  ' WHERE id = 1", &[])
             .expect("update legacy local source_id");
 
         let (where_sql, param) =
@@ -91673,7 +91683,7 @@ mod legacy_source_filter_tests {
         let sql = format!("SELECT COUNT(*) FROM conversations c{where_sql}");
         let params_vec = vec![param.expect("source id param").into()];
         let count: i64 = conn
-            .query_row_map(&sql, &params_vec, |r: &frankensqlite::Row| r.get_typed(0))
+            .query_row_map(&sql, &params_vec, |r: &FrankenRow| r.get_typed(0))
             .expect("count trimmed local source rows");
         assert_eq!(count, 1);
 
@@ -91681,7 +91691,7 @@ mod legacy_source_filter_tests {
         assert!(param.is_none());
         let sql = format!("SELECT COUNT(*) FROM conversations c{where_sql}");
         let count: i64 = conn
-            .query_row_map(&sql, &[], |r: &frankensqlite::Row| r.get_typed(0))
+            .query_row_map(&sql, &[], |r: &FrankenRow| r.get_typed(0))
             .expect("count local source rows");
         assert_eq!(count, 1);
 
@@ -91723,7 +91733,7 @@ mod legacy_source_filter_tests {
     fn find_context_source_conversation_matches_blank_remote_source_id_via_origin_host() {
         let (_tmp, db_path, shared_path) = make_legacy_local_db();
         let conn = open_legacy_local_db_for_update(&db_path);
-        conn.execute("UPDATE conversations SET source_id = '   ' WHERE id = 2")
+        conn.execute("UPDATE conversations SET source_id = '   ' WHERE id = 2", &[])
             .expect("blank remote source_id");
 
         let row = find_context_source_conversation(
@@ -91742,7 +91752,7 @@ mod legacy_source_filter_tests {
     fn find_context_source_conversation_matches_trimmed_local_source_id_in_db() {
         let (_tmp, db_path, shared_path) = make_legacy_local_db();
         let conn = open_legacy_local_db_for_update(&db_path);
-        conn.execute("UPDATE conversations SET source_id = '  local  ' WHERE id = 1")
+        conn.execute("UPDATE conversations SET source_id = '  local  ' WHERE id = 1", &[])
             .expect("update legacy local source_id");
 
         let row =
@@ -91779,7 +91789,7 @@ mod legacy_source_filter_tests {
              ORDER BY source_id"
         );
         let source_rows: Vec<(String, i64)> = conn
-            .query_map_collect(&source_sql, &[], |r: &frankensqlite::Row| {
+            .query_all_map(&source_sql, &[], |r: &FrankenRow| {
                 Ok((r.get_typed(0)?, r.get_typed(1)?))
             })
             .expect("query source rows");
@@ -91795,7 +91805,7 @@ mod legacy_source_filter_tests {
         );
 
         let timeline_rows: Vec<String> = conn
-            .query_map_collect(
+            .query_all_map(
                 "SELECT COALESCE(c.source_id, 'local')
                  FROM conversations c
                  JOIN agents a ON c.agent_id = a.id
@@ -91804,7 +91814,7 @@ mod legacy_source_filter_tests {
                  GROUP BY c.id
                  ORDER BY c.started_at DESC",
                 &[1_699_999_999_000_i64.into(), 1_700_000_200_000_i64.into()],
-                |r: &frankensqlite::Row| r.get_typed(0),
+                |r: &FrankenRow| r.get_typed(0),
             )
             .expect("query timeline rows");
         assert!(timeline_rows.iter().any(|source_id| source_id == "local"));
@@ -91816,7 +91826,7 @@ mod legacy_source_filter_tests {
     fn stats_source_grouping_uses_origin_host_when_remote_source_id_blank() {
         let (_tmp, db_path, _shared_path) = make_legacy_local_db();
         let conn = open_legacy_local_db_for_update(&db_path);
-        conn.execute("UPDATE conversations SET source_id = '   ' WHERE id = 2")
+        conn.execute("UPDATE conversations SET source_id = '   ' WHERE id = 2", &[])
             .expect("blank remote source_id");
 
         let normalized_source_sql =
@@ -91828,7 +91838,7 @@ mod legacy_source_filter_tests {
              ORDER BY source_id"
         );
         let source_rows: Vec<(String, i64)> = conn
-            .query_map_collect(&source_sql, &[], |r: &frankensqlite::Row| {
+            .query_all_map(&source_sql, &[], |r: &FrankenRow| {
                 Ok((r.get_typed(0)?, r.get_typed(1)?))
             })
             .expect("query normalized source rows");
@@ -91847,7 +91857,7 @@ mod legacy_source_filter_tests {
     fn stats_source_grouping_normalizes_trimmed_local_source_id_in_db() {
         let (_tmp, db_path, _shared_path) = make_legacy_local_db();
         let conn = open_legacy_local_db_for_update(&db_path);
-        conn.execute("UPDATE conversations SET source_id = '  local  ' WHERE id = 1")
+        conn.execute("UPDATE conversations SET source_id = '  local  ' WHERE id = 1", &[])
             .expect("update legacy local source_id");
 
         let normalized_source_sql = normalized_source_id_sql_expr("c.source_id");
@@ -91858,7 +91868,7 @@ mod legacy_source_filter_tests {
              ORDER BY source_id"
         );
         let source_rows: Vec<(String, i64)> = conn
-            .query_map_collect(&source_sql, &[], |r: &frankensqlite::Row| {
+            .query_all_map(&source_sql, &[], |r: &FrankenRow| {
                 Ok((r.get_typed(0)?, r.get_typed(1)?))
             })
             .expect("query normalized source rows");
@@ -94711,7 +94721,6 @@ fn run_timeline(
 ) -> CliResult<()> {
     use crate::sources::provenance::SourceFilter;
     use chrono::{Local, TimeZone, Utc};
-    use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
     use std::collections::HashMap;
 
     // Parse source filter (P3.2)
@@ -94793,7 +94802,7 @@ fn run_timeline(
     sql.push_str(" GROUP BY c.id ORDER BY c.started_at DESC");
 
     let rows = conn
-        .query_map_collect(&sql, &params, |row: &frankensqlite::Row| {
+        .query_all_map(&sql, &params, |row: &FrankenRow| {
             Ok((
                 row.get_typed::<i64>(0)?,            // id
                 row.get_typed::<String>(1)?,         // agent
@@ -101563,31 +101572,30 @@ fn relink_identity_key(
 
 /// 读出 DB 里全部会话的身份投影。只读打开，绝不写。
 fn relink_load_conversations(db_path: &Path) -> Result<Vec<RelinkConversationRow>> {
-    use frankensqlite::compat::RowExt as _;
 
     let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(db_path)
         .map_err(|e| anyhow::anyhow!("open readonly db for relink {}: {e}", db_path.display()))?;
-    let rows = storage
+    let out = storage
         .raw()
-        .query(
+        .query_all_map(
             "SELECT c.id, c.source_id, c.origin_host, c.source_path, c.started_at, \
              (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id), a.slug \
              FROM conversations c JOIN agents a ON a.id = c.agent_id",
+            &[],
+            |row| {
+                Ok(RelinkConversationRow {
+                    conversation_id: row.get_typed::<i64>(0)?,
+                    source_id: row.get_typed::<String>(1)?,
+                    origin_host: row.get_typed::<String>(2).ok(),
+                    source_path: row.get_typed::<String>(3)?,
+                    started_at_ms: row.get_typed::<i64>(4).ok(),
+                    message_count: usize::try_from(row.get_typed::<i64>(5).unwrap_or(0).max(0))
+                        .unwrap_or(0),
+                    agent_slug: row.get_typed::<String>(6)?,
+                })
+            },
         )
         .map_err(|e| anyhow::anyhow!("query conversations for relink: {e}"))?;
-    let mut out = Vec::with_capacity(rows.len());
-    for row in &rows {
-        out.push(RelinkConversationRow {
-            conversation_id: row.get_typed::<i64>(0)?,
-            source_id: row.get_typed::<String>(1)?,
-            origin_host: row.get_typed::<String>(2).ok(),
-            source_path: row.get_typed::<String>(3)?,
-            started_at_ms: row.get_typed::<i64>(4).ok(),
-            message_count: usize::try_from(row.get_typed::<i64>(5).unwrap_or(0).max(0))
-                .unwrap_or(0),
-            agent_slug: row.get_typed::<String>(6)?,
-        });
-    }
     storage.close_best_effort_in_place();
     Ok(out)
 }
@@ -101973,13 +101981,12 @@ fn relink_pause_if_requested(boundary: &str) {
 
 /// 在一个事务里写 receipt。receipt 是 DB 侧唯一的提交事实。
 fn relink_write_receipt(db_path: &Path, operation_id: &str, state: &str) -> Result<()> {
-    use frankensqlite::compat::{ConnectionExt as _, ParamValue};
     let storage = crate::storage::sqlite::FrankenStorage::open(db_path)
         .map_err(|e| anyhow::anyhow!("open db for relink receipt {}: {e}", db_path.display()))?;
     let raw = storage.raw();
-    raw.execute("BEGIN IMMEDIATE;")
+    raw.execute("BEGIN IMMEDIATE;", &[])
         .map_err(|e| anyhow::anyhow!("begin relink receipt tx: {e}"))?;
-    let result = raw.execute_compat(
+    let result = raw.execute(
         "INSERT INTO operation_commit_receipt \
          (idempotency_key, operation, state, committed_at_ms) VALUES (?1, ?2, ?3, ?4) \
          ON CONFLICT(idempotency_key) DO UPDATE SET state = excluded.state",
@@ -101992,29 +101999,29 @@ fn relink_write_receipt(db_path: &Path, operation_id: &str, state: &str) -> Resu
     );
     match result {
         Ok(_) => {
-            raw.execute("COMMIT;")
+            raw.execute("COMMIT;", &[])
                 .map_err(|e| anyhow::anyhow!("commit relink receipt: {e}"))?;
             Ok(())
         }
         Err(err) => {
-            let _ = raw.execute("ROLLBACK;");
+            let _ = raw.execute("ROLLBACK;", &[]);
             Err(anyhow::anyhow!("write relink receipt: {err}"))
         }
     }
 }
 
 pub fn relink_receipt_state(db_path: &Path, operation_id: &str) -> Result<Option<String>> {
-    use frankensqlite::compat::RowExt as _;
     let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(db_path)
         .map_err(|e| anyhow::anyhow!("open db for receipt read {}: {e}", db_path.display()))?;
-    let rows = storage
+    let rows: Vec<String> = storage
         .raw()
-        .query_with_params(
+        .query_all_map(
             "SELECT state FROM operation_commit_receipt WHERE idempotency_key = ?1",
-            &[frankensqlite::SqliteValue::from(operation_id)],
+            &[SqliteValue::from(operation_id)],
+            |row| row.get_typed(0),
         )
         .map_err(|e| anyhow::anyhow!("read relink receipt: {e}"))?;
-    let out = rows.first().and_then(|row| row.get_typed::<String>(0).ok());
+    let out = rows.into_iter().next();
     storage.close_best_effort_in_place();
     Ok(out)
 }
@@ -102274,28 +102281,27 @@ mod mirror_relink_tests {
         let db_path = data_dir.join("agent_search.db");
         let storage = crate::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
         let raw = storage.raw();
-        use frankensqlite::compat::{ConnectionExt as _, ParamValue};
-        raw.execute_compat(
+        raw.execute(
             "INSERT INTO agents(id, slug, name, kind, created_at, updated_at) \
              VALUES(1, ?1, 'Agent', 'cli', 0, 0)",
             &[ParamValue::from(agent_slug)],
         )
         .unwrap();
-        raw.execute_compat(
+        raw.execute(
             "INSERT OR IGNORE INTO sources(id, kind, created_at, updated_at) \
              VALUES('local','local',0,0)",
             &[] as &[ParamValue],
         )
         .unwrap();
         let src_path = source_file.display().to_string();
-        raw.execute_compat(
+        raw.execute(
             "INSERT INTO conversations(id, agent_id, source_id, source_path, started_at) \
              VALUES(7, 1, 'local', ?1, 1710000000000)",
             &[ParamValue::from(src_path.as_str())],
         )
         .unwrap();
         for idx in 0..2i64 {
-            raw.execute_compat(
+            raw.execute(
                 "INSERT INTO messages(conversation_id, idx, role, content) VALUES(7, ?1, 'user', 'x')",
                 &[ParamValue::from(idx)],
             )
@@ -103198,15 +103204,14 @@ mod mirror_relink_tests {
         {
             let storage = crate::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
             let raw = storage.raw();
-            use frankensqlite::compat::{ConnectionExt as _, ParamValue};
-            raw.execute_compat(
+            raw.execute(
                 "INSERT INTO agents(id, slug, name, kind, created_at, updated_at) \
                  VALUES(2,'claude_code','Claude Code','cli',0,0)",
                 &[] as &[ParamValue],
             )
             .unwrap();
             let src_path = source_file.display().to_string();
-            raw.execute_compat(
+            raw.execute(
                 "INSERT INTO conversations(id, agent_id, source_id, source_path, started_at) \
                  VALUES(99, 2, 'local', ?1, 1710000000000)",
                 &[ParamValue::from(src_path.as_str())],
@@ -103218,7 +103223,6 @@ mod mirror_relink_tests {
         {
             let mut storage =
                 crate::storage::sqlite::FrankenStorage::open_readonly(&db_path).unwrap();
-            use frankensqlite::compat::{ConnectionExt as _, ParamValue, RowExt as _};
             let n: Option<i64> = storage
                 .raw()
                 .query_row_map(
