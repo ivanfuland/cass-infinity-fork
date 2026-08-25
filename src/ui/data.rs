@@ -3,8 +3,7 @@ use crate::search::query::SearchHit;
 use crate::storage::sqlite::FrankenStorage;
 use crate::ui::components::theme::ThemePalette;
 use anyhow::Result;
-use frankensqlite::compat::{ConnectionExt, RowExt};
-use frankensqlite::{FrankenError, Row};
+use crate::storage::api::{Row, StorageError as FrankenError};
 use lru::LruCache;
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
@@ -347,7 +346,7 @@ fn load_conversation_by_id_uncached(
     // LEFT JOIN + COALESCE on agents so conversations with NULL agent_id
     // (legacy V1 schema) still load instead of returning "conversation not
     // found" in the UI.  Consistent with 8a0c547c / e1c08e7c.
-    let rows = storage.raw().query_map_collect(
+    let rows = storage.raw().query_all_map(
         "SELECT c.id, COALESCE(a.slug, 'unknown'), w.id, w.path, w.display_name, c.external_id, c.title, c.source_path,
                 c.started_at, c.ended_at, c.approx_tokens, c.metadata_json, c.source_id, c.origin_host, c.metadata_bin
          FROM conversations c
@@ -355,7 +354,7 @@ fn load_conversation_by_id_uncached(
          LEFT JOIN workspaces w ON c.workspace_id = w.id
          WHERE c.id = ?1
          LIMIT 1",
-        frankensqlite::params![conversation_id],
+        &crate::storage::api::params![conversation_id] as &[crate::storage::api::Value],
         ui_conversation_row_parts,
     )?;
     if let Some((convo_id, convo, workspace)) = rows.into_iter().next() {
@@ -395,7 +394,7 @@ pub(crate) fn load_conversation_uncached(
                  WHERE c.source_path = ?1 AND {normalized_source_sql} = ?2
                  ORDER BY c.started_at DESC LIMIT 1"
             ),
-            frankensqlite::params![source_path, normalize_ui_source_id_value(Some(source_id))],
+            &crate::storage::api::params![source_path, normalize_ui_source_id_value(Some(source_id))] as &[crate::storage::api::Value],
         )
     } else {
         (
@@ -411,12 +410,12 @@ pub(crate) fn load_conversation_uncached(
                  LIMIT 1",
                 local = crate::sources::provenance::LOCAL_SOURCE_ID,
             ),
-            frankensqlite::params![source_path],
+            &crate::storage::api::params![source_path] as &[crate::storage::api::Value],
         )
     };
     let rows = storage
         .raw()
-        .query_map_collect(&sql, params, ui_conversation_row_parts)?;
+        .query_all_map(&sql, params, ui_conversation_row_parts)?;
     if let Some((convo_id, convo, workspace)) = rows.into_iter().next() {
         let messages = storage.fetch_messages(convo_id)?;
         return Ok(Some(ConversationView {
@@ -457,7 +456,7 @@ fn cached_conversation_matches_lookup_head(
             format!(
                 "SELECT id, {normalized_source_sql} FROM conversations WHERE source_path = ?1 AND {normalized_source_sql} = ?2 ORDER BY started_at DESC LIMIT 1"
             ),
-            frankensqlite::params![source_path, normalize_ui_source_id_value(Some(source_id))],
+            &crate::storage::api::params![source_path, normalize_ui_source_id_value(Some(source_id))] as &[crate::storage::api::Value],
         )
     } else {
         (
@@ -465,11 +464,11 @@ fn cached_conversation_matches_lookup_head(
                 "SELECT id, {normalized_source_sql} FROM conversations WHERE source_path = ?1 ORDER BY CASE WHEN {normalized_source_sql} = '{local}' THEN 0 ELSE 1 END, started_at DESC LIMIT 1",
                 local = crate::sources::provenance::LOCAL_SOURCE_ID,
             ),
-            frankensqlite::params![source_path],
+            &crate::storage::api::params![source_path] as &[crate::storage::api::Value],
         )
     };
 
-    let rows = storage.raw().query_map_collect(&sql, params, |row: &Row| {
+    let rows = storage.raw().query_all_map(&sql, params, |row: &Row| {
         Ok((row.get_typed::<i64>(0)?, row.get_typed::<String>(1)?))
     })?;
 
@@ -715,12 +714,12 @@ pub fn load_conversation_for_hit(
          WHERE c.source_path = ?1 AND {normalized_source_sql} = ?2
          ORDER BY c.started_at DESC"
     );
-    let rows = storage.raw().query_map_collect(
+    let rows = storage.raw().query_all_map(
         &sql,
-        frankensqlite::params![
+        &crate::storage::api::params![
             fallback_hit.source_path.as_str(),
             normalize_ui_hit_source_id(&fallback_hit)
-        ],
+        ] as &[crate::storage::api::Value],
         ui_conversation_row_parts,
     )?;
 
@@ -1392,31 +1391,31 @@ mod tests {
         CONVERSATION_CACHE.invalidate_scoped(&scope_b, None, shared_path);
 
         for conn in [&conn_a, &conn_b] {
-            conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)")
+            conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)", &[])
                 .expect("insert agent");
         }
 
         {
-            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            use crate::storage::api::Value as ParamValue;
             let p = [ParamValue::from(shared_path.to_string())];
-            conn_a.execute_with_params(
+            conn_a.execute(
                 "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'db-a', 'DB A Session', ?1, 'local', 100)",
-                &param_slice_to_values(&p),
+                &p,
             )
             .expect("insert db a conversation");
-            conn_b.execute_with_params(
+            conn_b.execute(
                 "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'db-b', 'DB B Session', ?1, 'local', 100)",
-                &param_slice_to_values(&p),
+                &p,
             )
             .expect("insert db b conversation");
         }
         conn_a.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'db a body')",
-        )
+        &[])
         .expect("insert db a message");
         conn_b.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'db b body')",
-        )
+        &[])
         .expect("insert db b message");
 
         let from_a = load_conversation(&storage_a, shared_path)
@@ -1445,24 +1444,24 @@ mod tests {
         let conn = storage.raw();
         let shared_path = "/shared/session.jsonl";
 
-        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)")
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)", &[])
             .expect("insert agent");
         conn.execute(
             "INSERT INTO sources (id, kind, host_label, created_at, updated_at) VALUES ('   ', 'ssh', 'user@laptop', 0, 0)",
-        )
+        &[])
         .expect("insert blank-id remote source");
         {
-            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            use crate::storage::api::Value as ParamValue;
             let p = [ParamValue::from(shared_path.to_string())];
-            conn.execute_with_params(
+            conn.execute(
                 "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, origin_host, started_at) VALUES (1, 1, 'remote-ext', 'Remote Session', ?1, '   ', 'user@laptop', 200)",
-                &param_slice_to_values(&p),
+                &p,
             )
             .expect("insert remote conversation");
         }
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'remote body')",
-        )
+        &[])
         .expect("insert remote message");
 
         let loaded = load_conversation_for_source(&storage, "user@laptop", shared_path)
@@ -1485,37 +1484,37 @@ mod tests {
         let conn = storage.raw();
         let shared_path = "/shared/session.jsonl";
 
-        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)")
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)", &[])
             .expect("insert agent");
         conn.execute(
             "INSERT INTO sources (id, kind, host_label, created_at, updated_at) VALUES ('  local  ', 'local', 'local', 0, 0)",
-        )
+        &[])
         .expect("insert local source");
         conn.execute(
             "INSERT INTO sources (id, kind, host_label, created_at, updated_at) VALUES ('work-laptop', 'ssh', 'work-laptop', 0, 0)",
-        )
+        &[])
         .expect("insert source");
         {
-            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            use crate::storage::api::Value as ParamValue;
             let p = [ParamValue::from(shared_path.to_string())];
-            conn.execute_with_params(
+            conn.execute(
                 "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'local-ext', 'Local Session', ?1, '  local  ', 200)",
-                &param_slice_to_values(&p),
+                &p,
             )
             .expect("insert local conversation");
-            conn.execute_with_params(
+            conn.execute(
                 "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (2, 1, 'remote-ext', 'Remote Session', ?1, 'work-laptop', 100)",
-                &param_slice_to_values(&p),
+                &p,
             )
             .expect("insert remote conversation");
         }
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'local body')",
-        )
+        &[])
         .expect("insert local message");
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (2, 2, 0, 'user', 'remote body')",
-        )
+        &[])
         .expect("insert remote message");
 
         let local = load_conversation_for_source(&storage, "local", shared_path)
@@ -1546,20 +1545,20 @@ mod tests {
 
         CONVERSATION_CACHE.invalidate(Some("local"), shared_path);
 
-        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)")
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)", &[])
             .expect("insert agent");
         {
-            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            use crate::storage::api::Value as ParamValue;
             let p = [ParamValue::from(shared_path.to_string())];
-            conn.execute_with_params(
+            conn.execute(
                 "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'old-ext', 'Old Session', ?1, 'local', 100)",
-                &param_slice_to_values(&p),
+                &p,
             )
             .expect("insert old conversation");
         }
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'old body')",
-        )
+        &[])
         .expect("insert old message");
 
         let first = load_conversation_for_source(&storage, "local", shared_path)
@@ -1569,17 +1568,17 @@ mod tests {
         assert_eq!(first.messages[0].content, "old body");
 
         {
-            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            use crate::storage::api::Value as ParamValue;
             let p = [ParamValue::from(shared_path.to_string())];
-            conn.execute_with_params(
+            conn.execute(
                 "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (2, 1, 'new-ext', 'New Session', ?1, 'local', 200)",
-                &param_slice_to_values(&p),
+                &p,
             )
             .expect("insert new conversation");
         }
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (2, 2, 0, 'user', 'new body')",
-        )
+        &[])
         .expect("insert new message");
 
         let second = load_conversation_for_source(&storage, "local", shared_path)
@@ -1602,37 +1601,37 @@ mod tests {
         let conn = storage.raw();
         let shared_path = "/shared/session.jsonl";
 
-        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)")
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)", &[])
             .expect("insert agent");
         conn.execute(
             "INSERT INTO sources (id, kind, host_label, created_at, updated_at) VALUES ('  local  ', 'local', 'local', 0, 0)",
-        )
+        &[])
         .expect("insert local source");
         conn.execute(
             "INSERT INTO sources (id, kind, host_label, created_at, updated_at) VALUES ('work-laptop', 'ssh', 'work-laptop', 0, 0)",
-        )
+        &[])
         .expect("insert source");
         {
-            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            use crate::storage::api::Value as ParamValue;
             let p = [ParamValue::from(shared_path.to_string())];
-            conn.execute_with_params(
+            conn.execute(
                 "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'local-ext', 'Local Session', ?1, '  local  ', 100)",
-                &param_slice_to_values(&p),
+                &p,
             )
             .expect("insert local conversation");
-            conn.execute_with_params(
+            conn.execute(
                 "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (2, 1, 'remote-ext', 'Remote Session', ?1, 'work-laptop', 200)",
-                &param_slice_to_values(&p),
+                &p,
             )
             .expect("insert remote conversation");
         }
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'local body')",
-        )
+        &[])
         .expect("insert local message");
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (2, 2, 0, 'user', 'remote body')",
-        )
+        &[])
         .expect("insert remote message");
 
         let loaded = load_conversation(&storage, shared_path)
@@ -1657,20 +1656,20 @@ mod tests {
         CONVERSATION_CACHE.invalidate(None, shared_path);
         CONVERSATION_CACHE.invalidate(Some("local"), shared_path);
 
-        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)")
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)", &[])
             .expect("insert agent");
         {
-            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            use crate::storage::api::Value as ParamValue;
             let p = [ParamValue::from(shared_path.to_string())];
-            conn.execute_with_params(
+            conn.execute(
                 "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'local-ext', 'Cached Session', ?1, 'local', 100)",
-                &param_slice_to_values(&p),
+                &p,
             )
             .expect("insert local conversation");
         }
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'cached body')",
-        )
+        &[])
         .expect("insert local message");
 
         let cached = load_conversation(&storage, shared_path)
@@ -1679,7 +1678,7 @@ mod tests {
         assert_eq!(cached.convo.title.as_deref(), Some("Cached Session"));
         assert_eq!(cached.messages[0].content, "cached body");
 
-        conn.execute("DROP TABLE conversations")
+        conn.execute("DROP TABLE conversations", &[])
             .expect("drop conversations to force validation failure");
 
         let still_cached = load_conversation(&storage, shared_path)
@@ -1917,20 +1916,20 @@ mod tests {
 
         CONVERSATION_CACHE.invalidate(Some("local"), shared_path);
 
-        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)")
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)", &[])
             .expect("insert agent");
         {
-            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            use crate::storage::api::Value as ParamValue;
             let p = [ParamValue::from(shared_path.to_string())];
-            conn.execute_with_params(
+            conn.execute(
                 "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'local-ext', 'Cached Session', ?1, 'local', 100)",
-                &param_slice_to_values(&p),
+                &p,
             )
             .expect("insert local conversation");
         }
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'cached body')",
-        )
+        &[])
         .expect("insert local message");
 
         let cached = load_conversation_for_source(&storage, "local", shared_path)
@@ -1939,7 +1938,7 @@ mod tests {
         assert_eq!(cached.convo.title.as_deref(), Some("Cached Session"));
         assert_eq!(cached.messages[0].content, "cached body");
 
-        conn.execute("DROP TABLE conversations")
+        conn.execute("DROP TABLE conversations", &[])
             .expect("drop conversations to force validation failure");
 
         let still_cached = load_conversation_for_source(&storage, "  LOCAL  ", shared_path)
@@ -1966,24 +1965,24 @@ mod tests {
         CONVERSATION_CACHE.invalidate(Some("local"), shared_path);
         CONVERSATION_CACHE.invalidate(Some("work-laptop"), shared_path);
 
-        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)")
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)", &[])
             .expect("insert agent");
         conn.execute(
             "INSERT INTO sources (id, kind, host_label, created_at, updated_at) VALUES ('work-laptop', 'ssh', 'work-laptop', 0, 0)",
-        )
+        &[])
         .expect("insert source");
         {
-            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            use crate::storage::api::Value as ParamValue;
             let p = [ParamValue::from(shared_path.to_string())];
-            conn.execute_with_params(
+            conn.execute(
                 "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'remote-ext', 'Remote Session', ?1, 'work-laptop', 200)",
-                &param_slice_to_values(&p),
+                &p,
             )
             .expect("insert remote conversation");
         }
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'remote body')",
-        )
+        &[])
         .expect("insert remote message");
 
         let first = load_conversation(&storage, shared_path)
@@ -1993,17 +1992,17 @@ mod tests {
         assert_eq!(first.messages[0].content, "remote body");
 
         {
-            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            use crate::storage::api::Value as ParamValue;
             let p = [ParamValue::from(shared_path.to_string())];
-            conn.execute_with_params(
+            conn.execute(
                 "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (2, 1, 'local-ext', 'Local Session', ?1, 'local', 100)",
-                &param_slice_to_values(&p),
+                &p,
             )
             .expect("insert local conversation");
         }
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (2, 2, 0, 'user', 'local body')",
-        )
+        &[])
         .expect("insert local message");
 
         let second = load_conversation(&storage, shared_path)
@@ -2029,23 +2028,23 @@ mod tests {
         let conn = storage.raw();
         let shared_path = "/shared/cursor.sqlite";
 
-        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'cursor', 'Cursor', 'local', 0, 0)")
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'cursor', 'Cursor', 'local', 0, 0)", &[])
             .expect("insert agent");
         conn.execute(
             "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'old-ext', 'Old Session', '/shared/cursor.sqlite', 'local', 100)",
-        )
+        &[])
         .expect("insert old conversation");
         conn.execute(
             "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (2, 1, 'new-ext', 'New Session', '/shared/cursor.sqlite', 'local', 200)",
-        )
+        &[])
         .expect("insert new conversation");
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, created_at, content) VALUES (1, 1, 0, 'user', 101, 'old conversation body')",
-        )
+        &[])
         .expect("insert old message");
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, created_at, content) VALUES (2, 2, 0, 'user', 201, 'new conversation body')",
-        )
+        &[])
         .expect("insert new message");
 
         let hit = SearchHit {
@@ -2086,15 +2085,15 @@ mod tests {
         let conn = storage.raw();
         let shared_path = "/shared/cursor.sqlite";
 
-        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'cursor', 'Cursor', 'local', 0, 0)")
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'cursor', 'Cursor', 'local', 0, 0)", &[])
             .expect("insert agent");
         conn.execute(
             "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'new-ext', 'New Session', '/shared/cursor.sqlite', 'local', 200)",
-        )
+        &[])
         .expect("insert conversation");
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, created_at, content) VALUES (1, 1, 0, 'user', 201, 'new conversation body')",
-        )
+        &[])
         .expect("insert message");
 
         let hit = SearchHit {
@@ -2130,15 +2129,15 @@ mod tests {
         let db_path = tmp.path().join("cass.db");
         let storage = FrankenStorage::open(&db_path).expect("open db");
         let conn = storage.raw();
-        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)")
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)", &[])
             .expect("insert agent");
         conn.execute(
             "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'exact-ext', 'Database Title', '/shared/cursor.sqlite', 'local', 200)",
-        )
+        &[])
         .expect("insert conversation");
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, created_at, content) VALUES (1, 1, 0, 'user', 201, 'db body')",
-        )
+        &[])
         .expect("insert message");
 
         let hit = SearchHit {
@@ -2180,19 +2179,19 @@ mod tests {
         let conn = storage.raw();
         let shared_path = "/shared/remote.sqlite";
 
-        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'cursor', 'Cursor', 'local', 0, 0)")
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'cursor', 'Cursor', 'local', 0, 0)", &[])
             .expect("insert agent");
         conn.execute(
             "INSERT INTO sources (id, kind, host_label, created_at, updated_at) VALUES ('   ', 'ssh', 'user@laptop', 0, 0)",
-        )
+        &[])
         .expect("insert blank-id remote source");
         conn.execute(
             "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, origin_host, started_at) VALUES (1, 1, 'remote-ext', 'Remote Session', '/shared/remote.sqlite', '   ', 'user@laptop', 200)",
-        )
+        &[])
         .expect("insert conversation");
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, created_at, content) VALUES (1, 1, 0, 'user', 201, 'db body')",
-        )
+        &[])
         .expect("insert message");
 
         let hit = SearchHit {
@@ -2232,19 +2231,19 @@ mod tests {
         let storage = FrankenStorage::open(&db_path).expect("open storage");
         let conn = storage.raw();
 
-        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'cursor', 'Cursor', 'local', 0, 0)")
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'cursor', 'Cursor', 'local', 0, 0)", &[])
             .expect("insert agent");
         conn.execute(
             "INSERT INTO sources (id, kind, host_label, created_at, updated_at) VALUES ('  local  ', 'local', 'local', 0, 0)",
-        )
+        &[])
         .expect("insert local source");
         conn.execute(
             "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'exact-ext', 'Database Title', '/db/real/path.sqlite', '  local  ', 200)",
-        )
+        &[])
         .expect("insert conversation");
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, created_at, content) VALUES (1, 1, 0, 'user', 201, 'db body')",
-        )
+        &[])
         .expect("insert message");
 
         let hit = SearchHit {
@@ -2288,15 +2287,15 @@ mod tests {
         let conn = storage.raw();
         let shared_path = "/shared/cursor.sqlite";
 
-        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'cursor', 'Cursor', 'local', 0, 0)")
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'cursor', 'Cursor', 'local', 0, 0)", &[])
             .expect("insert agent");
         conn.execute(
             "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'exact-ext', 'Database Title', '/shared/cursor.sqlite', 'local', 200)",
-        )
+        &[])
         .expect("insert conversation");
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, created_at, content) VALUES (1, 1, 0, 'user', 201, 'db body')",
-        )
+        &[])
         .expect("insert message");
 
         let hit = SearchHit {
@@ -2336,23 +2335,23 @@ mod tests {
         let conn = storage.raw();
         let shared_path = "/shared/cursor.sqlite";
 
-        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'cursor', 'Cursor', 'local', 0, 0)")
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'cursor', 'Cursor', 'local', 0, 0)", &[])
             .expect("insert agent");
         conn.execute(
             "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'old-ext', 'Old Session', '/shared/cursor.sqlite', 'local', 100)",
-        )
+        &[])
         .expect("insert old conversation");
         conn.execute(
             "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (2, 1, 'new-ext', 'New Session', '/shared/cursor.sqlite', 'local', 200)",
-        )
+        &[])
         .expect("insert new conversation");
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'old conversation body')",
-        )
+        &[])
         .expect("insert old message");
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (2, 2, 0, 'user', 'new conversation body')",
-        )
+        &[])
         .expect("insert new message");
 
         let hit = SearchHit {
@@ -2393,23 +2392,23 @@ mod tests {
         let conn = storage.raw();
         let shared_path = "/shared/cursor.sqlite";
 
-        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'cursor', 'Cursor', 'local', 0, 0)")
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'cursor', 'Cursor', 'local', 0, 0)", &[])
             .expect("insert agent");
         conn.execute(
             "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'old-ext', 'Old Session', '/shared/cursor.sqlite', 'local', 100)",
-        )
+        &[])
         .expect("insert old conversation");
         conn.execute(
             "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (2, 1, 'new-ext', 'New Session', '/shared/cursor.sqlite', 'local', 200)",
-        )
+        &[])
         .expect("insert new conversation");
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'old conversation body')",
-        )
+        &[])
         .expect("insert old message");
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (2, 2, 0, 'user', 'new conversation body')",
-        )
+        &[])
         .expect("insert new message");
 
         let hit = SearchHit {
@@ -2449,23 +2448,23 @@ mod tests {
         let conn = storage.raw();
         let shared_path = "/shared/cursor.sqlite";
 
-        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'cursor', 'Cursor', 'local', 0, 0)")
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'cursor', 'Cursor', 'local', 0, 0)", &[])
             .expect("insert agent");
         conn.execute(
             "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'old-ext', 'Old Session', '/shared/cursor.sqlite', 'local', 100)",
-        )
+        &[])
         .expect("insert old conversation");
         conn.execute(
             "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (2, 1, 'new-ext', 'New Session', '/shared/cursor.sqlite', 'local', 200)",
-        )
+        &[])
         .expect("insert new conversation");
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, created_at, content) VALUES (1, 1, 0, 'user', 101, 'old conversation body')",
-        )
+        &[])
         .expect("insert old message");
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, created_at, content) VALUES (2, 2, 0, 'user', 201, 'new conversation body')",
-        )
+        &[])
         .expect("insert new message");
 
         let hit = SearchHit {
