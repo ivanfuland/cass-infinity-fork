@@ -13,15 +13,33 @@
 
 use coding_agent_search::connectors::hermes::HermesConnector;
 use coding_agent_search::connectors::{Connector, NormalizedConversation, ScanContext};
-use frankensqlite::Connection;
-use frankensqlite::compat::ConnectionExt;
-use frankensqlite::params;
+use coding_agent_search::storage::api::Conn as Connection;
 use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
 
+/// Test-only parameter list builder (this integration test is a separate
+/// crate and can't reach `storage::api`'s crate-private `params!` shim):
+/// borrows + handles the zero-arg case, mirroring sqlite.rs's own `fparams!`.
+macro_rules! params {
+    () => {
+        &[] as &[coding_agent_search::storage::api::Value]
+    };
+    ($($val:expr),+ $(,)?) => {
+        &[$(coding_agent_search::storage::api::IntoValue::into_value($val)),+]
+            as &[coding_agent_search::storage::api::Value]
+    };
+}
+
+/// Stage A note: `storage::api::Conn::open_writable` is deliberately
+/// crate-private (R2-F3), so this integration test (a separate crate)
+/// bootstraps through `FrankenStorage::open` + `into_raw()` rather than
+/// opening a bare, schema-free connection the way the pre-migration
+/// native-`frankensqlite` version of this helper did.
 fn create_hermes_db(path: &Path) -> Connection {
-    let conn = Connection::open(path.to_string_lossy().as_ref()).expect("open hermes db");
+    let conn = coding_agent_search::storage::sqlite::FrankenStorage::open(path)
+        .expect("open hermes db")
+        .into_raw();
     conn.execute(
         "CREATE TABLE sessions (
             id TEXT PRIMARY KEY,
@@ -36,7 +54,7 @@ fn create_hermes_db(path: &Path) -> Connection {
             tool_call_count INTEGER,
             input_tokens INTEGER,
             output_tokens INTEGER
-        )",
+        )", &[],
     )
     .expect("create sessions");
     conn.execute(
@@ -49,7 +67,7 @@ fn create_hermes_db(path: &Path) -> Connection {
             tool_call_id TEXT,
             reasoning TEXT,
             timestamp REAL
-        )",
+        )", &[],
     )
     .expect("create messages");
     conn
@@ -68,7 +86,7 @@ fn insert_session(
     input_tokens: i64,
     output_tokens: i64,
 ) {
-    conn.execute_compat(
+    conn.execute(
         "INSERT INTO sessions
             (id, source, model, title, parent_session_id, started_at, ended_at,
              end_reason, message_count, tool_call_count, input_tokens, output_tokens)
@@ -89,7 +107,7 @@ fn insert_session(
 }
 
 fn insert_message(conn: &Connection, session_id: &str, role: &str, content: &str, timestamp: f64) {
-    conn.execute_compat(
+    conn.execute(
         "INSERT INTO messages
             (session_id, role, content, tool_calls, tool_name, tool_call_id, reasoning, timestamp)
          VALUES (?1, ?2, ?3, NULL, NULL, NULL, NULL, ?4)",
@@ -259,9 +277,11 @@ fn hermes_empty_zero_byte_db_returns_empty_result() {
 fn hermes_malformed_schema_returns_empty_result_without_panic() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("malformed.db");
-    let conn = Connection::open(db_path.to_string_lossy().as_ref()).expect("open db");
+    let conn = coding_agent_search::storage::sqlite::FrankenStorage::open(&db_path)
+        .expect("open db")
+        .into_raw();
     // `sessions` exists but `messages` is missing — scan must degrade to empty.
-    conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY)")
+    conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY)", &[])
         .expect("create incomplete sessions table");
     drop(conn);
 

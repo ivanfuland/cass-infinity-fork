@@ -1,7 +1,7 @@
 use coding_agent_search::connectors::cursor::CursorConnector;
 use coding_agent_search::connectors::{Connector, NormalizedConversation, ScanContext};
-use frankensqlite::Connection as FrankenConnection;
-use frankensqlite::compat::ConnectionExt;
+use coding_agent_search::storage::api::Conn as FrankenConnection;
+use coding_agent_search::storage::api::Value as ParamValue;
 use serde::Deserialize;
 use serde_json::json;
 use std::fs;
@@ -13,27 +13,41 @@ use tempfile::TempDir;
 // ============================================================================
 
 /// Create a test SQLite database with the cursorDiskKV and ItemTable tables.
+/// Stage A note: `storage::api::Conn::open_writable` is deliberately
+/// crate-private (R2-F3), so this integration test (a separate crate)
+/// bootstraps through `FrankenStorage::open` + `into_raw()` rather than
+/// opening a bare connection directly the way the pre-migration
+/// native-`frankensqlite` version of this helper did; the extra cass tables
+/// alongside cursorDiskKV/ItemTable don't affect this connector's reads.
 fn create_test_db(path: &Path) -> FrankenConnection {
-    let conn = FrankenConnection::open(path.to_string_lossy().into_owned()).unwrap();
-    conn.execute("CREATE TABLE IF NOT EXISTS cursorDiskKV (key TEXT PRIMARY KEY, value TEXT)")
-        .unwrap();
-    conn.execute("CREATE TABLE IF NOT EXISTS ItemTable (key TEXT PRIMARY KEY, value TEXT)")
-        .unwrap();
+    let conn = coding_agent_search::storage::sqlite::FrankenStorage::open(path)
+        .unwrap()
+        .into_raw();
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS cursorDiskKV (key TEXT PRIMARY KEY, value TEXT)",
+        &[],
+    )
+    .unwrap();
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS ItemTable (key TEXT PRIMARY KEY, value TEXT)",
+        &[],
+    )
+    .unwrap();
     conn
 }
 
 fn insert_kv(conn: &FrankenConnection, key: &str, value: &str) {
-    conn.execute_compat(
+    conn.execute(
         "INSERT OR REPLACE INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
-        frankensqlite::params![key, value],
+        &[ParamValue::from(key), ParamValue::from(value)],
     )
     .unwrap();
 }
 
 fn insert_item(conn: &FrankenConnection, key: &str, value: &str) {
-    conn.execute_compat(
+    conn.execute(
         "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?1, ?2)",
-        frankensqlite::params![key, value],
+        &[ParamValue::from(key), ParamValue::from(value)],
     )
     .unwrap();
 }

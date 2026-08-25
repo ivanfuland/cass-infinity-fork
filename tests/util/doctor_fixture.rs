@@ -4,8 +4,9 @@ use assert_cmd::Command;
 use coding_agent_search::model::types::{Agent, AgentKind, Conversation};
 use coding_agent_search::sources::config::{SourceDefinition, SourcesConfig, SyncSchedule};
 use coding_agent_search::sources::sync::{SourceSyncInfo, SyncResult, SyncStatus};
-use coding_agent_search::storage::sqlite::SqliteStorage;
-use frankensqlite::Connection as FrankenConnection;
+use coding_agent_search::storage::sqlite::{
+    ConnectionManagerConfig, FrankenConnectionManager, SqliteStorage,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1291,10 +1292,24 @@ impl DoctorFixtureFactory {
         let scratch_dir = self.root().join("scratch");
         fs::create_dir_all(&scratch_dir).expect("create fixture scratch dir");
         let scratch_db = scratch_dir.join("fast-incomplete-agent-search.db");
-        let mut conn = FrankenConnection::open(scratch_db.to_string_lossy().as_ref())
-            .expect("create fast incomplete fixture db");
-        conn.close_in_place()
-            .expect("close fast incomplete fixture db");
+        // Stage A note: this fixture must stay genuinely schema-free (an
+        // "incomplete schema" archive) -- FrankenStorage::open would apply
+        // cass's real migrations, defeating the point. storage::api::Conn::
+        // open_writable is the schema-free path but deliberately
+        // crate-private (R2-F3); FrankenConnectionManager (the one public,
+        // schema-free way to reach it from outside the crate) is used
+        // instead, and its WriterGuard::drop already does the equivalent of
+        // the removed explicit close_in_place() (also crate-private) via its
+        // own best-effort close.
+        {
+            let mgr = FrankenConnectionManager::new(
+                &scratch_db,
+                ConnectionManagerConfig { reader_count: 1, max_writers: 1 },
+            )
+            .expect("open connection manager for fast incomplete fixture db");
+            let guard = mgr.writer().expect("create fast incomplete fixture db");
+            drop(guard);
+        }
         let db_bytes = fs::read(&scratch_db).expect("read fast incomplete fixture db");
         self.write_confined_file(&db_path, &db_bytes, "archive_database_incomplete_schema");
 

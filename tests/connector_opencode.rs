@@ -2,12 +2,23 @@
 
 use coding_agent_search::connectors::opencode::OpenCodeConnector;
 use coding_agent_search::connectors::{Connector, ScanContext};
-use frankensqlite::Connection;
-use frankensqlite::compat::ConnectionExt;
-use frankensqlite::params;
+use coding_agent_search::storage::api::Conn as Connection;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
+
+/// Test-only parameter list builder (this integration test is a separate
+/// crate and can't reach `storage::api`'s crate-private `params!` shim):
+/// borrows + handles the zero-arg case, mirroring sqlite.rs's own `fparams!`.
+macro_rules! params {
+    () => {
+        &[] as &[coding_agent_search::storage::api::Value]
+    };
+    ($($val:expr),+ $(,)?) => {
+        &[$(coding_agent_search::storage::api::IntoValue::into_value($val)),+]
+            as &[coding_agent_search::storage::api::Value]
+    };
+}
 
 /// Helper to create a JSON-based OpenCode storage structure
 fn create_test_storage(dir: &std::path::Path, sessions: &[TestSession]) -> std::io::Result<()> {
@@ -106,8 +117,15 @@ struct TestPart {
     state: Option<String>,
 }
 
+/// Stage A note: `storage::api::Conn::open_writable` is deliberately
+/// crate-private (R2-F3), so this integration test (a separate crate)
+/// bootstraps through `FrankenStorage::open` + `into_raw()` rather than
+/// opening a bare, schema-free connection the way the pre-migration
+/// native-`frankensqlite` version of this helper did.
 fn create_drizzle_opencode_db(path: &Path) -> Connection {
-    let conn = Connection::open(path.to_string_lossy().as_ref()).expect("open opencode db");
+    let conn = coding_agent_search::storage::sqlite::FrankenStorage::open(path)
+        .expect("open opencode db")
+        .into_raw();
     conn.execute_batch(
         "CREATE TABLE session (
             id TEXT PRIMARY KEY,
@@ -162,7 +180,7 @@ fn opencode_parses_drizzle_sqlite_schema() {
     let db_path = dir.path().join("opencode.db");
     let conn = create_drizzle_opencode_db(&db_path);
 
-    conn.execute_compat(
+    conn.execute(
         "INSERT INTO session (
             id, project_id, slug, directory, title, version, time_created, time_updated
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -178,7 +196,7 @@ fn opencode_parses_drizzle_sqlite_schema() {
         ],
     )
     .expect("insert session");
-    conn.execute_compat(
+    conn.execute(
         "INSERT INTO message (id, session_id, time_created, time_updated, data)
          VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
@@ -190,7 +208,7 @@ fn opencode_parses_drizzle_sqlite_schema() {
         ],
     )
     .expect("insert message");
-    conn.execute_compat(
+    conn.execute(
         "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
