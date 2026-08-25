@@ -7,8 +7,10 @@
 //! - Missing optional fields have sensible defaults
 
 use coding_agent_search::pages::encrypt::{EncryptionConfig, KdfAlgorithm, SlotType};
-use coding_agent_search::storage::sqlite::{CURRENT_SCHEMA_VERSION, MigrationError, SqliteStorage};
-use frankensqlite::Connection as FrankenConnection;
+use coding_agent_search::storage::sqlite::{
+    CURRENT_SCHEMA_VERSION, ConnectionManagerConfig, FrankenConnectionManager, MigrationError,
+    SqliteStorage,
+};
 use serde_json::json;
 use std::path::Path;
 use tempfile::TempDir;
@@ -24,9 +26,19 @@ const _: () = {
     );
 };
 
-fn open_fixture_db(path: &Path) -> FrankenConnection {
-    let path = path.to_string_lossy();
-    FrankenConnection::open(path.as_ref()).expect("open frankensqlite fixture database")
+/// Schema-free fixture writer: these fixtures deliberately build legacy /
+/// pre-migration schemas that `SqliteStorage::open_or_rebuild` must detect,
+/// so opening through `FrankenStorage::open` (which would migrate first)
+/// defeats the point of the test.
+fn open_fixture_db(path: &Path) -> FrankenConnectionManager {
+    FrankenConnectionManager::new(
+        path,
+        ConnectionManagerConfig {
+            reader_count: 1,
+            max_writers: 1,
+        },
+    )
+    .expect("open frankensqlite fixture database")
 }
 
 // =============================================================================
@@ -66,12 +78,18 @@ fn test_detects_older_schema() {
 
     // Create a minimal old-style database
     {
-        let conn = open_fixture_db(&db_path);
-        conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+        let mgr = open_fixture_db(&db_path);
+        let mut guard = mgr.writer().unwrap();
+        let conn = guard.storage().raw();
+        conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)", &[])
             .unwrap();
         // Simulate an older schema version
-        conn.execute("INSERT INTO meta (key, value) VALUES ('schema_version', '1')")
-            .unwrap();
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('schema_version', '1')",
+            &[],
+        )
+        .unwrap();
+        guard.mark_committed();
     }
 
     // Try to open with SqliteStorage - should trigger migration or rebuild
@@ -110,12 +128,15 @@ fn test_ignores_unknown_tables() {
 
     // Add extra tables that a future version might have
     {
-        let conn = open_fixture_db(&db_path);
+        let mgr = open_fixture_db(&db_path);
+        let mut guard = mgr.writer().unwrap();
+        let conn = guard.storage().raw();
         conn.execute(
             "CREATE TABLE future_feature (
                 id INTEGER PRIMARY KEY,
                 data TEXT
             )",
+            &[],
         )
         .unwrap();
         conn.execute(
@@ -123,8 +144,10 @@ fn test_ignores_unknown_tables() {
                 id INTEGER PRIMARY KEY,
                 value BLOB
             )",
+            &[],
         )
         .unwrap();
+        guard.mark_committed();
     }
 
     // Should still be able to open and use the database
@@ -144,7 +167,9 @@ fn test_handles_missing_optional_columns() {
 
     // Create a database with minimal required structure
     {
-        let conn = open_fixture_db(&db_path);
+        let mgr = open_fixture_db(&db_path);
+        let mut guard = mgr.writer().unwrap();
+        let conn = guard.storage().raw();
         conn.execute_batch(
             r#"
             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
@@ -196,6 +221,7 @@ fn test_handles_missing_optional_columns() {
             "#,
         )
         .unwrap();
+        guard.mark_committed();
     }
 
     // Should open successfully with readonly
@@ -384,11 +410,17 @@ fn test_reject_schema_version_0() {
     let db_path = dir.path().join("ancient.db");
 
     {
-        let conn = open_fixture_db(&db_path);
-        conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+        let mgr = open_fixture_db(&db_path);
+        let mut guard = mgr.writer().unwrap();
+        let conn = guard.storage().raw();
+        conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)", &[])
             .unwrap();
-        conn.execute("INSERT INTO meta (key, value) VALUES ('schema_version', '0')")
-            .unwrap();
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('schema_version', '0')",
+            &[],
+        )
+        .unwrap();
+        guard.mark_committed();
     }
 
     // Very old schemas should trigger rebuild
@@ -429,7 +461,9 @@ fn test_search_without_fts() {
 
     // Create database without FTS
     {
-        let conn = open_fixture_db(&db_path);
+        let mgr = open_fixture_db(&db_path);
+        let mut guard = mgr.writer().unwrap();
+        let conn = guard.storage().raw();
         conn.execute_batch(&format!(
             r#"
             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
@@ -490,6 +524,7 @@ fn test_search_without_fts() {
             CURRENT_SCHEMA_VERSION
         ))
         .unwrap();
+        guard.mark_committed();
     }
 
     // Should be able to open and query (though FTS won't work)
