@@ -514,6 +514,17 @@ fn seed_analytics_remote_source_tokens_fixture(temp_home: &TempDir) {
         .map(|(_, id)| id)
         .expect("workspace-b id");
 
+    // Blank-but-present remote source: a real `sources` row is required so the
+    // simulated "blank remote source_id" mutation below satisfies the FK on
+    // conversations.source_id (matches how a real ingest path would register
+    // any source before referencing it).
+    conn.execute(
+        "INSERT OR IGNORE INTO sources(id, kind, host_label, created_at, updated_at)
+         VALUES ('   ', 'remote', NULL, strftime('%s','now')*1000, strftime('%s','now')*1000)",
+        &[],
+    )
+    .unwrap();
+
     conn.execute(
         "UPDATE conversations SET source_id = '   ', origin_host = 'remote-ci' WHERE workspace_id = ?1",
         fparams![workspace_b_id],
@@ -557,6 +568,17 @@ fn seed_analytics_remote_source_tools_fixture(temp_home: &TempDir) {
         .find(|(path, _)| path == &workspace_b.to_string_lossy())
         .map(|(_, id)| id)
         .expect("workspace-b id");
+
+    // Blank-but-present remote source: a real `sources` row is required so the
+    // simulated "blank remote source_id" mutation below satisfies the FK on
+    // conversations.source_id (matches how a real ingest path would register
+    // any source before referencing it).
+    conn.execute(
+        "INSERT OR IGNORE INTO sources(id, kind, host_label, created_at, updated_at)
+         VALUES ('   ', 'remote', NULL, strftime('%s','now')*1000, strftime('%s','now')*1000)",
+        &[],
+    )
+    .unwrap();
 
     conn.execute(
         "UPDATE conversations SET source_id = '   ', origin_host = 'remote-ci' WHERE workspace_id = ?1",
