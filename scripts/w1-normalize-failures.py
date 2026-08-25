@@ -39,7 +39,18 @@ COMPILE_ERROR_RE = re.compile(
 LOC_RE = re.compile(r'\S+\.rs:\d+:\d+')
 ADDR_RE = re.compile(r'\b0x[0-9a-fA-F]+\b')
 TIME_RE = re.compile(r'\bfinished in [\d.]+s\b')
-ABS_PATH_RE = re.compile(r'/[^\s:]+/([A-Za-z0-9_.\-]+\.rs)')
+# plan delta d9: was scoped to `.rs` source paths only, which missed absolute
+# paths to non-.rs files (golden fixtures, shell scripts, etc.) that panic
+# messages routinely embed (e.g. "Expected: /home/.../tests/golden/robot/
+# capabilities.json.golden"). Those paths are rooted at the tree's own working
+# directory, which differs between the baseline and candidate worktrees (two
+# distinct absolute paths) even when the underlying failure content is
+# byte-identical -- inflating both sides' failure-form counts the same way the
+# d8 PID/tmpdir leak did. Broadened to strip the directory prefix of any
+# absolute path down to its basename, regardless of extension; the basename is
+# kept (not collapsed away) so genuinely different files still normalize
+# differently.
+ABS_PATH_RE = re.compile(r'/[^\s:]+/([A-Za-z0-9_.\-]+)')
 # plan delta d8: cross-run thread ids in "thread '<name>' (<PID>) panicked" are not
 # stable (random per-process), so leaving them in makes two runs of the identical
 # assertion normalize to different strings and get misclassified as a new failure
