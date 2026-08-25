@@ -36,10 +36,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, never, select};
 use frankensearch::index::VectorIndex as FsVectorIndex;
-use frankensqlite::compat::{
-    ConnectionExt, ParamValue, RowExt, Transaction as FrankenTransaction,
-    TransactionExt as FrankenTransactionExt,
-};
+use crate::storage::api::StorageError;
+use crate::storage::api::Tx as FrankenTransaction;
+type ParamValue = crate::storage::api::Value;
 use fs2::FileExt;
 use notify::event::{AccessKind, AccessMode, MetadataKind, ModifyKind};
 use notify::{RecursiveMode, Watcher, recommended_watcher};
@@ -8976,10 +8975,10 @@ fn count_total_messages_exact(storage: &FrankenStorage) -> Result<usize> {
 fn expected_live_lexical_doc_count(storage: &FrankenStorage) -> Result<usize> {
     let conversation_ids: Vec<i64> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT id FROM conversations",
             &[] as &[ParamValue],
-            |row: &frankensqlite::Row| row.get_typed::<i64>(0),
+            |row| row.get_typed::<i64>(0),
         )
         .context("listing conversations for the noise-adjusted lexical doc expectation")?;
     let mut expected_docs = 0usize;
@@ -10878,7 +10877,7 @@ fn packet_update_daily_stats_batched_in_tx(
     let now = FrankenStorage::now_millis();
     let mut total_affected = 0usize;
     for (day_id, agent_slug, source_id, delta) in entries {
-        total_affected += tx.execute_compat(
+        total_affected += tx.execute(
             "INSERT INTO daily_stats (day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
              VALUES(?1,?2,?3,?4,?5,?6,?7)
              ON CONFLICT(day_id, agent_slug, source_id) DO UPDATE SET
@@ -10919,7 +10918,7 @@ fn rebuild_daily_stats_from_conversation_packets(
             db_path.display()
         )
     })?;
-    tx.execute("DELETE FROM daily_stats").with_context(|| {
+    tx.execute("DELETE FROM daily_stats", &[]).with_context(|| {
         format!(
             "clearing daily_stats before packet rebuild for {}",
             db_path.display()
@@ -13508,7 +13507,7 @@ pub fn run_index(
     // database" from frankensqlite.
     if let Err(err) = storage
         .raw()
-        .execute("UPDATE meta SET value = value WHERE key = 'schema_version'")
+        .execute("UPDATE meta SET value = value WHERE key = 'schema_version'", &[])
     {
         tracing::warn!(
             db_path = %opts.db_path.display(),
@@ -15566,8 +15565,11 @@ fn run_final_wal_checkpoint(db_path: &Path, context: &str) -> Result<FinalWalChe
     // Run this after closing the indexing storage handle: frankensqlite flushes
     // retained autocommit writes during close, and TRUNCATE avoids leaving the
     // completed bulk-ingest WAL for the next opener to replay.
-    let checkpoint_db_path = db_path.to_string_lossy().into_owned();
-    let conn = frankensqlite::Connection::open(checkpoint_db_path).with_context(|| {
+    let conn = crate::storage::api::Conn::open_writable(
+        db_path,
+        crate::storage::api::Profile::Production,
+    )
+    .with_context(|| {
         format!(
             "opening canonical db for final WAL checkpoint after {context}: {}",
             db_path.display()
@@ -15587,33 +15589,26 @@ fn run_final_wal_checkpoint(db_path: &Path, context: &str) -> Result<FinalWalChe
 }
 
 fn query_final_wal_checkpoint(
-    conn: &frankensqlite::Connection,
+    conn: &crate::storage::api::Conn,
     db_path: &Path,
     context: &str,
 ) -> Result<FinalWalCheckpointOutcome> {
-    let rows = conn
-        .query("PRAGMA wal_checkpoint(TRUNCATE);")
+    let rows: Vec<(i64, i64, i64)> = conn
+        .query_all_map("PRAGMA wal_checkpoint(TRUNCATE);", &[], |row| {
+            Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?))
+        })
         .with_context(|| {
             format!(
                 "running final WAL checkpoint after {context}: {}",
                 db_path.display()
             )
         })?;
-    let row = rows.first().ok_or_else(|| {
+    let (busy, log_frames, checkpointed_frames) = *rows.first().ok_or_else(|| {
         anyhow::anyhow!(
             "final WAL checkpoint returned no status row after {context}: {}",
             db_path.display()
         )
     })?;
-    let busy: i64 = row
-        .get_typed(0)
-        .with_context(|| "reading final WAL checkpoint busy flag")?;
-    let log_frames: i64 = row
-        .get_typed(1)
-        .with_context(|| "reading final WAL checkpoint log frame count")?;
-    let checkpointed_frames: i64 = row
-        .get_typed(2)
-        .with_context(|| "reading final WAL checkpoint backfilled frame count")?;
 
     let outcome = classify_final_wal_checkpoint(busy, log_frames, checkpointed_frames);
     if log_frames >= 0 {
@@ -16344,11 +16339,12 @@ fn non_destructive_meta_schema_version(db_path: &Path) -> Result<Option<i64>> {
         )
     })?;
 
-    let result = match conn.query("SELECT value FROM meta WHERE key = 'schema_version';") {
-        Ok(rows) => Ok(rows
-            .first()
-            .and_then(|row| row.get_typed::<String>(0).ok())
-            .and_then(|raw| raw.parse::<i64>().ok())),
+    let result = match conn.query_opt_map(
+        "SELECT value FROM meta WHERE key = 'schema_version';",
+        &[],
+        |row| Ok(row.get_typed::<String>(0).ok()),
+    ) {
+        Ok(value) => Ok(value.flatten().and_then(|raw| raw.parse::<i64>().ok())),
         Err(err) if storage_error_mentions_missing_table_or_column(&err) => Ok(None),
         Err(err) => Err(anyhow::anyhow!(
             "reading canonical archive schema_version before index: {err}"
@@ -16670,10 +16666,14 @@ fn current_schema_fast_probe(db_path: &Path) -> Result<bool> {
 
     let version = storage
         .raw()
-        .query("SELECT value FROM meta WHERE key = 'schema_version';")
+        .query_opt_map(
+            "SELECT value FROM meta WHERE key = 'schema_version';",
+            &[],
+            |row| Ok(row.get_typed::<String>(0).ok()),
+        )
         .ok()
-        .and_then(|rows| rows.first().cloned())
-        .and_then(|row| row.get_typed::<String>(0).ok())
+        .flatten()
+        .flatten()
         .and_then(|raw| raw.parse::<i64>().ok());
 
     if let Err(close_err) = storage.close_without_checkpoint_in_place() {
@@ -21240,7 +21240,7 @@ fn ingest_non_watch_batch_once(
         // Use the typed `FrankenError::OutOfMemory` variant so the OOM detector
         // exercises the downcast path that real frankensqlite OOMs hit, instead
         // of relying on the plain-string fallback.
-        return Err(anyhow::Error::new(frankensqlite::FrankenError::OutOfMemory));
+        return Err(out_of_memory_storage_error());
     }
 
     let outcome = ingest_batch_detailed(
@@ -21558,7 +21558,7 @@ fn ingest_watch_batch_with_oom_split_inner(
             // Use the typed `FrankenError::OutOfMemory` variant so the OOM detector
             // exercises the downcast path that real frankensqlite OOMs hit, instead
             // of relying on the plain-string fallback.
-            Err(anyhow::Error::new(frankensqlite::FrankenError::OutOfMemory))
+            Err(out_of_memory_storage_error())
         } else {
             let mut semantic_delta = WatchSemanticDelta::default();
             ingest_batch_with_semantic_delta(
@@ -21643,7 +21643,7 @@ fn ingest_watch_batch_with_oom_split_inner(
             // conversation (solo ingest also OOMs) set
             // `CASS_TEST_WATCH_SOLO_RETRY_OOM=1`.
             let solo_retry = if should_force_watch_solo_retry_oom() {
-                Err(anyhow::Error::new(frankensqlite::FrankenError::OutOfMemory))
+                Err(out_of_memory_storage_error())
             } else {
                 ingest_watch_batch_with_oom_split_inner(
                     storage,
@@ -21835,11 +21835,21 @@ fn save_watch_state_watermark(
     Ok(())
 }
 
+/// Build a typed OOM error matching what `storage::api`'s `map_franken_err`
+/// produces for a real native `FrankenError::OutOfMemory` (`StorageError::
+/// Other` with `detail` set to the native error's exact Display text, "out
+/// of memory") — used both to simulate an OOM for test injection and by
+/// `error_is_out_of_memory`'s typed-downcast path below, so the two can never
+/// drift out of sync.
+fn out_of_memory_storage_error() -> anyhow::Error {
+    anyhow::Error::new(StorageError::Other { code: None, detail: "out of memory".to_string() })
+}
+
 fn error_is_out_of_memory(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         if cause
-            .downcast_ref::<frankensqlite::FrankenError>()
-            .is_some_and(|err| matches!(err, frankensqlite::FrankenError::OutOfMemory))
+            .downcast_ref::<StorageError>()
+            .is_some_and(|err| matches!(err, StorageError::Other { detail, .. } if error_message_is_exact_out_of_memory(detail)))
         {
             return true;
         }
@@ -23828,7 +23838,7 @@ fn explicit_watch_once_root_unchanged_after_last_index(
     let source_path = root.path.to_string_lossy();
     let matches: Vec<i64> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT id
              FROM conversations
              WHERE source_id = ?1 AND source_path = ?2
@@ -25265,8 +25275,8 @@ pub mod persist {
     use std::time::Instant;
 
     use anyhow::{Context, Result, anyhow};
-    use frankensqlite::FrankenError;
-    use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
+    use crate::storage::api::StorageError;
+    use crate::storage::api::Value as ParamValue;
     use rand::RngExt;
     use rayon::prelude::*;
 
@@ -25488,7 +25498,7 @@ pub mod persist {
         }
         sql.push_str(") ORDER BY id ASC");
 
-        let rows: Vec<(i64, i64)> = storage.raw().query_map_collect(&sql, &params, |row| {
+        let rows: Vec<(i64, i64)> = storage.raw().query_all_map(&sql, &params, |row| {
             Ok((row.get_typed(0)?, row.get_typed(1)?))
         })?;
         Ok(rows.into_iter().map(|(id, idx)| (idx, id)).collect())
@@ -25717,7 +25727,7 @@ pub mod persist {
     fn apply_begin_concurrent_writer_tuning(storage: &FrankenStorage, defer_checkpoints: bool) {
         let cache_kib = begin_concurrent_writer_cache_kib();
         let pragma = format!("PRAGMA cache_size = -{cache_kib};");
-        if let Err(err) = storage.raw().execute(&pragma) {
+        if let Err(err) = storage.raw().execute(&pragma, &[]) {
             tracing::debug!(
                 cache_kib,
                 error = %err,
@@ -25733,7 +25743,7 @@ pub mod persist {
             return;
         }
         let pragma = format!("PRAGMA busy_timeout = {busy_timeout_ms};");
-        if let Err(err) = storage.raw().execute(&pragma) {
+        if let Err(err) = storage.raw().execute(&pragma, &[]) {
             tracing::debug!(
                 busy_timeout_ms,
                 error = %err,
@@ -25795,15 +25805,18 @@ pub mod persist {
             return;
         }
         let started = std::time::Instant::now();
-        match storage.raw().query("PRAGMA wal_checkpoint(PASSIVE);") {
-            Ok(rows) => {
-                let status = rows.first().map(|row| {
-                    (
-                        row.get_typed::<i64>(0).unwrap_or(-1),
-                        row.get_typed::<i64>(1).unwrap_or(-1),
-                        row.get_typed::<i64>(2).unwrap_or(-1),
-                    )
-                });
+        match storage.raw().query_opt_map(
+            "PRAGMA wal_checkpoint(PASSIVE);",
+            &[],
+            |row| {
+                Ok((
+                    row.get_typed::<i64>(0).unwrap_or(-1),
+                    row.get_typed::<i64>(1).unwrap_or(-1),
+                    row.get_typed::<i64>(2).unwrap_or(-1),
+                ))
+            },
+        ) {
+            Ok(status) => {
                 let (busy, log_frames, checkpointed_frames) = status.unwrap_or((-1, -1, -1));
                 tracing::info!(
                     db_path = %db_path.display(),
@@ -25836,7 +25849,7 @@ pub mod persist {
             return;
         }
         let pragma = format!("PRAGMA wal_autocheckpoint = {wal_autocheckpoint_pages};");
-        if let Err(err) = storage.raw().execute(&pragma) {
+        if let Err(err) = storage.raw().execute(&pragma, &[]) {
             tracing::debug!(
                 wal_autocheckpoint_pages,
                 error = %err,
@@ -25901,7 +25914,7 @@ pub mod persist {
             // overhead without improving correctness.
             if let Err(err) = writer
                 .raw()
-                .execute("UPDATE meta SET value = value WHERE key = 'schema_version'")
+                .execute("UPDATE meta SET value = value WHERE key = 'schema_version'", &[])
             {
                 discard_writer(writer);
                 anyhow::bail!(
@@ -25924,7 +25937,7 @@ pub mod persist {
         // After sustained write activity (~39 min), frankensqlite's cursor cache
         // can report false-positive FK constraint violations that PRAGMA
         // foreign_key_check confirms do not actually exist.
-        if let Err(err) = writer.raw().execute("PRAGMA foreign_keys = OFF") {
+        if let Err(err) = writer.raw().execute("PRAGMA foreign_keys = OFF", &[]) {
             tracing::debug!(
                 error = %err,
                 context,
@@ -25953,9 +25966,9 @@ pub mod persist {
         }
     }
 
-    fn transient_franken_error(err: &anyhow::Error) -> Option<&FrankenError> {
-        err.downcast_ref::<FrankenError>()
-            .or_else(|| err.root_cause().downcast_ref::<FrankenError>())
+    fn transient_franken_error(err: &anyhow::Error) -> Option<&StorageError> {
+        err.downcast_ref::<StorageError>()
+            .or_else(|| err.root_cause().downcast_ref::<StorageError>())
     }
 
     fn is_retryable_franken_error(err: &anyhow::Error) -> bool {
@@ -25964,14 +25977,13 @@ pub mod persist {
             // corruption can amplify damage by hammering corrupt pages and
             // spreading partial writes through the WAL.  Let it fail fast so
             // the caller can trigger the backup/quarantine path instead.
-            matches!(
-                inner,
-                FrankenError::Busy
-                    | FrankenError::BusyRecovery
-                    | FrankenError::BusySnapshot { .. }
-                    | FrankenError::WriteConflict { .. }
-                    | FrankenError::SerializationFailure { .. }
-            )
+            //
+            // Stage A note: the native engine's Busy/BusyRecovery/BusySnapshot/
+            // WriteConflict/SerializationFailure — this function's original
+            // five-variant retry set — all collapse into `StorageError::Busy`
+            // (either scope) via `storage::api::map_franken_err`; matching that
+            // single variant reproduces the same retry set bit-for-bit.
+            matches!(inner, StorageError::Busy { .. })
         })
     }
 
@@ -26096,7 +26108,7 @@ pub mod persist {
         })?;
         apply_begin_concurrent_writer_tuning(&franken, defer_checkpoints);
         // CASS #169: Disable FK enforcement — see with_ephemeral_writer for rationale.
-        if let Err(err) = franken.raw().execute("PRAGMA foreign_keys = OFF") {
+        if let Err(err) = franken.raw().execute("PRAGMA foreign_keys = OFF", &[]) {
             tracing::debug!(
                 error = %err,
                 "failed to disable FK enforcement on serial fallback writer"
@@ -26246,7 +26258,7 @@ pub mod persist {
                 })?;
                 apply_begin_concurrent_writer_tuning(&franken, defer_checkpoints);
                 // CASS #169: Disable FK enforcement — see with_ephemeral_writer for rationale.
-                if let Err(err) = franken.raw().execute("PRAGMA foreign_keys = OFF") {
+                if let Err(err) = franken.raw().execute("PRAGMA foreign_keys = OFF", &[]) {
                     tracing::debug!(
                         error = %err,
                         chunk_idx,
@@ -26951,7 +26963,7 @@ pub mod persist {
     mod persist_internal_tests {
         use super::*;
         use crate::connectors::NormalizedMessage;
-        use fsqlite_types::value::SqliteValue;
+        use crate::storage::api::Value as SqliteValue;
         use serial_test::serial;
 
         static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
@@ -27100,12 +27112,13 @@ pub mod persist {
 
         #[test]
         fn retryable_franken_errors_are_detected() {
-            let retryable = anyhow::Error::new(FrankenError::BusySnapshot {
-                conflicting_pages: "1,2".to_string(),
+            let retryable = anyhow::Error::new(StorageError::Busy {
+                scope: crate::storage::api::BusyScope::Snapshot,
             });
             assert!(is_retryable_franken_error(&retryable));
 
-            let not_retryable = anyhow::Error::new(FrankenError::ConcurrentUnavailable);
+            let not_retryable =
+                anyhow::Error::new(StorageError::Other { code: None, detail: String::new() });
             assert!(!is_retryable_franken_error(&not_retryable));
         }
 
@@ -27135,7 +27148,7 @@ pub mod persist {
                 .unwrap();
             storage
                 .raw()
-                .execute_compat(
+                .execute(
                     "INSERT INTO conversations(
                          id, agent_id, workspace_id, source_id, title, source_path, metadata_json
                      ) VALUES
@@ -27146,7 +27159,7 @@ pub mod persist {
                 .unwrap();
             storage
                 .raw()
-                .execute_compat(
+                .execute(
                     "INSERT INTO messages(id, conversation_id, idx, role, content, extra_json)
                      VALUES
                          (10, 4, 0, 'user', 'older message', '{}'),
@@ -27248,7 +27261,7 @@ pub mod persist {
 
             storage
                 .raw()
-                .execute_compat(
+                .execute(
                     "UPDATE conversations SET source_id = ?1, origin_host = ?2 WHERE id = ?3",
                     &[
                         ParamValue::from("replayed-remote"),
@@ -27259,7 +27272,7 @@ pub mod persist {
                 .unwrap();
             storage
                 .raw()
-                .execute_compat(
+                .execute(
                     "UPDATE messages SET role = ?1, content = ?2 WHERE id = ?3",
                     &[
                         ParamValue::from("tool"),
@@ -27307,11 +27320,11 @@ pub mod persist {
             assert_eq!(storage.index_writer_checkpoint_pages(), Some(4096));
 
             apply_index_writer_checkpoint_policy(&storage, true);
-            let rows = storage.raw().query("PRAGMA wal_autocheckpoint;").unwrap();
+            let rows = storage.raw().query_all_map("PRAGMA wal_autocheckpoint;", &[], |row| row.get_value(0)).unwrap();
             assert_eq!(rows.len(), 1);
             assert_eq!(
-                rows[0].get(0).unwrap(),
-                &SqliteValue::Integer(BULK_IMPORT_WAL_AUTOCHECKPOINT_PAGES)
+                rows[0],
+                SqliteValue::Integer(BULK_IMPORT_WAL_AUTOCHECKPOINT_PAGES)
             );
             assert_eq!(
                 storage.index_writer_checkpoint_pages(),
@@ -27319,9 +27332,9 @@ pub mod persist {
             );
 
             apply_index_writer_checkpoint_policy(&storage, false);
-            let rows = storage.raw().query("PRAGMA wal_autocheckpoint;").unwrap();
+            let rows = storage.raw().query_all_map("PRAGMA wal_autocheckpoint;", &[], |row| row.get_value(0)).unwrap();
             assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(1000));
+            assert_eq!(rows[0], SqliteValue::Integer(1000));
             assert_eq!(storage.index_writer_checkpoint_pages(), Some(1000));
         }
 
@@ -27353,10 +27366,10 @@ pub mod persist {
             with_ephemeral_writer(&storage, false, "ephemeral-writer-reuse", |writer| {
                 writer
                     .raw()
-                    .execute("CREATE TEMP TABLE temp_writer_reuse(marker INTEGER NOT NULL);")?;
+                    .execute("CREATE TEMP TABLE temp_writer_reuse(marker INTEGER NOT NULL);", &[])?;
                 writer
                     .raw()
-                    .execute("INSERT INTO temp_writer_reuse(marker) VALUES (1);")?;
+                    .execute("INSERT INTO temp_writer_reuse(marker) VALUES (1);", &[])?;
                 Ok(())
             })
             .unwrap();
@@ -27378,7 +27391,6 @@ pub mod persist {
         fn begin_concurrent_persist_writes_all_conversations() {
             use crate::connectors::NormalizedConversation;
             use crate::search::tantivy::TantivyIndex;
-            use frankensqlite::compat::{ConnectionExt, RowExt};
 
             let dir = tempfile::TempDir::new().unwrap();
             let db_path = dir.path().join("test.db");
@@ -27443,7 +27455,7 @@ pub mod persist {
                 .unwrap();
             let persisted_conversations: Vec<(i64, i64, Option<String>, String)> = reader
                 .raw()
-                .query_map_collect(
+                .query_all_map(
                     "SELECT id, agent_id, external_id, source_path FROM conversations ORDER BY id",
                     &[],
                     |row| {
@@ -27458,7 +27470,7 @@ pub mod persist {
                 .unwrap();
             let persisted_message_counts: Vec<(i64, i64)> = reader
                 .raw()
-                .query_map_collect(
+                .query_all_map(
                     "SELECT conversation_id, COUNT(*) FROM messages GROUP BY conversation_id ORDER BY conversation_id",
                     &[],
                     |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
@@ -27494,7 +27506,6 @@ pub mod persist {
         fn begin_concurrent_single_conversation_works() {
             use crate::connectors::NormalizedConversation;
             use crate::search::tantivy::TantivyIndex;
-            use frankensqlite::compat::{ConnectionExt, RowExt};
 
             let dir = tempfile::TempDir::new().unwrap();
             let db_path = dir.path().join("test.db");
@@ -27558,7 +27569,6 @@ pub mod persist {
         fn persist_conversations_batched_can_defer_inline_lexical_updates() {
             use crate::connectors::NormalizedConversation;
             use crate::search::tantivy::TantivyIndex;
-            use frankensqlite::compat::{ConnectionExt, RowExt};
 
             let _guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
 
@@ -27631,7 +27641,6 @@ pub mod persist {
         fn begin_concurrent_persist_can_defer_inline_lexical_updates() {
             use crate::connectors::NormalizedConversation;
             use crate::search::tantivy::TantivyIndex;
-            use frankensqlite::compat::{ConnectionExt, RowExt};
 
             let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "1");
             let _chunk_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE", "1");
@@ -28389,7 +28398,6 @@ pub mod persist {
             use crate::connectors::NormalizedConversation;
             use crate::search::tantivy::TantivyIndex;
             use crate::sources::provenance::{Source, SourceKind};
-            use frankensqlite::compat::{ConnectionExt, RowExt};
 
             let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "1");
             let _chunk_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE", "1");
@@ -28496,7 +28504,7 @@ pub mod persist {
 
             let stored_indices: Vec<i64> = reader
                 .raw()
-                .query_map_collect("SELECT idx FROM messages ORDER BY idx", &[], |row| {
+                .query_all_map("SELECT idx FROM messages ORDER BY idx", &[], |row| {
                     row.get_typed(0)
                 })
                 .unwrap();
@@ -28514,7 +28522,6 @@ pub mod persist {
             // persisted content, message ordering, or redaction behaviour.
             use crate::connectors::NormalizedConversation;
             use crate::search::tantivy::TantivyIndex;
-            use frankensqlite::compat::{ConnectionExt, RowExt};
 
             let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
             // Force redaction on so we exercise the heavier allocation path
@@ -28599,7 +28606,7 @@ pub mod persist {
             // substrings would survive here.
             let titles: Vec<String> = reader
                 .raw()
-                .query_map_collect(
+                .query_all_map(
                     "SELECT title FROM conversations WHERE title IS NOT NULL ORDER BY id",
                     &[],
                     |row| row.get_typed(0),
@@ -28626,7 +28633,6 @@ pub mod persist {
             // old per-chunk map_to_internal loop produced.
             use crate::connectors::NormalizedConversation;
             use crate::search::tantivy::TantivyIndex;
-            use frankensqlite::compat::{ConnectionExt, RowExt};
 
             let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "1");
             // Use chunk_size 8 so the 32-conv batch splits across multiple
@@ -28688,7 +28694,7 @@ pub mod persist {
 
             let titles: Vec<String> = reader
                 .raw()
-                .query_map_collect(
+                .query_all_map(
                     "SELECT title FROM conversations WHERE title IS NOT NULL ORDER BY id",
                     &[],
                     |row| row.get_typed(0),
@@ -28716,7 +28722,6 @@ pub mod persist {
             // (external_id, started_at) tuples.
             use crate::connectors::NormalizedConversation;
             use crate::search::tantivy::TantivyIndex;
-            use frankensqlite::compat::{ConnectionExt, RowExt};
 
             fn run_once(parallel_wal: Option<&str>) -> Vec<(String, i64)> {
                 let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "1");
@@ -28765,7 +28770,7 @@ pub mod persist {
                 let reader = FrankenStorage::open(&db_path).unwrap();
                 reader
                     .raw()
-                    .query_map_collect(
+                    .query_all_map(
                         "SELECT external_id, started_at FROM conversations ORDER BY id",
                         &[],
                         |row| {
@@ -28859,7 +28864,6 @@ pub mod persist {
         fn persist_conversations_batched_registers_missing_remote_source_in_serial_path() {
             use crate::connectors::NormalizedConversation;
             use crate::search::tantivy::TantivyIndex;
-            use frankensqlite::compat::{ConnectionExt, RowExt};
 
             let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
 
@@ -28912,7 +28916,7 @@ pub mod persist {
 
             let provenance: Vec<(String, Option<String>)> = reader
                 .raw()
-                .query_map_collect(
+                .query_all_map(
                     "SELECT source_id, origin_host FROM conversations",
                     &[],
                     |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
@@ -28930,7 +28934,6 @@ pub mod persist {
         {
             use crate::connectors::NormalizedConversation;
             use crate::search::tantivy::TantivyIndex;
-            use frankensqlite::compat::{ConnectionExt, RowExt};
 
             let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "1");
             let _chunk_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE", "1");
@@ -28984,7 +28987,7 @@ pub mod persist {
 
             let provenance: Vec<(String, Option<String>)> = reader
                 .raw()
-                .query_map_collect(
+                .query_all_map(
                     "SELECT source_id, origin_host FROM conversations",
                     &[],
                     |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
@@ -29004,7 +29007,6 @@ pub mod persist {
         fn persist_conversations_batched_reuses_auto_registered_remote_source_across_serial_runs() {
             use crate::connectors::NormalizedConversation;
             use crate::search::tantivy::TantivyIndex;
-            use frankensqlite::compat::{ConnectionExt, RowExt};
 
             let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
 
@@ -29071,7 +29073,7 @@ pub mod persist {
             let reader = FrankenStorage::open(&db_path).unwrap();
             let source_rows: Vec<(String, Option<String>)> = reader
                 .raw()
-                .query_map_collect(
+                .query_all_map(
                     "SELECT id, host_label FROM sources WHERE id <> 'local' ORDER BY id",
                     &[],
                     |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
@@ -29088,7 +29090,7 @@ pub mod persist {
 
             let provenance: Vec<(String, Option<String>, String)> = reader
                 .raw()
-                .query_map_collect(
+                .query_all_map(
                     "SELECT source_id, origin_host, external_id FROM conversations ORDER BY external_id",
                     &[],
                     |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
@@ -29119,7 +29121,7 @@ pub mod persist {
                 .unwrap();
             assert_eq!(conversation_count, 2);
 
-            let fk_violations = reader.raw().query("PRAGMA foreign_key_check").unwrap();
+            let fk_violations = reader.raw().query_all_map("PRAGMA foreign_key_check", &[], |_row| Ok(())).unwrap();
             assert!(
                 fk_violations.is_empty(),
                 "serial path should not leave any foreign-key violations after source auto-registration"
@@ -29132,7 +29134,6 @@ pub mod persist {
          {
             use crate::connectors::NormalizedConversation;
             use crate::search::tantivy::TantivyIndex;
-            use frankensqlite::compat::{ConnectionExt, RowExt};
 
             let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "1");
             let _chunk_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE", "1");
@@ -29200,7 +29201,7 @@ pub mod persist {
             let reader = FrankenStorage::open(&db_path).unwrap();
             let source_rows: Vec<(String, Option<String>)> = reader
                 .raw()
-                .query_map_collect(
+                .query_all_map(
                     "SELECT id, host_label FROM sources WHERE id <> 'local' ORDER BY id",
                     &[],
                     |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
@@ -29217,7 +29218,7 @@ pub mod persist {
 
             let provenance: Vec<(String, Option<String>, String)> = reader
                 .raw()
-                .query_map_collect(
+                .query_all_map(
                     "SELECT source_id, origin_host, external_id FROM conversations ORDER BY external_id",
                     &[],
                     |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
@@ -29248,7 +29249,7 @@ pub mod persist {
                 .unwrap();
             assert_eq!(conversation_count, 2);
 
-            let fk_violations = reader.raw().query("PRAGMA foreign_key_check").unwrap();
+            let fk_violations = reader.raw().query_all_map("PRAGMA foreign_key_check", &[], |_row| Ok(())).unwrap();
             assert!(
                 fk_violations.is_empty(),
                 "begin-concurrent path should not leave any foreign-key violations after source auto-registration"
@@ -29259,7 +29260,6 @@ pub mod persist {
         fn persist_conversation_registers_missing_remote_source() {
             use crate::connectors::NormalizedConversation;
             use crate::search::tantivy::TantivyIndex;
-            use frankensqlite::compat::{ConnectionExt, RowExt};
 
             let dir = tempfile::TempDir::new().unwrap();
             let db_path = dir.path().join("single-remote-source.db");
@@ -29304,7 +29304,7 @@ pub mod persist {
 
             let provenance: Vec<(String, Option<String>)> = reader
                 .raw()
-                .query_map_collect(
+                .query_all_map(
                     "SELECT source_id, origin_host FROM conversations",
                     &[],
                     |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
@@ -29323,7 +29323,6 @@ pub mod persist {
         fn persist_conversation_host_only_remote_source_infers_source_id_from_host() {
             use crate::connectors::NormalizedConversation;
             use crate::search::tantivy::TantivyIndex;
-            use frankensqlite::compat::{ConnectionExt, RowExt};
 
             let dir = tempfile::TempDir::new().unwrap();
             let db_path = dir.path().join("single-host-only-remote.db");
@@ -29368,7 +29367,7 @@ pub mod persist {
 
             let provenance: Vec<(String, Option<String>)> = reader
                 .raw()
-                .query_map_collect(
+                .query_all_map(
                     "SELECT source_id, origin_host FROM conversations",
                     &[],
                     |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
@@ -29664,8 +29663,8 @@ mod tests {
     };
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
     use crate::sources::provenance::SourceKind;
-    use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
-    use fsqlite_types::value::SqliteValue;
+    use crate::storage::api::Value as ParamValue;
+    use crate::storage::api::Value as SqliteValue;
     use serial_test::serial;
     use tempfile::TempDir;
 
@@ -30554,7 +30553,7 @@ mod tests {
 
         let conversation_ids: Vec<i64> = storage
             .raw()
-            .query_map_collect(
+            .query_all_map(
                 "SELECT id FROM conversations WHERE external_id = ?1",
                 &[ParamValue::from("raw-mirror-persisted-link")],
                 |row| row.get_typed(0),
@@ -31005,7 +31004,7 @@ mod tests {
 
     #[test]
     fn out_of_memory_classifier_rejects_contextual_substrings() {
-        let typed: anyhow::Error = frankensqlite::FrankenError::OutOfMemory.into();
+        let typed: anyhow::Error = out_of_memory_storage_error();
         assert!(error_is_out_of_memory(&typed));
 
         let exact = anyhow::anyhow!("out of memory");
@@ -31049,7 +31048,7 @@ mod tests {
         // Build a realistic wrapped chain: low-level FrankenError::OutOfMemory
         // bubbling up through two layers of context (mirrors how it actually
         // arrives at the quarantine path inside the watch ingest flow).
-        let typed: anyhow::Error = frankensqlite::FrankenError::OutOfMemory.into();
+        let typed: anyhow::Error = out_of_memory_storage_error();
         let with_inner_ctx = typed.context("vdbe register allocation");
         let error: anyhow::Error = with_inner_ctx.context("ingest_batch_with_semantic_delta");
 
@@ -32018,16 +32017,17 @@ mod tests {
                         created_at UNINDEXED,
                         message_id UNINDEXED,
                         tokenize='porter'
-                    )",
+                    )", &[],
                 )
                 .unwrap();
         }
         assert!(
             storage
                 .raw()
-                .query("SELECT rowid FROM fts_messages LIMIT 1")
+                .query_all_map("SELECT rowid FROM fts_messages LIMIT 1", &[], |row| row
+                    .get_value(0))
                 .is_ok(),
-            "fts_messages should remain queryable via frankensqlite in tests"
+            "fts_messages should remain queryable via storage::api in tests"
         );
     }
 
@@ -35741,13 +35741,13 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("legacy-canonical.db");
         let db_path_str = db_path.to_string_lossy().into_owned();
-        let conn = frankensqlite::Connection::open(db_path_str).unwrap();
-        conn.execute_compat(
+        let conn = crate::storage::api::Conn::open_writable(std::path::Path::new(&db_path_str), crate::storage::api::Profile::Production).unwrap();
+        conn.execute(
             "CREATE TABLE conversations (id INTEGER PRIMARY KEY, source_path TEXT NOT NULL)",
             &[] as &[ParamValue],
         )
         .unwrap();
-        conn.execute_compat(
+        conn.execute(
             "CREATE TABLE messages (
                 id INTEGER PRIMARY KEY,
                 conversation_id INTEGER NOT NULL,
@@ -35761,13 +35761,13 @@ mod tests {
             &[] as &[ParamValue],
         )
         .unwrap();
-        conn.execute_compat(
+        conn.execute(
             "CREATE INDEX idx_messages_conv_idx ON messages(conversation_id, idx)",
             &[] as &[ParamValue],
         )
         .unwrap();
         for conversation_id in 1..=130 {
-            conn.execute_compat(
+            conn.execute(
                 "INSERT INTO conversations(id, source_path) VALUES (?1, ?2)",
                 &[
                     ParamValue::from(i64::from(conversation_id)),
@@ -35775,7 +35775,7 @@ mod tests {
                 ],
             )
             .unwrap();
-            conn.execute_compat(
+            conn.execute(
                 "INSERT INTO messages(conversation_id, idx, role, content)
                  VALUES (?1, 0, 'user', ?2)",
                 &[
@@ -35845,8 +35845,8 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("sparse-tail-canonical.db");
         let db_path_str = db_path.to_string_lossy().into_owned();
-        let conn = frankensqlite::Connection::open(db_path_str).unwrap();
-        conn.execute_compat(
+        let conn = crate::storage::api::Conn::open_writable(std::path::Path::new(&db_path_str), crate::storage::api::Profile::Production).unwrap();
+        conn.execute(
             "CREATE TABLE conversations (
                 id INTEGER PRIMARY KEY,
                 source_path TEXT NOT NULL,
@@ -35855,7 +35855,7 @@ mod tests {
             &[] as &[ParamValue],
         )
         .unwrap();
-        conn.execute_compat(
+        conn.execute(
             "CREATE TABLE messages (
                 id INTEGER PRIMARY KEY,
                 conversation_id INTEGER NOT NULL,
@@ -35869,12 +35869,12 @@ mod tests {
             &[] as &[ParamValue],
         )
         .unwrap();
-        conn.execute_compat(
+        conn.execute(
             "CREATE INDEX idx_messages_conv_idx ON messages(conversation_id, idx)",
             &[] as &[ParamValue],
         )
         .unwrap();
-        conn.execute_compat(
+        conn.execute(
             "CREATE TABLE conversation_tail_state (
                 conversation_id INTEGER PRIMARY KEY,
                 ended_at INTEGER,
@@ -35886,7 +35886,7 @@ mod tests {
         .unwrap();
         for conversation_id in 1..=130 {
             if conversation_id == 1 {
-                conn.execute_compat(
+                conn.execute(
                     "INSERT INTO conversations(id, source_path, last_message_idx)
                      VALUES (?1, ?2, 0)",
                     &[
@@ -35896,7 +35896,7 @@ mod tests {
                 )
                 .unwrap();
             } else {
-                conn.execute_compat(
+                conn.execute(
                     "INSERT INTO conversations(id, source_path, last_message_idx)
                      VALUES (?1, ?2, NULL)",
                     &[
@@ -35906,7 +35906,7 @@ mod tests {
                 )
                 .unwrap();
             }
-            conn.execute_compat(
+            conn.execute(
                 "INSERT INTO messages(conversation_id, idx, role, content)
                  VALUES (?1, 0, 'user', ?2)",
                 &[
@@ -35915,7 +35915,7 @@ mod tests {
                 ],
             )
             .unwrap();
-            conn.execute_compat(
+            conn.execute(
                 "INSERT INTO conversation_tail_state(conversation_id, last_message_idx)
                  VALUES (?1, 0)",
                 &[ParamValue::from(i64::from(conversation_id + 1_000))],
@@ -39770,8 +39770,11 @@ mod tests {
             "DB file should still exist after checkpoint"
         );
         // A fresh connection can open and query it.
-        let conn = frankensqlite::Connection::open(db_path.to_string_lossy().into_owned())?;
-        let _ = conn.query("PRAGMA quick_check;");
+        let conn = crate::storage::api::Conn::open_writable(
+            &db_path,
+            crate::storage::api::Profile::Production,
+        )?;
+        let _ = conn.query_all_map("PRAGMA quick_check;", &[], |row| row.get_value(0));
         conn.close().ok();
         Ok(())
     }
@@ -40500,11 +40503,11 @@ mod tests {
         )
         .unwrap();
 
-        let rows = storage.raw().query("PRAGMA wal_autocheckpoint;").unwrap();
+        let rows = storage.raw().query_all_map("PRAGMA wal_autocheckpoint;", &[], |row| row.get_value(0)).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0].get(0).unwrap(),
-            &SqliteValue::Integer(persist::BULK_IMPORT_WAL_AUTOCHECKPOINT_PAGES)
+            rows[0],
+            SqliteValue::Integer(persist::BULK_IMPORT_WAL_AUTOCHECKPOINT_PAGES)
         );
 
         let second = vec![norm_conv(Some("checkpoint-b"), vec![norm_msg(0, 2_000)])];
@@ -40519,9 +40522,9 @@ mod tests {
         )
         .unwrap();
 
-        let rows = storage.raw().query("PRAGMA wal_autocheckpoint;").unwrap();
+        let rows = storage.raw().query_all_map("PRAGMA wal_autocheckpoint;", &[], |row| row.get_value(0)).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(1000));
+        assert_eq!(rows[0], SqliteValue::Integer(1000));
     }
 
     #[test]
@@ -40537,18 +40540,18 @@ mod tests {
         persist::apply_index_writer_checkpoint_policy(&storage, true);
         restore_watch_steady_state_checkpoint_policy(&storage, true);
 
-        let rows = storage.raw().query("PRAGMA wal_autocheckpoint;").unwrap();
+        let rows = storage.raw().query_all_map("PRAGMA wal_autocheckpoint;", &[], |row| row.get_value(0)).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(1000));
+        assert_eq!(rows[0], SqliteValue::Integer(1000));
 
         persist::apply_index_writer_checkpoint_policy(&storage, true);
         restore_watch_steady_state_checkpoint_policy(&storage, false);
 
-        let rows = storage.raw().query("PRAGMA wal_autocheckpoint;").unwrap();
+        let rows = storage.raw().query_all_map("PRAGMA wal_autocheckpoint;", &[], |row| row.get_value(0)).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0].get(0).unwrap(),
-            &SqliteValue::Integer(persist::BULK_IMPORT_WAL_AUTOCHECKPOINT_PAGES)
+            rows[0],
+            SqliteValue::Integer(persist::BULK_IMPORT_WAL_AUTOCHECKPOINT_PAGES)
         );
     }
 
@@ -40562,18 +40565,18 @@ mod tests {
         ensure_fts_schema(&storage);
 
         persist::apply_index_writer_checkpoint_policy(&storage, true);
-        let rows = storage.raw().query("PRAGMA wal_autocheckpoint;").unwrap();
+        let rows = storage.raw().query_all_map("PRAGMA wal_autocheckpoint;", &[], |row| row.get_value(0)).unwrap();
         assert_eq!(
-            rows[0].get(0).unwrap(),
-            &SqliteValue::Integer(persist::BULK_IMPORT_WAL_AUTOCHECKPOINT_PAGES)
+            rows[0],
+            SqliteValue::Integer(persist::BULK_IMPORT_WAL_AUTOCHECKPOINT_PAGES)
         );
 
         prepare_storage_for_final_checkpoint(&storage, &db_path, "test index close");
 
-        let rows = storage.raw().query("PRAGMA wal_autocheckpoint;").unwrap();
+        let rows = storage.raw().query_all_map("PRAGMA wal_autocheckpoint;", &[], |row| row.get_value(0)).unwrap();
         assert_eq!(
-            rows[0].get(0).unwrap(),
-            &SqliteValue::Integer(1000),
+            rows[0],
+            SqliteValue::Integer(1000),
             "final close should restore bounded auto-checkpoint policy after deferred bulk ingest"
         );
         assert_eq!(storage.index_writer_checkpoint_pages(), Some(1000));
@@ -40587,25 +40590,31 @@ mod tests {
         let db_path = tmp.path().join("final-close-checkpoints.db");
         let db_path_str = db_path.to_string_lossy().to_string();
         let storage = FrankenStorage::open(&db_path).unwrap();
-        storage.raw().execute("PRAGMA journal_mode = WAL;").unwrap();
+        storage.raw().execute("PRAGMA journal_mode = WAL;", &[]).unwrap();
         storage
             .raw()
-            .execute("CREATE TABLE checkpoint_probe (x INTEGER);")
+            .execute("CREATE TABLE checkpoint_probe (x INTEGER);", &[])
             .unwrap();
         persist::apply_index_writer_checkpoint_policy(&storage, true);
         storage
             .raw()
-            .execute("INSERT INTO checkpoint_probe VALUES (42);")
+            .execute("INSERT INTO checkpoint_probe VALUES (42);", &[])
             .unwrap();
 
         close_storage_after_index(storage, &db_path, "test index run").unwrap();
 
-        let conn = frankensqlite::Connection::open(db_path_str).unwrap();
-        let rows = conn.query("PRAGMA wal_checkpoint(FULL);").unwrap();
+        let conn = crate::storage::api::Conn::open_writable(
+            std::path::Path::new(&db_path_str),
+            crate::storage::api::Profile::Production,
+        )
+        .unwrap();
+        let rows = conn
+            .query_all_map("PRAGMA wal_checkpoint(FULL);", &[], |row| row.get_value(2))
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0].get(2).unwrap(),
-            &SqliteValue::Integer(0),
+            rows[0],
+            SqliteValue::Integer(0),
             "normal index close should already have checkpointed deferred WAL frames"
         );
         conn.close().unwrap();
@@ -40698,10 +40707,10 @@ mod tests {
         // Ordering: external_ids must appear in the DB in the order they
         // were sent on the channel. The combine path concatenates, so
         // this is only true if the drain preserves FIFO semantics.
-        use frankensqlite::compat::{ConnectionExt, RowExt};
+
         let external_ids: Vec<String> = storage
             .raw()
-            .query_map_collect(
+            .query_all_map(
                 "SELECT external_id FROM conversations WHERE external_id IS NOT NULL ORDER BY id",
                 &[],
                 |row| row.get_typed(0),
@@ -40789,7 +40798,6 @@ mod tests {
             )
             .unwrap();
 
-            use frankensqlite::compat::{ConnectionExt, RowExt};
             let conv_count: i64 = storage
                 .raw()
                 .query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| {
@@ -40802,7 +40810,7 @@ mod tests {
                 .unwrap();
             let rows: Vec<(String, i64)> = storage
                 .raw()
-                .query_map_collect(
+                .query_all_map(
                     "SELECT external_id, started_at FROM conversations ORDER BY id",
                     &[],
                     |row| {
@@ -41625,7 +41633,7 @@ mod tests {
             let storage = FrankenStorage::open(&db_path).unwrap();
             storage
                 .raw()
-                .execute_compat(
+                .execute(
                     "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?1)",
                     &[ParamValue::from(format!(
                         "{}",
@@ -41827,7 +41835,7 @@ mod tests {
         let storage = FrankenStorage::open(&db_path).unwrap();
         storage
             .raw()
-            .execute("DROP TABLE messages")
+            .execute("DROP TABLE messages", &[])
             .expect("drop messages to simulate current-schema archive damage");
 
         let problem = full_rebuild_existing_storage_integrity_problem(&storage)
@@ -41862,7 +41870,7 @@ mod tests {
         let storage = FrankenStorage::open(&db_path).unwrap();
         storage
             .raw()
-            .execute_compat(
+            .execute(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?1)",
                 &[ParamValue::from(format!(
                     "{}",
@@ -41884,7 +41892,7 @@ mod tests {
             let storage = FrankenStorage::open(&db_path).unwrap();
             storage
                 .raw()
-                .execute("DROP TABLE _schema_migrations")
+                .execute("DROP TABLE _schema_migrations", &[])
                 .unwrap();
         }
 
@@ -41901,7 +41909,8 @@ mod tests {
         assert!(
             storage
                 .raw()
-                .query("SELECT version FROM _schema_migrations LIMIT 1;")
+                .query_all_map("SELECT version FROM _schema_migrations LIMIT 1;", &[], |row| row
+                    .get_value(0))
                 .is_ok()
         );
     }
@@ -41967,7 +41976,7 @@ mod tests {
 
         storage
             .raw()
-            .execute_compat(
+            .execute(
                 "INSERT INTO daily_stats(day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
                  VALUES(?1, ?2, ?3, 1, 1, 10, ?4)",
                 &[
@@ -41980,7 +41989,7 @@ mod tests {
             .unwrap();
         storage
             .raw()
-            .execute_compat(
+            .execute(
                 "INSERT INTO usage_daily(day_id, agent_slug, workspace_id, source_id, message_count, last_updated)
                  VALUES(?1, ?2, ?3, ?4, 1, ?5)",
                 &[
@@ -42079,12 +42088,12 @@ mod tests {
             .insert_conversations_batched(&[(agent_id, None, &conversation)])
             .unwrap();
 
-        storage.raw().execute("DELETE FROM daily_stats").unwrap();
+        storage.raw().execute("DELETE FROM daily_stats", &[]).unwrap();
         storage
             .raw()
             .execute(
                 "INSERT INTO daily_stats(day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
-                 VALUES(0, 'all', 'all', 99, 99, 99, 0)",
+                 VALUES(0, 'all', 'all', 99, 99, 99, 0)", &[],
             )
             .unwrap();
 
@@ -42148,12 +42157,12 @@ mod tests {
         storage
             .insert_conversations_batched(&[(agent_id, None, &conversation)])
             .unwrap();
-        storage.raw().execute("DELETE FROM daily_stats").unwrap();
+        storage.raw().execute("DELETE FROM daily_stats", &[]).unwrap();
         storage
             .raw()
             .execute(
                 "INSERT INTO daily_stats(day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
-                 VALUES(0, 'all', 'all', 99, 99, 99, 0)",
+                 VALUES(0, 'all', 'all', 99, 99, 99, 0)", &[],
             )
             .unwrap();
 
@@ -42177,7 +42186,7 @@ mod tests {
         ) -> Vec<(i64, String, String, i64, i64, i64)> {
             storage
                 .raw()
-                .query_map_collect(
+                .query_all_map(
                     "SELECT day_id, agent_slug, source_id, session_count, message_count, total_chars
                      FROM daily_stats
                      ORDER BY day_id, agent_slug, source_id",
@@ -42318,11 +42327,11 @@ mod tests {
             ])
             .unwrap();
 
-        storage.raw().execute("DELETE FROM daily_stats").unwrap();
+        storage.raw().execute("DELETE FROM daily_stats", &[]).unwrap();
         let expected_rebuild = storage.rebuild_daily_stats().unwrap();
         let expected_rows = load_daily_stats_rows(&storage);
 
-        storage.raw().execute("DELETE FROM daily_stats").unwrap();
+        storage.raw().execute("DELETE FROM daily_stats", &[]).unwrap();
         assert_eq!(
             repair_daily_stats_if_drifted(&storage, &db_path, None).unwrap(),
             DailyStatsRepairOutcome::Rebuilt {
@@ -42829,8 +42838,8 @@ mod tests {
         // feature dependency. Opens a FrankenConnection directly against
         // the file written by SqliteStorage above.
         let canonical_db_path = canonical_db.to_string_lossy().to_string();
-        let conn = frankensqlite::Connection::open(canonical_db_path).unwrap();
-        conn.execute_compat(
+        let conn = crate::storage::api::Conn::open_writable(std::path::Path::new(&canonical_db_path), crate::storage::api::Profile::Production).unwrap();
+        conn.execute(
             "INSERT INTO meta(key, value) VALUES(?1, ?2)",
             &[
                 ParamValue::from("historical_bundle_salvaged:test"),
@@ -42914,7 +42923,7 @@ mod tests {
         let storage = FrankenStorage::open(&canonical_db).unwrap();
         storage
             .raw()
-            .execute_compat(
+            .execute(
                 "INSERT INTO meta(key, value) VALUES(?1, ?2)",
                 &[
                     ParamValue::from("historical_bundle_progress:test"),
