@@ -43,20 +43,33 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use frankensqlite::Connection;
-#[cfg(test)]
-use frankensqlite::compat::OptionalExtension;
-use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
-#[cfg(test)]
-use frankensqlite::params;
+use crate::storage::api::{Conn as Connection, Row as FrankenRow, StorageError};
+type ParamValue = crate::storage::api::Value;
 
-/// Wrapper around `frankensqlite::Connection` that implements `Send`.
+/// Test-only parameter list builder (Task A6 batch: mirrors sqlite.rs's
+/// `fparams!` shim): delegates to `storage::api::params!`, but produces a
+/// borrowed `&[ParamValue]` (the old native `params!` macro's call sites here
+/// passed their expansion straight into `execute_compat`/`query_row_map` by
+/// value; the api facade's `execute`/`query_row_map` take `&[Value]`) and
+/// supports the zero-arg case the api macro doesn't.
+#[cfg(test)]
+macro_rules! fparams {
+    () => {
+        &[] as &[ParamValue]
+    };
+    ($($val:expr),+ $(,)?) => {
+        &crate::storage::api::params![$($val),+] as &[ParamValue]
+    };
+}
+
+/// Wrapper around the `storage::api` `Connection` (Task A4a: backed by
+/// frankensqlite in Stage A) that implements `Send`.
 ///
-/// `frankensqlite::Connection` is `!Send` because it uses `Rc` internally.
-/// However, the `Rc` values are entirely self-contained within the Connection
-/// and are not shared with any external references.  When wrapped in a `Mutex`
-/// (as in `SearchClient`), exclusive access is guaranteed, making cross-thread
-/// transfer safe.
+/// The native frankensqlite connection this wraps is `!Send` because it uses
+/// `Rc` internally. However, the `Rc` values are entirely self-contained
+/// within the connection and are not shared with any external references.
+/// When wrapped in a `Mutex` (as in `SearchClient`), exclusive access is
+/// guaranteed, making cross-thread transfer safe.
 struct SendConnection(Connection);
 
 type TantivyContentExactKey = (i64, i64);
@@ -137,13 +150,14 @@ impl std::ops::Deref for SendConnection {
 fn open_search_hydration_sqlite(path: &Path, timeout: Duration) -> Result<Connection> {
     let conn =
         crate::storage::sqlite::open_franken_raw_readonly_connection_with_timeout(path, timeout)?;
-    conn.execute("PRAGMA query_only = 1;")
+    conn.execute("PRAGMA query_only = 1;", &[])
         .with_context(|| "setting search hydration query_only")?;
-    conn.execute("PRAGMA busy_timeout = 5000;")
+    conn.execute("PRAGMA busy_timeout = 5000;", &[])
         .with_context(|| "setting search hydration busy_timeout")?;
-    conn.execute(&format!(
-        "PRAGMA cache_size = -{SEARCH_SQLITE_HYDRATION_CACHE_KIB};"
-    ))
+    conn.execute(
+        &format!("PRAGMA cache_size = -{SEARCH_SQLITE_HYDRATION_CACHE_KIB};"),
+        &[],
+    )
     .with_context(|| "setting search hydration cache_size")?;
     Ok(conn)
 }
@@ -162,14 +176,14 @@ fn franken_query_map_collect_retry<T, F>(
     sql: &str,
     params: &[ParamValue],
     map: F,
-) -> Result<Vec<T>, frankensqlite::FrankenError>
+) -> Result<Vec<T>, StorageError>
 where
-    F: Copy + Fn(&frankensqlite::Row) -> Result<T, frankensqlite::FrankenError>,
+    F: Copy + Fn(&FrankenRow) -> Result<T, StorageError>,
 {
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut backoff = Duration::from_millis(4);
     loop {
-        match conn.query_map_collect(sql, params, |row| map(row)) {
+        match conn.query_all_map(sql, params, |row| map(row)) {
             Ok(values) => return Ok(values),
             Err(err) if crate::storage::sqlite::retryable_franken_error(&err) => {
                 let now = Instant::now();
@@ -4780,7 +4794,7 @@ impl SearchClient {
             }
 
             let chunk_rows: Vec<ResolvedSemanticLookupRow> =
-                conn.query_map_collect(&sql, &params, |row: &frankensqlite::Row| {
+                conn.query_all_map(&sql, &params, |row: &FrankenRow| {
                     let conversation_id: i64 = row.get_typed(0)?;
                     let source_id: String = row.get_typed(1)?;
                     let source_path: String = row.get_typed(2)?;
@@ -4800,8 +4814,9 @@ impl SearchClient {
                         return Ok(None);
                     }
 
-                    let message_id = u64::try_from(message_id_raw).map_err(|_| {
-                        std::io::Error::other("message id out of range for progressive doc_id")
+                    let message_id = u64::try_from(message_id_raw).map_err(|_| StorageError::Other {
+                        code: None,
+                        detail: "message id out of range for progressive doc_id".to_string(),
                     })?;
                     let agent_id = semantic_doc_component_id_from_db(agent_id_raw);
                     let workspace_id = semantic_doc_component_id_from_db(workspace_id_raw);
@@ -4865,7 +4880,7 @@ impl SearchClient {
             }
 
             let chunk_rows: Vec<ResolvedSemanticLookupRow> =
-                conn.query_map_collect(&sql, &params, |row: &frankensqlite::Row| {
+                conn.query_all_map(&sql, &params, |row: &FrankenRow| {
                     let source_id: String = row.get_typed(0)?;
                     let source_path: String = row.get_typed(1)?;
                     let idx: i64 = row.get_typed(2)?;
@@ -4884,8 +4899,9 @@ impl SearchClient {
                         return Ok(None);
                     }
 
-                    let message_id = u64::try_from(message_id_raw).map_err(|_| {
-                        std::io::Error::other("message id out of range for progressive doc_id")
+                    let message_id = u64::try_from(message_id_raw).map_err(|_| StorageError::Other {
+                        code: None,
+                        detail: "message id out of range for progressive doc_id".to_string(),
                     })?;
                     let agent_id = semantic_doc_component_id_from_db(agent_id_raw);
                     let workspace_id = semantic_doc_component_id_from_db(workspace_id_raw);
@@ -4934,10 +4950,10 @@ impl SearchClient {
         let conn = sqlite_guard
             .as_ref()
             .ok_or_else(|| anyhow!("progressive search requires database connection"))?;
-        let rows: Vec<String> = conn.query_map_collect(
+        let rows: Vec<String> = conn.query_all_map(
             "SELECT content FROM messages WHERE id = ?",
             &[ParamValue::from(i64::try_from(message_id)?)],
-            |row: &frankensqlite::Row| row.get_typed(0),
+            |row: &FrankenRow| row.get_typed(0),
         )?;
         Ok(rows.into_iter().next())
     }
@@ -5041,10 +5057,12 @@ impl SearchClient {
         );
 
         let message_rows: Vec<MessageHydrationRow> =
-            conn.query_map_collect(&message_sql, &message_params, |row: &frankensqlite::Row| {
+            conn.query_all_map(&message_sql, &message_params, |row: &FrankenRow| {
                 let message_id: i64 = row.get_typed(0)?;
                 Ok(MessageHydrationRow {
-                    message_id: semantic_message_id_from_db(message_id)?,
+                    message_id: semantic_message_id_from_db(message_id).map_err(|e| {
+                        StorageError::Other { code: None, detail: e.to_string() }
+                    })?,
                     conversation_id: row.get_typed(1)?,
                     full_content: row.get_typed(2)?,
                     msg_created_at: row.get_typed(3)?,
@@ -5095,7 +5113,7 @@ impl SearchClient {
         );
 
         let conversation_rows: Vec<(i64, ConversationHydrationRow)> =
-            conn.query_map_collect(&sql, &conversation_params, |row: &frankensqlite::Row| {
+            conn.query_all_map(&sql, &conversation_params, |row: &FrankenRow| {
                 let conversation_id: i64 = row.get_typed(0)?;
                 let title: Option<String> = if field_mask.wants_title() {
                     row.get_typed(1)?
@@ -6051,7 +6069,7 @@ impl SearchClient {
         if filters.agents.is_empty()
             && let Ok(sqlite_guard) = self.sqlite.lock()
             && let Some(conn) = sqlite_guard.as_ref()
-            && let Ok(rows) = conn.query_map_collect(
+            && let Ok(rows) = conn.query_all_map(
                 "SELECT a.slug
                  FROM conversations c
                  JOIN agents a ON c.agent_id = a.id
@@ -6059,7 +6077,7 @@ impl SearchClient {
                  ORDER BY MAX(c.id) DESC
                  LIMIT 3",
                 &[],
-                |row: &frankensqlite::Row| row.get_typed::<String>(0),
+                |row: &FrankenRow| row.get_typed::<String>(0),
             )
         {
             for row in rows {
@@ -6684,7 +6702,7 @@ impl SearchClient {
              ORDER BY rowid DESC
              LIMIT 1",
             &params,
-            |row: &frankensqlite::Row| row.get_typed::<String>(0),
+            |row: &FrankenRow| row.get_typed::<String>(0),
         )?;
         Ok(ddl_rows
             .first()
@@ -6698,7 +6716,7 @@ impl SearchClient {
             conn,
             "SELECT COUNT(*) FROM fts_messages WHERE fts_messages MATCH ?",
             &params,
-            |row: &frankensqlite::Row| row.get_typed::<i64>(0),
+            |row: &FrankenRow| row.get_typed::<i64>(0),
         ) {
             Ok(_) => Ok(SqliteFtsMatchMode::Table),
             Err(err)
@@ -6718,7 +6736,7 @@ impl SearchClient {
             conn,
             "SELECT rowid FROM fts_messages LIMIT 1",
             &params,
-            |row: &frankensqlite::Row| row.get_typed::<i64>(0),
+            |row: &FrankenRow| row.get_typed::<i64>(0),
         )
         .is_ok()
     }
@@ -7736,7 +7754,7 @@ impl SearchClient {
         params.push(ParamValue::from(offset as i64));
 
         let rows: Vec<SearchHit> =
-            conn.query_map_collect(&sql, &params, |row: &frankensqlite::Row| {
+            conn.query_all_map(&sql, &params, |row: &FrankenRow| {
                 let conversation_id: i64 = row.get_typed(0)?;
                 let title: String = if field_mask.wants_title() {
                     row.get_typed::<Option<String>>(1)?.unwrap_or_default()
@@ -8713,9 +8731,8 @@ mod tests {
     use crate::connectors::{NormalizedConversation, NormalizedMessage, NormalizedSnippet};
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
     use crate::search::tantivy::TantivyIndex;
+    use crate::storage::api::Profile;
     use crate::storage::sqlite::FrankenStorage;
-    use frankensqlite::Connection as FrankenConnection;
-    use frankensqlite::compat::ParamValue;
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -9513,13 +9530,13 @@ mod tests {
             storage.insert_conversation_tree(agent_id, Some(workspace_id), &conversation)?;
         }
 
-        let message_rows: Vec<(u64, i64)> = storage.raw().query_map_collect(
+        let message_rows: Vec<(u64, i64)> = storage.raw().query_all_map(
             "SELECT m.id, COALESCE(m.created_at, c.started_at, 0)
              FROM messages m
              JOIN conversations c ON m.conversation_id = c.id
              ORDER BY c.id",
             &[],
-            |row: &frankensqlite::Row| {
+            |row: &FrankenRow| {
                 let message_id: i64 = row.get_typed(0)?;
                 let created_at: i64 = row.get_typed(1)?;
                 Ok((u64::try_from(message_id).unwrap_or(u64::MAX), created_at))
@@ -9608,7 +9625,7 @@ mod tests {
         let workspace_id = 1_i64;
         let source_id = crate::sources::provenance::LOCAL_SOURCE_ID;
         let source_hash = crc32fast::hash(source_id.as_bytes());
-        let conn = Connection::open(":memory:")?;
+        let conn = Connection::open_memory()?;
         conn.execute_batch(
             r#"
             CREATE TABLE agents (
@@ -9643,17 +9660,17 @@ mod tests {
             );
             "#,
         )?;
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO agents (id, slug) VALUES (?1, ?2)",
-            params![agent_id, "codex"],
+            fparams![agent_id, "codex"],
         )?;
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO workspaces (id, path) VALUES (?1, ?2)",
-            params![workspace_id, workspace_path.to_string_lossy().to_string()],
+            fparams![workspace_id, workspace_path.to_string_lossy().to_string()],
         )?;
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO sources (id, kind) VALUES (?1, ?2)",
-            params![source_id, "local"],
+            fparams![source_id, "local"],
         )?;
 
         let query = "oauth refresh token middleware session cache".to_string();
@@ -9688,11 +9705,11 @@ mod tests {
             let source_path_str = source_path.to_string_lossy().to_string();
             let title = format!("progressive fixture {idx}");
 
-            conn.execute_compat(
+            conn.execute(
                 "INSERT INTO conversations (
                     id, agent_id, workspace_id, title, source_path, source_id, origin_host, started_at
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)",
-                params![
+                fparams![
                     conversation_id,
                     agent_id,
                     workspace_id,
@@ -9702,11 +9719,11 @@ mod tests {
                     created_at
                 ],
             )?;
-            conn.execute_compat(
+            conn.execute(
                 "INSERT INTO messages (
                     id, conversation_id, idx, role, created_at, content
                  ) VALUES (?1, ?2, 0, 'user', ?3, ?4)",
-                params![
+                fparams![
                     i64::try_from(message_id)?,
                     conversation_id,
                     created_at,
@@ -9838,7 +9855,7 @@ mod tests {
     }
 
     fn sqlite_master_name_count(db_path: &Path, name: &str) -> Result<i64> {
-        let conn = FrankenConnection::open(db_path.to_string_lossy().as_ref())?;
+        let conn = Connection::open_read(db_path)?;
         Ok(conn.query_row_map(
             "SELECT COUNT(*) FROM sqlite_master WHERE name = ?1",
             &[ParamValue::from(name)],
@@ -11246,7 +11263,7 @@ mod tests {
     #[test]
     fn sqlite_backend_skips_wildcard_queries() -> Result<()> {
         // Build a client with SQLite only; wildcard queries should short-circuit without errors.
-        let conn = Connection::open(":memory:")?;
+        let conn = Connection::open_memory()?;
         let client = SearchClient {
             reader: None,
             sqlite: Mutex::new(Some(SendConnection(conn))),
@@ -11275,7 +11292,7 @@ mod tests {
 
     #[test]
     fn sqlite_backend_handles_null_workspace() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = Connection::open_memory()?;
         conn.execute_batch(
             "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
              CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
@@ -11307,16 +11324,16 @@ mod tests {
                 tokenize='porter'
              );",
         )?;
-        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')")?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
+        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')", &[])?;
+        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
         conn.execute(
             "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path) VALUES(1, 1, NULL, 'local', NULL, 't', '/tmp/session.jsonl')",
-        )?;
-        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(1, 1, 0, 'auth token failure', 42)")?;
-        conn.execute_compat(
+        &[])?;
+        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(1, 1, 0, 'auth token failure', 42)", &[])?;
+        conn.execute(
             "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
              VALUES(?1, ?2, ?3, ?4, NULL, ?5, ?6)",
-            params![
+            fparams![
                 1_i64,
                 "auth token failure",
                 "t",
@@ -11354,7 +11371,7 @@ mod tests {
 
     #[test]
     fn sqlite_backend_supports_legacy_fts_message_id_schema() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = Connection::open_memory()?;
         conn.execute_batch(
             "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
              CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
@@ -11386,21 +11403,21 @@ mod tests {
                 tokenize='porter'
              );",
         )?;
-        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')")?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
-        conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/legacy')")?;
+        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')", &[])?;
+        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
+        conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/legacy')", &[])?;
         conn.execute(
             "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
              VALUES(1, 1, 1, 'local', NULL, 'legacy title', '/tmp/legacy.jsonl')",
-        )?;
+        &[])?;
         conn.execute(
             "INSERT INTO messages(id, conversation_id, idx, content, created_at)
              VALUES(42, 1, 4, 'legacy auth token failure', 99)",
-        )?;
-        conn.execute_compat(
+        &[])?;
+        conn.execute(
             "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at, message_id)
              VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
+            fparams![
                 1_i64,
                 "legacy auth token failure",
                 "legacy title",
@@ -11450,7 +11467,7 @@ mod tests {
             "test fixture should open a Tantivy reader even with an empty index"
         );
 
-        let conn = Connection::open(":memory:")?;
+        let conn = Connection::open_memory()?;
         conn.execute_batch(
             "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
              CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
@@ -11482,21 +11499,21 @@ mod tests {
                 tokenize='porter'
              );",
         )?;
-        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')")?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
-        conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/sqlite-only')")?;
+        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')", &[])?;
+        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
+        conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/sqlite-only')", &[])?;
         conn.execute(
             "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
              VALUES(1, 1, 1, 'local', NULL, 'sqlite fallback only', '/tmp/sqlite-only.jsonl')",
-        )?;
+        &[])?;
         conn.execute(
             "INSERT INTO messages(id, conversation_id, idx, content, created_at)
              VALUES(1, 1, 0, 'sqliteonlytoken overflow candidate', 42)",
-        )?;
-        conn.execute_compat(
+        &[])?;
+        conn.execute(
             "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
              VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
+            fparams![
                 1_i64,
                 "sqliteonlytoken overflow candidate",
                 "sqlite fallback only",
@@ -11602,8 +11619,8 @@ mod tests {
         // This is the condition ensure_fts_consistency_via_frankensqlite
         // detects to trigger a full FTS rebuild.
         {
-            let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned())?;
-            conn.execute_compat(
+            let conn = Connection::open_writable(&db_path, Profile::Production)?;
+            conn.execute(
                 "DELETE FROM meta WHERE key = ?1",
                 &[ParamValue::from("fts_frankensqlite_rebuild_generation")],
             )?;
@@ -11645,14 +11662,12 @@ mod tests {
         drop(guard);
 
         // The read-only open must not rewrite the rebuild-generation marker.
-        let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned())?;
-        let generation_after: Option<String> = conn
-            .query_row_map(
-                "SELECT value FROM meta WHERE key = ?1",
-                &[ParamValue::from("fts_frankensqlite_rebuild_generation")],
-                |row| row.get_typed(0),
-            )
-            .optional()?;
+        let conn = Connection::open_writable(&db_path, Profile::Production)?;
+        let generation_after: Option<String> = conn.query_opt_map(
+            "SELECT value FROM meta WHERE key = ?1",
+            &[ParamValue::from("fts_frankensqlite_rebuild_generation")],
+            |row| row.get_typed(0),
+        )?;
         assert!(
             generation_after.is_none(),
             "search sqlite guard must not mutate FTS rebuild metadata"
@@ -11671,7 +11686,7 @@ mod tests {
 
     #[test]
     fn sqlite_path_rusqlite_fallback_matches_hyphenated_ids_with_workspace_filter() -> Result<()> {
-        fn fts_match_count(conn: &FrankenConnection, fts_query: &str) -> Result<Option<usize>> {
+        fn fts_match_count(conn: &Connection, fts_query: &str) -> Result<Option<usize>> {
             let match_mode = SearchClient::sqlite_fts_match_mode(conn)?;
             let sql = format!(
                 "SELECT COUNT(*) FROM fts_messages WHERE {}",
@@ -11701,26 +11716,31 @@ mod tests {
             conn.execute(
                 "INSERT INTO agents(id, slug, name, kind, created_at, updated_at)
                  VALUES(1, 'codex', 'Codex', 'codex', 1, 1)",
+                &[],
             )?;
-            conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/ws/alpha')")?;
-            conn.execute("INSERT INTO workspaces(id, path) VALUES(2, '/ws/beta')")?;
+            conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/ws/alpha')", &[])?;
+            conn.execute("INSERT INTO workspaces(id, path) VALUES(2, '/ws/beta')", &[])?;
             conn.execute(
                 "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
                  VALUES(1, 1, 1, 'local', NULL, 'alpha bead', '/tmp/alpha.jsonl')",
+                &[],
             )?;
             conn.execute(
                 "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
                  VALUES(2, 1, 2, 'local', NULL, 'beta bead', '/tmp/beta.jsonl')",
+                &[],
             )?;
             conn.execute(
                 "INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
                  VALUES(11, 1, 0, 'user', 'Need follow-up on br-123 root cause', 100)",
+                &[],
             )?;
             conn.execute(
                 "INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
                  VALUES(12, 2, 0, 'user', 'Need follow-up on br-123 user report', 101)",
+                &[],
             )?;
-            conn.execute_compat(
+            conn.execute(
                 "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
                  VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 &[
@@ -11733,7 +11753,7 @@ mod tests {
                     ParamValue::from(100_i64),
                 ],
             )?;
-            conn.execute_compat(
+            conn.execute(
                 "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
                  VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 &[
@@ -11747,7 +11767,7 @@ mod tests {
                 ],
             )?;
             let preclose_total_rows: i64 =
-                conn.query_row_map("SELECT COUNT(*) FROM fts_messages", params![], |row| {
+                conn.query_row_map("SELECT COUNT(*) FROM fts_messages", fparams![], |row| {
                     row.get_typed(0)
                 })?;
             assert_eq!(
@@ -11783,7 +11803,7 @@ mod tests {
         let guard = client.sqlite_guard()?;
         let conn = guard.as_ref().expect("sqlite guard should reopen file db");
         let reopened_total_rows: i64 =
-            conn.query_row_map("SELECT COUNT(*) FROM fts_messages", params![], |row| {
+            conn.query_row_map("SELECT COUNT(*) FROM fts_messages", fparams![], |row| {
                 row.get_typed(0)
             })?;
         assert_eq!(
@@ -11857,7 +11877,7 @@ mod tests {
 
     #[test]
     fn sqlite_backend_orders_hits_by_bm25_score() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = Connection::open_memory()?;
         conn.execute_batch(
             "CREATE TABLE conversations (
                 id INTEGER PRIMARY KEY,
@@ -11889,21 +11909,21 @@ mod tests {
                 tokenize='porter'
              );",
         )?;
-        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')")?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
-        conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/ws')")?;
+        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')", &[])?;
+        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
+        conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/ws')", &[])?;
         conn.execute(
             "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path) VALUES(1, 1, 1, 'local', NULL, 'best', '/tmp/best.jsonl')",
-        )?;
+        &[])?;
         conn.execute(
             "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path) VALUES(2, 1, 1, 'local', NULL, 'worse', '/tmp/worse.jsonl')",
-        )?;
-        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(7, 1, 0, 'auth auth auth failure', 42)")?;
-        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(8, 2, 0, 'auth failure', 43)")?;
-        conn.execute_compat(
+        &[])?;
+        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(7, 1, 0, 'auth auth auth failure', 42)", &[])?;
+        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(8, 2, 0, 'auth failure', 43)", &[])?;
+        conn.execute(
             "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
              VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
+            fparams![
                 7_i64,
                 "auth auth auth failure",
                 "best",
@@ -11913,10 +11933,10 @@ mod tests {
                 42_i64
             ],
         )?;
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
              VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
+            fparams![
                 8_i64,
                 "auth failure",
                 "worse",
@@ -12028,7 +12048,7 @@ mod tests {
     #[test]
     fn tantivy_fallback_hydration_narrows_by_normalized_source_before_message_lookup() -> Result<()>
     {
-        let conn = Connection::open(":memory:")?;
+        let conn = Connection::open_memory()?;
         conn.execute_batch(
             "CREATE TABLE conversations (
                 id INTEGER PRIMARY KEY,
@@ -12048,19 +12068,19 @@ mod tests {
         conn.execute(
             "INSERT INTO conversations(id, source_id, origin_host, source_path)
              VALUES(1, '', 'devbox', '/tmp/shared-fallback.jsonl')",
-        )?;
+        &[])?;
         conn.execute(
             "INSERT INTO conversations(id, source_id, origin_host, source_path)
              VALUES(2, 'local', NULL, '/tmp/shared-fallback.jsonl')",
-        )?;
+        &[])?;
         conn.execute(
             "INSERT INTO messages(id, conversation_id, idx, content)
              VALUES(10, 1, 2, 'remote fallback content')",
-        )?;
+        &[])?;
         conn.execute(
             "INSERT INTO messages(id, conversation_id, idx, content)
              VALUES(20, 2, 2, 'local content must not win')",
-        )?;
+        &[])?;
 
         let client = SearchClient {
             reader: None,
@@ -12097,7 +12117,7 @@ mod tests {
 
     #[test]
     fn exact_content_hydration_returns_only_requested_message_indices() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = Connection::open_memory()?;
         conn.execute_batch(
             "CREATE TABLE messages (
                 id INTEGER PRIMARY KEY,
@@ -12112,12 +12132,12 @@ mod tests {
             conn.execute(&format!(
                 "INSERT INTO messages(conversation_id, idx, content)
                  VALUES(1, {idx}, 'conversation one row {idx}')"
-            ))?;
+            ), &[])?;
         }
         conn.execute(
             "INSERT INTO messages(conversation_id, idx, content)
              VALUES(2, 0, 'conversation two row 0')",
-        )?;
+        &[])?;
 
         let hydrated =
             hydrate_message_content_by_conversation(&conn, &[(1, 6), (1, 2), (2, 0), (1, 99)])?;
@@ -12142,7 +12162,7 @@ mod tests {
 
     #[test]
     fn sqlite_backend_generates_snippet_from_content() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = Connection::open_memory()?;
         conn.execute_batch(
             "CREATE TABLE conversations (
                 id INTEGER PRIMARY KEY,
@@ -12174,17 +12194,17 @@ mod tests {
                 tokenize='porter'
              );",
         )?;
-        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')")?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
-        conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/ws')")?;
+        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')", &[])?;
+        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
+        conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/ws')", &[])?;
         conn.execute(
             "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path) VALUES(1, 1, 1, 'local', NULL, 'snippet title', '/tmp/snippet.jsonl')",
-        )?;
-        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(1, 1, 0, 'alpha beta gamma delta epsilon zeta eta theta', 42)")?;
-        conn.execute_compat(
+        &[])?;
+        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(1, 1, 0, 'alpha beta gamma delta epsilon zeta eta theta', 42)", &[])?;
+        conn.execute(
             "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
              VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
+            fparams![
                 1_i64,
                 "alpha beta gamma delta epsilon zeta eta theta",
                 "snippet title",
@@ -12223,7 +12243,7 @@ mod tests {
 
     #[test]
     fn sqlite_backend_respects_source_filter() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = Connection::open_memory()?;
         conn.execute_batch(
             "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
              CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
@@ -12255,21 +12275,21 @@ mod tests {
                 tokenize='porter'
              );",
         )?;
-        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')")?;
-        conn.execute("INSERT INTO sources(id, kind) VALUES('laptop', 'ssh')")?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
-        conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/local')")?;
-        conn.execute("INSERT INTO workspaces(id, path) VALUES(2, '/remote')")?;
+        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')", &[])?;
+        conn.execute("INSERT INTO sources(id, kind) VALUES('laptop', 'ssh')", &[])?;
+        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
+        conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/local')", &[])?;
+        conn.execute("INSERT INTO workspaces(id, path) VALUES(2, '/remote')", &[])?;
         conn.execute(
             "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path) VALUES(1, 1, 1, '  local  ', NULL, 'local title', '/tmp/local.jsonl')",
-        )?;
-        conn.execute("INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path) VALUES(2, 1, 2, 'laptop', 'dev@laptop', 'remote title', '/tmp/remote.jsonl')")?;
-        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(1, 1, 0, 'auth token failure', 42)")?;
-        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(2, 2, 0, 'auth token failure', 43)")?;
-        conn.execute_compat(
+        &[])?;
+        conn.execute("INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path) VALUES(2, 1, 2, 'laptop', 'dev@laptop', 'remote title', '/tmp/remote.jsonl')", &[])?;
+        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(1, 1, 0, 'auth token failure', 42)", &[])?;
+        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(2, 2, 0, 'auth token failure', 43)", &[])?;
+        conn.execute(
             "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
              VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
+            fparams![
                 1_i64,
                 "auth token failure",
                 "local title",
@@ -12279,10 +12299,10 @@ mod tests {
                 42_i64
             ],
         )?;
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
              VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
+            fparams![
                 2_i64,
                 "auth token failure",
                 "remote title",
@@ -12343,7 +12363,7 @@ mod tests {
     #[test]
     fn sqlite_backend_remote_source_filter_matches_blank_source_id_with_origin_host() -> Result<()>
     {
-        let conn = Connection::open(":memory:")?;
+        let conn = Connection::open_memory()?;
         conn.execute_batch(
             "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
              CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
@@ -12375,19 +12395,19 @@ mod tests {
                 tokenize='porter'
              );",
         )?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
+        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
         conn.execute(
             "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
              VALUES(1, 1, NULL, '   ', 'dev@laptop', 'remote title', '/tmp/remote-filter.jsonl')",
-        )?;
+        &[])?;
         conn.execute(
             "INSERT INTO messages(id, conversation_id, idx, content, created_at)
              VALUES(1, 1, 0, 'remote filter proof', 42)",
-        )?;
-        conn.execute_compat(
+        &[])?;
+        conn.execute(
             "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
              VALUES(?1, ?2, ?3, ?4, NULL, ?5, ?6)",
-            params![
+            fparams![
                 1_i64,
                 "remote filter proof",
                 "remote title",
@@ -12448,7 +12468,7 @@ mod tests {
 
     #[test]
     fn sqlite_backend_workspace_filter_matches_null_workspace_as_empty_string() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = Connection::open_memory()?;
         conn.execute_batch(
             "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
              CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
@@ -12480,23 +12500,23 @@ mod tests {
                 tokenize='porter'
              );",
         )?;
-        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')")?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
-        conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/named')")?;
+        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')", &[])?;
+        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
+        conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/named')", &[])?;
         // Conversation 1: no workspace (workspace_id=NULL)
         conn.execute(
             "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path) VALUES(1, 1, NULL, 'local', NULL, 'null workspace', '/tmp/null-workspace.jsonl')",
-        )?;
+        &[])?;
         // Conversation 2: with workspace
         conn.execute(
             "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path) VALUES(2, 1, 1, 'local', NULL, 'named workspace', '/tmp/named-workspace.jsonl')",
-        )?;
-        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(1, 1, 0, 'auth token failure', 42)")?;
-        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(2, 2, 0, 'auth token failure', 43)")?;
-        conn.execute_compat(
+        &[])?;
+        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(1, 1, 0, 'auth token failure', 42)", &[])?;
+        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(2, 2, 0, 'auth token failure', 43)", &[])?;
+        conn.execute(
             "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
              VALUES(?1, ?2, ?3, ?4, NULL, ?5, ?6)",
-            params![
+            fparams![
                 1_i64,
                 "auth token failure",
                 "null workspace",
@@ -12505,10 +12525,10 @@ mod tests {
                 42_i64
             ],
         )?;
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
              VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
+            fparams![
                 2_i64,
                 "auth token failure",
                 "named workspace",
@@ -12605,7 +12625,7 @@ mod tests {
 
     #[test]
     fn browse_by_date_treats_null_workspace_and_source_as_local() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = Connection::open_memory()?;
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
              CREATE TABLE conversations (
@@ -12627,15 +12647,15 @@ mod tests {
              );
              CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);",
         )?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
+        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
         conn.execute(
             "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
              VALUES(1, 1, NULL, NULL, NULL, 'browse title', '/tmp/browse.jsonl')",
-        )?;
+        &[])?;
         conn.execute(
             "INSERT INTO messages(id, conversation_id, idx, content, created_at)
              VALUES(1, 1, 0, 'browse auth token failure', 123)",
-        )?;
+        &[])?;
 
         let client = SearchClient {
             reader: None,
@@ -12676,7 +12696,7 @@ mod tests {
     #[test]
     fn hydrate_semantic_hits_with_ids_snippet_only_uses_full_content_for_snippets_and_identity()
     -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = Connection::open_memory()?;
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
              CREATE TABLE conversations (
@@ -12700,32 +12720,32 @@ mod tests {
              );
              CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);",
         )?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
+        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
         conn.execute(
             "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path, started_at)
              VALUES(1, 1, NULL, 'local', NULL, 'semantic title', '/tmp/semantic.jsonl', 100)",
-        )?;
+        &[])?;
         let shared_prefix = "shared-prefix ".repeat(32);
         let first = format!("{shared_prefix}first unique semantic tail");
         let second = format!("{shared_prefix}second unique semantic tail");
-        conn.execute_with_params(
+        conn.execute(
             "INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
              VALUES(?1, 1, ?2, 'assistant', ?3, ?4)",
             &[
-                fsqlite_types::value::SqliteValue::Integer(1),
-                fsqlite_types::value::SqliteValue::Integer(0),
-                fsqlite_types::value::SqliteValue::Text(first.clone().into()),
-                fsqlite_types::value::SqliteValue::Integer(101),
+                crate::storage::api::Value::Integer(1),
+                crate::storage::api::Value::Integer(0),
+                crate::storage::api::Value::Text(first.clone().into()),
+                crate::storage::api::Value::Integer(101),
             ],
         )?;
-        conn.execute_with_params(
+        conn.execute(
             "INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
              VALUES(?1, 1, ?2, 'assistant', ?3, ?4)",
             &[
-                fsqlite_types::value::SqliteValue::Integer(2),
-                fsqlite_types::value::SqliteValue::Integer(1),
-                fsqlite_types::value::SqliteValue::Text(second.clone().into()),
-                fsqlite_types::value::SqliteValue::Integer(102),
+                crate::storage::api::Value::Integer(2),
+                crate::storage::api::Value::Integer(1),
+                crate::storage::api::Value::Text(second.clone().into()),
+                crate::storage::api::Value::Integer(102),
             ],
         )?;
 
@@ -12771,7 +12791,7 @@ mod tests {
 
     #[test]
     fn hydrate_semantic_hits_with_ids_normalizes_trimmed_local_source_metadata() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = Connection::open_memory()?;
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
              CREATE TABLE conversations (
@@ -12795,17 +12815,17 @@ mod tests {
              );
              CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);",
         )?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
+        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
         conn.execute(
             "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path, started_at)
              VALUES(1, 1, NULL, '  local  ', NULL, 'trimmed local semantic', '/tmp/trimmed-local-semantic.jsonl', 100)",
-        )?;
-        conn.execute_with_params(
+        &[])?;
+        conn.execute(
             "INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
              VALUES(?1, 1, 0, 'assistant', ?2, 101)",
             &[
-                fsqlite_types::value::SqliteValue::Integer(1),
-                fsqlite_types::value::SqliteValue::Text("trimmed local semantic body".into()),
+                crate::storage::api::Value::Integer(1),
+                crate::storage::api::Value::Text("trimmed local semantic body".into()),
             ],
         )?;
 
@@ -12843,7 +12863,7 @@ mod tests {
 
     #[test]
     fn hydrate_semantic_hits_with_ids_preserves_remote_origin_without_source_row() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = Connection::open_memory()?;
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
              CREATE TABLE conversations (
@@ -12867,17 +12887,17 @@ mod tests {
              );
              CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);",
         )?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
+        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
         conn.execute(
             "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path, started_at)
              VALUES(1, 1, NULL, 'laptop', 'dev@laptop', 'remote semantic', '/tmp/remote-semantic.jsonl', 100)",
-        )?;
-        conn.execute_with_params(
+        &[])?;
+        conn.execute(
             "INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
              VALUES(?1, 1, 0, 'assistant', ?2, 101)",
             &[
-                fsqlite_types::value::SqliteValue::Integer(1),
-                fsqlite_types::value::SqliteValue::Text("remote semantic body".into()),
+                crate::storage::api::Value::Integer(1),
+                crate::storage::api::Value::Text("remote semantic body".into()),
             ],
         )?;
 
@@ -12917,7 +12937,7 @@ mod tests {
     #[test]
     fn resolve_semantic_doc_ids_for_hits_distinguishes_same_source_path_line_by_content_hash()
     -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = Connection::open_memory()?;
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
              CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
@@ -12939,33 +12959,33 @@ mod tests {
                 created_at INTEGER
              );",
         )?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
+        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
         conn.execute(
             "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
              VALUES(1, 1, NULL, 'local', NULL, 'Shared Session', '/tmp/progressive-shared.jsonl')",
-        )?;
+        &[])?;
         conn.execute(
             "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
              VALUES(2, 1, NULL, 'local', NULL, 'Shared Session', '/tmp/progressive-shared.jsonl')",
-        )?;
+        &[])?;
         let first = "same prefix first tail".to_string();
         let second = "same prefix second tail".to_string();
-        conn.execute_with_params(
+        conn.execute(
             "INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
              VALUES(?1, ?2, 0, 'assistant', ?3, 100)",
             &[
-                fsqlite_types::value::SqliteValue::Integer(11),
-                fsqlite_types::value::SqliteValue::Integer(1),
-                fsqlite_types::value::SqliteValue::Text(first.clone().into()),
+                crate::storage::api::Value::Integer(11),
+                crate::storage::api::Value::Integer(1),
+                crate::storage::api::Value::Text(first.clone().into()),
             ],
         )?;
-        conn.execute_with_params(
+        conn.execute(
             "INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
              VALUES(?1, ?2, 0, 'assistant', ?3, 100)",
             &[
-                fsqlite_types::value::SqliteValue::Integer(22),
-                fsqlite_types::value::SqliteValue::Integer(2),
-                fsqlite_types::value::SqliteValue::Text(second.clone().into()),
+                crate::storage::api::Value::Integer(22),
+                crate::storage::api::Value::Integer(2),
+                crate::storage::api::Value::Text(second.clone().into()),
             ],
         )?;
 
@@ -13047,7 +13067,7 @@ mod tests {
 
     #[test]
     fn hydrate_semantic_hits_with_ids_keeps_missing_title_empty() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = Connection::open_memory()?;
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
              CREATE TABLE conversations (
@@ -13071,17 +13091,17 @@ mod tests {
              );
              CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);",
         )?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
+        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
         conn.execute(
             "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path, started_at)
              VALUES(1, 1, NULL, 'local', NULL, NULL, '/tmp/untitled-semantic.jsonl', 100)",
-        )?;
-        conn.execute_with_params(
+        &[])?;
+        conn.execute(
             "INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
              VALUES(?1, 1, 0, 'assistant', ?2, 101)",
             &[
-                fsqlite_types::value::SqliteValue::Integer(1),
-                fsqlite_types::value::SqliteValue::Text("untitled semantic body".into()),
+                crate::storage::api::Value::Integer(1),
+                crate::storage::api::Value::Text("untitled semantic body".into()),
             ],
         )?;
 
@@ -13119,7 +13139,7 @@ mod tests {
     #[test]
     fn resolve_semantic_doc_ids_for_hits_prefers_conversation_id_over_ambiguous_provenance()
     -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = Connection::open_memory()?;
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
              CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
@@ -13141,32 +13161,32 @@ mod tests {
                 created_at INTEGER
              );",
         )?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
+        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
         conn.execute(
             "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
              VALUES(1, 1, NULL, 'local', NULL, 'Shared Session', '/tmp/progressive-conversation-id.jsonl')",
-        )?;
+        &[])?;
         conn.execute(
             "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
              VALUES(2, 1, NULL, 'local', NULL, 'Shared Session', '/tmp/progressive-conversation-id.jsonl')",
-        )?;
+        &[])?;
         let content = "same ambiguous content".to_string();
-        conn.execute_with_params(
+        conn.execute(
             "INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
              VALUES(?1, ?2, 0, 'assistant', ?3, 100)",
             &[
-                fsqlite_types::value::SqliteValue::Integer(11),
-                fsqlite_types::value::SqliteValue::Integer(1),
-                fsqlite_types::value::SqliteValue::Text(content.clone().into()),
+                crate::storage::api::Value::Integer(11),
+                crate::storage::api::Value::Integer(1),
+                crate::storage::api::Value::Text(content.clone().into()),
             ],
         )?;
-        conn.execute_with_params(
+        conn.execute(
             "INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
              VALUES(?1, ?2, 0, 'assistant', ?3, 100)",
             &[
-                fsqlite_types::value::SqliteValue::Integer(22),
-                fsqlite_types::value::SqliteValue::Integer(2),
-                fsqlite_types::value::SqliteValue::Text(content.clone().into()),
+                crate::storage::api::Value::Integer(22),
+                crate::storage::api::Value::Integer(2),
+                crate::storage::api::Value::Text(content.clone().into()),
             ],
         )?;
 
@@ -13225,7 +13245,7 @@ mod tests {
 
     #[test]
     fn resolve_semantic_doc_ids_for_hits_treats_null_source_as_local() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = Connection::open_memory()?;
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
              CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
@@ -13247,18 +13267,18 @@ mod tests {
                 created_at INTEGER
              );",
         )?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
+        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
         conn.execute(
             "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
              VALUES(1, 1, NULL, NULL, NULL, 'Legacy Local', '/tmp/legacy-local.jsonl')",
-        )?;
+        &[])?;
         let content = "legacy local semantic message".to_string();
-        conn.execute_with_params(
+        conn.execute(
             "INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
              VALUES(?1, 1, 0, 'assistant', ?2, 100)",
             &[
-                fsqlite_types::value::SqliteValue::Integer(11),
-                fsqlite_types::value::SqliteValue::Text(content.clone().into()),
+                crate::storage::api::Value::Integer(11),
+                crate::storage::api::Value::Text(content.clone().into()),
             ],
         )?;
 
@@ -13307,7 +13327,7 @@ mod tests {
 
     #[test]
     fn resolve_semantic_doc_ids_for_hits_matches_trimmed_local_source_id() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = Connection::open_memory()?;
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
              CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
@@ -13329,18 +13349,18 @@ mod tests {
                 created_at INTEGER
              );",
         )?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
+        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
         conn.execute(
             "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
              VALUES(1, 1, NULL, '  local  ', NULL, 'Trimmed Local', '/tmp/trimmed-local.jsonl')",
-        )?;
+        &[])?;
         let content = "trimmed local semantic message".to_string();
-        conn.execute_with_params(
+        conn.execute(
             "INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
              VALUES(?1, 1, 0, 'assistant', ?2, 100)",
             &[
-                fsqlite_types::value::SqliteValue::Integer(11),
-                fsqlite_types::value::SqliteValue::Text(content.clone().into()),
+                crate::storage::api::Value::Integer(11),
+                crate::storage::api::Value::Text(content.clone().into()),
             ],
         )?;
 
@@ -13389,7 +13409,7 @@ mod tests {
 
     #[test]
     fn resolve_semantic_doc_ids_for_hits_normalizes_blank_local_source_id() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = Connection::open_memory()?;
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
              CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
@@ -13411,18 +13431,18 @@ mod tests {
                 created_at INTEGER
              );",
         )?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
+        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
         conn.execute(
             "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
              VALUES(1, 1, NULL, 'local', NULL, 'Blank Local', '/tmp/blank-local.jsonl')",
-        )?;
+        &[])?;
         let content = "blank local semantic message".to_string();
-        conn.execute_with_params(
+        conn.execute(
             "INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
              VALUES(?1, 1, 0, 'assistant', ?2, 100)",
             &[
-                fsqlite_types::value::SqliteValue::Integer(11),
-                fsqlite_types::value::SqliteValue::Text(content.clone().into()),
+                crate::storage::api::Value::Integer(11),
+                crate::storage::api::Value::Text(content.clone().into()),
             ],
         )?;
 
@@ -13472,7 +13492,7 @@ mod tests {
     #[test]
     fn resolve_semantic_doc_ids_for_hits_infers_remote_source_from_origin_host_when_source_id_blank()
     -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = Connection::open_memory()?;
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
              CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
@@ -13494,18 +13514,18 @@ mod tests {
                 created_at INTEGER
              );",
         )?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
+        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
         conn.execute(
             "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
              VALUES(1, 1, NULL, '   ', 'dev@laptop', 'Legacy Remote', '/tmp/legacy-remote.jsonl')",
-        )?;
+        &[])?;
         let content = "legacy remote semantic message".to_string();
-        conn.execute_with_params(
+        conn.execute(
             "INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
              VALUES(?1, 1, 0, 'assistant', ?2, 100)",
             &[
-                fsqlite_types::value::SqliteValue::Integer(11),
-                fsqlite_types::value::SqliteValue::Text(content.clone().into()),
+                crate::storage::api::Value::Integer(11),
+                crate::storage::api::Value::Text(content.clone().into()),
             ],
         )?;
 
@@ -13554,7 +13574,7 @@ mod tests {
 
     #[test]
     fn browse_by_date_snippet_only_uses_full_content_for_hit_identity() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = Connection::open_memory()?;
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
              CREATE TABLE conversations (
@@ -13576,32 +13596,32 @@ mod tests {
              );
              CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);",
         )?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
+        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
         conn.execute(
             "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
              VALUES(1, 1, NULL, 'local', NULL, 'browse title', '/tmp/browse-shared.jsonl')",
-        )?;
+        &[])?;
         let shared_prefix = "shared-prefix ".repeat(48);
         let first = format!("{shared_prefix}first browse-only tail");
         let second = format!("{shared_prefix}second browse-only tail");
-        conn.execute_with_params(
+        conn.execute(
             "INSERT INTO messages(id, conversation_id, idx, content, created_at)
              VALUES(?1, 1, ?2, ?3, ?4)",
             &[
-                fsqlite_types::value::SqliteValue::Integer(1),
-                fsqlite_types::value::SqliteValue::Integer(0),
-                fsqlite_types::value::SqliteValue::Text(first.clone().into()),
-                fsqlite_types::value::SqliteValue::Integer(101),
+                crate::storage::api::Value::Integer(1),
+                crate::storage::api::Value::Integer(0),
+                crate::storage::api::Value::Text(first.clone().into()),
+                crate::storage::api::Value::Integer(101),
             ],
         )?;
-        conn.execute_with_params(
+        conn.execute(
             "INSERT INTO messages(id, conversation_id, idx, content, created_at)
              VALUES(?1, 1, ?2, ?3, ?4)",
             &[
-                fsqlite_types::value::SqliteValue::Integer(2),
-                fsqlite_types::value::SqliteValue::Integer(1),
-                fsqlite_types::value::SqliteValue::Text(second.clone().into()),
-                fsqlite_types::value::SqliteValue::Integer(102),
+                crate::storage::api::Value::Integer(2),
+                crate::storage::api::Value::Integer(1),
+                crate::storage::api::Value::Text(second.clone().into()),
+                crate::storage::api::Value::Integer(102),
             ],
         )?;
 
@@ -16896,7 +16916,7 @@ mod tests {
     ///    split could break by hydrating before honoring the limit).
     #[test]
     fn search_sqlite_fts5_rank_and_hydrate_split_preserves_limit_prefix_invariant() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = Connection::open_memory()?;
         conn.execute_batch(
             "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
              CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
@@ -16928,9 +16948,9 @@ mod tests {
                 tokenize='porter'
              );",
         )?;
-        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')")?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
-        conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/tmp/k0e5p')")?;
+        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')", &[])?;
+        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
+        conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/tmp/k0e5p')", &[])?;
 
         // Seed N=6 messages all matching the same query token. Each
         // gets a distinct message_id + content shape so the prefix
@@ -16941,21 +16961,21 @@ mod tests {
         for (i, repeats) in (1..=6_i64).enumerate() {
             let conv_id = i as i64 + 1;
             let msg_id = (i as i64 + 1) * 10;
-            conn.execute_compat(
+            conn.execute(
                 "INSERT INTO conversations(id, agent_id, workspace_id, source_id, \
                  origin_host, title, source_path) \
                  VALUES(?1, 1, 1, 'local', NULL, ?2, ?3)",
-                params![
+                fparams![
                     conv_id,
                     format!("k0e5p-{}", i),
                     format!("/tmp/k0e5p/{}.jsonl", i),
                 ],
             )?;
             let content = "rankprobe ".repeat(repeats as usize);
-            conn.execute_compat(
+            conn.execute(
                 "INSERT INTO messages(id, conversation_id, idx, content, created_at) \
                  VALUES(?1, ?2, ?3, ?4, ?5)",
-                params![
+                fparams![
                     msg_id,
                     conv_id,
                     i as i64,
@@ -16963,11 +16983,11 @@ mod tests {
                     1_700_000_000_i64 + i as i64
                 ],
             )?;
-            conn.execute_compat(
+            conn.execute(
                 "INSERT INTO fts_messages(rowid, content, title, agent, workspace, \
                  source_path, created_at, message_id) \
                  VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
+                fparams![
                     msg_id,
                     content.as_str(),
                     format!("k0e5p-{}", i),
