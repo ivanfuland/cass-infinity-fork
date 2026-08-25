@@ -1,8 +1,13 @@
 //! storage::api — backend-agnostic facade over the relational storage layer.
 
+mod backend_franken;
+mod config;
+mod conn;
 mod error;
 mod value;
 
+pub use config::{OpenOptions, Profile};
+pub use conn::{Conn, Row, Tx};
 pub use error::{BusyScope, StorageError};
 pub use value::{FromValue, IntoValue, Value};
 
