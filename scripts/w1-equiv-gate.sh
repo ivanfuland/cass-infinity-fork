@@ -139,13 +139,17 @@ has_lib = False
 for pkg in d.get("packages", []):
     for t in pkg.get("targets", []):
         kinds = set(t.get("kind", []))
-        if kinds & {"lib", "bin", "test"}:
+        # 注意：不含 "bin"——cargo test（不带 --bins/--all-targets）默认不给 [[bin]]
+        # 目标单独起一条 unittests 测试二进制（哪怕包里同时有 lib）；实测本仓 2 个 bin
+        # target 全程只出现 1 条 "Running unittests src/lib.rs"，加 bin 计数会把
+        # expected 算多 2、跟 started/finished 对不上（真实基线捕获中踩到，243 vs 245）。
+        if kinds & {"lib", "test"}:
             n += 1
         if "lib" in kinds:
             has_lib = True
 # cargo test 对含 lib target 的包总会跑一个 Doc-tests 阶段（哪怕 0 条 doc test 也打印
-# 一行 "test result: ok. 0 passed..."），这是独立于 lib/bin/test kind 计数之外的
-# 第 4 类 target——实测验证见 fixture PASS 场景（w1-equiv-gate 冒烟）。
+# 一行 "test result: ok. 0 passed..."），这是独立于 lib/test kind 计数之外的
+# 第 3 类 target——实测验证见 fixture PASS 场景（w1-equiv-gate 冒烟）。
 if has_lib:
     n += 1
 print(n)
