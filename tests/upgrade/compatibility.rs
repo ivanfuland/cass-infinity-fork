@@ -542,25 +542,15 @@ fn test_search_without_fts() {
 ///
 /// `build.rs` validates manifest/package/feature contracts; this test makes the
 /// expected symbols compile against the currently resolved dependency graph.
+///
+/// The frankensqlite quarter of this contract lives in
+/// `tests/frankensqlite_compat_gates.rs::fsqlite_path_dependency_compile_contract`
+/// (plan delta d6, 2026-08-25) -- that file is the designated home for tests
+/// that deliberately bypass the api facade and pin the raw frankensqlite
+/// surface, and frankensqlite is the one sibling here that's a migration-
+/// scoped engine rather than a long-lived dependency.
 #[test]
 fn test_path_dependency_compile_contracts() {
-    use frankensqlite::compat::{ConnectionExt, RowExt};
-
-    let conn = frankensqlite::Connection::open(":memory:").expect("open frankensqlite memory db");
-    conn.execute("CREATE TABLE contract_check (value INTEGER)")
-        .expect("create contract table");
-    let _params_contract = frankensqlite::params![7_i64];
-    conn.execute("INSERT INTO contract_check(value) VALUES (7)")
-        .expect("insert contract row");
-    let value: i64 = conn
-        .query_row_map(
-            "SELECT value FROM contract_check",
-            &[],
-            |row: &frankensqlite::Row| row.get_typed(0),
-        )
-        .expect("query contract row");
-    assert_eq!(value, 7);
-
     let _runtime_builder = asupersync::runtime::RuntimeBuilder::current_thread();
     let _http_builder = asupersync::http::h1::HttpClient::builder();
 
