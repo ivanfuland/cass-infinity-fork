@@ -28,6 +28,17 @@ impl FrankenBackend {
     pub(crate) fn open_memory() -> Result<Self, StorageError> {
         FrankenConnection::open(":memory:").map(|conn| Self { conn }).map_err(map_franken_err)
     }
+
+    /// Stage-A-only escape hatch (Task A5), same family as
+    /// `run_franken_migrations`: lets a caller that already reached this
+    /// backend via `Conn::as_franken()` get the real connection to hand to
+    /// code that hasn't been migrated off the native type yet (Task A5's
+    /// `analytics::{query,validate}` call sites — that module is Task A6
+    /// batch 3, out of this task's scope). Deleted along with this file at
+    /// the end of Stage B.
+    pub(crate) fn native(&self) -> &FrankenConnection {
+        &self.conn
+    }
 }
 
 fn sqlite_to_value(v: &SqliteValue) -> Value {
