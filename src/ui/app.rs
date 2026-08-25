@@ -30649,26 +30649,26 @@ mod tests {
         let db_path = tmp.path().join("cass.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
         let conn = storage.raw();
-        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'remote', 0, 0)").unwrap();
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'remote', 0, 0)", &[]).unwrap();
         conn.execute(
-            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (1, 1, 'local-ext', 'Local Session', '/fake/shared-md.jsonl', 'local', 10)",
+            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (1, 1, 'local-ext', 'Local Session', '/fake/shared-md.jsonl', 'local', 10)", &[],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO sources (id, kind, host_label, created_at, updated_at) VALUES ('work-laptop', 'ssh', 'work-laptop', 0, 0)",
+            "INSERT INTO sources (id, kind, host_label, created_at, updated_at) VALUES ('work-laptop', 'ssh', 'work-laptop', 0, 0)", &[],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (2, 1, 'remote-ext', 'Remote Session', '/fake/shared-md.jsonl', 'work-laptop', 10)",
+            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (2, 1, 'remote-ext', 'Remote Session', '/fake/shared-md.jsonl', 'work-laptop', 10)", &[],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'local markdown body')"
-        )
+        , &[])
         .unwrap();
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (2, 2, 0, 'user', 'remote markdown body')"
-        )
+        , &[])
         .unwrap();
 
         let output_path = tmp.path().join("shared.md");
@@ -30702,22 +30702,22 @@ mod tests {
         let db_path = tmp.path().join("cass.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
         let conn = storage.raw();
-        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'remote', 0, 0)").unwrap();
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'remote', 0, 0)", &[]).unwrap();
         conn.execute(
-            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (1, 1, 'old-ext', 'Old Session', '/fake/shared-md-same-source.jsonl', 'local', 10)",
+            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (1, 1, 'old-ext', 'Old Session', '/fake/shared-md-same-source.jsonl', 'local', 10)", &[],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (2, 1, 'new-ext', 'New Session', '/fake/shared-md-same-source.jsonl', 'local', 10)",
+            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (2, 1, 'new-ext', 'New Session', '/fake/shared-md-same-source.jsonl', 'local', 10)", &[],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'old markdown body')"
-        )
+        , &[])
         .unwrap();
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (2, 2, 0, 'user', 'new markdown body')"
-        )
+        , &[])
         .unwrap();
 
         let output_path = tmp.path().join("shared-same-source.md");
@@ -30759,21 +30759,21 @@ mod tests {
         let db_path = tmp.path().join("cass.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
         let conn = storage.raw();
-        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)").unwrap();
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)", &[]).unwrap();
         {
-            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            use crate::storage::api::Value as ParamValue;
             let params = [
                 ParamValue::from(1_i64),
                 ParamValue::from(session_path.display().to_string()),
             ];
-            conn.execute_with_params(
+            conn.execute(
                 "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (?1, 1, 'stale-ext', 'Stale Session', ?2, 'local', 10)",
-                &param_slice_to_values(&params),
+                &params,
             )
             .unwrap();
         }
         conn.execute(
-            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'stale indexed markdown body')",
+            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'stale indexed markdown body')", &[],
         )
         .unwrap();
 
@@ -30816,21 +30816,21 @@ mod tests {
         let db_path = tmp.path().join("cass.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
         let conn = storage.raw();
-        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)").unwrap();
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)", &[]).unwrap();
         {
-            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            use crate::storage::api::Value as ParamValue;
             let params = [
                 ParamValue::from(1_i64),
                 ParamValue::from(session_path.display().to_string()),
             ];
-            conn.execute_with_params(
+            conn.execute(
                 "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (?1, 1, 'indexed-ext', 'Indexed Session', ?2, 'local', 10)",
-                &param_slice_to_values(&params),
+                &params,
             )
             .unwrap();
         }
         conn.execute(
-            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'indexed markdown fallback body')",
+            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'indexed markdown fallback body')", &[],
         )
         .unwrap();
 
@@ -30870,21 +30870,21 @@ not jsonl",
         let db_path = tmp.path().join("cass.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
         let conn = storage.raw();
-        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'aider', 'Aider', 'local', 0, 0)").unwrap();
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'aider', 'Aider', 'local', 0, 0)", &[]).unwrap();
         {
-            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            use crate::storage::api::Value as ParamValue;
             let params = [
                 ParamValue::from(1_i64),
                 ParamValue::from(session_path.display().to_string()),
             ];
-            conn.execute_with_params(
+            conn.execute(
                 "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (?1, 1, 'aider-ext', 'Aider Session', ?2, 'local', 10)",
-                &param_slice_to_values(&params),
+                &params,
             )
             .unwrap();
         }
         conn.execute(
-            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'indexed aider markdown body')",
+            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'indexed aider markdown body')", &[],
         )
         .unwrap();
 
@@ -30917,17 +30917,17 @@ not jsonl",
         let storage = FrankenStorage::open(&db_path).unwrap();
 
         let conn = storage.raw();
-        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'remote', 0, 0)").unwrap();
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'remote', 0, 0)", &[]).unwrap();
         conn.execute(
             "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) 
-             VALUES (1, 1, 'ext', 'Test', '/fake/session.jsonl', 'local', 10)",
+             VALUES (1, 1, 'ext', 'Test', '/fake/session.jsonl', 'local', 10)", &[],
         ).unwrap();
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'hello')"
-        ).unwrap();
+        , &[]).unwrap();
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (2, 1, 1, 'assistant', 'hi')"
-        ).unwrap();
+        , &[]).unwrap();
 
         let session_path = "/fake/session.jsonl";
 
@@ -30978,26 +30978,26 @@ not jsonl",
         let db_path = tmp.path().join("cass.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
         let conn = storage.raw();
-        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'remote', 0, 0)").unwrap();
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'remote', 0, 0)", &[]).unwrap();
         conn.execute(
-            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (1, 1, 'local-ext', 'Local Session', '/fake/shared.jsonl', 'local', 10)",
+            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (1, 1, 'local-ext', 'Local Session', '/fake/shared.jsonl', 'local', 10)", &[],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO sources (id, kind, host_label, created_at, updated_at) VALUES ('work-laptop', 'ssh', 'work-laptop', 0, 0)",
+            "INSERT INTO sources (id, kind, host_label, created_at, updated_at) VALUES ('work-laptop', 'ssh', 'work-laptop', 0, 0)", &[],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (2, 1, 'remote-ext', 'Remote Session', '/fake/shared.jsonl', 'work-laptop', 10)",
+            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (2, 1, 'remote-ext', 'Remote Session', '/fake/shared.jsonl', 'work-laptop', 10)", &[],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'local export body')"
-        )
+        , &[])
         .unwrap();
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (2, 2, 0, 'user', 'remote export body')"
-        )
+        , &[])
         .unwrap();
 
         let output_path = tmp.path().join("shared.html");
@@ -31037,22 +31037,22 @@ not jsonl",
         let db_path = tmp.path().join("cass.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
         let conn = storage.raw();
-        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'remote', 0, 0)").unwrap();
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'remote', 0, 0)", &[]).unwrap();
         conn.execute(
-            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (1, 1, 'old-ext', 'Old Session', '/fake/shared-same-source.jsonl', 'local', 10)",
+            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (1, 1, 'old-ext', 'Old Session', '/fake/shared-same-source.jsonl', 'local', 10)", &[],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (2, 1, 'new-ext', 'New Session', '/fake/shared-same-source.jsonl', 'local', 10)",
+            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (2, 1, 'new-ext', 'New Session', '/fake/shared-same-source.jsonl', 'local', 10)", &[],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'old export body')"
-        )
+        , &[])
         .unwrap();
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (2, 2, 0, 'user', 'new export body')"
-        )
+        , &[])
         .unwrap();
 
         let output_path = tmp.path().join("shared-same-source.html");
@@ -31104,21 +31104,21 @@ not jsonl",
         let db_path = tmp.path().join("cass.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
         let conn = storage.raw();
-        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)").unwrap();
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)", &[]).unwrap();
         {
-            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            use crate::storage::api::Value as ParamValue;
             let params = [
                 ParamValue::from(1_i64),
                 ParamValue::from(session_path.display().to_string()),
             ];
-            conn.execute_with_params(
+            conn.execute(
                 "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (?1, 1, 'stale-ext', 'Stale Session', ?2, 'local', 10)",
-                &param_slice_to_values(&params),
+                &params,
             )
             .unwrap();
         }
         conn.execute(
-            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'stale indexed html body')",
+            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'stale indexed html body')", &[],
         )
         .unwrap();
 
@@ -31166,21 +31166,21 @@ not jsonl",
         let db_path = tmp.path().join("cass.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
         let conn = storage.raw();
-        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)").unwrap();
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)", &[]).unwrap();
         {
-            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            use crate::storage::api::Value as ParamValue;
             let params = [
                 ParamValue::from(1_i64),
                 ParamValue::from(session_path.display().to_string()),
             ];
-            conn.execute_with_params(
+            conn.execute(
                 "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (?1, 1, 'indexed-ext', 'Indexed Session', ?2, 'local', 10)",
-                &param_slice_to_values(&params),
+                &params,
             )
             .unwrap();
         }
         conn.execute(
-            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'indexed html fallback body')",
+            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'indexed html fallback body')", &[],
         )
         .unwrap();
 
@@ -31230,21 +31230,21 @@ not jsonl",
         let db_path = tmp.path().join("cass.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
         let conn = storage.raw();
-        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'aider', 'Aider', 'local', 0, 0)").unwrap();
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'aider', 'Aider', 'local', 0, 0)", &[]).unwrap();
         {
-            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            use crate::storage::api::Value as ParamValue;
             let params = [
                 ParamValue::from(1_i64),
                 ParamValue::from(session_path.display().to_string()),
             ];
-            conn.execute_with_params(
+            conn.execute(
                 "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (?1, 1, 'aider-ext', 'Aider Session', ?2, 'local', 10)",
-                &param_slice_to_values(&params),
+                &params,
             )
             .unwrap();
         }
         conn.execute(
-            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'indexed aider html body')",
+            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'indexed aider html body')", &[],
         )
         .unwrap();
 
