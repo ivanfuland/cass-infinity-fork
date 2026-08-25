@@ -91,15 +91,15 @@ impl StorageBackend for FrankenBackend {
         result.map_err(map_franken_err)
     }
 
-    fn begin(&mut self, _mode: TxMode) -> Result<(), StorageError> {
+    fn begin(&self, _mode: TxMode) -> Result<(), StorageError> {
         self.conn.begin_transaction().map_err(map_franken_err)
     }
 
-    fn commit(&mut self) -> Result<(), StorageError> {
+    fn commit(&self) -> Result<(), StorageError> {
         self.conn.commit_transaction().map_err(map_franken_err)
     }
 
-    fn rollback(&mut self) -> Result<(), StorageError> {
+    fn rollback(&self) -> Result<(), StorageError> {
         self.conn.rollback_transaction().map_err(map_franken_err)
     }
 
@@ -114,6 +114,63 @@ impl StorageBackend for FrankenBackend {
     fn close_without_checkpoint(self: Box<Self>) -> Result<(), StorageError> {
         self.conn.close_without_checkpoint().map_err(map_franken_err)
     }
+
+    fn close_in_place(&mut self) -> Result<(), StorageError> {
+        self.conn.close_in_place().map_err(map_franken_err)
+    }
+
+    fn close_without_checkpoint_in_place(&mut self) -> Result<(), StorageError> {
+        self.conn.close_without_checkpoint_in_place().map_err(map_franken_err)
+    }
+
+    fn close_best_effort_in_place(&mut self) {
+        self.conn.close_best_effort_in_place();
+    }
+
+    fn as_franken(&self) -> Option<&FrankenBackend> {
+        Some(self)
+    }
+}
+
+/// A single schema migration (Task A4a: mirrors `frankensqlite::migrate::Migration`'s
+/// shape so `sqlite.rs` doesn't need to name that type directly).
+pub(crate) struct FrankenMigration {
+    pub(crate) version: i64,
+    pub(crate) name: &'static str,
+    pub(crate) up_sql: &'static str,
+}
+
+/// Mirrors `frankensqlite::migrate::MigrationResult`.
+pub(crate) struct FrankenMigrationResult {
+    pub(crate) applied: Vec<i64>,
+    pub(crate) current: i64,
+    pub(crate) was_fresh: bool,
+}
+
+/// Task A4a: runs `frankensqlite::migrate::MigrationRunner` against the native
+/// connection behind `conn`. franken-specific migration machinery stays inside
+/// this backend file; `sqlite.rs` only ever sees [`FrankenMigration`]/
+/// [`FrankenMigrationResult`]. Panics if `conn` isn't backed by [`FrankenBackend`]
+/// (Stage A has no other backend, so this can't happen in practice).
+pub(crate) fn run_franken_migrations(
+    conn: &super::conn::Conn,
+    migrations: &[FrankenMigration],
+) -> Result<FrankenMigrationResult, StorageError> {
+    let backend = conn
+        .as_franken()
+        .expect("Stage A: run_franken_migrations requires the franken backend");
+    let mut runner = frankensqlite::migrate::MigrationRunner::new();
+    for m in migrations {
+        runner = runner.add(m.version, m.name, m.up_sql);
+    }
+    runner
+        .run(&backend.conn)
+        .map(|r| FrankenMigrationResult {
+            applied: r.applied,
+            current: r.current,
+            was_fresh: r.was_fresh,
+        })
+        .map_err(map_franken_err)
 }
 
 /// Stage A fsqlite error mapping (plan Task A3). Retry classification mirrors
@@ -132,7 +189,21 @@ pub(crate) fn map_franken_err(e: FrankenError) -> StorageError {
         | FrankenError::Busy
         | FrankenError::DatabaseLocked { .. }
         | FrankenError::LockFailed { .. } => StorageError::Busy { scope: BusyScope::Statement },
-        FrankenError::WalCorrupt { .. } => StorageError::Corrupt { detail },
+        // Task A4a: `WalCorrupt` was the only variant this arm covered under A3
+        // (whose doc comment above cites only `retryable_franken_error`'s 7-variant
+        // retry set as the contract to preserve bit-for-bit). Migrating
+        // `schema_check_error_requires_rebuild` (sqlite.rs) surfaced a second,
+        // independent contract this mapping must also satisfy: its own doc
+        // comment lists `DatabaseCorrupt`/`WalCorrupt`/`NotADatabase`/`ShortRead`
+        // as the exact rebuild-worthy set (cass's own judgment call — note fsqlite
+        // itself classifies `ShortRead` as a plain I/O error, not corruption, but
+        // cass has always treated a short read while parsing the DB header/pages
+        // as a corruption signal). Adding these three doesn't touch the retry set
+        // above (none of them were ever retryable).
+        FrankenError::WalCorrupt { .. }
+        | FrankenError::DatabaseCorrupt { .. }
+        | FrankenError::NotADatabase { .. }
+        | FrankenError::ShortRead { .. } => StorageError::Corrupt { detail },
         FrankenError::UniqueViolation { .. }
         | FrankenError::NotNullViolation { .. }
         | FrankenError::CheckViolation { .. }

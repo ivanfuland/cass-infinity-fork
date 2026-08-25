@@ -194,6 +194,16 @@ impl IntoValue for &[u8] {
     }
 }
 
+/// w1a Task A4a: `sqlite.rs` historically built parameter vectors via
+/// `frankensqlite::compat::ParamValue::from(x)` call sites (not the `params!`
+/// macro). `ParamValue` is now a local alias for `Value`, so this blanket impl
+/// keeps those call sites compiling unchanged, routing through `IntoValue`.
+impl<T: IntoValue> From<T> for Value {
+    fn from(v: T) -> Value {
+        v.into_value()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::error::StorageError;

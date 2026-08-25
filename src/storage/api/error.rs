@@ -8,6 +8,14 @@ pub enum BusyScope {
     Snapshot,
 }
 
+/// plan delta d4: single source of truth for the zero-row signal `query_row_map`
+/// constructs as `StorageError::Other { detail: NO_ROWS_DETAIL, .. }` (there is no
+/// dedicated `StorageError` variant for it — the five-class design doesn't carve
+/// one out). Anything that needs to detect "no rows" from that error (e.g.
+/// `sqlite.rs`'s `FrankenOptionalCompat` shim) must match against this constant,
+/// not a duplicated string literal, so the two can never drift out of sync.
+pub(crate) const NO_ROWS_DETAIL: &str = "query returned no rows";
+
 #[derive(Debug)]
 pub enum StorageError {
     Busy { scope: BusyScope },

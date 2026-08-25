@@ -9,7 +9,10 @@ mod value;
 pub use config::{OpenOptions, Profile};
 pub use conn::{Conn, Row, Tx};
 pub use error::{BusyScope, StorageError};
+pub(crate) use error::NO_ROWS_DETAIL;
 pub use value::{FromValue, IntoValue, Value};
+// Task A4a: Stage-A-only migration escape hatch (see backend_franken.rs doc comment).
+pub(crate) use backend_franken::{FrankenMigration, FrankenMigrationResult, run_franken_migrations};
 
 /// Build a `[Value; N]` from expressions, each converted via [`IntoValue`].
 /// Empty parameter lists use a bare `&[]` at the call site instead (no macro needed —
