@@ -47,8 +47,9 @@ pub(crate) trait StorageBackend {
     fn close_best_effort_in_place(&mut self);
 
     /// Stage-A-only escape hatch (Task A4a): lets `run_franken_migrations` reach
-    /// the native fsqlite connection to run `frankensqlite::migrate::MigrationRunner`
-    /// without leaking the engine type into the `StorageBackend` trait surface.
+    /// the native fsqlite connection to run the native engine's
+    /// `migrate::MigrationRunner` without leaking the engine type into the
+    /// `StorageBackend` trait surface.
     /// Deleted along with `backend_franken.rs` at the end of Stage B.
     fn as_franken(&self) -> Option<&super::backend_franken::FrankenBackend> {
         None

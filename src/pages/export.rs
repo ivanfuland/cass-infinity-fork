@@ -2,8 +2,8 @@ use crate::ui::time_parser::parse_time_input;
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use clap::ValueEnum;
-use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt, TransactionExt};
-use frankensqlite::{Connection, Row as FrankenRow, params};
+use crate::storage::api::{Conn as Connection, Row as FrankenRow, params};
+type ParamValue = crate::storage::api::Value;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -95,9 +95,11 @@ impl ExportEngine {
             unique_atomic_sidecar_path(&self.output_path, "tmp", "pages_export.db");
         let mut replace_attempted = false;
         let result = (|| -> Result<ExportStats> {
-            let output_path = temp_output_path.to_string_lossy().to_string();
-            let dest =
-                Connection::open(&output_path).context("Failed to create output database")?;
+            let dest = Connection::open_writable(
+                &temp_output_path,
+                crate::storage::api::Profile::Production,
+            )
+            .context("Failed to create output database")?;
 
             dest.execute_batch(
                 // Pages exports are encrypted/copied as one portable SQLite file.
@@ -125,7 +127,7 @@ impl ExportEngine {
                 ended_at INTEGER,
                 message_count INTEGER,
                 metadata_json TEXT
-            )",
+            )", &[],
                 )
                 .context("Failed to create conversations table")?;
 
@@ -141,7 +143,7 @@ impl ExportEngine {
                 model TEXT,
                 attachment_refs TEXT,
                 FOREIGN KEY (conversation_id) REFERENCES conversations(id)
-            )",
+            )", &[],
                 )
                 .context("Failed to create messages table")?;
 
@@ -155,7 +157,7 @@ impl ExportEngine {
                 language TEXT,
                 snippet_text TEXT,
                 FOREIGN KEY (message_id) REFERENCES messages(id)
-            )",
+            )", &[],
                 )
                 .context("Failed to create snippets table")?;
 
@@ -163,7 +165,7 @@ impl ExportEngine {
                     "CREATE TABLE export_meta (
                 key TEXT PRIMARY KEY,
                 value TEXT
-            )",
+            )", &[],
                 )
                 .context("Failed to create export_meta table")?;
 
@@ -171,7 +173,7 @@ impl ExportEngine {
                     "CREATE VIRTUAL TABLE messages_fts USING fts5(
                 content,
                 tokenize='porter unicode61 remove_diacritics 2'
-            )",
+            )", &[],
                 )
                 .context("Failed to create messages_fts table")?;
 
@@ -179,7 +181,7 @@ impl ExportEngine {
                     r#"CREATE VIRTUAL TABLE messages_code_fts USING fts5(
                 content,
                 tokenize="unicode61 tokenchars '-_./:@#$%\\'"
-            )"#,
+            )"#, &[],
                 )
                 .context("Failed to create messages_code_fts table")?;
 
@@ -267,7 +269,7 @@ impl ExportEngine {
                     Option<String>,
                 );
                 let conv_rows: Vec<ConversationExportRow> =
-                    src.query_map_collect(&query, &params, |row: &FrankenRow| {
+                    src.query_all_map(&query, &params, |row: &FrankenRow| {
                         Ok((
                             row.get_typed::<i64>(0)?,
                             row.get_typed::<String>(1)?,
@@ -308,10 +310,10 @@ impl ExportEngine {
                     // Transform Path
                     let transformed_path = self.transform_path(source_path, workspace);
 
-                    tx.execute_compat(
+                    tx.execute(
                     "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, ended_at, message_count, metadata_json)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                    params![
+                    &params![
                         *id,
                         agent.as_str(),
                         workspace.as_deref(),
@@ -325,9 +327,9 @@ impl ExportEngine {
                 )?;
 
                     // Fetch messages for this conversation
-                    let msg_rows: Vec<MessageExportRow> = src.query_map_collect(
+                    let msg_rows: Vec<MessageExportRow> = src.query_all_map(
                         &msg_query,
-                        frankensqlite::params![*id],
+                        &params![*id],
                         |row: &FrankenRow| {
                             Ok((
                                 row.get_typed::<i64>(0)?,
@@ -361,10 +363,10 @@ impl ExportEngine {
                             normalize_optional_text(attachment_refs.clone())
                                 .or_else(|| derive_attachment_refs(extra_json.as_deref()));
 
-                        tx.execute_compat(
+                        tx.execute(
                             "INSERT INTO messages (id, conversation_id, idx, role, content, created_at, updated_at, model, attachment_refs)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                            params![
+                            &params![
                                 *source_message_id,
                                 *id,
                                 *idx,
@@ -378,20 +380,20 @@ impl ExportEngine {
                         )?;
 
                         // Populate FTS
-                        tx.execute_compat(
+                        tx.execute(
                             "INSERT INTO messages_fts (rowid, content) VALUES (?1, ?2)",
-                            params![*source_message_id, content.as_str()],
+                            &params![*source_message_id, content.as_str()],
                         )?;
-                        tx.execute_compat(
+                        tx.execute(
                             "INSERT INTO messages_code_fts (rowid, content) VALUES (?1, ?2)",
-                            params![*source_message_id, content.as_str()],
+                            &params![*source_message_id, content.as_str()],
                         )?;
 
                         // 5. Migrate Snippets for this message (bd-4x92)
                         let snip_rows: Vec<SnippetExportRow> = if has_snippets_table {
-                            src.query_map_collect(
+                            src.query_all_map(
                                 "SELECT file_path, start_line, end_line, language, snippet_text FROM snippets WHERE message_id = ?1",
-                                params![*source_message_id],
+                                &params![*source_message_id],
                                 |row: &FrankenRow| {
                                     Ok((
                                         row.get_typed::<Option<String>>(0)?,
@@ -407,10 +409,10 @@ impl ExportEngine {
                         };
 
                         for (fpath, start, end, lang, stext) in snip_rows {
-                            tx.execute_compat(
+                            tx.execute(
                                 "INSERT INTO snippets (message_id, file_path, start_line, end_line, language, snippet_text)
                                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                                params![*source_message_id, fpath, start, end, lang, stext.as_str()],
+                                &params![*source_message_id, fpath, start, end, lang, stext.as_str()],
                             )?;
                         }
 
@@ -422,11 +424,11 @@ impl ExportEngine {
                 }
 
                 // Metadata
-                tx.execute("INSERT INTO export_meta (key, value) VALUES ('schema_version', '1')")?;
+                tx.execute("INSERT INTO export_meta (key, value) VALUES ('schema_version', '1')", &[])?;
                 let exported_at = Utc::now().to_rfc3339();
-                tx.execute_compat(
+                tx.execute(
                     "INSERT INTO export_meta (key, value) VALUES ('exported_at', ?1)",
-                    params![exported_at.as_str()],
+                    &params![exported_at.as_str()],
                 )?;
 
                 tx.commit()?;
@@ -496,7 +498,7 @@ type MessageExportRow = (
 
 fn table_columns(conn: &Connection, table_name: &str) -> Result<Vec<String>> {
     let pragma = format!("PRAGMA table_info({table_name})");
-    conn.query_map_collect(&pragma, params![], |row: &FrankenRow| {
+    conn.query_all_map(&pragma, &[], |row: &FrankenRow| {
         row.get_typed::<String>(1)
     })
     .context("Failed to inspect source table schema")

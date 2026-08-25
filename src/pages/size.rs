@@ -4,8 +4,8 @@
 //! exporting/encrypting data that would exceed GitHub Pages limits.
 
 use anyhow::{Context, Result, bail};
-use frankensqlite::Row;
-use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
+use crate::storage::api::Row;
+type ParamValue = crate::storage::api::Value;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -65,7 +65,7 @@ impl SizeEstimate {
         let conn = super::open_existing_sqlite_db(db_path.as_ref())
             .context("Failed to open database for size estimation")?;
 
-        conn.execute("PRAGMA busy_timeout = 5000;")?;
+        conn.execute("PRAGMA busy_timeout = 5000;", &[])?;
 
         // Build filter conditions
         let mut conditions = Vec::new();
@@ -413,7 +413,7 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use frankensqlite::Connection;
+    use crate::storage::api::Conn as Connection;
 
     #[test]
     fn test_size_estimate_from_plaintext() {
@@ -503,7 +503,7 @@ mod tests {
     fn test_from_database_filters_agents_through_agents_table() -> Result<()> {
         let temp = tempfile::TempDir::new()?;
         let db_path = temp.path().join("cass.db");
-        let conn = Connection::open(db_path.to_string_lossy().as_ref())?;
+        let conn = Connection::open_writable(&db_path, crate::storage::api::Profile::Production)?;
         conn.execute_batch(
             "CREATE TABLE agents (
                 id INTEGER PRIMARY KEY,
@@ -554,7 +554,7 @@ mod tests {
     fn test_from_database_allows_read_only_source_db() -> Result<()> {
         let temp = tempfile::TempDir::new()?;
         let db_path = temp.path().join("cass-read-only.db");
-        let conn = Connection::open(db_path.to_string_lossy().as_ref())?;
+        let conn = Connection::open_writable(&db_path, crate::storage::api::Profile::Production)?;
         conn.execute_batch(
             "CREATE TABLE agents (
                 id INTEGER PRIMARY KEY,

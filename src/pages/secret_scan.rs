@@ -1,7 +1,6 @@
 use anyhow::{Context, Result, bail};
 use console::{Term, style};
-use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt, params_from_iter};
-use frankensqlite::params;
+type ParamValue = crate::storage::api::Value;
 use indicatif::{ProgressBar, ProgressStyle};
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -280,22 +279,25 @@ pub fn scan_database<P: AsRef<Path>>(
         "SELECT c.id, c.title, c.metadata_json, c.source_path, COALESCE(a.slug, 'unknown'), w.path\n         FROM conversations c\n         LEFT JOIN agents a ON c.agent_id = a.id\n         LEFT JOIN workspaces w ON c.workspace_id = w.id{}",
         conv_where
     );
-    let conv_param_values = params_from_iter(conv_params);
-    let conv_rows = conn.query_with_params(&conv_sql, &conv_param_values)?;
+    let conv_rows: Vec<(i64, Option<String>, Option<String>, String, String, Option<String>)> =
+        conn.query_all_map(&conv_sql, &conv_params, |row| {
+            Ok((
+                row.get_typed(0)?,
+                row.get_typed(1)?,
+                row.get_typed(2)?,
+                row.get_typed(3)?,
+                row.get_typed(4)?,
+                row.get_typed(5)?,
+            ))
+        })?;
 
-    for row in &conv_rows {
+    for (conv_id, title, metadata_json, source_path, agent_slug, workspace_path) in conv_rows {
         if running
             .as_ref()
             .is_some_and(|flag| !flag.load(Ordering::Relaxed))
         {
             break;
         }
-        let conv_id: i64 = row.get_typed(0)?;
-        let title: Option<String> = row.get_typed(1)?;
-        let metadata_json: Option<String> = row.get_typed(2)?;
-        let source_path: String = row.get_typed(3)?;
-        let agent_slug: String = row.get_typed(4)?;
-        let workspace_path: Option<String> = row.get_typed(5)?;
 
         let ctx = ScanContext {
             agent: Some(agent_slug),
@@ -344,24 +346,29 @@ pub fn scan_database<P: AsRef<Path>>(
             "SELECT m.id, m.idx, m.content, m.extra_json, c.id, c.source_path, COALESCE(a.slug, 'unknown'), w.path\n             FROM messages m\n             JOIN conversations c ON m.conversation_id = c.id\n             LEFT JOIN agents a ON c.agent_id = a.id\n             LEFT JOIN workspaces w ON c.workspace_id = w.id{}",
             msg_where
         );
-        let msg_param_values = params_from_iter(msg_params);
-        let msg_rows = conn.query_with_params(&msg_sql, &msg_param_values)?;
+        let msg_rows: Vec<(i64, i64, String, Option<String>, i64, String, String, Option<String>)> =
+            conn.query_all_map(&msg_sql, &msg_params, |row| {
+                Ok((
+                    row.get_typed(0)?,
+                    row.get_typed(1)?,
+                    row.get_typed(2)?,
+                    row.get_typed(3)?,
+                    row.get_typed(4)?,
+                    row.get_typed(5)?,
+                    row.get_typed(6)?,
+                    row.get_typed(7)?,
+                ))
+            })?;
 
-        for row in &msg_rows {
+        for (msg_id, msg_idx, content, extra_json, conv_id, source_path, agent_slug, workspace_path) in
+            msg_rows
+        {
             if running
                 .as_ref()
                 .is_some_and(|flag| !flag.load(Ordering::Relaxed))
             {
                 break;
             }
-            let msg_id: i64 = row.get_typed(0)?;
-            let msg_idx: i64 = row.get_typed(1)?;
-            let content: String = row.get_typed(2)?;
-            let extra_json: Option<String> = row.get_typed(3)?;
-            let conv_id: i64 = row.get_typed(4)?;
-            let source_path: String = row.get_typed(5)?;
-            let agent_slug: String = row.get_typed(6)?;
-            let workspace_path: Option<String> = row.get_typed(7)?;
 
             let ctx = ScanContext {
                 agent: Some(agent_slug),
@@ -409,23 +416,28 @@ pub fn scan_database<P: AsRef<Path>>(
             "SELECT s.snippet_text, m.id, m.idx, c.id, c.source_path, COALESCE(a.slug, 'unknown'), w.path\n             FROM snippets s\n             JOIN messages m ON s.message_id = m.id\n             JOIN conversations c ON m.conversation_id = c.id\n             LEFT JOIN agents a ON c.agent_id = a.id\n             LEFT JOIN workspaces w ON c.workspace_id = w.id{}",
             snip_where
         );
-        let snip_param_values = params_from_iter(snip_params);
-        let snip_rows = conn.query_with_params(&snip_sql, &snip_param_values)?;
+        let snip_rows: Vec<(String, i64, i64, i64, String, String, Option<String>)> =
+            conn.query_all_map(&snip_sql, &snip_params, |row| {
+                Ok((
+                    row.get_typed(0)?,
+                    row.get_typed(1)?,
+                    row.get_typed(2)?,
+                    row.get_typed(3)?,
+                    row.get_typed(4)?,
+                    row.get_typed(5)?,
+                    row.get_typed(6)?,
+                ))
+            })?;
 
-        for row in &snip_rows {
+        for (snippet_text, msg_id, msg_idx, conv_id, source_path, agent_slug, workspace_path) in
+            snip_rows
+        {
             if running
                 .as_ref()
                 .is_some_and(|flag| !flag.load(Ordering::Relaxed))
             {
                 break;
             }
-            let snippet_text: String = row.get_typed(0)?;
-            let msg_id: i64 = row.get_typed(1)?;
-            let msg_idx: i64 = row.get_typed(2)?;
-            let conv_id: i64 = row.get_typed(3)?;
-            let source_path: String = row.get_typed(4)?;
-            let agent_slug: String = row.get_typed(5)?;
-            let workspace_path: Option<String> = row.get_typed(6)?;
 
             let ctx = ScanContext {
                 agent: Some(agent_slug),
@@ -485,7 +497,7 @@ pub fn scan_database<P: AsRef<Path>>(
     })
 }
 
-fn table_exists(conn: &frankensqlite::Connection, table_name: &str) -> bool {
+fn table_exists(conn: &crate::storage::api::Conn, table_name: &str) -> bool {
     if !table_name
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
@@ -494,7 +506,7 @@ fn table_exists(conn: &frankensqlite::Connection, table_name: &str) -> bool {
     }
 
     let pragma = format!("PRAGMA table_info({table_name})");
-    conn.query_map_collect(&pragma, params![], |row| row.get_typed::<String>(1))
+    conn.query_all_map(&pragma, &[], |row| row.get_typed::<String>(1))
         .map(|columns| !columns.is_empty())
         .unwrap_or(false)
 }
