@@ -97,17 +97,6 @@ fn open_franken_with_flags(
     FrankenConnection::open_read(Path::new(path))
 }
 
-/// Stage-A-only bridge (Task A5) for `analytics::{query,validate}` call sites:
-/// that module is Task A6 batch 3 (out of this task's scope) and still takes
-/// `&frankensqlite`'s native `Connection` directly. Backed by the same
-/// `Conn::as_franken()`/`FrankenBackend::native()` escape hatch used by
-/// `run_franken_migrations`. Deleted once A6 migrates `analytics::*` to the
-/// facade and this bridge has no callers left.
-fn as_native_franken(conn: &FrankenConnection) -> &frankensqlite::Connection {
-    conn.as_franken()
-        .expect("Stage A: analytics bridge requires the franken backend")
-        .native()
-}
 use indexer::IndexOptions;
 use model::cli_error_kind::ErrorKind as CliErrorKind;
 use serde::{Deserialize, Serialize};
@@ -16877,7 +16866,7 @@ fn resolve_analytics_workspace_ids(
         return Ok(Vec::new());
     }
 
-    if !analytics::query::table_exists(as_native_franken(conn), "workspaces") {
+    if !analytics::query::table_exists(conn, "workspaces") {
         return Ok(vec![-1]);
     }
 
@@ -17262,7 +17251,7 @@ fn run_analytics_status(
     let conn = open_franken_analytics_db(&common.data_dir, db_path_override)?;
     let filter = analytics_query_filter(&conn, common)?;
 
-    analytics::query::query_status(as_native_franken(&conn), &filter)
+    analytics::query::query_status(&conn, &filter)
         .map(|r| r.to_json())
         .map_err(analytics_query_cli_error)
 }
@@ -17280,7 +17269,7 @@ fn run_analytics_tokens(
     let conn = open_franken_analytics_db(&common.data_dir, db_path_override)?;
     let filter = analytics_query_filter(&conn, common)?;
 
-    analytics::query::query_tokens_timeseries(as_native_franken(&conn), &filter, group_by.into())
+    analytics::query::query_tokens_timeseries(&conn, &filter, group_by.into())
         .map(|r| r.to_cli_json())
         .map_err(analytics_query_cli_error)
 }
@@ -17375,7 +17364,7 @@ fn run_analytics_tools(
     let conn = open_franken_analytics_db(&common.data_dir, db_path_override)?;
     let filter = analytics_query_filter(&conn, common)?;
 
-    analytics::query::query_tools(as_native_franken(&conn), &filter, group_by.into(), limit)
+    analytics::query::query_tools(&conn, &filter, group_by.into(), limit)
         .map(|r| r.to_cli_json())
         .map_err(analytics_query_cli_error)
 }
@@ -17512,7 +17501,7 @@ fn run_analytics_validate(
     let db_path = analytics_db_path(&common.data_dir, db_path_override);
 
     let pre_conn = open_franken_analytics_db(&common.data_dir, db_path_override)?;
-    let pre_report = analytics::validate::run_validation(as_native_franken(&pre_conn), &config);
+    let pre_report = analytics::validate::run_validation(&pre_conn, &config);
     let pre_summary = analytics_validation_summary(&pre_report);
     let repair_plan = fix.then(|| analytics::validate::build_repair_plan(&pre_report));
 
@@ -17526,7 +17515,7 @@ fn run_analytics_validate(
                 analytics::validate::RepairKind::RebuildTrackA => {
                     if ["messages", "conversations", "agents"]
                         .into_iter()
-                        .all(|table| analytics::query::table_exists(as_native_franken(&pre_conn), table))
+                        .all(|table| analytics::query::table_exists(&pre_conn, table))
                     {
                         let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
                             code: 9,
@@ -17627,14 +17616,14 @@ fn run_analytics_validate(
     }
 
     let conn = open_franken_analytics_db(&common.data_dir, db_path_override)?;
-    let mut report = analytics::validate::run_validation(as_native_franken(&conn), &config);
+    let mut report = analytics::validate::run_validation(&conn, &config);
     if fix {
         annotate_deferred_analytics_failures(&mut report, &deferred_check_ids);
     }
     let summary = analytics_validation_summary(&report);
 
-    let perf_ts = analytics::validate::perf_query_guardrail(as_native_franken(&conn));
-    let perf_bd = analytics::validate::perf_breakdown_guardrail(as_native_franken(&conn));
+    let perf_ts = analytics::validate::perf_query_guardrail(&conn);
+    let perf_bd = analytics::validate::perf_breakdown_guardrail(&conn);
 
     if fix {
         emit_analytics_validate_summary("pre-fix:", &pre_summary);
@@ -17741,7 +17730,7 @@ fn run_analytics_models(
 
     // Model breakdown by API tokens.
     let by_tokens = analytics::query::query_breakdown(
-        as_native_franken(&conn),
+        &conn,
         &filter,
         analytics::Dim::Model,
         analytics::Metric::ApiTotal,
@@ -17750,7 +17739,7 @@ fn run_analytics_models(
     .map_err(analytics_query_cli_error)?;
 
     // Time series for aggregate stats.
-    let ts = analytics::query::query_tokens_timeseries(as_native_franken(&conn), &filter, group_by.into())
+    let ts = analytics::query::query_tokens_timeseries(&conn, &filter, group_by.into())
         .map_err(analytics_query_cli_error)?;
 
     // Human-readable stderr summary.

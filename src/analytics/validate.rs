@@ -9,9 +9,7 @@
 //! Output is a structured [`ValidationReport`] that serialises to JSON
 //! for `cass analytics validate --json`.
 
-use frankensqlite::Connection;
-use frankensqlite::Row;
-use frankensqlite::compat::{ConnectionExt, RowExt};
+use crate::storage::api::{Conn as Connection, Row};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
@@ -326,7 +324,7 @@ pub fn run_validation(conn: &Connection, config: &ValidateConfig) -> ValidationR
 }
 
 fn query_executes(conn: &Connection, sql: &str) -> Result<(), String> {
-    conn.query_map_collect(sql, &[], |_row: &Row| Ok(()))
+    conn.query_all_map(sql, &[], |_row: &Row| Ok(()))
         .map(|_| ())
         .map_err(|err| err.to_string())
 }
@@ -443,7 +441,7 @@ fn validate_track_a(conn: &Connection, config: &ValidateConfig) -> (Vec<Check>, 
     let mut mismatches_api_cov = 0_usize;
     let mut checked = 0_usize;
 
-    let rows = match conn.query_map_collect(&sql, &[], |row: &Row| {
+    let rows = match conn.query_all_map(&sql, &[], |row: &Row| {
         Ok((
             row.get_typed::<i64>(0)?,    // day_id
             row.get_typed::<String>(1)?, // agent_slug
@@ -680,7 +678,7 @@ fn validate_track_b(conn: &Connection, config: &ValidateConfig) -> (Vec<Check>, 
     let mut mismatches_tools = 0_usize;
     let mut checked = 0_usize;
 
-    let rows = match conn.query_map_collect(&sql, &[], |row: &Row| {
+    let rows = match conn.query_all_map(&sql, &[], |row: &Row| {
         Ok((
             row.get_typed::<i64>(4)?, // tds.grand_total_tokens
             row.get_typed::<i64>(5)?, // tu.sum_total
@@ -782,7 +780,7 @@ fn validate_cross_track_drift(
     let mut drift_checked = 0_usize;
     let mut merged = BTreeMap::<(i64, String, String), (i64, i64)>::new();
 
-    let track_a_rows = match conn.query_map_collect(
+    let track_a_rows = match conn.query_all_map(
         "SELECT day_id, agent_slug, source_id, SUM(api_tokens_total) AS api_total
          FROM usage_daily
          GROUP BY day_id, agent_slug, source_id",
@@ -819,7 +817,7 @@ fn validate_cross_track_drift(
             .0 = total;
     }
 
-    let track_b_rows = match conn.query_map_collect(
+    let track_b_rows = match conn.query_all_map(
         "SELECT day_id, agent_slug, source_id, SUM(grand_total_tokens) AS grand_total
          FROM token_daily_stats
          GROUP BY day_id, agent_slug, source_id",
@@ -1198,7 +1196,7 @@ mod tests {
 
     /// Create a minimal Track A fixture (message_metrics + usage_daily).
     fn setup_track_a_fixture() -> Connection {
-        let conn = Connection::open(":memory:").unwrap();
+        let conn = Connection::open_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE message_metrics (
                 message_id INTEGER PRIMARY KEY,
@@ -1372,7 +1370,7 @@ mod tests {
         let conn = setup_track_a_fixture();
 
         // Inject drift: change usage_daily content_tokens_est_total.
-        conn.execute("UPDATE usage_daily SET content_tokens_est_total = 9999 WHERE day_id = 20254")
+        conn.execute("UPDATE usage_daily SET content_tokens_est_total = 9999 WHERE day_id = 20254", &[])
             .unwrap();
 
         let config = ValidateConfig::deep();
@@ -1392,7 +1390,7 @@ mod tests {
         let conn = setup_track_a_fixture();
 
         // Inject drift: change message_count.
-        conn.execute("UPDATE usage_daily SET message_count = 999 WHERE day_id = 20254")
+        conn.execute("UPDATE usage_daily SET message_count = 999 WHERE day_id = 20254", &[])
             .unwrap();
 
         let config = ValidateConfig::deep();
@@ -1425,10 +1423,10 @@ mod tests {
         let conn = setup_both_tracks_fixture();
 
         // Inject drift: delete token_usage row (Track B ledger).
-        conn.execute("DELETE FROM token_usage WHERE id = 1")
+        conn.execute("DELETE FROM token_usage WHERE id = 1", &[])
             .unwrap();
         // Also zero out token_daily_stats to be consistent with the deletion.
-        conn.execute("UPDATE token_daily_stats SET grand_total_tokens = 0 WHERE day_id = 20254")
+        conn.execute("UPDATE token_daily_stats SET grand_total_tokens = 0 WHERE day_id = 20254", &[])
             .unwrap();
 
         let config = ValidateConfig::deep();
@@ -1451,7 +1449,7 @@ mod tests {
         let conn = setup_track_a_fixture();
 
         // Inject negative counter.
-        conn.execute("UPDATE usage_daily SET tool_call_count = -5 WHERE day_id = 20254")
+        conn.execute("UPDATE usage_daily SET tool_call_count = -5 WHERE day_id = 20254", &[])
             .unwrap();
 
         let config = ValidateConfig::deep();
@@ -1471,7 +1469,7 @@ mod tests {
 
         // Inject bad data: coverage > message count.
         conn.execute(
-            "UPDATE usage_daily SET api_coverage_message_count = 999 WHERE day_id = 20254",
+            "UPDATE usage_daily SET api_coverage_message_count = 999 WHERE day_id = 20254", &[],
         )
         .unwrap();
 
@@ -1488,7 +1486,7 @@ mod tests {
 
     #[test]
     fn empty_database_reports_missing_tables() {
-        let conn = Connection::open(":memory:").unwrap();
+        let conn = Connection::open_memory().unwrap();
         let config = ValidateConfig::default();
         let report = run_validation(&conn, &config);
 
@@ -1567,7 +1565,7 @@ mod tests {
 
     #[test]
     fn perf_query_guardrail_reports_query_failure() {
-        let conn = Connection::open(":memory:").unwrap();
+        let conn = Connection::open_memory().unwrap();
         conn.execute_batch("CREATE TABLE usage_daily (message_count INTEGER);")
             .unwrap();
 
@@ -1579,7 +1577,7 @@ mod tests {
 
     #[test]
     fn perf_breakdown_guardrail_reports_query_failure() {
-        let conn = Connection::open(":memory:").unwrap();
+        let conn = Connection::open_memory().unwrap();
         conn.execute_batch("CREATE TABLE usage_daily (api_tokens_total INTEGER);")
             .unwrap();
 
@@ -1591,7 +1589,7 @@ mod tests {
 
     #[test]
     fn malformed_track_a_schema_reports_query_failure() {
-        let conn = Connection::open(":memory:").unwrap();
+        let conn = Connection::open_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE message_metrics (day_id INTEGER);
              CREATE TABLE usage_daily (day_id INTEGER);",
@@ -1612,7 +1610,7 @@ mod tests {
 
     #[test]
     fn malformed_track_b_schema_reports_query_failure() {
-        let conn = Connection::open(":memory:").unwrap();
+        let conn = Connection::open_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
              CREATE TABLE token_usage (day_id INTEGER, agent_id INTEGER, source_id TEXT, model_family TEXT);
@@ -1634,7 +1632,7 @@ mod tests {
 
     #[test]
     fn malformed_cross_track_schema_reports_query_failure() {
-        let conn = Connection::open(":memory:").unwrap();
+        let conn = Connection::open_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE usage_daily (day_id INTEGER);
              CREATE TABLE token_daily_stats (day_id INTEGER);",
@@ -1655,7 +1653,7 @@ mod tests {
     #[test]
     fn repair_plan_marks_track_a_failures_fixable() {
         let conn = setup_track_a_fixture();
-        conn.execute("UPDATE usage_daily SET message_count = 999 WHERE day_id = 20254")
+        conn.execute("UPDATE usage_daily SET message_count = 999 WHERE day_id = 20254", &[])
             .unwrap();
 
         let report = run_validation(&conn, &ValidateConfig::deep());
@@ -1683,7 +1681,7 @@ mod tests {
         // `token_daily_stats` rows (keeping token_usage intact) is the
         // textbook repairable scenario.
         let conn = setup_both_tracks_fixture();
-        conn.execute("DELETE FROM token_daily_stats").unwrap();
+        conn.execute("DELETE FROM token_daily_stats", &[]).unwrap();
 
         let report = run_validation(&conn, &ValidateConfig::deep());
         let plan = build_repair_plan(&report);
@@ -1710,7 +1708,7 @@ mod tests {
         // cannot recover — fall through to TrackAllRebuildUnavailable
         // which tells the operator to do a full canonical replay.
         let conn = setup_both_tracks_fixture();
-        conn.execute("DROP TABLE token_usage").unwrap();
+        conn.execute("DROP TABLE token_usage", &[]).unwrap();
 
         let report = run_validation(&conn, &ValidateConfig::deep());
         let plan = build_repair_plan(&report);
