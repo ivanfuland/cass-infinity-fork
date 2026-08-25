@@ -11,7 +11,7 @@ use frankensearch::index::{
     Quantization as FsQuantization, VectorIndex as FsVectorIndex,
     VectorIndexWriter as FsVectorIndexWriter,
 };
-use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
+use crate::storage::api::Value as ParamValue;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rayon::prelude::*;
 
@@ -692,7 +692,7 @@ fn total_semantic_conversations(storage: &FrankenStorage) -> Result<u64> {
             }
             let conversation_ids: Vec<i64> = storage
                 .raw()
-                .query_map_collect(hinted_fallback_sql, &[] as &[ParamValue], |row| {
+                .query_all_map(hinted_fallback_sql, &[] as &[ParamValue], |row| {
                     row.get_typed(0)
                 })
                 .or_else(|err| {
@@ -700,7 +700,7 @@ fn total_semantic_conversations(storage: &FrankenStorage) -> Result<u64> {
                         .to_string()
                         .contains("no such index: sqlite_autoindex_messages_1")
                     {
-                        return storage.raw().query_map_collect(
+                        return storage.raw().query_all_map(
                             fallback_sql,
                             &[] as &[ParamValue],
                             |row| row.get_typed(0),
@@ -877,7 +877,7 @@ fn fetch_canonical_embedding_conversations(
 
     storage
         .raw()
-        .query_map_collect(&envelope_sql, &params, |row| {
+        .query_all_map(&envelope_sql, &params, |row| {
             let workspace_path: Option<String> = row.get_typed(4)?;
             Ok(CanonicalEmbeddingConversationRow {
                 conversation_id: row.get_typed(0)?,
@@ -1060,7 +1060,7 @@ fn fetch_canonical_embedding_batch_inner_with_caps(
     );
     let mut conversation_ids: Vec<i64> = storage
         .raw()
-        .query_map_collect(&hinted_sql, &params, |row| row.get_typed(0))
+        .query_all_map(&hinted_sql, &params, |row| row.get_typed(0))
         .or_else(|err| {
             if err
                 .to_string()
@@ -1068,7 +1068,7 @@ fn fetch_canonical_embedding_batch_inner_with_caps(
             {
                 return storage
                     .raw()
-                    .query_map_collect(&fallback_sql, &params, |row| row.get_typed(0));
+                    .query_all_map(&fallback_sql, &params, |row| row.get_typed(0));
             }
             Err(err)
         })
@@ -1278,7 +1278,7 @@ pub(crate) fn packet_embedding_inputs_from_storage_since(
 ) -> Result<CanonicalIncrementalEmbeddingBatch> {
     let conversation_ids: Vec<i64> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT DISTINCT m.conversation_id
              FROM messages m
              WHERE m.id > ?1
@@ -4338,7 +4338,7 @@ mod tests {
         )?;
 
         let since_batch = packet_embedding_inputs_from_storage_since(&storage, watermark)?;
-        let conversation_ids: Vec<i64> = storage.raw().query_map_collect(
+        let conversation_ids: Vec<i64> = storage.raw().query_all_map(
             "SELECT DISTINCT conversation_id
              FROM messages
              WHERE id > ?1
@@ -4348,7 +4348,7 @@ mod tests {
         )?;
         let selected_message_ids: HashSet<i64> = storage
             .raw()
-            .query_map_collect(
+            .query_all_map(
                 "SELECT id
                  FROM messages
                  WHERE id > ?1
@@ -4545,7 +4545,7 @@ mod tests {
         // would normally pair with packets), then convert those rows
         // into ConversationPackets via canonical replay and feed them
         // through `semantic_inputs_from_packets`.
-        let conversation_ids: Vec<i64> = storage.raw().query_map_collect(
+        let conversation_ids: Vec<i64> = storage.raw().query_all_map(
             "SELECT DISTINCT m.conversation_id
              FROM messages m
              JOIN conversations c ON c.id = m.conversation_id
