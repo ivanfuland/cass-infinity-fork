@@ -31,10 +31,9 @@ use coding_agent_search::pages::encrypt::{DecryptionEngine, EncryptionEngine, lo
 use coding_agent_search::pages::export::{ExportEngine, ExportFilter, PathMode};
 use coding_agent_search::pages::key_management::{key_add_password, key_list, key_revoke};
 use coding_agent_search::pages::verify::verify_bundle;
+use coding_agent_search::storage::api::Conn as FrankenConnection;
+use coding_agent_search::storage::api::IntoValue;
 use coding_agent_search::storage::sqlite::SqliteStorage;
-use frankensqlite::Connection as FrankenConnection;
-use frankensqlite::compat::{ConnectionExt, RowExt};
-use frankensqlite::params;
 use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -47,11 +46,10 @@ mod util;
 use util::{ConversationFixtureBuilder, PerfMeasurement};
 
 fn count_export_messages_containing(db_path: &Path, needle: &str) -> i64 {
-    let conn =
-        FrankenConnection::open(db_path.to_string_lossy().into_owned()).expect("open export db");
+    let conn = FrankenConnection::open_read(db_path).expect("open export db");
     conn.query_row_map(
         "SELECT COUNT(*) FROM messages WHERE content LIKE ?",
-        params![format!("%{needle}%")],
+        &[format!("%{needle}%").into_value()],
         |row| row.get_typed(0),
     )
     .expect("content query")
