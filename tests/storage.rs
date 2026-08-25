@@ -2,19 +2,30 @@ use std::path::{Path, PathBuf};
 
 use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
 use coding_agent_search::sources::provenance::{LOCAL_SOURCE_ID, Source, SourceKind};
-use coding_agent_search::storage::api::Conn as FrankenConnection;
 use coding_agent_search::storage::api::Value as ParamValue;
-use coding_agent_search::storage::sqlite::{MigrationError, SqliteStorage};
+use coding_agent_search::storage::sqlite::{
+    ConnectionManagerConfig, FrankenConnectionManager, MigrationError, SqliteStorage,
+};
 
-/// Stage A note: `storage::api::Conn::open_writable` is deliberately
-/// crate-private (R2-F3), so this integration test (a separate crate)
-/// bootstraps through `FrankenStorage::open` + `into_raw()` rather than
-/// opening a bare connection directly the way the pre-migration
-/// native-`frankensqlite` version of this helper did.
-fn open_fixture_db(path: impl AsRef<Path>) -> FrankenConnection {
-    coding_agent_search::storage::sqlite::FrankenStorage::open(path.as_ref())
-        .expect("open cass fixture database")
-        .into_raw()
+/// Fix (plan delta d8 investigation, 2026-08-25): these fixtures deliberately
+/// build legacy/pre-migration schemas (v1..v4, future) that
+/// `SqliteStorage::open_or_rebuild` must detect, so they need a schema-free
+/// open. `FrankenStorage::open` is NOT schema-free -- it runs cass's real
+/// migrations first, which collided with these fixtures' own `CREATE TABLE
+/// meta` and produced "table meta already exists" panics (confirmed by a
+/// baseline-vs-candidate equivalence-gate diff: this file's tests passed on
+/// the pre-Stage-A baseline and failed on Stage A HEAD). Routes through
+/// `FrankenConnectionManager` instead, matching the bridge already used by
+/// the sibling upgrade/migration.rs and upgrade/compatibility.rs fixtures.
+fn open_fixture_db(path: impl AsRef<Path>) -> FrankenConnectionManager {
+    FrankenConnectionManager::new(
+        path.as_ref(),
+        ConnectionManagerConfig {
+            reader_count: 1,
+            max_writers: 1,
+        },
+    )
+    .expect("open cass fixture database")
 }
 
 fn sample_agent() -> Agent {
@@ -776,7 +787,9 @@ fn migration_from_v1_requires_rebuild() {
 
     // Manually create a v1 database
     {
-        let conn = open_fixture_db(&db_path);
+        let mgr = open_fixture_db(&db_path);
+        let mut guard = mgr.writer().expect("acquire fixture writer");
+        let conn = guard.storage().raw();
         conn.execute_batch(
             r"
             PRAGMA foreign_keys = ON;
@@ -850,6 +863,7 @@ fn migration_from_v1_requires_rebuild() {
             ",
         )
         .expect("create v1 schema");
+        guard.mark_committed();
     }
 
     let result = SqliteStorage::open_or_rebuild(&db_path);
@@ -880,7 +894,9 @@ fn migration_from_v2_requires_rebuild() {
 
     // Manually create a v2 database with FTS5 table
     {
-        let conn = open_fixture_db(&db_path);
+        let mgr = open_fixture_db(&db_path);
+        let mut guard = mgr.writer().expect("acquire fixture writer");
+        let conn = guard.storage().raw();
         conn.execute_batch(
             r"
             PRAGMA foreign_keys = ON;
@@ -966,6 +982,7 @@ fn migration_from_v2_requires_rebuild() {
             ",
         )
         .expect("create v2 schema");
+        guard.mark_committed();
     }
 
     let result = SqliteStorage::open_or_rebuild(&db_path);
@@ -1270,7 +1287,9 @@ fn migration_from_v3_requires_rebuild() {
 
     // Manually create a v3 database (without sources table)
     {
-        let conn = open_fixture_db(&db_path);
+        let mgr = open_fixture_db(&db_path);
+        let mut guard = mgr.writer().expect("acquire fixture writer");
+        let conn = guard.storage().raw();
         conn.execute_batch(
             r"
             PRAGMA foreign_keys = ON;
@@ -1355,6 +1374,7 @@ fn migration_from_v3_requires_rebuild() {
             ",
         )
         .expect("create v3 schema");
+        guard.mark_committed();
     }
 
     let result = SqliteStorage::open_or_rebuild(&db_path);
@@ -1511,7 +1531,9 @@ fn open_or_rebuild_requires_rebuild_for_legacy_v4_schema() {
 
     // Create a v4 database (without provenance columns in conversations)
     {
-        let conn = open_fixture_db(&db_path);
+        let mgr = open_fixture_db(&db_path);
+        let mut guard = mgr.writer().expect("acquire fixture writer");
+        let conn = guard.storage().raw();
         conn.execute_batch(
             r"
             PRAGMA foreign_keys = ON;
@@ -1599,6 +1621,7 @@ fn open_or_rebuild_requires_rebuild_for_legacy_v4_schema() {
             ",
         )
         .expect("create v4 schema");
+        guard.mark_committed();
     }
 
     // Open with open_or_rebuild - should migrate successfully
@@ -1630,7 +1653,9 @@ fn open_or_rebuild_triggers_rebuild_for_future_version() {
 
     // Create a database with a future schema version
     {
-        let conn = open_fixture_db(&db_path);
+        let mgr = open_fixture_db(&db_path);
+        let mut guard = mgr.writer().expect("acquire fixture writer");
+        let conn = guard.storage().raw();
         conn.execute_batch(
             r"
             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -1638,6 +1663,7 @@ fn open_or_rebuild_triggers_rebuild_for_future_version() {
             ",
         )
         .expect("create future schema");
+        guard.mark_committed();
     }
 
     // Open with open_or_rebuild - should trigger rebuild

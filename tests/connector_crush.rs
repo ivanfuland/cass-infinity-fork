@@ -20,37 +20,52 @@ macro_rules! params {
     };
 }
 
-/// Stage A note: `storage::api::Conn::open_writable` is deliberately
-/// crate-private (R2-F3), so this integration test (a separate crate)
-/// bootstraps through `FrankenStorage::open` + `into_raw()` rather than
-/// opening a bare, schema-free connection the way the pre-migration
-/// native-`frankensqlite` version of this helper did.
-fn create_crush_db(path: &Path) -> Connection {
-    let conn = coding_agent_search::storage::sqlite::FrankenStorage::open(path)
-        .expect("open crush db")
-        .into_raw();
-    conn.execute(
-        "CREATE TABLE sessions (
-            id TEXT PRIMARY KEY,
-            title TEXT,
-            prompt_tokens INTEGER,
-            completion_tokens INTEGER,
-            cost REAL
-        )", &[],
+/// Fix (plan delta d8 investigation, 2026-08-25): `FrankenStorage::open` is
+/// NOT schema-free -- it runs cass's real migrations first, which already
+/// create a `messages` table and collided with this fixture's own
+/// `CREATE TABLE messages` ("table messages already exists", confirmed by a
+/// baseline-vs-candidate equivalence-gate diff: this file's tests passed on
+/// the pre-Stage-A baseline and failed on Stage A HEAD). Routes through the
+/// schema-free `FrankenConnectionManager` instead, matching the bridge used
+/// by tests/pages_fts.rs and tests/storage.rs's own fixtures.
+fn create_crush_db(
+    path: &Path,
+) -> coding_agent_search::storage::sqlite::FrankenConnectionManager {
+    let mgr = coding_agent_search::storage::sqlite::FrankenConnectionManager::new(
+        path,
+        coding_agent_search::storage::sqlite::ConnectionManagerConfig {
+            reader_count: 1,
+            max_writers: 1,
+        },
     )
-    .expect("create sessions");
-    conn.execute(
-        "CREATE TABLE messages (
-            session_id TEXT,
-            role TEXT,
-            parts TEXT,
-            created_at INTEGER,
-            model TEXT,
-            provider TEXT
-        )", &[],
-    )
-    .expect("create messages");
-    conn
+    .expect("open crush db");
+    {
+        let mut guard = mgr.writer().expect("acquire crush schema writer");
+        let conn = guard.storage().raw();
+        conn.execute(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                title TEXT,
+                prompt_tokens INTEGER,
+                completion_tokens INTEGER,
+                cost REAL
+            )", &[],
+        )
+        .expect("create sessions");
+        conn.execute(
+            "CREATE TABLE messages (
+                session_id TEXT,
+                role TEXT,
+                parts TEXT,
+                created_at INTEGER,
+                model TEXT,
+                provider TEXT
+            )", &[],
+        )
+        .expect("create messages");
+        guard.mark_committed();
+    }
+    mgr
 }
 
 fn scan_db(path: &Path) -> Vec<coding_agent_search::connectors::NormalizedConversation> {
@@ -97,7 +112,9 @@ fn insert_crush_message(
 fn crush_happy_path_preserves_sqlite_session_fields() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("crush.db");
-    let conn = create_crush_db(&db_path);
+    let mgr = create_crush_db(&db_path);
+    let mut guard = mgr.writer().expect("acquire crush fixture writer");
+    let conn = guard.storage().raw();
 
     conn.execute(
         "INSERT INTO sessions (id, title, prompt_tokens, completion_tokens, cost)
@@ -131,7 +148,9 @@ fn crush_happy_path_preserves_sqlite_session_fields() {
         ],
     )
     .expect("insert assistant message");
-    drop(conn);
+    guard.mark_committed();
+    drop(guard);
+    drop(mgr);
 
     let convs = scan_db(&db_path);
     assert_eq!(convs.len(), 1);
@@ -165,7 +184,9 @@ fn crush_happy_path_preserves_sqlite_session_fields() {
 fn crush_multiple_sessions_ignore_orphans_and_preserve_metadata_ownership() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("crush-multi.db");
-    let conn = create_crush_db(&db_path);
+    let mgr = create_crush_db(&db_path);
+    let mut guard = mgr.writer().expect("acquire crush fixture writer");
+    let conn = guard.storage().raw();
 
     // Insert sessions in reverse lexical order; the connector contract sorts
     // by session id and then message timestamp.
@@ -208,7 +229,9 @@ fn crush_multiple_sessions_ignore_orphans_and_preserve_metadata_ownership() {
         None,
         None,
     );
-    drop(conn);
+    guard.mark_committed();
+    drop(guard);
+    drop(mgr);
 
     let convs = scan_db(&db_path);
     assert_eq!(
