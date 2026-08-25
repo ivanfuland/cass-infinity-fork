@@ -4,9 +4,9 @@ use super::cass_bin;
 use super::doctor_fixture::{
     DoctorFixtureFactory, DoctorFixtureScenario, default_expected_artifact_keys,
 };
-use coding_agent_search::storage::sqlite::SqliteStorage;
-use frankensqlite::Connection as FrankenConnection;
-use frankensqlite::compat::ConnectionExt;
+use coding_agent_search::storage::sqlite::{
+    ConnectionManagerConfig, FrankenConnectionManager, SqliteStorage,
+};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -3142,20 +3142,32 @@ fn write_doctor_e2e_sqlite_marker_db(path: &Path, marker: &str) -> Result<(), St
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| format!("create sqlite parent: {err}"))?;
     }
-    let conn = FrankenConnection::open(path.to_string_lossy().into_owned())
-        .map_err(|err| format!("create doctor backup fixture sqlite db: {err}"))?;
-    conn.execute_compat(
+    let mgr = FrankenConnectionManager::new(
+        path,
+        ConnectionManagerConfig {
+            reader_count: 1,
+            max_writers: 1,
+        },
+    )
+    .map_err(|err| format!("create doctor backup fixture sqlite db: {err}"))?;
+    let mut guard = mgr
+        .writer()
+        .map_err(|err| format!("acquire doctor backup fixture writer: {err}"))?;
+    let conn = guard.storage().raw();
+    conn.execute(
         "CREATE TABLE IF NOT EXISTS restore_probe(marker TEXT NOT NULL)",
-        frankensqlite::params![],
+        &[],
     )
     .map_err(|err| format!("create doctor backup fixture marker table: {err}"))?;
-    conn.execute_compat(
+    conn.execute(
         "INSERT INTO restore_probe(marker) VALUES (?1)",
-        frankensqlite::params![marker],
+        &[coding_agent_search::storage::api::IntoValue::into_value(marker)],
     )
     .map_err(|err| format!("write doctor backup fixture sqlite marker: {err}"))?;
-    let _ = conn.query("PRAGMA wal_checkpoint(TRUNCATE);");
-    drop(conn);
+    let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+    guard.mark_committed();
+    drop(guard);
+    drop(mgr);
     Ok(())
 }
 
