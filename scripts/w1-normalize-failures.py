@@ -40,6 +40,13 @@ LOC_RE = re.compile(r'\S+\.rs:\d+:\d+')
 ADDR_RE = re.compile(r'\b0x[0-9a-fA-F]+\b')
 TIME_RE = re.compile(r'\bfinished in [\d.]+s\b')
 ABS_PATH_RE = re.compile(r'/[^\s:]+/([A-Za-z0-9_.\-]+\.rs)')
+# plan delta d8: cross-run thread ids in "thread '<name>' (<PID>) panicked" are not
+# stable (random per-process), so leaving them in makes two runs of the identical
+# assertion normalize to different strings and get misclassified as a new failure
+# form. Same for the ephemeral first-level /tmp/<random> segment (tempfile-crate
+# dirs, per-worktree CARGO_TARGET_DIR hash) that appears throughout panic payloads.
+THREAD_PID_RE = re.compile(r"(thread '[^']*') \(\d+\) panicked")
+TMPDIR_RE = re.compile(r'/tmp/[^/\s]+')
 
 
 def normalize_mode(text):
@@ -47,6 +54,8 @@ def normalize_mode(text):
     t = ADDR_RE.sub('<ADDR>', t)
     t = TIME_RE.sub('<TIME>', t)
     t = ABS_PATH_RE.sub(r'<PATH>/\1', t)
+    t = THREAD_PID_RE.sub(r'\1 (<PID>) panicked', t)
+    t = TMPDIR_RE.sub('/tmp/<TMPDIR>', t)
     t = re.sub(r'\s+', ' ', t).strip()
     return t
 
