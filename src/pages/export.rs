@@ -104,11 +104,15 @@ impl ExportEngine {
             dest.execute_batch(
                 // Pages exports are encrypted/copied as one portable SQLite file.
                 // WAL would allow committed schema/data to remain in a sidecar
-                // that is not part of the encrypted payload.
+                // that is not part of the encrypted payload. foreign_keys is no
+                // longer set here (w1b Task B2b, R0-B3): every storage::api
+                // connection now enforces it at open time, and the api layer
+                // rejects any SQL text mentioning `foreign_keys` as a
+                // defense-in-depth guard -- this line would now be rejected,
+                // not just redundant.
                 "PRAGMA journal_mode = 'delete';
                  PRAGMA synchronous = NORMAL;
-                 PRAGMA busy_timeout = 5000;
-                 PRAGMA foreign_keys = ON;",
+                 PRAGMA busy_timeout = 5000;",
             )
             .context("Failed to set destination database PRAGMAs")?;
 

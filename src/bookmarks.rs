@@ -116,12 +116,17 @@ impl BookmarkStore {
         let conn = Connection::open_writable(path, crate::storage::api::Profile::Production)
             .with_context(|| format!("opening bookmarks db at {}", path.display()))?;
 
-        // Apply pragmas for performance and concurrency safety
+        // Apply pragmas for performance and concurrency safety. foreign_keys
+        // is no longer set here (w1b Task B2b, R0-B3): every storage::api
+        // connection now enforces it at open time (backend_franken.rs's
+        // `enforce_foreign_keys`), and the api layer rejects any SQL text
+        // mentioning `foreign_keys` as a defense-in-depth guard against
+        // toggling it (see `reject_foreign_keys_keyword`) -- this line would
+        // now be rejected, not just redundant.
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
-             PRAGMA busy_timeout = 5000;
-             PRAGMA foreign_keys = ON;",
+             PRAGMA busy_timeout = 5000;",
         )?;
 
         // Create schema if needed

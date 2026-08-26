@@ -85,6 +85,34 @@ impl<'a> Row<'a> {
     }
 }
 
+/// w1b Task B2b (R0-B3, R3-N7, R4-B3): the api layer provides no capability
+/// to turn foreign key enforcement off -- `Conn`/`Tx` construction never
+/// exposes such a knob -- but `execute`/`execute_batch` still accept
+/// arbitrary SQL text, so that guarantee is not structurally airtight on the
+/// string channel (R3-N7's own honest admission). This is the defense-in-
+/// depth layer for that gap: reject (rather than silently execute) any SQL
+/// whose full text mentions the literal `foreign_keys` keyword,
+/// case-insensitively. R4-B3: scans the *entire* text, not a prefix check --
+/// a prefix check is trivially bypassed by a multi-statement batch like
+/// `"SELECT 1; PRAGMA foreign_keys=OFF"`. False-positive risk is accepted:
+/// ordinary business SQL never contains this identifier, and even a comment
+/// mentioning it should fail loud rather than risk a real bypass slipping
+/// through. This is the depth layer behind two others: the runtime
+/// `foreign_keys=ON` readback assertion (Task B2, `backend_sqlite.rs`) and
+/// the `grep` gate over `src/`/`tests/` for literal `foreign_keys = OFF`.
+fn reject_foreign_keys_keyword(sql: &str) -> Result<(), StorageError> {
+    if sql.to_ascii_lowercase().contains("foreign_keys") {
+        return Err(StorageError::Other {
+            code: None,
+            detail: "SQL text references 'foreign_keys'; storage::api does not allow \
+                     toggling foreign key enforcement (use Tx::defer_foreign_keys() for \
+                     legitimate out-of-order writes inside a transaction)"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
 fn path_to_str(path: &Path) -> Result<&str, StorageError> {
     path.to_str().ok_or_else(|| StorageError::Other {
         code: None,
@@ -202,10 +230,31 @@ impl Conn {
     }
 
     pub fn execute(&self, sql: &str, params: &[Value]) -> Result<usize, StorageError> {
+        reject_foreign_keys_keyword(sql)?;
         self.inner.execute(sql, params)
     }
 
     pub fn execute_batch(&self, sql: &str) -> Result<(), StorageError> {
+        reject_foreign_keys_keyword(sql)?;
+        self.inner.execute_batch(sql)
+    }
+
+    /// w1b Task B2b (R0-B3) exception, Ivan-adjudicated 2026-08-26:
+    /// crate-internal escape hatch for the exactly three test fixtures
+    /// (`storage::sqlite::tests::cleanup_orphan_fk_rows_*`) that must plant
+    /// a genuine FK-orphan row -- a child referencing an already-missing
+    /// parent -- to test the cass#202 self-heal (`cleanup_orphan_fk_rows`)
+    /// finding and removing it. That state is structurally unreachable
+    /// through any FK-respecting SQL (the constraint itself is what
+    /// prevents it), so it cannot go through `execute_batch`'s
+    /// `reject_foreign_keys_keyword` guard. Deliberately `pub(crate)`, not
+    /// `pub`: invisible outside this crate, so it can never become a de
+    /// facto public "turn FK off" capability, and its name is unambiguous
+    /// about what it is for anyone who greps for it.
+    pub(crate) fn execute_batch_bypassing_foreign_keys_guard(
+        &self,
+        sql: &str,
+    ) -> Result<(), StorageError> {
         self.inner.execute_batch(sql)
     }
 
@@ -293,11 +342,51 @@ pub struct Tx<'c> {
 
 impl Tx<'_> {
     pub fn execute(&self, sql: &str, params: &[Value]) -> Result<usize, StorageError> {
+        reject_foreign_keys_keyword(sql)?;
         self.backend.execute(sql, params)
     }
 
     pub fn execute_batch(&self, sql: &str) -> Result<(), StorageError> {
+        reject_foreign_keys_keyword(sql)?;
         self.backend.execute_batch(sql)
+    }
+
+    /// Legitimate out-of-order multi-statement writes inside a transaction
+    /// (plan Task B2b, R0-B3): SQLite's own `defer_foreign_keys` pragma
+    /// delays FK checking from per-statement to commit time, scoped to this
+    /// transaction only (SQLite resets it automatically at COMMIT/ROLLBACK,
+    /// so it can never leak into a later transaction on the same
+    /// connection). Exposed as an explicit, named method rather than being
+    /// reachable through `execute`/`execute_batch` (which reject any SQL
+    /// mentioning `foreign_keys`, see `reject_foreign_keys_keyword`) so it
+    /// can't be invoked by accident or smuggled through arbitrary SQL text
+    /// — it calls the backend directly, bypassing that guard on purpose.
+    ///
+    /// Reads the pragma back and errors if it didn't actually engage
+    /// (discovered live, not hypothetical: the current production backend,
+    /// frankensqlite, silently no-ops this pragma -- `execute_batch`
+    /// returns `Ok(())` but per-statement FK checking stays in effect, and
+    /// `PRAGMA defer_foreign_keys;` returns zero rows, meaning it doesn't
+    /// recognize the pragma at all. Without this readback, a caller relying
+    /// on deferred checking for a legitimate out-of-order write would get a
+    /// silent, wrong immediate-check failure instead. `backend_sqlite.rs`'s
+    /// own tests confirm real SQLite honors this pragma correctly; the
+    /// error path here only fires on a backend that doesn't).
+    pub fn defer_foreign_keys(&self) -> Result<(), StorageError> {
+        self.backend.execute_batch("PRAGMA defer_foreign_keys = ON;")?;
+        let engaged =
+            self.query_row_map("PRAGMA defer_foreign_keys;", &[], |r| r.get_typed::<i64>(0))
+                .unwrap_or(0);
+        if engaged != 1 {
+            return Err(StorageError::Other {
+                code: None,
+                detail: "PRAGMA defer_foreign_keys did not engage on this connection -- this \
+                         backend does not support deferred FK checking, so out-of-order \
+                         writes inside a transaction are not available here"
+                    .to_string(),
+            });
+        }
+        Ok(())
     }
 
     pub fn query_row_map<T>(
@@ -421,5 +510,81 @@ mod tests {
         assert_eq!(n, 0);
         assert!(reader.execute("INSERT INTO t(id) VALUES (1)", &[]).is_err());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn api_execute_rejects_sql_mentioning_foreign_keys() {
+        // R4-B3: full-text scan, not a prefix check -- a multi-statement
+        // batch smuggling the keyword after a leading innocuous statement
+        // must still be caught.
+        let c = Conn::open_memory().unwrap();
+        assert!(matches!(
+            c.execute_batch("PRAGMA foreign_keys = OFF;"),
+            Err(StorageError::Other { .. })
+        ));
+        assert!(matches!(
+            c.execute_batch("SELECT 1; PRAGMA foreign_keys=OFF;"),
+            Err(StorageError::Other { .. })
+        ));
+        assert!(matches!(
+            c.execute("PRAGMA FOREIGN_KEYS = OFF", &[]),
+            Err(StorageError::Other { .. })
+        ), "must be case-insensitive");
+    }
+
+    #[test]
+    fn api_foreign_keys_stay_on_across_batch_write_and_orphan_insert_fails() {
+        // plan Task B2b Step 2's integration test: a batch write path (a
+        // well-ordered multi-statement transaction -- parent before child,
+        // the shape every real batch write actually uses) must not leave FK
+        // enforcement off afterward, and a genuine orphan insert outside
+        // that transaction must still be rejected as a real `Constraint`
+        // error (see `api_defer_foreign_keys_errors_on_unsupported_backend`
+        // below for the separate out-of-order/deferred-check path, which
+        // the current production backend doesn't support).
+        let c = Conn::open_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE parent(id INTEGER PRIMARY KEY);
+             CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER NOT NULL REFERENCES parent(id));",
+        )
+        .unwrap();
+
+        {
+            let tx = c.transaction().unwrap();
+            tx.execute("INSERT INTO parent(id) VALUES (100)", &[]).unwrap();
+            tx.execute("INSERT INTO child(id, parent_id) VALUES (1, 100)", &[]).unwrap();
+            tx.commit().unwrap();
+        }
+
+        let fk: i64 =
+            c.query_row_map("PRAGMA foreign_keys;", &[], |r| r.get_typed(0)).unwrap();
+        assert_eq!(fk, 1, "foreign_keys must remain ON after a batch-write transaction");
+
+        let err = c
+            .execute("INSERT INTO child(id, parent_id) VALUES (2, 999)", &[])
+            .unwrap_err();
+        assert!(matches!(err, StorageError::Constraint { .. }));
+    }
+
+    #[test]
+    fn api_defer_foreign_keys_errors_on_unsupported_backend() {
+        // R0-B3 death judgment, discovered live while wiring up this task's
+        // own integration test: the current production backend
+        // (frankensqlite) does not implement `PRAGMA defer_foreign_keys` --
+        // `execute_batch` accepts the SET form without error but has no
+        // actual deferring effect (the very next statement still trips an
+        // immediate constraint failure), and the GET form returns zero rows.
+        // `defer_foreign_keys()`'s own readback self-check must catch this
+        // and fail loudly rather than let a caller believe out-of-order
+        // writes are safe when they silently aren't.
+        // `backend_sqlite.rs`'s tests confirm real SQLite (the eventual
+        // production backend, Task B2) honors this pragma correctly --
+        // this is a today-only limitation of the currently-active backend,
+        // not a defect in the deferred-check design itself.
+        let c = Conn::open_memory().unwrap();
+        c.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY);").unwrap();
+        let tx = c.transaction().unwrap();
+        let err = tx.defer_foreign_keys().unwrap_err();
+        assert!(matches!(err, StorageError::Other { .. }));
     }
 }

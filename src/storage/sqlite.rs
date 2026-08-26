@@ -3303,8 +3303,6 @@ const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
 
 #[cfg(test)]
 const MIGRATION_V1: &str = r"
-PRAGMA foreign_keys = ON;
-
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -4558,10 +4556,14 @@ impl FrankenStorage {
             .execute("PRAGMA cache_size = -65536;", &[])
             .with_context(|| "setting cache_size")?;
 
-        // foreign_keys: enable constraint enforcement.
-        self.conn
-            .execute("PRAGMA foreign_keys = ON;", &[])
-            .with_context(|| "setting foreign_keys")?;
+        // foreign_keys is no longer set here (w1b Task B2b, R0-B3): `self.conn`
+        // is `storage::api::Conn` (see the `Conn as FrankenConnection` import
+        // alias at the top of this file), whose underlying backend now
+        // enforces `foreign_keys = ON` unconditionally at open time
+        // (`backend_franken.rs`'s `enforce_foreign_keys`) -- this call is both
+        // redundant and, since the api layer now rejects any SQL text
+        // mentioning `foreign_keys` as a defense-in-depth guard against
+        // toggling it (see `reject_foreign_keys_keyword`), would fail outright.
 
         // busy_timeout: 5 seconds (in milliseconds).
         self.conn
@@ -4627,9 +4629,8 @@ impl FrankenStorage {
         self.conn
             .execute("PRAGMA cache_size = -65536;", &[])
             .with_context(|| "setting cache_size")?;
-        self.conn
-            .execute("PRAGMA foreign_keys = ON;", &[])
-            .with_context(|| "setting foreign_keys")?;
+        // foreign_keys: see the comment on `apply_config` above -- redundant
+        // and now rejected outright (w1b Task B2b, R0-B3).
         Ok(())
     }
 
@@ -23076,19 +23077,15 @@ mod tests {
                 .unwrap();
         }
 
-        storage.conn.execute("PRAGMA foreign_keys = OFF", &[]).unwrap();
+        // w1b Task B2b (R0-B3): `messages.conversation_id` carries `ON DELETE
+        // CASCADE` (schema MIGRATION_V21) -- with FK enforcement on (the
+        // connection default now, no more toggling it off), deleting the
+        // `conversations` rows below cascades the matching `messages` rows
+        // automatically; no separate cleanup delete needed.
         storage
             .conn
             .execute("DELETE FROM conversations WHERE id IN (2, 4)", fparams![])
             .unwrap();
-        storage
-            .conn
-            .execute(
-                "DELETE FROM messages WHERE conversation_id IN (2, 4)",
-                fparams![],
-            )
-            .unwrap();
-        storage.conn.execute("PRAGMA foreign_keys = ON", &[]).unwrap();
 
         let (agent_slugs, workspace_paths) = storage.build_lexical_rebuild_lookups().unwrap();
 
@@ -23177,7 +23174,9 @@ mod tests {
                 .unwrap();
         }
 
-        storage.conn.execute("PRAGMA foreign_keys = OFF", &[]).unwrap();
+        // w1b Task B2b (R0-B3): see the sibling test above -- `ON DELETE
+        // CASCADE` on `messages.conversation_id` cascades this delete with
+        // FK enforcement on, no separate cleanup delete needed.
         storage
             .conn
             .execute(
@@ -23185,14 +23184,6 @@ mod tests {
                 fparams![],
             )
             .unwrap();
-        storage
-            .conn
-            .execute(
-                "DELETE FROM messages WHERE conversation_id IN (3, 5, 7, 8)",
-                fparams![],
-            )
-            .unwrap();
-        storage.conn.execute("PRAGMA foreign_keys = ON", &[]).unwrap();
 
         let (agent_slugs, workspace_paths) = storage.build_lexical_rebuild_lookups().unwrap();
 
@@ -23679,7 +23670,21 @@ mod tests {
             .insert_conversation_tree(agent_id, None, &conversation)
             .unwrap()
             .conversation_id;
-        storage.conn.execute("PRAGMA foreign_keys = OFF", &[]).unwrap();
+        // w1b Task B2b (R0-B3): blank-but-present remote source, same pattern
+        // as commit 069397b5 (seed_analytics_remote_source_*_fixture) -- a
+        // real `sources` row is required so the simulated "blank remote
+        // source_id" mutation below satisfies the FK on
+        // conversations.source_id (matches how a real ingest path would
+        // register any source before referencing it) instead of needing FK
+        // enforcement turned off.
+        storage
+            .conn
+            .execute(
+                "INSERT OR IGNORE INTO sources(id, kind, host_label, created_at, updated_at)
+                 VALUES ('   ', 'remote', NULL, strftime('%s','now')*1000, strftime('%s','now')*1000)",
+                &[],
+            )
+            .unwrap();
         storage
             .conn
             .execute(
@@ -23687,7 +23692,6 @@ mod tests {
                 fparams!["   ", "dev@laptop", conversation_id],
             )
             .unwrap();
-        storage.conn.execute("PRAGMA foreign_keys = ON", &[]).unwrap();
 
         let listed = storage.list_conversations(10, 0).unwrap();
         assert_eq!(listed.len(), 1);
@@ -28970,9 +28974,22 @@ mod tests {
         let db_path = dir.path().join("orphan_fk_self_heal.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
 
-        // Plant orphan rows directly: rows whose FK parent does not exist.
-        // FK enforcement is temporarily off so the planted rows can land.
-        storage.raw().execute("PRAGMA foreign_keys = OFF", &[]).unwrap();
+        // w1b Task B2b (R0-B3) exception, Ivan-adjudicated 2026-08-26: this
+        // FK-OFF toggle is a deliberate, narrow test-fixture exception, kept
+        // (not retired like the other 8 sites this task removed). Its job is
+        // to simulate the exact corrupted state `cleanup_orphan_fk_rows`
+        // exists to repair -- a child row whose FK parent is already gone
+        // (cass#202's crash-mid-transaction scenario). With FK enforcement
+        // truly on for every ordinary connection (this task's whole point),
+        // that state is structurally unreachable through any normal insert:
+        // the constraint itself is what prevents a child from ever
+        // referencing a missing parent. There is no `defer_foreign_keys` or
+        // reordering trick that produces it either -- deferred checking
+        // still runs at commit and would reject the very row this test
+        // needs to persist. Retiring this site would mean deleting the
+        // test's ability to construct its own regression fixture, not
+        // fixing a design flaw.
+        storage.raw().execute_batch_bypassing_foreign_keys_guard("PRAGMA foreign_keys = OFF").unwrap();
 
         // Seed a real conversation so a subset of children DO have valid
         // parents — we want the cleanup to be precise, not a table-flush.
@@ -29054,7 +29071,7 @@ mod tests {
             )
             .unwrap();
 
-        storage.raw().execute("PRAGMA foreign_keys = ON", &[]).unwrap();
+        storage.raw().execute_batch_bypassing_foreign_keys_guard("PRAGMA foreign_keys = ON").unwrap();
 
         // Sanity: the planted orphans are visible.
         let messages_before: i64 = storage
@@ -29149,7 +29166,10 @@ mod tests {
         let storage = FrankenStorage::open(&db_path).unwrap();
         let orphan_count = ORPHAN_FK_ID_CHUNK_SIZE + 3;
 
-        storage.raw().execute("PRAGMA foreign_keys = OFF", &[]).unwrap();
+        // w1b Task B2b (R0-B3) exception -- see
+        // `cleanup_orphan_fk_rows_removes_orphans_and_is_noop_on_clean_db`'s
+        // comment above for why this FK-OFF toggle is deliberately kept.
+        storage.raw().execute_batch_bypassing_foreign_keys_guard("PRAGMA foreign_keys = OFF").unwrap();
         {
             let mut tx = storage.raw().transaction().unwrap();
             for idx in 0..orphan_count {
@@ -29172,7 +29192,7 @@ mod tests {
             }
             tx.commit().unwrap();
         }
-        storage.raw().execute("PRAGMA foreign_keys = ON", &[]).unwrap();
+        storage.raw().execute_batch_bypassing_foreign_keys_guard("PRAGMA foreign_keys = ON").unwrap();
 
         let report = storage.cleanup_orphan_fk_rows().unwrap();
 
@@ -29206,7 +29226,10 @@ mod tests {
         let storage = FrankenStorage::open(&db_path).unwrap();
         let orphan_count = (ORPHAN_FK_ID_CHUNK_SIZE * 2) + 5;
 
-        storage.raw().execute("PRAGMA foreign_keys = OFF", &[]).unwrap();
+        // w1b Task B2b (R0-B3) exception -- see
+        // `cleanup_orphan_fk_rows_removes_orphans_and_is_noop_on_clean_db`'s
+        // comment above for why this FK-OFF toggle is deliberately kept.
+        storage.raw().execute_batch_bypassing_foreign_keys_guard("PRAGMA foreign_keys = OFF").unwrap();
         {
             let mut tx = storage.raw().transaction().unwrap();
             for idx in 0..orphan_count {
@@ -29222,7 +29245,7 @@ mod tests {
             }
             tx.commit().unwrap();
         }
-        storage.raw().execute("PRAGMA foreign_keys = ON", &[]).unwrap();
+        storage.raw().execute_batch_bypassing_foreign_keys_guard("PRAGMA foreign_keys = ON").unwrap();
 
         let report = storage.cleanup_orphan_fk_rows().unwrap();
 

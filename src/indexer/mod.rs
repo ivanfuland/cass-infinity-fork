@@ -25930,20 +25930,21 @@ pub mod persist {
         apply_index_writer_busy_timeout(&writer);
         apply_index_writer_checkpoint_policy(&writer, defer_checkpoints);
 
-        // CASS #169: Disable database-level FK enforcement on ephemeral writers.
-        // All insert paths already guarantee FK parent records exist at the
-        // application level (ensure_agent, ensure_workspace,
-        // ensure_embedded_source_registered), so SQLite FK checks are redundant.
-        // After sustained write activity (~39 min), frankensqlite's cursor cache
-        // can report false-positive FK constraint violations that PRAGMA
-        // foreign_key_check confirms do not actually exist.
-        if let Err(err) = writer.raw().execute("PRAGMA foreign_keys = OFF", &[]) {
-            tracing::debug!(
-                error = %err,
-                context,
-                "failed to disable FK enforcement on ephemeral writer"
-            );
-        }
+        // w1b Task B2b (R0-B3): CASS #169 used to disable FK enforcement here
+        // to work around a frankensqlite cursor-cache bug (false-positive FK
+        // violations after ~39min of sustained write activity, confirmed
+        // spurious by `PRAGMA foreign_key_check`) on the theory that
+        // application-level guarantees (ensure_agent/ensure_workspace/
+        // ensure_embedded_source_registered) made DB-level enforcement
+        // redundant. Spec R0-B07 requires every connection to keep FK
+        // enforcement on -- "the application layer already guarantees it" is
+        // exactly the assumption this wave's own FK-orphan fixes (P0,
+        // commit 069397b5) disproved elsewhere, and leaving FK off here
+        // would let a real orphan silently land instead of failing loudly.
+        // Removed rather than reworked into a defer/retry: this isn't an
+        // insert-ordering problem `defer_foreign_keys` could paper over, and
+        // if the cursor-cache false-positive still exists it is now visible
+        // (and diagnosable) instead of masked.
 
         let result = f(&writer);
 
@@ -26107,13 +26108,8 @@ pub mod persist {
             )
         })?;
         apply_begin_concurrent_writer_tuning(&franken, defer_checkpoints);
-        // CASS #169: Disable FK enforcement — see with_ephemeral_writer for rationale.
-        if let Err(err) = franken.raw().execute("PRAGMA foreign_keys = OFF", &[]) {
-            tracing::debug!(
-                error = %err,
-                "failed to disable FK enforcement on serial fallback writer"
-            );
-        }
+        // w1b Task B2b (R0-B3): CASS #169 FK-disable removed -- see the
+        // longer rationale on `with_ephemeral_writer`'s equivalent site.
         let fallback_retries = max_retries.max(12);
         let result =
             persist_chunk_with_writer(&franken, base_idx, chunk, internal_chunk, fallback_retries);
@@ -26257,14 +26253,9 @@ pub mod persist {
                     )
                 })?;
                 apply_begin_concurrent_writer_tuning(&franken, defer_checkpoints);
-                // CASS #169: Disable FK enforcement — see with_ephemeral_writer for rationale.
-                if let Err(err) = franken.raw().execute("PRAGMA foreign_keys = OFF", &[]) {
-                    tracing::debug!(
-                        error = %err,
-                        chunk_idx,
-                        "failed to disable FK enforcement on begin-concurrent writer"
-                    );
-                }
+                // w1b Task B2b (R0-B3): CASS #169 FK-disable removed -- see
+                // the longer rationale on `with_ephemeral_writer`'s
+                // equivalent site.
                 let result = persist_chunk_with_writer(
                     &franken,
                     base_idx,

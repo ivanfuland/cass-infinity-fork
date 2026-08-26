@@ -334,6 +334,50 @@ mod tests {
     }
 
     #[test]
+    fn defer_foreign_keys_permits_out_of_order_write_then_resets_after_commit() {
+        // w1b Task B2b (R0-B3): real SQLite (unlike the current production
+        // frankensqlite backend, see conn.rs's
+        // `api_defer_foreign_keys_errors_on_unsupported_backend`) genuinely
+        // implements `defer_foreign_keys` -- this proves the mechanism
+        // `Tx::defer_foreign_keys()` relies on actually works once this
+        // backend is the one in use.
+        let backend = open_mem();
+        backend
+            .execute_batch(
+                "CREATE TABLE parent(id INTEGER PRIMARY KEY);
+                 CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER NOT NULL REFERENCES parent(id));",
+            )
+            .unwrap();
+
+        backend.begin(TxMode::Deferred).unwrap();
+        backend.execute_batch("PRAGMA defer_foreign_keys = ON;").unwrap();
+        let mut engaged = 0_i64;
+        backend
+            .query_map("PRAGMA defer_foreign_keys;", &[], &mut |row| {
+                engaged = i64::from_value(row.get_value(0)?)?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(engaged, 1, "real SQLite must report defer_foreign_keys engaged");
+
+        // Child inserted before its parent exists -- would fail immediately
+        // under per-statement checking, must succeed here.
+        backend.execute("INSERT INTO child(id, parent_id) VALUES (1, 100)", &[]).unwrap();
+        backend.execute("INSERT INTO parent(id) VALUES (100)", &[]).unwrap();
+        backend.commit().unwrap();
+
+        // A second transaction that leaves an orphan unresolved must still
+        // fail -- defer_foreign_keys is transaction-scoped and must not
+        // leak past commit.
+        backend.begin(TxMode::Deferred).unwrap();
+        let err = backend
+            .execute("INSERT INTO child(id, parent_id) VALUES (2, 999)", &[])
+            .expect_err("unresolved orphan must fail once the prior transaction committed");
+        assert!(matches!(err, StorageError::Constraint { .. }));
+        backend.rollback().unwrap();
+    }
+
+    #[test]
     fn production_profile_pragma_readback_on_real_file() {
         // plan B2 Step 1: not the declarative `PragmaPlan` shape (covered by
         // `production_profile_pragma_plan` below) -- an actual Production-
@@ -458,6 +502,40 @@ mod tests {
         unsafe {
             std::env::remove_var(super::super::config::BULK_REBUILD_UNSAFE_ENV);
         }
+    }
+
+    #[test]
+    fn bulk_rebuild_unsafe_nondurable_actually_applies_through_real_open() {
+        // Not just the declarative `PragmaPlan` shape (covered above) -- a
+        // real `open_writable(Profile::BulkRebuild)` call with the env var
+        // set, proving `apply_profile`'s `unsafe_nondurable_warning` branch
+        // (which does `eprintln!` -- plan @702's mandatory warning-on-open
+        // log line) actually executes on the real code path, not just in a
+        // unit test of the plan struct in isolation.
+        let dir = std::env::temp_dir()
+            .join(format!("cc-cass-w1b-b2-bulkrebuild-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("t.db");
+        unsafe {
+            std::env::set_var(super::super::config::BULK_REBUILD_UNSAFE_ENV, "1");
+        }
+        let backend =
+            SqliteBackend::open_writable(db_path.to_str().unwrap(), Profile::BulkRebuild).unwrap();
+        unsafe {
+            std::env::remove_var(super::super::config::BULK_REBUILD_UNSAFE_ENV);
+        }
+
+        let mut synchronous = -1_i64;
+        backend
+            .query_map("PRAGMA synchronous;", &[], &mut |row| {
+                synchronous = i64::from_value(row.get_value(0)?)?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(synchronous, 1, "unsafe-nondurable BulkRebuild must actually read back NORMAL(1)");
+
+        drop(backend);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

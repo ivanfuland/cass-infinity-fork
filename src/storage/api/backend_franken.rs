@@ -16,18 +16,35 @@ pub(crate) struct FrankenBackend {
 
 impl FrankenBackend {
     pub(crate) fn open(path: &str) -> Result<Self, StorageError> {
-        FrankenConnection::open(path).map(|conn| Self { conn }).map_err(map_franken_err)
+        let conn = FrankenConnection::open(path).map_err(map_franken_err)?;
+        enforce_foreign_keys(&conn)?;
+        Ok(Self { conn })
     }
 
     pub(crate) fn open_read_only(path: &str) -> Result<Self, StorageError> {
-        open_franken_with_flags(path, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map(|conn| Self { conn })
-            .map_err(map_franken_err)
+        let conn = open_franken_with_flags(path, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(map_franken_err)?;
+        enforce_foreign_keys(&conn)?;
+        Ok(Self { conn })
     }
 
     pub(crate) fn open_memory() -> Result<Self, StorageError> {
-        FrankenConnection::open(":memory:").map(|conn| Self { conn }).map_err(map_franken_err)
+        let conn = FrankenConnection::open(":memory:").map_err(map_franken_err)?;
+        enforce_foreign_keys(&conn)?;
+        Ok(Self { conn })
     }
+}
+
+/// w1b Task B2b (R0-B3): spec R0-B07 requires every `storage::api` connection
+/// to enforce FK constraints -- discovered missing here while wiring up
+/// B2b's own integration test (`conn.rs::api_foreign_keys_stay_on_across_
+/// batch_write_and_orphan_insert_fails`), not something this backend ever
+/// had. `backend_sqlite.rs` (Task B2) applies this as part of its full
+/// `Profile`-driven PRAGMA plan; this backend doesn't branch on `Profile`
+/// (Stage A doc comment on `config.rs`), so it just applies the one rule
+/// that's constant across every profile.
+fn enforce_foreign_keys(conn: &FrankenConnection) -> Result<(), StorageError> {
+    conn.execute_batch("PRAGMA foreign_keys = ON;").map_err(map_franken_err)
 }
 
 fn sqlite_to_value(v: &SqliteValue) -> Value {
