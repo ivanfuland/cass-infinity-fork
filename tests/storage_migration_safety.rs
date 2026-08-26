@@ -1,12 +1,32 @@
-use coding_agent_search::storage::sqlite::{MigrationError, SqliteStorage};
-use frankensqlite::Connection;
+use coding_agent_search::storage::sqlite::{
+    ConnectionManagerConfig, FrankenConnectionManager, MigrationError, SqliteStorage,
+};
 use std::path::Path;
 use tempfile::TempDir;
 
+/// Open a writer connection with no cass migrations applied. These fixtures
+/// intentionally build legacy/corrupt/pre-migration schemas that
+/// `SqliteStorage::open_or_rebuild` must detect and reject, so migrating
+/// them first (as `FrankenStorage::open` would) defeats the test's purpose.
+fn raw_fixture_writer(path: &Path) -> FrankenConnectionManager {
+    FrankenConnectionManager::new(
+        path,
+        ConnectionManagerConfig {
+            reader_count: 1,
+            max_writers: 1,
+        },
+    )
+    .expect("open raw fixture writer")
+}
+
 // Helper to create a V1 database with some data
 fn create_v1_db(path: &Path) {
-    let conn = Connection::open(path.to_string_lossy().as_ref()).expect("create v1 db");
-    conn.execute_batch(
+    let mgr = raw_fixture_writer(path);
+    let mut guard = mgr.writer().expect("acquire fixture writer");
+    guard
+        .storage()
+        .raw()
+        .execute_batch(
         r"
         PRAGMA foreign_keys = ON;
         CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -82,8 +102,9 @@ fn create_v1_db(path: &Path) {
         INSERT INTO messages(conversation_id, idx, role, content, created_at)
         VALUES (1, 0, 'user', 'Hello from V1', 2000);
         ",
-    )
-    .expect("setup v1 schema/data");
+        )
+        .expect("setup v1 schema/data");
+    guard.mark_committed();
 }
 
 #[test]
@@ -152,9 +173,14 @@ fn test_missing_meta_triggers_rebuild() {
 
     // Create a valid SQLite DB but without meta table (simulating very old or broken state)
     {
-        let conn = Connection::open(db_path.to_string_lossy().as_ref()).unwrap();
-        conn.execute("CREATE TABLE some_table (id INTEGER)")
+        let mgr = raw_fixture_writer(&db_path);
+        let mut guard = mgr.writer().unwrap();
+        guard
+            .storage()
+            .raw()
+            .execute("CREATE TABLE some_table (id INTEGER)", &[])
             .unwrap();
+        guard.mark_committed();
     }
 
     let result = SqliteStorage::open_or_rebuild(&db_path);
@@ -172,11 +198,17 @@ fn test_future_schema_triggers_rebuild() {
     let db_path = tmp.path().join("future.db");
 
     {
-        let conn = Connection::open(db_path.to_string_lossy().as_ref()).unwrap();
-        conn.execute("CREATE TABLE meta (key TEXT, value TEXT)")
+        let mgr = raw_fixture_writer(&db_path);
+        let mut guard = mgr.writer().unwrap();
+        let conn = guard.storage().raw();
+        conn.execute("CREATE TABLE meta (key TEXT, value TEXT)", &[])
             .unwrap();
-        conn.execute("INSERT INTO meta VALUES ('schema_version', '9999')")
-            .unwrap();
+        conn.execute(
+            "INSERT INTO meta VALUES ('schema_version', '9999')",
+            &[],
+        )
+        .unwrap();
+        guard.mark_committed();
     }
 
     let result = SqliteStorage::open_or_rebuild(&db_path);

@@ -22,20 +22,34 @@
 #[test]
 #[ignore = "manual diagnostic for bead mot85; run with --ignored"]
 fn probe_mot85_fsqlite_writable_schema_writes() {
-    use frankensqlite::Connection as FrankenConnection;
+    use coding_agent_search::storage::sqlite::{ConnectionManagerConfig, FrankenConnectionManager};
+
     let tmpdir = tempfile::tempdir().unwrap();
     let db_path = tmpdir.path().join("probe.db");
-    let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned()).unwrap();
-    conn.execute("CREATE TABLE foo (id INTEGER)").unwrap();
-    let pragma = conn.execute("PRAGMA writable_schema = ON");
+    // No cass migrations here on purpose: this probe tests raw upstream
+    // sqlite_master/writable_schema behavior, not cass's own schema.
+    let mgr = FrankenConnectionManager::new(
+        &db_path,
+        ConnectionManagerConfig {
+            reader_count: 1,
+            max_writers: 1,
+        },
+    )
+    .unwrap();
+    let mut guard = mgr.writer().unwrap();
+    let conn = guard.storage().raw();
+    conn.execute("CREATE TABLE foo (id INTEGER)", &[]).unwrap();
+    let pragma = conn.execute("PRAGMA writable_schema = ON", &[]);
     eprintln!("[mot85-probe] writable_schema=ON result: {pragma:?}");
     let insert = conn.execute(
         "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql) \
          VALUES('table', 'fixture_tbl', 'fixture_tbl', 0, 'CREATE TABLE fixture_tbl(x)')",
+        &[],
     );
     eprintln!("[mot85-probe] INSERT sqlite_master result: {insert:?}");
     assert!(
         insert.is_ok(),
         "mot85 is still blocked upstream: INSERT INTO sqlite_master returned {insert:?}"
     );
+    guard.mark_committed();
 }

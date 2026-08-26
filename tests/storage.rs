@@ -2,13 +2,30 @@ use std::path::{Path, PathBuf};
 
 use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
 use coding_agent_search::sources::provenance::{LOCAL_SOURCE_ID, Source, SourceKind};
-use coding_agent_search::storage::sqlite::{MigrationError, SqliteStorage};
-use frankensqlite::Connection as FrankenConnection;
-use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
+use coding_agent_search::storage::api::Value as ParamValue;
+use coding_agent_search::storage::sqlite::{
+    ConnectionManagerConfig, FrankenConnectionManager, MigrationError, SqliteStorage,
+};
 
-fn open_fixture_db(path: impl AsRef<Path>) -> FrankenConnection {
-    let path = path.as_ref().to_string_lossy();
-    FrankenConnection::open(path.as_ref()).expect("open frankensqlite fixture database")
+/// Fix (plan delta d8 investigation, 2026-08-25): these fixtures deliberately
+/// build legacy/pre-migration schemas (v1..v4, future) that
+/// `SqliteStorage::open_or_rebuild` must detect, so they need a schema-free
+/// open. `FrankenStorage::open` is NOT schema-free -- it runs cass's real
+/// migrations first, which collided with these fixtures' own `CREATE TABLE
+/// meta` and produced "table meta already exists" panics (confirmed by a
+/// baseline-vs-candidate equivalence-gate diff: this file's tests passed on
+/// the pre-Stage-A baseline and failed on Stage A HEAD). Routes through
+/// `FrankenConnectionManager` instead, matching the bridge already used by
+/// the sibling upgrade/migration.rs and upgrade/compatibility.rs fixtures.
+fn open_fixture_db(path: impl AsRef<Path>) -> FrankenConnectionManager {
+    FrankenConnectionManager::new(
+        path.as_ref(),
+        ConnectionManagerConfig {
+            reader_count: 1,
+            max_writers: 1,
+        },
+    )
+    .expect("open cass fixture database")
 }
 
 fn sample_agent() -> Agent {
@@ -65,7 +82,7 @@ fn schema_version_uses_schema_migrations_after_open() {
 
     // `_schema_migrations` is authoritative now, so removing the legacy
     // compatibility row must not break schema version reporting.
-    storage.raw().execute("DELETE FROM meta").unwrap();
+    storage.raw().execute("DELETE FROM meta", &[]).unwrap();
     assert!(
         matches!(
             storage.schema_version(),
@@ -111,7 +128,7 @@ fn rebuild_fts_repopulates_rows() {
 
     storage
         .raw()
-        .execute("DROP TABLE IF EXISTS fts_messages")
+        .execute("DROP TABLE IF EXISTS fts_messages", &[])
         .unwrap();
     let fts_table_count: i64 = storage
         .raw()
@@ -174,7 +191,7 @@ fn insert_conversation_tree_succeeds_without_db_resident_fts() {
     let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
     storage
         .raw()
-        .execute("DROP TABLE IF EXISTS fts_messages")
+        .execute("DROP TABLE IF EXISTS fts_messages", &[])
         .unwrap();
 
     let conv = sample_conv(None, vec![msg(0, 1)]);
@@ -225,7 +242,7 @@ fn insert_conversations_batched_succeeds_without_db_resident_fts() {
 
     storage
         .raw()
-        .execute("DROP TABLE IF EXISTS fts_messages")
+        .execute("DROP TABLE IF EXISTS fts_messages", &[])
         .unwrap();
 
     let result = storage.insert_conversations_batched(&refs);
@@ -285,7 +302,7 @@ fn append_only_updates_existing_conversation() {
 
     let rows: Vec<(i64, i64)> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT idx, created_at FROM messages ORDER BY idx",
             &[],
             |r| Ok((r.get_typed(0)?, r.get_typed::<Option<i64>>(1)?.unwrap())),
@@ -353,7 +370,7 @@ fn large_batch_insert_can_materialize_derived_fts() {
     // Spot check a few message rows for correct ordering and timestamps
     let rows: Vec<(i64, i64)> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT idx, created_at FROM messages ORDER BY idx LIMIT 3 OFFSET 197",
             &[],
             |r| Ok((r.get_typed(0)?, r.get_typed::<Option<i64>>(1)?.unwrap())),
@@ -405,7 +422,7 @@ fn open_ignores_stale_meta_schema_version_once_schema_migrations_exist() {
     // Poison the schema_version to an unsupported future value
     storage
         .raw()
-        .execute("UPDATE meta SET value = '999' WHERE key = 'schema_version'")
+        .execute("UPDATE meta SET value = '999' WHERE key = 'schema_version'", &[])
         .unwrap();
     drop(storage); // Close connection before reopening
 
@@ -434,7 +451,7 @@ fn fresh_db_creates_all_tables() {
     // Query sqlite_master for table names
     let tables: Vec<String> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
             &[],
             |r| r.get_typed(0),
@@ -486,7 +503,7 @@ fn fresh_db_creates_all_indexes() {
 
     let indexes: Vec<String> = storage
         .raw()
-        .query_map_collect("SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%' ORDER BY name", &[], |r| r.get_typed(0))
+        .query_all_map("SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%' ORDER BY name", &[], |r| r.get_typed(0))
         .unwrap();
 
     assert!(
@@ -500,7 +517,7 @@ fn fresh_db_creates_all_indexes() {
 
     let message_indexes: Vec<String> = storage
         .raw()
-        .query_map_collect("PRAGMA index_list(messages)", &[], |r| r.get_typed(1))
+        .query_all_map("PRAGMA index_list(messages)", &[], |r| r.get_typed(1))
         .unwrap();
     assert!(
         message_indexes.contains(&"sqlite_autoindex_messages_1".to_string()),
@@ -521,23 +538,23 @@ fn migration_v16_drops_redundant_message_conv_idx() {
         storage
             .raw()
             .execute(
-                "CREATE INDEX IF NOT EXISTS idx_messages_conv_idx ON messages(conversation_id, idx)",
+                "CREATE INDEX IF NOT EXISTS idx_messages_conv_idx ON messages(conversation_id, idx)", &[],
             )
             .unwrap();
         storage
             .raw()
-            .execute("DELETE FROM _schema_migrations WHERE version = 16")
+            .execute("DELETE FROM _schema_migrations WHERE version = 16", &[])
             .unwrap();
         storage
             .raw()
-            .execute("UPDATE meta SET value = '15' WHERE key = 'schema_version'")
+            .execute("UPDATE meta SET value = '15' WHERE key = 'schema_version'", &[])
             .unwrap();
     }
 
     let storage = SqliteStorage::open(&db_path).expect("reopen migrated db");
     let message_indexes: Vec<String> = storage
         .raw()
-        .query_map_collect("PRAGMA index_list(messages)", &[], |r| r.get_typed(1))
+        .query_all_map("PRAGMA index_list(messages)", &[], |r| r.get_typed(1))
         .unwrap();
     assert!(
         message_indexes.contains(&"sqlite_autoindex_messages_1".to_string()),
@@ -557,22 +574,22 @@ fn migration_v17_drops_message_created_idx() {
         let storage = SqliteStorage::open(&db_path).expect("open");
         storage
             .raw()
-            .execute("CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at)")
+            .execute("CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at)", &[])
             .unwrap();
         storage
             .raw()
-            .execute("DELETE FROM _schema_migrations WHERE version = 17")
+            .execute("DELETE FROM _schema_migrations WHERE version = 17", &[])
             .unwrap();
         storage
             .raw()
-            .execute("UPDATE meta SET value = '16' WHERE key = 'schema_version'")
+            .execute("UPDATE meta SET value = '16' WHERE key = 'schema_version'", &[])
             .unwrap();
     }
 
     let storage = SqliteStorage::open(&db_path).expect("reopen migrated db");
     let message_indexes: Vec<String> = storage
         .raw()
-        .query_map_collect("PRAGMA index_list(messages)", &[], |r| r.get_typed(1))
+        .query_all_map("PRAGMA index_list(messages)", &[], |r| r.get_typed(1))
         .unwrap();
     assert!(
         !message_indexes.contains(&"idx_messages_created".to_string()),
@@ -588,7 +605,7 @@ fn agents_table_has_correct_columns() {
 
     let columns: Vec<String> = storage
         .raw()
-        .query_map_collect("PRAGMA table_info(agents)", &[], |r| {
+        .query_all_map("PRAGMA table_info(agents)", &[], |r| {
             r.get_typed::<String>(1)
         })
         .unwrap();
@@ -622,7 +639,7 @@ fn conversations_table_has_correct_columns() {
 
     let columns: Vec<String> = storage
         .raw()
-        .query_map_collect("PRAGMA table_info(conversations)", &[], |r| {
+        .query_all_map("PRAGMA table_info(conversations)", &[], |r| {
             r.get_typed::<String>(1)
         })
         .unwrap();
@@ -662,7 +679,7 @@ fn messages_table_has_correct_columns() {
 
     let columns: Vec<String> = storage
         .raw()
-        .query_map_collect("PRAGMA table_info(messages)", &[], |r| {
+        .query_all_map("PRAGMA table_info(messages)", &[], |r| {
             r.get_typed::<String>(1)
         })
         .unwrap();
@@ -770,7 +787,9 @@ fn migration_from_v1_requires_rebuild() {
 
     // Manually create a v1 database
     {
-        let conn = open_fixture_db(&db_path);
+        let mgr = open_fixture_db(&db_path);
+        let mut guard = mgr.writer().expect("acquire fixture writer");
+        let conn = guard.storage().raw();
         conn.execute_batch(
             r"
             PRAGMA foreign_keys = ON;
@@ -844,6 +863,7 @@ fn migration_from_v1_requires_rebuild() {
             ",
         )
         .expect("create v1 schema");
+        guard.mark_committed();
     }
 
     let result = SqliteStorage::open_or_rebuild(&db_path);
@@ -874,7 +894,9 @@ fn migration_from_v2_requires_rebuild() {
 
     // Manually create a v2 database with FTS5 table
     {
-        let conn = open_fixture_db(&db_path);
+        let mgr = open_fixture_db(&db_path);
+        let mut guard = mgr.writer().expect("acquire fixture writer");
+        let conn = guard.storage().raw();
         conn.execute_batch(
             r"
             PRAGMA foreign_keys = ON;
@@ -960,6 +982,7 @@ fn migration_from_v2_requires_rebuild() {
             ",
         )
         .expect("create v2 schema");
+        guard.mark_committed();
     }
 
     let result = SqliteStorage::open_or_rebuild(&db_path);
@@ -1009,13 +1032,13 @@ fn unique_constraints_work() {
     storage
         .raw()
         .execute(
-            "INSERT INTO agents(slug, name, kind, created_at, updated_at) VALUES('test', 'Test', 'cli', 0, 0)",
+            "INSERT INTO agents(slug, name, kind, created_at, updated_at) VALUES('test', 'Test', 'cli', 0, 0)", &[],
         )
         .expect("first insert");
 
     // Try to insert duplicate slug
     let result = storage.raw().execute(
-        "INSERT INTO agents(slug, name, kind, created_at, updated_at) VALUES('test', 'Test2', 'cli', 0, 0)",
+        "INSERT INTO agents(slug, name, kind, created_at, updated_at) VALUES('test', 'Test2', 'cli', 0, 0)", &[],
     );
 
     assert!(
@@ -1242,7 +1265,7 @@ fn sources_table_has_correct_columns() {
 
     let columns: Vec<String> = storage
         .raw()
-        .query_map_collect("PRAGMA table_info(sources)", &[], |r| {
+        .query_all_map("PRAGMA table_info(sources)", &[], |r| {
             r.get_typed::<String>(1)
         })
         .unwrap();
@@ -1264,7 +1287,9 @@ fn migration_from_v3_requires_rebuild() {
 
     // Manually create a v3 database (without sources table)
     {
-        let conn = open_fixture_db(&db_path);
+        let mgr = open_fixture_db(&db_path);
+        let mut guard = mgr.writer().expect("acquire fixture writer");
+        let conn = guard.storage().raw();
         conn.execute_batch(
             r"
             PRAGMA foreign_keys = ON;
@@ -1349,6 +1374,7 @@ fn migration_from_v3_requires_rebuild() {
             ",
         )
         .expect("create v3 schema");
+        guard.mark_committed();
     }
 
     let result = SqliteStorage::open_or_rebuild(&db_path);
@@ -1505,7 +1531,9 @@ fn open_or_rebuild_requires_rebuild_for_legacy_v4_schema() {
 
     // Create a v4 database (without provenance columns in conversations)
     {
-        let conn = open_fixture_db(&db_path);
+        let mgr = open_fixture_db(&db_path);
+        let mut guard = mgr.writer().expect("acquire fixture writer");
+        let conn = guard.storage().raw();
         conn.execute_batch(
             r"
             PRAGMA foreign_keys = ON;
@@ -1593,6 +1621,7 @@ fn open_or_rebuild_requires_rebuild_for_legacy_v4_schema() {
             ",
         )
         .expect("create v4 schema");
+        guard.mark_committed();
     }
 
     // Open with open_or_rebuild - should migrate successfully
@@ -1624,7 +1653,9 @@ fn open_or_rebuild_triggers_rebuild_for_future_version() {
 
     // Create a database with a future schema version
     {
-        let conn = open_fixture_db(&db_path);
+        let mgr = open_fixture_db(&db_path);
+        let mut guard = mgr.writer().expect("acquire fixture writer");
+        let conn = guard.storage().raw();
         conn.execute_batch(
             r"
             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -1632,6 +1663,7 @@ fn open_or_rebuild_triggers_rebuild_for_future_version() {
             ",
         )
         .expect("create future schema");
+        guard.mark_committed();
     }
 
     // Open with open_or_rebuild - should trigger rebuild
@@ -1761,7 +1793,7 @@ fn timeline_source_filter_local_only() {
     // Query with source_id = 'local' filter
     let local_only: Vec<String> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT c.external_id FROM conversations c
              WHERE c.source_id = 'local'
              ORDER BY c.started_at DESC",
@@ -1826,7 +1858,7 @@ fn timeline_source_filter_remote_only() {
     // Query with source_id != 'local' (remote filter)
     let remote_only: Vec<String> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT c.external_id FROM conversations c
              WHERE c.source_id != 'local'
              ORDER BY c.started_at DESC",
@@ -1898,7 +1930,7 @@ fn timeline_source_filter_specific_source() {
     // Query with source_id = 'laptop' (specific source)
     let laptop_only: Vec<String> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT c.external_id FROM conversations c
              WHERE c.source_id = 'laptop'
              ORDER BY c.started_at DESC",
@@ -1953,7 +1985,7 @@ fn timeline_json_includes_source_id_field() {
     // Query with source_id field selection (simulates timeline JSON output)
     let result: Vec<(i64, String)> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT c.id, c.source_id FROM conversations c
              WHERE c.source_id IS NOT NULL",
             &[],
@@ -2018,7 +2050,7 @@ fn timeline_json_includes_origin_kind_field() {
     // Query with origin_kind from sources table (matches timeline SQL)
     let results: Vec<(String, String, String)> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT c.source_id, c.origin_host, s.kind as origin_kind
              FROM conversations c
              LEFT JOIN sources s ON c.source_id = s.id
@@ -2094,7 +2126,7 @@ fn timeline_json_includes_origin_host_field() {
     // Query origin_host field
     let results: Vec<(String, Option<String>)> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT c.source_id, c.origin_host FROM conversations c ORDER BY c.source_id",
             &[],
             |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
@@ -2169,7 +2201,7 @@ fn timeline_json_grouped_output_includes_provenance() {
     // Query all provenance fields as timeline JSON would
     let results: Vec<(i64, String, Option<String>, Option<String>)> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT c.id, c.source_id, c.origin_host, s.kind as origin_kind
              FROM conversations c
              LEFT JOIN sources s ON c.source_id = s.id",
@@ -2220,7 +2252,7 @@ fn daily_stats_table_created_on_fresh_db() {
     // Check that daily_stats table exists
     let tables: Vec<String> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='daily_stats'",
             &[],
             |r| r.get_typed(0),
@@ -2232,7 +2264,7 @@ fn daily_stats_table_created_on_fresh_db() {
     // Check columns
     let columns: Vec<String> = storage
         .raw()
-        .query_map_collect("PRAGMA table_info(daily_stats)", &[], |r| {
+        .query_all_map("PRAGMA table_info(daily_stats)", &[], |r| {
             r.get_typed::<String>(1)
         })
         .unwrap();
@@ -2603,7 +2635,7 @@ fn daily_stats_null_timestamp_consistency() {
     // Check that the session was placed at day_id=0, not a negative day_id
     let day_ids: Vec<i64> = storage
         .raw()
-        .query_map_collect("SELECT DISTINCT day_id FROM daily_stats WHERE agent_slug = 'all' AND source_id = 'all'", &[], |r| r.get_typed(0))
+        .query_all_map("SELECT DISTINCT day_id FROM daily_stats WHERE agent_slug = 'all' AND source_id = 'all'", &[], |r| r.get_typed(0))
         .unwrap();
 
     assert_eq!(day_ids.len(), 1, "should have exactly 1 day_id");
@@ -2746,14 +2778,14 @@ use coding_agent_search::storage::sqlite::IndexingCache;
 fn dump_agent_workspace_state(storage: &SqliteStorage) -> (Vec<(i64, String)>, Vec<(i64, String)>) {
     let agents: Vec<(i64, String)> = storage
         .raw()
-        .query_map_collect("SELECT id, slug FROM agents ORDER BY slug", &[], |r| {
+        .query_all_map("SELECT id, slug FROM agents ORDER BY slug", &[], |r| {
             Ok((r.get_typed(0)?, r.get_typed(1)?))
         })
         .unwrap();
 
     let workspaces: Vec<(i64, String)> = storage
         .raw()
-        .query_map_collect("SELECT id, path FROM workspaces ORDER BY path", &[], |r| {
+        .query_all_map("SELECT id, path FROM workspaces ORDER BY path", &[], |r| {
             Ok((r.get_typed(0)?, r.get_typed(1)?))
         })
         .unwrap();

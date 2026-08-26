@@ -19,7 +19,7 @@
 //! This module is the classification contract:
 //! - [`ContentionClass`] separates busy/locked, busy-recovery, snapshot
 //!   conflict, stale WAL/SHM sidecar, stale searcher/cache, and host-pressure.
-//! - [`classify_franken_error`] maps a real `frankensqlite::FrankenError` to
+//! - [`classify_franken_error`] maps a `storage::api::StorageError` to
 //!   its contention class (or `None` when the error is not contention — e.g.
 //!   corruption, which is a `.14.1` integrity state, not a transient).
 //! - [`Retryability`] + [`BoundedWaitGuidance`] give retry/backoff advice that
@@ -38,6 +38,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::search::storage_integrity::StorageState;
+use crate::storage::api::StorageError;
 
 /// Schema version for the contention-report JSON contract.
 pub(crate) const CONTENTION_REPORT_SCHEMA_VERSION: u32 = 1;
@@ -188,30 +189,38 @@ impl ContentionClass {
     }
 }
 
-/// Map a real `frankensqlite::FrankenError` to its contention class, or `None`
+/// Map a `storage::api::StorageError` to its contention class, or `None`
 /// when the error is not a transient/contention class (e.g. corruption, which
 /// is a `.14.1` integrity state). The struct variants are matched with `{ .. }`
 /// so this stays robust to field-shape changes, with a catch-all for any
 /// future non-contention variant.
-pub(crate) fn classify_franken_error(err: &frankensqlite::FrankenError) -> Option<ContentionClass> {
-    use frankensqlite::FrankenError as E;
+///
+/// Stage A note: the native engine distinguished `Busy` (another writer holds
+/// the lock) from `BusyRecovery` (hot-journal recovery in progress); the
+/// `storage::api` facade's `map_franken_err` collapses both into
+/// `StorageError::Busy { scope: BusyScope::Statement }` (see
+/// `storage/api/backend_franken.rs`). This classifier therefore can no longer
+/// independently reach [`ContentionClass::BusyRecovery`] — that finer split
+/// is out of scope for this type-only migration and belongs to the B5
+/// redesign of this module's classification contract.
+pub(crate) fn classify_franken_error(err: &StorageError) -> Option<ContentionClass> {
+    use crate::storage::api::BusyScope;
     match err {
-        E::Busy => Some(ContentionClass::BusyLocked),
-        E::BusyRecovery => Some(ContentionClass::BusyRecovery),
-        E::BusySnapshot { .. } | E::WriteConflict { .. } | E::SerializationFailure { .. } => {
-            Some(ContentionClass::SnapshotConflict)
+        StorageError::Busy { scope: BusyScope::Statement } | StorageError::Locked => {
+            Some(ContentionClass::BusyLocked)
         }
+        StorageError::Busy { scope: BusyScope::Snapshot } => Some(ContentionClass::SnapshotConflict),
         // Corruption is NOT contention — it is a `.14.1` IntegrityFailed state
         // handled by the storage-integrity probe, never auto-retried here.
         _ => None,
     }
 }
 
-/// Whether a `frankensqlite::FrankenError` is a retryable contention error
+/// Whether a `storage::api::StorageError` is a retryable contention error
 /// (busy/recovery/snapshot conflict). Mirrors the retry predicate used by the
 /// connection-manager backoff loop, but driven by the shared classifier so the
 /// two never disagree.
-pub(crate) fn is_retryable_contention(err: &frankensqlite::FrankenError) -> bool {
+pub(crate) fn is_retryable_contention(err: &StorageError) -> bool {
     classify_franken_error(err)
         .is_some_and(|c| matches!(c.retryability(), Retryability::RetryAfterBackoff))
 }
@@ -382,9 +391,9 @@ impl ContentionReport {
         }
     }
 
-    /// Build the verdict directly from a `frankensqlite::FrankenError`, or
+    /// Build the verdict directly from a `storage::api::StorageError`, or
     /// `None` when the error is not a contention class (e.g. corruption).
-    pub(crate) fn from_franken_error(err: &frankensqlite::FrankenError) -> Option<Self> {
+    pub(crate) fn from_franken_error(err: &StorageError) -> Option<Self> {
         classify_franken_error(err).map(|class| Self::classify(class, None))
     }
 }
@@ -587,36 +596,40 @@ mod tests {
 
     #[test]
     fn classify_franken_error_maps_busy_variants_and_skips_corruption() {
-        use frankensqlite::FrankenError as E;
-        // Busy / recovery are concrete unit variants — safe to construct.
+        use crate::storage::api::BusyScope;
         assert_eq!(
-            classify_franken_error(&E::Busy),
+            classify_franken_error(&StorageError::Busy { scope: BusyScope::Statement }),
             Some(ContentionClass::BusyLocked)
         );
         assert_eq!(
-            classify_franken_error(&E::BusyRecovery),
-            Some(ContentionClass::BusyRecovery)
+            classify_franken_error(&StorageError::Locked),
+            Some(ContentionClass::BusyLocked)
         );
-        assert!(is_retryable_contention(&E::Busy));
-        assert!(is_retryable_contention(&E::BusyRecovery));
+        assert_eq!(
+            classify_franken_error(&StorageError::Busy { scope: BusyScope::Snapshot }),
+            Some(ContentionClass::SnapshotConflict)
+        );
+        assert!(is_retryable_contention(&StorageError::Busy { scope: BusyScope::Statement }));
+        assert!(is_retryable_contention(&StorageError::Busy { scope: BusyScope::Snapshot }));
         // A non-contention error classifies to None and is not retryable here.
-        assert_eq!(classify_franken_error(&E::QueryReturnedNoRows), None);
-        assert!(!is_retryable_contention(&E::QueryReturnedNoRows));
+        assert_eq!(
+            classify_franken_error(&StorageError::Other { code: None, detail: String::new() }),
+            None
+        );
+        assert!(!is_retryable_contention(&StorageError::Other { code: None, detail: String::new() }));
     }
 }
 
-/// Integration coverage: real reader/writer contention on a frankensqlite-backed
+/// Integration coverage: real reader/writer contention on a storage::api-backed
 /// temp DB. Mirrors the proven concurrent-stress pattern (anyhow + downcast to
-/// `FrankenError`, `concurrent_writer`, `execute_compat`) but drives the retry
+/// `StorageError`, `concurrent_writer`) but drives the retry
 /// loop through this module's shared classifier, proving that every MVCC commit
 /// conflict is classified as a retryable contention class (never archive loss),
 /// that bounded retry converges, and that no update is lost.
 #[cfg(test)]
 mod contention_integration_tests {
-    use super::{ContentionClass, classify_franken_error};
+    use super::{ContentionClass, StorageError, classify_franken_error};
     use crate::storage::sqlite::{ConnectionManagerConfig, FrankenConnectionManager, WriterGuard};
-    use frankensqlite::compat::{RowExt, TransactionExt};
-    use frankensqlite::params as fparams;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -625,13 +638,13 @@ mod contention_integration_tests {
     /// One blind-increment transaction against the hot counter row. A fresh
     /// transaction per call reads the latest committed value, so a retried
     /// commit lands exactly one increment — no lost updates. Returns the raw
-    /// `anyhow` error so the caller can downcast to `FrankenError` and classify
+    /// `anyhow` error so the caller can downcast to `StorageError` and classify
     /// the contention, mirroring the production retry loop.
     fn try_increment(guard: &WriterGuard<'_>) -> anyhow::Result<()> {
-        let mut tx = guard.storage().raw().transaction()?;
-        tx.execute_compat(
+        let tx = guard.storage().raw().transaction()?;
+        tx.execute(
             "UPDATE counter SET v = v + ?1 WHERE id = 1",
-            fparams![1_i64],
+            &crate::storage::api::params![1_i64],
         )?;
         tx.commit()?;
         Ok(())
@@ -654,12 +667,12 @@ mod contention_integration_tests {
             guard
                 .storage()
                 .raw()
-                .execute("CREATE TABLE counter (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)")
+                .execute("CREATE TABLE counter (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)", &[])
                 .expect("create table");
             guard
                 .storage()
                 .raw()
-                .execute("INSERT INTO counter (id, v) VALUES (1, 0)")
+                .execute("INSERT INTO counter (id, v) VALUES (1, 0)", &[])
                 .expect("seed counter");
             guard.mark_committed();
         }
@@ -690,10 +703,10 @@ mod contention_integration_tests {
                                 }
                                 Err(err) => {
                                     let franken = err
-                                        .downcast_ref::<frankensqlite::FrankenError>()
+                                        .downcast_ref::<StorageError>()
                                         .or_else(|| {
                                             err.root_cause()
-                                                .downcast_ref::<frankensqlite::FrankenError>()
+                                                .downcast_ref::<StorageError>()
                                         });
                                     let class = franken.and_then(classify_franken_error);
                                     match class {
@@ -743,10 +756,9 @@ mod contention_integration_tests {
         // Bounded retry converged with no lost updates: the hot counter equals
         // every successful increment.
         let reader = mgr.reader();
-        let rows = reader
-            .query("SELECT v FROM counter WHERE id = 1")
+        let final_v: i64 = reader
+            .query_row_map("SELECT v FROM counter WHERE id = 1", &[], |row| row.get_typed(0))
             .expect("read counter");
-        let final_v: i64 = rows[0].get_typed(0).expect("typed counter");
         assert_eq!(
             final_v,
             (num_threads * incr_per_thread) as i64,

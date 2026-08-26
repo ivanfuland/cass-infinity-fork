@@ -12,9 +12,45 @@ use coding_agent_search::evidence_bundle::{
     EvidenceBundleChunk, EvidenceBundleChunkRole, EvidenceBundleKind, EvidenceBundleManifest,
 };
 use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
-use frankensqlite::compat::{ConnectionExt, RowExt};
-use frankensqlite::{Connection as FrankenConnection, params as fparams};
+use coding_agent_search::storage::api::Conn as FrankenConnection;
+use coding_agent_search::storage::sqlite::{ConnectionManagerConfig, FrankenConnectionManager};
 use predicates::prelude::*;
+
+/// Stage A note: `storage::api::Conn::open_writable` is deliberately
+/// crate-private (R2-F3), so this integration test (a separate crate)
+/// bootstraps a deliberately-malformed/incomplete-schema fixture through
+/// `FrankenConnectionManager` (a single-writer/single-reader pool the
+/// production connection-manager code path already uses) -- the one
+/// *public*, schema-free way to reach it from outside the crate.
+/// `FrankenStorage::open` is not an option for these two malformed-schema
+/// fixtures specifically: it would apply cass's real migrations first,
+/// defeating the point of a schema that's deliberately missing/incomplete.
+fn with_writable_db<R>(
+    path: &std::path::Path,
+    write: impl FnOnce(&FrankenConnection) -> anyhow::Result<R>,
+) -> anyhow::Result<R> {
+    let mgr = FrankenConnectionManager::new(
+        path,
+        ConnectionManagerConfig { reader_count: 1, max_writers: 1 },
+    )?;
+    let mut guard = mgr.writer()?;
+    let result = write(guard.storage().raw())?;
+    guard.mark_committed();
+    Ok(result)
+}
+
+/// Test-only parameter list builder (this integration test is a separate
+/// crate and can't reach `storage::api`'s crate-private `params!` shim):
+/// borrows + handles the zero-arg case, mirroring sqlite.rs's own `fparams!`.
+macro_rules! fparams {
+    () => {
+        &[] as &[coding_agent_search::storage::api::Value]
+    };
+    ($($val:expr),+ $(,)?) => {
+        &[$(coding_agent_search::storage::api::IntoValue::into_value($val)),+]
+            as &[coding_agent_search::storage::api::Value]
+    };
+}
 use predicates::str::contains;
 use serde_json::{Value, json};
 use std::fs;
@@ -240,13 +276,13 @@ fn seed_analytics_models_workspace_fixture(temp_home: &TempDir) -> PathBuf {
     let db_path = temp_home
         .path()
         .join(".local/share/coding-agent-search/agent_search.db");
-    let conn = FrankenConnection::open(db_path.to_string_lossy().to_string()).unwrap();
+    let conn = coding_agent_search::storage::sqlite::FrankenStorage::open(&db_path).map(|s| s.into_raw()).unwrap();
 
     let workspace_rows = conn
-        .query_map_collect(
+        .query_all_map(
             "SELECT path, id FROM workspaces",
             &[],
-            |row: &frankensqlite::Row| Ok((row.get_typed::<String>(0)?, row.get_typed::<i64>(1)?)),
+            |row| Ok((row.get_typed::<String>(0)?, row.get_typed::<i64>(1)?)),
         )
         .unwrap();
     let workspace_a_id = workspace_rows
@@ -256,13 +292,13 @@ fn seed_analytics_models_workspace_fixture(temp_home: &TempDir) -> PathBuf {
         .expect("workspace-a id");
 
     let message_rows = conn
-        .query_map_collect(
+        .query_all_map(
             "SELECT m.id, m.conversation_id, c.workspace_id, c.agent_id, m.role, COALESCE(m.created_at, 0), LENGTH(m.content)
              FROM messages m
              JOIN conversations c ON c.id = m.conversation_id
              ORDER BY m.id",
             &[],
-            |row: &frankensqlite::Row| {
+            |row| {
                 Ok((
                     row.get_typed::<i64>(0)?,
                     row.get_typed::<i64>(1)?,
@@ -315,12 +351,12 @@ fn seed_analytics_models_workspace_fixture(temp_home: &TempDir) -> PathBuf {
         };
         let day_id =
             coding_agent_search::storage::sqlite::FrankenStorage::day_id_from_millis(created_at);
-        conn.execute_compat(
+        conn.execute(
             "INSERT OR REPLACE INTO token_usage (
                 message_id, conversation_id, agent_id, workspace_id, source_id, timestamp_ms, day_id,
                 model_name, model_family, total_tokens, role, content_chars, data_source
              ) VALUES (?1, ?2, ?3, ?4, 'local', ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'api')",
-            frankensqlite::params![
+            fparams![
                 message_id,
                 conversation_id,
                 agent_id,
@@ -335,15 +371,15 @@ fn seed_analytics_models_workspace_fixture(temp_home: &TempDir) -> PathBuf {
             ],
         )
         .unwrap();
-        conn.execute_compat(
+        conn.execute(
             "UPDATE messages SET extra_json = ?1 WHERE id = ?2",
-            frankensqlite::params![usage_json.to_string(), message_id],
+            fparams![usage_json.to_string(), message_id],
         )
         .unwrap();
     }
 
     let token_daily_rows = conn
-        .query_map_collect(
+        .query_all_map(
             "SELECT tu.day_id,
                     a.slug,
                     tu.source_id,
@@ -368,7 +404,7 @@ fn seed_analytics_models_workspace_fixture(temp_home: &TempDir) -> PathBuf {
              GROUP BY tu.day_id, a.slug, tu.source_id, COALESCE(tu.model_family, 'unknown')
              ORDER BY tu.day_id, a.slug",
             &[],
-            |row: &frankensqlite::Row| {
+            |row| {
                 Ok((
                     row.get_typed::<i64>(0)?,
                     row.get_typed::<String>(1)?,
@@ -416,7 +452,7 @@ fn seed_analytics_models_workspace_fixture(temp_home: &TempDir) -> PathBuf {
         last_updated,
     ) in token_daily_rows
     {
-        conn.execute_compat(
+        conn.execute(
             "INSERT OR REPLACE INTO token_daily_stats (
                 day_id, agent_slug, source_id, model_family,
                 api_call_count, user_message_count, assistant_message_count, tool_message_count,
@@ -424,7 +460,7 @@ fn seed_analytics_models_workspace_fixture(temp_home: &TempDir) -> PathBuf {
                 total_thinking_tokens, grand_total_tokens, total_content_chars, total_tool_calls,
                 estimated_cost_usd, session_count, last_updated
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
-            frankensqlite::params![
+            fparams![
                 day_id,
                 agent_slug,
                 source_id,
@@ -461,15 +497,15 @@ fn seed_analytics_remote_source_tokens_fixture(temp_home: &TempDir) {
     let db_path = temp_home
         .path()
         .join(".local/share/coding-agent-search/agent_search.db");
-    let conn = FrankenConnection::open(db_path.to_string_lossy().to_string()).unwrap();
-    conn.execute("ALTER TABLE conversations ADD COLUMN origin_host TEXT")
+    let conn = coding_agent_search::storage::sqlite::FrankenStorage::open(&db_path).map(|s| s.into_raw()).unwrap();
+    conn.execute("ALTER TABLE conversations ADD COLUMN origin_host TEXT", &[])
         .unwrap();
 
     let workspace_rows = conn
-        .query_map_collect(
+        .query_all_map(
             "SELECT path, id FROM workspaces",
             &[],
-            |row: &frankensqlite::Row| Ok((row.get_typed::<String>(0)?, row.get_typed::<i64>(1)?)),
+            |row| Ok((row.get_typed::<String>(0)?, row.get_typed::<i64>(1)?)),
         )
         .unwrap();
     let workspace_b_id = workspace_rows
@@ -478,22 +514,33 @@ fn seed_analytics_remote_source_tokens_fixture(temp_home: &TempDir) {
         .map(|(_, id)| id)
         .expect("workspace-b id");
 
-    conn.execute_compat(
+    // Blank-but-present remote source: a real `sources` row is required so the
+    // simulated "blank remote source_id" mutation below satisfies the FK on
+    // conversations.source_id (matches how a real ingest path would register
+    // any source before referencing it).
+    conn.execute(
+        "INSERT OR IGNORE INTO sources(id, kind, host_label, created_at, updated_at)
+         VALUES ('   ', 'remote', NULL, strftime('%s','now')*1000, strftime('%s','now')*1000)",
+        &[],
+    )
+    .unwrap();
+
+    conn.execute(
         "UPDATE conversations SET source_id = '   ', origin_host = 'remote-ci' WHERE workspace_id = ?1",
         fparams![workspace_b_id],
     )
     .unwrap();
-    conn.execute_compat(
+    conn.execute(
         "UPDATE message_metrics SET source_id = '   ' WHERE workspace_id = ?1",
         fparams![workspace_b_id],
     )
     .unwrap();
-    conn.execute_compat(
+    conn.execute(
         "UPDATE usage_hourly SET source_id = '   ' WHERE workspace_id = ?1",
         fparams![workspace_b_id],
     )
     .unwrap();
-    conn.execute_compat(
+    conn.execute(
         "UPDATE usage_daily SET source_id = '   ' WHERE workspace_id = ?1",
         fparams![workspace_b_id],
     )
@@ -505,15 +552,15 @@ fn seed_analytics_remote_source_tools_fixture(temp_home: &TempDir) {
     let db_path = temp_home
         .path()
         .join(".local/share/coding-agent-search/agent_search.db");
-    let conn = FrankenConnection::open(db_path.to_string_lossy().to_string()).unwrap();
-    conn.execute("ALTER TABLE conversations ADD COLUMN origin_host TEXT")
+    let conn = coding_agent_search::storage::sqlite::FrankenStorage::open(&db_path).map(|s| s.into_raw()).unwrap();
+    conn.execute("ALTER TABLE conversations ADD COLUMN origin_host TEXT", &[])
         .unwrap();
 
     let workspace_rows = conn
-        .query_map_collect(
+        .query_all_map(
             "SELECT path, id FROM workspaces",
             &[],
-            |row: &frankensqlite::Row| Ok((row.get_typed::<String>(0)?, row.get_typed::<i64>(1)?)),
+            |row| Ok((row.get_typed::<String>(0)?, row.get_typed::<i64>(1)?)),
         )
         .unwrap();
     let workspace_b_id = workspace_rows
@@ -522,12 +569,23 @@ fn seed_analytics_remote_source_tools_fixture(temp_home: &TempDir) {
         .map(|(_, id)| id)
         .expect("workspace-b id");
 
-    conn.execute_compat(
+    // Blank-but-present remote source: a real `sources` row is required so the
+    // simulated "blank remote source_id" mutation below satisfies the FK on
+    // conversations.source_id (matches how a real ingest path would register
+    // any source before referencing it).
+    conn.execute(
+        "INSERT OR IGNORE INTO sources(id, kind, host_label, created_at, updated_at)
+         VALUES ('   ', 'remote', NULL, strftime('%s','now')*1000, strftime('%s','now')*1000)",
+        &[],
+    )
+    .unwrap();
+
+    conn.execute(
         "UPDATE conversations SET source_id = '   ', origin_host = 'remote-ci' WHERE workspace_id = ?1",
         fparams![workspace_b_id],
     )
     .unwrap();
-    conn.execute_compat(
+    conn.execute(
         "UPDATE message_metrics
          SET source_id = '   ', tool_call_count = 7, content_tokens_est = 90,
              api_input_tokens = 30, api_output_tokens = 70,
@@ -536,7 +594,7 @@ fn seed_analytics_remote_source_tools_fixture(temp_home: &TempDir) {
         fparams![workspace_b_id],
     )
     .unwrap();
-    conn.execute_compat(
+    conn.execute(
         "UPDATE usage_hourly
          SET source_id = '   ', tool_call_count = 7, message_count = 1,
              api_tokens_total = 100, content_tokens_est_total = 90,
@@ -545,7 +603,7 @@ fn seed_analytics_remote_source_tools_fixture(temp_home: &TempDir) {
         fparams![workspace_b_id],
     )
     .unwrap();
-    conn.execute_compat(
+    conn.execute(
         "UPDATE usage_daily
          SET source_id = '   ', tool_call_count = 7, message_count = 1,
              api_tokens_total = 100, content_tokens_est_total = 90,
@@ -1007,8 +1065,8 @@ fn timeline_json_normalizes_remote_provenance_without_source_row() {
             "user@work-laptop",
         ))
         .unwrap();
-    let conn = frankensqlite::Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
-    conn.execute("UPDATE sources SET kind = '' WHERE id = 'work-laptop'")
+    let conn = coding_agent_search::storage::sqlite::FrankenStorage::open(&db_path).unwrap().into_raw();
+    conn.execute("UPDATE sources SET kind = '' WHERE id = 'work-laptop'", &[])
         .unwrap();
 
     let now_ms = std::time::SystemTime::now()
@@ -1088,9 +1146,9 @@ fn timeline_json_derives_remote_source_id_from_origin_host_when_source_id_blank(
     let workspace_id = storage
         .ensure_workspace(&workspace, Some("workspace"))
         .unwrap();
-    let conn = frankensqlite::Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+    let conn = coding_agent_search::storage::sqlite::FrankenStorage::open(&db_path).unwrap().into_raw();
     conn.execute(
-        "INSERT INTO sources(id, kind, host_label, created_at, updated_at) VALUES ('   ', 'remote', 'user@work-laptop', 0, 0)",
+        "INSERT INTO sources(id, kind, host_label, created_at, updated_at) VALUES ('   ', 'remote', 'user@work-laptop', 0, 0)", &[],
     )
     .unwrap();
 
@@ -2347,9 +2405,9 @@ fn sessions_json_derives_remote_source_id_from_origin_host_when_source_id_blank(
     let workspace_id = storage
         .ensure_workspace(&workspace, Some("workspace"))
         .unwrap();
-    let conn = frankensqlite::Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+    let conn = coding_agent_search::storage::sqlite::FrankenStorage::open(&db_path).unwrap().into_raw();
     conn.execute(
-        "INSERT INTO sources(id, kind, host_label, created_at, updated_at) VALUES ('   ', 'remote', 'user@work-laptop', 0, 0)",
+        "INSERT INTO sources(id, kind, host_label, created_at, updated_at) VALUES ('   ', 'remote', 'user@work-laptop', 0, 0)", &[],
     )
     .unwrap();
 
@@ -2416,9 +2474,9 @@ fn sessions_json_keeps_local_file_metadata_for_blank_source_id() {
     let workspace_id = storage
         .ensure_workspace(&workspace, Some("workspace"))
         .unwrap();
-    let conn = frankensqlite::Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+    let conn = coding_agent_search::storage::sqlite::FrankenStorage::open(&db_path).unwrap().into_raw();
     conn.execute(
-        "INSERT INTO sources(id, kind, host_label, created_at, updated_at) VALUES ('   ', 'local', NULL, 0, 0)",
+        "INSERT INTO sources(id, kind, host_label, created_at, updated_at) VALUES ('   ', 'local', NULL, 0, 0)", &[],
     )
     .unwrap();
 
@@ -3536,15 +3594,15 @@ fn analytics_validate_reports_query_failure_for_malformed_schema() {
     fs::create_dir_all(&data_dir).expect("create data dir");
     let db_path = data_dir.join("agent_search.db");
 
-    let conn =
-        FrankenConnection::open(db_path.to_string_lossy().to_string()).expect("create sqlite db");
-    conn.execute_batch(
-        "CREATE TABLE message_metrics (day_id INTEGER);
-         CREATE TABLE usage_daily (day_id INTEGER);
-         INSERT INTO usage_daily (day_id) VALUES (20254);",
-    )
+    with_writable_db(&db_path, |conn| {
+        conn.execute_batch(
+            "CREATE TABLE message_metrics (day_id INTEGER);
+             CREATE TABLE usage_daily (day_id INTEGER);
+             INSERT INTO usage_daily (day_id) VALUES (20254);",
+        )?;
+        Ok(())
+    })
     .expect("create malformed analytics tables");
-    drop(conn);
 
     let mut cmd = base_cmd(tmp_home.path());
     cmd.args([
@@ -3648,8 +3706,8 @@ fn analytics_validate_fix_rebuilds_track_a_when_safe() {
     let data_dir = tmp_home.path().join(".local/share/coding-agent-search");
     let db_path = data_dir.join("agent_search.db");
     let conn =
-        FrankenConnection::open(db_path.to_string_lossy().to_string()).expect("open analytics db");
-    conn.execute("UPDATE usage_daily SET message_count = message_count + 7")
+        coding_agent_search::storage::sqlite::FrankenStorage::open(&db_path).map(|s| s.into_raw()).expect("open analytics db");
+    conn.execute("UPDATE usage_daily SET message_count = message_count + 7", &[])
         .expect("corrupt track a rollup");
     drop(conn);
 
@@ -3696,15 +3754,15 @@ fn analytics_validate_fix_refuses_when_source_schema_is_missing() {
     fs::create_dir_all(&data_dir).expect("create data dir");
     let db_path = data_dir.join("agent_search.db");
 
-    let conn =
-        FrankenConnection::open(db_path.to_string_lossy().to_string()).expect("create sqlite db");
-    conn.execute_batch(
-        "CREATE TABLE message_metrics (day_id INTEGER);
-         CREATE TABLE usage_daily (day_id INTEGER);
-         INSERT INTO usage_daily (day_id) VALUES (20254);",
-    )
+    with_writable_db(&db_path, |conn| {
+        conn.execute_batch(
+            "CREATE TABLE message_metrics (day_id INTEGER);
+             CREATE TABLE usage_daily (day_id INTEGER);
+             INSERT INTO usage_daily (day_id) VALUES (20254);",
+        )?;
+        Ok(())
+    })
     .expect("create malformed analytics tables");
-    drop(conn);
 
     let mut cmd = base_cmd(tmp_home.path());
     cmd.args([

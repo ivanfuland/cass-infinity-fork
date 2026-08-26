@@ -357,12 +357,10 @@ fn test_wizard_state_final_site_dir_tracking() {
 
 use coding_agent_search::pages::config_input::PagesConfig;
 use coding_agent_search::pages::export::{ExportEngine, ExportFilter, PathMode};
-use frankensqlite::Connection as FrankenConnection;
-use frankensqlite::compat::{ConnectionExt, RowExt};
+use coding_agent_search::storage::api::Conn as FrankenConnection;
 
 fn open_franken_connection(path: &Path) -> FrankenConnection {
-    FrankenConnection::open(path.to_string_lossy().into_owned())
-        .expect("should open database with frankensqlite")
+    FrankenConnection::open_read(path).expect("should open database with storage::api")
 }
 
 fn query_i64(conn: &FrankenConnection, sql: &str) -> i64 {
@@ -371,12 +369,12 @@ fn query_i64(conn: &FrankenConnection, sql: &str) -> i64 {
 }
 
 fn query_strings(conn: &FrankenConnection, sql: &str) -> Vec<String> {
-    conn.query_map_collect(sql, &[], |row| row.get_typed(0))
+    conn.query_all_map(sql, &[], |row| row.get_typed(0))
         .expect("string query should succeed")
 }
 
 fn query_i64s(conn: &FrankenConnection, sql: &str) -> Vec<i64> {
-    conn.query_map_collect(sql, &[], |row| row.get_typed(0))
+    conn.query_all_map(sql, &[], |row| row.get_typed(0))
         .expect("integer list query should succeed")
 }
 

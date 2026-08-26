@@ -500,10 +500,10 @@ pub fn load_chart_data(
 }
 
 fn resolve_workspace_filter_ids(
-    conn: &frankensqlite::Connection,
+    conn: &crate::storage::api::Conn,
     workspaces: &std::collections::HashSet<String>,
 ) -> Vec<i64> {
-    use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
+    use crate::storage::api::Value as ParamValue;
 
     if workspaces.is_empty() {
         return Vec::new();
@@ -521,7 +521,7 @@ fn resolve_workspace_filter_ids(
         if let Ok(id) = conn.query_row_map(
             "SELECT id FROM workspaces WHERE path = ?1",
             &[ParamValue::from(workspace.as_str())],
-            |row: &frankensqlite::Row| row.get_typed::<i64>(0),
+            |row| row.get_typed::<i64>(0),
         ) && !ids.contains(&id)
         {
             ids.push(id);
@@ -3263,12 +3263,11 @@ fn format_number(n: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use frankensqlite::compat::ConnectionExt;
-    use frankensqlite::params;
+    use crate::storage::api::params;
 
     #[test]
     fn resolve_workspace_filter_ids_supports_paths_and_numeric_ids() {
-        let conn = frankensqlite::Connection::open(":memory:").unwrap();
+        let conn = crate::storage::api::Conn::open_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE workspaces (
                 id INTEGER PRIMARY KEY,
@@ -3276,14 +3275,14 @@ mod tests {
             );",
         )
         .unwrap();
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO workspaces (id, path) VALUES (?1, ?2)",
-            params![1_i64, "/workspace/one"],
+            &params![1_i64, "/workspace/one"],
         )
         .unwrap();
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO workspaces (id, path) VALUES (?1, ?2)",
-            params![2_i64, "/workspace/two"],
+            &params![2_i64, "/workspace/two"],
         )
         .unwrap();
 
@@ -3316,20 +3315,20 @@ mod tests {
             .unwrap()
             .as_millis() as i64;
         let conn = storage.raw();
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO usage_daily (
                 day_id, agent_slug, workspace_id, source_id,
                 message_count, tool_call_count, api_tokens_total, last_updated
              ) VALUES (?1, 'codex', ?2, 'local', 10, 2, 1000, ?3)",
-            params![20260220_i64, ws_a, now_ms],
+            &params![20260220_i64, ws_a, now_ms],
         )
         .unwrap();
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO usage_daily (
                 day_id, agent_slug, workspace_id, source_id,
                 message_count, tool_call_count, api_tokens_total, last_updated
              ) VALUES (?1, 'codex', ?2, 'local', 20, 4, 2000, ?3)",
-            params![20260220_i64, ws_b, now_ms],
+            &params![20260220_i64, ws_b, now_ms],
         )
         .unwrap();
 

@@ -2,7 +2,6 @@ use std::path::Path;
 use std::time::Duration;
 
 use coding_agent_search::storage::sqlite::SqliteStorage;
-use frankensqlite::compat::{ConnectionExt, RowExt};
 use serde_json::Value;
 use tempfile::TempDir;
 

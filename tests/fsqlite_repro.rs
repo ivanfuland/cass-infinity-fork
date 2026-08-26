@@ -8,9 +8,13 @@ fn test_query_after_migrations() {
     let fs = FrankenStorage::open(&db_path).unwrap();
 
     // Instead of querying sqlite_master, try querying the table directly
-    let res = fs.raw().query("SELECT 1 FROM meta LIMIT 1;");
+    let res = fs.raw().query_all_map("SELECT 1 FROM meta LIMIT 1;", &[], |row| row.get_value(0));
     println!("query meta direct: {:?}", res.is_ok());
 
-    let res = fs.raw().query("SELECT 1 FROM non_existent_table LIMIT 1;");
+    let res = fs.raw().query_all_map(
+        "SELECT 1 FROM non_existent_table LIMIT 1;",
+        &[],
+        |row| row.get_value(0),
+    );
     println!("query non_existent: {:?}", res.is_ok());
 }

@@ -9,8 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow};
-use frankensqlite::Connection as FrankenConnection;
-use frankensqlite::compat::{ConnectionExt, RowExt};
+use crate::storage::api::Conn as FrankenConnection;
 use half::f16;
 
 pub use frankensearch::index::{Quantization, SearchParams, VectorIndex, VectorIndexWriter};
@@ -284,10 +283,10 @@ impl SemanticFilterMaps {
 
     pub fn from_connection(conn: &FrankenConnection) -> Result<Self> {
         let mut agent_slug_to_id = HashMap::new();
-        let agent_rows = conn.query_map_collect(
+        let agent_rows = conn.query_all_map(
             "SELECT id, slug FROM agents",
             &[],
-            |row: &frankensqlite::Row| {
+            |row| {
                 let id: i64 = row.get_typed(0)?;
                 let slug: String = row.get_typed(1)?;
                 Ok((id, slug))
@@ -299,10 +298,10 @@ impl SemanticFilterMaps {
         }
 
         let mut workspace_path_to_id = HashMap::new();
-        let workspace_rows = conn.query_map_collect(
+        let workspace_rows = conn.query_all_map(
             "SELECT id, path FROM workspaces",
             &[],
-            |row: &frankensqlite::Row| {
+            |row| {
                 let id: i64 = row.get_typed(0)?;
                 let path: String = row.get_typed(1)?;
                 Ok((id, path))
@@ -315,10 +314,10 @@ impl SemanticFilterMaps {
 
         let mut source_id_to_id = HashMap::new();
         let mut remote_source_ids = HashSet::new();
-        let source_rows = conn.query_map_collect(
+        let source_rows = conn.query_all_map(
             "SELECT id, kind FROM sources",
             &[],
-            |row: &frankensqlite::Row| {
+            |row| {
                 let id: String = row.get_typed(0)?;
                 let kind: String = row.get_typed(1)?;
                 Ok((id, kind))

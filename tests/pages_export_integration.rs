@@ -5,8 +5,8 @@
 
 use chrono::{TimeZone, Utc};
 use coding_agent_search::pages::export::{ExportEngine, ExportFilter, PathMode};
-use frankensqlite::compat::{ConnectionExt, RowExt};
-use frankensqlite::{Connection, Row as FrankenRow, params as fparams};
+use coding_agent_search::storage::api::{Conn as Connection, Row as FrankenRow};
+use coding_agent_search::storage::sqlite::{ConnectionManagerConfig, FrankenConnectionManager};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -14,9 +14,43 @@ use tempfile::TempDir;
 
 type TestResult<T> = anyhow::Result<T>;
 
+/// Test-only parameter list builder (this integration test is a separate
+/// crate and can't reach `storage::api`'s crate-private `params!` shim):
+/// borrows + handles the zero-arg case, mirroring sqlite.rs's own `fparams!`.
+macro_rules! fparams {
+    () => {
+        &[] as &[coding_agent_search::storage::api::Value]
+    };
+    ($($val:expr),+ $(,)?) => {
+        &[$(coding_agent_search::storage::api::IntoValue::into_value($val)),+]
+            as &[coding_agent_search::storage::api::Value]
+    };
+}
+
+/// Stage A note: `create_source_db` deliberately reuses cass's own table
+/// names (`conversations`/`messages`), so opening through
+/// `FrankenStorage::open` (which would apply cass's real migrations first)
+/// is not an option -- it would collide on `CREATE TABLE conversations`.
+/// `storage::api::Conn::open_writable` is the schema-free public path, but
+/// it's deliberately crate-private (R2-F3); `FrankenConnectionManager` (a
+/// single-writer/single-reader pool the production connection-manager code
+/// path already uses) is the one *public*, schema-free way to reach it from
+/// outside the crate. Every `src_conn` fixture below now goes through this;
+/// every `out_conn`/`preserved_conn` reopen is read-only (verification
+/// queries only) and uses the always-public `open_db` (now `open_read`).
+fn with_writable_db<R>(path: &Path, write: impl FnOnce(&Connection) -> TestResult<R>) -> TestResult<R> {
+    let mgr = FrankenConnectionManager::new(
+        path,
+        ConnectionManagerConfig { reader_count: 1, max_writers: 1 },
+    )?;
+    let mut guard = mgr.writer()?;
+    let result = write(guard.storage().raw())?;
+    guard.mark_committed();
+    Ok(result)
+}
+
 fn open_db(path: &Path) -> TestResult<Connection> {
-    let path_str = path.to_string_lossy();
-    Ok(Connection::open(path_str.as_ref())?)
+    Ok(Connection::open_read(path)?)
 }
 
 fn query_i64(conn: &Connection, sql: &str) -> TestResult<i64> {
@@ -28,16 +62,16 @@ fn query_string(conn: &Connection, sql: &str) -> TestResult<String> {
 }
 
 fn query_strings(conn: &Connection, sql: &str) -> TestResult<Vec<String>> {
-    Ok(conn.query_map_collect(sql, &[], |row: &FrankenRow| row.get_typed(0))?)
+    Ok(conn.query_all_map(sql, &[], |row: &FrankenRow| row.get_typed(0))?)
 }
 
 fn query_table_columns(conn: &Connection, table_name: &str) -> TestResult<Vec<String>> {
     let sql = format!("PRAGMA table_info({table_name})");
-    Ok(conn.query_map_collect(&sql, &[], |row: &FrankenRow| row.get_typed(1))?)
+    Ok(conn.query_all_map(&sql, &[], |row: &FrankenRow| row.get_typed(1))?)
 }
 
 fn query_message_pairs(conn: &Connection, sql: &str) -> TestResult<Vec<(i64, String)>> {
-    Ok(conn.query_map_collect(sql, &[], |row: &FrankenRow| {
+    Ok(conn.query_all_map(sql, &[], |row: &FrankenRow| {
         Ok((row.get_typed(0)?, row.get_typed(1)?))
     })?)
 }
@@ -90,23 +124,23 @@ fn create_source_db(conn: &Connection) -> TestResult<()> {
 /// Insert test data into the source database.
 fn insert_test_data(conn: &Connection) -> TestResult<()> {
     // Insert agents
-    conn.execute("INSERT INTO agents (id, slug, name, kind) VALUES (1, 'claude', 'Claude', 'ai')")?;
-    conn.execute("INSERT INTO agents (id, slug, name, kind) VALUES (2, 'codex', 'Codex', 'ai')")?;
-    conn.execute("INSERT INTO agents (id, slug, name, kind) VALUES (3, 'gemini', 'Gemini', 'ai')")?;
+    conn.execute("INSERT INTO agents (id, slug, name, kind) VALUES (1, 'claude', 'Claude', 'ai')", &[])?;
+    conn.execute("INSERT INTO agents (id, slug, name, kind) VALUES (2, 'codex', 'Codex', 'ai')", &[])?;
+    conn.execute("INSERT INTO agents (id, slug, name, kind) VALUES (3, 'gemini', 'Gemini', 'ai')", &[])?;
 
     // Insert workspaces
     conn.execute(
         "INSERT INTO workspaces (id, path, display_name) VALUES (1, '/home/user/project-a', 'Project A')"
-    )?;
+    , &[])?;
     conn.execute(
         "INSERT INTO workspaces (id, path, display_name) VALUES (2, '/home/user/project-b', 'Project B')"
-    )?;
+    , &[])?;
 
     // Insert conversations with different agents, workspaces, and timestamps
     let base_ts = Utc.with_ymd_and_hms(2024, 6, 15, 10, 0, 0).unwrap();
 
     // Conversation 1: claude, project-a, June 15
-    conn.execute_compat(
+    conn.execute(
         "INSERT INTO conversations (id, agent_id, workspace_id, title, source_path, started_at, ended_at, message_count)
          VALUES (1, 1, 1, 'Auth debugging', '/home/user/project-a/sessions/auth.jsonl', ?1, ?2, 3)",
         fparams![base_ts.timestamp_millis(), (base_ts + chrono::Duration::hours(1)).timestamp_millis()],
@@ -114,7 +148,7 @@ fn insert_test_data(conn: &Connection) -> TestResult<()> {
 
     // Conversation 2: codex, project-a, June 16
     let ts2 = base_ts + chrono::Duration::days(1);
-    conn.execute_compat(
+    conn.execute(
         "INSERT INTO conversations (id, agent_id, workspace_id, title, source_path, started_at, ended_at, message_count)
          VALUES (2, 2, 1, 'API refactoring', '/home/user/project-a/sessions/api.jsonl', ?1, ?2, 2)",
         fparams![ts2.timestamp_millis(), (ts2 + chrono::Duration::hours(2)).timestamp_millis()],
@@ -122,7 +156,7 @@ fn insert_test_data(conn: &Connection) -> TestResult<()> {
 
     // Conversation 3: claude, project-b, June 17
     let ts3 = base_ts + chrono::Duration::days(2);
-    conn.execute_compat(
+    conn.execute(
         "INSERT INTO conversations (id, agent_id, workspace_id, title, source_path, started_at, ended_at, message_count)
          VALUES (3, 1, 2, 'UI design', '/home/user/project-b/sessions/ui.jsonl', ?1, ?2, 4)",
         fparams![ts3.timestamp_millis(), (ts3 + chrono::Duration::hours(3)).timestamp_millis()],
@@ -130,7 +164,7 @@ fn insert_test_data(conn: &Connection) -> TestResult<()> {
 
     // Conversation 4: gemini, project-b, June 18
     let ts4 = base_ts + chrono::Duration::days(3);
-    conn.execute_compat(
+    conn.execute(
         "INSERT INTO conversations (id, agent_id, workspace_id, title, source_path, started_at, ended_at, message_count)
          VALUES (4, 3, 2, 'Database optimization', '/home/user/project-b/sessions/db.jsonl', ?1, ?2, 5)",
         fparams![ts4.timestamp_millis(), (ts4 + chrono::Duration::hours(1)).timestamp_millis()],
@@ -164,7 +198,7 @@ fn insert_test_data(conn: &Connection) -> TestResult<()> {
     ];
 
     for (conv_id, idx, role, content) in messages {
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO messages (conversation_id, idx, role, content, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             fparams![
                 conv_id as i64,
@@ -225,10 +259,11 @@ fn export_engine_exports_all_conversations_with_no_filter() {
     let output_path = tmp.path().join("export.db");
 
     // Create and populate source DB
-    let src_conn = open_db(&source_path).unwrap();
-    create_source_db(&src_conn).unwrap();
-    insert_test_data(&src_conn).unwrap();
-    drop(src_conn);
+    with_writable_db(&source_path, |src_conn| {
+    create_source_db(src_conn)?;
+    insert_test_data(src_conn)?;
+    Ok(())
+}).unwrap();
 
     // Export with no filter
     let filter = ExportFilter {
@@ -263,10 +298,11 @@ fn export_engine_filters_by_single_agent() {
     let source_path = tmp.path().join("source.db");
     let output_path = tmp.path().join("export.db");
 
-    let src_conn = open_db(&source_path).unwrap();
-    create_source_db(&src_conn).unwrap();
-    insert_test_data(&src_conn).unwrap();
-    drop(src_conn);
+    with_writable_db(&source_path, |src_conn| {
+    create_source_db(src_conn)?;
+    insert_test_data(src_conn)?;
+    Ok(())
+}).unwrap();
 
     // Filter to only claude conversations
     let filter = ExportFilter {
@@ -295,10 +331,11 @@ fn export_engine_filters_by_multiple_agents() {
     let source_path = tmp.path().join("source.db");
     let output_path = tmp.path().join("export.db");
 
-    let src_conn = open_db(&source_path).unwrap();
-    create_source_db(&src_conn).unwrap();
-    insert_test_data(&src_conn).unwrap();
-    drop(src_conn);
+    with_writable_db(&source_path, |src_conn| {
+    create_source_db(src_conn)?;
+    insert_test_data(src_conn)?;
+    Ok(())
+}).unwrap();
 
     // Filter to claude and codex
     let filter = ExportFilter {
@@ -323,10 +360,11 @@ fn export_engine_filters_by_workspace() {
     let source_path = tmp.path().join("source.db");
     let output_path = tmp.path().join("export.db");
 
-    let src_conn = open_db(&source_path).unwrap();
-    create_source_db(&src_conn).unwrap();
-    insert_test_data(&src_conn).unwrap();
-    drop(src_conn);
+    with_writable_db(&source_path, |src_conn| {
+    create_source_db(src_conn)?;
+    insert_test_data(src_conn)?;
+    Ok(())
+}).unwrap();
 
     // Filter to project-a only
     let filter = ExportFilter {
@@ -356,10 +394,11 @@ fn export_engine_filters_by_time_range() {
     let source_path = tmp.path().join("source.db");
     let output_path = tmp.path().join("export.db");
 
-    let src_conn = open_db(&source_path).unwrap();
-    create_source_db(&src_conn).unwrap();
-    insert_test_data(&src_conn).unwrap();
-    drop(src_conn);
+    with_writable_db(&source_path, |src_conn| {
+    create_source_db(src_conn)?;
+    insert_test_data(src_conn)?;
+    Ok(())
+}).unwrap();
 
     // Filter to June 16-17 only (conversations 2 and 3)
     let since = Utc.with_ymd_and_hms(2024, 6, 16, 0, 0, 0).unwrap();
@@ -387,10 +426,11 @@ fn export_engine_combined_filters() {
     let source_path = tmp.path().join("source.db");
     let output_path = tmp.path().join("export.db");
 
-    let src_conn = open_db(&source_path).unwrap();
-    create_source_db(&src_conn).unwrap();
-    insert_test_data(&src_conn).unwrap();
-    drop(src_conn);
+    with_writable_db(&source_path, |src_conn| {
+    create_source_db(src_conn)?;
+    insert_test_data(src_conn)?;
+    Ok(())
+}).unwrap();
 
     // Filter: claude only, project-b workspace
     let filter = ExportFilter {
@@ -419,10 +459,11 @@ fn export_engine_transforms_paths_with_full_mode() {
     let source_path = tmp.path().join("source.db");
     let output_path = tmp.path().join("export.db");
 
-    let src_conn = open_db(&source_path).unwrap();
-    create_source_db(&src_conn).unwrap();
-    insert_test_data(&src_conn).unwrap();
-    drop(src_conn);
+    with_writable_db(&source_path, |src_conn| {
+    create_source_db(src_conn)?;
+    insert_test_data(src_conn)?;
+    Ok(())
+}).unwrap();
 
     let filter = ExportFilter {
         agents: Some(vec!["claude".to_string()]),
@@ -448,10 +489,11 @@ fn export_engine_transforms_paths_with_basename_mode() {
     let source_path = tmp.path().join("source.db");
     let output_path = tmp.path().join("export.db");
 
-    let src_conn = open_db(&source_path).unwrap();
-    create_source_db(&src_conn).unwrap();
-    insert_test_data(&src_conn).unwrap();
-    drop(src_conn);
+    with_writable_db(&source_path, |src_conn| {
+    create_source_db(src_conn)?;
+    insert_test_data(src_conn)?;
+    Ok(())
+}).unwrap();
 
     let filter = ExportFilter {
         agents: Some(vec!["claude".to_string()]),
@@ -477,10 +519,11 @@ fn export_engine_transforms_paths_with_relative_mode() {
     let source_path = tmp.path().join("source.db");
     let output_path = tmp.path().join("export.db");
 
-    let src_conn = open_db(&source_path).unwrap();
-    create_source_db(&src_conn).unwrap();
-    insert_test_data(&src_conn).unwrap();
-    drop(src_conn);
+    with_writable_db(&source_path, |src_conn| {
+    create_source_db(src_conn)?;
+    insert_test_data(src_conn)?;
+    Ok(())
+}).unwrap();
 
     let filter = ExportFilter {
         agents: Some(vec!["claude".to_string()]),
@@ -506,10 +549,11 @@ fn export_engine_transforms_paths_with_hash_mode() {
     let source_path = tmp.path().join("source.db");
     let output_path = tmp.path().join("export.db");
 
-    let src_conn = open_db(&source_path).unwrap();
-    create_source_db(&src_conn).unwrap();
-    insert_test_data(&src_conn).unwrap();
-    drop(src_conn);
+    with_writable_db(&source_path, |src_conn| {
+    create_source_db(src_conn)?;
+    insert_test_data(src_conn)?;
+    Ok(())
+}).unwrap();
 
     let filter = ExportFilter {
         agents: Some(vec!["claude".to_string()]),
@@ -540,10 +584,11 @@ fn export_engine_handles_empty_filter_results() {
     let source_path = tmp.path().join("source.db");
     let output_path = tmp.path().join("export.db");
 
-    let src_conn = open_db(&source_path).unwrap();
-    create_source_db(&src_conn).unwrap();
-    insert_test_data(&src_conn).unwrap();
-    drop(src_conn);
+    with_writable_db(&source_path, |src_conn| {
+    create_source_db(src_conn)?;
+    insert_test_data(src_conn)?;
+    Ok(())
+}).unwrap();
 
     // Filter to non-existent agent
     let filter = ExportFilter {
@@ -571,10 +616,11 @@ fn export_engine_handles_empty_agents_list() {
     let source_path = tmp.path().join("source.db");
     let output_path = tmp.path().join("export.db");
 
-    let src_conn = open_db(&source_path).unwrap();
-    create_source_db(&src_conn).unwrap();
-    insert_test_data(&src_conn).unwrap();
-    drop(src_conn);
+    with_writable_db(&source_path, |src_conn| {
+    create_source_db(src_conn)?;
+    insert_test_data(src_conn)?;
+    Ok(())
+}).unwrap();
 
     // Empty agents list should match nothing
     let filter = ExportFilter {
@@ -598,10 +644,11 @@ fn export_engine_cancellation_via_running_flag() {
     let source_path = tmp.path().join("source.db");
     let output_path = tmp.path().join("export.db");
 
-    let src_conn = open_db(&source_path).unwrap();
-    create_source_db(&src_conn).unwrap();
-    insert_test_data(&src_conn).unwrap();
-    drop(src_conn);
+    with_writable_db(&source_path, |src_conn| {
+    create_source_db(src_conn)?;
+    insert_test_data(src_conn)?;
+    Ok(())
+}).unwrap();
 
     let filter = ExportFilter {
         agents: None,
@@ -628,9 +675,10 @@ fn export_engine_rejects_same_source_and_output() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("source.db");
 
-    let src_conn = open_db(&db_path).unwrap();
-    create_source_db(&src_conn).unwrap();
-    drop(src_conn);
+    with_writable_db(&db_path, |src_conn| {
+    create_source_db(src_conn)?;
+    Ok(())
+}).unwrap();
 
     let filter = ExportFilter {
         agents: None,
@@ -654,9 +702,10 @@ fn export_engine_rejects_output_directory() {
     let tmp = TempDir::new().unwrap();
     let source_path = tmp.path().join("source.db");
 
-    let src_conn = open_db(&source_path).unwrap();
-    create_source_db(&src_conn).unwrap();
-    drop(src_conn);
+    with_writable_db(&source_path, |src_conn| {
+    create_source_db(src_conn)?;
+    Ok(())
+}).unwrap();
 
     let filter = ExportFilter {
         agents: None,
@@ -681,10 +730,11 @@ fn export_engine_preserves_existing_output_on_cancelled_rerun() {
     let source_path = tmp.path().join("source.db");
     let output_path = tmp.path().join("export.db");
 
-    let src_conn = open_db(&source_path).unwrap();
-    create_source_db(&src_conn).unwrap();
-    insert_test_data(&src_conn).unwrap();
-    drop(src_conn);
+    with_writable_db(&source_path, |src_conn| {
+    create_source_db(src_conn)?;
+    insert_test_data(src_conn)?;
+    Ok(())
+}).unwrap();
 
     let filter = ExportFilter {
         agents: None,
@@ -742,10 +792,11 @@ fn export_engine_populates_fts_indexes() {
     let source_path = tmp.path().join("source.db");
     let output_path = tmp.path().join("export.db");
 
-    let src_conn = open_db(&source_path).unwrap();
-    create_source_db(&src_conn).unwrap();
-    insert_test_data(&src_conn).unwrap();
-    drop(src_conn);
+    with_writable_db(&source_path, |src_conn| {
+    create_source_db(src_conn)?;
+    insert_test_data(src_conn)?;
+    Ok(())
+}).unwrap();
 
     let filter = ExportFilter {
         agents: None,
@@ -793,10 +844,11 @@ fn export_engine_preserves_message_order() {
     let source_path = tmp.path().join("source.db");
     let output_path = tmp.path().join("export.db");
 
-    let src_conn = open_db(&source_path).unwrap();
-    create_source_db(&src_conn).unwrap();
-    insert_test_data(&src_conn).unwrap();
-    drop(src_conn);
+    with_writable_db(&source_path, |src_conn| {
+    create_source_db(src_conn)?;
+    insert_test_data(src_conn)?;
+    Ok(())
+}).unwrap();
 
     let filter = ExportFilter {
         agents: Some(vec!["claude".to_string()]),
@@ -835,10 +887,11 @@ fn export_engine_calls_progress_callback() {
     let source_path = tmp.path().join("source.db");
     let output_path = tmp.path().join("export.db");
 
-    let src_conn = open_db(&source_path).unwrap();
-    create_source_db(&src_conn).unwrap();
-    insert_test_data(&src_conn).unwrap();
-    drop(src_conn);
+    with_writable_db(&source_path, |src_conn| {
+    create_source_db(src_conn)?;
+    insert_test_data(src_conn)?;
+    Ok(())
+}).unwrap();
 
     let filter = ExportFilter {
         agents: None,

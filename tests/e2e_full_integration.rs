@@ -9,7 +9,7 @@
 //! Bead: coding_agent_session_search-1p9xd
 
 use coding_agent_search::storage::sqlite::SqliteStorage;
-use frankensqlite::compat::{ConnectionExt, RowExt};
+
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
@@ -441,7 +441,7 @@ fn e2e_database_integrity() {
     // The current contentless FTS table is considered healthy if frankensqlite can
     // query it and at least one row is visible through the canonical doctor probe.
     let fts_probe_rows: Vec<i64> = conn
-        .query_map_collect("SELECT rowid FROM fts_messages LIMIT 1", &[], |r| {
+        .query_all_map("SELECT rowid FROM fts_messages LIMIT 1", &[], |r| {
             r.get_typed(0)
         })
         .expect("fts probe");

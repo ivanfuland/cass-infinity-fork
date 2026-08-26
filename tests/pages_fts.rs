@@ -12,19 +12,54 @@ mod tests {
         Fts5SearchMode, detect_search_mode, escape_fts5_query, format_fts5_query,
         validate_fts5_query,
     };
-    use frankensqlite::compat::{ConnectionExt, RowExt};
-    use frankensqlite::{Connection as FrankenConnection, params as fparams};
+    use coding_agent_search::storage::api::Conn as FrankenConnection;
+    use coding_agent_search::storage::sqlite::{ConnectionManagerConfig, FrankenConnectionManager};
     use std::path::Path;
     use tempfile::TempDir;
 
-    fn open_franken_db(path: &Path) -> Result<FrankenConnection> {
-        let path_str = path.to_string_lossy();
-        Ok(FrankenConnection::open(path_str.as_ref())?)
+    /// Test-only parameter list builder (this integration test is a separate
+    /// crate and can't reach `storage::api`'s crate-private `params!` shim):
+    /// borrows + handles the zero-arg case, mirroring sqlite.rs's own `fparams!`.
+    macro_rules! fparams {
+        () => {
+            &[] as &[coding_agent_search::storage::api::Value]
+        };
+        ($($val:expr),+ $(,)?) => {
+            &[$(coding_agent_search::storage::api::IntoValue::into_value($val)),+]
+                as &[coding_agent_search::storage::api::Value]
+        };
+    }
+
+    /// Stage A note: these fixtures deliberately reuse cass's own table names
+    /// (`conversations`/`messages`) with a simplified column set, so opening
+    /// through `FrankenStorage::open` (which would apply cass's real
+    /// migrations first) is not an option here -- it would collide on
+    /// `CREATE TABLE conversations`. `storage::api::Conn::open_writable` is
+    /// the schema-free public path, but it's deliberately crate-private
+    /// (R2-F3); `FrankenConnectionManager` (a single-writer/single-reader
+    /// pool the production connection-manager code path already uses) is the
+    /// one *public*, schema-free way to reach it from outside the crate.
+    /// `write_fts_fixture` runs the write phase through it and hands back
+    /// nothing; callers that need a connection afterward reopen read-only via
+    /// the always-public `Conn::open_read`, which every remaining query in
+    /// this file only ever needs.
+    fn write_fts_fixture(
+        path: &Path,
+        write: impl FnOnce(&FrankenConnection) -> Result<()>,
+    ) -> Result<()> {
+        let mgr = FrankenConnectionManager::new(
+            path,
+            ConnectionManagerConfig { reader_count: 1, max_writers: 1 },
+        )?;
+        let mut guard = mgr.writer()?;
+        write(guard.storage().raw())?;
+        guard.mark_committed();
+        Ok(())
     }
 
     /// Set up a source database with test data for FTS5 testing
     fn setup_fts_source_db(path: &Path) -> Result<()> {
-        let conn = open_franken_db(path)?;
+        write_fts_fixture(path, |conn| {
 
         conn.execute_batch(
             r#"
@@ -67,14 +102,14 @@ mod tests {
         )?;
 
         // Agents + workspaces
-        conn.execute("INSERT INTO agents (id, slug) VALUES (1, 'claude')")?;
-        conn.execute("INSERT INTO workspaces (id, path) VALUES (1, '/home/user/project')")?;
+        conn.execute("INSERT INTO agents (id, slug) VALUES (1, 'claude')", &[])?;
+        conn.execute("INSERT INTO workspaces (id, path) VALUES (1, '/home/user/project')", &[])?;
 
         // Insert test conversations
         conn.execute(
             "INSERT INTO conversations (id, agent_id, workspace_id, title, source_path, started_at, message_count)
              VALUES (1, 1, 1, 'FTS Test', '/path/1.json', 1600000000000, 5)"
-        )?;
+        , &[])?;
 
         // Insert messages with various content types for FTS testing
 
@@ -82,33 +117,34 @@ mod tests {
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content, created_at)
              VALUES (1, 1, 0, 'user', 'I am running the tests and they keep running forever', 1600000000000)"
-        )?;
+        , &[])?;
 
         // Message 2: Code identifier with underscore (snake_case)
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content, created_at)
              VALUES (2, 1, 1, 'assistant', 'You should call my_function and get_user_by_id to fix the issue', 1600000001000)"
-        )?;
+        , &[])?;
 
         // Message 3: File path / filename
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content, created_at)
              VALUES (3, 1, 2, 'user', 'The error is in AuthController.ts at line 42', 1600000002000)"
-        )?;
+        , &[])?;
 
         // Message 4: More content for BM25 ranking tests
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content, created_at)
              VALUES (4, 1, 3, 'assistant', 'Error error error - this message has many errors', 1600000003000)"
-        )?;
+        , &[])?;
 
         // Message 5: Single mention for ranking comparison
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content, created_at)
-             VALUES (5, 1, 4, 'user', 'I found one error in the code', 1600000004000)",
+             VALUES (5, 1, 4, 'user', 'I found one error in the code', 1600000004000)", &[],
         )?;
 
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Create an exported database with FTS5 indexes
@@ -129,13 +165,13 @@ mod tests {
         let engine = ExportEngine::new(&source_path, &output_path, filter);
         engine.execute(|_, _| {}, None)?;
 
-        let conn = FrankenConnection::open(output_path.to_string_lossy().into_owned())?;
+        let conn = FrankenConnection::open_read(&output_path)?;
         Ok((conn, output_path))
     }
 
     fn create_runtime_fts_db(temp_dir: &TempDir) -> Result<FrankenConnection> {
         let db_path = temp_dir.path().join("runtime_fts.db");
-        let conn = open_franken_db(&db_path)?;
+        write_fts_fixture(&db_path, |conn| {
 
         conn.execute_batch(
             r#"
@@ -179,33 +215,36 @@ mod tests {
         conn.execute(
             "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, message_count)
              VALUES (1, 'claude', '/home/user/project', 'FTS Test', '/path/1.json', 1600000000000, 5)"
-        )?;
+        , &[])?;
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content, created_at)
              VALUES (1, 1, 0, 'user', 'I am running the tests and they keep running forever', 1600000000000)"
-        )?;
+        , &[])?;
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content, created_at)
              VALUES (2, 1, 1, 'assistant', 'You should call my_function and get_user_by_id to fix the issue', 1600000001000)"
-        )?;
+        , &[])?;
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content, created_at)
              VALUES (3, 1, 2, 'user', 'The error is in AuthController.ts at line 42', 1600000002000)"
-        )?;
+        , &[])?;
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content, created_at)
              VALUES (4, 1, 3, 'assistant', 'Error error error - this message has many errors', 1600000003000)"
-        )?;
+        , &[])?;
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content, created_at)
-             VALUES (5, 1, 4, 'user', 'I found one error in the code', 1600000004000)",
+             VALUES (5, 1, 4, 'user', 'I found one error in the code', 1600000004000)", &[],
         )?;
-        conn.execute("INSERT INTO messages_fts(rowid, content) SELECT id, content FROM messages")?;
+        conn.execute("INSERT INTO messages_fts(rowid, content) SELECT id, content FROM messages", &[])?;
         conn.execute(
             "INSERT INTO messages_code_fts(rowid, content) SELECT id, content FROM messages",
+            &[],
         )?;
 
-        Ok(conn)
+            Ok(())
+        })?;
+        Ok(FrankenConnection::open_read(&db_path)?)
     }
 
     // ============================================
@@ -218,7 +257,7 @@ mod tests {
         let conn = create_runtime_fts_db(&temp_dir)?;
 
         // Search for "run" should match content with "running" due to porter stemmer
-        let results: Vec<String> = conn.query_map_collect(
+        let results: Vec<String> = conn.query_all_map(
             r#"
                 SELECT snippet(messages_fts, 0, '[', ']', '...', 20) as snippet
                 FROM messages_fts
@@ -404,7 +443,7 @@ mod tests {
         let conn = create_runtime_fts_db(&temp_dir)?;
 
         // Search for "error" - message 4 has many, message 5 has one
-        let results: Vec<(i64, f64)> = conn.query_map_collect(
+        let results: Vec<(i64, f64)> = conn.query_all_map(
             r#"
                 SELECT m.id, bm25(messages_fts) as score
                 FROM messages_fts
@@ -557,7 +596,7 @@ mod tests {
         let sql = build_fts5_search_sql("messages_fts", 64, false);
 
         let results: Vec<(i64, String)> =
-            conn.query_map_collect(&sql, fparams!["\"error\"", 10_i64, 0_i64], |row| {
+            conn.query_all_map(&sql, fparams!["\"error\"", 10_i64, 0_i64], |row| {
                 Ok((row.get_typed(0)?, row.get_typed(3)?))
             })?;
 
@@ -576,7 +615,7 @@ mod tests {
         // Build SQL with agent filter
         let sql = build_fts5_search_sql("messages_fts", 64, true);
 
-        let results: Vec<i64> = conn.query_map_collect(
+        let results: Vec<i64> = conn.query_all_map(
             &sql,
             fparams!["\"error\"", "claude", 10_i64, 0_i64],
             |row| row.get_typed(0),
@@ -589,7 +628,7 @@ mod tests {
         );
 
         // Try with non-existent agent
-        let no_results: Vec<i64> = conn.query_map_collect(
+        let no_results: Vec<i64> = conn.query_all_map(
             &sql,
             fparams!["\"error\"", "nonexistent", 10_i64, 0_i64],
             |row| row.get_typed(0),

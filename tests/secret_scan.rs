@@ -4,11 +4,21 @@ mod tests {
     use coding_agent_search::pages::secret_scan::{
         SecretScanConfig, SecretScanFilters, SecretScanReport, SecretSeverity, scan_database,
     };
-    use frankensqlite::Connection as FrankenConnection;
-    use frankensqlite::compat::ConnectionExt;
-    use frankensqlite::params as fparams;
+    use coding_agent_search::storage::sqlite::{ConnectionManagerConfig, FrankenConnectionManager};
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
+
+    /// Test-only parameter list builder (this integration test is a separate
+    /// crate and can't reach `storage::api`'s crate-private `params!` shim).
+    macro_rules! fparams {
+        () => {
+            &[] as &[coding_agent_search::storage::api::Value]
+        };
+        ($($val:expr),+ $(,)?) => {
+            &[$(coding_agent_search::storage::api::IntoValue::into_value($val)),+]
+                as &[coding_agent_search::storage::api::Value]
+        };
+    }
 
     fn severity_rank(s: SecretSeverity) -> u8 {
         match s {
@@ -19,13 +29,25 @@ mod tests {
         }
     }
 
-    fn open_db(path: &Path) -> Result<FrankenConnection> {
-        let path_str = path.to_string_lossy();
-        Ok(FrankenConnection::open(path_str.as_ref())?)
+    /// Schema-free fixture writer: these fixtures reuse cass's real table
+    /// names (`agents`/`workspaces`/`conversations`/`messages`) with a
+    /// simplified column set, so `FrankenStorage::open`'s migration pipeline
+    /// (which would apply cass's real migrations first and collide on the
+    /// `CREATE TABLE`s below) is not an option here.
+    fn open_db(path: &Path) -> Result<FrankenConnectionManager> {
+        Ok(FrankenConnectionManager::new(
+            path,
+            ConnectionManagerConfig {
+                reader_count: 1,
+                max_writers: 1,
+            },
+        )?)
     }
 
     fn setup_db(path: &Path, message_content: &str) -> Result<()> {
-        let conn = open_db(path)?;
+        let mgr = open_db(path)?;
+        let mut guard = mgr.writer()?;
+        let conn = guard.storage().raw();
         conn.execute_batch(
             r#"
             CREATE TABLE agents (
@@ -55,17 +77,18 @@ mod tests {
             "#,
         )?;
 
-        conn.execute("INSERT INTO agents (id, slug) VALUES (1, 'codex')")?;
-        conn.execute("INSERT INTO workspaces (id, path) VALUES (1, '/tmp/project')")?;
+        conn.execute("INSERT INTO agents (id, slug) VALUES (1, 'codex')", &[])?;
+        conn.execute("INSERT INTO workspaces (id, path) VALUES (1, '/tmp/project')", &[])?;
         conn.execute(
             r#"INSERT INTO conversations (id, agent_id, workspace_id, title, source_path, started_at, metadata_json)
-             VALUES (1, 1, 1, 'Test Conversation', '/tmp/project/session.json', 1700000000000, '{"info":"none"}')"#,
+             VALUES (1, 1, 1, 'Test Conversation', '/tmp/project/session.json', 1700000000000, '{"info":"none"}')"#, &[],
         )?;
-        conn.execute_compat(
+        conn.execute(
             r#"INSERT INTO messages (id, conversation_id, idx, content, extra_json)
              VALUES (1, 1, 0, ?1, '{"note":"none"}')"#,
             fparams![message_content],
         )?;
+        guard.mark_committed();
 
         Ok(())
     }
@@ -80,7 +103,9 @@ mod tests {
         started_at: i64,
         messages: &[(i64, &str, Option<&str>)], // (idx, content, extra_json)
     ) -> Result<()> {
-        let conn = open_db(path)?;
+        let mgr = open_db(path)?;
+        let mut guard = mgr.writer()?;
+        let conn = guard.storage().raw();
         conn.execute_batch(
             r#"
             CREATE TABLE agents (
@@ -110,27 +135,28 @@ mod tests {
             "#,
         )?;
 
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO agents (id, slug) VALUES (1, ?1)",
             fparams![agent_slug],
         )?;
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO workspaces (id, path) VALUES (1, ?1)",
             fparams![workspace_path],
         )?;
-        conn.execute_compat(
+        conn.execute(
             r#"INSERT INTO conversations (id, agent_id, workspace_id, title, source_path, started_at, metadata_json)
              VALUES (1, 1, 1, ?1, '/test/session.json', ?2, ?3)"#,
             fparams![title, started_at, metadata_json],
         )?;
 
         for (i, (idx, content, extra)) in messages.iter().enumerate() {
-            conn.execute_compat(
+            conn.execute(
                 r#"INSERT INTO messages (id, conversation_id, idx, content, extra_json)
                  VALUES (?1, 1, ?2, ?3, ?4)"#,
                 fparams![i as i64 + 1, *idx, *content, extra.unwrap_or("null")],
             )?;
         }
+        guard.mark_committed();
 
         Ok(())
     }
@@ -262,7 +288,9 @@ mod tests {
         let db_path = temp.path().join("scan.db");
         setup_db(&db_path, "harmless content")?;
 
-        let conn = open_db(&db_path)?;
+        let mgr = open_db(&db_path)?;
+        let mut guard = mgr.writer()?;
+        let conn = guard.storage().raw();
         conn.execute_batch(
             r#"
             CREATE TABLE snippets (
@@ -277,13 +305,15 @@ mod tests {
             "#,
         )?;
         let snippet_text = format!(r#"const OPENAI = \"{}\";"#, oai_fixture());
-        conn.execute_compat(
+        conn.execute(
             r#"INSERT INTO snippets (
                 id, message_id, file_path, start_line, end_line, language, snippet_text
             ) VALUES (1, 1, '/tmp/project/src/lib.rs', 10, 12, 'rust', ?1)"#,
             fparams![snippet_text.as_str()],
         )?;
-        drop(conn);
+        guard.mark_committed();
+        drop(guard);
+        drop(mgr);
 
         let report = scan(&db_path)?;
         assert!(
@@ -732,7 +762,9 @@ mod tests {
         let temp = TempDir::new()?;
         let db_path = temp.path().join("scan.db");
 
-        let conn = open_db(&db_path)?;
+        let mgr = open_db(&db_path)?;
+        let mut guard = mgr.writer()?;
+        let conn = guard.storage().raw();
         conn.execute_batch(
             r#"
             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
@@ -748,7 +780,9 @@ mod tests {
             );
             "#,
         )?;
-        drop(conn);
+        guard.mark_committed();
+        drop(guard);
+        drop(mgr);
 
         let report = scan(&db_path)?;
         assert_eq!(report.findings.len(), 0);

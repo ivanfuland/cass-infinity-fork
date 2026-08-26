@@ -21,11 +21,11 @@ use coding_agent_search::connectors::{NormalizedConversation, NormalizedMessage}
 use coding_agent_search::indexer::persist::persist_conversation;
 use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
 use coding_agent_search::search::tantivy::{TantivyIndex, index_dir};
+use coding_agent_search::storage::api::StorageError;
 use coding_agent_search::storage::sqlite::{
     ConnectionManagerConfig, FrankenConnectionManager, FrankenStorage,
 };
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use frankensqlite::FrankenError;
 use std::hint::black_box;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -531,7 +531,9 @@ fn bench_query_comparison(c: &mut Criterion) {
             black_box(
                 direct_storage
                     .raw()
-                    .query("SELECT COUNT(*) FROM conversations")
+                    .query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| {
+                        row.get_typed::<i64>(0)
+                    })
                     .unwrap(),
             )
         })
@@ -553,19 +555,15 @@ where
         match f() {
             Ok(val) => return Ok(val),
             Err(err) => {
+                // Stage A note: the original five busy/conflict variants plus
+                // DatabaseCorrupt all collapse into storage::api's StorageError::
+                // Busy{..}/Corrupt{..} via map_franken_err; matching those two
+                // variants reproduces the same retry set.
                 let is_retryable = err
-                    .downcast_ref::<FrankenError>()
-                    .or_else(|| err.root_cause().downcast_ref::<FrankenError>())
+                    .downcast_ref::<StorageError>()
+                    .or_else(|| err.root_cause().downcast_ref::<StorageError>())
                     .is_some_and(|inner| {
-                        matches!(
-                            inner,
-                            FrankenError::Busy
-                                | FrankenError::BusyRecovery
-                                | FrankenError::BusySnapshot { .. }
-                                | FrankenError::WriteConflict { .. }
-                                | FrankenError::SerializationFailure { .. }
-                                | FrankenError::DatabaseCorrupt { .. }
-                        )
+                        matches!(inner, StorageError::Busy { .. } | StorageError::Corrupt { .. })
                     });
                 if attempt < max_retries && is_retryable {
                     std::thread::sleep(Duration::from_millis(backoff_ms));
@@ -584,8 +582,6 @@ where
 // =============================================================================
 
 fn bench_concurrent_writes(c: &mut Criterion) {
-    use frankensqlite::compat::TransactionExt;
-
     let mut group = c.benchmark_group("concurrent_writes");
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(5));
@@ -638,7 +634,7 @@ fn bench_concurrent_writes(c: &mut Criterion) {
                 let fs = FrankenStorage::open(&db_path).unwrap();
                 // Create a simple table for raw concurrent writes
                 fs.raw()
-                    .execute("CREATE TABLE IF NOT EXISTS bench_raw (id INTEGER PRIMARY KEY, tid INTEGER, seq INTEGER, val TEXT)")
+                    .execute("CREATE TABLE IF NOT EXISTS bench_raw (id INTEGER PRIMARY KEY, tid INTEGER, seq INTEGER, val TEXT)", &[])
                     .unwrap();
                 drop(fs);
 
@@ -657,10 +653,13 @@ fn bench_concurrent_writes(c: &mut Criterion) {
                             for seq in 0..100 {
                                 let mut guard = m.concurrent_writer().unwrap();
                                 with_retry(50, || {
-                                    let mut tx = guard.storage().raw().transaction()?;
-                                    tx.execute(&format!(
-                                        "INSERT INTO bench_raw (tid, seq, val) VALUES ({tid}, {seq}, 'bench-{tid}-{seq}')"
-                                    ))?;
+                                    let tx = guard.storage().raw().transaction()?;
+                                    tx.execute(
+                                        &format!(
+                                            "INSERT INTO bench_raw (tid, seq, val) VALUES ({tid}, {seq}, 'bench-{tid}-{seq}')"
+                                        ),
+                                        &[],
+                                    )?;
                                     tx.commit().map_err(anyhow::Error::new)?;
                                     Ok(())
                                 })

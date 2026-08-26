@@ -618,7 +618,7 @@ fn index_handles_existing_schema_13_db() {
     let storage = SqliteStorage::open(&db_path).expect("seed sqlite db");
     storage
         .raw()
-        .execute("UPDATE meta SET value = '13' WHERE key = 'schema_version'")
+        .execute("UPDATE meta SET value = '13' WHERE key = 'schema_version'", &[])
         .expect("set schema_version to 13");
     drop(storage);
 

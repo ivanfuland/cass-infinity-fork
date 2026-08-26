@@ -5111,9 +5111,7 @@ pub fn hold_for_unreadable_sealed_blob(
 #[cfg(test)]
 mod e5_p30_blob_read_tests {
     use super::*;
-    use frankensqlite::compat::{
-        ConnectionExt, OptionalExtension, ParamValue, RowExt, TransactionExt,
-    };
+    use crate::storage::api::Value as ParamValue;
     use serial_test::serial;
     use tempfile::TempDir;
 
@@ -5649,7 +5647,7 @@ mod e5_p30_blob_read_tests {
             if drop_hot_tail_row {
                 storage
                     .raw()
-                    .execute_compat(
+                    .execute(
                         "DELETE FROM conversation_tail_state WHERE conversation_id = ?1",
                         &[ParamValue::from(conv_id)],
                     )
@@ -5716,12 +5714,11 @@ mod e5_p30_blob_read_tests {
         // 「tail 定位正确」在那一支上必须由**回落源**作证。
         let hot_tail_idx: Option<i64> = storage
             .raw()
-            .query_row_map(
+            .query_opt_map(
                 "SELECT last_message_idx FROM conversation_tail_state WHERE conversation_id = ?1",
                 &[ParamValue::from(conv_id)],
                 |row| row.get_typed(0),
             )
-            .optional()
             .unwrap()
             .flatten();
         let legacy_tail_idx: Option<i64> = storage
@@ -5846,12 +5843,12 @@ mod e5_p30_blob_read_tests {
 
             // 造 legacy 形态：热表清掉（逼回落），legacy 三列只留一个**陈旧高位** idx。
             let conn = storage.raw();
-            conn.execute_compat(
+            conn.execute(
                 "DELETE FROM conversation_tail_state WHERE conversation_id = ?1",
                 &[ParamValue::from(conv_id)],
             )
             .unwrap();
-            conn.execute_compat(
+            conn.execute(
                 "UPDATE conversations
                  SET last_message_idx = 99, last_message_created_at = NULL, ended_at = NULL
                  WHERE id = ?1",
@@ -5907,7 +5904,7 @@ mod e5_p30_blob_read_tests {
         );
         let idxs: Vec<i64> = storage
             .raw()
-            .query_map_collect(
+            .query_all_map(
                 "SELECT idx FROM messages WHERE conversation_id = ?1 ORDER BY idx",
                 &[ParamValue::from(conv_id)],
                 |row| row.get_typed(0),
@@ -6014,7 +6011,7 @@ pub(crate) fn replace_idempotency_key(snapshot_root: &str, identity: &RestoreIde
 /// 8 重建第三处 tail 载体；9 conversation 级字段按 §B.1.2；10 推进 generation；
 /// 11 写 receipt。
 pub(crate) fn commit_replace_in_tx(
-    tx: &frankensqlite::compat::Transaction<'_>,
+    tx: &crate::storage::api::Tx<'_>,
     input: &ReplaceCommitInput<'_>,
     pricing: &crate::storage::sqlite::PricingTable,
     committed_at_ms: i64,
@@ -6213,8 +6210,7 @@ pub(crate) fn commit_restore_new(
 
     // 第二个原子步：generation 与 receipt 一起提交 —— 它们之间不能再有窗，
     // 否则会出现「代际已推进、却查不到 receipt」这种更难判读的状态。
-    use frankensqlite::compat::TransactionExt as _;
-    let mut tx = storage.raw().transaction()?;
+    let tx = storage.raw().transaction()?;
     crate::storage::sqlite::franken_set_source_content_generation_in_tx(&tx, input.generation)?;
     crate::storage::sqlite::franken_insert_operation_commit_receipt_in_tx(
         &tx,
@@ -6249,9 +6245,7 @@ pub(crate) fn commit_restore_new(
 #[cfg(test)]
 mod e6_replace_commit_tests {
     use super::*;
-    use frankensqlite::compat::{
-        ConnectionExt, OptionalExtension, ParamValue, RowExt, TransactionExt,
-    };
+    use crate::storage::api::Value as ParamValue;
     use tempfile::TempDir;
 
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
@@ -6321,8 +6315,7 @@ mod e6_replace_commit_tests {
     fn scalar_i64(storage: &FrankenStorage, sql: &str, id: i64) -> Option<i64> {
         storage
             .raw()
-            .query_row_map(sql, &[ParamValue::from(id)], |row| row.get_typed(0))
-            .optional()
+            .query_opt_map(sql, &[ParamValue::from(id)], |row| row.get_typed(0))
             .unwrap()
             .flatten()
     }
@@ -6402,7 +6395,7 @@ mod e6_replace_commit_tests {
     fn lookup_keys_for(storage: &FrankenStorage, conversation_id: i64) -> Vec<String> {
         storage
             .raw()
-            .query_map_collect(
+            .query_all_map(
                 "SELECT lookup_key FROM conversation_external_tail_lookup \
                  WHERE conversation_id = ?1 ORDER BY lookup_key",
                 &[ParamValue::from(conversation_id)],
@@ -6804,14 +6797,13 @@ mod e6_replace_commit_tests {
         // ⑩ generation 推进。
         let generation: Option<String> = storage
             .raw()
-            .query_row_map(
+            .query_opt_map(
                 "SELECT value FROM meta WHERE key = ?1",
                 &[ParamValue::from(
                     crate::storage::sqlite::SOURCE_CONTENT_GENERATION_META_KEY,
                 )],
                 |row| row.get_typed(0),
             )
-            .optional()
             .unwrap()
             .flatten();
         assert_eq!(generation.as_deref(), Some("gen-e6-0001"));
@@ -6902,14 +6894,13 @@ mod e6_replace_commit_tests {
         );
         let generation: Option<String> = storage
             .raw()
-            .query_row_map(
+            .query_opt_map(
                 "SELECT value FROM meta WHERE key = ?1",
                 &[ParamValue::from(
                     crate::storage::sqlite::SOURCE_CONTENT_GENERATION_META_KEY,
                 )],
                 |row| row.get_typed(0),
             )
-            .optional()
             .unwrap()
             .flatten();
         assert_eq!(generation, None, "generation 必须一起回滚");
@@ -6927,7 +6918,6 @@ mod e6_replace_commit_tests {
     // （A 的行被当成 B 的候选，判成 replace 后用 B 的内容盖掉 A）。
     #[test]
     fn e6_candidate_lookup_does_not_fold_two_agents_sharing_one_path() {
-        use frankensqlite::compat::ConnectionExt as _;
         let dir = TempDir::new().unwrap();
         let storage = FrankenStorage::open(&dir.path().join("fold.sqlite")).unwrap();
 
@@ -7100,7 +7090,7 @@ mod e6_replace_commit_tests {
         // 造崩溃窗留下的状态：插入已提交，receipt 没写成。
         storage
             .raw()
-            .execute_compat("DELETE FROM operation_commit_receipt", &[])
+            .execute("DELETE FROM operation_commit_receipt", &[])
             .unwrap();
         let receipts: Option<i64> = storage
             .raw()
@@ -7199,7 +7189,7 @@ mod e6_replace_commit_tests {
     fn message_metrics_digest(storage: &FrankenStorage) -> Vec<String> {
         storage
             .raw()
-            .query_map_collect(
+            .query_all_map(
                 "SELECT CAST(message_id AS TEXT) || '|' || CAST(hour_id AS TEXT) || '|'
                         || CAST(day_id AS TEXT) || '|' || agent_slug || '|'
                         || CAST(content_tokens_est AS TEXT) || '|' || api_data_source
@@ -7214,7 +7204,7 @@ mod e6_replace_commit_tests {
     fn rollup_digest(storage: &FrankenStorage, table: &str) -> Vec<String> {
         storage
             .raw()
-            .query_map_collect(
+            .query_all_map(
                 &format!(
                     "SELECT agent_slug || '|' || CAST(message_count AS TEXT) || '|'
                             || CAST(user_message_count AS TEXT) || '|'
@@ -7273,7 +7263,7 @@ mod e6_replace_commit_tests {
         // 覆盖掉，于是「没被触碰」从「值相等」变成了可观测的事实。
         storage
             .raw()
-            .execute_compat(
+            .execute(
                 "UPDATE message_metrics SET provider = 'sentinel-untouched'
                  WHERE message_id = (SELECT MIN(message_id) FROM message_metrics)",
                 &[],
@@ -7316,7 +7306,7 @@ mod e6_replace_commit_tests {
         );
         let daily_rows: Vec<String> = storage
             .raw()
-            .query_map_collect(
+            .query_all_map(
                 "SELECT CAST(day_id AS TEXT) || '/' || agent_slug || '/' || source_id || '='
                         || CAST(session_count AS TEXT) || ',' || CAST(message_count AS TEXT)
                  FROM daily_stats ORDER BY day_id, agent_slug, source_id",
@@ -7967,7 +7957,7 @@ fn conversation_ids_for_identity(
     storage: &crate::storage::sqlite::FrankenStorage,
     identity: &RestoreIdentity,
 ) -> anyhow::Result<Vec<i64>> {
-    use frankensqlite::compat::{ConnectionExt as _, ParamValue, RowExt as _};
+    use crate::storage::api::Value as ParamValue;
 
     // manifest 侧 `origin_host: None` 在身份里被写成 `RESTORE_LOCAL_ORIGIN_HOST`
     // 这个哨兵；换算回 `Option` 再喂给生产归一化，别让哨兵被当成一个真的主机名。
@@ -8001,7 +7991,7 @@ fn conversation_ids_for_identity(
     }
     let ids: Vec<i64> = storage
         .raw()
-        .query_map_collect(&sql, &params, |row| row.get_typed(0))?;
+        .query_all_map(&sql, &params, |row| row.get_typed(0))?;
     Ok(ids)
 }
 
@@ -8157,8 +8147,7 @@ fn restore_run_db_phase(
                 outcome.receipt_keys.push(out.idempotency_key);
             }
             PlannedAction::Replace { conversation_id } => {
-                use frankensqlite::compat::TransactionExt as _;
-                let mut tx = storage.raw().transaction()?;
+                let tx = storage.raw().transaction()?;
                 let replaced = commit_replace_in_tx(
                     &tx,
                     &ReplaceCommitInput {
@@ -9030,19 +9019,17 @@ impl W1CommitMarker {
 
 /// 读 DB 里的内容代际（`meta` 保留 key）。key 常量与写侧共用一个，**不在两处各写一份**。
 fn read_content_generation(db_path: &Path) -> anyhow::Result<Option<String>> {
-    use frankensqlite::compat::{ConnectionExt as _, OptionalExtension as _, RowExt as _};
     let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(db_path)
         .map_err(|e| anyhow::anyhow!("open db for generation read: {e}"))?;
     let got: Option<String> = storage
         .raw()
-        .query_row_map(
+        .query_opt_map(
             "SELECT value FROM meta WHERE key = ?1",
-            &[frankensqlite::compat::ParamValue::from(
+            &[crate::storage::api::Value::from(
                 crate::storage::sqlite::SOURCE_CONTENT_GENERATION_META_KEY,
             )],
             |row| row.get_typed(0),
-        )
-        .optional()?
+        )?
         .flatten();
     storage.close_best_effort_in_place();
     Ok(got)
@@ -9596,7 +9583,7 @@ pub(crate) fn test_tree_snapshot(root: &Path) -> Vec<(String, u64)> {
 #[cfg(test)]
 mod e7_restore_journal_tests {
     use super::*;
-    use frankensqlite::compat::{ConnectionExt, OptionalExtension, ParamValue, RowExt};
+    use crate::storage::api::Value as ParamValue;
     use tempfile::TempDir;
 
     const SNAPSHOT_ROOT: &str = "e7-snapshot-root-0001";
@@ -9720,7 +9707,7 @@ mod e7_restore_journal_tests {
         let storage = crate::storage::sqlite::FrankenStorage::open(db_path).unwrap();
         storage
             .raw()
-            .execute_compat(
+            .execute(
                 "INSERT OR REPLACE INTO daily_stats
                  (day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -9780,12 +9767,11 @@ mod e7_restore_journal_tests {
         let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(db_path).unwrap();
         let found: Option<i64> = storage
             .raw()
-            .query_row_map(
+            .query_opt_map(
                 "SELECT 1 FROM daily_stats WHERE agent_slug = 'e7-sentinel'",
                 &[],
                 |row| row.get_typed(0),
             )
-            .optional()
             .unwrap()
             .flatten();
         storage.close_best_effort_in_place();
@@ -9874,7 +9860,7 @@ mod e7_restore_journal_tests {
             crate::storage::sqlite::FrankenStorage::open_readonly(&d.db_path).unwrap();
         let found: Vec<i64> = storage
             .raw()
-            .query_map_collect(
+            .query_all_map(
                 "SELECT c.id FROM conversations c JOIN agents a ON a.id = c.agent_id \
                  WHERE c.source_path = ?1 AND c.source_id = ?2 AND a.slug = ?3 \
                    AND COALESCE(NULLIF(TRIM(COALESCE(c.origin_host, '')), ''), 'local') = ?4",
@@ -10398,7 +10384,7 @@ mod e7_restore_journal_tests {
             crate::storage::sqlite::FrankenStorage::open_readonly(&d.db_path).unwrap();
         let stored_hosts: Vec<String> = storage
             .raw()
-            .query_map_collect(
+            .query_all_map(
                 "SELECT COALESCE(c.origin_host, '<NULL>') FROM conversations c \
                  WHERE c.external_id IN ('e7-local-with-host', 'e7-local-no-host') ORDER BY c.id",
                 &[],
@@ -10823,7 +10809,7 @@ mod e7_restore_journal_tests {
         let storage = crate::storage::sqlite::FrankenStorage::open(&d.db_path).unwrap();
         storage
             .raw()
-            .execute("DELETE FROM operation_commit_receipt;")
+            .execute("DELETE FROM operation_commit_receipt;", &[])
             .unwrap();
         drop(storage);
 

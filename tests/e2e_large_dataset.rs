@@ -27,7 +27,6 @@
 
 use assert_cmd::cargo::cargo_bin;
 use coding_agent_search::storage::sqlite::SqliteStorage;
-use frankensqlite::compat::{ConnectionExt, RowExt};
 use serial_test::serial;
 use std::fs;
 use std::path::Path;

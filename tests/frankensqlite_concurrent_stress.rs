@@ -5,39 +5,59 @@
 //!
 //! Bead: coding_agent_session_search-2tax6
 
+use coding_agent_search::storage::api::{Conn as Connection, StorageError as FrankenError};
 use coding_agent_search::storage::sqlite::{
     ConnectionManagerConfig, FrankenConnectionManager, FrankenStorage,
 };
-use frankensqlite::compat::{ConnectionExt, RowExt, TransactionExt};
-use frankensqlite::params as fparams;
-use frankensqlite::{Connection, FrankenError};
 use rand::RngExt;
+
+/// Test-only parameter list builder (this integration test is a separate
+/// crate and can't reach `storage::api`'s crate-private `params!` shim):
+/// borrows + handles the zero-arg case, mirroring sqlite.rs's own `fparams!`.
+macro_rules! fparams {
+    () => {
+        &[] as &[coding_agent_search::storage::api::Value]
+    };
+    ($($val:expr),+ $(,)?) => {
+        &[$(coding_agent_search::storage::api::IntoValue::into_value($val)),+]
+            as &[coding_agent_search::storage::api::Value]
+    };
+}
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
-/// Create a frankensqlite DB with cass schema applied.
+/// Create a cass-schema DB (via storage::api).
 fn setup_db(dir: &TempDir) -> std::path::PathBuf {
     let db_path = dir.path().join("stress.db");
-    let fs = FrankenStorage::open(&db_path).expect("create frankensqlite db");
+    let fs = FrankenStorage::open(&db_path).expect("create cass db");
     drop(fs);
     db_path
 }
 
-/// Create a minimal frankensqlite DB with just a simple table.
+/// Create a DB with cass's schema plus a simple ad-hoc table for raw
+/// concurrency tests. Stage A note: `storage::api::Conn::open_writable` is
+/// deliberately crate-private (R2-F3 — the only public path to a writable
+/// `Conn` at a real path is via `FrankenStorage`), so this integration test
+/// (a separate crate) bootstraps through `FrankenStorage::open` +
+/// `into_raw()` rather than opening a bare, schema-free connection the way
+/// the pre-migration native-`frankensqlite` version of this helper did. The
+/// extra cass tables don't collide with `items`/`counter`/`cm_stress` and
+/// don't affect the concurrency behavior under test.
 /// Sets WAL mode and busy_timeout — required for concurrent writes.
 fn setup_simple_db(dir: &TempDir) -> std::path::PathBuf {
     let db_path = dir.path().join("simple.db");
-    let conn = Connection::open(db_path.to_str().unwrap()).unwrap();
-    conn.execute("PRAGMA journal_mode = WAL;").unwrap();
-    conn.execute("PRAGMA synchronous = NORMAL;").unwrap();
-    conn.execute("PRAGMA busy_timeout = 5000;").unwrap();
+    let conn = FrankenStorage::open(&db_path).unwrap().into_raw();
+    conn.execute("PRAGMA journal_mode = WAL;", &[]).unwrap();
+    conn.execute("PRAGMA synchronous = NORMAL;", &[]).unwrap();
+    conn.execute("PRAGMA busy_timeout = 5000;", &[]).unwrap();
     conn.execute(
         "CREATE TABLE items (id INTEGER PRIMARY KEY, thread_id INTEGER, seq INTEGER, val TEXT)",
+        &[],
     )
     .unwrap();
-    conn.execute("CREATE INDEX idx_items_thread ON items(thread_id)")
+    conn.execute("CREATE INDEX idx_items_thread ON items(thread_id)", &[])
         .unwrap();
     drop(conn);
     db_path
@@ -45,10 +65,10 @@ fn setup_simple_db(dir: &TempDir) -> std::path::PathBuf {
 
 /// Open a connection with proper WAL/busy_timeout config for concurrent tests.
 fn open_configured(path: &std::path::Path) -> Connection {
-    let conn = Connection::open(path.to_str().unwrap()).unwrap();
-    let _ = conn.execute("PRAGMA journal_mode = WAL;");
-    let _ = conn.execute("PRAGMA busy_timeout = 5000;");
-    let _ = conn.execute("PRAGMA cache_size = -4096;");
+    let conn = FrankenStorage::open(path).unwrap().into_raw();
+    let _ = conn.execute("PRAGMA journal_mode = WAL;", &[]);
+    let _ = conn.execute("PRAGMA busy_timeout = 5000;", &[]);
+    let _ = conn.execute("PRAGMA cache_size = -4096;", &[]);
     conn
 }
 
@@ -63,19 +83,15 @@ where
         match f() {
             Ok(val) => return Ok(val),
             Err(err) => {
+                // Stage A note: the original five busy/conflict variants plus
+                // DatabaseCorrupt all collapse into storage::api's StorageError::
+                // Busy{..}/Corrupt{..} via map_franken_err; matching those two
+                // variants reproduces the same retry set.
                 let is_retryable = err
                     .downcast_ref::<FrankenError>()
                     .or_else(|| err.root_cause().downcast_ref::<FrankenError>())
                     .is_some_and(|inner| {
-                        matches!(
-                            inner,
-                            FrankenError::Busy
-                                | FrankenError::BusyRecovery
-                                | FrankenError::BusySnapshot { .. }
-                                | FrankenError::WriteConflict { .. }
-                                | FrankenError::SerializationFailure { .. }
-                                | FrankenError::DatabaseCorrupt { .. }
-                        )
+                        matches!(inner, FrankenError::Busy { .. } | FrankenError::Corrupt { .. })
                     });
                 if attempt < max_retries && is_retryable {
                     // Jittered backoff to reduce thundering herd
@@ -114,7 +130,7 @@ fn stress_parallel_connector_writes() {
         guard
             .storage()
             .raw()
-            .execute("CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY, thread_id INTEGER, seq INTEGER, val TEXT)")
+            .execute("CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY, thread_id INTEGER, seq INTEGER, val TEXT)", &[])
             .unwrap();
         guard.mark_committed();
     }
@@ -134,8 +150,8 @@ fn stress_parallel_connector_writes() {
                     let val = format!("thread-{thread_id}-seq-{seq}");
                     let mut guard = m.concurrent_writer().expect("acquire writer");
                     with_retry(50, || {
-                        let mut tx = guard.storage().raw().transaction()?;
-                        tx.execute_compat(
+                        let tx = guard.storage().raw().transaction()?;
+                        tx.execute(
                             "INSERT INTO items (thread_id, seq, val) VALUES (?1, ?2, ?3)",
                             fparams![thread_id, seq, val.as_str()],
                         )?;
@@ -157,8 +173,9 @@ fn stress_parallel_connector_writes() {
 
     // Verify via reader
     let reader = mgr.reader();
-    let rows = reader.query("SELECT COUNT(*) FROM items").unwrap();
-    let count: i64 = rows[0].get_typed(0).unwrap();
+        let count: i64 = reader
+        .query_row_map("SELECT COUNT(*) FROM items", &[], |row| row.get_typed(0))
+        .unwrap();
     let expected = (num_threads * writes_per_thread) as i64;
     assert!(
         count >= expected,
@@ -198,7 +215,7 @@ fn stress_write_heavy_contention() {
         guard
             .storage()
             .raw()
-            .execute("CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY, thread_id INTEGER, seq INTEGER, val TEXT)")
+            .execute("CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY, thread_id INTEGER, seq INTEGER, val TEXT)", &[])
             .unwrap();
         guard.mark_committed();
     }
@@ -218,18 +235,21 @@ fn stress_write_heavy_contention() {
                 for batch in 0..batches_per_thread {
                     with_retry(50, || {
                         let mut guard = m.concurrent_writer().expect("acquire writer");
-                        let mut tx = guard.storage().raw().transaction()?;
+                        let tx = guard.storage().raw().transaction()?;
                         for row_in_batch in 0..rows_per_batch {
                             let seq = batch * rows_per_batch + row_in_batch;
                             // Generate a unique ID per thread and seq to avoid auto-increment collisions
                             let unique_id = (thread_id * 100000) + seq;
-                            tx.execute_compat(
+                            tx.execute(
                                 "INSERT INTO items (id, thread_id, seq, val) VALUES (?1, ?2, ?3, 'contention')",
                                 fparams![unique_id, thread_id, seq],
                             )?;
                         }
                         tx.commit().map_err(anyhow::Error::new)?;
-                        drop(tx); // Release borrow on guard before mutable access
+                        // Stage A: `Tx::commit` now consumes `self` (releasing its
+                        // borrow on `guard` as part of the move), so the explicit
+                        // `drop` the native-frankensqlite `&mut self` commit needed
+                        // is no longer necessary.
                         guard.mark_committed();
                         Ok(())
                     })
@@ -250,34 +270,37 @@ fn stress_write_heavy_contention() {
 
     // Verify via reader
     let reader = mgr.reader();
-    let rows = reader
-        .query("SELECT thread_id, COUNT(*) FROM items GROUP BY thread_id")
+    let rows: Vec<(i64, i64)> = reader
+        .query_all_map(
+            "SELECT thread_id, COUNT(*) FROM items GROUP BY thread_id",
+            &[],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+        )
         .unwrap();
-    for row in rows {
-        let tid: i64 = row.get_typed(0).unwrap();
-        let cnt: i64 = row.get_typed(1).unwrap();
+    for (tid, cnt) in rows {
         println!("thread {} inserted {} rows", tid, cnt);
 
         if tid == 1 {
-            let seqs = reader
-                .query("SELECT id, seq FROM items WHERE thread_id = 1 ORDER BY seq")
+            let seq_list: Vec<(i64, i64)> = reader
+                .query_all_map(
+                    "SELECT id, seq FROM items WHERE thread_id = 1 ORDER BY seq",
+                    &[],
+                    |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+                )
                 .unwrap();
-            let mut seq_list = Vec::new();
-            for s_row in seqs {
-                seq_list.push((
-                    s_row.get_typed::<i64>(0).unwrap(),
-                    s_row.get_typed::<i64>(1).unwrap(),
-                ));
-            }
             println!("thread 1 seqs: {:?}", seq_list);
         }
     }
 
-    let rows = reader.query("SELECT COUNT(*) FROM items").unwrap();
-    let count: i64 = rows[0].get_typed(0).unwrap();
+    let count: i64 = reader
+        .query_row_map("SELECT COUNT(*) FROM items", &[], |row| row.get_typed(0))
+        .unwrap();
 
-    let max_id: i64 = reader.query("SELECT MAX(id) FROM items").unwrap()[0]
-        .get_typed(0)
+    let max_id: i64 = reader
+        .query_row_map("SELECT MAX(id) FROM items", &[], |row| {
+            row.get_typed::<Option<i64>>(0)
+        })
+        .unwrap()
         .unwrap_or(0);
     println!("Total rows: {}, Max ID: {}", count, max_id);
 
@@ -320,8 +343,8 @@ fn stress_read_write_mix() {
 
                 while start.elapsed() < duration {
                     let result = with_retry(30, || {
-                        let mut tx = conn.transaction()?;
-                        tx.execute_compat(
+                        let tx = conn.transaction()?;
+                        tx.execute(
                             "INSERT INTO items (thread_id, seq, val) VALUES (?1, ?2, 'rw-mix')",
                             fparams![thread_id, seq],
                         )?;
@@ -347,9 +370,10 @@ fn stress_read_write_mix() {
                 let start = Instant::now();
 
                 while start.elapsed() < duration {
-                    match conn.query("SELECT COUNT(*) FROM items") {
-                        Ok(rows) => {
-                            let _count: i64 = rows[0].get_typed(0).unwrap();
+                    match conn.query_row_map("SELECT COUNT(*) FROM items", &[], |row| {
+                        row.get_typed::<i64>(0)
+                    }) {
+                        Ok(_count) => {
                             reads.fetch_add(1, Ordering::Relaxed);
                         }
                         Err(_) => {
@@ -369,8 +393,9 @@ fn stress_read_write_mix() {
 
     // Verify final state
     let conn = open_configured(&db_path);
-    let rows = conn.query("SELECT COUNT(*) FROM items").unwrap();
-    let final_count: i64 = rows[0].get_typed(0).unwrap();
+        let final_count: i64 = conn
+        .query_row_map("SELECT COUNT(*) FROM items", &[], |row| row.get_typed(0))
+        .unwrap();
 
     // The DB count is authoritative. Under MVCC, a commit may return an error
     // after the data was actually persisted (partial commit edge case), so we
@@ -379,15 +404,16 @@ fn stress_read_write_mix() {
     assert!(total_reads > 0, "readers should have completed queries");
 
     // Verify data integrity: all rows are readable and have expected columns
-    let integrity_rows = conn
-        .query("SELECT thread_id, seq, val FROM items ORDER BY thread_id, seq")
+    let integrity_rows: Vec<(i64, i64, String)> = conn
+        .query_all_map(
+            "SELECT thread_id, seq, val FROM items ORDER BY thread_id, seq",
+            &[],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+        )
         .unwrap();
-    for row in &integrity_rows {
-        let tid: i64 = row.get_typed(0).unwrap();
-        let seq: i64 = row.get_typed(1).unwrap();
-        let val: String = row.get_typed(2).unwrap();
-        assert!((0..4).contains(&tid), "thread_id {tid} should be 0..3");
-        assert!(seq >= 0, "seq should be non-negative");
+    for (tid, seq, val) in &integrity_rows {
+        assert!((0..4).contains(tid), "thread_id {tid} should be 0..3");
+        assert!(*seq >= 0, "seq should be non-negative");
         assert_eq!(val, "rw-mix", "val should be 'rw-mix'");
     }
 
@@ -428,8 +454,8 @@ fn stress_crash_recovery_uncommitted_data_absent() {
     // Commit some data first
     {
         let conn = open_configured(&db_path);
-        let mut tx = conn.transaction().unwrap();
-        tx.execute("INSERT INTO items (thread_id, seq, val) VALUES (0, 0, 'committed')")
+        let tx = conn.transaction().unwrap();
+        tx.execute("INSERT INTO items (thread_id, seq, val) VALUES (0, 0, 'committed')", &[])
             .unwrap();
         tx.commit().unwrap();
     }
@@ -437,21 +463,24 @@ fn stress_crash_recovery_uncommitted_data_absent() {
     // Begin concurrent write but DO NOT commit - drop connection
     {
         let conn = open_configured(&db_path);
-        conn.execute("BEGIN CONCURRENT").unwrap();
-        conn.execute("INSERT INTO items (thread_id, seq, val) VALUES (1, 0, 'uncommitted')")
+        conn.execute("BEGIN CONCURRENT", &[]).unwrap();
+        conn.execute("INSERT INTO items (thread_id, seq, val) VALUES (1, 0, 'uncommitted')", &[])
             .unwrap();
         // Drop without COMMIT — should auto-rollback
     }
 
     // Verify only committed data exists
     let conn = open_configured(&db_path);
-    let rows = conn.query("SELECT COUNT(*) FROM items").unwrap();
-    let count: i64 = rows[0].get_typed(0).unwrap();
+        let count: i64 = conn
+        .query_row_map("SELECT COUNT(*) FROM items", &[], |row| row.get_typed(0))
+        .unwrap();
     assert_eq!(count, 1, "only committed row should exist");
 
-    let val_rows = conn.query("SELECT val FROM items").unwrap();
+    let first_val: String = conn
+        .query_row_map("SELECT val FROM items", &[], |row| row.get_typed(0))
+        .unwrap();
     assert_eq!(
-        val_rows[0].get_typed::<String>(0).unwrap(),
+        first_val,
         "committed",
         "only committed data should be present"
     );
@@ -471,11 +500,11 @@ fn stress_large_transaction() {
 
     {
         let conn = open_configured(&db_path);
-        let mut tx = conn.transaction().unwrap();
+        let tx = conn.transaction().unwrap();
 
         for i in 0..num_rows {
             let val = format!("large-txn-row-{i}");
-            tx.execute_compat(
+            tx.execute(
                 "INSERT INTO items (thread_id, seq, val) VALUES (0, ?1, ?2)",
                 fparams![i, val.as_str()],
             )
@@ -489,8 +518,9 @@ fn stress_large_transaction() {
 
     // Verify all rows present
     let conn = open_configured(&db_path);
-    let rows = conn.query("SELECT COUNT(*) FROM items").unwrap();
-    let count: i64 = rows[0].get_typed(0).unwrap();
+        let count: i64 = conn
+        .query_row_map("SELECT COUNT(*) FROM items", &[], |row| row.get_typed(0))
+        .unwrap();
     assert_eq!(count, num_rows, "all {num_rows} rows should be present");
 
     eprintln!(
@@ -513,9 +543,9 @@ fn stress_retry_convergence_conflicting_writes() {
     let db_path = dir.path().join("conflict.db");
 
     let conn = open_configured(&db_path);
-    conn.execute("CREATE TABLE counter (id INTEGER PRIMARY KEY, val INTEGER)")
+    conn.execute("CREATE TABLE counter (id INTEGER PRIMARY KEY, val INTEGER)", &[])
         .unwrap();
-    conn.execute("INSERT INTO counter (id, val) VALUES (1, 0)")
+    conn.execute("INSERT INTO counter (id, val) VALUES (1, 0)", &[])
         .unwrap();
     drop(conn);
 
@@ -537,17 +567,20 @@ fn stress_retry_convergence_conflicting_writes() {
                 for _ in 0..increments_per_thread {
                     let mut attempt = 0;
                     loop {
-                        let mut tx = conn.transaction().unwrap();
-                        let rows = tx.query("SELECT val FROM counter WHERE id = 1").unwrap();
-                        let current: i64 = rows[0].get_typed(0).unwrap();
+                        let tx = conn.transaction().unwrap();
+                        let current: i64 = tx
+                            .query_row_map("SELECT val FROM counter WHERE id = 1", &[], |row| {
+                                row.get_typed(0)
+                            })
+                            .unwrap();
                         let new_val = current + 1;
 
-                        if let Err(e) = tx.execute_compat(
+                        if let Err(e) = tx.execute(
                             "UPDATE counter SET val = ?1 WHERE id = 1",
                             fparams![new_val],
                         ) {
                             // Execute failed — likely conflict
-                            let _ = conn.execute("ROLLBACK");
+                            let _ = conn.execute("ROLLBACK", &[]);
                             attempt += 1;
                             retries.fetch_add(1, Ordering::Relaxed);
                             if attempt > 50 {
@@ -594,8 +627,9 @@ fn stress_retry_convergence_conflicting_writes() {
 
     // Verify final counter value
     let conn = open_configured(&db_path);
-    let rows = conn.query("SELECT val FROM counter WHERE id = 1").unwrap();
-    let final_val: i64 = rows[0].get_typed(0).unwrap();
+    let final_val: i64 = conn
+        .query_row_map("SELECT val FROM counter WHERE id = 1", &[], |row| row.get_typed(0))
+        .unwrap();
 
     // With optimistic concurrency, some increments may be lost due to
     // read-modify-write races. The counter should be >= num_threads
@@ -636,7 +670,7 @@ fn stress_connection_manager_parallel_writers() {
         guard
             .storage()
             .raw()
-            .execute("CREATE TABLE IF NOT EXISTS cm_stress (id INTEGER PRIMARY KEY, tid INTEGER, val TEXT)")
+            .execute("CREATE TABLE IF NOT EXISTS cm_stress (id INTEGER PRIMARY KEY, tid INTEGER, val TEXT)", &[])
             .unwrap();
         guard.mark_committed();
     }
@@ -651,9 +685,9 @@ fn stress_connection_manager_parallel_writers() {
                 for seq in 0..writes_per_thread {
                     let mut guard = m.concurrent_writer().expect("acquire writer");
                     with_retry(50, || {
-                        let mut tx = guard.storage().raw().transaction()?;
+                        let tx = guard.storage().raw().transaction()?;
                         let val = format!("cm-{tid}-{seq}");
-                        tx.execute_compat(
+                        tx.execute(
                             "INSERT INTO cm_stress (tid, val) VALUES (?1, ?2)",
                             fparams![tid, val.as_str()],
                         )?;
@@ -672,10 +706,9 @@ fn stress_connection_manager_parallel_writers() {
 
     // Verify via reader
     let reader_guard = mgr.reader();
-    let rows = reader_guard
-        .query("SELECT COUNT(*) FROM cm_stress")
+    let count: i64 = reader_guard
+        .query_row_map("SELECT COUNT(*) FROM cm_stress", &[], |row| row.get_typed(0))
         .unwrap();
-    let count: i64 = rows[0].get_typed(0).unwrap();
     assert_eq!(
         count,
         (4 * writes_per_thread) as i64,

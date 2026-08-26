@@ -27,7 +27,7 @@ use crate::pages::summary::{
     ExclusionSet, PrePublishSummary, SummaryFilters, SummaryGenerator, format_size,
 };
 use crate::storage::sqlite::FrankenStorage;
-use frankensqlite::Connection;
+use crate::storage::api::Conn as Connection;
 
 /// Deployment target for the export
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -977,8 +977,11 @@ impl PagesWizard {
 
     /// Generate the pre-publish summary from the database.
     fn generate_prepublish_summary(&self) -> Result<PrePublishSummary> {
-        let conn = Connection::open(self.state.db_path.to_string_lossy().as_ref())
-            .context("Failed to open database for summary generation")?;
+        let conn = Connection::open_writable(
+            &self.state.db_path,
+            crate::storage::api::Profile::Production,
+        )
+        .context("Failed to open database for summary generation")?;
 
         conn.execute_batch(
             "PRAGMA busy_timeout = 5000;

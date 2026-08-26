@@ -559,7 +559,7 @@ pub fn run_doctor_cleanup_interrupted_artifacts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use frankensqlite::compat::{ConnectionExt as _, ParamValue, RowExt as _};
+    use crate::storage::api::Value as ParamValue;
 
     fn write_message(storage: &FrankenStorage, conversation_id: i64, idx: i64, raw_line: &str) {
         // Store the verbatim line via the historical-raw-json sentinel wrapper
@@ -568,7 +568,7 @@ mod tests {
         let extra = serde_json::to_string(&wrapper).unwrap();
         storage
             .raw()
-            .execute_compat(
+            .execute(
                 "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin) \
                  VALUES(?1, ?2, 'user', NULL, ?3, ?4, ?5, NULL)",
                 &[
@@ -587,7 +587,7 @@ mod tests {
         // migrations, so a conversation row needs a real agent first.
         storage
             .raw()
-            .execute_compat(
+            .execute(
                 "INSERT INTO agents(slug, name, version, kind, created_at, updated_at) \
                  VALUES('claude', 'Claude Code', NULL, 'cli', 1000, 1000)",
                 &[] as &[ParamValue],
@@ -609,7 +609,7 @@ mod tests {
     ) -> i64 {
         storage
             .raw()
-            .execute_compat(
+            .execute(
                 "INSERT INTO conversations(agent_id, external_id, title, source_path, started_at) \
                  VALUES(?1, ?2, ?3, ?4, 1000)",
                 &[

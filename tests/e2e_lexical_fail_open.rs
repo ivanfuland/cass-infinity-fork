@@ -22,8 +22,8 @@ use coding_agent_search::indexer::semantic::{
     EmbeddingInput, SemanticIndexer, SemanticShardBuildPlan,
 };
 use coding_agent_search::search::semantic_manifest::{SemanticShardManifest, TierKind};
+use coding_agent_search::storage::api::Value as ParamValue;
 use coding_agent_search::storage::sqlite::FrankenStorage;
-use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
@@ -86,7 +86,7 @@ fn semantic_inputs_from_db(db_path: &Path) -> Vec<EmbeddingInput> {
     let empty: &[ParamValue] = &[];
     let rows: Vec<(i64, i64, String)> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT id, COALESCE(created_at, 0), content
              FROM messages
              ORDER BY id ASC",
