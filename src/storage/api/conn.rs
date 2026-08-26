@@ -910,6 +910,62 @@ mod tests {
         assert_eq!(stmt_call_count.load(Ordering::SeqCst), 1);
     }
 
+    /// Control-plane follow-up on Step 1①: that test exercises the real
+    /// `retry_statement_on_busy` production function directly, standalone --
+    /// this one proves the actual wiring from `Conn::execute` through to it
+    /// under real contention, single-threaded (no background thread: A never
+    /// releases its lock, so this exercises the retry-exhaustion path, not
+    /// eventual success -- that half is already covered by Step 1①).
+    #[test]
+    fn api_execute_retries_then_gives_up_past_the_bound_on_real_statement_busy() {
+        let dir = std::env::temp_dir()
+            .join(format!("cc-cass-w1b-b3-stmt-busy-exhaust-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("t.db");
+
+        let holder = open_writable_sqlite_for_test(&db_path);
+        holder.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY);").unwrap();
+        let holder_tx = holder.transaction_with_mode(TxMode::Immediate).unwrap();
+        holder_tx.execute("INSERT INTO t(id) VALUES (1)", &[]).unwrap();
+        // Left open for the whole test -- the contender must exhaust its
+        // retry budget without ever succeeding.
+
+        let contender = open_writable_sqlite_for_test(&db_path);
+        contender.execute_batch("PRAGMA busy_timeout = 0;").unwrap();
+
+        test_support::reset_statement_retry_count();
+        let start = std::time::Instant::now();
+        let result = contender.execute("INSERT INTO t(id) VALUES (2)", &[]);
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(result, Err(StorageError::Busy { scope: BusyScope::Statement })),
+            "expected the retry loop to exhaust and propagate the original Busy{{Statement}}, got {result:?}"
+        );
+        // The observed retry count here is the number of times the loop
+        // actually slept-and-retried, not the raw attempt-count bound
+        // (`STATEMENT_RETRY_MAX_ATTEMPTS` = 5): with the current constants
+        // (50ms base, doubling, 1000ms total cap), the total-elapsed cap
+        // binds before the 5th backoff would fit (50+100+200+400 = 750ms,
+        // and the 5th nominal backoff of ~800ms would push cumulative
+        // elapsed past 1000ms), so this converges on 4 actual retries in
+        // practice, not 5 -- asserting a range rather than a single exact
+        // number to tolerate the +/-25% jitter shifting which backoff trips
+        // the cap.
+        let retry_count = test_support::statement_retry_count();
+        assert!(
+            (3..=5).contains(&retry_count),
+            "expected 3-5 observed retries before the total-elapsed cap or attempt bound kicked in, got {retry_count}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(300) && elapsed <= Duration::from_millis(2000),
+            "expected total elapsed time in the ballpark of the ~750ms-1000ms retry budget, got {elapsed:?}"
+        );
+
+        drop(holder_tx);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Plan Step 1④ (R4-B4, "本组最承重"): a REAL end-to-end `BUSY_SNAPSHOT`
     /// chain, not an injected one -- connection A begins DEFERRED and reads
     /// a row (establishing a read snapshot), connection B writes and

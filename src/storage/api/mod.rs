@@ -8,7 +8,7 @@ mod error;
 mod value;
 
 pub use config::{OpenOptions, Profile};
-pub use conn::{Conn, Row, Tx};
+pub use conn::{Conn, Row, Tx, TxMode};
 pub use error::{BusyScope, StorageError};
 pub(crate) use error::NO_ROWS_DETAIL;
 pub use value::{FromValue, IntoValue, Value};

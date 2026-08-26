@@ -12,7 +12,8 @@ use anyhow::{Context, Result, anyhow, bail};
 // keep compiling unchanged. `SqliteValue`/`ParamValue` collapse to the single `Value`
 // enum api uses for both bound params and row values.
 use crate::storage::api::{
-    Conn as FrankenConnection, Row as FrankenRow, StorageError, Tx as FrankenTransaction, Value,
+    Conn as FrankenConnection, Row as FrankenRow, StorageError, Tx as FrankenTransaction, TxMode,
+    Value,
 };
 type SqliteValue = Value;
 type ParamValue = Value;
@@ -849,6 +850,26 @@ pub(crate) fn retryable_franken_anyhow(err: &anyhow::Error) -> bool {
             .is_some_and(retryable_franken_error)
             || retryable_storage_error_message(&cause.to_string())
     })
+}
+
+/// w1b Task B3 (D2): `with_tx`/`with_tx_no_replay` closures must return
+/// `Result<T, StorageError>` (that's what lets the replay loop pattern-match
+/// `Busy{Snapshot}` specifically), but this crate's business logic almost
+/// universally speaks `anyhow::Result` with `.context()`/`.with_context()`
+/// enrichment. Rather than rewrite that logic's error type, this recovers
+/// the original typed `StorageError` from wherever it sits in the `anyhow`
+/// chain -- same chain-walking `retryable_franken_anyhow` already does, but
+/// returning the owned error itself (not just a bool) so a caller three
+/// levels of `.context()` deep still gets a real `Busy{Snapshot}` a closure
+/// can act on, not a stringified `Other`. Falls back to `StorageError::Other`
+/// (preserving the full `{:#}` message, contexts included) only when no
+/// `StorageError` is anywhere in the chain -- e.g. a non-storage failure
+/// (serialization, I/O) that happened to occur inside the same closure.
+pub(crate) fn anyhow_error_into_storage_error(err: anyhow::Error) -> StorageError {
+    if let Some(found) = err.chain().find_map(|cause| cause.downcast_ref::<StorageError>()) {
+        return found.clone();
+    }
+    StorageError::Other { code: None, detail: format!("{err:#}") }
 }
 
 impl Drop for LazyFrankenDb {
@@ -6190,37 +6211,39 @@ fn delete_orphan_message_id_chunk(conn: &FrankenConnection, ids: &[i64]) -> Resu
 }
 
 fn delete_orphan_message_id_chunk_once(conn: &FrankenConnection, ids: &[i64]) -> Result<usize> {
-    let mut tx = conn.transaction()?;
-    let mut deleted = 0usize;
-    for entry in ORPHAN_MESSAGE_DEPENDENT_TABLES {
-        match delete_rows_by_i64_chunks(&tx, entry.delete_many_sql_prefix, ids) {
-            Ok(count) => {
-                deleted = deleted.saturating_add(count);
-            }
-            Err(err) if error_indicates_missing_table(&err) => {
-                tracing::debug!(
-                    target: "cass::fk_repair",
-                    child_table = entry.child_table,
-                    error = %err,
-                    "skipping orphan-message dependent cleanup (table unavailable)"
-                );
-            }
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!(
+    // w1b Task B3 (D2): with_tx, TxMode::Immediate (plan @775: write
+    // transactions use Immediate). Pure DB closure -- safe to replay whole
+    // on a real Busy{Snapshot}.
+    Ok(conn.with_tx(TxMode::Immediate, |tx| -> Result<usize, StorageError> {
+        let mut deleted = 0usize;
+        for entry in ORPHAN_MESSAGE_DEPENDENT_TABLES {
+            match delete_rows_by_i64_chunks(tx, entry.delete_many_sql_prefix, ids) {
+                Ok(count) => {
+                    deleted = deleted.saturating_add(count);
+                }
+                Err(err) if error_indicates_missing_table(&err) => {
+                    tracing::debug!(
+                        target: "cass::fk_repair",
+                        child_table = entry.child_table,
+                        error = %err,
+                        "skipping orphan-message dependent cleanup (table unavailable)"
+                    );
+                }
+                Err(err) => {
+                    return Err(anyhow_error_into_storage_error(err.context(format!(
                         "deleting rows from {} that depend on orphan messages",
                         entry.child_table
-                    )
-                });
+                    ))));
+                }
             }
         }
-    }
-    deleted = deleted.saturating_add(
-        delete_rows_by_i64_chunks(&tx, "DELETE FROM messages WHERE id IN", ids)
-            .context("deleting orphan rows from messages")?,
-    );
-    tx.commit()?;
-    Ok(deleted)
+        let more = delete_rows_by_i64_chunks(tx, "DELETE FROM messages WHERE id IN", ids)
+            .map_err(|err| {
+                anyhow_error_into_storage_error(err.context("deleting orphan rows from messages"))
+            })?;
+        deleted = deleted.saturating_add(more);
+        Ok(deleted)
+    })?)
 }
 
 fn collect_direct_orphan_id_page(
@@ -6281,10 +6304,11 @@ fn delete_direct_orphan_id_chunk_once(
     entry: &'static OrphanFkTable,
     ids: &[i64],
 ) -> Result<usize> {
-    let mut tx = conn.transaction()?;
-    let deleted = delete_rows_by_i64_chunks(&tx, entry.delete_many_sql_prefix, ids)?;
-    tx.commit()?;
-    Ok(deleted)
+    // w1b Task B3 (D2): with_tx, TxMode::Immediate.
+    Ok(conn.with_tx(TxMode::Immediate, |tx| -> Result<usize, StorageError> {
+        delete_rows_by_i64_chunks(tx, entry.delete_many_sql_prefix, ids)
+            .map_err(anyhow_error_into_storage_error)
+    })?)
 }
 
 /// Tables whose FK parent rows can go missing when an index transaction is
@@ -7851,34 +7875,36 @@ impl FrankenStorage {
             |row| row.get_typed(0),
         )?;
 
-        let mut tx = self.conn.transaction()?;
-        tx.execute(
-            "DELETE FROM conversation_external_lookup
-             WHERE conversation_id IN (
-                 SELECT id FROM conversations WHERE agent_id = ?1
-             )",
-            fparams![agent_id],
-        )?;
-        tx.execute(
-            "DELETE FROM conversation_external_tail_lookup
-             WHERE conversation_id IN (
-                 SELECT id FROM conversations WHERE agent_id = ?1
-             )",
-            fparams![agent_id],
-        )?;
-        tx.execute(
-            "DELETE FROM conversations WHERE agent_id = ?1",
-            fparams![agent_id],
-        )?;
-        tx.execute(
-            "DELETE FROM agents
-             WHERE id = ?1
-               AND NOT EXISTS (
-                   SELECT 1 FROM conversations WHERE agent_id = ?1
-               )",
-            fparams![agent_id],
-        )?;
-        tx.commit()?;
+        // w1b Task B3 (D2): with_tx, TxMode::Immediate.
+        self.conn.with_tx(TxMode::Immediate, |tx| -> Result<(), StorageError> {
+            tx.execute(
+                "DELETE FROM conversation_external_lookup
+                 WHERE conversation_id IN (
+                     SELECT id FROM conversations WHERE agent_id = ?1
+                 )",
+                fparams![agent_id],
+            )?;
+            tx.execute(
+                "DELETE FROM conversation_external_tail_lookup
+                 WHERE conversation_id IN (
+                     SELECT id FROM conversations WHERE agent_id = ?1
+                 )",
+                fparams![agent_id],
+            )?;
+            tx.execute(
+                "DELETE FROM conversations WHERE agent_id = ?1",
+                fparams![agent_id],
+            )?;
+            tx.execute(
+                "DELETE FROM agents
+                 WHERE id = ?1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM conversations WHERE agent_id = ?1
+                   )",
+                fparams![agent_id],
+            )?;
+            Ok(())
+        })?;
 
         Ok(AgentArchivePurgeResult {
             conversations_deleted: conversations_deleted.max(0) as usize,
@@ -7973,26 +7999,28 @@ impl FrankenStorage {
             });
         }
 
-        let mut tx = self.conn.transaction()?;
-        // Non-cascading external-lookup tables first (mirrors agent purge).
-        tx.execute(
-            &format!(
-                "DELETE FROM conversation_external_lookup WHERE conversation_id IN ({id_list})"
-            ),
-            fparams![],
-        )?;
-        tx.execute(
-            &format!(
-                "DELETE FROM conversation_external_tail_lookup WHERE conversation_id IN ({id_list})"
-            ),
-            fparams![],
-        )?;
-        // The remaining child tables (messages, snippets, tags, ...) cascade.
-        tx.execute(
-            &format!("DELETE FROM conversations WHERE id IN ({id_list})"),
-            fparams![],
-        )?;
-        tx.commit()?;
+        // w1b Task B3 (D2): with_tx, TxMode::Immediate.
+        self.conn.with_tx(TxMode::Immediate, |tx| -> Result<(), StorageError> {
+            // Non-cascading external-lookup tables first (mirrors agent purge).
+            tx.execute(
+                &format!(
+                    "DELETE FROM conversation_external_lookup WHERE conversation_id IN ({id_list})"
+                ),
+                fparams![],
+            )?;
+            tx.execute(
+                &format!(
+                    "DELETE FROM conversation_external_tail_lookup WHERE conversation_id IN ({id_list})"
+                ),
+                fparams![],
+            )?;
+            // The remaining child tables (messages, snippets, tags, ...) cascade.
+            tx.execute(
+                &format!("DELETE FROM conversations WHERE id IN ({id_list})"),
+                fparams![],
+            )?;
+            Ok(())
+        })?;
 
         Ok(ForgetConversationsResult {
             pattern: trimmed.to_string(),
@@ -8090,37 +8118,39 @@ impl FrankenStorage {
         // transaction. Messages, snippets, conversation_tags, token_usage,
         // etc. carry `ON DELETE CASCADE`; the two external-lookup tables do
         // not, so delete them explicitly first (mirrors `purge_agent_archive`).
-        let mut tx = self.conn.transaction()?;
-        for candidate in &result.pairs {
-            let drop_id = candidate.drop_conversation_id;
-            tx.execute(
-                "DELETE FROM conversation_external_lookup WHERE conversation_id = ?1",
-                fparams![drop_id],
-            )?;
-            tx.execute(
-                "DELETE FROM conversation_external_tail_lookup WHERE conversation_id = ?1",
-                fparams![drop_id],
-            )?;
-            // Explicit message delete (do not rely solely on cascade) so the
-            // operation is correct even if FK enforcement is toggled off.
-            tx.execute(
-                "DELETE FROM messages WHERE conversation_id = ?1",
-                fparams![drop_id],
-            )?;
-            tx.execute(
-                "DELETE FROM conversation_tail_state WHERE conversation_id = ?1",
-                fparams![drop_id],
-            )?;
-            tx.execute(
-                "DELETE FROM token_usage WHERE conversation_id = ?1",
-                fparams![drop_id],
-            )?;
-            // NOTE: `embedding_jobs` is a per-(db_path, model_id) job table,
-            // NOT a per-conversation table — it has no conversation_id column,
-            // so there is nothing conversation-scoped to delete there.
-            tx.execute("DELETE FROM conversations WHERE id = ?1", fparams![drop_id])?;
-        }
-        tx.commit()?;
+        // w1b Task B3 (D2): with_tx, TxMode::Immediate.
+        self.conn.with_tx(TxMode::Immediate, |tx| -> Result<(), StorageError> {
+            for candidate in &result.pairs {
+                let drop_id = candidate.drop_conversation_id;
+                tx.execute(
+                    "DELETE FROM conversation_external_lookup WHERE conversation_id = ?1",
+                    fparams![drop_id],
+                )?;
+                tx.execute(
+                    "DELETE FROM conversation_external_tail_lookup WHERE conversation_id = ?1",
+                    fparams![drop_id],
+                )?;
+                // Explicit message delete (do not rely solely on cascade) so the
+                // operation is correct even if FK enforcement is toggled off.
+                tx.execute(
+                    "DELETE FROM messages WHERE conversation_id = ?1",
+                    fparams![drop_id],
+                )?;
+                tx.execute(
+                    "DELETE FROM conversation_tail_state WHERE conversation_id = ?1",
+                    fparams![drop_id],
+                )?;
+                tx.execute(
+                    "DELETE FROM token_usage WHERE conversation_id = ?1",
+                    fparams![drop_id],
+                )?;
+                // NOTE: `embedding_jobs` is a per-(db_path, model_id) job table,
+                // NOT a per-conversation table — it has no conversation_id column,
+                // so there is nothing conversation-scoped to delete there.
+                tx.execute("DELETE FROM conversations WHERE id = ?1", fparams![drop_id])?;
+            }
+            Ok(())
+        })?;
 
         // The derived FTS shadow rows for the dropped messages are now stale.
         // Invalidate the presence cache; the caller is responsible for the
@@ -10053,71 +10083,202 @@ impl FrankenStorage {
         workspace_id: Option<i64>,
         conv: &Conversation,
     ) -> Result<InsertOutcome> {
+        // w1b Task B3 (D2): with_tx, TxMode::Immediate. Preamble kept
+        // outside with_tx exactly as before migration -- `ensure_source_for_
+        // conversation` ran via autocommit before the transaction even
+        // opened in the original code, and moving it inside the retryable
+        // closure would change its persistence semantics (it'd roll back
+        // with the rest of the transaction on failure, and re-run on
+        // replay, instead of always persisting once regardless of what
+        // happens next). The rest of the original body -- everything that
+        // ran between `let mut tx = self.conn.transaction()?;` and its three
+        // `tx.commit()?;` sites -- moves into the closure verbatim (those
+        // three per-branch commits removed; with_tx commits once after the
+        // whole closure returns `Ok`), converted to `StorageError` once at
+        // the boundary rather than threading `anyhow_error_into_storage_
+        // error` through each individual `?` -- far lower risk of an
+        // introduced mistake in a function this central. `&tx` becomes
+        // `tx` throughout: the closure's `tx` parameter is already `&Tx`.
         let normalized_conv = normalized_conversation_for_storage(conv);
         let conv = normalized_conv.as_ref();
         self.ensure_source_for_conversation(conv)?;
         let defer_lexical_updates = defer_storage_lexical_updates_enabled();
         let defer_analytics_updates = defer_analytics_updates_enabled();
         let conversation_key = conversation_merge_key(agent_id, conv);
-        let mut tx = self.conn.transaction()?;
-        let existing = franken_find_existing_conversation_with_tail_by_key(
-            &tx,
-            &conversation_key,
-            Some(conv),
-        )?;
-        if let Some(existing) = existing {
-            let outcome = self.franken_append_messages_with_tail_in_tx(
-                &tx,
-                agent_id,
-                existing.id,
-                conv,
-                existing.tail_state,
-                defer_lexical_updates,
-                defer_analytics_updates,
-            )?;
-            tx.commit()?;
-            return Ok(outcome);
-        }
+        Ok(self.conn.with_tx(TxMode::Immediate, |tx| -> Result<InsertOutcome, StorageError> {
+            (|| -> Result<InsertOutcome> {
+                let existing = franken_find_existing_conversation_with_tail_by_key(
+                    tx,
+                    &conversation_key,
+                    Some(conv),
+                )?;
+                if let Some(existing) = existing {
+                    let outcome = self.franken_append_messages_with_tail_in_tx(
+                        tx,
+                        agent_id,
+                        existing.id,
+                        conv,
+                        existing.tail_state,
+                        defer_lexical_updates,
+                        defer_analytics_updates,
+                    )?;
+                    return Ok(outcome);
+                }
 
-        let conv_id = match franken_insert_conversation_or_get_existing_after_miss(
-            &tx,
-            agent_id,
-            workspace_id,
-            conv,
-            &conversation_key,
-        )? {
-            ConversationInsertStatus::Inserted(conv_id) => conv_id,
-            ConversationInsertStatus::Existing(existing_id) => {
-                let ExistingMessageLookup {
-                    by_idx: mut existing_messages,
-                    replay: mut existing_replay_fingerprints,
-                } = franken_existing_message_lookup(&tx, existing_id, &conv.messages)?;
-                let ExistingConversationNewMessages {
-                    messages: new_messages,
-                    new_chars: _planned_new_chars,
-                    idx_collision_count,
-                    first_collision_idx,
-                } = collect_new_messages_for_existing_conversation(
-                    existing_id,
+                let conv_id = match franken_insert_conversation_or_get_existing_after_miss(
+                    tx,
+                    agent_id,
+                    workspace_id,
                     conv,
-                    &mut existing_messages,
-                    &mut existing_replay_fingerprints,
-                    "skipping replay-equivalent recovered message with shifted idx",
-                );
-                let (inserted_last_idx, inserted_last_created_at) =
-                    borrowed_messages_tail_state(&new_messages);
-                let mut inserted_indices = Vec::new();
+                    &conversation_key,
+                )? {
+                    ConversationInsertStatus::Inserted(conv_id) => conv_id,
+                    ConversationInsertStatus::Existing(existing_id) => {
+                        let ExistingMessageLookup {
+                            by_idx: mut existing_messages,
+                            replay: mut existing_replay_fingerprints,
+                        } = franken_existing_message_lookup(tx, existing_id, &conv.messages)?;
+                        let ExistingConversationNewMessages {
+                            messages: new_messages,
+                            new_chars: _planned_new_chars,
+                            idx_collision_count,
+                            first_collision_idx,
+                        } = collect_new_messages_for_existing_conversation(
+                            existing_id,
+                            conv,
+                            &mut existing_messages,
+                            &mut existing_replay_fingerprints,
+                            "skipping replay-equivalent recovered message with shifted idx",
+                        );
+                        let (inserted_last_idx, inserted_last_created_at) =
+                            borrowed_messages_tail_state(&new_messages);
+                        let mut inserted_indices = Vec::new();
+                        let mut fts_entries = Vec::new();
+                        let mut fts_pending_chars = 0usize;
+                        let mut _fts_inserted_total = 0usize;
+                        let inserted_messages =
+                            franken_append_insert_new_messages(tx, existing_id, &new_messages)?;
+                        let inserted_chars = inserted_messages
+                            .iter()
+                            .map(|(_, msg)| msg.content.len() as i64)
+                            .sum::<i64>();
+                        for (msg_id, msg) in inserted_messages {
+                            franken_insert_snippets(tx, msg_id, &msg.snippets)?;
+                            if !defer_lexical_updates {
+                                fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
+                                fts_pending_chars = fts_pending_chars.saturating_add(msg.content.len());
+                                if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
+                                    || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
+                                {
+                                    flush_pending_fts_entries(
+                                        self,
+                                        tx,
+                                        &mut fts_entries,
+                                        &mut fts_pending_chars,
+                                        &mut _fts_inserted_total,
+                                    )?;
+                                }
+                            }
+                            inserted_indices.push(msg.idx);
+                        }
+
+                        if idx_collision_count > 0 {
+                            tracing::warn!(
+                                conversation_id = existing_id,
+                                collision_count = idx_collision_count,
+                                first_idx = first_collision_idx,
+                                source_path = %conv.source_path.display(),
+                                "message idx collisions encountered while merging recovered conversation; retaining canonical message variants"
+                            );
+                        }
+
+                        if !defer_lexical_updates {
+                            flush_pending_fts_entries(
+                                self,
+                                tx,
+                                &mut fts_entries,
+                                &mut fts_pending_chars,
+                                &mut _fts_inserted_total,
+                            )?;
+                        }
+
+                        let conv_last_ts = conversation_tail_ended_at_candidate(conv);
+                        franken_update_conversation_tail_state(
+                            tx,
+                            existing_id,
+                            conv_last_ts,
+                            inserted_last_idx,
+                            inserted_last_created_at,
+                        )?;
+                        if let Some(lookup_key) = conversation_external_lookup_key_for_conv(agent_id, conv)
+                        {
+                            franken_update_external_conversation_tail_lookup_key(
+                                tx,
+                                &lookup_key,
+                                conv_last_ts,
+                                inserted_last_idx,
+                                inserted_last_created_at,
+                            )?;
+                        }
+
+                        if !defer_analytics_updates && !inserted_indices.is_empty() {
+                            franken_update_daily_stats_in_tx(
+                                self,
+                                tx,
+                                &conv.agent_slug,
+                                &conv.source_id,
+                                conversation_effective_started_at(conv),
+                                StatsDelta {
+                                    session_count_delta: 0,
+                                    message_count_delta: inserted_indices.len() as i64,
+                                    total_chars_delta: inserted_chars,
+                                },
+                            )?;
+                        }
+
+                        return Ok(InsertOutcome {
+                            conversation_id: existing_id,
+                            conversation_inserted: false,
+                            inserted_indices,
+                        });
+                    }
+                };
                 let mut fts_entries = Vec::new();
                 let mut fts_pending_chars = 0usize;
                 let mut _fts_inserted_total = 0usize;
-                let inserted_messages =
-                    franken_append_insert_new_messages(&tx, existing_id, &new_messages)?;
-                let inserted_chars = inserted_messages
-                    .iter()
-                    .map(|(_, msg)| msg.content.len() as i64)
-                    .sum::<i64>();
-                for (msg_id, msg) in inserted_messages {
-                    franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
+                let mut total_chars: i64 = 0;
+                let mut inserted_indices = Vec::new();
+                let mut pending_messages = HashMap::new();
+                let mut pending_replay_fingerprints = HashSet::new();
+                let mut idx_collision_count = 0usize;
+                let mut first_collision_idx: Option<i64> = None;
+                let mut new_messages = Vec::new();
+                for msg in &conv.messages {
+                    let incoming_fingerprint = message_merge_fingerprint(msg);
+                    if let Some(existing_fingerprint) = pending_messages.get(&msg.idx) {
+                        if existing_fingerprint != &incoming_fingerprint {
+                            idx_collision_count = idx_collision_count.saturating_add(1);
+                            first_collision_idx.get_or_insert(msg.idx);
+                        }
+                        continue;
+                    }
+                    let incoming_replay = message_replay_fingerprint(msg);
+                    if pending_replay_fingerprints.contains(&incoming_replay) {
+                        tracing::debug!(
+                            conversation_id = conv_id,
+                            idx = msg.idx,
+                            source_path = %conv.source_path.display(),
+                            "skipping replay-equivalent duplicate message within new conversation insert"
+                        );
+                        continue;
+                    }
+                    pending_messages.insert(msg.idx, incoming_fingerprint);
+                    pending_replay_fingerprints.insert(incoming_replay);
+                    new_messages.push(msg);
+                }
+                let inserted_message_ids = franken_batch_insert_new_messages(tx, conv_id, &new_messages)?;
+                for (msg_id, msg) in inserted_message_ids.into_iter().zip(new_messages) {
+                    franken_insert_snippets(tx, msg_id, &msg.snippets)?;
                     if !defer_lexical_updates {
                         fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
                         fts_pending_chars = fts_pending_chars.saturating_add(msg.content.len());
@@ -10126,172 +10287,58 @@ impl FrankenStorage {
                         {
                             flush_pending_fts_entries(
                                 self,
-                                &tx,
+                                tx,
                                 &mut fts_entries,
                                 &mut fts_pending_chars,
                                 &mut _fts_inserted_total,
                             )?;
                         }
                     }
+                    total_chars += msg.content.len() as i64;
                     inserted_indices.push(msg.idx);
                 }
-
                 if idx_collision_count > 0 {
                     tracing::warn!(
-                        conversation_id = existing_id,
+                        conversation_id = conv_id,
                         collision_count = idx_collision_count,
                         first_idx = first_collision_idx,
                         source_path = %conv.source_path.display(),
-                        "message idx collisions encountered while merging recovered conversation; retaining canonical message variants"
+                        "message idx collisions encountered while inserting a new conversation; retaining the first canonical variant per idx"
                     );
                 }
-
                 if !defer_lexical_updates {
                     flush_pending_fts_entries(
                         self,
-                        &tx,
+                        tx,
                         &mut fts_entries,
                         &mut fts_pending_chars,
                         &mut _fts_inserted_total,
                     )?;
                 }
 
-                let conv_last_ts = conversation_tail_ended_at_candidate(conv);
-                franken_update_conversation_tail_state(
-                    &tx,
-                    existing_id,
-                    conv_last_ts,
-                    inserted_last_idx,
-                    inserted_last_created_at,
-                )?;
-                if let Some(lookup_key) = conversation_external_lookup_key_for_conv(agent_id, conv)
-                {
-                    franken_update_external_conversation_tail_lookup_key(
-                        &tx,
-                        &lookup_key,
-                        conv_last_ts,
-                        inserted_last_idx,
-                        inserted_last_created_at,
-                    )?;
-                }
-
-                if !defer_analytics_updates && !inserted_indices.is_empty() {
+                if !defer_analytics_updates {
                     franken_update_daily_stats_in_tx(
                         self,
-                        &tx,
+                        tx,
                         &conv.agent_slug,
                         &conv.source_id,
                         conversation_effective_started_at(conv),
                         StatsDelta {
-                            session_count_delta: 0,
+                            session_count_delta: 1,
                             message_count_delta: inserted_indices.len() as i64,
-                            total_chars_delta: inserted_chars,
+                            total_chars_delta: total_chars,
                         },
                     )?;
                 }
 
-                tx.commit()?;
-                return Ok(InsertOutcome {
-                    conversation_id: existing_id,
-                    conversation_inserted: false,
+                Ok(InsertOutcome {
+                    conversation_id: conv_id,
+                    conversation_inserted: true,
                     inserted_indices,
-                });
-            }
-        };
-        let mut fts_entries = Vec::new();
-        let mut fts_pending_chars = 0usize;
-        let mut _fts_inserted_total = 0usize;
-        let mut total_chars: i64 = 0;
-        let mut inserted_indices = Vec::new();
-        let mut pending_messages = HashMap::new();
-        let mut pending_replay_fingerprints = HashSet::new();
-        let mut idx_collision_count = 0usize;
-        let mut first_collision_idx: Option<i64> = None;
-        let mut new_messages = Vec::new();
-        for msg in &conv.messages {
-            let incoming_fingerprint = message_merge_fingerprint(msg);
-            if let Some(existing_fingerprint) = pending_messages.get(&msg.idx) {
-                if existing_fingerprint != &incoming_fingerprint {
-                    idx_collision_count = idx_collision_count.saturating_add(1);
-                    first_collision_idx.get_or_insert(msg.idx);
-                }
-                continue;
-            }
-            let incoming_replay = message_replay_fingerprint(msg);
-            if pending_replay_fingerprints.contains(&incoming_replay) {
-                tracing::debug!(
-                    conversation_id = conv_id,
-                    idx = msg.idx,
-                    source_path = %conv.source_path.display(),
-                    "skipping replay-equivalent duplicate message within new conversation insert"
-                );
-                continue;
-            }
-            pending_messages.insert(msg.idx, incoming_fingerprint);
-            pending_replay_fingerprints.insert(incoming_replay);
-            new_messages.push(msg);
-        }
-        let inserted_message_ids = franken_batch_insert_new_messages(&tx, conv_id, &new_messages)?;
-        for (msg_id, msg) in inserted_message_ids.into_iter().zip(new_messages) {
-            franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
-            if !defer_lexical_updates {
-                fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
-                fts_pending_chars = fts_pending_chars.saturating_add(msg.content.len());
-                if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
-                    || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
-                {
-                    flush_pending_fts_entries(
-                        self,
-                        &tx,
-                        &mut fts_entries,
-                        &mut fts_pending_chars,
-                        &mut _fts_inserted_total,
-                    )?;
-                }
-            }
-            total_chars += msg.content.len() as i64;
-            inserted_indices.push(msg.idx);
-        }
-        if idx_collision_count > 0 {
-            tracing::warn!(
-                conversation_id = conv_id,
-                collision_count = idx_collision_count,
-                first_idx = first_collision_idx,
-                source_path = %conv.source_path.display(),
-                "message idx collisions encountered while inserting a new conversation; retaining the first canonical variant per idx"
-            );
-        }
-        if !defer_lexical_updates {
-            flush_pending_fts_entries(
-                self,
-                &tx,
-                &mut fts_entries,
-                &mut fts_pending_chars,
-                &mut _fts_inserted_total,
-            )?;
-        }
-
-        if !defer_analytics_updates {
-            franken_update_daily_stats_in_tx(
-                self,
-                &tx,
-                &conv.agent_slug,
-                &conv.source_id,
-                conversation_effective_started_at(conv),
-                StatsDelta {
-                    session_count_delta: 1,
-                    message_count_delta: inserted_indices.len() as i64,
-                    total_chars_delta: total_chars,
-                },
-            )?;
-        }
-
-        tx.commit()?;
-        Ok(InsertOutcome {
-            conversation_id: conv_id,
-            conversation_inserted: true,
-            inserted_indices,
-        })
+                })
+            })()
+            .map_err(anyhow_error_into_storage_error)
+        })?)
     }
 
     #[cfg(test)]
@@ -15076,12 +15123,17 @@ pub(crate) fn franken_recompute_usage_rollups_from_message_metrics(
         agg.record(entry);
     }
 
-    let mut tx = storage.conn.transaction()?;
-    for table in ["usage_hourly", "usage_daily", "usage_models_daily"] {
-        tx.execute(&format!("DELETE FROM {table}"), fparams![])?;
-    }
-    let (hourly, daily, models_daily) = franken_flush_analytics_rollups_in_tx(&tx, &agg)?;
-    tx.commit()?;
+    // w1b Task B3 (D2): with_tx, TxMode::Immediate.
+    let (hourly, daily, models_daily) =
+        storage.conn.with_tx(TxMode::Immediate, |tx| -> Result<(usize, usize, usize), StorageError> {
+            (|| -> Result<(usize, usize, usize)> {
+                for table in ["usage_hourly", "usage_daily", "usage_models_daily"] {
+                    tx.execute(&format!("DELETE FROM {table}"), fparams![])?;
+                }
+                franken_flush_analytics_rollups_in_tx(tx, &agg)
+            })()
+            .map_err(anyhow_error_into_storage_error)
+        })?;
 
     Ok(hourly + daily + models_daily)
 }
@@ -15751,13 +15803,16 @@ impl FrankenStorage {
             let entries = aggregate.expand();
             expanded_entries_flushed += entries.len();
             if !entries.is_empty() {
-                let mut batch_tx = self.conn.transaction()?;
-                franken_update_daily_stats_batched_in_tx_for_target(
-                    &batch_tx,
-                    &entries,
-                    DailyStatsBatchTarget::RebuildStage,
-                )?;
-                batch_tx.commit()?;
+                // w1b Task B3 (D2): with_tx, TxMode::Immediate.
+                self.conn
+                    .with_tx(TxMode::Immediate, |batch_tx| -> Result<usize, StorageError> {
+                        franken_update_daily_stats_batched_in_tx_for_target(
+                            batch_tx,
+                            &entries,
+                            DailyStatsBatchTarget::RebuildStage,
+                        )
+                        .map_err(anyhow_error_into_storage_error)
+                    })?;
             }
             if conversation_batch_count.is_multiple_of(25) {
                 tracing::info!(
@@ -15816,13 +15871,18 @@ impl FrankenStorage {
                     let entries = aggregate.expand();
                     expanded_entries_flushed += entries.len();
                     if !entries.is_empty() {
-                        let mut batch_tx = self.conn.transaction()?;
-                        franken_update_daily_stats_batched_in_tx_for_target(
-                            &batch_tx,
-                            &entries,
-                            DailyStatsBatchTarget::RebuildStage,
+                        // w1b Task B3 (D2): with_tx, TxMode::Immediate.
+                        self.conn.with_tx(
+                            TxMode::Immediate,
+                            |batch_tx| -> Result<usize, StorageError> {
+                                franken_update_daily_stats_batched_in_tx_for_target(
+                                    batch_tx,
+                                    &entries,
+                                    DailyStatsBatchTarget::RebuildStage,
+                                )
+                                .map_err(anyhow_error_into_storage_error)
+                            },
                         )?;
-                        batch_tx.commit()?;
                     }
                     if message_batch_count.is_multiple_of(50) {
                         tracing::info!(
@@ -15855,16 +15915,21 @@ impl FrankenStorage {
             |row| row.get_typed(0),
         )?;
 
-        let mut publish_tx = self.conn.transaction()?;
-        publish_tx.execute("DELETE FROM daily_stats", &[])?;
-        publish_tx.execute(
-            "INSERT INTO daily_stats (
-                day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated
-             )
-             SELECT day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated
-             FROM daily_stats_rebuild_stage",
-        &[])?;
-        publish_tx.commit()?;
+        // w1b Task B3 (D2): with_tx, TxMode::Immediate. Only reads
+        // daily_stats_rebuild_stage (never writes it), so replaying this on
+        // a real Busy{Snapshot} is safe regardless of how many times it runs.
+        self.conn.with_tx(TxMode::Immediate, |publish_tx| -> Result<(), StorageError> {
+            publish_tx.execute("DELETE FROM daily_stats", &[])?;
+            publish_tx.execute(
+                "INSERT INTO daily_stats (
+                    day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated
+                 )
+                 SELECT day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated
+                 FROM daily_stats_rebuild_stage",
+                &[],
+            )?;
+            Ok(())
+        })?;
         self.conn.execute("DELETE FROM daily_stats_rebuild_stage", &[])?;
 
         tracing::info!(

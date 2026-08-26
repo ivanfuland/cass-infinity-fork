@@ -16,7 +16,16 @@ pub enum BusyScope {
 /// not a duplicated string literal, so the two can never drift out of sync.
 pub(crate) const NO_ROWS_DETAIL: &str = "query returned no rows";
 
-#[derive(Debug)]
+/// w1b Task B3 (D2): `Clone` added so `Result<T, StorageError>`-returning
+/// `with_tx`/`with_tx_no_replay` closures can recover a typed `StorageError`
+/// (in particular `Busy{Snapshot}`, so replay can act on it) from deep
+/// inside an `anyhow::Error` chain that already exists throughout this
+/// crate's business logic (`.context()`/`.with_context()` wrap the original
+/// error rather than discard it -- `anyhow::Chain::downcast_ref` can still
+/// find it, but only gives `&StorageError`; an owned value is what a
+/// closure needs to return). All variants are simple owned data (`String`,
+/// `Option<i32>`, enum) -- nothing here made `Clone` non-trivial to add.
+#[derive(Debug, Clone)]
 pub enum StorageError {
     Busy { scope: BusyScope },
     Locked,
