@@ -11778,199 +11778,81 @@ impl FrankenStorage {
         });
         let mut pricing_diag = PricingDiagnostics::default();
 
-        let mut tx = self.conn.transaction()?;
+        // w1b Task B3 (D2, control-plane 2026-08-26): with_tx_no_replay,
+        // TxMode::Immediate. Same reasoning as the other no_replay sites
+        // (rebuild_analytics et al.): write transactions use Immediate, so
+        // there is no mid-transaction Busy{Snapshot} conflict for replay to
+        // catch, only the cost of redoing this batch from scratch on a rare
+        // conflict. `pricing_table`/`pricing_diag` stay captured from the
+        // enclosing scope (shared/mutable borrow respectively) rather than
+        // threaded through the closure's return value -- `pricing_diag.
+        // log_summary()` after the call is unchanged from before migration.
+        //
+        // #10 in the tx-purity-worklist: mechanical wrap (`&tx` becomes `tx`
+        // throughout since the closure's `tx` parameter is already `&Tx`,
+        // same as every other migration this task did), not a rewrite --
+        // deliberately given its own commit + targeted test evidence rather
+        // than folded into the batch of 17 other sites, because this is the
+        // single highest-traffic write path in the crate.
+        let outcomes = self.conn.with_tx_no_replay(
+            TxMode::Immediate,
+            |tx| -> Result<Vec<InsertOutcome>, StorageError> {
+                (|| -> Result<Vec<InsertOutcome>> {
 
-        // Bug #167: Ensure all referenced agents, workspaces, and sources
-        // exist inside the transaction so FK checks pass.  The caller resolves
-        // IDs via ensure_agent / ensure_workspace / ensure_sources_for_batch
-        // outside the transaction, but those autocommit writes may not be
-        // visible inside the transaction snapshot in frankensqlite.  Re-verify
-        // (and insert if missing) within the tx.
-        ensure_agents_in_tx(&tx, conversations)?;
-        ensure_workspaces_in_tx(&tx, conversations)?;
-        ensure_sources_in_tx(&tx, conversations)?;
+                // Bug #167: Ensure all referenced agents, workspaces, and sources
+                // exist inside the transaction so FK checks pass.  The caller resolves
+                // IDs via ensure_agent / ensure_workspace / ensure_sources_for_batch
+                // outside the transaction, but those autocommit writes may not be
+                // visible inside the transaction snapshot in frankensqlite.  Re-verify
+                // (and insert if missing) within the tx.
+                ensure_agents_in_tx(tx, conversations)?;
+                ensure_workspaces_in_tx(tx, conversations)?;
+                ensure_sources_in_tx(tx, conversations)?;
 
-        let mut outcomes = Vec::with_capacity(conversations.len());
-        let mut fts_entries = Vec::new();
-        let mut fts_pending_chars = 0usize;
-        let mut fts_inserted_total = 0usize;
-        let mut fts_count_total = 0usize;
-        let mut stats = StatsAggregator::new();
-        let mut token_stats = TokenStatsAggregator::new();
-        let mut token_entries: Vec<TokenUsageEntry> = Vec::new();
-        let mut metrics_entries: Vec<MessageMetricsEntry> = Vec::new();
-        let mut rollup_agg = AnalyticsRollupAggregator::new();
-        let mut conv_ids_to_summarize: Vec<i64> = Vec::new();
-        let mut pending_conversation_ids: HashMap<PendingConversationKey, i64> = HashMap::new();
-        let mut pending_message_fingerprints: HashMap<i64, HashMap<i64, MessageMergeFingerprint>> =
-            HashMap::new();
-        let mut pending_message_replay_fingerprints: HashMap<
-            i64,
-            HashSet<MessageReplayFingerprint>,
-        > = HashMap::new();
+                let mut outcomes = Vec::with_capacity(conversations.len());
+                let mut fts_entries = Vec::new();
+                let mut fts_pending_chars = 0usize;
+                let mut fts_inserted_total = 0usize;
+                let mut fts_count_total = 0usize;
+                let mut stats = StatsAggregator::new();
+                let mut token_stats = TokenStatsAggregator::new();
+                let mut token_entries: Vec<TokenUsageEntry> = Vec::new();
+                let mut metrics_entries: Vec<MessageMetricsEntry> = Vec::new();
+                let mut rollup_agg = AnalyticsRollupAggregator::new();
+                let mut conv_ids_to_summarize: Vec<i64> = Vec::new();
+                let mut pending_conversation_ids: HashMap<PendingConversationKey, i64> = HashMap::new();
+                let mut pending_message_fingerprints: HashMap<i64, HashMap<i64, MessageMergeFingerprint>> =
+                    HashMap::new();
+                let mut pending_message_replay_fingerprints: HashMap<
+                    i64,
+                    HashSet<MessageReplayFingerprint>,
+                > = HashMap::new();
 
-        for &(agent_id, workspace_id, raw_conv) in conversations {
-            let normalized_conv = normalized_conversation_for_storage(raw_conv);
-            let conv = normalized_conv.as_ref();
-            let mut total_chars: i64 = 0;
-            let mut inserted_indices = Vec::with_capacity(conv.messages.len());
-            let mut inserted_messages: Vec<(i64, &Message)> =
-                Vec::with_capacity(conv.messages.len());
-            let mut session_count_delta = 1_i64;
-            let conversation_key = conversation_merge_key(agent_id, conv);
+                for &(agent_id, workspace_id, raw_conv) in conversations {
+                    let normalized_conv = normalized_conversation_for_storage(raw_conv);
+                    let conv = normalized_conv.as_ref();
+                    let mut total_chars: i64 = 0;
+                    let mut inserted_indices = Vec::with_capacity(conv.messages.len());
+                    let mut inserted_messages: Vec<(i64, &Message)> =
+                        Vec::with_capacity(conv.messages.len());
+                    let mut session_count_delta = 1_i64;
+                    let conversation_key = conversation_merge_key(agent_id, conv);
 
-            let existing_conv_id = if let Some(existing_id) =
-                pending_conversation_ids.get(&conversation_key)
-            {
-                Some(*existing_id)
-            } else {
-                let existing_id =
-                    franken_find_existing_conversation_by_key(&tx, &conversation_key, Some(conv))?;
-                if let Some(existing_id) = existing_id {
-                    pending_conversation_ids.insert(conversation_key.clone(), existing_id);
-                }
-                existing_id
-            };
-
-            let conv_id = if let Some(existing_id) = existing_conv_id {
-                session_count_delta = 0;
-                let (
-                    ExistingConversationNewMessages {
-                        messages: new_messages,
-                        new_chars: _planned_new_chars,
-                        idx_collision_count,
-                        first_collision_idx,
-                    },
-                    existing_messages,
-                    existing_replay_fingerprints,
-                ) = franken_collect_batched_existing_new_messages(
-                    &tx,
-                    existing_id,
-                    conv,
-                    &mut pending_message_fingerprints,
-                    &mut pending_message_replay_fingerprints,
-                    "skipping replay-equivalent recovered message with shifted idx during batched merge",
-                )?;
-                let (inserted_last_idx, inserted_last_created_at) =
-                    borrowed_messages_tail_state(&new_messages);
-                let inserted_append_messages =
-                    franken_append_insert_new_messages(&tx, existing_id, &new_messages)?;
-                total_chars += inserted_append_messages
-                    .iter()
-                    .map(|(_, msg)| msg.content.len() as i64)
-                    .sum::<i64>();
-                for (msg_id, msg) in inserted_append_messages {
-                    franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
-                    if !defer_lexical_updates {
-                        fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
-                        fts_count_total += 1;
-                        fts_pending_chars = fts_pending_chars.saturating_add(msg.content.len());
-                        if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
-                            || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
-                        {
-                            flush_pending_fts_entries(
-                                self,
-                                &tx,
-                                &mut fts_entries,
-                                &mut fts_pending_chars,
-                                &mut fts_inserted_total,
-                            )?;
+                    let existing_conv_id = if let Some(existing_id) =
+                        pending_conversation_ids.get(&conversation_key)
+                    {
+                        Some(*existing_id)
+                    } else {
+                        let existing_id =
+                            franken_find_existing_conversation_by_key(tx, &conversation_key, Some(conv))?;
+                        if let Some(existing_id) = existing_id {
+                            pending_conversation_ids.insert(conversation_key.clone(), existing_id);
                         }
-                    }
-                    inserted_indices.push(msg.idx);
-                    inserted_messages.push((msg_id, msg));
-                }
+                        existing_id
+                    };
 
-                if idx_collision_count > 0 {
-                    tracing::warn!(
-                        conversation_id = existing_id,
-                        collision_count = idx_collision_count,
-                        first_idx = first_collision_idx,
-                        source_path = %conv.source_path.display(),
-                        "message idx collisions encountered during batched conversation merge; retaining canonical message variants"
-                    );
-                }
-
-                let conv_last_ts = conversation_tail_ended_at_candidate(conv);
-                franken_update_conversation_tail_state(
-                    &tx,
-                    existing_id,
-                    conv_last_ts,
-                    inserted_last_idx,
-                    inserted_last_created_at,
-                )?;
-                if let Some(lookup_key) = conversation_external_lookup_key_for_conv(agent_id, conv)
-                {
-                    franken_update_external_conversation_tail_lookup_key(
-                        &tx,
-                        &lookup_key,
-                        conv_last_ts,
-                        inserted_last_idx,
-                        inserted_last_created_at,
-                    )?;
-                }
-
-                pending_message_fingerprints.insert(existing_id, existing_messages);
-                pending_message_replay_fingerprints
-                    .insert(existing_id, existing_replay_fingerprints);
-
-                existing_id
-            } else {
-                match franken_insert_conversation_or_get_existing(
-                    &tx,
-                    agent_id,
-                    workspace_id,
-                    conv,
-                )? {
-                    ConversationInsertStatus::Inserted(new_conv_id) => {
-                        pending_conversation_ids.insert(conversation_key.clone(), new_conv_id);
-                        let pending_messages =
-                            pending_message_fingerprints.entry(new_conv_id).or_default();
-                        let pending_replay_fingerprints = pending_message_replay_fingerprints
-                            .entry(new_conv_id)
-                            .or_default();
-                        let mut new_messages = Vec::new();
-                        for msg in &conv.messages {
-                            let incoming_replay = message_replay_fingerprint(msg);
-                            if pending_messages.contains_key(&msg.idx)
-                                || pending_replay_fingerprints.contains(&incoming_replay)
-                            {
-                                continue;
-                            }
-                            pending_messages.insert(msg.idx, message_merge_fingerprint(msg));
-                            pending_replay_fingerprints.insert(incoming_replay);
-                            new_messages.push(msg);
-                        }
-                        let inserted_message_ids =
-                            franken_batch_insert_new_messages(&tx, new_conv_id, &new_messages)?;
-                        for (msg_id, msg) in inserted_message_ids.into_iter().zip(new_messages) {
-                            franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
-                            if !defer_lexical_updates {
-                                fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
-                                fts_count_total += 1;
-                                fts_pending_chars =
-                                    fts_pending_chars.saturating_add(msg.content.len());
-                                if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
-                                    || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
-                                {
-                                    flush_pending_fts_entries(
-                                        self,
-                                        &tx,
-                                        &mut fts_entries,
-                                        &mut fts_pending_chars,
-                                        &mut fts_inserted_total,
-                                    )?;
-                                }
-                            }
-                            total_chars += msg.content.len() as i64;
-                            inserted_indices.push(msg.idx);
-                            inserted_messages.push((msg_id, msg));
-                        }
-                        new_conv_id
-                    }
-                    ConversationInsertStatus::Existing(existing_id) => {
+                    let conv_id = if let Some(existing_id) = existing_conv_id {
                         session_count_delta = 0;
-                        pending_conversation_ids.insert(conversation_key.clone(), existing_id);
                         let (
                             ExistingConversationNewMessages {
                                 messages: new_messages,
@@ -11981,34 +11863,33 @@ impl FrankenStorage {
                             existing_messages,
                             existing_replay_fingerprints,
                         ) = franken_collect_batched_existing_new_messages(
-                            &tx,
+                            tx,
                             existing_id,
                             conv,
                             &mut pending_message_fingerprints,
                             &mut pending_message_replay_fingerprints,
-                            "skipping replay-equivalent recovered message with shifted idx after duplicate conversation recovery",
+                            "skipping replay-equivalent recovered message with shifted idx during batched merge",
                         )?;
                         let (inserted_last_idx, inserted_last_created_at) =
                             borrowed_messages_tail_state(&new_messages);
                         let inserted_append_messages =
-                            franken_append_insert_new_messages(&tx, existing_id, &new_messages)?;
+                            franken_append_insert_new_messages(tx, existing_id, &new_messages)?;
                         total_chars += inserted_append_messages
                             .iter()
                             .map(|(_, msg)| msg.content.len() as i64)
                             .sum::<i64>();
                         for (msg_id, msg) in inserted_append_messages {
-                            franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
+                            franken_insert_snippets(tx, msg_id, &msg.snippets)?;
                             if !defer_lexical_updates {
                                 fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
                                 fts_count_total += 1;
-                                fts_pending_chars =
-                                    fts_pending_chars.saturating_add(msg.content.len());
+                                fts_pending_chars = fts_pending_chars.saturating_add(msg.content.len());
                                 if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
                                     || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
                                 {
                                     flush_pending_fts_entries(
                                         self,
-                                        &tx,
+                                        tx,
                                         &mut fts_entries,
                                         &mut fts_pending_chars,
                                         &mut fts_inserted_total,
@@ -12025,23 +11906,22 @@ impl FrankenStorage {
                                 collision_count = idx_collision_count,
                                 first_idx = first_collision_idx,
                                 source_path = %conv.source_path.display(),
-                                "message idx collisions encountered after duplicate conversation recovery; retaining canonical message variants"
+                                "message idx collisions encountered during batched conversation merge; retaining canonical message variants"
                             );
                         }
 
                         let conv_last_ts = conversation_tail_ended_at_candidate(conv);
                         franken_update_conversation_tail_state(
-                            &tx,
+                            tx,
                             existing_id,
                             conv_last_ts,
                             inserted_last_idx,
                             inserted_last_created_at,
                         )?;
-                        if let Some(lookup_key) =
-                            conversation_external_lookup_key_for_conv(agent_id, conv)
+                        if let Some(lookup_key) = conversation_external_lookup_key_for_conv(agent_id, conv)
                         {
                             franken_update_external_conversation_tail_lookup_key(
-                                &tx,
+                                tx,
                                 &lookup_key,
                                 conv_last_ts,
                                 inserted_last_idx,
@@ -12054,291 +11934,433 @@ impl FrankenStorage {
                             .insert(existing_id, existing_replay_fingerprints);
 
                         existing_id
-                    }
-                }
-            };
-
-            if !defer_analytics_updates {
-                let delta = StatsDelta {
-                    session_count_delta,
-                    message_count_delta: inserted_messages.len() as i64,
-                    total_chars_delta: total_chars,
-                };
-
-                let effective_started_at = conversation_effective_started_at(conv);
-                let day_id = effective_started_at
-                    .map(FrankenStorage::day_id_from_millis)
-                    .unwrap_or(0);
-                stats.record_delta(
-                    &conv.agent_slug,
-                    &conv.source_id,
-                    day_id,
-                    delta.session_count_delta,
-                    delta.message_count_delta,
-                    delta.total_chars_delta,
-                );
-
-                let conv_day_id = day_id;
-                let mut session_model_family = String::from("unknown");
-                let mut has_any_tokens = false;
-
-                for &(message_id, msg) in &inserted_messages {
-                    let role_s = role_str(&msg.role);
-                    let usage = if historical_raw_json(&msg.extra_json).is_some() {
-                        crate::connectors::extract_tokens_for_agent(
-                            &conv.agent_slug,
-                            &serde_json::Value::Null,
-                            &msg.content,
-                            &role_s,
-                        )
                     } else {
-                        crate::connectors::extract_tokens_for_agent(
-                            &conv.agent_slug,
-                            &msg.extra_json,
-                            &msg.content,
-                            &role_s,
-                        )
+                        match franken_insert_conversation_or_get_existing(
+                            tx,
+                            agent_id,
+                            workspace_id,
+                            conv,
+                        )? {
+                            ConversationInsertStatus::Inserted(new_conv_id) => {
+                                pending_conversation_ids.insert(conversation_key.clone(), new_conv_id);
+                                let pending_messages =
+                                    pending_message_fingerprints.entry(new_conv_id).or_default();
+                                let pending_replay_fingerprints = pending_message_replay_fingerprints
+                                    .entry(new_conv_id)
+                                    .or_default();
+                                let mut new_messages = Vec::new();
+                                for msg in &conv.messages {
+                                    let incoming_replay = message_replay_fingerprint(msg);
+                                    if pending_messages.contains_key(&msg.idx)
+                                        || pending_replay_fingerprints.contains(&incoming_replay)
+                                    {
+                                        continue;
+                                    }
+                                    pending_messages.insert(msg.idx, message_merge_fingerprint(msg));
+                                    pending_replay_fingerprints.insert(incoming_replay);
+                                    new_messages.push(msg);
+                                }
+                                let inserted_message_ids =
+                                    franken_batch_insert_new_messages(tx, new_conv_id, &new_messages)?;
+                                for (msg_id, msg) in inserted_message_ids.into_iter().zip(new_messages) {
+                                    franken_insert_snippets(tx, msg_id, &msg.snippets)?;
+                                    if !defer_lexical_updates {
+                                        fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
+                                        fts_count_total += 1;
+                                        fts_pending_chars =
+                                            fts_pending_chars.saturating_add(msg.content.len());
+                                        if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
+                                            || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
+                                        {
+                                            flush_pending_fts_entries(
+                                                self,
+                                                tx,
+                                                &mut fts_entries,
+                                                &mut fts_pending_chars,
+                                                &mut fts_inserted_total,
+                                            )?;
+                                        }
+                                    }
+                                    total_chars += msg.content.len() as i64;
+                                    inserted_indices.push(msg.idx);
+                                    inserted_messages.push((msg_id, msg));
+                                }
+                                new_conv_id
+                            }
+                            ConversationInsertStatus::Existing(existing_id) => {
+                                session_count_delta = 0;
+                                pending_conversation_ids.insert(conversation_key.clone(), existing_id);
+                                let (
+                                    ExistingConversationNewMessages {
+                                        messages: new_messages,
+                                        new_chars: _planned_new_chars,
+                                        idx_collision_count,
+                                        first_collision_idx,
+                                    },
+                                    existing_messages,
+                                    existing_replay_fingerprints,
+                                ) = franken_collect_batched_existing_new_messages(
+                                    tx,
+                                    existing_id,
+                                    conv,
+                                    &mut pending_message_fingerprints,
+                                    &mut pending_message_replay_fingerprints,
+                                    "skipping replay-equivalent recovered message with shifted idx after duplicate conversation recovery",
+                                )?;
+                                let (inserted_last_idx, inserted_last_created_at) =
+                                    borrowed_messages_tail_state(&new_messages);
+                                let inserted_append_messages =
+                                    franken_append_insert_new_messages(tx, existing_id, &new_messages)?;
+                                total_chars += inserted_append_messages
+                                    .iter()
+                                    .map(|(_, msg)| msg.content.len() as i64)
+                                    .sum::<i64>();
+                                for (msg_id, msg) in inserted_append_messages {
+                                    franken_insert_snippets(tx, msg_id, &msg.snippets)?;
+                                    if !defer_lexical_updates {
+                                        fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
+                                        fts_count_total += 1;
+                                        fts_pending_chars =
+                                            fts_pending_chars.saturating_add(msg.content.len());
+                                        if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
+                                            || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
+                                        {
+                                            flush_pending_fts_entries(
+                                                self,
+                                                tx,
+                                                &mut fts_entries,
+                                                &mut fts_pending_chars,
+                                                &mut fts_inserted_total,
+                                            )?;
+                                        }
+                                    }
+                                    inserted_indices.push(msg.idx);
+                                    inserted_messages.push((msg_id, msg));
+                                }
+
+                                if idx_collision_count > 0 {
+                                    tracing::warn!(
+                                        conversation_id = existing_id,
+                                        collision_count = idx_collision_count,
+                                        first_idx = first_collision_idx,
+                                        source_path = %conv.source_path.display(),
+                                        "message idx collisions encountered after duplicate conversation recovery; retaining canonical message variants"
+                                    );
+                                }
+
+                                let conv_last_ts = conversation_tail_ended_at_candidate(conv);
+                                franken_update_conversation_tail_state(
+                                    tx,
+                                    existing_id,
+                                    conv_last_ts,
+                                    inserted_last_idx,
+                                    inserted_last_created_at,
+                                )?;
+                                if let Some(lookup_key) =
+                                    conversation_external_lookup_key_for_conv(agent_id, conv)
+                                {
+                                    franken_update_external_conversation_tail_lookup_key(
+                                        tx,
+                                        &lookup_key,
+                                        conv_last_ts,
+                                        inserted_last_idx,
+                                        inserted_last_created_at,
+                                    )?;
+                                }
+
+                                pending_message_fingerprints.insert(existing_id, existing_messages);
+                                pending_message_replay_fingerprints
+                                    .insert(existing_id, existing_replay_fingerprints);
+
+                                existing_id
+                            }
+                        }
                     };
 
-                    let msg_ts = msg
-                        .created_at
-                        .or(conversation_effective_started_at(conv))
-                        .unwrap_or(0);
-                    let msg_day_id = if msg_ts > 0 {
-                        FrankenStorage::day_id_from_millis(msg_ts)
-                    } else {
-                        conv_day_id
-                    };
+                    if !defer_analytics_updates {
+                        let delta = StatsDelta {
+                            session_count_delta,
+                            message_count_delta: inserted_messages.len() as i64,
+                            total_chars_delta: total_chars,
+                        };
 
-                    let model_info = usage
-                        .model_name
-                        .as_deref()
-                        .map(crate::connectors::normalize_model);
+                        let effective_started_at = conversation_effective_started_at(conv);
+                        let day_id = effective_started_at
+                            .map(FrankenStorage::day_id_from_millis)
+                            .unwrap_or(0);
+                        stats.record_delta(
+                            &conv.agent_slug,
+                            &conv.source_id,
+                            day_id,
+                            delta.session_count_delta,
+                            delta.message_count_delta,
+                            delta.total_chars_delta,
+                        );
 
-                    let model_family = model_info
-                        .as_ref()
-                        .map(|i| i.family.clone())
-                        .unwrap_or_else(|| "unknown".into());
-                    let model_tier = model_info
-                        .as_ref()
-                        .map(|i| i.tier.clone())
-                        .unwrap_or_else(|| "unknown".into());
-                    let provider = usage
-                        .provider
-                        .clone()
-                        .or_else(|| model_info.as_ref().map(|i| i.provider.clone()))
-                        .unwrap_or_else(|| "unknown".into());
+                        let conv_day_id = day_id;
+                        let mut session_model_family = String::from("unknown");
+                        let mut has_any_tokens = false;
 
-                    if model_family != "unknown" {
-                        session_model_family = model_family.clone();
+                        for &(message_id, msg) in &inserted_messages {
+                            let role_s = role_str(&msg.role);
+                            let usage = if historical_raw_json(&msg.extra_json).is_some() {
+                                crate::connectors::extract_tokens_for_agent(
+                                    &conv.agent_slug,
+                                    &serde_json::Value::Null,
+                                    &msg.content,
+                                    &role_s,
+                                )
+                            } else {
+                                crate::connectors::extract_tokens_for_agent(
+                                    &conv.agent_slug,
+                                    &msg.extra_json,
+                                    &msg.content,
+                                    &role_s,
+                                )
+                            };
+
+                            let msg_ts = msg
+                                .created_at
+                                .or(conversation_effective_started_at(conv))
+                                .unwrap_or(0);
+                            let msg_day_id = if msg_ts > 0 {
+                                FrankenStorage::day_id_from_millis(msg_ts)
+                            } else {
+                                conv_day_id
+                            };
+
+                            let model_info = usage
+                                .model_name
+                                .as_deref()
+                                .map(crate::connectors::normalize_model);
+
+                            let model_family = model_info
+                                .as_ref()
+                                .map(|i| i.family.clone())
+                                .unwrap_or_else(|| "unknown".into());
+                            let model_tier = model_info
+                                .as_ref()
+                                .map(|i| i.tier.clone())
+                                .unwrap_or_else(|| "unknown".into());
+                            let provider = usage
+                                .provider
+                                .clone()
+                                .or_else(|| model_info.as_ref().map(|i| i.provider.clone()))
+                                .unwrap_or_else(|| "unknown".into());
+
+                            if model_family != "unknown" {
+                                session_model_family = model_family.clone();
+                            }
+
+                            let estimated_cost = pricing_table.compute_cost(
+                                usage.model_name.as_deref(),
+                                msg_day_id,
+                                usage.input_tokens,
+                                usage.output_tokens,
+                                usage.cache_read_tokens,
+                                usage.cache_creation_tokens,
+                            );
+                            if estimated_cost.is_some() {
+                                pricing_diag.record_priced();
+                            } else if usage.has_token_data() {
+                                pricing_diag.record_unpriced(usage.model_name.as_deref());
+                            }
+
+                            token_stats.record(
+                                &conv.agent_slug,
+                                &conv.source_id,
+                                msg_day_id,
+                                &model_family,
+                                &role_s,
+                                &usage,
+                                msg.content.len() as i64,
+                                estimated_cost.unwrap_or(0.0),
+                            );
+
+                            if usage.has_token_data() {
+                                has_any_tokens = true;
+                            }
+
+                            let content_chars = msg.content.len() as i64;
+                            let content_tokens_est = content_chars / 4;
+                            let msg_hour_id = FrankenStorage::hour_id_from_millis(msg_ts);
+                            let has_plan = has_plan_for_role(&role_s, &msg.content);
+
+                            token_entries.push(TokenUsageEntry {
+                                message_id,
+                                conversation_id: conv_id,
+                                agent_id,
+                                workspace_id,
+                                source_id: conv.source_id.clone(),
+                                timestamp_ms: msg_ts,
+                                day_id: msg_day_id,
+                                model_name: usage.model_name.clone(),
+                                model_family: Some(model_family.clone()),
+                                model_tier: Some(model_tier.clone()),
+                                service_tier: usage.service_tier.clone(),
+                                provider: Some(provider.clone()),
+                                input_tokens: usage.input_tokens,
+                                output_tokens: usage.output_tokens,
+                                cache_read_tokens: usage.cache_read_tokens,
+                                cache_creation_tokens: usage.cache_creation_tokens,
+                                thinking_tokens: usage.thinking_tokens,
+                                total_tokens: usage.total_tokens(),
+                                estimated_cost_usd: estimated_cost,
+                                role: role_s.to_string(),
+                                content_chars,
+                                has_tool_calls: usage.has_tool_calls,
+                                tool_call_count: usage.tool_call_count,
+                                data_source: usage.data_source.as_str().to_string(),
+                            });
+
+                            let mm = MessageMetricsEntry {
+                                message_id,
+                                created_at_ms: msg_ts,
+                                hour_id: msg_hour_id,
+                                day_id: msg_day_id,
+                                agent_slug: conv.agent_slug.clone(),
+                                workspace_id: workspace_id.unwrap_or(0),
+                                source_id: conv.source_id.clone(),
+                                role: role_s.to_string(),
+                                content_chars,
+                                content_tokens_est,
+                                model_name: usage.model_name.clone(),
+                                model_family: model_family.clone(),
+                                model_tier: model_tier.clone(),
+                                provider,
+                                api_input_tokens: usage.input_tokens,
+                                api_output_tokens: usage.output_tokens,
+                                api_cache_read_tokens: usage.cache_read_tokens,
+                                api_cache_creation_tokens: usage.cache_creation_tokens,
+                                api_thinking_tokens: usage.thinking_tokens,
+                                api_service_tier: usage.service_tier.clone(),
+                                api_data_source: usage.data_source.as_str().to_string(),
+                                tool_call_count: usage.tool_call_count as i64,
+                                has_tool_calls: usage.has_tool_calls,
+                                has_plan,
+                            };
+                            rollup_agg.record(&mm);
+                            metrics_entries.push(mm);
+                        }
+
+                        if session_count_delta > 0 {
+                            token_stats.record_session(
+                                &conv.agent_slug,
+                                &conv.source_id,
+                                conv_day_id,
+                                &session_model_family,
+                            );
+                        }
+
+                        if has_any_tokens {
+                            conv_ids_to_summarize.push(conv_id);
+                        }
                     }
 
-                    let estimated_cost = pricing_table.compute_cost(
-                        usage.model_name.as_deref(),
-                        msg_day_id,
-                        usage.input_tokens,
-                        usage.output_tokens,
-                        usage.cache_read_tokens,
-                        usage.cache_creation_tokens,
-                    );
-                    if estimated_cost.is_some() {
-                        pricing_diag.record_priced();
-                    } else if usage.has_token_data() {
-                        pricing_diag.record_unpriced(usage.model_name.as_deref());
-                    }
-
-                    token_stats.record(
-                        &conv.agent_slug,
-                        &conv.source_id,
-                        msg_day_id,
-                        &model_family,
-                        &role_s,
-                        &usage,
-                        msg.content.len() as i64,
-                        estimated_cost.unwrap_or(0.0),
-                    );
-
-                    if usage.has_token_data() {
-                        has_any_tokens = true;
-                    }
-
-                    let content_chars = msg.content.len() as i64;
-                    let content_tokens_est = content_chars / 4;
-                    let msg_hour_id = FrankenStorage::hour_id_from_millis(msg_ts);
-                    let has_plan = has_plan_for_role(&role_s, &msg.content);
-
-                    token_entries.push(TokenUsageEntry {
-                        message_id,
+                    outcomes.push(InsertOutcome {
                         conversation_id: conv_id,
-                        agent_id,
-                        workspace_id,
-                        source_id: conv.source_id.clone(),
-                        timestamp_ms: msg_ts,
-                        day_id: msg_day_id,
-                        model_name: usage.model_name.clone(),
-                        model_family: Some(model_family.clone()),
-                        model_tier: Some(model_tier.clone()),
-                        service_tier: usage.service_tier.clone(),
-                        provider: Some(provider.clone()),
-                        input_tokens: usage.input_tokens,
-                        output_tokens: usage.output_tokens,
-                        cache_read_tokens: usage.cache_read_tokens,
-                        cache_creation_tokens: usage.cache_creation_tokens,
-                        thinking_tokens: usage.thinking_tokens,
-                        total_tokens: usage.total_tokens(),
-                        estimated_cost_usd: estimated_cost,
-                        role: role_s.to_string(),
-                        content_chars,
-                        has_tool_calls: usage.has_tool_calls,
-                        tool_call_count: usage.tool_call_count,
-                        data_source: usage.data_source.as_str().to_string(),
+                        conversation_inserted: session_count_delta > 0,
+                        inserted_indices,
                     });
-
-                    let mm = MessageMetricsEntry {
-                        message_id,
-                        created_at_ms: msg_ts,
-                        hour_id: msg_hour_id,
-                        day_id: msg_day_id,
-                        agent_slug: conv.agent_slug.clone(),
-                        workspace_id: workspace_id.unwrap_or(0),
-                        source_id: conv.source_id.clone(),
-                        role: role_s.to_string(),
-                        content_chars,
-                        content_tokens_est,
-                        model_name: usage.model_name.clone(),
-                        model_family: model_family.clone(),
-                        model_tier: model_tier.clone(),
-                        provider,
-                        api_input_tokens: usage.input_tokens,
-                        api_output_tokens: usage.output_tokens,
-                        api_cache_read_tokens: usage.cache_read_tokens,
-                        api_cache_creation_tokens: usage.cache_creation_tokens,
-                        api_thinking_tokens: usage.thinking_tokens,
-                        api_service_tier: usage.service_tier.clone(),
-                        api_data_source: usage.data_source.as_str().to_string(),
-                        tool_call_count: usage.tool_call_count as i64,
-                        has_tool_calls: usage.has_tool_calls,
-                        has_plan,
-                    };
-                    rollup_agg.record(&mm);
-                    metrics_entries.push(mm);
                 }
 
-                if session_count_delta > 0 {
-                    token_stats.record_session(
-                        &conv.agent_slug,
-                        &conv.source_id,
-                        conv_day_id,
-                        &session_model_family,
+                // Batch insert all FTS entries at once
+                if !defer_lexical_updates {
+                    flush_pending_fts_entries(
+                        self,
+                        tx,
+                        &mut fts_entries,
+                        &mut fts_pending_chars,
+                        &mut fts_inserted_total,
+                    )?;
+                }
+                if !defer_lexical_updates && fts_count_total > 0 {
+                    tracing::debug!(
+                        target: "cass::perf::fts5",
+                        total = fts_count_total,
+                        inserted = fts_inserted_total,
+                        conversations = conversations.len(),
+                        "franken_batch_fts_insert_complete"
                     );
                 }
 
-                if has_any_tokens {
-                    conv_ids_to_summarize.push(conv_id);
+                // Batched daily_stats update
+                if !defer_analytics_updates && !stats.is_empty() {
+                    let entries = stats.expand();
+                    let affected = franken_update_daily_stats_batched_in_tx(tx, &entries)?;
+                    tracing::debug!(
+                        target: "cass::perf::daily_stats",
+                        raw = stats.raw_entry_count(),
+                        expanded = entries.len(),
+                        affected = affected,
+                        "franken_batched_stats_update_complete"
+                    );
                 }
-            }
 
-            outcomes.push(InsertOutcome {
-                conversation_id: conv_id,
-                conversation_inserted: session_count_delta > 0,
-                inserted_indices,
-            });
-        }
+                // Batch insert token_usage rows
+                if !defer_analytics_updates && !token_entries.is_empty() {
+                    let token_count = token_entries.len();
+                    let inserted = franken_insert_token_usage_batched_in_tx(tx, &token_entries)?;
+                    tracing::debug!(
+                        target: "cass::perf::token_usage",
+                        total = token_count,
+                        inserted = inserted,
+                        "franken_batch_token_usage_insert_complete"
+                    );
+                }
 
-        // Batch insert all FTS entries at once
-        if !defer_lexical_updates {
-            flush_pending_fts_entries(
-                self,
-                &tx,
-                &mut fts_entries,
-                &mut fts_pending_chars,
-                &mut fts_inserted_total,
-            )?;
-        }
-        if !defer_lexical_updates && fts_count_total > 0 {
-            tracing::debug!(
-                target: "cass::perf::fts5",
-                total = fts_count_total,
-                inserted = fts_inserted_total,
-                conversations = conversations.len(),
-                "franken_batch_fts_insert_complete"
-            );
-        }
+                // Batched token_daily_stats update
+                if !defer_analytics_updates && !token_stats.is_empty() {
+                    let entries = token_stats.expand();
+                    let affected = franken_update_token_daily_stats_batched_in_tx(tx, &entries)?;
+                    tracing::debug!(
+                        target: "cass::perf::token_daily_stats",
+                        raw = token_stats.raw_entry_count(),
+                        expanded = entries.len(),
+                        affected = affected,
+                        "franken_batched_token_stats_update_complete"
+                    );
+                }
 
-        // Batched daily_stats update
-        if !defer_analytics_updates && !stats.is_empty() {
-            let entries = stats.expand();
-            let affected = franken_update_daily_stats_batched_in_tx(&tx, &entries)?;
-            tracing::debug!(
-                target: "cass::perf::daily_stats",
-                raw = stats.raw_entry_count(),
-                expanded = entries.len(),
-                affected = affected,
-                "franken_batched_stats_update_complete"
-            );
-        }
+                // Batch insert message_metrics rows
+                if !defer_analytics_updates && !metrics_entries.is_empty() {
+                    let mm_count = metrics_entries.len();
+                    let inserted = franken_insert_message_metrics_batched_in_tx(tx, &metrics_entries)?;
+                    tracing::debug!(
+                        target: "cass::perf::message_metrics",
+                        total = mm_count,
+                        inserted = inserted,
+                        "franken_batch_message_metrics_insert_complete"
+                    );
+                }
 
-        // Batch insert token_usage rows
-        if !defer_analytics_updates && !token_entries.is_empty() {
-            let token_count = token_entries.len();
-            let inserted = franken_insert_token_usage_batched_in_tx(&tx, &token_entries)?;
-            tracing::debug!(
-                target: "cass::perf::token_usage",
-                total = token_count,
-                inserted = inserted,
-                "franken_batch_token_usage_insert_complete"
-            );
-        }
+                // Flush usage_hourly + usage_daily rollups
+                if !defer_analytics_updates && !rollup_agg.is_empty() {
+                    let (hourly, daily, models_daily) =
+                        franken_flush_analytics_rollups_in_tx(tx, &rollup_agg)?;
+                    tracing::debug!(
+                        target: "cass::perf::usage_rollups",
+                        hourly_buckets = rollup_agg.hourly_entry_count(),
+                        daily_buckets = rollup_agg.daily_entry_count(),
+                        models_daily_buckets = rollup_agg.models_daily_entry_count(),
+                        hourly_affected = hourly,
+                        daily_affected = daily,
+                        models_daily_affected = models_daily,
+                        "franken_batched_usage_rollups_complete"
+                    );
+                }
 
-        // Batched token_daily_stats update
-        if !defer_analytics_updates && !token_stats.is_empty() {
-            let entries = token_stats.expand();
-            let affected = franken_update_token_daily_stats_batched_in_tx(&tx, &entries)?;
-            tracing::debug!(
-                target: "cass::perf::token_daily_stats",
-                raw = token_stats.raw_entry_count(),
-                expanded = entries.len(),
-                affected = affected,
-                "franken_batched_token_stats_update_complete"
-            );
-        }
-
-        // Batch insert message_metrics rows
-        if !defer_analytics_updates && !metrics_entries.is_empty() {
-            let mm_count = metrics_entries.len();
-            let inserted = franken_insert_message_metrics_batched_in_tx(&tx, &metrics_entries)?;
-            tracing::debug!(
-                target: "cass::perf::message_metrics",
-                total = mm_count,
-                inserted = inserted,
-                "franken_batch_message_metrics_insert_complete"
-            );
-        }
-
-        // Flush usage_hourly + usage_daily rollups
-        if !defer_analytics_updates && !rollup_agg.is_empty() {
-            let (hourly, daily, models_daily) =
-                franken_flush_analytics_rollups_in_tx(&tx, &rollup_agg)?;
-            tracing::debug!(
-                target: "cass::perf::usage_rollups",
-                hourly_buckets = rollup_agg.hourly_entry_count(),
-                daily_buckets = rollup_agg.daily_entry_count(),
-                models_daily_buckets = rollup_agg.models_daily_entry_count(),
-                hourly_affected = hourly,
-                daily_affected = daily,
-                models_daily_affected = models_daily,
-                "franken_batched_usage_rollups_complete"
-            );
-        }
-
-        // Update conversation-level token summaries
-        if !defer_analytics_updates {
-            for conv_id in &conv_ids_to_summarize {
-                franken_update_conversation_token_summaries_in_tx(&tx, *conv_id)?;
-            }
-        }
-
-        tx.commit()?;
+                // Update conversation-level token summaries
+                if !defer_analytics_updates {
+                    for conv_id in &conv_ids_to_summarize {
+                        franken_update_conversation_token_summaries_in_tx(tx, *conv_id)?;
+                    }
+                }
+                    Ok(outcomes)
+                })()
+                .map_err(anyhow_error_into_storage_error)
+            },
+        )?;
 
         pricing_diag.log_summary();
 
