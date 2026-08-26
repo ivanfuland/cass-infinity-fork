@@ -29200,6 +29200,7 @@ struct DoctorRootCauseIncident {
 struct DoctorDatabaseIntegrityProbe {
     quick_check_status: String,
     integrity_check_diagnostics: Vec<String>,
+    foreign_key_check_diagnostics: Vec<String>,
 }
 
 const DOCTOR_DATABASE_INTEGRITY_DIAGNOSTIC_LIMIT: usize = 20;
@@ -29463,9 +29464,41 @@ fn doctor_database_integrity_probe(
         Vec::new()
     };
 
+    // w1b Task B2c (spec v6.1 §10, R3-B2): `quick_check`/`integrity_check`
+    // are page-level b-tree probes and never inspect referential integrity,
+    // so a dangling FK reference passes both as "ok". `PRAGMA
+    // foreign_key_check` is the pragma that actually scans for existing FK
+    // violations. Gated on `quick_check_ok` like `integrity_check` above --
+    // no point scanning FK state on a database whose b-tree pages are
+    // already known-corrupt.
+    let foreign_key_check_diagnostics = if quick_check_ok {
+        let rows: Vec<(String, Option<i64>, String, i64)> = conn
+            .query_all_map("PRAGMA foreign_key_check;", &[], |row: &FrankenRow| {
+                Ok((
+                    row.get_typed(0)?,
+                    row.get_typed(1)?,
+                    row.get_typed(2)?,
+                    row.get_typed(3)?,
+                ))
+            })
+            .map_err(|err| format!("running PRAGMA foreign_key_check: {err}"))?;
+        rows.into_iter()
+            .take(DOCTOR_DATABASE_INTEGRITY_DIAGNOSTIC_LIMIT)
+            .map(|(table, rowid, parent, fkid)| {
+                let rowid = rowid
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "NULL".to_string());
+                format!("table={table} rowid={rowid} references={parent} fkid={fkid}")
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     Ok(DoctorDatabaseIntegrityProbe {
         quick_check_status,
         integrity_check_diagnostics,
+        foreign_key_check_diagnostics,
     })
 }
 
@@ -29473,13 +29506,16 @@ impl DoctorDatabaseIntegrityProbe {
     fn is_ok(&self) -> bool {
         self.quick_check_status.trim().eq_ignore_ascii_case("ok")
             && self.integrity_check_diagnostics.is_empty()
+            && self.foreign_key_check_diagnostics.is_empty()
     }
 
     fn failed_pragma_name(&self) -> &'static str {
-        if self.quick_check_status.trim().eq_ignore_ascii_case("ok") {
+        if !self.quick_check_status.trim().eq_ignore_ascii_case("ok") {
+            "quick_check"
+        } else if !self.integrity_check_diagnostics.is_empty() {
             "integrity_check"
         } else {
-            "quick_check"
+            "foreign_key_check"
         }
     }
 
@@ -29487,14 +29523,13 @@ impl DoctorDatabaseIntegrityProbe {
         if !self.quick_check_status.trim().eq_ignore_ascii_case("ok") {
             return self.quick_check_status.trim().to_string();
         }
-        let mut summary = self
-            .integrity_check_diagnostics
-            .iter()
-            .take(3)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join("; ");
-        let omitted = self.integrity_check_diagnostics.len().saturating_sub(3);
+        let diagnostics: &[String] = if !self.integrity_check_diagnostics.is_empty() {
+            &self.integrity_check_diagnostics
+        } else {
+            &self.foreign_key_check_diagnostics
+        };
+        let mut summary = diagnostics.iter().take(3).cloned().collect::<Vec<_>>().join("; ");
+        let omitted = diagnostics.len().saturating_sub(3);
         if omitted > 0 {
             if !summary.is_empty() {
                 summary.push_str("; ");
@@ -29506,6 +29541,91 @@ impl DoctorDatabaseIntegrityProbe {
         } else {
             summary
         }
+    }
+}
+
+#[cfg(test)]
+mod doctor_foreign_key_check_tests {
+    use super::*;
+    use crate::storage::sqlite::FrankenStorage;
+    use tempfile::TempDir;
+
+    // w1b Task B2c (spec v6.1 §10, R3-B2): `quick_check`/`integrity_check`
+    // are page-level b-tree probes -- they never inspect referential
+    // integrity, so a dangling FK reference sails through both as "ok".
+    // `PRAGMA foreign_key_check` is the only pragma that actually scans for
+    // existing FK violations (independent of whether the `foreign_keys`
+    // pragma was on when the orphan was written), which is why it needs its
+    // own doctor-probe wiring rather than piggybacking on integrity_check.
+    #[test]
+    fn doctor_database_integrity_probe_flags_orphan_foreign_key_rows() {
+        let dir = TempDir::new().expect("temp dir");
+        let db_path = dir.path().join("orphan_fk_doctor.db");
+        let storage = FrankenStorage::open(&db_path).expect("open db");
+
+        // Same fixture-construction pattern as
+        // `cleanup_orphan_fk_rows_removes_orphans_and_is_noop_on_clean_db`
+        // (storage/sqlite.rs): with FK enforcement genuinely on for every
+        // ordinary connection, an orphan child row is structurally
+        // unreachable through any normal insert, so the fixture must plant
+        // it via the same narrow, Ivan-adjudicated bypass.
+        storage
+            .raw()
+            .execute_batch_bypassing_foreign_keys_guard("PRAGMA foreign_keys = OFF")
+            .expect("disable FK for fixture setup");
+        storage
+            .raw()
+            .execute(
+                "INSERT INTO agents(id, slug, name, kind, created_at, updated_at) \
+                 VALUES(1, 'test-agent', 'Test Agent', 'cli', 0, 0)",
+                &[],
+            )
+            .expect("insert agent");
+        storage
+            .raw()
+            .execute(
+                "INSERT INTO messages(id, conversation_id, idx, role, content) \
+                 VALUES(1, 99999, 0, 'user', 'orphan message')",
+                &[],
+            )
+            .expect("insert orphan message referencing a nonexistent conversation");
+        storage
+            .raw()
+            .execute_batch_bypassing_foreign_keys_guard("PRAGMA foreign_keys = ON")
+            .expect("restore FK enforcement");
+        drop(storage);
+
+        // Plan Step 1 calls for "关 FK 插入后重开" -- reopen fresh so the
+        // probe runs against a connection that never itself toggled FK off,
+        // matching how `cass doctor` would actually encounter this database.
+        let reopened = FrankenStorage::open(&db_path).expect("reopen db");
+        let probe = doctor_database_integrity_probe(reopened.raw())
+            .expect("probe should run without error even when it finds violations");
+
+        assert!(
+            !probe.is_ok(),
+            "expected the orphan FK row to fail the doctor integrity probe, got {probe:?}"
+        );
+        assert_eq!(probe.failed_pragma_name(), "foreign_key_check");
+        assert!(
+            probe.diagnostic_summary().contains("messages"),
+            "expected the foreign_key_check diagnostic to name the offending table, got: {}",
+            probe.diagnostic_summary()
+        );
+    }
+
+    #[test]
+    fn doctor_database_integrity_probe_is_healthy_on_clean_db() {
+        let dir = TempDir::new().expect("temp dir");
+        let db_path = dir.path().join("clean_doctor.db");
+        let storage = FrankenStorage::open(&db_path).expect("open db");
+
+        let probe = doctor_database_integrity_probe(storage.raw()).expect("probe should run");
+
+        assert!(
+            probe.is_ok(),
+            "expected a freshly-opened, empty database to pass the doctor integrity probe, got {probe:?}"
+        );
     }
 }
 
@@ -29526,7 +29646,10 @@ fn doctor_anomaly_for_check(name: &str, status: &str, message: &str) -> DoctorAn
             }
         }
         "database" => {
-            if message.contains("quick_check") || message.contains("integrity_check") {
+            if message.contains("quick_check")
+                || message.contains("integrity_check")
+                || message.contains("foreign_key_check")
+            {
                 DoctorAnomaly::ArchiveDbCorrupt
             } else {
                 DoctorAnomaly::ArchiveDbUnreadable
