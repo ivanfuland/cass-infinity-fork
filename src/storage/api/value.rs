@@ -144,9 +144,31 @@ impl IntoValue for u32 {
     }
 }
 
+// R1-B5 (PR-front code review, control-plane adjudicated 2026-08-25): `as i64`
+// silently wraps an out-of-range u64/usize (e.g. usize::MAX on a 64-bit
+// platform) into a negative Integer, corrupting whatever paging/counter/id
+// value was being persisted. Mirrors fsqlite 0.1.16's own
+// `ParamValue::from(u64)`/`From<usize>` byte-for-byte (registry+https://
+// github.com/rust-lang/crates.io-index, fsqlite-0.1.16/src/compat/params.rs:
+// "Keep parity with u64 handling to avoid lossy saturation"): try the exact
+// i64 conversion first, and only on overflow fall back to a decimal TEXT
+// value instead of clamping/wrapping -- pulled in verbatim (dependency
+// contract's own precedent), not reinvented.
+impl IntoValue for u64 {
+    fn into_value(self) -> Value {
+        match i64::try_from(self) {
+            Ok(i) => Value::Integer(i),
+            Err(_) => Value::Text(self.to_string()),
+        }
+    }
+}
+
 impl IntoValue for usize {
     fn into_value(self) -> Value {
-        Value::Integer(self as i64)
+        match i64::try_from(self) {
+            Ok(i) => Value::Integer(i),
+            Err(_) => Value::Text(self.to_string()),
+        }
     }
 }
 
@@ -284,6 +306,20 @@ mod tests {
         assert_eq!(vec![1_u8, 2].into_value(), Value::Blob(vec![1, 2]));
         assert_eq!(true.into_value(), Value::Integer(1));
         assert_eq!(false.into_value(), Value::Integer(0));
+    }
+
+    #[test]
+    fn into_value_u64_usize_overflow_falls_back_to_text() {
+        // R1-B5: in-range values still become Integer (fast path unchanged)...
+        assert_eq!(100_u64.into_value(), Value::Integer(100));
+        assert_eq!(200_usize.into_value(), Value::Integer(200));
+        // ...but a value that doesn't fit in i64 must NOT silently wrap to a
+        // negative Integer (the `as i64` bug) -- it becomes a decimal TEXT,
+        // exactly mirroring fsqlite 0.1.16's ParamValue::from(u64/usize).
+        assert_eq!(u64::MAX.into_value(), Value::Text(u64::MAX.to_string()));
+        assert_eq!(usize::MAX.into_value(), Value::Text(usize::MAX.to_string()));
+        assert_ne!(u64::MAX.into_value(), Value::Integer(-1));
+        assert_ne!(usize::MAX.into_value(), Value::Integer(-1));
     }
 
     #[test]
