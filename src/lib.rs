@@ -14340,26 +14340,14 @@ struct FailurePatternRule {
 
 fn swarm_failure_pattern_rules() -> Vec<FailurePatternRule> {
     vec![
-        FailurePatternRule {
-            kind: "fsqlite-query-shape-regression",
-            severity: "high",
-            title: "FrankenSQLite query-shape regression",
-            summary: "Evidence mentions fsqlite planner/query-shape failures that should become targeted SQL regression tests.",
-            keywords: &[
-                "frankensqlite",
-                "fsqlite",
-                "execute_join_select",
-                "fts5",
-                "query-shape",
-                "planner",
-                "join select",
-            ],
-            suggested_test: "Add a fixture-backed SQL regression that reproduces the exact fsqlite query shape and expected rows.",
-            suggested_test_target: "tests/frankensqlite_*.rs or upstream /data/projects/frankensqlite reproducer",
-            candidate_bead_title: "Pin fsqlite query-shape regression with downstream cass fixture coverage",
-            candidate_bead_type: "test",
-            candidate_bead_priority: 1,
-        },
+        // w1b Task B5 (plan delta d14, 2026-08-26): the `fsqlite-query-shape-regression`
+        // rule that used to live here (matching "frankensqlite"/"fsqlite"/
+        // "execute_join_select"/"fts5"/"query-shape"/"planner"/"join select" in
+        // evidence text) is retired -- frankensqlite's query planner is not
+        // this crate's pin to regression-test against once the storage
+        // engine converges on stock SQLite (see contention_diagnostics.rs's
+        // matching six-to-three-class retirement for the storage-contention
+        // side of this same wave). Identity is `w1b-b4-deleted-tests.md`.
         FailurePatternRule {
             kind: "panic-surface-regression",
             severity: "high",
@@ -14575,9 +14563,6 @@ fn swarm_failure_pattern_false_positive_controls(kind: &str) -> Vec<&'static str
         }
         "flaky-or-toxic-suite" => {
             controls.push("distinguish explicitly ignored stress proofs from required gates");
-        }
-        "fsqlite-query-shape-regression" => {
-            controls.push("confirm the failing query shape against the pinned fsqlite revision");
         }
         _ => {}
     }

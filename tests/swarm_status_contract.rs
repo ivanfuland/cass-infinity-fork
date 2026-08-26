@@ -2241,8 +2241,13 @@ fn swarm_failure_patterns_cli_ranks_test_suggestions_and_redacts_sessions()
         .filter_map(|pattern| pattern.get("kind").and_then(Value::as_str))
         .collect::<Vec<_>>();
 
+    // w1b Task B5 (plan delta d14): `fsqlite-query-shape-regression` retired
+    // (see `w1b-b4-deleted-tests.md`) -- `panic-surface-regression` is now
+    // the sole surviving "high" severity rule, and it still matches the
+    // `cass-fsqlite` fixture bead's close_reason on its own keywords
+    // ("range end index", "out of range").
     require(
-        kinds.starts_with(&["fsqlite-query-shape-regression", "panic-surface-regression"]),
+        kinds.first() == Some(&"panic-surface-regression"),
         format!("high-severity pattern ordering drifted: {kinds:?}"),
     )?;
     for expected in [
