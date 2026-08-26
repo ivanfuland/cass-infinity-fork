@@ -3,7 +3,7 @@ use coding_agent_search::search::tantivy::expected_index_dir;
 use coding_agent_search::storage::api::Conn as FrankenConnection;
 use coding_agent_search::storage::api::StorageError as FrankenError;
 use coding_agent_search::storage::api::Value as ParamValue;
-use coding_agent_search::storage::sqlite::FrankenStorage;
+use coding_agent_search::storage::sqlite::{ConnectionManagerConfig, FrankenConnectionManager, FrankenStorage};
 use fs2::FileExt;
 use serde_json::{Value, json};
 
@@ -257,9 +257,32 @@ fn seed_healthy_empty_index(test_home: &Path, data_dir: &Path) {
     );
 }
 
+/// Fix (v3.1 verdict follow-up, control-plane adjudicated 2026-08-25): every
+/// call site builds a fresh, minimal `restore_probe`-only fixture db (backup/
+/// restore/archive-export scenarios) that must not carry cass's real schema —
+/// `open_raw()` (`FrankenStorage::open().into_raw()`) runs cass's real
+/// migrations on a fresh file, which both plants unrelated cass tables in
+/// what's meant to be a bare fixture and (confirmed via equivalence-gate
+/// baseline-vs-candidate diff) leaves a frankensqlite `-fsqlite-ns-gate`
+/// namespace sidecar the pre-migration bare `frankensqlite::Connection::open`
+/// never did, tripping `doctor archive export`'s asset-manifest accounting.
+/// Routes through `FrankenConnectionManager` instead — same schema-free
+/// bridge as the `tests/storage.rs` fix in `7bd20321`. Other `open_raw()`
+/// call sites in this file reopen a db a prior `cass index` CLI run already
+/// migrated (just inserting extra fixture rows into existing tables) and are
+/// unaffected by this fixture's schema, so they're left on `open_raw()`.
 fn write_test_sqlite_db(path: &Path, marker: &str) {
     fs::create_dir_all(path.parent().expect("sqlite db parent")).expect("create sqlite db parent");
-    let conn = open_raw(path);
+    let mgr = FrankenConnectionManager::new(
+        path,
+        ConnectionManagerConfig {
+            reader_count: 1,
+            max_writers: 1,
+        },
+    )
+    .expect("open schema-free fixture database");
+    let mut guard = mgr.writer().expect("acquire fixture writer");
+    let conn = guard.storage().raw();
     conn.execute(
         "CREATE TABLE restore_probe(marker TEXT NOT NULL)",
         fparams![],
@@ -271,7 +294,7 @@ fn write_test_sqlite_db(path: &Path, marker: &str) {
     )
     .expect("insert restore probe marker");
     let _ = conn.query_all_map("PRAGMA wal_checkpoint(TRUNCATE);", &[], |row| row.get_value(0));
-    drop(conn);
+    guard.mark_committed();
 }
 
 struct DoctorBackupFixture {
