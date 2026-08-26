@@ -3159,6 +3159,14 @@ fn has_db_sidecar_suffix(name: &str) -> bool {
         "-lock-shared",
         "-lock-reserved",
         "-lock-pending",
+        // w1b: frankensqlite plants these namespace-lock sidecars next to ANY
+        // file it opens (read or write), even ones that fail to parse as a
+        // database. Their names inherit the opened file's prefix, so an
+        // unfiltered sidecar matches the same `.corrupt.`/`.bak` glob
+        // patterns `historical_bundle_root_paths` uses and gets miscounted
+        // as an independent historical salvage bundle.
+        "-fsqlite-ns-use",
+        "-fsqlite-ns-gate",
     ];
     SIDECAR_SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
 }
@@ -25215,6 +25223,31 @@ mod tests {
                 .any(|detail| detail.contains("TEMP B-TREE")),
             "expected per-conversation lexical rebuild fetch to avoid sorter temp b-trees, got {message_plan_details:?}"
         );
+    }
+
+    #[test]
+    fn has_db_sidecar_suffix_recognizes_frankensqlite_namespace_lock_sidecars() {
+        // w1b: these sidecars are what leaked past
+        // `historical_bundle_root_paths` and got miscounted as independent
+        // salvage bundles (see the two `salvage_historical_databases_*`
+        // regression tests below).
+        assert!(has_db_sidecar_suffix(
+            "agent_search.corrupt.20260324_212907-fsqlite-ns-use"
+        ));
+        assert!(has_db_sidecar_suffix("agent_search.db-fsqlite-ns-gate"));
+    }
+
+    #[test]
+    fn has_db_sidecar_suffix_does_not_overmatch_near_miss_suffixes() {
+        // Exact-suffix semantics: a name that merely contains the sidecar
+        // token as a substring, without ending in the exact suffix, must not
+        // be treated as a sidecar (would otherwise risk sweeping up a
+        // legitimately-named bundle file).
+        assert!(!has_db_sidecar_suffix(
+            "agent_search.corrupt.20260324_212907-fsqlite-ns-used"
+        ));
+        assert!(!has_db_sidecar_suffix("agent_search.db-fsqlite-ns-gated"));
+        assert!(!has_db_sidecar_suffix("agent_search.db"));
     }
 
     #[test]
