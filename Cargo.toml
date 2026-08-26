@@ -44,6 +44,10 @@ shell-words = "1.1.1"
 dotenvy = "0.15.7"
 notify = "8.2.0"
 frankensqlite = { version = "=0.1.16", package = "fsqlite", features = ["fts5"] }
+# w1b (Stage B, plan Task B1): promoted from [dev-dependencies] -- backend_sqlite.rs
+# (Task B2) is a real production storage backend, not a test-only interop fixture.
+# `bundled` pins the linked SQLite version for build reproducibility (spec §6).
+rusqlite = { version = "0.39.0", features = ["bundled", "modern_sqlite"] }
 rayon = "1.12.0"
 crossbeam-channel = "0.5.15"
 parking_lot = "0.12.5"
@@ -96,8 +100,6 @@ franken-agent-detection = { version = "0.1.9", git = "https://github.com/ivanful
 wide = "1.4.0"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "0.7.6"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization
 bloomfilter = "3.0.1"  # Probabilistic membership testing for P2 Opt 3.3: Workspace Cache
-hnsw_rs = "0.3.4"  # Opt 9: Approximate Nearest Neighbor with HNSW
-ouroboros = "0.18.5"  # Safe self-referential wrapper for HNSW loader lifetime
 
 # Crypto for ChatGPT encrypted conversations and HTML export encryption.
 # The aes-gcm + digest + hkdf + hmac + sha2 family must stay on compatible
@@ -179,9 +181,6 @@ arbitrary = { version = "1", features = ["derive"] }
 serde_yaml = "0.9.34"
 rand = "0.10"
 rand_chacha = "0.10"
-# rusqlite is retained only for C-SQLite interop fixtures in tests; production
-# storage and historical salvage paths use frankensqlite.
-rusqlite = { version = "0.39.0", features = ["bundled", "modern_sqlite"] }
 # frankensqlite compat gate tests (bead 3vvqa) — fsqlite-types needed for SqliteValue
 # enum variants in test assertions. The main fsqlite dep is available as `frankensqlite`.
 fsqlite-types = { version = "=0.1.16", package = "fsqlite-types" }

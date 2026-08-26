@@ -16,27 +16,34 @@ use std::fmt::Write as _;
 use coding_agent_search::storage::sqlite::{CURRENT_SCHEMA_VERSION, FrankenStorage, SqliteStorage};
 
 #[test]
-fn rusqlite_is_dev_dependency_only() {
+fn rusqlite_is_bundled() {
+    // w1b Task B1 (plan 2026-08-25-w1-relational-sqlite-swap.md, control-plane
+    // adjudicated R0-B2): Stage B promotes rusqlite from a dev-only C-SQLite
+    // interop fixture to a real production storage backend (backend_sqlite.rs,
+    // Task B2), directly conflicting with this test's old assertion that it
+    // must stay out of `[dependencies]`. Rewritten to preserve the test's
+    // actual intent -- "the linked SQLite build is reproducible" -- by
+    // asserting the `bundled` feature is enabled (vendors and pins its own
+    // libsqlite3 version) rather than asserting dependency-table placement.
     let manifest: toml::Table =
         toml::from_str(include_str!("../Cargo.toml")).expect("parse Cargo.toml");
     let dependencies = manifest
         .get("dependencies")
         .and_then(toml::Value::as_table)
         .expect("Cargo.toml dependencies table");
-    assert!(
-        !dependencies.contains_key("rusqlite"),
-        "rusqlite must not ship as a normal production dependency; \
-         keep C-SQLite interop coverage in dev-dependencies only"
-    );
-
-    let dev_dependencies = manifest
-        .get("dev-dependencies")
+    let rusqlite = dependencies
+        .get("rusqlite")
         .and_then(toml::Value::as_table)
-        .expect("Cargo.toml dev-dependencies table");
+        .expect("rusqlite must be a normal production dependency (w1b Task B1)");
+    let features = rusqlite
+        .get("features")
+        .and_then(toml::Value::as_array)
+        .expect("rusqlite dependency must declare a features list");
+    let has_bundled = features.iter().any(|f| f.as_str() == Some("bundled"));
     assert!(
-        dev_dependencies.contains_key("rusqlite"),
-        "rusqlite should remain available to tests that build legacy \
-         C-SQLite fixture databases"
+        has_bundled,
+        "rusqlite must enable the `bundled` feature so the linked SQLite \
+         version is vendored/pinned, not resolved against the system libsqlite3"
     );
 }
 

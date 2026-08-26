@@ -2988,6 +2988,7 @@ Update check state is stored in the data directory:
 | `frankensearch` | `2cad158f` |
 | `frankentui` | `5f78cfa0` |
 | `toon` (`tru`) | `5669b72a` |
+| `rusqlite` | `0.39.0` (crates.io; `bundled,modern_sqlite` features — w1b Stage B production SQLite backend; `bundled` links and pins its own libsqlite3 build for reproducibility, not build.rs-guarded like the sibling forks above since it carries no git revision to drift) |
 
 **Build-time validation**
 - `build.rs` validates the committed dependency source contract against the expected package name, package version, Cargo feature/default-features contract, and git source where applicable.

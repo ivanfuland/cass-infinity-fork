@@ -72,7 +72,17 @@ strings "$BIN" > "$str_tmp" || { rm -f "$str_tmp"; die verify "strings failed on
 n=$(grep -cE 'onnxruntime|ort_sys' "$str_tmp" || true)
 rm -f "$str_tmp"
 [ "$n" = "0" ] || die verify "binary has $n ONNX symbols; expected 0 (did semantic feature leak in?)"
-if ldd "$BIN" 2>/dev/null | grep -qiE 'onnx|ort'; then die verify "binary dynamically links onnx/ort"; fi
+# w1b Task B1 (R0-B08): the old `ldd ... 2>/dev/null | grep -qiE 'onnx|ort'` swallowed
+# ldd's own failure (e.g. "not a dynamic executable") into a false PASS -- if ldd
+# itself errored, grep saw no input, found no match, and the `if` never fired.
+# Split into an explicit rc check (HOLD, not pass, on probe failure) and count the
+# same anchored `onnxruntime|ort_sys` pattern used above (not the bare `onnx|ort`
+# substring, which false-positives on help text).
+ldd_rc=0
+ldd_out=$(ldd "$BIN" 2>&1) || ldd_rc=$?
+if [ $ldd_rc -ne 0 ]; then die verify "ldd probe itself failed (rc=$ldd_rc) — HOLD, not pass"; fi
+onnx_hits=$(printf '%s' "$ldd_out" | grep -cE 'onnxruntime|ort_sys' || true)
+[ "$onnx_hits" = "0" ] || die verify "ldd shows $onnx_hits onnx/ort links"
 
 step "6/7 backup current install (rollback point)"
 if [ -e "$INSTALL_PATH" ]; then cp -a "$INSTALL_PATH" "$INSTALL_PATH.prev"; fi
