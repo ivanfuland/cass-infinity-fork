@@ -141,6 +141,21 @@ FAILUREDUMP_TS_RE = re.compile(r'_\d{8}_\d{6}\.txt\b')
 # on every doctor test that snapshots a file tree (an unavoidable-noise field,
 # not a content difference).
 MODIFIED_MS_RE = re.compile(r'modified_ms: Some\(\d+\)')
+# plan delta d11 (round-4.md follow-up, control-plane adjudicated
+# 2026-08-26): the doctor e2e test harness's own run-summary artifact
+# directory name embeds a millisecond timestamp + PID (`run-<TS>-<PID>`),
+# which is structurally guaranteed to differ between any two independent
+# process runs regardless of any code change -- same per-invocation-random
+# family as d8's thread-PID/tmpdir-first-segment and d10's
+# elapsed_ms/blake3/timing/tempfile/ISO8601/FailureDump-timestamp fields.
+# R4-B1's narrowing of ABS_PATH_RE to an explicit root allowlist stopped
+# incidentally swallowing this directory name whole (it used to get eaten
+# along with the rest of the absolute path down to a bare basename), which
+# surfaced it as a new candidate-only failure form in v5.4 even though both
+# sides fail with byte-identical scenario content. Anchored to the literal
+# `run-` prefix (not a bare digit-string match) so it can't accidentally eat
+# an unrelated numeric filename segment elsewhere.
+RUN_ID_RE = re.compile(r'run-\d{10,}-\d+')
 
 
 def normalize_mode(text, known_root_sub=None):
@@ -156,6 +171,7 @@ def normalize_mode(text, known_root_sub=None):
     if known_root_sub is not None:
         root_pattern, root_repl = known_root_sub
         t = root_pattern.sub(root_repl, t)
+    t = RUN_ID_RE.sub('run-<RUNID>', t)
     t = FAILUREDUMP_TS_RE.sub('_<TS>.txt', t)
     t = TMPFILE_BASENAME_RE.sub('.tmp<RAND>', t)
     t = THREAD_PID_RE.sub(r'\1 (<PID>) panicked', t)
