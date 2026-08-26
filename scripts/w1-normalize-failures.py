@@ -119,6 +119,21 @@ def normalize_mode(text):
     return t
 
 
+def target_label(cur_target):
+    """R2-B2 v2 (control-plane redesign 2026-08-26): strip the absolute
+    binary path suffix (` (/tmp/.../deps/foo-<hash>)`) from a `cur_target`
+    string, leaving just the tree-relative label (e.g. `tests/connector_
+    crush.rs` or `unittests src/lib.rs`) that's stable across baseline and
+    candidate builds -- the absolute path differs by construction (distinct
+    tree_target_dir per side), so cross-side target matching must key on
+    this, not the raw `cur_target` string.
+    """
+    if cur_target is None:
+        return cur_target
+    idx = cur_target.find(' (')
+    return cur_target[:idx] if idx != -1 else cur_target
+
+
 def is_poison_cascade(text):
     low = text.lower()
     return 'poisonerror' in low or 'poisoned' in low
@@ -201,9 +216,13 @@ def parse(lines):
             mode = normalize_mode(body) if body else '<no-captured-output>'
             failures.append({'target': cur_target, 'test': name, 'mode': mode})
             recorded_here += 1
+        is_doctest = cur_target is not None and cur_target.startswith('doctests ')
         target_accounting.append(
             {
                 'target': cur_target,
+                'target_label': target_label(cur_target),
+                'is_doctest': is_doctest,
+                'declared_running': cur_declared_n,
                 'cargo_reported_failed': failed,
                 'recorded_failures': recorded_here,
                 'poison_excluded': poison_here,

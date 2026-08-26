@@ -101,6 +101,52 @@ def load_inventory(path):
     return keys
 
 
+def inventory_identity(key):
+    """Strip the trailing content hash, keeping `<file>::<test>::<status>`
+    -- the identity that's stable across a source-body edit that changes the
+    hash but not the test's existence (R2-B2 v2 needs "did a test get
+    added/removed", not "did its body change")."""
+    parts = key.rsplit('::', 1)
+    return parts[0] if len(parts) == 2 else key
+
+
+def identity_file(identity):
+    return identity.split('::', 1)[0]
+
+
+def target_file_scope(label):
+    """R2-B2 v2 (control-plane redesign 2026-08-26): map a target_label to
+    the inventory file(s) it corresponds to. The lib unittest target is the
+    one many-to-one case -- every `src/*.rs` file's #[test]s all run inside
+    a single `unittests src/lib.rs` binary/target, so its scope is a prefix
+    match; every other target (an integration test file or a bench file) is
+    exactly the file whose relative path equals the target label."""
+    if label is not None and label.startswith('unittests '):
+        return ('prefix', 'src/')
+    return ('exact', label)
+
+
+def file_in_scope(file, scope):
+    kind, val = scope
+    return file.startswith(val) if kind == 'prefix' else file == val
+
+
+def build_target_running(completeness):
+    """Per-target declared-running totals for one side, keyed by the
+    tree-relative target_label (doctests excluded -- they have no
+    test-inventory.txt counterpart to reconcile against)."""
+    out = {}
+    for t in completeness.get('target_accounting') or []:
+        if t.get('is_doctest'):
+            continue
+        label = t.get('target_label')
+        n = t.get('declared_running')
+        if label is None or n is None:
+            continue
+        out[label] = out.get(label, 0) + n
+    return out
+
+
 def main(argv):
     if len(argv) != 3:
         print('usage: w1-compare-verdict.py <baseline_out_dir> <candidate_out_dir>', file=sys.stderr)
@@ -124,18 +170,55 @@ def main(argv):
     cand_poison = cand_completeness.get('poison_excluded') or 0
     base_unreconciled = base_completeness.get('unreconciled_targets') or []
     cand_unreconciled = cand_completeness.get('unreconciled_targets') or []
-    # R2-B2: cross-target reconciliation between cargo's own declared
-    # "running N" sum (over non-doctest targets) and w1-test-inventory.py's
-    # independent static scan (every line in test-inventory.txt is either
-    # `active` or `ignored`, so its line count IS that side's active+ignored
-    # total). Two independently-derived counts of "how many #[test]
-    # functions exist" that should always agree; a mismatch means one of the
-    # two counting mechanisms has a bug neither side's own internal checks
-    # would catch.
+    # R2-B2 v2 (control-plane redesign 2026-08-26, replaces the first cut):
+    # the absolute "running sum == inventory count" check per side rejected
+    # v5's real data on a ~1.44x structural gap the inventory scanner and
+    # cargo's own per-target running count have always had (an inherited,
+    # symmetric baseline property, not a defect this wave introduced) --
+    # wrong invariant. The threat model B2 actually guards is "candidate
+    # silently suppresses tests baseline used to run" (e.g. a stray
+    # `#[cfg(any())]`), and baseline is the reference, not the audit target.
+    # Re-anchored to a cross-side DIFFERENTIAL invariant instead: for each
+    # target (by tree-relative label, matched across both sides' distinct
+    # absolute build paths), the change in declared running count between
+    # baseline and candidate must equal the net test-identity change (added
+    # minus removed, ignoring pure content-hash churn) among the inventory
+    # entries that belong to that target's source file(s). A `#[cfg(any())]`
+    # suppression drops that target's candidate running count without a
+    # matching inventory removal, so it can't hide from this either -- but a
+    # target's count legitimately growing because its own source file
+    # gained new #[test]s (this wave's own `src/storage/api/*.rs`) is
+    # correctly explained and does not HOLD.
+    base_target_running = build_target_running(base_completeness)
+    cand_target_running = build_target_running(cand_completeness)
+    base_identities = {inventory_identity(k) for k in base_inventory}
+    cand_identities = {inventory_identity(k) for k in cand_inventory}
+    added_identities = cand_identities - base_identities
+    removed_identities = base_identities - cand_identities
+    running_mismatches = []
+    for label in sorted(set(base_target_running) | set(cand_target_running)):
+        base_n = base_target_running.get(label, 0)
+        cand_n = cand_target_running.get(label, 0)
+        actual_diff = cand_n - base_n
+        scope = target_file_scope(label)
+        added_in_scope = sum(1 for i in added_identities if file_in_scope(identity_file(i), scope))
+        removed_in_scope = sum(1 for i in removed_identities if file_in_scope(identity_file(i), scope))
+        expected_diff = added_in_scope - removed_in_scope
+        if actual_diff != expected_diff:
+            running_mismatches.append(
+                {
+                    'target_label': label,
+                    'base_running': base_n,
+                    'cand_running': cand_n,
+                    'actual_diff': actual_diff,
+                    'expected_diff_from_inventory': expected_diff,
+                }
+            )
+    running_reconciled = not running_mismatches
+    # Advisory-only aggregate sums (not a judging input -- the absolute ratio
+    # is inherited baseline structure, see comment above).
     base_running_sum = base_completeness.get('total_declared_running_non_doctest')
     cand_running_sum = cand_completeness.get('total_declared_running_non_doctest')
-    base_running_reconciled = base_running_sum is not None and base_running_sum == len(base_inventory)
-    cand_running_reconciled = cand_running_sum is not None and cand_running_sum == len(cand_inventory)
     base_complete = (
         bool(base_completeness.get('complete'))
         and not base_completeness.get('run_count_mismatches')
@@ -144,7 +227,6 @@ def main(argv):
         and base_poison == 0
         and not base_unreconciled
         and not base_failures_missing
-        and base_running_reconciled
     )
     cand_complete = (
         bool(cand_completeness.get('complete'))
@@ -154,7 +236,6 @@ def main(argv):
         and cand_poison == 0
         and not cand_unreconciled
         and not cand_failures_missing
-        and cand_running_reconciled
     )
     print(f'baseline: complete={base_completeness.get("complete")} '
           f'started={base_completeness.get("started_targets")} '
@@ -164,7 +245,7 @@ def main(argv):
           f'run_count_mismatches={len(base_completeness.get("run_count_mismatches") or [])} '
           f'failures_jsonl_missing={base_failures_missing} '
           f'running_sum={base_running_sum} inventory_count={len(base_inventory)} '
-          f'running_reconciled={base_running_reconciled} '
+          f'(advisory ratio only, not judged) '
           f'cargo_check_rc={base_check_rc} inventory_rc={base_inventory_rc} '
           f'poison_excluded={base_poison} unreconciled_targets={len(base_unreconciled)}')
     print(f'candidate: complete={cand_completeness.get("complete")} '
@@ -175,15 +256,29 @@ def main(argv):
           f'run_count_mismatches={len(cand_completeness.get("run_count_mismatches") or [])} '
           f'failures_jsonl_missing={cand_failures_missing} '
           f'running_sum={cand_running_sum} inventory_count={len(cand_inventory)} '
-          f'running_reconciled={cand_running_reconciled} '
+          f'(advisory ratio only, not judged) '
           f'cargo_check_rc={cand_check_rc} inventory_rc={cand_inventory_rc} '
           f'poison_excluded={cand_poison} unreconciled_targets={len(cand_unreconciled)}')
+    print()
+    print('=== 跨侧 target running 差分对账（R2-B2 v2）===')
+    print(f'candidate ⊆ baseline running-diff reconciled against inventory identity diff: {running_reconciled}')
+    total_actual_diff = sum(cand_target_running.values()) - sum(base_target_running.values())
+    total_expected_diff = len(added_identities) - len(removed_identities)
+    print(f'总和差分校验（advisory,per-target 通过时恒等）: '
+          f'cand_sum-base_sum={total_actual_diff} vs cand_inv-base_inv={total_expected_diff} '
+          f'({"OK" if total_actual_diff == total_expected_diff else "MISMATCH"})')
+    if running_mismatches:
+        print(f'不能被清单差分解释的 target（{len(running_mismatches)} 个,逐条列出）:')
+        for m in running_mismatches:
+            print(f"  - {m['target_label']}: base_running={m['base_running']} "
+                  f"cand_running={m['cand_running']} actual_diff={m['actual_diff']} "
+                  f"expected_diff_from_inventory={m['expected_diff_from_inventory']}")
     if base_unreconciled:
         print(f'baseline unreconciled targets (至多10条): {base_unreconciled[:10]}')
     if cand_unreconciled:
         print(f'candidate unreconciled targets (至多10条): {cand_unreconciled[:10]}')
 
-    incomplete = not (base_complete and cand_complete)
+    incomplete = not (base_complete and cand_complete and running_reconciled)
 
     # R1-B4: multiset (Counter), not set. A plain set comparison collapses
     # distinct failing tests whose panic text normalizes to the same mode --
