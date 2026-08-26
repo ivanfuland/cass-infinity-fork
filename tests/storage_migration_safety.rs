@@ -1,6 +1,6 @@
-use coding_agent_search::storage::sqlite::{
-    ConnectionManagerConfig, FrankenConnectionManager, MigrationError, SqliteStorage,
-};
+use coding_agent_search::storage::api::Profile;
+use coding_agent_search::storage::sqlite::{MigrationError, SqliteStorage};
+use coding_agent_search::storage::testing::{TestWriterGuard, open_test_writer};
 use std::path::Path;
 use tempfile::TempDir;
 
@@ -8,27 +8,18 @@ use tempfile::TempDir;
 /// intentionally build legacy/corrupt/pre-migration schemas that
 /// `SqliteStorage::open_or_rebuild` must detect and reject, so migrating
 /// them first (as `FrankenStorage::open` would) defeats the test's purpose.
-fn raw_fixture_writer(path: &Path) -> FrankenConnectionManager {
-    FrankenConnectionManager::new(
-        path,
-        ConnectionManagerConfig {
-            reader_count: 1,
-            max_writers: 1,
-        },
-    )
-    .expect("open raw fixture writer")
+fn raw_fixture_writer(path: &Path) -> TestWriterGuard {
+    open_test_writer(path, Profile::Production).expect("open raw fixture writer")
 }
 
 // Helper to create a V1 database with some data
 fn create_v1_db(path: &Path) {
-    let mgr = raw_fixture_writer(path);
-    let mut guard = mgr.writer().expect("acquire fixture writer");
+    let mut guard = raw_fixture_writer(path);
     guard
         .storage()
         .raw()
         .execute_batch(
         r"
-        PRAGMA foreign_keys = ON;
         CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         INSERT INTO meta(key, value) VALUES('schema_version', '1');
 
@@ -173,8 +164,7 @@ fn test_missing_meta_triggers_rebuild() {
 
     // Create a valid SQLite DB but without meta table (simulating very old or broken state)
     {
-        let mgr = raw_fixture_writer(&db_path);
-        let mut guard = mgr.writer().unwrap();
+        let mut guard = raw_fixture_writer(&db_path);
         guard
             .storage()
             .raw()
@@ -198,8 +188,7 @@ fn test_future_schema_triggers_rebuild() {
     let db_path = tmp.path().join("future.db");
 
     {
-        let mgr = raw_fixture_writer(&db_path);
-        let mut guard = mgr.writer().unwrap();
+        let mut guard = raw_fixture_writer(&db_path);
         let conn = guard.storage().raw();
         conn.execute("CREATE TABLE meta (key TEXT, value TEXT)", &[])
             .unwrap();

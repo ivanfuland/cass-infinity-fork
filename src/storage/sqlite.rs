@@ -882,245 +882,6 @@ impl Drop for LazyFrankenDb {
 }
 
 // -------------------------------------------------------------------------
-// FrankenSQLite Connection Manager (bead 3rlf8)
-// -------------------------------------------------------------------------
-// Multi-connection management: reader pool + concurrent writer connections.
-// Replaces the LazyFrankenDb single-connection bottleneck for high-throughput
-// scenarios (indexer parallel writes, concurrent TUI reads + indexer writes).
-
-/// Configuration for the [`FrankenConnectionManager`].
-#[derive(Debug, Clone)]
-pub struct ConnectionManagerConfig {
-    /// Number of pre-opened reader connections (default: 4).
-    pub reader_count: usize,
-    /// Maximum concurrent writer connections (default: available parallelism).
-    pub max_writers: usize,
-}
-
-impl Default for ConnectionManagerConfig {
-    fn default() -> Self {
-        let cpus = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
-        Self {
-            reader_count: 4,
-            max_writers: cpus,
-        }
-    }
-}
-
-/// Multi-connection manager for frankensqlite.
-///
-/// Provides:
-/// - A pool of pre-opened reader connections (round-robin, Mutex-protected)
-/// - Controlled creation of writer connections with token-based limits
-/// - RAII guards that auto-rollback uncommitted transactions on drop
-///
-/// Thread-safe: reader connections are wrapped in Mutex (FrankenConnection is !Sync).
-/// Writer connections are created per-request (each thread gets its own).
-pub struct FrankenConnectionManager {
-    db_path: PathBuf,
-    readers: Vec<parking_lot::Mutex<SendFrankenConnection>>,
-    reader_idx: std::sync::atomic::AtomicUsize,
-    /// Token-based writer limit: channel pre-filled with `max_writers` tokens.
-    /// `recv()` = acquire slot, `send()` = release slot.
-    writer_tokens: (
-        crossbeam_channel::Sender<()>,
-        crossbeam_channel::Receiver<()>,
-    ),
-    config: ConnectionManagerConfig,
-}
-
-// Safety: FrankenConnectionManager is Send+Sync because:
-// - readers wrapped in Mutex<SendFrankenConnection> (exclusive access)
-// - writer_tokens uses crossbeam (Send+Sync)
-// - db_path is PathBuf (Send+Sync)
-unsafe impl Send for FrankenConnectionManager {}
-unsafe impl Sync for FrankenConnectionManager {}
-
-impl FrankenConnectionManager {
-    /// Create a new connection manager.
-    ///
-    /// Opens `config.reader_count` reader connections immediately.
-    /// Writer connections are created on demand (up to `config.max_writers`).
-    pub fn new(db_path: impl Into<PathBuf>, config: ConnectionManagerConfig) -> Result<Self> {
-        let db_path = db_path.into();
-        let path_str = db_path.to_string_lossy().to_string();
-
-        let reader_count = config.reader_count.max(1);
-        let mut readers = Vec::with_capacity(reader_count);
-        for _ in 0..reader_count {
-            let conn = FrankenConnection::open_writable(std::path::Path::new(&(&path_str)), crate::storage::api::Profile::Production)
-                .with_context(|| format!("opening reader connection at {}", db_path.display()))?;
-            // Apply read-tuned config (no migration, no write PRAGMAs)
-            let _ = conn.execute("PRAGMA busy_timeout = 5000;", &[]); // match writer config
-            let _ = conn.execute("PRAGMA cache_size = -16384;", &[]); // 16MB reader cache
-            readers.push(parking_lot::Mutex::new(SendFrankenConnection::new(conn)));
-        }
-
-        let max_writers = config.max_writers.max(1);
-
-        // Pre-fill bounded channel with tokens (acts as counting semaphore).
-        // A zero-capacity channel with no initial tokens would make the first
-        // writer acquisition block forever.
-        let (tx, rx) = crossbeam_channel::bounded(max_writers);
-        for _ in 0..max_writers {
-            tx.send(())
-                .map_err(|_| anyhow!("writer token channel closed during initialization"))?;
-        }
-
-        Ok(Self {
-            db_path,
-            readers,
-            reader_idx: std::sync::atomic::AtomicUsize::new(0),
-            writer_tokens: (tx, rx),
-            config: ConnectionManagerConfig {
-                reader_count,
-                max_writers,
-            },
-        })
-    }
-
-    /// Get a reader connection (round-robin from the pool).
-    ///
-    /// Returns a mutex guard wrapping the connection. The guard prevents
-    /// concurrent access to the same connection (FrankenConnection is !Sync).
-    pub fn reader(&self) -> parking_lot::MutexGuard<'_, SendFrankenConnection> {
-        let idx = self
-            .reader_idx
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.readers[idx % self.readers.len()].lock()
-    }
-
-    /// Acquire a writer connection.
-    ///
-    /// Opens a new frankensqlite connection with full config (no migration).
-    /// Blocks if `max_writers` connections are already in use.
-    /// The returned [`WriterGuard`] auto-rolls back on drop.
-    pub fn writer(&self) -> Result<WriterGuard<'_>> {
-        self.writer_tokens
-            .1
-            .recv()
-            .map_err(|_| anyhow!("writer token channel closed"))?;
-        let path_str = self.db_path.to_string_lossy().to_string();
-        let conn = match FrankenConnection::open_writable(std::path::Path::new(&(&path_str)), crate::storage::api::Profile::Production) {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = self.writer_tokens.0.send(());
-                return Err(anyhow::Error::from(e).context(format!(
-                    "opening writer connection at {}",
-                    self.db_path.display()
-                )));
-            }
-        };
-        let storage = FrankenStorage::new(conn, self.db_path.clone());
-        if let Err(e) = storage.apply_config() {
-            let _ = self.writer_tokens.0.send(());
-            return Err(e);
-        }
-        Ok(WriterGuard {
-            storage,
-            mgr: self,
-            committed: false,
-        })
-    }
-
-    /// Acquire a concurrent writer connection (BEGIN CONCURRENT via MVCC).
-    ///
-    /// Similar to [`writer`] but tuned for the parallel indexer write pool.
-    /// Uses reduced cache size and is designed for short-lived batch inserts.
-    pub fn concurrent_writer(&self) -> Result<WriterGuard<'_>> {
-        self.writer_tokens
-            .1
-            .recv()
-            .map_err(|_| anyhow!("writer token channel closed"))?;
-        let path_str = self.db_path.to_string_lossy().to_string();
-        let conn = match FrankenConnection::open_writable(std::path::Path::new(&(&path_str)), crate::storage::api::Profile::Production) {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = self.writer_tokens.0.send(());
-                return Err(anyhow::Error::from(e).context(format!(
-                    "opening concurrent writer at {}",
-                    self.db_path.display()
-                )));
-            }
-        };
-        let storage = FrankenStorage::new(conn, self.db_path.clone());
-        if let Err(e) = storage.apply_config() {
-            let _ = self.writer_tokens.0.send(());
-            return Err(e);
-        }
-        // Reduced cache for concurrent writers (they're short-lived)
-        let _ = storage.raw().execute("PRAGMA cache_size = -4096;", &[]);
-        Ok(WriterGuard {
-            storage,
-            mgr: self,
-            committed: false,
-        })
-    }
-
-    /// Database path managed by this pool.
-    pub fn db_path(&self) -> &Path {
-        &self.db_path
-    }
-
-    /// Number of reader connections in the pool.
-    pub fn reader_count(&self) -> usize {
-        self.readers.len()
-    }
-
-    /// Maximum concurrent writers allowed.
-    pub fn max_writers(&self) -> usize {
-        self.config.max_writers
-    }
-}
-
-impl Drop for FrankenConnectionManager {
-    fn drop(&mut self) {
-        for reader in &mut self.readers {
-            reader.get_mut().0.close_best_effort_in_place();
-        }
-    }
-}
-
-/// RAII guard for a writer connection.
-///
-/// Provides access to a [`FrankenStorage`] for write operations.
-/// Releases the writer semaphore slot when dropped.
-pub struct WriterGuard<'a> {
-    storage: FrankenStorage,
-    mgr: &'a FrankenConnectionManager,
-    committed: bool,
-}
-
-impl<'a> WriterGuard<'a> {
-    /// Access the underlying storage for read/write operations.
-    pub fn storage(&self) -> &FrankenStorage {
-        &self.storage
-    }
-
-    /// Mark this writer as successfully committed.
-    ///
-    /// Call after your transaction's `commit()` succeeds. Prevents the drop
-    /// guard from attempting a rollback.
-    pub fn mark_committed(&mut self) {
-        self.committed = true;
-    }
-}
-
-impl Drop for WriterGuard<'_> {
-    fn drop(&mut self) {
-        if !self.committed {
-            // Best-effort rollback — connection may already be in autocommit
-            let _ = self.storage.raw().execute("ROLLBACK;", &[]);
-        }
-        self.storage.close_best_effort_in_place();
-        // Release writer token
-        let _ = self.mgr.writer_tokens.0.send(());
-    }
-}
-
-// -------------------------------------------------------------------------
 // Binary Metadata Serialization (Opt 3.1)
 // -------------------------------------------------------------------------
 // MessagePack provides 50-70% storage reduction vs JSON and faster parsing.
@@ -17765,6 +17526,91 @@ mod tests {
         fs2::FileExt::unlock(&lock_file).unwrap();
     }
 
+    /// w1b Task B4 Step 2, dedicated negative case for the M3 "InUse silent
+    /// fallback" hole found during the write-topology inventory
+    /// (`w1b-b4-write-topology-inventory.md` §①): when
+    /// `acquire_cached_ephemeral_writer`'s single cached slot is already
+    /// `InUse`, it does not block/queue -- it silently opens a second real
+    /// writer connection (`sqlite.rs` `acquire_cached_ephemeral_writer`,
+    /// the `CachedEphemeralWriter::InUse` arm). That is the one place in
+    /// the pre-B4 codebase that can genuinely put more than one live
+    /// writer connection on the same path at once. This test pins that
+    /// old-mechanism behavior down with the shared registry
+    /// (`storage::api::writer_connection_peak`), then shows the equivalent
+    /// contention shape through `WriterHandle` never exceeds 1 -- so the
+    /// hole's closure (once production write paths stop calling
+    /// `acquire_cached_ephemeral_writer` directly, per B4 Step 3) has a
+    /// concrete, independent before/after signature instead of just
+    /// "the code that called it got deleted."
+    #[test]
+    fn ephemeral_writer_cache_inuse_fallback_is_the_only_multi_writer_hole_writer_handle_closes() {
+        use crate::storage::api::{Profile, WriterHandle, reset_writer_connection_peak, writer_connection_peak};
+
+        let dir = TempDir::new().unwrap();
+        let old_mechanism_db = dir.path().join("old-mechanism.db");
+        {
+            let storage = FrankenStorage::open(&old_mechanism_db).unwrap();
+            storage.close().unwrap();
+        }
+        // Old behavior (pre-B4 M3): acquire the cached slot once (now
+        // InUse), then acquire again before releasing it. The second call
+        // must NOT block -- it silently opens a second real connection.
+        // Reset *after* opening `storage`'s own primary connection so the
+        // peak below isolates the ephemeral-writer-cache behavior itself,
+        // not the unrelated fact that `storage` also holds a connection.
+        let storage = FrankenStorage::open(&old_mechanism_db).unwrap();
+        reset_writer_connection_peak(&old_mechanism_db);
+        let (writer_one, _reusable_one) = storage.acquire_cached_ephemeral_writer().unwrap();
+        let (writer_two, reusable_two) = storage.acquire_cached_ephemeral_writer().unwrap();
+        assert!(!reusable_two, "second concurrent acquire must not reuse the InUse slot");
+        // 3 live connections: `storage`'s own primary connection (opened
+        // once, above, and still held) plus the two ephemeral writers --
+        // the second of which should never have existed. A caller doing
+        // nothing more exotic than "ask for the writer twice without
+        // releasing it in between" ends up holding 2 *extra* real
+        // connections instead of blocking on the second ask.
+        assert_eq!(
+            writer_connection_peak(&old_mechanism_db),
+            3,
+            "pre-B4 M3 fallback must be observed opening a second live writer connection \
+             on top of the storage handle's own primary connection"
+        );
+        storage.release_cached_ephemeral_writer(writer_one);
+        storage.discard_cached_ephemeral_writer(writer_two);
+        storage.close().unwrap();
+
+        // New behavior (B4 WriterHandle): the same shape of contention --
+        // many callers wanting "the writer" at once, none of them willing
+        // to wait for each other to finish first -- must never be observed
+        // above 1 live connection, because there is structurally only one
+        // writer thread and every submitter blocks on the channel instead
+        // of opening its own connection.
+        let new_mechanism_db = dir.path().join("writer-handle-mechanism.db");
+        reset_writer_connection_peak(&new_mechanism_db);
+        let (handle, join) =
+            WriterHandle::<crate::storage::api::Conn>::spawn(new_mechanism_db.clone(), Profile::Production, Ok)
+                .expect("spawn writer handle");
+        let mut worker_handles = Vec::new();
+        for _ in 0..8 {
+            let handle = handle.clone();
+            worker_handles.push(std::thread::spawn(move || {
+                for _ in 0..10 {
+                    handle.submit(|conn| conn.execute_batch("SELECT 1;")).unwrap();
+                }
+            }));
+        }
+        for w in worker_handles {
+            w.join().unwrap();
+        }
+        assert_eq!(
+            writer_connection_peak(&new_mechanism_db),
+            1,
+            "WriterHandle must hold the invariant even under the InUse-shaped contention above"
+        );
+        drop(handle);
+        join.join().unwrap();
+    }
+
     #[test]
     fn doctor_storage_open_allows_current_doctor_process_probe() {
         use std::io::Write as _;
@@ -28731,189 +28577,6 @@ mod tests {
             model_daily_rows > 0,
             "usage_models_daily should be populated"
         );
-    }
-
-    // =========================================================================
-    // FrankenConnectionManager tests (bead 3rlf8)
-    // =========================================================================
-
-    #[test]
-    fn connection_manager_creates_readers() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("cm.db");
-
-        // Create the DB first
-        let fs = FrankenStorage::open(&db_path).unwrap();
-        drop(fs);
-
-        let config = ConnectionManagerConfig {
-            reader_count: 3,
-            max_writers: 2,
-        };
-        let mgr = FrankenConnectionManager::new(&db_path, config).unwrap();
-        assert_eq!(mgr.reader_count(), 3);
-        assert_eq!(mgr.max_writers(), 2);
-    }
-
-    #[test]
-    fn connection_manager_clamps_zero_writer_limit_to_prevent_deadlock() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("cm.db");
-
-        let fs = FrankenStorage::open(&db_path).unwrap();
-        drop(fs);
-
-        let mgr = std::sync::Arc::new(
-            FrankenConnectionManager::new(
-                &db_path,
-                ConnectionManagerConfig {
-                    reader_count: 0,
-                    max_writers: 0,
-                },
-            )
-            .unwrap(),
-        );
-        assert_eq!(mgr.reader_count(), 1);
-        assert_eq!(mgr.max_writers(), 1);
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        let mgr_for_thread = std::sync::Arc::clone(&mgr);
-        std::thread::spawn(move || {
-            let result = mgr_for_thread.writer().map(|mut guard| {
-                guard.mark_committed();
-            });
-            tx.send(result.is_ok()).expect("writer result send");
-        });
-
-        assert!(
-            rx.recv_timeout(Duration::from_secs(10)).unwrap(),
-            "writer acquisition should not block forever when configured with zero writer slots"
-        );
-    }
-
-    #[test]
-    fn connection_manager_reader_round_robin() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("cm.db");
-
-        let fs = FrankenStorage::open(&db_path).unwrap();
-        drop(fs);
-
-        let config = ConnectionManagerConfig {
-            reader_count: 2,
-            max_writers: 1,
-        };
-        let mgr = FrankenConnectionManager::new(&db_path, config).unwrap();
-
-        // Reader index should advance (round-robin)
-        let idx_before = mgr.reader_idx.load(std::sync::atomic::Ordering::Relaxed);
-        let _r1 = mgr.reader();
-        let idx_after = mgr.reader_idx.load(std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(idx_after, idx_before + 1, "reader index should advance");
-    }
-
-    #[test]
-    fn connection_manager_writer_reads_and_writes() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("cm.db");
-
-        let fs = FrankenStorage::open(&db_path).unwrap();
-        drop(fs);
-
-        let mgr = FrankenConnectionManager::new(&db_path, Default::default()).unwrap();
-
-        // Acquire writer and insert data
-        {
-            let mut guard = mgr.writer().unwrap();
-            guard
-                .storage()
-                .raw()
-                .execute("CREATE TABLE IF NOT EXISTS cm_test (id INTEGER PRIMARY KEY, val TEXT)", &[])
-                .unwrap();
-            guard
-                .storage()
-                .raw()
-                .execute("INSERT INTO cm_test (val) VALUES ('hello')", &[])
-                .unwrap();
-            guard.mark_committed();
-        }
-
-        // Verify via reader (returns MutexGuard<SendFrankenConnection>)
-        let reader_guard = mgr.reader();
-        let rows = reader_guard
-            .query_all_map("SELECT val FROM cm_test", &[], |row| row.get_typed::<String>(0))
-            .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0], "hello");
-    }
-
-    #[test]
-    fn connection_manager_writer_guard_drops_releases_slot() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("cm.db");
-
-        let fs = FrankenStorage::open(&db_path).unwrap();
-        drop(fs);
-
-        let config = ConnectionManagerConfig {
-            reader_count: 1,
-            max_writers: 1,
-        };
-        let mgr = FrankenConnectionManager::new(&db_path, config).unwrap();
-
-        // Acquire and release writer
-        {
-            let mut guard = mgr.writer().unwrap();
-            guard.mark_committed();
-        }
-
-        // Should be able to acquire again (slot released)
-        let mut guard2 = mgr.writer().unwrap();
-        guard2.mark_committed();
-    }
-
-    #[test]
-    fn connection_manager_concurrent_writer_works() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("cm.db");
-
-        let fs = FrankenStorage::open(&db_path).unwrap();
-        drop(fs);
-
-        let config = ConnectionManagerConfig {
-            reader_count: 1,
-            max_writers: 2,
-        };
-        let mgr = FrankenConnectionManager::new(&db_path, config).unwrap();
-
-        {
-            let mut guard = mgr.concurrent_writer().unwrap();
-            guard
-                .storage()
-                .raw()
-                .execute("CREATE TABLE IF NOT EXISTS cm_conc (id INTEGER PRIMARY KEY, val TEXT)", &[])
-                .unwrap();
-            guard
-                .storage()
-                .raw()
-                .execute("INSERT INTO cm_conc (val) VALUES ('concurrent')", &[])
-                .unwrap();
-            guard.mark_committed();
-        }
-
-        let reader_guard = mgr.reader();
-        let rows = reader_guard
-            .query_all_map("SELECT val FROM cm_conc", &[], |row| row.get_typed::<String>(0))
-            .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0], "concurrent");
-    }
-
-    #[test]
-    fn connection_manager_default_config() {
-        let config = ConnectionManagerConfig::default();
-        assert_eq!(config.reader_count, 4);
-        assert!(config.max_writers > 0);
     }
 
     #[test]

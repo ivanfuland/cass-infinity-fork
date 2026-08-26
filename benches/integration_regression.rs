@@ -21,10 +21,7 @@ use coding_agent_search::connectors::{NormalizedConversation, NormalizedMessage}
 use coding_agent_search::indexer::persist::persist_conversation;
 use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
 use coding_agent_search::search::tantivy::{TantivyIndex, index_dir};
-use coding_agent_search::storage::api::StorageError;
-use coding_agent_search::storage::sqlite::{
-    ConnectionManagerConfig, FrankenConnectionManager, FrankenStorage,
-};
+use coding_agent_search::storage::sqlite::FrankenStorage;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 use std::path::PathBuf;
@@ -543,43 +540,18 @@ fn bench_query_comparison(c: &mut Criterion) {
 }
 
 // =============================================================================
-// Retry helper for concurrent writes
+// 4. CONCURRENT WRITE THROUGHPUT (WriterHandle)
 // =============================================================================
-
-fn with_retry<F, T>(max_retries: usize, mut f: F) -> anyhow::Result<T>
-where
-    F: FnMut() -> Result<T, anyhow::Error>,
-{
-    let mut backoff_ms = 2_u64;
-    for attempt in 0..=max_retries {
-        match f() {
-            Ok(val) => return Ok(val),
-            Err(err) => {
-                // Stage A note: the original five busy/conflict variants plus
-                // DatabaseCorrupt all collapse into storage::api's StorageError::
-                // Busy{..}/Corrupt{..} via map_franken_err; matching those two
-                // variants reproduces the same retry set.
-                let is_retryable = err
-                    .downcast_ref::<StorageError>()
-                    .or_else(|| err.root_cause().downcast_ref::<StorageError>())
-                    .is_some_and(|inner| {
-                        matches!(inner, StorageError::Busy { .. } | StorageError::Corrupt { .. })
-                    });
-                if attempt < max_retries && is_retryable {
-                    std::thread::sleep(Duration::from_millis(backoff_ms));
-                    backoff_ms = (backoff_ms * 2).min(128);
-                    continue;
-                }
-                return Err(err);
-            }
-        }
-    }
-    Err(anyhow::anyhow!("exhausted retries"))
-}
-
-// =============================================================================
-// 4. CONCURRENT WRITE THROUGHPUT (FrankenConnectionManager)
-// =============================================================================
+// w1b Task B4 (secondary contract #4): this used to benchmark N *real*
+// concurrent frankensqlite MVCC writer connections (`ConnectionManagerConfig
+// { max_writers: 4 }` + `.concurrent_writer()`), each committing its own
+// `BEGIN CONCURRENT` transaction and retrying on snapshot conflicts. That
+// capability is retired -- the process now holds at most 1 live writer
+// connection per db path (`storage::api::WriterHandle`). The benchmark below
+// measures the modern equivalent: N submitter threads racing to push work
+// through the single writer queue, which is the throughput characteristic
+// that actually matters post-B4 (there is no more "4 real writers" scenario
+// to benchmark).
 
 fn bench_concurrent_writes(c: &mut Criterion) {
     let mut group = c.benchmark_group("concurrent_writes");
@@ -622,53 +594,52 @@ fn bench_concurrent_writes(c: &mut Criterion) {
         );
     });
 
-    // ConnectionManager with 4 concurrent writers using raw SQL.
-    // Uses raw INSERT + retry to benchmark the MVCC concurrent write path
-    // independent of the full insert_conversation_tree complexity.
+    // 4 submitter threads racing to push raw INSERTs through one
+    // `WriterHandle` (the post-B4 single-writer queue) -- the direct
+    // replacement for the old "4 real MVCC writers" benchmark above.
     group.throughput(Throughput::Elements(400));
-    group.bench_function("4_writers_raw_400_rows", |b| {
+    group.bench_function("writer_handle_4_submitters_400_rows", |b| {
         b.iter_with_setup(
             || {
                 let temp = TempDir::new().unwrap();
                 let db_path = temp.path().join("bench.db");
-                let fs = FrankenStorage::open(&db_path).unwrap();
-                // Create a simple table for raw concurrent writes
-                fs.raw()
-                    .execute("CREATE TABLE IF NOT EXISTS bench_raw (id INTEGER PRIMARY KEY, tid INTEGER, seq INTEGER, val TEXT)", &[])
-                    .unwrap();
-                drop(fs);
-
-                let config = ConnectionManagerConfig {
-                    reader_count: 2,
-                    max_writers: 4,
-                };
-                let mgr = FrankenConnectionManager::new(&db_path, config).unwrap();
-                (temp, mgr)
+                {
+                    let fs = FrankenStorage::open(&db_path).unwrap();
+                    fs.raw()
+                        .execute("CREATE TABLE IF NOT EXISTS bench_raw (id INTEGER PRIMARY KEY, tid INTEGER, seq INTEGER, val TEXT)", &[])
+                        .unwrap();
+                }
+                let (handle, join) = coding_agent_search::storage::api::WriterHandle::<
+                    coding_agent_search::storage::api::Conn,
+                >::spawn(
+                    db_path.clone(),
+                    coding_agent_search::storage::api::Profile::Production,
+                    Ok,
+                )
+                .unwrap();
+                (temp, handle, join)
             },
-            |(_temp, mgr)| {
+            |(_temp, handle, join)| {
                 std::thread::scope(|s| {
                     for tid in 0..4 {
-                        let m = &mgr;
+                        let h = handle.clone();
                         s.spawn(move || {
                             for seq in 0..100 {
-                                let mut guard = m.concurrent_writer().unwrap();
-                                with_retry(50, || {
-                                    let tx = guard.storage().raw().transaction()?;
-                                    tx.execute(
+                                h.submit(move |conn: &coding_agent_search::storage::api::Conn| {
+                                    conn.execute(
                                         &format!(
                                             "INSERT INTO bench_raw (tid, seq, val) VALUES ({tid}, {seq}, 'bench-{tid}-{seq}')"
                                         ),
                                         &[],
-                                    )?;
-                                    tx.commit().map_err(anyhow::Error::new)?;
-                                    Ok(())
+                                    )
                                 })
-                                .expect("concurrent raw insert should succeed");
-                                guard.mark_committed();
+                                .expect("insert via WriterHandle should succeed");
                             }
                         });
                     }
                 });
+                drop(handle);
+                join.join().expect("writer thread teardown");
             },
         );
     });

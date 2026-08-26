@@ -36,22 +36,19 @@ macro_rules! params {
 /// create a `messages` table and collided with this fixture's own
 /// `CREATE TABLE messages` ("table messages already exists", confirmed by a
 /// baseline-vs-candidate equivalence-gate diff: this file's tests passed on
-/// the pre-Stage-A baseline and failed on Stage A HEAD). Routes through the
-/// schema-free `FrankenConnectionManager` instead, matching the bridge used
-/// by tests/connector_crush.rs and tests/storage.rs's own fixtures.
-fn create_hermes_db(
-    path: &Path,
-) -> coding_agent_search::storage::sqlite::FrankenConnectionManager {
-    let mgr = coding_agent_search::storage::sqlite::FrankenConnectionManager::new(
-        path,
-        coding_agent_search::storage::sqlite::ConnectionManagerConfig {
-            reader_count: 1,
-            max_writers: 1,
-        },
-    )
-    .expect("open hermes db");
+/// the pre-Stage-A baseline and failed on Stage A HEAD). Routes through
+/// `storage::testing::open_test_writer` instead (w1b Task B4 Q3's sanctioned
+/// schema-free bridge for `tests/`, replacing the old `FrankenConnectionManager`
+/// bridge used by tests/connector_crush.rs and tests/storage.rs's own
+/// fixtures). Each caller reopens its own writer afterward -- there is no
+/// shared "manager" to hand back anymore.
+fn create_hermes_db(path: &Path) {
     {
-        let mut guard = mgr.writer().expect("acquire hermes schema writer");
+        let mut guard = coding_agent_search::storage::testing::open_test_writer(
+            path,
+            coding_agent_search::storage::api::Profile::Production,
+        )
+        .expect("open hermes db");
         let conn = guard.storage().raw();
         conn.execute(
             "CREATE TABLE sessions (
@@ -85,7 +82,6 @@ fn create_hermes_db(
         .expect("create messages");
         guard.mark_committed();
     }
-    mgr
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -141,8 +137,8 @@ fn scan_db(path: &Path) -> Vec<NormalizedConversation> {
 fn hermes_happy_path_preserves_session_and_message_fields() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("state.db");
-    let mgr = create_hermes_db(&db_path);
-    let mut guard = mgr.writer().expect("acquire hermes fixture writer");
+    create_hermes_db(&db_path);
+    let mut guard = coding_agent_search::storage::testing::open_test_writer(&db_path, coding_agent_search::storage::api::Profile::Production).expect("acquire hermes fixture writer");
     let conn = guard.storage().raw();
 
     insert_session(
@@ -173,7 +169,6 @@ fn hermes_happy_path_preserves_session_and_message_fields() {
     );
     guard.mark_committed();
     drop(guard);
-    drop(mgr);
 
     let convs = scan_db(&db_path);
     assert_eq!(convs.len(), 1);
@@ -213,8 +208,8 @@ fn hermes_happy_path_preserves_session_and_message_fields() {
 fn hermes_session_without_messages_is_skipped() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("state.db");
-    let mgr = create_hermes_db(&db_path);
-    let mut guard = mgr.writer().expect("acquire hermes fixture writer");
+    create_hermes_db(&db_path);
+    let mut guard = coding_agent_search::storage::testing::open_test_writer(&db_path, coding_agent_search::storage::api::Profile::Production).expect("acquire hermes fixture writer");
     let conn = guard.storage().raw();
 
     // A session row with no message rows must not synthesize a conversation.
@@ -232,7 +227,6 @@ fn hermes_session_without_messages_is_skipped() {
     );
     guard.mark_committed();
     drop(guard);
-    drop(mgr);
 
     assert!(
         scan_db(&db_path).is_empty(),
@@ -244,8 +238,8 @@ fn hermes_session_without_messages_is_skipped() {
 fn hermes_session_meta_role_messages_are_skipped() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("state.db");
-    let mgr = create_hermes_db(&db_path);
-    let mut guard = mgr.writer().expect("acquire hermes fixture writer");
+    create_hermes_db(&db_path);
+    let mut guard = coding_agent_search::storage::testing::open_test_writer(&db_path, coding_agent_search::storage::api::Profile::Production).expect("acquire hermes fixture writer");
     let conn = guard.storage().raw();
 
     insert_session(
@@ -278,7 +272,6 @@ fn hermes_session_meta_role_messages_are_skipped() {
     );
     guard.mark_committed();
     drop(guard);
-    drop(mgr);
 
     let convs = scan_db(&db_path);
     assert_eq!(convs.len(), 1);
@@ -308,27 +301,22 @@ fn hermes_malformed_schema_returns_empty_result_without_panic() {
     // table, so this fixture never actually modeled "messages missing" (the
     // table this test's name claims to cover was present all along, just
     // via cass's own schema, not hermes's). Routes through the same
-    // schema-free `FrankenConnectionManager` bridge used above so only the
-    // fixture's own `sessions` table exists.
+    // schema-free `storage::testing::open_test_writer` bridge used above so
+    // only the fixture's own `sessions` table exists.
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("malformed.db");
-    let mgr = coding_agent_search::storage::sqlite::FrankenConnectionManager::new(
-        &db_path,
-        coding_agent_search::storage::sqlite::ConnectionManagerConfig {
-            reader_count: 1,
-            max_writers: 1,
-        },
-    )
-    .expect("open malformed hermes db");
     {
-        let mut guard = mgr.writer().expect("acquire malformed schema writer");
+        let mut guard = coding_agent_search::storage::testing::open_test_writer(
+            &db_path,
+            coding_agent_search::storage::api::Profile::Production,
+        )
+        .expect("open malformed hermes db");
         let conn = guard.storage().raw();
         // `sessions` exists but `messages` is missing — scan must degrade to empty.
         conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY)", &[])
             .expect("create incomplete sessions table");
         guard.mark_committed();
     }
-    drop(mgr);
 
     assert!(scan_db(&db_path).is_empty());
 }

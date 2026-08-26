@@ -12,8 +12,8 @@ mod tests {
         Fts5SearchMode, detect_search_mode, escape_fts5_query, format_fts5_query,
         validate_fts5_query,
     };
-    use coding_agent_search::storage::api::Conn as FrankenConnection;
-    use coding_agent_search::storage::sqlite::{ConnectionManagerConfig, FrankenConnectionManager};
+    use coding_agent_search::storage::api::{Conn as FrankenConnection, Profile};
+    use coding_agent_search::storage::testing::open_test_writer;
     use std::path::Path;
     use tempfile::TempDir;
 
@@ -36,22 +36,17 @@ mod tests {
     /// migrations first) is not an option here -- it would collide on
     /// `CREATE TABLE conversations`. `storage::api::Conn::open_writable` is
     /// the schema-free public path, but it's deliberately crate-private
-    /// (R2-F3); `FrankenConnectionManager` (a single-writer/single-reader
-    /// pool the production connection-manager code path already uses) is the
-    /// one *public*, schema-free way to reach it from outside the crate.
-    /// `write_fts_fixture` runs the write phase through it and hands back
-    /// nothing; callers that need a connection afterward reopen read-only via
-    /// the always-public `Conn::open_read`, which every remaining query in
-    /// this file only ever needs.
+    /// (R2-F3); `storage::testing::open_test_writer` (w1b Task B4 Q3's
+    /// sanctioned schema-free bridge for `tests/`) is the way to reach it
+    /// from outside the crate. `write_fts_fixture` runs the write phase
+    /// through it and hands back nothing; callers that need a connection
+    /// afterward reopen read-only via the always-public `Conn::open_read`,
+    /// which every remaining query in this file only ever needs.
     fn write_fts_fixture(
         path: &Path,
         write: impl FnOnce(&FrankenConnection) -> Result<()>,
     ) -> Result<()> {
-        let mgr = FrankenConnectionManager::new(
-            path,
-            ConnectionManagerConfig { reader_count: 1, max_writers: 1 },
-        )?;
-        let mut guard = mgr.writer()?;
+        let mut guard = open_test_writer(path, Profile::Production)?;
         write(guard.storage().raw())?;
         guard.mark_committed();
         Ok(())

@@ -22,21 +22,14 @@
 #[test]
 #[ignore = "manual diagnostic for bead mot85; run with --ignored"]
 fn probe_mot85_fsqlite_writable_schema_writes() {
-    use coding_agent_search::storage::sqlite::{ConnectionManagerConfig, FrankenConnectionManager};
+    use coding_agent_search::storage::api::Profile;
+    use coding_agent_search::storage::testing::open_test_writer;
 
     let tmpdir = tempfile::tempdir().unwrap();
     let db_path = tmpdir.path().join("probe.db");
     // No cass migrations here on purpose: this probe tests raw upstream
     // sqlite_master/writable_schema behavior, not cass's own schema.
-    let mgr = FrankenConnectionManager::new(
-        &db_path,
-        ConnectionManagerConfig {
-            reader_count: 1,
-            max_writers: 1,
-        },
-    )
-    .unwrap();
-    let mut guard = mgr.writer().unwrap();
+    let mut guard = open_test_writer(&db_path, Profile::Production).unwrap();
     let conn = guard.storage().raw();
     conn.execute("CREATE TABLE foo (id INTEGER)", &[]).unwrap();
     let pragma = conn.execute("PRAGMA writable_schema = ON", &[]);

@@ -7,10 +7,9 @@
 //! - Backup is created before destructive operations
 
 use coding_agent_search::storage::api::Conn as FrankenConnection;
-use coding_agent_search::storage::sqlite::{
-    CURRENT_SCHEMA_VERSION, ConnectionManagerConfig, FrankenConnectionManager, MigrationError,
-    SqliteStorage,
-};
+use coding_agent_search::storage::api::Profile;
+use coding_agent_search::storage::sqlite::{CURRENT_SCHEMA_VERSION, MigrationError, SqliteStorage};
+use coding_agent_search::storage::testing::{TestWriterGuard, open_test_writer};
 use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
@@ -19,15 +18,8 @@ use tempfile::TempDir;
 /// pre-migration / corrupted schemas that `SqliteStorage::open_or_rebuild`
 /// must detect, so opening through `FrankenStorage::open` (which would
 /// migrate first) defeats the point of the test.
-fn open_fixture_db(path: &Path) -> FrankenConnectionManager {
-    FrankenConnectionManager::new(
-        path,
-        ConnectionManagerConfig {
-            reader_count: 1,
-            max_writers: 1,
-        },
-    )
-    .expect("open frankensqlite fixture database")
+fn open_fixture_db(path: &Path) -> TestWriterGuard {
+    open_test_writer(path, Profile::Production).expect("open frankensqlite fixture database")
 }
 
 // =============================================================================
@@ -42,8 +34,7 @@ fn test_migration_creates_backup() {
 
     // Create database with old schema
     {
-        let mgr = open_fixture_db(&db_path);
-        let mut guard = mgr.writer().unwrap();
+        let mut guard = open_fixture_db(&db_path);
         let conn = guard.storage().raw();
         conn.execute_batch(
             r#"
@@ -130,8 +121,7 @@ fn test_migration_preserves_data() {
 
     // Create database with data
     {
-        let mgr = open_fixture_db(&db_path);
-        let mut guard = mgr.writer().unwrap();
+        let mut guard = open_fixture_db(&db_path);
         let conn = guard.storage().raw();
         conn.execute_batch(&format!(
             r#"
@@ -231,8 +221,7 @@ fn test_migration_handles_corruption() {
 
     // Create a "corrupted" database (incomplete schema)
     {
-        let mgr = open_fixture_db(&db_path);
-        let mut guard = mgr.writer().unwrap();
+        let mut guard = open_fixture_db(&db_path);
         let conn = guard.storage().raw();
         conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)", &[])
             .unwrap();
@@ -315,8 +304,7 @@ fn test_schema_version_5_to_current() {
 
 /// Create a v5 schema database for testing.
 fn create_v5_schema(path: &Path) {
-    let mgr = open_fixture_db(path);
-    let mut guard = mgr.writer().unwrap();
+        let mut guard = open_fixture_db(path);
     let conn = guard.storage().raw();
     conn.execute_batch(
         r#"
@@ -393,8 +381,7 @@ fn test_fts_rebuild() {
 
     // Create database with data but no FTS
     {
-        let mgr = open_fixture_db(&db_path);
-        let mut guard = mgr.writer().unwrap();
+        let mut guard = open_fixture_db(&db_path);
         let conn = guard.storage().raw();
         conn.execute_batch(&format!(
             r#"
@@ -552,8 +539,7 @@ fn test_failed_migration_preserves_original() {
 
     // Create a valid database
     {
-        let mgr = open_fixture_db(&db_path);
-        let mut guard = mgr.writer().unwrap();
+        let mut guard = open_fixture_db(&db_path);
         let conn = guard.storage().raw();
         conn.execute_batch(&format!(
             r#"

@@ -620,161 +620,94 @@ mod tests {
     }
 }
 
-/// Integration coverage: real reader/writer contention on a storage::api-backed
-/// temp DB. Mirrors the proven concurrent-stress pattern (anyhow + downcast to
-/// `StorageError`, `concurrent_writer`) but drives the retry
-/// loop through this module's shared classifier, proving that every MVCC commit
-/// conflict is classified as a retryable contention class (never archive loss),
-/// that bounded retry converges, and that no update is lost.
+
+/// Integration coverage, rewritten for w1b Task B4 (secondary contract #4):
+/// this used to drive real MVCC write-write conflicts through N genuinely
+/// concurrent `FrankenConnectionManager::concurrent_writer()` connections
+/// and assert every conflict classified as `ContentionClass::SnapshotConflict`
+/// (a retryable, non-archive-loss class). B4 retires the capability to have
+/// more than 1 live writer connection on a path at all -- `WriterHandle`
+/// serializes every write through a single dedicated thread, so a real
+/// snapshot conflict can no longer occur here by construction.
+///
+/// This is a deliberate B4/B5 boundary (write-topology inventory §⑥, item
+/// 4, control-plane adjudicated 2026-08-26): B4's job is to make this
+/// compile and pass under the single-writer model; retiring
+/// `ContentionClass::SnapshotConflict` itself from the taxonomy (six
+/// classes -> three) is B5's job. So this test keeps proving the property
+/// that actually matters across the migration -- N threads hammering the
+/// same hot row through `WriterHandle` never lose an update -- without the
+/// now-unreachable conflict-classification assertions.
 #[cfg(test)]
 mod contention_integration_tests {
-    use super::{ContentionClass, StorageError, classify_franken_error};
-    use crate::storage::sqlite::{ConnectionManagerConfig, FrankenConnectionManager, WriterGuard};
+    use crate::storage::api::{Conn, Profile, WriterHandle};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
     use tempfile::TempDir;
 
-    /// One blind-increment transaction against the hot counter row. A fresh
-    /// transaction per call reads the latest committed value, so a retried
-    /// commit lands exactly one increment — no lost updates. Returns the raw
-    /// `anyhow` error so the caller can downcast to `StorageError` and classify
-    /// the contention, mirroring the production retry loop.
-    fn try_increment(guard: &WriterGuard<'_>) -> anyhow::Result<()> {
-        let tx = guard.storage().raw().transaction()?;
-        tx.execute(
-            "UPDATE counter SET v = v + ?1 WHERE id = 1",
-            &crate::storage::api::params![1_i64],
-        )?;
-        tx.commit()?;
-        Ok(())
-    }
-
     #[test]
-    fn concurrent_writers_on_hot_row_classify_as_retryable_contention_and_converge() {
+    fn writer_handle_serializes_hot_row_increments_with_no_lost_updates() {
         let dir = TempDir::new().expect("temp dir");
         let db_path = dir.path().join("contention.db");
-        let config = ConnectionManagerConfig {
-            reader_count: 2,
-            max_writers: 4,
-        };
-        let mgr = FrankenConnectionManager::new(&db_path, config).expect("open manager");
+        let (handle, join) =
+            WriterHandle::<Conn>::spawn(db_path, Profile::Production, Ok).expect("spawn writer");
 
-        // One hot counter row that every writer contends on — maximizes the
-        // chance the MVCC engine raises a real write-write conflict.
-        {
-            let mut guard = mgr.writer().expect("writer");
-            guard
-                .storage()
-                .raw()
-                .execute("CREATE TABLE counter (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)", &[])
-                .expect("create table");
-            guard
-                .storage()
-                .raw()
-                .execute("INSERT INTO counter (id, v) VALUES (1, 0)", &[])
-                .expect("seed counter");
-            guard.mark_committed();
-        }
+        // One hot counter row that every submitter thread contends on --
+        // under the pre-B4 MVCC-concurrent-writer model this was the row
+        // engineered to maximize real write-write conflicts; under
+        // WriterHandle it just exercises normal serialized contention.
+        handle
+            .submit(|conn: &Conn| {
+                conn.execute_batch(
+                    "CREATE TABLE counter (id INTEGER PRIMARY KEY, v INTEGER NOT NULL); \
+                     INSERT INTO counter (id, v) VALUES (1, 0);",
+                )
+            })
+            .expect("seed counter");
 
         let num_threads = 6;
         let incr_per_thread = 60;
-        let classified_conflicts = Arc::new(AtomicUsize::new(0));
-        let archive_loss_seen = Arc::new(AtomicUsize::new(0));
-        let non_contention_errors = Arc::new(AtomicUsize::new(0));
+        let unexpected_errors = Arc::new(AtomicUsize::new(0));
 
         std::thread::scope(|s| {
             for _ in 0..num_threads {
-                let m = &mgr;
-                let conflicts = Arc::clone(&classified_conflicts);
-                let losses = Arc::clone(&archive_loss_seen);
-                let unexpected = Arc::clone(&non_contention_errors);
+                let h = handle.clone();
+                let unexpected = Arc::clone(&unexpected_errors);
                 s.spawn(move || {
                     for _ in 0..incr_per_thread {
-                        let mut attempt: u32 = 0;
-                        loop {
-                            let mut guard = m.concurrent_writer().expect("concurrent writer");
-                            let result = try_increment(&guard);
-
-                            match result {
-                                Ok(()) => {
-                                    guard.mark_committed();
-                                    break;
-                                }
-                                Err(err) => {
-                                    let franken = err
-                                        .downcast_ref::<StorageError>()
-                                        .or_else(|| {
-                                            err.root_cause()
-                                                .downcast_ref::<StorageError>()
-                                        });
-                                    let class = franken.and_then(classify_franken_error);
-                                    match class {
-                                        Some(c) => {
-                                            conflicts.fetch_add(1, Ordering::Relaxed);
-                                            if c.is_archive_loss() {
-                                                losses.fetch_add(1, Ordering::Relaxed);
-                                            }
-                                            // Bounded jittered backoff, capped so
-                                            // the loop can never spin forever.
-                                            attempt += 1;
-                                            assert!(
-                                                attempt < 500,
-                                                "bounded retry must converge, not spin"
-                                            );
-                                            let backoff = (1u64 << attempt.min(8)).min(256);
-                                            std::thread::sleep(Duration::from_millis(backoff));
-                                        }
-                                        None => {
-                                            // A non-contention error here is a
-                                            // genuine failure; record and stop
-                                            // this increment's loop.
-                                            unexpected.fetch_add(1, Ordering::Relaxed);
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
+                        let result = h.submit(|conn: &Conn| {
+                            let tx = conn.transaction()?;
+                            tx.execute("UPDATE counter SET v = v + 1 WHERE id = 1", &[])?;
+                            tx.commit()
+                        });
+                        if result.is_err() {
+                            unexpected.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 });
             }
         });
 
-        // No spurious non-contention error surfaced under pure write contention.
+        // Single-writer serialization means there is structurally no
+        // conflict to retry away -- every submitted increment must simply
+        // succeed.
         assert_eq!(
-            non_contention_errors.load(Ordering::Relaxed),
+            unexpected_errors.load(Ordering::Relaxed),
             0,
-            "all errors under write contention must be contention classes"
+            "WriterHandle must never surface an error under pure write contention"
         );
-        // Contention is never archive loss.
-        assert_eq!(
-            archive_loss_seen.load(Ordering::Relaxed),
-            0,
-            "no contention error may report archive loss"
-        );
-        // Bounded retry converged with no lost updates: the hot counter equals
-        // every successful increment.
-        let reader = mgr.reader();
-        let final_v: i64 = reader
-            .query_row_map("SELECT v FROM counter WHERE id = 1", &[], |row| row.get_typed(0))
+
+        // No lost updates: the hot counter equals every successful increment.
+        let final_v: i64 = handle
+            .submit(|conn: &Conn| conn.query_row_map("SELECT v FROM counter WHERE id = 1", &[], |row| row.get_typed(0)))
             .expect("read counter");
         assert_eq!(
             final_v,
             (num_threads * incr_per_thread) as i64,
             "every increment must be durably applied (no lost updates)"
         );
-        // The classifier was actually exercised by real MVCC contention.
-        let observed = classified_conflicts.load(Ordering::Relaxed);
-        eprintln!("hot-row contention: {observed} classified retryable conflicts");
-        assert!(
-            observed >= 1,
-            "hot-row contention should raise at least one classified conflict"
-        );
-        // Sanity: the contention class observed maps to a busy-or-locked
-        // storage state and is retryable.
-        let busy = ContentionClass::SnapshotConflict;
-        assert!(busy.to_storage_state().is_some());
-        assert!(!busy.is_archive_loss());
+
+        drop(handle);
+        join.join().expect("writer thread teardown");
     }
 }

@@ -25,22 +25,18 @@ macro_rules! params {
 /// create a `messages` table and collided with this fixture's own
 /// `CREATE TABLE messages` ("table messages already exists", confirmed by a
 /// baseline-vs-candidate equivalence-gate diff: this file's tests passed on
-/// the pre-Stage-A baseline and failed on Stage A HEAD). Routes through the
-/// schema-free `FrankenConnectionManager` instead, matching the bridge used
-/// by tests/pages_fts.rs and tests/storage.rs's own fixtures.
-fn create_crush_db(
-    path: &Path,
-) -> coding_agent_search::storage::sqlite::FrankenConnectionManager {
-    let mgr = coding_agent_search::storage::sqlite::FrankenConnectionManager::new(
-        path,
-        coding_agent_search::storage::sqlite::ConnectionManagerConfig {
-            reader_count: 1,
-            max_writers: 1,
-        },
-    )
-    .expect("open crush db");
+/// the pre-Stage-A baseline and failed on Stage A HEAD). Routes through
+/// `storage::testing::open_test_writer` instead (w1b Task B4 Q3's sanctioned
+/// schema-free bridge for `tests/`, replacing the old `FrankenConnectionManager`
+/// bridge used by tests/pages_fts.rs and tests/storage.rs's own fixtures).
+/// Each caller reopens its own writer afterward -- there is no shared
+/// "manager" to hand back anymore, every `open_test_writer` call is an
+/// independent connection on the same path.
+fn create_crush_db(path: &Path) {
     {
-        let mut guard = mgr.writer().expect("acquire crush schema writer");
+        let mut guard =
+            coding_agent_search::storage::testing::open_test_writer(path, coding_agent_search::storage::api::Profile::Production)
+                .expect("open crush db");
         let conn = guard.storage().raw();
         conn.execute(
             "CREATE TABLE sessions (
@@ -65,7 +61,6 @@ fn create_crush_db(
         .expect("create messages");
         guard.mark_committed();
     }
-    mgr
 }
 
 fn scan_db(path: &Path) -> Vec<coding_agent_search::connectors::NormalizedConversation> {
@@ -112,8 +107,8 @@ fn insert_crush_message(
 fn crush_happy_path_preserves_sqlite_session_fields() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("crush.db");
-    let mgr = create_crush_db(&db_path);
-    let mut guard = mgr.writer().expect("acquire crush fixture writer");
+    create_crush_db(&db_path);
+    let mut guard = coding_agent_search::storage::testing::open_test_writer(&db_path, coding_agent_search::storage::api::Profile::Production).expect("acquire crush fixture writer");
     let conn = guard.storage().raw();
 
     conn.execute(
@@ -150,7 +145,6 @@ fn crush_happy_path_preserves_sqlite_session_fields() {
     .expect("insert assistant message");
     guard.mark_committed();
     drop(guard);
-    drop(mgr);
 
     let convs = scan_db(&db_path);
     assert_eq!(convs.len(), 1);
@@ -184,8 +178,8 @@ fn crush_happy_path_preserves_sqlite_session_fields() {
 fn crush_multiple_sessions_ignore_orphans_and_preserve_metadata_ownership() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("crush-multi.db");
-    let mgr = create_crush_db(&db_path);
-    let mut guard = mgr.writer().expect("acquire crush fixture writer");
+    create_crush_db(&db_path);
+    let mut guard = coding_agent_search::storage::testing::open_test_writer(&db_path, coding_agent_search::storage::api::Profile::Production).expect("acquire crush fixture writer");
     let conn = guard.storage().raw();
 
     // Insert sessions in reverse lexical order; the connector contract sorts
@@ -231,7 +225,6 @@ fn crush_multiple_sessions_ignore_orphans_and_preserve_metadata_ownership() {
     );
     guard.mark_committed();
     drop(guard);
-    drop(mgr);
 
     let convs = scan_db(&db_path);
     assert_eq!(
@@ -290,27 +283,23 @@ fn crush_malformed_schema_returns_empty_result_without_panic() {
     // table, so the incomplete-schema fixture below never actually modeled
     // "messages missing" (the table this test's name claims to cover was
     // present all along, just via cass's own schema, not crush's). Routes
-    // through the same schema-free `FrankenConnectionManager` bridge as
-    // `create_crush_db` above so only the fixture's own `sessions` table
-    // exists and the "messages missing" branch is genuinely exercised.
+    // through the same schema-free `storage::testing::open_test_writer`
+    // bridge as `create_crush_db` above so only the fixture's own
+    // `sessions` table exists and the "messages missing" branch is
+    // genuinely exercised.
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("malformed.db");
-    let mgr = coding_agent_search::storage::sqlite::FrankenConnectionManager::new(
-        &db_path,
-        coding_agent_search::storage::sqlite::ConnectionManagerConfig {
-            reader_count: 1,
-            max_writers: 1,
-        },
-    )
-    .expect("open malformed crush db");
     {
-        let mut guard = mgr.writer().expect("acquire malformed schema writer");
+        let mut guard = coding_agent_search::storage::testing::open_test_writer(
+            &db_path,
+            coding_agent_search::storage::api::Profile::Production,
+        )
+        .expect("open malformed crush db");
         let conn = guard.storage().raw();
         conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY)", &[])
             .expect("create incomplete sessions table");
         guard.mark_committed();
     }
-    drop(mgr);
 
     assert!(scan_db(&db_path).is_empty());
 }

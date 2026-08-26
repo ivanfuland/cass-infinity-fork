@@ -7,10 +7,9 @@
 //! - Missing optional fields have sensible defaults
 
 use coding_agent_search::pages::encrypt::{EncryptionConfig, KdfAlgorithm, SlotType};
-use coding_agent_search::storage::sqlite::{
-    CURRENT_SCHEMA_VERSION, ConnectionManagerConfig, FrankenConnectionManager, MigrationError,
-    SqliteStorage,
-};
+use coding_agent_search::storage::api::Profile;
+use coding_agent_search::storage::sqlite::{CURRENT_SCHEMA_VERSION, MigrationError, SqliteStorage};
+use coding_agent_search::storage::testing::{TestWriterGuard, open_test_writer};
 use serde_json::json;
 use std::path::Path;
 use tempfile::TempDir;
@@ -30,15 +29,8 @@ const _: () = {
 /// pre-migration schemas that `SqliteStorage::open_or_rebuild` must detect,
 /// so opening through `FrankenStorage::open` (which would migrate first)
 /// defeats the point of the test.
-fn open_fixture_db(path: &Path) -> FrankenConnectionManager {
-    FrankenConnectionManager::new(
-        path,
-        ConnectionManagerConfig {
-            reader_count: 1,
-            max_writers: 1,
-        },
-    )
-    .expect("open frankensqlite fixture database")
+fn open_fixture_db(path: &Path) -> TestWriterGuard {
+    open_test_writer(path, Profile::Production).expect("open frankensqlite fixture database")
 }
 
 // =============================================================================
@@ -78,8 +70,7 @@ fn test_detects_older_schema() {
 
     // Create a minimal old-style database
     {
-        let mgr = open_fixture_db(&db_path);
-        let mut guard = mgr.writer().unwrap();
+        let mut guard = open_fixture_db(&db_path);
         let conn = guard.storage().raw();
         conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)", &[])
             .unwrap();
@@ -128,8 +119,7 @@ fn test_ignores_unknown_tables() {
 
     // Add extra tables that a future version might have
     {
-        let mgr = open_fixture_db(&db_path);
-        let mut guard = mgr.writer().unwrap();
+        let mut guard = open_fixture_db(&db_path);
         let conn = guard.storage().raw();
         conn.execute(
             "CREATE TABLE future_feature (
@@ -167,8 +157,7 @@ fn test_handles_missing_optional_columns() {
 
     // Create a database with minimal required structure
     {
-        let mgr = open_fixture_db(&db_path);
-        let mut guard = mgr.writer().unwrap();
+        let mut guard = open_fixture_db(&db_path);
         let conn = guard.storage().raw();
         conn.execute_batch(
             r#"
@@ -410,8 +399,7 @@ fn test_reject_schema_version_0() {
     let db_path = dir.path().join("ancient.db");
 
     {
-        let mgr = open_fixture_db(&db_path);
-        let mut guard = mgr.writer().unwrap();
+        let mut guard = open_fixture_db(&db_path);
         let conn = guard.storage().raw();
         conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)", &[])
             .unwrap();
@@ -461,8 +449,7 @@ fn test_search_without_fts() {
 
     // Create database without FTS
     {
-        let mgr = open_fixture_db(&db_path);
-        let mut guard = mgr.writer().unwrap();
+        let mut guard = open_fixture_db(&db_path);
         let conn = guard.storage().raw();
         conn.execute_batch(&format!(
             r#"

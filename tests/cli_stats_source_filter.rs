@@ -1,5 +1,6 @@
 use assert_cmd::cargo::cargo_bin_cmd;
-use coding_agent_search::storage::sqlite::{ConnectionManagerConfig, FrankenConnectionManager};
+use coding_agent_search::storage::api::Profile;
+use coding_agent_search::storage::testing::open_test_writer;
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -23,18 +24,10 @@ fn stats_source_filter_preserves_date_range() {
 
     // Minimal schema required by `cass stats` queries. Reuses cass's real
     // table names with a simplified column set, so this must stay on the
-    // schema-free FrankenConnectionManager path rather than
+    // schema-free `storage::testing::open_test_writer` path rather than
     // `FrankenStorage::open`, which would apply cass's real migrations
     // first and collide on `CREATE TABLE conversations`.
-    let mgr = FrankenConnectionManager::new(
-        &db_path,
-        ConnectionManagerConfig {
-            reader_count: 1,
-            max_writers: 1,
-        },
-    )
-    .expect("open db");
-    let mut guard = mgr.writer().expect("acquire fixture writer");
+    let mut guard = open_test_writer(&db_path, Profile::Production).expect("open db");
     let conn = guard.storage().raw();
     conn.execute(
         "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL)",
@@ -85,7 +78,6 @@ fn stats_source_filter_preserves_date_range() {
     .expect("insert message");
     guard.mark_committed();
     drop(guard);
-    drop(mgr);
 
     let out = cargo_bin_cmd!("cass")
         .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")

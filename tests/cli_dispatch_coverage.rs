@@ -12,28 +12,23 @@ use coding_agent_search::evidence_bundle::{
     EvidenceBundleChunk, EvidenceBundleChunkRole, EvidenceBundleKind, EvidenceBundleManifest,
 };
 use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
-use coding_agent_search::storage::api::Conn as FrankenConnection;
-use coding_agent_search::storage::sqlite::{ConnectionManagerConfig, FrankenConnectionManager};
+use coding_agent_search::storage::api::{Conn as FrankenConnection, Profile};
+use coding_agent_search::storage::testing::open_test_writer;
 use predicates::prelude::*;
 
 /// Stage A note: `storage::api::Conn::open_writable` is deliberately
 /// crate-private (R2-F3), so this integration test (a separate crate)
 /// bootstraps a deliberately-malformed/incomplete-schema fixture through
-/// `FrankenConnectionManager` (a single-writer/single-reader pool the
-/// production connection-manager code path already uses) -- the one
-/// *public*, schema-free way to reach it from outside the crate.
-/// `FrankenStorage::open` is not an option for these two malformed-schema
-/// fixtures specifically: it would apply cass's real migrations first,
-/// defeating the point of a schema that's deliberately missing/incomplete.
+/// `storage::testing::open_test_writer` (w1b Task B4 Q3's sanctioned
+/// schema-free bridge for `tests/`) -- `FrankenStorage::open` is not an
+/// option for these two malformed-schema fixtures specifically: it would
+/// apply cass's real migrations first, defeating the point of a schema
+/// that's deliberately missing/incomplete.
 fn with_writable_db<R>(
     path: &std::path::Path,
     write: impl FnOnce(&FrankenConnection) -> anyhow::Result<R>,
 ) -> anyhow::Result<R> {
-    let mgr = FrankenConnectionManager::new(
-        path,
-        ConnectionManagerConfig { reader_count: 1, max_writers: 1 },
-    )?;
-    let mut guard = mgr.writer()?;
+    let mut guard = open_test_writer(path, Profile::Production)?;
     let result = write(guard.storage().raw())?;
     guard.mark_committed();
     Ok(result)

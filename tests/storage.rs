@@ -2,10 +2,9 @@ use std::path::{Path, PathBuf};
 
 use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
 use coding_agent_search::sources::provenance::{LOCAL_SOURCE_ID, Source, SourceKind};
-use coding_agent_search::storage::api::Value as ParamValue;
-use coding_agent_search::storage::sqlite::{
-    ConnectionManagerConfig, FrankenConnectionManager, MigrationError, SqliteStorage,
-};
+use coding_agent_search::storage::api::{Profile, Value as ParamValue};
+use coding_agent_search::storage::sqlite::{MigrationError, SqliteStorage};
+use coding_agent_search::storage::testing::{TestWriterGuard, open_test_writer};
 
 /// Fix (plan delta d8 investigation, 2026-08-25): these fixtures deliberately
 /// build legacy/pre-migration schemas (v1..v4, future) that
@@ -15,17 +14,12 @@ use coding_agent_search::storage::sqlite::{
 /// meta` and produced "table meta already exists" panics (confirmed by a
 /// baseline-vs-candidate equivalence-gate diff: this file's tests passed on
 /// the pre-Stage-A baseline and failed on Stage A HEAD). Routes through
-/// `FrankenConnectionManager` instead, matching the bridge already used by
-/// the sibling upgrade/migration.rs and upgrade/compatibility.rs fixtures.
-fn open_fixture_db(path: impl AsRef<Path>) -> FrankenConnectionManager {
-    FrankenConnectionManager::new(
-        path.as_ref(),
-        ConnectionManagerConfig {
-            reader_count: 1,
-            max_writers: 1,
-        },
-    )
-    .expect("open cass fixture database")
+/// `storage::testing::open_test_writer` (w1b Task B4 Q3's sanctioned
+/// schema-free bridge for `tests/`, replacing the old
+/// `FrankenConnectionManager` bridge this and the sibling
+/// upgrade/migration.rs and upgrade/compatibility.rs fixtures used to share).
+fn open_fixture_db(path: impl AsRef<Path>) -> TestWriterGuard {
+    open_test_writer(path.as_ref(), Profile::Production).expect("open cass fixture database")
 }
 
 fn sample_agent() -> Agent {
@@ -787,13 +781,10 @@ fn migration_from_v1_requires_rebuild() {
 
     // Manually create a v1 database
     {
-        let mgr = open_fixture_db(&db_path);
-        let mut guard = mgr.writer().expect("acquire fixture writer");
+        let mut guard = open_fixture_db(&db_path);
         let conn = guard.storage().raw();
         conn.execute_batch(
             r"
-            PRAGMA foreign_keys = ON;
-
             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             INSERT INTO meta(key, value) VALUES('schema_version', '1');
 
@@ -894,13 +885,10 @@ fn migration_from_v2_requires_rebuild() {
 
     // Manually create a v2 database with FTS5 table
     {
-        let mgr = open_fixture_db(&db_path);
-        let mut guard = mgr.writer().expect("acquire fixture writer");
+        let mut guard = open_fixture_db(&db_path);
         let conn = guard.storage().raw();
         conn.execute_batch(
             r"
-            PRAGMA foreign_keys = ON;
-
             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             INSERT INTO meta(key, value) VALUES('schema_version', '2');
 
@@ -1287,13 +1275,10 @@ fn migration_from_v3_requires_rebuild() {
 
     // Manually create a v3 database (without sources table)
     {
-        let mgr = open_fixture_db(&db_path);
-        let mut guard = mgr.writer().expect("acquire fixture writer");
+        let mut guard = open_fixture_db(&db_path);
         let conn = guard.storage().raw();
         conn.execute_batch(
             r"
-            PRAGMA foreign_keys = ON;
-
             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             INSERT INTO meta(key, value) VALUES('schema_version', '3');
 
@@ -1531,12 +1516,10 @@ fn open_or_rebuild_requires_rebuild_for_legacy_v4_schema() {
 
     // Create a v4 database (without provenance columns in conversations)
     {
-        let mgr = open_fixture_db(&db_path);
-        let mut guard = mgr.writer().expect("acquire fixture writer");
+        let mut guard = open_fixture_db(&db_path);
         let conn = guard.storage().raw();
         conn.execute_batch(
             r"
-            PRAGMA foreign_keys = ON;
             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             INSERT INTO meta(key, value) VALUES('schema_version', '4');
 
@@ -1653,8 +1636,7 @@ fn open_or_rebuild_triggers_rebuild_for_future_version() {
 
     // Create a database with a future schema version
     {
-        let mgr = open_fixture_db(&db_path);
-        let mut guard = mgr.writer().expect("acquire fixture writer");
+        let mut guard = open_fixture_db(&db_path);
         let conn = guard.storage().raw();
         conn.execute_batch(
             r"

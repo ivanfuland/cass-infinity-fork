@@ -1,9 +1,11 @@
 use assert_cmd::Command;
 use coding_agent_search::search::tantivy::expected_index_dir;
 use coding_agent_search::storage::api::Conn as FrankenConnection;
+use coding_agent_search::storage::api::Profile;
 use coding_agent_search::storage::api::StorageError as FrankenError;
 use coding_agent_search::storage::api::Value as ParamValue;
-use coding_agent_search::storage::sqlite::{ConnectionManagerConfig, FrankenConnectionManager, FrankenStorage};
+use coding_agent_search::storage::sqlite::FrankenStorage;
+use coding_agent_search::storage::testing::open_test_writer;
 use fs2::FileExt;
 use serde_json::{Value, json};
 
@@ -266,22 +268,17 @@ fn seed_healthy_empty_index(test_home: &Path, data_dir: &Path) {
 /// baseline-vs-candidate diff) leaves a frankensqlite `-fsqlite-ns-gate`
 /// namespace sidecar the pre-migration bare `frankensqlite::Connection::open`
 /// never did, tripping `doctor archive export`'s asset-manifest accounting.
-/// Routes through `FrankenConnectionManager` instead — same schema-free
-/// bridge as the `tests/storage.rs` fix in `7bd20321`. Other `open_raw()`
-/// call sites in this file reopen a db a prior `cass index` CLI run already
-/// migrated (just inserting extra fixture rows into existing tables) and are
-/// unaffected by this fixture's schema, so they're left on `open_raw()`.
+/// Routes through `storage::testing::open_test_writer` instead (w1b Task B4
+/// Q3's sanctioned schema-free bridge for `tests/`, replacing the old
+/// `FrankenConnectionManager` bridge the `tests/storage.rs` fix in
+/// `7bd20321` used). Other `open_raw()` call sites in this file reopen a db
+/// a prior `cass index` CLI run already migrated (just inserting extra
+/// fixture rows into existing tables) and are unaffected by this fixture's
+/// schema, so they're left on `open_raw()`.
 fn write_test_sqlite_db(path: &Path, marker: &str) {
     fs::create_dir_all(path.parent().expect("sqlite db parent")).expect("create sqlite db parent");
-    let mgr = FrankenConnectionManager::new(
-        path,
-        ConnectionManagerConfig {
-            reader_count: 1,
-            max_writers: 1,
-        },
-    )
-    .expect("open schema-free fixture database");
-    let mut guard = mgr.writer().expect("acquire fixture writer");
+    let mut guard =
+        open_test_writer(path, Profile::Production).expect("open schema-free fixture database");
     let conn = guard.storage().raw();
     conn.execute(
         "CREATE TABLE restore_probe(marker TEXT NOT NULL)",

@@ -5,8 +5,8 @@
 
 use chrono::{TimeZone, Utc};
 use coding_agent_search::pages::export::{ExportEngine, ExportFilter, PathMode};
-use coding_agent_search::storage::api::{Conn as Connection, Row as FrankenRow};
-use coding_agent_search::storage::sqlite::{ConnectionManagerConfig, FrankenConnectionManager};
+use coding_agent_search::storage::api::{Conn as Connection, Profile, Row as FrankenRow};
+use coding_agent_search::storage::testing::open_test_writer;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -32,18 +32,14 @@ macro_rules! fparams {
 /// `FrankenStorage::open` (which would apply cass's real migrations first)
 /// is not an option -- it would collide on `CREATE TABLE conversations`.
 /// `storage::api::Conn::open_writable` is the schema-free public path, but
-/// it's deliberately crate-private (R2-F3); `FrankenConnectionManager` (a
-/// single-writer/single-reader pool the production connection-manager code
-/// path already uses) is the one *public*, schema-free way to reach it from
-/// outside the crate. Every `src_conn` fixture below now goes through this;
-/// every `out_conn`/`preserved_conn` reopen is read-only (verification
-/// queries only) and uses the always-public `open_db` (now `open_read`).
+/// it's deliberately crate-private (R2-F3); `storage::testing::open_test_writer`
+/// (w1b Task B4 Q3's sanctioned schema-free bridge for `tests/`) is the way
+/// to reach it from outside the crate. Every `src_conn` fixture below now
+/// goes through this; every `out_conn`/`preserved_conn` reopen is read-only
+/// (verification queries only) and uses the always-public `open_db` (now
+/// `open_read`).
 fn with_writable_db<R>(path: &Path, write: impl FnOnce(&Connection) -> TestResult<R>) -> TestResult<R> {
-    let mgr = FrankenConnectionManager::new(
-        path,
-        ConnectionManagerConfig { reader_count: 1, max_writers: 1 },
-    )?;
-    let mut guard = mgr.writer()?;
+    let mut guard = open_test_writer(path, Profile::Production)?;
     let result = write(guard.storage().raw())?;
     guard.mark_committed();
     Ok(result)

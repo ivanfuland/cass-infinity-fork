@@ -54024,16 +54024,20 @@ fn run_doctor_archive_db_post_repair_probe(
         }),
     );
 
-    let manager = match crate::storage::sqlite::FrankenConnectionManager::new(
+    // w1b Task B4: this used to go through `FrankenConnectionManager` (a
+    // reader pool + writer-token semaphore) purely to reach a writable
+    // connection past `Conn::open_writable`'s `pub(crate)` visibility --
+    // this module is inside the crate, so it can call it directly. The
+    // semaphore/pool machinery `FrankenConnectionManager` provided was
+    // never actually needed here: this probe opens exactly one connection,
+    // uses it, and closes it.
+    let writer_conn = match crate::storage::api::Conn::open_writable(
         db_path,
-        crate::storage::sqlite::ConnectionManagerConfig {
-            reader_count: 1,
-            max_writers: 1,
-        },
+        crate::storage::api::Profile::Production,
     ) {
-        Ok(manager) => {
-            steps.push("open_production_connection_manager".to_string());
-            manager
+        Ok(conn) => {
+            steps.push("open_writable_connection".to_string());
+            conn
         }
         Err(err) => {
             return doctor_post_repair_probe_report(
@@ -54041,9 +54045,7 @@ fn run_doctor_archive_db_post_repair_probe(
                 doctor_post_repair_probe_outcome(
                     "fail",
                     doctor_post_repair_probe_duration_ms(start),
-                    Some(format!(
-                        "failed to open archive DB through production frankensqlite manager: {err}"
-                    )),
+                    Some(format!("failed to open archive DB writer: {err}")),
                     true,
                     true,
                     false,
@@ -54052,28 +54054,7 @@ fn run_doctor_archive_db_post_repair_probe(
             );
         }
     };
-
-    let writer = match manager.writer() {
-        Ok(writer) => {
-            steps.push("acquire_production_writer".to_string());
-            writer
-        }
-        Err(err) => {
-            return doctor_post_repair_probe_report(
-                target,
-                doctor_post_repair_probe_outcome(
-                    "fail",
-                    doctor_post_repair_probe_duration_ms(start),
-                    Some(format!("failed to acquire archive DB writer: {err}")),
-                    true,
-                    true,
-                    false,
-                    steps,
-                ),
-            );
-        }
-    };
-    let conn = writer.storage().raw();
+    let conn = &writer_conn;
     if let Err(err) = conn.execute("BEGIN;", &[]) {
         return doctor_post_repair_probe_report(
             target,
@@ -54216,8 +54197,7 @@ fn run_doctor_archive_db_post_repair_probe(
     }
     let rollback_confirmed = true;
     steps.push("rollback_probe_transaction".to_string());
-    drop(writer);
-    drop(manager);
+    drop(writer_conn);
 
     let conn = match open_franken_cli_read_db(
         db_path.to_path_buf(),
@@ -59595,7 +59575,7 @@ mod doctor_asset_taxonomy_tests {
                 .failure_reason
                 .as_deref()
                 .unwrap_or_default()
-                .contains("production frankensqlite manager"),
+                .contains("failed to open archive DB writer"),
             "failure should name production open path: {probe:#?}"
         );
     }
