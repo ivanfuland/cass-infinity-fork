@@ -15297,142 +15297,159 @@ impl FrankenStorage {
             "token_daily_stats_rebuild_start"
         );
 
-        let mut tx = self.conn.transaction()?;
-        tx.execute("DELETE FROM token_daily_stats", &[])?;
+        // w1b Task B3 (D2, control-plane 2026-08-26): with_tx_no_replay,
+        // TxMode::Immediate. Write transactions use Immediate (BEGIN takes
+        // the write lock immediately), which structurally cannot hit a
+        // mid-transaction Busy{Snapshot} upgrade conflict -- only a
+        // Busy{Statement} at BEGIN, already covered by statement-level
+        // retry. So there is nothing for with_tx's replay to actually
+        // catch here, only cost: this loop scans every conversation and
+        // every token_usage row in the database, and a replay would mean
+        // redoing that whole scan. no_replay makes "this transaction
+        // shouldn't be replayed" the explicit, load-bearing choice it is,
+        // not an accident of Busy{Snapshot} happening not to fire today.
+        let rows_created = self.conn.with_tx_no_replay(
+            TxMode::Immediate,
+            |tx| -> Result<usize, StorageError> {
+                (|| -> Result<usize> {
+                    tx.execute("DELETE FROM token_daily_stats", &[])?;
 
-        let mut last_conversation_id = 0_i64;
-        let mut rows_created = 0_usize;
+                    let mut last_conversation_id = 0_i64;
+                    let mut rows_created = 0_usize;
 
-        loop {
-            let conversation_rows = tx.query_all_map(
-                "SELECT c.id, c.started_at, c.source_id,
-                        COALESCE((SELECT a.slug FROM agents a WHERE a.id = c.agent_id), 'unknown')
-                 FROM conversations c
-                 WHERE c.id > ?1
-                 ORDER BY c.id
-                 LIMIT ?2",
-                fparams![last_conversation_id, CONVERSATION_BATCH_SIZE as i64],
-                |row| {
-                    Ok((
-                        row.get_typed::<i64>(0)?,
-                        row.get_typed::<Option<i64>>(1)?,
-                        row.get_typed::<String>(2)?,
-                        row.get_typed::<String>(3)?,
-                    ))
-                },
-            )?;
-            if conversation_rows.is_empty() {
-                break;
-            }
-
-            let mut aggregate = TokenStatsAggregator::new();
-
-            for (conversation_id, started_at, source_id, agent_slug) in conversation_rows {
-                last_conversation_id = conversation_id;
-                let conversation_day_id = started_at.map(Self::day_id_from_millis).unwrap_or(0);
-                let mut last_token_usage_id = 0_i64;
-                let mut session_model_family = String::from("unknown");
-
-                loop {
-                    let usage_rows = tx.query_all_map(
-                        "SELECT id, day_id, role,
-                                COALESCE(model_family, 'unknown'),
-                                input_tokens, output_tokens, cache_read_tokens,
-                                cache_creation_tokens, thinking_tokens,
-                                has_tool_calls, tool_call_count,
-                                content_chars, estimated_cost_usd
-                         FROM token_usage
-                         WHERE conversation_id = ?1
-                           AND id > ?2
-                         ORDER BY id
-                         LIMIT ?3",
-                        fparams![
-                            conversation_id,
-                            last_token_usage_id,
-                            TOKEN_USAGE_BATCH_SIZE as i64
-                        ],
+                    loop {
+                    let conversation_rows = tx.query_all_map(
+                        "SELECT c.id, c.started_at, c.source_id,
+                                COALESCE((SELECT a.slug FROM agents a WHERE a.id = c.agent_id), 'unknown')
+                         FROM conversations c
+                         WHERE c.id > ?1
+                         ORDER BY c.id
+                         LIMIT ?2",
+                        fparams![last_conversation_id, CONVERSATION_BATCH_SIZE as i64],
                         |row| {
                             Ok((
                                 row.get_typed::<i64>(0)?,
-                                row.get_typed::<i64>(1)?,
+                                row.get_typed::<Option<i64>>(1)?,
                                 row.get_typed::<String>(2)?,
                                 row.get_typed::<String>(3)?,
-                                row.get_typed::<Option<i64>>(4)?,
-                                row.get_typed::<Option<i64>>(5)?,
-                                row.get_typed::<Option<i64>>(6)?,
-                                row.get_typed::<Option<i64>>(7)?,
-                                row.get_typed::<Option<i64>>(8)?,
-                                row.get_typed::<i64>(9)?,
-                                row.get_typed::<i64>(10)?,
-                                row.get_typed::<i64>(11)?,
-                                row.get_typed::<Option<f64>>(12)?,
                             ))
                         },
                     )?;
-                    if usage_rows.is_empty() {
+                    if conversation_rows.is_empty() {
                         break;
                     }
 
-                    for (
-                        token_usage_id,
-                        day_id,
-                        role,
-                        model_family,
-                        input_tokens,
-                        output_tokens,
-                        cache_read_tokens,
-                        cache_creation_tokens,
-                        thinking_tokens,
-                        has_tool_calls,
-                        tool_call_count,
-                        content_chars,
-                        estimated_cost_usd,
-                    ) in usage_rows
-                    {
-                        last_token_usage_id = token_usage_id;
-                        if model_family != "unknown" {
-                            session_model_family = model_family.clone();
+                    let mut aggregate = TokenStatsAggregator::new();
+
+                    for (conversation_id, started_at, source_id, agent_slug) in conversation_rows {
+                        last_conversation_id = conversation_id;
+                        let conversation_day_id = started_at.map(Self::day_id_from_millis).unwrap_or(0);
+                        let mut last_token_usage_id = 0_i64;
+                        let mut session_model_family = String::from("unknown");
+
+                        loop {
+                            let usage_rows = tx.query_all_map(
+                                "SELECT id, day_id, role,
+                                        COALESCE(model_family, 'unknown'),
+                                        input_tokens, output_tokens, cache_read_tokens,
+                                        cache_creation_tokens, thinking_tokens,
+                                        has_tool_calls, tool_call_count,
+                                        content_chars, estimated_cost_usd
+                                 FROM token_usage
+                                 WHERE conversation_id = ?1
+                                   AND id > ?2
+                                 ORDER BY id
+                                 LIMIT ?3",
+                                fparams![
+                                    conversation_id,
+                                    last_token_usage_id,
+                                    TOKEN_USAGE_BATCH_SIZE as i64
+                                ],
+                                |row| {
+                                    Ok((
+                                        row.get_typed::<i64>(0)?,
+                                        row.get_typed::<i64>(1)?,
+                                        row.get_typed::<String>(2)?,
+                                        row.get_typed::<String>(3)?,
+                                        row.get_typed::<Option<i64>>(4)?,
+                                        row.get_typed::<Option<i64>>(5)?,
+                                        row.get_typed::<Option<i64>>(6)?,
+                                        row.get_typed::<Option<i64>>(7)?,
+                                        row.get_typed::<Option<i64>>(8)?,
+                                        row.get_typed::<i64>(9)?,
+                                        row.get_typed::<i64>(10)?,
+                                        row.get_typed::<i64>(11)?,
+                                        row.get_typed::<Option<f64>>(12)?,
+                                    ))
+                                },
+                            )?;
+                            if usage_rows.is_empty() {
+                                break;
+                            }
+
+                            for (
+                                token_usage_id,
+                                day_id,
+                                role,
+                                model_family,
+                                input_tokens,
+                                output_tokens,
+                                cache_read_tokens,
+                                cache_creation_tokens,
+                                thinking_tokens,
+                                has_tool_calls,
+                                tool_call_count,
+                                content_chars,
+                                estimated_cost_usd,
+                            ) in usage_rows
+                            {
+                                last_token_usage_id = token_usage_id;
+                                if model_family != "unknown" {
+                                    session_model_family = model_family.clone();
+                                }
+                                let usage = crate::connectors::ExtractedTokenUsage {
+                                    model_name: None,
+                                    provider: None,
+                                    input_tokens,
+                                    output_tokens,
+                                    cache_read_tokens,
+                                    cache_creation_tokens,
+                                    thinking_tokens,
+                                    service_tier: None,
+                                    has_tool_calls: has_tool_calls != 0,
+                                    tool_call_count: u32::try_from(tool_call_count.max(0)).unwrap_or(0),
+                                    data_source: franken_agent_detection::TokenDataSource::Api,
+                                };
+                                aggregate.record(
+                                    &agent_slug,
+                                    &source_id,
+                                    day_id,
+                                    &model_family,
+                                    &role,
+                                    &usage,
+                                    content_chars,
+                                    estimated_cost_usd.unwrap_or(0.0),
+                                );
+                            }
                         }
-                        let usage = crate::connectors::ExtractedTokenUsage {
-                            model_name: None,
-                            provider: None,
-                            input_tokens,
-                            output_tokens,
-                            cache_read_tokens,
-                            cache_creation_tokens,
-                            thinking_tokens,
-                            service_tier: None,
-                            has_tool_calls: has_tool_calls != 0,
-                            tool_call_count: u32::try_from(tool_call_count.max(0)).unwrap_or(0),
-                            data_source: franken_agent_detection::TokenDataSource::Api,
-                        };
-                        aggregate.record(
+
+                        aggregate.record_session(
                             &agent_slug,
                             &source_id,
-                            day_id,
-                            &model_family,
-                            &role,
-                            &usage,
-                            content_chars,
-                            estimated_cost_usd.unwrap_or(0.0),
+                            conversation_day_id,
+                            &session_model_family,
                         );
                     }
+
+                    let entries = aggregate.expand();
+                    rows_created = rows_created.saturating_add(entries.len());
+                    franken_update_token_daily_stats_batched_in_tx(tx, &entries)?;
                 }
-
-                aggregate.record_session(
-                    &agent_slug,
-                    &source_id,
-                    conversation_day_id,
-                    &session_model_family,
-                );
-            }
-
-            let entries = aggregate.expand();
-            rows_created = rows_created.saturating_add(entries.len());
-            franken_update_token_daily_stats_batched_in_tx(&tx, &entries)?;
-        }
-
-        tx.commit()?;
+                    Ok(rows_created)
+                })()
+                .map_err(anyhow_error_into_storage_error)
+            },
+        )?;
 
         tracing::info!(
             target: "cass::analytics",
@@ -15459,184 +15476,200 @@ impl FrankenStorage {
             "analytics_rebuild_start"
         );
 
-        let mut tx = self.conn.transaction()?;
+        // w1b Task B3 (D2, control-plane 2026-08-26): with_tx_no_replay,
+        // TxMode::Immediate -- same reasoning as rebuild_token_daily_stats
+        // just above: Immediate structurally rules out a mid-transaction
+        // Busy{Snapshot} conflict, so replay has nothing to catch here,
+        // only the cost of redoing a full messages-table scan.
+        let (total_inserted, usage_hourly_rows, usage_daily_rows, usage_models_daily_rows) =
+            self.conn.with_tx_no_replay(
+                TxMode::Immediate,
+                |tx| -> Result<(usize, usize, usize, usize), StorageError> {
+                    (|| -> Result<(usize, usize, usize, usize)> {
+                tx.execute("DELETE FROM message_metrics", &[])?;
+                tx.execute("DELETE FROM usage_hourly", &[])?;
+                tx.execute("DELETE FROM usage_daily", &[])?;
+                tx.execute("DELETE FROM usage_models_daily", &[])?;
 
-        tx.execute("DELETE FROM message_metrics", &[])?;
-        tx.execute("DELETE FROM usage_hourly", &[])?;
-        tx.execute("DELETE FROM usage_daily", &[])?;
-        tx.execute("DELETE FROM usage_models_daily", &[])?;
+                const CHUNK_SIZE: i64 = 10_000;
+                let mut offset: i64 = 0;
+                let mut total_inserted: usize = 0;
+                let mut usage_hourly_rows: usize = 0;
+                let mut usage_daily_rows: usize = 0;
+                let mut usage_models_daily_rows: usize = 0;
 
-        const CHUNK_SIZE: i64 = 10_000;
-        let mut offset: i64 = 0;
-        let mut total_inserted: usize = 0;
-        let mut usage_hourly_rows: usize = 0;
-        let mut usage_daily_rows: usize = 0;
-        let mut usage_models_daily_rows: usize = 0;
+                loop {
+                    #[allow(clippy::type_complexity)]
+                    let rows: Vec<(
+                        i64,
+                        String,
+                        String,
+                        Option<serde_json::Value>,
+                        Option<i64>,
+                        Option<i64>,
+                        String,
+                        Option<i64>,
+                        String,
+                    )> = tx.query_all_map(
+                        // Avoid the 3-table JOIN with LIMIT/OFFSET that triggers
+                        // frankensqlite's materialization fallback (see 860acb12).
+                        // Inline the agent slug lookup as a correlated subquery and
+                        // fall back to 'unknown' for NULL agent_id, matching the
+                        // FTS / lexical rebuild paths.
+                        "SELECT m.id, m.idx, m.role, m.content, m.extra_json, m.extra_bin,
+                                m.created_at,
+                                c.id AS conv_id, c.started_at AS conv_started_at,
+                                c.source_id, c.workspace_id,
+                                COALESCE((SELECT a.slug FROM agents a WHERE a.id = c.agent_id), 'unknown') AS agent_slug
+                         FROM messages m
+                         JOIN conversations c ON m.conversation_id = c.id
+                         ORDER BY m.id
+                         LIMIT ?1 OFFSET ?2",
+                        fparams![CHUNK_SIZE, offset],
+                        |row| {
+                            let msg_id: i64 = row.get_typed(0)?;
+                            let role: String = row.get_typed(2)?;
+                            let content: String = row.get_typed(3)?;
+                            let extra_json = row
+                                .get_typed::<Option<String>>(4)?
+                                .and_then(|s| serde_json::from_str(&s).ok())
+                                .or_else(|| {
+                                    row.get_typed::<Option<Vec<u8>>>(5)
+                                        .ok()
+                                        .flatten()
+                                        .and_then(|b| rmp_serde::from_slice(&b).ok())
+                                });
+                            let msg_ts: Option<i64> = row.get_typed(6)?;
+                            let conv_started_at: Option<i64> = row.get_typed(8)?;
+                            let source_id: String = row.get_typed(9)?;
+                            let workspace_id: Option<i64> = row.get_typed(10)?;
+                            let agent_slug: String = row.get_typed(11)?;
+                            let effective_ts = msg_ts.or(conv_started_at).unwrap_or(0);
 
-        loop {
-            #[allow(clippy::type_complexity)]
-            let rows: Vec<(
-                i64,
-                String,
-                String,
-                Option<serde_json::Value>,
-                Option<i64>,
-                Option<i64>,
-                String,
-                Option<i64>,
-                String,
-            )> = tx.query_all_map(
-                // Avoid the 3-table JOIN with LIMIT/OFFSET that triggers
-                // frankensqlite's materialization fallback (see 860acb12).
-                // Inline the agent slug lookup as a correlated subquery and
-                // fall back to 'unknown' for NULL agent_id, matching the
-                // FTS / lexical rebuild paths.
-                "SELECT m.id, m.idx, m.role, m.content, m.extra_json, m.extra_bin,
-                        m.created_at,
-                        c.id AS conv_id, c.started_at AS conv_started_at,
-                        c.source_id, c.workspace_id,
-                        COALESCE((SELECT a.slug FROM agents a WHERE a.id = c.agent_id), 'unknown') AS agent_slug
-                 FROM messages m
-                 JOIN conversations c ON m.conversation_id = c.id
-                 ORDER BY m.id
-                 LIMIT ?1 OFFSET ?2",
-                fparams![CHUNK_SIZE, offset],
-                |row| {
-                    let msg_id: i64 = row.get_typed(0)?;
-                    let role: String = row.get_typed(2)?;
-                    let content: String = row.get_typed(3)?;
-                    let extra_json = row
-                        .get_typed::<Option<String>>(4)?
-                        .and_then(|s| serde_json::from_str(&s).ok())
-                        .or_else(|| {
-                            row.get_typed::<Option<Vec<u8>>>(5)
-                                .ok()
-                                .flatten()
-                                .and_then(|b| rmp_serde::from_slice(&b).ok())
-                        });
-                    let msg_ts: Option<i64> = row.get_typed(6)?;
-                    let conv_started_at: Option<i64> = row.get_typed(8)?;
-                    let source_id: String = row.get_typed(9)?;
-                    let workspace_id: Option<i64> = row.get_typed(10)?;
-                    let agent_slug: String = row.get_typed(11)?;
-                    let effective_ts = msg_ts.or(conv_started_at).unwrap_or(0);
+                            Ok((
+                                msg_id,
+                                role,
+                                content,
+                                extra_json,
+                                Some(effective_ts),
+                                workspace_id,
+                                source_id,
+                                conv_started_at,
+                                agent_slug,
+                            ))
+                        },
+                    )?;
 
-                    Ok((
+                    if rows.is_empty() {
+                        break;
+                    }
+
+                    let chunk_len = rows.len();
+                    let mut entries = Vec::with_capacity(chunk_len);
+                    let mut rollup_agg = AnalyticsRollupAggregator::new();
+
+                    for (
                         msg_id,
                         role,
                         content,
                         extra_json,
-                        Some(effective_ts),
+                        effective_ts,
                         workspace_id,
                         source_id,
-                        conv_started_at,
+                        _conv_started_at,
                         agent_slug,
-                    ))
+                    ) in &rows
+                    {
+                        let ts = effective_ts.unwrap_or(0);
+                        let day_id = Self::day_id_from_millis(ts);
+                        let hour_id = Self::hour_id_from_millis(ts);
+                        let content_chars = content.len() as i64;
+                        let content_tokens_est = content_chars / 4;
+                        let extra = extra_json
+                            .as_ref()
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
+                        let usage =
+                            crate::connectors::extract_tokens_for_agent(agent_slug, &extra, content, role);
+                        let model_info = usage
+                            .model_name
+                            .as_deref()
+                            .map(crate::connectors::normalize_model);
+                        let model_family = model_info
+                            .as_ref()
+                            .map(|i| i.family.clone())
+                            .unwrap_or_else(|| "unknown".into());
+                        let model_tier = model_info
+                            .as_ref()
+                            .map(|i| i.tier.clone())
+                            .unwrap_or_else(|| "unknown".into());
+                        let provider = usage
+                            .provider
+                            .clone()
+                            .or_else(|| model_info.as_ref().map(|i| i.provider.clone()))
+                            .unwrap_or_else(|| "unknown".into());
+
+                        let entry = MessageMetricsEntry {
+                            message_id: *msg_id,
+                            created_at_ms: ts,
+                            hour_id,
+                            day_id,
+                            agent_slug: agent_slug.clone(),
+                            workspace_id: workspace_id.unwrap_or(0),
+                            source_id: source_id.clone(),
+                            role: role.clone(),
+                            content_chars,
+                            content_tokens_est,
+                            model_name: usage.model_name.clone(),
+                            model_family,
+                            model_tier,
+                            provider,
+                            api_input_tokens: usage.input_tokens,
+                            api_output_tokens: usage.output_tokens,
+                            api_cache_read_tokens: usage.cache_read_tokens,
+                            api_cache_creation_tokens: usage.cache_creation_tokens,
+                            api_thinking_tokens: usage.thinking_tokens,
+                            api_service_tier: usage.service_tier,
+                            api_data_source: usage.data_source.as_str().to_string(),
+                            tool_call_count: usage.tool_call_count as i64,
+                            has_tool_calls: usage.has_tool_calls,
+                            has_plan: has_plan_for_role(role, content),
+                        };
+                        rollup_agg.record(&entry);
+                        entries.push(entry);
+                    }
+
+                    total_inserted += franken_insert_message_metrics_batched_in_tx(tx, &entries)?;
+                    let (hourly, daily, models_daily) =
+                        franken_flush_analytics_rollups_in_tx(tx, &rollup_agg)?;
+                    usage_hourly_rows += hourly;
+                    usage_daily_rows += daily;
+                    usage_models_daily_rows += models_daily;
+                    offset += chunk_len as i64;
+
+                    tracing::debug!(
+                        target: "cass::analytics",
+                        offset,
+                        chunk = chunk_len,
+                        inserted = entries.len(),
+                        total = total_inserted,
+                        "analytics_rebuild_chunk"
+                    );
+
+                    if (chunk_len as i64) < CHUNK_SIZE {
+                        break;
+                    }
+                }
+                        Ok((
+                            total_inserted,
+                            usage_hourly_rows,
+                            usage_daily_rows,
+                            usage_models_daily_rows,
+                        ))
+                    })()
+                    .map_err(anyhow_error_into_storage_error)
                 },
             )?;
-
-            if rows.is_empty() {
-                break;
-            }
-
-            let chunk_len = rows.len();
-            let mut entries = Vec::with_capacity(chunk_len);
-            let mut rollup_agg = AnalyticsRollupAggregator::new();
-
-            for (
-                msg_id,
-                role,
-                content,
-                extra_json,
-                effective_ts,
-                workspace_id,
-                source_id,
-                _conv_started_at,
-                agent_slug,
-            ) in &rows
-            {
-                let ts = effective_ts.unwrap_or(0);
-                let day_id = Self::day_id_from_millis(ts);
-                let hour_id = Self::hour_id_from_millis(ts);
-                let content_chars = content.len() as i64;
-                let content_tokens_est = content_chars / 4;
-                let extra = extra_json
-                    .as_ref()
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                let usage =
-                    crate::connectors::extract_tokens_for_agent(agent_slug, &extra, content, role);
-                let model_info = usage
-                    .model_name
-                    .as_deref()
-                    .map(crate::connectors::normalize_model);
-                let model_family = model_info
-                    .as_ref()
-                    .map(|i| i.family.clone())
-                    .unwrap_or_else(|| "unknown".into());
-                let model_tier = model_info
-                    .as_ref()
-                    .map(|i| i.tier.clone())
-                    .unwrap_or_else(|| "unknown".into());
-                let provider = usage
-                    .provider
-                    .clone()
-                    .or_else(|| model_info.as_ref().map(|i| i.provider.clone()))
-                    .unwrap_or_else(|| "unknown".into());
-
-                let entry = MessageMetricsEntry {
-                    message_id: *msg_id,
-                    created_at_ms: ts,
-                    hour_id,
-                    day_id,
-                    agent_slug: agent_slug.clone(),
-                    workspace_id: workspace_id.unwrap_or(0),
-                    source_id: source_id.clone(),
-                    role: role.clone(),
-                    content_chars,
-                    content_tokens_est,
-                    model_name: usage.model_name.clone(),
-                    model_family,
-                    model_tier,
-                    provider,
-                    api_input_tokens: usage.input_tokens,
-                    api_output_tokens: usage.output_tokens,
-                    api_cache_read_tokens: usage.cache_read_tokens,
-                    api_cache_creation_tokens: usage.cache_creation_tokens,
-                    api_thinking_tokens: usage.thinking_tokens,
-                    api_service_tier: usage.service_tier,
-                    api_data_source: usage.data_source.as_str().to_string(),
-                    tool_call_count: usage.tool_call_count as i64,
-                    has_tool_calls: usage.has_tool_calls,
-                    has_plan: has_plan_for_role(role, content),
-                };
-                rollup_agg.record(&entry);
-                entries.push(entry);
-            }
-
-            total_inserted += franken_insert_message_metrics_batched_in_tx(&tx, &entries)?;
-            let (hourly, daily, models_daily) =
-                franken_flush_analytics_rollups_in_tx(&tx, &rollup_agg)?;
-            usage_hourly_rows += hourly;
-            usage_daily_rows += daily;
-            usage_models_daily_rows += models_daily;
-            offset += chunk_len as i64;
-
-            tracing::debug!(
-                target: "cass::analytics",
-                offset,
-                chunk = chunk_len,
-                inserted = entries.len(),
-                total = total_inserted,
-                "analytics_rebuild_chunk"
-            );
-
-            if (chunk_len as i64) < CHUNK_SIZE {
-                break;
-            }
-        }
-
-        tx.commit()?;
 
         let elapsed = start.elapsed();
         let elapsed_ms = elapsed.as_millis() as u64;

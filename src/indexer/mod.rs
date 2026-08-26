@@ -10912,133 +10912,161 @@ fn rebuild_daily_stats_from_conversation_packets(
     let (agent_slugs, workspace_paths) = storage
         .build_lexical_rebuild_lookups()
         .with_context(|| format!("building packet rebuild lookups for {}", db_path.display()))?;
-    let mut tx = storage.raw().transaction().with_context(|| {
-        format!(
-            "opening packet daily_stats rebuild transaction for {}",
-            db_path.display()
-        )
-    })?;
-    tx.execute("DELETE FROM daily_stats", &[]).with_context(|| {
-        format!(
-            "clearing daily_stats before packet rebuild for {}",
-            db_path.display()
-        )
-    })?;
-
-    let mut last_conversation_id = 0_i64;
-    let mut conversation_batches = 0usize;
-    let mut conversations_processed = 0usize;
-    let mut messages_projected = 0usize;
-    let mut raw_entries_flushed = 0usize;
-    let mut expanded_entries_flushed = 0usize;
-
-    loop {
-        let conversation_rows = storage
-            .list_conversations_for_lexical_rebuild_after_id(
-                PACKET_DAILY_STATS_REBUILD_BATCH_SIZE,
-                last_conversation_id,
-                &agent_slugs,
-                &workspace_paths,
+    // w1b Task B3 (D2, control-plane 2026-08-26): with_tx_no_replay,
+    // TxMode::Immediate -- same reasoning as sqlite.rs's rebuild
+    // functions: Immediate rules out a mid-transaction Busy{Snapshot}
+    // conflict structurally, so replay has nothing to catch, only the
+    // cost of redoing a full conversation-packet scan.
+    let (
+        rows_created,
+        total_sessions,
+        conversation_batches,
+        conversations_processed,
+        messages_projected,
+        raw_entries_flushed,
+        expanded_entries_flushed,
+    ) = storage
+        .raw()
+        .with_tx_no_replay(
+            crate::storage::api::TxMode::Immediate,
+            |tx| -> Result<(i64, i64, usize, usize, usize, usize, usize), crate::storage::api::StorageError> {
+                (|| -> Result<(i64, i64, usize, usize, usize, usize, usize)> {
+        tx.execute("DELETE FROM daily_stats", &[]).with_context(|| {
+            format!(
+                "clearing daily_stats before packet rebuild for {}",
+                db_path.display()
             )
-            .with_context(|| {
-                format!(
-                    "listing canonical conversations for packet daily_stats rebuild after id {}",
-                    last_conversation_id
-                )
-            })?;
-        if conversation_rows.is_empty() {
-            break;
-        }
+        })?;
 
-        let conversation_ids = conversation_rows
-            .iter()
-            .map(|conversation| {
-                conversation.id.ok_or_else(|| {
+        let mut last_conversation_id = 0_i64;
+        let mut conversation_batches = 0usize;
+        let mut conversations_processed = 0usize;
+        let mut messages_projected = 0usize;
+        let mut raw_entries_flushed = 0usize;
+        let mut expanded_entries_flushed = 0usize;
+
+        loop {
+            let conversation_rows = storage
+                .list_conversations_for_lexical_rebuild_after_id(
+                    PACKET_DAILY_STATS_REBUILD_BATCH_SIZE,
+                    last_conversation_id,
+                    &agent_slugs,
+                    &workspace_paths,
+                )
+                .with_context(|| {
+                    format!(
+                        "listing canonical conversations for packet daily_stats rebuild after id {}",
+                        last_conversation_id
+                    )
+                })?;
+            if conversation_rows.is_empty() {
+                break;
+            }
+
+            let conversation_ids = conversation_rows
+                .iter()
+                .map(|conversation| {
+                    conversation.id.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "packet daily_stats rebuild encountered conversation without id after {}",
+                            last_conversation_id
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut grouped_messages = storage
+                .fetch_messages_for_lexical_rebuild_batch(&conversation_ids, None, None)
+                .with_context(|| {
+                    format!(
+                        "fetching canonical message batch for packet daily_stats rebuild after id {}",
+                        last_conversation_id
+                    )
+                })?;
+
+            let mut aggregate = StatsAggregator::new();
+            for conversation in conversation_rows {
+                let conversation_id = conversation.id.ok_or_else(|| {
                     anyhow::anyhow!(
                         "packet daily_stats rebuild encountered conversation without id after {}",
                         last_conversation_id
                     )
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let mut grouped_messages = storage
-            .fetch_messages_for_lexical_rebuild_batch(&conversation_ids, None, None)
-            .with_context(|| {
-                format!(
-                    "fetching canonical message batch for packet daily_stats rebuild after id {}",
-                    last_conversation_id
-                )
-            })?;
+                })?;
+                last_conversation_id = conversation_id;
 
-        let mut aggregate = StatsAggregator::new();
-        for conversation in conversation_rows {
-            let conversation_id = conversation.id.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "packet daily_stats rebuild encountered conversation without id after {}",
-                    last_conversation_id
-                )
-            })?;
-            last_conversation_id = conversation_id;
+                let canonical_messages = grouped_messages
+                    .remove(&conversation_id)
+                    .unwrap_or_default();
+                let provenance = packet_daily_stats_provenance(&conversation);
+                let packet = lexical_rebuild_contract_from_canonical_messages(
+                    &conversation,
+                    &provenance,
+                    canonical_messages,
+                );
+                let message_count = packet_daily_stats_message_count(&packet.projections);
+                let total_chars = packet_daily_stats_total_chars(&packet.projections);
+                let day_id = conversation
+                    .started_at
+                    .map(FrankenStorage::day_id_from_millis)
+                    .unwrap_or(0);
+                aggregate.record(
+                    &conversation.agent_slug,
+                    &conversation.source_id,
+                    day_id,
+                    message_count,
+                    total_chars,
+                );
+                conversations_processed += 1;
+                messages_projected = messages_projected.saturating_add(message_count.max(0) as usize);
+            }
 
-            let canonical_messages = grouped_messages
-                .remove(&conversation_id)
-                .unwrap_or_default();
-            let provenance = packet_daily_stats_provenance(&conversation);
-            let packet = lexical_rebuild_contract_from_canonical_messages(
-                &conversation,
-                &provenance,
-                canonical_messages,
-            );
-            let message_count = packet_daily_stats_message_count(&packet.projections);
-            let total_chars = packet_daily_stats_total_chars(&packet.projections);
-            let day_id = conversation
-                .started_at
-                .map(FrankenStorage::day_id_from_millis)
-                .unwrap_or(0);
-            aggregate.record(
-                &conversation.agent_slug,
-                &conversation.source_id,
-                day_id,
-                message_count,
-                total_chars,
-            );
-            conversations_processed += 1;
-            messages_projected = messages_projected.saturating_add(message_count.max(0) as usize);
+            conversation_batches += 1;
+            raw_entries_flushed += aggregate.raw_entry_count();
+            let entries = aggregate.expand();
+            expanded_entries_flushed += entries.len();
+            if !entries.is_empty() {
+                packet_update_daily_stats_batched_in_tx(tx, &entries)?;
+            }
+
+            if conversation_batches.is_multiple_of(25) {
+                tracing::info!(
+                    target: "cass::perf::daily_stats",
+                    conversation_batches,
+                    batch_size = PACKET_DAILY_STATS_REBUILD_BATCH_SIZE,
+                    last_conversation_id,
+                    conversations_processed,
+                    messages_projected,
+                    "packet daily_stats rebuild progress"
+                );
+            }
         }
 
-        conversation_batches += 1;
-        raw_entries_flushed += aggregate.raw_entry_count();
-        let entries = aggregate.expand();
-        expanded_entries_flushed += entries.len();
-        if !entries.is_empty() {
-            packet_update_daily_stats_batched_in_tx(&tx, &entries)?;
-        }
+        let rows_created: i64 = tx.query_row_map(
+            "SELECT COUNT(*) FROM daily_stats",
+            &[] as &[ParamValue],
+            |row| row.get_typed(0),
+        )?;
+        let total_sessions: i64 = tx.query_row_map(
+            "SELECT COALESCE(SUM(session_count), 0) FROM daily_stats WHERE agent_slug = 'all' AND source_id = 'all'",
+            &[] as &[ParamValue],
+            |row| row.get_typed(0),
+        )?;
 
-        if conversation_batches.is_multiple_of(25) {
-            tracing::info!(
-                target: "cass::perf::daily_stats",
-                conversation_batches,
-                batch_size = PACKET_DAILY_STATS_REBUILD_BATCH_SIZE,
-                last_conversation_id,
-                conversations_processed,
-                messages_projected,
-                "packet daily_stats rebuild progress"
-            );
-        }
-    }
-
-    let rows_created: i64 = tx.query_row_map(
-        "SELECT COUNT(*) FROM daily_stats",
-        &[] as &[ParamValue],
-        |row| row.get_typed(0),
-    )?;
-    let total_sessions: i64 = tx.query_row_map(
-        "SELECT COALESCE(SUM(session_count), 0) FROM daily_stats WHERE agent_slug = 'all' AND source_id = 'all'",
-        &[] as &[ParamValue],
-        |row| row.get_typed(0),
-    )?;
-
-    tx.commit()?;
+                    Ok((
+                        rows_created,
+                        total_sessions,
+                        conversation_batches,
+                        conversations_processed,
+                        messages_projected,
+                        raw_entries_flushed,
+                        expanded_entries_flushed,
+                    ))
+                })()
+                .map_err(crate::storage::sqlite::anyhow_error_into_storage_error)
+            },
+        )
+        .with_context(|| {
+            format!("packet daily_stats rebuild transaction failed for {}", db_path.display())
+        })?;
 
     tracing::info!(
         target: "cass::perf::daily_stats",
