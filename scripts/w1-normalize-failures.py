@@ -131,6 +131,15 @@ def parse(lines):
     run_count_mismatches = []
     failures = []
     poison_excluded = 0
+    # plan delta R1-B3 (PR-front code review, control-plane adjudicated
+    # 2026-08-25): per-target reconciliation between cargo's own reported
+    # `failed` count and what this parser actually recorded (failures.jsonl
+    # entries + poison-excluded entries for that target). A mismatch means
+    # the parser silently dropped or miscounted failures for that target
+    # (e.g. a name appearing twice in the "failures:" list, or a parsing
+    # edge case) -- previously undetectable because `complete` only checked
+    # target counts and compile errors, never cross-checked failure counts.
+    target_accounting = []
 
     cur_target = None
     cur_declared_n = None
@@ -161,13 +170,26 @@ def parse(lines):
                         'result_total': total,
                     }
                 )
+        recorded_here = 0
+        poison_here = 0
         for name in cur_failed_names:
             body = '\n'.join(stdout_blocks.get(name, []))
             if is_poison_cascade(body):
                 poison_excluded_ref[0] += 1
+                poison_here += 1
                 continue
             mode = normalize_mode(body) if body else '<no-captured-output>'
             failures.append({'target': cur_target, 'test': name, 'mode': mode})
+            recorded_here += 1
+        target_accounting.append(
+            {
+                'target': cur_target,
+                'cargo_reported_failed': failed,
+                'recorded_failures': recorded_here,
+                'poison_excluded': poison_here,
+                'reconciled': (recorded_here + poison_here == failed),
+            }
+        )
         cur_target = None
         cur_declared_n = None
         cur_failed_names = []
@@ -253,6 +275,7 @@ def parse(lines):
         'run_count_mismatches': run_count_mismatches,
         'failures': failures,
         'poison_excluded': poison_excluded_ref[0],
+        'target_accounting': target_accounting,
     }
 
 
@@ -285,6 +308,10 @@ def main(argv):
         'compile_error': result['compile_error'],
         'run_count_mismatches': result['run_count_mismatches'],
         'poison_excluded': result['poison_excluded'],
+        'target_accounting': result['target_accounting'],
+        'unreconciled_targets': [
+            t for t in result['target_accounting'] if not t['reconciled']
+        ],
         'complete': (
             result['started_targets'] == result['finished_targets'] == expected_targets
             and not result['compile_error']
