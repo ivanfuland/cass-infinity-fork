@@ -182,7 +182,8 @@ print(n)
   local normalize_rc=0
   python3 "$SCRIPT_DIR/w1-normalize-failures.py" \
     "$out_dir/cargo-test.log" "$out_dir/expected-targets.txt" \
-    "$out_dir/failures.jsonl" "$out_dir/completeness.json" || normalize_rc=$?
+    "$out_dir/failures.jsonl" "$out_dir/completeness.json" \
+    "$tree_dir" "$target_dir" || normalize_rc=$?
   # plan delta R2-B3 (PR-front code review round 2, control-plane adjudicated
   # 2026-08-26): a nonzero normalizer exit previously left whatever partial
   # failures.jsonl/completeness.json it managed to write (or none at all) on

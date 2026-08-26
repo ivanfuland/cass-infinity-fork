@@ -3,15 +3,22 @@
 
 用法:
   w1-normalize-failures.py <cargo-test-log> <expected-targets-count-file> \
-      <failures-out.jsonl> <completeness-out.json>
+      <failures-out.jsonl> <completeness-out.json> [<tree-root> <target-root>]
+
+<tree-root>/<target-root> 是可选的、**这一侧自己的**绝对路径根（调用方
+w1-equiv-gate.sh 的 capture_one() 只知道自己这一侧的 tree_dir/target_dir，
+一侧日志里也只可能出现自己这一侧的路径，不会出现另一侧的）；省略时不做任何
+根剥离（比 R4-B1 之前的无界 ABS_PATH_RE 更保守，只是噪音更多）。
 
 从 `cargo test $FEATURES --no-fail-fast -- --test-threads=1` 的完整 stdout+stderr 日志中：
 - 按 target 切块（"Running ... (bin)" 或 "Doc-tests <crate>" 起，至该 target 的
   "test result: ..." 止），逐块核对 "running N tests" 与最终 passed+failed+ignored+
   measured+filtered_out 是否一致（c2 运行数对账）。
 - 对每个 FAILED 用例，从 "---- <name> stdout ----" 块抓取 panic/断言文本，
-  归一化（去 file:line:col / 十六进制地址 / 计时数字 / 绝对路径），得到失败形态 mode；
-  含 PoisonError/poisoned 连带的记录整条剔除（不写入 failures.jsonl，仅计数报告）。
+  归一化（去 file:line:col / 十六进制地址 / 计时数字 / 已知根下的绝对路径——
+  R4-B1 起只剥 <tree-root>/<target-root> 前缀，前缀外的绝对路径原样保留），
+  得到失败形态 mode；含 PoisonError/poisoned 连带的记录整条剔除（不写入
+  failures.jsonl，仅计数报告）。
 - 执行完整性三判据：启动 target 数 == 收尾 test result 数 == 期望 target 数（独立真值源，
   来自 cargo metadata，读自 <expected-targets-count-file>）；日志内出现编译期错误
   （error[E.../ error: could not compile / error: linking）视为真编译错误，完整性判 False。
@@ -39,18 +46,54 @@ COMPILE_ERROR_RE = re.compile(
 LOC_RE = re.compile(r'\S+\.rs:\d+:\d+')
 ADDR_RE = re.compile(r'\b0x[0-9a-fA-F]+\b')
 TIME_RE = re.compile(r'\bfinished in [\d.]+s\b')
-# plan delta d9: was scoped to `.rs` source paths only, which missed absolute
+# plan delta d9 (superseded by R4-B1, round-4.md, control-plane adjudicated
+# 2026-08-26): d9 was scoped to `.rs` source paths only, which missed absolute
 # paths to non-.rs files (golden fixtures, shell scripts, etc.) that panic
 # messages routinely embed (e.g. "Expected: /home/.../tests/golden/robot/
-# capabilities.json.golden"). Those paths are rooted at the tree's own working
-# directory, which differs between the baseline and candidate worktrees (two
-# distinct absolute paths) even when the underlying failure content is
-# byte-identical -- inflating both sides' failure-form counts the same way the
-# d8 PID/tmpdir leak did. Broadened to strip the directory prefix of any
-# absolute path down to its basename, regardless of extension; the basename is
-# kept (not collapsed away) so genuinely different files still normalize
-# differently.
-ABS_PATH_RE = re.compile(r'/[^\s:]+/([A-Za-z0-9_.\-]+)')
+# capabilities.json.golden"). d9 broadened this to strip the directory prefix
+# of *any* absolute path down to its basename -- but that over-normalizes: a
+# candidate that resolves a file under an entirely wrong directory (a real
+# regression) folds into the same failure form as the baseline, because both
+# ends keep only the basename. R4-B1 replaces this with an explicit-allowlist
+# scoped stripper (`build_known_root_sub` below): only paths under a root this
+# invocation's caller actually knows is position-independent infra (this
+# side's tree checkout, this side's CARGO_TARGET_DIR) get their root replaced
+# by a `<TREE>`/`<TARGET>` tag -- the path *below* the root is kept verbatim,
+# not collapsed to a bare basename, so a same-tree directory-level regression
+# still surfaces as a distinct mode. Any absolute path NOT under a known root
+# is left completely untouched, which is exactly the signal a "resolved to
+# the wrong place entirely" regression needs to survive comparison on.
+# `/tmp/<random>` paths not under a known root still fall through to the
+# pre-existing TMPDIR_RE rule below (unchanged, d8/d10).
+
+
+def build_known_root_sub(roots):
+    """Build a (pattern, repl-function) pair from `roots`, a list of
+    (absolute_root_path, tag) pairs (e.g. `[(tree_dir, '<TREE>'), (target_dir,
+    '<TARGET>')]`). Roots that are empty/None are skipped. Longest root first
+    so a root that happens to be a path-prefix of another root can't shadow
+    the more specific one. Returns None if no usable roots were given (the
+    caller then leaves all absolute paths untouched, which is a strictly
+    safer default than the old over-broad basename-collapse)."""
+    entries = []
+    for root, tag in roots:
+        if not root:
+            continue
+        normalized = root.rstrip('/')
+        if not normalized:
+            continue
+        entries.append((normalized, tag))
+    if not entries:
+        return None
+    entries.sort(key=lambda e: -len(e[0]))
+    alternation = '|'.join(re.escape(root) for root, _ in entries)
+    pattern = re.compile(r'(' + alternation + r')(/[^\s:]*)?')
+    tag_by_root = dict(entries)
+
+    def repl(m):
+        return tag_by_root[m.group(1)] + (m.group(2) or '')
+
+    return pattern, repl
 # plan delta d8: cross-run thread ids in "thread '<name>' (<PID>) panicked" are not
 # stable (random per-process), so leaving them in makes two runs of the identical
 # assertion normalize to different strings and get misclassified as a new failure
@@ -100,7 +143,7 @@ FAILUREDUMP_TS_RE = re.compile(r'_\d{8}_\d{6}\.txt\b')
 MODIFIED_MS_RE = re.compile(r'modified_ms: Some\(\d+\)')
 
 
-def normalize_mode(text):
+def normalize_mode(text, known_root_sub=None):
     t = LOC_RE.sub('<LOC>', text)
     t = ADDR_RE.sub('<ADDR>', t)
     t = TIME_RE.sub('<TIME>', t)
@@ -110,7 +153,9 @@ def normalize_mode(text):
     t = BLAKE3_RE.sub('blake3: Some(<HASH>)', t)
     t = BLAKE3_JSON_RE.sub(r'"\1": <HASH>', t)
     t = ISO8601_RE.sub('<ISO8601>', t)
-    t = ABS_PATH_RE.sub(r'<PATH>/\1', t)
+    if known_root_sub is not None:
+        root_pattern, root_repl = known_root_sub
+        t = root_pattern.sub(root_repl, t)
     t = FAILUREDUMP_TS_RE.sub('_<TS>.txt', t)
     t = TMPFILE_BASENAME_RE.sub('.tmp<RAND>', t)
     t = THREAD_PID_RE.sub(r'\1 (<PID>) panicked', t)
@@ -139,7 +184,7 @@ def is_poison_cascade(text):
     return 'poisonerror' in low or 'poisoned' in low
 
 
-def parse(lines):
+def parse(lines, known_root_sub=None):
     started = 0
     finished = 0
     compile_error = False
@@ -213,7 +258,7 @@ def parse(lines):
                 poison_excluded_ref[0] += 1
                 poison_here += 1
                 continue
-            mode = normalize_mode(body) if body else '<no-captured-output>'
+            mode = normalize_mode(body, known_root_sub) if body else '<no-captured-output>'
             failures.append({'target': cur_target, 'test': name, 'mode': mode})
             recorded_here += 1
         is_doctest = cur_target is not None and cur_target.startswith('doctests ')
@@ -321,20 +366,31 @@ def parse(lines):
 
 
 def main(argv):
-    if len(argv) != 5:
+    # R4-B1: <tree-root>/<target-root> are optional and *this side's own*
+    # (the caller -- w1-equiv-gate.sh's capture_one() -- only ever knows its
+    # own tree_dir/target_dir; a side's log can only ever contain paths under
+    # its own tree/target, never the other side's). Omitting them falls back
+    # to leaving all absolute paths untouched (no known_root_sub), which is
+    # strictly safer than the old unscoped ABS_PATH_RE, just noisier.
+    if len(argv) not in (5, 7):
         print(
             'usage: w1-normalize-failures.py <cargo-test-log> <expected-targets-count-file> '
-            '<failures-out.jsonl> <completeness-out.json>',
+            '<failures-out.jsonl> <completeness-out.json> [<tree-root> <target-root>]',
             file=sys.stderr,
         )
         return 64
 
     log_path, expected_path, failures_out_path, completeness_out_path = argv[1:5]
+    tree_root = argv[5] if len(argv) == 7 else None
+    target_root = argv[6] if len(argv) == 7 else None
+    known_root_sub = build_known_root_sub(
+        [(tree_root, '<TREE>'), (target_root, '<TARGET>')]
+    )
 
     with open(log_path, encoding='utf-8', errors='replace') as f:
         lines = f.readlines()
 
-    result = parse(lines)
+    result = parse(lines, known_root_sub)
 
     try:
         with open(expected_path, encoding='utf-8') as f:
