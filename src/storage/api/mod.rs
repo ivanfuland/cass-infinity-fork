@@ -1,6 +1,7 @@
 //! storage::api — backend-agnostic facade over the relational storage layer.
 
 mod backend_franken;
+mod backend_sqlite;
 mod config;
 mod conn;
 mod error;
