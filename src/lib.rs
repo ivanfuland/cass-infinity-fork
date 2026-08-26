@@ -29568,7 +29568,8 @@ mod doctor_foreign_key_check_tests {
         // (storage/sqlite.rs): with FK enforcement genuinely on for every
         // ordinary connection, an orphan child row is structurally
         // unreachable through any normal insert, so the fixture must plant
-        // it via the same narrow, Ivan-adjudicated bypass.
+        // it via the same narrow test-only bypass B2b introduced for that
+        // purpose.
         storage
             .raw()
             .execute_batch_bypassing_foreign_keys_guard("PRAGMA foreign_keys = OFF")
