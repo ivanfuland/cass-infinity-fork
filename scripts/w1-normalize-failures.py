@@ -140,6 +140,22 @@ def parse(lines):
     # edge case) -- previously undetectable because `complete` only checked
     # target counts and compile errors, never cross-checked failure counts.
     target_accounting = []
+    # plan delta R2-B2 (PR-front code review round 2, control-plane
+    # adjudicated 2026-08-26): cross-target reconciliation between cargo's
+    # own declared "running N tests" sum (across all non-doctest targets)
+    # and w1-test-inventory.py's independent static AST scan of #[test]
+    # functions (active+ignored). Doc-tests are excluded on both sides of
+    # this comparison -- they're a real cargo phase with their own "running
+    # N tests" line, but the inventory scanner only scans #[test]-annotated
+    # functions in src/tests/benches, never doc comments, so including them
+    # would create a permanent, expected mismatch rather than catching a
+    # real one. A mismatch here means the two independently-derived test
+    # counts disagree even when neither side's own internal accounting
+    # (run_count_mismatches, per-target `reconciled`) caught anything --
+    # e.g. the inventory scanner's fixed-line scan window silently
+    # miscounting a target's tests without erroring.
+    total_declared_running_non_doctest = 0
+    total_declared_running_doctest = 0
 
     cur_target = None
     cur_declared_n = None
@@ -158,7 +174,7 @@ def parse(lines):
 
     def close_target(result_word, passed, failed, ignored, measured, filtered):
         nonlocal cur_target, cur_declared_n, cur_failed_names, stdout_blocks
-        nonlocal finished
+        nonlocal finished, total_declared_running_non_doctest, total_declared_running_doctest
         finished += 1
         if cur_declared_n is not None:
             total = passed + failed + ignored + measured + filtered
@@ -170,6 +186,10 @@ def parse(lines):
                         'result_total': total,
                     }
                 )
+            if cur_target is not None and cur_target.startswith('doctests '):
+                total_declared_running_doctest += cur_declared_n
+            else:
+                total_declared_running_non_doctest += cur_declared_n
         recorded_here = 0
         poison_here = 0
         for name in cur_failed_names:
@@ -276,6 +296,8 @@ def parse(lines):
         'failures': failures,
         'poison_excluded': poison_excluded_ref[0],
         'target_accounting': target_accounting,
+        'total_declared_running_non_doctest': total_declared_running_non_doctest,
+        'total_declared_running_doctest': total_declared_running_doctest,
     }
 
 
@@ -312,6 +334,8 @@ def main(argv):
         'unreconciled_targets': [
             t for t in result['target_accounting'] if not t['reconciled']
         ],
+        'total_declared_running_non_doctest': result['total_declared_running_non_doctest'],
+        'total_declared_running_doctest': result['total_declared_running_doctest'],
         'complete': (
             result['started_targets'] == result['finished_targets'] == expected_targets
             and not result['compile_error']
@@ -320,15 +344,25 @@ def main(argv):
         else False,
     }
 
-    with open(completeness_out_path, 'w', encoding='utf-8') as f:
-        json.dump(completeness, f, indent=2, sort_keys=True)
-        f.write('\n')
-
+    # plan delta R2-B3 (PR-front code review round 2, control-plane
+    # adjudicated 2026-08-26): write order reversed -- failures.jsonl first,
+    # completeness.json last as a seal. If this process is killed/crashes
+    # mid-write, completeness.json existing now implies failures.jsonl is
+    # already fully written (the seal was only written after), so a
+    # comparator that trusts "completeness.json present == this side's
+    # capture finished" can no longer be fooled by a truncated/missing
+    # failures.jsonl that got left behind by the OLD order (completeness.json
+    # written first, so it could exist and look "done" while failures.jsonl
+    # was still being written or never got written at all).
     with open(failures_out_path, 'w', encoding='utf-8') as f:
         # 失败形态集合按 (target,mode) 去重，但逐条 test 归属仍全量保留在 JSON 行里
         for rec in result['failures']:
             f.write(json.dumps(rec, sort_keys=True))
             f.write('\n')
+
+    with open(completeness_out_path, 'w', encoding='utf-8') as f:
+        json.dump(completeness, f, indent=2, sort_keys=True)
+        f.write('\n')
 
     print(
         f"[w1-normalize-failures] started={result['started_targets']} "

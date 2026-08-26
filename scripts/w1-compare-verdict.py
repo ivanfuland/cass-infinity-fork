@@ -5,17 +5,23 @@
 
 读取两侧 capture_one() 产物（completeness.json / failures.jsonl / test-inventory.txt /
 cargo-check-rc.txt / inventory-rc.txt），输出人读诊断 + 末行
-`VERDICT=<PASS|HOLD_INCOMPLETE|HOLD_SUPERSET|HOLD_DRIFT>`。
+`VERDICT=<PASS|HOLD_INCOMPLETE|HOLD_SUPERSET|HOLD_NAME_DRIFT|HOLD_DRIFT>`。
 
 判定优先级（前一条不过，后面照样跑出诊断但不覆盖已判定的 verdict）：
   1) 执行完整性（两侧都要 complete=true，含 run_count_mismatches 为空，
      cargo-check-rc.txt==0，inventory-rc.txt==0，poison_excluded==0，
-     target_accounting 逐 target 均 reconciled） -> 否则 HOLD_INCOMPLETE
-     （plan delta R1-B1/B2/B3，PR 前对抗审阻断项：此前 `cargo check --all-targets`
-     与 test-inventory 抽取的非零退出码从未被本判定器消费——候选只破坏
-     benchmark/额外 target 或漏收新测试仍可判 PASS；PoisonError 级联失败被
-     归一化器整条剔除且不核对失败数，单个真实失败混着 PoisonError 也会让
-     `complete` 照过）
+     target_accounting 逐 target 均 reconciled，failures.jsonl 文件存在，
+     两侧「非 doc-test target 的 declared running 总和」与该侧
+     test-inventory.txt 行数相等） -> 否则 HOLD_INCOMPLETE
+     （plan delta R1-B1/B2/B3 + R2-B2/B3，PR 前对抗审阻断项：此前
+     `cargo check --all-targets` 与 test-inventory 抽取的非零退出码从未被
+     本判定器消费——候选只破坏 benchmark/额外 target 或漏收新测试仍可判
+     PASS；PoisonError 级联失败被归一化器整条剔除且不核对失败数；
+     failures.jsonl 缺失时 `load_failures` 曾静默当空表处理，一侧真实失败
+     记录全部丢失也可能判 PASS；两侧总测试数从未做过跨 target 的独立源
+     交叉核（cargo 自己声明的 running 总和 vs test-inventory.py 静态扫描
+     的 active+ignored 计数），归一化器自身的扫描窗口 bug 不会报错也不会
+     被任何既有判据发现）
   2) 候选失败形态**多重集** ⊆ 基线失败形态多重集（按 (target 无关的) mode
      计数比较，候选每种 mode 的出现次数不得超过基线同一 mode 的出现次数）
      -> 否则 HOLD_SUPERSET（plan delta R1-B4：此前用 set 比较会把「候选两个
@@ -23,7 +29,13 @@ cargo-check-rc.txt / inventory-rc.txt），输出人读诊断 + 末行
      成同一形态、判 PASS，丢失了失败身份与重数；形态口径本身不变，按 EXEC
      「按形态判，不按测试名判」的原则保留，只是从 set 升级为多重集，并新增
      (测试名, mode) 配对附表供人审）
-  3) 闭世界清单差集为空 -> 否则 HOLD_DRIFT（新增/删除/ignore态变更/哈希变更 逐条列出待人审）
+  3) 仅当 2) 的 mode 多重集 subset 成立时才检查：候选失败(测试名,mode)
+     **配对多重集** ⊆ 基线配对多重集 -> 否则 HOLD_NAME_DRIFT（plan delta
+     R2-B1，R1-B4 重开：mode 多重集 subset 只保证「候选每种 mode 出现次数
+     不超基线」，不保证是**同一批测试**在失败——基线 A 失败 mode X、候选 B
+     失败 mode X（A 反而通过了），mode 计数两侧都是 {X:1}，纯 mode 多重集
+     判 PASS，但这其实是一次身份漂移，需要人审，不该自动放行）
+  4) 闭世界清单差集为空 -> 否则 HOLD_DRIFT（新增/删除/ignore态变更/哈希变更 逐条列出待人审）
   全过 -> PASS
 
 「确定性内核逐条相等」（spec 字面要求）在本通用 harness 里降级为附加信息位
@@ -57,6 +69,13 @@ def load_rc(path):
 
 
 def load_failures(path):
+    """R2-B3: returns (records, missing). `missing=True` means the file
+    itself doesn't exist/isn't readable -- distinct from an existing,
+    genuinely-empty file (zero failures is a legitimate, common result).
+    Previously an OSError here was swallowed into an empty list identical to
+    the "zero failures" case, so a deleted/never-written failures.jsonl for
+    one side silently looked like "that side had no failures" instead of
+    "this run's data can't be trusted"."""
     out = []
     try:
         with open(path, encoding='utf-8') as f:
@@ -64,9 +83,9 @@ def load_failures(path):
                 line = line.strip()
                 if line:
                     out.append(json.loads(line))
+        return out, False
     except OSError:
-        pass
-    return out
+        return out, True
 
 
 def load_inventory(path):
@@ -91,8 +110,8 @@ def main(argv):
 
     base_completeness = load_json(f'{baseline_dir}/completeness.json')
     cand_completeness = load_json(f'{candidate_dir}/completeness.json')
-    base_failures = load_failures(f'{baseline_dir}/failures.jsonl')
-    cand_failures = load_failures(f'{candidate_dir}/failures.jsonl')
+    base_failures, base_failures_missing = load_failures(f'{baseline_dir}/failures.jsonl')
+    cand_failures, cand_failures_missing = load_failures(f'{candidate_dir}/failures.jsonl')
     base_inventory = load_inventory(f'{baseline_dir}/test-inventory.txt')
     cand_inventory = load_inventory(f'{candidate_dir}/test-inventory.txt')
     base_check_rc = load_rc(f'{baseline_dir}/cargo-check-rc.txt')
@@ -105,6 +124,18 @@ def main(argv):
     cand_poison = cand_completeness.get('poison_excluded') or 0
     base_unreconciled = base_completeness.get('unreconciled_targets') or []
     cand_unreconciled = cand_completeness.get('unreconciled_targets') or []
+    # R2-B2: cross-target reconciliation between cargo's own declared
+    # "running N" sum (over non-doctest targets) and w1-test-inventory.py's
+    # independent static scan (every line in test-inventory.txt is either
+    # `active` or `ignored`, so its line count IS that side's active+ignored
+    # total). Two independently-derived counts of "how many #[test]
+    # functions exist" that should always agree; a mismatch means one of the
+    # two counting mechanisms has a bug neither side's own internal checks
+    # would catch.
+    base_running_sum = base_completeness.get('total_declared_running_non_doctest')
+    cand_running_sum = cand_completeness.get('total_declared_running_non_doctest')
+    base_running_reconciled = base_running_sum is not None and base_running_sum == len(base_inventory)
+    cand_running_reconciled = cand_running_sum is not None and cand_running_sum == len(cand_inventory)
     base_complete = (
         bool(base_completeness.get('complete'))
         and not base_completeness.get('run_count_mismatches')
@@ -112,6 +143,8 @@ def main(argv):
         and base_inventory_rc == 0
         and base_poison == 0
         and not base_unreconciled
+        and not base_failures_missing
+        and base_running_reconciled
     )
     cand_complete = (
         bool(cand_completeness.get('complete'))
@@ -120,6 +153,8 @@ def main(argv):
         and cand_inventory_rc == 0
         and cand_poison == 0
         and not cand_unreconciled
+        and not cand_failures_missing
+        and cand_running_reconciled
     )
     print(f'baseline: complete={base_completeness.get("complete")} '
           f'started={base_completeness.get("started_targets")} '
@@ -127,6 +162,9 @@ def main(argv):
           f'expected={base_completeness.get("expected_targets")} '
           f'compile_error={base_completeness.get("compile_error")} '
           f'run_count_mismatches={len(base_completeness.get("run_count_mismatches") or [])} '
+          f'failures_jsonl_missing={base_failures_missing} '
+          f'running_sum={base_running_sum} inventory_count={len(base_inventory)} '
+          f'running_reconciled={base_running_reconciled} '
           f'cargo_check_rc={base_check_rc} inventory_rc={base_inventory_rc} '
           f'poison_excluded={base_poison} unreconciled_targets={len(base_unreconciled)}')
     print(f'candidate: complete={cand_completeness.get("complete")} '
@@ -135,6 +173,9 @@ def main(argv):
           f'expected={cand_completeness.get("expected_targets")} '
           f'compile_error={cand_completeness.get("compile_error")} '
           f'run_count_mismatches={len(cand_completeness.get("run_count_mismatches") or [])} '
+          f'failures_jsonl_missing={cand_failures_missing} '
+          f'running_sum={cand_running_sum} inventory_count={len(cand_inventory)} '
+          f'running_reconciled={cand_running_reconciled} '
           f'cargo_check_rc={cand_check_rc} inventory_rc={cand_inventory_rc} '
           f'poison_excluded={cand_poison} unreconciled_targets={len(cand_unreconciled)}')
     if base_unreconciled:
@@ -174,6 +215,40 @@ def main(argv):
             cand_n, base_n = over_count_modes[m]
             print(f'  - [候选x{cand_n} 基线x{base_n}] {m[:200]}')
 
+    # R2-B1 (R1-B4 reopened): mode-count subset alone can't distinguish "the
+    # same tests failed with the same content" from "a different set of
+    # tests happened to produce panic text that normalizes to a mode the
+    # baseline already had" -- e.g. baseline: test A fails with mode X;
+    # candidate: test A passes but test B now fails with mode X. Both sides
+    # have {X: 1} in the mode Counter (subset holds), yet this is a real
+    # identity drift a human needs to see. Only evaluated when the mode-level
+    # subset already holds -- if it doesn't, HOLD_SUPERSET already covers a
+    # strictly coarser version of the same problem.
+    name_drift = False
+    over_count_pairs = {}
+    if is_subset:
+        base_pair_counts = Counter((f['test'], f['mode']) for f in base_failures)
+        cand_pair_counts = Counter((f['test'], f['mode']) for f in cand_failures)
+        over_count_pairs = {
+            pair: (cand_pair_counts[pair], base_pair_counts.get(pair, 0))
+            for pair in cand_pair_counts
+            if cand_pair_counts[pair] > base_pair_counts.get(pair, 0)
+        }
+        name_drift = bool(over_count_pairs)
+
+    print()
+    print('=== (测试名, mode) 配对多重集判定 ===')
+    if not is_subset:
+        print('跳过（mode 多重集 subset 已经不成立，HOLD_SUPERSET 已覆盖，无需再判配对）')
+    else:
+        print(f'candidate 配对 ⊆ baseline 配对（同一 mode 必须是同一批测试在挂）: {not name_drift}')
+        if name_drift:
+            print('候选独有的 (测试名,mode) 配对（mode 本身基线有，但挂的测试变了 -- 需要人审）:')
+            for pair in sorted(over_count_pairs):
+                cand_n, base_n = over_count_pairs[pair]
+                test, mode = pair
+                print(f'  - [候选x{cand_n} 基线x{base_n}] test={test} :: {mode[:160]}')
+
     print()
     print('=== (测试名, mode) 配对附表（人审用,不参与判定）===')
     print('候选侧全部失败记录:')
@@ -204,13 +279,21 @@ def main(argv):
         verdict = 'HOLD_INCOMPLETE'
     elif not is_subset:
         verdict = 'HOLD_SUPERSET'
+    elif name_drift:
+        verdict = 'HOLD_NAME_DRIFT'
     elif drift:
         verdict = 'HOLD_DRIFT'
     else:
         verdict = 'PASS'
 
     print(f'VERDICT={verdict}')
-    return {'PASS': 0, 'HOLD_INCOMPLETE': 10, 'HOLD_SUPERSET': 11, 'HOLD_DRIFT': 12}[verdict]
+    return {
+        'PASS': 0,
+        'HOLD_INCOMPLETE': 10,
+        'HOLD_SUPERSET': 11,
+        'HOLD_DRIFT': 12,
+        'HOLD_NAME_DRIFT': 13,
+    }[verdict]
 
 
 if __name__ == '__main__':

@@ -179,9 +179,24 @@ print(n)
   echo "$test_rc" > "$out_dir/cargo-test-rc.txt"
 
   echo "[w1-equiv-gate] 失败归一化 ..." >&2
+  local normalize_rc=0
   python3 "$SCRIPT_DIR/w1-normalize-failures.py" \
     "$out_dir/cargo-test.log" "$out_dir/expected-targets.txt" \
-    "$out_dir/failures.jsonl" "$out_dir/completeness.json"
+    "$out_dir/failures.jsonl" "$out_dir/completeness.json" || normalize_rc=$?
+  # plan delta R2-B3 (PR-front code review round 2, control-plane adjudicated
+  # 2026-08-26): a nonzero normalizer exit previously left whatever partial
+  # failures.jsonl/completeness.json it managed to write (or none at all) on
+  # disk without aborting -- the comparator would then either crash obscurely
+  # or, worse, treat missing/empty files as "no failures" (a false PASS).
+  # Abort this side's capture immediately and overwrite completeness.json
+  # with an explicit hold marker so any downstream reader sees a hard stop,
+  # not silence.
+  if [ "$normalize_rc" -ne 0 ]; then
+    echo "[w1-equiv-gate] FATAL: 归一化器非零退出 (rc=$normalize_rc)，该侧捕获中止" >&2
+    printf '{"complete": false, "normalize_error": true, "normalize_rc": %s}\n' "$normalize_rc" \
+      > "$out_dir/completeness.json"
+    return 1
+  fi
 }
 
 cmd="${1:-}"
@@ -189,7 +204,10 @@ case "$cmd" in
   capture)
     out_dir="${2:-}"
     [ -n "$out_dir" ] || usage
-    capture_one "$REPO_ROOT" "$out_dir"
+    capture_one "$REPO_ROOT" "$out_dir" || {
+      echo "[w1-equiv-gate] FATAL: capture 中止（归一化器失败），见上方日志" >&2
+      exit 1
+    }
     echo "[w1-equiv-gate] capture 完成，产物在 $out_dir" >&2
     ;;
   compare)
@@ -197,8 +215,17 @@ case "$cmd" in
     [ -n "$baseline_dir" ] && [ -n "$candidate_dir" ] && [ -n "$out_dir" ] || usage
     mkdir -p "$out_dir"
     echo "[w1-equiv-gate] compare：紧邻串行双跑，同一环境窗口（R0-B7）" >&2
-    capture_one "$baseline_dir" "$out_dir/baseline" "$(tree_target_dir "$baseline_dir")"
-    capture_one "$candidate_dir" "$out_dir/candidate" "$(tree_target_dir "$candidate_dir")"
+    # R2-B3: don't let a failed capture on either side silently flow into
+    # the comparator -- abort compare entirely rather than let it judge
+    # against a hold-marker completeness.json it might not even understand.
+    capture_one "$baseline_dir" "$out_dir/baseline" "$(tree_target_dir "$baseline_dir")" || {
+      echo "[w1-equiv-gate] FATAL: baseline 捕获中止（归一化器失败），compare 不继续" >&2
+      exit 1
+    }
+    capture_one "$candidate_dir" "$out_dir/candidate" "$(tree_target_dir "$candidate_dir")" || {
+      echo "[w1-equiv-gate] FATAL: candidate 捕获中止（归一化器失败），compare 不继续" >&2
+      exit 1
+    }
     echo "[w1-equiv-gate] 判定 ..." >&2
     python3 "$SCRIPT_DIR/w1-compare-verdict.py" "$out_dir/baseline" "$out_dir/candidate" \
       | tee "$out_dir/verdict.txt"
