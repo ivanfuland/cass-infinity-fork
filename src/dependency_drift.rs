@@ -8,7 +8,6 @@ const SCHEMA_VERSION: &str = "cass.swarm.dependency_drift.v1";
 const STRICT_CHECK_COMMAND: &str = "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-strict-target cargo check --features strict-path-dep-validation";
 const FULL_CHECK_COMMAND: &str =
     "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-check-target cargo check --all-targets";
-const FSQLITE_REGRESSION_COMMAND: &str = "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-fsqlite-target cargo test --lib cleanup_orphan_fk_rows -- --nocapture";
 
 #[derive(Clone, Copy)]
 struct DependencySpec {
@@ -59,28 +58,6 @@ struct DependencyRisk {
 }
 
 const DEPENDENCY_SPECS: &[DependencySpec] = &[
-    DependencySpec {
-        name: "frankensqlite",
-        package: "fsqlite",
-        manifest_table: "dependencies",
-        manifest_key: "frankensqlite",
-        source_kind: "registry",
-        repo_rel: "../frankensqlite",
-        required_tests: &[
-            STRICT_CHECK_COMMAND,
-            FULL_CHECK_COMMAND,
-            FSQLITE_REGRESSION_COMMAND,
-        ],
-    },
-    DependencySpec {
-        name: "fsqlite-types",
-        package: "fsqlite-types",
-        manifest_table: "dev-dependencies",
-        manifest_key: "fsqlite-types",
-        source_kind: "registry",
-        repo_rel: "../frankensqlite",
-        required_tests: &[STRICT_CHECK_COMMAND, FULL_CHECK_COMMAND],
-    },
     DependencySpec {
         name: "franken-agent-detection",
         package: "franken-agent-detection",
@@ -747,10 +724,6 @@ fn recommendations(
 ) -> Vec<Value> {
     let risks = dependencies.iter().map(classify).collect::<Vec<_>>();
     let warning_count = risks.iter().filter(|risk| risk.level == "warning").count();
-    let has_fsqlite_warning = dependencies
-        .iter()
-        .zip(risks.iter())
-        .any(|(dep, risk)| dep.package == "fsqlite" && risk.level == "warning");
     let mut output = vec![json!({
         "kind": "strict-path-dep-validation",
         "summary": "Run the strict dependency contract check before enabling local sibling overrides or updating pins.",
@@ -774,16 +747,6 @@ fn recommendations(
             "kind": "review-drift-before-release",
             "summary": "Do not treat local sibling behavior as release proof until Cargo.toml pins, build.rs contracts, and downstream checks agree.",
             "commands": [STRICT_CHECK_COMMAND, FULL_CHECK_COMMAND],
-            "requires_network": false,
-            "requires_human_confirmation": false
-        }));
-    }
-
-    if has_fsqlite_warning {
-        output.push(json!({
-            "kind": "frankensqlite-first",
-            "summary": "If SQLite behavior is missing, fix /data/projects/frankensqlite and bump the fsqlite pin; do not add new rusqlite workarounds.",
-            "commands": [FSQLITE_REGRESSION_COMMAND, STRICT_CHECK_COMMAND],
             "requires_network": false,
             "requires_human_confirmation": false
         }));
@@ -907,7 +870,7 @@ mod tests {
             None => return Err(test_error("dependencies table should exist")),
         };
         ensure(
-            dependencies.contains_key("frankensqlite"),
+            dependencies.contains_key("asupersync"),
             "dependency drift live mode must see Cargo.toml dependency pins",
         )?;
         ensure(
@@ -920,22 +883,18 @@ mod tests {
     fn manifest_pin_reads_git_and_registry_dependency_specs() -> Result<(), Box<dyn Error>> {
         let manifest = checked_in_manifest()?;
 
-        let frankensqlite_spec = dependency_spec("frankensqlite")?;
-        let frankensqlite = manifest_pin(&manifest, frankensqlite_spec);
+        let franken_agent_spec = dependency_spec("franken-agent-detection")?;
+        let franken_agent = manifest_pin(&manifest, franken_agent_spec);
         ensure(
-            frankensqlite.status == "version-pinned",
+            franken_agent.status == "pinned",
             format!(
-                "expected frankensqlite version-pinned, got {}",
-                frankensqlite.status
+                "expected franken-agent-detection pinned, got {}",
+                franken_agent.status
             ),
         )?;
         ensure(
-            frankensqlite.package.as_deref() == Some(frankensqlite_spec.package),
-            "frankensqlite package should match the dependency spec",
-        )?;
-        ensure(
-            frankensqlite.version.as_deref() == Some("=0.1.16"),
-            "frankensqlite registry version pin should match Cargo.toml",
+            franken_agent.git.is_some() && franken_agent.rev.is_some(),
+            "franken-agent-detection git pin should include git url and rev",
         )?;
 
         let asupersync = manifest_pin(&manifest, dependency_spec("asupersync")?);

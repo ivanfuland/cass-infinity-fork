@@ -2460,8 +2460,8 @@ fn swarm_dependency_drift_cli_flags_pin_dirty_missing_and_network_risks()
         .filter_map(|recommendation| recommendation.get("kind").and_then(Value::as_str))
         .collect::<Vec<_>>();
     require(
-        recommendation_kinds.contains(&"frankensqlite-first"),
-        "frankensqlite-specific recommendation missing",
+        recommendation_kinds.contains(&"review-drift-before-release"),
+        "drift review recommendation missing",
     )?;
     require(
         serde_json::to_string(&output)?.contains(
