@@ -290,13 +290,26 @@ impl BookmarkStore {
         for mut bookmark in bookmarks {
             let line_number = line_number_to_db(bookmark.line_number)?;
 
-            // Check for duplicates
+            // Check for duplicates. R1-B6 (PR-front code review, control-plane
+            // adjudicated 2026-08-25): `.unwrap_or(0)` around the whole
+            // query_row_map call swallowed any error -- including a real
+            // query-execution failure (Busy, lock recovery, etc.) -- as
+            // "no duplicate found", letting the INSERT below commit a
+            // duplicate row. Baseline (31628af8) split this into two error
+            // tiers: `tx.query_with_params(...)?` propagates execution
+            // errors, and only the per-row *value conversion*
+            // (`row.get_typed(0).ok()`) plus the "zero rows returned" case
+            // (`exists_row.first()` on an empty Vec) tolerate a fallback to
+            // 0. Restored that boundary: `query_opt_map`'s outer `?` still
+            // propagates execution errors; `Ok(None)` on zero rows and the
+            // inline `.unwrap_or(0)` on a row-conversion miss both fall
+            // back to 0, matching baseline exactly.
             let exists: i64 = tx
-                .query_row_map(
+                .query_opt_map(
                     "SELECT EXISTS(SELECT 1 FROM bookmarks WHERE source_path = ?1 AND line_number IS ?2)",
                     &params![bookmark.source_path.as_str(), line_number],
-                    |row| row.get_typed(0),
-                )
+                    |row| Ok(row.get_typed::<i64>(0).unwrap_or(0)),
+                )?
                 .unwrap_or(0);
 
             if exists == 0 {
