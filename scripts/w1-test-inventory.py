@@ -7,11 +7,15 @@
 
 口径（照抄 plan，不发明）:
 - 计数/抽取统一用行锚定 `^[ \t]*#\[test\]`（非锚定会把注释/字符串里的字面量计进去）。
-- #[test] 后属性可堆叠（#[serial]/#[ignore] 等），禁 grep -A1：前向扫描 8 行内找首个
-  `fn <name>`，途中记录是否出现行锚定 `#[ignore`。
+- #[test] 前后属性都可堆叠（#[ignore]/#[serial] 等，Rust 对属性顺序不作要求）：先向上
+  扫过连续的属性/注释/空行找到属性块首行，再从 #[test] 起前向扫描 8 行内找首个
+  `fn <name>`；`#[ignore` 判定覆盖属性块上下两段（R3-B1：此前只前向扫描会漏判
+  `#[ignore]` 置于 `#[test]` 之前的合法写法，候选把失败测试的 ignore 属性挪到 #[test]
+  前即可让该测试仍被记成 active、哈希不变，equiv-gate 判 PASS 而实际已停跑）。
 - 键含 ignore 态，同名跨文件不塌缩（键含完整路径）。
-- 哈希覆盖 "#[test] 起 至 函数体闭括号止" 的完整归一化文本（含全部属性行），
-  防「加 #[cfg(any())] 静默撤测」与「断言掏空」两型阉割；哈希差异不自动 FAIL，落变更清单人审。
+- 哈希覆盖 "属性块首行 起 至 函数体闭括号止" 的完整归一化文本（含全部属性行，不论其
+  排在 #[test] 前还是后），防「加 #[cfg(any())] 静默撤测」与「断言掏空」两型阉割；
+  哈希差异不自动 FAIL，落变更清单人审。
 """
 import hashlib
 import re
@@ -21,7 +25,38 @@ from pathlib import Path
 TEST_ATTR_RE = re.compile(r'^[ \t]*#\[test\]')
 IGNORE_ATTR_RE = re.compile(r'^[ \t]*#\[ignore')
 FN_RE = re.compile(r'\bfn\s+([A-Za-z_][A-Za-z0-9_]*)')
+ATTR_LINE_RE = re.compile(r'^[ \t]*#\[')
+COMMENT_LINE_RE = re.compile(r'^[ \t]*//')
+BLANK_LINE_RE = re.compile(r'^[ \t]*$')
 MAX_FORWARD_SCAN = 8
+MAX_BACKWARD_SCAN = 8
+
+
+def find_attr_block_start(raw_lines, test_idx):
+    """R3-B1: walk upward from the `#[test]` line through any contiguous run
+    of attribute/comment/blank lines to find the top of the attribute block.
+    Rust doesn't require `#[ignore]` to come after `#[test]` -- a candidate
+    can place it *before* `#[test]` and the old forward-only scan (and
+    forward-only hash range) would silently miss it, recording a stopped
+    test as still `active` with an unchanged hash. Bounded like the forward
+    scan; conservative on purpose (control-plane 2026-08-26): a non-attr/
+    comment/blank line always stops the scan, so at worst the block is
+    drawn a little too large (harmless extra rehashing), never too small
+    (which is what would let an #[ignore] fall outside it)."""
+    block_start = test_idx
+    j = test_idx - 1
+    floor = max(-1, test_idx - 1 - MAX_BACKWARD_SCAN)
+    while j > floor:
+        line = raw_lines[j]
+        if ATTR_LINE_RE.match(line) or COMMENT_LINE_RE.match(line):
+            block_start = j
+            j -= 1
+            continue
+        if BLANK_LINE_RE.match(line):
+            j -= 1
+            continue
+        break
+    return block_start
 
 
 def mask_file(text):
@@ -159,8 +194,11 @@ def process_file(path, rel_path, errors):
     while i < n:
         if TEST_ATTR_RE.match(raw_lines[i]):
             test_count += 1
+            block_start = find_attr_block_start(raw_lines, i)
             fn_idx = None
-            ignored = False
+            ignored = any(
+                IGNORE_ATTR_RE.match(raw_lines[k]) for k in range(block_start, i)
+            )
             for k in range(i, min(i + MAX_FORWARD_SCAN + 1, n)):
                 if k > i and IGNORE_ATTR_RE.match(raw_lines[k]):
                     ignored = True
@@ -178,7 +216,7 @@ def process_file(path, rel_path, errors):
                 errors.append((rel_path, f'no-matching-close-brace@{i + 1}', 1))
                 i = fn_idx + 1
                 continue
-            full_text = '\n'.join(raw_lines[i:close_idx + 1])
+            full_text = '\n'.join(raw_lines[block_start:close_idx + 1])
             normalized = re.sub(r'\s+', ' ', full_text).strip()
             hash8 = hashlib.md5(normalized.encode('utf-8')).hexdigest()[:8]
             state = 'ignored' if ignored else 'active'

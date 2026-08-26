@@ -29,12 +29,19 @@ cargo-check-rc.txt / inventory-rc.txt），输出人读诊断 + 末行
      成同一形态、判 PASS，丢失了失败身份与重数；形态口径本身不变，按 EXEC
      「按形态判，不按测试名判」的原则保留，只是从 set 升级为多重集，并新增
      (测试名, mode) 配对附表供人审）
-  3) 仅当 2) 的 mode 多重集 subset 成立时才检查：候选失败(测试名,mode)
+  3) 仅当 2) 的 mode 多重集 subset 成立时才检查：候选失败(target_label,测试名,mode)
      **配对多重集** ⊆ 基线配对多重集 -> 否则 HOLD_NAME_DRIFT（plan delta
-     R2-B1，R1-B4 重开：mode 多重集 subset 只保证「候选每种 mode 出现次数
-     不超基线」，不保证是**同一批测试**在失败——基线 A 失败 mode X、候选 B
-     失败 mode X（A 反而通过了），mode 计数两侧都是 {X:1}，纯 mode 多重集
-     判 PASS，但这其实是一次身份漂移，需要人审，不该自动放行）
+     R2-B1，R1-B4 重开；R3-B2 把配对键从二元组 (test, mode) 升到三元组
+     (target_label, test, mode)：mode 多重集 subset 只保证「候选每种 mode
+     出现次数不超基线」，不保证是**同一批测试**在失败——基线 A 失败 mode X、
+     候选 B 失败 mode X（A 反而通过了），mode 计数两侧都是 {X:1}，纯 mode
+     多重集判 PASS，但这其实是一次身份漂移，需要人审，不该自动放行。二元组
+     (test, mode) 本身还有个洞：不同 target 里的同名测试会被当成同一个身份
+     ——`tests/connector_chatgpt.rs::detect_does_not_panic` 挂了又被
+     `tests/connector_cursor.rs` 里同名同 mode 的失败顶替，(test, mode) 计
+     数两侧都不变，照样判 PASS。target_label 用 target 字段剥掉两侧不同
+     build 路径后的 tree-relative 标签（与 R2-B2 v2 的 target_label() 同一
+     剥法），把 target 也编进配对键即可堵上）
   4) 闭世界清单差集为空 -> 否则 HOLD_DRIFT（新增/删除/ignore态变更/哈希变更 逐条列出待人审）
   全过 -> PASS
 
@@ -99,6 +106,21 @@ def load_inventory(path):
     except OSError:
         pass
     return keys
+
+
+def failure_target_label(target):
+    """R3-B2: same tree-relative stripping as
+    w1-normalize-failures.py::target_label() (` (<abs-path>)` suffix cut),
+    reapplied here to a failures.jsonl record's raw `target` field --
+    failures.jsonl only carries `target` (the absolute-path-suffixed raw
+    string), not the already-stripped `target_label` that target_accounting
+    entries in completeness.json carry, so the (target_label, test, mode)
+    pairing key below needs its own derivation, not a shared import (these
+    are two independently invoked scripts)."""
+    if target is None:
+        return target
+    idx = target.find(' (')
+    return target[:idx] if idx != -1 else target
 
 
 def inventory_identity(key):
@@ -322,8 +344,12 @@ def main(argv):
     name_drift = False
     over_count_pairs = {}
     if is_subset:
-        base_pair_counts = Counter((f['test'], f['mode']) for f in base_failures)
-        cand_pair_counts = Counter((f['test'], f['mode']) for f in cand_failures)
+        base_pair_counts = Counter(
+            (failure_target_label(f.get('target')), f['test'], f['mode']) for f in base_failures
+        )
+        cand_pair_counts = Counter(
+            (failure_target_label(f.get('target')), f['test'], f['mode']) for f in cand_failures
+        )
         over_count_pairs = {
             pair: (cand_pair_counts[pair], base_pair_counts.get(pair, 0))
             for pair in cand_pair_counts
@@ -332,17 +358,17 @@ def main(argv):
         name_drift = bool(over_count_pairs)
 
     print()
-    print('=== (测试名, mode) 配对多重集判定 ===')
+    print('=== (target_label, 测试名, mode) 配对多重集判定 ===')
     if not is_subset:
         print('跳过（mode 多重集 subset 已经不成立，HOLD_SUPERSET 已覆盖，无需再判配对）')
     else:
-        print(f'candidate 配对 ⊆ baseline 配对（同一 mode 必须是同一批测试在挂）: {not name_drift}')
+        print(f'candidate 配对 ⊆ baseline 配对（同一 target 同一 mode 必须是同一批测试在挂）: {not name_drift}')
         if name_drift:
-            print('候选独有的 (测试名,mode) 配对（mode 本身基线有，但挂的测试变了 -- 需要人审）:')
+            print('候选独有的 (target_label,测试名,mode) 配对（mode 本身基线有，但挂的 target/测试变了 -- 需要人审）:')
             for pair in sorted(over_count_pairs):
                 cand_n, base_n = over_count_pairs[pair]
-                test, mode = pair
-                print(f'  - [候选x{cand_n} 基线x{base_n}] test={test} :: {mode[:160]}')
+                target_label_val, test, mode = pair
+                print(f'  - [候选x{cand_n} 基线x{base_n}] target={target_label_val} test={test} :: {mode[:160]}')
 
     print()
     print('=== (测试名, mode) 配对附表（人审用,不参与判定）===')
