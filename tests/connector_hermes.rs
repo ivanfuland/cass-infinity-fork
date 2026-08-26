@@ -302,15 +302,33 @@ fn hermes_empty_zero_byte_db_returns_empty_result() {
 
 #[test]
 fn hermes_malformed_schema_returns_empty_result_without_panic() {
+    // R1-N4 (PR-front code review, control-plane adjudicated 2026-08-25): was
+    // using `FrankenStorage::open().into_raw()`, which on a fresh file runs
+    // cass's real migrations first -- those already create a `messages`
+    // table, so this fixture never actually modeled "messages missing" (the
+    // table this test's name claims to cover was present all along, just
+    // via cass's own schema, not hermes's). Routes through the same
+    // schema-free `FrankenConnectionManager` bridge used above so only the
+    // fixture's own `sessions` table exists.
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("malformed.db");
-    let conn = coding_agent_search::storage::sqlite::FrankenStorage::open(&db_path)
-        .expect("open db")
-        .into_raw();
-    // `sessions` exists but `messages` is missing — scan must degrade to empty.
-    conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY)", &[])
-        .expect("create incomplete sessions table");
-    drop(conn);
+    let mgr = coding_agent_search::storage::sqlite::FrankenConnectionManager::new(
+        &db_path,
+        coding_agent_search::storage::sqlite::ConnectionManagerConfig {
+            reader_count: 1,
+            max_writers: 1,
+        },
+    )
+    .expect("open malformed hermes db");
+    {
+        let mut guard = mgr.writer().expect("acquire malformed schema writer");
+        let conn = guard.storage().raw();
+        // `sessions` exists but `messages` is missing — scan must degrade to empty.
+        conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY)", &[])
+            .expect("create incomplete sessions table");
+        guard.mark_committed();
+    }
+    drop(mgr);
 
     assert!(scan_db(&db_path).is_empty());
 }
