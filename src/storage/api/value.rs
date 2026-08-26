@@ -69,10 +69,19 @@ impl FromValue for usize {
     }
 }
 
+// R1-N2 (PR-front code review, control-plane adjudicated 2026-08-25): restored
+// engine-faithful loose conversions from fsqlite 0.1.16's own
+// `FromSqliteValue` impls (registry+https://github.com/rust-lang/
+// crates.io-index, fsqlite-0.1.16/src/compat/row.rs) -- this facade had
+// tightened both f64 and bool into stricter type checks than the engine
+// itself ever enforced, which turns historical/non-standard-schema data from
+// readable into a hard query failure instead of a value.
 impl FromValue for f64 {
     fn from_value(v: Value) -> Result<Self, StorageError> {
         match v {
             Value::Real(f) => Ok(f),
+            // fsqlite 0.1.16 row.rs:92 -- `SqliteValue::Integer(n) => Ok(*n as Self)`.
+            Value::Integer(i) => Ok(i as f64),
             other => Err(type_mismatch("Real", &other)),
         }
     }
@@ -99,13 +108,11 @@ impl FromValue for Vec<u8> {
 impl FromValue for bool {
     fn from_value(v: Value) -> Result<Self, StorageError> {
         match v {
-            Value::Integer(0) => Ok(false),
-            Value::Integer(1) => Ok(true),
-            other @ Value::Integer(_) => Err(StorageError::Other {
-                code: None,
-                detail: format!("invalid bool encoding: {other:?}"),
-            }),
-            other => Err(type_mismatch("Integer(0|1)", &other)),
+            // fsqlite 0.1.16 row.rs:128 -- `SqliteValue::Integer(n) => Ok(*n != 0)`.
+            // Any nonzero integer (2, -1, ...) is truthy, matching historical
+            // boolean-ish columns that were never guaranteed to be exactly 0/1.
+            Value::Integer(i) => Ok(i != 0),
+            other => Err(type_mismatch("Integer", &other)),
         }
     }
 }
@@ -232,7 +239,12 @@ mod tests {
     #[test]
     fn from_value_f64() {
         assert_eq!(f64::from_value(Value::Real(1.5)).unwrap(), 1.5);
-        assert!(f64::from_value(Value::Integer(1)).is_err());
+        // R1-N2: Integer coerces to f64 (engine-faithful, fsqlite 0.1.16
+        // row.rs:92), not a type error -- this test previously asserted the
+        // opposite (a Stage-A-only strictness this facade never should have
+        // had, since it's a new test not a fixture bound by baseline parity).
+        assert_eq!(f64::from_value(Value::Integer(1)).unwrap(), 1.0);
+        assert!(f64::from_value(Value::Text("x".into())).is_err());
     }
 
     #[test]
@@ -247,7 +259,11 @@ mod tests {
     fn from_value_bool() {
         assert!(!bool::from_value(Value::Integer(0)).unwrap());
         assert!(bool::from_value(Value::Integer(1)).unwrap());
-        assert!(bool::from_value(Value::Integer(2)).is_err());
+        // R1-N2: any nonzero integer is truthy (engine-faithful, fsqlite
+        // 0.1.16 row.rs:128 `*n != 0`), not a hard error -- historical
+        // boolean-ish columns were never guaranteed to be exactly 0/1.
+        assert!(bool::from_value(Value::Integer(2)).unwrap());
+        assert!(bool::from_value(Value::Integer(-1)).unwrap());
         assert!(bool::from_value(Value::Null).is_err());
     }
 
