@@ -108,6 +108,10 @@ impl StorageBackend for FrankenBackend {
         result.map_err(map_franken_err)
     }
 
+    /// w1b Task B3 (D2): `TxMode::Immediate` exists as of this task, but
+    /// frankensqlite's `begin_transaction()` takes no mode -- this
+    /// Stage-A-only backend (deleted at the end of Stage B) always begins
+    /// deferred-equivalent regardless of `mode`.
     fn begin(&self, _mode: TxMode) -> Result<(), StorageError> {
         self.conn.begin_transaction().map_err(map_franken_err)
     }

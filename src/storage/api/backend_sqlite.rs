@@ -168,11 +168,19 @@ impl StorageBackend for SqliteBackend {
     /// mirroring frankensqlite's own `&self`-based
     /// begin/commit/rollback_transaction, not by Rust-level exclusivity;
     /// see `conn.rs`'s `StorageBackend::begin` doc comment).
-    fn begin(&self, _mode: TxMode) -> Result<(), StorageError> {
-        // Only variant today is `Deferred` (see `TxMode` doc comment in
-        // conn.rs); bare `BEGIN` is already deferred in SQLite, spelled out
-        // here for self-documentation.
-        self.conn()?.execute_batch("BEGIN DEFERRED;").map_err(map_sqlite_err)
+    fn begin(&self, mode: TxMode) -> Result<(), StorageError> {
+        // w1b Task B3 (D2, plan @775-776): `Immediate` acquires the write
+        // lock immediately at BEGIN rather than deferring it to the first
+        // write statement -- avoids the deferred-transaction upgrade
+        // conflict (another connection grabbing the write lock, or a
+        // snapshot-invalidating commit, between this transaction's read and
+        // its write) that write transactions should not have to contend
+        // with in the first place.
+        let sql = match mode {
+            TxMode::Deferred => "BEGIN DEFERRED;",
+            TxMode::Immediate => "BEGIN IMMEDIATE;",
+        };
+        self.conn()?.execute_batch(sql).map_err(map_sqlite_err)
     }
 
     fn commit(&self) -> Result<(), StorageError> {

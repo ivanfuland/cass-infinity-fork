@@ -21,6 +21,26 @@ pub struct OpenOptions {
     pub busy_timeout: Duration,
 }
 
+/// w1b Task B3 (D2, plan @783-786): statement-level `Busy{Statement}` bounded
+/// retry parameters. "Conservative starting point" per spec -- these are
+/// deliberately generous rather than aggressive; changing them is a recorded
+/// decision (plan @786), not a tuning knob to adjust casually.
+pub(crate) const STATEMENT_RETRY_MAX_ATTEMPTS: u32 = 5;
+pub(crate) const STATEMENT_RETRY_BASE_MS: u64 = 50;
+pub(crate) const STATEMENT_RETRY_TOTAL_CAP_MS: u64 = 1000;
+
+/// w1b Task B3 (D2, plan @775-781): `with_tx`'s whole-transaction replay on
+/// `Busy{Snapshot}` -- only for the `Fn` (pure, re-invocable) closure variant.
+/// `with_tx_no_replay` never uses these.
+pub(crate) const TX_REPLAY_MAX_ATTEMPTS: u32 = 3;
+pub(crate) const TX_REPLAY_BASE_MS: u64 = 100;
+
+/// w1b Task B3: both retry families use base*2^attempt with this symmetric
+/// jitter band (plan's "±25% 抖动") to avoid lock-step retry storms across
+/// threads that hit the same contention at the same moment.
+pub(crate) const RETRY_JITTER_MIN_PERCENT: u64 = 75;
+pub(crate) const RETRY_JITTER_MAX_PERCENT: u64 = 125;
+
 /// w1b Task B2: env var that must be set to exactly `"1"` to unlock
 /// `BulkRebuild`'s non-durable `synchronous=NORMAL` PRAGMA (plan @698-703,
 /// spec R2-F15 + R4-B1 collapse). `--full` alone must never imply it -- named

@@ -3,11 +3,103 @@
 //! [`StorageBackend`], private to this module tree.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use super::backend_franken::FrankenBackend;
-use super::config::{OpenOptions, Profile};
-use super::error::StorageError;
+use super::config::{
+    OpenOptions, Profile, RETRY_JITTER_MAX_PERCENT, RETRY_JITTER_MIN_PERCENT,
+    STATEMENT_RETRY_BASE_MS, STATEMENT_RETRY_MAX_ATTEMPTS, STATEMENT_RETRY_TOTAL_CAP_MS,
+    TX_REPLAY_BASE_MS, TX_REPLAY_MAX_ATTEMPTS,
+};
+use super::error::{BusyScope, StorageError};
 use super::value::Value;
+
+/// w1b Task B3 (D2): SplitMix64-derived jitter source, mirroring
+/// `storage::sqlite::next_franken_retry_jitter_ms`'s approach (no `rand`
+/// dependency for this -- an atomic counter plus a fixed mixing constant is
+/// enough scatter to avoid lock-step retries across threads, and stays
+/// dependency-free at this layer). Not shared with that function directly:
+/// `storage::api` does not depend on `storage::sqlite` (the dependency runs
+/// the other way), so this is a deliberate small duplication, not an
+/// oversight.
+static RETRY_JITTER_STATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn next_jitter_percent() -> u64 {
+    let mut value = RETRY_JITTER_STATE
+        .fetch_add(0x9e37_79b9_7f4a_7c15, std::sync::atomic::Ordering::Relaxed);
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^= value >> 31;
+    let span = RETRY_JITTER_MAX_PERCENT - RETRY_JITTER_MIN_PERCENT + 1;
+    RETRY_JITTER_MIN_PERCENT + (value % span)
+}
+
+/// w1b Task B3 (D2): `base_ms * 2^attempt`, scaled by a `±25%` jitter factor
+/// (plan's "100ms*2^n ±25% 抖动" / "50ms*2^n ±25%"). `attempt` is 0-indexed
+/// (the first retry uses `attempt == 0`).
+fn jittered_backoff_ms(base_ms: u64, attempt: u32) -> u64 {
+    let exp_ms = base_ms.saturating_mul(1u64 << attempt.min(20));
+    exp_ms.saturating_mul(next_jitter_percent()) / 100
+}
+
+/// w1b Task B3 (D2, R1-N2): the shared bounded-retry loop for a single
+/// statement. Only ever invoked on operations with no caller-visible
+/// intermediate state -- a single `execute()` call, or a from-scratch
+/// re-run of a query -- because SQLite guarantees a statement that fails
+/// with `SQLITE_BUSY` made no partial change, so re-running it from
+/// scratch is safe regardless of what it does. This is why `execute_batch`
+/// (multiple statements, autocommit, partial-completion risk) is
+/// deliberately excluded and never routed through this function.
+fn retry_statement_on_busy<T>(
+    mut op: impl FnMut() -> Result<T, StorageError>,
+) -> Result<T, StorageError> {
+    let mut attempt = 0u32;
+    let mut elapsed_ms = 0u64;
+    loop {
+        let outcome = op();
+        match &outcome {
+            Ok(_) => return outcome,
+            Err(StorageError::Busy { scope: BusyScope::Statement }) => {
+                if attempt >= STATEMENT_RETRY_MAX_ATTEMPTS {
+                    return outcome;
+                }
+                let backoff = jittered_backoff_ms(STATEMENT_RETRY_BASE_MS, attempt);
+                if elapsed_ms.saturating_add(backoff) > STATEMENT_RETRY_TOTAL_CAP_MS {
+                    return outcome;
+                }
+                std::thread::sleep(Duration::from_millis(backoff));
+                elapsed_ms += backoff;
+                attempt += 1;
+                #[cfg(test)]
+                test_support::note_statement_retry();
+            }
+            Err(_) => return outcome,
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::cell::Cell;
+
+    thread_local! {
+        static STATEMENT_RETRY_COUNT: Cell<u32> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn note_statement_retry() {
+        STATEMENT_RETRY_COUNT.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(crate) fn reset_statement_retry_count() {
+        STATEMENT_RETRY_COUNT.with(|c| c.set(0));
+    }
+
+    pub(crate) fn statement_retry_count() -> u32 {
+        STATEMENT_RETRY_COUNT.with(|c| c.get())
+    }
+}
 
 /// Backend SPI (R0-F1, spec §3.2 trait layer's landing point). Private to `api`;
 /// consumers only ever see [`Conn`]/[`Row`]/[`Tx`].
@@ -56,12 +148,19 @@ pub(crate) trait StorageBackend {
     }
 }
 
-/// Transaction begin mode. Only one variant exists in Stage A (fsqlite's
-/// `begin_transaction()` takes no mode); Stage B's D2 concurrency model may
-/// add Immediate/Exclusive without changing the `StorageBackend` signature.
+/// Transaction begin mode. w1b Task B3 (D2, plan @775-776) adds `Immediate`
+/// -- write transactions use it deliberately (avoids the deferred-upgrade
+/// deadlock/BUSY_SNAPSHOT surface a `Deferred` transaction hits the moment it
+/// tries to upgrade from a read to a write). `pub` per the plan's stated
+/// interface: callers choosing between `with_tx`/`with_tx_no_replay` pick a
+/// mode explicitly. `backend_franken.rs` (Stage A, deleted at Stage B's end)
+/// cannot distinguish modes -- fsqlite's `begin_transaction()` takes none --
+/// so it ignores this and always begins deferred-equivalent; only
+/// `backend_sqlite.rs` (the eventual production backend) branches on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TxMode {
+pub enum TxMode {
     Deferred,
+    Immediate,
 }
 
 pub struct Row<'a> {
@@ -229,9 +328,20 @@ impl Conn {
         Ok(Conn { inner: Box::new(backend), path: None })
     }
 
+    /// w1b Task B3 (D2, R1-N2): bounded-retries on a real `Busy{Statement}`
+    /// (up to [`super::config::STATEMENT_RETRY_MAX_ATTEMPTS`] times, capped
+    /// at [`super::config::STATEMENT_RETRY_TOTAL_CAP_MS`] total elapsed
+    /// backoff). Safe because a single statement that fails with
+    /// `SQLITE_BUSY` made no partial change -- re-running it is not a
+    /// double-apply risk the way re-running `execute_batch` would be.
+    /// `Busy{Snapshot}` and `Locked` are NOT retried here (`Locked` per
+    /// spec §3.3 -- a connection-discipline defect that retries into an
+    /// infinite loop; `Busy{Snapshot}` needs a whole-transaction replay,
+    /// which only makes sense inside `with_tx`, not a bare single-statement
+    /// `execute()` with no transaction context to replay).
     pub fn execute(&self, sql: &str, params: &[Value]) -> Result<usize, StorageError> {
         reject_foreign_keys_keyword(sql)?;
-        self.inner.execute(sql, params)
+        retry_statement_on_busy(|| self.inner.execute(sql, params))
     }
 
     pub fn execute_batch(&self, sql: &str) -> Result<(), StorageError> {
@@ -287,8 +397,75 @@ impl Conn {
 
     /// plan delta d4: `&self` (see [`StorageBackend::begin`] doc comment).
     pub fn transaction(&self) -> Result<Tx<'_>, StorageError> {
-        self.inner.begin(TxMode::Deferred)?;
+        self.transaction_with_mode(TxMode::Deferred)
+    }
+
+    /// w1b Task B3 (D2): like [`Conn::transaction`], but lets the caller pick
+    /// [`TxMode`] explicitly -- the primitive `with_tx`/`with_tx_no_replay`
+    /// build on.
+    pub fn transaction_with_mode(&self, mode: TxMode) -> Result<Tx<'_>, StorageError> {
+        self.inner.begin(mode)?;
         Ok(Tx { backend: self.inner.as_ref(), finalized: false })
+    }
+
+    /// w1b Task B3 (D2 core, plan @775-781): whole-transaction replay on a
+    /// real `Busy{Snapshot}` conflict (up to
+    /// [`super::config::TX_REPLAY_MAX_ATTEMPTS`] times, `100ms*2^n ±25%`
+    /// backoff between attempts). `f` must be a pure DB closure -- no
+    /// caller-visible side effects outside the database -- because a replay
+    /// re-invokes it from scratch against a brand-new transaction after the
+    /// failed one was rolled back (via `Tx`'s `Drop`). That purity
+    /// requirement is why this takes `impl Fn`, not `impl FnOnce`: the type
+    /// system only allows something callable more than once. It does NOT
+    /// prove the closure is actually free of non-DB side effects (Rust can't
+    /// check that) -- callers whose closure does anything outside the
+    /// database (I/O, logging with external effects, mutating state a retry
+    /// would double-apply) must use [`Conn::with_tx_no_replay`] instead, even
+    /// though its `FnOnce` signature happens to accept a technically-`Fn`
+    /// closure too.
+    ///
+    /// Any other error (including `Locked`, which spec §3.3 found retries
+    /// into an infinite loop) propagates immediately without retry.
+    pub fn with_tx<T>(
+        &self,
+        mode: TxMode,
+        f: impl Fn(&Tx) -> Result<T, StorageError>,
+    ) -> Result<T, StorageError> {
+        let mut attempt = 0u32;
+        loop {
+            let tx = self.transaction_with_mode(mode)?;
+            let outcome = match f(&tx) {
+                Ok(value) => tx.commit().map(|()| value),
+                Err(err) => Err(err),
+            };
+            match outcome {
+                Ok(value) => return Ok(value),
+                Err(StorageError::Busy { scope: BusyScope::Snapshot })
+                    if attempt < TX_REPLAY_MAX_ATTEMPTS =>
+                {
+                    let backoff = jittered_backoff_ms(TX_REPLAY_BASE_MS, attempt);
+                    std::thread::sleep(Duration::from_millis(backoff));
+                    attempt += 1;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    /// w1b Task B3 (D2): non-replaying counterpart to [`Conn::with_tx`] for a
+    /// closure that is not (or is not known to be) a pure DB operation --
+    /// runs the closure exactly once, commits on success, and propagates any
+    /// error (including `Busy{Snapshot}`) without retry. The transaction
+    /// still rolls back on any error path via `Tx`'s `Drop`.
+    pub fn with_tx_no_replay<T>(
+        &self,
+        mode: TxMode,
+        f: impl FnOnce(&Tx) -> Result<T, StorageError>,
+    ) -> Result<T, StorageError> {
+        let tx = self.transaction_with_mode(mode)?;
+        let value = f(&tx)?;
+        tx.commit()?;
+        Ok(value)
     }
 
     pub fn last_insert_rowid(&self) -> i64 {
@@ -341,9 +518,16 @@ pub struct Tx<'c> {
 }
 
 impl Tx<'_> {
+    /// w1b Task B3 (D2): same statement-level bounded retry as
+    /// [`Conn::execute`] -- retrying just this one statement (not the whole
+    /// transaction) is safe for the same reason: a statement that fails with
+    /// `SQLITE_BUSY` made no partial change. `Busy{Snapshot}` propagates
+    /// immediately here; only [`Conn::with_tx`]'s whole-transaction replay
+    /// handles that (this `Tx` may already be too far along to safely retry
+    /// in place -- e.g. earlier statements already executed against it).
     pub fn execute(&self, sql: &str, params: &[Value]) -> Result<usize, StorageError> {
         reject_foreign_keys_keyword(sql)?;
-        self.backend.execute(sql, params)
+        retry_statement_on_busy(|| self.backend.execute(sql, params))
     }
 
     pub fn execute_batch(&self, sql: &str) -> Result<(), StorageError> {
@@ -451,8 +635,23 @@ impl Drop for Tx<'_> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::backend_sqlite::SqliteBackend;
     use super::super::params;
     use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// w1b Task B3 (D2): test-only construction of a `Conn` wrapping the real
+    /// `SqliteBackend` (rusqlite/real SQLite), not the Stage-A frankensqlite
+    /// backend `Conn::open_writable` currently resolves to. The real
+    /// `BUSY`/`BUSY_SNAPSHOT` concurrency tests in this module need genuine
+    /// SQLite WAL/MVCC semantics -- this is scoped to `#[cfg(test)]` only and
+    /// does not touch the (separately-tracked, out-of-scope-for-B3) question
+    /// of when `Conn::open_writable` itself cuts over to `SqliteBackend`.
+    fn open_writable_sqlite_for_test(path: &Path) -> Conn {
+        let backend = SqliteBackend::open_writable(path.to_str().unwrap(), Profile::Production)
+            .expect("open real sqlite backend for test");
+        Conn { inner: Box::new(backend), path: Some(path.to_path_buf()) }
+    }
 
     #[test]
     fn api_conn_memory_smoke() {
@@ -586,5 +785,215 @@ mod tests {
         let tx = c.transaction().unwrap();
         let err = tx.defer_foreign_keys().unwrap_err();
         assert!(matches!(err, StorageError::Other { .. }));
+    }
+
+    // =========================================================================
+    // w1b Task B3 (D2): retry / whole-transaction replay
+    // =========================================================================
+
+    /// Plan Step 1①: two real connections, a real `Busy{Statement}`,
+    /// statement-level retry succeeds once the lock clears, retry count > 0.
+    ///
+    /// Drops to raw `rusqlite::Connection` rather than `Conn`/`Tx`
+    /// (discovered live while wiring this test up): `StorageBackend` has no
+    /// `Send` bound, and cannot gain one without breaking the still-active
+    /// `FrankenBackend` impl -- fsqlite's `Connection` holds `Rc<RefCell<_>>`
+    /// state internally and is not `Send`. So `Box<dyn StorageBackend>` (and
+    /// therefore `Conn`, and `Tx`'s `&dyn StorageBackend`) cannot cross a
+    /// thread boundary today. That's a real architectural fact surfaced by
+    /// this task, not a workaround-of-convenience: it means the `Conn`/`Tx`
+    /// facade itself is single-thread-only until `backend_franken.rs` is
+    /// retired, worth flagging for B4's `WriterHandle` design too. This test
+    /// exercises the actual production `retry_statement_on_busy` function
+    /// (not a reimplementation) against real rusqlite contention instead.
+    #[test]
+    fn api_execute_retries_past_real_statement_busy_and_succeeds() {
+        let dir = std::env::temp_dir()
+            .join(format!("cc-cass-w1b-b3-stmt-busy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("t.db");
+        let db_path_str = db_path.to_str().unwrap().to_string();
+
+        let holder = rusqlite::Connection::open(&db_path_str).unwrap();
+        holder.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY);").unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        holder.execute("INSERT INTO t(id) VALUES (1)", []).unwrap();
+        // Left open (not committed) -- the contender below must collide.
+
+        let contender = rusqlite::Connection::open(&db_path_str).unwrap();
+        // busy_timeout=0 so contention surfaces as a real Busy{Statement}
+        // immediately instead of blocking inside SQLite's own C busy
+        // handler -- exactly like `backend_sqlite.rs`'s
+        // `map_sqlite_err_real_busy_statement_from_write_contention` (this
+        // task's own retry loop is meant to own that responsibility instead).
+        contender.busy_timeout(Duration::from_millis(0)).unwrap();
+
+        // Release the lock partway through the contender's retry window
+        // (well inside the ~750ms-1000ms the retry schedule allows) so this
+        // proves convergence, not a race against the cap. `rusqlite::
+        // Connection` is `Send` (just not `Sync`), so moving `holder` here
+        // is fine.
+        let release_handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            holder.execute_batch("COMMIT;").unwrap();
+        });
+
+        test_support::reset_statement_retry_count();
+        let result = retry_statement_on_busy(|| {
+            contender
+                .execute("INSERT INTO t(id) VALUES (2)", [])
+                .map_err(super::super::backend_sqlite::map_sqlite_err)
+        });
+        release_handle.join().unwrap();
+
+        assert!(result.is_ok(), "expected the retry loop to converge once the lock cleared, got {result:?}");
+        assert!(test_support::statement_retry_count() > 0, "expected at least one observed retry");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Plan Step 1②: injected `Busy{Snapshot}` from within the closure --
+    /// `with_tx` must re-invoke it and eventually return the successful
+    /// result.
+    #[test]
+    fn api_with_tx_replays_closure_on_injected_busy_snapshot() {
+        let c = Conn::open_memory().unwrap();
+        c.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY);").unwrap();
+
+        let call_count = AtomicU32::new(0);
+        let result = c.with_tx(TxMode::Immediate, |tx| {
+            let n = call_count.fetch_add(1, Ordering::SeqCst);
+            if n < 2 {
+                return Err(StorageError::Busy { scope: BusyScope::Snapshot });
+            }
+            tx.execute("INSERT INTO t(id) VALUES (1)", &[])?;
+            Ok(())
+        });
+
+        assert!(result.is_ok(), "expected with_tx to replay past injected Busy{{Snapshot}}: {result:?}");
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            3,
+            "expected 2 injected failures + 1 successful invocation"
+        );
+        let n: i64 = c.query_row_map("SELECT count(*) FROM t", &[], |r| r.get_typed(0)).unwrap();
+        assert_eq!(n, 1, "the successful attempt's write must have committed exactly once");
+    }
+
+    /// Plan Step 1③: `Locked` must never be retried, at either the
+    /// statement level or `with_tx`'s transaction-replay level.
+    #[test]
+    fn api_locked_is_never_retried() {
+        let c = Conn::open_memory().unwrap();
+        c.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY);").unwrap();
+
+        let call_count = AtomicU32::new(0);
+        let result = c.with_tx(TxMode::Immediate, |_tx| {
+            call_count.fetch_add(1, Ordering::SeqCst);
+            Err::<(), _>(StorageError::Locked)
+        });
+        assert!(matches!(result, Err(StorageError::Locked)));
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "Locked must propagate on the first attempt, with_tx must not replay it"
+        );
+
+        // Statement-level: `retry_statement_on_busy` itself, isolated from
+        // any real connection, must not retry a `Locked` outcome either.
+        let stmt_call_count = AtomicU32::new(0);
+        let stmt_result = retry_statement_on_busy(|| {
+            stmt_call_count.fetch_add(1, Ordering::SeqCst);
+            Err::<(), _>(StorageError::Locked)
+        });
+        assert!(matches!(stmt_result, Err(StorageError::Locked)));
+        assert_eq!(stmt_call_count.load(Ordering::SeqCst), 1);
+    }
+
+    /// Plan Step 1④ (R4-B4, "本组最承重"): a REAL end-to-end `BUSY_SNAPSHOT`
+    /// chain, not an injected one -- connection A begins DEFERRED and reads
+    /// a row (establishing a read snapshot), connection B writes and
+    /// commits (advancing the WAL past A's snapshot), then A attempts a
+    /// write inside the SAME still-open transaction. That sequence is
+    /// deliberately built without any thread/timing race for the conflict
+    /// itself (only `with_tx`'s own backoff sleep involves real time) --
+    /// steps happen in strict sequence across the two connections, so the
+    /// real `SQLITE_BUSY_SNAPSHOT` this manufactures is deterministic, not
+    /// timing-dependent.
+    #[test]
+    fn api_with_tx_replays_past_a_real_busy_snapshot_conflict() {
+        // Half A: prove the extended-code mapping fires for real, standalone
+        // (not wrapped in with_tx yet) -- this is the "real scenario exists"
+        // half of Step 1④'s assertion.
+        let dir_a = std::env::temp_dir()
+            .join(format!("cc-cass-w1b-b3-snapshot-mapping-{}", std::process::id()));
+        std::fs::create_dir_all(&dir_a).unwrap();
+        let db_path_a = dir_a.join("t.db");
+
+        let conn_a = open_writable_sqlite_for_test(&db_path_a);
+        conn_a
+            .execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER NOT NULL);")
+            .unwrap();
+        conn_a.execute("INSERT INTO t(id, v) VALUES (1, 0)", &[]).unwrap();
+
+        let tx_a = conn_a.transaction_with_mode(TxMode::Deferred).unwrap();
+        let _v: i64 =
+            tx_a.query_row_map("SELECT v FROM t WHERE id = 1", &[], |r| r.get_typed(0)).unwrap();
+
+        let conn_b = open_writable_sqlite_for_test(&db_path_a);
+        conn_b.execute("UPDATE t SET v = v + 1 WHERE id = 1", &[]).unwrap();
+        drop(conn_b);
+
+        let write_err = tx_a.execute("UPDATE t SET v = v + 100 WHERE id = 1", &[]).unwrap_err();
+        assert!(
+            matches!(write_err, StorageError::Busy { scope: BusyScope::Snapshot }),
+            "expected a real BUSY_SNAPSHOT from the extended-code mapping, got {write_err:?}"
+        );
+        drop(tx_a);
+        std::fs::remove_dir_all(&dir_a).ok();
+
+        // Half B: the same real conflict, this time driven through
+        // `with_tx`, proving the whole-transaction replay actually recovers
+        // from it and commits successfully.
+        let dir_b = std::env::temp_dir()
+            .join(format!("cc-cass-w1b-b3-snapshot-replay-{}", std::process::id()));
+        std::fs::create_dir_all(&dir_b).unwrap();
+        let db_path_b = dir_b.join("t.db");
+
+        let conn = open_writable_sqlite_for_test(&db_path_b);
+        conn.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER NOT NULL);")
+            .unwrap();
+        conn.execute("INSERT INTO t(id, v) VALUES (1, 0)", &[]).unwrap();
+
+        let attempt_count = AtomicU32::new(0);
+        let result = conn.with_tx(TxMode::Deferred, |tx| {
+            let n = attempt_count.fetch_add(1, Ordering::SeqCst);
+            let _v: i64 =
+                tx.query_row_map("SELECT v FROM t WHERE id = 1", &[], |r| r.get_typed(0))?;
+            if n == 0 {
+                // Only on the first attempt: interleave a real conflicting
+                // commit from another connection while this transaction is
+                // still open, so the write below hits a real BUSY_SNAPSHOT
+                // (not an injected one) on this attempt specifically.
+                let interloper = open_writable_sqlite_for_test(&db_path_b);
+                interloper.execute("UPDATE t SET v = v + 1 WHERE id = 1", &[])?;
+                drop(interloper);
+            }
+            tx.execute("UPDATE t SET v = v + 100 WHERE id = 1", &[])?;
+            Ok(())
+        });
+
+        assert!(result.is_ok(), "expected with_tx to replay past a real BUSY_SNAPSHOT: {result:?}");
+        assert!(
+            attempt_count.load(Ordering::SeqCst) >= 2,
+            "expected the closure to be re-invoked after the real snapshot conflict, got {} attempts",
+            attempt_count.load(Ordering::SeqCst)
+        );
+
+        let final_v: i64 =
+            conn.query_row_map("SELECT v FROM t WHERE id = 1", &[], |r| r.get_typed(0)).unwrap();
+        assert_eq!(final_v, 101, "expected exactly one successful +1 (interloper) and one +100 (replayed write), not a double-apply");
+
+        std::fs::remove_dir_all(&dir_b).ok();
     }
 }
