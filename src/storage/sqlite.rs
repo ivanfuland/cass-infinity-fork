@@ -4312,6 +4312,23 @@ impl FrankenStorage {
         Ok(storage)
     }
 
+    /// w1b Task B4: wrap an already-open writable connection into a
+    /// `FrankenStorage`, applying the same writer-side setup
+    /// (`apply_config` + FTS-messages-present fast path) that
+    /// `open_writer`/`open_writer_with_shared_caches` apply to a connection
+    /// they open themselves. Does not open a new connection -- this exists
+    /// specifically so `storage::api::WriterHandle<FrankenStorage>` (whose
+    /// writer thread already owns exactly one `Conn`) can hand it in here
+    /// instead of a second call opening a second connection. Never call
+    /// this with a connection whose lifetime is not already owned by the
+    /// caller for exactly this purpose.
+    pub(crate) fn from_writer_handle_conn(conn: FrankenConnection, db_path: PathBuf) -> Result<Self> {
+        let storage = Self::new(conn, db_path);
+        storage.apply_config()?;
+        storage.set_fts_messages_present_cache(true);
+        Ok(storage)
+    }
+
     pub(crate) fn acquire_cached_ephemeral_writer(&self) -> Result<(Self, bool)> {
         let mut cached = self.cached_ephemeral_writer.lock();
         match std::mem::replace(&mut *cached, CachedEphemeralWriter::InUse) {

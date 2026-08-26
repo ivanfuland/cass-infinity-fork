@@ -25319,7 +25319,9 @@ pub mod persist {
     use crate::search::tantivy::TantivyIndex;
     #[cfg(test)]
     use crate::sources::provenance::{Source, SourceKind};
-    use crate::storage::sqlite::{FrankenStorage, IndexingCache, InsertOutcome};
+    use crate::storage::sqlite::{
+        FrankenStorage, IndexingCache, InsertOutcome, anyhow_error_into_storage_error,
+    };
 
     /// `coding_agent_session_search-5b9p0` (ibuuh.32 follow-up):
     /// builds a [`ConversationPacket`] for the lexical sink AND the
@@ -26121,61 +26123,35 @@ pub mod persist {
         Ok(ChunkPersistResult::Completed(outcomes))
     }
 
+    /// w1b Task B4: the fallback pass used to open its own dedicated
+    /// `FrankenStorage::open_writer` connection -- a second live writer
+    /// connection alongside whatever the primary chunk pass still held.
+    /// It now submits through the same `WriterHandle` the primary pass
+    /// uses, so the "at most 1 live writer connection" invariant holds
+    /// across the fallback path too, not just the happy path.
     fn persist_chunk_serial_fallback(
-        db_path: &std::path::Path,
+        writer_handle: &crate::storage::api::WriterHandle<FrankenStorage>,
         base_idx: usize,
         chunk: &[NormalizedConversation],
         internal_chunk: &[Conversation],
         max_retries: usize,
-        defer_checkpoints: bool,
     ) -> Result<Vec<(usize, InsertOutcome)>> {
-        let franken = FrankenStorage::open_writer(db_path).with_context(|| {
-            format!(
-                "opening frankensqlite writer for begin-concurrent serial fallback: {}",
-                db_path.display()
-            )
-        })?;
-        apply_begin_concurrent_writer_tuning(&franken, defer_checkpoints);
         // w1b Task B2b (R0-B3): CASS #169 FK-disable removed -- see the
         // longer rationale on `with_ephemeral_writer`'s equivalent site.
         let fallback_retries = max_retries.max(12);
-        let result =
-            persist_chunk_with_writer(&franken, base_idx, chunk, internal_chunk, fallback_retries);
-        let close_result = franken.close().with_context(|| {
-            format!(
-                "closing frankensqlite writer for begin-concurrent serial fallback: {}",
-                db_path.display()
-            )
-        });
+        let chunk_owned = chunk.to_vec();
+        let internal_chunk_owned = internal_chunk.to_vec();
+        let result = writer_handle
+            .submit(move |franken: &FrankenStorage| {
+                persist_chunk_with_writer(franken, base_idx, &chunk_owned, &internal_chunk_owned, fallback_retries)
+                    .map_err(anyhow_error_into_storage_error)
+            })
+            .map_err(|e| anyhow!("{e}"))?;
 
         match result {
-            Ok(ChunkPersistResult::Completed(outcomes)) => {
-                close_result?;
-                Ok(outcomes)
-            }
-            Ok(ChunkPersistResult::RetryableFallback {
-                completed,
-                remaining_range,
-                error,
-            }) => {
-                if let Err(close_err) = close_result {
-                    tracing::warn!(
-                        error = %close_err,
-                        db_path = %db_path.display(),
-                        "failed to close serial fallback writer cleanly after retry exhaustion"
-                    );
-                }
+            ChunkPersistResult::Completed(outcomes) => Ok(outcomes),
+            ChunkPersistResult::RetryableFallback { completed, remaining_range, error } => {
                 ordered_bail_serial_fallback(completed.len(), remaining_range, error)
-            }
-            Err(err) => {
-                if let Err(close_err) = close_result {
-                    tracing::warn!(
-                        error = %close_err,
-                        db_path = %db_path.display(),
-                        "failed to close serial fallback writer cleanly after index error"
-                    );
-                }
-                Err(err)
             }
         }
     }
@@ -26257,81 +26233,68 @@ pub mod persist {
             )
             .collect();
 
-        let indexed_chunks: Vec<Result<ChunkPersistResult>> = convs
-            .par_chunks(chunk_size)
-            .enumerate()
-            .map(|(chunk_idx, chunk)| {
-                let base_idx = chunk_idx * chunk_size;
-                let internal_chunk = &internal_convs[base_idx..base_idx + chunk.len()];
-                // Card 1 / Silo shadow observer — observes only, NO commit
-                // semantics change. When CASS_INDEXER_PARALLEL_WAL=shadow is
-                // set, this records per-chunk wall-clock so future sessions
-                // can compare what a parallel-WAL coordinator would have
-                // decided. Explicit `off` mode returns None; default shadow
-                // mode records a tiny bounded evidence manifest.
-                let shadow_guard = crate::indexer::parallel_wal_shadow::start_chunk(
-                    chunk_idx,
-                    base_idx,
-                    chunk.len(),
-                );
-                let franken = FrankenStorage::open_writer(db_path).with_context(|| {
-                    format!(
-                        "opening frankensqlite writer for begin-concurrent mode: {}",
-                        db_path.display()
-                    )
-                })?;
-                apply_begin_concurrent_writer_tuning(&franken, defer_checkpoints);
-                // w1b Task B2b (R0-B3): CASS #169 FK-disable removed -- see
-                // the longer rationale on `with_ephemeral_writer`'s
-                // equivalent site.
-                let result = persist_chunk_with_writer(
-                    &franken,
-                    base_idx,
-                    chunk,
-                    internal_chunk,
-                    max_retries,
-                );
-                let close_result = franken.close().with_context(|| {
-                    format!(
-                        "closing frankensqlite writer for begin-concurrent mode: {}",
-                        db_path.display()
-                    )
-                });
-                match result {
-                    Ok(outcomes) => {
-                        close_result?;
-                        if let Some(g) = shadow_guard {
-                            g.finish_ok();
-                        }
-                        Ok(outcomes)
-                    }
-                    Err(err) => {
-                        if let Err(close_err) = close_result {
-                            tracing::warn!(
-                                error = %close_err,
-                                db_path = %db_path.display(),
-                                "failed to close begin-concurrent writer cleanly after index error"
-                            );
-                        }
-                        if let Some(g) = shadow_guard {
-                            g.finish_err();
-                        }
-                        Err(err)
-                    }
-                }
-            })
-            .collect();
+        // w1b Task B4 (secondary contract #4): the rayon pool above only
+        // does CPU-side parsing (`internal_convs`). Every chunk's actual
+        // SQLite writes now funnel through one dedicated writer thread via
+        // `WriterHandle`, instead of each chunk opening its own
+        // `FrankenStorage::open_writer` connection in parallel -- that
+        // "one connection per rayon chunk" pattern was the only site in
+        // the codebase that structurally opened more than one live writer
+        // connection on the same path at once
+        // (`w1b-b4-write-topology-inventory.md` §③, M5). Chunks are still
+        // dispatched one at a time here (`.chunks()`, not `.par_chunks()`)
+        // because the writer thread would serialize them regardless; the
+        // parallelism that mattered (parsing/redaction) already happened
+        // above.
+        let writer_db_path = db_path.to_path_buf();
+        let writer_db_path_for_build = writer_db_path.clone();
+        let (writer_handle, writer_join) = crate::storage::api::WriterHandle::<FrankenStorage>::spawn(
+            writer_db_path,
+            crate::storage::api::Profile::Production,
+            move |conn| {
+                let storage = FrankenStorage::from_writer_handle_conn(conn, writer_db_path_for_build)
+                    .map_err(anyhow_error_into_storage_error)?;
+                apply_begin_concurrent_writer_tuning(&storage, defer_checkpoints);
+                Ok(storage)
+            },
+        )
+        .with_context(|| {
+            format!("spawning begin-concurrent writer handle for {}", db_path.display())
+        })?;
 
         let mut ordered = Vec::with_capacity(convs.len());
         let mut fallback_ranges = Vec::new();
-        for chunk in indexed_chunks {
-            match chunk? {
-                ChunkPersistResult::Completed(outcomes) => ordered.extend(outcomes),
-                ChunkPersistResult::RetryableFallback {
-                    completed,
-                    remaining_range,
-                    error,
-                } => {
+        for (chunk_idx, chunk) in convs.chunks(chunk_size).enumerate() {
+            let base_idx = chunk_idx * chunk_size;
+            let internal_chunk = internal_convs[base_idx..base_idx + chunk.len()].to_vec();
+            let chunk_owned = chunk.to_vec();
+            // Card 1 / Silo shadow observer — observes only, NO commit
+            // semantics change. When CASS_INDEXER_PARALLEL_WAL=shadow is
+            // set, this records per-chunk wall-clock so future sessions
+            // can compare what a parallel-WAL coordinator would have
+            // decided. Explicit `off` mode returns None; default shadow
+            // mode records a tiny bounded evidence manifest.
+            let shadow_guard =
+                crate::indexer::parallel_wal_shadow::start_chunk(chunk_idx, base_idx, chunk.len());
+            // w1b Task B2b (R0-B3): CASS #169 FK-disable removed -- see the
+            // longer rationale on `with_ephemeral_writer`'s equivalent site.
+            let result = writer_handle
+                .submit(move |franken: &FrankenStorage| {
+                    persist_chunk_with_writer(franken, base_idx, &chunk_owned, &internal_chunk, max_retries)
+                        .map_err(anyhow_error_into_storage_error)
+                })
+                .map_err(|e| anyhow!("{e}"));
+            match result {
+                Ok(ChunkPersistResult::Completed(outcomes)) => {
+                    if let Some(g) = shadow_guard {
+                        g.finish_ok();
+                    }
+                    ordered.extend(outcomes);
+                }
+                Ok(ChunkPersistResult::RetryableFallback { completed, remaining_range, error }) => {
+                    if let Some(g) = shadow_guard {
+                        g.finish_err();
+                    }
                     tracing::warn!(
                         error = %error,
                         completed = completed.len(),
@@ -26343,20 +26306,34 @@ pub mod persist {
                     ordered.extend(completed);
                     fallback_ranges.push(remaining_range);
                 }
+                Err(err) => {
+                    if let Some(g) = shadow_guard {
+                        g.finish_err();
+                    }
+                    drop(writer_handle);
+                    let _ = writer_join.join();
+                    return Err(err);
+                }
             }
         }
 
         for remaining_range in fallback_ranges {
             let fallback_outcomes = persist_chunk_serial_fallback(
-                db_path,
+                &writer_handle,
                 remaining_range.start,
                 &convs[remaining_range.clone()],
                 &internal_convs[remaining_range.clone()],
                 max_retries,
-                defer_checkpoints,
             )?;
             ordered.extend(fallback_outcomes);
         }
+
+        // Release the writer thread's connection before any post-processing
+        // below might want a fresh connection of its own -- keeps the
+        // "at most 1 live writer on this path" invariant tight to this
+        // function's own write phase, not artificially extended past it.
+        drop(writer_handle);
+        writer_join.join().map_err(|_| anyhow!("begin-concurrent writer thread panicked"))?;
         ordered.sort_by_key(|(idx, _)| *idx);
         if let Some(data_dir) = raw_mirror_data_dir {
             for (idx, outcome) in &ordered {
@@ -27518,6 +27495,106 @@ pub mod persist {
             assert_eq!(agent_count, 3, "3 distinct agent slugs should exist");
 
             // Commit tantivy to finalize
+            t_index.commit().unwrap();
+        }
+
+        /// B4 Step 2 assertion ②: the rayon-parallel-chunk direct-write path
+        /// must land the same artifact as `begin_concurrent_persist_writes_all_conversations`
+        /// above (conversation/message/agent counts all match) while never
+        /// holding more than 1 live writer connection on the db path at
+        /// once. Pre-B4 this is red -- `persist_conversations_batched_begin_concurrent`
+        /// opens one `FrankenStorage::open_writer` per rayon chunk inside
+        /// `par_chunks().map()`, so a chunk size smaller than the corpus
+        /// drives the peak above 1.
+        #[test]
+        fn begin_concurrent_persist_never_exceeds_one_live_writer_connection() {
+            use crate::connectors::NormalizedConversation;
+            use crate::search::tantivy::TantivyIndex;
+            use crate::storage::api::{reset_writer_connection_peak, writer_connection_peak};
+
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("mini-corpus.db");
+            let index_path = dir.path().join("tantivy");
+
+            let frank = create_franken_db(&db_path);
+            drop(frank);
+            let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
+
+            // 6 conversations, chunk size 2 -> 3 parallel chunks pre-B4.
+            let convs: Vec<NormalizedConversation> = (0..6)
+                .map(|i| {
+                    let slug = format!("agent-{}", i % 2);
+                    NormalizedConversation {
+                        agent_slug: slug,
+                        external_id: Some(format!("mini-conv-{i}")),
+                        title: Some(format!("Mini conversation {i}")),
+                        workspace: Some(std::path::PathBuf::from(format!("/ws/mini-{i}"))),
+                        source_path: std::path::PathBuf::from(format!("/log/mini-{i}.jsonl")),
+                        started_at: Some(2000 + i * 100),
+                        ended_at: Some(2000 + i * 100 + 50),
+                        metadata: serde_json::json!({}),
+                        messages: (0..2)
+                            .map(|j| NormalizedMessage {
+                                idx: j,
+                                role: if j % 2 == 0 { "user" } else { "assistant" }.to_string(),
+                                author: Some("tester".into()),
+                                created_at: Some(2000 + i * 100 + j * 10),
+                                content: format!("mini-corpus conv={i} msg={j}"),
+                                extra: serde_json::json!({}),
+                                snippets: vec![],
+                                invocations: Vec::new(),
+                            })
+                            .collect(),
+                    }
+                })
+                .collect();
+
+            let _chunk_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE", "2");
+            // The caller-supplied `storage` handle below is a pre-existing,
+            // general-purpose connection opened before this call for
+            // reasons outside B4's scope (`Storage::open` read-only-ization
+            // is explicitly deferred to B7 -- see the write-topology
+            // inventory M2/M3). Reset *after* opening it so the assertion
+            // below isolates exactly what this call's own writer-thread
+            // spawn is responsible for, not the caller's pre-existing
+            // connection.
+            let caller_storage = FrankenStorage::open(&db_path).unwrap();
+            let baseline_writer_connections = crate::storage::api::writer_connection_count(&db_path);
+            reset_writer_connection_peak(&db_path);
+
+            persist_conversations_batched_begin_concurrent(
+                &caller_storage,
+                &db_path,
+                Some(&mut t_index),
+                &convs,
+                LexicalPopulationStrategy::InlineRebuildFromScan,
+                false,
+                false,
+                None,
+            )
+            .expect("begin-concurrent persist should succeed");
+
+            let reader = FrankenStorage::open(&db_path).unwrap();
+            let conv_count: i64 = reader
+                .raw()
+                .query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| row.get_typed(0))
+                .unwrap();
+            let msg_count: i64 = reader
+                .raw()
+                .query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0))
+                .unwrap();
+            assert_eq!(conv_count, 6, "artifact equivalence: all 6 mini-corpus conversations must land");
+            assert_eq!(msg_count, 12, "artifact equivalence: all 12 mini-corpus messages must land");
+
+            assert_eq!(
+                writer_connection_peak(&db_path) - baseline_writer_connections,
+                1,
+                "B4 invariant: this call must open exactly 1 NEW live writer connection \
+                 (its own WriterHandle thread) beyond whatever the caller already had open, \
+                 even across parallel rayon chunks -- workers must hand parsed batches to a \
+                 single writer thread instead of each opening their own connection"
+            );
+
             t_index.commit().unwrap();
         }
 

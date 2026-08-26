@@ -288,6 +288,13 @@ fn query_all_map_impl<T>(
 pub struct Conn {
     inner: Box<dyn StorageBackend>,
     path: Option<PathBuf>,
+    /// w1b Task B4: present only on connections opened through
+    /// [`Conn::open_writable`]. Its `Drop` decrements the process-wide
+    /// per-path writer-connection registry (`super::writer`), which is how
+    /// the B4 "at most one live writer connection per path" invariant is
+    /// observed at runtime regardless of which call site opened the
+    /// connection.
+    _writer_open_guard: Option<super::writer::WriterOpenGuard>,
 }
 
 /// Task A4a: some consumers embed `Conn` in a `#[derive(Debug)]` struct or
@@ -303,7 +310,7 @@ impl std::fmt::Debug for Conn {
 impl Conn {
     pub fn open_read(path: &Path) -> Result<Conn, StorageError> {
         let backend = FrankenBackend::open_read_only(path_to_str(path)?)?;
-        Ok(Conn { inner: Box::new(backend), path: Some(path.to_path_buf()) })
+        Ok(Conn { inner: Box::new(backend), path: Some(path.to_path_buf()), _writer_open_guard: None })
     }
 
     pub fn open_read_with(path: &Path, opts: OpenOptions) -> Result<Conn, StorageError> {
@@ -317,15 +324,23 @@ impl Conn {
 
     /// Writable connection construction is deliberately not `pub` (R2-F3): the only
     /// public path to a writable `Conn` is `open_memory()` (test fixture) plus,
-    /// once built, the `WriterHandle`/schema call sites within this crate.
+    /// once built, the `WriterHandle`/schema call sites within this crate. w1b
+    /// Task B4 (Q3): `storage::testing` re-exposes this for integration-test
+    /// fixture construction only (`tests/`/`benches/` are separate crates and
+    /// can't reach `pub(crate)` items directly) -- see that module's doc
+    /// comment for the closed-world boundary this relies on.
     pub(crate) fn open_writable(path: &Path, _profile: Profile) -> Result<Conn, StorageError> {
         let backend = FrankenBackend::open(path_to_str(path)?)?;
-        Ok(Conn { inner: Box::new(backend), path: Some(path.to_path_buf()) })
+        Ok(Conn {
+            inner: Box::new(backend),
+            path: Some(path.to_path_buf()),
+            _writer_open_guard: Some(super::writer::note_writer_opened(path)),
+        })
     }
 
     pub fn open_memory() -> Result<Conn, StorageError> {
         let backend = FrankenBackend::open_memory()?;
-        Ok(Conn { inner: Box::new(backend), path: None })
+        Ok(Conn { inner: Box::new(backend), path: None, _writer_open_guard: None })
     }
 
     /// w1b Task B3 (D2, R1-N2): bounded-retries on a real `Busy{Statement}`
@@ -650,7 +665,11 @@ mod tests {
     fn open_writable_sqlite_for_test(path: &Path) -> Conn {
         let backend = SqliteBackend::open_writable(path.to_str().unwrap(), Profile::Production)
             .expect("open real sqlite backend for test");
-        Conn { inner: Box::new(backend), path: Some(path.to_path_buf()) }
+        Conn {
+            inner: Box::new(backend),
+            path: Some(path.to_path_buf()),
+            _writer_open_guard: Some(crate::storage::api::writer::note_writer_opened(path)),
+        }
     }
 
     #[test]

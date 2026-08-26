@@ -6,12 +6,16 @@ mod config;
 mod conn;
 mod error;
 mod value;
+mod writer;
 
 pub use config::{OpenOptions, Profile};
 pub use conn::{Conn, Row, Tx, TxMode};
 pub use error::{BusyScope, StorageError};
 pub(crate) use error::NO_ROWS_DETAIL;
 pub use value::{FromValue, IntoValue, Value};
+pub use writer::{
+    WriterHandle, reset_writer_connection_peak, writer_connection_count, writer_connection_peak,
+};
 // Task A4a: Stage-A-only migration escape hatch (see backend_franken.rs doc comment).
 pub(crate) use backend_franken::{FrankenMigration, FrankenMigrationResult, run_franken_migrations};
 
