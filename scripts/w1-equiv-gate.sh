@@ -112,13 +112,24 @@ capture_one() {
   # 修法：compare 的两侧各给独立 target 子目录（仍在 CARGO_TARGET_DIR 根下，
   # 满足磁盘铁律「独立 CARGO_TARGET_DIR」的隔离意图），capture 单树调用不受影响。
 
+  # R2-N1 (PR-front code review round 2, control-plane adjudicated 2026-08-26):
+  # `env | sort` dumped the entire process environment verbatim, including
+  # ambient credentials (API keys/tokens/secrets this session's shell had
+  # exported for unrelated tools) into a gate-evidence artifact under a
+  # world-readable-by-default temp/artifacts path. Two independent layers:
+  # (1) only capture a known-safe whitelist relevant to reproducing the
+  # build/env (cargo/rust toolchain knobs, PATH/HOME/LANG/TZ, the disk-law
+  # env vars this script itself requires); (2) belt-and-suspenders name-based
+  # redaction on whatever *does* get captured, and 0600 perms on the file.
   {
     echo "tree_dir=$tree_dir"
     echo "target_dir=$target_dir"
     ( cd "$tree_dir" && git rev-parse HEAD 2>/dev/null ) || echo "HEAD=<no-git>"
-    echo "---env---"
-    env | sort
+    echo "---env (whitelist: CARGO_*/RUSTFLAGS/RUST_*/PATH/HOME/LANG/LC_*/TZ)---"
+    env | sort | grep -E '^(CARGO_[A-Z_]*|RUSTFLAGS|RUST_[A-Z_]*|PATH|HOME|LANG|LC_[A-Z_]*|TZ|W1_[A-Z_]*)=' \
+      | sed -E 's/^([A-Za-z_][A-Za-z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|AUTH|BEARER)[A-Za-z0-9_]*)=.*/\1=<REDACTED>/I'
   } > "$out_dir/env.txt"
+  chmod 600 "$out_dir/env.txt"
 
   echo "[w1-equiv-gate] test-inventory ..." >&2
   ( cd "$tree_dir" && python3 "$SCRIPT_DIR/w1-test-inventory.py" src/ tests/ benches/ 2>"$out_dir/inventory.err" ) \
