@@ -478,6 +478,24 @@ fn doctor_no_write_snapshot(root: &Path) -> BTreeMap<String, DoctorNoWriteTreeEn
             .expect("strip snapshot root")
             .to_string_lossy()
             .replace('\\', "/");
+        // w1b Task B9 (2026-08-27, equivalence-gate-caught, control-plane
+        // ruling): vanilla SQLite's WAL-mode shared-memory (`-shm`) and log
+        // (`-wal`) sidecars are engine-managed transient state, not cass
+        // data -- reproduced directly against stock `sqlite3 -readonly`
+        // against this exact fixture (same fixture, same commands, only the
+        // read-only flag toggled): opening a WAL-mode database read-only
+        // creates/touches these two files as an unavoidable side effect of
+        // WAL's shared-memory coordination protocol, which requires write
+        // access to check-point away -- read-only access structurally
+        // cannot clean them up regardless of the engine on top. The legacy
+        // franken engine never exhibited this because it did not implement
+        // real WAL-mode read access the same way. Exempt only these two
+        // filenames from the "must not touch cass files" comparison; every
+        // other file, including agent_search.db's own bytes, must still be
+        // asserted byte-for-byte and mtime-for-mtime unchanged.
+        if relative_path == "agent_search.db-shm" || relative_path == "agent_search.db-wal" {
+            continue;
+        }
         let entry_kind = if metadata.file_type().is_symlink() {
             "symlink"
         } else if metadata.is_dir() {

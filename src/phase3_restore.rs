@@ -9569,6 +9569,17 @@ pub(crate) fn test_tree_snapshot(root: &Path) -> Vec<(String, u64)> {
             if meta.is_dir() {
                 out.push((format!("{rel}/"), 0));
                 walk(&path, base, out);
+            } else if rel.ends_with("-shm") || rel.ends_with("-wal") {
+                // w1b Task B9 (2026-08-27, equivalence-gate-caught, control-
+                // plane ruling): vanilla SQLite's WAL-mode shared-memory/log
+                // sidecars are engine-managed transient state, not tracked
+                // write-set content -- see tests/cli_doctor.rs's
+                // doctor_no_write_snapshot for the same exemption and its
+                // full rationale (reproduced directly: even a read-only
+                // connection to a WAL-mode database creates/touches these
+                // two files, which only a writable connection can ever
+                // checkpoint away). Every other file, including the
+                // canonical .db itself, is still tracked byte-for-byte.
             } else {
                 out.push((rel, meta.len()));
             }

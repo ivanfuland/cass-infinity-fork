@@ -103400,19 +103400,24 @@ mod mirror_relink_tests {
                 let Ok(meta) = std::fs::symlink_metadata(&path) else {
                     continue;
                 };
+                let rel = path
+                    .strip_prefix(base)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string();
                 if meta.is_dir() {
                     walk(&path, base, out);
+                } else if rel.ends_with("-shm") || rel.ends_with("-wal") {
+                    // w1b Task B9 (2026-08-27, equivalence-gate-caught,
+                    // control-plane ruling): same exemption and rationale as
+                    // tests/cli_doctor.rs's doctor_no_write_snapshot -- these
+                    // are vanilla SQLite WAL-mode engine sidecars, not
+                    // tracked write-set content; even a read-only connection
+                    // creates/touches them.
                 } else if meta.is_file() {
                     let bytes = std::fs::read(&path).unwrap_or_default();
                     let digest = blake3::hash(&bytes).to_hex().to_string();
-                    out.push((
-                        path.strip_prefix(base)
-                            .unwrap_or(&path)
-                            .display()
-                            .to_string(),
-                        meta.len(),
-                        digest,
-                    ));
+                    out.push((rel, meta.len(), digest));
                 }
             }
         }
