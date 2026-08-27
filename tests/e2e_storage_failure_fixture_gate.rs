@@ -165,12 +165,6 @@ enum Corruption {
     /// Zero `len` bytes at `offset` (e.g. blank the page-1 b-tree header so an
     /// OpenRead cursor cannot decode the root page).
     ZeroRange { offset: usize, len: usize },
-    /// Leave the DB valid but drop orphaned, stale `-wal` + `-shm` sidecars
-    /// beside it (no live writer).
-    OrphanWalShm,
-    /// Leave the DB valid but drop a populated `-wal` only (a writer that left
-    /// an uncommitted WAL — the busy/locked on-disk signal).
-    ActiveWal,
     /// Leave the DB valid but overwrite every file under `index/` with garbage
     /// (a derived lexical asset that is structurally broken).
     OverwriteLexicalIndex { content: &'static [u8] },
@@ -225,9 +219,11 @@ struct StorageFixture {
     proof_log_expectation: &'static str,
 }
 
-/// The eight required storage-failure fixtures — one per class the bead's
-/// acceptance enumerates. Every corruption recipe is empirically verified to
-/// drive the real binary into its `expected` observable.
+/// The storage-failure fixtures — one per class the bead's acceptance
+/// enumerates, minus the two retired at w1b Task B9 (see
+/// `acceptable_doctor_storage_states`'s doc comment for why). Every
+/// corruption recipe is empirically verified to drive the real binary into
+/// its `expected` observable.
 fn fixtures() -> Vec<StorageFixture> {
     vec![
         StorageFixture {
@@ -308,40 +304,6 @@ fn fixtures() -> Vec<StorageFixture> {
             unsafe_command: "cass doctor --repair --yes --plan-fingerprint <fp>",
             human_summary: "storage legacy_interop_failed (source-of-truth risk medium) — \
                             a legacy database could not be read by the current engine",
-            proof_log_expectation: "one pass record (status=pass); never timeout or generated-only",
-        },
-        StorageFixture {
-            id: "fm-storage-stale-wal-shm",
-            class: "stale or orphaned WAL/SHM sidecar",
-            provenance: "valid baseline DB plus orphaned, stale agent_search.db-wal and \
-                         agent_search.db-shm sidecars (no live writer)",
-            expected_storage_state: "wal_sidecar_suspect",
-            expected_source_of_truth_risk: "medium",
-            corruption: Corruption::OrphanWalShm,
-            expected: Expected::FailClosed {
-                error_kinds: STORAGE_ERROR_KINDS,
-            },
-            safe_command: "cass status --json",
-            unsafe_command: "cass doctor --repair --yes --plan-fingerprint <fp>",
-            human_summary: "storage wal_sidecar_suspect (source-of-truth risk medium) — \
-                            a WAL/SHM sidecar is stale or orphaned; do not delete it blindly",
-            proof_log_expectation: "one pass record (status=pass); never timeout or generated-only",
-        },
-        StorageFixture {
-            id: "fm-storage-busy-lock-active-writer",
-            class: "busy-lock / concurrent writer",
-            provenance: "valid baseline DB plus a populated agent_search.db-wal (a writer that \
-                         left an uncommitted WAL — the busy/locked on-disk signal)",
-            expected_storage_state: "busy_or_locked",
-            expected_source_of_truth_risk: "low",
-            corruption: Corruption::ActiveWal,
-            expected: Expected::FailClosed {
-                error_kinds: STORAGE_ERROR_KINDS,
-            },
-            safe_command: "cass status --json",
-            unsafe_command: "cass doctor --repair --yes --plan-fingerprint <fp>",
-            human_summary: "storage busy_or_locked (source-of-truth risk low) — \
-                            another writer holds the DB; retry after bounded backoff",
             proof_log_expectation: "one pass record (status=pass); never timeout or generated-only",
         },
         StorageFixture {
@@ -636,16 +598,6 @@ fn apply_corruption(data_dir: &Path, corruption: &Corruption) -> Result<(), Stri
                 }
             }
             std::fs::write(&db, &buf).map_err(|e| format!("write DB for ZeroRange: {e}"))
-        }
-        Corruption::OrphanWalShm => {
-            std::fs::write(data_dir.join("agent_search.db-wal"), vec![0xAB_u8; 40_000])
-                .map_err(|e| format!("write orphan -wal: {e}"))?;
-            std::fs::write(data_dir.join("agent_search.db-shm"), vec![0xCD_u8; 32_768])
-                .map_err(|e| format!("write orphan -shm: {e}"))
-        }
-        Corruption::ActiveWal => {
-            std::fs::write(data_dir.join("agent_search.db-wal"), vec![0xEF_u8; 50_000])
-                .map_err(|e| format!("write active -wal: {e}"))
         }
         Corruption::OverwriteLexicalIndex { content } => {
             rewrite_files_under(&data_dir.join("index"), &|_| content.to_vec())
@@ -1660,22 +1612,34 @@ fn acceptable_doctor_storage_states(fixture_id: &str) -> &'static [&'static str]
         "fm-storage-stale-searcher-cache" | "fm-storage-fts-metadata-mismatch" => {
             &["derived_only_drift"]
         }
-        // Every canonical-broken fixture — header corruption (integrity / openread
-        // / schema-drift / legacy-interop) AND the WAL/SHM sidecar fixtures
-        // (stale-wal-shm / busy-lock) — defeats doctor's read-only opener, so all
-        // six observe a coarse high-risk read-failure (`openread_failed` today;
+        // Every canonical-broken header-corruption fixture (integrity / openread /
+        // schema-drift / legacy-interop) defeats doctor's read-only opener, so all
+        // four observe a coarse high-risk read-failure (`openread_failed` today;
         // `integrity_failed` is the documented neighbour if the opener succeeds but
         // a later integrity probe fails; `unknown_deferred` covers a bounded-probe
         // timeout under host pressure). The PRECISE cause — `schema_drift` /
-        // `legacy_interop_failed` / `wal_sidecar_suspect` / `busy_or_locked` —
-        // needs the unstarted `.14.2`/`.14.3` schema-version / WAL / busy probes,
-        // so it stays forward metadata until those land.
+        // `legacy_interop_failed` — needs the unstarted `.14.2` schema-version
+        // probe, so it stays forward metadata until that lands.
+        //
+        // w1b Task B9 (2026-08-27, control-plane ruling): the WAL/SHM sidecar
+        // fixtures this comment used to also cover (`fm-storage-stale-wal-shm` /
+        // `fm-storage-busy-lock-active-writer`) were retired outright, not ported.
+        // Their corruption recipes wrote raw garbage bytes (`0xAB`/`0xCD`/`0xEF`
+        // fill, not a real WAL frame) into `-wal`/`-shm` sidecar files -- real
+        // SQLite validates a WAL's header before trusting it and simply discards
+        // an invalid one on open (documented, safe behavior; empirically
+        // reproduced: `sqlite3` read the DB clean and the garbage `-wal` file was
+        // gone afterward), so "any wal/shm file present -> fail closed" was
+        // franken-specific paranoia the real engine never shared. Vanilla SQLite
+        // has no static-disk-byte equivalent for either risk state: a genuinely
+        // stale-but-valid WAL and a live busy-lock are runtime conditions, not
+        // fixable byte patterns, so fabricating a "corruption" for them would
+        // manufacture a scenario that cannot occur for real. See
+        // w1b-b4-deleted-tests.md for the full retirement record.
         "fm-storage-pragma-integrity-fail"
         | "fm-storage-frankensqlite-openread-cursor"
         | "fm-storage-schema-version-drift"
-        | "fm-storage-legacy-interop-fail"
-        | "fm-storage-stale-wal-shm"
-        | "fm-storage-busy-lock-active-writer" => {
+        | "fm-storage-legacy-interop-fail" => {
             &["openread_failed", "integrity_failed", "unknown_deferred"]
         }
         // Unknown fixture id: permissive so a newly-added fixture never silently
