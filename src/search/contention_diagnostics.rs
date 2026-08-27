@@ -19,7 +19,7 @@
 //! - [`ContentionClass`] separates busy-timeout, WAL-checkpoint-stall, and
 //!   host-pressure (w1b Task B5, plan delta d14: redesigned for the stock
 //!   SQLite lock model — the original six-class taxonomy carried three
-//!   variants scoped to frankensqlite's `BEGIN CONCURRENT` MVCC mode or to a
+//!   variants scoped to the legacy embedded engine's `BEGIN CONCURRENT` MVCC mode or to a
 //!   cached-searcher-generation concern this module never actually owned;
 //!   see [`ContentionClass::BusyTimeout`]'s doc comment for which of those
 //!   three still had a real, reachable error branch worth preserving).

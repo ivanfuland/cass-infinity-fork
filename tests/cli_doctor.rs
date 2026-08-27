@@ -25,7 +25,7 @@ macro_rules! fparams {
 /// crate-private (R2-F3), so this integration test (a separate crate)
 /// opens through `FrankenStorage::open` + `into_raw()`. When `path` is a
 /// fresh file this also applies cass's own migrations before handing back
-/// the raw connection (unlike the pre-migration native-`frankensqlite`
+/// the raw connection (unlike the pre-migration native-`legacy-engine`
 /// `Connection::open`, which opened schema-free); when `path` already holds
 /// a cass db (the common case here — most callers reopen a db a prior `cass
 /// index` run already created) this is a no-op idempotent reopen.
@@ -265,7 +265,7 @@ fn seed_healthy_empty_index(test_home: &Path, data_dir: &Path) {
 /// `open_raw()` (`FrankenStorage::open().into_raw()`) runs cass's real
 /// migrations on a fresh file, which both plants unrelated cass tables in
 /// what's meant to be a bare fixture and (confirmed via equivalence-gate
-/// baseline-vs-candidate diff) leaves a frankensqlite `-fsqlite-ns-gate`
+/// baseline-vs-candidate diff) leaves a legacy embedded engine `-fsqlite-ns-gate`
 /// namespace sidecar the pre-migration bare `frankensqlite::Connection::open`
 /// never did, tripping `doctor archive export`'s asset-manifest accounting.
 /// Routes through `storage::testing::open_test_writer` instead (w1b Task B4
@@ -3369,8 +3369,8 @@ fn doctor_backups_list_and_verify_candidate_promotion_manifest() {
             .as_array()
             .expect("warnings")
             .iter()
-            .any(|warning| warning.as_str() == Some("frankensqlite read-only probe passed")),
-        "verify should prove the backup DB opens through frankensqlite: {verify_payload:#}"
+            .any(|warning| warning.as_str() == Some("the legacy embedded engine read-only probe passed")),
+        "verify should prove the backup DB opens through the legacy embedded engine: {verify_payload:#}"
     );
 }
 

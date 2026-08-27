@@ -63,9 +63,9 @@ macro_rules! fparams {
 }
 
 /// Wrapper around the `storage::api` `Connection` (Task A4a: backed by
-/// frankensqlite in Stage A) that implements `Send`.
+/// the legacy embedded engine in Stage A) that implements `Send`.
 ///
-/// The native frankensqlite connection this wraps is `!Send` because it uses
+/// The native legacy embedded engine connection this wraps is `!Send` because it uses
 /// `Rc` internally. However, the `Rc` values are entirely self-contained
 /// within the connection and are not shared with any external references.
 /// When wrapped in a `Mutex` (as in `SearchClient`), exclusive access is
@@ -125,7 +125,7 @@ enum SqliteFtsMatchMode {
     IndexedColumns,
 }
 
-// Frankensqlite follows SQLite's bind-variable ceiling. Keep fallback
+// The legacy embedded engine follows SQLite's bind-variable ceiling. Keep fallback
 // hydration IN-lists below that ceiling so large pages do not turn into
 // empty fallback result sets.
 const SQLITE_FTS5_HYDRATE_PARAM_CHUNK: usize = 30_000;
@@ -6065,7 +6065,7 @@ impl SearchClient {
 
         // 4. Suggest alternative agents if SQLite is already open and no agent
         // filter is set. Avoid lazy-opening storage solely for no-hit advice:
-        // large read-only frankensqlite opens can dominate fast lexical misses.
+        // large read-only the legacy embedded engine opens can dominate fast lexical misses.
         if filters.agents.is_empty()
             && let Ok(sqlite_guard) = self.sqlite.lock()
             && let Some(conn) = sqlite_guard.as_ref()
@@ -7329,7 +7329,7 @@ impl SearchClient {
         };
         if !Self::sqlite_fts5_rowid_projection_available(conn) {
             tracing::warn!(
-                "sqlite FTS fallback cannot project rowid through frankensqlite; using source-table scan fallback"
+                "sqlite FTS fallback cannot project rowid through the legacy embedded engine; using source-table scan fallback"
             );
             return self.search_sqlite_message_scan(conn, scan_request);
         }
@@ -7682,7 +7682,7 @@ impl SearchClient {
             "''"
         };
         // Replace INNER JOIN agents with a correlated subquery: (a) avoids
-        // frankensqlite's multi-table-JOIN-with-LIMIT/OFFSET materialization
+        // the legacy embedded engine's multi-table-JOIN-with-LIMIT/OFFSET materialization
         // fallback on every paginated search, and (b) stops silently dropping
         // search hits whose conversation has a NULL agent_id (legacy V1 rows)
         // by degrading to 'unknown' consistently with e1c08e7c / 8a0c547c.
@@ -12022,7 +12022,7 @@ mod tests {
         );
         assert!(
             unchunked_sql.matches('?').count() > SQLITE_MAX_VARIABLE_NUMBER,
-            "the pre-fix one-shot hydration query would exceed frankensqlite's bind limit"
+            "the pre-fix one-shot hydration query would exceed the legacy embedded engine's bind limit"
         );
 
         let ranked_rows: Vec<(i64, f64)> = (0..(SQLITE_FTS5_HYDRATE_PARAM_CHUNK + 17))
@@ -12041,7 +12041,7 @@ mod tests {
             chunk_sizes
                 .iter()
                 .all(|chunk_size| *chunk_size <= SQLITE_MAX_VARIABLE_NUMBER),
-            "every hydration chunk must fit under frankensqlite's bind-variable ceiling"
+            "every hydration chunk must fit under the legacy embedded engine's bind-variable ceiling"
         );
     }
 

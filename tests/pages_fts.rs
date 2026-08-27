@@ -282,7 +282,7 @@ mod tests {
         let temp_dir = TempDir::new()?;
         let conn = create_runtime_fts_db(&temp_dir)?;
 
-        // The pinned frankensqlite query path does not run MATCH phrases back
+        // The pinned legacy embedded engine query path does not run MATCH phrases back
         // through the table tokenizer, so callers search by the indexed stem.
         let count: i64 = conn.query_row_map(
             r#"SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH '"run"'"#,

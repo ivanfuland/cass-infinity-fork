@@ -1,7 +1,7 @@
 //! Stress tests for cass's write path under realistic concurrent workloads.
 //!
 //! w1b Task B4 (secondary contract #4, 2026-08-26): this file used to stress
-//! frankensqlite's `BEGIN CONCURRENT` (MVCC) mode -- N real writer
+//! the legacy embedded engine's `BEGIN CONCURRENT` (MVCC) mode -- N real writer
 //! connections racing on the same rows, with retry-on-conflict loops. B4
 //! retires the capability to have more than 1 live writer connection on a
 //! path at all (`storage::api::WriterHandle` serializes every write through
@@ -50,7 +50,7 @@ fn setup_db(dir: &TempDir) -> std::path::PathBuf {
 /// `Conn` at a real path is via `FrankenStorage`), so this integration test
 /// (a separate crate) bootstraps through `FrankenStorage::open` +
 /// `into_raw()` rather than opening a bare, schema-free connection the way
-/// the pre-migration native-`frankensqlite` version of this helper did. The
+/// the pre-migration native-`legacy-engine` version of this helper did. The
 /// extra cass tables don't collide with `items`/`counter`/`cm_stress` and
 /// don't affect the concurrency behavior under test.
 /// Sets WAL mode and busy_timeout — required for concurrent reads.
@@ -367,7 +367,7 @@ fn stress_crash_recovery_uncommitted_data_absent() {
     }
 
     // Begin a standard transaction but DO NOT commit -- drop the guard.
-    // w1b Task B4: previously issued literal `BEGIN CONCURRENT` (frankensqlite's
+    // w1b Task B4: previously issued literal `BEGIN CONCURRENT` (the legacy embedded engine's
     // MVCC syntax); rewritten to a standard transaction, since the property
     // under test -- an uncommitted transaction leaves no trace once dropped
     // -- is not MVCC-specific.

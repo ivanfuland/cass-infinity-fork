@@ -2,7 +2,7 @@
 //!
 //! `SqliteStorage` is now a compatibility alias for `FrankenStorage`, so this
 //! benchmark suite no longer compares rusqlite/legacy SQLite against
-//! frankensqlite. Instead it compares two distinct cass-owned paths:
+//! the legacy embedded engine. Instead it compares two distinct cass-owned paths:
 //! - `persist_conversation`: normalized ingestion + lexical index updates
 //! - direct `FrankenStorage` calls: pre-resolved IDs + storage-only writes
 //!
@@ -543,7 +543,7 @@ fn bench_query_comparison(c: &mut Criterion) {
 // 4. CONCURRENT WRITE THROUGHPUT (WriterHandle)
 // =============================================================================
 // w1b Task B4 (secondary contract #4): this used to benchmark N *real*
-// concurrent frankensqlite MVCC writer connections (`ConnectionManagerConfig
+// concurrent the legacy embedded engine MVCC writer connections (`ConnectionManagerConfig
 // { max_writers: 4 }` + `.concurrent_writer()`), each committing its own
 // `BEGIN CONCURRENT` transaction and retrying on snapshot conflicts. That
 // capability is retired -- the process now holds at most 1 live writer

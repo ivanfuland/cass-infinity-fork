@@ -1,4 +1,4 @@
-//! w1b Task B8: the frankensqlite-era incremental migration engine
+//! w1b Task B8: the legacy-engine-era incremental migration engine
 //! (`SqliteStorage::open_or_rebuild`, `meta.schema_version`-keyed fixtures)
 //! this file used to test is retired -- the rusqlite engine's sole version
 //! authority is `PRAGMA user_version` via `storage::schema::ensure`, which

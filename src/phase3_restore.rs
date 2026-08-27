@@ -7763,7 +7763,7 @@ pub(crate) fn validate_restore_write_targets(
 
         // 候选库的 sidecar：**同目录、以候选库文件名打头**的任何名字。
         //
-        // 用前缀规则而不是一张后缀白名单是有意的：本仓的 frankensqlite 自己就会产出
+        // 用前缀规则而不是一张后缀白名单是有意的：本仓的 the legacy embedded engine 自己就会产出
         // 白名单里没有的 sidecar 族，而两侧代价不对称 —— **漏挡一条 = 毁库，
         // 误挡一条 = 换个报告名**。误挡时错误信息会把出路直接说出来。
         if let (Some(dir_key), Some(db)) = (db_dir_key.as_ref(), db_name.as_ref()) {
@@ -12486,7 +12486,7 @@ mod e7_restore_journal_tests {
     /// 受保护的不止候选库主文件：sidecar 是同一个库的一部分，写坏它一样毁库。
     ///
     /// 判据用的是**前缀规则**（同目录下以候选库文件名打头的任何名字），不是一张后缀白名单：
-    /// 本仓的 frankensqlite 自己就会产出白名单里没有的 sidecar 族，
+    /// 本仓的 the legacy embedded engine 自己就会产出白名单里没有的 sidecar 族，
     /// 而**漏挡一条 = 毁库，误挡一条 = 换个报告名**，两侧代价不对称。
     #[test]
     fn e7_apply_refuses_a_journal_path_that_lands_on_a_candidate_db_sidecar() {

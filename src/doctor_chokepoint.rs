@@ -1074,7 +1074,7 @@ mod tests {
     }
 
     /// fm-storage-frankensqlite-openread-cursor: file format incompatibility
-    /// between rusqlite-written DB and frankensqlite reader. Same quarantine
+    /// between rusqlite-written DB and the legacy embedded engine reader. Same quarantine
     /// repair as integrity-fail.
     #[test]
     fn pass6_fixture_fm_storage_frankensqlite_openread_cursor() {

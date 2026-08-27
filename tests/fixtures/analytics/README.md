@@ -1,6 +1,6 @@
 # Analytics test fixtures
 
-Per `coding_agent_session_search-vz9t8.3`. This directory holds frankensqlite
+Per `coding_agent_session_search-vz9t8.3`. This directory holds the legacy embedded engine
 database files used by the Plans-subview snapshot tests.
 
 ## Required fixtures

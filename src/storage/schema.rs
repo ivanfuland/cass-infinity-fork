@@ -4,13 +4,13 @@
 //! `PRAGMA user_version` is the sole version authority for databases built
 //! through [`ensure`] — this is a *separate* mechanism from the pre-existing
 //! `meta.schema_version` / `_schema_migrations` bookkeeping in
-//! `storage::sqlite` (the frankensqlite-era migration engine, retired
+//! `storage::sqlite` (the legacy-engine-era migration engine, retired
 //! together with the franken backend at Task B8). See
 //! `w1b-b7-step0-version-mechanism-audit.md` (control-plane artifacts) for
 //! the full audit of that older mechanism and why the two are not merged
 //! here: the old engine does real incremental DDL migration across ~20
 //! historical schema revisions with franken-specific workarounds (e.g.
-//! avoiding `DROP TABLE`, which triggers a known frankensqlite autoindex
+//! avoiding `DROP TABLE`, which triggers a known the legacy embedded engine autoindex
 //! limitation); this module only ever builds today's final table shape in
 //! one shot and gates on a version number for the (currently nonexistent)
 //! future migrations above it.
@@ -37,7 +37,7 @@
 //! (`sqlite_sequence` name is reserved) and pointless for the FTS5 shadows;
 //! this is also the mechanism behind the plan's "standard SQLite rebuild
 //! naturally has no `fts_messages_config` autoindex birth-scar" note — that
-//! scar is a frankensqlite quirk from an older incremental path, not
+//! scar is a legacy embedded engine quirk from an older incremental path, not
 //! something this fresh, single-shot DDL can reproduce even if it wanted to.
 //!
 //! `meta` and `_schema_migrations` are kept as empty tables in the DDL
@@ -171,7 +171,7 @@ fn reject(detail: impl Into<String>) -> StorageError {
 ///   database exactly as empty as it started, and a retry takes the same
 ///   fresh-build branch again).
 /// - `user_version == 0` and non-empty → this looks like a database that
-///   predates `user_version` tracking entirely (a frankensqlite-era
+///   predates `user_version` tracking entirely (a legacy-engine-era
 ///   archive, or a half-built database from a build that was interrupted
 ///   *after* some other process broke the single-transaction contract).
 ///   Rejected outright — this module does not attempt in-place conversion;

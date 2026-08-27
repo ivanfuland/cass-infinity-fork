@@ -626,7 +626,7 @@ fn fresh_database_fts_messages_is_queryable_via_frankensqlite() {
         .query_row_map("SELECT COUNT(*) FROM fts_messages", &[], |row| {
             row.get_typed(0)
         })
-        .expect("fresh FTS table should be queryable via frankensqlite");
+        .expect("fresh FTS table should be queryable via the legacy embedded engine");
     assert_eq!(count, 0, "fresh FTS table should start empty");
 }
 

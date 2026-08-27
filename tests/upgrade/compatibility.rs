@@ -29,7 +29,7 @@ const _: () = {
 /// without `schema::ensure` (which `SqliteStorage::open` now always runs)
 /// building/overwriting them first.
 fn open_fixture_db(path: &Path) -> TestWriterGuard {
-    open_test_writer(path, Profile::Production).expect("open frankensqlite fixture database")
+    open_test_writer(path, Profile::Production).expect("open the legacy embedded engine fixture database")
 }
 
 // =============================================================================
@@ -442,11 +442,11 @@ fn test_search_without_fts() {
 /// `build.rs` validates manifest/package/feature contracts; this test makes the
 /// expected symbols compile against the currently resolved dependency graph.
 ///
-/// The frankensqlite quarter of this contract lives in
+/// The legacy embedded engine quarter of this contract lives in
 /// `tests/frankensqlite_compat_gates.rs::fsqlite_path_dependency_compile_contract`
 /// (plan delta d6, 2026-08-25) -- that file is the designated home for tests
-/// that deliberately bypass the api facade and pin the raw frankensqlite
-/// surface, and frankensqlite is the one sibling here that's a migration-
+/// that deliberately bypass the api facade and pin the raw the legacy embedded engine
+/// surface, and the legacy embedded engine is the one sibling here that's a migration-
 /// scoped engine rather than a long-lived dependency.
 #[test]
 fn test_path_dependency_compile_contracts() {

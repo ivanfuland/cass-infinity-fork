@@ -131,7 +131,7 @@ impl StorageBackend for SqliteBackend {
     /// ("Execute returned results - did you mean to call query?") on any
     /// statement that returns a result set -- and some PRAGMAs cass runs
     /// through this exact trait method do (`PRAGMA journal_mode = WAL;`
-    /// returns the resulting mode as a one-row result set; frankensqlite's
+    /// returns the resulting mode as a one-row result set; the legacy embedded engine's
     /// `execute` tolerated this, which is why the bug was latent until
     /// `Conn::open_writable` actually dispatched here). Prepare + drain
     /// instead of `Connection::execute` so any such statement (PRAGMA or
@@ -183,7 +183,7 @@ impl StorageBackend for SqliteBackend {
     /// Raw SQL, not rusqlite's own `Connection::transaction()` guard -- that
     /// guard requires `&mut Connection`, incompatible with this trait's
     /// `&self` contract (plan d4: transaction state is managed by SQL itself,
-    /// mirroring frankensqlite's own `&self`-based
+    /// mirroring the legacy embedded engine's own `&self`-based
     /// begin/commit/rollback_transaction, not by Rust-level exclusivity;
     /// see `conn.rs`'s `StorageBackend::begin` doc comment).
     fn begin(&self, mode: TxMode) -> Result<(), StorageError> {
@@ -362,7 +362,7 @@ mod tests {
     #[test]
     fn defer_foreign_keys_permits_out_of_order_write_then_resets_after_commit() {
         // w1b Task B2b (R0-B3): real SQLite (unlike the current production
-        // frankensqlite backend, see conn.rs's
+        // legacy-embedded-engine backend, see conn.rs's
         // `api_defer_foreign_keys_errors_on_unsupported_backend`) genuinely
         // implements `defer_foreign_keys` -- this proves the mechanism
         // `Tx::defer_foreign_keys()` relies on actually works once this

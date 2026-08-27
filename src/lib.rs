@@ -77,7 +77,7 @@ use base64::prelude::*;
 use chrono::Utc;
 use clap::{Arg, ArgAction, Command, CommandFactory, Parser, Subcommand, ValueEnum, ValueHint};
 // w1a Task A5 (mirrors sqlite.rs Task A4a): resolve the historical
-// `frankensqlite` imports through the backend-agnostic `storage::api` facade.
+// `the legacy embedded engine` imports through the backend-agnostic `storage::api` facade.
 use storage::api::{Conn as FrankenConnection, Row as FrankenRow, StorageError, Value};
 type ParamValue = Value;
 type SqliteValue = Value;
@@ -14343,7 +14343,7 @@ fn swarm_failure_pattern_rules() -> Vec<FailurePatternRule> {
         // w1b Task B5 (plan delta d14, 2026-08-26): the `fsqlite-query-shape-regression`
         // rule that used to live here (matching "frankensqlite"/"fsqlite"/
         // "execute_join_select"/"fts5"/"query-shape"/"planner"/"join select" in
-        // evidence text) is retired -- frankensqlite's query planner is not
+        // evidence text) is retired -- the legacy embedded engine's query planner is not
         // this crate's pin to regression-test against once the storage
         // engine converges on stock SQLite (see contention_diagnostics.rs's
         // matching six-to-three-class retirement for the storage-contention
@@ -16889,7 +16889,7 @@ fn analytics_query_filter(
     Ok(filter)
 }
 
-/// Open a read-only frankensqlite connection for analytics queries.
+/// Open a read-only the legacy embedded engine connection for analytics queries.
 fn open_franken_analytics_db(
     data_dir: &Option<PathBuf>,
     db_path_override: Option<&PathBuf>,
@@ -20586,7 +20586,7 @@ fn analytics_requests_structured_output(cmd: &AnalyticsCommand, cli: &Cli) -> bo
 }
 
 /// Default tracing directive for interactive human mode: emit INFO and above
-/// but suppress frankensqlite internal telemetry that spams at INFO level.
+/// but suppress the legacy embedded engine internal telemetry that spams at INFO level.
 ///
 /// `EnvFilter` uses a colon-separated hierarchy, so `fsqlite=warn` covers
 /// `fsqlite`'s `runtime`/`cx` sub-targets, etc. Crate-level targets like
@@ -20654,7 +20654,7 @@ const DEFAULT_DEP_LOG_SUPPRESSION: &str = concat!(
 ///
 /// Robot and quiet modes are machine-consumed: they pin the filter to `error`
 /// (unless the operator explicitly opts into `--verbose`) so that dependency
-/// INFO/WARN logging — frankensqlite telemetry in particular — can never
+/// INFO/WARN logging — the legacy embedded engine telemetry in particular — can never
 /// interleave with a JSON stream, even when `RUST_LOG` is set in the
 /// environment. This is the single source of truth for robot stdout/stderr
 /// hygiene; the regression suite in `tests/cli_robot_log_hygiene.rs` exercises it
@@ -20684,7 +20684,7 @@ fn build_robot_aware_log_filter(robot_mode: bool, verbose: bool, quiet: bool) ->
 /// (coding_agent_session_search-cass-fleet-resilience-20260608-uojcg.2.5).
 ///
 /// When an operator opts into `--trace-file`, dependency-level diagnostics
-/// (frankensqlite / frankensearch / asupersync, etc.) are captured at `debug`
+/// (the legacy embedded engine / frankensearch / asupersync, etc.) are captured at `debug`
 /// into that file as a deliberate trace artifact, while the stderr layer stays
 /// pinned to its robot-aware level so machine output is never corrupted. This is
 /// the "explicit trace surface" the bead requires: deep logs are available on
@@ -20782,7 +20782,7 @@ mod log_hygiene_tests {
 
     #[test]
     fn dep_suppression_quiets_fsqlite_targets() {
-        // The fallback list must keep frankensqlite telemetry below INFO so even
+        // The fallback list must keep the legacy embedded engine telemetry below INFO so even
         // human-mode stderr is not flooded.
         assert!(DEFAULT_DEP_LOG_SUPPRESSION.starts_with("info"));
         assert!(DEFAULT_DEP_LOG_SUPPRESSION.contains("fsqlite=warn"));
@@ -42168,7 +42168,7 @@ fn doctor_candidate_probe_frankensqlite(
     let conn = FrankenConnection::open_writable(std::path::Path::new(&(candidate_db_path.to_string_lossy().as_ref())), crate::storage::api::Profile::Production)
         .map_err(|err| {
             format!(
-                "failed to open candidate archive DB with frankensqlite at {}: {err}",
+                "failed to open candidate archive DB with the legacy embedded engine at {}: {err}",
                 candidate_db_path.display()
             )
         })?;
@@ -42681,7 +42681,7 @@ fn doctor_candidate_reconstruct_archive_from_raw_mirror(
 ) -> std::result::Result<(usize, usize, Vec<String>, Vec<DoctorFsMutationReceipt>), String> {
     let storage = crate::storage::sqlite::SqliteStorage::open(candidate_db_path).map_err(|err| {
         format!(
-            "failed to initialize reconstructed candidate archive DB {} with frankensqlite storage: {err}",
+            "failed to initialize reconstructed candidate archive DB {} with the legacy embedded engine storage: {err}",
             candidate_db_path.display()
         )
     })?;
@@ -43966,11 +43966,11 @@ fn verify_doctor_backup_record(
                     drop(connection);
                     verification
                         .warnings
-                        .push("frankensqlite read-only probe passed".to_string());
+                        .push("the legacy embedded engine read-only probe passed".to_string());
                 }
                 Err(err) => {
                     verification.blocked_reasons.push(format!(
-                        "frankensqlite read-only probe failed for prior-live backup DB: {err}"
+                        "the legacy embedded engine read-only probe failed for prior-live backup DB: {err}"
                     ));
                 }
             }
@@ -44192,7 +44192,7 @@ fn run_doctor_backup_restore_rehearsal(
             ) {
                 Ok(connection) => drop(connection),
                 Err(err) => blocked_reasons.push(format!(
-                    "restore rehearsal frankensqlite probe failed: {err}"
+                    "restore rehearsal the legacy embedded engine probe failed: {err}"
                 )),
             }
         }
@@ -70356,7 +70356,7 @@ fn gather_projection_signals_from_state(
         ..Default::default()
     };
 
-    // frankensqlite storage: a non-retryable open failure whose error text names
+    // the legacy embedded engine storage: a non-retryable open failure whose error text names
     // a storage-engine fault (corruption / OpenRead / bad format) — not a
     // permission/not-found/busy condition, which are host/transient, not storage
     // corruption.
@@ -72117,7 +72117,7 @@ mod doctor_fts_tests {
         let state = probe_doctor_fts_table(&conn);
         assert!(
             matches!(state, DoctorFtsTableState::QueryableViaFrankensqlite),
-            "frankensqlite FTS table should be accepted by doctor: {state:?}"
+            "the legacy embedded engine FTS table should be accepted by doctor: {state:?}"
         );
 
         Ok(())
@@ -72577,7 +72577,7 @@ mod cli_read_db_tests {
     }
 
     /// Regression for CASS #192: when `total_counts_exact` is false the code
-    /// previously reopened the live DB through frankensqlite to collect
+    /// previously reopened the live DB through the legacy embedded engine to collect
     /// `SELECT COUNT(*)` values, which triggered `Connection::open ->
     /// reload_memdb_from_pager_with_mode` and advanced the DB fingerprint past
     /// the just-written lexical checkpoint. The post-#192 path derives counts
@@ -74729,7 +74729,7 @@ pub(crate) fn run_doctor_impl(
                                     );
 
                                     // Check whether the FTS table is visible through
-                                    // frankensqlite on this connection. Do not auto-register
+                                    // the legacy embedded engine on this connection. Do not auto-register
                                     // it here: on migrated databases with legacy rootpage=0
                                     // FTS schema entries, CREATE VIRTUAL TABLE IF NOT EXISTS
                                     // can persist duplicate sqlite_master rows.
@@ -74738,7 +74738,7 @@ pub(crate) fn run_doctor_impl(
                                             add_check!(
                                                 "fts_table",
                                                 "pass",
-                                                "FTS search table (fts_messages) is queryable via frankensqlite",
+                                                "FTS search table (fts_messages) is queryable via the legacy embedded engine",
                                                 false
                                             );
                                         }
@@ -74754,7 +74754,7 @@ pub(crate) fn run_doctor_impl(
                                                 "fts_table",
                                                 "pass",
                                                 format!(
-                                                    "Database-resident FTS table is absent or not queryable via frankensqlite ({frankensqlite_error}); lexical search relies on the Tantivy index instead"
+                                                    "Database-resident FTS table is absent or not queryable via the legacy embedded engine ({frankensqlite_error}); lexical search relies on the Tantivy index instead"
                                                 ),
                                                 false
                                             );
@@ -74769,7 +74769,7 @@ pub(crate) fn run_doctor_impl(
                                         "database",
                                         "fail",
                                         format!(
-                                            "Database failed frankensqlite {failed_pragma}: {} ({} conversations, {} messages)",
+                                            "Database failed the legacy embedded engine {failed_pragma}: {} ({} conversations, {} messages)",
                                             integrity.diagnostic_summary(),
                                             conv_count,
                                             msg_count
@@ -74784,7 +74784,7 @@ pub(crate) fn run_doctor_impl(
                                         "database",
                                         "fail",
                                         format!(
-                                            "Database health probe failed via frankensqlite: {err}"
+                                            "Database health probe failed via the legacy embedded engine: {err}"
                                         ),
                                         true
                                     );
@@ -75859,7 +75859,7 @@ pub(crate) fn run_doctor_impl(
                                         name: "database_after_candidate_promotion".to_string(),
                                         status: "pass".to_string(),
                                         message: format!(
-                                            "Promoted archive DB passed frankensqlite quick_check ({} conversations, {} messages)",
+                                            "Promoted archive DB passed the legacy embedded engine quick_check ({} conversations, {} messages)",
                                             conv_count, msg_count
                                         ),
                                         fix_available: false,
@@ -75880,7 +75880,7 @@ pub(crate) fn run_doctor_impl(
                                         name: "database_after_candidate_promotion".to_string(),
                                         status: "fail".to_string(),
                                         message: format!(
-                                            "Promoted archive DB failed frankensqlite quick_check: {}",
+                                            "Promoted archive DB failed the legacy embedded engine quick_check: {}",
                                             status.trim()
                                         ),
                                         fix_available: true,
@@ -77358,7 +77358,7 @@ fn run_sessions(
     }
 
     // Backfill message/human-turn counts for the surviving sessions only.
-    // Deliberately NOT a SQL aggregate: the frankensqlite planner executes
+    // Deliberately NOT a SQL aggregate: the legacy embedded engine planner executes
     // `SELECT COUNT(..) WHERE conversation_id = ?` as a full messages-table
     // scan even under an INDEXED BY hint (verified via live backtraces on a
     // 26 GB index). The plain indexed row-fetch shape below is the same one
@@ -86200,7 +86200,7 @@ fn index_stall_abort_threshold(
 ///
 /// A non-watch, non-semantic `cass index --full` ends by checkpointing the
 /// deferred bulk-ingest WAL inside `close_storage_after_index` — a synchronous,
-/// `!Send` frankensqlite `conn.close()` + `wal_checkpoint(TRUNCATE)` that runs
+/// `!Send` legacy-embedded-engine `conn.close()` + `wal_checkpoint(TRUNCATE)` that runs
 /// on the indexer thread and cannot advance the progress atomics. On a large
 /// corpus (the #319 report: a ~1.1 GB / ~290k-frame WAL) that checkpoint
 /// legitimately takes minutes, especially on macOS where Darwin fsync/flock is
@@ -86459,7 +86459,7 @@ impl IndexStallWatchdog {
         // #319/#321: while the indexer signals `finalizing`, the phase-0 /
         // current==total / quiescent shape is the post-publish WAL-checkpoint
         // window, not a #297 wedge. The checkpoint is a synchronous, `!Send`
-        // frankensqlite call on the indexer thread that cannot advance the
+        // the legacy embedded engine call on the indexer thread that cannot advance the
         // progress atomics, so it can only be recognised via this flag. Give it
         // the larger `finalize_abort_threshold` so a slow-but-active checkpoint
         // of a large deferred WAL completes instead of being killed mid-write
@@ -86939,7 +86939,7 @@ mod stall_diagnostics_tests {
 
     /// Regression for #319/#321: the post-publish finalize WAL checkpoint of a
     /// large deferred bulk-ingest WAL runs as a synchronous, `!Send`
-    /// frankensqlite call on the indexer thread (inside
+    /// the legacy embedded engine call on the indexer thread (inside
     /// `close_storage_after_index`). It cannot advance the progress atomics, so
     /// it looks exactly like a #297 finalize wedge — phase 0, `current == total`,
     /// pipeline quiescent — while the process is actually alive and checkpointing

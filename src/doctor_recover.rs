@@ -3,13 +3,13 @@
 //! When the read-only pre-index health gate refuses to index because the
 //! canonical `agent_search.db` is corrupt, the operator previously hit a wall:
 //! `doctor repair` refuses an unreadable archive, a stock-sqlite `.recover`
-//! rebuild is rejected by frankensqlite on readonly open, and the only working
+//! rebuild is rejected by the legacy embedded engine on readonly open, and the only working
 //! path was a hand-rolled JSONL reconstruction from cass's own preserved
 //! events. This module turns that working recovery into first-class commands:
 //!
 //! * [`run_doctor_recover_from_archive`] rebuilds the source JSONL tree from the
 //!   canonical archive's preserved `extra_json`/`extra_bin` envelopes so the
-//!   data can be re-ingested into a fresh, frankensqlite-native archive — no
+//!   data can be re-ingested into a fresh, the legacy embedded engine-native archive — no
 //!   `.recover` and no external SQLite tool needed.
 //! * [`run_doctor_rebuild_canonical_fts`] drops and rebuilds the canonical FTS5
 //!   shadow tables in place (the exact out-of-band fix that resolved the
@@ -141,7 +141,7 @@ fn sanitize_path_component(raw: &str) -> String {
 /// `target_dir` receives one `.jsonl` file per reconstructable conversation.
 /// The canonical archive is opened read-only and never mutated. After this
 /// completes the operator can `cass index --full` over `target_dir` to produce
-/// a fresh frankensqlite-native archive.
+/// a fresh the legacy embedded engine-native archive.
 pub fn run_doctor_recover_from_archive(
     data_dir_override: Option<PathBuf>,
     db_override: Option<PathBuf>,

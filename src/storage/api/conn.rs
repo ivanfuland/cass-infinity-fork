@@ -111,7 +111,7 @@ pub(crate) trait StorageBackend {
         params: &[Value],
         cb: &mut dyn FnMut(&Row) -> Result<(), StorageError>,
     ) -> Result<(), StorageError>;
-    /// plan delta d4: `&self`, not `&mut self` — mirrors native fsqlite
+    /// plan delta d4: `&self`, not `&mut self` — mirrors the legacy engine crate's native
     /// `begin_transaction/commit_transaction/rollback_transaction(&self)` (the
     /// engine manages transaction state itself; Rust-level exclusivity is not how
     /// this was ever enforced). Forcing `&mut self` in Stage A would cascade into
@@ -122,18 +122,18 @@ pub(crate) trait StorageBackend {
     fn commit(&self) -> Result<(), StorageError>;
     fn rollback(&self) -> Result<(), StorageError>;
     fn last_insert_rowid(&self) -> i64;
-    /// == current fsqlite `Connection::close()` (checkpoint policy left to SQLite's
+    /// == current the legacy engine crate's `Connection::close()` (checkpoint policy left to SQLite's
     /// default close path).
     fn close(self: Box<Self>) -> Result<(), StorageError>;
-    /// == current fsqlite `Connection::close_without_checkpoint()`.
+    /// == current the legacy engine crate's `Connection::close_without_checkpoint()`.
     fn close_without_checkpoint(self: Box<Self>) -> Result<(), StorageError>;
 
-    /// == current fsqlite `Connection::close_in_place(&mut self)` (Task A4a): closes
+    /// == current the legacy engine crate's `Connection::close_in_place(&mut self)` (Task A4a): closes
     /// without consuming the handle, for callers that only hold `&mut Conn`.
     fn close_in_place(&mut self) -> Result<(), StorageError>;
-    /// == current fsqlite `Connection::close_without_checkpoint_in_place(&mut self)`.
+    /// == current the legacy engine crate's `Connection::close_without_checkpoint_in_place(&mut self)`.
     fn close_without_checkpoint_in_place(&mut self) -> Result<(), StorageError>;
-    /// == current fsqlite `Connection::close_best_effort_in_place(&mut self)`
+    /// == current the legacy engine crate's `Connection::close_best_effort_in_place(&mut self)`
     /// (same no-checkpoint best-effort path as `Drop`, errors swallowed).
     fn close_best_effort_in_place(&mut self);
 }
@@ -144,7 +144,7 @@ pub(crate) trait StorageBackend {
 /// tries to upgrade from a read to a write). `pub` per the plan's stated
 /// interface: callers choosing between `with_tx`/`with_tx_no_replay` pick a
 /// mode explicitly. `backend_franken.rs` (Stage A, deleted at Stage B's end)
-/// cannot distinguish modes -- fsqlite's `begin_transaction()` takes none --
+/// cannot distinguish modes -- the legacy engine crate's `begin_transaction()` takes none --
 /// so it ignores this and always begins deferred-equivalent; only
 /// `backend_sqlite.rs` (the eventual production backend) branches on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -552,7 +552,7 @@ impl Tx<'_> {
     ///
     /// Reads the pragma back and errors if it didn't actually engage
     /// (discovered live, not hypothetical: the current production backend,
-    /// frankensqlite, silently no-ops this pragma -- `execute_batch`
+    /// the legacy embedded engine, silently no-ops this pragma -- `execute_batch`
     /// returns `Ok(())` but per-statement FK checking stays in effect, and
     /// `PRAGMA defer_foreign_keys;` returns zero rows, meaning it doesn't
     /// recognize the pragma at all. Without this readback, a caller relying
@@ -618,7 +618,7 @@ impl Tx<'_> {
         Ok(())
     }
 
-    /// == current fsqlite `compat::Transaction::rollback` (Task A4a): explicit
+    /// == current the legacy engine crate's `compat::Transaction::rollback` (Task A4a): explicit
     /// rollback, distinct from the implicit best-effort rollback in `Drop`.
     pub fn rollback(mut self) -> Result<(), StorageError> {
         self.backend.rollback()?;
@@ -631,7 +631,7 @@ impl Drop for Tx<'_> {
     fn drop(&mut self) {
         if !self.finalized {
             // Best-effort rollback; errors are unobservable from Drop by design
-            // (matches fsqlite's own compat::Transaction Drop behavior).
+            // (matches the legacy engine crate's own compat::Transaction Drop behavior).
             let _ = self.backend.rollback();
         }
     }
@@ -645,7 +645,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     /// w1b Task B3 (D2): test-only construction of a `Conn` wrapping the real
-    /// `SqliteBackend` (rusqlite/real SQLite), not the Stage-A frankensqlite
+    /// `SqliteBackend` (rusqlite/real SQLite), not the Stage-A the legacy embedded engine
     /// backend `Conn::open_writable` currently resolves to. The real
     /// `BUSY`/`BUSY_SNAPSHOT` concurrency tests in this module need genuine
     /// SQLite WAL/MVCC semantics -- this is scoped to `#[cfg(test)]` only and
@@ -791,7 +791,7 @@ mod tests {
     /// Drops to raw `rusqlite::Connection` rather than `Conn`/`Tx`
     /// (discovered live while wiring this test up): `StorageBackend` has no
     /// `Send` bound, and cannot gain one without breaking the still-active
-    /// `FrankenBackend` impl -- fsqlite's `Connection` holds `Rc<RefCell<_>>`
+    /// `FrankenBackend` impl -- the legacy engine crate's `Connection` holds `Rc<RefCell<_>>`
     /// state internally and is not `Send`. So `Box<dyn StorageBackend>` (and
     /// therefore `Conn`, and `Tx`'s `&dyn StorageBackend`) cannot cross a
     /// thread boundary today. That's a real architectural fact surfaced by

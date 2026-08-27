@@ -1,12 +1,12 @@
 //! FrankenStorage parity tests.
 //!
-//! These tests exercise FrankenStorage (the primary frankensqlite-backed storage
+//! These tests exercise FrankenStorage (the primary legacy-engine-backed storage
 //! engine) against the full range of SQL patterns cass uses. `SqliteStorage` is a
 //! type alias for `FrankenStorage`.
 //!
 //! Covers: CRUD operations, queries (JOIN, GROUP BY, ORDER BY, LIMIT, LIKE, FTS),
 //! transaction behavior, edge cases (Unicode, NULL, empty DB, large content),
-//! and cross-format file reads (rusqlite ↔ frankensqlite interop).
+//! and cross-format file reads (rusqlite ↔ the legacy embedded engine interop).
 
 use coding_agent_search::model::types::{
     Agent, AgentKind, Conversation, Message, MessageRole, Snippet,
@@ -1004,7 +1004,7 @@ fn transition_rusqlite_db_readable_by_frankenstorage_basic() {
     // Verify sources readable
     let src = frank.get_source("local").unwrap();
     // Bead 7k7pl: pin the EXACT id — migration must preserve the
-    // well-known "local" id through the rusqlite→frankensqlite
+    // well-known "local" id through the rusqlite→the legacy embedded engine
     // transition. A regression that renamed the id would slip past
     // `.is_some()` while silently breaking source lookup by id.
     let src = src.expect("local source must exist after transition");

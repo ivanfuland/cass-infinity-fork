@@ -183,7 +183,7 @@ mod tests {
                 1_i64,
                 1_i64,
                 1_i64,
-                "Frankensqlite Export",
+                "Legacy Embedded Engine Export",
                 "/home/user/franken/.codex/session.jsonl",
                 1_700_000_000_000_i64,
                 2_i64
@@ -197,7 +197,7 @@ mod tests {
                 1_i64,
                 0_i64,
                 "user",
-                "please verify frankensqlite pages export",
+                "please verify legacy-embedded-engine pages export",
                 1_700_000_000_000_i64,
                 1_700_000_000_100_i64,
                 "gpt-5",
@@ -212,7 +212,7 @@ mod tests {
                 1_i64,
                 1_i64,
                 "assistant",
-                "frankensqlite export payload is queryable",
+                "legacy-embedded-engine export payload is queryable",
                 1_700_000_000_500_i64,
                 1_700_000_000_600_i64,
                 "gpt-5",
@@ -330,11 +330,11 @@ mod tests {
         )?;
         assert_eq!(
             assistant_content,
-            "frankensqlite export payload is queryable"
+            "legacy-embedded-engine export payload is queryable"
         );
 
         let fts_hits: i64 = output_conn.query_row_map(
-            "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'frankensqlite'",
+            "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'legacy-embedded-engine'",
             &[],
             |row: &FrankenRow| row.get_typed(0),
         )?;

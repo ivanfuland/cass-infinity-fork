@@ -154,7 +154,7 @@ impl StorageState {
     }
 
     /// The root-cause family this state attributes to. Storage states are
-    /// frankensqlite-storage except the explicit deferred fallback.
+    /// legacy-embedded-engine storage except the explicit deferred fallback.
     pub(crate) fn root_cause_family(self) -> RootCauseFamily {
         match self {
             Self::UnknownDeferred => RootCauseFamily::Unknown,
@@ -432,7 +432,7 @@ mod tests {
             if s == StorageState::Ok {
                 assert_eq!(risk, SourceOfTruthRisk::None);
             }
-            // Every non-deferred state attributes to frankensqlite-storage.
+            // Every non-deferred state attributes to legacy-embedded-engine storage.
             let fam = s.root_cause_family();
             if s == StorageState::UnknownDeferred {
                 assert_eq!(fam, RootCauseFamily::Unknown);

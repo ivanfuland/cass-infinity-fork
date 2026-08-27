@@ -69,7 +69,7 @@
 //! ([`spawn_with_timeout_or_diag`]), which keeps stdout/stderr separate and
 //! turns a hang into a loud `TIMEOUT DIAGNOSTIC` + panic — categorically
 //! distinct from this gate's `Err` (assertion fail) and `Ok` (pass). A failed
-//! probe is attributed to one of the four bead categories — CASS, frankensqlite
+//! probe is attributed to one of the four bead categories — CASS, the legacy embedded engine
 //! storage, host-pressure, or fixture-setup — by [`attribute_failure`], proven
 //! by [`failure_attribution_separates_the_four_categories`].
 //!
@@ -401,14 +401,14 @@ const STORAGE_ERROR_KINDS: &[&str] = &[
 // =============================================================================
 
 /// Which layer a failed probe is attributed to. The bead requires every E2E
-/// failure to say whether it is a CASS bug, a frankensqlite-storage problem,
+/// failure to say whether it is a CASS bug, a legacy embedded engine storage problem,
 /// host pressure, or a fixture-setup error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Attribution {
     /// A cass-level defect: wrong dispatch, malformed envelope, stdout leakage,
     /// or a contract the gate expected but did not see.
     Cass,
-    /// A frankensqlite-storage error surfaced honestly (e.g. a storage/corrupt
+    /// A legacy embedded engine storage error surfaced honestly (e.g. a storage/corrupt
     /// envelope) — the storage engine behaving as the fixture intends.
     Frankensqlite,
     /// A bounded-runner timeout: a hang or host-pressure stall.
@@ -431,7 +431,7 @@ impl Attribution {
 
 /// Pure attribution: fixture-setup outranks everything (no cass behavior was
 /// observed), then a timeout (host pressure / hang), then a storage-engine
-/// error (frankensqlite behaving as intended), else a cass-level defect.
+/// error (the legacy embedded engine behaving as intended), else a cass-level defect.
 fn attribute_failure(
     fixture_setup_failed: bool,
     timed_out: bool,
@@ -732,7 +732,7 @@ fn check_fail_closed_search(out: &Output, error_kinds: &[&str]) -> Result<bool, 
             "process exit code {code} does not mirror error.code {ecode} (exit-code contract)"
         ));
     }
-    // A storage envelope (kind in the storage set, retryable) is a frankensqlite
+    // A storage envelope (kind in the storage set, retryable) is a legacy embedded engine
     // signal, not a cass-dispatch bug — record that for attribution.
     Ok(true)
 }
@@ -1551,7 +1551,7 @@ fn proof_artifact_distinguishes_pass_from_timeout() -> Result<(), String> {
 }
 
 /// Attribution separates the four bead categories — fixture-setup, host
-/// pressure (timeout), frankensqlite storage, and cass — with the documented
+/// pressure (timeout), the legacy embedded engine storage, and cass — with the documented
 /// precedence (setup outranks timeout outranks storage-error outranks cass).
 #[test]
 fn failure_attribution_separates_the_four_categories() -> Result<(), String> {

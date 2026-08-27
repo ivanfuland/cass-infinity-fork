@@ -6,7 +6,7 @@ use crate::model::types::{
 use crate::sources::provenance::{LOCAL_SOURCE_ID, Source, SourceKind};
 use anyhow::{Context, Result, anyhow, bail};
 // w1a Task A4a (plan delta d3): the file historically imported these names from
-// `frankensqlite` directly; they now resolve to the backend-agnostic `storage::api`
+// `the legacy embedded engine` directly; they now resolve to the backend-agnostic `storage::api`
 // facade (A1-A3, ACCEPTED) under the same local aliases so call sites using the
 // mirrored method names (`query_row_map`, `get_typed`, `execute`, `transaction`, …)
 // keep compiling unchanged. `SqliteValue`/`ParamValue` collapse to the single `Value`
@@ -82,7 +82,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicI8, AtomicI64, AtomicU64, AtomicUsize, Ordering},
 };
 
-/// Frankensqlite parameter list builder (Task A4a thin shim: delegates to
+/// The legacy embedded engine's parameter list builder (Task A4a thin shim: delegates to
 /// `storage::api::params!`; call-site shape at the 423 usages is unchanged).
 macro_rules! fparams {
     () => {
@@ -164,7 +164,7 @@ impl std::ops::Deref for SendFrankenConnection {
     }
 }
 
-/// Lazy-opening wrapper for `FrankenConnection` (frankensqlite).
+/// Lazy-opening wrapper for `FrankenConnection` (the legacy embedded engine).
 ///
 /// Constructing a `LazyFrankenDb` is cheap (no I/O).  The underlying
 /// `FrankenConnection` is opened on the first call to [`get`].
@@ -490,7 +490,7 @@ fn next_franken_retry_jitter_ms(max_inclusive: u64) -> u64 {
 }
 
 /// Sleep with jittered exponential backoff to avoid lock-step retry storms
-/// when many threads hit the same transient SQLite/frankensqlite contention.
+/// when many threads hit the same transient SQLite/the legacy embedded engine contention.
 pub(crate) fn sleep_with_franken_retry_backoff(
     backoff: &mut Duration,
     remaining: Duration,
@@ -762,7 +762,7 @@ pub(crate) fn open_franken_raw_connection_with_timeout(
     loop {
         let _doctor_guard = acquire_doctor_mutation_db_open_guard(path, timeout)?;
         match FrankenConnection::open_writable(std::path::Path::new(&(&path_str)), crate::storage::api::Profile::Production)
-            .with_context(|| format!("opening raw frankensqlite db at {}", path.display()))
+            .with_context(|| format!("opening raw the legacy embedded engine db at {}", path.display()))
         {
             Ok(conn) => return Ok(conn),
             Err(err) if retryable_franken_anyhow(&err) => {
@@ -798,7 +798,7 @@ pub(crate) fn open_franken_raw_readonly_connection_with_timeout(
         match open_franken_with_flags(&path_str, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| {
                 format!(
-                    "opening raw frankensqlite db readonly at {}",
+                    "opening raw the legacy embedded engine db readonly at {}",
                     path.display()
                 )
             }) {
@@ -908,7 +908,7 @@ fn deserialize_msgpack_to_json(bytes: &[u8]) -> serde_json::Value {
     })
 }
 
-/// Read metadata from a frankensqlite Row, preferring binary (msgpack) over JSON.
+/// Read metadata from a legacy embedded engine Row, preferring binary (msgpack) over JSON.
 fn franken_read_metadata_compat(
     row: &FrankenRow,
     json_idx: usize,
@@ -948,7 +948,7 @@ fn franken_read_message_extra_compat(
     serde_json::Value::Null
 }
 
-/// SQL to register the FTS5 virtual table on a frankensqlite connection.
+/// SQL to register the FTS5 virtual table on a legacy embedded engine connection.
 ///
 /// FrankenSQLite skips virtual-table entries (rootpage=0) when loading
 /// `sqlite_master` from a stock-SQLite database.  Executing this CREATE
@@ -1122,7 +1122,7 @@ pub fn fts_messages_integrity_error_from_message(
         // fixture pattern) makes real SQLite refuse to even open the
         // connection -- it eagerly parses the full schema and errors with
         // "table fts_messages already exists" the moment two virtual-table
-        // declarations for the same name collide. The old frankensqlite
+        // declarations for the same name collide. The old the legacy embedded engine
         // backend deferred this validation until the table was actually
         // queried, so this failure mode never reached this classifier
         // before; without recognizing it here, the caller falls straight
@@ -1216,10 +1216,10 @@ pub fn validate_fts_messages_integrity_for_connection(conn: &FrankenConnection) 
 
     // If every required shadow table is present, the FTS5 schema is
     // structurally sound. A probe-SQL failure here typically reflects an
-    // incomplete FTS5 runtime emulation (e.g. frankensqlite's vtable path)
+    // incomplete FTS5 runtime emulation (e.g. the legacy embedded engine's vtable path)
     // rather than fixture corruption — and conflating the two would
     // wrongly reject every database with the new message_id schema that
-    // frankensqlite happens to serve via a different code path. Returning
+    // the legacy embedded engine happens to serve via a different code path. Returning
     // Ok here keeps the false-positive surface narrow; the truly-missing-
     // shadow case below still surfaces as before.
     if missing_shadow_tables.is_empty() {
@@ -1239,13 +1239,13 @@ pub fn validate_fts_messages_integrity_for_connection(conn: &FrankenConnection) 
 #[cfg(test)]
 pub(crate) fn materialize_fresh_fts_schema_via_rusqlite(db_path: &Path) -> Result<()> {
     // Delegate to FrankenStorage: DROP TABLE IF EXISTS + CREATE VIRTUAL TABLE
-    // is fully supported by the frankensqlite FTS5 path at
+    // is fully supported by the legacy embedded engine FTS5 path at
     // FrankenStorage::rebuild_fts_via_frankensqlite. We call rebuild which
     // also populates rows, matching the historical semantics ("fresh FTS"
     // means the schema exists and is consistent with message rows).
     let storage = FrankenStorage::open(db_path).with_context(|| {
         format!(
-            "opening frankensqlite db at {} for FTS materialization",
+            "opening the legacy embedded engine db at {} for FTS materialization",
             db_path.display()
         )
     })?;
@@ -1256,7 +1256,7 @@ pub(crate) fn materialize_fresh_fts_schema_via_rusqlite(db_path: &Path) -> Resul
 pub(crate) fn rebuild_fts_via_rusqlite(db_path: &Path) -> Result<usize> {
     let storage = FrankenStorage::open(db_path).with_context(|| {
         format!(
-            "opening frankensqlite db at {} for FTS rebuild",
+            "opening the legacy embedded engine db at {} for FTS rebuild",
             db_path.display()
         )
     })?;
@@ -1268,10 +1268,10 @@ pub(crate) fn rebuild_fts_via_rusqlite(db_path: &Path) -> Result<usize> {
 pub(crate) fn ensure_fts_consistency_via_rusqlite(db_path: &Path) -> Result<FtsConsistencyRepair> {
     // Delegates to the FrankenStorage-native path. The function name retains
     // the `_via_rusqlite` suffix only for backwards compatibility with the
-    // few test-site callers; all operations now run through frankensqlite.
+    // few test-site callers; all operations now run through the legacy embedded engine.
     let storage = FrankenStorage::open(db_path).with_context(|| {
         format!(
-            "opening frankensqlite db at {} for FTS consistency check",
+            "opening the legacy embedded engine db at {} for FTS consistency check",
             db_path.display()
         )
     })?;
@@ -2398,7 +2398,7 @@ fn franken_fts_schema_rows(conn: &FrankenConnection) -> Result<i64> {
         fparams![],
         |row| row.get_typed(0),
     )
-    .context("counting sqlite_master rows for fts_messages via frankensqlite")
+    .context("counting sqlite_master rows for fts_messages via the legacy embedded engine")
 }
 
 struct StagedHistoricalSeed {
@@ -2704,7 +2704,7 @@ fn message_payload_size_hint(message: &Message) -> usize {
 }
 
 // Suffixes that mark sqlite sidecar files we must never re-open as a DB root.
-// Includes the standard -wal/-shm pair plus frankensqlite's Windows advisory-
+// Includes the standard -wal/-shm pair plus the legacy embedded engine's Windows advisory-
 // lock sidecars (-lock-shared/-lock-reserved/-lock-pending). Used by directory
 // enumeration paths in `historical_bundle_root_paths`.
 fn has_db_sidecar_suffix(name: &str) -> bool {
@@ -2714,7 +2714,7 @@ fn has_db_sidecar_suffix(name: &str) -> bool {
         "-lock-shared",
         "-lock-reserved",
         "-lock-pending",
-        // w1b: frankensqlite plants these namespace-lock sidecars next to ANY
+        // w1b: the legacy embedded engine plants these namespace-lock sidecars next to ANY
         // file it opens (read or write), even ones that fail to parse as a
         // database. Their names inherit the opened file's prefix, so an
         // unfiltered sidecar matches the same `.corrupt.`/`.bak` glob
@@ -2733,7 +2733,7 @@ fn has_db_sidecar_suffix(name: &str) -> bool {
 /// CURRENT_SCHEMA_VERSION` (`phase3_restore.rs`'s db-identity recording,
 /// `indexer/mod.rs`'s fast-path skip check) keep working unchanged, with the
 /// value naturally following the new engine's numbering instead of the
-/// retired frankensqlite-era incremental engine's (which topped out at 21).
+/// retired legacy-engine-era incremental engine's (which topped out at 21).
 pub use crate::storage::schema::CURRENT_SCHEMA_VERSION;
 
 /// Row from the embedding_jobs table.
@@ -2755,7 +2755,7 @@ pub struct EmbeddingJobRow {
 ///
 /// This intentionally omits `metadata_json` / `metadata_bin` and other bulky
 /// fields because Tantivy only needs the stable envelope plus provenance
-/// identifiers. Reading full metadata here can force frankensqlite to traverse
+/// identifiers. Reading full metadata here can force the legacy embedded engine to traverse
 /// large overflow chains before the first lexical checkpoint is committed.
 #[derive(Debug, Clone)]
 pub struct LexicalRebuildConversationRow {
@@ -2949,7 +2949,7 @@ fn truncate_lexical_rebuild_conversation_content(
 /// Compatibility alias retained while call sites finish converging on `FrankenStorage`.
 pub type SqliteStorage = FrankenStorage;
 
-/// Primary frankensqlite-backed storage backend.
+/// Primary legacy-engine-backed storage backend.
 pub struct FrankenStorage {
     conn: FrankenConnection,
     db_path: PathBuf,
@@ -3076,9 +3076,9 @@ where
     }
 
     Err(anyhow!(
-        "failed to disable autocommit_retain on frankensqlite connection; \
+        "failed to disable autocommit_retain on the legacy embedded engine connection; \
          refusing to keep a long-lived MVCC connection that may accumulate \
-         unbounded write snapshots. Upgrade frankensqlite to a version that \
+         unbounded write snapshots. Upgrade the legacy embedded engine to a version that \
          supports one of these PRAGMAs or use a short-lived connection path. \
          attempts: {}",
         failures.join("; ")
@@ -3143,7 +3143,7 @@ impl FrankenStorage {
         }
     }
 
-    /// Open a frankensqlite connection, run migrations, and apply config.
+    /// Open a legacy embedded engine connection, run migrations, and apply config.
     ///
     /// This initializes canonical schema state only. Derived fallback search
     /// structures like the in-database `fts_messages` table are repaired
@@ -3154,7 +3154,7 @@ impl FrankenStorage {
     /// build; `0 < user_version <= CURRENT_SCHEMA_VERSION` -> no-op verify;
     /// `user_version == 0` and non-empty -> reject with a rebuild-not-
     /// convert message). That last branch is the intended behavior change
-    /// this task ships: a pre-B8 (frankensqlite-era) database has
+    /// this task ships: a pre-B8 (legacy-engine-era) database has
     /// `user_version == 0` and is non-empty, so it is now rejected outright
     /// rather than incrementally migrated in place -- Stage C's re-ingest
     /// path is the supported route back for real user data, per spec's
@@ -3438,12 +3438,12 @@ impl FrankenStorage {
             CachedEphemeralWriter::Cached(mut conn) => conn
                 .0
                 .close_without_checkpoint_in_place()
-                .with_context(|| "closing cached frankensqlite writer without final checkpoint"),
+                .with_context(|| "closing cached the legacy embedded engine writer without final checkpoint"),
             CachedEphemeralWriter::Uninitialized | CachedEphemeralWriter::InUse => Ok(()),
         }
     }
 
-    /// Open in read-only mode using frankensqlite compat flags.
+    /// Open in read-only mode using the legacy embedded engine compat flags.
     pub fn open_readonly(path: &Path) -> Result<Self> {
         Self::open_readonly_with_doctor_lock_timeout(path, DOCTOR_MUTATION_DB_OPEN_LOCK_TIMEOUT)
     }
@@ -3456,7 +3456,7 @@ impl FrankenStorage {
         let path_str = path.to_string_lossy().to_string();
         let _doctor_guard = acquire_doctor_mutation_db_open_guard(path, timeout)?;
         let conn = open_franken_with_flags(&path_str, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
-            .with_context(|| format!("opening frankensqlite db readonly at {}", path.display()))?;
+            .with_context(|| format!("opening the legacy embedded engine db readonly at {}", path.display()))?;
         let storage = Self::new(conn, path.to_path_buf());
         storage.apply_readonly_config()?;
         Ok(storage)
@@ -3467,7 +3467,7 @@ impl FrankenStorage {
         this.close_cached_ephemeral_writer_best_effort_in_place();
         this.conn
             .close()
-            .with_context(|| "closing frankensqlite connection")
+            .with_context(|| "closing the legacy embedded engine connection")
     }
 
     pub fn close_without_checkpoint(self) -> Result<()> {
@@ -3475,7 +3475,7 @@ impl FrankenStorage {
         this.close_cached_ephemeral_writer_without_checkpoint_in_place()?;
         this.conn
             .close_without_checkpoint()
-            .with_context(|| "closing frankensqlite connection without final checkpoint")
+            .with_context(|| "closing the legacy embedded engine connection without final checkpoint")
     }
 
     pub fn close_best_effort_in_place(&mut self) {
@@ -3487,15 +3487,15 @@ impl FrankenStorage {
         self.close_cached_ephemeral_writer_without_checkpoint_in_place()?;
         self.conn
             .close_without_checkpoint_in_place()
-            .with_context(|| "closing frankensqlite connection without final checkpoint")
+            .with_context(|| "closing the legacy embedded engine connection without final checkpoint")
     }
 
-    /// Access the raw frankensqlite connection.
+    /// Access the raw the legacy embedded engine connection.
     pub fn raw(&self) -> &FrankenConnection {
         &self.conn
     }
 
-    /// Consume the storage wrapper and return the underlying frankensqlite
+    /// Consume the storage wrapper and return the underlying the legacy embedded engine
     /// connection after migrations/repair have already been applied.
     pub fn into_raw(self) -> FrankenConnection {
         let mut this = self;
@@ -3505,13 +3505,13 @@ impl FrankenStorage {
 
     /// Apply connection PRAGMAs for parity with SqliteStorage's `apply_pragmas()`.
     ///
-    /// Frankensqlite supports all PRAGMAs cass uses (journal_mode, synchronous,
+    /// The legacy embedded engine supports all PRAGMAs cass uses (journal_mode, synchronous,
     /// cache_size, foreign_keys, busy_timeout). Its default journal_mode is already
     /// WAL and default synchronous is NORMAL, matching cass's requirements.
     ///
     pub fn apply_config(&self) -> Result<()> {
-        // journal_mode: frankensqlite defaults to WAL, same as cass.
-        // synchronous: frankensqlite defaults to NORMAL, same as cass.
+        // journal_mode: the legacy embedded engine defaults to WAL, same as cass.
+        // synchronous: the legacy embedded engine defaults to NORMAL, same as cass.
         // Both are set explicitly for clarity.
         self.conn
             .execute("PRAGMA journal_mode = WAL;", &[])
@@ -3540,7 +3540,7 @@ impl FrankenStorage {
             .with_context(|| "setting busy_timeout")?;
 
         // temp_store = MEMORY and mmap_size are C SQLite performance knobs.
-        // In frankensqlite's architecture (in-memory MVCC engine with pager
+        // In the legacy embedded engine's architecture (in-memory MVCC engine with pager
         // backend), temp_store is always memory-resident and mmap_size does not
         // apply. Skipped intentionally — these are no-ops or errors.
 
@@ -3552,10 +3552,10 @@ impl FrankenStorage {
         self.index_writer_checkpoint_pages
             .store(DEFAULT_WAL_AUTOCHECKPOINT_PAGES, Ordering::Relaxed);
         // Explicitly enable concurrent writer mode for BEGIN/transaction paths.
-        // Try both namespace variants for compatibility across fsqlite builds.
+        // Try both namespace variants for compatibility across the legacy engine crate builds.
         let _ = self.conn.execute("PRAGMA fsqlite.concurrent_mode = ON;", &[]);
         let _ = self.conn.execute("PRAGMA concurrent_mode = ON;", &[]);
-        // Frankensqlite retained autocommit currently mis-serves same-connection
+        // The legacy embedded engine's retained autocommit currently mis-serves same-connection
         // read-after-write queries on cass's storage paths; keep it off here
         // until the upstream visibility bug is fixed.
         //
@@ -3569,7 +3569,7 @@ impl FrankenStorage {
             Ok(autocommit_pragma) => {
                 tracing::debug!(
                     pragma = autocommit_pragma,
-                    "disabled frankensqlite autocommit_retain for storage connection"
+                    "disabled the legacy embedded engine autocommit_retain for storage connection"
                 );
             }
             Err(err) => {
@@ -3577,7 +3577,7 @@ impl FrankenStorage {
                 if error_message_indicates_populated_fts_shadow_without_rowid_reload(&detail) {
                     tracing::warn!(
                         error = %detail,
-                        "frankensqlite could not disable autocommit_retain because a populated derived FTS shadow table cannot yet be reloaded; continuing so canonical indexing can proceed"
+                        "the legacy embedded engine could not disable autocommit_retain because a populated derived FTS shadow table cannot yet be reloaded; continuing so canonical indexing can proceed"
                     );
                 } else {
                     return Err(err);
@@ -3674,7 +3674,7 @@ impl FrankenStorage {
     /// Detect and remove orphan rows whose FK parent has gone missing.
     ///
     /// A `Connection` dropped mid-transaction (the `drop_close` warning emitted
-    /// by frankensqlite's `Drop` impl) can leave child rows persisted without a
+    /// by the legacy embedded engine's `Drop` impl) can leave child rows persisted without a
     /// matching parent — `messages` referencing a `conversation_id` that does
     /// not exist, `message_metrics`/`token_usage`/`snippets` referencing a
     /// `message_id` that does not exist, etc. With `PRAGMA foreign_keys = ON`,
@@ -5832,7 +5832,7 @@ impl FrankenStorage {
                     .execute("COMMIT;", &[])
                     .with_context(|| "committing scan-watermark restore transaction")
                 {
-                    // fsqlite keeps the transaction ACTIVE after a failed
+                    // the legacy engine crate keeps the transaction ACTIVE after a failed
                     // COMMIT — roll it back explicitly so this connection is
                     // not returned to any pool with an open transaction.
                     let _ = self.conn.execute("ROLLBACK;", &[]);
@@ -5851,7 +5851,7 @@ impl FrankenStorage {
     /// explicit transaction.
     ///
     /// These reads run during index startup. On large file-backed archives,
-    /// issuing them one-at-a-time in autocommit can force frankensqlite's
+    /// issuing them one-at-a-time in autocommit can force the legacy embedded engine's
     /// clean prepared-read path to refresh the file-backed MemDatabase before
     /// any connector work starts. A single explicit transaction keeps the
     /// startup path on the pager-backed read path while preserving the same
@@ -6106,7 +6106,7 @@ impl FrankenStorage {
     ///
     /// Matching is done in Rust with the `glob` crate (not a SQL `GLOB`
     /// operator) so the semantics are portable and deterministic across the
-    /// frankensqlite backend.
+    /// the legacy embedded engine backend.
     pub fn forget_conversations_by_source_glob(
         &self,
         pattern: &str,
@@ -6361,7 +6361,7 @@ impl FrankenStorage {
     /// List conversations with pagination.
     pub fn list_conversations(&self, limit: i64, offset: i64) -> Result<Vec<Conversation>> {
         // Avoid the multi-table JOIN with LIMIT/OFFSET that triggers
-        // frankensqlite's materialization fallback (see c38edcd9, 860acb12).
+        // the legacy embedded engine's materialization fallback (see c38edcd9, 860acb12).
         // Use correlated subqueries for the tiny agents (~20 rows) and
         // workspaces (~30 rows) lookup tables and degrade NULL agent_id to
         // the same 'unknown' sentinel that 8a0c547c established for the
@@ -6663,7 +6663,7 @@ impl FrankenStorage {
             // `.with_context(...)` on the inner query wraps the raw
             // "no such index" error, so `err.to_string()` only ever showed
             // the outer context message and this fallback never triggered --
-            // latent under frankensqlite (which silently tolerates an
+            // latent under the legacy embedded engine (which silently tolerates an
             // `INDEXED BY` naming a nonexistent index instead of erroring),
             // newly load-bearing now that a real SQLite backend enforces it.
             // Walk the full `anyhow` cause chain instead of the top frame.
@@ -6736,7 +6736,7 @@ impl FrankenStorage {
         workspace_paths: &HashMap<i64, PathBuf>,
     ) -> Result<Vec<LexicalRebuildConversationRow>> {
         // Single-table query avoids the 3-table JOIN that triggers
-        // frankensqlite's full-materialization fallback path.
+        // the legacy embedded engine's full-materialization fallback path.
         self.conn
             .query_all_map(
                 r"SELECT id, agent_id, workspace_id, external_id, title, source_path,
@@ -7091,7 +7091,7 @@ impl FrankenStorage {
         let mut total_content_bytes = 0usize;
 
         // The apparent single-query shape (`WHERE conversation_id IN (...) ORDER BY ...`)
-        // is a bad frankensqlite plan for large live databases: it can
+        // is a bad the legacy embedded engine plan for large live databases: it can
         // materialize far more of `messages` than the requested conversations.
         // Reuse the hinted per-conversation primary-key lookup instead.
         for conversation_id in conversation_ids {
@@ -9128,7 +9128,7 @@ impl FrankenStorage {
                     archive_fingerprint.to_string()
                 ],
             )
-            .with_context(|| "recording frankensqlite FTS archive fingerprint")?;
+            .with_context(|| "recording the legacy embedded engine FTS archive fingerprint")?;
         Ok(())
     }
 
@@ -9220,7 +9220,7 @@ impl FrankenStorage {
                     FTS_FRANKEN_REBUILD_GENERATION.to_string()
                 ],
             )
-            .with_context(|| "recording frankensqlite FTS rebuild generation")?;
+            .with_context(|| "recording the legacy embedded engine FTS rebuild generation")?;
         Ok(())
     }
 
@@ -9290,7 +9290,7 @@ impl FrankenStorage {
             Err(err) => {
                 tracing::warn!(
                     error = %err,
-                    "frankensqlite FTS consistency probe failed; rebuilding authoritative FTS"
+                    "the legacy embedded engine FTS consistency probe failed; rebuilding authoritative FTS"
                 );
                 let inserted_rows = self.rebuild_fts_via_frankensqlite()?;
                 self.record_fts_franken_rebuild_generation()?;
@@ -9330,7 +9330,7 @@ impl FrankenStorage {
 
         let inserted_rows = self
             .stream_fts_rows_via_frankensqlite(true)
-            .with_context(|| "incrementally repairing missing FTS rows via frankensqlite")?;
+            .with_context(|| "incrementally repairing missing FTS rows via the legacy embedded engine")?;
         let repaired_rows =
             self.conn
                 .query_row_map("SELECT COUNT(*) FROM fts_messages", fparams![], |row| {
@@ -9377,10 +9377,10 @@ impl FrankenStorage {
         self.invalidate_fts_messages_present_cache();
         self.conn
             .execute("DROP TABLE IF EXISTS fts_messages;", &[])
-            .with_context(|| "dropping derived fts_messages before frankensqlite rebuild")?;
+            .with_context(|| "dropping derived fts_messages before the legacy embedded engine rebuild")?;
         self.conn
             .execute(FTS5_REGISTER_SQL, fparams![])
-            .with_context(|| "creating derived fts_messages via frankensqlite rebuild")?;
+            .with_context(|| "creating derived fts_messages via the legacy embedded engine rebuild")?;
         self.set_fts_messages_present_cache(true);
 
         self.stream_fts_rows_via_frankensqlite(false)
@@ -9836,7 +9836,7 @@ impl FrankenStorage {
         // conversations; filter on agent slug via an EXISTS subquery only
         // when that filter is actually requested.  This avoids the unneeded
         // 2-table JOIN (which also silently dropped legacy conversations
-        // with NULL agent_id) and sidesteps frankensqlite's materialization
+        // with NULL agent_id) and sidesteps the legacy embedded engine's materialization
         // fallback entirely.
         let mut sql = "SELECT COUNT(*) FROM conversations c WHERE 1=1".to_string();
         let mut param_values: Vec<ParamValue> = Vec::new();
@@ -9991,7 +9991,7 @@ impl FrankenStorage {
                 // exist inside the transaction so FK checks pass.  The caller resolves
                 // IDs via ensure_agent / ensure_workspace / ensure_sources_for_batch
                 // outside the transaction, but those autocommit writes may not be
-                // visible inside the transaction snapshot in frankensqlite.  Re-verify
+                // visible inside the transaction snapshot in the legacy embedded engine.  Re-verify
                 // (and insert if missing) within the tx.
                 ensure_agents_in_tx(tx, conversations)?;
                 ensure_workspaces_in_tx(tx, conversations)?;
@@ -10663,7 +10663,7 @@ impl FrankenStorage {
 // FrankenStorage transaction helper functions
 // =========================================================================
 
-/// Get last_insert_rowid from a frankensqlite transaction.
+/// Get last_insert_rowid from a legacy embedded engine transaction.
 fn franken_last_rowid(tx: &FrankenTransaction<'_>) -> Result<i64> {
     // Task A4a: `api::Tx::last_insert_rowid` returns a bare `i64` (it cannot fail),
     // unlike the compat `Transaction::last_insert_rowid() -> Result<i64, FrankenError>`
@@ -10679,7 +10679,7 @@ fn franken_last_rowid(tx: &FrankenTransaction<'_>) -> Result<i64> {
 /// Bug #167: Ensure all agents referenced by a batch exist within the
 /// transaction.  The caller already resolved `agent_id` values via
 /// `ensure_agent` outside the transaction, but those autocommit writes may
-/// not be visible inside a frankensqlite transaction snapshot.  This function
+/// not be visible inside a legacy embedded engine transaction snapshot.  This function
 /// checks each unique agent_id and creates a stub row if it's missing.
 fn ensure_agents_in_tx(
     tx: &FrankenTransaction<'_>,
@@ -11276,7 +11276,7 @@ fn franken_insert_conversation_or_get_existing_after_miss(
     }
 }
 
-/// Insert a conversation into the DB within a frankensqlite transaction.
+/// Insert a conversation into the DB within a legacy embedded engine transaction.
 ///
 /// Uses a plain `INSERT` so the common miss path stays on the slim direct
 /// insert lane. Duplicate provenance conflicts are converted into `Ok(None)`
@@ -11450,7 +11450,7 @@ fn franken_message_insert_payload(msg: &Message) -> Result<MessageInsertPayload<
 /// `SQLITE_MAX_VARIABLE_NUMBER` limit of 999 while still amortizing parse cost.
 const MESSAGE_INSERT_BATCH_SIZE: usize = 100;
 
-/// Append workloads profile fastest with larger chunks on current frankensqlite.
+/// Append workloads profile fastest with larger chunks on current the legacy embedded engine.
 ///
 /// After the tail-state hot table removed conversation-row rewrites from the
 /// append path, 50-row chunks beat the old 20-row setting on the append-merge
@@ -11706,7 +11706,7 @@ fn franken_batch_insert_new_messages_with_profile_batch_size(
     Ok(inserted_ids)
 }
 
-/// Insert snippets within a frankensqlite transaction.
+/// Insert snippets within a legacy embedded engine transaction.
 fn franken_insert_snippets(
     tx: &FrankenTransaction<'_>,
     message_id: i64,
@@ -12104,7 +12104,7 @@ fn franken_collect_batched_existing_new_messages<'a>(
     ))
 }
 
-/// Batch insert FTS5 entries within a frankensqlite transaction.
+/// Batch insert FTS5 entries within a legacy embedded engine transaction.
 fn franken_batch_insert_fts(
     storage: &FrankenStorage,
     tx: &FrankenTransaction<'_>,
@@ -12172,7 +12172,7 @@ fn franken_batch_insert_fts(
                     tracing::warn!(
                         error = %err,
                         chunk_docs = chunk.len(),
-                        "frankensqlite FTS batch insert failed; skipping db-resident FTS maintenance because Tantivy is authoritative"
+                        "the legacy embedded engine FTS batch insert failed; skipping db-resident FTS maintenance because Tantivy is authoritative"
                     );
                 }
                 return Ok(inserted);
@@ -12241,7 +12241,7 @@ fn franken_batch_insert_fts_on_connection(
     Ok(inserted)
 }
 
-/// Update daily stats within a frankensqlite transaction.
+/// Update daily stats within a legacy embedded engine transaction.
 fn franken_update_daily_stats_in_tx(
     storage: &FrankenStorage,
     tx: &FrankenTransaction<'_>,
@@ -12430,7 +12430,7 @@ fn franken_apply_daily_stats_delta_in_tx(
 // Frankensqlite batch helpers
 // -------------------------------------------------------------------------
 
-/// Batch upsert daily_stats within a frankensqlite transaction.
+/// Batch upsert daily_stats within a legacy embedded engine transaction.
 fn franken_update_daily_stats_batched_in_tx(
     tx: &FrankenTransaction<'_>,
     entries: &[(i64, String, String, StatsDelta)],
@@ -12486,9 +12486,9 @@ fn franken_update_daily_stats_batched_in_tx_for_target(
     let mut total_affected = 0;
     let upsert_sql = target.upsert_sql();
 
-    // Keep frankensqlite UPSERTs row-wise inside the transaction. The
+    // Keep the legacy embedded engine UPSERTs row-wise inside the transaction. The
     // multi-row VALUES ... ON CONFLICT form still falls back through
-    // INSERT...SELECT in fsqlite-core, which rejects UPSERT/RETURNING during
+    // INSERT...SELECT in the legacy engine crate-core, which rejects UPSERT/RETURNING during
     // real cass indexing.
     for (day_id, agent, source, delta) in entries {
         total_affected += tx.execute(
@@ -12508,9 +12508,9 @@ fn franken_update_daily_stats_batched_in_tx_for_target(
     Ok(total_affected)
 }
 
-/// Batch insert token_usage rows within a frankensqlite transaction.
+/// Batch insert token_usage rows within a legacy embedded engine transaction.
 ///
-/// Uses row-wise INSERT OR IGNORE to avoid the frankensqlite limitation where
+/// Uses row-wise INSERT OR IGNORE to avoid the legacy embedded engine limitation where
 /// multi-row VALUES lists fall through to INSERT...SELECT, which rejects
 /// UPSERT/OR IGNORE conflict clauses.
 fn franken_insert_token_usage_batched_in_tx(
@@ -12569,7 +12569,7 @@ fn franken_insert_token_usage_batched_in_tx(
     Ok(total_inserted)
 }
 
-/// Batch upsert token_daily_stats within a frankensqlite transaction.
+/// Batch upsert token_daily_stats within a legacy embedded engine transaction.
 fn franken_update_token_daily_stats_batched_in_tx(
     tx: &FrankenTransaction<'_>,
     entries: &[(i64, String, String, String, TokenStatsDelta)],
@@ -12635,9 +12635,9 @@ fn franken_update_token_daily_stats_batched_in_tx(
     Ok(total_affected)
 }
 
-/// Batch insert message_metrics rows within a frankensqlite transaction.
+/// Batch insert message_metrics rows within a legacy embedded engine transaction.
 ///
-/// Uses row-wise INSERT OR IGNORE to avoid the frankensqlite limitation where
+/// Uses row-wise INSERT OR IGNORE to avoid the legacy embedded engine limitation where
 /// multi-row VALUES lists fall through to INSERT...SELECT, which rejects
 /// UPSERT/OR IGNORE conflict clauses.
 fn franken_insert_message_metrics_batched_in_tx(
@@ -12698,7 +12698,7 @@ fn franken_insert_message_metrics_batched_in_tx(
     Ok(total_inserted)
 }
 
-/// Flush one rollup table (shared logic for hourly + daily) within a frankensqlite transaction.
+/// Flush one rollup table (shared logic for hourly + daily) within a legacy embedded engine transaction.
 fn franken_flush_rollup_table(
     tx: &FrankenTransaction<'_>,
     table: &str,
@@ -12778,7 +12778,7 @@ fn franken_flush_rollup_table(
     Ok(total_affected)
 }
 
-/// Flush usage_models_daily rollup within a frankensqlite transaction.
+/// Flush usage_models_daily rollup within a legacy embedded engine transaction.
 fn franken_flush_model_daily_rollup_table(
     tx: &FrankenTransaction<'_>,
     deltas: &HashMap<(i64, String, i64, String, String, String), UsageRollupDelta>,
@@ -12849,7 +12849,7 @@ fn franken_flush_model_daily_rollup_table(
     Ok(total_affected)
 }
 
-/// Flush AnalyticsRollupAggregator deltas via frankensqlite transaction.
+/// Flush AnalyticsRollupAggregator deltas via the legacy embedded engine transaction.
 fn franken_flush_analytics_rollups_in_tx(
     tx: &FrankenTransaction<'_>,
     agg: &AnalyticsRollupAggregator,
@@ -12864,7 +12864,7 @@ fn franken_flush_analytics_rollups_in_tx(
     Ok((hourly_affected, daily_affected, models_daily_affected))
 }
 
-/// Update conversation-level token summary columns via frankensqlite transaction.
+/// Update conversation-level token summary columns via the legacy embedded engine transaction.
 fn franken_update_conversation_token_summaries_in_tx(
     tx: &FrankenTransaction<'_>,
     conversation_id: i64,
@@ -13722,7 +13722,7 @@ impl FrankenStorage {
                         String,
                     )> = tx.query_all_map(
                         // Avoid the 3-table JOIN with LIMIT/OFFSET that triggers
-                        // frankensqlite's materialization fallback (see 860acb12).
+                        // the legacy embedded engine's materialization fallback (see 860acb12).
                         // Inline the agent slug lookup as a correlated subquery and
                         // fall back to 'unknown' for NULL agent_id, matching the
                         // FTS / lexical rebuild paths.
@@ -13989,7 +13989,7 @@ impl FrankenStorage {
         };
 
         loop {
-            // Avoid the 2-table JOIN with LIMIT that triggers frankensqlite's
+            // Avoid the 2-table JOIN with LIMIT that triggers the legacy embedded engine's
             // materialization fallback (which is what the OOM retry below is
             // defending against — see 860acb12).  Inline agent slug via
             // correlated subquery and degrade NULL agent_id to 'unknown' for
@@ -15025,7 +15025,7 @@ impl PricingTable {
         Self::franken_load(conn)
     }
 
-    /// Load all pricing entries from a frankensqlite connection.
+    /// Load all pricing entries from a legacy embedded engine connection.
     pub fn franken_load(conn: &FrankenConnection) -> Result<Self> {
         let entries = conn.query_all_map(
             "SELECT model_pattern, provider, input_cost_per_mtok, output_cost_per_mtok,
@@ -15215,7 +15215,7 @@ fn rebuild_batch_size_env(var: &str, default: usize) -> usize {
 /// Returns true when the error chain represents a real `FrankenError::OutOfMemory`
 /// (typed variant) or a bare "out of memory" / "not enough memory" message.
 ///
-/// We *deliberately* do not do substring matching on the rendered chain: frankensqlite's
+/// We *deliberately* do not do substring matching on the rendered chain: the legacy embedded engine's
 /// `FrankenError::OutOfMemory` renders as the literal "out of memory" and is also emitted
 /// for several non-process-OOM internal conditions (VFS buffer / VDBE register allocation).
 /// Contextual messages like "connector parse failed: not enough memory in record" must not
@@ -15363,13 +15363,13 @@ pub struct DailyStatsHealth {
 
 /// Rows per FTS5 INSERT statement during db-resident `fts_messages`
 /// maintenance/rebuild. Each row binds 7 columns (rowid + 6 cols), and
-/// frankensqlite's `MAX_VARIABLE_NUMBER` is 32766, so the hard ceiling is
+/// the legacy embedded engine's `MAX_VARIABLE_NUMBER` is 32766, so the hard ceiling is
 /// 32766 / 7 = 4680 rows per statement; 4096 leaves margin (28672 params).
 ///
 /// This value is performance-critical, NOT just a memory knob
 /// (`coding_agent_session_search-nhqw0` / gh #301): `fts_messages` is a
 /// contentless FTS5 table (`content=''`), which routes every INSERT through
-/// frankensqlite's `persist_rootpage_zero_fts5_shadow_rows` full-table
+/// the legacy embedded engine's `persist_rootpage_zero_fts5_shadow_rows` full-table
 /// re-encode (`build_pending_hash` re-tokenizes *all* rows). The cost of one
 /// INSERT is therefore O(rows-so-far) regardless of the statement's row count,
 /// so the total rebuild cost is (number of INSERT statements) × O(table). The
@@ -15378,7 +15378,7 @@ pub struct DailyStatsHealth {
 /// wedged `cass index --full` above ~15-30 MB of content. Issuing one large
 /// param-safe statement per flush collapses that to a handful of re-encodes.
 /// The asymptotic fix (incremental contentless persistence) is tracked in
-/// frankensqlite bd-sf8dx.
+/// the legacy embedded engine bd-sf8dx.
 const FTS5_BATCH_SIZE: usize = 4096;
 
 #[derive(Debug, Clone)]
@@ -16969,7 +16969,7 @@ mod tests {
         let storage = SqliteStorage::open(&db_path).unwrap();
         let version = storage.schema_version().unwrap();
         // w1b Task B8: the floor used to be `>= 5` under the old ~21-step
-        // frankensqlite migration numbering; `PRAGMA user_version` starts a
+        // the legacy embedded engine migration numbering; `PRAGMA user_version` starts a
         // fresh count at 1 under `schema::ensure`.
         assert_eq!(version, CURRENT_SCHEMA_VERSION, "fresh database should report the current schema version");
     }
@@ -17136,7 +17136,7 @@ mod tests {
         // "V13 creates it, V14 drops it, a later FTS consistency check
         // recreates it lazily" dance this assertion used to check for is
         // retired for new-engine databases (that dance existed to work around
-        // a frankensqlite-specific limitation; the machinery itself retires
+        // a legacy embedded engine-specific limitation; the machinery itself retires
         // at Task B8). A fresh database now has exactly one, immediately
         // queryable, fts_messages schema row from the moment it's built.
         let fts_schema_rows: i64 = conn
@@ -21775,7 +21775,7 @@ mod tests {
             drop(legacy);
 
             // Verify fixture with rusqlite+writable_schema to see raw
-            // sqlite_master rows (frankensqlite deduplicates schema entries).
+            // sqlite_master rows (the legacy embedded engine deduplicates schema entries).
             {
                 let verify = rusqlite_test_fixture_conn(&source_db);
                 verify
@@ -21889,7 +21889,7 @@ mod tests {
             CURRENT_SCHEMA_VERSION
         );
         // Post-V14 fts_messages is recreated lazily. `FrankenStorage::open`
-        // alone doesn't re-register the virtual table for the frankensqlite
+        // alone doesn't re-register the virtual table for the legacy embedded engine
         // query engine — the consistency pass does, and this is exactly what
         // normal cass startup runs before the first search. Invoke it
         // explicitly so the query below exercises the expected post-repair
@@ -25615,9 +25615,9 @@ mod tests {
         // SQLite defers FTS5 shadow-table validation to the virtual
         // table's `xConnect`, triggered by the first real reference to
         // `fts_messages` -- not by opening the connection. The old
-        // frankensqlite backend validated eagerly at open time (which this
+        // the legacy embedded engine backend validated eagerly at open time (which this
         // test originally pinned); that eagerness was a side effect of
-        // frankensqlite's own vtable machinery, the very thing this wave
+        // the legacy embedded engine's own vtable machinery, the very thing this wave
         // retires. Opening a connection to a database carrying a single
         // (non-duplicated) orphaned fts_messages declaration must now
         // succeed:
@@ -25628,7 +25628,7 @@ mod tests {
         // actually queried, pinning the real exposure timing so a future
         // engine change silently moving it elsewhere goes noticed. Real
         // SQLite's xConnect failure here is a generic "vtable constructor
-        // failed: fts_messages" -- unlike frankensqlite's old open-time
+        // failed: fts_messages" -- unlike the legacy embedded engine's old open-time
         // message, it does not name any specific missing shadow table, so
         // `fts_messages_integrity_error_from_message` classifies it as
         // structural FTS damage with an empty `missing_shadow_tables()`
@@ -25698,7 +25698,7 @@ mod tests {
         drop(storage);
 
         let c_reader = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().into_owned())), crate::storage::api::Profile::Production)
-            .expect("open DB via frankensqlite for sqlite_master inspection");
+            .expect("open DB via the legacy embedded engine for sqlite_master inspection");
         assert_eq!(
             franken_fts_schema_rows(&c_reader).unwrap(),
             1,
@@ -25712,7 +25712,7 @@ mod tests {
                 .raw()
                 .query_all_map("SELECT COUNT(*) FROM fts_messages", &[], |_row| Ok(()))
                 .is_ok(),
-            "fts_messages must be queryable through frankensqlite after open"
+            "fts_messages must be queryable through the legacy embedded engine after open"
         );
     }
 

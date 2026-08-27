@@ -20395,7 +20395,7 @@ impl super::ftui_adapter::Model for CassApp {
                                             has_messages && needs_rebuild
                                         }
                                         Err(e) => {
-                                            // query_status failed (likely frankensqlite compat) —
+                                            // query_status failed (likely the legacy embedded engine compat) —
                                             // try rebuild anyway since we have no data to show.
                                             tracing::warn!(
                                                 error = %e,
@@ -34177,7 +34177,7 @@ not jsonl",
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("analytics_loading.db");
         let storage =
-            FrankenStorage::open(&db_path).expect("open frankensqlite for analytics test");
+            FrankenStorage::open(&db_path).expect("open the legacy embedded engine for analytics test");
         app.db_reader = Some(Arc::new(storage));
 
         let cmd = app.schedule_analytics_reload();
@@ -34252,7 +34252,7 @@ not jsonl",
     fn analytics_entered_sets_loading_context_when_cache_empty() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("analytics_enter.db");
-        let storage = FrankenStorage::open(&db_path).expect("open frankensqlite");
+        let storage = FrankenStorage::open(&db_path).expect("open the legacy embedded engine");
         let mut app = CassApp::default();
         app.db_reader = Some(Arc::new(storage));
         app.analytics_cache = None;

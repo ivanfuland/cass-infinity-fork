@@ -25,8 +25,8 @@ use crate::root_cause_taxonomy::{
 /// gathered; presence (not prose) drives attribution. Defaults are "no signal".
 #[derive(Debug, Clone, Default)]
 pub struct ProjectionSignals {
-    // --- frankensqlite / storage ---
-    /// A structured fsqlite error code was observed (direct evidence).
+    // --- the legacy embedded engine / storage ---
+    /// A structured the legacy engine crate error code was observed (direct evidence).
     pub fsqlite_error_code: Option<String>,
     /// An OpenRead / FTS read failure occurred.
     pub open_read_failure: bool,
@@ -97,7 +97,7 @@ struct FamilyHit {
 fn collect_hits(s: &ProjectionSignals) -> Vec<FamilyHit> {
     let mut hits: Vec<FamilyHit> = Vec::new();
 
-    // frankensqlite storage — direct on an explicit error code / OpenRead.
+    // the legacy embedded engine storage — direct on an explicit error code / OpenRead.
     {
         let mut ev = Vec::new();
         let mut direct = false;

@@ -63,7 +63,7 @@ fn plans_view_navigation_constants_documented() {
 fn plans_view_fixture_directory_present_for_future_snapshots() {
     tracing::info!(target: "vz9t8_3_test", scenario = "fixture_dir");
     // The bead requires three fixture DBs at tests/fixtures/analytics/. We
-    // don't ship the binary DB files here (they require frankensqlite-driven
+    // don't ship the binary DB files here (they require the legacy embedded engine-driven
     // generation), but we DO ship the directory + a README explaining how
     // to populate them, so the snapshot regen script has a known location.
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

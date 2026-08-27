@@ -1053,7 +1053,7 @@ pub struct IndexingProgress {
     /// Set by `run_index` while it is inside the post-publish finalize window —
     /// specifically `close_storage_after_index`, which runs the (deferred,
     /// possibly multi-GB) bulk-ingest WAL checkpoint via a synchronous,
-    /// `!Send` frankensqlite `conn.close()` + `wal_checkpoint(TRUNCATE)` on the
+    /// `!Send` legacy-embedded-engine `conn.close()` + `wal_checkpoint(TRUNCATE)` on the
     /// indexer thread. That checkpoint cannot report progress and, on a large
     /// corpus (esp. macOS, where Darwin fsync/flock is slow), legitimately
     /// takes minutes. The stall watchdog reads this flag so it does not misread
@@ -2977,7 +2977,7 @@ impl IndexRunLockGuard {
 /// v0.6.6 against a 3.25 GB / 7,566-conversation / 417,234-message DB
 /// — i.e. the `ORDER BY conversation_id ASC LIMIT 1` query in
 /// `collect_orphan_message_ids` descends the `messages` B-tree without
-/// a usable index and wedges in fsqlite.
+/// a usable index and wedges in the legacy engine crate.
 ///
 /// This module turns the diagnostic infrastructure into a *self-
 /// debugging surface*:
@@ -2992,7 +2992,7 @@ impl IndexRunLockGuard {
 /// 2. Per-op skip env vars: `CASS_SKIP_PREFLIGHT_<NAME>=1` lets an
 ///    operator bypass a single wedged step (e.g.
 ///    `CASS_SKIP_PREFLIGHT_CLEANUP_ORPHAN_FK_ROWS=1`) so they can
-///    actually use cass while the underlying fsqlite/cass bug is
+///    actually use cass while the underlying the legacy engine crate/cass bug is
 ///    being root-caused.
 /// 3. Per-op completion bump: every bounded preflight step calls the
 ///    completion macro after it returns, disarming the per-op watchdog
@@ -6808,7 +6808,7 @@ fn persist_lexical_rebuild_generation_artifacts(
 // thousands of conversations on a developer workstation (~512MB tantivy heap,
 // 4 writer threads). Raise via env vars on constrained hosts or when a corpus
 // exceeds these budgets. The previous (much smaller) defaults served
-// correctness during the frankensqlite migration but capped throughput at
+// correctness during the legacy embedded engine migration but capped throughput at
 // ~20 docs/sec on a 4.7M-message corpus; the values below keep Tantivy's
 // writer threads fed and cut SQL round-trips by ~5x without blowing the
 // configured heap.
@@ -9354,7 +9354,7 @@ fn repair_fallback_fts_after_full_index_run(
     // of the repair — the fingerprint probe, the consistency check, and
     // the marker write.  The long-running indexer connection accumulates
     // per-thread cursor cancellation state across the rayon worker pool
-    // (see `observe_cursor_cancellation` in fsqlite-btree), which can
+    // (see `observe_cursor_cancellation` in the legacy engine crate-btree), which can
     // surface on the FIRST subsequent query as `SQLITE_ABORT`
     // ("callback requested query abort").  That failure was making
     // every full-rebuild `run_index` call in the bench harness return
@@ -9382,7 +9382,7 @@ fn repair_fallback_fts_after_full_index_run(
             }
             return Err(err).with_context(|| {
                 format!(
-                    "opening fresh frankensqlite connection for fallback FTS repair at {}",
+                    "opening fresh the legacy embedded engine connection for fallback FTS repair at {}",
                     db_path.display()
                 )
             });
@@ -13534,7 +13534,7 @@ pub fn run_index(
     // CASS #162 item 2: Verify the connection is writable early, before the
     // code reaches deep batch-insert paths where a readonly failure is hard
     // to diagnose.  A benign no-op UPDATE catches "attempt to write a readonly
-    // database" from frankensqlite.
+    // database" from the legacy embedded engine.
     if let Err(err) = storage
         .raw()
         .execute("UPDATE meta SET value = value WHERE key = 'schema_version'", &[])
@@ -13598,7 +13598,7 @@ pub fn run_index(
             tracing::warn!(
                 db_path = %opts.db_path.display(),
                 error = %detail,
-                "skipping derived fallback FTS validation repair because frankensqlite cannot yet reload populated FTS shadow WITHOUT ROWID tables; canonical indexing will continue"
+                "skipping derived fallback FTS validation repair because the legacy embedded engine cannot yet reload populated FTS shadow WITHOUT ROWID tables; canonical indexing will continue"
             );
         } else {
             tracing::warn!(
@@ -13693,7 +13693,7 @@ pub fn run_index(
     //
     // cass#265/cass#272 follow-up: both external reports and the
     // local profile of the production archive show this preflight can
-    // peg CPU inside `collect_orphan_message_ids` / fsqlite page-cache
+    // peg CPU inside `collect_orphan_message_ids` / the legacy engine crate page-cache
     // eviction for minutes. Routine indexing skips it by default; run
     // with CASS_PREFLIGHT_CLEANUP_ORPHAN_FK_ROWS=1 to force the old
     // repair behavior, or combine that with
@@ -14147,7 +14147,7 @@ pub fn run_index(
         // cass#272 performance follow-up: routine incremental refreshes on a
         // populated canonical archive should not probe historical bundles at
         // startup. Discovery opens candidate backup/snapshot DBs and can wedge
-        // in fsqlite page-cache eviction before real indexing starts. Keep the
+        // in the legacy engine crate page-cache eviction before real indexing starts. Keep the
         // automatic path for explicit full/rebuilt/empty recovery, and expose
         // the old populated-incremental discovery behavior behind
         // CASS_PREFLIGHT_HISTORICAL_SALVAGE_DISCOVERY=1.
@@ -14276,7 +14276,7 @@ pub fn run_index(
             // repair branch — `count_total_messages_exact` issues a
             // `SELECT COUNT(*) FROM messages` which, on the cass#265
             // reporter's 417k-row DB, can route through the same
-            // fsqlite full-table-scan path that wedges
+            // the legacy engine crate full-table-scan path that wedges
             // `cleanup_orphan_fk_rows`. Skipping leaves the planner
             // in the "no repair plan" branch, which falls through to
             // the normal scan loop instead of the lexical-repair
@@ -15050,7 +15050,7 @@ pub fn run_index(
     )
     .with_context(|| {
         format!(
-            "repairing frankensqlite-owned fallback FTS after full index run for {}",
+            "repairing the legacy embedded engine-owned fallback FTS after full index run for {}",
             opts.db_path.display()
         )
     })? {
@@ -15068,7 +15068,7 @@ pub fn run_index(
                 tracing::warn!(
                     db_path = %opts.db_path.display(),
                     error = %detail,
-                    "skipping derived fallback FTS repair because frankensqlite cannot yet reload populated FTS shadow WITHOUT ROWID tables; canonical SQLite rows and Tantivy remain authoritative"
+                    "skipping derived fallback FTS repair because the legacy embedded engine cannot yet reload populated FTS shadow WITHOUT ROWID tables; canonical SQLite rows and Tantivy remain authoritative"
                 );
             }
             FallbackFtsRepairOutcome::SkippedCorruptDerivedIndex { detail } => {
@@ -15108,7 +15108,7 @@ pub fn run_index(
         tracing::info!(
             db_path = %opts.db_path.display(),
             canonical_only_full_rebuild,
-            "skipping frankensqlite-owned fallback FTS rebuild because this full run only rebuilt Tantivy from the existing canonical database"
+            "skipping the legacy embedded engine-owned fallback FTS rebuild because this full run only rebuilt Tantivy from the existing canonical database"
         );
     }
 
@@ -15442,7 +15442,7 @@ pub fn run_index(
     }
 
     // #319/#321: `close_storage_after_index` runs the final WAL checkpoint of
-    // the deferred bulk-ingest WAL — a synchronous, `!Send` frankensqlite
+    // the deferred bulk-ingest WAL — a synchronous, `!Send` the legacy embedded engine
     // `conn.close()` + `wal_checkpoint(TRUNCATE)` that executes on THIS thread
     // and cannot report progress. On a large corpus (the report: ~1.1 GB /
     // ~290k-frame WAL) it legitimately takes minutes, especially on macOS.
@@ -15541,7 +15541,7 @@ fn classify_final_wal_checkpoint(
 /// The `cass index` stall-abort path exits via `std::process::exit(70)`, which
 /// skips destructors — so the canonical WAL is never checkpointed and a killed
 /// run leaves a multi-GB orphaned `*.db-wal` behind a tiny `*.db` (the #296
-/// symptom). This opens a *fresh, independent* frankensqlite connection to the
+/// symptom). This opens a *fresh, independent* the legacy embedded engine connection to the
 /// canonical DB file (the wedged storage handle's workers are parked, but the
 /// file itself is checkpointable through a new connection) and runs
 /// `wal_checkpoint(TRUNCATE)` so the post-abort DB is recoverable by stock
@@ -15596,7 +15596,7 @@ pub fn best_effort_abort_wal_checkpoint(data_dir: &Path) {
 }
 
 fn run_final_wal_checkpoint(db_path: &Path, context: &str) -> Result<FinalWalCheckpointOutcome> {
-    // Run this after closing the indexing storage handle: frankensqlite flushes
+    // Run this after closing the indexing storage handle: the legacy embedded engine flushes
     // retained autocommit writes during close, and TRUNCATE avoids leaving the
     // completed bulk-ingest WAL for the next opener to replay.
     let conn = crate::storage::api::Conn::open_writable(
@@ -16283,7 +16283,7 @@ fn incremental_semantic_embed(
     )
 }
 
-/// Open frankensqlite storage for indexing without replacing canonical data.
+/// Open the legacy embedded engine storage for indexing without replacing canonical data.
 ///
 /// Returns `(storage, rebuilt, opened_fresh_for_full)`. `rebuilt` and
 /// `opened_fresh_for_full` are retained for progress metadata compatibility;
@@ -16698,7 +16698,7 @@ fn file_size_bytes(path: &Path) -> u64 {
 #[cfg(test)]
 fn current_schema_fast_probe(db_path: &Path) -> Result<bool> {
     let mut storage = FrankenStorage::open_readonly(db_path)
-        .with_context(|| format!("opening frankensqlite db readonly at {}", db_path.display()))?;
+        .with_context(|| format!("opening the legacy embedded engine db readonly at {}", db_path.display()))?;
 
     let version = storage
         .raw()
@@ -17511,7 +17511,7 @@ fn spawn_lexical_rebuild_packet_producer(
             log_prep_step("load_sources", &mut prep_step_started);
 
             // Pre-fetch agent/workspace lookup maps to avoid 3-table JOINs in the
-            // rebuild query path — frankensqlite materialises the full Cartesian
+            // rebuild query path — the legacy embedded engine materialises the full Cartesian
             // product for multi-table JOINs, causing 200x+ regressions.
             let (agent_slugs, workspace_paths) = match storage.build_lexical_rebuild_lookups() {
                 Ok(lookups) => lookups,
@@ -21150,7 +21150,7 @@ fn ingest_batch_detailed(
         robot_trace_ingest_start("ingest_batch", convs, lexical_strategy, defer_checkpoints);
     // Persistence now uses short-lived writer connections internally so the
     // long-lived watch/session handle does not accumulate retained MVCC state
-    // on older frankensqlite builds that ignore autocommit_retain.
+    // on older the legacy embedded engine builds that ignore autocommit_retain.
     let batch_result = persist::persist_conversations_batched_with_raw_mirror_links(
         storage,
         t_index,
@@ -21277,7 +21277,7 @@ fn ingest_non_watch_batch_once(
 ) -> Result<NonWatchIngestOutcome> {
     if should_inject_non_watch_ingest_test_oom(convs) {
         // Use the typed `FrankenError::OutOfMemory` variant so the OOM detector
-        // exercises the downcast path that real frankensqlite OOMs hit, instead
+        // exercises the downcast path that real the legacy embedded engine OOMs hit, instead
         // of relying on the plain-string fallback.
         return Err(out_of_memory_storage_error());
     }
@@ -21384,7 +21384,7 @@ fn ingest_non_watch_oom_retry_or_quarantine(
 
     let conv = &convs[0];
 
-    // #298: mirror the watch-path plausibility gate. frankensqlite raises the
+    // #298: mirror the watch-path plausibility gate. the legacy embedded engine raises the
     // same typed `FrankenError::OutOfMemory` for per-statement bounded
     // allocation guards, so a NoMem on a small conversation with no real host
     // memory pressure is not evidence of a poisoned conversation. Defer it
@@ -21595,7 +21595,7 @@ fn ingest_watch_batch_with_oom_split_inner(
     let batch_result =
         if mode == WatchOomIngestMode::Standard && should_inject_watch_ingest_test_oom(convs) {
             // Use the typed `FrankenError::OutOfMemory` variant so the OOM detector
-            // exercises the downcast path that real frankensqlite OOMs hit, instead
+            // exercises the downcast path that real the legacy embedded engine OOMs hit, instead
             // of relying on the plain-string fallback.
             Err(out_of_memory_storage_error())
         } else {
@@ -21664,7 +21664,7 @@ fn ingest_watch_batch_with_oom_split_inner(
             let conv = &convs[0];
 
             // #298: a typed `FrankenError::OutOfMemory` (NoMem) on the batch
-            // path is NOT proof of real host memory exhaustion — frankensqlite
+            // path is NOT proof of real host memory exhaustion — the legacy embedded engine
             // raises the same typed error for per-statement bounded allocation
             // guards. Before quarantining a single small conversation that may
             // well ingest fine in isolation, retry it solo (which the reporter
@@ -21898,7 +21898,7 @@ fn error_is_out_of_memory(error: &anyhow::Error) -> bool {
 
 /// Default ceiling, in bytes of *indexed text*, under which a watch-ingest
 /// `NoMem` is treated as a bounded-allocation-guard false positive rather than
-/// real host memory exhaustion (#298). frankensqlite raises the same typed
+/// real host memory exhaustion (#298). the legacy embedded engine raises the same typed
 /// `FrankenError::OutOfMemory` for per-statement bounded allocation limits
 /// (VDBE frame/register/pager guards) as it does for real OS pressure, so a
 /// small conversation that ingests fine solo must never be quarantined just
@@ -23302,7 +23302,7 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) -> Resu
 fn reset_storage(storage: &FrankenStorage) -> Result<()> {
     // Wrap the canonical-table reset in a transaction so partial clears roll back.
     // The derived FTS table is recreated explicitly afterward because the
-    // frankensqlite writer path does not implement the FTS5 control-column
+    // the legacy embedded engine writer path does not implement the FTS5 control-column
     // `delete-all` command used by stock SQLite.
     storage.raw().execute_batch(
         "BEGIN TRANSACTION;
@@ -25738,7 +25738,7 @@ pub mod persist {
     /// GH#320: bulk-import mode used to disable autocheckpoints entirely
     /// (`0`), deferring the whole checkpoint to post-publish. That let the
     /// WAL grow with the corpus (1 GB+ on large fleets) and — because the
-    /// frankensqlite pager keeps WAL-resident state in memory — drove the
+    /// the legacy embedded engine pager keeps WAL-resident state in memory — drove the
     /// ingest-phase physical footprint to roughly 3.5-4x the WAL size
     /// (13-14 GB peaks on 16 GB hosts). A bounded-but-large threshold keeps
     /// bulk import's amortized-checkpoint intent (one checkpoint per
@@ -25919,7 +25919,7 @@ pub mod persist {
         apply_index_writer_checkpoint_policy(storage, defer_checkpoints);
         let (writer, reusable) = storage.acquire_cached_ephemeral_writer().with_context(|| {
             format!(
-                "opening short-lived frankensqlite writer for {context}: {}",
+                "opening short-lived the legacy embedded engine writer for {context}: {}",
                 db_path.display()
             )
         })?;
@@ -25931,7 +25931,7 @@ pub mod persist {
             } else {
                 writer.close().with_context(|| {
                     format!(
-                        "closing short-lived frankensqlite writer for {context}: {}",
+                        "closing short-lived the legacy embedded engine writer for {context}: {}",
                         db_path.display()
                     )
                 })
@@ -25972,7 +25972,7 @@ pub mod persist {
         apply_index_writer_checkpoint_policy(&writer, defer_checkpoints);
 
         // w1b Task B2b (R0-B3): CASS #169 used to disable FK enforcement here
-        // to work around a frankensqlite cursor-cache bug (false-positive FK
+        // to work around a legacy embedded engine cursor-cache bug (false-positive FK
         // violations after ~39min of sustained write activity, confirmed
         // spurious by `PRAGMA foreign_key_check`) on the theory that
         // application-level guarantees (ensure_agent/ensure_workspace/
@@ -27129,9 +27129,9 @@ pub mod persist {
             assert!(!is_retryable_franken_error(&not_retryable));
         }
 
-        /// Helper: create a frankensqlite-native database with schema applied.
+        /// Helper: create a legacy embedded engine-native database with schema applied.
         fn create_franken_db(path: &std::path::Path) -> FrankenStorage {
-            let fs = FrankenStorage::open(path).expect("open frankensqlite db");
+            let fs = FrankenStorage::open(path).expect("open the legacy embedded engine db");
             fs
         }
 
@@ -27402,7 +27402,7 @@ pub mod persist {
             let db_path = dir.path().join("test.db");
             let index_path = dir.path().join("tantivy");
 
-            // Create frankensqlite-native database (BEGIN CONCURRENT requires it)
+            // Create the legacy embedded engine-native database (BEGIN CONCURRENT requires it)
             let frank = create_franken_db(&db_path);
             drop(frank); // close so writers can open independently
             let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
@@ -31315,7 +31315,7 @@ mod tests {
     /// `phase=watch_startup` block ran with no progress bump and no
     /// sub-phase breadcrumb. If any one of them wedged (e.g. a multi-
     /// second-to-multi-hour COUNT scan against `messages` triggering a
-    /// fsqlite B-tree descent bug), operators saw only the opaque
+    /// the legacy engine crate B-tree descent bug), operators saw only the opaque
     /// `phase=watch_startup` for hours, with no way to tell whether
     /// the wedge was in `cleanup_orphan_fk_rows`, the lexical-
     /// checkpoint probe, the tantivy reader preflight, or somewhere
@@ -39377,7 +39377,7 @@ mod tests {
 
     /// #298 gate (non-watch): a small conversation that hits a typed NoMem
     /// with no real host memory pressure is deferred to the next index run —
-    /// never quarantined — because frankensqlite's bounded allocation guards
+    /// never quarantined — because the legacy embedded engine's bounded allocation guards
     /// raise the same typed error without the host being out of memory.
     #[test]
     #[serial]
@@ -42934,7 +42934,7 @@ mod tests {
 
         // Migrated from rusqlite per AGENTS.md Rule 2 + bead uiojh: the
         // meta row seed is a plain INSERT into a user table (not a
-        // writable_schema path), so fsqlite handles it with no upstream
+        // writable_schema path), so the legacy engine crate handles it with no upstream
         // feature dependency. Opens a FrankenConnection directly against
         // the file written by SqliteStorage above.
         let canonical_db_path = canonical_db.to_string_lossy().to_string();
