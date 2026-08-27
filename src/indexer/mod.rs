@@ -42098,13 +42098,13 @@ mod tests {
             storage.schema_version().unwrap(),
             crate::storage::sqlite::CURRENT_SCHEMA_VERSION
         );
-        assert!(
-            storage
-                .raw()
-                .query_all_map("SELECT version FROM _schema_migrations LIMIT 1;", &[], |row| row
-                    .get_value(0))
-                .is_ok()
-        );
+        // w1b Task B9 (2026-08-27, control-plane ruling): the trailing
+        // assertion that used to read a backfilled row out of
+        // _schema_migrations here is gone -- ensure no longer populates that
+        // table with invented history for a fast-path-current db (that would
+        // forge provenance for a migration that never ran). This test's
+        // remaining assertions still cover its real subject: the fast path
+        // reopens without rebuilding or falling back to a fresh full index.
     }
 
     #[test]
