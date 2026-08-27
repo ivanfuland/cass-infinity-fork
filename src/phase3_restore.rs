@@ -13491,10 +13491,21 @@ mod e8_dry_run_planner_tests {
                 if path.is_dir() {
                     stack.push(path);
                 } else if let Ok(meta) = entry.metadata() {
-                    out.push((
-                        path.strip_prefix(root).unwrap().display().to_string(),
-                        meta.len(),
-                    ));
+                    let rel = path.strip_prefix(root).unwrap().display().to_string();
+                    // w1b Task B9 (2026-08-27, equivalence-gate-caught, control-
+                    // plane ruling): vanilla SQLite's WAL-mode shared-memory/log
+                    // sidecars are engine-managed transient state, not tracked
+                    // write-set content -- see tests/cli_doctor.rs's
+                    // doctor_no_write_snapshot for the same exemption and its
+                    // full rationale (reproduced directly: even a read-only
+                    // connection to a WAL-mode database creates/touches these
+                    // two files, which only a writable connection can ever
+                    // checkpoint away). Every other file, including the
+                    // canonical .db itself, is still tracked byte-for-byte.
+                    if rel.ends_with("-shm") || rel.ends_with("-wal") {
+                        continue;
+                    }
+                    out.push((rel, meta.len()));
                 }
             }
         }
