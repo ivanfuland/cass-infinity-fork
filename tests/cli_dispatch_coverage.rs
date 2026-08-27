@@ -493,8 +493,13 @@ fn seed_analytics_remote_source_tokens_fixture(temp_home: &TempDir) {
         .path()
         .join(".local/share/coding-agent-search/agent_search.db");
     let conn = coding_agent_search::storage::sqlite::FrankenStorage::open(&db_path).map(|s| s.into_raw()).unwrap();
-    conn.execute("ALTER TABLE conversations ADD COLUMN origin_host TEXT", &[])
-        .unwrap();
+    // w1b Task B9 (2026-08-27): `conversations.origin_host` is part of
+    // storage::schema::ensure's base DDL from the first CREATE TABLE, unlike
+    // the legacy incremental migration engine where it only existed on
+    // databases that had been incrementally migrated far enough to pick up
+    // that column. The `ALTER TABLE ... ADD COLUMN origin_host` this fixture
+    // used to need is now a duplicate-column error against a database built
+    // through the current engine.
 
     let workspace_rows = conn
         .query_all_map(
@@ -548,8 +553,13 @@ fn seed_analytics_remote_source_tools_fixture(temp_home: &TempDir) {
         .path()
         .join(".local/share/coding-agent-search/agent_search.db");
     let conn = coding_agent_search::storage::sqlite::FrankenStorage::open(&db_path).map(|s| s.into_raw()).unwrap();
-    conn.execute("ALTER TABLE conversations ADD COLUMN origin_host TEXT", &[])
-        .unwrap();
+    // w1b Task B9 (2026-08-27): `conversations.origin_host` is part of
+    // storage::schema::ensure's base DDL from the first CREATE TABLE, unlike
+    // the legacy incremental migration engine where it only existed on
+    // databases that had been incrementally migrated far enough to pick up
+    // that column. The `ALTER TABLE ... ADD COLUMN origin_host` this fixture
+    // used to need is now a duplicate-column error against a database built
+    // through the current engine.
 
     let workspace_rows = conn
         .query_all_map(
