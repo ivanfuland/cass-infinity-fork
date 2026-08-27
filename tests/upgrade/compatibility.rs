@@ -61,6 +61,58 @@ fn test_new_database_has_current_schema() {
 // Database Compatibility Tests
 // =============================================================================
 
+/// w1b Task B9 (2026-08-27, control-plane ruling): dedicated write-path e2e
+/// coverage for the "rebuild, don't silently convert, a pre-rusqlite
+/// archive" contract (`storage::schema::ensure`'s own rejection). This
+/// replaces `e2e_storage_failure_fixture_gate.rs`'s retired
+/// `fm-storage-legacy-interop-fail` fixture -- that file's fixtures are all
+/// driven through read-only `safe_command`s (`doctor --check`/`status`/
+/// `search`), none of which ever reach `schema::ensure`'s writable-open-only
+/// rejection (`open_read` never consults `user_version` at all -- a
+/// vanilla-readable structurally-intact old database opens and searches
+/// fine, which is correct: silently migrating one on ANY open, including
+/// read-only ones, is exactly the franken-era anti-pattern Task B8(a)
+/// retired). `SqliteStorage::open()` -- the real production entry point
+/// every write-triggering command (`cass index`, `current`, ...) goes
+/// through -- is the only code path that actually enforces this contract,
+/// so this test drives that function directly rather than shelling out to
+/// a read-only CLI surface.
+#[test]
+fn test_open_rejects_pre_rusqlite_archive_instead_of_converting_it() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("pre_rusqlite.db");
+
+    // A real, fully-current-schema database, built through the same
+    // production entry point the rejection itself lives in -- not a
+    // hand-rolled schema. `user_version` lives at the fixed SQLite header
+    // offset 60..64 (big-endian i32); this is the one on-disk byte a
+    // pre-rusqlite archive would actually differ on, everything else about
+    // the file is a perfectly ordinary, structurally intact database.
+    {
+        let storage = SqliteStorage::open(&db_path).expect("build a real current-schema database");
+        drop(storage);
+    }
+    let mut bytes = std::fs::read(&db_path).expect("read the database file");
+    bytes[60..64].copy_from_slice(&[0, 0, 0, 0]);
+    std::fs::write(&db_path, &bytes).expect("zero the user_version header field");
+
+    let result = SqliteStorage::open(&db_path);
+    let err = match result {
+        Ok(_) => panic!(
+            "a structurally-intact database with user_version=0 must be rejected, not silently converted"
+        ),
+        Err(err) => err,
+    };
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("user_version=0 but is not empty"),
+        "expected schema::ensure's pre-rusqlite-archive rejection, got: {rendered}"
+    );
+    assert!(
+        rendered.contains("rebuild the archive instead of trying to convert this file"),
+        "expected the rebuild-not-convert guidance, got: {rendered}"
+    );
+}
 
 /// Test that unknown tables are ignored (forward compatibility).
 #[test]
