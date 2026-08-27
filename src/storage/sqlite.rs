@@ -10309,7 +10309,11 @@ impl FrankenStorage {
                 // Batched token_daily_stats update
                 if !defer_analytics_updates && !token_stats.is_empty() {
                     let entries = token_stats.expand();
-                    let affected = franken_update_token_daily_stats_batched_in_tx(tx, &entries)?;
+                    let affected = franken_update_token_daily_stats_batched_in_tx(
+                        tx,
+                        &entries,
+                        FrankenStorage::now_millis(),
+                    )?;
                     tracing::debug!(
                         target: "cass::perf::token_daily_stats",
                         raw = token_stats.raw_entry_count(),
@@ -10333,8 +10337,11 @@ impl FrankenStorage {
 
                 // Flush usage_hourly + usage_daily rollups
                 if !defer_analytics_updates && !rollup_agg.is_empty() {
-                    let (hourly, daily, models_daily) =
-                        franken_flush_analytics_rollups_in_tx(tx, &rollup_agg)?;
+                    let (hourly, daily, models_daily) = franken_flush_analytics_rollups_in_tx(
+                        tx,
+                        &rollup_agg,
+                        FrankenStorage::now_millis(),
+                    )?;
                     tracing::debug!(
                         target: "cass::perf::usage_rollups",
                         hourly_buckets = rollup_agg.hourly_entry_count(),
@@ -12248,6 +12255,7 @@ fn franken_update_daily_stats_batched_in_tx(
         tx,
         entries,
         DailyStatsBatchTarget::Canonical,
+        FrankenStorage::now_millis(),
     )
 }
 
@@ -12286,12 +12294,12 @@ fn franken_update_daily_stats_batched_in_tx_for_target(
     tx: &FrankenTransaction<'_>,
     entries: &[(i64, String, String, StatsDelta)],
     target: DailyStatsBatchTarget,
+    now: i64,
 ) -> Result<usize> {
     if entries.is_empty() {
         return Ok(0);
     }
 
-    let now = FrankenStorage::now_millis();
     let mut total_affected = 0;
     let upsert_sql = target.upsert_sql();
 
@@ -12379,15 +12387,26 @@ fn franken_insert_token_usage_batched_in_tx(
 }
 
 /// Batch upsert token_daily_stats within a legacy embedded engine transaction.
+///
+/// w1b Task B9 (2026-08-27, control-plane ruling): `last_updated` here is
+/// deliberately restamped on every batch, same reasoning as
+/// `franken_flush_rollup_table`'s comment (usage_hourly/usage_daily) --
+/// `src/analytics/query.rs`'s `is_recently_updated` reads
+/// `token_daily_stats.last_updated` as Track B's staleness heartbeat
+/// (`track_b_fresh`), so making the restamp conditional on "did the
+/// aggregate values change" would make a freshly-reverified, unchanged
+/// table look stale to that consumer. Only `daily_stats`'s publish step
+/// (a consumer-free table, per that function's own comment) got the
+/// compare-then-write treatment; keep this one blind.
 fn franken_update_token_daily_stats_batched_in_tx(
     tx: &FrankenTransaction<'_>,
     entries: &[(i64, String, String, String, TokenStatsDelta)],
+    now: i64,
 ) -> Result<usize> {
     if entries.is_empty() {
         return Ok(0);
     }
 
-    let now = FrankenStorage::now_millis();
     let mut total_affected = 0;
 
     for (day_id, agent, source, model, delta) in entries {
@@ -12508,6 +12527,20 @@ fn franken_insert_message_metrics_batched_in_tx(
 }
 
 /// Flush one rollup table (shared logic for hourly + daily) within a legacy embedded engine transaction.
+///
+/// w1b Task B9 (2026-08-27, control-plane ruling): `last_updated` here is
+/// deliberately restamped on every flush, unlike `daily_stats`'s publish
+/// step (see that function's own comment for the paired case this was
+/// split from). `usage_hourly`/`usage_daily`'s `last_updated` is read as a
+/// staleness heartbeat by `src/analytics/query.rs`'s `is_recently_updated`
+/// (feeding `track_a_fresh`/`track_b_fresh`, which drive the
+/// `track_freshness_mismatch` drift signal and `recommended_action:
+/// rebuild_track_a/b`) -- making this table's restamping conditional on
+/// "did the aggregate values actually change" would make a table that was
+/// just re-verified healthy (rebuilt, nothing drifted) look stale to that
+/// consumer, which is the opposite of what it means to answer. Keep the
+/// blind stamp here; do not "clean up" this asymmetry with `daily_stats`
+/// without re-checking that consumer first.
 fn franken_flush_rollup_table(
     tx: &FrankenTransaction<'_>,
     table: &str,
@@ -12662,9 +12695,8 @@ fn franken_flush_model_daily_rollup_table(
 fn franken_flush_analytics_rollups_in_tx(
     tx: &FrankenTransaction<'_>,
     agg: &AnalyticsRollupAggregator,
+    now: i64,
 ) -> Result<(usize, usize, usize)> {
-    let now = FrankenStorage::now_millis();
-
     let hourly_affected =
         franken_flush_rollup_table(tx, "usage_hourly", "hour_id", &agg.hourly, now)?;
     let daily_affected = franken_flush_rollup_table(tx, "usage_daily", "day_id", &agg.daily, now)?;
@@ -13095,8 +13127,18 @@ pub(crate) fn franken_operation_commit_receipt_exists(
 ///
 /// 规模说明：它扫全表 `message_metrics`。restore 的量级下可接受；若将来要按会话增量
 /// 重算，那是另一个函数，不是把这个改成半增量 —— 半增量会重新引入「删旧没扣干净」。
+///
+/// `now_ms`（w1b Task B9，2026-08-27，控制面终裁）：唯一调用方是 W1 restore 的
+/// `recompute_materialized_aggregates_after_commit`，本函数没有生产索引主链路的
+/// 第二调用方，故不需要保留零参外壳——直接要求调用方显式传入 restore 驱动记在
+/// journal 里的确定性时间戳（首跑与 recover 两条路径共用同一个值，`usage_hourly`/
+/// `usage_daily`/`usage_models_daily` 的 `last_updated` 两次盖同一个章，digest 不再
+/// 因 recover 重跑而漂移，同时 `src/analytics/query.rs` 的 `is_recently_updated`
+/// 心跳消费点分毫未动——见 [`FrankenStorage::rebuild_daily_stats_with_timestamp`]
+/// 的完整裁决记录）。
 pub(crate) fn franken_recompute_usage_rollups_from_message_metrics(
     storage: &FrankenStorage,
+    now_ms: i64,
 ) -> Result<usize> {
     let entries: Vec<MessageMetricsEntry> = storage.conn.query_all_map(
         "SELECT message_id, created_at_ms, hour_id, day_id, agent_slug, workspace_id,
@@ -13149,7 +13191,7 @@ pub(crate) fn franken_recompute_usage_rollups_from_message_metrics(
                 for table in ["usage_hourly", "usage_daily", "usage_models_daily"] {
                     tx.execute(&format!("DELETE FROM {table}"), fparams![])?;
                 }
-                franken_flush_analytics_rollups_in_tx(tx, &agg)
+                franken_flush_analytics_rollups_in_tx(tx, &agg, now_ms)
             })()
             .map_err(anyhow_error_into_storage_error)
         })?;
@@ -13302,6 +13344,19 @@ fn replace_derived_rows_for_message(
 impl FrankenStorage {
     /// Rebuild token_daily_stats from the token_usage ledger.
     pub fn rebuild_token_daily_stats(&self) -> Result<usize> {
+        self.rebuild_token_daily_stats_with_timestamp(Self::now_millis())
+    }
+
+    /// Same as [`Self::rebuild_token_daily_stats`], but the caller supplies
+    /// the `last_updated` timestamp -- see
+    /// [`Self::rebuild_daily_stats_with_timestamp`]'s doc comment for why
+    /// this variant exists (W1 restore crash-recovery replay determinism).
+    /// `token_daily_stats.last_updated` deliberately keeps the blind-
+    /// restamp semantics (`franken_update_token_daily_stats_batched_in_tx`'s
+    /// comment: it is Track B's staleness heartbeat consumer in
+    /// `src/analytics/query.rs`) -- this only pins WHICH timestamp gets
+    /// written on a restore replay, it does not skip the write.
+    pub(crate) fn rebuild_token_daily_stats_with_timestamp(&self, now_ms: i64) -> Result<usize> {
         const CONVERSATION_BATCH_SIZE: usize = 1_000;
         const TOKEN_USAGE_BATCH_SIZE: usize = 10_000;
 
@@ -13462,7 +13517,7 @@ impl FrankenStorage {
 
                     let entries = aggregate.expand();
                     rows_created = rows_created.saturating_add(entries.len());
-                    franken_update_token_daily_stats_batched_in_tx(tx, &entries)?;
+                    franken_update_token_daily_stats_batched_in_tx(tx, &entries, now_ms)?;
                 }
                     Ok(rows_created)
                 })()
@@ -13659,8 +13714,11 @@ impl FrankenStorage {
                     }
 
                     total_inserted += franken_insert_message_metrics_batched_in_tx(tx, &entries)?;
-                    let (hourly, daily, models_daily) =
-                        franken_flush_analytics_rollups_in_tx(tx, &rollup_agg)?;
+                    let (hourly, daily, models_daily) = franken_flush_analytics_rollups_in_tx(
+                        tx,
+                        &rollup_agg,
+                        FrankenStorage::now_millis(),
+                    )?;
                     usage_hourly_rows += hourly;
                     usage_daily_rows += daily;
                     usage_models_daily_rows += models_daily;
@@ -13721,6 +13779,40 @@ impl FrankenStorage {
 
     /// Rebuild all daily stats from scratch.
     pub fn rebuild_daily_stats(&self) -> Result<DailyStatsRebuildResult> {
+        self.rebuild_daily_stats_with_timestamp(Self::now_millis())
+    }
+
+    /// Same as [`Self::rebuild_daily_stats`], but the caller supplies the
+    /// `last_updated` timestamp instead of it being captured internally
+    /// from the wall clock.
+    ///
+    /// w1b Task B9 (2026-08-27, control-plane ruling, final): W1 restore's
+    /// crash-recovery replay redrives this rebuild unconditionally (journal
+    /// rank is the source of truth for what to redo, and it cannot
+    /// distinguish "genuinely needs a fresh analytics pass" from "already
+    /// did this, just replaying"), so first-run and recovery each captured
+    /// their own, different wall-clock reading here -- purely restamping
+    /// `last_updated` even when every aggregate value came out identical,
+    /// which broke the W1 commit marker's byte-identity (`db_identity.
+    /// sqlite_digest`). The fix is NOT "stop restamping" (see
+    /// `franken_update_daily_stats_batched_in_tx_for_target`'s
+    /// compare-then-write comment for why `daily_stats` alone got that
+    /// treatment, and why usage_hourly/usage_daily/token_daily_stats
+    /// deliberately did not: `src/analytics/query.rs`'s
+    /// `is_recently_updated` reads their `last_updated` as a genuine
+    /// staleness heartbeat). It is "restamp with the SAME timestamp on
+    /// every replay of the SAME logical restore operation" -- the restore
+    /// driver captures one `now_ms` at first run, persists it in the
+    /// journal, and recovery reads that same value back instead of calling
+    /// the wall clock again, so two replays of one operation always agree
+    /// on what "now" meant for it. Every other caller (live indexing,
+    /// tests, `cass doctor --fix`, ...) keeps using
+    /// [`Self::rebuild_daily_stats`] unchanged -- wall-clock semantics
+    /// outside the restore/recover path are exactly as before.
+    pub(crate) fn rebuild_daily_stats_with_timestamp(
+        &self,
+        now_ms: i64,
+    ) -> Result<DailyStatsRebuildResult> {
         const DAILY_STATS_REBUILD_CONVERSATION_BATCH_SIZE: usize = 1_000;
         const DAILY_STATS_REBUILD_MESSAGE_BATCH_SIZE: usize = 10_000;
 
@@ -13862,6 +13954,7 @@ impl FrankenStorage {
                             batch_tx,
                             &entries,
                             DailyStatsBatchTarget::RebuildStage,
+                            now_ms,
                         )
                         .map_err(anyhow_error_into_storage_error)
                     })?;
@@ -13931,6 +14024,7 @@ impl FrankenStorage {
                                     batch_tx,
                                     &entries,
                                     DailyStatsBatchTarget::RebuildStage,
+                                    now_ms,
                                 )
                                 .map_err(anyhow_error_into_storage_error)
                             },
@@ -13970,14 +14064,68 @@ impl FrankenStorage {
         // w1b Task B3 (D2): with_tx, TxMode::Immediate. Only reads
         // daily_stats_rebuild_stage (never writes it), so replaying this on
         // a real Busy{Snapshot} is safe regardless of how many times it runs.
+        //
+        // w1b Task B9 (2026-08-27, equivalence-gate-caught, control-plane
+        // ruling, daily_stats only -- see rationale on
+        // `franken_update_daily_stats_batched_in_tx_for_target` for why
+        // usage_hourly/usage_daily/token_daily_stats deliberately keep the
+        // old blind-restamp behavior): publish used to be an unconditional
+        // DELETE-then-INSERT, which restamps every row's `last_updated` to
+        // "now" on every rebuild pass regardless of whether its aggregate
+        // values actually changed. That made `daily_stats` un-idempotent at
+        // the byte level -- rerunning a rebuild against unchanged source
+        // content (e.g. W1 restore's crash-recovery replay, which redrives
+        // every phase including analytics rebuild) produced a different
+        // on-disk `daily_stats` even though nothing about the aggregates
+        // was different, which broke the W1 commit marker's
+        // `db_identity.sqlite_digest` (reproduced:
+        // e7_disposition_conservation_holds_on_both_first_run_and_recovery
+        // et al -- first-run vs. recovery digests disagreed purely from
+        // this restamping, not from any real content difference). Now an
+        // UPSERT that preserves the existing `last_updated` whenever the
+        // three aggregate columns are unchanged (only a genuinely different
+        // value gets a fresh stamp), followed by a targeted DELETE for rows
+        // the new stage no longer has (a day/agent/source combination whose
+        // source data was actually removed) -- same end state as the old
+        // wholesale replace, but idempotent when nothing changed.
         self.conn.with_tx(TxMode::Immediate, |publish_tx| -> Result<(), StorageError> {
-            publish_tx.execute("DELETE FROM daily_stats", &[])?;
             publish_tx.execute(
                 "INSERT INTO daily_stats (
                     day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated
                  )
                  SELECT day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated
-                 FROM daily_stats_rebuild_stage",
+                 FROM daily_stats_rebuild_stage
+                 -- WHERE TRUE is load-bearing, not decoration: SQLite's
+                 -- grammar cannot parse an upsert-clause after a bare
+                 -- INSERT ... SELECT ... FROM tbl with no WHERE/ORDER/
+                 -- LIMIT (reproduced directly with stock sqlite3: a near-DO
+                 -- syntax error, while the exact same query with a
+                 -- trailing WHERE parses fine); a VALUES(...)-sourced
+                 -- insert has no such restriction, which is why every
+                 -- other upsert in this file (VALUES-sourced) does not
+                 -- need this.
+                 WHERE TRUE
+                 ON CONFLICT(day_id, agent_slug, source_id) DO UPDATE SET
+                     session_count = excluded.session_count,
+                     message_count = excluded.message_count,
+                     total_chars = excluded.total_chars,
+                     last_updated = CASE
+                         WHEN daily_stats.session_count = excluded.session_count
+                          AND daily_stats.message_count = excluded.message_count
+                          AND daily_stats.total_chars = excluded.total_chars
+                         THEN daily_stats.last_updated
+                         ELSE excluded.last_updated
+                     END",
+                &[],
+            )?;
+            publish_tx.execute(
+                "DELETE FROM daily_stats
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM daily_stats_rebuild_stage s
+                     WHERE s.day_id = daily_stats.day_id
+                       AND s.agent_slug = daily_stats.agent_slug
+                       AND s.source_id = daily_stats.source_id
+                 )",
                 &[],
             )?;
             Ok(())
@@ -18566,6 +18714,102 @@ mod tests {
             )
             .unwrap();
         assert_eq!(staged_rows, 0, "successful publish must clear staging rows");
+    }
+
+    #[test]
+    fn rebuild_daily_stats_with_timestamp_only_restamps_last_updated_when_values_actually_change() {
+        // w1b Task B9 (2026-08-27, control-plane ruling, e7 case final,
+        // requirement 4: the reverse verification the compare-then-write
+        // fix owes -- a real content change must still get a fresh
+        // last_updated, not just "unchanged content keeps the old one").
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let started_at = 1_700_000_000_000_i64;
+
+        storage
+            .conn
+            .execute(
+                "INSERT INTO agents (id, slug, name, version, kind, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, NULL, ?4, 0, 0)",
+                fparams![1_i64, "codex", "Codex", "cli"],
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute(
+                "INSERT INTO conversations (
+                    id, agent_id, workspace_id, source_id, external_id, title, source_path,
+                    started_at, ended_at, approx_tokens, metadata_json, origin_host, metadata_bin
+                 ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, NULL, NULL)",
+                fparams![
+                    1_i64,
+                    1_i64,
+                    LOCAL_SOURCE_ID,
+                    "ts-a",
+                    "TS A",
+                    "/tmp/ts-a.jsonl",
+                    started_at,
+                    started_at + 100,
+                    "{}"
+                ],
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute(
+                "INSERT INTO messages (
+                    id, conversation_id, idx, role, author, created_at, content, extra_json, extra_bin
+                 ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, NULL, NULL)",
+                fparams![1_i64, 1_i64, 0_i64, "user", started_at, "hello"],
+            )
+            .unwrap();
+
+        let t1 = 1_700_000_000_001_i64;
+        storage.rebuild_daily_stats_with_timestamp(t1).unwrap();
+        let read_last_updated = |storage: &FrankenStorage| -> i64 {
+            storage
+                .conn
+                .query_row_map(
+                    "SELECT last_updated FROM daily_stats WHERE agent_slug = 'all' AND source_id = 'all'",
+                    fparams![],
+                    |row| row.get_typed(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(read_last_updated(&storage), t1);
+
+        // Rerun with a different timestamp but identical source content
+        // (nothing inserted since t1) -- last_updated must stay t1, not
+        // jump to t2. This is the exact scenario a W1 restore recovery
+        // replay hits.
+        let t2 = 1_700_000_000_002_i64;
+        storage.rebuild_daily_stats_with_timestamp(t2).unwrap();
+        assert_eq!(
+            read_last_updated(&storage),
+            t1,
+            "unchanged aggregate values must keep the old last_updated, not the new rerun's timestamp"
+        );
+
+        // Now make a REAL content change (a new message) and rerun with a
+        // third timestamp -- last_updated must move to t3. Compare-then-
+        // write must not have quietly become "never write".
+        storage
+            .conn
+            .execute(
+                "INSERT INTO messages (
+                    id, conversation_id, idx, role, author, created_at, content, extra_json, extra_bin
+                 ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, NULL, NULL)",
+                fparams![2_i64, 1_i64, 1_i64, "assistant", started_at + 50, "world"],
+            )
+            .unwrap();
+        let t3 = 1_700_000_000_003_i64;
+        storage.rebuild_daily_stats_with_timestamp(t3).unwrap();
+        assert_eq!(
+            read_last_updated(&storage),
+            t3,
+            "a genuine aggregate change must get a fresh last_updated"
+        );
     }
 
     #[test]
