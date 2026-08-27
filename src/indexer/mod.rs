@@ -16700,17 +16700,21 @@ fn current_schema_fast_probe(db_path: &Path) -> Result<bool> {
     let mut storage = FrankenStorage::open_readonly(db_path)
         .with_context(|| format!("opening the legacy embedded engine db readonly at {}", db_path.display()))?;
 
+    // w1b Task B9 (2026-08-27, equivalence-gate-caught B7 regression): the
+    // legacy incremental migration engine kept `meta.schema_version` in sync
+    // as its version authority; `storage::schema::ensure` (Task B7) moved
+    // that authority to `PRAGMA user_version` and, by its own module doc,
+    // deliberately never populates `meta`/`_schema_migrations` on the
+    // single-shot fresh-build path. Reading `meta.schema_version` here always
+    // came back empty for a current-schema database built through that path,
+    // making this fast probe report "not current schema" unconditionally --
+    // never caught before because this function has zero production callers
+    // (grep-verified) and the first full `--lib` equivalence-gate rerun is
+    // what finally exercised it end to end.
     let version = storage
         .raw()
-        .query_opt_map(
-            "SELECT value FROM meta WHERE key = 'schema_version';",
-            &[],
-            |row| Ok(row.get_typed::<String>(0).ok()),
-        )
-        .ok()
-        .flatten()
-        .flatten()
-        .and_then(|raw| raw.parse::<i64>().ok());
+        .query_row_map("PRAGMA user_version;", &[], |row| row.get_typed::<i64>(0))
+        .ok();
 
     if let Err(close_err) = storage.close_without_checkpoint_in_place() {
         tracing::warn!(
@@ -42050,19 +42054,21 @@ mod tests {
 
     #[test]
     fn current_schema_fast_probe_rejects_future_schema_marker() {
+        // w1b Task B9 (2026-08-27): rewritten for the PRAGMA user_version
+        // authority current_schema_fast_probe now reads (see the function's
+        // own doc comment) -- the old `meta.schema_version` marker this test
+        // used to poke is never written by storage::schema::ensure, so
+        // setting it no longer means anything to the probe.
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("future-marker.db");
 
         let storage = FrankenStorage::open(&db_path).unwrap();
         storage
             .raw()
-            .execute(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?1)",
-                &[ParamValue::from(format!(
-                    "{}",
-                    crate::storage::sqlite::CURRENT_SCHEMA_VERSION + 1
-                ))],
-            )
+            .execute_batch(&format!(
+                "PRAGMA user_version = {};",
+                crate::storage::sqlite::CURRENT_SCHEMA_VERSION + 1
+            ))
             .unwrap();
         drop(storage);
 
