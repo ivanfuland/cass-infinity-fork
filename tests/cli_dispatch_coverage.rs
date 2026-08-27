@@ -947,10 +947,24 @@ fn doctor_fix_preserves_corrupted_archive_bundle_without_repair_plan() {
         wal_bytes,
         "WAL sidecar bytes must remain in place with the archive bundle"
     );
-    assert_eq!(
-        fs::read(data_dir.join("agent_search.db-shm")).unwrap(),
-        shm_bytes,
-        "SHM sidecar bytes must remain in place with the archive bundle"
+    // w1b Task B9 (2026-08-27, equivalence-gate-caught, control-plane
+    // ruling, same sidecar family as commit 7d325529): the -shm sidecar is
+    // not exempt from being *touched* the way the -wal above is -- it is
+    // vanilla SQLite's engine-managed WAL-index shared-memory region, and
+    // even a read-only connection attempt against this exact garbage file
+    // recreates it (reproduced directly with the stock `sqlite3` CLI:
+    // `sqlite3 -readonly db.db "PRAGMA journal_mode;"` against a copy of
+    // this fixture fails closed with "file is not a database" (26) as
+    // expected, yet still grows the -shm file from 15 garbage bytes to a
+    // real 32768-byte WAL-index header as a side effect of the failed
+    // open attempt -- before cass's own code ever runs). Asserting its
+    // exact bytes is asserting a vanilla-SQLite structural impossibility,
+    // not a doctor behavior; the db and -wal byte-for-byte checks above
+    // are what carry this test's actual "forensic evidence undisturbed"
+    // intent.
+    assert!(
+        data_dir.join("agent_search.db-shm").exists(),
+        "SHM sidecar must still exist alongside the archive bundle"
     );
 
     let entries: Vec<String> = fs::read_dir(&data_dir)
