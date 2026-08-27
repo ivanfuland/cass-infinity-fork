@@ -25611,11 +25611,58 @@ mod tests {
             conn.execute_batch("PRAGMA writable_schema = OFF;").unwrap();
         }
 
-        let open_err = FrankenConnection::open_writable(std::path::Path::new(&(corrupt_db_path.to_string_lossy().to_string())), crate::storage::api::Profile::Production)
-            .expect_err("orphaned fts_messages schema should fail during connection open");
-        let integrity = fts_messages_integrity_error_from_message(open_err.to_string())
-            .expect("open-time FTS corruption should map to the typed FTS integrity kind");
-        assert_eq!(integrity.missing_shadow_tables(), &["fts_messages_content"]);
+        // w1b Task B9 (salvage problem C, control-plane ruling): vanilla
+        // SQLite defers FTS5 shadow-table validation to the virtual
+        // table's `xConnect`, triggered by the first real reference to
+        // `fts_messages` -- not by opening the connection. The old
+        // frankensqlite backend validated eagerly at open time (which this
+        // test originally pinned); that eagerness was a side effect of
+        // frankensqlite's own vtable machinery, the very thing this wave
+        // retires. Opening a connection to a database carrying a single
+        // (non-duplicated) orphaned fts_messages declaration must now
+        // succeed:
+        let conn = FrankenConnection::open_writable(std::path::Path::new(&(corrupt_db_path.to_string_lossy().to_string())), crate::storage::api::Profile::Production)
+            .expect("a single orphaned fts_messages declaration (no name collision) must not fail connection open under vanilla SQLite's lazy vtable validation");
+
+        // -- and the corruption must surface the moment fts_messages is
+        // actually queried, pinning the real exposure timing so a future
+        // engine change silently moving it elsewhere goes noticed. Real
+        // SQLite's xConnect failure here is a generic "vtable constructor
+        // failed: fts_messages" -- unlike frankensqlite's old open-time
+        // message, it does not name any specific missing shadow table, so
+        // `fts_messages_integrity_error_from_message` classifies it as
+        // structural FTS damage with an empty `missing_shadow_tables()`
+        // (verified: `query_err.to_string()` contains
+        // "vtable constructor failed").
+        let query_err = conn
+            .query_all_map(FTS_MESSAGES_INTEGRITY_PROBE_SQL, &[], |_row| Ok(()))
+            .expect_err("querying fts_messages is where xConnect shadow-table validation actually fires");
+        assert!(
+            query_err.to_string().contains("vtable constructor failed"),
+            "unexpected query-time error shape: {query_err}"
+        );
+        fts_messages_integrity_error_from_message(query_err.to_string())
+            .expect("query-time FTS corruption should map to the typed FTS integrity kind");
+
+        // The crate's real, production-wired detection entry point
+        // (validate_fts_messages_integrity_for_connection, consumed as an
+        // opt-in preflight check by indexer/mod.rs before indexing) must
+        // independently catch this too -- this is the guarantee that
+        // actually matters for operators, decoupled from whichever
+        // specific statement happens to trip xConnect first. Its
+        // shadow-table check is a real `sqlite_master` query rather than
+        // string-matching a driver error, so it correctly reports all five
+        // required tables as missing (none were ever created -- the
+        // fixture hand-inserted only the top-level declaration row).
+        let validate_err = validate_fts_messages_integrity_for_connection(&conn)
+            .expect_err("validate_fts_messages_integrity must detect the orphaned fts_messages declaration");
+        let integrity = validate_err
+            .downcast_ref::<FtsMessagesIntegrityError>()
+            .expect("validation failure should be the typed FTS integrity error");
+        assert_eq!(
+            integrity.missing_shadow_tables(),
+            &FTS_MESSAGES_REQUIRED_SHADOW_TABLES[..]
+        );
         let rendered = integrity.to_string();
         assert!(
             rendered.contains("fts_messages")
