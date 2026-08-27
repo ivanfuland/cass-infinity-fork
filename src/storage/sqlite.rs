@@ -1475,10 +1475,44 @@ pub(crate) struct HistoricalDatabaseBundle {
 
 #[derive(Debug, Clone, Copy, Default)]
 struct HistoricalBundleProbe {
+    /// Legacy franken-generation version marker (`meta.schema_version`).
+    /// Frozen forever at its old ceiling (see
+    /// [`LEGACY_FRANKEN_SCHEMA_VERSION_CEILING`]) now that nothing writes
+    /// this table anymore -- present only on bundles that predate w1b Task
+    /// B8, never on ones `schema::ensure` built.
     schema_version: Option<i64>,
+    /// New rusqlite-generation version marker (`PRAGMA user_version`,
+    /// `schema::ensure`'s sole authority). `None` for franken-generation
+    /// bundles (where it reads 0, i.e. "unset") -- the two fields are
+    /// mutually exclusive in practice, never both `Some` on a real bundle.
+    user_version: Option<i64>,
     fts_schema_rows: Option<i64>,
     fts_queryable: bool,
     max_message_id: i64,
+}
+
+/// w1b Task B8 (plan delta d17, salvage generation-aware ordering rule):
+/// `meta.schema_version`'s old ceiling, frozen in place now that the franken
+/// incremental engine that wrote it is retired -- `storage::schema::
+/// CURRENT_SCHEMA_VERSION` moved on to a new, unrelated 1-based numbering, so
+/// comparing a legacy bundle's `meta.schema_version` against today's
+/// `CURRENT_SCHEMA_VERSION` would silently misclassify every pre-B8 archive
+/// as "not current" (21 != 1) even though 21 was, and remains, that
+/// generation's actual ceiling. This constant is what "current" means for a
+/// bundle that belongs to the old generation; it must never be bumped --
+/// there is no code path left that can produce a franken-generation bundle
+/// newer than 21.
+const LEGACY_FRANKEN_SCHEMA_VERSION_CEILING: i64 = 21;
+
+/// Generation-aware replacement for the old bare `schema_version ==
+/// CURRENT_SCHEMA_VERSION` comparison: a bundle counts as schema-current if
+/// it is current *for its own generation*, whichever one it belongs to.
+fn historical_bundle_schema_is_current(probe: &HistoricalBundleProbe) -> bool {
+    match (probe.user_version, probe.schema_version) {
+        (Some(uv), _) => uv == CURRENT_SCHEMA_VERSION,
+        (None, Some(sv)) => sv == LEGACY_FRANKEN_SCHEMA_VERSION_CEILING,
+        (None, None) => false,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1786,14 +1820,14 @@ pub(crate) fn discover_historical_database_bundles(
         // n >= 2 (duplicated CREATE VIRTUAL TABLE rows from a broken legacy
         // rebuild), `None` entirely, or `Some(0)` on a non-current schema —
         // is not "fts clean".
+        let schema_current = historical_bundle_schema_is_current(&bundle.probe);
         let fts_clean = match bundle.probe.fts_schema_rows {
             Some(1) => bundle.probe.fts_queryable,
-            Some(0) => bundle.probe.schema_version == Some(CURRENT_SCHEMA_VERSION),
+            Some(0) => schema_current,
             _ => false,
         };
 
-        let clean_schema14_fts =
-            bundle.probe.schema_version == Some(CURRENT_SCHEMA_VERSION) && fts_clean;
+        let clean_schema14_fts = schema_current && fts_clean;
         if clean_schema14_fts {
             return 5;
         }
@@ -1802,9 +1836,7 @@ pub(crate) fn discover_historical_database_bundles(
             return 4;
         }
 
-        if bundle.probe.schema_version == Some(CURRENT_SCHEMA_VERSION)
-            && bundle.supports_direct_readonly
-        {
+        if schema_current && bundle.supports_direct_readonly {
             return 3;
         }
 
@@ -1838,6 +1870,14 @@ fn probe_historical_bundle(root_path: &Path) -> HistoricalBundleProbe {
     };
 
     let schema_version = read_meta_schema_version(&conn).ok().flatten();
+    // w1b Task B8 (plan delta d17): the new-generation authority, alongside
+    // the legacy one above -- a franken-generation bundle reads 0 here
+    // (never written), which `filter(|&v| v > 0)` folds into `None` so
+    // `historical_bundle_schema_is_current` can tell "new generation, not
+    // current" apart from "old generation, use schema_version instead".
+    let user_version = crate::storage::schema::read_user_version(&conn)
+        .ok()
+        .filter(|&v| v > 0);
     let fts_schema_rows: Option<i64> = conn
         .query_row_map(
             "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
@@ -1857,6 +1897,7 @@ fn probe_historical_bundle(root_path: &Path) -> HistoricalBundleProbe {
 
     let probe = HistoricalBundleProbe {
         schema_version,
+        user_version,
         fts_schema_rows,
         fts_queryable,
         max_message_id,
@@ -1882,7 +1923,8 @@ fn probe_historical_bundle_via_sqlite3_metadata(root_path: &Path) -> Option<Hist
             "PRAGMA writable_schema=ON;
              SELECT COALESCE((SELECT value FROM meta WHERE key = 'schema_version'), '');
              SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages';
-             SELECT COALESCE(MAX(id), 0) FROM messages;",
+             SELECT COALESCE(MAX(id), 0) FROM messages;
+             PRAGMA user_version;",
         )
         .output()
         .ok()?;
@@ -1898,9 +1940,16 @@ fn probe_historical_bundle_via_sqlite3_metadata(root_path: &Path) -> Option<Hist
         .next()
         .and_then(|raw| raw.trim().parse::<i64>().ok())
         .unwrap_or(0);
+    // w1b Task B8 (plan delta d17): same new-generation authority as the
+    // direct-connection path above.
+    let user_version = lines
+        .next()
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+        .filter(|&v| v > 0);
 
     Some(HistoricalBundleProbe {
         schema_version,
+        user_version,
         fts_schema_rows,
         fts_queryable: false,
         max_message_id,
@@ -23310,7 +23359,17 @@ mod tests {
         let replay_legacy = rusqlite_test_fixture_conn(&replay_db);
         replay_legacy
             .execute_batch(
-                "UPDATE meta SET value = '13' WHERE key = 'schema_version';
+                // w1b Task B8 (plan delta d17): `replay_db` was built through
+                // the real `schema::ensure` path above (like any file
+                // `SqliteStorage::open` touches), so simulating "this is a
+                // franken-generation v13 bundle" for the probe now requires
+                // resetting `PRAGMA user_version` back to 0 too -- a real
+                // pre-B8 archive never had it set in the first place, and
+                // `historical_bundle_schema_is_current` checks `user_version`
+                // before falling back to the legacy `meta.schema_version`
+                // this UPDATE still rolls back.
+                "PRAGMA user_version = 0;
+                 UPDATE meta SET value = '13' WHERE key = 'schema_version';
                  DELETE FROM _schema_migrations WHERE version = 14;
                  PRAGMA writable_schema = ON;",
             )
@@ -23355,8 +23414,12 @@ mod tests {
 
         assert_eq!(ordered_paths[0], clean_backup);
         assert_eq!(ordered_paths[1], replay_db);
+        // w1b Task B8 (plan delta d17): `clean_backup` is a genuine
+        // new-generation bundle (built via `schema::ensure`, never touches
+        // the legacy `meta` table) -- its version authority is
+        // `PRAGMA user_version`, not `meta.schema_version`.
         assert_eq!(
-            bundles[0].probe.schema_version,
+            bundles[0].probe.user_version,
             Some(CURRENT_SCHEMA_VERSION)
         );
         // w1b Task B7 (control-plane ruling, bead z9fse.11): `clean_backup` is
