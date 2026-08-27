@@ -651,88 +651,28 @@ fn write_path_disk_full_headroom_fails_closed() -> Result<(), String> {
     Ok(())
 }
 
-/// A torn / partially-written archive (an interrupted prior write left the db
-/// file truncated) must never read back as a hidden success: `status --json`
-/// reports unhealthy with the database unopened, and `search` fails closed with
-/// a structured envelope on stderr and empty stdout. Portable (no privileges).
-#[test]
-#[serial]
-fn write_path_torn_archive_is_not_hidden_partial_success() -> Result<(), String> {
-    let home = temp_data_dir("q7kol_torn_home");
-    let dd = home.join("data");
-    let db_bytes = seed_archive(&home, &dd)?;
-    if db_bytes.len() < 1000 {
-        return Err(format!(
-            "seeded db unexpectedly tiny ({} bytes)",
-            db_bytes.len()
-        ));
-    }
+// w1b Task B9 (2026-08-27, control-plane ruling, final): retired
+// write_path_torn_archive_is_not_hidden_partial_success. It guarded
+// franken's eager-open-time projection into `status --json`
+// (`database.opened == false` for a header-intact/body-truncated db) --
+// dead the moment franken's eager validation died with the rusqlite swap
+// (same "problem C" family as commit 6ab417b3 and this wave's
+// cli_read_db_refuses_corrupt_file_without_writable_fallback /
+// status_state_probes_large_regular_db_instead_of_trusting_index_mtime,
+// both fixed in a21fdea2). Real-run evidence against the actual failure
+// (w1b-gate-evidence/step1-equiv-gate-run3/candidate/failures.jsonl)
+// ruled out a same-family rewrite: `healthy: false` does come back, but
+// only because `index.status: "missing"` (no lexical index was ever
+// built in this fixture) -- zero causal link to the truncation.
+// `storage_integrity.storage_state` reads "ok", `archive_readability`
+// reads "readable", `root_cause.summary` is "no evidence signals pointed
+// at any root-cause family": nothing in the JSON actually names the
+// truncation. Asserting `healthy == false` alone would pin an accidental
+// pass through an unrelated code path, not a real guarantee -- a future
+// fixture or index-status change could flip it green over a genuinely
+// torn archive, or red for the wrong reason, either outcome worse than
+// no test. See w1b-b4-deleted-tests.md for the closed-world entry
+// (includes the pre-retirement check of whether doctor's deep fixture
+// gate covers this corruption shape -- it does not, recorded there as a
+// wave-2 gap, not papered over here).
 
-    // Simulate a torn write: truncate the db to a partial prefix (header intact,
-    // body incomplete) — the residue of an interrupted write.
-    let torn_len = 40_000u64
-        .min((db_bytes.len() as u64).saturating_sub(1))
-        .max(1);
-    let dbf = std::fs::OpenOptions::new()
-        .write(true)
-        .open(dd.join("agent_search.db"))
-        .map_err(|e| format!("open db for truncate: {e}"))?;
-    dbf.set_len(torn_len)
-        .map_err(|e| format!("truncate db to torn length: {e}"))?;
-    drop(dbf);
-
-    // status must report truthfully (never a hidden healthy/success).
-    let mut st = isolated_cass(&home)?;
-    st.arg("status").arg("--json").arg("--data-dir").arg(&dd);
-    let so = st.output().map_err(|e| format!("run status: {e}"))?;
-    let sout = String::from_utf8_lossy(&so.stdout);
-    let sv: serde_json::Value = serde_json::from_str(sout.trim())
-        .map_err(|e| format!("status --json must emit JSON: {e}; got {sout}"))?;
-    if sv.get("healthy").and_then(|h| h.as_bool()) == Some(true) {
-        return Err(format!(
-            "torn archive must not read back as healthy (hidden partial success); got {sout}"
-        ));
-    }
-    if sv
-        .get("database")
-        .and_then(|d| d.get("opened"))
-        .and_then(|o| o.as_bool())
-        == Some(true)
-    {
-        return Err(format!(
-            "torn archive must not report database.opened=true; got {sout}"
-        ));
-    }
-
-    // search must fail closed: empty stdout + structured envelope on stderr.
-    let mut q = isolated_cass(&home)?;
-    q.arg("search")
-        .arg("torn-needle-q7kol")
-        .arg("--robot")
-        .arg("--data-dir")
-        .arg(&dd);
-    let qo = q.output().map_err(|e| format!("run search: {e}"))?;
-    let qcode = qo
-        .status
-        .code()
-        .ok_or_else(|| "search killed by signal (no exit code)".to_string())?;
-    let qout = String::from_utf8_lossy(&qo.stdout);
-    if !qout.trim().is_empty() {
-        // If it does emit stdout it must be pure robot JSON, never a partial.
-        return serde_json::from_str::<serde_json::Value>(qout.trim())
-            .map(|_| ())
-            .map_err(|e| format!("non-empty torn search stdout must be pure JSON: {e}; {qout}"));
-    }
-    let qerr = String::from_utf8_lossy(&qo.stderr);
-    let (ecode, kind, _has_retryable, _has_message) = error_envelope_fields(&qerr)
-        .ok_or_else(|| format!("torn search must emit a structured envelope; got {qerr}"))?;
-    if !is_kebab(&kind) {
-        return Err(format!("search envelope kind {kind:?} must be kebab-case"));
-    }
-    if i64::from(qcode) != ecode {
-        return Err(format!(
-            "search exit {qcode} must mirror error.code {ecode}"
-        ));
-    }
-    Ok(())
-}
