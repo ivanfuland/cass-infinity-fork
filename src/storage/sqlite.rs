@@ -1799,7 +1799,7 @@ fn historical_bundle_supports_direct_readonly(root_path: &Path) -> bool {
         .is_ok()
 }
 
-fn historical_table_exists(conn: &FrankenConnection, table: &str) -> Result<bool> {
+pub(crate) fn historical_table_exists(conn: &FrankenConnection, table: &str) -> Result<bool> {
     let found: Option<i64> = conn
         .query_row_map(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1",

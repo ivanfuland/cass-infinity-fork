@@ -76,7 +76,7 @@ use crate::sources::sync::path_to_safe_dirname;
 use crate::storage::sqlite::{
     DailyStatsRebuildResult, FrankenStorage, FtsConsistencyRepair, HistoricalSalvageOutcome,
     LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE, StatsAggregator, StatsDelta,
-    seed_canonical_from_best_historical_bundle,
+    historical_table_exists, seed_canonical_from_best_historical_bundle,
 };
 use semantic::{
     EmbeddingInput, SemanticIndexer, packet_embedding_inputs_from_storage,
@@ -16916,6 +16916,42 @@ pub(crate) fn refresh_completed_lexical_rebuild_checkpoint_from_live_index(
     })
 }
 
+/// The oldest table every lexical-rebuild-capable database generation has:
+/// added by the post-v13 migrations (see `storage::schema` docs) and never
+/// dropped since. A database predating it cannot satisfy
+/// `list_conversations_for_lexical_rebuild_after_id_through_id`'s
+/// `conversation_tail_state` correlated subquery -- that used to be masked
+/// by the now-retired incremental migration engine silently backfilling the
+/// table on any open (including this repair path's own readonly open), so
+/// a pre-generation database only ever surfaced a raw "no such table" SQL
+/// error here instead of a clear diagnosis (control-plane ruling
+/// 2026-08-27: harden this specific entry point with a fail-closed check
+/// rather than resurrect the retired silent-backfill behavior).
+const LEXICAL_REBUILD_GENERATION_MARKER_TABLE: &str = "conversation_tail_state";
+
+/// Fail closed, in the same "rebuild the archive, don't try to convert this
+/// file" style as `storage::schema::ensure`'s own legacy-database rejection,
+/// before the heavyweight inline rebuild below can reach the marker table
+/// and surface a raw SQL error instead. Checked once per invocation of this
+/// repair path (only reached when a rebuild was already judged necessary),
+/// not on every read-only search open -- a schema-current database pays one
+/// cheap `sqlite_master` lookup, nothing more.
+fn reject_pre_lexical_rebuild_generation_database(
+    storage: &FrankenStorage,
+    db_path: &Path,
+) -> Result<()> {
+    if historical_table_exists(storage.raw(), LEXICAL_REBUILD_GENERATION_MARKER_TABLE)? {
+        return Ok(());
+    }
+    Err(anyhow::anyhow!(
+        "database at {} predates the `{LEXICAL_REBUILD_GENERATION_MARKER_TABLE}` schema \
+         generation (a pre-rusqlite archive, or a database that was never rebuilt after an \
+         engine upgrade); this repair path does not attempt in-place conversion -- run `cass \
+         index --full` to rebuild the canonical database and its lexical index together",
+        db_path.display()
+    ))
+}
+
 pub(crate) fn repair_lexical_index_from_canonical_db_for_search(
     db_path: &Path,
     data_dir: &Path,
@@ -16938,6 +16974,7 @@ pub(crate) fn repair_lexical_index_from_canonical_db_for_search(
             db_path.display()
         )
     })?;
+    reject_pre_lexical_rebuild_generation_database(&storage, db_path)?;
     let total_conversations = count_total_conversations_exact(&storage)?;
     if total_conversations == 0 {
         let index_path = index_dir(data_dir)?;
@@ -29804,6 +29841,51 @@ mod tests {
                 )
             }),
         }
+    }
+
+    /// Control-plane ruling 2026-08-27 (w1b Task B9 salvage, exec13): a
+    /// database predating `conversation_tail_state` used to surface a raw
+    /// `no such table` SQL error out of the search-triggered lexical repair
+    /// path instead of a clear, actionable diagnosis. Simulate that
+    /// pre-generation shape by dropping the marker table from an otherwise
+    /// normal current-schema database, then assert the repair path fails
+    /// closed with the schema::ensure-style message instead of leaking the
+    /// raw SQL error text.
+    #[test]
+    fn repair_lexical_index_from_canonical_db_rejects_pre_tail_state_generation() {
+        let dir = TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("agent_search.db");
+        {
+            let storage = FrankenStorage::open(&db_path).expect("open current-generation db");
+            storage
+                .raw()
+                .execute_batch("DROP TABLE conversation_tail_state;")
+                .expect("simulate a pre-generation database by dropping the marker table");
+            storage
+                .close_without_checkpoint()
+                .expect("close the simulated legacy database");
+        }
+
+        let err =
+            repair_lexical_index_from_canonical_db_for_search(&db_path, dir.path(), None)
+                .expect_err(
+                    "a database missing conversation_tail_state must be rejected, not crash on a raw SQL error",
+                );
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains(
+                "predates the `conversation_tail_state` schema generation"
+            ),
+            "expected the fail-closed generation-mismatch message, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("cass index --full"),
+            "expected actionable rebuild guidance, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("no such table"),
+            "raw SQL error text must not leak past the fail-closed guard, got: {rendered}"
+        );
     }
 
     #[test]
