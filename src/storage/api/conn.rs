@@ -773,27 +773,13 @@ mod tests {
         assert!(matches!(err, StorageError::Constraint { .. }));
     }
 
-    #[test]
-    fn api_defer_foreign_keys_errors_on_unsupported_backend() {
-        // R0-B3 death judgment, discovered live while wiring up this task's
-        // own integration test: the current production backend
-        // (frankensqlite) does not implement `PRAGMA defer_foreign_keys` --
-        // `execute_batch` accepts the SET form without error but has no
-        // actual deferring effect (the very next statement still trips an
-        // immediate constraint failure), and the GET form returns zero rows.
-        // `defer_foreign_keys()`'s own readback self-check must catch this
-        // and fail loudly rather than let a caller believe out-of-order
-        // writes are safe when they silently aren't.
-        // `backend_sqlite.rs`'s tests confirm real SQLite (the eventual
-        // production backend, Task B2) honors this pragma correctly --
-        // this is a today-only limitation of the currently-active backend,
-        // not a defect in the deferred-check design itself.
-        let c = Conn::open_memory().unwrap();
-        c.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY);").unwrap();
-        let tx = c.transaction().unwrap();
-        let err = tx.defer_foreign_keys().unwrap_err();
-        assert!(matches!(err, StorageError::Other { .. }));
-    }
+    // w1b Task B8: `api_defer_foreign_keys_errors_on_unsupported_backend`
+    // (asserted `Conn::open_memory()` -> `defer_foreign_keys()` errors, back
+    // when it resolved to the franken backend, which didn't implement the
+    // pragma) retired -- `Conn::open_memory` now resolves to `SqliteBackend`,
+    // which honors `defer_foreign_keys` correctly; the positive case is
+    // already covered by `backend_sqlite.rs`'s
+    // `defer_foreign_keys_permits_out_of_order_write_then_resets_after_commit`.
 
     // =========================================================================
     // w1b Task B3 (D2): retry / whole-transaction replay

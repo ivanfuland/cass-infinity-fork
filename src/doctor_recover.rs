@@ -372,7 +372,8 @@ pub fn run_doctor_rebuild_canonical_fts(
     // A read-write open is required to drop/recreate the shadow tables. The
     // canonical rows are intact in this code path (corruption is in the derived
     // FTS5 shadow), so a normal open is the right authority.
-    let storage = FrankenStorage::open(&db_path).map_err(|e| {
+    // w1b Task B8 (d16, open-consumer audit): write path.
+    let storage = FrankenStorage::open_writer(&db_path).map_err(|e| {
         storage_error(
             format!(
                 "could not open canonical archive {} for FTS5 rebuild: {e:#}",

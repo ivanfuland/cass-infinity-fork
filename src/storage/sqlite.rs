@@ -3150,7 +3150,15 @@ impl FrankenStorage {
         let _doctor_guard =
             acquire_doctor_mutation_db_open_guard(path, DOCTOR_MUTATION_DB_OPEN_LOCK_TIMEOUT)?;
         let conn = FrankenConnection::open_writable(std::path::Path::new(&(&path_str)), crate::storage::api::Profile::Production)
-            .with_context(|| format!("opening frankensqlite writer at {}", path.display()))?;
+            .with_context(|| format!("opening sqlite writer at {}", path.display()))?;
+        // w1b Task B8 (d16, `Storage::open` read-only-ification's prerequisite):
+        // `open_writer` is becoming the sole schema-building entry point as
+        // consumer sites move off the now-read-only `open()`, so it must run
+        // the same `schema::ensure` `open()` always has -- otherwise a
+        // consumer that only ever calls `open_writer()` on a not-yet-existing
+        // db path would get an empty, table-less connection.
+        crate::storage::schema::ensure(&conn)
+            .with_context(|| format!("ensuring schema for writer at {}", path.display()))?;
         let storage = Self::new_with_shared_caches(
             conn,
             path.to_path_buf(),
@@ -3159,6 +3167,7 @@ impl FrankenStorage {
             ensured_conversation_sources,
             ensured_daily_stats_keys,
         );
+        storage.repair_missing_current_schema_objects()?;
         storage.apply_config()?;
         storage.set_fts_messages_present_cache(true);
         Ok(storage)

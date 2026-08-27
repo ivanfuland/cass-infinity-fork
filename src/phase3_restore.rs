@@ -8080,7 +8080,7 @@ fn restore_run_db_phase(
     outcome: &mut RestoreRunOutcome,
 ) -> anyhow::Result<()> {
     let views = crate::raw_mirror::manifest_views(&journal.data_dir)?;
-    let storage = crate::storage::sqlite::FrankenStorage::open(&journal.db_path)
+    let storage = crate::storage::sqlite::FrankenStorage::open_writer(&journal.db_path)
         .map_err(|e| anyhow::anyhow!("open candidate db {}: {e}", journal.db_path.display()))?;
     let pricing = crate::storage::sqlite::PricingTable::franken_load(storage.raw())?;
 
@@ -8310,7 +8310,7 @@ fn restore_invalidate_embeddings(journal: &RestoreJournal) -> anyhow::Result<()>
 /// 第 4 格 · analytics 失效并重算（幂等）。**直接用 E6 Step 1b 那个函数**，
 /// 不在这里另写一份重算（它已经处理了「绕开 `rebuild_analytics`」那条裁定）。
 fn restore_rebuild_analytics(journal: &RestoreJournal) -> anyhow::Result<()> {
-    let storage = crate::storage::sqlite::FrankenStorage::open(&journal.db_path)
+    let storage = crate::storage::sqlite::FrankenStorage::open_writer(&journal.db_path)
         .map_err(|e| anyhow::anyhow!("open candidate db for analytics: {e}"))?;
     recompute_materialized_aggregates_after_commit(&storage)
 }

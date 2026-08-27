@@ -9178,7 +9178,7 @@ fn run_forget_command(
         });
     }
 
-    let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
+    let storage = FrankenStorage::open_writer(&db_path).map_err(|e| CliError {
         code: 5,
         kind: "forget",
         message: format!("failed to open canonical database: {e}"),
@@ -17295,7 +17295,7 @@ fn run_analytics_rebuild(
     // Progress diagnostics go to stderr.
     eprintln!("Rebuilding analytics (Track A)...");
 
-    let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
+    let storage = FrankenStorage::open_writer(&db_path).map_err(|e| CliError {
         code: 9,
         kind: CliErrorKind::DbError.kind_str(),
         message: format!("Failed to open database: {e}"),
@@ -17502,7 +17502,7 @@ fn run_analytics_validate(
                         .into_iter()
                         .all(|table| analytics::query::table_exists(&pre_conn, table))
                     {
-                        let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
+                        let storage = FrankenStorage::open_writer(&db_path).map_err(|e| CliError {
                             code: 9,
                             kind: CliErrorKind::DbError.kind_str(),
                             message: format!("Failed to open database for analytics repair: {e}"),
@@ -17545,7 +17545,7 @@ fn run_analytics_validate(
                     // the intact `token_usage` ledger into fresh
                     // `token_daily_stats` rows. Transactional inside
                     // rebuild_token_daily_stats.
-                    let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
+                    let storage = FrankenStorage::open_writer(&db_path).map_err(|e| CliError {
                         code: 9,
                         kind: CliErrorKind::DbError.kind_str(),
                         message: format!(
@@ -28396,7 +28396,7 @@ fn run_dedup(
     }
 
     let storage =
-        crate::storage::sqlite::FrankenStorage::open(&db_path).map_err(|err| CliError {
+        crate::storage::sqlite::FrankenStorage::open_writer(&db_path).map_err(|err| CliError {
             code: 3,
             kind: CliErrorKind::DbOpen.kind_str(),
             message: format!("failed to open canonical DB for dedup: {err}"),
@@ -69949,7 +69949,9 @@ fn gather_onboarding_observation(
     // "Existing indexed DB" means a DB that actually carries content, so an
     // empty/just-created DB still routes the user to a first index.
     let indexed_conversation_count = if db_path.exists() {
-        crate::storage::sqlite::FrankenStorage::open(db_path)
+        // w1b Task B8 (d16, open-consumer audit): pure read (onboarding
+        // observation), switched to the read-only open.
+        crate::storage::sqlite::FrankenStorage::open_readonly(db_path)
             .ok()
             .and_then(|storage| storage.total_conversation_count().ok())
             .unwrap_or(0) as u64
@@ -85553,7 +85555,9 @@ fn try_load_indexed_conversation_from_db_with_source(
     if !db_path.exists() {
         return None;
     }
-    let storage = crate::storage::sqlite::FrankenStorage::open(db_path).ok()?;
+    // w1b Task B8 (d16, open-consumer audit): pure read (follow-up
+    // conversation load), switched to the read-only open.
+    let storage = crate::storage::sqlite::FrankenStorage::open_readonly(db_path).ok()?;
     let source_path = source_path.to_string_lossy();
     let source_id = canonical_followup_source_id(source_id);
     if let Some(source_id) = source_id.as_deref() {
@@ -97158,7 +97162,9 @@ fn run_sources_reingest(
     // can confirm the mirror is present before the (potentially long) ingest.
     let mut mirror_roots: Vec<String> = Vec::new();
     let mut missing_mirrors: Vec<String> = Vec::new();
-    if let Ok(storage) = crate::storage::sqlite::FrankenStorage::open(&db_path) {
+    // w1b Task B8 (d16, open-consumer audit): pure read (surfacing mirror
+    // roots for display), switched to the read-only open.
+    if let Ok(storage) = crate::storage::sqlite::FrankenStorage::open_readonly(&db_path) {
         let roots = crate::indexer::build_scan_roots(&storage, &data_dir);
         let selected_names: std::collections::HashSet<&str> =
             selected.iter().map(|s| s.name.as_str()).collect();
@@ -99049,7 +99055,7 @@ fn run_models_backfill(
             ),
             retryable: true,
         })?;
-    let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
+    let storage = FrankenStorage::open_writer(&db_path).map_err(|e| CliError {
         code: 5,
         kind: CliErrorKind::Storage.kind_str(),
         message: format!("Failed to open cass database {}: {e}", db_path.display()),
@@ -99417,7 +99423,7 @@ fn purge_excluded_agent_archive_data(
 
     let data_dir = archive_data_dir_for_agents_command(cli);
     let archive_agent_slug = archive_agent_slug_for_exclusion(agent);
-    let storage = match FrankenStorage::open(&db_path) {
+    let storage = match FrankenStorage::open_writer(&db_path) {
         Ok(storage) => storage,
         Err(err) => {
             tracing::warn!(
@@ -102059,7 +102065,7 @@ fn relink_pause_if_requested(boundary: &str) {
 
 /// 在一个事务里写 receipt。receipt 是 DB 侧唯一的提交事实。
 fn relink_write_receipt(db_path: &Path, operation_id: &str, state: &str) -> Result<()> {
-    let storage = crate::storage::sqlite::FrankenStorage::open(db_path)
+    let storage = crate::storage::sqlite::FrankenStorage::open_writer(db_path)
         .map_err(|e| anyhow::anyhow!("open db for relink receipt {}: {e}", db_path.display()))?;
     let raw = storage.raw();
     raw.execute("BEGIN IMMEDIATE;", &[])

@@ -13232,7 +13232,9 @@ fn restore_scan_watermarks_with_fresh_writer(
     snapshot: &[(String, String)],
 ) -> Result<()> {
     persist::with_concurrent_retry(2, || {
-        let writer = FrankenStorage::open(db_path)
+        // w1b Task B8 (d16, open-consumer audit): write path, switched to
+        // `open_writer`.
+        let writer = FrankenStorage::open_writer(db_path)
             .with_context(|| "opening dedicated writer for scan-watermark restore")?;
         let result = writer.restore_scan_watermarks(snapshot);
         let close_result = writer
@@ -15394,7 +15396,11 @@ pub fn run_index(
                     let db_path = guard.database_path().ok();
                     guard.close_best_effort_in_place();
                     if let Some(path) = db_path {
-                        match FrankenStorage::open(&path) {
+                        // w1b Task B8 (d16, open-consumer audit): this handle
+                        // is only ever read from (long-lived watch-cycle
+                        // handle, recycled solely to shed accumulated MVCC
+                        // snapshot state) -- switched to the read-only open.
+                        match FrankenStorage::open_readonly(&path) {
                             Ok(new_storage) => {
                                 *guard = new_storage;
                                 tracing::debug!(
@@ -16328,8 +16334,10 @@ fn open_storage_for_index(
         }
     }
 
+    // w1b Task B8 (d16, open-consumer audit): both branches write (index
+    // ingestion), switched to `open_writer`.
     if db_path.exists() {
-        match FrankenStorage::open(db_path) {
+        match FrankenStorage::open_writer(db_path) {
             Ok(storage) => Ok((storage, false, false)),
             Err(err) if anyhow_chain_indicates_retryable_storage_contention(&err) => {
                 Err(anyhow::anyhow!(
@@ -16342,9 +16350,9 @@ fn open_storage_for_index(
             )),
         }
     } else {
-        FrankenStorage::open(db_path)
+        FrankenStorage::open_writer(db_path)
             .map(|storage| (storage, false, full_index))
-            .with_context(|| format!("creating frankensqlite storage at {}", db_path.display()))
+            .with_context(|| format!("creating sqlite storage at {}", db_path.display()))
     }
 }
 
@@ -16798,7 +16806,8 @@ fn maybe_seed_empty_canonical_from_historical_bundle(
                     )
                 })?
             } else {
-                FrankenStorage::open(db_path).with_context(|| {
+                // w1b Task B8 (d16, open-consumer audit): write path.
+                FrankenStorage::open_writer(db_path).with_context(|| {
                     format!(
                         "reopening canonical database after baseline historical seed attempt: {}",
                         db_path.display()
@@ -16813,7 +16822,8 @@ fn maybe_seed_empty_canonical_from_historical_bundle(
                 error = %err,
                 "baseline historical seed import failed; falling back to incremental salvage"
             );
-            match FrankenStorage::open(db_path) {
+            // w1b Task B8 (d16, open-consumer audit): write path.
+            match FrankenStorage::open_writer(db_path) {
                 Ok(reopened) => Ok((reopened, None)),
                 Err(reopen_err) => {
                     tracing::warn!(
@@ -16835,7 +16845,8 @@ fn maybe_seed_empty_canonical_from_historical_bundle(
                             "moved failed baseline seed bundle aside before incremental salvage fallback"
                         );
                     }
-                    let reopened = FrankenStorage::open(db_path).with_context(|| {
+                    // w1b Task B8 (d16, open-consumer audit): write path.
+                    let reopened = FrankenStorage::open_writer(db_path).with_context(|| {
                         format!(
                             "recreating fresh canonical database after failed baseline seed import: {}",
                             db_path.display()
