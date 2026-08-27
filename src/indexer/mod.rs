@@ -42916,6 +42916,30 @@ mod tests {
         let storage = FrankenStorage::open(&db_path).unwrap();
         seed_lexical_rebuild_fixture(&storage);
 
+        // w1b Task B9 (2026-08-27, control-plane approved, same
+        // B7-schema-authority-migration family as commit d38be112's
+        // current_schema_fast_probe fix): this fixture used to reach a
+        // genuinely fts_messages-less database just by skipping
+        // `ensure_fts_schema` -- under the legacy engine, `fts_messages`
+        // was only ever created by that explicit call. Task B7's
+        // `storage::schema::ensure` (src/storage/schema.rs) now creates
+        // `fts_messages` unconditionally as part of the base schema, and
+        // `insert_conversation_tree` keeps it populated in step with
+        // `messages` -- so by the time `seed_lexical_rebuild_fixture`
+        // returns, the table already exists with all 4 rows indexed,
+        // making the "missing schema" scenario this test is named for
+        // impossible to reach through fixture setup alone (confirmed: the
+        // gate-caught failure here was `Repaired(AlreadyHealthy{rows:4})`,
+        // not the expected `Rebuilt` -- fts_messages was never missing,
+        // just never dropped). Drop it explicitly to recreate the
+        // scenario the test actually exercises: repair discovering an
+        // absent fts_messages and rebuilding it from the canonical
+        // `messages` table.
+        storage
+            .raw()
+            .execute("DROP TABLE IF EXISTS fts_messages", &[])
+            .unwrap();
+
         let repair =
             repair_fallback_fts_after_full_index_run(&storage, &db_path, true, false, None)
                 .unwrap();
