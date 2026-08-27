@@ -23368,8 +23368,20 @@ mod tests {
                 // `historical_bundle_schema_is_current` checks `user_version`
                 // before falling back to the legacy `meta.schema_version`
                 // this UPDATE still rolls back.
+                //
+                // w1b Task B9 (salvage problem A): `schema::ensure`'s
+                // fresh-build DDL leaves `meta` as an empty table (it never
+                // populates legacy bookkeeping rows, see
+                // `storage::schema` module doc) -- unlike a real
+                // franken-generation bundle, which always had a
+                // `schema_version` row to begin with. A plain `UPDATE`
+                // against a row that was never inserted is a silent no-op,
+                // so the legacy-version half of this simulated rollback
+                // never took effect. `INSERT OR REPLACE` makes the
+                // simulation correct regardless of which generation built
+                // the underlying database.
                 "PRAGMA user_version = 0;
-                 UPDATE meta SET value = '13' WHERE key = 'schema_version';
+                 INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', '13');
                  DELETE FROM _schema_migrations WHERE version = 14;
                  PRAGMA writable_schema = ON;",
             )
