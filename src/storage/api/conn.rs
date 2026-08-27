@@ -343,6 +343,31 @@ impl Conn {
         Ok(Conn { inner: Box::new(backend), path: None, _writer_open_guard: None })
     }
 
+    /// w1b Task B7: `storage::schema`'s own tests need to exercise
+    /// `schema::ensure` against genuine SQLite (rusqlite) semantics --
+    /// `PRAGMA user_version`, `sqlite3 PRAGMA integrity_check` from the
+    /// stock CLI, fault-injected mid-DDL crashes -- none of which
+    /// `Conn::open_writable`'s current `FrankenBackend` dispatch can stand
+    /// in for (same rationale as `tests::open_writable_sqlite_for_test`
+    /// below, just `pub(crate)` so a sibling module of `api` can reach it).
+    /// Test-only: does not touch the separately-tracked question of when
+    /// `Conn::open_writable` itself cuts over to `SqliteBackend` (that's B8).
+    #[cfg(test)]
+    pub(crate) fn open_writable_sqlite_backend_for_tests(
+        path: &Path,
+        profile: Profile,
+    ) -> Result<Conn, StorageError> {
+        let backend = super::backend_sqlite::SqliteBackend::open_writable(
+            path_to_str(path)?,
+            profile,
+        )?;
+        Ok(Conn {
+            inner: Box::new(backend),
+            path: Some(path.to_path_buf()),
+            _writer_open_guard: Some(super::writer::note_writer_opened(path)),
+        })
+    }
+
     /// w1b Task B3 (D2, R1-N2): bounded-retries on a real `Busy{Statement}`
     /// (up to [`super::config::STATEMENT_RETRY_MAX_ATTEMPTS`] times, capped
     /// at [`super::config::STATEMENT_RETRY_TOTAL_CAP_MS`] total elapsed
