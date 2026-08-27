@@ -1117,6 +1117,19 @@ pub fn fts_messages_integrity_error_from_message(
         || lower.contains("databasecorrupt")
         || lower.contains("database corrupt")
         || lower.contains("missing required")
+        // w1b Task B9 (salvage problem B): a duplicate `fts_messages`
+        // declaration in `sqlite_master` (the "malformed legacy bundle"
+        // fixture pattern) makes real SQLite refuse to even open the
+        // connection -- it eagerly parses the full schema and errors with
+        // "table fts_messages already exists" the moment two virtual-table
+        // declarations for the same name collide. The old frankensqlite
+        // backend deferred this validation until the table was actually
+        // queried, so this failure mode never reached this classifier
+        // before; without recognizing it here, the caller falls straight
+        // through to `.recover`-based salvage instead of the (correct,
+        // already-implemented) `scrub_staged_derived_fts_metadata_via_sqlite3`
+        // repair this function exists to route to.
+        || lower.contains("already exists")
         || (mentions_required_shadow_table
             && (lower.contains("table not found") || lower.contains("no such table")));
     if !mentions_structural_fts_failure {
@@ -21964,8 +21977,19 @@ mod tests {
         drop(source);
 
         let legacy = FrankenConnection::open_writable(std::path::Path::new(&(source_db.to_string_lossy().into_owned())), crate::storage::api::Profile::Production).unwrap();
+        // w1b Task B9 (salvage problem A, second occurrence): `schema::ensure`
+        // leaves `meta` empty on a fresh new-generation database (see the
+        // sibling fixture fix in
+        // discover_historical_database_bundles_prefers_healthy_backup_over_replay_priority),
+        // so a plain `UPDATE` against a `schema_version` row that was never
+        // inserted silently matches zero rows and never simulates the
+        // "legacy v12 bundle" this test needs to exercise the too-old
+        // rejection path.
         legacy
-            .execute("UPDATE meta SET value = '12' WHERE key = 'schema_version'", &[])
+            .execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', '12')",
+                &[],
+            )
             .unwrap();
         drop(legacy);
 
