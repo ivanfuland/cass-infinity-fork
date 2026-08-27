@@ -27723,11 +27723,20 @@ fn stats_message_count_sql(source_where: &str) -> String {
 }
 
 fn stats_workspace_count_sql(source_where: &str) -> String {
+    // w1b Task B9 (2026-08-27, equivalence-gate-caught): `ORDER BY COUNT(*)
+    // DESC` alone has no tiebreaker for workspaces with equal counts, so
+    // SQLite's output order for tied groups is whatever its query plan
+    // happens to produce -- not a guarantee of the SQL itself, and it can
+    // (and did) flip between two databases with byte-identical logical
+    // content but a different physical page layout (a rebuilt fixture vs.
+    // the original file). `c.workspace_id ASC` makes tied groups
+    // deterministic without changing any single-workspace or
+    // clearly-ordered-by-count result.
     if source_where.is_empty() {
-        "SELECT c.workspace_id, COUNT(*) FROM conversations c WHERE c.workspace_id IS NOT NULL GROUP BY c.workspace_id ORDER BY COUNT(*) DESC".to_string()
+        "SELECT c.workspace_id, COUNT(*) FROM conversations c WHERE c.workspace_id IS NOT NULL GROUP BY c.workspace_id ORDER BY COUNT(*) DESC, c.workspace_id ASC".to_string()
     } else {
         format!(
-            "SELECT c.workspace_id, COUNT(*) FROM conversations c{source_where} AND c.workspace_id IS NOT NULL GROUP BY c.workspace_id ORDER BY COUNT(*) DESC"
+            "SELECT c.workspace_id, COUNT(*) FROM conversations c{source_where} AND c.workspace_id IS NOT NULL GROUP BY c.workspace_id ORDER BY COUNT(*) DESC, c.workspace_id ASC"
         )
     }
 }
@@ -91704,7 +91713,7 @@ mod legacy_source_filter_tests {
         );
         assert_eq!(
             stats_workspace_count_sql(""),
-            "SELECT c.workspace_id, COUNT(*) FROM conversations c WHERE c.workspace_id IS NOT NULL GROUP BY c.workspace_id ORDER BY COUNT(*) DESC",
+            "SELECT c.workspace_id, COUNT(*) FROM conversations c WHERE c.workspace_id IS NOT NULL GROUP BY c.workspace_id ORDER BY COUNT(*) DESC, c.workspace_id ASC",
             "unfiltered workspace stats can aggregate workspace IDs before path lookup"
         );
 
