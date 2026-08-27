@@ -187,7 +187,7 @@ be silently skipped during closeout.
 - **Owning beads:** .14, .14.1, .14.4, .9.4
 - **Failure modes:** fm-storage-frankensqlite-openread-cursor, fm-storage-pragma-integrity-fail, fm-storage-wal-multiprocess-corruption, fm-storage-rusqlite-frankensqlite-incompat, fm-storage-schema-version-drift, fm-storage-busy-lock-timeout, fm-storage-stale-wal-orphan, fm-storage-sql-fmt-injection-risk
 - **Mandatory proofs:** integration, golden, e2e
-- **Proof artifacts:** `tests/e2e_storage_failure_fixture_gate.rs`, `tests/storage.rs`, `tests/storage_migration_safety.rs`
+- **Proof artifacts:** `tests/e2e_storage_failure_fixture_gate.rs`, `tests/storage.rs`
 - **Optional diagnostics:** live integrity-check sweep
 - **Fixture provenance:** deterministic raw-byte corrupt fixtures; DB preserved byte-identical
 - **Log expectation:** structured proof-log over the real-binary storage-failure gate
