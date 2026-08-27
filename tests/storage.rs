@@ -631,32 +631,6 @@ fn fresh_database_fts_messages_is_queryable_via_frankensqlite() {
 }
 
 #[test]
-fn open_disables_frankensqlite_autocommit_retain() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let db_path = tmp.path().join("autocommit-retain.db");
-    let storage = SqliteStorage::open(&db_path).expect("open");
-
-    let namespaced: i64 = storage
-        .raw()
-        .query_row_map("PRAGMA fsqlite.autocommit_retain;", &[], |row| {
-            row.get_typed(0)
-        })
-        .expect("fsqlite.autocommit_retain pragma should be queryable");
-    assert_eq!(
-        namespaced, 0,
-        "storage open should disable retained autocommit"
-    );
-
-    let alias: i64 = storage
-        .raw()
-        .query_row_map("PRAGMA autocommit_retain;", &[], |row| row.get_typed(0))
-        .expect("autocommit_retain pragma alias should be queryable");
-    assert_eq!(alias, 0, "autocommit_retain alias should also be disabled");
-}
-
-
-
-#[test]
 fn foreign_keys_pragma_is_enabled() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("fk.db");

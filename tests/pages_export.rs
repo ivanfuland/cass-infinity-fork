@@ -333,8 +333,18 @@ mod tests {
             "legacy-embedded-engine export payload is queryable"
         );
 
+        // w1b Task B9 (2026-08-27): the P1 text sweep (b743f695) renamed the
+        // franken/fsqlite prose this test's fixture content used to say into
+        // "legacy-embedded-engine" -- a hyphenated phrase, unlike the single
+        // word it replaced. Unquoted, FTS5's query-syntax parser treats
+        // hyphens specially (reproduced against stock sqlite3 directly: the
+        // exact same "no such column: embedded" error), so the term needs
+        // double-quoting to be treated as a literal phrase instead of parsed
+        // FTS5 query syntax. Not an engine behavior difference -- vanilla
+        // SQLite's FTS5 has always required this quoting for hyphenated
+        // MATCH terms.
         let fts_hits: i64 = output_conn.query_row_map(
-            "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'legacy-embedded-engine'",
+            "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH '\"legacy-embedded-engine\"'",
             &[],
             |row: &FrankenRow| row.get_typed(0),
         )?;
