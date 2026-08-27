@@ -27121,7 +27121,6 @@ pub mod persist {
         /// Helper: create a frankensqlite-native database with schema applied.
         fn create_franken_db(path: &std::path::Path) -> FrankenStorage {
             let fs = FrankenStorage::open(path).expect("open frankensqlite db");
-            fs.run_migrations().expect("run migrations");
             fs
         }
 
@@ -39432,7 +39431,6 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("db.sqlite");
         let storage = FrankenStorage::open(&db_path).unwrap();
-        storage.run_migrations().unwrap();
 
         storage.set_last_scan_ts(1_000).unwrap();
         storage.set_connector_last_scan_ts("codex", 1_100).unwrap();
@@ -39856,7 +39854,6 @@ mod tests {
         // Create a canonical DB with some content and an active WAL.
         let db_path = data_dir.join("agent_search.db");
         let storage = FrankenStorage::open(&db_path)?;
-        storage.run_migrations()?;
         drop(storage);
 
         // Checkpoint should succeed and leave a readable DB.
@@ -42146,7 +42143,6 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("db.sqlite");
         let storage = FrankenStorage::open(&db_path).unwrap();
-        storage.run_migrations().unwrap();
 
         let agent = crate::model::types::Agent {
             id: None,
@@ -42216,7 +42212,6 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("db.sqlite");
         let storage = FrankenStorage::open(&db_path).unwrap();
-        storage.run_migrations().unwrap();
 
         let agent = crate::model::types::Agent {
             id: None,
@@ -42304,7 +42299,6 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("db.sqlite");
         let storage = FrankenStorage::open(&db_path).unwrap();
-        storage.run_migrations().unwrap();
 
         let tester = crate::model::types::Agent {
             id: None,
@@ -42443,7 +42437,6 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("db.sqlite");
         let storage = FrankenStorage::open(&db_path).unwrap();
-        storage.run_migrations().unwrap();
 
         let agent = crate::model::types::Agent {
             id: None,
@@ -47510,7 +47503,6 @@ mod tests {
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
-        storage.run_migrations().unwrap();
         let index_path = index_dir(&opts.data_dir).unwrap();
         let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
         let state = std::sync::Mutex::new(std::collections::HashMap::new());
@@ -47591,7 +47583,6 @@ mod tests {
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
-        storage.run_migrations().unwrap();
         let index_path = index_dir(&opts.data_dir).unwrap();
         let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
         let state = std::sync::Mutex::new(std::collections::HashMap::new());
@@ -47685,7 +47676,6 @@ mod tests {
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
-        storage.run_migrations().unwrap();
         let index_path = index_dir(&opts.data_dir).unwrap();
         let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
         let state = std::sync::Mutex::new(std::collections::HashMap::new());
@@ -47778,7 +47768,6 @@ mod tests {
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
-        storage.run_migrations().unwrap();
         let index_path = index_dir(&opts.data_dir).unwrap();
         let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
         let state = std::sync::Mutex::new(std::collections::HashMap::new());
@@ -47873,7 +47862,6 @@ mod tests {
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
-        storage.run_migrations().unwrap();
         let index_path = index_dir(&opts.data_dir).unwrap();
         let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
         let state = std::sync::Mutex::new(std::collections::HashMap::new());
@@ -48204,7 +48192,6 @@ mod tests {
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
-        storage.run_migrations().unwrap();
         let index_path = index_dir(&opts.data_dir).unwrap();
         let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
         let state = std::sync::Mutex::new(std::collections::HashMap::new());
@@ -48293,7 +48280,6 @@ mod tests {
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
-        storage.run_migrations().unwrap();
         let index_path = index_dir(&opts.data_dir).unwrap();
         let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
         let state = std::sync::Mutex::new(std::collections::HashMap::new());

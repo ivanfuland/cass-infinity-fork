@@ -222,8 +222,9 @@ mod tests {
     use std::path::Path;
 
     fn open_sqlite_writer(path: &Path) -> Conn {
-        Conn::open_writable_sqlite_backend_for_tests(path, Profile::Production)
-            .expect("open real sqlite backend for schema test")
+        // w1b Task B8: `Conn::open_writable` itself now dispatches to
+        // `SqliteBackend` -- no separate test-only bridge needed.
+        Conn::open_writable(path, Profile::Production).expect("open sqlite backend for schema test")
     }
 
     /// The returned `TempDir` must stay alive for as long as the path is in

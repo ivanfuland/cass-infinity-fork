@@ -126,11 +126,29 @@ fn sqlite_to_value(v: rusqlite::types::Value) -> Value {
 }
 
 impl StorageBackend for SqliteBackend {
+    /// w1b Task B8 (regression found via real `cargo test` execution, not
+    /// `cargo check`): `rusqlite::Connection::execute` hard-errors
+    /// ("Execute returned results - did you mean to call query?") on any
+    /// statement that returns a result set -- and some PRAGMAs cass runs
+    /// through this exact trait method do (`PRAGMA journal_mode = WAL;`
+    /// returns the resulting mode as a one-row result set; frankensqlite's
+    /// `execute` tolerated this, which is why the bug was latent until
+    /// `Conn::open_writable` actually dispatched here). Prepare + drain
+    /// instead of `Connection::execute` so any such statement (PRAGMA or
+    /// ordinary DML) works uniformly; `Connection::changes()` after the
+    /// drain still reports the affected-row count `execute()`'s callers
+    /// expect.
     fn execute(&self, sql: &str, params: &[Value]) -> Result<usize, StorageError> {
+        let conn = self.conn()?;
         let sqlite_params: Vec<rusqlite::types::Value> = params.iter().map(value_to_sqlite).collect();
-        self.conn()?
-            .execute(sql, rusqlite::params_from_iter(sqlite_params.iter()))
-            .map_err(map_sqlite_err)
+        let mut stmt = conn.prepare(sql).map_err(map_sqlite_err)?;
+        let mut rows = stmt
+            .query(rusqlite::params_from_iter(sqlite_params.iter()))
+            .map_err(map_sqlite_err)?;
+        while rows.next().map_err(map_sqlite_err)?.is_some() {}
+        drop(rows);
+        drop(stmt);
+        Ok(conn.changes() as usize)
     }
 
     fn execute_batch(&self, sql: &str) -> Result<(), StorageError> {

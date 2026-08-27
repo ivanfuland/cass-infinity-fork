@@ -43,7 +43,9 @@ const STRICT_PATH_DEP_ENV: &str = "CASS_STRICT_PATH_DEP_VALIDATION";
 const CONTRACTS: &[DependencyContract] = &[
     DependencyContract {
         label: "frankensqlite facade",
-        dep_table: "dependencies",
+        // w1b Task B8: dev-only now (franken backend retired from production
+        // storage; only tests/frankensqlite_compat_gates.rs still uses this).
+        dep_table: "dev-dependencies",
         dep_key: "frankensqlite",
         crate_package_name: "fsqlite",
         manifest_package_field: Some("fsqlite"),

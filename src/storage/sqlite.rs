@@ -693,16 +693,13 @@ pub(crate) fn open_current_schema_storage_with_timeout(
     );
     storage.apply_open_stage_busy_timeout();
 
-    let version = storage
-        .raw()
-        .query_all_map(
-            "SELECT value FROM meta WHERE key = 'schema_version';",
-            &[],
-            |row| row.get_typed::<String>(0),
-        )
-        .ok()
-        .and_then(|rows| rows.into_iter().next())
-        .and_then(|raw| raw.parse::<i64>().ok());
+    // w1b Task B8: fast-path version check now reads the `PRAGMA
+    // user_version` authority instead of the retired `meta.schema_version`
+    // mirror -- a mismatch (including a read error, which `ok()` folds into
+    // "not current" the same way the old string-parse fallback did) simply
+    // falls back to the slow path (`FrankenStorage::open`, which runs
+    // `schema::ensure`), same as before.
+    let version = crate::storage::schema::read_user_version(storage.raw()).ok();
 
     if version != Some(CURRENT_SCHEMA_VERSION) {
         if let Err(close_err) = storage.close_without_checkpoint_in_place() {
@@ -716,7 +713,6 @@ pub(crate) fn open_current_schema_storage_with_timeout(
         return Ok(None);
     }
 
-    transition_from_meta_version(&storage.conn)?;
     storage.repair_missing_current_schema_objects()?;
     storage.apply_config()?;
     Ok(Some(storage))
@@ -950,54 +946,6 @@ fn franken_read_message_extra_compat(
     }
 
     serde_json::Value::Null
-}
-
-// -------------------------------------------------------------------------
-// Migration Error Types (P1.5)
-// -------------------------------------------------------------------------
-
-/// Error type for schema migration operations.
-#[derive(Debug, Error)]
-pub enum MigrationError {
-    /// The schema requires a full rebuild. The database has been backed up.
-    #[error("Rebuild required: {reason}")]
-    RebuildRequired {
-        reason: String,
-        backup_path: Option<std::path::PathBuf>,
-    },
-
-    /// A database error occurred during migration.
-    #[error("Database error: {0}")]
-    Database(#[from] StorageError),
-
-    /// An I/O error occurred during backup.
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
-
-    /// Other migration error.
-    #[error("{0}")]
-    Other(String),
-}
-
-impl From<anyhow::Error> for MigrationError {
-    fn from(e: anyhow::Error) -> Self {
-        MigrationError::Other(e.to_string())
-    }
-}
-
-/// Maximum number of backup files to retain.
-const MAX_BACKUPS: usize = 3;
-const BACKUP_VACUUM_BUSY_TIMEOUT_PRAGMA: &str = "PRAGMA busy_timeout = 30000;";
-
-/// Files that contain user-authored state and must NEVER be deleted during rebuild.
-const USER_DATA_FILES: &[&str] = &["bookmarks.db", "tui_state.json", "sources.toml", ".env"];
-
-/// Check if a file is user-authored data that must be preserved during rebuild.
-pub fn is_user_data_file(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|n| n.to_str())
-        .map(|name| USER_DATA_FILES.contains(&name))
-        .unwrap_or(false)
 }
 
 /// SQL to register the FTS5 virtual table on a frankensqlite connection.
@@ -1317,91 +1265,6 @@ pub(crate) fn ensure_fts_consistency_via_rusqlite(db_path: &Path) -> Result<FtsC
     storage.ensure_search_fallback_fts_consistency()
 }
 
-/// Create a uniquely named backup of the database file.
-///
-/// Returns the path to the backup file, or None if the source doesn't exist.
-pub fn create_backup(db_path: &Path) -> Result<Option<std::path::PathBuf>, MigrationError> {
-    if !bundle_path_exists(db_path)? {
-        return Ok(None);
-    }
-
-    if !copyable_bundle_file_exists(db_path)? {
-        return Ok(None);
-    }
-    let _ = copyable_bundle_sidecar_sources(db_path)?;
-
-    let backup_path = unique_backup_path(db_path);
-    let vacuum_stage_path = vacuum_stage_backup_path(&backup_path);
-
-    // Try to use SQLite's VACUUM INTO command first, which safely handles WAL files
-    // and produces a clean, minimized backup.
-    match vacuum_into_backup_stage(db_path, &vacuum_stage_path) {
-        Ok(()) => {
-            fs::rename(&vacuum_stage_path, &backup_path)?;
-        }
-        Err(err) if backup_vacuum_error_requires_consistent_retry(&err) => {
-            tracing::warn!(
-                db_path = %db_path.display(),
-                error = %err,
-                "create_backup: VACUUM INTO hit transient contention; refusing raw WAL bundle copy"
-            );
-            return Err(MigrationError::Database(err));
-        }
-        Err(err) => {
-            tracing::warn!(
-                db_path = %db_path.display(),
-                error = %err,
-                "create_backup: VACUUM INTO failed; falling back to raw evidence copy"
-            );
-        }
-    }
-
-    if backup_path.exists() {
-        sync_file_if_exists(&backup_path)?;
-        if let Some(parent) = backup_path.parent() {
-            sync_parent_directory(parent)?;
-        }
-        return Ok(Some(backup_path));
-    }
-
-    // Fallback to a raw evidence copy if VACUUM INTO failed (e.g., older SQLite
-    // or corruption). Keep this on the same symlink-safe bundle path as
-    // historical seeding so a malformed archive root cannot make us copy an
-    // arbitrary symlink target or publish a partial sidecar backup.
-    copy_database_bundle(db_path, &backup_path)?;
-
-    Ok(Some(backup_path))
-}
-
-fn vacuum_into_backup_stage(
-    db_path: &Path,
-    stage_path: &Path,
-) -> std::result::Result<(), StorageError> {
-    let mut conn = open_franken_with_flags(
-        &db_path.to_string_lossy(),
-        FrankenOpenFlags::SQLITE_OPEN_READ_ONLY,
-    )?;
-    let result = (|| {
-        conn.execute(BACKUP_VACUUM_BUSY_TIMEOUT_PRAGMA, &[])?;
-        let path_str = stage_path.to_string_lossy();
-        conn.execute("VACUUM INTO ?", fparams![path_str.as_ref()])?;
-        Ok(())
-    })();
-    if let Err(close_err) = conn.close_in_place() {
-        tracing::warn!(
-            error = %close_err,
-            db_path = %db_path.display(),
-            "create_backup: close_in_place failed after VACUUM INTO; falling back to best-effort close"
-        );
-        conn.close_best_effort_in_place();
-    }
-    result
-}
-
-fn backup_vacuum_error_requires_consistent_retry(err: &StorageError) -> bool {
-    retryable_franken_error(err)
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DatabaseBundleMoveResult {
     pub database: bool,
@@ -1417,6 +1280,36 @@ impl DatabaseBundleMoveResult {
 
 fn database_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(format!("{}{}", path.to_string_lossy(), suffix))
+}
+
+#[cfg(not(windows))]
+fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
+    fs::File::open(path)?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn sync_file_if_exists(path: &Path) -> std::io::Result<()> {
+    if path.exists() {
+        fs::File::open(path)?.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn sync_file_if_exists(path: &Path) -> std::io::Result<()> {
+    if path.exists() {
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?
+            .sync_all()?;
+    }
+    Ok(())
 }
 
 /// Move a database file and its WAL/SHM sidecars to a new basename.
@@ -1571,105 +1464,6 @@ fn copyable_bundle_file_exists(path: &Path) -> Result<bool> {
     }
 }
 
-/// Helper to safely remove a database file and its potential WAL/SHM sidecars.
-pub(crate) fn remove_database_files(path: &Path) -> std::io::Result<()> {
-    let mut removed_any = false;
-
-    match fs::remove_file(path) {
-        Ok(()) => removed_any = true,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err),
-    }
-
-    // Best-effort removal of sidecar files (ignore errors if they don't exist)
-    for suffix in ["-wal", "-shm"] {
-        match fs::remove_file(database_sidecar_path(path, suffix)) {
-            Ok(()) => removed_any = true,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err),
-        }
-    }
-
-    if removed_any && let Some(parent) = path.parent() {
-        sync_parent_directory(parent)?;
-    }
-
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
-    fs::File::open(path)?.sync_all()
-}
-
-#[cfg(windows)]
-fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn sync_file_if_exists(path: &Path) -> std::io::Result<()> {
-    if path.exists() {
-        fs::File::open(path)?.sync_all()?;
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn sync_file_if_exists(path: &Path) -> std::io::Result<()> {
-    if path.exists() {
-        fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)?
-            .sync_all()?;
-    }
-    Ok(())
-}
-
-/// Remove old backup files, keeping only the most recent `keep_count`.
-pub fn cleanup_old_backups(db_path: &Path, keep_count: usize) -> Result<(), std::io::Error> {
-    let parent = match db_path.parent() {
-        Some(p) => p,
-        None => return Ok(()),
-    };
-
-    let db_name = db_path.file_name().and_then(|n| n.to_str()).unwrap_or("db");
-
-    let prefix = format!("{}.backup.", db_name);
-
-    // Collect backup files matching the pattern
-    let mut backups: Vec<(std::path::PathBuf, SystemTime)> = Vec::new();
-
-    if let Ok(entries) = fs::read_dir(parent) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|n| n.to_str())
-                && is_backup_root_name(name, &prefix)
-                && let Ok(meta) = fs::metadata(&path)
-                && meta.is_file()
-                && let Ok(mtime) = meta.modified()
-            {
-                backups.push((path, mtime));
-            }
-        }
-    }
-
-    // Sort by modification time, newest first
-    backups.sort_by_key(|entry| std::cmp::Reverse(entry.1));
-
-    // Delete oldest backups beyond keep_count
-    for (path, _) in backups.into_iter().skip(keep_count) {
-        let _ = fs::remove_file(&path);
-
-        // Also try to cleanup potential sidecars from fs::copy fallback
-        let _ = fs::remove_file(database_sidecar_path(&path, "-wal"));
-        let _ = fs::remove_file(database_sidecar_path(&path, "-shm"));
-    }
-
-    Ok(())
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct HistoricalDatabaseBundle {
     root_path: PathBuf,
@@ -1685,17 +1479,6 @@ struct HistoricalBundleProbe {
     fts_schema_rows: Option<i64>,
     fts_queryable: bool,
     max_message_id: i64,
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SqliteDatabaseHealthProbe {
-    pub schema_version: Option<i64>,
-    pub quick_check_ok: bool,
-    pub fts_schema_rows: i64,
-    pub fts_queryable: bool,
-    pub message_count: i64,
-    pub max_message_id: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2556,72 +2339,6 @@ fn franken_fts_schema_rows(conn: &FrankenConnection) -> Result<i64> {
     .context("counting sqlite_master rows for fts_messages via frankensqlite")
 }
 
-#[cfg(test)]
-fn franken_fts_limit_probe(conn: &FrankenConnection) -> bool {
-    conn.query_all_map("SELECT COUNT(*) FROM fts_messages", &[], |_row| Ok(())).is_ok()
-}
-
-#[cfg(test)]
-pub(crate) fn probe_database_health_via_frankensqlite(
-    db_path: &Path,
-) -> Result<SqliteDatabaseHealthProbe> {
-    let path_str = db_path.to_string_lossy();
-    let conn = FrankenConnection::open_writable(std::path::Path::new(&(path_str.as_ref())), crate::storage::api::Profile::Production).with_context(|| {
-        format!(
-            "opening frankensqlite db at {} for database health probe",
-            db_path.display()
-        )
-    })?;
-    conn.execute_batch("PRAGMA busy_timeout = 30000;")
-        .with_context(|| {
-            format!(
-                "configuring busy timeout for database health probe at {}",
-                db_path.display()
-            )
-        })?;
-
-    let schema_version = read_meta_schema_version(&conn)?;
-    let quick_check_status: String = conn
-        .query_row_map("PRAGMA quick_check(1)", fparams![], |row| row.get_typed(0))
-        .with_context(|| format!("running PRAGMA quick_check(1) for {}", db_path.display()))?;
-    let quick_check_ok = quick_check_status.trim().eq_ignore_ascii_case("ok");
-    let fts_schema_rows = franken_fts_schema_rows(&conn)?;
-    let fts_queryable = fts_schema_rows == 1 && franken_fts_limit_probe(&conn);
-
-    if !quick_check_ok {
-        return Ok(SqliteDatabaseHealthProbe {
-            schema_version,
-            quick_check_ok,
-            fts_schema_rows,
-            fts_queryable,
-            message_count: 0,
-            max_message_id: 0,
-        });
-    }
-
-    let message_count: i64 = conn
-        .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
-            row.get_typed(0)
-        })
-        .context("counting messages during frankensqlite database health probe")?;
-    let max_message_id: i64 = conn
-        .query_row_map(
-            "SELECT COALESCE(MAX(id), 0) FROM messages",
-            fparams![],
-            |row| row.get_typed(0),
-        )
-        .context("reading max message id during frankensqlite database health probe")?;
-
-    Ok(SqliteDatabaseHealthProbe {
-        schema_version,
-        quick_check_ok,
-        fts_schema_rows,
-        fts_queryable,
-        message_count,
-        max_message_id,
-    })
-}
-
 struct StagedHistoricalSeed {
     tempdir: tempfile::TempDir,
     db_path: PathBuf,
@@ -2924,16 +2641,10 @@ fn message_payload_size_hint(message: &Message) -> usize {
         .saturating_add(json_value_size_hint(&message.extra_json))
 }
 
-fn is_backup_root_name(name: &str, prefix: &str) -> bool {
-    name.starts_with(prefix) && !name.ends_with("-wal") && !name.ends_with("-shm")
-}
-
 // Suffixes that mark sqlite sidecar files we must never re-open as a DB root.
 // Includes the standard -wal/-shm pair plus frankensqlite's Windows advisory-
 // lock sidecars (-lock-shared/-lock-reserved/-lock-pending). Used by directory
-// enumeration paths in `historical_bundle_root_paths`; deliberately NOT used
-// by `is_backup_root_name`, because the existing backup-rotation cleanup must
-// continue to sweep up any pre-existing orphan lock sidecars.
+// enumeration paths in `historical_bundle_root_paths`.
 fn has_db_sidecar_suffix(name: &str) -> bool {
     const SIDECAR_SUFFIXES: &[&str] = &[
         "-wal",
@@ -2953,651 +2664,15 @@ fn has_db_sidecar_suffix(name: &str) -> bool {
     SIDECAR_SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
 }
 
-/// Public schema version constant for external checks.
-pub const CURRENT_SCHEMA_VERSION: i64 = 21;
-const MIN_IN_PLACE_MIGRATION_SCHEMA_VERSION: i64 = 13;
-
-/// Result of checking schema compatibility.
-#[derive(Debug, Clone)]
-pub enum SchemaCheck {
-    /// Schema is up to date, no migration needed.
-    Compatible,
-    /// Schema needs migration but can be done incrementally.
-    NeedsMigration,
-    /// Schema is incompatible and needs a full rebuild (with reason).
-    NeedsRebuild(String),
-}
-
-fn schema_check_error_requires_rebuild(err: &StorageError) -> bool {
-    // Only on-disk corruption classes justify destructive rebuild.
-    // Locking, open, and generic I/O failures are often transient and must
-    // surface as errors rather than deleting the database under the caller.
-    // Task A4a: `map_franken_err` (backend_franken.rs) was extended to route
-    // DatabaseCorrupt/WalCorrupt/NotADatabase/ShortRead here as `Corrupt` — see
-    // its doc comment for why this exact 4-variant set is preserved.
-    matches!(err, StorageError::Corrupt { .. })
-}
-
-fn unique_backup_path(path: &Path) -> PathBuf {
-    static NEXT_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let nonce = NEXT_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("db");
-
-    path.with_file_name(format!(
-        "{file_name}.backup.{}.{}.{}",
-        std::process::id(),
-        timestamp,
-        nonce
-    ))
-}
-
-fn vacuum_stage_backup_path(backup_path: &Path) -> PathBuf {
-    let file_name = backup_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("db.backup");
-    backup_path.with_file_name(format!(".{file_name}.vacuum-in-progress"))
-}
-
-/// Check schema compatibility without modifying the database.
-///
-/// Opens the database read-only and checks the schema version.
-fn check_schema_compatibility(
-    path: &Path,
-) -> std::result::Result<SchemaCheck, StorageError> {
-    let mut conn = open_franken_with_flags(
-        &path.to_string_lossy(),
-        FrankenOpenFlags::SQLITE_OPEN_READ_ONLY,
-    )?;
-
-    let result = (|| {
-        // Check if meta table exists
-        let meta_exists: i32 = conn.query_row_map(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='meta'",
-            fparams![],
-            |row| row.get_typed(0),
-        )?;
-
-        if meta_exists == 0 {
-            // No meta table - could be empty or very old schema, needs rebuild
-            // But first check if there are any tables at all
-            let table_count: i32 = conn.query_row_map(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table'",
-                fparams![],
-                |row| row.get_typed(0),
-            )?;
-
-            if table_count == 0 {
-                // Empty database, will be initialized fresh
-                return Ok(SchemaCheck::NeedsMigration);
-            }
-
-            // Has tables but no meta - very old or corrupted
-            return Ok(SchemaCheck::NeedsRebuild(
-                "Database missing schema version metadata".to_string(),
-            ));
-        }
-
-        // Get the schema version
-        let version: Option<i64> = conn
-            .query_row_map(
-                "SELECT value FROM meta WHERE key = 'schema_version'",
-                fparams![],
-                |row| Ok(row.get_typed::<String>(0)?.parse().ok()),
-            )
-            .ok()
-            .flatten();
-
-        match version {
-            Some(v) if v == SCHEMA_VERSION => Ok(SchemaCheck::Compatible),
-            Some(v) if (MIN_IN_PLACE_MIGRATION_SCHEMA_VERSION..SCHEMA_VERSION).contains(&v) => {
-                Ok(SchemaCheck::NeedsMigration)
-            }
-            Some(v) if v > 0 && v < MIN_IN_PLACE_MIGRATION_SCHEMA_VERSION => {
-                Ok(SchemaCheck::NeedsRebuild(format!(
-                    "Schema version {} is too old for in-place migration; supported upgrade path starts at version {}",
-                    v, MIN_IN_PLACE_MIGRATION_SCHEMA_VERSION
-                )))
-            }
-            Some(v) => {
-                // v > SCHEMA_VERSION - database is from a newer version
-                Ok(SchemaCheck::NeedsRebuild(format!(
-                    "Schema version {} is newer than supported version {}",
-                    v, SCHEMA_VERSION
-                )))
-            }
-            None => Ok(SchemaCheck::NeedsRebuild(
-                "Schema version not found or invalid".to_string(),
-            )),
-        }
-    })();
-
-    if let Err(close_err) = conn.close_in_place() {
-        tracing::warn!(
-            error = %close_err,
-            db_path = %path.display(),
-            "check_schema_compatibility: close_in_place failed; falling back to best-effort close"
-        );
-        conn.close_best_effort_in_place();
-    }
-
-    result
-}
-
-const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
-
-#[cfg(test)]
-const MIGRATION_V1: &str = r"
-CREATE TABLE IF NOT EXISTS meta (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS agents (
-    id INTEGER PRIMARY KEY,
-    slug TEXT NOT NULL UNIQUE,
-    name TEXT NOT NULL,
-    version TEXT,
-    kind TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS workspaces (
-    id INTEGER PRIMARY KEY,
-    path TEXT NOT NULL UNIQUE,
-    display_name TEXT
-);
-
-CREATE TABLE IF NOT EXISTS conversations (
-    id INTEGER PRIMARY KEY,
-    agent_id INTEGER NOT NULL REFERENCES agents(id),
-    workspace_id INTEGER REFERENCES workspaces(id),
-    external_id TEXT,
-    title TEXT,
-    source_path TEXT NOT NULL,
-    started_at INTEGER,
-    ended_at INTEGER,
-    approx_tokens INTEGER,
-    metadata_json TEXT,
-    UNIQUE(agent_id, external_id)
-);
-
-CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY,
-    conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-    idx INTEGER NOT NULL,
-    role TEXT NOT NULL,
-    author TEXT,
-    created_at INTEGER,
-    content TEXT NOT NULL,
-    extra_json TEXT,
-    UNIQUE(conversation_id, idx)
-);
-
-CREATE TABLE IF NOT EXISTS snippets (
-    id INTEGER PRIMARY KEY,
-    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
-    file_path TEXT,
-    start_line INTEGER,
-    end_line INTEGER,
-    language TEXT,
-    snippet_text TEXT
-);
-
-CREATE TABLE IF NOT EXISTS tags (
-    id INTEGER PRIMARY KEY,
-    name TEXT NOT NULL UNIQUE
-);
-
-CREATE TABLE IF NOT EXISTS conversation_tags (
-    conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-    tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
-    PRIMARY KEY (conversation_id, tag_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_conversations_agent_started
-    ON conversations(agent_id, started_at DESC);
-
-CREATE INDEX IF NOT EXISTS idx_messages_conv_idx
-    ON messages(conversation_id, idx);
-
-";
-
-#[cfg(test)]
-const MIGRATION_V2: &str = r"
-CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(
-    content,
-    title,
-    agent,
-    workspace,
-    source_path,
-    created_at UNINDEXED,
-    message_id UNINDEXED,
-    tokenize='porter'
-);
-INSERT INTO fts_messages(content, title, agent, workspace, source_path, created_at, message_id)
-SELECT
-    m.content,
-    c.title,
-    a.slug,
-    w.path,
-    c.source_path,
-    m.created_at,
-    m.id
-FROM messages m
-JOIN conversations c ON m.conversation_id = c.id
-JOIN agents a ON c.agent_id = a.id
-LEFT JOIN workspaces w ON c.workspace_id = w.id;
-";
-
-#[cfg(test)]
-const MIGRATION_V3: &str = r"
-DROP TABLE IF EXISTS fts_messages;
-CREATE VIRTUAL TABLE fts_messages USING fts5(
-    content,
-    title,
-    agent,
-    workspace,
-    source_path,
-    created_at UNINDEXED,
-    message_id UNINDEXED,
-    tokenize='porter'
-);
-INSERT INTO fts_messages(content, title, agent, workspace, source_path, created_at, message_id)
-SELECT
-    m.content,
-    c.title,
-    a.slug,
-    w.path,
-    c.source_path,
-    m.created_at,
-    m.id
-FROM messages m
-JOIN conversations c ON m.conversation_id = c.id
-JOIN agents a ON c.agent_id = a.id
-LEFT JOIN workspaces w ON c.workspace_id = w.id;
-";
-
-#[cfg(test)]
-const MIGRATION_V4: &str = r"
--- Sources table for tracking where conversations come from
-CREATE TABLE IF NOT EXISTS sources (
-    id TEXT PRIMARY KEY,           -- source_id (e.g., 'local', 'work-laptop')
-    kind TEXT NOT NULL,            -- 'local', 'ssh', etc.
-    host_label TEXT,               -- display label
-    machine_id TEXT,               -- optional stable machine id
-    platform TEXT,                 -- 'macos', 'linux', 'windows'
-    config_json TEXT,              -- JSON blob for extra config (SSH params, path rewrites)
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
-);
-
--- Bootstrap: Insert the default 'local' source
-INSERT OR IGNORE INTO sources (id, kind, host_label, created_at, updated_at)
-VALUES ('local', 'local', NULL, strftime('%s','now')*1000, strftime('%s','now')*1000);
-";
-
-#[cfg(test)]
-const MIGRATION_V5: &str = r"
--- Add provenance columns to conversations table
--- SQLite cannot alter unique constraints, so we need to recreate the table
-
--- Create new table with provenance columns and updated unique constraint
-CREATE TABLE conversations_new (
-    id INTEGER PRIMARY KEY,
-    agent_id INTEGER NOT NULL REFERENCES agents(id),
-    workspace_id INTEGER REFERENCES workspaces(id),
-    source_id TEXT NOT NULL DEFAULT 'local' REFERENCES sources(id),
-    external_id TEXT,
-    title TEXT,
-    source_path TEXT NOT NULL,
-    started_at INTEGER,
-    ended_at INTEGER,
-    approx_tokens INTEGER,
-    metadata_json TEXT,
-    origin_host TEXT,
-    UNIQUE(source_id, agent_id, external_id)
-);
-
--- Copy data from old table (all existing conversations get source_id='local')
-INSERT INTO conversations_new (id, agent_id, workspace_id, source_id, external_id, title,
-                               source_path, started_at, ended_at, approx_tokens, metadata_json, origin_host)
-SELECT id, agent_id, workspace_id, 'local', external_id, title,
-       source_path, started_at, ended_at, approx_tokens, metadata_json, NULL
-FROM conversations;
-
--- Drop old table and rename new
-DROP TABLE conversations;
-ALTER TABLE conversations_new RENAME TO conversations;
-
--- Recreate indexes
-CREATE INDEX IF NOT EXISTS idx_conversations_agent_started ON conversations(agent_id, started_at DESC);
-CREATE INDEX IF NOT EXISTS idx_conversations_source_id ON conversations(source_id);
-";
-
-#[cfg(test)]
-const MIGRATION_V6: &str = r"
--- Optimize lookup by source_path (used by TUI detail view)
-CREATE INDEX IF NOT EXISTS idx_conversations_source_path ON conversations(source_path);
-";
-
-#[cfg(test)]
-const MIGRATION_V7: &str = r"
--- Add binary columns for MessagePack serialization (Opt 3.1)
--- Binary format is 50-70% smaller than JSON and faster to parse
-ALTER TABLE conversations ADD COLUMN metadata_bin BLOB;
-ALTER TABLE messages ADD COLUMN extra_bin BLOB;
-";
-
-#[cfg(test)]
-const MIGRATION_V8: &str = r"
--- Opt 3.2: Daily stats materialized table for O(1) time-range histograms
--- Provides fast aggregated queries for stats/dashboard without full table scans
-
-CREATE TABLE IF NOT EXISTS daily_stats (
-    day_id INTEGER NOT NULL,              -- Days since 2020-01-01 (Unix epoch + offset)
-    agent_slug TEXT NOT NULL,             -- 'all' for totals, or specific agent slug
-    source_id TEXT NOT NULL DEFAULT 'all', -- 'all' for totals, or specific source
-    session_count INTEGER NOT NULL DEFAULT 0,
-    message_count INTEGER NOT NULL DEFAULT 0,
-    total_chars INTEGER NOT NULL DEFAULT 0,
-    last_updated INTEGER NOT NULL,
-    PRIMARY KEY (day_id, agent_slug, source_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_daily_stats_agent ON daily_stats(agent_slug, day_id);
-CREATE INDEX IF NOT EXISTS idx_daily_stats_source ON daily_stats(source_id, day_id);
-";
-
-#[cfg(test)]
-const MIGRATION_V9: &str = r"
--- Background embedding jobs tracking table
-CREATE TABLE IF NOT EXISTS embedding_jobs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    db_path TEXT NOT NULL,
-    model_id TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending',
-    total_docs INTEGER NOT NULL DEFAULT 0,
-    completed_docs INTEGER NOT NULL DEFAULT 0,
-    error_message TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    started_at TEXT,
-    completed_at TEXT
-);
-
--- Only one pending or running job per (db_path, model_id) at a time.
--- Multiple completed/failed/cancelled jobs are allowed for history.
-CREATE UNIQUE INDEX IF NOT EXISTS idx_embedding_jobs_active
-ON embedding_jobs(db_path, model_id)
-WHERE status IN ('pending', 'running');
-";
-
-#[cfg(test)]
-const MIGRATION_V10: &str = r"
--- Token analytics: per-message token usage ledger
-CREATE TABLE IF NOT EXISTS token_usage (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
-    conversation_id INTEGER NOT NULL,
-    agent_id INTEGER NOT NULL,
-    workspace_id INTEGER,
-    source_id TEXT NOT NULL DEFAULT 'local',
-
-    -- Timing
-    timestamp_ms INTEGER NOT NULL,
-    day_id INTEGER NOT NULL,
-
-    -- Model identification
-    model_name TEXT,
-    model_family TEXT,
-    model_tier TEXT,
-    service_tier TEXT,
-    provider TEXT,
-
-    -- Token counts (nullable — not all agents provide all fields)
-    input_tokens INTEGER,
-    output_tokens INTEGER,
-    cache_read_tokens INTEGER,
-    cache_creation_tokens INTEGER,
-    thinking_tokens INTEGER,
-    total_tokens INTEGER,
-
-    -- Cost estimation
-    estimated_cost_usd REAL,
-
-    -- Message context
-    role TEXT NOT NULL,
-    content_chars INTEGER NOT NULL,
-    has_tool_calls INTEGER NOT NULL DEFAULT 0,
-    tool_call_count INTEGER NOT NULL DEFAULT 0,
-
-    -- Data quality
-    data_source TEXT NOT NULL DEFAULT 'api',
-
-    UNIQUE(message_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_token_usage_day ON token_usage(day_id, agent_id);
-CREATE INDEX IF NOT EXISTS idx_token_usage_conv ON token_usage(conversation_id);
-CREATE INDEX IF NOT EXISTS idx_token_usage_model ON token_usage(model_family, day_id);
-CREATE INDEX IF NOT EXISTS idx_token_usage_workspace ON token_usage(workspace_id, day_id);
-CREATE INDEX IF NOT EXISTS idx_token_usage_timestamp ON token_usage(timestamp_ms);
-
--- Token analytics: pre-aggregated daily rollups
-CREATE TABLE IF NOT EXISTS token_daily_stats (
-    day_id INTEGER NOT NULL,
-    agent_slug TEXT NOT NULL,
-    source_id TEXT NOT NULL DEFAULT 'all',
-    model_family TEXT NOT NULL DEFAULT 'all',
-
-    api_call_count INTEGER NOT NULL DEFAULT 0,
-    user_message_count INTEGER NOT NULL DEFAULT 0,
-    assistant_message_count INTEGER NOT NULL DEFAULT 0,
-    tool_message_count INTEGER NOT NULL DEFAULT 0,
-
-    total_input_tokens INTEGER NOT NULL DEFAULT 0,
-    total_output_tokens INTEGER NOT NULL DEFAULT 0,
-    total_cache_read_tokens INTEGER NOT NULL DEFAULT 0,
-    total_cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
-    total_thinking_tokens INTEGER NOT NULL DEFAULT 0,
-    grand_total_tokens INTEGER NOT NULL DEFAULT 0,
-
-    total_content_chars INTEGER NOT NULL DEFAULT 0,
-    total_tool_calls INTEGER NOT NULL DEFAULT 0,
-
-    estimated_cost_usd REAL NOT NULL DEFAULT 0.0,
-
-    session_count INTEGER NOT NULL DEFAULT 0,
-
-    last_updated INTEGER NOT NULL,
-
-    PRIMARY KEY (day_id, agent_slug, source_id, model_family)
-);
-
-CREATE INDEX IF NOT EXISTS idx_token_daily_stats_agent ON token_daily_stats(agent_slug, day_id);
-CREATE INDEX IF NOT EXISTS idx_token_daily_stats_model ON token_daily_stats(model_family, day_id);
-
--- Model pricing lookup table
-CREATE TABLE IF NOT EXISTS model_pricing (
-    model_pattern TEXT NOT NULL,
-    provider TEXT NOT NULL,
-    input_cost_per_mtok REAL NOT NULL,
-    output_cost_per_mtok REAL NOT NULL,
-    cache_read_cost_per_mtok REAL,
-    cache_creation_cost_per_mtok REAL,
-    effective_date TEXT NOT NULL,
-    PRIMARY KEY (model_pattern, effective_date)
-);
-
--- Seed with current pricing (as of 2026-02)
-INSERT OR IGNORE INTO model_pricing VALUES
-    ('claude-opus-4%', 'anthropic', 15.0, 75.0, 1.5, 18.75, '2025-10-01'),
-    ('claude-sonnet-4%', 'anthropic', 3.0, 15.0, 0.3, 3.75, '2025-10-01'),
-    ('claude-haiku-4%', 'anthropic', 0.80, 4.0, 0.08, 1.0, '2025-10-01'),
-    ('gpt-4o%', 'openai', 2.50, 10.0, NULL, NULL, '2025-01-01'),
-    ('gpt-4-turbo%', 'openai', 10.0, 30.0, NULL, NULL, '2024-04-01'),
-    ('gpt-4.1%', 'openai', 2.0, 8.0, NULL, NULL, '2025-04-01'),
-    ('o3%', 'openai', 2.0, 8.0, NULL, NULL, '2025-04-01'),
-    ('o4-mini%', 'openai', 1.10, 4.40, NULL, NULL, '2025-04-01'),
-    ('gemini-2%flash%', 'google', 0.075, 0.30, NULL, NULL, '2025-01-01'),
-    ('gemini-2%pro%', 'google', 1.25, 10.0, NULL, NULL, '2025-01-01');
-
--- Extend conversations table with token summary columns
-ALTER TABLE conversations ADD COLUMN total_input_tokens INTEGER;
-ALTER TABLE conversations ADD COLUMN total_output_tokens INTEGER;
-ALTER TABLE conversations ADD COLUMN total_cache_read_tokens INTEGER;
-ALTER TABLE conversations ADD COLUMN total_cache_creation_tokens INTEGER;
-ALTER TABLE conversations ADD COLUMN grand_total_tokens INTEGER;
-ALTER TABLE conversations ADD COLUMN estimated_cost_usd REAL;
-ALTER TABLE conversations ADD COLUMN primary_model TEXT;
-ALTER TABLE conversations ADD COLUMN api_call_count INTEGER;
-ALTER TABLE conversations ADD COLUMN tool_call_count INTEGER;
-ALTER TABLE conversations ADD COLUMN user_message_count INTEGER;
-ALTER TABLE conversations ADD COLUMN assistant_message_count INTEGER;
-";
-
-const MIGRATION_V14: &str = r"
--- Switch FTS5 from internal-content to contentless mode (CASS #163).
--- Drop the old V13 internal-content fts_messages first so that
--- sqlite_schema does not contain two conflicting CREATE VIRTUAL TABLE
--- entries, which makes the database completely unreadable.
--- The current contentless table is recreated lazily after open() only when the
--- frankensqlite FTS consistency check finds it missing or malformed.
-DROP TABLE IF EXISTS fts_messages;
-";
-
-const MIGRATION_V15_TAIL_STATE_TABLE: &str = r"
-CREATE TABLE IF NOT EXISTS conversation_tail_state (
-    -- Deliberately no FOREIGN KEY: this hot row is maintained by insert/append
-    -- paths, and FK metadata keeps frankensqlite off the direct rowid update path.
-    conversation_id INTEGER PRIMARY KEY,
-    ended_at INTEGER,
-    last_message_idx INTEGER,
-    last_message_created_at INTEGER
-);
-";
-
-const MIGRATION_V16: &str = r"
--- UNIQUE(conversation_id, idx) already creates sqlite_autoindex_messages_1,
--- which covers the same lookup/order key as idx_messages_conv_idx. Keeping both
--- doubles message insert index maintenance on the hot indexing path.
-DROP INDEX IF EXISTS idx_messages_conv_idx;
-";
-
-const MIGRATION_V17: &str = r"
--- Drop the global messages(created_at) secondary index from the ingest hot
--- path. Search/time filters are served by the derived search layer and
--- conversation/analytics indexes, while this index is maintained on every
--- message insert.
-DROP INDEX IF EXISTS idx_messages_created;
-";
-
-const MIGRATION_V18: &str = r"
--- Move append-tail state out of the wide, indexed conversations row. The hot
--- append path updates this cache for every appended conversation; keeping it in
--- a tiny rowid table avoids rewriting the large conversation record.
-CREATE TABLE IF NOT EXISTS conversation_tail_state (
-    -- Deliberately no FOREIGN KEY: this hot row is maintained by insert/append
-    -- paths, and FK metadata keeps frankensqlite off the direct rowid update path.
-    conversation_id INTEGER PRIMARY KEY,
-    ended_at INTEGER,
-    last_message_idx INTEGER,
-    last_message_created_at INTEGER
-);
-
-INSERT OR REPLACE INTO conversation_tail_state (
-    conversation_id, ended_at, last_message_idx, last_message_created_at
-)
-SELECT id, ended_at, last_message_idx, last_message_created_at
-FROM conversations
-WHERE ended_at IS NOT NULL
-   OR last_message_idx IS NOT NULL
-   OR last_message_created_at IS NOT NULL;
-";
-
-const MIGRATION_V19: &str = r"
--- Materialize external conversation provenance into one compact lookup key.
--- This keeps the hot append/new-conversation probe on a single primary-key
--- lookup instead of a composite conversations-table predicate.
-CREATE TABLE IF NOT EXISTS conversation_external_lookup (
-    lookup_key TEXT PRIMARY KEY,
-    conversation_id INTEGER NOT NULL
-);
-
-INSERT OR REPLACE INTO conversation_external_lookup (lookup_key, conversation_id)
-SELECT
-    CAST(length(source_id) AS TEXT) || ':' || source_id || ':' ||
-    CAST(agent_id AS TEXT) || ':' ||
-    CAST(length(external_id) AS TEXT) || ':' || external_id,
-    id
-FROM conversations
-WHERE external_id IS NOT NULL;
-";
-
-const MIGRATION_V20: &str = r"
--- Fuse external conversation lookup with append-tail state. Append-heavy
--- workloads can resolve both the conversation id and tail plan from one
--- primary-key probe.
-CREATE TABLE IF NOT EXISTS conversation_external_tail_lookup (
-    lookup_key TEXT PRIMARY KEY,
-    conversation_id INTEGER NOT NULL,
-    ended_at INTEGER,
-    last_message_idx INTEGER,
-    last_message_created_at INTEGER
-);
-
-INSERT OR REPLACE INTO conversation_external_tail_lookup (
-    lookup_key,
-    conversation_id,
-    ended_at,
-    last_message_idx,
-    last_message_created_at
-)
-SELECT
-    CAST(length(c.source_id) AS TEXT) || ':' || c.source_id || ':' ||
-    CAST(c.agent_id AS TEXT) || ':' ||
-    CAST(length(c.external_id) AS TEXT) || ':' || c.external_id,
-    c.id,
-    (SELECT ts.ended_at
-     FROM conversation_tail_state ts
-     WHERE ts.conversation_id = c.id),
-    (SELECT ts.last_message_idx
-     FROM conversation_tail_state ts
-     WHERE ts.conversation_id = c.id),
-    (SELECT ts.last_message_created_at
-     FROM conversation_tail_state ts
-     WHERE ts.conversation_id = c.id)
-FROM conversations c
-WHERE c.external_id IS NOT NULL;
-";
-
-const MIGRATION_V21: &str = r"
--- W1 operation commit receipt（上位契约 §20.1(b) 的 D1）。
---
--- 记的是「一次 DB 事务是否已提交」这个事实，崩溃重启后据 idempotency_key
--- 判幂等，避免同一次 relink / restore 被重复施加。
---
--- ⚠ 与基线的 DoctorAssetClass::OperationReceipt（其 asset_class 字符串值）
--- 语义完全不同：那个是 doctor 的**文件资产分类**，指向 <data_dir>/doctor/receipts/
--- 目录下的文件；本表是**DB 事务的提交事实**。两者不得混名，故本表取名
--- operation_commit_receipt（区分点是 commit），且字符串上不含 operation_receipt
--- 子串，基线那批的 grep 普查不会被本表污染。
-CREATE TABLE IF NOT EXISTS operation_commit_receipt (
-    id INTEGER PRIMARY KEY,
-    idempotency_key TEXT NOT NULL UNIQUE,
-    operation TEXT NOT NULL,
-    state TEXT NOT NULL,
-    snapshot_root TEXT,
-    committed_at_ms INTEGER NOT NULL,
-    detail TEXT
-);
-";
+/// w1b Task B8: single source of truth for "what schema version is this
+/// database at" now lives in `storage::schema` (the rusqlite engine's
+/// `PRAGMA user_version` authority) -- re-exported here so the handful of
+/// production call sites that already named `storage::sqlite::
+/// CURRENT_SCHEMA_VERSION` (`phase3_restore.rs`'s db-identity recording,
+/// `indexer/mod.rs`'s fast-path skip check) keep working unchanged, with the
+/// value naturally following the new engine's numbering instead of the
+/// retired frankensqlite-era incremental engine's (which topped out at 21).
+pub use crate::storage::schema::CURRENT_SCHEMA_VERSION;
 
 /// Row from the embedding_jobs table.
 #[derive(Debug, Clone)]
@@ -4011,46 +3086,36 @@ impl FrankenStorage {
     /// This initializes canonical schema state only. Derived fallback search
     /// structures like the in-database `fts_messages` table are repaired
     /// separately so ordinary opens never block on heavyweight maintenance.
+    /// w1b Task B8 (d16 follow-up): every open -- fresh file or a
+    /// pre-existing database -- routes through `schema::ensure`, which
+    /// already covers both cases per its own contract (empty database ->
+    /// build; `0 < user_version <= CURRENT_SCHEMA_VERSION` -> no-op verify;
+    /// `user_version == 0` and non-empty -> reject with a rebuild-not-
+    /// convert message). That last branch is the intended behavior change
+    /// this task ships: a pre-B8 (frankensqlite-era) database has
+    /// `user_version == 0` and is non-empty, so it is now rejected outright
+    /// rather than incrementally migrated in place -- Stage C's re-ingest
+    /// path is the supported route back for real user data, per spec's
+    /// "rebuild, not convert" contract (§3.5). The old incremental engine
+    /// (`run_migrations`/`transition_from_meta_version`/
+    /// `sync_meta_schema_version`/franken migration runner) and the Stage B
+    /// transition shim it required are retired together with the franken
+    /// backend in this same task.
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("creating db directory {}", parent.display()))?;
         }
 
-        // w1b Task B7 (control-plane ruling on plan delta d16's follow-up):
-        // captured before opening -- `FrankenConnection::open_writable`
-        // creates an empty file for a nonexistent path, so this has to be
-        // read first or every open would look "pre-existing". Deliberately
-        // narrow: only `SqliteStorage::open()`'s literal "database file does
-        // not exist yet" case (plan's own wording) routes through the new
-        // `schema::ensure` path below; `run_migrations()` itself is
-        // untouched, so every other caller -- including test helpers like
-        // `franken_storage_in_memory()` that call `run_migrations()`
-        // directly, and tests that hand-rewrite `_schema_migrations`/`meta`
-        // on an already-open storage to simulate a historical version state
-        // -- keeps exercising the pre-existing incremental engine exactly
-        // as before. An earlier attempt gated inside `run_migrations()`
-        // itself instead and broke 55 tests for exactly this reason: once
-        // any storage had user_version>=1 from a fresh build, no amount of
-        // hand-rewriting the legacy bookkeeping could route it back to the
-        // old engine those tests meant to exercise.
-        let is_new_database_file = !path.exists();
-
         let path_str = path.to_string_lossy().to_string();
         let _doctor_guard =
             acquire_doctor_mutation_db_open_guard(path, DOCTOR_MUTATION_DB_OPEN_LOCK_TIMEOUT)?;
         let conn = FrankenConnection::open_writable(std::path::Path::new(&(&path_str)), crate::storage::api::Profile::Production)
-            .with_context(|| format!("opening frankensqlite db at {}", path.display()))?;
+            .with_context(|| format!("opening sqlite db at {}", path.display()))?;
         let storage = Self::new(conn, path.to_path_buf());
         storage.apply_open_stage_busy_timeout();
-        if is_new_database_file {
-            crate::storage::schema::ensure(&storage.conn).with_context(|| {
-                format!("building fresh schema for new database at {}", path.display())
-            })?;
-            seed_legacy_schema_version_mirror_for_new_engine_db(&storage.conn)?;
-        } else {
-            storage.run_migrations()?;
-        }
+        crate::storage::schema::ensure(&storage.conn)
+            .with_context(|| format!("ensuring schema for database at {}", path.display()))?;
         storage.repair_missing_current_schema_objects()?;
         storage.apply_config()?;
         storage.set_fts_messages_present_cache(true);
@@ -4467,62 +3532,6 @@ impl FrankenStorage {
         Ok(())
     }
 
-    /// Run all schema migrations, handling transition from meta table versioning.
-    ///
-    /// The existing `SqliteStorage` tracks schema version in a `meta` table entry.
-    /// The new `MigrationRunner` uses a `_schema_migrations` table. This method:
-    /// 1. Transitions existing databases from meta table → `_schema_migrations`
-    /// 2. Runs pending migrations via `MigrationRunner`
-    /// 3. Syncs `meta.schema_version` for backward compatibility
-    ///
-    /// # Fresh vs existing databases
-    ///
-    /// Fresh databases use a single combined migration (`MIGRATION_FRESH_SCHEMA`)
-    /// that creates the complete V13 schema directly. This avoids the incremental
-    /// V5 migration which uses `DROP TABLE` — an operation that triggers a known
-    /// frankensqlite autoindex limitation.
-    ///
-    /// Existing databases (transitioned from SqliteStorage) are typically at
-    /// V13 or newer already; additive post-V13 migrations are applied normally.
-    pub fn run_migrations(&self) -> Result<()> {
-        transition_from_meta_version(&self.conn)?;
-
-        let base_result = crate::storage::api::run_franken_migrations(
-            &self.conn,
-            &build_cass_migrations_before_tail_cache(),
-        )
-        .with_context(|| "running base schema migrations")?;
-
-        let mut applied = base_result.applied;
-        if apply_conversation_tail_state_cache_migration(&self.conn)
-            .with_context(|| "running conversation tail-state cache migration")?
-        {
-            applied.push(15);
-        }
-
-        let post_result = crate::storage::api::run_franken_migrations(
-            &self.conn,
-            &build_cass_migrations_after_tail_cache(),
-        )
-        .with_context(|| "running post-tail-cache schema migrations")?;
-        applied.extend(post_result.applied);
-
-        let current = self.schema_version()?;
-        if !applied.is_empty() {
-            info!(
-                applied = ?applied,
-                current,
-                was_fresh = base_result.was_fresh,
-                "frankensqlite schema migrations applied"
-            );
-        }
-
-        // Keep meta.schema_version in sync for backward compatibility.
-        self.sync_meta_schema_version(current)?;
-
-        Ok(())
-    }
-
     /// Some historical canonical rebuild paths produced databases whose
     /// version markers claim the current schema while post-V10 analytics
     /// tables were never materialized. Detect that drift and backfill the
@@ -4693,55 +3702,12 @@ impl FrankenStorage {
         Ok(report)
     }
 
-    /// Return the current schema version from `_schema_migrations`.
+    /// w1b Task B8: reads `PRAGMA user_version` (the rusqlite engine's sole
+    /// version authority, `storage::schema::ensure`'s contract) instead of
+    /// the retired `_schema_migrations` table.
     pub fn schema_version(&self) -> Result<i64> {
-        let rows = self
-            .conn
-            .query_all_map("SELECT MAX(version) FROM _schema_migrations;", &[], |row| {
-                row.get_value(0)
-            })
-            .with_context(|| "reading schema version from _schema_migrations")?;
-
-        if let Some(value) = rows.into_iter().next()
-            && let Ok(v) = <Option<i64> as crate::storage::api::FromValue>::from_value(value)
-        {
-            return Ok(v.unwrap_or(0));
-        }
-        Ok(0)
-    }
-
-    /// Keep `meta.schema_version` in sync for backward compatibility with `SqliteStorage`.
-    fn sync_meta_schema_version(&self, version: i64) -> Result<()> {
-        // The meta table is created by V1 migration. If it doesn't exist yet,
-        // there's nothing to sync.
-        if self
-            .conn
-            .query_all_map("SELECT key FROM meta LIMIT 1;", &[], |_row| Ok(()))
-            .is_err()
-        {
-            return Ok(());
-        }
-
-        // Only write if the version needs updating to avoid write lock contention
-        if let Ok(rows) = self.conn.query_all_map(
-            "SELECT value FROM meta WHERE key = 'schema_version';",
-            &[],
-            |row| row.get_value(0),
-        ) && let Some(value) = rows.into_iter().next()
-            && let Ok(val) = <String as crate::storage::api::FromValue>::from_value(value)
-            && val == version.to_string()
-        {
-            return Ok(()); // Already up to date
-        }
-
-        self.conn
-            .execute(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?1);",
-                &[ParamValue::from(version.to_string())],
-            )
-            .with_context(|| "syncing meta schema_version")?;
-
-        Ok(())
+        crate::storage::schema::read_user_version(&self.conn)
+            .with_context(|| "reading schema version via PRAGMA user_version")
     }
 
     /// Resolve the database file path for this connection.
@@ -4779,207 +3745,6 @@ impl FrankenStorage {
             .store(timeout_ms, Ordering::Relaxed);
     }
 
-    /// Open database with migration, backing up if schema is incompatible.
-    pub fn open_or_rebuild(path: &Path) -> std::result::Result<Self, MigrationError> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        if path.exists() {
-            let check_result = check_schema_compatibility(path);
-            match check_result {
-                Ok(SchemaCheck::Compatible) | Ok(SchemaCheck::NeedsMigration) => {
-                    // Continue with normal open
-                }
-                Ok(SchemaCheck::NeedsRebuild(reason)) => {
-                    let backup_path = create_backup(path)?;
-                    cleanup_old_backups(path, MAX_BACKUPS)?;
-                    remove_database_files(path)?;
-                    return Err(MigrationError::RebuildRequired {
-                        reason,
-                        backup_path,
-                    });
-                }
-                Err(err) if schema_check_error_requires_rebuild(&err) => {
-                    let backup_path = create_backup(path)?;
-                    cleanup_old_backups(path, MAX_BACKUPS)?;
-                    remove_database_files(path)?;
-                    return Err(MigrationError::RebuildRequired {
-                        reason: format!("Database appears corrupted: {err}"),
-                        backup_path,
-                    });
-                }
-                Err(err) => return Err(MigrationError::Database(err)),
-            }
-        }
-
-        let storage = Self::open(path).map_err(|e| MigrationError::Other(e.to_string()))?;
-        Ok(storage)
-    }
-}
-
-// -------------------------------------------------------------------------
-// Frankensqlite migration helpers
-// -------------------------------------------------------------------------
-
-/// Build the `MigrationRunner` for the frankensqlite migration path.
-///
-/// Uses a single combined migration (version 13) that creates the complete
-/// final schema in one step. This avoids the V5 `DROP TABLE conversations`
-/// operation which triggers a known frankensqlite limitation: autoindex entries
-/// in sqlite_master are not properly cleaned up during DROP TABLE, causing
-/// "sqlite_master entry not found" errors.
-///
-/// For existing databases transitioned from SqliteStorage, the transition
-/// function backfills `_schema_migrations`; post-V13 additive migrations then
-/// run normally.
-fn build_cass_migrations_before_tail_cache() -> Vec<crate::storage::api::FrankenMigration> {
-    vec![
-        crate::storage::api::FrankenMigration {
-            version: 13,
-            name: "full_schema_v13",
-            up_sql: MIGRATION_FRESH_SCHEMA,
-        },
-        crate::storage::api::FrankenMigration {
-            version: 14,
-            name: "fts_contentless",
-            up_sql: MIGRATION_V14,
-        },
-    ]
-}
-
-fn build_cass_migrations_after_tail_cache() -> Vec<crate::storage::api::FrankenMigration> {
-    vec![
-        crate::storage::api::FrankenMigration {
-            version: 16,
-            name: "drop_redundant_message_conv_idx",
-            up_sql: MIGRATION_V16,
-        },
-        crate::storage::api::FrankenMigration {
-            version: 17,
-            name: "drop_message_created_idx",
-            up_sql: MIGRATION_V17,
-        },
-        crate::storage::api::FrankenMigration {
-            version: 18,
-            name: "conversation_tail_state_hot_table",
-            up_sql: MIGRATION_V18,
-        },
-        crate::storage::api::FrankenMigration {
-            version: 19,
-            name: "conversation_external_lookup",
-            up_sql: MIGRATION_V19,
-        },
-        crate::storage::api::FrankenMigration {
-            version: 20,
-            name: "conversation_external_tail_lookup",
-            up_sql: MIGRATION_V20,
-        },
-        crate::storage::api::FrankenMigration {
-            version: 21,
-            name: "operation_commit_receipt",
-            up_sql: MIGRATION_V21,
-        },
-    ]
-}
-
-/// STAGE B TRANSITION SHIM — retired at Task B8 together with the franken
-/// incremental migration engine it mirrors (grep for this function's name
-/// should find zero call sites once B8 lands).
-///
-/// `schema::ensure` (Task B7) only knows `PRAGMA user_version`; it has no
-/// idea `_schema_migrations`/`meta.schema_version` exist. But
-/// `SqliteStorage::schema_version()` and other pre-existing readers still
-/// read those tables, and both keep being exercised throughout Stage B
-/// until B8 deletes the franken backend they were built for. This backfills
-/// exactly the rows a *fresh* build through the old incremental path would
-/// have written -- built from the same [`build_cass_migrations_before_tail_cache`]
-/// / [`build_cass_migrations_after_tail_cache`] definitions that path itself
-/// runs from (not a hand-typed duplicate list: the fidelity requirement is
-/// that this can never silently drift from what the old path actually
-/// produces) plus the one migration those two lists don't cover (version
-/// 15, applied via a dedicated function -- same version/name pair as
-/// `apply_conversation_tail_state_cache_migration`'s own insert). Only ever
-/// called once, right after `schema::ensure` builds a brand-new database
-/// (see `SqliteStorage::open`), but `INSERT OR IGNORE`/`OR REPLACE` still
-/// make it idempotent in case that call is ever retried.
-fn seed_legacy_schema_version_mirror_for_new_engine_db(conn: &FrankenConnection) -> Result<()> {
-    let mut rows: Vec<(i64, &'static str)> = build_cass_migrations_before_tail_cache()
-        .iter()
-        .map(|m| (m.version, m.name))
-        .collect();
-    rows.push((15, "conversation_tail_state_cache"));
-    rows.extend(build_cass_migrations_after_tail_cache().iter().map(|m| (m.version, m.name)));
-
-    for (version, name) in rows {
-        conn.execute(
-            "INSERT OR IGNORE INTO _schema_migrations(version, name) VALUES (?1, ?2);",
-            fparams![version, name],
-        )
-        .with_context(|| format!("seeding legacy _schema_migrations row for version {version}"))?;
-    }
-    conn.execute(
-        "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?1);",
-        fparams![CURRENT_SCHEMA_VERSION.to_string()],
-    )
-    .with_context(|| "seeding legacy meta.schema_version mirror")?;
-    Ok(())
-}
-
-fn schema_migration_is_applied(conn: &FrankenConnection, version: i64) -> Result<bool> {
-    let rows = conn
-        .query_all_map(
-            "SELECT 1 FROM _schema_migrations WHERE version = ?1 LIMIT 1;",
-            &[SqliteValue::from(version)],
-            |_row| Ok(()),
-        )
-        .with_context(|| format!("checking schema migration version {version}"))?;
-    Ok(!rows.is_empty())
-}
-
-fn apply_conversation_tail_state_cache_migration(conn: &FrankenConnection) -> Result<bool> {
-    conn.execute("BEGIN IMMEDIATE;", &[])
-        .with_context(|| "starting v15 conversation tail-state migration transaction")?;
-
-    let result = (|| -> Result<bool> {
-        if schema_migration_is_applied(conn, 15)? {
-            conn.execute("COMMIT;", &[])
-                .with_context(|| "committing already-applied v15 migration transaction")?;
-            return Ok(false);
-        }
-
-        let started = Instant::now();
-        let conversation_columns = franken_table_column_names(conn, "conversations")
-            .with_context(|| "inspecting conversations columns before v15 migration")?;
-        if !conversation_columns.contains("last_message_idx") {
-            conn.execute("ALTER TABLE conversations ADD COLUMN last_message_idx INTEGER;", &[])
-                .with_context(|| "adding v15 conversations.last_message_idx column")?;
-        }
-        if !conversation_columns.contains("last_message_created_at") {
-            conn.execute("ALTER TABLE conversations ADD COLUMN last_message_created_at INTEGER;", &[])
-                .with_context(|| "adding v15 conversations.last_message_created_at column")?;
-        }
-        conn.execute_batch(MIGRATION_V15_TAIL_STATE_TABLE)
-            .with_context(|| "applying v15 conversation tail-state table schema")?;
-        conn.execute(
-            "INSERT INTO _schema_migrations (version, name) VALUES (?1, ?2);",
-            fparams![15_i64, "conversation_tail_state_cache"],
-        )
-        .with_context(|| "recording v15 conversation tail-state migration")?;
-        conn.execute("COMMIT;", &[])
-            .with_context(|| "committing v15 conversation tail-state migration")?;
-        info!(
-            elapsed_ms = started.elapsed().as_millis(),
-            "applied v15 conversation tail-state cache migration"
-        );
-        Ok(true)
-    })();
-
-    if result.is_err() {
-        let _ = conn.execute("ROLLBACK;", &[]);
-    }
-
-    result
 }
 
 fn franken_table_column_names(
@@ -5003,376 +3768,6 @@ fn franken_table_column_names(
     .with_context(|| format!("reading PRAGMA table_info({table_name})"))
     .map(|columns| columns.into_iter().collect())
 }
-
-/// Combined V13 schema for fresh databases.
-///
-/// Creates the complete final schema in a single migration, avoiding the
-/// incremental V5 `DROP TABLE conversations` which triggers a frankensqlite
-/// autoindex limitation. All columns from V1-V13 are included in their
-/// respective CREATE TABLE statements.
-///
-/// Table creation order respects foreign key references:
-/// sources → agents/workspaces → conversations → messages → snippets, etc.
-const MIGRATION_FRESH_SCHEMA: &str = r"
--- Core tables (V1)
-CREATE TABLE IF NOT EXISTS meta (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS agents (
-    id INTEGER PRIMARY KEY,
-    slug TEXT NOT NULL UNIQUE,
-    name TEXT NOT NULL,
-    version TEXT,
-    kind TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS workspaces (
-    id INTEGER PRIMARY KEY,
-    path TEXT NOT NULL UNIQUE,
-    display_name TEXT
-);
-
--- Sources (V4)
-CREATE TABLE IF NOT EXISTS sources (
-    id TEXT PRIMARY KEY,
-    kind TEXT NOT NULL,
-    host_label TEXT,
-    machine_id TEXT,
-    platform TEXT,
-    config_json TEXT,
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
-);
-
-INSERT OR IGNORE INTO sources (id, kind, host_label, created_at, updated_at)
-VALUES ('local', 'local', NULL, strftime('%s','now')*1000, strftime('%s','now')*1000);
-
--- Conversations: V1 base + V5 provenance + V7 metadata_bin + V10 token summary
-CREATE TABLE IF NOT EXISTS conversations (
-    id INTEGER PRIMARY KEY,
-    agent_id INTEGER NOT NULL REFERENCES agents(id),
-    workspace_id INTEGER REFERENCES workspaces(id),
-    source_id TEXT NOT NULL DEFAULT 'local' REFERENCES sources(id),
-    external_id TEXT,
-    title TEXT,
-    source_path TEXT NOT NULL,
-    started_at INTEGER,
-    ended_at INTEGER,
-    approx_tokens INTEGER,
-    metadata_json TEXT,
-    origin_host TEXT,
-    metadata_bin BLOB,
-    total_input_tokens INTEGER,
-    total_output_tokens INTEGER,
-    total_cache_read_tokens INTEGER,
-    total_cache_creation_tokens INTEGER,
-    grand_total_tokens INTEGER,
-    estimated_cost_usd REAL,
-    primary_model TEXT,
-    api_call_count INTEGER,
-    tool_call_count INTEGER,
-    user_message_count INTEGER,
-    assistant_message_count INTEGER,
-    -- V15 columns are included in the fresh schema so fresh DB creation does
-    -- not need ALTER TABLE on conversations. That ALTER path can duplicate
-    -- provenance autoindex state in frankensqlite when the named unique
-    -- provenance index already exists.
-    last_message_idx INTEGER,
-    last_message_created_at INTEGER
-);
-
--- Named unique index avoids autoindex issues if table is ever recreated
-CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_provenance
-    ON conversations(source_id, agent_id, external_id);
-
--- Messages: V1 base + V7 extra_bin
-CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY,
-    conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-    idx INTEGER NOT NULL,
-    role TEXT NOT NULL,
-    author TEXT,
-    created_at INTEGER,
-    content TEXT NOT NULL,
-    extra_json TEXT,
-    extra_bin BLOB,
-    UNIQUE(conversation_id, idx)
-);
-
-CREATE TABLE IF NOT EXISTS snippets (
-    id INTEGER PRIMARY KEY,
-    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
-    file_path TEXT,
-    start_line INTEGER,
-    end_line INTEGER,
-    language TEXT,
-    snippet_text TEXT
-);
-
-CREATE TABLE IF NOT EXISTS tags (
-    id INTEGER PRIMARY KEY,
-    name TEXT NOT NULL UNIQUE
-);
-
-CREATE TABLE IF NOT EXISTS conversation_tags (
-    conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-    tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
-    PRIMARY KEY (conversation_id, tag_id)
-);
-
--- Daily stats (V8)
-CREATE TABLE IF NOT EXISTS daily_stats (
-    day_id INTEGER NOT NULL,
-    agent_slug TEXT NOT NULL,
-    source_id TEXT NOT NULL DEFAULT 'all',
-    session_count INTEGER NOT NULL DEFAULT 0,
-    message_count INTEGER NOT NULL DEFAULT 0,
-    total_chars INTEGER NOT NULL DEFAULT 0,
-    last_updated INTEGER NOT NULL,
-    PRIMARY KEY (day_id, agent_slug, source_id)
-);
-
--- Embedding jobs (V9)
-CREATE TABLE IF NOT EXISTS embedding_jobs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    db_path TEXT NOT NULL,
-    model_id TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending',
-    total_docs INTEGER NOT NULL DEFAULT 0,
-    completed_docs INTEGER NOT NULL DEFAULT 0,
-    error_message TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    started_at TEXT,
-    completed_at TEXT
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_embedding_jobs_active
-ON embedding_jobs(db_path, model_id)
-WHERE status IN ('pending', 'running');
-
--- Token usage ledger (V10)
-CREATE TABLE IF NOT EXISTS token_usage (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
-    conversation_id INTEGER NOT NULL,
-    agent_id INTEGER NOT NULL,
-    workspace_id INTEGER,
-    source_id TEXT NOT NULL DEFAULT 'local',
-    timestamp_ms INTEGER NOT NULL,
-    day_id INTEGER NOT NULL,
-    model_name TEXT,
-    model_family TEXT,
-    model_tier TEXT,
-    service_tier TEXT,
-    provider TEXT,
-    input_tokens INTEGER,
-    output_tokens INTEGER,
-    cache_read_tokens INTEGER,
-    cache_creation_tokens INTEGER,
-    thinking_tokens INTEGER,
-    total_tokens INTEGER,
-    estimated_cost_usd REAL,
-    role TEXT NOT NULL,
-    content_chars INTEGER NOT NULL,
-    has_tool_calls INTEGER NOT NULL DEFAULT 0,
-    tool_call_count INTEGER NOT NULL DEFAULT 0,
-    data_source TEXT NOT NULL DEFAULT 'api',
-    UNIQUE(message_id)
-);
-
--- Token daily stats (V10)
-CREATE TABLE IF NOT EXISTS token_daily_stats (
-    day_id INTEGER NOT NULL,
-    agent_slug TEXT NOT NULL,
-    source_id TEXT NOT NULL DEFAULT 'all',
-    model_family TEXT NOT NULL DEFAULT 'all',
-    api_call_count INTEGER NOT NULL DEFAULT 0,
-    user_message_count INTEGER NOT NULL DEFAULT 0,
-    assistant_message_count INTEGER NOT NULL DEFAULT 0,
-    tool_message_count INTEGER NOT NULL DEFAULT 0,
-    total_input_tokens INTEGER NOT NULL DEFAULT 0,
-    total_output_tokens INTEGER NOT NULL DEFAULT 0,
-    total_cache_read_tokens INTEGER NOT NULL DEFAULT 0,
-    total_cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
-    total_thinking_tokens INTEGER NOT NULL DEFAULT 0,
-    grand_total_tokens INTEGER NOT NULL DEFAULT 0,
-    total_content_chars INTEGER NOT NULL DEFAULT 0,
-    total_tool_calls INTEGER NOT NULL DEFAULT 0,
-    estimated_cost_usd REAL NOT NULL DEFAULT 0.0,
-    session_count INTEGER NOT NULL DEFAULT 0,
-    last_updated INTEGER NOT NULL,
-    PRIMARY KEY (day_id, agent_slug, source_id, model_family)
-);
-
--- Model pricing (V10)
-CREATE TABLE IF NOT EXISTS model_pricing (
-    model_pattern TEXT NOT NULL,
-    provider TEXT NOT NULL,
-    input_cost_per_mtok REAL NOT NULL,
-    output_cost_per_mtok REAL NOT NULL,
-    cache_read_cost_per_mtok REAL,
-    cache_creation_cost_per_mtok REAL,
-    effective_date TEXT NOT NULL,
-    PRIMARY KEY (model_pattern, effective_date)
-);
-
-INSERT OR IGNORE INTO model_pricing VALUES
-    ('claude-opus-4%', 'anthropic', 15.0, 75.0, 1.5, 18.75, '2025-10-01'),
-    ('claude-sonnet-4%', 'anthropic', 3.0, 15.0, 0.3, 3.75, '2025-10-01'),
-    ('claude-haiku-4%', 'anthropic', 0.80, 4.0, 0.08, 1.0, '2025-10-01'),
-    ('gpt-4o%', 'openai', 2.50, 10.0, NULL, NULL, '2025-01-01'),
-    ('gpt-4-turbo%', 'openai', 10.0, 30.0, NULL, NULL, '2024-04-01'),
-    ('gpt-4.1%', 'openai', 2.0, 8.0, NULL, NULL, '2025-04-01'),
-    ('o3%', 'openai', 2.0, 8.0, NULL, NULL, '2025-04-01'),
-    ('o4-mini%', 'openai', 1.10, 4.40, NULL, NULL, '2025-04-01'),
-    ('gemini-2%flash%', 'google', 0.075, 0.30, NULL, NULL, '2025-01-01'),
-    ('gemini-2%pro%', 'google', 1.25, 10.0, NULL, NULL, '2025-01-01');
-
--- Message metrics: V11 base + V12 model dimensions
-CREATE TABLE IF NOT EXISTS message_metrics (
-    message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
-    created_at_ms INTEGER NOT NULL,
-    hour_id INTEGER NOT NULL,
-    day_id INTEGER NOT NULL,
-    agent_slug TEXT NOT NULL,
-    workspace_id INTEGER NOT NULL DEFAULT 0,
-    source_id TEXT NOT NULL DEFAULT 'local',
-    role TEXT NOT NULL,
-    content_chars INTEGER NOT NULL,
-    content_tokens_est INTEGER NOT NULL,
-    api_input_tokens INTEGER,
-    api_output_tokens INTEGER,
-    api_cache_read_tokens INTEGER,
-    api_cache_creation_tokens INTEGER,
-    api_thinking_tokens INTEGER,
-    api_service_tier TEXT,
-    api_data_source TEXT NOT NULL DEFAULT 'estimated',
-    tool_call_count INTEGER NOT NULL DEFAULT 0,
-    has_tool_calls INTEGER NOT NULL DEFAULT 0,
-    has_plan INTEGER NOT NULL DEFAULT 0,
-    model_name TEXT,
-    model_family TEXT NOT NULL DEFAULT 'unknown',
-    model_tier TEXT NOT NULL DEFAULT 'unknown',
-    provider TEXT NOT NULL DEFAULT 'unknown'
-);
-
--- Hourly rollups: V11 base + V13 plan columns
-CREATE TABLE IF NOT EXISTS usage_hourly (
-    hour_id INTEGER NOT NULL,
-    agent_slug TEXT NOT NULL,
-    workspace_id INTEGER NOT NULL DEFAULT 0,
-    source_id TEXT NOT NULL DEFAULT 'local',
-    message_count INTEGER NOT NULL DEFAULT 0,
-    user_message_count INTEGER NOT NULL DEFAULT 0,
-    assistant_message_count INTEGER NOT NULL DEFAULT 0,
-    tool_call_count INTEGER NOT NULL DEFAULT 0,
-    plan_message_count INTEGER NOT NULL DEFAULT 0,
-    api_coverage_message_count INTEGER NOT NULL DEFAULT 0,
-    content_tokens_est_total INTEGER NOT NULL DEFAULT 0,
-    content_tokens_est_user INTEGER NOT NULL DEFAULT 0,
-    content_tokens_est_assistant INTEGER NOT NULL DEFAULT 0,
-    api_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_input_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_output_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_cache_read_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_cache_creation_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_thinking_tokens_total INTEGER NOT NULL DEFAULT 0,
-    last_updated INTEGER NOT NULL DEFAULT 0,
-    plan_content_tokens_est_total INTEGER NOT NULL DEFAULT 0,
-    plan_api_tokens_total INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (hour_id, agent_slug, workspace_id, source_id)
-);
-
--- Daily rollups: V11 base + V13 plan columns
-CREATE TABLE IF NOT EXISTS usage_daily (
-    day_id INTEGER NOT NULL,
-    agent_slug TEXT NOT NULL,
-    workspace_id INTEGER NOT NULL DEFAULT 0,
-    source_id TEXT NOT NULL DEFAULT 'local',
-    message_count INTEGER NOT NULL DEFAULT 0,
-    user_message_count INTEGER NOT NULL DEFAULT 0,
-    assistant_message_count INTEGER NOT NULL DEFAULT 0,
-    tool_call_count INTEGER NOT NULL DEFAULT 0,
-    plan_message_count INTEGER NOT NULL DEFAULT 0,
-    api_coverage_message_count INTEGER NOT NULL DEFAULT 0,
-    content_tokens_est_total INTEGER NOT NULL DEFAULT 0,
-    content_tokens_est_user INTEGER NOT NULL DEFAULT 0,
-    content_tokens_est_assistant INTEGER NOT NULL DEFAULT 0,
-    api_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_input_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_output_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_cache_read_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_cache_creation_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_thinking_tokens_total INTEGER NOT NULL DEFAULT 0,
-    last_updated INTEGER NOT NULL DEFAULT 0,
-    plan_content_tokens_est_total INTEGER NOT NULL DEFAULT 0,
-    plan_api_tokens_total INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (day_id, agent_slug, workspace_id, source_id)
-);
-
--- Model daily rollups (V12)
-CREATE TABLE IF NOT EXISTS usage_models_daily (
-    day_id INTEGER NOT NULL,
-    agent_slug TEXT NOT NULL,
-    workspace_id INTEGER NOT NULL DEFAULT 0,
-    source_id TEXT NOT NULL DEFAULT 'local',
-    model_family TEXT NOT NULL DEFAULT 'unknown',
-    model_tier TEXT NOT NULL DEFAULT 'unknown',
-    message_count INTEGER NOT NULL DEFAULT 0,
-    user_message_count INTEGER NOT NULL DEFAULT 0,
-    assistant_message_count INTEGER NOT NULL DEFAULT 0,
-    tool_call_count INTEGER NOT NULL DEFAULT 0,
-    plan_message_count INTEGER NOT NULL DEFAULT 0,
-    api_coverage_message_count INTEGER NOT NULL DEFAULT 0,
-    content_tokens_est_total INTEGER NOT NULL DEFAULT 0,
-    content_tokens_est_user INTEGER NOT NULL DEFAULT 0,
-    content_tokens_est_assistant INTEGER NOT NULL DEFAULT 0,
-    api_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_input_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_output_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_cache_read_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_cache_creation_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_thinking_tokens_total INTEGER NOT NULL DEFAULT 0,
-    last_updated INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (day_id, agent_slug, workspace_id, source_id, model_family, model_tier)
-);
-
--- All indexes
-CREATE INDEX IF NOT EXISTS idx_conversations_agent_started ON conversations(agent_id, started_at DESC);
-CREATE INDEX IF NOT EXISTS idx_conversations_source_id ON conversations(source_id);
-CREATE INDEX IF NOT EXISTS idx_conversations_source_path ON conversations(source_path);
-CREATE INDEX IF NOT EXISTS idx_daily_stats_agent ON daily_stats(agent_slug, day_id);
-CREATE INDEX IF NOT EXISTS idx_daily_stats_source ON daily_stats(source_id, day_id);
-CREATE INDEX IF NOT EXISTS idx_token_usage_day ON token_usage(day_id, agent_id);
-CREATE INDEX IF NOT EXISTS idx_token_usage_conv ON token_usage(conversation_id);
-CREATE INDEX IF NOT EXISTS idx_token_usage_model ON token_usage(model_family, day_id);
-CREATE INDEX IF NOT EXISTS idx_token_usage_workspace ON token_usage(workspace_id, day_id);
-CREATE INDEX IF NOT EXISTS idx_token_usage_timestamp ON token_usage(timestamp_ms);
-CREATE INDEX IF NOT EXISTS idx_token_daily_stats_agent ON token_daily_stats(agent_slug, day_id);
-CREATE INDEX IF NOT EXISTS idx_token_daily_stats_model ON token_daily_stats(model_family, day_id);
-CREATE INDEX IF NOT EXISTS idx_mm_hour ON message_metrics(hour_id);
-CREATE INDEX IF NOT EXISTS idx_mm_day ON message_metrics(day_id);
-CREATE INDEX IF NOT EXISTS idx_mm_agent_hour ON message_metrics(agent_slug, hour_id);
-CREATE INDEX IF NOT EXISTS idx_mm_agent_day ON message_metrics(agent_slug, day_id);
-CREATE INDEX IF NOT EXISTS idx_mm_workspace_hour ON message_metrics(workspace_id, hour_id);
-CREATE INDEX IF NOT EXISTS idx_mm_source_hour ON message_metrics(source_id, hour_id);
-CREATE INDEX IF NOT EXISTS idx_mm_model_family_day ON message_metrics(model_family, day_id);
-CREATE INDEX IF NOT EXISTS idx_mm_provider_day ON message_metrics(provider, day_id);
-CREATE INDEX IF NOT EXISTS idx_uh_agent ON usage_hourly(agent_slug, hour_id);
-CREATE INDEX IF NOT EXISTS idx_uh_workspace ON usage_hourly(workspace_id, hour_id);
-CREATE INDEX IF NOT EXISTS idx_uh_source ON usage_hourly(source_id, hour_id);
-CREATE INDEX IF NOT EXISTS idx_ud_agent ON usage_daily(agent_slug, day_id);
-CREATE INDEX IF NOT EXISTS idx_ud_workspace ON usage_daily(workspace_id, day_id);
-CREATE INDEX IF NOT EXISTS idx_ud_source ON usage_daily(source_id, day_id);
-CREATE INDEX IF NOT EXISTS idx_umd_model_day ON usage_models_daily(model_family, day_id);
-CREATE INDEX IF NOT EXISTS idx_umd_agent_day ON usage_models_daily(agent_slug, day_id);
-CREATE INDEX IF NOT EXISTS idx_umd_workspace_day ON usage_models_daily(workspace_id, day_id);
-CREATE INDEX IF NOT EXISTS idx_umd_source_day ON usage_models_daily(source_id, day_id);
-";
 
 #[derive(Clone, Copy)]
 struct SchemaRepairBatch {
@@ -5770,139 +4165,6 @@ fn current_schema_repair_batches_for_missing_tables(
     }
 
     Ok(selected_batches)
-}
-
-/// Migration name lookup for backfilling `_schema_migrations` during transition.
-const MIGRATION_NAMES: [(i64, &str); 21] = [
-    (1, "core_tables"),
-    (2, "fts_messages"),
-    (3, "fts_messages_rebuild"),
-    (4, "sources"),
-    (5, "provenance_columns"),
-    (6, "source_path_index"),
-    (7, "msgpack_columns"),
-    (8, "daily_stats"),
-    (9, "embedding_jobs"),
-    (10, "token_analytics"),
-    (11, "message_metrics"),
-    (12, "model_dimensions"),
-    (13, "plan_token_rollups"),
-    (14, "fts_contentless"),
-    (15, "conversation_tail_state_cache"),
-    (16, "drop_redundant_message_conv_idx"),
-    (17, "drop_message_created_idx"),
-    (18, "conversation_tail_state_hot_table"),
-    (19, "conversation_external_lookup"),
-    (20, "conversation_external_tail_lookup"),
-    (21, "operation_commit_receipt"),
-];
-
-/// Transitions an existing database from `meta` table schema versioning to the
-/// `_schema_migrations` table used by `MigrationRunner`.
-///
-/// The existing `SqliteStorage` tracks schema version as a string value in
-/// `meta WHERE key = 'schema_version'`. The bead spec references
-/// `PRAGMA user_version`, but the actual cass code uses the `meta` table.
-/// This function handles the real code path.
-///
-/// Behavior:
-/// - If `_schema_migrations` already exists → skip (already transitioned)
-/// - If `meta` table has `schema_version > 0` → create `_schema_migrations`
-///   and backfill entries for versions `1..=current_version`
-/// - Legacy V10-V12 databases are represented as V13 in `_schema_migrations`
-///   because frankensqlite uses one combined V13 base migration instead of
-///   replaying the old incremental V11-V13 steps.
-/// - If `meta` table missing or `schema_version = 0` with no tables → fresh DB,
-///   let `MigrationRunner` handle it
-/// - If `schema_version = 0` but tables exist → corrupted state, log warning
-fn transition_from_meta_version(conn: &FrankenConnection) -> Result<()> {
-    // Avoid sqlite_master enumeration here. Databases with FTS virtual tables
-    // can trigger frankensqlite parse-recovery on sqlite_master reads, which is
-    // enough to break the transition on otherwise-healthy legacy cass DBs.
-    if conn
-        .query_all_map("SELECT version FROM \"_schema_migrations\";", &[], |_row| Ok(()))
-        .is_ok()
-    {
-        return Ok(());
-    }
-
-    // Check if the meta table exists.
-    if conn.query_all_map("SELECT key FROM meta;", &[], |_row| Ok(())).is_err() {
-        // No meta table → fresh database, let MigrationRunner handle it.
-        return Ok(());
-    }
-
-    // Read the current schema version from the meta table.
-    let rows = conn
-        .query_all_map(
-            "SELECT value FROM meta WHERE key = 'schema_version';",
-            &[],
-            |row| row.get_value(0),
-        )
-        .with_context(|| "reading schema_version from meta")?;
-
-    let current_version: i64 = rows
-        .into_iter()
-        .next()
-        .and_then(|v| <String as crate::storage::api::FromValue>::from_value(v).ok())
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-
-    if current_version == 0 {
-        // Check if tables actually exist (corrupted state: tables present but version=0).
-        if conn
-            .query_all_map("SELECT id FROM conversations LIMIT 1;", &[], |_row| Ok(()))
-            .is_err()
-        {
-            // Truly fresh DB (meta table exists but empty/reset). Let MigrationRunner handle it.
-            return Ok(());
-        }
-
-        // Tables exist but version=0: corrupted state. Log and skip transition;
-        // MigrationRunner will fail on "table already exists" and surface the error.
-        info!("meta.schema_version=0 but tables exist; skipping transition (corrupted state)");
-        return Ok(());
-    }
-
-    // Create _schema_migrations and backfill entries for all applied versions.
-    info!(
-        current_version,
-        "transitioning schema tracking from meta table to _schema_migrations"
-    );
-
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS _schema_migrations (\
-            version INTEGER PRIMARY KEY, \
-            name TEXT NOT NULL, \
-            applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))\
-        );",
-    &[])
-    .with_context(|| "creating _schema_migrations table for transition")?;
-
-    let backfill_through_version = if (10..13).contains(&current_version) {
-        13
-    } else {
-        current_version
-    };
-
-    for &(version, name) in &MIGRATION_NAMES {
-        if version > backfill_through_version {
-            break;
-        }
-        conn.execute(
-            "INSERT INTO _schema_migrations (version, name) VALUES (?1, ?2);",
-            &[ParamValue::from(version), ParamValue::from(name)],
-        )
-        .with_context(|| format!("backfilling _schema_migrations version {version}"))?;
-    }
-
-    info!(
-        current_version,
-        backfill_through_version,
-        "schema version transition complete: backfilled legacy meta schema versions"
-    );
-
-    Ok(())
 }
 
 const REQUIRED_CURRENT_SCHEMA_TABLE_PROBES: &[(&str, &str)] = &[
@@ -8326,9 +6588,17 @@ impl FrankenStorage {
              ORDER BY conversation_id ASC",
         )
         .or_else(|err| {
+            // w1b Task B8 (regression found via real `cargo test` execution):
+            // `.with_context(...)` on the inner query wraps the raw
+            // "no such index" error, so `err.to_string()` only ever showed
+            // the outer context message and this fallback never triggered --
+            // latent under frankensqlite (which silently tolerates an
+            // `INDEXED BY` naming a nonexistent index instead of erroring),
+            // newly load-bearing now that a real SQLite backend enforces it.
+            // Walk the full `anyhow` cause chain instead of the top frame.
             if err
-                .to_string()
-                .contains("no such index: idx_messages_conv_idx")
+                .chain()
+                .any(|cause| cause.to_string().contains("no such index: idx_messages_conv_idx"))
             {
                 return self.fill_missing_lexical_rebuild_footprint_tails_from_grouped_messages(
                     footprints,
@@ -17856,79 +16126,17 @@ mod tests {
     // User data file protection tests (bead yln.4)
     // =========================================================================
 
-    #[test]
-    fn is_user_data_file_detects_bookmarks() {
-        assert!(is_user_data_file(Path::new("/data/bookmarks.db")));
-        assert!(is_user_data_file(Path::new("bookmarks.db")));
-    }
 
-    #[test]
-    fn is_user_data_file_detects_tui_state() {
-        assert!(is_user_data_file(Path::new("/data/tui_state.json")));
-    }
 
-    #[test]
-    fn is_user_data_file_detects_sources_toml() {
-        assert!(is_user_data_file(Path::new("/config/sources.toml")));
-    }
 
-    #[test]
-    fn is_user_data_file_detects_env() {
-        assert!(is_user_data_file(Path::new(".env")));
-    }
 
-    #[test]
-    fn is_user_data_file_rejects_other_files() {
-        assert!(!is_user_data_file(Path::new("index.db")));
-        assert!(!is_user_data_file(Path::new("conversations.db")));
-        assert!(!is_user_data_file(Path::new("random.txt")));
-    }
 
     // =========================================================================
     // Backup creation tests (bead yln.4)
     // =========================================================================
 
-    #[test]
-    fn create_backup_returns_none_for_nonexistent() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("nonexistent.db");
-        let result = create_backup(&db_path).unwrap();
-        assert!(result.is_none());
-    }
 
-    #[test]
-    fn create_backup_creates_named_file() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test.db");
-        std::fs::write(&db_path, b"test data").unwrap();
 
-        let backup_path = create_backup(&db_path).unwrap();
-        assert!(backup_path.is_some());
-        let backup = backup_path.unwrap();
-        assert!(backup.exists());
-        assert!(
-            backup
-                .file_name()
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .contains("backup")
-        );
-    }
-
-    #[test]
-    fn create_backup_paths_are_unique() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test.db");
-        std::fs::write(&db_path, b"test data").unwrap();
-
-        let first = create_backup(&db_path).unwrap().unwrap();
-        let second = create_backup(&db_path).unwrap().unwrap();
-
-        assert_ne!(first, second);
-        assert!(first.exists());
-        assert!(second.exists());
-    }
 
     #[test]
     fn lexical_rebuild_messages_query_uses_conversation_idx_access_path() {
@@ -18337,260 +16545,19 @@ mod tests {
         }
     }
 
-    #[test]
-    fn schema_check_rebuild_classification_ignores_transient_errors() {
-        // Task A4a: rewritten from literal `FrankenError` (the original engine crate's error type) variant
-        // construction to the `StorageError` values `map_franken_err`
-        // (backend_franken.rs) now produces for each — same classification intent,
-        // since `schema_check_error_requires_rebuild` operates post-mapping.
-        assert!(!schema_check_error_requires_rebuild(&StorageError::Busy {
-            scope: crate::storage::api::BusyScope::Statement,
-        }));
-        assert!(!schema_check_error_requires_rebuild(&StorageError::Busy {
-            scope: crate::storage::api::BusyScope::Statement,
-        }));
-        assert!(!schema_check_error_requires_rebuild(&StorageError::Other {
-            code: None,
-            detail: "cannot open /tmp/test.db".to_string(),
-        }));
-        assert!(!schema_check_error_requires_rebuild(&StorageError::Other {
-            code: None,
-            detail: "disk hiccup".to_string(),
-        }));
-    }
 
-    #[test]
-    fn schema_check_rebuild_classification_keeps_corruption_errors() {
-        assert!(schema_check_error_requires_rebuild(&StorageError::Corrupt {
-            detail: "bad header".to_string(),
-        }));
-        assert!(schema_check_error_requires_rebuild(&StorageError::Corrupt {
-            detail: "bad wal".to_string(),
-        }));
-        assert!(schema_check_error_requires_rebuild(&StorageError::Corrupt {
-            detail: "not a database: /tmp/test.db".to_string(),
-        }));
-        assert!(schema_check_error_requires_rebuild(&StorageError::Corrupt {
-            detail: "short read: expected 4096, actual 64".to_string(),
-        }));
-    }
 
-    #[test]
-    fn create_backup_refuses_raw_copy_after_retryable_vacuum_errors() {
-        // Task A4a: same rewrite rationale as the two tests above.
-        use crate::storage::api::BusyScope;
-        let retryable_errors = [
-            StorageError::Busy { scope: BusyScope::Statement },
-            StorageError::Busy { scope: BusyScope::Statement },
-            StorageError::Busy { scope: BusyScope::Snapshot },
-            StorageError::Busy { scope: BusyScope::Statement },
-            StorageError::Busy { scope: BusyScope::Statement },
-            StorageError::Busy { scope: BusyScope::Snapshot },
-            StorageError::Busy { scope: BusyScope::Snapshot },
-            // `Internal("database is locked")` mapped to `Other` (not a named
-            // variant), but stayed retryable via the "locked" substring fallback
-            // (`retryable_storage_error_message`) — preserve that path here too.
-            StorageError::Other { code: None, detail: "database is locked".to_string() },
-        ];
 
-        for err in retryable_errors {
-            assert!(
-                backup_vacuum_error_requires_consistent_retry(&err),
-                "retryable VACUUM failure must not fall back to raw bundle copy: {err}"
-            );
-        }
 
-        assert!(!backup_vacuum_error_requires_consistent_retry(&StorageError::Corrupt {
-            detail: "not a database: /tmp/test.db".to_string(),
-        }));
-        assert!(!backup_vacuum_error_requires_consistent_retry(&StorageError::Corrupt {
-            detail: "bad header".to_string(),
-        }));
-    }
 
-    #[test]
-    fn create_backup_uses_hidden_vacuum_stage_path() {
-        let backup_path = PathBuf::from("/tmp/test.db.backup.123.456.0");
-        let stage_path = vacuum_stage_backup_path(&backup_path);
-        let stage_name = stage_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default();
 
-        assert!(stage_name.starts_with('.'));
-        assert!(stage_name.ends_with(".vacuum-in-progress"));
-        assert!(
-            !is_backup_root_name(stage_name, "test.db.backup."),
-            "incomplete VACUUM output must not be discoverable as a backup root"
-        );
-    }
 
-    #[test]
-    fn create_backup_preserves_content() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test.db");
-        let original_content = b"test database content 12345";
-        std::fs::write(&db_path, original_content).unwrap();
-
-        let backup_path = create_backup(&db_path).unwrap().unwrap();
-        let backup_content = std::fs::read(&backup_path).unwrap();
-        assert_eq!(backup_content, original_content);
-    }
-
-    #[test]
-    fn create_backup_copies_sidecars_when_present() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test.db");
-        std::fs::write(&db_path, b"db").unwrap();
-        std::fs::write(database_sidecar_path(&db_path, "-wal"), b"wal").unwrap();
-        std::fs::write(database_sidecar_path(&db_path, "-shm"), b"shm").unwrap();
-
-        let backup_path = create_backup(&db_path).unwrap().unwrap();
-
-        assert_eq!(
-            std::fs::read(database_sidecar_path(&backup_path, "-wal")).unwrap(),
-            b"wal"
-        );
-        assert_eq!(
-            std::fs::read(database_sidecar_path(&backup_path, "-shm")).unwrap(),
-            b"shm"
-        );
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn create_backup_rejects_symlink_root_during_raw_fallback() {
-        use std::os::unix::fs::symlink;
-
-        let dir = TempDir::new().unwrap();
-        let outside_db = dir.path().join("outside.db");
-        let db_path = dir.path().join("test.db");
-        std::fs::write(&outside_db, b"not sqlite").unwrap();
-        symlink(&outside_db, &db_path).unwrap();
-
-        let err = create_backup(&db_path).unwrap_err();
-
-        assert!(
-            err.to_string().contains("bundle symlink"),
-            "unexpected error: {err:#}"
-        );
-        assert_eq!(std::fs::read(&outside_db).unwrap(), b"not sqlite");
-        let backup_roots: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .filter(|name| name.starts_with("test.db.backup."))
-            .collect();
-        assert!(
-            backup_roots.is_empty(),
-            "symlinked backup source must not publish backup roots: {backup_roots:?}"
-        );
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn create_backup_rejects_symlink_sidecar_without_partial_backup() {
-        use std::os::unix::fs::symlink;
-
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test.db");
-        let outside_wal = dir.path().join("outside.wal");
-        let wal_path = database_sidecar_path(&db_path, "-wal");
-        std::fs::write(&db_path, b"not sqlite").unwrap();
-        std::fs::write(&outside_wal, b"outside wal").unwrap();
-        symlink(&outside_wal, &wal_path).unwrap();
-
-        let err = create_backup(&db_path).unwrap_err();
-
-        assert!(
-            err.to_string().contains("bundle symlink"),
-            "unexpected error: {err:#}"
-        );
-        assert_eq!(std::fs::read(&outside_wal).unwrap(), b"outside wal");
-        let backup_roots: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .filter(|name| name.starts_with("test.db.backup."))
-            .collect();
-        assert!(
-            backup_roots.is_empty(),
-            "sidecar preflight failure must not leave a partial backup root: {backup_roots:?}"
-        );
-    }
 
     // =========================================================================
     // Backup cleanup tests (bead yln.4)
     // =========================================================================
 
-    #[test]
-    fn cleanup_old_backups_keeps_recent() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test.db");
 
-        // Create 5 backup files with different timestamps
-        for i in 0..5 {
-            let backup_name = format!("test.db.backup.{}", 1000 + i);
-            std::fs::write(dir.path().join(&backup_name), format!("backup {i}")).unwrap();
-        }
-
-        cleanup_old_backups(&db_path, 3).unwrap();
-
-        // Count remaining backup files
-        let backups: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_str().unwrap_or("").contains("backup"))
-            .collect();
-
-        assert_eq!(backups.len(), 3);
-    }
-
-    #[test]
-    fn cleanup_old_backups_ignores_wal_and_shm_sidecars() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test.db");
-
-        for i in 0..3 {
-            let backup_name = format!("test.db.backup.{}", 1000 + i);
-            let backup_path = dir.path().join(&backup_name);
-            std::fs::write(&backup_path, format!("backup {i}")).unwrap();
-            std::fs::write(format!("{}-wal", backup_path.display()), b"wal").unwrap();
-            std::fs::write(format!("{}-shm", backup_path.display()), b"shm").unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-
-        cleanup_old_backups(&db_path, 2).unwrap();
-
-        let mut roots = Vec::new();
-        let mut wals = Vec::new();
-        let mut shms = Vec::new();
-        for entry in std::fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-        {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.ends_with("-wal") {
-                wals.push(name);
-            } else if name.ends_with("-shm") {
-                shms.push(name);
-            } else if name.contains("backup") {
-                roots.push(name);
-            }
-        }
-
-        assert_eq!(roots.len(), 2, "should keep two backup roots");
-        assert_eq!(
-            wals.len(),
-            2,
-            "should keep WAL sidecars only for retained backups"
-        );
-        assert_eq!(
-            shms.len(),
-            2,
-            "should keep SHM sidecars only for retained backups"
-        );
-    }
 
     #[test]
     fn move_database_bundle_moves_database_and_sidecars() {
@@ -18859,62 +16826,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn remove_database_files_removes_orphan_sidecars_without_main_db() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test.db");
 
-        std::fs::write(database_sidecar_path(&db_path, "-wal"), b"wal").unwrap();
-        std::fs::write(database_sidecar_path(&db_path, "-shm"), b"shm").unwrap();
-
-        remove_database_files(&db_path).unwrap();
-
-        assert!(!db_path.exists());
-        assert!(!database_sidecar_path(&db_path, "-wal").exists());
-        assert!(!database_sidecar_path(&db_path, "-shm").exists());
-    }
-
-    #[test]
-    fn cleanup_old_backups_ignores_backup_named_directories() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test.db");
-
-        for i in 0..3 {
-            let backup_name = format!("test.db.backup.{}", 1000 + i);
-            std::fs::write(dir.path().join(&backup_name), format!("backup {i}")).unwrap();
-        }
-        std::fs::create_dir(dir.path().join("test.db.backup.directory")).unwrap();
-
-        cleanup_old_backups(&db_path, 2).unwrap();
-
-        let mut backup_files = Vec::new();
-        let mut backup_dirs = Vec::new();
-        for entry in std::fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-        {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if !name.starts_with("test.db.backup.") {
-                continue;
-            }
-            if entry.path().is_dir() {
-                backup_dirs.push(name);
-            } else {
-                backup_files.push(name);
-            }
-        }
-
-        assert_eq!(
-            backup_files.len(),
-            2,
-            "only real backup files count toward retention"
-        );
-        assert_eq!(
-            backup_dirs.len(),
-            1,
-            "backup-named directories should be ignored"
-        );
-    }
 
     // =========================================================================
     // Storage open/create tests (bead yln.4)
@@ -18973,44 +16885,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn open_or_rebuild_current_schema_does_not_trigger_rebuild() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("existing.db");
 
-        // Create DB at current schema.
-        {
-            let storage = SqliteStorage::open(&db_path).unwrap();
-            assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
-        }
-
-        // Should open normally, not require rebuild.
-        let reopened = SqliteStorage::open_or_rebuild(&db_path)
-            .expect("current schema DB should open without rebuild");
-        assert_eq!(reopened.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
-    }
-
-    #[test]
-    fn open_or_rebuild_does_not_treat_non_database_paths_as_corruption() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("db_dir");
-        std::fs::create_dir(&db_path).unwrap();
-
-        let result = SqliteStorage::open_or_rebuild(&db_path);
-
-        assert!(
-            matches!(
-                result,
-                Err(MigrationError::Database(_)) | Err(MigrationError::Io(_))
-            ),
-            "non-database path should report the underlying open error without rebuild"
-        );
-
-        assert!(
-            db_path.is_dir(),
-            "non-database directory must be left in place"
-        );
-    }
 
     // =========================================================================
     // Schema version tests (bead yln.4)
@@ -19022,36 +16897,12 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let storage = SqliteStorage::open(&db_path).unwrap();
         let version = storage.schema_version().unwrap();
-        assert!(version >= 5, "Schema version should be at least 5");
+        // w1b Task B8: the floor used to be `>= 5` under the old ~21-step
+        // frankensqlite migration numbering; `PRAGMA user_version` starts a
+        // fresh count at 1 under `schema::ensure`.
+        assert_eq!(version, CURRENT_SCHEMA_VERSION, "fresh database should report the current schema version");
     }
 
-    /// STAGE B TRANSITION SHIM TEST — retires together with
-    /// `seed_legacy_schema_version_mirror_for_new_engine_db` at Task B8: a
-    /// fresh database now builds through `schema::ensure` (the
-    /// `user_version`-only new-engine path), but every pre-existing reader
-    /// of `schema_version()`/`_schema_migrations`/`meta.schema_version`
-    /// still needs to see `CURRENT_SCHEMA_VERSION` there until B8 deletes
-    /// that whole reading surface along with the franken backend. This
-    /// asserts both version accounts agree on a freshly-built database.
-    #[test]
-    fn fresh_database_has_consistent_new_and_legacy_schema_versions() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test.db");
-        let storage = SqliteStorage::open(&db_path).unwrap();
-
-        assert_eq!(
-            storage.schema_version().unwrap(),
-            CURRENT_SCHEMA_VERSION,
-            "legacy schema_version() must still report the current version on a \
-             new-engine-built database"
-        );
-        let user_version = crate::storage::schema::read_user_version(storage.raw()).unwrap();
-        assert_eq!(
-            user_version,
-            crate::storage::schema::CURRENT_SCHEMA_VERSION,
-            "PRAGMA user_version must reflect schema::ensure's own version authority"
-        );
-    }
 
     // =========================================================================
     // Current analytics/schema smoke test (bead z9fse.11)
@@ -19276,58 +17127,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn migration_v13_from_v10() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test.db");
-
-        // Open at v10 first by faking it
-        {
-            let conn = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().into_owned())), crate::storage::api::Profile::Production).unwrap();
-            conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);",
-            )
-            .unwrap();
-            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', '10')", &[])
-                .unwrap();
-            // Apply V1-V10 so schema is correct. Keep each historical DDL batch
-            // in autocommit mode; the fixture is testing cass migration
-            // transition behavior, not frankensqlite's handling of a giant
-            // synthetic legacy-DDL transaction.
-            conn.execute_batch(MIGRATION_V1).unwrap();
-            conn.execute_batch(MIGRATION_V2).unwrap();
-            conn.execute_batch(MIGRATION_V4).unwrap();
-            conn.execute_batch(MIGRATION_V5).unwrap();
-            conn.execute_batch(MIGRATION_V6).unwrap();
-            conn.execute_batch(MIGRATION_V7).unwrap();
-            conn.execute_batch(MIGRATION_V8).unwrap();
-            conn.execute_batch(MIGRATION_V9).unwrap();
-            conn.execute_batch(MIGRATION_V10).unwrap();
-            conn.execute("UPDATE meta SET value = '10' WHERE key = 'schema_version'", &[])
-                .unwrap();
-        }
-        materialize_fresh_fts_schema_via_rusqlite(&db_path).unwrap();
-
-        // Now open with SqliteStorage — should auto-migrate to current schema
-        let storage = SqliteStorage::open(&db_path).unwrap();
-        let version = storage.schema_version().unwrap();
-        assert_eq!(
-            version, CURRENT_SCHEMA_VERSION,
-            "Should have migrated from v10 to the current schema"
-        );
-
-        // Verify new tables exist
-        let count: i64 = storage
-            .raw()
-            .query_row_map(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('message_metrics', 'usage_hourly', 'usage_daily', 'usage_models_daily')",
-                &[],
-                |row: &FrankenRow| row.get_typed::<i64>(0),
-            )
-            .unwrap();
-        assert_eq!(count, 4, "All 4 analytics tables should exist");
-    }
 
     // =========================================================================
     // Analytics ingest integration test (bead z9fse.2)
@@ -27618,274 +25417,20 @@ mod tests {
     // FrankenStorage migration tests (bead 2j6p6)
     // =========================================================================
 
-    /// Helper: create a FrankenStorage wrapping an in-memory connection and
-    /// run migrations. This exercises the same code path as `open()` but avoids
-    /// frankensqlite's file-based autoindex renaming limitation (V5 uses
-    /// ALTER TABLE RENAME which triggers sqlite_autoindex lookup issues on
-    /// file-based pagers).
+    /// Helper: create a FrankenStorage wrapping an in-memory connection with
+    /// a fresh schema built. w1b Task B8: `schema::ensure` replaces the
+    /// retired franken incremental engine's `run_migrations`.
     fn franken_storage_in_memory() -> FrankenStorage {
         let conn = FrankenConnection::open_memory().unwrap();
         let storage = FrankenStorage::new(conn, PathBuf::from(":memory:"));
-        storage.run_migrations().unwrap();
+        crate::storage::schema::ensure(&storage.conn).unwrap();
         storage.apply_config().unwrap();
         storage
     }
 
-    #[test]
-    fn franken_migrations_create_all_tables() {
-        let storage = franken_storage_in_memory();
 
-        // Should be at CURRENT_SCHEMA_VERSION.
-        let version = storage.schema_version().unwrap();
-        assert_eq!(
-            version, CURRENT_SCHEMA_VERSION,
-            "fresh FrankenStorage should be at current schema version"
-        );
 
-        // Core tables from V1 should exist.
-        let table_names: Vec<String> = storage
-            .raw()
-            .query_all_map(
-                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;",
-                &[],
-                |r| r.get_typed::<String>(0),
-            )
-            .unwrap();
 
-        for required in [
-            "meta",
-            "agents",
-            "workspaces",
-            "conversations",
-            "messages",
-            "snippets",
-            "tags",
-            "conversation_tags",
-        ] {
-            assert!(
-                table_names.contains(&required.to_string()),
-                "missing table: {required}"
-            );
-        }
-
-        // V4 sources table.
-        assert!(
-            table_names.contains(&"sources".to_string()),
-            "missing sources table"
-        );
-
-        // V8 daily_stats table.
-        assert!(
-            table_names.contains(&"daily_stats".to_string()),
-            "missing daily_stats table"
-        );
-
-        // V9 embedding_jobs table.
-        assert!(
-            table_names.contains(&"embedding_jobs".to_string()),
-            "missing embedding_jobs table"
-        );
-
-        // V11 message_metrics, usage_hourly, usage_daily tables.
-        for analytics_table in ["message_metrics", "usage_hourly", "usage_daily"] {
-            assert!(
-                table_names.contains(&analytics_table.to_string()),
-                "missing table: {analytics_table}"
-            );
-        }
-        assert!(
-            table_names.contains(&"conversation_tail_state".to_string()),
-            "missing conversation_tail_state table"
-        );
-        assert!(
-            table_names.contains(&"conversation_external_lookup".to_string()),
-            "missing conversation_external_lookup table"
-        );
-        assert!(
-            table_names.contains(&"conversation_external_tail_lookup".to_string()),
-            "missing conversation_external_tail_lookup table"
-        );
-
-        // Fresh frankensqlite databases should record the combined V13 base
-        // schema plus every additive post-V13 migration.
-        let count: i64 = storage
-            .raw()
-            .query_row_map("SELECT COUNT(*) FROM _schema_migrations;", &[], |row| {
-                row.get_typed(0)
-            })
-            .unwrap();
-        assert_eq!(
-            count,
-            (13..=CURRENT_SCHEMA_VERSION).count() as i64,
-            "_schema_migrations should record the V13 base schema and post-V13 migrations"
-        );
-
-        // The latest applied migration should be the current schema version.
-        let versions: Vec<i64> = storage
-            .raw()
-            .query_all_map(
-                "SELECT version FROM _schema_migrations ORDER BY version;",
-                &[],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-        assert_eq!(
-            versions,
-            (13..=CURRENT_SCHEMA_VERSION).collect::<Vec<i64>>(),
-            "_schema_migrations should contain v13 through current"
-        );
-    }
-
-    #[test]
-    fn franken_migrations_idempotent() {
-        let storage = franken_storage_in_memory();
-        assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
-
-        // Re-running migrations on the same connection is a no-op.
-        storage.run_migrations().unwrap();
-        assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
-    }
-
-    #[test]
-    fn migration_v20_backfills_conversation_external_tail_lookup() {
-        let storage = franken_storage_in_memory();
-        let agent_id = storage
-            .ensure_agent(&Agent {
-                id: None,
-                slug: "codex".into(),
-                name: "Codex".into(),
-                version: None,
-                kind: AgentKind::Cli,
-            })
-            .unwrap();
-        let workspace_id = storage
-            .ensure_workspace(&PathBuf::from("/ws/profiled-storage-remote"), None)
-            .unwrap();
-        let mut conv = make_profiled_storage_remote_conversation(1919, 2);
-        conv.source_id = "profiled-storage-remote-source-東京".into();
-        conv.external_id = Some("profiled-storage-remote-☃-1919".into());
-        let outcome = storage
-            .insert_conversation_tree(agent_id, Some(workspace_id), &conv)
-            .unwrap();
-        let external_id = conv.external_id.as_deref().unwrap();
-        let lookup_key = conversation_external_lookup_key(&conv.source_id, agent_id, external_id);
-
-        storage
-            .raw()
-            .execute("DELETE FROM conversation_external_tail_lookup", &[])
-            .unwrap();
-        storage
-            .raw()
-            .execute("DELETE FROM _schema_migrations WHERE version = 20", &[])
-            .unwrap();
-        storage
-            .raw()
-            .execute(
-                "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
-                fparams!["19"],
-            )
-            .unwrap();
-
-        storage.run_migrations().unwrap();
-
-        let backfilled: (i64, Option<i64>, Option<i64>, Option<i64>) = storage
-            .raw()
-            .query_row_map(
-                "SELECT conversation_id, ended_at, last_message_idx, last_message_created_at
-                 FROM conversation_external_tail_lookup
-                 WHERE lookup_key = ?1",
-                fparams![lookup_key.as_str()],
-                |row| {
-                    Ok((
-                        row.get_typed(0)?,
-                        row.get_typed(1)?,
-                        row.get_typed(2)?,
-                        row.get_typed(3)?,
-                    ))
-                },
-            )
-            .unwrap();
-        assert_eq!(
-            backfilled,
-            (
-                outcome.conversation_id,
-                conv.ended_at,
-                Some(1),
-                conv.messages[1].created_at
-            )
-        );
-        assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
-    }
-
-    #[test]
-    fn migration_v15_creates_lazy_tail_state_cache() {
-        let conn = FrankenConnection::open_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE conversations (
-                 id INTEGER PRIMARY KEY,
-                 ended_at INTEGER
-             );
-             CREATE TABLE messages (
-                 id INTEGER PRIMARY KEY,
-                 conversation_id INTEGER NOT NULL,
-                 idx INTEGER NOT NULL,
-                 created_at INTEGER
-             );
-             INSERT INTO conversations(id, ended_at) VALUES
-                 (1, 1710000000300),
-                 (2, NULL);
-             INSERT INTO messages(id, conversation_id, idx, created_at) VALUES
-                 (10, 1, 0, 1710000000100),
-                 (11, 1, 1, 1710000000200),
-                 (12, 2, 0, 1710000000400);",
-        )
-        .unwrap();
-
-        conn.execute(
-            "CREATE TABLE _schema_migrations (
-                version INTEGER PRIMARY KEY,
-                name TEXT NOT NULL,
-                applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
-             );",
-        &[])
-        .unwrap();
-
-        assert!(
-            apply_conversation_tail_state_cache_migration(&conn).unwrap(),
-            "v15 migration should apply once"
-        );
-        assert!(
-            !apply_conversation_tail_state_cache_migration(&conn).unwrap(),
-            "v15 migration should be idempotent once recorded"
-        );
-
-        let column_names: HashSet<String> = conn
-            .query_all_map("PRAGMA table_info(conversations);", &[], |row| row.get_typed(1))
-            .unwrap()
-            .into_iter()
-            .collect();
-        assert!(column_names.contains("last_message_idx"));
-        assert!(column_names.contains("last_message_created_at"));
-
-        let tail_rows: i64 = conn
-            .query_row_map("SELECT COUNT(*) FROM conversation_tail_state;", &[], |row| {
-                row.get_typed(0)
-            })
-            .unwrap();
-        assert_eq!(
-            tail_rows, 0,
-            "v15 should create the cache without an open-time message scan"
-        );
-
-        let applied: i64 = conn
-            .query_row_map(
-                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 15;",
-                &[],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-        assert_eq!(applied, 1);
-    }
 
     #[test]
     fn schema_repair_adds_missing_conversations_token_columns() {
@@ -27912,390 +25457,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn franken_meta_schema_version_in_sync() {
-        let storage = franken_storage_in_memory();
 
-        // meta.schema_version should be kept in sync.
-        let meta_version: String = storage
-            .raw()
-            .query_row_map(
-                "SELECT value FROM meta WHERE key = 'schema_version';",
-                &[],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-        assert_eq!(
-            meta_version,
-            CURRENT_SCHEMA_VERSION.to_string(),
-            "meta.schema_version should match CURRENT_SCHEMA_VERSION"
-        );
-    }
 
-    #[test]
-    fn franken_transition_from_meta_version() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test_transition.db");
 
-        // Simulate an existing database created by SqliteStorage at version 10.
-        // We create just enough schema to test the transition.
-        let conn = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().to_string())), crate::storage::api::Profile::Production).unwrap();
-        conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);", &[])
-            .unwrap();
-        conn.execute("INSERT INTO meta(key, value) VALUES('schema_version', '10');", &[])
-            .unwrap();
-        // Create a dummy conversations table so transition doesn't think it's corrupted.
-        conn.execute("CREATE TABLE conversations (id INTEGER PRIMARY KEY);", &[])
-            .unwrap();
-        drop(conn);
 
-        // Now run the transition function.
-        let conn = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().to_string())), crate::storage::api::Profile::Production).unwrap();
-        transition_from_meta_version(&conn).unwrap();
 
-        // The frankensqlite path uses a combined V13 base migration, so a
-        // legacy V10 marker is bridged to V13 and later idempotent repair fills
-        // in any missing V11-V13 objects.
-        let versions: Vec<i64> = conn
-            .query_all_map(
-                "SELECT version FROM _schema_migrations ORDER BY version;",
-                &[],
-                |r| r.get_typed(0),
-            )
-            .unwrap();
-        assert_eq!(
-            versions,
-            (1..=13).collect::<Vec<i64>>(),
-            "transition should bridge legacy V10 databases through the combined V13 base marker"
-        );
-    }
 
-    #[test]
-    fn franken_transition_from_current_meta_backfills_current_schema_marker() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test_current_transition.db");
 
-        let conn = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().to_string())), crate::storage::api::Profile::Production).unwrap();
-        conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);", &[])
-            .unwrap();
-        conn.execute(
-            "INSERT INTO meta(key, value) VALUES('schema_version', ?1);",
-            &[ParamValue::from(CURRENT_SCHEMA_VERSION.to_string())],
-        )
-        .unwrap();
-        conn.execute("CREATE TABLE conversations (id INTEGER PRIMARY KEY);", &[])
-            .unwrap();
-        drop(conn);
-
-        let conn = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().to_string())), crate::storage::api::Profile::Production).unwrap();
-        transition_from_meta_version(&conn).unwrap();
-
-        let versions: Vec<i64> = conn
-            .query_all_map(
-                "SELECT version FROM _schema_migrations ORDER BY version;",
-                &[],
-                |r| r.get_typed(0),
-            )
-            .unwrap();
-        assert_eq!(
-            versions,
-            (1..=CURRENT_SCHEMA_VERSION).collect::<Vec<i64>>(),
-            "current meta schema marker should backfill every known migration"
-        );
-    }
-
-    #[test]
-    fn franken_transition_skips_when_already_done() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test_transition_skip.db");
-
-        // Create a DB that already has _schema_migrations.
-        let conn = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().to_string())), crate::storage::api::Profile::Production).unwrap();
-        conn.execute(
-            "CREATE TABLE _schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL DEFAULT 'now');",
-        &[]).unwrap();
-        conn.execute("INSERT INTO _schema_migrations (version, name) VALUES (1, 'test');", &[])
-            .unwrap();
-
-        // Transition should be a no-op.
-        transition_from_meta_version(&conn).unwrap();
-
-        // Should still have exactly 1 entry.
-        let count: i64 = conn
-            .query_row_map("SELECT COUNT(*) FROM _schema_migrations;", &[], |row| {
-                row.get_typed(0)
-            })
-            .unwrap();
-        assert_eq!(
-            count, 1,
-            "transition should not re-run on already-transitioned DB"
-        );
-    }
-
-    #[test]
-    fn franken_transition_fresh_db_is_noop() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test_fresh_noop.db");
-
-        // Empty database — no meta table, no tables at all.
-        let conn = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().to_string())), crate::storage::api::Profile::Production).unwrap();
-        transition_from_meta_version(&conn).unwrap();
-
-        // _schema_migrations should NOT have been created.
-        let res = conn.query_all_map("SELECT * FROM \"_schema_migrations\";", &[], |_row| Ok(()));
-        assert!(
-            res.is_err(),
-            "transition should not create _schema_migrations on fresh DB"
-        );
-    }
-
-    #[test]
-    fn franken_transition_with_fts_virtual_table_succeeds() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test_transition_with_fts.db");
-
-        let conn = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().into_owned())), crate::storage::api::Profile::Production).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             INSERT INTO meta(key, value) VALUES('schema_version', '13');
-             CREATE TABLE conversations (id INTEGER PRIMARY KEY);
-             CREATE VIRTUAL TABLE fts_messages USING fts5(
-                 content,
-                 title,
-                 agent,
-                 workspace,
-                 source_path,
-                 created_at,
-                 content='',
-                 tokenize='porter unicode61'
-             );",
-        )
-        .unwrap();
-        drop(conn);
-
-        let conn = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().to_string())), crate::storage::api::Profile::Production).unwrap();
-        transition_from_meta_version(&conn).unwrap();
-
-        let versions: Vec<i64> = conn
-            .query_all_map(
-                "SELECT version FROM _schema_migrations ORDER BY version;",
-                &[],
-                |r| r.get_typed(0),
-            )
-            .unwrap();
-        assert_eq!(versions, (1..=13).collect::<Vec<i64>>());
-    }
-
-    #[test]
-    fn franken_storage_open_legacy_v13_with_fts_virtual_table_succeeds() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test_open_legacy_v13_with_fts.db");
-
-        let conn = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().into_owned())), crate::storage::api::Profile::Production).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             INSERT INTO meta(key, value) VALUES('schema_version', '13');
-             CREATE TABLE agents (
-                 id INTEGER PRIMARY KEY,
-                 slug TEXT NOT NULL
-             );
-             CREATE TABLE workspaces (
-                 id INTEGER PRIMARY KEY,
-                 path TEXT NOT NULL
-             );
-             CREATE TABLE sources (
-                 id TEXT PRIMARY KEY,
-                 kind TEXT NOT NULL,
-                 host_label TEXT,
-                 machine_id TEXT,
-                 platform TEXT,
-                 config_json TEXT,
-                 created_at INTEGER NOT NULL,
-                 updated_at INTEGER NOT NULL
-             );
-             CREATE TABLE conversations (
-                 id INTEGER PRIMARY KEY,
-                 agent_id INTEGER NOT NULL,
-                 workspace_id INTEGER,
-                 source_id TEXT NOT NULL DEFAULT 'local',
-                 external_id TEXT,
-                 title TEXT,
-                 source_path TEXT NOT NULL,
-                 started_at INTEGER,
-                 ended_at INTEGER
-             );
-             CREATE TABLE messages (
-                 id INTEGER PRIMARY KEY,
-                 conversation_id INTEGER NOT NULL,
-                 idx INTEGER NOT NULL,
-                 role TEXT NOT NULL,
-                 author TEXT,
-                 created_at INTEGER,
-                 content TEXT NOT NULL,
-                 extra_json TEXT,
-                 extra_bin BLOB
-             );
-             INSERT INTO agents(id, slug) VALUES (1, 'codex');
-             INSERT INTO workspaces(id, path) VALUES (1, '/data/projects/coding_agent_session_search');
-             INSERT INTO sources(id, kind, host_label, created_at, updated_at)
-             VALUES ('local', 'local', NULL, 1710000000000, 1710000000000);
-             INSERT INTO conversations(
-                 id,
-                 agent_id,
-                 workspace_id,
-                 source_id,
-                 external_id,
-                 title,
-                 source_path,
-                 started_at
-             )
-             VALUES (
-                 1,
-                 1,
-                 1,
-                 'local',
-                 'legacy-session',
-                 'legacy session',
-                 '/tmp/legacy.jsonl',
-                 1710000000000
-             );
-             INSERT INTO messages(id, conversation_id, idx, role, author, created_at, content)
-             VALUES (1, 1, 0, 'user', 'tester', 1710000000000, 'legacy content');
-             CREATE VIRTUAL TABLE fts_messages USING fts5(
-                 content,
-                 title,
-                 agent,
-                 workspace,
-                 source_path,
-                 created_at,
-                 message_id,
-                 content='',
-                 tokenize='porter unicode61'
-             );",
-        )
-        .unwrap();
-        drop(conn);
-
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
-
-        let versions: Vec<i64> = storage
-            .raw()
-            .query_all_map(
-                "SELECT version FROM _schema_migrations ORDER BY version;",
-                &[],
-                |r| r.get_typed(0),
-            )
-            .unwrap();
-        assert_eq!(versions, (1..=CURRENT_SCHEMA_VERSION).collect::<Vec<i64>>());
-    }
-
-    #[test]
-    #[ignore = "blocked on frankensqlite contentless-FTS fix (y8n3i / fsqlite bd-sf8dx): fsqlite 0.1.13 open-validation still demands a _content shadow for a legacy (no content= option) fts_messages schema row, so repair cannot even open; un-ignore via cljkz once fsqlite treats that as recoverable"]
-    fn franken_storage_open_repairs_duplicate_fts_messages_schema_rows() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test_open_repairs_duplicate_fts_schema.db");
-
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        let agent = Agent {
-            id: None,
-            slug: "codex".into(),
-            name: "Codex".into(),
-            version: None,
-            kind: AgentKind::Cli,
-        };
-        let agent_id = storage.ensure_agent(&agent).unwrap();
-        let conversation = Conversation {
-            id: None,
-            agent_slug: "codex".into(),
-            workspace: Some(PathBuf::from("/tmp/workspace")),
-            external_id: Some("dup-fts-schema".into()),
-            title: Some("Duplicate FTS schema".into()),
-            source_path: PathBuf::from("/tmp/dup-fts-schema.jsonl"),
-            started_at: Some(1_700_000_000_000),
-            ended_at: Some(1_700_000_000_100),
-            approx_tokens: Some(42),
-            metadata_json: serde_json::Value::Null,
-            messages: vec![Message {
-                id: None,
-                idx: 0,
-                role: MessageRole::User,
-                author: Some("user".into()),
-                created_at: Some(1_700_000_000_050),
-                content: "message that should remain queryable".into(),
-                extra_json: serde_json::Value::Null,
-                snippets: Vec::new(),
-            }],
-            source_id: LOCAL_SOURCE_ID.into(),
-            origin_host: None,
-        };
-        storage
-            .insert_conversation_tree(agent_id, None, &conversation)
-            .unwrap();
-        drop(storage);
-        materialize_fresh_fts_schema_via_rusqlite(&db_path).unwrap();
-
-        let duplicate_legacy_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')";
-        let conn = rusqlite_test_fixture_conn(&db_path);
-        conn.execute_batch("PRAGMA writable_schema = ON;").unwrap();
-        conn.execute(
-            "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
-             VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
-            [duplicate_legacy_fts_sql],
-        )
-        .unwrap();
-        conn.execute(
-            "DELETE FROM meta WHERE key = ?1",
-            [FTS_FRANKEN_REBUILD_META_KEY],
-        )
-        .unwrap();
-        // Simulate a pre-fix upgraded database that has never gone through the
-        // authoritative frankensqlite FTS rebuild generation yet.
-        conn.execute_batch("PRAGMA writable_schema = OFF;").unwrap();
-
-        let duplicate_rows: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(duplicate_rows, 2);
-        drop(conn);
-
-        let reopened = FrankenStorage::open(&db_path).unwrap();
-        assert_eq!(reopened.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
-        let generation_rows: Vec<String> = reopened
-            .raw()
-            .query_all_map(
-                "SELECT value FROM meta WHERE key = ?1",
-                fparams![FTS_FRANKEN_REBUILD_META_KEY],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-        assert_eq!(
-            generation_rows.len(),
-            0,
-            "canonical open should not eagerly rewrite FTS repair metadata"
-        );
-        reopened.ensure_search_fallback_fts_consistency().unwrap();
-        let repaired = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().into_owned())), crate::storage::api::Profile::Production).unwrap();
-        assert_eq!(franken_fts_schema_rows(&repaired).unwrap(), 1);
-
-        let total_messages: i64 = reopened
-            .raw()
-            .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
-                row.get_typed(0)
-            })
-            .unwrap();
-        let total_fts_rows: i64 = reopened
-            .raw()
-            .query_row_map("SELECT COUNT(*) FROM fts_messages", fparams![], |row| {
-                row.get_typed(0)
-            })
-            .unwrap();
-        assert_eq!(total_fts_rows, total_messages);
-    }
 
     #[test]
     fn fts_messages_integrity_reports_missing_shadow_tables() {
@@ -28524,37 +25692,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn build_cass_migrations_applies_combined_v13() {
-        let conn = FrankenConnection::open_memory().unwrap();
-        let base_result = crate::storage::api::run_franken_migrations(
-            &conn,
-            &build_cass_migrations_before_tail_cache(),
-        )
-        .unwrap();
-        assert!(apply_conversation_tail_state_cache_migration(&conn).unwrap());
-        let post_result = crate::storage::api::run_franken_migrations(
-            &conn,
-            &build_cass_migrations_after_tail_cache(),
-        )
-        .unwrap();
-
-        assert!(base_result.was_fresh);
-        let mut applied = base_result.applied;
-        applied.push(15);
-        applied.extend(post_result.applied);
-        assert_eq!(
-            applied,
-            (13..=CURRENT_SCHEMA_VERSION).collect::<Vec<i64>>(),
-            "should apply combined V13 plus additive post-V13 migrations"
-        );
-        let current: i64 = conn
-            .query_row_map("SELECT MAX(version) FROM _schema_migrations;", &[], |row| {
-                row.get_typed(0)
-            })
-            .unwrap();
-        assert_eq!(current, CURRENT_SCHEMA_VERSION);
-    }
 
     #[test]
     #[serial]

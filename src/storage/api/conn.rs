@@ -5,7 +5,6 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use super::backend_franken::FrankenBackend;
 use super::config::{
     OpenOptions, Profile, RETRY_JITTER_MAX_PERCENT, RETRY_JITTER_MIN_PERCENT,
     STATEMENT_RETRY_BASE_MS, STATEMENT_RETRY_MAX_ATTEMPTS, STATEMENT_RETRY_TOTAL_CAP_MS,
@@ -137,15 +136,6 @@ pub(crate) trait StorageBackend {
     /// == current fsqlite `Connection::close_best_effort_in_place(&mut self)`
     /// (same no-checkpoint best-effort path as `Drop`, errors swallowed).
     fn close_best_effort_in_place(&mut self);
-
-    /// Stage-A-only escape hatch (Task A4a): lets `run_franken_migrations` reach
-    /// the native fsqlite connection to run the native engine's
-    /// `migrate::MigrationRunner` without leaking the engine type into the
-    /// `StorageBackend` trait surface.
-    /// Deleted along with `backend_franken.rs` at the end of Stage B.
-    fn as_franken(&self) -> Option<&super::backend_franken::FrankenBackend> {
-        None
-    }
 }
 
 /// Transaction begin mode. w1b Task B3 (D2, plan @775-776) adds `Immediate`
@@ -309,7 +299,7 @@ impl std::fmt::Debug for Conn {
 
 impl Conn {
     pub fn open_read(path: &Path) -> Result<Conn, StorageError> {
-        let backend = FrankenBackend::open_read_only(path_to_str(path)?)?;
+        let backend = super::backend_sqlite::SqliteBackend::open_read_only(path_to_str(path)?)?;
         Ok(Conn { inner: Box::new(backend), path: Some(path.to_path_buf()), _writer_open_guard: None })
     }
 
@@ -329,8 +319,12 @@ impl Conn {
     /// fixture construction only (`tests/`/`benches/` are separate crates and
     /// can't reach `pub(crate)` items directly) -- see that module's doc
     /// comment for the closed-world boundary this relies on.
-    pub(crate) fn open_writable(path: &Path, _profile: Profile) -> Result<Conn, StorageError> {
-        let backend = FrankenBackend::open(path_to_str(path)?)?;
+    ///
+    /// w1b Task B8: dispatches to `SqliteBackend` (the franken backend and
+    /// its `FrankenBackend::open` dispatch here were retired together with
+    /// `backend_franken.rs`).
+    pub(crate) fn open_writable(path: &Path, profile: Profile) -> Result<Conn, StorageError> {
+        let backend = super::backend_sqlite::SqliteBackend::open_writable(path_to_str(path)?, profile)?;
         Ok(Conn {
             inner: Box::new(backend),
             path: Some(path.to_path_buf()),
@@ -339,33 +333,8 @@ impl Conn {
     }
 
     pub fn open_memory() -> Result<Conn, StorageError> {
-        let backend = FrankenBackend::open_memory()?;
+        let backend = super::backend_sqlite::SqliteBackend::open_memory()?;
         Ok(Conn { inner: Box::new(backend), path: None, _writer_open_guard: None })
-    }
-
-    /// w1b Task B7: `storage::schema`'s own tests need to exercise
-    /// `schema::ensure` against genuine SQLite (rusqlite) semantics --
-    /// `PRAGMA user_version`, `sqlite3 PRAGMA integrity_check` from the
-    /// stock CLI, fault-injected mid-DDL crashes -- none of which
-    /// `Conn::open_writable`'s current `FrankenBackend` dispatch can stand
-    /// in for (same rationale as `tests::open_writable_sqlite_for_test`
-    /// below, just `pub(crate)` so a sibling module of `api` can reach it).
-    /// Test-only: does not touch the separately-tracked question of when
-    /// `Conn::open_writable` itself cuts over to `SqliteBackend` (that's B8).
-    #[cfg(test)]
-    pub(crate) fn open_writable_sqlite_backend_for_tests(
-        path: &Path,
-        profile: Profile,
-    ) -> Result<Conn, StorageError> {
-        let backend = super::backend_sqlite::SqliteBackend::open_writable(
-            path_to_str(path)?,
-            profile,
-        )?;
-        Ok(Conn {
-            inner: Box::new(backend),
-            path: Some(path.to_path_buf()),
-            _writer_open_guard: Some(super::writer::note_writer_opened(path)),
-        })
     }
 
     /// w1b Task B3 (D2, R1-N2): bounded-retries on a real `Busy{Statement}`
@@ -510,11 +479,6 @@ impl Conn {
 
     pub fn last_insert_rowid(&self) -> i64 {
         self.inner.last_insert_rowid()
-    }
-
-    /// Stage-A-only (Task A4a): see [`StorageBackend::as_franken`].
-    pub(crate) fn as_franken(&self) -> Option<&super::backend_franken::FrankenBackend> {
-        self.inner.as_franken()
     }
 
     pub fn path(&self) -> Option<&Path> {

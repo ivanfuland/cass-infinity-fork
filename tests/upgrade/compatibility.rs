@@ -8,7 +8,7 @@
 
 use coding_agent_search::pages::encrypt::{EncryptionConfig, KdfAlgorithm, SlotType};
 use coding_agent_search::storage::api::Profile;
-use coding_agent_search::storage::sqlite::{CURRENT_SCHEMA_VERSION, MigrationError, SqliteStorage};
+use coding_agent_search::storage::sqlite::{CURRENT_SCHEMA_VERSION, SqliteStorage};
 use coding_agent_search::storage::testing::{TestWriterGuard, open_test_writer};
 use serde_json::json;
 use std::path::Path;
@@ -25,10 +25,9 @@ const _: () = {
     );
 };
 
-/// Schema-free fixture writer: these fixtures deliberately build legacy /
-/// pre-migration schemas that `SqliteStorage::open_or_rebuild` must detect,
-/// so opening through `FrankenStorage::open` (which would migrate first)
-/// defeats the point of the test.
+/// Schema-free fixture writer: lets a test poke at a database's raw tables
+/// without `schema::ensure` (which `SqliteStorage::open` now always runs)
+/// building/overwriting them first.
 fn open_fixture_db(path: &Path) -> TestWriterGuard {
     open_test_writer(path, Profile::Production).expect("open frankensqlite fixture database")
 }
@@ -62,49 +61,6 @@ fn test_new_database_has_current_schema() {
 // Database Compatibility Tests
 // =============================================================================
 
-/// Test that we can open a database with older schema version and check compatibility.
-#[test]
-fn test_detects_older_schema() {
-    let dir = TempDir::new().unwrap();
-    let db_path = dir.path().join("old.db");
-
-    // Create a minimal old-style database
-    {
-        let mut guard = open_fixture_db(&db_path);
-        let conn = guard.storage().raw();
-        conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)", &[])
-            .unwrap();
-        // Simulate an older schema version
-        conn.execute(
-            "INSERT INTO meta (key, value) VALUES ('schema_version', '1')",
-            &[],
-        )
-        .unwrap();
-        guard.mark_committed();
-    }
-
-    // Try to open with SqliteStorage - should trigger migration or rebuild
-    let result = SqliteStorage::open_or_rebuild(&db_path);
-
-    // Should succeed (either migrate or rebuild)
-    match result {
-        Ok(_) => {
-            // Successfully opened/migrated
-            let storage = SqliteStorage::open(&db_path).unwrap();
-            let version = storage.schema_version().unwrap();
-            assert!(
-                version >= CURRENT_SCHEMA_VERSION,
-                "Schema should be at least current version after migration"
-            );
-        }
-        Err(e) => {
-            // Migration error is acceptable for very old schemas
-            if let MigrationError::RebuildRequired { reason, .. } = e {
-                assert!(!reason.is_empty(), "Rebuild reason should not be empty");
-            }
-        }
-    }
-}
 
 /// Test that unknown tables are ignored (forward compatibility).
 #[test]
@@ -392,50 +348,6 @@ fn test_detect_config_version() {
     assert_eq!(get_version(r#"{"other": "field"}"#), None);
 }
 
-/// Test graceful handling of very old schema.
-#[test]
-fn test_reject_schema_version_0() {
-    let dir = TempDir::new().unwrap();
-    let db_path = dir.path().join("ancient.db");
-
-    {
-        let mut guard = open_fixture_db(&db_path);
-        let conn = guard.storage().raw();
-        conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)", &[])
-            .unwrap();
-        conn.execute(
-            "INSERT INTO meta (key, value) VALUES ('schema_version', '0')",
-            &[],
-        )
-        .unwrap();
-        guard.mark_committed();
-    }
-
-    // Very old schemas should trigger rebuild
-    let result = SqliteStorage::open_or_rebuild(&db_path);
-    // Either succeeds with rebuild or returns error
-    match result {
-        Ok(_storage) => {
-            // Rebuild succeeded, verify schema is current
-            let storage = SqliteStorage::open(&db_path).unwrap();
-            assert!(storage.schema_version().unwrap() >= CURRENT_SCHEMA_VERSION);
-        }
-        Err(e) => match e {
-            MigrationError::RebuildRequired { reason, .. } => {
-                assert!(
-                    reason.to_lowercase().contains("rebuild")
-                        || reason.to_lowercase().contains("schema"),
-                    "Rebuild reason should be informative: {}",
-                    reason
-                );
-            }
-            other => {
-                let unexpected = format!("{other:?}");
-                assert!(unexpected.is_empty(), "Unexpected error type: {unexpected}");
-            }
-        },
-    }
-}
 
 // =============================================================================
 // Feature Degradation Tests
