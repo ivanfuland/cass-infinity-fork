@@ -45368,6 +45368,24 @@ fn doctor_archive_export_verify_target(target_root: &Path, data_dir: &Path) -> s
             ) {
                 continue;
             }
+            // w1b Task B9 (2026-08-27, equivalence-gate-caught, control-
+            // plane ruling, same sidecar family as commit 7d325529): the
+            // manifest correctly excludes -shm/-wal sidecars from the
+            // exported asset set (policy: not exportable, vanilla SQLite
+            // engine-managed transient state) -- but this verify function's
+            // own frankensqlite_probe below opens the copied canonical db
+            // readonly to sanity-check it, and that mere open spontaneously
+            // recreates fresh -shm/-wal files right here in the target
+            // directory (reproduced directly: even a read-only connection
+            // to a WAL-mode database creates/touches these two files; see
+            // tests/cli_doctor.rs's doctor_no_write_snapshot and this
+            // file's own write_set_snapshot exemptions for the same root
+            // cause). Without this exemption, every archive-export verify
+            // pass self-inflicts a false-positive "extra_file" issue on the
+            // very files its own probe just created.
+            if relative.ends_with("-shm") || relative.ends_with("-wal") {
+                continue;
+            }
             if !expected_paths.contains(&relative) {
                 issues.push(serde_json::json!({
                     "kind": "extra_file",
