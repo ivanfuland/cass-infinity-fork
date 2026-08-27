@@ -4017,6 +4017,25 @@ impl FrankenStorage {
                 .with_context(|| format!("creating db directory {}", parent.display()))?;
         }
 
+        // w1b Task B7 (control-plane ruling on plan delta d16's follow-up):
+        // captured before opening -- `FrankenConnection::open_writable`
+        // creates an empty file for a nonexistent path, so this has to be
+        // read first or every open would look "pre-existing". Deliberately
+        // narrow: only `SqliteStorage::open()`'s literal "database file does
+        // not exist yet" case (plan's own wording) routes through the new
+        // `schema::ensure` path below; `run_migrations()` itself is
+        // untouched, so every other caller -- including test helpers like
+        // `franken_storage_in_memory()` that call `run_migrations()`
+        // directly, and tests that hand-rewrite `_schema_migrations`/`meta`
+        // on an already-open storage to simulate a historical version state
+        // -- keeps exercising the pre-existing incremental engine exactly
+        // as before. An earlier attempt gated inside `run_migrations()`
+        // itself instead and broke 55 tests for exactly this reason: once
+        // any storage had user_version>=1 from a fresh build, no amount of
+        // hand-rewriting the legacy bookkeeping could route it back to the
+        // old engine those tests meant to exercise.
+        let is_new_database_file = !path.exists();
+
         let path_str = path.to_string_lossy().to_string();
         let _doctor_guard =
             acquire_doctor_mutation_db_open_guard(path, DOCTOR_MUTATION_DB_OPEN_LOCK_TIMEOUT)?;
@@ -4024,7 +4043,14 @@ impl FrankenStorage {
             .with_context(|| format!("opening frankensqlite db at {}", path.display()))?;
         let storage = Self::new(conn, path.to_path_buf());
         storage.apply_open_stage_busy_timeout();
-        storage.run_migrations()?;
+        if is_new_database_file {
+            crate::storage::schema::ensure(&storage.conn).with_context(|| {
+                format!("building fresh schema for new database at {}", path.display())
+            })?;
+            seed_legacy_schema_version_mirror_for_new_engine_db(&storage.conn)?;
+        } else {
+            storage.run_migrations()?;
+        }
         storage.repair_missing_current_schema_objects()?;
         storage.apply_config()?;
         storage.set_fts_messages_present_cache(true);
@@ -4855,6 +4881,49 @@ fn build_cass_migrations_after_tail_cache() -> Vec<crate::storage::api::FrankenM
             up_sql: MIGRATION_V21,
         },
     ]
+}
+
+/// STAGE B TRANSITION SHIM — retired at Task B8 together with the franken
+/// incremental migration engine it mirrors (grep for this function's name
+/// should find zero call sites once B8 lands).
+///
+/// `schema::ensure` (Task B7) only knows `PRAGMA user_version`; it has no
+/// idea `_schema_migrations`/`meta.schema_version` exist. But
+/// `SqliteStorage::schema_version()` and other pre-existing readers still
+/// read those tables, and both keep being exercised throughout Stage B
+/// until B8 deletes the franken backend they were built for. This backfills
+/// exactly the rows a *fresh* build through the old incremental path would
+/// have written -- built from the same [`build_cass_migrations_before_tail_cache`]
+/// / [`build_cass_migrations_after_tail_cache`] definitions that path itself
+/// runs from (not a hand-typed duplicate list: the fidelity requirement is
+/// that this can never silently drift from what the old path actually
+/// produces) plus the one migration those two lists don't cover (version
+/// 15, applied via a dedicated function -- same version/name pair as
+/// `apply_conversation_tail_state_cache_migration`'s own insert). Only ever
+/// called once, right after `schema::ensure` builds a brand-new database
+/// (see `SqliteStorage::open`), but `INSERT OR IGNORE`/`OR REPLACE` still
+/// make it idempotent in case that call is ever retried.
+fn seed_legacy_schema_version_mirror_for_new_engine_db(conn: &FrankenConnection) -> Result<()> {
+    let mut rows: Vec<(i64, &'static str)> = build_cass_migrations_before_tail_cache()
+        .iter()
+        .map(|m| (m.version, m.name))
+        .collect();
+    rows.push((15, "conversation_tail_state_cache"));
+    rows.extend(build_cass_migrations_after_tail_cache().iter().map(|m| (m.version, m.name)));
+
+    for (version, name) in rows {
+        conn.execute(
+            "INSERT OR IGNORE INTO _schema_migrations(version, name) VALUES (?1, ?2);",
+            fparams![version, name],
+        )
+        .with_context(|| format!("seeding legacy _schema_migrations row for version {version}"))?;
+    }
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?1);",
+        fparams![CURRENT_SCHEMA_VERSION.to_string()],
+    )
+    .with_context(|| "seeding legacy meta.schema_version mirror")?;
+    Ok(())
 }
 
 fn schema_migration_is_applied(conn: &FrankenConnection, version: i64) -> Result<bool> {
@@ -18956,6 +19025,34 @@ mod tests {
         assert!(version >= 5, "Schema version should be at least 5");
     }
 
+    /// STAGE B TRANSITION SHIM TEST — retires together with
+    /// `seed_legacy_schema_version_mirror_for_new_engine_db` at Task B8: a
+    /// fresh database now builds through `schema::ensure` (the
+    /// `user_version`-only new-engine path), but every pre-existing reader
+    /// of `schema_version()`/`_schema_migrations`/`meta.schema_version`
+    /// still needs to see `CURRENT_SCHEMA_VERSION` there until B8 deletes
+    /// that whole reading surface along with the franken backend. This
+    /// asserts both version accounts agree on a freshly-built database.
+    #[test]
+    fn fresh_database_has_consistent_new_and_legacy_schema_versions() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        assert_eq!(
+            storage.schema_version().unwrap(),
+            CURRENT_SCHEMA_VERSION,
+            "legacy schema_version() must still report the current version on a \
+             new-engine-built database"
+        );
+        let user_version = crate::storage::schema::read_user_version(storage.raw()).unwrap();
+        assert_eq!(
+            user_version,
+            crate::storage::schema::CURRENT_SCHEMA_VERSION,
+            "PRAGMA user_version must reflect schema::ensure's own version authority"
+        );
+    }
+
     // =========================================================================
     // Current analytics/schema smoke test (bead z9fse.11)
     // =========================================================================
@@ -19111,6 +19208,15 @@ mod tests {
                 && conversation_cols.contains(&"last_message_created_at".to_string()),
             "fresh schema must include V15 tail columns without ALTER TABLE on conversations"
         );
+        // w1b Task B7 (control-plane ruling, bead z9fse.11): `SqliteStorage::open`
+        // on a new file now builds through `schema::ensure`, which creates
+        // fts_messages eagerly as part of the one-shot fresh DDL -- the old
+        // "V13 creates it, V14 drops it, a later FTS consistency check
+        // recreates it lazily" dance this assertion used to check for is
+        // retired for new-engine databases (that dance existed to work around
+        // a frankensqlite-specific limitation; the machinery itself retires
+        // at Task B8). A fresh database now has exactly one, immediately
+        // queryable, fts_messages schema row from the moment it's built.
         let fts_schema_rows: i64 = conn
             .query_row_map(
                 "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
@@ -19119,8 +19225,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            fts_schema_rows, 0,
-            "fresh schema should not create and immediately drop derived fts_messages"
+            fts_schema_rows, 1,
+            "fresh schema must create fts_messages eagerly, not lazily"
         );
         let integrity: Vec<String> = conn
             .query_all_map("PRAGMA integrity_check;", fparams![], |row: &FrankenRow| {
@@ -23763,15 +23869,13 @@ mod tests {
         {
             // Legacy "duplicate FTS" fixture reconstruction.
             //
-            // Post-V14 migration cass drops the V13-era fts_messages virtual table
-            // and recreates it lazily, so a freshly-opened canonical DB has zero
-            // fts_messages entries in sqlite_master. To reproduce the historical
-            // failure mode this test exercises — a legacy v13 bundle with a
-            // duplicated CREATE VIRTUAL TABLE row — we have to inject *both*
-            // entries: the original V13-era contentless row and the buggy duplicate
-            // row. Before V14 existed the original was already present after
-            // migration and only the duplicate needed manual injection.
-            let legacy_v13_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, content='', tokenize='porter')";
+            // w1b Task B7 (control-plane ruling, bead z9fse.11): `SqliteStorage::open`
+            // on a new file now builds through `schema::ensure`, which creates
+            // fts_messages eagerly -- `source` (opened above) already has exactly
+            // one real fts_messages row, playing the same "one legitimate contentless
+            // entry" role the old V13-era row used to need manual injection for. Only
+            // the buggy duplicate row -- the actual subject of the fixup logic this
+            // test exercises -- needs injecting now.
             let duplicate_legacy_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')";
             let legacy = rusqlite_test_fixture_conn(&source_db);
             legacy
@@ -23787,15 +23891,7 @@ mod tests {
                     [FTS_FRANKEN_REBUILD_META_KEY],
                 )
                 .unwrap();
-            // Inject the V13 original first.
-            legacy
-                .execute(
-                    "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
-                     VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
-                    [legacy_v13_fts_sql],
-                )
-                .unwrap();
-            // Then the duplicate that's the real subject of the fixup logic.
+            // Inject the duplicate that's the real subject of the fixup logic.
             legacy
                 .execute(
                     "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
@@ -25455,21 +25551,24 @@ mod tests {
             bundles[0].probe.schema_version,
             Some(CURRENT_SCHEMA_VERSION)
         );
-        // Post-V14 cass drops the fts_messages virtual table during migration
-        // and recreates it lazily on first open, so a freshly-migrated "clean"
-        // backup has zero fts_messages rows in sqlite_master. The bundle is
-        // still ranked as healthy by `bundle_health_rank` because 0 rows is a
-        // legitimate lazy-FTS state (see comment there).
-        assert_eq!(bundles[0].probe.fts_schema_rows, Some(0));
-        // `fts_queryable` mirrors a direct rusqlite probe; with 0 sqlite_master
-        // rows the table isn't queryable until lazy repair runs.
-        assert!(!bundles[0].probe.fts_queryable);
+        // w1b Task B7 (control-plane ruling, bead z9fse.11): `clean_backup` is
+        // built via `SqliteStorage::open` on a new file, which now creates
+        // fts_messages eagerly through `schema::ensure` -- one real,
+        // immediately-queryable schema row, no lazy repair needed. The bundle
+        // was already ranked healthiest before this change (0 lazy rows was
+        // also a legitimate healthy state); it stays healthiest now.
+        assert_eq!(bundles[0].probe.fts_schema_rows, Some(1));
+        assert!(bundles[0].probe.fts_queryable);
         assert_eq!(bundles[1].probe.schema_version, Some(13));
-        // The replay bundle had V14 run (dropping fts_messages → 0 rows), then
-        // the test rolls meta.schema_version back to 13 and deletes the V14
-        // marker. On Unix CI we also inject a duplicate sqlite_master row to
-        // exercise the malformed-bundle probe path that depends on sqlite3.
-        let expected_fts_schema_rows = if cfg!(windows) { Some(0) } else { Some(1) };
+        // w1b Task B7 (control-plane ruling, bead z9fse.11): `replay_storage`
+        // was also built via `SqliteStorage::open` on a new file, so it
+        // starts with one real, eagerly-created fts_messages row before the
+        // test rolls meta.schema_version back to 13 and deletes the V14
+        // marker (that rollback only touches version bookkeeping, not the
+        // schema object itself). On Unix CI we also inject a duplicate
+        // sqlite_master row on top of that real one to exercise the
+        // malformed-bundle probe path that depends on sqlite3.
+        let expected_fts_schema_rows = if cfg!(windows) { Some(1) } else { Some(2) };
         assert_eq!(bundles[1].probe.fts_schema_rows, expected_fts_schema_rows);
     }
 
@@ -28258,12 +28357,18 @@ mod tests {
         let storage = FrankenStorage::open(&db_path).unwrap();
         assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
 
-        // The FTS5 virtual table is no longer created eagerly by the
-        // migration runner (V14 drops the old internal-content table and the
-        // current contentless table is recreated lazily — see MIGRATION_V14).
-        // Invoke the repair path to match normal cass startup, then assert
-        // there is exactly one fts_messages entry in sqlite_schema (no
-        // duplicates).
+        // w1b Task B7 interaction probe (control-plane ruling, bead z9fse.11):
+        // `schema::ensure` now creates fts_messages eagerly, so by this point
+        // the database already has exactly one, correct fts_messages schema
+        // row -- unlike the pre-B7 world this test originally documented,
+        // where V14 drops the V13-era table and nothing recreates it until a
+        // consistency pass runs. The old lazy-repair machinery
+        // (`ensure_search_fallback_fts_consistency`) still exists and still
+        // runs during normal cass startup until Task B8, so the interaction
+        // that actually matters now is the reverse of what this test used to
+        // check: does that machinery stay a clean no-op -- no duplicate
+        // schema row, still queryable -- when it finds a table that's
+        // already present and correct, rather than absent?
         storage
             .ensure_search_fallback_fts_consistency()
             .expect("ensure FTS consistency after fresh open");

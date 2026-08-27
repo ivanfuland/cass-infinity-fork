@@ -115,9 +115,13 @@ fn rebuild_fts_repopulates_rows() {
             |r| r.get_typed(0),
         )
         .unwrap();
+    // w1b Task B7 (control-plane ruling, bead z9fse.11): fts_messages is now
+    // materialized eagerly by `schema::ensure` at open time. Drop it below
+    // to independently exercise `rebuild_fts()` recreating an absent table,
+    // regardless of the eager-vs-lazy starting state.
     assert_eq!(
-        fts_table_count, 0,
-        "fresh storage keeps db-resident FTS as a derived asset"
+        fts_table_count, 1,
+        "fresh storage materializes db-resident FTS eagerly"
     );
 
     storage
@@ -347,9 +351,12 @@ fn large_batch_insert_can_materialize_derived_fts() {
             |r| r.get_typed(0),
         )
         .unwrap();
+    // w1b Task B7 (control-plane ruling, bead z9fse.11): fts_messages is now
+    // materialized eagerly by `schema::ensure` at open time, not lazily on
+    // first rebuild -- it just isn't populated with this batch's rows yet.
     assert_eq!(
-        fts_table_count, 0,
-        "db-resident FTS should remain absent until explicitly rebuilt"
+        fts_table_count, 1,
+        "db-resident FTS table exists eagerly; explicit rebuild populates it"
     );
 
     storage.rebuild_fts().unwrap();
@@ -478,9 +485,12 @@ fn fresh_db_creates_all_tables() {
         tables.contains(&"conversation_tags".to_string()),
         "conversation_tags table exists"
     );
+    // w1b Task B7 (control-plane ruling, bead z9fse.11): `SqliteStorage::open`
+    // on a new file now builds through `schema::ensure`, which materializes
+    // fts_messages eagerly as part of the one-shot fresh DDL.
     assert!(
-        !tables.contains(&"fts_messages".to_string()),
-        "fresh schema should not materialize derived fts_messages"
+        tables.contains(&"fts_messages".to_string()),
+        "fresh schema must materialize fts_messages eagerly"
     );
     // Sources table (v4)
     assert!(
