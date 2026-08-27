@@ -72224,34 +72224,51 @@ mod cli_read_db_tests {
 
     #[test]
     fn cli_read_db_refuses_corrupt_file_without_writable_fallback() {
+        // w1b Task B9 (2026-08-27, equivalence-gate-caught, control-plane
+        // ruling, same "problem C" family as commit 6ab417b3): franken's
+        // legacy engine validated the SQLite header eagerly, at connection-
+        // open time. Real SQLite (via rusqlite, now backing
+        // `open_franken_cli_read_db` through `storage::api::Conn`) validates
+        // lazily -- `Conn::open_read`'s `Profile::ReadOnly` pragma plan sets
+        // no `journal_mode` (a read-only connection can't change it anyway),
+        // so the only PRAGMA touched at open time is `foreign_keys`, which
+        // is a connection-level setting that never reads the file's page-1
+        // header. Reproduced directly with the underlying `rusqlite` crate
+        // against a copy of this fixture: `Connection::open_with_flags(...,
+        // SQLITE_OPEN_READ_ONLY)` succeeds outright, and even `PRAGMA
+        // foreign_keys;` returns cleanly; only a real schema-touching query
+        // (`SELECT COUNT(*) FROM sqlite_master`) surfaces
+        // `SqliteFailure(NotADatabase, "file is not a database")`. This is a
+        // permanent, structural engine difference, not a regression --
+        // rewritten to assert corruption at the point real SQLite actually
+        // exposes it, pinning both ends of the behavior shift so a future
+        // drift back to eager validation would be noticed either way.
         let temp = TempDir::new().expect("tempdir");
         let db_path = temp.path().join("agent_search.db");
         let corrupt_bytes = b"not a sqlite database";
         std::fs::write(&db_path, corrupt_bytes).expect("write corrupt db bytes");
 
-        let err = match open_franken_cli_read_db(
+        let conn = open_franken_cli_read_db(
             db_path.clone(),
             "corrupt preservation test",
             Duration::from_millis(250),
-        ) {
-            Ok(_) => panic!("corrupt db should not open"),
-            Err(err) => err,
-        };
+        )
+        .expect("vanilla SQLite opens a readonly connection lazily even against a corrupt file");
 
-        assert_eq!(err.kind, CliErrorKind::DbOpen.kind_str());
+        let query_err = conn
+            .query_row_map("SELECT COUNT(*) FROM sqlite_master", &[], |row| {
+                row.get_typed::<i64>(0)
+            })
+            .expect_err("the first real schema-touching query must surface the corruption");
         assert!(
-            err.message.contains("raw readonly open failed"),
-            "error should report the readonly failure chain: {}",
-            err.message
+            matches!(query_err, StorageError::Corrupt { .. }),
+            "corruption must surface as StorageError::Corrupt, got: {query_err:?}"
         );
-        assert!(
-            !err.message.contains("raw open failed"),
-            "read helper must not use a writable fallback: {}",
-            err.message
-        );
+
         assert_eq!(
-            std::fs::read(&db_path).expect("read db after failed open"),
-            corrupt_bytes
+            std::fs::read(&db_path).expect("read db after open+query"),
+            corrupt_bytes,
+            "a readonly connection (open or queried) must never write back to a corrupt file"
         );
     }
 
@@ -72275,6 +72292,19 @@ mod cli_read_db_tests {
 
     #[test]
     fn status_state_probes_large_regular_db_instead_of_trusting_index_mtime() {
+        // w1b Task B9 (2026-08-27, equivalence-gate-caught, control-plane
+        // ruling, same "problem C" family as commit 6ab417b3 and
+        // cli_read_db_refuses_corrupt_file_without_writable_fallback just
+        // above): this test's own sparse, all-zero placeholder is not a
+        // valid SQLite header either, and `probe_state_db_modes` opens it
+        // through the same `open_franken_cli_read_db` -> `Conn::open_read`
+        // path proven lazy there -- open succeeds regardless of the
+        // (invalid) header content; only a real query would fail. What
+        // this test actually guards -- confirmed unaffected by that shift
+        // -- is that a large "regular" db file still gets a real open
+        // attempt (`open_skipped=false`) rather than being short-circuited
+        // by the size heuristic into trusting the lexical index's mtime
+        // instead; that assertion is untouched below.
         let temp = TempDir::new().expect("tempdir");
         let db_path = temp.path().join("agent_search.db");
         let file = std::fs::File::create(&db_path).expect("create sparse db placeholder");
@@ -72291,17 +72321,18 @@ mod cli_read_db_tests {
         assert_eq!(database.get("exists").and_then(|v| v.as_bool()), Some(true));
         assert_eq!(
             database.get("open_skipped").and_then(|v| v.as_bool()),
-            Some(false)
+            Some(false),
+            "a large regular db must still get a real open attempt, not a size-based skip"
         );
         assert_eq!(
             database.get("opened").and_then(|v| v.as_bool()),
-            Some(false)
+            Some(true),
+            "vanilla SQLite opens a readonly connection lazily even against an invalid header"
         );
-        assert!(
-            database
-                .get("open_error")
-                .and_then(|v| v.as_str())
-                .is_some_and(|err| !err.is_empty())
+        assert_eq!(
+            database.get("open_error").and_then(|v| v.as_str()),
+            None,
+            "lazy open reports no open_error; corruption (if any) only surfaces on a real query"
         );
     }
 
