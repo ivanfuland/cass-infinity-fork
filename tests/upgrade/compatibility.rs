@@ -412,6 +412,12 @@ fn test_search_without_fts() {
                 path TEXT NOT NULL UNIQUE,
                 updated_at INTEGER NOT NULL
             );
+            CREATE TABLE conversation_tail_state (
+                conversation_id INTEGER PRIMARY KEY,
+                ended_at INTEGER,
+                last_message_idx INTEGER,
+                last_message_created_at INTEGER
+            );
             INSERT INTO sources (id, kind, path, updated_at) VALUES ('local', 'local', 'default', 0);
             INSERT INTO agents (id, slug, name, kind, created_at, updated_at)
                 VALUES (1, 'test', 'Test Agent', 'cli', 0, 0);
