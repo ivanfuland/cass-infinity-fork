@@ -45520,6 +45520,76 @@ fn doctor_archive_export_event_log(
     doctor_event_log_from_events("embedded_archive_export_events", events)
 }
 
+/// R1-B2: checkpoint the source canonical db before archive export collects
+/// assets. `doctor_archive_export_collect_assets` hashes/copies the main db
+/// file directly off disk, and `-wal`/`-shm` sidecars are never exported
+/// (`doctor_asset_policy` refuses `Export` for
+/// `DoctorAssetClass::ArchiveDbSidecar`) -- so any committed transaction
+/// still sitting only in `-wal` was silently excluded from the export
+/// unless the main db file already carries it.
+///
+/// This opens its own short-lived `Profile::Production` writer connection
+/// (a new write point distinct from any long-lived indexer/writer handle
+/// already open on the same path) and fails closed -- refusing the export
+/// rather than falling back to a stale copy -- when the checkpoint cannot
+/// fully drain and truncate the WAL (blocked by an active writer, or any
+/// open/PRAGMA error). Runs for both `Plan` and `Apply` (not `Verify`,
+/// which never touches the source): planning must checkpoint too, or a
+/// plan's `plan_fingerprint` would be computed over pre-checkpoint bytes
+/// that the later apply's own checkpoint would then change out from under
+/// it, failing the plan/apply fingerprint match for reasons invisible to
+/// the caller.
+fn doctor_archive_export_checkpoint_source(db_path: &Path) -> Result<()> {
+    if !db_path.exists() {
+        // Nothing to checkpoint yet -- `collect_assets` already tolerates a
+        // missing db_path (fresh/empty data dir).
+        return Ok(());
+    }
+    let conn = crate::storage::api::Conn::open_writable(db_path, crate::storage::api::Profile::Production)
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "opening archive export source db for pre-export WAL checkpoint {}: {err}",
+                db_path.display()
+            )
+        })?;
+    let checkpoint_result = doctor_archive_export_run_checkpoint(&conn, db_path);
+    let close_result = conn.close().map_err(|err| {
+        anyhow::anyhow!(
+            "closing archive export pre-export checkpoint handle {}: {err}",
+            db_path.display()
+        )
+    });
+    checkpoint_result?;
+    close_result?;
+    Ok(())
+}
+
+fn doctor_archive_export_run_checkpoint(conn: &crate::storage::api::Conn, db_path: &Path) -> Result<()> {
+    let rows: Vec<(i64, i64, i64)> = conn
+        .query_all_map("PRAGMA wal_checkpoint(TRUNCATE);", &[], |row| {
+            Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?))
+        })
+        .map_err(|err| {
+            anyhow::anyhow!("running pre-export WAL checkpoint {}: {err}", db_path.display())
+        })?;
+    let (busy, log_frames, checkpointed_frames) = *rows.first().ok_or_else(|| {
+        anyhow::anyhow!(
+            "pre-export WAL checkpoint returned no status row: {}",
+            db_path.display()
+        )
+    })?;
+    let left_frames_uncheckpointed = log_frames > 0 && checkpointed_frames < log_frames;
+    if busy > 0 || left_frames_uncheckpointed {
+        anyhow::bail!(
+            "archive export pre-export WAL checkpoint was blocked (busy={busy}, \
+             log_frames={log_frames}, checkpointed_frames={checkpointed_frames}) -- the source \
+             db has an active writer; refusing to export a stale copy: {}",
+            db_path.display()
+        );
+    }
+    Ok(())
+}
+
 /// World-class-doctor pass-2: `cass doctor --ls`. Read-only; lists per-run
 /// artifact directories under `<data_dir>/doctor/runs/`. Output is JSON when
 /// `structured_format` is set; otherwise a human-readable table.
@@ -46874,6 +46944,18 @@ fn run_doctor_archive_export_impl(
         }
         return Ok(());
     }
+
+    doctor_archive_export_checkpoint_source(&db_path).map_err(|err| CliError {
+        code: 4,
+        kind: "io",
+        message: format!("{err:#}"),
+        hint: Some(
+            "Retry once the source database's active writer has finished; archive export \
+             refuses to copy a stale, uncheckpointed source rather than silently drop data."
+                .to_string(),
+        ),
+        retryable: true,
+    })?;
 
     let (assets, warnings) = doctor_archive_export_collect_assets(&data_dir, &db_path);
     let plan = doctor_archive_export_plan_value(

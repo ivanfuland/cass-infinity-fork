@@ -6,6 +6,7 @@ use coding_agent_search::storage::api::StorageError as FrankenError;
 use coding_agent_search::storage::api::Value as ParamValue;
 use coding_agent_search::storage::sqlite::FrankenStorage;
 use coding_agent_search::storage::testing::open_test_writer;
+use coding_agent_search::storage::testing::open_writable_for_tests;
 use fs2::FileExt;
 use serde_json::{Value, json};
 
@@ -7070,6 +7071,178 @@ fn seed_archive_export_fixture(data_dir: &Path) {
         b"derived lexical bytes",
     )
     .expect("write derived lexical asset");
+}
+
+/// R1-B2: like `write_test_sqlite_db`, but deliberately skips the mid-fixture
+/// `PRAGMA wal_checkpoint(TRUNCATE)` -- and, unlike `open_test_writer`'s
+/// `TestWriterGuard`, does not close the connection at all. Closing the
+/// *last* connection to a WAL-mode db makes SQLite auto-checkpoint on close
+/// (`close_best_effort_in_place` never sets
+/// `SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE`, unlike the `_without_checkpoint`
+/// variants), which would silently undo the "committed only in -wal"
+/// fixture shape this needs. The caller must keep the returned connection
+/// alive for as long as the fixture must stay uncheckpointed.
+fn write_test_sqlite_db_leaving_uncheckpointed_wal(path: &Path, marker: &str) -> FrankenConnection {
+    fs::create_dir_all(path.parent().expect("sqlite db parent")).expect("create sqlite db parent");
+    let conn = open_writable_for_tests(path, Profile::Production)
+        .expect("open schema-free fixture database");
+    conn.execute(
+        "CREATE TABLE wal_checkpoint_probe(marker TEXT NOT NULL)",
+        fparams![],
+    )
+    .expect("create wal checkpoint probe table");
+    conn.execute(
+        "INSERT INTO wal_checkpoint_probe(marker) VALUES (?1)",
+        fparams![marker],
+    )
+    .expect("insert wal checkpoint probe marker");
+    conn
+}
+
+/// R1-B2: doctor archive export used to copy the source db as-is, so a
+/// committed transaction still sitting only in `-wal` (never checkpointed
+/// into the main db file) was silently excluded from the export -- the main
+/// db file is the sole carrier of data in the export (sidecar `-wal`/`-shm`
+/// assets are never included; see `seed_archive_export_fixture`'s siblings
+/// below, which assert on `derived`/`sidecar` skip classes). The fix
+/// checkpoints the source before collecting assets so the copy is complete.
+#[test]
+fn doctor_archive_export_checkpoints_uncommitted_wal_before_collecting_assets() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let test_home = temp.path();
+    let data_dir = test_home.join("cass-data");
+    let target_root = test_home.join("exports/wal-checkpoint");
+    fs::create_dir_all(target_root.parent().expect("target parent")).expect("target parent dir");
+    let db_path = data_dir.join("agent_search.db");
+    // Kept alive for the rest of the test: dropping it would be the *last*
+    // connection closing and auto-checkpointing away the fixture's whole
+    // point (see the helper's doc comment).
+    let _fixture_conn = write_test_sqlite_db_leaving_uncheckpointed_wal(&db_path, "wal-only-marker");
+
+    let wal_path = db_path.with_file_name("agent_search.db-wal");
+    let wal_len_before = fs::metadata(&wal_path)
+        .map(|m| m.len())
+        .expect("uncheckpointed fixture must leave a non-empty -wal file");
+    assert!(
+        wal_len_before > 0,
+        "fixture precondition: the marker row must be sitting only in -wal before export"
+    );
+
+    let plan_out = cass_cmd(test_home)
+        .args([
+            "doctor",
+            "archive",
+            "export",
+            target_root.to_str().expect("target utf8"),
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("data utf8"),
+        ])
+        .output()
+        .expect("run archive export plan");
+    assert!(
+        plan_out.status.success(),
+        "archive export plan failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&plan_out.stdout),
+        String::from_utf8_lossy(&plan_out.stderr)
+    );
+    let plan: Value = serde_json::from_slice(&plan_out.stdout).expect("plan json");
+    let fingerprint = plan["plan_fingerprint"].as_str().expect("fingerprint");
+
+    let apply_out = cass_cmd(test_home)
+        .args([
+            "doctor",
+            "archive",
+            "export",
+            target_root.to_str().expect("target utf8"),
+            "--yes",
+            "--plan-fingerprint",
+            fingerprint,
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("data utf8"),
+        ])
+        .output()
+        .expect("run archive export apply");
+    assert!(
+        apply_out.status.success(),
+        "archive export apply failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&apply_out.stdout),
+        String::from_utf8_lossy(&apply_out.stderr)
+    );
+    let apply: Value = serde_json::from_slice(&apply_out.stdout).expect("apply json");
+    assert_eq!(apply["status"].as_str(), Some("applied"), "{apply:#}");
+
+    // The export must checkpoint the SOURCE db too, not just produce a
+    // correct copy -- otherwise plan and apply (both of which collect
+    // assets against the same source) would disagree on `plan_fingerprint`
+    // once the apply's own checkpoint changed the source bytes underneath
+    // an already-issued plan.
+    let wal_len_after_source = fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+    assert_eq!(
+        wal_len_after_source, 0,
+        "archive export must checkpoint+truncate the source db's WAL before collecting assets"
+    );
+
+    let exported_db_path = target_root.join("data/agent_search.db");
+    assert!(exported_db_path.exists(), "exported main db file must exist");
+    let exported =
+        FrankenConnection::open_read(&exported_db_path).expect("open exported db read-only");
+    let marker: String = exported
+        .query_row_map("SELECT marker FROM wal_checkpoint_probe LIMIT 1", &[], |row| {
+            row.get_typed(0)
+        })
+        .expect("the row that was only in -wal before export must be present in the exported copy");
+    assert_eq!(marker, "wal-only-marker");
+}
+
+/// R1-B2 fail-closed branch: when the source db's pre-export checkpoint
+/// cannot run because another connection actively holds a write lock, the
+/// export must refuse outright rather than silently falling back to
+/// whatever stale bytes happen to be on disk.
+#[test]
+fn doctor_archive_export_fails_closed_when_source_checkpoint_is_blocked_by_active_writer() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let test_home = temp.path();
+    let data_dir = test_home.join("cass-data");
+    let target_root = test_home.join("exports/blocked");
+    fs::create_dir_all(target_root.parent().expect("target parent")).expect("target parent dir");
+    let db_path = data_dir.join("agent_search.db");
+    write_test_sqlite_db(&db_path, "blocked-writer");
+
+    let blocker = open_writable_for_tests(&db_path, Profile::Production)
+        .expect("open blocking writer on the export source db");
+    blocker
+        .execute_batch("BEGIN IMMEDIATE;")
+        .expect("hold a write lock on the export source db");
+
+    let plan_out = cass_cmd(test_home)
+        .args([
+            "doctor",
+            "archive",
+            "export",
+            target_root.to_str().expect("target utf8"),
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("data utf8"),
+        ])
+        .output()
+        .expect("run archive export plan while the source db is write-locked");
+
+    blocker.execute_batch("ROLLBACK;").ok();
+
+    assert!(
+        !plan_out.status.success(),
+        "archive export must fail closed (non-zero exit) when the source checkpoint is \
+         blocked by an active writer instead of silently exporting a stale copy: \
+         stdout={} stderr={}",
+        String::from_utf8_lossy(&plan_out.stdout),
+        String::from_utf8_lossy(&plan_out.stderr)
+    );
+    assert!(
+        !target_root.exists(),
+        "a blocked pre-export checkpoint must not leave a partially-created export target"
+    );
 }
 
 #[test]
