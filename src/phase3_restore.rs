@@ -10888,19 +10888,31 @@ mod e7_restore_journal_tests {
         // perturbation nobody would hit outside a test harness is not.
         // Tolerate exactly this one error shape and verify what actually
         // matters -- the recomputed content -- directly instead.
-        let recover_result = restore_recover(&d.journal_path);
-        let outcome = match recover_result {
-            Ok(outcome) => Some(outcome),
-            Err(err) => {
-                let detail = format!("{err:#}");
-                assert!(
-                    detail.contains("existing W1 commit marker disagrees"),
-                    "unexpected recover failure (not the known write-history-divergence \
-                     shape this test tolerates): {detail}"
-                );
-                None
-            }
-        };
+        // STAGE-B-INDEX 收尾债 #7（marker 物理 digest 残余，messy crash 态）；
+        // 本裁决 2026-08-28（cass-sql-advisor，R1-N1 D 案，PR #13 R1 对抗审）:
+        // 这个确定性失败正是该债在测试内的投影——`db_identity_of` 拿整个库
+        // 文件的原始字节做 marker identity 是已知的波2 债（真正的修复要
+        // 触碰 `write_w1_commit_marker` 的 I1 TOCTOU 加固不变量，超出波1
+        // 范围，波1 不动生产语义）。上一版把它当「容忍分支、结果丢弃」处理，
+        // 代价是任何带同款子串的失败都能溜过去——真假绿面。这里升格成
+        // **硬预期断言**：这一确定性错误本身就是当前正确行为，断言它，
+        // 不绕过它。
+        //
+        // 死亡判据：recover 若不带这个错误文本失败，或干脆意外成功，本
+        // 断言必须让测试红——那意味着 I1 的 marker-identity 语义被动过了，
+        // 波2 修复落地的信号就是这里，届时把 `expect_err` 换回
+        // `.unwrap()` 按新语义重写整段，不是继续放宽容忍。
+        let err = restore_recover(&d.journal_path).expect_err(
+            "recover must currently fail with the known W1 commit marker digest \
+             disagreement (STAGE-B-INDEX debt #7); an unexpected Ok means I1's \
+             marker-identity semantics changed underneath this test",
+        );
+        let detail = format!("{err:#}");
+        assert!(
+            detail.contains("existing W1 commit marker disagrees"),
+            "unexpected recover failure shape (not the known digest-disagreement \
+             debt this test pins down): {detail}"
+        );
 
         assert_eq!(
             conv_count(&d.db_path),
@@ -10919,13 +10931,6 @@ mod e7_restore_journal_tests {
              ——这是「这一轮没有任何新的写库动作」在 daily_stats 上的真实验证面，\
              marker 的裸字节 digest 不是（见上方注释）"
         );
-        if let Some(outcome) = &outcome {
-            assert_eq!(
-                outcome.restored + outcome.replaced,
-                0,
-                "这一轮不该有任何新的写库动作"
-            );
-        }
         // 「前进」的观测量：三组事务外动作**必须真的补做**。
         assert!(
             !lexical_checkpoint_present(&d.data_dir),
