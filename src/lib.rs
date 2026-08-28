@@ -2375,6 +2375,15 @@ pub enum IngestCommand {
         /// Output path for the manifest JSONL file.
         #[arg(long)]
         out: PathBuf,
+
+        /// d20: classify subagent transcripts as structurally excluded
+        /// (`exclude_reason = "subagent"`), mirroring the live indexer's
+        /// `CASS_SKIP_SUBAGENTS` opt-in. Default (flag absent): subagent
+        /// transcripts are eligible, matching production `cass index`'s
+        /// default ingestion behavior. The effective value is sealed into
+        /// the manifest header.
+        #[arg(long = "skip-subagents", default_value_t = false)]
+        skip_subagents: bool,
     },
     /// Reconcile a sealed manifest against a database: coverage (forward +
     /// reverse anti-join), root-set attestation, and content conservation.
@@ -8841,10 +8850,12 @@ fn run_ingest_command(cmd: IngestCommand, cli: &Cli) -> CliResult<()> {
             scan_root,
             mirror,
             out,
+            skip_subagents,
         } => crate::ingest_manifest::run_manifest(crate::ingest_manifest::ManifestArgs {
             scan_roots: scan_root,
             mirror,
             out,
+            skip_subagents,
         })
         .map_err(|error| CliError::unknown(error.to_string())),
         IngestCommand::Reconcile {

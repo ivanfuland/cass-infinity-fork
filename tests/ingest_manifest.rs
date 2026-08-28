@@ -194,17 +194,16 @@ fn manifest_reports_eligible_excluded_and_deduped_sessions() {
 }
 
 /// Subagent transcripts (Claude Code's `<session>/subagents/agent-*.jsonl`)
-/// are content-parseable but structurally excluded from the reingest
-/// candidate accounting (plan Task C1: "资格谓词...复用连接器现有判定
-/// （子代理...既有过滤 = 谓词排除项）"). This must fire independent of the
-/// live indexer's `CASS_SKIP_SUBAGENTS` opt-in toggle -- the manifest's job
-/// is a deterministic structural classification, not a mirror of whatever
-/// env var happens to be set when it runs.
-#[test]
-fn manifest_excludes_subagent_transcripts() {
-    let tmp = TempDir::new().unwrap();
-    let root = tmp.path().join("root");
-
+/// are content-parseable and eligible-by-default (d20: production `cass
+/// index` ingests them unless the operator opts in to
+/// `CASS_SKIP_SUBAGENTS`, so the manifest's default classification must
+/// match that live behavior -- treating them as structurally excluded
+/// unconditionally was the modeling error). This must hold independent of
+/// whatever `CASS_SKIP_SUBAGENTS` happens to be set to in the operator's
+/// environment: the manifest's own `--skip-subagents` flag is the only
+/// thing that flips it, mirrored below in
+/// `manifest_subagent_excluded_with_skip_flag_set`.
+fn write_subagent_fixture(root: &Path) {
     write_session(
         &root.join("session-a/session-a.jsonl"),
         concat!(
@@ -219,6 +218,13 @@ fn manifest_excludes_subagent_transcripts() {
             "\n",
         ),
     );
+}
+
+#[test]
+fn manifest_subagent_eligible_by_default() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("root");
+    write_subagent_fixture(&root);
 
     let mirror_dir = tmp.path().join("mirror");
     fs::create_dir_all(&mirror_dir).unwrap();
@@ -235,7 +241,8 @@ fn manifest_excludes_subagent_transcripts() {
         "--out",
         out_path.to_str().unwrap(),
     ]);
-    // Deliberately unset: this must not depend on the operator's live-index toggle.
+    // Deliberately unset and no --skip-subagents flag: default classification
+    // must not depend on the operator's live-index env toggle.
     cmd.env_remove("CASS_SKIP_SUBAGENTS");
     cmd.assert().success();
 
@@ -252,6 +259,102 @@ fn manifest_excludes_subagent_transcripts() {
         &vec![Value::String(root.to_str().unwrap().to_string())],
         "manifest header scan_roots must record the single --scan-root given: {header}"
     );
+    assert_eq!(
+        header["skip_subagents"], false,
+        "manifest header must record the effective --skip-subagents value (default false): {header}"
+    );
+    let lines = all_lines;
+    assert_eq!(
+        lines.len(),
+        2,
+        "expected 2 manifest entries (top-level + subagent, both eligible by default), got {}: {manifest_text}",
+        lines.len()
+    );
+
+    let top_level = lines
+        .iter()
+        .find(|entry| {
+            entry["sources"].as_array().unwrap().iter().any(|s| {
+                s.as_str().unwrap().ends_with("session-a.jsonl")
+                    && !s.as_str().unwrap().contains("subagents")
+            })
+        })
+        .unwrap_or_else(|| panic!("no top-level manifest entry: {manifest_text}"));
+    assert_eq!(top_level["eligible"], true);
+    assert_eq!(top_level["exclude_reason"], Value::Null);
+    assert_eq!(top_level["message_count"], 1);
+    assert_eq!(
+        top_level["content_digest"].as_str().unwrap(),
+        expected_digest(&["Top-level session"]),
+        "top-level entry: {top_level}"
+    );
+
+    // The subagent transcript must be treated exactly like any other
+    // eligible session by default: real identity_key, real message_count,
+    // real content_digest -- not a half-flip that only changed the
+    // `eligible` bit while leaving the excluded-branch's placeholder fields
+    // (message_count=0, empty-message digest) in place.
+    let subagent_entry = lines
+        .iter()
+        .find(|entry| {
+            entry["sources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s.as_str().unwrap().contains("subagents"))
+        })
+        .unwrap_or_else(|| panic!("no subagent manifest entry: {manifest_text}"));
+    assert_eq!(subagent_entry["eligible"], true);
+    assert_eq!(subagent_entry["exclude_reason"], Value::Null);
+    assert_eq!(subagent_entry["message_count"], 1);
+    assert_eq!(
+        subagent_entry["content_digest"].as_str().unwrap(),
+        expected_digest(&["Subagent scratchpad"]),
+        "subagent entry: {subagent_entry}"
+    );
+    let identity_key = subagent_entry["identity_key"].as_str().unwrap();
+    assert!(
+        !identity_key.is_empty(),
+        "subagent entry must carry a real identity_key like any other eligible session: {subagent_entry}"
+    );
+}
+
+#[test]
+fn manifest_subagent_excluded_with_skip_flag_set() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("root");
+    write_subagent_fixture(&root);
+
+    let mirror_dir = tmp.path().join("mirror");
+    fs::create_dir_all(&mirror_dir).unwrap();
+    let out_path = tmp.path().join("manifest.jsonl");
+
+    let mut cmd = base_cmd();
+    cmd.args([
+        "ingest",
+        "manifest",
+        "--scan-root",
+        root.to_str().unwrap(),
+        "--mirror",
+        mirror_dir.to_str().unwrap(),
+        "--out",
+        out_path.to_str().unwrap(),
+        "--skip-subagents",
+    ]);
+    cmd.assert().success();
+
+    let manifest_text = fs::read_to_string(&out_path).unwrap();
+    let mut all_lines: Vec<Value> = manifest_text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad manifest line {l:?}: {e}")))
+        .collect();
+    assert!(!all_lines.is_empty(), "manifest is empty: {manifest_text}");
+    let header = all_lines.remove(0);
+    assert_eq!(
+        header["skip_subagents"], true,
+        "manifest header must record --skip-subagents=true when the flag is passed: {header}"
+    );
     let lines = all_lines;
     assert_eq!(
         lines.len(),
@@ -263,15 +366,16 @@ fn manifest_excludes_subagent_transcripts() {
     let top_level = lines
         .iter()
         .find(|entry| {
-            entry["sources"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|s| s.as_str().unwrap().ends_with("session-a.jsonl") && !s.as_str().unwrap().contains("subagents"))
+            entry["sources"].as_array().unwrap().iter().any(|s| {
+                s.as_str().unwrap().ends_with("session-a.jsonl")
+                    && !s.as_str().unwrap().contains("subagents")
+            })
         })
         .unwrap_or_else(|| panic!("no top-level manifest entry: {manifest_text}"));
-    assert_eq!(top_level["eligible"], true);
-    assert_eq!(top_level["exclude_reason"], Value::Null);
+    assert_eq!(
+        top_level["eligible"], true,
+        "--skip-subagents must not affect the non-subagent entry: {top_level}"
+    );
     assert_eq!(top_level["message_count"], 1);
 
     let subagent_entry = lines
@@ -287,6 +391,11 @@ fn manifest_excludes_subagent_transcripts() {
     assert_eq!(subagent_entry["eligible"], false);
     assert_eq!(subagent_entry["exclude_reason"], "subagent");
     assert_eq!(subagent_entry["message_count"], 0);
+    assert_eq!(
+        subagent_entry["content_digest"].as_str().unwrap(),
+        expected_digest(&[]),
+        "excluded subagent entry: {subagent_entry}"
+    );
 }
 
 /// `identity_key`'s agent-slug component must be the connector's own

@@ -30,6 +30,12 @@ pub struct ManifestArgs {
     pub scan_roots: Vec<PathBuf>,
     pub mirror: PathBuf,
     pub out: PathBuf,
+    /// d20: subagent transcripts are eligible-by-default (production `cass
+    /// index` ingests them unless the operator sets `CASS_SKIP_SUBAGENTS`).
+    /// Only when this flag is set does the manifest classify them as
+    /// structurally excluded (`exclude_reason = "subagent"`), mirroring the
+    /// runtime opt-in rather than reversing it unconditionally.
+    pub skip_subagents: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -39,6 +45,10 @@ struct ManifestHeader {
     /// `cass ingest reconcile --expected-roots` can assert no root was
     /// silently dropped between manifest generation and reconcile.
     scan_roots: Vec<String>,
+    /// d20: the effective `--skip-subagents` value this manifest was
+    /// generated with, sealed into the header so a reconcile run can see
+    /// which subagent policy produced the candidate set.
+    skip_subagents: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -146,11 +156,18 @@ pub fn run_manifest(args: ManifestArgs) -> Result<()> {
                 let identity_key = identity_key_for_conversation(&conv.agent_slug, &conv);
                 let source = conv.source_path.to_string_lossy().into_owned();
 
-                // Subagent transcripts parse fine but are a structural
-                // exclusion (plan Task C1) independent of the live indexer's
-                // CASS_SKIP_SUBAGENTS opt-in toggle -- the manifest always
-                // classifies them, it doesn't mirror a runtime env flag.
-                if crate::indexer::conversation_source_is_subagent(&conv.source_path) {
+                // d20: subagent transcripts are eligible-by-default, the
+                // same as production `cass index` (which ingests them unless
+                // the operator opts in to CASS_SKIP_SUBAGENTS). The manifest
+                // only classifies them as excluded when this run's own
+                // `--skip-subagents` flag mirrors that opt-in -- treating
+                // them as an unconditional structural exclusion was the
+                // modeling error d20 corrects (a real reconcile run found
+                // production DB rows for subagent transcripts that the old
+                // manifest logic could never match).
+                if args.skip_subagents
+                    && crate::indexer::conversation_source_is_subagent(&conv.source_path)
+                {
                     entries
                         .entry(identity_key.clone())
                         .and_modify(|entry| {
@@ -220,6 +237,7 @@ pub fn run_manifest(args: ManifestArgs) -> Result<()> {
     header_roots.sort();
     let header = ManifestHeader {
         scan_roots: header_roots,
+        skip_subagents: args.skip_subagents,
     };
     writeln!(out_file, "{}", serde_json::to_string(&header)?)?;
 
