@@ -118,8 +118,19 @@ pub fn run_manifest(args: ManifestArgs) -> Result<()> {
         let mut scanned_paths: HashSet<PathBuf> = HashSet::new();
 
         connector
-            .scan_with_callback(&ctx, &mut |conv: NormalizedConversation| {
+            .scan_with_callback(&ctx, &mut |mut conv: NormalizedConversation| {
                 scanned_paths.insert(conv.source_path.clone());
+                // Mirror the indexer's own dedup-key normalization
+                // (src/indexer/mod.rs::canonicalize_claude_external_id,
+                // gh #302) before computing identity_key: the claude
+                // connector's raw `external_id` carries a leading
+                // `projects/` segment when scanned via a `~/.claude`-shaped
+                // root (the same rooting `detect_installed_agents` reports),
+                // but the indexer strips that prefix before writing the DB
+                // row. Skipping this step here left every such session's
+                // identity_key permanently unmatchable against reconcile's
+                // DB-side recomputation, exactly like the agent_slug case.
+                crate::indexer::canonicalize_claude_external_id(provider_slug, &mut conv);
                 // Use the conversation's own `agent_slug` (the exact value
                 // `src/indexer/mod.rs` writes into the `agents.slug` DB
                 // column via `conv.agent_slug.clone()`), not the

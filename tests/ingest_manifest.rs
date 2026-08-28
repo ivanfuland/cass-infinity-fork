@@ -300,6 +300,69 @@ fn manifest_excludes_subagent_transcripts() {
 /// claude-connector sessions to show up as both `missing` (manifest side,
 /// keyed `claude|...`) and `unexpected` (DB side, keyed `claude_code|...`).
 #[test]
+fn manifest_identity_key_canonicalizes_claude_external_id_like_the_indexer_does() {
+    // `src/indexer/mod.rs::canonicalize_claude_external_id` (gh #302) exists
+    // precisely because the claude connector's raw `external_id` differs by
+    // a leading `projects/` segment depending on which scan-root form
+    // produced it: `detect_installed_agents` reports `~/.claude` (root
+    // basename `.claude`), which -- because `--scan-root` is used literally,
+    // not root-relative -- yields a `projects/`-prefixed external_id, while
+    // C3's earlier synthetic fixtures (a flat, non-`.claude`-named root)
+    // happened to already land on the canonical bare form and never
+    // exercised this path. The indexer strips the prefix before writing the
+    // DB row; a real reconcile run (2026-08-28, C3 Step 4 second pass)
+    // found the manifest side still emitting the prefixed form for content
+    // scanned via a real `~/.claude`-shaped root, so every such session's
+    // identity_key never matched the DB's recomputed one despite the
+    // agent_slug fix above.
+    let tmp = TempDir::new().unwrap();
+    let claude_home = tmp.path().join(".claude");
+    write_session(
+        &claude_home.join("projects/-workspace-proj/sess-prefixed.jsonl"),
+        concat!(
+            r#"{"type":"user","cwd":"/workspace/proj","sessionId":"sess-prefixed","message":{"role":"user","content":"hi"},"timestamp":"2025-01-01T00:00:00.000Z"}"#,
+            "\n",
+        ),
+    );
+
+    let mirror_dir = tmp.path().join("mirror");
+    fs::create_dir_all(&mirror_dir).unwrap();
+    let out_path = tmp.path().join("manifest.jsonl");
+
+    let mut cmd = base_cmd();
+    cmd.args([
+        "ingest",
+        "manifest",
+        "--scan-root",
+        claude_home.to_str().unwrap(),
+        "--mirror",
+        mirror_dir.to_str().unwrap(),
+        "--out",
+        out_path.to_str().unwrap(),
+    ]);
+    cmd.assert().success();
+
+    let manifest_text = fs::read_to_string(&out_path).unwrap();
+    let mut all_lines: Vec<Value> = manifest_text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad manifest line {l:?}: {e}")))
+        .collect();
+    all_lines.remove(0); // header
+    assert_eq!(all_lines.len(), 1, "expected 1 manifest entry: {manifest_text}");
+
+    let identity_key = all_lines[0]["identity_key"].as_str().unwrap();
+    assert!(
+        !identity_key.contains("|projects/") && !identity_key.contains("|projects\\"),
+        "identity_key must canonicalize away the leading `projects/` segment \
+         from a `~/.claude`-rooted scan the same way \
+         indexer::canonicalize_claude_external_id does before the DB write, \
+         so reconcile's DB-side recomputation (which reads the already-\
+         canonicalized external_id column) can match it: got {identity_key:?}"
+    );
+}
+
+#[test]
 fn manifest_identity_key_uses_conversations_own_agent_slug_not_registry_key() {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path().join("root");

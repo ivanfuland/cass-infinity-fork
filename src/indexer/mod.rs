@@ -24781,7 +24781,10 @@ fn inject_provenance(conv: &mut NormalizedConversation, origin: &Origin) {
 /// single ingest chokepoint makes every path produce one stable key, so dedup
 /// matches an existing row instead of accumulating duplicates as the watcher
 /// runs.
-fn canonicalize_claude_external_id(connector_name: &str, conv: &mut NormalizedConversation) {
+pub(crate) fn canonicalize_claude_external_id(
+    connector_name: &str,
+    conv: &mut NormalizedConversation,
+) {
     if connector_name != "claude" {
         return;
     }
