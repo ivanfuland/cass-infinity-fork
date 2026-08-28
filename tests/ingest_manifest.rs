@@ -598,3 +598,164 @@ fn manifest_identity_key_attributes_openclaw_sessions_to_their_subagent() {
          got {identity_key:?}"
     );
 }
+
+/// d21: a `--scan-root <slug>:<path>` root must be fed only to the
+/// connector registered under that slug -- not broadcast to every
+/// connector the way an unscoped root still is (back-compat). This is the
+/// real over-discovery bug a reconcile run traced to ~2700 manifest rows:
+/// giving connectors a shared broad root let generic extension-based
+/// connectors (claude_code, codex) recurse into another connector's own
+/// nested session directories. Reuses the OpenClaw sub-agent fixture from
+/// `manifest_identity_key_attributes_openclaw_sessions_to_their_subagent`
+/// above, whose own comment already documents that this exact generic
+/// JSON-lines shape gets independently discovered by the claude_code
+/// connector's extension-based matching when the root is broadcast --
+/// scoping the root to `openclaw:` must suppress that cross-connector hit
+/// entirely, not just leave it for the test to filter around.
+#[test]
+fn manifest_scan_root_dispatch_does_not_feed_connector_a_root_to_connector_b() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("root");
+    let wood_sessions = root.join(".openclaw/agents/wood/sessions");
+    fs::create_dir_all(&wood_sessions).unwrap();
+
+    write_session(
+        &wood_sessions.join("s1.jsonl"),
+        concat!(
+            r#"{"type":"session","id":"s1","timestamp":"2026-02-01T16:00:00.000Z","cwd":"/tmp/wood"}"#,
+            "\n",
+            r#"{"type":"message","id":"m1","timestamp":"2026-02-01T16:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"hello wood"}]}}"#,
+            "\n",
+        ),
+    );
+
+    let mirror_dir = tmp.path().join("mirror");
+    fs::create_dir_all(&mirror_dir).unwrap();
+    let out_path = tmp.path().join("manifest.jsonl");
+
+    let scoped_root = format!("openclaw:{}", root.to_str().unwrap());
+    let mut cmd = base_cmd();
+    cmd.args([
+        "ingest",
+        "manifest",
+        "--scan-root",
+        &scoped_root,
+        "--mirror",
+        mirror_dir.to_str().unwrap(),
+        "--out",
+        out_path.to_str().unwrap(),
+    ]);
+    cmd.assert().success();
+
+    let manifest_text = fs::read_to_string(&out_path).unwrap();
+    let mut all_lines: Vec<Value> = manifest_text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad manifest line {l:?}: {e}")))
+        .collect();
+    let header = all_lines.remove(0);
+    assert_eq!(
+        header["scan_roots"].as_array().unwrap(),
+        &vec![Value::String(scoped_root.clone())],
+        "manifest header must record the raw slug-prefixed --scan-root string verbatim: {header}"
+    );
+
+    // Scoping the root to "openclaw" must mean ONLY the openclaw connector
+    // ever sees it -- no other connector (e.g. claude_code, which the sibling
+    // test above documents as independently discovering this exact fixture
+    // shape when the root is broadcast) may produce a candidate entry for
+    // this file at all.
+    assert_eq!(
+        all_lines.len(),
+        1,
+        "a root scoped to \"openclaw:\" must be fed to no other connector, so exactly 1 \
+         manifest entry (the openclaw one) is expected, got {}: {manifest_text}",
+        all_lines.len()
+    );
+    let identity_key = all_lines[0]["identity_key"].as_str().unwrap();
+    assert!(
+        identity_key.starts_with("openclaw/wood|"),
+        "the sole manifest entry from a root scoped to \"openclaw:\" must be the OpenClaw \
+         sub-agent session, not a cross-connector hit: got {identity_key:?}"
+    );
+}
+
+/// d21: an unscoped (no `<slug>:` prefix) `--scan-root` must still be
+/// broadcast to every connector, exactly like before d21 -- this is the
+/// explicit back-compat path the plan calls for.
+#[test]
+fn manifest_scan_root_without_slug_prefix_still_broadcasts_to_every_connector() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("root");
+    write_session(
+        &root.join("session.jsonl"),
+        concat!(
+            r#"{"type":"user","cwd":"/workspace/proj","sessionId":"sess-broadcast","message":{"role":"user","content":"hi"},"timestamp":"2025-01-01T00:00:00.000Z"}"#,
+            "\n",
+        ),
+    );
+
+    let mirror_dir = tmp.path().join("mirror");
+    fs::create_dir_all(&mirror_dir).unwrap();
+    let out_path = tmp.path().join("manifest.jsonl");
+
+    let mut cmd = base_cmd();
+    cmd.args([
+        "ingest",
+        "manifest",
+        "--scan-root",
+        root.to_str().unwrap(),
+        "--mirror",
+        mirror_dir.to_str().unwrap(),
+        "--out",
+        out_path.to_str().unwrap(),
+    ]);
+    cmd.assert().success();
+
+    let manifest_text = fs::read_to_string(&out_path).unwrap();
+    let mut all_lines: Vec<Value> = manifest_text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad manifest line {l:?}: {e}")))
+        .collect();
+    all_lines.remove(0); // header
+    assert_eq!(
+        all_lines.len(),
+        1,
+        "expected 1 manifest entry (claude_code, the only connector this generic fixture's \
+         extension-based discovery matches): {manifest_text}"
+    );
+    let identity_key = all_lines[0]["identity_key"].as_str().unwrap();
+    assert!(
+        identity_key.starts_with("claude_code|"),
+        "unscoped root must still broadcast to the connector that discovers it, same as \
+         pre-d21 behavior: got {identity_key:?}"
+    );
+}
+
+/// d21: an invalid `--scan-root` slug (no registered connector under that
+/// name) must fail loud rather than silently producing an empty manifest.
+#[test]
+fn manifest_scan_root_rejects_unknown_slug() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("root");
+    fs::create_dir_all(&root).unwrap();
+
+    let mirror_dir = tmp.path().join("mirror");
+    fs::create_dir_all(&mirror_dir).unwrap();
+    let out_path = tmp.path().join("manifest.jsonl");
+
+    let bogus_root = format!("not-a-real-connector:{}", root.to_str().unwrap());
+    let mut cmd = base_cmd();
+    cmd.args([
+        "ingest",
+        "manifest",
+        "--scan-root",
+        &bogus_root,
+        "--mirror",
+        mirror_dir.to_str().unwrap(),
+        "--out",
+        out_path.to_str().unwrap(),
+    ]);
+    cmd.assert().failure();
+}

@@ -27,7 +27,10 @@ use crate::connectors::{
 };
 
 pub struct ManifestArgs {
-    pub scan_roots: Vec<PathBuf>,
+    /// Raw `--scan-root` values, each either a plain path (broadcast to
+    /// every connector, back-compat) or `<slug>:<path>` (d21: fed only to
+    /// the connector registered under that `get_connector_factories()` slug).
+    pub scan_roots: Vec<String>,
     pub mirror: PathBuf,
     pub out: PathBuf,
     /// d20: subagent transcripts are eligible-by-default (production `cass
@@ -36,6 +39,29 @@ pub struct ManifestArgs {
     /// structurally excluded (`exclude_reason = "subagent"`), mirroring the
     /// runtime opt-in rather than reversing it unconditionally.
     pub skip_subagents: bool,
+}
+
+/// d21: a parsed `--scan-root` value. Root sets used to be handed to every
+/// connector unconditionally, which let generic extension-based connectors
+/// (claude_code, codex) recurse into other connectors' own nested session
+/// directories (e.g. an OpenClaw sub-agent's embedded `codex-home/sessions`)
+/// -- over-discovery a real reconcile run traced to ~2700 manifest rows the
+/// live indexer's own default detection never touches. Scoping a root to one
+/// connector slug closes that off; the unscoped (`Broadcast`) form preserves
+/// the old shared-root behavior for backward compatibility.
+enum ScanRootSpec {
+    Broadcast(PathBuf),
+    Scoped { slug: String, path: PathBuf },
+}
+
+fn parse_scan_root_spec(raw: &str) -> ScanRootSpec {
+    match raw.split_once(':') {
+        Some((slug, path)) if !slug.is_empty() => ScanRootSpec::Scoped {
+            slug: slug.to_string(),
+            path: PathBuf::from(path),
+        },
+        _ => ScanRootSpec::Broadcast(PathBuf::from(raw)),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -104,14 +130,54 @@ pub fn run_manifest(args: ManifestArgs) -> Result<()> {
     fs::create_dir_all(&args.mirror)
         .with_context(|| format!("creating mirror dir {}", args.mirror.display()))?;
 
-    let scan_roots: Vec<ScanRoot> = args.scan_roots.iter().cloned().map(ScanRoot::local).collect();
+    let specs: Vec<ScanRootSpec> = args
+        .scan_roots
+        .iter()
+        .map(|raw| parse_scan_root_spec(raw))
+        .collect();
+
+    let known_slugs: HashSet<&'static str> = get_connector_factories()
+        .into_iter()
+        .map(|(slug, _)| slug)
+        .collect();
+    for spec in &specs {
+        if let ScanRootSpec::Scoped { slug, .. } = spec {
+            if !known_slugs.contains(slug.as_str()) {
+                anyhow::bail!(
+                    "--scan-root slug {slug:?} does not match any registered connector \
+                     (known slugs: {known_slugs:?})"
+                );
+            }
+        }
+    }
+
+    let broadcast_roots: Vec<PathBuf> = specs
+        .iter()
+        .filter_map(|spec| match spec {
+            ScanRootSpec::Broadcast(path) => Some(path.clone()),
+            ScanRootSpec::Scoped { .. } => None,
+        })
+        .collect();
 
     // Keyed by identity_key for deterministic (sorted) manifest output.
     let mut entries: BTreeMap<String, ManifestEntry> = BTreeMap::new();
 
     for (provider_slug, factory) in get_connector_factories() {
         let connector = factory();
-        let ctx = ScanContext::with_roots(PathBuf::new(), scan_roots.clone(), None);
+
+        // d21: this connector only sees broadcast (unscoped) roots plus
+        // roots explicitly scoped to its own slug -- never another
+        // connector's scoped root.
+        let mut connector_roots: Vec<PathBuf> = broadcast_roots.clone();
+        connector_roots.extend(specs.iter().filter_map(|spec| match spec {
+            ScanRootSpec::Scoped { slug, path } if slug == provider_slug => Some(path.clone()),
+            _ => None,
+        }));
+        if connector_roots.is_empty() {
+            continue;
+        }
+        let scan_roots: Vec<ScanRoot> = connector_roots.into_iter().map(ScanRoot::local).collect();
+        let ctx = ScanContext::with_roots(PathBuf::new(), scan_roots, None);
 
         let discovered_paths: HashSet<PathBuf> = connector
             .discover_source_files(&ctx)
@@ -229,11 +295,10 @@ pub fn run_manifest(args: ManifestArgs) -> Result<()> {
     let mut out_file = fs::File::create(&args.out)
         .with_context(|| format!("creating manifest output {}", args.out.display()))?;
 
-    let mut header_roots: Vec<String> = args
-        .scan_roots
-        .iter()
-        .map(|p| p.to_string_lossy().into_owned())
-        .collect();
+    // Header records the exact raw --scan-root strings (slug prefix
+    // included where given), matching reconcile's --expected-roots
+    // exact-string-set-equality check.
+    let mut header_roots: Vec<String> = args.scan_roots.clone();
     header_roots.sort();
     let header = ManifestHeader {
         scan_roots: header_roots,

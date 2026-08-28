@@ -2363,9 +2363,12 @@ pub enum IngestCommand {
     /// sealed candidate manifest (JSONL), one line per stable session identity.
     Manifest {
         /// Root directory to scan (repeatable). No default-detection fallback:
-        /// all roots must be given explicitly.
+        /// all roots must be given explicitly. Either a plain path
+        /// (broadcast to every connector, back-compat) or
+        /// `<slug>:<path>` (d21: fed only to the connector registered
+        /// under that slug, e.g. `openclaw:/path/to/.openclaw`).
         #[arg(long = "scan-root", required = true)]
-        scan_root: Vec<PathBuf>,
+        scan_root: Vec<String>,
 
         /// Raw-mirror directory associated with this manifest generation
         /// (accepted for interface parity with plan C3; not yet consumed).
