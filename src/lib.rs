@@ -35,6 +35,7 @@ pub mod html_export;
 pub mod incident_discovery;
 pub mod indexer;
 pub mod ingest_manifest;
+pub mod ingest_reconcile;
 pub mod lessons;
 pub mod lessons_extraction;
 pub mod metric_integrity;
@@ -2374,6 +2375,24 @@ pub enum IngestCommand {
         /// Output path for the manifest JSONL file.
         #[arg(long)]
         out: PathBuf,
+    },
+    /// Reconcile a sealed manifest against a database: coverage (forward +
+    /// reverse anti-join), root-set attestation, and content conservation.
+    /// Exit 0 = closed; exit 1 = any discrepancy (each listed in the report).
+    /// The database is the top-level `--db` flag (global in this CLI), not a
+    /// subcommand flag -- `--db` is unconditionally lifted to the front of
+    /// the argument list by `normalize_args`, so a per-subcommand `--db`
+    /// field here would never receive a value.
+    Reconcile {
+        /// Path to a manifest JSONL file produced by `cass ingest manifest`.
+        #[arg(long)]
+        manifest: PathBuf,
+
+        /// Root-set truth file (one scan root per line) independent of the
+        /// manifest itself -- asserted equal to the manifest header's
+        /// scan-root attestation.
+        #[arg(long = "expected-roots")]
+        expected_roots: PathBuf,
     },
 }
 
@@ -8788,7 +8807,7 @@ async fn execute_cli(
                     handle_import(subcmd, cli).await?;
                 }
                 Commands::Ingest(subcmd) => {
-                    run_ingest_command(subcmd)?;
+                    run_ingest_command(subcmd, cli)?;
                 }
                 #[cfg(unix)]
                 Commands::Daemon {
@@ -8816,7 +8835,7 @@ async fn handle_import(cmd: ImportCommand, cli: &Cli) -> CliResult<()> {
     }
 }
 
-fn run_ingest_command(cmd: IngestCommand) -> CliResult<()> {
+fn run_ingest_command(cmd: IngestCommand, cli: &Cli) -> CliResult<()> {
     match cmd {
         IngestCommand::Manifest {
             scan_root,
@@ -8828,6 +8847,39 @@ fn run_ingest_command(cmd: IngestCommand) -> CliResult<()> {
             out,
         })
         .map_err(|error| CliError::unknown(error.to_string())),
+        IngestCommand::Reconcile {
+            manifest,
+            expected_roots,
+        } => {
+            let db = cli.db.clone().ok_or_else(|| {
+                CliError::usage(
+                    "cass ingest reconcile requires --db (the staging database to reconcile; \
+                     there is deliberately no fallback to the production data dir)",
+                    None,
+                )
+            })?;
+            let report = crate::ingest_reconcile::run_reconcile(crate::ingest_reconcile::ReconcileArgs {
+                manifest,
+                db,
+                expected_roots,
+            })
+            .map_err(|error| CliError::unknown(error.to_string()))?;
+            let report_json = serde_json::to_string_pretty(&report)
+                .map_err(|error| CliError::unknown(error.to_string()))?;
+            println!("{report_json}");
+            if report.is_closed() {
+                Ok(())
+            } else {
+                Err(CliError {
+                    code: 1,
+                    kind: "reconcile_discrepancy",
+                    message: "reconcile found coverage/content discrepancies (see report above)"
+                        .to_string(),
+                    hint: None,
+                    retryable: false,
+                })
+            }
+        }
     }
 }
 

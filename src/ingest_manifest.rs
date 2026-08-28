@@ -67,6 +67,15 @@ pub(crate) fn content_digest(messages: &[String]) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
+/// Stable session identity: `{agent_slug}|{workspace}|{external_id}`, blank
+/// for absent workspace/external_id. `pub(crate)` so `ingest_reconcile`
+/// (Task C2) recomputes identity from DB rows with this exact function --
+/// never a second copy of the format string (same discipline as
+/// `content_digest`).
+pub(crate) fn identity_key(agent_slug: &str, workspace: &str, external_id: &str) -> String {
+    format!("{agent_slug}|{workspace}|{external_id}")
+}
+
 fn identity_key_for_conversation(agent_slug: &str, conv: &NormalizedConversation) -> String {
     let workspace = conv
         .workspace
@@ -74,7 +83,7 @@ fn identity_key_for_conversation(agent_slug: &str, conv: &NormalizedConversation
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
     let external_id = conv.external_id.as_deref().unwrap_or_default();
-    format!("{agent_slug}|{workspace}|{external_id}")
+    identity_key(agent_slug, &workspace, external_id)
 }
 
 fn identity_key_for_excluded_file(provider_slug: &str, source_path: &Path) -> String {
