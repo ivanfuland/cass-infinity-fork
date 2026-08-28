@@ -16294,17 +16294,28 @@ fn open_storage_for_index(
     full_index: bool,
 ) -> Result<(FrankenStorage, bool, bool)> {
     if db_path.exists() {
-        match non_destructive_meta_schema_version(db_path) {
-            Ok(Some(version)) if version > crate::storage::sqlite::CURRENT_SCHEMA_VERSION => {
-                return Err(canonical_archive_unhealthy_for_index_error(
-                    db_path,
-                    &format!(
-                        "schema_version {version} is newer than supported version {}",
-                        crate::storage::sqlite::CURRENT_SCHEMA_VERSION
-                    ),
-                ));
-            }
-            Ok(_) => {}
+        match non_destructive_index_open_schema_probe(db_path) {
+            Ok(probe) => match classify_index_open_generation(&probe) {
+                IndexOpenGeneration::CurrentOrEmpty => {}
+                IndexOpenGeneration::NewerThanSupported => {
+                    return Err(canonical_archive_unhealthy_for_index_error(
+                        db_path,
+                        &format!(
+                            "schema_version {} is newer than supported version {}",
+                            probe.user_version,
+                            crate::storage::sqlite::CURRENT_SCHEMA_VERSION
+                        ),
+                    ));
+                }
+                IndexOpenGeneration::LegacyFrankenGeneration => {
+                    return Err(canonical_archive_unhealthy_for_index_error(
+                        db_path,
+                        &legacy_franken_generation_rebuild_not_convert_reason(
+                            probe.legacy_meta_schema_version,
+                        ),
+                    ));
+                }
+            },
             Err(err) if anyhow_chain_indicates_retryable_storage_contention(&err) => {
                 return Err(anyhow::anyhow!(
                     "canonical db is busy/locked during index open; refusing to replace it: {err:#}"
@@ -16363,7 +16374,67 @@ fn index_storage_open_error_reason(err: &anyhow::Error) -> String {
         .unwrap_or(message)
 }
 
-fn non_destructive_meta_schema_version(db_path: &Path) -> Result<Option<i64>> {
+/// R1-B3: `PRAGMA user_version` (the new rusqlite generation's sole
+/// authority, per `schema::ensure`) plus the legacy `meta.schema_version`
+/// marker (present only on franken-generation archives that predate w1b
+/// Task B8, frozen forever at `sqlite.rs`'s
+/// `LEGACY_FRANKEN_SCHEMA_VERSION_CEILING` -- see that constant's doc
+/// comment). The two numbering schemes are unrelated: a bare comparison of
+/// one against the other's ceiling (the bug this replaces) misclassifies
+/// every legacy archive.
+struct IndexOpenSchemaProbe {
+    user_version: i64,
+    legacy_meta_schema_version: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexOpenGeneration {
+    /// Either a current-generation archive (`user_version ==
+    /// CURRENT_SCHEMA_VERSION`) or a genuinely empty/fresh db (`user_version
+    /// == 0` and no legacy marker either) -- the normal open path below
+    /// handles both without any special-casing here.
+    CurrentOrEmpty,
+    /// A franken-generation (pre-w1b-B8) archive: `user_version == 0` with a
+    /// legacy `meta.schema_version` row. Not a "future schema" -- comparing
+    /// its old-numbering value against `CURRENT_SCHEMA_VERSION` is
+    /// meaningless. `schema::ensure` itself rejects any non-empty
+    /// `user_version == 0` database as rebuild-not-convert; this classifies
+    /// the same case earlier, with the correct legacy-specific reason
+    /// instead of misreporting it via the wrong generation's ceiling.
+    LegacyFrankenGeneration,
+    /// A genuine future rusqlite-generation archive: `user_version >
+    /// CURRENT_SCHEMA_VERSION`. This binary is older than the database.
+    NewerThanSupported,
+}
+
+fn classify_index_open_generation(probe: &IndexOpenSchemaProbe) -> IndexOpenGeneration {
+    if probe.user_version > 0 {
+        if probe.user_version > crate::storage::sqlite::CURRENT_SCHEMA_VERSION {
+            return IndexOpenGeneration::NewerThanSupported;
+        }
+        return IndexOpenGeneration::CurrentOrEmpty;
+    }
+    if probe.legacy_meta_schema_version.is_some() {
+        return IndexOpenGeneration::LegacyFrankenGeneration;
+    }
+    IndexOpenGeneration::CurrentOrEmpty
+}
+
+fn legacy_franken_generation_rebuild_not_convert_reason(
+    legacy_meta_schema_version: Option<i64>,
+) -> String {
+    let legacy_version_text =
+        legacy_meta_schema_version.map_or_else(|| "unknown".to_string(), |v| v.to_string());
+    format!(
+        "this is a pre-rusqlite (legacy franken-generation) archive, meta.schema_version=\
+         {legacy_version_text} under the retired franken numbering -- this is a \
+         rebuild-not-convert case, the same as `schema::ensure`'s own user_version=0 \
+         rejection: move the existing archive aside and rebuild it from source with \
+         `cass index --full`, or wait for a future `cass doctor` migration route"
+    )
+}
+
+fn non_destructive_index_open_schema_probe(db_path: &Path) -> Result<IndexOpenSchemaProbe> {
     let mut conn = crate::storage::sqlite::open_franken_raw_readonly_connection_with_timeout(
         db_path,
         Duration::from_secs(10),
@@ -16375,7 +16446,9 @@ fn non_destructive_meta_schema_version(db_path: &Path) -> Result<Option<i64>> {
         )
     })?;
 
-    let result = match conn.query_opt_map(
+    let user_version_result = crate::storage::schema::read_user_version(&conn)
+        .map_err(|err| anyhow::anyhow!("reading canonical archive user_version before index: {err}"));
+    let legacy_meta_schema_version_result = match conn.query_opt_map(
         "SELECT value FROM meta WHERE key = 'schema_version';",
         &[],
         |row| Ok(row.get_typed::<String>(0).ok()),
@@ -16391,12 +16464,15 @@ fn non_destructive_meta_schema_version(db_path: &Path) -> Result<Option<i64>> {
         tracing::debug!(
             error = %close_err,
             db_path = %db_path.display(),
-            "non_destructive_meta_schema_version: close_without_checkpoint_in_place failed"
+            "non_destructive_index_open_schema_probe: close_without_checkpoint_in_place failed"
         );
         conn.close_best_effort_in_place();
     }
 
-    result
+    Ok(IndexOpenSchemaProbe {
+        user_version: user_version_result?,
+        legacy_meta_schema_version: legacy_meta_schema_version_result?,
+    })
 }
 
 fn storage_error_mentions_missing_table_or_column(err: &impl std::fmt::Display) -> bool {
@@ -41816,6 +41892,15 @@ mod tests {
 
     #[test]
     fn open_storage_for_index_refuses_newer_schema_without_replacing_db() {
+        // R1-B3 (w1b Task B9 follow-up, same reason as
+        // `current_schema_fast_probe_rejects_future_schema_marker`'s own
+        // earlier rewrite): the legacy `meta.schema_version` marker this
+        // test used to poke is never written by `schema::ensure` and, after
+        // R1-B3's generation-aware fix, no longer means "future schema" to
+        // `open_storage_for_index` at all -- a *real* rusqlite-generation
+        // "newer than supported" archive is one with `PRAGMA user_version`
+        // itself set past `CURRENT_SCHEMA_VERSION`, so that's what this
+        // fixture simulates now.
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("future-schema.db");
 
@@ -41823,13 +41908,10 @@ mod tests {
             let storage = FrankenStorage::open(&db_path).unwrap();
             storage
                 .raw()
-                .execute(
-                    "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?1)",
-                    &[ParamValue::from(format!(
-                        "{}",
-                        crate::storage::sqlite::CURRENT_SCHEMA_VERSION + 1
-                    ))],
-                )
+                .execute_batch(&format!(
+                    "PRAGMA user_version = {};",
+                    crate::storage::sqlite::CURRENT_SCHEMA_VERSION + 1
+                ))
                 .unwrap();
         }
 
@@ -41860,6 +41942,54 @@ mod tests {
             backup_count == 0,
             "index open must not backup-and-replace a future-schema archive"
         );
+    }
+
+    #[test]
+    fn open_storage_for_index_refuses_legacy_franken_generation_with_rebuild_not_convert_guidance() {
+        // R1-B3: a real pre-w1b-B8 (franken-generation) archive has
+        // `PRAGMA user_version == 0` and a legacy `meta.schema_version` row
+        // (frozen forever, per `sqlite.rs`'s
+        // `LEGACY_FRANKEN_SCHEMA_VERSION_CEILING` doc comment, at 21 under
+        // the old franken numbering -- unrelated to the new rusqlite
+        // generation's own 1-based `CURRENT_SCHEMA_VERSION`). Comparing
+        // that legacy value against `CURRENT_SCHEMA_VERSION` with a bare
+        // `>` (`21 > 1`) used to misreport every such archive as "newer
+        // than supported version 1" -- self-locking it out of ever being
+        // indexed again instead of directing the operator to rebuild it.
+        // Fixture built the same way `sqlite.rs`'s own
+        // `historical_bundle_schema_is_current` coverage simulates a
+        // franken-generation bundle: build a real current-schema db, then
+        // roll `user_version` back to 0 and plant the legacy marker
+        // (`schema::ensure`'s fresh-build DDL leaves `meta` present but
+        // empty, so `INSERT OR REPLACE` is required -- a plain `UPDATE`
+        // against a never-inserted row would be a silent no-op).
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("legacy-generation.db");
+
+        {
+            let storage = FrankenStorage::open(&db_path).unwrap();
+            storage
+                .raw()
+                .execute_batch(
+                    "PRAGMA user_version = 0;
+                     INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', '21');",
+                )
+                .unwrap();
+        }
+
+        let err = match open_storage_for_index(&db_path, false) {
+            Ok(_) => panic!("legacy-generation archive must fail closed before indexing"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            !err.contains("newer than supported"),
+            "legacy-generation archive must not be misdiagnosed as a future schema: {err}"
+        );
+        assert!(
+            err.contains("rebuild-not-convert") && err.contains("cass index --full"),
+            "diagnostic should point at rebuilding, not converting, the legacy archive: {err}"
+        );
+        assert!(db_path.exists(), "canonical DB must remain in place");
     }
 
     #[test]
