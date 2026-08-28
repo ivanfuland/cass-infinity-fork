@@ -10856,6 +10856,11 @@ mod e7_restore_journal_tests {
         let conv_after_first = conv_count(&d.db_path);
         let receipts_after_first = receipt_count(&d.db_path);
         let daily_stats_after_first = daily_stats_snapshot(&d.db_path);
+        // R2-F3: 首跑落地的 marker 逐字节快照——见下方 `expect_err` 之后的
+        // 防覆写断言。
+        let marker_path = d.db_path.parent().unwrap().join(W1_COMMIT_MARKER_FILENAME);
+        let marker_bytes_after_first =
+            std::fs::read(&marker_path).expect("首跑必须已经落地 W1 commit marker");
 
         // 再把现场倒回那个**必然存在**的窗：journal 退回 `planned`，
         // 三组事务外动作的哨兵重新种上（模拟「DB 提交了、journal 没推进就崩了」）。
@@ -10912,6 +10917,20 @@ mod e7_restore_journal_tests {
             detail.contains("existing W1 commit marker disagrees"),
             "unexpected recover failure shape (not the known digest-disagreement \
              debt this test pins down): {detail}"
+        );
+        // R2-F3（非阻断，波2 债 #7 的取证收窄）：这条子串断言只能证明
+        // `write_w1_commit_marker` 判定了「整个 marker 结构体不等」，证不到
+        // 到底是哪个字段不等——那层字段级取证仍然是波2 债 #7 的范围，这里
+        // 不越权补。能在波1 内验的是这条更根本的不变量 I1（"先查后做，绝不
+        // 覆盖"）：拒绝发布之后，磁盘上那份既有 marker 必须与首跑落地时逐
+        // 字节相等——`write_w1_commit_marker` 的 `hard_link` 发布路径失败于
+        // `EEXIST` 时从不触碰 `marker_path` 本身，只有 tmp 文件被清理；这里
+        // 拿真磁盘字节验证这一点，不是假定它。
+        assert_eq!(
+            std::fs::read(&marker_path).expect("recover 拒绝之后 marker 文件必须仍然存在"),
+            marker_bytes_after_first,
+            "recover 因 marker 不一致而拒绝时，绝不能覆写磁盘上既有的 marker —— \
+             这是不变量 I1（先查后做，绝不覆盖）在失败路径上的真实验证"
         );
 
         assert_eq!(
