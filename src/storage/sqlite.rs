@@ -3315,20 +3315,22 @@ impl FrankenStorage {
     /// Apply connection PRAGMAs for parity with SqliteStorage's `apply_pragmas()`.
     ///
     /// The legacy embedded engine supports all PRAGMAs cass uses (journal_mode, synchronous,
-    /// cache_size, foreign_keys, busy_timeout). Its default journal_mode is already
-    /// WAL and default synchronous is NORMAL, matching cass's requirements.
+    /// cache_size, foreign_keys, busy_timeout).
     ///
+    /// R1-B1: `journal_mode` and `synchronous` are deliberately *not* set
+    /// here anymore. Every caller of `apply_config` (`open`, `open_writer`,
+    /// `from_writer_handle_conn`) receives a connection that has already
+    /// gone through `storage::api::Conn::open_writable`'s `apply_profile`,
+    /// which sets both from the caller's `Profile::pragma_plan()` (`WAL` /
+    /// `FULL` for `Profile::Production`, the only profile any current
+    /// caller uses) *and* reads each one back to confirm it took (spec
+    /// R0-B07 / R4-B1). Re-setting them here unconditionally to a fixed
+    /// `WAL`/`NORMAL` pair -- with no readback check -- silently downgraded
+    /// `Profile::Production` connections from the durable `synchronous =
+    /// FULL` the profile promised back down to `NORMAL`, defeating the
+    /// profile's own self-checked guarantee. Trust the profile the
+    /// connection was actually opened with instead of re-deciding here.
     pub fn apply_config(&self) -> Result<()> {
-        // journal_mode: the legacy embedded engine defaults to WAL, same as cass.
-        // synchronous: the legacy embedded engine defaults to NORMAL, same as cass.
-        // Both are set explicitly for clarity.
-        self.conn
-            .execute("PRAGMA journal_mode = WAL;", &[])
-            .with_context(|| "setting journal_mode")?;
-        self.conn
-            .execute("PRAGMA synchronous = NORMAL;", &[])
-            .with_context(|| "setting synchronous")?;
-
         // cache_size: 64MB (negative value = KiB).
         self.conn
             .execute("PRAGMA cache_size = -65536;", &[])
@@ -25497,8 +25499,40 @@ mod tests {
         storage
     }
 
+    fn franken_query_synchronous(conn: &FrankenConnection) -> i64 {
+        conn.query_row_map("PRAGMA synchronous;", &[], |row| row.get_typed(0)).unwrap()
+    }
 
+    /// R1-B1: `apply_config` used to unconditionally run
+    /// `PRAGMA synchronous = NORMAL;` after `FrankenConnection::open_writable`
+    /// had already applied `Profile::Production`'s `synchronous = FULL`
+    /// (config.rs `pragma_plan`, self-checked by `apply_profile`'s readback in
+    /// `backend_sqlite.rs`) -- silently downgrading durability below what the
+    /// profile promised, with no readback check catching the downgrade.
+    /// `FrankenStorage::open`/`open_writer` are the only production entry
+    /// points that call `apply_config`, and both always open with
+    /// `Profile::Production` -- so every writer connection must read back
+    /// FULL (2) after `apply_config`, not NORMAL (1).
+    #[test]
+    fn open_and_open_writer_preserve_production_profile_synchronous_full() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
 
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        assert_eq!(
+            franken_query_synchronous(storage.raw()),
+            2,
+            "FrankenStorage::open must keep Profile::Production's synchronous=FULL after apply_config"
+        );
+        storage.close().unwrap();
+
+        let writer = FrankenStorage::open_writer(&db_path).unwrap();
+        assert_eq!(
+            franken_query_synchronous(writer.raw()),
+            2,
+            "FrankenStorage::open_writer must keep Profile::Production's synchronous=FULL after apply_config"
+        );
+    }
 
 
     #[test]
