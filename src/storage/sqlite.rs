@@ -1324,7 +1324,7 @@ struct HistoricalBundleProbe {
 /// bundle that belongs to the old generation; it must never be bumped --
 /// there is no code path left that can produce a franken-generation bundle
 /// newer than 21.
-const LEGACY_FRANKEN_SCHEMA_VERSION_CEILING: i64 = 21;
+pub(crate) const LEGACY_FRANKEN_SCHEMA_VERSION_CEILING: i64 = 21;
 
 /// Generation-aware replacement for the old bare `schema_version ==
 /// CURRENT_SCHEMA_VERSION` comparison: a bundle counts as schema-current if

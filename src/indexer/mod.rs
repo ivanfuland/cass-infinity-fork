@@ -16414,7 +16414,19 @@ fn classify_index_open_generation(probe: &IndexOpenSchemaProbe) -> IndexOpenGene
         }
         return IndexOpenGeneration::CurrentOrEmpty;
     }
-    if probe.legacy_meta_schema_version.is_some() {
+    // R2-F4: a legacy franken-generation archive's `meta.schema_version` is
+    // frozen forever at `LEGACY_FRANKEN_SCHEMA_VERSION_CEILING` (21) -- see
+    // that constant's doc comment. A bare `.is_some()` here misclassified
+    // *any* `user_version == 0` db carrying an unrelated `meta.schema_version`
+    // value above that ceiling as this generation too, when it's really just
+    // some other `user_version == 0` non-empty db `schema::ensure`'s own
+    // generic rebuild-not-convert rejection already refuses. Values within
+    // the legacy generation's actual range (<= 21) still classify here so
+    // they get the more specific, legacy-aware reason text.
+    if probe
+        .legacy_meta_schema_version
+        .is_some_and(|version| version <= crate::storage::sqlite::LEGACY_FRANKEN_SCHEMA_VERSION_CEILING)
+    {
         return IndexOpenGeneration::LegacyFrankenGeneration;
     }
     IndexOpenGeneration::CurrentOrEmpty
@@ -41988,6 +42000,64 @@ mod tests {
         assert!(
             err.contains("rebuild-not-convert") && err.contains("cass index --full"),
             "diagnostic should point at rebuilding, not converting, the legacy archive: {err}"
+        );
+        assert!(db_path.exists(), "canonical DB must remain in place");
+    }
+
+    #[test]
+    fn open_storage_for_index_does_not_misclassify_an_out_of_range_meta_schema_version_as_legacy() {
+        // R2-F4: `classify_index_open_generation` used to treat *any*
+        // `user_version == 0` db with `legacy_meta_schema_version.is_some()`
+        // as `LegacyFrankenGeneration`, regardless of the value -- but the
+        // legacy franken generation's `meta.schema_version` is frozen
+        // forever at `LEGACY_FRANKEN_SCHEMA_VERSION_CEILING` (21); a value
+        // above that ceiling isn't a franken-generation archive at all, just
+        // some other `user_version == 0` non-empty db that happens to carry
+        // an unrelated row under that key. Misclassifying it hands back the
+        // legacy-specific "pre-rusqlite (legacy franken-generation) archive"
+        // guidance for a db that was never that generation.
+        //
+        // Fixture: same shape as the sibling legacy test above, but with
+        // `meta.schema_version = 999` (comfortably past the ceiling). This
+        // must fall through to `CurrentOrEmpty` and let `schema::ensure`'s
+        // own generic "user_version=0 but not empty" rejection fire instead
+        // -- the same reason `schema::ensure` already gives non-legacy,
+        // non-empty `user_version == 0` databases; the diagnostic text is
+        // generic-and-accurate rather than legacy-specific-and-wrong.
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("out-of-range-meta.db");
+
+        {
+            let storage = FrankenStorage::open(&db_path).unwrap();
+            storage
+                .raw()
+                .execute_batch(
+                    "PRAGMA user_version = 0;
+                     INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', '999');",
+                )
+                .unwrap();
+        }
+
+        let err = match open_storage_for_index(&db_path, false) {
+            Ok(_) => panic!("non-empty user_version=0 archive must fail closed before indexing"),
+            Err(err) => err.to_string(),
+        };
+        // "cass index --full" is NOT a usable discriminator here: it also
+        // appears in `canonical_archive_unhealthy_for_index_error`'s shared
+        // generic remediation boilerplate (the "re-ingest with `cass index
+        // --full`" step), which every archive-unhealthy error carries
+        // regardless of classification. "retired franken numbering" and
+        // "legacy franken-generation" only ever appear in
+        // `legacy_franken_generation_rebuild_not_convert_reason`'s text.
+        assert!(
+            !err.contains("legacy franken-generation") && !err.contains("retired franken numbering"),
+            "a meta.schema_version above the legacy ceiling must not get the \
+             legacy-specific rebuild guidance: {err}"
+        );
+        assert!(
+            err.contains("schema::ensure") && err.contains("can open in place"),
+            "diagnostic should be schema::ensure's own generic user_version=0-but-not-empty \
+             rejection, not a legacy-specific one: {err}"
         );
         assert!(db_path.exists(), "canonical DB must remain in place");
     }
