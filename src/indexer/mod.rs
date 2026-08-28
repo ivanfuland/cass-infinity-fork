@@ -350,7 +350,7 @@ fn skip_subagents_active() -> bool {
 
 /// True when `source_path` is a subagent transcript — it lives directly inside a
 /// `subagents/` directory (e.g. `.../<session>/subagents/agent-1234.jsonl`).
-fn conversation_source_is_subagent(source_path: &Path) -> bool {
+pub(crate) fn conversation_source_is_subagent(source_path: &Path) -> bool {
     source_path
         .parent()
         .and_then(|parent| parent.file_name())

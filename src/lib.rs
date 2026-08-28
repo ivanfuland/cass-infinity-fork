@@ -34,6 +34,7 @@ pub mod guide_planner;
 pub mod html_export;
 pub mod incident_discovery;
 pub mod indexer;
+pub mod ingest_manifest;
 pub mod lessons;
 pub mod lessons_extraction;
 pub mod metric_integrity;
@@ -1658,6 +1659,9 @@ pub enum Commands {
     /// Import data from external sources
     #[command(subcommand)]
     Import(ImportCommand),
+    /// Staging reingest candidate-inventory and coverage tooling (plan v6 Stage C)
+    #[command(subcommand)]
+    Ingest(IngestCommand),
     /// Token usage, tool, and model analytics
     ///
     /// Subcommands: status, tokens, tools, models, rebuild, validate.
@@ -2348,6 +2352,28 @@ pub enum SourcesCommand {
         /// Output progress as JSON (implies non-interactive, for scripting)
         #[arg(long, visible_alias = "robot")]
         json: bool,
+    },
+}
+
+/// Subcommands for staging reingest candidate-inventory tooling (plan v6 Stage C).
+#[derive(Subcommand, Debug, Clone)]
+pub enum IngestCommand {
+    /// Enumerate connector-discovered sessions under explicit scan roots into a
+    /// sealed candidate manifest (JSONL), one line per stable session identity.
+    Manifest {
+        /// Root directory to scan (repeatable). No default-detection fallback:
+        /// all roots must be given explicitly.
+        #[arg(long = "scan-root", required = true)]
+        scan_root: Vec<PathBuf>,
+
+        /// Raw-mirror directory associated with this manifest generation
+        /// (accepted for interface parity with plan C3; not yet consumed).
+        #[arg(long)]
+        mirror: PathBuf,
+
+        /// Output path for the manifest JSONL file.
+        #[arg(long)]
+        out: PathBuf,
     },
 }
 
@@ -8761,6 +8787,9 @@ async fn execute_cli(
                 Commands::Import(subcmd) => {
                     handle_import(subcmd, cli).await?;
                 }
+                Commands::Ingest(subcmd) => {
+                    run_ingest_command(subcmd)?;
+                }
                 #[cfg(unix)]
                 Commands::Daemon {
                     socket,
@@ -8784,6 +8813,21 @@ async fn handle_import(cmd: ImportCommand, cli: &Cli) -> CliResult<()> {
             let structured_format = cli.robot_format.or_else(robot_format_from_env);
             import_chatgpt_export(&path, output_dir.as_deref(), structured_format).await
         }
+    }
+}
+
+fn run_ingest_command(cmd: IngestCommand) -> CliResult<()> {
+    match cmd {
+        IngestCommand::Manifest {
+            scan_root,
+            mirror,
+            out,
+        } => crate::ingest_manifest::run_manifest(crate::ingest_manifest::ManifestArgs {
+            scan_roots: scan_root,
+            mirror,
+            out,
+        })
+        .map_err(|error| CliError::unknown(error.to_string())),
     }
 }
 
@@ -20561,6 +20605,7 @@ fn describe_command(cli: &Cli) -> String {
         #[cfg(unix)]
         Some(Commands::Daemon { .. }) => "daemon".to_string(),
         Some(Commands::Import(..)) => "import".to_string(),
+        Some(Commands::Ingest(..)) => "ingest".to_string(),
         Some(Commands::Analytics(..)) => "analytics".to_string(),
         None => "(default)".to_string(),
     }
