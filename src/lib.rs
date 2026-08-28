@@ -45520,9 +45520,9 @@ fn doctor_archive_export_event_log(
     doctor_event_log_from_events("embedded_archive_export_events", events)
 }
 
-/// R1-B2: checkpoint the source canonical db before archive export collects
-/// assets. `doctor_archive_export_collect_assets` hashes/copies the main db
-/// file directly off disk, and `-wal`/`-shm` sidecars are never exported
+/// R1-B2/R2-F1: checkpoint the source canonical db before archive export
+/// copies it. `doctor_archive_export_collect_assets` hashes/copies the main
+/// db file directly off disk, and `-wal`/`-shm` sidecars are never exported
 /// (`doctor_asset_policy` refuses `Export` for
 /// `DoctorAssetClass::ArchiveDbSidecar`) -- so any committed transaction
 /// still sitting only in `-wal` was silently excluded from the export
@@ -45533,17 +45533,36 @@ fn doctor_archive_export_event_log(
 /// already open on the same path) and fails closed -- refusing the export
 /// rather than falling back to a stale copy -- when the checkpoint cannot
 /// fully drain and truncate the WAL (blocked by an active writer, or any
-/// open/PRAGMA error). Runs for both `Plan` and `Apply` (not `Verify`,
-/// which never touches the source): planning must checkpoint too, or a
-/// plan's `plan_fingerprint` would be computed over pre-checkpoint bytes
-/// that the later apply's own checkpoint would then change out from under
-/// it, failing the plan/apply fingerprint match for reasons invisible to
-/// the caller.
-fn doctor_archive_export_checkpoint_source(db_path: &Path) -> Result<()> {
+/// open/PRAGMA error).
+///
+/// R2-F1: this runs *only* for `Apply`, and only after the caller's
+/// `plan_fingerprint` has already been matched against a plan computed from
+/// the pre-checkpoint state (see `run_doctor_archive_export_impl`) -- never
+/// for `Plan`/dry-run, which must be a true zero-write read of the current
+/// state. WAL-mode commits never touch the main db file's bytes (only a
+/// checkpoint does), so a pre-checkpoint plan's fingerprint is naturally
+/// stable between a Plan call and a later Apply call regardless of
+/// concurrent WAL commits landing in between; this function is the only
+/// thing in this path that is allowed to change those bytes.
+///
+/// Returns an [`DoctorArchiveExportQuiescenceProbe`] opened *after* this
+/// checkpoint has run and its writer connection has closed -- `None` if the
+/// source db does not exist. R2-F2 (probe-connection design, control-plane
+/// re-adjudicated after the original main-db-file-header change-counter
+/// design was disproven by direct experiment: in WAL mode that field tracks
+/// schema changes, not ordinary data commits, so it silently misses the
+/// exact "a writer's ordinary commit gets externally checkpointed during
+/// the copy window" case this exists to catch) uses the probe as the
+/// "quiescent" baseline: `doctor_archive_export_assert_source_quiescent`
+/// re-reads `PRAGMA data_version` on the *same* held connection after the
+/// copy to detect any change.
+fn doctor_archive_export_checkpoint_source(
+    db_path: &Path,
+) -> Result<Option<DoctorArchiveExportQuiescenceProbe>> {
     if !db_path.exists() {
         // Nothing to checkpoint yet -- `collect_assets` already tolerates a
         // missing db_path (fresh/empty data dir).
-        return Ok(());
+        return Ok(None);
     }
     let conn = crate::storage::api::Conn::open_writable(db_path, crate::storage::api::Profile::Production)
         .map_err(|err| {
@@ -45561,6 +45580,85 @@ fn doctor_archive_export_checkpoint_source(db_path: &Path) -> Result<()> {
     });
     checkpoint_result?;
     close_result?;
+    doctor_archive_export_open_quiescence_probe(db_path).map(Some)
+}
+
+/// R2-F2: a read-only connection to the archive-export source db, opened
+/// immediately after this export's own pre-copy checkpoint and held open
+/// across the whole copy window, plus the `PRAGMA data_version` value read
+/// at the moment it was opened. `data_version` is SQLite's own "has another
+/// connection changed this database" signal and (unlike the main db file's
+/// header change counter) does reflect ordinary WAL-mode data commits from
+/// other connections -- but its value is only meaningful compared against
+/// an earlier read *on this same connection*, so the connection must stay
+/// open and be reused for the later comparison, not reopened.
+struct DoctorArchiveExportQuiescenceProbe {
+    conn: crate::storage::api::Conn,
+    baseline_data_version: i64,
+}
+
+fn doctor_archive_export_open_quiescence_probe(
+    db_path: &Path,
+) -> Result<DoctorArchiveExportQuiescenceProbe> {
+    let conn = crate::storage::api::Conn::open_read(db_path).map_err(|err| {
+        anyhow::anyhow!(
+            "opening archive export source db read-only quiescence probe {}: {err}",
+            db_path.display()
+        )
+    })?;
+    let baseline_data_version: i64 = conn
+        .query_row_map("PRAGMA data_version;", &[], |row| row.get_typed(0))
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "reading archive export source db data_version {}: {err}",
+                db_path.display()
+            )
+        })?;
+    Ok(DoctorArchiveExportQuiescenceProbe { conn, baseline_data_version })
+}
+
+/// R2-F2: assert the source db has not been written to since `probe` was
+/// opened. Called after the copy has finished but before verify is allowed
+/// to mark the export `verified`/`applied`.
+///
+/// Any committed transaction necessarily makes `-wal` non-empty (WAL-mode
+/// commits only ever append there) *unless* it has also been checkpointed
+/// by then -- checkpointing truncates `-wal` back to empty, so the `-wal`
+/// check alone would miss that case. But checkpointing a commit is itself a
+/// change another connection made to the database, which SQLite's
+/// `data_version` is specifically defined to detect. Together the two
+/// checks cover the whole copy window: still-uncommitted-to-main shows up
+/// as a non-empty `-wal`; already-checkpointed shows up as a moved
+/// `data_version` on `probe`'s held connection.
+fn doctor_archive_export_assert_source_quiescent(
+    db_path: &Path,
+    probe: &DoctorArchiveExportQuiescenceProbe,
+) -> Result<()> {
+    let wal_len = match doctor_sqlite_sidecar_path(db_path, "-wal") {
+        Some(wal_path) => match std::fs::metadata(&wal_path) {
+            Ok(metadata) => metadata.len(),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => 0,
+            Err(err) => {
+                return Err(anyhow::anyhow!(
+                    "checking archive export source -wal for post-copy quiescence {}: {err}",
+                    wal_path.display()
+                ));
+            }
+        },
+        None => 0,
+    };
+    let current_data_version: i64 = probe
+        .conn
+        .query_row_map("PRAGMA data_version;", &[], |row| row.get_typed(0))
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "reading archive export source db data_version for post-copy quiescence {}: {err}",
+                db_path.display()
+            )
+        })?;
+    if wal_len != 0 || current_data_version != probe.baseline_data_version {
+        anyhow::bail!("source database changed during export; retry when writers are idle");
+    }
     Ok(())
 }
 
@@ -46945,19 +47043,16 @@ fn run_doctor_archive_export_impl(
         return Ok(());
     }
 
-    doctor_archive_export_checkpoint_source(&db_path).map_err(|err| CliError {
-        code: 4,
-        kind: "io",
-        message: format!("{err:#}"),
-        hint: Some(
-            "Retry once the source database's active writer has finished; archive export \
-             refuses to copy a stale, uncheckpointed source rather than silently drop data."
-                .to_string(),
-        ),
-        retryable: true,
-    })?;
-
-    let (assets, warnings) = doctor_archive_export_collect_assets(&data_dir, &db_path);
+    // R2-F1: compute the plan from the *pre-checkpoint* state, for Plan and
+    // Apply alike. This is the plan a Plan/dry-run caller sees (Plan never
+    // checkpoints -- see below), and it is also what an Apply caller's
+    // `--plan-fingerprint` is matched against, *before* this function does
+    // any writing. `plan`/`plan_fingerprint` stay pinned to this
+    // pre-checkpoint value for the rest of the function (the manifest,
+    // receipt, and response report the plan identity that was approved,
+    // not a value recomputed after Apply's own checkpoint changes the
+    // source's bytes underneath it).
+    let (mut assets, warnings) = doctor_archive_export_collect_assets(&data_dir, &db_path);
     let plan = doctor_archive_export_plan_value(
         request.workflow,
         &data_dir,
@@ -46970,17 +47065,9 @@ fn run_doctor_archive_export_impl(
         .as_str()
         .unwrap_or_default()
         .to_string();
-    let required_bytes = plan["required_bytes"].as_u64().unwrap_or(0);
+    let mut required_bytes = plan["required_bytes"].as_u64().unwrap_or(0);
     let target_available_bytes = doctor_archive_export_target_available_bytes(target_root).ok();
     let mut blocked_reasons = Vec::new();
-    if let Some(available) = target_available_bytes
-        && request.command_mode == DoctorArchiveExportCommandMode::Apply
-        && available < required_bytes
-    {
-        blocked_reasons.push(format!(
-            "target has {available} available bytes but archive export requires {required_bytes}"
-        ));
-    }
     if request.command_mode == DoctorArchiveExportCommandMode::Apply
         && request.plan_fingerprint.as_deref() != Some(plan_fingerprint.as_str())
     {
@@ -46997,10 +47084,50 @@ fn run_doctor_archive_export_impl(
     });
     let mut event_log_path = serde_json::Value::Null;
     let status = if request.command_mode == DoctorArchiveExportCommandMode::Plan {
+        // R2-F1: Plan/dry-run is a true zero-write read -- no checkpoint,
+        // no `open_writable`, nothing beyond the `collect_assets` above.
         "planned"
     } else if !blocked_reasons.is_empty() {
+        // Fingerprint mismatch, discovered before any write -- blocked
+        // with zero writes, exactly like the pre-existing space/mismatch
+        // path below.
         "blocked"
     } else {
+        // R2-F1: fingerprint matched -- now (and only now) checkpoint the
+        // source, then recollect assets against the post-checkpoint main
+        // db file. `doctor_archive_export_copy_assets` verifies each
+        // copied byte against `asset.blake3`, so the assets driving the
+        // copy must reflect what the checkpoint just wrote into the main
+        // file, or every copy would fail its own hash check against the
+        // stale pre-checkpoint hash.
+        let quiescence_probe = doctor_archive_export_checkpoint_source(&db_path).map_err(|err| CliError {
+            code: 4,
+            kind: "io",
+            message: format!("{err:#}"),
+            hint: Some(
+                "Retry once the source database's active writer has finished; archive export \
+                 refuses to copy a stale, uncheckpointed source rather than silently drop data."
+                    .to_string(),
+            ),
+            retryable: true,
+        })?;
+        let (assets_post, _warnings_post) = doctor_archive_export_collect_assets(&data_dir, &db_path);
+        required_bytes = assets_post
+            .iter()
+            .filter(|asset| asset.included)
+            .map(|asset| asset.size_bytes)
+            .sum();
+        assets = assets_post;
+        if let Some(available) = target_available_bytes
+            && available < required_bytes
+        {
+            blocked_reasons.push(format!(
+                "target has {available} available bytes but archive export requires {required_bytes}"
+            ));
+        }
+        if !blocked_reasons.is_empty() {
+            "blocked"
+        } else {
         doctor_forensic_create_private_dir_all(target_root).map_err(|err| CliError {
             code: 4,
             kind: "io",
@@ -47048,6 +47175,27 @@ fn run_doctor_archive_export_impl(
                 hint: Some("Retry after checking target filesystem health.".to_string()),
                 retryable: true,
             })?;
+        // R2-F2: the copy is done but not yet verified -- assert the
+        // source hasn't changed since our own checkpoint (a live writer
+        // mid-commit shows up as a non-empty `-wal`; a completed external
+        // checkpoint bypassing WAL shows up as a moved `data_version` on
+        // the held probe connection) before allowing verify to mark this
+        // `verified`/`applied`. No probe means `db_path` didn't exist at
+        // checkpoint time (fresh/empty data dir) -- nothing to compare.
+        if let Some(probe) = quiescence_probe.as_ref() {
+            doctor_archive_export_assert_source_quiescent(&db_path, probe).map_err(|err| CliError {
+                code: 4,
+                kind: "io",
+                message: format!("{err:#}"),
+                hint: Some(
+                    "Retry once the source database's active writer has finished; archive export \
+                     refuses to mark an export verified when the source changed during the copy \
+                     window."
+                        .to_string(),
+                ),
+                retryable: true,
+            })?;
+        }
         verify_status = doctor_archive_export_verify_target(target_root, &data_dir);
         let event_log = doctor_archive_export_event_log(
             &plan_fingerprint,
@@ -47103,6 +47251,7 @@ fn run_doctor_archive_export_impl(
             "applied"
         } else {
             "blocked"
+        }
         }
     };
 
@@ -68500,6 +68649,245 @@ mod doctor_archive_export_path_safety_tests {
         assert!(
             !relative_paths.contains("external-db/agent_search.db-wal"),
             "archive export must not pick a hard-coded default WAL for custom DB paths: {relative_paths:#?}"
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod doctor_archive_export_quiescence_tests {
+    use super::*;
+
+    /// A fully checkpointed, quiescent source db with one committed row.
+    fn quiescent_fixture(db_path: &Path) {
+        std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
+        let conn = crate::storage::api::Conn::open_writable(
+            db_path,
+            crate::storage::api::Profile::Production,
+        )
+        .expect("open quiescence fixture writer");
+        conn.execute("CREATE TABLE quiescence_probe(marker TEXT NOT NULL)", &[])
+            .expect("create quiescence probe table");
+        conn.execute(
+            "INSERT INTO quiescence_probe(marker) VALUES (?1)",
+            &crate::storage::api::params!["seed"],
+        )
+        .expect("seed quiescence probe row");
+        conn.query_all_map("PRAGMA wal_checkpoint(TRUNCATE);", &[], |row| {
+            row.get_value(0)
+        })
+        .expect("checkpoint quiescence fixture");
+        conn.close().expect("close quiescence fixture writer");
+    }
+
+    #[test]
+    fn archive_export_assert_source_quiescent_passes_when_nothing_changed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("agent_search.db");
+        quiescent_fixture(&db_path);
+        let probe =
+            doctor_archive_export_open_quiescence_probe(&db_path).expect("open quiescence probe");
+
+        doctor_archive_export_assert_source_quiescent(&db_path, &probe)
+            .expect("an untouched source must be reported quiescent");
+    }
+
+    #[test]
+    fn archive_export_assert_source_quiescent_fails_when_wal_is_nonempty() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("agent_search.db");
+        quiescent_fixture(&db_path);
+        let probe =
+            doctor_archive_export_open_quiescence_probe(&db_path).expect("open quiescence probe");
+
+        // A live writer mid-commit: open a second connection and leave a
+        // committed transaction sitting only in -wal (don't checkpoint,
+        // don't close -- closing the last connection would auto-checkpoint
+        // and defeat the fixture).
+        let live_writer = crate::storage::api::Conn::open_writable(
+            &db_path,
+            crate::storage::api::Profile::Production,
+        )
+        .expect("open live writer");
+        live_writer
+            .execute(
+                "INSERT INTO quiescence_probe(marker) VALUES (?1)",
+                &crate::storage::api::params!["live-writer"],
+            )
+            .expect("commit a row that stays only in -wal");
+
+        let err = doctor_archive_export_assert_source_quiescent(&db_path, &probe)
+            .expect_err("a non-empty -wal must fail the quiescence assertion");
+        assert!(
+            format!("{err:#}")
+                .contains("source database changed during export; retry when writers are idle"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn archive_export_assert_source_quiescent_fails_when_the_data_version_moved() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("agent_search.db");
+        quiescent_fixture(&db_path);
+        let probe =
+            doctor_archive_export_open_quiescence_probe(&db_path).expect("open quiescence probe");
+
+        // An external checkpoint: another connection commits and then
+        // checkpoints (TRUNCATE), which truncates -wal back to empty -- the
+        // -wal check alone would miss this -- but bumps `data_version` as
+        // read back on `probe`'s still-open connection, since SQLite
+        // defines that pragma to detect exactly this: another connection
+        // changed the database (verified empirically: the main db file's
+        // header change counter this replaced does *not* move for this
+        // scenario -- only for schema changes -- which is why R2-F2 was
+        // re-adjudicated onto `data_version`).
+        let external_checkpointer = crate::storage::api::Conn::open_writable(
+            &db_path,
+            crate::storage::api::Profile::Production,
+        )
+        .expect("open external checkpointer");
+        external_checkpointer
+            .execute(
+                "INSERT INTO quiescence_probe(marker) VALUES (?1)",
+                &crate::storage::api::params!["external-checkpoint"],
+            )
+            .expect("commit a row ahead of the external checkpoint");
+        external_checkpointer
+            .query_all_map("PRAGMA wal_checkpoint(TRUNCATE);", &[], |row| {
+                row.get_value(0)
+            })
+            .expect("run external checkpoint");
+        external_checkpointer
+            .close()
+            .expect("close external checkpointer");
+
+        let err = doctor_archive_export_assert_source_quiescent(&db_path, &probe).expect_err(
+            "a moved data_version must fail the quiescence assertion even with an empty -wal",
+        );
+        assert!(
+            format!("{err:#}")
+                .contains("source database changed during export; retry when writers are idle"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    /// R2-F2 full-chain: races a real writer against
+    /// `run_doctor_archive_export_impl`'s Apply copy window -- as soon as
+    /// this Apply's own checkpoint truncates `-wal` back to empty, a
+    /// background thread commits a fresh transaction landing only in
+    /// `-wal`. The R2-F2 post-copy, pre-verify quiescence assertion must
+    /// catch this and fail closed rather than mark the export
+    /// verified/applied over a source that changed mid-copy.
+    #[test]
+    fn archive_export_apply_fails_closed_when_source_writer_commits_during_the_copy_window() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let target_root = temp.path().join("export");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        let db_path = data_dir.join("agent_search.db");
+        quiescent_fixture(&db_path);
+
+        // Widen the real copy window: give `doctor_archive_export_copy_assets`
+        // enough genuine file I/O to do that the racer thread has a
+        // realistic chance to land its commit before the post-copy
+        // quiescence check -- a single-row fixture's copy is fast enough
+        // that the race is not reliably winnable otherwise.
+        let padding_dir = data_dir.join("raw-mirror/v1/blobs");
+        std::fs::create_dir_all(&padding_dir).expect("create padding dir");
+        for i in 0..200 {
+            std::fs::write(padding_dir.join(format!("pad-{i:04}.bin")), vec![7_u8; 8192])
+                .expect("write padding asset");
+        }
+
+        let (assets, warnings) = doctor_archive_export_collect_assets(&data_dir, &db_path);
+        let plan = doctor_archive_export_plan_value(
+            DoctorArchiveExportWorkflow::Export,
+            &data_dir,
+            &db_path,
+            &target_root,
+            &assets,
+            &warnings,
+        );
+        let plan_fingerprint = plan["plan_fingerprint"]
+            .as_str()
+            .expect("fingerprint")
+            .to_string();
+
+        // Pre-open the racer's writer connection before the race starts, so
+        // the race is just "wait for the signal, then INSERT on an
+        // already-open connection" -- not also paying SQLite
+        // connection-open latency after the signal, which would make the
+        // race unrealistically hard to win on a fast machine. `crate::
+        // storage::api::Conn` isn't `Send` (it boxes a `dyn StorageBackend`),
+        // so this opens straight through `rusqlite` -- fine for a plain
+        // autocommit `INSERT`, and only this test needs `Send`.
+        let racer_conn = rusqlite::Connection::open(&db_path).expect("pre-open racer connection");
+        // R2-F2's own checkpoint truncates -wal to 0 *before* it opens the
+        // quiescence probe connection and reads its baseline `data_version`
+        // (see `doctor_archive_export_checkpoint_source`) -- so polling on
+        // "-wal is empty" fires too early: a commit landing right then races
+        // the probe's own open+baseline-read and can land *before* the
+        // baseline is captured, silently becoming part of the baseline
+        // instead of a detected post-baseline change. `target_root` is only
+        // created (`doctor_forensic_create_private_dir_all`) after the probe
+        // has already opened and captured its baseline, so it's the
+        // earliest externally observable signal that's guaranteed to be
+        // strictly after the baseline -- polling on it gives the racer the
+        // whole rest of the copy window (asset copy + manifest write) to
+        // land its commit, which is the window R2-F2 actually needs to
+        // defend.
+        let racer_target_root = target_root.clone();
+        let racer = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if racer_target_root.exists() {
+                    break;
+                }
+                if std::time::Instant::now() > deadline {
+                    return false;
+                }
+                // Deliberately a tight spin, not `yield_now()` -- on this
+                // box's 20 cores the poll needs to react promptly to the
+                // signal to leave real time inside the copy window; a
+                // cooperative yield adds scheduler-timeslice-scale latency.
+            }
+            racer_conn
+                .execute(
+                    "INSERT INTO quiescence_probe(marker) VALUES (?1)",
+                    rusqlite::params!["race"],
+                )
+                .is_ok()
+        });
+
+        let outcome = run_doctor_archive_export_impl(
+            DoctorArchiveExportRequest {
+                data_dir_override: Some(data_dir.clone()),
+                db_override: None,
+                output_format: None,
+                workflow: DoctorArchiveExportWorkflow::Export,
+                command_mode: DoctorArchiveExportCommandMode::Apply,
+                target_root: Some(target_root.clone()),
+                dry_run: false,
+                yes: true,
+                plan_fingerprint: Some(plan_fingerprint),
+                backup_id: None,
+                force_rebuild: false,
+                allow_repeated_repair: false,
+            },
+            WrapConfig::new(None, true),
+        );
+
+        let raced = racer.join().expect("racer thread panicked");
+        assert!(
+            raced,
+            "race thread never landed its commit inside the copy window; test is inconclusive"
+        );
+        let err = outcome.expect_err(
+            "archive export apply must fail closed when the source changes during the copy window",
+        );
+        assert!(
+            err.message.contains("source database changed during export"),
+            "unexpected error: {err:?}"
         );
     }
 }

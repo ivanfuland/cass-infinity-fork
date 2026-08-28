@@ -7099,13 +7099,17 @@ fn write_test_sqlite_db_leaving_uncheckpointed_wal(path: &Path, marker: &str) ->
     conn
 }
 
-/// R1-B2: doctor archive export used to copy the source db as-is, so a
+/// R1-B2/R2-F1: doctor archive export used to copy the source db as-is, so a
 /// committed transaction still sitting only in `-wal` (never checkpointed
 /// into the main db file) was silently excluded from the export -- the main
 /// db file is the sole carrier of data in the export (sidecar `-wal`/`-shm`
 /// assets are never included; see `seed_archive_export_fixture`'s siblings
 /// below, which assert on `derived`/`sidecar` skip classes). The fix
-/// checkpoints the source before collecting assets so the copy is complete.
+/// checkpoints the source before copying it. R2-F1 narrowed this to Apply
+/// only -- Plan/dry-run must be a true zero-write read (see
+/// `doctor_archive_export_plan_is_a_true_zero_write_read_of_an_uncheckpointed_source`
+/// below) -- so this test now exercises and asserts the checkpoint at the
+/// Apply step, not Plan.
 #[test]
 fn doctor_archive_export_checkpoints_uncommitted_wal_before_collecting_assets() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -7149,6 +7153,14 @@ fn doctor_archive_export_checkpoints_uncommitted_wal_before_collecting_assets() 
     let plan: Value = serde_json::from_slice(&plan_out.stdout).expect("plan json");
     let fingerprint = plan["plan_fingerprint"].as_str().expect("fingerprint");
 
+    // R2-F1: Plan/dry-run must not checkpoint -- the WAL this fixture set up
+    // must still be exactly as large as it was before the Plan call.
+    let wal_len_after_plan = fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+    assert_eq!(
+        wal_len_after_plan, wal_len_before,
+        "archive export Plan/dry-run must not checkpoint the source -- it is a zero-write read"
+    );
+
     let apply_out = cass_cmd(test_home)
         .args([
             "doctor",
@@ -7173,15 +7185,13 @@ fn doctor_archive_export_checkpoints_uncommitted_wal_before_collecting_assets() 
     let apply: Value = serde_json::from_slice(&apply_out.stdout).expect("apply json");
     assert_eq!(apply["status"].as_str(), Some("applied"), "{apply:#}");
 
-    // The export must checkpoint the SOURCE db too, not just produce a
-    // correct copy -- otherwise plan and apply (both of which collect
-    // assets against the same source) would disagree on `plan_fingerprint`
-    // once the apply's own checkpoint changed the source bytes underneath
-    // an already-issued plan.
-    let wal_len_after_source = fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+    // R2-F1: Apply -- not Plan -- must checkpoint+truncate the source WAL
+    // before copying, so the marker row (previously only in -wal) lands in
+    // the exported copy below.
+    let wal_len_after_apply = fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
     assert_eq!(
-        wal_len_after_source, 0,
-        "archive export must checkpoint+truncate the source db's WAL before collecting assets"
+        wal_len_after_apply, 0,
+        "archive export apply must checkpoint+truncate the source db's WAL before collecting the copy manifest"
     );
 
     let exported_db_path = target_root.join("data/agent_search.db");
@@ -7196,10 +7206,14 @@ fn doctor_archive_export_checkpoints_uncommitted_wal_before_collecting_assets() 
     assert_eq!(marker, "wal-only-marker");
 }
 
-/// R1-B2 fail-closed branch: when the source db's pre-export checkpoint
-/// cannot run because another connection actively holds a write lock, the
-/// export must refuse outright rather than silently falling back to
-/// whatever stale bytes happen to be on disk.
+/// R1-B2/R2-F1 fail-closed branch: when the source db's pre-copy checkpoint
+/// cannot run because another connection actively holds a write lock, Apply
+/// must refuse outright rather than silently falling back to whatever stale
+/// bytes happen to be on disk. R2-F1 moved the checkpoint out of Plan
+/// entirely, so this now blocks Apply's checkpoint specifically -- a Plan
+/// call while the writer holds its lock is expected to succeed (Plan never
+/// touches the source beyond reading it), which is exactly why this test
+/// gets its fingerprint from Plan *before* installing the blocker.
 #[test]
 fn doctor_archive_export_fails_closed_when_source_checkpoint_is_blocked_by_active_writer() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -7209,12 +7223,6 @@ fn doctor_archive_export_fails_closed_when_source_checkpoint_is_blocked_by_activ
     fs::create_dir_all(target_root.parent().expect("target parent")).expect("target parent dir");
     let db_path = data_dir.join("agent_search.db");
     write_test_sqlite_db(&db_path, "blocked-writer");
-
-    let blocker = open_writable_for_tests(&db_path, Profile::Production)
-        .expect("open blocking writer on the export source db");
-    blocker
-        .execute_batch("BEGIN IMMEDIATE;")
-        .expect("hold a write lock on the export source db");
 
     let plan_out = cass_cmd(test_home)
         .args([
@@ -7227,21 +7235,136 @@ fn doctor_archive_export_fails_closed_when_source_checkpoint_is_blocked_by_activ
             data_dir.to_str().expect("data utf8"),
         ])
         .output()
-        .expect("run archive export plan while the source db is write-locked");
+        .expect("run archive export plan");
+    assert!(
+        plan_out.status.success(),
+        "archive export plan failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&plan_out.stdout),
+        String::from_utf8_lossy(&plan_out.stderr)
+    );
+    let plan: Value = serde_json::from_slice(&plan_out.stdout).expect("plan json");
+    let fingerprint = plan["plan_fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+
+    let blocker = open_writable_for_tests(&db_path, Profile::Production)
+        .expect("open blocking writer on the export source db");
+    blocker
+        .execute_batch("BEGIN IMMEDIATE;")
+        .expect("hold a write lock on the export source db");
+
+    let apply_out = cass_cmd(test_home)
+        .args([
+            "doctor",
+            "archive",
+            "export",
+            target_root.to_str().expect("target utf8"),
+            "--yes",
+            "--plan-fingerprint",
+            &fingerprint,
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("data utf8"),
+        ])
+        .output()
+        .expect("run archive export apply while the source db is write-locked");
 
     blocker.execute_batch("ROLLBACK;").ok();
 
     assert!(
-        !plan_out.status.success(),
-        "archive export must fail closed (non-zero exit) when the source checkpoint is \
+        !apply_out.status.success(),
+        "archive export apply must fail closed (non-zero exit) when its pre-copy checkpoint is \
          blocked by an active writer instead of silently exporting a stale copy: \
          stdout={} stderr={}",
-        String::from_utf8_lossy(&plan_out.stdout),
-        String::from_utf8_lossy(&plan_out.stderr)
+        String::from_utf8_lossy(&apply_out.stdout),
+        String::from_utf8_lossy(&apply_out.stderr)
     );
     assert!(
         !target_root.exists(),
-        "a blocked pre-export checkpoint must not leave a partially-created export target"
+        "a blocked pre-copy checkpoint must not leave a partially-created export target"
+    );
+}
+
+/// R2-F1: Plan/dry-run must be a true zero-write read of the source db --
+/// no checkpoint, no `open_writable` at all. Before this fix, doctor
+/// archive export ran the same pre-export checkpoint for both Plan and
+/// Apply, which contradicted the dry-run contract documented for
+/// `--dry-run` (a Plan invocation, i.e. no `--yes`, is this command's
+/// dry-run). This asserts a Plan call over a source with a genuine
+/// uncheckpointed WAL leaves the source main db file and its `-wal`
+/// sidecar byte-for-byte untouched, and still reports `planned`.
+#[test]
+fn doctor_archive_export_plan_is_a_true_zero_write_read_of_an_uncheckpointed_source() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let test_home = temp.path();
+    let data_dir = test_home.join("cass-data");
+    let target_root = test_home.join("exports/plan-zero-write");
+    fs::create_dir_all(target_root.parent().expect("target parent")).expect("target parent dir");
+    let db_path = data_dir.join("agent_search.db");
+    // Kept alive for the whole test -- see
+    // `write_test_sqlite_db_leaving_uncheckpointed_wal`'s doc comment:
+    // dropping it would auto-checkpoint on close and defeat the
+    // before/after byte comparison below.
+    let _fixture_conn =
+        write_test_sqlite_db_leaving_uncheckpointed_wal(&db_path, "plan-zero-write-marker");
+
+    let wal_path = db_path.with_file_name("agent_search.db-wal");
+    let db_len_before = fs::metadata(&db_path).expect("main db file must exist").len();
+    let wal_len_before = fs::metadata(&wal_path)
+        .map(|m| m.len())
+        .expect("uncheckpointed fixture must leave a non-empty -wal file");
+    assert!(
+        wal_len_before > 0,
+        "fixture precondition: the marker row must be sitting only in -wal before Plan"
+    );
+    let db_blake3_before = test_file_blake3(&db_path);
+    let wal_blake3_before = test_file_blake3(&wal_path);
+
+    let plan_out = cass_cmd(test_home)
+        .args([
+            "doctor",
+            "archive",
+            "export",
+            target_root.to_str().expect("target utf8"),
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("data utf8"),
+        ])
+        .output()
+        .expect("run archive export plan");
+    assert!(
+        plan_out.status.success(),
+        "archive export plan failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&plan_out.stdout),
+        String::from_utf8_lossy(&plan_out.stderr)
+    );
+    let plan: Value = serde_json::from_slice(&plan_out.stdout).expect("plan json");
+    assert_eq!(plan["status"].as_str(), Some("planned"), "{plan:#}");
+
+    let db_len_after = fs::metadata(&db_path)
+        .expect("main db file must still exist after Plan")
+        .len();
+    let wal_len_after = fs::metadata(&wal_path)
+        .expect("-wal file must still exist after Plan")
+        .len();
+    assert_eq!(
+        db_len_after, db_len_before,
+        "Plan/dry-run must not change the source main db file's size"
+    );
+    assert_eq!(
+        wal_len_after, wal_len_before,
+        "Plan/dry-run must not change the source -wal file's size"
+    );
+    assert_eq!(
+        test_file_blake3(&db_path),
+        db_blake3_before,
+        "Plan/dry-run must not change a single byte of the source main db file"
+    );
+    assert_eq!(
+        test_file_blake3(&wal_path),
+        wal_blake3_before,
+        "Plan/dry-run must not change a single byte of the source -wal file"
     );
 }
 
