@@ -288,3 +288,141 @@ fn manifest_excludes_subagent_transcripts() {
     assert_eq!(subagent_entry["exclude_reason"], "subagent");
     assert_eq!(subagent_entry["message_count"], 0);
 }
+
+/// `identity_key`'s agent-slug component must be the connector's own
+/// per-conversation `NormalizedConversation.agent_slug` (the exact value
+/// `src/indexer/mod.rs` uses when it writes the `agents.slug` DB column --
+/// `let agent_slug = conv.agent_slug.clone();`), not the `get_connector_factories()`
+/// registry key used only to dispatch to the connector. The claude_code
+/// connector sets `agent_slug: "claude_code"` on every conversation it
+/// emits, while its registry key is `"claude"` -- a real-world reconcile run
+/// (2026-08-28, C3 Step 4) found this exact divergence caused ~100% of
+/// claude-connector sessions to show up as both `missing` (manifest side,
+/// keyed `claude|...`) and `unexpected` (DB side, keyed `claude_code|...`).
+#[test]
+fn manifest_identity_key_uses_conversations_own_agent_slug_not_registry_key() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("root");
+
+    write_session(
+        &root.join("session.jsonl"),
+        concat!(
+            r#"{"type":"user","cwd":"/workspace/proj","sessionId":"sess-claude","message":{"role":"user","content":"hi"},"timestamp":"2025-01-01T00:00:00.000Z"}"#,
+            "\n",
+        ),
+    );
+
+    let mirror_dir = tmp.path().join("mirror");
+    fs::create_dir_all(&mirror_dir).unwrap();
+    let out_path = tmp.path().join("manifest.jsonl");
+
+    let mut cmd = base_cmd();
+    cmd.args([
+        "ingest",
+        "manifest",
+        "--scan-root",
+        root.to_str().unwrap(),
+        "--mirror",
+        mirror_dir.to_str().unwrap(),
+        "--out",
+        out_path.to_str().unwrap(),
+    ]);
+    cmd.assert().success();
+
+    let manifest_text = fs::read_to_string(&out_path).unwrap();
+    let mut all_lines: Vec<Value> = manifest_text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad manifest line {l:?}: {e}")))
+        .collect();
+    all_lines.remove(0); // header
+    assert_eq!(all_lines.len(), 1, "expected 1 manifest entry: {manifest_text}");
+
+    let entry = &all_lines[0];
+    let identity_key = entry["identity_key"].as_str().unwrap();
+    assert!(
+        identity_key.starts_with("claude_code|"),
+        "identity_key must use the conversation's own agent_slug (\"claude_code\", matching \
+         the agents.slug DB column the indexer writes), not the connector registry key \
+         (\"claude\"): got {identity_key:?}"
+    );
+}
+
+/// OpenClaw sessions are attributed to a per-sub-agent identity
+/// (`openclaw/<name>`, computed inside the connector itself from the
+/// `<root>/.openclaw/agents/<name>/sessions/` directory shape) rather than a
+/// flat `"openclaw"` slug -- this is a real 1-to-N split the indexer's DB
+/// write path (`conv.agent_slug`) already respects. The manifest's
+/// identity_key must follow the same per-sub-agent attribution, or every
+/// OpenClaw session in the corpus mismatches reconcile the same way the
+/// claude_code case does.
+#[test]
+fn manifest_identity_key_attributes_openclaw_sessions_to_their_subagent() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("root");
+    let wood_sessions = root.join(".openclaw/agents/wood/sessions");
+    fs::create_dir_all(&wood_sessions).unwrap();
+
+    write_session(
+        &wood_sessions.join("s1.jsonl"),
+        concat!(
+            r#"{"type":"session","id":"s1","timestamp":"2026-02-01T16:00:00.000Z","cwd":"/tmp/wood"}"#,
+            "\n",
+            r#"{"type":"message","id":"m1","timestamp":"2026-02-01T16:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"hello wood"}]}}"#,
+            "\n",
+        ),
+    );
+
+    let mirror_dir = tmp.path().join("mirror");
+    fs::create_dir_all(&mirror_dir).unwrap();
+    let out_path = tmp.path().join("manifest.jsonl");
+
+    let mut cmd = base_cmd();
+    cmd.args([
+        "ingest",
+        "manifest",
+        "--scan-root",
+        root.to_str().unwrap(),
+        "--mirror",
+        mirror_dir.to_str().unwrap(),
+        "--out",
+        out_path.to_str().unwrap(),
+    ]);
+    cmd.assert().success();
+
+    let manifest_text = fs::read_to_string(&out_path).unwrap();
+    let mut all_lines: Vec<Value> = manifest_text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad manifest line {l:?}: {e}")))
+        .collect();
+    all_lines.remove(0); // header
+
+    // The fixture's generic JSON-lines shape also matches the claude_code
+    // connector's own (extension-based, not directory-structure-based) file
+    // discovery, so it may produce an unrelated extra candidate entry for
+    // the same file under a different connector -- find the OpenClaw entry
+    // specifically rather than assuming there is exactly one entry total.
+    let openclaw_entries: Vec<&Value> = all_lines
+        .iter()
+        .filter(|entry| {
+            entry["identity_key"]
+                .as_str()
+                .is_some_and(|k| k.starts_with("openclaw"))
+        })
+        .collect();
+    assert_eq!(
+        openclaw_entries.len(),
+        1,
+        "expected exactly 1 openclaw-attributed manifest entry: {manifest_text}"
+    );
+
+    let identity_key = openclaw_entries[0]["identity_key"].as_str().unwrap();
+    assert!(
+        identity_key.starts_with("openclaw/wood|"),
+        "identity_key must attribute this session to its OpenClaw sub-agent \
+         (\"openclaw/wood\", matching the agents.slug DB column the indexer writes \
+         via conv.agent_slug), not the flat connector registry key (\"openclaw\"): \
+         got {identity_key:?}"
+    );
+}

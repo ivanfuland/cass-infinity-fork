@@ -120,7 +120,19 @@ pub fn run_manifest(args: ManifestArgs) -> Result<()> {
         connector
             .scan_with_callback(&ctx, &mut |conv: NormalizedConversation| {
                 scanned_paths.insert(conv.source_path.clone());
-                let identity_key = identity_key_for_conversation(provider_slug, &conv);
+                // Use the conversation's own `agent_slug` (the exact value
+                // `src/indexer/mod.rs` writes into the `agents.slug` DB
+                // column via `conv.agent_slug.clone()`), not the
+                // `get_connector_factories()` registry key (`provider_slug`)
+                // used only to dispatch to this connector. Some connectors
+                // remap or split their registry slug per-conversation --
+                // e.g. claude_code always emits `agent_slug: "claude_code"`
+                // (registry key is `"claude"`), and OpenClaw computes a
+                // per-sub-agent `"openclaw/<name>"` slug internally. Using
+                // `provider_slug` here made every such conversation's
+                // identity_key permanently unmatchable against the DB's
+                // recomputed identity in `cass ingest reconcile`.
+                let identity_key = identity_key_for_conversation(&conv.agent_slug, &conv);
                 let source = conv.source_path.to_string_lossy().into_owned();
 
                 // Subagent transcripts parse fine but are a structural
