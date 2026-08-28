@@ -98,11 +98,36 @@ fn manifest_reports_eligible_excluded_and_deduped_sessions() {
 
     let manifest_text = fs::read_to_string(&out_path)
         .unwrap_or_else(|e| panic!("manifest output file missing at {out_path:?}: {e}"));
-    let lines: Vec<Value> = manifest_text
+    let mut all_lines: Vec<Value> = manifest_text
         .lines()
         .filter(|l| !l.trim().is_empty())
         .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad manifest line {l:?}: {e}")))
         .collect();
+    assert!(!all_lines.is_empty(), "manifest is empty: {manifest_text}");
+
+    // First line is the root-set attestation header (plan v6 Stage C Task C2:
+    // "manifest 头部记录生成时的扫描根全集摘要" -- reconcile's --expected-roots
+    // check needs this). Distinguished from candidate entries by the
+    // scan_roots key, which no candidate line carries.
+    let header = all_lines.remove(0);
+    let mut header_roots: Vec<String> = header["scan_roots"]
+        .as_array()
+        .unwrap_or_else(|| panic!("manifest header missing scan_roots array: {header}"))
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    header_roots.sort();
+    let mut expected_roots = vec![
+        root_a.to_str().unwrap().to_string(),
+        root_b.to_str().unwrap().to_string(),
+    ];
+    expected_roots.sort();
+    assert_eq!(
+        header_roots, expected_roots,
+        "manifest header scan_roots must record the exact --scan-root set"
+    );
+
+    let lines = all_lines;
     assert_eq!(
         lines.len(),
         3,
@@ -215,11 +240,19 @@ fn manifest_excludes_subagent_transcripts() {
     cmd.assert().success();
 
     let manifest_text = fs::read_to_string(&out_path).unwrap();
-    let lines: Vec<Value> = manifest_text
+    let mut all_lines: Vec<Value> = manifest_text
         .lines()
         .filter(|l| !l.trim().is_empty())
         .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad manifest line {l:?}: {e}")))
         .collect();
+    assert!(!all_lines.is_empty(), "manifest is empty: {manifest_text}");
+    let header = all_lines.remove(0);
+    assert_eq!(
+        header["scan_roots"].as_array().unwrap(),
+        &vec![Value::String(root.to_str().unwrap().to_string())],
+        "manifest header scan_roots must record the single --scan-root given: {header}"
+    );
+    let lines = all_lines;
     assert_eq!(
         lines.len(),
         2,

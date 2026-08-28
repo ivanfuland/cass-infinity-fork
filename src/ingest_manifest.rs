@@ -33,6 +33,15 @@ pub struct ManifestArgs {
 }
 
 #[derive(Debug, Serialize)]
+struct ManifestHeader {
+    /// Root-set attestation (plan v6 Stage C Task C2, R2-F5): the exact
+    /// `--scan-root` set this manifest was generated against, so
+    /// `cass ingest reconcile --expected-roots` can assert no root was
+    /// silently dropped between manifest generation and reconcile.
+    scan_roots: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
 struct ManifestEntry {
     identity_key: String,
     sources: Vec<String>,
@@ -45,7 +54,10 @@ struct ManifestEntry {
 /// `blake3(concat(u32_le(len(content_utf8)) || content_utf8))` over each
 /// message's raw content, in source-parse order. No role/timestamp/metadata
 /// -- plan v6 Stage C Task C1 digest contract (R1-S14/NG4 + R3-N5).
-fn content_digest(messages: &[String]) -> String {
+///
+/// `pub(crate)` so `ingest_reconcile` (Task C2) recomputes with this exact
+/// function -- never a second copy of the formula.
+pub(crate) fn content_digest(messages: &[String]) -> String {
     let mut hasher = Hasher::new();
     for content in messages {
         let bytes = content.as_bytes();
@@ -167,6 +179,18 @@ pub fn run_manifest(args: ManifestArgs) -> Result<()> {
 
     let mut out_file = fs::File::create(&args.out)
         .with_context(|| format!("creating manifest output {}", args.out.display()))?;
+
+    let mut header_roots: Vec<String> = args
+        .scan_roots
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    header_roots.sort();
+    let header = ManifestHeader {
+        scan_roots: header_roots,
+    };
+    writeln!(out_file, "{}", serde_json::to_string(&header)?)?;
+
     for entry in entries.values() {
         let line = serde_json::to_string(entry)?;
         writeln!(out_file, "{line}")?;
