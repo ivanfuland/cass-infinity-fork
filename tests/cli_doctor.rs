@@ -1,9 +1,12 @@
 use assert_cmd::Command;
 use coding_agent_search::search::tantivy::expected_index_dir;
 use coding_agent_search::storage::api::Conn as FrankenConnection;
+use coding_agent_search::storage::api::Profile;
 use coding_agent_search::storage::api::StorageError as FrankenError;
 use coding_agent_search::storage::api::Value as ParamValue;
-use coding_agent_search::storage::sqlite::{ConnectionManagerConfig, FrankenConnectionManager, FrankenStorage};
+use coding_agent_search::storage::sqlite::FrankenStorage;
+use coding_agent_search::storage::testing::open_test_writer;
+use coding_agent_search::storage::testing::open_writable_for_tests;
 use fs2::FileExt;
 use serde_json::{Value, json};
 
@@ -23,7 +26,7 @@ macro_rules! fparams {
 /// crate-private (R2-F3), so this integration test (a separate crate)
 /// opens through `FrankenStorage::open` + `into_raw()`. When `path` is a
 /// fresh file this also applies cass's own migrations before handing back
-/// the raw connection (unlike the pre-migration native-`frankensqlite`
+/// the raw connection (unlike the pre-migration native-`legacy-engine`
 /// `Connection::open`, which opened schema-free); when `path` already holds
 /// a cass db (the common case here — most callers reopen a db a prior `cass
 /// index` run already created) this is a no-op idempotent reopen.
@@ -263,25 +266,20 @@ fn seed_healthy_empty_index(test_home: &Path, data_dir: &Path) {
 /// `open_raw()` (`FrankenStorage::open().into_raw()`) runs cass's real
 /// migrations on a fresh file, which both plants unrelated cass tables in
 /// what's meant to be a bare fixture and (confirmed via equivalence-gate
-/// baseline-vs-candidate diff) leaves a frankensqlite `-fsqlite-ns-gate`
+/// baseline-vs-candidate diff) leaves a legacy embedded engine `-fsqlite-ns-gate`
 /// namespace sidecar the pre-migration bare `frankensqlite::Connection::open`
 /// never did, tripping `doctor archive export`'s asset-manifest accounting.
-/// Routes through `FrankenConnectionManager` instead — same schema-free
-/// bridge as the `tests/storage.rs` fix in `7bd20321`. Other `open_raw()`
-/// call sites in this file reopen a db a prior `cass index` CLI run already
-/// migrated (just inserting extra fixture rows into existing tables) and are
-/// unaffected by this fixture's schema, so they're left on `open_raw()`.
+/// Routes through `storage::testing::open_test_writer` instead (w1b Task B4
+/// Q3's sanctioned schema-free bridge for `tests/`, replacing the old
+/// `FrankenConnectionManager` bridge the `tests/storage.rs` fix in
+/// `7bd20321` used). Other `open_raw()` call sites in this file reopen a db
+/// a prior `cass index` CLI run already migrated (just inserting extra
+/// fixture rows into existing tables) and are unaffected by this fixture's
+/// schema, so they're left on `open_raw()`.
 fn write_test_sqlite_db(path: &Path, marker: &str) {
     fs::create_dir_all(path.parent().expect("sqlite db parent")).expect("create sqlite db parent");
-    let mgr = FrankenConnectionManager::new(
-        path,
-        ConnectionManagerConfig {
-            reader_count: 1,
-            max_writers: 1,
-        },
-    )
-    .expect("open schema-free fixture database");
-    let mut guard = mgr.writer().expect("acquire fixture writer");
+    let mut guard =
+        open_test_writer(path, Profile::Production).expect("open schema-free fixture database");
     let conn = guard.storage().raw();
     conn.execute(
         "CREATE TABLE restore_probe(marker TEXT NOT NULL)",
@@ -481,6 +479,24 @@ fn doctor_no_write_snapshot(root: &Path) -> BTreeMap<String, DoctorNoWriteTreeEn
             .expect("strip snapshot root")
             .to_string_lossy()
             .replace('\\', "/");
+        // w1b Task B9 (2026-08-27, equivalence-gate-caught, control-plane
+        // ruling): vanilla SQLite's WAL-mode shared-memory (`-shm`) and log
+        // (`-wal`) sidecars are engine-managed transient state, not cass
+        // data -- reproduced directly against stock `sqlite3 -readonly`
+        // against this exact fixture (same fixture, same commands, only the
+        // read-only flag toggled): opening a WAL-mode database read-only
+        // creates/touches these two files as an unavoidable side effect of
+        // WAL's shared-memory coordination protocol, which requires write
+        // access to check-point away -- read-only access structurally
+        // cannot clean them up regardless of the engine on top. The legacy
+        // franken engine never exhibited this because it did not implement
+        // real WAL-mode read access the same way. Exempt only these two
+        // filenames from the "must not touch cass files" comparison; every
+        // other file, including agent_search.db's own bytes, must still be
+        // asserted byte-for-byte and mtime-for-mtime unchanged.
+        if relative_path == "agent_search.db-shm" || relative_path == "agent_search.db-wal" {
+            continue;
+        }
         let entry_kind = if metadata.file_type().is_symlink() {
             "symlink"
         } else if metadata.is_dir() {
@@ -3372,8 +3388,8 @@ fn doctor_backups_list_and_verify_candidate_promotion_manifest() {
             .as_array()
             .expect("warnings")
             .iter()
-            .any(|warning| warning.as_str() == Some("frankensqlite read-only probe passed")),
-        "verify should prove the backup DB opens through frankensqlite: {verify_payload:#}"
+            .any(|warning| warning.as_str() == Some("the legacy embedded engine read-only probe passed")),
+        "verify should prove the backup DB opens through the legacy embedded engine: {verify_payload:#}"
     );
 }
 
@@ -7055,6 +7071,301 @@ fn seed_archive_export_fixture(data_dir: &Path) {
         b"derived lexical bytes",
     )
     .expect("write derived lexical asset");
+}
+
+/// R1-B2: like `write_test_sqlite_db`, but deliberately skips the mid-fixture
+/// `PRAGMA wal_checkpoint(TRUNCATE)` -- and, unlike `open_test_writer`'s
+/// `TestWriterGuard`, does not close the connection at all. Closing the
+/// *last* connection to a WAL-mode db makes SQLite auto-checkpoint on close
+/// (`close_best_effort_in_place` never sets
+/// `SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE`, unlike the `_without_checkpoint`
+/// variants), which would silently undo the "committed only in -wal"
+/// fixture shape this needs. The caller must keep the returned connection
+/// alive for as long as the fixture must stay uncheckpointed.
+fn write_test_sqlite_db_leaving_uncheckpointed_wal(path: &Path, marker: &str) -> FrankenConnection {
+    fs::create_dir_all(path.parent().expect("sqlite db parent")).expect("create sqlite db parent");
+    let conn = open_writable_for_tests(path, Profile::Production)
+        .expect("open schema-free fixture database");
+    conn.execute(
+        "CREATE TABLE wal_checkpoint_probe(marker TEXT NOT NULL)",
+        fparams![],
+    )
+    .expect("create wal checkpoint probe table");
+    conn.execute(
+        "INSERT INTO wal_checkpoint_probe(marker) VALUES (?1)",
+        fparams![marker],
+    )
+    .expect("insert wal checkpoint probe marker");
+    conn
+}
+
+/// R1-B2/R2-F1: doctor archive export used to copy the source db as-is, so a
+/// committed transaction still sitting only in `-wal` (never checkpointed
+/// into the main db file) was silently excluded from the export -- the main
+/// db file is the sole carrier of data in the export (sidecar `-wal`/`-shm`
+/// assets are never included; see `seed_archive_export_fixture`'s siblings
+/// below, which assert on `derived`/`sidecar` skip classes). The fix
+/// checkpoints the source before copying it. R2-F1 narrowed this to Apply
+/// only -- Plan/dry-run must be a true zero-write read (see
+/// `doctor_archive_export_plan_is_a_true_zero_write_read_of_an_uncheckpointed_source`
+/// below) -- so this test now exercises and asserts the checkpoint at the
+/// Apply step, not Plan.
+#[test]
+fn doctor_archive_export_checkpoints_uncommitted_wal_before_collecting_assets() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let test_home = temp.path();
+    let data_dir = test_home.join("cass-data");
+    let target_root = test_home.join("exports/wal-checkpoint");
+    fs::create_dir_all(target_root.parent().expect("target parent")).expect("target parent dir");
+    let db_path = data_dir.join("agent_search.db");
+    // Kept alive for the rest of the test: dropping it would be the *last*
+    // connection closing and auto-checkpointing away the fixture's whole
+    // point (see the helper's doc comment).
+    let _fixture_conn = write_test_sqlite_db_leaving_uncheckpointed_wal(&db_path, "wal-only-marker");
+
+    let wal_path = db_path.with_file_name("agent_search.db-wal");
+    let wal_len_before = fs::metadata(&wal_path)
+        .map(|m| m.len())
+        .expect("uncheckpointed fixture must leave a non-empty -wal file");
+    assert!(
+        wal_len_before > 0,
+        "fixture precondition: the marker row must be sitting only in -wal before export"
+    );
+
+    let plan_out = cass_cmd(test_home)
+        .args([
+            "doctor",
+            "archive",
+            "export",
+            target_root.to_str().expect("target utf8"),
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("data utf8"),
+        ])
+        .output()
+        .expect("run archive export plan");
+    assert!(
+        plan_out.status.success(),
+        "archive export plan failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&plan_out.stdout),
+        String::from_utf8_lossy(&plan_out.stderr)
+    );
+    let plan: Value = serde_json::from_slice(&plan_out.stdout).expect("plan json");
+    let fingerprint = plan["plan_fingerprint"].as_str().expect("fingerprint");
+
+    // R2-F1: Plan/dry-run must not checkpoint -- the WAL this fixture set up
+    // must still be exactly as large as it was before the Plan call.
+    let wal_len_after_plan = fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+    assert_eq!(
+        wal_len_after_plan, wal_len_before,
+        "archive export Plan/dry-run must not checkpoint the source -- it is a zero-write read"
+    );
+
+    let apply_out = cass_cmd(test_home)
+        .args([
+            "doctor",
+            "archive",
+            "export",
+            target_root.to_str().expect("target utf8"),
+            "--yes",
+            "--plan-fingerprint",
+            fingerprint,
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("data utf8"),
+        ])
+        .output()
+        .expect("run archive export apply");
+    assert!(
+        apply_out.status.success(),
+        "archive export apply failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&apply_out.stdout),
+        String::from_utf8_lossy(&apply_out.stderr)
+    );
+    let apply: Value = serde_json::from_slice(&apply_out.stdout).expect("apply json");
+    assert_eq!(apply["status"].as_str(), Some("applied"), "{apply:#}");
+
+    // R2-F1: Apply -- not Plan -- must checkpoint+truncate the source WAL
+    // before copying, so the marker row (previously only in -wal) lands in
+    // the exported copy below.
+    let wal_len_after_apply = fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+    assert_eq!(
+        wal_len_after_apply, 0,
+        "archive export apply must checkpoint+truncate the source db's WAL before collecting the copy manifest"
+    );
+
+    let exported_db_path = target_root.join("data/agent_search.db");
+    assert!(exported_db_path.exists(), "exported main db file must exist");
+    let exported =
+        FrankenConnection::open_read(&exported_db_path).expect("open exported db read-only");
+    let marker: String = exported
+        .query_row_map("SELECT marker FROM wal_checkpoint_probe LIMIT 1", &[], |row| {
+            row.get_typed(0)
+        })
+        .expect("the row that was only in -wal before export must be present in the exported copy");
+    assert_eq!(marker, "wal-only-marker");
+}
+
+/// R1-B2/R2-F1 fail-closed branch: when the source db's pre-copy checkpoint
+/// cannot run because another connection actively holds a write lock, Apply
+/// must refuse outright rather than silently falling back to whatever stale
+/// bytes happen to be on disk. R2-F1 moved the checkpoint out of Plan
+/// entirely, so this now blocks Apply's checkpoint specifically -- a Plan
+/// call while the writer holds its lock is expected to succeed (Plan never
+/// touches the source beyond reading it), which is exactly why this test
+/// gets its fingerprint from Plan *before* installing the blocker.
+#[test]
+fn doctor_archive_export_fails_closed_when_source_checkpoint_is_blocked_by_active_writer() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let test_home = temp.path();
+    let data_dir = test_home.join("cass-data");
+    let target_root = test_home.join("exports/blocked");
+    fs::create_dir_all(target_root.parent().expect("target parent")).expect("target parent dir");
+    let db_path = data_dir.join("agent_search.db");
+    write_test_sqlite_db(&db_path, "blocked-writer");
+
+    let plan_out = cass_cmd(test_home)
+        .args([
+            "doctor",
+            "archive",
+            "export",
+            target_root.to_str().expect("target utf8"),
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("data utf8"),
+        ])
+        .output()
+        .expect("run archive export plan");
+    assert!(
+        plan_out.status.success(),
+        "archive export plan failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&plan_out.stdout),
+        String::from_utf8_lossy(&plan_out.stderr)
+    );
+    let plan: Value = serde_json::from_slice(&plan_out.stdout).expect("plan json");
+    let fingerprint = plan["plan_fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+
+    let blocker = open_writable_for_tests(&db_path, Profile::Production)
+        .expect("open blocking writer on the export source db");
+    blocker
+        .execute_batch("BEGIN IMMEDIATE;")
+        .expect("hold a write lock on the export source db");
+
+    let apply_out = cass_cmd(test_home)
+        .args([
+            "doctor",
+            "archive",
+            "export",
+            target_root.to_str().expect("target utf8"),
+            "--yes",
+            "--plan-fingerprint",
+            &fingerprint,
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("data utf8"),
+        ])
+        .output()
+        .expect("run archive export apply while the source db is write-locked");
+
+    blocker.execute_batch("ROLLBACK;").ok();
+
+    assert!(
+        !apply_out.status.success(),
+        "archive export apply must fail closed (non-zero exit) when its pre-copy checkpoint is \
+         blocked by an active writer instead of silently exporting a stale copy: \
+         stdout={} stderr={}",
+        String::from_utf8_lossy(&apply_out.stdout),
+        String::from_utf8_lossy(&apply_out.stderr)
+    );
+    assert!(
+        !target_root.exists(),
+        "a blocked pre-copy checkpoint must not leave a partially-created export target"
+    );
+}
+
+/// R2-F1: Plan/dry-run must be a true zero-write read of the source db --
+/// no checkpoint, no `open_writable` at all. Before this fix, doctor
+/// archive export ran the same pre-export checkpoint for both Plan and
+/// Apply, which contradicted the dry-run contract documented for
+/// `--dry-run` (a Plan invocation, i.e. no `--yes`, is this command's
+/// dry-run). This asserts a Plan call over a source with a genuine
+/// uncheckpointed WAL leaves the source main db file and its `-wal`
+/// sidecar byte-for-byte untouched, and still reports `planned`.
+#[test]
+fn doctor_archive_export_plan_is_a_true_zero_write_read_of_an_uncheckpointed_source() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let test_home = temp.path();
+    let data_dir = test_home.join("cass-data");
+    let target_root = test_home.join("exports/plan-zero-write");
+    fs::create_dir_all(target_root.parent().expect("target parent")).expect("target parent dir");
+    let db_path = data_dir.join("agent_search.db");
+    // Kept alive for the whole test -- see
+    // `write_test_sqlite_db_leaving_uncheckpointed_wal`'s doc comment:
+    // dropping it would auto-checkpoint on close and defeat the
+    // before/after byte comparison below.
+    let _fixture_conn =
+        write_test_sqlite_db_leaving_uncheckpointed_wal(&db_path, "plan-zero-write-marker");
+
+    let wal_path = db_path.with_file_name("agent_search.db-wal");
+    let db_len_before = fs::metadata(&db_path).expect("main db file must exist").len();
+    let wal_len_before = fs::metadata(&wal_path)
+        .map(|m| m.len())
+        .expect("uncheckpointed fixture must leave a non-empty -wal file");
+    assert!(
+        wal_len_before > 0,
+        "fixture precondition: the marker row must be sitting only in -wal before Plan"
+    );
+    let db_blake3_before = test_file_blake3(&db_path);
+    let wal_blake3_before = test_file_blake3(&wal_path);
+
+    let plan_out = cass_cmd(test_home)
+        .args([
+            "doctor",
+            "archive",
+            "export",
+            target_root.to_str().expect("target utf8"),
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("data utf8"),
+        ])
+        .output()
+        .expect("run archive export plan");
+    assert!(
+        plan_out.status.success(),
+        "archive export plan failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&plan_out.stdout),
+        String::from_utf8_lossy(&plan_out.stderr)
+    );
+    let plan: Value = serde_json::from_slice(&plan_out.stdout).expect("plan json");
+    assert_eq!(plan["status"].as_str(), Some("planned"), "{plan:#}");
+
+    let db_len_after = fs::metadata(&db_path)
+        .expect("main db file must still exist after Plan")
+        .len();
+    let wal_len_after = fs::metadata(&wal_path)
+        .expect("-wal file must still exist after Plan")
+        .len();
+    assert_eq!(
+        db_len_after, db_len_before,
+        "Plan/dry-run must not change the source main db file's size"
+    );
+    assert_eq!(
+        wal_len_after, wal_len_before,
+        "Plan/dry-run must not change the source -wal file's size"
+    );
+    assert_eq!(
+        test_file_blake3(&db_path),
+        db_blake3_before,
+        "Plan/dry-run must not change a single byte of the source main db file"
+    );
+    assert_eq!(
+        test_file_blake3(&wal_path),
+        wal_blake3_before,
+        "Plan/dry-run must not change a single byte of the source -wal file"
+    );
 }
 
 #[test]

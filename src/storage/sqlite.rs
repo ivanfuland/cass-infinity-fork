@@ -6,13 +6,14 @@ use crate::model::types::{
 use crate::sources::provenance::{LOCAL_SOURCE_ID, Source, SourceKind};
 use anyhow::{Context, Result, anyhow, bail};
 // w1a Task A4a (plan delta d3): the file historically imported these names from
-// `frankensqlite` directly; they now resolve to the backend-agnostic `storage::api`
+// `the legacy embedded engine` directly; they now resolve to the backend-agnostic `storage::api`
 // facade (A1-A3, ACCEPTED) under the same local aliases so call sites using the
 // mirrored method names (`query_row_map`, `get_typed`, `execute`, `transaction`, …)
 // keep compiling unchanged. `SqliteValue`/`ParamValue` collapse to the single `Value`
 // enum api uses for both bound params and row values.
 use crate::storage::api::{
-    Conn as FrankenConnection, Row as FrankenRow, StorageError, Tx as FrankenTransaction, Value,
+    Conn as FrankenConnection, Row as FrankenRow, StorageError, Tx as FrankenTransaction, TxMode,
+    Value,
 };
 type SqliteValue = Value;
 type ParamValue = Value;
@@ -81,7 +82,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicI8, AtomicI64, AtomicU64, AtomicUsize, Ordering},
 };
 
-/// Frankensqlite parameter list builder (Task A4a thin shim: delegates to
+/// The legacy embedded engine's parameter list builder (Task A4a thin shim: delegates to
 /// `storage::api::params!`; call-site shape at the 423 usages is unchanged).
 macro_rules! fparams {
     () => {
@@ -98,29 +99,6 @@ use tracing::info;
 
 const DOCTOR_MUTATION_DB_OPEN_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const DOCTOR_MUTATION_LOCK_MAX_METADATA_READ: u64 = 64 * 1024;
-
-// -------------------------------------------------------------------------
-// Lazy FrankenSQLite Connection (bd-1ueu)
-// -------------------------------------------------------------------------
-// Defers opening the database until first use, cutting startup cost for
-// commands that may not need the DB at all.  Thread-safe via parking_lot
-// Mutex; logs the reason and duration of the open on first access.
-
-/// Error from lazy database initialization.
-#[derive(Debug, Error)]
-pub enum LazyDbError {
-    #[error("Database not found at {0}")]
-    NotFound(PathBuf),
-    #[error("Failed to open FrankenSQLite database at {path}: {source}")]
-    FrankenOpenFailed {
-        path: PathBuf,
-        source: StorageError,
-    },
-}
-
-// -------------------------------------------------------------------------
-// LazyFrankenDb — lazy wrapper around FrankenConnection
-// -------------------------------------------------------------------------
 
 /// Wrapper around `FrankenConnection` that implements `Send`.
 ///
@@ -160,165 +138,6 @@ impl std::ops::Deref for SendFrankenConnection {
     type Target = FrankenConnection;
     fn deref(&self) -> &FrankenConnection {
         &self.0
-    }
-}
-
-/// Lazy-opening wrapper for `FrankenConnection` (frankensqlite).
-///
-/// Constructing a `LazyFrankenDb` is cheap (no I/O).  The underlying
-/// `FrankenConnection` is opened on the first call to [`get`].
-/// Subsequent calls return the cached connection.
-pub struct LazyFrankenDb {
-    path: PathBuf,
-    conn: parking_lot::Mutex<Option<SendFrankenConnection>>,
-}
-
-/// RAII guard that dereferences to the inner `FrankenConnection`.
-pub struct LazyFrankenDbGuard<'a>(parking_lot::MutexGuard<'a, Option<SendFrankenConnection>>);
-
-impl std::fmt::Debug for LazyFrankenDbGuard<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("LazyFrankenDbGuard")
-            .field(&self.0.is_some())
-            .finish()
-    }
-}
-
-impl std::ops::Deref for LazyFrankenDbGuard<'_> {
-    type Target = FrankenConnection;
-    fn deref(&self) -> &FrankenConnection {
-        self.0
-            .as_ref()
-            .expect("LazyFrankenDb connection must be initialized before access")
-    }
-}
-
-impl LazyFrankenDb {
-    /// Create a lazy handle pointing at `path`.  No I/O is performed.
-    pub fn new(path: PathBuf) -> Self {
-        Self {
-            path,
-            conn: parking_lot::Mutex::new(None),
-        }
-    }
-
-    /// Resolve path from optional CLI overrides.
-    ///
-    /// Uses `data_dir / agent_search.db` as fallback.
-    pub fn from_overrides(data_dir: &Option<PathBuf>, db_override: Option<PathBuf>) -> Self {
-        let data_dir = data_dir.clone().unwrap_or_else(crate::default_data_dir);
-        let path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
-        Self::new(path)
-    }
-
-    /// Get the connection, opening the database on first access.
-    ///
-    /// `reason` is logged alongside the open duration so callers can
-    /// identify which command triggered the open.
-    pub fn get(&self, reason: &str) -> std::result::Result<LazyFrankenDbGuard<'_>, LazyDbError> {
-        let mut guard = self.conn.lock();
-        if guard.is_none() {
-            if !self.path.exists() {
-                return Err(LazyDbError::NotFound(self.path.clone()));
-            }
-            let start = Instant::now();
-            let _doctor_guard = acquire_doctor_mutation_db_open_guard(
-                &self.path,
-                DOCTOR_MUTATION_DB_OPEN_LOCK_TIMEOUT,
-            )
-            .map_err(|err| LazyDbError::FrankenOpenFailed {
-                path: self.path.clone(),
-                source: StorageError::Other { code: None, detail: err.to_string() },
-            })?;
-            let conn =
-                FrankenConnection::open_writable(std::path::Path::new(&(self.path.to_string_lossy().into_owned())), crate::storage::api::Profile::Production).map_err(|e| {
-                    LazyDbError::FrankenOpenFailed {
-                        path: self.path.clone(),
-                        source: e,
-                    }
-                })?;
-            let elapsed_ms = start.elapsed().as_millis();
-            info!(
-                path = %self.path.display(),
-                elapsed_ms = elapsed_ms,
-                reason = reason,
-                "lazily opened FrankenSQLite database"
-            );
-            *guard = Some(SendFrankenConnection::new(conn));
-        }
-        Ok(LazyFrankenDbGuard(guard))
-    }
-
-    /// Get the connection with a timeout, opening the database on first access.
-    ///
-    /// Like [`get`] but spawns the open in a background thread and waits up to
-    /// `timeout` for it to complete. Returns `LazyDbError::FrankenOpenFailed`
-    /// with a descriptive message if the timeout elapses. Fix for #128.
-    pub fn get_with_timeout(
-        &self,
-        reason: &str,
-        timeout: Duration,
-    ) -> std::result::Result<LazyFrankenDbGuard<'_>, LazyDbError> {
-        let mut guard = self.conn.lock();
-        if guard.is_none() {
-            if !self.path.exists() {
-                return Err(LazyDbError::NotFound(self.path.clone()));
-            }
-            let start = Instant::now();
-            let path_owned = self.path.to_string_lossy().into_owned();
-            let path_for_guard = self.path.clone();
-            let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                let _doctor_guard =
-                    match acquire_doctor_mutation_db_open_guard(&path_for_guard, timeout) {
-                        Ok(guard) => guard,
-                        Err(err) => {
-                            let _ = tx.send(Err(StorageError::Other {
-                                code: None,
-                                detail: err.to_string(),
-                            }));
-                            return;
-                        }
-                    };
-                let _ =
-                    tx.send(FrankenConnection::open_writable(std::path::Path::new(&(path_owned)), crate::storage::api::Profile::Production).map(SendFrankenConnection::new));
-            });
-            let conn = rx
-                .recv_timeout(timeout)
-                .map_err(|_| LazyDbError::FrankenOpenFailed {
-                    path: self.path.clone(),
-                    source: StorageError::Other {
-                        code: None,
-                        detail: format!(
-                            "database open timed out after {}s (possible corruption or lock contention)",
-                            timeout.as_secs()
-                        ),
-                    },
-                })?
-                .map_err(|e| LazyDbError::FrankenOpenFailed {
-                    path: self.path.clone(),
-                    source: e,
-                })?;
-            let elapsed_ms = start.elapsed().as_millis();
-            info!(
-                path = %self.path.display(),
-                elapsed_ms = elapsed_ms,
-                reason = reason,
-                "lazily opened FrankenSQLite database (with timeout)"
-            );
-            *guard = Some(conn);
-        }
-        Ok(LazyFrankenDbGuard(guard))
-    }
-
-    /// Path to the database file (even if not yet opened).
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// Whether the connection has been opened.
-    pub fn is_open(&self) -> bool {
-        self.conn.lock().is_some()
     }
 }
 
@@ -489,7 +308,7 @@ fn next_franken_retry_jitter_ms(max_inclusive: u64) -> u64 {
 }
 
 /// Sleep with jittered exponential backoff to avoid lock-step retry storms
-/// when many threads hit the same transient SQLite/frankensqlite contention.
+/// when many threads hit the same transient SQLite/the legacy embedded engine contention.
 pub(crate) fn sleep_with_franken_retry_backoff(
     backoff: &mut Duration,
     remaining: Duration,
@@ -692,16 +511,13 @@ pub(crate) fn open_current_schema_storage_with_timeout(
     );
     storage.apply_open_stage_busy_timeout();
 
-    let version = storage
-        .raw()
-        .query_all_map(
-            "SELECT value FROM meta WHERE key = 'schema_version';",
-            &[],
-            |row| row.get_typed::<String>(0),
-        )
-        .ok()
-        .and_then(|rows| rows.into_iter().next())
-        .and_then(|raw| raw.parse::<i64>().ok());
+    // w1b Task B8: fast-path version check now reads the `PRAGMA
+    // user_version` authority instead of the retired `meta.schema_version`
+    // mirror -- a mismatch (including a read error, which `ok()` folds into
+    // "not current" the same way the old string-parse fallback did) simply
+    // falls back to the slow path (`FrankenStorage::open`, which runs
+    // `schema::ensure`), same as before.
+    let version = crate::storage::schema::read_user_version(storage.raw()).ok();
 
     if version != Some(CURRENT_SCHEMA_VERSION) {
         if let Err(close_err) = storage.close_without_checkpoint_in_place() {
@@ -715,7 +531,6 @@ pub(crate) fn open_current_schema_storage_with_timeout(
         return Ok(None);
     }
 
-    transition_from_meta_version(&storage.conn)?;
     storage.repair_missing_current_schema_objects()?;
     storage.apply_config()?;
     Ok(Some(storage))
@@ -765,7 +580,7 @@ pub(crate) fn open_franken_raw_connection_with_timeout(
     loop {
         let _doctor_guard = acquire_doctor_mutation_db_open_guard(path, timeout)?;
         match FrankenConnection::open_writable(std::path::Path::new(&(&path_str)), crate::storage::api::Profile::Production)
-            .with_context(|| format!("opening raw frankensqlite db at {}", path.display()))
+            .with_context(|| format!("opening raw the legacy embedded engine db at {}", path.display()))
         {
             Ok(conn) => return Ok(conn),
             Err(err) if retryable_franken_anyhow(&err) => {
@@ -801,7 +616,7 @@ pub(crate) fn open_franken_raw_readonly_connection_with_timeout(
         match open_franken_with_flags(&path_str, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| {
                 format!(
-                    "opening raw frankensqlite db readonly at {}",
+                    "opening raw the legacy embedded engine db readonly at {}",
                     path.display()
                 )
             }) {
@@ -851,252 +666,24 @@ pub(crate) fn retryable_franken_anyhow(err: &anyhow::Error) -> bool {
     })
 }
 
-impl Drop for LazyFrankenDb {
-    fn drop(&mut self) {
-        let Some(mut conn) = self.conn.get_mut().take() else {
-            return;
-        };
-        conn.0.close_best_effort_in_place();
+/// w1b Task B3 (D2): `with_tx`/`with_tx_no_replay` closures must return
+/// `Result<T, StorageError>` (that's what lets the replay loop pattern-match
+/// `Busy{Snapshot}` specifically), but this crate's business logic almost
+/// universally speaks `anyhow::Result` with `.context()`/`.with_context()`
+/// enrichment. Rather than rewrite that logic's error type, this recovers
+/// the original typed `StorageError` from wherever it sits in the `anyhow`
+/// chain -- same chain-walking `retryable_franken_anyhow` already does, but
+/// returning the owned error itself (not just a bool) so a caller three
+/// levels of `.context()` deep still gets a real `Busy{Snapshot}` a closure
+/// can act on, not a stringified `Other`. Falls back to `StorageError::Other`
+/// (preserving the full `{:#}` message, contexts included) only when no
+/// `StorageError` is anywhere in the chain -- e.g. a non-storage failure
+/// (serialization, I/O) that happened to occur inside the same closure.
+pub(crate) fn anyhow_error_into_storage_error(err: anyhow::Error) -> StorageError {
+    if let Some(found) = err.chain().find_map(|cause| cause.downcast_ref::<StorageError>()) {
+        return found.clone();
     }
-}
-
-// -------------------------------------------------------------------------
-// FrankenSQLite Connection Manager (bead 3rlf8)
-// -------------------------------------------------------------------------
-// Multi-connection management: reader pool + concurrent writer connections.
-// Replaces the LazyFrankenDb single-connection bottleneck for high-throughput
-// scenarios (indexer parallel writes, concurrent TUI reads + indexer writes).
-
-/// Configuration for the [`FrankenConnectionManager`].
-#[derive(Debug, Clone)]
-pub struct ConnectionManagerConfig {
-    /// Number of pre-opened reader connections (default: 4).
-    pub reader_count: usize,
-    /// Maximum concurrent writer connections (default: available parallelism).
-    pub max_writers: usize,
-}
-
-impl Default for ConnectionManagerConfig {
-    fn default() -> Self {
-        let cpus = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
-        Self {
-            reader_count: 4,
-            max_writers: cpus,
-        }
-    }
-}
-
-/// Multi-connection manager for frankensqlite.
-///
-/// Provides:
-/// - A pool of pre-opened reader connections (round-robin, Mutex-protected)
-/// - Controlled creation of writer connections with token-based limits
-/// - RAII guards that auto-rollback uncommitted transactions on drop
-///
-/// Thread-safe: reader connections are wrapped in Mutex (FrankenConnection is !Sync).
-/// Writer connections are created per-request (each thread gets its own).
-pub struct FrankenConnectionManager {
-    db_path: PathBuf,
-    readers: Vec<parking_lot::Mutex<SendFrankenConnection>>,
-    reader_idx: std::sync::atomic::AtomicUsize,
-    /// Token-based writer limit: channel pre-filled with `max_writers` tokens.
-    /// `recv()` = acquire slot, `send()` = release slot.
-    writer_tokens: (
-        crossbeam_channel::Sender<()>,
-        crossbeam_channel::Receiver<()>,
-    ),
-    config: ConnectionManagerConfig,
-}
-
-// Safety: FrankenConnectionManager is Send+Sync because:
-// - readers wrapped in Mutex<SendFrankenConnection> (exclusive access)
-// - writer_tokens uses crossbeam (Send+Sync)
-// - db_path is PathBuf (Send+Sync)
-unsafe impl Send for FrankenConnectionManager {}
-unsafe impl Sync for FrankenConnectionManager {}
-
-impl FrankenConnectionManager {
-    /// Create a new connection manager.
-    ///
-    /// Opens `config.reader_count` reader connections immediately.
-    /// Writer connections are created on demand (up to `config.max_writers`).
-    pub fn new(db_path: impl Into<PathBuf>, config: ConnectionManagerConfig) -> Result<Self> {
-        let db_path = db_path.into();
-        let path_str = db_path.to_string_lossy().to_string();
-
-        let reader_count = config.reader_count.max(1);
-        let mut readers = Vec::with_capacity(reader_count);
-        for _ in 0..reader_count {
-            let conn = FrankenConnection::open_writable(std::path::Path::new(&(&path_str)), crate::storage::api::Profile::Production)
-                .with_context(|| format!("opening reader connection at {}", db_path.display()))?;
-            // Apply read-tuned config (no migration, no write PRAGMAs)
-            let _ = conn.execute("PRAGMA busy_timeout = 5000;", &[]); // match writer config
-            let _ = conn.execute("PRAGMA cache_size = -16384;", &[]); // 16MB reader cache
-            readers.push(parking_lot::Mutex::new(SendFrankenConnection::new(conn)));
-        }
-
-        let max_writers = config.max_writers.max(1);
-
-        // Pre-fill bounded channel with tokens (acts as counting semaphore).
-        // A zero-capacity channel with no initial tokens would make the first
-        // writer acquisition block forever.
-        let (tx, rx) = crossbeam_channel::bounded(max_writers);
-        for _ in 0..max_writers {
-            tx.send(())
-                .map_err(|_| anyhow!("writer token channel closed during initialization"))?;
-        }
-
-        Ok(Self {
-            db_path,
-            readers,
-            reader_idx: std::sync::atomic::AtomicUsize::new(0),
-            writer_tokens: (tx, rx),
-            config: ConnectionManagerConfig {
-                reader_count,
-                max_writers,
-            },
-        })
-    }
-
-    /// Get a reader connection (round-robin from the pool).
-    ///
-    /// Returns a mutex guard wrapping the connection. The guard prevents
-    /// concurrent access to the same connection (FrankenConnection is !Sync).
-    pub fn reader(&self) -> parking_lot::MutexGuard<'_, SendFrankenConnection> {
-        let idx = self
-            .reader_idx
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.readers[idx % self.readers.len()].lock()
-    }
-
-    /// Acquire a writer connection.
-    ///
-    /// Opens a new frankensqlite connection with full config (no migration).
-    /// Blocks if `max_writers` connections are already in use.
-    /// The returned [`WriterGuard`] auto-rolls back on drop.
-    pub fn writer(&self) -> Result<WriterGuard<'_>> {
-        self.writer_tokens
-            .1
-            .recv()
-            .map_err(|_| anyhow!("writer token channel closed"))?;
-        let path_str = self.db_path.to_string_lossy().to_string();
-        let conn = match FrankenConnection::open_writable(std::path::Path::new(&(&path_str)), crate::storage::api::Profile::Production) {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = self.writer_tokens.0.send(());
-                return Err(anyhow::Error::from(e).context(format!(
-                    "opening writer connection at {}",
-                    self.db_path.display()
-                )));
-            }
-        };
-        let storage = FrankenStorage::new(conn, self.db_path.clone());
-        if let Err(e) = storage.apply_config() {
-            let _ = self.writer_tokens.0.send(());
-            return Err(e);
-        }
-        Ok(WriterGuard {
-            storage,
-            mgr: self,
-            committed: false,
-        })
-    }
-
-    /// Acquire a concurrent writer connection (BEGIN CONCURRENT via MVCC).
-    ///
-    /// Similar to [`writer`] but tuned for the parallel indexer write pool.
-    /// Uses reduced cache size and is designed for short-lived batch inserts.
-    pub fn concurrent_writer(&self) -> Result<WriterGuard<'_>> {
-        self.writer_tokens
-            .1
-            .recv()
-            .map_err(|_| anyhow!("writer token channel closed"))?;
-        let path_str = self.db_path.to_string_lossy().to_string();
-        let conn = match FrankenConnection::open_writable(std::path::Path::new(&(&path_str)), crate::storage::api::Profile::Production) {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = self.writer_tokens.0.send(());
-                return Err(anyhow::Error::from(e).context(format!(
-                    "opening concurrent writer at {}",
-                    self.db_path.display()
-                )));
-            }
-        };
-        let storage = FrankenStorage::new(conn, self.db_path.clone());
-        if let Err(e) = storage.apply_config() {
-            let _ = self.writer_tokens.0.send(());
-            return Err(e);
-        }
-        // Reduced cache for concurrent writers (they're short-lived)
-        let _ = storage.raw().execute("PRAGMA cache_size = -4096;", &[]);
-        Ok(WriterGuard {
-            storage,
-            mgr: self,
-            committed: false,
-        })
-    }
-
-    /// Database path managed by this pool.
-    pub fn db_path(&self) -> &Path {
-        &self.db_path
-    }
-
-    /// Number of reader connections in the pool.
-    pub fn reader_count(&self) -> usize {
-        self.readers.len()
-    }
-
-    /// Maximum concurrent writers allowed.
-    pub fn max_writers(&self) -> usize {
-        self.config.max_writers
-    }
-}
-
-impl Drop for FrankenConnectionManager {
-    fn drop(&mut self) {
-        for reader in &mut self.readers {
-            reader.get_mut().0.close_best_effort_in_place();
-        }
-    }
-}
-
-/// RAII guard for a writer connection.
-///
-/// Provides access to a [`FrankenStorage`] for write operations.
-/// Releases the writer semaphore slot when dropped.
-pub struct WriterGuard<'a> {
-    storage: FrankenStorage,
-    mgr: &'a FrankenConnectionManager,
-    committed: bool,
-}
-
-impl<'a> WriterGuard<'a> {
-    /// Access the underlying storage for read/write operations.
-    pub fn storage(&self) -> &FrankenStorage {
-        &self.storage
-    }
-
-    /// Mark this writer as successfully committed.
-    ///
-    /// Call after your transaction's `commit()` succeeds. Prevents the drop
-    /// guard from attempting a rollback.
-    pub fn mark_committed(&mut self) {
-        self.committed = true;
-    }
-}
-
-impl Drop for WriterGuard<'_> {
-    fn drop(&mut self) {
-        if !self.committed {
-            // Best-effort rollback — connection may already be in autocommit
-            let _ = self.storage.raw().execute("ROLLBACK;", &[]);
-        }
-        self.storage.close_best_effort_in_place();
-        // Release writer token
-        let _ = self.mgr.writer_tokens.0.send(());
-    }
+    StorageError::Other { code: None, detail: format!("{err:#}") }
 }
 
 // -------------------------------------------------------------------------
@@ -1130,7 +717,7 @@ fn deserialize_msgpack_to_json(bytes: &[u8]) -> serde_json::Value {
     })
 }
 
-/// Read metadata from a frankensqlite Row, preferring binary (msgpack) over JSON.
+/// Read metadata from a legacy embedded engine Row, preferring binary (msgpack) over JSON.
 fn franken_read_metadata_compat(
     row: &FrankenRow,
     json_idx: usize,
@@ -1170,55 +757,7 @@ fn franken_read_message_extra_compat(
     serde_json::Value::Null
 }
 
-// -------------------------------------------------------------------------
-// Migration Error Types (P1.5)
-// -------------------------------------------------------------------------
-
-/// Error type for schema migration operations.
-#[derive(Debug, Error)]
-pub enum MigrationError {
-    /// The schema requires a full rebuild. The database has been backed up.
-    #[error("Rebuild required: {reason}")]
-    RebuildRequired {
-        reason: String,
-        backup_path: Option<std::path::PathBuf>,
-    },
-
-    /// A database error occurred during migration.
-    #[error("Database error: {0}")]
-    Database(#[from] StorageError),
-
-    /// An I/O error occurred during backup.
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
-
-    /// Other migration error.
-    #[error("{0}")]
-    Other(String),
-}
-
-impl From<anyhow::Error> for MigrationError {
-    fn from(e: anyhow::Error) -> Self {
-        MigrationError::Other(e.to_string())
-    }
-}
-
-/// Maximum number of backup files to retain.
-const MAX_BACKUPS: usize = 3;
-const BACKUP_VACUUM_BUSY_TIMEOUT_PRAGMA: &str = "PRAGMA busy_timeout = 30000;";
-
-/// Files that contain user-authored state and must NEVER be deleted during rebuild.
-const USER_DATA_FILES: &[&str] = &["bookmarks.db", "tui_state.json", "sources.toml", ".env"];
-
-/// Check if a file is user-authored data that must be preserved during rebuild.
-pub fn is_user_data_file(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|n| n.to_str())
-        .map(|name| USER_DATA_FILES.contains(&name))
-        .unwrap_or(false)
-}
-
-/// SQL to register the FTS5 virtual table on a frankensqlite connection.
+/// SQL to register the FTS5 virtual table on a legacy embedded engine connection.
 ///
 /// FrankenSQLite skips virtual-table entries (rootpage=0) when loading
 /// `sqlite_master` from a stock-SQLite database.  Executing this CREATE
@@ -1387,6 +926,19 @@ pub fn fts_messages_integrity_error_from_message(
         || lower.contains("databasecorrupt")
         || lower.contains("database corrupt")
         || lower.contains("missing required")
+        // w1b Task B9 (salvage problem B): a duplicate `fts_messages`
+        // declaration in `sqlite_master` (the "malformed legacy bundle"
+        // fixture pattern) makes real SQLite refuse to even open the
+        // connection -- it eagerly parses the full schema and errors with
+        // "table fts_messages already exists" the moment two virtual-table
+        // declarations for the same name collide. The old the legacy embedded engine
+        // backend deferred this validation until the table was actually
+        // queried, so this failure mode never reached this classifier
+        // before; without recognizing it here, the caller falls straight
+        // through to `.recover`-based salvage instead of the (correct,
+        // already-implemented) `scrub_staged_derived_fts_metadata_via_sqlite3`
+        // repair this function exists to route to.
+        || lower.contains("already exists")
         || (mentions_required_shadow_table
             && (lower.contains("table not found") || lower.contains("no such table")));
     if !mentions_structural_fts_failure {
@@ -1473,10 +1025,10 @@ pub fn validate_fts_messages_integrity_for_connection(conn: &FrankenConnection) 
 
     // If every required shadow table is present, the FTS5 schema is
     // structurally sound. A probe-SQL failure here typically reflects an
-    // incomplete FTS5 runtime emulation (e.g. frankensqlite's vtable path)
+    // incomplete FTS5 runtime emulation (e.g. the legacy embedded engine's vtable path)
     // rather than fixture corruption — and conflating the two would
     // wrongly reject every database with the new message_id schema that
-    // frankensqlite happens to serve via a different code path. Returning
+    // the legacy embedded engine happens to serve via a different code path. Returning
     // Ok here keeps the false-positive surface narrow; the truly-missing-
     // shadow case below still surfaces as before.
     if missing_shadow_tables.is_empty() {
@@ -1496,13 +1048,13 @@ pub fn validate_fts_messages_integrity_for_connection(conn: &FrankenConnection) 
 #[cfg(test)]
 pub(crate) fn materialize_fresh_fts_schema_via_rusqlite(db_path: &Path) -> Result<()> {
     // Delegate to FrankenStorage: DROP TABLE IF EXISTS + CREATE VIRTUAL TABLE
-    // is fully supported by the frankensqlite FTS5 path at
+    // is fully supported by the legacy embedded engine FTS5 path at
     // FrankenStorage::rebuild_fts_via_frankensqlite. We call rebuild which
     // also populates rows, matching the historical semantics ("fresh FTS"
     // means the schema exists and is consistent with message rows).
     let storage = FrankenStorage::open(db_path).with_context(|| {
         format!(
-            "opening frankensqlite db at {} for FTS materialization",
+            "opening the legacy embedded engine db at {} for FTS materialization",
             db_path.display()
         )
     })?;
@@ -1513,7 +1065,7 @@ pub(crate) fn materialize_fresh_fts_schema_via_rusqlite(db_path: &Path) -> Resul
 pub(crate) fn rebuild_fts_via_rusqlite(db_path: &Path) -> Result<usize> {
     let storage = FrankenStorage::open(db_path).with_context(|| {
         format!(
-            "opening frankensqlite db at {} for FTS rebuild",
+            "opening the legacy embedded engine db at {} for FTS rebuild",
             db_path.display()
         )
     })?;
@@ -1525,99 +1077,14 @@ pub(crate) fn rebuild_fts_via_rusqlite(db_path: &Path) -> Result<usize> {
 pub(crate) fn ensure_fts_consistency_via_rusqlite(db_path: &Path) -> Result<FtsConsistencyRepair> {
     // Delegates to the FrankenStorage-native path. The function name retains
     // the `_via_rusqlite` suffix only for backwards compatibility with the
-    // few test-site callers; all operations now run through frankensqlite.
+    // few test-site callers; all operations now run through the legacy embedded engine.
     let storage = FrankenStorage::open(db_path).with_context(|| {
         format!(
-            "opening frankensqlite db at {} for FTS consistency check",
+            "opening the legacy embedded engine db at {} for FTS consistency check",
             db_path.display()
         )
     })?;
     storage.ensure_search_fallback_fts_consistency()
-}
-
-/// Create a uniquely named backup of the database file.
-///
-/// Returns the path to the backup file, or None if the source doesn't exist.
-pub fn create_backup(db_path: &Path) -> Result<Option<std::path::PathBuf>, MigrationError> {
-    if !bundle_path_exists(db_path)? {
-        return Ok(None);
-    }
-
-    if !copyable_bundle_file_exists(db_path)? {
-        return Ok(None);
-    }
-    let _ = copyable_bundle_sidecar_sources(db_path)?;
-
-    let backup_path = unique_backup_path(db_path);
-    let vacuum_stage_path = vacuum_stage_backup_path(&backup_path);
-
-    // Try to use SQLite's VACUUM INTO command first, which safely handles WAL files
-    // and produces a clean, minimized backup.
-    match vacuum_into_backup_stage(db_path, &vacuum_stage_path) {
-        Ok(()) => {
-            fs::rename(&vacuum_stage_path, &backup_path)?;
-        }
-        Err(err) if backup_vacuum_error_requires_consistent_retry(&err) => {
-            tracing::warn!(
-                db_path = %db_path.display(),
-                error = %err,
-                "create_backup: VACUUM INTO hit transient contention; refusing raw WAL bundle copy"
-            );
-            return Err(MigrationError::Database(err));
-        }
-        Err(err) => {
-            tracing::warn!(
-                db_path = %db_path.display(),
-                error = %err,
-                "create_backup: VACUUM INTO failed; falling back to raw evidence copy"
-            );
-        }
-    }
-
-    if backup_path.exists() {
-        sync_file_if_exists(&backup_path)?;
-        if let Some(parent) = backup_path.parent() {
-            sync_parent_directory(parent)?;
-        }
-        return Ok(Some(backup_path));
-    }
-
-    // Fallback to a raw evidence copy if VACUUM INTO failed (e.g., older SQLite
-    // or corruption). Keep this on the same symlink-safe bundle path as
-    // historical seeding so a malformed archive root cannot make us copy an
-    // arbitrary symlink target or publish a partial sidecar backup.
-    copy_database_bundle(db_path, &backup_path)?;
-
-    Ok(Some(backup_path))
-}
-
-fn vacuum_into_backup_stage(
-    db_path: &Path,
-    stage_path: &Path,
-) -> std::result::Result<(), StorageError> {
-    let mut conn = open_franken_with_flags(
-        &db_path.to_string_lossy(),
-        FrankenOpenFlags::SQLITE_OPEN_READ_ONLY,
-    )?;
-    let result = (|| {
-        conn.execute(BACKUP_VACUUM_BUSY_TIMEOUT_PRAGMA, &[])?;
-        let path_str = stage_path.to_string_lossy();
-        conn.execute("VACUUM INTO ?", fparams![path_str.as_ref()])?;
-        Ok(())
-    })();
-    if let Err(close_err) = conn.close_in_place() {
-        tracing::warn!(
-            error = %close_err,
-            db_path = %db_path.display(),
-            "create_backup: close_in_place failed after VACUUM INTO; falling back to best-effort close"
-        );
-        conn.close_best_effort_in_place();
-    }
-    result
-}
-
-fn backup_vacuum_error_requires_consistent_retry(err: &StorageError) -> bool {
-    retryable_franken_error(err)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1635,6 +1102,36 @@ impl DatabaseBundleMoveResult {
 
 fn database_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(format!("{}{}", path.to_string_lossy(), suffix))
+}
+
+#[cfg(not(windows))]
+fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
+    fs::File::open(path)?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn sync_file_if_exists(path: &Path) -> std::io::Result<()> {
+    if path.exists() {
+        fs::File::open(path)?.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn sync_file_if_exists(path: &Path) -> std::io::Result<()> {
+    if path.exists() {
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?
+            .sync_all()?;
+    }
+    Ok(())
 }
 
 /// Move a database file and its WAL/SHM sidecars to a new basename.
@@ -1789,105 +1286,6 @@ fn copyable_bundle_file_exists(path: &Path) -> Result<bool> {
     }
 }
 
-/// Helper to safely remove a database file and its potential WAL/SHM sidecars.
-pub(crate) fn remove_database_files(path: &Path) -> std::io::Result<()> {
-    let mut removed_any = false;
-
-    match fs::remove_file(path) {
-        Ok(()) => removed_any = true,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err),
-    }
-
-    // Best-effort removal of sidecar files (ignore errors if they don't exist)
-    for suffix in ["-wal", "-shm"] {
-        match fs::remove_file(database_sidecar_path(path, suffix)) {
-            Ok(()) => removed_any = true,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err),
-        }
-    }
-
-    if removed_any && let Some(parent) = path.parent() {
-        sync_parent_directory(parent)?;
-    }
-
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
-    fs::File::open(path)?.sync_all()
-}
-
-#[cfg(windows)]
-fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn sync_file_if_exists(path: &Path) -> std::io::Result<()> {
-    if path.exists() {
-        fs::File::open(path)?.sync_all()?;
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn sync_file_if_exists(path: &Path) -> std::io::Result<()> {
-    if path.exists() {
-        fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)?
-            .sync_all()?;
-    }
-    Ok(())
-}
-
-/// Remove old backup files, keeping only the most recent `keep_count`.
-pub fn cleanup_old_backups(db_path: &Path, keep_count: usize) -> Result<(), std::io::Error> {
-    let parent = match db_path.parent() {
-        Some(p) => p,
-        None => return Ok(()),
-    };
-
-    let db_name = db_path.file_name().and_then(|n| n.to_str()).unwrap_or("db");
-
-    let prefix = format!("{}.backup.", db_name);
-
-    // Collect backup files matching the pattern
-    let mut backups: Vec<(std::path::PathBuf, SystemTime)> = Vec::new();
-
-    if let Ok(entries) = fs::read_dir(parent) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|n| n.to_str())
-                && is_backup_root_name(name, &prefix)
-                && let Ok(meta) = fs::metadata(&path)
-                && meta.is_file()
-                && let Ok(mtime) = meta.modified()
-            {
-                backups.push((path, mtime));
-            }
-        }
-    }
-
-    // Sort by modification time, newest first
-    backups.sort_by_key(|entry| std::cmp::Reverse(entry.1));
-
-    // Delete oldest backups beyond keep_count
-    for (path, _) in backups.into_iter().skip(keep_count) {
-        let _ = fs::remove_file(&path);
-
-        // Also try to cleanup potential sidecars from fs::copy fallback
-        let _ = fs::remove_file(database_sidecar_path(&path, "-wal"));
-        let _ = fs::remove_file(database_sidecar_path(&path, "-shm"));
-    }
-
-    Ok(())
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct HistoricalDatabaseBundle {
     root_path: PathBuf,
@@ -1899,21 +1297,44 @@ pub(crate) struct HistoricalDatabaseBundle {
 
 #[derive(Debug, Clone, Copy, Default)]
 struct HistoricalBundleProbe {
+    /// Legacy franken-generation version marker (`meta.schema_version`).
+    /// Frozen forever at its old ceiling (see
+    /// [`LEGACY_FRANKEN_SCHEMA_VERSION_CEILING`]) now that nothing writes
+    /// this table anymore -- present only on bundles that predate w1b Task
+    /// B8, never on ones `schema::ensure` built.
     schema_version: Option<i64>,
+    /// New rusqlite-generation version marker (`PRAGMA user_version`,
+    /// `schema::ensure`'s sole authority). `None` for franken-generation
+    /// bundles (where it reads 0, i.e. "unset") -- the two fields are
+    /// mutually exclusive in practice, never both `Some` on a real bundle.
+    user_version: Option<i64>,
     fts_schema_rows: Option<i64>,
     fts_queryable: bool,
     max_message_id: i64,
 }
 
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SqliteDatabaseHealthProbe {
-    pub schema_version: Option<i64>,
-    pub quick_check_ok: bool,
-    pub fts_schema_rows: i64,
-    pub fts_queryable: bool,
-    pub message_count: i64,
-    pub max_message_id: i64,
+/// w1b Task B8 (plan delta d17, salvage generation-aware ordering rule):
+/// `meta.schema_version`'s old ceiling, frozen in place now that the franken
+/// incremental engine that wrote it is retired -- `storage::schema::
+/// CURRENT_SCHEMA_VERSION` moved on to a new, unrelated 1-based numbering, so
+/// comparing a legacy bundle's `meta.schema_version` against today's
+/// `CURRENT_SCHEMA_VERSION` would silently misclassify every pre-B8 archive
+/// as "not current" (21 != 1) even though 21 was, and remains, that
+/// generation's actual ceiling. This constant is what "current" means for a
+/// bundle that belongs to the old generation; it must never be bumped --
+/// there is no code path left that can produce a franken-generation bundle
+/// newer than 21.
+pub(crate) const LEGACY_FRANKEN_SCHEMA_VERSION_CEILING: i64 = 21;
+
+/// Generation-aware replacement for the old bare `schema_version ==
+/// CURRENT_SCHEMA_VERSION` comparison: a bundle counts as schema-current if
+/// it is current *for its own generation*, whichever one it belongs to.
+fn historical_bundle_schema_is_current(probe: &HistoricalBundleProbe) -> bool {
+    match (probe.user_version, probe.schema_version) {
+        (Some(uv), _) => uv == CURRENT_SCHEMA_VERSION,
+        (None, Some(sv)) => sv == LEGACY_FRANKEN_SCHEMA_VERSION_CEILING,
+        (None, None) => false,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2221,14 +1642,14 @@ pub(crate) fn discover_historical_database_bundles(
         // n >= 2 (duplicated CREATE VIRTUAL TABLE rows from a broken legacy
         // rebuild), `None` entirely, or `Some(0)` on a non-current schema —
         // is not "fts clean".
+        let schema_current = historical_bundle_schema_is_current(&bundle.probe);
         let fts_clean = match bundle.probe.fts_schema_rows {
             Some(1) => bundle.probe.fts_queryable,
-            Some(0) => bundle.probe.schema_version == Some(CURRENT_SCHEMA_VERSION),
+            Some(0) => schema_current,
             _ => false,
         };
 
-        let clean_schema14_fts =
-            bundle.probe.schema_version == Some(CURRENT_SCHEMA_VERSION) && fts_clean;
+        let clean_schema14_fts = schema_current && fts_clean;
         if clean_schema14_fts {
             return 5;
         }
@@ -2237,9 +1658,7 @@ pub(crate) fn discover_historical_database_bundles(
             return 4;
         }
 
-        if bundle.probe.schema_version == Some(CURRENT_SCHEMA_VERSION)
-            && bundle.supports_direct_readonly
-        {
+        if schema_current && bundle.supports_direct_readonly {
             return 3;
         }
 
@@ -2273,6 +1692,14 @@ fn probe_historical_bundle(root_path: &Path) -> HistoricalBundleProbe {
     };
 
     let schema_version = read_meta_schema_version(&conn).ok().flatten();
+    // w1b Task B8 (plan delta d17): the new-generation authority, alongside
+    // the legacy one above -- a franken-generation bundle reads 0 here
+    // (never written), which `filter(|&v| v > 0)` folds into `None` so
+    // `historical_bundle_schema_is_current` can tell "new generation, not
+    // current" apart from "old generation, use schema_version instead".
+    let user_version = crate::storage::schema::read_user_version(&conn)
+        .ok()
+        .filter(|&v| v > 0);
     let fts_schema_rows: Option<i64> = conn
         .query_row_map(
             "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
@@ -2292,6 +1719,7 @@ fn probe_historical_bundle(root_path: &Path) -> HistoricalBundleProbe {
 
     let probe = HistoricalBundleProbe {
         schema_version,
+        user_version,
         fts_schema_rows,
         fts_queryable,
         max_message_id,
@@ -2317,7 +1745,8 @@ fn probe_historical_bundle_via_sqlite3_metadata(root_path: &Path) -> Option<Hist
             "PRAGMA writable_schema=ON;
              SELECT COALESCE((SELECT value FROM meta WHERE key = 'schema_version'), '');
              SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages';
-             SELECT COALESCE(MAX(id), 0) FROM messages;",
+             SELECT COALESCE(MAX(id), 0) FROM messages;
+             PRAGMA user_version;",
         )
         .output()
         .ok()?;
@@ -2333,9 +1762,16 @@ fn probe_historical_bundle_via_sqlite3_metadata(root_path: &Path) -> Option<Hist
         .next()
         .and_then(|raw| raw.trim().parse::<i64>().ok())
         .unwrap_or(0);
+    // w1b Task B8 (plan delta d17): same new-generation authority as the
+    // direct-connection path above.
+    let user_version = lines
+        .next()
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+        .filter(|&v| v > 0);
 
     Some(HistoricalBundleProbe {
         schema_version,
+        user_version,
         fts_schema_rows,
         fts_queryable: false,
         max_message_id,
@@ -2363,7 +1799,7 @@ fn historical_bundle_supports_direct_readonly(root_path: &Path) -> bool {
         .is_ok()
 }
 
-fn historical_table_exists(conn: &FrankenConnection, table: &str) -> Result<bool> {
+pub(crate) fn historical_table_exists(conn: &FrankenConnection, table: &str) -> Result<bool> {
     let found: Option<i64> = conn
         .query_row_map(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1",
@@ -2771,73 +2207,7 @@ fn franken_fts_schema_rows(conn: &FrankenConnection) -> Result<i64> {
         fparams![],
         |row| row.get_typed(0),
     )
-    .context("counting sqlite_master rows for fts_messages via frankensqlite")
-}
-
-#[cfg(test)]
-fn franken_fts_limit_probe(conn: &FrankenConnection) -> bool {
-    conn.query_all_map("SELECT COUNT(*) FROM fts_messages", &[], |_row| Ok(())).is_ok()
-}
-
-#[cfg(test)]
-pub(crate) fn probe_database_health_via_frankensqlite(
-    db_path: &Path,
-) -> Result<SqliteDatabaseHealthProbe> {
-    let path_str = db_path.to_string_lossy();
-    let conn = FrankenConnection::open_writable(std::path::Path::new(&(path_str.as_ref())), crate::storage::api::Profile::Production).with_context(|| {
-        format!(
-            "opening frankensqlite db at {} for database health probe",
-            db_path.display()
-        )
-    })?;
-    conn.execute_batch("PRAGMA busy_timeout = 30000;")
-        .with_context(|| {
-            format!(
-                "configuring busy timeout for database health probe at {}",
-                db_path.display()
-            )
-        })?;
-
-    let schema_version = read_meta_schema_version(&conn)?;
-    let quick_check_status: String = conn
-        .query_row_map("PRAGMA quick_check(1)", fparams![], |row| row.get_typed(0))
-        .with_context(|| format!("running PRAGMA quick_check(1) for {}", db_path.display()))?;
-    let quick_check_ok = quick_check_status.trim().eq_ignore_ascii_case("ok");
-    let fts_schema_rows = franken_fts_schema_rows(&conn)?;
-    let fts_queryable = fts_schema_rows == 1 && franken_fts_limit_probe(&conn);
-
-    if !quick_check_ok {
-        return Ok(SqliteDatabaseHealthProbe {
-            schema_version,
-            quick_check_ok,
-            fts_schema_rows,
-            fts_queryable,
-            message_count: 0,
-            max_message_id: 0,
-        });
-    }
-
-    let message_count: i64 = conn
-        .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
-            row.get_typed(0)
-        })
-        .context("counting messages during frankensqlite database health probe")?;
-    let max_message_id: i64 = conn
-        .query_row_map(
-            "SELECT COALESCE(MAX(id), 0) FROM messages",
-            fparams![],
-            |row| row.get_typed(0),
-        )
-        .context("reading max message id during frankensqlite database health probe")?;
-
-    Ok(SqliteDatabaseHealthProbe {
-        schema_version,
-        quick_check_ok,
-        fts_schema_rows,
-        fts_queryable,
-        message_count,
-        max_message_id,
-    })
+    .context("counting sqlite_master rows for fts_messages via the legacy embedded engine")
 }
 
 struct StagedHistoricalSeed {
@@ -3142,16 +2512,10 @@ fn message_payload_size_hint(message: &Message) -> usize {
         .saturating_add(json_value_size_hint(&message.extra_json))
 }
 
-fn is_backup_root_name(name: &str, prefix: &str) -> bool {
-    name.starts_with(prefix) && !name.ends_with("-wal") && !name.ends_with("-shm")
-}
-
 // Suffixes that mark sqlite sidecar files we must never re-open as a DB root.
-// Includes the standard -wal/-shm pair plus frankensqlite's Windows advisory-
+// Includes the standard -wal/-shm pair plus the legacy embedded engine's Windows advisory-
 // lock sidecars (-lock-shared/-lock-reserved/-lock-pending). Used by directory
-// enumeration paths in `historical_bundle_root_paths`; deliberately NOT used
-// by `is_backup_root_name`, because the existing backup-rotation cleanup must
-// continue to sweep up any pre-existing orphan lock sidecars.
+// enumeration paths in `historical_bundle_root_paths`.
 fn has_db_sidecar_suffix(name: &str) -> bool {
     const SIDECAR_SUFFIXES: &[&str] = &[
         "-wal",
@@ -3159,657 +2523,27 @@ fn has_db_sidecar_suffix(name: &str) -> bool {
         "-lock-shared",
         "-lock-reserved",
         "-lock-pending",
+        // w1b: the legacy embedded engine plants these namespace-lock sidecars next to ANY
+        // file it opens (read or write), even ones that fail to parse as a
+        // database. Their names inherit the opened file's prefix, so an
+        // unfiltered sidecar matches the same `.corrupt.`/`.bak` glob
+        // patterns `historical_bundle_root_paths` uses and gets miscounted
+        // as an independent historical salvage bundle.
+        "-fsqlite-ns-use",
+        "-fsqlite-ns-gate",
     ];
     SIDECAR_SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
 }
 
-/// Public schema version constant for external checks.
-pub const CURRENT_SCHEMA_VERSION: i64 = 21;
-const MIN_IN_PLACE_MIGRATION_SCHEMA_VERSION: i64 = 13;
-
-/// Result of checking schema compatibility.
-#[derive(Debug, Clone)]
-pub enum SchemaCheck {
-    /// Schema is up to date, no migration needed.
-    Compatible,
-    /// Schema needs migration but can be done incrementally.
-    NeedsMigration,
-    /// Schema is incompatible and needs a full rebuild (with reason).
-    NeedsRebuild(String),
-}
-
-fn schema_check_error_requires_rebuild(err: &StorageError) -> bool {
-    // Only on-disk corruption classes justify destructive rebuild.
-    // Locking, open, and generic I/O failures are often transient and must
-    // surface as errors rather than deleting the database under the caller.
-    // Task A4a: `map_franken_err` (backend_franken.rs) was extended to route
-    // DatabaseCorrupt/WalCorrupt/NotADatabase/ShortRead here as `Corrupt` — see
-    // its doc comment for why this exact 4-variant set is preserved.
-    matches!(err, StorageError::Corrupt { .. })
-}
-
-fn unique_backup_path(path: &Path) -> PathBuf {
-    static NEXT_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let nonce = NEXT_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("db");
-
-    path.with_file_name(format!(
-        "{file_name}.backup.{}.{}.{}",
-        std::process::id(),
-        timestamp,
-        nonce
-    ))
-}
-
-fn vacuum_stage_backup_path(backup_path: &Path) -> PathBuf {
-    let file_name = backup_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("db.backup");
-    backup_path.with_file_name(format!(".{file_name}.vacuum-in-progress"))
-}
-
-/// Check schema compatibility without modifying the database.
-///
-/// Opens the database read-only and checks the schema version.
-fn check_schema_compatibility(
-    path: &Path,
-) -> std::result::Result<SchemaCheck, StorageError> {
-    let mut conn = open_franken_with_flags(
-        &path.to_string_lossy(),
-        FrankenOpenFlags::SQLITE_OPEN_READ_ONLY,
-    )?;
-
-    let result = (|| {
-        // Check if meta table exists
-        let meta_exists: i32 = conn.query_row_map(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='meta'",
-            fparams![],
-            |row| row.get_typed(0),
-        )?;
-
-        if meta_exists == 0 {
-            // No meta table - could be empty or very old schema, needs rebuild
-            // But first check if there are any tables at all
-            let table_count: i32 = conn.query_row_map(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table'",
-                fparams![],
-                |row| row.get_typed(0),
-            )?;
-
-            if table_count == 0 {
-                // Empty database, will be initialized fresh
-                return Ok(SchemaCheck::NeedsMigration);
-            }
-
-            // Has tables but no meta - very old or corrupted
-            return Ok(SchemaCheck::NeedsRebuild(
-                "Database missing schema version metadata".to_string(),
-            ));
-        }
-
-        // Get the schema version
-        let version: Option<i64> = conn
-            .query_row_map(
-                "SELECT value FROM meta WHERE key = 'schema_version'",
-                fparams![],
-                |row| Ok(row.get_typed::<String>(0)?.parse().ok()),
-            )
-            .ok()
-            .flatten();
-
-        match version {
-            Some(v) if v == SCHEMA_VERSION => Ok(SchemaCheck::Compatible),
-            Some(v) if (MIN_IN_PLACE_MIGRATION_SCHEMA_VERSION..SCHEMA_VERSION).contains(&v) => {
-                Ok(SchemaCheck::NeedsMigration)
-            }
-            Some(v) if v > 0 && v < MIN_IN_PLACE_MIGRATION_SCHEMA_VERSION => {
-                Ok(SchemaCheck::NeedsRebuild(format!(
-                    "Schema version {} is too old for in-place migration; supported upgrade path starts at version {}",
-                    v, MIN_IN_PLACE_MIGRATION_SCHEMA_VERSION
-                )))
-            }
-            Some(v) => {
-                // v > SCHEMA_VERSION - database is from a newer version
-                Ok(SchemaCheck::NeedsRebuild(format!(
-                    "Schema version {} is newer than supported version {}",
-                    v, SCHEMA_VERSION
-                )))
-            }
-            None => Ok(SchemaCheck::NeedsRebuild(
-                "Schema version not found or invalid".to_string(),
-            )),
-        }
-    })();
-
-    if let Err(close_err) = conn.close_in_place() {
-        tracing::warn!(
-            error = %close_err,
-            db_path = %path.display(),
-            "check_schema_compatibility: close_in_place failed; falling back to best-effort close"
-        );
-        conn.close_best_effort_in_place();
-    }
-
-    result
-}
-
-const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
-
-#[cfg(test)]
-const MIGRATION_V1: &str = r"
-PRAGMA foreign_keys = ON;
-
-CREATE TABLE IF NOT EXISTS meta (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS agents (
-    id INTEGER PRIMARY KEY,
-    slug TEXT NOT NULL UNIQUE,
-    name TEXT NOT NULL,
-    version TEXT,
-    kind TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS workspaces (
-    id INTEGER PRIMARY KEY,
-    path TEXT NOT NULL UNIQUE,
-    display_name TEXT
-);
-
-CREATE TABLE IF NOT EXISTS conversations (
-    id INTEGER PRIMARY KEY,
-    agent_id INTEGER NOT NULL REFERENCES agents(id),
-    workspace_id INTEGER REFERENCES workspaces(id),
-    external_id TEXT,
-    title TEXT,
-    source_path TEXT NOT NULL,
-    started_at INTEGER,
-    ended_at INTEGER,
-    approx_tokens INTEGER,
-    metadata_json TEXT,
-    UNIQUE(agent_id, external_id)
-);
-
-CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY,
-    conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-    idx INTEGER NOT NULL,
-    role TEXT NOT NULL,
-    author TEXT,
-    created_at INTEGER,
-    content TEXT NOT NULL,
-    extra_json TEXT,
-    UNIQUE(conversation_id, idx)
-);
-
-CREATE TABLE IF NOT EXISTS snippets (
-    id INTEGER PRIMARY KEY,
-    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
-    file_path TEXT,
-    start_line INTEGER,
-    end_line INTEGER,
-    language TEXT,
-    snippet_text TEXT
-);
-
-CREATE TABLE IF NOT EXISTS tags (
-    id INTEGER PRIMARY KEY,
-    name TEXT NOT NULL UNIQUE
-);
-
-CREATE TABLE IF NOT EXISTS conversation_tags (
-    conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-    tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
-    PRIMARY KEY (conversation_id, tag_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_conversations_agent_started
-    ON conversations(agent_id, started_at DESC);
-
-CREATE INDEX IF NOT EXISTS idx_messages_conv_idx
-    ON messages(conversation_id, idx);
-
-";
-
-#[cfg(test)]
-const MIGRATION_V2: &str = r"
-CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(
-    content,
-    title,
-    agent,
-    workspace,
-    source_path,
-    created_at UNINDEXED,
-    message_id UNINDEXED,
-    tokenize='porter'
-);
-INSERT INTO fts_messages(content, title, agent, workspace, source_path, created_at, message_id)
-SELECT
-    m.content,
-    c.title,
-    a.slug,
-    w.path,
-    c.source_path,
-    m.created_at,
-    m.id
-FROM messages m
-JOIN conversations c ON m.conversation_id = c.id
-JOIN agents a ON c.agent_id = a.id
-LEFT JOIN workspaces w ON c.workspace_id = w.id;
-";
-
-#[cfg(test)]
-const MIGRATION_V3: &str = r"
-DROP TABLE IF EXISTS fts_messages;
-CREATE VIRTUAL TABLE fts_messages USING fts5(
-    content,
-    title,
-    agent,
-    workspace,
-    source_path,
-    created_at UNINDEXED,
-    message_id UNINDEXED,
-    tokenize='porter'
-);
-INSERT INTO fts_messages(content, title, agent, workspace, source_path, created_at, message_id)
-SELECT
-    m.content,
-    c.title,
-    a.slug,
-    w.path,
-    c.source_path,
-    m.created_at,
-    m.id
-FROM messages m
-JOIN conversations c ON m.conversation_id = c.id
-JOIN agents a ON c.agent_id = a.id
-LEFT JOIN workspaces w ON c.workspace_id = w.id;
-";
-
-#[cfg(test)]
-const MIGRATION_V4: &str = r"
--- Sources table for tracking where conversations come from
-CREATE TABLE IF NOT EXISTS sources (
-    id TEXT PRIMARY KEY,           -- source_id (e.g., 'local', 'work-laptop')
-    kind TEXT NOT NULL,            -- 'local', 'ssh', etc.
-    host_label TEXT,               -- display label
-    machine_id TEXT,               -- optional stable machine id
-    platform TEXT,                 -- 'macos', 'linux', 'windows'
-    config_json TEXT,              -- JSON blob for extra config (SSH params, path rewrites)
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
-);
-
--- Bootstrap: Insert the default 'local' source
-INSERT OR IGNORE INTO sources (id, kind, host_label, created_at, updated_at)
-VALUES ('local', 'local', NULL, strftime('%s','now')*1000, strftime('%s','now')*1000);
-";
-
-#[cfg(test)]
-const MIGRATION_V5: &str = r"
--- Add provenance columns to conversations table
--- SQLite cannot alter unique constraints, so we need to recreate the table
-
--- Create new table with provenance columns and updated unique constraint
-CREATE TABLE conversations_new (
-    id INTEGER PRIMARY KEY,
-    agent_id INTEGER NOT NULL REFERENCES agents(id),
-    workspace_id INTEGER REFERENCES workspaces(id),
-    source_id TEXT NOT NULL DEFAULT 'local' REFERENCES sources(id),
-    external_id TEXT,
-    title TEXT,
-    source_path TEXT NOT NULL,
-    started_at INTEGER,
-    ended_at INTEGER,
-    approx_tokens INTEGER,
-    metadata_json TEXT,
-    origin_host TEXT,
-    UNIQUE(source_id, agent_id, external_id)
-);
-
--- Copy data from old table (all existing conversations get source_id='local')
-INSERT INTO conversations_new (id, agent_id, workspace_id, source_id, external_id, title,
-                               source_path, started_at, ended_at, approx_tokens, metadata_json, origin_host)
-SELECT id, agent_id, workspace_id, 'local', external_id, title,
-       source_path, started_at, ended_at, approx_tokens, metadata_json, NULL
-FROM conversations;
-
--- Drop old table and rename new
-DROP TABLE conversations;
-ALTER TABLE conversations_new RENAME TO conversations;
-
--- Recreate indexes
-CREATE INDEX IF NOT EXISTS idx_conversations_agent_started ON conversations(agent_id, started_at DESC);
-CREATE INDEX IF NOT EXISTS idx_conversations_source_id ON conversations(source_id);
-";
-
-#[cfg(test)]
-const MIGRATION_V6: &str = r"
--- Optimize lookup by source_path (used by TUI detail view)
-CREATE INDEX IF NOT EXISTS idx_conversations_source_path ON conversations(source_path);
-";
-
-#[cfg(test)]
-const MIGRATION_V7: &str = r"
--- Add binary columns for MessagePack serialization (Opt 3.1)
--- Binary format is 50-70% smaller than JSON and faster to parse
-ALTER TABLE conversations ADD COLUMN metadata_bin BLOB;
-ALTER TABLE messages ADD COLUMN extra_bin BLOB;
-";
-
-#[cfg(test)]
-const MIGRATION_V8: &str = r"
--- Opt 3.2: Daily stats materialized table for O(1) time-range histograms
--- Provides fast aggregated queries for stats/dashboard without full table scans
-
-CREATE TABLE IF NOT EXISTS daily_stats (
-    day_id INTEGER NOT NULL,              -- Days since 2020-01-01 (Unix epoch + offset)
-    agent_slug TEXT NOT NULL,             -- 'all' for totals, or specific agent slug
-    source_id TEXT NOT NULL DEFAULT 'all', -- 'all' for totals, or specific source
-    session_count INTEGER NOT NULL DEFAULT 0,
-    message_count INTEGER NOT NULL DEFAULT 0,
-    total_chars INTEGER NOT NULL DEFAULT 0,
-    last_updated INTEGER NOT NULL,
-    PRIMARY KEY (day_id, agent_slug, source_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_daily_stats_agent ON daily_stats(agent_slug, day_id);
-CREATE INDEX IF NOT EXISTS idx_daily_stats_source ON daily_stats(source_id, day_id);
-";
-
-#[cfg(test)]
-const MIGRATION_V9: &str = r"
--- Background embedding jobs tracking table
-CREATE TABLE IF NOT EXISTS embedding_jobs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    db_path TEXT NOT NULL,
-    model_id TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending',
-    total_docs INTEGER NOT NULL DEFAULT 0,
-    completed_docs INTEGER NOT NULL DEFAULT 0,
-    error_message TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    started_at TEXT,
-    completed_at TEXT
-);
-
--- Only one pending or running job per (db_path, model_id) at a time.
--- Multiple completed/failed/cancelled jobs are allowed for history.
-CREATE UNIQUE INDEX IF NOT EXISTS idx_embedding_jobs_active
-ON embedding_jobs(db_path, model_id)
-WHERE status IN ('pending', 'running');
-";
-
-#[cfg(test)]
-const MIGRATION_V10: &str = r"
--- Token analytics: per-message token usage ledger
-CREATE TABLE IF NOT EXISTS token_usage (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
-    conversation_id INTEGER NOT NULL,
-    agent_id INTEGER NOT NULL,
-    workspace_id INTEGER,
-    source_id TEXT NOT NULL DEFAULT 'local',
-
-    -- Timing
-    timestamp_ms INTEGER NOT NULL,
-    day_id INTEGER NOT NULL,
-
-    -- Model identification
-    model_name TEXT,
-    model_family TEXT,
-    model_tier TEXT,
-    service_tier TEXT,
-    provider TEXT,
-
-    -- Token counts (nullable — not all agents provide all fields)
-    input_tokens INTEGER,
-    output_tokens INTEGER,
-    cache_read_tokens INTEGER,
-    cache_creation_tokens INTEGER,
-    thinking_tokens INTEGER,
-    total_tokens INTEGER,
-
-    -- Cost estimation
-    estimated_cost_usd REAL,
-
-    -- Message context
-    role TEXT NOT NULL,
-    content_chars INTEGER NOT NULL,
-    has_tool_calls INTEGER NOT NULL DEFAULT 0,
-    tool_call_count INTEGER NOT NULL DEFAULT 0,
-
-    -- Data quality
-    data_source TEXT NOT NULL DEFAULT 'api',
-
-    UNIQUE(message_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_token_usage_day ON token_usage(day_id, agent_id);
-CREATE INDEX IF NOT EXISTS idx_token_usage_conv ON token_usage(conversation_id);
-CREATE INDEX IF NOT EXISTS idx_token_usage_model ON token_usage(model_family, day_id);
-CREATE INDEX IF NOT EXISTS idx_token_usage_workspace ON token_usage(workspace_id, day_id);
-CREATE INDEX IF NOT EXISTS idx_token_usage_timestamp ON token_usage(timestamp_ms);
-
--- Token analytics: pre-aggregated daily rollups
-CREATE TABLE IF NOT EXISTS token_daily_stats (
-    day_id INTEGER NOT NULL,
-    agent_slug TEXT NOT NULL,
-    source_id TEXT NOT NULL DEFAULT 'all',
-    model_family TEXT NOT NULL DEFAULT 'all',
-
-    api_call_count INTEGER NOT NULL DEFAULT 0,
-    user_message_count INTEGER NOT NULL DEFAULT 0,
-    assistant_message_count INTEGER NOT NULL DEFAULT 0,
-    tool_message_count INTEGER NOT NULL DEFAULT 0,
-
-    total_input_tokens INTEGER NOT NULL DEFAULT 0,
-    total_output_tokens INTEGER NOT NULL DEFAULT 0,
-    total_cache_read_tokens INTEGER NOT NULL DEFAULT 0,
-    total_cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
-    total_thinking_tokens INTEGER NOT NULL DEFAULT 0,
-    grand_total_tokens INTEGER NOT NULL DEFAULT 0,
-
-    total_content_chars INTEGER NOT NULL DEFAULT 0,
-    total_tool_calls INTEGER NOT NULL DEFAULT 0,
-
-    estimated_cost_usd REAL NOT NULL DEFAULT 0.0,
-
-    session_count INTEGER NOT NULL DEFAULT 0,
-
-    last_updated INTEGER NOT NULL,
-
-    PRIMARY KEY (day_id, agent_slug, source_id, model_family)
-);
-
-CREATE INDEX IF NOT EXISTS idx_token_daily_stats_agent ON token_daily_stats(agent_slug, day_id);
-CREATE INDEX IF NOT EXISTS idx_token_daily_stats_model ON token_daily_stats(model_family, day_id);
-
--- Model pricing lookup table
-CREATE TABLE IF NOT EXISTS model_pricing (
-    model_pattern TEXT NOT NULL,
-    provider TEXT NOT NULL,
-    input_cost_per_mtok REAL NOT NULL,
-    output_cost_per_mtok REAL NOT NULL,
-    cache_read_cost_per_mtok REAL,
-    cache_creation_cost_per_mtok REAL,
-    effective_date TEXT NOT NULL,
-    PRIMARY KEY (model_pattern, effective_date)
-);
-
--- Seed with current pricing (as of 2026-02)
-INSERT OR IGNORE INTO model_pricing VALUES
-    ('claude-opus-4%', 'anthropic', 15.0, 75.0, 1.5, 18.75, '2025-10-01'),
-    ('claude-sonnet-4%', 'anthropic', 3.0, 15.0, 0.3, 3.75, '2025-10-01'),
-    ('claude-haiku-4%', 'anthropic', 0.80, 4.0, 0.08, 1.0, '2025-10-01'),
-    ('gpt-4o%', 'openai', 2.50, 10.0, NULL, NULL, '2025-01-01'),
-    ('gpt-4-turbo%', 'openai', 10.0, 30.0, NULL, NULL, '2024-04-01'),
-    ('gpt-4.1%', 'openai', 2.0, 8.0, NULL, NULL, '2025-04-01'),
-    ('o3%', 'openai', 2.0, 8.0, NULL, NULL, '2025-04-01'),
-    ('o4-mini%', 'openai', 1.10, 4.40, NULL, NULL, '2025-04-01'),
-    ('gemini-2%flash%', 'google', 0.075, 0.30, NULL, NULL, '2025-01-01'),
-    ('gemini-2%pro%', 'google', 1.25, 10.0, NULL, NULL, '2025-01-01');
-
--- Extend conversations table with token summary columns
-ALTER TABLE conversations ADD COLUMN total_input_tokens INTEGER;
-ALTER TABLE conversations ADD COLUMN total_output_tokens INTEGER;
-ALTER TABLE conversations ADD COLUMN total_cache_read_tokens INTEGER;
-ALTER TABLE conversations ADD COLUMN total_cache_creation_tokens INTEGER;
-ALTER TABLE conversations ADD COLUMN grand_total_tokens INTEGER;
-ALTER TABLE conversations ADD COLUMN estimated_cost_usd REAL;
-ALTER TABLE conversations ADD COLUMN primary_model TEXT;
-ALTER TABLE conversations ADD COLUMN api_call_count INTEGER;
-ALTER TABLE conversations ADD COLUMN tool_call_count INTEGER;
-ALTER TABLE conversations ADD COLUMN user_message_count INTEGER;
-ALTER TABLE conversations ADD COLUMN assistant_message_count INTEGER;
-";
-
-const MIGRATION_V14: &str = r"
--- Switch FTS5 from internal-content to contentless mode (CASS #163).
--- Drop the old V13 internal-content fts_messages first so that
--- sqlite_schema does not contain two conflicting CREATE VIRTUAL TABLE
--- entries, which makes the database completely unreadable.
--- The current contentless table is recreated lazily after open() only when the
--- frankensqlite FTS consistency check finds it missing or malformed.
-DROP TABLE IF EXISTS fts_messages;
-";
-
-const MIGRATION_V15_TAIL_STATE_TABLE: &str = r"
-CREATE TABLE IF NOT EXISTS conversation_tail_state (
-    -- Deliberately no FOREIGN KEY: this hot row is maintained by insert/append
-    -- paths, and FK metadata keeps frankensqlite off the direct rowid update path.
-    conversation_id INTEGER PRIMARY KEY,
-    ended_at INTEGER,
-    last_message_idx INTEGER,
-    last_message_created_at INTEGER
-);
-";
-
-const MIGRATION_V16: &str = r"
--- UNIQUE(conversation_id, idx) already creates sqlite_autoindex_messages_1,
--- which covers the same lookup/order key as idx_messages_conv_idx. Keeping both
--- doubles message insert index maintenance on the hot indexing path.
-DROP INDEX IF EXISTS idx_messages_conv_idx;
-";
-
-const MIGRATION_V17: &str = r"
--- Drop the global messages(created_at) secondary index from the ingest hot
--- path. Search/time filters are served by the derived search layer and
--- conversation/analytics indexes, while this index is maintained on every
--- message insert.
-DROP INDEX IF EXISTS idx_messages_created;
-";
-
-const MIGRATION_V18: &str = r"
--- Move append-tail state out of the wide, indexed conversations row. The hot
--- append path updates this cache for every appended conversation; keeping it in
--- a tiny rowid table avoids rewriting the large conversation record.
-CREATE TABLE IF NOT EXISTS conversation_tail_state (
-    -- Deliberately no FOREIGN KEY: this hot row is maintained by insert/append
-    -- paths, and FK metadata keeps frankensqlite off the direct rowid update path.
-    conversation_id INTEGER PRIMARY KEY,
-    ended_at INTEGER,
-    last_message_idx INTEGER,
-    last_message_created_at INTEGER
-);
-
-INSERT OR REPLACE INTO conversation_tail_state (
-    conversation_id, ended_at, last_message_idx, last_message_created_at
-)
-SELECT id, ended_at, last_message_idx, last_message_created_at
-FROM conversations
-WHERE ended_at IS NOT NULL
-   OR last_message_idx IS NOT NULL
-   OR last_message_created_at IS NOT NULL;
-";
-
-const MIGRATION_V19: &str = r"
--- Materialize external conversation provenance into one compact lookup key.
--- This keeps the hot append/new-conversation probe on a single primary-key
--- lookup instead of a composite conversations-table predicate.
-CREATE TABLE IF NOT EXISTS conversation_external_lookup (
-    lookup_key TEXT PRIMARY KEY,
-    conversation_id INTEGER NOT NULL
-);
-
-INSERT OR REPLACE INTO conversation_external_lookup (lookup_key, conversation_id)
-SELECT
-    CAST(length(source_id) AS TEXT) || ':' || source_id || ':' ||
-    CAST(agent_id AS TEXT) || ':' ||
-    CAST(length(external_id) AS TEXT) || ':' || external_id,
-    id
-FROM conversations
-WHERE external_id IS NOT NULL;
-";
-
-const MIGRATION_V20: &str = r"
--- Fuse external conversation lookup with append-tail state. Append-heavy
--- workloads can resolve both the conversation id and tail plan from one
--- primary-key probe.
-CREATE TABLE IF NOT EXISTS conversation_external_tail_lookup (
-    lookup_key TEXT PRIMARY KEY,
-    conversation_id INTEGER NOT NULL,
-    ended_at INTEGER,
-    last_message_idx INTEGER,
-    last_message_created_at INTEGER
-);
-
-INSERT OR REPLACE INTO conversation_external_tail_lookup (
-    lookup_key,
-    conversation_id,
-    ended_at,
-    last_message_idx,
-    last_message_created_at
-)
-SELECT
-    CAST(length(c.source_id) AS TEXT) || ':' || c.source_id || ':' ||
-    CAST(c.agent_id AS TEXT) || ':' ||
-    CAST(length(c.external_id) AS TEXT) || ':' || c.external_id,
-    c.id,
-    (SELECT ts.ended_at
-     FROM conversation_tail_state ts
-     WHERE ts.conversation_id = c.id),
-    (SELECT ts.last_message_idx
-     FROM conversation_tail_state ts
-     WHERE ts.conversation_id = c.id),
-    (SELECT ts.last_message_created_at
-     FROM conversation_tail_state ts
-     WHERE ts.conversation_id = c.id)
-FROM conversations c
-WHERE c.external_id IS NOT NULL;
-";
-
-const MIGRATION_V21: &str = r"
--- W1 operation commit receipt（上位契约 §20.1(b) 的 D1）。
---
--- 记的是「一次 DB 事务是否已提交」这个事实，崩溃重启后据 idempotency_key
--- 判幂等，避免同一次 relink / restore 被重复施加。
---
--- ⚠ 与基线的 DoctorAssetClass::OperationReceipt（其 asset_class 字符串值）
--- 语义完全不同：那个是 doctor 的**文件资产分类**，指向 <data_dir>/doctor/receipts/
--- 目录下的文件；本表是**DB 事务的提交事实**。两者不得混名，故本表取名
--- operation_commit_receipt（区分点是 commit），且字符串上不含 operation_receipt
--- 子串，基线那批的 grep 普查不会被本表污染。
-CREATE TABLE IF NOT EXISTS operation_commit_receipt (
-    id INTEGER PRIMARY KEY,
-    idempotency_key TEXT NOT NULL UNIQUE,
-    operation TEXT NOT NULL,
-    state TEXT NOT NULL,
-    snapshot_root TEXT,
-    committed_at_ms INTEGER NOT NULL,
-    detail TEXT
-);
-";
+/// w1b Task B8: single source of truth for "what schema version is this
+/// database at" now lives in `storage::schema` (the rusqlite engine's
+/// `PRAGMA user_version` authority) -- re-exported here so the handful of
+/// production call sites that already named `storage::sqlite::
+/// CURRENT_SCHEMA_VERSION` (`phase3_restore.rs`'s db-identity recording,
+/// `indexer/mod.rs`'s fast-path skip check) keep working unchanged, with the
+/// value naturally following the new engine's numbering instead of the
+/// retired legacy-engine-era incremental engine's (which topped out at 21).
+pub use crate::storage::schema::CURRENT_SCHEMA_VERSION;
 
 /// Row from the embedding_jobs table.
 #[derive(Debug, Clone)]
@@ -3830,7 +2564,7 @@ pub struct EmbeddingJobRow {
 ///
 /// This intentionally omits `metadata_json` / `metadata_bin` and other bulky
 /// fields because Tantivy only needs the stable envelope plus provenance
-/// identifiers. Reading full metadata here can force frankensqlite to traverse
+/// identifiers. Reading full metadata here can force the legacy embedded engine to traverse
 /// large overflow chains before the first lexical checkpoint is committed.
 #[derive(Debug, Clone)]
 pub struct LexicalRebuildConversationRow {
@@ -4024,7 +2758,7 @@ fn truncate_lexical_rebuild_conversation_content(
 /// Compatibility alias retained while call sites finish converging on `FrankenStorage`.
 pub type SqliteStorage = FrankenStorage;
 
-/// Primary frankensqlite-backed storage backend.
+/// Primary legacy-engine-backed storage backend.
 pub struct FrankenStorage {
     conn: FrankenConnection,
     db_path: PathBuf,
@@ -4151,9 +2885,9 @@ where
     }
 
     Err(anyhow!(
-        "failed to disable autocommit_retain on frankensqlite connection; \
+        "failed to disable autocommit_retain on the legacy embedded engine connection; \
          refusing to keep a long-lived MVCC connection that may accumulate \
-         unbounded write snapshots. Upgrade frankensqlite to a version that \
+         unbounded write snapshots. Upgrade the legacy embedded engine to a version that \
          supports one of these PRAGMAs or use a short-lived connection path. \
          attempts: {}",
         failures.join("; ")
@@ -4218,11 +2952,26 @@ impl FrankenStorage {
         }
     }
 
-    /// Open a frankensqlite connection, run migrations, and apply config.
+    /// Open a legacy embedded engine connection, run migrations, and apply config.
     ///
     /// This initializes canonical schema state only. Derived fallback search
     /// structures like the in-database `fts_messages` table are repaired
     /// separately so ordinary opens never block on heavyweight maintenance.
+    /// w1b Task B8 (d16 follow-up): every open -- fresh file or a
+    /// pre-existing database -- routes through `schema::ensure`, which
+    /// already covers both cases per its own contract (empty database ->
+    /// build; `0 < user_version <= CURRENT_SCHEMA_VERSION` -> no-op verify;
+    /// `user_version == 0` and non-empty -> reject with a rebuild-not-
+    /// convert message). That last branch is the intended behavior change
+    /// this task ships: a pre-B8 (legacy-engine-era) database has
+    /// `user_version == 0` and is non-empty, so it is now rejected outright
+    /// rather than incrementally migrated in place -- Stage C's re-ingest
+    /// path is the supported route back for real user data, per spec's
+    /// "rebuild, not convert" contract (§3.5). The old incremental engine
+    /// (`run_migrations`/`transition_from_meta_version`/
+    /// `sync_meta_schema_version`/franken migration runner) and the Stage B
+    /// transition shim it required are retired together with the franken
+    /// backend in this same task.
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
@@ -4233,10 +2982,11 @@ impl FrankenStorage {
         let _doctor_guard =
             acquire_doctor_mutation_db_open_guard(path, DOCTOR_MUTATION_DB_OPEN_LOCK_TIMEOUT)?;
         let conn = FrankenConnection::open_writable(std::path::Path::new(&(&path_str)), crate::storage::api::Profile::Production)
-            .with_context(|| format!("opening frankensqlite db at {}", path.display()))?;
+            .with_context(|| format!("opening sqlite db at {}", path.display()))?;
         let storage = Self::new(conn, path.to_path_buf());
         storage.apply_open_stage_busy_timeout();
-        storage.run_migrations()?;
+        crate::storage::schema::ensure(&storage.conn)
+            .with_context(|| format!("ensuring schema for database at {}", path.display()))?;
         storage.repair_missing_current_schema_objects()?;
         storage.apply_config()?;
         storage.set_fts_messages_present_cache(true);
@@ -4271,7 +3021,15 @@ impl FrankenStorage {
         let _doctor_guard =
             acquire_doctor_mutation_db_open_guard(path, DOCTOR_MUTATION_DB_OPEN_LOCK_TIMEOUT)?;
         let conn = FrankenConnection::open_writable(std::path::Path::new(&(&path_str)), crate::storage::api::Profile::Production)
-            .with_context(|| format!("opening frankensqlite writer at {}", path.display()))?;
+            .with_context(|| format!("opening sqlite writer at {}", path.display()))?;
+        // w1b Task B8 (d16, `Storage::open` read-only-ification's prerequisite):
+        // `open_writer` is becoming the sole schema-building entry point as
+        // consumer sites move off the now-read-only `open()`, so it must run
+        // the same `schema::ensure` `open()` always has -- otherwise a
+        // consumer that only ever calls `open_writer()` on a not-yet-existing
+        // db path would get an empty, table-less connection.
+        crate::storage::schema::ensure(&conn)
+            .with_context(|| format!("ensuring schema for writer at {}", path.display()))?;
         let storage = Self::new_with_shared_caches(
             conn,
             path.to_path_buf(),
@@ -4280,6 +3038,24 @@ impl FrankenStorage {
             ensured_conversation_sources,
             ensured_daily_stats_keys,
         );
+        storage.repair_missing_current_schema_objects()?;
+        storage.apply_config()?;
+        storage.set_fts_messages_present_cache(true);
+        Ok(storage)
+    }
+
+    /// w1b Task B4: wrap an already-open writable connection into a
+    /// `FrankenStorage`, applying the same writer-side setup
+    /// (`apply_config` + FTS-messages-present fast path) that
+    /// `open_writer`/`open_writer_with_shared_caches` apply to a connection
+    /// they open themselves. Does not open a new connection -- this exists
+    /// specifically so `storage::api::WriterHandle<FrankenStorage>` (whose
+    /// writer thread already owns exactly one `Conn`) can hand it in here
+    /// instead of a second call opening a second connection. Never call
+    /// this with a connection whose lifetime is not already owned by the
+    /// caller for exactly this purpose.
+    pub(crate) fn from_writer_handle_conn(conn: FrankenConnection, db_path: PathBuf) -> Result<Self> {
+        let storage = Self::new(conn, db_path);
         storage.apply_config()?;
         storage.set_fts_messages_present_cache(true);
         Ok(storage)
@@ -4471,12 +3247,12 @@ impl FrankenStorage {
             CachedEphemeralWriter::Cached(mut conn) => conn
                 .0
                 .close_without_checkpoint_in_place()
-                .with_context(|| "closing cached frankensqlite writer without final checkpoint"),
+                .with_context(|| "closing cached the legacy embedded engine writer without final checkpoint"),
             CachedEphemeralWriter::Uninitialized | CachedEphemeralWriter::InUse => Ok(()),
         }
     }
 
-    /// Open in read-only mode using frankensqlite compat flags.
+    /// Open in read-only mode using the legacy embedded engine compat flags.
     pub fn open_readonly(path: &Path) -> Result<Self> {
         Self::open_readonly_with_doctor_lock_timeout(path, DOCTOR_MUTATION_DB_OPEN_LOCK_TIMEOUT)
     }
@@ -4489,7 +3265,7 @@ impl FrankenStorage {
         let path_str = path.to_string_lossy().to_string();
         let _doctor_guard = acquire_doctor_mutation_db_open_guard(path, timeout)?;
         let conn = open_franken_with_flags(&path_str, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
-            .with_context(|| format!("opening frankensqlite db readonly at {}", path.display()))?;
+            .with_context(|| format!("opening the legacy embedded engine db readonly at {}", path.display()))?;
         let storage = Self::new(conn, path.to_path_buf());
         storage.apply_readonly_config()?;
         Ok(storage)
@@ -4500,7 +3276,7 @@ impl FrankenStorage {
         this.close_cached_ephemeral_writer_best_effort_in_place();
         this.conn
             .close()
-            .with_context(|| "closing frankensqlite connection")
+            .with_context(|| "closing the legacy embedded engine connection")
     }
 
     pub fn close_without_checkpoint(self) -> Result<()> {
@@ -4508,7 +3284,7 @@ impl FrankenStorage {
         this.close_cached_ephemeral_writer_without_checkpoint_in_place()?;
         this.conn
             .close_without_checkpoint()
-            .with_context(|| "closing frankensqlite connection without final checkpoint")
+            .with_context(|| "closing the legacy embedded engine connection without final checkpoint")
     }
 
     pub fn close_best_effort_in_place(&mut self) {
@@ -4520,15 +3296,15 @@ impl FrankenStorage {
         self.close_cached_ephemeral_writer_without_checkpoint_in_place()?;
         self.conn
             .close_without_checkpoint_in_place()
-            .with_context(|| "closing frankensqlite connection without final checkpoint")
+            .with_context(|| "closing the legacy embedded engine connection without final checkpoint")
     }
 
-    /// Access the raw frankensqlite connection.
+    /// Access the raw the legacy embedded engine connection.
     pub fn raw(&self) -> &FrankenConnection {
         &self.conn
     }
 
-    /// Consume the storage wrapper and return the underlying frankensqlite
+    /// Consume the storage wrapper and return the underlying the legacy embedded engine
     /// connection after migrations/repair have already been applied.
     pub fn into_raw(self) -> FrankenConnection {
         let mut this = self;
@@ -4538,30 +3314,36 @@ impl FrankenStorage {
 
     /// Apply connection PRAGMAs for parity with SqliteStorage's `apply_pragmas()`.
     ///
-    /// Frankensqlite supports all PRAGMAs cass uses (journal_mode, synchronous,
-    /// cache_size, foreign_keys, busy_timeout). Its default journal_mode is already
-    /// WAL and default synchronous is NORMAL, matching cass's requirements.
+    /// The legacy embedded engine supports all PRAGMAs cass uses (journal_mode, synchronous,
+    /// cache_size, foreign_keys, busy_timeout).
     ///
+    /// R1-B1: `journal_mode` and `synchronous` are deliberately *not* set
+    /// here anymore. Every caller of `apply_config` (`open`, `open_writer`,
+    /// `from_writer_handle_conn`) receives a connection that has already
+    /// gone through `storage::api::Conn::open_writable`'s `apply_profile`,
+    /// which sets both from the caller's `Profile::pragma_plan()` (`WAL` /
+    /// `FULL` for `Profile::Production`, the only profile any current
+    /// caller uses) *and* reads each one back to confirm it took (spec
+    /// R0-B07 / R4-B1). Re-setting them here unconditionally to a fixed
+    /// `WAL`/`NORMAL` pair -- with no readback check -- silently downgraded
+    /// `Profile::Production` connections from the durable `synchronous =
+    /// FULL` the profile promised back down to `NORMAL`, defeating the
+    /// profile's own self-checked guarantee. Trust the profile the
+    /// connection was actually opened with instead of re-deciding here.
     pub fn apply_config(&self) -> Result<()> {
-        // journal_mode: frankensqlite defaults to WAL, same as cass.
-        // synchronous: frankensqlite defaults to NORMAL, same as cass.
-        // Both are set explicitly for clarity.
-        self.conn
-            .execute("PRAGMA journal_mode = WAL;", &[])
-            .with_context(|| "setting journal_mode")?;
-        self.conn
-            .execute("PRAGMA synchronous = NORMAL;", &[])
-            .with_context(|| "setting synchronous")?;
-
         // cache_size: 64MB (negative value = KiB).
         self.conn
             .execute("PRAGMA cache_size = -65536;", &[])
             .with_context(|| "setting cache_size")?;
 
-        // foreign_keys: enable constraint enforcement.
-        self.conn
-            .execute("PRAGMA foreign_keys = ON;", &[])
-            .with_context(|| "setting foreign_keys")?;
+        // foreign_keys is no longer set here (w1b Task B2b, R0-B3): `self.conn`
+        // is `storage::api::Conn` (see the `Conn as FrankenConnection` import
+        // alias at the top of this file), whose underlying backend now
+        // enforces `foreign_keys = ON` unconditionally at open time
+        // (`backend_franken.rs`'s `enforce_foreign_keys`) -- this call is both
+        // redundant and, since the api layer now rejects any SQL text
+        // mentioning `foreign_keys` as a defense-in-depth guard against
+        // toggling it (see `reject_foreign_keys_keyword`), would fail outright.
 
         // busy_timeout: 5 seconds (in milliseconds).
         self.conn
@@ -4569,7 +3351,7 @@ impl FrankenStorage {
             .with_context(|| "setting busy_timeout")?;
 
         // temp_store = MEMORY and mmap_size are C SQLite performance knobs.
-        // In frankensqlite's architecture (in-memory MVCC engine with pager
+        // In the legacy embedded engine's architecture (in-memory MVCC engine with pager
         // backend), temp_store is always memory-resident and mmap_size does not
         // apply. Skipped intentionally — these are no-ops or errors.
 
@@ -4581,10 +3363,10 @@ impl FrankenStorage {
         self.index_writer_checkpoint_pages
             .store(DEFAULT_WAL_AUTOCHECKPOINT_PAGES, Ordering::Relaxed);
         // Explicitly enable concurrent writer mode for BEGIN/transaction paths.
-        // Try both namespace variants for compatibility across fsqlite builds.
+        // Try both namespace variants for compatibility across the legacy engine crate builds.
         let _ = self.conn.execute("PRAGMA fsqlite.concurrent_mode = ON;", &[]);
         let _ = self.conn.execute("PRAGMA concurrent_mode = ON;", &[]);
-        // Frankensqlite retained autocommit currently mis-serves same-connection
+        // The legacy embedded engine's retained autocommit currently mis-serves same-connection
         // read-after-write queries on cass's storage paths; keep it off here
         // until the upstream visibility bug is fixed.
         //
@@ -4598,7 +3380,7 @@ impl FrankenStorage {
             Ok(autocommit_pragma) => {
                 tracing::debug!(
                     pragma = autocommit_pragma,
-                    "disabled frankensqlite autocommit_retain for storage connection"
+                    "disabled the legacy embedded engine autocommit_retain for storage connection"
                 );
             }
             Err(err) => {
@@ -4606,7 +3388,7 @@ impl FrankenStorage {
                 if error_message_indicates_populated_fts_shadow_without_rowid_reload(&detail) {
                     tracing::warn!(
                         error = %detail,
-                        "frankensqlite could not disable autocommit_retain because a populated derived FTS shadow table cannot yet be reloaded; continuing so canonical indexing can proceed"
+                        "the legacy embedded engine could not disable autocommit_retain because a populated derived FTS shadow table cannot yet be reloaded; continuing so canonical indexing can proceed"
                     );
                 } else {
                     return Err(err);
@@ -4627,65 +3409,8 @@ impl FrankenStorage {
         self.conn
             .execute("PRAGMA cache_size = -65536;", &[])
             .with_context(|| "setting cache_size")?;
-        self.conn
-            .execute("PRAGMA foreign_keys = ON;", &[])
-            .with_context(|| "setting foreign_keys")?;
-        Ok(())
-    }
-
-    /// Run all schema migrations, handling transition from meta table versioning.
-    ///
-    /// The existing `SqliteStorage` tracks schema version in a `meta` table entry.
-    /// The new `MigrationRunner` uses a `_schema_migrations` table. This method:
-    /// 1. Transitions existing databases from meta table → `_schema_migrations`
-    /// 2. Runs pending migrations via `MigrationRunner`
-    /// 3. Syncs `meta.schema_version` for backward compatibility
-    ///
-    /// # Fresh vs existing databases
-    ///
-    /// Fresh databases use a single combined migration (`MIGRATION_FRESH_SCHEMA`)
-    /// that creates the complete V13 schema directly. This avoids the incremental
-    /// V5 migration which uses `DROP TABLE` — an operation that triggers a known
-    /// frankensqlite autoindex limitation.
-    ///
-    /// Existing databases (transitioned from SqliteStorage) are typically at
-    /// V13 or newer already; additive post-V13 migrations are applied normally.
-    pub fn run_migrations(&self) -> Result<()> {
-        transition_from_meta_version(&self.conn)?;
-
-        let base_result = crate::storage::api::run_franken_migrations(
-            &self.conn,
-            &build_cass_migrations_before_tail_cache(),
-        )
-        .with_context(|| "running base schema migrations")?;
-
-        let mut applied = base_result.applied;
-        if apply_conversation_tail_state_cache_migration(&self.conn)
-            .with_context(|| "running conversation tail-state cache migration")?
-        {
-            applied.push(15);
-        }
-
-        let post_result = crate::storage::api::run_franken_migrations(
-            &self.conn,
-            &build_cass_migrations_after_tail_cache(),
-        )
-        .with_context(|| "running post-tail-cache schema migrations")?;
-        applied.extend(post_result.applied);
-
-        let current = self.schema_version()?;
-        if !applied.is_empty() {
-            info!(
-                applied = ?applied,
-                current,
-                was_fresh = base_result.was_fresh,
-                "frankensqlite schema migrations applied"
-            );
-        }
-
-        // Keep meta.schema_version in sync for backward compatibility.
-        self.sync_meta_schema_version(current)?;
-
+        // foreign_keys: see the comment on `apply_config` above -- redundant
+        // and now rejected outright (w1b Task B2b, R0-B3).
         Ok(())
     }
 
@@ -4760,7 +3485,7 @@ impl FrankenStorage {
     /// Detect and remove orphan rows whose FK parent has gone missing.
     ///
     /// A `Connection` dropped mid-transaction (the `drop_close` warning emitted
-    /// by frankensqlite's `Drop` impl) can leave child rows persisted without a
+    /// by the legacy embedded engine's `Drop` impl) can leave child rows persisted without a
     /// matching parent — `messages` referencing a `conversation_id` that does
     /// not exist, `message_metrics`/`token_usage`/`snippets` referencing a
     /// `message_id` that does not exist, etc. With `PRAGMA foreign_keys = ON`,
@@ -4859,55 +3584,12 @@ impl FrankenStorage {
         Ok(report)
     }
 
-    /// Return the current schema version from `_schema_migrations`.
+    /// w1b Task B8: reads `PRAGMA user_version` (the rusqlite engine's sole
+    /// version authority, `storage::schema::ensure`'s contract) instead of
+    /// the retired `_schema_migrations` table.
     pub fn schema_version(&self) -> Result<i64> {
-        let rows = self
-            .conn
-            .query_all_map("SELECT MAX(version) FROM _schema_migrations;", &[], |row| {
-                row.get_value(0)
-            })
-            .with_context(|| "reading schema version from _schema_migrations")?;
-
-        if let Some(value) = rows.into_iter().next()
-            && let Ok(v) = <Option<i64> as crate::storage::api::FromValue>::from_value(value)
-        {
-            return Ok(v.unwrap_or(0));
-        }
-        Ok(0)
-    }
-
-    /// Keep `meta.schema_version` in sync for backward compatibility with `SqliteStorage`.
-    fn sync_meta_schema_version(&self, version: i64) -> Result<()> {
-        // The meta table is created by V1 migration. If it doesn't exist yet,
-        // there's nothing to sync.
-        if self
-            .conn
-            .query_all_map("SELECT key FROM meta LIMIT 1;", &[], |_row| Ok(()))
-            .is_err()
-        {
-            return Ok(());
-        }
-
-        // Only write if the version needs updating to avoid write lock contention
-        if let Ok(rows) = self.conn.query_all_map(
-            "SELECT value FROM meta WHERE key = 'schema_version';",
-            &[],
-            |row| row.get_value(0),
-        ) && let Some(value) = rows.into_iter().next()
-            && let Ok(val) = <String as crate::storage::api::FromValue>::from_value(value)
-            && val == version.to_string()
-        {
-            return Ok(()); // Already up to date
-        }
-
-        self.conn
-            .execute(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?1);",
-                &[ParamValue::from(version.to_string())],
-            )
-            .with_context(|| "syncing meta schema_version")?;
-
-        Ok(())
+        crate::storage::schema::read_user_version(&self.conn)
+            .with_context(|| "reading schema version via PRAGMA user_version")
     }
 
     /// Resolve the database file path for this connection.
@@ -4945,164 +3627,6 @@ impl FrankenStorage {
             .store(timeout_ms, Ordering::Relaxed);
     }
 
-    /// Open database with migration, backing up if schema is incompatible.
-    pub fn open_or_rebuild(path: &Path) -> std::result::Result<Self, MigrationError> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        if path.exists() {
-            let check_result = check_schema_compatibility(path);
-            match check_result {
-                Ok(SchemaCheck::Compatible) | Ok(SchemaCheck::NeedsMigration) => {
-                    // Continue with normal open
-                }
-                Ok(SchemaCheck::NeedsRebuild(reason)) => {
-                    let backup_path = create_backup(path)?;
-                    cleanup_old_backups(path, MAX_BACKUPS)?;
-                    remove_database_files(path)?;
-                    return Err(MigrationError::RebuildRequired {
-                        reason,
-                        backup_path,
-                    });
-                }
-                Err(err) if schema_check_error_requires_rebuild(&err) => {
-                    let backup_path = create_backup(path)?;
-                    cleanup_old_backups(path, MAX_BACKUPS)?;
-                    remove_database_files(path)?;
-                    return Err(MigrationError::RebuildRequired {
-                        reason: format!("Database appears corrupted: {err}"),
-                        backup_path,
-                    });
-                }
-                Err(err) => return Err(MigrationError::Database(err)),
-            }
-        }
-
-        let storage = Self::open(path).map_err(|e| MigrationError::Other(e.to_string()))?;
-        Ok(storage)
-    }
-}
-
-// -------------------------------------------------------------------------
-// Frankensqlite migration helpers
-// -------------------------------------------------------------------------
-
-/// Build the `MigrationRunner` for the frankensqlite migration path.
-///
-/// Uses a single combined migration (version 13) that creates the complete
-/// final schema in one step. This avoids the V5 `DROP TABLE conversations`
-/// operation which triggers a known frankensqlite limitation: autoindex entries
-/// in sqlite_master are not properly cleaned up during DROP TABLE, causing
-/// "sqlite_master entry not found" errors.
-///
-/// For existing databases transitioned from SqliteStorage, the transition
-/// function backfills `_schema_migrations`; post-V13 additive migrations then
-/// run normally.
-fn build_cass_migrations_before_tail_cache() -> Vec<crate::storage::api::FrankenMigration> {
-    vec![
-        crate::storage::api::FrankenMigration {
-            version: 13,
-            name: "full_schema_v13",
-            up_sql: MIGRATION_FRESH_SCHEMA,
-        },
-        crate::storage::api::FrankenMigration {
-            version: 14,
-            name: "fts_contentless",
-            up_sql: MIGRATION_V14,
-        },
-    ]
-}
-
-fn build_cass_migrations_after_tail_cache() -> Vec<crate::storage::api::FrankenMigration> {
-    vec![
-        crate::storage::api::FrankenMigration {
-            version: 16,
-            name: "drop_redundant_message_conv_idx",
-            up_sql: MIGRATION_V16,
-        },
-        crate::storage::api::FrankenMigration {
-            version: 17,
-            name: "drop_message_created_idx",
-            up_sql: MIGRATION_V17,
-        },
-        crate::storage::api::FrankenMigration {
-            version: 18,
-            name: "conversation_tail_state_hot_table",
-            up_sql: MIGRATION_V18,
-        },
-        crate::storage::api::FrankenMigration {
-            version: 19,
-            name: "conversation_external_lookup",
-            up_sql: MIGRATION_V19,
-        },
-        crate::storage::api::FrankenMigration {
-            version: 20,
-            name: "conversation_external_tail_lookup",
-            up_sql: MIGRATION_V20,
-        },
-        crate::storage::api::FrankenMigration {
-            version: 21,
-            name: "operation_commit_receipt",
-            up_sql: MIGRATION_V21,
-        },
-    ]
-}
-
-fn schema_migration_is_applied(conn: &FrankenConnection, version: i64) -> Result<bool> {
-    let rows = conn
-        .query_all_map(
-            "SELECT 1 FROM _schema_migrations WHERE version = ?1 LIMIT 1;",
-            &[SqliteValue::from(version)],
-            |_row| Ok(()),
-        )
-        .with_context(|| format!("checking schema migration version {version}"))?;
-    Ok(!rows.is_empty())
-}
-
-fn apply_conversation_tail_state_cache_migration(conn: &FrankenConnection) -> Result<bool> {
-    conn.execute("BEGIN IMMEDIATE;", &[])
-        .with_context(|| "starting v15 conversation tail-state migration transaction")?;
-
-    let result = (|| -> Result<bool> {
-        if schema_migration_is_applied(conn, 15)? {
-            conn.execute("COMMIT;", &[])
-                .with_context(|| "committing already-applied v15 migration transaction")?;
-            return Ok(false);
-        }
-
-        let started = Instant::now();
-        let conversation_columns = franken_table_column_names(conn, "conversations")
-            .with_context(|| "inspecting conversations columns before v15 migration")?;
-        if !conversation_columns.contains("last_message_idx") {
-            conn.execute("ALTER TABLE conversations ADD COLUMN last_message_idx INTEGER;", &[])
-                .with_context(|| "adding v15 conversations.last_message_idx column")?;
-        }
-        if !conversation_columns.contains("last_message_created_at") {
-            conn.execute("ALTER TABLE conversations ADD COLUMN last_message_created_at INTEGER;", &[])
-                .with_context(|| "adding v15 conversations.last_message_created_at column")?;
-        }
-        conn.execute_batch(MIGRATION_V15_TAIL_STATE_TABLE)
-            .with_context(|| "applying v15 conversation tail-state table schema")?;
-        conn.execute(
-            "INSERT INTO _schema_migrations (version, name) VALUES (?1, ?2);",
-            fparams![15_i64, "conversation_tail_state_cache"],
-        )
-        .with_context(|| "recording v15 conversation tail-state migration")?;
-        conn.execute("COMMIT;", &[])
-            .with_context(|| "committing v15 conversation tail-state migration")?;
-        info!(
-            elapsed_ms = started.elapsed().as_millis(),
-            "applied v15 conversation tail-state cache migration"
-        );
-        Ok(true)
-    })();
-
-    if result.is_err() {
-        let _ = conn.execute("ROLLBACK;", &[]);
-    }
-
-    result
 }
 
 fn franken_table_column_names(
@@ -5126,376 +3650,6 @@ fn franken_table_column_names(
     .with_context(|| format!("reading PRAGMA table_info({table_name})"))
     .map(|columns| columns.into_iter().collect())
 }
-
-/// Combined V13 schema for fresh databases.
-///
-/// Creates the complete final schema in a single migration, avoiding the
-/// incremental V5 `DROP TABLE conversations` which triggers a frankensqlite
-/// autoindex limitation. All columns from V1-V13 are included in their
-/// respective CREATE TABLE statements.
-///
-/// Table creation order respects foreign key references:
-/// sources → agents/workspaces → conversations → messages → snippets, etc.
-const MIGRATION_FRESH_SCHEMA: &str = r"
--- Core tables (V1)
-CREATE TABLE IF NOT EXISTS meta (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS agents (
-    id INTEGER PRIMARY KEY,
-    slug TEXT NOT NULL UNIQUE,
-    name TEXT NOT NULL,
-    version TEXT,
-    kind TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS workspaces (
-    id INTEGER PRIMARY KEY,
-    path TEXT NOT NULL UNIQUE,
-    display_name TEXT
-);
-
--- Sources (V4)
-CREATE TABLE IF NOT EXISTS sources (
-    id TEXT PRIMARY KEY,
-    kind TEXT NOT NULL,
-    host_label TEXT,
-    machine_id TEXT,
-    platform TEXT,
-    config_json TEXT,
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
-);
-
-INSERT OR IGNORE INTO sources (id, kind, host_label, created_at, updated_at)
-VALUES ('local', 'local', NULL, strftime('%s','now')*1000, strftime('%s','now')*1000);
-
--- Conversations: V1 base + V5 provenance + V7 metadata_bin + V10 token summary
-CREATE TABLE IF NOT EXISTS conversations (
-    id INTEGER PRIMARY KEY,
-    agent_id INTEGER NOT NULL REFERENCES agents(id),
-    workspace_id INTEGER REFERENCES workspaces(id),
-    source_id TEXT NOT NULL DEFAULT 'local' REFERENCES sources(id),
-    external_id TEXT,
-    title TEXT,
-    source_path TEXT NOT NULL,
-    started_at INTEGER,
-    ended_at INTEGER,
-    approx_tokens INTEGER,
-    metadata_json TEXT,
-    origin_host TEXT,
-    metadata_bin BLOB,
-    total_input_tokens INTEGER,
-    total_output_tokens INTEGER,
-    total_cache_read_tokens INTEGER,
-    total_cache_creation_tokens INTEGER,
-    grand_total_tokens INTEGER,
-    estimated_cost_usd REAL,
-    primary_model TEXT,
-    api_call_count INTEGER,
-    tool_call_count INTEGER,
-    user_message_count INTEGER,
-    assistant_message_count INTEGER,
-    -- V15 columns are included in the fresh schema so fresh DB creation does
-    -- not need ALTER TABLE on conversations. That ALTER path can duplicate
-    -- provenance autoindex state in frankensqlite when the named unique
-    -- provenance index already exists.
-    last_message_idx INTEGER,
-    last_message_created_at INTEGER
-);
-
--- Named unique index avoids autoindex issues if table is ever recreated
-CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_provenance
-    ON conversations(source_id, agent_id, external_id);
-
--- Messages: V1 base + V7 extra_bin
-CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY,
-    conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-    idx INTEGER NOT NULL,
-    role TEXT NOT NULL,
-    author TEXT,
-    created_at INTEGER,
-    content TEXT NOT NULL,
-    extra_json TEXT,
-    extra_bin BLOB,
-    UNIQUE(conversation_id, idx)
-);
-
-CREATE TABLE IF NOT EXISTS snippets (
-    id INTEGER PRIMARY KEY,
-    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
-    file_path TEXT,
-    start_line INTEGER,
-    end_line INTEGER,
-    language TEXT,
-    snippet_text TEXT
-);
-
-CREATE TABLE IF NOT EXISTS tags (
-    id INTEGER PRIMARY KEY,
-    name TEXT NOT NULL UNIQUE
-);
-
-CREATE TABLE IF NOT EXISTS conversation_tags (
-    conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-    tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
-    PRIMARY KEY (conversation_id, tag_id)
-);
-
--- Daily stats (V8)
-CREATE TABLE IF NOT EXISTS daily_stats (
-    day_id INTEGER NOT NULL,
-    agent_slug TEXT NOT NULL,
-    source_id TEXT NOT NULL DEFAULT 'all',
-    session_count INTEGER NOT NULL DEFAULT 0,
-    message_count INTEGER NOT NULL DEFAULT 0,
-    total_chars INTEGER NOT NULL DEFAULT 0,
-    last_updated INTEGER NOT NULL,
-    PRIMARY KEY (day_id, agent_slug, source_id)
-);
-
--- Embedding jobs (V9)
-CREATE TABLE IF NOT EXISTS embedding_jobs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    db_path TEXT NOT NULL,
-    model_id TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending',
-    total_docs INTEGER NOT NULL DEFAULT 0,
-    completed_docs INTEGER NOT NULL DEFAULT 0,
-    error_message TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    started_at TEXT,
-    completed_at TEXT
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_embedding_jobs_active
-ON embedding_jobs(db_path, model_id)
-WHERE status IN ('pending', 'running');
-
--- Token usage ledger (V10)
-CREATE TABLE IF NOT EXISTS token_usage (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
-    conversation_id INTEGER NOT NULL,
-    agent_id INTEGER NOT NULL,
-    workspace_id INTEGER,
-    source_id TEXT NOT NULL DEFAULT 'local',
-    timestamp_ms INTEGER NOT NULL,
-    day_id INTEGER NOT NULL,
-    model_name TEXT,
-    model_family TEXT,
-    model_tier TEXT,
-    service_tier TEXT,
-    provider TEXT,
-    input_tokens INTEGER,
-    output_tokens INTEGER,
-    cache_read_tokens INTEGER,
-    cache_creation_tokens INTEGER,
-    thinking_tokens INTEGER,
-    total_tokens INTEGER,
-    estimated_cost_usd REAL,
-    role TEXT NOT NULL,
-    content_chars INTEGER NOT NULL,
-    has_tool_calls INTEGER NOT NULL DEFAULT 0,
-    tool_call_count INTEGER NOT NULL DEFAULT 0,
-    data_source TEXT NOT NULL DEFAULT 'api',
-    UNIQUE(message_id)
-);
-
--- Token daily stats (V10)
-CREATE TABLE IF NOT EXISTS token_daily_stats (
-    day_id INTEGER NOT NULL,
-    agent_slug TEXT NOT NULL,
-    source_id TEXT NOT NULL DEFAULT 'all',
-    model_family TEXT NOT NULL DEFAULT 'all',
-    api_call_count INTEGER NOT NULL DEFAULT 0,
-    user_message_count INTEGER NOT NULL DEFAULT 0,
-    assistant_message_count INTEGER NOT NULL DEFAULT 0,
-    tool_message_count INTEGER NOT NULL DEFAULT 0,
-    total_input_tokens INTEGER NOT NULL DEFAULT 0,
-    total_output_tokens INTEGER NOT NULL DEFAULT 0,
-    total_cache_read_tokens INTEGER NOT NULL DEFAULT 0,
-    total_cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
-    total_thinking_tokens INTEGER NOT NULL DEFAULT 0,
-    grand_total_tokens INTEGER NOT NULL DEFAULT 0,
-    total_content_chars INTEGER NOT NULL DEFAULT 0,
-    total_tool_calls INTEGER NOT NULL DEFAULT 0,
-    estimated_cost_usd REAL NOT NULL DEFAULT 0.0,
-    session_count INTEGER NOT NULL DEFAULT 0,
-    last_updated INTEGER NOT NULL,
-    PRIMARY KEY (day_id, agent_slug, source_id, model_family)
-);
-
--- Model pricing (V10)
-CREATE TABLE IF NOT EXISTS model_pricing (
-    model_pattern TEXT NOT NULL,
-    provider TEXT NOT NULL,
-    input_cost_per_mtok REAL NOT NULL,
-    output_cost_per_mtok REAL NOT NULL,
-    cache_read_cost_per_mtok REAL,
-    cache_creation_cost_per_mtok REAL,
-    effective_date TEXT NOT NULL,
-    PRIMARY KEY (model_pattern, effective_date)
-);
-
-INSERT OR IGNORE INTO model_pricing VALUES
-    ('claude-opus-4%', 'anthropic', 15.0, 75.0, 1.5, 18.75, '2025-10-01'),
-    ('claude-sonnet-4%', 'anthropic', 3.0, 15.0, 0.3, 3.75, '2025-10-01'),
-    ('claude-haiku-4%', 'anthropic', 0.80, 4.0, 0.08, 1.0, '2025-10-01'),
-    ('gpt-4o%', 'openai', 2.50, 10.0, NULL, NULL, '2025-01-01'),
-    ('gpt-4-turbo%', 'openai', 10.0, 30.0, NULL, NULL, '2024-04-01'),
-    ('gpt-4.1%', 'openai', 2.0, 8.0, NULL, NULL, '2025-04-01'),
-    ('o3%', 'openai', 2.0, 8.0, NULL, NULL, '2025-04-01'),
-    ('o4-mini%', 'openai', 1.10, 4.40, NULL, NULL, '2025-04-01'),
-    ('gemini-2%flash%', 'google', 0.075, 0.30, NULL, NULL, '2025-01-01'),
-    ('gemini-2%pro%', 'google', 1.25, 10.0, NULL, NULL, '2025-01-01');
-
--- Message metrics: V11 base + V12 model dimensions
-CREATE TABLE IF NOT EXISTS message_metrics (
-    message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
-    created_at_ms INTEGER NOT NULL,
-    hour_id INTEGER NOT NULL,
-    day_id INTEGER NOT NULL,
-    agent_slug TEXT NOT NULL,
-    workspace_id INTEGER NOT NULL DEFAULT 0,
-    source_id TEXT NOT NULL DEFAULT 'local',
-    role TEXT NOT NULL,
-    content_chars INTEGER NOT NULL,
-    content_tokens_est INTEGER NOT NULL,
-    api_input_tokens INTEGER,
-    api_output_tokens INTEGER,
-    api_cache_read_tokens INTEGER,
-    api_cache_creation_tokens INTEGER,
-    api_thinking_tokens INTEGER,
-    api_service_tier TEXT,
-    api_data_source TEXT NOT NULL DEFAULT 'estimated',
-    tool_call_count INTEGER NOT NULL DEFAULT 0,
-    has_tool_calls INTEGER NOT NULL DEFAULT 0,
-    has_plan INTEGER NOT NULL DEFAULT 0,
-    model_name TEXT,
-    model_family TEXT NOT NULL DEFAULT 'unknown',
-    model_tier TEXT NOT NULL DEFAULT 'unknown',
-    provider TEXT NOT NULL DEFAULT 'unknown'
-);
-
--- Hourly rollups: V11 base + V13 plan columns
-CREATE TABLE IF NOT EXISTS usage_hourly (
-    hour_id INTEGER NOT NULL,
-    agent_slug TEXT NOT NULL,
-    workspace_id INTEGER NOT NULL DEFAULT 0,
-    source_id TEXT NOT NULL DEFAULT 'local',
-    message_count INTEGER NOT NULL DEFAULT 0,
-    user_message_count INTEGER NOT NULL DEFAULT 0,
-    assistant_message_count INTEGER NOT NULL DEFAULT 0,
-    tool_call_count INTEGER NOT NULL DEFAULT 0,
-    plan_message_count INTEGER NOT NULL DEFAULT 0,
-    api_coverage_message_count INTEGER NOT NULL DEFAULT 0,
-    content_tokens_est_total INTEGER NOT NULL DEFAULT 0,
-    content_tokens_est_user INTEGER NOT NULL DEFAULT 0,
-    content_tokens_est_assistant INTEGER NOT NULL DEFAULT 0,
-    api_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_input_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_output_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_cache_read_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_cache_creation_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_thinking_tokens_total INTEGER NOT NULL DEFAULT 0,
-    last_updated INTEGER NOT NULL DEFAULT 0,
-    plan_content_tokens_est_total INTEGER NOT NULL DEFAULT 0,
-    plan_api_tokens_total INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (hour_id, agent_slug, workspace_id, source_id)
-);
-
--- Daily rollups: V11 base + V13 plan columns
-CREATE TABLE IF NOT EXISTS usage_daily (
-    day_id INTEGER NOT NULL,
-    agent_slug TEXT NOT NULL,
-    workspace_id INTEGER NOT NULL DEFAULT 0,
-    source_id TEXT NOT NULL DEFAULT 'local',
-    message_count INTEGER NOT NULL DEFAULT 0,
-    user_message_count INTEGER NOT NULL DEFAULT 0,
-    assistant_message_count INTEGER NOT NULL DEFAULT 0,
-    tool_call_count INTEGER NOT NULL DEFAULT 0,
-    plan_message_count INTEGER NOT NULL DEFAULT 0,
-    api_coverage_message_count INTEGER NOT NULL DEFAULT 0,
-    content_tokens_est_total INTEGER NOT NULL DEFAULT 0,
-    content_tokens_est_user INTEGER NOT NULL DEFAULT 0,
-    content_tokens_est_assistant INTEGER NOT NULL DEFAULT 0,
-    api_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_input_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_output_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_cache_read_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_cache_creation_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_thinking_tokens_total INTEGER NOT NULL DEFAULT 0,
-    last_updated INTEGER NOT NULL DEFAULT 0,
-    plan_content_tokens_est_total INTEGER NOT NULL DEFAULT 0,
-    plan_api_tokens_total INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (day_id, agent_slug, workspace_id, source_id)
-);
-
--- Model daily rollups (V12)
-CREATE TABLE IF NOT EXISTS usage_models_daily (
-    day_id INTEGER NOT NULL,
-    agent_slug TEXT NOT NULL,
-    workspace_id INTEGER NOT NULL DEFAULT 0,
-    source_id TEXT NOT NULL DEFAULT 'local',
-    model_family TEXT NOT NULL DEFAULT 'unknown',
-    model_tier TEXT NOT NULL DEFAULT 'unknown',
-    message_count INTEGER NOT NULL DEFAULT 0,
-    user_message_count INTEGER NOT NULL DEFAULT 0,
-    assistant_message_count INTEGER NOT NULL DEFAULT 0,
-    tool_call_count INTEGER NOT NULL DEFAULT 0,
-    plan_message_count INTEGER NOT NULL DEFAULT 0,
-    api_coverage_message_count INTEGER NOT NULL DEFAULT 0,
-    content_tokens_est_total INTEGER NOT NULL DEFAULT 0,
-    content_tokens_est_user INTEGER NOT NULL DEFAULT 0,
-    content_tokens_est_assistant INTEGER NOT NULL DEFAULT 0,
-    api_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_input_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_output_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_cache_read_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_cache_creation_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_thinking_tokens_total INTEGER NOT NULL DEFAULT 0,
-    last_updated INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (day_id, agent_slug, workspace_id, source_id, model_family, model_tier)
-);
-
--- All indexes
-CREATE INDEX IF NOT EXISTS idx_conversations_agent_started ON conversations(agent_id, started_at DESC);
-CREATE INDEX IF NOT EXISTS idx_conversations_source_id ON conversations(source_id);
-CREATE INDEX IF NOT EXISTS idx_conversations_source_path ON conversations(source_path);
-CREATE INDEX IF NOT EXISTS idx_daily_stats_agent ON daily_stats(agent_slug, day_id);
-CREATE INDEX IF NOT EXISTS idx_daily_stats_source ON daily_stats(source_id, day_id);
-CREATE INDEX IF NOT EXISTS idx_token_usage_day ON token_usage(day_id, agent_id);
-CREATE INDEX IF NOT EXISTS idx_token_usage_conv ON token_usage(conversation_id);
-CREATE INDEX IF NOT EXISTS idx_token_usage_model ON token_usage(model_family, day_id);
-CREATE INDEX IF NOT EXISTS idx_token_usage_workspace ON token_usage(workspace_id, day_id);
-CREATE INDEX IF NOT EXISTS idx_token_usage_timestamp ON token_usage(timestamp_ms);
-CREATE INDEX IF NOT EXISTS idx_token_daily_stats_agent ON token_daily_stats(agent_slug, day_id);
-CREATE INDEX IF NOT EXISTS idx_token_daily_stats_model ON token_daily_stats(model_family, day_id);
-CREATE INDEX IF NOT EXISTS idx_mm_hour ON message_metrics(hour_id);
-CREATE INDEX IF NOT EXISTS idx_mm_day ON message_metrics(day_id);
-CREATE INDEX IF NOT EXISTS idx_mm_agent_hour ON message_metrics(agent_slug, hour_id);
-CREATE INDEX IF NOT EXISTS idx_mm_agent_day ON message_metrics(agent_slug, day_id);
-CREATE INDEX IF NOT EXISTS idx_mm_workspace_hour ON message_metrics(workspace_id, hour_id);
-CREATE INDEX IF NOT EXISTS idx_mm_source_hour ON message_metrics(source_id, hour_id);
-CREATE INDEX IF NOT EXISTS idx_mm_model_family_day ON message_metrics(model_family, day_id);
-CREATE INDEX IF NOT EXISTS idx_mm_provider_day ON message_metrics(provider, day_id);
-CREATE INDEX IF NOT EXISTS idx_uh_agent ON usage_hourly(agent_slug, hour_id);
-CREATE INDEX IF NOT EXISTS idx_uh_workspace ON usage_hourly(workspace_id, hour_id);
-CREATE INDEX IF NOT EXISTS idx_uh_source ON usage_hourly(source_id, hour_id);
-CREATE INDEX IF NOT EXISTS idx_ud_agent ON usage_daily(agent_slug, day_id);
-CREATE INDEX IF NOT EXISTS idx_ud_workspace ON usage_daily(workspace_id, day_id);
-CREATE INDEX IF NOT EXISTS idx_ud_source ON usage_daily(source_id, day_id);
-CREATE INDEX IF NOT EXISTS idx_umd_model_day ON usage_models_daily(model_family, day_id);
-CREATE INDEX IF NOT EXISTS idx_umd_agent_day ON usage_models_daily(agent_slug, day_id);
-CREATE INDEX IF NOT EXISTS idx_umd_workspace_day ON usage_models_daily(workspace_id, day_id);
-CREATE INDEX IF NOT EXISTS idx_umd_source_day ON usage_models_daily(source_id, day_id);
-";
 
 #[derive(Clone, Copy)]
 struct SchemaRepairBatch {
@@ -5895,139 +4049,6 @@ fn current_schema_repair_batches_for_missing_tables(
     Ok(selected_batches)
 }
 
-/// Migration name lookup for backfilling `_schema_migrations` during transition.
-const MIGRATION_NAMES: [(i64, &str); 21] = [
-    (1, "core_tables"),
-    (2, "fts_messages"),
-    (3, "fts_messages_rebuild"),
-    (4, "sources"),
-    (5, "provenance_columns"),
-    (6, "source_path_index"),
-    (7, "msgpack_columns"),
-    (8, "daily_stats"),
-    (9, "embedding_jobs"),
-    (10, "token_analytics"),
-    (11, "message_metrics"),
-    (12, "model_dimensions"),
-    (13, "plan_token_rollups"),
-    (14, "fts_contentless"),
-    (15, "conversation_tail_state_cache"),
-    (16, "drop_redundant_message_conv_idx"),
-    (17, "drop_message_created_idx"),
-    (18, "conversation_tail_state_hot_table"),
-    (19, "conversation_external_lookup"),
-    (20, "conversation_external_tail_lookup"),
-    (21, "operation_commit_receipt"),
-];
-
-/// Transitions an existing database from `meta` table schema versioning to the
-/// `_schema_migrations` table used by `MigrationRunner`.
-///
-/// The existing `SqliteStorage` tracks schema version as a string value in
-/// `meta WHERE key = 'schema_version'`. The bead spec references
-/// `PRAGMA user_version`, but the actual cass code uses the `meta` table.
-/// This function handles the real code path.
-///
-/// Behavior:
-/// - If `_schema_migrations` already exists → skip (already transitioned)
-/// - If `meta` table has `schema_version > 0` → create `_schema_migrations`
-///   and backfill entries for versions `1..=current_version`
-/// - Legacy V10-V12 databases are represented as V13 in `_schema_migrations`
-///   because frankensqlite uses one combined V13 base migration instead of
-///   replaying the old incremental V11-V13 steps.
-/// - If `meta` table missing or `schema_version = 0` with no tables → fresh DB,
-///   let `MigrationRunner` handle it
-/// - If `schema_version = 0` but tables exist → corrupted state, log warning
-fn transition_from_meta_version(conn: &FrankenConnection) -> Result<()> {
-    // Avoid sqlite_master enumeration here. Databases with FTS virtual tables
-    // can trigger frankensqlite parse-recovery on sqlite_master reads, which is
-    // enough to break the transition on otherwise-healthy legacy cass DBs.
-    if conn
-        .query_all_map("SELECT version FROM \"_schema_migrations\";", &[], |_row| Ok(()))
-        .is_ok()
-    {
-        return Ok(());
-    }
-
-    // Check if the meta table exists.
-    if conn.query_all_map("SELECT key FROM meta;", &[], |_row| Ok(())).is_err() {
-        // No meta table → fresh database, let MigrationRunner handle it.
-        return Ok(());
-    }
-
-    // Read the current schema version from the meta table.
-    let rows = conn
-        .query_all_map(
-            "SELECT value FROM meta WHERE key = 'schema_version';",
-            &[],
-            |row| row.get_value(0),
-        )
-        .with_context(|| "reading schema_version from meta")?;
-
-    let current_version: i64 = rows
-        .into_iter()
-        .next()
-        .and_then(|v| <String as crate::storage::api::FromValue>::from_value(v).ok())
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-
-    if current_version == 0 {
-        // Check if tables actually exist (corrupted state: tables present but version=0).
-        if conn
-            .query_all_map("SELECT id FROM conversations LIMIT 1;", &[], |_row| Ok(()))
-            .is_err()
-        {
-            // Truly fresh DB (meta table exists but empty/reset). Let MigrationRunner handle it.
-            return Ok(());
-        }
-
-        // Tables exist but version=0: corrupted state. Log and skip transition;
-        // MigrationRunner will fail on "table already exists" and surface the error.
-        info!("meta.schema_version=0 but tables exist; skipping transition (corrupted state)");
-        return Ok(());
-    }
-
-    // Create _schema_migrations and backfill entries for all applied versions.
-    info!(
-        current_version,
-        "transitioning schema tracking from meta table to _schema_migrations"
-    );
-
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS _schema_migrations (\
-            version INTEGER PRIMARY KEY, \
-            name TEXT NOT NULL, \
-            applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))\
-        );",
-    &[])
-    .with_context(|| "creating _schema_migrations table for transition")?;
-
-    let backfill_through_version = if (10..13).contains(&current_version) {
-        13
-    } else {
-        current_version
-    };
-
-    for &(version, name) in &MIGRATION_NAMES {
-        if version > backfill_through_version {
-            break;
-        }
-        conn.execute(
-            "INSERT INTO _schema_migrations (version, name) VALUES (?1, ?2);",
-            &[ParamValue::from(version), ParamValue::from(name)],
-        )
-        .with_context(|| format!("backfilling _schema_migrations version {version}"))?;
-    }
-
-    info!(
-        current_version,
-        backfill_through_version,
-        "schema version transition complete: backfilled legacy meta schema versions"
-    );
-
-    Ok(())
-}
-
 const REQUIRED_CURRENT_SCHEMA_TABLE_PROBES: &[(&str, &str)] = &[
     ("sources", "SELECT id FROM sources LIMIT 1;"),
     ("daily_stats", "SELECT day_id FROM daily_stats LIMIT 1;"),
@@ -6181,37 +4202,39 @@ fn delete_orphan_message_id_chunk(conn: &FrankenConnection, ids: &[i64]) -> Resu
 }
 
 fn delete_orphan_message_id_chunk_once(conn: &FrankenConnection, ids: &[i64]) -> Result<usize> {
-    let mut tx = conn.transaction()?;
-    let mut deleted = 0usize;
-    for entry in ORPHAN_MESSAGE_DEPENDENT_TABLES {
-        match delete_rows_by_i64_chunks(&tx, entry.delete_many_sql_prefix, ids) {
-            Ok(count) => {
-                deleted = deleted.saturating_add(count);
-            }
-            Err(err) if error_indicates_missing_table(&err) => {
-                tracing::debug!(
-                    target: "cass::fk_repair",
-                    child_table = entry.child_table,
-                    error = %err,
-                    "skipping orphan-message dependent cleanup (table unavailable)"
-                );
-            }
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!(
+    // w1b Task B3 (D2): with_tx, TxMode::Immediate (plan @775: write
+    // transactions use Immediate). Pure DB closure -- safe to replay whole
+    // on a real Busy{Snapshot}.
+    Ok(conn.with_tx(TxMode::Immediate, |tx| -> Result<usize, StorageError> {
+        let mut deleted = 0usize;
+        for entry in ORPHAN_MESSAGE_DEPENDENT_TABLES {
+            match delete_rows_by_i64_chunks(tx, entry.delete_many_sql_prefix, ids) {
+                Ok(count) => {
+                    deleted = deleted.saturating_add(count);
+                }
+                Err(err) if error_indicates_missing_table(&err) => {
+                    tracing::debug!(
+                        target: "cass::fk_repair",
+                        child_table = entry.child_table,
+                        error = %err,
+                        "skipping orphan-message dependent cleanup (table unavailable)"
+                    );
+                }
+                Err(err) => {
+                    return Err(anyhow_error_into_storage_error(err.context(format!(
                         "deleting rows from {} that depend on orphan messages",
                         entry.child_table
-                    )
-                });
+                    ))));
+                }
             }
         }
-    }
-    deleted = deleted.saturating_add(
-        delete_rows_by_i64_chunks(&tx, "DELETE FROM messages WHERE id IN", ids)
-            .context("deleting orphan rows from messages")?,
-    );
-    tx.commit()?;
-    Ok(deleted)
+        let more = delete_rows_by_i64_chunks(tx, "DELETE FROM messages WHERE id IN", ids)
+            .map_err(|err| {
+                anyhow_error_into_storage_error(err.context("deleting orphan rows from messages"))
+            })?;
+        deleted = deleted.saturating_add(more);
+        Ok(deleted)
+    })?)
 }
 
 fn collect_direct_orphan_id_page(
@@ -6272,10 +4295,11 @@ fn delete_direct_orphan_id_chunk_once(
     entry: &'static OrphanFkTable,
     ids: &[i64],
 ) -> Result<usize> {
-    let mut tx = conn.transaction()?;
-    let deleted = delete_rows_by_i64_chunks(&tx, entry.delete_many_sql_prefix, ids)?;
-    tx.commit()?;
-    Ok(deleted)
+    // w1b Task B3 (D2): with_tx, TxMode::Immediate.
+    Ok(conn.with_tx(TxMode::Immediate, |tx| -> Result<usize, StorageError> {
+        delete_rows_by_i64_chunks(tx, entry.delete_many_sql_prefix, ids)
+            .map_err(anyhow_error_into_storage_error)
+    })?)
 }
 
 /// Tables whose FK parent rows can go missing when an index transaction is
@@ -7619,7 +5643,7 @@ impl FrankenStorage {
                     .execute("COMMIT;", &[])
                     .with_context(|| "committing scan-watermark restore transaction")
                 {
-                    // fsqlite keeps the transaction ACTIVE after a failed
+                    // the legacy engine crate keeps the transaction ACTIVE after a failed
                     // COMMIT — roll it back explicitly so this connection is
                     // not returned to any pool with an open transaction.
                     let _ = self.conn.execute("ROLLBACK;", &[]);
@@ -7638,7 +5662,7 @@ impl FrankenStorage {
     /// explicit transaction.
     ///
     /// These reads run during index startup. On large file-backed archives,
-    /// issuing them one-at-a-time in autocommit can force frankensqlite's
+    /// issuing them one-at-a-time in autocommit can force the legacy embedded engine's
     /// clean prepared-read path to refresh the file-backed MemDatabase before
     /// any connector work starts. A single explicit transaction keeps the
     /// startup path on the pager-backed read path while preserving the same
@@ -7842,34 +5866,36 @@ impl FrankenStorage {
             |row| row.get_typed(0),
         )?;
 
-        let mut tx = self.conn.transaction()?;
-        tx.execute(
-            "DELETE FROM conversation_external_lookup
-             WHERE conversation_id IN (
-                 SELECT id FROM conversations WHERE agent_id = ?1
-             )",
-            fparams![agent_id],
-        )?;
-        tx.execute(
-            "DELETE FROM conversation_external_tail_lookup
-             WHERE conversation_id IN (
-                 SELECT id FROM conversations WHERE agent_id = ?1
-             )",
-            fparams![agent_id],
-        )?;
-        tx.execute(
-            "DELETE FROM conversations WHERE agent_id = ?1",
-            fparams![agent_id],
-        )?;
-        tx.execute(
-            "DELETE FROM agents
-             WHERE id = ?1
-               AND NOT EXISTS (
-                   SELECT 1 FROM conversations WHERE agent_id = ?1
-               )",
-            fparams![agent_id],
-        )?;
-        tx.commit()?;
+        // w1b Task B3 (D2): with_tx, TxMode::Immediate.
+        self.conn.with_tx(TxMode::Immediate, |tx| -> Result<(), StorageError> {
+            tx.execute(
+                "DELETE FROM conversation_external_lookup
+                 WHERE conversation_id IN (
+                     SELECT id FROM conversations WHERE agent_id = ?1
+                 )",
+                fparams![agent_id],
+            )?;
+            tx.execute(
+                "DELETE FROM conversation_external_tail_lookup
+                 WHERE conversation_id IN (
+                     SELECT id FROM conversations WHERE agent_id = ?1
+                 )",
+                fparams![agent_id],
+            )?;
+            tx.execute(
+                "DELETE FROM conversations WHERE agent_id = ?1",
+                fparams![agent_id],
+            )?;
+            tx.execute(
+                "DELETE FROM agents
+                 WHERE id = ?1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM conversations WHERE agent_id = ?1
+                   )",
+                fparams![agent_id],
+            )?;
+            Ok(())
+        })?;
 
         Ok(AgentArchivePurgeResult {
             conversations_deleted: conversations_deleted.max(0) as usize,
@@ -7891,7 +5917,7 @@ impl FrankenStorage {
     ///
     /// Matching is done in Rust with the `glob` crate (not a SQL `GLOB`
     /// operator) so the semantics are portable and deterministic across the
-    /// frankensqlite backend.
+    /// the legacy embedded engine backend.
     pub fn forget_conversations_by_source_glob(
         &self,
         pattern: &str,
@@ -7964,26 +5990,28 @@ impl FrankenStorage {
             });
         }
 
-        let mut tx = self.conn.transaction()?;
-        // Non-cascading external-lookup tables first (mirrors agent purge).
-        tx.execute(
-            &format!(
-                "DELETE FROM conversation_external_lookup WHERE conversation_id IN ({id_list})"
-            ),
-            fparams![],
-        )?;
-        tx.execute(
-            &format!(
-                "DELETE FROM conversation_external_tail_lookup WHERE conversation_id IN ({id_list})"
-            ),
-            fparams![],
-        )?;
-        // The remaining child tables (messages, snippets, tags, ...) cascade.
-        tx.execute(
-            &format!("DELETE FROM conversations WHERE id IN ({id_list})"),
-            fparams![],
-        )?;
-        tx.commit()?;
+        // w1b Task B3 (D2): with_tx, TxMode::Immediate.
+        self.conn.with_tx(TxMode::Immediate, |tx| -> Result<(), StorageError> {
+            // Non-cascading external-lookup tables first (mirrors agent purge).
+            tx.execute(
+                &format!(
+                    "DELETE FROM conversation_external_lookup WHERE conversation_id IN ({id_list})"
+                ),
+                fparams![],
+            )?;
+            tx.execute(
+                &format!(
+                    "DELETE FROM conversation_external_tail_lookup WHERE conversation_id IN ({id_list})"
+                ),
+                fparams![],
+            )?;
+            // The remaining child tables (messages, snippets, tags, ...) cascade.
+            tx.execute(
+                &format!("DELETE FROM conversations WHERE id IN ({id_list})"),
+                fparams![],
+            )?;
+            Ok(())
+        })?;
 
         Ok(ForgetConversationsResult {
             pattern: trimmed.to_string(),
@@ -8081,37 +6109,39 @@ impl FrankenStorage {
         // transaction. Messages, snippets, conversation_tags, token_usage,
         // etc. carry `ON DELETE CASCADE`; the two external-lookup tables do
         // not, so delete them explicitly first (mirrors `purge_agent_archive`).
-        let mut tx = self.conn.transaction()?;
-        for candidate in &result.pairs {
-            let drop_id = candidate.drop_conversation_id;
-            tx.execute(
-                "DELETE FROM conversation_external_lookup WHERE conversation_id = ?1",
-                fparams![drop_id],
-            )?;
-            tx.execute(
-                "DELETE FROM conversation_external_tail_lookup WHERE conversation_id = ?1",
-                fparams![drop_id],
-            )?;
-            // Explicit message delete (do not rely solely on cascade) so the
-            // operation is correct even if FK enforcement is toggled off.
-            tx.execute(
-                "DELETE FROM messages WHERE conversation_id = ?1",
-                fparams![drop_id],
-            )?;
-            tx.execute(
-                "DELETE FROM conversation_tail_state WHERE conversation_id = ?1",
-                fparams![drop_id],
-            )?;
-            tx.execute(
-                "DELETE FROM token_usage WHERE conversation_id = ?1",
-                fparams![drop_id],
-            )?;
-            // NOTE: `embedding_jobs` is a per-(db_path, model_id) job table,
-            // NOT a per-conversation table — it has no conversation_id column,
-            // so there is nothing conversation-scoped to delete there.
-            tx.execute("DELETE FROM conversations WHERE id = ?1", fparams![drop_id])?;
-        }
-        tx.commit()?;
+        // w1b Task B3 (D2): with_tx, TxMode::Immediate.
+        self.conn.with_tx(TxMode::Immediate, |tx| -> Result<(), StorageError> {
+            for candidate in &result.pairs {
+                let drop_id = candidate.drop_conversation_id;
+                tx.execute(
+                    "DELETE FROM conversation_external_lookup WHERE conversation_id = ?1",
+                    fparams![drop_id],
+                )?;
+                tx.execute(
+                    "DELETE FROM conversation_external_tail_lookup WHERE conversation_id = ?1",
+                    fparams![drop_id],
+                )?;
+                // Explicit message delete (do not rely solely on cascade) so the
+                // operation is correct even if FK enforcement is toggled off.
+                tx.execute(
+                    "DELETE FROM messages WHERE conversation_id = ?1",
+                    fparams![drop_id],
+                )?;
+                tx.execute(
+                    "DELETE FROM conversation_tail_state WHERE conversation_id = ?1",
+                    fparams![drop_id],
+                )?;
+                tx.execute(
+                    "DELETE FROM token_usage WHERE conversation_id = ?1",
+                    fparams![drop_id],
+                )?;
+                // NOTE: `embedding_jobs` is a per-(db_path, model_id) job table,
+                // NOT a per-conversation table — it has no conversation_id column,
+                // so there is nothing conversation-scoped to delete there.
+                tx.execute("DELETE FROM conversations WHERE id = ?1", fparams![drop_id])?;
+            }
+            Ok(())
+        })?;
 
         // The derived FTS shadow rows for the dropped messages are now stale.
         // Invalidate the presence cache; the caller is responsible for the
@@ -8142,7 +6172,7 @@ impl FrankenStorage {
     /// List conversations with pagination.
     pub fn list_conversations(&self, limit: i64, offset: i64) -> Result<Vec<Conversation>> {
         // Avoid the multi-table JOIN with LIMIT/OFFSET that triggers
-        // frankensqlite's materialization fallback (see c38edcd9, 860acb12).
+        // the legacy embedded engine's materialization fallback (see c38edcd9, 860acb12).
         // Use correlated subqueries for the tiny agents (~20 rows) and
         // workspaces (~30 rows) lookup tables and degrade NULL agent_id to
         // the same 'unknown' sentinel that 8a0c547c established for the
@@ -8440,9 +6470,17 @@ impl FrankenStorage {
              ORDER BY conversation_id ASC",
         )
         .or_else(|err| {
+            // w1b Task B8 (regression found via real `cargo test` execution):
+            // `.with_context(...)` on the inner query wraps the raw
+            // "no such index" error, so `err.to_string()` only ever showed
+            // the outer context message and this fallback never triggered --
+            // latent under the legacy embedded engine (which silently tolerates an
+            // `INDEXED BY` naming a nonexistent index instead of erroring),
+            // newly load-bearing now that a real SQLite backend enforces it.
+            // Walk the full `anyhow` cause chain instead of the top frame.
             if err
-                .to_string()
-                .contains("no such index: idx_messages_conv_idx")
+                .chain()
+                .any(|cause| cause.to_string().contains("no such index: idx_messages_conv_idx"))
             {
                 return self.fill_missing_lexical_rebuild_footprint_tails_from_grouped_messages(
                     footprints,
@@ -8509,7 +6547,7 @@ impl FrankenStorage {
         workspace_paths: &HashMap<i64, PathBuf>,
     ) -> Result<Vec<LexicalRebuildConversationRow>> {
         // Single-table query avoids the 3-table JOIN that triggers
-        // frankensqlite's full-materialization fallback path.
+        // the legacy embedded engine's full-materialization fallback path.
         self.conn
             .query_all_map(
                 r"SELECT id, agent_id, workspace_id, external_id, title, source_path,
@@ -8864,7 +6902,7 @@ impl FrankenStorage {
         let mut total_content_bytes = 0usize;
 
         // The apparent single-query shape (`WHERE conversation_id IN (...) ORDER BY ...`)
-        // is a bad frankensqlite plan for large live databases: it can
+        // is a bad the legacy embedded engine plan for large live databases: it can
         // materialize far more of `messages` than the requested conversations.
         // Reuse the hinted per-conversation primary-key lookup instead.
         for conversation_id in conversation_ids {
@@ -10044,71 +8082,202 @@ impl FrankenStorage {
         workspace_id: Option<i64>,
         conv: &Conversation,
     ) -> Result<InsertOutcome> {
+        // w1b Task B3 (D2): with_tx, TxMode::Immediate. Preamble kept
+        // outside with_tx exactly as before migration -- `ensure_source_for_
+        // conversation` ran via autocommit before the transaction even
+        // opened in the original code, and moving it inside the retryable
+        // closure would change its persistence semantics (it'd roll back
+        // with the rest of the transaction on failure, and re-run on
+        // replay, instead of always persisting once regardless of what
+        // happens next). The rest of the original body -- everything that
+        // ran between `let mut tx = self.conn.transaction()?;` and its three
+        // `tx.commit()?;` sites -- moves into the closure verbatim (those
+        // three per-branch commits removed; with_tx commits once after the
+        // whole closure returns `Ok`), converted to `StorageError` once at
+        // the boundary rather than threading `anyhow_error_into_storage_
+        // error` through each individual `?` -- far lower risk of an
+        // introduced mistake in a function this central. `&tx` becomes
+        // `tx` throughout: the closure's `tx` parameter is already `&Tx`.
         let normalized_conv = normalized_conversation_for_storage(conv);
         let conv = normalized_conv.as_ref();
         self.ensure_source_for_conversation(conv)?;
         let defer_lexical_updates = defer_storage_lexical_updates_enabled();
         let defer_analytics_updates = defer_analytics_updates_enabled();
         let conversation_key = conversation_merge_key(agent_id, conv);
-        let mut tx = self.conn.transaction()?;
-        let existing = franken_find_existing_conversation_with_tail_by_key(
-            &tx,
-            &conversation_key,
-            Some(conv),
-        )?;
-        if let Some(existing) = existing {
-            let outcome = self.franken_append_messages_with_tail_in_tx(
-                &tx,
-                agent_id,
-                existing.id,
-                conv,
-                existing.tail_state,
-                defer_lexical_updates,
-                defer_analytics_updates,
-            )?;
-            tx.commit()?;
-            return Ok(outcome);
-        }
+        Ok(self.conn.with_tx(TxMode::Immediate, |tx| -> Result<InsertOutcome, StorageError> {
+            (|| -> Result<InsertOutcome> {
+                let existing = franken_find_existing_conversation_with_tail_by_key(
+                    tx,
+                    &conversation_key,
+                    Some(conv),
+                )?;
+                if let Some(existing) = existing {
+                    let outcome = self.franken_append_messages_with_tail_in_tx(
+                        tx,
+                        agent_id,
+                        existing.id,
+                        conv,
+                        existing.tail_state,
+                        defer_lexical_updates,
+                        defer_analytics_updates,
+                    )?;
+                    return Ok(outcome);
+                }
 
-        let conv_id = match franken_insert_conversation_or_get_existing_after_miss(
-            &tx,
-            agent_id,
-            workspace_id,
-            conv,
-            &conversation_key,
-        )? {
-            ConversationInsertStatus::Inserted(conv_id) => conv_id,
-            ConversationInsertStatus::Existing(existing_id) => {
-                let ExistingMessageLookup {
-                    by_idx: mut existing_messages,
-                    replay: mut existing_replay_fingerprints,
-                } = franken_existing_message_lookup(&tx, existing_id, &conv.messages)?;
-                let ExistingConversationNewMessages {
-                    messages: new_messages,
-                    new_chars: _planned_new_chars,
-                    idx_collision_count,
-                    first_collision_idx,
-                } = collect_new_messages_for_existing_conversation(
-                    existing_id,
+                let conv_id = match franken_insert_conversation_or_get_existing_after_miss(
+                    tx,
+                    agent_id,
+                    workspace_id,
                     conv,
-                    &mut existing_messages,
-                    &mut existing_replay_fingerprints,
-                    "skipping replay-equivalent recovered message with shifted idx",
-                );
-                let (inserted_last_idx, inserted_last_created_at) =
-                    borrowed_messages_tail_state(&new_messages);
-                let mut inserted_indices = Vec::new();
+                    &conversation_key,
+                )? {
+                    ConversationInsertStatus::Inserted(conv_id) => conv_id,
+                    ConversationInsertStatus::Existing(existing_id) => {
+                        let ExistingMessageLookup {
+                            by_idx: mut existing_messages,
+                            replay: mut existing_replay_fingerprints,
+                        } = franken_existing_message_lookup(tx, existing_id, &conv.messages)?;
+                        let ExistingConversationNewMessages {
+                            messages: new_messages,
+                            new_chars: _planned_new_chars,
+                            idx_collision_count,
+                            first_collision_idx,
+                        } = collect_new_messages_for_existing_conversation(
+                            existing_id,
+                            conv,
+                            &mut existing_messages,
+                            &mut existing_replay_fingerprints,
+                            "skipping replay-equivalent recovered message with shifted idx",
+                        );
+                        let (inserted_last_idx, inserted_last_created_at) =
+                            borrowed_messages_tail_state(&new_messages);
+                        let mut inserted_indices = Vec::new();
+                        let mut fts_entries = Vec::new();
+                        let mut fts_pending_chars = 0usize;
+                        let mut _fts_inserted_total = 0usize;
+                        let inserted_messages =
+                            franken_append_insert_new_messages(tx, existing_id, &new_messages)?;
+                        let inserted_chars = inserted_messages
+                            .iter()
+                            .map(|(_, msg)| msg.content.len() as i64)
+                            .sum::<i64>();
+                        for (msg_id, msg) in inserted_messages {
+                            franken_insert_snippets(tx, msg_id, &msg.snippets)?;
+                            if !defer_lexical_updates {
+                                fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
+                                fts_pending_chars = fts_pending_chars.saturating_add(msg.content.len());
+                                if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
+                                    || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
+                                {
+                                    flush_pending_fts_entries(
+                                        self,
+                                        tx,
+                                        &mut fts_entries,
+                                        &mut fts_pending_chars,
+                                        &mut _fts_inserted_total,
+                                    )?;
+                                }
+                            }
+                            inserted_indices.push(msg.idx);
+                        }
+
+                        if idx_collision_count > 0 {
+                            tracing::warn!(
+                                conversation_id = existing_id,
+                                collision_count = idx_collision_count,
+                                first_idx = first_collision_idx,
+                                source_path = %conv.source_path.display(),
+                                "message idx collisions encountered while merging recovered conversation; retaining canonical message variants"
+                            );
+                        }
+
+                        if !defer_lexical_updates {
+                            flush_pending_fts_entries(
+                                self,
+                                tx,
+                                &mut fts_entries,
+                                &mut fts_pending_chars,
+                                &mut _fts_inserted_total,
+                            )?;
+                        }
+
+                        let conv_last_ts = conversation_tail_ended_at_candidate(conv);
+                        franken_update_conversation_tail_state(
+                            tx,
+                            existing_id,
+                            conv_last_ts,
+                            inserted_last_idx,
+                            inserted_last_created_at,
+                        )?;
+                        if let Some(lookup_key) = conversation_external_lookup_key_for_conv(agent_id, conv)
+                        {
+                            franken_update_external_conversation_tail_lookup_key(
+                                tx,
+                                &lookup_key,
+                                conv_last_ts,
+                                inserted_last_idx,
+                                inserted_last_created_at,
+                            )?;
+                        }
+
+                        if !defer_analytics_updates && !inserted_indices.is_empty() {
+                            franken_update_daily_stats_in_tx(
+                                self,
+                                tx,
+                                &conv.agent_slug,
+                                &conv.source_id,
+                                conversation_effective_started_at(conv),
+                                StatsDelta {
+                                    session_count_delta: 0,
+                                    message_count_delta: inserted_indices.len() as i64,
+                                    total_chars_delta: inserted_chars,
+                                },
+                            )?;
+                        }
+
+                        return Ok(InsertOutcome {
+                            conversation_id: existing_id,
+                            conversation_inserted: false,
+                            inserted_indices,
+                        });
+                    }
+                };
                 let mut fts_entries = Vec::new();
                 let mut fts_pending_chars = 0usize;
                 let mut _fts_inserted_total = 0usize;
-                let inserted_messages =
-                    franken_append_insert_new_messages(&tx, existing_id, &new_messages)?;
-                let inserted_chars = inserted_messages
-                    .iter()
-                    .map(|(_, msg)| msg.content.len() as i64)
-                    .sum::<i64>();
-                for (msg_id, msg) in inserted_messages {
-                    franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
+                let mut total_chars: i64 = 0;
+                let mut inserted_indices = Vec::new();
+                let mut pending_messages = HashMap::new();
+                let mut pending_replay_fingerprints = HashSet::new();
+                let mut idx_collision_count = 0usize;
+                let mut first_collision_idx: Option<i64> = None;
+                let mut new_messages = Vec::new();
+                for msg in &conv.messages {
+                    let incoming_fingerprint = message_merge_fingerprint(msg);
+                    if let Some(existing_fingerprint) = pending_messages.get(&msg.idx) {
+                        if existing_fingerprint != &incoming_fingerprint {
+                            idx_collision_count = idx_collision_count.saturating_add(1);
+                            first_collision_idx.get_or_insert(msg.idx);
+                        }
+                        continue;
+                    }
+                    let incoming_replay = message_replay_fingerprint(msg);
+                    if pending_replay_fingerprints.contains(&incoming_replay) {
+                        tracing::debug!(
+                            conversation_id = conv_id,
+                            idx = msg.idx,
+                            source_path = %conv.source_path.display(),
+                            "skipping replay-equivalent duplicate message within new conversation insert"
+                        );
+                        continue;
+                    }
+                    pending_messages.insert(msg.idx, incoming_fingerprint);
+                    pending_replay_fingerprints.insert(incoming_replay);
+                    new_messages.push(msg);
+                }
+                let inserted_message_ids = franken_batch_insert_new_messages(tx, conv_id, &new_messages)?;
+                for (msg_id, msg) in inserted_message_ids.into_iter().zip(new_messages) {
+                    franken_insert_snippets(tx, msg_id, &msg.snippets)?;
                     if !defer_lexical_updates {
                         fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
                         fts_pending_chars = fts_pending_chars.saturating_add(msg.content.len());
@@ -10117,172 +8286,58 @@ impl FrankenStorage {
                         {
                             flush_pending_fts_entries(
                                 self,
-                                &tx,
+                                tx,
                                 &mut fts_entries,
                                 &mut fts_pending_chars,
                                 &mut _fts_inserted_total,
                             )?;
                         }
                     }
+                    total_chars += msg.content.len() as i64;
                     inserted_indices.push(msg.idx);
                 }
-
                 if idx_collision_count > 0 {
                     tracing::warn!(
-                        conversation_id = existing_id,
+                        conversation_id = conv_id,
                         collision_count = idx_collision_count,
                         first_idx = first_collision_idx,
                         source_path = %conv.source_path.display(),
-                        "message idx collisions encountered while merging recovered conversation; retaining canonical message variants"
+                        "message idx collisions encountered while inserting a new conversation; retaining the first canonical variant per idx"
                     );
                 }
-
                 if !defer_lexical_updates {
                     flush_pending_fts_entries(
                         self,
-                        &tx,
+                        tx,
                         &mut fts_entries,
                         &mut fts_pending_chars,
                         &mut _fts_inserted_total,
                     )?;
                 }
 
-                let conv_last_ts = conversation_tail_ended_at_candidate(conv);
-                franken_update_conversation_tail_state(
-                    &tx,
-                    existing_id,
-                    conv_last_ts,
-                    inserted_last_idx,
-                    inserted_last_created_at,
-                )?;
-                if let Some(lookup_key) = conversation_external_lookup_key_for_conv(agent_id, conv)
-                {
-                    franken_update_external_conversation_tail_lookup_key(
-                        &tx,
-                        &lookup_key,
-                        conv_last_ts,
-                        inserted_last_idx,
-                        inserted_last_created_at,
-                    )?;
-                }
-
-                if !defer_analytics_updates && !inserted_indices.is_empty() {
+                if !defer_analytics_updates {
                     franken_update_daily_stats_in_tx(
                         self,
-                        &tx,
+                        tx,
                         &conv.agent_slug,
                         &conv.source_id,
                         conversation_effective_started_at(conv),
                         StatsDelta {
-                            session_count_delta: 0,
+                            session_count_delta: 1,
                             message_count_delta: inserted_indices.len() as i64,
-                            total_chars_delta: inserted_chars,
+                            total_chars_delta: total_chars,
                         },
                     )?;
                 }
 
-                tx.commit()?;
-                return Ok(InsertOutcome {
-                    conversation_id: existing_id,
-                    conversation_inserted: false,
+                Ok(InsertOutcome {
+                    conversation_id: conv_id,
+                    conversation_inserted: true,
                     inserted_indices,
-                });
-            }
-        };
-        let mut fts_entries = Vec::new();
-        let mut fts_pending_chars = 0usize;
-        let mut _fts_inserted_total = 0usize;
-        let mut total_chars: i64 = 0;
-        let mut inserted_indices = Vec::new();
-        let mut pending_messages = HashMap::new();
-        let mut pending_replay_fingerprints = HashSet::new();
-        let mut idx_collision_count = 0usize;
-        let mut first_collision_idx: Option<i64> = None;
-        let mut new_messages = Vec::new();
-        for msg in &conv.messages {
-            let incoming_fingerprint = message_merge_fingerprint(msg);
-            if let Some(existing_fingerprint) = pending_messages.get(&msg.idx) {
-                if existing_fingerprint != &incoming_fingerprint {
-                    idx_collision_count = idx_collision_count.saturating_add(1);
-                    first_collision_idx.get_or_insert(msg.idx);
-                }
-                continue;
-            }
-            let incoming_replay = message_replay_fingerprint(msg);
-            if pending_replay_fingerprints.contains(&incoming_replay) {
-                tracing::debug!(
-                    conversation_id = conv_id,
-                    idx = msg.idx,
-                    source_path = %conv.source_path.display(),
-                    "skipping replay-equivalent duplicate message within new conversation insert"
-                );
-                continue;
-            }
-            pending_messages.insert(msg.idx, incoming_fingerprint);
-            pending_replay_fingerprints.insert(incoming_replay);
-            new_messages.push(msg);
-        }
-        let inserted_message_ids = franken_batch_insert_new_messages(&tx, conv_id, &new_messages)?;
-        for (msg_id, msg) in inserted_message_ids.into_iter().zip(new_messages) {
-            franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
-            if !defer_lexical_updates {
-                fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
-                fts_pending_chars = fts_pending_chars.saturating_add(msg.content.len());
-                if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
-                    || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
-                {
-                    flush_pending_fts_entries(
-                        self,
-                        &tx,
-                        &mut fts_entries,
-                        &mut fts_pending_chars,
-                        &mut _fts_inserted_total,
-                    )?;
-                }
-            }
-            total_chars += msg.content.len() as i64;
-            inserted_indices.push(msg.idx);
-        }
-        if idx_collision_count > 0 {
-            tracing::warn!(
-                conversation_id = conv_id,
-                collision_count = idx_collision_count,
-                first_idx = first_collision_idx,
-                source_path = %conv.source_path.display(),
-                "message idx collisions encountered while inserting a new conversation; retaining the first canonical variant per idx"
-            );
-        }
-        if !defer_lexical_updates {
-            flush_pending_fts_entries(
-                self,
-                &tx,
-                &mut fts_entries,
-                &mut fts_pending_chars,
-                &mut _fts_inserted_total,
-            )?;
-        }
-
-        if !defer_analytics_updates {
-            franken_update_daily_stats_in_tx(
-                self,
-                &tx,
-                &conv.agent_slug,
-                &conv.source_id,
-                conversation_effective_started_at(conv),
-                StatsDelta {
-                    session_count_delta: 1,
-                    message_count_delta: inserted_indices.len() as i64,
-                    total_chars_delta: total_chars,
-                },
-            )?;
-        }
-
-        tx.commit()?;
-        Ok(InsertOutcome {
-            conversation_id: conv_id,
-            conversation_inserted: true,
-            inserted_indices,
-        })
+                })
+            })()
+            .map_err(anyhow_error_into_storage_error)
+        })?)
     }
 
     #[cfg(test)]
@@ -10884,7 +8939,7 @@ impl FrankenStorage {
                     archive_fingerprint.to_string()
                 ],
             )
-            .with_context(|| "recording frankensqlite FTS archive fingerprint")?;
+            .with_context(|| "recording the legacy embedded engine FTS archive fingerprint")?;
         Ok(())
     }
 
@@ -10976,7 +9031,7 @@ impl FrankenStorage {
                     FTS_FRANKEN_REBUILD_GENERATION.to_string()
                 ],
             )
-            .with_context(|| "recording frankensqlite FTS rebuild generation")?;
+            .with_context(|| "recording the legacy embedded engine FTS rebuild generation")?;
         Ok(())
     }
 
@@ -11046,7 +9101,7 @@ impl FrankenStorage {
             Err(err) => {
                 tracing::warn!(
                     error = %err,
-                    "frankensqlite FTS consistency probe failed; rebuilding authoritative FTS"
+                    "the legacy embedded engine FTS consistency probe failed; rebuilding authoritative FTS"
                 );
                 let inserted_rows = self.rebuild_fts_via_frankensqlite()?;
                 self.record_fts_franken_rebuild_generation()?;
@@ -11086,7 +9141,7 @@ impl FrankenStorage {
 
         let inserted_rows = self
             .stream_fts_rows_via_frankensqlite(true)
-            .with_context(|| "incrementally repairing missing FTS rows via frankensqlite")?;
+            .with_context(|| "incrementally repairing missing FTS rows via the legacy embedded engine")?;
         let repaired_rows =
             self.conn
                 .query_row_map("SELECT COUNT(*) FROM fts_messages", fparams![], |row| {
@@ -11133,10 +9188,10 @@ impl FrankenStorage {
         self.invalidate_fts_messages_present_cache();
         self.conn
             .execute("DROP TABLE IF EXISTS fts_messages;", &[])
-            .with_context(|| "dropping derived fts_messages before frankensqlite rebuild")?;
+            .with_context(|| "dropping derived fts_messages before the legacy embedded engine rebuild")?;
         self.conn
             .execute(FTS5_REGISTER_SQL, fparams![])
-            .with_context(|| "creating derived fts_messages via frankensqlite rebuild")?;
+            .with_context(|| "creating derived fts_messages via the legacy embedded engine rebuild")?;
         self.set_fts_messages_present_cache(true);
 
         self.stream_fts_rows_via_frankensqlite(false)
@@ -11592,7 +9647,7 @@ impl FrankenStorage {
         // conversations; filter on agent slug via an EXISTS subquery only
         // when that filter is actually requested.  This avoids the unneeded
         // 2-table JOIN (which also silently dropped legacy conversations
-        // with NULL agent_id) and sidesteps frankensqlite's materialization
+        // with NULL agent_id) and sidesteps the legacy embedded engine's materialization
         // fallback entirely.
         let mut sql = "SELECT COUNT(*) FROM conversations c WHERE 1=1".to_string();
         let mut param_values: Vec<ParamValue> = Vec::new();
@@ -11722,199 +9777,81 @@ impl FrankenStorage {
         });
         let mut pricing_diag = PricingDiagnostics::default();
 
-        let mut tx = self.conn.transaction()?;
+        // w1b Task B3 (D2, control-plane 2026-08-26): with_tx_no_replay,
+        // TxMode::Immediate. Same reasoning as the other no_replay sites
+        // (rebuild_analytics et al.): write transactions use Immediate, so
+        // there is no mid-transaction Busy{Snapshot} conflict for replay to
+        // catch, only the cost of redoing this batch from scratch on a rare
+        // conflict. `pricing_table`/`pricing_diag` stay captured from the
+        // enclosing scope (shared/mutable borrow respectively) rather than
+        // threaded through the closure's return value -- `pricing_diag.
+        // log_summary()` after the call is unchanged from before migration.
+        //
+        // #10 in the tx-purity-worklist: mechanical wrap (`&tx` becomes `tx`
+        // throughout since the closure's `tx` parameter is already `&Tx`,
+        // same as every other migration this task did), not a rewrite --
+        // deliberately given its own commit + targeted test evidence rather
+        // than folded into the batch of 17 other sites, because this is the
+        // single highest-traffic write path in the crate.
+        let outcomes = self.conn.with_tx_no_replay(
+            TxMode::Immediate,
+            |tx| -> Result<Vec<InsertOutcome>, StorageError> {
+                (|| -> Result<Vec<InsertOutcome>> {
 
-        // Bug #167: Ensure all referenced agents, workspaces, and sources
-        // exist inside the transaction so FK checks pass.  The caller resolves
-        // IDs via ensure_agent / ensure_workspace / ensure_sources_for_batch
-        // outside the transaction, but those autocommit writes may not be
-        // visible inside the transaction snapshot in frankensqlite.  Re-verify
-        // (and insert if missing) within the tx.
-        ensure_agents_in_tx(&tx, conversations)?;
-        ensure_workspaces_in_tx(&tx, conversations)?;
-        ensure_sources_in_tx(&tx, conversations)?;
+                // Bug #167: Ensure all referenced agents, workspaces, and sources
+                // exist inside the transaction so FK checks pass.  The caller resolves
+                // IDs via ensure_agent / ensure_workspace / ensure_sources_for_batch
+                // outside the transaction, but those autocommit writes may not be
+                // visible inside the transaction snapshot in the legacy embedded engine.  Re-verify
+                // (and insert if missing) within the tx.
+                ensure_agents_in_tx(tx, conversations)?;
+                ensure_workspaces_in_tx(tx, conversations)?;
+                ensure_sources_in_tx(tx, conversations)?;
 
-        let mut outcomes = Vec::with_capacity(conversations.len());
-        let mut fts_entries = Vec::new();
-        let mut fts_pending_chars = 0usize;
-        let mut fts_inserted_total = 0usize;
-        let mut fts_count_total = 0usize;
-        let mut stats = StatsAggregator::new();
-        let mut token_stats = TokenStatsAggregator::new();
-        let mut token_entries: Vec<TokenUsageEntry> = Vec::new();
-        let mut metrics_entries: Vec<MessageMetricsEntry> = Vec::new();
-        let mut rollup_agg = AnalyticsRollupAggregator::new();
-        let mut conv_ids_to_summarize: Vec<i64> = Vec::new();
-        let mut pending_conversation_ids: HashMap<PendingConversationKey, i64> = HashMap::new();
-        let mut pending_message_fingerprints: HashMap<i64, HashMap<i64, MessageMergeFingerprint>> =
-            HashMap::new();
-        let mut pending_message_replay_fingerprints: HashMap<
-            i64,
-            HashSet<MessageReplayFingerprint>,
-        > = HashMap::new();
+                let mut outcomes = Vec::with_capacity(conversations.len());
+                let mut fts_entries = Vec::new();
+                let mut fts_pending_chars = 0usize;
+                let mut fts_inserted_total = 0usize;
+                let mut fts_count_total = 0usize;
+                let mut stats = StatsAggregator::new();
+                let mut token_stats = TokenStatsAggregator::new();
+                let mut token_entries: Vec<TokenUsageEntry> = Vec::new();
+                let mut metrics_entries: Vec<MessageMetricsEntry> = Vec::new();
+                let mut rollup_agg = AnalyticsRollupAggregator::new();
+                let mut conv_ids_to_summarize: Vec<i64> = Vec::new();
+                let mut pending_conversation_ids: HashMap<PendingConversationKey, i64> = HashMap::new();
+                let mut pending_message_fingerprints: HashMap<i64, HashMap<i64, MessageMergeFingerprint>> =
+                    HashMap::new();
+                let mut pending_message_replay_fingerprints: HashMap<
+                    i64,
+                    HashSet<MessageReplayFingerprint>,
+                > = HashMap::new();
 
-        for &(agent_id, workspace_id, raw_conv) in conversations {
-            let normalized_conv = normalized_conversation_for_storage(raw_conv);
-            let conv = normalized_conv.as_ref();
-            let mut total_chars: i64 = 0;
-            let mut inserted_indices = Vec::with_capacity(conv.messages.len());
-            let mut inserted_messages: Vec<(i64, &Message)> =
-                Vec::with_capacity(conv.messages.len());
-            let mut session_count_delta = 1_i64;
-            let conversation_key = conversation_merge_key(agent_id, conv);
+                for &(agent_id, workspace_id, raw_conv) in conversations {
+                    let normalized_conv = normalized_conversation_for_storage(raw_conv);
+                    let conv = normalized_conv.as_ref();
+                    let mut total_chars: i64 = 0;
+                    let mut inserted_indices = Vec::with_capacity(conv.messages.len());
+                    let mut inserted_messages: Vec<(i64, &Message)> =
+                        Vec::with_capacity(conv.messages.len());
+                    let mut session_count_delta = 1_i64;
+                    let conversation_key = conversation_merge_key(agent_id, conv);
 
-            let existing_conv_id = if let Some(existing_id) =
-                pending_conversation_ids.get(&conversation_key)
-            {
-                Some(*existing_id)
-            } else {
-                let existing_id =
-                    franken_find_existing_conversation_by_key(&tx, &conversation_key, Some(conv))?;
-                if let Some(existing_id) = existing_id {
-                    pending_conversation_ids.insert(conversation_key.clone(), existing_id);
-                }
-                existing_id
-            };
-
-            let conv_id = if let Some(existing_id) = existing_conv_id {
-                session_count_delta = 0;
-                let (
-                    ExistingConversationNewMessages {
-                        messages: new_messages,
-                        new_chars: _planned_new_chars,
-                        idx_collision_count,
-                        first_collision_idx,
-                    },
-                    existing_messages,
-                    existing_replay_fingerprints,
-                ) = franken_collect_batched_existing_new_messages(
-                    &tx,
-                    existing_id,
-                    conv,
-                    &mut pending_message_fingerprints,
-                    &mut pending_message_replay_fingerprints,
-                    "skipping replay-equivalent recovered message with shifted idx during batched merge",
-                )?;
-                let (inserted_last_idx, inserted_last_created_at) =
-                    borrowed_messages_tail_state(&new_messages);
-                let inserted_append_messages =
-                    franken_append_insert_new_messages(&tx, existing_id, &new_messages)?;
-                total_chars += inserted_append_messages
-                    .iter()
-                    .map(|(_, msg)| msg.content.len() as i64)
-                    .sum::<i64>();
-                for (msg_id, msg) in inserted_append_messages {
-                    franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
-                    if !defer_lexical_updates {
-                        fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
-                        fts_count_total += 1;
-                        fts_pending_chars = fts_pending_chars.saturating_add(msg.content.len());
-                        if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
-                            || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
-                        {
-                            flush_pending_fts_entries(
-                                self,
-                                &tx,
-                                &mut fts_entries,
-                                &mut fts_pending_chars,
-                                &mut fts_inserted_total,
-                            )?;
+                    let existing_conv_id = if let Some(existing_id) =
+                        pending_conversation_ids.get(&conversation_key)
+                    {
+                        Some(*existing_id)
+                    } else {
+                        let existing_id =
+                            franken_find_existing_conversation_by_key(tx, &conversation_key, Some(conv))?;
+                        if let Some(existing_id) = existing_id {
+                            pending_conversation_ids.insert(conversation_key.clone(), existing_id);
                         }
-                    }
-                    inserted_indices.push(msg.idx);
-                    inserted_messages.push((msg_id, msg));
-                }
+                        existing_id
+                    };
 
-                if idx_collision_count > 0 {
-                    tracing::warn!(
-                        conversation_id = existing_id,
-                        collision_count = idx_collision_count,
-                        first_idx = first_collision_idx,
-                        source_path = %conv.source_path.display(),
-                        "message idx collisions encountered during batched conversation merge; retaining canonical message variants"
-                    );
-                }
-
-                let conv_last_ts = conversation_tail_ended_at_candidate(conv);
-                franken_update_conversation_tail_state(
-                    &tx,
-                    existing_id,
-                    conv_last_ts,
-                    inserted_last_idx,
-                    inserted_last_created_at,
-                )?;
-                if let Some(lookup_key) = conversation_external_lookup_key_for_conv(agent_id, conv)
-                {
-                    franken_update_external_conversation_tail_lookup_key(
-                        &tx,
-                        &lookup_key,
-                        conv_last_ts,
-                        inserted_last_idx,
-                        inserted_last_created_at,
-                    )?;
-                }
-
-                pending_message_fingerprints.insert(existing_id, existing_messages);
-                pending_message_replay_fingerprints
-                    .insert(existing_id, existing_replay_fingerprints);
-
-                existing_id
-            } else {
-                match franken_insert_conversation_or_get_existing(
-                    &tx,
-                    agent_id,
-                    workspace_id,
-                    conv,
-                )? {
-                    ConversationInsertStatus::Inserted(new_conv_id) => {
-                        pending_conversation_ids.insert(conversation_key.clone(), new_conv_id);
-                        let pending_messages =
-                            pending_message_fingerprints.entry(new_conv_id).or_default();
-                        let pending_replay_fingerprints = pending_message_replay_fingerprints
-                            .entry(new_conv_id)
-                            .or_default();
-                        let mut new_messages = Vec::new();
-                        for msg in &conv.messages {
-                            let incoming_replay = message_replay_fingerprint(msg);
-                            if pending_messages.contains_key(&msg.idx)
-                                || pending_replay_fingerprints.contains(&incoming_replay)
-                            {
-                                continue;
-                            }
-                            pending_messages.insert(msg.idx, message_merge_fingerprint(msg));
-                            pending_replay_fingerprints.insert(incoming_replay);
-                            new_messages.push(msg);
-                        }
-                        let inserted_message_ids =
-                            franken_batch_insert_new_messages(&tx, new_conv_id, &new_messages)?;
-                        for (msg_id, msg) in inserted_message_ids.into_iter().zip(new_messages) {
-                            franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
-                            if !defer_lexical_updates {
-                                fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
-                                fts_count_total += 1;
-                                fts_pending_chars =
-                                    fts_pending_chars.saturating_add(msg.content.len());
-                                if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
-                                    || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
-                                {
-                                    flush_pending_fts_entries(
-                                        self,
-                                        &tx,
-                                        &mut fts_entries,
-                                        &mut fts_pending_chars,
-                                        &mut fts_inserted_total,
-                                    )?;
-                                }
-                            }
-                            total_chars += msg.content.len() as i64;
-                            inserted_indices.push(msg.idx);
-                            inserted_messages.push((msg_id, msg));
-                        }
-                        new_conv_id
-                    }
-                    ConversationInsertStatus::Existing(existing_id) => {
+                    let conv_id = if let Some(existing_id) = existing_conv_id {
                         session_count_delta = 0;
-                        pending_conversation_ids.insert(conversation_key.clone(), existing_id);
                         let (
                             ExistingConversationNewMessages {
                                 messages: new_messages,
@@ -11925,34 +9862,33 @@ impl FrankenStorage {
                             existing_messages,
                             existing_replay_fingerprints,
                         ) = franken_collect_batched_existing_new_messages(
-                            &tx,
+                            tx,
                             existing_id,
                             conv,
                             &mut pending_message_fingerprints,
                             &mut pending_message_replay_fingerprints,
-                            "skipping replay-equivalent recovered message with shifted idx after duplicate conversation recovery",
+                            "skipping replay-equivalent recovered message with shifted idx during batched merge",
                         )?;
                         let (inserted_last_idx, inserted_last_created_at) =
                             borrowed_messages_tail_state(&new_messages);
                         let inserted_append_messages =
-                            franken_append_insert_new_messages(&tx, existing_id, &new_messages)?;
+                            franken_append_insert_new_messages(tx, existing_id, &new_messages)?;
                         total_chars += inserted_append_messages
                             .iter()
                             .map(|(_, msg)| msg.content.len() as i64)
                             .sum::<i64>();
                         for (msg_id, msg) in inserted_append_messages {
-                            franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
+                            franken_insert_snippets(tx, msg_id, &msg.snippets)?;
                             if !defer_lexical_updates {
                                 fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
                                 fts_count_total += 1;
-                                fts_pending_chars =
-                                    fts_pending_chars.saturating_add(msg.content.len());
+                                fts_pending_chars = fts_pending_chars.saturating_add(msg.content.len());
                                 if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
                                     || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
                                 {
                                     flush_pending_fts_entries(
                                         self,
-                                        &tx,
+                                        tx,
                                         &mut fts_entries,
                                         &mut fts_pending_chars,
                                         &mut fts_inserted_total,
@@ -11969,23 +9905,22 @@ impl FrankenStorage {
                                 collision_count = idx_collision_count,
                                 first_idx = first_collision_idx,
                                 source_path = %conv.source_path.display(),
-                                "message idx collisions encountered after duplicate conversation recovery; retaining canonical message variants"
+                                "message idx collisions encountered during batched conversation merge; retaining canonical message variants"
                             );
                         }
 
                         let conv_last_ts = conversation_tail_ended_at_candidate(conv);
                         franken_update_conversation_tail_state(
-                            &tx,
+                            tx,
                             existing_id,
                             conv_last_ts,
                             inserted_last_idx,
                             inserted_last_created_at,
                         )?;
-                        if let Some(lookup_key) =
-                            conversation_external_lookup_key_for_conv(agent_id, conv)
+                        if let Some(lookup_key) = conversation_external_lookup_key_for_conv(agent_id, conv)
                         {
                             franken_update_external_conversation_tail_lookup_key(
-                                &tx,
+                                tx,
                                 &lookup_key,
                                 conv_last_ts,
                                 inserted_last_idx,
@@ -11998,291 +9933,440 @@ impl FrankenStorage {
                             .insert(existing_id, existing_replay_fingerprints);
 
                         existing_id
-                    }
-                }
-            };
-
-            if !defer_analytics_updates {
-                let delta = StatsDelta {
-                    session_count_delta,
-                    message_count_delta: inserted_messages.len() as i64,
-                    total_chars_delta: total_chars,
-                };
-
-                let effective_started_at = conversation_effective_started_at(conv);
-                let day_id = effective_started_at
-                    .map(FrankenStorage::day_id_from_millis)
-                    .unwrap_or(0);
-                stats.record_delta(
-                    &conv.agent_slug,
-                    &conv.source_id,
-                    day_id,
-                    delta.session_count_delta,
-                    delta.message_count_delta,
-                    delta.total_chars_delta,
-                );
-
-                let conv_day_id = day_id;
-                let mut session_model_family = String::from("unknown");
-                let mut has_any_tokens = false;
-
-                for &(message_id, msg) in &inserted_messages {
-                    let role_s = role_str(&msg.role);
-                    let usage = if historical_raw_json(&msg.extra_json).is_some() {
-                        crate::connectors::extract_tokens_for_agent(
-                            &conv.agent_slug,
-                            &serde_json::Value::Null,
-                            &msg.content,
-                            &role_s,
-                        )
                     } else {
-                        crate::connectors::extract_tokens_for_agent(
-                            &conv.agent_slug,
-                            &msg.extra_json,
-                            &msg.content,
-                            &role_s,
-                        )
+                        match franken_insert_conversation_or_get_existing(
+                            tx,
+                            agent_id,
+                            workspace_id,
+                            conv,
+                        )? {
+                            ConversationInsertStatus::Inserted(new_conv_id) => {
+                                pending_conversation_ids.insert(conversation_key.clone(), new_conv_id);
+                                let pending_messages =
+                                    pending_message_fingerprints.entry(new_conv_id).or_default();
+                                let pending_replay_fingerprints = pending_message_replay_fingerprints
+                                    .entry(new_conv_id)
+                                    .or_default();
+                                let mut new_messages = Vec::new();
+                                for msg in &conv.messages {
+                                    let incoming_replay = message_replay_fingerprint(msg);
+                                    if pending_messages.contains_key(&msg.idx)
+                                        || pending_replay_fingerprints.contains(&incoming_replay)
+                                    {
+                                        continue;
+                                    }
+                                    pending_messages.insert(msg.idx, message_merge_fingerprint(msg));
+                                    pending_replay_fingerprints.insert(incoming_replay);
+                                    new_messages.push(msg);
+                                }
+                                let inserted_message_ids =
+                                    franken_batch_insert_new_messages(tx, new_conv_id, &new_messages)?;
+                                for (msg_id, msg) in inserted_message_ids.into_iter().zip(new_messages) {
+                                    franken_insert_snippets(tx, msg_id, &msg.snippets)?;
+                                    if !defer_lexical_updates {
+                                        fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
+                                        fts_count_total += 1;
+                                        fts_pending_chars =
+                                            fts_pending_chars.saturating_add(msg.content.len());
+                                        if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
+                                            || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
+                                        {
+                                            flush_pending_fts_entries(
+                                                self,
+                                                tx,
+                                                &mut fts_entries,
+                                                &mut fts_pending_chars,
+                                                &mut fts_inserted_total,
+                                            )?;
+                                        }
+                                    }
+                                    total_chars += msg.content.len() as i64;
+                                    inserted_indices.push(msg.idx);
+                                    inserted_messages.push((msg_id, msg));
+                                }
+                                new_conv_id
+                            }
+                            ConversationInsertStatus::Existing(existing_id) => {
+                                session_count_delta = 0;
+                                pending_conversation_ids.insert(conversation_key.clone(), existing_id);
+                                let (
+                                    ExistingConversationNewMessages {
+                                        messages: new_messages,
+                                        new_chars: _planned_new_chars,
+                                        idx_collision_count,
+                                        first_collision_idx,
+                                    },
+                                    existing_messages,
+                                    existing_replay_fingerprints,
+                                ) = franken_collect_batched_existing_new_messages(
+                                    tx,
+                                    existing_id,
+                                    conv,
+                                    &mut pending_message_fingerprints,
+                                    &mut pending_message_replay_fingerprints,
+                                    "skipping replay-equivalent recovered message with shifted idx after duplicate conversation recovery",
+                                )?;
+                                let (inserted_last_idx, inserted_last_created_at) =
+                                    borrowed_messages_tail_state(&new_messages);
+                                let inserted_append_messages =
+                                    franken_append_insert_new_messages(tx, existing_id, &new_messages)?;
+                                total_chars += inserted_append_messages
+                                    .iter()
+                                    .map(|(_, msg)| msg.content.len() as i64)
+                                    .sum::<i64>();
+                                for (msg_id, msg) in inserted_append_messages {
+                                    franken_insert_snippets(tx, msg_id, &msg.snippets)?;
+                                    if !defer_lexical_updates {
+                                        fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
+                                        fts_count_total += 1;
+                                        fts_pending_chars =
+                                            fts_pending_chars.saturating_add(msg.content.len());
+                                        if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
+                                            || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
+                                        {
+                                            flush_pending_fts_entries(
+                                                self,
+                                                tx,
+                                                &mut fts_entries,
+                                                &mut fts_pending_chars,
+                                                &mut fts_inserted_total,
+                                            )?;
+                                        }
+                                    }
+                                    inserted_indices.push(msg.idx);
+                                    inserted_messages.push((msg_id, msg));
+                                }
+
+                                if idx_collision_count > 0 {
+                                    tracing::warn!(
+                                        conversation_id = existing_id,
+                                        collision_count = idx_collision_count,
+                                        first_idx = first_collision_idx,
+                                        source_path = %conv.source_path.display(),
+                                        "message idx collisions encountered after duplicate conversation recovery; retaining canonical message variants"
+                                    );
+                                }
+
+                                let conv_last_ts = conversation_tail_ended_at_candidate(conv);
+                                franken_update_conversation_tail_state(
+                                    tx,
+                                    existing_id,
+                                    conv_last_ts,
+                                    inserted_last_idx,
+                                    inserted_last_created_at,
+                                )?;
+                                if let Some(lookup_key) =
+                                    conversation_external_lookup_key_for_conv(agent_id, conv)
+                                {
+                                    franken_update_external_conversation_tail_lookup_key(
+                                        tx,
+                                        &lookup_key,
+                                        conv_last_ts,
+                                        inserted_last_idx,
+                                        inserted_last_created_at,
+                                    )?;
+                                }
+
+                                pending_message_fingerprints.insert(existing_id, existing_messages);
+                                pending_message_replay_fingerprints
+                                    .insert(existing_id, existing_replay_fingerprints);
+
+                                existing_id
+                            }
+                        }
                     };
 
-                    let msg_ts = msg
-                        .created_at
-                        .or(conversation_effective_started_at(conv))
-                        .unwrap_or(0);
-                    let msg_day_id = if msg_ts > 0 {
-                        FrankenStorage::day_id_from_millis(msg_ts)
-                    } else {
-                        conv_day_id
-                    };
+                    if !defer_analytics_updates {
+                        let delta = StatsDelta {
+                            session_count_delta,
+                            message_count_delta: inserted_messages.len() as i64,
+                            total_chars_delta: total_chars,
+                        };
 
-                    let model_info = usage
-                        .model_name
-                        .as_deref()
-                        .map(crate::connectors::normalize_model);
+                        let effective_started_at = conversation_effective_started_at(conv);
+                        let day_id = effective_started_at
+                            .map(FrankenStorage::day_id_from_millis)
+                            .unwrap_or(0);
+                        stats.record_delta(
+                            &conv.agent_slug,
+                            &conv.source_id,
+                            day_id,
+                            delta.session_count_delta,
+                            delta.message_count_delta,
+                            delta.total_chars_delta,
+                        );
 
-                    let model_family = model_info
-                        .as_ref()
-                        .map(|i| i.family.clone())
-                        .unwrap_or_else(|| "unknown".into());
-                    let model_tier = model_info
-                        .as_ref()
-                        .map(|i| i.tier.clone())
-                        .unwrap_or_else(|| "unknown".into());
-                    let provider = usage
-                        .provider
-                        .clone()
-                        .or_else(|| model_info.as_ref().map(|i| i.provider.clone()))
-                        .unwrap_or_else(|| "unknown".into());
+                        let conv_day_id = day_id;
+                        let mut session_model_family = String::from("unknown");
+                        let mut has_any_tokens = false;
 
-                    if model_family != "unknown" {
-                        session_model_family = model_family.clone();
+                        for &(message_id, msg) in &inserted_messages {
+                            let role_s = role_str(&msg.role);
+                            let usage = if historical_raw_json(&msg.extra_json).is_some() {
+                                crate::connectors::extract_tokens_for_agent(
+                                    &conv.agent_slug,
+                                    &serde_json::Value::Null,
+                                    &msg.content,
+                                    &role_s,
+                                )
+                            } else {
+                                crate::connectors::extract_tokens_for_agent(
+                                    &conv.agent_slug,
+                                    &msg.extra_json,
+                                    &msg.content,
+                                    &role_s,
+                                )
+                            };
+
+                            let msg_ts = msg
+                                .created_at
+                                .or(conversation_effective_started_at(conv))
+                                .unwrap_or(0);
+                            let msg_day_id = if msg_ts > 0 {
+                                FrankenStorage::day_id_from_millis(msg_ts)
+                            } else {
+                                conv_day_id
+                            };
+
+                            let model_info = usage
+                                .model_name
+                                .as_deref()
+                                .map(crate::connectors::normalize_model);
+
+                            let model_family = model_info
+                                .as_ref()
+                                .map(|i| i.family.clone())
+                                .unwrap_or_else(|| "unknown".into());
+                            let model_tier = model_info
+                                .as_ref()
+                                .map(|i| i.tier.clone())
+                                .unwrap_or_else(|| "unknown".into());
+                            let provider = usage
+                                .provider
+                                .clone()
+                                .or_else(|| model_info.as_ref().map(|i| i.provider.clone()))
+                                .unwrap_or_else(|| "unknown".into());
+
+                            if model_family != "unknown" {
+                                session_model_family = model_family.clone();
+                            }
+
+                            let estimated_cost = pricing_table.compute_cost(
+                                usage.model_name.as_deref(),
+                                msg_day_id,
+                                usage.input_tokens,
+                                usage.output_tokens,
+                                usage.cache_read_tokens,
+                                usage.cache_creation_tokens,
+                            );
+                            if estimated_cost.is_some() {
+                                pricing_diag.record_priced();
+                            } else if usage.has_token_data() {
+                                pricing_diag.record_unpriced(usage.model_name.as_deref());
+                            }
+
+                            token_stats.record(
+                                &conv.agent_slug,
+                                &conv.source_id,
+                                msg_day_id,
+                                &model_family,
+                                &role_s,
+                                &usage,
+                                msg.content.len() as i64,
+                                estimated_cost.unwrap_or(0.0),
+                            );
+
+                            if usage.has_token_data() {
+                                has_any_tokens = true;
+                            }
+
+                            let content_chars = msg.content.len() as i64;
+                            let content_tokens_est = content_chars / 4;
+                            let msg_hour_id = FrankenStorage::hour_id_from_millis(msg_ts);
+                            let has_plan = has_plan_for_role(&role_s, &msg.content);
+
+                            token_entries.push(TokenUsageEntry {
+                                message_id,
+                                conversation_id: conv_id,
+                                agent_id,
+                                workspace_id,
+                                source_id: conv.source_id.clone(),
+                                timestamp_ms: msg_ts,
+                                day_id: msg_day_id,
+                                model_name: usage.model_name.clone(),
+                                model_family: Some(model_family.clone()),
+                                model_tier: Some(model_tier.clone()),
+                                service_tier: usage.service_tier.clone(),
+                                provider: Some(provider.clone()),
+                                input_tokens: usage.input_tokens,
+                                output_tokens: usage.output_tokens,
+                                cache_read_tokens: usage.cache_read_tokens,
+                                cache_creation_tokens: usage.cache_creation_tokens,
+                                thinking_tokens: usage.thinking_tokens,
+                                total_tokens: usage.total_tokens(),
+                                estimated_cost_usd: estimated_cost,
+                                role: role_s.to_string(),
+                                content_chars,
+                                has_tool_calls: usage.has_tool_calls,
+                                tool_call_count: usage.tool_call_count,
+                                data_source: usage.data_source.as_str().to_string(),
+                            });
+
+                            let mm = MessageMetricsEntry {
+                                message_id,
+                                created_at_ms: msg_ts,
+                                hour_id: msg_hour_id,
+                                day_id: msg_day_id,
+                                agent_slug: conv.agent_slug.clone(),
+                                workspace_id: workspace_id.unwrap_or(0),
+                                source_id: conv.source_id.clone(),
+                                role: role_s.to_string(),
+                                content_chars,
+                                content_tokens_est,
+                                model_name: usage.model_name.clone(),
+                                model_family: model_family.clone(),
+                                model_tier: model_tier.clone(),
+                                provider,
+                                api_input_tokens: usage.input_tokens,
+                                api_output_tokens: usage.output_tokens,
+                                api_cache_read_tokens: usage.cache_read_tokens,
+                                api_cache_creation_tokens: usage.cache_creation_tokens,
+                                api_thinking_tokens: usage.thinking_tokens,
+                                api_service_tier: usage.service_tier.clone(),
+                                api_data_source: usage.data_source.as_str().to_string(),
+                                tool_call_count: usage.tool_call_count as i64,
+                                has_tool_calls: usage.has_tool_calls,
+                                has_plan,
+                            };
+                            rollup_agg.record(&mm);
+                            metrics_entries.push(mm);
+                        }
+
+                        if session_count_delta > 0 {
+                            token_stats.record_session(
+                                &conv.agent_slug,
+                                &conv.source_id,
+                                conv_day_id,
+                                &session_model_family,
+                            );
+                        }
+
+                        if has_any_tokens {
+                            conv_ids_to_summarize.push(conv_id);
+                        }
                     }
 
-                    let estimated_cost = pricing_table.compute_cost(
-                        usage.model_name.as_deref(),
-                        msg_day_id,
-                        usage.input_tokens,
-                        usage.output_tokens,
-                        usage.cache_read_tokens,
-                        usage.cache_creation_tokens,
-                    );
-                    if estimated_cost.is_some() {
-                        pricing_diag.record_priced();
-                    } else if usage.has_token_data() {
-                        pricing_diag.record_unpriced(usage.model_name.as_deref());
-                    }
-
-                    token_stats.record(
-                        &conv.agent_slug,
-                        &conv.source_id,
-                        msg_day_id,
-                        &model_family,
-                        &role_s,
-                        &usage,
-                        msg.content.len() as i64,
-                        estimated_cost.unwrap_or(0.0),
-                    );
-
-                    if usage.has_token_data() {
-                        has_any_tokens = true;
-                    }
-
-                    let content_chars = msg.content.len() as i64;
-                    let content_tokens_est = content_chars / 4;
-                    let msg_hour_id = FrankenStorage::hour_id_from_millis(msg_ts);
-                    let has_plan = has_plan_for_role(&role_s, &msg.content);
-
-                    token_entries.push(TokenUsageEntry {
-                        message_id,
+                    outcomes.push(InsertOutcome {
                         conversation_id: conv_id,
-                        agent_id,
-                        workspace_id,
-                        source_id: conv.source_id.clone(),
-                        timestamp_ms: msg_ts,
-                        day_id: msg_day_id,
-                        model_name: usage.model_name.clone(),
-                        model_family: Some(model_family.clone()),
-                        model_tier: Some(model_tier.clone()),
-                        service_tier: usage.service_tier.clone(),
-                        provider: Some(provider.clone()),
-                        input_tokens: usage.input_tokens,
-                        output_tokens: usage.output_tokens,
-                        cache_read_tokens: usage.cache_read_tokens,
-                        cache_creation_tokens: usage.cache_creation_tokens,
-                        thinking_tokens: usage.thinking_tokens,
-                        total_tokens: usage.total_tokens(),
-                        estimated_cost_usd: estimated_cost,
-                        role: role_s.to_string(),
-                        content_chars,
-                        has_tool_calls: usage.has_tool_calls,
-                        tool_call_count: usage.tool_call_count,
-                        data_source: usage.data_source.as_str().to_string(),
+                        conversation_inserted: session_count_delta > 0,
+                        inserted_indices,
                     });
-
-                    let mm = MessageMetricsEntry {
-                        message_id,
-                        created_at_ms: msg_ts,
-                        hour_id: msg_hour_id,
-                        day_id: msg_day_id,
-                        agent_slug: conv.agent_slug.clone(),
-                        workspace_id: workspace_id.unwrap_or(0),
-                        source_id: conv.source_id.clone(),
-                        role: role_s.to_string(),
-                        content_chars,
-                        content_tokens_est,
-                        model_name: usage.model_name.clone(),
-                        model_family: model_family.clone(),
-                        model_tier: model_tier.clone(),
-                        provider,
-                        api_input_tokens: usage.input_tokens,
-                        api_output_tokens: usage.output_tokens,
-                        api_cache_read_tokens: usage.cache_read_tokens,
-                        api_cache_creation_tokens: usage.cache_creation_tokens,
-                        api_thinking_tokens: usage.thinking_tokens,
-                        api_service_tier: usage.service_tier.clone(),
-                        api_data_source: usage.data_source.as_str().to_string(),
-                        tool_call_count: usage.tool_call_count as i64,
-                        has_tool_calls: usage.has_tool_calls,
-                        has_plan,
-                    };
-                    rollup_agg.record(&mm);
-                    metrics_entries.push(mm);
                 }
 
-                if session_count_delta > 0 {
-                    token_stats.record_session(
-                        &conv.agent_slug,
-                        &conv.source_id,
-                        conv_day_id,
-                        &session_model_family,
+                // Batch insert all FTS entries at once
+                if !defer_lexical_updates {
+                    flush_pending_fts_entries(
+                        self,
+                        tx,
+                        &mut fts_entries,
+                        &mut fts_pending_chars,
+                        &mut fts_inserted_total,
+                    )?;
+                }
+                if !defer_lexical_updates && fts_count_total > 0 {
+                    tracing::debug!(
+                        target: "cass::perf::fts5",
+                        total = fts_count_total,
+                        inserted = fts_inserted_total,
+                        conversations = conversations.len(),
+                        "franken_batch_fts_insert_complete"
                     );
                 }
 
-                if has_any_tokens {
-                    conv_ids_to_summarize.push(conv_id);
+                // Batched daily_stats update
+                if !defer_analytics_updates && !stats.is_empty() {
+                    let entries = stats.expand();
+                    let affected = franken_update_daily_stats_batched_in_tx(tx, &entries)?;
+                    tracing::debug!(
+                        target: "cass::perf::daily_stats",
+                        raw = stats.raw_entry_count(),
+                        expanded = entries.len(),
+                        affected = affected,
+                        "franken_batched_stats_update_complete"
+                    );
                 }
-            }
 
-            outcomes.push(InsertOutcome {
-                conversation_id: conv_id,
-                conversation_inserted: session_count_delta > 0,
-                inserted_indices,
-            });
-        }
+                // Batch insert token_usage rows
+                if !defer_analytics_updates && !token_entries.is_empty() {
+                    let token_count = token_entries.len();
+                    let inserted = franken_insert_token_usage_batched_in_tx(tx, &token_entries)?;
+                    tracing::debug!(
+                        target: "cass::perf::token_usage",
+                        total = token_count,
+                        inserted = inserted,
+                        "franken_batch_token_usage_insert_complete"
+                    );
+                }
 
-        // Batch insert all FTS entries at once
-        if !defer_lexical_updates {
-            flush_pending_fts_entries(
-                self,
-                &tx,
-                &mut fts_entries,
-                &mut fts_pending_chars,
-                &mut fts_inserted_total,
-            )?;
-        }
-        if !defer_lexical_updates && fts_count_total > 0 {
-            tracing::debug!(
-                target: "cass::perf::fts5",
-                total = fts_count_total,
-                inserted = fts_inserted_total,
-                conversations = conversations.len(),
-                "franken_batch_fts_insert_complete"
-            );
-        }
+                // Batched token_daily_stats update
+                if !defer_analytics_updates && !token_stats.is_empty() {
+                    let entries = token_stats.expand();
+                    let affected = franken_update_token_daily_stats_batched_in_tx(
+                        tx,
+                        &entries,
+                        FrankenStorage::now_millis(),
+                    )?;
+                    tracing::debug!(
+                        target: "cass::perf::token_daily_stats",
+                        raw = token_stats.raw_entry_count(),
+                        expanded = entries.len(),
+                        affected = affected,
+                        "franken_batched_token_stats_update_complete"
+                    );
+                }
 
-        // Batched daily_stats update
-        if !defer_analytics_updates && !stats.is_empty() {
-            let entries = stats.expand();
-            let affected = franken_update_daily_stats_batched_in_tx(&tx, &entries)?;
-            tracing::debug!(
-                target: "cass::perf::daily_stats",
-                raw = stats.raw_entry_count(),
-                expanded = entries.len(),
-                affected = affected,
-                "franken_batched_stats_update_complete"
-            );
-        }
+                // Batch insert message_metrics rows
+                if !defer_analytics_updates && !metrics_entries.is_empty() {
+                    let mm_count = metrics_entries.len();
+                    let inserted = franken_insert_message_metrics_batched_in_tx(tx, &metrics_entries)?;
+                    tracing::debug!(
+                        target: "cass::perf::message_metrics",
+                        total = mm_count,
+                        inserted = inserted,
+                        "franken_batch_message_metrics_insert_complete"
+                    );
+                }
 
-        // Batch insert token_usage rows
-        if !defer_analytics_updates && !token_entries.is_empty() {
-            let token_count = token_entries.len();
-            let inserted = franken_insert_token_usage_batched_in_tx(&tx, &token_entries)?;
-            tracing::debug!(
-                target: "cass::perf::token_usage",
-                total = token_count,
-                inserted = inserted,
-                "franken_batch_token_usage_insert_complete"
-            );
-        }
+                // Flush usage_hourly + usage_daily rollups
+                if !defer_analytics_updates && !rollup_agg.is_empty() {
+                    let (hourly, daily, models_daily) = franken_flush_analytics_rollups_in_tx(
+                        tx,
+                        &rollup_agg,
+                        FrankenStorage::now_millis(),
+                    )?;
+                    tracing::debug!(
+                        target: "cass::perf::usage_rollups",
+                        hourly_buckets = rollup_agg.hourly_entry_count(),
+                        daily_buckets = rollup_agg.daily_entry_count(),
+                        models_daily_buckets = rollup_agg.models_daily_entry_count(),
+                        hourly_affected = hourly,
+                        daily_affected = daily,
+                        models_daily_affected = models_daily,
+                        "franken_batched_usage_rollups_complete"
+                    );
+                }
 
-        // Batched token_daily_stats update
-        if !defer_analytics_updates && !token_stats.is_empty() {
-            let entries = token_stats.expand();
-            let affected = franken_update_token_daily_stats_batched_in_tx(&tx, &entries)?;
-            tracing::debug!(
-                target: "cass::perf::token_daily_stats",
-                raw = token_stats.raw_entry_count(),
-                expanded = entries.len(),
-                affected = affected,
-                "franken_batched_token_stats_update_complete"
-            );
-        }
-
-        // Batch insert message_metrics rows
-        if !defer_analytics_updates && !metrics_entries.is_empty() {
-            let mm_count = metrics_entries.len();
-            let inserted = franken_insert_message_metrics_batched_in_tx(&tx, &metrics_entries)?;
-            tracing::debug!(
-                target: "cass::perf::message_metrics",
-                total = mm_count,
-                inserted = inserted,
-                "franken_batch_message_metrics_insert_complete"
-            );
-        }
-
-        // Flush usage_hourly + usage_daily rollups
-        if !defer_analytics_updates && !rollup_agg.is_empty() {
-            let (hourly, daily, models_daily) =
-                franken_flush_analytics_rollups_in_tx(&tx, &rollup_agg)?;
-            tracing::debug!(
-                target: "cass::perf::usage_rollups",
-                hourly_buckets = rollup_agg.hourly_entry_count(),
-                daily_buckets = rollup_agg.daily_entry_count(),
-                models_daily_buckets = rollup_agg.models_daily_entry_count(),
-                hourly_affected = hourly,
-                daily_affected = daily,
-                models_daily_affected = models_daily,
-                "franken_batched_usage_rollups_complete"
-            );
-        }
-
-        // Update conversation-level token summaries
-        if !defer_analytics_updates {
-            for conv_id in &conv_ids_to_summarize {
-                franken_update_conversation_token_summaries_in_tx(&tx, *conv_id)?;
-            }
-        }
-
-        tx.commit()?;
+                // Update conversation-level token summaries
+                if !defer_analytics_updates {
+                    for conv_id in &conv_ids_to_summarize {
+                        franken_update_conversation_token_summaries_in_tx(tx, *conv_id)?;
+                    }
+                }
+                    Ok(outcomes)
+                })()
+                .map_err(anyhow_error_into_storage_error)
+            },
+        )?;
 
         pricing_diag.log_summary();
 
@@ -12397,7 +10481,7 @@ impl FrankenStorage {
 // FrankenStorage transaction helper functions
 // =========================================================================
 
-/// Get last_insert_rowid from a frankensqlite transaction.
+/// Get last_insert_rowid from a legacy embedded engine transaction.
 fn franken_last_rowid(tx: &FrankenTransaction<'_>) -> Result<i64> {
     // Task A4a: `api::Tx::last_insert_rowid` returns a bare `i64` (it cannot fail),
     // unlike the compat `Transaction::last_insert_rowid() -> Result<i64, FrankenError>`
@@ -12413,7 +10497,7 @@ fn franken_last_rowid(tx: &FrankenTransaction<'_>) -> Result<i64> {
 /// Bug #167: Ensure all agents referenced by a batch exist within the
 /// transaction.  The caller already resolved `agent_id` values via
 /// `ensure_agent` outside the transaction, but those autocommit writes may
-/// not be visible inside a frankensqlite transaction snapshot.  This function
+/// not be visible inside a legacy embedded engine transaction snapshot.  This function
 /// checks each unique agent_id and creates a stub row if it's missing.
 fn ensure_agents_in_tx(
     tx: &FrankenTransaction<'_>,
@@ -13010,7 +11094,7 @@ fn franken_insert_conversation_or_get_existing_after_miss(
     }
 }
 
-/// Insert a conversation into the DB within a frankensqlite transaction.
+/// Insert a conversation into the DB within a legacy embedded engine transaction.
 ///
 /// Uses a plain `INSERT` so the common miss path stays on the slim direct
 /// insert lane. Duplicate provenance conflicts are converted into `Ok(None)`
@@ -13184,7 +11268,7 @@ fn franken_message_insert_payload(msg: &Message) -> Result<MessageInsertPayload<
 /// `SQLITE_MAX_VARIABLE_NUMBER` limit of 999 while still amortizing parse cost.
 const MESSAGE_INSERT_BATCH_SIZE: usize = 100;
 
-/// Append workloads profile fastest with larger chunks on current frankensqlite.
+/// Append workloads profile fastest with larger chunks on current the legacy embedded engine.
 ///
 /// After the tail-state hot table removed conversation-row rewrites from the
 /// append path, 50-row chunks beat the old 20-row setting on the append-merge
@@ -13440,7 +11524,7 @@ fn franken_batch_insert_new_messages_with_profile_batch_size(
     Ok(inserted_ids)
 }
 
-/// Insert snippets within a frankensqlite transaction.
+/// Insert snippets within a legacy embedded engine transaction.
 fn franken_insert_snippets(
     tx: &FrankenTransaction<'_>,
     message_id: i64,
@@ -13838,7 +11922,7 @@ fn franken_collect_batched_existing_new_messages<'a>(
     ))
 }
 
-/// Batch insert FTS5 entries within a frankensqlite transaction.
+/// Batch insert FTS5 entries within a legacy embedded engine transaction.
 fn franken_batch_insert_fts(
     storage: &FrankenStorage,
     tx: &FrankenTransaction<'_>,
@@ -13906,7 +11990,7 @@ fn franken_batch_insert_fts(
                     tracing::warn!(
                         error = %err,
                         chunk_docs = chunk.len(),
-                        "frankensqlite FTS batch insert failed; skipping db-resident FTS maintenance because Tantivy is authoritative"
+                        "the legacy embedded engine FTS batch insert failed; skipping db-resident FTS maintenance because Tantivy is authoritative"
                     );
                 }
                 return Ok(inserted);
@@ -13975,7 +12059,7 @@ fn franken_batch_insert_fts_on_connection(
     Ok(inserted)
 }
 
-/// Update daily stats within a frankensqlite transaction.
+/// Update daily stats within a legacy embedded engine transaction.
 fn franken_update_daily_stats_in_tx(
     storage: &FrankenStorage,
     tx: &FrankenTransaction<'_>,
@@ -14164,7 +12248,7 @@ fn franken_apply_daily_stats_delta_in_tx(
 // Frankensqlite batch helpers
 // -------------------------------------------------------------------------
 
-/// Batch upsert daily_stats within a frankensqlite transaction.
+/// Batch upsert daily_stats within a legacy embedded engine transaction.
 fn franken_update_daily_stats_batched_in_tx(
     tx: &FrankenTransaction<'_>,
     entries: &[(i64, String, String, StatsDelta)],
@@ -14173,6 +12257,7 @@ fn franken_update_daily_stats_batched_in_tx(
         tx,
         entries,
         DailyStatsBatchTarget::Canonical,
+        FrankenStorage::now_millis(),
     )
 }
 
@@ -14211,18 +12296,18 @@ fn franken_update_daily_stats_batched_in_tx_for_target(
     tx: &FrankenTransaction<'_>,
     entries: &[(i64, String, String, StatsDelta)],
     target: DailyStatsBatchTarget,
+    now: i64,
 ) -> Result<usize> {
     if entries.is_empty() {
         return Ok(0);
     }
 
-    let now = FrankenStorage::now_millis();
     let mut total_affected = 0;
     let upsert_sql = target.upsert_sql();
 
-    // Keep frankensqlite UPSERTs row-wise inside the transaction. The
+    // Keep the legacy embedded engine UPSERTs row-wise inside the transaction. The
     // multi-row VALUES ... ON CONFLICT form still falls back through
-    // INSERT...SELECT in fsqlite-core, which rejects UPSERT/RETURNING during
+    // INSERT...SELECT in the legacy engine crate-core, which rejects UPSERT/RETURNING during
     // real cass indexing.
     for (day_id, agent, source, delta) in entries {
         total_affected += tx.execute(
@@ -14242,9 +12327,9 @@ fn franken_update_daily_stats_batched_in_tx_for_target(
     Ok(total_affected)
 }
 
-/// Batch insert token_usage rows within a frankensqlite transaction.
+/// Batch insert token_usage rows within a legacy embedded engine transaction.
 ///
-/// Uses row-wise INSERT OR IGNORE to avoid the frankensqlite limitation where
+/// Uses row-wise INSERT OR IGNORE to avoid the legacy embedded engine limitation where
 /// multi-row VALUES lists fall through to INSERT...SELECT, which rejects
 /// UPSERT/OR IGNORE conflict clauses.
 fn franken_insert_token_usage_batched_in_tx(
@@ -14303,16 +12388,27 @@ fn franken_insert_token_usage_batched_in_tx(
     Ok(total_inserted)
 }
 
-/// Batch upsert token_daily_stats within a frankensqlite transaction.
+/// Batch upsert token_daily_stats within a legacy embedded engine transaction.
+///
+/// w1b Task B9 (2026-08-27, control-plane ruling): `last_updated` here is
+/// deliberately restamped on every batch, same reasoning as
+/// `franken_flush_rollup_table`'s comment (usage_hourly/usage_daily) --
+/// `src/analytics/query.rs`'s `is_recently_updated` reads
+/// `token_daily_stats.last_updated` as Track B's staleness heartbeat
+/// (`track_b_fresh`), so making the restamp conditional on "did the
+/// aggregate values change" would make a freshly-reverified, unchanged
+/// table look stale to that consumer. Only `daily_stats`'s publish step
+/// (a consumer-free table, per that function's own comment) got the
+/// compare-then-write treatment; keep this one blind.
 fn franken_update_token_daily_stats_batched_in_tx(
     tx: &FrankenTransaction<'_>,
     entries: &[(i64, String, String, String, TokenStatsDelta)],
+    now: i64,
 ) -> Result<usize> {
     if entries.is_empty() {
         return Ok(0);
     }
 
-    let now = FrankenStorage::now_millis();
     let mut total_affected = 0;
 
     for (day_id, agent, source, model, delta) in entries {
@@ -14369,9 +12465,9 @@ fn franken_update_token_daily_stats_batched_in_tx(
     Ok(total_affected)
 }
 
-/// Batch insert message_metrics rows within a frankensqlite transaction.
+/// Batch insert message_metrics rows within a legacy embedded engine transaction.
 ///
-/// Uses row-wise INSERT OR IGNORE to avoid the frankensqlite limitation where
+/// Uses row-wise INSERT OR IGNORE to avoid the legacy embedded engine limitation where
 /// multi-row VALUES lists fall through to INSERT...SELECT, which rejects
 /// UPSERT/OR IGNORE conflict clauses.
 fn franken_insert_message_metrics_batched_in_tx(
@@ -14432,7 +12528,21 @@ fn franken_insert_message_metrics_batched_in_tx(
     Ok(total_inserted)
 }
 
-/// Flush one rollup table (shared logic for hourly + daily) within a frankensqlite transaction.
+/// Flush one rollup table (shared logic for hourly + daily) within a legacy embedded engine transaction.
+///
+/// w1b Task B9 (2026-08-27, control-plane ruling): `last_updated` here is
+/// deliberately restamped on every flush, unlike `daily_stats`'s publish
+/// step (see that function's own comment for the paired case this was
+/// split from). `usage_hourly`/`usage_daily`'s `last_updated` is read as a
+/// staleness heartbeat by `src/analytics/query.rs`'s `is_recently_updated`
+/// (feeding `track_a_fresh`/`track_b_fresh`, which drive the
+/// `track_freshness_mismatch` drift signal and `recommended_action:
+/// rebuild_track_a/b`) -- making this table's restamping conditional on
+/// "did the aggregate values actually change" would make a table that was
+/// just re-verified healthy (rebuilt, nothing drifted) look stale to that
+/// consumer, which is the opposite of what it means to answer. Keep the
+/// blind stamp here; do not "clean up" this asymmetry with `daily_stats`
+/// without re-checking that consumer first.
 fn franken_flush_rollup_table(
     tx: &FrankenTransaction<'_>,
     table: &str,
@@ -14512,7 +12622,7 @@ fn franken_flush_rollup_table(
     Ok(total_affected)
 }
 
-/// Flush usage_models_daily rollup within a frankensqlite transaction.
+/// Flush usage_models_daily rollup within a legacy embedded engine transaction.
 fn franken_flush_model_daily_rollup_table(
     tx: &FrankenTransaction<'_>,
     deltas: &HashMap<(i64, String, i64, String, String, String), UsageRollupDelta>,
@@ -14583,13 +12693,12 @@ fn franken_flush_model_daily_rollup_table(
     Ok(total_affected)
 }
 
-/// Flush AnalyticsRollupAggregator deltas via frankensqlite transaction.
+/// Flush AnalyticsRollupAggregator deltas via the legacy embedded engine transaction.
 fn franken_flush_analytics_rollups_in_tx(
     tx: &FrankenTransaction<'_>,
     agg: &AnalyticsRollupAggregator,
+    now: i64,
 ) -> Result<(usize, usize, usize)> {
-    let now = FrankenStorage::now_millis();
-
     let hourly_affected =
         franken_flush_rollup_table(tx, "usage_hourly", "hour_id", &agg.hourly, now)?;
     let daily_affected = franken_flush_rollup_table(tx, "usage_daily", "day_id", &agg.daily, now)?;
@@ -14598,7 +12707,7 @@ fn franken_flush_analytics_rollups_in_tx(
     Ok((hourly_affected, daily_affected, models_daily_affected))
 }
 
-/// Update conversation-level token summary columns via frankensqlite transaction.
+/// Update conversation-level token summary columns via the legacy embedded engine transaction.
 fn franken_update_conversation_token_summaries_in_tx(
     tx: &FrankenTransaction<'_>,
     conversation_id: i64,
@@ -15020,8 +13129,18 @@ pub(crate) fn franken_operation_commit_receipt_exists(
 ///
 /// 规模说明：它扫全表 `message_metrics`。restore 的量级下可接受；若将来要按会话增量
 /// 重算，那是另一个函数，不是把这个改成半增量 —— 半增量会重新引入「删旧没扣干净」。
+///
+/// `now_ms`（w1b Task B9，2026-08-27，控制面终裁）：唯一调用方是 W1 restore 的
+/// `recompute_materialized_aggregates_after_commit`，本函数没有生产索引主链路的
+/// 第二调用方，故不需要保留零参外壳——直接要求调用方显式传入 restore 驱动记在
+/// journal 里的确定性时间戳（首跑与 recover 两条路径共用同一个值，`usage_hourly`/
+/// `usage_daily`/`usage_models_daily` 的 `last_updated` 两次盖同一个章，digest 不再
+/// 因 recover 重跑而漂移，同时 `src/analytics/query.rs` 的 `is_recently_updated`
+/// 心跳消费点分毫未动——见 [`FrankenStorage::rebuild_daily_stats_with_timestamp`]
+/// 的完整裁决记录）。
 pub(crate) fn franken_recompute_usage_rollups_from_message_metrics(
     storage: &FrankenStorage,
+    now_ms: i64,
 ) -> Result<usize> {
     let entries: Vec<MessageMetricsEntry> = storage.conn.query_all_map(
         "SELECT message_id, created_at_ms, hour_id, day_id, agent_slug, workspace_id,
@@ -15067,12 +13186,17 @@ pub(crate) fn franken_recompute_usage_rollups_from_message_metrics(
         agg.record(entry);
     }
 
-    let mut tx = storage.conn.transaction()?;
-    for table in ["usage_hourly", "usage_daily", "usage_models_daily"] {
-        tx.execute(&format!("DELETE FROM {table}"), fparams![])?;
-    }
-    let (hourly, daily, models_daily) = franken_flush_analytics_rollups_in_tx(&tx, &agg)?;
-    tx.commit()?;
+    // w1b Task B3 (D2): with_tx, TxMode::Immediate.
+    let (hourly, daily, models_daily) =
+        storage.conn.with_tx(TxMode::Immediate, |tx| -> Result<(usize, usize, usize), StorageError> {
+            (|| -> Result<(usize, usize, usize)> {
+                for table in ["usage_hourly", "usage_daily", "usage_models_daily"] {
+                    tx.execute(&format!("DELETE FROM {table}"), fparams![])?;
+                }
+                franken_flush_analytics_rollups_in_tx(tx, &agg, now_ms)
+            })()
+            .map_err(anyhow_error_into_storage_error)
+        })?;
 
     Ok(hourly + daily + models_daily)
 }
@@ -15222,6 +13346,19 @@ fn replace_derived_rows_for_message(
 impl FrankenStorage {
     /// Rebuild token_daily_stats from the token_usage ledger.
     pub fn rebuild_token_daily_stats(&self) -> Result<usize> {
+        self.rebuild_token_daily_stats_with_timestamp(Self::now_millis())
+    }
+
+    /// Same as [`Self::rebuild_token_daily_stats`], but the caller supplies
+    /// the `last_updated` timestamp -- see
+    /// [`Self::rebuild_daily_stats_with_timestamp`]'s doc comment for why
+    /// this variant exists (W1 restore crash-recovery replay determinism).
+    /// `token_daily_stats.last_updated` deliberately keeps the blind-
+    /// restamp semantics (`franken_update_token_daily_stats_batched_in_tx`'s
+    /// comment: it is Track B's staleness heartbeat consumer in
+    /// `src/analytics/query.rs`) -- this only pins WHICH timestamp gets
+    /// written on a restore replay, it does not skip the write.
+    pub(crate) fn rebuild_token_daily_stats_with_timestamp(&self, now_ms: i64) -> Result<usize> {
         const CONVERSATION_BATCH_SIZE: usize = 1_000;
         const TOKEN_USAGE_BATCH_SIZE: usize = 10_000;
 
@@ -15236,142 +13373,159 @@ impl FrankenStorage {
             "token_daily_stats_rebuild_start"
         );
 
-        let mut tx = self.conn.transaction()?;
-        tx.execute("DELETE FROM token_daily_stats", &[])?;
+        // w1b Task B3 (D2, control-plane 2026-08-26): with_tx_no_replay,
+        // TxMode::Immediate. Write transactions use Immediate (BEGIN takes
+        // the write lock immediately), which structurally cannot hit a
+        // mid-transaction Busy{Snapshot} upgrade conflict -- only a
+        // Busy{Statement} at BEGIN, already covered by statement-level
+        // retry. So there is nothing for with_tx's replay to actually
+        // catch here, only cost: this loop scans every conversation and
+        // every token_usage row in the database, and a replay would mean
+        // redoing that whole scan. no_replay makes "this transaction
+        // shouldn't be replayed" the explicit, load-bearing choice it is,
+        // not an accident of Busy{Snapshot} happening not to fire today.
+        let rows_created = self.conn.with_tx_no_replay(
+            TxMode::Immediate,
+            |tx| -> Result<usize, StorageError> {
+                (|| -> Result<usize> {
+                    tx.execute("DELETE FROM token_daily_stats", &[])?;
 
-        let mut last_conversation_id = 0_i64;
-        let mut rows_created = 0_usize;
+                    let mut last_conversation_id = 0_i64;
+                    let mut rows_created = 0_usize;
 
-        loop {
-            let conversation_rows = tx.query_all_map(
-                "SELECT c.id, c.started_at, c.source_id,
-                        COALESCE((SELECT a.slug FROM agents a WHERE a.id = c.agent_id), 'unknown')
-                 FROM conversations c
-                 WHERE c.id > ?1
-                 ORDER BY c.id
-                 LIMIT ?2",
-                fparams![last_conversation_id, CONVERSATION_BATCH_SIZE as i64],
-                |row| {
-                    Ok((
-                        row.get_typed::<i64>(0)?,
-                        row.get_typed::<Option<i64>>(1)?,
-                        row.get_typed::<String>(2)?,
-                        row.get_typed::<String>(3)?,
-                    ))
-                },
-            )?;
-            if conversation_rows.is_empty() {
-                break;
-            }
-
-            let mut aggregate = TokenStatsAggregator::new();
-
-            for (conversation_id, started_at, source_id, agent_slug) in conversation_rows {
-                last_conversation_id = conversation_id;
-                let conversation_day_id = started_at.map(Self::day_id_from_millis).unwrap_or(0);
-                let mut last_token_usage_id = 0_i64;
-                let mut session_model_family = String::from("unknown");
-
-                loop {
-                    let usage_rows = tx.query_all_map(
-                        "SELECT id, day_id, role,
-                                COALESCE(model_family, 'unknown'),
-                                input_tokens, output_tokens, cache_read_tokens,
-                                cache_creation_tokens, thinking_tokens,
-                                has_tool_calls, tool_call_count,
-                                content_chars, estimated_cost_usd
-                         FROM token_usage
-                         WHERE conversation_id = ?1
-                           AND id > ?2
-                         ORDER BY id
-                         LIMIT ?3",
-                        fparams![
-                            conversation_id,
-                            last_token_usage_id,
-                            TOKEN_USAGE_BATCH_SIZE as i64
-                        ],
+                    loop {
+                    let conversation_rows = tx.query_all_map(
+                        "SELECT c.id, c.started_at, c.source_id,
+                                COALESCE((SELECT a.slug FROM agents a WHERE a.id = c.agent_id), 'unknown')
+                         FROM conversations c
+                         WHERE c.id > ?1
+                         ORDER BY c.id
+                         LIMIT ?2",
+                        fparams![last_conversation_id, CONVERSATION_BATCH_SIZE as i64],
                         |row| {
                             Ok((
                                 row.get_typed::<i64>(0)?,
-                                row.get_typed::<i64>(1)?,
+                                row.get_typed::<Option<i64>>(1)?,
                                 row.get_typed::<String>(2)?,
                                 row.get_typed::<String>(3)?,
-                                row.get_typed::<Option<i64>>(4)?,
-                                row.get_typed::<Option<i64>>(5)?,
-                                row.get_typed::<Option<i64>>(6)?,
-                                row.get_typed::<Option<i64>>(7)?,
-                                row.get_typed::<Option<i64>>(8)?,
-                                row.get_typed::<i64>(9)?,
-                                row.get_typed::<i64>(10)?,
-                                row.get_typed::<i64>(11)?,
-                                row.get_typed::<Option<f64>>(12)?,
                             ))
                         },
                     )?;
-                    if usage_rows.is_empty() {
+                    if conversation_rows.is_empty() {
                         break;
                     }
 
-                    for (
-                        token_usage_id,
-                        day_id,
-                        role,
-                        model_family,
-                        input_tokens,
-                        output_tokens,
-                        cache_read_tokens,
-                        cache_creation_tokens,
-                        thinking_tokens,
-                        has_tool_calls,
-                        tool_call_count,
-                        content_chars,
-                        estimated_cost_usd,
-                    ) in usage_rows
-                    {
-                        last_token_usage_id = token_usage_id;
-                        if model_family != "unknown" {
-                            session_model_family = model_family.clone();
+                    let mut aggregate = TokenStatsAggregator::new();
+
+                    for (conversation_id, started_at, source_id, agent_slug) in conversation_rows {
+                        last_conversation_id = conversation_id;
+                        let conversation_day_id = started_at.map(Self::day_id_from_millis).unwrap_or(0);
+                        let mut last_token_usage_id = 0_i64;
+                        let mut session_model_family = String::from("unknown");
+
+                        loop {
+                            let usage_rows = tx.query_all_map(
+                                "SELECT id, day_id, role,
+                                        COALESCE(model_family, 'unknown'),
+                                        input_tokens, output_tokens, cache_read_tokens,
+                                        cache_creation_tokens, thinking_tokens,
+                                        has_tool_calls, tool_call_count,
+                                        content_chars, estimated_cost_usd
+                                 FROM token_usage
+                                 WHERE conversation_id = ?1
+                                   AND id > ?2
+                                 ORDER BY id
+                                 LIMIT ?3",
+                                fparams![
+                                    conversation_id,
+                                    last_token_usage_id,
+                                    TOKEN_USAGE_BATCH_SIZE as i64
+                                ],
+                                |row| {
+                                    Ok((
+                                        row.get_typed::<i64>(0)?,
+                                        row.get_typed::<i64>(1)?,
+                                        row.get_typed::<String>(2)?,
+                                        row.get_typed::<String>(3)?,
+                                        row.get_typed::<Option<i64>>(4)?,
+                                        row.get_typed::<Option<i64>>(5)?,
+                                        row.get_typed::<Option<i64>>(6)?,
+                                        row.get_typed::<Option<i64>>(7)?,
+                                        row.get_typed::<Option<i64>>(8)?,
+                                        row.get_typed::<i64>(9)?,
+                                        row.get_typed::<i64>(10)?,
+                                        row.get_typed::<i64>(11)?,
+                                        row.get_typed::<Option<f64>>(12)?,
+                                    ))
+                                },
+                            )?;
+                            if usage_rows.is_empty() {
+                                break;
+                            }
+
+                            for (
+                                token_usage_id,
+                                day_id,
+                                role,
+                                model_family,
+                                input_tokens,
+                                output_tokens,
+                                cache_read_tokens,
+                                cache_creation_tokens,
+                                thinking_tokens,
+                                has_tool_calls,
+                                tool_call_count,
+                                content_chars,
+                                estimated_cost_usd,
+                            ) in usage_rows
+                            {
+                                last_token_usage_id = token_usage_id;
+                                if model_family != "unknown" {
+                                    session_model_family = model_family.clone();
+                                }
+                                let usage = crate::connectors::ExtractedTokenUsage {
+                                    model_name: None,
+                                    provider: None,
+                                    input_tokens,
+                                    output_tokens,
+                                    cache_read_tokens,
+                                    cache_creation_tokens,
+                                    thinking_tokens,
+                                    service_tier: None,
+                                    has_tool_calls: has_tool_calls != 0,
+                                    tool_call_count: u32::try_from(tool_call_count.max(0)).unwrap_or(0),
+                                    data_source: franken_agent_detection::TokenDataSource::Api,
+                                };
+                                aggregate.record(
+                                    &agent_slug,
+                                    &source_id,
+                                    day_id,
+                                    &model_family,
+                                    &role,
+                                    &usage,
+                                    content_chars,
+                                    estimated_cost_usd.unwrap_or(0.0),
+                                );
+                            }
                         }
-                        let usage = crate::connectors::ExtractedTokenUsage {
-                            model_name: None,
-                            provider: None,
-                            input_tokens,
-                            output_tokens,
-                            cache_read_tokens,
-                            cache_creation_tokens,
-                            thinking_tokens,
-                            service_tier: None,
-                            has_tool_calls: has_tool_calls != 0,
-                            tool_call_count: u32::try_from(tool_call_count.max(0)).unwrap_or(0),
-                            data_source: franken_agent_detection::TokenDataSource::Api,
-                        };
-                        aggregate.record(
+
+                        aggregate.record_session(
                             &agent_slug,
                             &source_id,
-                            day_id,
-                            &model_family,
-                            &role,
-                            &usage,
-                            content_chars,
-                            estimated_cost_usd.unwrap_or(0.0),
+                            conversation_day_id,
+                            &session_model_family,
                         );
                     }
+
+                    let entries = aggregate.expand();
+                    rows_created = rows_created.saturating_add(entries.len());
+                    franken_update_token_daily_stats_batched_in_tx(tx, &entries, now_ms)?;
                 }
-
-                aggregate.record_session(
-                    &agent_slug,
-                    &source_id,
-                    conversation_day_id,
-                    &session_model_family,
-                );
-            }
-
-            let entries = aggregate.expand();
-            rows_created = rows_created.saturating_add(entries.len());
-            franken_update_token_daily_stats_batched_in_tx(&tx, &entries)?;
-        }
-
-        tx.commit()?;
+                    Ok(rows_created)
+                })()
+                .map_err(anyhow_error_into_storage_error)
+            },
+        )?;
 
         tracing::info!(
             target: "cass::analytics",
@@ -15398,184 +13552,203 @@ impl FrankenStorage {
             "analytics_rebuild_start"
         );
 
-        let mut tx = self.conn.transaction()?;
+        // w1b Task B3 (D2, control-plane 2026-08-26): with_tx_no_replay,
+        // TxMode::Immediate -- same reasoning as rebuild_token_daily_stats
+        // just above: Immediate structurally rules out a mid-transaction
+        // Busy{Snapshot} conflict, so replay has nothing to catch here,
+        // only the cost of redoing a full messages-table scan.
+        let (total_inserted, usage_hourly_rows, usage_daily_rows, usage_models_daily_rows) =
+            self.conn.with_tx_no_replay(
+                TxMode::Immediate,
+                |tx| -> Result<(usize, usize, usize, usize), StorageError> {
+                    (|| -> Result<(usize, usize, usize, usize)> {
+                tx.execute("DELETE FROM message_metrics", &[])?;
+                tx.execute("DELETE FROM usage_hourly", &[])?;
+                tx.execute("DELETE FROM usage_daily", &[])?;
+                tx.execute("DELETE FROM usage_models_daily", &[])?;
 
-        tx.execute("DELETE FROM message_metrics", &[])?;
-        tx.execute("DELETE FROM usage_hourly", &[])?;
-        tx.execute("DELETE FROM usage_daily", &[])?;
-        tx.execute("DELETE FROM usage_models_daily", &[])?;
+                const CHUNK_SIZE: i64 = 10_000;
+                let mut offset: i64 = 0;
+                let mut total_inserted: usize = 0;
+                let mut usage_hourly_rows: usize = 0;
+                let mut usage_daily_rows: usize = 0;
+                let mut usage_models_daily_rows: usize = 0;
 
-        const CHUNK_SIZE: i64 = 10_000;
-        let mut offset: i64 = 0;
-        let mut total_inserted: usize = 0;
-        let mut usage_hourly_rows: usize = 0;
-        let mut usage_daily_rows: usize = 0;
-        let mut usage_models_daily_rows: usize = 0;
+                loop {
+                    #[allow(clippy::type_complexity)]
+                    let rows: Vec<(
+                        i64,
+                        String,
+                        String,
+                        Option<serde_json::Value>,
+                        Option<i64>,
+                        Option<i64>,
+                        String,
+                        Option<i64>,
+                        String,
+                    )> = tx.query_all_map(
+                        // Avoid the 3-table JOIN with LIMIT/OFFSET that triggers
+                        // the legacy embedded engine's materialization fallback (see 860acb12).
+                        // Inline the agent slug lookup as a correlated subquery and
+                        // fall back to 'unknown' for NULL agent_id, matching the
+                        // FTS / lexical rebuild paths.
+                        "SELECT m.id, m.idx, m.role, m.content, m.extra_json, m.extra_bin,
+                                m.created_at,
+                                c.id AS conv_id, c.started_at AS conv_started_at,
+                                c.source_id, c.workspace_id,
+                                COALESCE((SELECT a.slug FROM agents a WHERE a.id = c.agent_id), 'unknown') AS agent_slug
+                         FROM messages m
+                         JOIN conversations c ON m.conversation_id = c.id
+                         ORDER BY m.id
+                         LIMIT ?1 OFFSET ?2",
+                        fparams![CHUNK_SIZE, offset],
+                        |row| {
+                            let msg_id: i64 = row.get_typed(0)?;
+                            let role: String = row.get_typed(2)?;
+                            let content: String = row.get_typed(3)?;
+                            let extra_json = row
+                                .get_typed::<Option<String>>(4)?
+                                .and_then(|s| serde_json::from_str(&s).ok())
+                                .or_else(|| {
+                                    row.get_typed::<Option<Vec<u8>>>(5)
+                                        .ok()
+                                        .flatten()
+                                        .and_then(|b| rmp_serde::from_slice(&b).ok())
+                                });
+                            let msg_ts: Option<i64> = row.get_typed(6)?;
+                            let conv_started_at: Option<i64> = row.get_typed(8)?;
+                            let source_id: String = row.get_typed(9)?;
+                            let workspace_id: Option<i64> = row.get_typed(10)?;
+                            let agent_slug: String = row.get_typed(11)?;
+                            let effective_ts = msg_ts.or(conv_started_at).unwrap_or(0);
 
-        loop {
-            #[allow(clippy::type_complexity)]
-            let rows: Vec<(
-                i64,
-                String,
-                String,
-                Option<serde_json::Value>,
-                Option<i64>,
-                Option<i64>,
-                String,
-                Option<i64>,
-                String,
-            )> = tx.query_all_map(
-                // Avoid the 3-table JOIN with LIMIT/OFFSET that triggers
-                // frankensqlite's materialization fallback (see 860acb12).
-                // Inline the agent slug lookup as a correlated subquery and
-                // fall back to 'unknown' for NULL agent_id, matching the
-                // FTS / lexical rebuild paths.
-                "SELECT m.id, m.idx, m.role, m.content, m.extra_json, m.extra_bin,
-                        m.created_at,
-                        c.id AS conv_id, c.started_at AS conv_started_at,
-                        c.source_id, c.workspace_id,
-                        COALESCE((SELECT a.slug FROM agents a WHERE a.id = c.agent_id), 'unknown') AS agent_slug
-                 FROM messages m
-                 JOIN conversations c ON m.conversation_id = c.id
-                 ORDER BY m.id
-                 LIMIT ?1 OFFSET ?2",
-                fparams![CHUNK_SIZE, offset],
-                |row| {
-                    let msg_id: i64 = row.get_typed(0)?;
-                    let role: String = row.get_typed(2)?;
-                    let content: String = row.get_typed(3)?;
-                    let extra_json = row
-                        .get_typed::<Option<String>>(4)?
-                        .and_then(|s| serde_json::from_str(&s).ok())
-                        .or_else(|| {
-                            row.get_typed::<Option<Vec<u8>>>(5)
-                                .ok()
-                                .flatten()
-                                .and_then(|b| rmp_serde::from_slice(&b).ok())
-                        });
-                    let msg_ts: Option<i64> = row.get_typed(6)?;
-                    let conv_started_at: Option<i64> = row.get_typed(8)?;
-                    let source_id: String = row.get_typed(9)?;
-                    let workspace_id: Option<i64> = row.get_typed(10)?;
-                    let agent_slug: String = row.get_typed(11)?;
-                    let effective_ts = msg_ts.or(conv_started_at).unwrap_or(0);
+                            Ok((
+                                msg_id,
+                                role,
+                                content,
+                                extra_json,
+                                Some(effective_ts),
+                                workspace_id,
+                                source_id,
+                                conv_started_at,
+                                agent_slug,
+                            ))
+                        },
+                    )?;
 
-                    Ok((
+                    if rows.is_empty() {
+                        break;
+                    }
+
+                    let chunk_len = rows.len();
+                    let mut entries = Vec::with_capacity(chunk_len);
+                    let mut rollup_agg = AnalyticsRollupAggregator::new();
+
+                    for (
                         msg_id,
                         role,
                         content,
                         extra_json,
-                        Some(effective_ts),
+                        effective_ts,
                         workspace_id,
                         source_id,
-                        conv_started_at,
+                        _conv_started_at,
                         agent_slug,
-                    ))
+                    ) in &rows
+                    {
+                        let ts = effective_ts.unwrap_or(0);
+                        let day_id = Self::day_id_from_millis(ts);
+                        let hour_id = Self::hour_id_from_millis(ts);
+                        let content_chars = content.len() as i64;
+                        let content_tokens_est = content_chars / 4;
+                        let extra = extra_json
+                            .as_ref()
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
+                        let usage =
+                            crate::connectors::extract_tokens_for_agent(agent_slug, &extra, content, role);
+                        let model_info = usage
+                            .model_name
+                            .as_deref()
+                            .map(crate::connectors::normalize_model);
+                        let model_family = model_info
+                            .as_ref()
+                            .map(|i| i.family.clone())
+                            .unwrap_or_else(|| "unknown".into());
+                        let model_tier = model_info
+                            .as_ref()
+                            .map(|i| i.tier.clone())
+                            .unwrap_or_else(|| "unknown".into());
+                        let provider = usage
+                            .provider
+                            .clone()
+                            .or_else(|| model_info.as_ref().map(|i| i.provider.clone()))
+                            .unwrap_or_else(|| "unknown".into());
+
+                        let entry = MessageMetricsEntry {
+                            message_id: *msg_id,
+                            created_at_ms: ts,
+                            hour_id,
+                            day_id,
+                            agent_slug: agent_slug.clone(),
+                            workspace_id: workspace_id.unwrap_or(0),
+                            source_id: source_id.clone(),
+                            role: role.clone(),
+                            content_chars,
+                            content_tokens_est,
+                            model_name: usage.model_name.clone(),
+                            model_family,
+                            model_tier,
+                            provider,
+                            api_input_tokens: usage.input_tokens,
+                            api_output_tokens: usage.output_tokens,
+                            api_cache_read_tokens: usage.cache_read_tokens,
+                            api_cache_creation_tokens: usage.cache_creation_tokens,
+                            api_thinking_tokens: usage.thinking_tokens,
+                            api_service_tier: usage.service_tier,
+                            api_data_source: usage.data_source.as_str().to_string(),
+                            tool_call_count: usage.tool_call_count as i64,
+                            has_tool_calls: usage.has_tool_calls,
+                            has_plan: has_plan_for_role(role, content),
+                        };
+                        rollup_agg.record(&entry);
+                        entries.push(entry);
+                    }
+
+                    total_inserted += franken_insert_message_metrics_batched_in_tx(tx, &entries)?;
+                    let (hourly, daily, models_daily) = franken_flush_analytics_rollups_in_tx(
+                        tx,
+                        &rollup_agg,
+                        FrankenStorage::now_millis(),
+                    )?;
+                    usage_hourly_rows += hourly;
+                    usage_daily_rows += daily;
+                    usage_models_daily_rows += models_daily;
+                    offset += chunk_len as i64;
+
+                    tracing::debug!(
+                        target: "cass::analytics",
+                        offset,
+                        chunk = chunk_len,
+                        inserted = entries.len(),
+                        total = total_inserted,
+                        "analytics_rebuild_chunk"
+                    );
+
+                    if (chunk_len as i64) < CHUNK_SIZE {
+                        break;
+                    }
+                }
+                        Ok((
+                            total_inserted,
+                            usage_hourly_rows,
+                            usage_daily_rows,
+                            usage_models_daily_rows,
+                        ))
+                    })()
+                    .map_err(anyhow_error_into_storage_error)
                 },
             )?;
-
-            if rows.is_empty() {
-                break;
-            }
-
-            let chunk_len = rows.len();
-            let mut entries = Vec::with_capacity(chunk_len);
-            let mut rollup_agg = AnalyticsRollupAggregator::new();
-
-            for (
-                msg_id,
-                role,
-                content,
-                extra_json,
-                effective_ts,
-                workspace_id,
-                source_id,
-                _conv_started_at,
-                agent_slug,
-            ) in &rows
-            {
-                let ts = effective_ts.unwrap_or(0);
-                let day_id = Self::day_id_from_millis(ts);
-                let hour_id = Self::hour_id_from_millis(ts);
-                let content_chars = content.len() as i64;
-                let content_tokens_est = content_chars / 4;
-                let extra = extra_json
-                    .as_ref()
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                let usage =
-                    crate::connectors::extract_tokens_for_agent(agent_slug, &extra, content, role);
-                let model_info = usage
-                    .model_name
-                    .as_deref()
-                    .map(crate::connectors::normalize_model);
-                let model_family = model_info
-                    .as_ref()
-                    .map(|i| i.family.clone())
-                    .unwrap_or_else(|| "unknown".into());
-                let model_tier = model_info
-                    .as_ref()
-                    .map(|i| i.tier.clone())
-                    .unwrap_or_else(|| "unknown".into());
-                let provider = usage
-                    .provider
-                    .clone()
-                    .or_else(|| model_info.as_ref().map(|i| i.provider.clone()))
-                    .unwrap_or_else(|| "unknown".into());
-
-                let entry = MessageMetricsEntry {
-                    message_id: *msg_id,
-                    created_at_ms: ts,
-                    hour_id,
-                    day_id,
-                    agent_slug: agent_slug.clone(),
-                    workspace_id: workspace_id.unwrap_or(0),
-                    source_id: source_id.clone(),
-                    role: role.clone(),
-                    content_chars,
-                    content_tokens_est,
-                    model_name: usage.model_name.clone(),
-                    model_family,
-                    model_tier,
-                    provider,
-                    api_input_tokens: usage.input_tokens,
-                    api_output_tokens: usage.output_tokens,
-                    api_cache_read_tokens: usage.cache_read_tokens,
-                    api_cache_creation_tokens: usage.cache_creation_tokens,
-                    api_thinking_tokens: usage.thinking_tokens,
-                    api_service_tier: usage.service_tier,
-                    api_data_source: usage.data_source.as_str().to_string(),
-                    tool_call_count: usage.tool_call_count as i64,
-                    has_tool_calls: usage.has_tool_calls,
-                    has_plan: has_plan_for_role(role, content),
-                };
-                rollup_agg.record(&entry);
-                entries.push(entry);
-            }
-
-            total_inserted += franken_insert_message_metrics_batched_in_tx(&tx, &entries)?;
-            let (hourly, daily, models_daily) =
-                franken_flush_analytics_rollups_in_tx(&tx, &rollup_agg)?;
-            usage_hourly_rows += hourly;
-            usage_daily_rows += daily;
-            usage_models_daily_rows += models_daily;
-            offset += chunk_len as i64;
-
-            tracing::debug!(
-                target: "cass::analytics",
-                offset,
-                chunk = chunk_len,
-                inserted = entries.len(),
-                total = total_inserted,
-                "analytics_rebuild_chunk"
-            );
-
-            if (chunk_len as i64) < CHUNK_SIZE {
-                break;
-            }
-        }
-
-        tx.commit()?;
 
         let elapsed = start.elapsed();
         let elapsed_ms = elapsed.as_millis() as u64;
@@ -15608,6 +13781,40 @@ impl FrankenStorage {
 
     /// Rebuild all daily stats from scratch.
     pub fn rebuild_daily_stats(&self) -> Result<DailyStatsRebuildResult> {
+        self.rebuild_daily_stats_with_timestamp(Self::now_millis())
+    }
+
+    /// Same as [`Self::rebuild_daily_stats`], but the caller supplies the
+    /// `last_updated` timestamp instead of it being captured internally
+    /// from the wall clock.
+    ///
+    /// w1b Task B9 (2026-08-27, control-plane ruling, final): W1 restore's
+    /// crash-recovery replay redrives this rebuild unconditionally (journal
+    /// rank is the source of truth for what to redo, and it cannot
+    /// distinguish "genuinely needs a fresh analytics pass" from "already
+    /// did this, just replaying"), so first-run and recovery each captured
+    /// their own, different wall-clock reading here -- purely restamping
+    /// `last_updated` even when every aggregate value came out identical,
+    /// which broke the W1 commit marker's byte-identity (`db_identity.
+    /// sqlite_digest`). The fix is NOT "stop restamping" (see
+    /// `franken_update_daily_stats_batched_in_tx_for_target`'s
+    /// compare-then-write comment for why `daily_stats` alone got that
+    /// treatment, and why usage_hourly/usage_daily/token_daily_stats
+    /// deliberately did not: `src/analytics/query.rs`'s
+    /// `is_recently_updated` reads their `last_updated` as a genuine
+    /// staleness heartbeat). It is "restamp with the SAME timestamp on
+    /// every replay of the SAME logical restore operation" -- the restore
+    /// driver captures one `now_ms` at first run, persists it in the
+    /// journal, and recovery reads that same value back instead of calling
+    /// the wall clock again, so two replays of one operation always agree
+    /// on what "now" meant for it. Every other caller (live indexing,
+    /// tests, `cass doctor --fix`, ...) keeps using
+    /// [`Self::rebuild_daily_stats`] unchanged -- wall-clock semantics
+    /// outside the restore/recover path are exactly as before.
+    pub(crate) fn rebuild_daily_stats_with_timestamp(
+        &self,
+        now_ms: i64,
+    ) -> Result<DailyStatsRebuildResult> {
         const DAILY_STATS_REBUILD_CONVERSATION_BATCH_SIZE: usize = 1_000;
         const DAILY_STATS_REBUILD_MESSAGE_BATCH_SIZE: usize = 10_000;
 
@@ -15685,7 +13892,7 @@ impl FrankenStorage {
         };
 
         loop {
-            // Avoid the 2-table JOIN with LIMIT that triggers frankensqlite's
+            // Avoid the 2-table JOIN with LIMIT that triggers the legacy embedded engine's
             // materialization fallback (which is what the OOM retry below is
             // defending against — see 860acb12).  Inline agent slug via
             // correlated subquery and degrade NULL agent_id to 'unknown' for
@@ -15742,13 +13949,17 @@ impl FrankenStorage {
             let entries = aggregate.expand();
             expanded_entries_flushed += entries.len();
             if !entries.is_empty() {
-                let mut batch_tx = self.conn.transaction()?;
-                franken_update_daily_stats_batched_in_tx_for_target(
-                    &batch_tx,
-                    &entries,
-                    DailyStatsBatchTarget::RebuildStage,
-                )?;
-                batch_tx.commit()?;
+                // w1b Task B3 (D2): with_tx, TxMode::Immediate.
+                self.conn
+                    .with_tx(TxMode::Immediate, |batch_tx| -> Result<usize, StorageError> {
+                        franken_update_daily_stats_batched_in_tx_for_target(
+                            batch_tx,
+                            &entries,
+                            DailyStatsBatchTarget::RebuildStage,
+                            now_ms,
+                        )
+                        .map_err(anyhow_error_into_storage_error)
+                    })?;
             }
             if conversation_batch_count.is_multiple_of(25) {
                 tracing::info!(
@@ -15807,13 +14018,19 @@ impl FrankenStorage {
                     let entries = aggregate.expand();
                     expanded_entries_flushed += entries.len();
                     if !entries.is_empty() {
-                        let mut batch_tx = self.conn.transaction()?;
-                        franken_update_daily_stats_batched_in_tx_for_target(
-                            &batch_tx,
-                            &entries,
-                            DailyStatsBatchTarget::RebuildStage,
+                        // w1b Task B3 (D2): with_tx, TxMode::Immediate.
+                        self.conn.with_tx(
+                            TxMode::Immediate,
+                            |batch_tx| -> Result<usize, StorageError> {
+                                franken_update_daily_stats_batched_in_tx_for_target(
+                                    batch_tx,
+                                    &entries,
+                                    DailyStatsBatchTarget::RebuildStage,
+                                    now_ms,
+                                )
+                                .map_err(anyhow_error_into_storage_error)
+                            },
                         )?;
-                        batch_tx.commit()?;
                     }
                     if message_batch_count.is_multiple_of(50) {
                         tracing::info!(
@@ -15846,16 +14063,75 @@ impl FrankenStorage {
             |row| row.get_typed(0),
         )?;
 
-        let mut publish_tx = self.conn.transaction()?;
-        publish_tx.execute("DELETE FROM daily_stats", &[])?;
-        publish_tx.execute(
-            "INSERT INTO daily_stats (
-                day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated
-             )
-             SELECT day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated
-             FROM daily_stats_rebuild_stage",
-        &[])?;
-        publish_tx.commit()?;
+        // w1b Task B3 (D2): with_tx, TxMode::Immediate. Only reads
+        // daily_stats_rebuild_stage (never writes it), so replaying this on
+        // a real Busy{Snapshot} is safe regardless of how many times it runs.
+        //
+        // w1b Task B9 (2026-08-27, equivalence-gate-caught, control-plane
+        // ruling, daily_stats only -- see rationale on
+        // `franken_update_daily_stats_batched_in_tx_for_target` for why
+        // usage_hourly/usage_daily/token_daily_stats deliberately keep the
+        // old blind-restamp behavior): publish used to be an unconditional
+        // DELETE-then-INSERT, which restamps every row's `last_updated` to
+        // "now" on every rebuild pass regardless of whether its aggregate
+        // values actually changed. That made `daily_stats` un-idempotent at
+        // the byte level -- rerunning a rebuild against unchanged source
+        // content (e.g. W1 restore's crash-recovery replay, which redrives
+        // every phase including analytics rebuild) produced a different
+        // on-disk `daily_stats` even though nothing about the aggregates
+        // was different, which broke the W1 commit marker's
+        // `db_identity.sqlite_digest` (reproduced:
+        // e7_disposition_conservation_holds_on_both_first_run_and_recovery
+        // et al -- first-run vs. recovery digests disagreed purely from
+        // this restamping, not from any real content difference). Now an
+        // UPSERT that preserves the existing `last_updated` whenever the
+        // three aggregate columns are unchanged (only a genuinely different
+        // value gets a fresh stamp), followed by a targeted DELETE for rows
+        // the new stage no longer has (a day/agent/source combination whose
+        // source data was actually removed) -- same end state as the old
+        // wholesale replace, but idempotent when nothing changed.
+        self.conn.with_tx(TxMode::Immediate, |publish_tx| -> Result<(), StorageError> {
+            publish_tx.execute(
+                "INSERT INTO daily_stats (
+                    day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated
+                 )
+                 SELECT day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated
+                 FROM daily_stats_rebuild_stage
+                 -- WHERE TRUE is load-bearing, not decoration: SQLite's
+                 -- grammar cannot parse an upsert-clause after a bare
+                 -- INSERT ... SELECT ... FROM tbl with no WHERE/ORDER/
+                 -- LIMIT (reproduced directly with stock sqlite3: a near-DO
+                 -- syntax error, while the exact same query with a
+                 -- trailing WHERE parses fine); a VALUES(...)-sourced
+                 -- insert has no such restriction, which is why every
+                 -- other upsert in this file (VALUES-sourced) does not
+                 -- need this.
+                 WHERE TRUE
+                 ON CONFLICT(day_id, agent_slug, source_id) DO UPDATE SET
+                     session_count = excluded.session_count,
+                     message_count = excluded.message_count,
+                     total_chars = excluded.total_chars,
+                     last_updated = CASE
+                         WHEN daily_stats.session_count = excluded.session_count
+                          AND daily_stats.message_count = excluded.message_count
+                          AND daily_stats.total_chars = excluded.total_chars
+                         THEN daily_stats.last_updated
+                         ELSE excluded.last_updated
+                     END",
+                &[],
+            )?;
+            publish_tx.execute(
+                "DELETE FROM daily_stats
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM daily_stats_rebuild_stage s
+                     WHERE s.day_id = daily_stats.day_id
+                       AND s.agent_slug = daily_stats.agent_slug
+                       AND s.source_id = daily_stats.source_id
+                 )",
+                &[],
+            )?;
+            Ok(())
+        })?;
         self.conn.execute("DELETE FROM daily_stats_rebuild_stage", &[])?;
 
         tracing::info!(
@@ -16708,7 +14984,7 @@ impl PricingTable {
         Self::franken_load(conn)
     }
 
-    /// Load all pricing entries from a frankensqlite connection.
+    /// Load all pricing entries from a legacy embedded engine connection.
     pub fn franken_load(conn: &FrankenConnection) -> Result<Self> {
         let entries = conn.query_all_map(
             "SELECT model_pattern, provider, input_cost_per_mtok, output_cost_per_mtok,
@@ -16898,7 +15174,7 @@ fn rebuild_batch_size_env(var: &str, default: usize) -> usize {
 /// Returns true when the error chain represents a real `FrankenError::OutOfMemory`
 /// (typed variant) or a bare "out of memory" / "not enough memory" message.
 ///
-/// We *deliberately* do not do substring matching on the rendered chain: frankensqlite's
+/// We *deliberately* do not do substring matching on the rendered chain: the legacy embedded engine's
 /// `FrankenError::OutOfMemory` renders as the literal "out of memory" and is also emitted
 /// for several non-process-OOM internal conditions (VFS buffer / VDBE register allocation).
 /// Contextual messages like "connector parse failed: not enough memory in record" must not
@@ -17046,13 +15322,13 @@ pub struct DailyStatsHealth {
 
 /// Rows per FTS5 INSERT statement during db-resident `fts_messages`
 /// maintenance/rebuild. Each row binds 7 columns (rowid + 6 cols), and
-/// frankensqlite's `MAX_VARIABLE_NUMBER` is 32766, so the hard ceiling is
+/// the legacy embedded engine's `MAX_VARIABLE_NUMBER` is 32766, so the hard ceiling is
 /// 32766 / 7 = 4680 rows per statement; 4096 leaves margin (28672 params).
 ///
 /// This value is performance-critical, NOT just a memory knob
 /// (`coding_agent_session_search-nhqw0` / gh #301): `fts_messages` is a
 /// contentless FTS5 table (`content=''`), which routes every INSERT through
-/// frankensqlite's `persist_rootpage_zero_fts5_shadow_rows` full-table
+/// the legacy embedded engine's `persist_rootpage_zero_fts5_shadow_rows` full-table
 /// re-encode (`build_pending_hash` re-tokenizes *all* rows). The cost of one
 /// INSERT is therefore O(rows-so-far) regardless of the statement's row count,
 /// so the total rebuild cost is (number of INSERT statements) × O(table). The
@@ -17061,7 +15337,7 @@ pub struct DailyStatsHealth {
 /// wedged `cass index --full` above ~15-30 MB of content. Issuing one large
 /// param-safe statement per flush collapses that to a handful of re-encodes.
 /// The asymptotic fix (incremental contentless persistence) is tracked in
-/// frankensqlite bd-sf8dx.
+/// the legacy embedded engine bd-sf8dx.
 const FTS5_BATCH_SIZE: usize = 4096;
 
 #[derive(Debug, Clone)]
@@ -17619,6 +15895,91 @@ mod tests {
         fs2::FileExt::unlock(&lock_file).unwrap();
     }
 
+    /// w1b Task B4 Step 2, dedicated negative case for the M3 "InUse silent
+    /// fallback" hole found during the write-topology inventory
+    /// (`w1b-b4-write-topology-inventory.md` §①): when
+    /// `acquire_cached_ephemeral_writer`'s single cached slot is already
+    /// `InUse`, it does not block/queue -- it silently opens a second real
+    /// writer connection (`sqlite.rs` `acquire_cached_ephemeral_writer`,
+    /// the `CachedEphemeralWriter::InUse` arm). That is the one place in
+    /// the pre-B4 codebase that can genuinely put more than one live
+    /// writer connection on the same path at once. This test pins that
+    /// old-mechanism behavior down with the shared registry
+    /// (`storage::api::writer_connection_peak`), then shows the equivalent
+    /// contention shape through `WriterHandle` never exceeds 1 -- so the
+    /// hole's closure (once production write paths stop calling
+    /// `acquire_cached_ephemeral_writer` directly, per B4 Step 3) has a
+    /// concrete, independent before/after signature instead of just
+    /// "the code that called it got deleted."
+    #[test]
+    fn ephemeral_writer_cache_inuse_fallback_is_the_only_multi_writer_hole_writer_handle_closes() {
+        use crate::storage::api::{Profile, WriterHandle, reset_writer_connection_peak, writer_connection_peak};
+
+        let dir = TempDir::new().unwrap();
+        let old_mechanism_db = dir.path().join("old-mechanism.db");
+        {
+            let storage = FrankenStorage::open(&old_mechanism_db).unwrap();
+            storage.close().unwrap();
+        }
+        // Old behavior (pre-B4 M3): acquire the cached slot once (now
+        // InUse), then acquire again before releasing it. The second call
+        // must NOT block -- it silently opens a second real connection.
+        // Reset *after* opening `storage`'s own primary connection so the
+        // peak below isolates the ephemeral-writer-cache behavior itself,
+        // not the unrelated fact that `storage` also holds a connection.
+        let storage = FrankenStorage::open(&old_mechanism_db).unwrap();
+        reset_writer_connection_peak(&old_mechanism_db);
+        let (writer_one, _reusable_one) = storage.acquire_cached_ephemeral_writer().unwrap();
+        let (writer_two, reusable_two) = storage.acquire_cached_ephemeral_writer().unwrap();
+        assert!(!reusable_two, "second concurrent acquire must not reuse the InUse slot");
+        // 3 live connections: `storage`'s own primary connection (opened
+        // once, above, and still held) plus the two ephemeral writers --
+        // the second of which should never have existed. A caller doing
+        // nothing more exotic than "ask for the writer twice without
+        // releasing it in between" ends up holding 2 *extra* real
+        // connections instead of blocking on the second ask.
+        assert_eq!(
+            writer_connection_peak(&old_mechanism_db),
+            3,
+            "pre-B4 M3 fallback must be observed opening a second live writer connection \
+             on top of the storage handle's own primary connection"
+        );
+        storage.release_cached_ephemeral_writer(writer_one);
+        storage.discard_cached_ephemeral_writer(writer_two);
+        storage.close().unwrap();
+
+        // New behavior (B4 WriterHandle): the same shape of contention --
+        // many callers wanting "the writer" at once, none of them willing
+        // to wait for each other to finish first -- must never be observed
+        // above 1 live connection, because there is structurally only one
+        // writer thread and every submitter blocks on the channel instead
+        // of opening its own connection.
+        let new_mechanism_db = dir.path().join("writer-handle-mechanism.db");
+        reset_writer_connection_peak(&new_mechanism_db);
+        let (handle, join) =
+            WriterHandle::<crate::storage::api::Conn>::spawn(new_mechanism_db.clone(), Profile::Production, Ok)
+                .expect("spawn writer handle");
+        let mut worker_handles = Vec::new();
+        for _ in 0..8 {
+            let handle = handle.clone();
+            worker_handles.push(std::thread::spawn(move || {
+                for _ in 0..10 {
+                    handle.submit(|conn| conn.execute_batch("SELECT 1;")).unwrap();
+                }
+            }));
+        }
+        for w in worker_handles {
+            w.join().unwrap();
+        }
+        assert_eq!(
+            writer_connection_peak(&new_mechanism_db),
+            1,
+            "WriterHandle must hold the invariant even under the InUse-shaped contention above"
+        );
+        drop(handle);
+        join.join().unwrap();
+    }
+
     #[test]
     fn doctor_storage_open_allows_current_doctor_process_probe() {
         use std::io::Write as _;
@@ -17795,79 +16156,17 @@ mod tests {
     // User data file protection tests (bead yln.4)
     // =========================================================================
 
-    #[test]
-    fn is_user_data_file_detects_bookmarks() {
-        assert!(is_user_data_file(Path::new("/data/bookmarks.db")));
-        assert!(is_user_data_file(Path::new("bookmarks.db")));
-    }
 
-    #[test]
-    fn is_user_data_file_detects_tui_state() {
-        assert!(is_user_data_file(Path::new("/data/tui_state.json")));
-    }
 
-    #[test]
-    fn is_user_data_file_detects_sources_toml() {
-        assert!(is_user_data_file(Path::new("/config/sources.toml")));
-    }
 
-    #[test]
-    fn is_user_data_file_detects_env() {
-        assert!(is_user_data_file(Path::new(".env")));
-    }
 
-    #[test]
-    fn is_user_data_file_rejects_other_files() {
-        assert!(!is_user_data_file(Path::new("index.db")));
-        assert!(!is_user_data_file(Path::new("conversations.db")));
-        assert!(!is_user_data_file(Path::new("random.txt")));
-    }
 
     // =========================================================================
     // Backup creation tests (bead yln.4)
     // =========================================================================
 
-    #[test]
-    fn create_backup_returns_none_for_nonexistent() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("nonexistent.db");
-        let result = create_backup(&db_path).unwrap();
-        assert!(result.is_none());
-    }
 
-    #[test]
-    fn create_backup_creates_named_file() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test.db");
-        std::fs::write(&db_path, b"test data").unwrap();
 
-        let backup_path = create_backup(&db_path).unwrap();
-        assert!(backup_path.is_some());
-        let backup = backup_path.unwrap();
-        assert!(backup.exists());
-        assert!(
-            backup
-                .file_name()
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .contains("backup")
-        );
-    }
-
-    #[test]
-    fn create_backup_paths_are_unique() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test.db");
-        std::fs::write(&db_path, b"test data").unwrap();
-
-        let first = create_backup(&db_path).unwrap().unwrap();
-        let second = create_backup(&db_path).unwrap().unwrap();
-
-        assert_ne!(first, second);
-        assert!(first.exists());
-        assert!(second.exists());
-    }
 
     #[test]
     fn lexical_rebuild_messages_query_uses_conversation_idx_access_path() {
@@ -18276,260 +16575,19 @@ mod tests {
         }
     }
 
-    #[test]
-    fn schema_check_rebuild_classification_ignores_transient_errors() {
-        // Task A4a: rewritten from literal `FrankenError` (the original engine crate's error type) variant
-        // construction to the `StorageError` values `map_franken_err`
-        // (backend_franken.rs) now produces for each — same classification intent,
-        // since `schema_check_error_requires_rebuild` operates post-mapping.
-        assert!(!schema_check_error_requires_rebuild(&StorageError::Busy {
-            scope: crate::storage::api::BusyScope::Statement,
-        }));
-        assert!(!schema_check_error_requires_rebuild(&StorageError::Busy {
-            scope: crate::storage::api::BusyScope::Statement,
-        }));
-        assert!(!schema_check_error_requires_rebuild(&StorageError::Other {
-            code: None,
-            detail: "cannot open /tmp/test.db".to_string(),
-        }));
-        assert!(!schema_check_error_requires_rebuild(&StorageError::Other {
-            code: None,
-            detail: "disk hiccup".to_string(),
-        }));
-    }
 
-    #[test]
-    fn schema_check_rebuild_classification_keeps_corruption_errors() {
-        assert!(schema_check_error_requires_rebuild(&StorageError::Corrupt {
-            detail: "bad header".to_string(),
-        }));
-        assert!(schema_check_error_requires_rebuild(&StorageError::Corrupt {
-            detail: "bad wal".to_string(),
-        }));
-        assert!(schema_check_error_requires_rebuild(&StorageError::Corrupt {
-            detail: "not a database: /tmp/test.db".to_string(),
-        }));
-        assert!(schema_check_error_requires_rebuild(&StorageError::Corrupt {
-            detail: "short read: expected 4096, actual 64".to_string(),
-        }));
-    }
 
-    #[test]
-    fn create_backup_refuses_raw_copy_after_retryable_vacuum_errors() {
-        // Task A4a: same rewrite rationale as the two tests above.
-        use crate::storage::api::BusyScope;
-        let retryable_errors = [
-            StorageError::Busy { scope: BusyScope::Statement },
-            StorageError::Busy { scope: BusyScope::Statement },
-            StorageError::Busy { scope: BusyScope::Snapshot },
-            StorageError::Busy { scope: BusyScope::Statement },
-            StorageError::Busy { scope: BusyScope::Statement },
-            StorageError::Busy { scope: BusyScope::Snapshot },
-            StorageError::Busy { scope: BusyScope::Snapshot },
-            // `Internal("database is locked")` mapped to `Other` (not a named
-            // variant), but stayed retryable via the "locked" substring fallback
-            // (`retryable_storage_error_message`) — preserve that path here too.
-            StorageError::Other { code: None, detail: "database is locked".to_string() },
-        ];
 
-        for err in retryable_errors {
-            assert!(
-                backup_vacuum_error_requires_consistent_retry(&err),
-                "retryable VACUUM failure must not fall back to raw bundle copy: {err}"
-            );
-        }
 
-        assert!(!backup_vacuum_error_requires_consistent_retry(&StorageError::Corrupt {
-            detail: "not a database: /tmp/test.db".to_string(),
-        }));
-        assert!(!backup_vacuum_error_requires_consistent_retry(&StorageError::Corrupt {
-            detail: "bad header".to_string(),
-        }));
-    }
 
-    #[test]
-    fn create_backup_uses_hidden_vacuum_stage_path() {
-        let backup_path = PathBuf::from("/tmp/test.db.backup.123.456.0");
-        let stage_path = vacuum_stage_backup_path(&backup_path);
-        let stage_name = stage_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default();
 
-        assert!(stage_name.starts_with('.'));
-        assert!(stage_name.ends_with(".vacuum-in-progress"));
-        assert!(
-            !is_backup_root_name(stage_name, "test.db.backup."),
-            "incomplete VACUUM output must not be discoverable as a backup root"
-        );
-    }
 
-    #[test]
-    fn create_backup_preserves_content() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test.db");
-        let original_content = b"test database content 12345";
-        std::fs::write(&db_path, original_content).unwrap();
-
-        let backup_path = create_backup(&db_path).unwrap().unwrap();
-        let backup_content = std::fs::read(&backup_path).unwrap();
-        assert_eq!(backup_content, original_content);
-    }
-
-    #[test]
-    fn create_backup_copies_sidecars_when_present() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test.db");
-        std::fs::write(&db_path, b"db").unwrap();
-        std::fs::write(database_sidecar_path(&db_path, "-wal"), b"wal").unwrap();
-        std::fs::write(database_sidecar_path(&db_path, "-shm"), b"shm").unwrap();
-
-        let backup_path = create_backup(&db_path).unwrap().unwrap();
-
-        assert_eq!(
-            std::fs::read(database_sidecar_path(&backup_path, "-wal")).unwrap(),
-            b"wal"
-        );
-        assert_eq!(
-            std::fs::read(database_sidecar_path(&backup_path, "-shm")).unwrap(),
-            b"shm"
-        );
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn create_backup_rejects_symlink_root_during_raw_fallback() {
-        use std::os::unix::fs::symlink;
-
-        let dir = TempDir::new().unwrap();
-        let outside_db = dir.path().join("outside.db");
-        let db_path = dir.path().join("test.db");
-        std::fs::write(&outside_db, b"not sqlite").unwrap();
-        symlink(&outside_db, &db_path).unwrap();
-
-        let err = create_backup(&db_path).unwrap_err();
-
-        assert!(
-            err.to_string().contains("bundle symlink"),
-            "unexpected error: {err:#}"
-        );
-        assert_eq!(std::fs::read(&outside_db).unwrap(), b"not sqlite");
-        let backup_roots: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .filter(|name| name.starts_with("test.db.backup."))
-            .collect();
-        assert!(
-            backup_roots.is_empty(),
-            "symlinked backup source must not publish backup roots: {backup_roots:?}"
-        );
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn create_backup_rejects_symlink_sidecar_without_partial_backup() {
-        use std::os::unix::fs::symlink;
-
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test.db");
-        let outside_wal = dir.path().join("outside.wal");
-        let wal_path = database_sidecar_path(&db_path, "-wal");
-        std::fs::write(&db_path, b"not sqlite").unwrap();
-        std::fs::write(&outside_wal, b"outside wal").unwrap();
-        symlink(&outside_wal, &wal_path).unwrap();
-
-        let err = create_backup(&db_path).unwrap_err();
-
-        assert!(
-            err.to_string().contains("bundle symlink"),
-            "unexpected error: {err:#}"
-        );
-        assert_eq!(std::fs::read(&outside_wal).unwrap(), b"outside wal");
-        let backup_roots: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .filter(|name| name.starts_with("test.db.backup."))
-            .collect();
-        assert!(
-            backup_roots.is_empty(),
-            "sidecar preflight failure must not leave a partial backup root: {backup_roots:?}"
-        );
-    }
 
     // =========================================================================
     // Backup cleanup tests (bead yln.4)
     // =========================================================================
 
-    #[test]
-    fn cleanup_old_backups_keeps_recent() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test.db");
 
-        // Create 5 backup files with different timestamps
-        for i in 0..5 {
-            let backup_name = format!("test.db.backup.{}", 1000 + i);
-            std::fs::write(dir.path().join(&backup_name), format!("backup {i}")).unwrap();
-        }
-
-        cleanup_old_backups(&db_path, 3).unwrap();
-
-        // Count remaining backup files
-        let backups: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_str().unwrap_or("").contains("backup"))
-            .collect();
-
-        assert_eq!(backups.len(), 3);
-    }
-
-    #[test]
-    fn cleanup_old_backups_ignores_wal_and_shm_sidecars() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test.db");
-
-        for i in 0..3 {
-            let backup_name = format!("test.db.backup.{}", 1000 + i);
-            let backup_path = dir.path().join(&backup_name);
-            std::fs::write(&backup_path, format!("backup {i}")).unwrap();
-            std::fs::write(format!("{}-wal", backup_path.display()), b"wal").unwrap();
-            std::fs::write(format!("{}-shm", backup_path.display()), b"shm").unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-
-        cleanup_old_backups(&db_path, 2).unwrap();
-
-        let mut roots = Vec::new();
-        let mut wals = Vec::new();
-        let mut shms = Vec::new();
-        for entry in std::fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-        {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.ends_with("-wal") {
-                wals.push(name);
-            } else if name.ends_with("-shm") {
-                shms.push(name);
-            } else if name.contains("backup") {
-                roots.push(name);
-            }
-        }
-
-        assert_eq!(roots.len(), 2, "should keep two backup roots");
-        assert_eq!(
-            wals.len(),
-            2,
-            "should keep WAL sidecars only for retained backups"
-        );
-        assert_eq!(
-            shms.len(),
-            2,
-            "should keep SHM sidecars only for retained backups"
-        );
-    }
 
     #[test]
     fn move_database_bundle_moves_database_and_sidecars() {
@@ -18798,62 +16856,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn remove_database_files_removes_orphan_sidecars_without_main_db() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test.db");
 
-        std::fs::write(database_sidecar_path(&db_path, "-wal"), b"wal").unwrap();
-        std::fs::write(database_sidecar_path(&db_path, "-shm"), b"shm").unwrap();
-
-        remove_database_files(&db_path).unwrap();
-
-        assert!(!db_path.exists());
-        assert!(!database_sidecar_path(&db_path, "-wal").exists());
-        assert!(!database_sidecar_path(&db_path, "-shm").exists());
-    }
-
-    #[test]
-    fn cleanup_old_backups_ignores_backup_named_directories() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test.db");
-
-        for i in 0..3 {
-            let backup_name = format!("test.db.backup.{}", 1000 + i);
-            std::fs::write(dir.path().join(&backup_name), format!("backup {i}")).unwrap();
-        }
-        std::fs::create_dir(dir.path().join("test.db.backup.directory")).unwrap();
-
-        cleanup_old_backups(&db_path, 2).unwrap();
-
-        let mut backup_files = Vec::new();
-        let mut backup_dirs = Vec::new();
-        for entry in std::fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-        {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if !name.starts_with("test.db.backup.") {
-                continue;
-            }
-            if entry.path().is_dir() {
-                backup_dirs.push(name);
-            } else {
-                backup_files.push(name);
-            }
-        }
-
-        assert_eq!(
-            backup_files.len(),
-            2,
-            "only real backup files count toward retention"
-        );
-        assert_eq!(
-            backup_dirs.len(),
-            1,
-            "backup-named directories should be ignored"
-        );
-    }
 
     // =========================================================================
     // Storage open/create tests (bead yln.4)
@@ -18912,44 +16915,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn open_or_rebuild_current_schema_does_not_trigger_rebuild() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("existing.db");
 
-        // Create DB at current schema.
-        {
-            let storage = SqliteStorage::open(&db_path).unwrap();
-            assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
-        }
-
-        // Should open normally, not require rebuild.
-        let reopened = SqliteStorage::open_or_rebuild(&db_path)
-            .expect("current schema DB should open without rebuild");
-        assert_eq!(reopened.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
-    }
-
-    #[test]
-    fn open_or_rebuild_does_not_treat_non_database_paths_as_corruption() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("db_dir");
-        std::fs::create_dir(&db_path).unwrap();
-
-        let result = SqliteStorage::open_or_rebuild(&db_path);
-
-        assert!(
-            matches!(
-                result,
-                Err(MigrationError::Database(_)) | Err(MigrationError::Io(_))
-            ),
-            "non-database path should report the underlying open error without rebuild"
-        );
-
-        assert!(
-            db_path.is_dir(),
-            "non-database directory must be left in place"
-        );
-    }
 
     // =========================================================================
     // Schema version tests (bead yln.4)
@@ -18961,8 +16927,12 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let storage = SqliteStorage::open(&db_path).unwrap();
         let version = storage.schema_version().unwrap();
-        assert!(version >= 5, "Schema version should be at least 5");
+        // w1b Task B8: the floor used to be `>= 5` under the old ~21-step
+        // the legacy embedded engine migration numbering; `PRAGMA user_version` starts a
+        // fresh count at 1 under `schema::ensure`.
+        assert_eq!(version, CURRENT_SCHEMA_VERSION, "fresh database should report the current schema version");
     }
+
 
     // =========================================================================
     // Current analytics/schema smoke test (bead z9fse.11)
@@ -19119,6 +17089,15 @@ mod tests {
                 && conversation_cols.contains(&"last_message_created_at".to_string()),
             "fresh schema must include V15 tail columns without ALTER TABLE on conversations"
         );
+        // w1b Task B7 (control-plane ruling, bead z9fse.11): `SqliteStorage::open`
+        // on a new file now builds through `schema::ensure`, which creates
+        // fts_messages eagerly as part of the one-shot fresh DDL -- the old
+        // "V13 creates it, V14 drops it, a later FTS consistency check
+        // recreates it lazily" dance this assertion used to check for is
+        // retired for new-engine databases (that dance existed to work around
+        // a legacy embedded engine-specific limitation; the machinery itself retires
+        // at Task B8). A fresh database now has exactly one, immediately
+        // queryable, fts_messages schema row from the moment it's built.
         let fts_schema_rows: i64 = conn
             .query_row_map(
                 "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
@@ -19127,8 +17106,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            fts_schema_rows, 0,
-            "fresh schema should not create and immediately drop derived fts_messages"
+            fts_schema_rows, 1,
+            "fresh schema must create fts_messages eagerly, not lazily"
         );
         let integrity: Vec<String> = conn
             .query_all_map("PRAGMA integrity_check;", fparams![], |row: &FrankenRow| {
@@ -19178,58 +17157,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn migration_v13_from_v10() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test.db");
-
-        // Open at v10 first by faking it
-        {
-            let conn = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().into_owned())), crate::storage::api::Profile::Production).unwrap();
-            conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);",
-            )
-            .unwrap();
-            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', '10')", &[])
-                .unwrap();
-            // Apply V1-V10 so schema is correct. Keep each historical DDL batch
-            // in autocommit mode; the fixture is testing cass migration
-            // transition behavior, not frankensqlite's handling of a giant
-            // synthetic legacy-DDL transaction.
-            conn.execute_batch(MIGRATION_V1).unwrap();
-            conn.execute_batch(MIGRATION_V2).unwrap();
-            conn.execute_batch(MIGRATION_V4).unwrap();
-            conn.execute_batch(MIGRATION_V5).unwrap();
-            conn.execute_batch(MIGRATION_V6).unwrap();
-            conn.execute_batch(MIGRATION_V7).unwrap();
-            conn.execute_batch(MIGRATION_V8).unwrap();
-            conn.execute_batch(MIGRATION_V9).unwrap();
-            conn.execute_batch(MIGRATION_V10).unwrap();
-            conn.execute("UPDATE meta SET value = '10' WHERE key = 'schema_version'", &[])
-                .unwrap();
-        }
-        materialize_fresh_fts_schema_via_rusqlite(&db_path).unwrap();
-
-        // Now open with SqliteStorage — should auto-migrate to current schema
-        let storage = SqliteStorage::open(&db_path).unwrap();
-        let version = storage.schema_version().unwrap();
-        assert_eq!(
-            version, CURRENT_SCHEMA_VERSION,
-            "Should have migrated from v10 to the current schema"
-        );
-
-        // Verify new tables exist
-        let count: i64 = storage
-            .raw()
-            .query_row_map(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('message_metrics', 'usage_hourly', 'usage_daily', 'usage_models_daily')",
-                &[],
-                |row: &FrankenRow| row.get_typed::<i64>(0),
-            )
-            .unwrap();
-        assert_eq!(count, 4, "All 4 analytics tables should exist");
-    }
 
     // =========================================================================
     // Analytics ingest integration test (bead z9fse.2)
@@ -20789,6 +18716,102 @@ mod tests {
             )
             .unwrap();
         assert_eq!(staged_rows, 0, "successful publish must clear staging rows");
+    }
+
+    #[test]
+    fn rebuild_daily_stats_with_timestamp_only_restamps_last_updated_when_values_actually_change() {
+        // w1b Task B9 (2026-08-27, control-plane ruling, e7 case final,
+        // requirement 4: the reverse verification the compare-then-write
+        // fix owes -- a real content change must still get a fresh
+        // last_updated, not just "unchanged content keeps the old one").
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let started_at = 1_700_000_000_000_i64;
+
+        storage
+            .conn
+            .execute(
+                "INSERT INTO agents (id, slug, name, version, kind, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, NULL, ?4, 0, 0)",
+                fparams![1_i64, "codex", "Codex", "cli"],
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute(
+                "INSERT INTO conversations (
+                    id, agent_id, workspace_id, source_id, external_id, title, source_path,
+                    started_at, ended_at, approx_tokens, metadata_json, origin_host, metadata_bin
+                 ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, NULL, NULL)",
+                fparams![
+                    1_i64,
+                    1_i64,
+                    LOCAL_SOURCE_ID,
+                    "ts-a",
+                    "TS A",
+                    "/tmp/ts-a.jsonl",
+                    started_at,
+                    started_at + 100,
+                    "{}"
+                ],
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute(
+                "INSERT INTO messages (
+                    id, conversation_id, idx, role, author, created_at, content, extra_json, extra_bin
+                 ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, NULL, NULL)",
+                fparams![1_i64, 1_i64, 0_i64, "user", started_at, "hello"],
+            )
+            .unwrap();
+
+        let t1 = 1_700_000_000_001_i64;
+        storage.rebuild_daily_stats_with_timestamp(t1).unwrap();
+        let read_last_updated = |storage: &FrankenStorage| -> i64 {
+            storage
+                .conn
+                .query_row_map(
+                    "SELECT last_updated FROM daily_stats WHERE agent_slug = 'all' AND source_id = 'all'",
+                    fparams![],
+                    |row| row.get_typed(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(read_last_updated(&storage), t1);
+
+        // Rerun with a different timestamp but identical source content
+        // (nothing inserted since t1) -- last_updated must stay t1, not
+        // jump to t2. This is the exact scenario a W1 restore recovery
+        // replay hits.
+        let t2 = 1_700_000_000_002_i64;
+        storage.rebuild_daily_stats_with_timestamp(t2).unwrap();
+        assert_eq!(
+            read_last_updated(&storage),
+            t1,
+            "unchanged aggregate values must keep the old last_updated, not the new rerun's timestamp"
+        );
+
+        // Now make a REAL content change (a new message) and rerun with a
+        // third timestamp -- last_updated must move to t3. Compare-then-
+        // write must not have quietly become "never write".
+        storage
+            .conn
+            .execute(
+                "INSERT INTO messages (
+                    id, conversation_id, idx, role, author, created_at, content, extra_json, extra_bin
+                 ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, NULL, NULL)",
+                fparams![2_i64, 1_i64, 1_i64, "assistant", started_at + 50, "world"],
+            )
+            .unwrap();
+        let t3 = 1_700_000_000_003_i64;
+        storage.rebuild_daily_stats_with_timestamp(t3).unwrap();
+        assert_eq!(
+            read_last_updated(&storage),
+            t3,
+            "a genuine aggregate change must get a fresh last_updated"
+        );
     }
 
     #[test]
@@ -23076,19 +21099,15 @@ mod tests {
                 .unwrap();
         }
 
-        storage.conn.execute("PRAGMA foreign_keys = OFF", &[]).unwrap();
+        // w1b Task B2b (R0-B3): `messages.conversation_id` carries `ON DELETE
+        // CASCADE` (schema MIGRATION_V21) -- with FK enforcement on (the
+        // connection default now, no more toggling it off), deleting the
+        // `conversations` rows below cascades the matching `messages` rows
+        // automatically; no separate cleanup delete needed.
         storage
             .conn
             .execute("DELETE FROM conversations WHERE id IN (2, 4)", fparams![])
             .unwrap();
-        storage
-            .conn
-            .execute(
-                "DELETE FROM messages WHERE conversation_id IN (2, 4)",
-                fparams![],
-            )
-            .unwrap();
-        storage.conn.execute("PRAGMA foreign_keys = ON", &[]).unwrap();
 
         let (agent_slugs, workspace_paths) = storage.build_lexical_rebuild_lookups().unwrap();
 
@@ -23177,7 +21196,9 @@ mod tests {
                 .unwrap();
         }
 
-        storage.conn.execute("PRAGMA foreign_keys = OFF", &[]).unwrap();
+        // w1b Task B2b (R0-B3): see the sibling test above -- `ON DELETE
+        // CASCADE` on `messages.conversation_id` cascades this delete with
+        // FK enforcement on, no separate cleanup delete needed.
         storage
             .conn
             .execute(
@@ -23185,14 +21206,6 @@ mod tests {
                 fparams![],
             )
             .unwrap();
-        storage
-            .conn
-            .execute(
-                "DELETE FROM messages WHERE conversation_id IN (3, 5, 7, 8)",
-                fparams![],
-            )
-            .unwrap();
-        storage.conn.execute("PRAGMA foreign_keys = ON", &[]).unwrap();
 
         let (agent_slugs, workspace_paths) = storage.build_lexical_rebuild_lookups().unwrap();
 
@@ -23679,7 +21692,21 @@ mod tests {
             .insert_conversation_tree(agent_id, None, &conversation)
             .unwrap()
             .conversation_id;
-        storage.conn.execute("PRAGMA foreign_keys = OFF", &[]).unwrap();
+        // w1b Task B2b (R0-B3): blank-but-present remote source, same pattern
+        // as commit 069397b5 (seed_analytics_remote_source_*_fixture) -- a
+        // real `sources` row is required so the simulated "blank remote
+        // source_id" mutation below satisfies the FK on
+        // conversations.source_id (matches how a real ingest path would
+        // register any source before referencing it) instead of needing FK
+        // enforcement turned off.
+        storage
+            .conn
+            .execute(
+                "INSERT OR IGNORE INTO sources(id, kind, host_label, created_at, updated_at)
+                 VALUES ('   ', 'remote', NULL, strftime('%s','now')*1000, strftime('%s','now')*1000)",
+                &[],
+            )
+            .unwrap();
         storage
             .conn
             .execute(
@@ -23687,7 +21714,6 @@ mod tests {
                 fparams!["   ", "dev@laptop", conversation_id],
             )
             .unwrap();
-        storage.conn.execute("PRAGMA foreign_keys = ON", &[]).unwrap();
 
         let listed = storage.list_conversations(10, 0).unwrap();
         assert_eq!(listed.len(), 1);
@@ -23768,15 +21794,13 @@ mod tests {
         {
             // Legacy "duplicate FTS" fixture reconstruction.
             //
-            // Post-V14 migration cass drops the V13-era fts_messages virtual table
-            // and recreates it lazily, so a freshly-opened canonical DB has zero
-            // fts_messages entries in sqlite_master. To reproduce the historical
-            // failure mode this test exercises — a legacy v13 bundle with a
-            // duplicated CREATE VIRTUAL TABLE row — we have to inject *both*
-            // entries: the original V13-era contentless row and the buggy duplicate
-            // row. Before V14 existed the original was already present after
-            // migration and only the duplicate needed manual injection.
-            let legacy_v13_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, content='', tokenize='porter')";
+            // w1b Task B7 (control-plane ruling, bead z9fse.11): `SqliteStorage::open`
+            // on a new file now builds through `schema::ensure`, which creates
+            // fts_messages eagerly -- `source` (opened above) already has exactly
+            // one real fts_messages row, playing the same "one legitimate contentless
+            // entry" role the old V13-era row used to need manual injection for. Only
+            // the buggy duplicate row -- the actual subject of the fixup logic this
+            // test exercises -- needs injecting now.
             let duplicate_legacy_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')";
             let legacy = rusqlite_test_fixture_conn(&source_db);
             legacy
@@ -23792,15 +21816,7 @@ mod tests {
                     [FTS_FRANKEN_REBUILD_META_KEY],
                 )
                 .unwrap();
-            // Inject the V13 original first.
-            legacy
-                .execute(
-                    "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
-                     VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
-                    [legacy_v13_fts_sql],
-                )
-                .unwrap();
-            // Then the duplicate that's the real subject of the fixup logic.
+            // Inject the duplicate that's the real subject of the fixup logic.
             legacy
                 .execute(
                     "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
@@ -23814,7 +21830,7 @@ mod tests {
             drop(legacy);
 
             // Verify fixture with rusqlite+writable_schema to see raw
-            // sqlite_master rows (frankensqlite deduplicates schema entries).
+            // sqlite_master rows (the legacy embedded engine deduplicates schema entries).
             {
                 let verify = rusqlite_test_fixture_conn(&source_db);
                 verify
@@ -23928,7 +21944,7 @@ mod tests {
             CURRENT_SCHEMA_VERSION
         );
         // Post-V14 fts_messages is recreated lazily. `FrankenStorage::open`
-        // alone doesn't re-register the virtual table for the frankensqlite
+        // alone doesn't re-register the virtual table for the legacy embedded engine
         // query engine — the consistency pass does, and this is exactly what
         // normal cass startup runs before the first search. Invoke it
         // explicitly so the query below exercises the expected post-repair
@@ -24016,8 +22032,19 @@ mod tests {
         drop(source);
 
         let legacy = FrankenConnection::open_writable(std::path::Path::new(&(source_db.to_string_lossy().into_owned())), crate::storage::api::Profile::Production).unwrap();
+        // w1b Task B9 (salvage problem A, second occurrence): `schema::ensure`
+        // leaves `meta` empty on a fresh new-generation database (see the
+        // sibling fixture fix in
+        // discover_historical_database_bundles_prefers_healthy_backup_over_replay_priority),
+        // so a plain `UPDATE` against a `schema_version` row that was never
+        // inserted silently matches zero rows and never simulates the
+        // "legacy v12 bundle" this test needs to exercise the too-old
+        // rejection path.
         legacy
-            .execute("UPDATE meta SET value = '12' WHERE key = 'schema_version'", &[])
+            .execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', '12')",
+                &[],
+            )
             .unwrap();
         drop(legacy);
 
@@ -25214,6 +23241,31 @@ mod tests {
     }
 
     #[test]
+    fn has_db_sidecar_suffix_recognizes_frankensqlite_namespace_lock_sidecars() {
+        // w1b: these sidecars are what leaked past
+        // `historical_bundle_root_paths` and got miscounted as independent
+        // salvage bundles (see the two `salvage_historical_databases_*`
+        // regression tests below).
+        assert!(has_db_sidecar_suffix(
+            "agent_search.corrupt.20260324_212907-fsqlite-ns-use"
+        ));
+        assert!(has_db_sidecar_suffix("agent_search.db-fsqlite-ns-gate"));
+    }
+
+    #[test]
+    fn has_db_sidecar_suffix_does_not_overmatch_near_miss_suffixes() {
+        // Exact-suffix semantics: a name that merely contains the sidecar
+        // token as a substring, without ending in the exact suffix, must not
+        // be treated as a sidecar (would otherwise risk sweeping up a
+        // legitimately-named bundle file).
+        assert!(!has_db_sidecar_suffix(
+            "agent_search.corrupt.20260324_212907-fsqlite-ns-used"
+        ));
+        assert!(!has_db_sidecar_suffix("agent_search.db-fsqlite-ns-gated"));
+        assert!(!has_db_sidecar_suffix("agent_search.db"));
+    }
+
+    #[test]
     fn discover_historical_database_bundles_prefers_larger_archives_first() {
         let dir = TempDir::new().unwrap();
         let canonical_db = dir.path().join("agent_search.db");
@@ -25386,7 +23438,29 @@ mod tests {
         let replay_legacy = rusqlite_test_fixture_conn(&replay_db);
         replay_legacy
             .execute_batch(
-                "UPDATE meta SET value = '13' WHERE key = 'schema_version';
+                // w1b Task B8 (plan delta d17): `replay_db` was built through
+                // the real `schema::ensure` path above (like any file
+                // `SqliteStorage::open` touches), so simulating "this is a
+                // franken-generation v13 bundle" for the probe now requires
+                // resetting `PRAGMA user_version` back to 0 too -- a real
+                // pre-B8 archive never had it set in the first place, and
+                // `historical_bundle_schema_is_current` checks `user_version`
+                // before falling back to the legacy `meta.schema_version`
+                // this UPDATE still rolls back.
+                //
+                // w1b Task B9 (salvage problem A): `schema::ensure`'s
+                // fresh-build DDL leaves `meta` as an empty table (it never
+                // populates legacy bookkeeping rows, see
+                // `storage::schema` module doc) -- unlike a real
+                // franken-generation bundle, which always had a
+                // `schema_version` row to begin with. A plain `UPDATE`
+                // against a row that was never inserted is a silent no-op,
+                // so the legacy-version half of this simulated rollback
+                // never took effect. `INSERT OR REPLACE` makes the
+                // simulation correct regardless of which generation built
+                // the underlying database.
+                "PRAGMA user_version = 0;
+                 INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', '13');
                  DELETE FROM _schema_migrations WHERE version = 14;
                  PRAGMA writable_schema = ON;",
             )
@@ -25431,25 +23505,32 @@ mod tests {
 
         assert_eq!(ordered_paths[0], clean_backup);
         assert_eq!(ordered_paths[1], replay_db);
+        // w1b Task B8 (plan delta d17): `clean_backup` is a genuine
+        // new-generation bundle (built via `schema::ensure`, never touches
+        // the legacy `meta` table) -- its version authority is
+        // `PRAGMA user_version`, not `meta.schema_version`.
         assert_eq!(
-            bundles[0].probe.schema_version,
+            bundles[0].probe.user_version,
             Some(CURRENT_SCHEMA_VERSION)
         );
-        // Post-V14 cass drops the fts_messages virtual table during migration
-        // and recreates it lazily on first open, so a freshly-migrated "clean"
-        // backup has zero fts_messages rows in sqlite_master. The bundle is
-        // still ranked as healthy by `bundle_health_rank` because 0 rows is a
-        // legitimate lazy-FTS state (see comment there).
-        assert_eq!(bundles[0].probe.fts_schema_rows, Some(0));
-        // `fts_queryable` mirrors a direct rusqlite probe; with 0 sqlite_master
-        // rows the table isn't queryable until lazy repair runs.
-        assert!(!bundles[0].probe.fts_queryable);
+        // w1b Task B7 (control-plane ruling, bead z9fse.11): `clean_backup` is
+        // built via `SqliteStorage::open` on a new file, which now creates
+        // fts_messages eagerly through `schema::ensure` -- one real,
+        // immediately-queryable schema row, no lazy repair needed. The bundle
+        // was already ranked healthiest before this change (0 lazy rows was
+        // also a legitimate healthy state); it stays healthiest now.
+        assert_eq!(bundles[0].probe.fts_schema_rows, Some(1));
+        assert!(bundles[0].probe.fts_queryable);
         assert_eq!(bundles[1].probe.schema_version, Some(13));
-        // The replay bundle had V14 run (dropping fts_messages → 0 rows), then
-        // the test rolls meta.schema_version back to 13 and deletes the V14
-        // marker. On Unix CI we also inject a duplicate sqlite_master row to
-        // exercise the malformed-bundle probe path that depends on sqlite3.
-        let expected_fts_schema_rows = if cfg!(windows) { Some(0) } else { Some(1) };
+        // w1b Task B7 (control-plane ruling, bead z9fse.11): `replay_storage`
+        // was also built via `SqliteStorage::open` on a new file, so it
+        // starts with one real, eagerly-created fts_messages row before the
+        // test rolls meta.schema_version back to 13 and deletes the V14
+        // marker (that rollback only touches version bookkeeping, not the
+        // schema object itself). On Unix CI we also inject a duplicate
+        // sqlite_master row on top of that real one to exercise the
+        // malformed-bundle probe path that depends on sqlite3.
+        let expected_fts_schema_rows = if cfg!(windows) { Some(1) } else { Some(2) };
         assert_eq!(bundles[1].probe.fts_schema_rows, expected_fts_schema_rows);
     }
 
@@ -27082,98 +25163,6 @@ mod tests {
     }
 
     // =========================================================================
-    // LazyFrankenDb tests (bd-1ueu)
-    // =========================================================================
-
-    #[test]
-    fn lazy_franken_db_not_open_before_get() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("lazy_test.db");
-
-        // Create a real DB so the path exists
-        let _storage = SqliteStorage::open(&db_path).unwrap();
-
-        let lazy = LazyFrankenDb::new(db_path);
-        assert!(
-            !lazy.is_open(),
-            "LazyFrankenDb must not open on construction"
-        );
-    }
-
-    #[test]
-    fn lazy_franken_db_opens_on_first_get() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("lazy_test.db");
-
-        // Create a real DB so the path exists
-        let _storage = SqliteStorage::open(&db_path).unwrap();
-        drop(_storage);
-
-        let lazy = LazyFrankenDb::new(db_path);
-        assert!(!lazy.is_open());
-
-        let conn = lazy.get("test").expect("should open successfully");
-        let count: i64 = conn
-            .query_row_map("SELECT COUNT(*) FROM conversations", fparams![], |r| {
-                r.get_typed(0)
-            })
-            .unwrap();
-        assert_eq!(count, 0);
-        drop(conn);
-
-        assert!(lazy.is_open(), "LazyFrankenDb must be open after get()");
-    }
-
-    #[test]
-    fn lazy_franken_db_reuses_connection() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("lazy_test.db");
-        let _storage = SqliteStorage::open(&db_path).unwrap();
-        drop(_storage);
-
-        let lazy = LazyFrankenDb::new(db_path);
-
-        // First access opens
-        {
-            let conn = lazy.get("first").unwrap();
-            conn.execute_batch("CREATE TABLE IF NOT EXISTS test_tbl (id INTEGER)")
-                .unwrap();
-        }
-
-        // Second access reuses (table still exists)
-        {
-            let conn = lazy.get("second").unwrap();
-            let count: i64 = conn
-                .query_row_map("SELECT COUNT(*) FROM test_tbl", fparams![], |r| {
-                    r.get_typed(0)
-                })
-                .unwrap();
-            assert_eq!(count, 0);
-        }
-    }
-
-    #[test]
-    fn lazy_franken_db_not_found_error() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("nonexistent.db");
-
-        let lazy = LazyFrankenDb::new(db_path);
-        let result = lazy.get("test");
-        assert!(result.is_err());
-        assert!(
-            matches!(result.unwrap_err(), LazyDbError::NotFound(_)),
-            "should return NotFound for missing DB"
-        );
-    }
-
-    #[test]
-    fn lazy_franken_db_path_accessor() {
-        let path = PathBuf::from("/tmp/test_lazy.db");
-        let lazy = LazyFrankenDb::new(path.clone());
-        assert_eq!(lazy.path(), path.as_path());
-    }
-
-    // =========================================================================
     // Pricing / cost estimation tests (bead z9fse.10)
     // =========================================================================
 
@@ -27499,274 +25488,52 @@ mod tests {
     // FrankenStorage migration tests (bead 2j6p6)
     // =========================================================================
 
-    /// Helper: create a FrankenStorage wrapping an in-memory connection and
-    /// run migrations. This exercises the same code path as `open()` but avoids
-    /// frankensqlite's file-based autoindex renaming limitation (V5 uses
-    /// ALTER TABLE RENAME which triggers sqlite_autoindex lookup issues on
-    /// file-based pagers).
+    /// Helper: create a FrankenStorage wrapping an in-memory connection with
+    /// a fresh schema built. w1b Task B8: `schema::ensure` replaces the
+    /// retired franken incremental engine's `run_migrations`.
     fn franken_storage_in_memory() -> FrankenStorage {
         let conn = FrankenConnection::open_memory().unwrap();
         let storage = FrankenStorage::new(conn, PathBuf::from(":memory:"));
-        storage.run_migrations().unwrap();
+        crate::storage::schema::ensure(&storage.conn).unwrap();
         storage.apply_config().unwrap();
         storage
     }
 
+    fn franken_query_synchronous(conn: &FrankenConnection) -> i64 {
+        conn.query_row_map("PRAGMA synchronous;", &[], |row| row.get_typed(0)).unwrap()
+    }
+
+    /// R1-B1: `apply_config` used to unconditionally run
+    /// `PRAGMA synchronous = NORMAL;` after `FrankenConnection::open_writable`
+    /// had already applied `Profile::Production`'s `synchronous = FULL`
+    /// (config.rs `pragma_plan`, self-checked by `apply_profile`'s readback in
+    /// `backend_sqlite.rs`) -- silently downgrading durability below what the
+    /// profile promised, with no readback check catching the downgrade.
+    /// `FrankenStorage::open`/`open_writer` are the only production entry
+    /// points that call `apply_config`, and both always open with
+    /// `Profile::Production` -- so every writer connection must read back
+    /// FULL (2) after `apply_config`, not NORMAL (1).
     #[test]
-    fn franken_migrations_create_all_tables() {
-        let storage = franken_storage_in_memory();
+    fn open_and_open_writer_preserve_production_profile_synchronous_full() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
 
-        // Should be at CURRENT_SCHEMA_VERSION.
-        let version = storage.schema_version().unwrap();
+        let storage = FrankenStorage::open(&db_path).unwrap();
         assert_eq!(
-            version, CURRENT_SCHEMA_VERSION,
-            "fresh FrankenStorage should be at current schema version"
+            franken_query_synchronous(storage.raw()),
+            2,
+            "FrankenStorage::open must keep Profile::Production's synchronous=FULL after apply_config"
         );
+        storage.close().unwrap();
 
-        // Core tables from V1 should exist.
-        let table_names: Vec<String> = storage
-            .raw()
-            .query_all_map(
-                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;",
-                &[],
-                |r| r.get_typed::<String>(0),
-            )
-            .unwrap();
-
-        for required in [
-            "meta",
-            "agents",
-            "workspaces",
-            "conversations",
-            "messages",
-            "snippets",
-            "tags",
-            "conversation_tags",
-        ] {
-            assert!(
-                table_names.contains(&required.to_string()),
-                "missing table: {required}"
-            );
-        }
-
-        // V4 sources table.
-        assert!(
-            table_names.contains(&"sources".to_string()),
-            "missing sources table"
-        );
-
-        // V8 daily_stats table.
-        assert!(
-            table_names.contains(&"daily_stats".to_string()),
-            "missing daily_stats table"
-        );
-
-        // V9 embedding_jobs table.
-        assert!(
-            table_names.contains(&"embedding_jobs".to_string()),
-            "missing embedding_jobs table"
-        );
-
-        // V11 message_metrics, usage_hourly, usage_daily tables.
-        for analytics_table in ["message_metrics", "usage_hourly", "usage_daily"] {
-            assert!(
-                table_names.contains(&analytics_table.to_string()),
-                "missing table: {analytics_table}"
-            );
-        }
-        assert!(
-            table_names.contains(&"conversation_tail_state".to_string()),
-            "missing conversation_tail_state table"
-        );
-        assert!(
-            table_names.contains(&"conversation_external_lookup".to_string()),
-            "missing conversation_external_lookup table"
-        );
-        assert!(
-            table_names.contains(&"conversation_external_tail_lookup".to_string()),
-            "missing conversation_external_tail_lookup table"
-        );
-
-        // Fresh frankensqlite databases should record the combined V13 base
-        // schema plus every additive post-V13 migration.
-        let count: i64 = storage
-            .raw()
-            .query_row_map("SELECT COUNT(*) FROM _schema_migrations;", &[], |row| {
-                row.get_typed(0)
-            })
-            .unwrap();
+        let writer = FrankenStorage::open_writer(&db_path).unwrap();
         assert_eq!(
-            count,
-            (13..=CURRENT_SCHEMA_VERSION).count() as i64,
-            "_schema_migrations should record the V13 base schema and post-V13 migrations"
-        );
-
-        // The latest applied migration should be the current schema version.
-        let versions: Vec<i64> = storage
-            .raw()
-            .query_all_map(
-                "SELECT version FROM _schema_migrations ORDER BY version;",
-                &[],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-        assert_eq!(
-            versions,
-            (13..=CURRENT_SCHEMA_VERSION).collect::<Vec<i64>>(),
-            "_schema_migrations should contain v13 through current"
+            franken_query_synchronous(writer.raw()),
+            2,
+            "FrankenStorage::open_writer must keep Profile::Production's synchronous=FULL after apply_config"
         );
     }
 
-    #[test]
-    fn franken_migrations_idempotent() {
-        let storage = franken_storage_in_memory();
-        assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
-
-        // Re-running migrations on the same connection is a no-op.
-        storage.run_migrations().unwrap();
-        assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
-    }
-
-    #[test]
-    fn migration_v20_backfills_conversation_external_tail_lookup() {
-        let storage = franken_storage_in_memory();
-        let agent_id = storage
-            .ensure_agent(&Agent {
-                id: None,
-                slug: "codex".into(),
-                name: "Codex".into(),
-                version: None,
-                kind: AgentKind::Cli,
-            })
-            .unwrap();
-        let workspace_id = storage
-            .ensure_workspace(&PathBuf::from("/ws/profiled-storage-remote"), None)
-            .unwrap();
-        let mut conv = make_profiled_storage_remote_conversation(1919, 2);
-        conv.source_id = "profiled-storage-remote-source-東京".into();
-        conv.external_id = Some("profiled-storage-remote-☃-1919".into());
-        let outcome = storage
-            .insert_conversation_tree(agent_id, Some(workspace_id), &conv)
-            .unwrap();
-        let external_id = conv.external_id.as_deref().unwrap();
-        let lookup_key = conversation_external_lookup_key(&conv.source_id, agent_id, external_id);
-
-        storage
-            .raw()
-            .execute("DELETE FROM conversation_external_tail_lookup", &[])
-            .unwrap();
-        storage
-            .raw()
-            .execute("DELETE FROM _schema_migrations WHERE version = 20", &[])
-            .unwrap();
-        storage
-            .raw()
-            .execute(
-                "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
-                fparams!["19"],
-            )
-            .unwrap();
-
-        storage.run_migrations().unwrap();
-
-        let backfilled: (i64, Option<i64>, Option<i64>, Option<i64>) = storage
-            .raw()
-            .query_row_map(
-                "SELECT conversation_id, ended_at, last_message_idx, last_message_created_at
-                 FROM conversation_external_tail_lookup
-                 WHERE lookup_key = ?1",
-                fparams![lookup_key.as_str()],
-                |row| {
-                    Ok((
-                        row.get_typed(0)?,
-                        row.get_typed(1)?,
-                        row.get_typed(2)?,
-                        row.get_typed(3)?,
-                    ))
-                },
-            )
-            .unwrap();
-        assert_eq!(
-            backfilled,
-            (
-                outcome.conversation_id,
-                conv.ended_at,
-                Some(1),
-                conv.messages[1].created_at
-            )
-        );
-        assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
-    }
-
-    #[test]
-    fn migration_v15_creates_lazy_tail_state_cache() {
-        let conn = FrankenConnection::open_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE conversations (
-                 id INTEGER PRIMARY KEY,
-                 ended_at INTEGER
-             );
-             CREATE TABLE messages (
-                 id INTEGER PRIMARY KEY,
-                 conversation_id INTEGER NOT NULL,
-                 idx INTEGER NOT NULL,
-                 created_at INTEGER
-             );
-             INSERT INTO conversations(id, ended_at) VALUES
-                 (1, 1710000000300),
-                 (2, NULL);
-             INSERT INTO messages(id, conversation_id, idx, created_at) VALUES
-                 (10, 1, 0, 1710000000100),
-                 (11, 1, 1, 1710000000200),
-                 (12, 2, 0, 1710000000400);",
-        )
-        .unwrap();
-
-        conn.execute(
-            "CREATE TABLE _schema_migrations (
-                version INTEGER PRIMARY KEY,
-                name TEXT NOT NULL,
-                applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
-             );",
-        &[])
-        .unwrap();
-
-        assert!(
-            apply_conversation_tail_state_cache_migration(&conn).unwrap(),
-            "v15 migration should apply once"
-        );
-        assert!(
-            !apply_conversation_tail_state_cache_migration(&conn).unwrap(),
-            "v15 migration should be idempotent once recorded"
-        );
-
-        let column_names: HashSet<String> = conn
-            .query_all_map("PRAGMA table_info(conversations);", &[], |row| row.get_typed(1))
-            .unwrap()
-            .into_iter()
-            .collect();
-        assert!(column_names.contains("last_message_idx"));
-        assert!(column_names.contains("last_message_created_at"));
-
-        let tail_rows: i64 = conn
-            .query_row_map("SELECT COUNT(*) FROM conversation_tail_state;", &[], |row| {
-                row.get_typed(0)
-            })
-            .unwrap();
-        assert_eq!(
-            tail_rows, 0,
-            "v15 should create the cache without an open-time message scan"
-        );
-
-        let applied: i64 = conn
-            .query_row_map(
-                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 15;",
-                &[],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-        assert_eq!(applied, 1);
-    }
 
     #[test]
     fn schema_repair_adds_missing_conversations_token_columns() {
@@ -27793,390 +25560,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn franken_meta_schema_version_in_sync() {
-        let storage = franken_storage_in_memory();
 
-        // meta.schema_version should be kept in sync.
-        let meta_version: String = storage
-            .raw()
-            .query_row_map(
-                "SELECT value FROM meta WHERE key = 'schema_version';",
-                &[],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-        assert_eq!(
-            meta_version,
-            CURRENT_SCHEMA_VERSION.to_string(),
-            "meta.schema_version should match CURRENT_SCHEMA_VERSION"
-        );
-    }
 
-    #[test]
-    fn franken_transition_from_meta_version() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test_transition.db");
 
-        // Simulate an existing database created by SqliteStorage at version 10.
-        // We create just enough schema to test the transition.
-        let conn = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().to_string())), crate::storage::api::Profile::Production).unwrap();
-        conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);", &[])
-            .unwrap();
-        conn.execute("INSERT INTO meta(key, value) VALUES('schema_version', '10');", &[])
-            .unwrap();
-        // Create a dummy conversations table so transition doesn't think it's corrupted.
-        conn.execute("CREATE TABLE conversations (id INTEGER PRIMARY KEY);", &[])
-            .unwrap();
-        drop(conn);
 
-        // Now run the transition function.
-        let conn = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().to_string())), crate::storage::api::Profile::Production).unwrap();
-        transition_from_meta_version(&conn).unwrap();
 
-        // The frankensqlite path uses a combined V13 base migration, so a
-        // legacy V10 marker is bridged to V13 and later idempotent repair fills
-        // in any missing V11-V13 objects.
-        let versions: Vec<i64> = conn
-            .query_all_map(
-                "SELECT version FROM _schema_migrations ORDER BY version;",
-                &[],
-                |r| r.get_typed(0),
-            )
-            .unwrap();
-        assert_eq!(
-            versions,
-            (1..=13).collect::<Vec<i64>>(),
-            "transition should bridge legacy V10 databases through the combined V13 base marker"
-        );
-    }
 
-    #[test]
-    fn franken_transition_from_current_meta_backfills_current_schema_marker() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test_current_transition.db");
 
-        let conn = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().to_string())), crate::storage::api::Profile::Production).unwrap();
-        conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);", &[])
-            .unwrap();
-        conn.execute(
-            "INSERT INTO meta(key, value) VALUES('schema_version', ?1);",
-            &[ParamValue::from(CURRENT_SCHEMA_VERSION.to_string())],
-        )
-        .unwrap();
-        conn.execute("CREATE TABLE conversations (id INTEGER PRIMARY KEY);", &[])
-            .unwrap();
-        drop(conn);
-
-        let conn = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().to_string())), crate::storage::api::Profile::Production).unwrap();
-        transition_from_meta_version(&conn).unwrap();
-
-        let versions: Vec<i64> = conn
-            .query_all_map(
-                "SELECT version FROM _schema_migrations ORDER BY version;",
-                &[],
-                |r| r.get_typed(0),
-            )
-            .unwrap();
-        assert_eq!(
-            versions,
-            (1..=CURRENT_SCHEMA_VERSION).collect::<Vec<i64>>(),
-            "current meta schema marker should backfill every known migration"
-        );
-    }
-
-    #[test]
-    fn franken_transition_skips_when_already_done() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test_transition_skip.db");
-
-        // Create a DB that already has _schema_migrations.
-        let conn = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().to_string())), crate::storage::api::Profile::Production).unwrap();
-        conn.execute(
-            "CREATE TABLE _schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL DEFAULT 'now');",
-        &[]).unwrap();
-        conn.execute("INSERT INTO _schema_migrations (version, name) VALUES (1, 'test');", &[])
-            .unwrap();
-
-        // Transition should be a no-op.
-        transition_from_meta_version(&conn).unwrap();
-
-        // Should still have exactly 1 entry.
-        let count: i64 = conn
-            .query_row_map("SELECT COUNT(*) FROM _schema_migrations;", &[], |row| {
-                row.get_typed(0)
-            })
-            .unwrap();
-        assert_eq!(
-            count, 1,
-            "transition should not re-run on already-transitioned DB"
-        );
-    }
-
-    #[test]
-    fn franken_transition_fresh_db_is_noop() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test_fresh_noop.db");
-
-        // Empty database — no meta table, no tables at all.
-        let conn = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().to_string())), crate::storage::api::Profile::Production).unwrap();
-        transition_from_meta_version(&conn).unwrap();
-
-        // _schema_migrations should NOT have been created.
-        let res = conn.query_all_map("SELECT * FROM \"_schema_migrations\";", &[], |_row| Ok(()));
-        assert!(
-            res.is_err(),
-            "transition should not create _schema_migrations on fresh DB"
-        );
-    }
-
-    #[test]
-    fn franken_transition_with_fts_virtual_table_succeeds() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test_transition_with_fts.db");
-
-        let conn = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().into_owned())), crate::storage::api::Profile::Production).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             INSERT INTO meta(key, value) VALUES('schema_version', '13');
-             CREATE TABLE conversations (id INTEGER PRIMARY KEY);
-             CREATE VIRTUAL TABLE fts_messages USING fts5(
-                 content,
-                 title,
-                 agent,
-                 workspace,
-                 source_path,
-                 created_at,
-                 content='',
-                 tokenize='porter unicode61'
-             );",
-        )
-        .unwrap();
-        drop(conn);
-
-        let conn = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().to_string())), crate::storage::api::Profile::Production).unwrap();
-        transition_from_meta_version(&conn).unwrap();
-
-        let versions: Vec<i64> = conn
-            .query_all_map(
-                "SELECT version FROM _schema_migrations ORDER BY version;",
-                &[],
-                |r| r.get_typed(0),
-            )
-            .unwrap();
-        assert_eq!(versions, (1..=13).collect::<Vec<i64>>());
-    }
-
-    #[test]
-    fn franken_storage_open_legacy_v13_with_fts_virtual_table_succeeds() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test_open_legacy_v13_with_fts.db");
-
-        let conn = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().into_owned())), crate::storage::api::Profile::Production).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             INSERT INTO meta(key, value) VALUES('schema_version', '13');
-             CREATE TABLE agents (
-                 id INTEGER PRIMARY KEY,
-                 slug TEXT NOT NULL
-             );
-             CREATE TABLE workspaces (
-                 id INTEGER PRIMARY KEY,
-                 path TEXT NOT NULL
-             );
-             CREATE TABLE sources (
-                 id TEXT PRIMARY KEY,
-                 kind TEXT NOT NULL,
-                 host_label TEXT,
-                 machine_id TEXT,
-                 platform TEXT,
-                 config_json TEXT,
-                 created_at INTEGER NOT NULL,
-                 updated_at INTEGER NOT NULL
-             );
-             CREATE TABLE conversations (
-                 id INTEGER PRIMARY KEY,
-                 agent_id INTEGER NOT NULL,
-                 workspace_id INTEGER,
-                 source_id TEXT NOT NULL DEFAULT 'local',
-                 external_id TEXT,
-                 title TEXT,
-                 source_path TEXT NOT NULL,
-                 started_at INTEGER,
-                 ended_at INTEGER
-             );
-             CREATE TABLE messages (
-                 id INTEGER PRIMARY KEY,
-                 conversation_id INTEGER NOT NULL,
-                 idx INTEGER NOT NULL,
-                 role TEXT NOT NULL,
-                 author TEXT,
-                 created_at INTEGER,
-                 content TEXT NOT NULL,
-                 extra_json TEXT,
-                 extra_bin BLOB
-             );
-             INSERT INTO agents(id, slug) VALUES (1, 'codex');
-             INSERT INTO workspaces(id, path) VALUES (1, '/data/projects/coding_agent_session_search');
-             INSERT INTO sources(id, kind, host_label, created_at, updated_at)
-             VALUES ('local', 'local', NULL, 1710000000000, 1710000000000);
-             INSERT INTO conversations(
-                 id,
-                 agent_id,
-                 workspace_id,
-                 source_id,
-                 external_id,
-                 title,
-                 source_path,
-                 started_at
-             )
-             VALUES (
-                 1,
-                 1,
-                 1,
-                 'local',
-                 'legacy-session',
-                 'legacy session',
-                 '/tmp/legacy.jsonl',
-                 1710000000000
-             );
-             INSERT INTO messages(id, conversation_id, idx, role, author, created_at, content)
-             VALUES (1, 1, 0, 'user', 'tester', 1710000000000, 'legacy content');
-             CREATE VIRTUAL TABLE fts_messages USING fts5(
-                 content,
-                 title,
-                 agent,
-                 workspace,
-                 source_path,
-                 created_at,
-                 message_id,
-                 content='',
-                 tokenize='porter unicode61'
-             );",
-        )
-        .unwrap();
-        drop(conn);
-
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
-
-        let versions: Vec<i64> = storage
-            .raw()
-            .query_all_map(
-                "SELECT version FROM _schema_migrations ORDER BY version;",
-                &[],
-                |r| r.get_typed(0),
-            )
-            .unwrap();
-        assert_eq!(versions, (1..=CURRENT_SCHEMA_VERSION).collect::<Vec<i64>>());
-    }
-
-    #[test]
-    #[ignore = "blocked on frankensqlite contentless-FTS fix (y8n3i / fsqlite bd-sf8dx): fsqlite 0.1.13 open-validation still demands a _content shadow for a legacy (no content= option) fts_messages schema row, so repair cannot even open; un-ignore via cljkz once fsqlite treats that as recoverable"]
-    fn franken_storage_open_repairs_duplicate_fts_messages_schema_rows() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test_open_repairs_duplicate_fts_schema.db");
-
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        let agent = Agent {
-            id: None,
-            slug: "codex".into(),
-            name: "Codex".into(),
-            version: None,
-            kind: AgentKind::Cli,
-        };
-        let agent_id = storage.ensure_agent(&agent).unwrap();
-        let conversation = Conversation {
-            id: None,
-            agent_slug: "codex".into(),
-            workspace: Some(PathBuf::from("/tmp/workspace")),
-            external_id: Some("dup-fts-schema".into()),
-            title: Some("Duplicate FTS schema".into()),
-            source_path: PathBuf::from("/tmp/dup-fts-schema.jsonl"),
-            started_at: Some(1_700_000_000_000),
-            ended_at: Some(1_700_000_000_100),
-            approx_tokens: Some(42),
-            metadata_json: serde_json::Value::Null,
-            messages: vec![Message {
-                id: None,
-                idx: 0,
-                role: MessageRole::User,
-                author: Some("user".into()),
-                created_at: Some(1_700_000_000_050),
-                content: "message that should remain queryable".into(),
-                extra_json: serde_json::Value::Null,
-                snippets: Vec::new(),
-            }],
-            source_id: LOCAL_SOURCE_ID.into(),
-            origin_host: None,
-        };
-        storage
-            .insert_conversation_tree(agent_id, None, &conversation)
-            .unwrap();
-        drop(storage);
-        materialize_fresh_fts_schema_via_rusqlite(&db_path).unwrap();
-
-        let duplicate_legacy_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')";
-        let conn = rusqlite_test_fixture_conn(&db_path);
-        conn.execute_batch("PRAGMA writable_schema = ON;").unwrap();
-        conn.execute(
-            "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
-             VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
-            [duplicate_legacy_fts_sql],
-        )
-        .unwrap();
-        conn.execute(
-            "DELETE FROM meta WHERE key = ?1",
-            [FTS_FRANKEN_REBUILD_META_KEY],
-        )
-        .unwrap();
-        // Simulate a pre-fix upgraded database that has never gone through the
-        // authoritative frankensqlite FTS rebuild generation yet.
-        conn.execute_batch("PRAGMA writable_schema = OFF;").unwrap();
-
-        let duplicate_rows: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(duplicate_rows, 2);
-        drop(conn);
-
-        let reopened = FrankenStorage::open(&db_path).unwrap();
-        assert_eq!(reopened.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
-        let generation_rows: Vec<String> = reopened
-            .raw()
-            .query_all_map(
-                "SELECT value FROM meta WHERE key = ?1",
-                fparams![FTS_FRANKEN_REBUILD_META_KEY],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-        assert_eq!(
-            generation_rows.len(),
-            0,
-            "canonical open should not eagerly rewrite FTS repair metadata"
-        );
-        reopened.ensure_search_fallback_fts_consistency().unwrap();
-        let repaired = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().into_owned())), crate::storage::api::Profile::Production).unwrap();
-        assert_eq!(franken_fts_schema_rows(&repaired).unwrap(), 1);
-
-        let total_messages: i64 = reopened
-            .raw()
-            .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
-                row.get_typed(0)
-            })
-            .unwrap();
-        let total_fts_rows: i64 = reopened
-            .raw()
-            .query_row_map("SELECT COUNT(*) FROM fts_messages", fparams![], |row| {
-                row.get_typed(0)
-            })
-            .unwrap();
-        assert_eq!(total_fts_rows, total_messages);
-    }
 
     #[test]
     fn fts_messages_integrity_reports_missing_shadow_tables() {
@@ -28216,11 +25606,58 @@ mod tests {
             conn.execute_batch("PRAGMA writable_schema = OFF;").unwrap();
         }
 
-        let open_err = FrankenConnection::open_writable(std::path::Path::new(&(corrupt_db_path.to_string_lossy().to_string())), crate::storage::api::Profile::Production)
-            .expect_err("orphaned fts_messages schema should fail during connection open");
-        let integrity = fts_messages_integrity_error_from_message(open_err.to_string())
-            .expect("open-time FTS corruption should map to the typed FTS integrity kind");
-        assert_eq!(integrity.missing_shadow_tables(), &["fts_messages_content"]);
+        // w1b Task B9 (salvage problem C, control-plane ruling): vanilla
+        // SQLite defers FTS5 shadow-table validation to the virtual
+        // table's `xConnect`, triggered by the first real reference to
+        // `fts_messages` -- not by opening the connection. The old
+        // the legacy embedded engine backend validated eagerly at open time (which this
+        // test originally pinned); that eagerness was a side effect of
+        // the legacy embedded engine's own vtable machinery, the very thing this wave
+        // retires. Opening a connection to a database carrying a single
+        // (non-duplicated) orphaned fts_messages declaration must now
+        // succeed:
+        let conn = FrankenConnection::open_writable(std::path::Path::new(&(corrupt_db_path.to_string_lossy().to_string())), crate::storage::api::Profile::Production)
+            .expect("a single orphaned fts_messages declaration (no name collision) must not fail connection open under vanilla SQLite's lazy vtable validation");
+
+        // -- and the corruption must surface the moment fts_messages is
+        // actually queried, pinning the real exposure timing so a future
+        // engine change silently moving it elsewhere goes noticed. Real
+        // SQLite's xConnect failure here is a generic "vtable constructor
+        // failed: fts_messages" -- unlike the legacy embedded engine's old open-time
+        // message, it does not name any specific missing shadow table, so
+        // `fts_messages_integrity_error_from_message` classifies it as
+        // structural FTS damage with an empty `missing_shadow_tables()`
+        // (verified: `query_err.to_string()` contains
+        // "vtable constructor failed").
+        let query_err = conn
+            .query_all_map(FTS_MESSAGES_INTEGRITY_PROBE_SQL, &[], |_row| Ok(()))
+            .expect_err("querying fts_messages is where xConnect shadow-table validation actually fires");
+        assert!(
+            query_err.to_string().contains("vtable constructor failed"),
+            "unexpected query-time error shape: {query_err}"
+        );
+        fts_messages_integrity_error_from_message(query_err.to_string())
+            .expect("query-time FTS corruption should map to the typed FTS integrity kind");
+
+        // The crate's real, production-wired detection entry point
+        // (validate_fts_messages_integrity_for_connection, consumed as an
+        // opt-in preflight check by indexer/mod.rs before indexing) must
+        // independently catch this too -- this is the guarantee that
+        // actually matters for operators, decoupled from whichever
+        // specific statement happens to trip xConnect first. Its
+        // shadow-table check is a real `sqlite_master` query rather than
+        // string-matching a driver error, so it correctly reports all five
+        // required tables as missing (none were ever created -- the
+        // fixture hand-inserted only the top-level declaration row).
+        let validate_err = validate_fts_messages_integrity_for_connection(&conn)
+            .expect_err("validate_fts_messages_integrity must detect the orphaned fts_messages declaration");
+        let integrity = validate_err
+            .downcast_ref::<FtsMessagesIntegrityError>()
+            .expect("validation failure should be the typed FTS integrity error");
+        assert_eq!(
+            integrity.missing_shadow_tables(),
+            &FTS_MESSAGES_REQUIRED_SHADOW_TABLES[..]
+        );
         let rendered = integrity.to_string();
         assert!(
             rendered.contains("fts_messages")
@@ -28238,19 +25675,25 @@ mod tests {
         let storage = FrankenStorage::open(&db_path).unwrap();
         assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
 
-        // The FTS5 virtual table is no longer created eagerly by the
-        // migration runner (V14 drops the old internal-content table and the
-        // current contentless table is recreated lazily — see MIGRATION_V14).
-        // Invoke the repair path to match normal cass startup, then assert
-        // there is exactly one fts_messages entry in sqlite_schema (no
-        // duplicates).
+        // w1b Task B7 interaction probe (control-plane ruling, bead z9fse.11):
+        // `schema::ensure` now creates fts_messages eagerly, so by this point
+        // the database already has exactly one, correct fts_messages schema
+        // row -- unlike the pre-B7 world this test originally documented,
+        // where V14 drops the V13-era table and nothing recreates it until a
+        // consistency pass runs. The old lazy-repair machinery
+        // (`ensure_search_fallback_fts_consistency`) still exists and still
+        // runs during normal cass startup until Task B8, so the interaction
+        // that actually matters now is the reverse of what this test used to
+        // check: does that machinery stay a clean no-op -- no duplicate
+        // schema row, still queryable -- when it finds a table that's
+        // already present and correct, rather than absent?
         storage
             .ensure_search_fallback_fts_consistency()
             .expect("ensure FTS consistency after fresh open");
         drop(storage);
 
         let c_reader = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().into_owned())), crate::storage::api::Profile::Production)
-            .expect("open DB via frankensqlite for sqlite_master inspection");
+            .expect("open DB via the legacy embedded engine for sqlite_master inspection");
         assert_eq!(
             franken_fts_schema_rows(&c_reader).unwrap(),
             1,
@@ -28264,7 +25707,7 @@ mod tests {
                 .raw()
                 .query_all_map("SELECT COUNT(*) FROM fts_messages", &[], |_row| Ok(()))
                 .is_ok(),
-            "fts_messages must be queryable through frankensqlite after open"
+            "fts_messages must be queryable through the legacy embedded engine after open"
         );
     }
 
@@ -28399,37 +25842,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn build_cass_migrations_applies_combined_v13() {
-        let conn = FrankenConnection::open_memory().unwrap();
-        let base_result = crate::storage::api::run_franken_migrations(
-            &conn,
-            &build_cass_migrations_before_tail_cache(),
-        )
-        .unwrap();
-        assert!(apply_conversation_tail_state_cache_migration(&conn).unwrap());
-        let post_result = crate::storage::api::run_franken_migrations(
-            &conn,
-            &build_cass_migrations_after_tail_cache(),
-        )
-        .unwrap();
-
-        assert!(base_result.was_fresh);
-        let mut applied = base_result.applied;
-        applied.push(15);
-        applied.extend(post_result.applied);
-        assert_eq!(
-            applied,
-            (13..=CURRENT_SCHEMA_VERSION).collect::<Vec<i64>>(),
-            "should apply combined V13 plus additive post-V13 migrations"
-        );
-        let current: i64 = conn
-            .query_row_map("SELECT MAX(version) FROM _schema_migrations;", &[], |row| {
-                row.get_typed(0)
-            })
-            .unwrap();
-        assert_eq!(current, CURRENT_SCHEMA_VERSION);
-    }
 
     #[test]
     #[serial]
@@ -28557,189 +25969,6 @@ mod tests {
             model_daily_rows > 0,
             "usage_models_daily should be populated"
         );
-    }
-
-    // =========================================================================
-    // FrankenConnectionManager tests (bead 3rlf8)
-    // =========================================================================
-
-    #[test]
-    fn connection_manager_creates_readers() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("cm.db");
-
-        // Create the DB first
-        let fs = FrankenStorage::open(&db_path).unwrap();
-        drop(fs);
-
-        let config = ConnectionManagerConfig {
-            reader_count: 3,
-            max_writers: 2,
-        };
-        let mgr = FrankenConnectionManager::new(&db_path, config).unwrap();
-        assert_eq!(mgr.reader_count(), 3);
-        assert_eq!(mgr.max_writers(), 2);
-    }
-
-    #[test]
-    fn connection_manager_clamps_zero_writer_limit_to_prevent_deadlock() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("cm.db");
-
-        let fs = FrankenStorage::open(&db_path).unwrap();
-        drop(fs);
-
-        let mgr = std::sync::Arc::new(
-            FrankenConnectionManager::new(
-                &db_path,
-                ConnectionManagerConfig {
-                    reader_count: 0,
-                    max_writers: 0,
-                },
-            )
-            .unwrap(),
-        );
-        assert_eq!(mgr.reader_count(), 1);
-        assert_eq!(mgr.max_writers(), 1);
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        let mgr_for_thread = std::sync::Arc::clone(&mgr);
-        std::thread::spawn(move || {
-            let result = mgr_for_thread.writer().map(|mut guard| {
-                guard.mark_committed();
-            });
-            tx.send(result.is_ok()).expect("writer result send");
-        });
-
-        assert!(
-            rx.recv_timeout(Duration::from_secs(10)).unwrap(),
-            "writer acquisition should not block forever when configured with zero writer slots"
-        );
-    }
-
-    #[test]
-    fn connection_manager_reader_round_robin() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("cm.db");
-
-        let fs = FrankenStorage::open(&db_path).unwrap();
-        drop(fs);
-
-        let config = ConnectionManagerConfig {
-            reader_count: 2,
-            max_writers: 1,
-        };
-        let mgr = FrankenConnectionManager::new(&db_path, config).unwrap();
-
-        // Reader index should advance (round-robin)
-        let idx_before = mgr.reader_idx.load(std::sync::atomic::Ordering::Relaxed);
-        let _r1 = mgr.reader();
-        let idx_after = mgr.reader_idx.load(std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(idx_after, idx_before + 1, "reader index should advance");
-    }
-
-    #[test]
-    fn connection_manager_writer_reads_and_writes() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("cm.db");
-
-        let fs = FrankenStorage::open(&db_path).unwrap();
-        drop(fs);
-
-        let mgr = FrankenConnectionManager::new(&db_path, Default::default()).unwrap();
-
-        // Acquire writer and insert data
-        {
-            let mut guard = mgr.writer().unwrap();
-            guard
-                .storage()
-                .raw()
-                .execute("CREATE TABLE IF NOT EXISTS cm_test (id INTEGER PRIMARY KEY, val TEXT)", &[])
-                .unwrap();
-            guard
-                .storage()
-                .raw()
-                .execute("INSERT INTO cm_test (val) VALUES ('hello')", &[])
-                .unwrap();
-            guard.mark_committed();
-        }
-
-        // Verify via reader (returns MutexGuard<SendFrankenConnection>)
-        let reader_guard = mgr.reader();
-        let rows = reader_guard
-            .query_all_map("SELECT val FROM cm_test", &[], |row| row.get_typed::<String>(0))
-            .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0], "hello");
-    }
-
-    #[test]
-    fn connection_manager_writer_guard_drops_releases_slot() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("cm.db");
-
-        let fs = FrankenStorage::open(&db_path).unwrap();
-        drop(fs);
-
-        let config = ConnectionManagerConfig {
-            reader_count: 1,
-            max_writers: 1,
-        };
-        let mgr = FrankenConnectionManager::new(&db_path, config).unwrap();
-
-        // Acquire and release writer
-        {
-            let mut guard = mgr.writer().unwrap();
-            guard.mark_committed();
-        }
-
-        // Should be able to acquire again (slot released)
-        let mut guard2 = mgr.writer().unwrap();
-        guard2.mark_committed();
-    }
-
-    #[test]
-    fn connection_manager_concurrent_writer_works() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("cm.db");
-
-        let fs = FrankenStorage::open(&db_path).unwrap();
-        drop(fs);
-
-        let config = ConnectionManagerConfig {
-            reader_count: 1,
-            max_writers: 2,
-        };
-        let mgr = FrankenConnectionManager::new(&db_path, config).unwrap();
-
-        {
-            let mut guard = mgr.concurrent_writer().unwrap();
-            guard
-                .storage()
-                .raw()
-                .execute("CREATE TABLE IF NOT EXISTS cm_conc (id INTEGER PRIMARY KEY, val TEXT)", &[])
-                .unwrap();
-            guard
-                .storage()
-                .raw()
-                .execute("INSERT INTO cm_conc (val) VALUES ('concurrent')", &[])
-                .unwrap();
-            guard.mark_committed();
-        }
-
-        let reader_guard = mgr.reader();
-        let rows = reader_guard
-            .query_all_map("SELECT val FROM cm_conc", &[], |row| row.get_typed::<String>(0))
-            .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0], "concurrent");
-    }
-
-    #[test]
-    fn connection_manager_default_config() {
-        let config = ConnectionManagerConfig::default();
-        assert_eq!(config.reader_count, 4);
-        assert!(config.max_writers > 0);
     }
 
     #[test]
@@ -28970,9 +26199,22 @@ mod tests {
         let db_path = dir.path().join("orphan_fk_self_heal.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
 
-        // Plant orphan rows directly: rows whose FK parent does not exist.
-        // FK enforcement is temporarily off so the planted rows can land.
-        storage.raw().execute("PRAGMA foreign_keys = OFF", &[]).unwrap();
+        // w1b Task B2b (R0-B3) exception, Ivan-adjudicated 2026-08-26: this
+        // FK-OFF toggle is a deliberate, narrow test-fixture exception, kept
+        // (not retired like the other 8 sites this task removed). Its job is
+        // to simulate the exact corrupted state `cleanup_orphan_fk_rows`
+        // exists to repair -- a child row whose FK parent is already gone
+        // (cass#202's crash-mid-transaction scenario). With FK enforcement
+        // truly on for every ordinary connection (this task's whole point),
+        // that state is structurally unreachable through any normal insert:
+        // the constraint itself is what prevents a child from ever
+        // referencing a missing parent. There is no `defer_foreign_keys` or
+        // reordering trick that produces it either -- deferred checking
+        // still runs at commit and would reject the very row this test
+        // needs to persist. Retiring this site would mean deleting the
+        // test's ability to construct its own regression fixture, not
+        // fixing a design flaw.
+        storage.raw().execute_batch_bypassing_foreign_keys_guard("PRAGMA foreign_keys = OFF").unwrap();
 
         // Seed a real conversation so a subset of children DO have valid
         // parents — we want the cleanup to be precise, not a table-flush.
@@ -29054,7 +26296,7 @@ mod tests {
             )
             .unwrap();
 
-        storage.raw().execute("PRAGMA foreign_keys = ON", &[]).unwrap();
+        storage.raw().execute_batch_bypassing_foreign_keys_guard("PRAGMA foreign_keys = ON").unwrap();
 
         // Sanity: the planted orphans are visible.
         let messages_before: i64 = storage
@@ -29149,7 +26391,10 @@ mod tests {
         let storage = FrankenStorage::open(&db_path).unwrap();
         let orphan_count = ORPHAN_FK_ID_CHUNK_SIZE + 3;
 
-        storage.raw().execute("PRAGMA foreign_keys = OFF", &[]).unwrap();
+        // w1b Task B2b (R0-B3) exception -- see
+        // `cleanup_orphan_fk_rows_removes_orphans_and_is_noop_on_clean_db`'s
+        // comment above for why this FK-OFF toggle is deliberately kept.
+        storage.raw().execute_batch_bypassing_foreign_keys_guard("PRAGMA foreign_keys = OFF").unwrap();
         {
             let mut tx = storage.raw().transaction().unwrap();
             for idx in 0..orphan_count {
@@ -29172,7 +26417,7 @@ mod tests {
             }
             tx.commit().unwrap();
         }
-        storage.raw().execute("PRAGMA foreign_keys = ON", &[]).unwrap();
+        storage.raw().execute_batch_bypassing_foreign_keys_guard("PRAGMA foreign_keys = ON").unwrap();
 
         let report = storage.cleanup_orphan_fk_rows().unwrap();
 
@@ -29206,7 +26451,10 @@ mod tests {
         let storage = FrankenStorage::open(&db_path).unwrap();
         let orphan_count = (ORPHAN_FK_ID_CHUNK_SIZE * 2) + 5;
 
-        storage.raw().execute("PRAGMA foreign_keys = OFF", &[]).unwrap();
+        // w1b Task B2b (R0-B3) exception -- see
+        // `cleanup_orphan_fk_rows_removes_orphans_and_is_noop_on_clean_db`'s
+        // comment above for why this FK-OFF toggle is deliberately kept.
+        storage.raw().execute_batch_bypassing_foreign_keys_guard("PRAGMA foreign_keys = OFF").unwrap();
         {
             let mut tx = storage.raw().transaction().unwrap();
             for idx in 0..orphan_count {
@@ -29222,7 +26470,7 @@ mod tests {
             }
             tx.commit().unwrap();
         }
-        storage.raw().execute("PRAGMA foreign_keys = ON", &[]).unwrap();
+        storage.raw().execute_batch_bypassing_foreign_keys_guard("PRAGMA foreign_keys = ON").unwrap();
 
         let report = storage.cleanup_orphan_fk_rows().unwrap();
 

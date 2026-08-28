@@ -137,14 +137,29 @@ def identity_file(identity):
 
 
 def target_file_scope(label):
-    """R2-B2 v2 (control-plane redesign 2026-08-26): map a target_label to
-    the inventory file(s) it corresponds to. The lib unittest target is the
-    one many-to-one case -- every `src/*.rs` file's #[test]s all run inside
-    a single `unittests src/lib.rs` binary/target, so its scope is a prefix
-    match; every other target (an integration test file or a bench file) is
-    exactly the file whose relative path equals the target label."""
+    """R2-B2 v2 (control-plane redesign 2026-08-26) + exec13 fix (2026-08-27,
+    upgrade/mod.rs HOLD_INCOMPLETE root cause): map a target_label to the
+    inventory file(s) it corresponds to. The lib unittest target is one
+    many-to-one case -- every `src/*.rs` file's #[test]s all run inside a
+    single `unittests src/lib.rs` binary/target, so its scope is a prefix
+    match. A directory-style integration test target (`tests/<name>/mod.rs`,
+    pre-2018-edition module layout) is a SECOND many-to-one case the original
+    exact-match design missed: `mod.rs` itself declares `mod submodule_a;
+    mod submodule_b;` and carries zero #[test]s of its own -- every real test
+    lives in a sibling file under the same directory (w1-test-inventory.py
+    keys by the file it scans, e.g. `tests/upgrade/compatibility.rs`, never
+    by the directory's mod.rs). Exact-matching the target_label against that
+    empty-of-tests mod.rs file always produced an empty in-scope identity set
+    (added=0, removed=0, expected_diff=0) regardless of how many tests were
+    actually added/removed in the submodules -- confirmed exec13 2026-08-27
+    against tests/upgrade/mod.rs (actual_diff=-8 for 8 tests genuinely
+    retired by commit 4b9059eb, expected_diff_from_inventory=0). Every other
+    target (a flat `tests/*.rs` file or a bench file) is still exactly the
+    file whose relative path equals the target label."""
     if label is not None and label.startswith('unittests '):
         return ('prefix', 'src/')
+    if label is not None and label.endswith('/mod.rs'):
+        return ('prefix', label[: -len('mod.rs')])
     return ('exact', label)
 
 

@@ -8,7 +8,6 @@
 //! Gate 2: Existing C SQLite database file compatibility (read rusqlite-created DBs)
 
 use frankensqlite::Connection;
-use frankensqlite::Connection as FrankenConnection;
 use frankensqlite::compat::RowExt;
 use fsqlite_types::value::SqliteValue;
 use std::fmt::Write as _;
@@ -16,27 +15,34 @@ use std::fmt::Write as _;
 use coding_agent_search::storage::sqlite::{CURRENT_SCHEMA_VERSION, FrankenStorage, SqliteStorage};
 
 #[test]
-fn rusqlite_is_dev_dependency_only() {
+fn rusqlite_is_bundled() {
+    // w1b Task B1 (plan 2026-08-25-w1-relational-sqlite-swap.md, control-plane
+    // adjudicated R0-B2): Stage B promotes rusqlite from a dev-only C-SQLite
+    // interop fixture to a real production storage backend (backend_sqlite.rs,
+    // Task B2), directly conflicting with this test's old assertion that it
+    // must stay out of `[dependencies]`. Rewritten to preserve the test's
+    // actual intent -- "the linked SQLite build is reproducible" -- by
+    // asserting the `bundled` feature is enabled (vendors and pins its own
+    // libsqlite3 version) rather than asserting dependency-table placement.
     let manifest: toml::Table =
         toml::from_str(include_str!("../Cargo.toml")).expect("parse Cargo.toml");
     let dependencies = manifest
         .get("dependencies")
         .and_then(toml::Value::as_table)
         .expect("Cargo.toml dependencies table");
-    assert!(
-        !dependencies.contains_key("rusqlite"),
-        "rusqlite must not ship as a normal production dependency; \
-         keep C-SQLite interop coverage in dev-dependencies only"
-    );
-
-    let dev_dependencies = manifest
-        .get("dev-dependencies")
+    let rusqlite = dependencies
+        .get("rusqlite")
         .and_then(toml::Value::as_table)
-        .expect("Cargo.toml dev-dependencies table");
+        .expect("rusqlite must be a normal production dependency (w1b Task B1)");
+    let features = rusqlite
+        .get("features")
+        .and_then(toml::Value::as_array)
+        .expect("rusqlite dependency must declare a features list");
+    let has_bundled = features.iter().any(|f| f.as_str() == Some("bundled"));
     assert!(
-        dev_dependencies.contains_key("rusqlite"),
-        "rusqlite should remain available to tests that build legacy \
-         C-SQLite fixture databases"
+        has_bundled,
+        "rusqlite must enable the `bundled` feature so the linked SQLite \
+         version is vendored/pinned, not resolved against the system libsqlite3"
     );
 }
 
@@ -808,93 +814,15 @@ fn index_list(conn: &rusqlite::Connection, table_name: &str) -> Vec<IndexListRow
     values
 }
 
-#[test]
-fn gate3_migration_transition_from_rusqlite_meta_to_schema_migrations() {
-    let dir = tempfile::TempDir::new().expect("temp dir");
-    let db_path = dir.path().join("transition_from_rusqlite.db");
-
-    // Step 1: Build an existing cass DB via rusqlite-backed storage.
-    {
-        let storage = SqliteStorage::open(&db_path).expect("create rusqlite-backed cass db");
-        assert_eq!(
-            storage.schema_version().expect("schema version"),
-            CURRENT_SCHEMA_VERSION
-        );
-    }
-
-    // Current bootstrap may materialize _schema_migrations immediately, so this
-    // gate only requires that the bookkeeping stays bounded and consistent
-    // across the FrankenStorage reopen.
-    {
-        let conn = rusqlite::Connection::open(&db_path).expect("open db with rusqlite");
-        let schema_migration_rows: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master
-                 WHERE type='table' AND name='_schema_migrations'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("query _schema_migrations existence");
-        assert!(
-            (0..=1).contains(&schema_migration_rows),
-            "bootstrap should create at most one _schema_migrations table, got {schema_migration_rows}"
-        );
-    }
-
-    // Step 2: Open with FrankenStorage to trigger transition + migration runner.
-    {
-        let storage = FrankenStorage::open(&db_path).expect("open with FrankenStorage");
-        assert_eq!(
-            storage.schema_version().expect("franken schema version"),
-            CURRENT_SCHEMA_VERSION
-        );
-    }
-
-    // Step 3: Validate transition artifacts via frankensqlite API.
-    // Note: this verifies migration bookkeeping without relying on C-SQLite
-    // parser behavior for newly-written schema rows.
-    let conn = FrankenConnection::open(db_path.to_str().expect("db path str"))
-        .expect("reopen with franken");
-    let rows = conn
-        .query("SELECT MAX(version) FROM _schema_migrations")
-        .expect("query max migrated version");
-    let max_version: i64 = rows
-        .first()
-        .expect("max version row")
-        .get_typed(0)
-        .expect("max version col");
-    assert_eq!(
-        max_version, CURRENT_SCHEMA_VERSION,
-        "transition should set _schema_migrations max(version) to CURRENT_SCHEMA_VERSION"
-    );
-
-    let rows = conn
-        .query("SELECT COUNT(*) FROM _schema_migrations")
-        .expect("query migrated row count");
-    let migration_count: i64 = rows
-        .first()
-        .expect("migration count row")
-        .get_typed(0)
-        .expect("migration count col");
-    assert!(
-        (1..=CURRENT_SCHEMA_VERSION).contains(&migration_count),
-        "_schema_migrations should keep a bounded number of bookkeeping rows, got {migration_count}"
-    );
-
-    let rows = conn
-        .query("SELECT value FROM meta WHERE key = 'schema_version'")
-        .expect("query meta.schema_version");
-    let meta_version: String = rows
-        .first()
-        .expect("meta row")
-        .get_typed(0)
-        .expect("meta value col");
-    assert_eq!(
-        meta_version,
-        CURRENT_SCHEMA_VERSION.to_string(),
-        "meta.schema_version should stay synchronized after transition"
-    );
-}
+// w1b Task B9 (2026-08-27, control-plane ruling): retired
+// gate3_migration_transition_from_rusqlite_meta_to_schema_migrations. The
+// meta->_schema_migrations transition/backfill machinery it guarded was
+// franken's incremental migration engine, which no longer exists after the
+// rusqlite swap -- there is nothing left to fabricate a "transition" for.
+// Ensuring the ledger contains an invented backfill history for a
+// rebuild-not-convert database would forge provenance (see
+// w1b-b4-deleted-tests.md for the full ruling text). See that ledger's
+// closed-world entry for this retirement.
 
 #[test]
 #[ignore = "Blocked by upstream frankensqlite sqlite_master/autoindex inconsistency on fresh migration path"]

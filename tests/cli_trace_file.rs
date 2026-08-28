@@ -3,7 +3,7 @@
 //! Bead: coding_agent_session_search-cass-fleet-resilience-20260608-uojcg.2.5
 //! ("Gate dependency tracing behind explicit trace surfaces").
 //!
-//! Dependency-level logs (frankensqlite / frankensearch / asupersync) must NOT
+//! Dependency-level logs (the legacy embedded engine / frankensearch / asupersync) must NOT
 //! appear during normal robot commands; they are available only through an
 //! explicit surface. These tests pin that contract for `--trace-file`: even under
 //! a deliberately noisy `RUST_LOG`, robot stdout stays pure JSON and stderr stays
@@ -48,7 +48,7 @@ fn assert_stderr_has_no_dependency_tracing(label: &str, stderr: &str) {
     let lower = stderr.to_lowercase();
     assert!(
         !lower.contains("fsqlite"),
-        "{label}: stderr leaked frankensqlite tracing despite --trace-file routing; stderr:\n{stderr}"
+        "{label}: stderr leaked the legacy embedded engine's tracing despite --trace-file routing; stderr:\n{stderr}"
     );
     for level in [" INFO ", " DEBUG ", " TRACE "] {
         assert!(

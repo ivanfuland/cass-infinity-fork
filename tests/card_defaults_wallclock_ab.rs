@@ -95,7 +95,7 @@ fn run_cell(label: &str, governor: &str, combine: &str, shadow: &str, corpus_siz
 
     // Full rebuild path matches the original `bench_card_defaults_ab`
     // intent. The trailing FTS repair used to fail with "callback
-    // requested query abort" under frankensqlite on fresh test DBs;
+    // requested query abort" under the legacy embedded engine on fresh test DBs;
     // that's fixed upstream (indexer opens a fresh storage for the
     // repair) so run_index returns Ok here. We still use
     // `force_rebuild=true` + `full=true` to exercise the full ingest +

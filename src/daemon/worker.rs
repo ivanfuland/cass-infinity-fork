@@ -247,7 +247,8 @@ impl EmbeddingWorker {
 
     /// Cancel jobs in the database.
     fn cancel_in_db(db_path: &str, model_id: Option<&str>) -> anyhow::Result<()> {
-        let storage = FrankenStorage::open(Path::new(db_path))?;
+        // w1b Task B8 (d16, open-consumer audit): write path.
+        let storage = FrankenStorage::open_writer(Path::new(db_path))?;
         storage.cancel_embedding_jobs(db_path, model_id)?;
         Ok(())
     }
@@ -258,7 +259,8 @@ impl EmbeddingWorker {
         let index_path = Path::new(&config.index_path);
 
         // Open storage and fetch messages
-        let storage = FrankenStorage::open(db_path)?;
+        // w1b Task B8 (d16, open-consumer audit): write path (job lifecycle).
+        let storage = FrankenStorage::open_writer(db_path)?;
         let messages = storage.fetch_messages_for_embedding()?;
         let total_docs = saturating_i64_from_usize(messages.len());
 

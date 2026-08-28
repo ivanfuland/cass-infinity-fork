@@ -4,9 +4,9 @@ use assert_cmd::Command;
 use coding_agent_search::model::types::{Agent, AgentKind, Conversation};
 use coding_agent_search::sources::config::{SourceDefinition, SourcesConfig, SyncSchedule};
 use coding_agent_search::sources::sync::{SourceSyncInfo, SyncResult, SyncStatus};
-use coding_agent_search::storage::sqlite::{
-    ConnectionManagerConfig, FrankenConnectionManager, SqliteStorage,
-};
+use coding_agent_search::storage::api::Profile;
+use coding_agent_search::storage::sqlite::SqliteStorage;
+use coding_agent_search::storage::testing::open_writable_for_tests;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -302,7 +302,7 @@ impl DoctorFixtureFactory {
         SqliteStorage::open(&db_path).expect("create fixture archive db");
         self.log(
             "seed_empty_archive_db",
-            "created frankensqlite archive schema",
+            "created the legacy embedded engine archive schema",
         );
         self
     }
@@ -1294,21 +1294,15 @@ impl DoctorFixtureFactory {
         let scratch_db = scratch_dir.join("fast-incomplete-agent-search.db");
         // Stage A note: this fixture must stay genuinely schema-free (an
         // "incomplete schema" archive) -- FrankenStorage::open would apply
-        // cass's real migrations, defeating the point. storage::api::Conn::
-        // open_writable is the schema-free path but deliberately
-        // crate-private (R2-F3); FrankenConnectionManager (the one public,
-        // schema-free way to reach it from outside the crate) is used
-        // instead, and its WriterGuard::drop already does the equivalent of
-        // the removed explicit close_in_place() (also crate-private) via its
-        // own best-effort close.
+        // cass's real migrations, defeating the point.
+        // storage::api::Conn::open_writable is the schema-free path but
+        // deliberately crate-private (R2-F3); w1b Task B4 (Q3) added
+        // `storage::testing::open_writable_for_tests` as the sanctioned
+        // schema-free bridge for integration-test fixtures like this one.
         {
-            let mgr = FrankenConnectionManager::new(
-                &scratch_db,
-                ConnectionManagerConfig { reader_count: 1, max_writers: 1 },
-            )
-            .expect("open connection manager for fast incomplete fixture db");
-            let guard = mgr.writer().expect("create fast incomplete fixture db");
-            drop(guard);
+            let conn = open_writable_for_tests(&scratch_db, Profile::Production)
+                .expect("create fast incomplete fixture db");
+            drop(conn);
         }
         let db_bytes = fs::read(&scratch_db).expect("read fast incomplete fixture db");
         self.write_confined_file(&db_path, &db_bytes, "archive_database_incomplete_schema");

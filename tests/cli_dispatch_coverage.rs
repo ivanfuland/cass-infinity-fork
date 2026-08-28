@@ -12,28 +12,23 @@ use coding_agent_search::evidence_bundle::{
     EvidenceBundleChunk, EvidenceBundleChunkRole, EvidenceBundleKind, EvidenceBundleManifest,
 };
 use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
-use coding_agent_search::storage::api::Conn as FrankenConnection;
-use coding_agent_search::storage::sqlite::{ConnectionManagerConfig, FrankenConnectionManager};
+use coding_agent_search::storage::api::{Conn as FrankenConnection, Profile};
+use coding_agent_search::storage::testing::open_test_writer;
 use predicates::prelude::*;
 
 /// Stage A note: `storage::api::Conn::open_writable` is deliberately
 /// crate-private (R2-F3), so this integration test (a separate crate)
 /// bootstraps a deliberately-malformed/incomplete-schema fixture through
-/// `FrankenConnectionManager` (a single-writer/single-reader pool the
-/// production connection-manager code path already uses) -- the one
-/// *public*, schema-free way to reach it from outside the crate.
-/// `FrankenStorage::open` is not an option for these two malformed-schema
-/// fixtures specifically: it would apply cass's real migrations first,
-/// defeating the point of a schema that's deliberately missing/incomplete.
+/// `storage::testing::open_test_writer` (w1b Task B4 Q3's sanctioned
+/// schema-free bridge for `tests/`) -- `FrankenStorage::open` is not an
+/// option for these two malformed-schema fixtures specifically: it would
+/// apply cass's real migrations first, defeating the point of a schema
+/// that's deliberately missing/incomplete.
 fn with_writable_db<R>(
     path: &std::path::Path,
     write: impl FnOnce(&FrankenConnection) -> anyhow::Result<R>,
 ) -> anyhow::Result<R> {
-    let mgr = FrankenConnectionManager::new(
-        path,
-        ConnectionManagerConfig { reader_count: 1, max_writers: 1 },
-    )?;
-    let mut guard = mgr.writer()?;
+    let mut guard = open_test_writer(path, Profile::Production)?;
     let result = write(guard.storage().raw())?;
     guard.mark_committed();
     Ok(result)
@@ -498,8 +493,13 @@ fn seed_analytics_remote_source_tokens_fixture(temp_home: &TempDir) {
         .path()
         .join(".local/share/coding-agent-search/agent_search.db");
     let conn = coding_agent_search::storage::sqlite::FrankenStorage::open(&db_path).map(|s| s.into_raw()).unwrap();
-    conn.execute("ALTER TABLE conversations ADD COLUMN origin_host TEXT", &[])
-        .unwrap();
+    // w1b Task B9 (2026-08-27): `conversations.origin_host` is part of
+    // storage::schema::ensure's base DDL from the first CREATE TABLE, unlike
+    // the legacy incremental migration engine where it only existed on
+    // databases that had been incrementally migrated far enough to pick up
+    // that column. The `ALTER TABLE ... ADD COLUMN origin_host` this fixture
+    // used to need is now a duplicate-column error against a database built
+    // through the current engine.
 
     let workspace_rows = conn
         .query_all_map(
@@ -553,8 +553,13 @@ fn seed_analytics_remote_source_tools_fixture(temp_home: &TempDir) {
         .path()
         .join(".local/share/coding-agent-search/agent_search.db");
     let conn = coding_agent_search::storage::sqlite::FrankenStorage::open(&db_path).map(|s| s.into_raw()).unwrap();
-    conn.execute("ALTER TABLE conversations ADD COLUMN origin_host TEXT", &[])
-        .unwrap();
+    // w1b Task B9 (2026-08-27): `conversations.origin_host` is part of
+    // storage::schema::ensure's base DDL from the first CREATE TABLE, unlike
+    // the legacy incremental migration engine where it only existed on
+    // databases that had been incrementally migrated far enough to pick up
+    // that column. The `ALTER TABLE ... ADD COLUMN origin_host` this fixture
+    // used to need is now a duplicate-column error against a database built
+    // through the current engine.
 
     let workspace_rows = conn
         .query_all_map(
@@ -942,10 +947,24 @@ fn doctor_fix_preserves_corrupted_archive_bundle_without_repair_plan() {
         wal_bytes,
         "WAL sidecar bytes must remain in place with the archive bundle"
     );
-    assert_eq!(
-        fs::read(data_dir.join("agent_search.db-shm")).unwrap(),
-        shm_bytes,
-        "SHM sidecar bytes must remain in place with the archive bundle"
+    // w1b Task B9 (2026-08-27, equivalence-gate-caught, control-plane
+    // ruling, same sidecar family as commit 7d325529): the -shm sidecar is
+    // not exempt from being *touched* the way the -wal above is -- it is
+    // vanilla SQLite's engine-managed WAL-index shared-memory region, and
+    // even a read-only connection attempt against this exact garbage file
+    // recreates it (reproduced directly with the stock `sqlite3` CLI:
+    // `sqlite3 -readonly db.db "PRAGMA journal_mode;"` against a copy of
+    // this fixture fails closed with "file is not a database" (26) as
+    // expected, yet still grows the -shm file from 15 garbage bytes to a
+    // real 32768-byte WAL-index header as a side effect of the failed
+    // open attempt -- before cass's own code ever runs). Asserting its
+    // exact bytes is asserting a vanilla-SQLite structural impossibility,
+    // not a doctor behavior; the db and -wal byte-for-byte checks above
+    // are what carry this test's actual "forensic evidence undisturbed"
+    // intent.
+    assert!(
+        data_dir.join("agent_search.db-shm").exists(),
+        "SHM sidecar must still exist alongside the archive bundle"
     );
 
     let entries: Vec<String> = fs::read_dir(&data_dir)

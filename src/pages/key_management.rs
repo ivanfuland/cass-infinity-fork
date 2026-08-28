@@ -524,7 +524,7 @@ fn derive_kek_hkdf(secret: &[u8], salt: &[u8]) -> Result<zeroize::Zeroizing<[u8;
         // [coding_agent_session_search-htiim] Capture actual_len BEFORE
         // try_into consumes the Vec so the message can show the actual
         // KEK length operators / future contributors need to debug a
-        // frankensqlite / hkdf upstream regression.
+        // the legacy embedded engine / hkdf upstream regression.
         anyhow::anyhow!(
             "HKDF expansion produced invalid KEK length: expected 32, got {}",
             actual_len
@@ -2407,7 +2407,7 @@ mod tests {
     /// `derive_kek_hkdf` returned bare "HKDF expansion produced
     /// invalid KEK length" with no diagnostic; post-fix, the message
     /// carries the actual length so operators can debug a
-    /// frankensqlite / hkdf upstream regression that returned the
+    /// the legacy embedded engine / hkdf upstream regression that returned the
     /// wrong KEK size.
     #[test]
     fn derive_kek_hkdf_error_message_pins_actual_kek_length() {

@@ -6,7 +6,7 @@
 //!
 //! This is the regression matrix that proves the uojcg.2.1 hygiene chokepoint
 //! holds across the *classes* of noise the report and operators actually hit:
-//! frankensqlite tracing bursts (observed polluting `cass view`), slow-query /
+//! the legacy embedded engine tracing bursts (observed polluting `cass view`), slow-query /
 //! drop-close / database-busy WARN messages from the storage layer, and
 //! host-pressure (OOM / disk) diagnostics. For every (noise-class × robot
 //! command) pair, stdout must remain a single valid JSON document and stderr must
@@ -150,7 +150,7 @@ fn robot_commands_stay_parseable_across_all_noise_classes() {
 
 #[test]
 fn view_stays_clean_under_dependency_burst() {
-    // The exact failure the report observed: `cass view` polluted by frankensqlite
+    // The exact failure the report observed: `cass view` polluted by the legacy embedded engine
     // tracing. Under the heaviest burst, the JSON payload must not interleave with
     // dependency spans.
     let (_, burst) = noise_classes()[0];

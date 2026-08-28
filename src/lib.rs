@@ -77,7 +77,7 @@ use base64::prelude::*;
 use chrono::Utc;
 use clap::{Arg, ArgAction, Command, CommandFactory, Parser, Subcommand, ValueEnum, ValueHint};
 // w1a Task A5 (mirrors sqlite.rs Task A4a): resolve the historical
-// `frankensqlite` imports through the backend-agnostic `storage::api` facade.
+// `the legacy embedded engine` imports through the backend-agnostic `storage::api` facade.
 use storage::api::{Conn as FrankenConnection, Row as FrankenRow, StorageError, Value};
 type ParamValue = Value;
 type SqliteValue = Value;
@@ -9178,7 +9178,7 @@ fn run_forget_command(
         });
     }
 
-    let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
+    let storage = FrankenStorage::open_writer(&db_path).map_err(|e| CliError {
         code: 5,
         kind: "forget",
         message: format!("failed to open canonical database: {e}"),
@@ -14340,26 +14340,14 @@ struct FailurePatternRule {
 
 fn swarm_failure_pattern_rules() -> Vec<FailurePatternRule> {
     vec![
-        FailurePatternRule {
-            kind: "fsqlite-query-shape-regression",
-            severity: "high",
-            title: "FrankenSQLite query-shape regression",
-            summary: "Evidence mentions fsqlite planner/query-shape failures that should become targeted SQL regression tests.",
-            keywords: &[
-                "frankensqlite",
-                "fsqlite",
-                "execute_join_select",
-                "fts5",
-                "query-shape",
-                "planner",
-                "join select",
-            ],
-            suggested_test: "Add a fixture-backed SQL regression that reproduces the exact fsqlite query shape and expected rows.",
-            suggested_test_target: "tests/frankensqlite_*.rs or upstream /data/projects/frankensqlite reproducer",
-            candidate_bead_title: "Pin fsqlite query-shape regression with downstream cass fixture coverage",
-            candidate_bead_type: "test",
-            candidate_bead_priority: 1,
-        },
+        // w1b Task B5 (plan delta d14, 2026-08-26): the `fsqlite-query-shape-regression`
+        // rule that used to live here (matching "frankensqlite"/"fsqlite"/
+        // "execute_join_select"/"fts5"/"query-shape"/"planner"/"join select" in
+        // evidence text) is retired -- the legacy embedded engine's query planner is not
+        // this crate's pin to regression-test against once the storage
+        // engine converges on stock SQLite (see contention_diagnostics.rs's
+        // matching six-to-three-class retirement for the storage-contention
+        // side of this same wave). Identity is `w1b-b4-deleted-tests.md`.
         FailurePatternRule {
             kind: "panic-surface-regression",
             severity: "high",
@@ -14575,9 +14563,6 @@ fn swarm_failure_pattern_false_positive_controls(kind: &str) -> Vec<&'static str
         }
         "flaky-or-toxic-suite" => {
             controls.push("distinguish explicitly ignored stress proofs from required gates");
-        }
-        "fsqlite-query-shape-regression" => {
-            controls.push("confirm the failing query shape against the pinned fsqlite revision");
         }
         _ => {}
     }
@@ -16904,7 +16889,7 @@ fn analytics_query_filter(
     Ok(filter)
 }
 
-/// Open a read-only frankensqlite connection for analytics queries.
+/// Open a read-only the legacy embedded engine connection for analytics queries.
 fn open_franken_analytics_db(
     data_dir: &Option<PathBuf>,
     db_path_override: Option<&PathBuf>,
@@ -17310,7 +17295,7 @@ fn run_analytics_rebuild(
     // Progress diagnostics go to stderr.
     eprintln!("Rebuilding analytics (Track A)...");
 
-    let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
+    let storage = FrankenStorage::open_writer(&db_path).map_err(|e| CliError {
         code: 9,
         kind: CliErrorKind::DbError.kind_str(),
         message: format!("Failed to open database: {e}"),
@@ -17517,7 +17502,7 @@ fn run_analytics_validate(
                         .into_iter()
                         .all(|table| analytics::query::table_exists(&pre_conn, table))
                     {
-                        let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
+                        let storage = FrankenStorage::open_writer(&db_path).map_err(|e| CliError {
                             code: 9,
                             kind: CliErrorKind::DbError.kind_str(),
                             message: format!("Failed to open database for analytics repair: {e}"),
@@ -17560,7 +17545,7 @@ fn run_analytics_validate(
                     // the intact `token_usage` ledger into fresh
                     // `token_daily_stats` rows. Transactional inside
                     // rebuild_token_daily_stats.
-                    let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
+                    let storage = FrankenStorage::open_writer(&db_path).map_err(|e| CliError {
                         code: 9,
                         kind: CliErrorKind::DbError.kind_str(),
                         message: format!(
@@ -20601,7 +20586,7 @@ fn analytics_requests_structured_output(cmd: &AnalyticsCommand, cli: &Cli) -> bo
 }
 
 /// Default tracing directive for interactive human mode: emit INFO and above
-/// but suppress frankensqlite internal telemetry that spams at INFO level.
+/// but suppress the legacy embedded engine internal telemetry that spams at INFO level.
 ///
 /// `EnvFilter` uses a colon-separated hierarchy, so `fsqlite=warn` covers
 /// `fsqlite`'s `runtime`/`cx` sub-targets, etc. Crate-level targets like
@@ -20669,7 +20654,7 @@ const DEFAULT_DEP_LOG_SUPPRESSION: &str = concat!(
 ///
 /// Robot and quiet modes are machine-consumed: they pin the filter to `error`
 /// (unless the operator explicitly opts into `--verbose`) so that dependency
-/// INFO/WARN logging — frankensqlite telemetry in particular — can never
+/// INFO/WARN logging — the legacy embedded engine telemetry in particular — can never
 /// interleave with a JSON stream, even when `RUST_LOG` is set in the
 /// environment. This is the single source of truth for robot stdout/stderr
 /// hygiene; the regression suite in `tests/cli_robot_log_hygiene.rs` exercises it
@@ -20699,7 +20684,7 @@ fn build_robot_aware_log_filter(robot_mode: bool, verbose: bool, quiet: bool) ->
 /// (coding_agent_session_search-cass-fleet-resilience-20260608-uojcg.2.5).
 ///
 /// When an operator opts into `--trace-file`, dependency-level diagnostics
-/// (frankensqlite / frankensearch / asupersync, etc.) are captured at `debug`
+/// (the legacy embedded engine / frankensearch / asupersync, etc.) are captured at `debug`
 /// into that file as a deliberate trace artifact, while the stderr layer stays
 /// pinned to its robot-aware level so machine output is never corrupted. This is
 /// the "explicit trace surface" the bead requires: deep logs are available on
@@ -20797,7 +20782,7 @@ mod log_hygiene_tests {
 
     #[test]
     fn dep_suppression_quiets_fsqlite_targets() {
-        // The fallback list must keep frankensqlite telemetry below INFO so even
+        // The fallback list must keep the legacy embedded engine telemetry below INFO so even
         // human-mode stderr is not flooded.
         assert!(DEFAULT_DEP_LOG_SUPPRESSION.starts_with("info"));
         assert!(DEFAULT_DEP_LOG_SUPPRESSION.contains("fsqlite=warn"));
@@ -27738,11 +27723,20 @@ fn stats_message_count_sql(source_where: &str) -> String {
 }
 
 fn stats_workspace_count_sql(source_where: &str) -> String {
+    // w1b Task B9 (2026-08-27, equivalence-gate-caught): `ORDER BY COUNT(*)
+    // DESC` alone has no tiebreaker for workspaces with equal counts, so
+    // SQLite's output order for tied groups is whatever its query plan
+    // happens to produce -- not a guarantee of the SQL itself, and it can
+    // (and did) flip between two databases with byte-identical logical
+    // content but a different physical page layout (a rebuilt fixture vs.
+    // the original file). `c.workspace_id ASC` makes tied groups
+    // deterministic without changing any single-workspace or
+    // clearly-ordered-by-count result.
     if source_where.is_empty() {
-        "SELECT c.workspace_id, COUNT(*) FROM conversations c WHERE c.workspace_id IS NOT NULL GROUP BY c.workspace_id ORDER BY COUNT(*) DESC".to_string()
+        "SELECT c.workspace_id, COUNT(*) FROM conversations c WHERE c.workspace_id IS NOT NULL GROUP BY c.workspace_id ORDER BY COUNT(*) DESC, c.workspace_id ASC".to_string()
     } else {
         format!(
-            "SELECT c.workspace_id, COUNT(*) FROM conversations c{source_where} AND c.workspace_id IS NOT NULL GROUP BY c.workspace_id ORDER BY COUNT(*) DESC"
+            "SELECT c.workspace_id, COUNT(*) FROM conversations c{source_where} AND c.workspace_id IS NOT NULL GROUP BY c.workspace_id ORDER BY COUNT(*) DESC, c.workspace_id ASC"
         )
     }
 }
@@ -28411,7 +28405,7 @@ fn run_dedup(
     }
 
     let storage =
-        crate::storage::sqlite::FrankenStorage::open(&db_path).map_err(|err| CliError {
+        crate::storage::sqlite::FrankenStorage::open_writer(&db_path).map_err(|err| CliError {
             code: 3,
             kind: CliErrorKind::DbOpen.kind_str(),
             message: format!("failed to open canonical DB for dedup: {err}"),
@@ -29200,6 +29194,7 @@ struct DoctorRootCauseIncident {
 struct DoctorDatabaseIntegrityProbe {
     quick_check_status: String,
     integrity_check_diagnostics: Vec<String>,
+    foreign_key_check_diagnostics: Vec<String>,
 }
 
 const DOCTOR_DATABASE_INTEGRITY_DIAGNOSTIC_LIMIT: usize = 20;
@@ -29463,9 +29458,41 @@ fn doctor_database_integrity_probe(
         Vec::new()
     };
 
+    // w1b Task B2c (spec v6.1 §10, R3-B2): `quick_check`/`integrity_check`
+    // are page-level b-tree probes and never inspect referential integrity,
+    // so a dangling FK reference passes both as "ok". `PRAGMA
+    // foreign_key_check` is the pragma that actually scans for existing FK
+    // violations. Gated on `quick_check_ok` like `integrity_check` above --
+    // no point scanning FK state on a database whose b-tree pages are
+    // already known-corrupt.
+    let foreign_key_check_diagnostics = if quick_check_ok {
+        let rows: Vec<(String, Option<i64>, String, i64)> = conn
+            .query_all_map("PRAGMA foreign_key_check;", &[], |row: &FrankenRow| {
+                Ok((
+                    row.get_typed(0)?,
+                    row.get_typed(1)?,
+                    row.get_typed(2)?,
+                    row.get_typed(3)?,
+                ))
+            })
+            .map_err(|err| format!("running PRAGMA foreign_key_check: {err}"))?;
+        rows.into_iter()
+            .take(DOCTOR_DATABASE_INTEGRITY_DIAGNOSTIC_LIMIT)
+            .map(|(table, rowid, parent, fkid)| {
+                let rowid = rowid
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "NULL".to_string());
+                format!("table={table} rowid={rowid} references={parent} fkid={fkid}")
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     Ok(DoctorDatabaseIntegrityProbe {
         quick_check_status,
         integrity_check_diagnostics,
+        foreign_key_check_diagnostics,
     })
 }
 
@@ -29473,13 +29500,16 @@ impl DoctorDatabaseIntegrityProbe {
     fn is_ok(&self) -> bool {
         self.quick_check_status.trim().eq_ignore_ascii_case("ok")
             && self.integrity_check_diagnostics.is_empty()
+            && self.foreign_key_check_diagnostics.is_empty()
     }
 
     fn failed_pragma_name(&self) -> &'static str {
-        if self.quick_check_status.trim().eq_ignore_ascii_case("ok") {
+        if !self.quick_check_status.trim().eq_ignore_ascii_case("ok") {
+            "quick_check"
+        } else if !self.integrity_check_diagnostics.is_empty() {
             "integrity_check"
         } else {
-            "quick_check"
+            "foreign_key_check"
         }
     }
 
@@ -29487,14 +29517,13 @@ impl DoctorDatabaseIntegrityProbe {
         if !self.quick_check_status.trim().eq_ignore_ascii_case("ok") {
             return self.quick_check_status.trim().to_string();
         }
-        let mut summary = self
-            .integrity_check_diagnostics
-            .iter()
-            .take(3)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join("; ");
-        let omitted = self.integrity_check_diagnostics.len().saturating_sub(3);
+        let diagnostics: &[String] = if !self.integrity_check_diagnostics.is_empty() {
+            &self.integrity_check_diagnostics
+        } else {
+            &self.foreign_key_check_diagnostics
+        };
+        let mut summary = diagnostics.iter().take(3).cloned().collect::<Vec<_>>().join("; ");
+        let omitted = diagnostics.len().saturating_sub(3);
         if omitted > 0 {
             if !summary.is_empty() {
                 summary.push_str("; ");
@@ -29506,6 +29535,92 @@ impl DoctorDatabaseIntegrityProbe {
         } else {
             summary
         }
+    }
+}
+
+#[cfg(test)]
+mod doctor_foreign_key_check_tests {
+    use super::*;
+    use crate::storage::sqlite::FrankenStorage;
+    use tempfile::TempDir;
+
+    // w1b Task B2c (spec v6.1 §10, R3-B2): `quick_check`/`integrity_check`
+    // are page-level b-tree probes -- they never inspect referential
+    // integrity, so a dangling FK reference sails through both as "ok".
+    // `PRAGMA foreign_key_check` is the only pragma that actually scans for
+    // existing FK violations (independent of whether the `foreign_keys`
+    // pragma was on when the orphan was written), which is why it needs its
+    // own doctor-probe wiring rather than piggybacking on integrity_check.
+    #[test]
+    fn doctor_database_integrity_probe_flags_orphan_foreign_key_rows() {
+        let dir = TempDir::new().expect("temp dir");
+        let db_path = dir.path().join("orphan_fk_doctor.db");
+        let storage = FrankenStorage::open(&db_path).expect("open db");
+
+        // Same fixture-construction pattern as
+        // `cleanup_orphan_fk_rows_removes_orphans_and_is_noop_on_clean_db`
+        // (storage/sqlite.rs): with FK enforcement genuinely on for every
+        // ordinary connection, an orphan child row is structurally
+        // unreachable through any normal insert, so the fixture must plant
+        // it via the same narrow test-only bypass B2b introduced for that
+        // purpose.
+        storage
+            .raw()
+            .execute_batch_bypassing_foreign_keys_guard("PRAGMA foreign_keys = OFF")
+            .expect("disable FK for fixture setup");
+        storage
+            .raw()
+            .execute(
+                "INSERT INTO agents(id, slug, name, kind, created_at, updated_at) \
+                 VALUES(1, 'test-agent', 'Test Agent', 'cli', 0, 0)",
+                &[],
+            )
+            .expect("insert agent");
+        storage
+            .raw()
+            .execute(
+                "INSERT INTO messages(id, conversation_id, idx, role, content) \
+                 VALUES(1, 99999, 0, 'user', 'orphan message')",
+                &[],
+            )
+            .expect("insert orphan message referencing a nonexistent conversation");
+        storage
+            .raw()
+            .execute_batch_bypassing_foreign_keys_guard("PRAGMA foreign_keys = ON")
+            .expect("restore FK enforcement");
+        drop(storage);
+
+        // Plan Step 1 calls for "关 FK 插入后重开" -- reopen fresh so the
+        // probe runs against a connection that never itself toggled FK off,
+        // matching how `cass doctor` would actually encounter this database.
+        let reopened = FrankenStorage::open(&db_path).expect("reopen db");
+        let probe = doctor_database_integrity_probe(reopened.raw())
+            .expect("probe should run without error even when it finds violations");
+
+        assert!(
+            !probe.is_ok(),
+            "expected the orphan FK row to fail the doctor integrity probe, got {probe:?}"
+        );
+        assert_eq!(probe.failed_pragma_name(), "foreign_key_check");
+        assert!(
+            probe.diagnostic_summary().contains("messages"),
+            "expected the foreign_key_check diagnostic to name the offending table, got: {}",
+            probe.diagnostic_summary()
+        );
+    }
+
+    #[test]
+    fn doctor_database_integrity_probe_is_healthy_on_clean_db() {
+        let dir = TempDir::new().expect("temp dir");
+        let db_path = dir.path().join("clean_doctor.db");
+        let storage = FrankenStorage::open(&db_path).expect("open db");
+
+        let probe = doctor_database_integrity_probe(storage.raw()).expect("probe should run");
+
+        assert!(
+            probe.is_ok(),
+            "expected a freshly-opened, empty database to pass the doctor integrity probe, got {probe:?}"
+        );
     }
 }
 
@@ -29526,7 +29641,10 @@ fn doctor_anomaly_for_check(name: &str, status: &str, message: &str) -> DoctorAn
             }
         }
         "database" => {
-            if message.contains("quick_check") || message.contains("integrity_check") {
+            if message.contains("quick_check")
+                || message.contains("integrity_check")
+                || message.contains("foreign_key_check")
+            {
                 DoctorAnomaly::ArchiveDbCorrupt
             } else {
                 DoctorAnomaly::ArchiveDbUnreadable
@@ -42059,7 +42177,7 @@ fn doctor_candidate_probe_frankensqlite(
     let conn = FrankenConnection::open_writable(std::path::Path::new(&(candidate_db_path.to_string_lossy().as_ref())), crate::storage::api::Profile::Production)
         .map_err(|err| {
             format!(
-                "failed to open candidate archive DB with frankensqlite at {}: {err}",
+                "failed to open candidate archive DB with the legacy embedded engine at {}: {err}",
                 candidate_db_path.display()
             )
         })?;
@@ -42572,7 +42690,7 @@ fn doctor_candidate_reconstruct_archive_from_raw_mirror(
 ) -> std::result::Result<(usize, usize, Vec<String>, Vec<DoctorFsMutationReceipt>), String> {
     let storage = crate::storage::sqlite::SqliteStorage::open(candidate_db_path).map_err(|err| {
         format!(
-            "failed to initialize reconstructed candidate archive DB {} with frankensqlite storage: {err}",
+            "failed to initialize reconstructed candidate archive DB {} with the legacy embedded engine storage: {err}",
             candidate_db_path.display()
         )
     })?;
@@ -43857,11 +43975,11 @@ fn verify_doctor_backup_record(
                     drop(connection);
                     verification
                         .warnings
-                        .push("frankensqlite read-only probe passed".to_string());
+                        .push("the legacy embedded engine read-only probe passed".to_string());
                 }
                 Err(err) => {
                     verification.blocked_reasons.push(format!(
-                        "frankensqlite read-only probe failed for prior-live backup DB: {err}"
+                        "the legacy embedded engine read-only probe failed for prior-live backup DB: {err}"
                     ));
                 }
             }
@@ -44083,7 +44201,7 @@ fn run_doctor_backup_restore_rehearsal(
             ) {
                 Ok(connection) => drop(connection),
                 Err(err) => blocked_reasons.push(format!(
-                    "restore rehearsal frankensqlite probe failed: {err}"
+                    "restore rehearsal the legacy embedded engine probe failed: {err}"
                 )),
             }
         }
@@ -45250,6 +45368,24 @@ fn doctor_archive_export_verify_target(target_root: &Path, data_dir: &Path) -> s
             ) {
                 continue;
             }
+            // w1b Task B9 (2026-08-27, equivalence-gate-caught, control-
+            // plane ruling, same sidecar family as commit 7d325529): the
+            // manifest correctly excludes -shm/-wal sidecars from the
+            // exported asset set (policy: not exportable, vanilla SQLite
+            // engine-managed transient state) -- but this verify function's
+            // own frankensqlite_probe below opens the copied canonical db
+            // readonly to sanity-check it, and that mere open spontaneously
+            // recreates fresh -shm/-wal files right here in the target
+            // directory (reproduced directly: even a read-only connection
+            // to a WAL-mode database creates/touches these two files; see
+            // tests/cli_doctor.rs's doctor_no_write_snapshot and this
+            // file's own write_set_snapshot exemptions for the same root
+            // cause). Without this exemption, every archive-export verify
+            // pass self-inflicts a false-positive "extra_file" issue on the
+            // very files its own probe just created.
+            if relative.ends_with("-shm") || relative.ends_with("-wal") {
+                continue;
+            }
             if !expected_paths.contains(&relative) {
                 issues.push(serde_json::json!({
                     "kind": "extra_file",
@@ -45382,6 +45518,174 @@ fn doctor_archive_export_event_log(
         ),
     );
     doctor_event_log_from_events("embedded_archive_export_events", events)
+}
+
+/// R1-B2/R2-F1: checkpoint the source canonical db before archive export
+/// copies it. `doctor_archive_export_collect_assets` hashes/copies the main
+/// db file directly off disk, and `-wal`/`-shm` sidecars are never exported
+/// (`doctor_asset_policy` refuses `Export` for
+/// `DoctorAssetClass::ArchiveDbSidecar`) -- so any committed transaction
+/// still sitting only in `-wal` was silently excluded from the export
+/// unless the main db file already carries it.
+///
+/// This opens its own short-lived `Profile::Production` writer connection
+/// (a new write point distinct from any long-lived indexer/writer handle
+/// already open on the same path) and fails closed -- refusing the export
+/// rather than falling back to a stale copy -- when the checkpoint cannot
+/// fully drain and truncate the WAL (blocked by an active writer, or any
+/// open/PRAGMA error).
+///
+/// R2-F1: this runs *only* for `Apply`, and only after the caller's
+/// `plan_fingerprint` has already been matched against a plan computed from
+/// the pre-checkpoint state (see `run_doctor_archive_export_impl`) -- never
+/// for `Plan`/dry-run, which must be a true zero-write read of the current
+/// state. WAL-mode commits never touch the main db file's bytes (only a
+/// checkpoint does), so a pre-checkpoint plan's fingerprint is naturally
+/// stable between a Plan call and a later Apply call regardless of
+/// concurrent WAL commits landing in between; this function is the only
+/// thing in this path that is allowed to change those bytes.
+///
+/// Returns an [`DoctorArchiveExportQuiescenceProbe`] opened *after* this
+/// checkpoint has run and its writer connection has closed -- `None` if the
+/// source db does not exist. R2-F2 (probe-connection design, control-plane
+/// re-adjudicated after the original main-db-file-header change-counter
+/// design was disproven by direct experiment: in WAL mode that field tracks
+/// schema changes, not ordinary data commits, so it silently misses the
+/// exact "a writer's ordinary commit gets externally checkpointed during
+/// the copy window" case this exists to catch) uses the probe as the
+/// "quiescent" baseline: `doctor_archive_export_assert_source_quiescent`
+/// re-reads `PRAGMA data_version` on the *same* held connection after the
+/// copy to detect any change.
+fn doctor_archive_export_checkpoint_source(
+    db_path: &Path,
+) -> Result<Option<DoctorArchiveExportQuiescenceProbe>> {
+    if !db_path.exists() {
+        // Nothing to checkpoint yet -- `collect_assets` already tolerates a
+        // missing db_path (fresh/empty data dir).
+        return Ok(None);
+    }
+    let conn = crate::storage::api::Conn::open_writable(db_path, crate::storage::api::Profile::Production)
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "opening archive export source db for pre-export WAL checkpoint {}: {err}",
+                db_path.display()
+            )
+        })?;
+    let checkpoint_result = doctor_archive_export_run_checkpoint(&conn, db_path);
+    let close_result = conn.close().map_err(|err| {
+        anyhow::anyhow!(
+            "closing archive export pre-export checkpoint handle {}: {err}",
+            db_path.display()
+        )
+    });
+    checkpoint_result?;
+    close_result?;
+    doctor_archive_export_open_quiescence_probe(db_path).map(Some)
+}
+
+/// R2-F2: a read-only connection to the archive-export source db, opened
+/// immediately after this export's own pre-copy checkpoint and held open
+/// across the whole copy window, plus the `PRAGMA data_version` value read
+/// at the moment it was opened. `data_version` is SQLite's own "has another
+/// connection changed this database" signal and (unlike the main db file's
+/// header change counter) does reflect ordinary WAL-mode data commits from
+/// other connections -- but its value is only meaningful compared against
+/// an earlier read *on this same connection*, so the connection must stay
+/// open and be reused for the later comparison, not reopened.
+struct DoctorArchiveExportQuiescenceProbe {
+    conn: crate::storage::api::Conn,
+    baseline_data_version: i64,
+}
+
+fn doctor_archive_export_open_quiescence_probe(
+    db_path: &Path,
+) -> Result<DoctorArchiveExportQuiescenceProbe> {
+    let conn = crate::storage::api::Conn::open_read(db_path).map_err(|err| {
+        anyhow::anyhow!(
+            "opening archive export source db read-only quiescence probe {}: {err}",
+            db_path.display()
+        )
+    })?;
+    let baseline_data_version: i64 = conn
+        .query_row_map("PRAGMA data_version;", &[], |row| row.get_typed(0))
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "reading archive export source db data_version {}: {err}",
+                db_path.display()
+            )
+        })?;
+    Ok(DoctorArchiveExportQuiescenceProbe { conn, baseline_data_version })
+}
+
+/// R2-F2: assert the source db has not been written to since `probe` was
+/// opened. Called after the copy has finished but before verify is allowed
+/// to mark the export `verified`/`applied`.
+///
+/// Any committed transaction necessarily makes `-wal` non-empty (WAL-mode
+/// commits only ever append there) *unless* it has also been checkpointed
+/// by then -- checkpointing truncates `-wal` back to empty, so the `-wal`
+/// check alone would miss that case. But checkpointing a commit is itself a
+/// change another connection made to the database, which SQLite's
+/// `data_version` is specifically defined to detect. Together the two
+/// checks cover the whole copy window: still-uncommitted-to-main shows up
+/// as a non-empty `-wal`; already-checkpointed shows up as a moved
+/// `data_version` on `probe`'s held connection.
+fn doctor_archive_export_assert_source_quiescent(
+    db_path: &Path,
+    probe: &DoctorArchiveExportQuiescenceProbe,
+) -> Result<()> {
+    let wal_len = match doctor_sqlite_sidecar_path(db_path, "-wal") {
+        Some(wal_path) => match std::fs::metadata(&wal_path) {
+            Ok(metadata) => metadata.len(),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => 0,
+            Err(err) => {
+                return Err(anyhow::anyhow!(
+                    "checking archive export source -wal for post-copy quiescence {}: {err}",
+                    wal_path.display()
+                ));
+            }
+        },
+        None => 0,
+    };
+    let current_data_version: i64 = probe
+        .conn
+        .query_row_map("PRAGMA data_version;", &[], |row| row.get_typed(0))
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "reading archive export source db data_version for post-copy quiescence {}: {err}",
+                db_path.display()
+            )
+        })?;
+    if wal_len != 0 || current_data_version != probe.baseline_data_version {
+        anyhow::bail!("source database changed during export; retry when writers are idle");
+    }
+    Ok(())
+}
+
+fn doctor_archive_export_run_checkpoint(conn: &crate::storage::api::Conn, db_path: &Path) -> Result<()> {
+    let rows: Vec<(i64, i64, i64)> = conn
+        .query_all_map("PRAGMA wal_checkpoint(TRUNCATE);", &[], |row| {
+            Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?))
+        })
+        .map_err(|err| {
+            anyhow::anyhow!("running pre-export WAL checkpoint {}: {err}", db_path.display())
+        })?;
+    let (busy, log_frames, checkpointed_frames) = *rows.first().ok_or_else(|| {
+        anyhow::anyhow!(
+            "pre-export WAL checkpoint returned no status row: {}",
+            db_path.display()
+        )
+    })?;
+    let left_frames_uncheckpointed = log_frames > 0 && checkpointed_frames < log_frames;
+    if busy > 0 || left_frames_uncheckpointed {
+        anyhow::bail!(
+            "archive export pre-export WAL checkpoint was blocked (busy={busy}, \
+             log_frames={log_frames}, checkpointed_frames={checkpointed_frames}) -- the source \
+             db has an active writer; refusing to export a stale copy: {}",
+            db_path.display()
+        );
+    }
+    Ok(())
 }
 
 /// World-class-doctor pass-2: `cass doctor --ls`. Read-only; lists per-run
@@ -46739,7 +47043,16 @@ fn run_doctor_archive_export_impl(
         return Ok(());
     }
 
-    let (assets, warnings) = doctor_archive_export_collect_assets(&data_dir, &db_path);
+    // R2-F1: compute the plan from the *pre-checkpoint* state, for Plan and
+    // Apply alike. This is the plan a Plan/dry-run caller sees (Plan never
+    // checkpoints -- see below), and it is also what an Apply caller's
+    // `--plan-fingerprint` is matched against, *before* this function does
+    // any writing. `plan`/`plan_fingerprint` stay pinned to this
+    // pre-checkpoint value for the rest of the function (the manifest,
+    // receipt, and response report the plan identity that was approved,
+    // not a value recomputed after Apply's own checkpoint changes the
+    // source's bytes underneath it).
+    let (mut assets, warnings) = doctor_archive_export_collect_assets(&data_dir, &db_path);
     let plan = doctor_archive_export_plan_value(
         request.workflow,
         &data_dir,
@@ -46752,17 +47065,9 @@ fn run_doctor_archive_export_impl(
         .as_str()
         .unwrap_or_default()
         .to_string();
-    let required_bytes = plan["required_bytes"].as_u64().unwrap_or(0);
+    let mut required_bytes = plan["required_bytes"].as_u64().unwrap_or(0);
     let target_available_bytes = doctor_archive_export_target_available_bytes(target_root).ok();
     let mut blocked_reasons = Vec::new();
-    if let Some(available) = target_available_bytes
-        && request.command_mode == DoctorArchiveExportCommandMode::Apply
-        && available < required_bytes
-    {
-        blocked_reasons.push(format!(
-            "target has {available} available bytes but archive export requires {required_bytes}"
-        ));
-    }
     if request.command_mode == DoctorArchiveExportCommandMode::Apply
         && request.plan_fingerprint.as_deref() != Some(plan_fingerprint.as_str())
     {
@@ -46779,10 +47084,50 @@ fn run_doctor_archive_export_impl(
     });
     let mut event_log_path = serde_json::Value::Null;
     let status = if request.command_mode == DoctorArchiveExportCommandMode::Plan {
+        // R2-F1: Plan/dry-run is a true zero-write read -- no checkpoint,
+        // no `open_writable`, nothing beyond the `collect_assets` above.
         "planned"
     } else if !blocked_reasons.is_empty() {
+        // Fingerprint mismatch, discovered before any write -- blocked
+        // with zero writes, exactly like the pre-existing space/mismatch
+        // path below.
         "blocked"
     } else {
+        // R2-F1: fingerprint matched -- now (and only now) checkpoint the
+        // source, then recollect assets against the post-checkpoint main
+        // db file. `doctor_archive_export_copy_assets` verifies each
+        // copied byte against `asset.blake3`, so the assets driving the
+        // copy must reflect what the checkpoint just wrote into the main
+        // file, or every copy would fail its own hash check against the
+        // stale pre-checkpoint hash.
+        let quiescence_probe = doctor_archive_export_checkpoint_source(&db_path).map_err(|err| CliError {
+            code: 4,
+            kind: "io",
+            message: format!("{err:#}"),
+            hint: Some(
+                "Retry once the source database's active writer has finished; archive export \
+                 refuses to copy a stale, uncheckpointed source rather than silently drop data."
+                    .to_string(),
+            ),
+            retryable: true,
+        })?;
+        let (assets_post, _warnings_post) = doctor_archive_export_collect_assets(&data_dir, &db_path);
+        required_bytes = assets_post
+            .iter()
+            .filter(|asset| asset.included)
+            .map(|asset| asset.size_bytes)
+            .sum();
+        assets = assets_post;
+        if let Some(available) = target_available_bytes
+            && available < required_bytes
+        {
+            blocked_reasons.push(format!(
+                "target has {available} available bytes but archive export requires {required_bytes}"
+            ));
+        }
+        if !blocked_reasons.is_empty() {
+            "blocked"
+        } else {
         doctor_forensic_create_private_dir_all(target_root).map_err(|err| CliError {
             code: 4,
             kind: "io",
@@ -46830,6 +47175,27 @@ fn run_doctor_archive_export_impl(
                 hint: Some("Retry after checking target filesystem health.".to_string()),
                 retryable: true,
             })?;
+        // R2-F2: the copy is done but not yet verified -- assert the
+        // source hasn't changed since our own checkpoint (a live writer
+        // mid-commit shows up as a non-empty `-wal`; a completed external
+        // checkpoint bypassing WAL shows up as a moved `data_version` on
+        // the held probe connection) before allowing verify to mark this
+        // `verified`/`applied`. No probe means `db_path` didn't exist at
+        // checkpoint time (fresh/empty data dir) -- nothing to compare.
+        if let Some(probe) = quiescence_probe.as_ref() {
+            doctor_archive_export_assert_source_quiescent(&db_path, probe).map_err(|err| CliError {
+                code: 4,
+                kind: "io",
+                message: format!("{err:#}"),
+                hint: Some(
+                    "Retry once the source database's active writer has finished; archive export \
+                     refuses to mark an export verified when the source changed during the copy \
+                     window."
+                        .to_string(),
+                ),
+                retryable: true,
+            })?;
+        }
         verify_status = doctor_archive_export_verify_target(target_root, &data_dir);
         let event_log = doctor_archive_export_event_log(
             &plan_fingerprint,
@@ -46885,6 +47251,7 @@ fn run_doctor_archive_export_impl(
             "applied"
         } else {
             "blocked"
+        }
         }
     };
 
@@ -53900,16 +54267,20 @@ fn run_doctor_archive_db_post_repair_probe(
         }),
     );
 
-    let manager = match crate::storage::sqlite::FrankenConnectionManager::new(
+    // w1b Task B4: this used to go through `FrankenConnectionManager` (a
+    // reader pool + writer-token semaphore) purely to reach a writable
+    // connection past `Conn::open_writable`'s `pub(crate)` visibility --
+    // this module is inside the crate, so it can call it directly. The
+    // semaphore/pool machinery `FrankenConnectionManager` provided was
+    // never actually needed here: this probe opens exactly one connection,
+    // uses it, and closes it.
+    let writer_conn = match crate::storage::api::Conn::open_writable(
         db_path,
-        crate::storage::sqlite::ConnectionManagerConfig {
-            reader_count: 1,
-            max_writers: 1,
-        },
+        crate::storage::api::Profile::Production,
     ) {
-        Ok(manager) => {
-            steps.push("open_production_connection_manager".to_string());
-            manager
+        Ok(conn) => {
+            steps.push("open_writable_connection".to_string());
+            conn
         }
         Err(err) => {
             return doctor_post_repair_probe_report(
@@ -53917,9 +54288,7 @@ fn run_doctor_archive_db_post_repair_probe(
                 doctor_post_repair_probe_outcome(
                     "fail",
                     doctor_post_repair_probe_duration_ms(start),
-                    Some(format!(
-                        "failed to open archive DB through production frankensqlite manager: {err}"
-                    )),
+                    Some(format!("failed to open archive DB writer: {err}")),
                     true,
                     true,
                     false,
@@ -53928,28 +54297,7 @@ fn run_doctor_archive_db_post_repair_probe(
             );
         }
     };
-
-    let writer = match manager.writer() {
-        Ok(writer) => {
-            steps.push("acquire_production_writer".to_string());
-            writer
-        }
-        Err(err) => {
-            return doctor_post_repair_probe_report(
-                target,
-                doctor_post_repair_probe_outcome(
-                    "fail",
-                    doctor_post_repair_probe_duration_ms(start),
-                    Some(format!("failed to acquire archive DB writer: {err}")),
-                    true,
-                    true,
-                    false,
-                    steps,
-                ),
-            );
-        }
-    };
-    let conn = writer.storage().raw();
+    let conn = &writer_conn;
     if let Err(err) = conn.execute("BEGIN;", &[]) {
         return doctor_post_repair_probe_report(
             target,
@@ -54092,8 +54440,7 @@ fn run_doctor_archive_db_post_repair_probe(
     }
     let rollback_confirmed = true;
     steps.push("rollback_probe_transaction".to_string());
-    drop(writer);
-    drop(manager);
+    drop(writer_conn);
 
     let conn = match open_franken_cli_read_db(
         db_path.to_path_buf(),
@@ -59471,7 +59818,7 @@ mod doctor_asset_taxonomy_tests {
                 .failure_reason
                 .as_deref()
                 .unwrap_or_default()
-                .contains("production frankensqlite manager"),
+                .contains("failed to open archive DB writer"),
             "failure should name production open path: {probe:#?}"
         );
     }
@@ -68307,6 +68654,245 @@ mod doctor_archive_export_path_safety_tests {
 }
 
 #[cfg(all(test, unix))]
+mod doctor_archive_export_quiescence_tests {
+    use super::*;
+
+    /// A fully checkpointed, quiescent source db with one committed row.
+    fn quiescent_fixture(db_path: &Path) {
+        std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
+        let conn = crate::storage::api::Conn::open_writable(
+            db_path,
+            crate::storage::api::Profile::Production,
+        )
+        .expect("open quiescence fixture writer");
+        conn.execute("CREATE TABLE quiescence_probe(marker TEXT NOT NULL)", &[])
+            .expect("create quiescence probe table");
+        conn.execute(
+            "INSERT INTO quiescence_probe(marker) VALUES (?1)",
+            &crate::storage::api::params!["seed"],
+        )
+        .expect("seed quiescence probe row");
+        conn.query_all_map("PRAGMA wal_checkpoint(TRUNCATE);", &[], |row| {
+            row.get_value(0)
+        })
+        .expect("checkpoint quiescence fixture");
+        conn.close().expect("close quiescence fixture writer");
+    }
+
+    #[test]
+    fn archive_export_assert_source_quiescent_passes_when_nothing_changed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("agent_search.db");
+        quiescent_fixture(&db_path);
+        let probe =
+            doctor_archive_export_open_quiescence_probe(&db_path).expect("open quiescence probe");
+
+        doctor_archive_export_assert_source_quiescent(&db_path, &probe)
+            .expect("an untouched source must be reported quiescent");
+    }
+
+    #[test]
+    fn archive_export_assert_source_quiescent_fails_when_wal_is_nonempty() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("agent_search.db");
+        quiescent_fixture(&db_path);
+        let probe =
+            doctor_archive_export_open_quiescence_probe(&db_path).expect("open quiescence probe");
+
+        // A live writer mid-commit: open a second connection and leave a
+        // committed transaction sitting only in -wal (don't checkpoint,
+        // don't close -- closing the last connection would auto-checkpoint
+        // and defeat the fixture).
+        let live_writer = crate::storage::api::Conn::open_writable(
+            &db_path,
+            crate::storage::api::Profile::Production,
+        )
+        .expect("open live writer");
+        live_writer
+            .execute(
+                "INSERT INTO quiescence_probe(marker) VALUES (?1)",
+                &crate::storage::api::params!["live-writer"],
+            )
+            .expect("commit a row that stays only in -wal");
+
+        let err = doctor_archive_export_assert_source_quiescent(&db_path, &probe)
+            .expect_err("a non-empty -wal must fail the quiescence assertion");
+        assert!(
+            format!("{err:#}")
+                .contains("source database changed during export; retry when writers are idle"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn archive_export_assert_source_quiescent_fails_when_the_data_version_moved() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("agent_search.db");
+        quiescent_fixture(&db_path);
+        let probe =
+            doctor_archive_export_open_quiescence_probe(&db_path).expect("open quiescence probe");
+
+        // An external checkpoint: another connection commits and then
+        // checkpoints (TRUNCATE), which truncates -wal back to empty -- the
+        // -wal check alone would miss this -- but bumps `data_version` as
+        // read back on `probe`'s still-open connection, since SQLite
+        // defines that pragma to detect exactly this: another connection
+        // changed the database (verified empirically: the main db file's
+        // header change counter this replaced does *not* move for this
+        // scenario -- only for schema changes -- which is why R2-F2 was
+        // re-adjudicated onto `data_version`).
+        let external_checkpointer = crate::storage::api::Conn::open_writable(
+            &db_path,
+            crate::storage::api::Profile::Production,
+        )
+        .expect("open external checkpointer");
+        external_checkpointer
+            .execute(
+                "INSERT INTO quiescence_probe(marker) VALUES (?1)",
+                &crate::storage::api::params!["external-checkpoint"],
+            )
+            .expect("commit a row ahead of the external checkpoint");
+        external_checkpointer
+            .query_all_map("PRAGMA wal_checkpoint(TRUNCATE);", &[], |row| {
+                row.get_value(0)
+            })
+            .expect("run external checkpoint");
+        external_checkpointer
+            .close()
+            .expect("close external checkpointer");
+
+        let err = doctor_archive_export_assert_source_quiescent(&db_path, &probe).expect_err(
+            "a moved data_version must fail the quiescence assertion even with an empty -wal",
+        );
+        assert!(
+            format!("{err:#}")
+                .contains("source database changed during export; retry when writers are idle"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    /// R2-F2 full-chain: races a real writer against
+    /// `run_doctor_archive_export_impl`'s Apply copy window -- as soon as
+    /// this Apply's own checkpoint truncates `-wal` back to empty, a
+    /// background thread commits a fresh transaction landing only in
+    /// `-wal`. The R2-F2 post-copy, pre-verify quiescence assertion must
+    /// catch this and fail closed rather than mark the export
+    /// verified/applied over a source that changed mid-copy.
+    #[test]
+    fn archive_export_apply_fails_closed_when_source_writer_commits_during_the_copy_window() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let target_root = temp.path().join("export");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        let db_path = data_dir.join("agent_search.db");
+        quiescent_fixture(&db_path);
+
+        // Widen the real copy window: give `doctor_archive_export_copy_assets`
+        // enough genuine file I/O to do that the racer thread has a
+        // realistic chance to land its commit before the post-copy
+        // quiescence check -- a single-row fixture's copy is fast enough
+        // that the race is not reliably winnable otherwise.
+        let padding_dir = data_dir.join("raw-mirror/v1/blobs");
+        std::fs::create_dir_all(&padding_dir).expect("create padding dir");
+        for i in 0..200 {
+            std::fs::write(padding_dir.join(format!("pad-{i:04}.bin")), vec![7_u8; 8192])
+                .expect("write padding asset");
+        }
+
+        let (assets, warnings) = doctor_archive_export_collect_assets(&data_dir, &db_path);
+        let plan = doctor_archive_export_plan_value(
+            DoctorArchiveExportWorkflow::Export,
+            &data_dir,
+            &db_path,
+            &target_root,
+            &assets,
+            &warnings,
+        );
+        let plan_fingerprint = plan["plan_fingerprint"]
+            .as_str()
+            .expect("fingerprint")
+            .to_string();
+
+        // Pre-open the racer's writer connection before the race starts, so
+        // the race is just "wait for the signal, then INSERT on an
+        // already-open connection" -- not also paying SQLite
+        // connection-open latency after the signal, which would make the
+        // race unrealistically hard to win on a fast machine. `crate::
+        // storage::api::Conn` isn't `Send` (it boxes a `dyn StorageBackend`),
+        // so this opens straight through `rusqlite` -- fine for a plain
+        // autocommit `INSERT`, and only this test needs `Send`.
+        let racer_conn = rusqlite::Connection::open(&db_path).expect("pre-open racer connection");
+        // R2-F2's own checkpoint truncates -wal to 0 *before* it opens the
+        // quiescence probe connection and reads its baseline `data_version`
+        // (see `doctor_archive_export_checkpoint_source`) -- so polling on
+        // "-wal is empty" fires too early: a commit landing right then races
+        // the probe's own open+baseline-read and can land *before* the
+        // baseline is captured, silently becoming part of the baseline
+        // instead of a detected post-baseline change. `target_root` is only
+        // created (`doctor_forensic_create_private_dir_all`) after the probe
+        // has already opened and captured its baseline, so it's the
+        // earliest externally observable signal that's guaranteed to be
+        // strictly after the baseline -- polling on it gives the racer the
+        // whole rest of the copy window (asset copy + manifest write) to
+        // land its commit, which is the window R2-F2 actually needs to
+        // defend.
+        let racer_target_root = target_root.clone();
+        let racer = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if racer_target_root.exists() {
+                    break;
+                }
+                if std::time::Instant::now() > deadline {
+                    return false;
+                }
+                // Deliberately a tight spin, not `yield_now()` -- on this
+                // box's 20 cores the poll needs to react promptly to the
+                // signal to leave real time inside the copy window; a
+                // cooperative yield adds scheduler-timeslice-scale latency.
+            }
+            racer_conn
+                .execute(
+                    "INSERT INTO quiescence_probe(marker) VALUES (?1)",
+                    rusqlite::params!["race"],
+                )
+                .is_ok()
+        });
+
+        let outcome = run_doctor_archive_export_impl(
+            DoctorArchiveExportRequest {
+                data_dir_override: Some(data_dir.clone()),
+                db_override: None,
+                output_format: None,
+                workflow: DoctorArchiveExportWorkflow::Export,
+                command_mode: DoctorArchiveExportCommandMode::Apply,
+                target_root: Some(target_root.clone()),
+                dry_run: false,
+                yes: true,
+                plan_fingerprint: Some(plan_fingerprint),
+                backup_id: None,
+                force_rebuild: false,
+                allow_repeated_repair: false,
+            },
+            WrapConfig::new(None, true),
+        );
+
+        let raced = racer.join().expect("racer thread panicked");
+        assert!(
+            raced,
+            "race thread never landed its commit inside the copy window; test is inconclusive"
+        );
+        let err = outcome.expect_err(
+            "archive export apply must fail closed when the source changes during the copy window",
+        );
+        assert!(
+            err.message.contains("source database changed during export"),
+            "unexpected error: {err:?}"
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
 mod doctor_support_bundle_path_safety_tests {
     use super::*;
 
@@ -69860,7 +70446,9 @@ fn gather_onboarding_observation(
     // "Existing indexed DB" means a DB that actually carries content, so an
     // empty/just-created DB still routes the user to a first index.
     let indexed_conversation_count = if db_path.exists() {
-        crate::storage::sqlite::FrankenStorage::open(db_path)
+        // w1b Task B8 (d16, open-consumer audit): pure read (onboarding
+        // observation), switched to the read-only open.
+        crate::storage::sqlite::FrankenStorage::open_readonly(db_path)
             .ok()
             .and_then(|storage| storage.total_conversation_count().ok())
             .unwrap_or(0) as u64
@@ -70265,7 +70853,7 @@ fn gather_projection_signals_from_state(
         ..Default::default()
     };
 
-    // frankensqlite storage: a non-retryable open failure whose error text names
+    // the legacy embedded engine storage: a non-retryable open failure whose error text names
     // a storage-engine fault (corruption / OpenRead / bad format) — not a
     // permission/not-found/busy condition, which are host/transient, not storage
     // corruption.
@@ -72026,7 +72614,7 @@ mod doctor_fts_tests {
         let state = probe_doctor_fts_table(&conn);
         assert!(
             matches!(state, DoctorFtsTableState::QueryableViaFrankensqlite),
-            "frankensqlite FTS table should be accepted by doctor: {state:?}"
+            "the legacy embedded engine FTS table should be accepted by doctor: {state:?}"
         );
 
         Ok(())
@@ -72124,34 +72712,51 @@ mod cli_read_db_tests {
 
     #[test]
     fn cli_read_db_refuses_corrupt_file_without_writable_fallback() {
+        // w1b Task B9 (2026-08-27, equivalence-gate-caught, control-plane
+        // ruling, same "problem C" family as commit 6ab417b3): franken's
+        // legacy engine validated the SQLite header eagerly, at connection-
+        // open time. Real SQLite (via rusqlite, now backing
+        // `open_franken_cli_read_db` through `storage::api::Conn`) validates
+        // lazily -- `Conn::open_read`'s `Profile::ReadOnly` pragma plan sets
+        // no `journal_mode` (a read-only connection can't change it anyway),
+        // so the only PRAGMA touched at open time is `foreign_keys`, which
+        // is a connection-level setting that never reads the file's page-1
+        // header. Reproduced directly with the underlying `rusqlite` crate
+        // against a copy of this fixture: `Connection::open_with_flags(...,
+        // SQLITE_OPEN_READ_ONLY)` succeeds outright, and even `PRAGMA
+        // foreign_keys;` returns cleanly; only a real schema-touching query
+        // (`SELECT COUNT(*) FROM sqlite_master`) surfaces
+        // `SqliteFailure(NotADatabase, "file is not a database")`. This is a
+        // permanent, structural engine difference, not a regression --
+        // rewritten to assert corruption at the point real SQLite actually
+        // exposes it, pinning both ends of the behavior shift so a future
+        // drift back to eager validation would be noticed either way.
         let temp = TempDir::new().expect("tempdir");
         let db_path = temp.path().join("agent_search.db");
         let corrupt_bytes = b"not a sqlite database";
         std::fs::write(&db_path, corrupt_bytes).expect("write corrupt db bytes");
 
-        let err = match open_franken_cli_read_db(
+        let conn = open_franken_cli_read_db(
             db_path.clone(),
             "corrupt preservation test",
             Duration::from_millis(250),
-        ) {
-            Ok(_) => panic!("corrupt db should not open"),
-            Err(err) => err,
-        };
+        )
+        .expect("vanilla SQLite opens a readonly connection lazily even against a corrupt file");
 
-        assert_eq!(err.kind, CliErrorKind::DbOpen.kind_str());
+        let query_err = conn
+            .query_row_map("SELECT COUNT(*) FROM sqlite_master", &[], |row| {
+                row.get_typed::<i64>(0)
+            })
+            .expect_err("the first real schema-touching query must surface the corruption");
         assert!(
-            err.message.contains("raw readonly open failed"),
-            "error should report the readonly failure chain: {}",
-            err.message
+            matches!(query_err, StorageError::Corrupt { .. }),
+            "corruption must surface as StorageError::Corrupt, got: {query_err:?}"
         );
-        assert!(
-            !err.message.contains("raw open failed"),
-            "read helper must not use a writable fallback: {}",
-            err.message
-        );
+
         assert_eq!(
-            std::fs::read(&db_path).expect("read db after failed open"),
-            corrupt_bytes
+            std::fs::read(&db_path).expect("read db after open+query"),
+            corrupt_bytes,
+            "a readonly connection (open or queried) must never write back to a corrupt file"
         );
     }
 
@@ -72175,6 +72780,19 @@ mod cli_read_db_tests {
 
     #[test]
     fn status_state_probes_large_regular_db_instead_of_trusting_index_mtime() {
+        // w1b Task B9 (2026-08-27, equivalence-gate-caught, control-plane
+        // ruling, same "problem C" family as commit 6ab417b3 and
+        // cli_read_db_refuses_corrupt_file_without_writable_fallback just
+        // above): this test's own sparse, all-zero placeholder is not a
+        // valid SQLite header either, and `probe_state_db_modes` opens it
+        // through the same `open_franken_cli_read_db` -> `Conn::open_read`
+        // path proven lazy there -- open succeeds regardless of the
+        // (invalid) header content; only a real query would fail. What
+        // this test actually guards -- confirmed unaffected by that shift
+        // -- is that a large "regular" db file still gets a real open
+        // attempt (`open_skipped=false`) rather than being short-circuited
+        // by the size heuristic into trusting the lexical index's mtime
+        // instead; that assertion is untouched below.
         let temp = TempDir::new().expect("tempdir");
         let db_path = temp.path().join("agent_search.db");
         let file = std::fs::File::create(&db_path).expect("create sparse db placeholder");
@@ -72191,17 +72809,18 @@ mod cli_read_db_tests {
         assert_eq!(database.get("exists").and_then(|v| v.as_bool()), Some(true));
         assert_eq!(
             database.get("open_skipped").and_then(|v| v.as_bool()),
-            Some(false)
+            Some(false),
+            "a large regular db must still get a real open attempt, not a size-based skip"
         );
         assert_eq!(
             database.get("opened").and_then(|v| v.as_bool()),
-            Some(false)
+            Some(true),
+            "vanilla SQLite opens a readonly connection lazily even against an invalid header"
         );
-        assert!(
-            database
-                .get("open_error")
-                .and_then(|v| v.as_str())
-                .is_some_and(|err| !err.is_empty())
+        assert_eq!(
+            database.get("open_error").and_then(|v| v.as_str()),
+            None,
+            "lazy open reports no open_error; corruption (if any) only surfaces on a real query"
         );
     }
 
@@ -72486,7 +73105,7 @@ mod cli_read_db_tests {
     }
 
     /// Regression for CASS #192: when `total_counts_exact` is false the code
-    /// previously reopened the live DB through frankensqlite to collect
+    /// previously reopened the live DB through the legacy embedded engine to collect
     /// `SELECT COUNT(*)` values, which triggered `Connection::open ->
     /// reload_memdb_from_pager_with_mode` and advanced the DB fingerprint past
     /// the just-written lexical checkpoint. The post-#192 path derives counts
@@ -74638,7 +75257,7 @@ pub(crate) fn run_doctor_impl(
                                     );
 
                                     // Check whether the FTS table is visible through
-                                    // frankensqlite on this connection. Do not auto-register
+                                    // the legacy embedded engine on this connection. Do not auto-register
                                     // it here: on migrated databases with legacy rootpage=0
                                     // FTS schema entries, CREATE VIRTUAL TABLE IF NOT EXISTS
                                     // can persist duplicate sqlite_master rows.
@@ -74647,7 +75266,7 @@ pub(crate) fn run_doctor_impl(
                                             add_check!(
                                                 "fts_table",
                                                 "pass",
-                                                "FTS search table (fts_messages) is queryable via frankensqlite",
+                                                "FTS search table (fts_messages) is queryable via the legacy embedded engine",
                                                 false
                                             );
                                         }
@@ -74663,7 +75282,7 @@ pub(crate) fn run_doctor_impl(
                                                 "fts_table",
                                                 "pass",
                                                 format!(
-                                                    "Database-resident FTS table is absent or not queryable via frankensqlite ({frankensqlite_error}); lexical search relies on the Tantivy index instead"
+                                                    "Database-resident FTS table is absent or not queryable via the legacy embedded engine ({frankensqlite_error}); lexical search relies on the Tantivy index instead"
                                                 ),
                                                 false
                                             );
@@ -74678,7 +75297,7 @@ pub(crate) fn run_doctor_impl(
                                         "database",
                                         "fail",
                                         format!(
-                                            "Database failed frankensqlite {failed_pragma}: {} ({} conversations, {} messages)",
+                                            "Database failed the legacy embedded engine {failed_pragma}: {} ({} conversations, {} messages)",
                                             integrity.diagnostic_summary(),
                                             conv_count,
                                             msg_count
@@ -74693,7 +75312,7 @@ pub(crate) fn run_doctor_impl(
                                         "database",
                                         "fail",
                                         format!(
-                                            "Database health probe failed via frankensqlite: {err}"
+                                            "Database health probe failed via the legacy embedded engine: {err}"
                                         ),
                                         true
                                     );
@@ -75768,7 +76387,7 @@ pub(crate) fn run_doctor_impl(
                                         name: "database_after_candidate_promotion".to_string(),
                                         status: "pass".to_string(),
                                         message: format!(
-                                            "Promoted archive DB passed frankensqlite quick_check ({} conversations, {} messages)",
+                                            "Promoted archive DB passed the legacy embedded engine quick_check ({} conversations, {} messages)",
                                             conv_count, msg_count
                                         ),
                                         fix_available: false,
@@ -75789,7 +76408,7 @@ pub(crate) fn run_doctor_impl(
                                         name: "database_after_candidate_promotion".to_string(),
                                         status: "fail".to_string(),
                                         message: format!(
-                                            "Promoted archive DB failed frankensqlite quick_check: {}",
+                                            "Promoted archive DB failed the legacy embedded engine quick_check: {}",
                                             status.trim()
                                         ),
                                         fix_available: true,
@@ -77267,7 +77886,7 @@ fn run_sessions(
     }
 
     // Backfill message/human-turn counts for the surviving sessions only.
-    // Deliberately NOT a SQL aggregate: the frankensqlite planner executes
+    // Deliberately NOT a SQL aggregate: the legacy embedded engine planner executes
     // `SELECT COUNT(..) WHERE conversation_id = ?` as a full messages-table
     // scan even under an INDEXED BY hint (verified via live backtraces on a
     // 26 GB index). The plain indexed row-fetch shape below is the same one
@@ -85464,7 +86083,9 @@ fn try_load_indexed_conversation_from_db_with_source(
     if !db_path.exists() {
         return None;
     }
-    let storage = crate::storage::sqlite::FrankenStorage::open(db_path).ok()?;
+    // w1b Task B8 (d16, open-consumer audit): pure read (follow-up
+    // conversation load), switched to the read-only open.
+    let storage = crate::storage::sqlite::FrankenStorage::open_readonly(db_path).ok()?;
     let source_path = source_path.to_string_lossy();
     let source_id = canonical_followup_source_id(source_id);
     if let Some(source_id) = source_id.as_deref() {
@@ -86107,7 +86728,7 @@ fn index_stall_abort_threshold(
 ///
 /// A non-watch, non-semantic `cass index --full` ends by checkpointing the
 /// deferred bulk-ingest WAL inside `close_storage_after_index` — a synchronous,
-/// `!Send` frankensqlite `conn.close()` + `wal_checkpoint(TRUNCATE)` that runs
+/// `!Send` legacy-embedded-engine `conn.close()` + `wal_checkpoint(TRUNCATE)` that runs
 /// on the indexer thread and cannot advance the progress atomics. On a large
 /// corpus (the #319 report: a ~1.1 GB / ~290k-frame WAL) that checkpoint
 /// legitimately takes minutes, especially on macOS where Darwin fsync/flock is
@@ -86366,7 +86987,7 @@ impl IndexStallWatchdog {
         // #319/#321: while the indexer signals `finalizing`, the phase-0 /
         // current==total / quiescent shape is the post-publish WAL-checkpoint
         // window, not a #297 wedge. The checkpoint is a synchronous, `!Send`
-        // frankensqlite call on the indexer thread that cannot advance the
+        // the legacy embedded engine call on the indexer thread that cannot advance the
         // progress atomics, so it can only be recognised via this flag. Give it
         // the larger `finalize_abort_threshold` so a slow-but-active checkpoint
         // of a large deferred WAL completes instead of being killed mid-write
@@ -86846,7 +87467,7 @@ mod stall_diagnostics_tests {
 
     /// Regression for #319/#321: the post-publish finalize WAL checkpoint of a
     /// large deferred bulk-ingest WAL runs as a synchronous, `!Send`
-    /// frankensqlite call on the indexer thread (inside
+    /// the legacy embedded engine call on the indexer thread (inside
     /// `close_storage_after_index`). It cannot advance the progress atomics, so
     /// it looks exactly like a #297 finalize wedge — phase 0, `current == total`,
     /// pipeline quiescent — while the process is actually alive and checkpointing
@@ -91611,7 +92232,7 @@ mod legacy_source_filter_tests {
         );
         assert_eq!(
             stats_workspace_count_sql(""),
-            "SELECT c.workspace_id, COUNT(*) FROM conversations c WHERE c.workspace_id IS NOT NULL GROUP BY c.workspace_id ORDER BY COUNT(*) DESC",
+            "SELECT c.workspace_id, COUNT(*) FROM conversations c WHERE c.workspace_id IS NOT NULL GROUP BY c.workspace_id ORDER BY COUNT(*) DESC, c.workspace_id ASC",
             "unfiltered workspace stats can aggregate workspace IDs before path lookup"
         );
 
@@ -97069,7 +97690,9 @@ fn run_sources_reingest(
     // can confirm the mirror is present before the (potentially long) ingest.
     let mut mirror_roots: Vec<String> = Vec::new();
     let mut missing_mirrors: Vec<String> = Vec::new();
-    if let Ok(storage) = crate::storage::sqlite::FrankenStorage::open(&db_path) {
+    // w1b Task B8 (d16, open-consumer audit): pure read (surfacing mirror
+    // roots for display), switched to the read-only open.
+    if let Ok(storage) = crate::storage::sqlite::FrankenStorage::open_readonly(&db_path) {
         let roots = crate::indexer::build_scan_roots(&storage, &data_dir);
         let selected_names: std::collections::HashSet<&str> =
             selected.iter().map(|s| s.name.as_str()).collect();
@@ -98960,7 +99583,7 @@ fn run_models_backfill(
             ),
             retryable: true,
         })?;
-    let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
+    let storage = FrankenStorage::open_writer(&db_path).map_err(|e| CliError {
         code: 5,
         kind: CliErrorKind::Storage.kind_str(),
         message: format!("Failed to open cass database {}: {e}", db_path.display()),
@@ -99328,7 +99951,7 @@ fn purge_excluded_agent_archive_data(
 
     let data_dir = archive_data_dir_for_agents_command(cli);
     let archive_agent_slug = archive_agent_slug_for_exclusion(agent);
-    let storage = match FrankenStorage::open(&db_path) {
+    let storage = match FrankenStorage::open_writer(&db_path) {
         Ok(storage) => storage,
         Err(err) => {
             tracing::warn!(
@@ -101970,7 +102593,7 @@ fn relink_pause_if_requested(boundary: &str) {
 
 /// 在一个事务里写 receipt。receipt 是 DB 侧唯一的提交事实。
 fn relink_write_receipt(db_path: &Path, operation_id: &str, state: &str) -> Result<()> {
-    let storage = crate::storage::sqlite::FrankenStorage::open(db_path)
+    let storage = crate::storage::sqlite::FrankenStorage::open_writer(db_path)
         .map_err(|e| anyhow::anyhow!("open db for relink receipt {}: {e}", db_path.display()))?;
     let raw = storage.raw();
     raw.execute("BEGIN IMMEDIATE;", &[])
@@ -103296,19 +103919,24 @@ mod mirror_relink_tests {
                 let Ok(meta) = std::fs::symlink_metadata(&path) else {
                     continue;
                 };
+                let rel = path
+                    .strip_prefix(base)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string();
                 if meta.is_dir() {
                     walk(&path, base, out);
+                } else if rel.ends_with("-shm") || rel.ends_with("-wal") {
+                    // w1b Task B9 (2026-08-27, equivalence-gate-caught,
+                    // control-plane ruling): same exemption and rationale as
+                    // tests/cli_doctor.rs's doctor_no_write_snapshot -- these
+                    // are vanilla SQLite WAL-mode engine sidecars, not
+                    // tracked write-set content; even a read-only connection
+                    // creates/touches them.
                 } else if meta.is_file() {
                     let bytes = std::fs::read(&path).unwrap_or_default();
                     let digest = blake3::hash(&bytes).to_hex().to_string();
-                    out.push((
-                        path.strip_prefix(base)
-                            .unwrap_or(&path)
-                            .display()
-                            .to_string(),
-                        meta.len(),
-                        digest,
-                    ));
+                    out.push((rel, meta.len(), digest));
                 }
             }
         }

@@ -2306,7 +2306,7 @@ mod tests {
 
     /// Companion to `unwrap_key_chains_aead_source_error_into_diagnostic_message`:
     /// pins that the `derive_kek_hkdf` length-check error includes
-    /// the actual length so operators can debug a frankensqlite /
+    /// the actual length so operators can debug a legacy embedded engine /
     /// hkdf upstream regression that returned the wrong KEK size.
     /// Pre-fix, the message was "HKDF expansion produced invalid KEK
     /// length" with no diagnostic — operators had no way to know

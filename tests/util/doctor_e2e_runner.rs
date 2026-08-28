@@ -4,9 +4,9 @@ use super::cass_bin;
 use super::doctor_fixture::{
     DoctorFixtureFactory, DoctorFixtureScenario, default_expected_artifact_keys,
 };
-use coding_agent_search::storage::sqlite::{
-    ConnectionManagerConfig, FrankenConnectionManager, SqliteStorage,
-};
+use coding_agent_search::storage::api::Profile;
+use coding_agent_search::storage::sqlite::SqliteStorage;
+use coding_agent_search::storage::testing::open_test_writer;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -3142,17 +3142,8 @@ fn write_doctor_e2e_sqlite_marker_db(path: &Path, marker: &str) -> Result<(), St
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| format!("create sqlite parent: {err}"))?;
     }
-    let mgr = FrankenConnectionManager::new(
-        path,
-        ConnectionManagerConfig {
-            reader_count: 1,
-            max_writers: 1,
-        },
-    )
-    .map_err(|err| format!("create doctor backup fixture sqlite db: {err}"))?;
-    let mut guard = mgr
-        .writer()
-        .map_err(|err| format!("acquire doctor backup fixture writer: {err}"))?;
+    let mut guard = open_test_writer(path, Profile::Production)
+        .map_err(|err| format!("create doctor backup fixture sqlite db: {err}"))?;
     let conn = guard.storage().raw();
     conn.execute(
         "CREATE TABLE IF NOT EXISTS restore_probe(marker TEXT NOT NULL)",
@@ -3167,7 +3158,6 @@ fn write_doctor_e2e_sqlite_marker_db(path: &Path, marker: &str) -> Result<(), St
     let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
     guard.mark_committed();
     drop(guard);
-    drop(mgr);
     Ok(())
 }
 

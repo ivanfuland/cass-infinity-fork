@@ -104,336 +104,354 @@ impl ExportEngine {
             dest.execute_batch(
                 // Pages exports are encrypted/copied as one portable SQLite file.
                 // WAL would allow committed schema/data to remain in a sidecar
-                // that is not part of the encrypted payload.
+                // that is not part of the encrypted payload. foreign_keys is no
+                // longer set here (w1b Task B2b, R0-B3): every storage::api
+                // connection now enforces it at open time, and the api layer
+                // rejects any SQL text mentioning `foreign_keys` as a
+                // defense-in-depth guard -- this line would now be rejected,
+                // not just redundant.
                 "PRAGMA journal_mode = 'delete';
                  PRAGMA synchronous = NORMAL;
-                 PRAGMA busy_timeout = 5000;
-                 PRAGMA foreign_keys = ON;",
+                 PRAGMA busy_timeout = 5000;",
             )
             .context("Failed to set destination database PRAGMAs")?;
 
-            let (processed, msg_processed) = {
-                let mut tx = dest.transaction()?;
+            // w1b Task B3 (D2, control-plane 2026-08-26): with_tx_no_replay,
+            // TxMode::Immediate. Same reasoning as the rebuild functions in
+            // sqlite.rs: Immediate structurally rules out a mid-transaction
+            // Busy{Snapshot} conflict, so there is nothing for replay to
+            // catch here, only the cost of redoing a potentially large export
+            // (source read + schema create + FTS population) from scratch.
+            // `progress(...)` (an external callback, see below) is called
+            // exactly once per conversation either way -- FnOnce makes that
+            // safe without needing to reason about replay-induced double
+            // invocation the way `with_tx`'s Fn would have required.
+            let (processed, msg_processed) = dest.with_tx_no_replay(
+                crate::storage::api::TxMode::Immediate,
+                |tx| -> Result<(usize, usize), crate::storage::api::StorageError> {
+                    (|| -> Result<(usize, usize)> {
 
-                // 3. Create Schema (Split into individual statements)
-                tx.execute(
-                    "CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                agent TEXT NOT NULL,
-                workspace TEXT,
-                title TEXT,
-                source_path TEXT NOT NULL,
-                started_at INTEGER,
-                ended_at INTEGER,
-                message_count INTEGER,
-                metadata_json TEXT
-            )", &[],
-                )
-                .context("Failed to create conversations table")?;
-
-                tx.execute(
-                    "CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER NOT NULL,
-                idx INTEGER NOT NULL,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                created_at INTEGER,
-                updated_at INTEGER,
-                model TEXT,
-                attachment_refs TEXT,
-                FOREIGN KEY (conversation_id) REFERENCES conversations(id)
-            )", &[],
-                )
-                .context("Failed to create messages table")?;
-
-                tx.execute(
-                    "CREATE TABLE snippets (
-                id INTEGER PRIMARY KEY,
-                message_id INTEGER NOT NULL,
-                file_path TEXT,
-                start_line INTEGER,
-                end_line INTEGER,
-                language TEXT,
-                snippet_text TEXT,
-                FOREIGN KEY (message_id) REFERENCES messages(id)
-            )", &[],
-                )
-                .context("Failed to create snippets table")?;
-
-                tx.execute(
-                    "CREATE TABLE export_meta (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )", &[],
-                )
-                .context("Failed to create export_meta table")?;
-
-                tx.execute(
-                    "CREATE VIRTUAL TABLE messages_fts USING fts5(
-                content,
-                tokenize='porter unicode61 remove_diacritics 2'
-            )", &[],
-                )
-                .context("Failed to create messages_fts table")?;
-
-                tx.execute(
-                    r#"CREATE VIRTUAL TABLE messages_code_fts USING fts5(
-                content,
-                tokenize="unicode61 tokenchars '-_./:@#$%\\'"
-            )"#, &[],
-                )
-                .context("Failed to create messages_code_fts table")?;
-
-                // 4. Query Source.  LEFT JOIN + COALESCE on agents so the
-                // export path includes legacy NULL-agent conversations
-                // (otherwise the exported archive silently omits them).
-                // Agent filter becomes an EXISTS guard against the agents
-                // table so it works correctly without the joined column.
-                let mut from_where = String::from(
-                    " FROM conversations c
-             LEFT JOIN agents a ON c.agent_id = a.id
-             LEFT JOIN workspaces w ON c.workspace_id = w.id
-             WHERE 1=1",
-                );
-                let mut params: Vec<ParamValue> = Vec::new();
-
-                if let Some(agents) = &self.filter.agents {
-                    if agents.is_empty() {
-                        from_where.push_str(" AND 1=0");
-                    } else {
-                        from_where.push_str(" AND EXISTS (SELECT 1 FROM agents a2 WHERE a2.id = c.agent_id AND a2.slug IN (");
-                        for (i, agent) in agents.iter().enumerate() {
-                            if i > 0 {
-                                from_where.push_str(", ");
-                            }
-                            from_where.push('?');
-                            params.push(ParamValue::from(agent.clone()));
-                        }
-                        from_where.push_str("))");
-                    }
-                }
-
-                // Note: Workspace filtering in source DB might be string matching if paths aren't normalized consistently.
-                // Assuming strict matching for now.
-                if let Some(workspaces) = &self.filter.workspaces {
-                    if workspaces.is_empty() {
-                        from_where.push_str(" AND 1=0");
-                    } else {
-                        from_where.push_str(" AND w.path IN (");
-                        for (i, ws) in workspaces.iter().enumerate() {
-                            if i > 0 {
-                                from_where.push_str(", ");
-                            }
-                            from_where.push('?');
-                            params.push(ParamValue::from(ws.to_string_lossy().to_string()));
-                        }
-                        from_where.push(')');
-                    }
-                }
-
-                if let Some(since) = self.filter.since {
-                    from_where.push_str(" AND c.started_at >= ?");
-                    params.push(ParamValue::from(since.timestamp_millis()));
-                }
-
-                if let Some(until) = self.filter.until {
-                    from_where.push_str(" AND c.started_at <= ?");
-                    params.push(ParamValue::from(until.timestamp_millis()));
-                }
-
-                let query = format!(
-                    "SELECT c.id, COALESCE(a.slug, 'unknown') as agent, w.path as workspace, c.title, c.source_path, c.started_at, c.ended_at,
-             (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count,
-             c.metadata_json
-             {from_where}"
-                );
-
-                let mut count_query = String::from("SELECT COUNT(*)");
-                count_query.push_str(&from_where);
-                let total_convs: usize =
-                    src.query_row_map(&count_query, &params, |row: &FrankenRow| {
-                        row.get_typed::<i64>(0).map(|v| v as usize)
-                    })?;
-
-                // Execute Main Query - collect all conversation rows
-                type ConversationExportRow = (
-                    i64,
-                    String,
-                    Option<String>,
-                    Option<String>,
-                    String,
-                    Option<i64>,
-                    Option<i64>,
-                    i64,
-                    Option<String>,
-                );
-                let conv_rows: Vec<ConversationExportRow> =
-                    src.query_all_map(&query, &params, |row: &FrankenRow| {
-                        Ok((
-                            row.get_typed::<i64>(0)?,
-                            row.get_typed::<String>(1)?,
-                            row.get_typed::<Option<String>>(2)?,
-                            row.get_typed::<Option<String>>(3)?,
-                            row.get_typed::<String>(4)?,
-                            row.get_typed::<Option<i64>>(5)?,
-                            row.get_typed::<Option<i64>>(6)?,
-                            row.get_typed::<i64>(7)?,
-                            row.get_typed::<Option<String>>(8)?,
-                        ))
-                    })?;
-
-                let mut processed = 0;
-                let mut msg_processed = 0;
-                let message_cols = table_columns(&src, "messages")?;
-                let has_snippets_table = table_exists(&src, "snippets");
-                let msg_query = build_message_export_query(&message_cols);
-
-                for (
-                    id,
-                    agent,
-                    workspace,
-                    title,
-                    source_path,
-                    started_at,
-                    ended_at,
-                    message_count,
-                    metadata_json,
-                ) in &conv_rows
-                {
-                    if let Some(r) = &running
-                        && !r.load(Ordering::Relaxed)
-                    {
-                        return Err(anyhow::anyhow!("Export cancelled"));
-                    }
-
-                    // Transform Path
-                    let transformed_path = self.transform_path(source_path, workspace);
-
-                    tx.execute(
-                    "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, ended_at, message_count, metadata_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                    &params![
-                        *id,
-                        agent.as_str(),
-                        workspace.as_deref(),
-                        title.as_deref(),
-                        transformed_path.as_str(),
-                        *started_at,
-                        *ended_at,
-                        *message_count,
-                        metadata_json.as_deref()
-                    ],
-                )?;
-
-                    // Fetch messages for this conversation
-                    let msg_rows: Vec<MessageExportRow> = src.query_all_map(
-                        &msg_query,
-                        &params![*id],
-                        |row: &FrankenRow| {
-                            Ok((
-                                row.get_typed::<i64>(0)?,
-                                row.get_typed::<String>(1)?,
-                                row.get_typed::<String>(2)?,
-                                row.get_typed::<Option<i64>>(3)?,
-                                row.get_typed::<i64>(4)?,
-                                row.get_typed::<Option<i64>>(5)?,
-                                row.get_typed::<Option<String>>(6)?,
-                                row.get_typed::<Option<String>>(7)?,
-                                row.get_typed::<Option<String>>(8)?,
-                            ))
-                        },
-                    )?;
-
-                    for (
-                        source_message_id,
-                        role,
-                        content,
-                        created_at,
-                        idx,
-                        updated_at,
-                        model,
-                        attachment_refs,
-                        extra_json,
-                    ) in &msg_rows
-                    {
-                        let resolved_model = normalize_optional_text(model.clone())
-                            .or_else(|| derive_message_model(extra_json.as_deref()));
-                        let resolved_attachment_refs =
-                            normalize_optional_text(attachment_refs.clone())
-                                .or_else(|| derive_attachment_refs(extra_json.as_deref()));
+                        // 3. Create Schema (Split into individual statements)
+                        tx.execute(
+                            "CREATE TABLE conversations (
+                        id INTEGER PRIMARY KEY,
+                        agent TEXT NOT NULL,
+                        workspace TEXT,
+                        title TEXT,
+                        source_path TEXT NOT NULL,
+                        started_at INTEGER,
+                        ended_at INTEGER,
+                        message_count INTEGER,
+                        metadata_json TEXT
+                    )", &[],
+                        )
+                        .context("Failed to create conversations table")?;
 
                         tx.execute(
-                            "INSERT INTO messages (id, conversation_id, idx, role, content, created_at, updated_at, model, attachment_refs)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                            "CREATE TABLE messages (
+                        id INTEGER PRIMARY KEY,
+                        conversation_id INTEGER NOT NULL,
+                        idx INTEGER NOT NULL,
+                        role TEXT NOT NULL,
+                        content TEXT NOT NULL,
+                        created_at INTEGER,
+                        updated_at INTEGER,
+                        model TEXT,
+                        attachment_refs TEXT,
+                        FOREIGN KEY (conversation_id) REFERENCES conversations(id)
+                    )", &[],
+                        )
+                        .context("Failed to create messages table")?;
+
+                        tx.execute(
+                            "CREATE TABLE snippets (
+                        id INTEGER PRIMARY KEY,
+                        message_id INTEGER NOT NULL,
+                        file_path TEXT,
+                        start_line INTEGER,
+                        end_line INTEGER,
+                        language TEXT,
+                        snippet_text TEXT,
+                        FOREIGN KEY (message_id) REFERENCES messages(id)
+                    )", &[],
+                        )
+                        .context("Failed to create snippets table")?;
+
+                        tx.execute(
+                            "CREATE TABLE export_meta (
+                        key TEXT PRIMARY KEY,
+                        value TEXT
+                    )", &[],
+                        )
+                        .context("Failed to create export_meta table")?;
+
+                        tx.execute(
+                            "CREATE VIRTUAL TABLE messages_fts USING fts5(
+                        content,
+                        tokenize='porter unicode61 remove_diacritics 2'
+                    )", &[],
+                        )
+                        .context("Failed to create messages_fts table")?;
+
+                        tx.execute(
+                            r#"CREATE VIRTUAL TABLE messages_code_fts USING fts5(
+                        content,
+                        tokenize="unicode61 tokenchars '-_./:@#$%\\'"
+                    )"#, &[],
+                        )
+                        .context("Failed to create messages_code_fts table")?;
+
+                        // 4. Query Source.  LEFT JOIN + COALESCE on agents so the
+                        // export path includes legacy NULL-agent conversations
+                        // (otherwise the exported archive silently omits them).
+                        // Agent filter becomes an EXISTS guard against the agents
+                        // table so it works correctly without the joined column.
+                        let mut from_where = String::from(
+                            " FROM conversations c
+                     LEFT JOIN agents a ON c.agent_id = a.id
+                     LEFT JOIN workspaces w ON c.workspace_id = w.id
+                     WHERE 1=1",
+                        );
+                        let mut params: Vec<ParamValue> = Vec::new();
+
+                        if let Some(agents) = &self.filter.agents {
+                            if agents.is_empty() {
+                                from_where.push_str(" AND 1=0");
+                            } else {
+                                from_where.push_str(" AND EXISTS (SELECT 1 FROM agents a2 WHERE a2.id = c.agent_id AND a2.slug IN (");
+                                for (i, agent) in agents.iter().enumerate() {
+                                    if i > 0 {
+                                        from_where.push_str(", ");
+                                    }
+                                    from_where.push('?');
+                                    params.push(ParamValue::from(agent.clone()));
+                                }
+                                from_where.push_str("))");
+                            }
+                        }
+
+                        // Note: Workspace filtering in source DB might be string matching if paths aren't normalized consistently.
+                        // Assuming strict matching for now.
+                        if let Some(workspaces) = &self.filter.workspaces {
+                            if workspaces.is_empty() {
+                                from_where.push_str(" AND 1=0");
+                            } else {
+                                from_where.push_str(" AND w.path IN (");
+                                for (i, ws) in workspaces.iter().enumerate() {
+                                    if i > 0 {
+                                        from_where.push_str(", ");
+                                    }
+                                    from_where.push('?');
+                                    params.push(ParamValue::from(ws.to_string_lossy().to_string()));
+                                }
+                                from_where.push(')');
+                            }
+                        }
+
+                        if let Some(since) = self.filter.since {
+                            from_where.push_str(" AND c.started_at >= ?");
+                            params.push(ParamValue::from(since.timestamp_millis()));
+                        }
+
+                        if let Some(until) = self.filter.until {
+                            from_where.push_str(" AND c.started_at <= ?");
+                            params.push(ParamValue::from(until.timestamp_millis()));
+                        }
+
+                        let query = format!(
+                            "SELECT c.id, COALESCE(a.slug, 'unknown') as agent, w.path as workspace, c.title, c.source_path, c.started_at, c.ended_at,
+                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count,
+                     c.metadata_json
+                     {from_where}"
+                        );
+
+                        let mut count_query = String::from("SELECT COUNT(*)");
+                        count_query.push_str(&from_where);
+                        let total_convs: usize =
+                            src.query_row_map(&count_query, &params, |row: &FrankenRow| {
+                                row.get_typed::<i64>(0).map(|v| v as usize)
+                            })?;
+
+                        // Execute Main Query - collect all conversation rows
+                        type ConversationExportRow = (
+                            i64,
+                            String,
+                            Option<String>,
+                            Option<String>,
+                            String,
+                            Option<i64>,
+                            Option<i64>,
+                            i64,
+                            Option<String>,
+                        );
+                        let conv_rows: Vec<ConversationExportRow> =
+                            src.query_all_map(&query, &params, |row: &FrankenRow| {
+                                Ok((
+                                    row.get_typed::<i64>(0)?,
+                                    row.get_typed::<String>(1)?,
+                                    row.get_typed::<Option<String>>(2)?,
+                                    row.get_typed::<Option<String>>(3)?,
+                                    row.get_typed::<String>(4)?,
+                                    row.get_typed::<Option<i64>>(5)?,
+                                    row.get_typed::<Option<i64>>(6)?,
+                                    row.get_typed::<i64>(7)?,
+                                    row.get_typed::<Option<String>>(8)?,
+                                ))
+                            })?;
+
+                        let mut processed = 0;
+                        let mut msg_processed = 0;
+                        let message_cols = table_columns(&src, "messages")?;
+                        let has_snippets_table = table_exists(&src, "snippets");
+                        let msg_query = build_message_export_query(&message_cols);
+
+                        for (
+                            id,
+                            agent,
+                            workspace,
+                            title,
+                            source_path,
+                            started_at,
+                            ended_at,
+                            message_count,
+                            metadata_json,
+                        ) in &conv_rows
+                        {
+                            if let Some(r) = &running
+                                && !r.load(Ordering::Relaxed)
+                            {
+                                return Err(anyhow::anyhow!("Export cancelled"));
+                            }
+
+                            // Transform Path
+                            let transformed_path = self.transform_path(source_path, workspace);
+
+                            tx.execute(
+                            "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, ended_at, message_count, metadata_json)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                             &params![
-                                *source_message_id,
                                 *id,
-                                *idx,
-                                role.as_str(),
-                                content.as_str(),
-                                *created_at,
-                                *updated_at,
-                                resolved_model.as_deref(),
-                                resolved_attachment_refs.as_deref()
+                                agent.as_str(),
+                                workspace.as_deref(),
+                                title.as_deref(),
+                                transformed_path.as_str(),
+                                *started_at,
+                                *ended_at,
+                                *message_count,
+                                metadata_json.as_deref()
                             ],
                         )?;
 
-                        // Populate FTS
-                        tx.execute(
-                            "INSERT INTO messages_fts (rowid, content) VALUES (?1, ?2)",
-                            &params![*source_message_id, content.as_str()],
-                        )?;
-                        tx.execute(
-                            "INSERT INTO messages_code_fts (rowid, content) VALUES (?1, ?2)",
-                            &params![*source_message_id, content.as_str()],
-                        )?;
-
-                        // 5. Migrate Snippets for this message (bd-4x92)
-                        let snip_rows: Vec<SnippetExportRow> = if has_snippets_table {
-                            src.query_all_map(
-                                "SELECT file_path, start_line, end_line, language, snippet_text FROM snippets WHERE message_id = ?1",
-                                &params![*source_message_id],
+                            // Fetch messages for this conversation
+                            let msg_rows: Vec<MessageExportRow> = src.query_all_map(
+                                &msg_query,
+                                &params![*id],
                                 |row: &FrankenRow| {
                                     Ok((
-                                        row.get_typed::<Option<String>>(0)?,
-                                        row.get_typed::<Option<i64>>(1)?,
-                                        row.get_typed::<Option<i64>>(2)?,
-                                        row.get_typed::<Option<String>>(3)?,
-                                        row.get_typed::<String>(4)?,
+                                        row.get_typed::<i64>(0)?,
+                                        row.get_typed::<String>(1)?,
+                                        row.get_typed::<String>(2)?,
+                                        row.get_typed::<Option<i64>>(3)?,
+                                        row.get_typed::<i64>(4)?,
+                                        row.get_typed::<Option<i64>>(5)?,
+                                        row.get_typed::<Option<String>>(6)?,
+                                        row.get_typed::<Option<String>>(7)?,
+                                        row.get_typed::<Option<String>>(8)?,
                                     ))
                                 },
-                            )?
-                        } else {
-                            Vec::new()
-                        };
-
-                        for (fpath, start, end, lang, stext) in snip_rows {
-                            tx.execute(
-                                "INSERT INTO snippets (message_id, file_path, start_line, end_line, language, snippet_text)
-                                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                                &params![*source_message_id, fpath, start, end, lang, stext.as_str()],
                             )?;
+
+                            for (
+                                source_message_id,
+                                role,
+                                content,
+                                created_at,
+                                idx,
+                                updated_at,
+                                model,
+                                attachment_refs,
+                                extra_json,
+                            ) in &msg_rows
+                            {
+                                let resolved_model = normalize_optional_text(model.clone())
+                                    .or_else(|| derive_message_model(extra_json.as_deref()));
+                                let resolved_attachment_refs =
+                                    normalize_optional_text(attachment_refs.clone())
+                                        .or_else(|| derive_attachment_refs(extra_json.as_deref()));
+
+                                tx.execute(
+                                    "INSERT INTO messages (id, conversation_id, idx, role, content, created_at, updated_at, model, attachment_refs)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                                    &params![
+                                        *source_message_id,
+                                        *id,
+                                        *idx,
+                                        role.as_str(),
+                                        content.as_str(),
+                                        *created_at,
+                                        *updated_at,
+                                        resolved_model.as_deref(),
+                                        resolved_attachment_refs.as_deref()
+                                    ],
+                                )?;
+
+                                // Populate FTS
+                                tx.execute(
+                                    "INSERT INTO messages_fts (rowid, content) VALUES (?1, ?2)",
+                                    &params![*source_message_id, content.as_str()],
+                                )?;
+                                tx.execute(
+                                    "INSERT INTO messages_code_fts (rowid, content) VALUES (?1, ?2)",
+                                    &params![*source_message_id, content.as_str()],
+                                )?;
+
+                                // 5. Migrate Snippets for this message (bd-4x92)
+                                let snip_rows: Vec<SnippetExportRow> = if has_snippets_table {
+                                    src.query_all_map(
+                                        "SELECT file_path, start_line, end_line, language, snippet_text FROM snippets WHERE message_id = ?1",
+                                        &params![*source_message_id],
+                                        |row: &FrankenRow| {
+                                            Ok((
+                                                row.get_typed::<Option<String>>(0)?,
+                                                row.get_typed::<Option<i64>>(1)?,
+                                                row.get_typed::<Option<i64>>(2)?,
+                                                row.get_typed::<Option<String>>(3)?,
+                                                row.get_typed::<String>(4)?,
+                                            ))
+                                        },
+                                    )?
+                                } else {
+                                    Vec::new()
+                                };
+
+                                for (fpath, start, end, lang, stext) in snip_rows {
+                                    tx.execute(
+                                        "INSERT INTO snippets (message_id, file_path, start_line, end_line, language, snippet_text)
+                                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                                        &params![*source_message_id, fpath, start, end, lang, stext.as_str()],
+                                    )?;
+                                }
+
+                                msg_processed += 1;
+                            }
+
+                            processed += 1;
+                            progress(processed, total_convs);
                         }
 
-                        msg_processed += 1;
-                    }
+                        // Metadata
+                        tx.execute("INSERT INTO export_meta (key, value) VALUES ('schema_version', '1')", &[])?;
+                        let exported_at = Utc::now().to_rfc3339();
+                        tx.execute(
+                            "INSERT INTO export_meta (key, value) VALUES ('exported_at', ?1)",
+                            &params![exported_at.as_str()],
+                        )?;
 
-                    processed += 1;
-                    progress(processed, total_convs);
-                }
-
-                // Metadata
-                tx.execute("INSERT INTO export_meta (key, value) VALUES ('schema_version', '1')", &[])?;
-                let exported_at = Utc::now().to_rfc3339();
-                tx.execute(
-                    "INSERT INTO export_meta (key, value) VALUES ('exported_at', ?1)",
-                    &params![exported_at.as_str()],
-                )?;
-
-                tx.commit()?;
-                (processed, msg_processed)
-            };
+                        Ok((processed, msg_processed))
+                    })()
+                    .map_err(crate::storage::sqlite::anyhow_error_into_storage_error)
+                },
+            )?;
             drop(dest);
 
             replace_attempted = true;

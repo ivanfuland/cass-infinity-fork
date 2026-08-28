@@ -76,7 +76,7 @@ use crate::sources::sync::path_to_safe_dirname;
 use crate::storage::sqlite::{
     DailyStatsRebuildResult, FrankenStorage, FtsConsistencyRepair, HistoricalSalvageOutcome,
     LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE, StatsAggregator, StatsDelta,
-    seed_canonical_from_best_historical_bundle,
+    historical_table_exists, seed_canonical_from_best_historical_bundle,
 };
 use semantic::{
     EmbeddingInput, SemanticIndexer, packet_embedding_inputs_from_storage,
@@ -1053,7 +1053,7 @@ pub struct IndexingProgress {
     /// Set by `run_index` while it is inside the post-publish finalize window —
     /// specifically `close_storage_after_index`, which runs the (deferred,
     /// possibly multi-GB) bulk-ingest WAL checkpoint via a synchronous,
-    /// `!Send` frankensqlite `conn.close()` + `wal_checkpoint(TRUNCATE)` on the
+    /// `!Send` legacy-embedded-engine `conn.close()` + `wal_checkpoint(TRUNCATE)` on the
     /// indexer thread. That checkpoint cannot report progress and, on a large
     /// corpus (esp. macOS, where Darwin fsync/flock is slow), legitimately
     /// takes minutes. The stall watchdog reads this flag so it does not misread
@@ -2977,7 +2977,7 @@ impl IndexRunLockGuard {
 /// v0.6.6 against a 3.25 GB / 7,566-conversation / 417,234-message DB
 /// — i.e. the `ORDER BY conversation_id ASC LIMIT 1` query in
 /// `collect_orphan_message_ids` descends the `messages` B-tree without
-/// a usable index and wedges in fsqlite.
+/// a usable index and wedges in the legacy engine crate.
 ///
 /// This module turns the diagnostic infrastructure into a *self-
 /// debugging surface*:
@@ -2992,7 +2992,7 @@ impl IndexRunLockGuard {
 /// 2. Per-op skip env vars: `CASS_SKIP_PREFLIGHT_<NAME>=1` lets an
 ///    operator bypass a single wedged step (e.g.
 ///    `CASS_SKIP_PREFLIGHT_CLEANUP_ORPHAN_FK_ROWS=1`) so they can
-///    actually use cass while the underlying fsqlite/cass bug is
+///    actually use cass while the underlying the legacy engine crate/cass bug is
 ///    being root-caused.
 /// 3. Per-op completion bump: every bounded preflight step calls the
 ///    completion macro after it returns, disarming the per-op watchdog
@@ -6808,7 +6808,7 @@ fn persist_lexical_rebuild_generation_artifacts(
 // thousands of conversations on a developer workstation (~512MB tantivy heap,
 // 4 writer threads). Raise via env vars on constrained hosts or when a corpus
 // exceeds these budgets. The previous (much smaller) defaults served
-// correctness during the frankensqlite migration but capped throughput at
+// correctness during the legacy embedded engine migration but capped throughput at
 // ~20 docs/sec on a 4.7M-message corpus; the values below keep Tantivy's
 // writer threads fed and cut SQL round-trips by ~5x without blowing the
 // configured heap.
@@ -9354,7 +9354,7 @@ fn repair_fallback_fts_after_full_index_run(
     // of the repair — the fingerprint probe, the consistency check, and
     // the marker write.  The long-running indexer connection accumulates
     // per-thread cursor cancellation state across the rayon worker pool
-    // (see `observe_cursor_cancellation` in fsqlite-btree), which can
+    // (see `observe_cursor_cancellation` in the legacy engine crate-btree), which can
     // surface on the FIRST subsequent query as `SQLITE_ABORT`
     // ("callback requested query abort").  That failure was making
     // every full-rebuild `run_index` call in the bench harness return
@@ -9382,7 +9382,7 @@ fn repair_fallback_fts_after_full_index_run(
             }
             return Err(err).with_context(|| {
                 format!(
-                    "opening fresh frankensqlite connection for fallback FTS repair at {}",
+                    "opening fresh the legacy embedded engine connection for fallback FTS repair at {}",
                     db_path.display()
                 )
             });
@@ -10912,133 +10912,161 @@ fn rebuild_daily_stats_from_conversation_packets(
     let (agent_slugs, workspace_paths) = storage
         .build_lexical_rebuild_lookups()
         .with_context(|| format!("building packet rebuild lookups for {}", db_path.display()))?;
-    let mut tx = storage.raw().transaction().with_context(|| {
-        format!(
-            "opening packet daily_stats rebuild transaction for {}",
-            db_path.display()
-        )
-    })?;
-    tx.execute("DELETE FROM daily_stats", &[]).with_context(|| {
-        format!(
-            "clearing daily_stats before packet rebuild for {}",
-            db_path.display()
-        )
-    })?;
-
-    let mut last_conversation_id = 0_i64;
-    let mut conversation_batches = 0usize;
-    let mut conversations_processed = 0usize;
-    let mut messages_projected = 0usize;
-    let mut raw_entries_flushed = 0usize;
-    let mut expanded_entries_flushed = 0usize;
-
-    loop {
-        let conversation_rows = storage
-            .list_conversations_for_lexical_rebuild_after_id(
-                PACKET_DAILY_STATS_REBUILD_BATCH_SIZE,
-                last_conversation_id,
-                &agent_slugs,
-                &workspace_paths,
+    // w1b Task B3 (D2, control-plane 2026-08-26): with_tx_no_replay,
+    // TxMode::Immediate -- same reasoning as sqlite.rs's rebuild
+    // functions: Immediate rules out a mid-transaction Busy{Snapshot}
+    // conflict structurally, so replay has nothing to catch, only the
+    // cost of redoing a full conversation-packet scan.
+    let (
+        rows_created,
+        total_sessions,
+        conversation_batches,
+        conversations_processed,
+        messages_projected,
+        raw_entries_flushed,
+        expanded_entries_flushed,
+    ) = storage
+        .raw()
+        .with_tx_no_replay(
+            crate::storage::api::TxMode::Immediate,
+            |tx| -> Result<(i64, i64, usize, usize, usize, usize, usize), crate::storage::api::StorageError> {
+                (|| -> Result<(i64, i64, usize, usize, usize, usize, usize)> {
+        tx.execute("DELETE FROM daily_stats", &[]).with_context(|| {
+            format!(
+                "clearing daily_stats before packet rebuild for {}",
+                db_path.display()
             )
-            .with_context(|| {
-                format!(
-                    "listing canonical conversations for packet daily_stats rebuild after id {}",
-                    last_conversation_id
-                )
-            })?;
-        if conversation_rows.is_empty() {
-            break;
-        }
+        })?;
 
-        let conversation_ids = conversation_rows
-            .iter()
-            .map(|conversation| {
-                conversation.id.ok_or_else(|| {
+        let mut last_conversation_id = 0_i64;
+        let mut conversation_batches = 0usize;
+        let mut conversations_processed = 0usize;
+        let mut messages_projected = 0usize;
+        let mut raw_entries_flushed = 0usize;
+        let mut expanded_entries_flushed = 0usize;
+
+        loop {
+            let conversation_rows = storage
+                .list_conversations_for_lexical_rebuild_after_id(
+                    PACKET_DAILY_STATS_REBUILD_BATCH_SIZE,
+                    last_conversation_id,
+                    &agent_slugs,
+                    &workspace_paths,
+                )
+                .with_context(|| {
+                    format!(
+                        "listing canonical conversations for packet daily_stats rebuild after id {}",
+                        last_conversation_id
+                    )
+                })?;
+            if conversation_rows.is_empty() {
+                break;
+            }
+
+            let conversation_ids = conversation_rows
+                .iter()
+                .map(|conversation| {
+                    conversation.id.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "packet daily_stats rebuild encountered conversation without id after {}",
+                            last_conversation_id
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut grouped_messages = storage
+                .fetch_messages_for_lexical_rebuild_batch(&conversation_ids, None, None)
+                .with_context(|| {
+                    format!(
+                        "fetching canonical message batch for packet daily_stats rebuild after id {}",
+                        last_conversation_id
+                    )
+                })?;
+
+            let mut aggregate = StatsAggregator::new();
+            for conversation in conversation_rows {
+                let conversation_id = conversation.id.ok_or_else(|| {
                     anyhow::anyhow!(
                         "packet daily_stats rebuild encountered conversation without id after {}",
                         last_conversation_id
                     )
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let mut grouped_messages = storage
-            .fetch_messages_for_lexical_rebuild_batch(&conversation_ids, None, None)
-            .with_context(|| {
-                format!(
-                    "fetching canonical message batch for packet daily_stats rebuild after id {}",
-                    last_conversation_id
-                )
-            })?;
+                })?;
+                last_conversation_id = conversation_id;
 
-        let mut aggregate = StatsAggregator::new();
-        for conversation in conversation_rows {
-            let conversation_id = conversation.id.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "packet daily_stats rebuild encountered conversation without id after {}",
-                    last_conversation_id
-                )
-            })?;
-            last_conversation_id = conversation_id;
+                let canonical_messages = grouped_messages
+                    .remove(&conversation_id)
+                    .unwrap_or_default();
+                let provenance = packet_daily_stats_provenance(&conversation);
+                let packet = lexical_rebuild_contract_from_canonical_messages(
+                    &conversation,
+                    &provenance,
+                    canonical_messages,
+                );
+                let message_count = packet_daily_stats_message_count(&packet.projections);
+                let total_chars = packet_daily_stats_total_chars(&packet.projections);
+                let day_id = conversation
+                    .started_at
+                    .map(FrankenStorage::day_id_from_millis)
+                    .unwrap_or(0);
+                aggregate.record(
+                    &conversation.agent_slug,
+                    &conversation.source_id,
+                    day_id,
+                    message_count,
+                    total_chars,
+                );
+                conversations_processed += 1;
+                messages_projected = messages_projected.saturating_add(message_count.max(0) as usize);
+            }
 
-            let canonical_messages = grouped_messages
-                .remove(&conversation_id)
-                .unwrap_or_default();
-            let provenance = packet_daily_stats_provenance(&conversation);
-            let packet = lexical_rebuild_contract_from_canonical_messages(
-                &conversation,
-                &provenance,
-                canonical_messages,
-            );
-            let message_count = packet_daily_stats_message_count(&packet.projections);
-            let total_chars = packet_daily_stats_total_chars(&packet.projections);
-            let day_id = conversation
-                .started_at
-                .map(FrankenStorage::day_id_from_millis)
-                .unwrap_or(0);
-            aggregate.record(
-                &conversation.agent_slug,
-                &conversation.source_id,
-                day_id,
-                message_count,
-                total_chars,
-            );
-            conversations_processed += 1;
-            messages_projected = messages_projected.saturating_add(message_count.max(0) as usize);
+            conversation_batches += 1;
+            raw_entries_flushed += aggregate.raw_entry_count();
+            let entries = aggregate.expand();
+            expanded_entries_flushed += entries.len();
+            if !entries.is_empty() {
+                packet_update_daily_stats_batched_in_tx(tx, &entries)?;
+            }
+
+            if conversation_batches.is_multiple_of(25) {
+                tracing::info!(
+                    target: "cass::perf::daily_stats",
+                    conversation_batches,
+                    batch_size = PACKET_DAILY_STATS_REBUILD_BATCH_SIZE,
+                    last_conversation_id,
+                    conversations_processed,
+                    messages_projected,
+                    "packet daily_stats rebuild progress"
+                );
+            }
         }
 
-        conversation_batches += 1;
-        raw_entries_flushed += aggregate.raw_entry_count();
-        let entries = aggregate.expand();
-        expanded_entries_flushed += entries.len();
-        if !entries.is_empty() {
-            packet_update_daily_stats_batched_in_tx(&tx, &entries)?;
-        }
+        let rows_created: i64 = tx.query_row_map(
+            "SELECT COUNT(*) FROM daily_stats",
+            &[] as &[ParamValue],
+            |row| row.get_typed(0),
+        )?;
+        let total_sessions: i64 = tx.query_row_map(
+            "SELECT COALESCE(SUM(session_count), 0) FROM daily_stats WHERE agent_slug = 'all' AND source_id = 'all'",
+            &[] as &[ParamValue],
+            |row| row.get_typed(0),
+        )?;
 
-        if conversation_batches.is_multiple_of(25) {
-            tracing::info!(
-                target: "cass::perf::daily_stats",
-                conversation_batches,
-                batch_size = PACKET_DAILY_STATS_REBUILD_BATCH_SIZE,
-                last_conversation_id,
-                conversations_processed,
-                messages_projected,
-                "packet daily_stats rebuild progress"
-            );
-        }
-    }
-
-    let rows_created: i64 = tx.query_row_map(
-        "SELECT COUNT(*) FROM daily_stats",
-        &[] as &[ParamValue],
-        |row| row.get_typed(0),
-    )?;
-    let total_sessions: i64 = tx.query_row_map(
-        "SELECT COALESCE(SUM(session_count), 0) FROM daily_stats WHERE agent_slug = 'all' AND source_id = 'all'",
-        &[] as &[ParamValue],
-        |row| row.get_typed(0),
-    )?;
-
-    tx.commit()?;
+                    Ok((
+                        rows_created,
+                        total_sessions,
+                        conversation_batches,
+                        conversations_processed,
+                        messages_projected,
+                        raw_entries_flushed,
+                        expanded_entries_flushed,
+                    ))
+                })()
+                .map_err(crate::storage::sqlite::anyhow_error_into_storage_error)
+            },
+        )
+        .with_context(|| {
+            format!("packet daily_stats rebuild transaction failed for {}", db_path.display())
+        })?;
 
     tracing::info!(
         target: "cass::perf::daily_stats",
@@ -13204,7 +13232,9 @@ fn restore_scan_watermarks_with_fresh_writer(
     snapshot: &[(String, String)],
 ) -> Result<()> {
     persist::with_concurrent_retry(2, || {
-        let writer = FrankenStorage::open(db_path)
+        // w1b Task B8 (d16, open-consumer audit): write path, switched to
+        // `open_writer`.
+        let writer = FrankenStorage::open_writer(db_path)
             .with_context(|| "opening dedicated writer for scan-watermark restore")?;
         let result = writer.restore_scan_watermarks(snapshot);
         let close_result = writer
@@ -13504,7 +13534,7 @@ pub fn run_index(
     // CASS #162 item 2: Verify the connection is writable early, before the
     // code reaches deep batch-insert paths where a readonly failure is hard
     // to diagnose.  A benign no-op UPDATE catches "attempt to write a readonly
-    // database" from frankensqlite.
+    // database" from the legacy embedded engine.
     if let Err(err) = storage
         .raw()
         .execute("UPDATE meta SET value = value WHERE key = 'schema_version'", &[])
@@ -13568,7 +13598,7 @@ pub fn run_index(
             tracing::warn!(
                 db_path = %opts.db_path.display(),
                 error = %detail,
-                "skipping derived fallback FTS validation repair because frankensqlite cannot yet reload populated FTS shadow WITHOUT ROWID tables; canonical indexing will continue"
+                "skipping derived fallback FTS validation repair because the legacy embedded engine cannot yet reload populated FTS shadow WITHOUT ROWID tables; canonical indexing will continue"
             );
         } else {
             tracing::warn!(
@@ -13663,7 +13693,7 @@ pub fn run_index(
     //
     // cass#265/cass#272 follow-up: both external reports and the
     // local profile of the production archive show this preflight can
-    // peg CPU inside `collect_orphan_message_ids` / fsqlite page-cache
+    // peg CPU inside `collect_orphan_message_ids` / the legacy engine crate page-cache
     // eviction for minutes. Routine indexing skips it by default; run
     // with CASS_PREFLIGHT_CLEANUP_ORPHAN_FK_ROWS=1 to force the old
     // repair behavior, or combine that with
@@ -14117,7 +14147,7 @@ pub fn run_index(
         // cass#272 performance follow-up: routine incremental refreshes on a
         // populated canonical archive should not probe historical bundles at
         // startup. Discovery opens candidate backup/snapshot DBs and can wedge
-        // in fsqlite page-cache eviction before real indexing starts. Keep the
+        // in the legacy engine crate page-cache eviction before real indexing starts. Keep the
         // automatic path for explicit full/rebuilt/empty recovery, and expose
         // the old populated-incremental discovery behavior behind
         // CASS_PREFLIGHT_HISTORICAL_SALVAGE_DISCOVERY=1.
@@ -14246,7 +14276,7 @@ pub fn run_index(
             // repair branch — `count_total_messages_exact` issues a
             // `SELECT COUNT(*) FROM messages` which, on the cass#265
             // reporter's 417k-row DB, can route through the same
-            // fsqlite full-table-scan path that wedges
+            // the legacy engine crate full-table-scan path that wedges
             // `cleanup_orphan_fk_rows`. Skipping leaves the planner
             // in the "no repair plan" branch, which falls through to
             // the normal scan loop instead of the lexical-repair
@@ -15020,7 +15050,7 @@ pub fn run_index(
     )
     .with_context(|| {
         format!(
-            "repairing frankensqlite-owned fallback FTS after full index run for {}",
+            "repairing the legacy embedded engine-owned fallback FTS after full index run for {}",
             opts.db_path.display()
         )
     })? {
@@ -15038,7 +15068,7 @@ pub fn run_index(
                 tracing::warn!(
                     db_path = %opts.db_path.display(),
                     error = %detail,
-                    "skipping derived fallback FTS repair because frankensqlite cannot yet reload populated FTS shadow WITHOUT ROWID tables; canonical SQLite rows and Tantivy remain authoritative"
+                    "skipping derived fallback FTS repair because the legacy embedded engine cannot yet reload populated FTS shadow WITHOUT ROWID tables; canonical SQLite rows and Tantivy remain authoritative"
                 );
             }
             FallbackFtsRepairOutcome::SkippedCorruptDerivedIndex { detail } => {
@@ -15078,7 +15108,7 @@ pub fn run_index(
         tracing::info!(
             db_path = %opts.db_path.display(),
             canonical_only_full_rebuild,
-            "skipping frankensqlite-owned fallback FTS rebuild because this full run only rebuilt Tantivy from the existing canonical database"
+            "skipping the legacy embedded engine-owned fallback FTS rebuild because this full run only rebuilt Tantivy from the existing canonical database"
         );
     }
 
@@ -15366,7 +15396,11 @@ pub fn run_index(
                     let db_path = guard.database_path().ok();
                     guard.close_best_effort_in_place();
                     if let Some(path) = db_path {
-                        match FrankenStorage::open(&path) {
+                        // w1b Task B8 (d16, open-consumer audit): this handle
+                        // is only ever read from (long-lived watch-cycle
+                        // handle, recycled solely to shed accumulated MVCC
+                        // snapshot state) -- switched to the read-only open.
+                        match FrankenStorage::open_readonly(&path) {
                             Ok(new_storage) => {
                                 *guard = new_storage;
                                 tracing::debug!(
@@ -15408,7 +15442,7 @@ pub fn run_index(
     }
 
     // #319/#321: `close_storage_after_index` runs the final WAL checkpoint of
-    // the deferred bulk-ingest WAL — a synchronous, `!Send` frankensqlite
+    // the deferred bulk-ingest WAL — a synchronous, `!Send` the legacy embedded engine
     // `conn.close()` + `wal_checkpoint(TRUNCATE)` that executes on THIS thread
     // and cannot report progress. On a large corpus (the report: ~1.1 GB /
     // ~290k-frame WAL) it legitimately takes minutes, especially on macOS.
@@ -15507,7 +15541,7 @@ fn classify_final_wal_checkpoint(
 /// The `cass index` stall-abort path exits via `std::process::exit(70)`, which
 /// skips destructors — so the canonical WAL is never checkpointed and a killed
 /// run leaves a multi-GB orphaned `*.db-wal` behind a tiny `*.db` (the #296
-/// symptom). This opens a *fresh, independent* frankensqlite connection to the
+/// symptom). This opens a *fresh, independent* the legacy embedded engine connection to the
 /// canonical DB file (the wedged storage handle's workers are parked, but the
 /// file itself is checkpointable through a new connection) and runs
 /// `wal_checkpoint(TRUNCATE)` so the post-abort DB is recoverable by stock
@@ -15562,7 +15596,7 @@ pub fn best_effort_abort_wal_checkpoint(data_dir: &Path) {
 }
 
 fn run_final_wal_checkpoint(db_path: &Path, context: &str) -> Result<FinalWalCheckpointOutcome> {
-    // Run this after closing the indexing storage handle: frankensqlite flushes
+    // Run this after closing the indexing storage handle: the legacy embedded engine flushes
     // retained autocommit writes during close, and TRUNCATE avoids leaving the
     // completed bulk-ingest WAL for the next opener to replay.
     let conn = crate::storage::api::Conn::open_writable(
@@ -16249,7 +16283,7 @@ fn incremental_semantic_embed(
     )
 }
 
-/// Open frankensqlite storage for indexing without replacing canonical data.
+/// Open the legacy embedded engine storage for indexing without replacing canonical data.
 ///
 /// Returns `(storage, rebuilt, opened_fresh_for_full)`. `rebuilt` and
 /// `opened_fresh_for_full` are retained for progress metadata compatibility;
@@ -16260,17 +16294,28 @@ fn open_storage_for_index(
     full_index: bool,
 ) -> Result<(FrankenStorage, bool, bool)> {
     if db_path.exists() {
-        match non_destructive_meta_schema_version(db_path) {
-            Ok(Some(version)) if version > crate::storage::sqlite::CURRENT_SCHEMA_VERSION => {
-                return Err(canonical_archive_unhealthy_for_index_error(
-                    db_path,
-                    &format!(
-                        "schema_version {version} is newer than supported version {}",
-                        crate::storage::sqlite::CURRENT_SCHEMA_VERSION
-                    ),
-                ));
-            }
-            Ok(_) => {}
+        match non_destructive_index_open_schema_probe(db_path) {
+            Ok(probe) => match classify_index_open_generation(&probe) {
+                IndexOpenGeneration::CurrentOrEmpty => {}
+                IndexOpenGeneration::NewerThanSupported => {
+                    return Err(canonical_archive_unhealthy_for_index_error(
+                        db_path,
+                        &format!(
+                            "schema_version {} is newer than supported version {}",
+                            probe.user_version,
+                            crate::storage::sqlite::CURRENT_SCHEMA_VERSION
+                        ),
+                    ));
+                }
+                IndexOpenGeneration::LegacyFrankenGeneration => {
+                    return Err(canonical_archive_unhealthy_for_index_error(
+                        db_path,
+                        &legacy_franken_generation_rebuild_not_convert_reason(
+                            probe.legacy_meta_schema_version,
+                        ),
+                    ));
+                }
+            },
             Err(err) if anyhow_chain_indicates_retryable_storage_contention(&err) => {
                 return Err(anyhow::anyhow!(
                     "canonical db is busy/locked during index open; refusing to replace it: {err:#}"
@@ -16300,8 +16345,10 @@ fn open_storage_for_index(
         }
     }
 
+    // w1b Task B8 (d16, open-consumer audit): both branches write (index
+    // ingestion), switched to `open_writer`.
     if db_path.exists() {
-        match FrankenStorage::open(db_path) {
+        match FrankenStorage::open_writer(db_path) {
             Ok(storage) => Ok((storage, false, false)),
             Err(err) if anyhow_chain_indicates_retryable_storage_contention(&err) => {
                 Err(anyhow::anyhow!(
@@ -16314,9 +16361,9 @@ fn open_storage_for_index(
             )),
         }
     } else {
-        FrankenStorage::open(db_path)
+        FrankenStorage::open_writer(db_path)
             .map(|storage| (storage, false, full_index))
-            .with_context(|| format!("creating frankensqlite storage at {}", db_path.display()))
+            .with_context(|| format!("creating sqlite storage at {}", db_path.display()))
     }
 }
 
@@ -16327,7 +16374,79 @@ fn index_storage_open_error_reason(err: &anyhow::Error) -> String {
         .unwrap_or(message)
 }
 
-fn non_destructive_meta_schema_version(db_path: &Path) -> Result<Option<i64>> {
+/// R1-B3: `PRAGMA user_version` (the new rusqlite generation's sole
+/// authority, per `schema::ensure`) plus the legacy `meta.schema_version`
+/// marker (present only on franken-generation archives that predate w1b
+/// Task B8, frozen forever at `sqlite.rs`'s
+/// `LEGACY_FRANKEN_SCHEMA_VERSION_CEILING` -- see that constant's doc
+/// comment). The two numbering schemes are unrelated: a bare comparison of
+/// one against the other's ceiling (the bug this replaces) misclassifies
+/// every legacy archive.
+struct IndexOpenSchemaProbe {
+    user_version: i64,
+    legacy_meta_schema_version: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexOpenGeneration {
+    /// Either a current-generation archive (`user_version ==
+    /// CURRENT_SCHEMA_VERSION`) or a genuinely empty/fresh db (`user_version
+    /// == 0` and no legacy marker either) -- the normal open path below
+    /// handles both without any special-casing here.
+    CurrentOrEmpty,
+    /// A franken-generation (pre-w1b-B8) archive: `user_version == 0` with a
+    /// legacy `meta.schema_version` row. Not a "future schema" -- comparing
+    /// its old-numbering value against `CURRENT_SCHEMA_VERSION` is
+    /// meaningless. `schema::ensure` itself rejects any non-empty
+    /// `user_version == 0` database as rebuild-not-convert; this classifies
+    /// the same case earlier, with the correct legacy-specific reason
+    /// instead of misreporting it via the wrong generation's ceiling.
+    LegacyFrankenGeneration,
+    /// A genuine future rusqlite-generation archive: `user_version >
+    /// CURRENT_SCHEMA_VERSION`. This binary is older than the database.
+    NewerThanSupported,
+}
+
+fn classify_index_open_generation(probe: &IndexOpenSchemaProbe) -> IndexOpenGeneration {
+    if probe.user_version > 0 {
+        if probe.user_version > crate::storage::sqlite::CURRENT_SCHEMA_VERSION {
+            return IndexOpenGeneration::NewerThanSupported;
+        }
+        return IndexOpenGeneration::CurrentOrEmpty;
+    }
+    // R2-F4: a legacy franken-generation archive's `meta.schema_version` is
+    // frozen forever at `LEGACY_FRANKEN_SCHEMA_VERSION_CEILING` (21) -- see
+    // that constant's doc comment. A bare `.is_some()` here misclassified
+    // *any* `user_version == 0` db carrying an unrelated `meta.schema_version`
+    // value above that ceiling as this generation too, when it's really just
+    // some other `user_version == 0` non-empty db `schema::ensure`'s own
+    // generic rebuild-not-convert rejection already refuses. Values within
+    // the legacy generation's actual range (<= 21) still classify here so
+    // they get the more specific, legacy-aware reason text.
+    if probe
+        .legacy_meta_schema_version
+        .is_some_and(|version| version <= crate::storage::sqlite::LEGACY_FRANKEN_SCHEMA_VERSION_CEILING)
+    {
+        return IndexOpenGeneration::LegacyFrankenGeneration;
+    }
+    IndexOpenGeneration::CurrentOrEmpty
+}
+
+fn legacy_franken_generation_rebuild_not_convert_reason(
+    legacy_meta_schema_version: Option<i64>,
+) -> String {
+    let legacy_version_text =
+        legacy_meta_schema_version.map_or_else(|| "unknown".to_string(), |v| v.to_string());
+    format!(
+        "this is a pre-rusqlite (legacy franken-generation) archive, meta.schema_version=\
+         {legacy_version_text} under the retired franken numbering -- this is a \
+         rebuild-not-convert case, the same as `schema::ensure`'s own user_version=0 \
+         rejection: move the existing archive aside and rebuild it from source with \
+         `cass index --full`, or wait for a future `cass doctor` migration route"
+    )
+}
+
+fn non_destructive_index_open_schema_probe(db_path: &Path) -> Result<IndexOpenSchemaProbe> {
     let mut conn = crate::storage::sqlite::open_franken_raw_readonly_connection_with_timeout(
         db_path,
         Duration::from_secs(10),
@@ -16339,7 +16458,9 @@ fn non_destructive_meta_schema_version(db_path: &Path) -> Result<Option<i64>> {
         )
     })?;
 
-    let result = match conn.query_opt_map(
+    let user_version_result = crate::storage::schema::read_user_version(&conn)
+        .map_err(|err| anyhow::anyhow!("reading canonical archive user_version before index: {err}"));
+    let legacy_meta_schema_version_result = match conn.query_opt_map(
         "SELECT value FROM meta WHERE key = 'schema_version';",
         &[],
         |row| Ok(row.get_typed::<String>(0).ok()),
@@ -16355,12 +16476,15 @@ fn non_destructive_meta_schema_version(db_path: &Path) -> Result<Option<i64>> {
         tracing::debug!(
             error = %close_err,
             db_path = %db_path.display(),
-            "non_destructive_meta_schema_version: close_without_checkpoint_in_place failed"
+            "non_destructive_index_open_schema_probe: close_without_checkpoint_in_place failed"
         );
         conn.close_best_effort_in_place();
     }
 
-    result
+    Ok(IndexOpenSchemaProbe {
+        user_version: user_version_result?,
+        legacy_meta_schema_version: legacy_meta_schema_version_result?,
+    })
 }
 
 fn storage_error_mentions_missing_table_or_column(err: &impl std::fmt::Display) -> bool {
@@ -16662,19 +16786,23 @@ fn file_size_bytes(path: &Path) -> u64 {
 #[cfg(test)]
 fn current_schema_fast_probe(db_path: &Path) -> Result<bool> {
     let mut storage = FrankenStorage::open_readonly(db_path)
-        .with_context(|| format!("opening frankensqlite db readonly at {}", db_path.display()))?;
+        .with_context(|| format!("opening the legacy embedded engine db readonly at {}", db_path.display()))?;
 
+    // w1b Task B9 (2026-08-27, equivalence-gate-caught B7 regression): the
+    // legacy incremental migration engine kept `meta.schema_version` in sync
+    // as its version authority; `storage::schema::ensure` (Task B7) moved
+    // that authority to `PRAGMA user_version` and, by its own module doc,
+    // deliberately never populates `meta`/`_schema_migrations` on the
+    // single-shot fresh-build path. Reading `meta.schema_version` here always
+    // came back empty for a current-schema database built through that path,
+    // making this fast probe report "not current schema" unconditionally --
+    // never caught before because this function has zero production callers
+    // (grep-verified) and the first full `--lib` equivalence-gate rerun is
+    // what finally exercised it end to end.
     let version = storage
         .raw()
-        .query_opt_map(
-            "SELECT value FROM meta WHERE key = 'schema_version';",
-            &[],
-            |row| Ok(row.get_typed::<String>(0).ok()),
-        )
-        .ok()
-        .flatten()
-        .flatten()
-        .and_then(|raw| raw.parse::<i64>().ok());
+        .query_row_map("PRAGMA user_version;", &[], |row| row.get_typed::<i64>(0))
+        .ok();
 
     if let Err(close_err) = storage.close_without_checkpoint_in_place() {
         tracing::warn!(
@@ -16770,7 +16898,8 @@ fn maybe_seed_empty_canonical_from_historical_bundle(
                     )
                 })?
             } else {
-                FrankenStorage::open(db_path).with_context(|| {
+                // w1b Task B8 (d16, open-consumer audit): write path.
+                FrankenStorage::open_writer(db_path).with_context(|| {
                     format!(
                         "reopening canonical database after baseline historical seed attempt: {}",
                         db_path.display()
@@ -16785,7 +16914,8 @@ fn maybe_seed_empty_canonical_from_historical_bundle(
                 error = %err,
                 "baseline historical seed import failed; falling back to incremental salvage"
             );
-            match FrankenStorage::open(db_path) {
+            // w1b Task B8 (d16, open-consumer audit): write path.
+            match FrankenStorage::open_writer(db_path) {
                 Ok(reopened) => Ok((reopened, None)),
                 Err(reopen_err) => {
                     tracing::warn!(
@@ -16807,7 +16937,8 @@ fn maybe_seed_empty_canonical_from_historical_bundle(
                             "moved failed baseline seed bundle aside before incremental salvage fallback"
                         );
                     }
-                    let reopened = FrankenStorage::open(db_path).with_context(|| {
+                    // w1b Task B8 (d16, open-consumer audit): write path.
+                    let reopened = FrankenStorage::open_writer(db_path).with_context(|| {
                         format!(
                             "recreating fresh canonical database after failed baseline seed import: {}",
                             db_path.display()
@@ -16877,6 +17008,42 @@ pub(crate) fn refresh_completed_lexical_rebuild_checkpoint_from_live_index(
     })
 }
 
+/// The oldest table every lexical-rebuild-capable database generation has:
+/// added by the post-v13 migrations (see `storage::schema` docs) and never
+/// dropped since. A database predating it cannot satisfy
+/// `list_conversations_for_lexical_rebuild_after_id_through_id`'s
+/// `conversation_tail_state` correlated subquery -- that used to be masked
+/// by the now-retired incremental migration engine silently backfilling the
+/// table on any open (including this repair path's own readonly open), so
+/// a pre-generation database only ever surfaced a raw "no such table" SQL
+/// error here instead of a clear diagnosis (control-plane ruling
+/// 2026-08-27: harden this specific entry point with a fail-closed check
+/// rather than resurrect the retired silent-backfill behavior).
+const LEXICAL_REBUILD_GENERATION_MARKER_TABLE: &str = "conversation_tail_state";
+
+/// Fail closed, in the same "rebuild the archive, don't try to convert this
+/// file" style as `storage::schema::ensure`'s own legacy-database rejection,
+/// before the heavyweight inline rebuild below can reach the marker table
+/// and surface a raw SQL error instead. Checked once per invocation of this
+/// repair path (only reached when a rebuild was already judged necessary),
+/// not on every read-only search open -- a schema-current database pays one
+/// cheap `sqlite_master` lookup, nothing more.
+fn reject_pre_lexical_rebuild_generation_database(
+    storage: &FrankenStorage,
+    db_path: &Path,
+) -> Result<()> {
+    if historical_table_exists(storage.raw(), LEXICAL_REBUILD_GENERATION_MARKER_TABLE)? {
+        return Ok(());
+    }
+    Err(anyhow::anyhow!(
+        "database at {} predates the `{LEXICAL_REBUILD_GENERATION_MARKER_TABLE}` schema \
+         generation (a pre-rusqlite archive, or a database that was never rebuilt after an \
+         engine upgrade); this repair path does not attempt in-place conversion -- run `cass \
+         index --full` to rebuild the canonical database and its lexical index together",
+        db_path.display()
+    ))
+}
+
 pub(crate) fn repair_lexical_index_from_canonical_db_for_search(
     db_path: &Path,
     data_dir: &Path,
@@ -16899,6 +17066,7 @@ pub(crate) fn repair_lexical_index_from_canonical_db_for_search(
             db_path.display()
         )
     })?;
+    reject_pre_lexical_rebuild_generation_database(&storage, db_path)?;
     let total_conversations = count_total_conversations_exact(&storage)?;
     if total_conversations == 0 {
         let index_path = index_dir(data_dir)?;
@@ -17472,7 +17640,7 @@ fn spawn_lexical_rebuild_packet_producer(
             log_prep_step("load_sources", &mut prep_step_started);
 
             // Pre-fetch agent/workspace lookup maps to avoid 3-table JOINs in the
-            // rebuild query path — frankensqlite materialises the full Cartesian
+            // rebuild query path — the legacy embedded engine materialises the full Cartesian
             // product for multi-table JOINs, causing 200x+ regressions.
             let (agent_slugs, workspace_paths) = match storage.build_lexical_rebuild_lookups() {
                 Ok(lookups) => lookups,
@@ -21111,7 +21279,7 @@ fn ingest_batch_detailed(
         robot_trace_ingest_start("ingest_batch", convs, lexical_strategy, defer_checkpoints);
     // Persistence now uses short-lived writer connections internally so the
     // long-lived watch/session handle does not accumulate retained MVCC state
-    // on older frankensqlite builds that ignore autocommit_retain.
+    // on older the legacy embedded engine builds that ignore autocommit_retain.
     let batch_result = persist::persist_conversations_batched_with_raw_mirror_links(
         storage,
         t_index,
@@ -21238,7 +21406,7 @@ fn ingest_non_watch_batch_once(
 ) -> Result<NonWatchIngestOutcome> {
     if should_inject_non_watch_ingest_test_oom(convs) {
         // Use the typed `FrankenError::OutOfMemory` variant so the OOM detector
-        // exercises the downcast path that real frankensqlite OOMs hit, instead
+        // exercises the downcast path that real the legacy embedded engine OOMs hit, instead
         // of relying on the plain-string fallback.
         return Err(out_of_memory_storage_error());
     }
@@ -21345,7 +21513,7 @@ fn ingest_non_watch_oom_retry_or_quarantine(
 
     let conv = &convs[0];
 
-    // #298: mirror the watch-path plausibility gate. frankensqlite raises the
+    // #298: mirror the watch-path plausibility gate. the legacy embedded engine raises the
     // same typed `FrankenError::OutOfMemory` for per-statement bounded
     // allocation guards, so a NoMem on a small conversation with no real host
     // memory pressure is not evidence of a poisoned conversation. Defer it
@@ -21556,7 +21724,7 @@ fn ingest_watch_batch_with_oom_split_inner(
     let batch_result =
         if mode == WatchOomIngestMode::Standard && should_inject_watch_ingest_test_oom(convs) {
             // Use the typed `FrankenError::OutOfMemory` variant so the OOM detector
-            // exercises the downcast path that real frankensqlite OOMs hit, instead
+            // exercises the downcast path that real the legacy embedded engine OOMs hit, instead
             // of relying on the plain-string fallback.
             Err(out_of_memory_storage_error())
         } else {
@@ -21625,7 +21793,7 @@ fn ingest_watch_batch_with_oom_split_inner(
             let conv = &convs[0];
 
             // #298: a typed `FrankenError::OutOfMemory` (NoMem) on the batch
-            // path is NOT proof of real host memory exhaustion — frankensqlite
+            // path is NOT proof of real host memory exhaustion — the legacy embedded engine
             // raises the same typed error for per-statement bounded allocation
             // guards. Before quarantining a single small conversation that may
             // well ingest fine in isolation, retry it solo (which the reporter
@@ -21859,7 +22027,7 @@ fn error_is_out_of_memory(error: &anyhow::Error) -> bool {
 
 /// Default ceiling, in bytes of *indexed text*, under which a watch-ingest
 /// `NoMem` is treated as a bounded-allocation-guard false positive rather than
-/// real host memory exhaustion (#298). frankensqlite raises the same typed
+/// real host memory exhaustion (#298). the legacy embedded engine raises the same typed
 /// `FrankenError::OutOfMemory` for per-statement bounded allocation limits
 /// (VDBE frame/register/pager guards) as it does for real OS pressure, so a
 /// small conversation that ingests fine solo must never be quarantined just
@@ -23263,7 +23431,7 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) -> Resu
 fn reset_storage(storage: &FrankenStorage) -> Result<()> {
     // Wrap the canonical-table reset in a transaction so partial clears roll back.
     // The derived FTS table is recreated explicitly afterward because the
-    // frankensqlite writer path does not implement the FTS5 control-column
+    // the legacy embedded engine writer path does not implement the FTS5 control-column
     // `delete-all` command used by stock SQLite.
     storage.raw().execute_batch(
         "BEGIN TRANSACTION;
@@ -25291,7 +25459,9 @@ pub mod persist {
     use crate::search::tantivy::TantivyIndex;
     #[cfg(test)]
     use crate::sources::provenance::{Source, SourceKind};
-    use crate::storage::sqlite::{FrankenStorage, IndexingCache, InsertOutcome};
+    use crate::storage::sqlite::{
+        FrankenStorage, IndexingCache, InsertOutcome, anyhow_error_into_storage_error,
+    };
 
     /// `coding_agent_session_search-5b9p0` (ibuuh.32 follow-up):
     /// builds a [`ConversationPacket`] for the lexical sink AND the
@@ -25697,7 +25867,7 @@ pub mod persist {
     /// GH#320: bulk-import mode used to disable autocheckpoints entirely
     /// (`0`), deferring the whole checkpoint to post-publish. That let the
     /// WAL grow with the corpus (1 GB+ on large fleets) and — because the
-    /// frankensqlite pager keeps WAL-resident state in memory — drove the
+    /// the legacy embedded engine pager keeps WAL-resident state in memory — drove the
     /// ingest-phase physical footprint to roughly 3.5-4x the WAL size
     /// (13-14 GB peaks on 16 GB hosts). A bounded-but-large threshold keeps
     /// bulk import's amortized-checkpoint intent (one checkpoint per
@@ -25878,7 +26048,7 @@ pub mod persist {
         apply_index_writer_checkpoint_policy(storage, defer_checkpoints);
         let (writer, reusable) = storage.acquire_cached_ephemeral_writer().with_context(|| {
             format!(
-                "opening short-lived frankensqlite writer for {context}: {}",
+                "opening short-lived the legacy embedded engine writer for {context}: {}",
                 db_path.display()
             )
         })?;
@@ -25890,7 +26060,7 @@ pub mod persist {
             } else {
                 writer.close().with_context(|| {
                     format!(
-                        "closing short-lived frankensqlite writer for {context}: {}",
+                        "closing short-lived the legacy embedded engine writer for {context}: {}",
                         db_path.display()
                     )
                 })
@@ -25930,20 +26100,21 @@ pub mod persist {
         apply_index_writer_busy_timeout(&writer);
         apply_index_writer_checkpoint_policy(&writer, defer_checkpoints);
 
-        // CASS #169: Disable database-level FK enforcement on ephemeral writers.
-        // All insert paths already guarantee FK parent records exist at the
-        // application level (ensure_agent, ensure_workspace,
-        // ensure_embedded_source_registered), so SQLite FK checks are redundant.
-        // After sustained write activity (~39 min), frankensqlite's cursor cache
-        // can report false-positive FK constraint violations that PRAGMA
-        // foreign_key_check confirms do not actually exist.
-        if let Err(err) = writer.raw().execute("PRAGMA foreign_keys = OFF", &[]) {
-            tracing::debug!(
-                error = %err,
-                context,
-                "failed to disable FK enforcement on ephemeral writer"
-            );
-        }
+        // w1b Task B2b (R0-B3): CASS #169 used to disable FK enforcement here
+        // to work around a legacy embedded engine cursor-cache bug (false-positive FK
+        // violations after ~39min of sustained write activity, confirmed
+        // spurious by `PRAGMA foreign_key_check`) on the theory that
+        // application-level guarantees (ensure_agent/ensure_workspace/
+        // ensure_embedded_source_registered) made DB-level enforcement
+        // redundant. Spec R0-B07 requires every connection to keep FK
+        // enforcement on -- "the application layer already guarantees it" is
+        // exactly the assumption this wave's own FK-orphan fixes (P0,
+        // commit 069397b5) disproved elsewhere, and leaving FK off here
+        // would let a real orphan silently land instead of failing loudly.
+        // Removed rather than reworked into a defer/retry: this isn't an
+        // insert-ordering problem `defer_foreign_keys` could paper over, and
+        // if the cursor-cache false-positive still exists it is now visible
+        // (and diagnosable) instead of masked.
 
         let result = f(&writer);
 
@@ -26092,66 +26263,35 @@ pub mod persist {
         Ok(ChunkPersistResult::Completed(outcomes))
     }
 
+    /// w1b Task B4: the fallback pass used to open its own dedicated
+    /// `FrankenStorage::open_writer` connection -- a second live writer
+    /// connection alongside whatever the primary chunk pass still held.
+    /// It now submits through the same `WriterHandle` the primary pass
+    /// uses, so the "at most 1 live writer connection" invariant holds
+    /// across the fallback path too, not just the happy path.
     fn persist_chunk_serial_fallback(
-        db_path: &std::path::Path,
+        writer_handle: &crate::storage::api::WriterHandle<FrankenStorage>,
         base_idx: usize,
         chunk: &[NormalizedConversation],
         internal_chunk: &[Conversation],
         max_retries: usize,
-        defer_checkpoints: bool,
     ) -> Result<Vec<(usize, InsertOutcome)>> {
-        let franken = FrankenStorage::open_writer(db_path).with_context(|| {
-            format!(
-                "opening frankensqlite writer for begin-concurrent serial fallback: {}",
-                db_path.display()
-            )
-        })?;
-        apply_begin_concurrent_writer_tuning(&franken, defer_checkpoints);
-        // CASS #169: Disable FK enforcement — see with_ephemeral_writer for rationale.
-        if let Err(err) = franken.raw().execute("PRAGMA foreign_keys = OFF", &[]) {
-            tracing::debug!(
-                error = %err,
-                "failed to disable FK enforcement on serial fallback writer"
-            );
-        }
+        // w1b Task B2b (R0-B3): CASS #169 FK-disable removed -- see the
+        // longer rationale on `with_ephemeral_writer`'s equivalent site.
         let fallback_retries = max_retries.max(12);
-        let result =
-            persist_chunk_with_writer(&franken, base_idx, chunk, internal_chunk, fallback_retries);
-        let close_result = franken.close().with_context(|| {
-            format!(
-                "closing frankensqlite writer for begin-concurrent serial fallback: {}",
-                db_path.display()
-            )
-        });
+        let chunk_owned = chunk.to_vec();
+        let internal_chunk_owned = internal_chunk.to_vec();
+        let result = writer_handle
+            .submit(move |franken: &FrankenStorage| {
+                persist_chunk_with_writer(franken, base_idx, &chunk_owned, &internal_chunk_owned, fallback_retries)
+                    .map_err(anyhow_error_into_storage_error)
+            })
+            .map_err(|e| anyhow!("{e}"))?;
 
         match result {
-            Ok(ChunkPersistResult::Completed(outcomes)) => {
-                close_result?;
-                Ok(outcomes)
-            }
-            Ok(ChunkPersistResult::RetryableFallback {
-                completed,
-                remaining_range,
-                error,
-            }) => {
-                if let Err(close_err) = close_result {
-                    tracing::warn!(
-                        error = %close_err,
-                        db_path = %db_path.display(),
-                        "failed to close serial fallback writer cleanly after retry exhaustion"
-                    );
-                }
+            ChunkPersistResult::Completed(outcomes) => Ok(outcomes),
+            ChunkPersistResult::RetryableFallback { completed, remaining_range, error } => {
                 ordered_bail_serial_fallback(completed.len(), remaining_range, error)
-            }
-            Err(err) => {
-                if let Err(close_err) = close_result {
-                    tracing::warn!(
-                        error = %close_err,
-                        db_path = %db_path.display(),
-                        "failed to close serial fallback writer cleanly after index error"
-                    );
-                }
-                Err(err)
             }
         }
     }
@@ -26233,86 +26373,68 @@ pub mod persist {
             )
             .collect();
 
-        let indexed_chunks: Vec<Result<ChunkPersistResult>> = convs
-            .par_chunks(chunk_size)
-            .enumerate()
-            .map(|(chunk_idx, chunk)| {
-                let base_idx = chunk_idx * chunk_size;
-                let internal_chunk = &internal_convs[base_idx..base_idx + chunk.len()];
-                // Card 1 / Silo shadow observer — observes only, NO commit
-                // semantics change. When CASS_INDEXER_PARALLEL_WAL=shadow is
-                // set, this records per-chunk wall-clock so future sessions
-                // can compare what a parallel-WAL coordinator would have
-                // decided. Explicit `off` mode returns None; default shadow
-                // mode records a tiny bounded evidence manifest.
-                let shadow_guard = crate::indexer::parallel_wal_shadow::start_chunk(
-                    chunk_idx,
-                    base_idx,
-                    chunk.len(),
-                );
-                let franken = FrankenStorage::open_writer(db_path).with_context(|| {
-                    format!(
-                        "opening frankensqlite writer for begin-concurrent mode: {}",
-                        db_path.display()
-                    )
-                })?;
-                apply_begin_concurrent_writer_tuning(&franken, defer_checkpoints);
-                // CASS #169: Disable FK enforcement — see with_ephemeral_writer for rationale.
-                if let Err(err) = franken.raw().execute("PRAGMA foreign_keys = OFF", &[]) {
-                    tracing::debug!(
-                        error = %err,
-                        chunk_idx,
-                        "failed to disable FK enforcement on begin-concurrent writer"
-                    );
-                }
-                let result = persist_chunk_with_writer(
-                    &franken,
-                    base_idx,
-                    chunk,
-                    internal_chunk,
-                    max_retries,
-                );
-                let close_result = franken.close().with_context(|| {
-                    format!(
-                        "closing frankensqlite writer for begin-concurrent mode: {}",
-                        db_path.display()
-                    )
-                });
-                match result {
-                    Ok(outcomes) => {
-                        close_result?;
-                        if let Some(g) = shadow_guard {
-                            g.finish_ok();
-                        }
-                        Ok(outcomes)
-                    }
-                    Err(err) => {
-                        if let Err(close_err) = close_result {
-                            tracing::warn!(
-                                error = %close_err,
-                                db_path = %db_path.display(),
-                                "failed to close begin-concurrent writer cleanly after index error"
-                            );
-                        }
-                        if let Some(g) = shadow_guard {
-                            g.finish_err();
-                        }
-                        Err(err)
-                    }
-                }
-            })
-            .collect();
+        // w1b Task B4 (secondary contract #4): the rayon pool above only
+        // does CPU-side parsing (`internal_convs`). Every chunk's actual
+        // SQLite writes now funnel through one dedicated writer thread via
+        // `WriterHandle`, instead of each chunk opening its own
+        // `FrankenStorage::open_writer` connection in parallel -- that
+        // "one connection per rayon chunk" pattern was the only site in
+        // the codebase that structurally opened more than one live writer
+        // connection on the same path at once
+        // (`w1b-b4-write-topology-inventory.md` §③, M5). Chunks are still
+        // dispatched one at a time here (`.chunks()`, not `.par_chunks()`)
+        // because the writer thread would serialize them regardless; the
+        // parallelism that mattered (parsing/redaction) already happened
+        // above.
+        let writer_db_path = db_path.to_path_buf();
+        let writer_db_path_for_build = writer_db_path.clone();
+        let (writer_handle, writer_join) = crate::storage::api::WriterHandle::<FrankenStorage>::spawn(
+            writer_db_path,
+            crate::storage::api::Profile::Production,
+            move |conn| {
+                let storage = FrankenStorage::from_writer_handle_conn(conn, writer_db_path_for_build)
+                    .map_err(anyhow_error_into_storage_error)?;
+                apply_begin_concurrent_writer_tuning(&storage, defer_checkpoints);
+                Ok(storage)
+            },
+        )
+        .with_context(|| {
+            format!("spawning begin-concurrent writer handle for {}", db_path.display())
+        })?;
 
         let mut ordered = Vec::with_capacity(convs.len());
         let mut fallback_ranges = Vec::new();
-        for chunk in indexed_chunks {
-            match chunk? {
-                ChunkPersistResult::Completed(outcomes) => ordered.extend(outcomes),
-                ChunkPersistResult::RetryableFallback {
-                    completed,
-                    remaining_range,
-                    error,
-                } => {
+        for (chunk_idx, chunk) in convs.chunks(chunk_size).enumerate() {
+            let base_idx = chunk_idx * chunk_size;
+            let internal_chunk = internal_convs[base_idx..base_idx + chunk.len()].to_vec();
+            let chunk_owned = chunk.to_vec();
+            // Card 1 / Silo shadow observer — observes only, NO commit
+            // semantics change. When CASS_INDEXER_PARALLEL_WAL=shadow is
+            // set, this records per-chunk wall-clock so future sessions
+            // can compare what a parallel-WAL coordinator would have
+            // decided. Explicit `off` mode returns None; default shadow
+            // mode records a tiny bounded evidence manifest.
+            let shadow_guard =
+                crate::indexer::parallel_wal_shadow::start_chunk(chunk_idx, base_idx, chunk.len());
+            // w1b Task B2b (R0-B3): CASS #169 FK-disable removed -- see the
+            // longer rationale on `with_ephemeral_writer`'s equivalent site.
+            let result = writer_handle
+                .submit(move |franken: &FrankenStorage| {
+                    persist_chunk_with_writer(franken, base_idx, &chunk_owned, &internal_chunk, max_retries)
+                        .map_err(anyhow_error_into_storage_error)
+                })
+                .map_err(|e| anyhow!("{e}"));
+            match result {
+                Ok(ChunkPersistResult::Completed(outcomes)) => {
+                    if let Some(g) = shadow_guard {
+                        g.finish_ok();
+                    }
+                    ordered.extend(outcomes);
+                }
+                Ok(ChunkPersistResult::RetryableFallback { completed, remaining_range, error }) => {
+                    if let Some(g) = shadow_guard {
+                        g.finish_err();
+                    }
                     tracing::warn!(
                         error = %error,
                         completed = completed.len(),
@@ -26324,20 +26446,34 @@ pub mod persist {
                     ordered.extend(completed);
                     fallback_ranges.push(remaining_range);
                 }
+                Err(err) => {
+                    if let Some(g) = shadow_guard {
+                        g.finish_err();
+                    }
+                    drop(writer_handle);
+                    let _ = writer_join.join();
+                    return Err(err);
+                }
             }
         }
 
         for remaining_range in fallback_ranges {
             let fallback_outcomes = persist_chunk_serial_fallback(
-                db_path,
+                &writer_handle,
                 remaining_range.start,
                 &convs[remaining_range.clone()],
                 &internal_convs[remaining_range.clone()],
                 max_retries,
-                defer_checkpoints,
             )?;
             ordered.extend(fallback_outcomes);
         }
+
+        // Release the writer thread's connection before any post-processing
+        // below might want a fresh connection of its own -- keeps the
+        // "at most 1 live writer on this path" invariant tight to this
+        // function's own write phase, not artificially extended past it.
+        drop(writer_handle);
+        writer_join.join().map_err(|_| anyhow!("begin-concurrent writer thread panicked"))?;
         ordered.sort_by_key(|(idx, _)| *idx);
         if let Some(data_dir) = raw_mirror_data_dir {
             for (idx, outcome) in &ordered {
@@ -27122,10 +27258,9 @@ pub mod persist {
             assert!(!is_retryable_franken_error(&not_retryable));
         }
 
-        /// Helper: create a frankensqlite-native database with schema applied.
+        /// Helper: create a legacy embedded engine-native database with schema applied.
         fn create_franken_db(path: &std::path::Path) -> FrankenStorage {
-            let fs = FrankenStorage::open(path).expect("open frankensqlite db");
-            fs.run_migrations().expect("run migrations");
+            let fs = FrankenStorage::open(path).expect("open the legacy embedded engine db");
             fs
         }
 
@@ -27396,7 +27531,7 @@ pub mod persist {
             let db_path = dir.path().join("test.db");
             let index_path = dir.path().join("tantivy");
 
-            // Create frankensqlite-native database (BEGIN CONCURRENT requires it)
+            // Create the legacy embedded engine-native database (BEGIN CONCURRENT requires it)
             let frank = create_franken_db(&db_path);
             drop(frank); // close so writers can open independently
             let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
@@ -27499,6 +27634,106 @@ pub mod persist {
             assert_eq!(agent_count, 3, "3 distinct agent slugs should exist");
 
             // Commit tantivy to finalize
+            t_index.commit().unwrap();
+        }
+
+        /// B4 Step 2 assertion ②: the rayon-parallel-chunk direct-write path
+        /// must land the same artifact as `begin_concurrent_persist_writes_all_conversations`
+        /// above (conversation/message/agent counts all match) while never
+        /// holding more than 1 live writer connection on the db path at
+        /// once. Pre-B4 this is red -- `persist_conversations_batched_begin_concurrent`
+        /// opens one `FrankenStorage::open_writer` per rayon chunk inside
+        /// `par_chunks().map()`, so a chunk size smaller than the corpus
+        /// drives the peak above 1.
+        #[test]
+        fn begin_concurrent_persist_never_exceeds_one_live_writer_connection() {
+            use crate::connectors::NormalizedConversation;
+            use crate::search::tantivy::TantivyIndex;
+            use crate::storage::api::{reset_writer_connection_peak, writer_connection_peak};
+
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("mini-corpus.db");
+            let index_path = dir.path().join("tantivy");
+
+            let frank = create_franken_db(&db_path);
+            drop(frank);
+            let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
+
+            // 6 conversations, chunk size 2 -> 3 parallel chunks pre-B4.
+            let convs: Vec<NormalizedConversation> = (0..6)
+                .map(|i| {
+                    let slug = format!("agent-{}", i % 2);
+                    NormalizedConversation {
+                        agent_slug: slug,
+                        external_id: Some(format!("mini-conv-{i}")),
+                        title: Some(format!("Mini conversation {i}")),
+                        workspace: Some(std::path::PathBuf::from(format!("/ws/mini-{i}"))),
+                        source_path: std::path::PathBuf::from(format!("/log/mini-{i}.jsonl")),
+                        started_at: Some(2000 + i * 100),
+                        ended_at: Some(2000 + i * 100 + 50),
+                        metadata: serde_json::json!({}),
+                        messages: (0..2)
+                            .map(|j| NormalizedMessage {
+                                idx: j,
+                                role: if j % 2 == 0 { "user" } else { "assistant" }.to_string(),
+                                author: Some("tester".into()),
+                                created_at: Some(2000 + i * 100 + j * 10),
+                                content: format!("mini-corpus conv={i} msg={j}"),
+                                extra: serde_json::json!({}),
+                                snippets: vec![],
+                                invocations: Vec::new(),
+                            })
+                            .collect(),
+                    }
+                })
+                .collect();
+
+            let _chunk_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE", "2");
+            // The caller-supplied `storage` handle below is a pre-existing,
+            // general-purpose connection opened before this call for
+            // reasons outside B4's scope (`Storage::open` read-only-ization
+            // is explicitly deferred to B7 -- see the write-topology
+            // inventory M2/M3). Reset *after* opening it so the assertion
+            // below isolates exactly what this call's own writer-thread
+            // spawn is responsible for, not the caller's pre-existing
+            // connection.
+            let caller_storage = FrankenStorage::open(&db_path).unwrap();
+            let baseline_writer_connections = crate::storage::api::writer_connection_count(&db_path);
+            reset_writer_connection_peak(&db_path);
+
+            persist_conversations_batched_begin_concurrent(
+                &caller_storage,
+                &db_path,
+                Some(&mut t_index),
+                &convs,
+                LexicalPopulationStrategy::InlineRebuildFromScan,
+                false,
+                false,
+                None,
+            )
+            .expect("begin-concurrent persist should succeed");
+
+            let reader = FrankenStorage::open(&db_path).unwrap();
+            let conv_count: i64 = reader
+                .raw()
+                .query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| row.get_typed(0))
+                .unwrap();
+            let msg_count: i64 = reader
+                .raw()
+                .query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0))
+                .unwrap();
+            assert_eq!(conv_count, 6, "artifact equivalence: all 6 mini-corpus conversations must land");
+            assert_eq!(msg_count, 12, "artifact equivalence: all 12 mini-corpus messages must land");
+
+            assert_eq!(
+                writer_connection_peak(&db_path) - baseline_writer_connections,
+                1,
+                "B4 invariant: this call must open exactly 1 NEW live writer connection \
+                 (its own WriterHandle thread) beyond whatever the caller already had open, \
+                 even across parallel rayon chunks -- workers must hand parsed batches to a \
+                 single writer thread instead of each opening their own connection"
+            );
+
             t_index.commit().unwrap();
         }
 
@@ -29700,6 +29935,51 @@ mod tests {
         }
     }
 
+    /// Control-plane ruling 2026-08-27 (w1b Task B9 salvage, exec13): a
+    /// database predating `conversation_tail_state` used to surface a raw
+    /// `no such table` SQL error out of the search-triggered lexical repair
+    /// path instead of a clear, actionable diagnosis. Simulate that
+    /// pre-generation shape by dropping the marker table from an otherwise
+    /// normal current-schema database, then assert the repair path fails
+    /// closed with the schema::ensure-style message instead of leaking the
+    /// raw SQL error text.
+    #[test]
+    fn repair_lexical_index_from_canonical_db_rejects_pre_tail_state_generation() {
+        let dir = TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("agent_search.db");
+        {
+            let storage = FrankenStorage::open(&db_path).expect("open current-generation db");
+            storage
+                .raw()
+                .execute_batch("DROP TABLE conversation_tail_state;")
+                .expect("simulate a pre-generation database by dropping the marker table");
+            storage
+                .close_without_checkpoint()
+                .expect("close the simulated legacy database");
+        }
+
+        let err =
+            repair_lexical_index_from_canonical_db_for_search(&db_path, dir.path(), None)
+                .expect_err(
+                    "a database missing conversation_tail_state must be rejected, not crash on a raw SQL error",
+                );
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains(
+                "predates the `conversation_tail_state` schema generation"
+            ),
+            "expected the fail-closed generation-mismatch message, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("cass index --full"),
+            "expected actionable rebuild guidance, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("no such table"),
+            "raw SQL error text must not leak past the fail-closed guard, got: {rendered}"
+        );
+    }
+
     #[test]
     fn scan_path_exclusions_value_active_handles_commas_and_newlines() {
         assert!(!scan_path_exclusions_value_active(None));
@@ -31209,7 +31489,7 @@ mod tests {
     /// `phase=watch_startup` block ran with no progress bump and no
     /// sub-phase breadcrumb. If any one of them wedged (e.g. a multi-
     /// second-to-multi-hour COUNT scan against `messages` triggering a
-    /// fsqlite B-tree descent bug), operators saw only the opaque
+    /// the legacy engine crate B-tree descent bug), operators saw only the opaque
     /// `phase=watch_startup` for hours, with no way to tell whether
     /// the wedge was in `cleanup_orphan_fk_rows`, the lexical-
     /// checkpoint probe, the tantivy reader preflight, or somewhere
@@ -39271,7 +39551,7 @@ mod tests {
 
     /// #298 gate (non-watch): a small conversation that hits a typed NoMem
     /// with no real host memory pressure is deferred to the next index run —
-    /// never quarantined — because frankensqlite's bounded allocation guards
+    /// never quarantined — because the legacy embedded engine's bounded allocation guards
     /// raise the same typed error without the host being out of memory.
     #[test]
     #[serial]
@@ -39336,7 +39616,6 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("db.sqlite");
         let storage = FrankenStorage::open(&db_path).unwrap();
-        storage.run_migrations().unwrap();
 
         storage.set_last_scan_ts(1_000).unwrap();
         storage.set_connector_last_scan_ts("codex", 1_100).unwrap();
@@ -39760,7 +40039,6 @@ mod tests {
         // Create a canonical DB with some content and an active WAL.
         let db_path = data_dir.join("agent_search.db");
         let storage = FrankenStorage::open(&db_path)?;
-        storage.run_migrations()?;
         drop(storage);
 
         // Checkpoint should succeed and leave a readable DB.
@@ -41626,6 +41904,15 @@ mod tests {
 
     #[test]
     fn open_storage_for_index_refuses_newer_schema_without_replacing_db() {
+        // R1-B3 (w1b Task B9 follow-up, same reason as
+        // `current_schema_fast_probe_rejects_future_schema_marker`'s own
+        // earlier rewrite): the legacy `meta.schema_version` marker this
+        // test used to poke is never written by `schema::ensure` and, after
+        // R1-B3's generation-aware fix, no longer means "future schema" to
+        // `open_storage_for_index` at all -- a *real* rusqlite-generation
+        // "newer than supported" archive is one with `PRAGMA user_version`
+        // itself set past `CURRENT_SCHEMA_VERSION`, so that's what this
+        // fixture simulates now.
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("future-schema.db");
 
@@ -41633,13 +41920,10 @@ mod tests {
             let storage = FrankenStorage::open(&db_path).unwrap();
             storage
                 .raw()
-                .execute(
-                    "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?1)",
-                    &[ParamValue::from(format!(
-                        "{}",
-                        crate::storage::sqlite::CURRENT_SCHEMA_VERSION + 1
-                    ))],
-                )
+                .execute_batch(&format!(
+                    "PRAGMA user_version = {};",
+                    crate::storage::sqlite::CURRENT_SCHEMA_VERSION + 1
+                ))
                 .unwrap();
         }
 
@@ -41670,6 +41954,112 @@ mod tests {
             backup_count == 0,
             "index open must not backup-and-replace a future-schema archive"
         );
+    }
+
+    #[test]
+    fn open_storage_for_index_refuses_legacy_franken_generation_with_rebuild_not_convert_guidance() {
+        // R1-B3: a real pre-w1b-B8 (franken-generation) archive has
+        // `PRAGMA user_version == 0` and a legacy `meta.schema_version` row
+        // (frozen forever, per `sqlite.rs`'s
+        // `LEGACY_FRANKEN_SCHEMA_VERSION_CEILING` doc comment, at 21 under
+        // the old franken numbering -- unrelated to the new rusqlite
+        // generation's own 1-based `CURRENT_SCHEMA_VERSION`). Comparing
+        // that legacy value against `CURRENT_SCHEMA_VERSION` with a bare
+        // `>` (`21 > 1`) used to misreport every such archive as "newer
+        // than supported version 1" -- self-locking it out of ever being
+        // indexed again instead of directing the operator to rebuild it.
+        // Fixture built the same way `sqlite.rs`'s own
+        // `historical_bundle_schema_is_current` coverage simulates a
+        // franken-generation bundle: build a real current-schema db, then
+        // roll `user_version` back to 0 and plant the legacy marker
+        // (`schema::ensure`'s fresh-build DDL leaves `meta` present but
+        // empty, so `INSERT OR REPLACE` is required -- a plain `UPDATE`
+        // against a never-inserted row would be a silent no-op).
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("legacy-generation.db");
+
+        {
+            let storage = FrankenStorage::open(&db_path).unwrap();
+            storage
+                .raw()
+                .execute_batch(
+                    "PRAGMA user_version = 0;
+                     INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', '21');",
+                )
+                .unwrap();
+        }
+
+        let err = match open_storage_for_index(&db_path, false) {
+            Ok(_) => panic!("legacy-generation archive must fail closed before indexing"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            !err.contains("newer than supported"),
+            "legacy-generation archive must not be misdiagnosed as a future schema: {err}"
+        );
+        assert!(
+            err.contains("rebuild-not-convert") && err.contains("cass index --full"),
+            "diagnostic should point at rebuilding, not converting, the legacy archive: {err}"
+        );
+        assert!(db_path.exists(), "canonical DB must remain in place");
+    }
+
+    #[test]
+    fn open_storage_for_index_does_not_misclassify_an_out_of_range_meta_schema_version_as_legacy() {
+        // R2-F4: `classify_index_open_generation` used to treat *any*
+        // `user_version == 0` db with `legacy_meta_schema_version.is_some()`
+        // as `LegacyFrankenGeneration`, regardless of the value -- but the
+        // legacy franken generation's `meta.schema_version` is frozen
+        // forever at `LEGACY_FRANKEN_SCHEMA_VERSION_CEILING` (21); a value
+        // above that ceiling isn't a franken-generation archive at all, just
+        // some other `user_version == 0` non-empty db that happens to carry
+        // an unrelated row under that key. Misclassifying it hands back the
+        // legacy-specific "pre-rusqlite (legacy franken-generation) archive"
+        // guidance for a db that was never that generation.
+        //
+        // Fixture: same shape as the sibling legacy test above, but with
+        // `meta.schema_version = 999` (comfortably past the ceiling). This
+        // must fall through to `CurrentOrEmpty` and let `schema::ensure`'s
+        // own generic "user_version=0 but not empty" rejection fire instead
+        // -- the same reason `schema::ensure` already gives non-legacy,
+        // non-empty `user_version == 0` databases; the diagnostic text is
+        // generic-and-accurate rather than legacy-specific-and-wrong.
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("out-of-range-meta.db");
+
+        {
+            let storage = FrankenStorage::open(&db_path).unwrap();
+            storage
+                .raw()
+                .execute_batch(
+                    "PRAGMA user_version = 0;
+                     INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', '999');",
+                )
+                .unwrap();
+        }
+
+        let err = match open_storage_for_index(&db_path, false) {
+            Ok(_) => panic!("non-empty user_version=0 archive must fail closed before indexing"),
+            Err(err) => err.to_string(),
+        };
+        // "cass index --full" is NOT a usable discriminator here: it also
+        // appears in `canonical_archive_unhealthy_for_index_error`'s shared
+        // generic remediation boilerplate (the "re-ingest with `cass index
+        // --full`" step), which every archive-unhealthy error carries
+        // regardless of classification. "retired franken numbering" and
+        // "legacy franken-generation" only ever appear in
+        // `legacy_franken_generation_rebuild_not_convert_reason`'s text.
+        assert!(
+            !err.contains("legacy franken-generation") && !err.contains("retired franken numbering"),
+            "a meta.schema_version above the legacy ceiling must not get the \
+             legacy-specific rebuild guidance: {err}"
+        );
+        assert!(
+            err.contains("schema::ensure") && err.contains("can open in place"),
+            "diagnostic should be schema::ensure's own generic user_version=0-but-not-empty \
+             rejection, not a legacy-specific one: {err}"
+        );
+        assert!(db_path.exists(), "canonical DB must remain in place");
     }
 
     #[test]
@@ -41864,19 +42254,21 @@ mod tests {
 
     #[test]
     fn current_schema_fast_probe_rejects_future_schema_marker() {
+        // w1b Task B9 (2026-08-27): rewritten for the PRAGMA user_version
+        // authority current_schema_fast_probe now reads (see the function's
+        // own doc comment) -- the old `meta.schema_version` marker this test
+        // used to poke is never written by storage::schema::ensure, so
+        // setting it no longer means anything to the probe.
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("future-marker.db");
 
         let storage = FrankenStorage::open(&db_path).unwrap();
         storage
             .raw()
-            .execute(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?1)",
-                &[ParamValue::from(format!(
-                    "{}",
-                    crate::storage::sqlite::CURRENT_SCHEMA_VERSION + 1
-                ))],
-            )
+            .execute_batch(&format!(
+                "PRAGMA user_version = {};",
+                crate::storage::sqlite::CURRENT_SCHEMA_VERSION + 1
+            ))
             .unwrap();
         drop(storage);
 
@@ -41906,13 +42298,13 @@ mod tests {
             storage.schema_version().unwrap(),
             crate::storage::sqlite::CURRENT_SCHEMA_VERSION
         );
-        assert!(
-            storage
-                .raw()
-                .query_all_map("SELECT version FROM _schema_migrations LIMIT 1;", &[], |row| row
-                    .get_value(0))
-                .is_ok()
-        );
+        // w1b Task B9 (2026-08-27, control-plane ruling): the trailing
+        // assertion that used to read a backfilled row out of
+        // _schema_migrations here is gone -- ensure no longer populates that
+        // table with invented history for a fast-path-current db (that would
+        // forge provenance for a migration that never ran). This test's
+        // remaining assertions still cover its real subject: the fast path
+        // reopens without rebuilding or falling back to a fresh full index.
     }
 
     #[test]
@@ -42050,7 +42442,6 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("db.sqlite");
         let storage = FrankenStorage::open(&db_path).unwrap();
-        storage.run_migrations().unwrap();
 
         let agent = crate::model::types::Agent {
             id: None,
@@ -42120,7 +42511,6 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("db.sqlite");
         let storage = FrankenStorage::open(&db_path).unwrap();
-        storage.run_migrations().unwrap();
 
         let agent = crate::model::types::Agent {
             id: None,
@@ -42208,7 +42598,6 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("db.sqlite");
         let storage = FrankenStorage::open(&db_path).unwrap();
-        storage.run_migrations().unwrap();
 
         let tester = crate::model::types::Agent {
             id: None,
@@ -42347,7 +42736,6 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("db.sqlite");
         let storage = FrankenStorage::open(&db_path).unwrap();
-        storage.run_migrations().unwrap();
 
         let agent = crate::model::types::Agent {
             id: None,
@@ -42728,6 +43116,30 @@ mod tests {
         let storage = FrankenStorage::open(&db_path).unwrap();
         seed_lexical_rebuild_fixture(&storage);
 
+        // w1b Task B9 (2026-08-27, control-plane approved, same
+        // B7-schema-authority-migration family as commit d38be112's
+        // current_schema_fast_probe fix): this fixture used to reach a
+        // genuinely fts_messages-less database just by skipping
+        // `ensure_fts_schema` -- under the legacy engine, `fts_messages`
+        // was only ever created by that explicit call. Task B7's
+        // `storage::schema::ensure` (src/storage/schema.rs) now creates
+        // `fts_messages` unconditionally as part of the base schema, and
+        // `insert_conversation_tree` keeps it populated in step with
+        // `messages` -- so by the time `seed_lexical_rebuild_fixture`
+        // returns, the table already exists with all 4 rows indexed,
+        // making the "missing schema" scenario this test is named for
+        // impossible to reach through fixture setup alone (confirmed: the
+        // gate-caught failure here was `Repaired(AlreadyHealthy{rows:4})`,
+        // not the expected `Rebuilt` -- fts_messages was never missing,
+        // just never dropped). Drop it explicitly to recreate the
+        // scenario the test actually exercises: repair discovering an
+        // absent fts_messages and rebuilding it from the canonical
+        // `messages` table.
+        storage
+            .raw()
+            .execute("DROP TABLE IF EXISTS fts_messages", &[])
+            .unwrap();
+
         let repair =
             repair_fallback_fts_after_full_index_run(&storage, &db_path, true, false, None)
                 .unwrap();
@@ -42834,7 +43246,7 @@ mod tests {
 
         // Migrated from rusqlite per AGENTS.md Rule 2 + bead uiojh: the
         // meta row seed is a plain INSERT into a user table (not a
-        // writable_schema path), so fsqlite handles it with no upstream
+        // writable_schema path), so the legacy engine crate handles it with no upstream
         // feature dependency. Opens a FrankenConnection directly against
         // the file written by SqliteStorage above.
         let canonical_db_path = canonical_db.to_string_lossy().to_string();
@@ -47414,7 +47826,6 @@ mod tests {
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
-        storage.run_migrations().unwrap();
         let index_path = index_dir(&opts.data_dir).unwrap();
         let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
         let state = std::sync::Mutex::new(std::collections::HashMap::new());
@@ -47495,7 +47906,6 @@ mod tests {
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
-        storage.run_migrations().unwrap();
         let index_path = index_dir(&opts.data_dir).unwrap();
         let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
         let state = std::sync::Mutex::new(std::collections::HashMap::new());
@@ -47589,7 +47999,6 @@ mod tests {
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
-        storage.run_migrations().unwrap();
         let index_path = index_dir(&opts.data_dir).unwrap();
         let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
         let state = std::sync::Mutex::new(std::collections::HashMap::new());
@@ -47682,7 +48091,6 @@ mod tests {
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
-        storage.run_migrations().unwrap();
         let index_path = index_dir(&opts.data_dir).unwrap();
         let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
         let state = std::sync::Mutex::new(std::collections::HashMap::new());
@@ -47777,7 +48185,6 @@ mod tests {
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
-        storage.run_migrations().unwrap();
         let index_path = index_dir(&opts.data_dir).unwrap();
         let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
         let state = std::sync::Mutex::new(std::collections::HashMap::new());
@@ -48108,7 +48515,6 @@ mod tests {
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
-        storage.run_migrations().unwrap();
         let index_path = index_dir(&opts.data_dir).unwrap();
         let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
         let state = std::sync::Mutex::new(std::collections::HashMap::new());
@@ -48197,7 +48603,6 @@ mod tests {
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
-        storage.run_migrations().unwrap();
         let index_path = index_dir(&opts.data_dir).unwrap();
         let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
         let state = std::sync::Mutex::new(std::collections::HashMap::new());

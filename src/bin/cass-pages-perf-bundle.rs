@@ -194,7 +194,8 @@ fn generate_db(
     remainder: usize,
     message_len: usize,
 ) -> Result<()> {
-    let storage = FrankenStorage::open(db_path).context("open frankensqlite storage")?;
+    // w1b Task B8 (d16, open-consumer audit): write path (bundle generator).
+    let storage = FrankenStorage::open_writer(db_path).context("open sqlite storage")?;
 
     let agent = Agent {
         id: None,

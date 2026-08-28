@@ -69,7 +69,7 @@
 //! ([`spawn_with_timeout_or_diag`]), which keeps stdout/stderr separate and
 //! turns a hang into a loud `TIMEOUT DIAGNOSTIC` + panic — categorically
 //! distinct from this gate's `Err` (assertion fail) and `Ok` (pass). A failed
-//! probe is attributed to one of the four bead categories — CASS, frankensqlite
+//! probe is attributed to one of the four bead categories — CASS, the legacy embedded engine
 //! storage, host-pressure, or fixture-setup — by [`attribute_failure`], proven
 //! by [`failure_attribution_separates_the_four_categories`].
 //!
@@ -165,12 +165,6 @@ enum Corruption {
     /// Zero `len` bytes at `offset` (e.g. blank the page-1 b-tree header so an
     /// OpenRead cursor cannot decode the root page).
     ZeroRange { offset: usize, len: usize },
-    /// Leave the DB valid but drop orphaned, stale `-wal` + `-shm` sidecars
-    /// beside it (no live writer).
-    OrphanWalShm,
-    /// Leave the DB valid but drop a populated `-wal` only (a writer that left
-    /// an uncommitted WAL — the busy/locked on-disk signal).
-    ActiveWal,
     /// Leave the DB valid but overwrite every file under `index/` with garbage
     /// (a derived lexical asset that is structurally broken).
     OverwriteLexicalIndex { content: &'static [u8] },
@@ -225,9 +219,11 @@ struct StorageFixture {
     proof_log_expectation: &'static str,
 }
 
-/// The eight required storage-failure fixtures — one per class the bead's
-/// acceptance enumerates. Every corruption recipe is empirically verified to
-/// drive the real binary into its `expected` observable.
+/// The storage-failure fixtures — one per class the bead's acceptance
+/// enumerates, minus the two retired at w1b Task B9 (see
+/// `acceptable_doctor_storage_states`'s doc comment for why). Every
+/// corruption recipe is empirically verified to drive the real binary into
+/// its `expected` observable.
 fn fixtures() -> Vec<StorageFixture> {
     vec![
         StorageFixture {
@@ -291,60 +287,6 @@ fn fixtures() -> Vec<StorageFixture> {
             proof_log_expectation: "one pass record (status=pass); never timeout or generated-only",
         },
         StorageFixture {
-            id: "fm-storage-legacy-interop-fail",
-            class: "legacy database readability / migration-plan",
-            provenance: "valid baseline DB with the schema-format number (bytes 44..48) set to \
-                         the legacy value 1 so the current engine cannot interop",
-            expected_storage_state: "legacy_interop_failed",
-            expected_source_of_truth_risk: "medium",
-            corruption: Corruption::SetHeaderBytes {
-                offset: 44,
-                bytes: &[0x00, 0x00, 0x00, 0x01],
-            },
-            expected: Expected::FailClosed {
-                error_kinds: STORAGE_ERROR_KINDS,
-            },
-            safe_command: "cass doctor --check --json",
-            unsafe_command: "cass doctor --repair --yes --plan-fingerprint <fp>",
-            human_summary: "storage legacy_interop_failed (source-of-truth risk medium) — \
-                            a legacy database could not be read by the current engine",
-            proof_log_expectation: "one pass record (status=pass); never timeout or generated-only",
-        },
-        StorageFixture {
-            id: "fm-storage-stale-wal-shm",
-            class: "stale or orphaned WAL/SHM sidecar",
-            provenance: "valid baseline DB plus orphaned, stale agent_search.db-wal and \
-                         agent_search.db-shm sidecars (no live writer)",
-            expected_storage_state: "wal_sidecar_suspect",
-            expected_source_of_truth_risk: "medium",
-            corruption: Corruption::OrphanWalShm,
-            expected: Expected::FailClosed {
-                error_kinds: STORAGE_ERROR_KINDS,
-            },
-            safe_command: "cass status --json",
-            unsafe_command: "cass doctor --repair --yes --plan-fingerprint <fp>",
-            human_summary: "storage wal_sidecar_suspect (source-of-truth risk medium) — \
-                            a WAL/SHM sidecar is stale or orphaned; do not delete it blindly",
-            proof_log_expectation: "one pass record (status=pass); never timeout or generated-only",
-        },
-        StorageFixture {
-            id: "fm-storage-busy-lock-active-writer",
-            class: "busy-lock / concurrent writer",
-            provenance: "valid baseline DB plus a populated agent_search.db-wal (a writer that \
-                         left an uncommitted WAL — the busy/locked on-disk signal)",
-            expected_storage_state: "busy_or_locked",
-            expected_source_of_truth_risk: "low",
-            corruption: Corruption::ActiveWal,
-            expected: Expected::FailClosed {
-                error_kinds: STORAGE_ERROR_KINDS,
-            },
-            safe_command: "cass status --json",
-            unsafe_command: "cass doctor --repair --yes --plan-fingerprint <fp>",
-            human_summary: "storage busy_or_locked (source-of-truth risk low) — \
-                            another writer holds the DB; retry after bounded backoff",
-            proof_log_expectation: "one pass record (status=pass); never timeout or generated-only",
-        },
-        StorageFixture {
             id: "fm-storage-fts-metadata-mismatch",
             class: "FTS metadata mismatch or fts_messages readability",
             provenance: "valid baseline DB with every file under index/ overwritten by garbage \
@@ -401,14 +343,14 @@ const STORAGE_ERROR_KINDS: &[&str] = &[
 // =============================================================================
 
 /// Which layer a failed probe is attributed to. The bead requires every E2E
-/// failure to say whether it is a CASS bug, a frankensqlite-storage problem,
+/// failure to say whether it is a CASS bug, a legacy embedded engine storage problem,
 /// host pressure, or a fixture-setup error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Attribution {
     /// A cass-level defect: wrong dispatch, malformed envelope, stdout leakage,
     /// or a contract the gate expected but did not see.
     Cass,
-    /// A frankensqlite-storage error surfaced honestly (e.g. a storage/corrupt
+    /// A legacy embedded engine storage error surfaced honestly (e.g. a storage/corrupt
     /// envelope) — the storage engine behaving as the fixture intends.
     Frankensqlite,
     /// A bounded-runner timeout: a hang or host-pressure stall.
@@ -431,7 +373,7 @@ impl Attribution {
 
 /// Pure attribution: fixture-setup outranks everything (no cass behavior was
 /// observed), then a timeout (host pressure / hang), then a storage-engine
-/// error (frankensqlite behaving as intended), else a cass-level defect.
+/// error (the legacy embedded engine behaving as intended), else a cass-level defect.
 fn attribute_failure(
     fixture_setup_failed: bool,
     timed_out: bool,
@@ -637,16 +579,6 @@ fn apply_corruption(data_dir: &Path, corruption: &Corruption) -> Result<(), Stri
             }
             std::fs::write(&db, &buf).map_err(|e| format!("write DB for ZeroRange: {e}"))
         }
-        Corruption::OrphanWalShm => {
-            std::fs::write(data_dir.join("agent_search.db-wal"), vec![0xAB_u8; 40_000])
-                .map_err(|e| format!("write orphan -wal: {e}"))?;
-            std::fs::write(data_dir.join("agent_search.db-shm"), vec![0xCD_u8; 32_768])
-                .map_err(|e| format!("write orphan -shm: {e}"))
-        }
-        Corruption::ActiveWal => {
-            std::fs::write(data_dir.join("agent_search.db-wal"), vec![0xEF_u8; 50_000])
-                .map_err(|e| format!("write active -wal: {e}"))
-        }
         Corruption::OverwriteLexicalIndex { content } => {
             rewrite_files_under(&data_dir.join("index"), &|_| content.to_vec())
                 .map_err(|e| format!("overwrite lexical index: {e}"))
@@ -732,7 +664,7 @@ fn check_fail_closed_search(out: &Output, error_kinds: &[&str]) -> Result<bool, 
             "process exit code {code} does not mirror error.code {ecode} (exit-code contract)"
         ));
     }
-    // A storage envelope (kind in the storage set, retryable) is a frankensqlite
+    // A storage envelope (kind in the storage set, retryable) is a legacy embedded engine
     // signal, not a cass-dispatch bug — record that for attribution.
     Ok(true)
 }
@@ -1370,15 +1302,25 @@ fn storage_fixture_suite_is_wellformed_against_the_taxonomy() -> Result<(), Stri
     let suite = fixtures();
     let mut problems: Vec<String> = Vec::new();
 
-    // Every required class (by storage_state) must be represented.
+    // Every required class (by storage_state) must be represented -- except
+    // the three retired at w1b Task B9 (2026-08-27, control-plane ruling):
+    // `wal_sidecar_suspect` / `busy_or_locked` have no vanilla-SQLite static
+    // on-disk equivalent at all (a genuinely stale-but-valid WAL and a live
+    // busy-lock are runtime conditions a byte-level fixture cannot fabricate
+    // without inventing a scenario that cannot occur for real), and
+    // `legacy_interop_failed`'s dedicated write-path e2e coverage now lives
+    // in tests/upgrade/compatibility.rs::test_open_rejects_pre_rusqlite_archive_instead_of_converting_it
+    // instead (this file's fixtures are all driven through read-only
+    // `safe_command`s that structurally never reach the write-path-only
+    // rejection that class actually needs). `StorageState` itself (`src/
+    // search/storage_integrity.rs`) is untouched -- these remain real,
+    // reachable-in-production wire values; only this file's fixture roster
+    // no longer claims to synthesize them. See w1b-b4-deleted-tests.md.
     let required_states = [
         "openread_failed",
         "integrity_failed",
         "schema_drift",
-        "wal_sidecar_suspect",
-        "busy_or_locked",
         "fts_metadata_failed",
-        "legacy_interop_failed",
         "derived_only_drift",
     ];
     let uncovered: Vec<&str> = required_states
@@ -1551,7 +1493,7 @@ fn proof_artifact_distinguishes_pass_from_timeout() -> Result<(), String> {
 }
 
 /// Attribution separates the four bead categories — fixture-setup, host
-/// pressure (timeout), frankensqlite storage, and cass — with the documented
+/// pressure (timeout), the legacy embedded engine storage, and cass — with the documented
 /// precedence (setup outranks timeout outranks storage-error outranks cass).
 #[test]
 fn failure_attribution_separates_the_four_categories() -> Result<(), String> {
@@ -1660,22 +1602,52 @@ fn acceptable_doctor_storage_states(fixture_id: &str) -> &'static [&'static str]
         "fm-storage-stale-searcher-cache" | "fm-storage-fts-metadata-mismatch" => {
             &["derived_only_drift"]
         }
-        // Every canonical-broken fixture — header corruption (integrity / openread
-        // / schema-drift / legacy-interop) AND the WAL/SHM sidecar fixtures
-        // (stale-wal-shm / busy-lock) — defeats doctor's read-only opener, so all
-        // six observe a coarse high-risk read-failure (`openread_failed` today;
-        // `integrity_failed` is the documented neighbour if the opener succeeds but
-        // a later integrity probe fails; `unknown_deferred` covers a bounded-probe
-        // timeout under host pressure). The PRECISE cause — `schema_drift` /
-        // `legacy_interop_failed` / `wal_sidecar_suspect` / `busy_or_locked` —
-        // needs the unstarted `.14.2`/`.14.3` schema-version / WAL / busy probes,
-        // so it stays forward metadata until those land.
+        // Every canonical-broken header-corruption fixture (integrity / openread /
+        // schema-drift) defeats doctor's read-only opener, so all three observe a
+        // coarse high-risk read-failure (`openread_failed` today; `integrity_failed`
+        // is the documented neighbour if the opener succeeds but a later integrity
+        // probe fails; `unknown_deferred` covers a bounded-probe timeout under host
+        // pressure). The PRECISE cause — `schema_drift` — needs the unstarted
+        // `.14.2` schema-version probe, so it stays forward metadata until that
+        // lands.
+        //
+        // w1b Task B9 (2026-08-27, control-plane ruling): three fixtures this
+        // comment used to also cover were retired outright, not ported --
+        // `fm-storage-stale-wal-shm` / `fm-storage-busy-lock-active-writer` (their
+        // corruption recipes wrote raw garbage bytes -- `0xAB`/`0xCD`/`0xEF` fill,
+        // not a real WAL frame -- into `-wal`/`-shm` sidecar files; real SQLite
+        // validates a WAL's header before trusting it and simply discards an
+        // invalid one on open, documented safe behavior empirically reproduced:
+        // `sqlite3` read the DB clean and the garbage `-wal` file was gone
+        // afterward -- vanilla SQLite has no static-disk-byte equivalent for either
+        // risk state at all, since a genuinely stale-but-valid WAL and a live
+        // busy-lock are runtime conditions, not fixable byte patterns) and
+        // `fm-storage-legacy-interop-fail` (its schema-format-byte corruption is
+        // similarly franken-specific and meaningless to vanilla SQLite -- reproduced
+        // by hand: a copy of a healthy DB with the same byte flip opens and queries
+        // fine under stock `sqlite3`. Its underlying contract -- "rebuild, don't
+        // silently convert, a pre-rusqlite archive" -- is real and load-bearing
+        // (`storage::schema::ensure`'s own rejection), but it is a WRITE-path-only
+        // guarantee: `schema::ensure`'s reject-on-open only runs on a writable open.
+        // `search`/`doctor --check`/`status` all read through `open_read`, which
+        // never consults `user_version` at all -- confirmed by constructing a
+        // structurally-intact `user_version=0` database and observing `cass search`
+        // return real hits with exit 0, no fail-closed behavior whatsoever. A
+        // vanilla-readable structurally-intact old database is not a bug: franken's
+        // old engine silently migrating such a database on ANY open, including
+        // read-only ones, is exactly the anti-pattern Task B8(a) retired.
+        // `safe_command`-only fixtures (this file's whole design, restricted to
+        // read-only probes) are structurally unable to exercise a write-path-only
+        // contract, so this fixture doesn't belong in this file at all -- the
+        // rebuild-not-convert contract now has its own dedicated write-path e2e
+        // coverage instead (see
+        // tests/upgrade/compatibility.rs::test_open_rejects_pre_rusqlite_archive_instead_of_converting_it,
+        // which drives `SqliteStorage::open()` directly -- the actual entry point
+        // every write-triggering command goes through). See
+        // w1b-b4-deleted-tests.md for the full retirement record of all three.
         "fm-storage-pragma-integrity-fail"
         | "fm-storage-frankensqlite-openread-cursor"
-        | "fm-storage-schema-version-drift"
-        | "fm-storage-legacy-interop-fail"
-        | "fm-storage-stale-wal-shm"
-        | "fm-storage-busy-lock-active-writer" => {
+        | "fm-storage-schema-version-drift" => {
             &["openread_failed", "integrity_failed", "unknown_deferred"]
         }
         // Unknown fixture id: permissive so a newly-added fixture never silently

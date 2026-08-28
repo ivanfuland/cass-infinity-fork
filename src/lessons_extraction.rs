@@ -683,12 +683,12 @@ mod tests {
             project: "cass".to_string(),
             commits: vec![commit(
                 "new99",
-                "feat(frankensqlite): use SUM(0) in grouped query",
+                "feat(the legacy embedded engine): use SUM(0) in grouped query",
                 300,
             )],
             beads: vec![bead(
                 "bd-2",
-                "frankensqlite group-by workaround",
+                "the legacy embedded engine group-by workaround",
                 "abandoned: bare 0 in grouped query does not work, rolled back",
                 "task",
                 100,
@@ -698,7 +698,7 @@ mod tests {
         // Force both onto the same (topic, project) so supersession applies.
         let mut result = extract(&evidence);
         for c in &mut result.candidates {
-            c.topic = "frankensqlite-group-by".to_string();
+            c.topic = "the legacy embedded engine-group-by".to_string();
         }
         let graph = LessonGraph::build(result.candidates);
         assert_eq!(graph.summary.total, 2);

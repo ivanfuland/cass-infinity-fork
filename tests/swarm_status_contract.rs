@@ -2241,8 +2241,13 @@ fn swarm_failure_patterns_cli_ranks_test_suggestions_and_redacts_sessions()
         .filter_map(|pattern| pattern.get("kind").and_then(Value::as_str))
         .collect::<Vec<_>>();
 
+    // w1b Task B5 (plan delta d14): `fsqlite-query-shape-regression` retired
+    // (see `w1b-b4-deleted-tests.md`) -- `panic-surface-regression` is now
+    // the sole surviving "high" severity rule, and it still matches the
+    // `cass-fsqlite` fixture bead's close_reason on its own keywords
+    // ("range end index", "out of range").
     require(
-        kinds.starts_with(&["fsqlite-query-shape-regression", "panic-surface-regression"]),
+        kinds.first() == Some(&"panic-surface-regression"),
         format!("high-severity pattern ordering drifted: {kinds:?}"),
     )?;
     for expected in [
@@ -2455,8 +2460,8 @@ fn swarm_dependency_drift_cli_flags_pin_dirty_missing_and_network_risks()
         .filter_map(|recommendation| recommendation.get("kind").and_then(Value::as_str))
         .collect::<Vec<_>>();
     require(
-        recommendation_kinds.contains(&"frankensqlite-first"),
-        "frankensqlite-specific recommendation missing",
+        recommendation_kinds.contains(&"review-drift-before-release"),
+        "drift review recommendation missing",
     )?;
     require(
         serde_json::to_string(&output)?.contains(

@@ -20395,7 +20395,7 @@ impl super::ftui_adapter::Model for CassApp {
                                             has_messages && needs_rebuild
                                         }
                                         Err(e) => {
-                                            // query_status failed (likely frankensqlite compat) —
+                                            // query_status failed (likely the legacy embedded engine compat) —
                                             // try rebuild anyway since we have no data to show.
                                             tracing::warn!(
                                                 error = %e,
@@ -20410,7 +20410,8 @@ impl super::ftui_adapter::Model for CassApp {
 
                                 if should_auto_rebuild {
                                     tracing::info!("analytics auto-rebuild triggered");
-                                    match crate::storage::sqlite::FrankenStorage::open(&db_path) {
+                                    // w1b Task B8 (d16, open-consumer audit): write path.
+                                    match crate::storage::sqlite::FrankenStorage::open_writer(&db_path) {
                                         Ok(db_rw) => match db_rw.rebuild_analytics() {
                                             Ok(_) => {
                                                 // Re-open with FrankenStorage to load refreshed data
@@ -22780,8 +22781,10 @@ fn load_indexed_export_view(
         return Ok(None);
     }
 
-    let storage =
-        FrankenStorage::open(db_path).map_err(|err| format!("Failed to open database: {err}"))?;
+    // w1b Task B8 (d16, open-consumer audit): pure read (session load for
+    // display), switched to the read-only open.
+    let storage = FrankenStorage::open_readonly(db_path)
+        .map_err(|err| format!("Failed to open database: {err}"))?;
     load_conversation_for_hit(&storage, hit).map_err(|err| format!("Failed to load session: {err}"))
 }
 
@@ -34174,7 +34177,7 @@ not jsonl",
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("analytics_loading.db");
         let storage =
-            FrankenStorage::open(&db_path).expect("open frankensqlite for analytics test");
+            FrankenStorage::open(&db_path).expect("open the legacy embedded engine for analytics test");
         app.db_reader = Some(Arc::new(storage));
 
         let cmd = app.schedule_analytics_reload();
@@ -34249,7 +34252,7 @@ not jsonl",
     fn analytics_entered_sets_loading_context_when_cache_empty() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("analytics_enter.db");
-        let storage = FrankenStorage::open(&db_path).expect("open frankensqlite");
+        let storage = FrankenStorage::open(&db_path).expect("open the legacy embedded engine");
         let mut app = CassApp::default();
         app.db_reader = Some(Arc::new(storage));
         app.analytics_cache = None;

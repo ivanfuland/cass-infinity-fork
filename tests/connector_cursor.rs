@@ -17,7 +17,7 @@ use tempfile::TempDir;
 /// crate-private (R2-F3), so this integration test (a separate crate)
 /// bootstraps through `FrankenStorage::open` + `into_raw()` rather than
 /// opening a bare connection directly the way the pre-migration
-/// native-`frankensqlite` version of this helper did; the extra cass tables
+/// native-`legacy-engine` version of this helper did; the extra cass tables
 /// alongside cursorDiskKV/ItemTable don't affect this connector's reads.
 fn create_test_db(path: &Path) -> FrankenConnection {
     let conn = coding_agent_search::storage::sqlite::FrankenStorage::open(path)

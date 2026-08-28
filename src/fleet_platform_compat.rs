@@ -220,7 +220,7 @@ mod tests {
             PathOrigin::LinuxHome
         );
         assert_eq!(
-            classify_path_origin("/dp/frankensqlite"),
+            classify_path_origin("/dp/legacy-embedded-engine"),
             PathOrigin::DpCheckout
         );
         assert_eq!(

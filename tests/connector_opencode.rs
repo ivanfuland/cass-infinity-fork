@@ -121,7 +121,7 @@ struct TestPart {
 /// crate-private (R2-F3), so this integration test (a separate crate)
 /// bootstraps through `FrankenStorage::open` + `into_raw()` rather than
 /// opening a bare, schema-free connection the way the pre-migration
-/// native-`frankensqlite` version of this helper did.
+/// native-`legacy-engine` version of this helper did.
 fn create_drizzle_opencode_db(path: &Path) -> Connection {
     let conn = coding_agent_search::storage::sqlite::FrankenStorage::open(path)
         .expect("open opencode db")

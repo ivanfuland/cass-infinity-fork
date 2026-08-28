@@ -461,7 +461,7 @@ mod tests {
             RootKind::CassWorkspace
         );
         assert_eq!(
-            classify_root_kind("/data/projects/frankensqlite", None),
+            classify_root_kind("/data/projects/legacy-embedded-engine", None),
             RootKind::DependencyWorkspace
         );
         assert_eq!(classify_root_kind("/opt/random", None), RootKind::Other);
@@ -497,7 +497,7 @@ mod tests {
     fn noisy_dependency_root_does_not_count_as_sessions() {
         let roots = vec![root(
             RootKind::DependencyWorkspace,
-            "/data/projects/frankensqlite",
+            "/data/projects/legacy-embedded-engine",
         )];
         let s = summarize_coverage(
             &roots,

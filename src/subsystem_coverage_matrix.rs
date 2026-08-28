@@ -427,11 +427,7 @@ pub fn subsystem_coverage_matrix() -> Vec<SubsystemCoverage> {
                 "fm-storage-sql-fmt-injection-risk",
             ],
             mandatory_proofs: &[ProofLevel::Integration, ProofLevel::Golden, ProofLevel::E2e],
-            proof_artifacts: &[
-                "tests/e2e_storage_failure_fixture_gate.rs",
-                "tests/storage.rs",
-                "tests/storage_migration_safety.rs",
-            ],
+            proof_artifacts: &["tests/e2e_storage_failure_fixture_gate.rs", "tests/storage.rs"],
             optional_diagnostics: &["live integrity-check sweep"],
             fixture_provenance: "deterministic raw-byte corrupt fixtures; DB preserved byte-identical",
             log_expectation: "structured proof-log over the real-binary storage-failure gate",

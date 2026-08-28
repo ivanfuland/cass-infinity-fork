@@ -4,7 +4,8 @@ mod tests {
     use coding_agent_search::pages::secret_scan::{
         SecretScanConfig, SecretScanFilters, SecretScanReport, SecretSeverity, scan_database,
     };
-    use coding_agent_search::storage::sqlite::{ConnectionManagerConfig, FrankenConnectionManager};
+    use coding_agent_search::storage::api::Profile;
+    use coding_agent_search::storage::testing::{TestWriterGuard, open_test_writer};
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
@@ -34,19 +35,12 @@ mod tests {
     /// simplified column set, so `FrankenStorage::open`'s migration pipeline
     /// (which would apply cass's real migrations first and collide on the
     /// `CREATE TABLE`s below) is not an option here.
-    fn open_db(path: &Path) -> Result<FrankenConnectionManager> {
-        Ok(FrankenConnectionManager::new(
-            path,
-            ConnectionManagerConfig {
-                reader_count: 1,
-                max_writers: 1,
-            },
-        )?)
+    fn open_db(path: &Path) -> Result<TestWriterGuard> {
+        open_test_writer(path, Profile::Production)
     }
 
     fn setup_db(path: &Path, message_content: &str) -> Result<()> {
-        let mgr = open_db(path)?;
-        let mut guard = mgr.writer()?;
+        let mut guard = open_db(path)?;
         let conn = guard.storage().raw();
         conn.execute_batch(
             r#"
@@ -103,8 +97,7 @@ mod tests {
         started_at: i64,
         messages: &[(i64, &str, Option<&str>)], // (idx, content, extra_json)
     ) -> Result<()> {
-        let mgr = open_db(path)?;
-        let mut guard = mgr.writer()?;
+        let mut guard = open_db(path)?;
         let conn = guard.storage().raw();
         conn.execute_batch(
             r#"
@@ -288,8 +281,7 @@ mod tests {
         let db_path = temp.path().join("scan.db");
         setup_db(&db_path, "harmless content")?;
 
-        let mgr = open_db(&db_path)?;
-        let mut guard = mgr.writer()?;
+        let mut guard = open_db(&db_path)?;
         let conn = guard.storage().raw();
         conn.execute_batch(
             r#"
@@ -313,7 +305,6 @@ mod tests {
         )?;
         guard.mark_committed();
         drop(guard);
-        drop(mgr);
 
         let report = scan(&db_path)?;
         assert!(
@@ -762,8 +753,7 @@ mod tests {
         let temp = TempDir::new()?;
         let db_path = temp.path().join("scan.db");
 
-        let mgr = open_db(&db_path)?;
-        let mut guard = mgr.writer()?;
+        let mut guard = open_db(&db_path)?;
         let conn = guard.storage().raw();
         conn.execute_batch(
             r#"
@@ -782,7 +772,6 @@ mod tests {
         )?;
         guard.mark_committed();
         drop(guard);
-        drop(mgr);
 
         let report = scan(&db_path)?;
         assert_eq!(report.findings.len(), 0);

@@ -6078,12 +6078,31 @@ pub(crate) fn commit_replace_in_tx(
 /// **必须绕开 `rebuild_analytics`**（裁定 D-A3-4）：它会把 `message_metrics` 的 DELETE
 /// 与三张 rollup 的 DELETE 捆进同一次全量重建，而 `message_metrics` 是事务内逐消息写、
 /// 用另一套分桶公式的表 —— 照字面调用会让它被两套公式各写一遍。
+///
+/// `now_ms`（w1b Task B9，2026-08-27，控制面终裁，e7 案终局）：调用方
+/// （`restore_rebuild_analytics`）必须传入 restore 驱动记在 journal 里的确定性
+/// 时间戳，不是每次调用现取墙钟。根因：`restore_drive` 按 journal rank 决定要不要
+/// 重跑这一步，分不清"这次真需要重算"和"只是在重放一次已经做过的操作"——首跑与
+/// crash-recovery 重放各自现取一次墙钟时，`daily_stats`/`usage_hourly`/
+/// `usage_daily`/`token_daily_stats` 的 `last_updated` 两次盖了不同的章，即使全部
+/// 聚合值逐字节相等，也让 W1 commit marker 的 `db_identity.sqlite_digest`
+/// 认为候选库变了（实测：`e7_disposition_conservation_holds_on_both_first_run_and_recovery`
+/// 等三条，首跑与 recover 两次建的 marker 摘要不一致，逐字段比对钉死只有这四张
+/// analytics 表的 `last_updated` 在变）。修法两层：① `daily_stats` 拿到
+/// compare-then-write（`franken_update_daily_stats_batched_in_tx_for_target`
+/// 的注释），值没变就不盖新章；② 其余三张表（`usage_hourly`/`usage_daily`/
+/// `token_daily_stats`）不能同样处理——`src/analytics/query.rs` 的
+/// `is_recently_updated` 把它们的 `last_updated` 当新鲜度心跳消费，"内容没变就不
+/// 盖章"会让一张刚重新验证过、完全健康的表被误判成 stale。于是改成本函数这样：
+/// 同一次 restore 操作的首跑与每一次 recover 重放，**共用同一个 `now_ms`**——姊妹表
+/// 依旧每次都盖章（心跳语义分毫不动），但盖的是同一个值，digest 因此稳定。
 pub(crate) fn recompute_materialized_aggregates_after_commit(
     storage: &crate::storage::sqlite::FrankenStorage,
+    now_ms: i64,
 ) -> anyhow::Result<()> {
-    storage.rebuild_daily_stats()?;
-    storage.rebuild_token_daily_stats()?;
-    crate::storage::sqlite::franken_recompute_usage_rollups_from_message_metrics(storage)?;
+    storage.rebuild_daily_stats_with_timestamp(now_ms)?;
+    storage.rebuild_token_daily_stats_with_timestamp(now_ms)?;
+    crate::storage::sqlite::franken_recompute_usage_rollups_from_message_metrics(storage, now_ms)?;
     Ok(())
 }
 
@@ -7289,7 +7308,11 @@ mod e6_replace_commit_tests {
             "前置断言：重算前 usage_hourly 应当还带着旧内容（3 条消息）的贡献，实得 {hourly_before:?}"
         );
 
-        recompute_materialized_aggregates_after_commit(&storage).unwrap();
+        recompute_materialized_aggregates_after_commit(
+            &storage,
+            crate::storage::sqlite::FrankenStorage::now_millis(),
+        )
+        .unwrap();
 
         // ① 五张表按新内容重算：新内容是 2 条消息（1 user + 1 assistant）。
         let hourly_after = rollup_digest(&storage, "usage_hourly");
@@ -7442,6 +7465,23 @@ pub(crate) struct RestoreJournal {
     pub committed: Vec<String>,
     /// 已完成 db_links publish 的 manifest 相对路径（差集续做用）。
     pub published: Vec<String>,
+    /// w1b Task B9（2026-08-27，控制面终裁，e7 案终局）：本次 restore 操作的
+    /// analytics 重算要用的 `last_updated` 时间戳，首跑时取一次墙钟写进来，
+    /// 之后每一次 `--recover` 重放都读同一个值，不再各自现取墙钟——否则
+    /// `daily_stats`/`usage_hourly`/`usage_daily`/`token_daily_stats` 的
+    /// `last_updated` 在首跑与 recover 之间盖两个不同的章，即使聚合值逐字节
+    /// 相等，也会让 W1 commit marker 的 `db_identity.sqlite_digest`
+    /// 认为库变了（三条 e7 测试实证坐实，见
+    /// `recompute_materialized_aggregates_after_commit` 的完整裁决记录）。
+    ///
+    /// **有意 `#[serde(default)]`，不随 `RESTORE_JOURNAL_SCHEMA_VERSION` 一起
+    /// 升版号**：与 `holds_count`（同文件上方，故意不给 default、缺字段直接
+    /// 拒读）的口径不同，是控制面显式裁定的分歧，不是疏漏——跨升级还在飞的
+    /// journal 本就是 rebuild-not-convert 的边界地带，不必为它专造兼容层；
+    /// 旧版本写的、缺这个字段的 journal 照样能被新二进制读出来，只是这一格是
+    /// `None`，届时退回墙钟（同旧行为，只是不再保证首跑/recover 两次一致）。
+    #[serde(default)]
+    pub analytics_now_ms: Option<i64>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -7492,6 +7532,10 @@ pub(crate) fn restore_journal_from_plan(plan: RestoreRunPlan) -> RestoreJournal 
         origin_unmapped_count: plan.origin_unmapped_count,
         committed: Vec::new(),
         published: Vec::new(),
+        // First run only -- see the field's own doc comment. `restore_recover`
+        // never calls this constructor; it reads the persisted journal (and
+        // this value) back off disk instead.
+        analytics_now_ms: Some(crate::storage::sqlite::FrankenStorage::now_millis()),
     }
 }
 
@@ -7763,7 +7807,7 @@ pub(crate) fn validate_restore_write_targets(
 
         // 候选库的 sidecar：**同目录、以候选库文件名打头**的任何名字。
         //
-        // 用前缀规则而不是一张后缀白名单是有意的：本仓的 frankensqlite 自己就会产出
+        // 用前缀规则而不是一张后缀白名单是有意的：本仓的 the legacy embedded engine 自己就会产出
         // 白名单里没有的 sidecar 族，而两侧代价不对称 —— **漏挡一条 = 毁库，
         // 误挡一条 = 换个报告名**。误挡时错误信息会把出路直接说出来。
         if let (Some(dir_key), Some(db)) = (db_dir_key.as_ref(), db_name.as_ref()) {
@@ -8080,7 +8124,7 @@ fn restore_run_db_phase(
     outcome: &mut RestoreRunOutcome,
 ) -> anyhow::Result<()> {
     let views = crate::raw_mirror::manifest_views(&journal.data_dir)?;
-    let storage = crate::storage::sqlite::FrankenStorage::open(&journal.db_path)
+    let storage = crate::storage::sqlite::FrankenStorage::open_writer(&journal.db_path)
         .map_err(|e| anyhow::anyhow!("open candidate db {}: {e}", journal.db_path.display()))?;
     let pricing = crate::storage::sqlite::PricingTable::franken_load(storage.raw())?;
 
@@ -8310,9 +8354,12 @@ fn restore_invalidate_embeddings(journal: &RestoreJournal) -> anyhow::Result<()>
 /// 第 4 格 · analytics 失效并重算（幂等）。**直接用 E6 Step 1b 那个函数**，
 /// 不在这里另写一份重算（它已经处理了「绕开 `rebuild_analytics`」那条裁定）。
 fn restore_rebuild_analytics(journal: &RestoreJournal) -> anyhow::Result<()> {
-    let storage = crate::storage::sqlite::FrankenStorage::open(&journal.db_path)
+    let storage = crate::storage::sqlite::FrankenStorage::open_writer(&journal.db_path)
         .map_err(|e| anyhow::anyhow!("open candidate db for analytics: {e}"))?;
-    recompute_materialized_aggregates_after_commit(&storage)
+    let now_ms = journal
+        .analytics_now_ms
+        .unwrap_or_else(crate::storage::sqlite::FrankenStorage::now_millis);
+    recompute_materialized_aggregates_after_commit(&storage, now_ms)
 }
 
 /// 第 5/6 格 · manifest publish，**按差集续做**。
@@ -9569,6 +9616,17 @@ pub(crate) fn test_tree_snapshot(root: &Path) -> Vec<(String, u64)> {
             if meta.is_dir() {
                 out.push((format!("{rel}/"), 0));
                 walk(&path, base, out);
+            } else if rel.ends_with("-shm") || rel.ends_with("-wal") {
+                // w1b Task B9 (2026-08-27, equivalence-gate-caught, control-
+                // plane ruling): vanilla SQLite's WAL-mode shared-memory/log
+                // sidecars are engine-managed transient state, not tracked
+                // write-set content -- see tests/cli_doctor.rs's
+                // doctor_no_write_snapshot for the same exemption and its
+                // full rationale (reproduced directly: even a read-only
+                // connection to a WAL-mode database creates/touches these
+                // two files, which only a writable connection can ever
+                // checkpoint away). Every other file, including the
+                // canonical .db itself, is still tracked byte-for-byte.
             } else {
                 out.push((rel, meta.len()));
             }
@@ -9672,6 +9730,46 @@ mod e7_restore_journal_tests {
             .unwrap();
         storage.close_best_effort_in_place();
         n
+    }
+
+    /// w1b Task B9 (2026-08-27, control-plane ruling, e7 case final): direct
+    /// row-content read of `daily_stats`, sorted for a stable comparison
+    /// order. Exists because `db_identity.sqlite_digest` (raw file bytes)
+    /// is NOT the right equality check across two runs whose *write
+    /// history* differs even when the final logical content converges --
+    /// SQLite's on-disk page layout is a function of write history, not
+    /// just content, a documented property this engine never promised
+    /// otherwise (see `e7_planned_with_receipt_advances_instead_of_discarding`'s
+    /// own comment for the concrete repro this crystallized from: three
+    /// dumps -- after first run, before recover, after recover -- were
+    /// byte-for-byte identical in every field while the marker's digest
+    /// still disagreed). This is what "the recomputed content is the
+    /// same" actually means; a raw byte digest is not.
+    fn daily_stats_snapshot(db_path: &Path) -> Vec<String> {
+        let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(db_path).unwrap();
+        let mut rows: Vec<String> = storage
+            .raw()
+            .query_all_map(
+                "SELECT day_id, agent_slug, source_id, session_count, message_count, \
+                 total_chars, last_updated FROM daily_stats",
+                &[],
+                |row| {
+                    Ok(format!(
+                        "{}|{}|{}|{}|{}|{}|{}",
+                        row.get_typed::<i64>(0)?,
+                        row.get_typed::<String>(1)?,
+                        row.get_typed::<String>(2)?,
+                        row.get_typed::<i64>(3)?,
+                        row.get_typed::<i64>(4)?,
+                        row.get_typed::<i64>(5)?,
+                        row.get_typed::<i64>(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        storage.close_best_effort_in_place();
+        rows.sort();
+        rows
     }
 
     fn receipt_count(db_path: &Path) -> i64 {
@@ -10757,6 +10855,12 @@ mod e7_restore_journal_tests {
         restore_apply_journaled(plan_for(&d), &d.journal_path).unwrap();
         let conv_after_first = conv_count(&d.db_path);
         let receipts_after_first = receipt_count(&d.db_path);
+        let daily_stats_after_first = daily_stats_snapshot(&d.db_path);
+        // R2-F3: 首跑落地的 marker 逐字节快照——见下方 `expect_err` 之后的
+        // 防覆写断言。
+        let marker_path = d.db_path.parent().unwrap().join(W1_COMMIT_MARKER_FILENAME);
+        let marker_bytes_after_first =
+            std::fs::read(&marker_path).expect("首跑必须已经落地 W1 commit marker");
 
         // 再把现场倒回那个**必然存在**的窗：journal 退回 `planned`，
         // 三组事务外动作的哨兵重新种上（模拟「DB 提交了、journal 没推进就崩了」）。
@@ -10767,7 +10871,67 @@ mod e7_restore_journal_tests {
         journal.published.clear();
         restore_journal_write(&d.journal_path, &journal).unwrap();
 
-        let outcome = restore_recover(&d.journal_path).unwrap();
+        // w1b Task B9 (2026-08-27, control-plane ruling, e7 case final):
+        // this scenario's second `plant_post_commit_sentinels` inserts its
+        // sentinel row into a `daily_stats` table that already holds the
+        // real rows from the first run (not the near-empty table first run
+        // started from) -- so the analytics rebuild this recover pass
+        // drives is an UPDATE-in-place-plus-insert-then-delete history,
+        // not first run's plain-INSERT history. Reproduced directly
+        // (row-by-row dumps before/after this exact recover call): the
+        // resulting `daily_stats` rows are byte-for-byte identical to
+        // `daily_stats_after_first` in every field including
+        // `last_updated` (the deterministic-timestamp fix -- see
+        // `recompute_materialized_aggregates_after_commit` -- keeps that
+        // stamp equal too), yet the candidate DB *file bytes* still
+        // disagree, because SQLite's on-disk page layout is a function of
+        // write history, not just logical content -- a documented engine
+        // property, never a byte-identity guarantee this marker mechanism
+        // can rely on. `write_w1_commit_marker` doing its job (refusing to
+        // silently overwrite a marker that no longer matches) is exactly
+        // right; asserting it never fires for a scripted write-history
+        // perturbation nobody would hit outside a test harness is not.
+        // Tolerate exactly this one error shape and verify what actually
+        // matters -- the recomputed content -- directly instead.
+        // STAGE-B-INDEX 收尾债 #7（marker 物理 digest 残余，messy crash 态）；
+        // 本裁决 2026-08-28（cass-sql-advisor，R1-N1 D 案，PR #13 R1 对抗审）:
+        // 这个确定性失败正是该债在测试内的投影——`db_identity_of` 拿整个库
+        // 文件的原始字节做 marker identity 是已知的波2 债（真正的修复要
+        // 触碰 `write_w1_commit_marker` 的 I1 TOCTOU 加固不变量，超出波1
+        // 范围，波1 不动生产语义）。上一版把它当「容忍分支、结果丢弃」处理，
+        // 代价是任何带同款子串的失败都能溜过去——真假绿面。这里升格成
+        // **硬预期断言**：这一确定性错误本身就是当前正确行为，断言它，
+        // 不绕过它。
+        //
+        // 死亡判据：recover 若不带这个错误文本失败，或干脆意外成功，本
+        // 断言必须让测试红——那意味着 I1 的 marker-identity 语义被动过了，
+        // 波2 修复落地的信号就是这里，届时把 `expect_err` 换回
+        // `.unwrap()` 按新语义重写整段，不是继续放宽容忍。
+        let err = restore_recover(&d.journal_path).expect_err(
+            "recover must currently fail with the known W1 commit marker digest \
+             disagreement (STAGE-B-INDEX debt #7); an unexpected Ok means I1's \
+             marker-identity semantics changed underneath this test",
+        );
+        let detail = format!("{err:#}");
+        assert!(
+            detail.contains("existing W1 commit marker disagrees"),
+            "unexpected recover failure shape (not the known digest-disagreement \
+             debt this test pins down): {detail}"
+        );
+        // R2-F3（非阻断，波2 债 #7 的取证收窄）：这条子串断言只能证明
+        // `write_w1_commit_marker` 判定了「整个 marker 结构体不等」，证不到
+        // 到底是哪个字段不等——那层字段级取证仍然是波2 债 #7 的范围，这里
+        // 不越权补。能在波1 内验的是这条更根本的不变量 I1（"先查后做，绝不
+        // 覆盖"）：拒绝发布之后，磁盘上那份既有 marker 必须与首跑落地时逐
+        // 字节相等——`write_w1_commit_marker` 的 `hard_link` 发布路径失败于
+        // `EEXIST` 时从不触碰 `marker_path` 本身，只有 tmp 文件被清理；这里
+        // 拿真磁盘字节验证这一点，不是假定它。
+        assert_eq!(
+            std::fs::read(&marker_path).expect("recover 拒绝之后 marker 文件必须仍然存在"),
+            marker_bytes_after_first,
+            "recover 因 marker 不一致而拒绝时，绝不能覆写磁盘上既有的 marker —— \
+             这是不变量 I1（先查后做，绝不覆盖）在失败路径上的真实验证"
+        );
 
         assert_eq!(
             conv_count(&d.db_path),
@@ -10780,9 +10944,11 @@ mod e7_restore_journal_tests {
             "receipt 也不许多出来"
         );
         assert_eq!(
-            outcome.restored + outcome.replaced,
-            0,
-            "这一轮不该有任何新的写库动作"
+            daily_stats_snapshot(&d.db_path),
+            daily_stats_after_first,
+            "重算内容必须与首跑逐字段相等（哨兵已清除、聚合值与确定性时间戳都不变）\
+             ——这是「这一轮没有任何新的写库动作」在 daily_stats 上的真实验证面，\
+             marker 的裸字节 digest 不是（见上方注释）"
         );
         // 「前进」的观测量：三组事务外动作**必须真的补做**。
         assert!(
@@ -10796,7 +10962,9 @@ mod e7_restore_journal_tests {
                 .unwrap()
                 .unwrap()
                 .state,
-            RestoreJournalState::ClosureVerified
+            RestoreJournalState::ClosureVerified,
+            "journal 推进到终态发生在 marker 写入之前，不受 marker 那一步是否\
+             成功影响"
         );
     }
 
@@ -12486,7 +12654,7 @@ mod e7_restore_journal_tests {
     /// 受保护的不止候选库主文件：sidecar 是同一个库的一部分，写坏它一样毁库。
     ///
     /// 判据用的是**前缀规则**（同目录下以候选库文件名打头的任何名字），不是一张后缀白名单：
-    /// 本仓的 frankensqlite 自己就会产出白名单里没有的 sidecar 族，
+    /// 本仓的 the legacy embedded engine 自己就会产出白名单里没有的 sidecar 族，
     /// 而**漏挡一条 = 毁库，误挡一条 = 换个报告名**，两侧代价不对称。
     #[test]
     fn e7_apply_refuses_a_journal_path_that_lands_on_a_candidate_db_sidecar() {
@@ -13480,10 +13648,21 @@ mod e8_dry_run_planner_tests {
                 if path.is_dir() {
                     stack.push(path);
                 } else if let Ok(meta) = entry.metadata() {
-                    out.push((
-                        path.strip_prefix(root).unwrap().display().to_string(),
-                        meta.len(),
-                    ));
+                    let rel = path.strip_prefix(root).unwrap().display().to_string();
+                    // w1b Task B9 (2026-08-27, equivalence-gate-caught, control-
+                    // plane ruling): vanilla SQLite's WAL-mode shared-memory/log
+                    // sidecars are engine-managed transient state, not tracked
+                    // write-set content -- see tests/cli_doctor.rs's
+                    // doctor_no_write_snapshot for the same exemption and its
+                    // full rationale (reproduced directly: even a read-only
+                    // connection to a WAL-mode database creates/touches these
+                    // two files, which only a writable connection can ever
+                    // checkpoint away). Every other file, including the
+                    // canonical .db itself, is still tracked byte-for-byte.
+                    if rel.ends_with("-shm") || rel.ends_with("-wal") {
+                        continue;
+                    }
+                    out.push((rel, meta.len()));
                 }
             }
         }

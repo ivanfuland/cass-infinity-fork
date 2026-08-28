@@ -7,10 +7,9 @@
 //! - Missing optional fields have sensible defaults
 
 use coding_agent_search::pages::encrypt::{EncryptionConfig, KdfAlgorithm, SlotType};
-use coding_agent_search::storage::sqlite::{
-    CURRENT_SCHEMA_VERSION, ConnectionManagerConfig, FrankenConnectionManager, MigrationError,
-    SqliteStorage,
-};
+use coding_agent_search::storage::api::Profile;
+use coding_agent_search::storage::sqlite::{CURRENT_SCHEMA_VERSION, SqliteStorage};
+use coding_agent_search::storage::testing::{TestWriterGuard, open_test_writer};
 use serde_json::json;
 use std::path::Path;
 use tempfile::TempDir;
@@ -26,19 +25,11 @@ const _: () = {
     );
 };
 
-/// Schema-free fixture writer: these fixtures deliberately build legacy /
-/// pre-migration schemas that `SqliteStorage::open_or_rebuild` must detect,
-/// so opening through `FrankenStorage::open` (which would migrate first)
-/// defeats the point of the test.
-fn open_fixture_db(path: &Path) -> FrankenConnectionManager {
-    FrankenConnectionManager::new(
-        path,
-        ConnectionManagerConfig {
-            reader_count: 1,
-            max_writers: 1,
-        },
-    )
-    .expect("open frankensqlite fixture database")
+/// Schema-free fixture writer: lets a test poke at a database's raw tables
+/// without `schema::ensure` (which `SqliteStorage::open` now always runs)
+/// building/overwriting them first.
+fn open_fixture_db(path: &Path) -> TestWriterGuard {
+    open_test_writer(path, Profile::Production).expect("open the legacy embedded engine fixture database")
 }
 
 // =============================================================================
@@ -70,49 +61,57 @@ fn test_new_database_has_current_schema() {
 // Database Compatibility Tests
 // =============================================================================
 
-/// Test that we can open a database with older schema version and check compatibility.
+/// w1b Task B9 (2026-08-27, control-plane ruling): dedicated write-path e2e
+/// coverage for the "rebuild, don't silently convert, a pre-rusqlite
+/// archive" contract (`storage::schema::ensure`'s own rejection). This
+/// replaces `e2e_storage_failure_fixture_gate.rs`'s retired
+/// `fm-storage-legacy-interop-fail` fixture -- that file's fixtures are all
+/// driven through read-only `safe_command`s (`doctor --check`/`status`/
+/// `search`), none of which ever reach `schema::ensure`'s writable-open-only
+/// rejection (`open_read` never consults `user_version` at all -- a
+/// vanilla-readable structurally-intact old database opens and searches
+/// fine, which is correct: silently migrating one on ANY open, including
+/// read-only ones, is exactly the franken-era anti-pattern Task B8(a)
+/// retired). `SqliteStorage::open()` -- the real production entry point
+/// every write-triggering command (`cass index`, `current`, ...) goes
+/// through -- is the only code path that actually enforces this contract,
+/// so this test drives that function directly rather than shelling out to
+/// a read-only CLI surface.
 #[test]
-fn test_detects_older_schema() {
+fn test_open_rejects_pre_rusqlite_archive_instead_of_converting_it() {
     let dir = TempDir::new().unwrap();
-    let db_path = dir.path().join("old.db");
+    let db_path = dir.path().join("pre_rusqlite.db");
 
-    // Create a minimal old-style database
+    // A real, fully-current-schema database, built through the same
+    // production entry point the rejection itself lives in -- not a
+    // hand-rolled schema. `user_version` lives at the fixed SQLite header
+    // offset 60..64 (big-endian i32); this is the one on-disk byte a
+    // pre-rusqlite archive would actually differ on, everything else about
+    // the file is a perfectly ordinary, structurally intact database.
     {
-        let mgr = open_fixture_db(&db_path);
-        let mut guard = mgr.writer().unwrap();
-        let conn = guard.storage().raw();
-        conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)", &[])
-            .unwrap();
-        // Simulate an older schema version
-        conn.execute(
-            "INSERT INTO meta (key, value) VALUES ('schema_version', '1')",
-            &[],
-        )
-        .unwrap();
-        guard.mark_committed();
+        let storage = SqliteStorage::open(&db_path).expect("build a real current-schema database");
+        drop(storage);
     }
+    let mut bytes = std::fs::read(&db_path).expect("read the database file");
+    bytes[60..64].copy_from_slice(&[0, 0, 0, 0]);
+    std::fs::write(&db_path, &bytes).expect("zero the user_version header field");
 
-    // Try to open with SqliteStorage - should trigger migration or rebuild
-    let result = SqliteStorage::open_or_rebuild(&db_path);
-
-    // Should succeed (either migrate or rebuild)
-    match result {
-        Ok(_) => {
-            // Successfully opened/migrated
-            let storage = SqliteStorage::open(&db_path).unwrap();
-            let version = storage.schema_version().unwrap();
-            assert!(
-                version >= CURRENT_SCHEMA_VERSION,
-                "Schema should be at least current version after migration"
-            );
-        }
-        Err(e) => {
-            // Migration error is acceptable for very old schemas
-            if let MigrationError::RebuildRequired { reason, .. } = e {
-                assert!(!reason.is_empty(), "Rebuild reason should not be empty");
-            }
-        }
-    }
+    let result = SqliteStorage::open(&db_path);
+    let err = match result {
+        Ok(_) => panic!(
+            "a structurally-intact database with user_version=0 must be rejected, not silently converted"
+        ),
+        Err(err) => err,
+    };
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("user_version=0 but is not empty"),
+        "expected schema::ensure's pre-rusqlite-archive rejection, got: {rendered}"
+    );
+    assert!(
+        rendered.contains("rebuild the archive instead of trying to convert this file"),
+        "expected the rebuild-not-convert guidance, got: {rendered}"
+    );
 }
 
 /// Test that unknown tables are ignored (forward compatibility).
@@ -128,8 +127,7 @@ fn test_ignores_unknown_tables() {
 
     // Add extra tables that a future version might have
     {
-        let mgr = open_fixture_db(&db_path);
-        let mut guard = mgr.writer().unwrap();
+        let mut guard = open_fixture_db(&db_path);
         let conn = guard.storage().raw();
         conn.execute(
             "CREATE TABLE future_feature (
@@ -167,8 +165,7 @@ fn test_handles_missing_optional_columns() {
 
     // Create a database with minimal required structure
     {
-        let mgr = open_fixture_db(&db_path);
-        let mut guard = mgr.writer().unwrap();
+        let mut guard = open_fixture_db(&db_path);
         let conn = guard.storage().raw();
         conn.execute_batch(
             r#"
@@ -403,51 +400,6 @@ fn test_detect_config_version() {
     assert_eq!(get_version(r#"{"other": "field"}"#), None);
 }
 
-/// Test graceful handling of very old schema.
-#[test]
-fn test_reject_schema_version_0() {
-    let dir = TempDir::new().unwrap();
-    let db_path = dir.path().join("ancient.db");
-
-    {
-        let mgr = open_fixture_db(&db_path);
-        let mut guard = mgr.writer().unwrap();
-        let conn = guard.storage().raw();
-        conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)", &[])
-            .unwrap();
-        conn.execute(
-            "INSERT INTO meta (key, value) VALUES ('schema_version', '0')",
-            &[],
-        )
-        .unwrap();
-        guard.mark_committed();
-    }
-
-    // Very old schemas should trigger rebuild
-    let result = SqliteStorage::open_or_rebuild(&db_path);
-    // Either succeeds with rebuild or returns error
-    match result {
-        Ok(_storage) => {
-            // Rebuild succeeded, verify schema is current
-            let storage = SqliteStorage::open(&db_path).unwrap();
-            assert!(storage.schema_version().unwrap() >= CURRENT_SCHEMA_VERSION);
-        }
-        Err(e) => match e {
-            MigrationError::RebuildRequired { reason, .. } => {
-                assert!(
-                    reason.to_lowercase().contains("rebuild")
-                        || reason.to_lowercase().contains("schema"),
-                    "Rebuild reason should be informative: {}",
-                    reason
-                );
-            }
-            other => {
-                let unexpected = format!("{other:?}");
-                assert!(unexpected.is_empty(), "Unexpected error type: {unexpected}");
-            }
-        },
-    }
-}
 
 // =============================================================================
 // Feature Degradation Tests
@@ -461,8 +413,7 @@ fn test_search_without_fts() {
 
     // Create database without FTS
     {
-        let mgr = open_fixture_db(&db_path);
-        let mut guard = mgr.writer().unwrap();
+        let mut guard = open_fixture_db(&db_path);
         let conn = guard.storage().raw();
         conn.execute_batch(&format!(
             r#"
@@ -513,6 +464,12 @@ fn test_search_without_fts() {
                 path TEXT NOT NULL UNIQUE,
                 updated_at INTEGER NOT NULL
             );
+            CREATE TABLE conversation_tail_state (
+                conversation_id INTEGER PRIMARY KEY,
+                ended_at INTEGER,
+                last_message_idx INTEGER,
+                last_message_created_at INTEGER
+            );
             INSERT INTO sources (id, kind, path, updated_at) VALUES ('local', 'local', 'default', 0);
             INSERT INTO agents (id, slug, name, kind, created_at, updated_at)
                 VALUES (1, 'test', 'Test Agent', 'cli', 0, 0);
@@ -543,11 +500,11 @@ fn test_search_without_fts() {
 /// `build.rs` validates manifest/package/feature contracts; this test makes the
 /// expected symbols compile against the currently resolved dependency graph.
 ///
-/// The frankensqlite quarter of this contract lives in
+/// The legacy embedded engine quarter of this contract lives in
 /// `tests/frankensqlite_compat_gates.rs::fsqlite_path_dependency_compile_contract`
 /// (plan delta d6, 2026-08-25) -- that file is the designated home for tests
-/// that deliberately bypass the api facade and pin the raw frankensqlite
-/// surface, and frankensqlite is the one sibling here that's a migration-
+/// that deliberately bypass the api facade and pin the raw the legacy embedded engine
+/// surface, and the legacy embedded engine is the one sibling here that's a migration-
 /// scoped engine rather than a long-lived dependency.
 #[test]
 fn test_path_dependency_compile_contracts() {

@@ -417,7 +417,7 @@ mod tests {
         // A "failed workaround" replaced by a "high-confidence landed decision".
         let g = LessonGraph::build(vec![
             candidate(
-                "frankensqlite-group-by",
+                "the legacy embedded engine-group-by",
                 LessonKind::FailedApproach,
                 LessonConfidence::Low,
                 100,
@@ -425,7 +425,7 @@ mod tests {
                 "old",
             ),
             candidate(
-                "frankensqlite-group-by",
+                "the legacy embedded engine-group-by",
                 LessonKind::ReusableDecision,
                 LessonConfidence::High,
                 300,

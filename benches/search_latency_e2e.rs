@@ -30,7 +30,7 @@ const PREFIX_SEQUENCES: usize = 6;
 const TYPICAL_P95_BUDGET_MS: f64 = 60.0;
 const FILTER_OVERHEAD_MAX_RATIO: f64 = 2.0;
 
-const EXACT_QUERY: &str = "frankensqlite write conflict";
+const EXACT_QUERY: &str = "legacy embedded engine write conflict";
 const PHRASE_QUERY: &str = "\"distributed tracing handshake\"";
 const WILDCARD_QUERY: &str = "*token*";
 const PREFIX_SEQUENCE: [&str; 4] = ["a", "au", "aut", "auth"];
@@ -139,7 +139,7 @@ fn build_fixture_conversation(
 
         if highlight_filtered_lane || (conv_idx + msg_idx).is_multiple_of(7) {
             content.push_str(
-                " The incident reproduced a frankensqlite write conflict during concurrent indexing.",
+                " The incident reproduced a legacy embedded engine write conflict during concurrent indexing.",
             );
         }
         if highlight_filtered_lane || (conv_idx + msg_idx).is_multiple_of(11) {
