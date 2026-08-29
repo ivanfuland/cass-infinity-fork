@@ -838,3 +838,134 @@ fn manifest_folds_duplicate_identity_keeping_the_larger_message_count() {
         "both sources must still be recorded even though only one side's counts win: {entry}"
     );
 }
+
+/// R1-B10: the production persistence path redacts every message's content
+/// before it reaches `messages.content` (`src/indexer/mod.rs`
+/// `map_to_internal_with_redactor`, security fix for #112), but the manifest
+/// tool's `content_digest` used to hash the connector's raw, unredacted
+/// content -- so any session that trips a redaction rule got a digest that
+/// could never match `cass ingest reconcile`'s DB-side recomputation. This
+/// hashes the *actual production* `redact_text` output (imported from the
+/// lib crate, not reimplemented here) to prove the manifest tool now applies
+/// the same transformation, not just a plausible-looking one.
+#[test]
+fn manifest_content_digest_reflects_production_redaction_for_secret_content() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("root");
+    fs::create_dir_all(&root).unwrap();
+
+    let raw_content = "DATABASE_URL=postgres://user:pass@host/db";
+    let session_line = format!(
+        r#"{{"type":"user","cwd":"/workspace/secret","sessionId":"sess-secret","message":{{"role":"user","content":"{}"}},"timestamp":"2025-01-01T00:00:00.000Z"}}"#,
+        raw_content
+    ) + "\n";
+    write_session(&root.join("secret.jsonl"), &session_line);
+
+    let mirror_dir = tmp.path().join("mirror");
+    fs::create_dir_all(&mirror_dir).unwrap();
+    let out_path = tmp.path().join("manifest.jsonl");
+
+    let mut cmd = base_cmd();
+    cmd.args([
+        "ingest",
+        "manifest",
+        "--scan-root",
+        root.to_str().unwrap(),
+        "--mirror",
+        mirror_dir.to_str().unwrap(),
+        "--out",
+        out_path.to_str().unwrap(),
+    ]);
+    cmd.assert().success();
+
+    let manifest_text = fs::read_to_string(&out_path).unwrap();
+    let entries: Vec<Value> = manifest_text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .skip(1) // header
+        .collect();
+    assert_eq!(
+        entries.len(),
+        1,
+        "expected exactly one session entry: {manifest_text}"
+    );
+    let entry = &entries[0];
+
+    let redacted_content =
+        coding_agent_search::indexer::redact_secrets::redact_text(raw_content).into_owned();
+    assert_ne!(
+        redacted_content, raw_content,
+        "fixture must actually trip a redaction rule, or this test proves nothing"
+    );
+
+    assert_eq!(
+        entry["content_digest"].as_str().unwrap(),
+        expected_digest(&[&redacted_content]),
+        "manifest content_digest must be computed over the same redacted bytes \
+         the production indexer persists to messages.content, not the raw \
+         connector content: {entry}"
+    );
+    assert_ne!(
+        entry["content_digest"].as_str().unwrap(),
+        expected_digest(&[raw_content]),
+        "manifest content_digest must NOT match a digest of the raw, \
+         unredacted content: {entry}"
+    );
+}
+
+/// Reverse control for the fix above: a session with no secret-shaped
+/// content must produce the exact same digest as before the R1-B10 fix
+/// (redaction is a byte-identical no-op when no pattern matches), so the fix
+/// cannot be read as "hash something else entirely".
+#[test]
+fn manifest_content_digest_unchanged_when_no_secret_present() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("root");
+    fs::create_dir_all(&root).unwrap();
+
+    let benign_content = "Just a normal message about refactoring the parser, no secrets here.";
+    let session_line = format!(
+        r#"{{"type":"user","cwd":"/workspace/benign","sessionId":"sess-benign","message":{{"role":"user","content":"{}"}},"timestamp":"2025-01-01T00:00:00.000Z"}}"#,
+        benign_content
+    ) + "\n";
+    write_session(&root.join("benign.jsonl"), &session_line);
+
+    let mirror_dir = tmp.path().join("mirror");
+    fs::create_dir_all(&mirror_dir).unwrap();
+    let out_path = tmp.path().join("manifest.jsonl");
+
+    let mut cmd = base_cmd();
+    cmd.args([
+        "ingest",
+        "manifest",
+        "--scan-root",
+        root.to_str().unwrap(),
+        "--mirror",
+        mirror_dir.to_str().unwrap(),
+        "--out",
+        out_path.to_str().unwrap(),
+    ]);
+    cmd.assert().success();
+
+    let manifest_text = fs::read_to_string(&out_path).unwrap();
+    let entries: Vec<Value> = manifest_text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .skip(1) // header
+        .collect();
+    assert_eq!(
+        entries.len(),
+        1,
+        "expected exactly one session entry: {manifest_text}"
+    );
+    let entry = &entries[0];
+
+    assert_eq!(
+        entry["content_digest"].as_str().unwrap(),
+        expected_digest(&[benign_content]),
+        "content without secrets must digest identically before and after \
+         the R1-B10 redaction-alignment fix: {entry}"
+    );
+}

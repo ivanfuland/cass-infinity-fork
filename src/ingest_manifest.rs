@@ -326,7 +326,27 @@ pub fn run_manifest(args: ManifestArgs) -> Result<()> {
                     return Ok(());
                 }
 
-                let messages: Vec<String> = conv.messages.iter().map(|m| m.content.clone()).collect();
+                // R1-B10: the production persistence path redacts every
+                // message's content before it reaches `messages.content`
+                // (`src/indexer/mod.rs` `map_to_internal_with_redactor`,
+                // security fix for #112). The manifest's digest must be
+                // computed over the exact same bytes DB storage ends up
+                // with, or any session that trips a redaction rule gets a
+                // `content_digest` that can never match reconcile's
+                // DB-side recomputation. Reusing `redact_secrets::redact_text`
+                // (single-point discipline, same as `identity_key_for_conversation`)
+                // instead of a second copy of the rules.
+                let messages: Vec<String> = conv
+                    .messages
+                    .iter()
+                    .map(|m| {
+                        if crate::indexer::redact_secrets::redaction_enabled() {
+                            crate::indexer::redact_secrets::redact_text(&m.content).into_owned()
+                        } else {
+                            m.content.clone()
+                        }
+                    })
+                    .collect();
                 let message_count = messages.len() as u64;
                 let digest = content_digest(&messages);
                 let digest_for_modify = digest.clone();

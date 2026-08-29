@@ -273,3 +273,91 @@ fn root_set_ok_ignores_duplicate_roots_on_either_side() {
         "duplicate root on the manifest side must not fail root-set equality: {report}"
     );
 }
+
+/// R1-B10: closes the loop the other two regression tests
+/// (`tests/ingest_manifest.rs`
+/// `manifest_content_digest_reflects_production_redaction_for_secret_content`
+/// and its reverse control) leave open -- that a manifest digest computed
+/// over *redacted* content actually reconciles clean against a DB row
+/// storing that same redacted content, via the real `cass ingest reconcile`
+/// binary. The DB row here is seeded with the exact bytes the production
+/// indexer would persist (`redact_secrets::redact_text`, imported from the
+/// lib crate, not reimplemented) for a message containing a DB connection
+/// string; the manifest entry's digest is computed over those same redacted
+/// bytes. Before the R1-B10 fix, the manifest tool hashed the raw
+/// (unredacted) content instead, which this DB row could never match.
+#[test]
+fn reconcile_shows_no_content_mismatch_when_manifest_digest_is_computed_over_redacted_content() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("agent_search.db");
+
+    let raw_content = "DATABASE_URL=postgres://user:pass@host/db";
+    let redacted_content =
+        coding_agent_search::indexer::redact_secrets::redact_text(raw_content).into_owned();
+    assert_ne!(
+        redacted_content, raw_content,
+        "fixture must actually trip a redaction rule, or this test proves nothing"
+    );
+
+    let storage = FrankenStorage::open(&db_path).expect("open fixture db");
+    let conn = storage.raw();
+    conn.execute(
+        "INSERT INTO agents(id, slug, name, kind, created_at, updated_at) \
+         VALUES (1, 'claude_code', 'Claude Code', 'cli', 0, 0)",
+        fparams(),
+    )
+    .expect("seed agent");
+    conn.execute(
+        "INSERT INTO conversations(id, agent_id, source_path, external_id) \
+         VALUES (1, 1, '/fixture/secret-session.jsonl', 'secret-session.jsonl')",
+        fparams(),
+    )
+    .expect("seed conversation");
+    conn.execute(
+        &format!(
+            "INSERT INTO messages(id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', '{}')",
+            redacted_content.replace('\'', "''")
+        ),
+        fparams(),
+    )
+    .expect("seed message (production-redacted content, matching map_to_internal_with_redactor)");
+    drop(storage);
+
+    let manifest_path = tmp.path().join("manifest.jsonl");
+    write_manifest(
+        &manifest_path,
+        &["/fixture"],
+        &[manifest_entry(
+            "claude_code||secret-session.jsonl",
+            true,
+            1,
+            &expected_digest(&[&redacted_content]),
+        )],
+    );
+
+    let roots_path = tmp.path().join("roots.txt");
+    fs::write(&roots_path, "/fixture\n").unwrap();
+
+    let mut cmd = base_cmd();
+    cmd.args([
+        "ingest",
+        "reconcile",
+        "--manifest",
+        manifest_path.to_str().unwrap(),
+        "--db",
+        db_path.to_str().unwrap(),
+        "--expected-roots",
+        roots_path.to_str().unwrap(),
+    ]);
+    let assertion = cmd.assert().success();
+    let output = assertion.get_output();
+    let report: Value = serde_json::from_slice(&output.stdout).expect("reconcile report is JSON");
+    assert_eq!(report["missing"].as_array().unwrap().len(), 0, "report: {report}");
+    assert_eq!(report["unexpected"].as_array().unwrap().len(), 0, "report: {report}");
+    assert_eq!(
+        report["content_mismatch"].as_array().unwrap().len(),
+        0,
+        "manifest digest over redacted content must match reconcile's DB-side \
+         digest over that same redacted content -- this is the R1-B10 contract: {report}"
+    );
+}
