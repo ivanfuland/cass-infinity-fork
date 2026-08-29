@@ -350,7 +350,7 @@ fn skip_subagents_active() -> bool {
 
 /// True when `source_path` is a subagent transcript — it lives directly inside a
 /// `subagents/` directory (e.g. `.../<session>/subagents/agent-1234.jsonl`).
-fn conversation_source_is_subagent(source_path: &Path) -> bool {
+pub(crate) fn conversation_source_is_subagent(source_path: &Path) -> bool {
     source_path
         .parent()
         .and_then(|parent| parent.file_name())
@@ -1060,7 +1060,9 @@ pub struct IndexingProgress {
     /// that active checkpoint as a #297 finalize wedge and kill the process
     /// (exit 70) mid-write — which strands the un-truncated WAL and leaves the
     /// canonical DB malformed to stock SQLite (#296/#321). Liveness is still
-    /// bounded: see `index_finalize_abort_threshold` (#319).
+    /// bounded: see `index_finalize_abort_threshold` (#319); its default is
+    /// pinned to the KU1 measurement in
+    /// `reports/w1-artifacts/ku1-checkpoint-latency.md`.
     pub finalizing: AtomicBool,
     /// Number of coding agents discovered so far during scanning
     pub discovered_agents: AtomicUsize,
@@ -15450,8 +15452,10 @@ pub fn run_index(
     // does not misread the quiescent, phase-0, current==total state as a #297
     // finalize wedge and kill the process (exit 70) mid-checkpoint — which would
     // strand the un-truncated WAL and leave the DB malformed (#296/#321). The
-    // watchdog still bounds this window (see `index_finalize_abort_threshold`),
-    // so a genuinely stuck finalize is still aborted.
+    // watchdog still bounds this window (see `index_finalize_abort_threshold`,
+    // default pinned to the KU1 measurement in
+    // reports/w1-artifacts/ku1-checkpoint-latency.md), so a genuinely stuck
+    // finalize is still aborted.
     if let Some(progress) = opts.progress.as_ref() {
         progress.finalizing.store(true, Ordering::Relaxed);
     }
@@ -24781,7 +24785,10 @@ fn inject_provenance(conv: &mut NormalizedConversation, origin: &Origin) {
 /// single ingest chokepoint makes every path produce one stable key, so dedup
 /// matches an existing row instead of accumulating duplicates as the watcher
 /// runs.
-fn canonicalize_claude_external_id(connector_name: &str, conv: &mut NormalizedConversation) {
+pub(crate) fn canonicalize_claude_external_id(
+    connector_name: &str,
+    conv: &mut NormalizedConversation,
+) {
     if connector_name != "claude" {
         return;
     }

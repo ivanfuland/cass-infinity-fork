@@ -34,6 +34,8 @@ pub mod guide_planner;
 pub mod html_export;
 pub mod incident_discovery;
 pub mod indexer;
+pub mod ingest_manifest;
+pub mod ingest_reconcile;
 pub mod lessons;
 pub mod lessons_extraction;
 pub mod metric_integrity;
@@ -1658,6 +1660,9 @@ pub enum Commands {
     /// Import data from external sources
     #[command(subcommand)]
     Import(ImportCommand),
+    /// Staging reingest candidate-inventory and coverage tooling (plan v6 Stage C)
+    #[command(subcommand)]
+    Ingest(IngestCommand),
     /// Token usage, tool, and model analytics
     ///
     /// Subcommands: status, tokens, tools, models, rebuild, validate.
@@ -2348,6 +2353,58 @@ pub enum SourcesCommand {
         /// Output progress as JSON (implies non-interactive, for scripting)
         #[arg(long, visible_alias = "robot")]
         json: bool,
+    },
+}
+
+/// Subcommands for staging reingest candidate-inventory tooling (plan v6 Stage C).
+#[derive(Subcommand, Debug, Clone)]
+pub enum IngestCommand {
+    /// Enumerate connector-discovered sessions under explicit scan roots into a
+    /// sealed candidate manifest (JSONL), one line per stable session identity.
+    Manifest {
+        /// Root directory to scan (repeatable). No default-detection fallback:
+        /// all roots must be given explicitly. Either a plain path
+        /// (broadcast to every connector, back-compat) or
+        /// `<slug>:<path>` (d21: fed only to the connector registered
+        /// under that slug, e.g. `openclaw:/path/to/.openclaw`).
+        #[arg(long = "scan-root", required = true)]
+        scan_root: Vec<String>,
+
+        /// Raw-mirror directory associated with this manifest generation
+        /// (accepted for interface parity with plan C3; not yet consumed).
+        #[arg(long)]
+        mirror: PathBuf,
+
+        /// Output path for the manifest JSONL file.
+        #[arg(long)]
+        out: PathBuf,
+
+        /// d20: classify subagent transcripts as structurally excluded
+        /// (`exclude_reason = "subagent"`), mirroring the live indexer's
+        /// `CASS_SKIP_SUBAGENTS` opt-in. Default (flag absent): subagent
+        /// transcripts are eligible, matching production `cass index`'s
+        /// default ingestion behavior. The effective value is sealed into
+        /// the manifest header.
+        #[arg(long = "skip-subagents", default_value_t = false)]
+        skip_subagents: bool,
+    },
+    /// Reconcile a sealed manifest against a database: coverage (forward +
+    /// reverse anti-join), root-set attestation, and content conservation.
+    /// Exit 0 = closed; exit 1 = any discrepancy (each listed in the report).
+    /// The database is the top-level `--db` flag (global in this CLI), not a
+    /// subcommand flag -- `--db` is unconditionally lifted to the front of
+    /// the argument list by `normalize_args`, so a per-subcommand `--db`
+    /// field here would never receive a value.
+    Reconcile {
+        /// Path to a manifest JSONL file produced by `cass ingest manifest`.
+        #[arg(long)]
+        manifest: PathBuf,
+
+        /// Root-set truth file (one scan root per line) independent of the
+        /// manifest itself -- asserted equal to the manifest header's
+        /// scan-root attestation.
+        #[arg(long = "expected-roots")]
+        expected_roots: PathBuf,
     },
 }
 
@@ -8761,6 +8818,9 @@ async fn execute_cli(
                 Commands::Import(subcmd) => {
                     handle_import(subcmd, cli).await?;
                 }
+                Commands::Ingest(subcmd) => {
+                    run_ingest_command(subcmd, cli)?;
+                }
                 #[cfg(unix)]
                 Commands::Daemon {
                     socket,
@@ -8783,6 +8843,56 @@ async fn handle_import(cmd: ImportCommand, cli: &Cli) -> CliResult<()> {
         ImportCommand::Chatgpt { path, output_dir } => {
             let structured_format = cli.robot_format.or_else(robot_format_from_env);
             import_chatgpt_export(&path, output_dir.as_deref(), structured_format).await
+        }
+    }
+}
+
+fn run_ingest_command(cmd: IngestCommand, cli: &Cli) -> CliResult<()> {
+    match cmd {
+        IngestCommand::Manifest {
+            scan_root,
+            mirror,
+            out,
+            skip_subagents,
+        } => crate::ingest_manifest::run_manifest(crate::ingest_manifest::ManifestArgs {
+            scan_roots: scan_root,
+            mirror,
+            out,
+            skip_subagents,
+        })
+        .map_err(|error| CliError::unknown(error.to_string())),
+        IngestCommand::Reconcile {
+            manifest,
+            expected_roots,
+        } => {
+            let db = cli.db.clone().ok_or_else(|| {
+                CliError::usage(
+                    "cass ingest reconcile requires --db (the staging database to reconcile; \
+                     there is deliberately no fallback to the production data dir)",
+                    None,
+                )
+            })?;
+            let report = crate::ingest_reconcile::run_reconcile(crate::ingest_reconcile::ReconcileArgs {
+                manifest,
+                db,
+                expected_roots,
+            })
+            .map_err(|error| CliError::unknown(error.to_string()))?;
+            let report_json = serde_json::to_string_pretty(&report)
+                .map_err(|error| CliError::unknown(error.to_string()))?;
+            println!("{report_json}");
+            if report.is_closed() {
+                Ok(())
+            } else {
+                Err(CliError {
+                    code: 1,
+                    kind: "reconcile_discrepancy",
+                    message: "reconcile found coverage/content discrepancies (see report above)"
+                        .to_string(),
+                    hint: None,
+                    retryable: false,
+                })
+            }
         }
     }
 }
@@ -20561,6 +20671,7 @@ fn describe_command(cli: &Cli) -> String {
         #[cfg(unix)]
         Some(Commands::Daemon { .. }) => "daemon".to_string(),
         Some(Commands::Import(..)) => "import".to_string(),
+        Some(Commands::Ingest(..)) => "ingest".to_string(),
         Some(Commands::Analytics(..)) => "analytics".to_string(),
         None => "(default)".to_string(),
     }
@@ -86745,16 +86856,101 @@ fn index_stall_abort_threshold(
 /// fires. `CASS_INDEX_FINALIZE_ABORT_SECS=0` makes the finalize window
 /// report-only (never abort). The floor is the ordinary abort threshold, so
 /// this can only ever *lengthen* the finalize grace, never shorten it.
+///
+/// Default value (KU1, `reports/w1-artifacts/ku1-checkpoint-latency.md`):
+/// 20 rounds of 10万-row batch write + `wal_checkpoint(TRUNCATE)` on a staging
+/// DB copy measured p50=1324.5ms / p99=3147ms, i.e. p99×3 ≈ 9.4s — far below
+/// this constant. The formula's floor (never lower than the prior value) wins
+/// here on purpose: the #319 worst case this constant actually guards against
+/// (~1.1 GB / ~290k-frame WAL, slow Darwin fsync) is far larger than anything
+/// the KU1 drill's Linux/NVMe/sub-GB-WAL samples reproduce, so a same-machine
+/// measurement understates it. Re-measure and only then reconsider lowering
+/// this if a representative large-WAL/macOS sample ever becomes available.
+const INDEX_FINALIZE_ABORT_SECS_DEFAULT: u64 = 1800;
+
 fn index_finalize_abort_threshold(abort_threshold: Option<Duration>) -> Option<Duration> {
     let abort_threshold = abort_threshold?;
     let finalize_secs = dotenvy::var("CASS_INDEX_FINALIZE_ABORT_SECS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(1800);
+        .unwrap_or(INDEX_FINALIZE_ABORT_SECS_DEFAULT);
     if finalize_secs == 0 {
         return None;
     }
     Some(Duration::from_secs(finalize_secs).max(abort_threshold))
+}
+
+#[cfg(test)]
+mod indexer_finalize_abort_threshold_tests {
+    use super::*;
+    use serial_test::serial;
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.previous {
+                unsafe {
+                    std::env::set_var(self.key, value);
+                }
+            } else {
+                unsafe {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    fn clear_env(key: &'static str) -> EnvGuard {
+        let previous = dotenvy::var(key).ok();
+        unsafe {
+            std::env::remove_var(key);
+        }
+        EnvGuard { key, previous }
+    }
+
+    /// KU1 (`reports/w1-artifacts/ku1-checkpoint-latency.md`): 20 rounds of
+    /// 10万-row batch write + `wal_checkpoint(TRUNCATE)` on a `VACUUM INTO`
+    /// drill copy of the staging DB measured p50=1324.5ms / p99=3147ms.
+    const KU1_MEASURED_P99_MS: u64 = 3147;
+    const PRE_KU1_DEFAULT_SECS: u64 = 1800;
+
+    #[test]
+    #[serial]
+    fn default_threshold_hits_real_code_path_and_honors_ku1_floor() {
+        // Exercise the real function end-to-end (not the raw constant in
+        // isolation): env override unset, and an ordinary abort_threshold far
+        // below the finalize default, so the finalize floor is what actually
+        // determines the returned value.
+        let _guard = clear_env("CASS_INDEX_FINALIZE_ABORT_SECS");
+        let ordinary = Duration::from_secs(300);
+
+        let resolved = index_finalize_abort_threshold(Some(ordinary))
+            .expect("finalize threshold must be Some when abort_threshold is Some and env unset");
+
+        assert_eq!(
+            resolved,
+            Duration::from_secs(INDEX_FINALIZE_ABORT_SECS_DEFAULT),
+            "default finalize abort threshold must come from the real \
+             index_finalize_abort_threshold() code path, not a hardcoded literal"
+        );
+
+        // KU1 formula: threshold = measured p99 * 3, floored at the prior
+        // production value (never lowered — see the doc comment on
+        // INDEX_FINALIZE_ABORT_SECS_DEFAULT and the KU1 report).
+        let measured_p99_x3_secs = (KU1_MEASURED_P99_MS * 3) as f64 / 1000.0;
+        assert!(
+            (INDEX_FINALIZE_ABORT_SECS_DEFAULT as f64) >= measured_p99_x3_secs,
+            "threshold ({INDEX_FINALIZE_ABORT_SECS_DEFAULT}s) must be >= measured p99*3 ({measured_p99_x3_secs}s)"
+        );
+        assert!(
+            INDEX_FINALIZE_ABORT_SECS_DEFAULT >= PRE_KU1_DEFAULT_SECS,
+            "KU1 must never lower the finalize abort threshold below the prior production value"
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

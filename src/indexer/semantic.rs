@@ -618,6 +618,14 @@ struct CanonicalEmbeddingBatch {
     last_conversation_id: i64,
     total_conversations: u64,
     cursor_exhausted: bool,
+    /// Highest canonical message PK selected anywhere in this batch,
+    /// paired with the conversation it came from. Message ids are NOT
+    /// monotonic with conversation ids (a conversation can keep
+    /// receiving new messages, with fresh ids, long after later
+    /// conversations already exist), so this pair must travel together
+    /// — see `fetch_canonical_embedding_batch_inner`'s doc comment.
+    raw_max_message_id: Option<i64>,
+    raw_max_message_id_conversation_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -988,7 +996,13 @@ fn fetch_canonical_embedding_batch(
     after_conversation_id: i64,
     max_conversations: usize,
 ) -> Result<CanonicalEmbeddingBatch> {
-    fetch_canonical_embedding_batch_inner(storage, after_conversation_id, max_conversations, None)
+    fetch_canonical_embedding_batch_inner(
+        storage,
+        after_conversation_id,
+        max_conversations,
+        None,
+        None,
+    )
 }
 
 /// Variant of [`fetch_canonical_embedding_batch`] that additionally
@@ -996,17 +1010,33 @@ fn fetch_canonical_embedding_batch(
 /// when set. This is how sub-fix 2 (`last_message_id` cursor) enforces
 /// the "resume MUST advance past `last_message_id`" rule on a partially
 /// embedded conversation.
+///
+/// `after_message_id_conversation_id` pairs the cursor with the single
+/// conversation it was captured from (see doc comment on
+/// `CanonicalEmbeddingBatch::raw_max_message_id_conversation_id`). The
+/// floor is applied ONLY to that conversation's candidacy/messages;
+/// every other conversation in the fetched range is evaluated on
+/// whole-conversation-candidate rules, unaffected by the cursor. A
+/// `None` conversation id (legacy checkpoint, or no prior cursor)
+/// disables the floor entirely rather than defaulting to a global
+/// filter (bead w1c-C5-B1: the previous unscoped floor could exclude
+/// every conversation whose messages happen to sit below the cursor's
+/// conversation, when that conversation's message ids are not
+/// monotonic with its conversation id — e.g. a long-lived conversation
+/// repeatedly appended to across many later ingest passes).
 fn fetch_canonical_embedding_batch_inner(
     storage: &FrankenStorage,
     after_conversation_id: i64,
     max_conversations: usize,
     after_message_id: Option<i64>,
+    after_message_id_conversation_id: Option<i64>,
 ) -> Result<CanonicalEmbeddingBatch> {
     fetch_canonical_embedding_batch_inner_with_caps(
         storage,
         after_conversation_id,
         max_conversations,
         after_message_id,
+        after_message_id_conversation_id,
         SemanticCheckpointCaps::unlimited(),
     )
 }
@@ -1016,6 +1046,7 @@ fn fetch_canonical_embedding_batch_inner_with_caps(
     after_conversation_id: i64,
     max_conversations: usize,
     after_message_id: Option<i64>,
+    after_message_id_conversation_id: Option<i64>,
     caps: SemanticCheckpointCaps,
 ) -> Result<CanonicalEmbeddingBatch> {
     let total_conversations = total_semantic_conversations(storage)?;
@@ -1026,11 +1057,24 @@ fn fetch_canonical_embedding_batch_inner_with_caps(
         ParamValue::from(after_conversation_id),
         ParamValue::from(query_limit_i64),
     ];
-    let message_cursor_predicate = if let Some(after_message_id) = after_message_id {
-        params.push(ParamValue::from(after_message_id));
-        " AND id > ?3"
-    } else {
-        ""
+    // The message-id floor only ever meant to constrain the single
+    // conversation it was captured from (see doc comment on the
+    // function above). Pairing both the message-id and the owning
+    // conversation-id lets us scope the SQL predicate to exactly that
+    // conversation via `conversation_id != ?4 OR id > ?3`: every other
+    // conversation's `EXISTS` check degenerates to "has any message"
+    // (unaffected), while the paired conversation still enforces the
+    // floor if it were ever re-examined. A bare `after_message_id`
+    // with no paired conversation id is intentionally NOT applied —
+    // silently defaulting to a global floor is exactly the bug this
+    // scoping fixes.
+    let message_cursor_predicate = match (after_message_id, after_message_id_conversation_id) {
+        (Some(after_message_id), Some(scoped_conversation_id)) => {
+            params.push(ParamValue::from(after_message_id));
+            params.push(ParamValue::from(scoped_conversation_id));
+            " AND (conversation_id != ?4 OR id > ?3)"
+        }
+        _ => "",
     };
     let hinted_sql = format!(
         "SELECT c.id
@@ -1083,6 +1127,8 @@ fn fetch_canonical_embedding_batch_inner_with_caps(
             last_conversation_id: after_conversation_id,
             total_conversations,
             cursor_exhausted: true,
+            raw_max_message_id: None,
+            raw_max_message_id_conversation_id: None,
         });
     }
 
@@ -1103,8 +1149,27 @@ fn fetch_canonical_embedding_batch_inner_with_caps(
         conversations,
         &mut grouped_messages,
         after_message_id,
+        after_message_id_conversation_id,
         caps,
     );
+
+    // Compute the paired (max message id, owning conversation id) from
+    // the messages we are actually about to embed, before the packet
+    // build below consumes `grouped_messages`. This is what the next
+    // checkpoint's scoped floor will pair with.
+    let mut raw_max_message_id: Option<i64> = None;
+    let mut raw_max_message_id_conversation_id: Option<i64> = None;
+    for conversation in &conversations {
+        if let Some(messages) = grouped_messages.get(&conversation.conversation_id) {
+            if let Some(conversation_max) = messages.iter().filter_map(|m| m.id).max()
+                && raw_max_message_id.is_none_or(|current| conversation_max > current)
+            {
+                raw_max_message_id = Some(conversation_max);
+                raw_max_message_id_conversation_id = Some(conversation.conversation_id);
+            }
+        }
+    }
+
     let (inputs, _) = packet_embedding_inputs_from_materialized_canonical_messages(
         &conversations,
         &mut grouped_messages,
@@ -1130,6 +1195,8 @@ fn fetch_canonical_embedding_batch_inner_with_caps(
         last_conversation_id: last_conversation_id.unwrap_or(after_conversation_id),
         total_conversations,
         cursor_exhausted,
+        raw_max_message_id,
+        raw_max_message_id_conversation_id,
     })
 }
 
@@ -1143,6 +1210,7 @@ fn select_checkpoint_capped_conversations(
     conversations: Vec<CanonicalEmbeddingConversationRow>,
     grouped_messages: &mut HashMap<i64, Vec<Message>>,
     after_message_id: Option<i64>,
+    after_message_id_conversation_id: Option<i64>,
     caps: SemanticCheckpointCaps,
 ) -> CheckpointCappedSelection {
     let mut selected = Vec::new();
@@ -1155,7 +1223,16 @@ fn select_checkpoint_capped_conversations(
         let mut messages = grouped_messages
             .remove(&conversation.conversation_id)
             .unwrap_or_default();
-        if let Some(min_exclusive) = after_message_id {
+        // Scoped floor: only the conversation the cursor was captured
+        // from is filtered by it. Every other conversation's messages
+        // are evaluated in full — a conversation elsewhere in the
+        // corpus having low message ids (because it hasn't been
+        // touched by a later ingest pass) is not evidence it was
+        // already embedded.
+        if let (Some(min_exclusive), Some(scoped_conversation_id)) =
+            (after_message_id, after_message_id_conversation_id)
+            && conversation.conversation_id == scoped_conversation_id
+        {
             messages.retain(|message| message.id.is_some_and(|id| id > min_exclusive));
         }
         if messages.is_empty() {
@@ -2101,15 +2178,18 @@ impl SemanticIndexer {
             manifest,
             plan,
             None,
+            None,
             &SemanticProgressSink::disabled(),
         )
     }
 
     /// Variant of [`run_backfill_batch`] that emits semantic progress
     /// events to the given JSONL sink and persists `last_message_id`
-    /// into the resumable checkpoint when supplied. The sink is silent
-    /// unless `CASS_SEMANTIC_PROGRESS_JSONL` is set, so this path is
-    /// safe to take in production.
+    /// (paired with `last_message_id_conversation_id`, the single
+    /// conversation it was captured from) into the resumable
+    /// checkpoint when supplied. The sink is silent unless
+    /// `CASS_SEMANTIC_PROGRESS_JSONL` is set, so this path is safe to
+    /// take in production.
     pub fn run_backfill_batch_with_sink(
         &self,
         messages: &[EmbeddingInput],
@@ -2117,6 +2197,7 @@ impl SemanticIndexer {
         manifest: &mut SemanticManifest,
         plan: SemanticBackfillBatchPlan,
         last_message_id: Option<i64>,
+        last_message_id_conversation_id: Option<i64>,
         sink: &SemanticProgressSink,
     ) -> Result<SemanticBackfillBatchOutcome> {
         if plan.db_fingerprint.trim().is_empty() {
@@ -2279,12 +2360,17 @@ impl SemanticIndexer {
                     },
                 );
             }
-            // Preserve any existing `last_message_id` cursor when the
-            // caller did not supply a fresher one — see sub-fix 2 for
-            // why durable message-PK resume matters.
+            // Preserve any existing `last_message_id` cursor (and its
+            // paired conversation id — the two must never separate,
+            // see sub-fix 2 / the scoped-floor doc comment on
+            // `CanonicalEmbeddingBatch`) when the caller did not supply
+            // a fresher one.
             let prior_last_message_id = prior_checkpoint
                 .as_ref()
                 .and_then(|checkpoint| checkpoint.last_message_id);
+            let prior_last_message_id_conversation_id = prior_checkpoint
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.last_message_id_conversation_id);
             manifest.save_checkpoint(BuildCheckpoint {
                 tier: plan.tier,
                 embedder_id: self.embedder_id().to_string(),
@@ -2297,6 +2383,8 @@ impl SemanticIndexer {
                 chunking_version: CHUNKING_STRATEGY_VERSION,
                 saved_at_ms: now_ms(),
                 last_message_id: last_message_id.or(prior_last_message_id),
+                last_message_id_conversation_id: last_message_id_conversation_id
+                    .or(prior_last_message_id_conversation_id),
                 cursor_exhausted: plan.cursor_exhausted,
             });
             manifest.save(data_dir)?;
@@ -2407,6 +2495,8 @@ impl SemanticIndexer {
         let after_conversation_id = prior_checkpoint.map_or(0, |checkpoint| checkpoint.last_offset);
         let prior_last_message_id =
             prior_checkpoint.and_then(|checkpoint| checkpoint.last_message_id);
+        let prior_last_message_id_conversation_id =
+            prior_checkpoint.and_then(|checkpoint| checkpoint.last_message_id_conversation_id);
 
         if sink.is_active() {
             sink.emit(
@@ -2426,6 +2516,7 @@ impl SemanticIndexer {
             after_conversation_id,
             plan.max_conversations,
             prior_last_message_id,
+            prior_last_message_id_conversation_id,
             caps,
         ) {
             Ok(batch) => batch,
@@ -2499,20 +2590,22 @@ impl SemanticIndexer {
             );
         }
 
-        // Compute the freshest `last_message_id` from the inputs we are
-        // about to embed. EmbeddingInput.message_id is u64 (canonical
-        // message PK); we coerce to i64 since the manifest stores i64.
-        let batch_last_message_id = batch
-            .inputs
-            .iter()
-            .map(|input| i64::try_from(input.message_id).unwrap_or(i64::MAX))
-            .max();
-        let next_last_message_id = match (prior_last_message_id, batch_last_message_id) {
-            (Some(prior), Some(batch_max)) => Some(prior.max(batch_max)),
-            (Some(prior), None) => Some(prior),
-            (None, Some(batch_max)) => Some(batch_max),
-            (None, None) => None,
-        };
+        // Carry forward whichever of (prior checkpoint, this batch) has
+        // the higher message id, keeping it paired with the
+        // conversation it came from — never a bare max across
+        // unrelated conversations (see `CanonicalEmbeddingBatch`'s doc
+        // comment on `raw_max_message_id_conversation_id`).
+        let (next_last_message_id, next_last_message_id_conversation_id) =
+            match (prior_last_message_id, batch.raw_max_message_id) {
+                (Some(prior), Some(batch_max)) if batch_max > prior => {
+                    (Some(batch_max), batch.raw_max_message_id_conversation_id)
+                }
+                (Some(prior), _) => (Some(prior), prior_last_message_id_conversation_id),
+                (None, Some(batch_max)) => {
+                    (Some(batch_max), batch.raw_max_message_id_conversation_id)
+                }
+                (None, None) => (None, None),
+            };
 
         let outcome = self.run_backfill_batch_with_sink(
             &batch.inputs,
@@ -2528,6 +2621,7 @@ impl SemanticIndexer {
                 cursor_exhausted: batch.cursor_exhausted,
             },
             next_last_message_id,
+            next_last_message_id_conversation_id,
             sink,
         );
 
@@ -3765,8 +3859,12 @@ mod tests {
         Ok(())
     }
 
+    /// The message-id floor, when paired with the conversation it was
+    /// captured from, still does its original job: resuming past
+    /// messages already embedded for THAT conversation.
     #[test]
-    fn canonical_embedding_batch_pushes_last_message_id_filter_into_selection() -> Result<()> {
+    fn canonical_embedding_batch_scoped_message_id_filter_applies_to_its_own_conversation()
+    -> Result<()> {
         let temp = tempdir().unwrap();
         let db_path = temp.path().join("agent_search.db");
         let storage = FrankenStorage::open(&db_path)?;
@@ -3780,26 +3878,78 @@ mod tests {
         storage.insert_conversation_tree(
             agent_id,
             None,
-            &test_conversation("before-watermark", "old semantic message"),
+            &test_conversation_with_messages(
+                "before-watermark",
+                vec![Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: None,
+                    created_at: Some(1_700_000_000_500),
+                    content: "old semantic message".to_string(),
+                    extra_json: json!({}),
+                    snippets: Vec::new(),
+                }],
+            ),
+        )?;
+        let watermark_conversation_id: i64 = storage.raw().query_row_map(
+            "SELECT id FROM conversations WHERE external_id = 'before-watermark'",
+            &[] as &[ParamValue],
+            |row| row.get_typed(0),
         )?;
         let watermark: i64 = storage.raw().query_row_map(
             "SELECT MAX(id) FROM messages",
             &[] as &[ParamValue],
             |row| row.get_typed(0),
         )?;
+        // A later batch that revisited the SAME conversation and staged
+        // a newer message onto it (idx 1) is the only realistic way
+        // `last_message_id` and `last_offset` end up pointing at the
+        // same conversation in production — model that directly rather
+        // than a second, unrelated conversation.
         storage.insert_conversation_tree(
             agent_id,
             None,
-            &test_conversation("after-watermark", "new semantic message"),
+            &test_conversation_with_messages(
+                "before-watermark",
+                vec![
+                    Message {
+                        id: None,
+                        idx: 0,
+                        role: MessageRole::User,
+                        author: None,
+                        created_at: Some(1_700_000_000_500),
+                        content: "old semantic message".to_string(),
+                        extra_json: json!({}),
+                        snippets: Vec::new(),
+                    },
+                    Message {
+                        id: None,
+                        idx: 1,
+                        role: MessageRole::Agent,
+                        author: None,
+                        created_at: Some(1_700_000_000_600),
+                        content: "new semantic message".to_string(),
+                        extra_json: json!({}),
+                        snippets: Vec::new(),
+                    },
+                ],
+            ),
         )?;
 
-        let batch = fetch_canonical_embedding_batch_inner(&storage, 0, 8, Some(watermark))?;
+        let batch = fetch_canonical_embedding_batch_inner(
+            &storage,
+            0,
+            8,
+            Some(watermark),
+            Some(watermark_conversation_id),
+        )?;
 
         assert_eq!(
             batch.conversations_in_batch, 1,
-            "last_message_id must be pushed into candidate selection so old conversations are not counted in the batch"
+            "the paired conversation's already-embedded message must not be re-selected"
         );
-        assert_eq!(batch.total_conversations, 2);
+        assert_eq!(batch.total_conversations, 1);
         anyhow::ensure!(
             batch.cursor_exhausted,
             "message-cursor selection should exhaust the remaining cursor"
@@ -3809,6 +3959,224 @@ mod tests {
         assert!(
             i64::try_from(batch.inputs[0].message_id).unwrap_or(i64::MAX) > watermark,
             "selected semantic input must be strictly newer than the checkpoint message id"
+        );
+        Ok(())
+    }
+
+    /// w1c-C5-B1 regression fixture: a message-id floor captured from
+    /// one long-lived conversation (repeatedly appended to across many
+    /// later ingest passes, so its message ids sprawl far past
+    /// conversations created after it) must NOT strand sibling
+    /// conversations whose own message ids happen to sit below that
+    /// floor. This reproduces the exact shape observed in staging:
+    /// conversation 224 spanned message ids 17501..1192932, and the
+    /// next checkpoint round silently dropped conversations 225..4611
+    /// because the old code applied that floor globally.
+    #[test]
+    fn canonical_embedding_batch_message_id_floor_does_not_strand_sibling_conversations()
+    -> Result<()> {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path)?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".to_string(),
+            name: "Codex".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+
+        // Conversation 1: created first (low conversation id), one
+        // early message (low message id). Uses
+        // `test_conversation_with_messages` (not `test_conversation`)
+        // so its source_id matches the later append below — canonical
+        // identity is keyed by (source_id, agent_id, external_id), and
+        // a mismatched source_id would spawn a second conversation
+        // instead of appending to this one.
+        storage.insert_conversation_tree(
+            agent_id,
+            None,
+            &test_conversation_with_messages(
+                "long-lived",
+                vec![Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: None,
+                    created_at: Some(1_700_000_000_500),
+                    content: "long-lived first message".to_string(),
+                    extra_json: json!({}),
+                    snippets: Vec::new(),
+                }],
+            ),
+        )?;
+        let long_lived_conversation_id: i64 = storage.raw().query_row_map(
+            "SELECT id FROM conversations WHERE external_id = 'long-lived'",
+            &[] as &[ParamValue],
+            |row| row.get_typed(0),
+        )?;
+
+        // Two ordinary sibling conversations created next, each with
+        // one message — moderate message ids, both below where the
+        // long-lived conversation's next message will land.
+        storage.insert_conversation_tree(
+            agent_id,
+            None,
+            &test_conversation("sibling-a", "sibling a message"),
+        )?;
+        storage.insert_conversation_tree(
+            agent_id,
+            None,
+            &test_conversation("sibling-b", "sibling b message"),
+        )?;
+
+        // The long-lived conversation gets revisited by a later ingest
+        // pass and appended to — its new message gets the highest
+        // message id in the whole corpus despite being conversation 1.
+        storage.insert_conversation_tree(
+            agent_id,
+            None,
+            &test_conversation_with_messages(
+                "long-lived",
+                vec![
+                    Message {
+                        id: None,
+                        idx: 0,
+                        role: MessageRole::User,
+                        author: None,
+                        created_at: Some(1_700_000_000_500),
+                        content: "long-lived first message".to_string(),
+                        extra_json: json!({}),
+                        snippets: Vec::new(),
+                    },
+                    Message {
+                        id: None,
+                        idx: 1,
+                        role: MessageRole::Agent,
+                        author: None,
+                        created_at: Some(1_900_000_000_600),
+                        content: "long-lived much later message".to_string(),
+                        extra_json: json!({}),
+                        snippets: Vec::new(),
+                    },
+                ],
+            ),
+        )?;
+        let long_lived_max_message_id: i64 = storage.raw().query_row_map(
+            "SELECT MAX(id) FROM messages",
+            &[] as &[ParamValue],
+            |row| row.get_typed(0),
+        )?;
+
+        // Round 1: process just the long-lived conversation (as the
+        // real backfill loop would with `--batch-conversations 1`),
+        // capturing the checkpoint pairing a caller would persist.
+        let round1 = fetch_canonical_embedding_batch_inner_with_caps(
+            &storage,
+            0,
+            1,
+            None,
+            None,
+            SemanticCheckpointCaps::unlimited(),
+        )?;
+        assert_eq!(round1.last_conversation_id, long_lived_conversation_id);
+        assert_eq!(
+            round1.raw_max_message_id,
+            Some(long_lived_max_message_id),
+            "batch must report the paired max message id it actually selected"
+        );
+        assert_eq!(
+            round1.raw_max_message_id_conversation_id,
+            Some(long_lived_conversation_id),
+            "the paired max message id must be attributed to the conversation it came from"
+        );
+
+        // Round 2: resume using round 1's checkpoint pairing. The two
+        // sibling conversations — never touched before, with message
+        // ids well below the floor — must still be selected in full.
+        let round2 = fetch_canonical_embedding_batch_inner_with_caps(
+            &storage,
+            round1.last_conversation_id,
+            8,
+            round1.raw_max_message_id,
+            round1.raw_max_message_id_conversation_id,
+            SemanticCheckpointCaps::unlimited(),
+        )?;
+
+        assert_eq!(
+            round2.conversations_in_batch, 2,
+            "both sibling conversations must survive resume; the long-lived conversation's \
+             message-id floor must not leak onto conversations it was never captured from"
+        );
+        assert_eq!(round2.inputs.len(), 2);
+        let sibling_contents: std::collections::BTreeSet<&str> = round2
+            .inputs
+            .iter()
+            .map(|input| input.content.as_str())
+            .collect();
+        assert!(sibling_contents.contains("sibling a message"));
+        assert!(sibling_contents.contains("sibling b message"));
+        anyhow::ensure!(
+            round2.cursor_exhausted,
+            "both siblings fitting under an unlimited cap should exhaust the cursor"
+        );
+        Ok(())
+    }
+
+    /// Old checkpoints (pre-w1c-C5-B1, or hand-edited manifests) carry
+    /// `last_message_id` without the new paired
+    /// `last_message_id_conversation_id`. Compatibility contract: an
+    /// unpaired message-id floor applies NO filtering at all, never
+    /// falling back to the old global-floor behavior — a few messages
+    /// getting harmlessly re-embedded (memoized/idempotent) is the
+    /// correct trade against silently stranding whole conversations.
+    #[test]
+    fn canonical_embedding_batch_unpaired_message_id_floor_applies_no_filter() -> Result<()> {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path)?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".to_string(),
+            name: "Codex".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        storage.insert_conversation_tree(
+            agent_id,
+            None,
+            &test_conversation("unpaired-a", "unpaired a message"),
+        )?;
+        storage.insert_conversation_tree(
+            agent_id,
+            None,
+            &test_conversation("unpaired-b", "unpaired b message"),
+        )?;
+        let high_watermark: i64 = storage.raw().query_row_map(
+            "SELECT MAX(id) FROM messages",
+            &[] as &[ParamValue],
+            |row| row.get_typed(0),
+        )?;
+
+        // A floor at (or above) every existing message id, but with no
+        // paired conversation — simulating a pre-fix checkpoint.
+        let batch = fetch_canonical_embedding_batch_inner(
+            &storage,
+            0,
+            8,
+            Some(high_watermark),
+            None,
+        )?;
+
+        assert_eq!(
+            batch.conversations_in_batch, 2,
+            "an unpaired message-id floor must not exclude any conversation"
+        );
+        assert_eq!(
+            batch.inputs.len(),
+            2,
+            "an unpaired message-id floor must not filter out any message, \
+             even ones at or below the floor value"
         );
         Ok(())
     }
@@ -3836,7 +4204,7 @@ mod tests {
             &test_conversation("limit-second", "second limit semantic message"),
         )?;
 
-        let first = fetch_canonical_embedding_batch_inner(&storage, 0, 1, None)?;
+        let first = fetch_canonical_embedding_batch_inner(&storage, 0, 1, None, None)?;
         anyhow::ensure!(
             first.conversations_in_batch == 1,
             "wanted first batch to select 1 conversation, got {}",
@@ -3847,8 +4215,13 @@ mod tests {
             "over-fetching one candidate should prove another conversation remains"
         );
 
-        let second =
-            fetch_canonical_embedding_batch_inner(&storage, first.last_conversation_id, 1, None)?;
+        let second = fetch_canonical_embedding_batch_inner(
+            &storage,
+            first.last_conversation_id,
+            1,
+            None,
+            None,
+        )?;
         anyhow::ensure!(
             second.conversations_in_batch == 1,
             "wanted second batch to select 1 conversation, got {}",
@@ -3914,6 +4287,7 @@ mod tests {
             &storage,
             0,
             8,
+            None,
             None,
             SemanticCheckpointCaps {
                 max_messages: 3,

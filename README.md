@@ -2983,7 +2983,7 @@ Update check state is stored in the data directory:
 | Dependency | Pinned source |
 |------------|-----------------|
 | `frankensqlite` / `fsqlite-types` | `=0.1.11` (crates.io; #95 BtCursor + #106 MVCC grow + FTS5 shadow-table persistence/lazy-reopen + MAX/MIN(rowid) leaf-seek + 0.1.11 FTS5 merge/finalize O(N²)→O(N) spin fix [cass#301] + composite-UNIQUE FK INSERT [#116] + correlated NOT EXISTS planner [#117] fixes) — **w1b Task B8**: both now `[dev-dependencies]`-only. The franken backend was cass's storage engine through Stage A; Stage B retired it in favor of `rusqlite` below, and the only remaining consumer is `tests/frankensqlite_compat_gates.rs`. Full removal is a wave-2 item once that gate migrates. |
-| `franken-agent-detection` | `068f423` (fork: ivanfuland/my_franken_agent_detection, connector-storage-contract) |
+| `franken-agent-detection` | `6be142d` (fork: ivanfuland/my_franken_agent_detection, fix/codex-legacy-token-count-shape) |
 | `asupersync` | `=0.3.5` |
 | `frankensearch` | `2cad158f` |
 | `frankentui` | `5f78cfa0` |
