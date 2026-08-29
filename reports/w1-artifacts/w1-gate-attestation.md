@@ -224,3 +224,38 @@ cass --db .../agent_search.db ingest reconcile \
 候选 HEAD：`e0facad3`（含本门自查自修的编译回归修复）。仅 commit 未 push；
 PR `feat/w1c-reingest-staging → feat/sqlite-consolidation` 由控制面操办
 （隐私三面扫 → Ivan 过目 bytes → draft → 门绿转 ready → Ivan merge）。
+
+## 门④ content_mismatch 定性（R1 审后补强）
+
+> 执行面：cass-sql-exec23，2026-08-29。承接 R1 对抗审（6 commit 修复）+ B1 双探针
+> （exec22）+ 本节的 R1-B10 修复与 eligibility 机制续查（exec23）。
+
+C8 密封时门④只卡 missing/unexpected 两个判据（`content_mismatch=1739` 延续既有
+"窗口漂移"分类，未定性）。R1 对抗审后的 B1 探针（exec22）用三方 digest 对比确认
+`content_mismatch` 里"同计数异 digest"的 306 条子桶根因是 manifest 工具漏做生产
+路径的脱敏（立案 R1-B10），"manifest>db"的 1431 条大桶模式成立但排除谓词未指认到
+（circumstantial）。exec23 完成 R1-B10 修复并续查 eligibility 机制，完整定性收口
+见独立报告 `reports/w1-artifacts/w1c-mismatch-disposition.md`：
+
+- **R1-B10 修复**（commit `ff724535`）：manifest `content_digest` 现与生产索引
+  持久化路径用同一份 `redact_secrets::redact_text` 计算。三元组
+  `21/0/1739 → 21/0/1738 → 21/0/1432`；306 条同计数异 digest 桶精确坍缩为 0，
+  37 条分层抽样里的 15 条 UNRESOLVED 样本 15/15 闭环解决，22 条 eligibility 样本
+  22/22 不受影响（符合预期）。
+- **eligibility 桶（manifest>db，1431 条）定性升级**：从"机制未指认
+  （circumstantial）"升级为"已证"——`src/storage/sqlite.rs`
+  `collect_new_messages_for_existing_conversation` 的 replay-fingerprint 去重
+  （防 codex 恢复/重放场景把同一段历史当新消息重复写入），非数据丢失、非索引
+  缺陷。真实 staging 数据里最大 gap 会话（codex，manifest 86544 vs db 81681）
+  抽取 3 处空洞消息逐条验证，3/3 命中"与紧邻更早 idx 的 content_hash/role/
+  author/created_at 完全一致"。代码未改动（既有设计行为，非缺陷，不在本次
+  R1 修复范围内）。
+
+**content_mismatch 从 1739 收敛到 1432，剩余全部落在已定性、非缺陷的 eligibility
+桶（1431 条）与 1 条已解释的自扫描 `db_ahead` 窗口漂移 artifact（详见 disposition
+报告 §4 附记）。门④对 content_mismatch 判据的定性收口完成，missing/unexpected
+两项判据结论不变（PASS）。**
+
+修订时间：2026-08-29。修订原因：R1 对抗审发现 manifest 工具存在脱敏对齐缺陷
+（R1-B10），C8 密封时未定性的 content_mismatch 需要在修复落地后重新给出有证据的
+定性，替代原先"延续 C3 分类"的占位记录。
