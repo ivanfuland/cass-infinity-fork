@@ -101,6 +101,17 @@ CKPT_PID=$!
 wait $SEARCHER_PIDS 2>/dev/null
 wait "$CKPT_PID" 2>/dev/null
 
+# R1-B7(a): record whether the writer was still alive right up to the end
+# of the window -- captured *before* we kill it, so a writer that silently
+# died mid-drill (and would otherwise look identical to "ran the whole
+# time, now being stopped on schedule") gets caught instead of assumed.
+if kill -0 "$WRITER_PID" 2>/dev/null; then
+  writer_alive_at_end=1
+else
+  writer_alive_at_end=0
+fi
+echo "writer_alive_at_end=${writer_alive_at_end}" >> "$OUT_DIR/drill-meta.log"
+
 # Writer runs forever in --watch mode; stop it now that the window is over.
 kill "$WRITER_PID" 2>/dev/null
 wait "$WRITER_PID" 2>/dev/null
@@ -135,3 +146,27 @@ ok_count=$(awk -F'\t' 'NR>1 && $5==0' "$OUT_DIR/searcher-results.tsv" | wc -l)
     echo "busy_timeout_ratio=n/a"
   fi
 } | tee "$OUT_DIR/classification-summary.txt"
+
+# R1-B7(b): the writer must have actually done something during the window,
+# not just sat there idle. `--json` mode on this CLI puts its NDJSON
+# lifecycle/progress events on *stderr*, not stdout (confirmed against a
+# real 30-minute run: writer.stdout.ndjson was 0 bytes while
+# writer.stderr.log carried 1028 progress-event lines) -- `--no-progress-events`
+# is documented as suppressing "NDJSON progress events on stderr", which is
+# the tell. Counting stdout here would always read 0 and fail every future
+# run regardless of how healthy the writer was, so this counts stderr.
+writer_event_count=$(grep -c '"event"' "$OUT_DIR/writer.stderr.log" 2>/dev/null || echo 0)
+{
+  echo "writer_alive_at_end=${writer_alive_at_end}"
+  echo "writer_event_count=${writer_event_count}"
+} | tee -a "$OUT_DIR/classification-summary.txt"
+
+# R1-B6/B7: fail the drill if any judgment criterion is unmet -- panics,
+# unmapped errors, search timeouts, a writer that died before the window
+# ended, or a writer that produced no observable activity at all.
+if [ "$panic_count" -gt 0 ] || [ "$unmapped_count" -gt 0 ] || [ "$timeout_count" -gt 0 ] \
+  || [ "$writer_alive_at_end" -eq 0 ] || [ "$writer_event_count" -eq 0 ]; then
+  echo "DRILL FAILED: see classification-summary.txt and drill-meta.log for which criterion" >&2
+  exit 1
+fi
+exit 0
