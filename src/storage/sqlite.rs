@@ -16747,16 +16747,24 @@ mod tests {
     /// full cross-path comparison is left as a documented gap, not silently
     /// dropped.
     #[test]
+    #[serial]
     fn conversation_crossing_lexical_cap_truncates_and_clears_correctly_across_append() {
         use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
         use std::path::PathBuf;
 
         const CAP_ENV: &str = "CASS_LEXICAL_MAX_CONVERSATION_CONTENT_BYTES";
-        // SAFETY-ish: process-global env var, but this test does not run
-        // concurrently with another test reading the same var within this
-        // process (no other test sets `CAP_ENV`), and it is restored before
-        // returning (including on panic, via a drop guard) so later tests in
-        // the same process see the compiled-in default again.
+        // w2 F5 fix: the previous comment here claimed "no other test sets
+        // `CAP_ENV`" -- false. `fetch_messages_for_lexical_rebuild_
+        // truncates_oversized_conversation_content` (below, in this same
+        // file) also sets this exact process-global env var, to a different
+        // value ("1024" vs this test's "100"), without any coordination.
+        // Under `cargo test`'s default parallel execution the two could
+        // interleave and each observe the other's value mid-run, producing
+        // a nondeterministic truncation boundary. `#[serial]` on both tests
+        // (this crate's existing serialization mechanism -- no new
+        // dependency) is what actually prevents that race; this guard alone
+        // only restores the var on unwind, it does not exclude concurrent
+        // readers/writers.
         struct EnvGuard;
         impl Drop for EnvGuard {
             fn drop(&mut self) {
@@ -17320,13 +17328,25 @@ mod tests {
 
     /// #290: a conversation whose content exceeds the cap is admitted through the
     /// lexical-rebuild fetch with truncated content, not OOM-quarantined.
+    ///
+    /// w2 F5 fix: `#[serial]` -- this test and
+    /// `conversation_crossing_lexical_cap_truncates_and_clears_correctly_across_append`
+    /// (above, in this same file) both set the same process-global
+    /// `CASS_LEXICAL_MAX_CONVERSATION_CONTENT_BYTES` env var to different
+    /// values ("1024" here, "100" there) with no coordination between them;
+    /// under default parallel test execution either could observe the
+    /// other's value mid-run. `#[serial]` on both is this crate's existing
+    /// mechanism for exactly this kind of process-env race (no new
+    /// dependency introduced).
     #[test]
+    #[serial]
     fn fetch_messages_for_lexical_rebuild_truncates_oversized_conversation_content() {
         use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
         use std::path::PathBuf;
 
         // Force a small, deterministic cap independent of host memory.
-        // SAFETY: single-threaded test; the env var is read on each fetch call.
+        // SAFETY: `#[serial]` above excludes concurrent readers/writers of
+        // this env var; the value is read on each fetch call.
         unsafe {
             std::env::set_var("CASS_LEXICAL_MAX_CONVERSATION_CONTENT_BYTES", "1024");
         }
