@@ -237,3 +237,39 @@ fn reconcile_exits_nonzero_and_lists_every_discrepancy_class() {
             .all(|m| m["identity_key"] != "claude_code||session-a.jsonl")
     );
 }
+
+#[test]
+fn root_set_ok_ignores_duplicate_roots_on_either_side() {
+    // R1-N3: passing the same --scan-root twice at manifest-generation time
+    // (a duplicated header entry) must still reconcile true against an
+    // --expected-roots file that lists the same root only once, and vice
+    // versa -- root-set equality is a set comparison, not a multiset one.
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("agent_search.db");
+    FrankenStorage::open(&db_path).expect("open fixture db");
+
+    let manifest_path = tmp.path().join("manifest.jsonl");
+    write_manifest(&manifest_path, &["/fixture", "/fixture"], &[]);
+
+    let roots_path = tmp.path().join("roots.txt");
+    fs::write(&roots_path, "/fixture\n").unwrap();
+
+    let mut cmd = base_cmd();
+    cmd.args([
+        "ingest",
+        "reconcile",
+        "--manifest",
+        manifest_path.to_str().unwrap(),
+        "--db",
+        db_path.to_str().unwrap(),
+        "--expected-roots",
+        roots_path.to_str().unwrap(),
+    ]);
+    let assertion = cmd.assert().success();
+    let output = assertion.get_output();
+    let report: Value = serde_json::from_slice(&output.stdout).expect("reconcile report is JSON");
+    assert_eq!(
+        report["root_set_ok"], true,
+        "duplicate root on the manifest side must not fail root-set equality: {report}"
+    );
+}

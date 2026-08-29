@@ -97,9 +97,11 @@ pub fn run_reconcile(args: ReconcileArgs) -> Result<ReconcileReport> {
         .map(str::to_string)
         .collect();
     expected_roots.sort();
+    expected_roots.dedup();
 
     let mut manifest_scan_roots = header.scan_roots.clone();
     manifest_scan_roots.sort();
+    manifest_scan_roots.dedup();
     let root_set_ok = manifest_scan_roots == expected_roots;
 
     // Eligible-only: excluded (eligible=false) entries are a legal terminal
