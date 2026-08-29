@@ -27196,6 +27196,24 @@ pub mod persist {
             }
         }
 
+        /// F1 regression: forces `key` to be *unset* for the guard's
+        /// lifetime (under the same ENV_LOCK as `set_env`), so a test can
+        /// assert default-hot-path behavior without racing a sibling test
+        /// that happens to set the same key to a non-default value.
+        fn unset_env(key: &'static str) -> EnvGuard {
+            let _lock = acquire_env_lock();
+            let previous = dotenvy::var(key).ok();
+            // SAFETY: isolated test mutates a process env var and restores via guard.
+            unsafe {
+                std::env::remove_var(key);
+            }
+            EnvGuard {
+                key,
+                previous,
+                _lock,
+            }
+        }
+
         #[test]
         fn begin_concurrent_flag_parsing() {
             let _guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "1");
@@ -27982,6 +28000,88 @@ pub mod persist {
             assert_eq!(conversation_count, 1);
             assert_eq!(message_count, 2);
             assert_eq!(tantivy_doc_count(&mut t_index), 0);
+        }
+
+        #[test]
+        fn default_serial_batched_hot_path_syncs_fts_lex_domain() {
+            // w2 F1 regression: `insert_conversations_batched` is the
+            // crate's highest-traffic write path, reached by default (no
+            // CASS_INDEXER_BEGIN_CONCURRENT set) via
+            // `persist_conversations_batched_inner` -> the serial
+            // `with_ephemeral_writer` branch. Before the fix, this path
+            // called `flush_pending_fts_entries` (tantivy) only, never
+            // `sync_lexical_domain_for_conversation_in_tx` -- a new
+            // conversation ingested through the default hot path landed in
+            // `messages`/`conversations` but was invisible to `fts_lex
+            // MATCH`. Both CASS_INDEXER_BEGIN_CONCURRENT and
+            // CASS_DEFER_LEXICAL_UPDATES must stay unset for this test to
+            // actually exercise that path with lexical sync enabled.
+            use crate::connectors::NormalizedConversation;
+            use crate::search::tantivy::TantivyIndex;
+
+            let _begin_guard = unset_env("CASS_INDEXER_BEGIN_CONCURRENT");
+            let _defer_guard = unset_env("CASS_DEFER_LEXICAL_UPDATES");
+
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("default-hot-path.db");
+            let index_path = dir.path().join("tantivy");
+
+            let storage = create_franken_db(&db_path);
+            let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
+            let convs = vec![NormalizedConversation {
+                agent_slug: "default-hot-agent".into(),
+                external_id: Some("default-hot-1".into()),
+                title: Some("Default Hot Path".into()),
+                workspace: None,
+                source_path: std::path::PathBuf::from("/log/default-hot.jsonl"),
+                started_at: Some(100),
+                ended_at: Some(110),
+                metadata: serde_json::json!({}),
+                messages: vec![NormalizedMessage {
+                    idx: 0,
+                    role: "user".into(),
+                    author: Some("tester".into()),
+                    created_at: Some(100),
+                    content: "f1hotpathmarkerzqx".into(),
+                    extra: serde_json::json!({}),
+                    snippets: vec![],
+                    invocations: Vec::new(),
+                }],
+            }];
+
+            persist_conversations_batched(
+                &storage,
+                Some(&mut t_index),
+                &convs,
+                LexicalPopulationStrategy::InlineRebuildFromScan,
+                false,
+            )
+            .expect("default hot-path persist should succeed");
+
+            let message_count: i64 = storage
+                .raw()
+                .query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0))
+                .unwrap();
+            assert_eq!(message_count, 1);
+
+            let fts_lex_hits: i64 = storage
+                .raw()
+                .query_row_map(
+                    "SELECT count(*) FROM fts_lex WHERE fts_lex MATCH 'f1hotpathmarkerzqx'",
+                    &[],
+                    |row| row.get_typed(0),
+                )
+                .unwrap();
+            assert_eq!(
+                fts_lex_hits, 1,
+                "conversation inserted via the default serial batched hot path must be visible to fts_lex MATCH"
+            );
+
+            let lex_docs_count: i64 = storage
+                .raw()
+                .query_row_map("SELECT COUNT(*) FROM lex_docs", &[], |row| row.get_typed(0))
+                .unwrap();
+            assert_eq!(lex_docs_count, 1);
         }
 
         #[test]

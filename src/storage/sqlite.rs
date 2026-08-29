@@ -10175,6 +10175,23 @@ impl FrankenStorage {
                         }
                     };
 
+                    // w2 F1 fix: insert_conversations_batched is the crate's
+                    // highest-traffic write path and previously never synced
+                    // the lex_docs/fts_lex domain at all -- every conversation
+                    // that landed via this path was invisible to fts_lex
+                    // MATCH. Unlike the tantivy fts_entries buffer above
+                    // (batched across all conversations in this call and
+                    // flushed only once size thresholds are crossed),
+                    // sync_lexical_domain_for_conversation_in_tx recomputes
+                    // the full projection straight from the messages table,
+                    // so it only needs one call per conversation, right here
+                    // where `conv_id` is settled for both the new-insert and
+                    // existing-append branches -- same `!defer_lexical_updates`
+                    // gate and same in-tx semantics as insert_conversation_tree.
+                    if !defer_lexical_updates {
+                        sync_lexical_domain_for_conversation_in_tx(tx, conv_id)?;
+                    }
+
                     if !defer_analytics_updates {
                         let delta = StatsDelta {
                             session_count_delta,
