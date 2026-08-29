@@ -13073,6 +13073,21 @@ pub(crate) fn franken_replace_conversation_messages_in_tx(
         |row| row.get_typed(0),
     )?;
 
+    // w2 F2 fix: fts_lex has no FK relationship to lex_docs (FTS5
+    // external-content tables are not FK-aware), so ON DELETE CASCADE from
+    // messages -> lex_docs alone leaves fts_lex pointing at rowids the
+    // upcoming messages delete is about to cascade away. Must run *before*
+    // that delete, while `messages` still exist to resolve which fts_lex
+    // rowids belong to the *old* message ids -- sync_lexical_domain_for_
+    // conversation_in_tx runs later (post-insert, keyed off "current"
+    // messages) and can only ever see the *new* ids, so it cannot clean
+    // these up itself. Same precedent as the three delete-path call sites
+    // (W2-3): clear fts_lex first, while the old rowids are still resolvable.
+    tx.execute(
+        "DELETE FROM fts_lex WHERE rowid IN (SELECT id FROM messages WHERE conversation_id = ?1)",
+        fparams![conversation_id],
+    )?;
+
     // 删旧。`message_metrics` / `snippets` / `token_usage` 的 `message_id` 都带
     // `ON DELETE CASCADE`；`token_usage` 另有一列 `conversation_id` 无外键，
     // 故按基线 `cleanup_external_id_duplicates` 的做法再显式删一次（不依赖 cascade）。

@@ -6584,6 +6584,118 @@ mod e6_replace_commit_tests {
         );
     }
 
+    /// w2 F2 回归：真走 `franken_replace_conversation_messages_in_tx` 的删旧插新
+    /// 全链（经 `commit_replace_in_tx` 的完整步骤 2-11），不是手搭的小事务。
+    /// 旧内容含 `old_marker`，旧 message id 被级联删除、新 message 分配的 id
+    /// 严格大于旧全局最大值（不复用），修复前 `sync_lexical_domain_for_
+    /// conversation_in_tx`（步骤9b）按"当前" messages 表 id 反查只能看到新 id，
+    /// 旧 `old_marker` 倒排项永久残留，而 receipt 仍写 `committed`——修复要求
+    /// 事务里在级联删除**之前**按旧 id 显式清 fts_lex。
+    #[test]
+    fn e6_replace_clears_stale_fts_lex_entries_for_deleted_old_messages() {
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open(&dir);
+
+        let legacy = conversation_titled(
+            "旧标题",
+            vec![
+                message(0, MessageRole::User, "old_marker present here"),
+                message(1, MessageRole::Assistant, "旧 1"),
+            ],
+        );
+        storage
+            .insert_conversations_batched(&[(agent_id, None, &legacy)])
+            .unwrap();
+        let conv_id: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT id FROM conversations WHERE external_id = ?1",
+                &[ParamValue::from(EXTERNAL_ID)],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+
+        // 前置断言：确认 old_marker 此刻真的可被 MATCH，否则后面的"不可再 MATCH"
+        // 断言会是空转（探针先自证有效，见 MEMORY.md「先验证探针」）。
+        let hits_before: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT count(*) FROM fts_lex WHERE fts_lex MATCH 'old_marker'",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(hits_before, 1, "old_marker 必须在 replace 之前先可被 MATCH 到");
+
+        let projected = conversation_titled(
+            "新标题",
+            vec![
+                message(0, MessageRole::User, "brand new content"),
+                message(1, MessageRole::Assistant, "新 1"),
+            ],
+        );
+
+        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+        let idempotency_key = {
+            let mut tx = storage.raw().transaction().unwrap();
+            let outcome = commit_replace_in_tx(
+                &tx,
+                &ReplaceCommitInput {
+                    conversation_id: conv_id,
+                    agent_id,
+                    workspace_id: None,
+                    conv: &projected,
+                    identity: &identity(),
+                    snapshot_root: "f2-root",
+                    generation: "f2-gen",
+                },
+                &pricing,
+                TS,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            outcome.idempotency_key
+        };
+
+        let hits_after: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT count(*) FROM fts_lex WHERE fts_lex MATCH 'old_marker'",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            hits_after, 0,
+            "旧内容 old_marker 在 replace 之后必须不可再被 fts_lex MATCH 到——\
+             旧 message 已被级联删除，倒排项不得永久残留"
+        );
+
+        let new_hits: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT count(*) FROM fts_lex WHERE fts_lex MATCH 'brand'",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(new_hits, 1, "新内容必须已经写入 fts_lex 且可被 MATCH");
+
+        let receipt_state: Option<String> = storage
+            .raw()
+            .query_row_map(
+                "SELECT state FROM operation_commit_receipt WHERE idempotency_key = ?1",
+                &[ParamValue::from(idempotency_key.as_str())],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            receipt_state.as_deref(),
+            Some("committed"),
+            "receipt 仍必须写 committed——修复的是遗留倒排项，不是把这次 replace 判失败"
+        );
+    }
+
     /// 反方向臂 ②：新 id 被**另一行**占着时，必须死在一句说得清的话上。
     ///
     /// `UNIQUE(source_id, agent_id, external_id)` 会挡住它，但裸的约束错误
