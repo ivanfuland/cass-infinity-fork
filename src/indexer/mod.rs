@@ -14765,6 +14765,34 @@ pub fn run_index(
         t_index
     };
 
+    // w2 Task W2-4 Step 2: full lex_docs/fts_lex rebuild from the canonical
+    // messages/conversations tables. `rebuild_tantivy_from_db_with_options`
+    // (called above, either directly or via its deferred-startup variant)
+    // opens the database `open_readonly` and cannot itself write the lex
+    // domain, so this is a deliberate second pass over the same writable
+    // `storage` handle used for daily_stats repair elsewhere in this
+    // function -- not fused into Tantivy's staged-shard rebuild pipeline.
+    // Gated on `opts.full || canonical_only_full_rebuild` (both flags mean
+    // "the user asked for a full rebuild" per W2-0 Step 3c's real-dispatch
+    // finding) so routine incremental scans -- already kept in sync
+    // incrementally by the W2-2/W2-3 write-path wiring -- don't pay for a
+    // redundant whole-archive recompute on every run.
+    if opts.full || canonical_only_full_rebuild {
+        let lex_rebuild_started = Instant::now();
+        match storage.rebuild_lex_domain_from_db() {
+            Ok(stats) => tracing::info!(
+                db_path = %opts.db_path.display(),
+                conversations_processed = stats.conversations_processed,
+                lex_docs_count = stats.lex_docs_count,
+                elapsed_ms = lex_rebuild_started.elapsed().as_millis() as u64,
+                "full rebuild: lex_docs/fts_lex domain rebuilt from canonical messages/conversations"
+            ),
+            Err(err) => {
+                return Err(err).context("full rebuild: lex_docs/fts_lex domain rebuild failed");
+            }
+        }
+    }
+
     if stale_index_ingest_quarantine_retry_attempted
         && scan_watermark_preservation_active(&active_session_source_skips)
     {

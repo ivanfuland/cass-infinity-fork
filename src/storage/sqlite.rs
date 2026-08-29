@@ -5411,6 +5411,12 @@ pub struct MessageForEmbedding {
 // FrankenStorage CRUD operations
 // =========================================================================
 
+/// Summary of a [`FrankenStorage::rebuild_lex_domain_from_db`] run (W2-4).
+pub(crate) struct LexDomainRebuildStats {
+    pub conversations_processed: usize,
+    pub lex_docs_count: usize,
+}
+
 impl FrankenStorage {
     /// Ensure an agent exists in the database, returning its ID.
     pub fn ensure_agent(&self, agent: &Agent) -> Result<i64> {
@@ -6856,6 +6862,55 @@ impl FrankenStorage {
             lexical_max_conversation_content_bytes(),
         );
         Ok(messages)
+    }
+
+    /// W2-4 Step 2: full `lex_docs`/`fts_lex` rebuild from the canonical
+    /// `messages`/`conversations` tables — independent of, and run after,
+    /// `rebuild_tantivy_from_db_with_options` (which opens the database
+    /// `open_readonly` and therefore cannot itself write the lex domain).
+    ///
+    /// Batches conversations into fixed-size transactions (not one giant
+    /// transaction for the whole archive, nor one transaction per
+    /// conversation) to bound both peak transaction size and per-commit
+    /// fsync overhead on a large corpus. Each conversation is recomputed via
+    /// [`sync_lexical_domain_for_conversation_in_tx`] — the exact same
+    /// per-conversation logic the live write path already uses — so a full
+    /// rebuild and incremental sync can never diverge on what ends up in
+    /// `lex_docs`.
+    pub(crate) fn rebuild_lex_domain_from_db(&self) -> Result<LexDomainRebuildStats> {
+        const CONVERSATIONS_PER_TX: usize = 200;
+        let conversation_ids: Vec<i64> = self
+            .conn
+            .query_all_map("SELECT id FROM conversations ORDER BY id", &[], |row| row.get_typed(0))
+            .context("listing conversation ids for lex domain full rebuild")?;
+
+        let mut conversations_processed = 0usize;
+        for chunk in conversation_ids.chunks(CONVERSATIONS_PER_TX) {
+            self.conn
+                .with_tx(TxMode::Immediate, |tx| -> Result<(), StorageError> {
+                    for &conversation_id in chunk {
+                        sync_lexical_domain_for_conversation_in_tx(tx, conversation_id)
+                            .map_err(anyhow_error_into_storage_error)?;
+                    }
+                    Ok(())
+                })
+                .with_context(|| {
+                    format!(
+                        "rebuilding lex domain for a batch of {} conversations",
+                        chunk.len()
+                    )
+                })?;
+            conversations_processed += chunk.len();
+        }
+
+        let lex_docs_count: i64 = self
+            .conn
+            .query_row_map("SELECT COUNT(*) FROM lex_docs", &[], |row| row.get_typed(0))
+            .context("counting lex_docs after full rebuild")?;
+        Ok(LexDomainRebuildStats {
+            conversations_processed,
+            lex_docs_count: lex_docs_count as usize,
+        })
     }
 
     /// Inner fetch without the per-conversation content cap. Kept separate so the
@@ -16807,6 +16862,136 @@ mod tests {
             .query_row_map("SELECT COUNT(*) FROM messages WHERE id = 9001", &[], |row| row.get_typed(0))
             .unwrap();
         assert_eq!(msg_count, 0, "the message insert in the same transaction must also roll back");
+    }
+
+    /// W2-4 Step 1 (R2-W2-B2): identity-level bidirectional anti-join, not a
+    /// total-count comparison -- a total-count check can be defeated by
+    /// "one eligible message missing + one ineligible message present"
+    /// canceling out to a matching count while `lex_docs` is still wrong.
+    /// Builds conversations spanning every eligibility edge case (plain
+    /// eligible messages, a `tool_result`-role message that must be
+    /// excluded as noise, an empty-content message that must also be
+    /// excluded), computes the "eligible set" independently in this test
+    /// (mirroring `indexer::expected_live_lexical_doc_count`'s own
+    /// composition of `fetch_messages_for_lexical_rebuild` +
+    /// `is_lexical_rebuild_tool_class_role` + `is_hard_message_noise` --
+    /// the identical predicate, not a copy with drift risk), and asserts
+    /// both `eligible EXCEPT lex_docs = ∅` and `lex_docs EXCEPT eligible = ∅`
+    /// after `rebuild_lex_domain_from_db`.
+    #[test]
+    fn rebuild_lex_domain_from_db_matches_the_eligible_set_exactly_bidirectional_anti_join() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "claude_code".into(),
+                name: "Claude Code".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+
+        for i in 0..5 {
+            let external_id = format!("wm-antijoin-{i}");
+            let conversation = Conversation {
+                id: None,
+                agent_slug: "claude_code".into(),
+                workspace: None,
+                external_id: Some(external_id.clone()),
+                title: Some(format!("title {i}")),
+                source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
+                started_at: Some(1_700_000_000_000),
+                ended_at: None,
+                approx_tokens: None,
+                metadata_json: serde_json::Value::Null,
+                messages: vec![
+                    Message {
+                        id: None,
+                        idx: 0,
+                        role: MessageRole::User,
+                        author: Some("user".into()),
+                        created_at: Some(1_700_000_000_010),
+                        content: format!("eligible content {i}"),
+                        extra_json: serde_json::Value::Null,
+                        snippets: Vec::new(),
+                    },
+                    Message {
+                        id: None,
+                        idx: 1,
+                        role: MessageRole::Other("tool_result".into()),
+                        author: Some("tool".into()),
+                        created_at: Some(1_700_000_000_020),
+                        content: "no matches found".into(), // canonical short tool-ack -> excluded as noise
+                        extra_json: serde_json::Value::Null,
+                        snippets: Vec::new(),
+                    },
+                    Message {
+                        id: None,
+                        idx: 2,
+                        role: MessageRole::User,
+                        author: Some("user".into()),
+                        created_at: Some(1_700_000_000_030),
+                        content: "   ".into(), // whitespace-only -> empty after trim -> excluded
+                        extra_json: serde_json::Value::Null,
+                        snippets: Vec::new(),
+                    },
+                ],
+                source_id: LOCAL_SOURCE_ID.into(),
+                origin_host: None,
+            };
+            storage.insert_conversation_tree(agent_id, None, &conversation).unwrap();
+        }
+
+        // Independently compute the eligible set (same predicate, not the
+        // same call site as the production sync path).
+        let conversation_ids: Vec<i64> = storage
+            .conn
+            .query_all_map("SELECT id FROM conversations", &[], |row| row.get_typed(0))
+            .unwrap();
+        let mut eligible_ids: Vec<i64> = Vec::new();
+        for conversation_id in conversation_ids {
+            for message in storage.fetch_messages_for_lexical_rebuild(conversation_id).unwrap() {
+                let is_tool_role = is_lexical_rebuild_tool_class_role(role_as_str(&message.role));
+                let noise_role_hint: Option<&str> = is_tool_role.then_some("tool");
+                if !crate::search::canonicalize::is_hard_message_noise(noise_role_hint, &message.content) {
+                    eligible_ids.push(message.id.unwrap());
+                }
+            }
+        }
+        eligible_ids.sort_unstable();
+        assert_eq!(eligible_ids.len(), 5, "sanity: exactly one eligible message per conversation (5 conversations)");
+
+        // Simulate the real "full rebuild" scenario this function exists for
+        // (recovering a damaged/dropped lexical index from the canonical
+        // messages/conversations tables alone) rather than trivially
+        // reconfirming what the incremental W2-2/W2-3 write-path sync
+        // already populated during the inserts above -- without this, the
+        // test would pass even if `rebuild_lex_domain_from_db`'s own loop
+        // silently skipped every conversation, since nothing would ever
+        // exercise its from-scratch repopulation behavior.
+        storage.conn.execute_batch("DELETE FROM fts_lex; DELETE FROM lex_docs;").unwrap();
+        let sanity_empty: i64 =
+            storage.conn.query_row_map("SELECT COUNT(*) FROM lex_docs", &[], |row| row.get_typed(0)).unwrap();
+        assert_eq!(sanity_empty, 0, "sanity: lex_docs must be empty before the full rebuild runs");
+
+        let stats = storage.rebuild_lex_domain_from_db().unwrap();
+        assert_eq!(stats.conversations_processed, 5);
+
+        let mut lex_docs_ids: Vec<i64> = storage
+            .conn
+            .query_all_map("SELECT doc_id FROM lex_docs", &[], |row| row.get_typed(0))
+            .unwrap();
+        lex_docs_ids.sort_unstable();
+
+        assert_eq!(
+            eligible_ids, lex_docs_ids,
+            "bidirectional anti-join: eligible set and lex_docs must match exactly, not just in count"
+        );
     }
 
     /// `coding_agent_session_search-uhhxy` (gh #302 ask #2): the dedup
