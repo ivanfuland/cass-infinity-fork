@@ -162,11 +162,48 @@ fn parse_args() -> (PathBuf, PathBuf, PathBuf, PathBuf) {
     )
 }
 
+/// R1-B4: refuse a `--report` path that would land inside `raw_mirror` (real
+/// captured evidence) or `dest` (the fake-HOME tree this run itself is about
+/// to populate) -- same containment check shape as `cass ingest manifest`'s
+/// `--out` guard (R1-B3), scaled to this tool's own two boundaries.
+fn reject_report_inside_raw_mirror_or_dest(
+    report_path: &Path,
+    raw_mirror: &Path,
+    canonical_dest: &Path,
+) {
+    let report_parent = report_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let canonical_report_parent = fs::canonicalize(report_parent)
+        .unwrap_or_else(|e| panic!("canonicalizing --report parent directory {}: {e}", report_parent.display()));
+
+    if let Ok(canonical_raw_mirror) = fs::canonicalize(raw_mirror) {
+        if canonical_report_parent.starts_with(&canonical_raw_mirror) {
+            panic!(
+                "--report {} resolves inside --raw-mirror ({}) -- refusing to write the \
+                 report where it could be mistaken for captured evidence",
+                report_path.display(),
+                canonical_raw_mirror.display()
+            );
+        }
+    }
+    if canonical_report_parent.starts_with(canonical_dest) {
+        panic!(
+            "--report {} resolves inside --dest ({}) -- refusing to write the report into \
+             the fake-HOME tree this run is materializing",
+            report_path.display(),
+            canonical_dest.display()
+        );
+    }
+}
+
 fn main() {
     let (raw_mirror, strip_prefix, dest, report_path) = parse_args();
 
     fs::create_dir_all(&dest).expect("create destination root");
     let canonical_dest = fs::canonicalize(&dest).expect("canonicalize destination root");
+    reject_report_inside_raw_mirror_or_dest(&report_path, &raw_mirror, &canonical_dest);
 
     let manifests_dir = raw_mirror.join("manifests");
     let mut manifest_paths: Vec<PathBuf> = fs::read_dir(&manifests_dir)
@@ -364,4 +401,76 @@ fn main() {
 
     let report_json = serde_json::to_string_pretty(&report).expect("serialize report");
     fs::write(&report_path, report_json).expect("write report");
+
+    // R1-B5(b): any of these four counters non-empty means at least one
+    // capture didn't materialize cleanly (bad/missing blob, dropped
+    // original_path, or a path outside --strip-prefix skipped per B5(a)).
+    // The report is already written above -- exit nonzero so a caller
+    // scripting this tool can't silently treat a degraded run as clean.
+    if report.blob_verify_fail > 0
+        || report.blob_missing > 0
+        || !report.dropped.is_empty()
+        || !report.outside_strip_prefix.is_empty()
+    {
+        eprintln!(
+            "degraded materialization run: blob_verify_fail={} blob_missing={} dropped={} \
+             outside_strip_prefix={} (see {} for details)",
+            report.blob_verify_fail,
+            report.blob_missing,
+            report.dropped.len(),
+            report.outside_strip_prefix.len(),
+            report_path.display()
+        );
+        std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod report_path_safety_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    #[should_panic(expected = "resolves inside --raw-mirror")]
+    fn report_inside_raw_mirror_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let raw_mirror = tmp.path().join("raw-mirror");
+        fs::create_dir_all(&raw_mirror).unwrap();
+        let dest = tmp.path().join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        let canonical_dest = fs::canonicalize(&dest).unwrap();
+        let report_path = raw_mirror.join("report.json");
+
+        reject_report_inside_raw_mirror_or_dest(&report_path, &raw_mirror, &canonical_dest);
+    }
+
+    #[test]
+    #[should_panic(expected = "resolves inside --dest")]
+    fn report_inside_dest_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let raw_mirror = tmp.path().join("raw-mirror");
+        fs::create_dir_all(&raw_mirror).unwrap();
+        let dest = tmp.path().join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        let canonical_dest = fs::canonicalize(&dest).unwrap();
+        let report_path = dest.join("report.json");
+
+        reject_report_inside_raw_mirror_or_dest(&report_path, &raw_mirror, &canonical_dest);
+    }
+
+    #[test]
+    fn report_outside_both_boundaries_is_allowed() {
+        let tmp = TempDir::new().unwrap();
+        let raw_mirror = tmp.path().join("raw-mirror");
+        fs::create_dir_all(&raw_mirror).unwrap();
+        let dest = tmp.path().join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        let canonical_dest = fs::canonicalize(&dest).unwrap();
+        let report_dir = tmp.path().join("reports");
+        fs::create_dir_all(&report_dir).unwrap();
+        let report_path = report_dir.join("report.json");
+
+        // Must not panic.
+        reject_report_inside_raw_mirror_or_dest(&report_path, &raw_mirror, &canonical_dest);
+    }
 }
