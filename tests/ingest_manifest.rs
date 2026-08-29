@@ -759,3 +759,82 @@ fn manifest_scan_root_rejects_unknown_slug() {
     ]);
     cmd.assert().failure();
 }
+
+/// R1-N1: the same identity can legitimately show up twice across scan
+/// roots with different message counts (a stale mirror snapshot vs. a
+/// newer live scan). The manifest must keep the larger message_count (and
+/// its matching content_digest), mirroring the DB's own append-only merge
+/// semantics, rather than pinning to whichever source this run visits
+/// first.
+#[test]
+fn manifest_folds_duplicate_identity_keeping_the_larger_message_count() {
+    let tmp = TempDir::new().unwrap();
+    let root_mirror = tmp.path().join("root-mirror");
+    let root_live = tmp.path().join("root-live");
+    fs::create_dir_all(&root_mirror).unwrap();
+    fs::create_dir_all(&root_live).unwrap();
+
+    // Same cwd + sessionId in both -> same identity_key. Mirror snapshot has
+    // 3 messages (stale); live snapshot has 5 (current).
+    let mirror_content = concat!(
+        r#"{"type":"user","cwd":"/workspace/fold","sessionId":"sess-fold","message":{"role":"user","content":"m1"},"timestamp":"2025-01-01T00:00:00.000Z"}"#, "\n",
+        r#"{"type":"assistant","message":{"role":"assistant","content":"m2"},"timestamp":"2025-01-01T00:00:01.000Z"}"#, "\n",
+        r#"{"type":"user","message":{"role":"user","content":"m3"},"timestamp":"2025-01-01T00:00:02.000Z"}"#, "\n",
+    );
+    let live_content = concat!(
+        r#"{"type":"user","cwd":"/workspace/fold","sessionId":"sess-fold","message":{"role":"user","content":"m1"},"timestamp":"2025-01-01T00:00:00.000Z"}"#, "\n",
+        r#"{"type":"assistant","message":{"role":"assistant","content":"m2"},"timestamp":"2025-01-01T00:00:01.000Z"}"#, "\n",
+        r#"{"type":"user","message":{"role":"user","content":"m3"},"timestamp":"2025-01-01T00:00:02.000Z"}"#, "\n",
+        r#"{"type":"assistant","message":{"role":"assistant","content":"m4"},"timestamp":"2025-01-01T00:00:03.000Z"}"#, "\n",
+        r#"{"type":"user","message":{"role":"user","content":"m5"},"timestamp":"2025-01-01T00:00:04.000Z"}"#, "\n",
+    );
+    write_session(&root_mirror.join("fold.jsonl"), mirror_content);
+    write_session(&root_live.join("fold.jsonl"), live_content);
+
+    let mirror_dir = tmp.path().join("mirror");
+    fs::create_dir_all(&mirror_dir).unwrap();
+    let out_path = tmp.path().join("manifest.jsonl");
+
+    let mut cmd = base_cmd();
+    cmd.args([
+        "ingest",
+        "manifest",
+        "--scan-root",
+        root_mirror.to_str().unwrap(),
+        "--scan-root",
+        root_live.to_str().unwrap(),
+        "--mirror",
+        mirror_dir.to_str().unwrap(),
+        "--out",
+        out_path.to_str().unwrap(),
+    ]);
+    cmd.assert().success();
+
+    let manifest_text = fs::read_to_string(&out_path).unwrap();
+    let entries: Vec<Value> = manifest_text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .skip(1) // header
+        .collect();
+    assert_eq!(
+        entries.len(),
+        1,
+        "same identity across two roots must collapse into one entry: {manifest_text}"
+    );
+    let entry = &entries[0];
+    assert_eq!(
+        entry["message_count"], 5,
+        "must keep the larger message_count, not whichever source was visited first: {entry}"
+    );
+    assert_eq!(
+        entry["content_digest"].as_str().unwrap(),
+        expected_digest(&["m1", "m2", "m3", "m4", "m5"]),
+        "content_digest must match the message_count it was folded to: {entry}"
+    );
+    assert_eq!(
+        entry["sources"].as_array().unwrap().len(),
+        2,
+        "both sources must still be recorded even though only one side's counts win: {entry}"
+    );
+}

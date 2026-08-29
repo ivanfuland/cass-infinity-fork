@@ -103,13 +103,38 @@ pub(crate) fn content_digest(messages: &[String]) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
+/// R1-B9: escapes `\` and `|` in one identity component so the `|`-joined
+/// key can't collide between two sessions whose fields happen to contain a
+/// literal `|` at different positions (e.g. workspace=`/w|x`,external=`y`
+/// vs. workspace=`/w`,external=`x|y` previously both formatted to the exact
+/// same string).
+fn escape_identity_component(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '|' => escaped.push_str("\\|"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
 /// Stable session identity: `{agent_slug}|{workspace}|{external_id}`, blank
 /// for absent workspace/external_id. `pub(crate)` so `ingest_reconcile`
 /// (Task C2) recomputes identity from DB rows with this exact function --
 /// never a second copy of the format string (same discipline as
-/// `content_digest`).
+/// `content_digest`). Each component is escaped (see
+/// `escape_identity_component`) before joining, so a literal `|` inside a
+/// workspace path or external id can never be mistaken for the field
+/// separator.
 pub(crate) fn identity_key(agent_slug: &str, workspace: &str, external_id: &str) -> String {
-    format!("{agent_slug}|{workspace}|{external_id}")
+    format!(
+        "{}|{}|{}",
+        escape_identity_component(agent_slug),
+        escape_identity_component(workspace),
+        escape_identity_component(external_id)
+    )
 }
 
 fn identity_key_for_conversation(agent_slug: &str, conv: &NormalizedConversation) -> String {
@@ -126,7 +151,56 @@ fn identity_key_for_excluded_file(provider_slug: &str, source_path: &Path) -> St
     format!("excluded:{provider_slug}:{}", source_path.display())
 }
 
+/// R1-B3: refuse to write the manifest where it could land inside a scan
+/// root or the mirror dir and get scanned/mixed in as if it were source
+/// data. Canonicalizes `--out`'s *parent* (the file itself need not exist
+/// yet) and each boundary, then checks containment. Runs before any
+/// filesystem mutation -- a rejection here touches nothing.
+fn reject_out_inside_scan_roots_or_mirror(
+    out: &Path,
+    scan_roots: &[String],
+    mirror: &Path,
+) -> Result<()> {
+    let out_parent = out
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let canonical_out_parent = fs::canonicalize(out_parent)
+        .with_context(|| format!("canonicalizing --out parent directory {}", out_parent.display()))?;
+
+    let mut boundaries: Vec<(String, PathBuf)> = Vec::new();
+    if let Ok(canonical_mirror) = fs::canonicalize(mirror) {
+        boundaries.push(("--mirror".to_string(), canonical_mirror));
+    }
+    for raw in scan_roots {
+        let path = match parse_scan_root_spec(raw) {
+            ScanRootSpec::Broadcast(path) => path,
+            ScanRootSpec::Scoped { path, .. } => path,
+        };
+        // Best-effort: a scan root that doesn't exist (yet) can't contain
+        // anything, so it can't be violated -- skip rather than error the
+        // whole command over an unrelated, pre-existing condition.
+        if let Ok(canonical_root) = fs::canonicalize(&path) {
+            boundaries.push((format!("--scan-root {raw:?}"), canonical_root));
+        }
+    }
+
+    for (label, boundary) in &boundaries {
+        if canonical_out_parent.starts_with(boundary) {
+            anyhow::bail!(
+                "--out {} resolves inside {label} ({}) -- refusing to write the manifest \
+                 where it could be discovered as source data or clobber mirror content",
+                out.display(),
+                boundary.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 pub fn run_manifest(args: ManifestArgs) -> Result<()> {
+    reject_out_inside_scan_roots_or_mirror(&args.out, &args.scan_roots, &args.mirror)?;
+
     fs::create_dir_all(&args.mirror)
         .with_context(|| format!("creating mirror dir {}", args.mirror.display()))?;
 
@@ -255,12 +329,23 @@ pub fn run_manifest(args: ManifestArgs) -> Result<()> {
                 let messages: Vec<String> = conv.messages.iter().map(|m| m.content.clone()).collect();
                 let message_count = messages.len() as u64;
                 let digest = content_digest(&messages);
+                let digest_for_modify = digest.clone();
 
                 entries
                     .entry(identity_key.clone())
                     .and_modify(|entry| {
                         if !entry.sources.contains(&source) {
                             entry.sources.push(source.clone());
+                        }
+                        // R1-N1: the same identity can be seen twice across
+                        // scan passes (e.g. an older mirror snapshot and a
+                        // newer live scan). Keep whichever pass saw more
+                        // messages, mirroring the DB's own append-only merge
+                        // semantics, instead of pinning to whichever source
+                        // this map happened to visit first.
+                        if message_count > entry.message_count {
+                            entry.message_count = message_count;
+                            entry.content_digest = digest_for_modify.clone();
                         }
                     })
                     .or_insert_with(|| ManifestEntry {
@@ -312,4 +397,93 @@ pub fn run_manifest(args: ManifestArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod identity_and_out_safety_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn identity_key_escapes_embedded_pipes_so_shifted_fields_cannot_collide() {
+        // R1-B9: workspace="/w|x",external="y" and workspace="/w",external="x|y"
+        // both naively format to the same unescaped "agent|/w|x|y" string.
+        let key_a = identity_key("agent", "/w|x", "y");
+        let key_b = identity_key("agent", "/w", "x|y");
+        assert_ne!(
+            key_a, key_b,
+            "identity_key must not collide when a literal '|' shifts which \
+             component it appears to belong to"
+        );
+    }
+
+    #[test]
+    fn identity_key_escapes_embedded_backslashes() {
+        let key_a = identity_key("agent", r"C:\w", "y");
+        let key_b = identity_key("agent", r"C:\\w", "y");
+        assert_ne!(
+            key_a, key_b,
+            "a literal backslash must not be confused with an escape sequence \
+             produced for a different input"
+        );
+    }
+
+    #[test]
+    fn reject_out_inside_scan_root_refuses_without_touching_files() {
+        let tmp = TempDir::new().unwrap();
+        let scan_root = tmp.path().join("scan-root");
+        fs::create_dir_all(&scan_root).unwrap();
+        let mirror = tmp.path().join("mirror");
+        fs::create_dir_all(&mirror).unwrap();
+        let out = scan_root.join("manifest.jsonl");
+
+        let err = reject_out_inside_scan_roots_or_mirror(
+            &out,
+            &[scan_root.to_str().unwrap().to_string()],
+            &mirror,
+        )
+        .expect_err("--out inside a scan root must be rejected");
+        assert!(
+            format!("{err}").contains("resolves inside"),
+            "error should explain the containment violation: {err}"
+        );
+        assert!(!out.exists(), "rejection must not create the output file");
+    }
+
+    #[test]
+    fn reject_out_inside_mirror_refuses() {
+        let tmp = TempDir::new().unwrap();
+        let scan_root = tmp.path().join("scan-root");
+        fs::create_dir_all(&scan_root).unwrap();
+        let mirror = tmp.path().join("mirror");
+        fs::create_dir_all(&mirror).unwrap();
+        let out = mirror.join("manifest.jsonl");
+
+        let err = reject_out_inside_scan_roots_or_mirror(
+            &out,
+            &[scan_root.to_str().unwrap().to_string()],
+            &mirror,
+        )
+        .expect_err("--out inside --mirror must be rejected");
+        assert!(format!("{err}").contains("resolves inside"));
+    }
+
+    #[test]
+    fn reject_out_allows_a_path_outside_every_boundary() {
+        let tmp = TempDir::new().unwrap();
+        let scan_root = tmp.path().join("scan-root");
+        fs::create_dir_all(&scan_root).unwrap();
+        let mirror = tmp.path().join("mirror");
+        fs::create_dir_all(&mirror).unwrap();
+        let out_dir = tmp.path().join("out-dir");
+        fs::create_dir_all(&out_dir).unwrap();
+        let out = out_dir.join("manifest.jsonl");
+
+        reject_out_inside_scan_roots_or_mirror(
+            &out,
+            &[scan_root.to_str().unwrap().to_string()],
+            &mirror,
+        )
+        .expect("an --out path outside every scan root and the mirror dir must be allowed");
+    }
 }
