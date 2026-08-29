@@ -314,12 +314,17 @@ fn main() {
             continue;
         };
 
+        // R1-B5(a): a path that doesn't fall under --strip-prefix at all
+        // (e.g. captured from a different machine/HOME than this run's own)
+        // has no principled relative shape to materialize under -- trimming
+        // the leading slash and proceeding anyway silently mixed foreign
+        // paths into this machine's fake-HOME tree. Record and skip instead.
         let relative_source = match Path::new(&manifest.original_path).strip_prefix(&strip_prefix)
         {
             Ok(stripped) => stripped.to_path_buf(),
             Err(_) => {
                 outside_strip_prefix.push(manifest.original_path.clone());
-                Path::new(manifest.original_path.trim_start_matches('/')).to_path_buf()
+                continue;
             }
         };
         let relative = safe_relative_shape(&relative_source.to_string_lossy())
