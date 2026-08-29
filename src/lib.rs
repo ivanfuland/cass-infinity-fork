@@ -22958,7 +22958,12 @@ mod search_lexical_self_heal_tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn search_self_heal_defers_same_db_content_drift_to_index_run() {
+        // W2-5: see search_self_heal_defers_missing_checkpoint_when_index_is_readable --
+        // same Tantivy-specific checkpoint-deferral semantics, same reason
+        // to pin to the legacy flag.
+        let _tantivy_guard = crate::search::query::LexicalUseTantivyGuard::enable();
         let temp = tempfile::tempdir().expect("tempdir");
         let data_dir = temp.path();
         let db_path = data_dir.join("agent_search.db");
@@ -23297,7 +23302,17 @@ mod search_lexical_self_heal_tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn search_self_heal_defers_missing_checkpoint_when_index_is_readable() {
+        // W2-5: this test's "active_hits must be 0" assertion pins Tantivy's
+        // own checkpoint-deferral semantics (content already synced to the
+        // canonical DB but not yet reflected in the readable Tantivy index).
+        // `fts_lex` is synced in the same transaction as the DB write with
+        // no separate rebuild step, so it legitimately finds this content
+        // immediately -- a real improvement, not a regression -- which is
+        // exactly why this Tantivy-specific deferral test must run under
+        // the legacy flag.
+        let _tantivy_guard = crate::search::query::LexicalUseTantivyGuard::enable();
         let temp = tempfile::tempdir().expect("tempdir");
         let data_dir = temp.path();
         build_standalone_lexical_index_without_checkpoint(

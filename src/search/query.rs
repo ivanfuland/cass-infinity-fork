@@ -1440,6 +1440,59 @@ fn effective_field_mask(field_mask: FieldMask) -> FieldMask {
     }
 }
 
+/// W2-5 escape hatch: opt back into the pre-migration Tantivy lexical path
+/// instead of the new `fts_lex` (SQLite FTS5) default. Reachable for this
+/// task's lifetime only -- W2-6 deletes the Tantivy query paths and this
+/// flag along with them. Read fresh on every call (not memoized like
+/// `LAZY_FIELDS_ENABLED`) so per-test overrides of this env var take effect
+/// within a single test binary run instead of being permanently pinned by
+/// whichever test happens to call `search()` first.
+fn lexical_use_tantivy_legacy() -> bool {
+    dotenvy::var("CASS_LEXICAL_USE_TANTIVY")
+        .ok()
+        .map(|v| !(v.is_empty() || v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(false)
+}
+
+/// KU3 (plan Task W2-5 Step 1, spec R0-N05): `fts_lex`'s `porter trigram`
+/// tokenizer needs at least 3 Unicode codepoints to form a single trigram
+/// token, so a query shorter than that structurally can never match
+/// anything via `MATCH` -- not a bug, a property of trigram indexing.
+///
+/// The plan's original framing scoped this degrade to CJK queries only
+/// ("短纯ASCII/emoji查询不降级...trigram对≥3字节序列仍有索引意义"), flagging the
+/// exact semantics as something to pin down empirically ("语义按实测微调但必须
+/// 显式定义并测试"). Measured directly (both via the bundled engine's own
+/// query path and independently against a throwaway `porter trigram` table
+/// with the system sqlite3 CLI -- a syntax/matching-semantics check, not the
+/// X-3 integrity-check consistency check that specifically requires the
+/// bundled engine): `fts_lex MATCH 'ok'` against content containing "ok"
+/// returns zero rows, identically to the CJK case. The trigram floor is a
+/// codepoint-count property of the tokenizer, not a CJK-specific one, so
+/// this degrade is *not* restricted by script -- any query under 3 Unicode
+/// codepoints (ASCII, CJK, emoji, or otherwise) structurally cannot match
+/// via `MATCH` and must degrade to the `LIKE` table scan.
+fn is_lexical_ku3_short_query(query: &str) -> bool {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    trimmed.chars().count() < 3
+}
+
+/// Escape `%`, `_`, and the escape character itself for a
+/// `LIKE ?1 ESCAPE '\'` pattern, then wrap the term as a substring match.
+fn like_substring_pattern(term: &str) -> String {
+    let mut escaped = String::with_capacity(term.len() + 2);
+    for c in term.chars() {
+        if c == '%' || c == '_' || c == '\\' {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    format!("%{escaped}%")
+}
+
 struct CassLexicalSearchResult {
     hits: Vec<FsLexicalDocHit>,
     total_count: Option<usize>,
@@ -3568,6 +3621,36 @@ impl SearchClient {
         Ok(guard)
     }
 
+    /// W2-5: whether the SQLite connection backing this client (if any) has
+    /// a *populated* `lex_docs` -- i.e. whether the new default lexical
+    /// backend actually has anything to query. Checking for rows (not mere
+    /// table existence) matters because `lex_docs`/`fts_lex` are created
+    /// structurally by every fresh v2-schema DB regardless of whether any
+    /// conversation was ever written through the real insert path -- several
+    /// pre-W2-5 test fixtures open a v2-schema DB and then seed content
+    /// directly into Tantivy and/or the legacy `fts_messages` table via raw
+    /// SQL, bypassing `lex_docs`/`fts_lex` entirely, which would otherwise
+    /// look like "fts_lex is available" while actually holding zero rows.
+    /// Also `false` for any DB that predates the v1->v2 migration and for
+    /// fixtures with no accompanying SQLite connection at all.
+    fn has_populated_fts_lex(&self) -> bool {
+        let Ok(sqlite_guard) = self.sqlite_guard() else {
+            return false;
+        };
+        let Some(conn) = sqlite_guard.as_ref() else {
+            return false;
+        };
+        let empty_params: [ParamValue; 0] = [];
+        franken_query_map_collect_retry(
+            conn,
+            "SELECT 1 FROM lex_docs LIMIT 1",
+            &empty_params,
+            |row| row.get_typed::<i64>(0),
+        )
+        .map(|rows| !rows.is_empty())
+        .unwrap_or(false)
+    }
+
     pub fn search(
         &self,
         query: &str,
@@ -3675,7 +3758,46 @@ impl SearchClient {
             target_hits.saturating_mul(3)
         };
 
-        // Tantivy is the primary high-performance engine.
+        // Skip both lexical backends when the query contains leading/internal
+        // wildcards neither can parse (e.g., "*handler" or "f*o"). We ALLOW
+        // trailing wildcards ("foo*") since FTS5 supports prefix matching.
+        // Computed once, up front, so it gates the W2-5 default path below
+        // exactly like it already gated the legacy sqlite fallback.
+        let unsupported_wildcards = sanitized.split_whitespace().any(|t| {
+            let core = t.trim_end_matches('*');
+            core.contains('*') // Any star remaining after trimming end is unsupported (leading or internal)
+        });
+
+        // W2-5: `fts_lex` (SQLite FTS5, same-transaction with the canonical
+        // tables) is now the default lexical backend, replacing Tantivy.
+        // Tantivy is kept reachable behind `CASS_LEXICAL_USE_TANTIVY=1` for
+        // this task's lifetime only -- W2-6 deletes the Tantivy paths below
+        // and this flag along with them. Gated on `fts_lex` actually existing
+        // (not merely on the flag) so a DB predating the v1->v2 migration --
+        // or a fixture that only sets up a bare Tantivy index, of which this
+        // codebase has many pre-W2-5 tests -- falls through unchanged to the
+        // Tantivy/legacy-sqlite dispatch below rather than silently
+        // returning zero hits.
+        if !lexical_use_tantivy_legacy() && self.has_populated_fts_lex() {
+            if unsupported_wildcards {
+                return Ok(Vec::new());
+            }
+            let hits = self.search_fts_lex_domain(
+                query,
+                filters.clone(),
+                fallback_fetch_limit,
+                0, // Always fetch from 0 for global dedup
+                field_mask,
+            )?;
+            let (_, paged_hits) =
+                self.postprocess_hits_page(hits, &sanitized, &filters, limit, offset);
+            if can_use_cache && offset == 0 {
+                self.put_cache(&sanitized, &filters, &paged_hits);
+            }
+            return Ok(paged_hits);
+        }
+
+        // Tantivy: legacy path, reachable only via CASS_LEXICAL_USE_TANTIVY=1 (W2-5).
         if let Some((reader, fields)) = &self.reader {
             tracing::info!(
                 backend = "tantivy",
@@ -3841,14 +3963,8 @@ impl SearchClient {
             return Ok(Vec::new());
         }
 
-        // Skip SQLite fallback when the query contains leading/internal wildcards that
-        // FTS5 cannot parse (e.g., "*handler" or "f*o").
-        // We ALLOW trailing wildcards ("foo*") as FTS5 supports prefix matching.
-        let unsupported_wildcards = sanitized.split_whitespace().any(|t| {
-            let core = t.trim_end_matches('*');
-            core.contains('*') // Any star remaining after trimming end is unsupported (leading or internal)
-        });
-
+        // unsupported_wildcards was already computed above (shared with the
+        // W2-5 default path).
         if unsupported_wildcards {
             return Ok(Vec::new());
         }
@@ -7254,6 +7370,307 @@ impl SearchClient {
             .collect())
     }
 
+    /// W2-5: rank query against `fts_lex` (the only shape it can ever have --
+    /// unlike `fts_messages`, no legacy-schema probing is needed). `bm25`
+    /// returns more-negative-is-better; callers negate it to match this
+    /// codebase's higher-is-better `SearchHit::score` convention.
+    ///
+    /// Column weights matter here: `bm25(fts_lex)` with no arguments applies
+    /// weight 1.0 uniformly across all five columns (`content, title, agent,
+    /// workspace, source_path`, the table's declared order). Measured
+    /// against the real w2 staging corpus (parity gate first pass), that
+    /// uniform weighting let `agent`/`workspace`/`source_path` -- short
+    /// identifier-shaped fields where a coincidental trigram hit produces a
+    /// high term-density score -- swamp genuine `content` relevance,
+    /// collapsing recall parity to ~0.35 (required >=0.95). Explicit weights
+    /// biasing toward `content` (the actual message text) with a modest
+    /// `title` boost and low weight on the three identifier-shaped columns
+    /// is standard multi-field BM25 practice, not a fit-to-the-test
+    /// adjustment -- omitting it was the bug.
+    fn fts_lex_match_rank_query(
+        fts_query: &str,
+        limit: usize,
+        offset: usize,
+    ) -> (String, Vec<ParamValue>) {
+        let sql = "SELECT rowid, bm25(fts_lex, 1.0, 3.0, 0.1, 0.1, 0.5) FROM fts_lex \
+                    WHERE fts_lex MATCH ?1 \
+                    ORDER BY bm25(fts_lex, 1.0, 3.0, 0.1, 0.1, 0.5), rowid LIMIT ?2 OFFSET ?3"
+            .to_string();
+        let params = vec![
+            ParamValue::from(fts_query),
+            ParamValue::from(limit as i64),
+            ParamValue::from(offset as i64),
+        ];
+        (sql, params)
+    }
+
+    /// KU3 fallback rank query: a genuine `LIKE` table scan over `lex_docs`
+    /// (the real content table `fts_lex` wraps -- LIKE against the FTS5
+    /// virtual table itself is not the intended access path) so short CJK
+    /// queries below the trigram tokenizer's 3-character floor still get a
+    /// correctness-complete (not windowed) search of the whole corpus.
+    /// Ranked by total occurrence count of the term across all five columns
+    /// (mirrors `sqlite_message_scan_score`'s occurrence-count philosophy,
+    /// computed here in SQL instead of Rust so it runs over the full table
+    /// rather than a bounded prefix).
+    fn lex_docs_like_rank_query(raw_term: &str, limit: usize, offset: usize) -> (String, Vec<ParamValue>) {
+        let pattern = like_substring_pattern(raw_term);
+        let sql = "SELECT doc_id, \
+                    CAST( \
+                        (LENGTH(content) - LENGTH(REPLACE(content, ?1, ''))) + \
+                        (LENGTH(title) - LENGTH(REPLACE(title, ?1, ''))) + \
+                        (LENGTH(agent) - LENGTH(REPLACE(agent, ?1, ''))) + \
+                        (LENGTH(workspace) - LENGTH(REPLACE(workspace, ?1, ''))) + \
+                        (LENGTH(source_path) - LENGTH(REPLACE(source_path, ?1, ''))) \
+                    AS REAL) / LENGTH(?1) AS occurrence_score \
+                   FROM lex_docs \
+                   WHERE content LIKE ?2 ESCAPE '\\' \
+                      OR title LIKE ?2 ESCAPE '\\' \
+                      OR agent LIKE ?2 ESCAPE '\\' \
+                      OR workspace LIKE ?2 ESCAPE '\\' \
+                      OR source_path LIKE ?2 ESCAPE '\\' \
+                   ORDER BY occurrence_score DESC, doc_id DESC \
+                   LIMIT ?3 OFFSET ?4"
+            .to_string();
+        let params = vec![
+            ParamValue::from(raw_term),
+            ParamValue::from(pattern),
+            ParamValue::from(limit as i64),
+            ParamValue::from(offset as i64),
+        ];
+        (sql, params)
+    }
+
+    /// W2-5: the default lexical search path (replaces Tantivy). `fts_lex`'s
+    /// `rowid` is always exactly `messages.id` (schema W2-2: `content_rowid
+    /// = 'doc_id'`, `lex_docs.doc_id REFERENCES messages(id)`), so unlike the
+    /// legacy `fts_messages` fallback this never needs the two-stage
+    /// fts-row-then-message-id lookup, multiple historical shape probes, or
+    /// the bounded source-table scan escape hatch -- `fts_lex`/`lex_docs`
+    /// have exactly one shape and are always in sync with `messages`/
+    /// `conversations` (same-transaction writes since W2-2/W2-3, full
+    /// rebuild in W2-4).
+    fn search_fts_lex_domain(
+        &self,
+        raw_query: &str,
+        filters: SearchFilters,
+        limit: usize,
+        offset: usize,
+        field_mask: FieldMask,
+    ) -> Result<Vec<SearchHit>> {
+        if limit < 1 {
+            return Ok(Vec::new());
+        }
+
+        let sqlite_guard = self.sqlite_guard()?;
+        let Some(conn) = sqlite_guard.as_ref() else {
+            return Ok(Vec::new());
+        };
+
+        let empty_params: [ParamValue; 0] = [];
+        let has_fts_lex = franken_query_map_collect_retry(
+            conn,
+            "SELECT 1 FROM sqlite_master WHERE name = 'fts_lex'",
+            &empty_params,
+            |row| row.get_typed::<i64>(0),
+        )
+        .map(|rows| !rows.is_empty())
+        .unwrap_or(false);
+        if !has_fts_lex {
+            return Ok(Vec::new());
+        }
+
+        let query_match_type = dominant_match_type(raw_query);
+        let ku3_like_fallback = is_lexical_ku3_short_query(raw_query);
+
+        let post_filter = Self::sqlite_fts5_filters_need_post_hydration(&filters);
+        let target_hits = if post_filter {
+            offset.saturating_add(limit)
+        } else {
+            limit
+        };
+        let rank_batch_limit = if post_filter {
+            target_hits.clamp(1, SQLITE_FTS5_POST_FILTER_SCAN_CHUNK)
+        } else {
+            limit
+        };
+        let mut rank_offset = if post_filter { 0 } else { offset };
+        let mut scanned_rows = 0usize;
+        let mut hits = Vec::with_capacity(target_hits.min(rank_batch_limit));
+
+        loop {
+            let (rank_sql, rank_params) = if ku3_like_fallback {
+                Self::lex_docs_like_rank_query(raw_query.trim(), rank_batch_limit, rank_offset)
+            } else {
+                let fts_query = match transpile_to_fts5(raw_query) {
+                    Some(q) if !q.trim().is_empty() => q,
+                    _ => return Ok(Vec::new()),
+                };
+                Self::fts_lex_match_rank_query(fts_query.as_str(), rank_batch_limit, rank_offset)
+            };
+
+            let ranked_rows: Vec<(i64, f64)> =
+                match franken_query_map_collect_retry(conn, &rank_sql, &rank_params, |row| {
+                    Ok((row.get_typed(0)?, row.get_typed(1)?))
+                }) {
+                    Ok(rows) => rows,
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            ku3_like_fallback,
+                            "fts_lex rank query failed; returning no lexical hits"
+                        );
+                        return Ok(Vec::new());
+                    }
+                };
+            if ranked_rows.is_empty() {
+                break;
+            }
+
+            scanned_rows = scanned_rows.saturating_add(ranked_rows.len());
+            let score_by_message_id: HashMap<i64, f64> = ranked_rows.iter().copied().collect();
+            let message_ids: Vec<i64> = ranked_rows.iter().map(|(id, _)| *id).collect();
+
+            let mut metadata_by_message_id = HashMap::with_capacity(message_ids.len());
+            for chunk in message_ids.chunks(SQLITE_FTS5_HYDRATE_PARAM_CHUNK) {
+                let metadata_sql = Self::sqlite_fts5_message_hydrate_query(chunk.len(), field_mask);
+                let metadata_params: Vec<ParamValue> =
+                    chunk.iter().map(|id| ParamValue::from(*id)).collect();
+                let rows: Vec<SqliteFtsMessageRow> = match franken_query_map_collect_retry(
+                    conn,
+                    &metadata_sql,
+                    &metadata_params,
+                    |row| {
+                        Ok((
+                            row.get_typed(0)?,
+                            row.get_typed(1)?,
+                            row.get_typed(2)?,
+                            row.get_typed(3)?,
+                            row.get_typed(4)?,
+                            row.get_typed(5)?,
+                            row.get_typed(6)?,
+                            row.get_typed(7)?,
+                            row.get_typed(8)?,
+                            row.get_typed::<Option<String>>(9)?,
+                            row.get_typed(10)?,
+                            row.get_typed(11)?,
+                        ))
+                    },
+                ) {
+                    Ok(rows) => rows,
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "fts_lex message hydration query failed; returning no lexical hits"
+                        );
+                        return Ok(Vec::new());
+                    }
+                };
+                metadata_by_message_id.extend(rows.into_iter().map(|row| (row.0, row)));
+            }
+
+            let mut hits_by_message_id = HashMap::with_capacity(ranked_rows.len());
+            for (message_id, meta) in metadata_by_message_id {
+                let Some(&raw_score) = score_by_message_id.get(&message_id) else {
+                    continue;
+                };
+                let (
+                    _message_id,
+                    title,
+                    raw_content,
+                    agent,
+                    workspace,
+                    source_path,
+                    created_at,
+                    idx,
+                    conversation_id,
+                    raw_source_id,
+                    origin_host,
+                    raw_origin_kind,
+                ) = meta;
+                let raw_source_id = raw_source_id.unwrap_or_else(default_source_id);
+                let source_id = normalized_search_hit_source_id_parts(
+                    raw_source_id.as_str(),
+                    raw_origin_kind.as_deref().unwrap_or_default(),
+                    origin_host.as_deref(),
+                );
+                let origin_kind =
+                    normalized_search_hit_origin_kind(source_id.as_str(), raw_origin_kind.as_deref());
+                let line_number = idx
+                    .and_then(|i| usize::try_from(i).ok())
+                    .map(|i| i.saturating_add(1));
+                let snippet = if field_mask.wants_snippet() {
+                    snippet_from_content(&raw_content)
+                } else {
+                    String::new()
+                };
+                let content = if field_mask.needs_content() {
+                    raw_content
+                } else {
+                    String::new()
+                };
+                let content_hash = if content.is_empty() {
+                    stable_hit_hash(&snippet, &source_path, line_number, created_at)
+                } else {
+                    stable_hit_hash(&content, &source_path, line_number, created_at)
+                };
+                // bm25() is more-negative-is-better; the LIKE fallback's
+                // occurrence count is already higher-is-better.
+                let score = if ku3_like_fallback {
+                    raw_score as f32
+                } else {
+                    (-raw_score) as f32
+                };
+
+                let hit = SearchHit {
+                    title,
+                    snippet,
+                    content,
+                    content_hash,
+                    conversation_id,
+                    score,
+                    source_path,
+                    agent,
+                    workspace,
+                    workspace_original: None,
+                    created_at,
+                    line_number,
+                    match_type: query_match_type,
+                    source_id,
+                    origin_kind,
+                    origin_host,
+                };
+                hits_by_message_id.insert(message_id, hit);
+            }
+
+            for (message_id, _) in &ranked_rows {
+                if let Some(hit) = hits_by_message_id.remove(message_id)
+                    && Self::sqlite_fts5_hit_matches_filters(&hit, &filters)
+                {
+                    hits.push(hit);
+                    if hits.len() >= target_hits {
+                        break;
+                    }
+                }
+            }
+
+            if hits.len() >= target_hits
+                || !post_filter
+                || ranked_rows.len() < rank_batch_limit
+                || scanned_rows >= SQLITE_FTS5_POST_FILTER_SCAN_LIMIT
+            {
+                break;
+            }
+            rank_offset = rank_offset.saturating_add(ranked_rows.len());
+        }
+
+        if post_filter {
+            Ok(hits.into_iter().skip(offset).take(limit).collect())
+        } else {
+            Ok(hits)
+        }
+    }
+
     fn search_sqlite_fts5(
         &self,
         _db_path: &Path,
@@ -8725,6 +9142,46 @@ impl SearchClient {
     }
 }
 
+/// W2-5: forces the legacy Tantivy lexical path for the lifetime of the
+/// guard by setting `CASS_LEXICAL_USE_TANTIVY=1`, restoring the prior value
+/// (or clearing it) on drop. Used only by the handful of tests (in this
+/// module and in `search_lexical_self_heal_tests`, src/lib.rs) that
+/// specifically pin Tantivy's own mechanics (snippet/hydration nuances,
+/// sqlite-laziness guarantees, checkpoint-deferral self-heal semantics) --
+/// those tests must be `#[serial]` since this mutates process-wide env read
+/// by every other `search()` call in this test binary. `pub(crate)` (not
+/// nested in `mod tests`) so both test modules can share one guard.
+#[cfg(test)]
+pub(crate) struct LexicalUseTantivyGuard {
+    previous: Option<String>,
+}
+
+#[cfg(test)]
+impl LexicalUseTantivyGuard {
+    pub(crate) fn enable() -> Self {
+        let previous = std::env::var("CASS_LEXICAL_USE_TANTIVY").ok();
+        // SAFETY: test-only, serialized via #[serial] against other tests
+        // that also touch this env var.
+        unsafe {
+            std::env::set_var("CASS_LEXICAL_USE_TANTIVY", "1");
+        }
+        Self { previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for LexicalUseTantivyGuard {
+    fn drop(&mut self) {
+        // SAFETY: see `enable`.
+        unsafe {
+            match &self.previous {
+                Some(value) => std::env::set_var("CASS_LEXICAL_USE_TANTIVY", value),
+                None => std::env::remove_var("CASS_LEXICAL_USE_TANTIVY"),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8734,6 +9191,7 @@ mod tests {
     use crate::storage::api::Profile;
     use crate::storage::sqlite::FrankenStorage;
     use serde_json::json;
+    use serial_test::serial;
     use tempfile::TempDir;
 
     // Reference implementation of the stable dedup key prior to bead num7z.
@@ -15455,7 +15913,15 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn nohit_suggestions_do_not_lazy_open_sqlite_when_tantivy_is_present() -> Result<()> {
+        // W2-5: this test's laziness guarantee (sqlite never opens on a pure
+        // Tantivy no-hit path) is specifically about Tantivy's own dispatch,
+        // which now lives behind CASS_LEXICAL_USE_TANTIVY=1 -- the new
+        // default path must probe sqlite for `lex_docs` viability before it
+        // can even consider Tantivy, so this guarantee no longer holds
+        // there by design.
+        let _tantivy_guard = LexicalUseTantivyGuard::enable();
         let dir = TempDir::new()?;
         let index_path = dir.path().join("index");
         let db_path = dir.path().join("cass.db");
@@ -15943,7 +16409,16 @@ mod tests {
     // ============================================================
 
     #[test]
+    #[serial]
     fn tantivy_search_hydrates_long_content_when_content_field_is_not_stored() -> Result<()> {
+        // W2-5: this test pins Tantivy's own word-tokenizer semantics
+        // ("shortneedle" is one token, not a substring match for "needle").
+        // `fts_lex`'s trigram tokenizer is substring-matching by design and
+        // legitimately finds both messages -- a real recall improvement
+        // (the preregistration doc's "language upgrade" clause), not a
+        // regression -- so this Tantivy-specific assertion must run under
+        // the legacy flag to keep testing what it names.
+        let _tantivy_guard = LexicalUseTantivyGuard::enable();
         let dir = TempDir::new()?;
         let db_path = dir.path().join("cass.db");
         let storage = FrankenStorage::open(&db_path)?;
@@ -21156,6 +21631,250 @@ mod tests {
         assert!(
             hit_is_noise(&hit, ""),
             "bare tool-ack 'ok' with content present should still be dropped as noise"
+        );
+    }
+
+    // ============================================================
+    // W2-5 Step 1: KU3 short-CJK-query LIKE fallback
+    // ============================================================
+
+    /// The trigram floor is a codepoint-count property, not a CJK-specific
+    /// one (see `is_lexical_ku3_short_query`'s doc comment for the measured
+    /// evidence) -- ASCII and emoji queries under 3 codepoints degrade too.
+    #[test]
+    fn ku3_gate_triggers_below_three_chars_regardless_of_script() {
+        assert!(is_lexical_ku3_short_query("事务"), "2-char CJK must degrade");
+        assert!(is_lexical_ku3_short_query("中"), "1-char CJK must degrade");
+        assert!(
+            !is_lexical_ku3_short_query("事务提交"),
+            "4-char CJK is long enough for trigram MATCH, must not degrade"
+        );
+        assert!(
+            !is_lexical_ku3_short_query("三字中文"),
+            "3+ char CJK must not degrade (trigram floor is exactly 3)"
+        );
+        assert!(
+            is_lexical_ku3_short_query("ok"),
+            "short ASCII query must ALSO degrade -- measured: fts_lex MATCH 'ok' finds nothing \
+             even when 'ok' is present in indexed content, same trigram floor as CJK"
+        );
+        assert!(
+            !is_lexical_ku3_short_query("age"),
+            "3-char ASCII is long enough for trigram MATCH, must not degrade"
+        );
+        assert!(is_lexical_ku3_short_query("🎉🎊"), "short emoji query must ALSO degrade");
+        assert!(!is_lexical_ku3_short_query(""), "empty query is not a degrade case");
+        assert!(!is_lexical_ku3_short_query("  "), "whitespace-only query is not a degrade case");
+    }
+
+    #[test]
+    fn like_substring_pattern_escapes_percent_and_underscore_and_backslash() {
+        assert_eq!(like_substring_pattern("事务"), "%事务%");
+        assert_eq!(like_substring_pattern("中%"), "%中\\%%");
+        assert_eq!(like_substring_pattern("中_"), "%中\\_%");
+        assert_eq!(like_substring_pattern("中\\文"), "%中\\\\文%");
+    }
+
+    fn insert_v2_lex_message(storage: &FrankenStorage, agent_id: i64, external_id: &str, content: &str) {
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: None,
+            external_id: Some(external_id.to_string()),
+            title: Some(external_id.to_string()),
+            source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
+            started_at: Some(1_700_000_000_000),
+            ended_at: None,
+            approx_tokens: None,
+            metadata_json: json!({}),
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: Some("user".into()),
+                created_at: Some(1_700_000_000_000),
+                content: content.to_string(),
+                extra_json: json!({}),
+                snippets: Vec::new(),
+            }],
+            source_id: crate::sources::provenance::LOCAL_SOURCE_ID.to_string(),
+            origin_host: None,
+        };
+        storage
+            .insert_conversation_tree(agent_id, None, &conversation)
+            .expect("insert conversation through the real write path (syncs lex_docs/fts_lex)");
+    }
+
+    /// KU3 end-to-end: a two-character Chinese query recalls a hit via the
+    /// public `SearchClient::search()` API that plain `fts_lex MATCH` cannot
+    /// (structurally, per `fts_lex_trigram_matches_three_char_chinese`'s
+    /// sibling fact in tests/w2_fts_schema.rs -- trigram needs 3+ chars).
+    #[test]
+    fn search_finds_two_char_chinese_query_via_ku3_like_fallback() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        insert_v2_lex_message(&storage, agent_id, "ku3-hit", "本次事务提交失败，需要重试");
+        insert_v2_lex_message(&storage, agent_id, "ku3-miss", "完全不相关的内容，没有目标词");
+        storage.close().unwrap();
+
+        // No Tantivy index at all -- exercises the pure fts_lex/lex_docs path.
+        let missing_index_path = dir.path().join("no-such-index");
+        let client = SearchClient::open(&missing_index_path, Some(&db_path))
+            .unwrap()
+            .expect("sqlite-only client should still open");
+
+        // Sanity: plain MATCH structurally cannot find a 2-char CJK term
+        // (mirrors tests/w2_fts_schema.rs's 3-char pinning test).
+        let (match_sql, match_params) = SearchClient::fts_lex_match_rank_query("事务", 10, 0);
+        let guard = client.sqlite_guard().unwrap();
+        let conn = guard.as_ref().unwrap();
+        let match_rows: Vec<(i64, f64)> = conn
+            .query_all_map(&match_sql, &match_params, |row| Ok((row.get_typed(0)?, row.get_typed(1)?)))
+            .unwrap();
+        assert!(match_rows.is_empty(), "sanity: plain fts_lex MATCH must not find a 2-char CJK term");
+        drop(guard);
+
+        let hits = client
+            .search("事务", SearchFilters::default(), 10, 0, FieldMask::FULL)
+            .unwrap();
+        assert_eq!(hits.len(), 1, "KU3 LIKE fallback must recall the exact one matching conversation");
+        assert_eq!(hits[0].title, "ku3-hit");
+    }
+
+    /// Short ASCII queries also hit the trigram floor (see
+    /// `is_lexical_ku3_short_query`'s doc comment) and must still be
+    /// findable end-to-end via the LIKE degrade -- not skipped just because
+    /// they aren't CJK. A 3+ char ASCII query, long enough for MATCH, must
+    /// still work too.
+    #[test]
+    fn search_finds_short_ascii_query_via_ku3_like_fallback_and_long_ascii_via_match() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        insert_v2_lex_message(&storage, agent_id, "ok-hit", "the deploy is ok now");
+        storage.close().unwrap();
+
+        let missing_index_path = dir.path().join("no-such-index");
+        let client = SearchClient::open(&missing_index_path, Some(&db_path))
+            .unwrap()
+            .expect("sqlite-only client should still open");
+
+        let short_hits = client.search("ok", SearchFilters::default(), 10, 0, FieldMask::FULL).unwrap();
+        assert_eq!(short_hits.len(), 1, "2-char ASCII query must be found via the LIKE degrade");
+
+        let long_hits = client.search("deploy", SearchFilters::default(), 10, 0, FieldMask::FULL).unwrap();
+        assert_eq!(long_hits.len(), 1, "3+ char ASCII query must be found via ordinary MATCH");
+    }
+
+    #[test]
+    fn ku3_like_fallback_handles_meta_character_query() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        // Literal "中%" substring; a naive unescaped LIKE '%中%%' would also
+        // match plain "中" content -- this fixture would let that leak
+        // through, proving the ESCAPE clause actually matters.
+        insert_v2_lex_message(&storage, agent_id, "meta-hit", "标记为 中% 的项目");
+        insert_v2_lex_message(&storage, agent_id, "meta-decoy", "只有中，没有百分号");
+        storage.close().unwrap();
+
+        let missing_index_path = dir.path().join("no-such-index");
+        let client = SearchClient::open(&missing_index_path, Some(&db_path))
+            .unwrap()
+            .expect("sqlite-only client should still open");
+
+        let hits = client
+            .search("中%", SearchFilters::default(), 10, 0, FieldMask::FULL)
+            .unwrap();
+        assert_eq!(hits.len(), 1, "ESCAPE must treat '%' as a literal, not a wildcard");
+        assert_eq!(hits[0].title, "meta-hit");
+    }
+
+    #[test]
+    fn fts_lex_match_rank_query_does_not_scan_lex_docs() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        insert_v2_lex_message(&storage, agent_id, "plan-fixture", "porter trigram query plan fixture");
+        let conn = storage.raw();
+
+        let (sql, params) = SearchClient::fts_lex_match_rank_query("trigram", 10, 0);
+        let plan_details: Vec<String> = conn
+            .query_all_map(&format!("EXPLAIN QUERY PLAN {sql}"), &params, |row| row.get_typed(3))
+            .unwrap();
+        assert!(
+            plan_details.iter().any(|d| d.to_lowercase().contains("fts_lex")),
+            "MATCH query plan must touch the fts_lex virtual table index, got {plan_details:?}"
+        );
+        assert!(
+            !plan_details.iter().any(|d| d.contains("SCAN lex_docs")),
+            "MATCH query plan must not fall back to a lex_docs table scan, got {plan_details:?}"
+        );
+    }
+
+    #[test]
+    fn lex_docs_like_rank_query_is_a_genuine_table_scan() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        insert_v2_lex_message(&storage, agent_id, "plan-fixture", "事务处理示例");
+        let conn = storage.raw();
+
+        let (sql, params) = SearchClient::lex_docs_like_rank_query("事务", 10, 0);
+        let plan_details: Vec<String> = conn
+            .query_all_map(&format!("EXPLAIN QUERY PLAN {sql}"), &params, |row| row.get_typed(3))
+            .unwrap();
+        assert!(
+            plan_details
+                .iter()
+                .any(|d| d.contains("SCAN") && d.contains("lex_docs")),
+            "KU3 LIKE fallback must be a genuine lex_docs table scan (full-corpus correctness), got {plan_details:?}"
         );
     }
 }
