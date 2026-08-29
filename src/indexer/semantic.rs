@@ -4123,6 +4123,64 @@ mod tests {
         Ok(())
     }
 
+    /// Old checkpoints (pre-w1c-C5-B1, or hand-edited manifests) carry
+    /// `last_message_id` without the new paired
+    /// `last_message_id_conversation_id`. Compatibility contract: an
+    /// unpaired message-id floor applies NO filtering at all, never
+    /// falling back to the old global-floor behavior — a few messages
+    /// getting harmlessly re-embedded (memoized/idempotent) is the
+    /// correct trade against silently stranding whole conversations.
+    #[test]
+    fn canonical_embedding_batch_unpaired_message_id_floor_applies_no_filter() -> Result<()> {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path)?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".to_string(),
+            name: "Codex".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        storage.insert_conversation_tree(
+            agent_id,
+            None,
+            &test_conversation("unpaired-a", "unpaired a message"),
+        )?;
+        storage.insert_conversation_tree(
+            agent_id,
+            None,
+            &test_conversation("unpaired-b", "unpaired b message"),
+        )?;
+        let high_watermark: i64 = storage.raw().query_row_map(
+            "SELECT MAX(id) FROM messages",
+            &[] as &[ParamValue],
+            |row| row.get_typed(0),
+        )?;
+
+        // A floor at (or above) every existing message id, but with no
+        // paired conversation — simulating a pre-fix checkpoint.
+        let batch = fetch_canonical_embedding_batch_inner(
+            &storage,
+            0,
+            8,
+            Some(high_watermark),
+            None,
+        )?;
+
+        assert_eq!(
+            batch.conversations_in_batch, 2,
+            "an unpaired message-id floor must not exclude any conversation"
+        );
+        assert_eq!(
+            batch.inputs.len(),
+            2,
+            "an unpaired message-id floor must not filter out any message, \
+             even ones at or below the floor value"
+        );
+        Ok(())
+    }
+
     #[test]
     fn canonical_embedding_batch_reports_unexhausted_cursor_at_sql_limit() -> Result<()> {
         let temp = tempdir()?;
