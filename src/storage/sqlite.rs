@@ -6939,12 +6939,31 @@ impl FrankenStorage {
     /// per-conversation logic the live write path already uses — so a full
     /// rebuild and incremental sync can never diverge on what ends up in
     /// `lex_docs`.
-    pub(crate) fn rebuild_lex_domain_from_db(&self) -> Result<LexDomainRebuildStats> {
+    ///
+    /// X-2 (w2-4-rebuild-run.md): `progress`, when given, is driven with the
+    /// exact same `total.store` + `current.fetch_add(batch.len())` idiom the
+    /// tantivy rebuild pipeline already uses for its own conversation
+    /// batches — this is precisely what `IndexStallWatchdog::observe` reads
+    /// to decide whether the process is making forward progress. Without it,
+    /// the tantivy phase leaves `current == total` and this loop never
+    /// touches either atomic, so the watchdog sees zero progress from the
+    /// moment tantivy finishes and kills the process with `exit(70)` after
+    /// the default 300s abort threshold — on a real corpus this loop alone
+    /// runs for minutes, so the process was always killed before finishing.
+    pub(crate) fn rebuild_lex_domain_from_db(
+        &self,
+        progress: Option<&Arc<crate::indexer::IndexingProgress>>,
+    ) -> Result<LexDomainRebuildStats> {
         const CONVERSATIONS_PER_TX: usize = 200;
         let conversation_ids: Vec<i64> = self
             .conn
             .query_all_map("SELECT id FROM conversations ORDER BY id", &[], |row| row.get_typed(0))
             .context("listing conversation ids for lex domain full rebuild")?;
+
+        if let Some(progress) = progress {
+            progress.total.store(conversation_ids.len(), Ordering::Relaxed);
+            progress.current.store(0, Ordering::Relaxed);
+        }
 
         let mut conversations_processed = 0usize;
         for chunk in conversation_ids.chunks(CONVERSATIONS_PER_TX) {
@@ -6962,6 +6981,9 @@ impl FrankenStorage {
                         chunk.len()
                     )
                 })?;
+            if let Some(progress) = progress {
+                progress.current.fetch_add(chunk.len(), Ordering::Relaxed);
+            }
             conversations_processed += chunk.len();
         }
 
@@ -17081,7 +17103,7 @@ mod tests {
             storage.conn.query_row_map("SELECT COUNT(*) FROM lex_docs", &[], |row| row.get_typed(0)).unwrap();
         assert_eq!(sanity_empty, 0, "sanity: lex_docs must be empty before the full rebuild runs");
 
-        let stats = storage.rebuild_lex_domain_from_db().unwrap();
+        let stats = storage.rebuild_lex_domain_from_db(None).unwrap();
         assert_eq!(stats.conversations_processed, 5);
 
         let mut lex_docs_ids: Vec<i64> = storage
@@ -17093,6 +17115,126 @@ mod tests {
         assert_eq!(
             eligible_ids, lex_docs_ids,
             "bidirectional anti-join: eligible set and lex_docs must match exactly, not just in count"
+        );
+    }
+
+    /// X-2 (w2-4-rebuild-run.md): `IndexStallWatchdog::observe` decides
+    /// whether the indexer is making forward progress purely from
+    /// `IndexingProgress::{phase,current}` -- it never reads any on-disk
+    /// heartbeat file. `rebuild_lex_domain_from_db` must therefore refresh
+    /// `progress.current` after every committed transaction batch, not just
+    /// once at the very end (a real corpus's lex domain rebuild runs for
+    /// minutes and would otherwise be killed by the default 300s abort with
+    /// `exit(70)` because the watchdog would see zero progress from the
+    /// moment the preceding tantivy phase finished).
+    ///
+    /// Proven deterministically (no timing/threads required) by forcing the
+    /// SECOND batch to fail right after the FIRST batch commits: if
+    /// `current` were only bumped once at the very end (or not at all), it
+    /// would stay at 0 even though 200 conversations were successfully
+    /// synced; bumped per completed batch, it reflects exactly the first
+    /// batch's count. Deleting this test's per-batch `fetch_add` call turns
+    /// it red (mutation check).
+    #[test]
+    fn rebuild_lex_domain_from_db_refreshes_progress_current_after_each_committed_batch() {
+        use crate::model::types::{Agent, AgentKind, Conversation};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "claude_code".into(),
+                name: "Claude Code".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+
+        // 200 valid conversations (batch 1) + 1 poisoned conversation with a
+        // dangling `agent_id` inserted directly with the highest id (batch
+        // 2, alone). `rebuild_lex_domain_from_db` re-lists conversation ids
+        // itself right before batching, so the poisoned row must already
+        // exist in the table (not merely referenced afterwards) to land in
+        // the second batch -- a plain `DELETE` of the row would make it
+        // vanish from that listing entirely and produce one clean 200-row
+        // batch instead of the two-batch, second-fails shape this test needs.
+        const VALID_CONVERSATIONS: usize = 200;
+        for i in 0..VALID_CONVERSATIONS {
+            let external_id = format!("heartbeat-{i}");
+            let conversation = Conversation {
+                id: None,
+                agent_slug: "claude_code".into(),
+                workspace: None,
+                external_id: Some(external_id.clone()),
+                title: Some(format!("title {i}")),
+                source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
+                started_at: Some(1_700_000_000_000),
+                ended_at: None,
+                approx_tokens: None,
+                metadata_json: serde_json::Value::Null,
+                messages: Vec::new(),
+                source_id: LOCAL_SOURCE_ID.into(),
+                origin_host: None,
+            };
+            storage.insert_conversation_tree(agent_id, None, &conversation).unwrap();
+        }
+
+        let max_valid_id: i64 = storage
+            .conn
+            .query_row_map("SELECT MAX(id) FROM conversations", &[], |row| row.get_typed(0))
+            .unwrap();
+        let poisoned_id = max_valid_id + 1;
+
+        // Same narrow FK-bypass fixture pattern already used by
+        // `orphan_fk_self_heal`-style tests to construct a state that is
+        // structurally unreachable through any normal insert while FK
+        // enforcement is on: a conversation row whose `agent_id` points at
+        // no existing agent. `sync_lexical_domain_for_conversation_in_tx`'s
+        // `JOIN agents a ON a.id = c.agent_id` then returns zero rows for
+        // this one conversation, failing its batch with a real `Err`.
+        storage.raw().execute_batch_bypassing_foreign_keys_guard("PRAGMA foreign_keys = OFF").unwrap();
+        storage
+            .raw()
+            .execute(
+                "INSERT INTO conversations(id, agent_id, source_id, source_path, started_at) \
+                 VALUES(?1, 999999999, 'local', '/tmp/heartbeat-poisoned.jsonl', 1700000000000)",
+                fparams![poisoned_id],
+            )
+            .unwrap();
+        storage.raw().execute_batch_bypassing_foreign_keys_guard("PRAGMA foreign_keys = ON").unwrap();
+
+        const TOTAL_CONVERSATIONS: usize = VALID_CONVERSATIONS + 1;
+        let conversation_ids: Vec<i64> = storage
+            .conn
+            .query_all_map("SELECT id FROM conversations ORDER BY id", &[], |row| row.get_typed(0))
+            .unwrap();
+        assert_eq!(conversation_ids.len(), TOTAL_CONVERSATIONS);
+        assert_eq!(
+            *conversation_ids.last().unwrap(),
+            poisoned_id,
+            "sanity: the poisoned row must sort last so it lands alone in the second batch"
+        );
+
+        let progress = Arc::new(crate::indexer::IndexingProgress::default());
+        let result = storage.rebuild_lex_domain_from_db(Some(&progress));
+        assert!(result.is_err(), "batch 2's poisoned conversation row must fail the rebuild");
+
+        assert_eq!(
+            progress.total.load(Ordering::Relaxed),
+            TOTAL_CONVERSATIONS,
+            "total must be set to the full conversation count up front"
+        );
+        assert_eq!(
+            progress.current.load(Ordering::Relaxed),
+            200,
+            "current must reflect exactly the first (successfully committed) batch, proving \
+             the loop refreshes progress after each committed transaction batch rather than \
+             once at the end -- without this heartbeat the stall watchdog sees zero forward \
+             progress for the entire multi-minute lex domain rebuild on a real corpus and kills \
+             the process with exit(70) (X-2, w2-4-rebuild-run.md)"
         );
     }
 

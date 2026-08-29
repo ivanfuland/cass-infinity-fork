@@ -2676,12 +2676,14 @@ fn try_readonly_canonical_force_rebuild(
         )
     })?;
     let lex_rebuild_started = Instant::now();
-    let lex_stats = lex_storage.rebuild_lex_domain_from_db().with_context(|| {
-        format!(
-            "rebuilding lex_docs/fts_lex domain after readonly force rebuild: {}",
-            opts.db_path.display()
-        )
-    })?;
+    let lex_stats = lex_storage
+        .rebuild_lex_domain_from_db(opts.progress.as_ref())
+        .with_context(|| {
+            format!(
+                "rebuilding lex_docs/fts_lex domain after readonly force rebuild: {}",
+                opts.db_path.display()
+            )
+        })?;
     tracing::info!(
         db_path = %opts.db_path.display(),
         conversations_processed = lex_stats.conversations_processed,
@@ -14823,7 +14825,7 @@ pub fn run_index(
     // redundant whole-archive recompute on every run.
     if opts.full || canonical_only_full_rebuild {
         let lex_rebuild_started = Instant::now();
-        match storage.rebuild_lex_domain_from_db() {
+        match storage.rebuild_lex_domain_from_db(opts.progress.as_ref()) {
             Ok(stats) => tracing::info!(
                 db_path = %opts.db_path.display(),
                 conversations_processed = stats.conversations_processed,
