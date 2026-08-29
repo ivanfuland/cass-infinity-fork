@@ -667,6 +667,21 @@ pub struct BuildCheckpoint {
     /// strictly resumes past this cursor when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_message_id: Option<i64>,
+    /// The single conversation `last_message_id` was captured from.
+    ///
+    /// Added for the w1c-C5-B1 fix: message ids are not monotonic with
+    /// conversation ids (a conversation can keep receiving new
+    /// messages, with fresh ids, long after later conversations
+    /// already exist), so `last_message_id` on its own cannot safely
+    /// gate candidacy for conversations other than the one it came
+    /// from. Resume applies the `last_message_id` floor ONLY to this
+    /// paired conversation; every other conversation is evaluated on
+    /// whole-conversation-candidate rules. `None` for checkpoints
+    /// written before this fix, or when `last_message_id` itself is
+    /// `None` — both cases disable the floor entirely rather than
+    /// falling back to the old global-floor behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_message_id_conversation_id: Option<i64>,
     /// Whether the canonical selection cursor proved there are no more
     /// eligible conversations after this checkpoint.
     ///
@@ -1451,6 +1466,7 @@ mod tests {
             chunking_version: CHUNKING_STRATEGY_VERSION,
             saved_at_ms: 1_700_000_030_000,
             last_message_id: None,
+            last_message_id_conversation_id: None,
             cursor_exhausted: false,
         }
     }
