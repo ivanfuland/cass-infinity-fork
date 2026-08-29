@@ -1060,7 +1060,9 @@ pub struct IndexingProgress {
     /// that active checkpoint as a #297 finalize wedge and kill the process
     /// (exit 70) mid-write — which strands the un-truncated WAL and leaves the
     /// canonical DB malformed to stock SQLite (#296/#321). Liveness is still
-    /// bounded: see `index_finalize_abort_threshold` (#319).
+    /// bounded: see `index_finalize_abort_threshold` (#319); its default is
+    /// pinned to the KU1 measurement in
+    /// `reports/w1-artifacts/ku1-checkpoint-latency.md`.
     pub finalizing: AtomicBool,
     /// Number of coding agents discovered so far during scanning
     pub discovered_agents: AtomicUsize,
@@ -15450,8 +15452,10 @@ pub fn run_index(
     // does not misread the quiescent, phase-0, current==total state as a #297
     // finalize wedge and kill the process (exit 70) mid-checkpoint — which would
     // strand the un-truncated WAL and leave the DB malformed (#296/#321). The
-    // watchdog still bounds this window (see `index_finalize_abort_threshold`),
-    // so a genuinely stuck finalize is still aborted.
+    // watchdog still bounds this window (see `index_finalize_abort_threshold`,
+    // default pinned to the KU1 measurement in
+    // reports/w1-artifacts/ku1-checkpoint-latency.md), so a genuinely stuck
+    // finalize is still aborted.
     if let Some(progress) = opts.progress.as_ref() {
         progress.finalizing.store(true, Ordering::Relaxed);
     }

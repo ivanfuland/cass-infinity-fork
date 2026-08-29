@@ -86856,16 +86856,101 @@ fn index_stall_abort_threshold(
 /// fires. `CASS_INDEX_FINALIZE_ABORT_SECS=0` makes the finalize window
 /// report-only (never abort). The floor is the ordinary abort threshold, so
 /// this can only ever *lengthen* the finalize grace, never shorten it.
+///
+/// Default value (KU1, `reports/w1-artifacts/ku1-checkpoint-latency.md`):
+/// 20 rounds of 10万-row batch write + `wal_checkpoint(TRUNCATE)` on a staging
+/// DB copy measured p50=1324.5ms / p99=3147ms, i.e. p99×3 ≈ 9.4s — far below
+/// this constant. The formula's floor (never lower than the prior value) wins
+/// here on purpose: the #319 worst case this constant actually guards against
+/// (~1.1 GB / ~290k-frame WAL, slow Darwin fsync) is far larger than anything
+/// the KU1 drill's Linux/NVMe/sub-GB-WAL samples reproduce, so a same-machine
+/// measurement understates it. Re-measure and only then reconsider lowering
+/// this if a representative large-WAL/macOS sample ever becomes available.
+const INDEX_FINALIZE_ABORT_SECS_DEFAULT: u64 = 1800;
+
 fn index_finalize_abort_threshold(abort_threshold: Option<Duration>) -> Option<Duration> {
     let abort_threshold = abort_threshold?;
     let finalize_secs = dotenvy::var("CASS_INDEX_FINALIZE_ABORT_SECS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(1800);
+        .unwrap_or(INDEX_FINALIZE_ABORT_SECS_DEFAULT);
     if finalize_secs == 0 {
         return None;
     }
     Some(Duration::from_secs(finalize_secs).max(abort_threshold))
+}
+
+#[cfg(test)]
+mod indexer_finalize_abort_threshold_tests {
+    use super::*;
+    use serial_test::serial;
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.previous {
+                unsafe {
+                    std::env::set_var(self.key, value);
+                }
+            } else {
+                unsafe {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    fn clear_env(key: &'static str) -> EnvGuard {
+        let previous = dotenvy::var(key).ok();
+        unsafe {
+            std::env::remove_var(key);
+        }
+        EnvGuard { key, previous }
+    }
+
+    /// KU1 (`reports/w1-artifacts/ku1-checkpoint-latency.md`): 20 rounds of
+    /// 10万-row batch write + `wal_checkpoint(TRUNCATE)` on a `VACUUM INTO`
+    /// drill copy of the staging DB measured p50=1324.5ms / p99=3147ms.
+    const KU1_MEASURED_P99_MS: u64 = 3147;
+    const PRE_KU1_DEFAULT_SECS: u64 = 1800;
+
+    #[test]
+    #[serial]
+    fn default_threshold_hits_real_code_path_and_honors_ku1_floor() {
+        // Exercise the real function end-to-end (not the raw constant in
+        // isolation): env override unset, and an ordinary abort_threshold far
+        // below the finalize default, so the finalize floor is what actually
+        // determines the returned value.
+        let _guard = clear_env("CASS_INDEX_FINALIZE_ABORT_SECS");
+        let ordinary = Duration::from_secs(300);
+
+        let resolved = index_finalize_abort_threshold(Some(ordinary))
+            .expect("finalize threshold must be Some when abort_threshold is Some and env unset");
+
+        assert_eq!(
+            resolved,
+            Duration::from_secs(INDEX_FINALIZE_ABORT_SECS_DEFAULT),
+            "default finalize abort threshold must come from the real \
+             index_finalize_abort_threshold() code path, not a hardcoded literal"
+        );
+
+        // KU1 formula: threshold = measured p99 * 3, floored at the prior
+        // production value (never lowered — see the doc comment on
+        // INDEX_FINALIZE_ABORT_SECS_DEFAULT and the KU1 report).
+        let measured_p99_x3_secs = (KU1_MEASURED_P99_MS * 3) as f64 / 1000.0;
+        assert!(
+            (INDEX_FINALIZE_ABORT_SECS_DEFAULT as f64) >= measured_p99_x3_secs,
+            "threshold ({INDEX_FINALIZE_ABORT_SECS_DEFAULT}s) must be >= measured p99*3 ({measured_p99_x3_secs}s)"
+        );
+        assert!(
+            INDEX_FINALIZE_ABORT_SECS_DEFAULT >= PRE_KU1_DEFAULT_SECS,
+            "KU1 must never lower the finalize abort threshold below the prior production value"
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
