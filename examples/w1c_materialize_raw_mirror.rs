@@ -351,12 +351,40 @@ fn main() {
         let blob_path = raw_mirror.join(&manifest.blob_relative_path);
         let bytes = fs::read(&blob_path)
             .unwrap_or_else(|e| panic!("reading blob {}: {e}", blob_path.display()));
-        {
-            let mut file = fs::File::create(&target)
-                .unwrap_or_else(|e| panic!("creating {}: {e}", target.display()));
-            file.write_all(&bytes)
-                .unwrap_or_else(|e| panic!("writing {}: {e}", target.display()));
+
+        // R1-B8: write to a same-directory temp file, fsync, then atomically
+        // rename into place, so a run interrupted mid-write never leaves a
+        // truncated file sitting at `target` itself (the assert above
+        // already refuses to touch an existing `target`; this hardens the
+        // write path leading up to it). A leftover `.tmp` from a prior
+        // interrupted run is removed and rewritten rather than treated as
+        // an error -- it belongs to no completed materialization.
+        let tmp_target = target_parent.join(format!(
+            "{}.tmp",
+            target
+                .file_name()
+                .expect("target has a file name")
+                .to_string_lossy()
+        ));
+        if tmp_target.exists() {
+            fs::remove_file(&tmp_target)
+                .unwrap_or_else(|e| panic!("removing leftover tmp file {}: {e}", tmp_target.display()));
         }
+        {
+            let mut file = fs::File::create(&tmp_target)
+                .unwrap_or_else(|e| panic!("creating {}: {e}", tmp_target.display()));
+            file.write_all(&bytes)
+                .unwrap_or_else(|e| panic!("writing {}: {e}", tmp_target.display()));
+            file.sync_all()
+                .unwrap_or_else(|e| panic!("fsync {}: {e}", tmp_target.display()));
+        }
+        fs::rename(&tmp_target, &target).unwrap_or_else(|e| {
+            panic!(
+                "renaming {} -> {}: {e}",
+                tmp_target.display(),
+                target.display()
+            )
+        });
 
         // Final authority: reread from disk and rehash, independent of the
         // in-memory bytes just written.
