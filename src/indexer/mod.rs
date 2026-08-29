@@ -2652,6 +2652,50 @@ fn try_readonly_canonical_force_rebuild(
             observed_messages,
         );
     }
+
+    // w2 W2-4 closeout (X-1, control-plane ruling): this readonly fast path
+    // used to return here without ever touching the lex_docs/fts_lex
+    // domain -- the tantivy rebuild above never opens a writable
+    // connection, so a plain `cass index --force-rebuild` on a populated
+    // canonical DB (the common real dispatch path this function exists
+    // for) silently left the FTS5 lexical domain stale/missing while
+    // still reporting success. A short writable window here, opened and
+    // closed around just this one operation, preserves the fast path's
+    // readonly-preflight intent for the tantivy rebuild while still
+    // covering the domain a full/force rebuild is supposed to guarantee.
+    // `FrankenStorage::open()` runs `schema::ensure` internally, so this
+    // also performs the version 1 -> 2 migration for a database that
+    // predates lex_docs/fts_lex. Fail-closed: an error here fails the
+    // whole force-rebuild call (via `?`), not just a logged warning --
+    // otherwise "tantivy rebuilt fine" would silently mask "the lexical
+    // domain didn't."
+    let lex_storage = FrankenStorage::open(&opts.db_path).with_context(|| {
+        format!(
+            "opening canonical database writable for lex domain rebuild: {}",
+            opts.db_path.display()
+        )
+    })?;
+    let lex_rebuild_started = Instant::now();
+    let lex_stats = lex_storage.rebuild_lex_domain_from_db().with_context(|| {
+        format!(
+            "rebuilding lex_docs/fts_lex domain after readonly force rebuild: {}",
+            opts.db_path.display()
+        )
+    })?;
+    tracing::info!(
+        db_path = %opts.db_path.display(),
+        conversations_processed = lex_stats.conversations_processed,
+        lex_docs_count = lex_stats.lex_docs_count,
+        elapsed_ms = lex_rebuild_started.elapsed().as_millis() as u64,
+        "force rebuild: lex_docs/fts_lex domain rebuilt from canonical messages/conversations"
+    );
+    lex_storage.close().with_context(|| {
+        format!(
+            "closing canonical database after writable lex domain rebuild: {}",
+            opts.db_path.display()
+        )
+    })?;
+
     Ok(true)
 }
 
@@ -47380,6 +47424,120 @@ mod tests {
         anyhow::ensure!(
             matches!(index.record_count(), 2),
             "wrong vector record count"
+        );
+        Ok(())
+    }
+
+    /// w2 W2-4 closeout regression (X-1, control-plane ruling): `cass index
+    /// --force-rebuild` on a populated canonical DB with no --semantic/
+    /// --build-hnsw/--watch/--watch-once is the exact real dispatch that
+    /// `try_readonly_canonical_force_rebuild` exists for, and before this
+    /// fix it never opened a writable connection -- the tantivy rebuild it
+    /// runs is entirely readonly -- so it never touched lex_docs/fts_lex
+    /// at all, silently leaving a v1-shaped canonical DB un-migrated and
+    /// the lexical domain empty while still reporting success.
+    ///
+    /// This must be an entry-level test driving `run_index` itself, not a
+    /// direct call to `rebuild_lex_domain_from_db` or
+    /// `try_readonly_canonical_force_rebuild`: exec24's unit tests on the
+    /// inner rebuild function were all green because they called it
+    /// directly, bypassing the exact dispatch bug this test exists to
+    /// catch (a real `cass index --force-rebuild` process never reached
+    /// that function at all).
+    #[test]
+    #[serial]
+    fn run_index_force_rebuild_on_populated_db_repairs_lex_domain_via_readonly_fast_path()
+    -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let data_dir = tmp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir)?;
+        let db_path = data_dir.join("db.sqlite");
+        let session = tmp
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("28")
+            .join("rollout-w24-entry-fastpath.jsonl");
+        write_semantic_watch_once_codex_session(
+            &session,
+            "w24-entry-fastpath",
+            "entryfastpathmarkerzqx",
+        )?;
+
+        // Seed: one real session through the normal entry point. This also
+        // builds a v2 canonical DB with lex_docs/fts_lex already correctly
+        // populated (F1's fix covers this path) -- exactly why the next
+        // step reverts it, rather than trusting that as the test's proof.
+        let seed_opts = super::IndexOptions {
+            full: false,
+            watch: false,
+            force_rebuild: false,
+            watch_once_paths: Some(vec![session.clone()]),
+            db_path: db_path.clone(),
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_interval_secs: 30,
+        };
+        run_index(seed_opts, None)?;
+
+        // Revert to the real starting condition this bug lived in: a
+        // populated v1-shaped canonical DB with messages but no
+        // lex_docs/fts_lex at all -- exactly the exec25 staging DB's state
+        // when this bug was found (a W1 VACUUM INTO copy never opened by
+        // w2-aware code).
+        {
+            let corrupt = FrankenStorage::open(&db_path)?;
+            corrupt.raw().execute("DROP TABLE IF EXISTS fts_lex", &[])?;
+            corrupt.raw().execute("DROP TABLE IF EXISTS lex_docs", &[])?;
+            corrupt.raw().execute("PRAGMA user_version = 1;", &[])?;
+            corrupt.close()?;
+        }
+        let reverted = FrankenStorage::open_readonly(&db_path)?;
+        anyhow::ensure!(
+            reverted.schema_version()? == 1,
+            "sanity: DB must be reverted to v1 before the force-rebuild call"
+        );
+        reverted.close_without_checkpoint()?;
+
+        // The real dispatch this bug lived in:
+        // `should_try_readonly_canonical_force_rebuild`'s exact condition.
+        let force_rebuild_opts = super::IndexOptions {
+            full: false,
+            watch: false,
+            force_rebuild: true,
+            watch_once_paths: None,
+            db_path: db_path.clone(),
+            data_dir,
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_interval_secs: 30,
+        };
+        run_index(force_rebuild_opts, None)?;
+
+        let reader = FrankenStorage::open_readonly(&db_path)?;
+        anyhow::ensure!(
+            reader.schema_version()? == crate::storage::schema::CURRENT_SCHEMA_VERSION,
+            "force-rebuild's writable window must migrate the v1 DB to the current schema version"
+        );
+        // Quoted-phrase MATCH: the textbook-correct FTS5 syntax for an exact
+        // literal string. `write_semantic_watch_once_codex_session` puts the
+        // marker in *both* the user and the assistant message, so both must
+        // be rebuilt and MATCH-able: 2, not 1.
+        let hits: i64 = reader.raw().query_row_map(
+            "SELECT count(*) FROM fts_lex WHERE fts_lex MATCH '\"entryfastpathmarkerzqx\"'",
+            &[],
+            |row| row.get_typed(0),
+        )?;
+        anyhow::ensure!(
+            hits == 2,
+            "the readonly force-rebuild fast path must actually rebuild fts_lex, not just tantivy"
         );
         Ok(())
     }
