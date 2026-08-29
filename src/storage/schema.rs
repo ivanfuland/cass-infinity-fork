@@ -32,9 +32,14 @@
 //! other statements in the same script:
 //! `sqlite_sequence` (auto-created by the first `AUTOINCREMENT` column) and
 //! the four `fts_messages_*` FTS5 shadow tables (auto-created by the
-//! `CREATE VIRTUAL TABLE ... USING fts5(...)` statement). Explicitly
-//! re-creating those manually one at a time is invalid on real SQLite
-//! (`sqlite_sequence` name is reserved) and pointless for the FTS5 shadows;
+//! `CREATE VIRTUAL TABLE ... USING fts5(...)` statement) — `fts_lex` (w2
+//! Task W2-2, external-content mode) auto-creates the same four-shadow
+//! shape (`fts_lex_config`/`_data`/`_docsize`/`_idx`; no `_content` shadow,
+//! since external-content mode defers hydration to `lex_docs` rather than
+//! keeping its own copy — see OQ2 measurement, control plane 2026-08-29).
+//! Explicitly re-creating those manually one at a time is invalid on real
+//! SQLite (`sqlite_sequence` name is reserved) and pointless for the FTS5
+//! shadows;
 //! this is also the mechanism behind the plan's "standard SQLite rebuild
 //! naturally has no `fts_messages_config` autoindex birth-scar" note — that
 //! scar is a legacy embedded engine quirk from an older incremental path, not
@@ -53,9 +58,15 @@ use super::api::{Conn, StorageError, TxMode};
 /// no migration path defined above this yet — bump this and add a real
 /// upgrade step in [`ensure`] (not just widen the accepted range) the day a
 /// second version is needed.
-pub const CURRENT_SCHEMA_VERSION: i64 = 1;
+///
+/// Version 2 (w2 Task W2-2) adds the `lex_docs`/`fts_lex` domain below.
+/// There is still no real migration step for pre-existing version-1
+/// databases opened by this code (`ensure`'s "already built, nothing to do"
+/// branch does not retroactively add the new tables) -- that gap is closed
+/// by W2-3 Step 4's wave-boundary upgrade test, not here.
+pub const CURRENT_SCHEMA_VERSION: i64 = 2;
 
-/// Full DDL for a version-1 database, applied verbatim inside a single
+/// Full DDL for a version-2 database, applied verbatim inside a single
 /// transaction. See the module doc comment for provenance and the two
 /// auto-managed exclusions (`sqlite_sequence`, `fts_messages_*` shadows).
 const FRESH_SCHEMA_DDL: &str = r#"
@@ -127,6 +138,8 @@ CREATE TABLE IF NOT EXISTS conversation_external_lookup (lookup_key TEXT PRIMARY
 CREATE TABLE IF NOT EXISTS conversation_external_tail_lookup (lookup_key TEXT PRIMARY KEY, conversation_id INTEGER NOT NULL, ended_at INTEGER, last_message_idx INTEGER, last_message_created_at INTEGER);
 CREATE TABLE IF NOT EXISTS operation_commit_receipt (id INTEGER PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE, operation TEXT NOT NULL, state TEXT NOT NULL, snapshot_root TEXT, committed_at_ms INTEGER NOT NULL, detail TEXT);
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, content = '', tokenize = 'porter');
+CREATE TABLE IF NOT EXISTS lex_docs (doc_id INTEGER PRIMARY KEY REFERENCES messages (id) ON DELETE CASCADE, content TEXT NOT NULL, title TEXT NOT NULL, agent TEXT NOT NULL, workspace TEXT NOT NULL, source_path TEXT NOT NULL);
+CREATE VIRTUAL TABLE IF NOT EXISTS fts_lex USING fts5(content, title, agent, workspace, source_path, content = 'lex_docs', content_rowid = 'doc_id', tokenize = 'porter trigram');
 "#;
 
 /// `PRAGMA user_version` is not parameterizable, so it is spliced into a
@@ -264,6 +277,13 @@ mod tests {
         // sqlite_sequence / fts5 shadow tables must come from SQLite itself,
         // not be created a second time by this module.
         assert!(names.contains(&"fts_messages_data".to_string()));
+        // w2 Task W2-2: lex_docs + fts_lex (external-content, OQ2 decision).
+        assert!(names.contains(&"lex_docs".to_string()));
+        assert!(names.contains(&"fts_lex_data".to_string()));
+        assert!(
+            !names.contains(&"fts_lex_content".to_string()),
+            "external-content mode must not maintain its own content shadow"
+        );
     }
 
     /// Regression guard for the seed-data gap a `.schema`-only dump cannot
@@ -408,6 +428,7 @@ mod tests {
 
     /// One past the last real statement, so the loop above also covers
     /// "every statement ran, only the version pragma is missing" -- the
-    /// latest possible interruption point inside the transaction.
-    const FRESH_SCHEMA_DDL_STATEMENT_COUNT_FOR_TEST: usize = 58;
+    /// latest possible interruption point inside the transaction. Bumped
+    /// from 58 to 60 by w2 Task W2-2's `lex_docs`/`fts_lex` addition.
+    const FRESH_SCHEMA_DDL_STATEMENT_COUNT_FOR_TEST: usize = 60;
 }

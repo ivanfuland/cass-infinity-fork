@@ -6043,6 +6043,12 @@ pub(crate) fn commit_replace_in_tx(
         input.conv,
     )?;
 
+    // 9b · w2 Task W2-2/W2-3: 词法域(lex_docs/fts_lex)重算，须在步骤9(title/
+    // workspace 落定)之后调用——早于此处会用旧值同步（W2-0 remeasure 报告曾误
+    // 记「该 UPDATE 由 franken_replace_conversation_messages_in_tx 调用」，实为
+    // 本函数按步骤9独立调用，两者是同一编排下的兄弟步骤而非调用关系，已订正）。
+    crate::storage::sqlite::sync_lexical_domain_for_conversation_in_tx(tx, input.conversation_id)?;
+
     // 10 · 推进 generation
     crate::storage::sqlite::franken_set_source_content_generation_in_tx(tx, input.generation)?;
 
