@@ -3761,6 +3761,39 @@ ON embedding_jobs(db_path, model_id)
 WHERE status IN ('pending', 'running');
 ";
 
+// w2 F4 fix: byte-identical shape to schema.rs's `V2_LEX_DOMAIN_DDL` (which
+// this batch cannot import directly -- `V2_LEX_DOMAIN_DDL` is a private
+// `const &str` in a different module, same constraint that already forced
+// `FRESH_SCHEMA_DDL` to duplicate it there). This batch only recreates the
+// *empty* tables/virtual-table shape, matching every other repair batch
+// here that has no cheap SQL-only source to backfill from -- unlike
+// conversation_external_lookup or conversation_external_tail_lookup, whose
+// content can be regenerated with a single INSERT...SELECT off `messages`/
+// `conversations`, lex_docs/fts_lex content requires the same per-message
+// truncation and noise-filtering logic as
+// `sync_lexical_domain_for_conversation_in_tx`, which is not expressible as
+// a static SQL string. Once the tables exist again, in-transaction writes
+// repopulate them incrementally as conversations get touched; backfilling
+// pre-existing content is the `--full` rebuild's job (W2-4), not this
+// startup self-heal's.
+const CURRENT_SCHEMA_REPAIR_LEX_DOMAIN_SQL: &str = r"
+CREATE TABLE IF NOT EXISTS lex_docs (
+    doc_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+    content TEXT NOT NULL,
+    title TEXT NOT NULL,
+    agent TEXT NOT NULL,
+    workspace TEXT NOT NULL,
+    source_path TEXT NOT NULL
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS fts_lex USING fts5(
+    content, title, agent, workspace, source_path,
+    content = 'lex_docs',
+    content_rowid = 'doc_id',
+    tokenize = 'porter trigram'
+);
+";
+
 const CURRENT_SCHEMA_REPAIR_TOKEN_ANALYTICS_SQL: &str = r"
 CREATE TABLE IF NOT EXISTS token_usage (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4003,6 +4036,11 @@ const CURRENT_SCHEMA_REPAIR_BATCHES: &[SchemaRepairBatch] = &[
         sql: CURRENT_SCHEMA_REPAIR_EMBEDDING_JOBS_SQL,
     },
     SchemaRepairBatch {
+        name: "lex_domain",
+        tables: &["lex_docs", "fts_lex"],
+        sql: CURRENT_SCHEMA_REPAIR_LEX_DOMAIN_SQL,
+    },
+    SchemaRepairBatch {
         name: "token_analytics",
         tables: &["token_usage", "token_daily_stats", "model_pricing"],
         sql: CURRENT_SCHEMA_REPAIR_TOKEN_ANALYTICS_SQL,
@@ -4084,6 +4122,17 @@ const REQUIRED_CURRENT_SCHEMA_TABLE_PROBES: &[(&str, &str)] = &[
         "usage_models_daily",
         "SELECT day_id FROM usage_models_daily LIMIT 1;",
     ),
+    // w2 F4 fix: the version-1 -> 2 migration path already covers a
+    // pre-existing v1 database missing lex_docs/fts_lex entirely (schema.rs
+    // `ensure`'s `version == 1` branch), but a v2 database that lost these
+    // two tables to incomplete restore / derived-index corruption had no
+    // probe here and so was invisible to this self-heal pass -- `schema::
+    // ensure` returns Ok immediately for version 2, and the next write's
+    // `sync_lexical_domain_for_conversation_in_tx` call (fail-closed since
+    // W2-2/W2-3) would hard-fail the whole ingest transaction on "no such
+    // table: lex_docs"/"no such table: fts_lex" instead of self-healing.
+    ("lex_docs", "SELECT doc_id FROM lex_docs LIMIT 1;"),
+    ("fts_lex", "SELECT rowid FROM fts_lex LIMIT 1;"),
 ];
 
 const REQUIRED_CONVERSATION_TOKEN_COLUMNS: &[(&str, &str)] = &[
@@ -26554,6 +26603,98 @@ mod tests {
         assert_eq!(
             analytics_count, 9,
             "open() should recreate the missing analytics tables even when schema_version already says current"
+        );
+    }
+
+    /// w2 F4 regression: a version-2 database that lost `lex_docs`/`fts_lex`
+    /// (incomplete restore / derived-index corruption -- not the version
+    /// 1 -> 2 migration case, which is covered elsewhere) must be
+    /// self-healed by `FrankenStorage::open` the same way the analytics
+    /// tables above are, not silently left broken because `schema::ensure`
+    /// returns Ok immediately once `user_version` already reads 2.
+    #[test]
+    fn franken_storage_open_repairs_missing_lex_domain_tables_on_a_v2_database() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test_repair_missing_lex_domain.db");
+
+        {
+            let storage = FrankenStorage::open(&db_path).unwrap();
+            assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+        }
+
+        {
+            let conn = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().into_owned())), crate::storage::api::Profile::Production).unwrap();
+            for table in &["fts_lex", "lex_docs"] {
+                conn.execute(&format!("DROP TABLE IF EXISTS {table}"), &[])
+                    .unwrap();
+            }
+        }
+
+        let repaired = FrankenStorage::open(&db_path).unwrap();
+        assert_eq!(repaired.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+
+        let lex_domain_count: i64 = repaired
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('lex_docs', 'fts_lex')",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            lex_domain_count, 2,
+            "open() should recreate lex_docs/fts_lex even when schema_version already says current"
+        );
+
+        // Functional check, not just shape: a normal write through the
+        // repaired tables must actually work end to end.
+        let agent = Agent {
+            id: None,
+            slug: "repair-check".into(),
+            name: "repair-check".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        };
+        let agent_id = repaired.ensure_agent(&agent).unwrap();
+        let conv = Conversation {
+            id: None,
+            agent_slug: "repair-check".into(),
+            workspace: None,
+            external_id: Some("f4-repair-1".into()),
+            title: Some("F4 repair check".into()),
+            source_path: std::path::PathBuf::from("/fixtures/f4-repair.jsonl"),
+            started_at: Some(1),
+            ended_at: Some(2),
+            approx_tokens: None,
+            metadata_json: serde_json::json!({}),
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(1),
+                content: "f4repairmarker present after self heal".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: vec![],
+            }],
+            source_id: "local".into(),
+            origin_host: None,
+        };
+        repaired
+            .insert_conversations_batched(&[(agent_id, None, &conv)])
+            .expect("write through the repaired lex domain tables must succeed");
+
+        let hits: i64 = repaired
+            .raw()
+            .query_row_map(
+                "SELECT count(*) FROM fts_lex WHERE fts_lex MATCH 'f4repairmarker'",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            hits, 1,
+            "the repaired fts_lex table must actually be writable and MATCH-able, not just present"
         );
     }
 
