@@ -4378,6 +4378,19 @@ const ORPHAN_MESSAGE_DEPENDENT_TABLES: &[OrphanMessageDependentTable] = &[
         child_table: "snippets",
         delete_many_sql_prefix: "DELETE FROM snippets WHERE message_id IN",
     },
+    // w2 F3 fix: fts_lex has no FK relationship to lex_docs (FTS5
+    // external-content tables are not FK-aware), so it does not benefit from
+    // the `ON DELETE CASCADE` that quietly cleans up lex_docs when the
+    // `DELETE FROM messages` below runs. Listed here (not just alongside
+    // lex_docs) so the startup self-heal path clears fts_lex *before* the
+    // orphan message rows disappear, matching the same ordering precedent
+    // as the other explicit fts_lex delete sites (W2-3 / w2 F2). fts_lex's
+    // rowid is the message id (see sync_lexical_domain_for_conversation_in_tx),
+    // so the same `message_id IN (...)` id list applies unchanged.
+    OrphanMessageDependentTable {
+        child_table: "fts_lex",
+        delete_many_sql_prefix: "DELETE FROM fts_lex WHERE rowid IN",
+    },
 ];
 
 /// Summary of orphan rows detected and removed by `cleanup_orphan_fk_rows`.
@@ -27153,6 +27166,103 @@ mod tests {
         let second = storage.cleanup_orphan_fk_rows().unwrap();
         assert_eq!(second.total, 0);
         assert!(second.per_table.is_empty());
+    }
+
+    /// w2 F3 regression: an orphan message that was already synced into the
+    /// lexical domain (lex_docs/fts_lex) before its parent conversation went
+    /// missing must have *both* cleaned up by the startup self-heal, not just
+    /// lex_docs (which rides `ON DELETE CASCADE` off the `messages` delete).
+    /// fts_lex is an FTS5 external-content table with no FK to lex_docs, so
+    /// before the fix its rowid survived the self-heal untouched and stayed
+    /// permanently MATCH-able even though the message it indexed was gone.
+    #[test]
+    fn cleanup_orphan_fk_rows_clears_fts_lex_for_orphan_messages() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("orphan_fts_lex_self_heal.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+
+        // Same deliberate FK-OFF test-fixture exception as the sibling test
+        // above: this is the only way to construct the exact corrupted state
+        // (child row surviving its parent's disappearance) that the self-heal
+        // exists to repair.
+        storage.raw().execute_batch_bypassing_foreign_keys_guard("PRAGMA foreign_keys = OFF").unwrap();
+
+        storage
+            .raw()
+            .execute(
+                "INSERT INTO agents(id, slug, name, kind, created_at, updated_at) \
+                 VALUES(1, 'test-agent', 'Test Agent', 'cli', 0, 0)",
+                fparams![],
+            )
+            .unwrap();
+
+        // Orphan message: its conversation_id (99999) does not exist.
+        storage
+            .raw()
+            .execute(
+                "INSERT INTO messages(id, conversation_id, idx, role, content) \
+                 VALUES(201, 99999, 0, 'user', 'orphan_fts_marker present here')",
+                fparams![],
+            )
+            .unwrap();
+
+        // Simulate this orphan having already been synced into the lexical
+        // domain before its conversation went missing (the exact shape
+        // `sync_lexical_domain_for_conversation_in_tx` produces).
+        storage
+            .raw()
+            .execute(
+                "INSERT INTO lex_docs(doc_id, content, title, agent, workspace, source_path) \
+                 VALUES(201, 'orphan_fts_marker present here', 't', 'a', 'w', 's')",
+                fparams![],
+            )
+            .unwrap();
+        storage
+            .raw()
+            .execute(
+                "INSERT INTO fts_lex(rowid, content, title, agent, workspace, source_path) \
+                 VALUES(201, 'orphan_fts_marker present here', 't', 'a', 'w', 's')",
+                fparams![],
+            )
+            .unwrap();
+
+        storage.raw().execute_batch_bypassing_foreign_keys_guard("PRAGMA foreign_keys = ON").unwrap();
+
+        // Sanity: the orphan is indexed and MATCH-able before cleanup runs.
+        let hits_before: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT count(*) FROM fts_lex WHERE fts_lex MATCH 'orphan_fts_marker'",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(hits_before, 1, "orphan_fts_marker must be MATCH-able before self-heal runs");
+
+        let report = storage.cleanup_orphan_fk_rows().unwrap();
+        assert_eq!(report.total, 1, "the single orphan message must be reported: {:?}", report);
+
+        let hits_after: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT count(*) FROM fts_lex WHERE fts_lex MATCH 'orphan_fts_marker'",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            hits_after, 0,
+            "startup self-heal must clear fts_lex for orphan messages, not just lex_docs \
+             (fts_lex is FK-unaware and does not cascade off the messages delete)"
+        );
+
+        let lex_docs_after: i64 = storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM lex_docs WHERE doc_id = 201", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(lex_docs_after, 0, "lex_docs must still be cleaned via its FK cascade");
     }
 
     #[test]
