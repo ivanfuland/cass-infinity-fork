@@ -5882,6 +5882,21 @@ impl FrankenStorage {
                  )",
                 fparams![agent_id],
             )?;
+            // w2 Task W2-3 (spec 门②"删除"场景): fts_lex has no FK relationship
+            // to lex_docs (FTS5 external-content tables are not FK-aware), so
+            // ON DELETE CASCADE from messages -> lex_docs alone would leave
+            // fts_lex with stale, orphaned index entries pointing at rows the
+            // upcoming conversations delete is about to cascade away. Must run
+            // *before* the conversations delete, while `messages`/`lex_docs`
+            // still exist to resolve which fts_lex rowids belong to this agent.
+            tx.execute(
+                "DELETE FROM fts_lex WHERE rowid IN (
+                     SELECT m.id FROM messages m
+                     JOIN conversations c ON c.id = m.conversation_id
+                     WHERE c.agent_id = ?1
+                 )",
+                fparams![agent_id],
+            )?;
             tx.execute(
                 "DELETE FROM conversations WHERE agent_id = ?1",
                 fparams![agent_id],
@@ -6005,6 +6020,17 @@ impl FrankenStorage {
                 ),
                 fparams![],
             )?;
+            // w2 Task W2-3 (spec 门②"删除"场景): fts_lex has no FK to lex_docs
+            // (FTS5 external-content tables aren't FK-aware) -- must clear it
+            // before the cascading conversations delete below, same reasoning
+            // as `purge_agent_archive_data`.
+            tx.execute(
+                &format!(
+                    "DELETE FROM fts_lex WHERE rowid IN \
+                     (SELECT id FROM messages WHERE conversation_id IN ({id_list}))"
+                ),
+                fparams![],
+            )?;
             // The remaining child tables (messages, snippets, tags, ...) cascade.
             tx.execute(
                 &format!("DELETE FROM conversations WHERE id IN ({id_list})"),
@@ -6119,6 +6145,15 @@ impl FrankenStorage {
                 )?;
                 tx.execute(
                     "DELETE FROM conversation_external_tail_lookup WHERE conversation_id = ?1",
+                    fparams![drop_id],
+                )?;
+                // w2 Task W2-3 (spec 门②"删除"场景): fts_lex has no FK to
+                // lex_docs (FTS5 external-content tables aren't FK-aware) --
+                // must clear it before the explicit messages delete below,
+                // while messages/lex_docs still exist to resolve the join.
+                tx.execute(
+                    "DELETE FROM fts_lex WHERE rowid IN \
+                     (SELECT id FROM messages WHERE conversation_id = ?1)",
                     fparams![drop_id],
                 )?;
                 // Explicit message delete (do not rely solely on cascade) so the
@@ -16707,6 +16742,71 @@ mod tests {
             )
             .unwrap();
         assert_eq!(lex_content_msg1, "b".repeat(40), "msg1 must be truncated to exactly the remaining 40-byte budget");
+    }
+
+    /// W2-3 Step 1/2 (spec 门②"回滚"场景 + fail-closed 语义): if
+    /// `sync_lexical_domain_for_conversation_in_tx` fails, the *whole*
+    /// caller transaction must roll back — including relational rows
+    /// inserted earlier in that same transaction, not just the lex
+    /// half. Uses a real failure (`sync_lexical_domain_for_conversation_in_tx`
+    /// called with a `conversation_id` that does not exist in
+    /// `conversations`, so its projection-column lookup genuinely fails with
+    /// zero rows) rather than a mocked error, per this project's "探针必须
+    /// 是真失败" convention.
+    #[test]
+    fn lex_sync_failure_rolls_back_the_whole_transaction_fail_closed() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        use crate::model::types::{Agent, AgentKind};
+        let agent = Agent {
+            id: None,
+            slug: "claude_code".into(),
+            name: "Claude Code".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+
+        const BOGUS_CONVERSATION_ID: i64 = 999_999;
+        let result = storage
+            .conn
+            .with_tx(TxMode::Immediate, |tx| -> Result<(), StorageError> {
+                tx.execute(
+                    "INSERT INTO conversations(id, agent_id, title, source_path) \
+                     VALUES (9001, ?1, 'rollback test', '/tmp/rollback-test.jsonl')",
+                    fparams![agent_id],
+                )?;
+                tx.execute(
+                    "INSERT INTO messages(id, conversation_id, idx, role, content) \
+                     VALUES (9001, 9001, 0, 'user', 'rollback test content')",
+                    fparams![],
+                )?;
+                // The lex sync deliberately targets a conversation_id that was
+                // never inserted (not 9001), so its own internal query finds
+                // zero rows and genuinely fails.
+                sync_lexical_domain_for_conversation_in_tx(tx, BOGUS_CONVERSATION_ID)
+                    .map_err(anyhow_error_into_storage_error)?;
+                Ok(())
+            });
+        assert!(result.is_err(), "the transaction must fail because the lex sync step failed");
+
+        let conv_count: i64 = storage
+            .conn
+            .query_row_map("SELECT COUNT(*) FROM conversations WHERE id = 9001", &[], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(
+            conv_count, 0,
+            "fail-closed: the whole transaction, including the earlier relational insert, must roll back -- not just the failed lex step"
+        );
+        let msg_count: i64 = storage
+            .conn
+            .query_row_map("SELECT COUNT(*) FROM messages WHERE id = 9001", &[], |row| row.get_typed(0))
+            .unwrap();
+        assert_eq!(msg_count, 0, "the message insert in the same transaction must also roll back");
     }
 
     /// `coding_agent_session_search-uhhxy` (gh #302 ask #2): the dedup

@@ -60,15 +60,36 @@ use super::api::{Conn, StorageError, TxMode};
 /// second version is needed.
 ///
 /// Version 2 (w2 Task W2-2) adds the `lex_docs`/`fts_lex` domain below.
-/// There is still no real migration step for pre-existing version-1
-/// databases opened by this code (`ensure`'s "already built, nothing to do"
-/// branch does not retroactively add the new tables) -- that gap is closed
-/// by W2-3 Step 4's wave-boundary upgrade test, not here.
+/// `ensure`'s `version == 1` branch (w2 Task W2-3 Step 4) migrates a
+/// pre-existing version-1 database in place by adding just those two
+/// tables and bumping `user_version` -- it does not backfill historical
+/// message content into them (that is the `--full` rebuild's job, a
+/// separate future task).
 pub const CURRENT_SCHEMA_VERSION: i64 = 2;
+
+/// The `lex_docs`/`fts_lex` domain DDL (w2 Task W2-2, OQ2: external-content
+/// mode) — **must stay byte-for-byte identical** to the matching two lines
+/// at the tail of [`FRESH_SCHEMA_DDL`] below. Duplicated (not extracted into
+/// one shared constant `FRESH_SCHEMA_DDL` could reference) because
+/// `FRESH_SCHEMA_DDL` is a `const &str` raw-string literal and Rust's
+/// `concat!` only accepts literal tokens, not paths to other `const`s; a
+/// `fn` returning an owned `String` would ripple into every existing
+/// `&str`-typed call site (`execute_batch`, the DDL-statement-count test).
+/// Used by the version 1 → 2 upgrade path in [`ensure`] to backfill the new
+/// tables into a pre-existing version-1 database (w2 Task W2-3 Step 4,
+/// R1-X-N1: a wave-1 database must not be left behind by wave 2).
+const V2_LEX_DOMAIN_DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS lex_docs (doc_id INTEGER PRIMARY KEY REFERENCES messages (id) ON DELETE CASCADE, content TEXT NOT NULL, title TEXT NOT NULL, agent TEXT NOT NULL, workspace TEXT NOT NULL, source_path TEXT NOT NULL);
+CREATE VIRTUAL TABLE IF NOT EXISTS fts_lex USING fts5(content, title, agent, workspace, source_path, content = 'lex_docs', content_rowid = 'doc_id', tokenize = 'porter trigram');
+"#;
 
 /// Full DDL for a version-2 database, applied verbatim inside a single
 /// transaction. See the module doc comment for provenance and the two
 /// auto-managed exclusions (`sqlite_sequence`, `fts_messages_*` shadows).
+/// Its final two lines (the `lex_docs`/`fts_lex` domain) must stay
+/// byte-for-byte identical to [`V2_LEX_DOMAIN_DDL`] above — a unit test
+/// (`fresh_schema_ddl_tail_matches_v2_lex_domain_migration_ddl`) enforces
+/// this so the two copies cannot silently drift apart.
 const FRESH_SCHEMA_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS _schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')));
 CREATE TABLE IF NOT EXISTS meta ("key" TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -190,10 +211,13 @@ fn reject(detail: impl Into<String>) -> StorageError {
 ///   Rejected outright — this module does not attempt in-place conversion;
 ///   the caller's story for that case is "rebuild the archive", not
 ///   "migrate this file".
-/// - `0 < user_version <= CURRENT_SCHEMA_VERSION` → already built, nothing
-///   to do (there is no migration path defined yet above version 1; once
-///   one exists, this branch is where its step-by-step application goes,
-///   each step its own transaction per the plan's forward design).
+/// - `user_version == 1` → w2's version 1 → 2 migration: add the
+///   `lex_docs`/`fts_lex` domain ([`V2_LEX_DOMAIN_DDL`]) and bump
+///   `user_version` to 2, in its own transaction. Idempotent via `IF NOT
+///   EXISTS` on both statements.
+/// - `1 < user_version <= CURRENT_SCHEMA_VERSION` → already built, nothing
+///   to do (each future migration step goes here, its own transaction per
+///   the plan's forward design).
 /// - `user_version > CURRENT_SCHEMA_VERSION` → this binary is older than
 ///   the database it's looking at. Rejected: opening it would silently
 ///   ignore schema it doesn't understand.
@@ -222,6 +246,21 @@ pub fn ensure(conn: &Conn) -> Result<(), StorageError> {
             "database schema version {version} is newer than supported version \
              {CURRENT_SCHEMA_VERSION}"
         )));
+    }
+
+    if version == 1 {
+        // w2 Task W2-3 Step 4 (R1-X-N1): a pre-existing wave-1 database opened
+        // by wave-2 code must not be silently left without the lex_docs/fts_lex
+        // domain. `IF NOT EXISTS` on both statements (see V2_LEX_DOMAIN_DDL)
+        // makes this idempotent -- a retry after an interrupted attempt, or a
+        // second `ensure` call on an already-migrated version-2 database,
+        // re-runs harmlessly (the `version == 1` guard itself also means this
+        // whole branch is skipped once user_version reaches 2).
+        return conn.with_tx_no_replay(TxMode::Immediate, |tx| {
+            tx.execute_batch(V2_LEX_DOMAIN_DDL)?;
+            tx.execute_batch(&set_user_version_sql(CURRENT_SCHEMA_VERSION))?;
+            Ok(())
+        });
     }
 
     // 0 < version <= CURRENT_SCHEMA_VERSION: already built, nothing to do.
@@ -351,6 +390,56 @@ mod tests {
             err.to_string().contains("newer than supported"),
             "error should name the newer-than-supported condition, got: {err}"
         );
+    }
+
+    /// Guards against the two DDL copies (`FRESH_SCHEMA_DDL`'s tail and
+    /// `V2_LEX_DOMAIN_DDL`) silently drifting apart — see both constants'
+    /// doc comments for why they are duplicated instead of shared.
+    #[test]
+    fn fresh_schema_ddl_tail_matches_v2_lex_domain_migration_ddl() {
+        assert!(
+            FRESH_SCHEMA_DDL.trim_end().ends_with(V2_LEX_DOMAIN_DDL.trim()),
+            "FRESH_SCHEMA_DDL's final two statements must be byte-for-byte identical to \
+             V2_LEX_DOMAIN_DDL (the version 1 -> 2 migration applies exactly this text to a \
+             pre-existing database, and it must produce the same lex_docs/fts_lex shape a \
+             fresh build gets)"
+        );
+    }
+
+    /// w2 Task W2-3 Step 4 (R1-X-N1): opening a real wave-1-shaped database
+    /// (`user_version = 1`, no `lex_docs`/`fts_lex`) must not leave it behind
+    /// -- `ensure` must add the new domain and advance to version 2,
+    /// idempotently (a second `ensure` call, or a retry after an interrupted
+    /// first attempt, must not fail or duplicate anything).
+    #[test]
+    fn ensure_migrates_a_wave1_database_to_the_lex_domain_and_is_idempotent() {
+        let (_dir, path) = scratch_db_path();
+        let conn = open_sqlite_writer(&path);
+
+        // Build a version-1 shape directly (the pre-W2-2 DDL: everything up
+        // to and including fts_messages, but not lex_docs/fts_lex).
+        let v1_ddl = FRESH_SCHEMA_DDL
+            .trim_end()
+            .strip_suffix(V2_LEX_DOMAIN_DDL.trim())
+            .expect("FRESH_SCHEMA_DDL must end with V2_LEX_DOMAIN_DDL's text");
+        conn.execute_batch(v1_ddl).unwrap();
+        conn.execute_batch(&set_user_version_sql(1)).unwrap();
+        assert!(
+            !table_names(&conn).contains(&"lex_docs".to_string()),
+            "sanity: the hand-built v1 shape must not already have lex_docs"
+        );
+
+        ensure(&conn).expect("ensure must migrate a version-1 database forward");
+        assert_eq!(read_user_version(&conn).unwrap(), CURRENT_SCHEMA_VERSION);
+        let names = table_names(&conn);
+        assert!(names.contains(&"lex_docs".to_string()));
+        assert!(names.contains(&"fts_lex_data".to_string()));
+
+        // Idempotent: a second call (simulating either a deliberate re-run or
+        // recovery after an interrupted first migration) must not fail.
+        ensure(&conn).expect("a second ensure call on an already-migrated database must be a no-op");
+        assert_eq!(read_user_version(&conn).unwrap(), CURRENT_SCHEMA_VERSION);
+        assert_eq!(table_names(&conn), names, "re-running the migration must not change the table set");
     }
 
     #[test]
