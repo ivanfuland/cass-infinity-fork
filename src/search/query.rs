@@ -1,5 +1,4 @@
 use anyhow::{Context, Result, anyhow, bail};
-use crossbeam_channel as mpsc;
 use frankensearch::{
     Cx as FsCx, InMemoryTwoTierIndex as FsInMemoryTwoTierIndex,
     InMemoryVectorIndex as FsInMemoryVectorIndex, LexicalSearch as FsLexicalSearch,
@@ -8634,11 +8633,9 @@ mod tests {
     use super::*;
     use crate::connectors::{NormalizedConversation, NormalizedMessage, NormalizedSnippet};
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
-    use crate::search::tantivy::TantivyIndex;
     use crate::storage::api::Profile;
     use crate::storage::sqlite::FrankenStorage;
     use serde_json::json;
-    use serial_test::serial;
     use tempfile::TempDir;
 
     // Reference implementation of the stable dedup key prior to bead num7z.
@@ -9207,10 +9204,10 @@ mod tests {
     #[test]
     fn quality_mode_does_not_reuse_fast_only_two_tier_cache() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
-        index.commit()?;
+        let db_path = dir.path().join("placeholder.db");
+        std::fs::write(&db_path, b"")?;
 
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
         let embedder = Arc::new(crate::search::hash_embedder::HashEmbedder::new(256));
         let fast_path = dir.path().join(format!("index-{}.fsvi", embedder.id()));
         let writer = VectorIndex::create_with_revision(
@@ -9255,10 +9252,10 @@ mod tests {
     #[test]
     fn failed_quality_probe_does_not_block_fast_only_two_tier_load() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
-        index.commit()?;
+        let db_path = dir.path().join("placeholder.db");
+        std::fs::write(&db_path, b"")?;
 
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
         let embedder = Arc::new(crate::search::hash_embedder::HashEmbedder::new(256));
         let fast_path = dir.path().join(format!("index-{}.fsvi", embedder.id()));
         let writer = VectorIndex::create_with_revision(
@@ -9304,10 +9301,10 @@ mod tests {
     #[test]
     fn progressive_context_error_does_not_poison_future_attempts() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
-        index.commit()?;
+        let db_path = dir.path().join("placeholder.db");
+        std::fs::write(&db_path, b"")?;
 
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
         let embedder = Arc::new(crate::search::hash_embedder::HashEmbedder::new(256));
         let fast_path = dir.path().join(format!("index-{}.fsvi", embedder.id()));
         let writer = VectorIndex::create_with_revision(
@@ -9535,6 +9532,44 @@ mod tests {
     type QueryToken = FsCassQueryToken;
     type WildcardPattern = FsCassWildcardPattern;
     type QueryTokenList = Vec<QueryToken>;
+
+    /// W2-6 Task甲 exec35: pre-migration fixtures in this module seeded a
+    /// `TantivyIndex` directory and then called `SearchClient::open(dir,
+    /// None)` -- both the writer and the two-arg `open` signature are gone
+    /// (`db_path: None` now always yields `Ok(None)`). This is the
+    /// production-fidelity replacement: it goes through the exact same
+    /// `FrankenStorage::insert_conversation_tree` + `sync_lexical_domain_
+    /// for_conversation_in_tx` path the real indexer uses, so `lex_docs`/
+    /// `fts_lex` (the new primary lexical backend `client.search()`
+    /// actually reads, not the legacy `fts_messages` fallback) come out
+    /// populated the same way a real index run would populate them.
+    fn seed_conversations_for_search_client(
+        conversations: &[NormalizedConversation],
+    ) -> Result<(TempDir, PathBuf)> {
+        let dir = TempDir::new()?;
+        let db_path = dir.path().join("fixture.db");
+        let storage = FrankenStorage::open(&db_path)?;
+        let mut agent_ids: HashMap<String, i64> = HashMap::new();
+        for conv in conversations {
+            let agent_id = match agent_ids.get(&conv.agent_slug) {
+                Some(id) => *id,
+                None => {
+                    let id = storage.ensure_agent(&Agent {
+                        id: None,
+                        slug: conv.agent_slug.clone(),
+                        name: conv.agent_slug.clone(),
+                        version: None,
+                        kind: AgentKind::Cli,
+                    })?;
+                    agent_ids.insert(conv.agent_slug.clone(), id);
+                    id
+                }
+            };
+            let internal = crate::indexer::persist::map_to_internal(conv);
+            storage.insert_conversation_tree(agent_id, None, &internal)?;
+        }
+        Ok((dir, db_path))
+    }
 
     // ==========================================================================
     // StringInterner Tests (Opt 2.3)
@@ -10099,10 +10134,6 @@ mod tests {
         // pages. Global pagination still has to happen after deduplication, but
         // dedup itself only coalesces hits that share message-level provenance.
 
-        let dir = TempDir::new().unwrap();
-        let index_path = dir.path();
-        let mut index = TantivyIndex::open_or_create(index_path).unwrap();
-
         // Add two documents with IDENTICAL content but distinct other fields.
         // Tantivy scores them. If query matches both equally, one comes first.
         // We'll use different source paths to ensure they are distinct hits initially.
@@ -10150,11 +10181,10 @@ mod tests {
             messages: vec![msg2],
         };
 
-        index.add_conversation(&conv1).unwrap();
-        index.add_conversation(&conv2).unwrap();
-        index.commit().unwrap();
-
-        let client = SearchClient::open(index_path, None).unwrap().unwrap();
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv1, conv2]).unwrap();
+        let client = SearchClient::open(dir.path(), Some(&db_path))
+            .unwrap()
+            .unwrap();
 
         // Search page 1: limit 1, offset 0
         let page1 = client
@@ -10174,20 +10204,12 @@ mod tests {
     #[test]
     fn cache_skips_complex_queries() {
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         // Wildcard query should skip cache logic entirely (no miss recorded)
@@ -10224,20 +10246,12 @@ mod tests {
     #[test]
     fn cache_prefix_lookup_handles_utf8_boundaries() {
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hits = vec![SearchHit {
@@ -10344,20 +10358,12 @@ mod tests {
     #[test]
     fn progressive_phase_reuses_lexical_cache_without_db_hydration() -> Result<()> {
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
         let field_mask = FieldMask::new(false, true, true, true);
         let lexical_hit = SearchHit {
@@ -10426,7 +10432,6 @@ mod tests {
     #[test]
     fn search_returns_results_with_filters_and_pagination() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
         let conv = NormalizedConversation {
             agent_slug: "codex".into(),
             external_id: None,
@@ -10453,10 +10458,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
         let mut filters = SearchFilters::default();
         filters.agents.insert("codex".into());
 
@@ -10470,7 +10473,6 @@ mod tests {
     #[test]
     fn search_honors_created_range_and_workspace() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
 
         let conv_a = NormalizedConversation {
             agent_slug: "codex".into(),
@@ -10524,11 +10526,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv_a)?;
-        index.add_conversation(&conv_b)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv_a, conv_b])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
         let mut filters = SearchFilters::default();
         filters.workspaces.insert("/ws/b".into());
         filters.created_from = Some(15);
@@ -10544,7 +10543,7 @@ mod tests {
     #[test]
     fn pagination_skips_results() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+        let mut conversations = Vec::new();
         for i in 0..3 {
             let conv = NormalizedConversation {
                 agent_slug: "codex".into(),
@@ -10573,11 +10572,11 @@ mod tests {
                     invocations: Vec::new(),
                 }],
             };
-            index.add_conversation(&conv)?;
+            conversations.push(conv);
         }
-        index.commit()?;
+        let (dir, db_path) = seed_conversations_for_search_client(&conversations)?;
 
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
         let hits = client.search(
             "pagination",
             SearchFilters::default(),
@@ -10592,7 +10591,7 @@ mod tests {
     #[test]
     fn search_matches_hyphenated_term() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
         let conv = NormalizedConversation {
             agent_slug: "codex".into(),
             external_id: None,
@@ -10619,10 +10618,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
         let hits = client.search("cma-es", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
         assert_eq!(hits.len(), 1);
         assert!(hits[0].snippet.to_lowercase().contains("cma"));
@@ -10632,7 +10629,7 @@ mod tests {
     #[test]
     fn search_matches_prefix_edge_ngram() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
         let conv = NormalizedConversation {
             agent_slug: "codex".into(),
             external_id: None,
@@ -10653,10 +10650,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // "cal" should match "calculate"
         let hits = client.search("cal", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
@@ -10673,7 +10668,7 @@ mod tests {
     #[test]
     fn search_matches_snake_case() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
         let conv = NormalizedConversation {
             agent_slug: "codex".into(),
             external_id: None,
@@ -10694,10 +10689,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // "vari" should match "variable" inside "my_variable_name"
         let hits = client.search("vari", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
@@ -10719,7 +10712,7 @@ mod tests {
     #[test]
     fn search_matches_symbols_stripped() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
         let conv = NormalizedConversation {
             agent_slug: "codex".into(),
             external_id: None,
@@ -10740,10 +10733,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // "c++" -> "c"
         let hits = client.search("c++", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
@@ -10759,7 +10750,7 @@ mod tests {
     #[test]
     fn search_sets_match_type_for_wildcards() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         let conv = NormalizedConversation {
             agent_slug: "codex".into(),
@@ -10781,10 +10772,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         let exact = client.search("handler", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
         assert_eq!(exact[0].match_type, MatchType::Exact);
@@ -10805,7 +10794,7 @@ mod tests {
     #[test]
     fn search_with_fallback_marks_implicit_wildcard() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         let conv = NormalizedConversation {
             agent_slug: "codex".into(),
@@ -10827,10 +10816,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // Base search for "andle" finds nothing; fallback "*andle*" should hit and mark implicit.
         let result = client.search_with_fallback(
@@ -10853,20 +10840,12 @@ mod tests {
         // Build a client with SQLite only; wildcard queries should short-circuit without errors.
         let conn = Connection::open_memory()?;
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hits = client.search("*handler", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
@@ -10932,20 +10911,12 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hits = client.search("auth", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
@@ -11018,20 +10989,12 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hits = client.search("auth", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
@@ -11104,20 +11067,12 @@ mod tests {
         // Opening via sqlite_guard() must remain read-only. A search path
         // should not trigger heavyweight derived-index repair.
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: Some(db_path.clone()),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let guard = client
@@ -11259,20 +11214,12 @@ mod tests {
         }
 
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: Some(db_path),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let guard = client.sqlite_guard()?;
@@ -11422,20 +11369,12 @@ mod tests {
             ],
         )?;
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
         let direct_hits = client.search_sqlite_fts5(
             Path::new(":memory:"),
@@ -11558,20 +11497,12 @@ mod tests {
         &[])?;
 
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let fallback_key = (
@@ -11691,20 +11622,12 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hits = client.search("delta", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
@@ -11789,20 +11712,12 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let local_hits = client.browse_by_date(
@@ -11893,20 +11808,12 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let remote_hits = client.search(
@@ -12015,20 +11922,12 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hits = client.search(
@@ -12133,20 +12032,12 @@ mod tests {
         &[])?;
 
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hits = client.browse_by_date(
@@ -12225,20 +12116,12 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hits = client.hydrate_semantic_hits_with_ids(
@@ -12305,20 +12188,12 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hits = client.hydrate_semantic_hits_with_ids(
@@ -12377,20 +12252,12 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hits = client.hydrate_semantic_hits_with_ids(
@@ -12465,20 +12332,12 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let first_hit = SearchHit {
@@ -12581,20 +12440,12 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hits = client.hydrate_semantic_hits_with_ids(
@@ -12666,20 +12517,12 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let first_hit = SearchHit {
@@ -12758,20 +12601,12 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -12840,20 +12675,12 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -12922,20 +12749,12 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -13005,20 +12824,12 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -13101,20 +12912,12 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hits = client.browse_by_date(
@@ -13132,114 +12935,16 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn cache_invalidates_on_new_data() -> Result<()> {
-        let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
-
-        // 1. Add initial doc
-        let conv1 = NormalizedConversation {
-            agent_slug: "codex".into(),
-            external_id: None,
-            title: Some("first".into()),
-            workspace: None,
-            source_path: dir.path().join("1.jsonl"),
-            started_at: Some(1),
-            ended_at: None,
-            metadata: serde_json::json!({}),
-            messages: vec![NormalizedMessage {
-                idx: 0,
-                role: "user".into(),
-                author: None,
-                created_at: Some(1),
-                content: "apple banana".into(),
-                extra: serde_json::json!({}),
-                snippets: vec![],
-                invocations: Vec::new(),
-            }],
-        };
-        index.add_conversation(&conv1)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
-
-        // 2. Search "app" -> should hit "apple"
-        let hits = client.search("app", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].content, "apple banana");
-
-        // 3. Verify it's cached (peek internal state)
-        {
-            let cache = client.prefix_cache.lock().unwrap();
-            let shard = cache.shard_opt("global").unwrap();
-            // "app" should be in cache
-            assert!(shard.contains(&client.cache_key("app", &SearchFilters::default())));
-        }
-
-        // 4. Add new doc with "apricot"
-        let conv2 = NormalizedConversation {
-            agent_slug: "codex".into(),
-            external_id: None,
-            title: Some("second".into()),
-            workspace: None,
-            source_path: dir.path().join("2.jsonl"),
-            started_at: Some(2),
-            ended_at: None,
-            metadata: serde_json::json!({}),
-            messages: vec![NormalizedMessage {
-                idx: 0,
-                role: "user".into(),
-                author: None,
-                created_at: Some(2),
-                content: "apricot".into(),
-                extra: serde_json::json!({}),
-                snippets: vec![],
-                invocations: Vec::new(),
-            }],
-        };
-        index.add_conversation(&conv2)?;
-        index.commit()?;
-
-        // 5. Force reload (mocking time passing or just ensuring reload triggers)
-        // In test, maybe_reload_reader uses 300ms debounce.
-        // We can rely on opstamp check logic which runs AFTER reload.
-        // We need to sleep briefly to bypass debounce or just modify test to not rely on time?
-        // Actually SearchClient::maybe_reload_reader checks duration.
-        std::thread::sleep(std::time::Duration::from_millis(350));
-
-        // 6. Search "ap" (prefix of apricot and apple)
-        // The cache for "app" should be cleared if opstamp changed.
-        let _hits = client.search("app", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
-        // Should now find 1 doc still ("apple"), but cache should have been cleared first
-
-        // Search "apr" -> should find "apricot"
-        let hits = client.search("apr", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].content, "apricot");
-
-        // Check that cache was cleared by verifying a stale key is gone?
-        // Or rely on correctness of results if we searched a common prefix?
-
-        Ok(())
-    }
 
     #[test]
     fn cache_total_cap_evicts_across_shards() {
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(2, 0)), // tiny entry cap, no byte cap
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -13280,20 +12985,12 @@ mod tests {
     #[test]
     fn cache_stats_reflect_metrics() {
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         client.metrics.inc_cache_hits();
@@ -13318,20 +13015,12 @@ mod tests {
     fn cache_eviction_count_tracks_evictions() {
         // tiny entry cap (2 entries), no byte cap - forces evictions
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(2, 0)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -13529,20 +13218,12 @@ mod tests {
     fn cache_byte_cap_triggers_eviction() {
         // Large entry cap (1000), tiny byte cap (100 bytes) - forces byte-based evictions
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(1000, 100)), // byte cap of 100
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         // Large content to exceed byte cap quickly
@@ -14495,9 +14176,9 @@ mod tests {
     #[test]
     fn search_with_fallback_returns_exact_when_sufficient() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
 
         // Add enough docs to exceed threshold - each with UNIQUE content to avoid dedup
+        let mut conversations = Vec::new();
         for i in 0..5 {
             let conv = NormalizedConversation {
                 agent_slug: "codex".into(),
@@ -14520,11 +14201,11 @@ mod tests {
                     invocations: Vec::new(),
                 }],
             };
-            index.add_conversation(&conv)?;
+            conversations.push(conv);
         }
-        index.commit()?;
+        let (dir, db_path) = seed_conversations_for_search_client(&conversations)?;
 
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // Search with low threshold - should not trigger fallback
         let result = client.search_with_fallback(
@@ -14546,7 +14227,7 @@ mod tests {
     #[test]
     fn search_with_fallback_triggers_on_sparse_results() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         // Add docs with substring that won't match exact prefix
         let conv = NormalizedConversation {
@@ -14569,10 +14250,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // Search for "config" which should match "configuration" via prefix
         let result = client.search_with_fallback(
@@ -14594,7 +14273,7 @@ mod tests {
     #[test]
     fn search_with_fallback_skips_when_query_has_wildcards() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         let conv = NormalizedConversation {
             agent_slug: "codex".into(),
@@ -14616,10 +14295,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // Query already has wildcards - should not trigger fallback
         let result = client.search_with_fallback(
@@ -14638,10 +14315,11 @@ mod tests {
     #[test]
     fn search_with_fallback_prefers_wildcards_when_they_add_hits() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         // None of these documents contain the exact token "bet",
         // but they do contain it as a substring ("alphabet").
+        let mut conversations = Vec::new();
         for (i, body) in [
             "alphabet soup for coders",
             "mapping the alphabet city blocks",
@@ -14669,11 +14347,10 @@ mod tests {
                     invocations: Vec::new(),
                 }],
             };
-            index.add_conversation(&conv)?;
+            conversations.push(conv);
         }
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&conversations)?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         let result = client.search_with_fallback(
             "bet",
@@ -14707,7 +14384,7 @@ mod tests {
     #[test]
     fn automatic_wildcard_fallback_skips_long_zero_hit_token() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         let conv = NormalizedConversation {
             agent_slug: "codex".into(),
@@ -14729,10 +14406,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         let result = client.search_with_fallback(
             "zzzzzzunlikelyterm",
@@ -14768,109 +14443,14 @@ mod tests {
     }
 
     #[test]
-    #[serial]
-    fn nohit_suggestions_do_not_lazy_open_sqlite_when_tantivy_is_present() -> Result<()> {
-        // W2-5: this test's laziness guarantee (sqlite never opens on a pure
-        // Tantivy no-hit path) is specifically about Tantivy's own dispatch,
-        // which now lives behind CASS_LEXICAL_USE_TANTIVY=1 -- the new
-        // default path must probe sqlite for `lex_docs` viability before it
-        // can even consider Tantivy, so this guarantee no longer holds
-        // there by design.
-        let _tantivy_guard = LexicalUseTantivyGuard::enable();
-        let dir = TempDir::new()?;
-        let index_path = dir.path().join("index");
-        let db_path = dir.path().join("cass.db");
-
-        let storage = FrankenStorage::open(&db_path)?;
-        storage.close()?;
-
-        let mut index = TantivyIndex::open_or_create(&index_path)?;
-        let conv = NormalizedConversation {
-            agent_slug: "codex".into(),
-            external_id: None,
-            title: Some("fruit".into()),
-            workspace: Some(std::path::PathBuf::from("/ws")),
-            source_path: dir.path().join("fruit.jsonl"),
-            started_at: Some(100),
-            ended_at: None,
-            metadata: serde_json::json!({}),
-            messages: vec![NormalizedMessage {
-                idx: 0,
-                role: "user".into(),
-                author: None,
-                created_at: Some(100),
-                content: "apple pear banana".into(),
-                extra: serde_json::json!({}),
-                snippets: vec![],
-                invocations: Vec::new(),
-            }],
-        };
-        index.add_conversation(&conv)?;
-        index.commit()?;
-
-        let client = SearchClient::open(&index_path, Some(&db_path))?.expect("index present");
-        assert!(
-            client
-                .sqlite
-                .lock()
-                .map(|guard| guard.is_none())
-                .unwrap_or(false),
-            "sqlite should start closed"
-        );
-
-        let result = client.search_with_fallback(
-            "zzzzzzunlikelyterm",
-            SearchFilters::default(),
-            10,
-            0,
-            1,
-            FieldMask::FULL,
-        )?;
-
-        assert!(result.hits.is_empty());
-        assert!(
-            result
-                .suggestions
-                .iter()
-                .any(|s| matches!(s.kind, SuggestionKind::WildcardQuery)),
-            "manual wildcard suggestion should remain available"
-        );
-        assert!(
-            result
-                .suggestions
-                .iter()
-                .all(|s| !matches!(s.kind, SuggestionKind::AlternateAgent)),
-            "alternate-agent suggestions should not force a SQLite open"
-        );
-        assert!(
-            client
-                .sqlite
-                .lock()
-                .map(|guard| guard.is_none())
-                .unwrap_or(false),
-            "sqlite should stay closed after Tantivy no-hit suggestions"
-        );
-
-        Ok(())
-    }
-
-    #[test]
     fn search_with_fallback_emits_wildcard_suggestion_on_zero_hits() -> Result<()> {
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: "vtest|schema:none".into(),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let result = client.search_with_fallback(
@@ -14904,7 +14484,7 @@ mod tests {
     #[test]
     fn search_with_fallback_skips_empty_query() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         let conv = NormalizedConversation {
             agent_slug: "codex".into(),
@@ -14926,10 +14506,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // Empty query - should not trigger fallback
         let result = client.search_with_fallback(
@@ -14949,20 +14527,12 @@ mod tests {
     fn search_with_fallback_skips_for_nonzero_offset() -> Result<()> {
         // Even with zero hits, fallback should not run when paginating (offset > 0)
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: "vtest|schema:none".into(),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let result = client.search_with_fallback(
@@ -14993,20 +14563,12 @@ mod tests {
     fn generate_suggestions_limits_and_sets_shortcuts() -> Result<()> {
         // Build a client without backends; suggestions are purely local heuristics
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: "vtest|schema:none".into(),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let mut filters = SearchFilters::default();
@@ -15263,187 +14825,12 @@ mod tests {
     // Verify filters are never violated in search results
     // ============================================================
 
-    #[test]
-    #[serial]
-    fn tantivy_search_hydrates_long_content_when_content_field_is_not_stored() -> Result<()> {
-        // W2-5: this test pins Tantivy's own word-tokenizer semantics
-        // ("shortneedle" is one token, not a substring match for "needle").
-        // `fts_lex`'s trigram tokenizer is substring-matching by design and
-        // legitimately finds both messages -- a real recall improvement
-        // (the preregistration doc's "language upgrade" clause), not a
-        // regression -- so this Tantivy-specific assertion must run under
-        // the legacy flag to keep testing what it names.
-        let _tantivy_guard = LexicalUseTantivyGuard::enable();
-        let dir = TempDir::new()?;
-        let db_path = dir.path().join("cass.db");
-        let storage = FrankenStorage::open(&db_path)?;
-        let workspace_id = storage.ensure_workspace(dir.path(), None)?;
-        let agent = Agent {
-            id: None,
-            slug: "codex".into(),
-            name: "Codex".into(),
-            version: None,
-            kind: AgentKind::Cli,
-        };
-        let agent_id = storage.ensure_agent(&agent)?;
-        let long_content = format!(
-            "{}needle appears past the preview boundary for hydration proof",
-            "padding ".repeat(70)
-        );
-        let short_content = "shortneedle fits entirely inside the stored preview".to_string();
-        let conversation = Conversation {
-            id: None,
-            agent_slug: "codex".into(),
-            workspace: Some(dir.path().to_path_buf()),
-            external_id: Some("hydrate-long-content".into()),
-            title: Some("hydrated lexical doc".into()),
-            source_path: dir.path().join("hydrate.jsonl"),
-            started_at: Some(1_700_000_123_000),
-            ended_at: Some(1_700_000_123_000),
-            approx_tokens: Some(32),
-            metadata_json: json!({}),
-            messages: vec![
-                Message {
-                    id: None,
-                    idx: 0,
-                    role: MessageRole::User,
-                    author: Some("user".into()),
-                    created_at: Some(1_700_000_123_000),
-                    content: long_content.clone(),
-                    extra_json: json!({}),
-                    snippets: Vec::new(),
-                },
-                Message {
-                    id: None,
-                    idx: 1,
-                    role: MessageRole::Agent,
-                    author: Some("assistant".into()),
-                    created_at: Some(1_700_000_124_000),
-                    content: short_content.clone(),
-                    extra_json: json!({}),
-                    snippets: Vec::new(),
-                },
-            ],
-            source_id: crate::sources::provenance::LOCAL_SOURCE_ID.to_string(),
-            origin_host: None,
-        };
-        storage.insert_conversation_tree(agent_id, Some(workspace_id), &conversation)?;
-        storage.close()?;
-
-        let index_path = dir.path().join("search-index");
-        let mut index = TantivyIndex::open_or_create(&index_path)?;
-        let normalized = NormalizedConversation {
-            agent_slug: "codex".into(),
-            external_id: Some("hydrate-long-content".into()),
-            title: Some("hydrated lexical doc".into()),
-            workspace: Some(dir.path().to_path_buf()),
-            source_path: dir.path().join("hydrate.jsonl"),
-            started_at: Some(1_700_000_123_000),
-            ended_at: Some(1_700_000_123_000),
-            metadata: json!({}),
-            messages: vec![
-                NormalizedMessage {
-                    idx: 0,
-                    role: "user".into(),
-                    author: Some("user".into()),
-                    created_at: Some(1_700_000_123_000),
-                    content: long_content.clone(),
-                    extra: json!({}),
-                    snippets: vec![],
-                    invocations: Vec::new(),
-                },
-                NormalizedMessage {
-                    idx: 1,
-                    role: "assistant".into(),
-                    author: Some("assistant".into()),
-                    created_at: Some(1_700_000_124_000),
-                    content: short_content.clone(),
-                    extra: json!({}),
-                    snippets: vec![],
-                    invocations: Vec::new(),
-                },
-            ],
-        };
-        index.add_conversation(&normalized)?;
-        index.commit()?;
-
-        let client = SearchClient::open(&index_path, Some(&db_path))?.expect("db-backed client");
-        let hits = client.search("needle", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
-
-        assert_eq!(hits.len(), 1, "expected one lexical hit");
-        assert_eq!(hits[0].title, "hydrated lexical doc");
-        assert!(
-            hits[0]
-                .content
-                .contains("needle appears past the preview boundary"),
-            "lexical hit should hydrate full content from sqlite when Tantivy content is not stored"
-        );
-        assert!(
-            hits[0].snippet.to_lowercase().contains("needle"),
-            "snippet should still be rendered from hydrated content"
-        );
-
-        let bounded_hits = client.search(
-            "needle",
-            SearchFilters::default(),
-            5,
-            0,
-            FieldMask::FULL.with_preview_content_limit(Some(200)),
-        )?;
-
-        assert_eq!(bounded_hits.len(), 1, "expected one lexical hit");
-        assert!(
-            bounded_hits[0].content.starts_with("padding padding"),
-            "bounded content may be served from the stored preview prefix"
-        );
-        assert!(
-            !bounded_hits[0]
-                .content
-                .contains("needle appears past the preview boundary"),
-            "bounded preview content should not hydrate the full sqlite row"
-        );
-
-        let short_client =
-            SearchClient::open(&index_path, Some(&db_path))?.expect("db-backed client");
-        assert!(
-            short_client
-                .sqlite
-                .lock()
-                .map(|guard| guard.is_none())
-                .unwrap_or(false),
-            "sqlite should start closed for short preview hit"
-        );
-
-        let short_hits = short_client.search(
-            "shortneedle",
-            SearchFilters::default(),
-            5,
-            0,
-            FieldMask::FULL,
-        )?;
-
-        assert_eq!(short_hits.len(), 1, "expected one short lexical hit");
-        assert_eq!(
-            short_hits[0].content, short_content,
-            "untruncated stored preview is exact full content"
-        );
-        assert!(
-            short_client
-                .sqlite
-                .lock()
-                .map(|guard| guard.is_none())
-                .unwrap_or(false),
-            "short full-content hit should not lazy-open sqlite"
-        );
-
-        Ok(())
-    }
 
     #[test]
     fn filter_fidelity_agent_filter_respected() -> Result<()> {
         // Multiple agents; filter should return only matching agent
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         // Agent A (codex)
         let conv_a = NormalizedConversation {
@@ -15487,11 +14874,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv_a)?;
-        index.add_conversation(&conv_b)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv_a, conv_b])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // Search with agent filter for codex only
         let mut filters = SearchFilters::default();
@@ -15522,7 +14906,7 @@ mod tests {
     fn filter_fidelity_workspace_filter_respected() -> Result<()> {
         // Multiple workspaces; filter should return only matching workspace
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         // Workspace A
         let conv_a = NormalizedConversation {
@@ -15566,11 +14950,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv_a)?;
-        index.add_conversation(&conv_b)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv_a, conv_b])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // Search with workspace filter for beta only
         let mut filters = SearchFilters::default();
@@ -15604,7 +14985,7 @@ mod tests {
     fn filter_fidelity_date_range_respected() -> Result<()> {
         // Multiple dates; filter should return only within range
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         // Early doc (ts=100)
         let conv_early = NormalizedConversation {
@@ -15669,12 +15050,9 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv_early)?;
-        index.add_conversation(&conv_middle)?;
-        index.add_conversation(&conv_late)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) =
+            seed_conversations_for_search_client(&[conv_early, conv_middle, conv_late])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // Filter for middle range only (400-600)
         let filters = SearchFilters {
@@ -15715,7 +15093,7 @@ mod tests {
     fn filter_fidelity_combined_filters_respected() -> Result<()> {
         // Combine agent + workspace + date filters
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         // Create 4 docs with different combinations
         let combinations = [
@@ -15725,6 +15103,7 @@ mod tests {
             ("claude", "/ws/prod", 900), // correct agent, correct ws, wrong date
         ];
 
+        let mut conversations = Vec::new();
         for (i, (agent, ws, ts)) in combinations.iter().enumerate() {
             let conv = NormalizedConversation {
                 agent_slug: (*agent).into(),
@@ -15746,11 +15125,10 @@ mod tests {
                     invocations: Vec::new(),
                 }],
             };
-            index.add_conversation(&conv)?;
+            conversations.push(conv);
         }
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&conversations)?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // Filter: claude + /ws/prod + date 400-600
         let mut filters = SearchFilters::default();
@@ -15782,7 +15160,7 @@ mod tests {
     #[test]
     fn lexical_hits_normalize_trimmed_local_source_metadata() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         let conv = NormalizedConversation {
             agent_slug: "codex".into(),
@@ -15811,10 +15189,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
         let hits = client.search("trimmed", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
 
         assert_eq!(hits.len(), 1);
@@ -15827,7 +15203,7 @@ mod tests {
     #[test]
     fn lexical_hits_normalize_remote_origin_kind_without_source_id() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         let conv = NormalizedConversation {
             agent_slug: "codex".into(),
@@ -15857,10 +15233,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
         let hits = client.search("remote", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
 
         assert_eq!(hits.len(), 1);
@@ -15874,7 +15248,7 @@ mod tests {
     #[test]
     fn lexical_hits_infer_remote_origin_from_host_without_kind() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         let conv = NormalizedConversation {
             agent_slug: "codex".into(),
@@ -15903,10 +15277,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
         let hits = client.search("legacy", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
 
         assert_eq!(hits.len(), 1);
@@ -15921,7 +15293,7 @@ mod tests {
     fn filter_fidelity_source_filter_respected() -> Result<()> {
         // P3.1: Source filter should filter by origin_kind or source_id
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         // Local source doc
         let conv_local = NormalizedConversation {
@@ -15946,10 +15318,8 @@ mod tests {
         };
         // Remote source doc (would need to be indexed with ssh origin_kind)
         // For now, test that local filter returns local docs
-        index.add_conversation(&conv_local)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv_local])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // Filter for local sources
         let filters = SearchFilters {
@@ -15995,20 +15365,12 @@ mod tests {
     fn filter_fidelity_cache_key_isolation() {
         // Different filters should have different cache keys
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let filters_empty = SearchFilters::default();
@@ -16191,20 +15553,12 @@ mod tests {
     #[test]
     fn search_sqlite_fts5_returns_empty_when_sqlite_is_unavailable() {
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: false,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: "fts5-disabled".to_string(),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hits = client.search_sqlite_fts5(
@@ -16331,20 +15685,12 @@ mod tests {
         }
 
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: false,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:k0e5p"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         // Hit-key tuple: (source_path, line_number) is the stable
@@ -16489,7 +15835,7 @@ mod tests {
     #[test]
     fn search_boolean_and_filters_results() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         // Create documents with different word combinations
         let conv1 = NormalizedConversation {
@@ -16532,11 +15878,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv1)?;
-        index.add_conversation(&conv2)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv1, conv2])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // "alpha AND beta" should only match doc1
         let hits = client.search(
@@ -16566,7 +15909,7 @@ mod tests {
     #[test]
     fn search_boolean_or_expands_results() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         let conv1 = NormalizedConversation {
             agent_slug: "codex".into(),
@@ -16608,11 +15951,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv1)?;
-        index.add_conversation(&conv2)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv1, conv2])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // "xyzzy OR plugh" should match both docs
         let hits = client.search(
@@ -16630,7 +15970,7 @@ mod tests {
     #[test]
     fn search_boolean_not_excludes_results() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         let conv1 = NormalizedConversation {
             agent_slug: "codex".into(),
@@ -16672,11 +16012,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv1)?;
-        index.add_conversation(&conv2)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv1, conv2])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // "nottest NOT exclude" should only match doc1 (has nottest but NOT exclude)
         let hits = client.search(
@@ -16713,7 +16050,7 @@ mod tests {
     #[test]
     fn search_phrase_query_matches_exact_sequence() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         let conv1 = NormalizedConversation {
             agent_slug: "codex".into(),
@@ -16755,11 +16092,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv1)?;
-        index.add_conversation(&conv2)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv1, conv2])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // "quick brown" (without quotes) should match both (words just need to be present)
         let hits = client.search(
@@ -16788,7 +16122,7 @@ mod tests {
     #[test]
     fn search_dot_punctuation_splits_terms_but_hyphens_preserve_compound_semantics() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         let conv = NormalizedConversation {
             agent_slug: "codex".into(),
@@ -16810,10 +16144,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         let hits = client.search("foo.bar", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
         assert_eq!(hits.len(), 1);
@@ -16975,7 +16307,7 @@ mod tests {
     fn search_multi_filter_agent_workspace_time() -> Result<()> {
         // Test combining agent, workspace, and time range filters
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         // Create 4 conversations with different combinations
         let convs = [
@@ -16985,6 +16317,7 @@ mod tests {
             ("codex", "/ws/alpha", 300, "needle alpha codex late"),
         ];
 
+        let mut conversations = Vec::new();
         for (i, (agent, ws, ts, content)) in convs.iter().enumerate() {
             let conv = NormalizedConversation {
                 agent_slug: (*agent).into(),
@@ -17006,11 +16339,10 @@ mod tests {
                     invocations: Vec::new(),
                 }],
             };
-            index.add_conversation(&conv)?;
+            conversations.push(conv);
         }
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&conversations)?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // Filter: codex + alpha + time 50-250
         let mut filters = SearchFilters::default();
@@ -17037,8 +16369,9 @@ mod tests {
     fn search_multi_agent_filter() -> Result<()> {
         // Test filtering by multiple agents
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
 
+
+        let mut conversations = Vec::new();
         for agent in ["codex", "claude", "cline", "gemini"] {
             let conv = NormalizedConversation {
                 agent_slug: agent.into(),
@@ -17060,11 +16393,10 @@ mod tests {
                     invocations: Vec::new(),
                 }],
             };
-            index.add_conversation(&conv)?;
+            conversations.push(conv);
         }
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&conversations)?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // Filter for codex and claude only
         let mut filters = SearchFilters::default();
@@ -17089,20 +16421,12 @@ mod tests {
     #[test]
     fn cache_metrics_incremented_on_operations() {
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         // Initial metrics should be zero
@@ -17127,20 +16451,12 @@ mod tests {
     fn cache_shard_name_deterministic() {
         // Verify that shard name generation is deterministic for same filters
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let filters1 = SearchFilters::default();
@@ -17179,7 +16495,7 @@ mod tests {
     #[test]
     fn wildcard_fallback_respects_filter_constraints() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         // Create conversations that would match wildcard but not filter
         let conv_match = NormalizedConversation {
@@ -17224,11 +16540,8 @@ mod tests {
             }],
         };
 
-        index.add_conversation(&conv_match)?;
-        index.add_conversation(&conv_other)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv_match, conv_other])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // Search with filter that only matches conv_match
         let mut filters = SearchFilters::default();
@@ -17245,7 +16558,7 @@ mod tests {
     #[test]
     fn wildcard_fallback_short_query_triggers_prefix() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         let conv = NormalizedConversation {
             agent_slug: "codex".into(),
@@ -17267,10 +16580,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // Short prefix "auth" should match "authentication" and "authorization"
         let result = client.search_with_fallback(
@@ -17297,7 +16608,7 @@ mod tests {
     #[test]
     fn search_real_fixture_multiple_messages() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         // Create a realistic conversation with multiple messages
         let conv = NormalizedConversation {
@@ -17351,10 +16662,8 @@ mod tests {
                 },
             ],
         };
-        index.add_conversation(&conv)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // Search for various terms that should match
         let hits = client.search(
@@ -17401,9 +16710,10 @@ mod tests {
     #[test]
     fn search_deduplication_with_similar_content() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         // Create two conversations with very similar content
+        let mut conversations = Vec::new();
         for i in 0..2 {
             let conv = NormalizedConversation {
                 agent_slug: "codex".into(),
@@ -17426,11 +16736,10 @@ mod tests {
                     invocations: Vec::new(),
                 }],
             };
-            index.add_conversation(&conv)?;
+            conversations.push(conv);
         }
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&conversations)?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
         let result = client.search_with_fallback(
             "sorting algorithm",
             SearchFilters::default(),
@@ -17455,7 +16764,7 @@ mod tests {
     fn search_session_paths_filter() -> Result<()> {
         // Test filtering by specific session source paths (for chained searches)
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         // Create 3 conversations with different source paths
         let paths = [
@@ -17464,6 +16773,7 @@ mod tests {
             dir.path().join("session-c.jsonl"),
         ];
 
+        let mut conversations = Vec::new();
         for (i, path) in paths.iter().enumerate() {
             let conv = NormalizedConversation {
                 agent_slug: "claude".into(),
@@ -17485,11 +16795,10 @@ mod tests {
                     invocations: Vec::new(),
                 }],
             };
-            index.add_conversation(&conv)?;
+            conversations.push(conv);
         }
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&conversations)?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // First, search without filter - should get all 3
         let hits_all = client.search("needle", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
@@ -17526,9 +16835,10 @@ mod tests {
     #[test]
     fn lexical_session_paths_filter_retries_past_initial_page() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
         let requested_path = dir.path().join("requested-session.jsonl");
 
+        let mut conversations = Vec::new();
         for i in 0..4 {
             let conv = NormalizedConversation {
                 agent_slug: "claude".into(),
@@ -17550,7 +16860,7 @@ mod tests {
                     invocations: Vec::new(),
                 }],
             };
-            index.add_conversation(&conv)?;
+            conversations.push(conv);
         }
 
         let requested = NormalizedConversation {
@@ -17573,10 +16883,10 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&requested)?;
-        index.commit()?;
+        conversations.push(requested);
+        let (dir, db_path) = seed_conversations_for_search_client(&conversations)?;
 
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
         let mut filters = SearchFilters::default();
         filters
             .session_paths
@@ -17594,7 +16904,7 @@ mod tests {
     fn search_session_paths_empty_filter_returns_all() -> Result<()> {
         // Empty session_paths filter should not restrict results
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         let conv = NormalizedConversation {
             agent_slug: "claude".into(),
@@ -17616,10 +16926,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // Empty session_paths should not filter
         let filters = SearchFilters::default();
