@@ -58,32 +58,98 @@ pub(crate) fn bm25_field(idf_value: f64, tf: u32, dl: u32, avgdl: f64) -> f64 {
 /// tantivy's tokenizer chain, not FTS5's trigram tokenizer). A lone CJK
 /// character with no neighbor forms no bigram and is dropped, exactly as
 /// `CjkBigramDecompose` would produce no token for it either.
+///
+/// **Amendment #2 fidelity fix (X-4 follow-up diagnostic)**: an interior `-`
+/// between two ASCII alphanumeric characters stays glued into the same raw
+/// token during the scan (mirrors `CassTokenStream::scan_ascii_token`,
+/// `cass_compat.rs` -- *not* an ASCII-vs-Unicode-alphanumeric distinction
+/// anywhere else in this function, only the hyphen-glue condition itself is
+/// ASCII-scoped, matching the real tokenizer), then [`push_hyphen_decomposed`]
+/// re-expands that raw token into the compound form *and* each
+/// hyphen-delimited part (mirrors `HyphenDecompose`, same file) -- so
+/// `"force-rebuild"` contributes 3 tokens (`"force-rebuild"`, `"force"`,
+/// `"rebuild"`), not 2. Measured against the real pipeline on a 1185-doc
+/// random sample: this closes a ~3% average / up to 25% single-document
+/// `dl` undercount for hyphen-dense (CLI-flag/code-heavy) text -- see
+/// `W2_ARTIFACTS/w2-hyphen-decompose-fidelity-diagnostic.md`.
 pub(crate) fn tokenize(text: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut word = String::new();
     let mut cjk_run: Vec<char> = Vec::new();
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
 
-    for c in text.chars() {
+    while i < chars.len() {
+        let c = chars[i];
         if is_cjk_char(c) {
             if !word.is_empty() {
-                tokens.push(std::mem::take(&mut word));
+                push_hyphen_decomposed(std::mem::take(&mut word), &mut tokens);
             }
             cjk_run.push(c);
-        } else if c.is_alphanumeric() {
+            i += 1;
+            continue;
+        }
+        if c.is_alphanumeric() {
             flush_cjk_bigrams(&mut cjk_run, &mut tokens);
             word.extend(c.to_lowercase());
-        } else {
-            flush_cjk_bigrams(&mut cjk_run, &mut tokens);
-            if !word.is_empty() {
-                tokens.push(std::mem::take(&mut word));
+            i += 1;
+            let mut last_was_ascii_alnum = c.is_ascii_alphanumeric();
+            loop {
+                if i < chars.len() && chars[i].is_ascii_alphanumeric() {
+                    word.extend(chars[i].to_lowercase());
+                    i += 1;
+                    last_was_ascii_alnum = true;
+                    continue;
+                }
+                if last_was_ascii_alnum
+                    && i < chars.len()
+                    && chars[i] == '-'
+                    && i + 1 < chars.len()
+                    && chars[i + 1].is_ascii_alphanumeric()
+                {
+                    word.push('-');
+                    i += 1;
+                    last_was_ascii_alnum = false;
+                    continue;
+                }
+                break;
             }
+            continue;
         }
+        flush_cjk_bigrams(&mut cjk_run, &mut tokens);
+        if !word.is_empty() {
+            push_hyphen_decomposed(std::mem::take(&mut word), &mut tokens);
+        }
+        i += 1;
     }
     flush_cjk_bigrams(&mut cjk_run, &mut tokens);
     if !word.is_empty() {
-        tokens.push(word);
+        push_hyphen_decomposed(word, &mut tokens);
     }
     tokens
+}
+
+/// Mirrors tantivy's `HyphenDecompose` token filter (`cass_compat.rs`): a raw
+/// token containing `-` emits the compound form *and* each hyphen-delimited
+/// part (real tantivy emits them at the same token position; this module
+/// only needs the multiset for tf/dl counting, so plain pushes are
+/// equivalent). Fewer than 2 non-empty parts (e.g. a token that is just
+/// `-` internally with nothing on one side, which `scan_ascii_token`'s own
+/// adjacency check makes unreachable, kept here only as a defensive
+/// pass-through) leaves the token unchanged, matching `parts.len() < 2`
+/// in the real filter.
+fn push_hyphen_decomposed(word: String, tokens: &mut Vec<String>) {
+    if !word.contains('-') {
+        tokens.push(word);
+        return;
+    }
+    let parts: Vec<String> = word.split('-').filter(|s| !s.is_empty()).map(str::to_owned).collect();
+    if parts.len() < 2 {
+        tokens.push(word);
+        return;
+    }
+    tokens.push(word);
+    tokens.extend(parts);
 }
 
 fn flush_cjk_bigrams(run: &mut Vec<char>, tokens: &mut Vec<String>) {
@@ -455,7 +521,52 @@ mod tests {
     fn tokenize_splits_cjk_into_overlapping_bigrams_and_latin_into_words() {
         assert_eq!(tokenize("数据库"), vec!["数据", "据库"]);
         assert_eq!(tokenize("Connectors work"), vec!["connectors", "work"]);
-        assert_eq!(tokenize("indexing-tool"), vec!["indexing", "tool"]);
         assert_eq!(tokenize("单"), Vec::<String>::new(), "lone CJK char forms no bigram");
+    }
+
+    /// Behavior-parity fixture (amendment #2 fidelity fix): locks
+    /// `tokenize()`'s hyphen handling to real `CassTokenizer` +
+    /// `HyphenDecompose` behavior (`cass_compat.rs`, pin rev
+    /// `2cad158f4468ece7076e3fe529c8e5c20b2e020e`), verified against a
+    /// hand-rolled Python replica of that exact source during the X-4
+    /// follow-up diagnostic. This is the behavior contract W2-6 retirement
+    /// inherits once frankensearch is gone and this source can no longer be
+    /// read directly.
+    #[test]
+    fn tokenize_hyphen_handling_matches_cass_tokenizer_plus_hyphen_decompose() {
+        // A hyphenated compound emits the compound form *and* each part --
+        // this is the specific gap the diagnostic found (previously only
+        // the two parts were emitted, undercounting dl by one token per
+        // compound).
+        assert_eq!(
+            tokenize("indexing-tool"),
+            vec!["indexing-tool", "indexing", "tool"]
+        );
+        // Multi-hyphen compound: the whole run glues, then decomposes into
+        // the compound plus every part.
+        assert_eq!(
+            tokenize("no-default-features"),
+            vec!["no-default-features", "no", "default", "features"]
+        );
+        // A hyphen NOT between two ASCII alphanumerics is a plain separator
+        // (unreachable by `scan_ascii_token`'s adjacency check) -- leading,
+        // trailing, and doubled hyphens all fall back to ordinary word
+        // boundaries, same as before this fix.
+        assert_eq!(tokenize("-leading"), vec!["leading"]);
+        assert_eq!(tokenize("trailing-"), vec!["trailing"]);
+        assert_eq!(tokenize("double--hyphen"), vec!["double", "hyphen"]);
+        // Path-like and dotted text (no hyphens) is unaffected -- confirms
+        // this fix is hyphen-scoped, not a general retokenization.
+        assert_eq!(
+            tokenize("src/indexer/mod.rs"),
+            vec!["src", "indexer", "mod", "rs"]
+        );
+        assert_eq!(tokenize("a.md indexing"), vec!["a", "md", "indexing"]);
+        // A hyphenated word immediately followed by more words: the run
+        // boundary after the compound is still correct.
+        assert_eq!(
+            tokenize("--force-rebuild now"),
+            vec!["force-rebuild", "force", "rebuild", "now"]
+        );
     }
 }
