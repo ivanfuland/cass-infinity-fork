@@ -9908,7 +9908,7 @@ mod e7_restore_journal_tests {
     /// 否则「恢复后收敛」可能只是无事可做的假绿（part5 判据 ⑤）。
     fn plant_post_commit_sentinels(data_dir: &Path, db_path: &Path) {
         // ① readiness：词法重建 checkpoint 存在 = 「索引自称对当前指纹新鲜」。
-        let index_dir = crate::search::tantivy::expected_index_dir(data_dir);
+        let index_dir = crate::indexer::expected_index_dir(data_dir);
         std::fs::create_dir_all(&index_dir).unwrap();
         std::fs::write(index_dir.join(".lexical-rebuild-state.json"), b"{}").unwrap();
 
@@ -9967,7 +9967,7 @@ mod e7_restore_journal_tests {
     }
 
     fn lexical_checkpoint_present(data_dir: &Path) -> bool {
-        crate::search::tantivy::expected_index_dir(data_dir)
+        crate::indexer::expected_index_dir(data_dir)
             .join(".lexical-rebuild-state.json")
             .exists()
     }

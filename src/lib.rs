@@ -22542,7 +22542,6 @@ fn ensure_lexical_assets_for_search(
 #[cfg(test)]
 mod search_lexical_self_heal_tests {
     use super::*;
-    use crate::connectors::{NormalizedConversation, NormalizedMessage};
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
     use crate::search::query::{FieldMask, SearchClient, SearchFilters};
     use crate::storage::sqlite::FrankenStorage;
@@ -22597,36 +22596,6 @@ mod search_lexical_self_heal_tests {
         db_path
     }
 
-    fn build_standalone_lexical_index_without_checkpoint(data_dir: &Path, content: &str) {
-        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
-        let mut index =
-            crate::search::tantivy::TantivyIndex::open_or_create(&index_path).expect("open index");
-        let conversation = NormalizedConversation {
-            agent_slug: "codex".to_string(),
-            external_id: Some("standalone-no-checkpoint".to_string()),
-            title: Some("Standalone lexical fixture".to_string()),
-            workspace: Some(PathBuf::from("/tmp/search-self-heal")),
-            source_path: data_dir.join("standalone.jsonl"),
-            started_at: Some(1_770_000_000_000),
-            ended_at: Some(1_770_000_001_000),
-            metadata: serde_json::json!({}),
-            messages: vec![NormalizedMessage {
-                idx: 0,
-                role: "user".to_string(),
-                author: Some("tester".to_string()),
-                created_at: Some(1_770_000_000_000),
-                content: content.to_string(),
-                extra: serde_json::json!({}),
-                snippets: Vec::new(),
-                invocations: Vec::new(),
-            }],
-        };
-        index
-            .add_conversation(&conversation)
-            .expect("add standalone conversation");
-        index.commit().expect("commit standalone index");
-    }
-
     fn hold_active_index_run_lock(data_dir: &Path, db_path: &Path) -> std::fs::File {
         let lock_path = data_dir.join("index-run.lock");
         let mut lock_file = std::fs::OpenOptions::new()
@@ -22664,7 +22633,7 @@ mod search_lexical_self_heal_tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let data_dir = temp.path();
         let db_path = seed_canonical_search_db(data_dir);
-        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+        let index_path = crate::indexer::expected_index_dir(data_dir);
 
         // W2-6 Task1: `seed_canonical_search_db` dual-writes lex_docs/fts_lex
         // via the normal storage API, so there is nothing "missing" from the
@@ -22726,553 +22695,6 @@ mod search_lexical_self_heal_tests {
         assert!(hits[0].content.contains("autohealneedle"));
     }
 
-    // W2-6 Task1 (control-plane 2026-08-30 ruling): asserts against the
-    // tantivy checkpoint file's internal state (staleness/fingerprint-drift
-    // machinery), which retires wholesale with Task2 -- left ignored rather
-    // than guessing new expectations; Task2's closed-world account disposes
-    // of it for real.
-    #[test]
-    #[ignore = "W2-6 Task2: asserts tantivy checkpoint machinery slated for full retirement"]
-    fn search_self_heal_refreshes_stale_checkpoint_when_live_index_matches_db() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let data_dir = temp.path();
-        let db_path = seed_canonical_search_db(data_dir);
-        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
-        ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect("initial rebuild");
-
-        let state_path = index_path.join(".lexical-rebuild-state.json");
-        let mut state: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&state_path).expect("read checkpoint"))
-                .expect("parse checkpoint");
-        state["schema_hash"] = serde_json::json!("old-schema-hash");
-        std::fs::write(
-            &state_path,
-            serde_json::to_vec_pretty(&state).expect("serialize checkpoint"),
-        )
-        .expect("write stale checkpoint");
-
-        let repair = ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect("search self-heal should refresh checkpoint");
-        assert_eq!(repair.action, "refreshed-checkpoint");
-
-        let checkpoint = crate::indexer::load_lexical_rebuild_checkpoint(&index_path)
-            .expect("load repaired checkpoint")
-            .expect("checkpoint present");
-        assert_eq!(checkpoint.schema_hash, crate::search::tantivy::SCHEMA_HASH);
-        assert!(checkpoint.completed);
-    }
-
-    #[test]
-    #[ignore = "W2-6 Task2: asserts tantivy checkpoint machinery slated for full retirement"]
-    fn search_self_heal_rebuilds_when_checkpoint_references_different_db() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let data_dir = temp.path();
-        let old_db_path = data_dir.join("old_agent_search.db");
-        let db_path = data_dir.join("agent_search.db");
-        seed_search_db_at(
-            &old_db_path,
-            "oldautohealneedle exists only in the superseded database",
-            "old-search-self-heal-conversation",
-        );
-        seed_search_db_at(
-            &db_path,
-            "newautohealneedle exists only in the active database",
-            "new-search-self-heal-conversation",
-        );
-        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
-        ensure_lexical_assets_for_search(
-            data_dir,
-            &old_db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect("initial rebuild from old database");
-
-        let repair = ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect("search self-heal should rebuild for different active db");
-        assert_eq!(repair.action, "rebuilt-from-canonical-db");
-        assert_eq!(repair.indexed_docs, Some(1));
-
-        let checkpoint = crate::indexer::load_lexical_rebuild_checkpoint(&index_path)
-            .expect("load rebuilt checkpoint")
-            .expect("checkpoint present");
-        assert!(stored_path_identity_matches(&checkpoint.db_path, &db_path));
-
-        let client = SearchClient::open(&index_path, Some(&db_path))
-            .expect("open search client")
-            .expect("repaired index should open");
-        let new_hits = client
-            .search(
-                "newautohealneedle",
-                SearchFilters::default(),
-                5,
-                0,
-                FieldMask::FULL,
-            )
-            .expect("query rebuilt active-db index");
-        assert_eq!(new_hits.len(), 1);
-        let old_hits = client
-            .search(
-                "oldautohealneedle",
-                SearchFilters::default(),
-                5,
-                0,
-                FieldMask::FULL,
-            )
-            .expect("query superseded-db term");
-        assert_eq!(old_hits.len(), 0);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    #[ignore = "W2-6 Task2: asserts tantivy checkpoint machinery slated for full retirement"]
-    fn search_self_heal_defers_same_db_content_drift_to_index_run() {
-        // W2-5: see search_self_heal_defers_missing_checkpoint_when_index_is_readable --
-        // same Tantivy-specific checkpoint-deferral semantics, same reason
-        // to pin to the legacy flag.
-        let _tantivy_guard = crate::search::query::LexicalUseTantivyGuard::enable();
-        let temp = tempfile::tempdir().expect("tempdir");
-        let data_dir = temp.path();
-        let db_path = data_dir.join("agent_search.db");
-        seed_search_db_at(
-            &db_path,
-            "oldsamepathneedle is present in the first lexical generation",
-            "old-same-path-search-self-heal-conversation",
-        );
-        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
-        ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect("initial rebuild from active database");
-
-        seed_search_db_at(
-            &db_path,
-            "newsamepathneedle is appended to the same canonical database",
-            "new-same-path-search-self-heal-conversation",
-        );
-        let diagnosis = search_lexical_self_heal_diagnosis(&index_path, &db_path)
-            .expect("diagnose changed same-path database")
-            .expect("changed same-path database should require repair");
-        assert_eq!(
-            diagnosis.reason,
-            "lexical checkpoint storage fingerprint no longer matches active database"
-        );
-        assert!(
-            diagnosis.existing_index_search_allowed,
-            "same-db fingerprint drift should search the existing readable index and defer repair"
-        );
-
-        let repair = ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect("search self-heal should not rebuild inline after same-db content changes");
-        assert_eq!(repair.action, "deferred-repair-searching-existing-index");
-        assert_eq!(repair.indexed_docs, None);
-
-        let client = SearchClient::open(&index_path, Some(&db_path))
-            .expect("open search client")
-            .expect("existing stale index should still open");
-        let old_hits = client
-            .search(
-                "oldsamepathneedle",
-                SearchFilters::default(),
-                5,
-                0,
-                FieldMask::FULL,
-            )
-            .expect("query existing lexical generation");
-        assert_eq!(old_hits.len(), 1);
-        let new_hits = client
-            .search(
-                "newsamepathneedle",
-                SearchFilters::default(),
-                5,
-                0,
-                FieldMask::FULL,
-            )
-            .expect("query content that still needs the next index run");
-        assert_eq!(new_hits.len(), 0);
-    }
-
-    #[test]
-    #[ignore = "W2-6 Task2: asserts tantivy checkpoint machinery slated for full retirement (its setup relies on a checkpoint file that no longer gets created once a seeded db already dual-writes lex_docs/fts_lex)"]
-    fn active_rebuild_waits_instead_of_searching_stale_existing_index() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let data_dir = temp.path();
-        let old_db_path = data_dir.join("old_agent_search.db");
-        let db_path = data_dir.join("agent_search.db");
-        seed_search_db_at(
-            &old_db_path,
-            "oldactiverebuildneedle exists only in the superseded database",
-            "old-active-rebuild-search-self-heal-conversation",
-        );
-        seed_search_db_at(
-            &db_path,
-            "newactiverebuildneedle exists only in the active database",
-            "new-active-rebuild-search-self-heal-conversation",
-        );
-        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
-        ensure_lexical_assets_for_search(
-            data_dir,
-            &old_db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect("initial rebuild from old database");
-        let diagnosis = search_lexical_self_heal_diagnosis(&index_path, &db_path)
-            .expect("diagnose stale lexical index")
-            .expect("old database checkpoint should be stale for active db");
-        assert!(
-            diagnosis.reason.contains("lexical checkpoint references"),
-            "unexpected stale-index diagnosis: {}",
-            diagnosis.reason
-        );
-
-        let _lock_file = hold_active_index_run_lock(data_dir, &db_path);
-
-        let err = ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            Some(0),
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect_err(
-            "stale existing index should wait for active rebuild instead of being searched",
-        );
-        assert_eq!(err.code, 7);
-        assert_eq!(err.kind, CliErrorKind::IndexBusy.kind_str());
-        assert!(
-            err.message.contains("already repairing the search index"),
-            "unexpected error: {err:?}"
-        );
-    }
-
-    #[test]
-    #[ignore = "W2-6 Task2: asserts tantivy checkpoint machinery slated for full retirement (its setup relies on a checkpoint file that no longer gets created once a seeded db already dual-writes lex_docs/fts_lex)"]
-    fn active_rebuild_waits_instead_of_searching_incomplete_checkpoint() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let data_dir = temp.path();
-        let db_path = seed_canonical_search_db(data_dir);
-        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
-        ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect("initial rebuild from active database");
-
-        let state_path = index_path.join(".lexical-rebuild-state.json");
-        let mut state: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&state_path).expect("read checkpoint"))
-                .expect("parse checkpoint");
-        state["completed"] = serde_json::json!(false);
-        std::fs::write(
-            &state_path,
-            serde_json::to_vec_pretty(&state).expect("serialize checkpoint"),
-        )
-        .expect("write incomplete checkpoint");
-
-        let diagnosis = search_lexical_self_heal_diagnosis(&index_path, &db_path)
-            .expect("diagnose incomplete checkpoint")
-            .expect("incomplete checkpoint should require repair");
-        assert_eq!(diagnosis.reason, "lexical rebuild checkpoint is incomplete");
-        assert!(
-            !diagnosis.permits_existing_index_during_active_rebuild(),
-            "active rebuild must not search an index before checkpoint refresh proof"
-        );
-
-        let _lock_file = hold_active_index_run_lock(data_dir, &db_path);
-
-        let err = ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            Some(0),
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect_err(
-            "incomplete checkpoint should wait for active rebuild instead of being searched",
-        );
-        assert_eq!(err.code, 7);
-        assert_eq!(err.kind, CliErrorKind::IndexBusy.kind_str());
-        assert!(
-            err.message.contains("already repairing the search index"),
-            "unexpected error: {err:?}"
-        );
-    }
-
-    /// #287: a robot-mode search facing an incomplete lexical checkpoint that
-    /// the cheap live-index refresh cannot reconcile must return a bounded
-    /// structured refusal with the stable `checkpoint_incomplete` reason code
-    /// instead of silently launching a multi-minute inline rebuild.
-    #[test]
-    #[ignore = "W2-6 Task2: asserts tantivy checkpoint machinery slated for full retirement (its setup relies on a checkpoint file that no longer gets created once a seeded db already dual-writes lex_docs/fts_lex)"]
-    fn robot_search_returns_bounded_checkpoint_incomplete_instead_of_inline_rebuild() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let data_dir = temp.path();
-        let db_path = seed_canonical_search_db(data_dir);
-        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
-        ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect("initial rebuild from active database");
-
-        // Mark the checkpoint incomplete AND grow the canonical DB so the
-        // live-index doc count no longer matches — the cheap metadata-only
-        // checkpoint refresh then cannot reconcile, and only the heavyweight
-        // canonical rebuild path remains.
-        let state_path = index_path.join(".lexical-rebuild-state.json");
-        let mut state: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&state_path).expect("read checkpoint"))
-                .expect("parse checkpoint");
-        state["completed"] = serde_json::json!(false);
-        std::fs::write(
-            &state_path,
-            serde_json::to_vec_pretty(&state).expect("serialize checkpoint"),
-        )
-        .expect("write incomplete checkpoint");
-        seed_search_db_at(
-            &db_path,
-            "robotrefusalneedle appended after the incomplete checkpoint",
-            "robot-refusal-extra-conversation",
-        );
-
-        let err = ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            true,
-        )
-        .expect_err(
-            "robot search must refuse the heavyweight inline rebuild with a bounded verdict",
-        );
-        assert_eq!(err.kind, "checkpoint_incomplete");
-        assert_eq!(err.code, 5);
-        assert!(err.retryable);
-        assert!(
-            err.message
-                .contains("lexical rebuild checkpoint is incomplete"),
-            "unexpected error: {err:?}"
-        );
-
-        // Human-mode (non-robot) searches keep the self-healing inline rebuild.
-        let repair = ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect("human-mode search keeps the inline self-heal rebuild");
-        assert_eq!(repair.action, "rebuilt-from-canonical-db");
-    }
-
-    /// #287: an active ingest-quarantine circuit breaker means any inline
-    /// rebuild may never converge — robot-mode searches must surface the
-    /// stable `quarantine_circuit_breaker` reason code as a bounded refusal.
-    #[test]
-    #[ignore = "W2-6 Task2: asserts tantivy checkpoint machinery slated for full retirement (its setup relies on a checkpoint file that no longer gets created once a seeded db already dual-writes lex_docs/fts_lex)"]
-    fn robot_search_returns_bounded_quarantine_circuit_breaker_refusal() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let data_dir = temp.path();
-        let db_path = seed_canonical_search_db(data_dir);
-        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
-
-        // Trip the ingest-quarantine circuit breaker: at least
-        // INGEST_QUARANTINE_CIRCUIT_DEFAULT_LIMIT recent poison records.
-        let quarantine_dir = data_dir.join("quarantine");
-        std::fs::create_dir_all(&quarantine_dir).expect("create quarantine dir");
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        let mut lines = String::new();
-        for idx in 0..25 {
-            let record = serde_json::json!({
-                "schema_version": 1,
-                "conversation_id": format!("tester|/logs/demo-{idx}.jsonl|/workspace/demo|poison-{idx}|1|2|1"),
-                "schema_version_at_quarantine": crate::storage::sqlite::CURRENT_SCHEMA_VERSION,
-                "first_quarantined_at_ms": now_ms,
-                "last_attempt_at_ms": now_ms,
-                "attempt_count": 1,
-                "reason": "index-ingest-out-of-memory",
-                "error_kind": "out-of-memory",
-                "last_error": "out of memory",
-                "agent_slug": "tester",
-                "external_id": format!("poison-{idx}"),
-                "source_path": format!("/logs/demo-{idx}.jsonl"),
-                "workspace": "/workspace/demo",
-                "started_at": 1,
-                "ended_at": 2,
-                "message_count": 1
-            });
-            lines.push_str(&format!("{record}\n"));
-        }
-        std::fs::write(quarantine_dir.join("index_ingest_poison.jsonl"), lines)
-            .expect("write poison records");
-        let summary = crate::indexer::conversation_ingest_quarantine_summary(data_dir);
-        assert!(
-            summary.circuit_breaker_active,
-            "fixture must trip the ingest circuit breaker: {summary:?}"
-        );
-
-        // No lexical index exists, so the self-heal would normally launch the
-        // inline canonical rebuild; robot mode must refuse instead while the
-        // breaker is active.
-        let err = ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            true,
-        )
-        .expect_err("robot search must refuse inline rebuild behind an active circuit breaker");
-        assert_eq!(err.kind, "quarantine_circuit_breaker");
-        assert_eq!(err.code, 5);
-        assert!(err.retryable);
-        assert!(
-            err.hint
-                .as_deref()
-                .is_some_and(|hint| hint.contains("cass index --watch-once")),
-            "hint must name the recovery command: {err:?}"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn search_self_heal_defers_missing_checkpoint_when_index_is_readable() {
-        // W2-5: this test's "active_hits must be 0" assertion pins Tantivy's
-        // own checkpoint-deferral semantics (content already synced to the
-        // canonical DB but not yet reflected in the readable Tantivy index).
-        // `fts_lex` is synced in the same transaction as the DB write with
-        // no separate rebuild step, so it legitimately finds this content
-        // immediately -- a real improvement, not a regression -- which is
-        // exactly why this Tantivy-specific deferral test must run under
-        // the legacy flag.
-        let _tantivy_guard = crate::search::query::LexicalUseTantivyGuard::enable();
-        let temp = tempfile::tempdir().expect("tempdir");
-        let data_dir = temp.path();
-        build_standalone_lexical_index_without_checkpoint(
-            data_dir,
-            "orphanautohealneedle exists only in a standalone lexical artifact",
-        );
-        let db_path = data_dir.join("agent_search.db");
-        seed_search_db_at(
-            &db_path,
-            "checkpointmissingautohealneedle exists only in the active database",
-            "checkpoint-missing-search-self-heal-conversation",
-        );
-        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
-
-        let repair = ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect(
-            "search self-heal should not rebuild inline when only checkpoint metadata is missing",
-        );
-        assert_eq!(repair.action, "deferred-repair-searching-existing-index");
-        assert_eq!(repair.indexed_docs, None);
-
-        assert!(
-            crate::indexer::load_lexical_rebuild_checkpoint(&index_path)
-                .expect("load checkpoint")
-                .is_none(),
-            "foreground search should not synthesize unverifiable checkpoint metadata"
-        );
-
-        let client = SearchClient::open(&index_path, Some(&db_path))
-            .expect("open search client")
-            .expect("existing standalone index should still open");
-        let active_hits = client
-            .search(
-                "checkpointmissingautohealneedle",
-                SearchFilters::default(),
-                5,
-                0,
-                FieldMask::FULL,
-            )
-            .expect("query active-db term");
-        assert_eq!(active_hits.len(), 0);
-        let orphan_hits = client
-            .search(
-                "orphanautohealneedle",
-                SearchFilters::default(),
-                5,
-                0,
-                FieldMask::FULL,
-            )
-            .expect("query standalone lexical term");
-        assert_eq!(orphan_hits.len(), 1);
-    }
-
     // W2-6 Task1 closed-world account: `search_self_heal_rebuilds_incompatible_live_artifact`
     // (stale tantivy schema_hash.json triggers a rebuild) retired here, not
     // rewritten -- control-plane 2026-08-30 ruling. It tested a capability
@@ -23289,7 +22711,7 @@ mod search_lexical_self_heal_tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let data_dir = temp.path();
         let db_path = seed_canonical_search_db(data_dir);
-        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+        let index_path = crate::indexer::expected_index_dir(data_dir);
 
         // Corrupt the FTS5 domain's own internal segment-data shadow table,
         // instead of corrupting the retired tantivy meta.json -- self-heal's
@@ -59877,7 +59299,7 @@ mod doctor_asset_taxonomy_tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let data_dir = temp.path().join("cass-data");
         let db_path = data_dir.join("agent_search.db");
-        let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
+        let index_path = crate::indexer::expected_index_dir(&data_dir);
         std::fs::create_dir_all(&db_path).expect("create unopenable db path directory");
         let readiness_snapshot = serde_json::json!({
             "semantic": {
@@ -73361,14 +72783,14 @@ mod cli_read_db_tests {
     #[test]
     fn state_meta_json_reports_active_rebuild_pipeline_runtime() {
         let (temp, db_path) = seed_cli_db();
-        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        let index_path = crate::indexer::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
         std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
         std::fs::write(
             index_path.join(".lexical-rebuild-state.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
                 "version": 2,
-                "schema_hash": crate::search::tantivy::SCHEMA_HASH,
+                "schema_hash": crate::indexer::LEXICAL_REBUILD_SCHEMA_HASH,
                 "db": {
                     "db_path": db_path.display().to_string(),
                     "total_conversations": 10,
@@ -73510,14 +72932,14 @@ mod cli_read_db_tests {
     #[test]
     fn state_meta_json_hides_empty_active_rebuild_pipeline_runtime_before_first_heartbeat() {
         let (temp, db_path) = seed_cli_db();
-        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        let index_path = crate::indexer::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
         std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
         std::fs::write(
             index_path.join(".lexical-rebuild-state.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
                 "version": 2,
-                "schema_hash": crate::search::tantivy::SCHEMA_HASH,
+                "schema_hash": crate::indexer::LEXICAL_REBUILD_SCHEMA_HASH,
                 "db": {
                     "db_path": db_path.display().to_string(),
                     "total_conversations": 10,
@@ -73569,14 +72991,14 @@ mod cli_read_db_tests {
     #[test]
     fn state_meta_json_reports_active_rebuild() {
         let (temp, db_path) = seed_cli_db();
-        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        let index_path = crate::indexer::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
         std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
         std::fs::write(
             index_path.join(".lexical-rebuild-state.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
                 "version": 2,
-                "schema_hash": crate::search::tantivy::SCHEMA_HASH,
+                "schema_hash": crate::indexer::LEXICAL_REBUILD_SCHEMA_HASH,
                 "db": {
                     "db_path": db_path.display().to_string(),
                     "total_conversations": 10,
@@ -73630,14 +73052,14 @@ mod cli_read_db_tests {
     #[test]
     fn state_meta_json_prefers_pending_rebuild_progress_when_present() {
         let (temp, db_path) = seed_cli_db();
-        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        let index_path = crate::indexer::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
         std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
         std::fs::write(
             index_path.join(".lexical-rebuild-state.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
                 "version": 2,
-                "schema_hash": crate::search::tantivy::SCHEMA_HASH,
+                "schema_hash": crate::indexer::LEXICAL_REBUILD_SCHEMA_HASH,
                 "db": {
                     "db_path": db_path.display().to_string(),
                     "total_conversations": 10,
@@ -73697,7 +73119,7 @@ mod cli_read_db_tests {
     fn state_meta_json_matches_active_rebuild_for_equivalent_db_path_spellings() {
         let (temp, db_path) = seed_cli_db();
         let db_path_variant = temp.path().join(".").join("agent_search.db");
-        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        let index_path = crate::indexer::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
         std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
 
@@ -73769,7 +73191,7 @@ mod cli_read_db_tests {
     #[test]
     fn state_meta_json_reports_active_data_dir_lock_without_db_path_metadata() {
         let (temp, db_path) = seed_cli_db();
-        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        let index_path = crate::indexer::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
         std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
 
@@ -73827,7 +73249,7 @@ mod cli_read_db_tests {
     #[test]
     fn state_meta_json_reports_active_rebuild_before_lexical_snapshot_exists() {
         let (temp, db_path) = seed_cli_db();
-        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        let index_path = crate::indexer::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
         std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
 
@@ -73868,7 +73290,7 @@ mod cli_read_db_tests {
     #[test]
     fn state_meta_json_reports_watch_active_without_marking_rebuild() {
         let (temp, db_path) = seed_cli_db();
-        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        let index_path = crate::indexer::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
         std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
 
@@ -73907,7 +73329,7 @@ mod cli_read_db_tests {
         // and returns a clean default snapshot.  Verify that the state_meta
         // JSON reflects the reaped (clean) state.
         let (temp, db_path) = seed_cli_db();
-        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        let index_path = crate::indexer::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
         std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
 
@@ -73947,7 +73369,7 @@ mod cli_read_db_tests {
     #[test]
     fn state_meta_json_uses_latest_lock_heartbeat_when_asset_inspection_fails() {
         let (temp, db_path) = seed_cli_db();
-        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        let index_path = crate::indexer::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
         std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
         std::fs::create_dir_all(index_path.join(".lexical-rebuild-state.json"))
@@ -73996,7 +73418,7 @@ mod cli_read_db_tests {
     #[test]
     fn state_meta_json_does_not_infer_watch_activity_from_watch_state_file() {
         let (temp, db_path) = seed_cli_db();
-        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        let index_path = crate::indexer::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
         std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
         std::fs::write(
@@ -74013,14 +73435,14 @@ mod cli_read_db_tests {
     #[test]
     fn state_meta_json_marks_lexical_fingerprint_mismatch_stale() {
         let (temp, db_path) = seed_cli_db();
-        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        let index_path = crate::indexer::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
         std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
         std::fs::write(
             index_path.join(".lexical-rebuild-state.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
                 "version": 2,
-                "schema_hash": crate::search::tantivy::SCHEMA_HASH,
+                "schema_hash": crate::indexer::LEXICAL_REBUILD_SCHEMA_HASH,
                 "db": {
                     "db_path": db_path.display().to_string(),
                     "total_conversations": 10,
