@@ -17180,6 +17180,60 @@ pub(crate) fn repair_lexical_index_from_canonical_db_for_search(
                 db_path.display()
             )
         })?;
+
+        // W2-6 Task1 (X-5 fix, control-plane 2026-08-30 amendment): repair is
+        // unconditional drop+recreate+resync, not a conditional patch --
+        // derived data's repair story is "rebuild from the source of truth"
+        // (rebuild-not-convert doctrine), never "patch in place". This is
+        // the exact same code path regardless of whether the domain was
+        // missing, empty, or internally corrupted, so there is no branch to
+        // get wrong and no way for a resync to make a corrupted domain
+        // worse (the failure mode a conditional "resync only if unhealthy"
+        // design hit: FTS5 external-content DELETE re-derives the terms to
+        // remove from the *current* content column, so resyncing against an
+        // already-inconsistent domain can corrupt it further).
+        // A raw writable Conn (not FrankenStorage::open) deliberately skips
+        // FrankenStorage::open's own schema-completeness self-heal, which
+        // errors out on a corrupted (not just missing) fts_lex rather than
+        // repairing it -- exactly the state DROP+CREATE below is about to
+        // fix. Going through that probe first would prevent ever reaching
+        // the fix on a genuinely corrupted domain.
+        let lex_conn = crate::storage::api::Conn::open_writable(
+            db_path,
+            crate::storage::api::Profile::Production,
+        )
+        .with_context(|| {
+            format!(
+                "opening database (raw) to rebuild lex domain for empty search-triggered lexical repair: {}",
+                db_path.display()
+            )
+        })?;
+        crate::storage::schema::recreate_lex_domain_tables(&lex_conn).with_context(|| {
+            format!(
+                "recreating lex domain tables for empty search-triggered lexical repair: {}",
+                db_path.display()
+            )
+        })?;
+        let lex_storage = FrankenStorage::from_writer_handle_conn(lex_conn, db_path.to_path_buf())
+            .with_context(|| {
+                format!(
+                    "wrapping recreated lex domain connection for empty search-triggered lexical repair: {}",
+                    db_path.display()
+                )
+            })?;
+        lex_storage.rebuild_lex_domain_from_db(None).with_context(|| {
+            format!(
+                "rebuilding lex domain for empty search-triggered lexical repair: {}",
+                db_path.display()
+            )
+        })?;
+        lex_storage.close_without_checkpoint().with_context(|| {
+            format!(
+                "closing database after empty search-triggered lex domain repair: {}",
+                db_path.display()
+            )
+        })?;
+
         return Ok(SearchLexicalRepairOutcome { indexed_docs: 0 });
     }
     storage.close_without_checkpoint().with_context(|| {
@@ -17193,9 +17247,61 @@ pub(crate) fn repair_lexical_index_from_canonical_db_for_search(
         db_path,
         data_dir,
         total_conversations,
-        progress,
+        progress.clone(),
         Arc::clone(&index_run_lock.last_progress_at_ms_atomic),
     )?;
+
+    // W2-6 Task1 (X-5 fix): the tantivy rebuild above never touches
+    // lex_docs/fts_lex -- without this, self-heal would report
+    // "rebuilt-from-canonical-db" while the domain that actually serves
+    // search post-W2-5 stayed exactly as broken as before. Relational
+    // domain is already confirmed non-empty above; unconditionally
+    // drop+recreate+resync the lexical domain from it now (control-plane
+    // 2026-08-30 amendment: rebuild-not-convert doctrine -- see the empty-db
+    // branch above for why this must not be a conditional "resync only if
+    // unhealthy" repair).
+    // Raw writable Conn, not FrankenStorage::open -- see the empty-db
+    // branch above for why (its own schema-completeness self-heal errors
+    // out on a corrupted, not just missing, fts_lex instead of repairing
+    // it).
+    let lex_conn = crate::storage::api::Conn::open_writable(
+        db_path,
+        crate::storage::api::Profile::Production,
+    )
+    .with_context(|| {
+        format!(
+            "opening database (raw) to rebuild lex domain for search-triggered lexical repair: {}",
+            db_path.display()
+        )
+    })?;
+    crate::storage::schema::recreate_lex_domain_tables(&lex_conn).with_context(|| {
+        format!(
+            "recreating lex domain tables for search-triggered lexical repair: {}",
+            db_path.display()
+        )
+    })?;
+    let lex_storage = FrankenStorage::from_writer_handle_conn(lex_conn, db_path.to_path_buf())
+        .with_context(|| {
+            format!(
+                "wrapping recreated lex domain connection for search-triggered lexical repair: {}",
+                db_path.display()
+            )
+        })?;
+    lex_storage
+        .rebuild_lex_domain_from_db(progress.as_ref())
+        .with_context(|| {
+            format!(
+                "rebuilding lex domain for search-triggered lexical repair: {}",
+                db_path.display()
+            )
+        })?;
+    lex_storage.close_without_checkpoint().with_context(|| {
+        format!(
+            "closing database after search-triggered lex domain repair: {}",
+            db_path.display()
+        )
+    })?;
+
     Ok(SearchLexicalRepairOutcome {
         indexed_docs: rebuild.indexed_docs,
     })

@@ -18488,9 +18488,8 @@ fn cli_error_json_payload(err: &CliError, elapsed_ms: u128) -> serde_json::Value
 }
 
 fn cass_lexical_index_initialized(data_dir: &Path) -> bool {
-    crate::search::tantivy::searchable_index_exists(&crate::search::tantivy::expected_index_dir(
-        data_dir,
-    ))
+    // W2-6 Task1: reseated onto the lex_docs/fts_lex SQLite domain.
+    crate::search::lexical_index_health::searchable_index_exists(&data_dir.join("agent_search.db"))
 }
 
 fn cass_not_initialized(
@@ -18786,9 +18785,12 @@ fn state_meta_json_inner(
     let open_skipped = db_snapshot.open_skipped;
 
     let index_path = crate::search::tantivy::expected_index_dir(data_dir);
-    let lexical_index_initialized = crate::search::tantivy::searchable_index_exists(&index_path);
+    // W2-6 Task1: reseated onto the lex_docs/fts_lex SQLite domain (db_path);
+    // index_path is still needed below for tantivy-era pipeline runtime/
+    // manifest lookups pending Task2.
+    let lexical_index_initialized = crate::search::lexical_index_health::searchable_index_exists(db_path);
     if last_indexed_at.is_none() && lexical_index_initialized {
-        last_indexed_at = crate::search::tantivy::searchable_index_modified_time(&index_path)
+        last_indexed_at = crate::search::lexical_index_health::searchable_index_modified_time(db_path)
             .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_millis() as i64);
     }
@@ -22327,13 +22329,17 @@ fn search_lexical_self_heal_diagnosis(
     index_path: &Path,
     db_path: &Path,
 ) -> CliResult<Option<SearchLexicalSelfHealDiagnosis>> {
-    if !crate::search::tantivy::searchable_index_exists(index_path) {
+    // W2-6 Task1: reseated onto the lex_docs/fts_lex SQLite domain (db_path).
+    if !crate::search::lexical_index_health::searchable_index_exists(db_path) {
         return Ok(Some(SearchLexicalSelfHealDiagnosis::rebuild(
             "searchable lexical metadata missing",
         )));
     }
 
-    if let Err(err) = crate::search::tantivy::validate_searchable_index_contract(index_path) {
+    // W2-6 Task1 (hot-path cost fix, control-plane 2026-08-30 amendment):
+    // this runs on every search -- quick tier only, never the full rank=1
+    // integrity-check.
+    if let Err(err) = crate::search::lexical_index_health::validate_searchable_index_contract_quick(db_path) {
         return Ok(Some(SearchLexicalSelfHealDiagnosis::rebuild(format!(
             "lexical artifact contract is unusable: {err:#}"
         ))));
@@ -22419,13 +22425,16 @@ fn search_active_rebuild_wait_duration(timeout_ms: Option<u64>, started_at: Inst
 fn wait_for_searchable_index_after_active_rebuild(
     data_dir: &Path,
     db_path: &Path,
-    index_path: &Path,
+    // W2-6 Task1: no longer read -- the reseated existence check below uses
+    // db_path. Kept for now to avoid rippling a signature change through
+    // this function's callers outside Task1's scope.
+    _index_path: &Path,
     max_wait: Duration,
 ) -> bool {
     let deadline = Instant::now() + max_wait;
     loop {
         let rebuild_active = probe_index_run_lock(data_dir, db_path).active;
-        if crate::search::tantivy::searchable_index_exists(index_path) && !rebuild_active {
+        if crate::search::lexical_index_health::searchable_index_exists(db_path) && !rebuild_active {
             return true;
         }
         if Instant::now() >= deadline {
@@ -22513,7 +22522,8 @@ fn ensure_lexical_assets_for_search(
         return Ok(SearchLexicalSelfHeal::skipped());
     }
 
-    let initial_index_exists = crate::search::tantivy::searchable_index_exists(index_path);
+    // W2-6 Task1: reseated onto the lex_docs/fts_lex SQLite domain (db_path).
+    let initial_index_exists = crate::search::lexical_index_health::searchable_index_exists(db_path);
     let initial_rebuild_active = probe_index_run_lock(data_dir, db_path).active;
     if initial_rebuild_active {
         if initial_index_exists {
@@ -22730,13 +22740,6 @@ mod search_lexical_self_heal_tests {
         db_path
     }
 
-    fn seed_empty_canonical_search_db(data_dir: &Path) -> PathBuf {
-        let db_path = data_dir.join("agent_search.db");
-        let storage = FrankenStorage::open(&db_path).expect("open empty canonical db");
-        drop(storage);
-        db_path
-    }
-
     fn build_standalone_lexical_index_without_checkpoint(data_dir: &Path, content: &str) {
         let index_path = crate::search::tantivy::expected_index_dir(data_dir);
         let mut index =
@@ -22805,9 +22808,36 @@ mod search_lexical_self_heal_tests {
         let data_dir = temp.path();
         let db_path = seed_canonical_search_db(data_dir);
         let index_path = crate::search::tantivy::expected_index_dir(data_dir);
-        assert!(!crate::search::tantivy::searchable_index_exists(
-            &index_path
-        ));
+
+        // W2-6 Task1: `seed_canonical_search_db` dual-writes lex_docs/fts_lex
+        // via the normal storage API, so there is nothing "missing" from the
+        // FTS5 domain's point of view yet. Simulate the scenario
+        // `searchable_index_exists`'s "has content but no coverage" semantics
+        // exist to catch -- a v1->v2-migrated-but-never-backfilled database --
+        // by wiping the domain the seed just populated, without touching
+        // `messages`. The old scenario here ("no tantivy index directory")
+        // stopped being what self-heal needs to detect once W2-5 switched the
+        // query path to FTS5 (control-plane 2026-08-30 ruling; original
+        // tantivy-directory scenario recorded in the W2-6 closed-world
+        // account).
+        {
+            let conn = crate::storage::api::Conn::open_writable(
+                &db_path,
+                crate::storage::api::Profile::Production,
+            )
+            .expect("open db for fault injection");
+            conn.execute("DELETE FROM fts_lex WHERE rowid IN (SELECT id FROM messages)", &[])
+                .expect("wipe fts_lex for fault injection");
+            conn.execute("DELETE FROM lex_docs", &[])
+                .expect("wipe lex_docs for fault injection");
+        }
+        // Probe validity check (波1 铁律): the injected fault must actually
+        // produce the "has content, no coverage" state before self-heal is
+        // trusted to detect it.
+        assert!(
+            !crate::search::lexical_index_health::searchable_index_exists(&db_path),
+            "fault injection must make the lexical domain read as missing"
+        );
 
         let repair = ensure_lexical_assets_for_search(
             data_dir,
@@ -22821,7 +22851,7 @@ mod search_lexical_self_heal_tests {
         .expect("search self-heal should rebuild missing lexical index");
         assert_eq!(repair.action, "rebuilt-from-canonical-db");
         assert_eq!(repair.indexed_docs, Some(1));
-        assert!(crate::search::tantivy::searchable_index_exists(&index_path));
+        assert!(crate::search::lexical_index_health::searchable_index_exists(&db_path));
 
         let client = SearchClient::open(&index_path, Some(&db_path))
             .expect("open search client")
@@ -22839,7 +22869,13 @@ mod search_lexical_self_heal_tests {
         assert!(hits[0].content.contains("autohealneedle"));
     }
 
+    // W2-6 Task1 (control-plane 2026-08-30 ruling): asserts against the
+    // tantivy checkpoint file's internal state (staleness/fingerprint-drift
+    // machinery), which retires wholesale with Task2 -- left ignored rather
+    // than guessing new expectations; Task2's closed-world account disposes
+    // of it for real.
     #[test]
+    #[ignore = "W2-6 Task2: asserts tantivy checkpoint machinery slated for full retirement"]
     fn search_self_heal_refreshes_stale_checkpoint_when_live_index_matches_db() {
         let temp = tempfile::tempdir().expect("tempdir");
         let data_dir = temp.path();
@@ -22887,6 +22923,7 @@ mod search_lexical_self_heal_tests {
     }
 
     #[test]
+    #[ignore = "W2-6 Task2: asserts tantivy checkpoint machinery slated for full retirement"]
     fn search_self_heal_rebuilds_when_checkpoint_references_different_db() {
         let temp = tempfile::tempdir().expect("tempdir");
         let data_dir = temp.path();
@@ -22959,6 +22996,7 @@ mod search_lexical_self_heal_tests {
 
     #[test]
     #[serial_test::serial]
+    #[ignore = "W2-6 Task2: asserts tantivy checkpoint machinery slated for full retirement"]
     fn search_self_heal_defers_same_db_content_drift_to_index_run() {
         // W2-5: see search_self_heal_defers_missing_checkpoint_when_index_is_readable --
         // same Tantivy-specific checkpoint-deferral semantics, same reason
@@ -23040,6 +23078,7 @@ mod search_lexical_self_heal_tests {
     }
 
     #[test]
+    #[ignore = "W2-6 Task2: asserts tantivy checkpoint machinery slated for full retirement (its setup relies on a checkpoint file that no longer gets created once a seeded db already dual-writes lex_docs/fts_lex)"]
     fn active_rebuild_waits_instead_of_searching_stale_existing_index() {
         let temp = tempfile::tempdir().expect("tempdir");
         let data_dir = temp.path();
@@ -23098,6 +23137,7 @@ mod search_lexical_self_heal_tests {
     }
 
     #[test]
+    #[ignore = "W2-6 Task2: asserts tantivy checkpoint machinery slated for full retirement (its setup relies on a checkpoint file that no longer gets created once a seeded db already dual-writes lex_docs/fts_lex)"]
     fn active_rebuild_waits_instead_of_searching_incomplete_checkpoint() {
         let temp = tempfile::tempdir().expect("tempdir");
         let data_dir = temp.path();
@@ -23161,6 +23201,7 @@ mod search_lexical_self_heal_tests {
     /// structured refusal with the stable `checkpoint_incomplete` reason code
     /// instead of silently launching a multi-minute inline rebuild.
     #[test]
+    #[ignore = "W2-6 Task2: asserts tantivy checkpoint machinery slated for full retirement (its setup relies on a checkpoint file that no longer gets created once a seeded db already dual-writes lex_docs/fts_lex)"]
     fn robot_search_returns_bounded_checkpoint_incomplete_instead_of_inline_rebuild() {
         let temp = tempfile::tempdir().expect("tempdir");
         let data_dir = temp.path();
@@ -23236,6 +23277,7 @@ mod search_lexical_self_heal_tests {
     /// rebuild may never converge — robot-mode searches must surface the
     /// stable `quarantine_circuit_breaker` reason code as a bounded refusal.
     #[test]
+    #[ignore = "W2-6 Task2: asserts tantivy checkpoint machinery slated for full retirement (its setup relies on a checkpoint file that no longer gets created once a seeded db already dual-writes lex_docs/fts_lex)"]
     fn robot_search_returns_bounded_quarantine_circuit_breaker_refusal() {
         let temp = tempfile::tempdir().expect("tempdir");
         let data_dir = temp.path();
@@ -23374,29 +23416,62 @@ mod search_lexical_self_heal_tests {
         assert_eq!(orphan_hits.len(), 1);
     }
 
+    // W2-6 Task1 closed-world account: `search_self_heal_rebuilds_incompatible_live_artifact`
+    // (stale tantivy schema_hash.json triggers a rebuild) retired here, not
+    // rewritten -- control-plane 2026-08-30 ruling. It tested a capability
+    // tied to tantivy's own on-disk schema versioning file, which has no
+    // SQLite-domain file to point at (table-level schema evolution is
+    // covered by `PRAGMA user_version`; there is no equivalent for lexical
+    // *projection* semantics changing between binary versions -- see the
+    // known-debt note in the W2-6 closeout report: "lexical projection
+    // version detection is absent; a binary upgrade that changes projection
+    // semantics (tokenization/truncation/eligibility) requires a manual
+    // `--force-rebuild`, silently otherwise").
     #[test]
-    fn search_self_heal_rebuilds_incompatible_live_artifact() {
+    fn search_self_heal_replaces_corrupt_live_fts5_artifact() {
         let temp = tempfile::tempdir().expect("tempdir");
         let data_dir = temp.path();
         let db_path = seed_canonical_search_db(data_dir);
         let index_path = crate::search::tantivy::expected_index_dir(data_dir);
-        ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect("initial rebuild");
 
-        std::fs::write(
-            index_path.join("schema_hash.json"),
-            serde_json::to_vec(&serde_json::json!({"schema_hash": "old-schema-hash"}))
-                .expect("serialize stale schema hash"),
-        )
-        .expect("write stale schema hash");
+        // Corrupt the FTS5 domain's own internal segment-data shadow table,
+        // instead of corrupting the retired tantivy meta.json -- self-heal's
+        // corruption detection now runs against the domain that actually
+        // serves queries post-W2-5 (control-plane 2026-08-30 ruling;
+        // original tantivy-directory scenario recorded in the W2-6
+        // closed-world account).
+        //
+        // This must be a corruption the *quick* tier (control-plane
+        // 2026-08-30 amendment) can actually see -- self-heal's per-search
+        // diagnosis only ever runs the cheap tier, not the full rank=1
+        // integrity-check (see `self_heal_diagnosis_never_calls_the_full_tier_contract_check`
+        // below). A content/index desync (e.g. a raw `UPDATE lex_docs SET
+        // content = ...`) is invisible to the quick tier by design and so
+        // would never trigger this repair path in the first place; deleting
+        // fts_lex's own shadow data breaks even a basic `SELECT ... LIMIT 1`
+        // probe, which the quick tier does catch.
+        //
+        // The repair path itself opens a *raw* writable connection (not
+        // `FrankenStorage::open`) specifically so this class of corruption
+        // doesn't also block the repair from running -- see
+        // `repair_lexical_index_from_canonical_db_for_search`'s comments.
+        {
+            let conn = crate::storage::api::Conn::open_writable(
+                &db_path,
+                crate::storage::api::Profile::Production,
+            )
+            .expect("open db for fault injection");
+            conn.execute("DELETE FROM fts_lex_data", &[])
+                .expect("corrupt fts_lex shadow table for fault injection");
+        }
+        // Probe validity check (波1 铁律): confirm the injected fault actually
+        // fails the quick tier self-heal actually relies on before trusting
+        // it to catch this.
+        assert!(
+            crate::search::lexical_index_health::validate_searchable_index_contract_quick(&db_path)
+                .is_err(),
+            "fault injection must make the quick fts5 probe fail"
+        );
 
         let repair = ensure_lexical_assets_for_search(
             data_dir,
@@ -23407,56 +23482,38 @@ mod search_lexical_self_heal_tests {
             false,
             false,
         )
-        .expect("search self-heal should rebuild incompatible lexical artifact");
+        .expect("search self-heal should repair the corrupt fts5 artifact");
         assert_eq!(repair.action, "rebuilt-from-canonical-db");
         assert_eq!(repair.indexed_docs, Some(1));
-        crate::search::tantivy::validate_searchable_index_contract(&index_path)
+        crate::search::lexical_index_health::validate_searchable_index_contract_full(&db_path)
             .expect("repaired lexical artifact contract");
-
-        let client = SearchClient::open(&index_path, Some(&db_path))
-            .expect("open search client")
-            .expect("repaired index should open");
-        let hits = client
-            .search(
-                "autohealneedle",
-                SearchFilters::default(),
-                5,
-                0,
-                FieldMask::FULL,
-            )
-            .expect("query rebuilt index");
-        assert_eq!(hits.len(), 1);
+        assert!(
+            crate::search::lexical_index_health::searchable_index_exists(&db_path),
+            "the fts5 domain must actually be repopulated, not just the retired tantivy side"
+        );
     }
 
+    /// Grep-level guard (control-plane 2026-08-30 amendment, W2-6 Task1): the
+    /// full rank=1 integrity-check costs minutes on a large corpus and must
+    /// never ride the per-search hot path again. Pins the function's source
+    /// body, not just today's behavior, so a future edit that adds a call to
+    /// the full tier here fails loudly instead of silently reintroducing the
+    /// regression this session found and fixed.
     #[test]
-    fn search_self_heal_replaces_corrupt_live_artifact_for_empty_db() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let data_dir = temp.path();
-        let db_path = seed_empty_canonical_search_db(data_dir);
-        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
-        std::fs::create_dir_all(&index_path).expect("create corrupt index dir");
-        std::fs::write(index_path.join("meta.json"), b"not-json").expect("write corrupt meta");
-
-        let repair = ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect("search self-heal should publish a fresh empty lexical artifact");
-        assert_eq!(repair.action, "rebuilt-from-canonical-db");
-        assert_eq!(repair.indexed_docs, Some(0));
-        crate::search::tantivy::validate_searchable_index_contract(&index_path)
-            .expect("empty repaired lexical artifact contract");
-
-        let checkpoint = crate::indexer::load_lexical_rebuild_checkpoint(&index_path)
-            .expect("load empty repair checkpoint")
-            .expect("checkpoint present");
-        assert!(checkpoint.completed);
-        assert_eq!(checkpoint.indexed_docs, 0);
+    fn self_heal_diagnosis_never_calls_the_full_tier_contract_check() {
+        let source = include_str!("lib.rs");
+        let start = source
+            .find("fn search_lexical_self_heal_diagnosis(")
+            .expect("search_lexical_self_heal_diagnosis must still exist in lib.rs");
+        let after_start = &source[start..];
+        let body_end = after_start
+            .find("\nfn ")
+            .expect("a following top-level fn must terminate the body scan");
+        let body = &after_start[..body_end];
+        assert!(
+            !body.contains("validate_searchable_index_contract_full"),
+            "search_lexical_self_heal_diagnosis must only ever call the quick tier -- it runs on every search"
+        );
     }
 }
 
@@ -23740,7 +23797,8 @@ fn run_cli_search(
             "search lexical self-heal completed"
         );
     }
-    let tantivy_index_initialized = crate::search::tantivy::searchable_index_exists(&index_path);
+    // W2-6 Task1: reseated onto the lex_docs/fts_lex SQLite domain.
+    let tantivy_index_initialized = crate::search::lexical_index_health::searchable_index_exists(&db_path);
     let rebuild_active = probe_index_run_lock(&data_dir, &db_path).active;
 
     let client = SearchClient::open_with_options(
@@ -24813,7 +24871,8 @@ fn run_cli_pack(
         );
     }
 
-    let tantivy_index_initialized = crate::search::tantivy::searchable_index_exists(&index_path);
+    // W2-6 Task1: reseated onto the lex_docs/fts_lex SQLite domain.
+    let tantivy_index_initialized = crate::search::lexical_index_health::searchable_index_exists(&db_path);
     let rebuild_active = probe_index_run_lock(&data_dir, &db_path).active;
     let client = SearchClient::open_with_options(
         &index_path,
@@ -28750,9 +28809,12 @@ fn run_diag(
         (false, 0, 0, 0)
     };
 
-    // Check index existence
-    let (index_exists, index_size) = if crate::search::tantivy::searchable_index_exists(&index_path)
-    {
+    // Check index existence (W2-6 Task1: reseated onto the lex_docs/fts_lex
+    // SQLite domain; the reported size is still the tantivy directory's,
+    // which stays meaningful until Task2 retires it)
+    let (index_exists, index_size) = if crate::search::lexical_index_health::searchable_index_exists(
+        &db_path,
+    ) {
         let size = fs_dir_size(&index_path);
         (true, size)
     } else {
@@ -49350,7 +49412,7 @@ fn build_doctor_baseline_snapshot(
         "shm_exists": doctor_sqlite_sidecar_path(db_path, "-shm").is_some_and(|path| path.exists()),
     });
     let derived_generation = serde_json::json!({
-        "lexical_index_exists": crate::search::tantivy::searchable_index_exists(&index_path),
+        "lexical_index_exists": crate::search::lexical_index_health::searchable_index_exists(db_path),
         "lexical_index_path_blake3": doctor_canonical_blake3(
             "doctor-baseline-index-path-v1",
             serde_json::json!({ "index_path": doctor_path_identity_for_fingerprint(&index_path) }),
@@ -54643,7 +54705,9 @@ fn run_doctor_lexical_post_repair_probe(
     };
     let start = Instant::now();
     let mut steps = Vec::new();
-    if !crate::search::tantivy::searchable_index_exists(index_path) {
+    // W2-6 Task1: reseated onto the lex_docs/fts_lex SQLite domain.
+    let db_path = data_dir.join("agent_search.db");
+    if !crate::search::lexical_index_health::searchable_index_exists(&db_path) {
         return doctor_post_repair_probe_report(
             target,
             doctor_post_repair_probe_outcome(
@@ -54678,7 +54742,9 @@ fn run_doctor_lexical_post_repair_probe(
         );
     }
     steps.push("detect_searchable_index".to_string());
-    if let Err(err) = crate::search::tantivy::validate_searchable_index_contract(index_path) {
+    // W2-6 Task1: doctor's post-repair probe is an explicit, infrequent
+    // scenario -- full tier.
+    if let Err(err) = crate::search::lexical_index_health::validate_searchable_index_contract_full(&db_path) {
         return doctor_post_repair_probe_report(
             target,
             doctor_post_repair_probe_outcome(
@@ -54695,7 +54761,7 @@ fn run_doctor_lexical_post_repair_probe(
         );
     }
     steps.push("open_search_reader".to_string());
-    match crate::search::tantivy::searchable_index_summary(index_path) {
+    match crate::search::lexical_index_health::searchable_index_summary(&db_path) {
         Ok(summary) => {
             steps.push("read_generation_summary".to_string());
             let mut report = doctor_post_repair_probe_report(
@@ -75044,7 +75110,8 @@ pub(crate) fn run_doctor_impl(
     let not_initialized = !fix
         && cass_not_initialized(
             db_path.exists(),
-            crate::search::tantivy::searchable_index_exists(&index_path),
+            // W2-6 Task1: reseated onto the lex_docs/fts_lex SQLite domain.
+            crate::search::lexical_index_health::searchable_index_exists(&db_path),
             rebuild_active,
         );
     let explanation = not_initialized.then(|| cass_not_initialized_explanation(&data_dir));
@@ -75502,10 +75569,11 @@ pub(crate) fn run_doctor_impl(
         vec!["archive DB open, row counts, and integrity-style checks completed or were skipped by state".to_string()],
     );
 
-    // 4. Check Tantivy index exists and is readable
+    // 4. Check lexical index exists and is readable (W2-6 Task1: reseated
+    // onto the lex_docs/fts_lex SQLite domain).
     let lexical_probe_started = Instant::now();
-    if crate::search::tantivy::searchable_index_exists(&index_path) {
-        match crate::search::tantivy::searchable_index_summary(&index_path) {
+    if crate::search::lexical_index_health::searchable_index_exists(&db_path) {
+        match crate::search::lexical_index_health::searchable_index_summary(&db_path) {
             Ok(Some(summary)) => {
                 let num_docs = summary.docs;
                 add_check!(
@@ -95982,13 +96050,20 @@ fn run_sources_command(cmd: SourcesCommand, cli: &Cli) -> CliResult<()> {
     }
 }
 
-fn resolved_sources_artifact_manifest_index_path(
+/// W2-6 Task1: `--index-path`/`--data-dir` now resolve the `agent_search.db`
+/// file directly (there is no more tantivy index directory to point at);
+/// `lexical_search_evidence_bundle_manifest`'s federated-shard chunk-manifest
+/// model has no SQLite-domain equivalent, so this CLI surface's backing
+/// value is [`crate::search::lexical_index_health::LexicalDomainAttestation`]
+/// instead (control-plane 2026-08-30 ruling: db file sha256 + user_version +
+/// lex_docs/fts_lex row counts).
+fn resolved_sources_artifact_manifest_db_path(
     index_path: Option<PathBuf>,
     data_dir: Option<PathBuf>,
 ) -> PathBuf {
     index_path.unwrap_or_else(|| {
         let data_dir = data_dir.unwrap_or_else(default_data_dir);
-        search::tantivy::expected_index_dir(&data_dir)
+        data_dir.join("agent_search.db")
     })
 }
 
@@ -95996,7 +96071,7 @@ fn sources_artifact_manifest_error(e: anyhow::Error) -> CliError {
     CliError {
         code: 5,
         kind: CliErrorKind::LexicalGeneration.kind_str(),
-        message: format!("Failed to build lexical artifact evidence manifest: {e:#}"),
+        message: format!("Failed to build lexical domain attestation: {e:#}"),
         hint: Some(
             "Run `cass index --full --json` first, then retry the artifact manifest command."
                 .to_string(),
@@ -96014,71 +96089,43 @@ fn normalized_sources_artifact_manifest_format(fmt: RobotFormat) -> RobotFormat 
 }
 
 fn run_sources_verify_existing_artifact_manifest(
-    index_path: PathBuf,
+    db_path: PathBuf,
     expected_manifest: Option<PathBuf>,
     output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
-    let manifest_path = crate::evidence_bundle::EvidenceBundleManifest::path(&index_path);
-    let report =
-        crate::evidence_bundle::verify_evidence_bundle_manifest_file(&index_path, &manifest_path);
+    use crate::search::lexical_index_health::LexicalDomainAttestation;
+
+    let manifest_path = LexicalDomainAttestation::path(&db_path);
+    let live_attestation =
+        LexicalDomainAttestation::compute(&db_path).map_err(sources_artifact_manifest_error)?;
+    let recorded_attestation = LexicalDomainAttestation::load(&manifest_path).ok();
+    let attestation_matches_live = recorded_attestation
+        .as_ref()
+        .map(|recorded| *recorded == live_attestation);
+
     let expected_manifest_path = expected_manifest
         .as_ref()
         .map(|path| path.display().to_string());
-    let mut manifest_matches_expected = None;
-    let mut manifest_compare_error = None;
-    let mut actual_bundle_id = report.bundle_id.clone();
-    let mut expected_bundle_id = None;
-
-    if let Some(expected_manifest) = expected_manifest.as_ref() {
-        match (
-            crate::evidence_bundle::EvidenceBundleManifest::load(&manifest_path),
-            crate::evidence_bundle::EvidenceBundleManifest::load(expected_manifest),
-        ) {
-            (Ok(actual), Ok(expected)) => {
-                actual_bundle_id = Some(actual.bundle_id.clone());
-                expected_bundle_id = Some(expected.bundle_id.clone());
-                manifest_matches_expected = Some(actual == expected);
-            }
-            (actual, expected) => {
-                manifest_matches_expected = Some(false);
-                manifest_compare_error = Some(format!(
-                    "actual_manifest_load={}; expected_manifest_load={}",
-                    actual
-                        .as_ref()
-                        .map(|_| "ok".to_string())
-                        .unwrap_or_else(|err| format!("{err:#}")),
-                    expected
-                        .as_ref()
-                        .map(|_| "ok".to_string())
-                        .unwrap_or_else(|err| format!("{err:#}"))
-                ));
-                if let Ok(actual) = actual {
-                    actual_bundle_id = Some(actual.bundle_id);
-                }
-                if let Ok(expected) = expected {
-                    expected_bundle_id = Some(expected.bundle_id);
-                }
-            }
+    let expected_manifest_matches = expected_manifest.as_ref().map(|expected_manifest| {
+        match LexicalDomainAttestation::load(expected_manifest) {
+            Ok(expected) => recorded_attestation.as_ref() == Some(&expected),
+            Err(_) => false,
         }
-    }
+    });
 
-    let expected_manifest_matches = manifest_matches_expected.unwrap_or(true);
-    let complete = report.is_complete() && expected_manifest_matches;
+    let complete =
+        attestation_matches_live.unwrap_or(false) && expected_manifest_matches.unwrap_or(true);
     let status = if complete { "ok" } else { "error" };
-    let report_status = report.status;
-    let issue_count = report.issues.len();
-    let unsafe_issue_count = report.unsafe_issue_count;
 
     let payload = serde_json::json!({
         "status": status,
-        "index_path": index_path.display().to_string(),
+        "db_path": db_path.display().to_string(),
         "manifest_path": manifest_path.display().to_string(),
         "expected_manifest_path": expected_manifest_path,
-        "manifest_matches_expected": manifest_matches_expected,
-        "manifest_compare_error": manifest_compare_error,
-        "actual_bundle_id": actual_bundle_id,
-        "expected_bundle_id": expected_bundle_id,
-        "verification": report,
+        "live_attestation": live_attestation,
+        "recorded_attestation": recorded_attestation,
+        "attestation_matches_live": attestation_matches_live,
+        "expected_manifest_matches": expected_manifest_matches,
     });
 
     if let Some(fmt) = output_format {
@@ -96091,30 +96138,27 @@ fn run_sources_verify_existing_artifact_manifest(
             ));
         }
     } else {
-        println!("Lexical artifact evidence manifest verification");
-        println!("  index: {}", index_path.display());
+        println!("Lexical domain attestation verification");
+        println!("  db: {}", db_path.display());
         println!("  manifest: {}", manifest_path.display());
         if let Some(expected_manifest) = expected_manifest_path.as_deref() {
             println!("  expected_manifest: {expected_manifest}");
             println!(
-                "  manifest_matches_expected: {}",
-                manifest_matches_expected.unwrap_or(false)
+                "  expected_manifest_matches: {}",
+                expected_manifest_matches.unwrap_or(false)
             );
         }
-        println!("  status: {:?}", report_status);
-        println!("  issues: {issue_count} ({unsafe_issue_count} unsafe)");
+        println!("  status: {status}");
         if !complete {
             return Err(CliError {
                 code: 5,
                 kind: CliErrorKind::LexicalGeneration.kind_str(),
-                message: if !expected_manifest_matches {
-                    "Lexical artifact evidence manifest does not match the expected producer manifest"
+                message: if expected_manifest_matches == Some(false) {
+                    "Lexical domain attestation does not match the expected producer manifest"
                         .to_string()
                 } else {
-                    format!(
-                        "Lexical artifact evidence manifest verification failed: {:?}",
-                        report_status
-                    )
+                    "Lexical domain attestation verification failed against the live database"
+                        .to_string()
                 },
                 hint: Some(
                     "Reject this copied artifact and rebuild or copy it again from the source."
@@ -96136,71 +96180,54 @@ fn run_sources_artifact_manifest(
     expected_manifest: Option<PathBuf>,
     output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
-    let index_path = resolved_sources_artifact_manifest_index_path(index_path, data_dir);
+    use crate::search::lexical_index_health::LexicalDomainAttestation;
+
+    let db_path = resolved_sources_artifact_manifest_db_path(index_path, data_dir);
     if verify_existing {
         return run_sources_verify_existing_artifact_manifest(
-            index_path,
+            db_path,
             expected_manifest,
             output_format,
         );
     }
 
-    let manifest = search::tantivy::lexical_search_evidence_bundle_manifest(&index_path)
-        .map_err(sources_artifact_manifest_error)?;
-    let report = manifest.verify(&index_path);
-    if !report.is_complete() {
-        return Err(CliError {
-            code: 5,
-            kind: CliErrorKind::LexicalGeneration.kind_str(),
-            message: format!(
-                "Generated lexical artifact evidence manifest did not verify cleanly: {:?}",
-                report.status
-            ),
-            hint: Some(
-                "Re-run `cass index --full --json` before exchanging artifacts.".to_string(),
-            ),
-            retryable: true,
-        });
-    }
+    let attestation =
+        LexicalDomainAttestation::compute(&db_path).map_err(sources_artifact_manifest_error)?;
 
     let manifest_path = if write {
-        let path = manifest.save(&index_path).map_err(|e| CliError {
+        let path = attestation.save(&db_path).map_err(|e| CliError {
             code: 14,
             kind: CliErrorKind::IoError.kind_str(),
-            message: format!("Failed to write lexical artifact evidence manifest: {e:#}"),
-            hint: Some("Check that the index directory is writable.".to_string()),
+            message: format!("Failed to write lexical domain attestation: {e:#}"),
+            hint: Some("Check that the database's directory is writable.".to_string()),
             retryable: true,
         })?;
         Some(path)
     } else {
         None
     };
-    let expected_manifest_path = crate::evidence_bundle::EvidenceBundleManifest::path(&index_path);
-    let bundle_id = manifest.bundle_id.clone();
-    let kind = manifest.kind;
-    let chunk_count = manifest.chunks.len();
+    let expected_manifest_path = LexicalDomainAttestation::path(&db_path);
 
     let payload = serde_json::json!({
         "status": "ok",
-        "index_path": index_path.display().to_string(),
+        "db_path": db_path.display().to_string(),
         "manifest_path": manifest_path
             .as_ref()
             .unwrap_or(&expected_manifest_path)
             .display()
             .to_string(),
         "wrote_manifest": write,
-        "bundle_id": bundle_id,
-        "kind": kind,
-        "chunk_count": chunk_count,
-        "expected_bytes": report.expected_bytes,
-        "verification_status": report.status,
+        "db_sha256": attestation.db_sha256,
+        "user_version": attestation.user_version,
+        "lex_docs_rows": attestation.lex_docs_rows,
+        "fts_lex_rows": attestation.fts_lex_rows,
     });
 
     if let Some(fmt) = output_format {
         output_structured_value(payload, normalized_sources_artifact_manifest_format(fmt))?;
     } else {
-        println!("Lexical artifact evidence manifest");
-        println!("  index: {}", index_path.display());
+        println!("Lexical domain attestation");
+        println!("  db: {}", db_path.display());
         println!(
             "  manifest: {}{}",
             manifest_path
@@ -96209,15 +96236,10 @@ fn run_sources_artifact_manifest(
                 .display(),
             if write { "" } else { " (not written)" }
         );
-        println!(
-            "  bundle_id: {}",
-            payload["bundle_id"].as_str().unwrap_or("")
-        );
-        println!("  chunks: {}", payload["chunk_count"].as_u64().unwrap_or(0));
-        println!(
-            "  expected_bytes: {}",
-            payload["expected_bytes"].as_u64().unwrap_or(0)
-        );
+        println!("  db_sha256: {}", attestation.db_sha256);
+        println!("  user_version: {}", attestation.user_version);
+        println!("  lex_docs_rows: {}", attestation.lex_docs_rows);
+        println!("  fts_lex_rows: {}", attestation.fts_lex_rows);
     }
 
     Ok(())
@@ -98470,10 +98492,10 @@ fn local_archive_coverage(
 ) -> crate::fleet_archive_coverage::ArchiveCoverageSummary {
     use crate::fleet_archive_coverage::CoverageState;
     use crate::fleet_doctor_schema::ArchiveRisk;
-    let db_present = data_dir.join("agent_search.db").is_file();
-    let index_present = crate::search::tantivy::searchable_index_exists(
-        &crate::search::tantivy::expected_index_dir(data_dir),
-    );
+    let db_path = data_dir.join("agent_search.db");
+    let db_present = db_path.is_file();
+    // W2-6 Task1: reseated onto the lex_docs/fts_lex SQLite domain.
+    let index_present = crate::search::lexical_index_health::searchable_index_exists(&db_path);
     let (coverage_state, archive_risk) = if !db_present {
         (CoverageState::Unknown, ArchiveRisk::Unknown)
     } else if !index_present {

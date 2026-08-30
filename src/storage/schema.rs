@@ -83,6 +83,24 @@ CREATE TABLE IF NOT EXISTS lex_docs (doc_id INTEGER PRIMARY KEY REFERENCES messa
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_lex USING fts5(content, title, agent, workspace, source_path, content = 'lex_docs', content_rowid = 'doc_id', tokenize = 'porter trigram');
 "#;
 
+/// W2-6 Task1 (X-5 fix): unconditionally drop and recreate the
+/// `lex_docs`/`fts_lex` domain. Derived data's repair story is "rebuild from
+/// the source of truth", not "patch in place" (rebuild-not-convert
+/// doctrine) -- safe to call regardless of whether the domain is missing,
+/// empty, or internally corrupted, because `DROP TABLE IF EXISTS` tolerates
+/// all three and the `CREATE` statements are the exact ones schema
+/// migration itself uses ([`V2_LEX_DOMAIN_DDL`]). `fts_lex` is dropped
+/// before `lex_docs` (its external-content table) though nothing currently
+/// enforces that order at the SQL level.
+///
+/// Only rebuilds the empty shape -- callers must repopulate afterward via
+/// [`crate::storage::sqlite::FrankenStorage::rebuild_lex_domain_from_db`].
+pub(crate) fn recreate_lex_domain_tables(conn: &Conn) -> Result<(), StorageError> {
+    conn.execute_batch("DROP TABLE IF EXISTS fts_lex; DROP TABLE IF EXISTS lex_docs;")?;
+    conn.execute_batch(V2_LEX_DOMAIN_DDL)?;
+    Ok(())
+}
+
 /// Full DDL for a version-2 database, applied verbatim inside a single
 /// transaction. See the module doc comment for provenance and the two
 /// auto-managed exclusions (`sqlite_sequence`, `fts_messages_*` shadows).
@@ -513,6 +531,72 @@ mod tests {
             });
             assert_eq!(read_user_version(&conn).unwrap(), CURRENT_SCHEMA_VERSION);
         }
+    }
+
+    /// W2-6 Task1 (X-5 fix): `recreate_lex_domain_tables` must genuinely
+    /// DROP+CREATE, not a no-op "if not exists" -- existing rows must not
+    /// survive, since the whole point is being safe to call on a domain
+    /// whose internal structure may already be corrupted.
+    #[test]
+    fn recreate_lex_domain_tables_wipes_existing_rows() {
+        let (_dir, path) = scratch_db_path();
+        let conn = open_sqlite_writer(&path);
+        ensure(&conn).expect("ensure should build a fresh schema");
+
+        conn.execute(
+            "INSERT INTO agents(id, slug, name, kind, created_at, updated_at) \
+             VALUES (1, 'a', 'a', 'cli', 0, 0)",
+            &[],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversations(id, agent_id, title, source_path) VALUES (1, 1, 't', 'p')",
+            &[],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages(id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'c')",
+            &[],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO lex_docs(doc_id, content, title, agent, workspace, source_path) \
+             VALUES (1, 'c', 't', 'a', 'w', 'p')",
+            &[],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO fts_lex(rowid, content, title, agent, workspace, source_path) VALUES (1, 'c', 't', 'a', 'w', 'p')", &[])
+            .unwrap();
+
+        let before: i64 = conn
+            .query_row_map("SELECT COUNT(*) FROM lex_docs", &[], |row| row.get_typed(0))
+            .unwrap();
+        assert_eq!(before, 1, "sanity: row must exist before recreate");
+
+        recreate_lex_domain_tables(&conn).expect("recreate must succeed on a healthy domain");
+
+        let after: i64 = conn
+            .query_row_map("SELECT COUNT(*) FROM lex_docs", &[], |row| row.get_typed(0))
+            .unwrap();
+        assert_eq!(after, 0, "recreate must drop the old table, not leave old rows behind");
+    }
+
+    /// Must also work when the domain is entirely missing (simulating the
+    /// self-heal "domain was never built" path re-using the same code).
+    #[test]
+    fn recreate_lex_domain_tables_builds_domain_that_was_entirely_missing() {
+        let (_dir, path) = scratch_db_path();
+        let conn = open_sqlite_writer(&path);
+        ensure(&conn).expect("ensure should build a fresh schema");
+        conn.execute_batch("DROP TABLE IF EXISTS fts_lex; DROP TABLE IF EXISTS lex_docs;")
+            .expect("drop lex domain to simulate a missing domain");
+        assert!(!table_names(&conn).contains(&"lex_docs".to_string()));
+
+        recreate_lex_domain_tables(&conn).expect("recreate must rebuild a missing domain");
+
+        let names = table_names(&conn);
+        assert!(names.contains(&"lex_docs".to_string()));
+        assert!(names.contains(&"fts_lex_data".to_string()));
     }
 
     /// One past the last real statement, so the loop above also covers
