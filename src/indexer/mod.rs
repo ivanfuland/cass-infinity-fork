@@ -1723,15 +1723,6 @@ fn resolve_lexical_population_strategy(
     (strategy, reason)
 }
 
-fn lexical_population_strategy_requires_inline_tantivy(
-    strategy: LexicalPopulationStrategy,
-) -> bool {
-    !matches!(
-        strategy,
-        LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild
-    )
-}
-
 fn non_watch_ingest_chunk_size() -> usize {
     match dotenvy::var("CASS_NON_WATCH_INGEST_CHUNK_SIZE")
         .ok()
@@ -12140,7 +12131,6 @@ fn run_streaming_consumer(
     num_producers: usize,
     storage: &FrankenStorage,
     data_dir: &Path,
-    mut t_index: Option<&mut TantivyIndex>,
     flow_limiter: Arc<StreamingByteLimiter>,
     progress: &Option<Arc<IndexingProgress>>,
     lexical_strategy: LexicalPopulationStrategy,
@@ -12307,7 +12297,6 @@ fn run_streaming_consumer(
                 // combine_enabled = false or no extras were drained).
                 let batch_outcome = ingest_non_watch_batch_with_oom_split(
                     storage,
-                    t_index.as_deref_mut(),
                     data_dir,
                     &combined_conversations,
                     progress,
@@ -12330,13 +12319,6 @@ fn run_streaming_consumer(
                 // buffered memory both shrink in lockstep with the rest of
                 // the pipeline.
                 if last_commit.elapsed() >= streaming_consumer_commit_interval() {
-                    if let Some(t_index) = t_index.as_deref_mut() {
-                        if let Err(e) = t_index.commit() {
-                            tracing::warn!("incremental commit failed: {}", e);
-                        } else {
-                            tracing::debug!("incremental commit completed");
-                        }
-                    }
                     // Do not advance the legacy global `last_scan_ts` from a
                     // partial streaming run: a later connector scan error would
                     // make that global watermark unsafe for legacy fallback.
@@ -12451,12 +12433,7 @@ fn run_streaming_consumer(
         }
     }
 
-    // Final commit to ensure all data is persisted
-    if let Some(t_index) = t_index
-        && !ingest_outcome.lexical_update_deferred
-    {
-        t_index.commit()?;
-    } else if ingest_outcome.lexical_update_deferred {
+    if ingest_outcome.lexical_update_deferred {
         tracing::warn!(
             "skipping final streaming Tantivy commit because lexical updates were deferred; authoritative DB rebuild will replace derived lexical assets"
         );
@@ -12507,7 +12484,6 @@ fn run_streaming_consumer(
 #[allow(clippy::too_many_arguments)]
 fn run_streaming_index(
     storage: &FrankenStorage,
-    t_index: Option<&mut TantivyIndex>,
     opts: &IndexOptions,
     since_ts: Option<i64>,
     lexical_strategy: LexicalPopulationStrategy,
@@ -12518,7 +12494,6 @@ fn run_streaming_index(
 ) -> Result<NonWatchIngestOutcome> {
     run_streaming_index_with_connector_factories(
         storage,
-        t_index,
         opts,
         since_ts,
         lexical_strategy,
@@ -12576,7 +12551,6 @@ fn filter_disabled_connector_factories(
 #[allow(clippy::too_many_arguments)]
 fn run_streaming_index_with_connector_factories(
     storage: &FrankenStorage,
-    t_index: Option<&mut TantivyIndex>,
     opts: &IndexOptions,
     since_ts: Option<i64>,
     lexical_strategy: LexicalPopulationStrategy,
@@ -12667,7 +12641,6 @@ fn run_streaming_index_with_connector_factories(
         num_connectors,
         storage,
         &opts.data_dir,
-        t_index,
         producer_config.flow_limiter.clone(),
         &opts.progress,
         lexical_strategy,
@@ -12734,7 +12707,6 @@ fn run_streaming_index_with_connector_factories(
 #[allow(clippy::too_many_arguments)]
 fn run_batch_index(
     storage: &FrankenStorage,
-    t_index: Option<&mut TantivyIndex>,
     opts: &IndexOptions,
     since_ts: Option<i64>,
     lexical_strategy: LexicalPopulationStrategy,
@@ -12745,7 +12717,6 @@ fn run_batch_index(
 ) -> Result<NonWatchIngestOutcome> {
     run_batch_index_with_connector_factories(
         storage,
-        t_index,
         opts,
         since_ts,
         lexical_strategy,
@@ -12760,7 +12731,6 @@ fn run_batch_index(
 #[allow(clippy::too_many_arguments)]
 fn run_batch_index_with_connector_factories(
     storage: &FrankenStorage,
-    mut t_index: Option<&mut TantivyIndex>,
     opts: &IndexOptions,
     since_ts: Option<i64>,
     lexical_strategy: LexicalPopulationStrategy,
@@ -13057,7 +13027,6 @@ fn run_batch_index_with_connector_factories(
     for pending in pending_batches {
         let batch_outcome = ingest_non_watch_batch_with_oom_split(
             storage,
-            t_index.as_deref_mut(),
             &opts.data_dir,
             &pending.convs,
             &opts.progress,
@@ -14020,16 +13989,10 @@ pub fn run_index(
     // Record scan start time before scanning
     let scan_start_ts = FrankenStorage::now_millis();
 
-    let keep_tantivy_open_after_rebuild = opts.watch
-        || opts
-            .watch_once_paths
-            .as_ref()
-            .is_some_and(|paths| !paths.is_empty());
-
     let mut exact_completed_lexical_checkpoint = false;
     let mut skipped_noop_full_scan_authoritative_rebuild = false;
     let mut targeted_watch_once_only_run = false;
-    let t_index = if resume_lexical_rebuild {
+    if resume_lexical_rebuild {
         tracing::info!(
             db_path = %opts.db_path.display(),
             "rebuilding an incomplete lex_docs/fts_lex domain from the canonical database (routine incremental run)"
@@ -14064,14 +14027,7 @@ pub fn run_index(
             initial_canonical_sessions_before_salvage,
             count_total_messages_exact(&storage)?,
         );
-        if keep_tantivy_open_after_rebuild {
-            Some(TantivyIndex::open_or_create(&index_path)?)
-        } else {
-            None
-        }
     } else {
-        let mut t_index: Option<TantivyIndex> = None;
-
         if opts.full && !opened_fresh_for_full && initial_canonical_sessions_before_salvage == 0 {
             // NOTE: We deliberately do NOT reset either SQLite or Tantivy here.
             // An empty canonical archive can be populated in place, and the
@@ -14304,18 +14260,14 @@ pub fn run_index(
         }
 
         if rebuild_from_canonical_only {
-            drop(t_index.take());
             ensure_authoritative_lexical_rebuild_storage_headroom(&opts.data_dir, &opts.db_path)?;
             let rebuild_start = std::time::Instant::now();
             let rebuild_convs = canonical_sessions_before_salvage;
-            let rebuild = rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
-                &opts.db_path,
-                &opts.data_dir,
-                rebuild_convs,
-                opts.progress.clone(),
-                Arc::clone(&progress_bump),
-            )?;
-            exact_completed_lexical_checkpoint = rebuild.exact_checkpoint_persisted;
+            rebuild_lex_domain_from_db_full(&opts.db_path, opts.progress.clone())?;
+            // `rebuild_lex_domain_from_db_full` persists the `Completed` marker
+            // atomically with its last batch; unconditionally true, unlike the
+            // old `LexicalRebuildOutcome.exact_checkpoint_persisted` this replaces.
+            exact_completed_lexical_checkpoint = true;
             let rebuild_ms = rebuild_start.elapsed().as_millis() as u64;
             // Populate stats for canonical-only rebuild path (no scan occurs).
             // Without this, indexing_stats in JSON output would be all zeros
@@ -14328,16 +14280,11 @@ pub fn run_index(
                 stats.index_ms = rebuild_ms;
                 stats.total_conversations = rebuild_convs;
             }
-            if let Some(observed_messages) = rebuild.observed_messages {
-                record_exact_total_counts_in_progress(
-                    opts.progress.as_ref(),
-                    rebuild_convs,
-                    observed_messages,
-                );
-            }
-            if keep_tantivy_open_after_rebuild {
-                t_index = Some(TantivyIndex::open_or_create(&index_path)?);
-            }
+            record_exact_total_counts_in_progress(
+                opts.progress.as_ref(),
+                rebuild_convs,
+                count_total_messages_exact(&storage)?,
+            );
         } else {
             let followup_scan_after_authoritative_repair =
                 incremental_canonical_lexical_repair.is_some();
@@ -14366,28 +14313,18 @@ pub fn run_index(
                     "selected_lexical_population_strategy"
                 );
 
-                drop(t_index.take());
                 ensure_authoritative_lexical_rebuild_storage_headroom(
                     &opts.data_dir,
                     &opts.db_path,
                 )?;
                 let rebuild_convs = count_total_conversations_exact(&storage)?;
-                let rebuild = rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
-                    &opts.db_path,
-                    &opts.data_dir,
+                rebuild_lex_domain_from_db_full(&opts.db_path, opts.progress.clone())?;
+                exact_completed_lexical_checkpoint = true;
+                record_exact_total_counts_in_progress(
+                    opts.progress.as_ref(),
                     rebuild_convs,
-                    opts.progress.clone(),
-                    Arc::clone(&progress_bump),
-                )?;
-                exact_completed_lexical_checkpoint = rebuild.exact_checkpoint_persisted;
-                if let Some(observed_messages) = rebuild.observed_messages {
-                    record_exact_total_counts_in_progress(
-                        opts.progress.as_ref(),
-                        rebuild_convs,
-                        observed_messages,
-                    );
-                }
-                t_index = Some(TantivyIndex::open_or_create(&index_path)?);
+                    count_total_messages_exact(&storage)?,
+                );
                 needs_rebuild = false;
             }
 
@@ -14501,25 +14438,13 @@ pub fn run_index(
 
                 let additional_scan_roots =
                     additional_scan_roots_for_scan_or_watch(&storage, &opts.data_dir);
-                let scan_requires_tantivy =
-                    lexical_population_strategy_requires_inline_tantivy(lexical_strategy);
 
-                // Choose between streaming indexing (Opt 8.2) and batch indexing
-                if scan_requires_tantivy && t_index.is_none() {
-                    t_index = Some(TantivyIndex::open_or_create(&index_path)?);
-                } else if !scan_requires_tantivy {
-                    tracing::info!(
-                        strategy = lexical_strategy.as_str(),
-                        "scan phase is deferring Tantivy writer open/commit until the authoritative rebuild"
-                    );
-                }
                 preflight_phase!("watch_startup:scan_entry");
                 complete_preflight_phase!();
                 if streaming_index_enabled() {
                     tracing::info!("using streaming indexing (Opt 8.2)");
                     let scan_outcome = run_streaming_index(
                         &storage,
-                        t_index.as_mut(),
                         &opts,
                         since_ts,
                         lexical_strategy,
@@ -14548,7 +14473,6 @@ pub fn run_index(
                     );
                     let scan_outcome = run_batch_index(
                         &storage,
-                        t_index.as_mut(),
                         &opts,
                         since_ts,
                         lexical_strategy,
@@ -14608,21 +14532,12 @@ pub fn run_index(
                         inserted_messages = scan_canonical_mutations.inserted_messages,
                         "inline lexical updates were deferred during non-watch scan; rebuilding lex_docs/fts_lex from canonical SQLite"
                     );
-                    drop(t_index.take());
                     let lex_stats = storage.rebuild_lex_domain_from_db(opts.progress.as_ref())?;
                     record_exact_total_counts_in_progress(
                         opts.progress.as_ref(),
                         lex_stats.conversations_processed,
                         count_total_messages_exact(&storage)?,
                     );
-                    if keep_tantivy_open_after_rebuild {
-                        t_index = Some(TantivyIndex::open_or_create(&index_path)?);
-                    }
-                } else if scan_requires_tantivy {
-                    t_index
-                        .as_mut()
-                        .expect("tantivy index must remain open for lexical commit")
-                        .commit()?;
                 }
 
                 if !scan_lexical_update_deferred
@@ -14677,7 +14592,6 @@ pub fn run_index(
                         // same gated-write path as the OOM-retry case above
                         // -- `fts_lex` needs the same direct catch-up, not
                         // just Tantivy.
-                        drop(t_index.take());
                         let lex_stats = storage.rebuild_lex_domain_from_db(opts.progress.as_ref())?;
                         // Update stats to reflect the authoritative rebuild
                         // totals. The scan-phase stats tracked only what the
@@ -14688,15 +14602,10 @@ pub fn run_index(
                             lex_stats.conversations_processed,
                             count_total_messages_exact(&storage)?,
                         );
-                        if keep_tantivy_open_after_rebuild {
-                            t_index = Some(TantivyIndex::open_or_create(&index_path)?);
-                        }
                     }
                 }
             }
         }
-
-        t_index
     };
 
     // w2 Task W2-4 Step 2: full lex_docs/fts_lex rebuild from the canonical
@@ -15088,7 +14997,6 @@ pub fn run_index(
             .is_some_and(|paths| !paths.is_empty());
 
         if targeted_watch_once_only_run
-            && t_index.is_none()
             && watch_once_mode
             && should_skip_unchanged_explicit_watch_once_paths(&opts, &storage, &watch_roots)?
         {
@@ -15123,30 +15031,6 @@ pub fn run_index(
         let state = Mutex::new(load_watch_state(&opts.data_dir));
         let storage = Rc::new(Mutex::new(storage));
         let storage_for_watch = Rc::clone(&storage);
-        let should_preopen_tantivy_for_watch = opts.watch;
-        let watch_once_defers_tantivy_open =
-            watch_once_mode && !should_preopen_tantivy_for_watch && t_index.is_none();
-        let t_index = Mutex::new(if should_preopen_tantivy_for_watch {
-            Some(match t_index {
-                Some(t_index) => t_index,
-                None => TantivyIndex::open_or_create(&index_path).with_context(|| {
-                    format!(
-                        "opening Tantivy index before entering watch mode for {}",
-                        index_path.display()
-                    )
-                })?,
-            })
-        } else {
-            t_index
-        });
-        if watch_once_defers_tantivy_open {
-            tracing::info!(
-                index_path = %index_path.display(),
-                "deferring Tantivy open until one-shot watch-once ingest has conversations"
-            );
-        }
-        let index_path_for_watch = index_path.clone();
-
         // CASS #163 item 3: When autocommit_retain cannot be disabled, the
         // long-lived read handle accumulates MVCC snapshots. Periodically
         // close and reopen it to release that memory.
@@ -15221,8 +15105,6 @@ pub fn run_index(
                         roots,
                         &state,
                         &storage_for_watch,
-                        &t_index,
-                        &index_path_for_watch,
                         true,
                     );
                     finalize_watch_reindex_result(
@@ -15239,8 +15121,6 @@ pub fn run_index(
                             roots,
                             &state,
                             &storage_for_watch,
-                            &t_index,
-                            &index_path_for_watch,
                             false,
                             semantic_enabled.then_some(&mut semantic_delta),
                         ),
@@ -15249,16 +15129,6 @@ pub fn run_index(
                         "watch incremental reindex",
                     )?;
 
-                    // Only attempt segment merge when the scan actually
-                    // ingested something. Empty watch scans must not wake the
-                    // optimizer. See issue #194.
-                    if indexed > 0
-                        && let Ok(mut guard) = t_index.lock()
-                        && let Some(t_index) = guard.as_mut()
-                        && let Err(e) = t_index.optimize_if_idle()
-                    {
-                        tracing::warn!(error = %e, "segment merge failed during watch");
-                    }
                     if targeted_semantic_watch_once {
                         let stats = run_targeted_semantic_watch_once_publish(
                             &embedder_id,
@@ -15271,39 +15141,20 @@ pub fn run_index(
                     }
                     indexed
                 } else {
-                    let indexed = finalize_watch_reindex_result(
+                    finalize_watch_reindex_result(
                         reindex_paths_with_semantic_delta(
                             &opts_clone,
                             paths,
                             roots,
                             &state,
                             &storage_for_watch,
-                            &t_index,
-                            &index_path_for_watch,
                             false,
                             semantic_enabled.then_some(&mut semantic_delta),
                         ),
                         &detector_clone,
                         opts_clone.progress.as_ref(),
                         "watch incremental reindex",
-                    );
-
-                    // Merge Tantivy segments if idle conditions are met.
-                    // Without this, each reindex_paths() commit creates a new
-                    // segment, leading to unbounded accumulation over weeks of
-                    // continuous watch mode operation. The cooldown logic inside
-                    // optimize_if_idle() (300s, 4-segment threshold) prevents
-                    // over-merging. See issue #87.
-                    // Also gated on `indexed > 0` so empty watch scans don't
-                    // wake the optimizer. See issue #194.
-                    if indexed > 0
-                        && let Ok(mut guard) = t_index.lock()
-                        && let Some(t_index) = guard.as_mut()
-                        && let Err(e) = t_index.optimize_if_idle()
-                    {
-                        tracing::warn!(error = %e, "segment merge failed during watch");
-                    }
-                    indexed
+                    )
                 };
 
                 // Incremental semantic embedding with cooldown
@@ -17150,7 +17001,6 @@ pub(crate) fn repair_lexical_index_from_canonical_db_for_search(
 #[cfg(test)]
 fn ingest_batch(
     storage: &FrankenStorage,
-    t_index: Option<&mut TantivyIndex>,
     data_dir: &Path,
     convs: &[NormalizedConversation],
     progress: &Option<Arc<IndexingProgress>>,
@@ -17159,7 +17009,6 @@ fn ingest_batch(
 ) -> Result<CanonicalMutationCounts> {
     let outcome = ingest_batch_detailed(
         storage,
-        t_index,
         data_dir,
         convs,
         progress,
@@ -17178,7 +17027,6 @@ fn ingest_batch(
 #[allow(clippy::too_many_arguments)]
 fn ingest_batch_detailed(
     storage: &FrankenStorage,
-    t_index: Option<&mut TantivyIndex>,
     data_dir: &Path,
     convs: &[NormalizedConversation],
     progress: &Option<Arc<IndexingProgress>>,
@@ -17193,7 +17041,6 @@ fn ingest_batch_detailed(
     // on older the legacy embedded engine builds that ignore autocommit_retain.
     let batch_result = persist::persist_conversations_batched_with_raw_mirror_links(
         storage,
-        t_index,
         data_dir,
         convs,
         lexical_strategy,
@@ -17246,7 +17093,6 @@ fn ingest_batch_detailed(
 #[allow(clippy::too_many_arguments)]
 fn ingest_non_watch_batch_with_oom_split(
     storage: &FrankenStorage,
-    mut t_index: Option<&mut TantivyIndex>,
     data_dir: &Path,
     convs: &[NormalizedConversation],
     progress: &Option<Arc<IndexingProgress>>,
@@ -17264,7 +17110,6 @@ fn ingest_non_watch_batch_with_oom_split(
         for chunk in convs.chunks(chunk_size) {
             let outcome = ingest_non_watch_batch_with_oom_split(
                 storage,
-                t_index.as_deref_mut(),
                 data_dir,
                 chunk,
                 progress,
@@ -17279,7 +17124,6 @@ fn ingest_non_watch_batch_with_oom_split(
 
     let first_attempt = ingest_non_watch_batch_once(
         storage,
-        t_index,
         data_dir,
         convs,
         progress,
@@ -17307,7 +17151,6 @@ fn ingest_non_watch_batch_with_oom_split(
 #[allow(clippy::too_many_arguments)]
 fn ingest_non_watch_batch_once(
     storage: &FrankenStorage,
-    t_index: Option<&mut TantivyIndex>,
     data_dir: &Path,
     convs: &[NormalizedConversation],
     progress: &Option<Arc<IndexingProgress>>,
@@ -17324,7 +17167,6 @@ fn ingest_non_watch_batch_once(
 
     let outcome = ingest_batch_detailed(
         storage,
-        t_index,
         data_dir,
         convs,
         progress,
@@ -17347,47 +17189,11 @@ fn ingest_non_watch_oom_retry_or_quarantine(
     data_dir: &Path,
     convs: &[NormalizedConversation],
     progress: &Option<Arc<IndexingProgress>>,
-    lexical_strategy: LexicalPopulationStrategy,
+    _lexical_strategy: LexicalPopulationStrategy,
     defer_checkpoints: bool,
     progress_bump: Option<&Arc<AtomicI64>>,
     error: anyhow::Error,
 ) -> Result<NonWatchIngestOutcome> {
-    if lexical_population_strategy_requires_inline_tantivy(lexical_strategy) {
-        tracing::warn!(
-            conversations = convs.len(),
-            error = %error,
-            "non-watch ingest ran out of memory; retrying batch with deferred lexical updates before quarantine"
-        );
-        return match ingest_non_watch_batch_once(
-            storage,
-            None,
-            data_dir,
-            convs,
-            progress,
-            LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
-            defer_checkpoints,
-            progress_bump,
-        ) {
-            Ok(mut outcome) => {
-                outcome.lexical_update_deferred = true;
-                Ok(outcome)
-            }
-            Err(retry_error) if error_is_out_of_memory(&retry_error) => {
-                ingest_non_watch_oom_retry_or_quarantine(
-                    storage,
-                    data_dir,
-                    convs,
-                    progress,
-                    LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
-                    defer_checkpoints,
-                    progress_bump,
-                    retry_error,
-                )
-            }
-            Err(retry_error) => Err(retry_error),
-        };
-    }
-
     if convs.len() > 1 {
         let split_at = convs.len() / 2;
         tracing::warn!(
@@ -17399,7 +17205,6 @@ fn ingest_non_watch_oom_retry_or_quarantine(
         );
         let mut left = ingest_non_watch_batch_with_oom_split(
             storage,
-            None,
             data_dir,
             &convs[..split_at],
             progress,
@@ -17409,7 +17214,6 @@ fn ingest_non_watch_oom_retry_or_quarantine(
         )?;
         let right = ingest_non_watch_batch_with_oom_split(
             storage,
-            None,
             data_dir,
             &convs[split_at..],
             progress,
@@ -17487,7 +17291,6 @@ fn ingest_non_watch_oom_retry_or_quarantine(
 #[allow(clippy::too_many_arguments)]
 fn ingest_batch_with_semantic_delta(
     storage: &FrankenStorage,
-    t_index: Option<&mut TantivyIndex>,
     data_dir: &Path,
     convs: &[NormalizedConversation],
     progress: &Option<Arc<IndexingProgress>>,
@@ -17504,7 +17307,6 @@ fn ingest_batch_with_semantic_delta(
     let batch_result = if semantic_delta.is_some() {
         persist::persist_conversations_batched_with_semantic_delta_and_raw_mirror_links(
             storage,
-            t_index,
             data_dir,
             convs,
             lexical_strategy,
@@ -17513,7 +17315,6 @@ fn ingest_batch_with_semantic_delta(
     } else {
         persist::persist_conversations_batched_with_raw_mirror_links(
             storage,
-            t_index,
             data_dir,
             convs,
             lexical_strategy,
@@ -17600,7 +17401,6 @@ enum WatchOomIngestMode {
 #[allow(clippy::too_many_arguments)]
 fn ingest_watch_batch_with_oom_split(
     storage: &FrankenStorage,
-    t_index: &mut TantivyIndex,
     data_dir: &Path,
     convs: &[NormalizedConversation],
     progress: &Option<Arc<IndexingProgress>>,
@@ -17609,7 +17409,6 @@ fn ingest_watch_batch_with_oom_split(
 ) -> Result<WatchIngestBatchOutcome> {
     ingest_watch_batch_with_oom_split_inner(
         storage,
-        t_index,
         data_dir,
         convs,
         progress,
@@ -17622,7 +17421,6 @@ fn ingest_watch_batch_with_oom_split(
 #[allow(clippy::too_many_arguments)]
 fn ingest_watch_batch_with_oom_split_inner(
     storage: &FrankenStorage,
-    t_index: &mut TantivyIndex,
     data_dir: &Path,
     convs: &[NormalizedConversation],
     progress: &Option<Arc<IndexingProgress>>,
@@ -17642,7 +17440,6 @@ fn ingest_watch_batch_with_oom_split_inner(
             let mut semantic_delta = WatchSemanticDelta::default();
             ingest_batch_with_semantic_delta(
                 storage,
-                Some(t_index),
                 data_dir,
                 convs,
                 progress,
@@ -17671,7 +17468,6 @@ fn ingest_watch_batch_with_oom_split_inner(
             );
             let mut merged = ingest_watch_batch_with_oom_split_inner(
                 storage,
-                t_index,
                 data_dir,
                 &convs[..split_at],
                 progress,
@@ -17681,7 +17477,6 @@ fn ingest_watch_batch_with_oom_split_inner(
             )?;
             let right = ingest_watch_batch_with_oom_split_inner(
                 storage,
-                t_index,
                 data_dir,
                 &convs[split_at..],
                 progress,
@@ -17726,7 +17521,6 @@ fn ingest_watch_batch_with_oom_split_inner(
             } else {
                 ingest_watch_batch_with_oom_split_inner(
                     storage,
-                    t_index,
                     data_dir,
                     std::slice::from_ref(conv),
                     progress,
@@ -19378,13 +19172,9 @@ fn reindex_paths(
     roots: &[(ConnectorKind, ScanRoot)],
     state: &Mutex<HashMap<ConnectorKind, i64>>,
     storage: &Mutex<FrankenStorage>,
-    t_index: &Mutex<Option<TantivyIndex>>,
-    index_path: &Path,
     force_full: bool,
 ) -> Result<usize> {
-    reindex_paths_with_semantic_delta(
-        opts, paths, roots, state, storage, t_index, index_path, force_full, None,
-    )
+    reindex_paths_with_semantic_delta(opts, paths, roots, state, storage, force_full, None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -19394,8 +19184,6 @@ fn reindex_paths_with_semantic_delta(
     roots: &[(ConnectorKind, ScanRoot)],
     state: &Mutex<HashMap<ConnectorKind, i64>>,
     storage: &Mutex<FrankenStorage>,
-    t_index: &Mutex<Option<TantivyIndex>>,
-    index_path: &Path,
     force_full: bool,
     semantic_delta: Option<&mut WatchSemanticDelta>,
 ) -> Result<usize> {
@@ -19674,9 +19462,6 @@ fn reindex_paths_with_semantic_delta(
             let storage = storage
                 .lock()
                 .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
-            let mut t_index_guard = t_index
-                .lock()
-                .map_err(|_| anyhow::anyhow!("index lock poisoned"))?;
             let ingest_chunk_size = if explicit_watch_once {
                 conv_count.max(1)
             } else {
@@ -19684,27 +19469,14 @@ fn reindex_paths_with_semantic_delta(
             };
             let capture_semantic_delta = semantic_delta.is_some();
             for chunk in convs.chunks(ingest_chunk_size) {
-                if t_index_guard.is_none() {
-                    tracing::info!(
-                        index_path = %index_path.display(),
-                        "opening Tantivy lazily for watch ingest"
-                    );
-                    *t_index_guard = Some(TantivyIndex::open_or_create(index_path)?);
-                }
-                let chunk_outcome = {
-                    let t_index = t_index_guard
-                        .as_mut()
-                        .expect("lazy watch index must be open before ingest");
-                    ingest_watch_batch_with_oom_split(
-                        &storage,
-                        t_index,
-                        &opts.data_dir,
-                        chunk,
-                        &opts.progress,
-                        !opts.watch,
-                        capture_semantic_delta,
-                    )?
-                };
+                let chunk_outcome = ingest_watch_batch_with_oom_split(
+                    &storage,
+                    &opts.data_dir,
+                    chunk,
+                    &opts.progress,
+                    !opts.watch,
+                    capture_semantic_delta,
+                )?;
                 inserted_messages =
                     inserted_messages.saturating_add(chunk_outcome.batch_outcome.inserted_messages);
                 processed_conversations =
@@ -19720,24 +19492,8 @@ fn reindex_paths_with_semantic_delta(
                     );
                 }
 
-                // Commit each successful chunk before advancing the partial
-                // watch watermark. A crash after this point replays at worst
-                // the next unfinished chunk, not the entire backlog.
-                let lexical_update_deferred = chunk_outcome.batch_outcome.lexical_update_deferred;
-                if lexical_update_deferred {
-                    tracing::warn!(
-                        error = ?chunk_outcome.batch_outcome.lexical_update_error,
-                        "dropping uncommitted watch Tantivy writer after deferred lexical update"
-                    );
-                    *t_index_guard = None;
-                } else {
-                    t_index_guard
-                        .as_mut()
-                        .expect("watch Tantivy writer must still be open before commit")
-                        .commit()?;
-                }
-
                 // Keep last_indexed_at current so `cass status` doesn't report stale during watch mode.
+                let lexical_update_deferred = chunk_outcome.batch_outcome.lexical_update_deferred;
                 if lexical_update_deferred {
                     tracing::warn!(
                         "skipping watch last_indexed_at update after deferred lexical update so health/status report stale lexical assets"
@@ -21348,7 +21104,7 @@ pub fn apply_workspace_rewrite(conv: &mut NormalizedConversation, root: &ScanRoo
 }
 
 pub mod persist {
-    use super::{LexicalPopulationStrategy, lexical_population_strategy_requires_inline_tantivy};
+    use super::LexicalPopulationStrategy;
     use std::collections::{HashMap, HashSet};
     use std::ops::Range;
     use std::path::Path;
@@ -21370,6 +21126,7 @@ pub mod persist {
     use crate::model::types::{
         Agent, AgentKind, Conversation, Message, MessageRole, Snippet, role_from_str,
     };
+    #[cfg(test)]
     use crate::search::tantivy::TantivyIndex;
     #[cfg(test)]
     use crate::sources::provenance::{Source, SourceKind};
@@ -21800,12 +21557,6 @@ pub mod persist {
             } else {
                 1000
             })
-    }
-
-    fn defer_lexical_updates_enabled() -> bool {
-        dotenvy::var("CASS_DEFER_LEXICAL_UPDATES")
-            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
-            .unwrap_or(false)
     }
 
     fn apply_begin_concurrent_writer_tuning(storage: &FrankenStorage, defer_checkpoints: bool) {
@@ -22254,21 +22005,12 @@ pub mod persist {
     fn persist_conversations_batched_begin_concurrent(
         storage: &FrankenStorage,
         db_path: &Path,
-        mut t_index: Option<&mut TantivyIndex>,
         convs: &[NormalizedConversation],
-        lexical_strategy: LexicalPopulationStrategy,
+        _lexical_strategy: LexicalPopulationStrategy,
         defer_checkpoints: bool,
         capture_semantic_delta: bool,
         raw_mirror_data_dir: Option<&Path>,
     ) -> Result<PersistBatchOutcome> {
-        if lexical_population_strategy_requires_inline_tantivy(lexical_strategy)
-            && t_index.is_none()
-        {
-            anyhow::bail!(
-                "begin-concurrent batched persistence requires a Tantivy writer for {}",
-                lexical_strategy.as_str()
-            );
-        }
         let max_retries = begin_concurrent_retry_limit();
         let chunk_size = begin_concurrent_chunk_size().min(convs.len().max(1));
 
@@ -22397,77 +22139,10 @@ pub mod persist {
             }
         }
 
-        let defer_lexical_updates = defer_lexical_updates_enabled();
         let mut batch_outcome = PersistBatchOutcome::default();
 
-        let mut skip_inline_lexical_updates = false;
-        for (idx, outcome) in ordered {
-            let conv = &convs[idx];
+        for (_idx, outcome) in ordered {
             batch_outcome.record_insert_outcome(&outcome);
-            if defer_lexical_updates || skip_inline_lexical_updates {
-                if capture_semantic_delta {
-                    let (inputs, max_message_id) =
-                        packet_semantic_delta_for_outcome(storage, &outcome)?;
-                    batch_outcome.extend_semantic_delta(inputs, max_message_id);
-                }
-                continue;
-            }
-
-            // ibuuh.32 / 5b9p0: route the begin-concurrent lexical
-            // sink through the packet pipeline. Same shape as the
-            // serial batched path above; the regression test
-            // persist_packet_pipeline_matches_legacy_for_incremental_inline
-            // pins both paths produce identical CassDocuments.
-            match lexical_strategy {
-                LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild => continue,
-                LexicalPopulationStrategy::InlineRebuildFromScan => {
-                    let packet = lexical_packet_for_persist(conv);
-                    t_index
-                        .as_deref_mut()
-                        .expect("inline rebuild requires Tantivy writer")
-                        .add_messages_from_packet(
-                            &packet,
-                            None,
-                            Some(outcome.conversation_id),
-                            |_| Ok(()),
-                        )?;
-                }
-                LexicalPopulationStrategy::IncrementalInline => {
-                    if !outcome.inserted_indices.is_empty() {
-                        let packet = lexical_packet_for_persist(conv);
-                        let positional =
-                            positional_indices_for_inserted(&packet, &outcome.inserted_indices);
-                        if !positional.is_empty() {
-                            let add_result = if should_inject_incremental_lexical_update_oom() {
-                                Err(anyhow::anyhow!("out of memory"))
-                            } else {
-                                t_index
-                                    .as_deref_mut()
-                                    .expect("incremental inline updates require Tantivy writer")
-                                    .add_messages_from_packet(
-                                        &packet,
-                                        Some(&positional),
-                                        Some(outcome.conversation_id),
-                                        |_| Ok(()),
-                                    )
-                            };
-                            if let Err(error) = add_result {
-                                if should_defer_incremental_lexical_update_after_error(&error) {
-                                    batch_outcome.record_deferred_lexical_update(&error);
-                                    skip_inline_lexical_updates = true;
-                                    tracing::warn!(
-                                        error = %error,
-                                        "incremental lexical update ran out of memory; preserving SQLite ingest and deferring lexical repair"
-                                    );
-                                } else {
-                                    return Err(error);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
             if capture_semantic_delta {
                 let (inputs, max_message_id) =
                     packet_semantic_delta_for_outcome(storage, &outcome)?;
@@ -22617,15 +22292,10 @@ pub mod persist {
 
     pub fn persist_conversation(
         storage: &FrankenStorage,
-        t_index: &mut TantivyIndex,
         conv: &NormalizedConversation,
     ) -> Result<()> {
         tracing::info!(agent = %conv.agent_slug, messages = conv.messages.len(), "persist_conversation");
-        let InsertOutcome {
-            conversation_id,
-            conversation_inserted: _conversation_inserted,
-            inserted_indices,
-        } = with_ephemeral_writer(storage, false, "persist_conversation", |writer| {
+        with_ephemeral_writer(storage, false, "persist_conversation", |writer| {
             let internal_conv = map_to_internal(conv);
             let agent = Agent {
                 id: None,
@@ -22644,23 +22314,6 @@ pub mod persist {
 
             writer.insert_conversation_tree(agent_id, workspace_id, &internal_conv)
         })?;
-
-        // Only add newly inserted messages to the Tantivy index
-        // (incremental). Routed through the packet pipeline per
-        // ibuuh.32 sink migration; equivalence guaranteed by
-        // tests::persist_packet_pipeline_matches_legacy_for_incremental_inline.
-        if !defer_lexical_updates_enabled() && !inserted_indices.is_empty() {
-            let packet = lexical_packet_for_persist(conv);
-            let positional = positional_indices_for_inserted(&packet, &inserted_indices);
-            if !positional.is_empty() {
-                t_index.add_messages_from_packet(
-                    &packet,
-                    Some(&positional),
-                    Some(conversation_id),
-                    |_| Ok(()),
-                )?;
-            }
-        }
         Ok(())
     }
 
@@ -22736,14 +22389,12 @@ pub mod persist {
     #[cfg(test)]
     pub(super) fn persist_conversations_batched(
         storage: &FrankenStorage,
-        t_index: Option<&mut TantivyIndex>,
         convs: &[NormalizedConversation],
         lexical_strategy: LexicalPopulationStrategy,
         defer_checkpoints: bool,
     ) -> Result<PersistBatchOutcome> {
         persist_conversations_batched_inner(
             storage,
-            t_index,
             convs,
             lexical_strategy,
             defer_checkpoints,
@@ -22754,7 +22405,6 @@ pub mod persist {
 
     pub(super) fn persist_conversations_batched_with_raw_mirror_links(
         storage: &FrankenStorage,
-        t_index: Option<&mut TantivyIndex>,
         data_dir: &Path,
         convs: &[NormalizedConversation],
         lexical_strategy: LexicalPopulationStrategy,
@@ -22762,7 +22412,6 @@ pub mod persist {
     ) -> Result<PersistBatchOutcome> {
         persist_conversations_batched_inner(
             storage,
-            t_index,
             convs,
             lexical_strategy,
             defer_checkpoints,
@@ -22773,7 +22422,6 @@ pub mod persist {
 
     pub(super) fn persist_conversations_batched_with_semantic_delta_and_raw_mirror_links(
         storage: &FrankenStorage,
-        t_index: Option<&mut TantivyIndex>,
         data_dir: &Path,
         convs: &[NormalizedConversation],
         lexical_strategy: LexicalPopulationStrategy,
@@ -22781,7 +22429,6 @@ pub mod persist {
     ) -> Result<PersistBatchOutcome> {
         persist_conversations_batched_inner(
             storage,
-            t_index,
             convs,
             lexical_strategy,
             defer_checkpoints,
@@ -22792,7 +22439,6 @@ pub mod persist {
 
     fn persist_conversations_batched_inner(
         storage: &FrankenStorage,
-        mut t_index: Option<&mut TantivyIndex>,
         convs: &[NormalizedConversation],
         lexical_strategy: LexicalPopulationStrategy,
         defer_checkpoints: bool,
@@ -22801,14 +22447,6 @@ pub mod persist {
     ) -> Result<PersistBatchOutcome> {
         if convs.is_empty() {
             return Ok(PersistBatchOutcome::default());
-        }
-        if lexical_population_strategy_requires_inline_tantivy(lexical_strategy)
-            && t_index.is_none()
-        {
-            anyhow::bail!(
-                "batched persistence requires a Tantivy writer for {}",
-                lexical_strategy.as_str()
-            );
         }
 
         let begin_concurrent_enabled = begin_concurrent_writes_enabled();
@@ -22826,7 +22464,6 @@ pub mod persist {
             return persist_conversations_batched_begin_concurrent(
                 storage,
                 &db_path,
-                t_index,
                 convs,
                 lexical_strategy,
                 defer_checkpoints,
@@ -22924,75 +22561,10 @@ pub mod persist {
                 Ok(outcomes)
             },
         )?;
-        let defer_lexical_updates = defer_lexical_updates_enabled();
         let mut batch_outcome = PersistBatchOutcome::default();
         record_persisted_raw_mirror_db_links(raw_mirror_data_dir, convs, &outcomes);
-        if !defer_lexical_updates {
-            // ibuuh.32 / 5b9p0: route the serial-batched lexical sink
-            // through the packet pipeline. Build each packet ONCE and
-            // reuse it for both InlineRebuildFromScan (full message
-            // set) and IncrementalInline (positional subset derived
-            // from outcome.inserted_indices).
-            let mut skip_inline_lexical_updates = false;
-            for (conv, outcome) in convs.iter().zip(outcomes.iter()) {
-                batch_outcome.record_insert_outcome(outcome);
-                if skip_inline_lexical_updates {
-                    continue;
-                }
-                match lexical_strategy {
-                    LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild => continue,
-                    LexicalPopulationStrategy::InlineRebuildFromScan => {
-                        let packet = lexical_packet_for_persist(conv);
-                        t_index
-                            .as_deref_mut()
-                            .expect("inline rebuild requires Tantivy writer")
-                            .add_messages_from_packet(
-                                &packet,
-                                None,
-                                Some(outcome.conversation_id),
-                                |_| Ok(()),
-                            )?;
-                    }
-                    LexicalPopulationStrategy::IncrementalInline => {
-                        if !outcome.inserted_indices.is_empty() {
-                            let packet = lexical_packet_for_persist(conv);
-                            let positional =
-                                positional_indices_for_inserted(&packet, &outcome.inserted_indices);
-                            if !positional.is_empty() {
-                                let add_result = if should_inject_incremental_lexical_update_oom() {
-                                    Err(anyhow::anyhow!("out of memory"))
-                                } else {
-                                    t_index
-                                        .as_deref_mut()
-                                        .expect("incremental inline updates require Tantivy writer")
-                                        .add_messages_from_packet(
-                                            &packet,
-                                            Some(&positional),
-                                            Some(outcome.conversation_id),
-                                            |_| Ok(()),
-                                        )
-                                };
-                                if let Err(error) = add_result {
-                                    if should_defer_incremental_lexical_update_after_error(&error) {
-                                        batch_outcome.record_deferred_lexical_update(&error);
-                                        skip_inline_lexical_updates = true;
-                                        tracing::warn!(
-                                            error = %error,
-                                            "incremental lexical update ran out of memory; preserving SQLite ingest and deferring lexical repair"
-                                        );
-                                    } else {
-                                        return Err(error);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        } else {
-            for outcome in &outcomes {
-                batch_outcome.record_insert_outcome(outcome);
-            }
+        for outcome in &outcomes {
+            batch_outcome.record_insert_outcome(outcome);
         }
 
         if capture_semantic_delta {
