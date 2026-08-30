@@ -2730,8 +2730,16 @@ fn should_probe_live_tantivy_docs_for_post_full_scan_skip(
         && observed_tantivy_docs.is_none()
 }
 
+/// W2-6 Task A: reads the live `lex_docs` count via `storage` instead of
+/// `live_tantivy_doc_count(index_path)`. `initial_checkpoint_status.
+/// completed_indexed_docs` (compared against this at the call#4 skip check,
+/// `should_skip_post_full_scan_authoritative_rebuild`) is now itself a
+/// `lex_docs` count (`lex_domain_matching_status`) -- both sides of that
+/// comparison must read the same domain, or the "did anything change during
+/// this scan" check silently degrades to always-false (交接件's 14750/14757
+/// cross-reference).
 fn observed_tantivy_docs_for_post_full_scan_skip(
-    index_path: &Path,
+    storage: &FrankenStorage,
     full_rebuild: bool,
     rebuild_was_required: bool,
     salvage_messages_imported: usize,
@@ -2747,7 +2755,7 @@ fn observed_tantivy_docs_for_post_full_scan_skip(
         scan_canonical_mutations,
         observed_tantivy_docs,
     ) {
-        live_tantivy_doc_count(index_path)
+        count_lex_docs_exact(storage).map(Some)
     } else {
         Ok(observed_tantivy_docs)
     }
@@ -8985,6 +8993,92 @@ fn count_total_messages_exact(storage: &FrankenStorage) -> Result<usize> {
     Ok(usize::try_from(total_messages.max(0)).unwrap_or(usize::MAX))
 }
 
+/// W2-6 Task A, region1: cheap readonly-before-writable-open preflight,
+/// replacing the retired tantivy checkpoint file read
+/// (`nonresumable_pending_lexical_rebuild_status_from_readonly_db`). Reuses
+/// [`crate::search::lexical_index_health::searchable_index_exists`] (Task1) —
+/// which already fails closed on a missing `lex_docs` table (a pre-migration
+/// v1 database) by treating a query error as "table absent" rather than
+/// propagating it — so a v1-schema database reads as incomplete here too,
+/// not as an `Err` that would fall through to the generic error handler at
+/// this function's call site.
+///
+/// Deliberately catches only the catastrophic case (messages present, zero
+/// `lex_docs` rows): a domain that is nonempty but partially stale is left to
+/// the incremental-repair/OOM-retry/historical-salvage paths that already
+/// run as part of routine scanning (W2-6 Task2 segment2's "验旗两条结论") --
+/// this readonly fast path must stay O(1) queries, not scan message content.
+fn lex_domain_readonly_incomplete_status(db_path: &Path) -> Result<Option<(usize, usize)>> {
+    if crate::search::lexical_index_health::searchable_index_exists(db_path) {
+        return Ok(None);
+    }
+    let mut storage = FrankenStorage::open_readonly(db_path).with_context(|| {
+        format!(
+            "opening readonly storage to classify lex domain rebuild need: {}",
+            db_path.display()
+        )
+    })?;
+    let total_conversations = count_total_conversations_exact(&storage)?;
+    let total_messages = count_total_messages_exact(&storage)?;
+    storage.close_best_effort_in_place();
+    Ok(Some((total_conversations, total_messages)))
+}
+
+/// R0 condition1 (control-plane 2026-08-30): defensive against a missing
+/// `lex_docs` table, mirroring `count_total_conversations_exact`'s sibling
+/// counters, so it stays safe to call in any context this file might grow to
+/// reuse it from, not only the post-migration `storage` region2 currently
+/// has open.
+fn count_lex_docs_exact(storage: &FrankenStorage) -> Result<usize> {
+    match storage.raw().query_row_map(
+        "SELECT COUNT(*) FROM lex_docs",
+        &[] as &[ParamValue],
+        |row| row.get_typed::<i64>(0),
+    ) {
+        Ok(count) => Ok(usize::try_from(count.max(0)).unwrap_or(usize::MAX)),
+        Err(err) if err.to_string().contains("no such table") => Ok(0),
+        Err(err) => Err(err).context("counting lex_docs rows"),
+    }
+}
+
+/// W2-6 Task A, region2: reads the [`crate::storage::sqlite::
+/// LEX_DOMAIN_REBUILD_STATE_META_KEY`] marker (µs-class point lookup) instead
+/// of the retired tantivy checkpoint file, per R0 condition2's perf gate
+/// (`expected_live_lexical_doc_count` measured 5.6s release / 19.7s debug on
+/// a 1.3M-message staging corpus -- 11x/39x over the 500ms bar, so it stays
+/// in its original incremental-repair subsystem and is not called here).
+///
+/// `Absent` (no full rebuild has ever run against this database -- the
+/// common case for a database whose lex_docs domain has only ever been kept
+/// current by ordinary inline dual-write ingestion) maps to the same
+/// `default()` the old checkpoint-file reader returned for "no checkpoint
+/// file": neither pending nor completed, so routine incremental scanning
+/// proceeds untouched. Only `Building` (an explicit full rebuild was started
+/// and never finished) is treated as incomplete.
+fn lex_domain_matching_status(
+    storage: &FrankenStorage,
+    total_conversations: usize,
+) -> Result<MatchingLexicalRebuildStateStatus> {
+    use crate::storage::sqlite::LexDomainRebuildMarkerState;
+    match crate::storage::sqlite::lex_domain_rebuild_marker_status(storage.raw())? {
+        LexDomainRebuildMarkerState::Absent => Ok(MatchingLexicalRebuildStateStatus::default()),
+        LexDomainRebuildMarkerState::Building => Ok(MatchingLexicalRebuildStateStatus {
+            has_pending_resume: true,
+            ..MatchingLexicalRebuildStateStatus::default()
+        }),
+        LexDomainRebuildMarkerState::Completed { .. } => {
+            let lex_docs_count = count_lex_docs_exact(storage)?;
+            Ok(MatchingLexicalRebuildStateStatus {
+                has_pending_resume: false,
+                has_completed_checkpoint: true,
+                completed_indexed_docs: Some(lex_docs_count),
+                completed_exact_totals: Some((total_conversations, lex_docs_count)),
+                completed_storage_fingerprint: None,
+            })
+        }
+    }
+}
+
 /// Count the tantivy docs a *healthy* live lexical index should hold for the
 /// current canonical data: one per reachable (live-conversation) message that
 /// the authoritative rebuild sink does NOT drop as hard-noise.
@@ -13478,11 +13572,8 @@ pub fn run_index(
     ensure_index_startup_storage_headroom(&opts)?;
     complete_preflight_phase!();
     if should_try_readonly_nonresumable_lexical_resume(&opts) {
-        match nonresumable_pending_lexical_rebuild_status_from_readonly_db(
-            &index_path,
-            &opts.db_path,
-        ) {
-            Ok(Some((_status, total_conversations))) => {
+        match lex_domain_readonly_incomplete_status(&opts.db_path) {
+            Ok(Some((total_conversations, total_messages))) => {
                 if let Some(deferred) = should_defer_incremental_authoritative_lexical_repair(
                     &opts,
                     false,
@@ -13513,42 +13604,34 @@ pub fn run_index(
                 tracing::info!(
                     db_path = %opts.db_path.display(),
                     total_conversations,
-                    "restarting non-resumable lexical rebuild from a readonly canonical DB before writable storage open"
+                    "rebuilding an incomplete lex_docs/fts_lex domain from a readonly canonical DB before writable storage open"
                 );
                 record_lexical_population_strategy(
                     opts.progress.as_ref(),
                     LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
-                    "readonly_fast_resume_incomplete_nonresumable_lexical_rebuild",
+                    "readonly_fast_rebuild_incomplete_lex_domain",
                 );
                 tracing::info!(
                     strategy = LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild.as_str(),
-                    reason = "readonly_fast_resume_incomplete_nonresumable_lexical_rebuild",
+                    reason = "readonly_fast_rebuild_incomplete_lex_domain",
                     "selected_lexical_population_strategy"
                 );
                 ensure_authoritative_lexical_rebuild_storage_headroom(
                     &opts.data_dir,
                     &opts.db_path,
                 )?;
-                let rebuild = rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
-                    &opts.db_path,
-                    &opts.data_dir,
-                    total_conversations,
-                    opts.progress.clone(),
-                    Arc::clone(&progress_bump),
-                )?;
+                rebuild_lex_domain_from_db_full(&opts.db_path, opts.progress.clone())?;
                 if let Some(p) = &opts.progress
                     && let Ok(mut stats) = p.stats.lock()
                 {
                     stats.scan_ms = 0;
                     stats.total_conversations = total_conversations;
                 }
-                if let Some(observed_messages) = rebuild.observed_messages {
-                    record_exact_total_counts_in_progress(
-                        opts.progress.as_ref(),
-                        total_conversations,
-                        observed_messages,
-                    );
-                }
+                record_exact_total_counts_in_progress(
+                    opts.progress.as_ref(),
+                    total_conversations,
+                    total_messages,
+                );
                 return Ok(());
             }
             Ok(None) => {}
@@ -13556,7 +13639,7 @@ pub fn run_index(
                 tracing::debug!(
                     db_path = %opts.db_path.display(),
                     error = %err,
-                    "readonly lexical resume preflight failed; falling back to writable storage open"
+                    "readonly lex domain completeness preflight failed; falling back to writable storage open"
                 );
             }
         }
@@ -13804,83 +13887,55 @@ pub fn run_index(
         .as_ref()
         .is_some_and(|paths| !paths.is_empty());
     let targeted_semantic_watch_once = should_run_targeted_semantic_watch_once(&opts);
-    let populated_explicit_watch_once_only = has_explicit_watch_once_paths
-        && !opts.watch
-        && !opts.full
-        && !opts.force_rebuild
-        && !opts.semantic
-        && !opts.build_hnsw
-        && initial_canonical_sessions_before_salvage > 0;
     preflight_phase!("watch_startup:probe_lexical_checkpoint");
+    // W2-6 Task A, region2: `initial_matching_lexical_checkpoint` no longer
+    // comes from a tantivy checkpoint file -- see `lex_domain_matching_status`
+    // and the `LEX_DOMAIN_REBUILD_STATE_META_KEY` marker it reads. The old
+    // three-way branch on `populated_explicit_watch_once_only` existed only
+    // to pick which "is this checkpoint FILE still trustworthy" matcher to
+    // use (version/schema-hash/page-size/db-path/fingerprint); the marker has
+    // no such staleness problem (it is a live DB row, not a sidecar file), so
+    // that distinction collapses to a single call.
     let mut initial_matching_lexical_checkpoint = MatchingLexicalRebuildStateStatus::default();
-    let mut restart_pending_lexical_rebuild_from_zero = false;
     let resume_lexical_rebuild = if opts.force_rebuild {
         // force_rebuild always starts from scratch; never resume a stale checkpoint.
         false
     } else if initial_canonical_sessions_before_salvage > 0 {
-        if let Some(status) = nonresumable_pending_lexical_rebuild_status_without_fingerprint(
-            &index_path,
-            &opts.db_path,
+        initial_matching_lexical_checkpoint =
+            lex_domain_matching_status(&storage, initial_canonical_sessions_before_salvage)?;
+        if !initial_matching_lexical_checkpoint.has_pending_resume {
+            false
+        } else if let Some(deferred) = should_defer_incremental_authoritative_lexical_repair(
+            &opts,
+            canonical_storage_rebuilt,
             initial_canonical_sessions_before_salvage,
-        )? {
-            if let Some(deferred) = should_defer_incremental_authoritative_lexical_repair(
-                &opts,
-                canonical_storage_rebuilt,
-                initial_canonical_sessions_before_salvage,
-                true,
-                None,
-            ) {
-                tracing::warn!(
-                    db_path = %opts.db_path.display(),
-                    canonical_conversations = deferred.canonical_conversations,
-                    db_size_bytes = deferred.db_size_bytes,
-                    max_automatic_repair_db_size_bytes =
-                        deferred.max_automatic_repair_db_size_bytes,
-                    reason = deferred.reason,
-                    "deferring pending lexical rebuild resume during routine incremental index"
-                );
-                initial_matching_lexical_checkpoint = MatchingLexicalRebuildStateStatus {
-                    has_pending_resume: false,
-                    ..status
-                };
-                record_deferred_incremental_canonical_lexical_repair(
-                    opts.progress.as_ref(),
-                    &deferred,
-                );
-            } else {
-                initial_matching_lexical_checkpoint = status;
-                restart_pending_lexical_rebuild_from_zero = true;
-            }
-        } else if populated_explicit_watch_once_only {
-            if let Some(status) =
-                matching_completed_lexical_rebuild_state_status_without_fingerprint(
-                    &index_path,
-                    &opts.db_path,
-                    initial_canonical_sessions_before_salvage,
-                )?
-            {
-                initial_matching_lexical_checkpoint = status;
-            } else {
-                initial_matching_lexical_checkpoint =
-                    matching_lexical_rebuild_state_status_if_present(&index_path, || {
-                        lexical_rebuild_db_state_with_total_conversations(
-                            &storage,
-                            &opts.db_path,
-                            initial_canonical_sessions_before_salvage,
-                        )
-                    })?;
-            }
+            true,
+            None,
+        ) {
+            tracing::warn!(
+                db_path = %opts.db_path.display(),
+                canonical_conversations = deferred.canonical_conversations,
+                db_size_bytes = deferred.db_size_bytes,
+                max_automatic_repair_db_size_bytes =
+                    deferred.max_automatic_repair_db_size_bytes,
+                reason = deferred.reason,
+                "deferring pending lexical rebuild resume during routine incremental index"
+            );
+            initial_matching_lexical_checkpoint.has_pending_resume = false;
+            record_deferred_incremental_canonical_lexical_repair(
+                opts.progress.as_ref(),
+                &deferred,
+            );
+            false
         } else {
-            initial_matching_lexical_checkpoint =
-                matching_lexical_rebuild_state_status_if_present(&index_path, || {
-                    lexical_rebuild_db_state_with_total_conversations(
-                        &storage,
-                        &opts.db_path,
-                        initial_canonical_sessions_before_salvage,
-                    )
-                })?;
+            // No `restart_pending_lexical_rebuild_from_zero` distinction
+            // anymore: `rebuild_lex_domain_from_db_full` always rebuilds
+            // from zero, there is no partial-resume variant to choose
+            // between (X-5 judgment; see the `t_index = if
+            // resume_lexical_rebuild` branch below, which used to pick
+            // between two tantivy rebuild functions on this same flag).
+            true
         }
-        initial_matching_lexical_checkpoint.has_pending_resume
     } else {
         false
     };
@@ -14118,50 +14173,38 @@ pub fn run_index(
     let t_index = if resume_lexical_rebuild {
         tracing::info!(
             db_path = %opts.db_path.display(),
-            "resuming incomplete lexical rebuild from canonical database checkpoint"
+            "rebuilding an incomplete lex_docs/fts_lex domain from the canonical database (routine incremental run)"
         );
         record_lexical_population_strategy(
             opts.progress.as_ref(),
             LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
-            "resume_incomplete_authoritative_db_rebuild_from_checkpoint",
+            "rebuild_incomplete_lex_domain_from_canonical_db",
         );
         tracing::info!(
             strategy = LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild.as_str(),
-            reason = "resume_incomplete_authoritative_db_rebuild_from_checkpoint",
+            reason = "rebuild_incomplete_lex_domain_from_canonical_db",
             "selected_lexical_population_strategy"
         );
         ensure_authoritative_lexical_rebuild_storage_headroom(&opts.data_dir, &opts.db_path)?;
-        let rebuild = if restart_pending_lexical_rebuild_from_zero {
-            rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
-                &opts.db_path,
-                &opts.data_dir,
-                initial_canonical_sessions_before_salvage,
-                opts.progress.clone(),
-                Arc::clone(&progress_bump),
-            )?
-        } else {
-            rebuild_tantivy_from_db_with_progress_bump(
-                &opts.db_path,
-                &opts.data_dir,
-                initial_canonical_sessions_before_salvage,
-                opts.progress.clone(),
-                Arc::clone(&progress_bump),
-            )?
-        };
-        exact_completed_lexical_checkpoint = rebuild.exact_checkpoint_persisted;
-        // Populate stats for resumed lexical rebuild path
+        rebuild_lex_domain_from_db_full(&opts.db_path, opts.progress.clone())?;
+        // `rebuild_lex_domain_from_db` (called above) already persisted the
+        // `Completed` marker atomically with its last batch -- the lex
+        // domain's own authoritative state is done, unconditionally true
+        // (there is no partial/from-zero distinction to report, unlike the
+        // old `LexicalRebuildOutcome.exact_checkpoint_persisted` this
+        // replaces).
+        exact_completed_lexical_checkpoint = true;
+        // Populate stats for the routine-run lex domain rebuild path
         if let Some(p) = &opts.progress
             && let Ok(mut stats) = p.stats.lock()
         {
             stats.total_conversations = initial_canonical_sessions_before_salvage;
         }
-        if let Some(observed_messages) = rebuild.observed_messages {
-            record_exact_total_counts_in_progress(
-                opts.progress.as_ref(),
-                initial_canonical_sessions_before_salvage,
-                observed_messages,
-            );
-        }
+        record_exact_total_counts_in_progress(
+            opts.progress.as_ref(),
+            initial_canonical_sessions_before_salvage,
+            count_total_messages_exact(&storage)?,
+        );
         if keep_tantivy_open_after_rebuild {
             Some(TantivyIndex::open_or_create(&index_path)?)
         } else {
@@ -14728,7 +14771,7 @@ pub fn run_index(
                 {
                     let post_scan_observed_tantivy_docs =
                         observed_tantivy_docs_for_post_full_scan_skip(
-                            &index_path,
+                            &storage,
                             opts.full,
                             initial_needs_rebuild,
                             historical_salvage.messages_imported,
@@ -30178,6 +30221,222 @@ mod tests {
     use crate::storage::api::Value as SqliteValue;
     use serial_test::serial;
     use tempfile::TempDir;
+
+    fn scratch_db_with_one_message(content_text: &str) -> (TempDir, PathBuf) {
+        let dir = TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).expect("open db");
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "claude_code".into(),
+                name: "Claude Code".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .expect("ensure_agent");
+        storage
+            .insert_conversation_tree(
+                agent_id,
+                None,
+                &Conversation {
+                    id: None,
+                    agent_slug: "claude_code".into(),
+                    workspace: None,
+                    external_id: Some("region-a".into()),
+                    title: Some("title".into()),
+                    source_path: PathBuf::from("/tmp/region-a.jsonl"),
+                    started_at: Some(1_700_000_000_000),
+                    ended_at: None,
+                    approx_tokens: None,
+                    metadata_json: serde_json::Value::Null,
+                    messages: vec![Message {
+                        id: None,
+                        idx: 0,
+                        role: MessageRole::User,
+                        author: Some("user".into()),
+                        created_at: Some(1_700_000_000_000),
+                        content: content_text.into(),
+                        extra_json: serde_json::Value::Null,
+                        snippets: Vec::new(),
+                    }],
+                    source_id: "local".into(),
+                    origin_host: None,
+                },
+            )
+            .expect("insert_conversation_tree");
+        storage.close().expect("close db");
+        (dir, db_path)
+    }
+
+    /// 域不完整 -> 触发重建: a database with real messages but a `lex_docs`
+    /// domain wiped back to empty (the v1->v2-migrated-but-never-rebuilt
+    /// shape `searchable_index_exists` exists to catch) must be reported as
+    /// needing a full rebuild by region1's readonly preflight.
+    #[test]
+    fn lex_domain_readonly_incomplete_status_detects_never_populated_domain() {
+        let (_dir, db_path) = scratch_db_with_one_message("never backfilled");
+        {
+            let storage = FrankenStorage::open(&db_path).expect("reopen db");
+            storage.raw().execute("DELETE FROM lex_docs", &[]).expect("wipe lex_docs");
+            storage.raw().execute("DELETE FROM fts_lex", &[]).expect("wipe fts_lex");
+            storage.close().expect("close db");
+        }
+        let status = lex_domain_readonly_incomplete_status(&db_path).expect("status");
+        assert_eq!(status, Some((1, 1)), "must report (total_conversations, total_messages) when incomplete");
+    }
+
+    /// 域健康 -> 不触发: an ordinary, freshly inserted (dual-write-populated)
+    /// database must NOT be flagged by region1's preflight.
+    #[test]
+    fn lex_domain_readonly_incomplete_status_none_when_healthy() {
+        let (_dir, db_path) = scratch_db_with_one_message("healthy content");
+        let status = lex_domain_readonly_incomplete_status(&db_path).expect("status");
+        assert_eq!(status, None, "a healthy dual-write-populated domain must not trigger a rebuild");
+    }
+
+    /// Mirrors region2: `Absent` (no rebuild has ever run) must map to the
+    /// same default as the retired checkpoint file's "no checkpoint" case --
+    /// neither pending nor completed -- so ordinary incremental runs, which
+    /// never call `rebuild_lex_domain_from_db`, are left untouched.
+    #[test]
+    fn lex_domain_matching_status_absent_marker_is_default() {
+        let (_dir, db_path) = scratch_db_with_one_message("healthy content");
+        let storage = FrankenStorage::open(&db_path).expect("open db");
+        let status = lex_domain_matching_status(&storage, 1).expect("status");
+        assert_eq!(status, MatchingLexicalRebuildStateStatus::default());
+    }
+
+    /// 模拟中断态 -> 下次routine跑触发从零重建: a `Building` marker (an
+    /// interrupted rebuild) must surface as `has_pending_resume: true` so
+    /// region2's routine-run branch restarts it from zero.
+    #[test]
+    fn lex_domain_matching_status_building_marker_is_pending_resume() {
+        let (_dir, db_path) = scratch_db_with_one_message("healthy content");
+        let storage = FrankenStorage::open(&db_path).expect("open db");
+        storage.raw().execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES('lex_domain_rebuild_state', 'building')",
+            &[],
+        ).expect("write building marker");
+        let status = lex_domain_matching_status(&storage, 1).expect("status");
+        assert!(status.has_pending_resume, "Building marker must map to has_pending_resume");
+        assert!(!status.has_completed_checkpoint);
+    }
+
+    /// A `Completed` marker must surface as `has_completed_checkpoint` with
+    /// live-queried totals (not the marker's own stored numbers -- region2
+    /// needs a fresh count for the later "did anything change during this
+    /// scan" comparison, not a stale snapshot).
+    #[test]
+    fn lex_domain_matching_status_completed_marker_has_totals() {
+        let (_dir, db_path) = scratch_db_with_one_message("healthy content");
+        let storage = FrankenStorage::open(&db_path).expect("open db");
+        storage.rebuild_lex_domain_from_db(None).expect("rebuild");
+        let status = lex_domain_matching_status(&storage, 1).expect("status");
+        assert!(status.has_completed_checkpoint);
+        assert!(!status.has_pending_resume);
+        assert_eq!(status.completed_indexed_docs, Some(1));
+        assert_eq!(status.completed_exact_totals, Some((1, 1)));
+        assert_eq!(status.completed_storage_fingerprint, None, "fingerprint is structurally dead, R0 condition");
+    }
+
+    /// End-to-end (drives `run_index` itself, not the inner functions
+    /// directly -- same rationale as
+    /// `run_index_force_rebuild_on_populated_db_repairs_lex_domain_via_readonly_fast_path`:
+    /// a unit test on `lex_domain_matching_status` alone would miss a real
+    /// dispatch bug like the one this test exists to catch, where region2's
+    /// detection correctly says "incomplete" but the branch it feeds used to
+    /// call a tantivy rebuild function instead of a lex_domain one).
+    ///
+    /// Region1 must NOT fire first (it would short-circuit before region2 is
+    /// ever reached): seed lex_docs with real content via normal ingestion so
+    /// `searchable_index_exists` is true, then stamp the marker `building`
+    /// directly (simulating an interrupted rebuild) without touching
+    /// lex_docs -- region1 only catches "structurally empty," region2 is the
+    /// one that must catch "an explicit rebuild never finished."
+    #[test]
+    #[serial]
+    fn run_index_routine_run_repairs_lex_domain_when_marker_is_building() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let data_dir = tmp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir)?;
+        let db_path = data_dir.join("db.sqlite");
+
+        {
+            let storage = FrankenStorage::open(&db_path)?;
+            let agent_id = storage.ensure_agent(&Agent {
+                id: None,
+                slug: "claude_code".into(),
+                name: "Claude Code".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })?;
+            storage.insert_conversation_tree(
+                agent_id,
+                None,
+                &Conversation {
+                    id: None,
+                    agent_slug: "claude_code".into(),
+                    workspace: None,
+                    external_id: Some("region2-e2e".into()),
+                    title: Some("title".into()),
+                    source_path: PathBuf::from("/tmp/region2-e2e.jsonl"),
+                    started_at: Some(1_700_000_000_000),
+                    ended_at: None,
+                    approx_tokens: None,
+                    metadata_json: serde_json::Value::Null,
+                    messages: vec![Message {
+                        id: None,
+                        idx: 0,
+                        role: MessageRole::User,
+                        author: Some("user".into()),
+                        created_at: Some(1_700_000_000_000),
+                        content: "region2 end to end content".into(),
+                        extra_json: serde_json::Value::Null,
+                        snippets: Vec::new(),
+                    }],
+                    source_id: "local".into(),
+                    origin_host: None,
+                },
+            )?;
+            anyhow::ensure!(
+                crate::search::lexical_index_health::searchable_index_exists(&db_path),
+                "sanity: seeded lex_docs via normal dual-write ingestion must already exist"
+            );
+            storage.raw().execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES('lex_domain_rebuild_state', 'building')",
+                &[],
+            )?;
+            storage.close()?;
+        }
+
+        let opts = super::IndexOptions {
+            full: false,
+            watch: false,
+            force_rebuild: false,
+            watch_once_paths: None,
+            db_path: db_path.clone(),
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_interval_secs: 30,
+        };
+        run_index(opts, None)?;
+
+        let storage = FrankenStorage::open_readonly(&db_path)?;
+        assert_eq!(
+            crate::storage::sqlite::lex_domain_rebuild_marker_status(storage.raw())?,
+            crate::storage::sqlite::LexDomainRebuildMarkerState::Completed {
+                total_conversations: 1,
+                lex_docs_count: 1,
+            },
+            "region2 must have rebuilt the lex domain and cleared the marker to Completed, \
+             not left it stuck at Building or silently rebuilt tantivy instead"
+        );
+        Ok(())
+    }
 
     fn read_index_run_lock_metadata_for_test(lock_path: &Path) -> Result<String> {
         #[cfg(windows)]

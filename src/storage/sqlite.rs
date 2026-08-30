@@ -5479,6 +5479,104 @@ pub(crate) struct LexDomainRebuildStats {
     pub lex_docs_count: usize,
 }
 
+/// W2-6 Task A: `meta` key persisting whether the last
+/// [`FrankenStorage::rebuild_lex_domain_from_db`] run finished. Replaces the
+/// retired tantivy checkpoint file's completed/pending distinction with a
+/// single row (control-plane 2026-08-30 ruling: two states, no version/
+/// schema-hash/page-size/fingerprint matching -- that matching complexity is
+/// exactly what W2-6 delta w2-d4 judged dead along with the checkpoint file
+/// it protected). A crash mid-rebuild leaves the row at `"building"` (or
+/// absent, on a database that predates this marker); the next routine run
+/// reads that as incomplete and reruns the full rebuild from zero -- there is
+/// no partial-progress resume, matching the project's X-5 judgment.
+pub(crate) const LEX_DOMAIN_REBUILD_STATE_META_KEY: &str = "lex_domain_rebuild_state";
+const LEX_DOMAIN_REBUILD_STATE_BUILDING: &str = "building";
+const LEX_DOMAIN_REBUILD_STATE_COMPLETED_PREFIX: &str = "completed:";
+
+/// Parsed form of the [`LEX_DOMAIN_REBUILD_STATE_META_KEY`] row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LexDomainRebuildMarkerState {
+    /// No row at all: a pre-marker database, or one that has never run a
+    /// full lex domain rebuild.
+    Absent,
+    /// A rebuild is in progress (or was interrupted mid-run).
+    Building,
+    /// The last rebuild finished; totals observed at that time.
+    Completed {
+        total_conversations: usize,
+        lex_docs_count: usize,
+    },
+}
+
+/// Reads the current rebuild-state marker. A single indexed point lookup
+/// (`meta` is keyed on `key`), microsecond-class regardless of corpus size --
+/// this is the replacement for the tantivy checkpoint file read that used to
+/// gate `run_index`'s region2 trigger. A malformed `completed:` value (should
+/// never happen outside manual tampering) is treated as `Building`, not
+/// trusted as healthy -- fail toward "rebuild it," never toward "skip it."
+pub(crate) fn lex_domain_rebuild_marker_status(
+    conn: &FrankenConnection,
+) -> Result<LexDomainRebuildMarkerState> {
+    let raw: Option<String> = conn
+        .query_opt_map(
+            "SELECT value FROM meta WHERE key = ?1",
+            fparams![LEX_DOMAIN_REBUILD_STATE_META_KEY],
+            |row| row.get_typed(0),
+        )
+        .context("reading lex domain rebuild state marker")?;
+    let Some(raw) = raw else {
+        return Ok(LexDomainRebuildMarkerState::Absent);
+    };
+    if let Some(totals) = raw.strip_prefix(LEX_DOMAIN_REBUILD_STATE_COMPLETED_PREFIX)
+        && let Some((total_conversations, lex_docs_count)) = totals.split_once(':')
+        && let (Ok(total_conversations), Ok(lex_docs_count)) =
+            (total_conversations.parse::<usize>(), lex_docs_count.parse::<usize>())
+    {
+        return Ok(LexDomainRebuildMarkerState::Completed {
+            total_conversations,
+            lex_docs_count,
+        });
+    }
+    Ok(LexDomainRebuildMarkerState::Building)
+}
+
+fn write_lex_domain_rebuild_marker_building(conn: &FrankenConnection) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+        fparams![LEX_DOMAIN_REBUILD_STATE_META_KEY, LEX_DOMAIN_REBUILD_STATE_BUILDING],
+    )
+    .context("writing lex domain rebuild state marker (building)")?;
+    Ok(())
+}
+
+fn write_lex_domain_rebuild_marker_completed(
+    conn: &FrankenConnection,
+    total_conversations: usize,
+    lex_docs_count: usize,
+) -> Result<()> {
+    let value = format!("{LEX_DOMAIN_REBUILD_STATE_COMPLETED_PREFIX}{total_conversations}:{lex_docs_count}");
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+        fparams![LEX_DOMAIN_REBUILD_STATE_META_KEY, value.as_str()],
+    )
+    .context("writing lex domain rebuild state marker (completed)")?;
+    Ok(())
+}
+
+fn write_lex_domain_rebuild_marker_completed_in_tx(
+    tx: &FrankenTransaction<'_>,
+    total_conversations: usize,
+    lex_docs_count: usize,
+) -> Result<()> {
+    let value = format!("{LEX_DOMAIN_REBUILD_STATE_COMPLETED_PREFIX}{total_conversations}:{lex_docs_count}");
+    tx.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+        fparams![LEX_DOMAIN_REBUILD_STATE_META_KEY, value.as_str()],
+    )
+    .context("writing lex domain rebuild state marker (completed, in-transaction)")?;
+    Ok(())
+}
+
 impl FrankenStorage {
     /// Ensure an agent exists in the database, returning its ID.
     pub fn ensure_agent(&self, agent: &Agent) -> Result<i64> {
@@ -6965,13 +7063,37 @@ impl FrankenStorage {
             progress.current.store(0, Ordering::Relaxed);
         }
 
+        // W2-6 Task A: mark the rebuild in-progress before touching any
+        // conversation. A crash between here and the completed marker below
+        // leaves this row at "building", which region2's routine-run
+        // detection (indexer::mod.rs) reads as incomplete and reruns from
+        // zero next time -- no partial-progress resume (X-5 judgment).
+        write_lex_domain_rebuild_marker_building(&self.conn)?;
+
+        let total_conversations = conversation_ids.len();
         let mut conversations_processed = 0usize;
+        let mut remaining = total_conversations;
         for chunk in conversation_ids.chunks(CONVERSATIONS_PER_TX) {
+            remaining -= chunk.len();
+            let is_last_chunk = remaining == 0;
             self.conn
                 .with_tx(TxMode::Immediate, |tx| -> Result<(), StorageError> {
                     for &conversation_id in chunk {
                         sync_lexical_domain_for_conversation_in_tx(tx, conversation_id)
                             .map_err(anyhow_error_into_storage_error)?;
+                    }
+                    if is_last_chunk {
+                        // Same transaction as the last batch's commit: the
+                        // completed marker becomes visible atomically with
+                        // the data it describes, never ahead of it.
+                        let lex_docs_count: i64 =
+                            tx.query_row_map("SELECT COUNT(*) FROM lex_docs", &[], |row| row.get_typed(0))?;
+                        write_lex_domain_rebuild_marker_completed_in_tx(
+                            tx,
+                            total_conversations,
+                            usize::try_from(lex_docs_count.max(0)).unwrap_or(usize::MAX),
+                        )
+                        .map_err(anyhow_error_into_storage_error)?;
                     }
                     Ok(())
                 })
@@ -6985,6 +7107,11 @@ impl FrankenStorage {
                 progress.current.fetch_add(chunk.len(), Ordering::Relaxed);
             }
             conversations_processed += chunk.len();
+        }
+        if conversation_ids.is_empty() {
+            // No conversations at all: the loop above never ran, so mark
+            // completed directly instead of leaving the row at "building".
+            write_lex_domain_rebuild_marker_completed(&self.conn, 0, 0)?;
         }
 
         let lex_docs_count: i64 = self
@@ -17235,6 +17362,164 @@ mod tests {
              once at the end -- without this heartbeat the stall watchdog sees zero forward \
              progress for the entire multi-minute lex domain rebuild on a real corpus and kills \
              the process with exit(70) (X-2, w2-4-rebuild-run.md)"
+        );
+    }
+
+    fn insert_conversation_with_message(
+        storage: &SqliteStorage,
+        agent_id: i64,
+        external_id: &str,
+        content: &str,
+    ) {
+        storage
+            .insert_conversation_tree(
+                agent_id,
+                None,
+                &crate::model::types::Conversation {
+                    id: None,
+                    agent_slug: "claude_code".into(),
+                    workspace: None,
+                    external_id: Some(external_id.into()),
+                    title: Some(format!("title {external_id}")),
+                    source_path: std::path::PathBuf::from(format!("/tmp/{external_id}.jsonl")),
+                    started_at: Some(1_700_000_000_000),
+                    ended_at: None,
+                    approx_tokens: None,
+                    metadata_json: serde_json::Value::Null,
+                    messages: vec![crate::model::types::Message {
+                        id: None,
+                        idx: 0,
+                        role: crate::model::types::MessageRole::User,
+                        author: Some("user".into()),
+                        created_at: Some(1_700_000_000_000),
+                        content: content.into(),
+                        extra_json: serde_json::Value::Null,
+                        snippets: Vec::new(),
+                    }],
+                    source_id: LOCAL_SOURCE_ID.into(),
+                    origin_host: None,
+                },
+            )
+            .expect("insert_conversation_tree");
+    }
+
+    /// W2-6 Task A: a freshly-migrated (never-rebuilt) database has no
+    /// `LEX_DOMAIN_REBUILD_STATE_META_KEY` row at all. `lex_domain_matching_status`
+    /// (indexer/mod.rs) depends on this reading as `Absent`, not `Building` --
+    /// otherwise every ordinary incremental run (which never calls
+    /// `rebuild_lex_domain_from_db`) would misread a perfectly healthy,
+    /// dual-write-populated domain as needing a full rebuild forever.
+    #[test]
+    fn lex_domain_rebuild_marker_status_absent_on_fresh_db() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        assert_eq!(
+            lex_domain_rebuild_marker_status(storage.raw()).unwrap(),
+            LexDomainRebuildMarkerState::Absent
+        );
+    }
+
+    /// Domain incomplete -> triggers rebuild: `rebuild_lex_domain_from_db`
+    /// must leave the marker at `Completed { total_conversations, lex_docs_count }`
+    /// matching the real counts, atomically with the last batch's commit.
+    #[test]
+    fn rebuild_lex_domain_from_db_writes_completed_marker_matching_real_counts() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "claude_code".into(),
+                name: "Claude Code".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        for i in 0..3 {
+            insert_conversation_with_message(&storage, agent_id, &format!("marker-{i}"), "hello world");
+        }
+
+        // Sanity: fresh migration already dual-writes lex_docs inline, so
+        // clear it first to make the rebuild's own effect observable and
+        // isolate this test from that unrelated write path.
+        storage.raw().execute("DELETE FROM lex_docs", &[]).unwrap();
+        storage.raw().execute("DELETE FROM fts_lex", &[]).unwrap();
+
+        let stats = storage.rebuild_lex_domain_from_db(None).unwrap();
+        assert_eq!(stats.conversations_processed, 3);
+        assert_eq!(stats.lex_docs_count, 3);
+        assert_eq!(
+            lex_domain_rebuild_marker_status(storage.raw()).unwrap(),
+            LexDomainRebuildMarkerState::Completed {
+                total_conversations: 3,
+                lex_docs_count: 3,
+            }
+        );
+    }
+
+    /// 模拟中断态: a rebuild that never reaches the final chunk (marker stuck
+    /// at "building") must read as incomplete on the next routine run, not
+    /// as healthy -- proving there is no partial-progress resume (X-5): the
+    /// only two readable states are "definitely finished" and "redo it".
+    #[test]
+    fn interrupted_rebuild_marker_reads_as_building_not_completed() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "claude_code".into(),
+                name: "Claude Code".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        insert_conversation_with_message(&storage, agent_id, "interrupted-1", "hello world");
+
+        // Simulate a crash between `write_lex_domain_rebuild_marker_building`
+        // and the last chunk's commit: write "building" directly, as the
+        // real function does before its loop, without ever reaching the
+        // completed write.
+        write_lex_domain_rebuild_marker_building(storage.raw()).unwrap();
+
+        assert_eq!(
+            lex_domain_rebuild_marker_status(storage.raw()).unwrap(),
+            LexDomainRebuildMarkerState::Building
+        );
+
+        // A subsequent full rebuild (what indexer::mod.rs's region2 triggers
+        // on reading `Building`) must clear it back to `Completed`.
+        let stats = storage.rebuild_lex_domain_from_db(None).unwrap();
+        assert_eq!(
+            lex_domain_rebuild_marker_status(storage.raw()).unwrap(),
+            LexDomainRebuildMarkerState::Completed {
+                total_conversations: 1,
+                lex_docs_count: stats.lex_docs_count,
+            }
+        );
+    }
+
+    /// A malformed `completed:` value (only reachable by manual tampering,
+    /// never written by this codebase) must fail closed toward "rebuild it,"
+    /// never toward "trust it as healthy."
+    #[test]
+    fn malformed_completed_marker_reads_as_building_not_trusted() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        storage
+            .raw()
+            .execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                fparams![LEX_DOMAIN_REBUILD_STATE_META_KEY, "completed:not-a-number:also-not"],
+            )
+            .unwrap();
+        assert_eq!(
+            lex_domain_rebuild_marker_status(storage.raw()).unwrap(),
+            LexDomainRebuildMarkerState::Building
         );
     }
 
