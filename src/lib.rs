@@ -18786,8 +18786,8 @@ fn state_meta_json_inner(
 
     let index_path = crate::indexer::expected_index_dir(data_dir);
     // W2-6 Task1: reseated onto the lex_docs/fts_lex SQLite domain (db_path);
-    // index_path is still needed below for tantivy-era pipeline runtime/
-    // manifest lookups pending Task2.
+    // index_path is still needed below for the generation-manifest doc-count
+    // lookup (lexical_manifest_indexed_doc_count).
     let lexical_index_initialized = crate::search::lexical_index_health::searchable_index_exists(db_path);
     if last_indexed_at.is_none() && lexical_index_initialized {
         last_indexed_at = crate::search::lexical_index_health::searchable_index_modified_time(db_path)
@@ -18942,13 +18942,6 @@ fn state_meta_json_inner(
     } else {
         crate::indexer::lexical_rebuild_pipeline_settings_snapshot()
     };
-    let lexical_rebuild_pipeline_runtime = if lexical.rebuilding {
-        crate::indexer::load_active_lexical_rebuild_pipeline_runtime(&index_path, db_path)
-            .ok()
-            .flatten()
-    } else {
-        None
-    };
     let mut lexical_rebuild_pipeline_json =
         serde_json::to_value(&lexical_rebuild_pipeline).unwrap_or(serde_json::Value::Null);
     if let serde_json::Value::Object(ref mut pipeline) = lexical_rebuild_pipeline_json {
@@ -18972,67 +18965,16 @@ fn state_meta_json_inner(
                 .map(serde_json::Value::from)
                 .unwrap_or(serde_json::Value::Null),
         );
-        let runtime_value = lexical_rebuild_pipeline_runtime
-            .map(|runtime| {
-                let queue_capacity = lexical_rebuild_pipeline.pipeline_channel_size;
-                let inflight_message_bytes_limit = if runtime.max_message_bytes_in_flight > 0 {
-                    runtime.max_message_bytes_in_flight
-                } else {
-                    lexical_rebuild_pipeline.pipeline_max_message_bytes_in_flight.max(1)
-                };
-                serde_json::json!({
-                    "queue_depth": runtime.queue_depth,
-                    "queue_capacity": queue_capacity,
-                    "queue_headroom": queue_capacity.saturating_sub(runtime.queue_depth),
-                    "inflight_message_bytes": runtime.inflight_message_bytes,
-                    "max_message_bytes_in_flight": inflight_message_bytes_limit,
-                    "inflight_message_bytes_headroom": inflight_message_bytes_limit
-                        .saturating_sub(runtime.inflight_message_bytes),
-                    "pending_batch_conversations": runtime.pending_batch_conversations,
-                    "pending_batch_message_bytes": runtime.pending_batch_message_bytes,
-                    "page_prep_workers": runtime.page_prep_workers,
-                    "active_page_prep_jobs": runtime.active_page_prep_jobs,
-                    "ordered_buffered_pages": runtime.ordered_buffered_pages,
-                    "budget_generation": runtime.budget_generation,
-                    "producer_budget_wait_count": runtime.producer_budget_wait_count,
-                    "producer_budget_wait_ms": runtime.producer_budget_wait_ms,
-                    "producer_handoff_wait_count": runtime.producer_handoff_wait_count,
-                    "producer_handoff_wait_ms": runtime.producer_handoff_wait_ms,
-                    "host_loadavg_1m": runtime.host_loadavg_1m_milli.map(|value| f64::from(value) / 1000.0),
-                    "controller_mode": if runtime.controller_mode.is_empty() {
-                        serde_json::Value::Null
-                    } else {
-                        serde_json::json!(runtime.controller_mode)
-                    },
-                    "controller_reason": if runtime.controller_reason.is_empty() {
-                        serde_json::Value::Null
-                    } else {
-                        serde_json::json!(runtime.controller_reason)
-                    },
-                    "staged_merge_workers_max": runtime.staged_merge_workers_max,
-                    "staged_merge_allowed_jobs": runtime.staged_merge_allowed_jobs,
-                    "staged_merge_active_jobs": runtime.staged_merge_active_jobs,
-                    "staged_merge_ready_artifacts": runtime.staged_merge_ready_artifacts,
-                    "staged_merge_ready_groups": runtime.staged_merge_ready_groups,
-                    "staged_merge_controller_reason": if runtime.staged_merge_controller_reason.is_empty() {
-                        serde_json::Value::Null
-                    } else {
-                        serde_json::json!(runtime.staged_merge_controller_reason)
-                    },
-                    "staged_shard_build_workers_max": runtime.staged_shard_build_workers_max,
-                    "staged_shard_build_allowed_jobs": runtime.staged_shard_build_allowed_jobs,
-                    "staged_shard_build_active_jobs": runtime.staged_shard_build_active_jobs,
-                    "staged_shard_build_pending_jobs": runtime.staged_shard_build_pending_jobs,
-                    "staged_shard_build_controller_reason": if runtime.staged_shard_build_controller_reason.is_empty() {
-                        serde_json::Value::Null
-                    } else {
-                        serde_json::json!(runtime.staged_shard_build_controller_reason)
-                    },
-                    "updated_at": format_timestamp_millis_rfc3339(runtime.updated_at_ms),
-                })
-            })
-            .unwrap_or(serde_json::Value::Null);
-        pipeline.insert("runtime".to_string(), runtime_value);
+        // W2-6 Task B (reader②, control-plane 2026-08-30 ruling): the
+        // shard-build pipeline that used to populate this field's live
+        // telemetry is retired along with tantivy, and `state_meta_json_inner`
+        // is a cross-process disk-introspection call (backs `cass status`/
+        // `cass health`) with no way to read another process's in-memory
+        // `IndexingProgress` -- there is no live source left for this field,
+        // so it always reports null now (JSON shape kept for existing
+        // consumers, same "no DB-domain equivalent -> None" precedent as the
+        // W2-6 Task1 asset-state reseat).
+        pipeline.insert("runtime".to_string(), serde_json::Value::Null);
     }
     let semantic_policy = crate::search::policy::SemanticPolicy::resolve(
         &crate::search::policy::CliSemanticOverrides::default(),
@@ -22303,29 +22245,29 @@ impl SearchLexicalSelfHealDiagnosis {
         }
     }
 
-    fn existing_index(reason: impl Into<String>) -> Self {
-        Self {
-            reason: reason.into(),
-            checkpoint_refresh_allowed: false,
-            existing_index_search_allowed: true,
-        }
-    }
-
-    fn checkpoint(reason: impl Into<String>) -> Self {
-        Self {
-            reason: reason.into(),
-            checkpoint_refresh_allowed: true,
-            existing_index_search_allowed: false,
-        }
-    }
-
     fn permits_existing_index_during_active_rebuild(&self) -> bool {
         self.existing_index_search_allowed
     }
 }
 
+// W2-6 Task B (reader③, control-plane 2026-08-30 ruling): the
+// schema_hash/page_size/storage_fingerprint checkpoint-drift comparison this
+// function used to run below the quick-contract check is retired, not
+// reseated -- the desync class it protected against (sidecar tantivy index
+// silently out of sync with a DB that was copied/restored to an older
+// snapshot) is structurally eliminated by W2's single-file architecture:
+// lex_docs/fts_lex/the rebuild marker now all live inside the same .db file,
+// so replacing/restoring that file carries its own self-consistent index
+// along with it atomically -- there is no longer a second artifact that can
+// drift independently. Storing a fingerprint back into the marker (the
+// naive "reseat" option) would compare the DB's own fingerprint against
+// itself, a self-referential check that can never fail. Remaining failure
+// modes this used to help catch have their own owners: a stalled/incomplete
+// rebuild is caught by the marker + recovery path; corruption is caught by
+// this function's quick try-open probe (and the full-tier integrity-check on
+// 门①); dual-write bugs are caught by parity/judgment gates. None of those
+// is a fingerprint-comparison problem.
 fn search_lexical_self_heal_diagnosis(
-    index_path: &Path,
     db_path: &Path,
 ) -> CliResult<Option<SearchLexicalSelfHealDiagnosis>> {
     // W2-6 Task1: reseated onto the lex_docs/fts_lex SQLite domain (db_path).
@@ -22342,68 +22284,6 @@ fn search_lexical_self_heal_diagnosis(
         return Ok(Some(SearchLexicalSelfHealDiagnosis::rebuild(format!(
             "lexical artifact contract is unusable: {err:#}"
         ))));
-    }
-
-    let checkpoint =
-        crate::indexer::load_lexical_rebuild_checkpoint(index_path).map_err(|e| CliError {
-            code: 5,
-            kind: CliErrorKind::LexicalRebuild.kind_str(),
-            message: format!("failed to inspect lexical rebuild checkpoint: {e}"),
-            hint: Some(
-                "cass will rebuild the derived lexical index on the next search attempt"
-                    .to_string(),
-            ),
-            retryable: true,
-        })?;
-    let Some(checkpoint) = checkpoint else {
-        return Ok(Some(SearchLexicalSelfHealDiagnosis::existing_index(
-            "lexical rebuild checkpoint missing",
-        )));
-    };
-
-    if !stored_path_identity_matches(&checkpoint.db_path, db_path) {
-        return Ok(Some(SearchLexicalSelfHealDiagnosis::rebuild(format!(
-            "lexical checkpoint references {}, but active database is {}",
-            checkpoint.db_path,
-            db_path.display()
-        ))));
-    }
-    if !checkpoint.completed {
-        return Ok(Some(SearchLexicalSelfHealDiagnosis::checkpoint(
-            "lexical rebuild checkpoint is incomplete",
-        )));
-    }
-    if checkpoint.schema_hash != crate::indexer::LEXICAL_REBUILD_SCHEMA_HASH {
-        return Ok(Some(SearchLexicalSelfHealDiagnosis::checkpoint(
-            "lexical checkpoint schema no longer matches this cass binary",
-        )));
-    }
-    if !crate::indexer::lexical_rebuild_page_size_is_compatible(checkpoint.page_size) {
-        return Ok(Some(SearchLexicalSelfHealDiagnosis::checkpoint(
-            "lexical checkpoint page-size contract is incompatible with this cass binary",
-        )));
-    }
-    let current_storage_fingerprint =
-        crate::indexer::lexical_storage_fingerprint_for_db(db_path).map_err(|e| CliError {
-            code: 5,
-            kind: CliErrorKind::StorageFingerprint.kind_str(),
-            message: format!(
-                "failed to fingerprint cass database {} while validating lexical assets: {e}",
-                db_path.display()
-            ),
-            hint: Some(
-                "cass will rebuild the derived lexical index after the canonical database can be fingerprinted"
-                    .to_string(),
-            ),
-            retryable: true,
-        })?;
-    if !crate::search::asset_state::lexical_storage_fingerprints_match(
-        &current_storage_fingerprint,
-        &checkpoint.storage_fingerprint,
-    ) {
-        return Ok(Some(SearchLexicalSelfHealDiagnosis::existing_index(
-            "lexical checkpoint storage fingerprint no longer matches active database",
-        )));
     }
 
     Ok(None)
@@ -22462,11 +22342,12 @@ fn lexical_repair_error_is_active_index_run(rendered: &str) -> bool {
     rendered.contains("already holds")
 }
 
-/// #287: bounded degraded refusal for robot search callers. `kind` carries the
-/// stable machine-readable reason code (`checkpoint_incomplete` or
-/// `quarantine_circuit_breaker`) so an agent can branch on the structured
-/// error envelope instead of timing out against a silent multi-minute inline
-/// lexical rebuild.
+/// #287: bounded degraded refusal for robot search callers. `kind` carries a
+/// stable machine-readable reason code (currently only `quarantine_circuit_breaker`
+/// -- W2-6 Task B retired the `checkpoint_incomplete` caller along with the
+/// tantivy checkpoint file it diagnosed, see `search_lexical_self_heal_diagnosis`)
+/// so an agent can branch on the structured error envelope instead of timing
+/// out against a silent multi-minute inline lexical rebuild.
 fn search_robot_degraded_error(
     reason_code: &'static str,
     reason: &str,
@@ -22526,7 +22407,7 @@ fn ensure_lexical_assets_for_search(
     let initial_rebuild_active = probe_index_run_lock(data_dir, db_path).active;
     if initial_rebuild_active {
         if initial_index_exists {
-            let diagnosis = search_lexical_self_heal_diagnosis(index_path, db_path)?;
+            let diagnosis = search_lexical_self_heal_diagnosis(db_path)?;
             if diagnosis
                 .as_ref()
                 .is_none_or(|diagnosis| diagnosis.permits_existing_index_during_active_rebuild())
@@ -22549,7 +22430,7 @@ fn ensure_lexical_assets_for_search(
             return Err(search_lock_busy_error(data_dir));
         }
 
-        if search_lexical_self_heal_diagnosis(index_path, db_path)?.is_none() {
+        if search_lexical_self_heal_diagnosis(db_path)?.is_none() {
             return Ok(SearchLexicalSelfHeal {
                 action: "waited-for-active-rebuild",
                 reason: Some("foreground search waited for active lexical repair".to_string()),
@@ -22558,7 +22439,7 @@ fn ensure_lexical_assets_for_search(
         }
     }
 
-    let Some(diagnosis) = search_lexical_self_heal_diagnosis(index_path, db_path)? else {
+    let Some(diagnosis) = search_lexical_self_heal_diagnosis(db_path)? else {
         return Ok(SearchLexicalSelfHeal::skipped());
     };
     let reason = diagnosis.reason;
@@ -22636,7 +22517,7 @@ fn ensure_lexical_assets_for_search(
                 index_path,
                 search_active_rebuild_wait_duration(timeout_ms, started_at),
             );
-            if waited && search_lexical_self_heal_diagnosis(index_path, db_path)?.is_none() {
+            if waited && search_lexical_self_heal_diagnosis(db_path)?.is_none() {
                 return Ok(SearchLexicalSelfHeal {
                     action: "waited-for-concurrent-lexical-repair",
                     reason: Some(reason),

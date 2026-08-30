@@ -180,8 +180,7 @@ fn apply_default_tantivy_writer_thread_cap() {
         // Keep explicit operator tuning authoritative, otherwise use the same
         // memory-aware default as the search layer before frankensearch opens
         // any Tantivy writers.
-        let default_cap =
-            coding_agent_search::search::tantivy::default_tantivy_max_writer_threads();
+        let default_cap = coding_agent_search::indexer::default_tantivy_max_writer_threads();
         unsafe {
             std::env::set_var("CASS_TANTIVY_MAX_WRITER_THREADS", default_cap.to_string());
         }
