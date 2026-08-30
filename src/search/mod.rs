@@ -2,8 +2,7 @@
 //!
 //! This module provides the search infrastructure for cass, including:
 //!
-//! - **[`query`]**: Query parsing, execution, and caching for Tantivy-based full-text search.
-//! - **[`tantivy`]**: Tantivy index creation, schema management, and document indexing.
+//! - **[`query`]**: Query parsing, execution, and caching for FTS5-based full-text search.
 //! - **[`embedder`]**: Embedder trait for semantic search (hash and ML implementations).
 //! - **[`embedder_registry`]**: Embedder registry for model selection (bd-2mbe).
 //! - **[`hash_embedder`]**: FNV-1a feature hashing embedder (deterministic fallback).
@@ -70,7 +69,6 @@ pub(crate) mod semantic_readiness;
 pub(crate) mod source_provenance;
 pub(crate) mod storage_integrity;
 pub(crate) mod storage_salvage;
-pub mod tantivy;
 pub mod trust_correlation;
 pub mod trust_scoring;
 pub mod two_tier_search;
