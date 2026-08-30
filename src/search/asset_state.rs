@@ -17,11 +17,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use fs2::FileExt;
 
-use crate::indexer::{
-    LEXICAL_REBUILD_PAGE_SIZE_PUBLIC, LexicalRebuildCheckpoint,
-    lexical_rebuild_page_size_is_compatible, lexical_storage_fingerprint_for_db,
-    load_lexical_rebuild_checkpoint,
-};
+use crate::indexer::lexical_storage_fingerprint_for_db;
+#[cfg(test)]
+use crate::indexer::{LEXICAL_REBUILD_PAGE_SIZE_PUBLIC, LexicalRebuildCheckpoint};
 use crate::search::ann_index::hnsw_index_path;
 use crate::search::embedder::Embedder;
 use crate::search::fastembed_embedder::FastEmbedder;
@@ -652,7 +650,6 @@ pub(crate) fn inspect_search_assets(
     } = input;
 
     let lexical = inspect_lexical_assets(InspectLexicalAssetsInput {
-        data_dir,
         db_path,
         stale_threshold,
         last_indexed_at_ms,
@@ -1244,7 +1241,6 @@ fn semantic_checkpoint_progress_state(
 }
 
 struct InspectLexicalAssetsInput<'a> {
-    data_dir: &'a Path,
     db_path: &'a Path,
     stale_threshold: u64,
     last_indexed_at_ms: Option<i64>,
@@ -1260,7 +1256,6 @@ struct InspectLexicalAssetsInput<'a> {
 
 fn inspect_lexical_assets(input: InspectLexicalAssetsInput<'_>) -> Result<LexicalAssetState> {
     let InspectLexicalAssetsInput {
-        data_dir,
         db_path,
         stale_threshold,
         last_indexed_at_ms,
@@ -1269,9 +1264,32 @@ fn inspect_lexical_assets(input: InspectLexicalAssetsInput<'_>) -> Result<Lexica
         db_available,
         compute_lexical_fingerprint,
     } = input;
-    let index_path = crate::indexer::expected_index_dir(data_dir);
-    let checkpoint = load_lexical_rebuild_checkpoint(&index_path)
-        .with_context(|| format!("loading lexical checkpoint from {}", index_path.display()))?;
+    // W2-6 Task B 续二 (control-plane 2026-08-30 ruling, ③ "reseat the
+    // reader, not the writer"): the retired tantivy checkpoint file
+    // (.lexical-rebuild-state.json) is no longer read here. This asset-state
+    // surface is a real, unconditional consumer (`cass status`-style JSON) --
+    // reseated onto Task A's `lex_domain_rebuild_state` DB meta marker
+    // (storage::sqlite::lex_domain_rebuild_marker_status), the single source
+    // of truth for "did the last full lex_domain rebuild finish". The old
+    // version/schema-hash/page-size/fingerprint matching that used to gate
+    // `contract_mismatch` is delta w2-d4 dead code (no DB-domain equivalent);
+    // replaced with a live `validate_searchable_index_contract_quick` probe.
+    let marker = if db_available {
+        let conn = crate::storage::api::Conn::open_read(db_path).with_context(|| {
+            format!(
+                "opening {} to read lex domain rebuild marker",
+                db_path.display()
+            )
+        })?;
+        crate::storage::sqlite::lex_domain_rebuild_marker_status(&conn).with_context(|| {
+            format!(
+                "reading lex domain rebuild marker from {}",
+                db_path.display()
+            )
+        })?
+    } else {
+        crate::storage::sqlite::LexDomainRebuildMarkerState::Absent
+    };
     let current_db_fingerprint = if db_available && compute_lexical_fingerprint {
         Some(
             lexical_storage_fingerprint_for_db(db_path).with_context(|| {
@@ -1286,63 +1304,70 @@ fn inspect_lexical_assets(input: InspectLexicalAssetsInput<'_>) -> Result<Lexica
     };
 
     Ok(lexical_state_from_observations(LexicalObservationInput {
-        index_path: &index_path,
         db_path,
         stale_threshold,
         last_indexed_at_ms,
         now_ms,
         maintenance,
-        checkpoint: checkpoint.as_ref(),
+        marker,
         current_db_fingerprint: current_db_fingerprint.as_deref(),
     }))
 }
 
 struct LexicalObservationInput<'a> {
-    index_path: &'a Path,
     db_path: &'a Path,
     stale_threshold: u64,
     last_indexed_at_ms: Option<i64>,
     /// Full-precision wall clock (F4); see [`InspectSearchAssetsInput::now_ms`].
     now_ms: i64,
     maintenance: SearchMaintenanceSnapshot,
-    checkpoint: Option<&'a LexicalRebuildCheckpoint>,
+    marker: crate::storage::sqlite::LexDomainRebuildMarkerState,
     current_db_fingerprint: Option<&'a str>,
 }
 
 fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> LexicalAssetState {
     let LexicalObservationInput {
-        // W2-6 Task1: no longer read here -- the `exists` check below is
-        // reseated onto `db_path`. Kept in the struct/call site pending
-        // Task2's tantivy retirement (which removes the field entirely).
-        index_path: _index_path,
         db_path,
         stale_threshold,
         last_indexed_at_ms,
         now_ms,
         maintenance,
-        checkpoint,
+        marker,
         current_db_fingerprint,
     } = input;
     // W2-6 Task1: reseated onto the lex_docs/fts_lex SQLite domain (db_path),
-    // not the retired tantivy index directory (index_path) -- see
-    // search::lexical_index_health module docs.
+    // not the retired tantivy index directory -- see search::lexical_index_health
+    // module docs.
     let exists = crate::search::lexical_index_health::searchable_index_exists(db_path);
-    let checkpoint_db_matches =
-        checkpoint.map(|state| crate::stored_path_identity_matches(&state.db_path, db_path));
-    let schema_matches = checkpoint
-        .map(|state| state.schema_hash == crate::indexer::LEXICAL_REBUILD_SCHEMA_HASH);
-    let page_size_matches =
-        checkpoint.map(|state| state.page_size == LEXICAL_REBUILD_PAGE_SIZE_PUBLIC);
-    let page_size_compatible =
-        checkpoint.map(|state| lexical_rebuild_page_size_is_compatible(state.page_size));
-    let checkpoint_fingerprint = checkpoint.map(|state| state.storage_fingerprint.as_str());
-    let fingerprint_matches = match (current_db_fingerprint, checkpoint_fingerprint) {
-        (Some(current), Some(saved)) => Some(lexical_storage_fingerprints_match(current, saved)),
-        _ => None,
+    use crate::storage::sqlite::LexDomainRebuildMarkerState;
+    let checkpoint_present = !matches!(marker, LexDomainRebuildMarkerState::Absent);
+    let checkpoint_completed = match marker {
+        LexDomainRebuildMarkerState::Absent => None,
+        LexDomainRebuildMarkerState::Building => Some(false),
+        LexDomainRebuildMarkerState::Completed { .. } => Some(true),
     };
-    let checkpoint_incomplete = checkpoint.is_some_and(|state| !state.completed);
+    // W2-6 Task B 续二 (delta w2-d4): the retired checkpoint file's
+    // db-path/schema-hash/page-size matching has no DB-domain equivalent --
+    // the lex domain marker lives in the same database it describes, so
+    // "points at a different database" is now structurally impossible, and
+    // schema/page-size are DB migration concerns, not per-checkpoint ones.
+    let checkpoint_db_matches: Option<bool> = None;
+    let schema_matches: Option<bool> = None;
+    let page_size_matches: Option<bool> = None;
+    let page_size_compatible: Option<bool> = None;
+    // The marker carries no content fingerprint (w2-d4 retired that
+    // matching too); `current_db_fingerprint` is still a live, independent
+    // computation over current DB content, so it survives on its own.
+    let checkpoint_fingerprint: Option<String> = None;
+    let fingerprint_matches: Option<bool> = None;
+    let checkpoint_incomplete = checkpoint_completed == Some(false);
     let checkpoint_db_mismatch = checkpoint_db_matches == Some(false);
-    let contract_mismatch = schema_matches == Some(false) || page_size_compatible == Some(false);
+    // Reseated onto Task1's DB-domain contract probe (same cost class as the
+    // retired tantivy schema/page-size check it replaces) instead of the
+    // dead checkpoint-file matching above.
+    let contract_mismatch =
+        crate::search::lexical_index_health::validate_searchable_index_contract_quick(db_path)
+            .is_err();
     let fingerprint_mismatch = fingerprint_matches == Some(false);
     // F4 (cass tech debt): derive the (legacy) second-resolution clock
     // from `now_ms` rather than the other way around so the comparison
@@ -1370,7 +1395,6 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
         && maintenance
             .mode
             .is_some_and(SearchMaintenanceMode::rebuild_active);
-    let active_rebuild_progress = rebuilding;
     // Forward-progress liveness check (issue #258): when a rebuild is
     // active but the indexing thread has not posted progress within
     // `CASS_REBUILD_STALL_DETECT_SECS` (default 120 s), report
@@ -1440,35 +1464,25 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
     } else {
         None
     };
-    let checkpoint_progress_usable = checkpoint.is_some()
-        && checkpoint_db_matches == Some(true)
-        && schema_matches == Some(true)
-        && page_size_compatible == Some(true)
-        && if active_rebuild_progress {
-            true
-        } else {
-            current_db_fingerprint.is_some() && fingerprint_matches == Some(true)
-        };
-    let pending_sessions = checkpoint
-        .filter(|_| checkpoint_progress_usable)
-        .map(|state| {
-            state
-                .total_conversations
-                .saturating_sub(state.processed_conversations) as u64
-        })
-        .unwrap_or(0);
+    // The marker only ever carries totals for the `Completed` variant (no
+    // partial-progress tracking, per its own doc -- a crash mid-rebuild
+    // leaves it at `Building` with no counts, and the next run reruns from
+    // zero). `pending_sessions`/activity-from-checkpoint have no signal
+    // outside that variant; active-rebuild progress is already covered by
+    // `maintenance`-derived fields (`rebuilding`/`stalled`/
+    // `last_progress_age_ms`), not by this marker.
+    let (marker_total_conversations, marker_lex_docs_count) = match marker {
+        LexDomainRebuildMarkerState::Completed {
+            total_conversations,
+            lex_docs_count,
+        } => (Some(total_conversations as u64), Some(lex_docs_count as u64)),
+        _ => (None, None),
+    };
+    let pending_sessions = 0u64;
     let maintenance_activity_at_ms = maintenance_targets_current_db
         .then_some(())
         .and(maintenance.updated_at_ms.or(maintenance.started_at_ms));
-    let checkpoint_activity_at_ms = checkpoint
-        .filter(|_| checkpoint_progress_usable)
-        .and_then(|state| (state.updated_at_ms > 0).then_some(state.updated_at_ms));
-    let activity_at_ms = match (checkpoint_activity_at_ms, maintenance_activity_at_ms) {
-        (Some(checkpoint_ts), Some(maintenance_ts)) => Some(checkpoint_ts.max(maintenance_ts)),
-        (Some(checkpoint_ts), None) => Some(checkpoint_ts),
-        (None, Some(maintenance_ts)) => Some(maintenance_ts),
-        (None, None) => None,
-    };
+    let activity_at_ms = maintenance_activity_at_ms;
 
     LexicalAssetState {
         status,
@@ -1485,24 +1499,22 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
         stale_threshold_seconds: stale_threshold,
         activity_at_ms,
         pending_sessions,
-        processed_conversations: checkpoint
-            .filter(|_| checkpoint_progress_usable)
-            .map(|state| state.processed_conversations as u64),
-        total_conversations: checkpoint
-            .filter(|_| checkpoint_progress_usable)
-            .map(|state| state.total_conversations as u64),
-        indexed_docs: checkpoint
-            .filter(|_| checkpoint_progress_usable)
-            .map(|state| state.indexed_docs as u64),
+        // The marker's `Completed` variant never tracked a distinct
+        // "processed" count separate from its final total (no
+        // partial-progress resume, per its own doc) -- there is nothing
+        // honest to report here beyond the final totals below.
+        processed_conversations: None,
+        total_conversations: marker_total_conversations,
+        indexed_docs: marker_lex_docs_count,
         status_reason,
         fingerprint: LexicalFingerprintState {
             current_db_fingerprint: current_db_fingerprint.map(ToOwned::to_owned),
-            checkpoint_fingerprint: checkpoint.map(|state| state.storage_fingerprint.clone()),
+            checkpoint_fingerprint,
             matches_current_db_fingerprint: fingerprint_matches,
         },
         checkpoint: LexicalCheckpointState {
-            present: checkpoint.is_some(),
-            completed: checkpoint.map(|state| state.completed),
+            present: checkpoint_present,
+            completed: checkpoint_completed,
             db_matches: checkpoint_db_matches,
             schema_matches,
             page_size_matches,
