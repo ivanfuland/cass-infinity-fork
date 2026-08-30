@@ -9210,45 +9210,22 @@ fn can_skip_absent_explicit_watch_once_index_run(opts: &IndexOptions) -> bool {
         return false;
     }
 
-    let index_path = crate::search::tantivy::expected_index_dir(&opts.data_dir);
-    let schema_hash_path = index_path.join("schema_hash.json");
-    let schema_matches = schema_hash_path.exists()
-        && std::fs::read_to_string(&schema_hash_path)
-            .ok()
-            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
-            .and_then(|json| {
-                json.get("schema_hash")
-                    .and_then(|value| value.as_str())
-                    .map(schema_hash_matches)
-            })
-            .unwrap_or(false);
-    if !schema_matches {
-        return false;
-    }
-
+    // W2-6 Task B2: reseated onto the lex_docs/fts_lex SQLite domain -- see
+    // the run_index preflight block's comment for why the old
+    // schema_hash.json check is dropped rather than reseated (no DB-domain
+    // equivalent; the file is never written anymore so keeping the check
+    // would silently pin this to `false` forever).
     matches!(
-        crate::search::tantivy::searchable_index_summary(&index_path),
+        crate::search::lexical_index_health::searchable_index_summary(&opts.db_path),
         Ok(Some(_))
     )
 }
 
-fn current_searchable_index_summary_available(index_path: &Path) -> bool {
-    let schema_hash_path = index_path.join("schema_hash.json");
-    let schema_matches = schema_hash_path.exists()
-        && std::fs::read_to_string(&schema_hash_path)
-            .ok()
-            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
-            .and_then(|json| {
-                json.get("schema_hash")
-                    .and_then(|value| value.as_str())
-                    .map(schema_hash_matches)
-            })
-            .unwrap_or(false);
-    schema_matches
-        && matches!(
-            crate::search::tantivy::searchable_index_summary(index_path),
-            Ok(Some(_))
-        )
+fn current_searchable_index_summary_available(db_path: &Path) -> bool {
+    matches!(
+        crate::search::lexical_index_health::searchable_index_summary(db_path),
+        Ok(Some(_))
+    )
 }
 
 fn should_skip_unchanged_explicit_watch_once_paths(
@@ -9285,7 +9262,6 @@ fn should_skip_unchanged_explicit_watch_once_paths(
 fn can_skip_unchanged_explicit_watch_once_index_run(
     opts: &IndexOptions,
     storage: &FrankenStorage,
-    index_path: &Path,
 ) -> Result<bool> {
     if opts.watch || opts.full || opts.force_rebuild || opts.semantic || opts.build_hnsw {
         return Ok(false);
@@ -9304,7 +9280,7 @@ fn can_skip_unchanged_explicit_watch_once_index_run(
         return Ok(false);
     }
 
-    Ok(current_searchable_index_summary_available(index_path))
+    Ok(current_searchable_index_summary_available(&opts.db_path))
 }
 
 fn should_skip_broad_scan_after_watch_once_authoritative_repair(
@@ -13648,7 +13624,7 @@ pub fn run_index(
         ));
     }
 
-    if can_skip_unchanged_explicit_watch_once_index_run(&opts, &storage, &index_path)? {
+    if can_skip_unchanged_explicit_watch_once_index_run(&opts, &storage)? {
         let now_ms = FrankenStorage::now_millis();
         persist_final_index_run_metadata(&storage, &opts.db_path, false, now_ms, now_ms)?;
         record_lexical_population_strategy_if_unset(
@@ -13877,38 +13853,30 @@ pub fn run_index(
     let mut observed_tantivy_docs = None;
     preflight_phase!("watch_startup:tantivy_reader_preflight");
     if should_preflight_existing_tantivy_reader(resume_lexical_rebuild, opts.full) {
-        // Detect if we are rebuilding due to missing meta/schema mismatch/index corruption.
-        // IMPORTANT: This must stay aligned with TantivyIndex::open_or_create() rebuild triggers.
-        let schema_hash_path = index_path.join("schema_hash.json");
-        let schema_matches = schema_hash_path.exists()
-            && std::fs::read_to_string(&schema_hash_path)
-                .ok()
-                .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
-                .and_then(|json| {
-                    json.get("schema_hash")
-                        .and_then(|v| v.as_str())
-                        .map(schema_hash_matches)
-                })
-                .unwrap_or(false);
-
-        // Treat missing schema hash as rebuild (open_or_create will wipe/recreate).
+        // W2-6 Task B2: reseated onto the lex_docs/fts_lex SQLite domain
+        // (search::lexical_index_health) -- the old tantivy schema_hash.json
+        // file check has no DB-domain equivalent (schema currency is already
+        // the DB's own migration state, not a sidecar file) and is dropped
+        // rather than reseated, not left in place: `schema_hash.json` is
+        // never written by anything anymore, so keeping that check would
+        // silently force `tantivy_requires_rebuild = true` on every run
+        // forever instead of failing loudly.
         tantivy_requires_rebuild = opts.force_rebuild
-            || !crate::search::tantivy::searchable_index_exists(&index_path)
-            || !schema_matches;
+            || !crate::search::lexical_index_health::searchable_index_exists(&opts.db_path);
 
-        // Preflight open: if the cass-compatible Tantivy reader can't open, force a
-        // rebuild so we do a full scan and reindex messages into the new index
-        // (SQLite is incremental-only by default).
+        // Preflight probe: if the lex_docs/fts_lex domain fails its quick
+        // health check, force a rebuild so we do a full scan and reindex
+        // messages (SQLite is incremental-only by default).
         if !tantivy_requires_rebuild {
-            match crate::search::tantivy::searchable_index_summary(&index_path) {
+            match crate::search::lexical_index_health::searchable_index_summary(&opts.db_path) {
                 Ok(Some(summary)) => {
-                    if let Err(e) =
-                        crate::search::tantivy::validate_searchable_index_contract(&index_path)
-                    {
+                    if let Err(e) = crate::search::lexical_index_health::validate_searchable_index_contract_quick(
+                        &opts.db_path,
+                    ) {
                         tracing::warn!(
                             error = %e,
-                            path = %index_path.display(),
-                            "tantivy contract preflight failed; forcing rebuild"
+                            path = %opts.db_path.display(),
+                            "lexical index contract preflight failed; forcing rebuild"
                         );
                         tantivy_requires_rebuild = true;
                     } else {
@@ -13921,8 +13889,8 @@ pub fn run_index(
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
-                        path = %index_path.display(),
-                        "tantivy open preflight failed; forcing rebuild"
+                        path = %opts.db_path.display(),
+                        "lexical index summary preflight failed; forcing rebuild"
                     );
                     tantivy_requires_rebuild = true;
                 }
@@ -45168,7 +45136,7 @@ mod tests {
 
         let startup_skip = {
             let guard = storage.lock().unwrap();
-            can_skip_unchanged_explicit_watch_once_index_run(&opts, &guard, &index_path).unwrap()
+            can_skip_unchanged_explicit_watch_once_index_run(&opts, &guard).unwrap()
         };
         assert!(
             startup_skip,
