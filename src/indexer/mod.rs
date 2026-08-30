@@ -3868,16 +3868,16 @@ fn lexical_rebuild_packet_provenance_from_canonical(
         (fallback_kind, None, fallback_mode)
     };
 
-    let origin_host = crate::search::tantivy::normalized_index_origin_host(
+    let origin_host = crate::search::index_provenance::normalized_index_origin_host(
         conv.origin_host.as_deref().or(host_label.as_deref()),
     );
-    let source_id = crate::search::tantivy::normalized_index_source_id(
+    let source_id = crate::search::index_provenance::normalized_index_source_id(
         Some(&conv.source_id),
         Some(kind.as_str()),
         origin_host.as_deref(),
     );
     let origin_kind =
-        crate::search::tantivy::normalized_index_origin_kind(&source_id, Some(kind.as_str()));
+        crate::search::index_provenance::normalized_index_origin_kind(&source_id, Some(kind.as_str()));
 
     (
         LexicalRebuildPacketProvenance {
@@ -3906,18 +3906,18 @@ fn lexical_rebuild_packet_provenance_from_metadata(
     let raw_origin_kind = cass_origin
         .and_then(|origin| origin.get("kind"))
         .and_then(|value| value.as_str());
-    let origin_host = crate::search::tantivy::normalized_index_origin_host(
+    let origin_host = crate::search::index_provenance::normalized_index_origin_host(
         cass_origin
             .and_then(|origin| origin.get("host"))
             .and_then(|value| value.as_str()),
     );
-    let source_id = crate::search::tantivy::normalized_index_source_id(
+    let source_id = crate::search::index_provenance::normalized_index_source_id(
         raw_source_id,
         raw_origin_kind,
         origin_host.as_deref(),
     );
     let origin_kind =
-        crate::search::tantivy::normalized_index_origin_kind(&source_id, raw_origin_kind);
+        crate::search::index_provenance::normalized_index_origin_kind(&source_id, raw_origin_kind);
 
     let mode = if raw_source_id
         .map(str::trim)
@@ -26764,12 +26764,12 @@ pub mod persist {
         let raw_origin_kind = cass_origin
             .and_then(|o| o.get("kind"))
             .and_then(|v| v.as_str());
-        let origin_host = crate::search::tantivy::normalized_index_origin_host(
+        let origin_host = crate::search::index_provenance::normalized_index_origin_host(
             cass_origin
                 .and_then(|o| o.get("host"))
                 .and_then(|v| v.as_str()),
         );
-        let source_id = crate::search::tantivy::normalized_index_source_id(
+        let source_id = crate::search::index_provenance::normalized_index_source_id(
             raw_source_id,
             raw_origin_kind,
             origin_host.as_deref(),
@@ -27637,7 +27637,7 @@ pub mod persist {
                 Some("tool")
             );
 
-            let expected_source_id = crate::search::tantivy::normalized_index_source_id(
+            let expected_source_id = crate::search::index_provenance::normalized_index_source_id(
                 Some("replayed-remote"),
                 None,
                 Some("replayed-host"),

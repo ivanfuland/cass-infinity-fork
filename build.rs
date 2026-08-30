@@ -156,7 +156,10 @@ const CONTRACTS: &[DependencyContract] = &[
         // binary that crashes pre-AVX2 CPUs. The contract therefore only
         // pins the always-on features here; the conditional one is
         // validated by Cargo's own feature graph.
-        expected_features: &["ann", "hash", "lexical"],
+        // W2-6 Task2: "lexical" dropped with the tantivy-backed engine it
+        // pulled in (search::tantivy). Contract must move in lockstep with
+        // Cargo.toml's feature list -- see the comment there.
+        expected_features: &["ann", "hash"],
         expected_default_features: Some(false),
         repo_rel: "../frankensearch",
         manifest_rel: "frankensearch/Cargo.toml",

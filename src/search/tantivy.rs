@@ -12,6 +12,9 @@ use crate::model::conversation_packet::{
     ConversationPacket, ConversationPacketMessage, ConversationPacketProvenance,
 };
 use crate::search::canonicalize::is_hard_message_noise;
+use crate::search::index_provenance::{
+    normalized_index_origin_host, normalized_index_origin_kind, normalized_index_source_id,
+};
 use crate::sources::provenance::LOCAL_SOURCE_ID;
 use anyhow::{Context, Error, Result};
 use frankensearch::lexical::{
@@ -26,57 +29,9 @@ use frankensearch::lexical::{
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 
-pub(crate) fn normalized_index_source_id(
-    source_id: Option<&str>,
-    origin_kind: Option<&str>,
-    origin_host: Option<&str>,
-) -> String {
-    let trimmed_source_id = source_id.unwrap_or_default().trim();
-    if !trimmed_source_id.is_empty() {
-        if trimmed_source_id.eq_ignore_ascii_case(LOCAL_SOURCE_ID) {
-            return LOCAL_SOURCE_ID.to_string();
-        }
-        return trimmed_source_id.to_string();
-    }
-
-    let trimmed_origin_host = origin_host.map(str::trim).filter(|value| !value.is_empty());
-    let trimmed_origin_kind = origin_kind.unwrap_or_default().trim();
-    if trimmed_origin_kind.eq_ignore_ascii_case("ssh")
-        || trimmed_origin_kind.eq_ignore_ascii_case("remote")
-    {
-        return trimmed_origin_host.unwrap_or("remote").to_string();
-    }
-    if let Some(origin_host) = trimmed_origin_host {
-        return origin_host.to_string();
-    }
-
-    LOCAL_SOURCE_ID.to_string()
-}
-
-pub(crate) fn normalized_index_origin_kind(source_id: &str, origin_kind: Option<&str>) -> String {
-    if let Some(kind) = origin_kind.map(str::trim).filter(|value| !value.is_empty()) {
-        if kind.eq_ignore_ascii_case("local") {
-            return LOCAL_SOURCE_ID.to_string();
-        }
-        if kind.eq_ignore_ascii_case("ssh") || kind.eq_ignore_ascii_case("remote") {
-            return "remote".to_string();
-        }
-        return kind.to_ascii_lowercase();
-    }
-
-    if source_id == LOCAL_SOURCE_ID {
-        LOCAL_SOURCE_ID.to_string()
-    } else {
-        "remote".to_string()
-    }
-}
-
-pub(crate) fn normalized_index_origin_host(origin_host: Option<&str>) -> Option<String> {
-    origin_host
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-}
+// W2-6 Task2 (R2-X1): normalized_index_source_id/origin_kind/origin_host
+// moved to search::index_provenance (shared with indexer::semantic, no
+// tantivy-crate dependency) -- imported below.
 
 pub const SCHEMA_HASH: &str = CASS_SCHEMA_HASH;
 const ENV_TANTIVY_ADD_BATCH_MAX_CHARS: &str = "CASS_TANTIVY_ADD_BATCH_MAX_CHARS";
@@ -2229,13 +2184,6 @@ mod tests {
         reader.reload().expect("reload");
         let searcher = reader.searcher();
         assert_eq!(searcher.num_docs(), expected_docs as u64);
-    }
-
-    #[test]
-    fn normalized_index_source_id_infers_remote_from_origin_host_without_kind() {
-        let source_id = normalized_index_source_id(Some("   "), None, Some("dev@laptop"));
-        assert_eq!(source_id, "dev@laptop");
-        assert_eq!(normalized_index_origin_kind(&source_id, None), "remote");
     }
 
     #[test]

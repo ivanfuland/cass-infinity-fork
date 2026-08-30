@@ -33,7 +33,7 @@ use crate::search::semantic_manifest::{
     ArtifactRecord, BuildCheckpoint, SemanticManifest, SemanticShardManifest, SemanticShardRecord,
     TierKind,
 };
-use crate::search::tantivy::{
+use crate::search::index_provenance::{
     normalized_index_origin_host, normalized_index_origin_kind, normalized_index_source_id,
 };
 use crate::search::vector_index::{

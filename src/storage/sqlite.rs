@@ -7966,13 +7966,13 @@ impl FrankenStorage {
             raw_origin_host,
         ) in conv_rows
         {
-            let source_id = crate::search::tantivy::normalized_index_source_id(
+            let source_id = crate::search::index_provenance::normalized_index_source_id(
                 raw_source_id.as_deref(),
                 None,
                 raw_origin_host.as_deref(),
             );
             let origin_host =
-                crate::search::tantivy::normalized_index_origin_host(raw_origin_host.as_deref());
+                crate::search::index_provenance::normalized_index_origin_host(raw_origin_host.as_deref());
 
             let messages: Vec<Message> = source_conn
                 .query_all_map(msg_sql, fparams![conversation_row_id], |msg_row| {
@@ -10584,8 +10584,8 @@ pub(crate) fn normalized_storage_source_parts(
     origin_kind: Option<&str>,
     origin_host: Option<&str>,
 ) -> (String, SourceKind, Option<String>) {
-    let host_label = crate::search::tantivy::normalized_index_origin_host(origin_host);
-    let source_id = crate::search::tantivy::normalized_index_source_id(
+    let host_label = crate::search::index_provenance::normalized_index_origin_host(origin_host);
+    let source_id = crate::search::index_provenance::normalized_index_source_id(
         source_id,
         origin_kind,
         host_label.as_deref(),
