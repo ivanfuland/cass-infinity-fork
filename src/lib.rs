@@ -18784,7 +18784,7 @@ fn state_meta_json_inner(
     let counts_skipped = db_snapshot.counts_skipped;
     let open_skipped = db_snapshot.open_skipped;
 
-    let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+    let index_path = crate::indexer::expected_index_dir(data_dir);
     // W2-6 Task1: reseated onto the lex_docs/fts_lex SQLite domain (db_path);
     // index_path is still needed below for tantivy-era pipeline runtime/
     // manifest lookups pending Task2.
@@ -20173,7 +20173,7 @@ fn prepare_headless_once_tui_artifacts(
             })?;
     }
 
-    let _index_path = crate::search::tantivy::index_dir(data_dir).map_err(|e| {
+    let _index_path = crate::indexer::index_dir(data_dir).map_err(|e| {
         anyhow::anyhow!(
             "initialize index directory for headless --once at {}: {e}",
             data_dir.display()
@@ -22373,7 +22373,7 @@ fn search_lexical_self_heal_diagnosis(
             "lexical rebuild checkpoint is incomplete",
         )));
     }
-    if checkpoint.schema_hash != crate::search::tantivy::SCHEMA_HASH {
+    if checkpoint.schema_hash != crate::indexer::LEXICAL_REBUILD_SCHEMA_HASH {
         return Ok(Some(SearchLexicalSelfHealDiagnosis::checkpoint(
             "lexical checkpoint schema no longer matches this cass binary",
         )));
@@ -22562,29 +22562,6 @@ fn ensure_lexical_assets_for_search(
         return Ok(SearchLexicalSelfHeal::skipped());
     };
     let reason = diagnosis.reason;
-
-    if initial_index_exists && diagnosis.checkpoint_refresh_allowed {
-        match crate::indexer::refresh_completed_lexical_rebuild_checkpoint_from_live_index(
-            db_path, data_dir,
-        ) {
-            Ok(()) => {
-                if search_lexical_self_heal_diagnosis(index_path, db_path)?.is_none() {
-                    return Ok(SearchLexicalSelfHeal {
-                        action: "refreshed-checkpoint",
-                        reason: Some(reason),
-                        indexed_docs: None,
-                    });
-                }
-            }
-            Err(err) => {
-                tracing::debug!(
-                    error = %err,
-                    reason = %reason,
-                    "live lexical checkpoint refresh did not repair search assets; falling back to canonical rebuild"
-                );
-            }
-        }
-    }
 
     if initial_index_exists && diagnosis.existing_index_search_allowed {
         tracing::warn!(
@@ -23647,7 +23624,7 @@ fn run_cli_search(
     let start_time = Instant::now();
 
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
-    let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
+    let index_path = crate::indexer::expected_index_dir(&data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     let db_exists = db_path.exists();
 
@@ -24819,7 +24796,7 @@ fn run_cli_pack(
     limits.validate().map_err(pack_invalid_limit_error)?;
 
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
-    let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
+    let index_path = crate::indexer::expected_index_dir(&data_dir);
     let db_path = db_override
         .clone()
         .unwrap_or_else(|| data_dir.join("agent_search.db"));
@@ -28751,7 +28728,7 @@ fn run_diag(
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     // Use the actual versioned lexical index path without creating it during diagnostics.
-    let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
+    let index_path = crate::indexer::expected_index_dir(&data_dir);
 
     // Check database existence and get stats
     let (db_exists, db_size, conversation_count, message_count) = if db_path.exists() {
@@ -40857,7 +40834,7 @@ fn collect_doctor_raw_mirror_backfill_report(
                     operation_id: "doctor-raw-mirror-backfill",
                     data_dir,
                     db_path,
-                    index_path: &crate::search::tantivy::expected_index_dir(data_dir),
+                    index_path: &crate::indexer::expected_index_dir(data_dir),
                     plan: None,
                     quarantine_report: None,
                     extra_file_artifacts: &[],
@@ -44212,7 +44189,7 @@ fn doctor_restore_plan_payload(
 ) -> (serde_json::Value, String) {
     let live_inventory = doctor_candidate_live_inventory(
         db_path,
-        &crate::search::tantivy::expected_index_dir(data_dir),
+        &crate::indexer::expected_index_dir(data_dir),
     );
     let fingerprint_inputs =
         doctor_restore_fingerprint_inputs(backup_id, verification, &live_inventory);
@@ -44364,7 +44341,7 @@ fn run_doctor_backup_restore_rehearsal(
     let started_at_ms = doctor_now_ms();
     let live_inventory_before = doctor_candidate_live_inventory(
         db_path,
-        &crate::search::tantivy::expected_index_dir(data_dir),
+        &crate::indexer::expected_index_dir(data_dir),
     );
     let rehearsal_id = format!("{}-{backup_id}", started_at_ms);
     let rehearsal_dir = data_dir
@@ -44395,7 +44372,7 @@ fn run_doctor_backup_restore_rehearsal(
     }
     let live_inventory_after = doctor_candidate_live_inventory(
         db_path,
-        &crate::search::tantivy::expected_index_dir(data_dir),
+        &crate::indexer::expected_index_dir(data_dir),
     );
     let live_untouched = serde_json::to_value(&live_inventory_before).unwrap_or_default()
         == serde_json::to_value(&live_inventory_after).unwrap_or_default();
@@ -44537,7 +44514,7 @@ fn run_doctor_backup_restore_apply(
     requested_plan_fingerprint: &str,
     expected_plan_fingerprint: &str,
 ) -> serde_json::Value {
-    let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+    let index_path = crate::indexer::expected_index_dir(data_dir);
     if requested_plan_fingerprint != expected_plan_fingerprint {
         return doctor_restore_apply_payload_with_receipt(
             data_dir,
@@ -48587,7 +48564,7 @@ fn run_doctor_support_bundle_impl(
         });
     }
 
-    let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
+    let index_path = crate::indexer::expected_index_dir(&data_dir);
     let mut artifacts = Vec::new();
     let snapshot = build_doctor_baseline_snapshot(&data_dir, &db_path, &bundle_id, started);
     let redacted_report = snapshot
@@ -49375,7 +49352,7 @@ fn build_doctor_baseline_snapshot(
     baseline_id: &str,
     started: Instant,
 ) -> serde_json::Value {
-    let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+    let index_path = crate::indexer::expected_index_dir(data_dir);
     let sources_path = doctor_sources_config_path(data_dir);
     let config_path = data_dir.join("config.toml");
     let source_inventory = collect_doctor_source_inventory(data_dir, db_path);
@@ -71410,7 +71387,7 @@ fn run_status(
             if status_budget.is_healthy() {
                 let quarantine_report = collect_diag_quarantine_report(
                     &data_dir,
-                    &crate::search::tantivy::expected_index_dir(&data_dir),
+                    &crate::indexer::expected_index_dir(&data_dir),
                 );
                 let coverage_risk = doctor_fast_coverage_risk_unchecked(db_exists);
                 let sources_path = doctor_sources_config_path(&data_dir);
@@ -75027,7 +75004,7 @@ pub(crate) fn run_doctor_impl(
     let start = Instant::now();
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
-    let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
+    let index_path = crate::indexer::expected_index_dir(&data_dir);
     let lock_path = data_dir.join(".index.lock");
     let mut timing_spans: Vec<DoctorTimingSpanReport> = Vec::new();
     let lock_probe_started = Instant::now();

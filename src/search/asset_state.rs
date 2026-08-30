@@ -36,7 +36,6 @@ use crate::search::semantic_manifest::{
     ArtifactRecord, BuildCheckpoint, SemanticManifest, SemanticShardManifest, SemanticShardRecord,
     TierKind, semantic_shard_artifact_path_is_safe,
 };
-use crate::search::tantivy::SCHEMA_HASH;
 use crate::search::vector_index::{VECTOR_INDEX_DIR, vector_index_path};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -1270,7 +1269,7 @@ fn inspect_lexical_assets(input: InspectLexicalAssetsInput<'_>) -> Result<Lexica
         db_available,
         compute_lexical_fingerprint,
     } = input;
-    let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+    let index_path = crate::indexer::expected_index_dir(data_dir);
     let checkpoint = load_lexical_rebuild_checkpoint(&index_path)
         .with_context(|| format!("loading lexical checkpoint from {}", index_path.display()))?;
     let current_db_fingerprint = if db_available && compute_lexical_fingerprint {
@@ -1330,7 +1329,8 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
     let exists = crate::search::lexical_index_health::searchable_index_exists(db_path);
     let checkpoint_db_matches =
         checkpoint.map(|state| crate::stored_path_identity_matches(&state.db_path, db_path));
-    let schema_matches = checkpoint.map(|state| state.schema_hash == SCHEMA_HASH);
+    let schema_matches = checkpoint
+        .map(|state| state.schema_hash == crate::indexer::LEXICAL_REBUILD_SCHEMA_HASH);
     let page_size_matches =
         checkpoint.map(|state| state.page_size == LEXICAL_REBUILD_PAGE_SIZE_PUBLIC);
     let page_size_compatible =

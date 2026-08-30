@@ -26,7 +26,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::search::tantivy::SearchableIndexSummary;
+use crate::indexer::SearchableIndexSummary;
 use crate::storage::api::Conn;
 
 /// "Is there a usable lexical index at `db_path`" -- a "has content but no

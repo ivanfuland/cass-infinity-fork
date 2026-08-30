@@ -8423,7 +8423,7 @@ fn restore_index_root(journal: &RestoreJournal) -> anyhow::Result<&Path> {
 /// 路径用 `expected_index_dir`（纯拼接、**无副作用**）——不用会创建目录的 `index_dir`，
 /// 恢复器不该自己产副作用。
 fn restore_invalidate_readiness(journal: &RestoreJournal) -> anyhow::Result<()> {
-    let index_dir = crate::search::tantivy::expected_index_dir(restore_index_root(journal)?);
+    let index_dir = crate::indexer::expected_index_dir(restore_index_root(journal)?);
     crate::indexer::clear_lexical_rebuild_state(&index_dir)
 }
 

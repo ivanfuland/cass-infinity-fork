@@ -63,9 +63,6 @@ use crate::model::conversation_packet::{
 };
 use crate::search::asset_state::{SearchMaintenanceJobKind, SearchMaintenanceMode};
 use crate::search::canonicalize::is_hard_message_noise;
-use crate::search::tantivy::{
-    SearchableIndexSummary, TantivyIndex, index_dir, schema_hash_matches,
-};
 use crate::search::vector_index::{
     ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_TOOL, ROLE_USER, vector_index_path,
 };
@@ -2669,6 +2666,42 @@ impl Drop for RunIndexProgressReset {
     fn drop(&mut self) {
         reset_progress_to_idle(self.progress.as_ref());
     }
+}
+
+// W2-6 Task B 续一b: `crate::search::tantivy` (deleted, 198e3490) used to own
+// these four symbols. Reconstructed here byte-identical to the pre-deletion
+// values (recovered from git history at 198e3490^:src/search/tantivy.rs,
+// which itself re-exported them from the now also-unavailable
+// `frankensearch::lexical` feature) so on-disk `.lexical-rebuild-state.json`
+// checkpoints and the `data_dir/index/v8/` directory layout survive this
+// retirement unchanged -- no forced one-time invalidation, no path migration.
+// Deliberately NOT reusing `search::query::FS_CASS_SCHEMA_HASH` (same value,
+// different concern: that one keys a query-result cache, this one is a
+// rebuild-generation identity; W2-6 closeout's "CASS_SCHEMA_HASH语义漂移"
+// debt item covers unifying them later).
+pub(crate) const LEXICAL_REBUILD_SCHEMA_HASH: &str =
+    "tantivy-schema-v8-hyphen-cjk-bigrams-bounded-content-prefix-preview-stored-content-external";
+const CASS_SCHEMA_VERSION: &str = "v8";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SearchableIndexSummary {
+    pub docs: usize,
+    pub segments: usize,
+}
+
+fn schema_hash_matches(stored: &str) -> bool {
+    stored == LEXICAL_REBUILD_SCHEMA_HASH
+}
+
+pub(crate) fn expected_index_dir(base: &Path) -> PathBuf {
+    base.join("index").join(CASS_SCHEMA_VERSION)
+}
+
+pub(crate) fn index_dir(base: &Path) -> Result<PathBuf> {
+    let dir = expected_index_dir(base);
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("creating lexical index directory {}", dir.display()))?;
+    Ok(dir)
 }
 
 const LEXICAL_REBUILD_STATE_VERSION: u8 = 2;
@@ -6166,7 +6199,7 @@ impl LexicalRebuildState {
     fn new(db: LexicalRebuildDbState, page_size: i64) -> Self {
         Self {
             version: LEXICAL_REBUILD_STATE_VERSION,
-            schema_hash: crate::search::tantivy::SCHEMA_HASH.to_string(),
+            schema_hash: LEXICAL_REBUILD_SCHEMA_HASH.to_string(),
             db,
             page_size,
             committed_offset: 0,
@@ -6191,7 +6224,7 @@ impl LexicalRebuildState {
             lexical_rebuild_db_state_matches_legacy(&self.db, db)
         };
         self.version == LEXICAL_REBUILD_STATE_VERSION
-            && self.schema_hash == crate::search::tantivy::SCHEMA_HASH
+            && self.schema_hash == LEXICAL_REBUILD_SCHEMA_HASH
             && db_matches
             && lexical_rebuild_page_size_is_compatible(self.page_size)
     }
@@ -10426,7 +10459,7 @@ fn persist_completed_lexical_rebuild_checkpoint_from_observations(
     let mut state = match load_lexical_rebuild_state(index_path)? {
         Some(state)
             if state.version == LEXICAL_REBUILD_STATE_VERSION
-                && state.schema_hash == crate::search::tantivy::SCHEMA_HASH
+                && state.schema_hash == LEXICAL_REBUILD_SCHEMA_HASH
                 && lexical_rebuild_db_paths_match(&state.db.db_path, &db_path_string) =>
         {
             state
