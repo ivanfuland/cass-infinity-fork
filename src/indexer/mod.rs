@@ -14688,33 +14688,31 @@ pub fn run_index(
                 }
 
                 if scan_lexical_update_deferred {
+                    // W2-6 Task2 段2: `defer_lexical_updates` in
+                    // `storage/sqlite.rs`'s conversation-write path gates
+                    // BOTH the old inline Tantivy write AND
+                    // `sync_lexical_domain_for_conversation_in_tx` (verified
+                    // by reading src/storage/sqlite.rs:8367-8378) -- so
+                    // `fts_lex`/`lex_docs` fell behind here exactly like
+                    // Tantivy did. The Tantivy rebuild that used to run here
+                    // is gone; a direct `rebuild_lex_domain_from_db` call
+                    // catches `fts_lex` back up (no downstream fallback
+                    // covers this: the `opts.full || canonical_only_full_rebuild`
+                    // gate near the end of this function is false for this
+                    // routine, non-full, non-force-rebuild path).
                     tracing::warn!(
                         db_path = %opts.db_path.display(),
                         inserted_conversations = scan_canonical_mutations.inserted_conversations,
                         inserted_messages = scan_canonical_mutations.inserted_messages,
-                        "inline lexical updates were deferred during non-watch scan; rebuilding lexical assets from canonical SQLite"
+                        "inline lexical updates were deferred during non-watch scan; rebuilding lex_docs/fts_lex from canonical SQLite"
                     );
                     drop(t_index.take());
-                    ensure_authoritative_lexical_rebuild_storage_headroom(
-                        &opts.data_dir,
-                        &opts.db_path,
-                    )?;
-                    let rebuild_convs = count_total_conversations_exact(&storage)?;
-                    let rebuild = rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
-                        &opts.db_path,
-                        &opts.data_dir,
-                        rebuild_convs,
-                        opts.progress.clone(),
-                        Arc::clone(&progress_bump),
-                    )?;
-                    exact_completed_lexical_checkpoint = rebuild.exact_checkpoint_persisted;
-                    if let Some(observed_messages) = rebuild.observed_messages {
-                        record_exact_total_counts_in_progress(
-                            opts.progress.as_ref(),
-                            rebuild_convs,
-                            observed_messages,
-                        );
-                    }
+                    let lex_stats = storage.rebuild_lex_domain_from_db(opts.progress.as_ref())?;
+                    record_exact_total_counts_in_progress(
+                        opts.progress.as_ref(),
+                        lex_stats.conversations_processed,
+                        count_total_messages_exact(&storage)?,
+                    );
                     if keep_tantivy_open_after_rebuild {
                         t_index = Some(TantivyIndex::open_or_create(&index_path)?);
                     }
@@ -14769,31 +14767,25 @@ pub fn run_index(
                         );
                         skipped_noop_full_scan_authoritative_rebuild = true;
                     } else {
+                        // W2-6 Task2 段2: this branch also fires for
+                        // historical-salvage-imported messages
+                        // (`resolve_lexical_population_strategy`'s
+                        // `salvage_messages_imported > 0` case also selects
+                        // `DeferredAuthoritativeDbRebuild`), which take the
+                        // same gated-write path as the OOM-retry case above
+                        // -- `fts_lex` needs the same direct catch-up, not
+                        // just Tantivy.
                         drop(t_index.take());
-                        ensure_authoritative_lexical_rebuild_storage_headroom(
-                            &opts.data_dir,
-                            &opts.db_path,
-                        )?;
-                        let rebuild_convs = count_total_conversations_exact(&storage)?;
-                        let rebuild = rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
-                            &opts.db_path,
-                            &opts.data_dir,
-                            rebuild_convs,
-                            opts.progress.clone(),
-                            Arc::clone(&progress_bump),
-                        )?;
-                        exact_completed_lexical_checkpoint = rebuild.exact_checkpoint_persisted;
+                        let lex_stats = storage.rebuild_lex_domain_from_db(opts.progress.as_ref())?;
                         // Update stats to reflect the authoritative rebuild
                         // totals. The scan-phase stats tracked only what the
                         // connectors discovered; the DB rebuild is the source of
                         // truth for full-index runs.
-                        if let Some(observed_messages) = rebuild.observed_messages {
-                            record_exact_total_counts_in_progress(
-                                opts.progress.as_ref(),
-                                rebuild_convs,
-                                observed_messages,
-                            );
-                        }
+                        record_exact_total_counts_in_progress(
+                            opts.progress.as_ref(),
+                            lex_stats.conversations_processed,
+                            count_total_messages_exact(&storage)?,
+                        );
                         if keep_tantivy_open_after_rebuild {
                             t_index = Some(TantivyIndex::open_or_create(&index_path)?);
                         }
