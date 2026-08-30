@@ -23870,9 +23870,9 @@ fn run_cli_search(
         }
     })?;
 
-    if !client.has_tantivy() {
+    if !client.has_lexical_index() {
         eprintln!(
-            "Warning: Tantivy search index not found at {}. \
+            "Warning: lexical search index not found at {}. \
              Results will be severely limited. \
              Run `cass index --full` to rebuild the index.",
             index_path.display()

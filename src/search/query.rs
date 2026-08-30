@@ -1,19 +1,5 @@
 use anyhow::{Context, Result, anyhow, bail};
 use crossbeam_channel as mpsc;
-use frankensearch::lexical::{
-    BooleanQuery, CASS_SCHEMA_HASH as FS_CASS_SCHEMA_HASH, CassFields as FsCassFields,
-    CassQueryFilters as FsCassQueryFilters, CassQueryToken as FsCassQueryToken,
-    CassSourceFilter as FsCassSourceFilter, CassWildcardPattern as FsCassWildcardPattern, Count,
-    IndexReader, IndexRecordOption, LexicalDocHit as FsLexicalDocHit, Occur, Query, ReloadPolicy,
-    Searcher, SnippetConfig as FsSnippetConfig, TantivyDocument, Term, TermQuery, TopDocs, Value,
-    cass_build_tantivy_query as fs_cass_build_tantivy_query,
-    cass_has_boolean_operators as fs_cass_has_boolean_operators,
-    cass_open_search_reader as fs_cass_open_search_reader,
-    cass_parse_boolean_query as fs_cass_parse_boolean_query,
-    cass_sanitize_query as fs_cass_sanitize_query, load_doc as fs_load_doc,
-    render_snippet_html as fs_render_snippet_html,
-    try_build_snippet_generator as fs_try_build_snippet_generator,
-};
 use frankensearch::{
     Cx as FsCx, InMemoryTwoTierIndex as FsInMemoryTwoTierIndex,
     InMemoryVectorIndex as FsInMemoryVectorIndex, LexicalSearch as FsLexicalSearch,
@@ -33,10 +19,9 @@ use frankensearch::{
 use lru::LruCache;
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
-use std::cell::RefCell;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -45,6 +30,248 @@ use std::time::{Duration, Instant};
 
 use crate::storage::api::{Conn as Connection, Row as FrankenRow, StorageError};
 type ParamValue = crate::storage::api::Value;
+
+// W2-6 Task2: verbatim port of cass's own boolean-query-token/wildcard-pattern
+// parsing and query sanitization, ported into this crate because their old
+// home is going away with the rest of the Tantivy engine (Cargo.toml dropped
+// frankensearch's "lexical" feature in W2-6 Task2). Despite living in the
+// Tantivy-backed `frankensearch-lexical` crate, none of these five items
+// (the `CASS_SCHEMA_HASH` constant, the two enums, and the three functions)
+// reference any Tantivy type in their own bodies -- they are cass's own
+// hyphen-tokenizer-aligned query syntax, shared by every lexical backend
+// (Tantivy, `fts_lex`, and the legacy sqlite fallback alike), not something
+// tied to which engine executes the query. Copied byte-for-byte (including
+// doc comments) from:
+//   crate: frankensearch-lexical (workspace member of `frankensearch`)
+//   file:  crates/frankensearch-lexical/src/cass_compat.rs
+//   rev:   2cad158f4468ece7076e3fe529c8e5c20b2e020e (the exact
+//          Cargo.toml-pinned `rev` for `frankensearch` at the time of this
+//          port; see that crate's own Dependency Source Contract)
+// No behavior changed -- `fs_cass_sanitize_query("c++")` still yields
+// `"c  "`, etc. (see the exact-behavior assertions in this file's tests).
+#[allow(dead_code)]
+const FS_CASS_SCHEMA_HASH: &str =
+    "tantivy-schema-v8-hyphen-cjk-bigrams-bounded-content-prefix-preview-stored-content-external";
+
+/// Token types for cass-style boolean query parsing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FsCassQueryToken {
+    /// A search term (may include wildcards).
+    Term(String),
+    /// A quoted phrase for exact-order matching.
+    Phrase(String),
+    /// Explicit AND operator.
+    And,
+    /// OR operator.
+    Or,
+    /// NOT operator (negates the next term/phrase).
+    Not,
+}
+
+/// Sanitize query string to match the `hyphen_normalize` tokenizer for cass indexes.
+///
+/// The tokenizer preserves hyphens inside words (e.g. `bd-q3fy`, `POL-358`).
+/// We therefore keep hyphens alongside `*` (wildcards) and `"` (phrases),
+/// replacing all other non-alphanumeric characters with spaces so that query
+/// terms align with indexed tokens.
+#[must_use]
+fn fs_cass_sanitize_query(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '*' || c == '"' || c == '-' {
+                c
+            } else {
+                ' '
+            }
+        })
+        .collect()
+}
+
+#[must_use]
+fn cass_escape_regex(s: &str) -> String {
+    let mut escaped = String::with_capacity(s.len() * 2);
+    for c in s.chars() {
+        match c {
+            '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' => {
+                escaped.push('\\');
+                escaped.push(c);
+            }
+            _ => escaped.push(c),
+        }
+    }
+    escaped
+}
+
+/// Represents different wildcard patterns for a cass lexical search term.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FsCassWildcardPattern {
+    Exact(String),
+    Prefix(String),
+    Suffix(String),
+    Substring(String),
+    Complex(String),
+}
+
+impl FsCassWildcardPattern {
+    #[must_use]
+    fn parse(term: &str) -> Self {
+        let starts_with_star = term.starts_with('*');
+        let ends_with_star = term.ends_with('*');
+
+        let core = term.trim_matches('*').to_lowercase();
+        if core.is_empty() {
+            return Self::Exact(String::new());
+        }
+
+        // Internal wildcards (e.g. f*o) -> complex pattern.
+        if core.contains('*') {
+            return Self::Complex(term.to_lowercase());
+        }
+
+        match (starts_with_star, ends_with_star) {
+            (true, true) => Self::Substring(core),
+            (true, false) => Self::Suffix(core),
+            (false, true) => Self::Prefix(core),
+            (false, false) => Self::Exact(core),
+        }
+    }
+
+    #[must_use]
+    fn to_regex(&self) -> Option<String> {
+        match self {
+            Self::Suffix(core) => Some(format!(".*{}$", cass_escape_regex(core))),
+            Self::Substring(core) => Some(format!(".*{}.*", cass_escape_regex(core))),
+            Self::Complex(full_term) => {
+                let mut regex = String::with_capacity(full_term.len() * 2 + 2);
+
+                if full_term.starts_with('*') {
+                    regex.push_str(".*");
+                } else {
+                    regex.push('^');
+                }
+
+                let trimmed_start = full_term.trim_start_matches('*');
+                let trimmed = trimmed_start.trim_end_matches('*');
+                for c in trimmed.chars() {
+                    if c == '*' {
+                        regex.push_str(".*");
+                    } else {
+                        match c {
+                            '\\' | '.' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|'
+                            | '^' | '$' => {
+                                regex.push('\\');
+                                regex.push(c);
+                            }
+                            _ => regex.push(c),
+                        }
+                    }
+                }
+
+                if full_term.ends_with('*') {
+                    regex.push_str(".*");
+                } else {
+                    regex.push('$');
+                }
+
+                Some(regex)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Parse a query string into boolean tokens.
+///
+/// Supports:
+/// - AND / && (explicit AND; implicit AND between terms is handled by query construction)
+/// - OR / || (OR)
+/// - NOT / -prefix (negation)
+/// - \"quoted phrases\" (phrase match)
+#[must_use]
+fn fs_cass_parse_boolean_query(query: &str) -> Vec<FsCassQueryToken> {
+    let mut tokens = Vec::new();
+    let mut chars = query.chars().peekable();
+    let mut current_word = String::new();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                if !current_word.is_empty() {
+                    tokens.push(FsCassQueryToken::Term(std::mem::take(&mut current_word)));
+                }
+                let mut phrase = String::new();
+                while let Some(&next) = chars.peek() {
+                    if next == '"' {
+                        chars.next();
+                        break;
+                    }
+                    if let Some(c) = chars.next() {
+                        phrase.push(c);
+                    }
+                }
+                if !phrase.is_empty() {
+                    tokens.push(FsCassQueryToken::Phrase(phrase));
+                }
+            }
+            '&' if chars.peek() == Some(&'&') => {
+                chars.next();
+                if !current_word.is_empty() {
+                    tokens.push(FsCassQueryToken::Term(std::mem::take(&mut current_word)));
+                }
+                tokens.push(FsCassQueryToken::And);
+            }
+            '|' if chars.peek() == Some(&'|') => {
+                chars.next();
+                if !current_word.is_empty() {
+                    tokens.push(FsCassQueryToken::Term(std::mem::take(&mut current_word)));
+                }
+                tokens.push(FsCassQueryToken::Or);
+            }
+            '-' if current_word.is_empty() => {
+                tokens.push(FsCassQueryToken::Not);
+            }
+            ' ' | '\t' | '\n' => {
+                if !current_word.is_empty() {
+                    let word = std::mem::take(&mut current_word);
+                    let upper = word.to_ascii_uppercase();
+                    match upper.as_str() {
+                        "AND" => tokens.push(FsCassQueryToken::And),
+                        "OR" => tokens.push(FsCassQueryToken::Or),
+                        "NOT" => tokens.push(FsCassQueryToken::Not),
+                        _ => tokens.push(FsCassQueryToken::Term(word)),
+                    }
+                }
+            }
+            _ => current_word.push(c),
+        }
+    }
+
+    if !current_word.is_empty() {
+        let upper = current_word.to_ascii_uppercase();
+        match upper.as_str() {
+            "AND" => tokens.push(FsCassQueryToken::And),
+            "OR" => tokens.push(FsCassQueryToken::Or),
+            "NOT" => tokens.push(FsCassQueryToken::Not),
+            _ => tokens.push(FsCassQueryToken::Term(current_word)),
+        }
+    }
+
+    tokens
+}
+
+#[must_use]
+fn fs_cass_has_boolean_operators(query: &str) -> bool {
+    let tokens = fs_cass_parse_boolean_query(query);
+    tokens.iter().any(|t| {
+        matches!(
+            t,
+            FsCassQueryToken::And
+                | FsCassQueryToken::Or
+                | FsCassQueryToken::Not
+                | FsCassQueryToken::Phrase(_)
+        )
+    })
+}
 
 /// Test-only parameter list builder (Task A6 batch: mirrors sqlite.rs's
 /// `fparams!` shim): delegates to `storage::api::params!`, but produces a
@@ -1449,20 +1676,6 @@ fn effective_field_mask(field_mask: FieldMask) -> FieldMask {
     }
 }
 
-/// W2-5 escape hatch: opt back into the pre-migration Tantivy lexical path
-/// instead of the new `fts_lex` (SQLite FTS5) default. Reachable for this
-/// task's lifetime only -- W2-6 deletes the Tantivy query paths and this
-/// flag along with them. Read fresh on every call (not memoized like
-/// `LAZY_FIELDS_ENABLED`) so per-test overrides of this env var take effect
-/// within a single test binary run instead of being permanently pinned by
-/// whichever test happens to call `search()` first.
-fn lexical_use_tantivy_legacy() -> bool {
-    dotenvy::var("CASS_LEXICAL_USE_TANTIVY")
-        .ok()
-        .map(|v| !(v.is_empty() || v == "0" || v.eq_ignore_ascii_case("false")))
-        .unwrap_or(false)
-}
-
 /// KU3 (plan Task W2-5 Step 1, spec R0-N05): `fts_lex`'s `porter trigram`
 /// tokenizer needs at least 3 Unicode codepoints to form a single trigram
 /// token, so a query shorter than that structurally can never match
@@ -1502,55 +1715,6 @@ fn like_substring_pattern(term: &str) -> String {
     format!("%{escaped}%")
 }
 
-struct CassLexicalSearchResult {
-    hits: Vec<FsLexicalDocHit>,
-    total_count: Option<usize>,
-}
-
-fn execute_query_with_bounded_exact_count(
-    searcher: &Searcher,
-    query: &dyn Query,
-    limit: usize,
-    offset: usize,
-) -> Result<CassLexicalSearchResult> {
-    let top_docs = searcher.search(
-        query,
-        &TopDocs::with_limit(limit)
-            .and_offset(offset)
-            .order_by_score(),
-    )?;
-    let page_saturated = top_docs.len() == limit;
-    let index_doc_count = usize::try_from(searcher.num_docs()).unwrap_or(usize::MAX);
-    let total_count = if page_saturated {
-        if should_collect_exact_total_count(index_doc_count, exact_total_count_max_docs()) {
-            Some(searcher.search(query, &Count)?)
-        } else {
-            tracing::debug!(
-                index_doc_count,
-                exact_count_max_docs = exact_total_count_max_docs(),
-                limit,
-                offset,
-                "skipping exact Tantivy count on large saturated result page"
-            );
-            None
-        }
-    } else if offset > 0 && top_docs.is_empty() {
-        None
-    } else {
-        Some(offset.saturating_add(top_docs.len()))
-    };
-    let hits = top_docs
-        .into_iter()
-        .enumerate()
-        .map(|(rank, (bm25_score, doc_address))| FsLexicalDocHit {
-            bm25_score,
-            rank,
-            doc_address,
-        })
-        .collect();
-
-    Ok(CassLexicalSearchResult { hits, total_count })
-}
 
 /// Result of a search operation with metadata about how matches were found
 #[derive(Debug, Clone)]
@@ -2670,24 +2834,12 @@ impl FsLexicalSearch for CassProgressiveLexicalAdapter {
 }
 
 pub struct SearchClient {
-    reader: Option<(IndexReader, FsCassFields)>,
     sqlite: Mutex<Option<SendConnection>>,
     sqlite_path: Option<PathBuf>,
     prefix_cache: Mutex<CacheShards>,
-    reload_on_search: bool,
-    last_reload: Mutex<Option<Instant>>,
-    last_generation: Mutex<Option<u64>>,
-    reload_epoch: Arc<AtomicU64>,
-    warm_tx: Option<mpsc::Sender<WarmJob>>,
-    _warm_handle: Option<std::thread::JoinHandle<()>>,
     metrics: Metrics,
     cache_namespace: String,
     semantic: Mutex<Option<SemanticSearchState>>,
-    /// Exact total from the most recent Tantivy query when collecting it was
-    /// cheap enough. Large saturated pages leave this as `None` so robot output
-    /// can truthfully report lower-bound count precision without blocking the
-    /// top-N result path.
-    last_tantivy_total_count: Mutex<Option<usize>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2702,14 +2854,6 @@ impl Default for SearchClientOptions {
             enable_reload: true,
             enable_warm: true,
         }
-    }
-}
-
-impl Drop for SearchClient {
-    fn drop(&mut self) {
-        FEDERATED_SEARCH_READERS
-            .write()
-            .remove(&self.cache_namespace);
     }
 }
 
@@ -3144,39 +3288,6 @@ fn shard_cached_bytes(shard: &LruCache<Arc<str>, Vec<CachedHit>>) -> usize {
         .sum()
 }
 
-#[derive(Clone)]
-struct WarmJob {
-    query: String,
-    filters_fingerprint: String,
-    shard_name: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AdaptivePrewarmDecision {
-    Schedule,
-    SkipCold,
-    SkipPressure,
-}
-
-#[derive(Clone)]
-struct SearcherCacheEntry {
-    epoch: u64,
-    reader_key: usize,
-    searcher: Searcher,
-}
-
-thread_local! {
-    static THREAD_SEARCHER: RefCell<Option<SearcherCacheEntry>> = const { RefCell::new(None) };
-}
-
-#[derive(Clone)]
-struct FederatedIndexReader {
-    reader: IndexReader,
-    fields: FsCassFields,
-}
-
-static FEDERATED_SEARCH_READERS: Lazy<RwLock<HashMap<String, Arc<Vec<FederatedIndexReader>>>>> =
-    Lazy::new(|| RwLock::new(HashMap::new()));
 static SEARCH_CLIENT_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Calculate Levenshtein edit distance between two strings.
@@ -3519,9 +3630,16 @@ impl SearchClient {
     pub fn open_with_options(
         index_path: &Path,
         db_path: Option<&Path>,
-        options: SearchClientOptions,
+        _options: SearchClientOptions,
     ) -> Result<Option<Self>> {
-        let tantivy = fs_cass_open_search_reader(index_path, ReloadPolicy::Manual).ok();
+        // W2-6 Task2: the Tantivy reader/federated-reader/warm-worker
+        // machinery that used to live here is deleted; `fts_lex` (SQLite
+        // FTS5, same-transaction with the canonical tables) is the only
+        // lexical backend now, keyed entirely off `db_path`. `index_path` is
+        // kept in the signature (unused for opening anything -- it no
+        // longer names a Tantivy index directory) only for cache-namespace
+        // uniqueness and to avoid rippling a parameter removal through
+        // every caller.
         let client_id = SEARCH_CLIENT_INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed);
         let cache_namespace = format!(
             "v{}|schema:{}|client:{}|index:{}",
@@ -3530,77 +3648,22 @@ impl SearchClient {
             client_id,
             index_path.display()
         );
-        let federated_readers = if tantivy.is_none() {
-            crate::search::tantivy::open_federated_search_readers(index_path, ReloadPolicy::Manual)
-                .ok()
-                .flatten()
-                .filter(|readers| !readers.is_empty())
-                .map(|readers| {
-                    Arc::new(
-                        readers
-                            .into_iter()
-                            .map(|(reader, fields)| FederatedIndexReader { reader, fields })
-                            .collect::<Vec<_>>(),
-                    )
-                })
-        } else {
-            None
-        };
 
         let sqlite_path = db_path.map(Path::to_path_buf).filter(|path| path.exists());
 
-        if tantivy.is_none() && federated_readers.is_none() && sqlite_path.is_some() {
-            tracing::warn!(
-                index_path = %index_path.display(),
-                "Tantivy search index not found or incompatible. \
-                 Search results will be degraded. \
-                 Run `cass index --full` to rebuild the index."
-            );
-        }
-
-        if tantivy.is_none() && federated_readers.is_none() && sqlite_path.is_none() {
+        if sqlite_path.is_none() {
             return Ok(None);
         }
 
-        let reload_epoch = Arc::new(AtomicU64::new(0));
         let metrics = Metrics::default();
 
-        let warm_pair = if options.enable_warm
-            && let Some((reader, fields)) = &tantivy
-        {
-            maybe_spawn_warm_worker(
-                reader.clone(),
-                *fields,
-                reload_epoch.clone(),
-                metrics.clone(),
-            )
-        } else {
-            None
-        };
-
-        if let Some(readers) = &federated_readers {
-            FEDERATED_SEARCH_READERS
-                .write()
-                .insert(cache_namespace.clone(), Arc::clone(readers));
-        } else {
-            FEDERATED_SEARCH_READERS.write().remove(&cache_namespace);
-        }
-
         Ok(Some(Self {
-            reader: tantivy,
             sqlite: Mutex::new(None),
             sqlite_path,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: options.enable_reload,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch,
-            warm_tx: warm_pair.as_ref().map(|(tx, _)| tx.clone()),
-            _warm_handle: warm_pair.map(|(_, h)| h),
             metrics,
             cache_namespace,
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         }))
     }
 
@@ -3684,18 +3747,6 @@ impl SearchClient {
         let can_use_cache =
             field_mask.allows_cache() && (field_mask.needs_content() || field_mask.wants_snippet());
 
-        // Invalidate prefix cache if the index has been updated since last search.
-        // This must happen BEFORE the cache check below to avoid serving stale results.
-        if let Some((reader, _)) = &self.reader {
-            self.maybe_reload_reader(reader)?;
-            let searcher = self.searcher_for_thread(reader);
-            self.track_generation(searcher.generation().generation_id());
-        } else if let Some(readers) = self.federated_readers()
-            && let Some(signature) = self.maybe_reload_federated_readers(readers.as_ref())?
-        {
-            self.track_generation(signature);
-        }
-
         // Fast path: reuse cached prefix when user is typing forward (offset 0 only).
         // Only use cache for simple queries (no wildcards, no boolean operators) because
         // the cache matching logic enforces strict prefix AND semantics which is incorrect
@@ -3705,7 +3756,6 @@ impl SearchClient {
             && !query.contains('*')
             && !fs_cass_has_boolean_operators(query)
         {
-            self.maybe_schedule_adaptive_query_prewarm(&sanitized, &filters);
             if let Some(cached) = self.cached_prefix_hits(&sanitized, &filters) {
                 // Opt 2.4: Pre-compute lowercase query terms once, reuse for all hits
                 let query_terms = QueryTermsLower::from_query(&sanitized);
@@ -3718,9 +3768,6 @@ impl SearchClient {
                     filtered.truncate(limit);
                     self.metrics.inc_cache_hits();
                     self.maybe_log_cache_metrics("hit");
-                    if let Ok(mut tc) = self.last_tantivy_total_count.lock() {
-                        *tc = None;
-                    }
                     return Ok(filtered);
                 }
                 // Cache had entries but not enough to satisfy limit - shortfall, not miss
@@ -3733,27 +3780,15 @@ impl SearchClient {
             }
         }
 
-        // Adaptive fetch sizing: start at 2x target to reduce common-case work,
-        // retry at 3x only when deduplication causes shortfall.
-        // We always fetch from 0 to preserve global deduplication correctness.
         let target_hits = offset.saturating_add(limit);
-        let initial_fetch_limit = if target_hits <= 16 {
-            target_hits.saturating_mul(2)
-        } else {
-            // Larger pages benefit from a lower first-pass over-fetch.
-            // Retry logic below preserves correctness on duplicate-heavy corpora.
-            target_hits.saturating_mul(3).div_ceil(2)
-        };
         let session_path_filter_active = !filters.session_paths.is_empty();
-        // `--role` is a post-hoc filter applied in `postprocess_hits_page`
-        // (Tantivy carries no role field). A too-small fetch window can rank the
-        // only role-matching hit below it, so `search X --role tool --limit 1`
-        // wrongly returns empty even though the tool_result exists. Mirror the
-        // session-path treatment: over-fetch a large window (capped at
-        // `no_limit_result_cap()`) so role recall is correct. The Tantivy paths
-        // reach this via the dedup/shortfall retry; the SQLite-FTS fallback
-        // fetches `fallback_fetch_limit` directly — both are covered here.
-        // Kept off the no-role fast path so the common case is not slowed.
+        // `--role` is a post-hoc filter applied in `postprocess_hits_page`.
+        // A too-small fetch window can rank the only role-matching hit below
+        // it, so `search X --role tool --limit 1` wrongly returns empty even
+        // though the tool_result exists. Over-fetch a large window (capped at
+        // `no_limit_result_cap()`) so role recall is correct via
+        // `fallback_fetch_limit`. Kept off the no-role fast path so the
+        // common case is not slowed.
         let role_filter_active = filters
             .roles
             .as_ref()
@@ -3777,17 +3812,12 @@ impl SearchClient {
             core.contains('*') // Any star remaining after trimming end is unsupported (leading or internal)
         });
 
-        // W2-5: `fts_lex` (SQLite FTS5, same-transaction with the canonical
-        // tables) is now the default lexical backend, replacing Tantivy.
-        // Tantivy is kept reachable behind `CASS_LEXICAL_USE_TANTIVY=1` for
-        // this task's lifetime only -- W2-6 deletes the Tantivy paths below
-        // and this flag along with them. Gated on `fts_lex` actually existing
-        // (not merely on the flag) so a DB predating the v1->v2 migration --
-        // or a fixture that only sets up a bare Tantivy index, of which this
-        // codebase has many pre-W2-5 tests -- falls through unchanged to the
-        // Tantivy/legacy-sqlite dispatch below rather than silently
-        // returning zero hits.
-        if !lexical_use_tantivy_legacy() && self.has_populated_fts_lex() {
+        // W2-5/W2-6: `fts_lex` (SQLite FTS5, same-transaction with the
+        // canonical tables) is the only lexical backend now; the Tantivy
+        // dispatch that used to live here (plain + federated, gated behind
+        // `CASS_LEXICAL_USE_TANTIVY=1`) is deleted along with the escape
+        // hatch (W2-6 Task2).
+        if self.has_populated_fts_lex() {
             if unsupported_wildcards {
                 return Ok(Vec::new());
             }
@@ -3804,172 +3834,6 @@ impl SearchClient {
                 self.put_cache(&sanitized, &filters, &paged_hits);
             }
             return Ok(paged_hits);
-        }
-
-        // Tantivy: legacy path, reachable only via CASS_LEXICAL_USE_TANTIVY=1 (W2-5).
-        if let Some((reader, fields)) = &self.reader {
-            tracing::info!(
-                backend = "tantivy",
-                query = sanitized,
-                limit = initial_fetch_limit,
-                offset = 0,
-                "search_start"
-            );
-            let (hits, tantivy_total_count) = self.search_tantivy(
-                reader,
-                fields,
-                query,
-                &sanitized,
-                filters.clone(),
-                initial_fetch_limit,
-                0, // Always fetch from 0 for global dedup
-                field_mask,
-            )?;
-            if let Ok(mut tc) = self.last_tantivy_total_count.lock() {
-                *tc = tantivy_total_count;
-            }
-            if !hits.is_empty() {
-                let initial_hit_count = hits.len();
-                let page_hits = |raw_hits: Vec<SearchHit>| {
-                    self.postprocess_hits_page(raw_hits, &sanitized, &filters, limit, offset)
-                };
-
-                let (mut deduped_len, mut paged_hits) = page_hits(hits);
-
-                let needs_retry = deduped_len < target_hits
-                    && initial_hit_count == initial_fetch_limit
-                    && initial_fetch_limit < fallback_fetch_limit;
-
-                if needs_retry {
-                    tracing::debug!(
-                        query = sanitized,
-                        target_hits,
-                        deduped_len,
-                        initial_fetch_limit,
-                        fallback_fetch_limit,
-                        session_path_filter_active,
-                        "retrying lexical fetch due to dedup or session-path shortfall"
-                    );
-                    let (retry_hits, retry_total_count) = self.search_tantivy(
-                        reader,
-                        fields,
-                        query,
-                        &sanitized,
-                        filters.clone(),
-                        fallback_fetch_limit,
-                        0,
-                        field_mask,
-                    )?;
-                    if let Ok(mut tc) = self.last_tantivy_total_count.lock() {
-                        *tc = retry_total_count;
-                    }
-                    if !retry_hits.is_empty() {
-                        (deduped_len, paged_hits) = page_hits(retry_hits);
-                    }
-                }
-
-                tracing::trace!(
-                    query = sanitized,
-                    target_hits,
-                    deduped_len,
-                    returned = paged_hits.len(),
-                    "lexical fetch complete"
-                );
-
-                if can_use_cache && offset == 0 {
-                    self.put_cache(&sanitized, &filters, &paged_hits);
-                }
-                return Ok(paged_hits);
-            }
-            tracing::debug!(
-                query = sanitized,
-                "tantivy returned zero hits; skipping sqlite fallback because tantivy is authoritative when available"
-            );
-            return Ok(Vec::new());
-        } else if let Some(readers) = self.federated_readers() {
-            tracing::info!(
-                backend = "tantivy-federated",
-                query = sanitized,
-                limit = initial_fetch_limit,
-                offset = 0,
-                shards = readers.len(),
-                "search_start"
-            );
-            let (hits, tantivy_total_count) = self.search_tantivy_federated(
-                readers.as_ref(),
-                query,
-                &sanitized,
-                filters.clone(),
-                initial_fetch_limit,
-                field_mask,
-            )?;
-            if let Ok(mut tc) = self.last_tantivy_total_count.lock() {
-                *tc = tantivy_total_count;
-            }
-            if !hits.is_empty() {
-                let initial_hit_count = hits.len();
-                let page_hits = |raw_hits: Vec<SearchHit>| {
-                    self.postprocess_hits_page(raw_hits, &sanitized, &filters, limit, offset)
-                };
-
-                let (mut deduped_len, mut paged_hits) = page_hits(hits);
-                let expected_federated_capacity = initial_fetch_limit.saturating_mul(readers.len());
-                let federated_initial_capacity_reached = if session_path_filter_active {
-                    initial_hit_count >= initial_fetch_limit.min(expected_federated_capacity)
-                } else {
-                    initial_hit_count == expected_federated_capacity
-                };
-                let needs_retry = deduped_len < target_hits
-                    && federated_initial_capacity_reached
-                    && initial_fetch_limit < fallback_fetch_limit;
-
-                if needs_retry {
-                    tracing::debug!(
-                        query = sanitized,
-                        target_hits,
-                        deduped_len,
-                        initial_fetch_limit,
-                        fallback_fetch_limit,
-                        shards = readers.len(),
-                        session_path_filter_active,
-                        "retrying federated lexical fetch due to dedup or session-path shortfall"
-                    );
-                    let (retry_hits, retry_total_count) = self.search_tantivy_federated(
-                        readers.as_ref(),
-                        query,
-                        &sanitized,
-                        filters.clone(),
-                        fallback_fetch_limit,
-                        field_mask,
-                    )?;
-                    if let Ok(mut tc) = self.last_tantivy_total_count.lock() {
-                        *tc = retry_total_count;
-                    }
-                    if !retry_hits.is_empty() {
-                        (deduped_len, paged_hits) = page_hits(retry_hits);
-                    }
-                }
-
-                tracing::trace!(
-                    query = sanitized,
-                    target_hits,
-                    deduped_len,
-                    returned = paged_hits.len(),
-                    shards = readers.len(),
-                    "federated lexical fetch complete"
-                );
-
-                if can_use_cache && offset == 0 {
-                    self.put_cache(&sanitized, &filters, &paged_hits);
-                }
-                return Ok(paged_hits);
-            }
-            tracing::debug!(
-                query = sanitized,
-                shards = readers.len(),
-                "federated tantivy returned zero hits; skipping sqlite fallback because tantivy is authoritative when available"
-            );
-            return Ok(Vec::new());
         }
 
         // unsupported_wildcards was already computed above (shared with the
@@ -5911,12 +5775,11 @@ impl SearchClient {
         // First, try the normal search
         let hits = self.search(query, filters.clone(), limit, offset, field_mask)?;
         let baseline_stats = self.cache_stats();
-        // Capture the exact Tantivy total when the query path could collect it cheaply.
-        let tantivy_total = self
-            .last_tantivy_total_count
-            .lock()
-            .ok()
-            .and_then(|guard| *guard);
+        // W2-6 Task2: `fts_lex` has no cheap exact-total-count path (the old
+        // Tantivy-only fast path this used to capture is gone with the
+        // engine); always report unknown rather than a stale/fabricated
+        // count.
+        let tantivy_total: Option<usize> = None;
 
         // Check if we should try wildcard fallback
         let query_has_wildcards = query.contains('*');
@@ -5994,12 +5857,9 @@ impl SearchClient {
         let mut fallback_hits =
             self.search(&wildcard_query, filters.clone(), limit, offset, field_mask)?;
         let fallback_stats = self.cache_stats();
-        // Re-capture total_count after wildcard search (may have changed)
-        let fallback_tantivy_total = self
-            .last_tantivy_total_count
-            .lock()
-            .ok()
-            .and_then(|guard| *guard);
+        // W2-6 Task2: see the `tantivy_total` comment above -- no cheap
+        // exact-total-count path for `fts_lex`.
+        let fallback_tantivy_total: Option<usize> = None;
 
         // Use fallback results if they're better
         if fallback_hits.len() > hits.len() {
@@ -6224,95 +6084,6 @@ impl SearchClient {
         suggestions
     }
 
-    fn searcher_for_thread(&self, reader: &IndexReader) -> Searcher {
-        let epoch = self.reload_epoch.load(Ordering::Relaxed);
-        let reader_key = reader as *const IndexReader as usize;
-        THREAD_SEARCHER.with(|slot| {
-            let mut slot = slot.borrow_mut();
-            if let Some(entry) = slot.as_ref()
-                && entry.epoch == epoch
-                && entry.reader_key == reader_key
-            {
-                return entry.searcher.clone();
-            }
-            let searcher = reader.searcher();
-            *slot = Some(SearcherCacheEntry {
-                epoch,
-                reader_key,
-                searcher: searcher.clone(),
-            });
-            searcher
-        })
-    }
-
-    fn federated_readers(&self) -> Option<Arc<Vec<FederatedIndexReader>>> {
-        FEDERATED_SEARCH_READERS
-            .read()
-            .get(&self.cache_namespace)
-            .cloned()
-    }
-
-    fn maybe_reload_federated_readers(
-        &self,
-        readers: &[FederatedIndexReader],
-    ) -> Result<Option<u64>> {
-        if !self.reload_on_search || readers.is_empty() {
-            return Ok(None);
-        }
-        const MIN_RELOAD_INTERVAL: Duration = Duration::from_millis(300);
-        let now = Instant::now();
-        let mut guard = self.last_reload.lock().unwrap_or_else(|e| e.into_inner());
-        if guard
-            .map(|t| now.duration_since(t) < MIN_RELOAD_INTERVAL)
-            .unwrap_or(false)
-        {
-            let signature = self.federated_generation_signature(readers);
-            return Ok(Some(signature));
-        }
-
-        let reload_started = Instant::now();
-        for shard in readers {
-            shard.reader.reload()?;
-        }
-        let elapsed = reload_started.elapsed();
-        *guard = Some(now);
-        let epoch = self.reload_epoch.fetch_add(1, Ordering::SeqCst) + 1;
-        self.metrics.record_reload(elapsed);
-        tracing::debug!(
-            duration_ms = elapsed.as_millis() as u64,
-            reload_epoch = epoch,
-            shards = readers.len(),
-            "tantivy_reader_reload_federated"
-        );
-        Ok(Some(self.federated_generation_signature(readers)))
-    }
-
-    fn federated_generation_signature(&self, readers: &[FederatedIndexReader]) -> u64 {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        readers.len().hash(&mut hasher);
-        for shard in readers {
-            self.searcher_for_thread(&shard.reader)
-                .generation()
-                .generation_id()
-                .hash(&mut hasher);
-        }
-        hasher.finish()
-    }
-
-    fn track_generation(&self, generation: u64) {
-        let mut guard = self
-            .last_generation
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if let Some(prev) = *guard
-            && prev != generation
-            && let Ok(mut cache) = self.prefix_cache.lock()
-        {
-            cache.clear();
-        }
-        *guard = Some(generation);
-    }
-
     fn hydrate_tantivy_hit_contents(
         &self,
         exact_keys: &[TantivyContentExactKey],
@@ -6447,374 +6218,6 @@ impl SearchClient {
         }
 
         Ok((hydrated_exact, hydrated_fallback))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn search_tantivy(
-        &self,
-        reader: &IndexReader,
-        fields: &FsCassFields,
-        raw_query: &str,
-        sanitized_query: &str,
-        filters: SearchFilters,
-        limit: usize,
-        offset: usize,
-        field_mask: FieldMask,
-    ) -> Result<(Vec<SearchHit>, Option<usize>)> {
-        struct PendingTantivyHit {
-            score: f32,
-            doc: TantivyDocument,
-            title: String,
-            stored_content: String,
-            stored_preview: String,
-            agent: String,
-            source_path: String,
-            workspace: String,
-            workspace_original: Option<String>,
-            created_at: Option<i64>,
-            line_number: Option<usize>,
-            stored_preview_snippet: Option<String>,
-            source_id: String,
-            conversation_id: Option<i64>,
-            raw_origin_kind: Option<String>,
-            origin_host: Option<String>,
-        }
-
-        self.maybe_reload_reader(reader)?;
-        let searcher = self.searcher_for_thread(reader);
-        self.track_generation(searcher.generation().generation_id());
-
-        let wants_snippet = field_mask.wants_snippet();
-        let needs_content = field_mask.needs_content() || wants_snippet;
-
-        // Delegate cass-compatible query parsing + Tantivy clause construction to frankensearch.
-        // cass retains ownership of paging/fallback orchestration and stored-field hydration.
-        let fs_filters = FsCassQueryFilters {
-            agents: filters.agents.into_iter().collect(),
-            workspaces: filters.workspaces.into_iter().collect(),
-            created_from: filters.created_from,
-            created_to: filters.created_to,
-            source_filter: match filters.source_filter {
-                SourceFilter::All => FsCassSourceFilter::All,
-                SourceFilter::Local => FsCassSourceFilter::Local,
-                SourceFilter::Remote => FsCassSourceFilter::Remote,
-                SourceFilter::SourceId(id) => {
-                    FsCassSourceFilter::SourceId(normalize_search_source_filter_value(&id))
-                }
-            },
-        };
-
-        // NOTE: session_paths filtering is applied post-search since source_path
-        // is STORED but not indexed. See apply_session_paths_filter().
-        let q: Box<dyn Query> = fs_cass_build_tantivy_query(raw_query, &fs_filters, fields);
-
-        let prefix_only = is_prefix_only(sanitized_query);
-        let top_docs = execute_query_with_bounded_exact_count(&searcher, &*q, limit, offset)?;
-        let tantivy_total_count = top_docs.total_count;
-        let query_match_type = dominant_match_type(sanitized_query);
-        let mut pending_hits = Vec::with_capacity(top_docs.hits.len());
-        let mut missing_exact_content_keys = Vec::new();
-        let mut missing_fallback_content_keys = Vec::new();
-
-        for ranked_hit in top_docs.hits {
-            let score = ranked_hit.bm25_score;
-            let doc: TantivyDocument = fs_load_doc(&searcher, ranked_hit.doc_address)?;
-            let title = if field_mask.wants_title() {
-                doc.get_first(fields.title)
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string()
-            } else {
-                String::new()
-            };
-            let stored_content = doc
-                .get_first(fields.content)
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let stored_preview = doc
-                .get_first(fields.preview)
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let stored_preview_snippet = snippet_from_preview_without_full_content(
-                field_mask,
-                &stored_preview,
-                sanitized_query,
-            );
-            let agent = doc
-                .get_first(fields.agent)
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let workspace = doc
-                .get_first(fields.workspace)
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let workspace_original = doc
-                .get_first(fields.workspace_original)
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(String::from);
-            let created_at = doc.get_first(fields.created_at).and_then(|v| v.as_i64());
-            let line_number = doc
-                .get_first(fields.msg_idx)
-                .and_then(|v| v.as_u64())
-                .and_then(|i| usize::try_from(i).ok())
-                .map(|i| i.saturating_add(1));
-            let raw_source_id = doc
-                .get_first(fields.source_id)
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let conversation_id = fields
-                .conversation_id
-                .and_then(|field| doc.get_first(field))
-                .and_then(|v| v.as_i64());
-            let source_path = doc
-                .get_first(fields.source_path)
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let raw_origin_kind = doc
-                .get_first(fields.origin_kind)
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
-            let origin_host = doc
-                .get_first(fields.origin_host)
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(String::from);
-            let source_id = normalized_search_hit_source_id_parts(
-                raw_source_id.as_str(),
-                raw_origin_kind.as_deref().unwrap_or_default(),
-                origin_host.as_deref(),
-            );
-
-            let preview_satisfies_bounded_content =
-                field_mask.preview_content_limit().is_some() && !stored_preview.is_empty();
-            let preview_satisfies_full_content = field_mask.needs_content()
-                && field_mask.preview_content_limit().is_none()
-                && stored_preview_is_complete_content(&stored_preview);
-            if needs_content
-                && let Some(line_idx) = line_number
-                    .and_then(|line| line.checked_sub(1))
-                    .and_then(|line| i64::try_from(line).ok())
-                && stored_content.is_empty()
-                && !preview_satisfies_bounded_content
-                && !preview_satisfies_full_content
-                && stored_preview_snippet.is_none()
-            {
-                if let Some(conversation_id) = conversation_id {
-                    missing_exact_content_keys.push((conversation_id, line_idx));
-                } else {
-                    missing_fallback_content_keys.push((
-                        source_id.clone(),
-                        source_path.clone(),
-                        line_idx,
-                    ));
-                }
-            }
-
-            pending_hits.push(PendingTantivyHit {
-                score,
-                doc,
-                title,
-                stored_content,
-                stored_preview,
-                agent,
-                source_path,
-                workspace,
-                workspace_original,
-                created_at,
-                line_number,
-                stored_preview_snippet,
-                source_id,
-                conversation_id,
-                raw_origin_kind,
-                origin_host,
-            });
-        }
-
-        let (hydrated_contents, hydrated_fallback_contents) = if needs_content
-            && (!missing_exact_content_keys.is_empty() || !missing_fallback_content_keys.is_empty())
-        {
-            self.hydrate_tantivy_hit_contents(
-                &missing_exact_content_keys,
-                &missing_fallback_content_keys,
-            )?
-        } else {
-            (HashMap::new(), HashMap::new())
-        };
-        let needs_tantivy_snippet_generator = wants_snippet
-            && !prefix_only
-            && pending_hits
-                .iter()
-                .any(|pending| pending.stored_preview_snippet.is_none());
-        let snippet_generator = if needs_tantivy_snippet_generator {
-            let snippet_cfg = FsSnippetConfig {
-                max_chars: 160,
-                highlight_prefix: "<b>".to_string(),
-                highlight_postfix: "</b>".to_string(),
-            };
-            fs_try_build_snippet_generator(&searcher, &*q, fields.content, &snippet_cfg)
-        } else {
-            None
-        };
-        let mut hits = Vec::with_capacity(pending_hits.len());
-        for pending in pending_hits {
-            let hydrated_content = pending
-                .line_number
-                .and_then(|line| line.checked_sub(1))
-                .and_then(|line| i64::try_from(line).ok())
-                .and_then(|line_idx| {
-                    if let Some(conversation_id) = pending.conversation_id {
-                        hydrated_contents.get(&(conversation_id, line_idx)).cloned()
-                    } else {
-                        hydrated_fallback_contents
-                            .get(&(
-                                pending.source_id.clone(),
-                                pending.source_path.clone(),
-                                line_idx,
-                            ))
-                            .cloned()
-                    }
-                });
-            let preview_satisfies_effective_content = !pending.stored_preview.is_empty()
-                && (field_mask.preview_content_limit().is_some()
-                    || (field_mask.needs_content()
-                        && field_mask.preview_content_limit().is_none()
-                        && stored_preview_is_complete_content(&pending.stored_preview)));
-            let effective_content = if !pending.stored_content.is_empty() {
-                pending.stored_content.clone()
-            } else if preview_satisfies_effective_content {
-                pending.stored_preview.clone()
-            } else if let Some(content) = hydrated_content {
-                content
-            } else {
-                pending.stored_preview.clone()
-            };
-            let snippet = if wants_snippet {
-                if let Some(snippet) = pending.stored_preview_snippet.clone() {
-                    snippet
-                } else if let Some(r#gen) = &snippet_generator {
-                    let rendered = if !pending.stored_content.is_empty() {
-                        fs_render_snippet_html(r#gen, &pending.doc, "<b>", "</b>")
-                    } else if !effective_content.is_empty() {
-                        let mut snippet_doc = TantivyDocument::new();
-                        snippet_doc.add_text(fields.content, &effective_content);
-                        fs_render_snippet_html(r#gen, &snippet_doc, "<b>", "</b>")
-                    } else {
-                        None
-                    };
-                    rendered
-                        .map(|html| html.replace("<b>", "**").replace("</b>", "**"))
-                        .or_else(|| cached_prefix_snippet(&effective_content, sanitized_query, 160))
-                        .unwrap_or_else(|| {
-                            quick_prefix_snippet(&effective_content, sanitized_query, 160)
-                        })
-                } else if let Some(sn) =
-                    cached_prefix_snippet(&effective_content, sanitized_query, 160)
-                {
-                    sn
-                } else {
-                    quick_prefix_snippet(&effective_content, sanitized_query, 160)
-                }
-            } else {
-                String::new()
-            };
-            let content = if field_mask.needs_content() {
-                effective_content.clone()
-            } else {
-                String::new()
-            };
-            let content_hash = stable_hit_hash(
-                &effective_content,
-                &pending.source_path,
-                pending.line_number,
-                pending.created_at,
-            );
-            let origin_kind = normalized_search_hit_origin_kind(
-                &pending.source_id,
-                pending.raw_origin_kind.as_deref(),
-            )
-            .to_string();
-            hits.push(SearchHit {
-                title: pending.title,
-                snippet,
-                content,
-                content_hash,
-                conversation_id: pending.conversation_id,
-                score: pending.score,
-                source_path: pending.source_path,
-                agent: pending.agent,
-                workspace: pending.workspace,
-                workspace_original: pending.workspace_original,
-                created_at: pending.created_at,
-                line_number: pending.line_number,
-                match_type: query_match_type,
-                source_id: pending.source_id,
-                origin_kind,
-                origin_host: pending.origin_host,
-            });
-        }
-        Ok((hits, tantivy_total_count))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn search_tantivy_federated(
-        &self,
-        readers: &[FederatedIndexReader],
-        raw_query: &str,
-        sanitized_query: &str,
-        filters: SearchFilters,
-        limit: usize,
-        field_mask: FieldMask,
-    ) -> Result<(Vec<SearchHit>, Option<usize>)> {
-        let mut ranked_hits = Vec::new();
-        let mut total_count = Some(0usize);
-
-        for (shard_index, shard) in readers.iter().enumerate() {
-            let (shard_hits, shard_total_count) = self.search_tantivy(
-                &shard.reader,
-                &shard.fields,
-                raw_query,
-                sanitized_query,
-                filters.clone(),
-                limit,
-                0,
-                field_mask,
-            )?;
-            total_count = match (total_count, shard_total_count) {
-                (Some(total), Some(shard_total)) => Some(total.saturating_add(shard_total)),
-                _ => None,
-            };
-            for (shard_rank, hit) in shard_hits.into_iter().enumerate() {
-                ranked_hits.push(FederatedRankedHit {
-                    hit,
-                    shard_index,
-                    shard_rank,
-                    fused_score: federated_rrf_score(shard_rank),
-                });
-            }
-        }
-
-        let raw_hit_count = ranked_hits.len();
-        let generation_signature = self.federated_generation_signature(readers);
-        self.track_generation(generation_signature);
-        let combined_hits = merge_federated_ranked_hits(ranked_hits);
-        tracing::debug!(
-            generation_signature,
-            shard_count = readers.len(),
-            total_count,
-            raw_hit_count,
-            returned_hit_count = combined_hits.len(),
-            merge_policy = "rrf_rank_then_stable_hit_key",
-            "federated lexical search merged shard results"
-        );
-
-        Ok((combined_hits, total_count))
     }
 
     fn sqlite_fts_uses_message_id_column(conn: &Connection) -> Result<bool> {
@@ -8656,73 +8059,6 @@ impl Metrics {
     }
 }
 
-fn maybe_spawn_warm_worker(
-    reader: IndexReader,
-    fields: FsCassFields,
-    reload_epoch: Arc<AtomicU64>,
-    metrics: Metrics,
-) -> Option<(mpsc::Sender<WarmJob>, std::thread::JoinHandle<()>)> {
-    let (tx, rx) = mpsc::unbounded::<WarmJob>();
-    let handle = std::thread::Builder::new()
-        .name("cass-warm-worker".into())
-        .spawn(move || {
-            // Simple debounce: process at most one warmup every WARM_DEBOUNCE_MS.
-            let mut last_run = Instant::now();
-            while let Ok(job) = rx.recv() {
-                let now = Instant::now();
-                if now.duration_since(last_run) < Duration::from_millis(*WARM_DEBOUNCE_MS) {
-                    continue;
-                }
-                last_run = now;
-                let reload_started = Instant::now();
-                if let Err(err) = reader.reload() {
-                    tracing::warn!(error = ?err, "warm_worker_reload_failed");
-                    continue;
-                }
-                let elapsed = reload_started.elapsed();
-                let epoch = reload_epoch.fetch_add(1, Ordering::SeqCst) + 1;
-                metrics.record_reload(elapsed);
-                tracing::debug!(
-                    duration_ms = elapsed.as_millis() as u64,
-                    reload_epoch = epoch,
-                    filters = %job.filters_fingerprint,
-                    shard = %job.shard_name,
-                    "warm_worker_reload"
-                );
-                // Run a tiny warm search to prefill OS cache and hit the Tantivy reader
-                // without allocating full result sets. Limit 1 doc.
-                let searcher = reader.searcher();
-                let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-                for term_str in job.query.split_whitespace() {
-                    let term_lower = term_str.to_lowercase();
-                    let term_shoulds: Vec<(Occur, Box<dyn Query>)> = vec![
-                        (
-                            Occur::Should,
-                            Box::new(TermQuery::new(
-                                Term::from_field_text(fields.title, &term_lower),
-                                IndexRecordOption::WithFreqsAndPositions,
-                            )),
-                        ),
-                        (
-                            Occur::Should,
-                            Box::new(TermQuery::new(
-                                Term::from_field_text(fields.content, &term_lower),
-                                IndexRecordOption::WithFreqsAndPositions,
-                            )),
-                        ),
-                    ];
-                    clauses.push((Occur::Must, Box::new(BooleanQuery::new(term_shoulds))));
-                }
-                if !clauses.is_empty() {
-                    let q: Box<dyn Query> = Box::new(BooleanQuery::new(clauses));
-                    let _ = searcher.search(&q, &TopDocs::with_limit(1).order_by_score());
-                }
-            }
-        })
-        .ok()?;
-    Some((tx, handle))
-}
-
 fn cached_hit_from(hit: &SearchHit) -> CachedHit {
     let cache_text = if hit.content.is_empty() {
         hit.snippet.as_str()
@@ -9056,50 +8392,32 @@ fn filters_fingerprint(filters: &SearchFilters) -> String {
 }
 
 impl SearchClient {
-    /// Return the total number of indexed Tantivy documents.
+    /// Return the total number of indexed `lex_docs` rows (W2-6 Task2:
+    /// FTS5-domain replacement for the old Tantivy segment doc count).
     pub fn total_docs(&self) -> usize {
-        if let Some((reader, _)) = &self.reader {
-            return reader.searcher().num_docs() as usize;
-        }
-        self.federated_readers()
-            .map(|readers| {
-                readers
-                    .iter()
-                    .map(|shard| shard.reader.searcher().num_docs() as usize)
-                    .sum()
-            })
-            .unwrap_or(0)
+        let Ok(sqlite_guard) = self.sqlite_guard() else {
+            return 0;
+        };
+        let Some(conn) = sqlite_guard.as_ref() else {
+            return 0;
+        };
+        let empty_params: [ParamValue; 0] = [];
+        franken_query_map_collect_retry(
+            conn,
+            "SELECT COUNT(*) FROM lex_docs",
+            &empty_params,
+            |row| row.get_typed::<i64>(0),
+        )
+        .ok()
+        .and_then(|rows| rows.into_iter().next())
+        .map(|count| count.max(0) as usize)
+        .unwrap_or(0)
     }
 
-    /// Returns `true` if the Tantivy search index is available.
-    pub fn has_tantivy(&self) -> bool {
-        self.reader.is_some() || self.federated_readers().is_some()
-    }
-
-    fn maybe_reload_reader(&self, reader: &IndexReader) -> Result<()> {
-        if !self.reload_on_search {
-            return Ok(());
-        }
-        const MIN_RELOAD_INTERVAL: Duration = Duration::from_millis(300);
-        let now = Instant::now();
-        let mut guard = self.last_reload.lock().unwrap_or_else(|e| e.into_inner());
-        if guard
-            .map(|t| now.duration_since(t) >= MIN_RELOAD_INTERVAL)
-            .unwrap_or(true)
-        {
-            let reload_started = Instant::now();
-            reader.reload()?;
-            let elapsed = reload_started.elapsed();
-            *guard = Some(now);
-            let epoch = self.reload_epoch.fetch_add(1, Ordering::SeqCst) + 1;
-            self.metrics.record_reload(elapsed);
-            tracing::debug!(
-                duration_ms = elapsed.as_millis() as u64,
-                reload_epoch = epoch,
-                "tantivy_reader_reload"
-            );
-        }
-        Ok(())
+    /// Returns `true` if the `fts_lex` (SQLite FTS5) lexical index has
+    /// content (W2-6 Task2: renamed from the pre-migration `has_tantivy`).
+    pub fn has_lexical_index(&self) -> bool {
+        self.has_populated_fts_lex()
     }
 
     fn maybe_log_cache_metrics(&self, event: &str) {
@@ -9184,51 +8502,6 @@ impl SearchClient {
         false
     }
 
-    fn maybe_schedule_adaptive_query_prewarm(&self, query: &str, filters: &SearchFilters) {
-        if query.is_empty() {
-            return;
-        }
-        let Some(tx) = &self.warm_tx else {
-            return;
-        };
-
-        let shard_name = self.shard_name(filters);
-        let decision = match self.prefix_cache.lock() {
-            Ok(cache) => {
-                let hot_prefix = cache.shard_opt(&shard_name).is_some_and(|shard| {
-                    self.cached_prefix_key_exists_in_shard(shard, query, filters)
-                });
-                if !hot_prefix {
-                    AdaptivePrewarmDecision::SkipCold
-                } else if cache.prewarm_pressure() {
-                    AdaptivePrewarmDecision::SkipPressure
-                } else {
-                    AdaptivePrewarmDecision::Schedule
-                }
-            }
-            Err(_) => return,
-        };
-
-        if decision == AdaptivePrewarmDecision::SkipPressure {
-            self.metrics.inc_prewarm_skipped_pressure();
-            return;
-        }
-        if decision == AdaptivePrewarmDecision::SkipCold {
-            return;
-        }
-
-        if tx
-            .send(WarmJob {
-                query: query.to_string(),
-                filters_fingerprint: filters_fingerprint(filters),
-                shard_name,
-            })
-            .is_ok()
-        {
-            self.metrics.inc_prewarm_scheduled();
-        }
-    }
-
     fn cached_prefix_hits(&self, query: &str, filters: &SearchFilters) -> Option<Vec<CachedHit>> {
         if query.is_empty() {
             return None;
@@ -9267,7 +8540,11 @@ impl SearchClient {
     pub fn cache_stats(&self) -> CacheStats {
         let (hits, miss, shortfall, reloads, reload_ms_total) = self.metrics.snapshot_all();
         let (prewarm_scheduled, prewarm_skipped_pressure) = self.metrics.snapshot_prewarm();
-        let reader_generation = self.last_generation.lock().ok().and_then(|guard| *guard);
+        // W2-6 Task2: no more Tantivy reader generation to track; kept as a
+        // permanent `None` for JSON output-shape stability (control-plane
+        // ruling: don't touch the documented `cass search --output json`
+        // schema as a side effect of this deletion).
+        let reader_generation: Option<u64> = None;
         let (
             total_cap,
             total_cost,
