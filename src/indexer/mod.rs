@@ -3836,64 +3836,6 @@ pub(crate) struct LexicalRebuildEquivalenceGoldenHit {
 }
 
 
-#[derive(Debug)]
-struct LexicalRebuildPacketPrepInput {
-    conversation: crate::storage::sqlite::LexicalRebuildConversationRow,
-    messages: Option<Vec<crate::model::types::Message>>,
-}
-
-fn prepare_lexical_rebuild_packet_from_canonical(
-    input: LexicalRebuildPacketPrepInput,
-    source_map: &HashMap<String, (SourceKind, Option<String>)>,
-) -> Result<LexicalRebuildConversationPacket> {
-    if let Some(messages) = input.messages {
-        return LexicalRebuildConversationPacket::from_canonical_replay_messages(
-            input.conversation,
-            messages,
-            source_map,
-        );
-    }
-
-    Ok(LexicalRebuildConversationPacket::from_canonical_replay(
-        input.conversation,
-        crate::storage::sqlite::LexicalRebuildGroupedMessageRows::new(),
-        None,
-        source_map,
-    ))
-}
-
-fn prepare_lexical_rebuild_packet_batch(
-    conversation_page: Vec<crate::storage::sqlite::LexicalRebuildConversationRow>,
-    mut grouped_messages: HashMap<i64, Vec<crate::model::types::Message>>,
-    source_map: &HashMap<String, (SourceKind, Option<String>)>,
-    lexical_rebuild_worker_pool: Option<&ThreadPool>,
-) -> Result<Vec<LexicalRebuildConversationPacket>> {
-    let inputs = conversation_page
-        .into_iter()
-        .map(|conversation| {
-            let messages = conversation
-                .id
-                .and_then(|conversation_id| grouped_messages.remove(&conversation_id));
-            LexicalRebuildPacketPrepInput {
-                conversation,
-                messages,
-            }
-        })
-        .collect::<Vec<_>>();
-
-    match lexical_rebuild_worker_pool {
-        Some(pool) => pool.install(|| {
-            inputs
-                .into_par_iter()
-                .map(|input| prepare_lexical_rebuild_packet_from_canonical(input, source_map))
-                .collect::<Result<Vec<_>>>()
-        }),
-        None => inputs
-            .into_iter()
-            .map(|input| prepare_lexical_rebuild_packet_from_canonical(input, source_map))
-            .collect::<Result<Vec<_>>>(),
-    }
-}
 
 fn assign_lexical_rebuild_flow_reservation_bytes(
     packets: &mut [LexicalRebuildConversationPacket],
@@ -18853,12 +18795,6 @@ pub mod persist {
         }
 
         #[test]
-        fn defer_lexical_updates_flag_parsing() {
-            let _guard = set_env("CASS_DEFER_LEXICAL_UPDATES", "1");
-            assert!(defer_lexical_updates_enabled());
-        }
-
-        #[test]
         fn retryable_franken_errors_are_detected() {
             let retryable = anyhow::Error::new(StorageError::Busy {
                 scope: crate::storage::api::BusyScope::Snapshot,
@@ -22639,7 +22575,6 @@ mod tests {
 
         let mutations = run_batch_index_with_connector_factories(
             &storage,
-            None,
             &opts,
             None,
             LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
@@ -24554,60 +24489,42 @@ mod tests {
             .insert_conversation_tree(agent_id, Some(workspace_id), &conversation)
             .unwrap();
 
-        // Drive the real live canonical-replay sink used by `--force-rebuild`:
-        // batch-fetch the persisted messages (roles round-trip through the
-        // Task 2.1 codec, so `tool_result` comes back as `Other("tool_result")`)
-        // and build the packet exactly as `prepare_lexical_rebuild_packet_batch`
-        // does.
-        let mut fetched = storage
-            .fetch_messages_for_lexical_rebuild_batch(&[inserted.conversation_id], None, None)
-            .unwrap();
-        let replay_messages = fetched
-            .remove(&inserted.conversation_id)
-            .expect("canonical replay messages");
-        let replay_row = crate::storage::sqlite::LexicalRebuildConversationRow {
-            id: Some(inserted.conversation_id),
-            agent_slug: "codex".into(),
-            workspace: Some(PathBuf::from("/tmp/tool-result-live-workspace")),
-            external_id: Some("tool-result-live-rebuild".into()),
-            title: Some("Tool result live rebuild".into()),
-            source_path: PathBuf::from("/tmp/tool-result-live-rebuild.jsonl"),
-            started_at: Some(1_700_002_000_000),
-            ended_at: Some(1_700_002_000_500),
-            source_id: LOCAL_SOURCE_ID.into(),
-            origin_host: None,
-        };
+        // W2-6 Task丙续: the old canonical-replay `LexicalRebuildConversationPacket`
+        // + `prebuilt_docs()` path this test used to drive has no production
+        // caller any more (`prepare_lexical_rebuild_packet_batch` /
+        // `prepare_lexical_rebuild_packet_from_canonical` are dead -- the real
+        // sink is `sync_lexical_domain_for_conversation_in_tx`, which
+        // `insert_conversation_tree` above already ran inline). Drive the
+        // REAL live sink by reading its DB-domain output (`lex_docs`)
+        // directly instead of reconstructing an in-memory packet.
 
-        let packet = LexicalRebuildConversationPacket::from_canonical_replay_messages(
-            replay_row,
-            replay_messages,
-            &HashMap::new(),
-        )
-        .unwrap();
-
-        // (a) RED before / GREEN after: the sink must flag the tool_result row
-        // as tool-class. The canonical-replay path leaves `role` empty, so match
-        // by idx.
-        let tool_result_row = packet
-            .messages
-            .iter()
-            .find(|row| row.idx == 2)
-            .expect("tool_result row present in canonical-replay projection");
+        // (a) RED before / GREEN after: the classifier the sink uses must
+        // flag `tool_result` as tool-class (`Other("tool_result")` is not
+        // `MessageRole::Tool`, so a naive role-enum match would miss it).
         assert!(
-            tool_result_row.is_tool_role,
+            crate::storage::sqlite::is_lexical_rebuild_tool_class_role("tool_result"),
             "live force-rebuild sink must classify tool_result as tool-class (Other(\"tool_result\") is not MessageRole::Tool)"
         );
 
         // (b) Behavioral RED before / GREEN after: the tool-result ack must be
-        // dropped as hard noise, leaving only the user + assistant docs.
-        let docs = packet.prebuilt_docs();
+        // dropped as hard noise, leaving only the user + assistant docs in
+        // lex_docs (DB-domain equivalent of the old in-memory prebuilt_docs()).
+        let doc_contents: Vec<String> = storage
+            .raw()
+            .query_all_map(
+                "SELECT content FROM lex_docs WHERE doc_id IN \
+                 (SELECT id FROM messages WHERE conversation_id = ?1)",
+                &[ParamValue::from(inserted.conversation_id)],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
         assert_eq!(
-            docs.len(),
+            doc_contents.len(),
             2,
             "tool_result ack must be dropped from the lexical index, leaving user + assistant"
         );
         assert!(
-            !docs.iter().any(|doc| doc.content == "already up to date"),
+            !doc_contents.iter().any(|content| content == "already up to date"),
             "the tool_result acknowledgement must not leak into the lexical index"
         );
 
@@ -24617,8 +24534,8 @@ mod tests {
         let expected = expected_live_lexical_doc_count(&storage).unwrap();
         assert_eq!(
             expected,
-            docs.len(),
-            "expected_live_lexical_doc_count (counter) must match prebuilt_docs (sink) for a tool_result corpus"
+            doc_contents.len(),
+            "expected_live_lexical_doc_count (counter) must match lex_docs (sink) for a tool_result corpus"
         );
 
         println!("LEXICAL_TOOL_RESULT_LIVE_OK");
@@ -24626,397 +24543,6 @@ mod tests {
 
 
 
-
-    #[test]
-    fn prepare_lexical_rebuild_packet_batch_preserves_order_and_parallel_equivalence() {
-        let source_map = HashMap::from([(
-            "builder-prep".to_string(),
-            (SourceKind::Ssh, Some("builder-prep".to_string())),
-        )]);
-        let conversation_page = vec![
-            crate::storage::sqlite::LexicalRebuildConversationRow {
-                id: Some(11),
-                agent_slug: "codex".into(),
-                workspace: Some(PathBuf::from("/tmp/workspace-a")),
-                external_id: Some("prep-a".into()),
-                title: Some("Prep A".into()),
-                source_path: PathBuf::from("/tmp/prep-a.jsonl"),
-                started_at: Some(1_700_000_500_000),
-                ended_at: Some(1_700_000_500_100),
-                source_id: "builder-prep".into(),
-                origin_host: Some("builder-prep".into()),
-            },
-            crate::storage::sqlite::LexicalRebuildConversationRow {
-                id: Some(22),
-                agent_slug: "codex".into(),
-                workspace: Some(PathBuf::from("/tmp/workspace-b")),
-                external_id: Some("prep-empty".into()),
-                title: Some("Prep Empty".into()),
-                source_path: PathBuf::from("/tmp/prep-empty.jsonl"),
-                started_at: Some(1_700_000_500_200),
-                ended_at: Some(1_700_000_500_200),
-                source_id: LOCAL_SOURCE_ID.into(),
-                origin_host: None,
-            },
-            crate::storage::sqlite::LexicalRebuildConversationRow {
-                id: Some(33),
-                agent_slug: "codex".into(),
-                workspace: None,
-                external_id: Some("prep-c".into()),
-                title: Some("Prep C".into()),
-                source_path: PathBuf::from("/tmp/prep-c.jsonl"),
-                started_at: Some(1_700_000_500_400),
-                ended_at: Some(1_700_000_500_500),
-                source_id: LOCAL_SOURCE_ID.into(),
-                origin_host: None,
-            },
-        ];
-        let grouped_messages = HashMap::from([
-            (
-                11_i64,
-                vec![
-                    Message {
-                        id: Some(501),
-                        idx: 0,
-                        role: MessageRole::User,
-                        author: Some("user".into()),
-                        created_at: Some(1_700_000_500_010),
-                        content: "prep-a-0".into(),
-                        extra_json: serde_json::json!({}),
-                        snippets: Vec::new(),
-                    },
-                    Message {
-                        id: Some(502),
-                        idx: 1,
-                        role: MessageRole::Agent,
-                        author: Some("assistant".into()),
-                        created_at: Some(1_700_000_500_020),
-                        content: "prep-a-1".into(),
-                        extra_json: serde_json::json!({}),
-                        snippets: Vec::new(),
-                    },
-                ],
-            ),
-            (
-                33_i64,
-                vec![Message {
-                    id: Some(601),
-                    idx: 0,
-                    role: MessageRole::Tool,
-                    author: Some("tool".into()),
-                    created_at: Some(1_700_000_500_410),
-                    content: "prep-c-0".into(),
-                    extra_json: serde_json::json!({}),
-                    snippets: Vec::new(),
-                }],
-            ),
-        ]);
-
-        let serial_packets = prepare_lexical_rebuild_packet_batch(
-            conversation_page.clone(),
-            grouped_messages.clone(),
-            &source_map,
-            None,
-        )
-        .unwrap();
-        let worker_pool = ThreadPoolBuilder::new().num_threads(2).build().unwrap();
-        let parallel_packets = prepare_lexical_rebuild_packet_batch(
-            conversation_page,
-            grouped_messages,
-            &source_map,
-            Some(&worker_pool),
-        )
-        .unwrap();
-
-        let serial_views = serial_packets
-            .iter()
-            .map(LexicalRebuildConversationPacket::semantic_view)
-            .collect::<Vec<_>>();
-        let parallel_views = parallel_packets
-            .iter()
-            .map(LexicalRebuildConversationPacket::semantic_view)
-            .collect::<Vec<_>>();
-        assert_eq!(serial_views, parallel_views);
-        assert_eq!(
-            parallel_packets
-                .iter()
-                .map(|packet| packet.identity.external_id.as_deref())
-                .collect::<Vec<_>>(),
-            vec![Some("prep-a"), Some("prep-empty"), Some("prep-c")]
-        );
-        assert_eq!(parallel_packets[0].last_message_id, Some(502));
-        assert_eq!(parallel_packets[1].message_count, 0);
-        assert_eq!(parallel_packets[2].provenance.origin_kind, "local");
-    }
-
-    fn lexical_rebuild_test_source_map(
-        storage: &FrankenStorage,
-    ) -> HashMap<String, (SourceKind, Option<String>)> {
-        storage
-            .list_sources()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|source| (source.id, (source.kind, source.host_label)))
-            .collect()
-    }
-
-    fn legacy_offset_lexical_rebuild_packets(
-        storage: &FrankenStorage,
-        page_size: i64,
-    ) -> Result<Vec<LexicalRebuildConversationPacket>> {
-        let source_map = lexical_rebuild_test_source_map(storage);
-        let (agent_slugs, workspace_paths) = storage.build_lexical_rebuild_lookups()?;
-        let mut packets = Vec::new();
-        let mut offset = 0_i64;
-
-        loop {
-            let conversation_page = storage.list_conversations_for_lexical_rebuild_by_offset(
-                page_size,
-                offset,
-                &agent_slugs,
-                &workspace_paths,
-            )?;
-            if conversation_page.is_empty() {
-                break;
-            }
-
-            offset = offset.saturating_add(i64::try_from(conversation_page.len()).unwrap_or(0));
-            for conversation in conversation_page {
-                let conversation_id = conversation.id.ok_or_else(|| {
-                    anyhow::anyhow!("legacy lexical rebuild row missing conversation id")
-                })?;
-                let grouped_messages = HashMap::from([(
-                    conversation_id,
-                    storage.fetch_messages_for_lexical_rebuild(conversation_id)?,
-                )]);
-                let mut prepared = prepare_lexical_rebuild_packet_batch(
-                    vec![conversation],
-                    grouped_messages,
-                    &source_map,
-                    None,
-                )?;
-                packets.push(
-                    prepared
-                        .pop()
-                        .expect("single-conversation legacy packet should be prepared"),
-                );
-            }
-        }
-
-        Ok(packets)
-    }
-
-    fn keyset_batched_lexical_rebuild_packets(
-        storage: &FrankenStorage,
-        page_size: i64,
-        batch_limit: usize,
-    ) -> Result<Vec<LexicalRebuildConversationPacket>> {
-        let source_map = lexical_rebuild_test_source_map(storage);
-        let (agent_slugs, workspace_paths) = storage.build_lexical_rebuild_lookups()?;
-        let mut packets = Vec::new();
-        let mut after_conversation_id = 0_i64;
-        let batch_limit = batch_limit.max(1);
-
-        loop {
-            let conversation_page = storage.list_conversations_for_lexical_rebuild_after_id(
-                page_size,
-                after_conversation_id,
-                &agent_slugs,
-                &workspace_paths,
-            )?;
-            if conversation_page.is_empty() {
-                break;
-            }
-            after_conversation_id = conversation_page
-                .last()
-                .and_then(|conversation| conversation.id)
-                .ok_or_else(|| {
-                    anyhow::anyhow!("keyset lexical rebuild page missing terminal id")
-                })?;
-
-            for chunk in conversation_page.chunks(batch_limit) {
-                let conversation_chunk = chunk.to_vec();
-                let conversation_ids = conversation_chunk
-                    .iter()
-                    .filter_map(|conversation| conversation.id)
-                    .collect::<Vec<_>>();
-                let grouped_messages = storage.fetch_messages_for_lexical_rebuild_batch(
-                    &conversation_ids,
-                    None,
-                    None,
-                )?;
-                let mut prepared = prepare_lexical_rebuild_packet_batch(
-                    conversation_chunk,
-                    grouped_messages,
-                    &source_map,
-                    None,
-                )?;
-                packets.append(&mut prepared);
-            }
-        }
-
-        Ok(packets)
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    struct LexicalRebuildEquivalenceEvidence {
-        document_count: usize,
-        manifest_fingerprint: String,
-        golden_query_digest: String,
-    }
-
-    fn lexical_rebuild_packet_artifact(
-        packets: &[LexicalRebuildConversationPacket],
-    ) -> serde_json::Value {
-        let packet_rows = packets
-            .iter()
-            .map(|packet| {
-                serde_json::json!({
-                    "conversation_id": packet.identity.conversation_id,
-                    "external_id": packet.identity.external_id.as_deref(),
-                    "agent": &packet.identity.agent,
-                    "workspace": packet.identity.workspace.as_deref(),
-                    "source_path": &packet.identity.source_path,
-                    "source_id": &packet.provenance.source_id,
-                    "origin_kind": &packet.provenance.origin_kind,
-                    "origin_host": packet.provenance.origin_host.as_deref(),
-                    "message_count": packet.message_count,
-                    "message_bytes": packet.message_bytes,
-                    "last_message_id": packet.last_message_id,
-                    "messages": packet.messages.iter().map(|message| {
-                        serde_json::json!({
-                            "idx": message.idx,
-                            "is_tool_role": message.is_tool_role,
-                            "created_at": message.created_at,
-                            "content": &message.content,
-                        })
-                    }).collect::<Vec<_>>(),
-                })
-            })
-            .collect::<Vec<_>>();
-        let document_rows = packets
-            .iter()
-            .flat_map(|packet| {
-                packet.prebuilt_docs().into_iter().map(|doc| {
-                    serde_json::json!({
-                        "conversation_id": doc.conversation_id,
-                        "agent": doc.agent,
-                        "workspace": doc.workspace,
-                        "source_path": doc.source_path,
-                        "msg_idx": doc.msg_idx,
-                        "created_at": doc.created_at,
-                        "title": doc.title,
-                        "content": doc.content,
-                        "source_id": doc.source_id,
-                        "origin_kind": doc.origin_kind,
-                        "origin_host": doc.origin_host,
-                    })
-                })
-            })
-            .collect::<Vec<_>>();
-
-        serde_json::json!({
-            "packets": packet_rows,
-            "documents": document_rows,
-        })
-    }
-
-    fn stable_json_digest(value: &serde_json::Value) -> String {
-        let bytes = serde_json::to_vec(value).expect("equivalence artifact should serialize");
-        blake3::hash(&bytes).to_hex().to_string()
-    }
-
-    fn lexical_rebuild_golden_query_digest(packets: &[LexicalRebuildConversationPacket]) -> String {
-        let queries = [
-            "lexical-fixture-1",
-            "lexical-fixture-2-second",
-            "missing-golden-query",
-        ];
-        let hits = queries
-            .iter()
-            .flat_map(|query| {
-                packets.iter().flat_map(move |packet| {
-                    packet.prebuilt_docs().into_iter().filter_map(move |doc| {
-                        let title = doc.title.unwrap_or("");
-                        let workspace = doc.workspace.unwrap_or("");
-                        if doc.content.contains(query)
-                            || title.contains(query)
-                            || workspace.contains(query)
-                            || doc.source_path.contains(query)
-                        {
-                            Some(serde_json::json!({
-                                "query": query,
-                                "conversation_id": doc.conversation_id,
-                                "agent": doc.agent,
-                                "source_path": doc.source_path,
-                                "msg_idx": doc.msg_idx,
-                                "created_at": doc.created_at,
-                                "content": doc.content,
-                            }))
-                        } else {
-                            None
-                        }
-                    })
-                })
-            })
-            .collect::<Vec<_>>();
-
-        stable_json_digest(&serde_json::json!({
-            "queries": queries,
-            "hits": hits,
-        }))
-    }
-
-    fn lexical_rebuild_equivalence_evidence(
-        packets: &[LexicalRebuildConversationPacket],
-    ) -> LexicalRebuildEquivalenceEvidence {
-        let artifact = lexical_rebuild_packet_artifact(packets);
-        LexicalRebuildEquivalenceEvidence {
-            document_count: packets
-                .iter()
-                .map(|packet| packet.prebuilt_docs().len())
-                .sum(),
-            manifest_fingerprint: stable_json_digest(&artifact),
-            golden_query_digest: lexical_rebuild_golden_query_digest(packets),
-        }
-    }
-
-    #[test]
-    fn keyset_batched_lexical_rebuild_matches_legacy_offset_replay_evidence() {
-        let tmp = TempDir::new().unwrap();
-        let db_path = tmp.path().join("lexical-equivalence.db");
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        ensure_fts_schema(&storage);
-        seed_lexical_rebuild_fixture(&storage);
-
-        let legacy_packets = legacy_offset_lexical_rebuild_packets(&storage, 1).unwrap();
-        let keyset_packets = keyset_batched_lexical_rebuild_packets(&storage, 2, 2).unwrap();
-        let legacy_evidence = lexical_rebuild_equivalence_evidence(&legacy_packets);
-        let keyset_evidence = lexical_rebuild_equivalence_evidence(&keyset_packets);
-        let legacy_artifact =
-            serde_json::to_string_pretty(&lexical_rebuild_packet_artifact(&legacy_packets))
-                .unwrap();
-        let keyset_artifact =
-            serde_json::to_string_pretty(&lexical_rebuild_packet_artifact(&keyset_packets))
-                .unwrap();
-
-        assert_eq!(
-            legacy_packets
-                .iter()
-                .map(LexicalRebuildConversationPacket::semantic_view)
-                .collect::<Vec<_>>(),
-            keyset_packets
-                .iter()
-                .map(LexicalRebuildConversationPacket::semantic_view)
-                .collect::<Vec<_>>(),
-            "legacy offset replay and keyset batched replay diverged\nlegacy_artifact={legacy_artifact}\nkeyset_artifact={keyset_artifact}"
-        );
-        assert_eq!(
-            legacy_evidence, keyset_evidence,
-            "equivalence evidence diverged\nlegacy_artifact={legacy_artifact}\nkeyset_artifact={keyset_artifact}"
-        );
-        assert_eq!(keyset_evidence.document_count, 4);
-    }
 
     #[test]
     fn assign_lexical_rebuild_flow_reservation_bytes_preserves_exact_total() {
@@ -27550,8 +27076,6 @@ mod tests {
 
         let db_path = data_dir.join("db.sqlite");
         let storage = FrankenStorage::open(&db_path).unwrap();
-        ensure_fts_schema(&storage);
-        let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
         let progress = Arc::new(IndexingProgress::default());
         let (tx, rx) = bounded(2);
 
@@ -27569,7 +27093,6 @@ mod tests {
             1,
             &storage,
             &data_dir,
-            Some(&mut index),
             Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
             &Some(progress.clone()),
             LexicalPopulationStrategy::IncrementalInline,
@@ -27580,7 +27103,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(discovered, vec!["claude".to_string()]);
-        assert_eq!(mutations, CanonicalMutationCounts::default());
+        assert_eq!(mutations.canonical_mutations, CanonicalMutationCounts::default());
         let stats = progress.stats.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(stats.agents_discovered, vec!["claude".to_string()]);
         assert_eq!(stats.total_conversations, 0);
@@ -27600,9 +27123,6 @@ mod tests {
 
         let db_path = data_dir.join("db.sqlite");
         let storage = FrankenStorage::open(&db_path)?;
-        ensure_fts_schema(&storage);
-        let index_path = index_dir(&data_dir)?;
-        let mut index = TantivyIndex::open_or_create(&index_path)?;
         let progress = Arc::new(IndexingProgress::default());
         let (tx, rx) = bounded(2);
 
@@ -27625,7 +27145,6 @@ mod tests {
             1,
             &storage,
             &data_dir,
-            Some(&mut index),
             Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
             &Some(progress.clone()),
             LexicalPopulationStrategy::IncrementalInline,
@@ -27661,9 +27180,6 @@ mod tests {
 
         let db_path = data_dir.join("db.sqlite");
         let storage = FrankenStorage::open(&db_path)?;
-        ensure_fts_schema(&storage);
-        let index_path = index_dir(&data_dir)?;
-        let mut index = TantivyIndex::open_or_create(&index_path)?;
         let progress = Arc::new(IndexingProgress::default());
         let (tx, rx) = bounded(2);
 
@@ -27686,7 +27202,6 @@ mod tests {
             1,
             &storage,
             &data_dir,
-            Some(&mut index),
             Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
             &Some(progress),
             LexicalPopulationStrategy::IncrementalInline,
@@ -27712,7 +27227,6 @@ mod tests {
 
         let db_path = data_dir.join("db.sqlite");
         let storage = FrankenStorage::open(&db_path).unwrap();
-        ensure_fts_schema(&storage);
         let progress = Arc::new(IndexingProgress::default());
         let (tx, rx) = bounded(STREAMING_CHANNEL_SIZE);
 
@@ -27736,7 +27250,6 @@ mod tests {
             1,
             &storage,
             &data_dir,
-            None,
             Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
             &Some(progress.clone()),
             LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
@@ -27744,7 +27257,11 @@ mod tests {
             None,
             &SharedActiveSessionSourceSkips::default(),
         )
-        .expect("deferred streaming ingest should not require a Tantivy writer");
+        // W2-6 Task丙续: original message referenced "a Tantivy writer" --
+        // updated to the DB-domain equivalent ("the authoritative lexical
+        // rebuild"), the deferred path no longer requires any live sink up
+        // front at all.
+        .expect("deferred streaming ingest should not require an eager lexical sink");
 
         let conversation_count: i64 = storage
             .raw()
@@ -27759,7 +27276,7 @@ mod tests {
 
         assert_eq!(discovered, vec!["codex".to_string()]);
         assert_eq!(
-            mutations,
+            mutations.canonical_mutations,
             CanonicalMutationCounts {
                 inserted_conversations: 1,
                 inserted_messages: 2,
@@ -27767,9 +27284,18 @@ mod tests {
         );
         assert_eq!(conversation_count, 1);
         assert_eq!(message_count, 2);
-        assert!(
-            !index_dir(&data_dir).unwrap().join("meta.json").exists(),
-            "deferred streaming ingest should not materialize a live Tantivy index before the authoritative rebuild"
+        // W2-6 Task丙续: dropped the tantivy-only `meta.json` non-existence
+        // assertion (交接件-flagged dead symbol -- tantivy is gone, so it was
+        // vacuously true and never actually testing anything). The real
+        // regression intent -- deferred ingest doesn't populate the lexical
+        // domain up front -- is the DB-domain assertion below.
+        let lex_docs_count: i64 = storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM lex_docs", &[], |row| row.get_typed(0))
+            .unwrap();
+        assert_eq!(
+            lex_docs_count, 0,
+            "deferred streaming ingest should not populate lex_docs before the authoritative rebuild"
         );
     }
 
@@ -27783,8 +27309,6 @@ mod tests {
 
         let db_path = data_dir.join("db.sqlite");
         let storage = FrankenStorage::open(&db_path).unwrap();
-        ensure_fts_schema(&storage);
-        let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
         let progress = Arc::new(IndexingProgress::default());
         let (tx, rx) = bounded(STREAMING_CHANNEL_SIZE);
 
@@ -27805,7 +27329,6 @@ mod tests {
             1,
             &storage,
             &data_dir,
-            Some(&mut index),
             Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
             &Some(progress.clone()),
             LexicalPopulationStrategy::IncrementalInline,
@@ -27815,8 +27338,8 @@ mod tests {
         )
         .expect("lexical OOM after SQLite ingest should defer repair, not fail the scan");
 
-        assert_eq!(outcome.inserted_conversations, 1);
-        assert_eq!(outcome.inserted_messages, 1);
+        assert_eq!(outcome.canonical_mutations.inserted_conversations, 1);
+        assert_eq!(outcome.canonical_mutations.inserted_messages, 1);
         assert!(outcome.lexical_update_deferred);
         assert_eq!(outcome.quarantined_conversations, 0);
         let conversation_rows: i64 = storage
@@ -27851,12 +27374,10 @@ mod tests {
 
         let db_path = data_dir.join("db.sqlite");
         let storage = FrankenStorage::open(&db_path).unwrap();
-        ensure_fts_schema(&storage);
         let progress = Arc::new(IndexingProgress::default());
         let conv = norm_conv(Some("poison-single"), vec![norm_msg(0, 1_700_000_000_000)]);
 
         for expected_attempts in [1_u64, 2] {
-            let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
             let (tx, rx) = bounded(STREAMING_CHANNEL_SIZE);
             send_conversation_batches(&tx, "codex", vec![conv.clone()], true);
             send_done(&tx, "codex", true);
@@ -27867,7 +27388,6 @@ mod tests {
                 1,
                 &storage,
                 &data_dir,
-                Some(&mut index),
                 Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
                 &Some(progress.clone()),
                 LexicalPopulationStrategy::IncrementalInline,
@@ -27877,8 +27397,8 @@ mod tests {
             )
             .expect("single deferred ingest OOM should quarantine and continue");
 
-            assert_eq!(outcome.inserted_conversations, 0);
-            assert_eq!(outcome.inserted_messages, 0);
+            assert_eq!(outcome.canonical_mutations.inserted_conversations, 0);
+            assert_eq!(outcome.canonical_mutations.inserted_messages, 0);
             assert!(outcome.lexical_update_deferred);
             assert_eq!(outcome.quarantined_conversations, 1);
 
@@ -27932,8 +27452,6 @@ mod tests {
 
         let db_path = data_dir.join("db.sqlite");
         let storage = FrankenStorage::open(&db_path).unwrap();
-        ensure_fts_schema(&storage);
-        let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
         let progress = Arc::new(IndexingProgress::default());
         let conv = norm_conv(Some("defer-single"), vec![norm_msg(0, 1_700_000_000_000)]);
 
@@ -27947,7 +27465,6 @@ mod tests {
             1,
             &storage,
             &data_dir,
-            Some(&mut index),
             Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
             &Some(progress.clone()),
             LexicalPopulationStrategy::IncrementalInline,
@@ -28517,7 +28034,6 @@ mod tests {
 
         let db_path = data_dir.join("db.sqlite");
         let storage = FrankenStorage::open(&db_path)?;
-        ensure_fts_schema(&storage);
         let progress_tracker = Arc::new(IndexingProgress::default());
         let progress = Some(progress_tracker.clone());
         let progress_bump = Arc::new(AtomicI64::new(1));
@@ -28539,7 +28055,6 @@ mod tests {
 
         let outcome = ingest_non_watch_batch_with_oom_split(
             &storage,
-            None,
             &data_dir,
             &conversations,
             &progress,
@@ -28549,11 +28064,11 @@ mod tests {
         )?;
 
         anyhow::ensure!(
-            outcome.inserted_conversations == conversations.len(),
+            outcome.canonical_mutations.inserted_conversations == conversations.len(),
             "chunked ingest should insert every conversation"
         );
         anyhow::ensure!(
-            outcome.inserted_messages == conversations.len(),
+            outcome.canonical_mutations.inserted_messages == conversations.len(),
             "chunked ingest should insert every message"
         );
         anyhow::ensure!(
@@ -29070,7 +28585,6 @@ mod tests {
             2,
             &storage,
             &data_dir,
-            None,
             flow_limiter,
             &Some(progress.clone()),
             LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
@@ -29107,7 +28621,7 @@ mod tests {
         assert_eq!(conversation_count, expected_conversations);
         assert_eq!(message_count, expected_messages);
         assert_eq!(
-            mutations,
+            mutations.canonical_mutations,
             CanonicalMutationCounts {
                 inserted_conversations: expected_conversations as usize,
                 inserted_messages: expected_messages as usize,
