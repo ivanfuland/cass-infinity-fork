@@ -17410,60 +17410,6 @@ pub mod persist {
             .collect()
     }
 
-    #[cfg(test)]
-    #[derive(Debug, Clone, Default)]
-    struct PersistConversationPerfProfile {
-        invocations: usize,
-        messages: usize,
-        inserted_messages: usize,
-        total_duration: Duration,
-        db_duration: Duration,
-        packet_duration: Duration,
-        positional_duration: Duration,
-        tantivy_add_duration: Duration,
-    }
-
-    #[cfg(test)]
-    impl PersistConversationPerfProfile {
-        fn millis(duration: Duration) -> f64 {
-            duration.as_secs_f64() * 1000.0
-        }
-
-        fn log_summary(&self, label: &str) {
-            let calls = self.invocations.max(1) as f64;
-            let accounted_duration = self.db_duration
-                + self.packet_duration
-                + self.positional_duration
-                + self.tantivy_add_duration;
-            let residual_duration = self.total_duration.saturating_sub(accounted_duration);
-            eprintln!(
-                concat!(
-                    "CASS_PERSIST_STAGE_PROFILE ",
-                    "label={} calls={} messages={} inserted_messages={} ",
-                    "total_ms={:.3} db_ms={:.3} packet_ms={:.3} positional_ms={:.3} ",
-                    "tantivy_add_ms={:.3} residual_ms={:.3} ",
-                    "avg_total_ms={:.3} avg_db_ms={:.3} avg_packet_ms={:.3} ",
-                    "avg_positional_ms={:.3} avg_tantivy_add_ms={:.3}"
-                ),
-                label,
-                self.invocations,
-                self.messages,
-                self.inserted_messages,
-                Self::millis(self.total_duration),
-                Self::millis(self.db_duration),
-                Self::millis(self.packet_duration),
-                Self::millis(self.positional_duration),
-                Self::millis(self.tantivy_add_duration),
-                Self::millis(residual_duration),
-                Self::millis(self.total_duration) / calls,
-                Self::millis(self.db_duration) / calls,
-                Self::millis(self.packet_duration) / calls,
-                Self::millis(self.positional_duration) / calls,
-                Self::millis(self.tantivy_add_duration) / calls,
-            );
-        }
-    }
-
     #[derive(Debug, Clone, Default)]
     pub(super) struct PersistBatchOutcome {
         pub inserted_conversations: usize,
@@ -18543,70 +18489,6 @@ pub mod persist {
         Ok(())
     }
 
-    #[cfg(test)]
-    fn persist_conversation_with_profile(
-        storage: &FrankenStorage,
-        t_index: &mut TantivyIndex,
-        conv: &NormalizedConversation,
-        profile: &mut PersistConversationPerfProfile,
-    ) -> Result<()> {
-        let total_started = Instant::now();
-        let db_started = Instant::now();
-        let InsertOutcome {
-            conversation_id,
-            conversation_inserted: _conversation_inserted,
-            inserted_indices,
-        } = with_ephemeral_writer(storage, false, "persist_conversation", |writer| {
-            let internal_conv = map_to_internal(conv);
-            let agent = Agent {
-                id: None,
-                slug: conv.agent_slug.clone(),
-                name: conv.agent_slug.clone(),
-                version: None,
-                kind: AgentKind::Cli,
-            };
-            let agent_id = writer.ensure_agent(&agent)?;
-
-            let workspace_id = if let Some(ws) = &conv.workspace {
-                Some(writer.ensure_workspace(ws, None)?)
-            } else {
-                None
-            };
-
-            writer.insert_conversation_tree(agent_id, workspace_id, &internal_conv)
-        })?;
-        profile.db_duration += db_started.elapsed();
-
-        if !defer_lexical_updates_enabled() && !inserted_indices.is_empty() {
-            let packet_started = Instant::now();
-            let packet = lexical_packet_for_persist(conv);
-            profile.packet_duration += packet_started.elapsed();
-
-            let positional_started = Instant::now();
-            let positional = positional_indices_for_inserted(&packet, &inserted_indices);
-            profile.positional_duration += positional_started.elapsed();
-
-            if !positional.is_empty() {
-                let tantivy_add_started = Instant::now();
-                t_index.add_messages_from_packet(
-                    &packet,
-                    Some(&positional),
-                    Some(conversation_id),
-                    |_| Ok(()),
-                )?;
-                profile.tantivy_add_duration += tantivy_add_started.elapsed();
-            }
-        }
-
-        profile.invocations = profile.invocations.saturating_add(1);
-        profile.messages = profile.messages.saturating_add(conv.messages.len());
-        profile.inserted_messages = profile
-            .inserted_messages
-            .saturating_add(inserted_indices.len());
-        profile.total_duration += total_started.elapsed();
-        Ok(())
-    }
-
     /// Persist multiple conversations in a single database transaction for better performance.
     /// This reduces SQLite transaction overhead when indexing many conversations at once.
     ///
@@ -19039,11 +18921,11 @@ pub mod persist {
             assert_eq!(fingerprint, "content-v1:2:9:11");
         }
 
-        fn tantivy_doc_count(index: &mut crate::search::tantivy::TantivyIndex) -> u64 {
-            index.commit().expect("commit tantivy");
-            let reader = index.reader().expect("reader");
-            reader.reload().expect("reload");
-            reader.searcher().num_docs()
+        fn lex_docs_row_count(storage: &FrankenStorage) -> i64 {
+            storage
+                .raw()
+                .query_row_map("SELECT COUNT(*) FROM lex_docs", &[], |row| row.get_typed(0))
+                .unwrap()
         }
 
         #[test]
@@ -19255,16 +19137,13 @@ pub mod persist {
         #[test]
         fn begin_concurrent_persist_writes_all_conversations() {
             use crate::connectors::NormalizedConversation;
-            use crate::search::tantivy::TantivyIndex;
 
             let dir = tempfile::TempDir::new().unwrap();
             let db_path = dir.path().join("test.db");
-            let index_path = dir.path().join("tantivy");
 
             // Create the legacy embedded engine-native database (BEGIN CONCURRENT requires it)
             let frank = create_franken_db(&db_path);
             drop(frank); // close so writers can open independently
-            let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
 
             // Build 10 conversations across 3 agent slugs
             let convs: Vec<NormalizedConversation> = (0..10)
@@ -19301,7 +19180,6 @@ pub mod persist {
             persist_conversations_batched_begin_concurrent(
                 &FrankenStorage::open(&db_path).unwrap(),
                 &db_path,
-                Some(&mut t_index),
                 &convs,
                 LexicalPopulationStrategy::InlineRebuildFromScan,
                 false,
@@ -19362,9 +19240,6 @@ pub mod persist {
                 })
                 .unwrap();
             assert_eq!(agent_count, 3, "3 distinct agent slugs should exist");
-
-            // Commit tantivy to finalize
-            t_index.commit().unwrap();
         }
 
         /// B4 Step 2 assertion ②: the rayon-parallel-chunk direct-write path
@@ -19378,16 +19253,13 @@ pub mod persist {
         #[test]
         fn begin_concurrent_persist_never_exceeds_one_live_writer_connection() {
             use crate::connectors::NormalizedConversation;
-            use crate::search::tantivy::TantivyIndex;
             use crate::storage::api::{reset_writer_connection_peak, writer_connection_peak};
 
             let dir = tempfile::TempDir::new().unwrap();
             let db_path = dir.path().join("mini-corpus.db");
-            let index_path = dir.path().join("tantivy");
 
             let frank = create_franken_db(&db_path);
             drop(frank);
-            let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
 
             // 6 conversations, chunk size 2 -> 3 parallel chunks pre-B4.
             let convs: Vec<NormalizedConversation> = (0..6)
@@ -19434,7 +19306,6 @@ pub mod persist {
             persist_conversations_batched_begin_concurrent(
                 &caller_storage,
                 &db_path,
-                Some(&mut t_index),
                 &convs,
                 LexicalPopulationStrategy::InlineRebuildFromScan,
                 false,
@@ -19463,22 +19334,17 @@ pub mod persist {
                  even across parallel rayon chunks -- workers must hand parsed batches to a \
                  single writer thread instead of each opening their own connection"
             );
-
-            t_index.commit().unwrap();
         }
 
         #[test]
         fn begin_concurrent_single_conversation_works() {
             use crate::connectors::NormalizedConversation;
-            use crate::search::tantivy::TantivyIndex;
 
             let dir = tempfile::TempDir::new().unwrap();
             let db_path = dir.path().join("test.db");
-            let index_path = dir.path().join("tantivy");
 
             let frank = create_franken_db(&db_path);
             drop(frank);
-            let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
 
             let convs = vec![NormalizedConversation {
                 agent_slug: "solo-agent".into(),
@@ -19504,7 +19370,6 @@ pub mod persist {
             persist_conversations_batched_begin_concurrent(
                 &FrankenStorage::open(&db_path).unwrap(),
                 &db_path,
-                Some(&mut t_index),
                 &convs,
                 LexicalPopulationStrategy::InlineRebuildFromScan,
                 false,
@@ -19533,16 +19398,13 @@ pub mod persist {
         #[serial]
         fn persist_conversations_batched_can_defer_inline_lexical_updates() {
             use crate::connectors::NormalizedConversation;
-            use crate::search::tantivy::TantivyIndex;
 
             let _guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
 
             let dir = tempfile::TempDir::new().unwrap();
             let db_path = dir.path().join("serial-deferred.db");
-            let index_path = dir.path().join("tantivy");
 
             let storage = create_franken_db(&db_path);
-            let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
             let convs = vec![NormalizedConversation {
                 agent_slug: "serial-agent".into(),
                 external_id: Some("serial-1".into()),
@@ -19578,7 +19440,6 @@ pub mod persist {
 
             persist_conversations_batched(
                 &storage,
-                Some(&mut t_index),
                 &convs,
                 LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
                 false,
@@ -19598,25 +19459,26 @@ pub mod persist {
 
             assert_eq!(conversation_count, 1);
             assert_eq!(message_count, 2);
-            assert_eq!(tantivy_doc_count(&mut t_index), 0);
+            assert_eq!(
+                lex_docs_row_count(&storage),
+                0,
+                "DeferredAuthoritativeDbRebuild must not populate lex_docs inline"
+            );
         }
 
         #[test]
         #[serial]
         fn begin_concurrent_persist_can_defer_inline_lexical_updates() {
             use crate::connectors::NormalizedConversation;
-            use crate::search::tantivy::TantivyIndex;
 
             let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "1");
             let _chunk_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE", "1");
 
             let dir = tempfile::TempDir::new().unwrap();
             let db_path = dir.path().join("begin-deferred.db");
-            let index_path = dir.path().join("tantivy");
 
             let frank = create_franken_db(&db_path);
             drop(frank);
-            let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
             let convs = vec![NormalizedConversation {
                 agent_slug: "begin-agent".into(),
                 external_id: Some("begin-1".into()),
@@ -19653,7 +19515,6 @@ pub mod persist {
             persist_conversations_batched_begin_concurrent(
                 &FrankenStorage::open(&db_path).unwrap(),
                 &db_path,
-                Some(&mut t_index),
                 &convs,
                 LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
                 false,
@@ -19676,7 +19537,11 @@ pub mod persist {
 
             assert_eq!(conversation_count, 1);
             assert_eq!(message_count, 2);
-            assert_eq!(tantivy_doc_count(&mut t_index), 0);
+            assert_eq!(
+                lex_docs_row_count(&reader),
+                0,
+                "DeferredAuthoritativeDbRebuild must not populate lex_docs inline"
+            );
         }
 
         #[test]
@@ -19694,17 +19559,14 @@ pub mod persist {
             // CASS_DEFER_LEXICAL_UPDATES must stay unset for this test to
             // actually exercise that path with lexical sync enabled.
             use crate::connectors::NormalizedConversation;
-            use crate::search::tantivy::TantivyIndex;
 
             let _begin_guard = unset_env("CASS_INDEXER_BEGIN_CONCURRENT");
             let _defer_guard = unset_env("CASS_DEFER_LEXICAL_UPDATES");
 
             let dir = tempfile::TempDir::new().unwrap();
             let db_path = dir.path().join("default-hot-path.db");
-            let index_path = dir.path().join("tantivy");
 
             let storage = create_franken_db(&db_path);
-            let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
             let convs = vec![NormalizedConversation {
                 agent_slug: "default-hot-agent".into(),
                 external_id: Some("default-hot-1".into()),
@@ -19728,7 +19590,6 @@ pub mod persist {
 
             persist_conversations_batched(
                 &storage,
-                Some(&mut t_index),
                 &convs,
                 LexicalPopulationStrategy::InlineRebuildFromScan,
                 false,
@@ -20443,7 +20304,6 @@ pub mod persist {
         #[serial]
         fn persist_conversations_batched_falls_back_for_duplicate_keys() {
             use crate::connectors::NormalizedConversation;
-            use crate::search::tantivy::TantivyIndex;
             use crate::sources::provenance::{Source, SourceKind};
 
             let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "1");
@@ -20451,10 +20311,8 @@ pub mod persist {
 
             let dir = tempfile::TempDir::new().unwrap();
             let db_path = dir.path().join("test.db");
-            let index_path = dir.path().join("tantivy");
 
             let storage = create_franken_db(&db_path);
-            let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
             storage
                 .upsert_source(&Source {
                     id: "remote-source".into(),
@@ -20533,7 +20391,6 @@ pub mod persist {
 
             persist_conversations_batched(
                 &storage,
-                Some(&mut t_index),
                 &convs,
                 LexicalPopulationStrategy::IncrementalInline,
                 false,
@@ -20556,8 +20413,6 @@ pub mod persist {
                 })
                 .unwrap();
             assert_eq!(stored_indices, vec![0, 1, 2]);
-
-            t_index.commit().unwrap();
         }
 
         #[test]
@@ -20568,7 +20423,6 @@ pub mod persist {
             // asserts that the parallel pre-compute does NOT change the
             // persisted content, message ordering, or redaction behaviour.
             use crate::connectors::NormalizedConversation;
-            use crate::search::tantivy::TantivyIndex;
 
             let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
             // Force redaction on so we exercise the heavier allocation path
@@ -20577,10 +20431,8 @@ pub mod persist {
 
             let dir = tempfile::TempDir::new().unwrap();
             let db_path = dir.path().join("parallel-pre-map.db");
-            let index_path = dir.path().join("tantivy");
 
             let storage = create_franken_db(&db_path);
-            let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
 
             // Enough conversations that the parallel hoist will actually fan
             // out across rayon workers on a multi-core host; small enough that
@@ -20626,7 +20478,6 @@ pub mod persist {
 
             persist_conversations_batched(
                 &storage,
-                Some(&mut t_index),
                 &convs,
                 LexicalPopulationStrategy::IncrementalInline,
                 false,
@@ -20666,8 +20517,6 @@ pub mod persist {
                     "title should have been redacted but contained a live secret marker: {title}"
                 );
             }
-
-            t_index.commit().unwrap();
         }
 
         #[test]
@@ -20679,7 +20528,6 @@ pub mod persist {
             // begin-concurrent writers the *same* redacted, ordered data the
             // old per-chunk map_to_internal loop produced.
             use crate::connectors::NormalizedConversation;
-            use crate::search::tantivy::TantivyIndex;
 
             let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "1");
             // Use chunk_size 8 so the 32-conv batch splits across multiple
@@ -20690,10 +20538,8 @@ pub mod persist {
 
             let dir = tempfile::TempDir::new().unwrap();
             let db_path = dir.path().join("parallel-pre-map-concurrent.db");
-            let index_path = dir.path().join("tantivy");
 
             let storage = create_franken_db(&db_path);
-            let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
 
             let convs: Vec<NormalizedConversation> = (0..32)
                 .map(|i| NormalizedConversation {
@@ -20723,7 +20569,6 @@ pub mod persist {
 
             persist_conversations_batched(
                 &storage,
-                Some(&mut t_index),
                 &convs,
                 LexicalPopulationStrategy::IncrementalInline,
                 false,
@@ -20754,8 +20599,6 @@ pub mod persist {
                     "begin-concurrent hoist must preserve secret redaction; found raw token: {title}"
                 );
             }
-
-            t_index.commit().unwrap();
         }
 
         #[test]
@@ -20768,7 +20611,6 @@ pub mod persist {
             // and with =shadow, diff the resulting DB state by
             // (external_id, started_at) tuples.
             use crate::connectors::NormalizedConversation;
-            use crate::search::tantivy::TantivyIndex;
 
             fn run_once(parallel_wal: Option<&str>) -> Vec<(String, i64)> {
                 let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "1");
@@ -20778,9 +20620,7 @@ pub mod persist {
 
                 let dir = tempfile::TempDir::new().unwrap();
                 let db_path = dir.path().join("shadow-parity.db");
-                let index_path = dir.path().join("tantivy");
                 let storage = create_franken_db(&db_path);
-                let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
 
                 let convs: Vec<NormalizedConversation> = (0..16)
                     .map(|i| NormalizedConversation {
@@ -20807,7 +20647,6 @@ pub mod persist {
 
                 persist_conversations_batched(
                     &storage,
-                    Some(&mut t_index),
                     &convs,
                     LexicalPopulationStrategy::IncrementalInline,
                     false,
@@ -20853,7 +20692,6 @@ pub mod persist {
             // begin-concurrent batch should populate the shadow observer
             // ring buffer with at least one record.
             use crate::connectors::NormalizedConversation;
-            use crate::search::tantivy::TantivyIndex;
 
             let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "1");
             let _chunk_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE", "4");
@@ -20861,9 +20699,7 @@ pub mod persist {
 
             let dir = tempfile::TempDir::new().unwrap();
             let db_path = dir.path().join("shadow-tele.db");
-            let index_path = dir.path().join("tantivy");
             let storage = create_franken_db(&db_path);
-            let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
 
             let convs: Vec<NormalizedConversation> = (0..8)
                 .map(|i| NormalizedConversation {
@@ -20891,7 +20727,6 @@ pub mod persist {
             let baseline = crate::indexer::parallel_wal_shadow::telemetry_snapshot();
             persist_conversations_batched(
                 &storage,
-                Some(&mut t_index),
                 &convs,
                 LexicalPopulationStrategy::IncrementalInline,
                 false,
@@ -20910,16 +20745,13 @@ pub mod persist {
         #[serial]
         fn persist_conversations_batched_registers_missing_remote_source_in_serial_path() {
             use crate::connectors::NormalizedConversation;
-            use crate::search::tantivy::TantivyIndex;
 
             let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
 
             let dir = tempfile::TempDir::new().unwrap();
             let db_path = dir.path().join("serial-source.db");
-            let index_path = dir.path().join("tantivy");
 
             let storage = create_franken_db(&db_path);
-            let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
             let convs = vec![NormalizedConversation {
                 agent_slug: "codex".into(),
                 external_id: Some("remote-serial-session".into()),
@@ -20950,7 +20782,6 @@ pub mod persist {
 
             persist_conversations_batched(
                 &storage,
-                Some(&mut t_index),
                 &convs,
                 LexicalPopulationStrategy::IncrementalInline,
                 false,
@@ -20980,17 +20811,14 @@ pub mod persist {
         fn persist_conversations_batched_registers_missing_remote_source_in_begin_concurrent_path()
         {
             use crate::connectors::NormalizedConversation;
-            use crate::search::tantivy::TantivyIndex;
 
             let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "1");
             let _chunk_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE", "1");
 
             let dir = tempfile::TempDir::new().unwrap();
             let db_path = dir.path().join("begin-concurrent-source.db");
-            let index_path = dir.path().join("tantivy");
 
             let storage = create_franken_db(&db_path);
-            let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
             let convs = vec![NormalizedConversation {
                 agent_slug: "codex".into(),
                 external_id: Some("remote-begin-session".into()),
@@ -21021,7 +20849,6 @@ pub mod persist {
 
             persist_conversations_batched(
                 &storage,
-                Some(&mut t_index),
                 &convs,
                 LexicalPopulationStrategy::IncrementalInline,
                 false,
@@ -21053,16 +20880,13 @@ pub mod persist {
         #[serial]
         fn persist_conversations_batched_reuses_auto_registered_remote_source_across_serial_runs() {
             use crate::connectors::NormalizedConversation;
-            use crate::search::tantivy::TantivyIndex;
 
             let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
 
             let dir = tempfile::TempDir::new().unwrap();
             let db_path = dir.path().join("serial-source-reuse.db");
-            let index_path = dir.path().join("tantivy");
 
             let storage = create_franken_db(&db_path);
-            let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
             let metadata = serde_json::json!({
                 "cass": {
                     "origin": {
@@ -21109,7 +20933,6 @@ pub mod persist {
 
                 persist_conversations_batched(
                     &storage,
-                    Some(&mut t_index),
                     &convs,
                     LexicalPopulationStrategy::IncrementalInline,
                     false,
@@ -21180,17 +21003,14 @@ pub mod persist {
         fn persist_conversations_batched_reuses_auto_registered_remote_source_across_begin_concurrent_runs()
          {
             use crate::connectors::NormalizedConversation;
-            use crate::search::tantivy::TantivyIndex;
 
             let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "1");
             let _chunk_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE", "1");
 
             let dir = tempfile::TempDir::new().unwrap();
             let db_path = dir.path().join("begin-source-reuse.db");
-            let index_path = dir.path().join("tantivy");
 
             let storage = create_franken_db(&db_path);
-            let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
             let metadata = serde_json::json!({
                 "cass": {
                     "origin": {
@@ -21237,7 +21057,6 @@ pub mod persist {
 
                 persist_conversations_batched(
                     &storage,
-                    Some(&mut t_index),
                     &convs,
                     LexicalPopulationStrategy::IncrementalInline,
                     false,
@@ -21306,14 +21125,11 @@ pub mod persist {
         #[test]
         fn persist_conversation_registers_missing_remote_source() {
             use crate::connectors::NormalizedConversation;
-            use crate::search::tantivy::TantivyIndex;
 
             let dir = tempfile::TempDir::new().unwrap();
             let db_path = dir.path().join("single-remote-source.db");
-            let index_path = dir.path().join("tantivy");
 
             let storage = create_franken_db(&db_path);
-            let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
             let conv = NormalizedConversation {
                 agent_slug: "codex".into(),
                 external_id: Some("remote-single-session".into()),
@@ -21342,7 +21158,7 @@ pub mod persist {
                 }],
             };
 
-            persist_conversation(&storage, &mut t_index, &conv)
+            persist_conversation(&storage, &conv)
                 .expect("single conversation path should auto-register embedded remote sources");
 
             let reader = FrankenStorage::open(&db_path).unwrap();
@@ -21369,14 +21185,11 @@ pub mod persist {
         #[test]
         fn persist_conversation_host_only_remote_source_infers_source_id_from_host() {
             use crate::connectors::NormalizedConversation;
-            use crate::search::tantivy::TantivyIndex;
 
             let dir = tempfile::TempDir::new().unwrap();
             let db_path = dir.path().join("single-host-only-remote.db");
-            let index_path = dir.path().join("tantivy");
 
             let storage = create_franken_db(&db_path);
-            let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
             let conv = NormalizedConversation {
                 agent_slug: "codex".into(),
                 external_id: Some("host-only-remote-session".into()),
@@ -21405,7 +21218,7 @@ pub mod persist {
                 }],
             };
 
-            persist_conversation(&storage, &mut t_index, &conv)
+            persist_conversation(&storage, &conv)
                 .expect("host-only remote provenance should be auto-registered as remote");
 
             let reader = FrankenStorage::open(&db_path).unwrap();
@@ -21424,100 +21237,6 @@ pub mod persist {
                 provenance,
                 vec![("builder-4".to_string(), Some("builder-4".to_string()))]
             );
-        }
-
-        fn make_profiled_remote_conversation(
-            external_id: i64,
-            msg_count: usize,
-        ) -> NormalizedConversation {
-            NormalizedConversation {
-                agent_slug: "codex".into(),
-                external_id: Some(format!("profiled-remote-{external_id}")),
-                title: Some(format!("Profiled remote conversation {external_id}")),
-                workspace: Some(std::path::PathBuf::from("/ws/profiled-remote")),
-                source_path: std::path::PathBuf::from(format!(
-                    "/log/profiled-remote-{external_id}.jsonl"
-                )),
-                started_at: Some(10_000 + external_id * 100),
-                ended_at: Some(10_000 + external_id * 100 + msg_count as i64),
-                metadata: serde_json::json!({
-                    "cass": {
-                        "origin": {
-                            "source_id": "profiled-remote-source",
-                            "host": "builder-profile"
-                        }
-                    }
-                }),
-                messages: (0..msg_count)
-                    .map(|idx| NormalizedMessage {
-                        idx: idx as i64,
-                        role: if idx % 2 == 0 { "user" } else { "assistant" }.into(),
-                        author: Some("tester".into()),
-                        created_at: Some(20_000 + external_id * 100 + idx as i64),
-                        content: format!(
-                            "profiled remote content ext={external_id} idx={idx} {}",
-                            "x".repeat(64)
-                        ),
-                        extra: serde_json::json!({ "idx": idx }),
-                        snippets: vec![],
-                        invocations: Vec::new(),
-                    })
-                    .collect(),
-            }
-        }
-
-        #[test]
-        fn persist_conversation_stage_profile_tracks_steady_state_remote_reuse() {
-            use crate::search::tantivy::TantivyIndex;
-
-            let _defer_guard = set_env("CASS_DEFER_LEXICAL_UPDATES", "0");
-            let log_profile = std::env::var_os("CASS_PERSIST_STAGE_PROFILE").is_some();
-
-            for &(msg_count, iterations) in &[(5usize, 80usize), (20, 50), (50, 24)] {
-                let dir = tempfile::TempDir::new().unwrap();
-                let db_path = dir.path().join(format!("profile-{msg_count}.db"));
-                let index_path = dir.path().join(format!("tantivy-{msg_count}"));
-
-                let storage = create_franken_db(&db_path);
-                let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
-                persist_conversation(
-                    &storage,
-                    &mut t_index,
-                    &make_profiled_remote_conversation(0, msg_count),
-                )
-                .unwrap();
-
-                let mut profile = PersistConversationPerfProfile::default();
-                for external_id in 1..=iterations {
-                    persist_conversation_with_profile(
-                        &storage,
-                        &mut t_index,
-                        &make_profiled_remote_conversation(external_id as i64, msg_count),
-                        &mut profile,
-                    )
-                    .unwrap();
-                }
-
-                assert_eq!(profile.invocations, iterations);
-                assert_eq!(profile.messages, iterations * msg_count);
-                assert_eq!(profile.inserted_messages, iterations * msg_count);
-                assert!(
-                    profile.total_duration >= profile.db_duration,
-                    "db stage cannot exceed total duration"
-                );
-                assert!(
-                    profile.total_duration
-                        >= profile.db_duration
-                            + profile.packet_duration
-                            + profile.positional_duration
-                            + profile.tantivy_add_duration,
-                    "accounted stage durations cannot exceed total duration"
-                );
-
-                if log_profile {
-                    profile.log_summary(&format!("remote_reuse_{msg_count}_msgs"));
-                }
-            }
         }
 
         #[test]
@@ -22848,7 +22567,6 @@ mod tests {
 
         let mutations = ingest_batch(
             &storage,
-            None,
             &data_dir,
             &[conv],
             &None,
@@ -31621,9 +31339,14 @@ mod tests {
             "missing canonical/index assets must keep the normal repair/create path"
         );
 
+        // W2-6 Task丙续: the old tantivy-index-directory fixture had no
+        // DB-domain equivalent to build "on purpose" -- `searchable_index_exists`
+        // treats a schema-migrated DB with zero messages as vacuously current
+        // (see lexical_index_health.rs doc comment), so opening the storage
+        // (which runs schema migration) is the DB-domain "current lexical
+        // index is present" fixture.
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
         ensure_fts_schema(&storage);
-        let _index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
 
         assert!(
             can_skip_absent_explicit_watch_once_index_run(&opts),
@@ -32049,27 +31772,24 @@ mod tests {
 
         let db_path = data_dir.join("db.sqlite");
         let storage = FrankenStorage::open(&db_path).unwrap();
-        ensure_fts_schema(&storage);
-        let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
+
+        let lex_docs_count = |storage: &FrankenStorage| -> i64 {
+            storage
+                .raw()
+                .query_row_map("SELECT COUNT(*) FROM lex_docs", &[], |row| row.get_typed(0))
+                .unwrap()
+        };
 
         let conv1 = norm_conv(Some("ext"), vec![norm_msg(0, 100), norm_msg(1, 200)]);
-        persist::persist_conversation(&storage, &mut index, &conv1).unwrap();
-        index.commit().unwrap();
-
-        let reader = index.reader().unwrap();
-        reader.reload().unwrap();
-        assert_eq!(reader.searcher().num_docs(), 2);
+        persist::persist_conversation(&storage, &conv1).unwrap();
+        assert_eq!(lex_docs_count(&storage), 2);
 
         let conv2 = norm_conv(
             Some("ext"),
             vec![norm_msg(0, 100), norm_msg(1, 200), norm_msg(2, 300)],
         );
-        persist::persist_conversation(&storage, &mut index, &conv2).unwrap();
-        index.commit().unwrap();
-
-        let reader = index.reader().unwrap();
-        reader.reload().unwrap();
-        assert_eq!(reader.searcher().num_docs(), 3);
+        persist::persist_conversation(&storage, &conv2).unwrap();
+        assert_eq!(lex_docs_count(&storage), 3);
     }
 
 
