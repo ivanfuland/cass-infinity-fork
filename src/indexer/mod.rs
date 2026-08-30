@@ -28794,8 +28794,6 @@ mod tests {
         std::fs::create_dir_all(&data_dir).unwrap();
         let db_path = data_dir.join("combine.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
-        ensure_fts_schema(&storage);
-        let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
         let progress = Arc::new(IndexingProgress::default());
         let flow_limiter = Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT));
 
@@ -28840,7 +28838,6 @@ mod tests {
             2, // num_producers: enables combine-decision
             &storage,
             &data_dir,
-            Some(&mut index),
             flow_limiter,
             &Some(progress.clone()),
             LexicalPopulationStrategy::IncrementalInline,
@@ -28852,7 +28849,7 @@ mod tests {
 
         // All three conversations must end up persisted regardless of
         // how many drains coalesced them.
-        assert_eq!(mutations.inserted_conversations, 3);
+        assert_eq!(mutations.canonical_mutations.inserted_conversations, 3);
 
         let conversation_count: i64 = storage
             .raw()
@@ -28919,8 +28916,6 @@ mod tests {
             std::fs::create_dir_all(&data_dir).unwrap();
             let db_path = data_dir.join("parity.db");
             let storage = FrankenStorage::open(&db_path).unwrap();
-            ensure_fts_schema(&storage);
-            let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
             let progress = Arc::new(IndexingProgress::default());
             let flow_limiter = Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT));
             let (tx, rx) = bounded(STREAMING_CHANNEL_SIZE);
@@ -28946,7 +28941,6 @@ mod tests {
                 2,
                 &storage,
                 &data_dir,
-                Some(&mut index),
                 flow_limiter,
                 &Some(progress),
                 LexicalPopulationStrategy::IncrementalInline,
@@ -29004,8 +28998,6 @@ mod tests {
         std::fs::create_dir_all(&data_dir).unwrap();
         let db_path = data_dir.join("disabled.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
-        ensure_fts_schema(&storage);
-        let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
         let progress = Arc::new(IndexingProgress::default());
         let flow_limiter = Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT));
         let (tx, rx) = bounded(STREAMING_CHANNEL_SIZE);
@@ -29025,7 +29017,6 @@ mod tests {
             1,
             &storage,
             &data_dir,
-            Some(&mut index),
             flow_limiter,
             &Some(progress.clone()),
             LexicalPopulationStrategy::IncrementalInline,
@@ -29035,7 +29026,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(discovered, vec!["codex".to_string()]);
-        assert_eq!(mutations.inserted_conversations, 1);
+        assert_eq!(mutations.canonical_mutations.inserted_conversations, 1);
     }
 
     #[test]
@@ -29050,8 +29041,6 @@ mod tests {
         std::fs::create_dir_all(&data_dir).unwrap();
         let db_path = data_dir.join("single-prod.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
-        ensure_fts_schema(&storage);
-        let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
         let progress = Arc::new(IndexingProgress::default());
         let flow_limiter = Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT));
         let (tx, rx) = bounded(STREAMING_CHANNEL_SIZE);
@@ -29073,7 +29062,6 @@ mod tests {
             1, // single producer → drain loop body is bypassed
             &storage,
             &data_dir,
-            Some(&mut index),
             flow_limiter,
             &Some(progress.clone()),
             LexicalPopulationStrategy::IncrementalInline,
@@ -29082,7 +29070,7 @@ mod tests {
             &SharedActiveSessionSourceSkips::default(),
         )
         .unwrap();
-        assert_eq!(mutations.inserted_conversations, 3);
+        assert_eq!(mutations.canonical_mutations.inserted_conversations, 3);
     }
 
     #[test]
@@ -29183,8 +29171,6 @@ mod tests {
 
         let db_path = data_dir.join("db.sqlite");
         let storage = FrankenStorage::open(&db_path).unwrap();
-        ensure_fts_schema(&storage);
-        let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
         let progress = Arc::new(IndexingProgress::default());
         let (tx, rx) = bounded(STREAMING_CHANNEL_SIZE);
         let flow_limiter = Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT));
@@ -29214,7 +29200,6 @@ mod tests {
             1,
             &storage,
             &data_dir,
-            Some(&mut index),
             flow_limiter,
             &Some(progress.clone()),
             LexicalPopulationStrategy::IncrementalInline,
@@ -29226,7 +29211,7 @@ mod tests {
         handle.join().unwrap();
 
         assert_eq!(discovered, vec!["claude".to_string()]);
-        assert_eq!(mutations, CanonicalMutationCounts::default());
+        assert_eq!(mutations.canonical_mutations, CanonicalMutationCounts::default());
 
         let stats = progress.stats.lock().unwrap_or_else(|e| e.into_inner());
         let connector = stats
@@ -29259,9 +29244,6 @@ mod tests {
 
         let db_path = data_dir.join("db.sqlite");
         let storage = FrankenStorage::open(&db_path)?;
-        ensure_fts_schema(&storage);
-        let index_path = index_dir(&data_dir)?;
-        let mut index = TantivyIndex::open_or_create(&index_path)?;
         let progress = Arc::new(IndexingProgress::default());
         let opts = IndexOptions {
             full: false,
@@ -29279,7 +29261,6 @@ mod tests {
 
         let mutations = run_streaming_index_with_connector_factories(
             &storage,
-            Some(&mut index),
             &opts,
             Some(i64::MAX),
             LexicalPopulationStrategy::IncrementalInline,
@@ -29322,7 +29303,6 @@ mod tests {
 
         let db_path = data_dir.join("db.sqlite");
         let storage = FrankenStorage::open(&db_path)?;
-        ensure_fts_schema(&storage);
         storage.set_connector_last_scan_ts("claude", i64::MAX)?;
         let local_since_by_connector = connector_local_scan_since_ts_map(
             &storage,
@@ -29347,8 +29327,6 @@ mod tests {
             Some(i64::MAX - 1),
             "configured local roots must preserve the connector-specific cutoff"
         );
-        let index_path = index_dir(&data_dir)?;
-        let mut index = TantivyIndex::open_or_create(&index_path)?;
         let progress = Arc::new(IndexingProgress::default());
         let opts = IndexOptions {
             full: false,
@@ -29366,7 +29344,6 @@ mod tests {
 
         let mutations = run_streaming_index_with_connector_factories(
             &storage,
-            Some(&mut index),
             &opts,
             Some(i64::MAX),
             LexicalPopulationStrategy::IncrementalInline,
@@ -29394,8 +29371,6 @@ mod tests {
 
         let db_path = data_dir.join("db.sqlite");
         let storage = FrankenStorage::open(&db_path).unwrap();
-        ensure_fts_schema(&storage);
-        let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
         let progress = Arc::new(IndexingProgress::default());
         let opts = IndexOptions {
             full: false,
@@ -29413,7 +29388,6 @@ mod tests {
 
         let error = run_streaming_index_with_connector_factories(
             &storage,
-            Some(&mut index),
             &opts,
             None,
             LexicalPopulationStrategy::IncrementalInline,
@@ -29476,7 +29450,6 @@ mod tests {
 
         let mutations = run_batch_index_with_connector_factories(
             &storage,
-            None,
             &opts,
             Some(i64::MAX),
             LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
@@ -29561,7 +29534,6 @@ mod tests {
 
         let mutations = run_batch_index_with_connector_factories(
             &storage,
-            None,
             &opts,
             Some(i64::MAX),
             LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
@@ -29614,7 +29586,6 @@ mod tests {
 
             let mutations = run_batch_index_with_connector_factories(
                 &storage,
-                None,
                 &opts,
                 None,
                 LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
@@ -29661,7 +29632,6 @@ mod tests {
 
         let db_path = data_dir.join("db.sqlite");
         let storage = FrankenStorage::open(&db_path).unwrap();
-        ensure_fts_schema(&storage);
         let progress = Arc::new(IndexingProgress::default());
         let opts = IndexOptions {
             full: true,
@@ -29679,7 +29649,6 @@ mod tests {
 
         let mutations = run_batch_index_with_connector_factories(
             &storage,
-            None,
             &opts,
             None,
             LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
@@ -29689,7 +29658,9 @@ mod tests {
             None,
             &SharedActiveSessionSourceSkips::default(),
         )
-        .expect("deferred batch ingest should not require a Tantivy writer");
+        // W2-6 Task丙续: message updated to the DB-domain framing (see the
+        // sibling streaming test's rationale).
+        .expect("deferred batch ingest should not require an eager lexical sink");
 
         let conversation_count: i64 = storage
             .raw()
@@ -29704,7 +29675,7 @@ mod tests {
         let stats = progress.stats.lock().unwrap_or_else(|e| e.into_inner());
 
         assert_eq!(
-            mutations,
+            mutations.canonical_mutations,
             CanonicalMutationCounts {
                 inserted_conversations: 1,
                 inserted_messages: 2,
@@ -29714,9 +29685,16 @@ mod tests {
         assert_eq!(message_count, 2);
         assert_eq!(stats.total_conversations, 1);
         assert_eq!(stats.total_messages, 2);
-        assert!(
-            !index_dir(&data_dir).unwrap().join("meta.json").exists(),
-            "deferred batch ingest should not materialize a live Tantivy index before the authoritative rebuild"
+        // W2-6 Task丙续: dropped the tantivy-only `meta.json` non-existence
+        // assertion (dead symbol, was vacuously true); DB-domain equivalent
+        // below is the real regression intent.
+        let lex_docs_count: i64 = storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM lex_docs", &[], |row| row.get_typed(0))
+            .unwrap();
+        assert_eq!(
+            lex_docs_count, 0,
+            "deferred batch ingest should not populate lex_docs before the authoritative rebuild"
         );
     }
 
