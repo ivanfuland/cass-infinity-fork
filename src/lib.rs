@@ -72519,19 +72519,15 @@ fn run_health(
 
 fn rebuild_tantivy_from_db(
     db_path: &Path,
-    data_dir: &Path,
-    total_conversations: usize,
     progress: Option<std::sync::Arc<indexer::IndexingProgress>>,
 ) -> CliResult<usize> {
-    indexer::rebuild_tantivy_from_db(db_path, data_dir, total_conversations, progress)
-        .map(|outcome| outcome.indexed_docs)
-        .map_err(|e| CliError {
-            code: 5,
-            kind: CliErrorKind::Doctor.kind_str(),
-            message: format!("failed to rebuild Tantivy index from database: {e}"),
-            hint: None,
-            retryable: true,
-        })
+    indexer::rebuild_lex_domain_from_db_full(db_path, progress).map_err(|e| CliError {
+        code: 5,
+        kind: CliErrorKind::Doctor.kind_str(),
+        message: format!("failed to rebuild lexical search index from database: {e}"),
+        hint: None,
+        retryable: true,
+    })
 }
 
 fn wait_with_progress<T>(
@@ -75129,7 +75125,6 @@ pub(crate) fn run_doctor_impl(
     let mut checks: Vec<Check> = Vec::new();
     let mut needs_rebuild = force_rebuild;
     let mut db_ok = false;
-    let mut db_conversations: Option<usize> = None;
     let mut db_messages: Option<usize> = None;
     // `.14.1` storage-integrity signals (bead vl1cj): the read-only facts the
     // database + lexical-index checks below already observe, from which the
@@ -75433,7 +75428,6 @@ pub(crate) fn run_doctor_impl(
                         if let (Some(conv_count), Some(msg_count), Some(integrity_probe)) =
                             (probe.conv_count, probe.msg_count, probe.integrity)
                         {
-                            db_conversations = Some(conv_count.max(0) as usize);
                             db_messages = Some(msg_count.max(0) as usize);
                             match integrity_probe {
                                 Ok(integrity) if integrity.is_ok() => {
@@ -76574,7 +76568,6 @@ pub(crate) fn run_doctor_impl(
                             {
                                 if status.trim().eq_ignore_ascii_case("ok") {
                                     db_ok = true;
-                                    db_conversations = Some(conv_count.max(0) as usize);
                                     db_messages = Some(msg_count.max(0) as usize);
                                     checks.push(Check {
                                         name: "database_after_candidate_promotion".to_string(),
@@ -76749,12 +76742,10 @@ pub(crate) fn run_doctor_impl(
         let rebuild_from_db = db_ok && db_messages.unwrap_or(0) > 0;
 
         if rebuild_from_db {
-            let total_convs = db_conversations.unwrap_or(0);
             let rebuild_handle = std::thread::spawn({
                 let progress = progress.clone();
                 let db_path = db_path.clone();
-                let data_dir = data_dir.clone();
-                move || rebuild_tantivy_from_db(&db_path, &data_dir, total_convs, Some(progress))
+                move || rebuild_tantivy_from_db(&db_path, Some(progress))
             });
 
             let rebuild_result = wait_with_progress(
@@ -100163,13 +100154,6 @@ fn archive_agent_slug_for_exclusion(agent: &str) -> String {
     }
 }
 
-fn archive_data_dir_for_agents_command(cli: &Cli) -> PathBuf {
-    cli.db
-        .as_ref()
-        .and_then(|db_path| db_path.parent().map(Path::to_path_buf))
-        .unwrap_or_else(default_data_dir)
-}
-
 fn purge_excluded_agent_archive_data(
     agent: &str,
     cli: &Cli,
@@ -100181,7 +100165,6 @@ fn purge_excluded_agent_archive_data(
         return Ok(AgentArchivePurgeResult::default());
     }
 
-    let data_dir = archive_data_dir_for_agents_command(cli);
     let archive_agent_slug = archive_agent_slug_for_exclusion(agent);
     let storage = match FrankenStorage::open_writer(&db_path) {
         Ok(storage) => storage,
@@ -100240,19 +100223,9 @@ fn purge_excluded_agent_archive_data(
         hint: Some("Run 'cass index --full' to refresh token analytics".into()),
         retryable: false,
     })?;
-    let remaining_conversations = storage.total_conversation_count().map_err(|e| CliError {
-        code: 5,
-        kind: CliErrorKind::ArchiveCount.kind_str(),
-        message: format!(
-            "Purged '{archive_agent_slug}' but failed to count remaining conversations: {e}"
-        ),
-        hint: Some("Run 'cass index --full' to refresh the archive".into()),
-        retryable: false,
-    })?;
     drop(storage);
 
-    crate::indexer::rebuild_tantivy_from_db(&db_path, &data_dir, remaining_conversations, None)
-        .map_err(|e| CliError {
+    crate::indexer::rebuild_lex_domain_from_db_full(&db_path, None).map_err(|e| CliError {
             code: 5,
             kind: CliErrorKind::LexicalRebuild.kind_str(),
             message: format!(

@@ -2578,10 +2578,7 @@ fn should_try_readonly_canonical_force_rebuild(opts: &IndexOptions) -> bool {
         && opts.db_path.exists()
 }
 
-fn try_readonly_canonical_force_rebuild(
-    opts: &IndexOptions,
-    progress_bump: &Arc<AtomicI64>,
-) -> Result<bool> {
+fn try_readonly_canonical_force_rebuild(opts: &IndexOptions) -> Result<bool> {
     if !should_try_readonly_canonical_force_rebuild(opts) {
         return Ok(false);
     }
@@ -2628,30 +2625,21 @@ fn try_readonly_canonical_force_rebuild(
     );
 
     ensure_authoritative_lexical_rebuild_storage_headroom(&opts.data_dir, &opts.db_path)?;
-    let rebuild_start = Instant::now();
-    let rebuild = rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
-        &opts.db_path,
-        &opts.data_dir,
-        total_conversations,
-        opts.progress.clone(),
-        Arc::clone(progress_bump),
-    )?;
+    // W2-6 Task2: the Tantivy rebuild that used to run here
+    // (`rebuild_tantivy_from_db_deferred_startup_with_progress_bump`) is
+    // gone; the lex_docs/fts_lex domain rebuild below (already added by
+    // Task1's X-1 fix, since the Tantivy rebuild never touched that domain
+    // anyway) is now this function's only rebuild step, so its own timing
+    // (`lex_rebuild_started` below) covers `stats.index_ms` directly.
     if let Some(p) = &opts.progress
         && let Ok(mut stats) = p.stats.lock()
     {
         stats.scan_ms = 0;
-        stats.index_ms = rebuild_start.elapsed().as_millis() as u64;
         stats.total_conversations = total_conversations;
         stats.total_messages = total_messages;
         stats.total_counts_exact = true;
     }
-    if let Some(observed_messages) = rebuild.observed_messages {
-        record_exact_total_counts_in_progress(
-            opts.progress.as_ref(),
-            total_conversations,
-            observed_messages,
-        );
-    }
+    record_exact_total_counts_in_progress(opts.progress.as_ref(), total_conversations, total_messages);
 
     // w2 W2-4 closeout (X-1, control-plane ruling): this readonly fast path
     // used to return here without ever touching the lex_docs/fts_lex
@@ -2684,11 +2672,17 @@ fn try_readonly_canonical_force_rebuild(
                 opts.db_path.display()
             )
         })?;
+    let lex_rebuild_elapsed_ms = lex_rebuild_started.elapsed().as_millis() as u64;
+    if let Some(p) = &opts.progress
+        && let Ok(mut stats) = p.stats.lock()
+    {
+        stats.index_ms = lex_rebuild_elapsed_ms;
+    }
     tracing::info!(
         db_path = %opts.db_path.display(),
         conversations_processed = lex_stats.conversations_processed,
         lex_docs_count = lex_stats.lex_docs_count,
-        elapsed_ms = lex_rebuild_started.elapsed().as_millis() as u64,
+        elapsed_ms = lex_rebuild_elapsed_ms,
         "force rebuild: lex_docs/fts_lex domain rebuilt from canonical messages/conversations"
     );
     lex_storage.close().with_context(|| {
@@ -13567,7 +13561,7 @@ pub fn run_index(
             }
         }
     }
-    if try_readonly_canonical_force_rebuild(&opts, &progress_bump)? {
+    if try_readonly_canonical_force_rebuild(&opts)? {
         return Ok(());
     }
 
@@ -17029,6 +17023,32 @@ fn maybe_seed_empty_canonical_from_historical_bundle(
     }
 }
 
+/// W2-6 Task2 段2: FTS5-domain replacement for the `--full`/archive-purge
+/// external entry points that used to call [`rebuild_tantivy_from_db`] (the
+/// Tantivy staged-shard rebuild family below, dying in this task's段3).
+/// Delegates entirely to the already-existing, already-tested
+/// `FrankenStorage::rebuild_lex_domain_from_db` (X-2 heartbeat-ized, same
+/// per-batch `IndexingProgress` semantics the Tantivy pipeline used). No new
+/// design: this is the identical rebuild step `run_index`'s own `--full`
+/// path already runs unconditionally (see the `opts.full ||
+/// canonical_only_full_rebuild`-gated call near the end of `run_index`).
+/// `data_dir` is dropped from the signature -- the `fts_lex`/`lex_docs`
+/// domain lives inside `db_path` itself, no index directory to locate.
+pub(crate) fn rebuild_lex_domain_from_db_full(
+    db_path: &Path,
+    progress: Option<Arc<IndexingProgress>>,
+) -> Result<usize> {
+    let storage = FrankenStorage::open(db_path)
+        .with_context(|| format!("opening database for full lex domain rebuild: {}", db_path.display()))?;
+    let stats = storage
+        .rebuild_lex_domain_from_db(progress.as_ref())
+        .with_context(|| format!("rebuilding lex domain from db: {}", db_path.display()))?;
+    storage
+        .close()
+        .with_context(|| format!("closing database after full lex domain rebuild: {}", db_path.display()))?;
+    Ok(stats.lex_docs_count)
+}
+
 pub(crate) fn rebuild_tantivy_from_db(
     db_path: &Path,
     data_dir: &Path,
@@ -17147,33 +17167,11 @@ pub(crate) fn repair_lexical_index_from_canonical_db_for_search(
     reject_pre_lexical_rebuild_generation_database(&storage, db_path)?;
     let total_conversations = count_total_conversations_exact(&storage)?;
     if total_conversations == 0 {
-        let index_path = index_dir(data_dir)?;
-        let stage_parent = index_path.parent().unwrap_or(data_dir);
-        let stage_root = TempDirBuilder::new()
-            .prefix("cass-empty-lexical-repair-")
-            .tempdir_in(stage_parent)
-            .with_context(|| {
-                format!(
-                    "creating staging directory for empty lexical repair beside {}",
-                    index_path.display()
-                )
-            })?;
-        let staged_index_path = stage_root.path().join("index");
-        let empty_index = TantivyIndex::open_or_create(&staged_index_path).with_context(|| {
-            format!(
-                "creating empty lexical index for empty canonical database: {}",
-                staged_index_path.display()
-            )
-        })?;
-        drop(empty_index);
-        publish_staged_lexical_index(&staged_index_path, &index_path).with_context(|| {
-            format!(
-                "publishing empty lexical index repair {} -> {}",
-                staged_index_path.display(),
-                index_path.display()
-            )
-        })?;
-        refresh_completed_lexical_rebuild_checkpoint(&storage, db_path, data_dir)?;
+        // W2-6 Task2: the empty-Tantivy-index staging/publish that used to
+        // run here (create+publish an empty index directory) is gone --
+        // `fts_lex` has no directory-based index artifact to publish, only
+        // the lex_docs/fts_lex tables recreated+resynced below (which is
+        // trivially empty for an empty canonical DB).
         storage.close_without_checkpoint().with_context(|| {
             format!(
                 "closing readonly database after empty search-triggered lexical repair: {}",
@@ -17243,23 +17241,22 @@ pub(crate) fn repair_lexical_index_from_canonical_db_for_search(
         )
     })?;
 
-    let rebuild = rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
-        db_path,
-        data_dir,
-        total_conversations,
-        progress.clone(),
-        Arc::clone(&index_run_lock.last_progress_at_ms_atomic),
-    )?;
-
-    // W2-6 Task1 (X-5 fix): the tantivy rebuild above never touches
-    // lex_docs/fts_lex -- without this, self-heal would report
-    // "rebuilt-from-canonical-db" while the domain that actually serves
-    // search post-W2-5 stayed exactly as broken as before. Relational
-    // domain is already confirmed non-empty above; unconditionally
-    // drop+recreate+resync the lexical domain from it now (control-plane
-    // 2026-08-30 amendment: rebuild-not-convert doctrine -- see the empty-db
-    // branch above for why this must not be a conditional "resync only if
-    // unhealthy" repair).
+    // W2-6 Task2: the Tantivy rebuild that used to run here
+    // (`rebuild_tantivy_from_db_deferred_startup_with_progress_bump`) is
+    // gone; per Task1's X-5 fix comment below, that rebuild never touched
+    // lex_docs/fts_lex anyway, so the unconditional drop+recreate+resync
+    // that follows is this function's real, and now only, rebuild step.
+    //
+    // W2-6 Task1 (X-5 fix): unconditional drop+recreate+resync, not a
+    // conditional patch -- derived data's repair story is "rebuild from
+    // the source of truth" (rebuild-not-convert doctrine), never "patch in
+    // place". This is the exact same code path regardless of whether the
+    // domain was missing, empty, or internally corrupted, so there is no
+    // branch to get wrong and no way for a resync to make a corrupted
+    // domain worse (the failure mode a conditional "resync only if
+    // unhealthy" design hit: FTS5 external-content DELETE re-derives the
+    // terms to remove from the *current* content column, so resyncing
+    // against an already-inconsistent domain can corrupt it further).
     // Raw writable Conn, not FrankenStorage::open -- see the empty-db
     // branch above for why (its own schema-completeness self-heal errors
     // out on a corrupted, not just missing, fts_lex instead of repairing
@@ -17287,7 +17284,7 @@ pub(crate) fn repair_lexical_index_from_canonical_db_for_search(
                 db_path.display()
             )
         })?;
-    lex_storage
+    let lex_stats = lex_storage
         .rebuild_lex_domain_from_db(progress.as_ref())
         .with_context(|| {
             format!(
@@ -17303,7 +17300,7 @@ pub(crate) fn repair_lexical_index_from_canonical_db_for_search(
     })?;
 
     Ok(SearchLexicalRepairOutcome {
-        indexed_docs: rebuild.indexed_docs,
+        indexed_docs: lex_stats.lex_docs_count,
     })
 }
 
