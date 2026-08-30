@@ -19051,17 +19051,16 @@ fn state_meta_json_inner(
         serde_json::to_value(&ingest_quarantine_summary).unwrap_or(serde_json::Value::Null);
 
     // Probe the live lexical document count when the DB has messages. Prefer
-    // the published generation manifest: status only needs the durable count
-    // for stale/empty diagnostics, while opening a large Tantivy reader here
-    // fans out across every segment file on the hot robot path.
+    // the published generation manifest for the durable count; fall back to
+    // a direct lex_docs row count (W2-6 Task2: FTS5-domain replacement for
+    // the old Tantivy reader fallback, same "how many docs" semantics via
+    // Task1's searchable_index_summary).
     let index_doc_count: Option<u64> = if db_opened && message_count > 0 && lexical.exists {
         lexical_manifest_indexed_doc_count(&index_path).or_else(|| {
-            frankensearch::lexical::cass_open_search_reader(
-                &index_path,
-                frankensearch::lexical::ReloadPolicy::Manual,
-            )
-            .ok()
-            .map(|(reader, _fields)| reader.searcher().num_docs())
+            crate::search::lexical_index_health::searchable_index_summary(db_path)
+                .ok()
+                .flatten()
+                .map(|summary| summary.docs as u64)
         })
     } else {
         None
