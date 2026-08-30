@@ -41,6 +41,7 @@ pub(crate) mod incident_categories;
 pub(crate) mod incident_redaction;
 #[cfg(feature = "infinity")]
 pub mod infinity;
+pub(crate) mod lexical_rerank;
 pub(crate) mod liveness_fixtures;
 pub(crate) mod model_acquisition;
 pub mod model_download;

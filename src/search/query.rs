@@ -88,6 +88,14 @@ type SqliteFtsHydratedRow = (
     Option<String>,
     Option<i64>,
 );
+/// W2-5 Task2: `lex_docs` corpus-wide stats the BM25F reranker needs
+/// (design doc ②). `total_docs` doubles as `N` in the IDF formula.
+#[derive(Clone, Copy)]
+struct LexicalCorpusStats {
+    total_docs: u64,
+    avgdl: FieldAvgdl,
+}
+
 type SqliteFtsMessageRow = (
     i64,
     String,
@@ -325,6 +333,7 @@ fn semantic_doc_component_id_from_db(raw: Option<i64>) -> u32 {
 
 use crate::search::canonicalize::{canonicalize_for_embedding, content_hash, is_search_noise_text};
 use crate::search::embedder::Embedder;
+use crate::search::lexical_rerank::{self, FieldAvgdl, RerankCandidate};
 use crate::search::vector_index::{
     ROLE_USER, SemanticDocId, SemanticFilter, SemanticFilterMaps, VectorIndex, VectorSearchResult,
     parse_semantic_doc_id, role_code_from_str,
@@ -7370,50 +7379,51 @@ impl SearchClient {
             .collect())
     }
 
-    /// W2-5: rank query against `fts_lex` (the only shape it can ever have --
-    /// unlike `fts_messages`, no legacy-schema probing is needed). `bm25`
-    /// returns more-negative-is-better; callers negate it to match this
-    /// codebase's higher-is-better `SearchHit::score` convention.
+    /// Candidate query against `fts_lex` (the only shape it can ever have --
+    /// unlike `fts_messages`, no legacy-schema probing is needed).
     ///
-    /// Column weights matter here: `bm25(fts_lex)` with no arguments applies
-    /// weight 1.0 uniformly across all five columns (`content, title, agent,
-    /// workspace, source_path`, the table's declared order). Measured
-    /// against the real w2 staging corpus (parity gate first pass), that
-    /// uniform weighting let `agent`/`workspace`/`source_path` -- short
-    /// identifier-shaped fields where a coincidental trigram hit produces a
-    /// high term-density score -- swamp genuine `content` relevance,
-    /// collapsing recall parity to ~0.35 (required >=0.95). Explicit weights
-    /// biasing toward `content` (the actual message text) with a modest
-    /// `title` boost and low weight on the three identifier-shaped columns
-    /// is standard multi-field BM25 practice, not a fit-to-the-test
-    /// adjustment -- omitting it was the bug.
-    fn fts_lex_match_rank_query(
-        fts_query: &str,
-        limit: usize,
-        offset: usize,
-    ) -> (String, Vec<ParamValue>) {
+    /// `bm25(fts_lex, 1.0, 3.0, 0.1, 0.1, 0.5)` (content/title/agent/
+    /// workspace/source_path weights, the table's declared column order)
+    /// is still computed in the `SELECT` -- W2-5 exec26 found uniform
+    /// weighting let the three identifier-shaped columns swamp genuine
+    /// `content` relevance, so this keeps the bias toward content/title --
+    /// but as of Task2 it is *not* used to order or truncate this query;
+    /// see below.
+    ///
+    /// W2-5 Task2: candidate *generation*, not ranking -- no `ORDER BY`.
+    /// Pre-Task2 this query used `ORDER BY bm25(...) LIMIT small_window`,
+    /// which is exactly the bug the rerank layer exists to fix (design doc
+    /// ①: fts5's own unified-statistics `bm25()` buries the true best
+    /// candidate arbitrarily deep -- HOLD diagnosis's anchor case put it at
+    /// rank 1226 of 3143 -- so ranking-then-truncating before the reranker
+    /// ever sees the candidates would throw the true winner away before
+    /// Rust gets a chance to score it correctly). `cap` is
+    /// `no_limit_result_cap()`'s value, the same memory-aware safety valve
+    /// used elsewhere for "no limit" fetches -- not a tuned rank window.
+    /// `bm25(fts_lex, ...)` is still computed here (not dropped from the
+    /// `SELECT`) to serve as the zero-score tie-break signal (design doc
+    /// ⑤ "边界①") at zero extra query cost, not to order the results.
+    fn fts_lex_match_candidates_query(fts_query: &str, cap: usize) -> (String, Vec<ParamValue>) {
         let sql = "SELECT rowid, bm25(fts_lex, 1.0, 3.0, 0.1, 0.1, 0.5) FROM fts_lex \
-                    WHERE fts_lex MATCH ?1 \
-                    ORDER BY bm25(fts_lex, 1.0, 3.0, 0.1, 0.1, 0.5), rowid LIMIT ?2 OFFSET ?3"
+                    WHERE fts_lex MATCH ?1 LIMIT ?2"
             .to_string();
-        let params = vec![
-            ParamValue::from(fts_query),
-            ParamValue::from(limit as i64),
-            ParamValue::from(offset as i64),
-        ];
+        let params = vec![ParamValue::from(fts_query), ParamValue::from(cap as i64)];
         (sql, params)
     }
 
-    /// KU3 fallback rank query: a genuine `LIKE` table scan over `lex_docs`
-    /// (the real content table `fts_lex` wraps -- LIKE against the FTS5
-    /// virtual table itself is not the intended access path) so short CJK
-    /// queries below the trigram tokenizer's 3-character floor still get a
-    /// correctness-complete (not windowed) search of the whole corpus.
-    /// Ranked by total occurrence count of the term across all five columns
-    /// (mirrors `sqlite_message_scan_score`'s occurrence-count philosophy,
-    /// computed here in SQL instead of Rust so it runs over the full table
-    /// rather than a bounded prefix).
-    fn lex_docs_like_rank_query(raw_term: &str, limit: usize, offset: usize) -> (String, Vec<ParamValue>) {
+    /// KU3 fallback candidate query: a genuine `LIKE` table scan over
+    /// `lex_docs` (the real content table `fts_lex` wraps -- LIKE against
+    /// the FTS5 virtual table itself is not the intended access path) so
+    /// short CJK queries below the trigram tokenizer's 3-character floor
+    /// still get a correctness-complete (not windowed) search of the whole
+    /// corpus. W2-5 Task2: no longer `ORDER BY` here either -- same
+    /// candidate-generation-not-ranking rationale as
+    /// `fts_lex_match_candidates_query`; `occurrence_score` (total
+    /// occurrence count of the term across all five columns, mirrors
+    /// `sqlite_message_scan_score`'s philosophy) is still computed in the
+    /// `SELECT` to serve as the zero-score tie-break signal, not to order
+    /// results. `cap` is `no_limit_result_cap()`'s value.
+    fn lex_docs_like_candidates_query(raw_term: &str, cap: usize) -> (String, Vec<ParamValue>) {
         let pattern = like_substring_pattern(raw_term);
         let sql = "SELECT doc_id, \
                     CAST( \
@@ -7429,16 +7439,154 @@ impl SearchClient {
                       OR agent LIKE ?2 ESCAPE '\\' \
                       OR workspace LIKE ?2 ESCAPE '\\' \
                       OR source_path LIKE ?2 ESCAPE '\\' \
-                   ORDER BY occurrence_score DESC, doc_id DESC \
-                   LIMIT ?3 OFFSET ?4"
+                   LIMIT ?3"
             .to_string();
         let params = vec![
             ParamValue::from(raw_term),
             ParamValue::from(pattern),
-            ParamValue::from(limit as i64),
-            ParamValue::from(offset as i64),
+            ParamValue::from(cap as i64),
         ];
         (sql, params)
+    }
+
+    /// Disk sidecar for [`lexical_corpus_stats`], next to the sqlite DB
+    /// file (`.lexical-avgdl-cache.json`, following the same dot-prefixed
+    /// sidecar convention as `.lexical-rebuild-state.json` in
+    /// `indexer/mod.rs`). Measured need (not speculative): `cass search` is
+    /// a fresh process per invocation, so an in-process-only cache (the
+    /// `OnceLock` below) buys nothing for the CLI's actual usage pattern --
+    /// every single search would repeat the full-corpus tokenize scan.
+    /// Measured cost of that on the 1M-row w2 staging corpus: **~19.4s per
+    /// query** (`time cass search "indexing" --mode lexical`), which is why
+    /// this sidecar exists rather than relying on the process-lifetime
+    /// cache alone.
+    fn lexical_avgdl_cache_path(&self) -> Option<std::path::PathBuf> {
+        let db_path = self.sqlite_path.as_ref()?;
+        Some(db_path.parent()?.join(".lexical-avgdl-cache.json"))
+    }
+
+    /// W2-5 Task2: two-layer cache for the `lex_docs` corpus-wide stats the
+    /// BM25F reranker needs (design doc ②: computing this live per query is
+    /// not viable). Layer 1 (`OnceLock`): free within one long-lived
+    /// process. Layer 2 (disk sidecar, see [`lexical_avgdl_cache_path`]):
+    /// the layer that actually matters for the CLI's one-process-per-search
+    /// usage pattern. Known limitation, not yet closed: nothing here
+    /// invalidates the sidecar after a `--force-rebuild` -- avgdl is a
+    /// slow-moving statistic (design doc ②) so serving a stale-but-close
+    /// value is an accepted tradeoff, but a full rebuild that meaningfully
+    /// changes corpus composition should ideally refresh it; deleting the
+    /// sidecar file forces a fresh computation until that wiring exists.
+    fn lexical_corpus_stats(&self, conn: &SendConnection) -> Result<LexicalCorpusStats> {
+        static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<LexicalCorpusStats>>> =
+            std::sync::OnceLock::new();
+        let cache = CACHE.get_or_init(|| std::sync::Mutex::new(None));
+        if let Ok(guard) = cache.lock() {
+            if let Some(stats) = guard.as_ref() {
+                return Ok(*stats);
+            }
+        }
+
+        let cache_path = self.lexical_avgdl_cache_path();
+        if let Some(path) = &cache_path {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let (Some(total_docs), Some(avgdl_content), Some(avgdl_title)) = (
+                        value.get("total_docs").and_then(|v| v.as_u64()),
+                        value.get("avgdl_content").and_then(|v| v.as_f64()),
+                        value.get("avgdl_title").and_then(|v| v.as_f64()),
+                    ) {
+                        let stats = LexicalCorpusStats {
+                            total_docs,
+                            avgdl: FieldAvgdl { content: avgdl_content, title: avgdl_title },
+                        };
+                        if let Ok(mut guard) = cache.lock() {
+                            *guard = Some(stats);
+                        }
+                        return Ok(stats);
+                    }
+                }
+            }
+        }
+
+        let computed = Self::compute_lexical_corpus_stats(conn)?;
+        if let Ok(mut guard) = cache.lock() {
+            *guard = Some(computed);
+        }
+        if let Some(path) = &cache_path {
+            let payload = serde_json::json!({
+                "total_docs": computed.total_docs,
+                "avgdl_content": computed.avgdl.content,
+                "avgdl_title": computed.avgdl.title,
+            });
+            // Best-effort: a write failure (read-only fs, missing dir) just
+            // means the next process recomputes too -- not a correctness
+            // issue, only a repeated one-time cost.
+            let _ = std::fs::write(path, payload.to_string());
+        }
+        Ok(computed)
+    }
+
+    /// Full `lex_docs` scan, keyset-paginated by `doc_id` (avoids a single
+    /// multi-GB `IN (...)`/OFFSET query): tokenizes every row's `content`/
+    /// `title` with the same tantivy-faithful tokenizer the reranker itself
+    /// uses (`lexical_rerank::tokenize`), accumulating per-field token-count
+    /// sums to compute avgdl. Genuinely a full-corpus operation -- there is
+    /// no cheaper exact way to get avgdl in tokens (see design doc ②).
+    fn compute_lexical_corpus_stats(conn: &SendConnection) -> Result<LexicalCorpusStats> {
+        const SCAN_CHUNK: i64 = 20_000;
+        let mut total_docs: u64 = 0;
+        let mut content_token_sum: u64 = 0;
+        let mut title_token_sum: u64 = 0;
+        let mut last_doc_id: i64 = 0;
+        loop {
+            let sql = "SELECT doc_id, content, title FROM lex_docs \
+                        WHERE doc_id > ?1 ORDER BY doc_id LIMIT ?2";
+            let params = [ParamValue::from(last_doc_id), ParamValue::from(SCAN_CHUNK)];
+            let rows: Vec<(i64, String, String)> =
+                franken_query_map_collect_retry(conn, sql, &params, |row| {
+                    Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?))
+                })?;
+            if rows.is_empty() {
+                break;
+            }
+            let fetched = rows.len();
+            for (doc_id, content, title) in rows {
+                total_docs += 1;
+                content_token_sum += lexical_rerank::tokenize(&content).len() as u64;
+                title_token_sum += lexical_rerank::tokenize(&title).len() as u64;
+                last_doc_id = doc_id;
+            }
+            if fetched < SCAN_CHUNK as usize {
+                break;
+            }
+        }
+        let avgdl = if total_docs > 0 {
+            FieldAvgdl {
+                content: content_token_sum as f64 / total_docs as f64,
+                title: title_token_sum as f64 / total_docs as f64,
+            }
+        } else {
+            FieldAvgdl { content: 0.0, title: 0.0 }
+        };
+        Ok(LexicalCorpusStats { total_docs, avgdl })
+    }
+
+    /// W2-5 Task2: term list the BM25F reranker scores against, extracted
+    /// from the same boolean-query tokenizer the rest of this file already
+    /// uses (`fs_cass_parse_boolean_query`). Deliberately drops AND/OR/NOT
+    /// structure -- candidate *membership* is decided by the MATCH/LIKE
+    /// query already run in SQL; the reranker only needs "which terms are
+    /// in play" to score documents that are already known to be candidates
+    /// (design doc ②: "重排层不重新实现布尔逻辑").
+    fn lexical_rerank_query_terms(raw_query: &str) -> Vec<String> {
+        fs_cass_parse_boolean_query(raw_query)
+            .into_iter()
+            .filter_map(|token| match token {
+                FsCassQueryToken::Term(t) => Some(t),
+                FsCassQueryToken::Phrase(p) => Some(p),
+                _ => None,
+            })
+            .collect()
     }
 
     /// W2-5: the default lexical search path (replaces Tantivy). `fts_lex`'s
@@ -7482,193 +7630,215 @@ impl SearchClient {
 
         let query_match_type = dominant_match_type(raw_query);
         let ku3_like_fallback = is_lexical_ku3_short_query(raw_query);
+        let cap = no_limit_result_cap();
 
-        let post_filter = Self::sqlite_fts5_filters_need_post_hydration(&filters);
-        let target_hits = if post_filter {
-            offset.saturating_add(limit)
+        // W2-5 Task2: candidate generation is a single unwindowed fetch (up
+        // to the memory-aware safety valve `cap`), not an incremental
+        // "fetch a small ranked page, refetch more if filters thin it out"
+        // loop -- the old loop existed to avoid over-fetching when SQL's
+        // own `ORDER BY bm25()` was trusted to put the best candidates
+        // first. It no longer is (design doc ①): the reranker needs the
+        // (near-)full candidate set to score correctly, so there is
+        // nothing left to page through here -- final windowing happens
+        // once, in Rust, after reranking (see the `skip(offset).take(limit)`
+        // at the bottom).
+        let (candidates_sql, candidates_params) = if ku3_like_fallback {
+            Self::lex_docs_like_candidates_query(raw_query.trim(), cap)
         } else {
-            limit
+            let fts_query = match transpile_to_fts5(raw_query) {
+                Some(q) if !q.trim().is_empty() => q,
+                _ => return Ok(Vec::new()),
+            };
+            Self::fts_lex_match_candidates_query(fts_query.as_str(), cap)
         };
-        let rank_batch_limit = if post_filter {
-            target_hits.clamp(1, SQLITE_FTS5_POST_FILTER_SCAN_CHUNK)
-        } else {
-            limit
-        };
-        let mut rank_offset = if post_filter { 0 } else { offset };
-        let mut scanned_rows = 0usize;
-        let mut hits = Vec::with_capacity(target_hits.min(rank_batch_limit));
 
-        loop {
-            let (rank_sql, rank_params) = if ku3_like_fallback {
-                Self::lex_docs_like_rank_query(raw_query.trim(), rank_batch_limit, rank_offset)
+        let candidate_rows: Vec<(i64, f64)> = match franken_query_map_collect_retry(
+            conn,
+            &candidates_sql,
+            &candidates_params,
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+        ) {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    ku3_like_fallback,
+                    "fts_lex candidate query failed; returning no lexical hits"
+                );
+                return Ok(Vec::new());
+            }
+        };
+        if candidate_rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Sign-normalize to "higher is better" once, at this boundary, so
+        // everything downstream (the reranker's zero-score tie-break --
+        // design doc ⑤ "边界①" -- and ultimately `SearchHit::score`) shares
+        // one convention: `bm25()` is more-negative-is-better; the LIKE
+        // fallback's occurrence count is already higher-is-better.
+        let legacy_score_by_message_id: HashMap<i64, f64> = candidate_rows
+            .iter()
+            .map(|&(id, raw_score)| {
+                let normalized = if ku3_like_fallback { raw_score } else { -raw_score };
+                (id, normalized)
+            })
+            .collect();
+        let message_ids: Vec<i64> = candidate_rows.iter().map(|(id, _)| *id).collect();
+
+        // Force content/title into the hydrate SQL regardless of the
+        // caller's requested `field_mask` -- the reranker needs real text
+        // to score candidates even when the final `SearchHit` will blank
+        // content/snippet per `field_mask` afterward (unchanged below,
+        // using the caller's original `field_mask`, not this one). All
+        // five columns still come back together in one query because
+        // `sqlite_fts5_message_hydrate_query` is the same hydrate path
+        // every SearchHit-producing branch in this file uses -- agent/
+        // workspace/source_path are needed for the hit itself (and its
+        // existing filters) regardless of what the reranker scores.
+        let hydrate_mask = FieldMask::new(true, true, true, false);
+        let mut metadata_by_message_id = HashMap::with_capacity(message_ids.len());
+        for chunk in message_ids.chunks(SQLITE_FTS5_HYDRATE_PARAM_CHUNK) {
+            let metadata_sql = Self::sqlite_fts5_message_hydrate_query(chunk.len(), hydrate_mask);
+            let metadata_params: Vec<ParamValue> =
+                chunk.iter().map(|id| ParamValue::from(*id)).collect();
+            let rows: Vec<SqliteFtsMessageRow> = match franken_query_map_collect_retry(
+                conn,
+                &metadata_sql,
+                &metadata_params,
+                |row| {
+                    Ok((
+                        row.get_typed(0)?,
+                        row.get_typed(1)?,
+                        row.get_typed(2)?,
+                        row.get_typed(3)?,
+                        row.get_typed(4)?,
+                        row.get_typed(5)?,
+                        row.get_typed(6)?,
+                        row.get_typed(7)?,
+                        row.get_typed(8)?,
+                        row.get_typed::<Option<String>>(9)?,
+                        row.get_typed(10)?,
+                        row.get_typed(11)?,
+                    ))
+                },
+            ) {
+                Ok(rows) => rows,
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "fts_lex message hydration query failed; returning no lexical hits"
+                    );
+                    return Ok(Vec::new());
+                }
+            };
+            metadata_by_message_id.extend(rows.into_iter().map(|row| (row.0, row)));
+        }
+
+        let query_terms = Self::lexical_rerank_query_terms(raw_query);
+        let corpus_stats = match self.lexical_corpus_stats(conn) {
+            Ok(stats) => stats,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "fts_lex corpus stats computation failed; returning no lexical hits"
+                );
+                return Ok(Vec::new());
+            }
+        };
+
+        let rerank_input: Vec<RerankCandidate> = message_ids
+            .iter()
+            .filter_map(|id| {
+                let meta = metadata_by_message_id.get(id)?;
+                let legacy_score = *legacy_score_by_message_id.get(id)?;
+                Some(RerankCandidate {
+                    doc_id: *id,
+                    content: meta.2.clone(),
+                    title: meta.1.clone(),
+                    legacy_score,
+                    score: 0.0,
+                })
+            })
+            .collect();
+
+        let ranked = lexical_rerank::rerank_candidates(
+            rerank_input,
+            &query_terms,
+            &corpus_stats.avgdl,
+            corpus_stats.total_docs,
+        );
+
+        let mut hits = Vec::with_capacity(ranked.len().min(offset.saturating_add(limit)));
+        for candidate in &ranked {
+            let Some(meta) = metadata_by_message_id.get(&candidate.doc_id) else {
+                continue;
+            };
+            let (
+                _message_id,
+                title,
+                raw_content,
+                agent,
+                workspace,
+                source_path,
+                created_at,
+                idx,
+                conversation_id,
+                raw_source_id,
+                origin_host,
+                raw_origin_kind,
+            ) = meta.clone();
+            let raw_source_id = raw_source_id.unwrap_or_else(default_source_id);
+            let source_id = normalized_search_hit_source_id_parts(
+                raw_source_id.as_str(),
+                raw_origin_kind.as_deref().unwrap_or_default(),
+                origin_host.as_deref(),
+            );
+            let origin_kind =
+                normalized_search_hit_origin_kind(source_id.as_str(), raw_origin_kind.as_deref());
+            let line_number = idx
+                .and_then(|i| usize::try_from(i).ok())
+                .map(|i| i.saturating_add(1));
+            let snippet = if field_mask.wants_snippet() {
+                snippet_from_content(&raw_content)
             } else {
-                let fts_query = match transpile_to_fts5(raw_query) {
-                    Some(q) if !q.trim().is_empty() => q,
-                    _ => return Ok(Vec::new()),
-                };
-                Self::fts_lex_match_rank_query(fts_query.as_str(), rank_batch_limit, rank_offset)
+                String::new()
+            };
+            let content = if field_mask.needs_content() {
+                raw_content
+            } else {
+                String::new()
+            };
+            let content_hash = if content.is_empty() {
+                stable_hit_hash(&snippet, &source_path, line_number, created_at)
+            } else {
+                stable_hit_hash(&content, &source_path, line_number, created_at)
             };
 
-            let ranked_rows: Vec<(i64, f64)> =
-                match franken_query_map_collect_retry(conn, &rank_sql, &rank_params, |row| {
-                    Ok((row.get_typed(0)?, row.get_typed(1)?))
-                }) {
-                    Ok(rows) => rows,
-                    Err(err) => {
-                        tracing::warn!(
-                            error = %err,
-                            ku3_like_fallback,
-                            "fts_lex rank query failed; returning no lexical hits"
-                        );
-                        return Ok(Vec::new());
-                    }
-                };
-            if ranked_rows.is_empty() {
-                break;
+            let hit = SearchHit {
+                title,
+                snippet,
+                content,
+                content_hash,
+                conversation_id,
+                score: candidate.score as f32,
+                source_path,
+                agent,
+                workspace,
+                workspace_original: None,
+                created_at,
+                line_number,
+                match_type: query_match_type,
+                source_id,
+                origin_kind,
+                origin_host,
+            };
+            if Self::sqlite_fts5_hit_matches_filters(&hit, &filters) {
+                hits.push(hit);
             }
-
-            scanned_rows = scanned_rows.saturating_add(ranked_rows.len());
-            let score_by_message_id: HashMap<i64, f64> = ranked_rows.iter().copied().collect();
-            let message_ids: Vec<i64> = ranked_rows.iter().map(|(id, _)| *id).collect();
-
-            let mut metadata_by_message_id = HashMap::with_capacity(message_ids.len());
-            for chunk in message_ids.chunks(SQLITE_FTS5_HYDRATE_PARAM_CHUNK) {
-                let metadata_sql = Self::sqlite_fts5_message_hydrate_query(chunk.len(), field_mask);
-                let metadata_params: Vec<ParamValue> =
-                    chunk.iter().map(|id| ParamValue::from(*id)).collect();
-                let rows: Vec<SqliteFtsMessageRow> = match franken_query_map_collect_retry(
-                    conn,
-                    &metadata_sql,
-                    &metadata_params,
-                    |row| {
-                        Ok((
-                            row.get_typed(0)?,
-                            row.get_typed(1)?,
-                            row.get_typed(2)?,
-                            row.get_typed(3)?,
-                            row.get_typed(4)?,
-                            row.get_typed(5)?,
-                            row.get_typed(6)?,
-                            row.get_typed(7)?,
-                            row.get_typed(8)?,
-                            row.get_typed::<Option<String>>(9)?,
-                            row.get_typed(10)?,
-                            row.get_typed(11)?,
-                        ))
-                    },
-                ) {
-                    Ok(rows) => rows,
-                    Err(err) => {
-                        tracing::warn!(
-                            error = %err,
-                            "fts_lex message hydration query failed; returning no lexical hits"
-                        );
-                        return Ok(Vec::new());
-                    }
-                };
-                metadata_by_message_id.extend(rows.into_iter().map(|row| (row.0, row)));
-            }
-
-            let mut hits_by_message_id = HashMap::with_capacity(ranked_rows.len());
-            for (message_id, meta) in metadata_by_message_id {
-                let Some(&raw_score) = score_by_message_id.get(&message_id) else {
-                    continue;
-                };
-                let (
-                    _message_id,
-                    title,
-                    raw_content,
-                    agent,
-                    workspace,
-                    source_path,
-                    created_at,
-                    idx,
-                    conversation_id,
-                    raw_source_id,
-                    origin_host,
-                    raw_origin_kind,
-                ) = meta;
-                let raw_source_id = raw_source_id.unwrap_or_else(default_source_id);
-                let source_id = normalized_search_hit_source_id_parts(
-                    raw_source_id.as_str(),
-                    raw_origin_kind.as_deref().unwrap_or_default(),
-                    origin_host.as_deref(),
-                );
-                let origin_kind =
-                    normalized_search_hit_origin_kind(source_id.as_str(), raw_origin_kind.as_deref());
-                let line_number = idx
-                    .and_then(|i| usize::try_from(i).ok())
-                    .map(|i| i.saturating_add(1));
-                let snippet = if field_mask.wants_snippet() {
-                    snippet_from_content(&raw_content)
-                } else {
-                    String::new()
-                };
-                let content = if field_mask.needs_content() {
-                    raw_content
-                } else {
-                    String::new()
-                };
-                let content_hash = if content.is_empty() {
-                    stable_hit_hash(&snippet, &source_path, line_number, created_at)
-                } else {
-                    stable_hit_hash(&content, &source_path, line_number, created_at)
-                };
-                // bm25() is more-negative-is-better; the LIKE fallback's
-                // occurrence count is already higher-is-better.
-                let score = if ku3_like_fallback {
-                    raw_score as f32
-                } else {
-                    (-raw_score) as f32
-                };
-
-                let hit = SearchHit {
-                    title,
-                    snippet,
-                    content,
-                    content_hash,
-                    conversation_id,
-                    score,
-                    source_path,
-                    agent,
-                    workspace,
-                    workspace_original: None,
-                    created_at,
-                    line_number,
-                    match_type: query_match_type,
-                    source_id,
-                    origin_kind,
-                    origin_host,
-                };
-                hits_by_message_id.insert(message_id, hit);
-            }
-
-            for (message_id, _) in &ranked_rows {
-                if let Some(hit) = hits_by_message_id.remove(message_id)
-                    && Self::sqlite_fts5_hit_matches_filters(&hit, &filters)
-                {
-                    hits.push(hit);
-                    if hits.len() >= target_hits {
-                        break;
-                    }
-                }
-            }
-
-            if hits.len() >= target_hits
-                || !post_filter
-                || ranked_rows.len() < rank_batch_limit
-                || scanned_rows >= SQLITE_FTS5_POST_FILTER_SCAN_LIMIT
-            {
-                break;
-            }
-            rank_offset = rank_offset.saturating_add(ranked_rows.len());
         }
 
-        if post_filter {
-            Ok(hits.into_iter().skip(offset).take(limit).collect())
-        } else {
-            Ok(hits)
-        }
+        Ok(hits.into_iter().skip(offset).take(limit).collect())
     }
 
     fn search_sqlite_fts5(
@@ -21735,7 +21905,7 @@ mod tests {
 
         // Sanity: plain MATCH structurally cannot find a 2-char CJK term
         // (mirrors tests/w2_fts_schema.rs's 3-char pinning test).
-        let (match_sql, match_params) = SearchClient::fts_lex_match_rank_query("事务", 10, 0);
+        let (match_sql, match_params) = SearchClient::fts_lex_match_candidates_query("事务", 10_000);
         let guard = client.sqlite_guard().unwrap();
         let conn = guard.as_ref().unwrap();
         let match_rows: Vec<(i64, f64)> = conn
@@ -21819,7 +21989,7 @@ mod tests {
     }
 
     #[test]
-    fn fts_lex_match_rank_query_does_not_scan_lex_docs() {
+    fn fts_lex_match_candidates_query_does_not_scan_lex_docs() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("cass.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
@@ -21835,7 +22005,7 @@ mod tests {
         insert_v2_lex_message(&storage, agent_id, "plan-fixture", "porter trigram query plan fixture");
         let conn = storage.raw();
 
-        let (sql, params) = SearchClient::fts_lex_match_rank_query("trigram", 10, 0);
+        let (sql, params) = SearchClient::fts_lex_match_candidates_query("trigram", 10_000);
         let plan_details: Vec<String> = conn
             .query_all_map(&format!("EXPLAIN QUERY PLAN {sql}"), &params, |row| row.get_typed(3))
             .unwrap();
@@ -21850,7 +22020,7 @@ mod tests {
     }
 
     #[test]
-    fn lex_docs_like_rank_query_is_a_genuine_table_scan() {
+    fn lex_docs_like_candidates_query_is_a_genuine_table_scan() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("cass.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
@@ -21866,7 +22036,7 @@ mod tests {
         insert_v2_lex_message(&storage, agent_id, "plan-fixture", "事务处理示例");
         let conn = storage.raw();
 
-        let (sql, params) = SearchClient::lex_docs_like_rank_query("事务", 10, 0);
+        let (sql, params) = SearchClient::lex_docs_like_candidates_query("事务", 10_000);
         let plan_details: Vec<String> = conn
             .query_all_map(&format!("EXPLAIN QUERY PLAN {sql}"), &params, |row| row.get_typed(3))
             .unwrap();
