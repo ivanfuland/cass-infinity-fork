@@ -6021,21 +6021,6 @@ fn lexical_rebuild_db_state(
     let total_conversations = count_total_conversations_exact(storage)?;
     lexical_rebuild_db_state_with_total_conversations(storage, db_path, total_conversations)
 }
-#[cfg(test)]
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub(crate) struct LexicalRebuildSnapshot {
-    pub db_path: String,
-    pub total_conversations: usize,
-    pub storage_fingerprint: String,
-    pub committed_offset: i64,
-    pub committed_conversation_id: Option<i64>,
-    pub processed_conversations: usize,
-    pub indexed_docs: usize,
-    pub completed: bool,
-    pub updated_at_ms: i64,
-}
-
-
 const LEXICAL_SHARD_PLAN_VERSION: u8 = 1;
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -6899,35 +6884,6 @@ where
             Ok(())
         }
     }
-}
-
-#[cfg(test)]
-pub(crate) fn load_lexical_rebuild_snapshot(
-    index_path: &Path,
-    db_path: &Path,
-) -> Result<Option<LexicalRebuildSnapshot>> {
-    let Some(state) = load_lexical_rebuild_state(index_path)? else {
-        return Ok(None);
-    };
-
-    if state.completed || !crate::stored_path_identity_matches(&state.db.db_path, db_path) {
-        return Ok(None);
-    }
-    let processed_conversations = state.reported_processed_conversations();
-    let committed_conversation_id = state.reported_committed_conversation_id();
-    let indexed_docs = state.reported_indexed_docs();
-
-    Ok(Some(LexicalRebuildSnapshot {
-        db_path: state.db.db_path,
-        total_conversations: state.db.total_conversations,
-        storage_fingerprint: state.db.storage_fingerprint,
-        committed_offset: state.committed_offset,
-        committed_conversation_id,
-        processed_conversations,
-        indexed_docs,
-        completed: state.completed,
-        updated_at_ms: state.updated_at_ms,
-    }))
 }
 
 fn repair_daily_stats_if_drifted(
@@ -17295,8 +17251,6 @@ pub mod persist {
         Agent, AgentKind, Conversation, Message, MessageRole, Snippet, role_from_str,
     };
     #[cfg(test)]
-    use crate::search::tantivy::TantivyIndex;
-    #[cfg(test)]
     use crate::sources::provenance::{Source, SourceKind};
     use crate::storage::sqlite::{
         FrankenStorage, IndexingCache, InsertOutcome, anyhow_error_into_storage_error,
@@ -25792,14 +25746,6 @@ mod tests {
 
 
 
-    fn tantivy_doc_count_for_data_dir(data_dir: &Path) -> u64 {
-        let index_path = index_dir(data_dir).unwrap();
-        crate::search::tantivy::searchable_index_summary(&index_path)
-            .unwrap()
-            .expect("searchable lexical index summary")
-            .docs as u64
-    }
-
     fn token_usage_extra(input_tokens: i64, output_tokens: i64) -> serde_json::Value {
         serde_json::json!({
             "message": {
@@ -28644,15 +28590,12 @@ mod tests {
 
         let db_path = data_dir.join("checkpoint-policy.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
-        ensure_fts_schema(&storage);
-        let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
 
         persist::apply_index_writer_checkpoint_policy(&storage, false);
 
         let first = vec![norm_conv(Some("checkpoint-a"), vec![norm_msg(0, 1_000)])];
         ingest_batch(
             &storage,
-            Some(&mut index),
             &data_dir,
             &first,
             &None,
@@ -28671,7 +28614,6 @@ mod tests {
         let second = vec![norm_conv(Some("checkpoint-b"), vec![norm_msg(0, 2_000)])];
         ingest_batch(
             &storage,
-            Some(&mut index),
             &data_dir,
             &second,
             &None,
@@ -31487,22 +31429,10 @@ mod tests {
             watch_interval_secs: 30,
         };
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
-        let index_path = index_dir(&opts.data_dir).unwrap();
         let state = Mutex::new(HashMap::new());
         let storage = Mutex::new(storage);
-        let t_index = Mutex::new(None);
 
-        let indexed = reindex_paths(
-            &opts,
-            vec![session],
-            &[],
-            &state,
-            &storage,
-            &t_index,
-            &index_path,
-            false,
-        )
-        .unwrap();
+        let indexed = reindex_paths(&opts, vec![session], &[], &state, &storage, false).unwrap();
 
         assert_eq!(indexed, 1);
         let message_count: i64 = storage
@@ -32186,12 +32116,9 @@ mod tests {
 
         // Manually set up dependencies for reindex_paths
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
-        let index_path = index_dir(&opts.data_dir).unwrap();
-        let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
 
         let state = std::sync::Mutex::new(std::collections::HashMap::new());
         let storage = std::sync::Mutex::new(storage);
-        let t_index = std::sync::Mutex::new(Some(t_index));
 
         // Need roots for reindex_paths
         let roots = vec![(ConnectorKind::Amp, ScanRoot::local(amp_dir))];
@@ -32202,8 +32129,6 @@ mod tests {
             &roots,
             &state,
             &storage,
-            &t_index,
-            &index_path,
             false,
         )
         .unwrap();
@@ -32277,24 +32202,11 @@ mod tests {
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
-        let index_path = index_dir(&opts.data_dir).unwrap();
-        let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
         let state = std::sync::Mutex::new(std::collections::HashMap::new());
         let storage = std::sync::Mutex::new(storage);
-        let t_index = std::sync::Mutex::new(Some(t_index));
         let roots = vec![(ConnectorKind::Amp, ScanRoot::local(amp_dir))];
 
-        let indexed = reindex_paths(
-            &opts,
-            paths,
-            &roots,
-            &state,
-            &storage,
-            &t_index,
-            &index_path,
-            false,
-        )
-        .unwrap();
+        let indexed = reindex_paths(&opts, paths, &roots, &state, &storage, false).unwrap();
 
         assert_eq!(indexed, 4);
         assert_eq!(progress.current.load(Ordering::Relaxed), 4);
@@ -32374,24 +32286,12 @@ mod tests {
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
-        let index_path = index_dir(&opts.data_dir).unwrap();
-        let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
         let state = std::sync::Mutex::new(std::collections::HashMap::new());
         let storage = std::sync::Mutex::new(storage);
-        let t_index = std::sync::Mutex::new(Some(t_index));
         let roots = vec![(ConnectorKind::Amp, ScanRoot::local(amp_dir))];
 
-        let indexed = reindex_paths(
-            &opts,
-            vec![amp_file],
-            &roots,
-            &state,
-            &storage,
-            &t_index,
-            &index_path,
-            false,
-        )
-        .unwrap();
+        let indexed =
+            reindex_paths(&opts, vec![amp_file], &roots, &state, &storage, false).unwrap();
 
         assert_eq!(indexed, 1);
         assert!(
@@ -32454,24 +32354,12 @@ mod tests {
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
-        let index_path = index_dir(&opts.data_dir).unwrap();
-        let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
         let state = std::sync::Mutex::new(std::collections::HashMap::new());
         let storage = std::sync::Mutex::new(storage);
-        let t_index = std::sync::Mutex::new(Some(t_index));
         let roots = vec![(ConnectorKind::Amp, ScanRoot::local(amp_dir))];
 
-        let indexed = reindex_paths(
-            &opts,
-            vec![amp_file],
-            &roots,
-            &state,
-            &storage,
-            &t_index,
-            &index_path,
-            false,
-        )
-        .unwrap();
+        let indexed =
+            reindex_paths(&opts, vec![amp_file], &roots, &state, &storage, false).unwrap();
 
         assert_eq!(indexed, 1);
         assert!(
@@ -32547,11 +32435,8 @@ mod tests {
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
-        let index_path = index_dir(&opts.data_dir).unwrap();
-        let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
         let state = std::sync::Mutex::new(std::collections::HashMap::new());
         let storage = std::sync::Mutex::new(storage);
-        let t_index = std::sync::Mutex::new(Some(t_index));
         let roots = vec![(ConnectorKind::Amp, ScanRoot::local(amp_dir))];
 
         let indexed = reindex_paths(
@@ -32560,8 +32445,6 @@ mod tests {
             &roots,
             &state,
             &storage,
-            &t_index,
-            &index_path,
             false,
         )
         .unwrap();
@@ -32639,11 +32522,8 @@ mod tests {
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
-        let index_path = index_dir(&opts.data_dir).unwrap();
-        let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
         let state = std::sync::Mutex::new(std::collections::HashMap::new());
         let storage = std::sync::Mutex::new(storage);
-        let t_index = std::sync::Mutex::new(Some(t_index));
         let roots = vec![
             (ConnectorKind::Amp, ScanRoot::local(deferred_dir)),
             (ConnectorKind::Amp, ScanRoot::local(later_dir)),
@@ -32655,8 +32535,6 @@ mod tests {
             &roots,
             &state,
             &storage,
-            &t_index,
-            &index_path,
             false,
         )
         .unwrap();
@@ -32733,11 +32611,8 @@ mod tests {
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
-        let index_path = index_dir(&opts.data_dir).unwrap();
-        let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
         let state = std::sync::Mutex::new(std::collections::HashMap::new());
         let storage = std::sync::Mutex::new(storage);
-        let t_index = std::sync::Mutex::new(Some(t_index));
         let roots = vec![
             (ConnectorKind::Amp, ScanRoot::local(done_dir)),
             (ConnectorKind::Amp, ScanRoot::local(active_file.clone())),
@@ -32749,8 +32624,6 @@ mod tests {
             &roots,
             &state,
             &storage,
-            &t_index,
-            &index_path,
             false,
         )
         .unwrap();
@@ -32885,24 +32758,11 @@ mod tests {
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
-        let index_path = index_dir(&opts.data_dir).unwrap();
-        let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
         let state = std::sync::Mutex::new(std::collections::HashMap::new());
         let storage = std::sync::Mutex::new(storage);
-        let t_index = std::sync::Mutex::new(Some(t_index));
         let roots = vec![(ConnectorKind::Amp, ScanRoot::local(amp_dir))];
 
-        let indexed = reindex_paths(
-            &opts,
-            paths,
-            &roots,
-            &state,
-            &storage,
-            &t_index,
-            &index_path,
-            false,
-        )
-        .unwrap();
+        let indexed = reindex_paths(&opts, paths, &roots, &state, &storage, false).unwrap();
 
         assert_eq!(indexed, 4);
         assert_eq!(progress.current.load(Ordering::Relaxed), 4);
@@ -32970,11 +32830,8 @@ mod tests {
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
-        let index_path = index_dir(&opts.data_dir).unwrap();
-        let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
         let state = std::sync::Mutex::new(std::collections::HashMap::new());
         let storage = std::sync::Mutex::new(storage);
-        let t_index = std::sync::Mutex::new(Some(t_index));
         let roots = vec![(ConnectorKind::Amp, ScanRoot::local(amp_file.clone()))];
 
         let indexed = reindex_paths(
@@ -32983,8 +32840,6 @@ mod tests {
             &roots,
             &state,
             &storage,
-            &t_index,
-            &index_path,
             false,
         )
         .unwrap();
@@ -33018,10 +32873,14 @@ mod tests {
                 .exists(),
             "lexical update OOM must not quarantine a source conversation that persisted to SQLite"
         );
-        assert!(
-            t_index.lock().unwrap().is_none(),
-            "dirty Tantivy writer should be dropped after deferred lexical update"
-        );
+        // W2-6 Task丙续: dropped the tantivy-writer-dropped assertion -- there
+        // is no in-memory dirty writer any more in the DB-domain sink
+        // (`sync_lexical_domain_for_conversation_in_tx` runs inside the same
+        // atomic SQLite transaction as the message insert, so there is no
+        // separate "dirty writer" state that can outlive an OOM to begin
+        // with). The conversation/message row assertions above already
+        // cover the real invariant: SQLite persisted, only the lexical
+        // index population was deferred.
 
         if let Some(prev) = prev {
             unsafe { std::env::set_var("XDG_DATA_HOME", prev) };
@@ -33063,11 +32922,8 @@ mod tests {
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
-        let index_path = index_dir(&opts.data_dir).unwrap();
-        let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
         let state = std::sync::Mutex::new(std::collections::HashMap::new());
         let storage = std::sync::Mutex::new(storage);
-        let t_index = std::sync::Mutex::new(Some(t_index));
         let roots = vec![(ConnectorKind::Amp, ScanRoot::local(amp_file.clone()))];
 
         let indexed = reindex_paths(
@@ -33076,8 +32932,6 @@ mod tests {
             &roots,
             &state,
             &storage,
-            &t_index,
-            &index_path,
             false,
         )
         .unwrap();
@@ -33151,11 +33005,8 @@ mod tests {
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
-        let index_path = index_dir(&opts.data_dir).unwrap();
-        let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
         let state = std::sync::Mutex::new(std::collections::HashMap::new());
         let storage = std::sync::Mutex::new(storage);
-        let t_index = std::sync::Mutex::new(Some(t_index));
         let roots = vec![(ConnectorKind::Amp, ScanRoot::local(amp_file.clone()))];
 
         let indexed = reindex_paths(
@@ -33164,8 +33015,6 @@ mod tests {
             &roots,
             &state,
             &storage,
-            &t_index,
-            &index_path,
             false,
         )
         .unwrap();
@@ -33278,11 +33127,8 @@ mod tests {
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
-        let index_path = index_dir(&opts.data_dir).unwrap();
-        let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
         let state = std::sync::Mutex::new(std::collections::HashMap::new());
         let storage = std::sync::Mutex::new(storage);
-        let t_index = std::sync::Mutex::new(Some(t_index));
         let roots = vec![(ConnectorKind::Amp, ScanRoot::local(amp_dir.clone()))];
 
         let mut first_delta = WatchSemanticDelta::default();
@@ -33292,8 +33138,6 @@ mod tests {
             &roots,
             &state,
             &storage,
-            &t_index,
-            &index_path,
             false,
             Some(&mut first_delta),
         )
@@ -33333,8 +33177,6 @@ mod tests {
             &roots,
             &state,
             &storage,
-            &t_index,
-            &index_path,
             false,
             Some(&mut second_delta),
         )
@@ -33398,26 +33240,14 @@ mod tests {
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
-        let index_path = index_dir(&opts.data_dir).unwrap();
-        let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
         let mut initial = HashMap::new();
         initial.insert(ConnectorKind::Amp, i64::MAX / 4);
         let state = Mutex::new(initial);
         let storage = Mutex::new(storage);
-        let t_index = Mutex::new(Some(t_index));
         let roots = vec![(ConnectorKind::Amp, ScanRoot::local(amp_dir))];
 
-        let indexed = reindex_paths(
-            &opts,
-            vec![amp_file],
-            &roots,
-            &state,
-            &storage,
-            &t_index,
-            &index_path,
-            false,
-        )
-        .unwrap();
+        let indexed = reindex_paths(&opts, vec![amp_file], &roots, &state, &storage, false)
+            .unwrap();
         assert!(
             indexed > 0,
             "expected indexing to use trigger min_ts instead of stale future watch-state"
@@ -33463,25 +33293,14 @@ mod tests {
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
-        let index_path = index_dir(&opts.data_dir).unwrap();
         let mut initial = HashMap::new();
         initial.insert(ConnectorKind::Amp, 10_000);
         let state = Mutex::new(initial);
         let storage = Mutex::new(storage);
-        let t_index = Mutex::new(None);
         let roots = vec![(ConnectorKind::Amp, ScanRoot::local(amp_dir))];
 
-        let indexed = reindex_paths(
-            &opts,
-            vec![amp_file],
-            &roots,
-            &state,
-            &storage,
-            &t_index,
-            &index_path,
-            false,
-        )
-        .unwrap();
+        let indexed = reindex_paths(&opts, vec![amp_file], &roots, &state, &storage, false)
+            .unwrap();
         assert_eq!(
             indexed, 0,
             "fixture should produce no indexed conversations"
@@ -33490,13 +33309,11 @@ mod tests {
             state.lock().unwrap().get(&ConnectorKind::Amp),
             Some(&10_000)
         );
-        // The storage-side last_indexed_at and Tantivy writer should remain
-        // untouched: both live on the ingest path that conv_count == 0 now
-        // short-circuits around. See issue #194.
-        assert!(
-            t_index.lock().unwrap().is_none(),
-            "empty watch scan must not open Tantivy"
-        );
+        // W2-6 Task丙续: dropped the "Tantivy writer stays unopened" assertion
+        // -- there is no separate lexical-writer open step in the DB-domain
+        // sink any more (see issue #194's original concern), so it cannot be
+        // opened by accident either. The storage-side last_indexed_at
+        // assertion below is the real regression intent.
         assert_eq!(
             storage.lock().unwrap().get_last_indexed_at().unwrap(),
             None,
@@ -33560,11 +33377,8 @@ mod tests {
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
-        let index_path = index_dir(&opts.data_dir).unwrap();
-        let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
         let state = Mutex::new(HashMap::new());
         let storage = Mutex::new(storage);
-        let t_index = Mutex::new(Some(t_index));
 
         reindex_paths(
             &opts,
@@ -33572,8 +33386,6 @@ mod tests {
             &[(ConnectorKind::Amp, ScanRoot::local(amp_dir))],
             &state,
             &storage,
-            &t_index,
-            &index_path,
             false,
         )
         .unwrap();
@@ -33585,7 +33397,6 @@ mod tests {
         assert_eq!(progress.phase.load(Ordering::Relaxed), 0);
 
         // Explicitly drop resources to release locks before cleanup
-        drop(t_index);
         storage.into_inner().unwrap().close().unwrap();
         drop(state);
 
@@ -33634,13 +33445,10 @@ mod tests {
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
-        let index_path = index_dir(&opts.data_dir).unwrap();
-        let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
         let mut initial = HashMap::new();
         initial.insert(ConnectorKind::Amp, i64::MAX / 4);
         let state = Mutex::new(initial);
         let storage = Mutex::new(storage);
-        let t_index = Mutex::new(Some(t_index));
 
         let indexed = reindex_paths(
             &opts,
@@ -33648,8 +33456,6 @@ mod tests {
             &[(ConnectorKind::Amp, ScanRoot::local(amp_dir))],
             &state,
             &storage,
-            &t_index,
-            &index_path,
             false,
         )
         .unwrap();
@@ -33710,11 +33516,8 @@ mod tests {
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
-        let index_path = index_dir(&opts.data_dir).unwrap();
-        let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
         let state = Mutex::new(HashMap::new());
         let storage = Mutex::new(storage);
-        let t_index = Mutex::new(Some(t_index));
 
         let first = reindex_paths(
             &opts,
@@ -33722,8 +33525,6 @@ mod tests {
             &[(ConnectorKind::Amp, ScanRoot::local(amp_dir.clone()))],
             &state,
             &storage,
-            &t_index,
-            &index_path,
             false,
         )
         .unwrap();
@@ -33780,8 +33581,6 @@ mod tests {
             &[(ConnectorKind::Amp, ScanRoot::local(amp_dir))],
             &state,
             &storage,
-            &t_index,
-            &index_path,
             false,
         )
         .unwrap();
@@ -33837,11 +33636,8 @@ mod tests {
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
-        let index_path = index_dir(&opts.data_dir).unwrap();
-        let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
         let state = Mutex::new(persisted_state.clone());
         let storage = Mutex::new(storage);
-        let t_index = Mutex::new(Some(t_index));
 
         let indexed = reindex_paths(
             &opts,
@@ -33849,8 +33645,6 @@ mod tests {
             &[(ConnectorKind::Amp, ScanRoot::local(amp_dir))],
             &state,
             &storage,
-            &t_index,
-            &index_path,
             false,
         )
         .unwrap();
@@ -34940,32 +34734,22 @@ mod tests {
 
     #[test]
     fn clear_lexical_rebuild_state_removes_stale_snapshot() {
+        // W2-6 UNDECIDED裁定 (控制面 2026-08-30): `persist_lexical_rebuild_state`/
+        // `load_lexical_rebuild_state` are dead (removed by Task甲's t_index
+        // chain surgery). `clear_lexical_rebuild_state` only cares whether a
+        // file exists at the path -- it does not parse content -- so a
+        // minimal hand-written legacy-JSON-shaped fixture is sufficient; no
+        // need to reconstruct `LexicalRebuildState`'s real serialization.
         let tmp = TempDir::new().unwrap();
         let index_path = tmp.path().join("index");
         fs::create_dir_all(&index_path).unwrap();
 
-        let state = LexicalRebuildState::new(
-            LexicalRebuildDbState {
-                db_path: "/tmp/agent_search.db".to_string(),
-                total_conversations: 12,
-                total_messages: 24,
-                storage_fingerprint: "seed:12".to_string(),
-            },
-            LEXICAL_REBUILD_PAGE_SIZE,
-        );
-        persist_lexical_rebuild_state(&index_path, &state).unwrap();
-        assert!(
-            load_lexical_rebuild_snapshot(&index_path, Path::new("/tmp/agent_search.db"))
-                .unwrap()
-                .is_some()
-        );
+        let state_path = lexical_rebuild_state_path(&index_path);
+        fs::write(&state_path, b"{\"legacy\":\"fixture\"}").unwrap();
+        assert!(state_path.exists());
 
         clear_lexical_rebuild_state(&index_path).unwrap();
-        assert!(
-            load_lexical_rebuild_snapshot(&index_path, Path::new("/tmp/agent_search.db"))
-                .unwrap()
-                .is_none()
-        );
+        assert!(!state_path.exists());
     }
 
 
