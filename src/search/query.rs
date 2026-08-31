@@ -299,21 +299,6 @@ macro_rules! fparams {
 struct SendConnection(Connection);
 
 type TantivyContentExactKey = (i64, i64);
-type TantivyContentFallbackKey = (String, String, i64);
-type TantivyHydratedContentMaps = (
-    HashMap<TantivyContentExactKey, String>,
-    HashMap<TantivyContentFallbackKey, String>,
-);
-type SqliteFtsHydratedRow = (
-    i64,
-    Option<i64>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<i64>,
-);
 /// W2-5 Task2: `lex_docs` corpus-wide stats the BM25F reranker needs
 /// (design doc ②). `total_docs` doubles as `N` in the IDF formula.
 #[derive(Clone, Copy)]
@@ -336,37 +321,10 @@ type SqliteFtsMessageRow = (
     Option<String>,
     Option<String>,
 );
-type SqliteMessageScanAlternative = Vec<String>;
-type SqliteMessageScanGroup = Vec<SqliteMessageScanAlternative>;
-struct SqliteMessageScanQuery {
-    include_groups: Vec<SqliteMessageScanGroup>,
-    exclude_terms: Vec<String>,
-}
-
-#[derive(Clone, Copy)]
-struct SqliteMessageScanRequest<'a> {
-    raw_query: &'a str,
-    filters: &'a SearchFilters,
-    limit: usize,
-    offset: usize,
-    field_mask: FieldMask,
-    query_match_type: MatchType,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SqliteFtsMatchMode {
-    Table,
-    IndexedColumns,
-}
-
 // The legacy embedded engine follows SQLite's bind-variable ceiling. Keep fallback
 // hydration IN-lists below that ceiling so large pages do not turn into
 // empty fallback result sets.
 const SQLITE_FTS5_HYDRATE_PARAM_CHUNK: usize = 30_000;
-const SQLITE_MAX_VARIABLE_NUMBER: usize = 32_766;
-const SQLITE_FTS5_POST_FILTER_SCAN_CHUNK: usize = 1_024;
-const SQLITE_FTS5_POST_FILTER_SCAN_LIMIT: usize = 30_000;
-const SQLITE_MESSAGE_SCAN_FALLBACK_LIMIT: usize = 30_000;
 const SEARCH_SQLITE_HYDRATION_CACHE_KIB: i64 = 4_096;
 const SEMANTIC_EXACT_CHUNK_OVERFETCH_MULTIPLIER: usize = 4;
 
@@ -436,54 +394,6 @@ where
     }
 }
 
-fn hydrate_message_content_by_conversation(
-    conn: &Connection,
-    requests: &[TantivyContentExactKey],
-) -> Result<HashMap<TantivyContentExactKey, String>> {
-    if requests.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let mut wanted_by_conversation: HashMap<i64, HashSet<i64>> = HashMap::new();
-    for &(conversation_id, line_idx) in requests {
-        wanted_by_conversation
-            .entry(conversation_id)
-            .or_default()
-            .insert(line_idx);
-    }
-
-    let mut conversation_ids = wanted_by_conversation.keys().copied().collect::<Vec<_>>();
-    conversation_ids.sort_unstable();
-    let mut hydrated = HashMap::with_capacity(requests.len());
-
-    for conversation_id in conversation_ids {
-        let Some(wanted_indices) = wanted_by_conversation.get(&conversation_id) else {
-            continue;
-        };
-        let mut wanted_indices = wanted_indices.iter().copied().collect::<Vec<_>>();
-        wanted_indices.sort_unstable();
-        let placeholders = sql_placeholders(wanted_indices.len());
-        let sql = format!(
-            "SELECT m.conversation_id, m.idx, m.content
-             FROM messages m INDEXED BY sqlite_autoindex_messages_1
-             WHERE m.conversation_id = ? AND m.idx IN ({placeholders})
-             ORDER BY m.idx"
-        );
-        let mut params = Vec::with_capacity(wanted_indices.len() + 1);
-        params.push(ParamValue::from(conversation_id));
-        params.extend(wanted_indices.iter().copied().map(ParamValue::from));
-        let rows: Vec<(i64, i64, String)> =
-            franken_query_map_collect_retry(conn, &sql, &params, |row| {
-                Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?))
-            })?;
-        for (conversation_id, line_idx, content) in rows {
-            hydrated.insert((conversation_id, line_idx), content);
-        }
-    }
-
-    Ok(hydrated)
-}
-
 /// Look up a `SearchHit`'s (conversation_id, message idx) key, used to join
 /// back to the `messages` table for post-hoc filters (e.g. `--role`) that
 /// aren't available on the hit itself (lexical/Tantivy has no role field).
@@ -495,8 +405,8 @@ fn message_role_lookup_key(hit: &SearchHit) -> Option<TantivyContentExactKey> {
 
 /// Batch-hydrate message role codes for a set of (conversation_id, idx) keys.
 ///
-/// Mirrors [`hydrate_message_content_by_conversation`]'s per-conversation
-/// chunked-IN query shape, but reads `role` instead of `content` and maps
+/// Uses the same per-conversation chunked-IN query shape as other message
+/// hydration helpers in this module, but reads `role` instead of `content` and maps
 /// the stored role string to its compact code via `role_code_from_str` (so
 /// the 6-role normalization stays in one place).
 fn hydrate_message_roles_by_conversation(
@@ -5952,279 +5862,6 @@ impl SearchClient {
         suggestions
     }
 
-    fn hydrate_tantivy_hit_contents(
-        &self,
-        exact_keys: &[TantivyContentExactKey],
-        fallback_keys: &[TantivyContentFallbackKey],
-    ) -> Result<TantivyHydratedContentMaps> {
-        if exact_keys.is_empty() && fallback_keys.is_empty() {
-            return Ok((HashMap::new(), HashMap::new()));
-        }
-
-        let sqlite_guard = match self.sqlite_guard() {
-            Ok(guard) => guard,
-            Err(_) => return Ok((HashMap::new(), HashMap::new())),
-        };
-        let Some(conn) = sqlite_guard.as_ref() else {
-            return Ok((HashMap::new(), HashMap::new()));
-        };
-
-        let mut hydrated_exact = HashMap::new();
-        let mut hydrated_fallback = HashMap::new();
-        const CHUNK_SIZE: usize = 300;
-
-        if !exact_keys.is_empty() {
-            let mut unique_exact_keys = Vec::with_capacity(exact_keys.len());
-            let mut seen = HashSet::with_capacity(exact_keys.len());
-            for key in exact_keys {
-                if seen.insert(*key) {
-                    unique_exact_keys.push(*key);
-                }
-            }
-
-            hydrated_exact.extend(hydrate_message_content_by_conversation(
-                conn,
-                &unique_exact_keys,
-            )?);
-        }
-
-        if !fallback_keys.is_empty() {
-            let mut unique_fallback_keys = Vec::with_capacity(fallback_keys.len());
-            let mut seen = HashSet::with_capacity(fallback_keys.len());
-            for key in fallback_keys {
-                if seen.insert(key.clone()) {
-                    unique_fallback_keys.push(key.clone());
-                }
-            }
-
-            let mut unique_source_paths = Vec::with_capacity(unique_fallback_keys.len());
-            let mut seen_source_paths = HashSet::with_capacity(unique_fallback_keys.len());
-            for (_, source_path, _) in &unique_fallback_keys {
-                if seen_source_paths.insert(source_path.clone()) {
-                    unique_source_paths.push(source_path.clone());
-                }
-            }
-
-            let mut conversations_by_key: HashMap<(String, String), Vec<i64>> = HashMap::new();
-            for chunk in unique_source_paths.chunks(CHUNK_SIZE) {
-                let placeholders = sql_placeholders(chunk.len());
-                let sql = format!(
-                    "SELECT c.id,
-                            c.source_path,
-                            COALESCE(c.source_id, ''),
-                            COALESCE(c.origin_host, ''),
-                            COALESCE(s.kind, '')
-                     FROM conversations c
-                     LEFT JOIN sources s ON c.source_id = s.id
-                     WHERE c.source_path IN ({placeholders})
-                     ORDER BY c.id"
-                );
-                let params = chunk
-                    .iter()
-                    .map(|source_path| ParamValue::from(source_path.clone()))
-                    .collect::<Vec<_>>();
-                let rows: Vec<(i64, String, String, String, String)> =
-                    franken_query_map_collect_retry(conn, &sql, &params, |row| {
-                        Ok((
-                            row.get_typed(0)?,
-                            row.get_typed(1)?,
-                            row.get_typed(2)?,
-                            row.get_typed(3)?,
-                            row.get_typed(4)?,
-                        ))
-                    })?;
-
-                for (conversation_id, source_path, raw_source_id, origin_host, origin_kind) in rows
-                {
-                    let normalized_source_id = normalized_search_hit_source_id_parts(
-                        &raw_source_id,
-                        &origin_kind,
-                        (!origin_host.trim().is_empty()).then_some(origin_host.as_str()),
-                    );
-                    conversations_by_key
-                        .entry((normalized_source_id, source_path))
-                        .or_default()
-                        .push(conversation_id);
-                }
-            }
-
-            let mut message_requests = Vec::new();
-            let mut fallback_keys_by_exact: HashMap<
-                TantivyContentExactKey,
-                Vec<TantivyContentFallbackKey>,
-            > = HashMap::new();
-            let mut seen_message_requests = HashSet::new();
-            for (source_id, source_path, line_idx) in &unique_fallback_keys {
-                let key = (source_id.clone(), source_path.clone());
-                let Some(conversation_ids) = conversations_by_key.get(&key) else {
-                    continue;
-                };
-                for &conversation_id in conversation_ids {
-                    let exact_key = (conversation_id, *line_idx);
-                    if seen_message_requests.insert(exact_key) {
-                        message_requests.push(exact_key);
-                    }
-                    fallback_keys_by_exact.entry(exact_key).or_default().push((
-                        source_id.clone(),
-                        source_path.clone(),
-                        *line_idx,
-                    ));
-                }
-            }
-
-            for ((conversation_id, line_idx), content) in
-                hydrate_message_content_by_conversation(conn, &message_requests)?
-            {
-                if let Some(fallback_keys) =
-                    fallback_keys_by_exact.get(&(conversation_id, line_idx))
-                {
-                    for fallback_key in fallback_keys {
-                        hydrated_fallback.insert(fallback_key.clone(), content.clone());
-                    }
-                }
-            }
-        }
-
-        Ok((hydrated_exact, hydrated_fallback))
-    }
-
-    fn sqlite_fts_uses_message_id_column(conn: &Connection) -> Result<bool> {
-        let params: [ParamValue; 0] = [];
-        let ddl_rows: Vec<String> = franken_query_map_collect_retry(
-            conn,
-            "SELECT COALESCE(sql, '')
-             FROM sqlite_master
-             WHERE name = 'fts_messages'
-             ORDER BY rowid DESC
-             LIMIT 1",
-            &params,
-            |row: &FrankenRow| row.get_typed::<String>(0),
-        )?;
-        Ok(ddl_rows
-            .first()
-            .map(|sql| sql.to_ascii_lowercase().contains("message_id"))
-            .unwrap_or(false))
-    }
-
-    fn sqlite_fts_match_mode(conn: &Connection) -> Result<SqliteFtsMatchMode> {
-        let params = [ParamValue::from("__cass_fts_probe_no_match__")];
-        match franken_query_map_collect_retry(
-            conn,
-            "SELECT COUNT(*) FROM fts_messages WHERE fts_messages MATCH ?",
-            &params,
-            |row: &FrankenRow| row.get_typed::<i64>(0),
-        ) {
-            Ok(_) => Ok(SqliteFtsMatchMode::Table),
-            Err(err)
-                if err
-                    .to_string()
-                    .contains("no such column: fts_messages in table fts_messages") =>
-            {
-                Ok(SqliteFtsMatchMode::IndexedColumns)
-            }
-            Err(err) => Err(anyhow!(err)),
-        }
-    }
-
-    fn sqlite_fts5_rowid_projection_available(conn: &Connection) -> bool {
-        let params: [ParamValue; 0] = [];
-        franken_query_map_collect_retry(
-            conn,
-            "SELECT rowid FROM fts_messages LIMIT 1",
-            &params,
-            |row: &FrankenRow| row.get_typed::<i64>(0),
-        )
-        .is_ok()
-    }
-
-    fn sqlite_fts5_match_clause(match_mode: SqliteFtsMatchMode) -> &'static str {
-        match match_mode {
-            SqliteFtsMatchMode::Table => "fts_messages MATCH ?",
-            SqliteFtsMatchMode::IndexedColumns => {
-                "(content MATCH ?
-                  OR title MATCH ?
-                  OR agent MATCH ?
-                  OR workspace MATCH ?
-                  OR source_path MATCH ?)"
-            }
-        }
-    }
-
-    fn push_sqlite_fts5_match_params(
-        params: &mut Vec<ParamValue>,
-        fts_query: &str,
-        match_mode: SqliteFtsMatchMode,
-    ) {
-        let copies = match match_mode {
-            SqliteFtsMatchMode::Table => 1,
-            SqliteFtsMatchMode::IndexedColumns => 5,
-        };
-        for _ in 0..copies {
-            params.push(ParamValue::from(fts_query));
-        }
-    }
-
-    fn sqlite_fts5_rank_query(
-        fts_query: &str,
-        _filters: &SearchFilters,
-        limit: usize,
-        offset: usize,
-        _uses_message_id: bool,
-        match_mode: SqliteFtsMatchMode,
-    ) -> (String, Vec<ParamValue>) {
-        let match_clause = Self::sqlite_fts5_match_clause(match_mode);
-        let mut sql = format!(
-            "SELECT rowid,
-                    bm25(fts_messages)
-             FROM fts_messages
-             WHERE {match_clause}"
-        );
-        let mut params = Vec::with_capacity(9);
-        Self::push_sqlite_fts5_match_params(&mut params, fts_query, match_mode);
-
-        sql.push_str(" ORDER BY bm25(fts_messages), rowid LIMIT ? OFFSET ?");
-        params.push(ParamValue::from(limit as i64));
-        params.push(ParamValue::from(offset as i64));
-
-        (sql, params)
-    }
-
-    fn sqlite_fts5_hydrate_query(
-        row_count: usize,
-        field_mask: FieldMask,
-        uses_message_id: bool,
-    ) -> String {
-        let title_expr = if field_mask.wants_title() {
-            "fts_messages.title"
-        } else {
-            "NULL"
-        };
-        let content_expr = if field_mask.needs_content() || field_mask.wants_snippet() {
-            "fts_messages.content"
-        } else {
-            "NULL"
-        };
-        let message_key_expr = if uses_message_id {
-            "CAST(fts_messages.message_id AS INTEGER)"
-        } else {
-            "rowid"
-        };
-        let placeholders = sql_placeholders(row_count);
-
-        format!(
-            "SELECT rowid,
-                    {message_key_expr},
-                    {title_expr},
-                    {content_expr},
-                    fts_messages.agent,
-                    fts_messages.workspace,
-                    fts_messages.source_path,
-                    CAST(fts_messages.created_at AS INTEGER)
-             FROM fts_messages
-             WHERE rowid IN ({placeholders})"
-        )
-    }
-
     fn sqlite_fts5_message_hydrate_query(row_count: usize, field_mask: FieldMask) -> String {
         let title_expr = if field_mask.wants_title() {
             "COALESCE(c.title, '')"
@@ -6260,22 +5897,6 @@ impl SearchClient {
              LEFT JOIN workspaces w ON c.workspace_id = w.id
              WHERE m.id IN ({placeholders})"
         )
-    }
-
-    fn sqlite_fts5_hydrate_row_chunks(
-        ranked_rows: &[(i64, f64)],
-    ) -> impl Iterator<Item = &[(i64, f64)]> {
-        const _: () = assert!(SQLITE_FTS5_HYDRATE_PARAM_CHUNK <= SQLITE_MAX_VARIABLE_NUMBER);
-        ranked_rows.chunks(SQLITE_FTS5_HYDRATE_PARAM_CHUNK)
-    }
-
-    fn sqlite_fts5_filters_need_post_hydration(filters: &SearchFilters) -> bool {
-        !filters.agents.is_empty()
-            || !filters.workspaces.is_empty()
-            || filters.created_from.is_some()
-            || filters.created_to.is_some()
-            || !filters.source_filter.is_all()
-            || !filters.session_paths.is_empty()
     }
 
     fn sqlite_fts5_hit_matches_filters(hit: &SearchHit, filters: &SearchFilters) -> bool {
@@ -6326,328 +5947,6 @@ impl SearchClient {
                 )
             }
         }
-    }
-
-    fn sqlite_message_scan_query(raw_query: &str) -> Option<SqliteMessageScanQuery> {
-        fn scan_parts(parts: Vec<String>) -> Vec<String> {
-            parts
-                .into_iter()
-                .map(|part| part.trim_end_matches('*').to_lowercase())
-                .filter(|part| !part.is_empty())
-                .collect()
-        }
-
-        let tokens = fs_cass_parse_boolean_query(raw_query);
-        if tokens.is_empty() {
-            return None;
-        }
-
-        let mut include_groups = Vec::new();
-        let mut pending_or_group: SqliteMessageScanGroup = Vec::new();
-        let mut exclude_terms = Vec::new();
-        let mut negated = false;
-        let mut in_or_sequence = false;
-        for token in tokens {
-            match token {
-                FsCassQueryToken::And => {
-                    if !pending_or_group.is_empty() {
-                        include_groups.push(std::mem::take(&mut pending_or_group));
-                    }
-                    in_or_sequence = false;
-                    negated = false;
-                }
-                FsCassQueryToken::Or => {
-                    if include_groups.is_empty() && pending_or_group.is_empty() {
-                        continue;
-                    }
-                    if negated {
-                        return None;
-                    }
-                    in_or_sequence = true;
-                }
-                FsCassQueryToken::Not => {
-                    if in_or_sequence {
-                        return None;
-                    }
-                    if !pending_or_group.is_empty() {
-                        include_groups.push(std::mem::take(&mut pending_or_group));
-                    }
-                    negated = true;
-                    in_or_sequence = false;
-                }
-                FsCassQueryToken::Term(term) => {
-                    let parts = scan_parts(normalize_term_parts(&term));
-                    if parts.is_empty() {
-                        continue;
-                    }
-                    if negated {
-                        exclude_terms.extend(parts);
-                    } else if in_or_sequence {
-                        if pending_or_group.is_empty() {
-                            let previous = include_groups.pop()?;
-                            pending_or_group.extend(previous);
-                        }
-                        pending_or_group.push(parts);
-                    } else {
-                        include_groups.push(vec![parts]);
-                    }
-                    negated = false;
-                }
-                FsCassQueryToken::Phrase(phrase) => {
-                    let parts = normalize_phrase_terms(&phrase);
-                    if parts.is_empty() {
-                        continue;
-                    }
-                    if negated {
-                        exclude_terms.extend(parts);
-                    } else if in_or_sequence {
-                        if pending_or_group.is_empty() {
-                            let previous = include_groups.pop()?;
-                            pending_or_group.extend(previous);
-                        }
-                        pending_or_group.push(parts);
-                    } else {
-                        include_groups.push(vec![parts]);
-                    }
-                    negated = false;
-                }
-            }
-        }
-
-        if !pending_or_group.is_empty() {
-            include_groups.push(pending_or_group);
-        }
-
-        for group in &mut include_groups {
-            for alternative in group.iter_mut() {
-                alternative.sort();
-                alternative.dedup();
-            }
-            group.retain(|alternative| !alternative.is_empty());
-            group.sort();
-            group.dedup();
-        }
-        include_groups.retain(|group| !group.is_empty());
-        exclude_terms.sort();
-        exclude_terms.dedup();
-        if include_groups.is_empty() {
-            return None;
-        }
-
-        Some(SqliteMessageScanQuery {
-            include_groups,
-            exclude_terms,
-        })
-    }
-
-    fn sqlite_message_scan_score(haystack: &str, scan_query: &SqliteMessageScanQuery) -> f32 {
-        for term in &scan_query.exclude_terms {
-            if haystack.contains(term) {
-                return 0.0;
-            }
-        }
-
-        let mut score = 0.0f32;
-        for group in &scan_query.include_groups {
-            let mut group_score = 0.0f32;
-            for alternative in group {
-                let mut alternative_score = 0.0f32;
-                for term in alternative {
-                    let matches = haystack.matches(term).count();
-                    if matches < 1 {
-                        alternative_score = 0.0;
-                        break;
-                    }
-                    alternative_score += matches as f32;
-                }
-                group_score = group_score.max(alternative_score);
-            }
-            if group_score <= 0.0 {
-                return 0.0;
-            }
-            score += group_score;
-        }
-        score
-    }
-
-    fn sqlite_message_scan_query_sql(field_mask: FieldMask) -> String {
-        let title_expr = if field_mask.wants_title() {
-            "COALESCE(c.title, '')"
-        } else {
-            "''"
-        };
-        let content_expr = if field_mask.needs_content() || field_mask.wants_snippet() {
-            "COALESCE(m.content, '')"
-        } else {
-            "''"
-        };
-        let normalized_source_sql =
-            normalized_search_source_id_sql_expr("c.source_id", "s.kind", "c.origin_host");
-
-        format!(
-            "SELECT m.id,
-                    {title_expr},
-                    {content_expr},
-                    COALESCE(a.slug, ''),
-                    COALESCE(w.path, ''),
-                    COALESCE(c.source_path, ''),
-                    CAST(m.created_at AS INTEGER),
-                    m.idx,
-                    c.id,
-                    {normalized_source_sql},
-                    c.origin_host,
-                    s.kind,
-                    COALESCE(m.content, ''),
-                    COALESCE(c.title, '')
-             FROM messages m
-             LEFT JOIN conversations c ON m.conversation_id = c.id
-             LEFT JOIN sources s ON c.source_id = s.id
-             LEFT JOIN agents a ON c.agent_id = a.id
-             LEFT JOIN workspaces w ON c.workspace_id = w.id
-             ORDER BY m.id
-             LIMIT ?"
-        )
-    }
-
-    fn search_sqlite_message_scan(
-        &self,
-        conn: &Connection,
-        request: SqliteMessageScanRequest<'_>,
-    ) -> Result<Vec<SearchHit>> {
-        let Some(scan_query) = Self::sqlite_message_scan_query(request.raw_query) else {
-            return Ok(Vec::new());
-        };
-
-        let sql = Self::sqlite_message_scan_query_sql(request.field_mask);
-        let params = [ParamValue::from(SQLITE_MESSAGE_SCAN_FALLBACK_LIMIT as i64)];
-        let rows: Vec<(SqliteFtsMessageRow, String, String)> =
-            franken_query_map_collect_retry(conn, &sql, &params, |row| {
-                Ok((
-                    (
-                        row.get_typed(0)?,
-                        row.get_typed(1)?,
-                        row.get_typed(2)?,
-                        row.get_typed(3)?,
-                        row.get_typed(4)?,
-                        row.get_typed(5)?,
-                        row.get_typed(6)?,
-                        row.get_typed(7)?,
-                        row.get_typed(8)?,
-                        row.get_typed::<Option<String>>(9)?,
-                        row.get_typed(10)?,
-                        row.get_typed(11)?,
-                    ),
-                    row.get_typed(12)?,
-                    row.get_typed(13)?,
-                ))
-            })?;
-
-        let mut scored_hits = Vec::new();
-        for (
-            (
-                _message_id,
-                title,
-                raw_content,
-                agent,
-                workspace,
-                source_path,
-                created_at,
-                idx,
-                conversation_id,
-                raw_source_id,
-                origin_host,
-                raw_origin_kind,
-            ),
-            scan_content,
-            scan_title,
-        ) in rows
-        {
-            let mut haystack = String::with_capacity(
-                scan_content.len()
-                    + scan_title.len()
-                    + agent.len()
-                    + workspace.len()
-                    + source_path.len()
-                    + 4,
-            );
-            haystack.push_str(&scan_content);
-            haystack.push(' ');
-            haystack.push_str(&scan_title);
-            haystack.push(' ');
-            haystack.push_str(&agent);
-            haystack.push(' ');
-            haystack.push_str(&workspace);
-            haystack.push(' ');
-            haystack.push_str(&source_path);
-            let haystack = haystack.to_lowercase();
-            let score = Self::sqlite_message_scan_score(&haystack, &scan_query);
-            if score <= 0.0 {
-                continue;
-            }
-
-            let raw_source_id = raw_source_id.unwrap_or_else(default_source_id);
-            let source_id = normalized_search_hit_source_id_parts(
-                raw_source_id.as_str(),
-                raw_origin_kind.as_deref().unwrap_or_default(),
-                origin_host.as_deref(),
-            );
-            let origin_kind =
-                normalized_search_hit_origin_kind(source_id.as_str(), raw_origin_kind.as_deref());
-            let line_number = idx
-                .and_then(|i| usize::try_from(i).ok())
-                .map(|i| i.saturating_add(1));
-            let snippet = if request.field_mask.wants_snippet() {
-                snippet_from_content(&scan_content)
-            } else {
-                String::new()
-            };
-            let content = if request.field_mask.needs_content() {
-                raw_content
-            } else {
-                String::new()
-            };
-            let content_hash = if content.is_empty() {
-                stable_hit_hash(&snippet, &source_path, line_number, created_at)
-            } else {
-                stable_hit_hash(&content, &source_path, line_number, created_at)
-            };
-
-            let hit = SearchHit {
-                title,
-                snippet,
-                content,
-                content_hash,
-                conversation_id,
-                score,
-                source_path,
-                agent,
-                workspace,
-                workspace_original: None,
-                created_at,
-                line_number,
-                match_type: request.query_match_type,
-                source_id,
-                origin_kind,
-                origin_host,
-            };
-
-            if Self::sqlite_fts5_hit_matches_filters(&hit, request.filters) {
-                scored_hits.push(hit);
-            }
-        }
-
-        scored_hits.sort_by(|left, right| {
-            right
-                .score
-                .partial_cmp(&left.score)
-                .unwrap_or(CmpOrdering::Equal)
-        });
-
-        Ok(scored_hits
-            .into_iter()
-            .skip(request.offset)
-            .take(request.limit)
-            .collect())
     }
 
     /// Candidate query against `fts_lex` (the only shape it can ever have --
@@ -6915,7 +6214,23 @@ impl SearchClient {
         // once, in Rust, after reranking (see the `skip(offset).take(limit)`
         // at the bottom).
         let (candidates_sql, candidates_params) = if ku3_like_fallback {
-            Self::lex_docs_like_candidates_query(raw_query.trim(), cap)
+            // W2-6 Task戊 (advisor 2026-08-31 ruling: 既有裁定②「通配符剥星号
+            // 降级普通词条」覆盖缺口补全, not a new behavior decision): `*`
+            // has no meaning to SQL `LIKE` -- it is not one of `LIKE`'s own
+            // wildcards (`%`/`_`) -- so a raw query carrying a literal
+            // trailing `*` (e.g. "br-12*") that trips the KU3/short-subterm
+            // fallback would otherwise search for that literal asterisk
+            // character and never match. Strip it the same way the主 MATCH
+            // path already downgrades Suffix/Substring wildcards to a bare
+            // term (see `t.replace('*', "")` above): `LIKE` is already an
+            // unbounded substring match, so dropping `*` here only turns a
+            // "prefix" intent into "substring", a superset that still finds
+            // the same rows. This must not feed back into `ku3_like_fallback`
+            // itself -- that routing decision is already computed above off
+            // the untouched `raw_query` (exec37 案⑦: routing measures
+            // trimmed-length, not the stripped term).
+            let like_term = raw_query.trim().replace('*', "");
+            Self::lex_docs_like_candidates_query(&like_term, cap)
         } else {
             let fts_query = match transpile_to_fts5(raw_query) {
                 Some(q) if !q.trim().is_empty() => q,
@@ -7111,396 +6426,6 @@ impl SearchClient {
         }
 
         Ok(hits.into_iter().skip(offset).take(limit).collect())
-    }
-
-    fn search_sqlite_fts5(
-        &self,
-        _db_path: &Path,
-        raw_query: &str,
-        filters: SearchFilters,
-        limit: usize,
-        offset: usize,
-        field_mask: FieldMask,
-    ) -> Result<Vec<SearchHit>> {
-        if limit < 1 {
-            return Ok(Vec::new());
-        }
-
-        let fts_query = match transpile_to_fts5(raw_query) {
-            Some(q) if !q.trim().is_empty() => q,
-            _ => return Ok(Vec::new()),
-        };
-
-        let sqlite_guard = self.sqlite_guard()?;
-        let Some(conn) = sqlite_guard.as_ref() else {
-            return Ok(Vec::new());
-        };
-
-        let empty_params: [ParamValue; 0] = [];
-        let has_fts = franken_query_map_collect_retry(
-            conn,
-            "SELECT 1 FROM sqlite_master WHERE name = 'fts_messages'",
-            &empty_params,
-            |row| row.get_typed::<i64>(0),
-        )
-        .map(|rows| !rows.is_empty())
-        .unwrap_or(false);
-        if !has_fts {
-            return Ok(Vec::new());
-        }
-
-        let query_match_type = dominant_match_type(raw_query);
-        let scan_request = SqliteMessageScanRequest {
-            raw_query,
-            filters: &filters,
-            limit,
-            offset,
-            field_mask,
-            query_match_type,
-        };
-        if let Err(err) =
-            crate::storage::sqlite::validate_fts_messages_integrity_for_connection(conn)
-        {
-            tracing::warn!(
-                error = %err,
-                "sqlite FTS fallback integrity check failed; using source-table scan fallback"
-            );
-            return self.search_sqlite_message_scan(conn, scan_request);
-        }
-        let uses_message_id =
-            if let Ok(uses_message_id) = Self::sqlite_fts_uses_message_id_column(conn) {
-                uses_message_id
-            } else {
-                tracing::warn!(
-                    "sqlite FTS fallback is present but not queryable; skipping fallback search"
-                );
-                return self.search_sqlite_message_scan(conn, scan_request);
-            };
-        let match_mode = match Self::sqlite_fts_match_mode(conn) {
-            Ok(match_mode) => match_mode,
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    "sqlite FTS fallback is present but not queryable; skipping fallback search"
-                );
-                return self.search_sqlite_message_scan(conn, scan_request);
-            }
-        };
-        if !Self::sqlite_fts5_rowid_projection_available(conn) {
-            tracing::warn!(
-                "sqlite FTS fallback cannot project rowid through the legacy embedded engine; using source-table scan fallback"
-            );
-            return self.search_sqlite_message_scan(conn, scan_request);
-        }
-
-        let post_filter = Self::sqlite_fts5_filters_need_post_hydration(&filters);
-        let target_hits = if post_filter {
-            offset.saturating_add(limit)
-        } else {
-            limit
-        };
-        let rank_batch_limit = if post_filter {
-            target_hits.clamp(1, SQLITE_FTS5_POST_FILTER_SCAN_CHUNK)
-        } else {
-            limit
-        };
-        let mut rank_offset = if post_filter { 0 } else { offset };
-        let mut scanned_rows = 0usize;
-        let mut hits = Vec::with_capacity(target_hits.min(rank_batch_limit));
-
-        loop {
-            let (rank_sql, rank_params) = Self::sqlite_fts5_rank_query(
-                fts_query.as_str(),
-                &filters,
-                rank_batch_limit,
-                rank_offset,
-                uses_message_id,
-                match_mode,
-            );
-            let ranked_rows: Vec<(i64, f64)> =
-                match franken_query_map_collect_retry(conn, &rank_sql, &rank_params, |row| {
-                    Ok((row.get_typed(0)?, row.get_typed(1)?))
-                }) {
-                    Ok(rows) => rows,
-                    Err(err) => {
-                        tracing::warn!(
-                            error = %err,
-                            "sqlite FTS fallback rank query failed; returning no fallback hits"
-                        );
-                        return self.search_sqlite_message_scan(conn, scan_request);
-                    }
-                };
-            if ranked_rows.is_empty() {
-                break;
-            }
-
-            scanned_rows = scanned_rows.saturating_add(ranked_rows.len());
-            let bm25_by_rowid: HashMap<i64, f64> = ranked_rows.iter().copied().collect();
-            let mut fts_rows_by_rowid = HashMap::with_capacity(ranked_rows.len());
-            let mut message_ids = Vec::with_capacity(ranked_rows.len());
-            let mut seen_message_ids = HashSet::with_capacity(ranked_rows.len());
-
-            for rank_chunk in Self::sqlite_fts5_hydrate_row_chunks(&ranked_rows) {
-                let hydrate_sql =
-                    Self::sqlite_fts5_hydrate_query(rank_chunk.len(), field_mask, uses_message_id);
-                let hydrate_params = rank_chunk
-                    .iter()
-                    .map(|(fts_rowid, _)| ParamValue::from(*fts_rowid))
-                    .collect::<Vec<_>>();
-                let rows: Vec<SqliteFtsHydratedRow> = match franken_query_map_collect_retry(
-                    conn,
-                    &hydrate_sql,
-                    &hydrate_params,
-                    |row| {
-                        Ok((
-                            row.get_typed(0)?,
-                            row.get_typed(1)?,
-                            row.get_typed(2)?,
-                            row.get_typed(3)?,
-                            row.get_typed(4)?,
-                            row.get_typed(5)?,
-                            row.get_typed(6)?,
-                            row.get_typed(7)?,
-                        ))
-                    },
-                ) {
-                    Ok(rows) => rows,
-                    Err(err) => {
-                        tracing::warn!(
-                            error = %err,
-                            "sqlite FTS fallback rowid hydration query failed; returning no fallback hits"
-                        );
-                        return self.search_sqlite_message_scan(conn, scan_request);
-                    }
-                };
-
-                for row in rows {
-                    let fts_rowid = row.0;
-                    let message_id = row.1.unwrap_or(fts_rowid);
-                    if seen_message_ids.insert(message_id) {
-                        message_ids.push(message_id);
-                    }
-                    fts_rows_by_rowid.insert(fts_rowid, row);
-                }
-            }
-
-            let mut metadata_by_message_id = HashMap::with_capacity(message_ids.len());
-            for message_chunk in message_ids.chunks(SQLITE_FTS5_HYDRATE_PARAM_CHUNK) {
-                let metadata_sql =
-                    Self::sqlite_fts5_message_hydrate_query(message_chunk.len(), field_mask);
-                let metadata_params = message_chunk
-                    .iter()
-                    .map(|message_id| ParamValue::from(*message_id))
-                    .collect::<Vec<_>>();
-                let metadata_rows: Vec<SqliteFtsMessageRow> = match franken_query_map_collect_retry(
-                    conn,
-                    &metadata_sql,
-                    &metadata_params,
-                    |row| {
-                        Ok((
-                            row.get_typed(0)?,
-                            row.get_typed(1)?,
-                            row.get_typed(2)?,
-                            row.get_typed(3)?,
-                            row.get_typed(4)?,
-                            row.get_typed(5)?,
-                            row.get_typed(6)?,
-                            row.get_typed(7)?,
-                            row.get_typed(8)?,
-                            row.get_typed::<Option<String>>(9)?,
-                            row.get_typed(10)?,
-                            row.get_typed(11)?,
-                        ))
-                    },
-                ) {
-                    Ok(rows) => rows,
-                    Err(err) => {
-                        tracing::warn!(
-                            error = %err,
-                            "sqlite FTS fallback message hydration query failed; returning no fallback hits"
-                        );
-                        return self.search_sqlite_message_scan(conn, scan_request);
-                    }
-                };
-                metadata_by_message_id.extend(metadata_rows.into_iter().map(|row| (row.0, row)));
-            }
-
-            let mut hits_by_rowid = HashMap::with_capacity(ranked_rows.len());
-            for (
-                fts_rowid,
-                fts_message_id,
-                fts_title,
-                fts_content,
-                fts_agent,
-                fts_workspace,
-                fts_source_path,
-                fts_created_at,
-            ) in fts_rows_by_rowid.into_values()
-            {
-                let Some(&bm25_score) = bm25_by_rowid.get(&fts_rowid) else {
-                    continue;
-                };
-                let message_id = fts_message_id.unwrap_or(fts_rowid);
-                let (
-                    title,
-                    raw_content,
-                    agent,
-                    workspace,
-                    source_path,
-                    created_at,
-                    idx,
-                    conversation_id,
-                    raw_source_id,
-                    origin_host,
-                    raw_origin_kind,
-                ) = match metadata_by_message_id.remove(&message_id) {
-                    Some((
-                        _,
-                        metadata_title,
-                        metadata_content,
-                        metadata_agent,
-                        metadata_workspace,
-                        metadata_source_path,
-                        metadata_created_at,
-                        metadata_idx,
-                        metadata_conversation_id,
-                        metadata_raw_source_id,
-                        metadata_origin_host,
-                        metadata_raw_origin_kind,
-                    )) => (
-                        if metadata_title.is_empty() {
-                            fts_title.unwrap_or_default()
-                        } else {
-                            metadata_title
-                        },
-                        if metadata_content.is_empty() {
-                            fts_content.unwrap_or_default()
-                        } else {
-                            metadata_content
-                        },
-                        if metadata_agent.is_empty() {
-                            fts_agent.unwrap_or_default()
-                        } else {
-                            metadata_agent
-                        },
-                        if metadata_workspace.is_empty() {
-                            fts_workspace.unwrap_or_default()
-                        } else {
-                            metadata_workspace
-                        },
-                        if metadata_source_path.is_empty() {
-                            fts_source_path.unwrap_or_default()
-                        } else {
-                            metadata_source_path
-                        },
-                        metadata_created_at.or(fts_created_at),
-                        metadata_idx,
-                        metadata_conversation_id,
-                        metadata_raw_source_id.unwrap_or_else(default_source_id),
-                        metadata_origin_host,
-                        metadata_raw_origin_kind,
-                    ),
-                    None => (
-                        fts_title.unwrap_or_default(),
-                        fts_content.unwrap_or_default(),
-                        fts_agent.unwrap_or_default(),
-                        fts_workspace.unwrap_or_default(),
-                        fts_source_path.unwrap_or_default(),
-                        fts_created_at,
-                        None,
-                        None,
-                        default_source_id(),
-                        None,
-                        None,
-                    ),
-                };
-
-                let source_id = normalized_search_hit_source_id_parts(
-                    raw_source_id.as_str(),
-                    raw_origin_kind.as_deref().unwrap_or_default(),
-                    origin_host.as_deref(),
-                );
-                let origin_kind = normalized_search_hit_origin_kind(
-                    source_id.as_str(),
-                    raw_origin_kind.as_deref(),
-                );
-                let line_number = idx
-                    .and_then(|i| usize::try_from(i).ok())
-                    .map(|i| i.saturating_add(1));
-                let snippet = if field_mask.wants_snippet() {
-                    snippet_from_content(&raw_content)
-                } else {
-                    String::new()
-                };
-                let content = if field_mask.needs_content() {
-                    raw_content
-                } else {
-                    String::new()
-                };
-                let content_hash = if content.is_empty() {
-                    stable_hit_hash(&snippet, &source_path, line_number, created_at)
-                } else {
-                    stable_hit_hash(&content, &source_path, line_number, created_at)
-                };
-
-                let hit = SearchHit {
-                    title,
-                    snippet,
-                    content,
-                    content_hash,
-                    conversation_id,
-                    score: (-bm25_score) as f32,
-                    source_path,
-                    agent,
-                    workspace,
-                    workspace_original: None,
-                    created_at,
-                    line_number,
-                    match_type: query_match_type,
-                    source_id,
-                    origin_kind,
-                    origin_host,
-                };
-                hits_by_rowid.insert(fts_rowid, hit);
-            }
-
-            for (fts_rowid, _) in &ranked_rows {
-                if let Some(hit) = hits_by_rowid.remove(fts_rowid)
-                    && Self::sqlite_fts5_hit_matches_filters(&hit, &filters)
-                {
-                    hits.push(hit);
-                    if hits.len() >= target_hits {
-                        break;
-                    }
-                }
-            }
-
-            if hits.len() >= target_hits
-                || !post_filter
-                || ranked_rows.len() < rank_batch_limit
-                || scanned_rows >= SQLITE_FTS5_POST_FILTER_SCAN_LIMIT
-            {
-                break;
-            }
-            rank_offset = rank_offset.saturating_add(ranked_rows.len());
-        }
-
-        if post_filter {
-            let hits = hits
-                .into_iter()
-                .skip(offset)
-                .take(limit)
-                .collect::<Vec<_>>();
-            if hits.is_empty() {
-                self.search_sqlite_message_scan(conn, scan_request)
-            } else {
-                Ok(hits)
-            }
-        } else if hits.is_empty() {
-            self.search_sqlite_message_scan(conn, scan_request)
-        } else {
-            Ok(hits)
-        }
     }
 
     /// Browse messages ordered by date, without any text query.
@@ -10541,11 +9466,23 @@ mod tests {
 
     #[test]
     fn sqlite_backend_skips_wildcard_queries() -> Result<()> {
-        // Build a client with SQLite only; wildcard queries should short-circuit without errors.
-        let conn = Connection::open_memory()?;
+        // W2-6 Task戊: `search()`'s dispatch reads `meta`/`lex_docs` state up
+        // front regardless of query shape, so the fixture needs a real
+        // production schema (FrankenStorage::open) even though the wildcard
+        // query itself never touches any seeded content.
+        let temp_dir = TempDir::new()?;
+        let db_path = temp_dir.path().join("wildcard-skip.db");
+        {
+            let storage = FrankenStorage::open(&db_path)?;
+            // No conversations at all -- mark the (empty) lex domain rebuild
+            // completed via the real production path so `search()`'s
+            // dispatch sees a ready index instead of "absent".
+            storage.rebuild_lex_domain_from_db(None)?;
+        }
+
         let client = SearchClient {
-            sqlite: Mutex::new(Some(SendConnection(conn))),
-            sqlite_path: None,
+            sqlite: Mutex::new(None),
+            sqlite_path: Some(db_path),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -10563,60 +9500,50 @@ mod tests {
 
     #[test]
     fn sqlite_backend_handles_null_workspace() -> Result<()> {
-        let conn = Connection::open_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
-             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
-             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
-             CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                agent_id INTEGER,
-                workspace_id INTEGER,
-                source_id TEXT,
-                origin_host TEXT,
-                title TEXT,
-                source_path TEXT
-             );
-             CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER,
-                idx INTEGER,
-                content TEXT,
-                created_at INTEGER
-             );
-             CREATE VIRTUAL TABLE fts_messages USING fts5(
-                content,
-                title,
-                agent,
-                workspace,
-                source_path,
-                created_at UNINDEXED,
-                content='',
-                tokenize='porter'
-             );",
-        )?;
-        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')", &[])?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
-        conn.execute(
-            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path) VALUES(1, 1, NULL, 'local', NULL, 't', '/tmp/session.jsonl')",
-        &[])?;
-        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(1, 1, 0, 'auth token failure', 42)", &[])?;
-        conn.execute(
-            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
-             VALUES(?1, ?2, ?3, ?4, NULL, ?5, ?6)",
-            fparams![
-                1_i64,
-                "auth token failure",
-                "t",
-                "codex",
-                "/tmp/session.jsonl",
-                42_i64
-            ],
-        )?;
+        // W2-6 Task戊: fixture rebuilt on the real fts_lex/lex_docs write path
+        // (see `sqlite_backend_orders_hits_by_bm25_score` for rationale).
+        let temp_dir = TempDir::new()?;
+        let db_path = temp_dir.path().join("null-workspace.db");
+        {
+            let storage = FrankenStorage::open(&db_path)?;
+            let agent = Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            };
+            let agent_id = storage.ensure_agent(&agent)?;
+            let conversation = Conversation {
+                id: None,
+                agent_slug: agent.slug.clone(),
+                workspace: None,
+                external_id: Some("null-workspace".into()),
+                title: Some("t".into()),
+                source_path: temp_dir.path().join("session.jsonl"),
+                started_at: Some(42),
+                ended_at: Some(42),
+                approx_tokens: Some(16),
+                metadata_json: serde_json::Value::Null,
+                messages: vec![Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: Some("user".into()),
+                    created_at: Some(42),
+                    content: "auth token failure".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                }],
+                source_id: "local".into(),
+                origin_host: None,
+            };
+            storage.insert_conversation_tree(agent_id, None, &conversation)?;
+        }
 
         let client = SearchClient {
-            sqlite: Mutex::new(Some(SendConnection(conn))),
-            sqlite_path: None,
+            sqlite: Mutex::new(None),
+            sqlite_path: Some(db_path),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -10629,85 +9556,6 @@ mod tests {
         assert_eq!(hits[0].line_number, Some(1));
         assert_eq!(hits[0].source_id, "local");
         assert_eq!(hits[0].origin_kind, "local");
-        Ok(())
-    }
-
-    #[test]
-    fn sqlite_backend_supports_legacy_fts_message_id_schema() -> Result<()> {
-        let conn = Connection::open_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
-             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
-             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
-             CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                agent_id INTEGER,
-                workspace_id INTEGER,
-                source_id TEXT,
-                origin_host TEXT,
-                title TEXT,
-                source_path TEXT
-             );
-             CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER,
-                idx INTEGER,
-                content TEXT,
-                created_at INTEGER
-             );
-             CREATE VIRTUAL TABLE fts_messages USING fts5(
-                content,
-                title,
-                agent,
-                workspace,
-                source_path,
-                created_at UNINDEXED,
-                message_id UNINDEXED,
-                tokenize='porter'
-             );",
-        )?;
-        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')", &[])?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
-        conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/legacy')", &[])?;
-        conn.execute(
-            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
-             VALUES(1, 1, 1, 'local', NULL, 'legacy title', '/tmp/legacy.jsonl')",
-        &[])?;
-        conn.execute(
-            "INSERT INTO messages(id, conversation_id, idx, content, created_at)
-             VALUES(42, 1, 4, 'legacy auth token failure', 99)",
-        &[])?;
-        conn.execute(
-            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at, message_id)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            fparams![
-                1_i64,
-                "legacy auth token failure",
-                "legacy title",
-                "codex",
-                "/legacy",
-                "/tmp/legacy.jsonl",
-                99_i64,
-                42_i64
-            ],
-        )?;
-
-        let client = SearchClient {
-            sqlite: Mutex::new(Some(SendConnection(conn))),
-            sqlite_path: None,
-            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            metrics: Metrics::default(),
-            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
-            semantic: Mutex::new(None),
-        };
-
-        let hits = client.search("auth", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].title, "legacy title");
-        assert_eq!(hits[0].source_path, "/tmp/legacy.jsonl");
-        assert_eq!(hits[0].workspace, "/legacy");
-        assert_eq!(hits[0].line_number, Some(5));
-        assert_eq!(hits[0].content, "legacy auth token failure");
         Ok(())
     }
 
@@ -10820,100 +9668,81 @@ mod tests {
 
     #[test]
     fn sqlite_path_rusqlite_fallback_matches_hyphenated_ids_with_workspace_filter() -> Result<()> {
-        fn fts_match_count(conn: &Connection, fts_query: &str) -> Result<Option<usize>> {
-            let match_mode = SearchClient::sqlite_fts_match_mode(conn)?;
-            let sql = format!(
-                "SELECT COUNT(*) FROM fts_messages WHERE {}",
-                SearchClient::sqlite_fts5_match_clause(match_mode)
-            );
-            let mut params = Vec::new();
-            SearchClient::push_sqlite_fts5_match_params(&mut params, fts_query, match_mode);
-            match franken_query_map_collect_retry(conn, &sql, &params, |row| row.get_typed(0)) {
-                Ok(rows) => {
-                    let count: i64 = rows.into_iter().next().unwrap_or(0);
-                    Ok(Some(usize::try_from(count.max(0)).unwrap_or(usize::MAX)))
-                }
-                Err(err) if err.to_string().contains("no such function: MATCH/2") => Ok(None),
-                Err(err) => Err(err.into()),
-            }
-        }
-
+        // W2-6 Task戊: fixture rebuilt on the real fts_lex/lex_docs write path
+        // (FrankenStorage::open + insert_conversation_tree) after fts_messages
+        // DROP -- raw `INSERT INTO messages` against the storage connection
+        // bypasses the lex_docs sync that only runs through the real
+        // conversation-tree write path, and `search()`'s dispatch now
+        // requires `meta`/`lex_docs` state a hand-rolled fts_messages-only
+        // fixture never populated. `transpile_to_fts5`/hyphen-and-dot query
+        // handling is still exercised end-to-end via `client.search()`.
         let temp_dir = TempDir::new()?;
         let db_path = temp_dir.path().join("hyphenated-rusqlite-fallback.db");
+        let alpha_workspace = temp_dir.path().join("ws-alpha");
+        let beta_workspace = temp_dir.path().join("ws-beta");
+        let beta_workspace_str = beta_workspace.to_string_lossy().to_string();
+        let alpha_source_path = temp_dir.path().join("alpha.jsonl");
+        let beta_source_path = temp_dir.path().join("beta.jsonl");
+        let beta_source_path_str = beta_source_path.to_string_lossy().to_string();
 
         {
             let storage = FrankenStorage::open(&db_path)?;
-            // V14 drops fts_messages during migration — run the lazy repair
-            // so the direct INSERT INTO fts_messages below can land.
-            storage.ensure_search_fallback_fts_consistency()?;
-            let conn = storage.raw();
-            conn.execute(
-                "INSERT INTO agents(id, slug, name, kind, created_at, updated_at)
-                 VALUES(1, 'codex', 'Codex', 'codex', 1, 1)",
-                &[],
-            )?;
-            conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/ws/alpha')", &[])?;
-            conn.execute("INSERT INTO workspaces(id, path) VALUES(2, '/ws/beta')", &[])?;
-            conn.execute(
-                "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
-                 VALUES(1, 1, 1, 'local', NULL, 'alpha bead', '/tmp/alpha.jsonl')",
-                &[],
-            )?;
-            conn.execute(
-                "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
-                 VALUES(2, 1, 2, 'local', NULL, 'beta bead', '/tmp/beta.jsonl')",
-                &[],
-            )?;
-            conn.execute(
-                "INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
-                 VALUES(11, 1, 0, 'user', 'Need follow-up on br-123 root cause', 100)",
-                &[],
-            )?;
-            conn.execute(
-                "INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
-                 VALUES(12, 2, 0, 'user', 'Need follow-up on br-123 user report', 101)",
-                &[],
-            )?;
-            conn.execute(
-                "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                &[
-                    ParamValue::from(11_i64),
-                    ParamValue::from("Need follow-up on br-123 root cause"),
-                    ParamValue::from("alpha bead"),
-                    ParamValue::from("codex"),
-                    ParamValue::from("/ws/alpha"),
-                    ParamValue::from("/tmp/alpha.jsonl"),
-                    ParamValue::from(100_i64),
-                ],
-            )?;
-            conn.execute(
-                "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                &[
-                    ParamValue::from(12_i64),
-                    ParamValue::from("Need follow-up on br-123 user report"),
-                    ParamValue::from("beta bead"),
-                    ParamValue::from("codex"),
-                    ParamValue::from("/ws/beta"),
-                    ParamValue::from("/tmp/beta.jsonl"),
-                    ParamValue::from(101_i64),
-                ],
-            )?;
-            let preclose_total_rows: i64 =
-                conn.query_row_map("SELECT COUNT(*) FROM fts_messages", fparams![], |row| {
-                    row.get_typed(0)
-                })?;
-            assert_eq!(
-                preclose_total_rows, 2,
-                "freshly seeded file-backed FTS should retain the inserted rows"
-            );
-            let transpiled = transpile_to_fts5("br-123").expect("transpiled fallback query");
-            if let Some(match_count) = fts_match_count(conn, transpiled.as_str())? {
-                assert_eq!(
-                    match_count, 2,
-                    "freshly seeded file-backed FTS should match the transpiled hyphenated query before reopen"
-                );
+            let agent = Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            };
+            let agent_id = storage.ensure_agent(&agent)?;
+            std::fs::create_dir_all(&alpha_workspace)?;
+            std::fs::create_dir_all(&beta_workspace)?;
+            let alpha_workspace_id = storage.ensure_workspace(&alpha_workspace, None)?;
+            let beta_workspace_id = storage.ensure_workspace(&beta_workspace, None)?;
+
+            for (external_id, title, workspace_path, workspace_id, source_path, content) in [
+                (
+                    "hyphenated-alpha",
+                    "alpha bead",
+                    &alpha_workspace,
+                    alpha_workspace_id,
+                    &alpha_source_path,
+                    "Need follow-up on br-123 root cause",
+                ),
+                (
+                    "hyphenated-beta",
+                    "beta bead",
+                    &beta_workspace,
+                    beta_workspace_id,
+                    &beta_source_path,
+                    "Need follow-up on br-123 user report",
+                ),
+            ] {
+                let conversation = Conversation {
+                    id: None,
+                    agent_slug: agent.slug.clone(),
+                    workspace: Some(workspace_path.clone()),
+                    external_id: Some(external_id.to_string()),
+                    title: Some(title.to_string()),
+                    source_path: source_path.clone(),
+                    started_at: Some(100),
+                    ended_at: Some(100),
+                    approx_tokens: Some(16),
+                    metadata_json: serde_json::Value::Null,
+                    messages: vec![Message {
+                        id: None,
+                        idx: 0,
+                        role: MessageRole::User,
+                        author: Some("user".into()),
+                        created_at: Some(100),
+                        content: content.to_string(),
+                        extra_json: serde_json::Value::Null,
+                        snippets: Vec::new(),
+                    }],
+                    source_id: "local".into(),
+                    origin_host: None,
+                };
+                storage.insert_conversation_tree(agent_id, Some(workspace_id), &conversation)?;
             }
         }
 
@@ -10925,25 +9754,6 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
         };
-
-        let guard = client.sqlite_guard()?;
-        let conn = guard.as_ref().expect("sqlite guard should reopen file db");
-        let reopened_total_rows: i64 =
-            conn.query_row_map("SELECT COUNT(*) FROM fts_messages", fparams![], |row| {
-                row.get_typed(0)
-            })?;
-        assert_eq!(
-            reopened_total_rows, 2,
-            "reopened file-backed FTS should still contain the seeded rows"
-        );
-        let transpiled = transpile_to_fts5("br-123").expect("transpiled fallback query");
-        if let Some(match_count) = fts_match_count(conn, transpiled.as_str())? {
-            assert_eq!(
-                match_count, 2,
-                "reopened file-backed FTS should still match the transpiled hyphenated query"
-            );
-        }
-        drop(guard);
 
         let all_hits = client.search("br-123", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
         assert_eq!(all_hits.len(), 2);
@@ -10986,7 +9796,7 @@ mod tests {
         let filtered_hits = client.search(
             "br-123",
             SearchFilters {
-                workspaces: HashSet::from_iter(["/ws/beta".to_string()]),
+                workspaces: HashSet::from_iter([beta_workspace_str.clone()]),
                 ..SearchFilters::default()
             },
             10,
@@ -10994,8 +9804,8 @@ mod tests {
             FieldMask::FULL,
         )?;
         assert_eq!(filtered_hits.len(), 1);
-        assert_eq!(filtered_hits[0].workspace, "/ws/beta");
-        assert_eq!(filtered_hits[0].source_path, "/tmp/beta.jsonl");
+        assert_eq!(filtered_hits[0].workspace, beta_workspace_str);
+        assert_eq!(filtered_hits[0].source_path, beta_source_path_str);
         assert!(filtered_hits[0].content.contains("br-123"));
 
         Ok(())
@@ -11003,92 +9813,66 @@ mod tests {
 
     #[test]
     fn sqlite_backend_orders_hits_by_bm25_score() -> Result<()> {
-        let conn = Connection::open_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                agent_id INTEGER,
-                workspace_id INTEGER,
-                source_id TEXT,
-                origin_host TEXT,
-                title TEXT,
-                source_path TEXT
-             );
-             CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER,
-                idx INTEGER,
-                content TEXT,
-                created_at INTEGER
-             );
-             CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
-             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
-             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
-             CREATE VIRTUAL TABLE fts_messages USING fts5(
-                content,
-                title,
-                agent,
-                workspace,
-                source_path,
-                created_at UNINDEXED,
-                content='',
-                tokenize='porter'
-             );",
-        )?;
-        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')", &[])?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
-        conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/ws')", &[])?;
-        conn.execute(
-            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path) VALUES(1, 1, 1, 'local', NULL, 'best', '/tmp/best.jsonl')",
-        &[])?;
-        conn.execute(
-            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path) VALUES(2, 1, 1, 'local', NULL, 'worse', '/tmp/worse.jsonl')",
-        &[])?;
-        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(7, 1, 0, 'auth auth auth failure', 42)", &[])?;
-        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(8, 2, 0, 'auth failure', 43)", &[])?;
-        conn.execute(
-            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            fparams![
-                7_i64,
-                "auth auth auth failure",
-                "best",
-                "codex",
-                "/ws",
-                "/tmp/best.jsonl",
-                42_i64
-            ],
-        )?;
-        conn.execute(
-            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            fparams![
-                8_i64,
-                "auth failure",
-                "worse",
-                "codex",
-                "/ws",
-                "/tmp/worse.jsonl",
-                43_i64
-            ],
-        )?;
+        // W2-6 Task戊: fixture rebuilt on the real fts_lex/lex_docs write path
+        // (FrankenStorage::open + insert_conversation_tree) after fts_messages
+        // DROP -- a hand-rolled fts_messages CREATE TABLE fixture skips the
+        // `meta`/`lex_docs` setup `search()`'s dispatch now requires.
+        let temp_dir = TempDir::new()?;
+        let db_path = temp_dir.path().join("bm25-order.db");
+        {
+            let storage = FrankenStorage::open(&db_path)?;
+            let agent = Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            };
+            let agent_id = storage.ensure_agent(&agent)?;
+            let workspace_path = temp_dir.path().join("ws");
+            std::fs::create_dir_all(&workspace_path)?;
+            let workspace_id = storage.ensure_workspace(&workspace_path, None)?;
+
+            for (title, source_name, content) in [
+                ("best", "best.jsonl", "auth auth auth failure"),
+                ("worse", "worse.jsonl", "auth failure"),
+            ] {
+                let conversation = Conversation {
+                    id: None,
+                    agent_slug: agent.slug.clone(),
+                    workspace: Some(workspace_path.clone()),
+                    external_id: Some(format!("bm25-{title}")),
+                    title: Some(title.to_string()),
+                    source_path: temp_dir.path().join(source_name),
+                    started_at: Some(1_700_000_000_000),
+                    ended_at: Some(1_700_000_000_100),
+                    approx_tokens: Some(16),
+                    metadata_json: serde_json::Value::Null,
+                    messages: vec![Message {
+                        id: None,
+                        idx: 0,
+                        role: MessageRole::User,
+                        author: Some("user".into()),
+                        created_at: Some(1_700_000_000_050),
+                        content: content.to_string(),
+                        extra_json: serde_json::Value::Null,
+                        snippets: Vec::new(),
+                    }],
+                    source_id: "local".into(),
+                    origin_host: None,
+                };
+                storage.insert_conversation_tree(agent_id, Some(workspace_id), &conversation)?;
+            }
+        }
+
         let client = SearchClient {
-            sqlite: Mutex::new(Some(SendConnection(conn))),
-            sqlite_path: None,
+            sqlite: Mutex::new(None),
+            sqlite_path: Some(db_path),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
         };
-        let direct_hits = client.search_sqlite_fts5(
-            Path::new(":memory:"),
-            "auth",
-            SearchFilters::default(),
-            5,
-            0,
-            FieldMask::FULL,
-        )?;
-        assert_eq!(direct_hits.len(), 2);
 
         let hits = client.search("auth", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
         assert_eq!(hits.len(), 2);
@@ -11100,234 +9884,54 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_fts5_ranked_phase_defers_content_decode_until_after_limit() {
-        let (rank_sql, params) = SearchClient::sqlite_fts5_rank_query(
-            "auth",
-            &SearchFilters::default(),
-            50,
-            0,
-            false,
-            SqliteFtsMatchMode::Table,
-        );
-        let hydrate_sql = SearchClient::sqlite_fts5_hydrate_query(
-            2,
-            FieldMask::new(true, true, true, true),
-            false,
-        );
-
-        assert!(
-            !rank_sql.contains("fts_messages.content"),
-            "rank query must not decode large content rows before LIMIT"
-        );
-        assert!(
-            hydrate_sql.contains("fts_messages.content"),
-            "hydration query should still provide requested content"
-        );
-        assert!(
-            rank_sql.contains("LIMIT ? OFFSET ?"),
-            "rank query must apply page bounds before hydration"
-        );
-        assert_eq!(params.len(), 3, "fts query plus limit and offset params");
-    }
-
-    #[test]
-    fn sqlite_fts5_hydration_chunks_stay_below_bind_variable_limit() {
-        let oversized_row_count = SQLITE_MAX_VARIABLE_NUMBER + 1;
-        let unchunked_sql = SearchClient::sqlite_fts5_hydrate_query(
-            oversized_row_count,
-            FieldMask::new(true, true, true, true),
-            false,
-        );
-        assert!(
-            unchunked_sql.matches('?').count() > SQLITE_MAX_VARIABLE_NUMBER,
-            "the pre-fix one-shot hydration query would exceed the legacy embedded engine's bind limit"
-        );
-
-        let ranked_rows: Vec<(i64, f64)> = (0..(SQLITE_FTS5_HYDRATE_PARAM_CHUNK + 17))
-            .map(|idx| (idx as i64, idx as f64))
-            .collect();
-        let chunk_sizes: Vec<usize> = SearchClient::sqlite_fts5_hydrate_row_chunks(&ranked_rows)
-            .map(<[(i64, f64)]>::len)
-            .collect();
-
-        assert_eq!(
-            chunk_sizes,
-            vec![SQLITE_FTS5_HYDRATE_PARAM_CHUNK, 17],
-            "large fallback pages must hydrate in bounded chunks while preserving rank windows"
-        );
-        assert!(
-            chunk_sizes
-                .iter()
-                .all(|chunk_size| *chunk_size <= SQLITE_MAX_VARIABLE_NUMBER),
-            "every hydration chunk must fit under the legacy embedded engine's bind-variable ceiling"
-        );
-    }
-
-    #[test]
-    fn tantivy_fallback_hydration_narrows_by_normalized_source_before_message_lookup() -> Result<()>
-    {
-        let conn = Connection::open_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                source_id TEXT,
-                origin_host TEXT,
-                source_path TEXT NOT NULL
-             );
-             CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER NOT NULL,
-                idx INTEGER NOT NULL,
-                content TEXT NOT NULL,
-                UNIQUE(conversation_id, idx)
-             );
-             CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);",
-        )?;
-        conn.execute(
-            "INSERT INTO conversations(id, source_id, origin_host, source_path)
-             VALUES(1, '', 'devbox', '/tmp/shared-fallback.jsonl')",
-        &[])?;
-        conn.execute(
-            "INSERT INTO conversations(id, source_id, origin_host, source_path)
-             VALUES(2, 'local', NULL, '/tmp/shared-fallback.jsonl')",
-        &[])?;
-        conn.execute(
-            "INSERT INTO messages(id, conversation_id, idx, content)
-             VALUES(10, 1, 2, 'remote fallback content')",
-        &[])?;
-        conn.execute(
-            "INSERT INTO messages(id, conversation_id, idx, content)
-             VALUES(20, 2, 2, 'local content must not win')",
-        &[])?;
-
-        let client = SearchClient {
-            sqlite: Mutex::new(Some(SendConnection(conn))),
-            sqlite_path: None,
-            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            metrics: Metrics::default(),
-            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
-            semantic: Mutex::new(None),
-        };
-
-        let fallback_key = (
-            "devbox".to_string(),
-            "/tmp/shared-fallback.jsonl".to_string(),
-            2,
-        );
-        let (_, hydrated_fallback) =
-            client.hydrate_tantivy_hit_contents(&[], std::slice::from_ref(&fallback_key))?;
-
-        assert_eq!(
-            hydrated_fallback.get(&fallback_key).map(String::as_str),
-            Some("remote fallback content")
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn exact_content_hydration_returns_only_requested_message_indices() -> Result<()> {
-        let conn = Connection::open_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER NOT NULL,
-                idx INTEGER NOT NULL,
-                content TEXT NOT NULL,
-                UNIQUE(conversation_id, idx)
-             );",
-        )?;
-
-        for idx in 0..8 {
-            conn.execute(&format!(
-                "INSERT INTO messages(conversation_id, idx, content)
-                 VALUES(1, {idx}, 'conversation one row {idx}')"
-            ), &[])?;
-        }
-        conn.execute(
-            "INSERT INTO messages(conversation_id, idx, content)
-             VALUES(2, 0, 'conversation two row 0')",
-        &[])?;
-
-        let hydrated =
-            hydrate_message_content_by_conversation(&conn, &[(1, 6), (1, 2), (2, 0), (1, 99)])?;
-
-        assert_eq!(hydrated.len(), 3);
-        assert_eq!(
-            hydrated.get(&(1, 2)).map(String::as_str),
-            Some("conversation one row 2")
-        );
-        assert_eq!(
-            hydrated.get(&(1, 6)).map(String::as_str),
-            Some("conversation one row 6")
-        );
-        assert_eq!(
-            hydrated.get(&(2, 0)).map(String::as_str),
-            Some("conversation two row 0")
-        );
-        assert!(!hydrated.contains_key(&(1, 99)));
-
-        Ok(())
-    }
-
-    #[test]
     fn sqlite_backend_generates_snippet_from_content() -> Result<()> {
-        let conn = Connection::open_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                agent_id INTEGER,
-                workspace_id INTEGER,
-                source_id TEXT,
-                origin_host TEXT,
-                title TEXT,
-                source_path TEXT
-             );
-             CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER,
-                idx INTEGER,
-                content TEXT,
-                created_at INTEGER
-             );
-             CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
-             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
-             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
-             CREATE VIRTUAL TABLE fts_messages USING fts5(
-                content,
-                title,
-                agent,
-                workspace,
-                source_path,
-                created_at UNINDEXED,
-                content='',
-                tokenize='porter'
-             );",
-        )?;
-        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')", &[])?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
-        conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/ws')", &[])?;
-        conn.execute(
-            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path) VALUES(1, 1, 1, 'local', NULL, 'snippet title', '/tmp/snippet.jsonl')",
-        &[])?;
-        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(1, 1, 0, 'alpha beta gamma delta epsilon zeta eta theta', 42)", &[])?;
-        conn.execute(
-            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            fparams![
-                1_i64,
-                "alpha beta gamma delta epsilon zeta eta theta",
-                "snippet title",
-                "codex",
-                "/ws",
-                "/tmp/snippet.jsonl",
-                42_i64
-            ],
-        )?;
+        // W2-6 Task戊: fixture rebuilt on the real fts_lex/lex_docs write path
+        // (see `sqlite_backend_orders_hits_by_bm25_score` for rationale).
+        let temp_dir = TempDir::new()?;
+        let db_path = temp_dir.path().join("snippet.db");
+        {
+            let storage = FrankenStorage::open(&db_path)?;
+            let agent = Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            };
+            let agent_id = storage.ensure_agent(&agent)?;
+            let workspace_path = temp_dir.path().join("ws");
+            std::fs::create_dir_all(&workspace_path)?;
+            let workspace_id = storage.ensure_workspace(&workspace_path, None)?;
+            let conversation = Conversation {
+                id: None,
+                agent_slug: agent.slug.clone(),
+                workspace: Some(workspace_path.clone()),
+                external_id: Some("snippet".into()),
+                title: Some("snippet title".into()),
+                source_path: temp_dir.path().join("snippet.jsonl"),
+                started_at: Some(42),
+                ended_at: Some(42),
+                approx_tokens: Some(16),
+                metadata_json: serde_json::Value::Null,
+                messages: vec![Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: Some("user".into()),
+                    created_at: Some(42),
+                    content: "alpha beta gamma delta epsilon zeta eta theta".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                }],
+                source_id: "local".into(),
+                origin_host: None,
+            };
+            storage.insert_conversation_tree(agent_id, Some(workspace_id), &conversation)?;
+        }
 
         let client = SearchClient {
-            sqlite: Mutex::new(Some(SendConnection(conn))),
-            sqlite_path: None,
+            sqlite: Mutex::new(None),
+            sqlite_path: Some(db_path),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -11457,63 +10061,50 @@ mod tests {
     #[test]
     fn sqlite_backend_remote_source_filter_matches_blank_source_id_with_origin_host() -> Result<()>
     {
-        let conn = Connection::open_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
-             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
-             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
-             CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                agent_id INTEGER,
-                workspace_id INTEGER,
-                source_id TEXT,
-                origin_host TEXT,
-                title TEXT,
-                source_path TEXT
-             );
-             CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER,
-                idx INTEGER,
-                content TEXT,
-                created_at INTEGER
-             );
-             CREATE VIRTUAL TABLE fts_messages USING fts5(
-                content,
-                title,
-                agent,
-                workspace,
-                source_path,
-                created_at UNINDEXED,
-                content='',
-                tokenize='porter'
-             );",
-        )?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
-        conn.execute(
-            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
-             VALUES(1, 1, NULL, '   ', 'dev@laptop', 'remote title', '/tmp/remote-filter.jsonl')",
-        &[])?;
-        conn.execute(
-            "INSERT INTO messages(id, conversation_id, idx, content, created_at)
-             VALUES(1, 1, 0, 'remote filter proof', 42)",
-        &[])?;
-        conn.execute(
-            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
-             VALUES(?1, ?2, ?3, ?4, NULL, ?5, ?6)",
-            fparams![
-                1_i64,
-                "remote filter proof",
-                "remote title",
-                "codex",
-                "/tmp/remote-filter.jsonl",
-                42_i64
-            ],
-        )?;
+        // W2-6 Task戊: fixture rebuilt on the real fts_lex/lex_docs write path
+        // (see `sqlite_backend_orders_hits_by_bm25_score` for rationale).
+        let temp_dir = TempDir::new()?;
+        let db_path = temp_dir.path().join("remote-filter.db");
+        {
+            let storage = FrankenStorage::open(&db_path)?;
+            let agent = Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            };
+            let agent_id = storage.ensure_agent(&agent)?;
+            let conversation = Conversation {
+                id: None,
+                agent_slug: agent.slug.clone(),
+                workspace: None,
+                external_id: Some("remote-filter".into()),
+                title: Some("remote title".into()),
+                source_path: temp_dir.path().join("remote-filter.jsonl"),
+                started_at: Some(42),
+                ended_at: Some(42),
+                approx_tokens: Some(16),
+                metadata_json: serde_json::Value::Null,
+                messages: vec![Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: Some("user".into()),
+                    created_at: Some(42),
+                    content: "remote filter proof".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                }],
+                source_id: "   ".into(),
+                origin_host: Some("dev@laptop".into()),
+            };
+            storage.insert_conversation_tree(agent_id, None, &conversation)?;
+        }
 
         let client = SearchClient {
-            sqlite: Mutex::new(Some(SendConnection(conn))),
-            sqlite_path: None,
+            sqlite: Mutex::new(None),
+            sqlite_path: Some(db_path),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -11554,80 +10145,88 @@ mod tests {
 
     #[test]
     fn sqlite_backend_workspace_filter_matches_null_workspace_as_empty_string() -> Result<()> {
-        let conn = Connection::open_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
-             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
-             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
-             CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                agent_id INTEGER,
-                workspace_id INTEGER,
-                source_id TEXT,
-                origin_host TEXT,
-                title TEXT,
-                source_path TEXT
-             );
-             CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER,
-                idx INTEGER,
-                content TEXT,
-                created_at INTEGER
-             );
-             CREATE VIRTUAL TABLE fts_messages USING fts5(
-                content,
-                title,
-                agent,
-                workspace,
-                source_path,
-                created_at UNINDEXED,
-                content='',
-                tokenize='porter'
-             );",
-        )?;
-        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')", &[])?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
-        conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/named')", &[])?;
-        // Conversation 1: no workspace (workspace_id=NULL)
-        conn.execute(
-            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path) VALUES(1, 1, NULL, 'local', NULL, 'null workspace', '/tmp/null-workspace.jsonl')",
-        &[])?;
-        // Conversation 2: with workspace
-        conn.execute(
-            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path) VALUES(2, 1, 1, 'local', NULL, 'named workspace', '/tmp/named-workspace.jsonl')",
-        &[])?;
-        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(1, 1, 0, 'auth token failure', 42)", &[])?;
-        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(2, 2, 0, 'auth token failure', 43)", &[])?;
-        conn.execute(
-            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
-             VALUES(?1, ?2, ?3, ?4, NULL, ?5, ?6)",
-            fparams![
-                1_i64,
-                "auth token failure",
-                "null workspace",
-                "codex",
-                "/tmp/null-workspace.jsonl",
-                42_i64
-            ],
-        )?;
-        conn.execute(
-            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            fparams![
-                2_i64,
-                "auth token failure",
-                "named workspace",
-                "codex",
-                "/named",
-                "/tmp/named-workspace.jsonl",
-                43_i64
-            ],
-        )?;
+        // W2-6 Task戊: fixture rebuilt on the real fts_lex/lex_docs write path
+        // (see `sqlite_backend_orders_hits_by_bm25_score` for rationale).
+        let temp_dir = TempDir::new()?;
+        let db_path = temp_dir.path().join("workspace-filter.db");
+        let null_workspace_source_path = temp_dir.path().join("null-workspace.jsonl");
+        let null_workspace_source_path_str = null_workspace_source_path.to_string_lossy().to_string();
+        {
+            let storage = FrankenStorage::open(&db_path)?;
+            let agent = Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            };
+            let agent_id = storage.ensure_agent(&agent)?;
+            let named_workspace = temp_dir.path().join("named");
+            std::fs::create_dir_all(&named_workspace)?;
+            let named_workspace_id = storage.ensure_workspace(&named_workspace, None)?;
+
+            // Conversation 1: no workspace.
+            let no_workspace_conversation = Conversation {
+                id: None,
+                agent_slug: agent.slug.clone(),
+                workspace: None,
+                external_id: Some("null-workspace".into()),
+                title: Some("null workspace".into()),
+                source_path: null_workspace_source_path.clone(),
+                started_at: Some(42),
+                ended_at: Some(42),
+                approx_tokens: Some(16),
+                metadata_json: serde_json::Value::Null,
+                messages: vec![Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: Some("user".into()),
+                    created_at: Some(42),
+                    content: "auth token failure".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                }],
+                source_id: "local".into(),
+                origin_host: None,
+            };
+            storage.insert_conversation_tree(agent_id, None, &no_workspace_conversation)?;
+
+            // Conversation 2: with workspace.
+            let named_workspace_conversation = Conversation {
+                id: None,
+                agent_slug: agent.slug.clone(),
+                workspace: Some(named_workspace.clone()),
+                external_id: Some("named-workspace".into()),
+                title: Some("named workspace".into()),
+                source_path: temp_dir.path().join("named-workspace.jsonl"),
+                started_at: Some(43),
+                ended_at: Some(43),
+                approx_tokens: Some(16),
+                metadata_json: serde_json::Value::Null,
+                messages: vec![Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: Some("user".into()),
+                    created_at: Some(43),
+                    content: "auth token failure".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                }],
+                source_id: "local".into(),
+                origin_host: None,
+            };
+            storage.insert_conversation_tree(
+                agent_id,
+                Some(named_workspace_id),
+                &named_workspace_conversation,
+            )?;
+        }
 
         let client = SearchClient {
-            sqlite: Mutex::new(Some(SendConnection(conn))),
-            sqlite_path: None,
+            sqlite: Mutex::new(None),
+            sqlite_path: Some(db_path),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -11646,59 +10245,9 @@ mod tests {
         )?;
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].workspace, "");
-        assert_eq!(hits[0].source_path, "/tmp/null-workspace.jsonl");
+        assert_eq!(hits[0].source_path, null_workspace_source_path_str);
 
         Ok(())
-    }
-
-    #[test]
-    fn sqlite_message_scan_preserves_boolean_or_precedence() {
-        let simple_or =
-            SearchClient::sqlite_message_scan_query("alpha OR beta").expect("simple OR scan query");
-        assert!(SearchClient::sqlite_message_scan_score("alpha", &simple_or) > 0.0);
-        assert!(SearchClient::sqlite_message_scan_score("beta", &simple_or) > 0.0);
-        assert_eq!(
-            SearchClient::sqlite_message_scan_score("gamma", &simple_or),
-            0.0
-        );
-
-        let and_then_or = SearchClient::sqlite_message_scan_query("alpha AND beta OR gamma")
-            .expect("AND followed by OR scan query");
-        assert!(
-            SearchClient::sqlite_message_scan_score("alpha gamma", &and_then_or) > 0.0,
-            "alpha AND (beta OR gamma) should accept the gamma branch"
-        );
-        assert_eq!(
-            SearchClient::sqlite_message_scan_score("alpha", &and_then_or),
-            0.0
-        );
-        assert_eq!(
-            SearchClient::sqlite_message_scan_score("beta gamma", &and_then_or),
-            0.0
-        );
-
-        let or_then_and = SearchClient::sqlite_message_scan_query("alpha OR beta AND gamma")
-            .expect("OR followed by AND scan query");
-        assert!(
-            SearchClient::sqlite_message_scan_score("alpha gamma", &or_then_and) > 0.0,
-            "(alpha OR beta) AND gamma should accept the alpha branch"
-        );
-        assert!(
-            SearchClient::sqlite_message_scan_score("beta gamma", &or_then_and) > 0.0,
-            "(alpha OR beta) AND gamma should accept the beta branch"
-        );
-        assert_eq!(
-            SearchClient::sqlite_message_scan_score("alpha", &or_then_and),
-            0.0
-        );
-
-        let binary_not =
-            SearchClient::sqlite_message_scan_query("alpha NOT beta").expect("NOT scan query");
-        assert!(SearchClient::sqlite_message_scan_score("alpha", &binary_not) > 0.0);
-        assert_eq!(
-            SearchClient::sqlite_message_scan_score("alpha beta", &binary_not),
-            0.0
-        );
     }
 
     #[test]
@@ -15271,235 +13820,6 @@ mod tests {
             transpile_to_fts5("foo NOT bar-baz"),
             Some("foo NOT \"bar-baz\"".to_string())
         );
-    }
-
-    #[test]
-    fn search_sqlite_fts5_returns_empty_when_sqlite_is_unavailable() {
-        let client = SearchClient {
-            sqlite: Mutex::new(None),
-            sqlite_path: None,
-            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            metrics: Metrics::default(),
-            cache_namespace: "fts5-disabled".to_string(),
-            semantic: Mutex::new(None),
-        };
-
-        let hits = client.search_sqlite_fts5(
-            Path::new("/nonexistent"),
-            "test query",
-            SearchFilters::default(),
-            10,
-            0,
-            FieldMask::FULL,
-        );
-
-        assert!(hits.is_ok(), "disabled FTS5 path should stay non-fatal");
-        assert!(
-            hits.unwrap().is_empty(),
-            "unavailable SQLite fallback should keep returning an empty result set"
-        );
-    }
-
-    /// `coding_agent_session_search-k0e5p` (ibuuh.24.2 sub-bead):
-    /// E2E equivalence gate for the rank+hydrate FTS5 fallback split
-    /// landed in peer commit c91ea038. The peer's existing unit test
-    /// pins the rank-SQL SHAPE (no content columns referenced) but
-    /// nothing pins the user-facing RESULT-SET equivalence. A
-    /// regression where the hydrate phase silently re-orders, drops,
-    /// or re-filters hits would slip past the SQL-shape check and
-    /// produce user-visible quality changes.
-    ///
-    /// This test pins the prefix invariant (same pattern as bead
-    /// 1dd5u for the lexical search path): seed N ranked hits in the
-    /// FTS5 fallback DB, run search_sqlite_fts5 at limit=K and
-    /// limit=N, assert the smaller-limit result is a prefix of the
-    /// larger-limit result. A regression in either rank or hydrate
-    /// (re-order, drop, re-filter) trips immediately.
-    ///
-    /// Pins three invariants:
-    /// 1. Smaller-limit hits are a strict prefix of larger-limit hits.
-    /// 2. Limit=N returns exactly N matches when ≥N candidates exist.
-    /// 3. Limit=0 returns empty (boundary case the rank+hydrate
-    ///    split could break by hydrating before honoring the limit).
-    #[test]
-    fn search_sqlite_fts5_rank_and_hydrate_split_preserves_limit_prefix_invariant() -> Result<()> {
-        let conn = Connection::open_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
-             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
-             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
-             CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                agent_id INTEGER,
-                workspace_id INTEGER,
-                source_id TEXT,
-                origin_host TEXT,
-                title TEXT,
-                source_path TEXT
-             );
-             CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER,
-                idx INTEGER,
-                content TEXT,
-                created_at INTEGER
-             );
-             CREATE VIRTUAL TABLE fts_messages USING fts5(
-                content,
-                title,
-                agent,
-                workspace,
-                source_path,
-                created_at UNINDEXED,
-                message_id UNINDEXED,
-                tokenize='porter'
-             );",
-        )?;
-        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')", &[])?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
-        conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/tmp/k0e5p')", &[])?;
-
-        // Seed N=6 messages all matching the same query token. Each
-        // gets a distinct message_id + content shape so the prefix
-        // assertion can pin specific ordering rather than just
-        // counts. The bm25 score depends on per-row term frequency;
-        // we vary `rankprobe` repetition (1×..6×) so the rank phase
-        // produces a deterministic descending order.
-        for (i, repeats) in (1..=6_i64).enumerate() {
-            let conv_id = i as i64 + 1;
-            let msg_id = (i as i64 + 1) * 10;
-            conn.execute(
-                "INSERT INTO conversations(id, agent_id, workspace_id, source_id, \
-                 origin_host, title, source_path) \
-                 VALUES(?1, 1, 1, 'local', NULL, ?2, ?3)",
-                fparams![
-                    conv_id,
-                    format!("k0e5p-{}", i),
-                    format!("/tmp/k0e5p/{}.jsonl", i),
-                ],
-            )?;
-            let content = "rankprobe ".repeat(repeats as usize);
-            conn.execute(
-                "INSERT INTO messages(id, conversation_id, idx, content, created_at) \
-                 VALUES(?1, ?2, ?3, ?4, ?5)",
-                fparams![
-                    msg_id,
-                    conv_id,
-                    i as i64,
-                    content.as_str(),
-                    1_700_000_000_i64 + i as i64
-                ],
-            )?;
-            conn.execute(
-                "INSERT INTO fts_messages(rowid, content, title, agent, workspace, \
-                 source_path, created_at, message_id) \
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                fparams![
-                    msg_id,
-                    content.as_str(),
-                    format!("k0e5p-{}", i),
-                    "codex",
-                    "/tmp/k0e5p",
-                    format!("/tmp/k0e5p/{}.jsonl", i),
-                    1_700_000_000_i64 + i as i64,
-                    msg_id,
-                ],
-            )?;
-        }
-
-        let client = SearchClient {
-            sqlite: Mutex::new(Some(SendConnection(conn))),
-            sqlite_path: None,
-            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            metrics: Metrics::default(),
-            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:k0e5p"),
-            semantic: Mutex::new(None),
-        };
-
-        // Hit-key tuple: (source_path, line_number) is the stable
-        // operator-visible identity. Two limits that share a prefix
-        // must produce hits with the same identities in the same
-        // order across that prefix.
-        fn hit_keys(hits: &[SearchHit]) -> Vec<(String, Option<usize>)> {
-            hits.iter()
-                .map(|h| (h.source_path.clone(), h.line_number))
-                .collect()
-        }
-
-        let large_hits = client.search_sqlite_fts5(
-            Path::new(":memory:"),
-            "rankprobe",
-            SearchFilters::default(),
-            6,
-            0,
-            FieldMask::FULL,
-        )?;
-        assert_eq!(
-            large_hits.len(),
-            6,
-            "limit=N must return all N candidates when the corpus has exactly N matches"
-        );
-
-        let small_hits = client.search_sqlite_fts5(
-            Path::new(":memory:"),
-            "rankprobe",
-            SearchFilters::default(),
-            3,
-            0,
-            FieldMask::FULL,
-        )?;
-        assert_eq!(small_hits.len(), 3, "limit=3 must return exactly 3 hits");
-
-        // Invariant 1: smaller-limit hits are a STRICT prefix of the
-        // larger-limit hits — same identity, same order.
-        let large_keys = hit_keys(&large_hits);
-        let small_keys = hit_keys(&small_hits);
-        assert_eq!(
-            small_keys,
-            large_keys[..3],
-            "limit=3 hit keys MUST be the first 3 of limit=6 hit keys (rank+hydrate \
-             split must not re-order or re-filter); small={small_keys:?} \
-             large_prefix={:?}",
-            &large_keys[..3]
-        );
-
-        // Invariant 2: hit content is also identical across the
-        // shared prefix — the hydrate phase preserves the content
-        // string the rank phase ranked. A regression where hydrate
-        // pulled from a different DB row than rank pointed at would
-        // trip this even if the keys aligned.
-        for (idx, (small, large)) in small_hits.iter().zip(large_hits.iter()).enumerate() {
-            assert_eq!(
-                small.content, large.content,
-                "hit[{idx}] content must agree across limit=3 and limit=6: \
-                 small={:?} large={:?}",
-                small.content, large.content
-            );
-            assert_eq!(
-                small.title, large.title,
-                "hit[{idx}] title must agree across limit=3 and limit=6"
-            );
-        }
-
-        // Invariant 3: limit=0 boundary. The rank+hydrate split could
-        // break this by hydrating before honoring the limit; pinning
-        // it directly catches that regression class.
-        let zero_hits = client.search_sqlite_fts5(
-            Path::new(":memory:"),
-            "rankprobe",
-            SearchFilters::default(),
-            0,
-            0,
-            FieldMask::FULL,
-        )?;
-        assert!(
-            zero_hits.is_empty(),
-            "limit=0 must return zero hits even though the rank phase has candidates; \
-             got {} hits",
-            zero_hits.len()
-        );
-
-        Ok(())
     }
 
     // --- levenshtein_distance tests ---
