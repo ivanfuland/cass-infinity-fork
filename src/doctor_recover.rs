@@ -653,20 +653,4 @@ mod tests {
         assert!(quarantine.join("capture.dead1").exists());
         assert!(quarantine.join("capture.dead2").exists());
     }
-
-    #[test]
-    fn rebuild_canonical_fts_refuses_without_yes() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let db_path = tmp.path().join("agent_search.db");
-        {
-            let _storage = FrankenStorage::open(&db_path).expect("open db");
-        }
-        let refused = run_doctor_rebuild_canonical_fts(
-            Some(tmp.path().to_path_buf()),
-            Some(db_path),
-            false,
-            Some(RobotFormat::Json),
-        );
-        assert!(refused.is_err());
-    }
 }

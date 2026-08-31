@@ -298,35 +298,6 @@ fn bench_list_workspaces(c: &mut Criterion) {
 }
 
 // =============================================================================
-// FTS Benchmarks
-// =============================================================================
-
-/// Benchmark FTS rebuild.
-fn bench_fts_rebuild(c: &mut Criterion) {
-    let mut group = c.benchmark_group("fts_rebuild");
-    group.sample_size(10);
-
-    for &conv_count in &[100i64, 500, 1000] {
-        let (temp, storage) = setup_test_db(conv_count, 10);
-
-        group.throughput(Throughput::Elements(conv_count as u64 * 10)); // total messages
-        group.bench_with_input(
-            BenchmarkId::from_parameter(format!("{}_convs", conv_count)),
-            &conv_count,
-            |b, _| {
-                b.iter(|| {
-                    storage.rebuild_fts().expect("rebuild");
-                })
-            },
-        );
-
-        drop(temp);
-    }
-
-    group.finish();
-}
-
-// =============================================================================
 // Statistics Benchmarks
 // =============================================================================
 
@@ -430,8 +401,6 @@ criterion_group!(
     bench_list_workspaces
 );
 
-criterion_group!(fts_benches, bench_fts_rebuild);
-
 criterion_group!(
     stats_benches,
     bench_daily_histogram,
@@ -444,7 +413,6 @@ criterion_main!(
     open_benches,
     insert_benches,
     query_benches,
-    fts_benches,
     stats_benches,
     scaling_benches
 );

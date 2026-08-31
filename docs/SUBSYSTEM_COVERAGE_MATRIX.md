@@ -127,7 +127,7 @@ be silently skipped during closeout.
 - **Owning beads:** .1, .4, .11.2, .12.5, .14.4
 - **Failure modes:** fm-indexer-stale-lexical-publish-backups, fm-indexer-tantivy-corrupt-or-stale, fm-indexer-fsvi-vector-orphan, fm-indexer-zero-results-regression, fm-indexer-edge-ngram-mismatch, fm-indexer-double-saturating-sub
 - **Mandatory proofs:** integration, golden
-- **Proof artifacts:** `tests/indexer_tantivy.rs`, `tests/atomic_swap_publish_crash_window.rs`, `src/search/regression_corpus.rs`
+- **Proof artifacts:** `tests/atomic_swap_publish_crash_window.rs`, `src/search/regression_corpus.rs`
 - **Optional diagnostics:** live publish/backup retention tail
 - **Fixture provenance:** synthetic index trees + crash-window fixtures; SQLite is source of truth
 - **Log expectation:** proof-log over publish/atomic-swap runs; deterministic regression-corpus replay

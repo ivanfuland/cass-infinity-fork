@@ -14262,7 +14262,6 @@ fn reset_storage(storage: &FrankenStorage) -> Result<()> {
          DELETE FROM meta WHERE key = 'last_scan_ts';
          COMMIT;",
     )?;
-    storage.rebuild_fts()?;
     Ok(())
 }
 
@@ -29636,7 +29635,6 @@ mod tests {
                 )
                 .unwrap();
             drop(storage);
-            crate::storage::sqlite::rebuild_fts_via_rusqlite(db_path).unwrap();
         }
 
         let tmp = TempDir::new().unwrap();
@@ -29725,7 +29723,6 @@ mod tests {
                 )
                 .unwrap();
             drop(storage);
-            crate::storage::sqlite::rebuild_fts_via_rusqlite(db_path).unwrap();
         }
 
         let tmp = TempDir::new().unwrap();

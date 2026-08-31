@@ -1842,16 +1842,6 @@ fn read_meta_schema_version(conn: &FrankenConnection) -> Result<Option<i64>> {
     Ok(version.and_then(|raw| raw.parse::<i64>().ok()))
 }
 
-#[cfg(test)]
-fn franken_fts_schema_rows(conn: &FrankenConnection) -> Result<i64> {
-    conn.query_row_map(
-        "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
-        fparams![],
-        |row| row.get_typed(0),
-    )
-    .context("counting sqlite_master rows for fts_messages via the legacy embedded engine")
-}
-
 struct StagedHistoricalSeed {
     tempdir: tempfile::TempDir,
     db_path: PathBuf,
@@ -8180,7 +8170,6 @@ impl FrankenStorage {
         self.ensure_source_for_conversation(conv)?;
         profile.source_duration += source_start.elapsed();
 
-        let defer_lexical_updates = defer_storage_lexical_updates_enabled();
         let defer_analytics_updates = defer_analytics_updates_enabled();
         let conversation_key = conversation_merge_key(agent_id, conv);
 
@@ -8215,9 +8204,6 @@ impl FrankenStorage {
         };
         profile.conversation_row_duration += conversation_row_start.elapsed();
 
-        let mut fts_entries = Vec::new();
-        let mut fts_pending_chars = 0usize;
-        let mut fts_inserted_total = 0usize;
         let mut total_chars: i64 = 0;
         let mut inserted_indices = Vec::new();
         let mut pending_messages = HashMap::new();
@@ -8266,26 +8252,6 @@ impl FrankenStorage {
             franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
             profile.snippet_insert_duration += snippet_insert_start.elapsed();
 
-            if !defer_lexical_updates {
-                let fts_entry_start = Instant::now();
-                fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
-                fts_pending_chars = fts_pending_chars.saturating_add(msg.content.len());
-                profile.fts_entry_duration += fts_entry_start.elapsed();
-                if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
-                    || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
-                {
-                    let fts_flush_start = Instant::now();
-                    flush_pending_fts_entries(
-                        self,
-                        &tx,
-                        &mut fts_entries,
-                        &mut fts_pending_chars,
-                        &mut fts_inserted_total,
-                    )?;
-                    profile.fts_flush_duration += fts_flush_start.elapsed();
-                }
-            }
-
             total_chars += msg.content.len() as i64;
             inserted_indices.push(msg.idx);
         }
@@ -8298,18 +8264,6 @@ impl FrankenStorage {
                 source_path = %conv.source_path.display(),
                 "message idx collisions encountered while profiling a new conversation insert; retaining the first canonical variant per idx"
             );
-        }
-
-        if !defer_lexical_updates {
-            let fts_flush_start = Instant::now();
-            flush_pending_fts_entries(
-                self,
-                &tx,
-                &mut fts_entries,
-                &mut fts_pending_chars,
-                &mut fts_inserted_total,
-            )?;
-            profile.fts_flush_duration += fts_flush_start.elapsed();
         }
 
         if !defer_analytics_updates {
@@ -8360,7 +8314,6 @@ impl FrankenStorage {
         self.ensure_source_for_conversation(conv)?;
         profile.source_duration += source_start.elapsed();
 
-        let defer_lexical_updates = defer_storage_lexical_updates_enabled();
         let defer_analytics_updates = defer_analytics_updates_enabled();
         let conversation_key = conversation_merge_key(agent_id, conv);
 
@@ -8417,9 +8370,6 @@ impl FrankenStorage {
         profile.dedupe_filter_duration += dedupe_filter_start.elapsed();
 
         let mut inserted_indices = Vec::new();
-        let mut fts_entries = Vec::new();
-        let mut fts_pending_chars = 0usize;
-        let mut fts_inserted_total = 0usize;
         let (inserted_last_idx, inserted_last_created_at) =
             borrowed_messages_tail_state(&new_messages);
 
@@ -8437,26 +8387,6 @@ impl FrankenStorage {
             franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
             profile.snippet_insert_duration += snippet_insert_start.elapsed();
 
-            if !defer_lexical_updates {
-                let fts_entry_start = Instant::now();
-                fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
-                fts_pending_chars = fts_pending_chars.saturating_add(msg.content.len());
-                profile.fts_entry_duration += fts_entry_start.elapsed();
-                if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
-                    || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
-                {
-                    let fts_flush_start = Instant::now();
-                    flush_pending_fts_entries(
-                        self,
-                        &tx,
-                        &mut fts_entries,
-                        &mut fts_pending_chars,
-                        &mut fts_inserted_total,
-                    )?;
-                    profile.fts_flush_duration += fts_flush_start.elapsed();
-                }
-            }
-
             inserted_indices.push(msg.idx);
         }
 
@@ -8468,18 +8398,6 @@ impl FrankenStorage {
                 source_path = %conv.source_path.display(),
                 "message idx collisions encountered while profiling append merge; retaining canonical message variants"
             );
-        }
-
-        if !defer_lexical_updates {
-            let fts_flush_start = Instant::now();
-            flush_pending_fts_entries(
-                self,
-                &tx,
-                &mut fts_entries,
-                &mut fts_pending_chars,
-                &mut fts_inserted_total,
-            )?;
-            profile.fts_flush_duration += fts_flush_start.elapsed();
         }
 
         let conversation_row_start = Instant::now();
@@ -15011,25 +14929,6 @@ mod tests {
     }
 
     #[test]
-    fn populated_fts_shadow_without_rowid_reload_errors_are_classified() {
-        assert!(
-            error_message_indicates_populated_fts_shadow_without_rowid_reload(
-                "not implemented: reloading populated WITHOUT ROWID table `fts_messages_config` into MemDatabase is not yet supported",
-            )
-        );
-        assert!(
-            error_message_indicates_populated_fts_shadow_without_rowid_reload(
-                "not implemented: loading populated WITHOUT ROWID table fts_messages_data is not yet supported",
-            )
-        );
-        assert!(
-            !error_message_indicates_populated_fts_shadow_without_rowid_reload(
-                "not implemented: reloading populated WITHOUT ROWID table `user_table` into MemDatabase is not yet supported",
-            )
-        );
-    }
-
-    #[test]
     fn doctor_mutation_open_guard_only_targets_canonical_archive_db() {
         let dir = TempDir::new().unwrap();
         let canonical = dir.path().join("agent_search.db");
@@ -17894,83 +17793,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ud_msg, 3);
-    }
-
-    #[test]
-    fn insert_conversations_batched_flushes_large_fts_batches() {
-        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
-        use std::path::PathBuf;
-
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test.db");
-        let storage = SqliteStorage::open(&db_path).unwrap();
-        // V14 drops fts_messages during migration; cass normally recreates it
-        // during startup via `ensure_search_fallback_fts_consistency`. Tests
-        // that inspect fts_messages directly need to run the same repair pass
-        // to exercise the "insert flushes FTS" contract.
-        storage
-            .ensure_search_fallback_fts_consistency()
-            .expect("ensure FTS consistency before insert");
-
-        let agent = Agent {
-            id: None,
-            slug: "codex".into(),
-            name: "Codex".into(),
-            version: Some("0.2.3".into()),
-            kind: AgentKind::Cli,
-        };
-        let agent_id = storage.ensure_agent(&agent).unwrap();
-
-        let content = "y".repeat((FTS_ENTRY_BATCH_MAX_CHARS / 2) + 1);
-        let messages: Vec<_> = (0_i64..2)
-            .map(|i| Message {
-                id: None,
-                idx: i,
-                role: MessageRole::Agent,
-                author: None,
-                created_at: Some(1_700_000_000_000 + i),
-                content: format!("{i}-{content}"),
-                extra_json: serde_json::Value::Null,
-                snippets: Vec::new(),
-            })
-            .collect();
-        let conv = Conversation {
-            id: None,
-            agent_slug: "codex".into(),
-            workspace: Some(PathBuf::from("/tmp/workspace")),
-            external_id: Some("fts-large-batch".into()),
-            title: Some("FTS Large Batch".into()),
-            source_path: PathBuf::from("/tmp/rollout.jsonl"),
-            started_at: Some(1_700_000_000_000),
-            ended_at: Some(1_700_000_000_999),
-            approx_tokens: None,
-            metadata_json: serde_json::Value::Null,
-            messages,
-            source_id: "local".into(),
-            origin_host: None,
-        };
-
-        let outcomes = storage
-            .insert_conversations_batched(&[(agent_id, None, &conv)])
-            .unwrap();
-        assert_eq!(outcomes.len(), 1);
-        assert_eq!(outcomes[0].inserted_indices.len(), conv.messages.len());
-
-        let message_count: i64 = storage
-            .conn
-            .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
-                row.get_typed(0)
-            })
-            .unwrap();
-        let fts_count: i64 = storage
-            .conn
-            .query_row_map("SELECT COUNT(*) FROM fts_messages", fparams![], |row| {
-                row.get_typed(0)
-            })
-            .unwrap();
-
-        assert_eq!(message_count, conv.messages.len() as i64);
-        assert_eq!(fts_count, conv.messages.len() as i64);
     }
 
     fn make_profiled_storage_remote_conversation(
@@ -21786,70 +21608,6 @@ mod tests {
             .unwrap();
         drop(source);
 
-        #[cfg(not(windows))]
-        {
-            // Legacy "duplicate FTS" fixture reconstruction.
-            //
-            // w1b Task B7 (control-plane ruling, bead z9fse.11): `SqliteStorage::open`
-            // on a new file now builds through `schema::ensure`, which creates
-            // fts_messages eagerly -- `source` (opened above) already has exactly
-            // one real fts_messages row, playing the same "one legitimate contentless
-            // entry" role the old V13-era row used to need manual injection for. Only
-            // the buggy duplicate row -- the actual subject of the fixup logic this
-            // test exercises -- needs injecting now.
-            let duplicate_legacy_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')";
-            let legacy = rusqlite_test_fixture_conn(&source_db);
-            legacy
-                .execute_batch(
-                    "UPDATE meta SET value = '13' WHERE key = 'schema_version';
-                     DELETE FROM _schema_migrations WHERE version = 14;
-                     PRAGMA writable_schema = ON;",
-                )
-                .unwrap();
-            legacy
-                .execute(
-                    "DELETE FROM meta WHERE key = ?1",
-                    [FTS_FRANKEN_REBUILD_META_KEY],
-                )
-                .unwrap();
-            // Inject the duplicate that's the real subject of the fixup logic.
-            legacy
-                .execute(
-                    "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
-                     VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
-                    [duplicate_legacy_fts_sql],
-                )
-                .unwrap();
-            legacy
-                .execute_batch("PRAGMA writable_schema = OFF;")
-                .unwrap();
-            drop(legacy);
-
-            // Verify fixture with rusqlite+writable_schema to see raw
-            // sqlite_master rows (the legacy embedded engine deduplicates schema entries).
-            {
-                let verify = rusqlite_test_fixture_conn(&source_db);
-                verify
-                    .execute_batch("PRAGMA writable_schema = ON;")
-                    .unwrap();
-                let fts_entries: i64 = verify
-                    .query_row(
-                        "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
-                        [],
-                        |row| row.get(0),
-                    )
-                    .unwrap();
-                assert_eq!(
-                    fts_entries, 2,
-                    "test fixture should reproduce the duplicate legacy fts_messages rows"
-                );
-                let msg_count: i64 = verify
-                    .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
-                    .unwrap();
-                assert_eq!(msg_count, 1);
-            }
-        }
-
         let fresh = SqliteStorage::open(&canonical_db).unwrap();
         drop(fresh);
 
@@ -21916,17 +21674,6 @@ mod tests {
             FrankenOpenFlags::SQLITE_OPEN_READ_ONLY,
         )
         .unwrap();
-        let reopened_fts_entries: i64 = reopened_readonly
-            .query_row_map(
-                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
-                fparams![],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-        assert_eq!(
-            reopened_fts_entries, 1,
-            "seeded canonical db should keep a single stock-SQLite fts_messages schema row"
-        );
         let reopened_message_count: i64 = reopened_readonly
             .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
                 row.get_typed(0)
@@ -21938,31 +21685,6 @@ mod tests {
         assert_eq!(
             franken_seeded.schema_version().unwrap(),
             CURRENT_SCHEMA_VERSION
-        );
-        // Post-V14 fts_messages is recreated lazily. `FrankenStorage::open`
-        // alone doesn't re-register the virtual table for the legacy embedded engine
-        // query engine — the consistency pass does, and this is exactly what
-        // normal cass startup runs before the first search. Invoke it
-        // explicitly so the query below exercises the expected post-repair
-        // state rather than the between-steps state.
-        franken_seeded
-            .ensure_search_fallback_fts_consistency()
-            .expect("ensure FTS consistency after seed");
-        let post_franken_schema_rows: i64 = franken_seeded
-            .raw()
-            .query_row_map(
-                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
-                fparams![],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-        assert_eq!(post_franken_schema_rows, 1);
-        let fts_probe = franken_seeded
-            .raw()
-            .query_all_map("SELECT COUNT(*) FROM fts_messages", &[], |_row| Ok(()));
-        assert!(
-            fts_probe.is_ok(),
-            "expected post-seed FTS to be queryable, got {fts_probe:?}"
         );
     }
 
@@ -23461,12 +23183,6 @@ mod tests {
                  PRAGMA writable_schema = ON;",
             )
             .unwrap();
-        replay_legacy
-            .execute(
-                "DELETE FROM meta WHERE key = ?1",
-                [FTS_FRANKEN_REBUILD_META_KEY],
-            )
-            .unwrap();
         #[cfg(not(windows))]
         {
             let duplicate_legacy_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')";
@@ -23528,170 +23244,6 @@ mod tests {
         // malformed-bundle probe path that depends on sqlite3.
         let expected_fts_schema_rows = if cfg!(windows) { Some(1) } else { Some(2) };
         assert_eq!(bundles[1].probe.fts_schema_rows, expected_fts_schema_rows);
-    }
-
-    #[test]
-    #[ignore = "blocked on frankensqlite contentless-FTS fix (y8n3i / fsqlite bd-sf8dx): on fsqlite 0.1.13 the reopen-mutate no longer errors but the incremental catch-up still degrades to a full Rebuilt; un-ignore via cljkz once fsqlite ships true incremental catch-up on a reopened contentless table"]
-    fn ensure_fts_consistency_via_rusqlite_catches_up_missing_rows() {
-        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
-
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("fts-catchup.db");
-        let storage = SqliteStorage::open(&db_path).unwrap();
-        let agent = Agent {
-            id: None,
-            slug: "codex".into(),
-            name: "Codex".into(),
-            version: Some("0.2.3".into()),
-            kind: AgentKind::Cli,
-        };
-        let agent_id = storage.ensure_agent(&agent).unwrap();
-        let conversation = Conversation {
-            id: None,
-            agent_slug: "codex".into(),
-            workspace: Some(PathBuf::from("/tmp/workspace")),
-            external_id: Some("fts-catchup".into()),
-            title: Some("FTS catchup".into()),
-            source_path: PathBuf::from("/tmp/fts-catchup.jsonl"),
-            started_at: Some(1_700_000_000_000),
-            ended_at: Some(1_700_000_000_100),
-            approx_tokens: Some(42),
-            metadata_json: serde_json::Value::Null,
-            messages: vec![Message {
-                id: None,
-                idx: 0,
-                role: MessageRole::User,
-                author: Some("user".into()),
-                created_at: Some(1_700_000_000_050),
-                content: "initial message".into(),
-                extra_json: serde_json::Value::Null,
-                snippets: Vec::new(),
-            }],
-            source_id: LOCAL_SOURCE_ID.into(),
-            origin_host: None,
-        };
-        storage
-            .insert_conversation_tree(agent_id, None, &conversation)
-            .unwrap();
-        drop(storage);
-
-        rebuild_fts_via_rusqlite(&db_path).unwrap();
-
-        let conn = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().into_owned())), crate::storage::api::Profile::Production).unwrap();
-        let conversation_id: i64 = conn
-            .query_row_map("SELECT id FROM conversations LIMIT 1", fparams![], |row| {
-                row.get_typed(0)
-            })
-            .unwrap();
-        conn.execute(
-            "INSERT INTO messages(id, conversation_id, idx, role, author, created_at, content, extra_json, extra_bin)
-             VALUES(2, ?1, 1, 'assistant', 'assistant', 1700000000060, 'authentication catchup', NULL, NULL)",
-            fparams![conversation_id],
-        )
-        .unwrap();
-        drop(conn);
-
-        let repair = ensure_fts_consistency_via_rusqlite(&db_path).unwrap();
-        assert_eq!(
-            repair,
-            FtsConsistencyRepair::IncrementalCatchUp {
-                inserted_rows: 1,
-                total_rows: 2
-            }
-        );
-
-        let conn = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().into_owned())), crate::storage::api::Profile::Production).unwrap();
-        let auth_rows: i64 = conn
-            .query_row_map(
-                "SELECT COUNT(*) FROM fts_messages WHERE rowid = 2",
-                fparams![],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-        assert_eq!(auth_rows, 1);
-    }
-
-    #[test]
-    #[ignore = "blocked on frankensqlite contentless-FTS fix (y8n3i / fsqlite bd-sf8dx): fsqlite 0.1.13 open-validation still demands a _content shadow for a legacy (no content= option) fts_messages schema row, so repair cannot even open; un-ignore via cljkz once fsqlite treats that as recoverable"]
-    fn rebuild_fts_via_rusqlite_cleans_duplicate_legacy_schema_rows() {
-        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
-
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("fts-duplicate-rebuild.db");
-
-        let storage = SqliteStorage::open(&db_path).unwrap();
-        let agent = Agent {
-            id: None,
-            slug: "codex".into(),
-            name: "Codex".into(),
-            version: Some("0.2.3".into()),
-            kind: AgentKind::Cli,
-        };
-        let agent_id = storage.ensure_agent(&agent).unwrap();
-        let conversation = Conversation {
-            id: None,
-            agent_slug: "codex".into(),
-            workspace: Some(PathBuf::from("/ws")),
-            external_id: Some("retro".into()),
-            title: Some("retro".into()),
-            source_path: PathBuf::from("/tmp/retro.jsonl"),
-            started_at: Some(42),
-            ended_at: Some(42),
-            approx_tokens: None,
-            metadata_json: serde_json::Value::Null,
-            messages: vec![Message {
-                id: None,
-                idx: 0,
-                role: MessageRole::User,
-                author: None,
-                created_at: Some(42),
-                content: "retro investigation".into(),
-                extra_json: serde_json::Value::Null,
-                snippets: Vec::new(),
-            }],
-            source_id: LOCAL_SOURCE_ID.into(),
-            origin_host: None,
-        };
-        storage
-            .insert_conversation_tree(agent_id, None, &conversation)
-            .unwrap();
-        drop(storage);
-        materialize_fresh_fts_schema_via_rusqlite(&db_path).unwrap();
-
-        let conn = rusqlite_test_fixture_conn(&db_path);
-        conn.execute_batch("PRAGMA writable_schema = ON;").unwrap();
-        conn.execute(
-            "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
-             VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
-            ["CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')"],
-        )
-        .unwrap();
-        conn.execute_batch("PRAGMA writable_schema = OFF;").unwrap();
-        let duplicate_rows: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(duplicate_rows, 2);
-        drop(conn);
-
-        let inserted = rebuild_fts_via_rusqlite(&db_path).unwrap();
-        assert_eq!(inserted, 1);
-
-        let conn = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().into_owned())), crate::storage::api::Profile::Production).unwrap();
-        let schema_rows = franken_fts_schema_rows(&conn).unwrap();
-        assert_eq!(
-            schema_rows, 1,
-            "DROP TABLE should leave one clean FTS schema"
-        );
-        let match_count: i64 = conn
-            .query_row_map("SELECT COUNT(*) FROM fts_messages", fparams![], |row| {
-                row.get_typed(0)
-            })
-            .unwrap();
-        assert_eq!(match_count, 1);
     }
 
     // =========================================================================
@@ -25565,149 +25117,6 @@ mod tests {
 
 
     #[test]
-    fn fts_messages_integrity_reports_missing_shadow_tables() {
-        let direct_missing_shadow = fts_messages_integrity_error_from_message(
-            "inserting 10000 rows into fallback FTS: table not found: fts_messages_data",
-        )
-        .expect("a missing required shadow table must be classified as derived FTS damage");
-        assert_eq!(
-            direct_missing_shadow.missing_shadow_tables(),
-            &["fts_messages_data"]
-        );
-
-        let dir = TempDir::new().unwrap();
-        let healthy_db_path = dir.path().join("healthy_fts.db");
-
-        {
-            let storage = FrankenStorage::open(&healthy_db_path).unwrap();
-            storage.ensure_search_fallback_fts_consistency().unwrap();
-            storage
-                .validate_fts_messages_integrity()
-                .expect("freshly materialized fts_messages should pass integrity validation");
-        }
-
-        let corrupt_db_path = dir.path().join("test_corrupt_fts_missing_shadows.db");
-        {
-            let conn = rusqlite_test_fixture_conn(&corrupt_db_path);
-            conn.execute("CREATE TABLE schema_anchor(id INTEGER PRIMARY KEY)", [])
-                .unwrap();
-            let orphaned_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')";
-            conn.execute_batch("PRAGMA writable_schema = ON;").unwrap();
-            conn.execute(
-                "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
-                 VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
-                [orphaned_fts_sql],
-            )
-            .unwrap();
-            conn.execute_batch("PRAGMA writable_schema = OFF;").unwrap();
-        }
-
-        // w1b Task B9 (salvage problem C, control-plane ruling): vanilla
-        // SQLite defers FTS5 shadow-table validation to the virtual
-        // table's `xConnect`, triggered by the first real reference to
-        // `fts_messages` -- not by opening the connection. The old
-        // the legacy embedded engine backend validated eagerly at open time (which this
-        // test originally pinned); that eagerness was a side effect of
-        // the legacy embedded engine's own vtable machinery, the very thing this wave
-        // retires. Opening a connection to a database carrying a single
-        // (non-duplicated) orphaned fts_messages declaration must now
-        // succeed:
-        let conn = FrankenConnection::open_writable(std::path::Path::new(&(corrupt_db_path.to_string_lossy().to_string())), crate::storage::api::Profile::Production)
-            .expect("a single orphaned fts_messages declaration (no name collision) must not fail connection open under vanilla SQLite's lazy vtable validation");
-
-        // -- and the corruption must surface the moment fts_messages is
-        // actually queried, pinning the real exposure timing so a future
-        // engine change silently moving it elsewhere goes noticed. Real
-        // SQLite's xConnect failure here is a generic "vtable constructor
-        // failed: fts_messages" -- unlike the legacy embedded engine's old open-time
-        // message, it does not name any specific missing shadow table, so
-        // `fts_messages_integrity_error_from_message` classifies it as
-        // structural FTS damage with an empty `missing_shadow_tables()`
-        // (verified: `query_err.to_string()` contains
-        // "vtable constructor failed").
-        let query_err = conn
-            .query_all_map(FTS_MESSAGES_INTEGRITY_PROBE_SQL, &[], |_row| Ok(()))
-            .expect_err("querying fts_messages is where xConnect shadow-table validation actually fires");
-        assert!(
-            query_err.to_string().contains("vtable constructor failed"),
-            "unexpected query-time error shape: {query_err}"
-        );
-        fts_messages_integrity_error_from_message(query_err.to_string())
-            .expect("query-time FTS corruption should map to the typed FTS integrity kind");
-
-        // The crate's real, production-wired detection entry point
-        // (validate_fts_messages_integrity_for_connection, consumed as an
-        // opt-in preflight check by indexer/mod.rs before indexing) must
-        // independently catch this too -- this is the guarantee that
-        // actually matters for operators, decoupled from whichever
-        // specific statement happens to trip xConnect first. Its
-        // shadow-table check is a real `sqlite_master` query rather than
-        // string-matching a driver error, so it correctly reports all five
-        // required tables as missing (none were ever created -- the
-        // fixture hand-inserted only the top-level declaration row).
-        let validate_err = validate_fts_messages_integrity_for_connection(&conn)
-            .expect_err("validate_fts_messages_integrity must detect the orphaned fts_messages declaration");
-        let integrity = validate_err
-            .downcast_ref::<FtsMessagesIntegrityError>()
-            .expect("validation failure should be the typed FTS integrity error");
-        assert_eq!(
-            integrity.missing_shadow_tables(),
-            &FTS_MESSAGES_REQUIRED_SHADOW_TABLES[..]
-        );
-        let rendered = integrity.to_string();
-        assert!(
-            rendered.contains("fts_messages")
-                && rendered.contains("required FTS5 shadow tables")
-                && rendered.contains("fts_messages_content"),
-            "error should be an operator-facing FTS corruption diagnosis: {rendered}"
-        );
-    }
-
-    #[test]
-    fn franken_storage_open_fresh_db_keeps_single_franken_fts_schema_row() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("fresh-franken-storage-open.db");
-
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
-
-        // w1b Task B7 interaction probe (control-plane ruling, bead z9fse.11):
-        // `schema::ensure` now creates fts_messages eagerly, so by this point
-        // the database already has exactly one, correct fts_messages schema
-        // row -- unlike the pre-B7 world this test originally documented,
-        // where V14 drops the V13-era table and nothing recreates it until a
-        // consistency pass runs. The old lazy-repair machinery
-        // (`ensure_search_fallback_fts_consistency`) still exists and still
-        // runs during normal cass startup until Task B8, so the interaction
-        // that actually matters now is the reverse of what this test used to
-        // check: does that machinery stay a clean no-op -- no duplicate
-        // schema row, still queryable -- when it finds a table that's
-        // already present and correct, rather than absent?
-        storage
-            .ensure_search_fallback_fts_consistency()
-            .expect("ensure FTS consistency after fresh open");
-        drop(storage);
-
-        let c_reader = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().into_owned())), crate::storage::api::Profile::Production)
-            .expect("open DB via the legacy embedded engine for sqlite_master inspection");
-        assert_eq!(
-            franken_fts_schema_rows(&c_reader).unwrap(),
-            1,
-            "exactly one fts_messages schema row should exist after ensure_search_fallback_fts_consistency"
-        );
-        drop(c_reader);
-
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        assert!(
-            storage
-                .raw()
-                .query_all_map("SELECT COUNT(*) FROM fts_messages", &[], |_row| Ok(()))
-                .is_ok(),
-            "fts_messages must be queryable through the legacy embedded engine after open"
-        );
-    }
-
-    #[test]
     fn franken_storage_open_repairs_missing_analytics_tables_when_version_markers_lie() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test_repair_missing_analytics.db");
@@ -26125,7 +25534,6 @@ mod tests {
         assert_eq!(purge.conversations_deleted, 1);
         assert_eq!(purge.messages_deleted, 2);
 
-        storage.rebuild_fts().unwrap();
         storage.rebuild_analytics().unwrap();
         storage.rebuild_daily_stats().unwrap();
         storage.rebuild_token_daily_stats().unwrap();
@@ -26135,14 +25543,6 @@ mod tests {
         assert_eq!(agents[0].slug, "codex");
         assert_eq!(storage.total_conversation_count().unwrap(), 1);
         assert_eq!(storage.total_message_count().unwrap(), 2);
-
-        let fts_rows: i64 = storage
-            .raw()
-            .query_row_map("SELECT COUNT(*) FROM fts_messages", fparams![], |row| {
-                row.get_typed(0)
-            })
-            .unwrap();
-        assert_eq!(fts_rows, 2);
 
         let total_daily_sessions: i64 = storage
             .raw()

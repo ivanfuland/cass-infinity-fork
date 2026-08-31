@@ -586,38 +586,6 @@ fn parity_scan_timestamp_roundtrip() {
 }
 
 // ============================================================================
-// 8. FTS PARITY
-// ============================================================================
-
-#[test]
-fn parity_rebuild_fts_and_query() {
-    let (_dir, sql, frank) = open_both();
-
-    let agent = make_agent("claude", "Claude");
-    let sql_agent_id = sql.ensure_agent(&agent).unwrap();
-    let frank_agent_id = frank.ensure_agent(&agent).unwrap();
-
-    let conv = make_conversation(
-        "claude",
-        "fts-test",
-        "FTS Parity",
-        vec![
-            make_message(0, MessageRole::User, "searchable keyword alpha"),
-            make_message(1, MessageRole::Agent, "response with beta keyword"),
-        ],
-    );
-
-    sql.insert_conversation_tree(sql_agent_id, None, &conv)
-        .unwrap();
-    frank
-        .insert_conversation_tree(frank_agent_id, None, &conv)
-        .unwrap();
-
-    sql.rebuild_fts().unwrap();
-    frank.rebuild_fts().unwrap();
-}
-
-// ============================================================================
 // 9. EDGE CASES
 // ============================================================================
 

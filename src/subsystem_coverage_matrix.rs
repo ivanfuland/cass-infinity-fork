@@ -318,7 +318,6 @@ pub fn subsystem_coverage_matrix() -> Vec<SubsystemCoverage> {
             ],
             mandatory_proofs: &[ProofLevel::Integration, ProofLevel::Golden],
             proof_artifacts: &[
-                "tests/indexer_tantivy.rs",
                 "tests/atomic_swap_publish_crash_window.rs",
                 "src/search/regression_corpus.rs",
             ],

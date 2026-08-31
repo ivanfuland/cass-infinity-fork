@@ -48,68 +48,6 @@ fn msg(idx: i64, created_at: i64) -> Message {
 
 
 #[test]
-fn rebuild_fts_repopulates_rows() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let db_path = tmp.path().join("fts.db");
-    let storage = SqliteStorage::open(&db_path).expect("open");
-
-    let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
-    let ws_id = storage
-        .ensure_workspace(PathBuf::from("/workspace/demo").as_path(), Some("Demo"))
-        .unwrap();
-
-    let conv = sample_conv(Some("ext-1"), vec![msg(0, 10), msg(1, 20)]);
-    storage
-        .insert_conversation_tree(agent_id, Some(ws_id), &conv)
-        .unwrap();
-
-    let count_messages: i64 = storage
-        .raw()
-        .query_row_map("SELECT COUNT(*) FROM messages", &[], |r| r.get_typed(0))
-        .unwrap();
-    let fts_table_count: i64 = storage
-        .raw()
-        .query_row_map(
-            "SELECT COUNT(*) FROM sqlite_master WHERE name='fts_messages' AND type='table'",
-            &[],
-            |r| r.get_typed(0),
-        )
-        .unwrap();
-    // w1b Task B7 (control-plane ruling, bead z9fse.11): fts_messages is now
-    // materialized eagerly by `schema::ensure` at open time. Drop it below
-    // to independently exercise `rebuild_fts()` recreating an absent table,
-    // regardless of the eager-vs-lazy starting state.
-    assert_eq!(
-        fts_table_count, 1,
-        "fresh storage materializes db-resident FTS eagerly"
-    );
-
-    storage
-        .raw()
-        .execute("DROP TABLE IF EXISTS fts_messages", &[])
-        .unwrap();
-    let fts_table_count: i64 = storage
-        .raw()
-        .query_row_map(
-            "SELECT COUNT(*) FROM sqlite_master WHERE name='fts_messages' AND type='table'",
-            &[],
-            |r| r.get_typed(0),
-        )
-        .unwrap();
-    assert_eq!(
-        fts_table_count, 0,
-        "fts_messages should be absent after drop"
-    );
-
-    storage.rebuild_fts().unwrap();
-    let fts_count: i64 = storage
-        .raw()
-        .query_row_map("SELECT COUNT(*) FROM fts_messages", &[], |r| r.get_typed(0))
-        .unwrap();
-    assert_eq!(fts_count, count_messages);
-}
-
-#[test]
 fn duplicate_idx_within_new_conversation_keeps_first_message() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("rollback.db");
@@ -277,71 +215,6 @@ fn append_only_updates_existing_conversation() {
         )
         .unwrap();
     assert_eq!(ended_at, 300);
-}
-
-#[test]
-fn large_batch_insert_can_materialize_derived_fts() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let db_path = tmp.path().join("batch.db");
-    let storage = SqliteStorage::open(&db_path).expect("open");
-
-    let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
-
-    // Build a conversation with 200 messages
-    let mut msgs = Vec::new();
-    for idx in 0..200 {
-        msgs.push(msg(idx, 1_000 + idx));
-    }
-    let conv = sample_conv(Some("batch-1"), msgs);
-
-    let outcome = storage
-        .insert_conversation_tree(agent_id, None, &conv)
-        .expect("batch insert");
-    assert_eq!(outcome.inserted_indices.len(), 200);
-
-    let msg_count: i64 = storage
-        .raw()
-        .query_row_map("SELECT COUNT(*) FROM messages", &[], |r| r.get_typed(0))
-        .unwrap();
-    let fts_table_count: i64 = storage
-        .raw()
-        .query_row_map(
-            "SELECT COUNT(*) FROM sqlite_master WHERE name='fts_messages' AND type='table'",
-            &[],
-            |r| r.get_typed(0),
-        )
-        .unwrap();
-    // w1b Task B7 (control-plane ruling, bead z9fse.11): fts_messages is now
-    // materialized eagerly by `schema::ensure` at open time, not lazily on
-    // first rebuild -- it just isn't populated with this batch's rows yet.
-    assert_eq!(
-        fts_table_count, 1,
-        "db-resident FTS table exists eagerly; explicit rebuild populates it"
-    );
-
-    storage.rebuild_fts().unwrap();
-    let fts_count: i64 = storage
-        .raw()
-        .query_row_map("SELECT COUNT(*) FROM fts_messages", &[], |r| r.get_typed(0))
-        .unwrap();
-
-    assert_eq!(msg_count, 200);
-    assert_eq!(fts_count, 200);
-
-    // Spot check a few message rows for correct ordering and timestamps
-    let rows: Vec<(i64, i64)> = storage
-        .raw()
-        .query_all_map(
-            "SELECT idx, created_at FROM messages ORDER BY idx LIMIT 3 OFFSET 197",
-            &[],
-            |r| Ok((r.get_typed(0)?, r.get_typed::<Option<i64>>(1)?.unwrap())),
-        )
-        .unwrap();
-    assert_eq!(
-        rows,
-        vec![(197, 1_197), (198, 1_198), (199, 1_199)],
-        "tail rows should preserve order and timestamps"
-    );
 }
 
 #[test]
@@ -566,68 +439,6 @@ fn messages_table_has_correct_columns() {
     assert!(columns.contains(&"created_at".to_string()));
     assert!(columns.contains(&"content".to_string()));
     assert!(columns.contains(&"extra_json".to_string()));
-}
-
-#[test]
-fn fts_messages_is_fts5_virtual_table() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let db_path = tmp.path().join("fts5.db");
-    let storage = SqliteStorage::open(&db_path).expect("open");
-    storage
-        .rebuild_fts()
-        .expect("materialize derived FTS table");
-
-    // Check that fts_messages is an FTS5 virtual table
-    let sql: String = storage
-        .raw()
-        .query_row_map(
-            "SELECT sql FROM sqlite_master WHERE name='fts_messages' AND type='table'",
-            &[],
-            |r| r.get_typed(0),
-        )
-        .expect("fts_messages should exist");
-
-    assert!(
-        sql.contains("fts5"),
-        "fts_messages should be FTS5 virtual table"
-    );
-    assert!(sql.contains("content"), "fts_messages should have content");
-    assert!(sql.contains("title"), "fts_messages should have title");
-    assert!(sql.contains("agent"), "fts_messages should have agent");
-    assert!(
-        sql.contains("workspace"),
-        "fts_messages should have workspace"
-    );
-    assert!(
-        sql.contains("content=''") || sql.contains("content = ''"),
-        "fts_messages should use contentless storage"
-    );
-    assert!(
-        !sql.contains("message_id UNINDEXED"),
-        "fts_messages should no longer store legacy message_id payloads"
-    );
-    assert!(
-        sql.contains("porter"),
-        "fts_messages should use porter tokenizer"
-    );
-}
-
-#[test]
-fn fresh_database_fts_messages_is_queryable_via_frankensqlite() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let db_path = tmp.path().join("fresh-fts.db");
-    let storage = SqliteStorage::open(&db_path).expect("open");
-    storage
-        .rebuild_fts()
-        .expect("materialize derived FTS table");
-
-    let count: i64 = storage
-        .raw()
-        .query_row_map("SELECT COUNT(*) FROM fts_messages", &[], |row| {
-            row.get_typed(0)
-        })
-        .expect("fresh FTS table should be queryable via the legacy embedded engine");
-    assert_eq!(count, 0, "fresh FTS table should start empty");
 }
 
 #[test]
