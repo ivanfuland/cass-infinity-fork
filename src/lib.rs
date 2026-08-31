@@ -72778,33 +72778,24 @@ mod cli_read_db_tests {
 
     #[test]
     fn state_meta_json_hides_empty_active_rebuild_pipeline_runtime_before_first_heartbeat() {
+        // W2-6 exec39 (checkpoint-fixture item3, control-plane ruling):
+        // this test used to also write the retired
+        // `.lexical-rebuild-state.json` checkpoint file here (SCHEMA_HASH
+        // + a "runtime" telemetry blob). It was already dead weight
+        // before this edit -- `state["rebuild"]["pipeline"]["runtime"]`
+        // is unconditionally `Value::Null` regardless of any file content
+        // (see the `pipeline.insert("runtime", ...)` call this function
+        // exercises below), and `rebuilding`/`rebuild.active` come from
+        // the index-run.lock file's `mode=index`, not this checkpoint.
+        // The write never affected any assertion in this test; removed
+        // rather than left as a misleading no-op (third instance of the
+        // "adjacent test already migrated, this one wasn't" pattern --
+        // see `state_meta_json_reports_active_rebuild` below for the
+        // exec36 precedent that already made this exact move).
         let (temp, db_path) = seed_cli_db();
         let index_path = crate::indexer::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
         std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
-        std::fs::write(
-            index_path.join(".lexical-rebuild-state.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "version": 2,
-                "schema_hash": crate::indexer::LEXICAL_REBUILD_SCHEMA_HASH,
-                "db": {
-                    "db_path": db_path.display().to_string(),
-                    "total_conversations": 10,
-                    "storage_fingerprint": "10:42:0:0"
-                },
-                "page_size": crate::indexer::LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
-                "committed_offset": 4,
-                "committed_conversation_id": 4,
-                "processed_conversations": 4,
-                "indexed_docs": 20,
-                "committed_meta_fingerprint": null,
-                "pending": null,
-                "completed": false,
-                "updated_at_ms": 1_733_000_123_000_i64
-            }))
-            .expect("serialize rebuild state"),
-        )
-        .expect("write rebuild state");
 
         let lock_path = temp.path().join("index-run.lock");
         let mut lock_file = std::fs::OpenOptions::new()

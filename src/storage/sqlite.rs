@@ -5489,7 +5489,11 @@ pub(crate) struct LexDomainRebuildStats {
 /// absent, on a database that predates this marker); the next routine run
 /// reads that as incomplete and reruns the full rebuild from zero -- there is
 /// no partial-progress resume, matching the project's X-5 judgment.
-pub(crate) const LEX_DOMAIN_REBUILD_STATE_META_KEY: &str = "lex_domain_rebuild_state";
+// W2-6 exec39: widened crate-private -> pub so integration-test fixtures
+// (tests/cli_status.rs, tests/e2e_health.rs) can plant the real DB marker
+// instead of the retired `.lexical-rebuild-state.json` checkpoint file --
+// same rationale as LEXICAL_REBUILD_SCHEMA_HASH's earlier widening.
+pub const LEX_DOMAIN_REBUILD_STATE_META_KEY: &str = "lex_domain_rebuild_state";
 const LEX_DOMAIN_REBUILD_STATE_BUILDING: &str = "building";
 const LEX_DOMAIN_REBUILD_STATE_COMPLETED_PREFIX: &str = "completed:";
 

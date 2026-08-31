@@ -5,6 +5,7 @@ use coding_agent_search::model::types::{Agent, AgentKind, Conversation};
 use coding_agent_search::sources::config::{SourceDefinition, SourcesConfig, SyncSchedule};
 use coding_agent_search::sources::sync::{SourceSyncInfo, SyncResult, SyncStatus};
 use coding_agent_search::storage::api::Profile;
+use coding_agent_search::storage::api::Value as SqliteParamValue;
 use coding_agent_search::storage::sqlite::SqliteStorage;
 use coding_agent_search::storage::testing::open_writable_for_tests;
 use serde::{Deserialize, Serialize};
@@ -31,7 +32,27 @@ pub struct DoctorFixtureFactory {
     home_dir: PathBuf,
     data_dir: PathBuf,
     manifest: DoctorFixtureScenarioManifest,
+    // W2-6 exec39: consumed (and reset to false) by the next
+    // `insert_conversation` call -- see `LEXICAL_INSERT_ENV_LOCK` doc
+    // comment for why this must go through a real env-var toggle rather
+    // than a synthetic on-disk artifact, and why every conversation
+    // insert (not just the deferred one) must hold the same process-wide
+    // lock while it runs.
+    defer_next_lexical_insert: bool,
 }
+
+// W2-6 exec39: `CASS_DEFER_LEXICAL_UPDATES` is a real process-wide env var
+// (storage/sqlite.rs::defer_storage_lexical_updates_enabled reads it live
+// on every call, not a cached/compile-time value). `cargo test`'s default
+// harness runs `#[test]` fns in the SAME process on multiple threads, so
+// toggling it around one fixture's conversation insert would race any
+// OTHER concurrently-running fixture's insert in the same test binary
+// (cross-scenario env contamination, not just self-contamination). Every
+// `insert_conversation` call -- deferred or not -- holds this mutex for
+// its duration so no insert can ever observe another insert's env-var
+// window. Static (not thread_local!): the race is at the process/env
+// level, so the lock must be too.
+static LEXICAL_INSERT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Debug)]
 enum DoctorFixtureRoot {
@@ -125,7 +146,7 @@ pub enum DoctorFixtureScenario {
     DbCorrupt,
     DbCorruptWithStaleIndex,
     CoverageReducingCandidate,
-    IndexCorrupt,
+    DerivedLexicalDesyncBlindSpot,
     StaleLock,
     ActiveLock,
     InterruptedRepair,
@@ -263,6 +284,7 @@ impl DoctorFixtureFactory {
             home_dir,
             data_dir,
             manifest,
+            defer_next_lexical_insert: false,
         }
     }
 
@@ -570,13 +592,80 @@ impl DoctorFixtureFactory {
                     .push_unique("archive-db-corrupt");
             }
             DoctorFixtureScenario::DbCorruptWithStaleIndex => {
+                // W2-6 exec39 (control-plane ruling): this scenario feeds
+                // TWO independent, still-alive consumers that happen to
+                // share this one fixture step -- they are not the same
+                // check and this scenario must satisfy both:
+                //
+                // (1) doctor's routine staleness detector (lib.rs:74543
+                // "index_sync") -- a real, DB-domain, binary
+                // lex_docs==0-vs-messages>0 check. Manufactured through
+                // the real production CASS_DEFER_LEXICAL_UPDATES=1 toggle
+                // (storage/sqlite.rs::defer_storage_lexical_updates_enabled),
+                // not a synthetic file. Zero fidelity exemption: this is
+                // the same code path a real interrupted-defer incident
+                // would hit.
+                //
+                // (2) candidate-promotion's derived-followup bookkeeping
+                // (`doctor_candidate_promotion_derived_status`,
+                // lib.rs:49745) -- its FIRST branch gates on
+                // `live_inventory_before.index_exists`, which is a pure
+                // *directory*-existence probe (`index_path.exists()`,
+                // lib.rs:41341) over `expected_index_dir`, independent of
+                // lex_docs content. Audited 2026-08-31 (control-plane
+                // 三选一裁定 (c)): this directory-vs-DB judgment IS
+                // arguably misaligned for FTS5 (see debt note below), but
+                // rewiring it to open db_path and inspect lex_docs would
+                // break `doctor_candidate_live_inventory`'s
+                // corruption-tolerant contract -- it deliberately reads
+                // raw file bytes (blake3/exists) so it still produces a
+                // forensic snapshot when db_path is NOT a valid SQLite
+                // file (exactly this scenario's DbCorrupt precondition).
+                // Rewiring it is a real product change, out of scope
+                // here; this fixture instead honestly reproduces the
+                // legacy-layout deployment shape that check still keys
+                // on: SOME artifact present under `expected_index_dir`
+                // before the archive gets corrupted. The audit found only
+                // ONE semantic consumer of `.index_exists` in the whole
+                // crate (this branch), so the blast radius of leaving it
+                // as-is is narrow.
+                //
+                // Debt (w2-6-closeout, not decided here): `index_exists`
+                // directory-presence judgment is potentially misaligned
+                // three ways -- (a) false-negative on a fresh FTS5-only
+                // install that never populated `expected_index_dir` at
+                // all (lex_docs lives in the DB, not that directory) even
+                // though the pre-corruption archive had a fully healthy
+                // lex domain; (b) self-contradictory bookkeeping when it
+                // IS false: the promotion report can say
+                // "not-required" while the independent `needs_rebuild`
+                // path (DB-domain, correct) has already actually rebuilt
+                // the index -- the account text lies even though the
+                // real work happened; (c) candidate direction, undecided:
+                // a lightweight promotion-time attestation written
+                // without opening the full DB, letting the corruption-
+                // tolerant snapshot carry real lex-domain evidence instead
+                // of directory presence -- Ivan's call, not this fixture's.
+                // This fixture reproduces the LEGACY layout (artifact
+                // under `expected_index_dir`) that the check currently
+                // keys on; a fresh install with no such directory is the
+                // known, recorded gap above, not covered by this scenario.
+                //
+                // IMPORTANT: nothing between fixture construction and the
+                // `cass doctor` invocation may run `cass search` against
+                // this data dir -- the search hot path's self-heal
+                // (`ensure_lexical_assets_for_search`) transparently
+                // rebuilds lex_docs on first query and would silently eat
+                // the (1) staleness before doctor ever observes it (exec37
+                // smoke B).
+                self.defer_next_lexical_insert = true;
                 self.apply_scenario(DoctorFixtureScenario::DbCorrupt);
                 let index_path =
-                    coding_agent_search::search::tantivy::expected_index_dir(&self.data_dir);
+                    coding_agent_search::indexer::expected_index_dir(&self.data_dir);
                 self.write_confined_file(
-                    &index_path.join("stale-derived-segment.fixture"),
-                    b"stale derived lexical fixture",
-                    "derived_lexical_stale_fixture",
+                    &index_path.join("legacy-publish-artifact-presence.fixture"),
+                    b"legacy on-disk publish artifact -- presence only, not FTS5 lex_docs content",
+                    "legacy_publish_artifact_presence_fixture",
                 );
                 self.manifest
                     .expected_anomalies
@@ -594,30 +683,64 @@ impl DoctorFixtureFactory {
                     .expected_anomalies
                     .push_unique("candidate-coverage-decrease");
             }
-            DoctorFixtureScenario::IndexCorrupt => {
+            DoctorFixtureScenario::DerivedLexicalDesyncBlindSpot => {
+                // W2-6 exec39 (control-plane ruling, corrupt-candidate 2):
+                // there is no "derived-lexical-corrupt" doctor anomaly in
+                // the current taxonomy (`DoctorAnomaly`, src/lib.rs:28426)
+                // -- the only mechanism that can observe external-content
+                // desync is the FTS5 full-tier integrity-check
+                // (`validate_searchable_index_contract_full`), and it only
+                // runs as POST-REPAIR verification after `--fix` already
+                // mutated something, never as an independently-triggerable
+                // routine check. Routine `cass doctor` (the
+                // "index"/"index_sync" checks) only look at lex_docs row
+                // *counts*, which desync does not change -- so routine
+                // doctor reports pass/healthy even though the domain is
+                // desynced. This scenario deliberately exercises that
+                // KNOWN, DESIGN-INTENTIONAL detection gap as an explicit
+                // regression lock, not a corruption-detection test:
+                //   1. bypass the app's dual-write path with a raw SQL
+                //      UPDATE against lex_docs.content, skipping the
+                //      matching fts_lex companion write (exec29's
+                //      mechanism: DELETE-then-reinsert term accounting no
+                //      longer nets out once fts_lex doesn't know about the
+                //      new content) -- NOT a production path; fidelity
+                //      exemption: no production entry point lets an
+                //      operator trigger this state, this specifically
+                //      stages a known internal-consistency gap.
+                //   2. the CONSUMING e2e test must first run
+                //      `validate_searchable_index_contract_full` itself to
+                //      PROVE the desync was actually created (the probe
+                //      verifies itself before anything asserts on it),
+                //      THEN assert the routine `cass doctor` check reports
+                //      pass (the blind-spot lock). Skipping step 1 lets
+                //      this regress into a permanently-vacuous test if a
+                //      future write-path change makes the bypass stop
+                //      actually desyncing anything.
+                // Debt: whether routine doctor should gain a full-tier
+                // check to close this gap is Ivan's call, tracked in the
+                // w2-6-closeout debt ledger -- not decided by this fixture.
                 self.set_contract(
-                    "derived-asset-risk",
-                    "derived-only",
-                    "safe-derived-repair-eligible",
+                    "derived-lexical-desync-blind-spot",
+                    "read-only",
+                    "undetected-by-routine-check",
                 );
-                let _ = self.add_provider_source(
+                let source = self.add_provider_source(
                     DoctorProviderSpec::codex(),
                     "local",
                     true,
                     false,
                     false,
                 );
-                let index_path =
-                    coding_agent_search::search::tantivy::expected_index_dir(&self.data_dir);
-                self.write_confined_file(
-                    &index_path.join("corrupt-derived-segment.fixture"),
-                    b"corrupt-index",
-                    "derived_lexical_corrupt_fixture",
+                self.desync_lex_domain_content_bypassing_dual_write(
+                    source.conversation_id,
+                    "derived-lexical-desync-blind-spot: canonical content mutated bypassing the app dual-write path",
                 );
                 self.manifest.expected_coverage_state = "healthy".to_string();
-                self.manifest
-                    .expected_anomalies
-                    .push_unique("derived-lexical-stale");
+                // Deliberately NOT pushing any expected_anomalies entry --
+                // routine doctor is expected to report pass/healthy
+                // despite the desync; that absence of an anomaly IS the
+                // blind spot being locked.
             }
             DoctorFixtureScenario::StaleLock => {
                 self.set_contract("concurrency-risk", "read-only", "stale-lock-diagnosis");
@@ -1092,12 +1215,27 @@ impl DoctorFixtureFactory {
     }
 
     fn insert_conversation(
-        &self,
+        &mut self,
         provider: DoctorProviderSpec,
         source_id: &str,
         source_path: &Path,
         message_count: usize,
     ) -> i64 {
+        // W2-6 exec39: hold the process-wide env lock for the whole insert,
+        // regardless of whether THIS insert defers -- see
+        // `LEXICAL_INSERT_ENV_LOCK`'s doc comment.
+        let _env_lock = LEXICAL_INSERT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let defer_lexical = self.defer_next_lexical_insert;
+        self.defer_next_lexical_insert = false;
+        if defer_lexical {
+            // SAFETY: env mutation is confined to this held-lock window; no
+            // other insert_conversation call can observe it mid-flight.
+            unsafe {
+                std::env::set_var("CASS_DEFER_LEXICAL_UPDATES", "1");
+            }
+        }
         let storage = SqliteStorage::open(&self.data_dir.join("agent_search.db"))
             .expect("open fixture archive db");
         let agent_id = storage
@@ -1130,7 +1268,49 @@ impl DoctorFixtureFactory {
         let outcome = storage
             .insert_conversation_tree(agent_id, Some(workspace_id), &conv)
             .expect("insert fixture conversation");
+        if defer_lexical {
+            // SAFETY: same held-lock window as the set_var above.
+            unsafe {
+                std::env::remove_var("CASS_DEFER_LEXICAL_UPDATES");
+            }
+        }
         outcome.conversation_id
+    }
+
+    /// W2-6 exec39: bypass-write `lex_docs.content` directly via raw SQL,
+    /// skipping the app's dual-write companion update to `fts_lex`. This
+    /// is NOT a production path (see the `DerivedLexicalDesyncBlindSpot`
+    /// scenario doc comment for the fidelity exemption) -- it exists only
+    /// to stage the FTS5 external-content desync that
+    /// `validate_searchable_index_contract_full`'s integrity-check can
+    /// detect but the routine `cass doctor` check cannot.
+    fn desync_lex_domain_content_bypassing_dual_write(
+        &mut self,
+        conversation_id: i64,
+        desynced_content: &str,
+    ) {
+        let storage = SqliteStorage::open(&self.data_dir.join("agent_search.db"))
+            .expect("open fixture archive db for desync bypass");
+        let rows_updated = storage
+            .raw()
+            .execute(
+                "UPDATE lex_docs SET content = ?1 WHERE doc_id IN (SELECT id FROM messages WHERE conversation_id = ?2)",
+                &[
+                    SqliteParamValue::from(desynced_content),
+                    SqliteParamValue::from(conversation_id),
+                ],
+            )
+            .expect("bypass-write lex_docs content to desync from fts_lex");
+        assert!(
+            rows_updated > 0,
+            "desync bypass must touch at least one lex_docs row for conversation {conversation_id}"
+        );
+        self.log(
+            "desync_lex_domain_content_bypassing_dual_write",
+            &format!(
+                "UPDATE lex_docs.content directly via raw SQL for conversation_id={conversation_id}, skipping the fts_lex companion write -- not a production path, see DerivedLexicalDesyncBlindSpot fidelity exemption"
+            ),
+        );
     }
 
     fn write_raw_mirror(
@@ -1307,7 +1487,7 @@ impl DoctorFixtureFactory {
         let db_bytes = fs::read(&scratch_db).expect("read fast incomplete fixture db");
         self.write_confined_file(&db_path, &db_bytes, "archive_database_incomplete_schema");
 
-        let index_path = coding_agent_search::search::tantivy::expected_index_dir(&self.data_dir);
+        let index_path = coding_agent_search::indexer::expected_index_dir(&self.data_dir);
         self.write_confined_file(
             &index_path.join("stale-derived-segment.fixture"),
             b"stale derived lexical fixture",
@@ -1519,7 +1699,7 @@ impl DoctorFixtureFactory {
         let db_path = self.data_dir.join("agent_search.db");
         let wal_path = self.data_dir.join("agent_search.db-wal");
         let shm_path = self.data_dir.join("agent_search.db-shm");
-        let index_path = coding_agent_search::search::tantivy::expected_index_dir(&self.data_dir);
+        let index_path = coding_agent_search::indexer::expected_index_dir(&self.data_dir);
         let file_entry = |path: &Path| {
             let exists = path.exists();
             json!({

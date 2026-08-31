@@ -2201,12 +2201,26 @@ fn doctor_e2e_ignored_diagnostic_mutation_diffs(
 }
 
 fn doctor_e2e_ignores_diagnostic_mutation_diff(spec: &DoctorE2eScenarioSpec, diff: &str) -> bool {
-    if spec.command_mode != DoctorE2eCommandMode::SupportBundleAfterFailure {
-        return false;
-    }
     let Some((_, path)) = diff.rsplit_once(':') else {
         return false;
     };
+    // W2-6 exec39 (control-plane ruling, 波1 sidecar写集豁免判例
+    // exec13/14-era precedent applied): opening the archive DB in WAL
+    // mode materializes `-wal`/`-shm` sidecar files as vanilla SQLite
+    // behavior, not a doctor mutation -- a read-only `cass doctor check`
+    // has no way to avoid this. Excluded unconditionally (not gated to
+    // any one command_mode) because the underlying cause is inherent to
+    // opening a WAL-journal SQLite database at all, not specific to any
+    // scenario or repair mode. Everything else -- most importantly the
+    // archive DB's own main-file bytes -- remains strictly compared;
+    // this exclusion only ever suppresses the two known-benign sidecar
+    // filenames, never the database file itself.
+    if path == "data/agent_search.db-wal" || path == "data/agent_search.db-shm" {
+        return true;
+    }
+    if spec.command_mode != DoctorE2eCommandMode::SupportBundleAfterFailure {
+        return false;
+    }
     path == "data/doctor"
         || path == "data/doctor/support-bundles"
         || path.starts_with("data/doctor/support-bundles/")
@@ -3617,7 +3631,7 @@ pub fn default_doctor_e2e_scenarios() -> Vec<DoctorE2eScenarioSpec> {
         .require_json_pointer("/operation_state/mutating_doctor_allowed"),
         DoctorE2eScenarioSpec::new(
             "derived-index-corrupt-read-only",
-            DoctorFixtureScenario::IndexCorrupt,
+            DoctorFixtureScenario::DerivedLexicalDesyncBlindSpot,
             ["quick", "derived", "read-only"],
         )
         .require_json_pointer("/risk_level")
@@ -3726,7 +3740,7 @@ pub fn default_doctor_e2e_scenarios() -> Vec<DoctorE2eScenarioSpec> {
         .require_json_pointer("/checks"),
         DoctorE2eScenarioSpec::new(
             "safe-auto-stale-derived-metadata-rebuild",
-            DoctorFixtureScenario::IndexCorrupt,
+            DoctorFixtureScenario::DerivedLexicalDesyncBlindSpot,
             ["safe-auto", "derived", "metadata", "mutation"],
         )
         .allow_mutation(true)
@@ -4124,7 +4138,7 @@ fn doctor_e2e_fixture_scenario_name(scenario: DoctorFixtureScenario) -> &'static
         DoctorFixtureScenario::DbCorrupt => "db-corrupt",
         DoctorFixtureScenario::DbCorruptWithStaleIndex => "db-corrupt-with-stale-index",
         DoctorFixtureScenario::CoverageReducingCandidate => "coverage-reducing-candidate",
-        DoctorFixtureScenario::IndexCorrupt => "index-corrupt",
+        DoctorFixtureScenario::DerivedLexicalDesyncBlindSpot => "derived-lexical-desync-blind-spot",
         DoctorFixtureScenario::StaleLock => "stale-lock",
         DoctorFixtureScenario::ActiveLock => "active-lock",
         DoctorFixtureScenario::InterruptedRepair => "interrupted-repair",

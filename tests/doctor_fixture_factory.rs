@@ -102,7 +102,7 @@ fn doctor_fixture_factory_can_materialize_all_named_scenarios() {
         DoctorFixtureScenario::MirrorMissing,
         DoctorFixtureScenario::DbCorrupt,
         DoctorFixtureScenario::DbCorruptWithStaleIndex,
-        DoctorFixtureScenario::IndexCorrupt,
+        DoctorFixtureScenario::DerivedLexicalDesyncBlindSpot,
         DoctorFixtureScenario::StaleLock,
         DoctorFixtureScenario::ActiveLock,
         DoctorFixtureScenario::InterruptedRepair,

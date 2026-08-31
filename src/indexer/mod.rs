@@ -2391,8 +2391,16 @@ pub const LEXICAL_REBUILD_SCHEMA_HASH: &str =
     "tantivy-schema-v8-hyphen-cjk-bigrams-bounded-content-prefix-preview-stored-content-external";
 const CASS_SCHEMA_VERSION: &str = "v8";
 
+// W2-6 exec39: widened crate-private -> pub. `searchable_index_summary`
+// (this module) is already `pub` and returns this type, but tests/cli_index.rs
+// (an external integration-test crate) calling it hit "private type" --
+// same leaked-private-return-type class as LEXICAL_REBUILD_SCHEMA_HASH's
+// and LEX_DOMAIN_REBUILD_STATE_META_KEY's earlier widenings this session.
+// Latent bug: masked pre-exec39 because tests/util's mod-util cascade
+// (doctor_fixture.rs's 4 compile errors) kept cargo from ever reaching
+// tests/cli_index.rs far enough to report it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SearchableIndexSummary {
+pub struct SearchableIndexSummary {
     pub docs: usize,
     pub segments: usize,
 }
