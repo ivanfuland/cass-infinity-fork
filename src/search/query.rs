@@ -805,30 +805,6 @@ const NO_LIMIT_BYTES_FLOOR: u64 = 256 * 1024 * 1024;
 /// else on the box.
 const NO_LIMIT_RAM_DIVISOR: u64 = 16;
 
-/// Above this corpus size, exact Tantivy `Count` collection is not part of the
-/// default top-N path. Common-term counts on multi-million-document indexes can
-/// dominate the query and turn a five-hit search into a full corpus scan; robot
-/// output already reports lower-bound count precision when the exact total is
-/// not available.
-const DEFAULT_EXACT_TOTAL_COUNT_MAX_DOCS: usize = 50_000;
-
-fn exact_total_count_max_docs() -> usize {
-    static MAX_DOCS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *MAX_DOCS.get_or_init(|| {
-        dotenvy::var("CASS_SEARCH_EXACT_TOTAL_COUNT_MAX_DOCS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(DEFAULT_EXACT_TOTAL_COUNT_MAX_DOCS)
-    })
-}
-
-fn should_collect_exact_total_count(
-    index_doc_count: usize,
-    max_docs_for_exact_count: usize,
-) -> bool {
-    max_docs_for_exact_count > 0 && index_doc_count <= max_docs_for_exact_count
-}
-
 fn available_memory_bytes() -> Option<u64> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
     for line in meminfo.lines() {
@@ -1908,37 +1884,6 @@ impl PartialOrd for SearchHitKey {
     }
 }
 
-const FEDERATED_RRF_K: f32 = 60.0;
-
-#[derive(Debug)]
-struct FederatedRankedHit {
-    hit: SearchHit,
-    shard_index: usize,
-    shard_rank: usize,
-    fused_score: f32,
-}
-
-fn federated_rrf_score(shard_rank: usize) -> f32 {
-    1.0 / (FEDERATED_RRF_K + shard_rank as f32 + 1.0)
-}
-
-fn merge_federated_ranked_hits(mut ranked_hits: Vec<FederatedRankedHit>) -> Vec<SearchHit> {
-    ranked_hits.sort_by(|a, b| {
-        b.fused_score
-            .total_cmp(&a.fused_score)
-            .then_with(|| a.shard_rank.cmp(&b.shard_rank))
-            .then_with(|| SearchHitKey::from_hit(&a.hit).cmp(&SearchHitKey::from_hit(&b.hit)))
-            .then_with(|| a.shard_index.cmp(&b.shard_index))
-    });
-    ranked_hits
-        .into_iter()
-        .map(|mut ranked| {
-            ranked.hit.score = ranked.fused_score;
-            ranked.hit
-        })
-        .collect()
-}
-
 #[cfg(test)]
 #[allow(dead_code)]
 #[derive(Debug, Default, Clone)]
@@ -2954,21 +2899,7 @@ const DEFAULT_CACHE_BYTE_CAP_MEMORY_FRACTION_DENOMINATOR: u64 = 128;
 const DEFAULT_CACHE_BYTE_CAP_CEILING: u64 = 2 * 1024 * 1024 * 1024;
 const S3_FIFO_GHOST_CAP_MULTIPLIER: usize = 2;
 const S3_FIFO_LARGE_ENTRY_FRACTION_DENOMINATOR: usize = 4;
-const PREWARM_ENTRY_PRESSURE_NUMERATOR: usize = 9;
-const PREWARM_ENTRY_PRESSURE_DENOMINATOR: usize = 10;
-const PREWARM_BYTE_PRESSURE_NUMERATOR: usize = 4;
-const PREWARM_BYTE_PRESSURE_DENOMINATOR: usize = 5;
-
 const CACHE_KEY_VERSION: &str = "1";
-
-// Warm debounce (ms) for background reload/warm jobs; default 120ms.
-static WARM_DEBOUNCE_MS: Lazy<u64> = Lazy::new(|| {
-    dotenvy::var("CASS_WARM_DEBOUNCE_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(120)
-});
 
 fn default_cache_byte_cap() -> usize {
     default_cache_byte_cap_for_available(available_memory_bytes())
@@ -3226,15 +3157,6 @@ impl CacheShards {
         self.ghost_keys.retain(|candidate| candidate != key);
     }
 
-    fn clear(&mut self) {
-        self.shards.clear();
-        self.total_cost = 0;
-        self.total_bytes = 0;
-        self.ghost_keys.clear();
-        self.ghost_set.clear();
-        // Note: eviction_count preserved for lifetime stats
-    }
-
     fn total_cost(&self) -> usize {
         self.total_cost
     }
@@ -3265,23 +3187,6 @@ impl CacheShards {
 
     fn admission_rejects(&self) -> u64 {
         self.admission_rejects
-    }
-
-    fn prewarm_pressure(&self) -> bool {
-        let entry_pressure = self
-            .total_cost
-            .saturating_mul(PREWARM_ENTRY_PRESSURE_DENOMINATOR)
-            >= self
-                .total_cap
-                .saturating_mul(PREWARM_ENTRY_PRESSURE_NUMERATOR);
-        let byte_pressure = self.byte_cap > 0
-            && self
-                .total_bytes
-                .saturating_mul(PREWARM_BYTE_PRESSURE_DENOMINATOR)
-                >= self
-                    .byte_cap
-                    .saturating_mul(PREWARM_BYTE_PRESSURE_NUMERATOR);
-        entry_pressure || byte_pressure
     }
 }
 
@@ -3610,12 +3515,6 @@ fn snippet_from_preview_without_full_content(
     }
 
     cached_prefix_snippet(stored_preview, query, 160)
-}
-
-fn stored_preview_is_complete_content(stored_preview: &str) -> bool {
-    // The preview builder appends U+2026 only when truncating. A real message
-    // ending with that character becomes a conservative false negative here.
-    !stored_preview.is_empty() && !stored_preview.ends_with('…')
 }
 
 impl SearchClient {
@@ -7989,13 +7888,6 @@ impl Metrics {
     fn inc_cache_shortfall(&self) {
         self.cache_shortfall.fetch_add(1, Ordering::Relaxed);
     }
-    fn inc_prewarm_scheduled(&self) {
-        self.prewarm_scheduled.fetch_add(1, Ordering::Relaxed);
-    }
-    fn inc_prewarm_skipped_pressure(&self) {
-        self.prewarm_skipped_pressure
-            .fetch_add(1, Ordering::Relaxed);
-    }
     fn inc_reload(&self) {
         self.reloads.fetch_add(1, Ordering::Relaxed);
     }
@@ -8197,85 +8089,6 @@ fn hit_matches_query_cached(hit: &CachedHit, query: &str) -> bool {
     hit_matches_query_cached_precomputed(hit, &terms)
 }
 
-fn is_prefix_only(query: &str) -> bool {
-    let tokens: Vec<&str> = query.split_whitespace().collect();
-    // Only strictly optimize single-term prefix queries.
-    // Multi-term queries benefit from Tantivy's snippet generation (highlighting both terms).
-    if tokens.len() != 1 {
-        return false;
-    }
-    tokens[0].chars().all(char::is_alphanumeric)
-}
-
-fn quick_prefix_snippet(content: &str, query: &str, max_chars: usize) -> String {
-    // Handle empty query case first
-    if query.is_empty() {
-        let mut chars = content.chars();
-        let snippet: String = chars.by_ref().take(max_chars).collect();
-        return if chars.next().is_some() {
-            format!("{snippet}…")
-        } else {
-            snippet
-        };
-    }
-
-    let lc_content = content.to_lowercase();
-    let lc_query = query.to_lowercase();
-
-    if let Some(pos) = lc_content.find(&lc_query) {
-        // Convert byte index in the lowercased string to a character index.
-        let match_start_char_idx = lc_content[..pos].chars().count();
-        let query_char_len = lc_query.chars().count();
-
-        // Determine where to start the snippet (aim for 15 chars before match)
-        let start_char = match_start_char_idx.saturating_sub(15);
-        let mut chars_iter = content.chars().skip(start_char);
-        let mut snippet = String::new();
-        let mut chars_taken = 0;
-        let mut current_idx = start_char;
-
-        while chars_taken < max_chars {
-            if current_idx == match_start_char_idx {
-                snippet.push_str("**");
-                for _ in 0..query_char_len {
-                    if let Some(ch) = chars_iter.next() {
-                        snippet.push(ch);
-                        chars_taken += 1;
-                        current_idx += 1;
-                    }
-                }
-                snippet.push_str("**");
-                if chars_taken >= max_chars {
-                    break;
-                }
-                continue;
-            }
-
-            if let Some(ch) = chars_iter.next() {
-                snippet.push(ch);
-                chars_taken += 1;
-                current_idx += 1;
-            } else {
-                break;
-            }
-        }
-
-        if chars_iter.next().is_some() {
-            format!("{snippet}…")
-        } else {
-            snippet
-        }
-    } else {
-        let mut chars = content.chars();
-        let snippet: String = chars.by_ref().take(max_chars).collect();
-        if chars.next().is_some() {
-            format!("{snippet}…")
-        } else {
-            snippet
-        }
-    }
-}
-
 fn cached_prefix_snippet(content: &str, query: &str, max_chars: usize) -> Option<String> {
     if query.trim().is_empty() {
         return None;
@@ -8457,27 +8270,6 @@ impl SearchClient {
             "global".into()
         }
     }
-    fn cached_prefix_key_exists_in_shard(
-        &self,
-        shard: &LruCache<Arc<str>, Vec<CachedHit>>,
-        query: &str,
-        filters: &SearchFilters,
-    ) -> bool {
-        let mut byte_indices: Vec<usize> = query.char_indices().map(|(i, _)| i).collect();
-        byte_indices.push(query.len());
-        let query_len = query.len();
-        for &end in byte_indices.iter().rev() {
-            if end == 0 || end == query_len {
-                continue;
-            }
-            let key = self.cache_key(&query[..end], filters);
-            if shard.contains(&key) {
-                return true;
-            }
-        }
-        false
-    }
-
     fn cached_prefix_hits(&self, query: &str, filters: &SearchFilters) -> Option<Vec<CachedHit>> {
         if query.is_empty() {
             return None;
@@ -9811,97 +9603,6 @@ mod tests {
                 conversation_id: None,
             },
         }
-    }
-
-    fn make_federated_merge_hit(id: &str, agent: &str) -> SearchHit {
-        SearchHit {
-            title: id.into(),
-            snippet: String::new(),
-            content: id.into(),
-            content_hash: stable_content_hash(id),
-            score: 0.0,
-            source_path: format!("{id}.jsonl"),
-            agent: agent.into(),
-            workspace: "workspace".into(),
-            workspace_original: None,
-            created_at: Some(1_700_000_000_000),
-            line_number: Some(1),
-            match_type: MatchType::Exact,
-            source_id: "local".into(),
-            origin_kind: "local".into(),
-            origin_host: None,
-            conversation_id: None,
-        }
-    }
-
-    fn make_federated_ranked_hit(
-        shard_index: usize,
-        shard_rank: usize,
-        id: &str,
-    ) -> FederatedRankedHit {
-        FederatedRankedHit {
-            hit: make_federated_merge_hit(id, &format!("shard-{shard_index}")),
-            shard_index,
-            shard_rank,
-            fused_score: federated_rrf_score(shard_rank),
-        }
-    }
-
-    #[test]
-    fn federated_merge_orders_equal_rank_hits_by_stable_hit_key() {
-        let merged = merge_federated_ranked_hits(vec![
-            make_federated_ranked_hit(2, 0, "zeta"),
-            make_federated_ranked_hit(0, 0, "bravo"),
-            make_federated_ranked_hit(1, 0, "alpha"),
-        ]);
-
-        let paths = merged
-            .iter()
-            .map(|hit| hit.source_path.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(paths, vec!["alpha.jsonl", "bravo.jsonl", "zeta.jsonl"]);
-        assert!(
-            merged
-                .iter()
-                .all(|hit| (hit.score - federated_rrf_score(0)).abs() < f32::EPSILON),
-            "equal per-shard rank should produce equal RRF scores"
-        );
-    }
-
-    #[test]
-    fn federated_merge_keeps_rrf_rank_ahead_of_stable_key() {
-        let merged = merge_federated_ranked_hits(vec![
-            make_federated_ranked_hit(0, 1, "alpha"),
-            make_federated_ranked_hit(1, 0, "zeta"),
-        ]);
-
-        let paths = merged
-            .iter()
-            .map(|hit| hit.source_path.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(paths, vec!["zeta.jsonl", "alpha.jsonl"]);
-        assert!(merged[0].score > merged[1].score);
-    }
-
-    #[test]
-    fn federated_merge_uses_shard_index_as_duplicate_final_tiebreak() {
-        let merged = merge_federated_ranked_hits(vec![
-            FederatedRankedHit {
-                hit: make_federated_merge_hit("same", "shard-2"),
-                shard_index: 2,
-                shard_rank: 0,
-                fused_score: federated_rrf_score(0),
-            },
-            FederatedRankedHit {
-                hit: make_federated_merge_hit("same", "shard-0"),
-                shard_index: 0,
-                shard_rank: 0,
-                fused_score: federated_rrf_score(0),
-            },
-        ]);
-
-        assert_eq!(merged[0].agent, "shard-0");
-        assert_eq!(merged[1].agent, "shard-2");
     }
 
     #[test]
@@ -17258,20 +16959,6 @@ mod tests {
         // Mirror case: an explicit override under the floor is lifted.
         let cap = compute_no_limit_result_cap_from(Some("1".to_string()), None, None);
         assert_eq!(cap, NO_LIMIT_RESULT_MIN);
-    }
-
-    #[test]
-    fn exact_total_count_policy_allows_small_indexes_only() {
-        assert!(should_collect_exact_total_count(49_999, 50_000));
-        assert!(should_collect_exact_total_count(50_000, 50_000));
-        assert!(!should_collect_exact_total_count(50_001, 50_000));
-    }
-
-    #[test]
-    fn exact_total_count_policy_zero_limit_disables_recount() {
-        assert!(!should_collect_exact_total_count(0, 0));
-        assert!(!should_collect_exact_total_count(1, 0));
-        assert!(!should_collect_exact_total_count(usize::MAX, 0));
     }
 
     // W2-6 exec37 Task甲⑦ (structural-extinction ruling, w2-d4 family): the

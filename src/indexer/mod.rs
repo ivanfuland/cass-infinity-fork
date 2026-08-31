@@ -11,30 +11,22 @@ pub mod semantic_progress;
 pub(crate) mod staging_reclaim;
 
 use self::quarantine::{QuarantineKey, QuarantineState};
-use self::refresh_ledger::{
-    EquivalenceArtifacts as RefreshEquivalenceArtifacts, PhaseRecord, RefreshLedger,
-    RefreshLedgerEvidence, RefreshPhase,
-};
 
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-#[cfg(target_os = "linux")]
-use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Seek, Write};
-#[cfg(target_os = "linux")]
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::process::Command;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, never, select};
+use crossbeam_channel::{Receiver, Sender, bounded};
 use frankensearch::index::VectorIndex as FsVectorIndex;
 use crate::storage::api::StorageError;
 use crate::storage::api::Tx as FrankenTransaction;
@@ -42,8 +34,6 @@ type ParamValue = crate::storage::api::Value;
 use fs2::FileExt;
 use notify::event::{AccessKind, AccessMode, MetadataKind, ModifyKind};
 use notify::{RecursiveMode, Watcher, recommended_watcher};
-use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
-use tempfile::Builder as TempDirBuilder;
 
 use crate::connectors::NormalizedConversation;
 #[cfg(test)]
@@ -521,31 +511,6 @@ fn source_file_has_active_advisory_lock(path: &Path) -> bool {
             error.kind(),
             std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
         ),
-    }
-}
-
-#[cfg(target_os = "linux")]
-mod linux_publish_swap {
-    use std::ffi::{c_char, c_int, c_uint};
-
-    pub const AT_FDCWD: c_int = -100;
-    pub const RENAME_EXCHANGE: c_uint = 0x2;
-    /// Linux's `<errno.h>` definition (`EINVAL = 22`). We don't depend on
-    /// `libc` directly — `errno.h` has guaranteed this value on every
-    /// glibc/musl architecture since the kernel was renumbered, and
-    /// pulling in `libc` for one constant inflates compile time.
-    /// Cross-checked against `man 2 renameat2` (returns EINVAL when the
-    /// underlying filesystem doesn't support `RENAME_EXCHANGE`).
-    pub const EINVAL: i32 = 22;
-
-    unsafe extern "C" {
-        pub fn renameat2(
-            olddirfd: c_int,
-            oldpath: *const c_char,
-            newdirfd: c_int,
-            newpath: *const c_char,
-            flags: c_uint,
-        ) -> c_int;
     }
 }
 
@@ -2054,27 +2019,6 @@ fn reset_progress_to_idle(progress: Option<&Arc<IndexingProgress>>) {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct LexicalRebuildPipelineSinkRuntimeSnapshot {
-    queue_depth: usize,
-    pending_batch_conversations: usize,
-    pending_batch_message_bytes: usize,
-}
-
-impl LexicalRebuildPipelineSinkRuntimeSnapshot {
-    fn new(
-        queue_depth: usize,
-        pending_batch_conversations: usize,
-        pending_batch_message_bytes: usize,
-    ) -> Self {
-        Self {
-            queue_depth,
-            pending_batch_conversations,
-            pending_batch_message_bytes,
-        }
-    }
-}
-
 fn exact_total_counts_from_progress(
     progress: Option<&Arc<IndexingProgress>>,
 ) -> Option<(usize, usize)> {
@@ -2403,10 +2347,6 @@ const CASS_SCHEMA_VERSION: &str = "v8";
 pub struct SearchableIndexSummary {
     pub docs: usize,
     pub segments: usize,
-}
-
-fn schema_hash_matches(stored: &str) -> bool {
-    stored == LEXICAL_REBUILD_SCHEMA_HASH
 }
 
 pub fn expected_index_dir(base: &Path) -> PathBuf {
@@ -3833,34 +3773,6 @@ impl LexicalRebuildConversationPacket {
     }
 }
 
-/// Streaming equivalence proof for the authoritative lexical rebuild path
-/// (bead ibuuh.29).
-///
-/// The test module shipped a sibling struct populated from a fully materialized
-/// packet vector so the legacy OFFSET replay and the new keyset-batched replay
-/// could be diffed for equivalence on a fixture. The production rebuild cannot
-/// buffer every packet, so this struct is the streaming-consumed form of the
-/// same proof: document count, a packet-and-doc manifest fingerprint hashed in
-/// commit order, and per-probe golden-query digests. Because both the test
-/// helper and the production consumer now funnel through
-/// [`LexicalRebuildEquivalenceAccumulator`], runtime evidence is diffable
-/// against the fixture-derived ledger without materializing the whole corpus.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct LexicalRebuildEquivalenceEvidence {
-    pub document_count: u64,
-    pub manifest_fingerprint: String,
-    pub golden_query_digest: String,
-    pub golden_query_hit_counts: Vec<LexicalRebuildEquivalenceGoldenHit>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct LexicalRebuildEquivalenceGoldenHit {
-    pub probe: String,
-    pub hit_count: u64,
-}
-
-
-
 fn assign_lexical_rebuild_flow_reservation_bytes(
     packets: &mut [LexicalRebuildConversationPacket],
     reserved_bytes: usize,
@@ -4029,14 +3941,6 @@ pub(crate) struct LexicalRebuildPipelineRuntimeSnapshot {
 }
 
 impl LexicalRebuildPipelineRuntimeSnapshot {
-    fn checkpoint_snapshot(&self) -> Self {
-        let mut snapshot = self.clone();
-        snapshot.producer_budget_waiter_count = 0;
-        snapshot.producer_state = String::new();
-        snapshot.reservation_next_sequence = 0;
-        snapshot
-    }
-
     fn is_observed(&self) -> bool {
         self.updated_at_ms > 0
             || self.queue_depth > 0
@@ -4090,19 +3994,6 @@ enum LexicalRebuildExecutionMode {
     #[default]
     SharedWriter,
     StagedShardBuild,
-}
-
-impl LexicalRebuildExecutionMode {
-    fn requires_restart_from_zero_on_resume(self) -> bool {
-        matches!(self, Self::StagedShardBuild)
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::SharedWriter => "shared_writer",
-            Self::StagedShardBuild => "staged_shard_build",
-        }
-    }
 }
 
 fn lexical_rebuild_execution_mode_is_default(mode: &LexicalRebuildExecutionMode) -> bool {
@@ -4202,10 +4093,6 @@ impl LexicalRebuildState {
     fn clear_pending(&mut self) {
         self.pending = None;
         self.updated_at_ms = FrankenStorage::now_millis();
-    }
-
-    fn set_runtime(&mut self, runtime: &LexicalRebuildPipelineRuntimeSnapshot) {
-        self.runtime = runtime.checkpoint_snapshot();
     }
 
     fn clear_runtime(&mut self) {
@@ -4392,24 +4279,6 @@ fn lexical_rebuild_commit_intervals_for_state(
     )
 }
 
-fn lexical_rebuild_progress_heartbeat_interval_conversations() -> usize {
-    dotenvy::var("CASS_TANTIVY_REBUILD_PROGRESS_HEARTBEAT_EVERY_CONVERSATIONS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(2_000)
-}
-
-fn lexical_rebuild_progress_heartbeat_interval() -> Duration {
-    Duration::from_millis(
-        dotenvy::var("CASS_TANTIVY_REBUILD_PROGRESS_HEARTBEAT_EVERY_MS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(10_000),
-    )
-}
-
 fn lexical_rebuild_batch_fetch_conversation_limit(page_size: i64) -> usize {
     // Each chunk within a page is the unit of SQL message-fetch batching and
     // rebuild-worker feeding. The historical fixed default (512 conversations)
@@ -4522,27 +4391,6 @@ fn lexical_rebuild_worker_parallelism() -> usize {
         })
 }
 
-fn build_lexical_rebuild_worker_pool() -> Result<Option<ThreadPool>> {
-    // Apply the responsiveness governor to the pool size so we don't spawn
-    // more worker threads than the host can comfortably service. This affects
-    // only the pool itself; each downstream consumer (page-prep, shard
-    // builders, mergers) still applies its own governor clamp on top of its
-    // own hard cap, so you cannot accidentally exceed the pool size.
-    let raw = lexical_rebuild_worker_parallelism();
-    let parallelism = responsiveness::effective_worker_count(raw).max(1);
-    if parallelism <= 1 {
-        return Ok(None);
-    }
-
-    ThreadPoolBuilder::new()
-        .num_threads(parallelism)
-        .thread_name(|idx| format!("cass-lexical-rebuild-{idx}"))
-        .build()
-        .map(Some)
-        .map_err(anyhow::Error::new)
-        .with_context(|| format!("building lexical rebuild worker pool with {parallelism} threads"))
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct LexicalRebuildPipelineSettingsSnapshot {
     pub workers: usize,
@@ -4642,18 +4490,6 @@ fn parse_lexical_rebuild_loadavg_1m_milli(contents: &str) -> Option<u32> {
         return None;
     }
     Some(milli as u32)
-}
-
-#[cfg(target_os = "linux")]
-fn lexical_rebuild_host_loadavg_1m_milli() -> Option<u32> {
-    fs::read_to_string("/proc/loadavg")
-        .ok()
-        .and_then(|contents| parse_lexical_rebuild_loadavg_1m_milli(&contents))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn lexical_rebuild_host_loadavg_1m_milli() -> Option<u32> {
-    None
 }
 
 fn lexical_rebuild_default_controller_loadavg_high_watermark_1m_milli_for_available_and_reserved(
@@ -4808,27 +4644,6 @@ fn lexical_rebuild_pipeline_settings_snapshot_inner(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LexicalRebuildResponsivenessState {
-    Startup,
-    Steady,
-    PressureLimited,
-    PinnedSteady,
-    PinnedConservative,
-}
-
-impl LexicalRebuildResponsivenessState {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Startup => "startup",
-            Self::Steady => "steady",
-            Self::PressureLimited => "pressure_limited",
-            Self::PinnedSteady => "pinned_steady",
-            Self::PinnedConservative => "pinned_conservative",
-        }
-    }
-}
-
 /// Opt-in high-detail tracing for the lexical-rebuild flow-control path
 /// (#288). When truthy, the producer/worker park-site transitions, every
 /// budget-generation bump, and the periodic bounded-condvar-wait probes are
@@ -4842,159 +4657,6 @@ fn lexical_pipeline_trace_enabled() -> bool {
 /// blocked predicate is logged and the wait re-arms. Pure observability: the
 /// waiting thread always continues waiting after logging (#288).
 const LEXICAL_PIPELINE_BLOCKED_WAIT_LOG_INTERVAL: Duration = Duration::from_secs(5);
-
-/// Current blocking site of the lexical-rebuild page-production stage
-/// (producer thread + ordered page-prep workers), published through an
-/// `AtomicU8` so the stall watchdog can report *where* the pipeline is
-/// parked instead of only the cumulative after-success wait counters
-/// (#288: `producer_budget_wait_count` kept growing while the controller
-/// reported `steady_budget_with_headroom` and every thread was parked —
-/// the payload never said which condvar held the pipeline).
-///
-/// Updated on entry to each blocking section and reset to `Idle` when the
-/// section completes. Multiple threads share the cell (last writer wins);
-/// in the all-parked starvation case there are no further writers, so the
-/// final value identifies a genuine park site.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-enum LexicalRebuildProducerParkSite {
-    Idle = 0,
-    ListingDb = 1,
-    WaitingResult = 2,
-    WaitingTurn = 3,
-    WaitingBudget = 4,
-    HandoffSend = 5,
-}
-
-impl LexicalRebuildProducerParkSite {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Idle => "idle",
-            Self::ListingDb => "listing_db",
-            Self::WaitingResult => "waiting_result",
-            Self::WaitingTurn => "waiting_turn",
-            Self::WaitingBudget => "waiting_budget",
-            Self::HandoffSend => "handoff_send",
-        }
-    }
-
-    fn from_u8(value: u8) -> Self {
-        match value {
-            1 => Self::ListingDb,
-            2 => Self::WaitingResult,
-            3 => Self::WaitingTurn,
-            4 => Self::WaitingBudget,
-            5 => Self::HandoffSend,
-            _ => Self::Idle,
-        }
-    }
-
-    fn label_for(value: u8) -> &'static str {
-        Self::from_u8(value).as_str()
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct LexicalRebuildProducerTelemetrySnapshot {
-    page_prep_workers: usize,
-    active_page_prep_jobs: usize,
-    ordered_buffered_pages: usize,
-    budget_wait_count: usize,
-    budget_wait_ms: usize,
-    handoff_wait_count: usize,
-    handoff_wait_ms: usize,
-    producer_state: u8,
-    reservation_next_sequence: u64,
-}
-
-#[derive(Debug, Default)]
-struct LexicalRebuildProducerTelemetry {
-    page_prep_workers: AtomicUsize,
-    active_page_prep_jobs: AtomicUsize,
-    ordered_buffered_pages: AtomicUsize,
-    budget_wait_count: AtomicUsize,
-    budget_wait_ms: AtomicUsize,
-    handoff_wait_count: AtomicUsize,
-    handoff_wait_ms: AtomicUsize,
-    /// See [`LexicalRebuildProducerParkSite`].
-    producer_state: AtomicU8,
-    /// Mirror of `LexicalRebuildReservationOrder::next_sequence`, refreshed
-    /// around each ordered budget acquisition so the stall payload can show
-    /// which page sequence the reservation barrier is waiting to admit.
-    reservation_next_sequence: AtomicU64,
-}
-
-impl LexicalRebuildProducerTelemetry {
-    fn saturating_add(counter: &AtomicUsize, value: usize) {
-        let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            Some(current.saturating_add(value))
-        });
-    }
-
-    fn duration_millis(duration: Duration) -> usize {
-        if duration.is_zero() {
-            return 0;
-        }
-        usize::try_from(duration.as_millis())
-            .unwrap_or(usize::MAX)
-            .max(1)
-    }
-
-    fn snapshot(&self) -> LexicalRebuildProducerTelemetrySnapshot {
-        LexicalRebuildProducerTelemetrySnapshot {
-            page_prep_workers: self.page_prep_workers.load(Ordering::Relaxed),
-            active_page_prep_jobs: self.active_page_prep_jobs.load(Ordering::Relaxed),
-            ordered_buffered_pages: self.ordered_buffered_pages.load(Ordering::Relaxed),
-            budget_wait_count: self.budget_wait_count.load(Ordering::Relaxed),
-            budget_wait_ms: self.budget_wait_ms.load(Ordering::Relaxed),
-            handoff_wait_count: self.handoff_wait_count.load(Ordering::Relaxed),
-            handoff_wait_ms: self.handoff_wait_ms.load(Ordering::Relaxed),
-            producer_state: self.producer_state.load(Ordering::Relaxed),
-            reservation_next_sequence: self.reservation_next_sequence.load(Ordering::Relaxed),
-        }
-    }
-
-    fn set_producer_state(&self, state: LexicalRebuildProducerParkSite) {
-        let previous = self.producer_state.swap(state as u8, Ordering::Relaxed);
-        if previous != state as u8 && lexical_pipeline_trace_enabled() {
-            tracing::info!(
-                from = LexicalRebuildProducerParkSite::label_for(previous),
-                to = state.as_str(),
-                "CASS_PIPELINE_TRACE lexical rebuild page-production park-site transition"
-            );
-        }
-    }
-
-    fn record_reservation_next_sequence(&self, next_sequence: u64) {
-        self.reservation_next_sequence
-            .store(next_sequence, Ordering::Relaxed);
-    }
-
-    fn record(
-        &self,
-        page_prep_workers: usize,
-        active_page_prep_jobs: usize,
-        ordered_buffered_pages: usize,
-    ) {
-        self.page_prep_workers
-            .store(page_prep_workers, Ordering::Relaxed);
-        self.active_page_prep_jobs
-            .store(active_page_prep_jobs, Ordering::Relaxed);
-        self.ordered_buffered_pages
-            .store(ordered_buffered_pages, Ordering::Relaxed);
-    }
-
-    fn record_budget_wait(&self, duration: Duration) {
-        Self::saturating_add(&self.budget_wait_count, 1);
-        Self::saturating_add(&self.budget_wait_ms, Self::duration_millis(duration));
-    }
-
-    fn record_handoff_wait(&self, duration: Duration) {
-        Self::saturating_add(&self.handoff_wait_count, 1);
-        Self::saturating_add(&self.handoff_wait_ms, Self::duration_millis(duration));
-    }
-}
-
 
 fn lexical_rebuild_pipeline_channel_size() -> usize {
     dotenvy::var("CASS_TANTIVY_REBUILD_PIPELINE_CHANNEL_SIZE")
@@ -5109,10 +4771,6 @@ fn lexical_rebuild_content_fingerprint_value(
     max_message_id: i64,
 ) -> String {
     format!("content-v1:{total_conversations}:{max_conversation_id}:{max_message_id}")
-}
-
-fn lexical_rebuild_deferred_content_fingerprint(total_conversations: usize) -> String {
-    format!("content-pending-v1:{total_conversations}")
 }
 
 fn lexical_rebuild_content_fingerprint(
@@ -5450,18 +5108,6 @@ fn expected_live_lexical_doc_count(storage: &FrankenStorage) -> Result<usize> {
     Ok(expected_docs)
 }
 
-fn max_conversation_id_exact(storage: &FrankenStorage) -> Result<Option<i64>> {
-    let max_conversation_id: i64 = storage
-        .raw()
-        .query_row_map(
-            "SELECT COALESCE(MAX(id), 0) FROM conversations",
-            &[] as &[ParamValue],
-            |row| row.get_typed(0),
-        )
-        .context("computing lexical rebuild max conversation id")?;
-    Ok((max_conversation_id > 0).then_some(max_conversation_id))
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct IncrementalCanonicalLexicalRepairPlan {
     canonical_messages: usize,
@@ -5496,22 +5142,6 @@ struct IncrementalCanonicalLexicalRepairContext {
     /// context only: SQLite remains authoritative, and a fresh sparse live-doc
     /// observation must still repair the derived lexical index.
     published_index_validated_for_current_data: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LexicalRebuildOutcome {
-    pub indexed_docs: usize,
-    pub observed_messages: Option<usize>,
-    pub exact_checkpoint_persisted: bool,
-    /// Equivalence proof emitted by the authoritative streaming rebuild (ibuuh.29).
-    /// `None` for short-circuit paths that did not re-ingest packets (e.g., a
-    /// checkpoint that was already complete when the rebuild entered).
-    pub equivalence: Option<LexicalRebuildEquivalenceEvidence>,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct LexicalRebuildStartupOptions {
-    defer_initial_content_fingerprint: bool,
 }
 
 fn should_evaluate_incremental_canonical_lexical_repair(
@@ -5861,38 +5491,6 @@ fn full_rebuild_requires_historical_restart(
     Ok(false)
 }
 
-fn lexical_rebuild_db_state_with_total_conversations(
-    storage: &FrankenStorage,
-    db_path: &Path,
-    total_conversations: usize,
-) -> Result<LexicalRebuildDbState> {
-    let prep_profile = std::env::var_os("CASS_PREP_PROFILE").is_some();
-    let normalize_started = Instant::now();
-    let normalized_db_path = crate::normalize_path_identity(db_path)
-        .to_string_lossy()
-        .into_owned();
-    if prep_profile {
-        eprintln!(
-            "CASS_PREP_PROFILE step=normalize_db_path step_ms={}",
-            normalize_started.elapsed().as_millis()
-        );
-    }
-    let fingerprint_started = Instant::now();
-    let storage_fingerprint = lexical_rebuild_content_fingerprint(storage, total_conversations)?;
-    if prep_profile {
-        eprintln!(
-            "CASS_PREP_PROFILE step=compute_storage_fingerprint step_ms={}",
-            fingerprint_started.elapsed().as_millis()
-        );
-    }
-    Ok(lexical_rebuild_db_state_from_storage_fingerprint(
-        &normalized_db_path,
-        total_conversations,
-        0,
-        storage_fingerprint,
-    ))
-}
-
 fn lexical_rebuild_db_state_from_storage_fingerprint(
     normalized_db_path: &str,
     total_conversations: usize,
@@ -5924,28 +5522,6 @@ fn lexical_rebuild_db_state_with_exact_totals(
     ))
 }
 
-fn deferred_lexical_rebuild_db_state(
-    db_path: &Path,
-    total_conversations: usize,
-) -> LexicalRebuildDbState {
-    LexicalRebuildDbState {
-        db_path: crate::normalize_path_identity(db_path)
-            .to_string_lossy()
-            .into_owned(),
-        total_conversations,
-        total_messages: 0,
-        storage_fingerprint: lexical_rebuild_deferred_content_fingerprint(total_conversations),
-    }
-}
-
-#[cfg(test)]
-fn lexical_rebuild_db_state(
-    storage: &FrankenStorage,
-    db_path: &Path,
-) -> Result<LexicalRebuildDbState> {
-    let total_conversations = count_total_conversations_exact(storage)?;
-    lexical_rebuild_db_state_with_total_conversations(storage, db_path, total_conversations)
-}
 const LEXICAL_SHARD_PLAN_VERSION: u8 = 1;
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -6001,10 +5577,6 @@ pub(crate) struct LexicalShardPlan {
 }
 
 const LEXICAL_SHARD_UNKNOWN_MESSAGE_COUNT: usize = usize::MAX;
-
-fn lexical_shard_message_count_is_known(message_count: usize) -> bool {
-    message_count != LEXICAL_SHARD_UNKNOWN_MESSAGE_COUNT
-}
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn plan_lexical_rebuild_shards(
@@ -6267,21 +5839,6 @@ fn lexical_rebuild_staged_shard_max_message_bytes(
         .max(1)
 }
 
-fn lexical_rebuild_pending_shard_build_max_message_bytes(
-    settings: &LexicalRebuildPipelineSettingsSnapshot,
-) -> usize {
-    dotenvy::var("CASS_TANTIVY_REBUILD_PENDING_SHARD_BUILD_MAX_MESSAGE_BYTES")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or_else(|| {
-            settings
-                .pipeline_max_message_bytes_in_flight
-                .max(lexical_rebuild_staged_shard_max_message_bytes(settings))
-        })
-        .max(1)
-}
-
 fn lexical_rebuild_pending_shard_build_max_jobs(
     settings: &LexicalRebuildPipelineSettingsSnapshot,
 ) -> usize {
@@ -6478,157 +6035,16 @@ fn plan_lexical_rebuild_shards_from_storage_with_settings(
     Ok(plan)
 }
 
-#[derive(Debug, Clone)]
-struct LexicalRebuildPlannedShardCursor {
-    shards: Vec<LexicalShardPlanShard>,
-    next_shard_index: usize,
-}
-
-impl LexicalRebuildPlannedShardCursor {
-    fn for_resume(
-        mut shards: Vec<LexicalShardPlanShard>,
-        resume_after_conversation_id: Option<i64>,
-    ) -> Option<Self> {
-        if shards.is_empty() {
-            return None;
-        }
-        shards.sort_by_key(|shard| shard.shard_index);
-        let resume_after_conversation_id = resume_after_conversation_id.unwrap_or(0);
-        let next_shard_index = shards
-            .iter()
-            .position(|shard| shard.last_conversation_id > resume_after_conversation_id)
-            .unwrap_or(shards.len());
-        if next_shard_index >= shards.len() {
-            None
-        } else {
-            Some(Self {
-                shards,
-                next_shard_index,
-            })
-        }
-    }
-
-    fn current(&self) -> Option<&LexicalShardPlanShard> {
-        self.shards.get(self.next_shard_index)
-    }
-
-    fn skip_completed(&mut self, last_conversation_id: i64) {
-        while let Some(shard) = self.current() {
-            if last_conversation_id >= shard.last_conversation_id {
-                self.advance();
-            } else {
-                break;
-            }
-        }
-    }
-
-    fn advance(&mut self) {
-        self.next_shard_index = self.next_shard_index.saturating_add(1);
-    }
-}
-
-
-const LEXICAL_REBUILD_STAGED_SHARD_BUILDER_MEMORY_SLOT_BYTES: u64 = 32 * 1024 * 1024 * 1024;
-const LEXICAL_REBUILD_STAGED_SHARD_BUILDER_MEMORY_BUDGET_NUMERATOR: u64 = 2;
-const LEXICAL_REBUILD_STAGED_SHARD_BUILDER_MEMORY_BUDGET_DENOMINATOR: u64 = 3;
-const LEXICAL_REBUILD_STAGED_SHARD_BUILD_RESERVE_FRACTION: u64 = 8;
-const LEXICAL_REBUILD_STAGED_SHARD_BUILD_RESERVE_FALLBACK_BYTES: u64 = 16 * 1024 * 1024 * 1024;
-const LEXICAL_REBUILD_STAGED_SHARD_BUILD_RESERVE_FLOOR_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-const LEXICAL_REBUILD_STAGED_SHARD_BUILD_RESERVE_CEILING_BYTES: u64 = 32 * 1024 * 1024 * 1024;
-const LEXICAL_REBUILD_STAGED_SHARD_BUILD_EMERGENCY_RESERVE_FRACTION: u64 = 32;
-const LEXICAL_REBUILD_STAGED_SHARD_BUILD_EMERGENCY_FALLBACK_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-const LEXICAL_REBUILD_STAGED_SHARD_BUILD_EMERGENCY_FLOOR_BYTES: u64 = 1024 * 1024 * 1024;
-const LEXICAL_REBUILD_STAGED_SHARD_BUILD_EMERGENCY_CEILING_BYTES: u64 = 8 * 1024 * 1024 * 1024;
-const LEXICAL_REBUILD_STAGED_SHARD_BUILD_AMPLIFICATION_FLOOR_MILLI: u64 = 8_000;
-const LEXICAL_REBUILD_STAGED_SHARD_BUILD_AMPLIFICATION_HEADROOM_MILLI: u64 = 1_500;
-const LEXICAL_REBUILD_STAGED_SHARD_BUILD_MIN_ESTIMATED_BYTES: u64 = 512 * 1024 * 1024;
-
-fn lexical_rebuild_default_staged_shard_builder_parallelism_for_workers_and_memory(
-    workers: usize,
-    available_memory_bytes: Option<u64>,
-) -> usize {
-    let cpu_ceiling = workers.clamp(1, 8);
-    let Some(available_memory_bytes) = available_memory_bytes else {
-        return cpu_ceiling;
-    };
-    let memory_budget = available_memory_bytes
-        .saturating_mul(LEXICAL_REBUILD_STAGED_SHARD_BUILDER_MEMORY_BUDGET_NUMERATOR)
-        / LEXICAL_REBUILD_STAGED_SHARD_BUILDER_MEMORY_BUDGET_DENOMINATOR.max(1);
-    let memory_ceiling = usize::try_from(
-        memory_budget / LEXICAL_REBUILD_STAGED_SHARD_BUILDER_MEMORY_SLOT_BYTES.max(1),
-    )
-    .unwrap_or(usize::MAX)
-    .clamp(1, 8);
-    cpu_ceiling.min(memory_ceiling).max(1)
-}
-
-fn lexical_rebuild_default_staged_shard_builder_parallelism_for_workers(workers: usize) -> usize {
-    lexical_rebuild_default_staged_shard_builder_parallelism_for_workers_and_memory(
-        workers,
-        responsiveness::available_memory_bytes(),
-    )
-}
-
-fn usize_from_u64_saturating(value: u64) -> usize {
-    usize::try_from(value).unwrap_or(usize::MAX)
-}
-
-fn lexical_rebuild_default_staged_shard_build_memory_reserve_bytes_for_total_memory(
-    total_memory_bytes: Option<u64>,
-) -> usize {
-    let reserve = total_memory_bytes
-        .map(|total| total / LEXICAL_REBUILD_STAGED_SHARD_BUILD_RESERVE_FRACTION.max(1))
-        .unwrap_or(LEXICAL_REBUILD_STAGED_SHARD_BUILD_RESERVE_FALLBACK_BYTES)
-        .clamp(
-            LEXICAL_REBUILD_STAGED_SHARD_BUILD_RESERVE_FLOOR_BYTES,
-            LEXICAL_REBUILD_STAGED_SHARD_BUILD_RESERVE_CEILING_BYTES,
-        );
-    usize_from_u64_saturating(reserve)
-}
-
-fn lexical_rebuild_staged_shard_build_memory_reserve_bytes() -> usize {
-    dotenvy::var("CASS_TANTIVY_REBUILD_STAGED_SHARD_BUILD_MEMORY_RESERVE_BYTES")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or_else(|| {
-            lexical_rebuild_default_staged_shard_build_memory_reserve_bytes_for_total_memory(
-                responsiveness::total_memory_bytes(),
-            )
-        })
-}
-
-fn lexical_rebuild_default_staged_shard_build_emergency_memory_reserve_bytes_for_total_memory(
-    total_memory_bytes: Option<u64>,
-) -> usize {
-    let reserve = total_memory_bytes
-        .map(|total| total / LEXICAL_REBUILD_STAGED_SHARD_BUILD_EMERGENCY_RESERVE_FRACTION.max(1))
-        .unwrap_or(LEXICAL_REBUILD_STAGED_SHARD_BUILD_EMERGENCY_FALLBACK_BYTES)
-        .clamp(
-            LEXICAL_REBUILD_STAGED_SHARD_BUILD_EMERGENCY_FLOOR_BYTES,
-            LEXICAL_REBUILD_STAGED_SHARD_BUILD_EMERGENCY_CEILING_BYTES,
-        );
-    usize_from_u64_saturating(reserve)
-}
-
-fn lexical_rebuild_staged_shard_build_emergency_memory_reserve_bytes() -> usize {
-    dotenvy::var("CASS_TANTIVY_REBUILD_STAGED_SHARD_BUILD_EMERGENCY_MEMORY_RESERVE_BYTES")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or_else(|| {
-            lexical_rebuild_default_staged_shard_build_emergency_memory_reserve_bytes_for_total_memory(
-                responsiveness::total_memory_bytes(),
-            )
-        })
-}
-
 // W2-6 Task丙①: CASS_TANTIVY_REBUILD_STAGED_SHARD_BUILDERS's reader
-// (`lexical_rebuild_staged_shard_builder_parallelism[_configured]`) is
+// (`lexical_rebuild_staged_shard_builder_parallelism[_configured]`) was
 // retired -- its only production consumers were an advisory-only diagnostic
 // (topology_budget's `from_current_process`, which never feeds back into any
-// scheduler) and the now-fully-dead shard-build planner below. The snapshot
-// builder now hardcodes `staged_shard_builders: 0`.
+// scheduler) and the shard-build planner itself. The snapshot builder now
+// hardcodes `staged_shard_builders: 0`. W2-6 Task丙③ (see
+// W2_ARTIFACTS/w2-6-deleted-tests.md) then deleted the fully-dead planner
+// (`lexical_rebuild_default_staged_shard_builder_parallelism_for_workers[_and_memory]`
+// + the sibling `..._memory_reserve_bytes[_emergency]` family and their
+// backing constants) that used to sit here.
 
 fn lexical_rebuild_default_staged_merge_worker_parallelism_for_workers(workers: usize) -> usize {
     workers
@@ -7383,131 +6799,6 @@ impl StreamingByteLimiter {
         state.closed = true;
         self.cv.notify_all();
     }
-}
-
-#[derive(Debug)]
-struct LexicalRebuildReservationOrderState {
-    next_sequence: u64,
-    closed: bool,
-}
-
-#[derive(Debug)]
-struct LexicalRebuildReservationOrder {
-    state: Mutex<LexicalRebuildReservationOrderState>,
-    cv: Condvar,
-}
-
-impl LexicalRebuildReservationOrder {
-    fn new() -> Self {
-        Self {
-            state: Mutex::new(LexicalRebuildReservationOrderState {
-                next_sequence: 0,
-                closed: false,
-            }),
-            cv: Condvar::new(),
-        }
-    }
-
-    fn wait_for_turn(&self, sequence: u64) -> Result<()> {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let wait_started = Instant::now();
-        loop {
-            if state.closed {
-                return Err(anyhow::anyhow!(
-                    "lexical rebuild reservation order closed while waiting for sequence {}",
-                    sequence
-                ));
-            }
-            if sequence < state.next_sequence {
-                return Err(anyhow::anyhow!(
-                    "lexical rebuild page sequence {} tried to reserve after sequence {}",
-                    sequence,
-                    state.next_sequence
-                ));
-            }
-            if sequence == state.next_sequence {
-                return Ok(());
-            }
-            // #288: bounded wait so a parked pipeline periodically logs the
-            // blocked predicate instead of vanishing into an unbounded
-            // condvar park. Pure observability — the loop always re-arms.
-            let (next_state, timeout_result) = self
-                .cv
-                .wait_timeout(state, LEXICAL_PIPELINE_BLOCKED_WAIT_LOG_INTERVAL)
-                .unwrap_or_else(|e| e.into_inner());
-            state = next_state;
-            if timeout_result.timed_out() {
-                let waited_ms = wait_started.elapsed().as_millis() as u64;
-                if lexical_pipeline_trace_enabled() {
-                    tracing::info!(
-                        sequence,
-                        holds_turn = state.next_sequence,
-                        waited_ms,
-                        "CASS_PIPELINE_TRACE lexical rebuild page still parked waiting for ordered reservation turn"
-                    );
-                } else {
-                    tracing::debug!(
-                        sequence,
-                        holds_turn = state.next_sequence,
-                        waited_ms,
-                        "lexical rebuild page still parked waiting for ordered reservation turn"
-                    );
-                }
-            }
-        }
-    }
-
-    fn next_sequence(&self) -> u64 {
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .next_sequence
-    }
-
-    fn finish_turn(&self, sequence: u64) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.next_sequence == sequence {
-            state.next_sequence = state.next_sequence.saturating_add(1);
-        }
-        self.cv.notify_all();
-    }
-
-    fn close(&self) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.closed = true;
-        self.cv.notify_all();
-    }
-}
-
-fn acquire_ordered_lexical_rebuild_page_budget(
-    reservation_order: &LexicalRebuildReservationOrder,
-    flow_limiter: &StreamingByteLimiter,
-    producer_telemetry: &LexicalRebuildProducerTelemetry,
-    sequence: u64,
-    page_message_bytes: usize,
-) -> Result<(usize, Duration, bool)> {
-    producer_telemetry.set_producer_state(LexicalRebuildProducerParkSite::WaitingTurn);
-    producer_telemetry.record_reservation_next_sequence(reservation_order.next_sequence());
-    let turn = reservation_order.wait_for_turn(sequence);
-    producer_telemetry.record_reservation_next_sequence(reservation_order.next_sequence());
-    if let Err(err) = turn {
-        producer_telemetry.set_producer_state(LexicalRebuildProducerParkSite::Idle);
-        return Err(err);
-    }
-    producer_telemetry.set_producer_state(LexicalRebuildProducerParkSite::WaitingBudget);
-    let acquired = match flow_limiter.acquire_with_wait(page_message_bytes) {
-        Ok(acquired) => {
-            reservation_order.finish_turn(sequence);
-            producer_telemetry.record_reservation_next_sequence(reservation_order.next_sequence());
-            Ok(acquired)
-        }
-        Err(err) => {
-            reservation_order.close();
-            Err(err)
-        }
-    };
-    producer_telemetry.set_producer_state(LexicalRebuildProducerParkSite::Idle);
-    acquired
 }
 
 fn conversation_batch_footprint(conv: &NormalizedConversation) -> (usize, usize) {
@@ -17145,8 +16436,6 @@ pub mod persist {
     use std::ops::Range;
     use std::path::Path;
     use std::time::Duration;
-    #[cfg(test)]
-    use std::time::Instant;
 
     use anyhow::{Context, Result, anyhow};
     use crate::storage::api::StorageError;
@@ -17158,7 +16447,6 @@ pub mod persist {
     use crate::indexer::semantic::{
         EmbeddingInput, packet_embedding_inputs_from_storage_for_message_ids,
     };
-    use crate::model::conversation_packet::{ConversationPacket, ConversationPacketProvenance};
     use crate::model::types::{
         Agent, AgentKind, Conversation, Message, MessageRole, Snippet, role_from_str,
     };
@@ -17167,56 +16455,6 @@ pub mod persist {
     use crate::storage::sqlite::{
         FrankenStorage, IndexingCache, InsertOutcome, anyhow_error_into_storage_error,
     };
-
-    /// `coding_agent_session_search-5b9p0` (ibuuh.32 follow-up):
-    /// builds a [`ConversationPacket`] for the lexical sink AND the
-    /// positional message-index slice that maps `outcome.inserted_indices`
-    /// (which are message *idx* values, not array positions) onto the
-    /// packet's `payload.messages` Vec. The legacy
-    /// `add_messages_with_conversation_id` filter walks `conv.messages`
-    /// twice; this helper walks once and yields a slice of positional
-    /// indices that `TantivyIndex::add_messages_from_packet` can use
-    /// directly.
-    fn lexical_packet_for_persist(conv: &NormalizedConversation) -> ConversationPacket {
-        // #291 Gap A: the incremental/`--watch` inline ingest path materializes the
-        // whole conversation here, so a heavy (image/base64) conversation would
-        // OOM→bisect→quarantine exactly as the `--full` rebuild did before #290.
-        // Apply the same per-conversation lexical content cap that
-        // `fetch_messages_for_lexical_rebuild` applies on the `--full` path, so the
-        // watch daemon truncates indexed text instead of quarantining.
-        ConversationPacket::from_normalized_conversation(
-            conv,
-            ConversationPacketProvenance::local(),
-        )
-        .capped_for_inline_lexical_index(
-            crate::storage::sqlite::lexical_max_conversation_content_bytes(),
-        )
-    }
-
-    /// Map `outcome.inserted_indices` (message idx values from
-    /// `InsertOutcome`) onto positional indices into the packet's
-    /// messages Vec. Preserves source ordering so the lexical sink
-    /// emits docs in the same order the legacy filter produced.
-    fn positional_indices_for_inserted(
-        packet: &ConversationPacket,
-        inserted_indices: &[i64],
-    ) -> Vec<usize> {
-        if inserted_indices.is_empty() {
-            return Vec::new();
-        }
-        // Small linear-search lookup is fine here: a single conversation's
-        // inserted_indices is bounded by message count (typically <100,
-        // rarely >>10k) and we only run this once per persist outcome.
-        let inserted: HashSet<i64> = inserted_indices.iter().copied().collect();
-        packet
-            .payload
-            .messages
-            .iter()
-            .enumerate()
-            .filter(|(_, message)| inserted.contains(&message.idx))
-            .map(|(position, _)| position)
-            .collect()
-    }
 
     #[derive(Debug, Clone, Default)]
     pub(super) struct PersistBatchOutcome {
@@ -17249,13 +16487,6 @@ pub mod persist {
                     self.semantic_delta_max_message_id
                         .map_or(max_message_id, |current| current.max(max_message_id)),
                 );
-            }
-        }
-
-        fn record_deferred_lexical_update(&mut self, error: &anyhow::Error) {
-            self.lexical_update_deferred = true;
-            if self.lexical_update_error.is_none() {
-                self.lexical_update_error = Some(error.to_string());
             }
         }
 
@@ -21212,127 +20443,6 @@ pub mod persist {
             let _guard2 = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "false");
             assert!(!begin_concurrent_writes_enabled());
         }
-
-        /// `coding_agent_session_search-5b9p0`: pin the new helper that
-        /// maps `outcome.inserted_indices` (message *idx* values) onto
-        /// positional indices into the packet's messages Vec. The
-        /// legacy filter walked `conv.messages` looking for `m.idx in
-        /// inserted_indices` — the new helper produces the same
-        /// positional set so `add_messages_from_packet` emits the
-        /// same messages the legacy `add_messages_with_conversation_id`
-        /// + filter loop did.
-        ///
-        /// A regression that mis-mapped idx → position would silently
-        /// drop or duplicate documents in the lexical sink; this test
-        /// catches that.
-        #[test]
-        fn positional_indices_for_inserted_maps_idx_values_to_packet_positions() {
-            use serde_json::Value;
-
-            // Fixture: a NormalizedConversation with msg.idx values
-            // that are NOT 0..N (gaps + non-monotonic). The packet
-            // builder preserves source order, so positional indices
-            // are 0..N regardless of idx values.
-            let conv = NormalizedConversation {
-                agent_slug: "codex".to_string(),
-                external_id: Some("idx-mapping".to_string()),
-                title: None,
-                workspace: None,
-                source_path: std::path::PathBuf::from("/tmp/idx-mapping.jsonl"),
-                started_at: Some(1_700_000_000_000),
-                ended_at: Some(1_700_000_010_000),
-                metadata: Value::Null,
-                messages: vec![
-                    NormalizedMessage {
-                        idx: 0,
-                        role: "user".to_string(),
-                        author: None,
-                        created_at: Some(1_700_000_000_000),
-                        content: "first".to_string(),
-                        extra: Value::Null,
-                        snippets: Vec::new(),
-                        invocations: Vec::new(),
-                    },
-                    // Idx jumps to 5: the legacy filter treated this
-                    // as the second message in the iteration order
-                    // because it walks .messages in source order.
-                    NormalizedMessage {
-                        idx: 5,
-                        role: "assistant".to_string(),
-                        author: None,
-                        created_at: Some(1_700_000_001_000),
-                        content: "second".to_string(),
-                        extra: Value::Null,
-                        snippets: Vec::new(),
-                        invocations: Vec::new(),
-                    },
-                    NormalizedMessage {
-                        idx: 7,
-                        role: "tool".to_string(),
-                        author: None,
-                        created_at: Some(1_700_000_002_000),
-                        content: "third".to_string(),
-                        extra: Value::Null,
-                        snippets: Vec::new(),
-                        invocations: Vec::new(),
-                    },
-                ],
-            };
-
-            let packet = lexical_packet_for_persist(&conv);
-            assert_eq!(
-                packet.payload.messages.len(),
-                3,
-                "packet must preserve all conversation messages"
-            );
-
-            // Empty inserted_indices ⇒ empty positional set (no work).
-            let positional_empty = positional_indices_for_inserted(&packet, &[]);
-            assert_eq!(positional_empty, Vec::<usize>::new());
-
-            // Inserted only idx=5 ⇒ position 1.
-            let positional_one = positional_indices_for_inserted(&packet, &[5]);
-            assert_eq!(
-                positional_one,
-                vec![1],
-                "idx=5 must map to packet position 1, got {positional_one:?}"
-            );
-
-            // Inserted idx=0 and idx=7 (non-contiguous) ⇒ positions 0 and 2,
-            // ordered by packet iteration (source order), NOT by inserted_indices order.
-            let positional_two_unordered = positional_indices_for_inserted(&packet, &[7, 0]);
-            assert_eq!(
-                positional_two_unordered,
-                vec![0, 2],
-                "result must be in source order (positions 0, 2) regardless of \
-                 inserted_indices ordering, got {positional_two_unordered:?}"
-            );
-
-            // Inserted_indices that don't match any message idx ⇒ empty.
-            // (E.g. caller passed a stale/wrong list — silently emit nothing
-            // rather than crash, matching the legacy filter behavior.)
-            let positional_unmatched = positional_indices_for_inserted(&packet, &[99, 100]);
-            assert_eq!(
-                positional_unmatched,
-                Vec::<usize>::new(),
-                "unmatched idx values must produce an empty positional set"
-            );
-
-            // All three inserted ⇒ positions [0, 1, 2].
-            let positional_all = positional_indices_for_inserted(&packet, &[0, 5, 7]);
-            assert_eq!(positional_all, vec![0, 1, 2]);
-
-            // Duplicate idx values in inserted_indices ⇒ deduplicated by
-            // packet position (HashSet under the hood). Legacy filter
-            // would also have emitted each message once because
-            // `inserted_indices.contains(&m.idx)` is a contains check.
-            let positional_dupe = positional_indices_for_inserted(&packet, &[5, 5, 5]);
-            assert_eq!(
-                positional_dupe,
-                vec![1],
-                "duplicate idx values must collapse to a single position"
-            );
-        }
     }
 }
 
@@ -24812,41 +23922,6 @@ mod tests {
         );
     }
 
-
-
-    #[test]
-    fn lexical_rebuild_default_staged_shard_builder_parallelism_uses_bounded_builder_farm() {
-        const GIB: u64 = 1024 * 1024 * 1024;
-
-        assert_eq!(
-            lexical_rebuild_default_staged_shard_builder_parallelism_for_workers_and_memory(
-                1, None,
-            ),
-            1
-        );
-        assert_eq!(
-            lexical_rebuild_default_staged_shard_builder_parallelism_for_workers_and_memory(
-                4, None,
-            ),
-            4
-        );
-        assert_eq!(
-            lexical_rebuild_default_staged_shard_builder_parallelism_for_workers_and_memory(
-                8,
-                Some(128 * GIB),
-            ),
-            2,
-            "128 GiB hosts should not default to an 8-shard Tantivy build storm"
-        );
-        assert_eq!(
-            lexical_rebuild_default_staged_shard_builder_parallelism_for_workers_and_memory(
-                32,
-                Some(512 * GIB),
-            ),
-            8
-        );
-    }
-
     #[test]
     fn lexical_rebuild_default_staged_shard_max_message_bytes_scales_with_available_memory() {
         const GIB: u64 = 1024 * 1024 * 1024;
@@ -26520,79 +25595,6 @@ mod tests {
         limiter.release(first);
         waiter.join().unwrap();
     }
-
-    #[test]
-    fn lexical_rebuild_reservation_order_keeps_later_pages_from_spending_budget_first() {
-        let order = Arc::new(LexicalRebuildReservationOrder::new());
-        let limiter = Arc::new(StreamingByteLimiter::new(64));
-        let telemetry = Arc::new(LexicalRebuildProducerTelemetry::default());
-        let (ready_tx, ready_rx) = bounded(1);
-        let (result_tx, result_rx) = bounded(1);
-        let waiter = {
-            let order = order.clone();
-            let limiter = limiter.clone();
-            let telemetry = telemetry.clone();
-            thread::spawn(move || {
-                ready_tx.send(()).unwrap();
-                let (reserved, _, _) = acquire_ordered_lexical_rebuild_page_budget(
-                    &order, &limiter, &telemetry, 1, 64,
-                )
-                .unwrap();
-                result_tx.send(reserved).unwrap();
-            })
-        };
-
-        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert!(
-            result_rx.recv_timeout(Duration::from_millis(50)).is_err(),
-            "sequence 1 must wait even though the byte limiter is empty"
-        );
-        assert_eq!(
-            limiter.bytes_in_flight(),
-            0,
-            "later pages must not reserve bytes before earlier sequences"
-        );
-        let waiting_turn_deadline = Instant::now() + Duration::from_secs(2);
-        while telemetry.snapshot().producer_state
-            != LexicalRebuildProducerParkSite::WaitingTurn as u8
-            && Instant::now() < waiting_turn_deadline
-        {
-            thread::sleep(Duration::from_millis(5));
-        }
-        assert_eq!(
-            telemetry.snapshot().producer_state,
-            LexicalRebuildProducerParkSite::WaitingTurn as u8,
-            "a parked ordered reservation must publish the waiting_turn park site (#288)"
-        );
-
-        let (first, _, _) =
-            acquire_ordered_lexical_rebuild_page_budget(&order, &limiter, &telemetry, 0, 1)
-                .unwrap();
-        assert_eq!(first, 1);
-        assert_eq!(limiter.bytes_in_flight(), 1);
-        assert!(
-            result_rx.recv_timeout(Duration::from_millis(50)).is_err(),
-            "sequence 1 should still respect normal byte capacity after order opens"
-        );
-
-        limiter.release(first);
-        assert_eq!(result_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 64);
-        limiter.release(64);
-        waiter.join().unwrap();
-        assert_eq!(
-            telemetry.snapshot().producer_state,
-            LexicalRebuildProducerParkSite::Idle as u8,
-            "a completed ordered acquisition must settle the park site back to idle"
-        );
-        assert_eq!(
-            telemetry.snapshot().reservation_next_sequence,
-            2,
-            "the reservation barrier mirror must track the next admissible sequence"
-        );
-    }
-
-
-
 
     /// `coding_agent_session_search-wxsy8`: stress-pin the
     /// capacity-shrink-then-grow lost-wakeup race that the fix

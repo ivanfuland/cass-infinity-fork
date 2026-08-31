@@ -590,49 +590,6 @@ pub(crate) struct InspectSearchAssetsInput<'a> {
     pub inspect_semantic: bool,
 }
 
-const LEXICAL_STORAGE_FINGERPRINT_MTIME_TOLERANCE_MS: i64 = 1_000;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ParsedLexicalStorageFingerprint {
-    db_len: u64,
-    db_mtime_ms: i64,
-    wal_len: u64,
-    wal_mtime_ms: i64,
-}
-
-fn parse_lexical_storage_fingerprint(raw: &str) -> Option<ParsedLexicalStorageFingerprint> {
-    let mut parts = raw.split(':');
-    let fingerprint = ParsedLexicalStorageFingerprint {
-        db_len: parts.next()?.parse().ok()?,
-        db_mtime_ms: parts.next()?.parse().ok()?,
-        wal_len: parts.next()?.parse().ok()?,
-        wal_mtime_ms: parts.next()?.parse().ok()?,
-    };
-    if parts.next().is_some() {
-        return None;
-    }
-    Some(fingerprint)
-}
-
-pub(crate) fn lexical_storage_fingerprints_match(current: &str, saved: &str) -> bool {
-    match (
-        parse_lexical_storage_fingerprint(current),
-        parse_lexical_storage_fingerprint(saved),
-    ) {
-        (Some(current), Some(saved)) => {
-            current.db_len == saved.db_len
-                && current.wal_len == saved.wal_len
-                && current.db_mtime_ms.abs_diff(saved.db_mtime_ms)
-                    <= u64::try_from(LEXICAL_STORAGE_FINGERPRINT_MTIME_TOLERANCE_MS)
-                        .unwrap_or(u64::MAX)
-                && current.wal_mtime_ms.abs_diff(saved.wal_mtime_ms)
-                    <= u64::try_from(LEXICAL_STORAGE_FINGERPRINT_MTIME_TOLERANCE_MS)
-                        .unwrap_or(u64::MAX)
-        }
-        _ => current == saved,
-    }
-}
-
 pub(crate) fn inspect_search_assets(
     input: InspectSearchAssetsInput<'_>,
 ) -> Result<SearchAssetSnapshot> {
@@ -2273,32 +2230,6 @@ mod tests {
 
         FileExt::unlock(&owner)?;
         Ok(())
-    }
-
-    #[test]
-    fn lexical_storage_fingerprint_matching_handles_jitter_and_size_drift() {
-        let cases = [
-            (
-                "small mtime settle jitter",
-                "323584:1776310228000:329632:1776310227824",
-                "323584:1776310227832:329632:1776310227824",
-                true,
-            ),
-            (
-                "wal size drift",
-                "323584:1776310228000:329632:1776310227824",
-                "323584:1776310227832:400000:1776310227824",
-                false,
-            ),
-        ];
-
-        for (label, current, saved, expected) in cases {
-            assert_eq!(
-                lexical_storage_fingerprints_match(current, saved),
-                expected,
-                "{label}"
-            );
-        }
     }
 
     #[test]

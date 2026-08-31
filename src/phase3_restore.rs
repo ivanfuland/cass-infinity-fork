@@ -5618,7 +5618,7 @@ mod e5_p30_blob_read_tests {
             let storage = crate::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
             let pricing =
                 crate::storage::sqlite::PricingTable::franken_load(storage.raw()).unwrap();
-            let mut tx = storage.raw().transaction().unwrap();
+            let tx = storage.raw().transaction().unwrap();
             crate::storage::sqlite::franken_replace_conversation_messages_in_tx(
                 &tx,
                 conv_id,
@@ -5829,7 +5829,7 @@ mod e5_p30_blob_read_tests {
             let storage = crate::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
             let pricing =
                 crate::storage::sqlite::PricingTable::franken_load(storage.raw()).unwrap();
-            let mut tx = storage.raw().transaction().unwrap();
+            let tx = storage.raw().transaction().unwrap();
             crate::storage::sqlite::franken_replace_conversation_messages_in_tx(
                 &tx,
                 conv_id,
@@ -6476,7 +6476,7 @@ mod e6_replace_commit_tests {
 
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
         {
-            let mut tx = storage.raw().transaction().unwrap();
+            let tx = storage.raw().transaction().unwrap();
             commit_replace_in_tx(
                 &tx,
                 &ReplaceCommitInput {
@@ -6550,7 +6550,7 @@ mod e6_replace_commit_tests {
 
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
         {
-            let mut tx = storage.raw().transaction().unwrap();
+            let tx = storage.raw().transaction().unwrap();
             commit_replace_in_tx(
                 &tx,
                 &ReplaceCommitInput {
@@ -6637,7 +6637,7 @@ mod e6_replace_commit_tests {
 
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
         let idempotency_key = {
-            let mut tx = storage.raw().transaction().unwrap();
+            let tx = storage.raw().transaction().unwrap();
             let outcome = commit_replace_in_tx(
                 &tx,
                 &ReplaceCommitInput {
@@ -6741,7 +6741,7 @@ mod e6_replace_commit_tests {
             ],
         );
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
-        let mut tx = storage.raw().transaction().unwrap();
+        let tx = storage.raw().transaction().unwrap();
         let err = commit_replace_in_tx(
             &tx,
             &ReplaceCommitInput {
@@ -6825,7 +6825,7 @@ mod e6_replace_commit_tests {
         );
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
         {
-            let mut tx = storage.raw().transaction().unwrap();
+            let tx = storage.raw().transaction().unwrap();
             commit_replace_in_tx(
                 &tx,
                 &ReplaceCommitInput {
@@ -6864,7 +6864,7 @@ mod e6_replace_commit_tests {
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
 
         let outcome = {
-            let mut tx = storage.raw().transaction().unwrap();
+            let tx = storage.raw().transaction().unwrap();
             let out = commit_replace_in_tx(
                 &tx,
                 &ReplaceCommitInput {
@@ -6983,7 +6983,7 @@ mod e6_replace_commit_tests {
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
 
         {
-            let mut tx = storage.raw().transaction().unwrap();
+            let tx = storage.raw().transaction().unwrap();
             commit_replace_in_tx(
                 &tx,
                 &ReplaceCommitInput {
@@ -7373,7 +7373,7 @@ mod e6_replace_commit_tests {
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
 
         {
-            let mut tx = storage.raw().transaction().unwrap();
+            let tx = storage.raw().transaction().unwrap();
             commit_replace_in_tx(
                 &tx,
                 &ReplaceCommitInput {

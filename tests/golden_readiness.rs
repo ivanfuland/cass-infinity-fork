@@ -14,7 +14,6 @@ use coding_agent_search::search::semantic_manifest::{
     ArtifactRecord, BacklogLedger, BuildCheckpoint, SemanticManifest, TierKind,
 };
 use coding_agent_search::storage::sqlite::FrankenStorage;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 fn cass_cmd(test_home: &Path) -> Command {

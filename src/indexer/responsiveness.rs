@@ -1411,57 +1411,6 @@ pub(crate) fn available_memory_bytes() -> Option<u64> {
     }
 }
 
-pub(crate) fn total_memory_bytes() -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-        proc_kib_field_bytes(&meminfo, "MemTotal:")
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let output = std::process::Command::new("sysctl")
-            .args(["-n", "hw.memsize"])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .parse::<u64>()
-            .ok()
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        None
-    }
-}
-
-pub(crate) fn process_resident_memory_bytes() -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        let status = std::fs::read_to_string("/proc/self/status").ok()?;
-        proc_kib_field_bytes(&status, "VmRSS:")
-    }
-    // macOS: `ps -o rss=` reports resident set size in KiB for our own pid.
-    #[cfg(target_os = "macos")]
-    {
-        let pid = std::process::id().to_string();
-        let output = std::process::Command::new("ps")
-            .args(["-o", "rss=", "-p", &pid])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        macos_rss_kib_to_bytes(&String::from_utf8_lossy(&output.stdout))
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        None
-    }
-}
-
 #[cfg(any(target_os = "linux", test))]
 fn proc_kib_field_bytes(contents: &str, prefix: &str) -> Option<u64> {
     for line in contents.lines() {

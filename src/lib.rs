@@ -18320,10 +18320,6 @@ pub(crate) fn path_identities_match(lhs: &Path, rhs: &Path) -> bool {
     normalize_path_identity(lhs) == normalize_path_identity(rhs)
 }
 
-pub(crate) fn stored_path_identity_matches(saved: &str, current: &Path) -> bool {
-    path_identities_match(Path::new(saved), current)
-}
-
 fn read_index_run_lock_snapshot(
     data_dir: &Path,
 ) -> crate::search::asset_state::SearchMaintenanceSnapshot {

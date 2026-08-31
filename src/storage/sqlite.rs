@@ -94,7 +94,6 @@ macro_rules! fparams {
 }
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use thiserror::Error;
 use tracing::info;
 
 const DOCTOR_MUTATION_DB_OPEN_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
@@ -5854,7 +5853,7 @@ impl FrankenStorage {
             return Ok(states);
         }
 
-        let mut tx = self.conn.transaction()?;
+        let tx = self.conn.transaction()?;
         let watermark_rows: Vec<(String, String)> = tx.query_all_map(
             "SELECT key, value FROM meta WHERE key LIKE 'last_scan_ts:connector:%'",
             fparams![],
@@ -8672,7 +8671,7 @@ impl FrankenStorage {
         let conversation_key = conversation_merge_key(agent_id, conv);
 
         let tx_open_start = Instant::now();
-        let mut tx = self.conn.transaction()?;
+        let tx = self.conn.transaction()?;
         profile.tx_open_duration += tx_open_start.elapsed();
 
         let existing_lookup_start = Instant::now();
@@ -8852,7 +8851,7 @@ impl FrankenStorage {
         let conversation_key = conversation_merge_key(agent_id, conv);
 
         let tx_open_start = Instant::now();
-        let mut tx = self.conn.transaction()?;
+        let tx = self.conn.transaction()?;
         profile.tx_open_duration += tx_open_start.elapsed();
 
         let existing_lookup_start = Instant::now();
@@ -20191,7 +20190,7 @@ mod tests {
             )
             .unwrap();
 
-        let mut tx = storage.conn.transaction().unwrap();
+        let tx = storage.conn.transaction().unwrap();
         franken_update_daily_stats_in_tx(
             &storage,
             &tx,
@@ -20279,7 +20278,7 @@ mod tests {
             )
             .unwrap();
 
-        let mut tx = storage.conn.transaction().unwrap();
+        let tx = storage.conn.transaction().unwrap();
         franken_update_daily_stats_in_tx(
             &storage,
             &tx,
@@ -27869,7 +27868,7 @@ mod tests {
         // comment above for why this FK-OFF toggle is deliberately kept.
         storage.raw().execute_batch_bypassing_foreign_keys_guard("PRAGMA foreign_keys = OFF").unwrap();
         {
-            let mut tx = storage.raw().transaction().unwrap();
+            let tx = storage.raw().transaction().unwrap();
             for idx in 0..orphan_count {
                 let message_id = 10_000_i64 + i64::try_from(idx).unwrap();
                 let conversation_id = 20_000_i64 + i64::try_from(idx).unwrap();
@@ -27929,7 +27928,7 @@ mod tests {
         // comment above for why this FK-OFF toggle is deliberately kept.
         storage.raw().execute_batch_bypassing_foreign_keys_guard("PRAGMA foreign_keys = OFF").unwrap();
         {
-            let mut tx = storage.raw().transaction().unwrap();
+            let tx = storage.raw().transaction().unwrap();
             for idx in 0..orphan_count {
                 let message_id = 50_000_i64 + i64::try_from(idx).unwrap();
                 tx.execute(
@@ -28242,7 +28241,7 @@ mod e5_replace_tests {
         let new_conv = replacement("tx-scope");
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
         {
-            let mut tx = storage.raw().transaction().unwrap();
+            let tx = storage.raw().transaction().unwrap();
             franken_replace_conversation_messages_in_tx(
                 &tx, conv_id, agent_id, None, &new_conv, &pricing,
             )
@@ -28282,7 +28281,7 @@ mod e5_replace_tests {
         // 分辨力前置断言：同一份输入喂给基线的 tail 规划器，它计划插入 0 条。
         // 不先证这一点，本测试就分不出「绕过了规划器」与「规划器本来就会插满」。
         {
-            let mut tx = storage.raw().transaction().unwrap();
+            let tx = storage.raw().transaction().unwrap();
             let mut by_idx: HashMap<i64, HashMap<i64, MessageMergeFingerprint>> = HashMap::new();
             let mut replay: HashMap<i64, HashSet<MessageReplayFingerprint>> = HashMap::new();
             let (plan, _, _) = franken_collect_batched_existing_new_messages(
@@ -28302,7 +28301,7 @@ mod e5_replace_tests {
         }
 
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
-        let mut tx = storage.raw().transaction().unwrap();
+        let tx = storage.raw().transaction().unwrap();
         franken_replace_conversation_messages_in_tx(
             &tx, conv_id, agent_id, None, &new_conv, &pricing,
         )
@@ -28326,7 +28325,7 @@ mod e5_replace_tests {
         let new_conv = replacement("id-kept");
 
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
-        let mut tx = storage.raw().transaction().unwrap();
+        let tx = storage.raw().transaction().unwrap();
         franken_replace_conversation_messages_in_tx(
             &tx, conv_id, agent_id, None, &new_conv, &pricing,
         )
@@ -28404,7 +28403,7 @@ mod e5_replace_tests {
 
         let new_conv = replacement("tail-hot");
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
-        let mut tx = storage.raw().transaction().unwrap();
+        let tx = storage.raw().transaction().unwrap();
         franken_replace_conversation_messages_in_tx(
             &tx, conv_id, agent_id, None, &new_conv, &pricing,
         )
@@ -28464,7 +28463,7 @@ mod e5_replace_tests {
 
         let new_conv = replacement("tail-fallback");
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
-        let mut tx = storage.raw().transaction().unwrap();
+        let tx = storage.raw().transaction().unwrap();
         franken_replace_conversation_messages_in_tx(
             &tx, conv_id, agent_id, None, &new_conv, &pricing,
         )
@@ -28517,7 +28516,7 @@ mod e5_replace_tests {
 
         let new_conv = replacement("fingerprint");
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
-        let mut tx = storage.raw().transaction().unwrap();
+        let tx = storage.raw().transaction().unwrap();
         franken_replace_conversation_messages_in_tx(
             &tx, conv_id, agent_id, None, &new_conv, &pricing,
         )
@@ -28742,7 +28741,7 @@ mod e5_replace_tests {
         );
         let repl_conv = conversation("equiv", branch_coverage_messages());
         let pricing = PricingTable::franken_load(repl_storage.raw()).unwrap();
-        let mut tx = repl_storage.raw().transaction().unwrap();
+        let tx = repl_storage.raw().transaction().unwrap();
         franken_replace_conversation_messages_in_tx(
             &tx,
             repl_conv_id,
@@ -28825,7 +28824,7 @@ mod e5_replace_tests {
         let new_conv = conversation("summaries", messages);
 
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
-        let mut tx = storage.raw().transaction().unwrap();
+        let tx = storage.raw().transaction().unwrap();
         franken_replace_conversation_messages_in_tx(
             &tx, conv_id, agent_id, None, &new_conv, &pricing,
         )
@@ -28958,7 +28957,7 @@ mod e5_replace_tests {
 
         let new_conv = replacement("aggregates");
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
-        let mut tx = storage.raw().transaction().unwrap();
+        let tx = storage.raw().transaction().unwrap();
         franken_replace_conversation_messages_in_tx(
             &tx, conv_id, agent_id, None, &new_conv, &pricing,
         )
@@ -28988,7 +28987,7 @@ mod e5_replace_tests {
         let new_conv = conversation("no-ts", messages);
 
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
-        let mut tx = storage.raw().transaction().unwrap();
+        let tx = storage.raw().transaction().unwrap();
         franken_replace_conversation_messages_in_tx(
             &tx, conv_id, agent_id, None, &new_conv, &pricing,
         )
@@ -29049,7 +29048,7 @@ mod e5_replace_tests {
         empty.ended_at = None;
 
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
-        let mut tx = storage.raw().transaction().unwrap();
+        let tx = storage.raw().transaction().unwrap();
         franken_replace_conversation_messages_in_tx(&tx, conv_id, agent_id, None, &empty, &pricing)
             .unwrap();
         tx.commit().unwrap();
@@ -29114,7 +29113,7 @@ mod e5_replace_tests {
         );
 
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
-        let mut tx = storage.raw().transaction().unwrap();
+        let tx = storage.raw().transaction().unwrap();
         franken_replace_conversation_messages_in_tx(
             &tx, conv_id, agent_id, None, &new_conv, &pricing,
         )
@@ -29200,7 +29199,7 @@ mod e5_replace_tests {
 
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
         for conv in [&first, &second] {
-            let mut tx = storage.raw().transaction().unwrap();
+            let tx = storage.raw().transaction().unwrap();
             franken_replace_conversation_messages_in_tx(
                 &tx, conv_id, agent_id, None, conv, &pricing,
             )
@@ -29287,7 +29286,7 @@ mod e5_replace_tests {
         );
 
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
-        let mut tx = storage.raw().transaction().unwrap();
+        let tx = storage.raw().transaction().unwrap();
         franken_replace_conversation_messages_in_tx(
             &tx, conv_id, agent_id, None, &new_conv, &pricing,
         )
