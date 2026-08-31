@@ -1274,19 +1274,20 @@ fn inspect_lexical_assets(input: InspectLexicalAssetsInput<'_>) -> Result<Lexica
     // version/schema-hash/page-size/fingerprint matching that used to gate
     // `contract_mismatch` is delta w2-d4 dead code (no DB-domain equivalent);
     // replaced with a live `validate_searchable_index_contract_quick` probe.
+    // W2-6 exec36 Task甲1 (control-plane 2026-08-30 ruling, ⑤b): the retired
+    // JSON checkpoint file degraded to "no state" whenever it couldn't be
+    // read (missing file, bad path); mirror that here. `db_available` only
+    // promises the caller *believes* the db is usable -- a path that exists
+    // but isn't a valid SQLite file (e.g. a directory, per
+    // `inspect_search_assets_trusts_db_probe_for_semantic_metadata_probe`)
+    // still fails on open/query with a hard I/O error. Downgrade any such
+    // failure to `Absent` instead of propagating it and panicking every
+    // caller that trusts the `db_available` signal.
     let marker = if db_available {
-        let conn = crate::storage::api::Conn::open_read(db_path).with_context(|| {
-            format!(
-                "opening {} to read lex domain rebuild marker",
-                db_path.display()
-            )
-        })?;
-        crate::storage::sqlite::lex_domain_rebuild_marker_status(&conn).with_context(|| {
-            format!(
-                "reading lex domain rebuild marker from {}",
-                db_path.display()
-            )
-        })?
+        crate::storage::api::Conn::open_read(db_path)
+            .ok()
+            .and_then(|conn| crate::storage::sqlite::lex_domain_rebuild_marker_status(&conn).ok())
+            .unwrap_or(crate::storage::sqlite::LexDomainRebuildMarkerState::Absent)
     } else {
         crate::storage::sqlite::LexDomainRebuildMarkerState::Absent
     };
