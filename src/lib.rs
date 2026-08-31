@@ -22592,37 +22592,6 @@ mod search_lexical_self_heal_tests {
         db_path
     }
 
-    fn hold_active_index_run_lock(data_dir: &Path, db_path: &Path) -> std::fs::File {
-        let lock_path = data_dir.join("index-run.lock");
-        let mut lock_file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-            .expect("open index-run lock");
-        fs2::FileExt::try_lock_exclusive(&lock_file).expect("hold active index-run lock");
-        let metadata = format!(
-            "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index\n",
-            std::process::id(),
-            1_733_000_111_000_i64,
-            db_path.display()
-        );
-        {
-            use std::io::{Seek, SeekFrom, Write};
-            lock_file.set_len(0).expect("truncate index-run lock");
-            lock_file
-                .seek(SeekFrom::Start(0))
-                .expect("rewind index-run lock");
-            lock_file
-                .write_all(metadata.as_bytes())
-                .expect("write index-run lock metadata");
-            lock_file.flush().expect("flush index-run lock metadata");
-        }
-        crate::search::asset_state::write_index_run_lock_metadata_sidecar(&lock_path, &metadata)
-            .expect("write index-run lock metadata sidecar");
-        lock_file
-    }
 
     #[test]
     fn search_self_heal_rebuilds_missing_lexical_index_from_canonical_db() {

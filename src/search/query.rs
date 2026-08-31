@@ -8357,46 +8357,6 @@ impl SearchClient {
     }
 }
 
-/// W2-5: forces the legacy Tantivy lexical path for the lifetime of the
-/// guard by setting `CASS_LEXICAL_USE_TANTIVY=1`, restoring the prior value
-/// (or clearing it) on drop. Used only by the handful of tests (in this
-/// module and in `search_lexical_self_heal_tests`, src/lib.rs) that
-/// specifically pin Tantivy's own mechanics (snippet/hydration nuances,
-/// sqlite-laziness guarantees, checkpoint-deferral self-heal semantics) --
-/// those tests must be `#[serial]` since this mutates process-wide env read
-/// by every other `search()` call in this test binary. `pub(crate)` (not
-/// nested in `mod tests`) so both test modules can share one guard.
-#[cfg(test)]
-pub(crate) struct LexicalUseTantivyGuard {
-    previous: Option<String>,
-}
-
-#[cfg(test)]
-impl LexicalUseTantivyGuard {
-    pub(crate) fn enable() -> Self {
-        let previous = std::env::var("CASS_LEXICAL_USE_TANTIVY").ok();
-        // SAFETY: test-only, serialized via #[serial] against other tests
-        // that also touch this env var.
-        unsafe {
-            std::env::set_var("CASS_LEXICAL_USE_TANTIVY", "1");
-        }
-        Self { previous }
-    }
-}
-
-#[cfg(test)]
-impl Drop for LexicalUseTantivyGuard {
-    fn drop(&mut self) {
-        // SAFETY: see `enable`.
-        unsafe {
-            match &self.previous {
-                Some(value) => std::env::set_var("CASS_LEXICAL_USE_TANTIVY", value),
-                None => std::env::remove_var("CASS_LEXICAL_USE_TANTIVY"),
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
