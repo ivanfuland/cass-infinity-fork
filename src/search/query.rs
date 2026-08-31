@@ -9550,6 +9550,16 @@ mod tests {
         let db_path = dir.path().join("fixture.db");
         let storage = FrankenStorage::open(&db_path)?;
         let mut agent_ids: HashMap<String, i64> = HashMap::new();
+        // W2-6 exec36 Task甲4诊断②-⑥ (control-plane 2026-08-31 ruling, 批准修):
+        // this helper used to hardcode `workspace_id: None` for every seeded
+        // conversation, silently dropping `NormalizedConversation.workspace`
+        // -- the production write path (`sync_lexical_domain_for_conversation_
+        // in_tx`) and the fts_lex hydrate/filter path were both verified
+        // correct; the gap was entirely in this test-only seeding shortcut
+        // never having called `ensure_workspace`. Resolve it the same way
+        // `agent_id` is resolved above, so workspace-filter tests actually
+        // exercise the real workspace_id join instead of always seeing NULL.
+        let mut workspace_ids: HashMap<String, i64> = HashMap::new();
         for conv in conversations {
             let agent_id = match agent_ids.get(&conv.agent_slug) {
                 Some(id) => *id,
@@ -9565,8 +9575,22 @@ mod tests {
                     id
                 }
             };
+            let workspace_id = match &conv.workspace {
+                None => None,
+                Some(ws) => {
+                    let key = ws.to_string_lossy().into_owned();
+                    match workspace_ids.get(&key) {
+                        Some(id) => Some(*id),
+                        None => {
+                            let id = storage.ensure_workspace(ws, None)?;
+                            workspace_ids.insert(key, id);
+                            Some(id)
+                        }
+                    }
+                }
+            };
             let internal = crate::indexer::persist::map_to_internal(conv);
-            storage.insert_conversation_tree(agent_id, None, &internal)?;
+            storage.insert_conversation_tree(agent_id, workspace_id, &internal)?;
         }
         Ok((dir, db_path))
     }
