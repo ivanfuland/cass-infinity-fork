@@ -12343,11 +12343,6 @@ fn ingest_batch(
         defer_checkpoints,
         None,
     )?;
-    if outcome.lexical_update_deferred {
-        anyhow::bail!(
-            "incremental lexical update ran out of memory after SQLite ingest; rerun with CASS_DEFER_LEXICAL_UPDATES=1 or rebuild derived lexical assets"
-        );
-    }
     Ok(outcome.canonical_mutations)
 }
 
