@@ -1655,6 +1655,19 @@ fn robot_trace_ingest_finish(
     }
 }
 
+/// W2-6 exec36 Task甲3 (control-plane 2026-08-31 ruling, ④判死批准): before
+/// Tantivy retirement, this value picked which branch wrote to a live
+/// Tantivy writer (`IncrementalInline`/`InlineRebuildFromScan`) versus
+/// skipping that writer entirely (`DeferredAuthoritativeDbRebuild`) --
+/// commit 3d21bb1d deleted that dead branching along with the Tantivy
+/// writer plumbing itself. **It no longer gates any write** (lex_docs is
+/// always populated inline, in the same transaction as the message insert;
+/// see `sync_lexical_domain_for_conversation_in_tx`). It is retained purely
+/// as a diagnostic/telemetry label (`ingest_stats.lexical_strategy`) that
+/// still distinguishes *why* a given scan was classified this way. The one
+/// mechanism that genuinely suppresses inline lex_docs writes today is the
+/// unrelated, purely operator-driven `CASS_DEFER_LEXICAL_UPDATES` env var
+/// (`storage::sqlite::defer_storage_lexical_updates_enabled`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LexicalPopulationStrategy {
     IncrementalInline,
@@ -1708,12 +1721,15 @@ fn resolve_lexical_population_strategy(
     let defer_to_authoritative_db_rebuild = full_refresh || salvage_messages_imported > 0;
     let strategy =
         select_lexical_population_strategy(needs_rebuild, defer_to_authoritative_db_rebuild);
+    // W2-6 exec36 Task甲3: these reason strings are diagnostic labels only
+    // (see the `LexicalPopulationStrategy` doc comment) -- selecting any of
+    // them has no effect on whether lex_docs gets written inline.
     let reason = if salvage_messages_imported > 0 {
         "historical_salvage_imported_messages_require_authoritative_db_rebuild"
     } else if full_refresh {
-        "full_refresh_defers_inline_lexical_writes_to_authoritative_db_rebuild"
+        "full_refresh_selects_authoritative_db_rebuild_strategy_label"
     } else if needs_rebuild {
-        "lexical_index_needs_rebuild_so_scan_results_repopulate_tantivy_directly"
+        "lexical_index_needs_rebuild_so_scan_results_repopulate_the_lexical_domain_inline"
     } else {
         "incremental_scan_applies_inline_lexical_updates_only_for_new_messages"
     };
@@ -17367,20 +17383,6 @@ pub mod persist {
         }
     }
 
-    fn should_defer_incremental_lexical_update_after_error(error: &anyhow::Error) -> bool {
-        super::error_is_out_of_memory(error)
-    }
-
-    #[cfg(test)]
-    fn should_inject_incremental_lexical_update_oom() -> bool {
-        dotenvy::var("CASS_TEST_INCREMENTAL_LEXICAL_UPDATE_OOM").is_ok()
-    }
-
-    #[cfg(not(test))]
-    fn should_inject_incremental_lexical_update_oom() -> bool {
-        false
-    }
-
     fn load_inserted_message_ids_by_idx(
         storage: &FrankenStorage,
         conversation_id: i64,
@@ -19286,10 +19288,30 @@ pub mod persist {
 
         #[test]
         #[serial]
-        fn persist_conversations_batched_can_defer_inline_lexical_updates() {
+        fn persist_conversations_batched_defers_lex_docs_via_env_var_and_recovers_via_full_rebuild()
+         {
+            // W2-6 exec36 Task甲3 (control-plane 2026-08-31 ruling, ④ "结构性
+            // 灭绝" — 判死批准): this test used to assert that selecting
+            // `LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild`
+            // alone suppressed inline `lex_docs` writes. Archaeology (commit
+            // 3d21bb1d, "t_index链路手术") shows that strategy's *only* ever
+            // meaning was "does this need a live Tantivy writer" -- with
+            // Tantivy retired, the strategy enum no longer gates any write at
+            // all (dual-write always happens, see the sibling
+            // `_always_dual_writes_lex_docs_regardless_of_strategy` tests).
+            // The one mechanism that genuinely, still suppresses inline
+            // `lex_docs` writes is the env-var toggle
+            // `CASS_DEFER_LEXICAL_UPDATES` (storage/sqlite.rs's
+            // `defer_storage_lexical_updates_enabled`, dual-railed with the
+            // legacy fts_messages write since W2-3) -- but until this
+            // rewrite, no test exercised its actual write-suppression +
+            // recovery-path content behavior (only value-parsing truthiness,
+            // in `storage_env_flags_are_truthy_only`). Rewritten to cover
+            // that real, still-alive mechanism instead.
             use crate::connectors::NormalizedConversation;
 
-            let _guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
+            let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
+            let defer_guard = set_env("CASS_DEFER_LEXICAL_UPDATES", "1");
 
             let dir = tempfile::TempDir::new().unwrap();
             let db_path = dir.path().join("serial-deferred.db");
@@ -19328,6 +19350,102 @@ pub mod persist {
                 ],
             }];
 
+            // Strategy is passed through untouched but, per the archaeology
+            // above, no longer influences whether lex_docs gets written --
+            // only the env var does. Use a non-Deferred variant deliberately
+            // to make that irrelevance explicit at the call site.
+            persist_conversations_batched(
+                &storage,
+                &convs,
+                LexicalPopulationStrategy::IncrementalInline,
+                false,
+            )
+            .expect("serial batched persist should succeed");
+
+            let conversation_count: i64 = storage
+                .raw()
+                .query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| {
+                    row.get_typed(0)
+                })
+                .unwrap();
+            let message_count: i64 = storage
+                .raw()
+                .query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0))
+                .unwrap();
+
+            assert_eq!(conversation_count, 1);
+            assert_eq!(message_count, 2);
+            assert_eq!(
+                lex_docs_row_count(&storage),
+                0,
+                "CASS_DEFER_LEXICAL_UPDATES=1 must suppress inline lex_docs writes"
+            );
+
+            // Recovery path: turn the toggle back off (mirroring the
+            // operator flow -- rerun without the env var, or trigger an
+            // explicit rebuild) and run the real full lex-domain rebuild.
+            // It must backfill exactly the rows the deferred insert skipped.
+            drop(defer_guard);
+            storage
+                .rebuild_lex_domain_from_db(None)
+                .expect("full lex domain rebuild should backfill deferred lex_docs");
+            assert_eq!(
+                lex_docs_row_count(&storage),
+                2,
+                "full rebuild must backfill lex_docs for conversations persisted while deferred"
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn persist_conversations_batched_always_dual_writes_lex_docs_regardless_of_strategy() {
+            // W2-6 exec36 Task甲3: sibling of the env-driven defer test above
+            // -- locks in the *other* half of the same contract. Selecting
+            // `DeferredAuthoritativeDbRebuild` (or any other strategy) has no
+            // effect on whether lex_docs gets written inline; only
+            // `CASS_DEFER_LEXICAL_UPDATES` does. This replaces the deleted
+            // premise that strategy selection alone suppressed the write.
+            use crate::connectors::NormalizedConversation;
+
+            let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
+
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("serial-dual-write.db");
+
+            let storage = create_franken_db(&db_path);
+            let convs = vec![NormalizedConversation {
+                agent_slug: "serial-agent".into(),
+                external_id: Some("serial-2".into()),
+                title: Some("Serial Dual Write".into()),
+                workspace: Some(std::path::PathBuf::from("/ws/serial")),
+                source_path: std::path::PathBuf::from("/log/serial-dual.jsonl"),
+                started_at: Some(10),
+                ended_at: Some(20),
+                metadata: serde_json::json!({}),
+                messages: vec![
+                    NormalizedMessage {
+                        idx: 0,
+                        role: "user".into(),
+                        author: Some("tester".into()),
+                        created_at: Some(10),
+                        content: "serial dual write first".into(),
+                        extra: serde_json::json!({}),
+                        snippets: vec![],
+                        invocations: Vec::new(),
+                    },
+                    NormalizedMessage {
+                        idx: 1,
+                        role: "assistant".into(),
+                        author: Some("tester".into()),
+                        created_at: Some(11),
+                        content: "serial dual write second".into(),
+                        extra: serde_json::json!({}),
+                        snippets: vec![],
+                        invocations: Vec::new(),
+                    },
+                ],
+            }];
+
             persist_conversations_batched(
                 &storage,
                 &convs,
@@ -19351,14 +19469,24 @@ pub mod persist {
             assert_eq!(message_count, 2);
             assert_eq!(
                 lex_docs_row_count(&storage),
-                0,
-                "DeferredAuthoritativeDbRebuild must not populate lex_docs inline"
+                2,
+                "LexicalPopulationStrategy no longer gates lex_docs writes (Tantivy retired); \
+                 only CASS_DEFER_LEXICAL_UPDATES does"
             );
         }
 
         #[test]
         #[serial]
-        fn begin_concurrent_persist_can_defer_inline_lexical_updates() {
+        fn begin_concurrent_persist_always_dual_writes_lex_docs_regardless_of_strategy() {
+            // W2-6 exec36 Task甲3 (control-plane 2026-08-31 ruling, ④判死批准):
+            // `persist_conversations_batched_begin_concurrent`'s
+            // `LexicalPopulationStrategy` parameter is literally named
+            // `_lexical_strategy` -- unused by design since commit 3d21bb1d
+            // deleted the dead Tantivy-writer match arms it used to drive.
+            // Locks in the real contract: strategy selection has zero effect
+            // on this path's lex_docs write; only CASS_DEFER_LEXICAL_UPDATES
+            // does (see the sibling env-driven test in
+            // `persist_internal_tests`).
             use crate::connectors::NormalizedConversation;
 
             let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "1");
@@ -19429,8 +19557,9 @@ pub mod persist {
             assert_eq!(message_count, 2);
             assert_eq!(
                 lex_docs_row_count(&reader),
-                0,
-                "DeferredAuthoritativeDbRebuild must not populate lex_docs inline"
+                2,
+                "LexicalPopulationStrategy no longer gates lex_docs writes (Tantivy retired); \
+                 only CASS_DEFER_LEXICAL_UPDATES does"
             );
         }
 
@@ -19545,14 +19674,14 @@ pub mod persist {
                 crate::indexer::resolve_lexical_population_strategy(true, false, 0),
                 (
                     LexicalPopulationStrategy::InlineRebuildFromScan,
-                    "lexical_index_needs_rebuild_so_scan_results_repopulate_tantivy_directly",
+                    "lexical_index_needs_rebuild_so_scan_results_repopulate_the_lexical_domain_inline",
                 )
             );
             assert_eq!(
                 crate::indexer::resolve_lexical_population_strategy(false, true, 0),
                 (
                     LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
-                    "full_refresh_defers_inline_lexical_writes_to_authoritative_db_rebuild",
+                    "full_refresh_selects_authoritative_db_rebuild_strategy_label",
                 )
             );
             assert_eq!(
@@ -27166,7 +27295,11 @@ mod tests {
     }
 
     #[test]
-    fn streaming_consumer_can_defer_authoritative_lexical_updates_without_tantivy_writer() {
+    fn streaming_consumer_always_dual_writes_lex_docs_regardless_of_strategy() {
+        // W2-6 exec36 Task甲3 (control-plane 2026-08-31 ruling, ④判死批准):
+        // sibling of `batch_index_always_dual_writes_lex_docs_regardless_of_
+        // strategy` for the streaming ingest path. See that test's comment
+        // for the full archaeology (commit 3d21bb1d).
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -27230,80 +27363,15 @@ mod tests {
         );
         assert_eq!(conversation_count, 1);
         assert_eq!(message_count, 2);
-        // W2-6 Task丙续: dropped the tantivy-only `meta.json` non-existence
-        // assertion (交接件-flagged dead symbol -- tantivy is gone, so it was
-        // vacuously true and never actually testing anything). The real
-        // regression intent -- deferred ingest doesn't populate the lexical
-        // domain up front -- is the DB-domain assertion below.
         let lex_docs_count: i64 = storage
             .raw()
             .query_row_map("SELECT COUNT(*) FROM lex_docs", &[], |row| row.get_typed(0))
             .unwrap();
         assert_eq!(
-            lex_docs_count, 0,
-            "deferred streaming ingest should not populate lex_docs before the authoritative rebuild"
+            lex_docs_count, 2,
+            "LexicalPopulationStrategy no longer gates lex_docs writes (Tantivy retired); \
+             only CASS_DEFER_LEXICAL_UPDATES does"
         );
-    }
-
-    #[test]
-    #[serial]
-    fn streaming_consumer_defers_lexical_oom_without_quarantining_persisted_conversation() {
-        let _oom_guard = set_env("CASS_TEST_INCREMENTAL_LEXICAL_UPDATE_OOM", "1");
-        let tmp = TempDir::new().unwrap();
-        let data_dir = tmp.path().join("data");
-        std::fs::create_dir_all(&data_dir).unwrap();
-
-        let db_path = data_dir.join("db.sqlite");
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        let progress = Arc::new(IndexingProgress::default());
-        let (tx, rx) = bounded(STREAMING_CHANNEL_SIZE);
-
-        send_conversation_batches(
-            &tx,
-            "codex",
-            vec![norm_conv(
-                Some("lexical-oom-deferred"),
-                vec![norm_msg(0, 1_700_000_000_000)],
-            )],
-            true,
-        );
-        send_done(&tx, "codex", true);
-        drop(tx);
-
-        let (_discovered, outcome) = run_streaming_consumer(
-            rx,
-            1,
-            &storage,
-            &data_dir,
-            Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
-            &Some(progress.clone()),
-            LexicalPopulationStrategy::IncrementalInline,
-            Some(FrankenStorage::now_millis()),
-            None,
-            &SharedActiveSessionSourceSkips::default(),
-        )
-        .expect("lexical OOM after SQLite ingest should defer repair, not fail the scan");
-
-        assert_eq!(outcome.canonical_mutations.inserted_conversations, 1);
-        assert_eq!(outcome.canonical_mutations.inserted_messages, 1);
-        assert!(outcome.lexical_update_deferred);
-        assert_eq!(outcome.quarantined_conversations, 0);
-        let conversation_rows: i64 = storage
-            .raw()
-            .query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| {
-                row.get_typed(0)
-            })
-            .unwrap();
-        assert_eq!(conversation_rows, 1);
-        assert!(
-            !data_dir
-                .join("quarantine/index_ingest_poison.jsonl")
-                .exists(),
-            "lexical-only OOM must not quarantine a conversation already preserved in SQLite"
-        );
-        let stats = progress.stats.lock().unwrap_or_else(|e| e.into_inner());
-        assert!(stats.lexical_update_deferred);
-        assert_eq!(stats.quarantined_conversations, 0);
     }
 
     #[test]
@@ -29567,7 +29635,15 @@ mod tests {
     }
 
     #[test]
-    fn batch_index_can_defer_authoritative_lexical_updates_without_tantivy_writer() {
+    fn batch_index_always_dual_writes_lex_docs_regardless_of_strategy() {
+        // W2-6 exec36 Task甲3 (control-plane 2026-08-31 ruling, ④判死批准):
+        // `LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild`'s only
+        // ever meaning was "does this scan need a live Tantivy writer"
+        // (commit 3d21bb1d archaeology). Tantivy is retired, so this no
+        // longer gates lex_docs writes at all -- only
+        // CASS_DEFER_LEXICAL_UPDATES does (uncovered by this call path;
+        // batch ingest never reads the env var itself, it flows through
+        // `insert_conversations_batched` which does).
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -29627,16 +29703,14 @@ mod tests {
         assert_eq!(message_count, 2);
         assert_eq!(stats.total_conversations, 1);
         assert_eq!(stats.total_messages, 2);
-        // W2-6 Task丙续: dropped the tantivy-only `meta.json` non-existence
-        // assertion (dead symbol, was vacuously true); DB-domain equivalent
-        // below is the real regression intent.
         let lex_docs_count: i64 = storage
             .raw()
             .query_row_map("SELECT COUNT(*) FROM lex_docs", &[], |row| row.get_typed(0))
             .unwrap();
         assert_eq!(
-            lex_docs_count, 0,
-            "deferred batch ingest should not populate lex_docs before the authoritative rebuild"
+            lex_docs_count, 2,
+            "LexicalPopulationStrategy no longer gates lex_docs writes (Tantivy retired); \
+             only CASS_DEFER_LEXICAL_UPDATES does"
         );
     }
 
