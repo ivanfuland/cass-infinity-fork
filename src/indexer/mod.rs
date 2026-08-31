@@ -61,7 +61,7 @@ use crate::sources::config::{Platform, SourcesConfig};
 use crate::sources::provenance::{LOCAL_SOURCE_ID, Origin, Source, SourceKind};
 use crate::sources::sync::path_to_safe_dirname;
 use crate::storage::sqlite::{
-    DailyStatsRebuildResult, FrankenStorage, FtsConsistencyRepair, HistoricalSalvageOutcome,
+    DailyStatsRebuildResult, FrankenStorage, HistoricalSalvageOutcome,
     LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE, StatsAggregator, StatsDelta,
     historical_table_exists, seed_canonical_from_best_historical_bundle,
 };

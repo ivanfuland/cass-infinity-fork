@@ -8456,16 +8456,20 @@ async fn execute_cli(
                         )?;
                         return Ok(());
                     }
-                    // #285: `cass doctor --rebuild-canonical-fts --yes` — drop
-                    // and rebuild the canonical FTS5 shadow tables in place.
+                    // W2-6 Task戊: `cass doctor --rebuild-canonical-fts` rebuilt
+                    // the in-DB `fts_messages` shadow, which this task DROPs
+                    // entirely -- there is no longer anything for this flag to
+                    // rebuild. Kept parseable (rather than an "unknown flag"
+                    // error) so a user with an old script gets an explicit
+                    // retirement message instead of a confusing parse failure.
                     if rebuild_canonical_fts {
-                        doctor_recover::run_doctor_rebuild_canonical_fts(
-                            data_dir,
-                            cli.db.clone(),
-                            yes,
-                            structured_format,
-                        )?;
-                        return Ok(());
+                        return Err(CliError {
+                            code: 4,
+                            kind: "refused-unsafe",
+                            message: "`cass doctor --rebuild-canonical-fts` has been retired: the in-DB fts_messages shadow it rebuilt no longer exists (search runs entirely on the fts_lex/lex_docs index).".to_string(),
+                            hint: Some("No action needed -- there is no fts_messages shadow left to repair.".to_string()),
+                            retryable: false,
+                        });
                     }
                     // #285: `cass doctor --cleanup-interrupted-artifacts --yes`
                     // — quarantine interrupted raw_mirror_capture artifacts.
@@ -9309,14 +9313,10 @@ fn run_forget_command(
             retryable: false,
         })?;
 
-    // After an actual deletion, rebuild derived assets so search/analytics stay
-    // consistent (mirrors the agent-purge path). The lexical index also
-    // self-heals on next search, but rebuilding FTS now keeps DB-resident
-    // surfaces correct.
+    // After an actual deletion, rebuild derived assets so analytics stay
+    // consistent (mirrors the agent-purge path). The lexical index
+    // self-heals on next search.
     if apply && report.conversations_deleted > 0 {
-        if let Err(e) = storage.rebuild_fts() {
-            tracing::warn!(error = %e, "forget: failed to rebuild FTS after deletion");
-        }
         if let Err(e) = storage.rebuild_analytics() {
             tracing::warn!(error = %e, "forget: failed to rebuild analytics after deletion");
         }
@@ -27894,34 +27894,13 @@ fn run_dedup(
             retryable: false,
         })?;
 
-    // On apply, rebuild the lexical FTS index so the dropped twins stop
-    // surfacing in search. Only worth doing when something was removed.
-    let mut lexical_rebuilt = false;
-    if apply && result.conversations_affected > 0 {
-        match storage.rebuild_lexical_index_after_dedup() {
-            Ok(()) => lexical_rebuilt = true,
-            Err(err) => {
-                tracing::warn!(
-                    "duplicate cleanup removed rows but lexical rebuild failed: {err}; run 'cass index --full' to refresh search"
-                );
-            }
-        }
-    }
-
     let recommended_action = if result.conversations_affected == 0 {
         "No pre-existing duplicate conversations found. Nothing to do.".to_string()
     } else if apply {
-        if lexical_rebuilt {
-            format!(
-                "Collapsed {} duplicate conversation(s) and rebuilt the in-DB FTS shadow. Run 'cass index --full' to also refresh the on-disk lexical search index.",
-                result.conversations_affected
-            )
-        } else {
-            format!(
-                "Collapsed {} duplicate conversation(s). Run 'cass index --full' to refresh the lexical index.",
-                result.conversations_affected
-            )
-        }
+        format!(
+            "Collapsed {} duplicate conversation(s). Run 'cass index --full' to refresh the lexical index.",
+            result.conversations_affected
+        )
     } else {
         format!(
             "Found {} duplicate conversation(s) ({} message rows). Re-run with --apply to collapse them.",
@@ -27951,7 +27930,10 @@ fn run_dedup(
             "db_exists": true,
             "conversations_collapsed": result.conversations_affected,
             "messages_removed": result.messages_affected,
-            "lexical_rebuilt": lexical_rebuilt,
+            // W2-6 Task戊: the in-DB fts_messages shadow this field used to
+            // report on is retired; always false now (see the sibling
+            // no-op branch above, which already hardcoded this).
+            "lexical_rebuilt": false,
             "pairs": pairs,
             "recommended_action": recommended_action,
         });
@@ -97781,13 +97763,6 @@ fn purge_excluded_agent_archive_data(
         return Ok(purge);
     }
 
-    storage.rebuild_fts().map_err(|e| CliError {
-        code: 5,
-        kind: CliErrorKind::ArchiveFtsRebuild.kind_str(),
-        message: format!("Purged '{archive_agent_slug}' but failed to rebuild FTS: {e}"),
-        hint: Some("Run 'cass index --full' to refresh derived search data".into()),
-        retryable: false,
-    })?;
     storage.rebuild_analytics().map_err(|e| CliError {
         code: 5,
         kind: CliErrorKind::ArchiveAnalyticsRebuild.kind_str(),

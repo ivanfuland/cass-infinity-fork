@@ -79,7 +79,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicI8, AtomicI64, AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
 };
 
 /// The legacy embedded engine's parameter list builder (Task A4a thin shim: delegates to
@@ -762,22 +762,6 @@ fn franken_read_message_extra_compat(
     serde_json::Value::Null
 }
 
-/// SQL to register the FTS5 virtual table on a legacy embedded engine connection.
-///
-/// FrankenSQLite skips virtual-table entries (rootpage=0) when loading
-/// `sqlite_master` from a stock-SQLite database.  Executing this CREATE
-/// triggers the legacy FTS5 fallback path and materialises the table so
-/// subsequent FTS queries work.
-pub const FTS5_REGISTER_SQL: &str = "\
-    CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(\
-        content, title, agent, workspace, source_path, \
-        created_at UNINDEXED, \
-        content='', tokenize='porter'\
-    )";
-
-const FTS_FRANKEN_REBUILD_META_KEY: &str = "fts_frankensqlite_rebuild_generation";
-const FTS_FRANKEN_REBUILD_FINGERPRINT_META_KEY: &str = "fts_frankensqlite_archive_fingerprint";
-const FTS_FRANKEN_REBUILD_GENERATION: i64 = 1;
 const DAILY_STATS_HEALTH_META_KEY: &str = "daily_stats_archive_fingerprint";
 const DAILY_STATS_HEALTH_GENERATION_META_KEY: &str = "daily_stats_health_generation";
 const DAILY_STATS_HEALTH_GENERATION: i64 = 1;
@@ -838,258 +822,6 @@ impl SourceContentGenerationVerdict {
             Some(_) => Self::Mismatch,
         }
     }
-}
-
-/// SQL to clear all rows from the contentless `fts_messages` table.
-///
-/// Contentless FTS5 tables reject ordinary `DELETE FROM ...` statements.
-pub const FTS5_DELETE_ALL_SQL: &str =
-    "INSERT INTO fts_messages(fts_messages) VALUES('delete-all');";
-
-pub const FTS_MESSAGES_REQUIRED_SHADOW_TABLES: [&str; 5] = [
-    "fts_messages_config",
-    "fts_messages_content",
-    "fts_messages_data",
-    "fts_messages_docsize",
-    "fts_messages_idx",
-];
-
-pub const FTS_MESSAGES_INTEGRITY_PROBE_SQL: &str = "SELECT * FROM fts_messages LIMIT 0";
-
-pub const FTS_MESSAGES_CORRUPTION_RECOVERY_HINT: &str = "Stop all cass index/watch processes, back up the current database, then run \
-     'cass doctor check --json' for a read-only diagnosis before using a supported \
-     repair/rebuild path.";
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FtsMessagesIntegrityError {
-    missing_shadow_tables: Vec<&'static str>,
-    failed_sql: Option<&'static str>,
-    source_error: Option<String>,
-}
-
-impl FtsMessagesIntegrityError {
-    fn new(
-        missing_shadow_tables: Vec<&'static str>,
-        failed_sql: Option<&'static str>,
-        source_error: Option<String>,
-    ) -> Self {
-        Self {
-            missing_shadow_tables,
-            failed_sql,
-            source_error,
-        }
-    }
-
-    pub fn missing_shadow_tables(&self) -> &[&'static str] {
-        &self.missing_shadow_tables
-    }
-}
-
-impl std::fmt::Display for FtsMessagesIntegrityError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "CASS database FTS5 index is corrupt: fts_messages exists, but required FTS5 shadow tables are missing or unreadable"
-        )?;
-        if !self.missing_shadow_tables.is_empty() {
-            write!(
-                f,
-                "; missing shadow tables: {}",
-                self.missing_shadow_tables.join(", ")
-            )?;
-        }
-        if let Some(sql) = self.failed_sql {
-            write!(f, "; failed SQL: {sql}")?;
-        }
-        if let Some(source_error) = &self.source_error {
-            write!(f, "; error: {source_error}")?;
-        }
-        write!(
-            f,
-            ". Suggested recovery: {FTS_MESSAGES_CORRUPTION_RECOVERY_HINT}"
-        )
-    }
-}
-
-impl std::error::Error for FtsMessagesIntegrityError {}
-
-pub fn fts_messages_integrity_error_from_message(
-    source_error: impl Into<String>,
-) -> Option<FtsMessagesIntegrityError> {
-    let source_error = source_error.into();
-    let lower = source_error.to_ascii_lowercase();
-    if !lower.contains("fts_messages") {
-        return None;
-    }
-
-    let mentions_required_shadow_table = FTS_MESSAGES_REQUIRED_SHADOW_TABLES
-        .iter()
-        .any(|table| lower.contains(&table.to_ascii_lowercase()));
-    let mentions_structural_fts_failure = lower.contains("shadow table")
-        || lower.contains("vtable constructor failed")
-        || lower.contains("sqlite_corrupt")
-        || lower.contains("databasecorrupt")
-        || lower.contains("database corrupt")
-        || lower.contains("missing required")
-        // w1b Task B9 (salvage problem B): a duplicate `fts_messages`
-        // declaration in `sqlite_master` (the "malformed legacy bundle"
-        // fixture pattern) makes real SQLite refuse to even open the
-        // connection -- it eagerly parses the full schema and errors with
-        // "table fts_messages already exists" the moment two virtual-table
-        // declarations for the same name collide. The old the legacy embedded engine
-        // backend deferred this validation until the table was actually
-        // queried, so this failure mode never reached this classifier
-        // before; without recognizing it here, the caller falls straight
-        // through to `.recover`-based salvage instead of the (correct,
-        // already-implemented) `scrub_staged_derived_fts_metadata_via_sqlite3`
-        // repair this function exists to route to.
-        || lower.contains("already exists")
-        || (mentions_required_shadow_table
-            && (lower.contains("table not found") || lower.contains("no such table")));
-    if !mentions_structural_fts_failure {
-        return None;
-    }
-
-    let missing_shadow_tables = FTS_MESSAGES_REQUIRED_SHADOW_TABLES
-        .iter()
-        .copied()
-        .filter(|table| lower.contains(&table.to_ascii_lowercase()))
-        .collect::<Vec<_>>();
-
-    Some(FtsMessagesIntegrityError::new(
-        missing_shadow_tables,
-        Some(FTS_MESSAGES_INTEGRITY_PROBE_SQL),
-        Some(source_error),
-    ))
-}
-
-fn fts_schema_tolerates_missing_shadow_metadata(sql: &str) -> bool {
-    let normalized = sql
-        .chars()
-        .filter(|ch| !ch.is_whitespace())
-        .collect::<String>()
-        .to_ascii_lowercase();
-    normalized.contains("usingfts5(")
-        && normalized.contains("content=''")
-        && !normalized.contains("message_id")
-}
-
-pub fn validate_fts_messages_integrity_for_connection(conn: &FrankenConnection) -> Result<()> {
-    let fts_schema_sql: Vec<String> = conn
-        .query_all_map(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'fts_messages'",
-            fparams![],
-            |row: &FrankenRow| row.get_typed::<String>(0),
-        )
-        .with_context(|| "checking for fts_messages in sqlite_master")?;
-    if fts_schema_sql.is_empty() {
-        return Ok(());
-    }
-
-    let probe_error = conn
-        .query_all_map(FTS_MESSAGES_INTEGRITY_PROBE_SQL, &[], |_row| Ok(()))
-        .err();
-    if probe_error.is_none()
-        && fts_schema_sql
-            .iter()
-            .all(|sql| fts_schema_tolerates_missing_shadow_metadata(sql))
-    {
-        return Ok(());
-    }
-
-    let present_shadow_tables: HashSet<String> = conn
-        .query_all_map(
-            "SELECT name FROM sqlite_master
-             WHERE type = 'table'
-               AND name IN (
-                 'fts_messages_config',
-                 'fts_messages_content',
-                 'fts_messages_data',
-                 'fts_messages_docsize',
-                 'fts_messages_idx'
-               )",
-            fparams![],
-            |row: &FrankenRow| row.get_typed::<String>(0),
-        )
-        .map(|rows| rows.into_iter().collect())
-        .map_err(|err| {
-            FtsMessagesIntegrityError::new(
-                Vec::new(),
-                Some(
-                    "SELECT name FROM sqlite_master WHERE name IN \
-                     ('fts_messages_config','fts_messages_content','fts_messages_data','fts_messages_docsize','fts_messages_idx')",
-                ),
-                Some(err.to_string()),
-            )
-        })?;
-    let missing_shadow_tables = FTS_MESSAGES_REQUIRED_SHADOW_TABLES
-        .iter()
-        .copied()
-        .filter(|table| !present_shadow_tables.contains(*table))
-        .collect::<Vec<_>>();
-
-    // If every required shadow table is present, the FTS5 schema is
-    // structurally sound. A probe-SQL failure here typically reflects an
-    // incomplete FTS5 runtime emulation (e.g. the legacy embedded engine's vtable path)
-    // rather than fixture corruption — and conflating the two would
-    // wrongly reject every database with the new message_id schema that
-    // the legacy embedded engine happens to serve via a different code path. Returning
-    // Ok here keeps the false-positive surface narrow; the truly-missing-
-    // shadow case below still surfaces as before.
-    if missing_shadow_tables.is_empty() {
-        return Ok(());
-    }
-
-    Err(FtsMessagesIntegrityError::new(
-        missing_shadow_tables,
-        probe_error
-            .as_ref()
-            .map(|_| FTS_MESSAGES_INTEGRITY_PROBE_SQL),
-        probe_error.map(|err| err.to_string()),
-    )
-    .into())
-}
-
-#[cfg(test)]
-pub(crate) fn materialize_fresh_fts_schema_via_rusqlite(db_path: &Path) -> Result<()> {
-    // Delegate to FrankenStorage: DROP TABLE IF EXISTS + CREATE VIRTUAL TABLE
-    // is fully supported by the legacy embedded engine FTS5 path at
-    // FrankenStorage::rebuild_fts_via_frankensqlite. We call rebuild which
-    // also populates rows, matching the historical semantics ("fresh FTS"
-    // means the schema exists and is consistent with message rows).
-    let storage = FrankenStorage::open(db_path).with_context(|| {
-        format!(
-            "opening the legacy embedded engine db at {} for FTS materialization",
-            db_path.display()
-        )
-    })?;
-    storage.rebuild_fts_via_frankensqlite().map(|_| ())
-}
-
-#[cfg(test)]
-pub(crate) fn rebuild_fts_via_rusqlite(db_path: &Path) -> Result<usize> {
-    let storage = FrankenStorage::open(db_path).with_context(|| {
-        format!(
-            "opening the legacy embedded engine db at {} for FTS rebuild",
-            db_path.display()
-        )
-    })?;
-    let inserted = storage.rebuild_fts_via_frankensqlite()?;
-    storage.record_fts_franken_rebuild_generation()?;
-    Ok(inserted)
-}
-
-pub(crate) fn ensure_fts_consistency_via_rusqlite(db_path: &Path) -> Result<FtsConsistencyRepair> {
-    // Delegates to the FrankenStorage-native path. The function name retains
-    // the `_via_rusqlite` suffix only for backwards compatibility with the
-    // few test-site callers; all operations now run through the legacy embedded engine.
-    let storage = FrankenStorage::open(db_path).with_context(|| {
-        format!(
-            "opening the legacy embedded engine db at {} for FTS consistency check",
-            db_path.display()
-        )
-    })?;
-    storage.ensure_search_fallback_fts_consistency()
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1342,20 +1074,6 @@ fn historical_bundle_schema_is_current(probe: &HistoricalBundleProbe) -> bool {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FtsConsistencyRepair {
-    AlreadyHealthy {
-        rows: usize,
-    },
-    IncrementalCatchUp {
-        inserted_rows: usize,
-        total_rows: usize,
-    },
-    Rebuilt {
-        inserted_rows: usize,
-    },
-}
-
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct HistoricalSalvageOutcome {
     pub bundles_considered: usize,
@@ -1585,6 +1303,21 @@ fn bundle_total_bytes(root_path: &Path) -> u64 {
     total
 }
 
+// W2-6 Task戊 (advisor 2026-08-31 ruling, 类C 排除): `discover_historical_database_bundles`
+// down through `bundle_health_rank`/`probe_historical_bundle`/
+// `probe_historical_bundle_via_sqlite3_metadata`/
+// `historical_bundle_fts_queryable_via_frankensqlite` (and
+// `HistoricalBundleProbe.fts_schema_rows`/`fts_queryable`) probe **historical
+// backup bundles already sitting on disk** -- restore-cass.sh's candidate
+// scoring, not "does the live DB use this table". A pre-W2-6 bundle can
+// legitimately still carry `fts_messages`; that is not corruption, it is the
+// bundle's era. These `fts_messages` references are deliberately KEPT, not
+// missed cleanup -- `bundle_health_rank`'s existing `Some(0) => schema_current`
+// branch was already written for the V14 "fts_messages dropped during
+// migration" case, so it classifies a fresh post-W2-6 bundle (always
+// `fts_schema_rows == Some(0)`) as clean without any code change here.
+// terminal-scan grep exception: this file, this function through
+// `historical_bundle_fts_queryable_via_frankensqlite`'s closing brace.
 pub(crate) fn discover_historical_database_bundles(
     db_path: &Path,
 ) -> Vec<HistoricalDatabaseBundle> {
@@ -2047,106 +1780,10 @@ fn record_historical_bundle_import(
     Ok(())
 }
 
-fn scrub_staged_derived_fts_metadata_via_sqlite3(staged_db_path: &Path) -> Result<()> {
-    let scrub_sql = "PRAGMA writable_schema = ON;
-         DELETE FROM sqlite_master
-          WHERE name = 'fts_messages'
-             OR tbl_name = 'fts_messages'
-             OR name IN (
-                'fts_messages_config',
-                'fts_messages_content',
-                'fts_messages_data',
-                'fts_messages_docsize',
-                'fts_messages_idx'
-             )
-             OR tbl_name IN (
-                'fts_messages_config',
-                'fts_messages_content',
-                'fts_messages_data',
-                'fts_messages_docsize',
-                'fts_messages_idx'
-             );
-         PRAGMA writable_schema = OFF;";
-
-    let run_scrub = |disable_defensive: bool| -> Result<std::process::Output> {
-        let mut command = Command::new("sqlite3");
-        command.arg("-batch").arg(staged_db_path);
-        if disable_defensive {
-            command.arg(".dbconfig defensive off");
-        }
-        command.arg(scrub_sql).output().with_context(|| {
-            format!(
-                "running sqlite3 staged FTS metadata scrub for {}",
-                staged_db_path.display()
-            )
-        })
-    };
-    let render_output = |output: &std::process::Output| -> String {
-        format!(
-            "status {}; stdout: {}; stderr: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout).trim(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-    };
-
-    let defensive_off_output = run_scrub(true)?;
-    if defensive_off_output.status.success() {
-        return Ok(());
-    }
-
-    let fallback_output = run_scrub(false)?;
-    if !fallback_output.status.success() {
-        anyhow::bail!(
-            "sqlite3 staged FTS metadata scrub failed for {}; defensive-off attempt {}; fallback without .dbconfig {}",
-            staged_db_path.display(),
-            render_output(&defensive_off_output),
-            render_output(&fallback_output)
-        );
-    }
-    Ok(())
-}
-
-fn ensure_seeded_canonical_fts_consistency(staged_db_path: &Path) -> Result<FtsConsistencyRepair> {
-    match ensure_fts_consistency_via_rusqlite(staged_db_path) {
-        Ok(repair) => Ok(repair),
-        Err(err) => {
-            if fts_messages_integrity_error_from_message(format!("{err:#}")).is_none() {
-                return Err(err).with_context(|| {
-                    format!(
-                        "repairing staged canonical FTS consistency before finalization: {}",
-                        staged_db_path.display()
-                    )
-                });
-            }
-
-            tracing::warn!(
-                path = %staged_db_path.display(),
-                error = %err,
-                "staged historical seed has malformed derived FTS metadata; scrubbing and rebuilding FTS on staged copy"
-            );
-            scrub_staged_derived_fts_metadata_via_sqlite3(staged_db_path).with_context(|| {
-                format!(
-                    "scrubbing malformed staged FTS metadata before finalization: {}",
-                    staged_db_path.display()
-                )
-            })?;
-            ensure_fts_consistency_via_rusqlite(staged_db_path).with_context(|| {
-                format!(
-                    "repairing staged canonical FTS consistency after metadata scrub: {}",
-                    staged_db_path.display()
-                )
-            })
-        }
-    }
-}
-
 fn finalize_seeded_canonical_bundle_via_rusqlite(
     canonical_db_path: &Path,
     bundle: &HistoricalDatabaseBundle,
 ) -> Result<(usize, usize)> {
-    let _fts_repair = ensure_seeded_canonical_fts_consistency(canonical_db_path)?;
-
     let path_str = canonical_db_path.to_string_lossy();
     let conn = FrankenConnection::open_writable(std::path::Path::new(&(path_str.as_ref())), crate::storage::api::Profile::Production).with_context(|| {
         format!(
@@ -2775,7 +2412,6 @@ pub struct FrankenStorage {
     ensured_workspaces: Arc<parking_lot::Mutex<HashMap<EnsuredWorkspaceKey, i64>>>,
     ensured_conversation_sources: Arc<parking_lot::Mutex<HashSet<EnsuredConversationSourceKey>>>,
     ensured_daily_stats_keys: Arc<parking_lot::Mutex<HashSet<EnsuredDailyStatsKey>>>,
-    fts_messages_present_cache: AtomicI8,
 }
 
 /// Keep ordinary storage commits from tripping over frequent auto-checkpoints
@@ -2784,9 +2420,6 @@ pub struct FrankenStorage {
 const DEFAULT_WAL_AUTOCHECKPOINT_PAGES: i64 = 4096;
 const UNSET_INDEX_WRITER_CHECKPOINT_PAGES: i64 = i64::MIN;
 const UNSET_INDEX_WRITER_BUSY_TIMEOUT_MS: u64 = 0;
-const FTS_MESSAGES_PRESENT_UNKNOWN: i8 = 0;
-const FTS_MESSAGES_PRESENT_ABSENT: i8 = 1;
-const FTS_MESSAGES_PRESENT_PRESENT: i8 = 2;
 
 enum CachedEphemeralWriter {
     Uninitialized,
@@ -2899,18 +2532,6 @@ where
     ))
 }
 
-pub(crate) fn error_message_indicates_populated_fts_shadow_without_rowid_reload(
-    message: &str,
-) -> bool {
-    let lower = message.to_ascii_lowercase();
-    let mentions_populated_without_rowid_shadow = (lower
-        .contains("loading populated without rowid table")
-        || lower.contains("reloading populated without rowid table"))
-        && (lower.contains("table `fts_messages_") || lower.contains("table fts_messages_"));
-
-    mentions_populated_without_rowid_shadow && lower.contains("not yet supported")
-}
-
 impl FrankenStorage {
     fn new(conn: FrankenConnection, db_path: PathBuf) -> Self {
         Self::new_with_shared_caches(
@@ -2944,7 +2565,6 @@ impl FrankenStorage {
             ensured_workspaces,
             ensured_conversation_sources,
             ensured_daily_stats_keys,
-            fts_messages_present_cache: AtomicI8::new(FTS_MESSAGES_PRESENT_UNKNOWN),
         }
     }
 
@@ -2994,7 +2614,6 @@ impl FrankenStorage {
             .with_context(|| format!("ensuring schema for database at {}", path.display()))?;
         storage.repair_missing_current_schema_objects()?;
         storage.apply_config()?;
-        storage.set_fts_messages_present_cache(true);
         Ok(storage)
     }
 
@@ -3045,24 +2664,21 @@ impl FrankenStorage {
         );
         storage.repair_missing_current_schema_objects()?;
         storage.apply_config()?;
-        storage.set_fts_messages_present_cache(true);
         Ok(storage)
     }
 
     /// w1b Task B4: wrap an already-open writable connection into a
-    /// `FrankenStorage`, applying the same writer-side setup
-    /// (`apply_config` + FTS-messages-present fast path) that
-    /// `open_writer`/`open_writer_with_shared_caches` apply to a connection
-    /// they open themselves. Does not open a new connection -- this exists
-    /// specifically so `storage::api::WriterHandle<FrankenStorage>` (whose
-    /// writer thread already owns exactly one `Conn`) can hand it in here
-    /// instead of a second call opening a second connection. Never call
+    /// `FrankenStorage`, applying the same writer-side setup (`apply_config`)
+    /// that `open_writer`/`open_writer_with_shared_caches` apply to a
+    /// connection they open themselves. Does not open a new connection --
+    /// this exists specifically so `storage::api::WriterHandle<FrankenStorage>`
+    /// (whose writer thread already owns exactly one `Conn`) can hand it in
+    /// here instead of a second call opening a second connection. Never call
     /// this with a connection whose lifetime is not already owned by the
     /// caller for exactly this purpose.
     pub(crate) fn from_writer_handle_conn(conn: FrankenConnection, db_path: PathBuf) -> Result<Self> {
         let storage = Self::new(conn, db_path);
         storage.apply_config()?;
-        storage.set_fts_messages_present_cache(true);
         Ok(storage)
     }
 
@@ -3085,7 +2701,6 @@ impl FrankenStorage {
                 writer
                     .index_writer_busy_timeout_ms
                     .store(busy_timeout_ms, Ordering::Relaxed);
-                writer.set_fts_messages_present_cache(true);
                 Ok((writer, true))
             }
             CachedEphemeralWriter::Uninitialized => {
@@ -3185,49 +2800,6 @@ impl FrankenStorage {
 
     fn mark_daily_stats_key_ensured(&self, key: EnsuredDailyStatsKey) {
         self.ensured_daily_stats_keys.lock().insert(key);
-    }
-
-    fn fts_messages_present_cached(&self, tx: &FrankenTransaction<'_>) -> bool {
-        match self.fts_messages_present_cache.load(Ordering::Acquire) {
-            FTS_MESSAGES_PRESENT_PRESENT => return true,
-            FTS_MESSAGES_PRESENT_ABSENT => return false,
-            _ => {}
-        }
-
-        let present = tx
-            .query_row_map(
-                "SELECT COUNT(*) FROM sqlite_master
-                 WHERE name = 'fts_messages'
-                   AND rootpage > 0",
-                fparams![],
-                |row| row.get_typed::<i64>(0),
-            )
-            .map(|count| count > 0)
-            .unwrap_or_else(|err| {
-                tracing::debug!(
-                    error = %err,
-                    "failed to probe fts_messages presence; skipping db-resident FTS maintenance"
-                );
-                false
-            });
-        self.set_fts_messages_present_cache(present);
-        present
-    }
-
-    fn set_fts_messages_present_cache(&self, present: bool) {
-        self.fts_messages_present_cache.store(
-            if present {
-                FTS_MESSAGES_PRESENT_PRESENT
-            } else {
-                FTS_MESSAGES_PRESENT_ABSENT
-            },
-            Ordering::Release,
-        );
-    }
-
-    fn invalidate_fts_messages_present_cache(&self) {
-        self.fts_messages_present_cache
-            .store(FTS_MESSAGES_PRESENT_UNKNOWN, Ordering::Release);
     }
 
     fn invalidate_conversation_source_cache(&self, source_id: &str) {
@@ -3389,15 +2961,7 @@ impl FrankenStorage {
                 );
             }
             Err(err) => {
-                let detail = format!("{err:#}");
-                if error_message_indicates_populated_fts_shadow_without_rowid_reload(&detail) {
-                    tracing::warn!(
-                        error = %detail,
-                        "the legacy embedded engine could not disable autocommit_retain because a populated derived FTS shadow table cannot yet be reloaded; continuing so canonical indexing can proceed"
-                    );
-                } else {
-                    return Err(err);
-                }
+                return Err(err);
             }
         }
 
@@ -6353,11 +5917,6 @@ impl FrankenStorage {
             Ok(())
         })?;
 
-        // The derived FTS shadow rows for the dropped messages are now stale.
-        // Invalidate the presence cache; the caller is responsible for the
-        // actual lexical rebuild (so multi-step cleanups rebuild once).
-        self.invalidate_fts_messages_present_cache();
-
         Ok(result)
     }
 
@@ -8465,9 +8024,6 @@ impl FrankenStorage {
                         let (inserted_last_idx, inserted_last_created_at) =
                             borrowed_messages_tail_state(&new_messages);
                         let mut inserted_indices = Vec::new();
-                        let mut fts_entries = Vec::new();
-                        let mut fts_pending_chars = 0usize;
-                        let mut _fts_inserted_total = 0usize;
                         let inserted_messages =
                             franken_append_insert_new_messages(tx, existing_id, &new_messages)?;
                         let inserted_chars = inserted_messages
@@ -8476,21 +8032,6 @@ impl FrankenStorage {
                             .sum::<i64>();
                         for (msg_id, msg) in inserted_messages {
                             franken_insert_snippets(tx, msg_id, &msg.snippets)?;
-                            if !defer_lexical_updates {
-                                fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
-                                fts_pending_chars = fts_pending_chars.saturating_add(msg.content.len());
-                                if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
-                                    || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
-                                {
-                                    flush_pending_fts_entries(
-                                        self,
-                                        tx,
-                                        &mut fts_entries,
-                                        &mut fts_pending_chars,
-                                        &mut _fts_inserted_total,
-                                    )?;
-                                }
-                            }
                             inserted_indices.push(msg.idx);
                         }
 
@@ -8505,15 +8046,6 @@ impl FrankenStorage {
                         }
 
                         if !defer_lexical_updates {
-                            flush_pending_fts_entries(
-                                self,
-                                tx,
-                                &mut fts_entries,
-                                &mut fts_pending_chars,
-                                &mut _fts_inserted_total,
-                            )?;
-                            // w2 Task W2-3: dual-rail — tantivy (above) plus the
-                            // new fail-closed lex_docs/fts_lex domain, same tx.
                             sync_lexical_domain_for_conversation_in_tx(tx, existing_id)?;
                         }
 
@@ -8558,9 +8090,6 @@ impl FrankenStorage {
                         });
                     }
                 };
-                let mut fts_entries = Vec::new();
-                let mut fts_pending_chars = 0usize;
-                let mut _fts_inserted_total = 0usize;
                 let mut total_chars: i64 = 0;
                 let mut inserted_indices = Vec::new();
                 let mut pending_messages = HashMap::new();
@@ -8594,21 +8123,6 @@ impl FrankenStorage {
                 let inserted_message_ids = franken_batch_insert_new_messages(tx, conv_id, &new_messages)?;
                 for (msg_id, msg) in inserted_message_ids.into_iter().zip(new_messages) {
                     franken_insert_snippets(tx, msg_id, &msg.snippets)?;
-                    if !defer_lexical_updates {
-                        fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
-                        fts_pending_chars = fts_pending_chars.saturating_add(msg.content.len());
-                        if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
-                            || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
-                        {
-                            flush_pending_fts_entries(
-                                self,
-                                tx,
-                                &mut fts_entries,
-                                &mut fts_pending_chars,
-                                &mut _fts_inserted_total,
-                            )?;
-                        }
-                    }
                     total_chars += msg.content.len() as i64;
                     inserted_indices.push(msg.idx);
                 }
@@ -8622,15 +8136,6 @@ impl FrankenStorage {
                     );
                 }
                 if !defer_lexical_updates {
-                    flush_pending_fts_entries(
-                        self,
-                        tx,
-                        &mut fts_entries,
-                        &mut fts_pending_chars,
-                        &mut _fts_inserted_total,
-                    )?;
-                    // w2 Task W2-3: dual-rail — tantivy (above) plus the new
-                    // fail-closed lex_docs/fts_lex domain, same tx.
                     sync_lexical_domain_for_conversation_in_tx(tx, conv_id)?;
                 }
 
@@ -9098,9 +8603,6 @@ impl FrankenStorage {
         };
 
         let mut inserted_indices = Vec::new();
-        let mut fts_entries = Vec::new();
-        let mut fts_pending_chars = 0usize;
-        let mut _fts_inserted_total = 0usize;
         let (inserted_last_idx, inserted_last_created_at) =
             borrowed_messages_tail_state(&new_messages);
         let inserted_messages =
@@ -9111,21 +8613,6 @@ impl FrankenStorage {
             .sum::<i64>();
         for (msg_id, msg) in inserted_messages {
             franken_insert_snippets(tx, msg_id, &msg.snippets)?;
-            if !defer_lexical_updates {
-                fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
-                fts_pending_chars = fts_pending_chars.saturating_add(msg.content.len());
-                if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
-                    || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
-                {
-                    flush_pending_fts_entries(
-                        self,
-                        tx,
-                        &mut fts_entries,
-                        &mut fts_pending_chars,
-                        &mut _fts_inserted_total,
-                    )?;
-                }
-            }
             inserted_indices.push(msg.idx);
         }
 
@@ -9140,15 +8627,6 @@ impl FrankenStorage {
         }
 
         if !defer_lexical_updates {
-            flush_pending_fts_entries(
-                self,
-                tx,
-                &mut fts_entries,
-                &mut fts_pending_chars,
-                &mut _fts_inserted_total,
-            )?;
-            // w2 Task W2-3: dual-rail — tantivy (above) plus the new
-            // fail-closed lex_docs/fts_lex domain, same tx.
             sync_lexical_domain_for_conversation_in_tx(tx, conversation_id)?;
         }
 
@@ -9219,52 +8697,6 @@ impl FrankenStorage {
         })
     }
 
-    /// Rebuild the FTS5 index from scratch (chunked to avoid OOM on large databases, #110).
-    pub fn rebuild_fts(&self) -> Result<()> {
-        self.rebuild_fts_via_frankensqlite().map(|_| ())
-    }
-
-    /// Best-effort repair for the derived SQLite FTS fallback index.
-    ///
-    /// The canonical archive and Tantivy index remain authoritative, so callers
-    /// should invoke this from maintenance paths rather than ordinary opens.
-    pub(crate) fn ensure_search_fallback_fts_consistency(&self) -> Result<FtsConsistencyRepair> {
-        self.ensure_fts_consistency_via_frankensqlite()
-    }
-
-    pub(crate) fn validate_fts_messages_integrity(&self) -> Result<()> {
-        validate_fts_messages_integrity_for_connection(&self.conn)
-    }
-
-    pub(crate) fn fallback_fts_is_known_healthy_for_archive_fingerprint(
-        &self,
-        archive_fingerprint: &str,
-    ) -> Result<bool> {
-        Ok(
-            self.read_fts_franken_rebuild_generation()? == Some(FTS_FRANKEN_REBUILD_GENERATION)
-                && self
-                    .read_fts_franken_rebuild_archive_fingerprint()?
-                    .as_deref()
-                    == Some(archive_fingerprint),
-        )
-    }
-
-    pub(crate) fn record_search_fallback_fts_archive_fingerprint(
-        &self,
-        archive_fingerprint: &str,
-    ) -> Result<()> {
-        self.conn
-            .execute(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
-                fparams![
-                    FTS_FRANKEN_REBUILD_FINGERPRINT_META_KEY,
-                    archive_fingerprint.to_string()
-                ],
-            )
-            .with_context(|| "recording the legacy embedded engine FTS archive fingerprint")?;
-        Ok(())
-    }
-
     pub(crate) fn daily_stats_is_known_healthy_for_archive_fingerprint(
         &self,
         archive_fingerprint: &str,
@@ -9298,29 +8730,6 @@ impl FrankenStorage {
         Ok(())
     }
 
-    fn read_fts_franken_rebuild_generation(&self) -> Result<Option<i64>> {
-        let value: Option<String> = self
-            .conn
-            .query_row_map(
-                "SELECT value FROM meta WHERE key = ?1",
-                fparams![FTS_FRANKEN_REBUILD_META_KEY],
-                |row| row.get_typed(0),
-            )
-            .optional()?;
-        Ok(value.and_then(|v| v.parse::<i64>().ok()))
-    }
-
-    fn read_fts_franken_rebuild_archive_fingerprint(&self) -> Result<Option<String>> {
-        Ok(self
-            .conn
-            .query_row_map(
-                "SELECT value FROM meta WHERE key = ?1",
-                fparams![FTS_FRANKEN_REBUILD_FINGERPRINT_META_KEY],
-                |row| row.get_typed(0),
-            )
-            .optional()?)
-    }
-
     fn read_daily_stats_health_generation(&self) -> Result<Option<i64>> {
         let value: Option<String> = self
             .conn
@@ -9344,383 +8753,6 @@ impl FrankenStorage {
             .optional()?)
     }
 
-    fn record_fts_franken_rebuild_generation(&self) -> Result<()> {
-        self.conn
-            .execute(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
-                fparams![
-                    FTS_FRANKEN_REBUILD_META_KEY,
-                    FTS_FRANKEN_REBUILD_GENERATION.to_string()
-                ],
-            )
-            .with_context(|| "recording the legacy embedded engine FTS rebuild generation")?;
-        Ok(())
-    }
-
-    fn ensure_fts_consistency_via_frankensqlite(&self) -> Result<FtsConsistencyRepair> {
-        if self.read_fts_franken_rebuild_generation()? != Some(FTS_FRANKEN_REBUILD_GENERATION) {
-            // Before triggering an expensive full rebuild, probe whether
-            // fts_messages is already populated and consistent.  On large
-            // databases the rebuild can take hours and OOM — skip it when
-            // the only thing missing is the generation marker (#184).
-            let fts_already_healthy = (|| -> Result<bool> {
-                let fts_exists: i64 = self.conn.query_row_map(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
-                    fparams![],
-                    |row| row.get_typed(0),
-                )?;
-                if fts_exists != 1 {
-                    return Ok(false);
-                }
-                let total: i64 = self.conn.query_row_map(
-                    "SELECT COUNT(*) FROM messages",
-                    fparams![],
-                    |row| row.get_typed(0),
-                )?;
-                if total == 0 {
-                    return Ok(false);
-                }
-                let indexed: i64 = self.conn.query_row_map(
-                    "SELECT COUNT(*) FROM fts_messages",
-                    fparams![],
-                    |row| row.get_typed(0),
-                )?;
-                // Consider healthy if >=90% of messages are indexed
-                Ok(indexed > 0 && indexed * 100 >= total * 90)
-            })()
-            .unwrap_or(false);
-
-            if fts_already_healthy {
-                tracing::info!(
-                    target: "cass::fts_rebuild",
-                    "FTS already populated and consistent; setting generation marker without rebuild"
-                );
-                self.record_fts_franken_rebuild_generation()?;
-                self.set_fts_messages_present_cache(true);
-            } else {
-                let inserted_rows = self.rebuild_fts_via_frankensqlite()?;
-                self.record_fts_franken_rebuild_generation()?;
-                return Ok(FtsConsistencyRepair::Rebuilt { inserted_rows });
-            }
-        }
-
-        let inspection = (|| -> Result<(i64, bool)> {
-            let fts_schema_rows = self.conn.query_row_map(
-                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
-                fparams![],
-                |row| row.get_typed::<i64>(0),
-            )?;
-            let fts_queryable = fts_schema_rows == 1
-                && self
-                    .conn
-                    .query_all_map("SELECT COUNT(*) FROM fts_messages", &[], |_row| Ok(()))
-                    .is_ok();
-            Ok((fts_schema_rows, fts_queryable))
-        })();
-
-        let (fts_schema_rows, fts_queryable) = match inspection {
-            Ok(result) => result,
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    "the legacy embedded engine FTS consistency probe failed; rebuilding authoritative FTS"
-                );
-                let inserted_rows = self.rebuild_fts_via_frankensqlite()?;
-                self.record_fts_franken_rebuild_generation()?;
-                return Ok(FtsConsistencyRepair::Rebuilt { inserted_rows });
-            }
-        };
-
-        if fts_schema_rows != 1 || !fts_queryable {
-            let inserted_rows = self.rebuild_fts_via_frankensqlite()?;
-            self.record_fts_franken_rebuild_generation()?;
-            return Ok(FtsConsistencyRepair::Rebuilt { inserted_rows });
-        }
-
-        let total_messages =
-            self.conn
-                .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
-                    row.get_typed::<i64>(0)
-                })?;
-        let indexed_messages =
-            self.conn
-                .query_row_map("SELECT COUNT(*) FROM fts_messages", fparams![], |row| {
-                    row.get_typed::<i64>(0)
-                })?;
-
-        if indexed_messages == total_messages {
-            self.set_fts_messages_present_cache(true);
-            return Ok(FtsConsistencyRepair::AlreadyHealthy {
-                rows: usize::try_from(total_messages.max(0)).unwrap_or(usize::MAX),
-            });
-        }
-
-        if indexed_messages > total_messages {
-            let inserted_rows = self.rebuild_fts_via_frankensqlite()?;
-            self.record_fts_franken_rebuild_generation()?;
-            return Ok(FtsConsistencyRepair::Rebuilt { inserted_rows });
-        }
-
-        let inserted_rows = self
-            .stream_fts_rows_via_frankensqlite(true)
-            .with_context(|| "incrementally repairing missing FTS rows via the legacy embedded engine")?;
-        let repaired_rows =
-            self.conn
-                .query_row_map("SELECT COUNT(*) FROM fts_messages", fparams![], |row| {
-                    row.get_typed::<i64>(0)
-                })?;
-        if repaired_rows == total_messages {
-            self.set_fts_messages_present_cache(true);
-            return Ok(FtsConsistencyRepair::IncrementalCatchUp {
-                inserted_rows,
-                total_rows: usize::try_from(repaired_rows.max(0)).unwrap_or(usize::MAX),
-            });
-        }
-
-        // The incremental catch-up found nothing to insert, yet the gap
-        // between total_messages (all rows, including orphans) and
-        // indexed_messages (only rows with valid conversation_id, since the
-        // FTS INSERT inner-joins on conversations) remains.  A full rebuild
-        // cannot close this gap either — the orphaned messages will be
-        // excluded again — so falling through to one would just re-do ~5 min
-        // of work on every startup.  Accept the current state.
-        if inserted_rows == 0 {
-            tracing::debug!(
-                target: "cass::fts_rebuild",
-                indexed_messages = repaired_rows,
-                total_messages,
-                un_indexable_gap = total_messages.saturating_sub(repaired_rows),
-                "FTS catch-up inserted 0 rows; remaining gap is un-indexable (likely orphaned messages with dangling conversation_id)"
-            );
-            self.set_fts_messages_present_cache(true);
-            return Ok(FtsConsistencyRepair::IncrementalCatchUp {
-                inserted_rows: 0,
-                total_rows: usize::try_from(repaired_rows.max(0)).unwrap_or(usize::MAX),
-            });
-        }
-
-        // Incremental made progress but didn't fully close the gap — something
-        // is genuinely inconsistent, so do a full rebuild.
-        let inserted_rows = self.rebuild_fts_via_frankensqlite()?;
-        self.record_fts_franken_rebuild_generation()?;
-        Ok(FtsConsistencyRepair::Rebuilt { inserted_rows })
-    }
-
-    pub(crate) fn rebuild_fts_via_frankensqlite(&self) -> Result<usize> {
-        self.invalidate_fts_messages_present_cache();
-        self.conn
-            .execute("DROP TABLE IF EXISTS fts_messages;", &[])
-            .with_context(|| "dropping derived fts_messages before the legacy embedded engine rebuild")?;
-        self.conn
-            .execute(FTS5_REGISTER_SQL, fparams![])
-            .with_context(|| "creating derived fts_messages via the legacy embedded engine rebuild")?;
-        self.set_fts_messages_present_cache(true);
-
-        self.stream_fts_rows_via_frankensqlite(false)
-    }
-
-    /// `coding_agent_session_search-uhhxy`: rebuild the in-DB FTS5 shadow
-    /// (`fts_messages`) after `cass dedup --apply` drops duplicate
-    /// conversation rows, so the canonical-DB-backed full-text shadow no
-    /// longer references messages that were deleted. The separate on-disk
-    /// lexical search index (frankensearch) is rebuilt by the blessed
-    /// `cass index --full` path; this wrapper only reconciles the in-DB
-    /// shadow that the dedup deletion left stale.
-    pub fn rebuild_lexical_index_after_dedup(&self) -> Result<()> {
-        self.rebuild_fts_via_frankensqlite().map(|_| ())
-    }
-
-    fn stream_fts_rows_via_frankensqlite(&self, missing_only: bool) -> Result<usize> {
-        let batch_size = fts_rebuild_batch_size().max(1);
-        let batch_limit = i64::try_from(batch_size).unwrap_or(i64::MAX);
-        let mut total_inserted: usize = 0;
-        let mut total_skipped_orphans: usize = 0;
-        let mut total_skipped_existing: usize = 0;
-        let mut last_rowid: i64 = 0;
-        let conversation_by_id = self.load_fts_conversation_projection_map()?;
-        let agent_slug_by_id = self.load_fts_agent_slug_map()?;
-        let workspace_path_by_id = self.load_fts_workspace_path_map()?;
-        let existing_fts_rowids = if missing_only {
-            Some(self.load_fts_message_rowid_set()?)
-        } else {
-            None
-        };
-        let mut entries = Vec::new();
-        let mut pending_chars = 0usize;
-
-        loop {
-            let rows = self.fetch_fts_rebuild_message_rows(last_rowid, batch_limit)?;
-            let fetched_count = rows.len();
-            if fetched_count == 0 {
-                break;
-            }
-
-            let inserted_before_batch = total_inserted;
-            let skipped_before_batch = total_skipped_orphans;
-            let existing_before_batch = total_skipped_existing;
-
-            for row in rows {
-                last_rowid = row.rowid;
-                if existing_fts_rowids
-                    .as_ref()
-                    .is_some_and(|rowids| rowids.contains(&row.message_id))
-                {
-                    total_skipped_existing = total_skipped_existing.saturating_add(1);
-                    continue;
-                }
-                let Some(conversation) = conversation_by_id.get(&row.conversation_id) else {
-                    total_skipped_orphans = total_skipped_orphans.saturating_add(1);
-                    continue;
-                };
-                let agent = conversation
-                    .agent_id
-                    .and_then(|agent_id| agent_slug_by_id.get(&agent_id))
-                    .filter(|slug| !slug.is_empty())
-                    .cloned()
-                    .unwrap_or_else(|| "unknown".to_string());
-                let workspace = conversation
-                    .workspace_id
-                    .and_then(|workspace_id| workspace_path_by_id.get(&workspace_id))
-                    .cloned()
-                    .unwrap_or_default();
-                pending_chars = pending_chars.saturating_add(row.content.len());
-                entries.push(FtsEntry {
-                    content: row.content,
-                    title: conversation.title.clone(),
-                    agent,
-                    workspace,
-                    source_path: conversation.source_path.clone(),
-                    created_at: row.created_at,
-                    message_id: row.message_id,
-                });
-                if entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
-                    || pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
-                {
-                    total_inserted = total_inserted.saturating_add(
-                        franken_batch_insert_fts_on_connection(&self.conn, &entries)?,
-                    );
-                    entries.clear();
-                    pending_chars = 0;
-                }
-            }
-
-            if !entries.is_empty() {
-                total_inserted = total_inserted.saturating_add(
-                    franken_batch_insert_fts_on_connection(&self.conn, &entries)?,
-                );
-                entries.clear();
-                pending_chars = 0;
-            }
-
-            tracing::debug!(
-                target: "cass::fts_rebuild",
-                batch_rows = fetched_count,
-                batch_inserted = total_inserted.saturating_sub(inserted_before_batch),
-                batch_skipped_orphans = total_skipped_orphans.saturating_sub(skipped_before_batch),
-                batch_skipped_existing = total_skipped_existing.saturating_sub(existing_before_batch),
-                total_inserted,
-                total_skipped_orphans,
-                total_skipped_existing,
-                last_rowid,
-                missing_only,
-                "FTS streaming maintenance batch complete"
-            );
-
-            if fetched_count < batch_size {
-                break;
-            }
-        }
-
-        Ok(total_inserted)
-    }
-
-    fn fetch_fts_rebuild_message_rows(
-        &self,
-        last_rowid: i64,
-        batch_limit: i64,
-    ) -> Result<Vec<FtsRebuildMessageRow>> {
-        self.conn
-            .query_all_map(
-                "SELECT m.rowid, m.id, m.conversation_id, m.content, m.created_at
-                 FROM messages m
-                 WHERE m.rowid > ?1
-                 ORDER BY m.rowid
-                 LIMIT ?2",
-                fparams![last_rowid, batch_limit],
-                |row| {
-                    Ok(FtsRebuildMessageRow {
-                        rowid: row.get_typed(0)?,
-                        message_id: row.get_typed(1)?,
-                        conversation_id: row.get_typed(2)?,
-                        content: row.get_typed::<Option<String>>(3)?.unwrap_or_default(),
-                        created_at: row.get_typed(4)?,
-                    })
-                },
-            )
-            .with_context(|| format!("fetching FTS maintenance messages after rowid {last_rowid}"))
-    }
-
-    fn load_fts_message_rowid_set(&self) -> Result<HashSet<i64>> {
-        let rows: Vec<i64> = self
-            .conn
-            .query_all_map("SELECT rowid FROM fts_messages", fparams![], |row| {
-                row.get_typed(0)
-            })
-            .with_context(|| "loading existing FTS message rowids")?;
-        Ok(rows.into_iter().collect())
-    }
-
-    fn load_fts_conversation_projection_map(
-        &self,
-    ) -> Result<HashMap<i64, FtsConversationProjection>> {
-        let rows: Vec<(i64, FtsConversationProjection)> = self
-            .conn
-            .query_all_map(
-                "SELECT id, title, agent_id, workspace_id, source_path
-                 FROM conversations",
-                fparams![],
-                |row| {
-                    Ok((
-                        row.get_typed(0)?,
-                        FtsConversationProjection {
-                            title: row.get_typed::<Option<String>>(1)?.unwrap_or_default(),
-                            agent_id: row.get_typed(2)?,
-                            workspace_id: row.get_typed(3)?,
-                            source_path: row.get_typed::<Option<String>>(4)?.unwrap_or_default(),
-                        },
-                    ))
-                },
-            )
-            .with_context(|| "loading FTS conversation projection map")?;
-        Ok(rows.into_iter().collect())
-    }
-
-    fn load_fts_agent_slug_map(&self) -> Result<HashMap<i64, String>> {
-        let rows: Vec<(i64, String)> = self
-            .conn
-            .query_all_map("SELECT id, slug FROM agents", fparams![], |row| {
-                Ok((
-                    row.get_typed(0)?,
-                    row.get_typed::<Option<String>>(1)?
-                        .unwrap_or_else(|| "unknown".to_string()),
-                ))
-            })
-            .with_context(|| "loading FTS agent slug map")?;
-        Ok(rows.into_iter().collect())
-    }
-
-    fn load_fts_workspace_path_map(&self) -> Result<HashMap<i64, String>> {
-        let rows: Vec<(i64, String)> = self
-            .conn
-            .query_all_map("SELECT id, path FROM workspaces", fparams![], |row| {
-                Ok((
-                    row.get_typed(0)?,
-                    row.get_typed::<Option<String>>(1)?.unwrap_or_default(),
-                ))
-            })
-            .with_context(|| "loading FTS workspace path map")?;
-        Ok(rows.into_iter().collect())
-    }
 
     /// Fetch all messages for embedding generation.
     pub fn fetch_messages_for_embedding(&self) -> Result<Vec<MessageForEmbedding>> {
@@ -10131,10 +9163,6 @@ impl FrankenStorage {
                 ensure_sources_in_tx(tx, conversations)?;
 
                 let mut outcomes = Vec::with_capacity(conversations.len());
-                let mut fts_entries = Vec::new();
-                let mut fts_pending_chars = 0usize;
-                let mut fts_inserted_total = 0usize;
-                let mut fts_count_total = 0usize;
                 let mut stats = StatsAggregator::new();
                 let mut token_stats = TokenStatsAggregator::new();
                 let mut token_entries: Vec<TokenUsageEntry> = Vec::new();
@@ -10201,22 +9229,6 @@ impl FrankenStorage {
                             .sum::<i64>();
                         for (msg_id, msg) in inserted_append_messages {
                             franken_insert_snippets(tx, msg_id, &msg.snippets)?;
-                            if !defer_lexical_updates {
-                                fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
-                                fts_count_total += 1;
-                                fts_pending_chars = fts_pending_chars.saturating_add(msg.content.len());
-                                if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
-                                    || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
-                                {
-                                    flush_pending_fts_entries(
-                                        self,
-                                        tx,
-                                        &mut fts_entries,
-                                        &mut fts_pending_chars,
-                                        &mut fts_inserted_total,
-                                    )?;
-                                }
-                            }
                             inserted_indices.push(msg.idx);
                             inserted_messages.push((msg_id, msg));
                         }
@@ -10285,23 +9297,6 @@ impl FrankenStorage {
                                     franken_batch_insert_new_messages(tx, new_conv_id, &new_messages)?;
                                 for (msg_id, msg) in inserted_message_ids.into_iter().zip(new_messages) {
                                     franken_insert_snippets(tx, msg_id, &msg.snippets)?;
-                                    if !defer_lexical_updates {
-                                        fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
-                                        fts_count_total += 1;
-                                        fts_pending_chars =
-                                            fts_pending_chars.saturating_add(msg.content.len());
-                                        if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
-                                            || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
-                                        {
-                                            flush_pending_fts_entries(
-                                                self,
-                                                tx,
-                                                &mut fts_entries,
-                                                &mut fts_pending_chars,
-                                                &mut fts_inserted_total,
-                                            )?;
-                                        }
-                                    }
                                     total_chars += msg.content.len() as i64;
                                     inserted_indices.push(msg.idx);
                                     inserted_messages.push((msg_id, msg));
@@ -10338,23 +9333,6 @@ impl FrankenStorage {
                                     .sum::<i64>();
                                 for (msg_id, msg) in inserted_append_messages {
                                     franken_insert_snippets(tx, msg_id, &msg.snippets)?;
-                                    if !defer_lexical_updates {
-                                        fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
-                                        fts_count_total += 1;
-                                        fts_pending_chars =
-                                            fts_pending_chars.saturating_add(msg.content.len());
-                                        if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
-                                            || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
-                                        {
-                                            flush_pending_fts_entries(
-                                                self,
-                                                tx,
-                                                &mut fts_entries,
-                                                &mut fts_pending_chars,
-                                                &mut fts_inserted_total,
-                                            )?;
-                                        }
-                                    }
                                     inserted_indices.push(msg.idx);
                                     inserted_messages.push((msg_id, msg));
                                 }
@@ -10600,26 +9578,6 @@ impl FrankenStorage {
                         conversation_inserted: session_count_delta > 0,
                         inserted_indices,
                     });
-                }
-
-                // Batch insert all FTS entries at once
-                if !defer_lexical_updates {
-                    flush_pending_fts_entries(
-                        self,
-                        tx,
-                        &mut fts_entries,
-                        &mut fts_pending_chars,
-                        &mut fts_inserted_total,
-                    )?;
-                }
-                if !defer_lexical_updates && fts_count_total > 0 {
-                    tracing::debug!(
-                        target: "cass::perf::fts5",
-                        total = fts_count_total,
-                        inserted = fts_inserted_total,
-                        conversations = conversations.len(),
-                        "franken_batch_fts_insert_complete"
-                    );
                 }
 
                 // Batched daily_stats update
@@ -12403,143 +11361,6 @@ pub(crate) fn sync_lexical_domain_for_conversation_in_tx(
         .with_context(|| format!("inserting fts_lex row for message {doc_id}"))?;
     }
     Ok(())
-}
-
-/// Batch insert FTS5 entries within a legacy embedded engine transaction.
-fn franken_batch_insert_fts(
-    storage: &FrankenStorage,
-    tx: &FrankenTransaction<'_>,
-    entries: &[FtsEntry],
-) -> Result<usize> {
-    if entries.is_empty() {
-        return Ok(0);
-    }
-
-    let mut inserted = 0;
-
-    for chunk in entries.chunks(FTS5_BATCH_SIZE) {
-        let placeholders: String = chunk
-            .iter()
-            .enumerate()
-            .map(|(i, _)| {
-                let base = i * 7 + 1; // +1 for 1-indexed params
-                format!(
-                    "(?{},?{},?{},?{},?{},?{},?{})",
-                    base,
-                    base + 1,
-                    base + 2,
-                    base + 3,
-                    base + 4,
-                    base + 5,
-                    base + 6
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-
-        let sql = format!(
-            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at) VALUES {placeholders}"
-        );
-
-        let mut param_values: Vec<SqliteValue> = Vec::with_capacity(chunk.len() * 7);
-        for entry in chunk {
-            param_values.push(SqliteValue::from(entry.message_id));
-            param_values.push(SqliteValue::from(entry.content.as_str()));
-            param_values.push(SqliteValue::from(entry.title.as_str()));
-            param_values.push(SqliteValue::from(entry.agent.as_str()));
-            param_values.push(SqliteValue::from(entry.workspace.as_str()));
-            param_values.push(SqliteValue::from(entry.source_path.as_str()));
-            param_values.push(SqliteValue::from(entry.created_at));
-        }
-
-        match tx.execute(&sql, &param_values) {
-            Ok(_) => {
-                inserted += chunk.len();
-            }
-            Err(err) => {
-                if err.to_string().contains("no such table") {
-                    // Fresh DB / Tantivy-authoritative path (#295): the FTS5
-                    // shadow tables are not materialized yet. db-resident FTS
-                    // is best-effort here, so stop probing/inserting for the
-                    // rest of this process instead of emitting a warning on
-                    // every batch (which pegged a core on large corpora).
-                    storage.set_fts_messages_present_cache(false);
-                    tracing::debug!(
-                        error = %err,
-                        chunk_docs = chunk.len(),
-                        "fts_messages not materialized yet; skipping db-resident FTS maintenance (Tantivy is authoritative)"
-                    );
-                } else {
-                    tracing::warn!(
-                        error = %err,
-                        chunk_docs = chunk.len(),
-                        "the legacy embedded engine FTS batch insert failed; skipping db-resident FTS maintenance because Tantivy is authoritative"
-                    );
-                }
-                return Ok(inserted);
-            }
-        }
-    }
-
-    Ok(inserted)
-}
-
-fn franken_batch_insert_fts_on_connection(
-    conn: &FrankenConnection,
-    entries: &[FtsEntry],
-) -> Result<usize> {
-    if entries.is_empty() {
-        return Ok(0);
-    }
-
-    let mut inserted = 0;
-
-    for chunk in entries.chunks(FTS5_BATCH_SIZE) {
-        let placeholders: String = chunk
-            .iter()
-            .enumerate()
-            .map(|(i, _)| {
-                let base = i * 7 + 1;
-                format!(
-                    "(?{},?{},?{},?{},?{},?{},?{})",
-                    base,
-                    base + 1,
-                    base + 2,
-                    base + 3,
-                    base + 4,
-                    base + 5,
-                    base + 6
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-
-        let sql = format!(
-            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at) VALUES {placeholders}"
-        );
-
-        let mut param_values: Vec<SqliteValue> = Vec::with_capacity(chunk.len() * 7);
-        for entry in chunk {
-            param_values.push(SqliteValue::from(entry.message_id));
-            param_values.push(SqliteValue::from(entry.content.as_str()));
-            param_values.push(SqliteValue::from(entry.title.as_str()));
-            param_values.push(SqliteValue::from(entry.agent.as_str()));
-            param_values.push(SqliteValue::from(entry.workspace.as_str()));
-            param_values.push(SqliteValue::from(entry.source_path.as_str()));
-            param_values.push(SqliteValue::from(entry.created_at));
-        }
-
-        conn.execute(&sql, &param_values)
-            .with_context(|| {
-                format!(
-                    "inserting {} rows into fts_messages during streaming FTS maintenance",
-                    chunk.len()
-                )
-            })?;
-        inserted += chunk.len();
-    }
-
-    Ok(inserted)
 }
 
 /// Update daily stats within a legacy embedded engine transaction.
@@ -15812,125 +14633,6 @@ pub struct DailyStatsHealth {
     pub conversation_count: i64,
     pub materialized_total: i64,
     pub drift: i64,
-}
-
-// -------------------------------------------------------------------------
-// FTS5 Batch Insert (P2 Opt 2.1)
-// -------------------------------------------------------------------------
-
-/// Rows per FTS5 INSERT statement during db-resident `fts_messages`
-/// maintenance/rebuild. Each row binds 7 columns (rowid + 6 cols), and
-/// the legacy embedded engine's `MAX_VARIABLE_NUMBER` is 32766, so the hard ceiling is
-/// 32766 / 7 = 4680 rows per statement; 4096 leaves margin (28672 params).
-///
-/// This value is performance-critical, NOT just a memory knob
-/// (`coding_agent_session_search-nhqw0` / gh #301): `fts_messages` is a
-/// contentless FTS5 table (`content=''`), which routes every INSERT through
-/// the legacy embedded engine's `persist_rootpage_zero_fts5_shadow_rows` full-table
-/// re-encode (`build_pending_hash` re-tokenizes *all* rows). The cost of one
-/// INSERT is therefore O(rows-so-far) regardless of the statement's row count,
-/// so the total rebuild cost is (number of INSERT statements) × O(table). The
-/// old value of 100 fragmented a single ~512-row flush into ~6 statements and
-/// turned a multi-MB rebuild into ~120 whole-table re-encodes (O(N²)), which
-/// wedged `cass index --full` above ~15-30 MB of content. Issuing one large
-/// param-safe statement per flush collapses that to a handful of re-encodes.
-/// The asymptotic fix (incremental contentless persistence) is tracked in
-/// the legacy embedded engine bd-sf8dx.
-const FTS5_BATCH_SIZE: usize = 4096;
-
-#[derive(Debug, Clone)]
-struct FtsRebuildMessageRow {
-    rowid: i64,
-    message_id: i64,
-    conversation_id: i64,
-    content: String,
-    created_at: Option<i64>,
-}
-
-#[derive(Debug, Clone)]
-struct FtsConversationProjection {
-    title: String,
-    agent_id: Option<i64>,
-    workspace_id: Option<i64>,
-    source_path: String,
-}
-
-/// Entry for pending FTS5 insert.
-#[derive(Debug, Clone)]
-pub struct FtsEntry {
-    pub content: String,
-    pub title: String,
-    pub agent: String,
-    pub workspace: String,
-    pub source_path: String,
-    pub created_at: Option<i64>,
-    pub message_id: i64,
-}
-
-impl FtsEntry {
-    /// Create an FTS entry from a message and conversation.
-    pub fn from_message(message_id: i64, msg: &Message, conv: &Conversation) -> Self {
-        FtsEntry {
-            content: msg.content.clone(),
-            title: conv.title.clone().unwrap_or_default(),
-            agent: conv.agent_slug.clone(),
-            workspace: conv
-                .workspace
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            source_path: path_to_string(&conv.source_path),
-            created_at: msg.created_at.or(conv.started_at),
-            message_id,
-        }
-    }
-}
-
-// Per-flush accumulation caps for the streaming FTS rebuild/maintenance paths.
-// A flush is emitted once either cap is hit, then handed to
-// `franken_batch_insert_fts_on_connection`, which splits it into
-// `FTS5_BATCH_SIZE`-row INSERT statements. Because each contentless-FTS INSERT
-// re-encodes the whole table (see `FTS5_BATCH_SIZE` above /
-// `coding_agent_session_search-nhqw0`), these caps must be large enough that a
-// flush is a single param-safe statement — keeping the doc cap at/under
-// `FTS5_BATCH_SIZE` means one flush == one INSERT == one re-encode. The char
-// cap bounds peak entry-buffer memory for pathologically large messages.
-const FTS_ENTRY_BATCH_MAX_DOCS: usize = 4000;
-const FTS_ENTRY_BATCH_MAX_CHARS: usize = 32 * 1024 * 1024;
-
-/// Default batch size for the FTS rebuild INSERT (Bug #168).  When
-/// `fts_messages` is empty but `messages` has 100K+ rows, a single unbounded
-/// INSERT-SELECT OOMs.  This constant caps each batch so peak memory stays
-/// bounded.  Override via `CASS_FTS_REBUILD_BATCH_SIZE` for tuning.
-const FTS_REBUILD_BATCH_SIZE_DEFAULT: usize = 5_000;
-
-/// Read the FTS rebuild batch size from the environment, falling back to the
-/// compiled-in default.
-fn fts_rebuild_batch_size() -> usize {
-    dotenvy::var("CASS_FTS_REBUILD_BATCH_SIZE")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(FTS_REBUILD_BATCH_SIZE_DEFAULT)
-}
-
-fn flush_pending_fts_entries(
-    storage: &FrankenStorage,
-    tx: &FrankenTransaction<'_>,
-    entries: &mut Vec<FtsEntry>,
-    pending_chars: &mut usize,
-    inserted_total: &mut usize,
-) -> Result<()> {
-    if entries.is_empty() {
-        return Ok(());
-    }
-
-    if storage.fts_messages_present_cached(tx) {
-        *inserted_total += franken_batch_insert_fts(storage, tx, entries)?;
-    }
-    entries.clear();
-    *pending_chars = 0;
-    Ok(())
 }
 
 fn path_to_string<P: AsRef<Path>>(p: P) -> String {
