@@ -63,7 +63,7 @@ fn run_fresh_index(home: &Path, data_dir: &Path) {
 }
 
 fn lexical_checkpoint(data_dir: &Path) -> Value {
-    let checkpoint_path = coding_agent_search::search::tantivy::expected_index_dir(data_dir)
+    let checkpoint_path = coding_agent_search::indexer::expected_index_dir(data_dir)
         .join(".lexical-rebuild-state.json");
     let body = fs::read(&checkpoint_path).unwrap_or_else(|err| {
         panic!(

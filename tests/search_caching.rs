@@ -1,5 +1,6 @@
+use coding_agent_search::indexer::persist::persist_conversation;
 use coding_agent_search::search::query::{FieldMask, SearchClient, SearchFilters};
-use coding_agent_search::search::tantivy::TantivyIndex;
+use coding_agent_search::storage::sqlite::SqliteStorage;
 use tempfile::TempDir;
 
 mod util;
@@ -7,7 +8,8 @@ mod util;
 #[test]
 fn search_client_caches_repeated_queries() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     // Seed index
     let conv = util::ConversationFixtureBuilder::new("tester")
@@ -18,10 +20,9 @@ fn search_client_caches_repeated_queries() {
         .with_content(0, "unique_term_for_cache_test")
         .build_normalized();
 
-    index.add_conversation(&conv).unwrap();
-    index.commit().unwrap();
+    persist_conversation(&storage, &conv).unwrap();
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
     let filters = SearchFilters::default();
@@ -56,7 +57,8 @@ fn search_client_caches_repeated_queries() {
 #[test]
 fn search_client_prefix_cache_works() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     let conv = util::ConversationFixtureBuilder::new("tester")
         .title("prefix test")
@@ -66,10 +68,9 @@ fn search_client_prefix_cache_works() {
         .with_content(0, "apple banana cherry")
         .build_normalized();
 
-    index.add_conversation(&conv).unwrap();
-    index.commit().unwrap();
+    persist_conversation(&storage, &conv).unwrap();
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
     let filters = SearchFilters::default();

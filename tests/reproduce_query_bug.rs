@@ -1,6 +1,7 @@
 use coding_agent_search::connectors::{NormalizedConversation, NormalizedMessage};
+use coding_agent_search::indexer::persist::persist_conversation;
 use coding_agent_search::search::query::{FieldMask, SearchClient, SearchFilters};
-use coding_agent_search::search::tantivy::TantivyIndex;
+use coding_agent_search::storage::sqlite::SqliteStorage;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
@@ -9,7 +10,8 @@ use tempfile::TempDir;
 #[test]
 fn test_not_or_semantics_regression() -> anyhow::Result<()> {
     let dir = TempDir::new()?;
-    let mut index = TantivyIndex::open_or_create(dir.path())?;
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path)?;
 
     // Doc 1: "apple" (Should match "apple OR orange", should NOT match "NOT apple OR orange"?)
     // "NOT apple OR orange" means "Anything except apple" OR "orange".
@@ -60,11 +62,10 @@ fn test_not_or_semantics_regression() -> anyhow::Result<()> {
         metadata: serde_json::Value::Null,
     };
 
-    index.add_conversation(&doc1)?;
-    index.add_conversation(&doc2)?;
-    index.commit()?;
+    persist_conversation(&storage, &doc1)?;
+    persist_conversation(&storage, &doc2)?;
 
-    let client = SearchClient::open(dir.path(), None)?.expect("index");
+    let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index");
 
     // Query: "NOT apple OR orange"
     // Expected:

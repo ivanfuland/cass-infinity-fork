@@ -310,10 +310,6 @@ name = "cache_micro"
 harness = false
 
 [[bench]]
-name = "regex_cache"
-harness = false
-
-[[bench]]
 name = "integration_regression"
 harness = false
 

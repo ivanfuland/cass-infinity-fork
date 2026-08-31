@@ -20,7 +20,6 @@
 
 use coding_agent_search::connectors::{NormalizedConversation, NormalizedMessage};
 use coding_agent_search::indexer::persist::persist_conversation;
-use coding_agent_search::search::tantivy::{TantivyIndex, index_dir};
 use coding_agent_search::storage::sqlite::SqliteStorage;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
@@ -72,16 +71,13 @@ fn generate_conversation(conv_id: i64, msg_count: i64) -> NormalizedConversation
 fn setup_test_db(conv_count: i64, msgs_per_conv: i64) -> (TempDir, SqliteStorage) {
     let temp = TempDir::new().expect("create tempdir");
     let db_path = temp.path().join("bench.db");
-    let index_path = index_dir(temp.path()).expect("index path");
 
     let storage = SqliteStorage::open(&db_path).expect("open db");
-    let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
 
     for i in 0..conv_count {
         let conv = generate_conversation(i, msgs_per_conv);
-        persist_conversation(&storage, &mut t_index, &conv).expect("persist");
+        persist_conversation(&storage, &conv).expect("persist");
     }
-    t_index.commit().unwrap();
 
     (temp, storage)
 }
@@ -151,14 +147,12 @@ fn bench_insert_conversation(c: &mut Criterion) {
             |b, &msg_count| {
                 let temp = TempDir::new().expect("create tempdir");
                 let db_path = temp.path().join("bench.db");
-                let index_path = index_dir(temp.path()).expect("index path");
                 let storage = SqliteStorage::open(&db_path).expect("open db");
-                let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
                 let mut conv_id = 0i64;
 
                 b.iter(|| {
                     let conv = generate_conversation(conv_id, msg_count);
-                    persist_conversation(&storage, &mut t_index, &conv).expect("persist");
+                    persist_conversation(&storage, &conv).expect("persist");
                     conv_id += 1;
                 })
             },
@@ -181,17 +175,14 @@ fn bench_insert_batch(c: &mut Criterion) {
             |b, &batch_size| {
                 let temp = TempDir::new().expect("create tempdir");
                 let db_path = temp.path().join("bench.db");
-                let index_path = index_dir(temp.path()).expect("index path");
                 let storage = SqliteStorage::open(&db_path).expect("open db");
-                let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
                 let mut base_id = 0i64;
 
                 b.iter(|| {
                     for i in 0..batch_size as i64 {
                         let conv = generate_conversation(base_id + i, 10);
-                        persist_conversation(&storage, &mut t_index, &conv).expect("persist");
+                        persist_conversation(&storage, &conv).expect("persist");
                     }
-                    t_index.commit().unwrap();
                     base_id += batch_size as i64;
                 })
             },
@@ -248,17 +239,14 @@ fn bench_fetch_messages(c: &mut Criterion) {
     // Create conversations with different message counts
     let temp = TempDir::new().expect("create tempdir");
     let db_path = temp.path().join("bench.db");
-    let index_path = index_dir(temp.path()).expect("index path");
     let storage = SqliteStorage::open(&db_path).expect("open db");
-    let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
 
     // Create conversations with varying message counts
     let msg_counts = [10i64, 50, 100, 500];
     for (i, &msg_count) in msg_counts.iter().enumerate() {
         let conv = generate_conversation(i as i64, msg_count);
-        persist_conversation(&storage, &mut t_index, &conv).expect("persist");
+        persist_conversation(&storage, &conv).expect("persist");
     }
-    t_index.commit().unwrap();
 
     let mut group = c.benchmark_group("fetch_messages");
 

@@ -171,22 +171,6 @@ fn handle_fatal_error(err: coding_agent_search::CliError) -> ! {
     std::process::exit(err.code);
 }
 
-fn apply_default_tantivy_writer_thread_cap() {
-    let configured = dotenvy::var("CASS_TANTIVY_MAX_WRITER_THREADS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0);
-    if configured.is_none() {
-        // Keep explicit operator tuning authoritative, otherwise use the same
-        // memory-aware default as the search layer before frankensearch opens
-        // any Tantivy writers.
-        let default_cap = coding_agent_search::indexer::default_tantivy_max_writer_threads();
-        unsafe {
-            std::env::set_var("CASS_TANTIVY_MAX_WRITER_THREADS", default_cap.to_string());
-        }
-    }
-}
-
 /// Bound the legacy embedded engine per-cursor `read_witnesses` Vec so a long B-tree
 /// descent against a multi-GB index cannot balloon RSS into the multi-GB range.
 ///
@@ -265,8 +249,6 @@ fn main() -> anyhow::Result<()> {
         }
         Err(parsed) => *parsed,
     };
-
-    apply_default_tantivy_writer_thread_cap();
 
     let use_current_thread = matches!(
         parsed.cli.command,

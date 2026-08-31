@@ -3,7 +3,6 @@ use coding_agent_search::connectors::{
 };
 use coding_agent_search::indexer::persist;
 use coding_agent_search::search::query::{FieldMask, SearchClient, SearchFilters};
-use coding_agent_search::search::tantivy::TantivyIndex;
 use coding_agent_search::storage::sqlite::SqliteStorage;
 use criterion::{Criterion, criterion_group, criterion_main};
 use tempfile::TempDir;
@@ -13,10 +12,6 @@ fn build_small_index() -> (TempDir, SearchClient) {
     let data_dir = dir.path().to_path_buf();
     let db_path = data_dir.join("agent_search.db");
     let storage = SqliteStorage::open(&db_path).expect("storage");
-    let mut index = TantivyIndex::open_or_create(
-        &coding_agent_search::search::tantivy::index_dir(&data_dir).unwrap(),
-    )
-    .expect("index");
 
     let conv = NormalizedConversation {
         agent_slug: "codex".into(),
@@ -57,15 +52,11 @@ fn build_small_index() -> (TempDir, SearchClient) {
         ],
     };
 
-    persist::persist_conversation(&storage, &mut index, &conv).expect("persist");
-    index.commit().expect("commit");
+    persist::persist_conversation(&storage, &conv).expect("persist");
 
-    let client = SearchClient::open(
-        &coding_agent_search::search::tantivy::index_dir(&data_dir).unwrap(),
-        Some(&db_path),
-    )
-    .expect("open")
-    .expect("present");
+    let client = SearchClient::open(&data_dir, Some(&db_path))
+        .expect("open")
+        .expect("present");
 
     (dir, client)
 }

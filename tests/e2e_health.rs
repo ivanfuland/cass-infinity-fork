@@ -1,5 +1,5 @@
 use assert_cmd::Command;
-use coding_agent_search::search::tantivy::{SCHEMA_HASH, expected_index_dir};
+use coding_agent_search::indexer::{LEXICAL_REBUILD_SCHEMA_HASH as SCHEMA_HASH, expected_index_dir};
 use coding_agent_search::storage::api::Value as SqliteValue;
 use coding_agent_search::storage::sqlite::FrankenStorage;
 use fs2::FileExt;

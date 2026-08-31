@@ -9,7 +9,7 @@
 //! All tests use `--once` and `TUI_HEADLESS=1` for non-interactive execution.
 
 use assert_cmd::cargo::cargo_bin_cmd;
-use coding_agent_search::search::tantivy::expected_index_dir;
+use coding_agent_search::search::lexical_index_health::searchable_index_exists;
 use std::fs;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
@@ -143,7 +143,12 @@ fn tui_headless_launches_with_valid_index() {
 
     // Verify index artifacts exist
     assert!(data_dir.join("agent_search.db").exists(), "DB should exist");
-    assert!(expected_index_dir(&data_dir).exists(), "Index should exist");
+    // W2-6 Task丙②: no more separate index directory (Tantivy retired); the
+    // DB-domain equivalent is a searchable sqlite-fts5 asset in the same DB.
+    assert!(
+        searchable_index_exists(&data_dir.join("agent_search.db")),
+        "Index should exist"
+    );
 
     // Log test completion
     eprintln!("[SMOKE] tui_headless_launches_with_valid_index: PASSED");

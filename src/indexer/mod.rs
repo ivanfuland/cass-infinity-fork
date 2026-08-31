@@ -2387,7 +2387,7 @@ impl Drop for RunIndexProgressReset {
 // different concern: that one keys a query-result cache, this one is a
 // rebuild-generation identity; W2-6 closeout's "CASS_SCHEMA_HASH语义漂移"
 // debt item covers unifying them later).
-pub(crate) const LEXICAL_REBUILD_SCHEMA_HASH: &str =
+pub const LEXICAL_REBUILD_SCHEMA_HASH: &str =
     "tantivy-schema-v8-hyphen-cjk-bigrams-bounded-content-prefix-preview-stored-content-external";
 const CASS_SCHEMA_VERSION: &str = "v8";
 
@@ -2401,11 +2401,11 @@ fn schema_hash_matches(stored: &str) -> bool {
     stored == LEXICAL_REBUILD_SCHEMA_HASH
 }
 
-pub(crate) fn expected_index_dir(base: &Path) -> PathBuf {
+pub fn expected_index_dir(base: &Path) -> PathBuf {
     base.join("index").join(CASS_SCHEMA_VERSION)
 }
 
-pub(crate) fn index_dir(base: &Path) -> Result<PathBuf> {
+pub fn index_dir(base: &Path) -> Result<PathBuf> {
     let dir = expected_index_dir(base);
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("creating lexical index directory {}", dir.display()))?;
@@ -4404,11 +4404,14 @@ fn lexical_rebuild_progress_heartbeat_interval() -> Duration {
 
 fn lexical_rebuild_batch_fetch_conversation_limit(page_size: i64) -> usize {
     // Each chunk within a page is the unit of SQL message-fetch batching and
-    // Tantivy writer feeding. The historical fixed default (512 conversations)
+    // rebuild-worker feeding. The historical fixed default (512 conversations)
     // was tuned for a 4-thread writer; on larger hosts it silently under-fed
-    // the writer path even after prep parallelism improved. Scale the default
-    // with the writer-thread hint while still capping at `page_size` so we
-    // never fetch beyond what's been paged from the conversations table.
+    // the worker path even after prep parallelism improved. Scale the default
+    // with the real worker-parallelism hint (W2-6 Task丙①: previously scaled
+    // with the now-retired `tantivy_writer_parallelism_hint`, which sized a
+    // Tantivy writer pool that no longer exists) while still capping at
+    // `page_size` so we never fetch beyond what's been paged from the
+    // conversations table.
     dotenvy::var("CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -4416,7 +4419,7 @@ fn lexical_rebuild_batch_fetch_conversation_limit(page_size: i64) -> usize {
         .unwrap_or_else(|| {
             lexical_rebuild_default_batch_fetch_conversation_limit(
                 page_size,
-                tantivy_writer_parallelism_hint(),
+                lexical_rebuild_worker_parallelism(),
             )
         })
         .min(usize::try_from(page_size.max(1)).unwrap_or(usize::MAX))
@@ -4694,120 +4697,17 @@ fn lexical_rebuild_controller_loadavg_low_watermark_1m_milli_from_high(
     .or_else(|| high_watermark_1m_milli.map(|high| high.saturating_sub(1000)))
 }
 
-// W2-6 Task B (block2 audit): relocated verbatim from the deleted
-// `search::tantivy` module. This "how many tantivy writer threads would the
-// (now-retired) shard-build pipeline use" formula is pure env-var/host-memory
-// arithmetic -- it never touches a live TantivyIndex or the filesystem index
-// directory -- and it has a load-bearing consumer OUTSIDE the dying shard
-// pipeline: `topology_budget::TopologyPlannerDefaults::from_current_process`
-// reads `LexicalRebuildPipelineSettingsSnapshot.{available_parallelism,
-// reserved_cores,staged_shard_builders,staged_merge_workers,tantivy_writer_threads}`
-// as generic host-capacity defaults for the whole indexing topology budget
-// planner, which still matters for still-alive subsystems (e.g. semantic
-// indexing). So this is the same "physically block2, semantically not
-// block2-exclusive" pattern the b2-handoff already flagged for
-// `can_skip_absent_explicit_watch_once_index_run` -- kept, not retired.
-const ENV_TANTIVY_MAX_WRITER_THREADS: &str = "CASS_TANTIVY_MAX_WRITER_THREADS";
-const ENV_TANTIVY_REBUILD_STAGED_SHARD_BUILDERS: &str = "CASS_TANTIVY_REBUILD_STAGED_SHARD_BUILDERS";
-const DEFAULT_TANTIVY_MAX_WRITER_THREADS_CEILING: usize = 26;
-const DEFAULT_TANTIVY_ASSUMED_CONCURRENT_WRITERS: u64 = 8;
-const DEFAULT_TANTIVY_WRITER_HEAP_PER_THREAD_BYTES: u64 = 128 * 1024 * 1024;
-const DEFAULT_TANTIVY_WRITER_HEAP_RAM_FRACTION: u64 = 10;
-
-fn positive_usize_env(name: &str) -> Option<usize> {
-    dotenvy::var(name)
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-}
-
-#[cfg(target_os = "linux")]
-fn linux_available_memory_bytes() -> Option<u64> {
-    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-    for line in meminfo.lines() {
-        if let Some(rest) = line.strip_prefix("MemAvailable:") {
-            let kb = rest.split_whitespace().next()?.parse::<u64>().ok()?;
-            return kb.checked_mul(1024);
-        }
-    }
-    None
-}
-
-#[cfg(target_os = "linux")]
-fn host_memory_bytes_for_tantivy_default() -> Option<u64> {
-    linux_available_memory_bytes()
-}
-
-#[cfg(target_os = "macos")]
-fn host_memory_bytes_for_tantivy_default() -> Option<u64> {
-    let output = std::process::Command::new("sysctl")
-        .args(["-n", "hw.memsize"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8(output.stdout).ok()?;
-    stdout.trim().parse::<u64>().ok()
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn host_memory_bytes_for_tantivy_default() -> Option<u64> {
-    None
-}
-
-pub(crate) fn default_tantivy_max_writer_threads_for_memory_bytes_and_concurrent_writers(
-    memory_bytes: Option<u64>,
-    concurrent_writers: u64,
-) -> usize {
-    let Some(memory_bytes) = memory_bytes else {
-        return DEFAULT_TANTIVY_MAX_WRITER_THREADS_CEILING;
-    };
-    let per_thread_peak =
-        DEFAULT_TANTIVY_WRITER_HEAP_PER_THREAD_BYTES.saturating_mul(concurrent_writers.max(1));
-    if per_thread_peak == 0 {
-        return DEFAULT_TANTIVY_MAX_WRITER_THREADS_CEILING;
-    }
-    let budget = memory_bytes / DEFAULT_TANTIVY_WRITER_HEAP_RAM_FRACTION;
-    let threads = budget / per_thread_peak;
-    usize::try_from(threads)
-        .unwrap_or(usize::MAX)
-        .clamp(1, DEFAULT_TANTIVY_MAX_WRITER_THREADS_CEILING)
-}
-
-fn default_tantivy_assumed_concurrent_writers() -> u64 {
-    positive_usize_env(ENV_TANTIVY_REBUILD_STAGED_SHARD_BUILDERS)
-        .map(|value| value as u64)
-        .unwrap_or(DEFAULT_TANTIVY_ASSUMED_CONCURRENT_WRITERS)
-}
-
-pub fn default_tantivy_max_writer_threads() -> usize {
-    default_tantivy_max_writer_threads_for_memory_bytes_and_concurrent_writers(
-        host_memory_bytes_for_tantivy_default(),
-        default_tantivy_assumed_concurrent_writers(),
-    )
-}
-
-pub(crate) fn tantivy_writer_parallelism_hint_for_available(available_parallelism: usize) -> usize {
-    let max_threads =
-        positive_usize_env(ENV_TANTIVY_MAX_WRITER_THREADS).unwrap_or_else(default_tantivy_max_writer_threads);
-
-    available_parallelism.max(1).clamp(1, max_threads)
-}
-
-fn tantivy_writer_parallelism_hint_for_available_governed(available_parallelism: usize) -> usize {
-    let raw = tantivy_writer_parallelism_hint_for_available(available_parallelism);
-    responsiveness::effective_worker_count(raw).max(1)
-}
-
-fn tantivy_writer_parallelism_hint() -> usize {
-    tantivy_writer_parallelism_hint_for_available_governed(
-        std::thread::available_parallelism()
-            .map(std::num::NonZeroUsize::get)
-            .unwrap_or(1),
-    )
-}
-
+// W2-6 Task丙① (control-plane 2026-08-31 ruling, chain-of-custody audit):
+// CASS_TANTIVY_MAX_WRITER_THREADS and its "defaults/hints" function family
+// (this whole cluster) are retired. The prior comment here claimed
+// `topology_budget::TopologyPlannerDefaults::from_current_process` reads
+// `tantivy_writer_threads` as a load-bearing input -- that claim was checked
+// against the actual implementation (topology_budget.rs) and is FALSE:
+// `from_current_process` never reads that field. The field's only production
+// consumer was the now-fully-dead shard-build planner
+// (`lexical_rebuild_target_shard_count`, reachable only from
+// `#[cfg(test)]`), so no live code path is governed by this env var. See
+// W2_ARTIFACTS/w2-6-closeout.md for the full call-chain evidence.
 pub(crate) fn lexical_rebuild_pipeline_settings_snapshot() -> LexicalRebuildPipelineSettingsSnapshot
 {
     lexical_rebuild_pipeline_settings_snapshot_inner(true)
@@ -4843,12 +4743,11 @@ fn lexical_rebuild_pipeline_settings_snapshot_inner(
     );
     let available_parallelism = lexical_rebuild_available_parallelism();
     let reserved_cores = lexical_rebuild_reserved_cores_for_available(available_parallelism);
-    let tantivy_writer_threads_raw = tantivy_writer_parallelism_hint_for_available(available_parallelism);
-    let tantivy_writer_threads = if apply_responsiveness_governor {
-        responsiveness::effective_worker_count(tantivy_writer_threads_raw).max(1)
-    } else {
-        tantivy_writer_threads_raw
-    };
+    // W2-6 Task丙①: CASS_TANTIVY_MAX_WRITER_THREADS and its hint functions are
+    // retired (no live Tantivy writer pool exists). Field kept at 0 for JSON
+    // diagnostic shape stability (`cass status`/`cass health`); see the
+    // retirement note above `lexical_rebuild_pipeline_settings_snapshot`.
+    let tantivy_writer_threads = 0usize;
     let controller_restore_hold = lexical_rebuild_controller_restore_hold();
     let controller_loadavg_high_watermark_1m_milli =
         lexical_rebuild_controller_loadavg_high_watermark_1m_milli_for_available_and_reserved(
@@ -4865,11 +4764,13 @@ fn lexical_rebuild_pipeline_settings_snapshot_inner(
         available_parallelism,
         reserved_cores,
         tantivy_writer_threads,
-        staged_shard_builders: if apply_responsiveness_governor {
-            lexical_rebuild_staged_shard_builder_parallelism()
-        } else {
-            lexical_rebuild_staged_shard_builder_parallelism_configured()
-        },
+        // W2-6 Task丙①: CASS_TANTIVY_REBUILD_STAGED_SHARD_BUILDERS is retired
+        // (its only production readers were an advisory-only diagnostic
+        // report that never feeds back into any scheduler, and the
+        // now-fully-dead shard-build planner). Field kept at 0 for JSON
+        // diagnostic shape stability, same precedent as tantivy_writer_threads
+        // above.
+        staged_shard_builders: 0,
         staged_merge_workers: if apply_responsiveness_governor {
             lexical_rebuild_staged_merge_worker_parallelism()
         } else {
@@ -6714,25 +6615,12 @@ fn lexical_rebuild_staged_shard_build_emergency_memory_reserve_bytes() -> usize 
         })
 }
 
-fn lexical_rebuild_staged_shard_builder_parallelism() -> usize {
-    let raw = lexical_rebuild_staged_shard_builder_parallelism_configured();
-    // Apply the responsiveness governor so shard-builder fanout shrinks
-    // together with page-prep when the host is under pressure. On an idle
-    // box this is a no-op; under pressure it preserves interactive headroom.
-    responsiveness::effective_worker_count(raw).max(1)
-}
-
-fn lexical_rebuild_staged_shard_builder_parallelism_configured() -> usize {
-    dotenvy::var("CASS_TANTIVY_REBUILD_STAGED_SHARD_BUILDERS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or_else(|| {
-            lexical_rebuild_default_staged_shard_builder_parallelism_for_workers(
-                lexical_rebuild_worker_parallelism(),
-            )
-        })
-}
+// W2-6 Task丙①: CASS_TANTIVY_REBUILD_STAGED_SHARD_BUILDERS's reader
+// (`lexical_rebuild_staged_shard_builder_parallelism[_configured]`) is
+// retired -- its only production consumers were an advisory-only diagnostic
+// (topology_budget's `from_current_process`, which never feeds back into any
+// scheduler) and the now-fully-dead shard-build planner below. The snapshot
+// builder now hardcodes `staged_shard_builders: 0`.
 
 fn lexical_rebuild_default_staged_merge_worker_parallelism_for_workers(workers: usize) -> usize {
     workers
@@ -24770,8 +24658,6 @@ mod tests {
             "CASS_TANTIVY_REBUILD_PIPELINE_MAX_MESSAGE_BYTES_IN_FLIGHT",
             "777777",
         );
-        let _writer_threads = set_env("CASS_TANTIVY_MAX_WRITER_THREADS", "2");
-        let _shard_builders = set_env("CASS_TANTIVY_REBUILD_STAGED_SHARD_BUILDERS", "4");
         let _merge_workers = set_env("CASS_TANTIVY_REBUILD_STAGED_MERGE_WORKERS", "2");
 
         let snapshot = lexical_rebuild_pipeline_settings_snapshot();
@@ -24782,14 +24668,12 @@ mod tests {
             snapshot.reserved_cores,
             4.min(snapshot.available_parallelism.saturating_sub(1))
         );
-        assert_eq!(
-            snapshot.tantivy_writer_threads,
-            snapshot.available_parallelism.min(2)
-        );
-        assert_eq!(
-            snapshot.staged_shard_builders,
-            responsiveness::effective_worker_count(4).max(1)
-        );
+        // W2-6 Task丙①: CASS_TANTIVY_MAX_WRITER_THREADS and
+        // CASS_TANTIVY_REBUILD_STAGED_SHARD_BUILDERS no longer drive
+        // anything (retired, chain-of-custody audit confirmed no live
+        // consumer) -- both fields are now fixed at 0 regardless of env.
+        assert_eq!(snapshot.tantivy_writer_threads, 0);
+        assert_eq!(snapshot.staged_shard_builders, 0);
         assert_eq!(
             snapshot.staged_merge_workers,
             responsiveness::effective_worker_count(2).max(1)
@@ -25800,21 +25684,19 @@ mod tests {
         let _responsiveness = set_env("CASS_RESPONSIVENESS_DISABLE", "1");
         let _workers = set_env("CASS_TANTIVY_REBUILD_WORKERS", "12");
         let _pipeline_channel = set_env("CASS_TANTIVY_REBUILD_PIPELINE_CHANNEL_SIZE", "2");
-        let _writer_threads = set_env("CASS_TANTIVY_MAX_WRITER_THREADS", "2");
 
         let snapshot = lexical_rebuild_pipeline_settings_snapshot();
 
         assert_eq!(snapshot.workers, 12);
         assert_eq!(snapshot.pipeline_channel_size, 2);
-        assert_eq!(
-            snapshot.tantivy_writer_threads,
-            snapshot.available_parallelism.min(2)
-        );
+        // W2-6 Task丙①: CASS_TANTIVY_MAX_WRITER_THREADS is retired; the field
+        // is now fixed at 0 regardless of env.
+        assert_eq!(snapshot.tantivy_writer_threads, 0);
         assert_eq!(
             snapshot.steady_batch_fetch_conversations,
             lexical_rebuild_default_batch_fetch_conversation_limit(
                 LEXICAL_REBUILD_PAGE_SIZE,
-                snapshot.tantivy_writer_threads
+                snapshot.workers
             )
         );
         assert_eq!(

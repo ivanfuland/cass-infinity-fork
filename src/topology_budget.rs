@@ -126,7 +126,17 @@ impl TopologyPlannerDefaults {
         Self::conservative(
             pipeline.available_parallelism,
             pipeline.reserved_cores,
-            pipeline.staged_shard_builders,
+            // W2-6 Task丙① (chain-of-custody audit, control-plane 2026-08-31
+            // ruling): CASS_TANTIVY_REBUILD_STAGED_SHARD_BUILDERS's reader is
+            // retired -- verified its only production consumers were this
+            // advisory-only report (which never feeds back into a live
+            // scheduler, per this module's own "without changing the live
+            // indexing controllers" contract) and the now-fully-dead
+            // shard-build planner. `plan_for_topology` only ever uses this as
+            // a `.max()` floor against a topology-derived `shard_target`, so
+            // a fixed floor changes nothing observable in the advisory
+            // output on any real host.
+            1,
             pipeline.staged_merge_workers,
             pipeline.page_prep_workers,
             default_cache_cap_for_available(memory.available_bytes),

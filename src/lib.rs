@@ -72696,8 +72696,6 @@ mod cli_read_db_tests {
             "CASS_TANTIVY_REBUILD_PIPELINE_MAX_MESSAGE_BYTES_IN_FLIGHT",
             "888888",
         );
-        let _writer_threads = set_env("CASS_TANTIVY_MAX_WRITER_THREADS", "2");
-        let _shard_builders = set_env("CASS_TANTIVY_REBUILD_STAGED_SHARD_BUILDERS", "4");
         let _merge_workers = set_env("CASS_TANTIVY_REBUILD_STAGED_MERGE_WORKERS", "2");
 
         let (temp, db_path) = seed_cli_db();
@@ -72726,14 +72724,12 @@ mod cli_read_db_tests {
             pipeline["controller_loadavg_low_watermark_1m"].as_f64(),
             Some(6.25)
         );
-        assert_eq!(
-            pipeline["tantivy_writer_threads"].as_u64(),
-            Some(available_parallelism.min(2))
-        );
-        assert_eq!(
-            pipeline["staged_shard_builders"].as_u64(),
-            Some(crate::indexer::responsiveness::effective_worker_count(4).max(1) as u64)
-        );
+        // W2-6 Task丙①: CASS_TANTIVY_MAX_WRITER_THREADS and
+        // CASS_TANTIVY_REBUILD_STAGED_SHARD_BUILDERS no longer drive
+        // anything (retired, chain-of-custody audit confirmed no live
+        // consumer) -- both fields are now fixed at 0 regardless of env.
+        assert_eq!(pipeline["tantivy_writer_threads"].as_u64(), Some(0));
+        assert_eq!(pipeline["staged_shard_builders"].as_u64(), Some(0));
         assert_eq!(
             pipeline["staged_merge_workers"].as_u64(),
             Some(crate::indexer::responsiveness::effective_worker_count(2).max(1) as u64)

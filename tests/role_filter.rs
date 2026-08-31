@@ -26,7 +26,6 @@ use assert_cmd::cargo::cargo_bin_cmd;
 use coding_agent_search::connectors::{NormalizedConversation, NormalizedMessage};
 use coding_agent_search::indexer::persist::persist_conversation;
 use coding_agent_search::search::query::{FieldMask, SearchClient, SearchFilters};
-use coding_agent_search::search::tantivy::{TantivyIndex, index_dir};
 use coding_agent_search::search::vector_index::role_code_from_str;
 use coding_agent_search::storage::sqlite::FrankenStorage;
 use serde_json::{Value, json};
@@ -46,9 +45,7 @@ fn role_filter_tool_matches_tool_result_not_user_message() {
     // one conversation_id and the SQLite file is flushed to disk.
     let data_dir = dir.path();
     let db_path = data_dir.join("agent_search.db");
-    let index_path = index_dir(data_dir).expect("index path");
     let storage = FrankenStorage::open(&db_path).unwrap();
-    let mut index = TantivyIndex::open_or_create(&index_path).unwrap();
 
     let source_path = data_dir.join("role-filter.jsonl");
     let normalized = NormalizedConversation {
@@ -86,10 +83,9 @@ fn role_filter_tool_matches_tool_result_not_user_message() {
             },
         ],
     };
-    persist_conversation(&storage, &mut index, &normalized).unwrap();
-    index.commit().unwrap();
+    persist_conversation(&storage, &normalized).unwrap();
 
-    let client = SearchClient::open(&index_path, Some(&db_path))
+    let client = SearchClient::open(data_dir, Some(&db_path))
         .unwrap()
         .expect("client");
 
@@ -142,9 +138,7 @@ fn role_filter_lexical_recalls_tool_result_ranked_below_default_window() {
 
     let data_dir = dir.path();
     let db_path = data_dir.join("agent_search.db");
-    let index_path = index_dir(data_dir).expect("index path");
     let storage = FrankenStorage::open(&db_path).unwrap();
-    let mut index = TantivyIndex::open_or_create(&index_path).unwrap();
 
     // Six short, high-TF user messages that will outrank the tool_result.
     let mut messages: Vec<NormalizedMessage> = (0..6)
@@ -189,10 +183,9 @@ fn role_filter_lexical_recalls_tool_result_ranked_below_default_window() {
         metadata: json!({}),
         messages,
     };
-    persist_conversation(&storage, &mut index, &normalized).unwrap();
-    index.commit().unwrap();
+    persist_conversation(&storage, &normalized).unwrap();
 
-    let client = SearchClient::open(&index_path, Some(&db_path))
+    let client = SearchClient::open(data_dir, Some(&db_path))
         .unwrap()
         .expect("client");
 

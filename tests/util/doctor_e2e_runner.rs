@@ -2395,12 +2395,18 @@ fn build_post_repair_probes(
 ) -> Value {
     let data_dir = fixture.data_dir();
     let db_open_probe = read_fixture_db_row_counts(data_dir, redactor);
-    let index_path = coding_agent_search::search::tantivy::expected_index_dir(data_dir);
+    // W2-6 Task丙②: the Tantivy-backed on-disk index directory no longer
+    // exists; the lexical backend is `fts_lex` (SQLite FTS5, same-transaction
+    // with the canonical tables), keyed off `db_path` instead of a separate
+    // index directory. `lexical_index_health` is the DB-domain successor to
+    // the deleted `search::tantivy` readiness probes below.
+    let db_path = data_dir.join("agent_search.db");
     let lexical_searchable =
-        coding_agent_search::search::tantivy::searchable_index_exists(&index_path);
+        coding_agent_search::search::lexical_index_health::searchable_index_exists(&db_path);
     let lexical_contract = if lexical_searchable {
-        match coding_agent_search::search::tantivy::validate_searchable_index_contract(&index_path)
-        {
+        match coding_agent_search::search::lexical_index_health::validate_searchable_index_contract_full(
+            &db_path,
+        ) {
             Ok(()) => json!({
                 "status": "pass",
                 "error": Value::Null,
@@ -2487,7 +2493,10 @@ fn build_post_repair_probes(
         "data_dir": redactor.redact(&data_dir.display().to_string()),
         "db_open_probe": db_open_probe,
         "search_readiness": {
-            "lexical_index_path": redactor.redact(&index_path.display().to_string()),
+            // W2-6 Task丙②: field name kept for JSON shape stability; now
+            // reports db_path (the sqlite-fts5 source of truth) instead of
+            // the retired Tantivy index directory path.
+            "lexical_index_path": redactor.redact(&db_path.display().to_string()),
             "lexical_searchable": lexical_searchable,
             "lexical_contract": lexical_contract,
             "derived_semantic_assets": derived_semantic_assets,

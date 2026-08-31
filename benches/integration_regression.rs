@@ -20,7 +20,6 @@ use bench_utils::configure_criterion;
 use coding_agent_search::connectors::{NormalizedConversation, NormalizedMessage};
 use coding_agent_search::indexer::persist::persist_conversation;
 use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
-use coding_agent_search::search::tantivy::{TantivyIndex, index_dir};
 use coding_agent_search::storage::sqlite::FrankenStorage;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
@@ -150,16 +149,13 @@ fn make_agent(id: i64) -> Agent {
 fn setup_persist_seeded_db(conv_count: i64, msgs_per_conv: i64) -> (TempDir, FrankenStorage) {
     let temp = TempDir::new().expect("create tempdir");
     let db_path = temp.path().join("persist.db");
-    let index_path = index_dir(temp.path()).expect("index path");
 
     let storage = FrankenStorage::open(&db_path).expect("open persist-seeded db");
-    let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
 
     for i in 0..conv_count {
         let conv = generate_conversation(i, msgs_per_conv);
-        persist_conversation(&storage, &mut t_index, &conv).expect("persist");
+        persist_conversation(&storage, &conv).expect("persist");
     }
-    t_index.commit().unwrap();
 
     (temp, storage)
 }
@@ -253,14 +249,12 @@ fn bench_insert_comparison(c: &mut Criterion) {
             |b, &msg_count| {
                 let temp = TempDir::new().unwrap();
                 let db_path = temp.path().join("bench.db");
-                let index_path = index_dir(temp.path()).expect("index path");
                 let storage = FrankenStorage::open(&db_path).unwrap();
-                let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
                 let mut conv_id = 0i64;
 
                 b.iter(|| {
                     let conv = generate_conversation(conv_id, msg_count);
-                    persist_conversation(&storage, &mut t_index, &conv).unwrap();
+                    persist_conversation(&storage, &conv).unwrap();
                     conv_id += 1;
                 })
             },
@@ -319,21 +313,15 @@ fn bench_insert_remote_source_reuse(c: &mut Criterion) {
             |b, &msg_count| {
                 let temp = TempDir::new().unwrap();
                 let db_path = temp.path().join("bench.db");
-                let index_path = index_dir(temp.path()).expect("index path");
                 let storage = FrankenStorage::open(&db_path).unwrap();
-                let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
 
-                persist_conversation(
-                    &storage,
-                    &mut t_index,
-                    &generate_remote_conversation(0, msg_count),
-                )
-                .unwrap();
+                persist_conversation(&storage, &generate_remote_conversation(0, msg_count))
+                    .unwrap();
 
                 let mut conv_id = 1i64;
                 b.iter(|| {
                     let conv = generate_remote_conversation(conv_id, msg_count);
-                    persist_conversation(&storage, &mut t_index, &conv).unwrap();
+                    persist_conversation(&storage, &conv).unwrap();
                     conv_id += 1;
                 })
             },
@@ -394,25 +382,21 @@ fn bench_append_remote_source_merge(c: &mut Criterion) {
             |b, &msg_count| {
                 let temp = TempDir::new().unwrap();
                 let db_path = temp.path().join("bench.db");
-                let index_path = index_dir(temp.path()).expect("index path");
                 let storage = FrankenStorage::open(&db_path).unwrap();
-                let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
 
                 for conv_id in 0..WORKLOAD_CONVERSATIONS {
                     persist_conversation(
                         &storage,
-                        &mut t_index,
                         &generate_remote_conversation(conv_id, msg_count),
                     )
                     .unwrap();
                 }
-                t_index.commit().unwrap();
 
                 let mut conv_id = 0i64;
                 b.iter(|| {
                     let scenario_id = conv_id % WORKLOAD_CONVERSATIONS;
                     let conv = generate_remote_conversation(scenario_id, msg_count * 2);
-                    persist_conversation(&storage, &mut t_index, &conv).unwrap();
+                    persist_conversation(&storage, &conv).unwrap();
                     conv_id += 1;
                 })
             },
@@ -663,19 +647,16 @@ fn bench_insert_scaling(c: &mut Criterion) {
                 || {
                     let temp = TempDir::new().unwrap();
                     let db_path = temp.path().join("bench.db");
-                    let index_path = index_dir(temp.path()).expect("index path");
                     let storage = FrankenStorage::open(&db_path).unwrap();
-                    let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
                     let convs: Vec<_> = (0..count as i64)
                         .map(|i| generate_conversation(i, 10))
                         .collect();
-                    (temp, storage, t_index, convs)
+                    (temp, storage, convs)
                 },
-                |(_temp, storage, mut t_index, convs)| {
+                |(_temp, storage, convs)| {
                     for conv in &convs {
-                        persist_conversation(&storage, &mut t_index, conv).unwrap();
+                        persist_conversation(&storage, conv).unwrap();
                     }
-                    t_index.commit().unwrap();
                 },
             );
         });

@@ -1,12 +1,13 @@
+use coding_agent_search::indexer::persist::persist_conversation;
 use coding_agent_search::search::query::{FieldMask, SearchClient, SearchFilters};
-use coding_agent_search::search::tantivy::TantivyIndex;
+use coding_agent_search::storage::sqlite::SqliteStorage;
+use std::path::Path;
 use tempfile::TempDir;
 
 mod util;
 
-fn commit_and_open_client(index: &mut TantivyIndex, dir: &TempDir) -> SearchClient {
-    index.commit().unwrap();
-    SearchClient::open(dir.path(), None)
+fn open_client(dir: &TempDir, db_path: &Path) -> SearchClient {
+    SearchClient::open(dir.path(), Some(db_path))
         .unwrap()
         .expect("client")
 }
@@ -15,7 +16,8 @@ fn commit_and_open_client(index: &mut TantivyIndex, dir: &TempDir) -> SearchClie
 #[test]
 fn agent_filter_limits_results() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     let conv_codex = util::ConversationFixtureBuilder::new("codex")
         .title("codex doc")
@@ -32,9 +34,9 @@ fn agent_filter_limits_results() {
         .with_content(0, "shared_term oranges")
         .build_normalized();
 
-    index.add_conversation(&conv_codex).unwrap();
-    index.add_conversation(&conv_claude).unwrap();
-    let client = commit_and_open_client(&mut index, &dir);
+    persist_conversation(&storage, &conv_codex).unwrap();
+    persist_conversation(&storage, &conv_claude).unwrap();
+    let client = open_client(&dir, &db_path);
 
     let mut filters = SearchFilters::default();
     filters.agents.insert("codex".into());
@@ -54,7 +56,8 @@ fn agent_filter_limits_results() {
 #[test]
 fn workspace_filter_limits_results() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     let conv_a = util::ConversationFixtureBuilder::new("tester")
         .workspace(dir.path().join("repo/a"))
@@ -69,9 +72,9 @@ fn workspace_filter_limits_results() {
         .with_content(0, "workspace_term bar")
         .build_normalized();
 
-    index.add_conversation(&conv_a).unwrap();
-    index.add_conversation(&conv_b).unwrap();
-    let client = commit_and_open_client(&mut index, &dir);
+    persist_conversation(&storage, &conv_a).unwrap();
+    persist_conversation(&storage, &conv_b).unwrap();
+    let client = open_client(&dir, &db_path);
     let mut filters = SearchFilters::default();
     filters
         .workspaces
@@ -91,7 +94,8 @@ fn workspace_filter_limits_results() {
 #[test]
 fn time_filter_respects_since_until() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     // Three conversations at different times
     let conv_old = util::ConversationFixtureBuilder::new("tester")
@@ -107,10 +111,10 @@ fn time_filter_respects_since_until() {
         .with_content(0, "time_term three")
         .build_normalized();
 
-    index.add_conversation(&conv_old).unwrap();
-    index.add_conversation(&conv_mid).unwrap();
-    index.add_conversation(&conv_new).unwrap();
-    let client = commit_and_open_client(&mut index, &dir);
+    persist_conversation(&storage, &conv_old).unwrap();
+    persist_conversation(&storage, &conv_mid).unwrap();
+    persist_conversation(&storage, &conv_new).unwrap();
+    let client = open_client(&dir, &db_path);
 
     let filters = SearchFilters {
         created_from: Some(1_750_000_000_000), // between old and mid
@@ -130,7 +134,8 @@ fn time_filter_respects_since_until() {
 #[test]
 fn minimal_field_mask_preserves_order() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     let conv_strong = util::ConversationFixtureBuilder::new("tester")
         .title("strong match")
@@ -147,9 +152,9 @@ fn minimal_field_mask_preserves_order() {
         .with_content(0, "repeat")
         .build_normalized();
 
-    index.add_conversation(&conv_strong).unwrap();
-    index.add_conversation(&conv_weak).unwrap();
-    let client = commit_and_open_client(&mut index, &dir);
+    persist_conversation(&storage, &conv_strong).unwrap();
+    persist_conversation(&storage, &conv_weak).unwrap();
+    let client = open_client(&dir, &db_path);
 
     let full_hits = client
         .search("repeat", SearchFilters::default(), 10, 0, FieldMask::FULL)

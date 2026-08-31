@@ -12,7 +12,8 @@
 //! - Reasonable latency
 
 use coding_agent_search::search::query::{FieldMask, SearchClient, SearchFilters};
-use coding_agent_search::search::tantivy::TantivyIndex;
+use coding_agent_search::indexer::persist::persist_conversation;
+use coding_agent_search::storage::sqlite::SqliteStorage;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -25,7 +26,8 @@ mod util;
 #[test]
 fn concurrent_10_simultaneous_searches() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     // Seed index with diverse content for different searches
     for i in 0..20 {
@@ -39,9 +41,8 @@ fn concurrent_10_simultaneous_searches() {
             .with_content(2, format!("concurrent_test_{i} zeta eta"))
             .build_normalized();
 
-        index.add_conversation(&conv).unwrap();
+        persist_conversation(&storage, &conv).unwrap();
     }
-    index.commit().unwrap();
 
     // Each thread creates its own SearchClient so the search state stays thread-local.
     let index_path = dir.path().to_path_buf();
@@ -53,13 +54,15 @@ fn concurrent_10_simultaneous_searches() {
     // Spawn 10 threads that all search simultaneously
     for i in 0..10 {
         let index_path = index_path.clone();
+
+        let db_path = db_path.clone();
         let barrier = Arc::clone(&barrier);
         let success_count = Arc::clone(&success_count);
         let search_term = format!("unique_term_{}", i % 5); // Use 5 different terms
 
         handles.push(thread::spawn(move || {
             // Each thread creates its own client (thread-safe pattern)
-            let client = SearchClient::open(&index_path, None)
+            let client = SearchClient::open(&index_path, Some(&db_path))
                 .unwrap()
                 .expect("client");
 
@@ -110,7 +113,8 @@ fn concurrent_10_simultaneous_searches() {
 #[test]
 fn concurrent_search_during_indexing() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     // Initial seed data
     let conv = util::ConversationFixtureBuilder::new("tester")
@@ -121,8 +125,7 @@ fn concurrent_search_during_indexing() {
         .with_content(0, "baseline_content searchable_term")
         .build_normalized();
 
-    index.add_conversation(&conv).unwrap();
-    index.commit().unwrap();
+    persist_conversation(&storage, &conv).unwrap();
 
     // Each thread creates its own SearchClient so the search state stays thread-local.
     let index_path = dir.path().to_path_buf();
@@ -138,7 +141,7 @@ fn concurrent_search_during_indexing() {
     // Spawn searcher thread that searches continuously during indexing
     let search_handle = thread::spawn(move || {
         // Thread creates its own client
-        let client = SearchClient::open(&index_path, None)
+        let client = SearchClient::open(&index_path, Some(&db_path))
             .unwrap()
             .expect("client");
 
@@ -168,14 +171,7 @@ fn concurrent_search_during_indexing() {
             .with_content(0, format!("new_content_{i} searchable_term"))
             .build_normalized();
 
-        index.add_conversation(&conv).unwrap();
-
-        // Commit periodically to create multiple segments
-        if i % 10 == 0 {
-            index.commit().unwrap();
-        }
-    }
-    index.commit().unwrap();
+        persist_conversation(&storage, &conv).unwrap();    }
 
     // Signal indexing complete
     indexing_complete.store(true, Ordering::Relaxed);
@@ -201,7 +197,8 @@ fn concurrent_search_during_indexing() {
 #[test]
 fn concurrent_cache_contention() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     // Create content that will be cached
     let conv = util::ConversationFixtureBuilder::new("tester")
@@ -212,14 +209,13 @@ fn concurrent_cache_contention() {
         .with_content(0, "cache_contention_unique_term for testing")
         .build_normalized();
 
-    index.add_conversation(&conv).unwrap();
-    index.commit().unwrap();
+    persist_conversation(&storage, &conv).unwrap();
 
     // Each thread creates its own SearchClient so the search state stays thread-local.
     let index_path = dir.path().to_path_buf();
 
     // Pre-test: verify the content exists
-    let test_client = SearchClient::open(&index_path, None)
+    let test_client = SearchClient::open(&index_path, Some(&db_path))
         .unwrap()
         .expect("client");
     let initial_hits = test_client
@@ -241,12 +237,14 @@ fn concurrent_cache_contention() {
     // Spawn 20 threads that all hit the same search simultaneously
     for _ in 0..20 {
         let index_path = index_path.clone();
+
+        let db_path = db_path.clone();
         let barrier = Arc::clone(&barrier);
         let success_count = Arc::clone(&success_count);
 
         handles.push(thread::spawn(move || {
             // Each thread creates its own client
-            let client = SearchClient::open(&index_path, None)
+            let client = SearchClient::open(&index_path, Some(&db_path))
                 .unwrap()
                 .expect("client");
 
@@ -287,7 +285,8 @@ fn concurrent_cache_contention() {
 #[test]
 fn concurrent_reader_handle_exhaustion() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     // Seed index with substantial content
     for i in 0..100 {
@@ -303,9 +302,8 @@ fn concurrent_reader_handle_exhaustion() {
             .with_content(4, format!("exhaustion_check_{i} epsilon"))
             .build_normalized();
 
-        index.add_conversation(&conv).unwrap();
+        persist_conversation(&storage, &conv).unwrap();
     }
-    index.commit().unwrap();
 
     // Each thread creates its own SearchClient so the search state stays thread-local.
     let index_path = dir.path().to_path_buf();
@@ -318,13 +316,15 @@ fn concurrent_reader_handle_exhaustion() {
     // Spawn 50 threads to stress test concurrent index access
     for i in 0..50 {
         let index_path = index_path.clone();
+
+        let db_path = db_path.clone();
         let barrier = Arc::clone(&barrier);
         let success_count = Arc::clone(&success_count);
         let error_count = Arc::clone(&error_count);
 
         handles.push(thread::spawn(move || {
             // Each thread creates its own client
-            let client = SearchClient::open(&index_path, None)
+            let client = SearchClient::open(&index_path, Some(&db_path))
                 .unwrap()
                 .expect("client");
 
@@ -373,7 +373,8 @@ fn concurrent_reader_handle_exhaustion() {
 #[test]
 fn concurrent_different_filters_no_interference() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     // Create conversations with different agents and workspaces
     // Note: Use single-word agent names because the agent field uses TEXT (tokenized)
@@ -390,10 +391,9 @@ fn concurrent_different_filters_no_interference() {
                 .with_content(0, format!("filter_test common_term {agent} specific"))
                 .build_normalized();
 
-            index.add_conversation(&conv).unwrap();
+            persist_conversation(&storage, &conv).unwrap();
         }
     }
-    index.commit().unwrap();
 
     // Each thread creates its own SearchClient so the search state stays thread-local.
     let index_path = dir.path().to_path_buf();
@@ -404,12 +404,14 @@ fn concurrent_different_filters_no_interference() {
     // Spawn threads with different agent filters
     for agent in &["codex", "claude", "gemini"] {
         let index_path_clone = index_path.clone();
+
+        let db_path_clone = db_path.clone();
         let barrier_clone = Arc::clone(&barrier);
         let agent = agent.to_string();
 
         // Thread searching with agent filter
         handles.push(thread::spawn(move || {
-            let client = SearchClient::open(&index_path_clone, None)
+            let client = SearchClient::open(&index_path_clone, Some(&db_path_clone))
                 .unwrap()
                 .expect("client");
 
@@ -436,10 +438,12 @@ fn concurrent_different_filters_no_interference() {
 
         // Thread searching without filters
         let index_path_clone = index_path.clone();
+
+        let db_path_clone = db_path.clone();
         let barrier_clone = Arc::clone(&barrier);
 
         handles.push(thread::spawn(move || {
-            let client = SearchClient::open(&index_path_clone, None)
+            let client = SearchClient::open(&index_path_clone, Some(&db_path_clone))
                 .unwrap()
                 .expect("client");
 
@@ -482,7 +486,8 @@ fn concurrent_different_filters_no_interference() {
 #[test]
 fn concurrent_no_deadlock_mixed_operations() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     // Initial seed
     let conv = util::ConversationFixtureBuilder::new("tester")
@@ -493,8 +498,7 @@ fn concurrent_no_deadlock_mixed_operations() {
         .with_content(0, "deadlock_prevention_test")
         .build_normalized();
 
-    index.add_conversation(&conv).unwrap();
-    index.commit().unwrap();
+    persist_conversation(&storage, &conv).unwrap();
 
     // Each thread creates its own SearchClient so the search state stays thread-local.
     let index_path = dir.path().to_path_buf();
@@ -506,12 +510,14 @@ fn concurrent_no_deadlock_mixed_operations() {
     // Multiple search threads
     for _ in 0..5 {
         let index_path = index_path.clone();
+
+        let db_path = db_path.clone();
         let done = Arc::clone(&done);
         let search_count = Arc::clone(&search_count);
 
         handles.push(thread::spawn(move || {
             // Each thread creates its own client
-            let client = SearchClient::open(&index_path, None)
+            let client = SearchClient::open(&index_path, Some(&db_path))
                 .unwrap()
                 .expect("client");
 
@@ -533,15 +539,9 @@ fn concurrent_no_deadlock_mixed_operations() {
             .with_content(0, format!("deadlock_content_{i}"))
             .build_normalized();
 
-        index.add_conversation(&conv).unwrap();
-
-        if i % 5 == 0 {
-            index.commit().unwrap();
-        }
-
+        persist_conversation(&storage, &conv).unwrap();
         thread::sleep(Duration::from_millis(10));
     }
-    index.commit().unwrap();
 
     // Signal completion and wait with timeout
     done.store(true, Ordering::Relaxed);

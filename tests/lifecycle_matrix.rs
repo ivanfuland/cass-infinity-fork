@@ -21,7 +21,7 @@ use coding_agent_search::search::policy::{CHUNKING_STRATEGY_VERSION, SEMANTIC_SC
 use coding_agent_search::search::semantic_manifest::{
     ArtifactRecord, BacklogLedger, BuildCheckpoint, SemanticManifest, TierKind,
 };
-use coding_agent_search::search::tantivy::{expected_index_dir, index_dir};
+use coding_agent_search::indexer::{expected_index_dir, index_dir};
 use coding_agent_search::storage::sqlite::FrankenStorage;
 use serde_json::{Value, json};
 use std::fs;
