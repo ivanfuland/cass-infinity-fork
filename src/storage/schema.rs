@@ -65,7 +65,16 @@ use super::api::{Conn, StorageError, TxMode};
 /// tables and bumping `user_version` -- it does not backfill historical
 /// message content into them (that is the `--full` rebuild's job, a
 /// separate future task).
-pub const CURRENT_SCHEMA_VERSION: i64 = 2;
+///
+/// Version 3 (W2-6 Task戊) drops the legacy `fts_messages` FTS5 shadow: the
+/// production write/consistency/rebuild machinery that kept it in sync was
+/// retired earlier in W2-6, and search runs entirely on the `fts_lex`/
+/// `lex_docs` domain added at version 2. `ensure`'s `version < 3` migration
+/// step (see below) DROPs the table (`DROP TABLE` also removes its FTS5
+/// shadow tables -- `_data`/`_idx`/`_docsize`/`_config`, all four of them,
+/// verified empirically since this table is contentless (`content=''`) and
+/// therefore never had a `_content` shadow to begin with).
+pub const CURRENT_SCHEMA_VERSION: i64 = 3;
 
 /// The `lex_docs`/`fts_lex` domain DDL (w2 Task W2-2, OQ2: external-content
 /// mode) — **must stay byte-for-byte identical** to the matching two lines
@@ -176,7 +185,6 @@ CREATE TABLE IF NOT EXISTS conversation_tail_state (conversation_id INTEGER PRIM
 CREATE TABLE IF NOT EXISTS conversation_external_lookup (lookup_key TEXT PRIMARY KEY, conversation_id INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS conversation_external_tail_lookup (lookup_key TEXT PRIMARY KEY, conversation_id INTEGER NOT NULL, ended_at INTEGER, last_message_idx INTEGER, last_message_created_at INTEGER);
 CREATE TABLE IF NOT EXISTS operation_commit_receipt (id INTEGER PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE, operation TEXT NOT NULL, state TEXT NOT NULL, snapshot_root TEXT, committed_at_ms INTEGER NOT NULL, detail TEXT);
-CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, content = '', tokenize = 'porter');
 CREATE TABLE IF NOT EXISTS lex_docs (doc_id INTEGER PRIMARY KEY REFERENCES messages (id) ON DELETE CASCADE, content TEXT NOT NULL, title TEXT NOT NULL, agent TEXT NOT NULL, workspace TEXT NOT NULL, source_path TEXT NOT NULL);
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_lex USING fts5(content, title, agent, workspace, source_path, content = 'lex_docs', content_rowid = 'doc_id', tokenize = 'porter trigram');
 "#;
@@ -229,13 +237,19 @@ fn reject(detail: impl Into<String>) -> StorageError {
 ///   Rejected outright — this module does not attempt in-place conversion;
 ///   the caller's story for that case is "rebuild the archive", not
 ///   "migrate this file".
-/// - `user_version == 1` → w2's version 1 → 2 migration: add the
-///   `lex_docs`/`fts_lex` domain ([`V2_LEX_DOMAIN_DDL`]) and bump
-///   `user_version` to 2, in its own transaction. Idempotent via `IF NOT
-///   EXISTS` on both statements.
-/// - `1 < user_version <= CURRENT_SCHEMA_VERSION` → already built, nothing
-///   to do (each future migration step goes here, its own transaction per
-///   the plan's forward design).
+/// - `0 < user_version < CURRENT_SCHEMA_VERSION` → apply every pending
+///   migration step in version order, in a single transaction, then bump
+///   `user_version` straight to [`CURRENT_SCHEMA_VERSION`] (not "+1" per
+///   call): a database more than one version behind must not require a
+///   second `ensure` call to finish catching up, since callers invoke this
+///   once per open. Steps so far:
+///   - `version < 2`: add the `lex_docs`/`fts_lex` domain
+///     ([`V2_LEX_DOMAIN_DDL`]). Idempotent via `IF NOT EXISTS` on both
+///     statements.
+///   - `version < 3` (W2-6 Task戊): `DROP TABLE IF EXISTS fts_messages` —
+///     the legacy FTS5 shadow, superseded by the `fts_lex`/`lex_docs`
+///     domain. Idempotent via `IF EXISTS`.
+/// - `user_version == CURRENT_SCHEMA_VERSION` → already built, nothing to do.
 /// - `user_version > CURRENT_SCHEMA_VERSION` → this binary is older than
 ///   the database it's looking at. Rejected: opening it would silently
 ///   ignore schema it doesn't understand.
@@ -266,22 +280,28 @@ pub fn ensure(conn: &Conn) -> Result<(), StorageError> {
         )));
     }
 
-    if version == 1 {
-        // w2 Task W2-3 Step 4 (R1-X-N1): a pre-existing wave-1 database opened
-        // by wave-2 code must not be silently left without the lex_docs/fts_lex
-        // domain. `IF NOT EXISTS` on both statements (see V2_LEX_DOMAIN_DDL)
-        // makes this idempotent -- a retry after an interrupted attempt, or a
-        // second `ensure` call on an already-migrated version-2 database,
-        // re-runs harmlessly (the `version == 1` guard itself also means this
-        // whole branch is skipped once user_version reaches 2).
+    if version < CURRENT_SCHEMA_VERSION {
+        // w2 Task W2-3 Step 4 (R1-X-N1) + W2-6 Task戊: a pre-existing database
+        // opened by newer code must not be silently left behind. Every
+        // pending step below is idempotent (`IF NOT EXISTS` / `IF EXISTS`),
+        // so applying steps the database already has is harmless -- a retry
+        // after an interrupted attempt, or a second `ensure` call on an
+        // already-current database, re-runs (or skips) harmlessly. All
+        // pending steps apply in one transaction so a single `ensure` call
+        // fully catches a database up regardless of how far behind it is.
         return conn.with_tx_no_replay(TxMode::Immediate, |tx| {
-            tx.execute_batch(V2_LEX_DOMAIN_DDL)?;
+            if version < 2 {
+                tx.execute_batch(V2_LEX_DOMAIN_DDL)?;
+            }
+            if version < 3 {
+                tx.execute_batch("DROP TABLE IF EXISTS fts_messages;")?;
+            }
             tx.execute_batch(&set_user_version_sql(CURRENT_SCHEMA_VERSION))?;
             Ok(())
         });
     }
 
-    // 0 < version <= CURRENT_SCHEMA_VERSION: already built, nothing to do.
+    // version == CURRENT_SCHEMA_VERSION: already built, nothing to do.
     Ok(())
 }
 
@@ -329,11 +349,11 @@ mod tests {
         assert!(names.contains(&"agents".to_string()));
         assert!(names.contains(&"conversations".to_string()));
         assert!(names.contains(&"messages".to_string()));
-        assert!(names.contains(&"fts_messages".to_string()));
         assert!(names.contains(&"idx_conversations_provenance".to_string()));
-        // sqlite_sequence / fts5 shadow tables must come from SQLite itself,
-        // not be created a second time by this module.
-        assert!(names.contains(&"fts_messages_data".to_string()));
+        // W2-6 Task戊: fts_messages is retired at version 3 -- a fresh
+        // database must never create it (or its FTS5 shadows) again.
+        assert!(!names.contains(&"fts_messages".to_string()));
+        assert!(!names.contains(&"fts_messages_data".to_string()));
         // w2 Task W2-2: lex_docs + fts_lex (external-content, OQ2 decision).
         assert!(names.contains(&"lex_docs".to_string()));
         assert!(names.contains(&"fts_lex_data".to_string()));
@@ -435,16 +455,23 @@ mod tests {
         let conn = open_sqlite_writer(&path);
 
         // Build a version-1 shape directly (the pre-W2-2 DDL: everything up
-        // to and including fts_messages, but not lex_docs/fts_lex).
+        // to and including fts_messages -- the legacy FTS5 shadow a real
+        // wave-1 database still had -- but not lex_docs/fts_lex).
         let v1_ddl = FRESH_SCHEMA_DDL
             .trim_end()
             .strip_suffix(V2_LEX_DOMAIN_DDL.trim())
             .expect("FRESH_SCHEMA_DDL must end with V2_LEX_DOMAIN_DDL's text");
         conn.execute_batch(v1_ddl).unwrap();
+        conn.execute_batch(LEGACY_FTS_MESSAGES_DDL_FOR_TEST).unwrap();
         conn.execute_batch(&set_user_version_sql(1)).unwrap();
+        let v1_names = table_names(&conn);
         assert!(
-            !table_names(&conn).contains(&"lex_docs".to_string()),
+            !v1_names.contains(&"lex_docs".to_string()),
             "sanity: the hand-built v1 shape must not already have lex_docs"
+        );
+        assert!(
+            v1_names.contains(&"fts_messages".to_string()),
+            "sanity: a real wave-1 database still had fts_messages"
         );
 
         ensure(&conn).expect("ensure must migrate a version-1 database forward");
@@ -452,6 +479,55 @@ mod tests {
         let names = table_names(&conn);
         assert!(names.contains(&"lex_docs".to_string()));
         assert!(names.contains(&"fts_lex_data".to_string()));
+        // W2-6 Task戊: a database more than one version behind must catch
+        // all the way up in a single `ensure` call -- fts_messages must be
+        // dropped too, not just the version 1->2 lex_docs add applied.
+        assert!(
+            !names.contains(&"fts_messages".to_string()),
+            "a version-1 database must also get the version 2->3 fts_messages drop"
+        );
+
+        // Idempotent: a second call (simulating either a deliberate re-run or
+        // recovery after an interrupted first migration) must not fail.
+        ensure(&conn).expect("a second ensure call on an already-migrated database must be a no-op");
+        assert_eq!(read_user_version(&conn).unwrap(), CURRENT_SCHEMA_VERSION);
+        assert_eq!(table_names(&conn), names, "re-running the migration must not change the table set");
+    }
+
+    /// W2-6 Task戊: a version-2 database (the `lex_docs`/`fts_lex` domain
+    /// already added by the version 1->2 step, but `fts_messages` not yet
+    /// dropped -- the shape every real database had right up until this
+    /// task) must get `fts_messages` dropped and land on version 3,
+    /// idempotently.
+    #[test]
+    fn ensure_migrates_a_wave2_database_by_dropping_fts_messages_and_is_idempotent() {
+        let (_dir, path) = scratch_db_path();
+        let conn = open_sqlite_writer(&path);
+
+        conn.execute_batch(FRESH_SCHEMA_DDL).unwrap();
+        conn.execute_batch(LEGACY_FTS_MESSAGES_DDL_FOR_TEST).unwrap();
+        conn.execute_batch(&set_user_version_sql(2)).unwrap();
+        let v2_names = table_names(&conn);
+        assert!(
+            v2_names.contains(&"fts_messages".to_string()),
+            "sanity: the hand-built v2 shape must have fts_messages"
+        );
+
+        ensure(&conn).expect("ensure must migrate a version-2 database forward");
+        assert_eq!(read_user_version(&conn).unwrap(), CURRENT_SCHEMA_VERSION);
+        let names = table_names(&conn);
+        assert!(
+            !names.contains(&"fts_messages".to_string()),
+            "fts_messages must be dropped"
+        );
+        assert!(
+            !names.contains(&"fts_messages_data".to_string()),
+            "fts_messages's FTS5 shadow tables must be dropped along with it"
+        );
+        assert!(
+            names.contains(&"lex_docs".to_string()),
+            "the fts_messages drop must not touch the unrelated lex_docs/fts_lex domain"
+        );
 
         // Idempotent: a second call (simulating either a deliberate re-run or
         // recovery after an interrupted first migration) must not fail.
@@ -602,6 +678,15 @@ mod tests {
     /// One past the last real statement, so the loop above also covers
     /// "every statement ran, only the version pragma is missing" -- the
     /// latest possible interruption point inside the transaction. Bumped
-    /// from 58 to 60 by w2 Task W2-2's `lex_docs`/`fts_lex` addition.
-    const FRESH_SCHEMA_DDL_STATEMENT_COUNT_FOR_TEST: usize = 60;
+    /// from 58 to 60 by w2 Task W2-2's `lex_docs`/`fts_lex` addition, then
+    /// down to 59 by W2-6 Task戊 removing the `fts_messages` statement.
+    const FRESH_SCHEMA_DDL_STATEMENT_COUNT_FOR_TEST: usize = 59;
+
+    /// The historical `fts_messages` DDL, byte-for-byte identical to the
+    /// statement W2-6 Task戊 removed from [`FRESH_SCHEMA_DDL`]. A real
+    /// database built at version 1 or 2 (before this task) always had this
+    /// table -- kept here, test-only, so the version 1->3 and 2->3 migration
+    /// tests can hand-build an authentic pre-drop fixture instead of
+    /// depending on production DDL that must no longer contain it.
+    const LEGACY_FTS_MESSAGES_DDL_FOR_TEST: &str = "CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, content = '', tokenize = 'porter');";
 }

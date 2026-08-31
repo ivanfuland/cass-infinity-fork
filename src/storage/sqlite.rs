@@ -16984,15 +16984,10 @@ mod tests {
                 && conversation_cols.contains(&"last_message_created_at".to_string()),
             "fresh schema must include V15 tail columns without ALTER TABLE on conversations"
         );
-        // w1b Task B7 (control-plane ruling, bead z9fse.11): `SqliteStorage::open`
-        // on a new file now builds through `schema::ensure`, which creates
-        // fts_messages eagerly as part of the one-shot fresh DDL -- the old
-        // "V13 creates it, V14 drops it, a later FTS consistency check
-        // recreates it lazily" dance this assertion used to check for is
-        // retired for new-engine databases (that dance existed to work around
-        // a legacy embedded engine-specific limitation; the machinery itself retires
-        // at Task B8). A fresh database now has exactly one, immediately
-        // queryable, fts_messages schema row from the moment it's built.
+        // W2-6 Task戊: schema version 3 drops fts_messages entirely --
+        // `SqliteStorage::open` on a new file now builds through
+        // `schema::ensure`, which never creates it (search runs on the
+        // fts_lex/lex_docs index instead).
         let fts_schema_rows: i64 = conn
             .query_row_map(
                 "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
@@ -17001,8 +16996,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            fts_schema_rows, 1,
-            "fresh schema must create fts_messages eagerly, not lazily"
+            fts_schema_rows, 0,
+            "fresh schema must not create the retired fts_messages table"
         );
         let integrity: Vec<String> = conn
             .query_all_map("PRAGMA integrity_check;", fparams![], |row: &FrankenRow| {
@@ -23225,24 +23220,24 @@ mod tests {
             bundles[0].probe.user_version,
             Some(CURRENT_SCHEMA_VERSION)
         );
-        // w1b Task B7 (control-plane ruling, bead z9fse.11): `clean_backup` is
-        // built via `SqliteStorage::open` on a new file, which now creates
-        // fts_messages eagerly through `schema::ensure` -- one real,
-        // immediately-queryable schema row, no lazy repair needed. The bundle
-        // was already ranked healthiest before this change (0 lazy rows was
-        // also a legitimate healthy state); it stays healthiest now.
-        assert_eq!(bundles[0].probe.fts_schema_rows, Some(1));
-        assert!(bundles[0].probe.fts_queryable);
+        // W2-6 Task戊: `clean_backup` is built via `SqliteStorage::open` on a
+        // new file, which now goes through `schema::ensure` at version 3 --
+        // fts_messages is retired and never created. Zero schema rows on a
+        // current-schema bundle is exactly the `bundle_health_rank` clean
+        // shape (`Some(0) && schema_current`, see that function's doc
+        // comment), so it still ranks healthiest; `fts_queryable` only ever
+        // means something for the `Some(1)` shape, so it stays false here.
+        assert_eq!(bundles[0].probe.fts_schema_rows, Some(0));
+        assert!(!bundles[0].probe.fts_queryable);
         assert_eq!(bundles[1].probe.schema_version, Some(13));
-        // w1b Task B7 (control-plane ruling, bead z9fse.11): `replay_storage`
-        // was also built via `SqliteStorage::open` on a new file, so it
-        // starts with one real, eagerly-created fts_messages row before the
-        // test rolls meta.schema_version back to 13 and deletes the V14
-        // marker (that rollback only touches version bookkeeping, not the
-        // schema object itself). On Unix CI we also inject a duplicate
-        // sqlite_master row on top of that real one to exercise the
-        // malformed-bundle probe path that depends on sqlite3.
-        let expected_fts_schema_rows = if cfg!(windows) { Some(1) } else { Some(2) };
+        // W2-6 Task戊: `replay_storage` was also built via `SqliteStorage::open`
+        // on a new file, so (post-drop) it starts with zero fts_messages
+        // schema rows -- there is no longer a real row for the test's
+        // `#[cfg(not(windows))]` sqlite_master injection below to duplicate
+        // against. On Unix CI that injection adds the one and only
+        // (malformed, non-functional) row; on Windows nothing injects and
+        // the bundle stays at zero.
+        let expected_fts_schema_rows = if cfg!(windows) { Some(0) } else { Some(1) };
         assert_eq!(bundles[1].probe.fts_schema_rows, expected_fts_schema_rows);
     }
 

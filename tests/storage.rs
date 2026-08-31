@@ -294,12 +294,12 @@ fn fresh_db_creates_all_tables() {
         tables.contains(&"conversation_tags".to_string()),
         "conversation_tags table exists"
     );
-    // w1b Task B7 (control-plane ruling, bead z9fse.11): `SqliteStorage::open`
-    // on a new file now builds through `schema::ensure`, which materializes
-    // fts_messages eagerly as part of the one-shot fresh DDL.
+    // W2-6 Task戊: schema version 3 drops fts_messages -- a fresh database
+    // built through `schema::ensure` must never materialize it again (search
+    // runs entirely on the fts_lex/lex_docs index).
     assert!(
-        tables.contains(&"fts_messages".to_string()),
-        "fresh schema must materialize fts_messages eagerly"
+        !tables.contains(&"fts_messages".to_string()),
+        "fresh schema must not materialize the retired fts_messages table"
     );
     // Sources table (v4)
     assert!(

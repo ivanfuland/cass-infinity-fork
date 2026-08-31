@@ -272,22 +272,6 @@ fn fs_cass_has_boolean_operators(query: &str) -> bool {
     })
 }
 
-/// Test-only parameter list builder (Task A6 batch: mirrors sqlite.rs's
-/// `fparams!` shim): delegates to `storage::api::params!`, but produces a
-/// borrowed `&[ParamValue]` (the old native `params!` macro's call sites here
-/// passed their expansion straight into `execute_compat`/`query_row_map` by
-/// value; the api facade's `execute`/`query_row_map` take `&[Value]`) and
-/// supports the zero-arg case the api macro doesn't.
-#[cfg(test)]
-macro_rules! fparams {
-    () => {
-        &[] as &[ParamValue]
-    };
-    ($($val:expr),+ $(,)?) => {
-        &crate::storage::api::params![$($val),+] as &[ParamValue]
-    };
-}
-
 /// Wrapper around the `storage::api` `Connection` (Task A4a: backed by
 /// the legacy embedded engine in Stage A) that implements `Send`.
 ///
@@ -9949,79 +9933,87 @@ mod tests {
 
     #[test]
     fn sqlite_backend_respects_source_filter() -> Result<()> {
-        let conn = Connection::open_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
-             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
-             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
-             CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                agent_id INTEGER,
-                workspace_id INTEGER,
-                source_id TEXT,
-                origin_host TEXT,
-                title TEXT,
-                source_path TEXT
-             );
-             CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER,
-                idx INTEGER,
-                content TEXT,
-                created_at INTEGER
-             );
-             CREATE VIRTUAL TABLE fts_messages USING fts5(
-                content,
-                title,
-                agent,
-                workspace,
-                source_path,
-                created_at UNINDEXED,
-                content='',
-                tokenize='porter'
-             );",
-        )?;
-        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')", &[])?;
-        conn.execute("INSERT INTO sources(id, kind) VALUES('laptop', 'ssh')", &[])?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
-        conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/local')", &[])?;
-        conn.execute("INSERT INTO workspaces(id, path) VALUES(2, '/remote')", &[])?;
-        conn.execute(
-            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path) VALUES(1, 1, 1, '  local  ', NULL, 'local title', '/tmp/local.jsonl')",
-        &[])?;
-        conn.execute("INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path) VALUES(2, 1, 2, 'laptop', 'dev@laptop', 'remote title', '/tmp/remote.jsonl')", &[])?;
-        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(1, 1, 0, 'auth token failure', 42)", &[])?;
-        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(2, 2, 0, 'auth token failure', 43)", &[])?;
-        conn.execute(
-            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            fparams![
-                1_i64,
-                "auth token failure",
-                "local title",
-                "codex",
-                "/local",
-                "/tmp/local.jsonl",
-                42_i64
-            ],
-        )?;
-        conn.execute(
-            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            fparams![
-                2_i64,
-                "auth token failure",
-                "remote title",
-                "codex",
-                "/remote",
-                "/tmp/remote.jsonl",
-                43_i64
-            ],
-        )?;
+        // W2-6 Task戊: fixture rebuilt on the real production write path
+        // (FrankenStorage::open + insert_conversation_tree) -- this test
+        // exercises `browse_by_date`'s source filter, which never touches
+        // FTS at all, so (unlike its `client.search()` siblings) it never
+        // needed a hand-rolled fts_messages fixture in the first place; the
+        // old raw-SQL version carried one anyway as pure dead weight.
+        let temp_dir = TempDir::new()?;
+        let db_path = temp_dir.path().join("source-filter.db");
+        {
+            let storage = FrankenStorage::open(&db_path)?;
+            let agent = Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            };
+            let agent_id = storage.ensure_agent(&agent)?;
+            let local_workspace = temp_dir.path().join("local");
+            let remote_workspace = temp_dir.path().join("remote");
+            std::fs::create_dir_all(&local_workspace)?;
+            std::fs::create_dir_all(&remote_workspace)?;
+            let local_workspace_id = storage.ensure_workspace(&local_workspace, None)?;
+            let remote_workspace_id = storage.ensure_workspace(&remote_workspace, None)?;
+
+            let local_conversation = Conversation {
+                id: None,
+                agent_slug: agent.slug.clone(),
+                workspace: Some(local_workspace.clone()),
+                external_id: Some("local-conv".into()),
+                title: Some("local title".into()),
+                source_path: temp_dir.path().join("local.jsonl"),
+                started_at: Some(42),
+                ended_at: Some(42),
+                approx_tokens: Some(16),
+                metadata_json: serde_json::Value::Null,
+                messages: vec![Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: Some("user".into()),
+                    created_at: Some(42),
+                    content: "auth token failure".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                }],
+                source_id: "  local  ".into(),
+                origin_host: None,
+            };
+            storage.insert_conversation_tree(agent_id, Some(local_workspace_id), &local_conversation)?;
+
+            let remote_conversation = Conversation {
+                id: None,
+                agent_slug: agent.slug.clone(),
+                workspace: Some(remote_workspace.clone()),
+                external_id: Some("remote-conv".into()),
+                title: Some("remote title".into()),
+                source_path: temp_dir.path().join("remote.jsonl"),
+                started_at: Some(43),
+                ended_at: Some(43),
+                approx_tokens: Some(16),
+                metadata_json: serde_json::Value::Null,
+                messages: vec![Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: Some("user".into()),
+                    created_at: Some(43),
+                    content: "auth token failure".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                }],
+                source_id: "laptop".into(),
+                origin_host: Some("dev@laptop".into()),
+            };
+            storage.insert_conversation_tree(agent_id, Some(remote_workspace_id), &remote_conversation)?;
+        }
 
         let client = SearchClient {
-            sqlite: Mutex::new(Some(SendConnection(conn))),
-            sqlite_path: None,
+            sqlite: Mutex::new(None),
+            sqlite_path: Some(db_path),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
