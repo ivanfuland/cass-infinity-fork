@@ -758,7 +758,6 @@ const PROGRESSIVE_EMBEDDING_CACHE_CAPACITY: usize = 64;
 const ANN_CANDIDATE_MULTIPLIER: usize = 4;
 const HYBRID_NO_LIMIT_PLANNING_WINDOW: usize = 64;
 const HYBRID_NO_LIMIT_SEMANTIC_CAP: usize = 2048;
-const AUTOMATIC_WILDCARD_FALLBACK_MAX_TOKEN_CHARS: usize = 16;
 
 /// Upper bound on how many documents a `limit == 0` ("no limit") search is
 /// allowed to materialize. Each `SearchHit` carries the full message
@@ -812,7 +811,6 @@ const NO_LIMIT_RAM_DIVISOR: u64 = 16;
 /// output already reports lower-bound count precision when the exact total is
 /// not available.
 const DEFAULT_EXACT_TOTAL_COUNT_MAX_DOCS: usize = 50_000;
-const DEFAULT_AUTOMATIC_WILDCARD_FALLBACK_MAX_DOCS: usize = 10_000;
 
 fn exact_total_count_max_docs() -> usize {
     static MAX_DOCS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -829,23 +827,6 @@ fn should_collect_exact_total_count(
     max_docs_for_exact_count: usize,
 ) -> bool {
     max_docs_for_exact_count > 0 && index_doc_count <= max_docs_for_exact_count
-}
-
-fn automatic_wildcard_fallback_max_docs() -> usize {
-    static MAX_DOCS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *MAX_DOCS.get_or_init(|| {
-        dotenvy::var("CASS_AUTOMATIC_WILDCARD_FALLBACK_MAX_DOCS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(DEFAULT_AUTOMATIC_WILDCARD_FALLBACK_MAX_DOCS)
-    })
-}
-
-fn should_allow_automatic_wildcard_fallback(
-    index_doc_count: usize,
-    max_docs_for_automatic_wildcard: usize,
-) -> bool {
-    max_docs_for_automatic_wildcard > 0 && index_doc_count <= max_docs_for_automatic_wildcard
 }
 
 fn available_memory_bytes() -> Option<u64> {
@@ -3619,42 +3600,6 @@ pub(crate) fn deduplicate_hits_with_query(hits: Vec<SearchHit>, query: &str) -> 
     deduped
 }
 
-fn should_try_wildcard_fallback(
-    returned_hits: usize,
-    limit: usize,
-    offset: usize,
-    sparse_threshold: usize,
-) -> bool {
-    if offset != 0 {
-        return false;
-    }
-
-    let effective_sparse_threshold = if limit == 0 {
-        sparse_threshold
-    } else {
-        sparse_threshold.min(limit)
-    };
-
-    returned_hits < effective_sparse_threshold
-}
-
-fn should_skip_automatic_wildcard_fallback_for_long_zero_hit_query(
-    query: &str,
-    returned_hits: usize,
-) -> bool {
-    if returned_hits != 0 {
-        return false;
-    }
-
-    for token in normalize_phrase_terms(query) {
-        if token.chars().count() > AUTOMATIC_WILDCARD_FALLBACK_MAX_TOKEN_CHARS {
-            return true;
-        }
-    }
-
-    false
-}
-
 fn snippet_from_preview_without_full_content(
     field_mask: FieldMask,
     stored_preview: &str,
@@ -5820,8 +5765,45 @@ impl SearchClient {
     }
 
     /// Search with automatic wildcard fallback for sparse results.
-    /// If the initial search returns fewer than `sparse_threshold` results and the query
-    /// doesn't already contain wildcards, automatically retry with substring wildcards (*term*).
+    ///
+    /// W2-6 exec37 Task甲⑦ (structural-extinction ruling, w2-d4 family,
+    /// 2026-08-31): this used to retry a sparse baseline with `*term*`-
+    /// decorated terms and swap in the retry's hits when it found more of
+    /// them. Under `fts_lex`'s trigram tokenizer that retry can never find
+    /// more: every query reachable here (past the `query_has_wildcards` /
+    /// `has_boolean_or_phrase` guards below) resolves through exactly one of
+    /// two candidate-generation paths in [`Self::search`], and on both paths
+    /// wildcard-decorating every term cannot enlarge the candidate set:
+    ///
+    /// - **FTS5 MATCH path** (`transpile_to_fts5`): decorating a star-free
+    ///   term `t` with `*t*` always classifies as
+    ///   [`FsCassWildcardPattern::Substring`], which `transpile_to_fts5`
+    ///   strips back to `t` (Ivan 2026-08-31 Task甲4-② ruling) before the
+    ///   *identical* `normalize_term_parts` / `render_fts5_term_part`
+    ///   pipeline runs on it. The decorated and undecorated queries
+    ///   therefore transpile to a byte-identical FTS5 MATCH string, so the
+    ///   "retry" is a second execution of the exact same query.
+    /// - **KU3 LIKE path** (`lex_docs_like_candidates_query`, for
+    ///   short-subterm queries the trigram floor can't index): the LIKE
+    ///   pattern is built verbatim from the raw query text with no wildcard
+    ///   translation, so decorating adds literal `*` characters to the
+    ///   pattern (`%term%` -> `%*term*%`). Any row matching the decorated
+    ///   pattern must contain `*term*` as a substring, which necessarily
+    ///   contains `term` -- so the decorated pattern's match set is always a
+    ///   *subset* of the undecorated one's, never a superset.
+    ///
+    /// Either way `fallback_hits.len() > hits.len()` can never hold, so the
+    /// retry was always a wasted duplicate query. It has been removed along
+    /// with its now-orphaned gating helpers (the old sparse/offset/threshold
+    /// check, the large-index opt-out, and the long-zero-hit-token skip --
+    /// none of them had any other caller once the retry itself was deleted):
+    /// `wildcard_fallback` is unconditionally `false` and callers get the
+    /// baseline hits directly.
+    ///
+    /// `sparse_threshold` is kept in the signature (unused) rather than
+    /// removed, to avoid rippling a parameter deletion through this method's
+    /// many call sites for a ruling scoped to "is the retry ever useful",
+    /// not "redesign this API".
     pub fn search_with_fallback(
         &self,
         query: &str,
@@ -5831,7 +5813,7 @@ impl SearchClient {
         sparse_threshold: usize,
         field_mask: FieldMask,
     ) -> Result<SearchResult> {
-        // First, try the normal search
+        let _ = sparse_threshold;
         let hits = self.search(query, filters.clone(), limit, offset, field_mask)?;
         let baseline_stats = self.cache_stats();
         // W2-6 Task2: `fts_lex` has no cheap exact-total-count path (the old
@@ -5840,123 +5822,20 @@ impl SearchClient {
         // count.
         let tantivy_total: Option<usize> = None;
 
-        // Check if we should try wildcard fallback
-        let query_has_wildcards = query.contains('*');
-        let has_boolean_or_phrase = fs_cass_has_boolean_operators(query);
-        let is_sparse = should_try_wildcard_fallback(hits.len(), limit, offset, sparse_threshold);
-        let total_docs = self.total_docs();
-        let automatic_wildcard_allowed = should_allow_automatic_wildcard_fallback(
-            total_docs,
-            automatic_wildcard_fallback_max_docs(),
-        );
-
-        if !is_sparse
-            || query_has_wildcards
-            || has_boolean_or_phrase
-            || query.trim().is_empty()
-            || !automatic_wildcard_allowed
-        {
-            // Either we have enough results, query already has wildcards,
-            // query uses boolean/phrases, or query is empty.
-            if is_sparse && !automatic_wildcard_allowed {
-                tracing::debug!(
-                    query,
-                    returned_hits = hits.len(),
-                    total_docs,
-                    automatic_wildcard_max_docs = automatic_wildcard_fallback_max_docs(),
-                    "skipping automatic wildcard fallback on large index"
-                );
-            }
-            // Generate suggestions only if truly zero hits
-            let suggestions = if hits.is_empty() && !query.trim().is_empty() {
-                self.generate_suggestions(query, &filters)
-            } else {
-                Vec::new()
-            };
-            return Ok(SearchResult {
-                hits,
-                wildcard_fallback: false,
-                cache_stats: baseline_stats,
-                suggestions,
-                ann_stats: None,
-                total_count: tantivy_total,
-            });
-        }
-
-        if should_skip_automatic_wildcard_fallback_for_long_zero_hit_query(query, hits.len()) {
-            let suggestions = if hits.is_empty() {
-                self.generate_suggestions(query, &filters)
-            } else {
-                Vec::new()
-            };
-            return Ok(SearchResult {
-                hits,
-                wildcard_fallback: false,
-                cache_stats: baseline_stats,
-                suggestions,
-                ann_stats: None,
-                total_count: tantivy_total,
-            });
-        }
-
-        // Try wildcard fallback: wrap each term in *term*
-        let wildcard_query = query
-            .split_whitespace()
-            .map(|term| format!("*{}*", term.trim_matches('*')))
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        tracing::info!(
-            original_query = query,
-            wildcard_query = wildcard_query,
-            original_count = hits.len(),
-            "wildcard_fallback"
-        );
-
-        let mut fallback_hits =
-            self.search(&wildcard_query, filters.clone(), limit, offset, field_mask)?;
-        let fallback_stats = self.cache_stats();
-        // W2-6 Task2: see the `tantivy_total` comment above -- no cheap
-        // exact-total-count path for `fts_lex`.
-        let fallback_tantivy_total: Option<usize> = None;
-
-        // Use fallback results if they're better
-        if fallback_hits.len() > hits.len() {
-            // Mark all hits as ImplicitWildcard since we auto-added wildcards
-            for hit in &mut fallback_hits {
-                hit.match_type = MatchType::ImplicitWildcard;
-            }
-            // Generate suggestions if still zero hits after fallback
-            let suggestions = if fallback_hits.is_empty() {
-                self.generate_suggestions(query, &filters)
-            } else {
-                Vec::new()
-            };
-            Ok(SearchResult {
-                hits: fallback_hits,
-                wildcard_fallback: true,
-                cache_stats: fallback_stats,
-                suggestions,
-                ann_stats: None,
-                total_count: fallback_tantivy_total,
-            })
+        // Generate suggestions only if truly zero hits.
+        let suggestions = if hits.is_empty() && !query.trim().is_empty() {
+            self.generate_suggestions(query, &filters)
         } else {
-            // Keep original results even if sparse
-            // Generate suggestions if zero hits
-            let suggestions = if hits.is_empty() {
-                self.generate_suggestions(query, &filters)
-            } else {
-                Vec::new()
-            };
-            Ok(SearchResult {
-                hits,
-                wildcard_fallback: false,
-                cache_stats: baseline_stats,
-                suggestions,
-                ann_stats: None,
-                total_count: tantivy_total,
-            })
-        }
+            Vec::new()
+        };
+        Ok(SearchResult {
+            hits,
+            wildcard_fallback: false,
+            cache_stats: baseline_stats,
+            suggestions,
+            ann_stats: None,
+            total_count: tantivy_total,
+        })
     }
 
     /// Hybrid search that fuses lexical + semantic results with RRF.
@@ -10914,7 +10793,17 @@ mod tests {
     }
 
     #[test]
-    fn search_with_fallback_marks_implicit_wildcard() -> Result<()> {
+    // W2-6 exec37 Task甲⑦ (structural-extinction ruling, w2-d4 family): renamed
+    // from `search_with_fallback_marks_implicit_wildcard`. `fts_lex`'s trigram
+    // tokenizer already substring-matches a bare query term (probe-verified:
+    // `andle` finds "handler" directly via the baseline MATCH), so the sparse
+    // -> wildcard-retry heuristic in `search_with_fallback` never has anything
+    // to add here -- baseline hits are already complete and honestly labeled
+    // `Exact` (the raw query carries no literal `*`). The old assertion that
+    // this case flips `wildcard_fallback` to true and relabels the hit
+    // `ImplicitWildcard` asserted Tantivy-era behavior that the trigram
+    // backend structurally cannot reproduce.
+    fn search_with_fallback_never_triggers_when_trigram_baseline_already_matches() -> Result<()> {
         let dir = TempDir::new()?;
 
 
@@ -10941,7 +10830,8 @@ mod tests {
         let (dir, db_path) = seed_conversations_for_search_client(&[conv])?;
         let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
-        // Base search for "andle" finds nothing; fallback "*andle*" should hit and mark implicit.
+        // "andle" is a substring of "handler" -- the trigram baseline finds it
+        // directly, so the sparse-retry heuristic never fires.
         let result = client.search_with_fallback(
             "andle",
             SearchFilters::default(),
@@ -10950,9 +10840,9 @@ mod tests {
             2,
             FieldMask::FULL,
         )?;
-        assert!(result.wildcard_fallback);
+        assert!(!result.wildcard_fallback);
         assert_eq!(result.hits.len(), 1);
-        assert_eq!(result.hits[0].match_type, MatchType::ImplicitWildcard);
+        assert_eq!(result.hits[0].match_type, MatchType::Exact);
 
         Ok(())
     }
@@ -14236,33 +14126,12 @@ mod tests {
         assert!(deduped.iter().any(|h| h.source_id == "work-laptop"));
     }
 
-    #[test]
-    fn wildcard_fallback_sparse_check_uses_effective_limit() {
-        assert!(
-            !should_try_wildcard_fallback(1, 1, 0, 3),
-            "a filled one-result page is not sparse for fallback purposes"
-        );
-        assert!(
-            !should_try_wildcard_fallback(2, 2, 0, 3),
-            "a filled two-result page is not sparse for fallback purposes"
-        );
-        assert!(
-            should_try_wildcard_fallback(0, 1, 0, 3),
-            "zero hits should still trigger fallback even for tiny pages"
-        );
-        assert!(
-            should_try_wildcard_fallback(1, 2, 0, 3),
-            "a partially filled page should still trigger fallback"
-        );
-        assert!(
-            !should_try_wildcard_fallback(0, 5, 10, 3),
-            "pagination should not trigger wildcard fallback"
-        );
-        assert!(
-            should_try_wildcard_fallback(1, 0, 0, 3),
-            "limit zero preserves the legacy sparse-threshold semantics"
-        );
-    }
+    // W2-6 exec37 Task甲⑦ (structural-extinction ruling, w2-d4 family): the
+    // sibling test `wildcard_fallback_sparse_check_uses_effective_limit`
+    // (for the deleted `should_try_wildcard_fallback`) is removed here --
+    // the sparse-retry heuristic it locked down has no remaining caller now
+    // that `search_with_fallback`'s wildcard retry itself is gone. See
+    // `search_with_fallback`'s doc comment for the closed-form argument.
 
     #[test]
     fn snippet_preview_fast_path_requires_snippet_only_match() {
@@ -14442,7 +14311,22 @@ mod tests {
     }
 
     #[test]
-    fn search_with_fallback_prefers_wildcards_when_they_add_hits() -> Result<()> {
+    // W2-6 exec37 Task甲⑦ (structural-extinction ruling, w2-d4 family): renamed
+    // from `search_with_fallback_prefers_wildcards_when_they_add_hits`. This
+    // was the fixture the old Tantivy-era heuristic needed most -- a token
+    // ("bet") whose only matches are as a substring of a longer word
+    // ("alphabet") -- but `fts_lex`'s trigram baseline already substring-
+    // matches it directly, so `search_with_fallback`'s own baseline call
+    // finds both documents before the sparse-retry step is even reached.
+    // There is no remaining case in the trigram backend where the wildcard
+    // retry's candidate set is a strict superset of the baseline's -- see
+    // `search_with_fallback`'s doc comment for the closed-form argument (any
+    // reachable query resolves through either an FTS5 MATCH clause that
+    // transpiles byte-identically with or without `*`-decoration, or a LIKE
+    // scan where decoration only narrows the pattern) -- so this fixture now
+    // locks down that the baseline alone already carries the full result.
+    fn search_with_fallback_stays_inert_when_baseline_trigram_already_matches_substring(
+    ) -> Result<()> {
         let dir = TempDir::new()?;
 
 
@@ -14491,26 +14375,30 @@ mod tests {
         )?;
 
         assert!(
-            result.wildcard_fallback,
-            "should switch to wildcard fallback when it yields more hits"
+            !result.wildcard_fallback,
+            "trigram baseline already substring-matches; the retry heuristic has nothing to add"
         );
         assert_eq!(
             result.hits.len(),
             2,
-            "fallback should surface all alphabet docs"
+            "baseline alone should already surface all alphabet docs"
         );
-        assert!(
-            result
-                .hits
-                .iter()
-                .all(|h| h.match_type == MatchType::ImplicitWildcard)
-        );
+        assert!(result.hits.iter().all(|h| h.match_type == MatchType::Exact));
         assert!(result.hits.iter().all(|h| h.content.contains("alphabet")));
 
         Ok(())
     }
 
     #[test]
+    // W2-6 exec37 Task甲⑦ (structural-extinction ruling, w2-d4 family): the
+    // first half (long zero-hit token skips retry entirely) is untouched --
+    // `should_skip_automatic_wildcard_fallback_for_long_zero_hit_query` is a
+    // pure token-length guard, orthogonal to trigram substring semantics, and
+    // stays load-bearing. The second half's `short_result` assertions are
+    // rewritten: "pple" is a trigram substring of "apple" in the fixture, so
+    // the baseline call inside `search_with_fallback` already finds it and
+    // the sparse-retry step has nothing to add (same closed-form argument as
+    // the two renamed sibling tests above).
     fn automatic_wildcard_fallback_skips_long_zero_hit_token() -> Result<()> {
         let dir = TempDir::new()?;
 
@@ -14564,9 +14452,12 @@ mod tests {
             1,
             FieldMask::FULL,
         )?;
-        assert!(short_result.wildcard_fallback);
+        assert!(
+            !short_result.wildcard_fallback,
+            "trigram baseline already substring-matches \"pple\"; retry has nothing to add"
+        );
         assert_eq!(short_result.hits.len(), 1);
-        assert_eq!(short_result.hits[0].match_type, MatchType::ImplicitWildcard);
+        assert_eq!(short_result.hits[0].match_type, MatchType::Exact);
 
         Ok(())
     }
@@ -17383,19 +17274,14 @@ mod tests {
         assert!(!should_collect_exact_total_count(usize::MAX, 0));
     }
 
-    #[test]
-    fn automatic_wildcard_fallback_policy_allows_small_indexes_only() {
-        assert!(should_allow_automatic_wildcard_fallback(9_999, 10_000));
-        assert!(should_allow_automatic_wildcard_fallback(10_000, 10_000));
-        assert!(!should_allow_automatic_wildcard_fallback(10_001, 10_000));
-    }
-
-    #[test]
-    fn automatic_wildcard_fallback_policy_zero_limit_disables_fallback() {
-        assert!(!should_allow_automatic_wildcard_fallback(0, 0));
-        assert!(!should_allow_automatic_wildcard_fallback(1, 0));
-        assert!(!should_allow_automatic_wildcard_fallback(usize::MAX, 0));
-    }
+    // W2-6 exec37 Task甲⑦ (structural-extinction ruling, w2-d4 family): the
+    // sibling tests `automatic_wildcard_fallback_policy_allows_small_indexes_only`
+    // and `automatic_wildcard_fallback_policy_zero_limit_disables_fallback`
+    // (for the deleted `should_allow_automatic_wildcard_fallback` /
+    // `automatic_wildcard_fallback_max_docs`) are removed here -- the
+    // large-index opt-out they locked down has no remaining caller now that
+    // `search_with_fallback`'s wildcard retry itself is gone. See
+    // `search_with_fallback`'s doc comment for the closed-form argument.
 
     #[test]
     fn compute_no_limit_result_cap_uses_meminfo_when_no_env_override() {
