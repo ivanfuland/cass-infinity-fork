@@ -17055,11 +17055,6 @@ fn open_franken_cli_read_db(
                         "Failed to open {reason} database at {}: readonly storage open failed ({err}); raw readonly open failed ({raw_readonly_err})",
                         path.display()
                     );
-                    if let Some(fts_err) =
-                        crate::storage::sqlite::fts_messages_integrity_error_from_message(&message)
-                    {
-                        return Err(fts_messages_integrity_cli_error(reason, fts_err.into()));
-                    }
                     return Err(CliError {
                         code: 9,
                         kind: CliErrorKind::DbOpen.kind_str(),
@@ -17191,24 +17186,6 @@ fn close_franken_cli_read_db(
         conn.close_best_effort_in_place();
     }
     Ok(())
-}
-
-fn fts_messages_integrity_cli_error(surface: &str, err: anyhow::Error) -> CliError {
-    CliError {
-        code: 5,
-        kind: CliErrorKind::Storage.kind_str(),
-        message: format!("{surface} cannot continue: {err:#}"),
-        hint: Some(crate::storage::sqlite::FTS_MESSAGES_CORRUPTION_RECOVERY_HINT.to_string()),
-        retryable: false,
-    }
-}
-
-fn validate_fts_messages_integrity_for_cli(
-    conn: &FrankenConnection,
-    surface: &str,
-) -> CliResult<()> {
-    crate::storage::sqlite::validate_fts_messages_integrity_for_connection(conn)
-        .map_err(|err| fts_messages_integrity_cli_error(surface, err))
 }
 
 fn franken_query_row_map_retry<T, F>(
@@ -27296,7 +27273,6 @@ fn run_stats(
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     let conn = open_franken_cli_read_db(db_path.clone(), "stats", Duration::from_secs(30))?;
-    validate_fts_messages_integrity_for_cli(&conn, "stats")?;
     let conversation_columns = doctor_table_columns(&conn, "conversations");
     let source_id_sql = if conversation_columns.contains("source_id") {
         "c.source_id"
@@ -29147,7 +29123,7 @@ fn doctor_anomaly_for_check(name: &str, status: &str, message: &str) -> DoctorAn
         }
         "database_backup" => DoctorAnomaly::BackupUnverified,
         "safe_auto_archive_rebuild" => DoctorAnomaly::DegradedArchiveRisk,
-        "fts_table" | "index" | "index_sync" => DoctorAnomaly::DerivedLexicalStale,
+        "index" | "index_sync" => DoctorAnomaly::DerivedLexicalStale,
         "semantic_model" => DoctorAnomaly::DerivedSemanticStale,
         "rebuild" => DoctorAnomaly::RepairPreviouslyFailed,
         "repair_failure_marker" => DoctorAnomaly::RepairPreviouslyFailed,
@@ -29232,7 +29208,7 @@ fn doctor_safe_auto_action_for_check(check: &DoctorCheckReport) -> &'static str 
     match check.name.as_str() {
         "data_directory" => "create_missing_cass_data_dir",
         "lock_file" => "remove_stale_legacy_index_lock",
-        "index" | "index_sync" | "fts_table" | "rebuild" => {
+        "index" | "index_sync" | "rebuild" => {
             "rebuild_derived_lexical_index_from_archive_db"
         }
         "semantic_model" => "report_lexical_fallback_without_model_download",
@@ -72034,104 +72010,6 @@ fn wait_with_progress<T>(
     result
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum DoctorFtsTableState {
-    QueryableViaFrankensqlite,
-    Missing { frankensqlite_error: String },
-}
-
-fn probe_doctor_fts_table(conn: &FrankenConnection) -> DoctorFtsTableState {
-    match conn.query_all_map("SELECT rowid FROM fts_messages LIMIT 1;", &[], |_row| Ok(())) {
-        Ok(_) => DoctorFtsTableState::QueryableViaFrankensqlite,
-        Err(frankensqlite_error) => DoctorFtsTableState::Missing {
-            frankensqlite_error: frankensqlite_error.to_string(),
-        },
-    }
-}
-
-#[cfg(test)]
-mod doctor_fts_tests {
-    use super::*;
-
-    fn create_search_schema(
-        conn: &FrankenConnection,
-    ) -> Result<(), StorageError> {
-        conn.execute_batch(
-            "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
-             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
-             CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                agent_id INTEGER,
-                workspace_id INTEGER,
-                source_id TEXT,
-                origin_host TEXT,
-                title TEXT,
-                source_path TEXT
-             );
-             CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER,
-                idx INTEGER,
-                content TEXT,
-                created_at INTEGER
-             );",
-        )
-    }
-
-    #[test]
-    fn doctor_fts_probe_accepts_frankensqlite_fts_table() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let temp_dir = tempfile::TempDir::new()?;
-        let db_path = temp_dir.path().join("legacy-fts.db");
-
-        let conn = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().as_ref())), crate::storage::api::Profile::Production)?;
-        create_search_schema(&conn)?;
-        conn.execute_batch(
-            "CREATE VIRTUAL TABLE fts_messages USING fts5(
-                content,
-                title,
-                agent,
-                workspace,
-                source_path,
-                created_at UNINDEXED,
-                message_id UNINDEXED,
-                tokenize='porter'
-             );
-             INSERT INTO agents(id, slug) VALUES(1, 'codex');
-             INSERT INTO workspaces(id, path) VALUES(1, '/ws');
-             INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
-             VALUES(1, 1, 1, 'local', NULL, 'retro', '/tmp/retro.jsonl');
-             INSERT INTO messages(id, conversation_id, idx, content, created_at)
-             VALUES(7, 1, 0, 'retro investigation', 42);
-             INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at, message_id)
-             VALUES(7, 'retro investigation', 'retro', 'codex', '/ws', '/tmp/retro.jsonl', 42, '7');",
-        )?;
-        let state = probe_doctor_fts_table(&conn);
-        assert!(
-            matches!(state, DoctorFtsTableState::QueryableViaFrankensqlite),
-            "the legacy embedded engine FTS table should be accepted by doctor: {state:?}"
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn doctor_fts_probe_reports_missing_fts_table() -> Result<(), Box<dyn std::error::Error>> {
-        let temp_dir = tempfile::TempDir::new()?;
-        let db_path = temp_dir.path().join("missing-fts.db");
-
-        let conn = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().as_ref())), crate::storage::api::Profile::Production)?;
-        create_search_schema(&conn)?;
-        let state = probe_doctor_fts_table(&conn);
-        assert!(
-            matches!(state, DoctorFtsTableState::Missing { .. }),
-            "missing FTS table should be reported as missing: {state:?}"
-        );
-
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod cli_read_db_tests {
     use super::*;
@@ -73877,16 +73755,14 @@ mod cli_read_db_tests {
     }
 }
 
-/// Data gathered by the bounded archive-DB doctor probe (#287): row counts,
-/// the PRAGMA integrity verdict, and (when the database is healthy) the FTS
-/// visibility state — everything `run_doctor_impl` needs to reconstruct the
-/// `database`/`fts_table` checks without touching the connection on the main
-/// thread.
+/// Data gathered by the bounded archive-DB doctor probe (#287): row counts
+/// and the PRAGMA integrity verdict — everything `run_doctor_impl` needs to
+/// reconstruct the `database` check without touching the connection on the
+/// main thread.
 struct DoctorBoundedArchiveDbProbe {
     conv_count: Option<i64>,
     msg_count: Option<i64>,
     integrity: Option<Result<DoctorDatabaseIntegrityProbe, String>>,
-    fts_state: Option<DoctorFtsTableState>,
 }
 
 enum DoctorBoundedArchiveDbProbeOutcome {
@@ -73949,16 +73825,9 @@ fn run_bounded_doctor_archive_db_probe(
             )
             .ok();
         let mut integrity = None;
-        let mut fts_state = None;
         if conv_count.is_some() && msg_count.is_some() {
             set_phase("integrity_probe");
-            let probe = doctor_database_integrity_probe(&conn);
-            let healthy = matches!(&probe, Ok(result) if result.is_ok());
-            integrity = Some(probe);
-            if healthy {
-                set_phase("fts_probe");
-                fts_state = Some(probe_doctor_fts_table(&conn));
-            }
+            integrity = Some(doctor_database_integrity_probe(&conn));
         }
         set_phase("connection_close");
         let _ = close_franken_cli_read_db(conn, &worker_db_path, "doctor database health");
@@ -73966,7 +73835,6 @@ fn run_bounded_doctor_archive_db_probe(
             conv_count,
             msg_count,
             integrity,
-            fts_state,
         });
     });
 
@@ -74420,40 +74288,6 @@ pub(crate) fn run_doctor_impl(
                                         ),
                                         false
                                     );
-
-                                    // Check whether the FTS table is visible through
-                                    // the legacy embedded engine on this connection. Do not auto-register
-                                    // it here: on migrated databases with legacy rootpage=0
-                                    // FTS schema entries, CREATE VIRTUAL TABLE IF NOT EXISTS
-                                    // can persist duplicate sqlite_master rows.
-                                    match probe.fts_state {
-                                        Some(DoctorFtsTableState::QueryableViaFrankensqlite) => {
-                                            add_check!(
-                                                "fts_table",
-                                                "pass",
-                                                "FTS search table (fts_messages) is queryable via the legacy embedded engine",
-                                                false
-                                            );
-                                        }
-                                        Some(DoctorFtsTableState::Missing {
-                                            frankensqlite_error,
-                                        }) => {
-                                            // An absent in-DB FTS shadow is benign
-                                            // here (lexical search falls back to
-                                            // Tantivy), so it does NOT feed the
-                                            // storage_state derivation — doctor
-                                            // reports it as a `pass` below.
-                                            add_check!(
-                                                "fts_table",
-                                                "pass",
-                                                format!(
-                                                    "Database-resident FTS table is absent or not queryable via the legacy embedded engine ({frankensqlite_error}); lexical search relies on the Tantivy index instead"
-                                                ),
-                                                false
-                                            );
-                                        }
-                                        None => {}
-                                    }
                                 }
                                 Ok(integrity) => {
                                     storage_integrity_failed = true;
