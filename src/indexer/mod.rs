@@ -4781,7 +4781,7 @@ fn default_tantivy_assumed_concurrent_writers() -> u64 {
         .unwrap_or(DEFAULT_TANTIVY_ASSUMED_CONCURRENT_WRITERS)
 }
 
-pub(crate) fn default_tantivy_max_writer_threads() -> usize {
+pub fn default_tantivy_max_writer_threads() -> usize {
     default_tantivy_max_writer_threads_for_memory_bytes_and_concurrent_writers(
         host_memory_bytes_for_tantivy_default(),
         default_tantivy_assumed_concurrent_writers(),
