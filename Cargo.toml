@@ -184,15 +184,6 @@ arbitrary = { version = "1", features = ["derive"] }
 serde_yaml = "0.9.34"
 rand = "0.10"
 rand_chacha = "0.10"
-# w1b Task B8 (R0-B2b): demoted from [dependencies] -- cass's production
-# storage engine is rusqlite-only now (franken backend retired); the crate
-# survives here only because tests/frankensqlite_compat_gates.rs still
-# exercises it directly. Retiring these two dev-deps entirely is a wave-2
-# item (once compat_gates itself migrates), not this task's job.
-frankensqlite = { version = "=0.1.16", package = "fsqlite", features = ["fts5"] }
-# frankensqlite compat gate tests (bead 3vvqa) — fsqlite-types needed for SqliteValue
-# enum variants in test assertions. The main fsqlite dep is available as `frankensqlite`.
-fsqlite-types = { version = "=0.1.16", package = "fsqlite-types" }
 
 [[bin]]
 name = "cass"
@@ -229,8 +220,8 @@ debug = "line-tables-only"
 strip = false
 
 # The dependency graph is pinned to the asupersync 0.3.x line. Keep
-# frankensqlite plus frankensearch and franken-agent-detection revs aligned so
-# Cargo.lock does not reintroduce a parallel asupersync 0.2.x stack.
+# frankensearch and franken-agent-detection revs aligned so Cargo.lock does
+# not reintroduce a parallel asupersync 0.2.x stack.
 #
 # If you need to build against a local checkout of asupersync (sibling
 # at ../asupersync) during runtime-level hacking, add the following
@@ -255,9 +246,6 @@ strip = false
 # A fresh-clone build regression guard runs in CI (.github/workflows/fresh-clone-build.yml)
 # — if you re-enable any of these [patch] blocks, that workflow will fail.
 #
-# [patch."https://github.com/Dicklesworthstone/frankensqlite"]
-# fsqlite = { path = "../frankensqlite/crates/fsqlite" }
-# fsqlite-types = { path = "../frankensqlite/crates/fsqlite-types" }
 # [patch."https://github.com/Dicklesworthstone/franken_agent_detection"]
 # franken-agent-detection = { path = "../franken_agent_detection" }
 #
