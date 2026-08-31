@@ -14243,7 +14243,14 @@ mod tests {
 
         assert!(!result.wildcard_fallback);
         assert!(result.hits.len() >= 3); // has enough results
-        assert_eq!(result.total_count, Some(5));
+        // W2-6 exec36 Task甲4-⑤ (control-plane 2026-08-31 ruling, 接受现状):
+        // `fts_lex` has no cheap exact-total-count path (the old Tantivy-only
+        // fast path this used to capture is gone with the engine) --
+        // `search_with_fallback` deliberately reports `None` rather than a
+        // stale/fabricated count (see the `tantivy_total` comment in
+        // `search_with_fallback`). This is a documented W2-6 Task2 product
+        // decision, not a regression; align the assertion with it.
+        assert_eq!(result.total_count, None);
 
         Ok(())
     }
