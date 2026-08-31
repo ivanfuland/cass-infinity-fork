@@ -1701,6 +1701,30 @@ fn is_lexical_ku3_short_query(query: &str) -> bool {
     trimmed.chars().count() < 3
 }
 
+/// W2-6 exec36 Task甲4-①③ (control-plane 2026-08-31 ruling, 批准修 --
+/// 机制正确性修复，非能力扩张): [`is_lexical_ku3_short_query`] only measures
+/// the *raw* query's length. Punctuation splitting (`normalize_term_parts`,
+/// used by `transpile_to_fts5` to build the FTS5 fallback's AND clauses) can
+/// produce an individual sub-term shorter than the trigram floor even when
+/// the raw query clears 3 codepoints -- e.g. `"c++"` sanitizes down to the
+/// single 1-char term `"c"`, and `"my_variable"` splits (underscore is not
+/// alphanumeric) into `"my"` (2 chars) AND `"variable"`. Either case leaves
+/// an AND clause that can structurally never match via FTS5 `MATCH`, and the
+/// existing KU3 check's whole-query-length gate never catches it. Detect
+/// that here so those queries also degrade to the LIKE substring fallback
+/// (`lex_docs_like_candidates_query`, driven off the raw, unsplit query
+/// text -- which for both examples above still appears verbatim as a
+/// contiguous substring in the content it's meant to find).
+fn query_has_short_subterm_after_normalization(query: &str) -> bool {
+    fs_cass_parse_boolean_query(query).into_iter().any(|token| {
+        let FsCassQueryToken::Term(t) = token else {
+            return false;
+        };
+        let parts = normalize_term_parts(&t);
+        !parts.is_empty() && parts.iter().any(|p| p.trim_matches('*').chars().count() < 3)
+    })
+}
+
 /// Escape `%`, `_`, and the escape character itself for a
 /// `LIKE ?1 ESCAPE '\'` pattern, then wrap the term as a substring match.
 fn like_substring_pattern(term: &str) -> String {
@@ -7031,7 +7055,8 @@ impl SearchClient {
         }
 
         let query_match_type = dominant_match_type(raw_query);
-        let ku3_like_fallback = is_lexical_ku3_short_query(raw_query);
+        let ku3_like_fallback = is_lexical_ku3_short_query(raw_query)
+            || query_has_short_subterm_after_normalization(raw_query);
         let cap = no_limit_result_cap();
 
         // W2-5 Task2: candidate generation is a single unwindowed fetch (up
