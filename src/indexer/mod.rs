@@ -1640,7 +1640,20 @@ pub(crate) enum LexicalPopulationStrategy {
     DeferredAuthoritativeDbRebuild,
 }
 
-const DEFAULT_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_MAX_DB_BYTES: u64 = 1024 * 1024 * 1024;
+/// W2-6 exec41 (control-plane 2026-08-31 ruling): raised from the original
+/// 1 GiB. That floor made `should_defer_incremental_authoritative_lexical_
+/// repair` silently defer automatic repair on any populated DB above 1 GiB
+/// -- cass-fork's own real staging DB (20 GiB, ~5k conversations) tripped it
+/// on every routine `cass index` run, with no doctor/status surface telling
+/// the operator a manual `--full`/`--force-rebuild` was needed (the five-
+/// environment-debt gap this exec's Task子1② closed a slice of). 100 GiB
+/// keeps headroom over that real corpus while staying a policy the operator
+/// can still override via `CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_
+/// MAX_DB_BYTES` -- the sizing judgment now sits with the caller (e.g. an
+/// Inngest ledger orchestrating repair timing), not a small hardcoded floor
+/// inside cass itself.
+const DEFAULT_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_MAX_DB_BYTES: u64 =
+    100 * 1024 * 1024 * 1024;
 const DEFAULT_INCREMENTAL_MISSING_WATERMARK_FULL_SCAN_MAX_DB_BYTES: u64 = 1024 * 1024 * 1024;
 const DEFERRED_LARGE_INCREMENTAL_LEXICAL_REPAIR_REASON: &str = "large_populated_incremental_index_defers_authoritative_lexical_repair_until_explicit_full_or_force_rebuild";
 const BOOTSTRAP_LARGE_INCREMENTAL_MISSING_WATERMARK_REASON: &str =
@@ -9255,11 +9268,12 @@ pub fn run_index(
     // #289: pass the real `tantivy_requires_rebuild` instead of hardcoding
     // `authoritative_rebuild_required: true`. The hardcoded value made every
     // plain populated incremental over the automatic-repair DB-size cap
-    // (default 1 GiB) report a deferred repair probe even when no
-    // authoritative rebuild was required, which suppressed the end-of-run
-    // lexical checkpoint refresh — including the cheap metadata-only
-    // bootstrap that rewrites a missing `.lexical-rebuild-state.json` — so a
-    // lost checkpoint could never converge on large archives.
+    // (default 100 GiB as of W2-6 exec41) report a deferred repair probe
+    // even when no authoritative rebuild was required, which suppressed the
+    // end-of-run lexical checkpoint refresh — including the cheap
+    // metadata-only bootstrap that rewrites a missing
+    // `.lexical-rebuild-state.json` — so a lost checkpoint could never
+    // converge on large archives.
     let large_incremental_authoritative_lexical_repair_probe_deferred =
         should_defer_incremental_authoritative_lexical_repair(
             &opts,
@@ -9853,10 +9867,19 @@ pub fn run_index(
                     // `fts_lex`/`lex_docs` fell behind here exactly like
                     // Tantivy did. The Tantivy rebuild that used to run here
                     // is gone; a direct `rebuild_lex_domain_from_db` call
-                    // catches `fts_lex` back up (no downstream fallback
-                    // covers this: the `opts.full || canonical_only_full_rebuild`
-                    // gate near the end of this function is false for this
-                    // routine, non-full, non-force-rebuild path).
+                    // catches `fts_lex` back up.
+                    //
+                    // W2-6 exec41 correction: the removed claim here ("the
+                    // `opts.full || canonical_only_full_rebuild` gate near
+                    // the end of this function is false for this routine,
+                    // non-full, non-force-rebuild path") was stale --
+                    // `scan_lexical_update_deferred` is driven purely by
+                    // `CASS_DEFER_LEXICAL_UPDATES`, independent of
+                    // `opts.full`, so `--full` with that env var set reaches
+                    // this branch too. Setting
+                    // `exact_completed_lexical_checkpoint` below is what
+                    // actually makes the tail-block gate skip the redundant
+                    // second whole-archive rebuild in that combination.
                     tracing::warn!(
                         db_path = %opts.db_path.display(),
                         inserted_conversations = scan_canonical_mutations.inserted_conversations,
@@ -9864,6 +9887,12 @@ pub fn run_index(
                         "inline lexical updates were deferred during non-watch scan; rebuilding lex_docs/fts_lex from canonical SQLite"
                     );
                     let lex_stats = storage.rebuild_lex_domain_from_db(opts.progress.as_ref())?;
+                    // W2-6 exec41 (--full double/triple-rebuild fix): this is
+                    // a whole-archive rebuild (`rebuild_lex_domain_from_db`
+                    // has no per-conversation filter), so the lex domain is
+                    // authoritatively complete after this call -- mark it so
+                    // the unconditional tail block below doesn't redo it.
+                    exact_completed_lexical_checkpoint = true;
                     record_exact_total_counts_in_progress(
                         opts.progress.as_ref(),
                         lex_stats.conversations_processed,
@@ -9924,6 +9953,13 @@ pub fn run_index(
                         // -- `fts_lex` needs the same direct catch-up, not
                         // just Tantivy.
                         let lex_stats = storage.rebuild_lex_domain_from_db(opts.progress.as_ref())?;
+                        // W2-6 exec41 (--full double/triple-rebuild fix):
+                        // this is the post-scan whole-archive rebuild that a
+                        // plain `--full` run (or a historical-salvage import)
+                        // actually reaches -- mark the checkpoint complete so
+                        // the unconditional tail block below doesn't redo an
+                        // identical full pass over every conversation.
+                        exact_completed_lexical_checkpoint = true;
                         // Update stats to reflect the authoritative rebuild
                         // totals. The scan-phase stats tracked only what the
                         // connectors discovered; the DB rebuild is the source of
@@ -9940,18 +9976,25 @@ pub fn run_index(
     };
 
     // w2 Task W2-4 Step 2: full lex_docs/fts_lex rebuild from the canonical
-    // messages/conversations tables. `rebuild_tantivy_from_db_with_options`
-    // (called above, either directly or via its deferred-startup variant)
-    // opens the database `open_readonly` and cannot itself write the lex
-    // domain, so this is a deliberate second pass over the same writable
-    // `storage` handle used for daily_stats repair elsewhere in this
-    // function -- not fused into Tantivy's staged-shard rebuild pipeline.
-    // Gated on `opts.full || canonical_only_full_rebuild` (both flags mean
-    // "the user asked for a full rebuild" per W2-0 Step 3c's real-dispatch
-    // finding) so routine incremental scans -- already kept in sync
-    // incrementally by the W2-2/W2-3 write-path wiring -- don't pay for a
-    // redundant whole-archive recompute on every run.
-    if opts.full || canonical_only_full_rebuild {
+    // messages/conversations tables, for full-rebuild paths that reach this
+    // point WITHOUT already having done one above (`exact_completed_lexical_
+    // checkpoint` still false). Gated on `opts.full || canonical_only_full_
+    // rebuild` (both flags mean "the user asked for a full rebuild" per
+    // W2-0 Step 3c's real-dispatch finding) so routine incremental scans --
+    // already kept in sync incrementally by the W2-2/W2-3 write-path wiring
+    // -- don't pay for a redundant whole-archive recompute on every run.
+    //
+    // W2-6 exec41 (--full double-rebuild fix): the old unconditional `if
+    // opts.full || canonical_only_full_rebuild` here always re-ran a second
+    // whole-archive `rebuild_lex_domain_from_db` on top of the post-scan
+    // branch above (its "deliberate second pass, readonly Tantivy can't
+    // write lex" rationale predates the FTS5 migration and no longer
+    // applies -- that branch is itself a writable full rebuild), doubling
+    // `--full`/`--force-rebuild` cost on real staging DBs. Every branch
+    // above that already completed a whole-archive
+    // `rebuild_lex_domain_from_db(_full)` now sets `exact_completed_
+    // lexical_checkpoint`, so gating on it here skips exactly the repeat.
+    if (opts.full || canonical_only_full_rebuild) && !exact_completed_lexical_checkpoint {
         let lex_rebuild_started = Instant::now();
         match storage.rebuild_lex_domain_from_db(opts.progress.as_ref()) {
             Ok(stats) => tracing::info!(
@@ -17775,6 +17818,20 @@ pub mod persist {
             }
         }
 
+        fn clear_env(key: &'static str) -> EnvGuard {
+            let _lock = acquire_env_lock();
+            let previous = dotenvy::var(key).ok();
+            // SAFETY: isolated test mutates a process env var and restores via guard.
+            unsafe {
+                std::env::remove_var(key);
+            }
+            EnvGuard {
+                key,
+                previous,
+                _lock,
+            }
+        }
+
         /// F1 regression: forces `key` to be *unset* for the guard's
         /// lifetime (under the same ENV_LOCK as `set_env`), so a test can
         /// assert default-hot-path behavior without racing a sibling test
@@ -18832,6 +18889,21 @@ pub mod persist {
                 progress: None,
                 watch_interval_secs: 30,
             }
+        }
+
+        /// W2-6 exec41 (control-plane 2026-08-31 ruling): locks the raised
+        /// default (100 GiB, up from 1 GiB) so a future edit to the
+        /// constant is a deliberate, reviewed change, not a silent drift.
+        /// See `DEFAULT_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_MAX_DB_
+        /// BYTES`'s doc comment for the sizing rationale.
+        #[test]
+        #[serial]
+        fn incremental_authoritative_lexical_repair_default_max_db_bytes_is_100_gib() {
+            let _guard = clear_env("CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_MAX_DB_BYTES");
+            assert_eq!(
+                crate::indexer::incremental_authoritative_lexical_repair_max_db_bytes(),
+                100 * 1024 * 1024 * 1024
+            );
         }
 
         #[test]
@@ -30684,6 +30756,133 @@ mod tests {
         anyhow::ensure!(
             hits == 2,
             "the readonly force-rebuild fast path must actually rebuild fts_lex, not just tantivy"
+        );
+        Ok(())
+    }
+
+    /// W2-6 exec41 (--full double-rebuild fix regression lock): a plain
+    /// `cass index --full` on a populated DB used to call the whole-archive
+    /// `rebuild_lex_domain_from_db` twice (the post-scan branch, then an
+    /// unconditional tail block whose "readonly Tantivy can't write lex"
+    /// rationale predated the FTS5 migration) -- doubling `--full` cost on
+    /// real staging DBs (cass-fork exec40 finding, 20GB staging: 18min
+    /// became ~36min). Locks the fix at the entry-level `run_index` seam
+    /// per the same rationale as the sibling force-rebuild entry-level test
+    /// above: a direct call to `rebuild_lex_domain_from_db` would bypass
+    /// the exact dispatch bug this exists to catch.
+    #[test]
+    #[serial]
+    fn run_index_full_rebuild_calls_rebuild_lex_domain_from_db_exactly_once() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let home = tmp.path().join("home");
+        let data_dir = tmp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir)?;
+        let db_path = data_dir.join("db.sqlite");
+        let first = home
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("28")
+            .join("rollout-w26-full-double-rebuild-first.jsonl");
+        let second = first.with_file_name("rollout-w26-full-double-rebuild-second.jsonl");
+        write_semantic_watch_once_codex_session(
+            &first,
+            "w26-full-double-rebuild-first",
+            "fulldoublerebuildone",
+        )?;
+        write_semantic_watch_once_codex_session(
+            &second,
+            "w26-full-double-rebuild-second",
+            "fulldoublerebuildtwo",
+        )?;
+
+        // Isolate host discovery before EITHER `run_index` call: this dev
+        // box has a real `~/.config/cass/sources.toml` (a `full_scan=true`
+        // cross-machine NAS source) -- without `HOME`/`XDG_CONFIG_HOME`
+        // overrides and `CASS_IGNORE_SOURCES_CONFIG`, the plain `--full`
+        // call below's broad scan resolves `build_scan_roots` /
+        // `SourcesConfig::load()` against the *real* host config and
+        // started scanning real production data, hanging for many minutes
+        // (found the hard way while writing this test). Same convention as
+        // `deferred_non_watch_scan_restores_watermarks_before_later_semantic_error`.
+        let _home_guard = set_env("HOME", home.to_str().unwrap());
+        let _codex_guard = set_env("CODEX_HOME", home.join(".codex").to_str().unwrap());
+        let _xdg_data_guard = set_env(
+            "XDG_DATA_HOME",
+            tmp.path().join("xdg-data").to_str().unwrap(),
+        );
+        let _xdg_config_guard = set_env(
+            "XDG_CONFIG_HOME",
+            tmp.path().join("xdg-config").to_str().unwrap(),
+        );
+        let _ignore_sources_guard = set_env("CASS_IGNORE_SOURCES_CONFIG", "1");
+
+        // Disable the live machine-responsiveness governor too: it samples
+        // real host load (this shared dev box legitimately runs other
+        // CPU-bound processes) and throttles pipeline worker fan-out
+        // accordingly, which independently slowed this fixture down.
+        // `responsiveness::current_capacity_pct` checks this env var on
+        // every read (not just at its `LazyLock` init), so it's safe to set
+        // before either `run_index` call below.
+        let _responsiveness_guard = set_env("CASS_RESPONSIVENESS_DISABLE", "1");
+
+        // Seed: populate the canonical DB with two conversations through the
+        // normal watch-once entry point (not a direct storage call) so the
+        // `--full` run below starts from a real populated-DB state.
+        let seed_opts = super::IndexOptions {
+            full: false,
+            watch: false,
+            force_rebuild: false,
+            watch_once_paths: Some(vec![first.clone(), second.clone()]),
+            db_path: db_path.clone(),
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_interval_secs: 30,
+        };
+        run_index(seed_opts, None)?;
+
+        let conversation_count: i64 = FrankenStorage::open_readonly(&db_path)?
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| row.get_typed(0))?;
+        anyhow::ensure!(
+            conversation_count == 2,
+            "seed watch-once run should have populated exactly 2 conversations, got {conversation_count}"
+        );
+
+        crate::storage::sqlite::REBUILD_LEX_DOMAIN_FROM_DB_CALLS.store(0, Ordering::Relaxed);
+
+        // Pin the lex-domain rebuild pipeline's worker pool to 1: it
+        // otherwise sizes to `available_parallelism()` (see
+        // `lexical_rebuild_worker_parallelism`), which is pure overhead for
+        // this 2-conversation fixture and, under host CPU contention from
+        // unrelated processes, made this test's staged pipeline barrier
+        // wait tens of seconds for scheduler time it didn't need.
+        let _workers_guard = set_env("CASS_TANTIVY_REBUILD_WORKERS", "1");
+
+        let full_opts = super::IndexOptions {
+            full: true,
+            watch: false,
+            force_rebuild: false,
+            watch_once_paths: None,
+            db_path: db_path.clone(),
+            data_dir,
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_interval_secs: 30,
+        };
+        run_index(full_opts, None)?;
+
+        let calls =
+            crate::storage::sqlite::REBUILD_LEX_DOMAIN_FROM_DB_CALLS.load(Ordering::Relaxed);
+        anyhow::ensure!(
+            calls == 1,
+            "cass index --full must rebuild the whole-archive lex domain exactly once, got {calls} calls"
         );
         Ok(())
     }

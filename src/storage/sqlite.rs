@@ -142,6 +142,12 @@ impl std::ops::Deref for SendFrankenConnection {
 
 static FRANKEN_RETRY_JITTER_STATE: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
 static DOCTOR_MUTATION_DB_OPEN_BYPASS_DEPTH: AtomicUsize = AtomicUsize::new(0);
+/// W2-6 exec41: test-only call counter for `rebuild_lex_domain_from_db`
+/// (whole-archive lex_docs/fts_lex rebuild), used to regression-lock the
+/// `--full` double/triple-invocation bug (indexer/mod.rs `run_index` tail
+/// block). Not read in production builds.
+#[cfg(test)]
+pub(crate) static REBUILD_LEX_DOMAIN_FROM_DB_CALLS: AtomicUsize = AtomicUsize::new(0);
 static MESSAGE_LOOKUP_TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
 static MESSAGE_LOOKUP_EXACT_IDX_PROBES: AtomicU64 = AtomicU64::new(0);
 static MESSAGE_LOOKUP_BOUNDED_QUERIES: AtomicU64 = AtomicU64::new(0);
@@ -7055,6 +7061,8 @@ impl FrankenStorage {
         &self,
         progress: Option<&Arc<crate::indexer::IndexingProgress>>,
     ) -> Result<LexDomainRebuildStats> {
+        #[cfg(test)]
+        REBUILD_LEX_DOMAIN_FROM_DB_CALLS.fetch_add(1, Ordering::Relaxed);
         const CONVERSATIONS_PER_TX: usize = 200;
         let conversation_ids: Vec<i64> = self
             .conn
