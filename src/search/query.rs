@@ -3618,6 +3618,23 @@ impl SearchClient {
         .unwrap_or(false)
     }
 
+    /// W2-6 exec41 (Task戊): distinguishes *why* `lex_docs` is empty so
+    /// `search`'s else branch can report an honest, actionable state
+    /// instead of silently degrading to the retired `fts_messages` legacy
+    /// fallback (which could return stale hits from a table nobody keeps in
+    /// sync with `lex_docs` any more -- exec37's finding, verified live by
+    /// exec41: a query on a DB with an empty `lex_docs` but a populated
+    /// `fts_messages` used to return a hit from that stale table).
+    fn lex_domain_rebuild_marker_state_for_search(
+        &self,
+    ) -> Result<crate::storage::sqlite::LexDomainRebuildMarkerState> {
+        let sqlite_guard = self.sqlite_guard()?;
+        let Some(conn) = sqlite_guard.as_ref() else {
+            return Ok(crate::storage::sqlite::LexDomainRebuildMarkerState::Absent);
+        };
+        crate::storage::sqlite::lex_domain_rebuild_marker_status(conn)
+    }
+
     pub fn search(
         &self,
         query: &str,
@@ -3753,35 +3770,49 @@ impl SearchClient {
             sqlite_guard.is_some() || self.sqlite_path.is_some()
         };
 
-        if has_sqlite_backend {
-            tracing::info!(
-                backend = "sqlite-fts5",
-                query = sanitized,
-                limit = fallback_fetch_limit,
-                offset = 0,
-                "search_start"
-            );
-            let hits = self.search_sqlite_fts5(
-                self.sqlite_path
-                    .as_deref()
-                    .unwrap_or_else(|| Path::new(":memory:")),
-                query,
-                filters.clone(),
-                fallback_fetch_limit,
-                0, // Always fetch from 0 for global dedup
-                field_mask,
-            )?;
-            let (_, paged_hits) =
-                self.postprocess_hits_page(hits, &sanitized, &filters, limit, offset);
-
-            if can_use_cache && offset == 0 {
-                self.put_cache(&sanitized, &filters, &paged_hits);
-            }
-            return Ok(paged_hits);
+        if !has_sqlite_backend {
+            tracing::info!(backend = "none", query = query, "search_start");
+            return Ok(Vec::new());
         }
 
-        tracing::info!(backend = "none", query = query, "search_start");
-        Ok(Vec::new())
+        // W2-6 exec41 (Task戊, control-plane 2026-08-31 ruling): `fts_lex`
+        // being unpopulated here no longer falls back to the retired
+        // `fts_messages` legacy table (exec37 finding, confirmed live by
+        // exec41 -- see `lex_domain_rebuild_marker_state_for_search`'s doc
+        // comment). The self-heal call ahead of `search()` in the CLI path
+        // (`ensure_lexical_assets_for_search`) is the first line of
+        // defense and is unaffected by this change; reaching this point
+        // means self-heal either didn't run or didn't leave a populated
+        // index, so the honest answer is a structured error the CLI layer
+        // renders with a marker-state-specific hint, not a silent
+        // degrade to a table nobody keeps in sync any more. A `Completed`
+        // marker with zero indexed docs is not an error -- it is a
+        // genuinely empty archive -- so that one case still returns an
+        // empty result set. The `search_sqlite_fts5`/`search_sqlite_
+        // message_scan` legacy-fallback functions themselves, and the
+        // rest of the `fts_messages` write/probe infrastructure, are left
+        // in place here (dead code after this change) for the follow-up
+        // exec to remove along with the table -- see the W2-6 exec41
+        // Task戊 handoff for the full 8-file/257-line removal plan.
+        match self.lex_domain_rebuild_marker_state_for_search()? {
+            crate::storage::sqlite::LexDomainRebuildMarkerState::Completed {
+                lex_docs_count: 0,
+                ..
+            } => {
+                tracing::info!(backend = "sqlite-empty-archive", query = sanitized, "search_start");
+                Ok(Vec::new())
+            }
+            crate::storage::sqlite::LexDomainRebuildMarkerState::Building => Err(anyhow!(
+                "lexical index unavailable for search: lex_domain_rebuild_state=building -- \
+                 a lexical rebuild is currently in progress; retry shortly, or run `cass index` \
+                 and wait for it to finish"
+            )),
+            crate::storage::sqlite::LexDomainRebuildMarkerState::Absent
+            | crate::storage::sqlite::LexDomainRebuildMarkerState::Completed { .. } => Err(anyhow!(
+                "lexical index unavailable for search: lex_domain_rebuild_state=absent -- \
+                 no completed lexical rebuild was found; run `cass index --full` to build it"
+            )),
+        }
     }
 
     pub fn set_semantic_context(

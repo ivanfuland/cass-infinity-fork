@@ -18371,6 +18371,42 @@ fn error_chain_indicates_archive_health_blocked(chain: &str) -> bool {
     chain.contains("will not replace or truncate the SQLite source of truth")
 }
 
+// W2-6 exec41 (Task戊): `SearchClient::search` reports these when
+// `lex_docs` is empty and the self-heal ahead of it
+// (`ensure_lexical_assets_for_search`) either didn't run or didn't leave a
+// populated index -- an honest structured error, in place of the retired
+// silent fallback to the stale `fts_messages` legacy table.
+fn error_chain_indicates_lexical_index_building(chain: &str) -> bool {
+    chain.contains("lexical index unavailable for search") && chain.contains("state=building")
+}
+
+fn error_chain_indicates_lexical_index_absent(chain: &str) -> bool {
+    chain.contains("lexical index unavailable for search") && chain.contains("state=absent")
+}
+
+fn search_lexical_index_building_cli_error(chain: &str) -> CliError {
+    CliError {
+        code: 7,
+        kind: CliErrorKind::IndexBusy.kind_str(),
+        message: format!("search failed: {chain}"),
+        hint: Some(
+            "A lexical rebuild is currently in progress. Retry shortly, or run 'cass index' and wait for it to finish."
+                .to_string(),
+        ),
+        retryable: true,
+    }
+}
+
+fn search_lexical_index_absent_cli_error(chain: &str) -> CliError {
+    CliError {
+        code: 3,
+        kind: CliErrorKind::MissingIndex.kind_str(),
+        message: format!("search failed: {chain}"),
+        hint: Some("Run 'cass index --full' to build the lexical index.".to_string()),
+        retryable: true,
+    }
+}
+
 fn index_storage_contention_cli_error(chain: &str) -> CliError {
     CliError {
         code: 7,
@@ -23383,12 +23419,21 @@ fn run_cli_search(
                 search_sparse_threshold,
                 field_mask,
             )
-            .map_err(|e| CliError {
-                code: 9,
-                kind: CliErrorKind::Search.kind_str(),
-                message: format!("search failed: {e}"),
-                hint: None,
-                retryable: true,
+            .map_err(|e| {
+                let chain = format!("{e:#}");
+                if error_chain_indicates_lexical_index_building(&chain) {
+                    search_lexical_index_building_cli_error(&chain)
+                } else if error_chain_indicates_lexical_index_absent(&chain) {
+                    search_lexical_index_absent_cli_error(&chain)
+                } else {
+                    CliError {
+                        code: 9,
+                        kind: CliErrorKind::Search.kind_str(),
+                        message: format!("search failed: {e}"),
+                        hint: None,
+                        retryable: true,
+                    }
+                }
             })?,
         SearchMode::Semantic => {
             // cass#256: in the `-baseline` build (the `semantic` Cargo
@@ -23511,14 +23556,23 @@ fn run_cli_search(
                             search_sparse_threshold,
                             field_mask,
                         )
-                        .map_err(|fallback_err| CliError {
-                            code: 9,
-                            kind: CliErrorKind::Search.kind_str(),
-                            message: format!(
-                                "hybrid search failed ({e}); lexical fallback failed: {fallback_err}"
-                            ),
-                            hint: None,
-                            retryable: true,
+                        .map_err(|fallback_err| {
+                            let chain = format!("{fallback_err:#}");
+                            if error_chain_indicates_lexical_index_building(&chain) {
+                                search_lexical_index_building_cli_error(&chain)
+                            } else if error_chain_indicates_lexical_index_absent(&chain) {
+                                search_lexical_index_absent_cli_error(&chain)
+                            } else {
+                                CliError {
+                                    code: 9,
+                                    kind: CliErrorKind::Search.kind_str(),
+                                    message: format!(
+                                        "hybrid search failed ({e}); lexical fallback failed: {fallback_err}"
+                                    ),
+                                    hint: None,
+                                    retryable: true,
+                                }
+                            }
                         })?
                 } else if err_str.contains("unavailable") || err_str.contains("no embedder") {
                     return Err(CliError {
@@ -24191,15 +24245,24 @@ fn run_cli_pack(
             search_sparse_threshold,
             FieldMask::FULL,
         )
-        .map_err(|e| CliError {
-            code: 9,
-            kind: CliErrorKind::Search.kind_str(),
-            message: format!("pack search failed: {e}"),
-            hint: Some(
-                "Try `cass search <query> --robot --robot-meta` to inspect the search path."
-                    .to_string(),
-            ),
-            retryable: true,
+        .map_err(|e| {
+            let chain = format!("{e:#}");
+            if error_chain_indicates_lexical_index_building(&chain) {
+                search_lexical_index_building_cli_error(&chain)
+            } else if error_chain_indicates_lexical_index_absent(&chain) {
+                search_lexical_index_absent_cli_error(&chain)
+            } else {
+                CliError {
+                    code: 9,
+                    kind: CliErrorKind::Search.kind_str(),
+                    message: format!("pack search failed: {e}"),
+                    hint: Some(
+                        "Try `cass search <query> --robot --robot-meta` to inspect the search path."
+                            .to_string(),
+                    ),
+                    retryable: true,
+                }
+            }
         })?;
 
     if let Some(timeout) = timeout_duration
