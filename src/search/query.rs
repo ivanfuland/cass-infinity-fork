@@ -3825,15 +3825,23 @@ impl SearchClient {
             target_hits.saturating_mul(3)
         };
 
-        // Skip both lexical backends when the query contains leading/internal
-        // wildcards neither can parse (e.g., "*handler" or "f*o"). We ALLOW
-        // trailing wildcards ("foo*") since FTS5 supports prefix matching.
-        // Computed once, up front, so it gates the W2-5 default path below
-        // exactly like it already gated the legacy sqlite fallback.
-        let unsupported_wildcards = sanitized.split_whitespace().any(|t| {
-            let core = t.trim_end_matches('*');
-            core.contains('*') // Any star remaining after trimming end is unsupported (leading or internal)
-        });
+        // Skip both lexical backends only for genuinely unsupported internal
+        // wildcards (e.g. "f*o", "a*b*c" -- `FsCassWildcardPattern::Complex`).
+        // W2-6 exec36 Task甲4-② (Ivan 2026-08-31 ruling, 降级为普通词条):
+        // leading ("*handler", Suffix) and both-sided ("*andle*", Substring)
+        // wildcards are no longer flagged here -- `fts_lex`'s `porter
+        // trigram` tokenizer already performs substring matching for any
+        // plain term (verified via direct MATCH probe: an unwildcarded
+        // `handler` query already matches "my_handler_fn"), so these two
+        // patterns downgrade to a bare-term query (see `transpile_to_fts5`'s
+        // `Term` handling) instead of being rejected outright. Trailing-only
+        // wildcards ("foo*", Prefix) were always allowed since FTS5 supports
+        // prefix matching natively. Computed once, up front, so it gates the
+        // W2-5 default path below exactly like it already gated the legacy
+        // sqlite fallback.
+        let unsupported_wildcards = sanitized
+            .split_whitespace()
+            .any(|t| matches!(FsCassWildcardPattern::parse(t), FsCassWildcardPattern::Complex(_)));
 
         // W2-5/W2-6: `fts_lex` (SQLite FTS5, same-transaction with the
         // canonical tables) is the only lexical backend now; the Tantivy
@@ -7909,19 +7917,34 @@ fn transpile_to_fts5(raw_query: &str) -> Option<String> {
             }
             FsCassQueryToken::Term(t) => {
                 let raw_pattern = FsCassWildcardPattern::parse(&t);
-                if matches!(
-                    raw_pattern,
-                    FsCassWildcardPattern::Suffix(_)
-                        | FsCassWildcardPattern::Substring(_)
-                        | FsCassWildcardPattern::Complex(_)
-                ) {
+                if matches!(raw_pattern, FsCassWildcardPattern::Complex(_)) {
                     return None;
                 }
+
+                // W2-6 exec36 Task甲4-② (Ivan 2026-08-31 ruling, 降级为普通
+                // 词条): a suffix/substring wildcard term downgrades to its
+                // bare core by stripping every `*` before normalization --
+                // `fts_lex`'s trigram tokenizer already substring-matches
+                // any plain term (probe-verified), so this is
+                // near-equivalent to true suffix/substring matching without
+                // a dedicated LIKE+regex post-filter path. `raw_query`
+                // itself (unmodified) still drives `dominant_match_type`
+                // below, so hits are honestly still labeled
+                // Suffix/Substring even though execution is now a plain
+                // term query.
+                let t_for_normalize = if matches!(
+                    raw_pattern,
+                    FsCassWildcardPattern::Suffix(_) | FsCassWildcardPattern::Substring(_)
+                ) {
+                    t.replace('*', "")
+                } else {
+                    t.clone()
+                };
 
                 // Sanitize and normalize. FTS5 implicitly ANDs words in a string,
                 // but we split punctuation into porter-aligned fragments first so
                 // fallback queries match SQLite tokenization.
-                let term_parts = normalize_term_parts(&t);
+                let term_parts = normalize_term_parts(&t_for_normalize);
                 if term_parts.is_empty() {
                     continue;
                 }
@@ -19538,8 +19561,12 @@ mod tests {
         // Wildcards (allowed trailing)
         assert_eq!(transpile_to_fts5("foo*"), Some("foo*".to_string()));
 
-        // Unsupported wildcards (leading/internal)
-        assert_eq!(transpile_to_fts5("*foo"), None);
+        // W2-6 exec36 Task甲4-② (Ivan 2026-08-31 ruling): a leading-star
+        // (suffix) term downgrades to its bare core instead of being
+        // rejected -- `fts_lex`'s trigram tokenizer already substring
+        // matches any plain term. Internal wildcards (Complex) remain
+        // unsupported.
+        assert_eq!(transpile_to_fts5("*foo"), Some("foo".to_string()));
         assert_eq!(transpile_to_fts5("f*o"), None);
 
         // SQLite FTS5's porter tokenizer splits punctuation into separate
