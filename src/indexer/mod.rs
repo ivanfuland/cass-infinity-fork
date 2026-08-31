@@ -3041,7 +3041,6 @@ const WATCH_STARTUP_SUB_PHASE_TAXONOMY: &[&str] = &[
     "watch_startup:ensure_storage_headroom",
     "watch_startup:open_storage",
     "watch_startup:writable_preflight",
-    "watch_startup:validate_fts_messages",
     "watch_startup:cleanup_orphan_fk_rows",
     "watch_startup:count_total_conversations",
     "watch_startup:probe_lexical_checkpoint",
@@ -3077,10 +3076,6 @@ fn dotenvy_truthy(var: &str) -> bool {
     dotenvy::var(var)
         .ok()
         .is_some_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
-}
-
-fn preflight_validate_fts_messages_enabled() -> bool {
-    dotenvy_truthy("CASS_PREFLIGHT_VALIDATE_FTS_MESSAGES")
 }
 
 fn preflight_cleanup_orphan_fk_rows_enabled() -> bool {
@@ -5383,21 +5378,6 @@ fn should_skip_broad_scan_after_watch_once_authoritative_repair(
         && repaired_from_authoritative_canonical_db
 }
 
-fn should_repair_fallback_fts_after_full_index_run(
-    full_rebuild: bool,
-    canonical_only_full_rebuild: bool,
-) -> bool {
-    full_rebuild && !canonical_only_full_rebuild
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum FallbackFtsRepairOutcome {
-    SkippedKnownHealthyForFingerprint { archive_fingerprint: String },
-    SkippedUnsupportedPopulatedShadowReload { detail: String },
-    SkippedCorruptDerivedIndex { detail: String },
-    Repaired(FtsConsistencyRepair),
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DailyStatsRepairOutcome {
     SkippedKnownHealthyForFingerprint {
@@ -5408,95 +5388,6 @@ enum DailyStatsRepairOutcome {
         rows_created: i64,
         total_sessions: i64,
     },
-}
-
-fn nonfatal_fallback_fts_repair_outcome(detail: String) -> Option<FallbackFtsRepairOutcome> {
-    if crate::storage::sqlite::error_message_indicates_populated_fts_shadow_without_rowid_reload(
-        &detail,
-    ) {
-        return Some(FallbackFtsRepairOutcome::SkippedUnsupportedPopulatedShadowReload { detail });
-    }
-    if crate::storage::sqlite::fts_messages_integrity_error_from_message(&detail).is_some() {
-        return Some(FallbackFtsRepairOutcome::SkippedCorruptDerivedIndex { detail });
-    }
-    None
-}
-
-fn repair_fallback_fts_after_full_index_run(
-    _storage: &FrankenStorage,
-    db_path: &Path,
-    full_rebuild: bool,
-    canonical_only_full_rebuild: bool,
-    known_archive_fingerprint: Option<&str>,
-) -> Result<Option<FallbackFtsRepairOutcome>> {
-    if !should_repair_fallback_fts_after_full_index_run(full_rebuild, canonical_only_full_rebuild) {
-        return Ok(None);
-    }
-
-    // Use a short-lived, freshly-opened FrankenStorage for *every* step
-    // of the repair — the fingerprint probe, the consistency check, and
-    // the marker write.  The long-running indexer connection accumulates
-    // per-thread cursor cancellation state across the rayon worker pool
-    // (see `observe_cursor_cancellation` in the legacy engine crate-btree), which can
-    // surface on the FIRST subsequent query as `SQLITE_ABORT`
-    // ("callback requested query abort").  That failure was making
-    // every full-rebuild `run_index` call in the bench harness return
-    // an Err after ~1 s of abort bookkeeping, swamping the actual
-    // indexing wall-clock and quantizing measurements to 1 s bins.
-    //
-    // The repair work is bounded (at most one `COUNT(*)` probe, an
-    // optional batched rebuild, and a single meta write) and strictly
-    // idempotent on the disk state, so a fresh connection is both
-    // sufficient and correct.  The caller's `_storage` is intentionally
-    // *not* consulted: an earlier version of this function did the
-    // fingerprint probe on it and was still vulnerable to the exact
-    // abort this fix is supposed to prevent.  The `_storage` parameter
-    // is kept for API stability (callers pass the same long-running
-    // connection they already have) but is not touched.
-    let fresh_storage = match crate::storage::sqlite::open_franken_storage_with_timeout(
-        db_path,
-        std::time::Duration::from_secs(10),
-    ) {
-        Ok(storage) => storage,
-        Err(err) => {
-            let detail = format!("{err:#}");
-            if let Some(outcome) = nonfatal_fallback_fts_repair_outcome(detail) {
-                return Ok(Some(outcome));
-            }
-            return Err(err).with_context(|| {
-                format!(
-                    "opening fresh the legacy embedded engine connection for fallback FTS repair at {}",
-                    db_path.display()
-                )
-            });
-        }
-    };
-
-    if let Some(archive_fingerprint) = known_archive_fingerprint
-        && fresh_storage
-            .fallback_fts_is_known_healthy_for_archive_fingerprint(archive_fingerprint)?
-    {
-        return Ok(Some(
-            FallbackFtsRepairOutcome::SkippedKnownHealthyForFingerprint {
-                archive_fingerprint: archive_fingerprint.to_string(),
-            },
-        ));
-    }
-
-    let repair = match fresh_storage.ensure_search_fallback_fts_consistency() {
-        Ok(repair) => repair,
-        Err(err) => {
-            let detail = format!("{err:#}");
-            if let Some(outcome) = nonfatal_fallback_fts_repair_outcome(detail) {
-                return Ok(Some(outcome));
-            }
-            return Err(err);
-        }
-    };
-    if let Some(archive_fingerprint) = known_archive_fingerprint {
-        fresh_storage.record_search_fallback_fts_archive_fingerprint(archive_fingerprint)?;
-    }
-    Ok(Some(FallbackFtsRepairOutcome::Repaired(repair)))
 }
 
 fn full_rebuild_requires_historical_restart(
@@ -8891,85 +8782,6 @@ pub fn run_index(
     persist::apply_index_writer_checkpoint_policy(&storage, defer_checkpoints);
     complete_preflight_phase!();
 
-    preflight_phase!("watch_startup:validate_fts_messages");
-    // cass#265/cass#272 follow-up: this derived fallback-FTS repair
-    // probe can be multi-minute on large databases before any real
-    // indexing work starts. Routine indexing now skips it by default;
-    // operators investigating fallback FTS corruption can restore the
-    // old preflight with CASS_PREFLIGHT_VALIDATE_FTS_MESSAGES=1, and
-    // can still bypass that explicit probe with
-    // CASS_SKIP_PREFLIGHT_VALIDATE_FTS_MESSAGES=1.
-    let validate_fts_requested = preflight_validate_fts_messages_enabled();
-    let validate_fts_skipped =
-        validate_fts_requested && preflight_skip("watch_startup:validate_fts_messages");
-    if !validate_fts_requested {
-        tracing::debug!(
-            target: "cass::indexer::preflight",
-            db_path = %opts.db_path.display(),
-            "skipping opt-in derived fallback FTS preflight validation before indexing"
-        );
-    } else if validate_fts_skipped {
-        tracing::debug!(
-            target: "cass::indexer::preflight",
-            db_path = %opts.db_path.display(),
-            "operator skip suppressed opt-in derived fallback FTS preflight validation before indexing"
-        );
-    } else if let Err(err) = storage.validate_fts_messages_integrity() {
-        let detail = format!("{err:#}");
-        if crate::storage::sqlite::error_message_indicates_populated_fts_shadow_without_rowid_reload(
-            &detail,
-        ) {
-            tracing::warn!(
-                db_path = %opts.db_path.display(),
-                error = %detail,
-                "skipping derived fallback FTS validation repair because the legacy embedded engine cannot yet reload populated FTS shadow WITHOUT ROWID tables; canonical indexing will continue"
-            );
-        } else {
-            tracing::warn!(
-                db_path = %opts.db_path.display(),
-                error = %err,
-                "derived fallback FTS metadata is inconsistent; repairing before index pipeline"
-            );
-            storage.close_best_effort_in_place();
-            let mut repair_storage = crate::storage::sqlite::open_franken_storage_with_timeout(
-                &opts.db_path,
-                Duration::from_secs(10),
-            )
-            .with_context(|| {
-                format!(
-                    "opening fresh storage for fallback FTS repair before indexing {}",
-                    opts.db_path.display()
-                )
-            })?;
-            let repair = repair_storage.ensure_search_fallback_fts_consistency();
-            repair_storage.close_best_effort_in_place();
-            let repair = repair.with_context(|| {
-                format!(
-                    "repairing derived fallback FTS before indexing {}",
-                    opts.db_path.display()
-                )
-            })?;
-            tracing::info!(
-                db_path = %opts.db_path.display(),
-                ?repair,
-                "derived fallback FTS repair completed before index pipeline"
-            );
-            storage = crate::storage::sqlite::open_franken_storage_with_timeout(
-                &opts.db_path,
-                Duration::from_secs(10),
-            )
-            .with_context(|| {
-                format!(
-                    "reopening storage after fallback FTS repair before indexing {}",
-                    opts.db_path.display()
-                )
-            })?;
-            persist::apply_index_writer_busy_timeout(&storage);
-            persist::apply_index_writer_checkpoint_policy(&storage, defer_checkpoints);
-        }
-    }
-    complete_preflight_phase!();
-
     if opts.full
         && !opened_fresh_for_full
         && let Some(reason) = full_rebuild_existing_storage_integrity_problem(&storage)?
@@ -10286,84 +10098,6 @@ pub fn run_index(
     // vestigial I/O. Any file already on disk from a pre-W2-6 run is left
     // alone as an inert leftover -- not migrated, not cleaned up.
 
-    let fallback_fts_archive_fingerprint = skipped_noop_full_scan_authoritative_rebuild
-        .then_some(
-            initial_matching_lexical_checkpoint
-                .completed_storage_fingerprint
-                .as_deref(),
-        )
-        .flatten();
-    if let Some(repair) = repair_fallback_fts_after_full_index_run(
-        &storage,
-        &opts.db_path,
-        opts.full,
-        canonical_only_full_rebuild,
-        fallback_fts_archive_fingerprint,
-    )
-    .with_context(|| {
-        format!(
-            "repairing the legacy embedded engine-owned fallback FTS after full index run for {}",
-            opts.db_path.display()
-        )
-    })? {
-        match repair {
-            FallbackFtsRepairOutcome::SkippedKnownHealthyForFingerprint {
-                archive_fingerprint,
-            } => {
-                tracing::info!(
-                    db_path = %opts.db_path.display(),
-                    archive_fingerprint,
-                    "skipping fallback FTS consistency repair because this no-op full run preserved an archive fingerprint already known to be healthy"
-                );
-            }
-            FallbackFtsRepairOutcome::SkippedUnsupportedPopulatedShadowReload { detail } => {
-                tracing::warn!(
-                    db_path = %opts.db_path.display(),
-                    error = %detail,
-                    "skipping derived fallback FTS repair because the legacy embedded engine cannot yet reload populated FTS shadow WITHOUT ROWID tables; canonical SQLite rows and Tantivy remain authoritative"
-                );
-            }
-            FallbackFtsRepairOutcome::SkippedCorruptDerivedIndex { detail } => {
-                tracing::warn!(
-                    db_path = %opts.db_path.display(),
-                    error = %detail,
-                    "derived fallback FTS remains corrupt after its best-effort repair; preserving the successful canonical SQLite and Tantivy build. Run 'cass doctor check --json' before an explicit fallback-FTS rebuild"
-                );
-            }
-            FallbackFtsRepairOutcome::Repaired(FtsConsistencyRepair::AlreadyHealthy { rows }) => {
-                tracing::info!(
-                    db_path = %opts.db_path.display(),
-                    rows,
-                    "fallback FTS was already healthy after full index run; skipped rebuild"
-                );
-            }
-            FallbackFtsRepairOutcome::Repaired(FtsConsistencyRepair::IncrementalCatchUp {
-                inserted_rows,
-                total_rows,
-            }) => {
-                tracing::info!(
-                    db_path = %opts.db_path.display(),
-                    inserted_rows,
-                    total_rows,
-                    "incrementally repaired fallback FTS after full index run"
-                );
-            }
-            FallbackFtsRepairOutcome::Repaired(FtsConsistencyRepair::Rebuilt { inserted_rows }) => {
-                tracing::info!(
-                    db_path = %opts.db_path.display(),
-                    inserted_rows,
-                    "rebuilt fallback FTS after full index run"
-                );
-            }
-        }
-    } else if opts.full {
-        tracing::info!(
-            db_path = %opts.db_path.display(),
-            canonical_only_full_rebuild,
-            "skipping the legacy embedded engine-owned fallback FTS rebuild because this full run only rebuilt Tantivy from the existing canonical database"
-        );
-    }
-
     reset_progress_to_idle(opts.progress.as_ref());
 
     if opts.watch || opts.watch_once_paths.is_some() {
@@ -11564,10 +11298,7 @@ fn open_storage_for_index(
 }
 
 fn index_storage_open_error_reason(err: &anyhow::Error) -> String {
-    let message = format!("{err:#}");
-    crate::storage::sqlite::fts_messages_integrity_error_from_message(&message)
-        .map(|fts_err| fts_err.to_string())
-        .unwrap_or(message)
+    format!("{err:#}")
 }
 
 /// R1-B3: `PRAGMA user_version` (the new rusqlite generation's sole
@@ -22397,7 +22128,6 @@ mod tests {
         let sub_phases = [
             "watch_startup:ensure_index_dir",
             "watch_startup:open_storage",
-            "watch_startup:validate_fts_messages",
             "watch_startup:cleanup_orphan_fk_rows",
             "watch_startup:count_total_conversations",
             "watch_startup:probe_lexical_checkpoint",
@@ -22478,7 +22208,6 @@ mod tests {
             "watch_startup:ensure_storage_headroom",
             "watch_startup:open_storage",
             "watch_startup:writable_preflight",
-            "watch_startup:validate_fts_messages",
             "watch_startup:cleanup_orphan_fk_rows",
             "watch_startup:count_total_conversations",
             "watch_startup:probe_lexical_checkpoint",
@@ -22815,10 +22544,6 @@ mod tests {
             super::watch_startup_preflight::skip_env_name("watch_startup:count_total_messages"),
             "CASS_SKIP_PREFLIGHT_COUNT_TOTAL_MESSAGES"
         );
-        assert_eq!(
-            super::watch_startup_preflight::skip_env_name("watch_startup:validate_fts_messages"),
-            "CASS_SKIP_PREFLIGHT_VALIDATE_FTS_MESSAGES"
-        );
 
         // Round-trip every documented sub-phase so a future renamed
         // entry surfaces here.
@@ -22833,48 +22558,6 @@ mod tests {
                 "skip env var for {sub_phase} must strip the watch_startup: namespace; got {env_name}"
             );
         }
-    }
-
-    #[test]
-    fn validate_fts_messages_preflight_is_opt_in() {
-        {
-            let _guard = unset_env_var("CASS_PREFLIGHT_VALIDATE_FTS_MESSAGES");
-            assert!(
-                !super::preflight_validate_fts_messages_enabled(),
-                "routine indexing must not run the derived fallback FTS validation probe by default"
-            );
-        }
-
-        for value in ["1", "true", "TRUE", "yes", "YES"] {
-            let _guard = set_env_var("CASS_PREFLIGHT_VALIDATE_FTS_MESSAGES", value);
-            assert!(
-                super::preflight_validate_fts_messages_enabled(),
-                "{value:?} should enable the opt-in fallback FTS validation preflight"
-            );
-        }
-
-        for value in ["0", "false", "FALSE", "no", "NO", ""] {
-            let _guard = set_env_var("CASS_PREFLIGHT_VALIDATE_FTS_MESSAGES", value);
-            assert!(
-                !super::preflight_validate_fts_messages_enabled(),
-                "{value:?} should leave fallback FTS validation skipped for routine indexing"
-            );
-        }
-    }
-
-    #[test]
-    fn validate_fts_messages_skip_does_not_imply_opt_in() {
-        let _validate_guard = unset_env_var("CASS_PREFLIGHT_VALIDATE_FTS_MESSAGES");
-        let _skip_guard = set_env_var("CASS_SKIP_PREFLIGHT_VALIDATE_FTS_MESSAGES", "1");
-
-        assert!(
-            !super::preflight_validate_fts_messages_enabled(),
-            "the legacy skip knob must not turn the expensive fallback FTS validation probe on"
-        );
-        assert!(
-            super::preflight_skip("watch_startup:validate_fts_messages"),
-            "the skip knob should still parse truthfully when an explicit opt-in path consults it"
-        );
     }
 
     #[test]
@@ -29901,131 +29584,6 @@ mod tests {
         assert!(
             !should_skip_broad_scan_after_watch_once_authoritative_repair(
                 false, false, false, true
-            )
-        );
-    }
-
-    #[test]
-    fn fallback_fts_repair_is_skipped_for_canonical_only_full_rebuild() {
-        assert!(!should_repair_fallback_fts_after_full_index_run(true, true));
-        assert!(should_repair_fallback_fts_after_full_index_run(true, false));
-        assert!(!should_repair_fallback_fts_after_full_index_run(
-            false, false
-        ));
-        assert!(!should_repair_fallback_fts_after_full_index_run(
-            false, true
-        ));
-    }
-
-    #[test]
-    fn fallback_fts_repair_classifies_missing_shadow_as_nonfatal_derived_damage() {
-        let outcome = nonfatal_fallback_fts_repair_outcome(
-            "inserting 10000 fallback rows: table not found: fts_messages_data".to_string(),
-        );
-        assert!(matches!(
-            outcome,
-            Some(FallbackFtsRepairOutcome::SkippedCorruptDerivedIndex { detail })
-                if detail.contains("fts_messages_data")
-        ));
-
-        assert_eq!(
-            nonfatal_fallback_fts_repair_outcome(
-                "disk I/O error while opening canonical messages".to_string()
-            ),
-            None,
-            "canonical I/O failures must remain fatal"
-        );
-    }
-
-    #[test]
-    fn full_run_fallback_fts_repair_skips_rebuild_when_fts_is_already_healthy() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("fts-healthy.db");
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        ensure_fts_schema(&storage);
-        seed_lexical_rebuild_fixture(&storage);
-
-        let repair =
-            repair_fallback_fts_after_full_index_run(&storage, &db_path, true, false, None)
-                .unwrap();
-        assert_eq!(
-            repair,
-            Some(FallbackFtsRepairOutcome::Repaired(
-                FtsConsistencyRepair::AlreadyHealthy { rows: 4 }
-            ))
-        );
-    }
-
-    #[test]
-    fn full_run_fallback_fts_repair_rebuilds_missing_schema_when_needed() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("fts-missing.db");
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        seed_lexical_rebuild_fixture(&storage);
-
-        // w1b Task B9 (2026-08-27, control-plane approved, same
-        // B7-schema-authority-migration family as commit d38be112's
-        // current_schema_fast_probe fix): this fixture used to reach a
-        // genuinely fts_messages-less database just by skipping
-        // `ensure_fts_schema` -- under the legacy engine, `fts_messages`
-        // was only ever created by that explicit call. Task B7's
-        // `storage::schema::ensure` (src/storage/schema.rs) now creates
-        // `fts_messages` unconditionally as part of the base schema, and
-        // `insert_conversation_tree` keeps it populated in step with
-        // `messages` -- so by the time `seed_lexical_rebuild_fixture`
-        // returns, the table already exists with all 4 rows indexed,
-        // making the "missing schema" scenario this test is named for
-        // impossible to reach through fixture setup alone (confirmed: the
-        // gate-caught failure here was `Repaired(AlreadyHealthy{rows:4})`,
-        // not the expected `Rebuilt` -- fts_messages was never missing,
-        // just never dropped). Drop it explicitly to recreate the
-        // scenario the test actually exercises: repair discovering an
-        // absent fts_messages and rebuilding it from the canonical
-        // `messages` table.
-        storage
-            .raw()
-            .execute("DROP TABLE IF EXISTS fts_messages", &[])
-            .unwrap();
-
-        let repair =
-            repair_fallback_fts_after_full_index_run(&storage, &db_path, true, false, None)
-                .unwrap();
-        assert_eq!(
-            repair,
-            Some(FallbackFtsRepairOutcome::Repaired(
-                FtsConsistencyRepair::Rebuilt { inserted_rows: 4 }
-            ))
-        );
-    }
-
-    #[test]
-    fn full_run_fallback_fts_repair_skips_known_healthy_archive_fingerprint() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("fts-known-healthy.db");
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        ensure_fts_schema(&storage);
-        seed_lexical_rebuild_fixture(&storage);
-
-        let archive_fingerprint = lexical_storage_fingerprint_for_db(&db_path).unwrap();
-        storage.ensure_search_fallback_fts_consistency().unwrap();
-        storage
-            .record_search_fallback_fts_archive_fingerprint(&archive_fingerprint)
-            .unwrap();
-
-        let repair = repair_fallback_fts_after_full_index_run(
-            &storage,
-            &db_path,
-            true,
-            false,
-            Some(&archive_fingerprint),
-        )
-        .unwrap();
-        assert_eq!(
-            repair,
-            Some(
-                FallbackFtsRepairOutcome::SkippedKnownHealthyForFingerprint {
-                    archive_fingerprint
-                }
             )
         );
     }
