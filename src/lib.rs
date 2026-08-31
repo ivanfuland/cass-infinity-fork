@@ -72781,155 +72781,6 @@ mod cli_read_db_tests {
     }
 
     #[test]
-    fn state_meta_json_reports_active_rebuild_pipeline_runtime() {
-        let (temp, db_path) = seed_cli_db();
-        let index_path = crate::indexer::index_dir(temp.path()).expect("index dir");
-        std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
-        std::fs::write(
-            index_path.join(".lexical-rebuild-state.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "version": 2,
-                "schema_hash": crate::indexer::LEXICAL_REBUILD_SCHEMA_HASH,
-                "db": {
-                    "db_path": db_path.display().to_string(),
-                    "total_conversations": 10,
-                    "storage_fingerprint": "10:42:0:0"
-                },
-                "page_size": crate::indexer::LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
-                "committed_offset": 4,
-                "committed_conversation_id": 4,
-                "processed_conversations": 4,
-                "indexed_docs": 20,
-                "committed_meta_fingerprint": null,
-                "pending": null,
-                "completed": false,
-                "updated_at_ms": 1_733_000_123_000_i64,
-                "runtime": {
-                    "queue_depth": 3,
-                    "inflight_message_bytes": 65_536,
-                    "max_message_bytes_in_flight": 131_072,
-                    "pending_batch_conversations": 9,
-                    "pending_batch_message_bytes": 131_072,
-                    "page_prep_workers": 6,
-                    "active_page_prep_jobs": 2,
-                    "ordered_buffered_pages": 4,
-                    "budget_generation": 1,
-                    "producer_budget_wait_count": 2,
-                    "producer_budget_wait_ms": 17,
-                    "producer_handoff_wait_count": 1,
-                    "producer_handoff_wait_ms": 9,
-                    "host_loadavg_1m_milli": 7_250,
-                    "controller_mode": "pressure_limited",
-                    "controller_reason": "queue_depth_3_reached_pipeline_capacity_3",
-                    "staged_merge_workers_max": 3,
-                    "staged_merge_allowed_jobs": 1,
-                    "staged_merge_active_jobs": 1,
-                    "staged_merge_ready_artifacts": 5,
-                    "staged_merge_ready_groups": 1,
-                    "staged_merge_controller_reason": "page_prep_workers_saturated_6_of_6",
-                    "staged_shard_build_workers_max": 6,
-                    "staged_shard_build_allowed_jobs": 5,
-                    "staged_shard_build_active_jobs": 4,
-                    "staged_shard_build_pending_jobs": 2,
-                    "staged_shard_build_controller_reason": "reserving_1_slots_for_staged_merge_active_jobs_1_ready_groups_1",
-                    "updated_at_ms": 1_733_000_124_000_i64
-                }
-            }))
-            .expect("serialize rebuild state"),
-        )
-        .expect("write rebuild state");
-
-        let lock_path = temp.path().join("index-run.lock");
-        let mut lock_file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-            .expect("open lock file");
-        lock_file.try_lock_exclusive().expect("hold index lock");
-        write_index_lock_metadata(
-            &lock_path,
-            &mut lock_file,
-            &format!(
-                "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index\n",
-                std::process::id(),
-                1_733_000_111_000_i64,
-                db_path.display()
-            ),
-        );
-
-        let state = state_meta_json(temp.path(), &db_path, 60, true);
-        let runtime = &state["rebuild"]["pipeline"]["runtime"];
-        let pipeline = &state["rebuild"]["pipeline"];
-
-        assert_eq!(runtime["queue_depth"].as_u64(), Some(3));
-        assert_eq!(
-            runtime["queue_capacity"].as_u64(),
-            pipeline["pipeline_channel_size"].as_u64()
-        );
-        assert_eq!(
-            runtime["queue_headroom"].as_u64(),
-            runtime["queue_capacity"]
-                .as_u64()
-                .map(|value| value.saturating_sub(3))
-        );
-        assert_eq!(runtime["inflight_message_bytes"].as_u64(), Some(65_536));
-        assert_eq!(
-            runtime["max_message_bytes_in_flight"].as_u64(),
-            Some(131_072)
-        );
-        assert_eq!(
-            runtime["inflight_message_bytes_headroom"].as_u64(),
-            Some(65_536)
-        );
-        assert_eq!(runtime["pending_batch_conversations"].as_u64(), Some(9));
-        assert_eq!(
-            runtime["pending_batch_message_bytes"].as_u64(),
-            Some(131_072)
-        );
-        assert_eq!(runtime["page_prep_workers"].as_u64(), Some(6));
-        assert_eq!(runtime["active_page_prep_jobs"].as_u64(), Some(2));
-        assert_eq!(runtime["ordered_buffered_pages"].as_u64(), Some(4));
-        assert_eq!(runtime["budget_generation"].as_u64(), Some(1));
-        assert_eq!(runtime["producer_budget_wait_count"].as_u64(), Some(2));
-        assert_eq!(runtime["producer_budget_wait_ms"].as_u64(), Some(17));
-        assert_eq!(runtime["producer_handoff_wait_count"].as_u64(), Some(1));
-        assert_eq!(runtime["producer_handoff_wait_ms"].as_u64(), Some(9));
-        assert_eq!(runtime["host_loadavg_1m"].as_f64(), Some(7.25));
-        assert_eq!(
-            runtime["controller_mode"].as_str(),
-            Some("pressure_limited")
-        );
-        assert_eq!(
-            runtime["controller_reason"].as_str(),
-            Some("queue_depth_3_reached_pipeline_capacity_3")
-        );
-        assert_eq!(runtime["staged_merge_workers_max"].as_u64(), Some(3));
-        assert_eq!(runtime["staged_merge_allowed_jobs"].as_u64(), Some(1));
-        assert_eq!(runtime["staged_merge_active_jobs"].as_u64(), Some(1));
-        assert_eq!(runtime["staged_merge_ready_artifacts"].as_u64(), Some(5));
-        assert_eq!(runtime["staged_merge_ready_groups"].as_u64(), Some(1));
-        assert_eq!(
-            runtime["staged_merge_controller_reason"].as_str(),
-            Some("page_prep_workers_saturated_6_of_6")
-        );
-        assert_eq!(runtime["staged_shard_build_workers_max"].as_u64(), Some(6));
-        assert_eq!(runtime["staged_shard_build_allowed_jobs"].as_u64(), Some(5));
-        assert_eq!(runtime["staged_shard_build_active_jobs"].as_u64(), Some(4));
-        assert_eq!(runtime["staged_shard_build_pending_jobs"].as_u64(), Some(2));
-        assert_eq!(
-            runtime["staged_shard_build_controller_reason"].as_str(),
-            Some("reserving_1_slots_for_staged_merge_active_jobs_1_ready_groups_1")
-        );
-        assert_eq!(
-            runtime["updated_at"].as_str(),
-            format_timestamp_millis_rfc3339(1_733_000_124_000_i64).as_deref()
-        );
-    }
-
-    #[test]
     fn state_meta_json_hides_empty_active_rebuild_pipeline_runtime_before_first_heartbeat() {
         let (temp, db_path) = seed_cli_db();
         let index_path = crate::indexer::index_dir(temp.path()).expect("index dir");
@@ -72994,29 +72845,27 @@ mod cli_read_db_tests {
         let index_path = crate::indexer::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
         std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
-        std::fs::write(
-            index_path.join(".lexical-rebuild-state.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "version": 2,
-                "schema_hash": crate::indexer::LEXICAL_REBUILD_SCHEMA_HASH,
-                "db": {
-                    "db_path": db_path.display().to_string(),
-                    "total_conversations": 10,
-                    "storage_fingerprint": "10:42:0:0"
-                },
-                "page_size": crate::indexer::LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
-                "committed_offset": 4,
-                "committed_conversation_id": 4,
-                "processed_conversations": 4,
-                "indexed_docs": 20,
-                "committed_meta_fingerprint": null,
-                "pending": null,
-                "completed": false,
-                "updated_at_ms": 1_733_000_123_000_i64
-            }))
-            .expect("serialize rebuild state"),
-        )
-        .expect("write rebuild state");
+        // W2-6 exec36 Task甲2 (control-plane 2026-08-30 ruling, ③): the retired
+        // JSON checkpoint file is no longer read anywhere -- "a rebuild is in
+        // progress" is now carried by the SQLite `lex_domain_rebuild_state`
+        // meta marker (storage::sqlite::lex_domain_rebuild_marker_status).
+        // Plant the Building marker through a real write against the seeded
+        // db instead of the dead file, mirroring the real write path
+        // (storage/sqlite.rs's own `write_lex_domain_rebuild_marker_building`
+        // uses the identical statement against the same key/value pair).
+        {
+            let storage = FrankenStorage::open(&db_path).expect("reopen cass db for marker write");
+            storage
+                .raw()
+                .execute(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                    &crate::storage::api::params![
+                        crate::storage::sqlite::LEX_DOMAIN_REBUILD_STATE_META_KEY,
+                        "building"
+                    ],
+                )
+                .expect("write lex domain rebuild marker (building)");
+        }
 
         let lock_path = temp.path().join("index-run.lock");
         let mut lock_file = std::fs::OpenOptions::new()
@@ -73041,78 +72890,17 @@ mod cli_read_db_tests {
         let state = state_meta_json(temp.path(), &db_path, 60, true);
         assert_eq!(state["index"]["rebuilding"].as_bool(), Some(true));
         assert_eq!(state["rebuild"]["active"].as_bool(), Some(true));
-        assert_eq!(state["pending"]["sessions"].as_u64(), Some(6));
+        // The marker's Building variant carries no progress counters (no
+        // partial-progress resume, per its own doc -- see w2-d4) -- what it
+        // DOES report honestly is "a checkpoint exists and isn't finished".
         assert_eq!(
-            state["rebuild"]["processed_conversations"].as_u64(),
-            Some(4)
+            state["index"]["checkpoint"]["present"].as_bool(),
+            Some(true)
         );
-        assert_eq!(state["rebuild"]["total_conversations"].as_u64(), Some(10));
-    }
-
-    #[test]
-    fn state_meta_json_prefers_pending_rebuild_progress_when_present() {
-        let (temp, db_path) = seed_cli_db();
-        let index_path = crate::indexer::index_dir(temp.path()).expect("index dir");
-        std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
-        std::fs::write(
-            index_path.join(".lexical-rebuild-state.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "version": 2,
-                "schema_hash": crate::indexer::LEXICAL_REBUILD_SCHEMA_HASH,
-                "db": {
-                    "db_path": db_path.display().to_string(),
-                    "total_conversations": 10,
-                    "storage_fingerprint": "10:42:0:0"
-                },
-                "page_size": crate::indexer::LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
-                "committed_offset": 4,
-                "committed_conversation_id": 4,
-                "processed_conversations": 4,
-                "indexed_docs": 20,
-                "committed_meta_fingerprint": null,
-                "pending": {
-                    "next_offset": 6,
-                    "next_conversation_id": 6,
-                    "processed_conversations": 6,
-                    "indexed_docs": 30,
-                    "base_meta_fingerprint": "stable-meta"
-                },
-                "completed": false,
-                "updated_at_ms": 1_733_000_223_000_i64
-            }))
-            .expect("serialize rebuild state"),
-        )
-        .expect("write rebuild state");
-
-        let lock_path = temp.path().join("index-run.lock");
-        let mut lock_file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-            .expect("open lock file");
-        lock_file.try_lock_exclusive().expect("hold index lock");
-        write_index_lock_metadata(
-            &lock_path,
-            &mut lock_file,
-            &format!(
-                "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index\n",
-                std::process::id(),
-                1_733_000_111_000_i64,
-                db_path.display()
-            ),
-        );
-
-        let state = state_meta_json(temp.path(), &db_path, 60, true);
-        assert_eq!(state["rebuild"]["active"].as_bool(), Some(true));
-        assert_eq!(state["pending"]["sessions"].as_u64(), Some(4));
         assert_eq!(
-            state["rebuild"]["processed_conversations"].as_u64(),
-            Some(6)
+            state["index"]["checkpoint"]["completed"].as_bool(),
+            Some(false)
         );
-        assert_eq!(state["rebuild"]["indexed_docs"].as_u64(), Some(30));
     }
 
     #[test]
@@ -73367,55 +73155,6 @@ mod cli_read_db_tests {
     }
 
     #[test]
-    fn state_meta_json_uses_latest_lock_heartbeat_when_asset_inspection_fails() {
-        let (temp, db_path) = seed_cli_db();
-        let index_path = crate::indexer::index_dir(temp.path()).expect("index dir");
-        std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
-        std::fs::create_dir_all(index_path.join(".lexical-rebuild-state.json"))
-            .expect("create unreadable rebuild state path");
-
-        let lock_path = temp.path().join("index-run.lock");
-        let mut lock_file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-            .expect("open lock file");
-        lock_file.try_lock_exclusive().expect("hold index lock");
-        write_index_lock_metadata(
-            &lock_path,
-            &mut lock_file,
-            &format!(
-                concat!(
-                    "pid={}\n",
-                    "started_at_ms={}\n",
-                    "updated_at_ms={}\n",
-                    "db_path={}\n",
-                    "mode=index\n"
-                ),
-                std::process::id(),
-                1_733_000_555_000_i64,
-                1_733_000_666_000_i64,
-                db_path.display()
-            ),
-        );
-
-        let state = state_meta_json(temp.path(), &db_path, 60, true);
-        assert_eq!(state["index"]["status"].as_str(), Some("error"));
-        assert_eq!(
-            state["index"]["activity_at"].as_str(),
-            Some("2024-11-30T21:04:26+00:00")
-        );
-        assert!(
-            state["index"]["reason"]
-                .as_str()
-                .is_some_and(|reason| reason.contains("asset inspection failed"))
-        );
-    }
-
-    #[test]
     fn state_meta_json_does_not_infer_watch_activity_from_watch_state_file() {
         let (temp, db_path) = seed_cli_db();
         let index_path = crate::indexer::index_dir(temp.path()).expect("index dir");
@@ -73430,61 +73169,6 @@ mod cli_read_db_tests {
         let state = state_meta_json(temp.path(), &db_path, 60, true);
         assert_eq!(state["pending"]["watch_active"].as_bool(), Some(false));
         assert_eq!(state["pending"]["sessions"].as_u64(), Some(0));
-    }
-
-    #[test]
-    fn state_meta_json_marks_lexical_fingerprint_mismatch_stale() {
-        let (temp, db_path) = seed_cli_db();
-        let index_path = crate::indexer::index_dir(temp.path()).expect("index dir");
-        std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
-        std::fs::write(
-            index_path.join(".lexical-rebuild-state.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "version": 2,
-                "schema_hash": crate::indexer::LEXICAL_REBUILD_SCHEMA_HASH,
-                "db": {
-                    "db_path": db_path.display().to_string(),
-                    "total_conversations": 10,
-                    "storage_fingerprint": "stale-fingerprint"
-                },
-                "page_size": crate::indexer::LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
-                "committed_offset": 10,
-                "committed_conversation_id": 10,
-                "processed_conversations": 10,
-                "indexed_docs": 20,
-                "committed_meta_fingerprint": null,
-                "pending": null,
-                "completed": true,
-                "updated_at_ms": 1_733_000_123_000_i64
-            }))
-            .expect("serialize rebuild state"),
-        )
-        .expect("write rebuild state");
-
-        let state = state_meta_json(temp.path(), &db_path, 60, true);
-        assert_eq!(state["index"]["status"].as_str(), Some("stale"));
-        assert_eq!(state["index"]["stale"].as_bool(), Some(true));
-        assert_eq!(
-            state["index"]["fingerprint"]["matches_current_db_fingerprint"].as_bool(),
-            Some(false)
-        );
-        assert!(
-            state["index"]["reason"]
-                .as_str()
-                .is_some_and(|reason| reason.contains("fingerprint"))
-        );
-        assert_eq!(state["pending"]["sessions"].as_u64(), Some(0));
-        assert_eq!(
-            state["rebuild"]["processed_conversations"],
-            serde_json::Value::Null
-        );
-        assert_eq!(
-            state["rebuild"]["total_conversations"],
-            serde_json::Value::Null
-        );
-        assert_eq!(state["rebuild"]["indexed_docs"], serde_json::Value::Null);
-        assert_eq!(state["semantic"]["fallback_mode"].as_str(), Some("lexical"));
     }
 
     #[test]
