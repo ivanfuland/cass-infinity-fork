@@ -3346,18 +3346,46 @@ fn levenshtein_distance(a: &str, b: &str) -> usize {
     prev_row[b_len]
 }
 
+/// W2-6 exec36 Task甲4-④ (Ivan 2026-08-31 ruling): true iff `term` is a
+/// hyphenated compound word -- an internal `-` with alphanumeric content on
+/// both sides, no leading/trailing hyphen, no other punctuation (sanitize
+/// already stripped anything else to whitespace, splitting it into a
+/// separate boolean-query token upstream of this check). Used to route the
+/// term through a quoted FTS5 phrase instead of `normalize_term_parts`'s
+/// hyphen-as-separator splitting.
+fn is_hyphenated_compound_term(term: &str) -> bool {
+    !term.is_empty()
+        && !term.starts_with('-')
+        && !term.ends_with('-')
+        && term.contains('-')
+        && term.chars().all(|c| c.is_alphanumeric() || c == '-')
+}
+
 /// Normalize a term into FTS5-porter-aligned parts.
 /// Splits punctuation into separate fragments while preserving a trailing `*`
 /// on the final fragment so fallback queries match how SQLite tokenizes indexed
-/// text in `fts_messages`.
+/// text in `fts_messages`. W2-6 exec36 Task甲4-④ (Ivan 2026-08-31 ruling): an
+/// *internal* hyphen (current fragment already non-empty) is kept inside its
+/// fragment rather than treated as a separator, so "br-123.jsonl" yields
+/// `["br-123", "jsonl"]` -- the caller (`transpile_to_fts5`) then renders a
+/// hyphenated fragment as one quoted FTS5 phrase instead of splitting it
+/// further, per `fs_cass_sanitize_query`'s own "hyphens are compound-word
+/// glue" design. Scoped to tokens with **no** trailing wildcard: a probe
+/// against `fts_lex` showed a quoted phrase with the `*` inside (e.g.
+/// `"br-123*"`) does *not* behave as prefix-on-last-word and simply matches
+/// nothing, so a hyphenated term combined with a trailing wildcard (e.g.
+/// `foo-bar*`) keeps the pre-④ hyphen-as-separator splitting instead of
+/// risking a silently-broken phrase query -- out of ④'s authorized scope.
 fn normalize_term_parts(raw: &str) -> Vec<String> {
     let mut parts = Vec::new();
     for token in nfc_sanitize_query(raw).split_whitespace() {
+        let keep_internal_hyphens = !token.ends_with('*');
         let mut current = String::new();
         let mut chars = token.chars().peekable();
         while let Some(ch) = chars.next() {
             let trailing_wildcard = ch == '*' && chars.peek().is_none() && !current.is_empty();
-            if ch.is_alphanumeric() || ch == '_' || trailing_wildcard {
+            let internal_hyphen = keep_internal_hyphens && ch == '-' && !current.is_empty();
+            if ch.is_alphanumeric() || ch == '_' || trailing_wildcard || internal_hyphen {
                 current.push(ch);
                 continue;
             }
@@ -7943,7 +7971,11 @@ fn transpile_to_fts5(raw_query: &str) -> Option<String> {
 
                 // Sanitize and normalize. FTS5 implicitly ANDs words in a string,
                 // but we split punctuation into porter-aligned fragments first so
-                // fallback queries match SQLite tokenization.
+                // fallback queries match SQLite tokenization. W2-6 exec36 Task甲4-④
+                // (Ivan 2026-08-31 ruling): `normalize_term_parts` keeps an
+                // *internal* hyphen inside its fragment (does not split on it)
+                // -- see that function's own comment -- so "br-123.jsonl"
+                // yields `["br-123", "jsonl"]`, not three separate words.
                 let term_parts = normalize_term_parts(&t_for_normalize);
                 if term_parts.is_empty() {
                     continue;
@@ -7951,11 +7983,29 @@ fn transpile_to_fts5(raw_query: &str) -> Option<String> {
 
                 let mut rendered_parts = Vec::with_capacity(term_parts.len());
                 for part in &term_parts {
-                    rendered_parts.push(render_fts5_term_part(part)?);
+                    // W2-6 exec36 Task甲4-④ (Ivan 2026-08-31 ruling, 授权
+                    // 实施): a hyphenated compound fragment (`foo-bar`,
+                    // internal hyphen, alphanumeric on both sides) is
+                    // rendered as ONE quoted FTS5 phrase instead of being
+                    // spliced bare into the MATCH string -- an unquoted
+                    // hyphen is FTS5's own NOT operator and errors, and
+                    // splitting it into `(foo AND bar)` contradicts
+                    // `fs_cass_sanitize_query`'s own documented design
+                    // (hyphens preserved as compound-word glue). Probe-
+                    // verified: `fts_lex`'s trigram tokenizer content side
+                    // is fine with hyphens (a quoted MATCH phrase
+                    // `"foo-bar"` correctly finds "CMA-ES"-style compound
+                    // content and correctly does NOT match "foo bar baz");
+                    // the bug was query-side splitting, not the index.
+                    if is_hyphenated_compound_term(part) {
+                        rendered_parts.push(format!("\"{part}\""));
+                    } else {
+                        rendered_parts.push(render_fts5_term_part(part)?);
+                    }
                 }
 
                 // If multiple parts, wrap in parens and join with AND so a
-                // punctuated term like `foo-bar` becomes `(foo AND bar)`.
+                // punctuated term like `foo.bar` becomes `(foo AND bar)`.
                 let fts_term = if rendered_parts.len() > 1 {
                     format!("({})", rendered_parts.join(" AND "))
                 } else {
@@ -15599,21 +15649,32 @@ mod tests {
     #[test]
     fn transpile_to_fts5_ignores_leading_or() {
         assert_eq!(transpile_to_fts5("OR test"), Some("test".to_string()));
+        // W2-6 exec36 Task甲4-④ (Ivan 2026-08-31 ruling): hyphenated compound
+        // terms are now phrase-quoted rather than split (see the sibling
+        // `transpile_to_fts5_keeps_hyphenated_subterm_as_phrase_for_sqlite_
+        // fts` test).
         assert_eq!(
             transpile_to_fts5("OR foo-bar"),
-            Some("(foo AND bar)".to_string())
+            Some("\"foo-bar\"".to_string())
         );
     }
 
     #[test]
-    fn transpile_to_fts5_splits_hyphenated_subterms_for_sqlite_fts() {
+    fn transpile_to_fts5_keeps_hyphenated_subterm_as_phrase_for_sqlite_fts() {
+        // W2-6 exec36 Task甲4-④ (Ivan 2026-08-31 ruling): renamed from
+        // `..._splits_hyphenated_subterms_...` -- a hyphenated compound
+        // sub-term (dot-separated from the rest) is now phrase-quoted
+        // instead of split into separate AND'd words, matching
+        // `fs_cass_sanitize_query`'s own documented "hyphens preserved as
+        // compound-word glue" design. Probe-verified against both `fts_lex`
+        // (trigram) and the legacy `fts_messages` (porter) tokenizers.
         assert_eq!(
             transpile_to_fts5("br-123.jsonl"),
-            Some("(br AND 123 AND jsonl)".to_string())
+            Some("(\"br-123\" AND jsonl)".to_string())
         );
         assert_eq!(
             transpile_to_fts5("br-123.json*"),
-            Some("(br AND 123 AND json*)".to_string())
+            Some("(\"br-123\" AND json*)".to_string())
         );
     }
 
@@ -15625,7 +15686,7 @@ mod tests {
         );
         assert_eq!(
             transpile_to_fts5("foo NOT bar-baz"),
-            Some("foo NOT (bar AND baz)".to_string())
+            Some("foo NOT \"bar-baz\"".to_string())
         );
     }
 
@@ -18328,7 +18389,12 @@ mod tests {
         let sanitized = sanitize_query("[a-z]+");
         let parts: Vec<&str> = sanitized.split_whitespace().collect();
         assert_eq!(parts, vec!["a-z"]);
-        assert_eq!(normalize_term_parts("[a-z]+"), vec!["a", "z"]);
+        // W2-6 exec36 Task甲4-④ (Ivan 2026-08-31 ruling): `normalize_term_
+        // parts` now keeps an internal hyphen inside its fragment instead of
+        // splitting on it (see that function's doc comment) -- "a-z" is
+        // indistinguishable from any other hyphenated compound fragment at
+        // this layer.
+        assert_eq!(normalize_term_parts("[a-z]+"), vec!["a-z"]);
     }
 
     #[test]
@@ -19569,11 +19635,18 @@ mod tests {
         assert_eq!(transpile_to_fts5("*foo"), Some("foo".to_string()));
         assert_eq!(transpile_to_fts5("f*o"), None);
 
-        // SQLite FTS5's porter tokenizer splits punctuation into separate
-        // fragments, so fallback queries must do the same.
+        // W2-6 exec36 Task甲4-④ (Ivan 2026-08-31 ruling): a bare hyphenated
+        // compound term is kept as ONE quoted FTS5 phrase (probe-verified
+        // against both `fts_lex`'s trigram tokenizer and the legacy
+        // `fts_messages` porter tokenizer -- phrase re-tokenization makes
+        // this consistent either way), instead of being split into
+        // `(foo AND bar)`. Non-punctuation splitting (dot-separated tokens,
+        // e.g. "br-123.jsonl" -> two boolean-query terms "br-123" AND
+        // "jsonl") and trailing-wildcard forms (which fall outside the
+        // "bare hyphenated compound" check) are unaffected.
         assert_eq!(
             transpile_to_fts5("foo-bar"),
-            Some("(foo AND bar)".to_string())
+            Some("\"foo-bar\"".to_string())
         );
         assert_eq!(
             transpile_to_fts5("foo-bar*"),
@@ -19581,11 +19654,11 @@ mod tests {
         );
         assert_eq!(
             transpile_to_fts5("br-123.jsonl"),
-            Some("(br AND 123 AND jsonl)".to_string())
+            Some("(\"br-123\" AND jsonl)".to_string())
         );
         assert_eq!(
             transpile_to_fts5("br-123.json*"),
-            Some("(br AND 123 AND json*)".to_string())
+            Some("(\"br-123\" AND json*)".to_string())
         );
 
         // Leading unary-NOT forms are not valid FTS5 queries.
