@@ -2485,16 +2485,19 @@ impl IndexRunLockGuard {
     /// `watch_startup:fts_validate`) so cass#265 operators can see
     /// which preflight step wedged on a multi-GB DB.
     ///
-    /// Phase breadcrumbs MUST satisfy two invariants so the existing
-    /// `IndexStallWatchdog` keeps resetting its `last_progress_advance`
-    /// timer at each sub-phase transition:
+    /// Phase breadcrumbs MUST satisfy two invariants (W2-6 exec41: the
+    /// in-process `IndexStallWatchdog` that used to consume these has been
+    /// retired -- stall/wedge detection is now an external-observer concern
+    /// reading this same `phase=`/`last_progress_at_ms=` lock-file state, so
+    /// the invariants below still matter for that reader):
     ///   1. Each call produces a strictly different `phase=` string
-    ///      than the previous call (the watchdog gates on
-    ///      `phase_code != self.last_phase` to reset).
+    ///      than the previous call, so an external observer can tell
+    ///      sub-phases apart.
     ///   2. The free function `bump_index_run_lock_progress_atomic`
     ///      is also called at each transition so the heartbeat
     ///      thread folds a fresh `last_progress_at_ms=` into the
-    ///      on-disk payload even if the watchdog tick is rare.
+    ///      on-disk payload at every sub-phase boundary, not just
+    ///      periodically.
     fn write_metadata_with_phase(
         &mut self,
         mode: SearchMaintenanceMode,
@@ -2607,12 +2610,16 @@ mod watch_startup_preflight {
     use std::thread::{self, JoinHandle};
     use std::time::Duration;
 
-    /// Default per-op timeout (seconds). Chosen so a single preflight
-    /// step has 60 s of headroom over the F4 `CASS_INDEX_STALL_DETECT_SECS`
-    /// default (120 s). Operators investigating a wedge see the F4
-    /// `stall_detected` event first (so logs still flag the wedge at
-    /// 120 s), and the harder per-op kill at 180 s prevents the
-    /// indefinite hang the reporter on cass#265 observed.
+    /// Default per-op timeout (seconds). Originally chosen so a single
+    /// preflight step had 60 s of headroom over the F4 in-process stall
+    /// watchdog's 120 s report threshold, so operators saw its
+    /// `stall_detected` event first before this harder per-op kill fired
+    /// at 180 s (cass#265). W2-6 exec41 retired that F4 watchdog and its
+    /// `CASS_INDEX_STALL_DETECT_SECS` env var entirely (stall/wedge
+    /// detection is now an external-observer concern over the lock file's
+    /// `phase=`/`last_progress_at_ms=` state) -- this module's own per-op
+    /// timeout below is independent of that retirement and unaffected by
+    /// it; the 180 s value is kept as-is (not re-derived from anything).
     pub(super) const DEFAULT_TIMEOUT_SECS: u64 = 180;
 
     /// Sentinel meaning "no preflight step is currently active".
@@ -8686,8 +8693,10 @@ pub fn run_index(
     // stalled instead of an opaque `phase=watch_startup` for the entire
     // pre-pipeline block. Each `set_phase` call also bumps
     // `last_progress_at_ms` (in both the atomic and the on-disk field)
-    // and emits a new `phase=` string that `IndexStallWatchdog` treats
-    // as a phase transition (resets its `last_progress_advance` timer).
+    // and emits a new `phase=` string -- an external observer sampling
+    // the lock file (W2-6 exec41: the in-process `IndexStallWatchdog`
+    // that used to treat this as a phase transition has been retired)
+    // sees each sub-phase distinctly.
     // The macro keeps the call sites compact: noop on non-watch_startup
     // modes so plain `cass index` runs don't pay the I/O cost on the
     // initial-state non-watch path.
@@ -22344,10 +22353,10 @@ mod tests {
     /// 2. Bumps `last_progress_at_ms` (both the on-disk field and the
     ///    atomic the heartbeat folds in) so a real wedge inside ONE
     ///    preflight surfaces at +120 s with the sub-phase pinpointed.
-    /// 3. Forces `IndexStallWatchdog` to reset its
-    ///    `last_progress_advance` timer at each sub-phase boundary so
-    ///    the watchdog scopes its stall window to a single preflight
-    ///    rather than the whole watch_startup block.
+    /// 3. (W2-6 exec41: the in-process `IndexStallWatchdog` that used to
+    ///    consume this transition to scope its stall window to a single
+    ///    preflight has been retired -- stall detection is now an
+    ///    external-observer concern over this same on-disk state.)
     ///
     /// This test exercises `set_phase` directly (without spinning up
     /// the full indexer): acquire the lock as `WatchStartup`, call
@@ -22443,14 +22452,14 @@ mod tests {
 
     /// Regression for cass#265.
     ///
-    /// The `IndexStallWatchdog` resets its `last_progress_advance`
-    /// timer whenever `phase_code` changes. The new sub-phase
-    /// breadcrumbs live in the LOCK FILE's `phase=` field (a string),
-    /// not in `IndexingProgress::phase` (an atomic enum). So a
-    /// wedged preflight is detected by `last_progress_at_ms` (which
-    /// `set_phase` bumps) and surfaced to operators via the lock-file
-    /// `phase=` string. This test verifies the lock-file `phase=`
-    /// values are exactly the strings the README/issue triage docs
+    /// The sub-phase breadcrumbs live in the LOCK FILE's `phase=`
+    /// field (a string), not in `IndexingProgress::phase` (an atomic
+    /// enum). So a wedged preflight is detected by `last_progress_at_ms`
+    /// (which `set_phase` bumps) and surfaced to operators via the
+    /// lock-file `phase=` string (W2-6 exec41: detection is an
+    /// external-observer concern now that the in-process
+    /// `IndexStallWatchdog` has been retired). This test verifies the
+    /// lock-file `phase=` values are exactly the strings the README/issue triage docs
     /// reference, so a future refactor that renames them will be
     /// flagged here before it ships and silently breaks operator
     /// runbooks.

@@ -7050,13 +7050,14 @@ impl FrankenStorage {
     /// X-2 (w2-4-rebuild-run.md): `progress`, when given, is driven with the
     /// exact same `total.store` + `current.fetch_add(batch.len())` idiom the
     /// tantivy rebuild pipeline already uses for its own conversation
-    /// batches — this is precisely what `IndexStallWatchdog::observe` reads
-    /// to decide whether the process is making forward progress. Without it,
-    /// the tantivy phase leaves `current == total` and this loop never
-    /// touches either atomic, so the watchdog sees zero progress from the
-    /// moment tantivy finishes and kills the process with `exit(70)` after
-    /// the default 300s abort threshold — on a real corpus this loop alone
-    /// runs for minutes, so the process was always killed before finishing.
+    /// batches. This is what the "Indexed N/M" operator print (and any
+    /// external progress observer, since W2-6 exec41 retired the in-process
+    /// `IndexStallWatchdog` that used to read these same atomics for
+    /// stall/wedge detection) reads to know whether the process is making
+    /// forward progress. Without it, the tantivy phase leaves
+    /// `current == total` and this loop never touches either atomic, so an
+    /// operator watching the printed progress sees no movement for the
+    /// entire multi-minute rebuild on a real corpus.
     pub(crate) fn rebuild_lex_domain_from_db(
         &self,
         progress: Option<&Arc<crate::indexer::IndexingProgress>>,
@@ -17256,15 +17257,17 @@ mod tests {
         );
     }
 
-    /// X-2 (w2-4-rebuild-run.md): `IndexStallWatchdog::observe` decides
-    /// whether the indexer is making forward progress purely from
-    /// `IndexingProgress::{phase,current}` -- it never reads any on-disk
-    /// heartbeat file. `rebuild_lex_domain_from_db` must therefore refresh
-    /// `progress.current` after every committed transaction batch, not just
-    /// once at the very end (a real corpus's lex domain rebuild runs for
-    /// minutes and would otherwise be killed by the default 300s abort with
-    /// `exit(70)` because the watchdog would see zero progress from the
-    /// moment the preceding tantivy phase finished).
+    /// X-2 (w2-4-rebuild-run.md): both the "Indexed N/M" operator print and
+    /// any external progress observer read forward progress purely from
+    /// `IndexingProgress::{phase,current}` -- neither reads any on-disk
+    /// heartbeat file for this signal. `rebuild_lex_domain_from_db` must
+    /// therefore refresh `progress.current` after every committed
+    /// transaction batch, not just once at the very end (a real corpus's
+    /// lex domain rebuild runs for minutes; W2-6 exec41 retired the
+    /// in-process `IndexStallWatchdog` that used to treat prolonged
+    /// zero-progress here as a wedge and `exit(70)` -- but the printed
+    /// progress itself would still sit frozen for the whole rebuild without
+    /// this per-batch refresh).
     ///
     /// Proven deterministically (no timing/threads required) by forcing the
     /// SECOND batch to fail right after the FIRST batch commits: if
