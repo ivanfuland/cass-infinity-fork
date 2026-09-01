@@ -38,6 +38,96 @@ use std::process::Command;
 const FIXTURE_PATH: &str = "tests/fixtures/w2_parity_queries.jsonl";
 const DEFAULT_BASELINE_PATH: &str = "tests/fixtures/w2-baseline-v3.jsonl";
 
+struct QueryResult {
+    category: String,
+    anchor_source_path: String,
+    fts5_paths: Vec<String>,
+    fts5_hit: bool,
+    fts5_rank: usize,
+    tantivy_hit: bool,
+    tantivy_rank: usize,
+    overlap: Option<f64>,
+}
+
+/// Criterion 1: recall parity. R2-B2 (exec48 round 2): the numerator must be
+/// *paired* -- rows where the candidate also hit the exact row the baseline
+/// hit -- not the candidate's total hit count taken independently. The
+/// unpaired form (`fts5_hits_total / tantivy_hits`) lets unrelated fts5 hits
+/// on rows the baseline missed offset real losses on rows the baseline hit,
+/// silently masking a regression as a pass (a false-green parity gate).
+fn recall_parity(rows: &[&QueryResult]) -> Option<f64> {
+    let tantivy_hits = rows.iter().filter(|r| r.tantivy_hit).count();
+    if tantivy_hits == 0 {
+        return None;
+    }
+    let paired_hits = rows.iter().filter(|r| r.tantivy_hit && r.fts5_hit).count();
+    Some(paired_hits as f64 / tantivy_hits as f64)
+}
+
+#[cfg(test)]
+mod recall_parity_formula_tests {
+    use super::{QueryResult, recall_parity};
+
+    fn row(tantivy_hit: bool, fts5_hit: bool) -> QueryResult {
+        QueryResult {
+            category: "synthetic".to_string(),
+            anchor_source_path: "/synthetic".to_string(),
+            fts5_paths: Vec::new(),
+            fts5_hit,
+            fts5_rank: if fts5_hit { 1 } else { 11 },
+            tantivy_hit,
+            tantivy_rank: if tantivy_hit { 1 } else { 11 },
+            overlap: None,
+        }
+    }
+
+    /// R2-B2 regression: with the old unpaired formula
+    /// (`fts5_hits_total / tantivy_hits`), 6 fts5 hits on rows the baseline
+    /// never hit can offset 2 real losses on rows the baseline DID hit,
+    /// producing `(32 + 6) / 34 ~= 1.118` -- a false PASS (>= 0.95) even
+    /// though the candidate actually lost 2 of the baseline's 34 real
+    /// anchors. The paired formula must report the true, lower ratio.
+    /// Mutation target: revert `r.tantivy_hit && r.fts5_hit` back to
+    /// `r.fts5_hit` alone and this test goes red (ratio flips to >= 1.0).
+    #[test]
+    fn recall_parity_does_not_let_unrelated_fts5_hits_mask_lost_baseline_anchors() {
+        let mut rows: Vec<QueryResult> = Vec::with_capacity(40);
+        // 32 rows: baseline hit, candidate also hit (paired, healthy).
+        for _ in 0..32 {
+            rows.push(row(true, true));
+        }
+        // 2 rows: baseline hit, candidate missed -- the real losses.
+        for _ in 0..2 {
+            rows.push(row(true, false));
+        }
+        // 6 rows: baseline missed, candidate "found" something anyway --
+        // unrelated to the 34 real baseline hits, must not offset the losses.
+        for _ in 0..6 {
+            rows.push(row(false, true));
+        }
+        assert_eq!(rows.len(), 40);
+        assert_eq!(rows.iter().filter(|r| r.tantivy_hit).count(), 34);
+
+        let refs: Vec<&QueryResult> = rows.iter().collect();
+        let ratio = recall_parity(&refs).expect("34 baseline hits must yield Some(ratio)");
+
+        assert!(
+            ratio < 1.0,
+            "paired recall ratio must reflect the 2 real losses (expected ~0.941), got {ratio}"
+        );
+        assert!(
+            ratio < 0.95,
+            "2 losses out of 34 baseline hits (32/34 ~= 0.941) must fail the 0.95 criterion-1 \
+             threshold, got {ratio}"
+        );
+        let expected = 32.0 / 34.0;
+        assert!(
+            (ratio - expected).abs() < 1e-9,
+            "expected exactly paired_hits/tantivy_hits = {expected}, got {ratio}"
+        );
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 struct FixtureQuery {
     query: String,
@@ -184,17 +274,6 @@ fn w2_lexical_parity_gate() {
     let fixture = load_fixture();
     let baseline = load_baseline(&baseline_path);
 
-    struct QueryResult {
-        category: String,
-        anchor_source_path: String,
-        fts5_paths: Vec<String>,
-        fts5_hit: bool,
-        fts5_rank: usize,
-        tantivy_hit: bool,
-        tantivy_rank: usize,
-        overlap: Option<f64>,
-    }
-
     let mut results = Vec::with_capacity(fixture.len());
     for row in &fixture {
         let baseline_row = baseline
@@ -235,14 +314,6 @@ fn w2_lexical_parity_gate() {
     }
 
     // Criterion 1: recall parity, full set and zh_2char subset.
-    fn recall_parity(rows: &[&QueryResult]) -> Option<f64> {
-        let tantivy_hits = rows.iter().filter(|r| r.tantivy_hit).count();
-        if tantivy_hits == 0 {
-            return None;
-        }
-        let fts5_hits = rows.iter().filter(|r| r.fts5_hit).count();
-        Some(fts5_hits as f64 / tantivy_hits as f64)
-    }
     let all_refs: Vec<&QueryResult> = results.iter().collect();
     let zh2_refs: Vec<&QueryResult> = results.iter().filter(|r| r.category == "zh_2char").collect();
     let recall_all = recall_parity(&all_refs);
