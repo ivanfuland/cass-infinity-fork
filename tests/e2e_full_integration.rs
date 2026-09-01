@@ -438,20 +438,21 @@ fn e2e_database_integrity() {
         .expect("orphan conv check");
     assert_eq!(orphan_convs, 0, "No orphan conversations should exist");
 
-    // The current contentless FTS table is considered healthy if the legacy embedded engine can
-    // query it and at least one row is visible through the canonical doctor probe.
+    // W2-6 Task戊: fts_messages is DROP'd -- search runs entirely on the
+    // fts_lex/lex_docs index, so the FTS health probe now targets that
+    // domain instead.
     let fts_probe_rows: Vec<i64> = conn
-        .query_all_map("SELECT rowid FROM fts_messages LIMIT 1", &[], |r| {
+        .query_all_map("SELECT rowid FROM fts_lex LIMIT 1", &[], |r| {
             r.get_typed(0)
         })
-        .expect("fts probe");
+        .expect("fts_lex probe");
     let msg_count = count_messages(&db_path);
     assert!(
         !fts_probe_rows.is_empty(),
-        "FTS should expose at least one indexed row after indexing"
+        "fts_lex should expose at least one indexed row after indexing"
     );
     verbose!(
-        "DB integrity OK: {} messages, FTS queryable with {} visible probe rows, 0 orphans",
+        "DB integrity OK: {} messages, fts_lex queryable with {} visible probe rows, 0 orphans",
         msg_count,
         fts_probe_rows.len()
     );

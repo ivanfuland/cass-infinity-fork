@@ -47,7 +47,7 @@ use coding_agent_search::indexer::semantic::{
 };
 use coding_agent_search::indexer::{IndexOptions, get_connector_factories, run_index};
 use coding_agent_search::search::semantic_manifest::{SemanticShardManifest, TierKind};
-use coding_agent_search::search::tantivy::index_dir;
+use coding_agent_search::indexer::index_dir;
 use coding_agent_search::search::vector_index::{VectorIndex as FsVectorIndex, vector_index_path};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::fs;

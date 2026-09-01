@@ -198,7 +198,7 @@ fn hold_active_lexical_rebuild_lock(
     completed: bool,
     runtime: Option<Value>,
 ) -> fs::File {
-    let index_path = coding_agent_search::search::tantivy::expected_index_dir(data_dir);
+    let index_path = coding_agent_search::indexer::expected_index_dir(data_dir);
     fs::create_dir_all(&index_path).expect("create index dir");
     let (
         total_conversations,
@@ -216,7 +216,7 @@ fn hold_active_lexical_rebuild_lock(
 
     let mut rebuild_state = serde_json::json!({
         "version": 2,
-        "schema_hash": coding_agent_search::search::tantivy::SCHEMA_HASH,
+        "schema_hash": coding_agent_search::indexer::LEXICAL_REBUILD_SCHEMA_HASH,
         "db": {
             "db_path": db_path.display().to_string(),
             "total_conversations": total_conversations,
@@ -4275,7 +4275,7 @@ fn status_missing_db_reports_not_initialized() {
 #[test]
 fn status_empty_index_dir_without_meta_still_reports_not_initialized() {
     let tmp = TempDir::new().unwrap();
-    fs::create_dir_all(coding_agent_search::search::tantivy::expected_index_dir(
+    fs::create_dir_all(coding_agent_search::indexer::expected_index_dir(
         tmp.path(),
     ))
     .unwrap();
@@ -7301,7 +7301,7 @@ fn search_with_intact_db_but_wiped_lexical_degrades_with_truthful_warning() {
     );
 
     // Wipe ONLY the versioned lexical index directory; keep the DB.
-    let index_path = coding_agent_search::search::tantivy::index_dir(&data_dir)
+    let index_path = coding_agent_search::indexer::index_dir(&data_dir)
         .expect("resolve versioned tantivy index path");
     assert!(
         index_path.exists(),

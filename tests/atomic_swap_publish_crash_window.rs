@@ -1,41 +1,72 @@
 //! Bead coding_agent_session_search-ghw60 (child of ibuuh.10):
-//! concurrent-reader crash-window regression for the atomic-swap
-//! lexical publish contract from commits 109560e5
-//! (renameat2(RENAME_EXCHANGE) / rename-fallback) and a699f55b (stage
-//! generation artifacts before swap).
+//! crash-window regression for the lexical rebuild/publish contract.
 //!
-//! Invariant under test: while `cass index --full` is swapping a
-//! newly staged lexical index into the live path, an external reader
-//! that opens the live path in a tight loop must observe EXACTLY one
-//! of:
+//! W2-6 exec39 (control-plane 2026-08-31 ruling, item2): the ORIGINAL
+//! atomic-swap-publish protocol this file tested is structurally
+//! extinct. `renameat2(RENAME_EXCHANGE)` staged-directory swap
+//! (commits 109560e5 / a699f55b), `frankensearch::lexical` (crate
+//! built without the `lexical` feature -- zero src callers of
+//! `ReloadPolicy`/`IndexReader`/`cass_open_search_reader`/etc.), and
+//! `open_federated_search_readers` (zero src callers, no successor)
+//! are all gone. lex_docs/fts_lex now live inside the same SQLite file
+//! as everything else and are rebuilt via
+//! `FrankenStorage::rebuild_lex_domain_from_db`: a sequence of
+//! `IMMEDIATE` transactions (200 conversations each,
+//! src/storage/sqlite.rs:7059 `CONVERSATIONS_PER_TX`), never a
+//! parked-then-atomically-swapped directory. There is no more
+//! "half-torn intermediate filesystem state" for a directory-polling
+//! reader to observe -- SQLite's own transaction atomicity replaces
+//! that concern entirely.
 //!
-//!   1. the prior-live content (doc count == `BEFORE_DOCS`)
-//!   2. the newly published content (doc count == `AFTER_DOCS`)
-//!   3. a transient read error (Err) or a transiently absent path (Ok(None))
+//! Two of the three original tests are judged dead outright (their
+//! mechanism no longer exists) and are recorded, not kept:
 //!
-//! Any other observation — a readable summary with a doc count that
-//! matches NEITHER `BEFORE_DOCS` nor `AFTER_DOCS` — means a reader saw
-//! a half-torn intermediate filesystem state. That is exactly what
-//! the atomic-swap publish path exists to prevent.
+//!   - `concurrent_reader_never_sees_half_torn_lexical_index_during_publish_swap`
+//!   - `concurrent_reader_never_sees_half_torn_federated_lexical_index_during_publish_swap`
+//!     (federated reader concept additionally extinct on its own)
 //!
-//! The sibling in-process tests
-//! `publish_staged_lexical_index_recovers_from_crash_between_park_and_swap`
-//! and `publish_staged_lexical_index_retains_stale_in_progress_backup_when_live_present`
-//! cover the sequential RECOVERY side of the invariant by manually
-//! constructing the filesystem state a crash would leave behind. This
-//! test covers the CONCURRENT-READER side by exercising the real
-//! `cass index --full` binary and polling the live index path while
-//! the publish is in flight.
+//! Their INTENT -- what does a concurrent reader observe while a
+//! rebuild is in flight? -- is not dead, and W2-6 exec39's real
+//! (black-box CLI) experiment against the current DB-domain rebuild
+//! found real, reproducible behavior: `has_populated_fts_lex()`
+//! (src/search/query.rs:3704) retries lock contention for 2s then
+//! silently reports "no index" via `.unwrap_or(false)` on any
+//! remaining error, which can make a concurrent `cass search` return
+//! zero hits with a misleading "index not found" warning even while
+//! most of the rebuild's data is already committed. What the CORRECT
+//! behavior should be here (propagate the error? report "rebuild in
+//! progress, retry"? something else?) is undecided product behavior,
+//! not something this test suite gets to invent an assertion for --
+//! see w2-6-closeout's "重建中并发查询的行为契约未定义" debt entry.
+//! Writing a new test that pins one of these undefined choices would
+//! just be asserting on a coin flip, so none is added here.
+//!
+//! The third test, `kill_relaunch_recovers_lexical_publish_and_search_stays_stable`,
+//! is REWRITTEN below (not deleted) because its intent -- "a hard
+//! crash mid-rebuild is recovered on the next invocation" -- maps
+//! cleanly onto a real, DEFINED, verified-by-experiment DB-domain
+//! behavior: `FrankenStorage::rebuild_lex_domain_from_db` marks the
+//! lex-domain meta row `building` before touching any conversation and
+//! only flips it to `completed:<total>:<lex_docs_count>` atomically
+//! with the LAST batch's commit (src/storage/sqlite.rs:7070-7075's own
+//! comment: "A crash between here and the completed marker below
+//! leaves this row at 'building', which region2's routine-run
+//! detection (indexer::mod.rs) reads as incomplete and reruns from
+//! zero next time"). W2-6 exec39 verified this promise empirically:
+//! `cass doctor check`/`cass doctor --fix` are BOTH blind to a stuck
+//! `building` marker (report `healthy`/`needs_rebuild: false` and take
+//! no action -- a real, separately-tracked reporting gap, see
+//! w2-6-closeout), but the plain ROUTINE `cass index` (no `--full`)
+//! DOES detect it and triggers
+//! `"lexical_strategy_reason": "rebuild_incomplete_lex_domain_from_canonical_db"`,
+//! correctly rebuilding to completion. That is the real recovery path
+//! this test now pins.
 
 use assert_cmd::Command;
-use coding_agent_search::search::tantivy::{
-    SearchableIndexSummary, open_federated_search_readers, searchable_index_summary,
-};
-use frankensearch::lexical::ReloadPolicy;
-use serde_json::json;
+use coding_agent_search::storage::api::Value as SqliteValue;
+use coding_agent_search::storage::sqlite::{FrankenStorage, LEX_DOMAIN_REBUILD_STATE_META_KEY};
 use std::fs;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::process::{Command as StdCommand, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -52,475 +83,271 @@ fn cass_cmd(home: &std::path::Path) -> Command {
     cmd
 }
 
-fn iso_ts(ts_ms: i64) -> String {
-    chrono::DateTime::from_timestamp_millis(ts_ms)
-        .unwrap_or_else(chrono::Utc::now)
-        .to_rfc3339()
-}
-
-fn seed_codex_session(
-    codex_home: &std::path::Path,
-    date_path: &str,
-    filename: &str,
-    ts_ms: i64,
-    keyword: &str,
-) {
-    let sessions = codex_home.join(format!("sessions/{date_path}"));
-    fs::create_dir_all(&sessions).unwrap();
-    let actual_filename = if filename.starts_with("rollout-") {
-        filename.to_string()
-    } else {
-        format!("rollout-{filename}")
-    };
-    let workspace = codex_home.to_string_lossy().into_owned();
-    let lines = [
-        json!({
-            "timestamp": iso_ts(ts_ms),
-            "type": "session_meta",
-            "payload": { "id": actual_filename.clone(), "cwd": workspace, "cli_version": "0.42.0" },
-        }),
-        json!({
-            "timestamp": iso_ts(ts_ms + 1_000),
-            "type": "response_item",
-            "payload": {
-                "type": "message", "role": "user",
-                "content": [{ "type": "input_text", "text": keyword }],
-            },
-        }),
-        json!({
-            "timestamp": iso_ts(ts_ms + 2_000),
-            "type": "response_item",
-            "payload": {
-                "type": "message", "role": "assistant",
-                "content": [{ "type": "text", "text": format!("{keyword} response") }],
-            },
-        }),
-    ];
-    let mut body = String::new();
-    for line in lines {
-        body.push_str(&serde_json::to_string(&line).unwrap());
-        body.push('\n');
+/// Seed `count` conversations (2 messages each) directly via raw SQL --
+/// bypassing the app's dual-write path entirely, so `lex_docs` starts
+/// empty regardless of `count`. This is the same real production
+/// staleness shape `CASS_DEFER_LEXICAL_UPDATES=1` produces (an
+/// interrupted-defer incident leaves messages ingested with no
+/// matching lex_docs rows); it's deliberately large enough to span
+/// many `CONVERSATIONS_PER_TX=200` rebuild batches so a concurrently
+/// running kill has a wide real window to land inside, not a
+/// coin-flip-timed one.
+fn seed_conversations_bypassing_dual_write(db_path: &std::path::Path, count: i64) {
+    let storage = FrankenStorage::open(db_path).expect("open seed db");
+    let conn = storage.raw();
+    conn.execute(
+        "INSERT OR IGNORE INTO agents(id, slug, name, version, kind, created_at, updated_at) \
+         VALUES(1, 'codex', 'Codex', '0.0.0', 'cli', 0, 0)",
+        &[],
+    )
+    .expect("seed agent");
+    conn.execute("BEGIN", &[]).expect("begin seed batch");
+    const INSERT_CONVERSATION_SQL: &str = "INSERT INTO conversations(
+            id, agent_id, source_id, external_id, title, source_path, started_at, ended_at
+         ) VALUES (?1, 1, 'local', ?2, ?3, ?4, ?5, ?6)";
+    const INSERT_MESSAGE_SQL: &str = "INSERT INTO messages(
+            id, conversation_id, idx, role, author, created_at, content
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)";
+    let now = 1_733_000_000_000_i64;
+    for conversation_id in 1..=count {
+        let started_at = now + conversation_id;
+        let external_id = format!("crash-window-{conversation_id}");
+        let title = format!("Crash window {conversation_id}");
+        let source_path = format!("/tmp/cass-crash-window/session-{conversation_id}.jsonl");
+        conn.execute(
+            INSERT_CONVERSATION_SQL,
+            &[
+                SqliteValue::from(conversation_id),
+                SqliteValue::from(external_id.as_str()),
+                SqliteValue::from(title.as_str()),
+                SqliteValue::from(source_path.as_str()),
+                SqliteValue::from(started_at),
+                SqliteValue::from(started_at + 1),
+            ],
+        )
+        .expect("seed conversation");
+        let first_message_id = conversation_id * 2 - 1;
+        conn.execute(
+            INSERT_MESSAGE_SQL,
+            &[
+                SqliteValue::from(first_message_id),
+                SqliteValue::from(conversation_id),
+                SqliteValue::from(0_i64),
+                SqliteValue::from("user"),
+                SqliteValue::from("user"),
+                SqliteValue::from(started_at),
+                SqliteValue::from(format!("crash window needle {conversation_id}")),
+            ],
+        )
+        .expect("seed user message");
+        conn.execute(
+            INSERT_MESSAGE_SQL,
+            &[
+                SqliteValue::from(first_message_id + 1),
+                SqliteValue::from(conversation_id),
+                SqliteValue::from(1_i64),
+                SqliteValue::from("assistant"),
+                SqliteValue::from("agent"),
+                SqliteValue::from(started_at + 1),
+                SqliteValue::from(format!("crash window response {conversation_id}")),
+            ],
+        )
+        .expect("seed assistant message");
     }
-    fs::write(sessions.join(actual_filename), body).unwrap();
+    conn.execute("COMMIT", &[]).expect("commit seed batch");
 }
 
-fn force_federated_publish_env(cmd: &mut Command) {
-    cmd.env("CASS_TANTIVY_REBUILD_WORKERS", "6");
-    cmd.env("CASS_TANTIVY_MAX_WRITER_THREADS", "2");
-    cmd.env("CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS", "1");
-    cmd.env(
-        "CASS_TANTIVY_REBUILD_INITIAL_BATCH_FETCH_CONVERSATIONS",
-        "1",
-    );
-    cmd.env("CASS_TANTIVY_REBUILD_COMMIT_EVERY_CONVERSATIONS", "1");
-    cmd.env(
-        "CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_CONVERSATIONS",
-        "1",
-    );
-    cmd.env("CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGES", "2");
-    cmd.env("CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_MESSAGES", "2");
-    cmd.env("CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGE_BYTES", "4096");
-    cmd.env(
-        "CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_MESSAGE_BYTES",
-        "4096",
-    );
+// W2-6 exec39: these two pollers use `rusqlite` directly (a plain,
+// read-only connection), NOT `FrankenStorage::open` -- the app's own
+// open path is lock-aware and deliberately BLOCKS/refuses a concurrent
+// open while `cass doctor --fix` holds its repair mutation lock
+// (`doctor/locks/doctor-repair.lock`), which is exactly the state this
+// test needs to poll through. A bare SQLite connection has no such
+// coordination and just reads whatever is currently committed.
+fn lex_domain_rebuild_marker(db_path: &std::path::Path) -> String {
+    let conn = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("open db for marker read");
+    conn.query_row(
+        &format!(
+            "SELECT value FROM meta WHERE key = '{}'",
+            LEX_DOMAIN_REBUILD_STATE_META_KEY
+        ),
+        [],
+        |row| row.get::<_, String>(0),
+    )
+    .unwrap_or_default()
 }
 
-#[test]
-fn concurrent_reader_never_sees_half_torn_lexical_index_during_publish_swap() {
-    let tmp = TempDir::new().unwrap();
-    let home = tmp.path().to_path_buf();
-    let codex_home = home.join(".codex");
-    let data_dir = home.join("cass_data");
-    fs::create_dir_all(&data_dir).unwrap();
-
-    // Phase A: seed one session, build the initial live index.
-    seed_codex_session(
-        &codex_home,
-        "2026/04/23",
-        "swap-before.jsonl",
-        1_714_000_000_000,
-        "alphabet",
-    );
-    cass_cmd(&home)
-        .args(["index", "--full", "--json", "--data-dir"])
-        .arg(&data_dir)
-        .assert()
-        .success();
-
-    let index_path = coding_agent_search::search::tantivy::index_dir(&data_dir)
-        .expect("resolve versioned tantivy index path");
-    let before = searchable_index_summary(&index_path)
-        .expect("initial summary readable")
-        .expect("initial index present");
-    let before_docs = before.docs;
-    assert!(
-        before_docs >= 1,
-        "precondition: live index has at least 1 doc"
-    );
-
-    // Phase B: concurrent reader polling tight loop until either the
-    // publish-triggering `cass index --full --force-rebuild` returns
-    // or the deadline lapses. We use `--force-rebuild` on the SAME
-    // seeded content so the invariant becomes "every reader
-    // observation sees the stable doc count, an Err, or a missing
-    // path — never a DIFFERENT positive doc count". This is a
-    // strictly stronger assertion than "doc count is one of two
-    // values" because any other positive count would be a torn
-    // intermediate state. Record every observation so assertions
-    // below can inspect the full history.
-    let stop = Arc::new(AtomicBool::new(false));
-    let reader_stop = Arc::clone(&stop);
-    let reader_index_path = index_path.clone();
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let reader = thread::spawn(move || {
-        let mut observations: Vec<Result<Option<SearchableIndexSummary>, String>> = Vec::new();
-        while !reader_stop.load(Ordering::Relaxed) && Instant::now() < deadline {
-            let obs = searchable_index_summary(&reader_index_path).map_err(|e| format!("{e:#}"));
-            observations.push(obs);
-            // Don't burn a full core — 1ms polling is enough to
-            // blanket any swap that takes >1ms, and every real
-            // publish does. Keeps the test from being CI-noisy.
-            thread::sleep(Duration::from_millis(1));
-        }
-        observations
-    });
-
-    // Phase C: trigger the rebuild + atomic-swap publish.
-    // `--force-rebuild` is the load-bearing flag: it forces the
-    // authoritative serial rebuild path to re-emit the staged index
-    // even when the canonical DB hasn't changed, which is exactly the
-    // atomic swap we want a concurrent reader to observe.
-    cass_cmd(&home)
-        .args(["index", "--full", "--force-rebuild", "--json", "--data-dir"])
-        .arg(&data_dir)
-        .assert()
-        .success();
-
-    stop.store(true, Ordering::Relaxed);
-    let observations = reader.join().expect("reader thread panicked");
-
-    let after = searchable_index_summary(&index_path)
-        .expect("post-publish summary readable")
-        .expect("post-publish index present");
-    assert_eq!(
-        after.docs, before_docs,
-        "--force-rebuild on unchanged content must produce the same doc count; \
-         any discrepancy here means the test's premise is off, not that the \
-         atomic-swap invariant was violated"
-    );
-
-    assert!(
-        !observations.is_empty(),
-        "reader must have collected at least one observation during the publish window"
-    );
-
-    // Invariant: every observation is one of:
-    //   - Ok(Some(stable doc count)) — the rebuild must not wipe the
-    //     live index. Bead 9ct8r's fix guards the pre-wipe behind a
-    //     `!will_use_atomic_staged_publish` check so the live index
-    //     stays intact until publish_staged_lexical_index atomically
-    //     swaps the new one in.
-    //   - Ok(None) — path briefly absent during non-Linux rename
-    //     fallback between park and swap.
-    //   - Err(_) — transient Tantivy open errors during a swap
-    //     (meta.json being renamed into place, etc.).
-    // Any other doc count — including `Ok(Some(0))` — would mean a
-    // reader observed a half-torn intermediate Tantivy state, which is
-    // exactly what the atomic-swap publish path exists to prevent. If
-    // this test starts failing with `Ok(Some(0))` observations, bead
-    // 9ct8r regressed: the staged-shards delegation stopped running
-    // (e.g., total_conversations dropped to 0 or the shard plan
-    // collapsed to a single shard), or a new non-atomic wipe snuck
-    // into the rebuild lifecycle.
-    for (i, obs) in observations.iter().enumerate() {
-        if let Ok(Some(summary)) = obs {
-            assert_eq!(
-                summary.docs,
-                before_docs,
-                "observation #{i} returned {docs} docs; expected the stable \
-                 count {before_docs}. An intermediate doc count means a \
-                 reader observed a half-torn Tantivy state — the atomic-swap \
-                 rebuild invariant from bead 9ct8r has regressed. total \
-                 observations = {total}",
-                docs = summary.docs,
-                total = observations.len()
-            );
-        }
-    }
+fn lex_docs_count(db_path: &std::path::Path) -> i64 {
+    let conn = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("open db for lex_docs count");
+    conn.query_row("SELECT COUNT(*) FROM lex_docs", [], |row| {
+        row.get::<_, i64>(0)
+    })
+    .unwrap_or(0)
 }
 
-#[test]
-fn concurrent_reader_never_sees_half_torn_federated_lexical_index_during_publish_swap() {
-    let tmp = TempDir::new().unwrap();
-    let home = tmp.path().to_path_buf();
-    let codex_home = home.join(".codex");
-    let data_dir = home.join("cass_data");
-    fs::create_dir_all(&data_dir).unwrap();
-
-    for (filename, ts_ms, keyword) in [
-        ("swap-fed-1.jsonl", 1_714_100_000_000_i64, "federated alpha"),
-        ("swap-fed-2.jsonl", 1_714_100_100_000_i64, "federated beta"),
-        ("swap-fed-3.jsonl", 1_714_100_200_000_i64, "federated gamma"),
-    ] {
-        seed_codex_session(&codex_home, "2026/04/23", filename, ts_ms, keyword);
-    }
-
-    let mut initial_index = cass_cmd(&home);
-    force_federated_publish_env(&mut initial_index);
-    initial_index
-        .args(["index", "--full", "--json", "--data-dir"])
-        .arg(&data_dir)
-        .assert()
-        .success();
-
-    let index_path = coding_agent_search::search::tantivy::index_dir(&data_dir)
-        .expect("resolve versioned tantivy index path");
-    let before = searchable_index_summary(&index_path)
-        .expect("initial federated summary readable")
-        .expect("initial federated index present");
-    let before_docs = before.docs;
-    assert!(
-        before_docs >= 3,
-        "precondition: live federated index should contain multiple docs"
-    );
-    let before_federated_readers = open_federated_search_readers(&index_path, ReloadPolicy::Manual)
-        .expect("load federated readers before rebuild")
-        .expect("federated manifest should exist before rebuild");
-    assert!(
-        before_federated_readers.len() > 1,
-        "forced shard planner settings should materialize a federated live index before rebuild"
-    );
-
-    let stop = Arc::new(AtomicBool::new(false));
-    let reader_stop = Arc::clone(&stop);
-    let reader_index_path = index_path.clone();
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let reader = thread::spawn(move || {
-        let mut observations: Vec<Result<Option<SearchableIndexSummary>, String>> = Vec::new();
-        while !reader_stop.load(Ordering::Relaxed) && Instant::now() < deadline {
-            let obs = searchable_index_summary(&reader_index_path).map_err(|e| format!("{e:#}"));
-            observations.push(obs);
-            thread::sleep(Duration::from_millis(1));
-        }
-        observations
-    });
-
-    let mut rebuild = cass_cmd(&home);
-    force_federated_publish_env(&mut rebuild);
-    rebuild
-        .args(["index", "--full", "--force-rebuild", "--json", "--data-dir"])
-        .arg(&data_dir)
-        .assert()
-        .success();
-
-    stop.store(true, Ordering::Relaxed);
-    let observations = reader.join().expect("reader thread panicked");
-
-    let after = searchable_index_summary(&index_path)
-        .expect("post-publish federated summary readable")
-        .expect("post-publish federated index present");
-    assert_eq!(
-        after.docs, before_docs,
-        "forced federated --force-rebuild on unchanged content must preserve the doc count"
-    );
-    let after_federated_readers = open_federated_search_readers(&index_path, ReloadPolicy::Manual)
-        .expect("load federated readers after rebuild")
-        .expect("federated manifest should still exist after rebuild");
-    assert!(
-        after_federated_readers.len() > 1,
-        "post-rebuild live index should remain a federated publish bundle"
-    );
-
-    assert!(
-        !observations.is_empty(),
-        "reader must collect observations during the federated publish window"
-    );
-    for (i, obs) in observations.iter().enumerate() {
-        if let Ok(Some(summary)) = obs {
-            assert_eq!(
-                summary.docs,
-                before_docs,
-                "federated observation #{i} returned {docs} docs; expected the stable count {before_docs}. \
-                 Any other readable doc count indicates a half-torn federated lexical publish surface",
-                docs = summary.docs
-            );
-        }
-    }
-}
-
-/// Bead coding_agent_session_search-mux5k:
-/// E2E regression proving that a SIGKILL during the atomic publish
-/// window (after swap, while the canonical sidecar is parked) is
-/// recovered cleanly on the next cass invocation.
-///
-/// Uses the `CASS_TEST_LEXICAL_PUBLISH_KILL_RELAUNCH_SENTINEL` env gate
-/// so we don't rely on race timing.
-#[cfg(target_os = "linux")]
+/// Bead coding_agent_session_search-mux5k, rewritten W2-6 exec39: a
+/// hard SIGKILL mid-rebuild leaves the lex-domain meta marker stuck at
+/// `building` with a partially-populated `lex_docs` table. The next
+/// ROUTINE `cass index` (not `--full`) must detect that stuck marker
+/// and rebuild the lex domain from the canonical DB to completion --
+/// this is `FrankenStorage::rebuild_lex_domain_from_db`'s own
+/// documented crash-recovery contract (src/storage/sqlite.rs:7070),
+/// verified against the real binary rather than assumed from the
+/// comment.
 #[test]
 fn kill_relaunch_recovers_lexical_publish_and_search_stays_stable() {
-    use std::process::{Command as StdCommand, Stdio};
-
     let tmp = TempDir::new().unwrap();
     let home = tmp.path().to_path_buf();
-    let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
-    let base_ts = 1_700_000_000_000i64;
-    seed_codex_session(
-        &codex_home,
-        "2023/11/14",
-        "s1.jsonl",
-        base_ts,
-        "killrelaunch",
+    // Phase A: bootstrap schema through the real CLI, then seed enough
+    // conversations directly (bypassing the dual-write path) that
+    // lex_docs starts at 0 with messages present -- the real
+    // production shape `index_sync`'s staleness check exists to catch,
+    // and enough of them that the batched rebuild spans dozens of
+    // `CONVERSATIONS_PER_TX` transactions instead of finishing before
+    // a concurrent kill can land inside it.
+    cass_cmd(&home)
+        .args(["index", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success();
+    let db_path = data_dir.join("agent_search.db");
+    const TOTAL_CONVERSATIONS: i64 = 20_000;
+    seed_conversations_bypassing_dual_write(&db_path, TOTAL_CONVERSATIONS);
+    assert_eq!(
+        lex_docs_count(&db_path),
+        0,
+        "precondition: seeded conversations must bypass lex_docs population entirely"
     );
 
-    // Phase 1: build the initial index so there's a live generation.
-    let mut cmd = cass_cmd(&home);
-    cmd.args(["index", "--full", "--json", "--data-dir"])
-        .arg(&data_dir);
-    force_federated_publish_env(&mut cmd);
-    cmd.assert().success();
-
-    let index_path = coding_agent_search::search::tantivy::index_dir(&data_dir)
-        .expect("resolve versioned tantivy index path");
-
-    // Confirm there IS a live index now.
-    let before_summary =
-        searchable_index_summary(&index_path).expect("summary before kill-relaunch");
-    assert!(
-        before_summary.is_some(),
-        "live index must exist before kill-relaunch test"
-    );
-    let _before_docs = before_summary.unwrap().docs;
-
-    // Phase 2: seed a second session so --force-rebuild builds a NEW index.
-    seed_codex_session(
-        &codex_home,
-        "2023/11/15",
-        "s2.jsonl",
-        base_ts + 86_400_000,
-        "killrelaunch extra",
-    );
-
-    // Prepare the sentinel path that the publish gate will write to.
-    let sentinel_path = data_dir.join("kill_relaunch_sentinel.json");
-
-    // Spawn cass index --full --force-rebuild with the pause sentinel.
+    // Phase B: trigger the real batched rebuild (`cass doctor --fix`
+    // drives `FrankenStorage::rebuild_lex_domain_from_db`) and poll
+    // until it is genuinely mid-flight (marker=="building" with a
+    // meaningful chunk of lex_docs already committed), then SIGKILL
+    // the whole process -- a hard crash, not a graceful shutdown.
     let cass_bin = assert_cmd::cargo::cargo_bin!("cass");
     let mut child = StdCommand::new(cass_bin)
         .current_dir(&home)
-        .args(["index", "--full", "--force-rebuild", "--json", "--data-dir"])
+        .args(["doctor", "--fix", "--json", "--data-dir"])
         .arg(&data_dir)
         .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
         .env("CASS_IGNORE_SOURCES_CONFIG", "1")
         .env("HOME", &home)
         .env("XDG_DATA_HOME", home.join(".local/share"))
         .env("XDG_CONFIG_HOME", home.join(".config"))
-        .env("CODEX_HOME", &codex_home)
-        .env(
-            "CASS_TEST_LEXICAL_PUBLISH_KILL_RELAUNCH_SENTINEL",
-            &sentinel_path,
-        )
-        .env("CASS_TEST_LEXICAL_PUBLISH_KILL_RELAUNCH_SLEEP_MS", "30000")
-        .env("CASS_TANTIVY_REBUILD_WORKERS", "6")
-        .env("CASS_TANTIVY_MAX_WRITER_THREADS", "2")
-        .env("CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS", "1")
-        .env(
-            "CASS_TANTIVY_REBUILD_INITIAL_BATCH_FETCH_CONVERSATIONS",
-            "1",
-        )
-        .env("CASS_TANTIVY_REBUILD_COMMIT_EVERY_CONVERSATIONS", "1")
-        .env(
-            "CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_CONVERSATIONS",
-            "1",
-        )
-        .env("CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGES", "2")
-        .env("CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_MESSAGES", "2")
-        .env("CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGE_BYTES", "4096")
-        .env(
-            "CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_MESSAGE_BYTES",
-            "4096",
-        )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn cass index for kill-relaunch");
+        .expect("spawn cass doctor --fix");
 
-    // Wait for the sentinel file to appear (process is paused inside publish).
-    let deadline = Instant::now() + Duration::from_secs(120);
-    while !sentinel_path.exists() {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut observed_mid_rebuild = false;
+    loop {
         assert!(
             Instant::now() < deadline,
-            "timed out waiting for kill-relaunch sentinel — cass may have exited before reaching the publish gate"
+            "timed out waiting for the rebuild to reach a genuinely mid-flight state \
+             (marker=building with partial lex_docs) before killing it"
         );
-        thread::sleep(Duration::from_millis(100));
+        let marker = lex_domain_rebuild_marker(&db_path);
+        let docs = lex_docs_count(&db_path);
+        if marker == "building" && docs > 0 && docs < TOTAL_CONVERSATIONS {
+            observed_mid_rebuild = true;
+            break;
+        }
+        match child.try_wait() {
+            Ok(Some(_)) => break, // finished before we could catch it mid-flight
+            Ok(None) => {}
+            Err(err) => panic!("failed to poll doctor --fix child: {err}"),
+        }
+        thread::sleep(Duration::from_millis(5));
     }
-
-    // Read the sentinel to verify structure and get PID.
-    let sentinel_raw = fs::read_to_string(&sentinel_path).expect("read sentinel JSON");
-    let sentinel: serde_json::Value =
-        serde_json::from_str(&sentinel_raw).expect("parse sentinel JSON");
-    assert_eq!(
-        sentinel["stage"].as_str(),
-        Some("linux_swap_committed_prior_live_parked"),
-        "sentinel stage must indicate the process paused after swap+park"
-    );
-    let pid = sentinel["pid"].as_u64().expect("sentinel must contain pid");
-    assert_eq!(
-        pid,
-        u64::from(child.id()),
-        "sentinel PID must match spawned child"
-    );
-
-    // Verify the canonical sidecar exists (OLD generation parked).
-    let canonical_sidecar = sentinel["canonical_sidecar_path"]
-        .as_str()
-        .expect("sentinel must contain canonical_sidecar_path");
     assert!(
-        std::path::Path::new(canonical_sidecar).exists(),
-        "canonical sidecar must exist while process is paused"
+        observed_mid_rebuild,
+        "rebuild finished before a mid-flight state could be observed and killed -- \
+         increase TOTAL_CONVERSATIONS so the batched rebuild spans a wider window"
     );
 
-    // SIGKILL the child — simulates a hard crash mid-publish.
-    child.kill().expect("SIGKILL child process");
-    let exit = child.wait().expect("wait for killed child");
+    child.kill().expect("SIGKILL doctor --fix mid-rebuild");
+    let exit = child.wait().expect("wait for killed doctor --fix");
     assert!(
         !exit.success(),
-        "killed process must exit with failure status"
+        "killed doctor --fix process must exit with failure status"
     );
 
-    // The canonical sidecar should still be on disk after the crash.
+    let marker_after_kill = lex_domain_rebuild_marker(&db_path);
+    let docs_after_kill = lex_docs_count(&db_path);
+    assert_eq!(
+        marker_after_kill, "building",
+        "a hard SIGKILL mid-rebuild must leave the marker stuck at building, not silently \
+         advance to completed -- if this fails, the kill landed after the atomic last-batch \
+         commit and the test caught the wrong window"
+    );
     assert!(
-        std::path::Path::new(canonical_sidecar).exists(),
-        "canonical sidecar must survive the SIGKILL"
+        docs_after_kill > 0 && docs_after_kill < TOTAL_CONVERSATIONS,
+        "post-kill lex_docs count ({docs_after_kill}) must be a genuine partial state, \
+         not zero (rebuild never started) or complete (kill missed the window)"
     );
 
-    // Phase 3: relaunch cass — recovery should finalize the interrupted backup.
-    let mut cmd = cass_cmd(&home);
-    cmd.args(["index", "--full", "--json", "--data-dir"])
-        .arg(&data_dir);
-    force_federated_publish_env(&mut cmd);
-    let relaunch_output = cmd.output().expect("relaunch cass index");
+    // Phase C: the real recovery path. Routine `cass index` (NOT
+    // `--full`) must detect the stuck `building` marker and rebuild
+    // the lex domain from the canonical DB to completion.
+    let recovery_output = cass_cmd(&home)
+        .args(["index", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .output()
+        .expect("run routine cass index for crash recovery");
     assert!(
-        relaunch_output.status.success(),
-        "relaunched cass index must succeed after crash recovery; stderr: {}",
-        String::from_utf8_lossy(&relaunch_output.stderr)
+        recovery_output.status.success(),
+        "routine cass index must succeed after crash recovery; stderr: {}",
+        String::from_utf8_lossy(&recovery_output.stderr)
+    );
+    let recovery_json: serde_json::Value = serde_json::from_slice(&recovery_output.stdout)
+        .unwrap_or_else(|err| {
+            panic!(
+                "routine cass index output must be valid JSON: {err}\nstdout: {}",
+                String::from_utf8_lossy(&recovery_output.stdout)
+            )
+        });
+    assert_eq!(
+        recovery_json["indexing_stats"]["lexical_strategy_reason"].as_str(),
+        Some("rebuild_incomplete_lex_domain_from_canonical_db"),
+        "routine cass index must recognize the stuck building marker and take the \
+         authoritative-DB-rebuild recovery path, not silently no-op; full payload: \
+         {recovery_json:#}"
     );
 
-    // After recovery: canonical sidecar should be gone (moved to retained backups).
-    assert!(
-        !std::path::Path::new(canonical_sidecar).exists(),
-        "canonical sidecar must be cleaned up after recovery"
+    // Phase D: three-way alignment -- the marker, the lex_docs row
+    // count, and the canonical conversation count must all agree.
+    let marker_after_recovery = lex_domain_rebuild_marker(&db_path);
+    let docs_after_recovery = lex_docs_count(&db_path);
+    assert_eq!(
+        marker_after_recovery,
+        format!("completed:{TOTAL_CONVERSATIONS}:{docs_after_recovery}"),
+        "marker must land on completed:<total_conversations>:<lex_docs_count> after recovery"
+    );
+    assert_eq!(
+        docs_after_recovery,
+        TOTAL_CONVERSATIONS * 2,
+        "lex_docs must cover every message (2 per conversation) after recovery, not just \
+         the conversations that happened to be present at kill time"
     );
 
-    // Search must still work and return results.
-    let mut search_cmd = cass_cmd(&home);
-    search_cmd
+    // Phase E: search must work and return real results, not the
+    // degraded/empty state a still-broken recovery would produce.
+    let search_output = cass_cmd(&home)
         .args([
             "search",
-            "killrelaunch",
+            "needle",
             "--json",
             "--mode",
             "lexical",
@@ -530,14 +357,14 @@ fn kill_relaunch_recovers_lexical_publish_and_search_stays_stable() {
             "5",
             "--data-dir",
         ])
-        .arg(&data_dir);
-    let search_output = search_cmd.output().expect("search after recovery");
+        .arg(&data_dir)
+        .output()
+        .expect("search after crash recovery");
     assert!(
         search_output.status.success(),
         "search after kill-relaunch recovery must succeed; stderr: {}",
         String::from_utf8_lossy(&search_output.stderr)
     );
-
     let search_json: serde_json::Value = serde_json::from_slice(&search_output.stdout)
         .unwrap_or_else(|_| {
             panic!(
@@ -545,12 +372,8 @@ fn kill_relaunch_recovers_lexical_publish_and_search_stays_stable() {
                 String::from_utf8_lossy(&search_output.stdout)
             )
         });
-    let results = search_json["results"]
-        .as_array()
-        .or_else(|| search_json["hits"].as_array())
-        .or_else(|| search_json.as_array());
     assert!(
-        results.is_some_and(|r| !r.is_empty()),
-        "search after recovery must return at least one result"
+        search_json["total_matches"].as_u64().unwrap_or(0) > 0,
+        "search after recovery must return at least one result; payload: {search_json:#}"
     );
 }

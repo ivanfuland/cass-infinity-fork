@@ -1,18 +1,36 @@
-//! Frankensqlite Compatibility Gate Tests
+//! Rusqlite Compatibility Gate Tests
 //!
-//! These tests verify that frankensqlite (pure-Rust SQLite) can handle the
-//! critical features cass depends on. This is a BLOCKING RISK GATE for the
-//! frankensqlite migration (Track 3).
+//! These tests verify that the crate's actual production storage backend --
+//! bundled rusqlite (vanilla SQLite) -- supports the critical features cass
+//! depends on: FTS5 full-text search (CREATE VIRTUAL TABLE, trigram/porter
+//! tokenizers, MATCH, highlight, bm25, rebuild/optimize commands) and core
+//! SQL (aggregates, joins, subqueries, NULL handling, LIKE).
 //!
-//! Gate 1: FTS5 full-text search (CREATE VIRTUAL TABLE, MATCH, highlight, etc.)
-//! Gate 2: Existing C SQLite database file compatibility (read rusqlite-created DBs)
-
-use frankensqlite::Connection;
-use frankensqlite::compat::RowExt;
-use fsqlite_types::value::SqliteValue;
-use std::fmt::Write as _;
-
-use coding_agent_search::storage::sqlite::{CURRENT_SCHEMA_VERSION, FrankenStorage, SqliteStorage};
+//! W2-6 Task己 (2026-09-01): rewritten off the `frankensqlite`/`fsqlite-types`
+//! dev-dependencies these tests originally pinned directly. Those crates
+//! gated frankensqlite's viability *before* it was evaluated as a storage
+//! engine candidate (w1b Stage A); Stage B adopted plain rusqlite instead and
+//! retired the franken backend from production entirely -- `FrankenStorage`
+//! and `SqliteStorage` are the same rusqlite-backed type today (`pub type
+//! SqliteStorage = FrankenStorage;`, see `storage::sqlite`). What these gates
+//! actually need to keep proving is "the backend cass ships (bundled
+//! rusqlite) can do X", which every FTS5/SQL gate below now asserts directly
+//! against `rusqlite::Connection`. Retired outright, not faked green:
+//! - Gate 2 (cross-engine file compat: write with one engine, read with the
+//!   other) has no rusqlite-only equivalent -- there is no second engine left
+//!   to be compatible *with*.
+//! - Gate 3 (`gate3_schema_parity_transitioned_db_matches_fresh_frankensqlite_db`,
+//!   already `#[ignore]`d) compared "create via `SqliteStorage` then reopen
+//!   via `FrankenStorage`" against "fresh via `FrankenStorage`" -- since
+//!   those are now literally the same type calling the same `open()`, the
+//!   test's entire "transition between two engines" premise is vacuous (it
+//!   would just be opening the same file twice with the same function).
+//! - `verify_begin_concurrent` exercised `BEGIN CONCURRENT`, frankensqlite's
+//!   proprietary MVCC multi-writer extension; vanilla SQLite has no such
+//!   statement, so there is nothing to rewrite it against.
+//! - `fsqlite_path_dependency_compile_contract` existed solely to pin the
+//!   frankensqlite crate's own public API surface (import/open/params!/Row);
+//!   with the dependency gone there is no surface left to pin.
 
 #[test]
 fn rusqlite_is_bundled() {
@@ -52,55 +70,66 @@ fn rusqlite_is_bundled() {
 
 #[test]
 fn gate1_fts5_create_virtual_table() {
-    let conn = Connection::open(":memory:").expect("in-memory connection");
-    conn.execute("CREATE VIRTUAL TABLE test_fts USING fts5(content)")
+    let conn = rusqlite::Connection::open_in_memory().expect("in-memory connection");
+    conn.execute_batch("CREATE VIRTUAL TABLE test_fts USING fts5(content)")
         .expect("GATE 1.1 FAIL: Cannot create FTS5 virtual table");
 }
 
 #[test]
 fn gate1_fts5_create_with_trigram_tokenizer() {
-    let conn = Connection::open(":memory:").expect("in-memory connection");
+    let conn = rusqlite::Connection::open_in_memory().expect("in-memory connection");
     // Trigram tokenizer is critical for cass substring search
-    conn.execute("CREATE VIRTUAL TABLE test_fts USING fts5(content, tokenize='trigram')")
+    conn.execute_batch("CREATE VIRTUAL TABLE test_fts USING fts5(content, tokenize='trigram')")
         .expect("GATE 1.1b FAIL: Cannot create FTS5 table with trigram tokenizer");
 }
 
 #[test]
 fn gate1_fts5_create_with_porter_tokenizer() {
-    let conn = Connection::open(":memory:").expect("in-memory connection");
-    conn.execute("CREATE VIRTUAL TABLE test_fts USING fts5(content, tokenize='porter')")
+    let conn = rusqlite::Connection::open_in_memory().expect("in-memory connection");
+    conn.execute_batch("CREATE VIRTUAL TABLE test_fts USING fts5(content, tokenize='porter')")
         .expect("GATE 1.1c FAIL: Cannot create FTS5 table with porter tokenizer");
 }
 
 #[test]
 fn gate1_fts5_insert() {
-    let conn = Connection::open(":memory:").expect("in-memory connection");
-    conn.execute("CREATE VIRTUAL TABLE test_fts USING fts5(content)")
+    let conn = rusqlite::Connection::open_in_memory().expect("in-memory connection");
+    conn.execute_batch("CREATE VIRTUAL TABLE test_fts USING fts5(content)")
         .unwrap();
 
-    conn.execute("INSERT INTO test_fts(content) VALUES ('hello world')")
+    conn.execute("INSERT INTO test_fts(content) VALUES ('hello world')", [])
         .expect("GATE 1.2 FAIL: Cannot insert into FTS5 table");
-    conn.execute("INSERT INTO test_fts(content) VALUES ('rust programming language')")
-        .expect("GATE 1.2 FAIL: Cannot insert second row");
-    conn.execute("INSERT INTO test_fts(content) VALUES ('hello rust developers')")
-        .expect("GATE 1.2 FAIL: Cannot insert third row");
+    conn.execute(
+        "INSERT INTO test_fts(content) VALUES ('rust programming language')",
+        [],
+    )
+    .expect("GATE 1.2 FAIL: Cannot insert second row");
+    conn.execute(
+        "INSERT INTO test_fts(content) VALUES ('hello rust developers')",
+        [],
+    )
+    .expect("GATE 1.2 FAIL: Cannot insert third row");
 }
 
 #[test]
 fn gate1_fts5_match_query() {
-    let conn = Connection::open(":memory:").expect("in-memory connection");
-    conn.execute("CREATE VIRTUAL TABLE test_fts USING fts5(content)")
+    let conn = rusqlite::Connection::open_in_memory().expect("in-memory connection");
+    conn.execute_batch("CREATE VIRTUAL TABLE test_fts USING fts5(content)")
         .unwrap();
-    conn.execute("INSERT INTO test_fts(content) VALUES ('hello world')")
+    conn.execute("INSERT INTO test_fts(content) VALUES ('hello world')", [])
         .unwrap();
-    conn.execute("INSERT INTO test_fts(content) VALUES ('goodbye world')")
+    conn.execute("INSERT INTO test_fts(content) VALUES ('goodbye world')", [])
         .unwrap();
-    conn.execute("INSERT INTO test_fts(content) VALUES ('hello rust')")
+    conn.execute("INSERT INTO test_fts(content) VALUES ('hello rust')", [])
         .unwrap();
 
-    let rows = conn
-        .query("SELECT content FROM test_fts WHERE test_fts MATCH 'hello'")
+    let mut stmt = conn
+        .prepare("SELECT content FROM test_fts WHERE test_fts MATCH 'hello'")
         .expect("GATE 1.3 FAIL: FTS5 MATCH query failed");
+    let rows: Vec<String> = stmt
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
 
     assert_eq!(
         rows.len(),
@@ -112,20 +141,28 @@ fn gate1_fts5_match_query() {
 
 #[test]
 fn gate1_fts5_trigram_substring_match() {
-    let conn = Connection::open(":memory:").expect("in-memory connection");
-    conn.execute("CREATE VIRTUAL TABLE test_fts USING fts5(content, tokenize='trigram')")
+    let conn = rusqlite::Connection::open_in_memory().expect("in-memory connection");
+    conn.execute_batch("CREATE VIRTUAL TABLE test_fts USING fts5(content, tokenize='trigram')")
         .unwrap();
-    conn.execute("INSERT INTO test_fts(content) VALUES ('hello world')")
+    conn.execute("INSERT INTO test_fts(content) VALUES ('hello world')", [])
         .unwrap();
-    conn.execute("INSERT INTO test_fts(content) VALUES ('say hello there')")
-        .unwrap();
-    conn.execute("INSERT INTO test_fts(content) VALUES ('nothing here')")
+    conn.execute(
+        "INSERT INTO test_fts(content) VALUES ('say hello there')",
+        [],
+    )
+    .unwrap();
+    conn.execute("INSERT INTO test_fts(content) VALUES ('nothing here')", [])
         .unwrap();
 
     // Trigram search for substring 'llo' should match rows containing 'hello'
-    let rows = conn
-        .query("SELECT content FROM test_fts WHERE test_fts MATCH 'llo'")
+    let mut stmt = conn
+        .prepare("SELECT content FROM test_fts WHERE test_fts MATCH 'llo'")
         .expect("GATE 1.3b FAIL: Trigram substring search failed");
+    let rows: Vec<String> = stmt
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
 
     assert_eq!(
         rows.len(),
@@ -137,20 +174,28 @@ fn gate1_fts5_trigram_substring_match() {
 
 #[test]
 fn gate1_fts5_prefix_match() {
-    let conn = Connection::open(":memory:").expect("in-memory connection");
-    conn.execute("CREATE VIRTUAL TABLE test_fts USING fts5(content)")
+    let conn = rusqlite::Connection::open_in_memory().expect("in-memory connection");
+    conn.execute_batch("CREATE VIRTUAL TABLE test_fts USING fts5(content)")
         .unwrap();
-    conn.execute("INSERT INTO test_fts(content) VALUES ('authentication error')")
+    conn.execute(
+        "INSERT INTO test_fts(content) VALUES ('authentication error')",
+        [],
+    )
+    .unwrap();
+    conn.execute("INSERT INTO test_fts(content) VALUES ('authorize user')", [])
         .unwrap();
-    conn.execute("INSERT INTO test_fts(content) VALUES ('authorize user')")
-        .unwrap();
-    conn.execute("INSERT INTO test_fts(content) VALUES ('something else')")
+    conn.execute("INSERT INTO test_fts(content) VALUES ('something else')", [])
         .unwrap();
 
     // Prefix match with *
-    let rows = conn
-        .query("SELECT content FROM test_fts WHERE test_fts MATCH 'auth*'")
+    let mut stmt = conn
+        .prepare("SELECT content FROM test_fts WHERE test_fts MATCH 'auth*'")
         .expect("GATE 1.4 FAIL: FTS5 prefix matching failed");
+    let rows: Vec<String> = stmt
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
 
     assert_eq!(
         rows.len(),
@@ -162,72 +207,80 @@ fn gate1_fts5_prefix_match() {
 
 #[test]
 fn gate1_fts5_highlight_function() {
-    let conn = Connection::open(":memory:").expect("in-memory connection");
-    conn.execute("CREATE VIRTUAL TABLE test_fts USING fts5(content)")
+    let conn = rusqlite::Connection::open_in_memory().expect("in-memory connection");
+    conn.execute_batch("CREATE VIRTUAL TABLE test_fts USING fts5(content)")
         .unwrap();
-    conn.execute("INSERT INTO test_fts(content) VALUES ('hello world')")
+    conn.execute("INSERT INTO test_fts(content) VALUES ('hello world')", [])
         .unwrap();
 
-    let rows = conn
-        .query(
+    let mut stmt = conn
+        .prepare(
             "SELECT highlight(test_fts, 0, '<b>', '</b>') FROM test_fts WHERE test_fts MATCH 'hello'",
         )
         .expect("GATE 1.5 FAIL: FTS5 highlight() function failed");
+    let rows: Vec<String> = stmt
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
 
     assert_eq!(rows.len(), 1, "GATE 1.5 FAIL: Expected 1 highlighted row");
-    let val = rows[0].get(0).expect("column 0");
-    if let SqliteValue::Text(s) = val {
-        assert!(
-            s.contains("<b>hello</b>"),
-            "GATE 1.5 FAIL: highlight() should wrap 'hello' in <b> tags, got: {s}"
-        );
-    } else {
-        panic!("GATE 1.5 FAIL: highlight() should return text, got: {val:?}");
-    }
+    assert!(
+        rows[0].contains("<b>hello</b>"),
+        "GATE 1.5 FAIL: highlight() should wrap 'hello' in <b> tags, got: {}",
+        rows[0]
+    );
 }
 
 #[test]
 fn gate1_fts5_rebuild_command() {
-    let conn = Connection::open(":memory:").expect("in-memory connection");
-    conn.execute("CREATE VIRTUAL TABLE test_fts USING fts5(content)")
+    let conn = rusqlite::Connection::open_in_memory().expect("in-memory connection");
+    conn.execute_batch("CREATE VIRTUAL TABLE test_fts USING fts5(content)")
         .unwrap();
-    conn.execute("INSERT INTO test_fts(content) VALUES ('test data')")
+    conn.execute("INSERT INTO test_fts(content) VALUES ('test data')", [])
         .unwrap();
 
-    conn.execute("INSERT INTO test_fts(test_fts) VALUES('rebuild')")
+    conn.execute("INSERT INTO test_fts(test_fts) VALUES('rebuild')", [])
         .expect("GATE 1.6 FAIL: FTS5 rebuild command failed");
 }
 
 #[test]
 fn gate1_fts5_optimize_command() {
-    let conn = Connection::open(":memory:").expect("in-memory connection");
-    conn.execute("CREATE VIRTUAL TABLE test_fts USING fts5(content)")
+    let conn = rusqlite::Connection::open_in_memory().expect("in-memory connection");
+    conn.execute_batch("CREATE VIRTUAL TABLE test_fts USING fts5(content)")
         .unwrap();
-    conn.execute("INSERT INTO test_fts(content) VALUES ('optimize me')")
+    conn.execute("INSERT INTO test_fts(content) VALUES ('optimize me')", [])
         .unwrap();
 
-    conn.execute("INSERT INTO test_fts(test_fts) VALUES('optimize')")
+    conn.execute("INSERT INTO test_fts(test_fts) VALUES('optimize')", [])
         .expect("GATE 1.6b FAIL: FTS5 optimize command failed");
 }
 
 #[test]
 fn gate1_fts5_multi_column() {
-    let conn = Connection::open(":memory:").expect("in-memory connection");
-    conn.execute("CREATE VIRTUAL TABLE test_fts USING fts5(title, body)")
+    let conn = rusqlite::Connection::open_in_memory().expect("in-memory connection");
+    conn.execute_batch("CREATE VIRTUAL TABLE test_fts USING fts5(title, body)")
         .unwrap();
     conn.execute(
         "INSERT INTO test_fts(title, body) VALUES ('Rust Guide', 'Learn systems programming')",
+        [],
     )
     .unwrap();
     conn.execute(
         "INSERT INTO test_fts(title, body) VALUES ('Python Intro', 'Learn dynamic programming')",
+        [],
     )
     .unwrap();
 
     // Search in body column only
-    let rows = conn
-        .query("SELECT title FROM test_fts WHERE test_fts MATCH 'body:systems'")
+    let mut stmt = conn
+        .prepare("SELECT title FROM test_fts WHERE test_fts MATCH 'body:systems'")
         .expect("GATE 1.7 FAIL: Multi-column FTS5 column filter failed");
+    let rows: Vec<String> = stmt
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
 
     assert_eq!(
         rows.len(),
@@ -238,49 +291,57 @@ fn gate1_fts5_multi_column() {
 
 #[test]
 fn gate1_fts5_bm25_rank_function() {
-    let conn = Connection::open(":memory:").expect("in-memory connection");
-    conn.execute("CREATE VIRTUAL TABLE test_fts USING fts5(content)")
+    let conn = rusqlite::Connection::open_in_memory().expect("in-memory connection");
+    conn.execute_batch("CREATE VIRTUAL TABLE test_fts USING fts5(content)")
         .unwrap();
-    conn.execute("INSERT INTO test_fts(content) VALUES ('rust rust rust')") // high relevance
+    conn.execute("INSERT INTO test_fts(content) VALUES ('rust rust rust')", []) // high relevance
         .unwrap();
-    conn.execute("INSERT INTO test_fts(content) VALUES ('hello rust')") // low relevance
+    conn.execute("INSERT INTO test_fts(content) VALUES ('hello rust')", []) // low relevance
         .unwrap();
 
     // cass ranks FTS fallback queries through explicit bm25(table) calls. The
     // SQLite hidden `rank` column is useful compatibility coverage, but it is
     // not part of cass's required query surface.
-    let rows = conn
-        .query(
+    let mut stmt = conn
+        .prepare(
             "SELECT content, bm25(test_fts) AS rank \
              FROM test_fts WHERE test_fts MATCH 'rust' ORDER BY rank",
         )
         .expect("GATE 1.8 FAIL: FTS5 bm25 rank function failed");
+    let rows: Vec<(String, f64)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
 
     assert_eq!(rows.len(), 2, "GATE 1.8 FAIL: Expected 2 ranked results");
     // rank is a negative BM25 score (more negative = better match)
-    let rank0 = rows[0].get(1).expect("rank col");
-    let rank1 = rows[1].get(1).expect("rank col");
-    if let (SqliteValue::Float(r0), SqliteValue::Float(r1)) = (rank0, rank1) {
-        assert!(
-            r0 <= r1,
-            "GATE 1.8 FAIL: rank should be ordered (more negative first), got {r0} vs {r1}"
-        );
-    }
+    assert!(
+        rows[0].1 <= rows[1].1,
+        "GATE 1.8 FAIL: rank should be ordered (more negative first), got {} vs {}",
+        rows[0].1,
+        rows[1].1
+    );
 }
 
 #[test]
 fn gate1_fts5_within_transaction() {
-    let conn = Connection::open(":memory:").expect("in-memory connection");
-    conn.execute("CREATE VIRTUAL TABLE test_fts USING fts5(content)")
+    let conn = rusqlite::Connection::open_in_memory().expect("in-memory connection");
+    conn.execute_batch("CREATE VIRTUAL TABLE test_fts USING fts5(content)")
         .unwrap();
 
-    conn.execute("BEGIN").unwrap();
-    conn.execute("INSERT INTO test_fts(content) VALUES ('in transaction')")
+    conn.execute_batch("BEGIN").unwrap();
+    conn.execute("INSERT INTO test_fts(content) VALUES ('in transaction')", [])
         .expect("GATE 1.9 FAIL: FTS5 insert within transaction failed");
-    conn.execute("COMMIT").unwrap();
+    conn.execute_batch("COMMIT").unwrap();
 
-    let rows = conn
-        .query("SELECT content FROM test_fts WHERE test_fts MATCH 'transaction'")
+    let mut stmt = conn
+        .prepare("SELECT content FROM test_fts WHERE test_fts MATCH 'transaction'")
+        .unwrap();
+    let rows: Vec<String> = stmt
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
     assert_eq!(
         rows.len(),
@@ -291,88 +352,96 @@ fn gate1_fts5_within_transaction() {
 
 #[test]
 fn gate1_fts5_transaction_rollback() {
-    let conn = Connection::open(":memory:").expect("in-memory connection");
-    conn.execute("CREATE VIRTUAL TABLE test_fts USING fts5(content)")
+    let conn = rusqlite::Connection::open_in_memory().expect("in-memory connection");
+    conn.execute_batch("CREATE VIRTUAL TABLE test_fts USING fts5(content)")
         .unwrap();
 
-    conn.execute("BEGIN").unwrap();
-    conn.execute("INSERT INTO test_fts(content) VALUES ('will be rolled back')")
-        .unwrap();
-    conn.execute("ROLLBACK").unwrap();
+    conn.execute_batch("BEGIN").unwrap();
+    conn.execute(
+        "INSERT INTO test_fts(content) VALUES ('will be rolled back')",
+        [],
+    )
+    .unwrap();
+    conn.execute_batch("ROLLBACK").unwrap();
 
-    let rows = conn.query("SELECT COUNT(*) FROM test_fts").unwrap();
-    let count = rows[0].get(0).unwrap();
-    assert_eq!(
-        count,
-        &SqliteValue::Integer(0),
-        "GATE 1.9b FAIL: FTS5 data visible after rollback"
-    );
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM test_fts", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 0, "GATE 1.9b FAIL: FTS5 data visible after rollback");
 }
 
 #[test]
 fn gate1_fts5_multiple_tables_coexist() {
-    let conn = Connection::open(":memory:").expect("in-memory connection");
-    conn.execute("CREATE VIRTUAL TABLE fts_a USING fts5(content)")
+    let conn = rusqlite::Connection::open_in_memory().expect("in-memory connection");
+    conn.execute_batch("CREATE VIRTUAL TABLE fts_a USING fts5(content)")
         .unwrap();
-    conn.execute("CREATE VIRTUAL TABLE fts_b USING fts5(content)")
-        .unwrap();
-
-    conn.execute("INSERT INTO fts_a(content) VALUES ('alpha search')")
-        .unwrap();
-    conn.execute("INSERT INTO fts_b(content) VALUES ('beta search')")
+    conn.execute_batch("CREATE VIRTUAL TABLE fts_b USING fts5(content)")
         .unwrap();
 
-    let rows_a = conn
-        .query("SELECT content FROM fts_a WHERE fts_a MATCH 'alpha'")
+    conn.execute("INSERT INTO fts_a(content) VALUES ('alpha search')", [])
         .unwrap();
-    let rows_b = conn
-        .query("SELECT content FROM fts_b WHERE fts_b MATCH 'beta'")
+    conn.execute("INSERT INTO fts_b(content) VALUES ('beta search')", [])
+        .unwrap();
+
+    let rows_a: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM fts_a WHERE fts_a MATCH 'alpha'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let rows_b: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM fts_b WHERE fts_b MATCH 'beta'",
+            [],
+            |row| row.get(0),
+        )
         .unwrap();
 
     assert_eq!(
-        rows_a.len(),
-        1,
+        rows_a, 1,
         "GATE 1.10 FAIL: Multiple FTS5 tables - first table query failed"
     );
     assert_eq!(
-        rows_b.len(),
-        1,
+        rows_b, 1,
         "GATE 1.10 FAIL: Multiple FTS5 tables - second table query failed"
     );
 }
 
 #[test]
 fn gate1_fts5_bulk_insert_performance() {
-    let conn = Connection::open(":memory:").expect("in-memory connection");
-    conn.execute("CREATE VIRTUAL TABLE perf_fts USING fts5(content)")
+    let conn = rusqlite::Connection::open_in_memory().expect("in-memory connection");
+    conn.execute_batch("CREATE VIRTUAL TABLE perf_fts USING fts5(content)")
         .unwrap();
 
     // Insert 1000 rows
-    conn.execute("BEGIN").unwrap();
+    conn.execute_batch("BEGIN").unwrap();
     for i in 0..1000 {
-        conn.execute_with_params(
+        conn.execute(
             "INSERT INTO perf_fts(content) VALUES (?1)",
-            &[SqliteValue::Text(
-                format!("document number {i} with searchable content about rust programming")
-                    .into(),
+            rusqlite::params![format!(
+                "document number {i} with searchable content about rust programming"
             )],
         )
         .unwrap();
     }
-    conn.execute("COMMIT").unwrap();
+    conn.execute_batch("COMMIT").unwrap();
 
     // Verify count
-    let rows = conn.query("SELECT COUNT(*) FROM perf_fts").unwrap();
-    assert_eq!(
-        rows[0].get(0).unwrap(),
-        &SqliteValue::Integer(1000),
-        "GATE 1.11 FAIL: Bulk insert count mismatch"
-    );
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM perf_fts", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 1000, "GATE 1.11 FAIL: Bulk insert count mismatch");
 
     // Search should work on bulk data
-    let results = conn
-        .query("SELECT content FROM perf_fts WHERE perf_fts MATCH 'rust' LIMIT 5")
+    let mut stmt = conn
+        .prepare("SELECT content FROM perf_fts WHERE perf_fts MATCH 'rust' LIMIT 5")
         .expect("GATE 1.11 FAIL: Search on 1000-row FTS5 table failed");
+    let results: Vec<String> = stmt
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
 
     assert!(
         !results.is_empty(),
@@ -381,666 +450,125 @@ fn gate1_fts5_bulk_insert_performance() {
 }
 
 // ============================================================================
-// GATE 2: Existing C SQLite Database File Compatibility
-// ============================================================================
-
-#[test]
-fn gate2_file_compat_create_with_rusqlite_read_with_frankensqlite() {
-    let dir = tempfile::TempDir::new().expect("temp dir");
-    let db_path = dir.path().join("test_compat.db");
-
-    // Step 1: Create database with rusqlite (C SQLite)
-    {
-        let conn = rusqlite::Connection::open(&db_path).expect("rusqlite open for write");
-        conn.execute_batch(
-            "
-            PRAGMA journal_mode=WAL;
-            PRAGMA user_version=12;
-            CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                agent TEXT NOT NULL,
-                workspace TEXT,
-                created_at INTEGER NOT NULL,
-                content TEXT
-            );
-        ",
-        )
-        .expect("rusqlite schema creation");
-
-        // Insert test data
-        for i in 0..10 {
-            conn.execute(
-                "INSERT INTO conversations (id, agent, workspace, created_at, content) VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![
-                    i,
-                    format!("agent_{}", i % 3),
-                    format!("/workspace/{}", i),
-                    1700000000 + i * 1000,
-                    format!("conversation content for session {i}")
-                ],
-            ).expect("rusqlite insert");
-        }
-    }
-
-    // Step 2: Open with frankensqlite and verify
-    let conn = Connection::open(db_path.to_str().unwrap())
-        .expect("GATE 2.1 FAIL: frankensqlite cannot open rusqlite-created database");
-
-    // Verify row count
-    let rows = conn
-        .query("SELECT COUNT(*) FROM conversations")
-        .expect("GATE 2.2 FAIL: frankensqlite cannot query rusqlite-created table");
-
-    assert_eq!(
-        rows[0].get(0).unwrap(),
-        &SqliteValue::Integer(10),
-        "GATE 2.2 FAIL: Row count mismatch"
-    );
-
-    // Verify data integrity
-    let rows = conn
-        .query("SELECT id, agent, workspace, created_at, content FROM conversations ORDER BY id")
-        .expect("GATE 2.3 FAIL: Cannot read all columns");
-
-    assert_eq!(rows.len(), 10, "GATE 2.3 FAIL: Expected 10 rows");
-
-    // Verify first row
-    let first = &rows[0];
-    assert_eq!(
-        first.get(0).unwrap(),
-        &SqliteValue::Integer(0),
-        "GATE 2.3 FAIL: First row id mismatch"
-    );
-    assert_eq!(
-        first.get(1).unwrap(),
-        &SqliteValue::Text("agent_0".into()),
-        "GATE 2.3 FAIL: First row agent mismatch"
-    );
-}
-
-#[test]
-fn gate2_file_compat_pragma_user_version() {
-    let dir = tempfile::TempDir::new().expect("temp dir");
-    let db_path = dir.path().join("test_pragma.db");
-
-    // Create with rusqlite, set user_version
-    {
-        let conn = rusqlite::Connection::open(&db_path).expect("rusqlite open");
-        conn.execute_batch("PRAGMA user_version=12;").unwrap();
-        conn.execute_batch("CREATE TABLE t(x);").unwrap();
-    }
-
-    // Read with frankensqlite
-    let conn = Connection::open(db_path.to_str().unwrap())
-        .expect("GATE 2.4 FAIL: Cannot open for PRAGMA check");
-
-    let rows = conn
-        .query("PRAGMA user_version")
-        .expect("GATE 2.4 FAIL: Cannot read PRAGMA user_version");
-
-    let version = rows[0].get(0).expect("version column");
-    assert_eq!(
-        version,
-        &SqliteValue::Integer(12),
-        "GATE 2.4 FAIL: PRAGMA user_version should be 12, got {version:?}"
-    );
-}
-
-#[test]
-fn gate2_file_compat_wal_mode() {
-    let dir = tempfile::TempDir::new().expect("temp dir");
-    let db_path = dir.path().join("test_wal.db");
-
-    // Create WAL-mode database with rusqlite
-    {
-        let conn = rusqlite::Connection::open(&db_path).expect("rusqlite open");
-        conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
-        conn.execute_batch("CREATE TABLE data(id INTEGER PRIMARY KEY, val TEXT);")
-            .unwrap();
-        conn.execute("INSERT INTO data VALUES (1, 'wal test')", [])
-            .unwrap();
-    }
-
-    // Verify WAL files exist
-    let wal_path = db_path.with_extension("db-wal");
-    let shm_path = db_path.with_extension("db-shm");
-
-    // Open with frankensqlite (should handle WAL mode)
-    let conn = Connection::open(db_path.to_str().unwrap())
-        .expect("GATE 2.5 FAIL: Cannot open WAL-mode database");
-
-    let rows = conn
-        .query("SELECT val FROM data WHERE id = 1")
-        .expect("GATE 2.5 FAIL: Cannot query WAL-mode database");
-
-    assert_eq!(rows.len(), 1, "GATE 2.5 FAIL: Expected 1 row from WAL DB");
-    assert_eq!(
-        rows[0].get(0).unwrap(),
-        &SqliteValue::Text("wal test".into()),
-        "GATE 2.5 FAIL: WAL data mismatch"
-    );
-
-    // Log WAL file presence for diagnostics
-    eprintln!(
-        "  WAL file exists: {}, SHM file exists: {}",
-        wal_path.exists(),
-        shm_path.exists()
-    );
-}
-
-#[test]
-fn gate2_file_compat_filtered_query() {
-    let dir = tempfile::TempDir::new().expect("temp dir");
-    let db_path = dir.path().join("test_filter.db");
-
-    // Create with rusqlite
-    {
-        let conn = rusqlite::Connection::open(&db_path).expect("rusqlite open");
-        conn.execute_batch("CREATE TABLE msgs(id INTEGER PRIMARY KEY, agent TEXT, content TEXT);")
-            .unwrap();
-        conn.execute(
-            "INSERT INTO msgs VALUES (1, 'claude', 'hello from claude')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO msgs VALUES (2, 'codex', 'hello from codex')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO msgs VALUES (3, 'claude', 'another claude msg')",
-            [],
-        )
-        .unwrap();
-    }
-
-    // Query with frankensqlite using parameter binding
-    let conn = Connection::open(db_path.to_str().unwrap())
-        .expect("GATE 2.6 FAIL: Cannot open for filtered query");
-
-    let rows = conn
-        .query_with_params(
-            "SELECT id, content FROM msgs WHERE agent = ?1",
-            &[SqliteValue::Text("claude".into())],
-        )
-        .expect("GATE 2.6 FAIL: Parameterized query on rusqlite DB failed");
-
-    assert_eq!(
-        rows.len(),
-        2,
-        "GATE 2.6 FAIL: Expected 2 claude rows, got {}",
-        rows.len()
-    );
-}
-
-#[test]
-fn gate2_file_compat_write_back() {
-    let dir = tempfile::TempDir::new().expect("temp dir");
-    let db_path = dir.path().join("test_writeback.db");
-
-    // Create with rusqlite
-    {
-        let conn = rusqlite::Connection::open(&db_path).expect("rusqlite open");
-        conn.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT);")
-            .unwrap();
-        conn.execute("INSERT INTO t VALUES (1, 'original')", [])
-            .unwrap();
-    }
-
-    // Write with frankensqlite
-    {
-        let conn = Connection::open(db_path.to_str().unwrap())
-            .expect("GATE 2.7 FAIL: Cannot open for write-back");
-        conn.execute_with_params(
-            "INSERT INTO t VALUES (?1, ?2)",
-            &[
-                SqliteValue::Integer(2),
-                SqliteValue::Text("from frankensqlite".into()),
-            ],
-        )
-        .expect("GATE 2.7 FAIL: Cannot write to rusqlite-created DB");
-    }
-
-    // Verify with rusqlite that the write persisted
-    {
-        let conn = rusqlite::Connection::open(&db_path).expect("rusqlite reopen");
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(
-            count, 2,
-            "GATE 2.7 FAIL: Write from frankensqlite not visible to rusqlite"
-        );
-    }
-}
-
-#[test]
-fn gate2_file_compat_cass_schema_simulation() {
-    let dir = tempfile::TempDir::new().expect("temp dir");
-    let db_path = dir.path().join("test_cass_schema.db");
-
-    // Create a simplified cass-like schema with rusqlite
-    {
-        let conn = rusqlite::Connection::open(&db_path).expect("rusqlite open");
-        conn.execute_batch(
-            "
-            PRAGMA journal_mode=WAL;
-            PRAGMA user_version=12;
-
-            CREATE TABLE conversations (
-                id TEXT PRIMARY KEY,
-                agent TEXT NOT NULL,
-                workspace TEXT,
-                project_dir TEXT,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER,
-                model TEXT,
-                title TEXT,
-                message_count INTEGER DEFAULT 0,
-                source_id TEXT DEFAULT 'local'
-            );
-
-            CREATE TABLE messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                conversation_id TEXT NOT NULL REFERENCES conversations(id),
-                role TEXT NOT NULL,
-                content TEXT,
-                timestamp INTEGER,
-                token_count INTEGER DEFAULT 0
-            );
-
-            CREATE INDEX idx_conv_agent ON conversations(agent);
-            CREATE INDEX idx_conv_created ON conversations(created_at);
-            CREATE INDEX idx_msg_conv ON messages(conversation_id);
-        ",
-        )
-        .expect("cass schema creation");
-
-        // Insert realistic test data
-        conn.execute(
-            "INSERT INTO conversations VALUES ('sess-001', 'claude_code', '/home/user/project', '/home/user/project', 1700000000, 1700001000, 'claude-3-opus', 'Debug auth flow', 5, 'local')",
-            [],
-        ).unwrap();
-        conn.execute(
-            "INSERT INTO messages VALUES (1, 'sess-001', 'user', 'Why is my auth failing?', 1700000000, 42)",
-            [],
-        ).unwrap();
-        conn.execute(
-            "INSERT INTO messages VALUES (2, 'sess-001', 'assistant', 'Let me check the auth middleware...', 1700000100, 150)",
-            [],
-        ).unwrap();
-    }
-
-    // Verify full schema compatibility with frankensqlite
-    let conn = Connection::open(db_path.to_str().unwrap())
-        .expect("GATE 2.8 FAIL: Cannot open cass-like schema");
-
-    // Read conversations
-    let convs = conn
-        .query("SELECT id, agent, workspace, created_at, title FROM conversations")
-        .expect("GATE 2.8 FAIL: Cannot read conversations table");
-    assert_eq!(convs.len(), 1);
-    assert_eq!(
-        convs[0].get(1).unwrap(),
-        &SqliteValue::Text("claude_code".into())
-    );
-
-    // Read messages with join
-    let msgs = conn
-        .query(
-            "SELECT m.role, m.content, c.agent FROM messages m JOIN conversations c ON m.conversation_id = c.id ORDER BY m.id",
-        )
-        .expect("GATE 2.8 FAIL: JOIN query on cass schema failed");
-    assert_eq!(msgs.len(), 2);
-    assert_eq!(msgs[0].get(0).unwrap(), &SqliteValue::Text("user".into()));
-
-    // Verify PRAGMA user_version
-    let ver = conn.query("PRAGMA user_version").unwrap();
-    assert_eq!(
-        ver[0].get(0).unwrap(),
-        &SqliteValue::Integer(12),
-        "GATE 2.8 FAIL: Schema version mismatch"
-    );
-}
-
-// ============================================================================
-// GATE 3: FrankenStorage Migration/Schema Parity
-// ============================================================================
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TableInfoRow {
-    cid: i64,
-    name: String,
-    col_type: String,
-    not_null: i64,
-    default_value: Option<String>,
-    pk: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct IndexListRow {
-    name: String,
-    is_unique: i64,
-    origin: String,
-    is_partial: i64,
-}
-
-fn quoted_sql_literal(input: &str) -> String {
-    let mut out = String::with_capacity(input.len() + 2);
-    out.push('\'');
-    for c in input.chars() {
-        if c == '\'' {
-            out.push('\'');
-            out.push('\'');
-        } else {
-            out.push(c);
-        }
-    }
-    out.push('\'');
-    out
-}
-
-fn schema_tables(conn: &rusqlite::Connection) -> Vec<String> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT name
-             FROM sqlite_master
-             WHERE type='table'
-               AND name NOT LIKE 'sqlite_%'
-               AND name NOT LIKE 'fts_messages_%'
-             ORDER BY name",
-        )
-        .expect("prepare table listing");
-
-    let rows = stmt
-        .query_map([], |row| row.get::<_, String>(0))
-        .expect("query table listing");
-
-    rows.collect::<Result<Vec<_>, _>>()
-        .expect("collect table listing")
-}
-
-fn table_info(conn: &rusqlite::Connection, table_name: &str) -> Vec<TableInfoRow> {
-    let mut sql = String::new();
-    let _ = write!(
-        &mut sql,
-        "PRAGMA table_info({})",
-        quoted_sql_literal(table_name)
-    );
-
-    let mut stmt = conn.prepare(&sql).expect("prepare PRAGMA table_info");
-    let rows = stmt
-        .query_map([], |row| {
-            Ok(TableInfoRow {
-                cid: row.get(0)?,
-                name: row.get(1)?,
-                col_type: row.get(2)?,
-                not_null: row.get(3)?,
-                default_value: row.get(4)?,
-                pk: row.get(5)?,
-            })
-        })
-        .expect("query PRAGMA table_info");
-
-    rows.collect::<Result<Vec<_>, _>>()
-        .expect("collect PRAGMA table_info")
-}
-
-fn index_list(conn: &rusqlite::Connection, table_name: &str) -> Vec<IndexListRow> {
-    let mut sql = String::new();
-    let _ = write!(
-        &mut sql,
-        "PRAGMA index_list({})",
-        quoted_sql_literal(table_name)
-    );
-
-    let mut stmt = conn.prepare(&sql).expect("prepare PRAGMA index_list");
-    let rows = stmt
-        .query_map([], |row| {
-            Ok(IndexListRow {
-                name: row.get(1)?,
-                is_unique: row.get(2)?,
-                origin: row.get(3)?,
-                is_partial: row.get(4)?,
-            })
-        })
-        .expect("query PRAGMA index_list");
-
-    let mut values = rows
-        .collect::<Result<Vec<_>, _>>()
-        .expect("collect PRAGMA index_list");
-    values.sort();
-    values
-}
-
-// w1b Task B9 (2026-08-27, control-plane ruling): retired
-// gate3_migration_transition_from_rusqlite_meta_to_schema_migrations. The
-// meta->_schema_migrations transition/backfill machinery it guarded was
-// franken's incremental migration engine, which no longer exists after the
-// rusqlite swap -- there is nothing left to fabricate a "transition" for.
-// Ensuring the ledger contains an invented backfill history for a
-// rebuild-not-convert database would forge provenance (see
-// w1b-b4-deleted-tests.md for the full ruling text). See that ledger's
-// closed-world entry for this retirement.
-
-#[test]
-#[ignore = "Blocked by upstream frankensqlite sqlite_master/autoindex inconsistency on fresh migration path"]
-fn gate3_schema_parity_transitioned_db_matches_fresh_frankensqlite_db() {
-    let dir = tempfile::TempDir::new().expect("temp dir");
-    let db_a_path = dir.path().join("db_a_rusqlite_then_transition.db");
-    let db_b_path = dir.path().join("db_b_fresh_frankensqlite.db");
-
-    // DB-A: create with rusqlite-backed cass storage, then transition via FrankenStorage.
-    {
-        let storage = SqliteStorage::open(&db_a_path).expect("create db-a with SqliteStorage");
-        assert_eq!(
-            storage.schema_version().expect("db-a schema version"),
-            CURRENT_SCHEMA_VERSION
-        );
-    }
-    {
-        let storage =
-            FrankenStorage::open(&db_a_path).expect("transition db-a with FrankenStorage");
-        assert_eq!(
-            storage
-                .schema_version()
-                .expect("db-a franken schema version"),
-            CURRENT_SCHEMA_VERSION
-        );
-    }
-
-    // DB-B: fresh frankensqlite migration path.
-    {
-        let storage = FrankenStorage::open(&db_b_path).expect("create db-b with FrankenStorage");
-        assert_eq!(
-            storage.schema_version().expect("db-b schema version"),
-            CURRENT_SCHEMA_VERSION
-        );
-    }
-
-    let conn_a = rusqlite::Connection::open(&db_a_path).expect("open db-a with rusqlite");
-    let conn_b = rusqlite::Connection::open(&db_b_path).expect("open db-b with rusqlite");
-
-    let tables_a = schema_tables(&conn_a);
-    let tables_b = schema_tables(&conn_b);
-    assert_eq!(
-        tables_a, tables_b,
-        "table sets differ between transitioned and fresh frankensqlite databases"
-    );
-
-    for table in &tables_a {
-        let cols_a = table_info(&conn_a, table);
-        let cols_b = table_info(&conn_b, table);
-        assert_eq!(
-            cols_a, cols_b,
-            "PRAGMA table_info mismatch for table {table}"
-        );
-
-        let idx_a = index_list(&conn_a, table);
-        let idx_b = index_list(&conn_b, table);
-        assert_eq!(idx_a, idx_b, "PRAGMA index_list mismatch for table {table}");
-    }
-}
-
-// ============================================================================
 // Additional Verification: Features cass relies on
 // ============================================================================
 
 #[test]
 fn verify_count_aggregate() {
-    let conn = Connection::open(":memory:").expect("in-memory connection");
-    conn.execute("CREATE TABLE t(x INTEGER)").unwrap();
-    conn.execute("INSERT INTO t VALUES (1)").unwrap();
-    conn.execute("INSERT INTO t VALUES (2)").unwrap();
-    conn.execute("INSERT INTO t VALUES (3)").unwrap();
+    let conn = rusqlite::Connection::open_in_memory().expect("in-memory connection");
+    conn.execute_batch("CREATE TABLE t(x INTEGER)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)", []).unwrap();
+    conn.execute("INSERT INTO t VALUES (2)", []).unwrap();
+    conn.execute("INSERT INTO t VALUES (3)", []).unwrap();
 
-    let rows = conn.query("SELECT COUNT(*) FROM t").unwrap();
-    assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(3));
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 3);
 }
 
 #[test]
 fn verify_group_by_and_order_by() {
-    let conn = Connection::open(":memory:").expect("in-memory connection");
-    conn.execute("CREATE TABLE t(agent TEXT, cnt INTEGER)")
+    let conn = rusqlite::Connection::open_in_memory().expect("in-memory connection");
+    conn.execute_batch("CREATE TABLE t(agent TEXT, cnt INTEGER)")
         .unwrap();
-    conn.execute("INSERT INTO t VALUES ('claude', 1)").unwrap();
-    conn.execute("INSERT INTO t VALUES ('codex', 1)").unwrap();
-    conn.execute("INSERT INTO t VALUES ('claude', 1)").unwrap();
+    conn.execute("INSERT INTO t VALUES ('claude', 1)", []).unwrap();
+    conn.execute("INSERT INTO t VALUES ('codex', 1)", []).unwrap();
+    conn.execute("INSERT INTO t VALUES ('claude', 1)", []).unwrap();
 
-    let rows = conn
-        .query("SELECT agent, SUM(cnt) as total FROM t GROUP BY agent ORDER BY total DESC")
+    let mut stmt = conn
+        .prepare("SELECT agent, SUM(cnt) as total FROM t GROUP BY agent ORDER BY total DESC")
+        .unwrap();
+    let rows: Vec<(String, i64)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
 
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Text("claude".into()));
-    assert_eq!(rows[0].get(1).unwrap(), &SqliteValue::Integer(2));
+    assert_eq!(rows[0].0, "claude");
+    assert_eq!(rows[0].1, 2);
 }
 
 #[test]
 fn verify_nullable_columns() {
-    let conn = Connection::open(":memory:").expect("in-memory connection");
-    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
+    let conn = rusqlite::Connection::open_in_memory().expect("in-memory connection");
+    conn.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
         .unwrap();
-    conn.execute_with_params(
+    conn.execute(
         "INSERT INTO t VALUES (?1, ?2)",
-        &[SqliteValue::Integer(1), SqliteValue::Null],
+        rusqlite::params![1_i64, Option::<String>::None],
     )
     .unwrap();
 
-    let rows = conn.query("SELECT val FROM t WHERE id = 1").unwrap();
-    assert_eq!(
-        rows[0].get(0).unwrap(),
-        &SqliteValue::Null,
-        "NULL column should return Null variant"
-    );
+    let val: Option<String> = conn
+        .query_row("SELECT val FROM t WHERE id = 1", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(val, None, "NULL column should return None");
 
     // IS NULL comparison
-    let null_rows = conn.query("SELECT id FROM t WHERE val IS NULL").unwrap();
-    assert_eq!(null_rows.len(), 1, "IS NULL should find 1 row");
+    let null_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM t WHERE val IS NULL", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(null_count, 1, "IS NULL should find 1 row");
 }
 
 #[test]
 fn verify_like_operator() {
-    let conn = Connection::open(":memory:").expect("in-memory connection");
-    conn.execute("CREATE TABLE t(name TEXT)").unwrap();
-    conn.execute("INSERT INTO t VALUES ('authentication')")
+    let conn = rusqlite::Connection::open_in_memory().expect("in-memory connection");
+    conn.execute_batch("CREATE TABLE t(name TEXT)").unwrap();
+    conn.execute("INSERT INTO t VALUES ('authentication')", [])
         .unwrap();
-    conn.execute("INSERT INTO t VALUES ('authorization')")
+    conn.execute("INSERT INTO t VALUES ('authorization')", [])
         .unwrap();
-    conn.execute("INSERT INTO t VALUES ('other')").unwrap();
+    conn.execute("INSERT INTO t VALUES ('other')", []).unwrap();
 
-    let rows = conn
-        .query("SELECT name FROM t WHERE name LIKE 'auth%'")
+    let mut stmt = conn
+        .prepare("SELECT name FROM t WHERE name LIKE 'auth%'")
+        .unwrap();
+    let rows: Vec<String> = stmt
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
     assert_eq!(rows.len(), 2, "LIKE 'auth%' should match 2 rows");
 }
 
 #[test]
 fn verify_subquery() {
-    let conn = Connection::open(":memory:").expect("in-memory connection");
-    conn.execute("CREATE TABLE t(id INTEGER, val INTEGER)")
+    let conn = rusqlite::Connection::open_in_memory().expect("in-memory connection");
+    conn.execute_batch("CREATE TABLE t(id INTEGER, val INTEGER)")
         .unwrap();
-    conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
-    conn.execute("INSERT INTO t VALUES (2, 20)").unwrap();
-    conn.execute("INSERT INTO t VALUES (3, 30)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10)", []).unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 20)", []).unwrap();
+    conn.execute("INSERT INTO t VALUES (3, 30)", []).unwrap();
 
-    let rows = conn
-        .query("SELECT id FROM t WHERE val > (SELECT AVG(val) FROM t)")
+    let mut stmt = conn
+        .prepare("SELECT id FROM t WHERE val > (SELECT AVG(val) FROM t)")
+        .unwrap();
+    let rows: Vec<i64> = stmt
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
     assert_eq!(rows.len(), 1, "Subquery should find 1 row above average");
-    assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(3));
+    assert_eq!(rows[0], 3);
 }
 
 #[test]
 fn verify_coalesce_and_ifnull() {
-    let conn = Connection::open(":memory:").expect("in-memory connection");
-    let rows = conn
-        .query("SELECT COALESCE(NULL, NULL, 'fallback')")
+    let conn = rusqlite::Connection::open_in_memory().expect("in-memory connection");
+    let fallback: String = conn
+        .query_row("SELECT COALESCE(NULL, NULL, 'fallback')", [], |row| {
+            row.get(0)
+        })
         .unwrap();
-    assert_eq!(
-        rows[0].get(0).unwrap(),
-        &SqliteValue::Text("fallback".into())
-    );
+    assert_eq!(fallback, "fallback");
 
-    let rows = conn.query("SELECT IFNULL(NULL, 'default')").unwrap();
-    assert_eq!(
-        rows[0].get(0).unwrap(),
-        &SqliteValue::Text("default".into())
-    );
-}
-
-#[test]
-fn verify_begin_concurrent() {
-    let conn = Connection::open(":memory:").expect("in-memory connection");
-    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
+    let default: String = conn
+        .query_row("SELECT IFNULL(NULL, 'default')", [], |row| row.get(0))
         .unwrap();
-
-    // BEGIN CONCURRENT is frankensqlite's MVCC multi-writer mode
-    conn.execute("BEGIN CONCURRENT").unwrap();
-    conn.execute("INSERT INTO t VALUES (1, 'concurrent')")
-        .unwrap();
-    conn.execute("COMMIT").unwrap();
-
-    let rows = conn.query("SELECT val FROM t WHERE id = 1").unwrap();
-    assert_eq!(
-        rows[0].get(0).unwrap(),
-        &SqliteValue::Text("concurrent".into()),
-        "BEGIN CONCURRENT transaction should persist data"
-    );
-}
-
-// ============================================================================
-// Sibling API compile contract (fsqlite part; plan delta d6, 2026-08-25)
-// ============================================================================
-//
-// Relocated here from `tests/upgrade/compatibility.rs::test_path_dependency_compile_contracts`,
-// which originally locked the public API surface of six sibling crates in one
-// function. Only the frankensqlite-specific quarter (import/open/params!/Row)
-// is a compat-gate concern -- this file is the designated home for tests that
-// deliberately bypass the api facade and pin the raw frankensqlite crate
-// surface, and is slated for wave 2 disposition as a unit. The other five
-// sibling contracts (asupersync/franken_agent_detection/frankensearch/ftui/
-// toon) stay in compatibility.rs -- they don't reference frankensqlite, are
-// long-lived dependencies rather than a migration-scoped engine, and
-// shouldn't ride along with this file's wave-2 retirement.
-
-#[test]
-fn fsqlite_path_dependency_compile_contract() {
-    use frankensqlite::compat::ConnectionExt;
-
-    let conn = frankensqlite::Connection::open(":memory:").expect("open frankensqlite memory db");
-    conn.execute("CREATE TABLE contract_check (value INTEGER)")
-        .expect("create contract table");
-    let _params_contract = frankensqlite::params![7_i64];
-    conn.execute("INSERT INTO contract_check(value) VALUES (7)")
-        .expect("insert contract row");
-    let value: i64 = conn
-        .query_row_map(
-            "SELECT value FROM contract_check",
-            &[],
-            |row: &frankensqlite::Row| row.get_typed(0),
-        )
-        .expect("query contract row");
-    assert_eq!(value, 7);
+    assert_eq!(default, "default");
 }

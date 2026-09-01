@@ -240,7 +240,7 @@ fn doctor_e2e_default_registry_covers_read_only_no_mutation_matrix() {
         ),
         (
             "derived-index-corrupt-read-only",
-            DoctorFixtureScenario::IndexCorrupt,
+            DoctorFixtureScenario::DerivedLexicalDesyncBlindSpot,
             "corrupt derived index",
         ),
         (
@@ -314,7 +314,7 @@ fn doctor_e2e_default_registry_covers_safe_auto_journey_matrix() {
         ),
         (
             "safe-auto-stale-derived-metadata-rebuild",
-            DoctorFixtureScenario::IndexCorrupt,
+            DoctorFixtureScenario::DerivedLexicalDesyncBlindSpot,
             "stale or corrupt derived metadata",
         ),
         (
@@ -401,7 +401,7 @@ fn doctor_e2e_default_registry_covers_borrowed_sibling_safety_matrix() {
         (
             "read-only derived-index corruption",
             "derived-index-corrupt-read-only",
-            DoctorFixtureScenario::IndexCorrupt,
+            DoctorFixtureScenario::DerivedLexicalDesyncBlindSpot,
             DoctorE2eCommandMode::Check,
             false,
             "derived",
@@ -854,7 +854,20 @@ fn doctor_e2e_runner_proves_semantic_fallback_does_not_touch_archive_or_network(
     );
 }
 
+// W2-6 exec39: ignored, not deleted -- cascade-masked latent finding,
+// same fixture-pathology family as DbCorruptWithStaleIndex's old
+// junk-file problem but out of this round's scope (PartiallyIndexed
+// scenario, not one of doctor_fixture.rs's 4 compile-error lines).
+// PartiallyIndexed writes `diagnostics/partial-index.fixture`, which no
+// production doctor check reads; its `expected_anomalies` string
+// "partially-indexed" has zero hits in src/lib.rs and is not in the
+// DoctorAnomaly enum. See w2-6-deleted-tests.md "PartiallyIndexed场景死
+// fixture案" for the full disposition and the item1-level argument this
+// scenario still needs (does "partial index" even survive as a concept
+// under FTS5's binary index_sync check?). Ledger entry is the account of
+// record; do not un-ignore without resolving that argument first.
 #[test]
+#[ignore = "w2-6-deleted-tests.md: PartiallyIndexed场景死fixture案 (control-plane 2026-08-31 ruling)"]
 fn doctor_e2e_runner_proves_safe_auto_allows_derived_and_skips_archive_risk() {
     let temp = tempfile::TempDir::new().expect("tempdir");
     let runner = DoctorE2eRunner::new(temp.path().join("run")).expect("runner");

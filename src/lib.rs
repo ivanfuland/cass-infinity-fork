@@ -8456,16 +8456,20 @@ async fn execute_cli(
                         )?;
                         return Ok(());
                     }
-                    // #285: `cass doctor --rebuild-canonical-fts --yes` — drop
-                    // and rebuild the canonical FTS5 shadow tables in place.
+                    // W2-6 Task戊: `cass doctor --rebuild-canonical-fts` rebuilt
+                    // the in-DB `fts_messages` shadow, which this task DROPs
+                    // entirely -- there is no longer anything for this flag to
+                    // rebuild. Kept parseable (rather than an "unknown flag"
+                    // error) so a user with an old script gets an explicit
+                    // retirement message instead of a confusing parse failure.
                     if rebuild_canonical_fts {
-                        doctor_recover::run_doctor_rebuild_canonical_fts(
-                            data_dir,
-                            cli.db.clone(),
-                            yes,
-                            structured_format,
-                        )?;
-                        return Ok(());
+                        return Err(CliError {
+                            code: 4,
+                            kind: "refused-unsafe",
+                            message: "`cass doctor --rebuild-canonical-fts` has been retired: the in-DB fts_messages shadow it rebuilt no longer exists (search runs entirely on the fts_lex/lex_docs index).".to_string(),
+                            hint: Some("No action needed for fts_messages -- to rebuild the current fts_lex/lex_docs index instead, run 'cass index --full'.".to_string()),
+                            retryable: false,
+                        });
                     }
                     // #285: `cass doctor --cleanup-interrupted-artifacts --yes`
                     // — quarantine interrupted raw_mirror_capture artifacts.
@@ -9309,14 +9313,10 @@ fn run_forget_command(
             retryable: false,
         })?;
 
-    // After an actual deletion, rebuild derived assets so search/analytics stay
-    // consistent (mirrors the agent-purge path). The lexical index also
-    // self-heals on next search, but rebuilding FTS now keeps DB-resident
-    // surfaces correct.
+    // After an actual deletion, rebuild derived assets so analytics stay
+    // consistent (mirrors the agent-purge path). The lexical index
+    // self-heals on next search.
     if apply && report.conversations_deleted > 0 {
-        if let Err(e) = storage.rebuild_fts() {
-            tracing::warn!(error = %e, "forget: failed to rebuild FTS after deletion");
-        }
         if let Err(e) = storage.rebuild_analytics() {
             tracing::warn!(error = %e, "forget: failed to rebuild analytics after deletion");
         }
@@ -17055,11 +17055,6 @@ fn open_franken_cli_read_db(
                         "Failed to open {reason} database at {}: readonly storage open failed ({err}); raw readonly open failed ({raw_readonly_err})",
                         path.display()
                     );
-                    if let Some(fts_err) =
-                        crate::storage::sqlite::fts_messages_integrity_error_from_message(&message)
-                    {
-                        return Err(fts_messages_integrity_cli_error(reason, fts_err.into()));
-                    }
                     return Err(CliError {
                         code: 9,
                         kind: CliErrorKind::DbOpen.kind_str(),
@@ -17191,24 +17186,6 @@ fn close_franken_cli_read_db(
         conn.close_best_effort_in_place();
     }
     Ok(())
-}
-
-fn fts_messages_integrity_cli_error(surface: &str, err: anyhow::Error) -> CliError {
-    CliError {
-        code: 5,
-        kind: CliErrorKind::Storage.kind_str(),
-        message: format!("{surface} cannot continue: {err:#}"),
-        hint: Some(crate::storage::sqlite::FTS_MESSAGES_CORRUPTION_RECOVERY_HINT.to_string()),
-        retryable: false,
-    }
-}
-
-fn validate_fts_messages_integrity_for_cli(
-    conn: &FrankenConnection,
-    surface: &str,
-) -> CliResult<()> {
-    crate::storage::sqlite::validate_fts_messages_integrity_for_connection(conn)
-        .map_err(|err| fts_messages_integrity_cli_error(surface, err))
 }
 
 fn franken_query_row_map_retry<T, F>(
@@ -18320,10 +18297,6 @@ pub(crate) fn path_identities_match(lhs: &Path, rhs: &Path) -> bool {
     normalize_path_identity(lhs) == normalize_path_identity(rhs)
 }
 
-pub(crate) fn stored_path_identity_matches(saved: &str, current: &Path) -> bool {
-    path_identities_match(Path::new(saved), current)
-}
-
 fn read_index_run_lock_snapshot(
     data_dir: &Path,
 ) -> crate::search::asset_state::SearchMaintenanceSnapshot {
@@ -18373,6 +18346,42 @@ fn error_chain_indicates_orphan_fk_cleanup_blocked(chain: &str) -> bool {
 
 fn error_chain_indicates_archive_health_blocked(chain: &str) -> bool {
     chain.contains("will not replace or truncate the SQLite source of truth")
+}
+
+// W2-6 exec41 (Task戊): `SearchClient::search` reports these when
+// `lex_docs` is empty and the self-heal ahead of it
+// (`ensure_lexical_assets_for_search`) either didn't run or didn't leave a
+// populated index -- an honest structured error, in place of the retired
+// silent fallback to the stale `fts_messages` legacy table.
+fn error_chain_indicates_lexical_index_building(chain: &str) -> bool {
+    chain.contains("lexical index unavailable for search") && chain.contains("state=building")
+}
+
+fn error_chain_indicates_lexical_index_absent(chain: &str) -> bool {
+    chain.contains("lexical index unavailable for search") && chain.contains("state=absent")
+}
+
+fn search_lexical_index_building_cli_error(chain: &str) -> CliError {
+    CliError {
+        code: 7,
+        kind: CliErrorKind::IndexBusy.kind_str(),
+        message: format!("search failed: {chain}"),
+        hint: Some(
+            "A lexical rebuild is currently in progress. Retry shortly, or run 'cass index' and wait for it to finish."
+                .to_string(),
+        ),
+        retryable: true,
+    }
+}
+
+fn search_lexical_index_absent_cli_error(chain: &str) -> CliError {
+    CliError {
+        code: 3,
+        kind: CliErrorKind::MissingIndex.kind_str(),
+        message: format!("search failed: {chain}"),
+        hint: Some("Run 'cass index --full' to build the lexical index.".to_string()),
+        retryable: true,
+    }
 }
 
 fn index_storage_contention_cli_error(chain: &str) -> CliError {
@@ -18488,9 +18497,8 @@ fn cli_error_json_payload(err: &CliError, elapsed_ms: u128) -> serde_json::Value
 }
 
 fn cass_lexical_index_initialized(data_dir: &Path) -> bool {
-    crate::search::tantivy::searchable_index_exists(&crate::search::tantivy::expected_index_dir(
-        data_dir,
-    ))
+    // W2-6 Task1: reseated onto the lex_docs/fts_lex SQLite domain.
+    crate::search::lexical_index_health::searchable_index_exists(&data_dir.join("agent_search.db"))
 }
 
 fn cass_not_initialized(
@@ -18785,10 +18793,13 @@ fn state_meta_json_inner(
     let counts_skipped = db_snapshot.counts_skipped;
     let open_skipped = db_snapshot.open_skipped;
 
-    let index_path = crate::search::tantivy::expected_index_dir(data_dir);
-    let lexical_index_initialized = crate::search::tantivy::searchable_index_exists(&index_path);
+    let index_path = crate::indexer::expected_index_dir(data_dir);
+    // W2-6 Task1: reseated onto the lex_docs/fts_lex SQLite domain (db_path);
+    // index_path is still needed below for the generation-manifest doc-count
+    // lookup (lexical_manifest_indexed_doc_count).
+    let lexical_index_initialized = crate::search::lexical_index_health::searchable_index_exists(db_path);
     if last_indexed_at.is_none() && lexical_index_initialized {
-        last_indexed_at = crate::search::tantivy::searchable_index_modified_time(&index_path)
+        last_indexed_at = crate::search::lexical_index_health::searchable_index_modified_time(db_path)
             .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_millis() as i64);
     }
@@ -18940,13 +18951,6 @@ fn state_meta_json_inner(
     } else {
         crate::indexer::lexical_rebuild_pipeline_settings_snapshot()
     };
-    let lexical_rebuild_pipeline_runtime = if lexical.rebuilding {
-        crate::indexer::load_active_lexical_rebuild_pipeline_runtime(&index_path, db_path)
-            .ok()
-            .flatten()
-    } else {
-        None
-    };
     let mut lexical_rebuild_pipeline_json =
         serde_json::to_value(&lexical_rebuild_pipeline).unwrap_or(serde_json::Value::Null);
     if let serde_json::Value::Object(ref mut pipeline) = lexical_rebuild_pipeline_json {
@@ -18970,67 +18974,16 @@ fn state_meta_json_inner(
                 .map(serde_json::Value::from)
                 .unwrap_or(serde_json::Value::Null),
         );
-        let runtime_value = lexical_rebuild_pipeline_runtime
-            .map(|runtime| {
-                let queue_capacity = lexical_rebuild_pipeline.pipeline_channel_size;
-                let inflight_message_bytes_limit = if runtime.max_message_bytes_in_flight > 0 {
-                    runtime.max_message_bytes_in_flight
-                } else {
-                    lexical_rebuild_pipeline.pipeline_max_message_bytes_in_flight.max(1)
-                };
-                serde_json::json!({
-                    "queue_depth": runtime.queue_depth,
-                    "queue_capacity": queue_capacity,
-                    "queue_headroom": queue_capacity.saturating_sub(runtime.queue_depth),
-                    "inflight_message_bytes": runtime.inflight_message_bytes,
-                    "max_message_bytes_in_flight": inflight_message_bytes_limit,
-                    "inflight_message_bytes_headroom": inflight_message_bytes_limit
-                        .saturating_sub(runtime.inflight_message_bytes),
-                    "pending_batch_conversations": runtime.pending_batch_conversations,
-                    "pending_batch_message_bytes": runtime.pending_batch_message_bytes,
-                    "page_prep_workers": runtime.page_prep_workers,
-                    "active_page_prep_jobs": runtime.active_page_prep_jobs,
-                    "ordered_buffered_pages": runtime.ordered_buffered_pages,
-                    "budget_generation": runtime.budget_generation,
-                    "producer_budget_wait_count": runtime.producer_budget_wait_count,
-                    "producer_budget_wait_ms": runtime.producer_budget_wait_ms,
-                    "producer_handoff_wait_count": runtime.producer_handoff_wait_count,
-                    "producer_handoff_wait_ms": runtime.producer_handoff_wait_ms,
-                    "host_loadavg_1m": runtime.host_loadavg_1m_milli.map(|value| f64::from(value) / 1000.0),
-                    "controller_mode": if runtime.controller_mode.is_empty() {
-                        serde_json::Value::Null
-                    } else {
-                        serde_json::json!(runtime.controller_mode)
-                    },
-                    "controller_reason": if runtime.controller_reason.is_empty() {
-                        serde_json::Value::Null
-                    } else {
-                        serde_json::json!(runtime.controller_reason)
-                    },
-                    "staged_merge_workers_max": runtime.staged_merge_workers_max,
-                    "staged_merge_allowed_jobs": runtime.staged_merge_allowed_jobs,
-                    "staged_merge_active_jobs": runtime.staged_merge_active_jobs,
-                    "staged_merge_ready_artifacts": runtime.staged_merge_ready_artifacts,
-                    "staged_merge_ready_groups": runtime.staged_merge_ready_groups,
-                    "staged_merge_controller_reason": if runtime.staged_merge_controller_reason.is_empty() {
-                        serde_json::Value::Null
-                    } else {
-                        serde_json::json!(runtime.staged_merge_controller_reason)
-                    },
-                    "staged_shard_build_workers_max": runtime.staged_shard_build_workers_max,
-                    "staged_shard_build_allowed_jobs": runtime.staged_shard_build_allowed_jobs,
-                    "staged_shard_build_active_jobs": runtime.staged_shard_build_active_jobs,
-                    "staged_shard_build_pending_jobs": runtime.staged_shard_build_pending_jobs,
-                    "staged_shard_build_controller_reason": if runtime.staged_shard_build_controller_reason.is_empty() {
-                        serde_json::Value::Null
-                    } else {
-                        serde_json::json!(runtime.staged_shard_build_controller_reason)
-                    },
-                    "updated_at": format_timestamp_millis_rfc3339(runtime.updated_at_ms),
-                })
-            })
-            .unwrap_or(serde_json::Value::Null);
-        pipeline.insert("runtime".to_string(), runtime_value);
+        // W2-6 Task B (reader②, control-plane 2026-08-30 ruling): the
+        // shard-build pipeline that used to populate this field's live
+        // telemetry is retired along with tantivy, and `state_meta_json_inner`
+        // is a cross-process disk-introspection call (backs `cass status`/
+        // `cass health`) with no way to read another process's in-memory
+        // `IndexingProgress` -- there is no live source left for this field,
+        // so it always reports null now (JSON shape kept for existing
+        // consumers, same "no DB-domain equivalent -> None" precedent as the
+        // W2-6 Task1 asset-state reseat).
+        pipeline.insert("runtime".to_string(), serde_json::Value::Null);
     }
     let semantic_policy = crate::search::policy::SemanticPolicy::resolve(
         &crate::search::policy::CliSemanticOverrides::default(),
@@ -19049,17 +19002,16 @@ fn state_meta_json_inner(
         serde_json::to_value(&ingest_quarantine_summary).unwrap_or(serde_json::Value::Null);
 
     // Probe the live lexical document count when the DB has messages. Prefer
-    // the published generation manifest: status only needs the durable count
-    // for stale/empty diagnostics, while opening a large Tantivy reader here
-    // fans out across every segment file on the hot robot path.
+    // the published generation manifest for the durable count; fall back to
+    // a direct lex_docs row count (W2-6 Task2: FTS5-domain replacement for
+    // the old Tantivy reader fallback, same "how many docs" semantics via
+    // Task1's searchable_index_summary).
     let index_doc_count: Option<u64> = if db_opened && message_count > 0 && lexical.exists {
         lexical_manifest_indexed_doc_count(&index_path).or_else(|| {
-            frankensearch::lexical::cass_open_search_reader(
-                &index_path,
-                frankensearch::lexical::ReloadPolicy::Manual,
-            )
-            .ok()
-            .map(|(reader, _fields)| reader.searcher().num_docs())
+            crate::search::lexical_index_health::searchable_index_summary(db_path)
+                .ok()
+                .flatten()
+                .map(|summary| summary.docs as u64)
         })
     } else {
         None
@@ -20172,7 +20124,7 @@ fn prepare_headless_once_tui_artifacts(
             })?;
     }
 
-    let _index_path = crate::search::tantivy::index_dir(data_dir).map_err(|e| {
+    let _index_path = crate::indexer::index_dir(data_dir).map_err(|e| {
         anyhow::anyhow!(
             "initialize index directory for headless --once at {}: {e}",
             data_dir.display()
@@ -22302,103 +22254,45 @@ impl SearchLexicalSelfHealDiagnosis {
         }
     }
 
-    fn existing_index(reason: impl Into<String>) -> Self {
-        Self {
-            reason: reason.into(),
-            checkpoint_refresh_allowed: false,
-            existing_index_search_allowed: true,
-        }
-    }
-
-    fn checkpoint(reason: impl Into<String>) -> Self {
-        Self {
-            reason: reason.into(),
-            checkpoint_refresh_allowed: true,
-            existing_index_search_allowed: false,
-        }
-    }
-
     fn permits_existing_index_during_active_rebuild(&self) -> bool {
         self.existing_index_search_allowed
     }
 }
 
+// W2-6 Task B (reader③, control-plane 2026-08-30 ruling): the
+// schema_hash/page_size/storage_fingerprint checkpoint-drift comparison this
+// function used to run below the quick-contract check is retired, not
+// reseated -- the desync class it protected against (sidecar tantivy index
+// silently out of sync with a DB that was copied/restored to an older
+// snapshot) is structurally eliminated by W2's single-file architecture:
+// lex_docs/fts_lex/the rebuild marker now all live inside the same .db file,
+// so replacing/restoring that file carries its own self-consistent index
+// along with it atomically -- there is no longer a second artifact that can
+// drift independently. Storing a fingerprint back into the marker (the
+// naive "reseat" option) would compare the DB's own fingerprint against
+// itself, a self-referential check that can never fail. Remaining failure
+// modes this used to help catch have their own owners: a stalled/incomplete
+// rebuild is caught by the marker + recovery path; corruption is caught by
+// this function's quick try-open probe (and the full-tier integrity-check on
+// 门①); dual-write bugs are caught by parity/judgment gates. None of those
+// is a fingerprint-comparison problem.
 fn search_lexical_self_heal_diagnosis(
-    index_path: &Path,
     db_path: &Path,
 ) -> CliResult<Option<SearchLexicalSelfHealDiagnosis>> {
-    if !crate::search::tantivy::searchable_index_exists(index_path) {
+    // W2-6 Task1: reseated onto the lex_docs/fts_lex SQLite domain (db_path).
+    if !crate::search::lexical_index_health::searchable_index_exists(db_path) {
         return Ok(Some(SearchLexicalSelfHealDiagnosis::rebuild(
             "searchable lexical metadata missing",
         )));
     }
 
-    if let Err(err) = crate::search::tantivy::validate_searchable_index_contract(index_path) {
+    // W2-6 Task1 (hot-path cost fix, control-plane 2026-08-30 amendment):
+    // this runs on every search -- quick tier only, never the full rank=1
+    // integrity-check.
+    if let Err(err) = crate::search::lexical_index_health::validate_searchable_index_contract_quick(db_path) {
         return Ok(Some(SearchLexicalSelfHealDiagnosis::rebuild(format!(
             "lexical artifact contract is unusable: {err:#}"
         ))));
-    }
-
-    let checkpoint =
-        crate::indexer::load_lexical_rebuild_checkpoint(index_path).map_err(|e| CliError {
-            code: 5,
-            kind: CliErrorKind::LexicalRebuild.kind_str(),
-            message: format!("failed to inspect lexical rebuild checkpoint: {e}"),
-            hint: Some(
-                "cass will rebuild the derived lexical index on the next search attempt"
-                    .to_string(),
-            ),
-            retryable: true,
-        })?;
-    let Some(checkpoint) = checkpoint else {
-        return Ok(Some(SearchLexicalSelfHealDiagnosis::existing_index(
-            "lexical rebuild checkpoint missing",
-        )));
-    };
-
-    if !stored_path_identity_matches(&checkpoint.db_path, db_path) {
-        return Ok(Some(SearchLexicalSelfHealDiagnosis::rebuild(format!(
-            "lexical checkpoint references {}, but active database is {}",
-            checkpoint.db_path,
-            db_path.display()
-        ))));
-    }
-    if !checkpoint.completed {
-        return Ok(Some(SearchLexicalSelfHealDiagnosis::checkpoint(
-            "lexical rebuild checkpoint is incomplete",
-        )));
-    }
-    if checkpoint.schema_hash != crate::search::tantivy::SCHEMA_HASH {
-        return Ok(Some(SearchLexicalSelfHealDiagnosis::checkpoint(
-            "lexical checkpoint schema no longer matches this cass binary",
-        )));
-    }
-    if !crate::indexer::lexical_rebuild_page_size_is_compatible(checkpoint.page_size) {
-        return Ok(Some(SearchLexicalSelfHealDiagnosis::checkpoint(
-            "lexical checkpoint page-size contract is incompatible with this cass binary",
-        )));
-    }
-    let current_storage_fingerprint =
-        crate::indexer::lexical_storage_fingerprint_for_db(db_path).map_err(|e| CliError {
-            code: 5,
-            kind: CliErrorKind::StorageFingerprint.kind_str(),
-            message: format!(
-                "failed to fingerprint cass database {} while validating lexical assets: {e}",
-                db_path.display()
-            ),
-            hint: Some(
-                "cass will rebuild the derived lexical index after the canonical database can be fingerprinted"
-                    .to_string(),
-            ),
-            retryable: true,
-        })?;
-    if !crate::search::asset_state::lexical_storage_fingerprints_match(
-        &current_storage_fingerprint,
-        &checkpoint.storage_fingerprint,
-    ) {
-        return Ok(Some(SearchLexicalSelfHealDiagnosis::existing_index(
-            "lexical checkpoint storage fingerprint no longer matches active database",
-        )));
     }
 
     Ok(None)
@@ -22419,13 +22313,16 @@ fn search_active_rebuild_wait_duration(timeout_ms: Option<u64>, started_at: Inst
 fn wait_for_searchable_index_after_active_rebuild(
     data_dir: &Path,
     db_path: &Path,
-    index_path: &Path,
+    // W2-6 Task1: no longer read -- the reseated existence check below uses
+    // db_path. Kept for now to avoid rippling a signature change through
+    // this function's callers outside Task1's scope.
+    _index_path: &Path,
     max_wait: Duration,
 ) -> bool {
     let deadline = Instant::now() + max_wait;
     loop {
         let rebuild_active = probe_index_run_lock(data_dir, db_path).active;
-        if crate::search::tantivy::searchable_index_exists(index_path) && !rebuild_active {
+        if crate::search::lexical_index_health::searchable_index_exists(db_path) && !rebuild_active {
             return true;
         }
         if Instant::now() >= deadline {
@@ -22454,11 +22351,12 @@ fn lexical_repair_error_is_active_index_run(rendered: &str) -> bool {
     rendered.contains("already holds")
 }
 
-/// #287: bounded degraded refusal for robot search callers. `kind` carries the
-/// stable machine-readable reason code (`checkpoint_incomplete` or
-/// `quarantine_circuit_breaker`) so an agent can branch on the structured
-/// error envelope instead of timing out against a silent multi-minute inline
-/// lexical rebuild.
+/// #287: bounded degraded refusal for robot search callers. `kind` carries a
+/// stable machine-readable reason code (currently only `quarantine_circuit_breaker`
+/// -- W2-6 Task B retired the `checkpoint_incomplete` caller along with the
+/// tantivy checkpoint file it diagnosed, see `search_lexical_self_heal_diagnosis`)
+/// so an agent can branch on the structured error envelope instead of timing
+/// out against a silent multi-minute inline lexical rebuild.
 fn search_robot_degraded_error(
     reason_code: &'static str,
     reason: &str,
@@ -22513,11 +22411,12 @@ fn ensure_lexical_assets_for_search(
         return Ok(SearchLexicalSelfHeal::skipped());
     }
 
-    let initial_index_exists = crate::search::tantivy::searchable_index_exists(index_path);
+    // W2-6 Task1: reseated onto the lex_docs/fts_lex SQLite domain (db_path).
+    let initial_index_exists = crate::search::lexical_index_health::searchable_index_exists(db_path);
     let initial_rebuild_active = probe_index_run_lock(data_dir, db_path).active;
     if initial_rebuild_active {
         if initial_index_exists {
-            let diagnosis = search_lexical_self_heal_diagnosis(index_path, db_path)?;
+            let diagnosis = search_lexical_self_heal_diagnosis(db_path)?;
             if diagnosis
                 .as_ref()
                 .is_none_or(|diagnosis| diagnosis.permits_existing_index_during_active_rebuild())
@@ -22540,7 +22439,7 @@ fn ensure_lexical_assets_for_search(
             return Err(search_lock_busy_error(data_dir));
         }
 
-        if search_lexical_self_heal_diagnosis(index_path, db_path)?.is_none() {
+        if search_lexical_self_heal_diagnosis(db_path)?.is_none() {
             return Ok(SearchLexicalSelfHeal {
                 action: "waited-for-active-rebuild",
                 reason: Some("foreground search waited for active lexical repair".to_string()),
@@ -22549,33 +22448,10 @@ fn ensure_lexical_assets_for_search(
         }
     }
 
-    let Some(diagnosis) = search_lexical_self_heal_diagnosis(index_path, db_path)? else {
+    let Some(diagnosis) = search_lexical_self_heal_diagnosis(db_path)? else {
         return Ok(SearchLexicalSelfHeal::skipped());
     };
     let reason = diagnosis.reason;
-
-    if initial_index_exists && diagnosis.checkpoint_refresh_allowed {
-        match crate::indexer::refresh_completed_lexical_rebuild_checkpoint_from_live_index(
-            db_path, data_dir,
-        ) {
-            Ok(()) => {
-                if search_lexical_self_heal_diagnosis(index_path, db_path)?.is_none() {
-                    return Ok(SearchLexicalSelfHeal {
-                        action: "refreshed-checkpoint",
-                        reason: Some(reason),
-                        indexed_docs: None,
-                    });
-                }
-            }
-            Err(err) => {
-                tracing::debug!(
-                    error = %err,
-                    reason = %reason,
-                    "live lexical checkpoint refresh did not repair search assets; falling back to canonical rebuild"
-                );
-            }
-        }
-    }
 
     if initial_index_exists && diagnosis.existing_index_search_allowed {
         tracing::warn!(
@@ -22650,7 +22526,7 @@ fn ensure_lexical_assets_for_search(
                 index_path,
                 search_active_rebuild_wait_duration(timeout_ms, started_at),
             );
-            if waited && search_lexical_self_heal_diagnosis(index_path, db_path)?.is_none() {
+            if waited && search_lexical_self_heal_diagnosis(db_path)?.is_none() {
                 return Ok(SearchLexicalSelfHeal {
                     action: "waited-for-concurrent-lexical-repair",
                     reason: Some(reason),
@@ -22675,7 +22551,6 @@ fn ensure_lexical_assets_for_search(
 #[cfg(test)]
 mod search_lexical_self_heal_tests {
     use super::*;
-    use crate::connectors::{NormalizedConversation, NormalizedMessage};
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
     use crate::search::query::{FieldMask, SearchClient, SearchFilters};
     use crate::storage::sqlite::FrankenStorage;
@@ -22730,84 +22605,43 @@ mod search_lexical_self_heal_tests {
         db_path
     }
 
-    fn seed_empty_canonical_search_db(data_dir: &Path) -> PathBuf {
-        let db_path = data_dir.join("agent_search.db");
-        let storage = FrankenStorage::open(&db_path).expect("open empty canonical db");
-        drop(storage);
-        db_path
-    }
-
-    fn build_standalone_lexical_index_without_checkpoint(data_dir: &Path, content: &str) {
-        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
-        let mut index =
-            crate::search::tantivy::TantivyIndex::open_or_create(&index_path).expect("open index");
-        let conversation = NormalizedConversation {
-            agent_slug: "codex".to_string(),
-            external_id: Some("standalone-no-checkpoint".to_string()),
-            title: Some("Standalone lexical fixture".to_string()),
-            workspace: Some(PathBuf::from("/tmp/search-self-heal")),
-            source_path: data_dir.join("standalone.jsonl"),
-            started_at: Some(1_770_000_000_000),
-            ended_at: Some(1_770_000_001_000),
-            metadata: serde_json::json!({}),
-            messages: vec![NormalizedMessage {
-                idx: 0,
-                role: "user".to_string(),
-                author: Some("tester".to_string()),
-                created_at: Some(1_770_000_000_000),
-                content: content.to_string(),
-                extra: serde_json::json!({}),
-                snippets: Vec::new(),
-                invocations: Vec::new(),
-            }],
-        };
-        index
-            .add_conversation(&conversation)
-            .expect("add standalone conversation");
-        index.commit().expect("commit standalone index");
-    }
-
-    fn hold_active_index_run_lock(data_dir: &Path, db_path: &Path) -> std::fs::File {
-        let lock_path = data_dir.join("index-run.lock");
-        let mut lock_file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-            .expect("open index-run lock");
-        fs2::FileExt::try_lock_exclusive(&lock_file).expect("hold active index-run lock");
-        let metadata = format!(
-            "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index\n",
-            std::process::id(),
-            1_733_000_111_000_i64,
-            db_path.display()
-        );
-        {
-            use std::io::{Seek, SeekFrom, Write};
-            lock_file.set_len(0).expect("truncate index-run lock");
-            lock_file
-                .seek(SeekFrom::Start(0))
-                .expect("rewind index-run lock");
-            lock_file
-                .write_all(metadata.as_bytes())
-                .expect("write index-run lock metadata");
-            lock_file.flush().expect("flush index-run lock metadata");
-        }
-        crate::search::asset_state::write_index_run_lock_metadata_sidecar(&lock_path, &metadata)
-            .expect("write index-run lock metadata sidecar");
-        lock_file
-    }
 
     #[test]
     fn search_self_heal_rebuilds_missing_lexical_index_from_canonical_db() {
         let temp = tempfile::tempdir().expect("tempdir");
         let data_dir = temp.path();
         let db_path = seed_canonical_search_db(data_dir);
-        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
-        assert!(!crate::search::tantivy::searchable_index_exists(
-            &index_path
-        ));
+        let index_path = crate::indexer::expected_index_dir(data_dir);
+
+        // W2-6 Task1: `seed_canonical_search_db` dual-writes lex_docs/fts_lex
+        // via the normal storage API, so there is nothing "missing" from the
+        // FTS5 domain's point of view yet. Simulate the scenario
+        // `searchable_index_exists`'s "has content but no coverage" semantics
+        // exist to catch -- a v1->v2-migrated-but-never-backfilled database --
+        // by wiping the domain the seed just populated, without touching
+        // `messages`. The old scenario here ("no tantivy index directory")
+        // stopped being what self-heal needs to detect once W2-5 switched the
+        // query path to FTS5 (control-plane 2026-08-30 ruling; original
+        // tantivy-directory scenario recorded in the W2-6 closed-world
+        // account).
+        {
+            let conn = crate::storage::api::Conn::open_writable(
+                &db_path,
+                crate::storage::api::Profile::Production,
+            )
+            .expect("open db for fault injection");
+            conn.execute("DELETE FROM fts_lex WHERE rowid IN (SELECT id FROM messages)", &[])
+                .expect("wipe fts_lex for fault injection");
+            conn.execute("DELETE FROM lex_docs", &[])
+                .expect("wipe lex_docs for fault injection");
+        }
+        // Probe validity check (波1 铁律): the injected fault must actually
+        // produce the "has content, no coverage" state before self-heal is
+        // trusted to detect it.
+        assert!(
+            !crate::search::lexical_index_health::searchable_index_exists(&db_path),
+            "fault injection must make the lexical domain read as missing"
+        );
 
         let repair = ensure_lexical_assets_for_search(
             data_dir,
@@ -22821,7 +22655,7 @@ mod search_lexical_self_heal_tests {
         .expect("search self-heal should rebuild missing lexical index");
         assert_eq!(repair.action, "rebuilt-from-canonical-db");
         assert_eq!(repair.indexed_docs, Some(1));
-        assert!(crate::search::tantivy::searchable_index_exists(&index_path));
+        assert!(crate::search::lexical_index_health::searchable_index_exists(&db_path));
 
         let client = SearchClient::open(&index_path, Some(&db_path))
             .expect("open search client")
@@ -22839,478 +22673,62 @@ mod search_lexical_self_heal_tests {
         assert!(hits[0].content.contains("autohealneedle"));
     }
 
+    // W2-6 Task1 closed-world account: `search_self_heal_rebuilds_incompatible_live_artifact`
+    // (stale tantivy schema_hash.json triggers a rebuild) retired here, not
+    // rewritten -- control-plane 2026-08-30 ruling. It tested a capability
+    // tied to tantivy's own on-disk schema versioning file, which has no
+    // SQLite-domain file to point at (table-level schema evolution is
+    // covered by `PRAGMA user_version`; there is no equivalent for lexical
+    // *projection* semantics changing between binary versions -- see the
+    // known-debt note in the W2-6 closeout report: "lexical projection
+    // version detection is absent; a binary upgrade that changes projection
+    // semantics (tokenization/truncation/eligibility) requires a manual
+    // `--force-rebuild`, silently otherwise").
     #[test]
-    fn search_self_heal_refreshes_stale_checkpoint_when_live_index_matches_db() {
+    fn search_self_heal_replaces_corrupt_live_fts5_artifact() {
         let temp = tempfile::tempdir().expect("tempdir");
         let data_dir = temp.path();
         let db_path = seed_canonical_search_db(data_dir);
-        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
-        ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect("initial rebuild");
+        let index_path = crate::indexer::expected_index_dir(data_dir);
 
-        let state_path = index_path.join(".lexical-rebuild-state.json");
-        let mut state: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&state_path).expect("read checkpoint"))
-                .expect("parse checkpoint");
-        state["schema_hash"] = serde_json::json!("old-schema-hash");
-        std::fs::write(
-            &state_path,
-            serde_json::to_vec_pretty(&state).expect("serialize checkpoint"),
-        )
-        .expect("write stale checkpoint");
-
-        let repair = ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect("search self-heal should refresh checkpoint");
-        assert_eq!(repair.action, "refreshed-checkpoint");
-
-        let checkpoint = crate::indexer::load_lexical_rebuild_checkpoint(&index_path)
-            .expect("load repaired checkpoint")
-            .expect("checkpoint present");
-        assert_eq!(checkpoint.schema_hash, crate::search::tantivy::SCHEMA_HASH);
-        assert!(checkpoint.completed);
-    }
-
-    #[test]
-    fn search_self_heal_rebuilds_when_checkpoint_references_different_db() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let data_dir = temp.path();
-        let old_db_path = data_dir.join("old_agent_search.db");
-        let db_path = data_dir.join("agent_search.db");
-        seed_search_db_at(
-            &old_db_path,
-            "oldautohealneedle exists only in the superseded database",
-            "old-search-self-heal-conversation",
-        );
-        seed_search_db_at(
-            &db_path,
-            "newautohealneedle exists only in the active database",
-            "new-search-self-heal-conversation",
-        );
-        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
-        ensure_lexical_assets_for_search(
-            data_dir,
-            &old_db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect("initial rebuild from old database");
-
-        let repair = ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect("search self-heal should rebuild for different active db");
-        assert_eq!(repair.action, "rebuilt-from-canonical-db");
-        assert_eq!(repair.indexed_docs, Some(1));
-
-        let checkpoint = crate::indexer::load_lexical_rebuild_checkpoint(&index_path)
-            .expect("load rebuilt checkpoint")
-            .expect("checkpoint present");
-        assert!(stored_path_identity_matches(&checkpoint.db_path, &db_path));
-
-        let client = SearchClient::open(&index_path, Some(&db_path))
-            .expect("open search client")
-            .expect("repaired index should open");
-        let new_hits = client
-            .search(
-                "newautohealneedle",
-                SearchFilters::default(),
-                5,
-                0,
-                FieldMask::FULL,
+        // Corrupt the FTS5 domain's own internal segment-data shadow table,
+        // instead of corrupting the retired tantivy meta.json -- self-heal's
+        // corruption detection now runs against the domain that actually
+        // serves queries post-W2-5 (control-plane 2026-08-30 ruling;
+        // original tantivy-directory scenario recorded in the W2-6
+        // closed-world account).
+        //
+        // This must be a corruption the *quick* tier (control-plane
+        // 2026-08-30 amendment) can actually see -- self-heal's per-search
+        // diagnosis only ever runs the cheap tier, not the full rank=1
+        // integrity-check (see `self_heal_diagnosis_never_calls_the_full_tier_contract_check`
+        // below). A content/index desync (e.g. a raw `UPDATE lex_docs SET
+        // content = ...`) is invisible to the quick tier by design and so
+        // would never trigger this repair path in the first place; deleting
+        // fts_lex's own shadow data breaks even a basic `SELECT ... LIMIT 1`
+        // probe, which the quick tier does catch.
+        //
+        // The repair path itself opens a *raw* writable connection (not
+        // `FrankenStorage::open`) specifically so this class of corruption
+        // doesn't also block the repair from running -- see
+        // `repair_lexical_index_from_canonical_db_for_search`'s comments.
+        {
+            let conn = crate::storage::api::Conn::open_writable(
+                &db_path,
+                crate::storage::api::Profile::Production,
             )
-            .expect("query rebuilt active-db index");
-        assert_eq!(new_hits.len(), 1);
-        let old_hits = client
-            .search(
-                "oldautohealneedle",
-                SearchFilters::default(),
-                5,
-                0,
-                FieldMask::FULL,
-            )
-            .expect("query superseded-db term");
-        assert_eq!(old_hits.len(), 0);
-    }
-
-    #[test]
-    fn search_self_heal_defers_same_db_content_drift_to_index_run() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let data_dir = temp.path();
-        let db_path = data_dir.join("agent_search.db");
-        seed_search_db_at(
-            &db_path,
-            "oldsamepathneedle is present in the first lexical generation",
-            "old-same-path-search-self-heal-conversation",
-        );
-        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
-        ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect("initial rebuild from active database");
-
-        seed_search_db_at(
-            &db_path,
-            "newsamepathneedle is appended to the same canonical database",
-            "new-same-path-search-self-heal-conversation",
-        );
-        let diagnosis = search_lexical_self_heal_diagnosis(&index_path, &db_path)
-            .expect("diagnose changed same-path database")
-            .expect("changed same-path database should require repair");
-        assert_eq!(
-            diagnosis.reason,
-            "lexical checkpoint storage fingerprint no longer matches active database"
-        );
-        assert!(
-            diagnosis.existing_index_search_allowed,
-            "same-db fingerprint drift should search the existing readable index and defer repair"
-        );
-
-        let repair = ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect("search self-heal should not rebuild inline after same-db content changes");
-        assert_eq!(repair.action, "deferred-repair-searching-existing-index");
-        assert_eq!(repair.indexed_docs, None);
-
-        let client = SearchClient::open(&index_path, Some(&db_path))
-            .expect("open search client")
-            .expect("existing stale index should still open");
-        let old_hits = client
-            .search(
-                "oldsamepathneedle",
-                SearchFilters::default(),
-                5,
-                0,
-                FieldMask::FULL,
-            )
-            .expect("query existing lexical generation");
-        assert_eq!(old_hits.len(), 1);
-        let new_hits = client
-            .search(
-                "newsamepathneedle",
-                SearchFilters::default(),
-                5,
-                0,
-                FieldMask::FULL,
-            )
-            .expect("query content that still needs the next index run");
-        assert_eq!(new_hits.len(), 0);
-    }
-
-    #[test]
-    fn active_rebuild_waits_instead_of_searching_stale_existing_index() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let data_dir = temp.path();
-        let old_db_path = data_dir.join("old_agent_search.db");
-        let db_path = data_dir.join("agent_search.db");
-        seed_search_db_at(
-            &old_db_path,
-            "oldactiverebuildneedle exists only in the superseded database",
-            "old-active-rebuild-search-self-heal-conversation",
-        );
-        seed_search_db_at(
-            &db_path,
-            "newactiverebuildneedle exists only in the active database",
-            "new-active-rebuild-search-self-heal-conversation",
-        );
-        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
-        ensure_lexical_assets_for_search(
-            data_dir,
-            &old_db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect("initial rebuild from old database");
-        let diagnosis = search_lexical_self_heal_diagnosis(&index_path, &db_path)
-            .expect("diagnose stale lexical index")
-            .expect("old database checkpoint should be stale for active db");
-        assert!(
-            diagnosis.reason.contains("lexical checkpoint references"),
-            "unexpected stale-index diagnosis: {}",
-            diagnosis.reason
-        );
-
-        let _lock_file = hold_active_index_run_lock(data_dir, &db_path);
-
-        let err = ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            Some(0),
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect_err(
-            "stale existing index should wait for active rebuild instead of being searched",
-        );
-        assert_eq!(err.code, 7);
-        assert_eq!(err.kind, CliErrorKind::IndexBusy.kind_str());
-        assert!(
-            err.message.contains("already repairing the search index"),
-            "unexpected error: {err:?}"
-        );
-    }
-
-    #[test]
-    fn active_rebuild_waits_instead_of_searching_incomplete_checkpoint() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let data_dir = temp.path();
-        let db_path = seed_canonical_search_db(data_dir);
-        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
-        ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect("initial rebuild from active database");
-
-        let state_path = index_path.join(".lexical-rebuild-state.json");
-        let mut state: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&state_path).expect("read checkpoint"))
-                .expect("parse checkpoint");
-        state["completed"] = serde_json::json!(false);
-        std::fs::write(
-            &state_path,
-            serde_json::to_vec_pretty(&state).expect("serialize checkpoint"),
-        )
-        .expect("write incomplete checkpoint");
-
-        let diagnosis = search_lexical_self_heal_diagnosis(&index_path, &db_path)
-            .expect("diagnose incomplete checkpoint")
-            .expect("incomplete checkpoint should require repair");
-        assert_eq!(diagnosis.reason, "lexical rebuild checkpoint is incomplete");
-        assert!(
-            !diagnosis.permits_existing_index_during_active_rebuild(),
-            "active rebuild must not search an index before checkpoint refresh proof"
-        );
-
-        let _lock_file = hold_active_index_run_lock(data_dir, &db_path);
-
-        let err = ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            Some(0),
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect_err(
-            "incomplete checkpoint should wait for active rebuild instead of being searched",
-        );
-        assert_eq!(err.code, 7);
-        assert_eq!(err.kind, CliErrorKind::IndexBusy.kind_str());
-        assert!(
-            err.message.contains("already repairing the search index"),
-            "unexpected error: {err:?}"
-        );
-    }
-
-    /// #287: a robot-mode search facing an incomplete lexical checkpoint that
-    /// the cheap live-index refresh cannot reconcile must return a bounded
-    /// structured refusal with the stable `checkpoint_incomplete` reason code
-    /// instead of silently launching a multi-minute inline rebuild.
-    #[test]
-    fn robot_search_returns_bounded_checkpoint_incomplete_instead_of_inline_rebuild() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let data_dir = temp.path();
-        let db_path = seed_canonical_search_db(data_dir);
-        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
-        ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect("initial rebuild from active database");
-
-        // Mark the checkpoint incomplete AND grow the canonical DB so the
-        // live-index doc count no longer matches — the cheap metadata-only
-        // checkpoint refresh then cannot reconcile, and only the heavyweight
-        // canonical rebuild path remains.
-        let state_path = index_path.join(".lexical-rebuild-state.json");
-        let mut state: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&state_path).expect("read checkpoint"))
-                .expect("parse checkpoint");
-        state["completed"] = serde_json::json!(false);
-        std::fs::write(
-            &state_path,
-            serde_json::to_vec_pretty(&state).expect("serialize checkpoint"),
-        )
-        .expect("write incomplete checkpoint");
-        seed_search_db_at(
-            &db_path,
-            "robotrefusalneedle appended after the incomplete checkpoint",
-            "robot-refusal-extra-conversation",
-        );
-
-        let err = ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            true,
-        )
-        .expect_err(
-            "robot search must refuse the heavyweight inline rebuild with a bounded verdict",
-        );
-        assert_eq!(err.kind, "checkpoint_incomplete");
-        assert_eq!(err.code, 5);
-        assert!(err.retryable);
-        assert!(
-            err.message
-                .contains("lexical rebuild checkpoint is incomplete"),
-            "unexpected error: {err:?}"
-        );
-
-        // Human-mode (non-robot) searches keep the self-healing inline rebuild.
-        let repair = ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect("human-mode search keeps the inline self-heal rebuild");
-        assert_eq!(repair.action, "rebuilt-from-canonical-db");
-    }
-
-    /// #287: an active ingest-quarantine circuit breaker means any inline
-    /// rebuild may never converge — robot-mode searches must surface the
-    /// stable `quarantine_circuit_breaker` reason code as a bounded refusal.
-    #[test]
-    fn robot_search_returns_bounded_quarantine_circuit_breaker_refusal() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let data_dir = temp.path();
-        let db_path = seed_canonical_search_db(data_dir);
-        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
-
-        // Trip the ingest-quarantine circuit breaker: at least
-        // INGEST_QUARANTINE_CIRCUIT_DEFAULT_LIMIT recent poison records.
-        let quarantine_dir = data_dir.join("quarantine");
-        std::fs::create_dir_all(&quarantine_dir).expect("create quarantine dir");
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        let mut lines = String::new();
-        for idx in 0..25 {
-            let record = serde_json::json!({
-                "schema_version": 1,
-                "conversation_id": format!("tester|/logs/demo-{idx}.jsonl|/workspace/demo|poison-{idx}|1|2|1"),
-                "schema_version_at_quarantine": crate::storage::sqlite::CURRENT_SCHEMA_VERSION,
-                "first_quarantined_at_ms": now_ms,
-                "last_attempt_at_ms": now_ms,
-                "attempt_count": 1,
-                "reason": "index-ingest-out-of-memory",
-                "error_kind": "out-of-memory",
-                "last_error": "out of memory",
-                "agent_slug": "tester",
-                "external_id": format!("poison-{idx}"),
-                "source_path": format!("/logs/demo-{idx}.jsonl"),
-                "workspace": "/workspace/demo",
-                "started_at": 1,
-                "ended_at": 2,
-                "message_count": 1
-            });
-            lines.push_str(&format!("{record}\n"));
+            .expect("open db for fault injection");
+            conn.execute("DELETE FROM fts_lex_data", &[])
+                .expect("corrupt fts_lex shadow table for fault injection");
         }
-        std::fs::write(quarantine_dir.join("index_ingest_poison.jsonl"), lines)
-            .expect("write poison records");
-        let summary = crate::indexer::conversation_ingest_quarantine_summary(data_dir);
+        // Probe validity check (波1 铁律): confirm the injected fault actually
+        // fails the quick tier self-heal actually relies on before trusting
+        // it to catch this.
         assert!(
-            summary.circuit_breaker_active,
-            "fixture must trip the ingest circuit breaker: {summary:?}"
+            crate::search::lexical_index_health::validate_searchable_index_contract_quick(&db_path)
+                .is_err(),
+            "fault injection must make the quick fts5 probe fail"
         );
-
-        // No lexical index exists, so the self-heal would normally launch the
-        // inline canonical rebuild; robot mode must refuse instead while the
-        // breaker is active.
-        let err = ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            true,
-        )
-        .expect_err("robot search must refuse inline rebuild behind an active circuit breaker");
-        assert_eq!(err.kind, "quarantine_circuit_breaker");
-        assert_eq!(err.code, 5);
-        assert!(err.retryable);
-        assert!(
-            err.hint
-                .as_deref()
-                .is_some_and(|hint| hint.contains("cass index --watch-once")),
-            "hint must name the recovery command: {err:?}"
-        );
-    }
-
-    #[test]
-    fn search_self_heal_defers_missing_checkpoint_when_index_is_readable() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let data_dir = temp.path();
-        build_standalone_lexical_index_without_checkpoint(
-            data_dir,
-            "orphanautohealneedle exists only in a standalone lexical artifact",
-        );
-        let db_path = data_dir.join("agent_search.db");
-        seed_search_db_at(
-            &db_path,
-            "checkpointmissingautohealneedle exists only in the active database",
-            "checkpoint-missing-search-self-heal-conversation",
-        );
-        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
 
         let repair = ensure_lexical_assets_for_search(
             data_dir,
@@ -23321,127 +22739,38 @@ mod search_lexical_self_heal_tests {
             false,
             false,
         )
-        .expect(
-            "search self-heal should not rebuild inline when only checkpoint metadata is missing",
-        );
-        assert_eq!(repair.action, "deferred-repair-searching-existing-index");
-        assert_eq!(repair.indexed_docs, None);
-
-        assert!(
-            crate::indexer::load_lexical_rebuild_checkpoint(&index_path)
-                .expect("load checkpoint")
-                .is_none(),
-            "foreground search should not synthesize unverifiable checkpoint metadata"
-        );
-
-        let client = SearchClient::open(&index_path, Some(&db_path))
-            .expect("open search client")
-            .expect("existing standalone index should still open");
-        let active_hits = client
-            .search(
-                "checkpointmissingautohealneedle",
-                SearchFilters::default(),
-                5,
-                0,
-                FieldMask::FULL,
-            )
-            .expect("query active-db term");
-        assert_eq!(active_hits.len(), 0);
-        let orphan_hits = client
-            .search(
-                "orphanautohealneedle",
-                SearchFilters::default(),
-                5,
-                0,
-                FieldMask::FULL,
-            )
-            .expect("query standalone lexical term");
-        assert_eq!(orphan_hits.len(), 1);
-    }
-
-    #[test]
-    fn search_self_heal_rebuilds_incompatible_live_artifact() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let data_dir = temp.path();
-        let db_path = seed_canonical_search_db(data_dir);
-        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
-        ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect("initial rebuild");
-
-        std::fs::write(
-            index_path.join("schema_hash.json"),
-            serde_json::to_vec(&serde_json::json!({"schema_hash": "old-schema-hash"}))
-                .expect("serialize stale schema hash"),
-        )
-        .expect("write stale schema hash");
-
-        let repair = ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect("search self-heal should rebuild incompatible lexical artifact");
+        .expect("search self-heal should repair the corrupt fts5 artifact");
         assert_eq!(repair.action, "rebuilt-from-canonical-db");
         assert_eq!(repair.indexed_docs, Some(1));
-        crate::search::tantivy::validate_searchable_index_contract(&index_path)
+        crate::search::lexical_index_health::validate_searchable_index_contract_full(&db_path)
             .expect("repaired lexical artifact contract");
-
-        let client = SearchClient::open(&index_path, Some(&db_path))
-            .expect("open search client")
-            .expect("repaired index should open");
-        let hits = client
-            .search(
-                "autohealneedle",
-                SearchFilters::default(),
-                5,
-                0,
-                FieldMask::FULL,
-            )
-            .expect("query rebuilt index");
-        assert_eq!(hits.len(), 1);
+        assert!(
+            crate::search::lexical_index_health::searchable_index_exists(&db_path),
+            "the fts5 domain must actually be repopulated, not just the retired tantivy side"
+        );
     }
 
+    /// Grep-level guard (control-plane 2026-08-30 amendment, W2-6 Task1): the
+    /// full rank=1 integrity-check costs minutes on a large corpus and must
+    /// never ride the per-search hot path again. Pins the function's source
+    /// body, not just today's behavior, so a future edit that adds a call to
+    /// the full tier here fails loudly instead of silently reintroducing the
+    /// regression this session found and fixed.
     #[test]
-    fn search_self_heal_replaces_corrupt_live_artifact_for_empty_db() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let data_dir = temp.path();
-        let db_path = seed_empty_canonical_search_db(data_dir);
-        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
-        std::fs::create_dir_all(&index_path).expect("create corrupt index dir");
-        std::fs::write(index_path.join("meta.json"), b"not-json").expect("write corrupt meta");
-
-        let repair = ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect("search self-heal should publish a fresh empty lexical artifact");
-        assert_eq!(repair.action, "rebuilt-from-canonical-db");
-        assert_eq!(repair.indexed_docs, Some(0));
-        crate::search::tantivy::validate_searchable_index_contract(&index_path)
-            .expect("empty repaired lexical artifact contract");
-
-        let checkpoint = crate::indexer::load_lexical_rebuild_checkpoint(&index_path)
-            .expect("load empty repair checkpoint")
-            .expect("checkpoint present");
-        assert!(checkpoint.completed);
-        assert_eq!(checkpoint.indexed_docs, 0);
+    fn self_heal_diagnosis_never_calls_the_full_tier_contract_check() {
+        let source = include_str!("lib.rs");
+        let start = source
+            .find("fn search_lexical_self_heal_diagnosis(")
+            .expect("search_lexical_self_heal_diagnosis must still exist in lib.rs");
+        let after_start = &source[start..];
+        let body_end = after_start
+            .find("\nfn ")
+            .expect("a following top-level fn must terminate the body scan");
+        let body = &after_start[..body_end];
+        assert!(
+            !body.contains("validate_searchable_index_contract_full"),
+            "search_lexical_self_heal_diagnosis must only ever call the quick tier -- it runs on every search"
+        );
     }
 }
 
@@ -23576,7 +22905,7 @@ fn run_cli_search(
     let start_time = Instant::now();
 
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
-    let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
+    let index_path = crate::indexer::expected_index_dir(&data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     let db_exists = db_path.exists();
 
@@ -23725,7 +23054,8 @@ fn run_cli_search(
             "search lexical self-heal completed"
         );
     }
-    let tantivy_index_initialized = crate::search::tantivy::searchable_index_exists(&index_path);
+    // W2-6 Task1: reseated onto the lex_docs/fts_lex SQLite domain.
+    let tantivy_index_initialized = crate::search::lexical_index_health::searchable_index_exists(&db_path);
     let rebuild_active = probe_index_run_lock(&data_dir, &db_path).active;
 
     let client = SearchClient::open_with_options(
@@ -23798,9 +23128,9 @@ fn run_cli_search(
         }
     })?;
 
-    if !client.has_tantivy() {
+    if !client.has_lexical_index() {
         eprintln!(
-            "Warning: Tantivy search index not found at {}. \
+            "Warning: lexical search index not found at {}. \
              Results will be severely limited. \
              Run `cass index --full` to rebuild the index.",
             index_path.display()
@@ -24066,12 +23396,21 @@ fn run_cli_search(
                 search_sparse_threshold,
                 field_mask,
             )
-            .map_err(|e| CliError {
-                code: 9,
-                kind: CliErrorKind::Search.kind_str(),
-                message: format!("search failed: {e}"),
-                hint: None,
-                retryable: true,
+            .map_err(|e| {
+                let chain = format!("{e:#}");
+                if error_chain_indicates_lexical_index_building(&chain) {
+                    search_lexical_index_building_cli_error(&chain)
+                } else if error_chain_indicates_lexical_index_absent(&chain) {
+                    search_lexical_index_absent_cli_error(&chain)
+                } else {
+                    CliError {
+                        code: 9,
+                        kind: CliErrorKind::Search.kind_str(),
+                        message: format!("search failed: {e}"),
+                        hint: None,
+                        retryable: true,
+                    }
+                }
             })?,
         SearchMode::Semantic => {
             // cass#256: in the `-baseline` build (the `semantic` Cargo
@@ -24194,14 +23533,23 @@ fn run_cli_search(
                             search_sparse_threshold,
                             field_mask,
                         )
-                        .map_err(|fallback_err| CliError {
-                            code: 9,
-                            kind: CliErrorKind::Search.kind_str(),
-                            message: format!(
-                                "hybrid search failed ({e}); lexical fallback failed: {fallback_err}"
-                            ),
-                            hint: None,
-                            retryable: true,
+                        .map_err(|fallback_err| {
+                            let chain = format!("{fallback_err:#}");
+                            if error_chain_indicates_lexical_index_building(&chain) {
+                                search_lexical_index_building_cli_error(&chain)
+                            } else if error_chain_indicates_lexical_index_absent(&chain) {
+                                search_lexical_index_absent_cli_error(&chain)
+                            } else {
+                                CliError {
+                                    code: 9,
+                                    kind: CliErrorKind::Search.kind_str(),
+                                    message: format!(
+                                        "hybrid search failed ({e}); lexical fallback failed: {fallback_err}"
+                                    ),
+                                    hint: None,
+                                    retryable: true,
+                                }
+                            }
                         })?
                 } else if err_str.contains("unavailable") || err_str.contains("no embedder") {
                     return Err(CliError {
@@ -24747,7 +24095,7 @@ fn run_cli_pack(
     limits.validate().map_err(pack_invalid_limit_error)?;
 
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
-    let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
+    let index_path = crate::indexer::expected_index_dir(&data_dir);
     let db_path = db_override
         .clone()
         .unwrap_or_else(|| data_dir.join("agent_search.db"));
@@ -24798,7 +24146,8 @@ fn run_cli_pack(
         );
     }
 
-    let tantivy_index_initialized = crate::search::tantivy::searchable_index_exists(&index_path);
+    // W2-6 Task1: reseated onto the lex_docs/fts_lex SQLite domain.
+    let tantivy_index_initialized = crate::search::lexical_index_health::searchable_index_exists(&db_path);
     let rebuild_active = probe_index_run_lock(&data_dir, &db_path).active;
     let client = SearchClient::open_with_options(
         &index_path,
@@ -24873,15 +24222,24 @@ fn run_cli_pack(
             search_sparse_threshold,
             FieldMask::FULL,
         )
-        .map_err(|e| CliError {
-            code: 9,
-            kind: CliErrorKind::Search.kind_str(),
-            message: format!("pack search failed: {e}"),
-            hint: Some(
-                "Try `cass search <query> --robot --robot-meta` to inspect the search path."
-                    .to_string(),
-            ),
-            retryable: true,
+        .map_err(|e| {
+            let chain = format!("{e:#}");
+            if error_chain_indicates_lexical_index_building(&chain) {
+                search_lexical_index_building_cli_error(&chain)
+            } else if error_chain_indicates_lexical_index_absent(&chain) {
+                search_lexical_index_absent_cli_error(&chain)
+            } else {
+                CliError {
+                    code: 9,
+                    kind: CliErrorKind::Search.kind_str(),
+                    message: format!("pack search failed: {e}"),
+                    hint: Some(
+                        "Try `cass search <query> --robot --robot-meta` to inspect the search path."
+                            .to_string(),
+                    ),
+                    retryable: true,
+                }
+            }
         })?;
 
     if let Some(timeout) = timeout_duration
@@ -27915,7 +27273,6 @@ fn run_stats(
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     let conn = open_franken_cli_read_db(db_path.clone(), "stats", Duration::from_secs(30))?;
-    validate_fts_messages_integrity_for_cli(&conn, "stats")?;
     let conversation_columns = doctor_table_columns(&conn, "conversations");
     let source_id_sql = if conversation_columns.contains("source_id") {
         "c.source_id"
@@ -28537,34 +27894,13 @@ fn run_dedup(
             retryable: false,
         })?;
 
-    // On apply, rebuild the lexical FTS index so the dropped twins stop
-    // surfacing in search. Only worth doing when something was removed.
-    let mut lexical_rebuilt = false;
-    if apply && result.conversations_affected > 0 {
-        match storage.rebuild_lexical_index_after_dedup() {
-            Ok(()) => lexical_rebuilt = true,
-            Err(err) => {
-                tracing::warn!(
-                    "duplicate cleanup removed rows but lexical rebuild failed: {err}; run 'cass index --full' to refresh search"
-                );
-            }
-        }
-    }
-
     let recommended_action = if result.conversations_affected == 0 {
         "No pre-existing duplicate conversations found. Nothing to do.".to_string()
     } else if apply {
-        if lexical_rebuilt {
-            format!(
-                "Collapsed {} duplicate conversation(s) and rebuilt the in-DB FTS shadow. Run 'cass index --full' to also refresh the on-disk lexical search index.",
-                result.conversations_affected
-            )
-        } else {
-            format!(
-                "Collapsed {} duplicate conversation(s). Run 'cass index --full' to refresh the lexical index.",
-                result.conversations_affected
-            )
-        }
+        format!(
+            "Collapsed {} duplicate conversation(s). Run 'cass index --full' to refresh the lexical index.",
+            result.conversations_affected
+        )
     } else {
         format!(
             "Found {} duplicate conversation(s) ({} message rows). Re-run with --apply to collapse them.",
@@ -28594,7 +27930,10 @@ fn run_dedup(
             "db_exists": true,
             "conversations_collapsed": result.conversations_affected,
             "messages_removed": result.messages_affected,
-            "lexical_rebuilt": lexical_rebuilt,
+            // W2-6 Task戊: the in-DB fts_messages shadow this field used to
+            // report on is retired; always false now (see the sibling
+            // no-op branch above, which already hardcoded this).
+            "lexical_rebuilt": false,
             "pairs": pairs,
             "recommended_action": recommended_action,
         });
@@ -28678,7 +28017,7 @@ fn run_diag(
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     // Use the actual versioned lexical index path without creating it during diagnostics.
-    let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
+    let index_path = crate::indexer::expected_index_dir(&data_dir);
 
     // Check database existence and get stats
     let (db_exists, db_size, conversation_count, message_count) = if db_path.exists() {
@@ -28735,9 +28074,12 @@ fn run_diag(
         (false, 0, 0, 0)
     };
 
-    // Check index existence
-    let (index_exists, index_size) = if crate::search::tantivy::searchable_index_exists(&index_path)
-    {
+    // Check index existence (W2-6 Task1: reseated onto the lex_docs/fts_lex
+    // SQLite domain; the reported size is still the tantivy directory's,
+    // which stays meaningful until Task2 retires it)
+    let (index_exists, index_size) = if crate::search::lexical_index_health::searchable_index_exists(
+        &db_path,
+    ) {
         let size = fs_dir_size(&index_path);
         (true, size)
     } else {
@@ -29763,7 +29105,7 @@ fn doctor_anomaly_for_check(name: &str, status: &str, message: &str) -> DoctorAn
         }
         "database_backup" => DoctorAnomaly::BackupUnverified,
         "safe_auto_archive_rebuild" => DoctorAnomaly::DegradedArchiveRisk,
-        "fts_table" | "index" | "index_sync" => DoctorAnomaly::DerivedLexicalStale,
+        "index" | "index_sync" => DoctorAnomaly::DerivedLexicalStale,
         "semantic_model" => DoctorAnomaly::DerivedSemanticStale,
         "rebuild" => DoctorAnomaly::RepairPreviouslyFailed,
         "repair_failure_marker" => DoctorAnomaly::RepairPreviouslyFailed,
@@ -29848,7 +29190,7 @@ fn doctor_safe_auto_action_for_check(check: &DoctorCheckReport) -> &'static str 
     match check.name.as_str() {
         "data_directory" => "create_missing_cass_data_dir",
         "lock_file" => "remove_stale_legacy_index_lock",
-        "index" | "index_sync" | "fts_table" | "rebuild" => {
+        "index" | "index_sync" | "rebuild" => {
             "rebuild_derived_lexical_index_from_archive_db"
         }
         "semantic_model" => "report_lexical_fallback_without_model_download",
@@ -40781,7 +40123,7 @@ fn collect_doctor_raw_mirror_backfill_report(
                     operation_id: "doctor-raw-mirror-backfill",
                     data_dir,
                     db_path,
-                    index_path: &crate::search::tantivy::expected_index_dir(data_dir),
+                    index_path: &crate::indexer::expected_index_dir(data_dir),
                     plan: None,
                     quarantine_report: None,
                     extra_file_artifacts: &[],
@@ -44136,7 +43478,7 @@ fn doctor_restore_plan_payload(
 ) -> (serde_json::Value, String) {
     let live_inventory = doctor_candidate_live_inventory(
         db_path,
-        &crate::search::tantivy::expected_index_dir(data_dir),
+        &crate::indexer::expected_index_dir(data_dir),
     );
     let fingerprint_inputs =
         doctor_restore_fingerprint_inputs(backup_id, verification, &live_inventory);
@@ -44288,7 +43630,7 @@ fn run_doctor_backup_restore_rehearsal(
     let started_at_ms = doctor_now_ms();
     let live_inventory_before = doctor_candidate_live_inventory(
         db_path,
-        &crate::search::tantivy::expected_index_dir(data_dir),
+        &crate::indexer::expected_index_dir(data_dir),
     );
     let rehearsal_id = format!("{}-{backup_id}", started_at_ms);
     let rehearsal_dir = data_dir
@@ -44319,7 +43661,7 @@ fn run_doctor_backup_restore_rehearsal(
     }
     let live_inventory_after = doctor_candidate_live_inventory(
         db_path,
-        &crate::search::tantivy::expected_index_dir(data_dir),
+        &crate::indexer::expected_index_dir(data_dir),
     );
     let live_untouched = serde_json::to_value(&live_inventory_before).unwrap_or_default()
         == serde_json::to_value(&live_inventory_after).unwrap_or_default();
@@ -44461,7 +43803,7 @@ fn run_doctor_backup_restore_apply(
     requested_plan_fingerprint: &str,
     expected_plan_fingerprint: &str,
 ) -> serde_json::Value {
-    let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+    let index_path = crate::indexer::expected_index_dir(data_dir);
     if requested_plan_fingerprint != expected_plan_fingerprint {
         return doctor_restore_apply_payload_with_receipt(
             data_dir,
@@ -48511,7 +47853,7 @@ fn run_doctor_support_bundle_impl(
         });
     }
 
-    let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
+    let index_path = crate::indexer::expected_index_dir(&data_dir);
     let mut artifacts = Vec::new();
     let snapshot = build_doctor_baseline_snapshot(&data_dir, &db_path, &bundle_id, started);
     let redacted_report = snapshot
@@ -49299,7 +48641,7 @@ fn build_doctor_baseline_snapshot(
     baseline_id: &str,
     started: Instant,
 ) -> serde_json::Value {
-    let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+    let index_path = crate::indexer::expected_index_dir(data_dir);
     let sources_path = doctor_sources_config_path(data_dir);
     let config_path = data_dir.join("config.toml");
     let source_inventory = collect_doctor_source_inventory(data_dir, db_path);
@@ -49335,7 +48677,7 @@ fn build_doctor_baseline_snapshot(
         "shm_exists": doctor_sqlite_sidecar_path(db_path, "-shm").is_some_and(|path| path.exists()),
     });
     let derived_generation = serde_json::json!({
-        "lexical_index_exists": crate::search::tantivy::searchable_index_exists(&index_path),
+        "lexical_index_exists": crate::search::lexical_index_health::searchable_index_exists(db_path),
         "lexical_index_path_blake3": doctor_canonical_blake3(
             "doctor-baseline-index-path-v1",
             serde_json::json!({ "index_path": doctor_path_identity_for_fingerprint(&index_path) }),
@@ -54628,7 +53970,9 @@ fn run_doctor_lexical_post_repair_probe(
     };
     let start = Instant::now();
     let mut steps = Vec::new();
-    if !crate::search::tantivy::searchable_index_exists(index_path) {
+    // W2-6 Task1: reseated onto the lex_docs/fts_lex SQLite domain.
+    let db_path = data_dir.join("agent_search.db");
+    if !crate::search::lexical_index_health::searchable_index_exists(&db_path) {
         return doctor_post_repair_probe_report(
             target,
             doctor_post_repair_probe_outcome(
@@ -54663,7 +54007,9 @@ fn run_doctor_lexical_post_repair_probe(
         );
     }
     steps.push("detect_searchable_index".to_string());
-    if let Err(err) = crate::search::tantivy::validate_searchable_index_contract(index_path) {
+    // W2-6 Task1: doctor's post-repair probe is an explicit, infrequent
+    // scenario -- full tier.
+    if let Err(err) = crate::search::lexical_index_health::validate_searchable_index_contract_full(&db_path) {
         return doctor_post_repair_probe_report(
             target,
             doctor_post_repair_probe_outcome(
@@ -54680,7 +54026,7 @@ fn run_doctor_lexical_post_repair_probe(
         );
     }
     steps.push("open_search_reader".to_string());
-    match crate::search::tantivy::searchable_index_summary(index_path) {
+    match crate::search::lexical_index_health::searchable_index_summary(&db_path) {
         Ok(summary) => {
             steps.push("read_generation_summary".to_string());
             let mut report = doctor_post_repair_probe_report(
@@ -59939,7 +59285,7 @@ mod doctor_asset_taxonomy_tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let data_dir = temp.path().join("cass-data");
         let db_path = data_dir.join("agent_search.db");
-        let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
+        let index_path = crate::indexer::expected_index_dir(&data_dir);
         std::fs::create_dir_all(&db_path).expect("create unopenable db path directory");
         let readiness_snapshot = serde_json::json!({
             "semantic": {
@@ -71330,7 +70676,7 @@ fn run_status(
             if status_budget.is_healthy() {
                 let quarantine_report = collect_diag_quarantine_report(
                     &data_dir,
-                    &crate::search::tantivy::expected_index_dir(&data_dir),
+                    &crate::indexer::expected_index_dir(&data_dir),
                 );
                 let coverage_risk = doctor_fast_coverage_risk_unchecked(db_exists);
                 let sources_path = doctor_sources_config_path(&data_dir);
@@ -72439,19 +71785,15 @@ fn run_health(
 
 fn rebuild_tantivy_from_db(
     db_path: &Path,
-    data_dir: &Path,
-    total_conversations: usize,
     progress: Option<std::sync::Arc<indexer::IndexingProgress>>,
 ) -> CliResult<usize> {
-    indexer::rebuild_tantivy_from_db(db_path, data_dir, total_conversations, progress)
-        .map(|outcome| outcome.indexed_docs)
-        .map_err(|e| CliError {
-            code: 5,
-            kind: CliErrorKind::Doctor.kind_str(),
-            message: format!("failed to rebuild Tantivy index from database: {e}"),
-            hint: None,
-            retryable: true,
-        })
+    indexer::rebuild_lex_domain_from_db_full(db_path, progress).map_err(|e| CliError {
+        code: 5,
+        kind: CliErrorKind::Doctor.kind_str(),
+        message: format!("failed to rebuild lexical search index from database: {e}"),
+        hint: None,
+        retryable: true,
+    })
 }
 
 fn wait_with_progress<T>(
@@ -72648,104 +71990,6 @@ fn wait_with_progress<T>(
     }
 
     result
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum DoctorFtsTableState {
-    QueryableViaFrankensqlite,
-    Missing { frankensqlite_error: String },
-}
-
-fn probe_doctor_fts_table(conn: &FrankenConnection) -> DoctorFtsTableState {
-    match conn.query_all_map("SELECT rowid FROM fts_messages LIMIT 1;", &[], |_row| Ok(())) {
-        Ok(_) => DoctorFtsTableState::QueryableViaFrankensqlite,
-        Err(frankensqlite_error) => DoctorFtsTableState::Missing {
-            frankensqlite_error: frankensqlite_error.to_string(),
-        },
-    }
-}
-
-#[cfg(test)]
-mod doctor_fts_tests {
-    use super::*;
-
-    fn create_search_schema(
-        conn: &FrankenConnection,
-    ) -> Result<(), StorageError> {
-        conn.execute_batch(
-            "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
-             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
-             CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                agent_id INTEGER,
-                workspace_id INTEGER,
-                source_id TEXT,
-                origin_host TEXT,
-                title TEXT,
-                source_path TEXT
-             );
-             CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER,
-                idx INTEGER,
-                content TEXT,
-                created_at INTEGER
-             );",
-        )
-    }
-
-    #[test]
-    fn doctor_fts_probe_accepts_frankensqlite_fts_table() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let temp_dir = tempfile::TempDir::new()?;
-        let db_path = temp_dir.path().join("legacy-fts.db");
-
-        let conn = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().as_ref())), crate::storage::api::Profile::Production)?;
-        create_search_schema(&conn)?;
-        conn.execute_batch(
-            "CREATE VIRTUAL TABLE fts_messages USING fts5(
-                content,
-                title,
-                agent,
-                workspace,
-                source_path,
-                created_at UNINDEXED,
-                message_id UNINDEXED,
-                tokenize='porter'
-             );
-             INSERT INTO agents(id, slug) VALUES(1, 'codex');
-             INSERT INTO workspaces(id, path) VALUES(1, '/ws');
-             INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
-             VALUES(1, 1, 1, 'local', NULL, 'retro', '/tmp/retro.jsonl');
-             INSERT INTO messages(id, conversation_id, idx, content, created_at)
-             VALUES(7, 1, 0, 'retro investigation', 42);
-             INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at, message_id)
-             VALUES(7, 'retro investigation', 'retro', 'codex', '/ws', '/tmp/retro.jsonl', 42, '7');",
-        )?;
-        let state = probe_doctor_fts_table(&conn);
-        assert!(
-            matches!(state, DoctorFtsTableState::QueryableViaFrankensqlite),
-            "the legacy embedded engine FTS table should be accepted by doctor: {state:?}"
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn doctor_fts_probe_reports_missing_fts_table() -> Result<(), Box<dyn std::error::Error>> {
-        let temp_dir = tempfile::TempDir::new()?;
-        let db_path = temp_dir.path().join("missing-fts.db");
-
-        let conn = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().as_ref())), crate::storage::api::Profile::Production)?;
-        create_search_schema(&conn)?;
-        let state = probe_doctor_fts_table(&conn);
-        assert!(
-            matches!(state, DoctorFtsTableState::Missing { .. }),
-            "missing FTS table should be reported as missing: {state:?}"
-        );
-
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -73340,8 +72584,6 @@ mod cli_read_db_tests {
             "CASS_TANTIVY_REBUILD_PIPELINE_MAX_MESSAGE_BYTES_IN_FLIGHT",
             "888888",
         );
-        let _writer_threads = set_env("CASS_TANTIVY_MAX_WRITER_THREADS", "2");
-        let _shard_builders = set_env("CASS_TANTIVY_REBUILD_STAGED_SHARD_BUILDERS", "4");
         let _merge_workers = set_env("CASS_TANTIVY_REBUILD_STAGED_MERGE_WORKERS", "2");
 
         let (temp, db_path) = seed_cli_db();
@@ -73370,14 +72612,12 @@ mod cli_read_db_tests {
             pipeline["controller_loadavg_low_watermark_1m"].as_f64(),
             Some(6.25)
         );
-        assert_eq!(
-            pipeline["tantivy_writer_threads"].as_u64(),
-            Some(available_parallelism.min(2))
-        );
-        assert_eq!(
-            pipeline["staged_shard_builders"].as_u64(),
-            Some(crate::indexer::responsiveness::effective_worker_count(4).max(1) as u64)
-        );
+        // W2-6 Task丙①: CASS_TANTIVY_MAX_WRITER_THREADS and
+        // CASS_TANTIVY_REBUILD_STAGED_SHARD_BUILDERS no longer drive
+        // anything (retired, chain-of-custody audit confirmed no live
+        // consumer) -- both fields are now fixed at 0 regardless of env.
+        assert_eq!(pipeline["tantivy_writer_threads"].as_u64(), Some(0));
+        assert_eq!(pipeline["staged_shard_builders"].as_u64(), Some(0));
         assert_eq!(
             pipeline["staged_merge_workers"].as_u64(),
             Some(crate::indexer::responsiveness::effective_worker_count(2).max(1) as u64)
@@ -73425,183 +72665,25 @@ mod cli_read_db_tests {
     }
 
     #[test]
-    fn state_meta_json_reports_active_rebuild_pipeline_runtime() {
-        let (temp, db_path) = seed_cli_db();
-        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
-        std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
-        std::fs::write(
-            index_path.join(".lexical-rebuild-state.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "version": 2,
-                "schema_hash": crate::search::tantivy::SCHEMA_HASH,
-                "db": {
-                    "db_path": db_path.display().to_string(),
-                    "total_conversations": 10,
-                    "storage_fingerprint": "10:42:0:0"
-                },
-                "page_size": crate::indexer::LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
-                "committed_offset": 4,
-                "committed_conversation_id": 4,
-                "processed_conversations": 4,
-                "indexed_docs": 20,
-                "committed_meta_fingerprint": null,
-                "pending": null,
-                "completed": false,
-                "updated_at_ms": 1_733_000_123_000_i64,
-                "runtime": {
-                    "queue_depth": 3,
-                    "inflight_message_bytes": 65_536,
-                    "max_message_bytes_in_flight": 131_072,
-                    "pending_batch_conversations": 9,
-                    "pending_batch_message_bytes": 131_072,
-                    "page_prep_workers": 6,
-                    "active_page_prep_jobs": 2,
-                    "ordered_buffered_pages": 4,
-                    "budget_generation": 1,
-                    "producer_budget_wait_count": 2,
-                    "producer_budget_wait_ms": 17,
-                    "producer_handoff_wait_count": 1,
-                    "producer_handoff_wait_ms": 9,
-                    "host_loadavg_1m_milli": 7_250,
-                    "controller_mode": "pressure_limited",
-                    "controller_reason": "queue_depth_3_reached_pipeline_capacity_3",
-                    "staged_merge_workers_max": 3,
-                    "staged_merge_allowed_jobs": 1,
-                    "staged_merge_active_jobs": 1,
-                    "staged_merge_ready_artifacts": 5,
-                    "staged_merge_ready_groups": 1,
-                    "staged_merge_controller_reason": "page_prep_workers_saturated_6_of_6",
-                    "staged_shard_build_workers_max": 6,
-                    "staged_shard_build_allowed_jobs": 5,
-                    "staged_shard_build_active_jobs": 4,
-                    "staged_shard_build_pending_jobs": 2,
-                    "staged_shard_build_controller_reason": "reserving_1_slots_for_staged_merge_active_jobs_1_ready_groups_1",
-                    "updated_at_ms": 1_733_000_124_000_i64
-                }
-            }))
-            .expect("serialize rebuild state"),
-        )
-        .expect("write rebuild state");
-
-        let lock_path = temp.path().join("index-run.lock");
-        let mut lock_file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-            .expect("open lock file");
-        lock_file.try_lock_exclusive().expect("hold index lock");
-        write_index_lock_metadata(
-            &lock_path,
-            &mut lock_file,
-            &format!(
-                "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index\n",
-                std::process::id(),
-                1_733_000_111_000_i64,
-                db_path.display()
-            ),
-        );
-
-        let state = state_meta_json(temp.path(), &db_path, 60, true);
-        let runtime = &state["rebuild"]["pipeline"]["runtime"];
-        let pipeline = &state["rebuild"]["pipeline"];
-
-        assert_eq!(runtime["queue_depth"].as_u64(), Some(3));
-        assert_eq!(
-            runtime["queue_capacity"].as_u64(),
-            pipeline["pipeline_channel_size"].as_u64()
-        );
-        assert_eq!(
-            runtime["queue_headroom"].as_u64(),
-            runtime["queue_capacity"]
-                .as_u64()
-                .map(|value| value.saturating_sub(3))
-        );
-        assert_eq!(runtime["inflight_message_bytes"].as_u64(), Some(65_536));
-        assert_eq!(
-            runtime["max_message_bytes_in_flight"].as_u64(),
-            Some(131_072)
-        );
-        assert_eq!(
-            runtime["inflight_message_bytes_headroom"].as_u64(),
-            Some(65_536)
-        );
-        assert_eq!(runtime["pending_batch_conversations"].as_u64(), Some(9));
-        assert_eq!(
-            runtime["pending_batch_message_bytes"].as_u64(),
-            Some(131_072)
-        );
-        assert_eq!(runtime["page_prep_workers"].as_u64(), Some(6));
-        assert_eq!(runtime["active_page_prep_jobs"].as_u64(), Some(2));
-        assert_eq!(runtime["ordered_buffered_pages"].as_u64(), Some(4));
-        assert_eq!(runtime["budget_generation"].as_u64(), Some(1));
-        assert_eq!(runtime["producer_budget_wait_count"].as_u64(), Some(2));
-        assert_eq!(runtime["producer_budget_wait_ms"].as_u64(), Some(17));
-        assert_eq!(runtime["producer_handoff_wait_count"].as_u64(), Some(1));
-        assert_eq!(runtime["producer_handoff_wait_ms"].as_u64(), Some(9));
-        assert_eq!(runtime["host_loadavg_1m"].as_f64(), Some(7.25));
-        assert_eq!(
-            runtime["controller_mode"].as_str(),
-            Some("pressure_limited")
-        );
-        assert_eq!(
-            runtime["controller_reason"].as_str(),
-            Some("queue_depth_3_reached_pipeline_capacity_3")
-        );
-        assert_eq!(runtime["staged_merge_workers_max"].as_u64(), Some(3));
-        assert_eq!(runtime["staged_merge_allowed_jobs"].as_u64(), Some(1));
-        assert_eq!(runtime["staged_merge_active_jobs"].as_u64(), Some(1));
-        assert_eq!(runtime["staged_merge_ready_artifacts"].as_u64(), Some(5));
-        assert_eq!(runtime["staged_merge_ready_groups"].as_u64(), Some(1));
-        assert_eq!(
-            runtime["staged_merge_controller_reason"].as_str(),
-            Some("page_prep_workers_saturated_6_of_6")
-        );
-        assert_eq!(runtime["staged_shard_build_workers_max"].as_u64(), Some(6));
-        assert_eq!(runtime["staged_shard_build_allowed_jobs"].as_u64(), Some(5));
-        assert_eq!(runtime["staged_shard_build_active_jobs"].as_u64(), Some(4));
-        assert_eq!(runtime["staged_shard_build_pending_jobs"].as_u64(), Some(2));
-        assert_eq!(
-            runtime["staged_shard_build_controller_reason"].as_str(),
-            Some("reserving_1_slots_for_staged_merge_active_jobs_1_ready_groups_1")
-        );
-        assert_eq!(
-            runtime["updated_at"].as_str(),
-            format_timestamp_millis_rfc3339(1_733_000_124_000_i64).as_deref()
-        );
-    }
-
-    #[test]
     fn state_meta_json_hides_empty_active_rebuild_pipeline_runtime_before_first_heartbeat() {
+        // W2-6 exec39 (checkpoint-fixture item3, control-plane ruling):
+        // this test used to also write the retired
+        // `.lexical-rebuild-state.json` checkpoint file here (SCHEMA_HASH
+        // + a "runtime" telemetry blob). It was already dead weight
+        // before this edit -- `state["rebuild"]["pipeline"]["runtime"]`
+        // is unconditionally `Value::Null` regardless of any file content
+        // (see the `pipeline.insert("runtime", ...)` call this function
+        // exercises below), and `rebuilding`/`rebuild.active` come from
+        // the index-run.lock file's `mode=index`, not this checkpoint.
+        // The write never affected any assertion in this test; removed
+        // rather than left as a misleading no-op (third instance of the
+        // "adjacent test already migrated, this one wasn't" pattern --
+        // see `state_meta_json_reports_active_rebuild` below for the
+        // exec36 precedent that already made this exact move).
         let (temp, db_path) = seed_cli_db();
-        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        let index_path = crate::indexer::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
         std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
-        std::fs::write(
-            index_path.join(".lexical-rebuild-state.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "version": 2,
-                "schema_hash": crate::search::tantivy::SCHEMA_HASH,
-                "db": {
-                    "db_path": db_path.display().to_string(),
-                    "total_conversations": 10,
-                    "storage_fingerprint": "10:42:0:0"
-                },
-                "page_size": crate::indexer::LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
-                "committed_offset": 4,
-                "committed_conversation_id": 4,
-                "processed_conversations": 4,
-                "indexed_docs": 20,
-                "committed_meta_fingerprint": null,
-                "pending": null,
-                "completed": false,
-                "updated_at_ms": 1_733_000_123_000_i64
-            }))
-            .expect("serialize rebuild state"),
-        )
-        .expect("write rebuild state");
 
         let lock_path = temp.path().join("index-run.lock");
         let mut lock_file = std::fs::OpenOptions::new()
@@ -73635,32 +72717,30 @@ mod cli_read_db_tests {
     #[test]
     fn state_meta_json_reports_active_rebuild() {
         let (temp, db_path) = seed_cli_db();
-        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        let index_path = crate::indexer::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
         std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
-        std::fs::write(
-            index_path.join(".lexical-rebuild-state.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "version": 2,
-                "schema_hash": crate::search::tantivy::SCHEMA_HASH,
-                "db": {
-                    "db_path": db_path.display().to_string(),
-                    "total_conversations": 10,
-                    "storage_fingerprint": "10:42:0:0"
-                },
-                "page_size": crate::indexer::LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
-                "committed_offset": 4,
-                "committed_conversation_id": 4,
-                "processed_conversations": 4,
-                "indexed_docs": 20,
-                "committed_meta_fingerprint": null,
-                "pending": null,
-                "completed": false,
-                "updated_at_ms": 1_733_000_123_000_i64
-            }))
-            .expect("serialize rebuild state"),
-        )
-        .expect("write rebuild state");
+        // W2-6 exec36 Task甲2 (control-plane 2026-08-30 ruling, ③): the retired
+        // JSON checkpoint file is no longer read anywhere -- "a rebuild is in
+        // progress" is now carried by the SQLite `lex_domain_rebuild_state`
+        // meta marker (storage::sqlite::lex_domain_rebuild_marker_status).
+        // Plant the Building marker through a real write against the seeded
+        // db instead of the dead file, mirroring the real write path
+        // (storage/sqlite.rs's own `write_lex_domain_rebuild_marker_building`
+        // uses the identical statement against the same key/value pair).
+        {
+            let storage = FrankenStorage::open(&db_path).expect("reopen cass db for marker write");
+            storage
+                .raw()
+                .execute(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                    &crate::storage::api::params![
+                        crate::storage::sqlite::LEX_DOMAIN_REBUILD_STATE_META_KEY,
+                        "building"
+                    ],
+                )
+                .expect("write lex domain rebuild marker (building)");
+        }
 
         let lock_path = temp.path().join("index-run.lock");
         let mut lock_file = std::fs::OpenOptions::new()
@@ -73685,85 +72765,24 @@ mod cli_read_db_tests {
         let state = state_meta_json(temp.path(), &db_path, 60, true);
         assert_eq!(state["index"]["rebuilding"].as_bool(), Some(true));
         assert_eq!(state["rebuild"]["active"].as_bool(), Some(true));
-        assert_eq!(state["pending"]["sessions"].as_u64(), Some(6));
+        // The marker's Building variant carries no progress counters (no
+        // partial-progress resume, per its own doc -- see w2-d4) -- what it
+        // DOES report honestly is "a checkpoint exists and isn't finished".
         assert_eq!(
-            state["rebuild"]["processed_conversations"].as_u64(),
-            Some(4)
+            state["index"]["checkpoint"]["present"].as_bool(),
+            Some(true)
         );
-        assert_eq!(state["rebuild"]["total_conversations"].as_u64(), Some(10));
-    }
-
-    #[test]
-    fn state_meta_json_prefers_pending_rebuild_progress_when_present() {
-        let (temp, db_path) = seed_cli_db();
-        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
-        std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
-        std::fs::write(
-            index_path.join(".lexical-rebuild-state.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "version": 2,
-                "schema_hash": crate::search::tantivy::SCHEMA_HASH,
-                "db": {
-                    "db_path": db_path.display().to_string(),
-                    "total_conversations": 10,
-                    "storage_fingerprint": "10:42:0:0"
-                },
-                "page_size": crate::indexer::LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
-                "committed_offset": 4,
-                "committed_conversation_id": 4,
-                "processed_conversations": 4,
-                "indexed_docs": 20,
-                "committed_meta_fingerprint": null,
-                "pending": {
-                    "next_offset": 6,
-                    "next_conversation_id": 6,
-                    "processed_conversations": 6,
-                    "indexed_docs": 30,
-                    "base_meta_fingerprint": "stable-meta"
-                },
-                "completed": false,
-                "updated_at_ms": 1_733_000_223_000_i64
-            }))
-            .expect("serialize rebuild state"),
-        )
-        .expect("write rebuild state");
-
-        let lock_path = temp.path().join("index-run.lock");
-        let mut lock_file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-            .expect("open lock file");
-        lock_file.try_lock_exclusive().expect("hold index lock");
-        write_index_lock_metadata(
-            &lock_path,
-            &mut lock_file,
-            &format!(
-                "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index\n",
-                std::process::id(),
-                1_733_000_111_000_i64,
-                db_path.display()
-            ),
-        );
-
-        let state = state_meta_json(temp.path(), &db_path, 60, true);
-        assert_eq!(state["rebuild"]["active"].as_bool(), Some(true));
-        assert_eq!(state["pending"]["sessions"].as_u64(), Some(4));
         assert_eq!(
-            state["rebuild"]["processed_conversations"].as_u64(),
-            Some(6)
+            state["index"]["checkpoint"]["completed"].as_bool(),
+            Some(false)
         );
-        assert_eq!(state["rebuild"]["indexed_docs"].as_u64(), Some(30));
     }
 
     #[test]
     fn state_meta_json_matches_active_rebuild_for_equivalent_db_path_spellings() {
         let (temp, db_path) = seed_cli_db();
         let db_path_variant = temp.path().join(".").join("agent_search.db");
-        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        let index_path = crate::indexer::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
         std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
 
@@ -73835,7 +72854,7 @@ mod cli_read_db_tests {
     #[test]
     fn state_meta_json_reports_active_data_dir_lock_without_db_path_metadata() {
         let (temp, db_path) = seed_cli_db();
-        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        let index_path = crate::indexer::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
         std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
 
@@ -73893,7 +72912,7 @@ mod cli_read_db_tests {
     #[test]
     fn state_meta_json_reports_active_rebuild_before_lexical_snapshot_exists() {
         let (temp, db_path) = seed_cli_db();
-        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        let index_path = crate::indexer::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
         std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
 
@@ -73934,7 +72953,7 @@ mod cli_read_db_tests {
     #[test]
     fn state_meta_json_reports_watch_active_without_marking_rebuild() {
         let (temp, db_path) = seed_cli_db();
-        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        let index_path = crate::indexer::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
         std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
 
@@ -73973,7 +72992,7 @@ mod cli_read_db_tests {
         // and returns a clean default snapshot.  Verify that the state_meta
         // JSON reflects the reaped (clean) state.
         let (temp, db_path) = seed_cli_db();
-        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        let index_path = crate::indexer::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
         std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
 
@@ -74011,58 +73030,9 @@ mod cli_read_db_tests {
     }
 
     #[test]
-    fn state_meta_json_uses_latest_lock_heartbeat_when_asset_inspection_fails() {
-        let (temp, db_path) = seed_cli_db();
-        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
-        std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
-        std::fs::create_dir_all(index_path.join(".lexical-rebuild-state.json"))
-            .expect("create unreadable rebuild state path");
-
-        let lock_path = temp.path().join("index-run.lock");
-        let mut lock_file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-            .expect("open lock file");
-        lock_file.try_lock_exclusive().expect("hold index lock");
-        write_index_lock_metadata(
-            &lock_path,
-            &mut lock_file,
-            &format!(
-                concat!(
-                    "pid={}\n",
-                    "started_at_ms={}\n",
-                    "updated_at_ms={}\n",
-                    "db_path={}\n",
-                    "mode=index\n"
-                ),
-                std::process::id(),
-                1_733_000_555_000_i64,
-                1_733_000_666_000_i64,
-                db_path.display()
-            ),
-        );
-
-        let state = state_meta_json(temp.path(), &db_path, 60, true);
-        assert_eq!(state["index"]["status"].as_str(), Some("error"));
-        assert_eq!(
-            state["index"]["activity_at"].as_str(),
-            Some("2024-11-30T21:04:26+00:00")
-        );
-        assert!(
-            state["index"]["reason"]
-                .as_str()
-                .is_some_and(|reason| reason.contains("asset inspection failed"))
-        );
-    }
-
-    #[test]
     fn state_meta_json_does_not_infer_watch_activity_from_watch_state_file() {
         let (temp, db_path) = seed_cli_db();
-        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        let index_path = crate::indexer::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
         std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
         std::fs::write(
@@ -74074,61 +73044,6 @@ mod cli_read_db_tests {
         let state = state_meta_json(temp.path(), &db_path, 60, true);
         assert_eq!(state["pending"]["watch_active"].as_bool(), Some(false));
         assert_eq!(state["pending"]["sessions"].as_u64(), Some(0));
-    }
-
-    #[test]
-    fn state_meta_json_marks_lexical_fingerprint_mismatch_stale() {
-        let (temp, db_path) = seed_cli_db();
-        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
-        std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
-        std::fs::write(
-            index_path.join(".lexical-rebuild-state.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "version": 2,
-                "schema_hash": crate::search::tantivy::SCHEMA_HASH,
-                "db": {
-                    "db_path": db_path.display().to_string(),
-                    "total_conversations": 10,
-                    "storage_fingerprint": "stale-fingerprint"
-                },
-                "page_size": crate::indexer::LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
-                "committed_offset": 10,
-                "committed_conversation_id": 10,
-                "processed_conversations": 10,
-                "indexed_docs": 20,
-                "committed_meta_fingerprint": null,
-                "pending": null,
-                "completed": true,
-                "updated_at_ms": 1_733_000_123_000_i64
-            }))
-            .expect("serialize rebuild state"),
-        )
-        .expect("write rebuild state");
-
-        let state = state_meta_json(temp.path(), &db_path, 60, true);
-        assert_eq!(state["index"]["status"].as_str(), Some("stale"));
-        assert_eq!(state["index"]["stale"].as_bool(), Some(true));
-        assert_eq!(
-            state["index"]["fingerprint"]["matches_current_db_fingerprint"].as_bool(),
-            Some(false)
-        );
-        assert!(
-            state["index"]["reason"]
-                .as_str()
-                .is_some_and(|reason| reason.contains("fingerprint"))
-        );
-        assert_eq!(state["pending"]["sessions"].as_u64(), Some(0));
-        assert_eq!(
-            state["rebuild"]["processed_conversations"],
-            serde_json::Value::Null
-        );
-        assert_eq!(
-            state["rebuild"]["total_conversations"],
-            serde_json::Value::Null
-        );
-        assert_eq!(state["rebuild"]["indexed_docs"], serde_json::Value::Null);
-        assert_eq!(state["semantic"]["fallback_mode"].as_str(), Some("lexical"));
     }
 
     #[test]
@@ -74822,16 +73737,14 @@ mod cli_read_db_tests {
     }
 }
 
-/// Data gathered by the bounded archive-DB doctor probe (#287): row counts,
-/// the PRAGMA integrity verdict, and (when the database is healthy) the FTS
-/// visibility state — everything `run_doctor_impl` needs to reconstruct the
-/// `database`/`fts_table` checks without touching the connection on the main
-/// thread.
+/// Data gathered by the bounded archive-DB doctor probe (#287): row counts
+/// and the PRAGMA integrity verdict — everything `run_doctor_impl` needs to
+/// reconstruct the `database` check without touching the connection on the
+/// main thread.
 struct DoctorBoundedArchiveDbProbe {
     conv_count: Option<i64>,
     msg_count: Option<i64>,
     integrity: Option<Result<DoctorDatabaseIntegrityProbe, String>>,
-    fts_state: Option<DoctorFtsTableState>,
 }
 
 enum DoctorBoundedArchiveDbProbeOutcome {
@@ -74894,16 +73807,9 @@ fn run_bounded_doctor_archive_db_probe(
             )
             .ok();
         let mut integrity = None;
-        let mut fts_state = None;
         if conv_count.is_some() && msg_count.is_some() {
             set_phase("integrity_probe");
-            let probe = doctor_database_integrity_probe(&conn);
-            let healthy = matches!(&probe, Ok(result) if result.is_ok());
-            integrity = Some(probe);
-            if healthy {
-                set_phase("fts_probe");
-                fts_state = Some(probe_doctor_fts_table(&conn));
-            }
+            integrity = Some(doctor_database_integrity_probe(&conn));
         }
         set_phase("connection_close");
         let _ = close_franken_cli_read_db(conn, &worker_db_path, "doctor database health");
@@ -74911,7 +73817,6 @@ fn run_bounded_doctor_archive_db_probe(
             conv_count,
             msg_count,
             integrity,
-            fts_state,
         });
     });
 
@@ -74951,7 +73856,7 @@ pub(crate) fn run_doctor_impl(
     let start = Instant::now();
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
-    let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
+    let index_path = crate::indexer::expected_index_dir(&data_dir);
     let lock_path = data_dir.join(".index.lock");
     let mut timing_spans: Vec<DoctorTimingSpanReport> = Vec::new();
     let lock_probe_started = Instant::now();
@@ -75029,7 +73934,8 @@ pub(crate) fn run_doctor_impl(
     let not_initialized = !fix
         && cass_not_initialized(
             db_path.exists(),
-            crate::search::tantivy::searchable_index_exists(&index_path),
+            // W2-6 Task1: reseated onto the lex_docs/fts_lex SQLite domain.
+            crate::search::lexical_index_health::searchable_index_exists(&db_path),
             rebuild_active,
         );
     let explanation = not_initialized.then(|| cass_not_initialized_explanation(&data_dir));
@@ -75048,7 +73954,6 @@ pub(crate) fn run_doctor_impl(
     let mut checks: Vec<Check> = Vec::new();
     let mut needs_rebuild = force_rebuild;
     let mut db_ok = false;
-    let mut db_conversations: Option<usize> = None;
     let mut db_messages: Option<usize> = None;
     // `.14.1` storage-integrity signals (bead vl1cj): the read-only facts the
     // database + lexical-index checks below already observe, from which the
@@ -75352,7 +74257,6 @@ pub(crate) fn run_doctor_impl(
                         if let (Some(conv_count), Some(msg_count), Some(integrity_probe)) =
                             (probe.conv_count, probe.msg_count, probe.integrity)
                         {
-                            db_conversations = Some(conv_count.max(0) as usize);
                             db_messages = Some(msg_count.max(0) as usize);
                             match integrity_probe {
                                 Ok(integrity) if integrity.is_ok() => {
@@ -75366,40 +74270,6 @@ pub(crate) fn run_doctor_impl(
                                         ),
                                         false
                                     );
-
-                                    // Check whether the FTS table is visible through
-                                    // the legacy embedded engine on this connection. Do not auto-register
-                                    // it here: on migrated databases with legacy rootpage=0
-                                    // FTS schema entries, CREATE VIRTUAL TABLE IF NOT EXISTS
-                                    // can persist duplicate sqlite_master rows.
-                                    match probe.fts_state {
-                                        Some(DoctorFtsTableState::QueryableViaFrankensqlite) => {
-                                            add_check!(
-                                                "fts_table",
-                                                "pass",
-                                                "FTS search table (fts_messages) is queryable via the legacy embedded engine",
-                                                false
-                                            );
-                                        }
-                                        Some(DoctorFtsTableState::Missing {
-                                            frankensqlite_error,
-                                        }) => {
-                                            // An absent in-DB FTS shadow is benign
-                                            // here (lexical search falls back to
-                                            // Tantivy), so it does NOT feed the
-                                            // storage_state derivation — doctor
-                                            // reports it as a `pass` below.
-                                            add_check!(
-                                                "fts_table",
-                                                "pass",
-                                                format!(
-                                                    "Database-resident FTS table is absent or not queryable via the legacy embedded engine ({frankensqlite_error}); lexical search relies on the Tantivy index instead"
-                                                ),
-                                                false
-                                            );
-                                        }
-                                        None => {}
-                                    }
                                 }
                                 Ok(integrity) => {
                                     storage_integrity_failed = true;
@@ -75487,10 +74357,11 @@ pub(crate) fn run_doctor_impl(
         vec!["archive DB open, row counts, and integrity-style checks completed or were skipped by state".to_string()],
     );
 
-    // 4. Check Tantivy index exists and is readable
+    // 4. Check lexical index exists and is readable (W2-6 Task1: reseated
+    // onto the lex_docs/fts_lex SQLite domain).
     let lexical_probe_started = Instant::now();
-    if crate::search::tantivy::searchable_index_exists(&index_path) {
-        match crate::search::tantivy::searchable_index_summary(&index_path) {
+    if crate::search::lexical_index_health::searchable_index_exists(&db_path) {
+        match crate::search::lexical_index_health::searchable_index_summary(&db_path) {
             Ok(Some(summary)) => {
                 let num_docs = summary.docs;
                 add_check!(
@@ -76492,7 +75363,6 @@ pub(crate) fn run_doctor_impl(
                             {
                                 if status.trim().eq_ignore_ascii_case("ok") {
                                     db_ok = true;
-                                    db_conversations = Some(conv_count.max(0) as usize);
                                     db_messages = Some(msg_count.max(0) as usize);
                                     checks.push(Check {
                                         name: "database_after_candidate_promotion".to_string(),
@@ -76667,12 +75537,10 @@ pub(crate) fn run_doctor_impl(
         let rebuild_from_db = db_ok && db_messages.unwrap_or(0) > 0;
 
         if rebuild_from_db {
-            let total_convs = db_conversations.unwrap_or(0);
             let rebuild_handle = std::thread::spawn({
                 let progress = progress.clone();
                 let db_path = db_path.clone();
-                let data_dir = data_dir.clone();
-                move || rebuild_tantivy_from_db(&db_path, &data_dir, total_convs, Some(progress))
+                move || rebuild_tantivy_from_db(&db_path, Some(progress))
             });
 
             let rebuild_result = wait_with_progress(
@@ -86657,1160 +85525,6 @@ fn refresh_index_inline(db_override: Option<PathBuf>, data_dir_override: Option<
     }
 }
 
-/// Collect forensic context for a stalled `cass index` run so the JSON stall
-/// event carries enough on-disk state for issue triage without requiring the
-/// reporter to run secondary commands. All lookups are best-effort: if a path
-/// is missing or unreadable, we record the failure but never propagate an
-/// error out of the watchdog emitter.
-fn collect_stall_diagnostics(data_dir: &Path) -> serde_json::Value {
-    // Keep the snapshot compact — this is an observability event on stderr,
-    // not a full forensic bundle. If the reporter needs more, the event hint
-    // already tells them how to grab a stack trace.
-    const MAX_CHECKPOINT_BYTES: u64 = 64 * 1024;
-
-    let mut out = serde_json::Map::new();
-
-    let index_dir = data_dir.join("index");
-    out.insert(
-        "index_dir".into(),
-        serde_json::json!(index_dir.display().to_string()),
-    );
-    out.insert(
-        "index_dir_exists".into(),
-        serde_json::json!(index_dir.is_dir()),
-    );
-
-    // Candidate checkpoint filenames observed across cass versions. Recording
-    // any we find means the hang reporter doesn't need to hunt for the right
-    // name on their host.
-    let checkpoint_candidates = [
-        "lexical_rebuild_state.json",
-        "lexical_rebuild_state.v2.json",
-    ];
-    let mut checkpoints = serde_json::Map::new();
-    for name in checkpoint_candidates {
-        let path = index_dir.join(name);
-        if !path.exists() {
-            continue;
-        }
-        let meta = std::fs::metadata(&path).ok();
-        let size = meta.as_ref().map(std::fs::Metadata::len).unwrap_or(0);
-        let modified_ms = meta
-            .as_ref()
-            .and_then(|m| m.modified().ok())
-            .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as u64);
-        let mut entry = serde_json::Map::new();
-        entry.insert("path".into(), serde_json::json!(path.display().to_string()));
-        entry.insert("size_bytes".into(), serde_json::json!(size));
-        if let Some(ms) = modified_ms {
-            entry.insert("modified_ms".into(), serde_json::json!(ms));
-        }
-        if size <= MAX_CHECKPOINT_BYTES {
-            match std::fs::read_to_string(&path) {
-                Ok(contents) => {
-                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&contents) {
-                        entry.insert("content".into(), parsed);
-                    } else {
-                        entry.insert("content_raw".into(), serde_json::json!(contents));
-                    }
-                }
-                Err(err) => {
-                    entry.insert("read_error".into(), serde_json::json!(err.to_string()));
-                }
-            }
-        } else {
-            entry.insert(
-                "content_omitted".into(),
-                serde_json::json!("file larger than 64 KiB; dump manually with `cat`"),
-            );
-        }
-        checkpoints.insert(name.to_string(), serde_json::Value::Object(entry));
-    }
-    out.insert(
-        "lexical_rebuild_checkpoint".into(),
-        serde_json::Value::Object(checkpoints),
-    );
-
-    // Tantivy segment count at stall time — catches the producer/consumer
-    // mismatch where segments are being written but the checkpoint still
-    // reports zero processed conversations.
-    if let Ok(entries) = std::fs::read_dir(&index_dir) {
-        let mut segment_count: u64 = 0;
-        let mut segment_bytes: u64 = 0;
-        for entry in entries.flatten() {
-            if let Some(ext) = entry.path().extension().and_then(|e| e.to_str())
-                && matches!(ext, "idx" | "pos" | "fast" | "term" | "store" | "fieldnorm")
-            {
-                segment_count = segment_count.saturating_add(1);
-                if let Ok(meta) = entry.metadata() {
-                    segment_bytes = segment_bytes.saturating_add(meta.len());
-                }
-            }
-        }
-        out.insert(
-            "tantivy_segment_files".into(),
-            serde_json::json!(segment_count),
-        );
-        out.insert(
-            "tantivy_segment_bytes".into(),
-            serde_json::json!(segment_bytes),
-        );
-    }
-
-    // Index run lock file — if heartbeating, tells the reporter another
-    // process may actually be holding the writer.
-    let lock_path = data_dir.join("index-run.lock");
-    if lock_path.exists() {
-        let mut lock = serde_json::Map::new();
-        lock.insert(
-            "path".into(),
-            serde_json::json!(lock_path.display().to_string()),
-        );
-        if let Ok(meta) = std::fs::metadata(&lock_path) {
-            lock.insert("size_bytes".into(), serde_json::json!(meta.len()));
-            if let Ok(modified) = meta.modified()
-                && let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH)
-            {
-                lock.insert(
-                    "modified_ms".into(),
-                    serde_json::json!(duration.as_millis() as u64),
-                );
-            }
-        }
-        if let Ok(contents) = std::fs::read_to_string(&lock_path) {
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&contents) {
-                lock.insert("content".into(), parsed);
-            } else {
-                lock.insert("content_raw".into(), serde_json::json!(contents));
-            }
-        }
-        out.insert("index_run_lock".into(), serde_json::Value::Object(lock));
-    }
-
-    serde_json::Value::Object(out)
-}
-
-const INDEX_STALL_HINT: &str = concat!(
-    "Indexer made no forward progress for the configured stall window. ",
-    "Capture a stack trace with `sudo cat /proc/$(pgrep -f 'cass index')/stack` ",
-    "and/or `sudo gdb -batch -ex 'thread apply all bt' -p $(pgrep -f 'cass index') 2>/dev/null | head -200` ",
-    "and attach to issue #244 (indexing-phase wedges) or #258 (watch_startup wedges where the lock-file ",
-    "heartbeat keeps refreshing while one thread spins). Set CASS_INDEX_STALL_DETECT_SECS=0 to disable detection; ",
-    "set CASS_INDEX_STALL_ABORT_SECS=0 to keep phase-2 stalls report-only. ",
-    "If `finalizing` is true in the diagnostics the indexer is inside the final WAL checkpoint of a large ",
-    "deferred bulk-ingest WAL (slow on macOS); CASS_INDEX_FINALIZE_ABORT_SECS (default 1800) bounds that window, ",
-    "and CASS_INDEX_WRITER_WAL_AUTOCHECKPOINT_PAGES=1000 caps WAL growth so the final checkpoint stays small."
-);
-
-fn index_stall_threshold(progress_interval: Duration) -> Option<Duration> {
-    let stall_threshold_secs = dotenvy::var("CASS_INDEX_STALL_DETECT_SECS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(120);
-    if stall_threshold_secs == 0 {
-        None
-    } else {
-        let min = progress_interval.saturating_add(Duration::from_secs(1));
-        Some(Duration::from_secs(stall_threshold_secs).max(min))
-    }
-}
-
-fn index_stall_abort_threshold(
-    progress_interval: Duration,
-    report_threshold: Option<Duration>,
-) -> Option<Duration> {
-    let report_threshold = report_threshold?;
-    let abort_threshold_secs = dotenvy::var("CASS_INDEX_STALL_ABORT_SECS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(300);
-    if abort_threshold_secs == 0 {
-        return None;
-    }
-    let min_after_report = report_threshold
-        .checked_add(progress_interval.max(Duration::from_secs(1)))
-        .unwrap_or(report_threshold);
-    Some(Duration::from_secs(abort_threshold_secs).max(min_after_report))
-}
-
-/// Bounded-but-generous abort grace for the post-publish *finalize* window
-/// (#319/#321).
-///
-/// A non-watch, non-semantic `cass index --full` ends by checkpointing the
-/// deferred bulk-ingest WAL inside `close_storage_after_index` — a synchronous,
-/// `!Send` legacy-embedded-engine `conn.close()` + `wal_checkpoint(TRUNCATE)` that runs
-/// on the indexer thread and cannot advance the progress atomics. On a large
-/// corpus (the #319 report: a ~1.1 GB / ~290k-frame WAL) that checkpoint
-/// legitimately takes minutes, especially on macOS where Darwin fsync/flock is
-/// slow. The generic finalize-wedge abort (`CASS_INDEX_STALL_ABORT_SECS`,
-/// default 300 s) misreads that active checkpoint as a #297 wedge and kills the
-/// process with `exit(70)` mid-checkpoint — stranding the un-truncated WAL and
-/// leaving the DB malformed to stock SQLite (#296/#321).
-///
-/// While the indexer signals `IndexingProgress::finalizing`, the watchdog uses
-/// this larger threshold instead, so a slow-but-progressing final checkpoint
-/// completes. Because the checkpoint is a single blocking `!Send` call on the
-/// indexer thread, it cannot be heartbeated — so a bound is the only liveness
-/// guard against a genuinely stuck finalize: once it elapses the abort still
-/// fires. `CASS_INDEX_FINALIZE_ABORT_SECS=0` makes the finalize window
-/// report-only (never abort). The floor is the ordinary abort threshold, so
-/// this can only ever *lengthen* the finalize grace, never shorten it.
-///
-/// Default value (KU1, `reports/w1-artifacts/ku1-checkpoint-latency.md`):
-/// 20 rounds of 10万-row batch write + `wal_checkpoint(TRUNCATE)` on a staging
-/// DB copy measured p50=1324.5ms / p99=3147ms, i.e. p99×3 ≈ 9.4s — far below
-/// this constant. The formula's floor (never lower than the prior value) wins
-/// here on purpose: the #319 worst case this constant actually guards against
-/// (~1.1 GB / ~290k-frame WAL, slow Darwin fsync) is far larger than anything
-/// the KU1 drill's Linux/NVMe/sub-GB-WAL samples reproduce, so a same-machine
-/// measurement understates it. Re-measure and only then reconsider lowering
-/// this if a representative large-WAL/macOS sample ever becomes available.
-const INDEX_FINALIZE_ABORT_SECS_DEFAULT: u64 = 1800;
-
-fn index_finalize_abort_threshold(abort_threshold: Option<Duration>) -> Option<Duration> {
-    let abort_threshold = abort_threshold?;
-    let finalize_secs = dotenvy::var("CASS_INDEX_FINALIZE_ABORT_SECS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(INDEX_FINALIZE_ABORT_SECS_DEFAULT);
-    if finalize_secs == 0 {
-        return None;
-    }
-    Some(Duration::from_secs(finalize_secs).max(abort_threshold))
-}
-
-#[cfg(test)]
-mod indexer_finalize_abort_threshold_tests {
-    use super::*;
-    use serial_test::serial;
-
-    struct EnvGuard {
-        key: &'static str,
-        previous: Option<String>,
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            if let Some(value) = &self.previous {
-                unsafe {
-                    std::env::set_var(self.key, value);
-                }
-            } else {
-                unsafe {
-                    std::env::remove_var(self.key);
-                }
-            }
-        }
-    }
-
-    fn clear_env(key: &'static str) -> EnvGuard {
-        let previous = dotenvy::var(key).ok();
-        unsafe {
-            std::env::remove_var(key);
-        }
-        EnvGuard { key, previous }
-    }
-
-    /// KU1 (`reports/w1-artifacts/ku1-checkpoint-latency.md`): 20 rounds of
-    /// 10万-row batch write + `wal_checkpoint(TRUNCATE)` on a `VACUUM INTO`
-    /// drill copy of the staging DB measured p50=1324.5ms / p99=3147ms.
-    const KU1_MEASURED_P99_MS: u64 = 3147;
-    const PRE_KU1_DEFAULT_SECS: u64 = 1800;
-
-    #[test]
-    #[serial]
-    fn default_threshold_hits_real_code_path_and_honors_ku1_floor() {
-        // Exercise the real function end-to-end (not the raw constant in
-        // isolation): env override unset, and an ordinary abort_threshold far
-        // below the finalize default, so the finalize floor is what actually
-        // determines the returned value.
-        let _guard = clear_env("CASS_INDEX_FINALIZE_ABORT_SECS");
-        let ordinary = Duration::from_secs(300);
-
-        let resolved = index_finalize_abort_threshold(Some(ordinary))
-            .expect("finalize threshold must be Some when abort_threshold is Some and env unset");
-
-        assert_eq!(
-            resolved,
-            Duration::from_secs(INDEX_FINALIZE_ABORT_SECS_DEFAULT),
-            "default finalize abort threshold must come from the real \
-             index_finalize_abort_threshold() code path, not a hardcoded literal"
-        );
-
-        // KU1 formula: threshold = measured p99 * 3, floored at the prior
-        // production value (never lowered — see the doc comment on
-        // INDEX_FINALIZE_ABORT_SECS_DEFAULT and the KU1 report).
-        let measured_p99_x3_secs = (KU1_MEASURED_P99_MS * 3) as f64 / 1000.0;
-        assert!(
-            (INDEX_FINALIZE_ABORT_SECS_DEFAULT as f64) >= measured_p99_x3_secs,
-            "threshold ({INDEX_FINALIZE_ABORT_SECS_DEFAULT}s) must be >= measured p99*3 ({measured_p99_x3_secs}s)"
-        );
-        assert!(
-            INDEX_FINALIZE_ABORT_SECS_DEFAULT >= PRE_KU1_DEFAULT_SECS,
-            "KU1 must never lower the finalize abort threshold below the prior production value"
-        );
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum IndexStallAbortPolicy {
-    #[cfg(test)]
-    ReportOnly,
-    AbortPhaseTwo,
-}
-
-struct IndexStallWatchdog {
-    data_dir: PathBuf,
-    threshold: Option<Duration>,
-    abort_threshold: Option<Duration>,
-    /// Larger abort grace used only while `IndexingProgress::finalizing` is set
-    /// (the post-publish WAL-checkpoint window). `None` = never abort during
-    /// finalize (report-only). See `index_finalize_abort_threshold` (#319/#321).
-    finalize_abort_threshold: Option<Duration>,
-    abort_policy: IndexStallAbortPolicy,
-    /// True when supervising a long-lived `cass index --watch` daemon. In
-    /// watch mode the post-publish quiescent resting state (phase 0,
-    /// `current >= total`) is normal idle between rescans, not a wedge, so the
-    /// finalize-wedge detect/abort is suppressed (cass #311).
-    is_watch: bool,
-    /// True when this run is building semantic (vector) assets. The native
-    /// MiniLM embed + HNSW build + vector publish all run AFTER the lexical
-    /// rebuild has already parked the progress atomics in the quiescent
-    /// finalize state (phase 0 "preparing", `current >= total`), and they never
-    /// advance those atomics — so that multi-minute CPU-heavy work looks
-    /// identical to a #297 finalize wedge. Without this flag the abort fires
-    /// mid-embed and kills the process with exit(70) before any vector file is
-    /// published, so the next run starts over and semantic search never becomes
-    /// available (cass #315). Set on the semantic index path only.
-    semantic_build: bool,
-    last_phase: usize,
-    last_current: usize,
-    last_progress_advance: std::time::Instant,
-    stall_reported_for_phase: Option<usize>,
-    stall_abort_reported_for_phase: Option<usize>,
-}
-
-impl IndexStallWatchdog {
-    #[cfg(test)]
-    fn new(data_dir: PathBuf, progress_interval: Duration) -> Self {
-        Self::with_abort_policy(
-            data_dir,
-            progress_interval,
-            IndexStallAbortPolicy::ReportOnly,
-        )
-    }
-
-    fn aborting_phase_two(data_dir: PathBuf, progress_interval: Duration) -> Self {
-        Self::with_abort_policy(
-            data_dir,
-            progress_interval,
-            IndexStallAbortPolicy::AbortPhaseTwo,
-        )
-    }
-
-    /// Mark this watchdog as supervising a long-lived `cass index --watch`
-    /// daemon. In watch mode the post-publish, fully-quiescent resting state
-    /// (phase 0 "preparing", `current >= total`) is the NORMAL idle between
-    /// rescans — it is not a wedge. Without this flag the #297 finalize-wedge
-    /// abort fires after `abort_threshold` of that normal idle and crash-loops
-    /// the daemon with exit(70) (cass #311). Set on the watch path only.
-    fn watch_aware(mut self, is_watch: bool) -> Self {
-        self.is_watch = is_watch;
-        self
-    }
-
-    /// Mark this watchdog as supervising a one-shot semantic (vector) index
-    /// build. The native embedding pass, HNSW build, and vector publish all run
-    /// while the progress atomics are already parked in the quiescent finalize
-    /// state (phase 0 "preparing", `current >= total`) left by the preceding
-    /// lexical rebuild, and never advance them — so that legitimate multi-minute
-    /// work matches the #297 finalize-wedge shape exactly. Without this flag the
-    /// #297 abort fires after `abort_threshold` and kills the process with
-    /// exit(70) before any vector file is published (cass #315). Treating the
-    /// quiescent finalize state as healthy active work (like watch-mode idle)
-    /// lets the semantic build run to completion and publish. A genuine phase-2
-    /// (lexical indexing) wedge does not match and is still detected + aborted.
-    fn semantic_aware(mut self, semantic_build: bool) -> Self {
-        self.semantic_build = semantic_build;
-        self
-    }
-
-    fn data_dir(&self) -> &Path {
-        &self.data_dir
-    }
-
-    fn with_abort_policy(
-        data_dir: PathBuf,
-        progress_interval: Duration,
-        abort_policy: IndexStallAbortPolicy,
-    ) -> Self {
-        let threshold = index_stall_threshold(progress_interval);
-        let abort_threshold = index_stall_abort_threshold(progress_interval, threshold);
-        let finalize_abort_threshold = index_finalize_abort_threshold(abort_threshold);
-        Self {
-            data_dir,
-            threshold,
-            abort_threshold,
-            finalize_abort_threshold,
-            abort_policy,
-            is_watch: false,
-            semantic_build: false,
-            last_phase: usize::MAX,
-            last_current: 0,
-            last_progress_advance: std::time::Instant::now(),
-            stall_reported_for_phase: None,
-            stall_abort_reported_for_phase: None,
-        }
-    }
-
-    fn observe(
-        &mut self,
-        index_progress: &indexer::IndexingProgress,
-        elapsed_ms: u128,
-    ) -> Option<serde_json::Value> {
-        let phase_code = index_progress
-            .phase
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let current = index_progress
-            .current
-            .load(std::sync::atomic::Ordering::Relaxed);
-
-        if phase_code != self.last_phase {
-            self.last_phase = phase_code;
-            self.last_current = current;
-            self.last_progress_advance = std::time::Instant::now();
-            self.stall_reported_for_phase = None;
-            self.stall_abort_reported_for_phase = None;
-            return None;
-        }
-
-        if current != self.last_current {
-            self.last_progress_advance = std::time::Instant::now();
-            self.last_current = current;
-            self.stall_reported_for_phase = None;
-            self.stall_abort_reported_for_phase = None;
-            return None;
-        }
-
-        let threshold = self.threshold?;
-        let stall_elapsed = self.last_progress_advance.elapsed();
-        // cass #311: in `--watch` mode the daemon legitimately rests in a
-        // quiescent, fully-published state (phase 0 "preparing",
-        // `current >= total`) between rescans. That resting state matches the
-        // #297 finalize-wedge shape, so the watchdog used to emit a spurious
-        // `stall_detected` and then abort the long-lived watch process with
-        // exit(70) after `abort_threshold` of perfectly normal idle — a
-        // crash-loop (systemd restart -> repeat). Treat the quiescent resting
-        // state as healthy idle in watch mode (no detect, no abort). A genuine
-        // watch wedge in active work — phase 2, or phase 0 with `current < total`
-        // or a non-quiescent rebuild pipeline — does not match and is still
-        // detected and aborted below.
-        //
-        // cass #315: a one-shot `cass index --semantic` build has the same
-        // healthy-idle shape here for the entire semantic pass. The lexical
-        // rebuild finishes and parks progress at phase 0 / `current == total` /
-        // quiescent, then the native MiniLM embed + HNSW build + vector publish
-        // run for minutes WITHOUT ever advancing those atomics. That legitimate
-        // work is indistinguishable from a finalize wedge, so the abort used to
-        // kill the process (exit 70) before publishing any vector index. Treat
-        // the quiescent finalize state as healthy active work for semantic
-        // builds too, so the embed/publish runs to completion. A genuine phase-2
-        // lexical wedge does not match (phase_code != 0) and is still caught.
-        if (self.is_watch || self.semantic_build) && phase_code == 0 {
-            let total = index_progress
-                .total
-                .load(std::sync::atomic::Ordering::Relaxed);
-            if total > 0 && current >= total && index_progress.rebuild_pipeline_is_quiescent() {
-                return None;
-            }
-        }
-        // Historically this gated on `phase_code != 0` so the watchdog
-        // never fired during the "preparing" phase (phase=0). Issue #258
-        // is exactly that: the v0.6.2 watcher wedged at startup before
-        // ever advancing to Scanning/Indexing, the watchdog stayed
-        // silent for 4+ hours, and operators had no signal that the
-        // indexer was stuck. The fix is to also fire on phase=0 wedges
-        // — a startup that takes >120 s with no progress is, by any
-        // sensible definition, a stall worth reporting. The repeat
-        // guard `stall_reported_for_phase == Some(phase_code)` still
-        // prevents log spam from a single stalled phase.
-        if self.stall_reported_for_phase != Some(phase_code) {
-            if stall_elapsed < threshold {
-                return None;
-            }
-
-            self.stall_reported_for_phase = Some(phase_code);
-            return Some(self.stall_payload(
-                index_progress,
-                elapsed_ms,
-                stall_elapsed,
-                threshold,
-                "stall_detected",
-                None,
-            ));
-        }
-
-        let abort_threshold = self.abort_threshold?;
-        // The post-publish / post-rebuild finalize runs under the
-        // "preparing" phase (phase 0) with `current == total`. Issue #297:
-        // a wedge there (workers parked after the lexical publish, never
-        // woken to checkpoint/clean up) used to keep the process alive
-        // indefinitely, because the abort was historically gated on
-        // `phase == 2` only. Extend the abort to fire in any phase once the
-        // work is nominally complete (`current >= total > 0`) AND the
-        // rebuild pipeline is fully quiescent — so a legitimately
-        // slow-but-active sort/rebuild (#294) is never killed. The
-        // `abort_threshold` (default 300 s of zero forward progress) remains
-        // the outer safety margin on top of that.
-        let total = index_progress
-            .total
-            .load(std::sync::atomic::Ordering::Relaxed);
-        // `!self.is_watch`: in watch mode the quiescent `current >= total`
-        // resting state is normal idle (handled by the early return above), so
-        // it must never be treated as a finalize wedge (cass #311).
-        // `!self.semantic_build`: for a one-shot semantic build the same
-        // quiescent state is the active embed/publish window (also handled by
-        // the early return above); belt-and-suspenders so an off-by-one phase
-        // never resurrects the exit(70) that killed the build pre-publish (cass
-        // #315).
-        let finalize_wedge = !self.is_watch
-            && !self.semantic_build
-            && total > 0
-            && current >= total
-            && index_progress.rebuild_pipeline_is_quiescent();
-        let abort_eligible = phase_code == 2 || finalize_wedge;
-        // #319/#321: while the indexer signals `finalizing`, the phase-0 /
-        // current==total / quiescent shape is the post-publish WAL-checkpoint
-        // window, not a #297 wedge. The checkpoint is a synchronous, `!Send`
-        // the legacy embedded engine call on the indexer thread that cannot advance the
-        // progress atomics, so it can only be recognised via this flag. Give it
-        // the larger `finalize_abort_threshold` so a slow-but-active checkpoint
-        // of a large deferred WAL completes instead of being killed mid-write
-        // (which strands the WAL and leaves the DB malformed). A genuine phase-2
-        // wedge (phase_code == 2) is unaffected and still aborts at the normal
-        // threshold. Because the checkpoint blocks a single thread and cannot be
-        // heartbeated, the bound is the only liveness guard: once it elapses the
-        // finalize is aborted too.
-        let effective_abort_threshold = if finalize_wedge
-            && phase_code != 2
-            && index_progress
-                .finalizing
-                .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            // Finalize aborts disabled (CASS_INDEX_FINALIZE_ABORT_SECS=0):
-            // treat the finalize window as report-only.
-            self.finalize_abort_threshold?
-        } else {
-            abort_threshold
-        };
-        if self.abort_policy != IndexStallAbortPolicy::AbortPhaseTwo
-            || !abort_eligible
-            || self.stall_abort_reported_for_phase == Some(phase_code)
-            || stall_elapsed < effective_abort_threshold
-        {
-            return None;
-        }
-
-        self.stall_abort_reported_for_phase = Some(phase_code);
-        Some(self.stall_payload(
-            index_progress,
-            elapsed_ms,
-            stall_elapsed,
-            threshold,
-            "stall_aborting",
-            Some(abort_threshold),
-        ))
-    }
-
-    fn stall_payload(
-        &self,
-        index_progress: &indexer::IndexingProgress,
-        elapsed_ms: u128,
-        stall_elapsed: Duration,
-        threshold: Duration,
-        event: &'static str,
-        abort_threshold: Option<Duration>,
-    ) -> serde_json::Value {
-        let stall_elapsed_ms = stall_elapsed.as_millis();
-        let mut payload = index_progress.snapshot_json(elapsed_ms);
-        if let serde_json::Value::Object(ref mut m) = payload {
-            m.insert("event".into(), serde_json::json!(event));
-            m.insert(
-                "ts_ms".into(),
-                serde_json::json!(chrono::Utc::now().timestamp_millis()),
-            );
-            m.insert(
-                "stall_elapsed_ms".into(),
-                serde_json::json!(stall_elapsed_ms as u64),
-            );
-            m.insert(
-                "stall_threshold_secs".into(),
-                serde_json::json!(threshold.as_secs()),
-            );
-            if let Some(abort_threshold) = abort_threshold {
-                m.insert(
-                    "abort_threshold_secs".into(),
-                    serde_json::json!(abort_threshold.as_secs()),
-                );
-                m.insert("abort_process".into(), serde_json::json!(true));
-                m.insert("exit_code".into(), serde_json::json!(70));
-            }
-            m.insert(
-                "diagnostics".into(),
-                collect_stall_diagnostics(&self.data_dir),
-            );
-            m.insert("hint".into(), serde_json::json!(INDEX_STALL_HINT));
-        }
-        payload
-    }
-}
-
-fn index_stall_warning_lines(payload: &serde_json::Value) -> (String, String) {
-    let phase = payload
-        .get("phase")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("unknown");
-    let elapsed_secs = payload
-        .get("stall_elapsed_ms")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or_default()
-        / 1000;
-    let summary = format!(
-        "Warning: cass index made no {phase} progress for {elapsed_secs}s; stall diagnostics follow."
-    );
-    let diagnostics = serde_json::to_string(payload)
-        .unwrap_or_else(|err| format!(r#"{{"event":"stall_detected","serialize_error":"{err}"}}"#));
-    (summary, diagnostics)
-}
-
-fn abort_after_index_stall_if_requested(payload: &serde_json::Value, data_dir: &Path) {
-    if payload
-        .get("abort_process")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
-        eprintln!(
-            "cass index made no indexing progress past the abort threshold; exiting with code 70."
-        );
-        // #296: before the bounded exit (which skips destructors), best-effort
-        // checkpoint the canonical WAL so the killed run leaves a recoverable
-        // DB instead of a multi-GB orphaned WAL. Stale locks are reaped by the
-        // next startup's flock-based recovery.
-        crate::indexer::best_effort_abort_wal_checkpoint(data_dir);
-        std::process::exit(70);
-    }
-}
-
-#[cfg(test)]
-mod stall_diagnostics_tests {
-    use super::collect_stall_diagnostics;
-    use tempfile::TempDir;
-
-    #[test]
-    fn empty_data_dir_produces_null_checkpoint_and_no_lock() {
-        let tmp = TempDir::new().expect("temp dir");
-        let diag = collect_stall_diagnostics(tmp.path());
-        let obj = diag.as_object().expect("object");
-        assert_eq!(obj["index_dir_exists"], serde_json::json!(false));
-        assert!(obj["lexical_rebuild_checkpoint"].is_object());
-        assert!(
-            obj["lexical_rebuild_checkpoint"]
-                .as_object()
-                .expect("object")
-                .is_empty()
-        );
-        assert!(!obj.contains_key("index_run_lock"));
-    }
-
-    #[test]
-    fn captures_checkpoint_contents_and_lock_when_present() {
-        let tmp = TempDir::new().expect("temp dir");
-        let index_dir = tmp.path().join("index");
-        std::fs::create_dir_all(&index_dir).expect("create index dir");
-        std::fs::write(
-            index_dir.join("lexical_rebuild_state.json"),
-            r#"{"completed": true, "committed_conversation_id": 42}"#,
-        )
-        .expect("write checkpoint");
-        std::fs::write(tmp.path().join("index-run.lock"), "pid=12345\nmode=index\n")
-            .expect("write lock");
-        // Synthetic Tantivy-like segment so we exercise the segment counter.
-        std::fs::write(index_dir.join("abcd.idx"), b"x").expect("write segment");
-
-        let diag = collect_stall_diagnostics(tmp.path());
-        let obj = diag.as_object().expect("object");
-        assert_eq!(obj["index_dir_exists"], serde_json::json!(true));
-        assert_eq!(obj["tantivy_segment_files"], serde_json::json!(1));
-        let checkpoint = obj["lexical_rebuild_checkpoint"]
-            .as_object()
-            .expect("checkpoint object");
-        let entry = checkpoint["lexical_rebuild_state.json"]
-            .as_object()
-            .expect("entry");
-        assert_eq!(
-            entry["content"]["completed"],
-            serde_json::json!(true),
-            "parsed checkpoint JSON should round-trip"
-        );
-        let lock = obj["index_run_lock"].as_object().expect("lock object");
-        assert_eq!(lock["size_bytes"], serde_json::json!(21));
-        assert!(lock.contains_key("modified_ms"));
-        assert!(
-            lock["content_raw"]
-                .as_str()
-                .expect("content_raw string")
-                .contains("pid=12345")
-        );
-    }
-
-    #[test]
-    fn oversized_checkpoint_omits_content_but_records_size() {
-        let tmp = TempDir::new().expect("temp dir");
-        let index_dir = tmp.path().join("index");
-        std::fs::create_dir_all(&index_dir).expect("create index dir");
-        let big = vec![b'x'; 128 * 1024];
-        std::fs::write(index_dir.join("lexical_rebuild_state.json"), &big)
-            .expect("write oversize checkpoint");
-
-        let diag = collect_stall_diagnostics(tmp.path());
-        let entry = diag["lexical_rebuild_checkpoint"]["lexical_rebuild_state.json"]
-            .as_object()
-            .expect("entry");
-        assert!(entry.contains_key("content_omitted"));
-        assert!(!entry.contains_key("content"));
-        assert_eq!(entry["size_bytes"], serde_json::json!(big.len() as u64));
-    }
-
-    /// Regression for #258: `IndexStallWatchdog` previously short-
-    /// circuited on `phase_code == 0` (the "preparing" phase before
-    /// Scanning/Indexing), so any startup wedge that never advanced
-    /// past phase=0 was invisible. The v0.6.2 watcher reporter saw
-    /// 4+ hours of silence on exactly that path. The watchdog now
-    /// fires whenever no progress is observed within the threshold,
-    /// regardless of phase.
-    #[test]
-    fn watchdog_fires_on_phase_zero_startup_wedge() {
-        use super::IndexStallWatchdog;
-        use crate::indexer::IndexingProgress;
-        use std::sync::Arc;
-        use std::sync::atomic::Ordering;
-        use std::time::Duration;
-
-        let tmp = TempDir::new().expect("temp dir");
-        let mut watchdog =
-            IndexStallWatchdog::new(tmp.path().to_path_buf(), Duration::from_millis(50));
-        // Force a tiny stall threshold so the test does not need to
-        // sleep 120 s. Using a smaller-than-default value still
-        // exercises the same code path because
-        // `index_stall_threshold` floors at `progress_interval + 1s`,
-        // but for the unit test we drive the watchdog by directly
-        // tampering with `last_progress_advance`.
-        watchdog.threshold = Some(Duration::from_millis(1));
-        // Simulate "indexer just started, phase=0, current=0". Force
-        // last_progress_advance into the past so the threshold has
-        // already elapsed by the time we call `observe`.
-        watchdog.last_phase = 0;
-        watchdog.last_current = 0;
-        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
-
-        let progress = Arc::new(IndexingProgress::default());
-        // Caller has not touched phase/current — still 0/0.
-        assert_eq!(progress.phase.load(Ordering::Relaxed), 0);
-        assert_eq!(progress.current.load(Ordering::Relaxed), 0);
-
-        let payload = watchdog.observe(&progress, 100);
-        let payload = payload.expect(
-            "phase=0 wedges past the stall threshold must emit a stall_detected event (#258)",
-        );
-        let obj = payload.as_object().expect("event payload is an object");
-        assert_eq!(obj["event"], serde_json::json!("stall_detected"));
-        assert!(
-            obj.contains_key("stall_elapsed_ms"),
-            "watchdog event missing stall_elapsed_ms",
-        );
-
-        // Second observe call with no progress must be silenced by
-        // the per-phase repeat guard.
-        let repeat = watchdog.observe(&progress, 200);
-        assert!(
-            repeat.is_none(),
-            "watchdog must not spam repeated events for the same phase",
-        );
-    }
-
-    #[test]
-    fn watchdog_reports_before_phase_two_abort_event() -> anyhow::Result<()> {
-        use super::{IndexStallAbortPolicy, IndexStallWatchdog};
-        use crate::indexer::IndexingProgress;
-        use std::sync::Arc;
-        use std::sync::atomic::Ordering;
-        use std::time::Duration;
-
-        let tmp = TempDir::new()?;
-        let mut watchdog = IndexStallWatchdog::with_abort_policy(
-            tmp.path().to_path_buf(),
-            Duration::from_millis(50),
-            IndexStallAbortPolicy::AbortPhaseTwo,
-        );
-        watchdog.threshold = Some(Duration::from_millis(1));
-        watchdog.abort_threshold = Some(Duration::from_millis(2));
-        watchdog.last_phase = 2;
-        watchdog.last_current = 0;
-        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
-
-        let progress = Arc::new(IndexingProgress::default());
-        progress.phase.store(2, Ordering::Relaxed);
-
-        let report = watchdog
-            .observe(&progress, 100)
-            .ok_or_else(|| anyhow::anyhow!("phase-2 stall observation did not report"))?;
-        assert_eq!(report["event"], serde_json::json!("stall_detected"));
-        assert_ne!(report["abort_process"], serde_json::json!(true));
-
-        let abort = watchdog
-            .observe(&progress, 200)
-            .ok_or_else(|| anyhow::anyhow!("phase-2 stall observation did not request abort"))?;
-        assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
-        assert_eq!(abort["abort_process"], serde_json::json!(true));
-        assert_eq!(abort["exit_code"], serde_json::json!(70));
-
-        let repeat = watchdog.observe(&progress, 300);
-        assert!(
-            repeat.is_none(),
-            "watchdog must not spam repeated abort events for the same stalled phase",
-        );
-        Ok(())
-    }
-
-    /// Regression for #297: the post-publish / post-rebuild finalize runs
-    /// under the "preparing" phase (phase 0) with `current == total`. A
-    /// wedge there used to hang forever because the abort was gated on
-    /// `phase == 2`. The abort now fires for a quiescent finalize wedge in
-    /// any phase.
-    #[test]
-    fn watchdog_aborts_on_quiescent_finalize_wedge() -> anyhow::Result<()> {
-        use super::{IndexStallAbortPolicy, IndexStallWatchdog};
-        use crate::indexer::IndexingProgress;
-        use std::sync::Arc;
-        use std::sync::atomic::Ordering;
-        use std::time::Duration;
-
-        let tmp = TempDir::new()?;
-        let mut watchdog = IndexStallWatchdog::with_abort_policy(
-            tmp.path().to_path_buf(),
-            Duration::from_millis(50),
-            IndexStallAbortPolicy::AbortPhaseTwo,
-        );
-        watchdog.threshold = Some(Duration::from_millis(1));
-        watchdog.abort_threshold = Some(Duration::from_millis(2));
-        watchdog.last_phase = 0;
-        watchdog.last_current = 100;
-        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
-
-        let progress = Arc::new(IndexingProgress::default());
-        // Post-publish finalize: phase back to "preparing" (0), all work
-        // accounted for (current == total), pipeline fully idle.
-        progress.phase.store(0, Ordering::Relaxed);
-        progress.total.store(100, Ordering::Relaxed);
-        progress.current.store(100, Ordering::Relaxed);
-        assert!(progress.rebuild_pipeline_is_quiescent());
-
-        let report = watchdog
-            .observe(&progress, 100)
-            .ok_or_else(|| anyhow::anyhow!("finalize stall did not report"))?;
-        assert_eq!(report["event"], serde_json::json!("stall_detected"));
-        assert_ne!(report["abort_process"], serde_json::json!(true));
-
-        let abort = watchdog.observe(&progress, 200).ok_or_else(|| {
-            anyhow::anyhow!("quiescent finalize wedge did not request abort (#297)")
-        })?;
-        assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
-        assert_eq!(abort["abort_process"], serde_json::json!(true));
-        assert_eq!(abort["exit_code"], serde_json::json!(70));
-        Ok(())
-    }
-
-    /// Regression for #311: in `cass index --watch` mode the post-publish
-    /// quiescent resting state (phase 0, `current == total`, pipeline idle) is
-    /// NORMAL idle between rescans, not a wedge. A watch-aware watchdog must
-    /// neither report a stall nor abort the long-lived daemon with exit(70)
-    /// (the bug: a deterministic exit-70 crash-loop, systemd restart, repeat).
-    /// A genuine phase-2 wedge must still abort even in watch mode.
-    #[test]
-    fn watchdog_does_not_abort_watch_idle_resting_state() -> anyhow::Result<()> {
-        use super::{IndexStallAbortPolicy, IndexStallWatchdog};
-        use crate::indexer::IndexingProgress;
-        use std::sync::Arc;
-        use std::sync::atomic::Ordering;
-        use std::time::Duration;
-
-        let tmp = TempDir::new()?;
-        let mut watchdog = IndexStallWatchdog::with_abort_policy(
-            tmp.path().to_path_buf(),
-            Duration::from_millis(50),
-            IndexStallAbortPolicy::AbortPhaseTwo,
-        )
-        .watch_aware(true);
-        watchdog.threshold = Some(Duration::from_millis(1));
-        watchdog.abort_threshold = Some(Duration::from_millis(2));
-        watchdog.last_phase = 0;
-        watchdog.last_current = 100;
-        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
-
-        let progress = Arc::new(IndexingProgress::default());
-        // Identical state to the #297 finalize-wedge test, but in watch mode
-        // this is healthy idle: the daemon published and awaits the next rescan.
-        progress.phase.store(0, Ordering::Relaxed);
-        progress.total.store(100, Ordering::Relaxed);
-        progress.current.store(100, Ordering::Relaxed);
-        assert!(progress.rebuild_pipeline_is_quiescent());
-
-        // Well past both detect and abort thresholds: a non-watch watchdog
-        // would emit stall_detected then stall_aborting(exit 70) here (see
-        // `watchdog_aborts_on_quiescent_finalize_wedge`). Watch-aware: silent.
-        assert!(
-            watchdog.observe(&progress, 100).is_none(),
-            "watch idle resting state must not be reported as a stall (#311)"
-        );
-        assert!(
-            watchdog.observe(&progress, 200).is_none(),
-            "watch idle resting state must never trigger exit(70) abort (#311)"
-        );
-
-        // A genuine phase-2 wedge in watch mode is still aborted.
-        progress.phase.store(2, Ordering::Relaxed);
-        // The phase change resets the watchdog's progress clock; re-arm it.
-        let _ = watchdog.observe(&progress, 250);
-        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
-        let detected = watchdog
-            .observe(&progress, 300)
-            .ok_or_else(|| anyhow::anyhow!("phase-2 watch stall did not report"))?;
-        assert_eq!(detected["event"], serde_json::json!("stall_detected"));
-        let abort = watchdog
-            .observe(&progress, 400)
-            .ok_or_else(|| anyhow::anyhow!("phase-2 watch stall did not abort"))?;
-        assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
-        assert_eq!(abort["exit_code"], serde_json::json!(70));
-        Ok(())
-    }
-
-    /// Regression for #315: a one-shot `cass index --semantic` build finishes
-    /// the lexical rebuild (parking progress at phase 0, `current == total`,
-    /// pipeline quiescent) and then runs the native embed + HNSW build + vector
-    /// publish for minutes WITHOUT advancing the progress atomics. That work is
-    /// shaped exactly like a #297 finalize wedge, so a non-semantic watchdog
-    /// used to abort mid-embed with exit(70) before publishing any vector index
-    /// — leaving semantic search permanently unavailable. A semantic-aware
-    /// watchdog must treat that quiescent finalize state as healthy active work
-    /// (no exit-70 abort), while a genuine phase-2 lexical wedge still aborts.
-    #[test]
-    fn watchdog_does_not_abort_semantic_finalize_build() -> anyhow::Result<()> {
-        use super::{IndexStallAbortPolicy, IndexStallWatchdog};
-        use crate::indexer::IndexingProgress;
-        use std::sync::Arc;
-        use std::sync::atomic::Ordering;
-        use std::time::Duration;
-
-        let tmp = TempDir::new()?;
-        let mut watchdog = IndexStallWatchdog::with_abort_policy(
-            tmp.path().to_path_buf(),
-            Duration::from_millis(50),
-            IndexStallAbortPolicy::AbortPhaseTwo,
-        )
-        .semantic_aware(true);
-        watchdog.threshold = Some(Duration::from_millis(1));
-        watchdog.abort_threshold = Some(Duration::from_millis(2));
-        watchdog.last_phase = 0;
-        watchdog.last_current = 100;
-        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
-
-        let progress = Arc::new(IndexingProgress::default());
-        // Identical state to the #297 finalize-wedge test, but this is the
-        // semantic embed/publish window: the lexical rebuild published and the
-        // native embedder is now grinding through vectors without touching the
-        // atomics. Well past both detect and abort thresholds.
-        progress.phase.store(0, Ordering::Relaxed);
-        progress.total.store(100, Ordering::Relaxed);
-        progress.current.store(100, Ordering::Relaxed);
-        assert!(progress.rebuild_pipeline_is_quiescent());
-
-        assert!(
-            watchdog.observe(&progress, 100).is_none(),
-            "semantic finalize build must not be reported as a stall (#315)"
-        );
-        assert!(
-            watchdog.observe(&progress, 200).is_none(),
-            "semantic finalize build must never trigger exit(70) before publish (#315)"
-        );
-
-        // A genuine phase-2 lexical wedge during a semantic run is still aborted.
-        progress.phase.store(2, Ordering::Relaxed);
-        // The phase change resets the watchdog's progress clock; re-arm it.
-        let _ = watchdog.observe(&progress, 250);
-        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
-        let detected = watchdog
-            .observe(&progress, 300)
-            .ok_or_else(|| anyhow::anyhow!("phase-2 semantic stall did not report"))?;
-        assert_eq!(detected["event"], serde_json::json!("stall_detected"));
-        let abort = watchdog
-            .observe(&progress, 400)
-            .ok_or_else(|| anyhow::anyhow!("phase-2 semantic stall did not abort"))?;
-        assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
-        assert_eq!(abort["exit_code"], serde_json::json!(70));
-        Ok(())
-    }
-
-    /// Regression for #319/#321: the post-publish finalize WAL checkpoint of a
-    /// large deferred bulk-ingest WAL runs as a synchronous, `!Send`
-    /// the legacy embedded engine call on the indexer thread (inside
-    /// `close_storage_after_index`). It cannot advance the progress atomics, so
-    /// it looks exactly like a #297 finalize wedge — phase 0, `current == total`,
-    /// pipeline quiescent — while the process is actually alive and checkpointing
-    /// (minutes on macOS). Before this fix the watchdog aborted it at the normal
-    /// 300 s threshold with `exit(70)`, killing the checkpoint mid-write and
-    /// stranding the un-truncated ~1.1 GB WAL (leaving the DB malformed to stock
-    /// SQLite). The indexer now sets `IndexingProgress::finalizing`; the watchdog
-    /// must (a) NOT abort while finalizing until the larger
-    /// `finalize_abort_threshold` elapses, yet (b) still abort a genuinely stuck
-    /// finalize once that bound passes, and (c) still abort a normal phase-2
-    /// wedge at the ordinary threshold.
-    #[test]
-    fn watchdog_defers_abort_during_final_wal_checkpoint_finalize() -> anyhow::Result<()> {
-        use super::{IndexStallAbortPolicy, IndexStallWatchdog};
-        use crate::indexer::IndexingProgress;
-        use std::sync::Arc;
-        use std::sync::atomic::Ordering;
-        use std::time::Duration;
-
-        let tmp = TempDir::new()?;
-        let mut watchdog = IndexStallWatchdog::with_abort_policy(
-            tmp.path().to_path_buf(),
-            Duration::from_millis(50),
-            IndexStallAbortPolicy::AbortPhaseTwo,
-        );
-        watchdog.threshold = Some(Duration::from_millis(1));
-        watchdog.abort_threshold = Some(Duration::from_millis(2));
-        // Generous finalize grace: much larger than the ordinary abort threshold.
-        watchdog.finalize_abort_threshold = Some(Duration::from_millis(500));
-        watchdog.last_phase = 0;
-        watchdog.last_current = 100;
-        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
-
-        let progress = Arc::new(IndexingProgress::default());
-        // The exact #297 finalize-wedge shape, but the indexer has signalled it
-        // is inside the final WAL checkpoint.
-        progress.phase.store(0, Ordering::Relaxed);
-        progress.total.store(100, Ordering::Relaxed);
-        progress.current.store(100, Ordering::Relaxed);
-        progress.finalizing.store(true, Ordering::Relaxed);
-        assert!(progress.rebuild_pipeline_is_quiescent());
-
-        // Well past the ordinary abort threshold (2 ms) but under the finalize
-        // grace (500 ms): the first observe reports the stall, but the watchdog
-        // must NOT abort — the checkpoint is legitimate active work.
-        let detected = watchdog
-            .observe(&progress, 100)
-            .ok_or_else(|| anyhow::anyhow!("finalize stall did not report"))?;
-        assert_eq!(detected["event"], serde_json::json!("stall_detected"));
-        assert!(
-            detected.get("exit_code").is_none(),
-            "the stall_detected report must not carry an abort during finalize"
-        );
-        assert_eq!(detected["finalizing"], serde_json::json!(true));
-        for elapsed in [200_u128, 300, 400] {
-            assert!(
-                watchdog.observe(&progress, elapsed).is_none(),
-                "the finalize WAL checkpoint must not be aborted before the finalize grace elapses (#319/#321)"
-            );
-        }
-
-        // Liveness bound: once the finalize grace itself elapses, a genuinely
-        // stuck finalize is still aborted (the checkpoint blocks one thread and
-        // cannot be heartbeated, so this bound is the only guard).
-        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(600);
-        let abort = watchdog
-            .observe(&progress, 500)
-            .ok_or_else(|| anyhow::anyhow!("stuck finalize past the grace did not abort"))?;
-        assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
-        assert_eq!(abort["exit_code"], serde_json::json!(70));
-
-        // Control: with `finalizing` cleared, the identical quiescent shape is a
-        // #297 wedge again and aborts at the ordinary threshold.
-        let mut wedge_watchdog = IndexStallWatchdog::with_abort_policy(
-            tmp.path().to_path_buf(),
-            Duration::from_millis(50),
-            IndexStallAbortPolicy::AbortPhaseTwo,
-        );
-        wedge_watchdog.threshold = Some(Duration::from_millis(1));
-        wedge_watchdog.abort_threshold = Some(Duration::from_millis(2));
-        wedge_watchdog.finalize_abort_threshold = Some(Duration::from_millis(500));
-        wedge_watchdog.last_phase = 0;
-        wedge_watchdog.last_current = 100;
-        wedge_watchdog.last_progress_advance =
-            std::time::Instant::now() - Duration::from_millis(100);
-        progress.finalizing.store(false, Ordering::Relaxed);
-        let detected = wedge_watchdog
-            .observe(&progress, 100)
-            .ok_or_else(|| anyhow::anyhow!("non-finalizing wedge did not report"))?;
-        assert_eq!(detected["event"], serde_json::json!("stall_detected"));
-        let abort = wedge_watchdog.observe(&progress, 200).ok_or_else(|| {
-            anyhow::anyhow!("non-finalizing wedge did not abort at the ordinary threshold")
-        })?;
-        assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
-        assert_eq!(abort["exit_code"], serde_json::json!(70));
-        Ok(())
-    }
-
-    /// A legitimately slow but *active* rebuild (#294) must never be
-    /// aborted outside phase 2, even when `current == total` and the stall
-    /// threshold has elapsed: as long as the pipeline reports in-flight
-    /// work, the watchdog only reports, never aborts.
-    #[test]
-    fn watchdog_does_not_abort_active_rebuild_outside_phase_two() -> anyhow::Result<()> {
-        use super::{IndexStallAbortPolicy, IndexStallWatchdog};
-        use crate::indexer::IndexingProgress;
-        use std::sync::Arc;
-        use std::sync::atomic::Ordering;
-        use std::time::Duration;
-
-        let tmp = TempDir::new()?;
-        let mut watchdog = IndexStallWatchdog::with_abort_policy(
-            tmp.path().to_path_buf(),
-            Duration::from_millis(50),
-            IndexStallAbortPolicy::AbortPhaseTwo,
-        );
-        watchdog.threshold = Some(Duration::from_millis(1));
-        watchdog.abort_threshold = Some(Duration::from_millis(2));
-        watchdog.last_phase = 0;
-        watchdog.last_current = 100;
-        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
-
-        let progress = Arc::new(IndexingProgress::default());
-        progress.phase.store(0, Ordering::Relaxed);
-        progress.total.store(100, Ordering::Relaxed);
-        progress.current.store(100, Ordering::Relaxed);
-        // Still one staged shard build in flight: the rebuild is slow, not
-        // wedged.
-        progress
-            .rebuild_pipeline_staged_shard_build_active_jobs
-            .store(1, Ordering::Relaxed);
-        assert!(!progress.rebuild_pipeline_is_quiescent());
-
-        let report = watchdog
-            .observe(&progress, 100)
-            .ok_or_else(|| anyhow::anyhow!("finalize stall did not report"))?;
-        assert_eq!(report["event"], serde_json::json!("stall_detected"));
-
-        let again = watchdog.observe(&progress, 200);
-        assert!(
-            again.is_none(),
-            "an active (non-quiescent) rebuild must not be aborted outside phase 2 (#294)",
-        );
-        Ok(())
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn run_index_with_data(
     db_override: Option<PathBuf>,
@@ -87968,23 +85682,6 @@ fn run_index_with_data(
         }
     };
 
-    // #287: machine-readable liveness for robot callers. Healthy structured
-    // runs still end with exactly one JSON document on stdout; but when the
-    // stall watchdog fires, a robot caller that only reads stdout used to see
-    // zero bytes until its external timeout killed the process. Emit the
-    // stall/abort payload as an NDJSON event line on stdout too (flushed, in
-    // case the caller kills us next) so the agent can distinguish "wedged
-    // indexer" from "slow command" before its deadline.
-    let emit_robot_stall_event_on_stdout = |payload: &serde_json::Value| {
-        if structured_format.is_some()
-            && let Ok(line) = serde_json::to_string(payload)
-        {
-            use std::io::Write as _;
-            println!("{line}");
-            let _ = std::io::stdout().flush();
-        }
-    };
-
     if let Some(notice) = &indexing_exclusion_notice {
         emit_indexing_exclusion_notice(notice, structured_output);
     }
@@ -88099,10 +85796,6 @@ fn run_index_with_data(
         let mut last_current = usize::MAX;
         let mut last_agents = usize::MAX;
         let mut last_update = std::time::Instant::now();
-        let mut stall_watchdog =
-            IndexStallWatchdog::aborting_phase_two(data_dir.clone(), progress_interval)
-                .watch_aware(watch)
-                .semantic_aware(semantic);
 
         loop {
             // Check if indexer finished
@@ -88187,15 +85880,6 @@ fn run_index_with_data(
                 last_update = now;
             }
 
-            if let Some(payload) =
-                stall_watchdog.observe(&index_progress, start.elapsed().as_millis())
-            {
-                let (summary, diagnostics) = index_stall_warning_lines(&payload);
-                pb.println(summary);
-                pb.println(diagnostics);
-                abort_after_index_stall_if_requested(&payload, stall_watchdog.data_dir());
-            }
-
             std::thread::sleep(Duration::from_millis(50));
         }
 
@@ -88213,10 +85897,6 @@ fn run_index_with_data(
         let mut last_agents = 0;
         let mut last_current = 0;
         let mut last_scan_current = 0;
-        let mut stall_watchdog =
-            IndexStallWatchdog::aborting_phase_two(data_dir.clone(), progress_interval)
-                .watch_aware(watch)
-                .semantic_aware(semantic);
 
         loop {
             if index_handle.is_finished() {
@@ -88264,15 +85944,6 @@ fn run_index_with_data(
                 last_current = current;
             }
 
-            if let Some(payload) =
-                stall_watchdog.observe(&index_progress, start.elapsed().as_millis())
-            {
-                let (summary, diagnostics) = index_stall_warning_lines(&payload);
-                eprintln!("{summary}");
-                eprintln!("{diagnostics}");
-                abort_after_index_stall_if_requested(&payload, stall_watchdog.data_dir());
-            }
-
             std::thread::sleep(Duration::from_millis(200));
         }
     } else if emit_progress_events {
@@ -88285,10 +85956,6 @@ fn run_index_with_data(
         let mut last_emit = std::time::Instant::now()
             .checked_sub(progress_interval)
             .unwrap_or_else(std::time::Instant::now);
-        let mut stall_watchdog =
-            IndexStallWatchdog::aborting_phase_two(data_dir.clone(), progress_interval)
-                .watch_aware(watch)
-                .semantic_aware(semantic);
 
         // Finish-aware poll cadence: 100ms for snappy shutdown, but only emit a
         // `progress` event at `progress_interval`.
@@ -88327,34 +85994,12 @@ fn run_index_with_data(
                 last_emit = std::time::Instant::now();
             }
 
-            if let Some(payload) = stall_watchdog.observe(&index_progress, elapsed_ms) {
-                emit_event(payload.clone());
-                emit_robot_stall_event_on_stdout(&payload);
-                abort_after_index_stall_if_requested(&payload, stall_watchdog.data_dir());
-            }
-
             std::thread::sleep(Duration::from_millis(100));
         }
     } else {
         // No progress display (json mode with events disabled, or plain=none):
         // just wait for completion.
-        let mut stall_watchdog =
-            IndexStallWatchdog::aborting_phase_two(data_dir.clone(), progress_interval)
-                .watch_aware(watch)
-                .semantic_aware(semantic);
         while !index_handle.is_finished() {
-            if let Some(payload) =
-                stall_watchdog.observe(&index_progress, start.elapsed().as_millis())
-            {
-                let (summary, diagnostics) = index_stall_warning_lines(&payload);
-                eprintln!("{summary}");
-                eprintln!("{diagnostics}");
-                // #287: `--json --no-progress-events` callers still need a
-                // machine-readable stall signal on stdout before any external
-                // timeout kills the run.
-                emit_robot_stall_event_on_stdout(&payload);
-                abort_after_index_stall_if_requested(&payload, stall_watchdog.data_dir());
-            }
             std::thread::sleep(Duration::from_millis(100));
         }
     }
@@ -95967,13 +93612,20 @@ fn run_sources_command(cmd: SourcesCommand, cli: &Cli) -> CliResult<()> {
     }
 }
 
-fn resolved_sources_artifact_manifest_index_path(
+/// W2-6 Task1: `--index-path`/`--data-dir` now resolve the `agent_search.db`
+/// file directly (there is no more tantivy index directory to point at);
+/// `lexical_search_evidence_bundle_manifest`'s federated-shard chunk-manifest
+/// model has no SQLite-domain equivalent, so this CLI surface's backing
+/// value is [`crate::search::lexical_index_health::LexicalDomainAttestation`]
+/// instead (control-plane 2026-08-30 ruling: db file sha256 + user_version +
+/// lex_docs/fts_lex row counts).
+fn resolved_sources_artifact_manifest_db_path(
     index_path: Option<PathBuf>,
     data_dir: Option<PathBuf>,
 ) -> PathBuf {
     index_path.unwrap_or_else(|| {
         let data_dir = data_dir.unwrap_or_else(default_data_dir);
-        search::tantivy::expected_index_dir(&data_dir)
+        data_dir.join("agent_search.db")
     })
 }
 
@@ -95981,7 +93633,7 @@ fn sources_artifact_manifest_error(e: anyhow::Error) -> CliError {
     CliError {
         code: 5,
         kind: CliErrorKind::LexicalGeneration.kind_str(),
-        message: format!("Failed to build lexical artifact evidence manifest: {e:#}"),
+        message: format!("Failed to build lexical domain attestation: {e:#}"),
         hint: Some(
             "Run `cass index --full --json` first, then retry the artifact manifest command."
                 .to_string(),
@@ -95999,71 +93651,43 @@ fn normalized_sources_artifact_manifest_format(fmt: RobotFormat) -> RobotFormat 
 }
 
 fn run_sources_verify_existing_artifact_manifest(
-    index_path: PathBuf,
+    db_path: PathBuf,
     expected_manifest: Option<PathBuf>,
     output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
-    let manifest_path = crate::evidence_bundle::EvidenceBundleManifest::path(&index_path);
-    let report =
-        crate::evidence_bundle::verify_evidence_bundle_manifest_file(&index_path, &manifest_path);
+    use crate::search::lexical_index_health::LexicalDomainAttestation;
+
+    let manifest_path = LexicalDomainAttestation::path(&db_path);
+    let live_attestation =
+        LexicalDomainAttestation::compute(&db_path).map_err(sources_artifact_manifest_error)?;
+    let recorded_attestation = LexicalDomainAttestation::load(&manifest_path).ok();
+    let attestation_matches_live = recorded_attestation
+        .as_ref()
+        .map(|recorded| *recorded == live_attestation);
+
     let expected_manifest_path = expected_manifest
         .as_ref()
         .map(|path| path.display().to_string());
-    let mut manifest_matches_expected = None;
-    let mut manifest_compare_error = None;
-    let mut actual_bundle_id = report.bundle_id.clone();
-    let mut expected_bundle_id = None;
-
-    if let Some(expected_manifest) = expected_manifest.as_ref() {
-        match (
-            crate::evidence_bundle::EvidenceBundleManifest::load(&manifest_path),
-            crate::evidence_bundle::EvidenceBundleManifest::load(expected_manifest),
-        ) {
-            (Ok(actual), Ok(expected)) => {
-                actual_bundle_id = Some(actual.bundle_id.clone());
-                expected_bundle_id = Some(expected.bundle_id.clone());
-                manifest_matches_expected = Some(actual == expected);
-            }
-            (actual, expected) => {
-                manifest_matches_expected = Some(false);
-                manifest_compare_error = Some(format!(
-                    "actual_manifest_load={}; expected_manifest_load={}",
-                    actual
-                        .as_ref()
-                        .map(|_| "ok".to_string())
-                        .unwrap_or_else(|err| format!("{err:#}")),
-                    expected
-                        .as_ref()
-                        .map(|_| "ok".to_string())
-                        .unwrap_or_else(|err| format!("{err:#}"))
-                ));
-                if let Ok(actual) = actual {
-                    actual_bundle_id = Some(actual.bundle_id);
-                }
-                if let Ok(expected) = expected {
-                    expected_bundle_id = Some(expected.bundle_id);
-                }
-            }
+    let expected_manifest_matches = expected_manifest.as_ref().map(|expected_manifest| {
+        match LexicalDomainAttestation::load(expected_manifest) {
+            Ok(expected) => recorded_attestation.as_ref() == Some(&expected),
+            Err(_) => false,
         }
-    }
+    });
 
-    let expected_manifest_matches = manifest_matches_expected.unwrap_or(true);
-    let complete = report.is_complete() && expected_manifest_matches;
+    let complete =
+        attestation_matches_live.unwrap_or(false) && expected_manifest_matches.unwrap_or(true);
     let status = if complete { "ok" } else { "error" };
-    let report_status = report.status;
-    let issue_count = report.issues.len();
-    let unsafe_issue_count = report.unsafe_issue_count;
 
     let payload = serde_json::json!({
         "status": status,
-        "index_path": index_path.display().to_string(),
+        "db_path": db_path.display().to_string(),
         "manifest_path": manifest_path.display().to_string(),
         "expected_manifest_path": expected_manifest_path,
-        "manifest_matches_expected": manifest_matches_expected,
-        "manifest_compare_error": manifest_compare_error,
-        "actual_bundle_id": actual_bundle_id,
-        "expected_bundle_id": expected_bundle_id,
-        "verification": report,
+        "live_attestation": live_attestation,
+        "recorded_attestation": recorded_attestation,
+        "attestation_matches_live": attestation_matches_live,
+        "expected_manifest_matches": expected_manifest_matches,
     });
 
     if let Some(fmt) = output_format {
@@ -96076,30 +93700,27 @@ fn run_sources_verify_existing_artifact_manifest(
             ));
         }
     } else {
-        println!("Lexical artifact evidence manifest verification");
-        println!("  index: {}", index_path.display());
+        println!("Lexical domain attestation verification");
+        println!("  db: {}", db_path.display());
         println!("  manifest: {}", manifest_path.display());
         if let Some(expected_manifest) = expected_manifest_path.as_deref() {
             println!("  expected_manifest: {expected_manifest}");
             println!(
-                "  manifest_matches_expected: {}",
-                manifest_matches_expected.unwrap_or(false)
+                "  expected_manifest_matches: {}",
+                expected_manifest_matches.unwrap_or(false)
             );
         }
-        println!("  status: {:?}", report_status);
-        println!("  issues: {issue_count} ({unsafe_issue_count} unsafe)");
+        println!("  status: {status}");
         if !complete {
             return Err(CliError {
                 code: 5,
                 kind: CliErrorKind::LexicalGeneration.kind_str(),
-                message: if !expected_manifest_matches {
-                    "Lexical artifact evidence manifest does not match the expected producer manifest"
+                message: if expected_manifest_matches == Some(false) {
+                    "Lexical domain attestation does not match the expected producer manifest"
                         .to_string()
                 } else {
-                    format!(
-                        "Lexical artifact evidence manifest verification failed: {:?}",
-                        report_status
-                    )
+                    "Lexical domain attestation verification failed against the live database"
+                        .to_string()
                 },
                 hint: Some(
                     "Reject this copied artifact and rebuild or copy it again from the source."
@@ -96121,71 +93742,54 @@ fn run_sources_artifact_manifest(
     expected_manifest: Option<PathBuf>,
     output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
-    let index_path = resolved_sources_artifact_manifest_index_path(index_path, data_dir);
+    use crate::search::lexical_index_health::LexicalDomainAttestation;
+
+    let db_path = resolved_sources_artifact_manifest_db_path(index_path, data_dir);
     if verify_existing {
         return run_sources_verify_existing_artifact_manifest(
-            index_path,
+            db_path,
             expected_manifest,
             output_format,
         );
     }
 
-    let manifest = search::tantivy::lexical_search_evidence_bundle_manifest(&index_path)
-        .map_err(sources_artifact_manifest_error)?;
-    let report = manifest.verify(&index_path);
-    if !report.is_complete() {
-        return Err(CliError {
-            code: 5,
-            kind: CliErrorKind::LexicalGeneration.kind_str(),
-            message: format!(
-                "Generated lexical artifact evidence manifest did not verify cleanly: {:?}",
-                report.status
-            ),
-            hint: Some(
-                "Re-run `cass index --full --json` before exchanging artifacts.".to_string(),
-            ),
-            retryable: true,
-        });
-    }
+    let attestation =
+        LexicalDomainAttestation::compute(&db_path).map_err(sources_artifact_manifest_error)?;
 
     let manifest_path = if write {
-        let path = manifest.save(&index_path).map_err(|e| CliError {
+        let path = attestation.save(&db_path).map_err(|e| CliError {
             code: 14,
             kind: CliErrorKind::IoError.kind_str(),
-            message: format!("Failed to write lexical artifact evidence manifest: {e:#}"),
-            hint: Some("Check that the index directory is writable.".to_string()),
+            message: format!("Failed to write lexical domain attestation: {e:#}"),
+            hint: Some("Check that the database's directory is writable.".to_string()),
             retryable: true,
         })?;
         Some(path)
     } else {
         None
     };
-    let expected_manifest_path = crate::evidence_bundle::EvidenceBundleManifest::path(&index_path);
-    let bundle_id = manifest.bundle_id.clone();
-    let kind = manifest.kind;
-    let chunk_count = manifest.chunks.len();
+    let expected_manifest_path = LexicalDomainAttestation::path(&db_path);
 
     let payload = serde_json::json!({
         "status": "ok",
-        "index_path": index_path.display().to_string(),
+        "db_path": db_path.display().to_string(),
         "manifest_path": manifest_path
             .as_ref()
             .unwrap_or(&expected_manifest_path)
             .display()
             .to_string(),
         "wrote_manifest": write,
-        "bundle_id": bundle_id,
-        "kind": kind,
-        "chunk_count": chunk_count,
-        "expected_bytes": report.expected_bytes,
-        "verification_status": report.status,
+        "db_sha256": attestation.db_sha256,
+        "user_version": attestation.user_version,
+        "lex_docs_rows": attestation.lex_docs_rows,
+        "fts_lex_rows": attestation.fts_lex_rows,
     });
 
     if let Some(fmt) = output_format {
         output_structured_value(payload, normalized_sources_artifact_manifest_format(fmt))?;
     } else {
-        println!("Lexical artifact evidence manifest");
-        println!("  index: {}", index_path.display());
+        println!("Lexical domain attestation");
+        println!("  db: {}", db_path.display());
         println!(
             "  manifest: {}{}",
             manifest_path
@@ -96194,15 +93798,10 @@ fn run_sources_artifact_manifest(
                 .display(),
             if write { "" } else { " (not written)" }
         );
-        println!(
-            "  bundle_id: {}",
-            payload["bundle_id"].as_str().unwrap_or("")
-        );
-        println!("  chunks: {}", payload["chunk_count"].as_u64().unwrap_or(0));
-        println!(
-            "  expected_bytes: {}",
-            payload["expected_bytes"].as_u64().unwrap_or(0)
-        );
+        println!("  db_sha256: {}", attestation.db_sha256);
+        println!("  user_version: {}", attestation.user_version);
+        println!("  lex_docs_rows: {}", attestation.lex_docs_rows);
+        println!("  fts_lex_rows: {}", attestation.fts_lex_rows);
     }
 
     Ok(())
@@ -98455,10 +96054,10 @@ fn local_archive_coverage(
 ) -> crate::fleet_archive_coverage::ArchiveCoverageSummary {
     use crate::fleet_archive_coverage::CoverageState;
     use crate::fleet_doctor_schema::ArchiveRisk;
-    let db_present = data_dir.join("agent_search.db").is_file();
-    let index_present = crate::search::tantivy::searchable_index_exists(
-        &crate::search::tantivy::expected_index_dir(data_dir),
-    );
+    let db_path = data_dir.join("agent_search.db");
+    let db_present = db_path.is_file();
+    // W2-6 Task1: reseated onto the lex_docs/fts_lex SQLite domain.
+    let index_present = crate::search::lexical_index_health::searchable_index_exists(&db_path);
     let (coverage_state, archive_risk) = if !db_present {
         (CoverageState::Unknown, ArchiveRisk::Unknown)
     } else if !index_present {
@@ -100127,13 +97726,6 @@ fn archive_agent_slug_for_exclusion(agent: &str) -> String {
     }
 }
 
-fn archive_data_dir_for_agents_command(cli: &Cli) -> PathBuf {
-    cli.db
-        .as_ref()
-        .and_then(|db_path| db_path.parent().map(Path::to_path_buf))
-        .unwrap_or_else(default_data_dir)
-}
-
 fn purge_excluded_agent_archive_data(
     agent: &str,
     cli: &Cli,
@@ -100145,7 +97737,6 @@ fn purge_excluded_agent_archive_data(
         return Ok(AgentArchivePurgeResult::default());
     }
 
-    let data_dir = archive_data_dir_for_agents_command(cli);
     let archive_agent_slug = archive_agent_slug_for_exclusion(agent);
     let storage = match FrankenStorage::open_writer(&db_path) {
         Ok(storage) => storage,
@@ -100172,13 +97763,6 @@ fn purge_excluded_agent_archive_data(
         return Ok(purge);
     }
 
-    storage.rebuild_fts().map_err(|e| CliError {
-        code: 5,
-        kind: CliErrorKind::ArchiveFtsRebuild.kind_str(),
-        message: format!("Purged '{archive_agent_slug}' but failed to rebuild FTS: {e}"),
-        hint: Some("Run 'cass index --full' to refresh derived search data".into()),
-        retryable: false,
-    })?;
     storage.rebuild_analytics().map_err(|e| CliError {
         code: 5,
         kind: CliErrorKind::ArchiveAnalyticsRebuild.kind_str(),
@@ -100204,19 +97788,9 @@ fn purge_excluded_agent_archive_data(
         hint: Some("Run 'cass index --full' to refresh token analytics".into()),
         retryable: false,
     })?;
-    let remaining_conversations = storage.total_conversation_count().map_err(|e| CliError {
-        code: 5,
-        kind: CliErrorKind::ArchiveCount.kind_str(),
-        message: format!(
-            "Purged '{archive_agent_slug}' but failed to count remaining conversations: {e}"
-        ),
-        hint: Some("Run 'cass index --full' to refresh the archive".into()),
-        retryable: false,
-    })?;
     drop(storage);
 
-    crate::indexer::rebuild_tantivy_from_db(&db_path, &data_dir, remaining_conversations, None)
-        .map_err(|e| CliError {
+    crate::indexer::rebuild_lex_domain_from_db_full(&db_path, None).map_err(|e| CliError {
             code: 5,
             kind: CliErrorKind::LexicalRebuild.kind_str(),
             message: format!(

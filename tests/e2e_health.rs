@@ -1,9 +1,8 @@
 use assert_cmd::Command;
-use coding_agent_search::search::tantivy::{SCHEMA_HASH, expected_index_dir};
 use coding_agent_search::storage::api::Value as SqliteValue;
-use coding_agent_search::storage::sqlite::FrankenStorage;
+use coding_agent_search::storage::sqlite::{FrankenStorage, LEX_DOMAIN_REBUILD_STATE_META_KEY};
 use fs2::FileExt;
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
@@ -18,64 +17,39 @@ const HEALTH_LATENCY_WARMUP_RUNS: usize = 3;
 const HEALTH_LATENCY_MEASURED_RUNS: usize = 9;
 const HEALTH_LATENCY_FAST_QUORUM_RUNS: usize = 5;
 
+// W2-6 exec39 (checkpoint-fixture item3, control-plane ruling): "a
+// rebuild is in progress" is carried by the SQLite
+// `lex_domain_rebuild_state` meta marker now, not the retired
+// `.lexical-rebuild-state.json` checkpoint file -- nothing reads that
+// file anymore (pipeline["runtime"] is unconditionally Value::Null,
+// lib.rs:18977; asset_state's `processed_conversations`/
+// `total_conversations` are hardcoded None/marker-only,
+// src/search/asset_state.rs:1507-1508). Mirrors the precedent already
+// fixed in lib.rs::state_meta_json_reports_active_rebuild (W2-6 exec36
+// Task甲2): plant the Building marker through a real write against the
+// seeded db, identical to storage/sqlite.rs's own
+// `write_lex_domain_rebuild_marker_building`. The old function also
+// wrote a ~20-field synthetic "runtime" telemetry blob that no
+// production code path can produce anymore (cross-process
+// disk-introspection has no channel to another process's in-memory
+// pipeline state) -- callers that asserted on it were deleted alongside
+// this rewrite (see w2-6-deleted-tests.md).
 fn seed_active_rebuild_runtime(data_dir: &Path) -> std::fs::File {
     let db_path = data_dir.join("agent_search.db");
-    let index_path = expected_index_dir(data_dir);
-    fs::create_dir_all(&index_path).expect("create index dir");
-    fs::write(
-        index_path.join(".lexical-rebuild-state.json"),
-        serde_json::to_vec_pretty(&json!({
-            "version": 2,
-            "schema_hash": SCHEMA_HASH,
-            "db": {
-                "db_path": db_path.display().to_string(),
-                "total_conversations": 10,
-                "total_messages": 20,
-                "storage_fingerprint": "seed:10"
-            },
-            "page_size": 1024,
-            "committed_offset": 4,
-            "committed_conversation_id": 4,
-            "processed_conversations": 4,
-            "indexed_docs": 20,
-            "committed_meta_fingerprint": null,
-            "pending": null,
-            "completed": false,
-            "updated_at_ms": 1_733_000_123_000_i64,
-            "runtime": {
-                "queue_depth": 3,
-                "inflight_message_bytes": 65_536,
-                "max_message_bytes_in_flight": 131_072,
-                "pending_batch_conversations": 9,
-                "pending_batch_message_bytes": 131_072,
-                "page_prep_workers": 6,
-                "active_page_prep_jobs": 2,
-                "ordered_buffered_pages": 4,
-                "budget_generation": 1,
-                "producer_budget_wait_count": 2,
-                "producer_budget_wait_ms": 17,
-                "producer_handoff_wait_count": 1,
-                "producer_handoff_wait_ms": 9,
-                "host_loadavg_1m_milli": 7_250,
-                "controller_mode": "pressure_limited",
-                "controller_reason": "queue_depth_3_reached_pipeline_capacity_3",
-                "staged_merge_workers_max": 3,
-                "staged_merge_allowed_jobs": 1,
-                "staged_merge_active_jobs": 1,
-                "staged_merge_ready_artifacts": 5,
-                "staged_merge_ready_groups": 1,
-                "staged_merge_controller_reason": "page_prep_workers_saturated_6_of_6",
-                "staged_shard_build_workers_max": 6,
-                "staged_shard_build_allowed_jobs": 5,
-                "staged_shard_build_active_jobs": 4,
-                "staged_shard_build_pending_jobs": 2,
-                "staged_shard_build_controller_reason": "reserving_1_slots_for_staged_merge_active_jobs_1_ready_groups_1",
-                "updated_at_ms": 1_733_000_124_000_i64
-            }
-        }))
-        .expect("serialize rebuild state"),
-    )
-    .expect("write rebuild state");
+    {
+        let storage =
+            FrankenStorage::open(&db_path).expect("open fixture db for rebuild marker");
+        storage
+            .raw()
+            .execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                &[
+                    SqliteValue::from(LEX_DOMAIN_REBUILD_STATE_META_KEY),
+                    SqliteValue::from("building"),
+                ],
+            )
+            .expect("write lex domain rebuild marker (building)");
+    }
 
     let lock_path = data_dir.join("index-run.lock");
     let mut lock_file = OpenOptions::new()
@@ -98,81 +72,23 @@ fn seed_active_rebuild_runtime(data_dir: &Path) -> std::fs::File {
     lock_file
 }
 
-#[test]
-fn health_json_surfaces_runtime_queue_and_byte_budget_headroom() {
-    let test_home = tempfile::tempdir().expect("tempdir");
-    let data_dir = test_home.path().join("cass-data");
-    fs::create_dir_all(&data_dir).expect("create data dir");
-    let _lock = seed_active_rebuild_runtime(&data_dir);
-
-    let out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
-        .args([
-            "health",
-            "--data-dir",
-            data_dir.to_str().expect("utf8"),
-            "--json",
-        ])
-        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
-        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
-        .env("CASS_TANTIVY_REBUILD_PIPELINE_CHANNEL_SIZE", "5")
-        .env("XDG_DATA_HOME", test_home.path())
-        .env("HOME", test_home.path())
-        .output()
-        .expect("run cass health --json");
-    assert_eq!(
-        out.status.code(),
-        Some(1),
-        "health should report rebuilding"
-    );
-
-    let stdout = String::from_utf8(out.stdout).expect("utf8");
-    let payload: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
-    let runtime = &payload["state"]["rebuild"]["pipeline"]["runtime"];
-    let rebuild_progress = &payload["rebuild_progress"];
-
-    assert_eq!(runtime["queue_depth"].as_u64(), Some(3));
-    assert_eq!(runtime["queue_capacity"].as_u64(), Some(5));
-    assert_eq!(runtime["queue_headroom"].as_u64(), Some(2));
-    assert_eq!(runtime["inflight_message_bytes"].as_u64(), Some(65_536));
-    assert_eq!(
-        runtime["max_message_bytes_in_flight"].as_u64(),
-        Some(131_072)
-    );
-    assert_eq!(
-        runtime["inflight_message_bytes_headroom"].as_u64(),
-        Some(65_536)
-    );
-    assert_eq!(rebuild_progress["active"].as_bool(), Some(true));
-    assert_eq!(
-        rebuild_progress["processed_conversations"].as_u64(),
-        Some(4)
-    );
-    assert_eq!(rebuild_progress["total_conversations"].as_u64(), Some(10));
-    assert_eq!(
-        rebuild_progress["remaining_conversations"].as_u64(),
-        Some(6)
-    );
-    assert_eq!(rebuild_progress["completion_ratio"].as_f64(), Some(0.4));
-    assert_eq!(rebuild_progress["queue_depth"].as_u64(), Some(3));
-    assert_eq!(rebuild_progress["queue_capacity"].as_u64(), Some(5));
-    assert_eq!(rebuild_progress["queue_headroom"].as_u64(), Some(2));
-    assert_eq!(
-        rebuild_progress["inflight_message_bytes"].as_u64(),
-        Some(65_536)
-    );
-    assert_eq!(
-        rebuild_progress["inflight_message_bytes_headroom"].as_u64(),
-        Some(65_536)
-    );
-    assert_eq!(
-        rebuild_progress["controller_mode"].as_str(),
-        Some("pressure_limited")
-    );
-    assert_eq!(
-        rebuild_progress["controller_reason"].as_str(),
-        Some("queue_depth_3_reached_pipeline_capacity_3")
-    );
-}
+// W2-6 exec39: `health_json_surfaces_runtime_queue_and_byte_budget_headroom`
+// removed here -- its entire assertion surface (`state.rebuild.pipeline.runtime`
+// and every `rebuild_progress.*` field it read) is architecturally dead,
+// not a bug to fix. `pipeline["runtime"]` is unconditionally
+// `Value::Null` (lib.rs:18977, W2-6 Task B reader② ruling: "cross-process
+// disk-introspection... no way to read another process's in-memory
+// IndexingProgress"), and `processed_conversations`/`total_conversations`
+// are hardcoded `None`/marker-derived-only in `LexicalAssetState`
+// (src/search/asset_state.rs:1507-1508: "the marker's Building variant
+// carries no progress counters"). Deleting the whole test loses its
+// `out.status.code() == Some(1)` exit-code check as a named assertion,
+// but `health_recommended_action_during_active_rebuild_says_wait_not_reindex`
+// below still runs `cass health` against this same seeded active-rebuild
+// fixture and would fail its own JSON-parse/`rebuild_progress.active`
+// checks if health stopped reporting the degraded rebuild state, so the
+// coverage gap is narrow. See w2-6-deleted-tests.md for the full
+// disposition record.
 
 // ========================================================================
 // Bead coding_agent_session_search-v0p2i (child of ibuuh.10, scenario B):

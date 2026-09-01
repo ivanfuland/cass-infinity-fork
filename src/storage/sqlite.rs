@@ -79,7 +79,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicI8, AtomicI64, AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
 };
 
 /// The legacy embedded engine's parameter list builder (Task A4a thin shim: delegates to
@@ -94,7 +94,6 @@ macro_rules! fparams {
 }
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use thiserror::Error;
 use tracing::info;
 
 const DOCTOR_MUTATION_DB_OPEN_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
@@ -143,6 +142,12 @@ impl std::ops::Deref for SendFrankenConnection {
 
 static FRANKEN_RETRY_JITTER_STATE: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
 static DOCTOR_MUTATION_DB_OPEN_BYPASS_DEPTH: AtomicUsize = AtomicUsize::new(0);
+/// W2-6 exec41: test-only call counter for `rebuild_lex_domain_from_db`
+/// (whole-archive lex_docs/fts_lex rebuild), used to regression-lock the
+/// `--full` double/triple-invocation bug (indexer/mod.rs `run_index` tail
+/// block). Not read in production builds.
+#[cfg(test)]
+pub(crate) static REBUILD_LEX_DOMAIN_FROM_DB_CALLS: AtomicUsize = AtomicUsize::new(0);
 static MESSAGE_LOOKUP_TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
 static MESSAGE_LOOKUP_EXACT_IDX_PROBES: AtomicU64 = AtomicU64::new(0);
 static MESSAGE_LOOKUP_BOUNDED_QUERIES: AtomicU64 = AtomicU64::new(0);
@@ -757,22 +762,6 @@ fn franken_read_message_extra_compat(
     serde_json::Value::Null
 }
 
-/// SQL to register the FTS5 virtual table on a legacy embedded engine connection.
-///
-/// FrankenSQLite skips virtual-table entries (rootpage=0) when loading
-/// `sqlite_master` from a stock-SQLite database.  Executing this CREATE
-/// triggers the legacy FTS5 fallback path and materialises the table so
-/// subsequent FTS queries work.
-pub const FTS5_REGISTER_SQL: &str = "\
-    CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(\
-        content, title, agent, workspace, source_path, \
-        created_at UNINDEXED, \
-        content='', tokenize='porter'\
-    )";
-
-const FTS_FRANKEN_REBUILD_META_KEY: &str = "fts_frankensqlite_rebuild_generation";
-const FTS_FRANKEN_REBUILD_FINGERPRINT_META_KEY: &str = "fts_frankensqlite_archive_fingerprint";
-const FTS_FRANKEN_REBUILD_GENERATION: i64 = 1;
 const DAILY_STATS_HEALTH_META_KEY: &str = "daily_stats_archive_fingerprint";
 const DAILY_STATS_HEALTH_GENERATION_META_KEY: &str = "daily_stats_health_generation";
 const DAILY_STATS_HEALTH_GENERATION: i64 = 1;
@@ -833,258 +822,6 @@ impl SourceContentGenerationVerdict {
             Some(_) => Self::Mismatch,
         }
     }
-}
-
-/// SQL to clear all rows from the contentless `fts_messages` table.
-///
-/// Contentless FTS5 tables reject ordinary `DELETE FROM ...` statements.
-pub const FTS5_DELETE_ALL_SQL: &str =
-    "INSERT INTO fts_messages(fts_messages) VALUES('delete-all');";
-
-pub const FTS_MESSAGES_REQUIRED_SHADOW_TABLES: [&str; 5] = [
-    "fts_messages_config",
-    "fts_messages_content",
-    "fts_messages_data",
-    "fts_messages_docsize",
-    "fts_messages_idx",
-];
-
-pub const FTS_MESSAGES_INTEGRITY_PROBE_SQL: &str = "SELECT * FROM fts_messages LIMIT 0";
-
-pub const FTS_MESSAGES_CORRUPTION_RECOVERY_HINT: &str = "Stop all cass index/watch processes, back up the current database, then run \
-     'cass doctor check --json' for a read-only diagnosis before using a supported \
-     repair/rebuild path.";
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FtsMessagesIntegrityError {
-    missing_shadow_tables: Vec<&'static str>,
-    failed_sql: Option<&'static str>,
-    source_error: Option<String>,
-}
-
-impl FtsMessagesIntegrityError {
-    fn new(
-        missing_shadow_tables: Vec<&'static str>,
-        failed_sql: Option<&'static str>,
-        source_error: Option<String>,
-    ) -> Self {
-        Self {
-            missing_shadow_tables,
-            failed_sql,
-            source_error,
-        }
-    }
-
-    pub fn missing_shadow_tables(&self) -> &[&'static str] {
-        &self.missing_shadow_tables
-    }
-}
-
-impl std::fmt::Display for FtsMessagesIntegrityError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "CASS database FTS5 index is corrupt: fts_messages exists, but required FTS5 shadow tables are missing or unreadable"
-        )?;
-        if !self.missing_shadow_tables.is_empty() {
-            write!(
-                f,
-                "; missing shadow tables: {}",
-                self.missing_shadow_tables.join(", ")
-            )?;
-        }
-        if let Some(sql) = self.failed_sql {
-            write!(f, "; failed SQL: {sql}")?;
-        }
-        if let Some(source_error) = &self.source_error {
-            write!(f, "; error: {source_error}")?;
-        }
-        write!(
-            f,
-            ". Suggested recovery: {FTS_MESSAGES_CORRUPTION_RECOVERY_HINT}"
-        )
-    }
-}
-
-impl std::error::Error for FtsMessagesIntegrityError {}
-
-pub fn fts_messages_integrity_error_from_message(
-    source_error: impl Into<String>,
-) -> Option<FtsMessagesIntegrityError> {
-    let source_error = source_error.into();
-    let lower = source_error.to_ascii_lowercase();
-    if !lower.contains("fts_messages") {
-        return None;
-    }
-
-    let mentions_required_shadow_table = FTS_MESSAGES_REQUIRED_SHADOW_TABLES
-        .iter()
-        .any(|table| lower.contains(&table.to_ascii_lowercase()));
-    let mentions_structural_fts_failure = lower.contains("shadow table")
-        || lower.contains("vtable constructor failed")
-        || lower.contains("sqlite_corrupt")
-        || lower.contains("databasecorrupt")
-        || lower.contains("database corrupt")
-        || lower.contains("missing required")
-        // w1b Task B9 (salvage problem B): a duplicate `fts_messages`
-        // declaration in `sqlite_master` (the "malformed legacy bundle"
-        // fixture pattern) makes real SQLite refuse to even open the
-        // connection -- it eagerly parses the full schema and errors with
-        // "table fts_messages already exists" the moment two virtual-table
-        // declarations for the same name collide. The old the legacy embedded engine
-        // backend deferred this validation until the table was actually
-        // queried, so this failure mode never reached this classifier
-        // before; without recognizing it here, the caller falls straight
-        // through to `.recover`-based salvage instead of the (correct,
-        // already-implemented) `scrub_staged_derived_fts_metadata_via_sqlite3`
-        // repair this function exists to route to.
-        || lower.contains("already exists")
-        || (mentions_required_shadow_table
-            && (lower.contains("table not found") || lower.contains("no such table")));
-    if !mentions_structural_fts_failure {
-        return None;
-    }
-
-    let missing_shadow_tables = FTS_MESSAGES_REQUIRED_SHADOW_TABLES
-        .iter()
-        .copied()
-        .filter(|table| lower.contains(&table.to_ascii_lowercase()))
-        .collect::<Vec<_>>();
-
-    Some(FtsMessagesIntegrityError::new(
-        missing_shadow_tables,
-        Some(FTS_MESSAGES_INTEGRITY_PROBE_SQL),
-        Some(source_error),
-    ))
-}
-
-fn fts_schema_tolerates_missing_shadow_metadata(sql: &str) -> bool {
-    let normalized = sql
-        .chars()
-        .filter(|ch| !ch.is_whitespace())
-        .collect::<String>()
-        .to_ascii_lowercase();
-    normalized.contains("usingfts5(")
-        && normalized.contains("content=''")
-        && !normalized.contains("message_id")
-}
-
-pub fn validate_fts_messages_integrity_for_connection(conn: &FrankenConnection) -> Result<()> {
-    let fts_schema_sql: Vec<String> = conn
-        .query_all_map(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'fts_messages'",
-            fparams![],
-            |row: &FrankenRow| row.get_typed::<String>(0),
-        )
-        .with_context(|| "checking for fts_messages in sqlite_master")?;
-    if fts_schema_sql.is_empty() {
-        return Ok(());
-    }
-
-    let probe_error = conn
-        .query_all_map(FTS_MESSAGES_INTEGRITY_PROBE_SQL, &[], |_row| Ok(()))
-        .err();
-    if probe_error.is_none()
-        && fts_schema_sql
-            .iter()
-            .all(|sql| fts_schema_tolerates_missing_shadow_metadata(sql))
-    {
-        return Ok(());
-    }
-
-    let present_shadow_tables: HashSet<String> = conn
-        .query_all_map(
-            "SELECT name FROM sqlite_master
-             WHERE type = 'table'
-               AND name IN (
-                 'fts_messages_config',
-                 'fts_messages_content',
-                 'fts_messages_data',
-                 'fts_messages_docsize',
-                 'fts_messages_idx'
-               )",
-            fparams![],
-            |row: &FrankenRow| row.get_typed::<String>(0),
-        )
-        .map(|rows| rows.into_iter().collect())
-        .map_err(|err| {
-            FtsMessagesIntegrityError::new(
-                Vec::new(),
-                Some(
-                    "SELECT name FROM sqlite_master WHERE name IN \
-                     ('fts_messages_config','fts_messages_content','fts_messages_data','fts_messages_docsize','fts_messages_idx')",
-                ),
-                Some(err.to_string()),
-            )
-        })?;
-    let missing_shadow_tables = FTS_MESSAGES_REQUIRED_SHADOW_TABLES
-        .iter()
-        .copied()
-        .filter(|table| !present_shadow_tables.contains(*table))
-        .collect::<Vec<_>>();
-
-    // If every required shadow table is present, the FTS5 schema is
-    // structurally sound. A probe-SQL failure here typically reflects an
-    // incomplete FTS5 runtime emulation (e.g. the legacy embedded engine's vtable path)
-    // rather than fixture corruption — and conflating the two would
-    // wrongly reject every database with the new message_id schema that
-    // the legacy embedded engine happens to serve via a different code path. Returning
-    // Ok here keeps the false-positive surface narrow; the truly-missing-
-    // shadow case below still surfaces as before.
-    if missing_shadow_tables.is_empty() {
-        return Ok(());
-    }
-
-    Err(FtsMessagesIntegrityError::new(
-        missing_shadow_tables,
-        probe_error
-            .as_ref()
-            .map(|_| FTS_MESSAGES_INTEGRITY_PROBE_SQL),
-        probe_error.map(|err| err.to_string()),
-    )
-    .into())
-}
-
-#[cfg(test)]
-pub(crate) fn materialize_fresh_fts_schema_via_rusqlite(db_path: &Path) -> Result<()> {
-    // Delegate to FrankenStorage: DROP TABLE IF EXISTS + CREATE VIRTUAL TABLE
-    // is fully supported by the legacy embedded engine FTS5 path at
-    // FrankenStorage::rebuild_fts_via_frankensqlite. We call rebuild which
-    // also populates rows, matching the historical semantics ("fresh FTS"
-    // means the schema exists and is consistent with message rows).
-    let storage = FrankenStorage::open(db_path).with_context(|| {
-        format!(
-            "opening the legacy embedded engine db at {} for FTS materialization",
-            db_path.display()
-        )
-    })?;
-    storage.rebuild_fts_via_frankensqlite().map(|_| ())
-}
-
-#[cfg(test)]
-pub(crate) fn rebuild_fts_via_rusqlite(db_path: &Path) -> Result<usize> {
-    let storage = FrankenStorage::open(db_path).with_context(|| {
-        format!(
-            "opening the legacy embedded engine db at {} for FTS rebuild",
-            db_path.display()
-        )
-    })?;
-    let inserted = storage.rebuild_fts_via_frankensqlite()?;
-    storage.record_fts_franken_rebuild_generation()?;
-    Ok(inserted)
-}
-
-pub(crate) fn ensure_fts_consistency_via_rusqlite(db_path: &Path) -> Result<FtsConsistencyRepair> {
-    // Delegates to the FrankenStorage-native path. The function name retains
-    // the `_via_rusqlite` suffix only for backwards compatibility with the
-    // few test-site callers; all operations now run through the legacy embedded engine.
-    let storage = FrankenStorage::open(db_path).with_context(|| {
-        format!(
-            "opening the legacy embedded engine db at {} for FTS consistency check",
-            db_path.display()
-        )
-    })?;
-    storage.ensure_search_fallback_fts_consistency()
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1337,20 +1074,6 @@ fn historical_bundle_schema_is_current(probe: &HistoricalBundleProbe) -> bool {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FtsConsistencyRepair {
-    AlreadyHealthy {
-        rows: usize,
-    },
-    IncrementalCatchUp {
-        inserted_rows: usize,
-        total_rows: usize,
-    },
-    Rebuilt {
-        inserted_rows: usize,
-    },
-}
-
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct HistoricalSalvageOutcome {
     pub bundles_considered: usize,
@@ -1580,6 +1303,21 @@ fn bundle_total_bytes(root_path: &Path) -> u64 {
     total
 }
 
+// W2-6 Task戊 (advisor 2026-08-31 ruling, 类C 排除): `discover_historical_database_bundles`
+// down through `bundle_health_rank`/`probe_historical_bundle`/
+// `probe_historical_bundle_via_sqlite3_metadata`/
+// `historical_bundle_fts_queryable_via_frankensqlite` (and
+// `HistoricalBundleProbe.fts_schema_rows`/`fts_queryable`) probe **historical
+// backup bundles already sitting on disk** -- restore-cass.sh's candidate
+// scoring, not "does the live DB use this table". A pre-W2-6 bundle can
+// legitimately still carry `fts_messages`; that is not corruption, it is the
+// bundle's era. These `fts_messages` references are deliberately KEPT, not
+// missed cleanup -- `bundle_health_rank`'s existing `Some(0) => schema_current`
+// branch was already written for the V14 "fts_messages dropped during
+// migration" case, so it classifies a fresh post-W2-6 bundle (always
+// `fts_schema_rows == Some(0)`) as clean without any code change here.
+// terminal-scan grep exception: this file, this function through
+// `historical_bundle_fts_queryable_via_frankensqlite`'s closing brace.
 pub(crate) fn discover_historical_database_bundles(
     db_path: &Path,
 ) -> Vec<HistoricalDatabaseBundle> {
@@ -2042,106 +1780,10 @@ fn record_historical_bundle_import(
     Ok(())
 }
 
-fn scrub_staged_derived_fts_metadata_via_sqlite3(staged_db_path: &Path) -> Result<()> {
-    let scrub_sql = "PRAGMA writable_schema = ON;
-         DELETE FROM sqlite_master
-          WHERE name = 'fts_messages'
-             OR tbl_name = 'fts_messages'
-             OR name IN (
-                'fts_messages_config',
-                'fts_messages_content',
-                'fts_messages_data',
-                'fts_messages_docsize',
-                'fts_messages_idx'
-             )
-             OR tbl_name IN (
-                'fts_messages_config',
-                'fts_messages_content',
-                'fts_messages_data',
-                'fts_messages_docsize',
-                'fts_messages_idx'
-             );
-         PRAGMA writable_schema = OFF;";
-
-    let run_scrub = |disable_defensive: bool| -> Result<std::process::Output> {
-        let mut command = Command::new("sqlite3");
-        command.arg("-batch").arg(staged_db_path);
-        if disable_defensive {
-            command.arg(".dbconfig defensive off");
-        }
-        command.arg(scrub_sql).output().with_context(|| {
-            format!(
-                "running sqlite3 staged FTS metadata scrub for {}",
-                staged_db_path.display()
-            )
-        })
-    };
-    let render_output = |output: &std::process::Output| -> String {
-        format!(
-            "status {}; stdout: {}; stderr: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout).trim(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-    };
-
-    let defensive_off_output = run_scrub(true)?;
-    if defensive_off_output.status.success() {
-        return Ok(());
-    }
-
-    let fallback_output = run_scrub(false)?;
-    if !fallback_output.status.success() {
-        anyhow::bail!(
-            "sqlite3 staged FTS metadata scrub failed for {}; defensive-off attempt {}; fallback without .dbconfig {}",
-            staged_db_path.display(),
-            render_output(&defensive_off_output),
-            render_output(&fallback_output)
-        );
-    }
-    Ok(())
-}
-
-fn ensure_seeded_canonical_fts_consistency(staged_db_path: &Path) -> Result<FtsConsistencyRepair> {
-    match ensure_fts_consistency_via_rusqlite(staged_db_path) {
-        Ok(repair) => Ok(repair),
-        Err(err) => {
-            if fts_messages_integrity_error_from_message(format!("{err:#}")).is_none() {
-                return Err(err).with_context(|| {
-                    format!(
-                        "repairing staged canonical FTS consistency before finalization: {}",
-                        staged_db_path.display()
-                    )
-                });
-            }
-
-            tracing::warn!(
-                path = %staged_db_path.display(),
-                error = %err,
-                "staged historical seed has malformed derived FTS metadata; scrubbing and rebuilding FTS on staged copy"
-            );
-            scrub_staged_derived_fts_metadata_via_sqlite3(staged_db_path).with_context(|| {
-                format!(
-                    "scrubbing malformed staged FTS metadata before finalization: {}",
-                    staged_db_path.display()
-                )
-            })?;
-            ensure_fts_consistency_via_rusqlite(staged_db_path).with_context(|| {
-                format!(
-                    "repairing staged canonical FTS consistency after metadata scrub: {}",
-                    staged_db_path.display()
-                )
-            })
-        }
-    }
-}
-
 fn finalize_seeded_canonical_bundle_via_rusqlite(
     canonical_db_path: &Path,
     bundle: &HistoricalDatabaseBundle,
 ) -> Result<(usize, usize)> {
-    let _fts_repair = ensure_seeded_canonical_fts_consistency(canonical_db_path)?;
-
     let path_str = canonical_db_path.to_string_lossy();
     let conn = FrankenConnection::open_writable(std::path::Path::new(&(path_str.as_ref())), crate::storage::api::Profile::Production).with_context(|| {
         format!(
@@ -2198,16 +1840,6 @@ fn read_meta_schema_version(conn: &FrankenConnection) -> Result<Option<i64>> {
         )
         .optional()?;
     Ok(version.and_then(|raw| raw.parse::<i64>().ok()))
-}
-
-#[cfg(test)]
-fn franken_fts_schema_rows(conn: &FrankenConnection) -> Result<i64> {
-    conn.query_row_map(
-        "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
-        fparams![],
-        |row| row.get_typed(0),
-    )
-    .context("counting sqlite_master rows for fts_messages via the legacy embedded engine")
 }
 
 struct StagedHistoricalSeed {
@@ -2770,7 +2402,6 @@ pub struct FrankenStorage {
     ensured_workspaces: Arc<parking_lot::Mutex<HashMap<EnsuredWorkspaceKey, i64>>>,
     ensured_conversation_sources: Arc<parking_lot::Mutex<HashSet<EnsuredConversationSourceKey>>>,
     ensured_daily_stats_keys: Arc<parking_lot::Mutex<HashSet<EnsuredDailyStatsKey>>>,
-    fts_messages_present_cache: AtomicI8,
 }
 
 /// Keep ordinary storage commits from tripping over frequent auto-checkpoints
@@ -2779,9 +2410,6 @@ pub struct FrankenStorage {
 const DEFAULT_WAL_AUTOCHECKPOINT_PAGES: i64 = 4096;
 const UNSET_INDEX_WRITER_CHECKPOINT_PAGES: i64 = i64::MIN;
 const UNSET_INDEX_WRITER_BUSY_TIMEOUT_MS: u64 = 0;
-const FTS_MESSAGES_PRESENT_UNKNOWN: i8 = 0;
-const FTS_MESSAGES_PRESENT_ABSENT: i8 = 1;
-const FTS_MESSAGES_PRESENT_PRESENT: i8 = 2;
 
 enum CachedEphemeralWriter {
     Uninitialized,
@@ -2894,18 +2522,6 @@ where
     ))
 }
 
-pub(crate) fn error_message_indicates_populated_fts_shadow_without_rowid_reload(
-    message: &str,
-) -> bool {
-    let lower = message.to_ascii_lowercase();
-    let mentions_populated_without_rowid_shadow = (lower
-        .contains("loading populated without rowid table")
-        || lower.contains("reloading populated without rowid table"))
-        && (lower.contains("table `fts_messages_") || lower.contains("table fts_messages_"));
-
-    mentions_populated_without_rowid_shadow && lower.contains("not yet supported")
-}
-
 impl FrankenStorage {
     fn new(conn: FrankenConnection, db_path: PathBuf) -> Self {
         Self::new_with_shared_caches(
@@ -2939,7 +2555,6 @@ impl FrankenStorage {
             ensured_workspaces,
             ensured_conversation_sources,
             ensured_daily_stats_keys,
-            fts_messages_present_cache: AtomicI8::new(FTS_MESSAGES_PRESENT_UNKNOWN),
         }
     }
 
@@ -2989,7 +2604,6 @@ impl FrankenStorage {
             .with_context(|| format!("ensuring schema for database at {}", path.display()))?;
         storage.repair_missing_current_schema_objects()?;
         storage.apply_config()?;
-        storage.set_fts_messages_present_cache(true);
         Ok(storage)
     }
 
@@ -3040,24 +2654,21 @@ impl FrankenStorage {
         );
         storage.repair_missing_current_schema_objects()?;
         storage.apply_config()?;
-        storage.set_fts_messages_present_cache(true);
         Ok(storage)
     }
 
     /// w1b Task B4: wrap an already-open writable connection into a
-    /// `FrankenStorage`, applying the same writer-side setup
-    /// (`apply_config` + FTS-messages-present fast path) that
-    /// `open_writer`/`open_writer_with_shared_caches` apply to a connection
-    /// they open themselves. Does not open a new connection -- this exists
-    /// specifically so `storage::api::WriterHandle<FrankenStorage>` (whose
-    /// writer thread already owns exactly one `Conn`) can hand it in here
-    /// instead of a second call opening a second connection. Never call
+    /// `FrankenStorage`, applying the same writer-side setup (`apply_config`)
+    /// that `open_writer`/`open_writer_with_shared_caches` apply to a
+    /// connection they open themselves. Does not open a new connection --
+    /// this exists specifically so `storage::api::WriterHandle<FrankenStorage>`
+    /// (whose writer thread already owns exactly one `Conn`) can hand it in
+    /// here instead of a second call opening a second connection. Never call
     /// this with a connection whose lifetime is not already owned by the
     /// caller for exactly this purpose.
     pub(crate) fn from_writer_handle_conn(conn: FrankenConnection, db_path: PathBuf) -> Result<Self> {
         let storage = Self::new(conn, db_path);
         storage.apply_config()?;
-        storage.set_fts_messages_present_cache(true);
         Ok(storage)
     }
 
@@ -3080,7 +2691,6 @@ impl FrankenStorage {
                 writer
                     .index_writer_busy_timeout_ms
                     .store(busy_timeout_ms, Ordering::Relaxed);
-                writer.set_fts_messages_present_cache(true);
                 Ok((writer, true))
             }
             CachedEphemeralWriter::Uninitialized => {
@@ -3180,49 +2790,6 @@ impl FrankenStorage {
 
     fn mark_daily_stats_key_ensured(&self, key: EnsuredDailyStatsKey) {
         self.ensured_daily_stats_keys.lock().insert(key);
-    }
-
-    fn fts_messages_present_cached(&self, tx: &FrankenTransaction<'_>) -> bool {
-        match self.fts_messages_present_cache.load(Ordering::Acquire) {
-            FTS_MESSAGES_PRESENT_PRESENT => return true,
-            FTS_MESSAGES_PRESENT_ABSENT => return false,
-            _ => {}
-        }
-
-        let present = tx
-            .query_row_map(
-                "SELECT COUNT(*) FROM sqlite_master
-                 WHERE name = 'fts_messages'
-                   AND rootpage > 0",
-                fparams![],
-                |row| row.get_typed::<i64>(0),
-            )
-            .map(|count| count > 0)
-            .unwrap_or_else(|err| {
-                tracing::debug!(
-                    error = %err,
-                    "failed to probe fts_messages presence; skipping db-resident FTS maintenance"
-                );
-                false
-            });
-        self.set_fts_messages_present_cache(present);
-        present
-    }
-
-    fn set_fts_messages_present_cache(&self, present: bool) {
-        self.fts_messages_present_cache.store(
-            if present {
-                FTS_MESSAGES_PRESENT_PRESENT
-            } else {
-                FTS_MESSAGES_PRESENT_ABSENT
-            },
-            Ordering::Release,
-        );
-    }
-
-    fn invalidate_fts_messages_present_cache(&self) {
-        self.fts_messages_present_cache
-            .store(FTS_MESSAGES_PRESENT_UNKNOWN, Ordering::Release);
     }
 
     fn invalidate_conversation_source_cache(&self, source_id: &str) {
@@ -3384,15 +2951,7 @@ impl FrankenStorage {
                 );
             }
             Err(err) => {
-                let detail = format!("{err:#}");
-                if error_message_indicates_populated_fts_shadow_without_rowid_reload(&detail) {
-                    tracing::warn!(
-                        error = %detail,
-                        "the legacy embedded engine could not disable autocommit_retain because a populated derived FTS shadow table cannot yet be reloaded; continuing so canonical indexing can proceed"
-                    );
-                } else {
-                    return Err(err);
-                }
+                return Err(err);
             }
         }
 
@@ -3438,10 +2997,72 @@ impl FrankenStorage {
                 "repairing missing current-schema tables on an already-versioned cass database"
             );
 
-            for batch in current_schema_repair_batches_for_missing_tables(&missing_tables)? {
-                self.conn
-                    .execute_batch(batch.sql)
-                    .with_context(|| format!("repairing current-schema batch {}", batch.name))?;
+            let repair_batches = current_schema_repair_batches_for_missing_tables(&missing_tables)?;
+
+            // R3-B2: the repair batches (which recreate `fts_lex`'s *shape*)
+            // and the `rebuild` below (which repopulates it from surviving
+            // `lex_docs` content) used to run as independent autocommit
+            // steps. A crash or a `rebuild` failure (e.g. disk full) between
+            // the two left a permanent empty-shell `fts_lex`: `sqlite_master`
+            // shows the table, so the missing-table probe above no longer
+            // fires on the next open, and MATCH queries return nothing
+            // forever with no error -- the exact false-green the fix in
+            // R1-B2 (64bd722e) exists to prevent. Running both steps as one
+            // transaction makes the repair atomic: any failure rolls back to
+            // "table still missing", so the next open retries the repair
+            // instead of freezing on the half-repaired state.
+            self.conn
+                .execute("BEGIN IMMEDIATE;", &[])
+                .with_context(|| "starting current-schema repair transaction")?;
+            let repair_result = (|| -> Result<()> {
+                for batch in repair_batches {
+                    self.conn
+                        .execute_batch(batch.sql)
+                        .with_context(|| format!("repairing current-schema batch {}", batch.name))?;
+                }
+
+                // R1-B2: `CREATE VIRTUAL TABLE IF NOT EXISTS fts_lex` above
+                // only recreates the *shape* of the external-content FTS5
+                // index. When fts_lex alone went missing while lex_docs
+                // survived with rows, the freshly created shadow table has
+                // no entries pointing at that content -- MATCH queries
+                // return nothing, permanently, with no error. FTS5's
+                // `rebuild` command repopulates the shadow index from the
+                // external content table in one pass.
+                if missing_tables.contains(&"fts_lex") {
+                    let lex_docs_count: i64 = self
+                        .conn
+                        .query_row_map("SELECT COUNT(*) FROM lex_docs", &[], |row| {
+                            row.get_typed(0)
+                        })
+                        .context("counting lex_docs before rebuilding fts_lex shadow index")?;
+                    if lex_docs_count > 0 {
+                        self.conn
+                            .execute("INSERT INTO fts_lex(fts_lex) VALUES('rebuild')", &[])
+                            .context("rebuilding fts_lex shadow index from surviving lex_docs content")?;
+                    }
+                }
+                Ok(())
+            })();
+            match repair_result {
+                Ok(()) => {
+                    if let Err(commit_err) = self
+                        .conn
+                        .execute("COMMIT;", &[])
+                        .with_context(|| "committing current-schema repair transaction")
+                    {
+                        // as in `restore_scan_watermarks`: the legacy embedded
+                        // engine keeps the transaction ACTIVE after a failed
+                        // COMMIT -- roll it back explicitly so this connection
+                        // is not returned to any pool with an open transaction.
+                        let _ = self.conn.execute("ROLLBACK;", &[]);
+                        return Err(commit_err);
+                    }
+                }
+                Err(e) => {
+                    let _ = self.conn.execute("ROLLBACK;", &[]);
+                    return Err(e);
+                }
             }
 
             for &(table_name, probe_sql) in REQUIRED_CURRENT_SCHEMA_TABLE_PROBES {
@@ -3761,6 +3382,39 @@ ON embedding_jobs(db_path, model_id)
 WHERE status IN ('pending', 'running');
 ";
 
+// w2 F4 fix: byte-identical shape to schema.rs's `V2_LEX_DOMAIN_DDL` (which
+// this batch cannot import directly -- `V2_LEX_DOMAIN_DDL` is a private
+// `const &str` in a different module, same constraint that already forced
+// `FRESH_SCHEMA_DDL` to duplicate it there). This batch only recreates the
+// *empty* tables/virtual-table shape, matching every other repair batch
+// here that has no cheap SQL-only source to backfill from -- unlike
+// conversation_external_lookup or conversation_external_tail_lookup, whose
+// content can be regenerated with a single INSERT...SELECT off `messages`/
+// `conversations`, lex_docs/fts_lex content requires the same per-message
+// truncation and noise-filtering logic as
+// `sync_lexical_domain_for_conversation_in_tx`, which is not expressible as
+// a static SQL string. Once the tables exist again, in-transaction writes
+// repopulate them incrementally as conversations get touched; backfilling
+// pre-existing content is the `--full` rebuild's job (W2-4), not this
+// startup self-heal's.
+const CURRENT_SCHEMA_REPAIR_LEX_DOMAIN_SQL: &str = r"
+CREATE TABLE IF NOT EXISTS lex_docs (
+    doc_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+    content TEXT NOT NULL,
+    title TEXT NOT NULL,
+    agent TEXT NOT NULL,
+    workspace TEXT NOT NULL,
+    source_path TEXT NOT NULL
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS fts_lex USING fts5(
+    content, title, agent, workspace, source_path,
+    content = 'lex_docs',
+    content_rowid = 'doc_id',
+    tokenize = 'porter trigram'
+);
+";
+
 const CURRENT_SCHEMA_REPAIR_TOKEN_ANALYTICS_SQL: &str = r"
 CREATE TABLE IF NOT EXISTS token_usage (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4003,6 +3657,11 @@ const CURRENT_SCHEMA_REPAIR_BATCHES: &[SchemaRepairBatch] = &[
         sql: CURRENT_SCHEMA_REPAIR_EMBEDDING_JOBS_SQL,
     },
     SchemaRepairBatch {
+        name: "lex_domain",
+        tables: &["lex_docs", "fts_lex"],
+        sql: CURRENT_SCHEMA_REPAIR_LEX_DOMAIN_SQL,
+    },
+    SchemaRepairBatch {
         name: "token_analytics",
         tables: &["token_usage", "token_daily_stats", "model_pricing"],
         sql: CURRENT_SCHEMA_REPAIR_TOKEN_ANALYTICS_SQL,
@@ -4084,6 +3743,17 @@ const REQUIRED_CURRENT_SCHEMA_TABLE_PROBES: &[(&str, &str)] = &[
         "usage_models_daily",
         "SELECT day_id FROM usage_models_daily LIMIT 1;",
     ),
+    // w2 F4 fix: the version-1 -> 2 migration path already covers a
+    // pre-existing v1 database missing lex_docs/fts_lex entirely (schema.rs
+    // `ensure`'s `version == 1` branch), but a v2 database that lost these
+    // two tables to incomplete restore / derived-index corruption had no
+    // probe here and so was invisible to this self-heal pass -- `schema::
+    // ensure` returns Ok immediately for version 2, and the next write's
+    // `sync_lexical_domain_for_conversation_in_tx` call (fail-closed since
+    // W2-2/W2-3) would hard-fail the whole ingest transaction on "no such
+    // table: lex_docs"/"no such table: fts_lex" instead of self-healing.
+    ("lex_docs", "SELECT doc_id FROM lex_docs LIMIT 1;"),
+    ("fts_lex", "SELECT rowid FROM fts_lex LIMIT 1;"),
 ];
 
 const REQUIRED_CONVERSATION_TOKEN_COLUMNS: &[(&str, &str)] = &[
@@ -4377,6 +4047,19 @@ const ORPHAN_MESSAGE_DEPENDENT_TABLES: &[OrphanMessageDependentTable] = &[
     OrphanMessageDependentTable {
         child_table: "snippets",
         delete_many_sql_prefix: "DELETE FROM snippets WHERE message_id IN",
+    },
+    // w2 F3 fix: fts_lex has no FK relationship to lex_docs (FTS5
+    // external-content tables are not FK-aware), so it does not benefit from
+    // the `ON DELETE CASCADE` that quietly cleans up lex_docs when the
+    // `DELETE FROM messages` below runs. Listed here (not just alongside
+    // lex_docs) so the startup self-heal path clears fts_lex *before* the
+    // orphan message rows disappear, matching the same ordering precedent
+    // as the other explicit fts_lex delete sites (W2-3 / w2 F2). fts_lex's
+    // rowid is the message id (see sync_lexical_domain_for_conversation_in_tx),
+    // so the same `message_id IN (...)` id list applies unchanged.
+    OrphanMessageDependentTable {
+        child_table: "fts_lex",
+        delete_many_sql_prefix: "DELETE FROM fts_lex WHERE rowid IN",
     },
 ];
 
@@ -5411,6 +5094,114 @@ pub struct MessageForEmbedding {
 // FrankenStorage CRUD operations
 // =========================================================================
 
+/// Summary of a [`FrankenStorage::rebuild_lex_domain_from_db`] run (W2-4).
+pub(crate) struct LexDomainRebuildStats {
+    pub conversations_processed: usize,
+    pub lex_docs_count: usize,
+}
+
+/// W2-6 Task A: `meta` key persisting whether the last
+/// [`FrankenStorage::rebuild_lex_domain_from_db`] run finished. Replaces the
+/// retired tantivy checkpoint file's completed/pending distinction with a
+/// single row (control-plane 2026-08-30 ruling: two states, no version/
+/// schema-hash/page-size/fingerprint matching -- that matching complexity is
+/// exactly what W2-6 delta w2-d4 judged dead along with the checkpoint file
+/// it protected). A crash mid-rebuild leaves the row at `"building"` (or
+/// absent, on a database that predates this marker); the next routine run
+/// reads that as incomplete and reruns the full rebuild from zero -- there is
+/// no partial-progress resume, matching the project's X-5 judgment.
+// W2-6 exec39: widened crate-private -> pub so integration-test fixtures
+// (tests/cli_status.rs, tests/e2e_health.rs) can plant the real DB marker
+// instead of the retired `.lexical-rebuild-state.json` checkpoint file --
+// same rationale as LEXICAL_REBUILD_SCHEMA_HASH's earlier widening.
+pub const LEX_DOMAIN_REBUILD_STATE_META_KEY: &str = "lex_domain_rebuild_state";
+const LEX_DOMAIN_REBUILD_STATE_BUILDING: &str = "building";
+const LEX_DOMAIN_REBUILD_STATE_COMPLETED_PREFIX: &str = "completed:";
+
+/// Parsed form of the [`LEX_DOMAIN_REBUILD_STATE_META_KEY`] row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LexDomainRebuildMarkerState {
+    /// No row at all: a pre-marker database, or one that has never run a
+    /// full lex domain rebuild.
+    Absent,
+    /// A rebuild is in progress (or was interrupted mid-run).
+    Building,
+    /// The last rebuild finished; totals observed at that time.
+    Completed {
+        total_conversations: usize,
+        lex_docs_count: usize,
+    },
+}
+
+/// Reads the current rebuild-state marker. A single indexed point lookup
+/// (`meta` is keyed on `key`), microsecond-class regardless of corpus size --
+/// this is the replacement for the tantivy checkpoint file read that used to
+/// gate `run_index`'s region2 trigger. A malformed `completed:` value (should
+/// never happen outside manual tampering) is treated as `Building`, not
+/// trusted as healthy -- fail toward "rebuild it," never toward "skip it."
+pub(crate) fn lex_domain_rebuild_marker_status(
+    conn: &FrankenConnection,
+) -> Result<LexDomainRebuildMarkerState> {
+    let raw: Option<String> = conn
+        .query_opt_map(
+            "SELECT value FROM meta WHERE key = ?1",
+            fparams![LEX_DOMAIN_REBUILD_STATE_META_KEY],
+            |row| row.get_typed(0),
+        )
+        .context("reading lex domain rebuild state marker")?;
+    let Some(raw) = raw else {
+        return Ok(LexDomainRebuildMarkerState::Absent);
+    };
+    if let Some(totals) = raw.strip_prefix(LEX_DOMAIN_REBUILD_STATE_COMPLETED_PREFIX)
+        && let Some((total_conversations, lex_docs_count)) = totals.split_once(':')
+        && let (Ok(total_conversations), Ok(lex_docs_count)) =
+            (total_conversations.parse::<usize>(), lex_docs_count.parse::<usize>())
+    {
+        return Ok(LexDomainRebuildMarkerState::Completed {
+            total_conversations,
+            lex_docs_count,
+        });
+    }
+    Ok(LexDomainRebuildMarkerState::Building)
+}
+
+fn write_lex_domain_rebuild_marker_building(conn: &FrankenConnection) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+        fparams![LEX_DOMAIN_REBUILD_STATE_META_KEY, LEX_DOMAIN_REBUILD_STATE_BUILDING],
+    )
+    .context("writing lex domain rebuild state marker (building)")?;
+    Ok(())
+}
+
+fn write_lex_domain_rebuild_marker_completed(
+    conn: &FrankenConnection,
+    total_conversations: usize,
+    lex_docs_count: usize,
+) -> Result<()> {
+    let value = format!("{LEX_DOMAIN_REBUILD_STATE_COMPLETED_PREFIX}{total_conversations}:{lex_docs_count}");
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+        fparams![LEX_DOMAIN_REBUILD_STATE_META_KEY, value.as_str()],
+    )
+    .context("writing lex domain rebuild state marker (completed)")?;
+    Ok(())
+}
+
+fn write_lex_domain_rebuild_marker_completed_in_tx(
+    tx: &FrankenTransaction<'_>,
+    total_conversations: usize,
+    lex_docs_count: usize,
+) -> Result<()> {
+    let value = format!("{LEX_DOMAIN_REBUILD_STATE_COMPLETED_PREFIX}{total_conversations}:{lex_docs_count}");
+    tx.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+        fparams![LEX_DOMAIN_REBUILD_STATE_META_KEY, value.as_str()],
+    )
+    .context("writing lex domain rebuild state marker (completed, in-transaction)")?;
+    Ok(())
+}
+
 impl FrankenStorage {
     /// Ensure an agent exists in the database, returning its ID.
     pub fn ensure_agent(&self, agent: &Agent) -> Result<i64> {
@@ -5684,7 +5475,7 @@ impl FrankenStorage {
             return Ok(states);
         }
 
-        let mut tx = self.conn.transaction()?;
+        let tx = self.conn.transaction()?;
         let watermark_rows: Vec<(String, String)> = tx.query_all_map(
             "SELECT key, value FROM meta WHERE key LIKE 'last_scan_ts:connector:%'",
             fparams![],
@@ -5882,6 +5673,21 @@ impl FrankenStorage {
                  )",
                 fparams![agent_id],
             )?;
+            // w2 Task W2-3 (spec 门②"删除"场景): fts_lex has no FK relationship
+            // to lex_docs (FTS5 external-content tables are not FK-aware), so
+            // ON DELETE CASCADE from messages -> lex_docs alone would leave
+            // fts_lex with stale, orphaned index entries pointing at rows the
+            // upcoming conversations delete is about to cascade away. Must run
+            // *before* the conversations delete, while `messages`/`lex_docs`
+            // still exist to resolve which fts_lex rowids belong to this agent.
+            tx.execute(
+                "DELETE FROM fts_lex WHERE rowid IN (
+                     SELECT m.id FROM messages m
+                     JOIN conversations c ON c.id = m.conversation_id
+                     WHERE c.agent_id = ?1
+                 )",
+                fparams![agent_id],
+            )?;
             tx.execute(
                 "DELETE FROM conversations WHERE agent_id = ?1",
                 fparams![agent_id],
@@ -6005,6 +5811,17 @@ impl FrankenStorage {
                 ),
                 fparams![],
             )?;
+            // w2 Task W2-3 (spec 门②"删除"场景): fts_lex has no FK to lex_docs
+            // (FTS5 external-content tables aren't FK-aware) -- must clear it
+            // before the cascading conversations delete below, same reasoning
+            // as `purge_agent_archive_data`.
+            tx.execute(
+                &format!(
+                    "DELETE FROM fts_lex WHERE rowid IN \
+                     (SELECT id FROM messages WHERE conversation_id IN ({id_list}))"
+                ),
+                fparams![],
+            )?;
             // The remaining child tables (messages, snippets, tags, ...) cascade.
             tx.execute(
                 &format!("DELETE FROM conversations WHERE id IN ({id_list})"),
@@ -6121,6 +5938,15 @@ impl FrankenStorage {
                     "DELETE FROM conversation_external_tail_lookup WHERE conversation_id = ?1",
                     fparams![drop_id],
                 )?;
+                // w2 Task W2-3 (spec 门②"删除"场景): fts_lex has no FK to
+                // lex_docs (FTS5 external-content tables aren't FK-aware) --
+                // must clear it before the explicit messages delete below,
+                // while messages/lex_docs still exist to resolve the join.
+                tx.execute(
+                    "DELETE FROM fts_lex WHERE rowid IN \
+                     (SELECT id FROM messages WHERE conversation_id = ?1)",
+                    fparams![drop_id],
+                )?;
                 // Explicit message delete (do not rely solely on cascade) so the
                 // operation is correct even if FK enforcement is toggled off.
                 tx.execute(
@@ -6142,11 +5968,6 @@ impl FrankenStorage {
             }
             Ok(())
         })?;
-
-        // The derived FTS shadow rows for the dropped messages are now stale.
-        // Invalidate the presence cache; the caller is responsible for the
-        // actual lexical rebuild (so multi-step cleanups rebuild once).
-        self.invalidate_fts_messages_present_cache();
 
         Ok(result)
     }
@@ -6821,6 +6642,109 @@ impl FrankenStorage {
             lexical_max_conversation_content_bytes(),
         );
         Ok(messages)
+    }
+
+    /// W2-4 Step 2: full `lex_docs`/`fts_lex` rebuild from the canonical
+    /// `messages`/`conversations` tables — independent of, and run after,
+    /// `rebuild_tantivy_from_db_with_options` (which opens the database
+    /// `open_readonly` and therefore cannot itself write the lex domain).
+    ///
+    /// Batches conversations into fixed-size transactions (not one giant
+    /// transaction for the whole archive, nor one transaction per
+    /// conversation) to bound both peak transaction size and per-commit
+    /// fsync overhead on a large corpus. Each conversation is recomputed via
+    /// [`sync_lexical_domain_for_conversation_in_tx`] — the exact same
+    /// per-conversation logic the live write path already uses — so a full
+    /// rebuild and incremental sync can never diverge on what ends up in
+    /// `lex_docs`.
+    ///
+    /// X-2 (w2-4-rebuild-run.md): `progress`, when given, is driven with the
+    /// exact same `total.store` + `current.fetch_add(batch.len())` idiom the
+    /// tantivy rebuild pipeline already uses for its own conversation
+    /// batches. This is what the "Indexed N/M" operator print (and any
+    /// external progress observer, since W2-6 exec41 retired the in-process
+    /// `IndexStallWatchdog` that used to read these same atomics for
+    /// stall/wedge detection) reads to know whether the process is making
+    /// forward progress. Without it, the tantivy phase leaves
+    /// `current == total` and this loop never touches either atomic, so an
+    /// operator watching the printed progress sees no movement for the
+    /// entire multi-minute rebuild on a real corpus.
+    pub(crate) fn rebuild_lex_domain_from_db(
+        &self,
+        progress: Option<&Arc<crate::indexer::IndexingProgress>>,
+    ) -> Result<LexDomainRebuildStats> {
+        #[cfg(test)]
+        REBUILD_LEX_DOMAIN_FROM_DB_CALLS.fetch_add(1, Ordering::Relaxed);
+        const CONVERSATIONS_PER_TX: usize = 200;
+        let conversation_ids: Vec<i64> = self
+            .conn
+            .query_all_map("SELECT id FROM conversations ORDER BY id", &[], |row| row.get_typed(0))
+            .context("listing conversation ids for lex domain full rebuild")?;
+
+        if let Some(progress) = progress {
+            progress.total.store(conversation_ids.len(), Ordering::Relaxed);
+            progress.current.store(0, Ordering::Relaxed);
+        }
+
+        // W2-6 Task A: mark the rebuild in-progress before touching any
+        // conversation. A crash between here and the completed marker below
+        // leaves this row at "building", which region2's routine-run
+        // detection (indexer::mod.rs) reads as incomplete and reruns from
+        // zero next time -- no partial-progress resume (X-5 judgment).
+        write_lex_domain_rebuild_marker_building(&self.conn)?;
+
+        let total_conversations = conversation_ids.len();
+        let mut conversations_processed = 0usize;
+        let mut remaining = total_conversations;
+        for chunk in conversation_ids.chunks(CONVERSATIONS_PER_TX) {
+            remaining -= chunk.len();
+            let is_last_chunk = remaining == 0;
+            self.conn
+                .with_tx(TxMode::Immediate, |tx| -> Result<(), StorageError> {
+                    for &conversation_id in chunk {
+                        sync_lexical_domain_for_conversation_in_tx(tx, conversation_id)
+                            .map_err(anyhow_error_into_storage_error)?;
+                    }
+                    if is_last_chunk {
+                        // Same transaction as the last batch's commit: the
+                        // completed marker becomes visible atomically with
+                        // the data it describes, never ahead of it.
+                        let lex_docs_count: i64 =
+                            tx.query_row_map("SELECT COUNT(*) FROM lex_docs", &[], |row| row.get_typed(0))?;
+                        write_lex_domain_rebuild_marker_completed_in_tx(
+                            tx,
+                            total_conversations,
+                            usize::try_from(lex_docs_count.max(0)).unwrap_or(usize::MAX),
+                        )
+                        .map_err(anyhow_error_into_storage_error)?;
+                    }
+                    Ok(())
+                })
+                .with_context(|| {
+                    format!(
+                        "rebuilding lex domain for a batch of {} conversations",
+                        chunk.len()
+                    )
+                })?;
+            if let Some(progress) = progress {
+                progress.current.fetch_add(chunk.len(), Ordering::Relaxed);
+            }
+            conversations_processed += chunk.len();
+        }
+        if conversation_ids.is_empty() {
+            // No conversations at all: the loop above never ran, so mark
+            // completed directly instead of leaving the row at "building".
+            write_lex_domain_rebuild_marker_completed(&self.conn, 0, 0)?;
+        }
+
+        let lex_docs_count: i64 = self
+            .conn
+            .query_row_map("SELECT COUNT(*) FROM lex_docs", &[], |row| row.get_typed(0))
+            .context("counting lex_docs after full rebuild")?;
+        Ok(LexDomainRebuildStats {
+            conversations_processed,
+            lex_docs_count: lex_docs_count as usize,
+        })
     }
 
     /// Inner fetch without the per-conversation content cap. Kept separate so the
@@ -7792,13 +7716,13 @@ impl FrankenStorage {
             raw_origin_host,
         ) in conv_rows
         {
-            let source_id = crate::search::tantivy::normalized_index_source_id(
+            let source_id = crate::search::index_provenance::normalized_index_source_id(
                 raw_source_id.as_deref(),
                 None,
                 raw_origin_host.as_deref(),
             );
             let origin_host =
-                crate::search::tantivy::normalized_index_origin_host(raw_origin_host.as_deref());
+                crate::search::index_provenance::normalized_index_origin_host(raw_origin_host.as_deref());
 
             let messages: Vec<Message> = source_conn
                 .query_all_map(msg_sql, fparams![conversation_row_id], |msg_row| {
@@ -8152,9 +8076,6 @@ impl FrankenStorage {
                         let (inserted_last_idx, inserted_last_created_at) =
                             borrowed_messages_tail_state(&new_messages);
                         let mut inserted_indices = Vec::new();
-                        let mut fts_entries = Vec::new();
-                        let mut fts_pending_chars = 0usize;
-                        let mut _fts_inserted_total = 0usize;
                         let inserted_messages =
                             franken_append_insert_new_messages(tx, existing_id, &new_messages)?;
                         let inserted_chars = inserted_messages
@@ -8163,21 +8084,6 @@ impl FrankenStorage {
                             .sum::<i64>();
                         for (msg_id, msg) in inserted_messages {
                             franken_insert_snippets(tx, msg_id, &msg.snippets)?;
-                            if !defer_lexical_updates {
-                                fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
-                                fts_pending_chars = fts_pending_chars.saturating_add(msg.content.len());
-                                if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
-                                    || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
-                                {
-                                    flush_pending_fts_entries(
-                                        self,
-                                        tx,
-                                        &mut fts_entries,
-                                        &mut fts_pending_chars,
-                                        &mut _fts_inserted_total,
-                                    )?;
-                                }
-                            }
                             inserted_indices.push(msg.idx);
                         }
 
@@ -8192,13 +8098,7 @@ impl FrankenStorage {
                         }
 
                         if !defer_lexical_updates {
-                            flush_pending_fts_entries(
-                                self,
-                                tx,
-                                &mut fts_entries,
-                                &mut fts_pending_chars,
-                                &mut _fts_inserted_total,
-                            )?;
+                            sync_lexical_domain_for_conversation_in_tx(tx, existing_id)?;
                         }
 
                         let conv_last_ts = conversation_tail_ended_at_candidate(conv);
@@ -8242,9 +8142,6 @@ impl FrankenStorage {
                         });
                     }
                 };
-                let mut fts_entries = Vec::new();
-                let mut fts_pending_chars = 0usize;
-                let mut _fts_inserted_total = 0usize;
                 let mut total_chars: i64 = 0;
                 let mut inserted_indices = Vec::new();
                 let mut pending_messages = HashMap::new();
@@ -8278,21 +8175,6 @@ impl FrankenStorage {
                 let inserted_message_ids = franken_batch_insert_new_messages(tx, conv_id, &new_messages)?;
                 for (msg_id, msg) in inserted_message_ids.into_iter().zip(new_messages) {
                     franken_insert_snippets(tx, msg_id, &msg.snippets)?;
-                    if !defer_lexical_updates {
-                        fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
-                        fts_pending_chars = fts_pending_chars.saturating_add(msg.content.len());
-                        if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
-                            || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
-                        {
-                            flush_pending_fts_entries(
-                                self,
-                                tx,
-                                &mut fts_entries,
-                                &mut fts_pending_chars,
-                                &mut _fts_inserted_total,
-                            )?;
-                        }
-                    }
                     total_chars += msg.content.len() as i64;
                     inserted_indices.push(msg.idx);
                 }
@@ -8306,13 +8188,7 @@ impl FrankenStorage {
                     );
                 }
                 if !defer_lexical_updates {
-                    flush_pending_fts_entries(
-                        self,
-                        tx,
-                        &mut fts_entries,
-                        &mut fts_pending_chars,
-                        &mut _fts_inserted_total,
-                    )?;
+                    sync_lexical_domain_for_conversation_in_tx(tx, conv_id)?;
                 }
 
                 if !defer_analytics_updates {
@@ -8356,12 +8232,11 @@ impl FrankenStorage {
         self.ensure_source_for_conversation(conv)?;
         profile.source_duration += source_start.elapsed();
 
-        let defer_lexical_updates = defer_storage_lexical_updates_enabled();
         let defer_analytics_updates = defer_analytics_updates_enabled();
         let conversation_key = conversation_merge_key(agent_id, conv);
 
         let tx_open_start = Instant::now();
-        let mut tx = self.conn.transaction()?;
+        let tx = self.conn.transaction()?;
         profile.tx_open_duration += tx_open_start.elapsed();
 
         let existing_lookup_start = Instant::now();
@@ -8391,9 +8266,6 @@ impl FrankenStorage {
         };
         profile.conversation_row_duration += conversation_row_start.elapsed();
 
-        let mut fts_entries = Vec::new();
-        let mut fts_pending_chars = 0usize;
-        let mut fts_inserted_total = 0usize;
         let mut total_chars: i64 = 0;
         let mut inserted_indices = Vec::new();
         let mut pending_messages = HashMap::new();
@@ -8442,26 +8314,6 @@ impl FrankenStorage {
             franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
             profile.snippet_insert_duration += snippet_insert_start.elapsed();
 
-            if !defer_lexical_updates {
-                let fts_entry_start = Instant::now();
-                fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
-                fts_pending_chars = fts_pending_chars.saturating_add(msg.content.len());
-                profile.fts_entry_duration += fts_entry_start.elapsed();
-                if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
-                    || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
-                {
-                    let fts_flush_start = Instant::now();
-                    flush_pending_fts_entries(
-                        self,
-                        &tx,
-                        &mut fts_entries,
-                        &mut fts_pending_chars,
-                        &mut fts_inserted_total,
-                    )?;
-                    profile.fts_flush_duration += fts_flush_start.elapsed();
-                }
-            }
-
             total_chars += msg.content.len() as i64;
             inserted_indices.push(msg.idx);
         }
@@ -8474,18 +8326,6 @@ impl FrankenStorage {
                 source_path = %conv.source_path.display(),
                 "message idx collisions encountered while profiling a new conversation insert; retaining the first canonical variant per idx"
             );
-        }
-
-        if !defer_lexical_updates {
-            let fts_flush_start = Instant::now();
-            flush_pending_fts_entries(
-                self,
-                &tx,
-                &mut fts_entries,
-                &mut fts_pending_chars,
-                &mut fts_inserted_total,
-            )?;
-            profile.fts_flush_duration += fts_flush_start.elapsed();
         }
 
         if !defer_analytics_updates {
@@ -8536,12 +8376,11 @@ impl FrankenStorage {
         self.ensure_source_for_conversation(conv)?;
         profile.source_duration += source_start.elapsed();
 
-        let defer_lexical_updates = defer_storage_lexical_updates_enabled();
         let defer_analytics_updates = defer_analytics_updates_enabled();
         let conversation_key = conversation_merge_key(agent_id, conv);
 
         let tx_open_start = Instant::now();
-        let mut tx = self.conn.transaction()?;
+        let tx = self.conn.transaction()?;
         profile.tx_open_duration += tx_open_start.elapsed();
 
         let existing_lookup_start = Instant::now();
@@ -8593,9 +8432,6 @@ impl FrankenStorage {
         profile.dedupe_filter_duration += dedupe_filter_start.elapsed();
 
         let mut inserted_indices = Vec::new();
-        let mut fts_entries = Vec::new();
-        let mut fts_pending_chars = 0usize;
-        let mut fts_inserted_total = 0usize;
         let (inserted_last_idx, inserted_last_created_at) =
             borrowed_messages_tail_state(&new_messages);
 
@@ -8613,26 +8449,6 @@ impl FrankenStorage {
             franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
             profile.snippet_insert_duration += snippet_insert_start.elapsed();
 
-            if !defer_lexical_updates {
-                let fts_entry_start = Instant::now();
-                fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
-                fts_pending_chars = fts_pending_chars.saturating_add(msg.content.len());
-                profile.fts_entry_duration += fts_entry_start.elapsed();
-                if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
-                    || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
-                {
-                    let fts_flush_start = Instant::now();
-                    flush_pending_fts_entries(
-                        self,
-                        &tx,
-                        &mut fts_entries,
-                        &mut fts_pending_chars,
-                        &mut fts_inserted_total,
-                    )?;
-                    profile.fts_flush_duration += fts_flush_start.elapsed();
-                }
-            }
-
             inserted_indices.push(msg.idx);
         }
 
@@ -8644,18 +8460,6 @@ impl FrankenStorage {
                 source_path = %conv.source_path.display(),
                 "message idx collisions encountered while profiling append merge; retaining canonical message variants"
             );
-        }
-
-        if !defer_lexical_updates {
-            let fts_flush_start = Instant::now();
-            flush_pending_fts_entries(
-                self,
-                &tx,
-                &mut fts_entries,
-                &mut fts_pending_chars,
-                &mut fts_inserted_total,
-            )?;
-            profile.fts_flush_duration += fts_flush_start.elapsed();
         }
 
         let conversation_row_start = Instant::now();
@@ -8779,9 +8583,6 @@ impl FrankenStorage {
         };
 
         let mut inserted_indices = Vec::new();
-        let mut fts_entries = Vec::new();
-        let mut fts_pending_chars = 0usize;
-        let mut _fts_inserted_total = 0usize;
         let (inserted_last_idx, inserted_last_created_at) =
             borrowed_messages_tail_state(&new_messages);
         let inserted_messages =
@@ -8792,21 +8593,6 @@ impl FrankenStorage {
             .sum::<i64>();
         for (msg_id, msg) in inserted_messages {
             franken_insert_snippets(tx, msg_id, &msg.snippets)?;
-            if !defer_lexical_updates {
-                fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
-                fts_pending_chars = fts_pending_chars.saturating_add(msg.content.len());
-                if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
-                    || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
-                {
-                    flush_pending_fts_entries(
-                        self,
-                        tx,
-                        &mut fts_entries,
-                        &mut fts_pending_chars,
-                        &mut _fts_inserted_total,
-                    )?;
-                }
-            }
             inserted_indices.push(msg.idx);
         }
 
@@ -8821,13 +8607,7 @@ impl FrankenStorage {
         }
 
         if !defer_lexical_updates {
-            flush_pending_fts_entries(
-                self,
-                tx,
-                &mut fts_entries,
-                &mut fts_pending_chars,
-                &mut _fts_inserted_total,
-            )?;
+            sync_lexical_domain_for_conversation_in_tx(tx, conversation_id)?;
         }
 
         let mut exact_append_tail_set = false;
@@ -8897,52 +8677,6 @@ impl FrankenStorage {
         })
     }
 
-    /// Rebuild the FTS5 index from scratch (chunked to avoid OOM on large databases, #110).
-    pub fn rebuild_fts(&self) -> Result<()> {
-        self.rebuild_fts_via_frankensqlite().map(|_| ())
-    }
-
-    /// Best-effort repair for the derived SQLite FTS fallback index.
-    ///
-    /// The canonical archive and Tantivy index remain authoritative, so callers
-    /// should invoke this from maintenance paths rather than ordinary opens.
-    pub(crate) fn ensure_search_fallback_fts_consistency(&self) -> Result<FtsConsistencyRepair> {
-        self.ensure_fts_consistency_via_frankensqlite()
-    }
-
-    pub(crate) fn validate_fts_messages_integrity(&self) -> Result<()> {
-        validate_fts_messages_integrity_for_connection(&self.conn)
-    }
-
-    pub(crate) fn fallback_fts_is_known_healthy_for_archive_fingerprint(
-        &self,
-        archive_fingerprint: &str,
-    ) -> Result<bool> {
-        Ok(
-            self.read_fts_franken_rebuild_generation()? == Some(FTS_FRANKEN_REBUILD_GENERATION)
-                && self
-                    .read_fts_franken_rebuild_archive_fingerprint()?
-                    .as_deref()
-                    == Some(archive_fingerprint),
-        )
-    }
-
-    pub(crate) fn record_search_fallback_fts_archive_fingerprint(
-        &self,
-        archive_fingerprint: &str,
-    ) -> Result<()> {
-        self.conn
-            .execute(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
-                fparams![
-                    FTS_FRANKEN_REBUILD_FINGERPRINT_META_KEY,
-                    archive_fingerprint.to_string()
-                ],
-            )
-            .with_context(|| "recording the legacy embedded engine FTS archive fingerprint")?;
-        Ok(())
-    }
-
     pub(crate) fn daily_stats_is_known_healthy_for_archive_fingerprint(
         &self,
         archive_fingerprint: &str,
@@ -8976,29 +8710,6 @@ impl FrankenStorage {
         Ok(())
     }
 
-    fn read_fts_franken_rebuild_generation(&self) -> Result<Option<i64>> {
-        let value: Option<String> = self
-            .conn
-            .query_row_map(
-                "SELECT value FROM meta WHERE key = ?1",
-                fparams![FTS_FRANKEN_REBUILD_META_KEY],
-                |row| row.get_typed(0),
-            )
-            .optional()?;
-        Ok(value.and_then(|v| v.parse::<i64>().ok()))
-    }
-
-    fn read_fts_franken_rebuild_archive_fingerprint(&self) -> Result<Option<String>> {
-        Ok(self
-            .conn
-            .query_row_map(
-                "SELECT value FROM meta WHERE key = ?1",
-                fparams![FTS_FRANKEN_REBUILD_FINGERPRINT_META_KEY],
-                |row| row.get_typed(0),
-            )
-            .optional()?)
-    }
-
     fn read_daily_stats_health_generation(&self) -> Result<Option<i64>> {
         let value: Option<String> = self
             .conn
@@ -9022,383 +8733,6 @@ impl FrankenStorage {
             .optional()?)
     }
 
-    fn record_fts_franken_rebuild_generation(&self) -> Result<()> {
-        self.conn
-            .execute(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
-                fparams![
-                    FTS_FRANKEN_REBUILD_META_KEY,
-                    FTS_FRANKEN_REBUILD_GENERATION.to_string()
-                ],
-            )
-            .with_context(|| "recording the legacy embedded engine FTS rebuild generation")?;
-        Ok(())
-    }
-
-    fn ensure_fts_consistency_via_frankensqlite(&self) -> Result<FtsConsistencyRepair> {
-        if self.read_fts_franken_rebuild_generation()? != Some(FTS_FRANKEN_REBUILD_GENERATION) {
-            // Before triggering an expensive full rebuild, probe whether
-            // fts_messages is already populated and consistent.  On large
-            // databases the rebuild can take hours and OOM — skip it when
-            // the only thing missing is the generation marker (#184).
-            let fts_already_healthy = (|| -> Result<bool> {
-                let fts_exists: i64 = self.conn.query_row_map(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
-                    fparams![],
-                    |row| row.get_typed(0),
-                )?;
-                if fts_exists != 1 {
-                    return Ok(false);
-                }
-                let total: i64 = self.conn.query_row_map(
-                    "SELECT COUNT(*) FROM messages",
-                    fparams![],
-                    |row| row.get_typed(0),
-                )?;
-                if total == 0 {
-                    return Ok(false);
-                }
-                let indexed: i64 = self.conn.query_row_map(
-                    "SELECT COUNT(*) FROM fts_messages",
-                    fparams![],
-                    |row| row.get_typed(0),
-                )?;
-                // Consider healthy if >=90% of messages are indexed
-                Ok(indexed > 0 && indexed * 100 >= total * 90)
-            })()
-            .unwrap_or(false);
-
-            if fts_already_healthy {
-                tracing::info!(
-                    target: "cass::fts_rebuild",
-                    "FTS already populated and consistent; setting generation marker without rebuild"
-                );
-                self.record_fts_franken_rebuild_generation()?;
-                self.set_fts_messages_present_cache(true);
-            } else {
-                let inserted_rows = self.rebuild_fts_via_frankensqlite()?;
-                self.record_fts_franken_rebuild_generation()?;
-                return Ok(FtsConsistencyRepair::Rebuilt { inserted_rows });
-            }
-        }
-
-        let inspection = (|| -> Result<(i64, bool)> {
-            let fts_schema_rows = self.conn.query_row_map(
-                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
-                fparams![],
-                |row| row.get_typed::<i64>(0),
-            )?;
-            let fts_queryable = fts_schema_rows == 1
-                && self
-                    .conn
-                    .query_all_map("SELECT COUNT(*) FROM fts_messages", &[], |_row| Ok(()))
-                    .is_ok();
-            Ok((fts_schema_rows, fts_queryable))
-        })();
-
-        let (fts_schema_rows, fts_queryable) = match inspection {
-            Ok(result) => result,
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    "the legacy embedded engine FTS consistency probe failed; rebuilding authoritative FTS"
-                );
-                let inserted_rows = self.rebuild_fts_via_frankensqlite()?;
-                self.record_fts_franken_rebuild_generation()?;
-                return Ok(FtsConsistencyRepair::Rebuilt { inserted_rows });
-            }
-        };
-
-        if fts_schema_rows != 1 || !fts_queryable {
-            let inserted_rows = self.rebuild_fts_via_frankensqlite()?;
-            self.record_fts_franken_rebuild_generation()?;
-            return Ok(FtsConsistencyRepair::Rebuilt { inserted_rows });
-        }
-
-        let total_messages =
-            self.conn
-                .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
-                    row.get_typed::<i64>(0)
-                })?;
-        let indexed_messages =
-            self.conn
-                .query_row_map("SELECT COUNT(*) FROM fts_messages", fparams![], |row| {
-                    row.get_typed::<i64>(0)
-                })?;
-
-        if indexed_messages == total_messages {
-            self.set_fts_messages_present_cache(true);
-            return Ok(FtsConsistencyRepair::AlreadyHealthy {
-                rows: usize::try_from(total_messages.max(0)).unwrap_or(usize::MAX),
-            });
-        }
-
-        if indexed_messages > total_messages {
-            let inserted_rows = self.rebuild_fts_via_frankensqlite()?;
-            self.record_fts_franken_rebuild_generation()?;
-            return Ok(FtsConsistencyRepair::Rebuilt { inserted_rows });
-        }
-
-        let inserted_rows = self
-            .stream_fts_rows_via_frankensqlite(true)
-            .with_context(|| "incrementally repairing missing FTS rows via the legacy embedded engine")?;
-        let repaired_rows =
-            self.conn
-                .query_row_map("SELECT COUNT(*) FROM fts_messages", fparams![], |row| {
-                    row.get_typed::<i64>(0)
-                })?;
-        if repaired_rows == total_messages {
-            self.set_fts_messages_present_cache(true);
-            return Ok(FtsConsistencyRepair::IncrementalCatchUp {
-                inserted_rows,
-                total_rows: usize::try_from(repaired_rows.max(0)).unwrap_or(usize::MAX),
-            });
-        }
-
-        // The incremental catch-up found nothing to insert, yet the gap
-        // between total_messages (all rows, including orphans) and
-        // indexed_messages (only rows with valid conversation_id, since the
-        // FTS INSERT inner-joins on conversations) remains.  A full rebuild
-        // cannot close this gap either — the orphaned messages will be
-        // excluded again — so falling through to one would just re-do ~5 min
-        // of work on every startup.  Accept the current state.
-        if inserted_rows == 0 {
-            tracing::debug!(
-                target: "cass::fts_rebuild",
-                indexed_messages = repaired_rows,
-                total_messages,
-                un_indexable_gap = total_messages.saturating_sub(repaired_rows),
-                "FTS catch-up inserted 0 rows; remaining gap is un-indexable (likely orphaned messages with dangling conversation_id)"
-            );
-            self.set_fts_messages_present_cache(true);
-            return Ok(FtsConsistencyRepair::IncrementalCatchUp {
-                inserted_rows: 0,
-                total_rows: usize::try_from(repaired_rows.max(0)).unwrap_or(usize::MAX),
-            });
-        }
-
-        // Incremental made progress but didn't fully close the gap — something
-        // is genuinely inconsistent, so do a full rebuild.
-        let inserted_rows = self.rebuild_fts_via_frankensqlite()?;
-        self.record_fts_franken_rebuild_generation()?;
-        Ok(FtsConsistencyRepair::Rebuilt { inserted_rows })
-    }
-
-    pub(crate) fn rebuild_fts_via_frankensqlite(&self) -> Result<usize> {
-        self.invalidate_fts_messages_present_cache();
-        self.conn
-            .execute("DROP TABLE IF EXISTS fts_messages;", &[])
-            .with_context(|| "dropping derived fts_messages before the legacy embedded engine rebuild")?;
-        self.conn
-            .execute(FTS5_REGISTER_SQL, fparams![])
-            .with_context(|| "creating derived fts_messages via the legacy embedded engine rebuild")?;
-        self.set_fts_messages_present_cache(true);
-
-        self.stream_fts_rows_via_frankensqlite(false)
-    }
-
-    /// `coding_agent_session_search-uhhxy`: rebuild the in-DB FTS5 shadow
-    /// (`fts_messages`) after `cass dedup --apply` drops duplicate
-    /// conversation rows, so the canonical-DB-backed full-text shadow no
-    /// longer references messages that were deleted. The separate on-disk
-    /// lexical search index (frankensearch) is rebuilt by the blessed
-    /// `cass index --full` path; this wrapper only reconciles the in-DB
-    /// shadow that the dedup deletion left stale.
-    pub fn rebuild_lexical_index_after_dedup(&self) -> Result<()> {
-        self.rebuild_fts_via_frankensqlite().map(|_| ())
-    }
-
-    fn stream_fts_rows_via_frankensqlite(&self, missing_only: bool) -> Result<usize> {
-        let batch_size = fts_rebuild_batch_size().max(1);
-        let batch_limit = i64::try_from(batch_size).unwrap_or(i64::MAX);
-        let mut total_inserted: usize = 0;
-        let mut total_skipped_orphans: usize = 0;
-        let mut total_skipped_existing: usize = 0;
-        let mut last_rowid: i64 = 0;
-        let conversation_by_id = self.load_fts_conversation_projection_map()?;
-        let agent_slug_by_id = self.load_fts_agent_slug_map()?;
-        let workspace_path_by_id = self.load_fts_workspace_path_map()?;
-        let existing_fts_rowids = if missing_only {
-            Some(self.load_fts_message_rowid_set()?)
-        } else {
-            None
-        };
-        let mut entries = Vec::new();
-        let mut pending_chars = 0usize;
-
-        loop {
-            let rows = self.fetch_fts_rebuild_message_rows(last_rowid, batch_limit)?;
-            let fetched_count = rows.len();
-            if fetched_count == 0 {
-                break;
-            }
-
-            let inserted_before_batch = total_inserted;
-            let skipped_before_batch = total_skipped_orphans;
-            let existing_before_batch = total_skipped_existing;
-
-            for row in rows {
-                last_rowid = row.rowid;
-                if existing_fts_rowids
-                    .as_ref()
-                    .is_some_and(|rowids| rowids.contains(&row.message_id))
-                {
-                    total_skipped_existing = total_skipped_existing.saturating_add(1);
-                    continue;
-                }
-                let Some(conversation) = conversation_by_id.get(&row.conversation_id) else {
-                    total_skipped_orphans = total_skipped_orphans.saturating_add(1);
-                    continue;
-                };
-                let agent = conversation
-                    .agent_id
-                    .and_then(|agent_id| agent_slug_by_id.get(&agent_id))
-                    .filter(|slug| !slug.is_empty())
-                    .cloned()
-                    .unwrap_or_else(|| "unknown".to_string());
-                let workspace = conversation
-                    .workspace_id
-                    .and_then(|workspace_id| workspace_path_by_id.get(&workspace_id))
-                    .cloned()
-                    .unwrap_or_default();
-                pending_chars = pending_chars.saturating_add(row.content.len());
-                entries.push(FtsEntry {
-                    content: row.content,
-                    title: conversation.title.clone(),
-                    agent,
-                    workspace,
-                    source_path: conversation.source_path.clone(),
-                    created_at: row.created_at,
-                    message_id: row.message_id,
-                });
-                if entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
-                    || pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
-                {
-                    total_inserted = total_inserted.saturating_add(
-                        franken_batch_insert_fts_on_connection(&self.conn, &entries)?,
-                    );
-                    entries.clear();
-                    pending_chars = 0;
-                }
-            }
-
-            if !entries.is_empty() {
-                total_inserted = total_inserted.saturating_add(
-                    franken_batch_insert_fts_on_connection(&self.conn, &entries)?,
-                );
-                entries.clear();
-                pending_chars = 0;
-            }
-
-            tracing::debug!(
-                target: "cass::fts_rebuild",
-                batch_rows = fetched_count,
-                batch_inserted = total_inserted.saturating_sub(inserted_before_batch),
-                batch_skipped_orphans = total_skipped_orphans.saturating_sub(skipped_before_batch),
-                batch_skipped_existing = total_skipped_existing.saturating_sub(existing_before_batch),
-                total_inserted,
-                total_skipped_orphans,
-                total_skipped_existing,
-                last_rowid,
-                missing_only,
-                "FTS streaming maintenance batch complete"
-            );
-
-            if fetched_count < batch_size {
-                break;
-            }
-        }
-
-        Ok(total_inserted)
-    }
-
-    fn fetch_fts_rebuild_message_rows(
-        &self,
-        last_rowid: i64,
-        batch_limit: i64,
-    ) -> Result<Vec<FtsRebuildMessageRow>> {
-        self.conn
-            .query_all_map(
-                "SELECT m.rowid, m.id, m.conversation_id, m.content, m.created_at
-                 FROM messages m
-                 WHERE m.rowid > ?1
-                 ORDER BY m.rowid
-                 LIMIT ?2",
-                fparams![last_rowid, batch_limit],
-                |row| {
-                    Ok(FtsRebuildMessageRow {
-                        rowid: row.get_typed(0)?,
-                        message_id: row.get_typed(1)?,
-                        conversation_id: row.get_typed(2)?,
-                        content: row.get_typed::<Option<String>>(3)?.unwrap_or_default(),
-                        created_at: row.get_typed(4)?,
-                    })
-                },
-            )
-            .with_context(|| format!("fetching FTS maintenance messages after rowid {last_rowid}"))
-    }
-
-    fn load_fts_message_rowid_set(&self) -> Result<HashSet<i64>> {
-        let rows: Vec<i64> = self
-            .conn
-            .query_all_map("SELECT rowid FROM fts_messages", fparams![], |row| {
-                row.get_typed(0)
-            })
-            .with_context(|| "loading existing FTS message rowids")?;
-        Ok(rows.into_iter().collect())
-    }
-
-    fn load_fts_conversation_projection_map(
-        &self,
-    ) -> Result<HashMap<i64, FtsConversationProjection>> {
-        let rows: Vec<(i64, FtsConversationProjection)> = self
-            .conn
-            .query_all_map(
-                "SELECT id, title, agent_id, workspace_id, source_path
-                 FROM conversations",
-                fparams![],
-                |row| {
-                    Ok((
-                        row.get_typed(0)?,
-                        FtsConversationProjection {
-                            title: row.get_typed::<Option<String>>(1)?.unwrap_or_default(),
-                            agent_id: row.get_typed(2)?,
-                            workspace_id: row.get_typed(3)?,
-                            source_path: row.get_typed::<Option<String>>(4)?.unwrap_or_default(),
-                        },
-                    ))
-                },
-            )
-            .with_context(|| "loading FTS conversation projection map")?;
-        Ok(rows.into_iter().collect())
-    }
-
-    fn load_fts_agent_slug_map(&self) -> Result<HashMap<i64, String>> {
-        let rows: Vec<(i64, String)> = self
-            .conn
-            .query_all_map("SELECT id, slug FROM agents", fparams![], |row| {
-                Ok((
-                    row.get_typed(0)?,
-                    row.get_typed::<Option<String>>(1)?
-                        .unwrap_or_else(|| "unknown".to_string()),
-                ))
-            })
-            .with_context(|| "loading FTS agent slug map")?;
-        Ok(rows.into_iter().collect())
-    }
-
-    fn load_fts_workspace_path_map(&self) -> Result<HashMap<i64, String>> {
-        let rows: Vec<(i64, String)> = self
-            .conn
-            .query_all_map("SELECT id, path FROM workspaces", fparams![], |row| {
-                Ok((
-                    row.get_typed(0)?,
-                    row.get_typed::<Option<String>>(1)?.unwrap_or_default(),
-                ))
-            })
-            .with_context(|| "loading FTS workspace path map")?;
-        Ok(rows.into_iter().collect())
-    }
 
     /// Fetch all messages for embedding generation.
     pub fn fetch_messages_for_embedding(&self) -> Result<Vec<MessageForEmbedding>> {
@@ -9809,10 +9143,6 @@ impl FrankenStorage {
                 ensure_sources_in_tx(tx, conversations)?;
 
                 let mut outcomes = Vec::with_capacity(conversations.len());
-                let mut fts_entries = Vec::new();
-                let mut fts_pending_chars = 0usize;
-                let mut fts_inserted_total = 0usize;
-                let mut fts_count_total = 0usize;
                 let mut stats = StatsAggregator::new();
                 let mut token_stats = TokenStatsAggregator::new();
                 let mut token_entries: Vec<TokenUsageEntry> = Vec::new();
@@ -9879,22 +9209,6 @@ impl FrankenStorage {
                             .sum::<i64>();
                         for (msg_id, msg) in inserted_append_messages {
                             franken_insert_snippets(tx, msg_id, &msg.snippets)?;
-                            if !defer_lexical_updates {
-                                fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
-                                fts_count_total += 1;
-                                fts_pending_chars = fts_pending_chars.saturating_add(msg.content.len());
-                                if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
-                                    || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
-                                {
-                                    flush_pending_fts_entries(
-                                        self,
-                                        tx,
-                                        &mut fts_entries,
-                                        &mut fts_pending_chars,
-                                        &mut fts_inserted_total,
-                                    )?;
-                                }
-                            }
                             inserted_indices.push(msg.idx);
                             inserted_messages.push((msg_id, msg));
                         }
@@ -9963,23 +9277,6 @@ impl FrankenStorage {
                                     franken_batch_insert_new_messages(tx, new_conv_id, &new_messages)?;
                                 for (msg_id, msg) in inserted_message_ids.into_iter().zip(new_messages) {
                                     franken_insert_snippets(tx, msg_id, &msg.snippets)?;
-                                    if !defer_lexical_updates {
-                                        fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
-                                        fts_count_total += 1;
-                                        fts_pending_chars =
-                                            fts_pending_chars.saturating_add(msg.content.len());
-                                        if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
-                                            || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
-                                        {
-                                            flush_pending_fts_entries(
-                                                self,
-                                                tx,
-                                                &mut fts_entries,
-                                                &mut fts_pending_chars,
-                                                &mut fts_inserted_total,
-                                            )?;
-                                        }
-                                    }
                                     total_chars += msg.content.len() as i64;
                                     inserted_indices.push(msg.idx);
                                     inserted_messages.push((msg_id, msg));
@@ -10016,23 +9313,6 @@ impl FrankenStorage {
                                     .sum::<i64>();
                                 for (msg_id, msg) in inserted_append_messages {
                                     franken_insert_snippets(tx, msg_id, &msg.snippets)?;
-                                    if !defer_lexical_updates {
-                                        fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
-                                        fts_count_total += 1;
-                                        fts_pending_chars =
-                                            fts_pending_chars.saturating_add(msg.content.len());
-                                        if fts_entries.len() >= FTS_ENTRY_BATCH_MAX_DOCS
-                                            || fts_pending_chars >= FTS_ENTRY_BATCH_MAX_CHARS
-                                        {
-                                            flush_pending_fts_entries(
-                                                self,
-                                                tx,
-                                                &mut fts_entries,
-                                                &mut fts_pending_chars,
-                                                &mut fts_inserted_total,
-                                            )?;
-                                        }
-                                    }
                                     inserted_indices.push(msg.idx);
                                     inserted_messages.push((msg_id, msg));
                                 }
@@ -10075,6 +9355,23 @@ impl FrankenStorage {
                             }
                         }
                     };
+
+                    // w2 F1 fix: insert_conversations_batched is the crate's
+                    // highest-traffic write path and previously never synced
+                    // the lex_docs/fts_lex domain at all -- every conversation
+                    // that landed via this path was invisible to fts_lex
+                    // MATCH. Unlike the tantivy fts_entries buffer above
+                    // (batched across all conversations in this call and
+                    // flushed only once size thresholds are crossed),
+                    // sync_lexical_domain_for_conversation_in_tx recomputes
+                    // the full projection straight from the messages table,
+                    // so it only needs one call per conversation, right here
+                    // where `conv_id` is settled for both the new-insert and
+                    // existing-append branches -- same `!defer_lexical_updates`
+                    // gate and same in-tx semantics as insert_conversation_tree.
+                    if !defer_lexical_updates {
+                        sync_lexical_domain_for_conversation_in_tx(tx, conv_id)?;
+                    }
 
                     if !defer_analytics_updates {
                         let delta = StatsDelta {
@@ -10263,26 +9560,6 @@ impl FrankenStorage {
                     });
                 }
 
-                // Batch insert all FTS entries at once
-                if !defer_lexical_updates {
-                    flush_pending_fts_entries(
-                        self,
-                        tx,
-                        &mut fts_entries,
-                        &mut fts_pending_chars,
-                        &mut fts_inserted_total,
-                    )?;
-                }
-                if !defer_lexical_updates && fts_count_total > 0 {
-                    tracing::debug!(
-                        target: "cass::perf::fts5",
-                        total = fts_count_total,
-                        inserted = fts_inserted_total,
-                        conversations = conversations.len(),
-                        "franken_batch_fts_insert_complete"
-                    );
-                }
-
                 // Batched daily_stats update
                 if !defer_analytics_updates && !stats.is_empty() {
                     let entries = stats.expand();
@@ -10384,8 +9661,8 @@ pub(crate) fn normalized_storage_source_parts(
     origin_kind: Option<&str>,
     origin_host: Option<&str>,
 ) -> (String, SourceKind, Option<String>) {
-    let host_label = crate::search::tantivy::normalized_index_origin_host(origin_host);
-    let source_id = crate::search::tantivy::normalized_index_source_id(
+    let host_label = crate::search::index_provenance::normalized_index_origin_host(origin_host);
+    let source_id = crate::search::index_provenance::normalized_index_source_id(
         source_id,
         origin_kind,
         host_label.as_deref(),
@@ -11922,141 +11199,148 @@ fn franken_collect_batched_existing_new_messages<'a>(
     ))
 }
 
-/// Batch insert FTS5 entries within a legacy embedded engine transaction.
-fn franken_batch_insert_fts(
-    storage: &FrankenStorage,
+/// W2-2/W2-3 (spec G4, R2-W2-B1, R1-W2-B1): rebuild `lex_docs`/`fts_lex` for
+/// one conversation from scratch, in the same transaction as the caller's
+/// messages/conversations write.
+///
+/// Takes only `tx` (not `&FrankenStorage`) deliberately: the restore/backfill
+/// orchestration (`phase3_restore::commit_replace_in_tx`, which is the *real*
+/// caller of the parent-projection-field update — see below) only has a
+/// `Tx` in scope, not a `FrankenStorage` handle, so this cannot route through
+/// the `&self` method `FrankenStorage::fetch_messages_for_lexical_rebuild`.
+/// Reuses that method's exact query shape and its `truncate_lexical_rebuild_
+/// conversation_content` truncation call (the actual nontrivial 8 MiB
+/// business logic — the free function, not the `&self` wrapper around it) so
+/// the storage write path and the `--full` rebuild path apply the identical
+/// per-conversation cap. Eligibility is the same predicate
+/// `expected_live_lexical_doc_count` (`indexer/mod.rs`) composes from
+/// `is_lexical_rebuild_tool_class_role` + `is_hard_message_noise` — never
+/// duplicated, only called (W2-0 Step 3c's "复用同一投影实现，禁抄").
+///
+/// **Correction to the W2-0 remeasure report**: that report stated the
+/// title/workspace `UPDATE` "is called by `franken_replace_conversation_
+/// messages_in_tx`". That was never actually verified and is wrong — the two
+/// functions are *siblings*, both invoked in sequence by
+/// `phase3_restore::commit_replace_in_tx` (steps 2-7 then step 9). This
+/// function must therefore be wired in *after* step 9
+/// (`franken_update_conversation_projection_fields_in_tx`), not merely after
+/// `franken_replace_conversation_messages_in_tx`, or a replace would sync
+/// lexical rows against the *stale* pre-update title/workspace.
+///
+/// Full-conversation recompute (not incremental) is deliberate: the 8 MiB
+/// cap bounds per-conversation cost regardless of insert/append/replace, so
+/// recomputing from scratch on every call is trivially and provably
+/// consistent with the shared truncation logic for
+/// append/replace/parent-title-or-workspace-update alike — there is no
+/// separate incremental-truncation-state bookkeeping to get wrong. Deletes
+/// existing `fts_lex`/`lex_docs` rows for this conversation's message ids
+/// *before* touching `lex_docs` (external-content mode looks up the current
+/// `lex_docs` row via `content_rowid` to remove old index terms, so the
+/// content row must still be present at delete time), then reinserts the
+/// recomputed eligible set.
+///
+/// Fail-closed: every error here propagates via `?` — callers must not catch
+/// and continue. A lexical-domain write failure aborts the whole caller
+/// transaction, effective from the day this table exists (stricter than the
+/// spec's own "post-retirement" floor — R1-W2-B1 carried forward).
+pub(crate) fn sync_lexical_domain_for_conversation_in_tx(
     tx: &FrankenTransaction<'_>,
-    entries: &[FtsEntry],
-) -> Result<usize> {
-    if entries.is_empty() {
-        return Ok(0);
-    }
+    conversation_id: i64,
+) -> Result<()> {
+    let mut messages: Vec<Message> = tx
+        .query_all_map(
+            "SELECT id, idx, role, author, created_at, content \
+             FROM messages WHERE conversation_id = ?1 ORDER BY idx",
+            fparams![conversation_id],
+            |row| {
+                let role: String = row.get_typed(2)?;
+                Ok(Message {
+                    id: Some(row.get_typed(0)?),
+                    idx: row.get_typed(1)?,
+                    role: role_from_str(&role),
+                    author: row.get_typed(3)?,
+                    created_at: row.get_typed(4)?,
+                    content: row.get_typed(5)?,
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                })
+            },
+        )
+        .with_context(|| format!("fetching messages for lexical sync (conversation {conversation_id})"))?;
+    truncate_lexical_rebuild_conversation_content(
+        conversation_id,
+        &mut messages,
+        lexical_max_conversation_content_bytes(),
+    );
+    let (title, workspace, agent, source_path): (String, String, String, String) = tx
+        .query_row_map(
+            "SELECT COALESCE(c.title, ''), COALESCE(w.path, ''), COALESCE(a.slug, ''), c.source_path \
+             FROM conversations c \
+             JOIN agents a ON a.id = c.agent_id \
+             LEFT JOIN workspaces w ON w.id = c.workspace_id \
+             WHERE c.id = ?1",
+            fparams![conversation_id],
+            |row| {
+                Ok((
+                    row.get_typed(0)?,
+                    row.get_typed(1)?,
+                    row.get_typed(2)?,
+                    row.get_typed(3)?,
+                ))
+            },
+        )
+        .with_context(|| {
+            format!(
+                "loading conversation projection columns for lexical sync (conversation {conversation_id})"
+            )
+        })?;
 
-    let mut inserted = 0;
+    tx.execute(
+        "DELETE FROM fts_lex WHERE rowid IN (SELECT id FROM messages WHERE conversation_id = ?1)",
+        fparams![conversation_id],
+    )
+    .with_context(|| format!("clearing fts_lex for conversation {conversation_id} before resync"))?;
+    tx.execute(
+        "DELETE FROM lex_docs WHERE doc_id IN (SELECT id FROM messages WHERE conversation_id = ?1)",
+        fparams![conversation_id],
+    )
+    .with_context(|| format!("clearing lex_docs for conversation {conversation_id} before resync"))?;
 
-    for chunk in entries.chunks(FTS5_BATCH_SIZE) {
-        let placeholders: String = chunk
-            .iter()
-            .enumerate()
-            .map(|(i, _)| {
-                let base = i * 7 + 1; // +1 for 1-indexed params
-                format!(
-                    "(?{},?{},?{},?{},?{},?{},?{})",
-                    base,
-                    base + 1,
-                    base + 2,
-                    base + 3,
-                    base + 4,
-                    base + 5,
-                    base + 6
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-
-        let sql = format!(
-            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at) VALUES {placeholders}"
-        );
-
-        let mut param_values: Vec<SqliteValue> = Vec::with_capacity(chunk.len() * 7);
-        for entry in chunk {
-            param_values.push(SqliteValue::from(entry.message_id));
-            param_values.push(SqliteValue::from(entry.content.as_str()));
-            param_values.push(SqliteValue::from(entry.title.as_str()));
-            param_values.push(SqliteValue::from(entry.agent.as_str()));
-            param_values.push(SqliteValue::from(entry.workspace.as_str()));
-            param_values.push(SqliteValue::from(entry.source_path.as_str()));
-            param_values.push(SqliteValue::from(entry.created_at));
+    for message in messages {
+        let is_tool_role = is_lexical_rebuild_tool_class_role(role_as_str(&message.role));
+        let noise_role_hint: Option<&str> = is_tool_role.then_some("tool");
+        if crate::search::canonicalize::is_hard_message_noise(noise_role_hint, &message.content) {
+            continue;
         }
-
-        match tx.execute(&sql, &param_values) {
-            Ok(_) => {
-                inserted += chunk.len();
-            }
-            Err(err) => {
-                if err.to_string().contains("no such table") {
-                    // Fresh DB / Tantivy-authoritative path (#295): the FTS5
-                    // shadow tables are not materialized yet. db-resident FTS
-                    // is best-effort here, so stop probing/inserting for the
-                    // rest of this process instead of emitting a warning on
-                    // every batch (which pegged a core on large corpora).
-                    storage.set_fts_messages_present_cache(false);
-                    tracing::debug!(
-                        error = %err,
-                        chunk_docs = chunk.len(),
-                        "fts_messages not materialized yet; skipping db-resident FTS maintenance (Tantivy is authoritative)"
-                    );
-                } else {
-                    tracing::warn!(
-                        error = %err,
-                        chunk_docs = chunk.len(),
-                        "the legacy embedded engine FTS batch insert failed; skipping db-resident FTS maintenance because Tantivy is authoritative"
-                    );
-                }
-                return Ok(inserted);
-            }
-        }
+        let Some(doc_id) = message.id else { continue };
+        tx.execute(
+            "INSERT INTO lex_docs(doc_id, content, title, agent, workspace, source_path) \
+             VALUES (?1,?2,?3,?4,?5,?6)",
+            fparams![
+                doc_id,
+                message.content.as_str(),
+                title.as_str(),
+                agent.as_str(),
+                workspace.as_str(),
+                source_path.as_str()
+            ],
+        )
+        .with_context(|| format!("inserting lex_docs row for message {doc_id}"))?;
+        tx.execute(
+            "INSERT INTO fts_lex(rowid, content, title, agent, workspace, source_path) \
+             VALUES (?1,?2,?3,?4,?5,?6)",
+            fparams![
+                doc_id,
+                message.content.as_str(),
+                title.as_str(),
+                agent.as_str(),
+                workspace.as_str(),
+                source_path.as_str()
+            ],
+        )
+        .with_context(|| format!("inserting fts_lex row for message {doc_id}"))?;
     }
-
-    Ok(inserted)
-}
-
-fn franken_batch_insert_fts_on_connection(
-    conn: &FrankenConnection,
-    entries: &[FtsEntry],
-) -> Result<usize> {
-    if entries.is_empty() {
-        return Ok(0);
-    }
-
-    let mut inserted = 0;
-
-    for chunk in entries.chunks(FTS5_BATCH_SIZE) {
-        let placeholders: String = chunk
-            .iter()
-            .enumerate()
-            .map(|(i, _)| {
-                let base = i * 7 + 1;
-                format!(
-                    "(?{},?{},?{},?{},?{},?{},?{})",
-                    base,
-                    base + 1,
-                    base + 2,
-                    base + 3,
-                    base + 4,
-                    base + 5,
-                    base + 6
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-
-        let sql = format!(
-            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at) VALUES {placeholders}"
-        );
-
-        let mut param_values: Vec<SqliteValue> = Vec::with_capacity(chunk.len() * 7);
-        for entry in chunk {
-            param_values.push(SqliteValue::from(entry.message_id));
-            param_values.push(SqliteValue::from(entry.content.as_str()));
-            param_values.push(SqliteValue::from(entry.title.as_str()));
-            param_values.push(SqliteValue::from(entry.agent.as_str()));
-            param_values.push(SqliteValue::from(entry.workspace.as_str()));
-            param_values.push(SqliteValue::from(entry.source_path.as_str()));
-            param_values.push(SqliteValue::from(entry.created_at));
-        }
-
-        conn.execute(&sql, &param_values)
-            .with_context(|| {
-                format!(
-                    "inserting {} rows into fts_messages during streaming FTS maintenance",
-                    chunk.len()
-                )
-            })?;
-        inserted += chunk.len();
-    }
-
-    Ok(inserted)
+    Ok(())
 }
 
 /// Update daily stats within a legacy embedded engine transaction.
@@ -12811,6 +12095,21 @@ pub(crate) fn franken_replace_conversation_messages_in_tx(
         "SELECT COALESCE(MAX(id), 0) FROM messages",
         fparams![],
         |row| row.get_typed(0),
+    )?;
+
+    // w2 F2 fix: fts_lex has no FK relationship to lex_docs (FTS5
+    // external-content tables are not FK-aware), so ON DELETE CASCADE from
+    // messages -> lex_docs alone leaves fts_lex pointing at rowids the
+    // upcoming messages delete is about to cascade away. Must run *before*
+    // that delete, while `messages` still exist to resolve which fts_lex
+    // rowids belong to the *old* message ids -- sync_lexical_domain_for_
+    // conversation_in_tx runs later (post-insert, keyed off "current"
+    // messages) and can only ever see the *new* ids, so it cannot clean
+    // these up itself. Same precedent as the three delete-path call sites
+    // (W2-3): clear fts_lex first, while the old rowids are still resolvable.
+    tx.execute(
+        "DELETE FROM fts_lex WHERE rowid IN (SELECT id FROM messages WHERE conversation_id = ?1)",
+        fparams![conversation_id],
     )?;
 
     // 删旧。`message_metrics` / `snippets` / `token_usage` 的 `message_id` 都带
@@ -15316,125 +14615,6 @@ pub struct DailyStatsHealth {
     pub drift: i64,
 }
 
-// -------------------------------------------------------------------------
-// FTS5 Batch Insert (P2 Opt 2.1)
-// -------------------------------------------------------------------------
-
-/// Rows per FTS5 INSERT statement during db-resident `fts_messages`
-/// maintenance/rebuild. Each row binds 7 columns (rowid + 6 cols), and
-/// the legacy embedded engine's `MAX_VARIABLE_NUMBER` is 32766, so the hard ceiling is
-/// 32766 / 7 = 4680 rows per statement; 4096 leaves margin (28672 params).
-///
-/// This value is performance-critical, NOT just a memory knob
-/// (`coding_agent_session_search-nhqw0` / gh #301): `fts_messages` is a
-/// contentless FTS5 table (`content=''`), which routes every INSERT through
-/// the legacy embedded engine's `persist_rootpage_zero_fts5_shadow_rows` full-table
-/// re-encode (`build_pending_hash` re-tokenizes *all* rows). The cost of one
-/// INSERT is therefore O(rows-so-far) regardless of the statement's row count,
-/// so the total rebuild cost is (number of INSERT statements) × O(table). The
-/// old value of 100 fragmented a single ~512-row flush into ~6 statements and
-/// turned a multi-MB rebuild into ~120 whole-table re-encodes (O(N²)), which
-/// wedged `cass index --full` above ~15-30 MB of content. Issuing one large
-/// param-safe statement per flush collapses that to a handful of re-encodes.
-/// The asymptotic fix (incremental contentless persistence) is tracked in
-/// the legacy embedded engine bd-sf8dx.
-const FTS5_BATCH_SIZE: usize = 4096;
-
-#[derive(Debug, Clone)]
-struct FtsRebuildMessageRow {
-    rowid: i64,
-    message_id: i64,
-    conversation_id: i64,
-    content: String,
-    created_at: Option<i64>,
-}
-
-#[derive(Debug, Clone)]
-struct FtsConversationProjection {
-    title: String,
-    agent_id: Option<i64>,
-    workspace_id: Option<i64>,
-    source_path: String,
-}
-
-/// Entry for pending FTS5 insert.
-#[derive(Debug, Clone)]
-pub struct FtsEntry {
-    pub content: String,
-    pub title: String,
-    pub agent: String,
-    pub workspace: String,
-    pub source_path: String,
-    pub created_at: Option<i64>,
-    pub message_id: i64,
-}
-
-impl FtsEntry {
-    /// Create an FTS entry from a message and conversation.
-    pub fn from_message(message_id: i64, msg: &Message, conv: &Conversation) -> Self {
-        FtsEntry {
-            content: msg.content.clone(),
-            title: conv.title.clone().unwrap_or_default(),
-            agent: conv.agent_slug.clone(),
-            workspace: conv
-                .workspace
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            source_path: path_to_string(&conv.source_path),
-            created_at: msg.created_at.or(conv.started_at),
-            message_id,
-        }
-    }
-}
-
-// Per-flush accumulation caps for the streaming FTS rebuild/maintenance paths.
-// A flush is emitted once either cap is hit, then handed to
-// `franken_batch_insert_fts_on_connection`, which splits it into
-// `FTS5_BATCH_SIZE`-row INSERT statements. Because each contentless-FTS INSERT
-// re-encodes the whole table (see `FTS5_BATCH_SIZE` above /
-// `coding_agent_session_search-nhqw0`), these caps must be large enough that a
-// flush is a single param-safe statement — keeping the doc cap at/under
-// `FTS5_BATCH_SIZE` means one flush == one INSERT == one re-encode. The char
-// cap bounds peak entry-buffer memory for pathologically large messages.
-const FTS_ENTRY_BATCH_MAX_DOCS: usize = 4000;
-const FTS_ENTRY_BATCH_MAX_CHARS: usize = 32 * 1024 * 1024;
-
-/// Default batch size for the FTS rebuild INSERT (Bug #168).  When
-/// `fts_messages` is empty but `messages` has 100K+ rows, a single unbounded
-/// INSERT-SELECT OOMs.  This constant caps each batch so peak memory stays
-/// bounded.  Override via `CASS_FTS_REBUILD_BATCH_SIZE` for tuning.
-const FTS_REBUILD_BATCH_SIZE_DEFAULT: usize = 5_000;
-
-/// Read the FTS rebuild batch size from the environment, falling back to the
-/// compiled-in default.
-fn fts_rebuild_batch_size() -> usize {
-    dotenvy::var("CASS_FTS_REBUILD_BATCH_SIZE")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(FTS_REBUILD_BATCH_SIZE_DEFAULT)
-}
-
-fn flush_pending_fts_entries(
-    storage: &FrankenStorage,
-    tx: &FrankenTransaction<'_>,
-    entries: &mut Vec<FtsEntry>,
-    pending_chars: &mut usize,
-    inserted_total: &mut usize,
-) -> Result<()> {
-    if entries.is_empty() {
-        return Ok(());
-    }
-
-    if storage.fts_messages_present_cached(tx) {
-        *inserted_total += franken_batch_insert_fts(storage, tx, entries)?;
-    }
-    entries.clear();
-    *pending_chars = 0;
-    Ok(())
-}
-
 fn path_to_string<P: AsRef<Path>>(p: P) -> String {
     p.as_ref().to_string_lossy().into_owned()
 }
@@ -15807,25 +14987,6 @@ mod tests {
             collect_existing_conversation_noop_from_conversation_ended_at(&duplicate, 120)
                 .is_none(),
             "duplicate covered idx values still need collision-aware lookup"
-        );
-    }
-
-    #[test]
-    fn populated_fts_shadow_without_rowid_reload_errors_are_classified() {
-        assert!(
-            error_message_indicates_populated_fts_shadow_without_rowid_reload(
-                "not implemented: reloading populated WITHOUT ROWID table `fts_messages_config` into MemDatabase is not yet supported",
-            )
-        );
-        assert!(
-            error_message_indicates_populated_fts_shadow_without_rowid_reload(
-                "not implemented: loading populated WITHOUT ROWID table fts_messages_data is not yet supported",
-            )
-        );
-        assert!(
-            !error_message_indicates_populated_fts_shadow_without_rowid_reload(
-                "not implemented: reloading populated WITHOUT ROWID table `user_table` into MemDatabase is not yet supported",
-            )
         );
     }
 
@@ -16255,6 +15416,790 @@ mod tests {
         );
     }
 
+    /// W2-2 Step 4 mutation guard (R2-B6 + R2-W2-B1): the exact sequence
+    /// `phase3_restore::commit_replace_in_tx` wires — parent projection-field
+    /// update (title/workspace, step 9) followed by
+    /// `sync_lexical_domain_for_conversation_in_tx` (step 9b) — must leave
+    /// `lex_docs`/`fts_lex` reflecting the *new* title/workspace, not the
+    /// stale pre-replace values. Short-circuiting step 9b (comment it out)
+    /// must turn this test red; it is the discriminating test the plan's
+    /// "replace + 父表改题" scenario asks for.
+    #[test]
+    fn replace_with_new_title_and_workspace_refreshes_lex_docs_and_fts_lex() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::{Path, PathBuf};
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let agent = Agent {
+            id: None,
+            slug: "claude_code".into(),
+            name: "Claude Code".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        let workspace_id_old = storage.ensure_workspace(Path::new("/tmp/workspace-old"), None).unwrap();
+        let workspace_id_new = storage.ensure_workspace(Path::new("/tmp/workspace-new"), None).unwrap();
+
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "claude_code".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace-old")),
+            external_id: Some("conv-replace-1".into()),
+            title: Some("old title marker aaa111".into()),
+            source_path: PathBuf::from("/tmp/conv-replace-1.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: Some("user".into()),
+                created_at: Some(1_700_000_000_010),
+                content: "hello world".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+        storage
+            .insert_conversation_tree(agent_id, Some(workspace_id_old), &conversation)
+            .unwrap();
+
+        let conversation_id: i64 = storage
+            .conn
+            .query_row_map(
+                "SELECT id FROM conversations WHERE external_id = ?1",
+                fparams!["conv-replace-1"],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        let message_id: i64 = storage
+            .conn
+            .query_row_map(
+                "SELECT id FROM messages WHERE conversation_id = ?1",
+                fparams![conversation_id],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+
+        let (old_title, old_workspace): (String, String) = storage
+            .conn
+            .query_row_map(
+                "SELECT title, workspace FROM lex_docs WHERE doc_id = ?1",
+                fparams![message_id],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )
+            .unwrap();
+        assert_eq!(old_title, "old title marker aaa111");
+        assert_eq!(old_workspace, "/tmp/workspace-old");
+
+        let mut new_conv = conversation.clone();
+        new_conv.title = Some("new title marker zzz999".into());
+        new_conv.workspace = Some(PathBuf::from("/tmp/workspace-new"));
+
+        storage
+            .conn
+            .with_tx(TxMode::Immediate, |tx| -> Result<(), StorageError> {
+                franken_update_conversation_projection_fields_in_tx(
+                    tx,
+                    conversation_id,
+                    agent_id,
+                    Some(workspace_id_new),
+                    &new_conv,
+                )
+                .map_err(anyhow_error_into_storage_error)?;
+                sync_lexical_domain_for_conversation_in_tx(tx, conversation_id)
+                    .map_err(anyhow_error_into_storage_error)?;
+                Ok(())
+            })
+            .unwrap();
+
+        let (new_title, new_workspace): (String, String) = storage
+            .conn
+            .query_row_map(
+                "SELECT title, workspace FROM lex_docs WHERE doc_id = ?1",
+                fparams![message_id],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            new_title, "new title marker zzz999",
+            "lex_docs.title must reflect the post-replace title, not the stale pre-replace value"
+        );
+        assert_eq!(new_workspace, "/tmp/workspace-new");
+
+        let hits: i64 = storage
+            .conn
+            .query_row_map("SELECT count(*) FROM fts_lex WHERE fts_lex MATCH 'zzz999'", &[], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(hits, 1, "fts_lex index must be refreshed too, not just the lex_docs row");
+
+        let stale_hits: i64 = storage
+            .conn
+            .query_row_map("SELECT count(*) FROM fts_lex WHERE fts_lex MATCH 'aaa111'", &[], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(stale_hits, 0, "the old title term must no longer be recallable after replace");
+    }
+
+    /// W2-2 Step 3 (R2-W2-B1 必答项): a conversation crossing the
+    /// per-conversation lexical cap — verified end to end through the real
+    /// `insert_conversation_tree`/append wiring (not a direct call to the
+    /// sync function), so this exercises the actual production entry point.
+    /// Uses `CASS_LEXICAL_MAX_CONVERSATION_CONTENT_BYTES` to shrink the cap
+    /// to a lab-sized value instead of writing real 8 MiB of content.
+    ///
+    /// Scope note: this checks `lex_docs`'s output is byte-identical to what
+    /// `truncate_lexical_rebuild_conversation_content` computes (the same
+    /// function this sync path calls) — it does not additionally cross-check
+    /// against `ConversationPacket::capped_for_inline_lexical_index` (the
+    /// *other* consumer of the same cap, on the incremental-inline Tantivy
+    /// path), which would need a full `NormalizedConversation` fixture. Both
+    /// read the identical `lexical_max_conversation_content_bytes()` cap and
+    /// implement the same left-to-right truncate/clear algorithm (see that
+    /// function's doc comment), so this is believed sufficient for W2-2; a
+    /// full cross-path comparison is left as a documented gap, not silently
+    /// dropped.
+    #[test]
+    #[serial]
+    fn conversation_crossing_lexical_cap_truncates_and_clears_correctly_across_append() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        const CAP_ENV: &str = "CASS_LEXICAL_MAX_CONVERSATION_CONTENT_BYTES";
+        // w2 F5 fix: the previous comment here claimed "no other test sets
+        // `CAP_ENV`" -- false. `fetch_messages_for_lexical_rebuild_
+        // truncates_oversized_conversation_content` (below, in this same
+        // file) also sets this exact process-global env var, to a different
+        // value ("1024" vs this test's "100"), without any coordination.
+        // Under `cargo test`'s default parallel execution the two could
+        // interleave and each observe the other's value mid-run, producing
+        // a nondeterministic truncation boundary. `#[serial]` on both tests
+        // (this crate's existing serialization mechanism -- no new
+        // dependency) is what actually prevents that race; this guard alone
+        // only restores the var on unwind, it does not exclude concurrent
+        // readers/writers.
+        struct EnvGuard;
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    std::env::remove_var(CAP_ENV);
+                }
+            }
+        }
+        unsafe {
+            std::env::set_var(CAP_ENV, "100");
+        }
+        let _env_guard = EnvGuard;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let agent = Agent {
+            id: None,
+            slug: "claude_code".into(),
+            name: "Claude Code".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+
+        // msg0: 60 bytes (fits fully, cap=100, 40 bytes of budget remain).
+        let msg0_content = "a".repeat(60);
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "claude_code".into(),
+            workspace: None,
+            external_id: Some("conv-boundary-1".into()),
+            title: Some("boundary test".into()),
+            source_path: PathBuf::from("/tmp/conv-boundary-1.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: None,
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: Some("user".into()),
+                created_at: Some(1_700_000_000_010),
+                content: msg0_content.clone(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+        storage.insert_conversation_tree(agent_id, None, &conversation).unwrap();
+
+        let conversation_id: i64 = storage
+            .conn
+            .query_row_map(
+                "SELECT id FROM conversations WHERE external_id = ?1",
+                fparams!["conv-boundary-1"],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+
+        // Before append: msg0 must be present in lex_docs, full 60 bytes.
+        let msg0_id: i64 = storage
+            .conn
+            .query_row_map(
+                "SELECT id FROM messages WHERE conversation_id = ?1 AND idx = 0",
+                fparams![conversation_id],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        let lex_content_before: String = storage
+            .conn
+            .query_row_map(
+                "SELECT content FROM lex_docs WHERE doc_id = ?1",
+                fparams![msg0_id],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(lex_content_before, msg0_content, "msg0 must be indexed in full before any append");
+
+        // Append msg1 (idx 1): 60 more bytes. Cumulative 120 > cap 100, so
+        // only 40 bytes of msg1 fit (60 already used by msg0); msg1's lex
+        // content must be truncated to exactly those 40 bytes.
+        let msg1_content = "b".repeat(60);
+        let append_conv = Conversation {
+            messages: vec![Message {
+                id: None,
+                idx: 1,
+                role: MessageRole::User,
+                author: Some("user".into()),
+                created_at: Some(1_700_000_000_020),
+                content: msg1_content.clone(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            ..conversation.clone()
+        };
+        storage.insert_conversation_tree(agent_id, None, &append_conv).unwrap();
+
+        let msg1_id: i64 = storage
+            .conn
+            .query_row_map(
+                "SELECT id FROM messages WHERE conversation_id = ?1 AND idx = 1",
+                fparams![conversation_id],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+
+        // msg0 must be untouched by the later over-budget append (earlier
+        // messages are never retroactively affected by a later one crossing
+        // the cap -- only the message that straddles/exceeds the boundary
+        // is affected, matching `truncate_lexical_rebuild_conversation_content`'s
+        // left-to-right, earliest-first semantics).
+        let lex_content_msg0_after: String = storage
+            .conn
+            .query_row_map(
+                "SELECT content FROM lex_docs WHERE doc_id = ?1",
+                fparams![msg0_id],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(lex_content_msg0_after, msg0_content, "msg0 must remain full-length after a later append crosses the cap");
+
+        let lex_content_msg1: String = storage
+            .conn
+            .query_row_map(
+                "SELECT content FROM lex_docs WHERE doc_id = ?1",
+                fparams![msg1_id],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(lex_content_msg1, "b".repeat(40), "msg1 must be truncated to exactly the remaining 40-byte budget");
+    }
+
+    /// W2-3 Step 1/2 (spec 门②"回滚"场景 + fail-closed 语义): if
+    /// `sync_lexical_domain_for_conversation_in_tx` fails, the *whole*
+    /// caller transaction must roll back — including relational rows
+    /// inserted earlier in that same transaction, not just the lex
+    /// half. Uses a real failure (`sync_lexical_domain_for_conversation_in_tx`
+    /// called with a `conversation_id` that does not exist in
+    /// `conversations`, so its projection-column lookup genuinely fails with
+    /// zero rows) rather than a mocked error, per this project's "探针必须
+    /// 是真失败" convention.
+    #[test]
+    fn lex_sync_failure_rolls_back_the_whole_transaction_fail_closed() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        use crate::model::types::{Agent, AgentKind};
+        let agent = Agent {
+            id: None,
+            slug: "claude_code".into(),
+            name: "Claude Code".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+
+        const BOGUS_CONVERSATION_ID: i64 = 999_999;
+        let result = storage
+            .conn
+            .with_tx(TxMode::Immediate, |tx| -> Result<(), StorageError> {
+                tx.execute(
+                    "INSERT INTO conversations(id, agent_id, title, source_path) \
+                     VALUES (9001, ?1, 'rollback test', '/tmp/rollback-test.jsonl')",
+                    fparams![agent_id],
+                )?;
+                tx.execute(
+                    "INSERT INTO messages(id, conversation_id, idx, role, content) \
+                     VALUES (9001, 9001, 0, 'user', 'rollback test content')",
+                    fparams![],
+                )?;
+                // The lex sync deliberately targets a conversation_id that was
+                // never inserted (not 9001), so its own internal query finds
+                // zero rows and genuinely fails.
+                sync_lexical_domain_for_conversation_in_tx(tx, BOGUS_CONVERSATION_ID)
+                    .map_err(anyhow_error_into_storage_error)?;
+                Ok(())
+            });
+        assert!(result.is_err(), "the transaction must fail because the lex sync step failed");
+
+        let conv_count: i64 = storage
+            .conn
+            .query_row_map("SELECT COUNT(*) FROM conversations WHERE id = 9001", &[], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(
+            conv_count, 0,
+            "fail-closed: the whole transaction, including the earlier relational insert, must roll back -- not just the failed lex step"
+        );
+        let msg_count: i64 = storage
+            .conn
+            .query_row_map("SELECT COUNT(*) FROM messages WHERE id = 9001", &[], |row| row.get_typed(0))
+            .unwrap();
+        assert_eq!(msg_count, 0, "the message insert in the same transaction must also roll back");
+    }
+
+    /// W2-4 Step 1 (R2-W2-B2): identity-level bidirectional anti-join, not a
+    /// total-count comparison -- a total-count check can be defeated by
+    /// "one eligible message missing + one ineligible message present"
+    /// canceling out to a matching count while `lex_docs` is still wrong.
+    /// Builds conversations spanning every eligibility edge case (plain
+    /// eligible messages, a `tool_result`-role message that must be
+    /// excluded as noise, an empty-content message that must also be
+    /// excluded), computes the "eligible set" independently in this test
+    /// (mirroring `indexer::expected_live_lexical_doc_count`'s own
+    /// composition of `fetch_messages_for_lexical_rebuild` +
+    /// `is_lexical_rebuild_tool_class_role` + `is_hard_message_noise` --
+    /// the identical predicate, not a copy with drift risk), and asserts
+    /// both `eligible EXCEPT lex_docs = ∅` and `lex_docs EXCEPT eligible = ∅`
+    /// after `rebuild_lex_domain_from_db`.
+    #[test]
+    fn rebuild_lex_domain_from_db_matches_the_eligible_set_exactly_bidirectional_anti_join() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "claude_code".into(),
+                name: "Claude Code".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+
+        for i in 0..5 {
+            let external_id = format!("wm-antijoin-{i}");
+            let conversation = Conversation {
+                id: None,
+                agent_slug: "claude_code".into(),
+                workspace: None,
+                external_id: Some(external_id.clone()),
+                title: Some(format!("title {i}")),
+                source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
+                started_at: Some(1_700_000_000_000),
+                ended_at: None,
+                approx_tokens: None,
+                metadata_json: serde_json::Value::Null,
+                messages: vec![
+                    Message {
+                        id: None,
+                        idx: 0,
+                        role: MessageRole::User,
+                        author: Some("user".into()),
+                        created_at: Some(1_700_000_000_010),
+                        content: format!("eligible content {i}"),
+                        extra_json: serde_json::Value::Null,
+                        snippets: Vec::new(),
+                    },
+                    Message {
+                        id: None,
+                        idx: 1,
+                        role: MessageRole::Other("tool_result".into()),
+                        author: Some("tool".into()),
+                        created_at: Some(1_700_000_000_020),
+                        content: "no matches found".into(), // canonical short tool-ack -> excluded as noise
+                        extra_json: serde_json::Value::Null,
+                        snippets: Vec::new(),
+                    },
+                    Message {
+                        id: None,
+                        idx: 2,
+                        role: MessageRole::User,
+                        author: Some("user".into()),
+                        created_at: Some(1_700_000_000_030),
+                        content: "   ".into(), // whitespace-only -> empty after trim -> excluded
+                        extra_json: serde_json::Value::Null,
+                        snippets: Vec::new(),
+                    },
+                ],
+                source_id: LOCAL_SOURCE_ID.into(),
+                origin_host: None,
+            };
+            storage.insert_conversation_tree(agent_id, None, &conversation).unwrap();
+        }
+
+        // Independently compute the eligible set (same predicate, not the
+        // same call site as the production sync path).
+        let conversation_ids: Vec<i64> = storage
+            .conn
+            .query_all_map("SELECT id FROM conversations", &[], |row| row.get_typed(0))
+            .unwrap();
+        let mut eligible_ids: Vec<i64> = Vec::new();
+        for conversation_id in conversation_ids {
+            for message in storage.fetch_messages_for_lexical_rebuild(conversation_id).unwrap() {
+                let is_tool_role = is_lexical_rebuild_tool_class_role(role_as_str(&message.role));
+                let noise_role_hint: Option<&str> = is_tool_role.then_some("tool");
+                if !crate::search::canonicalize::is_hard_message_noise(noise_role_hint, &message.content) {
+                    eligible_ids.push(message.id.unwrap());
+                }
+            }
+        }
+        eligible_ids.sort_unstable();
+        assert_eq!(eligible_ids.len(), 5, "sanity: exactly one eligible message per conversation (5 conversations)");
+
+        // Simulate the real "full rebuild" scenario this function exists for
+        // (recovering a damaged/dropped lexical index from the canonical
+        // messages/conversations tables alone) rather than trivially
+        // reconfirming what the incremental W2-2/W2-3 write-path sync
+        // already populated during the inserts above -- without this, the
+        // test would pass even if `rebuild_lex_domain_from_db`'s own loop
+        // silently skipped every conversation, since nothing would ever
+        // exercise its from-scratch repopulation behavior.
+        storage.conn.execute_batch("DELETE FROM fts_lex; DELETE FROM lex_docs;").unwrap();
+        let sanity_empty: i64 =
+            storage.conn.query_row_map("SELECT COUNT(*) FROM lex_docs", &[], |row| row.get_typed(0)).unwrap();
+        assert_eq!(sanity_empty, 0, "sanity: lex_docs must be empty before the full rebuild runs");
+
+        let stats = storage.rebuild_lex_domain_from_db(None).unwrap();
+        assert_eq!(stats.conversations_processed, 5);
+
+        let mut lex_docs_ids: Vec<i64> = storage
+            .conn
+            .query_all_map("SELECT doc_id FROM lex_docs", &[], |row| row.get_typed(0))
+            .unwrap();
+        lex_docs_ids.sort_unstable();
+
+        assert_eq!(
+            eligible_ids, lex_docs_ids,
+            "bidirectional anti-join: eligible set and lex_docs must match exactly, not just in count"
+        );
+    }
+
+    /// X-2 (w2-4-rebuild-run.md): both the "Indexed N/M" operator print and
+    /// any external progress observer read forward progress purely from
+    /// `IndexingProgress::{phase,current}` -- neither reads any on-disk
+    /// heartbeat file for this signal. `rebuild_lex_domain_from_db` must
+    /// therefore refresh `progress.current` after every committed
+    /// transaction batch, not just once at the very end (a real corpus's
+    /// lex domain rebuild runs for minutes; W2-6 exec41 retired the
+    /// in-process `IndexStallWatchdog` that used to treat prolonged
+    /// zero-progress here as a wedge and `exit(70)` -- but the printed
+    /// progress itself would still sit frozen for the whole rebuild without
+    /// this per-batch refresh).
+    ///
+    /// Proven deterministically (no timing/threads required) by forcing the
+    /// SECOND batch to fail right after the FIRST batch commits: if
+    /// `current` were only bumped once at the very end (or not at all), it
+    /// would stay at 0 even though 200 conversations were successfully
+    /// synced; bumped per completed batch, it reflects exactly the first
+    /// batch's count. Deleting this test's per-batch `fetch_add` call turns
+    /// it red (mutation check).
+    #[test]
+    fn rebuild_lex_domain_from_db_refreshes_progress_current_after_each_committed_batch() {
+        use crate::model::types::{Agent, AgentKind, Conversation};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "claude_code".into(),
+                name: "Claude Code".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+
+        // 200 valid conversations (batch 1) + 1 poisoned conversation with a
+        // dangling `agent_id` inserted directly with the highest id (batch
+        // 2, alone). `rebuild_lex_domain_from_db` re-lists conversation ids
+        // itself right before batching, so the poisoned row must already
+        // exist in the table (not merely referenced afterwards) to land in
+        // the second batch -- a plain `DELETE` of the row would make it
+        // vanish from that listing entirely and produce one clean 200-row
+        // batch instead of the two-batch, second-fails shape this test needs.
+        const VALID_CONVERSATIONS: usize = 200;
+        for i in 0..VALID_CONVERSATIONS {
+            let external_id = format!("heartbeat-{i}");
+            let conversation = Conversation {
+                id: None,
+                agent_slug: "claude_code".into(),
+                workspace: None,
+                external_id: Some(external_id.clone()),
+                title: Some(format!("title {i}")),
+                source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
+                started_at: Some(1_700_000_000_000),
+                ended_at: None,
+                approx_tokens: None,
+                metadata_json: serde_json::Value::Null,
+                messages: Vec::new(),
+                source_id: LOCAL_SOURCE_ID.into(),
+                origin_host: None,
+            };
+            storage.insert_conversation_tree(agent_id, None, &conversation).unwrap();
+        }
+
+        let max_valid_id: i64 = storage
+            .conn
+            .query_row_map("SELECT MAX(id) FROM conversations", &[], |row| row.get_typed(0))
+            .unwrap();
+        let poisoned_id = max_valid_id + 1;
+
+        // Same narrow FK-bypass fixture pattern already used by
+        // `orphan_fk_self_heal`-style tests to construct a state that is
+        // structurally unreachable through any normal insert while FK
+        // enforcement is on: a conversation row whose `agent_id` points at
+        // no existing agent. `sync_lexical_domain_for_conversation_in_tx`'s
+        // `JOIN agents a ON a.id = c.agent_id` then returns zero rows for
+        // this one conversation, failing its batch with a real `Err`.
+        storage.raw().execute_batch_bypassing_foreign_keys_guard("PRAGMA foreign_keys = OFF").unwrap();
+        storage
+            .raw()
+            .execute(
+                "INSERT INTO conversations(id, agent_id, source_id, source_path, started_at) \
+                 VALUES(?1, 999999999, 'local', '/tmp/heartbeat-poisoned.jsonl', 1700000000000)",
+                fparams![poisoned_id],
+            )
+            .unwrap();
+        storage.raw().execute_batch_bypassing_foreign_keys_guard("PRAGMA foreign_keys = ON").unwrap();
+
+        const TOTAL_CONVERSATIONS: usize = VALID_CONVERSATIONS + 1;
+        let conversation_ids: Vec<i64> = storage
+            .conn
+            .query_all_map("SELECT id FROM conversations ORDER BY id", &[], |row| row.get_typed(0))
+            .unwrap();
+        assert_eq!(conversation_ids.len(), TOTAL_CONVERSATIONS);
+        assert_eq!(
+            *conversation_ids.last().unwrap(),
+            poisoned_id,
+            "sanity: the poisoned row must sort last so it lands alone in the second batch"
+        );
+
+        let progress = Arc::new(crate::indexer::IndexingProgress::default());
+        let result = storage.rebuild_lex_domain_from_db(Some(&progress));
+        assert!(result.is_err(), "batch 2's poisoned conversation row must fail the rebuild");
+
+        assert_eq!(
+            progress.total.load(Ordering::Relaxed),
+            TOTAL_CONVERSATIONS,
+            "total must be set to the full conversation count up front"
+        );
+        assert_eq!(
+            progress.current.load(Ordering::Relaxed),
+            200,
+            "current must reflect exactly the first (successfully committed) batch, proving \
+             the loop refreshes progress after each committed transaction batch rather than \
+             once at the end -- without this heartbeat the stall watchdog sees zero forward \
+             progress for the entire multi-minute lex domain rebuild on a real corpus and kills \
+             the process with exit(70) (X-2, w2-4-rebuild-run.md)"
+        );
+    }
+
+    fn insert_conversation_with_message(
+        storage: &SqliteStorage,
+        agent_id: i64,
+        external_id: &str,
+        content: &str,
+    ) {
+        storage
+            .insert_conversation_tree(
+                agent_id,
+                None,
+                &crate::model::types::Conversation {
+                    id: None,
+                    agent_slug: "claude_code".into(),
+                    workspace: None,
+                    external_id: Some(external_id.into()),
+                    title: Some(format!("title {external_id}")),
+                    source_path: std::path::PathBuf::from(format!("/tmp/{external_id}.jsonl")),
+                    started_at: Some(1_700_000_000_000),
+                    ended_at: None,
+                    approx_tokens: None,
+                    metadata_json: serde_json::Value::Null,
+                    messages: vec![crate::model::types::Message {
+                        id: None,
+                        idx: 0,
+                        role: crate::model::types::MessageRole::User,
+                        author: Some("user".into()),
+                        created_at: Some(1_700_000_000_000),
+                        content: content.into(),
+                        extra_json: serde_json::Value::Null,
+                        snippets: Vec::new(),
+                    }],
+                    source_id: LOCAL_SOURCE_ID.into(),
+                    origin_host: None,
+                },
+            )
+            .expect("insert_conversation_tree");
+    }
+
+    /// W2-6 Task A: a freshly-migrated (never-rebuilt) database has no
+    /// `LEX_DOMAIN_REBUILD_STATE_META_KEY` row at all. `lex_domain_matching_status`
+    /// (indexer/mod.rs) depends on this reading as `Absent`, not `Building` --
+    /// otherwise every ordinary incremental run (which never calls
+    /// `rebuild_lex_domain_from_db`) would misread a perfectly healthy,
+    /// dual-write-populated domain as needing a full rebuild forever.
+    #[test]
+    fn lex_domain_rebuild_marker_status_absent_on_fresh_db() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        assert_eq!(
+            lex_domain_rebuild_marker_status(storage.raw()).unwrap(),
+            LexDomainRebuildMarkerState::Absent
+        );
+    }
+
+    /// Domain incomplete -> triggers rebuild: `rebuild_lex_domain_from_db`
+    /// must leave the marker at `Completed { total_conversations, lex_docs_count }`
+    /// matching the real counts, atomically with the last batch's commit.
+    #[test]
+    fn rebuild_lex_domain_from_db_writes_completed_marker_matching_real_counts() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "claude_code".into(),
+                name: "Claude Code".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        for i in 0..3 {
+            insert_conversation_with_message(&storage, agent_id, &format!("marker-{i}"), "hello world");
+        }
+
+        // Sanity: fresh migration already dual-writes lex_docs inline, so
+        // clear it first to make the rebuild's own effect observable and
+        // isolate this test from that unrelated write path.
+        storage.raw().execute("DELETE FROM lex_docs", &[]).unwrap();
+        storage.raw().execute("DELETE FROM fts_lex", &[]).unwrap();
+
+        let stats = storage.rebuild_lex_domain_from_db(None).unwrap();
+        assert_eq!(stats.conversations_processed, 3);
+        assert_eq!(stats.lex_docs_count, 3);
+        assert_eq!(
+            lex_domain_rebuild_marker_status(storage.raw()).unwrap(),
+            LexDomainRebuildMarkerState::Completed {
+                total_conversations: 3,
+                lex_docs_count: 3,
+            }
+        );
+    }
+
+    /// 模拟中断态: a rebuild that never reaches the final chunk (marker stuck
+    /// at "building") must read as incomplete on the next routine run, not
+    /// as healthy -- proving there is no partial-progress resume (X-5): the
+    /// only two readable states are "definitely finished" and "redo it".
+    #[test]
+    fn interrupted_rebuild_marker_reads_as_building_not_completed() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "claude_code".into(),
+                name: "Claude Code".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        insert_conversation_with_message(&storage, agent_id, "interrupted-1", "hello world");
+
+        // Simulate a crash between `write_lex_domain_rebuild_marker_building`
+        // and the last chunk's commit: write "building" directly, as the
+        // real function does before its loop, without ever reaching the
+        // completed write.
+        write_lex_domain_rebuild_marker_building(storage.raw()).unwrap();
+
+        assert_eq!(
+            lex_domain_rebuild_marker_status(storage.raw()).unwrap(),
+            LexDomainRebuildMarkerState::Building
+        );
+
+        // A subsequent full rebuild (what indexer::mod.rs's region2 triggers
+        // on reading `Building`) must clear it back to `Completed`.
+        let stats = storage.rebuild_lex_domain_from_db(None).unwrap();
+        assert_eq!(
+            lex_domain_rebuild_marker_status(storage.raw()).unwrap(),
+            LexDomainRebuildMarkerState::Completed {
+                total_conversations: 1,
+                lex_docs_count: stats.lex_docs_count,
+            }
+        );
+    }
+
+    /// A malformed `completed:` value (only reachable by manual tampering,
+    /// never written by this codebase) must fail closed toward "rebuild it,"
+    /// never toward "trust it as healthy."
+    #[test]
+    fn malformed_completed_marker_reads_as_building_not_trusted() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        storage
+            .raw()
+            .execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                fparams![LEX_DOMAIN_REBUILD_STATE_META_KEY, "completed:not-a-number:also-not"],
+            )
+            .unwrap();
+        assert_eq!(
+            lex_domain_rebuild_marker_status(storage.raw()).unwrap(),
+            LexDomainRebuildMarkerState::Building
+        );
+    }
+
     /// `coding_agent_session_search-uhhxy` (gh #302 ask #2): the dedup
     /// cleanup must detect a `projects/<rel>` twin of a bare `<rel>`
     /// conversation sharing one source_path, report it on dry-run without
@@ -16487,13 +16432,25 @@ mod tests {
 
     /// #290: a conversation whose content exceeds the cap is admitted through the
     /// lexical-rebuild fetch with truncated content, not OOM-quarantined.
+    ///
+    /// w2 F5 fix: `#[serial]` -- this test and
+    /// `conversation_crossing_lexical_cap_truncates_and_clears_correctly_across_append`
+    /// (above, in this same file) both set the same process-global
+    /// `CASS_LEXICAL_MAX_CONVERSATION_CONTENT_BYTES` env var to different
+    /// values ("1024" here, "100" there) with no coordination between them;
+    /// under default parallel test execution either could observe the
+    /// other's value mid-run. `#[serial]` on both is this crate's existing
+    /// mechanism for exactly this kind of process-env race (no new
+    /// dependency introduced).
     #[test]
+    #[serial]
     fn fetch_messages_for_lexical_rebuild_truncates_oversized_conversation_content() {
         use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
         use std::path::PathBuf;
 
         // Force a small, deterministic cap independent of host memory.
-        // SAFETY: single-threaded test; the env var is read on each fetch call.
+        // SAFETY: `#[serial]` above excludes concurrent readers/writers of
+        // this env var; the value is read on each fetch call.
         unsafe {
             std::env::set_var("CASS_LEXICAL_MAX_CONVERSATION_CONTENT_BYTES", "1024");
         }
@@ -17089,15 +17046,10 @@ mod tests {
                 && conversation_cols.contains(&"last_message_created_at".to_string()),
             "fresh schema must include V15 tail columns without ALTER TABLE on conversations"
         );
-        // w1b Task B7 (control-plane ruling, bead z9fse.11): `SqliteStorage::open`
-        // on a new file now builds through `schema::ensure`, which creates
-        // fts_messages eagerly as part of the one-shot fresh DDL -- the old
-        // "V13 creates it, V14 drops it, a later FTS consistency check
-        // recreates it lazily" dance this assertion used to check for is
-        // retired for new-engine databases (that dance existed to work around
-        // a legacy embedded engine-specific limitation; the machinery itself retires
-        // at Task B8). A fresh database now has exactly one, immediately
-        // queryable, fts_messages schema row from the moment it's built.
+        // W2-6 Task戊: schema version 3 drops fts_messages entirely --
+        // `SqliteStorage::open` on a new file now builds through
+        // `schema::ensure`, which never creates it (search runs on the
+        // fts_lex/lex_docs index instead).
         let fts_schema_rows: i64 = conn
             .query_row_map(
                 "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
@@ -17106,8 +17058,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            fts_schema_rows, 1,
-            "fresh schema must create fts_messages eagerly, not lazily"
+            fts_schema_rows, 0,
+            "fresh schema must not create the retired fts_messages table"
         );
         let integrity: Vec<String> = conn
             .query_all_map("PRAGMA integrity_check;", fparams![], |row: &FrankenRow| {
@@ -17898,83 +17850,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ud_msg, 3);
-    }
-
-    #[test]
-    fn insert_conversations_batched_flushes_large_fts_batches() {
-        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
-        use std::path::PathBuf;
-
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test.db");
-        let storage = SqliteStorage::open(&db_path).unwrap();
-        // V14 drops fts_messages during migration; cass normally recreates it
-        // during startup via `ensure_search_fallback_fts_consistency`. Tests
-        // that inspect fts_messages directly need to run the same repair pass
-        // to exercise the "insert flushes FTS" contract.
-        storage
-            .ensure_search_fallback_fts_consistency()
-            .expect("ensure FTS consistency before insert");
-
-        let agent = Agent {
-            id: None,
-            slug: "codex".into(),
-            name: "Codex".into(),
-            version: Some("0.2.3".into()),
-            kind: AgentKind::Cli,
-        };
-        let agent_id = storage.ensure_agent(&agent).unwrap();
-
-        let content = "y".repeat((FTS_ENTRY_BATCH_MAX_CHARS / 2) + 1);
-        let messages: Vec<_> = (0_i64..2)
-            .map(|i| Message {
-                id: None,
-                idx: i,
-                role: MessageRole::Agent,
-                author: None,
-                created_at: Some(1_700_000_000_000 + i),
-                content: format!("{i}-{content}"),
-                extra_json: serde_json::Value::Null,
-                snippets: Vec::new(),
-            })
-            .collect();
-        let conv = Conversation {
-            id: None,
-            agent_slug: "codex".into(),
-            workspace: Some(PathBuf::from("/tmp/workspace")),
-            external_id: Some("fts-large-batch".into()),
-            title: Some("FTS Large Batch".into()),
-            source_path: PathBuf::from("/tmp/rollout.jsonl"),
-            started_at: Some(1_700_000_000_000),
-            ended_at: Some(1_700_000_000_999),
-            approx_tokens: None,
-            metadata_json: serde_json::Value::Null,
-            messages,
-            source_id: "local".into(),
-            origin_host: None,
-        };
-
-        let outcomes = storage
-            .insert_conversations_batched(&[(agent_id, None, &conv)])
-            .unwrap();
-        assert_eq!(outcomes.len(), 1);
-        assert_eq!(outcomes[0].inserted_indices.len(), conv.messages.len());
-
-        let message_count: i64 = storage
-            .conn
-            .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
-                row.get_typed(0)
-            })
-            .unwrap();
-        let fts_count: i64 = storage
-            .conn
-            .query_row_map("SELECT COUNT(*) FROM fts_messages", fparams![], |row| {
-                row.get_typed(0)
-            })
-            .unwrap();
-
-        assert_eq!(message_count, conv.messages.len() as i64);
-        assert_eq!(fts_count, conv.messages.len() as i64);
     }
 
     fn make_profiled_storage_remote_conversation(
@@ -18907,7 +18782,7 @@ mod tests {
             )
             .unwrap();
 
-        let mut tx = storage.conn.transaction().unwrap();
+        let tx = storage.conn.transaction().unwrap();
         franken_update_daily_stats_in_tx(
             &storage,
             &tx,
@@ -18995,7 +18870,7 @@ mod tests {
             )
             .unwrap();
 
-        let mut tx = storage.conn.transaction().unwrap();
+        let tx = storage.conn.transaction().unwrap();
         franken_update_daily_stats_in_tx(
             &storage,
             &tx,
@@ -21790,70 +21665,6 @@ mod tests {
             .unwrap();
         drop(source);
 
-        #[cfg(not(windows))]
-        {
-            // Legacy "duplicate FTS" fixture reconstruction.
-            //
-            // w1b Task B7 (control-plane ruling, bead z9fse.11): `SqliteStorage::open`
-            // on a new file now builds through `schema::ensure`, which creates
-            // fts_messages eagerly -- `source` (opened above) already has exactly
-            // one real fts_messages row, playing the same "one legitimate contentless
-            // entry" role the old V13-era row used to need manual injection for. Only
-            // the buggy duplicate row -- the actual subject of the fixup logic this
-            // test exercises -- needs injecting now.
-            let duplicate_legacy_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')";
-            let legacy = rusqlite_test_fixture_conn(&source_db);
-            legacy
-                .execute_batch(
-                    "UPDATE meta SET value = '13' WHERE key = 'schema_version';
-                     DELETE FROM _schema_migrations WHERE version = 14;
-                     PRAGMA writable_schema = ON;",
-                )
-                .unwrap();
-            legacy
-                .execute(
-                    "DELETE FROM meta WHERE key = ?1",
-                    [FTS_FRANKEN_REBUILD_META_KEY],
-                )
-                .unwrap();
-            // Inject the duplicate that's the real subject of the fixup logic.
-            legacy
-                .execute(
-                    "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
-                     VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
-                    [duplicate_legacy_fts_sql],
-                )
-                .unwrap();
-            legacy
-                .execute_batch("PRAGMA writable_schema = OFF;")
-                .unwrap();
-            drop(legacy);
-
-            // Verify fixture with rusqlite+writable_schema to see raw
-            // sqlite_master rows (the legacy embedded engine deduplicates schema entries).
-            {
-                let verify = rusqlite_test_fixture_conn(&source_db);
-                verify
-                    .execute_batch("PRAGMA writable_schema = ON;")
-                    .unwrap();
-                let fts_entries: i64 = verify
-                    .query_row(
-                        "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
-                        [],
-                        |row| row.get(0),
-                    )
-                    .unwrap();
-                assert_eq!(
-                    fts_entries, 2,
-                    "test fixture should reproduce the duplicate legacy fts_messages rows"
-                );
-                let msg_count: i64 = verify
-                    .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
-                    .unwrap();
-                assert_eq!(msg_count, 1);
-            }
-        }
-
         let fresh = SqliteStorage::open(&canonical_db).unwrap();
         drop(fresh);
 
@@ -21920,17 +21731,6 @@ mod tests {
             FrankenOpenFlags::SQLITE_OPEN_READ_ONLY,
         )
         .unwrap();
-        let reopened_fts_entries: i64 = reopened_readonly
-            .query_row_map(
-                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
-                fparams![],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-        assert_eq!(
-            reopened_fts_entries, 1,
-            "seeded canonical db should keep a single stock-SQLite fts_messages schema row"
-        );
         let reopened_message_count: i64 = reopened_readonly
             .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
                 row.get_typed(0)
@@ -21942,31 +21742,6 @@ mod tests {
         assert_eq!(
             franken_seeded.schema_version().unwrap(),
             CURRENT_SCHEMA_VERSION
-        );
-        // Post-V14 fts_messages is recreated lazily. `FrankenStorage::open`
-        // alone doesn't re-register the virtual table for the legacy embedded engine
-        // query engine — the consistency pass does, and this is exactly what
-        // normal cass startup runs before the first search. Invoke it
-        // explicitly so the query below exercises the expected post-repair
-        // state rather than the between-steps state.
-        franken_seeded
-            .ensure_search_fallback_fts_consistency()
-            .expect("ensure FTS consistency after seed");
-        let post_franken_schema_rows: i64 = franken_seeded
-            .raw()
-            .query_row_map(
-                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
-                fparams![],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-        assert_eq!(post_franken_schema_rows, 1);
-        let fts_probe = franken_seeded
-            .raw()
-            .query_all_map("SELECT COUNT(*) FROM fts_messages", &[], |_row| Ok(()));
-        assert!(
-            fts_probe.is_ok(),
-            "expected post-seed FTS to be queryable, got {fts_probe:?}"
         );
     }
 
@@ -23465,12 +23240,6 @@ mod tests {
                  PRAGMA writable_schema = ON;",
             )
             .unwrap();
-        replay_legacy
-            .execute(
-                "DELETE FROM meta WHERE key = ?1",
-                [FTS_FRANKEN_REBUILD_META_KEY],
-            )
-            .unwrap();
         #[cfg(not(windows))]
         {
             let duplicate_legacy_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')";
@@ -23513,189 +23282,25 @@ mod tests {
             bundles[0].probe.user_version,
             Some(CURRENT_SCHEMA_VERSION)
         );
-        // w1b Task B7 (control-plane ruling, bead z9fse.11): `clean_backup` is
-        // built via `SqliteStorage::open` on a new file, which now creates
-        // fts_messages eagerly through `schema::ensure` -- one real,
-        // immediately-queryable schema row, no lazy repair needed. The bundle
-        // was already ranked healthiest before this change (0 lazy rows was
-        // also a legitimate healthy state); it stays healthiest now.
-        assert_eq!(bundles[0].probe.fts_schema_rows, Some(1));
-        assert!(bundles[0].probe.fts_queryable);
+        // W2-6 Task戊: `clean_backup` is built via `SqliteStorage::open` on a
+        // new file, which now goes through `schema::ensure` at version 3 --
+        // fts_messages is retired and never created. Zero schema rows on a
+        // current-schema bundle is exactly the `bundle_health_rank` clean
+        // shape (`Some(0) && schema_current`, see that function's doc
+        // comment), so it still ranks healthiest; `fts_queryable` only ever
+        // means something for the `Some(1)` shape, so it stays false here.
+        assert_eq!(bundles[0].probe.fts_schema_rows, Some(0));
+        assert!(!bundles[0].probe.fts_queryable);
         assert_eq!(bundles[1].probe.schema_version, Some(13));
-        // w1b Task B7 (control-plane ruling, bead z9fse.11): `replay_storage`
-        // was also built via `SqliteStorage::open` on a new file, so it
-        // starts with one real, eagerly-created fts_messages row before the
-        // test rolls meta.schema_version back to 13 and deletes the V14
-        // marker (that rollback only touches version bookkeeping, not the
-        // schema object itself). On Unix CI we also inject a duplicate
-        // sqlite_master row on top of that real one to exercise the
-        // malformed-bundle probe path that depends on sqlite3.
-        let expected_fts_schema_rows = if cfg!(windows) { Some(1) } else { Some(2) };
+        // W2-6 Task戊: `replay_storage` was also built via `SqliteStorage::open`
+        // on a new file, so (post-drop) it starts with zero fts_messages
+        // schema rows -- there is no longer a real row for the test's
+        // `#[cfg(not(windows))]` sqlite_master injection below to duplicate
+        // against. On Unix CI that injection adds the one and only
+        // (malformed, non-functional) row; on Windows nothing injects and
+        // the bundle stays at zero.
+        let expected_fts_schema_rows = if cfg!(windows) { Some(0) } else { Some(1) };
         assert_eq!(bundles[1].probe.fts_schema_rows, expected_fts_schema_rows);
-    }
-
-    #[test]
-    #[ignore = "blocked on frankensqlite contentless-FTS fix (y8n3i / fsqlite bd-sf8dx): on fsqlite 0.1.13 the reopen-mutate no longer errors but the incremental catch-up still degrades to a full Rebuilt; un-ignore via cljkz once fsqlite ships true incremental catch-up on a reopened contentless table"]
-    fn ensure_fts_consistency_via_rusqlite_catches_up_missing_rows() {
-        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
-
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("fts-catchup.db");
-        let storage = SqliteStorage::open(&db_path).unwrap();
-        let agent = Agent {
-            id: None,
-            slug: "codex".into(),
-            name: "Codex".into(),
-            version: Some("0.2.3".into()),
-            kind: AgentKind::Cli,
-        };
-        let agent_id = storage.ensure_agent(&agent).unwrap();
-        let conversation = Conversation {
-            id: None,
-            agent_slug: "codex".into(),
-            workspace: Some(PathBuf::from("/tmp/workspace")),
-            external_id: Some("fts-catchup".into()),
-            title: Some("FTS catchup".into()),
-            source_path: PathBuf::from("/tmp/fts-catchup.jsonl"),
-            started_at: Some(1_700_000_000_000),
-            ended_at: Some(1_700_000_000_100),
-            approx_tokens: Some(42),
-            metadata_json: serde_json::Value::Null,
-            messages: vec![Message {
-                id: None,
-                idx: 0,
-                role: MessageRole::User,
-                author: Some("user".into()),
-                created_at: Some(1_700_000_000_050),
-                content: "initial message".into(),
-                extra_json: serde_json::Value::Null,
-                snippets: Vec::new(),
-            }],
-            source_id: LOCAL_SOURCE_ID.into(),
-            origin_host: None,
-        };
-        storage
-            .insert_conversation_tree(agent_id, None, &conversation)
-            .unwrap();
-        drop(storage);
-
-        rebuild_fts_via_rusqlite(&db_path).unwrap();
-
-        let conn = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().into_owned())), crate::storage::api::Profile::Production).unwrap();
-        let conversation_id: i64 = conn
-            .query_row_map("SELECT id FROM conversations LIMIT 1", fparams![], |row| {
-                row.get_typed(0)
-            })
-            .unwrap();
-        conn.execute(
-            "INSERT INTO messages(id, conversation_id, idx, role, author, created_at, content, extra_json, extra_bin)
-             VALUES(2, ?1, 1, 'assistant', 'assistant', 1700000000060, 'authentication catchup', NULL, NULL)",
-            fparams![conversation_id],
-        )
-        .unwrap();
-        drop(conn);
-
-        let repair = ensure_fts_consistency_via_rusqlite(&db_path).unwrap();
-        assert_eq!(
-            repair,
-            FtsConsistencyRepair::IncrementalCatchUp {
-                inserted_rows: 1,
-                total_rows: 2
-            }
-        );
-
-        let conn = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().into_owned())), crate::storage::api::Profile::Production).unwrap();
-        let auth_rows: i64 = conn
-            .query_row_map(
-                "SELECT COUNT(*) FROM fts_messages WHERE rowid = 2",
-                fparams![],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-        assert_eq!(auth_rows, 1);
-    }
-
-    #[test]
-    #[ignore = "blocked on frankensqlite contentless-FTS fix (y8n3i / fsqlite bd-sf8dx): fsqlite 0.1.13 open-validation still demands a _content shadow for a legacy (no content= option) fts_messages schema row, so repair cannot even open; un-ignore via cljkz once fsqlite treats that as recoverable"]
-    fn rebuild_fts_via_rusqlite_cleans_duplicate_legacy_schema_rows() {
-        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
-
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("fts-duplicate-rebuild.db");
-
-        let storage = SqliteStorage::open(&db_path).unwrap();
-        let agent = Agent {
-            id: None,
-            slug: "codex".into(),
-            name: "Codex".into(),
-            version: Some("0.2.3".into()),
-            kind: AgentKind::Cli,
-        };
-        let agent_id = storage.ensure_agent(&agent).unwrap();
-        let conversation = Conversation {
-            id: None,
-            agent_slug: "codex".into(),
-            workspace: Some(PathBuf::from("/ws")),
-            external_id: Some("retro".into()),
-            title: Some("retro".into()),
-            source_path: PathBuf::from("/tmp/retro.jsonl"),
-            started_at: Some(42),
-            ended_at: Some(42),
-            approx_tokens: None,
-            metadata_json: serde_json::Value::Null,
-            messages: vec![Message {
-                id: None,
-                idx: 0,
-                role: MessageRole::User,
-                author: None,
-                created_at: Some(42),
-                content: "retro investigation".into(),
-                extra_json: serde_json::Value::Null,
-                snippets: Vec::new(),
-            }],
-            source_id: LOCAL_SOURCE_ID.into(),
-            origin_host: None,
-        };
-        storage
-            .insert_conversation_tree(agent_id, None, &conversation)
-            .unwrap();
-        drop(storage);
-        materialize_fresh_fts_schema_via_rusqlite(&db_path).unwrap();
-
-        let conn = rusqlite_test_fixture_conn(&db_path);
-        conn.execute_batch("PRAGMA writable_schema = ON;").unwrap();
-        conn.execute(
-            "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
-             VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
-            ["CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')"],
-        )
-        .unwrap();
-        conn.execute_batch("PRAGMA writable_schema = OFF;").unwrap();
-        let duplicate_rows: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(duplicate_rows, 2);
-        drop(conn);
-
-        let inserted = rebuild_fts_via_rusqlite(&db_path).unwrap();
-        assert_eq!(inserted, 1);
-
-        let conn = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().into_owned())), crate::storage::api::Profile::Production).unwrap();
-        let schema_rows = franken_fts_schema_rows(&conn).unwrap();
-        assert_eq!(
-            schema_rows, 1,
-            "DROP TABLE should leave one clean FTS schema"
-        );
-        let match_count: i64 = conn
-            .query_row_map("SELECT COUNT(*) FROM fts_messages", fparams![], |row| {
-                row.get_typed(0)
-            })
-            .unwrap();
-        assert_eq!(match_count, 1);
     }
 
     // =========================================================================
@@ -25569,149 +25174,6 @@ mod tests {
 
 
     #[test]
-    fn fts_messages_integrity_reports_missing_shadow_tables() {
-        let direct_missing_shadow = fts_messages_integrity_error_from_message(
-            "inserting 10000 rows into fallback FTS: table not found: fts_messages_data",
-        )
-        .expect("a missing required shadow table must be classified as derived FTS damage");
-        assert_eq!(
-            direct_missing_shadow.missing_shadow_tables(),
-            &["fts_messages_data"]
-        );
-
-        let dir = TempDir::new().unwrap();
-        let healthy_db_path = dir.path().join("healthy_fts.db");
-
-        {
-            let storage = FrankenStorage::open(&healthy_db_path).unwrap();
-            storage.ensure_search_fallback_fts_consistency().unwrap();
-            storage
-                .validate_fts_messages_integrity()
-                .expect("freshly materialized fts_messages should pass integrity validation");
-        }
-
-        let corrupt_db_path = dir.path().join("test_corrupt_fts_missing_shadows.db");
-        {
-            let conn = rusqlite_test_fixture_conn(&corrupt_db_path);
-            conn.execute("CREATE TABLE schema_anchor(id INTEGER PRIMARY KEY)", [])
-                .unwrap();
-            let orphaned_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')";
-            conn.execute_batch("PRAGMA writable_schema = ON;").unwrap();
-            conn.execute(
-                "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
-                 VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
-                [orphaned_fts_sql],
-            )
-            .unwrap();
-            conn.execute_batch("PRAGMA writable_schema = OFF;").unwrap();
-        }
-
-        // w1b Task B9 (salvage problem C, control-plane ruling): vanilla
-        // SQLite defers FTS5 shadow-table validation to the virtual
-        // table's `xConnect`, triggered by the first real reference to
-        // `fts_messages` -- not by opening the connection. The old
-        // the legacy embedded engine backend validated eagerly at open time (which this
-        // test originally pinned); that eagerness was a side effect of
-        // the legacy embedded engine's own vtable machinery, the very thing this wave
-        // retires. Opening a connection to a database carrying a single
-        // (non-duplicated) orphaned fts_messages declaration must now
-        // succeed:
-        let conn = FrankenConnection::open_writable(std::path::Path::new(&(corrupt_db_path.to_string_lossy().to_string())), crate::storage::api::Profile::Production)
-            .expect("a single orphaned fts_messages declaration (no name collision) must not fail connection open under vanilla SQLite's lazy vtable validation");
-
-        // -- and the corruption must surface the moment fts_messages is
-        // actually queried, pinning the real exposure timing so a future
-        // engine change silently moving it elsewhere goes noticed. Real
-        // SQLite's xConnect failure here is a generic "vtable constructor
-        // failed: fts_messages" -- unlike the legacy embedded engine's old open-time
-        // message, it does not name any specific missing shadow table, so
-        // `fts_messages_integrity_error_from_message` classifies it as
-        // structural FTS damage with an empty `missing_shadow_tables()`
-        // (verified: `query_err.to_string()` contains
-        // "vtable constructor failed").
-        let query_err = conn
-            .query_all_map(FTS_MESSAGES_INTEGRITY_PROBE_SQL, &[], |_row| Ok(()))
-            .expect_err("querying fts_messages is where xConnect shadow-table validation actually fires");
-        assert!(
-            query_err.to_string().contains("vtable constructor failed"),
-            "unexpected query-time error shape: {query_err}"
-        );
-        fts_messages_integrity_error_from_message(query_err.to_string())
-            .expect("query-time FTS corruption should map to the typed FTS integrity kind");
-
-        // The crate's real, production-wired detection entry point
-        // (validate_fts_messages_integrity_for_connection, consumed as an
-        // opt-in preflight check by indexer/mod.rs before indexing) must
-        // independently catch this too -- this is the guarantee that
-        // actually matters for operators, decoupled from whichever
-        // specific statement happens to trip xConnect first. Its
-        // shadow-table check is a real `sqlite_master` query rather than
-        // string-matching a driver error, so it correctly reports all five
-        // required tables as missing (none were ever created -- the
-        // fixture hand-inserted only the top-level declaration row).
-        let validate_err = validate_fts_messages_integrity_for_connection(&conn)
-            .expect_err("validate_fts_messages_integrity must detect the orphaned fts_messages declaration");
-        let integrity = validate_err
-            .downcast_ref::<FtsMessagesIntegrityError>()
-            .expect("validation failure should be the typed FTS integrity error");
-        assert_eq!(
-            integrity.missing_shadow_tables(),
-            &FTS_MESSAGES_REQUIRED_SHADOW_TABLES[..]
-        );
-        let rendered = integrity.to_string();
-        assert!(
-            rendered.contains("fts_messages")
-                && rendered.contains("required FTS5 shadow tables")
-                && rendered.contains("fts_messages_content"),
-            "error should be an operator-facing FTS corruption diagnosis: {rendered}"
-        );
-    }
-
-    #[test]
-    fn franken_storage_open_fresh_db_keeps_single_franken_fts_schema_row() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("fresh-franken-storage-open.db");
-
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
-
-        // w1b Task B7 interaction probe (control-plane ruling, bead z9fse.11):
-        // `schema::ensure` now creates fts_messages eagerly, so by this point
-        // the database already has exactly one, correct fts_messages schema
-        // row -- unlike the pre-B7 world this test originally documented,
-        // where V14 drops the V13-era table and nothing recreates it until a
-        // consistency pass runs. The old lazy-repair machinery
-        // (`ensure_search_fallback_fts_consistency`) still exists and still
-        // runs during normal cass startup until Task B8, so the interaction
-        // that actually matters now is the reverse of what this test used to
-        // check: does that machinery stay a clean no-op -- no duplicate
-        // schema row, still queryable -- when it finds a table that's
-        // already present and correct, rather than absent?
-        storage
-            .ensure_search_fallback_fts_consistency()
-            .expect("ensure FTS consistency after fresh open");
-        drop(storage);
-
-        let c_reader = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().into_owned())), crate::storage::api::Profile::Production)
-            .expect("open DB via the legacy embedded engine for sqlite_master inspection");
-        assert_eq!(
-            franken_fts_schema_rows(&c_reader).unwrap(),
-            1,
-            "exactly one fts_messages schema row should exist after ensure_search_fallback_fts_consistency"
-        );
-        drop(c_reader);
-
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        assert!(
-            storage
-                .raw()
-                .query_all_map("SELECT COUNT(*) FROM fts_messages", &[], |_row| Ok(()))
-                .is_ok(),
-            "fts_messages must be queryable through the legacy embedded engine after open"
-        );
-    }
-
-    #[test]
     fn franken_storage_open_repairs_missing_analytics_tables_when_version_markers_lie() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test_repair_missing_analytics.db");
@@ -25770,6 +25232,286 @@ mod tests {
         assert_eq!(
             analytics_count, 9,
             "open() should recreate the missing analytics tables even when schema_version already says current"
+        );
+    }
+
+    /// w2 F4 regression: a version-2 database that lost `lex_docs`/`fts_lex`
+    /// (incomplete restore / derived-index corruption -- not the version
+    /// 1 -> 2 migration case, which is covered elsewhere) must be
+    /// self-healed by `FrankenStorage::open` the same way the analytics
+    /// tables above are, not silently left broken because `schema::ensure`
+    /// returns Ok immediately once `user_version` already reads 2.
+    #[test]
+    fn franken_storage_open_repairs_missing_lex_domain_tables_on_a_v2_database() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test_repair_missing_lex_domain.db");
+
+        {
+            let storage = FrankenStorage::open(&db_path).unwrap();
+            assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+        }
+
+        {
+            let conn = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().into_owned())), crate::storage::api::Profile::Production).unwrap();
+            for table in &["fts_lex", "lex_docs"] {
+                conn.execute(&format!("DROP TABLE IF EXISTS {table}"), &[])
+                    .unwrap();
+            }
+        }
+
+        let repaired = FrankenStorage::open(&db_path).unwrap();
+        assert_eq!(repaired.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+
+        let lex_domain_count: i64 = repaired
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('lex_docs', 'fts_lex')",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            lex_domain_count, 2,
+            "open() should recreate lex_docs/fts_lex even when schema_version already says current"
+        );
+
+        // Functional check, not just shape: a normal write through the
+        // repaired tables must actually work end to end.
+        let agent = Agent {
+            id: None,
+            slug: "repair-check".into(),
+            name: "repair-check".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        };
+        let agent_id = repaired.ensure_agent(&agent).unwrap();
+        let conv = Conversation {
+            id: None,
+            agent_slug: "repair-check".into(),
+            workspace: None,
+            external_id: Some("f4-repair-1".into()),
+            title: Some("F4 repair check".into()),
+            source_path: std::path::PathBuf::from("/fixtures/f4-repair.jsonl"),
+            started_at: Some(1),
+            ended_at: Some(2),
+            approx_tokens: None,
+            metadata_json: serde_json::json!({}),
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(1),
+                content: "f4repairmarker present after self heal".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: vec![],
+            }],
+            source_id: "local".into(),
+            origin_host: None,
+        };
+        repaired
+            .insert_conversations_batched(&[(agent_id, None, &conv)])
+            .expect("write through the repaired lex domain tables must succeed");
+
+        let hits: i64 = repaired
+            .raw()
+            .query_row_map(
+                "SELECT count(*) FROM fts_lex WHERE fts_lex MATCH 'f4repairmarker'",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            hits, 1,
+            "the repaired fts_lex table must actually be writable and MATCH-able, not just present"
+        );
+    }
+
+    /// R1-B2: when `fts_lex` alone goes missing (e.g. corruption wipes just
+    /// the virtual table) while `lex_docs` survives with rows, self-heal
+    /// must not leave a permanently empty, "healthy-looking" shadow index --
+    /// it has to `rebuild` from the surviving external content so
+    /// pre-existing rows stay MATCH-able, not just rows written after repair.
+    #[test]
+    fn franken_storage_open_rebuilds_fts_lex_from_surviving_lex_docs_when_only_fts_lex_is_missing()
+     {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test_repair_fts_lex_only.db");
+
+        let agent = Agent {
+            id: None,
+            slug: "repair-check".into(),
+            name: "repair-check".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        };
+        let conv = Conversation {
+            id: None,
+            agent_slug: "repair-check".into(),
+            workspace: None,
+            external_id: Some("r1b2-repair-1".into()),
+            title: Some("R1-B2 repair check".into()),
+            source_path: std::path::PathBuf::from("/fixtures/r1b2-repair.jsonl"),
+            started_at: Some(1),
+            ended_at: Some(2),
+            approx_tokens: None,
+            metadata_json: serde_json::json!({}),
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(1),
+                content: "r1b2fixmarker survives the fts_lex-only drop".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: vec![],
+            }],
+            source_id: "local".into(),
+            origin_host: None,
+        };
+
+        {
+            let storage = FrankenStorage::open(&db_path).unwrap();
+            let agent_id = storage.ensure_agent(&agent).unwrap();
+            storage
+                .insert_conversations_batched(&[(agent_id, None, &conv)])
+                .unwrap();
+        }
+
+        {
+            let conn = FrankenConnection::open_writable(
+                std::path::Path::new(&(db_path.to_string_lossy().into_owned())),
+                crate::storage::api::Profile::Production,
+            )
+            .unwrap();
+            conn.execute("DROP TABLE IF EXISTS fts_lex", &[]).unwrap();
+        }
+
+        let repaired = FrankenStorage::open(&db_path).unwrap();
+
+        let lex_docs_count: i64 = repaired
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM lex_docs", &[], |row| row.get_typed(0))
+            .unwrap();
+        assert_eq!(
+            lex_docs_count, 1,
+            "lex_docs must have survived the fts_lex-only drop untouched"
+        );
+
+        let hits: i64 = repaired
+            .raw()
+            .query_row_map(
+                "SELECT count(*) FROM fts_lex WHERE fts_lex MATCH 'r1b2fixmarker'",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            hits, 1,
+            "self-heal must rebuild the fts_lex shadow index from surviving lex_docs content, \
+             not just recreate an empty shadow table that silently matches nothing"
+        );
+    }
+
+    /// R3-B2: if the `rebuild` step fails after the repair batch already
+    /// recreated `fts_lex`'s shape, the whole repair must roll back to
+    /// "fts_lex still missing" -- not leave the freshly (re)created shadow
+    /// table sitting there empty, which is exactly the permanent false-green
+    /// state R1-B2 fixed. Forcing a real crash mid-repair isn't a low-cost
+    /// injection point, so this test forces the `rebuild` statement itself
+    /// to fail (by breaking `lex_docs`'s schema out from under it, after
+    /// `fts_lex` shape recreation would otherwise have succeeded) and checks
+    /// the transaction actually undid the `CREATE VIRTUAL TABLE`.
+    #[test]
+    fn franken_storage_open_rolls_back_fts_lex_shape_when_rebuild_fails_mid_repair() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test_repair_fts_lex_rebuild_failure.db");
+
+        let agent = Agent {
+            id: None,
+            slug: "repair-check".into(),
+            name: "repair-check".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        };
+        let conv = Conversation {
+            id: None,
+            agent_slug: "repair-check".into(),
+            workspace: None,
+            external_id: Some("r3b2-repair-1".into()),
+            title: Some("R3-B2 rollback check".into()),
+            source_path: std::path::PathBuf::from("/fixtures/r3b2-repair.jsonl"),
+            started_at: Some(1),
+            ended_at: Some(2),
+            approx_tokens: None,
+            metadata_json: serde_json::json!({}),
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(1),
+                content: "r3b2 marker for the forced rebuild failure".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: vec![],
+            }],
+            source_id: "local".into(),
+            origin_host: None,
+        };
+
+        {
+            let storage = FrankenStorage::open(&db_path).unwrap();
+            let agent_id = storage.ensure_agent(&agent).unwrap();
+            storage
+                .insert_conversations_batched(&[(agent_id, None, &conv)])
+                .unwrap();
+        }
+
+        {
+            let conn = FrankenConnection::open_writable(
+                std::path::Path::new(&(db_path.to_string_lossy().into_owned())),
+                crate::storage::api::Profile::Production,
+            )
+            .unwrap();
+            conn.execute("DROP TABLE IF EXISTS fts_lex", &[]).unwrap();
+            // `lex_docs` survives (like the R1-B2 case above) but loses one
+            // of the five columns the fts5 shape maps 1:1 onto. `CREATE
+            // VIRTUAL TABLE fts_lex USING fts5(...)` only declares the shape
+            // and does not validate `lex_docs` at creation time, so it would
+            // still succeed; the `INSERT INTO fts_lex(fts_lex)
+            // VALUES('rebuild')` that reads `lex_docs.workspace` is what
+            // fails -- the same "shape recreated, rebuild fails" ordering
+            // the real disk-full/crash scenario hits.
+            conn.execute("ALTER TABLE lex_docs DROP COLUMN workspace", &[])
+                .unwrap();
+        }
+
+        let open_err = FrankenStorage::open(&db_path)
+            .err()
+            .expect("open must surface the forced rebuild failure, not silently succeed");
+        let err_text = format!("{open_err:#}");
+        assert!(
+            err_text.contains("rebuilding fts_lex shadow index"),
+            "error should be attributed to the fts_lex rebuild step, got: {err_text}"
+        );
+
+        let raw = FrankenConnection::open_writable(
+            std::path::Path::new(&(db_path.to_string_lossy().into_owned())),
+            crate::storage::api::Profile::Production,
+        )
+        .unwrap();
+        let fts_lex_exists: i64 = raw
+            .query_row_map(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='fts_lex'",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            fts_lex_exists, 0,
+            "a failed rebuild must roll back the whole repair transaction -- fts_lex must stay \
+             missing (so the next open retries the repair), not survive as an empty shell that \
+             the missing-table probe no longer catches"
         );
     }
 
@@ -26037,7 +25779,6 @@ mod tests {
         assert_eq!(purge.conversations_deleted, 1);
         assert_eq!(purge.messages_deleted, 2);
 
-        storage.rebuild_fts().unwrap();
         storage.rebuild_analytics().unwrap();
         storage.rebuild_daily_stats().unwrap();
         storage.rebuild_token_daily_stats().unwrap();
@@ -26047,14 +25788,6 @@ mod tests {
         assert_eq!(agents[0].slug, "codex");
         assert_eq!(storage.total_conversation_count().unwrap(), 1);
         assert_eq!(storage.total_message_count().unwrap(), 2);
-
-        let fts_rows: i64 = storage
-            .raw()
-            .query_row_map("SELECT COUNT(*) FROM fts_messages", fparams![], |row| {
-                row.get_typed(0)
-            })
-            .unwrap();
-        assert_eq!(fts_rows, 2);
 
         let total_daily_sessions: i64 = storage
             .raw()
@@ -26384,6 +26117,103 @@ mod tests {
         assert!(second.per_table.is_empty());
     }
 
+    /// w2 F3 regression: an orphan message that was already synced into the
+    /// lexical domain (lex_docs/fts_lex) before its parent conversation went
+    /// missing must have *both* cleaned up by the startup self-heal, not just
+    /// lex_docs (which rides `ON DELETE CASCADE` off the `messages` delete).
+    /// fts_lex is an FTS5 external-content table with no FK to lex_docs, so
+    /// before the fix its rowid survived the self-heal untouched and stayed
+    /// permanently MATCH-able even though the message it indexed was gone.
+    #[test]
+    fn cleanup_orphan_fk_rows_clears_fts_lex_for_orphan_messages() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("orphan_fts_lex_self_heal.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+
+        // Same deliberate FK-OFF test-fixture exception as the sibling test
+        // above: this is the only way to construct the exact corrupted state
+        // (child row surviving its parent's disappearance) that the self-heal
+        // exists to repair.
+        storage.raw().execute_batch_bypassing_foreign_keys_guard("PRAGMA foreign_keys = OFF").unwrap();
+
+        storage
+            .raw()
+            .execute(
+                "INSERT INTO agents(id, slug, name, kind, created_at, updated_at) \
+                 VALUES(1, 'test-agent', 'Test Agent', 'cli', 0, 0)",
+                fparams![],
+            )
+            .unwrap();
+
+        // Orphan message: its conversation_id (99999) does not exist.
+        storage
+            .raw()
+            .execute(
+                "INSERT INTO messages(id, conversation_id, idx, role, content) \
+                 VALUES(201, 99999, 0, 'user', 'orphan_fts_marker present here')",
+                fparams![],
+            )
+            .unwrap();
+
+        // Simulate this orphan having already been synced into the lexical
+        // domain before its conversation went missing (the exact shape
+        // `sync_lexical_domain_for_conversation_in_tx` produces).
+        storage
+            .raw()
+            .execute(
+                "INSERT INTO lex_docs(doc_id, content, title, agent, workspace, source_path) \
+                 VALUES(201, 'orphan_fts_marker present here', 't', 'a', 'w', 's')",
+                fparams![],
+            )
+            .unwrap();
+        storage
+            .raw()
+            .execute(
+                "INSERT INTO fts_lex(rowid, content, title, agent, workspace, source_path) \
+                 VALUES(201, 'orphan_fts_marker present here', 't', 'a', 'w', 's')",
+                fparams![],
+            )
+            .unwrap();
+
+        storage.raw().execute_batch_bypassing_foreign_keys_guard("PRAGMA foreign_keys = ON").unwrap();
+
+        // Sanity: the orphan is indexed and MATCH-able before cleanup runs.
+        let hits_before: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT count(*) FROM fts_lex WHERE fts_lex MATCH 'orphan_fts_marker'",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(hits_before, 1, "orphan_fts_marker must be MATCH-able before self-heal runs");
+
+        let report = storage.cleanup_orphan_fk_rows().unwrap();
+        assert_eq!(report.total, 1, "the single orphan message must be reported: {:?}", report);
+
+        let hits_after: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT count(*) FROM fts_lex WHERE fts_lex MATCH 'orphan_fts_marker'",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            hits_after, 0,
+            "startup self-heal must clear fts_lex for orphan messages, not just lex_docs \
+             (fts_lex is FK-unaware and does not cascade off the messages delete)"
+        );
+
+        let lex_docs_after: i64 = storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM lex_docs WHERE doc_id = 201", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(lex_docs_after, 0, "lex_docs must still be cleaned via its FK cascade");
+    }
+
     #[test]
     fn cleanup_orphan_fk_rows_handles_more_than_one_delete_chunk() {
         let dir = TempDir::new().unwrap();
@@ -26396,7 +26226,7 @@ mod tests {
         // comment above for why this FK-OFF toggle is deliberately kept.
         storage.raw().execute_batch_bypassing_foreign_keys_guard("PRAGMA foreign_keys = OFF").unwrap();
         {
-            let mut tx = storage.raw().transaction().unwrap();
+            let tx = storage.raw().transaction().unwrap();
             for idx in 0..orphan_count {
                 let message_id = 10_000_i64 + i64::try_from(idx).unwrap();
                 let conversation_id = 20_000_i64 + i64::try_from(idx).unwrap();
@@ -26456,7 +26286,7 @@ mod tests {
         // comment above for why this FK-OFF toggle is deliberately kept.
         storage.raw().execute_batch_bypassing_foreign_keys_guard("PRAGMA foreign_keys = OFF").unwrap();
         {
-            let mut tx = storage.raw().transaction().unwrap();
+            let tx = storage.raw().transaction().unwrap();
             for idx in 0..orphan_count {
                 let message_id = 50_000_i64 + i64::try_from(idx).unwrap();
                 tx.execute(
@@ -26769,7 +26599,7 @@ mod e5_replace_tests {
         let new_conv = replacement("tx-scope");
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
         {
-            let mut tx = storage.raw().transaction().unwrap();
+            let tx = storage.raw().transaction().unwrap();
             franken_replace_conversation_messages_in_tx(
                 &tx, conv_id, agent_id, None, &new_conv, &pricing,
             )
@@ -26809,7 +26639,7 @@ mod e5_replace_tests {
         // 分辨力前置断言：同一份输入喂给基线的 tail 规划器，它计划插入 0 条。
         // 不先证这一点，本测试就分不出「绕过了规划器」与「规划器本来就会插满」。
         {
-            let mut tx = storage.raw().transaction().unwrap();
+            let tx = storage.raw().transaction().unwrap();
             let mut by_idx: HashMap<i64, HashMap<i64, MessageMergeFingerprint>> = HashMap::new();
             let mut replay: HashMap<i64, HashSet<MessageReplayFingerprint>> = HashMap::new();
             let (plan, _, _) = franken_collect_batched_existing_new_messages(
@@ -26829,7 +26659,7 @@ mod e5_replace_tests {
         }
 
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
-        let mut tx = storage.raw().transaction().unwrap();
+        let tx = storage.raw().transaction().unwrap();
         franken_replace_conversation_messages_in_tx(
             &tx, conv_id, agent_id, None, &new_conv, &pricing,
         )
@@ -26853,7 +26683,7 @@ mod e5_replace_tests {
         let new_conv = replacement("id-kept");
 
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
-        let mut tx = storage.raw().transaction().unwrap();
+        let tx = storage.raw().transaction().unwrap();
         franken_replace_conversation_messages_in_tx(
             &tx, conv_id, agent_id, None, &new_conv, &pricing,
         )
@@ -26931,7 +26761,7 @@ mod e5_replace_tests {
 
         let new_conv = replacement("tail-hot");
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
-        let mut tx = storage.raw().transaction().unwrap();
+        let tx = storage.raw().transaction().unwrap();
         franken_replace_conversation_messages_in_tx(
             &tx, conv_id, agent_id, None, &new_conv, &pricing,
         )
@@ -26991,7 +26821,7 @@ mod e5_replace_tests {
 
         let new_conv = replacement("tail-fallback");
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
-        let mut tx = storage.raw().transaction().unwrap();
+        let tx = storage.raw().transaction().unwrap();
         franken_replace_conversation_messages_in_tx(
             &tx, conv_id, agent_id, None, &new_conv, &pricing,
         )
@@ -27044,7 +26874,7 @@ mod e5_replace_tests {
 
         let new_conv = replacement("fingerprint");
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
-        let mut tx = storage.raw().transaction().unwrap();
+        let tx = storage.raw().transaction().unwrap();
         franken_replace_conversation_messages_in_tx(
             &tx, conv_id, agent_id, None, &new_conv, &pricing,
         )
@@ -27269,7 +27099,7 @@ mod e5_replace_tests {
         );
         let repl_conv = conversation("equiv", branch_coverage_messages());
         let pricing = PricingTable::franken_load(repl_storage.raw()).unwrap();
-        let mut tx = repl_storage.raw().transaction().unwrap();
+        let tx = repl_storage.raw().transaction().unwrap();
         franken_replace_conversation_messages_in_tx(
             &tx,
             repl_conv_id,
@@ -27352,7 +27182,7 @@ mod e5_replace_tests {
         let new_conv = conversation("summaries", messages);
 
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
-        let mut tx = storage.raw().transaction().unwrap();
+        let tx = storage.raw().transaction().unwrap();
         franken_replace_conversation_messages_in_tx(
             &tx, conv_id, agent_id, None, &new_conv, &pricing,
         )
@@ -27485,7 +27315,7 @@ mod e5_replace_tests {
 
         let new_conv = replacement("aggregates");
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
-        let mut tx = storage.raw().transaction().unwrap();
+        let tx = storage.raw().transaction().unwrap();
         franken_replace_conversation_messages_in_tx(
             &tx, conv_id, agent_id, None, &new_conv, &pricing,
         )
@@ -27515,7 +27345,7 @@ mod e5_replace_tests {
         let new_conv = conversation("no-ts", messages);
 
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
-        let mut tx = storage.raw().transaction().unwrap();
+        let tx = storage.raw().transaction().unwrap();
         franken_replace_conversation_messages_in_tx(
             &tx, conv_id, agent_id, None, &new_conv, &pricing,
         )
@@ -27576,7 +27406,7 @@ mod e5_replace_tests {
         empty.ended_at = None;
 
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
-        let mut tx = storage.raw().transaction().unwrap();
+        let tx = storage.raw().transaction().unwrap();
         franken_replace_conversation_messages_in_tx(&tx, conv_id, agent_id, None, &empty, &pricing)
             .unwrap();
         tx.commit().unwrap();
@@ -27641,7 +27471,7 @@ mod e5_replace_tests {
         );
 
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
-        let mut tx = storage.raw().transaction().unwrap();
+        let tx = storage.raw().transaction().unwrap();
         franken_replace_conversation_messages_in_tx(
             &tx, conv_id, agent_id, None, &new_conv, &pricing,
         )
@@ -27727,7 +27557,7 @@ mod e5_replace_tests {
 
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
         for conv in [&first, &second] {
-            let mut tx = storage.raw().transaction().unwrap();
+            let tx = storage.raw().transaction().unwrap();
             franken_replace_conversation_messages_in_tx(
                 &tx, conv_id, agent_id, None, conv, &pricing,
             )
@@ -27814,7 +27644,7 @@ mod e5_replace_tests {
         );
 
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
-        let mut tx = storage.raw().transaction().unwrap();
+        let tx = storage.raw().transaction().unwrap();
         franken_replace_conversation_messages_in_tx(
             &tx, conv_id, agent_id, None, &new_conv, &pricing,
         )

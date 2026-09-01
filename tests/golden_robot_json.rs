@@ -24,7 +24,6 @@
 //! schema change that requires human review before it ships.
 
 use assert_cmd::Command;
-use coding_agent_search::search::tantivy::expected_index_dir;
 use serde_json::{Value, json};
 use std::error::Error;
 use std::fs;
@@ -130,7 +129,11 @@ fn seed_diag_quarantine_fixture(test_home: &std::path::Path) -> PathBuf {
     )
     .expect("write failed seed wal");
 
-    let index_path = expected_index_dir(&data_dir);
+    // W2-6 Task丙②: `expected_index_dir` (Tantivy) is retired, but the
+    // `<data_dir>/index/` directory convention itself is still alive --
+    // `.lexical-publish-backups` and generation-quarantine bookkeeping still
+    // live there (src/doctor_chokepoint.rs, src/indexer/staging_reclaim.rs).
+    let index_path = data_dir.join("index");
     std::fs::create_dir_all(&index_path).expect("create expected index dir");
     let retained_publish_dir = index_path
         .parent()

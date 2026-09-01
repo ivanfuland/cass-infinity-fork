@@ -5618,7 +5618,7 @@ mod e5_p30_blob_read_tests {
             let storage = crate::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
             let pricing =
                 crate::storage::sqlite::PricingTable::franken_load(storage.raw()).unwrap();
-            let mut tx = storage.raw().transaction().unwrap();
+            let tx = storage.raw().transaction().unwrap();
             crate::storage::sqlite::franken_replace_conversation_messages_in_tx(
                 &tx,
                 conv_id,
@@ -5829,7 +5829,7 @@ mod e5_p30_blob_read_tests {
             let storage = crate::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
             let pricing =
                 crate::storage::sqlite::PricingTable::franken_load(storage.raw()).unwrap();
-            let mut tx = storage.raw().transaction().unwrap();
+            let tx = storage.raw().transaction().unwrap();
             crate::storage::sqlite::franken_replace_conversation_messages_in_tx(
                 &tx,
                 conv_id,
@@ -6042,6 +6042,12 @@ pub(crate) fn commit_replace_in_tx(
         input.workspace_id,
         input.conv,
     )?;
+
+    // 9b · w2 Task W2-2/W2-3: 词法域(lex_docs/fts_lex)重算，须在步骤9(title/
+    // workspace 落定)之后调用——早于此处会用旧值同步（W2-0 remeasure 报告曾误
+    // 记「该 UPDATE 由 franken_replace_conversation_messages_in_tx 调用」，实为
+    // 本函数按步骤9独立调用，两者是同一编排下的兄弟步骤而非调用关系，已订正）。
+    crate::storage::sqlite::sync_lexical_domain_for_conversation_in_tx(tx, input.conversation_id)?;
 
     // 10 · 推进 generation
     crate::storage::sqlite::franken_set_source_content_generation_in_tx(tx, input.generation)?;
@@ -6470,7 +6476,7 @@ mod e6_replace_commit_tests {
 
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
         {
-            let mut tx = storage.raw().transaction().unwrap();
+            let tx = storage.raw().transaction().unwrap();
             commit_replace_in_tx(
                 &tx,
                 &ReplaceCommitInput {
@@ -6544,7 +6550,7 @@ mod e6_replace_commit_tests {
 
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
         {
-            let mut tx = storage.raw().transaction().unwrap();
+            let tx = storage.raw().transaction().unwrap();
             commit_replace_in_tx(
                 &tx,
                 &ReplaceCommitInput {
@@ -6575,6 +6581,118 @@ mod e6_replace_commit_tests {
             stored.as_deref(),
             Some("projects/ws/keep-me.jsonl"),
             "投影没有外部 id 时不得抹掉库里既有的值"
+        );
+    }
+
+    /// w2 F2 回归：真走 `franken_replace_conversation_messages_in_tx` 的删旧插新
+    /// 全链（经 `commit_replace_in_tx` 的完整步骤 2-11），不是手搭的小事务。
+    /// 旧内容含 `old_marker`，旧 message id 被级联删除、新 message 分配的 id
+    /// 严格大于旧全局最大值（不复用），修复前 `sync_lexical_domain_for_
+    /// conversation_in_tx`（步骤9b）按"当前" messages 表 id 反查只能看到新 id，
+    /// 旧 `old_marker` 倒排项永久残留，而 receipt 仍写 `committed`——修复要求
+    /// 事务里在级联删除**之前**按旧 id 显式清 fts_lex。
+    #[test]
+    fn e6_replace_clears_stale_fts_lex_entries_for_deleted_old_messages() {
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open(&dir);
+
+        let legacy = conversation_titled(
+            "旧标题",
+            vec![
+                message(0, MessageRole::User, "old_marker present here"),
+                message(1, MessageRole::Assistant, "旧 1"),
+            ],
+        );
+        storage
+            .insert_conversations_batched(&[(agent_id, None, &legacy)])
+            .unwrap();
+        let conv_id: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT id FROM conversations WHERE external_id = ?1",
+                &[ParamValue::from(EXTERNAL_ID)],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+
+        // 前置断言：确认 old_marker 此刻真的可被 MATCH，否则后面的"不可再 MATCH"
+        // 断言会是空转（探针先自证有效，见 MEMORY.md「先验证探针」）。
+        let hits_before: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT count(*) FROM fts_lex WHERE fts_lex MATCH 'old_marker'",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(hits_before, 1, "old_marker 必须在 replace 之前先可被 MATCH 到");
+
+        let projected = conversation_titled(
+            "新标题",
+            vec![
+                message(0, MessageRole::User, "brand new content"),
+                message(1, MessageRole::Assistant, "新 1"),
+            ],
+        );
+
+        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+        let idempotency_key = {
+            let tx = storage.raw().transaction().unwrap();
+            let outcome = commit_replace_in_tx(
+                &tx,
+                &ReplaceCommitInput {
+                    conversation_id: conv_id,
+                    agent_id,
+                    workspace_id: None,
+                    conv: &projected,
+                    identity: &identity(),
+                    snapshot_root: "f2-root",
+                    generation: "f2-gen",
+                },
+                &pricing,
+                TS,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            outcome.idempotency_key
+        };
+
+        let hits_after: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT count(*) FROM fts_lex WHERE fts_lex MATCH 'old_marker'",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            hits_after, 0,
+            "旧内容 old_marker 在 replace 之后必须不可再被 fts_lex MATCH 到——\
+             旧 message 已被级联删除，倒排项不得永久残留"
+        );
+
+        let new_hits: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT count(*) FROM fts_lex WHERE fts_lex MATCH 'brand'",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(new_hits, 1, "新内容必须已经写入 fts_lex 且可被 MATCH");
+
+        let receipt_state: Option<String> = storage
+            .raw()
+            .query_row_map(
+                "SELECT state FROM operation_commit_receipt WHERE idempotency_key = ?1",
+                &[ParamValue::from(idempotency_key.as_str())],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            receipt_state.as_deref(),
+            Some("committed"),
+            "receipt 仍必须写 committed——修复的是遗留倒排项，不是把这次 replace 判失败"
         );
     }
 
@@ -6623,7 +6741,7 @@ mod e6_replace_commit_tests {
             ],
         );
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
-        let mut tx = storage.raw().transaction().unwrap();
+        let tx = storage.raw().transaction().unwrap();
         let err = commit_replace_in_tx(
             &tx,
             &ReplaceCommitInput {
@@ -6707,7 +6825,7 @@ mod e6_replace_commit_tests {
         );
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
         {
-            let mut tx = storage.raw().transaction().unwrap();
+            let tx = storage.raw().transaction().unwrap();
             commit_replace_in_tx(
                 &tx,
                 &ReplaceCommitInput {
@@ -6746,7 +6864,7 @@ mod e6_replace_commit_tests {
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
 
         let outcome = {
-            let mut tx = storage.raw().transaction().unwrap();
+            let tx = storage.raw().transaction().unwrap();
             let out = commit_replace_in_tx(
                 &tx,
                 &ReplaceCommitInput {
@@ -6865,7 +6983,7 @@ mod e6_replace_commit_tests {
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
 
         {
-            let mut tx = storage.raw().transaction().unwrap();
+            let tx = storage.raw().transaction().unwrap();
             commit_replace_in_tx(
                 &tx,
                 &ReplaceCommitInput {
@@ -7255,7 +7373,7 @@ mod e6_replace_commit_tests {
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
 
         {
-            let mut tx = storage.raw().transaction().unwrap();
+            let tx = storage.raw().transaction().unwrap();
             commit_replace_in_tx(
                 &tx,
                 &ReplaceCommitInput {
@@ -8305,7 +8423,7 @@ fn restore_index_root(journal: &RestoreJournal) -> anyhow::Result<&Path> {
 /// 路径用 `expected_index_dir`（纯拼接、**无副作用**）——不用会创建目录的 `index_dir`，
 /// 恢复器不该自己产副作用。
 fn restore_invalidate_readiness(journal: &RestoreJournal) -> anyhow::Result<()> {
-    let index_dir = crate::search::tantivy::expected_index_dir(restore_index_root(journal)?);
+    let index_dir = crate::indexer::expected_index_dir(restore_index_root(journal)?);
     crate::indexer::clear_lexical_rebuild_state(&index_dir)
 }
 
@@ -9790,7 +9908,7 @@ mod e7_restore_journal_tests {
     /// 否则「恢复后收敛」可能只是无事可做的假绿（part5 判据 ⑤）。
     fn plant_post_commit_sentinels(data_dir: &Path, db_path: &Path) {
         // ① readiness：词法重建 checkpoint 存在 = 「索引自称对当前指纹新鲜」。
-        let index_dir = crate::search::tantivy::expected_index_dir(data_dir);
+        let index_dir = crate::indexer::expected_index_dir(data_dir);
         std::fs::create_dir_all(&index_dir).unwrap();
         std::fs::write(index_dir.join(".lexical-rebuild-state.json"), b"{}").unwrap();
 
@@ -9849,7 +9967,7 @@ mod e7_restore_journal_tests {
     }
 
     fn lexical_checkpoint_present(data_dir: &Path) -> bool {
-        crate::search::tantivy::expected_index_dir(data_dir)
+        crate::indexer::expected_index_dir(data_dir)
             .join(".lexical-rebuild-state.json")
             .exists()
     }

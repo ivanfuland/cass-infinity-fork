@@ -12,7 +12,6 @@
 use coding_agent_search::connectors::{NormalizedConversation, NormalizedMessage};
 use coding_agent_search::indexer::persist::persist_conversation;
 use coding_agent_search::search::query::{FieldMask, SearchClient, SearchFilters};
-use coding_agent_search::search::tantivy::{TantivyIndex, index_dir};
 use coding_agent_search::storage::sqlite::SqliteStorage;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -64,18 +63,15 @@ fn setup_test_index(conv_count: i64, msgs_per_conv: i64) -> (TempDir, SearchClie
     let temp = TempDir::new().expect("create tempdir");
     let data_dir = temp.path().to_path_buf();
     let db_path = data_dir.join("memory_test.db");
-    let index_path = index_dir(&data_dir).expect("index path");
 
     let storage = SqliteStorage::open(&db_path).expect("open db");
-    let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
 
     for i in 0..conv_count {
         let conv = sample_conv(i, msgs_per_conv);
-        persist_conversation(&storage, &mut t_index, &conv).expect("persist");
+        persist_conversation(&storage, &conv).expect("persist");
     }
-    t_index.commit().unwrap();
 
-    let client = SearchClient::open(&index_path, Some(&db_path))
+    let client = SearchClient::open(&data_dir, Some(&db_path))
         .expect("open client")
         .expect("client available");
 
@@ -191,17 +187,14 @@ fn test_indexing_memory_no_leak() {
     let temp = TempDir::new().expect("tempdir");
     let data_dir = temp.path().to_path_buf();
     let db_path = data_dir.join("memory_index_test.db");
-    let index_path = index_dir(&data_dir).expect("index path");
 
     let storage = SqliteStorage::open(&db_path).expect("open db");
-    let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
 
     // Warm up
     for i in 0..5 {
         let conv = sample_conv(i, 5);
-        persist_conversation(&storage, &mut t_index, &conv).expect("persist");
+        persist_conversation(&storage, &conv).expect("persist");
     }
-    t_index.commit().unwrap();
 
     let baseline = get_process_memory_bytes();
 
@@ -213,14 +206,8 @@ fn test_indexing_memory_no_leak() {
     // Index many conversations
     for i in 5..105 {
         let conv = sample_conv(i, 10);
-        persist_conversation(&storage, &mut t_index, &conv).expect("persist");
-
-        // Commit periodically
-        if i % 20 == 0 {
-            t_index.commit().unwrap();
-        }
+        persist_conversation(&storage, &conv).expect("persist");
     }
-    t_index.commit().unwrap();
 
     let after = get_process_memory_bytes();
     let growth = after.saturating_sub(baseline);

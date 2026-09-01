@@ -9,7 +9,8 @@
 //! 6. Query parsing and search pipeline work end-to-end through frankensearch
 
 use coding_agent_search::search::query::{FieldMask, SearchClient, SearchFilters};
-use coding_agent_search::search::tantivy::TantivyIndex;
+use coding_agent_search::indexer::persist::persist_conversation;
+use coding_agent_search::storage::sqlite::SqliteStorage;
 use coding_agent_search::search::vector_index::{
     SemanticFilter, VectorIndex, parse_semantic_doc_id,
 };
@@ -312,7 +313,8 @@ fn frankensearch_vector_search_with_semantic_filter() {
 #[test]
 fn lexical_search_through_frankensearch_pipeline() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     let conv = util::ConversationFixtureBuilder::new("claude_code")
         .title("frankensearch integration test")
@@ -324,10 +326,9 @@ fn lexical_search_through_frankensearch_pipeline() {
         .with_content(2, "Rate limiting prevents abuse of the API endpoint")
         .build_normalized();
 
-    index.add_conversation(&conv).unwrap();
-    index.commit().unwrap();
+    persist_conversation(&storage, &conv).unwrap();
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
     let filters = SearchFilters::default();
@@ -359,7 +360,8 @@ fn lexical_search_through_frankensearch_pipeline() {
 #[test]
 fn agent_filter_through_frankensearch_pipeline() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     let conv_claude = util::ConversationFixtureBuilder::new("claude_code")
         .title("claude session")
@@ -377,11 +379,10 @@ fn agent_filter_through_frankensearch_pipeline() {
         .with_content(0, "debugging the cache invalidation logic")
         .build_normalized();
 
-    index.add_conversation(&conv_claude).unwrap();
-    index.add_conversation(&conv_codex).unwrap();
-    index.commit().unwrap();
+    persist_conversation(&storage, &conv_claude).unwrap();
+    persist_conversation(&storage, &conv_codex).unwrap();
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
 
@@ -497,7 +498,8 @@ fn frankensearch_rrf_fuse_produces_valid_scores() {
 #[test]
 fn search_results_are_deterministic() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     let conv = util::ConversationFixtureBuilder::new("claude_code")
         .title("determinism test")
@@ -511,10 +513,9 @@ fn search_results_are_deterministic() {
         .with_content(4, "authentication flow diagram and documentation")
         .build_normalized();
 
-    index.add_conversation(&conv).unwrap();
-    index.commit().unwrap();
+    persist_conversation(&storage, &conv).unwrap();
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
     let filters = SearchFilters::default();
@@ -551,7 +552,8 @@ fn search_results_are_deterministic() {
 #[test]
 fn search_results_have_expected_fields() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     let conv = util::ConversationFixtureBuilder::new("claude_code")
         .title("field test session")
@@ -564,10 +566,9 @@ fn search_results_have_expected_fields() {
         )
         .build_normalized();
 
-    index.add_conversation(&conv).unwrap();
-    index.commit().unwrap();
+    persist_conversation(&storage, &conv).unwrap();
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
     let filters = SearchFilters::default();

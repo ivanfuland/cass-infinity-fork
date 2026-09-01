@@ -10,7 +10,7 @@ use coding_agent_search::search::pack_planner::{
 use coding_agent_search::search::query::{
     FieldMask, MatchType, SearchClient, SearchFilters, SearchHit, rrf_fuse_hits,
 };
-use coding_agent_search::search::tantivy::index_dir;
+use coding_agent_search::indexer::index_dir;
 use coding_agent_search::search::vector_index::{
     Quantization, SemanticDocId, SemanticFilter, VectorIndex, dot_product_f16_scalar_bench,
     dot_product_f16_simd_bench, dot_product_scalar_bench, dot_product_simd_bench,

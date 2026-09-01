@@ -13,7 +13,8 @@ use coding_agent_search::connectors::{NormalizedConversation, NormalizedMessage}
 use coding_agent_search::search::query::{
     FieldMask, MatchType, SearchClient, SearchFilters, SearchHit,
 };
-use coding_agent_search::search::tantivy::TantivyIndex;
+use coding_agent_search::indexer::persist::persist_conversation;
+use coding_agent_search::storage::sqlite::SqliteStorage;
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -27,7 +28,8 @@ mod util;
 #[test]
 fn prefix_wildcard_matches_start_of_term() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     let conv = util::ConversationFixtureBuilder::new("tester")
         .title("prefix test")
@@ -37,10 +39,9 @@ fn prefix_wildcard_matches_start_of_term() {
         .with_content(0, "authentication authorization authenticate")
         .build_normalized();
 
-    index.add_conversation(&conv).unwrap();
-    index.commit().unwrap();
+    persist_conversation(&storage, &conv).unwrap();
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
     let filters = SearchFilters::default();
@@ -69,7 +70,8 @@ fn prefix_wildcard_matches_start_of_term() {
 #[test]
 fn suffix_wildcard_matches_end_of_term() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     let conv = util::ConversationFixtureBuilder::new("tester")
         .title("suffix test")
@@ -79,10 +81,9 @@ fn suffix_wildcard_matches_end_of_term() {
         .with_content(0, "function action decoration selection")
         .build_normalized();
 
-    index.add_conversation(&conv).unwrap();
-    index.commit().unwrap();
+    persist_conversation(&storage, &conv).unwrap();
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
     let filters = SearchFilters::default();
@@ -104,7 +105,8 @@ fn suffix_wildcard_matches_end_of_term() {
 #[test]
 fn substring_wildcard_matches_middle_of_term() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     let conv = util::ConversationFixtureBuilder::new("tester")
         .title("substring test")
@@ -114,10 +116,9 @@ fn substring_wildcard_matches_middle_of_term() {
         .with_content(0, "configuration reconfigure preconfig configurable")
         .build_normalized();
 
-    index.add_conversation(&conv).unwrap();
-    index.commit().unwrap();
+    persist_conversation(&storage, &conv).unwrap();
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
     let filters = SearchFilters::default();
@@ -142,7 +143,8 @@ fn substring_wildcard_matches_middle_of_term() {
 #[test]
 fn edge_ngram_enables_prefix_search() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     let conv = util::ConversationFixtureBuilder::new("tester")
         .title("ngram test")
@@ -152,10 +154,9 @@ fn edge_ngram_enables_prefix_search() {
         .with_content(0, "implementation")
         .build_normalized();
 
-    index.add_conversation(&conv).unwrap();
-    index.commit().unwrap();
+    persist_conversation(&storage, &conv).unwrap();
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
     let filters = SearchFilters::default();
@@ -176,7 +177,8 @@ fn edge_ngram_enables_prefix_search() {
 #[test]
 fn multiple_terms_with_wildcards() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     let conv1 = util::ConversationFixtureBuilder::new("tester")
         .title("doc1")
@@ -194,11 +196,10 @@ fn multiple_terms_with_wildcards() {
         .with_content(0, "authorization warning processing")
         .build_normalized();
 
-    index.add_conversation(&conv1).unwrap();
-    index.add_conversation(&conv2).unwrap();
-    index.commit().unwrap();
+    persist_conversation(&storage, &conv1).unwrap();
+    persist_conversation(&storage, &conv2).unwrap();
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
     let filters = SearchFilters::default();
@@ -220,7 +221,8 @@ fn multiple_terms_with_wildcards() {
 #[test]
 fn cache_hit_returns_identical_results() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     let conv = util::ConversationFixtureBuilder::new("tester")
         .title("cache hit test")
@@ -232,10 +234,9 @@ fn cache_hit_returns_identical_results() {
         .with_content(2, "cache test message three")
         .build_normalized();
 
-    index.add_conversation(&conv).unwrap();
-    index.commit().unwrap();
+    persist_conversation(&storage, &conv).unwrap();
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
     let filters = SearchFilters::default();
@@ -275,7 +276,8 @@ fn cache_hit_returns_identical_results() {
 #[test]
 fn cache_shortfall_fetches_more_results() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     // Create multiple conversations
     for i in 0..5 {
@@ -286,11 +288,10 @@ fn cache_shortfall_fetches_more_results() {
             .messages(1)
             .with_content(0, format!("shortfall test content {}", i))
             .build_normalized();
-        index.add_conversation(&conv).unwrap();
+        persist_conversation(&storage, &conv).unwrap();
     }
-    index.commit().unwrap();
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
     let filters = SearchFilters::default();
@@ -319,7 +320,8 @@ fn cache_shortfall_fetches_more_results() {
 #[test]
 fn different_filters_have_separate_cache_entries() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     let conv_codex = util::ConversationFixtureBuilder::new("codex")
         .title("codex doc")
@@ -337,11 +339,10 @@ fn different_filters_have_separate_cache_entries() {
         .with_content(0, "filter cache test")
         .build_normalized();
 
-    index.add_conversation(&conv_codex).unwrap();
-    index.add_conversation(&conv_claude).unwrap();
-    index.commit().unwrap();
+    persist_conversation(&storage, &conv_codex).unwrap();
+    persist_conversation(&storage, &conv_claude).unwrap();
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
 
@@ -396,7 +397,8 @@ fn different_filters_have_separate_cache_entries() {
 #[test]
 fn recency_affects_ranking() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     // Create conversations at different times with unique content
     let old_conv = util::ConversationFixtureBuilder::new("tester")
@@ -416,11 +418,10 @@ fn recency_affects_ranking() {
         .build_normalized();
 
     // Index old first, new second
-    index.add_conversation(&old_conv).unwrap();
-    index.add_conversation(&new_conv).unwrap();
-    index.commit().unwrap();
+    persist_conversation(&storage, &old_conv).unwrap();
+    persist_conversation(&storage, &new_conv).unwrap();
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
     let filters = SearchFilters::default();
@@ -451,7 +452,8 @@ fn recency_affects_ranking() {
 #[test]
 fn term_frequency_affects_bm25_score() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     // Document with low term frequency
     let low_tf = util::ConversationFixtureBuilder::new("tester")
@@ -471,11 +473,10 @@ fn term_frequency_affects_bm25_score() {
         .with_content(0, "rust rust rust rust rust rust rust rust code")
         .build_normalized();
 
-    index.add_conversation(&low_tf).unwrap();
-    index.add_conversation(&high_tf).unwrap();
-    index.commit().unwrap();
+    persist_conversation(&storage, &low_tf).unwrap();
+    persist_conversation(&storage, &high_tf).unwrap();
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
     let filters = SearchFilters::default();
@@ -505,7 +506,8 @@ fn term_frequency_affects_bm25_score() {
 #[test]
 fn snippet_includes_context_around_match() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     let conv = util::ConversationFixtureBuilder::new("tester")
         .title("snippet test")
@@ -518,10 +520,9 @@ fn snippet_includes_context_around_match() {
         )
         .build_normalized();
 
-    index.add_conversation(&conv).unwrap();
-    index.commit().unwrap();
+    persist_conversation(&storage, &conv).unwrap();
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
     let filters = SearchFilters::default();
@@ -544,7 +545,8 @@ fn snippet_includes_context_around_match() {
 #[test]
 fn content_field_preserves_full_text() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     let full_content = "This is a very long message with multiple sentences. \
         It contains various types of content including code examples like `fn main()`. \
@@ -558,10 +560,9 @@ fn content_field_preserves_full_text() {
         .with_content(0, full_content)
         .build_normalized();
 
-    index.add_conversation(&conv).unwrap();
-    index.commit().unwrap();
+    persist_conversation(&storage, &conv).unwrap();
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
     let filters = SearchFilters::default();
@@ -581,7 +582,8 @@ fn content_field_preserves_full_text() {
 #[test]
 fn title_field_is_searchable() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     let conv = util::ConversationFixtureBuilder::new("tester")
         .title("UniqueConversationTitle123")
@@ -591,10 +593,9 @@ fn title_field_is_searchable() {
         .with_content(0, "some content without the title term")
         .build_normalized();
 
-    index.add_conversation(&conv).unwrap();
-    index.commit().unwrap();
+    persist_conversation(&storage, &conv).unwrap();
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
     let filters = SearchFilters::default();
@@ -616,7 +617,8 @@ fn title_field_is_searchable() {
 #[test]
 fn empty_query_does_not_panic() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
     let source_path = dir.path().join("empty-query.jsonl");
 
     let conv = util::ConversationFixtureBuilder::new("tester")
@@ -626,10 +628,9 @@ fn empty_query_does_not_panic() {
         .with_content(0, "some content")
         .build_normalized();
 
-    index.add_conversation(&conv).unwrap();
-    index.commit().unwrap();
+    persist_conversation(&storage, &conv).unwrap();
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
     let filters = SearchFilters::default();
@@ -649,7 +650,8 @@ fn empty_query_does_not_panic() {
 #[test]
 fn whitespace_query_does_not_panic() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
     let source_path = dir.path().join("whitespace-query.jsonl");
 
     let conv = util::ConversationFixtureBuilder::new("tester")
@@ -659,10 +661,9 @@ fn whitespace_query_does_not_panic() {
         .with_content(0, "some content")
         .build_normalized();
 
-    index.add_conversation(&conv).unwrap();
-    index.commit().unwrap();
+    persist_conversation(&storage, &conv).unwrap();
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
     let filters = SearchFilters::default();
@@ -698,7 +699,8 @@ fn whitespace_query_does_not_panic() {
 #[test]
 fn special_characters_handled() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     let conv = util::ConversationFixtureBuilder::new("tester")
         .title("special chars")
@@ -708,10 +710,9 @@ fn special_characters_handled() {
         .with_content(0, "Testing c++ and std::vector and foo::bar")
         .build_normalized();
 
-    index.add_conversation(&conv).unwrap();
-    index.commit().unwrap();
+    persist_conversation(&storage, &conv).unwrap();
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
     let filters = SearchFilters::default();
@@ -749,16 +750,16 @@ fn special_characters_handled() {
 #[test]
 fn only_wildcard_query() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     let conv = util::ConversationFixtureBuilder::new("tester")
         .with_content(0, "some test content")
         .build_normalized();
 
-    index.add_conversation(&conv).unwrap();
-    index.commit().unwrap();
+    persist_conversation(&storage, &conv).unwrap();
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
     let filters = SearchFilters::default();
@@ -796,7 +797,8 @@ fn only_wildcard_query() {
 #[test]
 fn search_spans_multiple_messages() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     let conv = util::ConversationFixtureBuilder::new("tester")
         .title("multi message")
@@ -808,10 +810,9 @@ fn search_spans_multiple_messages() {
         .with_content(2, "third message about gamma")
         .build_normalized();
 
-    index.add_conversation(&conv).unwrap();
-    index.commit().unwrap();
+    persist_conversation(&storage, &conv).unwrap();
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
     let filters = SearchFilters::default();
@@ -836,7 +837,8 @@ fn search_spans_multiple_messages() {
 #[test]
 fn pagination_offset_works() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     // Create 10 distinct documents
     for i in 0..10 {
@@ -847,11 +849,10 @@ fn pagination_offset_works() {
             .messages(1)
             .with_content(0, format!("pagination test content number {}", i))
             .build_normalized();
-        index.add_conversation(&conv).unwrap();
+        persist_conversation(&storage, &conv).unwrap();
     }
-    index.commit().unwrap();
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
     let filters = SearchFilters::default();
@@ -885,7 +886,8 @@ fn pagination_offset_works() {
 #[test]
 fn deduplication_removes_duplicates() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     let identical_content = "exactly identical dedup test content";
 
@@ -906,11 +908,10 @@ fn deduplication_removes_duplicates() {
         .with_content(0, identical_content)
         .build_normalized();
 
-    index.add_conversation(&conv1).unwrap();
-    index.add_conversation(&conv2).unwrap();
-    index.commit().unwrap();
+    persist_conversation(&storage, &conv1).unwrap();
+    persist_conversation(&storage, &conv2).unwrap();
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
     let filters = SearchFilters::default();
@@ -928,7 +929,8 @@ fn deduplication_removes_duplicates() {
 #[test]
 fn indexing_skips_message_level_noise() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     let conv = NormalizedConversation {
         agent_slug: "tester".into(),
@@ -983,10 +985,9 @@ fn indexing_skips_message_level_noise() {
         ],
     };
 
-    index.add_conversation(&conv).unwrap();
-    index.commit().unwrap();
+    persist_conversation(&storage, &conv).unwrap();
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
 
@@ -1034,7 +1035,8 @@ fn indexing_skips_message_level_noise() {
 #[test]
 fn search_hides_system_prompts_unless_query_requests_them() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     let conv = NormalizedConversation {
         agent_slug: "tester".into(),
@@ -1071,10 +1073,9 @@ fn search_hides_system_prompts_unless_query_requests_them() {
         ],
     };
 
-    index.add_conversation(&conv).unwrap();
-    index.commit().unwrap();
+    persist_conversation(&storage, &conv).unwrap();
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
 

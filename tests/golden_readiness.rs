@@ -13,9 +13,7 @@ use coding_agent_search::search::policy::{CHUNKING_STRATEGY_VERSION, SEMANTIC_SC
 use coding_agent_search::search::semantic_manifest::{
     ArtifactRecord, BacklogLedger, BuildCheckpoint, SemanticManifest, TierKind,
 };
-use coding_agent_search::search::tantivy::index_dir;
 use coding_agent_search::storage::sqlite::FrankenStorage;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 fn cass_cmd(test_home: &Path) -> Command {
@@ -197,10 +195,6 @@ fn seed_semantic_progress_fixture(
         .expect("create canonical DB")
         .close()
         .expect("close canonical DB");
-
-    let index_path = index_dir(data_dir).expect("index dir");
-    fs::create_dir_all(&index_path).expect("create index dir");
-    fs::write(index_path.join("meta.json"), b"{}").expect("write index meta");
 
     let mut manifest = SemanticManifest::default();
     if fast_tier_ready {

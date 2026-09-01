@@ -1,5 +1,5 @@
 use assert_cmd::Command;
-use coding_agent_search::search::tantivy::expected_index_dir;
+use coding_agent_search::indexer::expected_index_dir;
 use coding_agent_search::storage::api::Conn as FrankenConnection;
 use coding_agent_search::storage::api::Profile;
 use coding_agent_search::storage::api::StorageError as FrankenError;

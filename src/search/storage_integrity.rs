@@ -228,8 +228,9 @@ impl StorageIntegrityReport {
 /// than over-claiming a precise cause it cannot prove. (`FtsMetadataFailed` is
 /// deferred because doctor's `fts_table` probe cannot distinguish a *benign*
 /// absent in-DB `fts_messages` shadow — which it reports as `pass`, since
-/// lexical search falls back to the Tantivy index — from a genuinely corrupt
-/// one; deriving a failure from the benign case would contradict that `pass`.)
+/// W2-6 Task戊 drops that table entirely and lexical search runs on the
+/// fts_lex/lex_docs index — from a genuinely corrupt one; deriving a failure
+/// from the benign case would contradict that `pass`.)
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct DoctorStorageSignals {
     /// The canonical `agent_search.db` file is present on disk.
@@ -282,7 +283,8 @@ impl DoctorStorageSignals {
                 // Canonical DB opened, integrity passed, derived assets in sync.
                 // An absent in-DB `fts_messages` shadow is intentionally NOT
                 // escalated here (see the struct docs): doctor reports it as a
-                // benign `pass` because lexical search falls back to Tantivy, so
+                // benign `pass` because W2-6 Task戊 drops that table entirely
+                // and lexical search runs on the fts_lex/lex_docs index, so
                 // claiming `FtsMetadataFailed` would contradict that verdict.
                 (StorageState::Ok, ArchiveReadability::Readable)
             }

@@ -1,19 +1,4 @@
 use anyhow::{Context, Result, anyhow, bail};
-use crossbeam_channel as mpsc;
-use frankensearch::lexical::{
-    BooleanQuery, CASS_SCHEMA_HASH as FS_CASS_SCHEMA_HASH, CassFields as FsCassFields,
-    CassQueryFilters as FsCassQueryFilters, CassQueryToken as FsCassQueryToken,
-    CassSourceFilter as FsCassSourceFilter, CassWildcardPattern as FsCassWildcardPattern, Count,
-    IndexReader, IndexRecordOption, LexicalDocHit as FsLexicalDocHit, Occur, Query, ReloadPolicy,
-    Searcher, SnippetConfig as FsSnippetConfig, TantivyDocument, Term, TermQuery, TopDocs, Value,
-    cass_build_tantivy_query as fs_cass_build_tantivy_query,
-    cass_has_boolean_operators as fs_cass_has_boolean_operators,
-    cass_open_search_reader as fs_cass_open_search_reader,
-    cass_parse_boolean_query as fs_cass_parse_boolean_query,
-    cass_sanitize_query as fs_cass_sanitize_query, load_doc as fs_load_doc,
-    render_snippet_html as fs_render_snippet_html,
-    try_build_snippet_generator as fs_try_build_snippet_generator,
-};
 use frankensearch::{
     Cx as FsCx, InMemoryTwoTierIndex as FsInMemoryTwoTierIndex,
     InMemoryVectorIndex as FsInMemoryVectorIndex, LexicalSearch as FsLexicalSearch,
@@ -33,10 +18,9 @@ use frankensearch::{
 use lru::LruCache;
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
-use std::cell::RefCell;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -46,20 +30,246 @@ use std::time::{Duration, Instant};
 use crate::storage::api::{Conn as Connection, Row as FrankenRow, StorageError};
 type ParamValue = crate::storage::api::Value;
 
-/// Test-only parameter list builder (Task A6 batch: mirrors sqlite.rs's
-/// `fparams!` shim): delegates to `storage::api::params!`, but produces a
-/// borrowed `&[ParamValue]` (the old native `params!` macro's call sites here
-/// passed their expansion straight into `execute_compat`/`query_row_map` by
-/// value; the api facade's `execute`/`query_row_map` take `&[Value]`) and
-/// supports the zero-arg case the api macro doesn't.
-#[cfg(test)]
-macro_rules! fparams {
-    () => {
-        &[] as &[ParamValue]
-    };
-    ($($val:expr),+ $(,)?) => {
-        &crate::storage::api::params![$($val),+] as &[ParamValue]
-    };
+// W2-6 Task2: verbatim port of cass's own boolean-query-token/wildcard-pattern
+// parsing and query sanitization, ported into this crate because their old
+// home is going away with the rest of the Tantivy engine (Cargo.toml dropped
+// frankensearch's "lexical" feature in W2-6 Task2). Despite living in the
+// Tantivy-backed `frankensearch-lexical` crate, none of these five items
+// (the `CASS_SCHEMA_HASH` constant, the two enums, and the three functions)
+// reference any Tantivy type in their own bodies -- they are cass's own
+// hyphen-tokenizer-aligned query syntax, shared by every lexical backend
+// (Tantivy, `fts_lex`, and the legacy sqlite fallback alike), not something
+// tied to which engine executes the query. Copied byte-for-byte (including
+// doc comments) from:
+//   crate: frankensearch-lexical (workspace member of `frankensearch`)
+//   file:  crates/frankensearch-lexical/src/cass_compat.rs
+//   rev:   2cad158f4468ece7076e3fe529c8e5c20b2e020e (the exact
+//          Cargo.toml-pinned `rev` for `frankensearch` at the time of this
+//          port; see that crate's own Dependency Source Contract)
+// No behavior changed -- `fs_cass_sanitize_query("c++")` still yields
+// `"c  "`, etc. (see the exact-behavior assertions in this file's tests).
+#[allow(dead_code)]
+const FS_CASS_SCHEMA_HASH: &str =
+    "tantivy-schema-v8-hyphen-cjk-bigrams-bounded-content-prefix-preview-stored-content-external";
+
+/// Token types for cass-style boolean query parsing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FsCassQueryToken {
+    /// A search term (may include wildcards).
+    Term(String),
+    /// A quoted phrase for exact-order matching.
+    Phrase(String),
+    /// Explicit AND operator.
+    And,
+    /// OR operator.
+    Or,
+    /// NOT operator (negates the next term/phrase).
+    Not,
+}
+
+/// Sanitize query string to match the `hyphen_normalize` tokenizer for cass indexes.
+///
+/// The tokenizer preserves hyphens inside words (e.g. `bd-q3fy`, `POL-358`).
+/// We therefore keep hyphens alongside `*` (wildcards) and `"` (phrases),
+/// replacing all other non-alphanumeric characters with spaces so that query
+/// terms align with indexed tokens.
+#[must_use]
+fn fs_cass_sanitize_query(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '*' || c == '"' || c == '-' {
+                c
+            } else {
+                ' '
+            }
+        })
+        .collect()
+}
+
+#[must_use]
+fn cass_escape_regex(s: &str) -> String {
+    let mut escaped = String::with_capacity(s.len() * 2);
+    for c in s.chars() {
+        match c {
+            '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' => {
+                escaped.push('\\');
+                escaped.push(c);
+            }
+            _ => escaped.push(c),
+        }
+    }
+    escaped
+}
+
+/// Represents different wildcard patterns for a cass lexical search term.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FsCassWildcardPattern {
+    Exact(String),
+    Prefix(String),
+    Suffix(String),
+    Substring(String),
+    Complex(String),
+}
+
+impl FsCassWildcardPattern {
+    #[must_use]
+    fn parse(term: &str) -> Self {
+        let starts_with_star = term.starts_with('*');
+        let ends_with_star = term.ends_with('*');
+
+        let core = term.trim_matches('*').to_lowercase();
+        if core.is_empty() {
+            return Self::Exact(String::new());
+        }
+
+        // Internal wildcards (e.g. f*o) -> complex pattern.
+        if core.contains('*') {
+            return Self::Complex(term.to_lowercase());
+        }
+
+        match (starts_with_star, ends_with_star) {
+            (true, true) => Self::Substring(core),
+            (true, false) => Self::Suffix(core),
+            (false, true) => Self::Prefix(core),
+            (false, false) => Self::Exact(core),
+        }
+    }
+
+    #[must_use]
+    fn to_regex(&self) -> Option<String> {
+        match self {
+            Self::Suffix(core) => Some(format!(".*{}$", cass_escape_regex(core))),
+            Self::Substring(core) => Some(format!(".*{}.*", cass_escape_regex(core))),
+            Self::Complex(full_term) => {
+                let mut regex = String::with_capacity(full_term.len() * 2 + 2);
+
+                if full_term.starts_with('*') {
+                    regex.push_str(".*");
+                } else {
+                    regex.push('^');
+                }
+
+                let trimmed_start = full_term.trim_start_matches('*');
+                let trimmed = trimmed_start.trim_end_matches('*');
+                for c in trimmed.chars() {
+                    if c == '*' {
+                        regex.push_str(".*");
+                    } else {
+                        match c {
+                            '\\' | '.' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|'
+                            | '^' | '$' => {
+                                regex.push('\\');
+                                regex.push(c);
+                            }
+                            _ => regex.push(c),
+                        }
+                    }
+                }
+
+                if full_term.ends_with('*') {
+                    regex.push_str(".*");
+                } else {
+                    regex.push('$');
+                }
+
+                Some(regex)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Parse a query string into boolean tokens.
+///
+/// Supports:
+/// - AND / && (explicit AND; implicit AND between terms is handled by query construction)
+/// - OR / || (OR)
+/// - NOT / -prefix (negation)
+/// - \"quoted phrases\" (phrase match)
+#[must_use]
+fn fs_cass_parse_boolean_query(query: &str) -> Vec<FsCassQueryToken> {
+    let mut tokens = Vec::new();
+    let mut chars = query.chars().peekable();
+    let mut current_word = String::new();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                if !current_word.is_empty() {
+                    tokens.push(FsCassQueryToken::Term(std::mem::take(&mut current_word)));
+                }
+                let mut phrase = String::new();
+                while let Some(&next) = chars.peek() {
+                    if next == '"' {
+                        chars.next();
+                        break;
+                    }
+                    if let Some(c) = chars.next() {
+                        phrase.push(c);
+                    }
+                }
+                if !phrase.is_empty() {
+                    tokens.push(FsCassQueryToken::Phrase(phrase));
+                }
+            }
+            '&' if chars.peek() == Some(&'&') => {
+                chars.next();
+                if !current_word.is_empty() {
+                    tokens.push(FsCassQueryToken::Term(std::mem::take(&mut current_word)));
+                }
+                tokens.push(FsCassQueryToken::And);
+            }
+            '|' if chars.peek() == Some(&'|') => {
+                chars.next();
+                if !current_word.is_empty() {
+                    tokens.push(FsCassQueryToken::Term(std::mem::take(&mut current_word)));
+                }
+                tokens.push(FsCassQueryToken::Or);
+            }
+            '-' if current_word.is_empty() => {
+                tokens.push(FsCassQueryToken::Not);
+            }
+            ' ' | '\t' | '\n' => {
+                if !current_word.is_empty() {
+                    let word = std::mem::take(&mut current_word);
+                    let upper = word.to_ascii_uppercase();
+                    match upper.as_str() {
+                        "AND" => tokens.push(FsCassQueryToken::And),
+                        "OR" => tokens.push(FsCassQueryToken::Or),
+                        "NOT" => tokens.push(FsCassQueryToken::Not),
+                        _ => tokens.push(FsCassQueryToken::Term(word)),
+                    }
+                }
+            }
+            _ => current_word.push(c),
+        }
+    }
+
+    if !current_word.is_empty() {
+        let upper = current_word.to_ascii_uppercase();
+        match upper.as_str() {
+            "AND" => tokens.push(FsCassQueryToken::And),
+            "OR" => tokens.push(FsCassQueryToken::Or),
+            "NOT" => tokens.push(FsCassQueryToken::Not),
+            _ => tokens.push(FsCassQueryToken::Term(current_word)),
+        }
+    }
+
+    tokens
+}
+
+#[must_use]
+fn fs_cass_has_boolean_operators(query: &str) -> bool {
+    let tokens = fs_cass_parse_boolean_query(query);
+    tokens.iter().any(|t| {
+        matches!(
+            t,
+            FsCassQueryToken::And
+                | FsCassQueryToken::Or
+                | FsCassQueryToken::Not
+                | FsCassQueryToken::Phrase(_)
+        )
+    })
 }
 
 /// Wrapper around the `storage::api` `Connection` (Task A4a: backed by
@@ -73,21 +283,14 @@ macro_rules! fparams {
 struct SendConnection(Connection);
 
 type TantivyContentExactKey = (i64, i64);
-type TantivyContentFallbackKey = (String, String, i64);
-type TantivyHydratedContentMaps = (
-    HashMap<TantivyContentExactKey, String>,
-    HashMap<TantivyContentFallbackKey, String>,
-);
-type SqliteFtsHydratedRow = (
-    i64,
-    Option<i64>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<i64>,
-);
+/// W2-5 Task2: `lex_docs` corpus-wide stats the BM25F reranker needs
+/// (design doc ②). `total_docs` doubles as `N` in the IDF formula.
+#[derive(Clone, Copy)]
+struct LexicalCorpusStats {
+    total_docs: u64,
+    avgdl: FieldAvgdl,
+}
+
 type SqliteFtsMessageRow = (
     i64,
     String,
@@ -102,37 +305,10 @@ type SqliteFtsMessageRow = (
     Option<String>,
     Option<String>,
 );
-type SqliteMessageScanAlternative = Vec<String>;
-type SqliteMessageScanGroup = Vec<SqliteMessageScanAlternative>;
-struct SqliteMessageScanQuery {
-    include_groups: Vec<SqliteMessageScanGroup>,
-    exclude_terms: Vec<String>,
-}
-
-#[derive(Clone, Copy)]
-struct SqliteMessageScanRequest<'a> {
-    raw_query: &'a str,
-    filters: &'a SearchFilters,
-    limit: usize,
-    offset: usize,
-    field_mask: FieldMask,
-    query_match_type: MatchType,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SqliteFtsMatchMode {
-    Table,
-    IndexedColumns,
-}
-
 // The legacy embedded engine follows SQLite's bind-variable ceiling. Keep fallback
 // hydration IN-lists below that ceiling so large pages do not turn into
 // empty fallback result sets.
 const SQLITE_FTS5_HYDRATE_PARAM_CHUNK: usize = 30_000;
-const SQLITE_MAX_VARIABLE_NUMBER: usize = 32_766;
-const SQLITE_FTS5_POST_FILTER_SCAN_CHUNK: usize = 1_024;
-const SQLITE_FTS5_POST_FILTER_SCAN_LIMIT: usize = 30_000;
-const SQLITE_MESSAGE_SCAN_FALLBACK_LIMIT: usize = 30_000;
 const SEARCH_SQLITE_HYDRATION_CACHE_KIB: i64 = 4_096;
 const SEMANTIC_EXACT_CHUNK_OVERFETCH_MULTIPLIER: usize = 4;
 
@@ -202,54 +378,6 @@ where
     }
 }
 
-fn hydrate_message_content_by_conversation(
-    conn: &Connection,
-    requests: &[TantivyContentExactKey],
-) -> Result<HashMap<TantivyContentExactKey, String>> {
-    if requests.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let mut wanted_by_conversation: HashMap<i64, HashSet<i64>> = HashMap::new();
-    for &(conversation_id, line_idx) in requests {
-        wanted_by_conversation
-            .entry(conversation_id)
-            .or_default()
-            .insert(line_idx);
-    }
-
-    let mut conversation_ids = wanted_by_conversation.keys().copied().collect::<Vec<_>>();
-    conversation_ids.sort_unstable();
-    let mut hydrated = HashMap::with_capacity(requests.len());
-
-    for conversation_id in conversation_ids {
-        let Some(wanted_indices) = wanted_by_conversation.get(&conversation_id) else {
-            continue;
-        };
-        let mut wanted_indices = wanted_indices.iter().copied().collect::<Vec<_>>();
-        wanted_indices.sort_unstable();
-        let placeholders = sql_placeholders(wanted_indices.len());
-        let sql = format!(
-            "SELECT m.conversation_id, m.idx, m.content
-             FROM messages m INDEXED BY sqlite_autoindex_messages_1
-             WHERE m.conversation_id = ? AND m.idx IN ({placeholders})
-             ORDER BY m.idx"
-        );
-        let mut params = Vec::with_capacity(wanted_indices.len() + 1);
-        params.push(ParamValue::from(conversation_id));
-        params.extend(wanted_indices.iter().copied().map(ParamValue::from));
-        let rows: Vec<(i64, i64, String)> =
-            franken_query_map_collect_retry(conn, &sql, &params, |row| {
-                Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?))
-            })?;
-        for (conversation_id, line_idx, content) in rows {
-            hydrated.insert((conversation_id, line_idx), content);
-        }
-    }
-
-    Ok(hydrated)
-}
-
 /// Look up a `SearchHit`'s (conversation_id, message idx) key, used to join
 /// back to the `messages` table for post-hoc filters (e.g. `--role`) that
 /// aren't available on the hit itself (lexical/Tantivy has no role field).
@@ -261,8 +389,8 @@ fn message_role_lookup_key(hit: &SearchHit) -> Option<TantivyContentExactKey> {
 
 /// Batch-hydrate message role codes for a set of (conversation_id, idx) keys.
 ///
-/// Mirrors [`hydrate_message_content_by_conversation`]'s per-conversation
-/// chunked-IN query shape, but reads `role` instead of `content` and maps
+/// Uses the same per-conversation chunked-IN query shape as other message
+/// hydration helpers in this module, but reads `role` instead of `content` and maps
 /// the stored role string to its compact code via `role_code_from_str` (so
 /// the 6-role normalization stays in one place).
 fn hydrate_message_roles_by_conversation(
@@ -325,6 +453,7 @@ fn semantic_doc_component_id_from_db(raw: Option<i64>) -> u32 {
 
 use crate::search::canonicalize::{canonicalize_for_embedding, content_hash, is_search_noise_text};
 use crate::search::embedder::Embedder;
+use crate::search::lexical_rerank::{self, FieldAvgdl, RerankCandidate};
 use crate::search::vector_index::{
     ROLE_USER, SemanticDocId, SemanticFilter, SemanticFilterMaps, VectorIndex, VectorSearchResult,
     parse_semantic_doc_id, role_code_from_str,
@@ -523,7 +652,6 @@ const PROGRESSIVE_EMBEDDING_CACHE_CAPACITY: usize = 64;
 const ANN_CANDIDATE_MULTIPLIER: usize = 4;
 const HYBRID_NO_LIMIT_PLANNING_WINDOW: usize = 64;
 const HYBRID_NO_LIMIT_SEMANTIC_CAP: usize = 2048;
-const AUTOMATIC_WILDCARD_FALLBACK_MAX_TOKEN_CHARS: usize = 16;
 
 /// Upper bound on how many documents a `limit == 0` ("no limit") search is
 /// allowed to materialize. Each `SearchHit` carries the full message
@@ -570,48 +698,6 @@ const NO_LIMIT_BYTES_FLOOR: u64 = 256 * 1024 * 1024;
 /// "no limit" search response. 1/16 leaves 93% of RAM for everything
 /// else on the box.
 const NO_LIMIT_RAM_DIVISOR: u64 = 16;
-
-/// Above this corpus size, exact Tantivy `Count` collection is not part of the
-/// default top-N path. Common-term counts on multi-million-document indexes can
-/// dominate the query and turn a five-hit search into a full corpus scan; robot
-/// output already reports lower-bound count precision when the exact total is
-/// not available.
-const DEFAULT_EXACT_TOTAL_COUNT_MAX_DOCS: usize = 50_000;
-const DEFAULT_AUTOMATIC_WILDCARD_FALLBACK_MAX_DOCS: usize = 10_000;
-
-fn exact_total_count_max_docs() -> usize {
-    static MAX_DOCS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *MAX_DOCS.get_or_init(|| {
-        dotenvy::var("CASS_SEARCH_EXACT_TOTAL_COUNT_MAX_DOCS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(DEFAULT_EXACT_TOTAL_COUNT_MAX_DOCS)
-    })
-}
-
-fn should_collect_exact_total_count(
-    index_doc_count: usize,
-    max_docs_for_exact_count: usize,
-) -> bool {
-    max_docs_for_exact_count > 0 && index_doc_count <= max_docs_for_exact_count
-}
-
-fn automatic_wildcard_fallback_max_docs() -> usize {
-    static MAX_DOCS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *MAX_DOCS.get_or_init(|| {
-        dotenvy::var("CASS_AUTOMATIC_WILDCARD_FALLBACK_MAX_DOCS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(DEFAULT_AUTOMATIC_WILDCARD_FALLBACK_MAX_DOCS)
-    })
-}
-
-fn should_allow_automatic_wildcard_fallback(
-    index_doc_count: usize,
-    max_docs_for_automatic_wildcard: usize,
-) -> bool {
-    max_docs_for_automatic_wildcard > 0 && index_doc_count <= max_docs_for_automatic_wildcard
-}
 
 fn available_memory_bytes() -> Option<u64> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
@@ -1440,55 +1526,69 @@ fn effective_field_mask(field_mask: FieldMask) -> FieldMask {
     }
 }
 
-struct CassLexicalSearchResult {
-    hits: Vec<FsLexicalDocHit>,
-    total_count: Option<usize>,
+/// KU3 (plan Task W2-5 Step 1, spec R0-N05): `fts_lex`'s `porter trigram`
+/// tokenizer needs at least 3 Unicode codepoints to form a single trigram
+/// token, so a query shorter than that structurally can never match
+/// anything via `MATCH` -- not a bug, a property of trigram indexing.
+///
+/// The plan's original framing scoped this degrade to CJK queries only
+/// ("短纯ASCII/emoji查询不降级...trigram对≥3字节序列仍有索引意义"), flagging the
+/// exact semantics as something to pin down empirically ("语义按实测微调但必须
+/// 显式定义并测试"). Measured directly (both via the bundled engine's own
+/// query path and independently against a throwaway `porter trigram` table
+/// with the system sqlite3 CLI -- a syntax/matching-semantics check, not the
+/// X-3 integrity-check consistency check that specifically requires the
+/// bundled engine): `fts_lex MATCH 'ok'` against content containing "ok"
+/// returns zero rows, identically to the CJK case. The trigram floor is a
+/// codepoint-count property of the tokenizer, not a CJK-specific one, so
+/// this degrade is *not* restricted by script -- any query under 3 Unicode
+/// codepoints (ASCII, CJK, emoji, or otherwise) structurally cannot match
+/// via `MATCH` and must degrade to the `LIKE` table scan.
+fn is_lexical_ku3_short_query(query: &str) -> bool {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    trimmed.chars().count() < 3
 }
 
-fn execute_query_with_bounded_exact_count(
-    searcher: &Searcher,
-    query: &dyn Query,
-    limit: usize,
-    offset: usize,
-) -> Result<CassLexicalSearchResult> {
-    let top_docs = searcher.search(
-        query,
-        &TopDocs::with_limit(limit)
-            .and_offset(offset)
-            .order_by_score(),
-    )?;
-    let page_saturated = top_docs.len() == limit;
-    let index_doc_count = usize::try_from(searcher.num_docs()).unwrap_or(usize::MAX);
-    let total_count = if page_saturated {
-        if should_collect_exact_total_count(index_doc_count, exact_total_count_max_docs()) {
-            Some(searcher.search(query, &Count)?)
-        } else {
-            tracing::debug!(
-                index_doc_count,
-                exact_count_max_docs = exact_total_count_max_docs(),
-                limit,
-                offset,
-                "skipping exact Tantivy count on large saturated result page"
-            );
-            None
+/// W2-6 exec36 Task甲4-①③ (control-plane 2026-08-31 ruling, 批准修 --
+/// 机制正确性修复，非能力扩张): [`is_lexical_ku3_short_query`] only measures
+/// the *raw* query's length. Punctuation splitting (`normalize_term_parts`,
+/// used by `transpile_to_fts5` to build the FTS5 fallback's AND clauses) can
+/// produce an individual sub-term shorter than the trigram floor even when
+/// the raw query clears 3 codepoints -- e.g. `"c++"` sanitizes down to the
+/// single 1-char term `"c"`, and `"my_variable"` splits (underscore is not
+/// alphanumeric) into `"my"` (2 chars) AND `"variable"`. Either case leaves
+/// an AND clause that can structurally never match via FTS5 `MATCH`, and the
+/// existing KU3 check's whole-query-length gate never catches it. Detect
+/// that here so those queries also degrade to the LIKE substring fallback
+/// (`lex_docs_like_candidates_query`, driven off the raw, unsplit query
+/// text -- which for both examples above still appears verbatim as a
+/// contiguous substring in the content it's meant to find).
+fn query_has_short_subterm_after_normalization(query: &str) -> bool {
+    fs_cass_parse_boolean_query(query).into_iter().any(|token| {
+        let FsCassQueryToken::Term(t) = token else {
+            return false;
+        };
+        let parts = normalize_term_parts(&t);
+        !parts.is_empty() && parts.iter().any(|p| p.trim_matches('*').chars().count() < 3)
+    })
+}
+
+/// Escape `%`, `_`, and the escape character itself for a
+/// `LIKE ?1 ESCAPE '\'` pattern, then wrap the term as a substring match.
+fn like_substring_pattern(term: &str) -> String {
+    let mut escaped = String::with_capacity(term.len() + 2);
+    for c in term.chars() {
+        if c == '%' || c == '_' || c == '\\' {
+            escaped.push('\\');
         }
-    } else if offset > 0 && top_docs.is_empty() {
-        None
-    } else {
-        Some(offset.saturating_add(top_docs.len()))
-    };
-    let hits = top_docs
-        .into_iter()
-        .enumerate()
-        .map(|(rank, (bm25_score, doc_address))| FsLexicalDocHit {
-            bm25_score,
-            rank,
-            doc_address,
-        })
-        .collect();
-
-    Ok(CassLexicalSearchResult { hits, total_count })
+        escaped.push(c);
+    }
+    format!("%{escaped}%")
 }
+
 
 /// Result of a search operation with metadata about how matches were found
 #[derive(Debug, Clone)]
@@ -1676,37 +1776,6 @@ impl PartialOrd for SearchHitKey {
     fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
         Some(self.cmp(other))
     }
-}
-
-const FEDERATED_RRF_K: f32 = 60.0;
-
-#[derive(Debug)]
-struct FederatedRankedHit {
-    hit: SearchHit,
-    shard_index: usize,
-    shard_rank: usize,
-    fused_score: f32,
-}
-
-fn federated_rrf_score(shard_rank: usize) -> f32 {
-    1.0 / (FEDERATED_RRF_K + shard_rank as f32 + 1.0)
-}
-
-fn merge_federated_ranked_hits(mut ranked_hits: Vec<FederatedRankedHit>) -> Vec<SearchHit> {
-    ranked_hits.sort_by(|a, b| {
-        b.fused_score
-            .total_cmp(&a.fused_score)
-            .then_with(|| a.shard_rank.cmp(&b.shard_rank))
-            .then_with(|| SearchHitKey::from_hit(&a.hit).cmp(&SearchHitKey::from_hit(&b.hit)))
-            .then_with(|| a.shard_index.cmp(&b.shard_index))
-    });
-    ranked_hits
-        .into_iter()
-        .map(|mut ranked| {
-            ranked.hit.score = ranked.fused_score;
-            ranked.hit
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -2608,24 +2677,12 @@ impl FsLexicalSearch for CassProgressiveLexicalAdapter {
 }
 
 pub struct SearchClient {
-    reader: Option<(IndexReader, FsCassFields)>,
     sqlite: Mutex<Option<SendConnection>>,
     sqlite_path: Option<PathBuf>,
     prefix_cache: Mutex<CacheShards>,
-    reload_on_search: bool,
-    last_reload: Mutex<Option<Instant>>,
-    last_generation: Mutex<Option<u64>>,
-    reload_epoch: Arc<AtomicU64>,
-    warm_tx: Option<mpsc::Sender<WarmJob>>,
-    _warm_handle: Option<std::thread::JoinHandle<()>>,
     metrics: Metrics,
     cache_namespace: String,
     semantic: Mutex<Option<SemanticSearchState>>,
-    /// Exact total from the most recent Tantivy query when collecting it was
-    /// cheap enough. Large saturated pages leave this as `None` so robot output
-    /// can truthfully report lower-bound count precision without blocking the
-    /// top-N result path.
-    last_tantivy_total_count: Mutex<Option<usize>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2640,14 +2697,6 @@ impl Default for SearchClientOptions {
             enable_reload: true,
             enable_warm: true,
         }
-    }
-}
-
-impl Drop for SearchClient {
-    fn drop(&mut self) {
-        FEDERATED_SEARCH_READERS
-            .write()
-            .remove(&self.cache_namespace);
     }
 }
 
@@ -2739,26 +2788,26 @@ static CACHE_EVICTION_POLICY: Lazy<CacheEvictionPolicy> = Lazy::new(|| {
     cache_eviction_policy_from_env_value(dotenvy::var("CASS_CACHE_EVICTION_POLICY").ok().as_deref())
 });
 
+// Task甲 (design doc B', window position quota): per-session seat cap
+// within the top-10 lexical rerank window. Default is
+// `lexical_rerank::DEFAULT_SESSION_WINDOW_CAP` (Google host-crowding
+// convention, not fitted); `0` disables the pass entirely (kill-switch).
+// Unlike the cache caps above, `0` is a valid, meaningful value here, so
+// there is no `.filter(|v| *v > 0)` -- any malformed/unset env falls back
+// to the default via `.unwrap_or`.
+static LEXICAL_SESSION_WINDOW_CAP: Lazy<usize> = Lazy::new(|| {
+    dotenvy::var("CASS_LEXICAL_SESSION_WINDOW_CAP")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(lexical_rerank::DEFAULT_SESSION_WINDOW_CAP)
+});
+
 const DEFAULT_CACHE_BYTE_CAP_FALLBACK: usize = 64 * 1024 * 1024;
 const DEFAULT_CACHE_BYTE_CAP_MEMORY_FRACTION_DENOMINATOR: u64 = 128;
 const DEFAULT_CACHE_BYTE_CAP_CEILING: u64 = 2 * 1024 * 1024 * 1024;
 const S3_FIFO_GHOST_CAP_MULTIPLIER: usize = 2;
 const S3_FIFO_LARGE_ENTRY_FRACTION_DENOMINATOR: usize = 4;
-const PREWARM_ENTRY_PRESSURE_NUMERATOR: usize = 9;
-const PREWARM_ENTRY_PRESSURE_DENOMINATOR: usize = 10;
-const PREWARM_BYTE_PRESSURE_NUMERATOR: usize = 4;
-const PREWARM_BYTE_PRESSURE_DENOMINATOR: usize = 5;
-
 const CACHE_KEY_VERSION: &str = "1";
-
-// Warm debounce (ms) for background reload/warm jobs; default 120ms.
-static WARM_DEBOUNCE_MS: Lazy<u64> = Lazy::new(|| {
-    dotenvy::var("CASS_WARM_DEBOUNCE_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(120)
-});
 
 fn default_cache_byte_cap() -> usize {
     default_cache_byte_cap_for_available(available_memory_bytes())
@@ -3016,15 +3065,6 @@ impl CacheShards {
         self.ghost_keys.retain(|candidate| candidate != key);
     }
 
-    fn clear(&mut self) {
-        self.shards.clear();
-        self.total_cost = 0;
-        self.total_bytes = 0;
-        self.ghost_keys.clear();
-        self.ghost_set.clear();
-        // Note: eviction_count preserved for lifetime stats
-    }
-
     fn total_cost(&self) -> usize {
         self.total_cost
     }
@@ -3056,23 +3096,6 @@ impl CacheShards {
     fn admission_rejects(&self) -> u64 {
         self.admission_rejects
     }
-
-    fn prewarm_pressure(&self) -> bool {
-        let entry_pressure = self
-            .total_cost
-            .saturating_mul(PREWARM_ENTRY_PRESSURE_DENOMINATOR)
-            >= self
-                .total_cap
-                .saturating_mul(PREWARM_ENTRY_PRESSURE_NUMERATOR);
-        let byte_pressure = self.byte_cap > 0
-            && self
-                .total_bytes
-                .saturating_mul(PREWARM_BYTE_PRESSURE_DENOMINATOR)
-                >= self
-                    .byte_cap
-                    .saturating_mul(PREWARM_BYTE_PRESSURE_NUMERATOR);
-        entry_pressure || byte_pressure
-    }
 }
 
 fn shard_cached_bytes(shard: &LruCache<Arc<str>, Vec<CachedHit>>) -> usize {
@@ -3082,39 +3105,6 @@ fn shard_cached_bytes(shard: &LruCache<Arc<str>, Vec<CachedHit>>) -> usize {
         .sum()
 }
 
-#[derive(Clone)]
-struct WarmJob {
-    query: String,
-    filters_fingerprint: String,
-    shard_name: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AdaptivePrewarmDecision {
-    Schedule,
-    SkipCold,
-    SkipPressure,
-}
-
-#[derive(Clone)]
-struct SearcherCacheEntry {
-    epoch: u64,
-    reader_key: usize,
-    searcher: Searcher,
-}
-
-thread_local! {
-    static THREAD_SEARCHER: RefCell<Option<SearcherCacheEntry>> = const { RefCell::new(None) };
-}
-
-#[derive(Clone)]
-struct FederatedIndexReader {
-    reader: IndexReader,
-    fields: FsCassFields,
-}
-
-static FEDERATED_SEARCH_READERS: Lazy<RwLock<HashMap<String, Arc<Vec<FederatedIndexReader>>>>> =
-    Lazy::new(|| RwLock::new(HashMap::new()));
 static SEARCH_CLIENT_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Calculate Levenshtein edit distance between two strings.
@@ -3150,18 +3140,46 @@ fn levenshtein_distance(a: &str, b: &str) -> usize {
     prev_row[b_len]
 }
 
+/// W2-6 exec36 Task甲4-④ (Ivan 2026-08-31 ruling): true iff `term` is a
+/// hyphenated compound word -- an internal `-` with alphanumeric content on
+/// both sides, no leading/trailing hyphen, no other punctuation (sanitize
+/// already stripped anything else to whitespace, splitting it into a
+/// separate boolean-query token upstream of this check). Used to route the
+/// term through a quoted FTS5 phrase instead of `normalize_term_parts`'s
+/// hyphen-as-separator splitting.
+fn is_hyphenated_compound_term(term: &str) -> bool {
+    !term.is_empty()
+        && !term.starts_with('-')
+        && !term.ends_with('-')
+        && term.contains('-')
+        && term.chars().all(|c| c.is_alphanumeric() || c == '-')
+}
+
 /// Normalize a term into FTS5-porter-aligned parts.
 /// Splits punctuation into separate fragments while preserving a trailing `*`
 /// on the final fragment so fallback queries match how SQLite tokenizes indexed
-/// text in `fts_messages`.
+/// text in `fts_messages`. W2-6 exec36 Task甲4-④ (Ivan 2026-08-31 ruling): an
+/// *internal* hyphen (current fragment already non-empty) is kept inside its
+/// fragment rather than treated as a separator, so "br-123.jsonl" yields
+/// `["br-123", "jsonl"]` -- the caller (`transpile_to_fts5`) then renders a
+/// hyphenated fragment as one quoted FTS5 phrase instead of splitting it
+/// further, per `fs_cass_sanitize_query`'s own "hyphens are compound-word
+/// glue" design. Scoped to tokens with **no** trailing wildcard: a probe
+/// against `fts_lex` showed a quoted phrase with the `*` inside (e.g.
+/// `"br-123*"`) does *not* behave as prefix-on-last-word and simply matches
+/// nothing, so a hyphenated term combined with a trailing wildcard (e.g.
+/// `foo-bar*`) keeps the pre-④ hyphen-as-separator splitting instead of
+/// risking a silently-broken phrase query -- out of ④'s authorized scope.
 fn normalize_term_parts(raw: &str) -> Vec<String> {
     let mut parts = Vec::new();
     for token in nfc_sanitize_query(raw).split_whitespace() {
+        let keep_internal_hyphens = !token.ends_with('*');
         let mut current = String::new();
         let mut chars = token.chars().peekable();
         while let Some(ch) = chars.next() {
             let trailing_wildcard = ch == '*' && chars.peek().is_none() && !current.is_empty();
-            if ch.is_alphanumeric() || ch == '_' || trailing_wildcard {
+            let internal_hyphen = keep_internal_hyphens && ch == '-' && !current.is_empty();
+            if ch.is_alphanumeric() || ch == '_' || trailing_wildcard || internal_hyphen {
                 current.push(ch);
                 continue;
             }
@@ -3395,42 +3413,6 @@ pub(crate) fn deduplicate_hits_with_query(hits: Vec<SearchHit>, query: &str) -> 
     deduped
 }
 
-fn should_try_wildcard_fallback(
-    returned_hits: usize,
-    limit: usize,
-    offset: usize,
-    sparse_threshold: usize,
-) -> bool {
-    if offset != 0 {
-        return false;
-    }
-
-    let effective_sparse_threshold = if limit == 0 {
-        sparse_threshold
-    } else {
-        sparse_threshold.min(limit)
-    };
-
-    returned_hits < effective_sparse_threshold
-}
-
-fn should_skip_automatic_wildcard_fallback_for_long_zero_hit_query(
-    query: &str,
-    returned_hits: usize,
-) -> bool {
-    if returned_hits != 0 {
-        return false;
-    }
-
-    for token in normalize_phrase_terms(query) {
-        if token.chars().count() > AUTOMATIC_WILDCARD_FALLBACK_MAX_TOKEN_CHARS {
-            return true;
-        }
-    }
-
-    false
-}
-
 fn snippet_from_preview_without_full_content(
     field_mask: FieldMask,
     stored_preview: &str,
@@ -3443,12 +3425,6 @@ fn snippet_from_preview_without_full_content(
     cached_prefix_snippet(stored_preview, query, 160)
 }
 
-fn stored_preview_is_complete_content(stored_preview: &str) -> bool {
-    // The preview builder appends U+2026 only when truncating. A real message
-    // ending with that character becomes a conservative false negative here.
-    !stored_preview.is_empty() && !stored_preview.ends_with('…')
-}
-
 impl SearchClient {
     pub fn open(index_path: &Path, db_path: Option<&Path>) -> Result<Option<Self>> {
         Self::open_with_options(index_path, db_path, SearchClientOptions::default())
@@ -3457,9 +3433,16 @@ impl SearchClient {
     pub fn open_with_options(
         index_path: &Path,
         db_path: Option<&Path>,
-        options: SearchClientOptions,
+        _options: SearchClientOptions,
     ) -> Result<Option<Self>> {
-        let tantivy = fs_cass_open_search_reader(index_path, ReloadPolicy::Manual).ok();
+        // W2-6 Task2: the Tantivy reader/federated-reader/warm-worker
+        // machinery that used to live here is deleted; `fts_lex` (SQLite
+        // FTS5, same-transaction with the canonical tables) is the only
+        // lexical backend now, keyed entirely off `db_path`. `index_path` is
+        // kept in the signature (unused for opening anything -- it no
+        // longer names a Tantivy index directory) only for cache-namespace
+        // uniqueness and to avoid rippling a parameter removal through
+        // every caller.
         let client_id = SEARCH_CLIENT_INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed);
         let cache_namespace = format!(
             "v{}|schema:{}|client:{}|index:{}",
@@ -3468,77 +3451,22 @@ impl SearchClient {
             client_id,
             index_path.display()
         );
-        let federated_readers = if tantivy.is_none() {
-            crate::search::tantivy::open_federated_search_readers(index_path, ReloadPolicy::Manual)
-                .ok()
-                .flatten()
-                .filter(|readers| !readers.is_empty())
-                .map(|readers| {
-                    Arc::new(
-                        readers
-                            .into_iter()
-                            .map(|(reader, fields)| FederatedIndexReader { reader, fields })
-                            .collect::<Vec<_>>(),
-                    )
-                })
-        } else {
-            None
-        };
 
         let sqlite_path = db_path.map(Path::to_path_buf).filter(|path| path.exists());
 
-        if tantivy.is_none() && federated_readers.is_none() && sqlite_path.is_some() {
-            tracing::warn!(
-                index_path = %index_path.display(),
-                "Tantivy search index not found or incompatible. \
-                 Search results will be degraded. \
-                 Run `cass index --full` to rebuild the index."
-            );
-        }
-
-        if tantivy.is_none() && federated_readers.is_none() && sqlite_path.is_none() {
+        if sqlite_path.is_none() {
             return Ok(None);
         }
 
-        let reload_epoch = Arc::new(AtomicU64::new(0));
         let metrics = Metrics::default();
 
-        let warm_pair = if options.enable_warm
-            && let Some((reader, fields)) = &tantivy
-        {
-            maybe_spawn_warm_worker(
-                reader.clone(),
-                *fields,
-                reload_epoch.clone(),
-                metrics.clone(),
-            )
-        } else {
-            None
-        };
-
-        if let Some(readers) = &federated_readers {
-            FEDERATED_SEARCH_READERS
-                .write()
-                .insert(cache_namespace.clone(), Arc::clone(readers));
-        } else {
-            FEDERATED_SEARCH_READERS.write().remove(&cache_namespace);
-        }
-
         Ok(Some(Self {
-            reader: tantivy,
             sqlite: Mutex::new(None),
             sqlite_path,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: options.enable_reload,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch,
-            warm_tx: warm_pair.as_ref().map(|(tx, _)| tx.clone()),
-            _warm_handle: warm_pair.map(|(_, h)| h),
             metrics,
             cache_namespace,
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         }))
     }
 
@@ -3568,6 +3496,53 @@ impl SearchClient {
         Ok(guard)
     }
 
+    /// W2-5: whether the SQLite connection backing this client (if any) has
+    /// a *populated* `lex_docs` -- i.e. whether the new default lexical
+    /// backend actually has anything to query. Checking for rows (not mere
+    /// table existence) matters because `lex_docs`/`fts_lex` are created
+    /// structurally by every fresh v2-schema DB regardless of whether any
+    /// conversation was ever written through the real insert path -- several
+    /// pre-W2-5 test fixtures open a v2-schema DB and then seed content
+    /// directly into Tantivy and/or the legacy `fts_messages` table via raw
+    /// SQL, bypassing `lex_docs`/`fts_lex` entirely, which would otherwise
+    /// look like "fts_lex is available" while actually holding zero rows.
+    /// Also `false` for any DB that predates the v1->v2 migration and for
+    /// fixtures with no accompanying SQLite connection at all.
+    fn has_populated_fts_lex(&self) -> bool {
+        let Ok(sqlite_guard) = self.sqlite_guard() else {
+            return false;
+        };
+        let Some(conn) = sqlite_guard.as_ref() else {
+            return false;
+        };
+        let empty_params: [ParamValue; 0] = [];
+        franken_query_map_collect_retry(
+            conn,
+            "SELECT 1 FROM lex_docs LIMIT 1",
+            &empty_params,
+            |row| row.get_typed::<i64>(0),
+        )
+        .map(|rows| !rows.is_empty())
+        .unwrap_or(false)
+    }
+
+    /// W2-6 exec41 (Task戊): distinguishes *why* `lex_docs` is empty so
+    /// `search`'s else branch can report an honest, actionable state
+    /// instead of silently degrading to the retired `fts_messages` legacy
+    /// fallback (which could return stale hits from a table nobody keeps in
+    /// sync with `lex_docs` any more -- exec37's finding, verified live by
+    /// exec41: a query on a DB with an empty `lex_docs` but a populated
+    /// `fts_messages` used to return a hit from that stale table).
+    fn lex_domain_rebuild_marker_state_for_search(
+        &self,
+    ) -> Result<crate::storage::sqlite::LexDomainRebuildMarkerState> {
+        let sqlite_guard = self.sqlite_guard()?;
+        let Some(conn) = sqlite_guard.as_ref() else {
+            return Ok(crate::storage::sqlite::LexDomainRebuildMarkerState::Absent);
+        };
+        crate::storage::sqlite::lex_domain_rebuild_marker_status(conn)
+    }
+
     pub fn search(
         &self,
         query: &str,
@@ -3592,18 +3567,6 @@ impl SearchClient {
         let can_use_cache =
             field_mask.allows_cache() && (field_mask.needs_content() || field_mask.wants_snippet());
 
-        // Invalidate prefix cache if the index has been updated since last search.
-        // This must happen BEFORE the cache check below to avoid serving stale results.
-        if let Some((reader, _)) = &self.reader {
-            self.maybe_reload_reader(reader)?;
-            let searcher = self.searcher_for_thread(reader);
-            self.track_generation(searcher.generation().generation_id());
-        } else if let Some(readers) = self.federated_readers()
-            && let Some(signature) = self.maybe_reload_federated_readers(readers.as_ref())?
-        {
-            self.track_generation(signature);
-        }
-
         // Fast path: reuse cached prefix when user is typing forward (offset 0 only).
         // Only use cache for simple queries (no wildcards, no boolean operators) because
         // the cache matching logic enforces strict prefix AND semantics which is incorrect
@@ -3613,7 +3576,6 @@ impl SearchClient {
             && !query.contains('*')
             && !fs_cass_has_boolean_operators(query)
         {
-            self.maybe_schedule_adaptive_query_prewarm(&sanitized, &filters);
             if let Some(cached) = self.cached_prefix_hits(&sanitized, &filters) {
                 // Opt 2.4: Pre-compute lowercase query terms once, reuse for all hits
                 let query_terms = QueryTermsLower::from_query(&sanitized);
@@ -3626,9 +3588,6 @@ impl SearchClient {
                     filtered.truncate(limit);
                     self.metrics.inc_cache_hits();
                     self.maybe_log_cache_metrics("hit");
-                    if let Ok(mut tc) = self.last_tantivy_total_count.lock() {
-                        *tc = None;
-                    }
                     return Ok(filtered);
                 }
                 // Cache had entries but not enough to satisfy limit - shortfall, not miss
@@ -3641,27 +3600,15 @@ impl SearchClient {
             }
         }
 
-        // Adaptive fetch sizing: start at 2x target to reduce common-case work,
-        // retry at 3x only when deduplication causes shortfall.
-        // We always fetch from 0 to preserve global deduplication correctness.
         let target_hits = offset.saturating_add(limit);
-        let initial_fetch_limit = if target_hits <= 16 {
-            target_hits.saturating_mul(2)
-        } else {
-            // Larger pages benefit from a lower first-pass over-fetch.
-            // Retry logic below preserves correctness on duplicate-heavy corpora.
-            target_hits.saturating_mul(3).div_ceil(2)
-        };
         let session_path_filter_active = !filters.session_paths.is_empty();
-        // `--role` is a post-hoc filter applied in `postprocess_hits_page`
-        // (Tantivy carries no role field). A too-small fetch window can rank the
-        // only role-matching hit below it, so `search X --role tool --limit 1`
-        // wrongly returns empty even though the tool_result exists. Mirror the
-        // session-path treatment: over-fetch a large window (capped at
-        // `no_limit_result_cap()`) so role recall is correct. The Tantivy paths
-        // reach this via the dedup/shortfall retry; the SQLite-FTS fallback
-        // fetches `fallback_fetch_limit` directly — both are covered here.
-        // Kept off the no-role fast path so the common case is not slowed.
+        // `--role` is a post-hoc filter applied in `postprocess_hits_page`.
+        // A too-small fetch window can rank the only role-matching hit below
+        // it, so `search X --role tool --limit 1` wrongly returns empty even
+        // though the tool_result exists. Over-fetch a large window (capped at
+        // `no_limit_result_cap()`) so role recall is correct via
+        // `fallback_fetch_limit`. Kept off the no-role fast path so the
+        // common case is not slowed.
         let role_filter_active = filters
             .roles
             .as_ref()
@@ -3675,180 +3622,50 @@ impl SearchClient {
             target_hits.saturating_mul(3)
         };
 
-        // Tantivy is the primary high-performance engine.
-        if let Some((reader, fields)) = &self.reader {
-            tracing::info!(
-                backend = "tantivy",
-                query = sanitized,
-                limit = initial_fetch_limit,
-                offset = 0,
-                "search_start"
-            );
-            let (hits, tantivy_total_count) = self.search_tantivy(
-                reader,
-                fields,
+        // Skip both lexical backends only for genuinely unsupported internal
+        // wildcards (e.g. "f*o", "a*b*c" -- `FsCassWildcardPattern::Complex`).
+        // W2-6 exec36 Task甲4-② (Ivan 2026-08-31 ruling, 降级为普通词条):
+        // leading ("*handler", Suffix) and both-sided ("*andle*", Substring)
+        // wildcards are no longer flagged here -- `fts_lex`'s `porter
+        // trigram` tokenizer already performs substring matching for any
+        // plain term (verified via direct MATCH probe: an unwildcarded
+        // `handler` query already matches "my_handler_fn"), so these two
+        // patterns downgrade to a bare-term query (see `transpile_to_fts5`'s
+        // `Term` handling) instead of being rejected outright. Trailing-only
+        // wildcards ("foo*", Prefix) were always allowed since FTS5 supports
+        // prefix matching natively. Computed once, up front, so it gates the
+        // W2-5 default path below exactly like it already gated the legacy
+        // sqlite fallback.
+        let unsupported_wildcards = sanitized
+            .split_whitespace()
+            .any(|t| matches!(FsCassWildcardPattern::parse(t), FsCassWildcardPattern::Complex(_)));
+
+        // W2-5/W2-6: `fts_lex` (SQLite FTS5, same-transaction with the
+        // canonical tables) is the only lexical backend now; the Tantivy
+        // dispatch that used to live here (plain + federated, gated behind
+        // `CASS_LEXICAL_USE_TANTIVY=1`) is deleted along with the escape
+        // hatch (W2-6 Task2).
+        if self.has_populated_fts_lex() {
+            if unsupported_wildcards {
+                return Ok(Vec::new());
+            }
+            let hits = self.search_fts_lex_domain(
                 query,
-                &sanitized,
                 filters.clone(),
-                initial_fetch_limit,
+                fallback_fetch_limit,
                 0, // Always fetch from 0 for global dedup
                 field_mask,
             )?;
-            if let Ok(mut tc) = self.last_tantivy_total_count.lock() {
-                *tc = tantivy_total_count;
+            let (_, paged_hits) =
+                self.postprocess_hits_page(hits, &sanitized, &filters, limit, offset);
+            if can_use_cache && offset == 0 {
+                self.put_cache(&sanitized, &filters, &paged_hits);
             }
-            if !hits.is_empty() {
-                let initial_hit_count = hits.len();
-                let page_hits = |raw_hits: Vec<SearchHit>| {
-                    self.postprocess_hits_page(raw_hits, &sanitized, &filters, limit, offset)
-                };
-
-                let (mut deduped_len, mut paged_hits) = page_hits(hits);
-
-                let needs_retry = deduped_len < target_hits
-                    && initial_hit_count == initial_fetch_limit
-                    && initial_fetch_limit < fallback_fetch_limit;
-
-                if needs_retry {
-                    tracing::debug!(
-                        query = sanitized,
-                        target_hits,
-                        deduped_len,
-                        initial_fetch_limit,
-                        fallback_fetch_limit,
-                        session_path_filter_active,
-                        "retrying lexical fetch due to dedup or session-path shortfall"
-                    );
-                    let (retry_hits, retry_total_count) = self.search_tantivy(
-                        reader,
-                        fields,
-                        query,
-                        &sanitized,
-                        filters.clone(),
-                        fallback_fetch_limit,
-                        0,
-                        field_mask,
-                    )?;
-                    if let Ok(mut tc) = self.last_tantivy_total_count.lock() {
-                        *tc = retry_total_count;
-                    }
-                    if !retry_hits.is_empty() {
-                        (deduped_len, paged_hits) = page_hits(retry_hits);
-                    }
-                }
-
-                tracing::trace!(
-                    query = sanitized,
-                    target_hits,
-                    deduped_len,
-                    returned = paged_hits.len(),
-                    "lexical fetch complete"
-                );
-
-                if can_use_cache && offset == 0 {
-                    self.put_cache(&sanitized, &filters, &paged_hits);
-                }
-                return Ok(paged_hits);
-            }
-            tracing::debug!(
-                query = sanitized,
-                "tantivy returned zero hits; skipping sqlite fallback because tantivy is authoritative when available"
-            );
-            return Ok(Vec::new());
-        } else if let Some(readers) = self.federated_readers() {
-            tracing::info!(
-                backend = "tantivy-federated",
-                query = sanitized,
-                limit = initial_fetch_limit,
-                offset = 0,
-                shards = readers.len(),
-                "search_start"
-            );
-            let (hits, tantivy_total_count) = self.search_tantivy_federated(
-                readers.as_ref(),
-                query,
-                &sanitized,
-                filters.clone(),
-                initial_fetch_limit,
-                field_mask,
-            )?;
-            if let Ok(mut tc) = self.last_tantivy_total_count.lock() {
-                *tc = tantivy_total_count;
-            }
-            if !hits.is_empty() {
-                let initial_hit_count = hits.len();
-                let page_hits = |raw_hits: Vec<SearchHit>| {
-                    self.postprocess_hits_page(raw_hits, &sanitized, &filters, limit, offset)
-                };
-
-                let (mut deduped_len, mut paged_hits) = page_hits(hits);
-                let expected_federated_capacity = initial_fetch_limit.saturating_mul(readers.len());
-                let federated_initial_capacity_reached = if session_path_filter_active {
-                    initial_hit_count >= initial_fetch_limit.min(expected_federated_capacity)
-                } else {
-                    initial_hit_count == expected_federated_capacity
-                };
-                let needs_retry = deduped_len < target_hits
-                    && federated_initial_capacity_reached
-                    && initial_fetch_limit < fallback_fetch_limit;
-
-                if needs_retry {
-                    tracing::debug!(
-                        query = sanitized,
-                        target_hits,
-                        deduped_len,
-                        initial_fetch_limit,
-                        fallback_fetch_limit,
-                        shards = readers.len(),
-                        session_path_filter_active,
-                        "retrying federated lexical fetch due to dedup or session-path shortfall"
-                    );
-                    let (retry_hits, retry_total_count) = self.search_tantivy_federated(
-                        readers.as_ref(),
-                        query,
-                        &sanitized,
-                        filters.clone(),
-                        fallback_fetch_limit,
-                        field_mask,
-                    )?;
-                    if let Ok(mut tc) = self.last_tantivy_total_count.lock() {
-                        *tc = retry_total_count;
-                    }
-                    if !retry_hits.is_empty() {
-                        (deduped_len, paged_hits) = page_hits(retry_hits);
-                    }
-                }
-
-                tracing::trace!(
-                    query = sanitized,
-                    target_hits,
-                    deduped_len,
-                    returned = paged_hits.len(),
-                    shards = readers.len(),
-                    "federated lexical fetch complete"
-                );
-
-                if can_use_cache && offset == 0 {
-                    self.put_cache(&sanitized, &filters, &paged_hits);
-                }
-                return Ok(paged_hits);
-            }
-            tracing::debug!(
-                query = sanitized,
-                shards = readers.len(),
-                "federated tantivy returned zero hits; skipping sqlite fallback because tantivy is authoritative when available"
-            );
-            return Ok(Vec::new());
+            return Ok(paged_hits);
         }
 
-        // Skip SQLite fallback when the query contains leading/internal wildcards that
-        // FTS5 cannot parse (e.g., "*handler" or "f*o").
-        // We ALLOW trailing wildcards ("foo*") as FTS5 supports prefix matching.
-        let unsupported_wildcards = sanitized.split_whitespace().any(|t| {
-            let core = t.trim_end_matches('*');
-            core.contains('*') // Any star remaining after trimming end is unsupported (leading or internal)
-        });
-
+        // unsupported_wildcards was already computed above (shared with the
+        // W2-5 default path).
         if unsupported_wildcards {
             return Ok(Vec::new());
         }
@@ -3861,35 +3678,49 @@ impl SearchClient {
             sqlite_guard.is_some() || self.sqlite_path.is_some()
         };
 
-        if has_sqlite_backend {
-            tracing::info!(
-                backend = "sqlite-fts5",
-                query = sanitized,
-                limit = fallback_fetch_limit,
-                offset = 0,
-                "search_start"
-            );
-            let hits = self.search_sqlite_fts5(
-                self.sqlite_path
-                    .as_deref()
-                    .unwrap_or_else(|| Path::new(":memory:")),
-                query,
-                filters.clone(),
-                fallback_fetch_limit,
-                0, // Always fetch from 0 for global dedup
-                field_mask,
-            )?;
-            let (_, paged_hits) =
-                self.postprocess_hits_page(hits, &sanitized, &filters, limit, offset);
-
-            if can_use_cache && offset == 0 {
-                self.put_cache(&sanitized, &filters, &paged_hits);
-            }
-            return Ok(paged_hits);
+        if !has_sqlite_backend {
+            tracing::info!(backend = "none", query = query, "search_start");
+            return Ok(Vec::new());
         }
 
-        tracing::info!(backend = "none", query = query, "search_start");
-        Ok(Vec::new())
+        // W2-6 exec41 (Task戊, control-plane 2026-08-31 ruling): `fts_lex`
+        // being unpopulated here no longer falls back to the retired
+        // `fts_messages` legacy table (exec37 finding, confirmed live by
+        // exec41 -- see `lex_domain_rebuild_marker_state_for_search`'s doc
+        // comment). The self-heal call ahead of `search()` in the CLI path
+        // (`ensure_lexical_assets_for_search`) is the first line of
+        // defense and is unaffected by this change; reaching this point
+        // means self-heal either didn't run or didn't leave a populated
+        // index, so the honest answer is a structured error the CLI layer
+        // renders with a marker-state-specific hint, not a silent
+        // degrade to a table nobody keeps in sync any more. A `Completed`
+        // marker with zero indexed docs is not an error -- it is a
+        // genuinely empty archive -- so that one case still returns an
+        // empty result set. The `search_sqlite_fts5`/`search_sqlite_
+        // message_scan` legacy-fallback functions themselves, and the
+        // rest of the `fts_messages` write/probe infrastructure, are left
+        // in place here (dead code after this change) for the follow-up
+        // exec to remove along with the table -- see the W2-6 exec41
+        // Task戊 handoff for the full 8-file/257-line removal plan.
+        match self.lex_domain_rebuild_marker_state_for_search()? {
+            crate::storage::sqlite::LexDomainRebuildMarkerState::Completed {
+                lex_docs_count: 0,
+                ..
+            } => {
+                tracing::info!(backend = "sqlite-empty-archive", query = sanitized, "search_start");
+                Ok(Vec::new())
+            }
+            crate::storage::sqlite::LexDomainRebuildMarkerState::Building => Err(anyhow!(
+                "lexical index unavailable for search: lex_domain_rebuild_state=building -- \
+                 a lexical rebuild is currently in progress; retry shortly, or run `cass index` \
+                 and wait for it to finish"
+            )),
+            crate::storage::sqlite::LexDomainRebuildMarkerState::Absent
+            | crate::storage::sqlite::LexDomainRebuildMarkerState::Completed { .. } => Err(anyhow!(
+                "lexical index unavailable for search: lex_domain_rebuild_state=absent -- \
+                 no completed lexical rebuild was found; run `cass index --full` to build it"
+            )),
+        }
     }
 
     pub fn set_semantic_context(
@@ -5772,8 +5603,45 @@ impl SearchClient {
     }
 
     /// Search with automatic wildcard fallback for sparse results.
-    /// If the initial search returns fewer than `sparse_threshold` results and the query
-    /// doesn't already contain wildcards, automatically retry with substring wildcards (*term*).
+    ///
+    /// W2-6 exec37 Task甲⑦ (structural-extinction ruling, w2-d4 family,
+    /// 2026-08-31): this used to retry a sparse baseline with `*term*`-
+    /// decorated terms and swap in the retry's hits when it found more of
+    /// them. Under `fts_lex`'s trigram tokenizer that retry can never find
+    /// more: every query reachable here (past the `query_has_wildcards` /
+    /// `has_boolean_or_phrase` guards below) resolves through exactly one of
+    /// two candidate-generation paths in [`Self::search`], and on both paths
+    /// wildcard-decorating every term cannot enlarge the candidate set:
+    ///
+    /// - **FTS5 MATCH path** (`transpile_to_fts5`): decorating a star-free
+    ///   term `t` with `*t*` always classifies as
+    ///   [`FsCassWildcardPattern::Substring`], which `transpile_to_fts5`
+    ///   strips back to `t` (Ivan 2026-08-31 Task甲4-② ruling) before the
+    ///   *identical* `normalize_term_parts` / `render_fts5_term_part`
+    ///   pipeline runs on it. The decorated and undecorated queries
+    ///   therefore transpile to a byte-identical FTS5 MATCH string, so the
+    ///   "retry" is a second execution of the exact same query.
+    /// - **KU3 LIKE path** (`lex_docs_like_candidates_query`, for
+    ///   short-subterm queries the trigram floor can't index): the LIKE
+    ///   pattern is built verbatim from the raw query text with no wildcard
+    ///   translation, so decorating adds literal `*` characters to the
+    ///   pattern (`%term%` -> `%*term*%`). Any row matching the decorated
+    ///   pattern must contain `*term*` as a substring, which necessarily
+    ///   contains `term` -- so the decorated pattern's match set is always a
+    ///   *subset* of the undecorated one's, never a superset.
+    ///
+    /// Either way `fallback_hits.len() > hits.len()` can never hold, so the
+    /// retry was always a wasted duplicate query. It has been removed along
+    /// with its now-orphaned gating helpers (the old sparse/offset/threshold
+    /// check, the large-index opt-out, and the long-zero-hit-token skip --
+    /// none of them had any other caller once the retry itself was deleted):
+    /// `wildcard_fallback` is unconditionally `false` and callers get the
+    /// baseline hits directly.
+    ///
+    /// `sparse_threshold` is kept in the signature (unused) rather than
+    /// removed, to avoid rippling a parameter deletion through this method's
+    /// many call sites for a ruling scoped to "is the retry ever useful",
+    /// not "redesign this API".
     pub fn search_with_fallback(
         &self,
         query: &str,
@@ -5783,136 +5651,29 @@ impl SearchClient {
         sparse_threshold: usize,
         field_mask: FieldMask,
     ) -> Result<SearchResult> {
-        // First, try the normal search
+        let _ = sparse_threshold;
         let hits = self.search(query, filters.clone(), limit, offset, field_mask)?;
         let baseline_stats = self.cache_stats();
-        // Capture the exact Tantivy total when the query path could collect it cheaply.
-        let tantivy_total = self
-            .last_tantivy_total_count
-            .lock()
-            .ok()
-            .and_then(|guard| *guard);
+        // W2-6 Task2: `fts_lex` has no cheap exact-total-count path (the old
+        // Tantivy-only fast path this used to capture is gone with the
+        // engine); always report unknown rather than a stale/fabricated
+        // count.
+        let tantivy_total: Option<usize> = None;
 
-        // Check if we should try wildcard fallback
-        let query_has_wildcards = query.contains('*');
-        let has_boolean_or_phrase = fs_cass_has_boolean_operators(query);
-        let is_sparse = should_try_wildcard_fallback(hits.len(), limit, offset, sparse_threshold);
-        let total_docs = self.total_docs();
-        let automatic_wildcard_allowed = should_allow_automatic_wildcard_fallback(
-            total_docs,
-            automatic_wildcard_fallback_max_docs(),
-        );
-
-        if !is_sparse
-            || query_has_wildcards
-            || has_boolean_or_phrase
-            || query.trim().is_empty()
-            || !automatic_wildcard_allowed
-        {
-            // Either we have enough results, query already has wildcards,
-            // query uses boolean/phrases, or query is empty.
-            if is_sparse && !automatic_wildcard_allowed {
-                tracing::debug!(
-                    query,
-                    returned_hits = hits.len(),
-                    total_docs,
-                    automatic_wildcard_max_docs = automatic_wildcard_fallback_max_docs(),
-                    "skipping automatic wildcard fallback on large index"
-                );
-            }
-            // Generate suggestions only if truly zero hits
-            let suggestions = if hits.is_empty() && !query.trim().is_empty() {
-                self.generate_suggestions(query, &filters)
-            } else {
-                Vec::new()
-            };
-            return Ok(SearchResult {
-                hits,
-                wildcard_fallback: false,
-                cache_stats: baseline_stats,
-                suggestions,
-                ann_stats: None,
-                total_count: tantivy_total,
-            });
-        }
-
-        if should_skip_automatic_wildcard_fallback_for_long_zero_hit_query(query, hits.len()) {
-            let suggestions = if hits.is_empty() {
-                self.generate_suggestions(query, &filters)
-            } else {
-                Vec::new()
-            };
-            return Ok(SearchResult {
-                hits,
-                wildcard_fallback: false,
-                cache_stats: baseline_stats,
-                suggestions,
-                ann_stats: None,
-                total_count: tantivy_total,
-            });
-        }
-
-        // Try wildcard fallback: wrap each term in *term*
-        let wildcard_query = query
-            .split_whitespace()
-            .map(|term| format!("*{}*", term.trim_matches('*')))
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        tracing::info!(
-            original_query = query,
-            wildcard_query = wildcard_query,
-            original_count = hits.len(),
-            "wildcard_fallback"
-        );
-
-        let mut fallback_hits =
-            self.search(&wildcard_query, filters.clone(), limit, offset, field_mask)?;
-        let fallback_stats = self.cache_stats();
-        // Re-capture total_count after wildcard search (may have changed)
-        let fallback_tantivy_total = self
-            .last_tantivy_total_count
-            .lock()
-            .ok()
-            .and_then(|guard| *guard);
-
-        // Use fallback results if they're better
-        if fallback_hits.len() > hits.len() {
-            // Mark all hits as ImplicitWildcard since we auto-added wildcards
-            for hit in &mut fallback_hits {
-                hit.match_type = MatchType::ImplicitWildcard;
-            }
-            // Generate suggestions if still zero hits after fallback
-            let suggestions = if fallback_hits.is_empty() {
-                self.generate_suggestions(query, &filters)
-            } else {
-                Vec::new()
-            };
-            Ok(SearchResult {
-                hits: fallback_hits,
-                wildcard_fallback: true,
-                cache_stats: fallback_stats,
-                suggestions,
-                ann_stats: None,
-                total_count: fallback_tantivy_total,
-            })
+        // Generate suggestions only if truly zero hits.
+        let suggestions = if hits.is_empty() && !query.trim().is_empty() {
+            self.generate_suggestions(query, &filters)
         } else {
-            // Keep original results even if sparse
-            // Generate suggestions if zero hits
-            let suggestions = if hits.is_empty() {
-                self.generate_suggestions(query, &filters)
-            } else {
-                Vec::new()
-            };
-            Ok(SearchResult {
-                hits,
-                wildcard_fallback: false,
-                cache_stats: baseline_stats,
-                suggestions,
-                ann_stats: None,
-                total_count: tantivy_total,
-            })
-        }
+            Vec::new()
+        };
+        Ok(SearchResult {
+            hits,
+            wildcard_fallback: false,
+            cache_stats: baseline_stats,
+            suggestions,
+            ann_stats: None,
+            total_count: tantivy_total,
+        })
     }
 
     /// Hybrid search that fuses lexical + semantic results with RRF.
@@ -6099,736 +5860,6 @@ impl SearchClient {
         suggestions
     }
 
-    fn searcher_for_thread(&self, reader: &IndexReader) -> Searcher {
-        let epoch = self.reload_epoch.load(Ordering::Relaxed);
-        let reader_key = reader as *const IndexReader as usize;
-        THREAD_SEARCHER.with(|slot| {
-            let mut slot = slot.borrow_mut();
-            if let Some(entry) = slot.as_ref()
-                && entry.epoch == epoch
-                && entry.reader_key == reader_key
-            {
-                return entry.searcher.clone();
-            }
-            let searcher = reader.searcher();
-            *slot = Some(SearcherCacheEntry {
-                epoch,
-                reader_key,
-                searcher: searcher.clone(),
-            });
-            searcher
-        })
-    }
-
-    fn federated_readers(&self) -> Option<Arc<Vec<FederatedIndexReader>>> {
-        FEDERATED_SEARCH_READERS
-            .read()
-            .get(&self.cache_namespace)
-            .cloned()
-    }
-
-    fn maybe_reload_federated_readers(
-        &self,
-        readers: &[FederatedIndexReader],
-    ) -> Result<Option<u64>> {
-        if !self.reload_on_search || readers.is_empty() {
-            return Ok(None);
-        }
-        const MIN_RELOAD_INTERVAL: Duration = Duration::from_millis(300);
-        let now = Instant::now();
-        let mut guard = self.last_reload.lock().unwrap_or_else(|e| e.into_inner());
-        if guard
-            .map(|t| now.duration_since(t) < MIN_RELOAD_INTERVAL)
-            .unwrap_or(false)
-        {
-            let signature = self.federated_generation_signature(readers);
-            return Ok(Some(signature));
-        }
-
-        let reload_started = Instant::now();
-        for shard in readers {
-            shard.reader.reload()?;
-        }
-        let elapsed = reload_started.elapsed();
-        *guard = Some(now);
-        let epoch = self.reload_epoch.fetch_add(1, Ordering::SeqCst) + 1;
-        self.metrics.record_reload(elapsed);
-        tracing::debug!(
-            duration_ms = elapsed.as_millis() as u64,
-            reload_epoch = epoch,
-            shards = readers.len(),
-            "tantivy_reader_reload_federated"
-        );
-        Ok(Some(self.federated_generation_signature(readers)))
-    }
-
-    fn federated_generation_signature(&self, readers: &[FederatedIndexReader]) -> u64 {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        readers.len().hash(&mut hasher);
-        for shard in readers {
-            self.searcher_for_thread(&shard.reader)
-                .generation()
-                .generation_id()
-                .hash(&mut hasher);
-        }
-        hasher.finish()
-    }
-
-    fn track_generation(&self, generation: u64) {
-        let mut guard = self
-            .last_generation
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if let Some(prev) = *guard
-            && prev != generation
-            && let Ok(mut cache) = self.prefix_cache.lock()
-        {
-            cache.clear();
-        }
-        *guard = Some(generation);
-    }
-
-    fn hydrate_tantivy_hit_contents(
-        &self,
-        exact_keys: &[TantivyContentExactKey],
-        fallback_keys: &[TantivyContentFallbackKey],
-    ) -> Result<TantivyHydratedContentMaps> {
-        if exact_keys.is_empty() && fallback_keys.is_empty() {
-            return Ok((HashMap::new(), HashMap::new()));
-        }
-
-        let sqlite_guard = match self.sqlite_guard() {
-            Ok(guard) => guard,
-            Err(_) => return Ok((HashMap::new(), HashMap::new())),
-        };
-        let Some(conn) = sqlite_guard.as_ref() else {
-            return Ok((HashMap::new(), HashMap::new()));
-        };
-
-        let mut hydrated_exact = HashMap::new();
-        let mut hydrated_fallback = HashMap::new();
-        const CHUNK_SIZE: usize = 300;
-
-        if !exact_keys.is_empty() {
-            let mut unique_exact_keys = Vec::with_capacity(exact_keys.len());
-            let mut seen = HashSet::with_capacity(exact_keys.len());
-            for key in exact_keys {
-                if seen.insert(*key) {
-                    unique_exact_keys.push(*key);
-                }
-            }
-
-            hydrated_exact.extend(hydrate_message_content_by_conversation(
-                conn,
-                &unique_exact_keys,
-            )?);
-        }
-
-        if !fallback_keys.is_empty() {
-            let mut unique_fallback_keys = Vec::with_capacity(fallback_keys.len());
-            let mut seen = HashSet::with_capacity(fallback_keys.len());
-            for key in fallback_keys {
-                if seen.insert(key.clone()) {
-                    unique_fallback_keys.push(key.clone());
-                }
-            }
-
-            let mut unique_source_paths = Vec::with_capacity(unique_fallback_keys.len());
-            let mut seen_source_paths = HashSet::with_capacity(unique_fallback_keys.len());
-            for (_, source_path, _) in &unique_fallback_keys {
-                if seen_source_paths.insert(source_path.clone()) {
-                    unique_source_paths.push(source_path.clone());
-                }
-            }
-
-            let mut conversations_by_key: HashMap<(String, String), Vec<i64>> = HashMap::new();
-            for chunk in unique_source_paths.chunks(CHUNK_SIZE) {
-                let placeholders = sql_placeholders(chunk.len());
-                let sql = format!(
-                    "SELECT c.id,
-                            c.source_path,
-                            COALESCE(c.source_id, ''),
-                            COALESCE(c.origin_host, ''),
-                            COALESCE(s.kind, '')
-                     FROM conversations c
-                     LEFT JOIN sources s ON c.source_id = s.id
-                     WHERE c.source_path IN ({placeholders})
-                     ORDER BY c.id"
-                );
-                let params = chunk
-                    .iter()
-                    .map(|source_path| ParamValue::from(source_path.clone()))
-                    .collect::<Vec<_>>();
-                let rows: Vec<(i64, String, String, String, String)> =
-                    franken_query_map_collect_retry(conn, &sql, &params, |row| {
-                        Ok((
-                            row.get_typed(0)?,
-                            row.get_typed(1)?,
-                            row.get_typed(2)?,
-                            row.get_typed(3)?,
-                            row.get_typed(4)?,
-                        ))
-                    })?;
-
-                for (conversation_id, source_path, raw_source_id, origin_host, origin_kind) in rows
-                {
-                    let normalized_source_id = normalized_search_hit_source_id_parts(
-                        &raw_source_id,
-                        &origin_kind,
-                        (!origin_host.trim().is_empty()).then_some(origin_host.as_str()),
-                    );
-                    conversations_by_key
-                        .entry((normalized_source_id, source_path))
-                        .or_default()
-                        .push(conversation_id);
-                }
-            }
-
-            let mut message_requests = Vec::new();
-            let mut fallback_keys_by_exact: HashMap<
-                TantivyContentExactKey,
-                Vec<TantivyContentFallbackKey>,
-            > = HashMap::new();
-            let mut seen_message_requests = HashSet::new();
-            for (source_id, source_path, line_idx) in &unique_fallback_keys {
-                let key = (source_id.clone(), source_path.clone());
-                let Some(conversation_ids) = conversations_by_key.get(&key) else {
-                    continue;
-                };
-                for &conversation_id in conversation_ids {
-                    let exact_key = (conversation_id, *line_idx);
-                    if seen_message_requests.insert(exact_key) {
-                        message_requests.push(exact_key);
-                    }
-                    fallback_keys_by_exact.entry(exact_key).or_default().push((
-                        source_id.clone(),
-                        source_path.clone(),
-                        *line_idx,
-                    ));
-                }
-            }
-
-            for ((conversation_id, line_idx), content) in
-                hydrate_message_content_by_conversation(conn, &message_requests)?
-            {
-                if let Some(fallback_keys) =
-                    fallback_keys_by_exact.get(&(conversation_id, line_idx))
-                {
-                    for fallback_key in fallback_keys {
-                        hydrated_fallback.insert(fallback_key.clone(), content.clone());
-                    }
-                }
-            }
-        }
-
-        Ok((hydrated_exact, hydrated_fallback))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn search_tantivy(
-        &self,
-        reader: &IndexReader,
-        fields: &FsCassFields,
-        raw_query: &str,
-        sanitized_query: &str,
-        filters: SearchFilters,
-        limit: usize,
-        offset: usize,
-        field_mask: FieldMask,
-    ) -> Result<(Vec<SearchHit>, Option<usize>)> {
-        struct PendingTantivyHit {
-            score: f32,
-            doc: TantivyDocument,
-            title: String,
-            stored_content: String,
-            stored_preview: String,
-            agent: String,
-            source_path: String,
-            workspace: String,
-            workspace_original: Option<String>,
-            created_at: Option<i64>,
-            line_number: Option<usize>,
-            stored_preview_snippet: Option<String>,
-            source_id: String,
-            conversation_id: Option<i64>,
-            raw_origin_kind: Option<String>,
-            origin_host: Option<String>,
-        }
-
-        self.maybe_reload_reader(reader)?;
-        let searcher = self.searcher_for_thread(reader);
-        self.track_generation(searcher.generation().generation_id());
-
-        let wants_snippet = field_mask.wants_snippet();
-        let needs_content = field_mask.needs_content() || wants_snippet;
-
-        // Delegate cass-compatible query parsing + Tantivy clause construction to frankensearch.
-        // cass retains ownership of paging/fallback orchestration and stored-field hydration.
-        let fs_filters = FsCassQueryFilters {
-            agents: filters.agents.into_iter().collect(),
-            workspaces: filters.workspaces.into_iter().collect(),
-            created_from: filters.created_from,
-            created_to: filters.created_to,
-            source_filter: match filters.source_filter {
-                SourceFilter::All => FsCassSourceFilter::All,
-                SourceFilter::Local => FsCassSourceFilter::Local,
-                SourceFilter::Remote => FsCassSourceFilter::Remote,
-                SourceFilter::SourceId(id) => {
-                    FsCassSourceFilter::SourceId(normalize_search_source_filter_value(&id))
-                }
-            },
-        };
-
-        // NOTE: session_paths filtering is applied post-search since source_path
-        // is STORED but not indexed. See apply_session_paths_filter().
-        let q: Box<dyn Query> = fs_cass_build_tantivy_query(raw_query, &fs_filters, fields);
-
-        let prefix_only = is_prefix_only(sanitized_query);
-        let top_docs = execute_query_with_bounded_exact_count(&searcher, &*q, limit, offset)?;
-        let tantivy_total_count = top_docs.total_count;
-        let query_match_type = dominant_match_type(sanitized_query);
-        let mut pending_hits = Vec::with_capacity(top_docs.hits.len());
-        let mut missing_exact_content_keys = Vec::new();
-        let mut missing_fallback_content_keys = Vec::new();
-
-        for ranked_hit in top_docs.hits {
-            let score = ranked_hit.bm25_score;
-            let doc: TantivyDocument = fs_load_doc(&searcher, ranked_hit.doc_address)?;
-            let title = if field_mask.wants_title() {
-                doc.get_first(fields.title)
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string()
-            } else {
-                String::new()
-            };
-            let stored_content = doc
-                .get_first(fields.content)
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let stored_preview = doc
-                .get_first(fields.preview)
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let stored_preview_snippet = snippet_from_preview_without_full_content(
-                field_mask,
-                &stored_preview,
-                sanitized_query,
-            );
-            let agent = doc
-                .get_first(fields.agent)
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let workspace = doc
-                .get_first(fields.workspace)
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let workspace_original = doc
-                .get_first(fields.workspace_original)
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(String::from);
-            let created_at = doc.get_first(fields.created_at).and_then(|v| v.as_i64());
-            let line_number = doc
-                .get_first(fields.msg_idx)
-                .and_then(|v| v.as_u64())
-                .and_then(|i| usize::try_from(i).ok())
-                .map(|i| i.saturating_add(1));
-            let raw_source_id = doc
-                .get_first(fields.source_id)
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let conversation_id = fields
-                .conversation_id
-                .and_then(|field| doc.get_first(field))
-                .and_then(|v| v.as_i64());
-            let source_path = doc
-                .get_first(fields.source_path)
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let raw_origin_kind = doc
-                .get_first(fields.origin_kind)
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
-            let origin_host = doc
-                .get_first(fields.origin_host)
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(String::from);
-            let source_id = normalized_search_hit_source_id_parts(
-                raw_source_id.as_str(),
-                raw_origin_kind.as_deref().unwrap_or_default(),
-                origin_host.as_deref(),
-            );
-
-            let preview_satisfies_bounded_content =
-                field_mask.preview_content_limit().is_some() && !stored_preview.is_empty();
-            let preview_satisfies_full_content = field_mask.needs_content()
-                && field_mask.preview_content_limit().is_none()
-                && stored_preview_is_complete_content(&stored_preview);
-            if needs_content
-                && let Some(line_idx) = line_number
-                    .and_then(|line| line.checked_sub(1))
-                    .and_then(|line| i64::try_from(line).ok())
-                && stored_content.is_empty()
-                && !preview_satisfies_bounded_content
-                && !preview_satisfies_full_content
-                && stored_preview_snippet.is_none()
-            {
-                if let Some(conversation_id) = conversation_id {
-                    missing_exact_content_keys.push((conversation_id, line_idx));
-                } else {
-                    missing_fallback_content_keys.push((
-                        source_id.clone(),
-                        source_path.clone(),
-                        line_idx,
-                    ));
-                }
-            }
-
-            pending_hits.push(PendingTantivyHit {
-                score,
-                doc,
-                title,
-                stored_content,
-                stored_preview,
-                agent,
-                source_path,
-                workspace,
-                workspace_original,
-                created_at,
-                line_number,
-                stored_preview_snippet,
-                source_id,
-                conversation_id,
-                raw_origin_kind,
-                origin_host,
-            });
-        }
-
-        let (hydrated_contents, hydrated_fallback_contents) = if needs_content
-            && (!missing_exact_content_keys.is_empty() || !missing_fallback_content_keys.is_empty())
-        {
-            self.hydrate_tantivy_hit_contents(
-                &missing_exact_content_keys,
-                &missing_fallback_content_keys,
-            )?
-        } else {
-            (HashMap::new(), HashMap::new())
-        };
-        let needs_tantivy_snippet_generator = wants_snippet
-            && !prefix_only
-            && pending_hits
-                .iter()
-                .any(|pending| pending.stored_preview_snippet.is_none());
-        let snippet_generator = if needs_tantivy_snippet_generator {
-            let snippet_cfg = FsSnippetConfig {
-                max_chars: 160,
-                highlight_prefix: "<b>".to_string(),
-                highlight_postfix: "</b>".to_string(),
-            };
-            fs_try_build_snippet_generator(&searcher, &*q, fields.content, &snippet_cfg)
-        } else {
-            None
-        };
-        let mut hits = Vec::with_capacity(pending_hits.len());
-        for pending in pending_hits {
-            let hydrated_content = pending
-                .line_number
-                .and_then(|line| line.checked_sub(1))
-                .and_then(|line| i64::try_from(line).ok())
-                .and_then(|line_idx| {
-                    if let Some(conversation_id) = pending.conversation_id {
-                        hydrated_contents.get(&(conversation_id, line_idx)).cloned()
-                    } else {
-                        hydrated_fallback_contents
-                            .get(&(
-                                pending.source_id.clone(),
-                                pending.source_path.clone(),
-                                line_idx,
-                            ))
-                            .cloned()
-                    }
-                });
-            let preview_satisfies_effective_content = !pending.stored_preview.is_empty()
-                && (field_mask.preview_content_limit().is_some()
-                    || (field_mask.needs_content()
-                        && field_mask.preview_content_limit().is_none()
-                        && stored_preview_is_complete_content(&pending.stored_preview)));
-            let effective_content = if !pending.stored_content.is_empty() {
-                pending.stored_content.clone()
-            } else if preview_satisfies_effective_content {
-                pending.stored_preview.clone()
-            } else if let Some(content) = hydrated_content {
-                content
-            } else {
-                pending.stored_preview.clone()
-            };
-            let snippet = if wants_snippet {
-                if let Some(snippet) = pending.stored_preview_snippet.clone() {
-                    snippet
-                } else if let Some(r#gen) = &snippet_generator {
-                    let rendered = if !pending.stored_content.is_empty() {
-                        fs_render_snippet_html(r#gen, &pending.doc, "<b>", "</b>")
-                    } else if !effective_content.is_empty() {
-                        let mut snippet_doc = TantivyDocument::new();
-                        snippet_doc.add_text(fields.content, &effective_content);
-                        fs_render_snippet_html(r#gen, &snippet_doc, "<b>", "</b>")
-                    } else {
-                        None
-                    };
-                    rendered
-                        .map(|html| html.replace("<b>", "**").replace("</b>", "**"))
-                        .or_else(|| cached_prefix_snippet(&effective_content, sanitized_query, 160))
-                        .unwrap_or_else(|| {
-                            quick_prefix_snippet(&effective_content, sanitized_query, 160)
-                        })
-                } else if let Some(sn) =
-                    cached_prefix_snippet(&effective_content, sanitized_query, 160)
-                {
-                    sn
-                } else {
-                    quick_prefix_snippet(&effective_content, sanitized_query, 160)
-                }
-            } else {
-                String::new()
-            };
-            let content = if field_mask.needs_content() {
-                effective_content.clone()
-            } else {
-                String::new()
-            };
-            let content_hash = stable_hit_hash(
-                &effective_content,
-                &pending.source_path,
-                pending.line_number,
-                pending.created_at,
-            );
-            let origin_kind = normalized_search_hit_origin_kind(
-                &pending.source_id,
-                pending.raw_origin_kind.as_deref(),
-            )
-            .to_string();
-            hits.push(SearchHit {
-                title: pending.title,
-                snippet,
-                content,
-                content_hash,
-                conversation_id: pending.conversation_id,
-                score: pending.score,
-                source_path: pending.source_path,
-                agent: pending.agent,
-                workspace: pending.workspace,
-                workspace_original: pending.workspace_original,
-                created_at: pending.created_at,
-                line_number: pending.line_number,
-                match_type: query_match_type,
-                source_id: pending.source_id,
-                origin_kind,
-                origin_host: pending.origin_host,
-            });
-        }
-        Ok((hits, tantivy_total_count))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn search_tantivy_federated(
-        &self,
-        readers: &[FederatedIndexReader],
-        raw_query: &str,
-        sanitized_query: &str,
-        filters: SearchFilters,
-        limit: usize,
-        field_mask: FieldMask,
-    ) -> Result<(Vec<SearchHit>, Option<usize>)> {
-        let mut ranked_hits = Vec::new();
-        let mut total_count = Some(0usize);
-
-        for (shard_index, shard) in readers.iter().enumerate() {
-            let (shard_hits, shard_total_count) = self.search_tantivy(
-                &shard.reader,
-                &shard.fields,
-                raw_query,
-                sanitized_query,
-                filters.clone(),
-                limit,
-                0,
-                field_mask,
-            )?;
-            total_count = match (total_count, shard_total_count) {
-                (Some(total), Some(shard_total)) => Some(total.saturating_add(shard_total)),
-                _ => None,
-            };
-            for (shard_rank, hit) in shard_hits.into_iter().enumerate() {
-                ranked_hits.push(FederatedRankedHit {
-                    hit,
-                    shard_index,
-                    shard_rank,
-                    fused_score: federated_rrf_score(shard_rank),
-                });
-            }
-        }
-
-        let raw_hit_count = ranked_hits.len();
-        let generation_signature = self.federated_generation_signature(readers);
-        self.track_generation(generation_signature);
-        let combined_hits = merge_federated_ranked_hits(ranked_hits);
-        tracing::debug!(
-            generation_signature,
-            shard_count = readers.len(),
-            total_count,
-            raw_hit_count,
-            returned_hit_count = combined_hits.len(),
-            merge_policy = "rrf_rank_then_stable_hit_key",
-            "federated lexical search merged shard results"
-        );
-
-        Ok((combined_hits, total_count))
-    }
-
-    fn sqlite_fts_uses_message_id_column(conn: &Connection) -> Result<bool> {
-        let params: [ParamValue; 0] = [];
-        let ddl_rows: Vec<String> = franken_query_map_collect_retry(
-            conn,
-            "SELECT COALESCE(sql, '')
-             FROM sqlite_master
-             WHERE name = 'fts_messages'
-             ORDER BY rowid DESC
-             LIMIT 1",
-            &params,
-            |row: &FrankenRow| row.get_typed::<String>(0),
-        )?;
-        Ok(ddl_rows
-            .first()
-            .map(|sql| sql.to_ascii_lowercase().contains("message_id"))
-            .unwrap_or(false))
-    }
-
-    fn sqlite_fts_match_mode(conn: &Connection) -> Result<SqliteFtsMatchMode> {
-        let params = [ParamValue::from("__cass_fts_probe_no_match__")];
-        match franken_query_map_collect_retry(
-            conn,
-            "SELECT COUNT(*) FROM fts_messages WHERE fts_messages MATCH ?",
-            &params,
-            |row: &FrankenRow| row.get_typed::<i64>(0),
-        ) {
-            Ok(_) => Ok(SqliteFtsMatchMode::Table),
-            Err(err)
-                if err
-                    .to_string()
-                    .contains("no such column: fts_messages in table fts_messages") =>
-            {
-                Ok(SqliteFtsMatchMode::IndexedColumns)
-            }
-            Err(err) => Err(anyhow!(err)),
-        }
-    }
-
-    fn sqlite_fts5_rowid_projection_available(conn: &Connection) -> bool {
-        let params: [ParamValue; 0] = [];
-        franken_query_map_collect_retry(
-            conn,
-            "SELECT rowid FROM fts_messages LIMIT 1",
-            &params,
-            |row: &FrankenRow| row.get_typed::<i64>(0),
-        )
-        .is_ok()
-    }
-
-    fn sqlite_fts5_match_clause(match_mode: SqliteFtsMatchMode) -> &'static str {
-        match match_mode {
-            SqliteFtsMatchMode::Table => "fts_messages MATCH ?",
-            SqliteFtsMatchMode::IndexedColumns => {
-                "(content MATCH ?
-                  OR title MATCH ?
-                  OR agent MATCH ?
-                  OR workspace MATCH ?
-                  OR source_path MATCH ?)"
-            }
-        }
-    }
-
-    fn push_sqlite_fts5_match_params(
-        params: &mut Vec<ParamValue>,
-        fts_query: &str,
-        match_mode: SqliteFtsMatchMode,
-    ) {
-        let copies = match match_mode {
-            SqliteFtsMatchMode::Table => 1,
-            SqliteFtsMatchMode::IndexedColumns => 5,
-        };
-        for _ in 0..copies {
-            params.push(ParamValue::from(fts_query));
-        }
-    }
-
-    fn sqlite_fts5_rank_query(
-        fts_query: &str,
-        _filters: &SearchFilters,
-        limit: usize,
-        offset: usize,
-        _uses_message_id: bool,
-        match_mode: SqliteFtsMatchMode,
-    ) -> (String, Vec<ParamValue>) {
-        let match_clause = Self::sqlite_fts5_match_clause(match_mode);
-        let mut sql = format!(
-            "SELECT rowid,
-                    bm25(fts_messages)
-             FROM fts_messages
-             WHERE {match_clause}"
-        );
-        let mut params = Vec::with_capacity(9);
-        Self::push_sqlite_fts5_match_params(&mut params, fts_query, match_mode);
-
-        sql.push_str(" ORDER BY bm25(fts_messages), rowid LIMIT ? OFFSET ?");
-        params.push(ParamValue::from(limit as i64));
-        params.push(ParamValue::from(offset as i64));
-
-        (sql, params)
-    }
-
-    fn sqlite_fts5_hydrate_query(
-        row_count: usize,
-        field_mask: FieldMask,
-        uses_message_id: bool,
-    ) -> String {
-        let title_expr = if field_mask.wants_title() {
-            "fts_messages.title"
-        } else {
-            "NULL"
-        };
-        let content_expr = if field_mask.needs_content() || field_mask.wants_snippet() {
-            "fts_messages.content"
-        } else {
-            "NULL"
-        };
-        let message_key_expr = if uses_message_id {
-            "CAST(fts_messages.message_id AS INTEGER)"
-        } else {
-            "rowid"
-        };
-        let placeholders = sql_placeholders(row_count);
-
-        format!(
-            "SELECT rowid,
-                    {message_key_expr},
-                    {title_expr},
-                    {content_expr},
-                    fts_messages.agent,
-                    fts_messages.workspace,
-                    fts_messages.source_path,
-                    CAST(fts_messages.created_at AS INTEGER)
-             FROM fts_messages
-             WHERE rowid IN ({placeholders})"
-        )
-    }
-
     fn sqlite_fts5_message_hydrate_query(row_count: usize, field_mask: FieldMask) -> String {
         let title_expr = if field_mask.wants_title() {
             "COALESCE(c.title, '')"
@@ -6864,22 +5895,6 @@ impl SearchClient {
              LEFT JOIN workspaces w ON c.workspace_id = w.id
              WHERE m.id IN ({placeholders})"
         )
-    }
-
-    fn sqlite_fts5_hydrate_row_chunks(
-        ranked_rows: &[(i64, f64)],
-    ) -> impl Iterator<Item = &[(i64, f64)]> {
-        const _: () = assert!(SQLITE_FTS5_HYDRATE_PARAM_CHUNK <= SQLITE_MAX_VARIABLE_NUMBER);
-        ranked_rows.chunks(SQLITE_FTS5_HYDRATE_PARAM_CHUNK)
-    }
-
-    fn sqlite_fts5_filters_need_post_hydration(filters: &SearchFilters) -> bool {
-        !filters.agents.is_empty()
-            || !filters.workspaces.is_empty()
-            || filters.created_from.is_some()
-            || filters.created_to.is_some()
-            || !filters.source_filter.is_all()
-            || !filters.session_paths.is_empty()
     }
 
     fn sqlite_fts5_hit_matches_filters(hit: &SearchHit, filters: &SearchFilters) -> bool {
@@ -6932,202 +5947,358 @@ impl SearchClient {
         }
     }
 
-    fn sqlite_message_scan_query(raw_query: &str) -> Option<SqliteMessageScanQuery> {
-        fn scan_parts(parts: Vec<String>) -> Vec<String> {
-            parts
-                .into_iter()
-                .map(|part| part.trim_end_matches('*').to_lowercase())
-                .filter(|part| !part.is_empty())
-                .collect()
+    /// Candidate query against `fts_lex` (the only shape it can ever have --
+    /// unlike `fts_messages`, no legacy-schema probing is needed).
+    ///
+    /// `bm25(fts_lex, 1.0, 3.0, 0.1, 0.1, 0.5)` (content/title/agent/
+    /// workspace/source_path weights, the table's declared column order)
+    /// is still computed in the `SELECT` -- W2-5 exec26 found uniform
+    /// weighting let the three identifier-shaped columns swamp genuine
+    /// `content` relevance, so this keeps the bias toward content/title --
+    /// but as of Task2 it is *not* used to order or truncate this query;
+    /// see below.
+    ///
+    /// W2-5 Task2: candidate *generation*, not ranking -- no `ORDER BY`.
+    /// Pre-Task2 this query used `ORDER BY bm25(...) LIMIT small_window`,
+    /// which is exactly the bug the rerank layer exists to fix (design doc
+    /// ①: fts5's own unified-statistics `bm25()` buries the true best
+    /// candidate arbitrarily deep -- HOLD diagnosis's anchor case put it at
+    /// rank 1226 of 3143 -- so ranking-then-truncating before the reranker
+    /// ever sees the candidates would throw the true winner away before
+    /// Rust gets a chance to score it correctly). `cap` is
+    /// `no_limit_result_cap()`'s value, the same memory-aware safety valve
+    /// used elsewhere for "no limit" fetches -- not a tuned rank window.
+    /// `bm25(fts_lex, ...)` is still computed here (not dropped from the
+    /// `SELECT`) to serve as the zero-score tie-break signal (design doc
+    /// ⑤ "边界①") at zero extra query cost, not to order the results.
+    fn fts_lex_match_candidates_query(fts_query: &str, cap: usize) -> (String, Vec<ParamValue>) {
+        let sql = "SELECT rowid, bm25(fts_lex, 1.0, 3.0, 0.1, 0.1, 0.5) FROM fts_lex \
+                    WHERE fts_lex MATCH ?1 LIMIT ?2"
+            .to_string();
+        let params = vec![ParamValue::from(fts_query), ParamValue::from(cap as i64)];
+        (sql, params)
+    }
+
+    /// KU3 fallback candidate query: a genuine `LIKE` table scan over
+    /// `lex_docs` (the real content table `fts_lex` wraps -- LIKE against
+    /// the FTS5 virtual table itself is not the intended access path) so
+    /// short CJK queries below the trigram tokenizer's 3-character floor
+    /// still get a correctness-complete (not windowed) search of the whole
+    /// corpus. W2-5 Task2: no longer `ORDER BY` here either -- same
+    /// candidate-generation-not-ranking rationale as
+    /// `fts_lex_match_candidates_query`; `occurrence_score` (total
+    /// occurrence count of the term across all five columns, mirrors
+    /// `sqlite_message_scan_score`'s philosophy) is still computed in the
+    /// `SELECT` to serve as the zero-score tie-break signal, not to order
+    /// results. `cap` is `no_limit_result_cap()`'s value.
+    fn lex_docs_like_candidates_query(raw_term: &str, cap: usize) -> (String, Vec<ParamValue>) {
+        let pattern = like_substring_pattern(raw_term);
+        let sql = "SELECT doc_id, \
+                    CAST( \
+                        (LENGTH(content) - LENGTH(REPLACE(content, ?1, ''))) + \
+                        (LENGTH(title) - LENGTH(REPLACE(title, ?1, ''))) + \
+                        (LENGTH(agent) - LENGTH(REPLACE(agent, ?1, ''))) + \
+                        (LENGTH(workspace) - LENGTH(REPLACE(workspace, ?1, ''))) + \
+                        (LENGTH(source_path) - LENGTH(REPLACE(source_path, ?1, ''))) \
+                    AS REAL) / LENGTH(?1) AS occurrence_score \
+                   FROM lex_docs \
+                   WHERE content LIKE ?2 ESCAPE '\\' \
+                      OR title LIKE ?2 ESCAPE '\\' \
+                      OR agent LIKE ?2 ESCAPE '\\' \
+                      OR workspace LIKE ?2 ESCAPE '\\' \
+                      OR source_path LIKE ?2 ESCAPE '\\' \
+                   LIMIT ?3"
+            .to_string();
+        let params = vec![
+            ParamValue::from(raw_term),
+            ParamValue::from(pattern),
+            ParamValue::from(cap as i64),
+        ];
+        (sql, params)
+    }
+
+    /// Disk sidecar for [`lexical_corpus_stats`], next to the sqlite DB
+    /// file (`.lexical-avgdl-cache.json`, following the same dot-prefixed
+    /// sidecar convention as `.lexical-rebuild-state.json` in
+    /// `indexer/mod.rs`). Measured need (not speculative): `cass search` is
+    /// a fresh process per invocation, so an in-process-only cache (the
+    /// `OnceLock` below) buys nothing for the CLI's actual usage pattern --
+    /// every single search would repeat the full-corpus tokenize scan.
+    /// Measured cost of that on the 1M-row w2 staging corpus: **~19.4s per
+    /// query** (`time cass search "indexing" --mode lexical`), which is why
+    /// this sidecar exists rather than relying on the process-lifetime
+    /// cache alone.
+    fn lexical_avgdl_cache_path(&self) -> Option<std::path::PathBuf> {
+        let db_path = self.sqlite_path.as_ref()?;
+        Some(db_path.parent()?.join(".lexical-avgdl-cache.json"))
+    }
+
+    /// W2-5 Task2: two-layer cache for the `lex_docs` corpus-wide stats the
+    /// BM25F reranker needs (design doc ②: computing this live per query is
+    /// not viable). Layer 1 (`OnceLock`): free within one long-lived
+    /// process. Layer 2 (disk sidecar, see [`lexical_avgdl_cache_path`]):
+    /// the layer that actually matters for the CLI's one-process-per-search
+    /// usage pattern. Known limitation, not yet closed: nothing here
+    /// invalidates the sidecar after a `--force-rebuild` -- avgdl is a
+    /// slow-moving statistic (design doc ②) so serving a stale-but-close
+    /// value is an accepted tradeoff, but a full rebuild that meaningfully
+    /// changes corpus composition should ideally refresh it; deleting the
+    /// sidecar file forces a fresh computation until that wiring exists.
+    fn lexical_corpus_stats(&self, conn: &SendConnection) -> Result<LexicalCorpusStats> {
+        static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<LexicalCorpusStats>>> =
+            std::sync::OnceLock::new();
+        let cache = CACHE.get_or_init(|| std::sync::Mutex::new(None));
+        if let Ok(guard) = cache.lock() {
+            if let Some(stats) = guard.as_ref() {
+                return Ok(*stats);
+            }
         }
 
-        let tokens = fs_cass_parse_boolean_query(raw_query);
-        if tokens.is_empty() {
-            return None;
-        }
-
-        let mut include_groups = Vec::new();
-        let mut pending_or_group: SqliteMessageScanGroup = Vec::new();
-        let mut exclude_terms = Vec::new();
-        let mut negated = false;
-        let mut in_or_sequence = false;
-        for token in tokens {
-            match token {
-                FsCassQueryToken::And => {
-                    if !pending_or_group.is_empty() {
-                        include_groups.push(std::mem::take(&mut pending_or_group));
-                    }
-                    in_or_sequence = false;
-                    negated = false;
-                }
-                FsCassQueryToken::Or => {
-                    if include_groups.is_empty() && pending_or_group.is_empty() {
-                        continue;
-                    }
-                    if negated {
-                        return None;
-                    }
-                    in_or_sequence = true;
-                }
-                FsCassQueryToken::Not => {
-                    if in_or_sequence {
-                        return None;
-                    }
-                    if !pending_or_group.is_empty() {
-                        include_groups.push(std::mem::take(&mut pending_or_group));
-                    }
-                    negated = true;
-                    in_or_sequence = false;
-                }
-                FsCassQueryToken::Term(term) => {
-                    let parts = scan_parts(normalize_term_parts(&term));
-                    if parts.is_empty() {
-                        continue;
-                    }
-                    if negated {
-                        exclude_terms.extend(parts);
-                    } else if in_or_sequence {
-                        if pending_or_group.is_empty() {
-                            let previous = include_groups.pop()?;
-                            pending_or_group.extend(previous);
+        let cache_path = self.lexical_avgdl_cache_path();
+        if let Some(path) = &cache_path {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let (Some(total_docs), Some(avgdl_content), Some(avgdl_title)) = (
+                        value.get("total_docs").and_then(|v| v.as_u64()),
+                        value.get("avgdl_content").and_then(|v| v.as_f64()),
+                        value.get("avgdl_title").and_then(|v| v.as_f64()),
+                    ) {
+                        let stats = LexicalCorpusStats {
+                            total_docs,
+                            avgdl: FieldAvgdl { content: avgdl_content, title: avgdl_title },
+                        };
+                        if let Ok(mut guard) = cache.lock() {
+                            *guard = Some(stats);
                         }
-                        pending_or_group.push(parts);
-                    } else {
-                        include_groups.push(vec![parts]);
+                        return Ok(stats);
                     }
-                    negated = false;
-                }
-                FsCassQueryToken::Phrase(phrase) => {
-                    let parts = normalize_phrase_terms(&phrase);
-                    if parts.is_empty() {
-                        continue;
-                    }
-                    if negated {
-                        exclude_terms.extend(parts);
-                    } else if in_or_sequence {
-                        if pending_or_group.is_empty() {
-                            let previous = include_groups.pop()?;
-                            pending_or_group.extend(previous);
-                        }
-                        pending_or_group.push(parts);
-                    } else {
-                        include_groups.push(vec![parts]);
-                    }
-                    negated = false;
                 }
             }
         }
 
-        if !pending_or_group.is_empty() {
-            include_groups.push(pending_or_group);
+        let computed = Self::compute_lexical_corpus_stats(conn)?;
+        if let Ok(mut guard) = cache.lock() {
+            *guard = Some(computed);
         }
-
-        for group in &mut include_groups {
-            for alternative in group.iter_mut() {
-                alternative.sort();
-                alternative.dedup();
-            }
-            group.retain(|alternative| !alternative.is_empty());
-            group.sort();
-            group.dedup();
+        if let Some(path) = &cache_path {
+            let payload = serde_json::json!({
+                "total_docs": computed.total_docs,
+                "avgdl_content": computed.avgdl.content,
+                "avgdl_title": computed.avgdl.title,
+            });
+            // Best-effort: a write failure (read-only fs, missing dir) just
+            // means the next process recomputes too -- not a correctness
+            // issue, only a repeated one-time cost.
+            let _ = std::fs::write(path, payload.to_string());
         }
-        include_groups.retain(|group| !group.is_empty());
-        exclude_terms.sort();
-        exclude_terms.dedup();
-        if include_groups.is_empty() {
-            return None;
-        }
-
-        Some(SqliteMessageScanQuery {
-            include_groups,
-            exclude_terms,
-        })
+        Ok(computed)
     }
 
-    fn sqlite_message_scan_score(haystack: &str, scan_query: &SqliteMessageScanQuery) -> f32 {
-        for term in &scan_query.exclude_terms {
-            if haystack.contains(term) {
-                return 0.0;
+    /// Full `lex_docs` scan, keyset-paginated by `doc_id` (avoids a single
+    /// multi-GB `IN (...)`/OFFSET query): tokenizes every row's `content`/
+    /// `title` with the same tantivy-faithful tokenizer the reranker itself
+    /// uses (`lexical_rerank::tokenize`), accumulating per-field token-count
+    /// sums to compute avgdl. Genuinely a full-corpus operation -- there is
+    /// no cheaper exact way to get avgdl in tokens (see design doc ②).
+    fn compute_lexical_corpus_stats(conn: &SendConnection) -> Result<LexicalCorpusStats> {
+        const SCAN_CHUNK: i64 = 20_000;
+        let mut total_docs: u64 = 0;
+        let mut content_token_sum: u64 = 0;
+        let mut title_token_sum: u64 = 0;
+        let mut last_doc_id: i64 = 0;
+        loop {
+            let sql = "SELECT doc_id, content, title FROM lex_docs \
+                        WHERE doc_id > ?1 ORDER BY doc_id LIMIT ?2";
+            let params = [ParamValue::from(last_doc_id), ParamValue::from(SCAN_CHUNK)];
+            let rows: Vec<(i64, String, String)> =
+                franken_query_map_collect_retry(conn, sql, &params, |row| {
+                    Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?))
+                })?;
+            if rows.is_empty() {
+                break;
+            }
+            let fetched = rows.len();
+            for (doc_id, content, title) in rows {
+                total_docs += 1;
+                content_token_sum += lexical_rerank::tokenize(&content).len() as u64;
+                title_token_sum += lexical_rerank::tokenize(&title).len() as u64;
+                last_doc_id = doc_id;
+            }
+            if fetched < SCAN_CHUNK as usize {
+                break;
             }
         }
-
-        let mut score = 0.0f32;
-        for group in &scan_query.include_groups {
-            let mut group_score = 0.0f32;
-            for alternative in group {
-                let mut alternative_score = 0.0f32;
-                for term in alternative {
-                    let matches = haystack.matches(term).count();
-                    if matches < 1 {
-                        alternative_score = 0.0;
-                        break;
-                    }
-                    alternative_score += matches as f32;
-                }
-                group_score = group_score.max(alternative_score);
+        let avgdl = if total_docs > 0 {
+            FieldAvgdl {
+                content: content_token_sum as f64 / total_docs as f64,
+                title: title_token_sum as f64 / total_docs as f64,
             }
-            if group_score <= 0.0 {
-                return 0.0;
-            }
-            score += group_score;
-        }
-        score
-    }
-
-    fn sqlite_message_scan_query_sql(field_mask: FieldMask) -> String {
-        let title_expr = if field_mask.wants_title() {
-            "COALESCE(c.title, '')"
         } else {
-            "''"
+            FieldAvgdl { content: 0.0, title: 0.0 }
         };
-        let content_expr = if field_mask.needs_content() || field_mask.wants_snippet() {
-            "COALESCE(m.content, '')"
-        } else {
-            "''"
-        };
-        let normalized_source_sql =
-            normalized_search_source_id_sql_expr("c.source_id", "s.kind", "c.origin_host");
-
-        format!(
-            "SELECT m.id,
-                    {title_expr},
-                    {content_expr},
-                    COALESCE(a.slug, ''),
-                    COALESCE(w.path, ''),
-                    COALESCE(c.source_path, ''),
-                    CAST(m.created_at AS INTEGER),
-                    m.idx,
-                    c.id,
-                    {normalized_source_sql},
-                    c.origin_host,
-                    s.kind,
-                    COALESCE(m.content, ''),
-                    COALESCE(c.title, '')
-             FROM messages m
-             LEFT JOIN conversations c ON m.conversation_id = c.id
-             LEFT JOIN sources s ON c.source_id = s.id
-             LEFT JOIN agents a ON c.agent_id = a.id
-             LEFT JOIN workspaces w ON c.workspace_id = w.id
-             ORDER BY m.id
-             LIMIT ?"
-        )
+        Ok(LexicalCorpusStats { total_docs, avgdl })
     }
 
-    fn search_sqlite_message_scan(
+    /// W2-5 Task2: term list the BM25F reranker scores against, extracted
+    /// from the same boolean-query tokenizer the rest of this file already
+    /// uses (`fs_cass_parse_boolean_query`). Deliberately drops AND/OR/NOT
+    /// structure -- candidate *membership* is decided by the MATCH/LIKE
+    /// query already run in SQL; the reranker only needs "which terms are
+    /// in play" to score documents that are already known to be candidates
+    /// (design doc ②: "重排层不重新实现布尔逻辑").
+    fn lexical_rerank_query_terms(raw_query: &str) -> Vec<String> {
+        fs_cass_parse_boolean_query(raw_query)
+            .into_iter()
+            .filter_map(|token| match token {
+                FsCassQueryToken::Term(t) => Some(t),
+                FsCassQueryToken::Phrase(p) => Some(p),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// W2-5: the default lexical search path (replaces Tantivy). `fts_lex`'s
+    /// `rowid` is always exactly `messages.id` (schema W2-2: `content_rowid
+    /// = 'doc_id'`, `lex_docs.doc_id REFERENCES messages(id)`), so unlike the
+    /// legacy `fts_messages` fallback this never needs the two-stage
+    /// fts-row-then-message-id lookup, multiple historical shape probes, or
+    /// the bounded source-table scan escape hatch -- `fts_lex`/`lex_docs`
+    /// have exactly one shape and are always in sync with `messages`/
+    /// `conversations` (same-transaction writes since W2-2/W2-3, full
+    /// rebuild in W2-4).
+    fn search_fts_lex_domain(
         &self,
-        conn: &Connection,
-        request: SqliteMessageScanRequest<'_>,
+        raw_query: &str,
+        filters: SearchFilters,
+        limit: usize,
+        offset: usize,
+        field_mask: FieldMask,
     ) -> Result<Vec<SearchHit>> {
-        let Some(scan_query) = Self::sqlite_message_scan_query(request.raw_query) else {
+        if limit < 1 {
+            return Ok(Vec::new());
+        }
+
+        let sqlite_guard = self.sqlite_guard()?;
+        let Some(conn) = sqlite_guard.as_ref() else {
             return Ok(Vec::new());
         };
 
-        let sql = Self::sqlite_message_scan_query_sql(request.field_mask);
-        let params = [ParamValue::from(SQLITE_MESSAGE_SCAN_FALLBACK_LIMIT as i64)];
-        let rows: Vec<(SqliteFtsMessageRow, String, String)> =
-            franken_query_map_collect_retry(conn, &sql, &params, |row| {
-                Ok((
-                    (
+        let empty_params: [ParamValue; 0] = [];
+        let has_fts_lex = franken_query_map_collect_retry(
+            conn,
+            "SELECT 1 FROM sqlite_master WHERE name = 'fts_lex'",
+            &empty_params,
+            |row| row.get_typed::<i64>(0),
+        )
+        .map(|rows| !rows.is_empty())
+        .unwrap_or(false);
+        if !has_fts_lex {
+            return Ok(Vec::new());
+        }
+
+        let query_match_type = dominant_match_type(raw_query);
+        let ku3_like_fallback = is_lexical_ku3_short_query(raw_query)
+            || query_has_short_subterm_after_normalization(raw_query);
+        let cap = no_limit_result_cap();
+
+        // W2-5 Task2: candidate generation is a single unwindowed fetch (up
+        // to the memory-aware safety valve `cap`), not an incremental
+        // "fetch a small ranked page, refetch more if filters thin it out"
+        // loop -- the old loop existed to avoid over-fetching when SQL's
+        // own `ORDER BY bm25()` was trusted to put the best candidates
+        // first. It no longer is (design doc ①): the reranker needs the
+        // (near-)full candidate set to score correctly, so there is
+        // nothing left to page through here -- final windowing happens
+        // once, in Rust, after reranking (see the `skip(offset).take(limit)`
+        // at the bottom).
+        let (candidates_sql, candidates_params) = if ku3_like_fallback {
+            // W2-6 Task戊 (advisor 2026-08-31 ruling: 既有裁定②「通配符剥星号
+            // 降级普通词条」覆盖缺口补全, not a new behavior decision): `*`
+            // has no meaning to SQL `LIKE` -- it is not one of `LIKE`'s own
+            // wildcards (`%`/`_`) -- so a raw query carrying a literal
+            // trailing `*` (e.g. "br-12*") that trips the KU3/short-subterm
+            // fallback would otherwise search for that literal asterisk
+            // character and never match. Strip it the same way the主 MATCH
+            // path already downgrades Suffix/Substring wildcards to a bare
+            // term (see `t.replace('*', "")` above): `LIKE` is already an
+            // unbounded substring match, so dropping `*` here only turns a
+            // "prefix" intent into "substring", a superset that still finds
+            // the same rows. This must not feed back into `ku3_like_fallback`
+            // itself -- that routing decision is already computed above off
+            // the untouched `raw_query` (exec37 案⑦: routing measures
+            // trimmed-length, not the stripped term).
+            let like_term = raw_query.trim().replace('*', "");
+            Self::lex_docs_like_candidates_query(&like_term, cap)
+        } else {
+            let fts_query = match transpile_to_fts5(raw_query) {
+                Some(q) if !q.trim().is_empty() => q,
+                _ => return Ok(Vec::new()),
+            };
+            Self::fts_lex_match_candidates_query(fts_query.as_str(), cap)
+        };
+
+        let candidate_rows: Vec<(i64, f64)> = match franken_query_map_collect_retry(
+            conn,
+            &candidates_sql,
+            &candidates_params,
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+        ) {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    ku3_like_fallback,
+                    "fts_lex candidate query failed"
+                );
+                // R1-B3: an execution failure is not the same fact as "zero
+                // matches" -- silently returning Ok(Vec::new()) made a
+                // broken query indistinguishable from a genuinely empty
+                // result (a false-green search). Propagate honestly, same
+                // doctrine as the marker-state three-way match in
+                // `search()` above.
+                return Err(err).context("fts_lex candidate query failed");
+            }
+        };
+        if candidate_rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Sign-normalize to "higher is better" once, at this boundary, so
+        // everything downstream (the reranker's zero-score tie-break --
+        // design doc ⑤ "边界①" -- and ultimately `SearchHit::score`) shares
+        // one convention: `bm25()` is more-negative-is-better; the LIKE
+        // fallback's occurrence count is already higher-is-better.
+        let legacy_score_by_message_id: HashMap<i64, f64> = candidate_rows
+            .iter()
+            .map(|&(id, raw_score)| {
+                let normalized = if ku3_like_fallback { raw_score } else { -raw_score };
+                (id, normalized)
+            })
+            .collect();
+        let message_ids: Vec<i64> = candidate_rows.iter().map(|(id, _)| *id).collect();
+
+        // Force content/title into the hydrate SQL regardless of the
+        // caller's requested `field_mask` -- the reranker needs real text
+        // to score candidates even when the final `SearchHit` will blank
+        // content/snippet per `field_mask` afterward (unchanged below,
+        // using the caller's original `field_mask`, not this one). All
+        // five columns still come back together in one query because
+        // `sqlite_fts5_message_hydrate_query` is the same hydrate path
+        // every SearchHit-producing branch in this file uses -- agent/
+        // workspace/source_path are needed for the hit itself (and its
+        // existing filters) regardless of what the reranker scores.
+        let hydrate_mask = FieldMask::new(true, true, true, false);
+        let mut metadata_by_message_id = HashMap::with_capacity(message_ids.len());
+        for chunk in message_ids.chunks(SQLITE_FTS5_HYDRATE_PARAM_CHUNK) {
+            let metadata_sql = Self::sqlite_fts5_message_hydrate_query(chunk.len(), hydrate_mask);
+            let metadata_params: Vec<ParamValue> =
+                chunk.iter().map(|id| ParamValue::from(*id)).collect();
+            let rows: Vec<SqliteFtsMessageRow> = match franken_query_map_collect_retry(
+                conn,
+                &metadata_sql,
+                &metadata_params,
+                |row| {
+                    Ok((
                         row.get_typed(0)?,
                         row.get_typed(1)?,
                         row.get_typed(2)?,
@@ -7140,15 +6311,70 @@ impl SearchClient {
                         row.get_typed::<Option<String>>(9)?,
                         row.get_typed(10)?,
                         row.get_typed(11)?,
-                    ),
-                    row.get_typed(12)?,
-                    row.get_typed(13)?,
-                ))
-            })?;
+                    ))
+                },
+            ) {
+                Ok(rows) => rows,
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "fts_lex message hydration query failed"
+                    );
+                    // R1-B3: see the candidate-query site above -- propagate
+                    // rather than mask a real failure as an empty result.
+                    return Err(err).context("fts_lex message hydration query failed");
+                }
+            };
+            metadata_by_message_id.extend(rows.into_iter().map(|row| (row.0, row)));
+        }
 
-        let mut scored_hits = Vec::new();
-        for (
-            (
+        let query_terms = Self::lexical_rerank_query_terms(raw_query);
+        let corpus_stats = match self.lexical_corpus_stats(conn) {
+            Ok(stats) => stats,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "fts_lex corpus stats computation failed"
+                );
+                // R1-B3: see the candidate-query site above -- propagate
+                // rather than mask a real failure as an empty result.
+                return Err(err).context("fts_lex corpus stats computation failed");
+            }
+        };
+
+        let rerank_input: Vec<RerankCandidate> = message_ids
+            .iter()
+            .filter_map(|id| {
+                let meta = metadata_by_message_id.get(id)?;
+                let legacy_score = *legacy_score_by_message_id.get(id)?;
+                Some(RerankCandidate {
+                    doc_id: *id,
+                    content: meta.2.clone(),
+                    title: meta.1.clone(),
+                    legacy_score,
+                    score: 0.0,
+                    // conversation identity for the Task甲 window quota
+                    // (design doc B') -- `meta.8` is `c.id` from the
+                    // hydrate query's `LEFT JOIN conversations c`.
+                    conversation_key: meta.8,
+                })
+            })
+            .collect();
+
+        let ranked = lexical_rerank::rerank_candidates(
+            rerank_input,
+            &query_terms,
+            &corpus_stats.avgdl,
+            corpus_stats.total_docs,
+            *LEXICAL_SESSION_WINDOW_CAP,
+        );
+
+        let mut hits = Vec::with_capacity(ranked.len().min(offset.saturating_add(limit)));
+        for candidate in &ranked {
+            let Some(meta) = metadata_by_message_id.get(&candidate.doc_id) else {
+                continue;
+            };
+            let (
                 _message_id,
                 title,
                 raw_content,
@@ -7161,34 +6387,7 @@ impl SearchClient {
                 raw_source_id,
                 origin_host,
                 raw_origin_kind,
-            ),
-            scan_content,
-            scan_title,
-        ) in rows
-        {
-            let mut haystack = String::with_capacity(
-                scan_content.len()
-                    + scan_title.len()
-                    + agent.len()
-                    + workspace.len()
-                    + source_path.len()
-                    + 4,
-            );
-            haystack.push_str(&scan_content);
-            haystack.push(' ');
-            haystack.push_str(&scan_title);
-            haystack.push(' ');
-            haystack.push_str(&agent);
-            haystack.push(' ');
-            haystack.push_str(&workspace);
-            haystack.push(' ');
-            haystack.push_str(&source_path);
-            let haystack = haystack.to_lowercase();
-            let score = Self::sqlite_message_scan_score(&haystack, &scan_query);
-            if score <= 0.0 {
-                continue;
-            }
-
+            ) = meta.clone();
             let raw_source_id = raw_source_id.unwrap_or_else(default_source_id);
             let source_id = normalized_search_hit_source_id_parts(
                 raw_source_id.as_str(),
@@ -7200,12 +6399,12 @@ impl SearchClient {
             let line_number = idx
                 .and_then(|i| usize::try_from(i).ok())
                 .map(|i| i.saturating_add(1));
-            let snippet = if request.field_mask.wants_snippet() {
-                snippet_from_content(&scan_content)
+            let snippet = if field_mask.wants_snippet() {
+                snippet_from_content(&raw_content)
             } else {
                 String::new()
             };
-            let content = if request.field_mask.needs_content() {
+            let content = if field_mask.needs_content() {
                 raw_content
             } else {
                 String::new()
@@ -7222,426 +6421,24 @@ impl SearchClient {
                 content,
                 content_hash,
                 conversation_id,
-                score,
+                score: candidate.score as f32,
                 source_path,
                 agent,
                 workspace,
                 workspace_original: None,
                 created_at,
                 line_number,
-                match_type: request.query_match_type,
+                match_type: query_match_type,
                 source_id,
                 origin_kind,
                 origin_host,
             };
-
-            if Self::sqlite_fts5_hit_matches_filters(&hit, request.filters) {
-                scored_hits.push(hit);
+            if Self::sqlite_fts5_hit_matches_filters(&hit, &filters) {
+                hits.push(hit);
             }
         }
 
-        scored_hits.sort_by(|left, right| {
-            right
-                .score
-                .partial_cmp(&left.score)
-                .unwrap_or(CmpOrdering::Equal)
-        });
-
-        Ok(scored_hits
-            .into_iter()
-            .skip(request.offset)
-            .take(request.limit)
-            .collect())
-    }
-
-    fn search_sqlite_fts5(
-        &self,
-        _db_path: &Path,
-        raw_query: &str,
-        filters: SearchFilters,
-        limit: usize,
-        offset: usize,
-        field_mask: FieldMask,
-    ) -> Result<Vec<SearchHit>> {
-        if limit < 1 {
-            return Ok(Vec::new());
-        }
-
-        let fts_query = match transpile_to_fts5(raw_query) {
-            Some(q) if !q.trim().is_empty() => q,
-            _ => return Ok(Vec::new()),
-        };
-
-        let sqlite_guard = self.sqlite_guard()?;
-        let Some(conn) = sqlite_guard.as_ref() else {
-            return Ok(Vec::new());
-        };
-
-        let empty_params: [ParamValue; 0] = [];
-        let has_fts = franken_query_map_collect_retry(
-            conn,
-            "SELECT 1 FROM sqlite_master WHERE name = 'fts_messages'",
-            &empty_params,
-            |row| row.get_typed::<i64>(0),
-        )
-        .map(|rows| !rows.is_empty())
-        .unwrap_or(false);
-        if !has_fts {
-            return Ok(Vec::new());
-        }
-
-        let query_match_type = dominant_match_type(raw_query);
-        let scan_request = SqliteMessageScanRequest {
-            raw_query,
-            filters: &filters,
-            limit,
-            offset,
-            field_mask,
-            query_match_type,
-        };
-        if let Err(err) =
-            crate::storage::sqlite::validate_fts_messages_integrity_for_connection(conn)
-        {
-            tracing::warn!(
-                error = %err,
-                "sqlite FTS fallback integrity check failed; using source-table scan fallback"
-            );
-            return self.search_sqlite_message_scan(conn, scan_request);
-        }
-        let uses_message_id =
-            if let Ok(uses_message_id) = Self::sqlite_fts_uses_message_id_column(conn) {
-                uses_message_id
-            } else {
-                tracing::warn!(
-                    "sqlite FTS fallback is present but not queryable; skipping fallback search"
-                );
-                return self.search_sqlite_message_scan(conn, scan_request);
-            };
-        let match_mode = match Self::sqlite_fts_match_mode(conn) {
-            Ok(match_mode) => match_mode,
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    "sqlite FTS fallback is present but not queryable; skipping fallback search"
-                );
-                return self.search_sqlite_message_scan(conn, scan_request);
-            }
-        };
-        if !Self::sqlite_fts5_rowid_projection_available(conn) {
-            tracing::warn!(
-                "sqlite FTS fallback cannot project rowid through the legacy embedded engine; using source-table scan fallback"
-            );
-            return self.search_sqlite_message_scan(conn, scan_request);
-        }
-
-        let post_filter = Self::sqlite_fts5_filters_need_post_hydration(&filters);
-        let target_hits = if post_filter {
-            offset.saturating_add(limit)
-        } else {
-            limit
-        };
-        let rank_batch_limit = if post_filter {
-            target_hits.clamp(1, SQLITE_FTS5_POST_FILTER_SCAN_CHUNK)
-        } else {
-            limit
-        };
-        let mut rank_offset = if post_filter { 0 } else { offset };
-        let mut scanned_rows = 0usize;
-        let mut hits = Vec::with_capacity(target_hits.min(rank_batch_limit));
-
-        loop {
-            let (rank_sql, rank_params) = Self::sqlite_fts5_rank_query(
-                fts_query.as_str(),
-                &filters,
-                rank_batch_limit,
-                rank_offset,
-                uses_message_id,
-                match_mode,
-            );
-            let ranked_rows: Vec<(i64, f64)> =
-                match franken_query_map_collect_retry(conn, &rank_sql, &rank_params, |row| {
-                    Ok((row.get_typed(0)?, row.get_typed(1)?))
-                }) {
-                    Ok(rows) => rows,
-                    Err(err) => {
-                        tracing::warn!(
-                            error = %err,
-                            "sqlite FTS fallback rank query failed; returning no fallback hits"
-                        );
-                        return self.search_sqlite_message_scan(conn, scan_request);
-                    }
-                };
-            if ranked_rows.is_empty() {
-                break;
-            }
-
-            scanned_rows = scanned_rows.saturating_add(ranked_rows.len());
-            let bm25_by_rowid: HashMap<i64, f64> = ranked_rows.iter().copied().collect();
-            let mut fts_rows_by_rowid = HashMap::with_capacity(ranked_rows.len());
-            let mut message_ids = Vec::with_capacity(ranked_rows.len());
-            let mut seen_message_ids = HashSet::with_capacity(ranked_rows.len());
-
-            for rank_chunk in Self::sqlite_fts5_hydrate_row_chunks(&ranked_rows) {
-                let hydrate_sql =
-                    Self::sqlite_fts5_hydrate_query(rank_chunk.len(), field_mask, uses_message_id);
-                let hydrate_params = rank_chunk
-                    .iter()
-                    .map(|(fts_rowid, _)| ParamValue::from(*fts_rowid))
-                    .collect::<Vec<_>>();
-                let rows: Vec<SqliteFtsHydratedRow> = match franken_query_map_collect_retry(
-                    conn,
-                    &hydrate_sql,
-                    &hydrate_params,
-                    |row| {
-                        Ok((
-                            row.get_typed(0)?,
-                            row.get_typed(1)?,
-                            row.get_typed(2)?,
-                            row.get_typed(3)?,
-                            row.get_typed(4)?,
-                            row.get_typed(5)?,
-                            row.get_typed(6)?,
-                            row.get_typed(7)?,
-                        ))
-                    },
-                ) {
-                    Ok(rows) => rows,
-                    Err(err) => {
-                        tracing::warn!(
-                            error = %err,
-                            "sqlite FTS fallback rowid hydration query failed; returning no fallback hits"
-                        );
-                        return self.search_sqlite_message_scan(conn, scan_request);
-                    }
-                };
-
-                for row in rows {
-                    let fts_rowid = row.0;
-                    let message_id = row.1.unwrap_or(fts_rowid);
-                    if seen_message_ids.insert(message_id) {
-                        message_ids.push(message_id);
-                    }
-                    fts_rows_by_rowid.insert(fts_rowid, row);
-                }
-            }
-
-            let mut metadata_by_message_id = HashMap::with_capacity(message_ids.len());
-            for message_chunk in message_ids.chunks(SQLITE_FTS5_HYDRATE_PARAM_CHUNK) {
-                let metadata_sql =
-                    Self::sqlite_fts5_message_hydrate_query(message_chunk.len(), field_mask);
-                let metadata_params = message_chunk
-                    .iter()
-                    .map(|message_id| ParamValue::from(*message_id))
-                    .collect::<Vec<_>>();
-                let metadata_rows: Vec<SqliteFtsMessageRow> = match franken_query_map_collect_retry(
-                    conn,
-                    &metadata_sql,
-                    &metadata_params,
-                    |row| {
-                        Ok((
-                            row.get_typed(0)?,
-                            row.get_typed(1)?,
-                            row.get_typed(2)?,
-                            row.get_typed(3)?,
-                            row.get_typed(4)?,
-                            row.get_typed(5)?,
-                            row.get_typed(6)?,
-                            row.get_typed(7)?,
-                            row.get_typed(8)?,
-                            row.get_typed::<Option<String>>(9)?,
-                            row.get_typed(10)?,
-                            row.get_typed(11)?,
-                        ))
-                    },
-                ) {
-                    Ok(rows) => rows,
-                    Err(err) => {
-                        tracing::warn!(
-                            error = %err,
-                            "sqlite FTS fallback message hydration query failed; returning no fallback hits"
-                        );
-                        return self.search_sqlite_message_scan(conn, scan_request);
-                    }
-                };
-                metadata_by_message_id.extend(metadata_rows.into_iter().map(|row| (row.0, row)));
-            }
-
-            let mut hits_by_rowid = HashMap::with_capacity(ranked_rows.len());
-            for (
-                fts_rowid,
-                fts_message_id,
-                fts_title,
-                fts_content,
-                fts_agent,
-                fts_workspace,
-                fts_source_path,
-                fts_created_at,
-            ) in fts_rows_by_rowid.into_values()
-            {
-                let Some(&bm25_score) = bm25_by_rowid.get(&fts_rowid) else {
-                    continue;
-                };
-                let message_id = fts_message_id.unwrap_or(fts_rowid);
-                let (
-                    title,
-                    raw_content,
-                    agent,
-                    workspace,
-                    source_path,
-                    created_at,
-                    idx,
-                    conversation_id,
-                    raw_source_id,
-                    origin_host,
-                    raw_origin_kind,
-                ) = match metadata_by_message_id.remove(&message_id) {
-                    Some((
-                        _,
-                        metadata_title,
-                        metadata_content,
-                        metadata_agent,
-                        metadata_workspace,
-                        metadata_source_path,
-                        metadata_created_at,
-                        metadata_idx,
-                        metadata_conversation_id,
-                        metadata_raw_source_id,
-                        metadata_origin_host,
-                        metadata_raw_origin_kind,
-                    )) => (
-                        if metadata_title.is_empty() {
-                            fts_title.unwrap_or_default()
-                        } else {
-                            metadata_title
-                        },
-                        if metadata_content.is_empty() {
-                            fts_content.unwrap_or_default()
-                        } else {
-                            metadata_content
-                        },
-                        if metadata_agent.is_empty() {
-                            fts_agent.unwrap_or_default()
-                        } else {
-                            metadata_agent
-                        },
-                        if metadata_workspace.is_empty() {
-                            fts_workspace.unwrap_or_default()
-                        } else {
-                            metadata_workspace
-                        },
-                        if metadata_source_path.is_empty() {
-                            fts_source_path.unwrap_or_default()
-                        } else {
-                            metadata_source_path
-                        },
-                        metadata_created_at.or(fts_created_at),
-                        metadata_idx,
-                        metadata_conversation_id,
-                        metadata_raw_source_id.unwrap_or_else(default_source_id),
-                        metadata_origin_host,
-                        metadata_raw_origin_kind,
-                    ),
-                    None => (
-                        fts_title.unwrap_or_default(),
-                        fts_content.unwrap_or_default(),
-                        fts_agent.unwrap_or_default(),
-                        fts_workspace.unwrap_or_default(),
-                        fts_source_path.unwrap_or_default(),
-                        fts_created_at,
-                        None,
-                        None,
-                        default_source_id(),
-                        None,
-                        None,
-                    ),
-                };
-
-                let source_id = normalized_search_hit_source_id_parts(
-                    raw_source_id.as_str(),
-                    raw_origin_kind.as_deref().unwrap_or_default(),
-                    origin_host.as_deref(),
-                );
-                let origin_kind = normalized_search_hit_origin_kind(
-                    source_id.as_str(),
-                    raw_origin_kind.as_deref(),
-                );
-                let line_number = idx
-                    .and_then(|i| usize::try_from(i).ok())
-                    .map(|i| i.saturating_add(1));
-                let snippet = if field_mask.wants_snippet() {
-                    snippet_from_content(&raw_content)
-                } else {
-                    String::new()
-                };
-                let content = if field_mask.needs_content() {
-                    raw_content
-                } else {
-                    String::new()
-                };
-                let content_hash = if content.is_empty() {
-                    stable_hit_hash(&snippet, &source_path, line_number, created_at)
-                } else {
-                    stable_hit_hash(&content, &source_path, line_number, created_at)
-                };
-
-                let hit = SearchHit {
-                    title,
-                    snippet,
-                    content,
-                    content_hash,
-                    conversation_id,
-                    score: (-bm25_score) as f32,
-                    source_path,
-                    agent,
-                    workspace,
-                    workspace_original: None,
-                    created_at,
-                    line_number,
-                    match_type: query_match_type,
-                    source_id,
-                    origin_kind,
-                    origin_host,
-                };
-                hits_by_rowid.insert(fts_rowid, hit);
-            }
-
-            for (fts_rowid, _) in &ranked_rows {
-                if let Some(hit) = hits_by_rowid.remove(fts_rowid)
-                    && Self::sqlite_fts5_hit_matches_filters(&hit, &filters)
-                {
-                    hits.push(hit);
-                    if hits.len() >= target_hits {
-                        break;
-                    }
-                }
-            }
-
-            if hits.len() >= target_hits
-                || !post_filter
-                || ranked_rows.len() < rank_batch_limit
-                || scanned_rows >= SQLITE_FTS5_POST_FILTER_SCAN_LIMIT
-            {
-                break;
-            }
-            rank_offset = rank_offset.saturating_add(ranked_rows.len());
-        }
-
-        if post_filter {
-            let hits = hits
-                .into_iter()
-                .skip(offset)
-                .take(limit)
-                .collect::<Vec<_>>();
-            if hits.is_empty() {
-                self.search_sqlite_message_scan(conn, scan_request)
-            } else {
-                Ok(hits)
-            }
-        } else if hits.is_empty() {
-            self.search_sqlite_message_scan(conn, scan_request)
-        } else {
-            Ok(hits)
-        }
+        Ok(hits.into_iter().skip(offset).take(limit).collect())
     }
 
     /// Browse messages ordered by date, without any text query.
@@ -7895,30 +6692,67 @@ fn transpile_to_fts5(raw_query: &str) -> Option<String> {
             }
             FsCassQueryToken::Term(t) => {
                 let raw_pattern = FsCassWildcardPattern::parse(&t);
-                if matches!(
-                    raw_pattern,
-                    FsCassWildcardPattern::Suffix(_)
-                        | FsCassWildcardPattern::Substring(_)
-                        | FsCassWildcardPattern::Complex(_)
-                ) {
+                if matches!(raw_pattern, FsCassWildcardPattern::Complex(_)) {
                     return None;
                 }
 
+                // W2-6 exec36 Task甲4-② (Ivan 2026-08-31 ruling, 降级为普通
+                // 词条): a suffix/substring wildcard term downgrades to its
+                // bare core by stripping every `*` before normalization --
+                // `fts_lex`'s trigram tokenizer already substring-matches
+                // any plain term (probe-verified), so this is
+                // near-equivalent to true suffix/substring matching without
+                // a dedicated LIKE+regex post-filter path. `raw_query`
+                // itself (unmodified) still drives `dominant_match_type`
+                // below, so hits are honestly still labeled
+                // Suffix/Substring even though execution is now a plain
+                // term query.
+                let t_for_normalize = if matches!(
+                    raw_pattern,
+                    FsCassWildcardPattern::Suffix(_) | FsCassWildcardPattern::Substring(_)
+                ) {
+                    t.replace('*', "")
+                } else {
+                    t.clone()
+                };
+
                 // Sanitize and normalize. FTS5 implicitly ANDs words in a string,
                 // but we split punctuation into porter-aligned fragments first so
-                // fallback queries match SQLite tokenization.
-                let term_parts = normalize_term_parts(&t);
+                // fallback queries match SQLite tokenization. W2-6 exec36 Task甲4-④
+                // (Ivan 2026-08-31 ruling): `normalize_term_parts` keeps an
+                // *internal* hyphen inside its fragment (does not split on it)
+                // -- see that function's own comment -- so "br-123.jsonl"
+                // yields `["br-123", "jsonl"]`, not three separate words.
+                let term_parts = normalize_term_parts(&t_for_normalize);
                 if term_parts.is_empty() {
                     continue;
                 }
 
                 let mut rendered_parts = Vec::with_capacity(term_parts.len());
                 for part in &term_parts {
-                    rendered_parts.push(render_fts5_term_part(part)?);
+                    // W2-6 exec36 Task甲4-④ (Ivan 2026-08-31 ruling, 授权
+                    // 实施): a hyphenated compound fragment (`foo-bar`,
+                    // internal hyphen, alphanumeric on both sides) is
+                    // rendered as ONE quoted FTS5 phrase instead of being
+                    // spliced bare into the MATCH string -- an unquoted
+                    // hyphen is FTS5's own NOT operator and errors, and
+                    // splitting it into `(foo AND bar)` contradicts
+                    // `fs_cass_sanitize_query`'s own documented design
+                    // (hyphens preserved as compound-word glue). Probe-
+                    // verified: `fts_lex`'s trigram tokenizer content side
+                    // is fine with hyphens (a quoted MATCH phrase
+                    // `"foo-bar"` correctly finds "CMA-ES"-style compound
+                    // content and correctly does NOT match "foo bar baz");
+                    // the bug was query-side splitting, not the index.
+                    if is_hyphenated_compound_term(part) {
+                        rendered_parts.push(format!("\"{part}\""));
+                    } else {
+                        rendered_parts.push(render_fts5_term_part(part)?);
+                    }
                 }
 
                 // If multiple parts, wrap in parens and join with AND so a
-                // punctuated term like `foo-bar` becomes `(foo AND bar)`.
+                // punctuated term like `foo.bar` becomes `(foo AND bar)`.
                 let fts_term = if rendered_parts.len() > 1 {
                     format!("({})", rendered_parts.join(" AND "))
                 } else {
@@ -8023,13 +6857,6 @@ impl Metrics {
     fn inc_cache_shortfall(&self) {
         self.cache_shortfall.fetch_add(1, Ordering::Relaxed);
     }
-    fn inc_prewarm_scheduled(&self) {
-        self.prewarm_scheduled.fetch_add(1, Ordering::Relaxed);
-    }
-    fn inc_prewarm_skipped_pressure(&self) {
-        self.prewarm_skipped_pressure
-            .fetch_add(1, Ordering::Relaxed);
-    }
     fn inc_reload(&self) {
         self.reloads.fetch_add(1, Ordering::Relaxed);
     }
@@ -8067,73 +6894,6 @@ impl Metrics {
         self.prewarm_scheduled.store(0, Ordering::Relaxed);
         self.prewarm_skipped_pressure.store(0, Ordering::Relaxed);
     }
-}
-
-fn maybe_spawn_warm_worker(
-    reader: IndexReader,
-    fields: FsCassFields,
-    reload_epoch: Arc<AtomicU64>,
-    metrics: Metrics,
-) -> Option<(mpsc::Sender<WarmJob>, std::thread::JoinHandle<()>)> {
-    let (tx, rx) = mpsc::unbounded::<WarmJob>();
-    let handle = std::thread::Builder::new()
-        .name("cass-warm-worker".into())
-        .spawn(move || {
-            // Simple debounce: process at most one warmup every WARM_DEBOUNCE_MS.
-            let mut last_run = Instant::now();
-            while let Ok(job) = rx.recv() {
-                let now = Instant::now();
-                if now.duration_since(last_run) < Duration::from_millis(*WARM_DEBOUNCE_MS) {
-                    continue;
-                }
-                last_run = now;
-                let reload_started = Instant::now();
-                if let Err(err) = reader.reload() {
-                    tracing::warn!(error = ?err, "warm_worker_reload_failed");
-                    continue;
-                }
-                let elapsed = reload_started.elapsed();
-                let epoch = reload_epoch.fetch_add(1, Ordering::SeqCst) + 1;
-                metrics.record_reload(elapsed);
-                tracing::debug!(
-                    duration_ms = elapsed.as_millis() as u64,
-                    reload_epoch = epoch,
-                    filters = %job.filters_fingerprint,
-                    shard = %job.shard_name,
-                    "warm_worker_reload"
-                );
-                // Run a tiny warm search to prefill OS cache and hit the Tantivy reader
-                // without allocating full result sets. Limit 1 doc.
-                let searcher = reader.searcher();
-                let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-                for term_str in job.query.split_whitespace() {
-                    let term_lower = term_str.to_lowercase();
-                    let term_shoulds: Vec<(Occur, Box<dyn Query>)> = vec![
-                        (
-                            Occur::Should,
-                            Box::new(TermQuery::new(
-                                Term::from_field_text(fields.title, &term_lower),
-                                IndexRecordOption::WithFreqsAndPositions,
-                            )),
-                        ),
-                        (
-                            Occur::Should,
-                            Box::new(TermQuery::new(
-                                Term::from_field_text(fields.content, &term_lower),
-                                IndexRecordOption::WithFreqsAndPositions,
-                            )),
-                        ),
-                    ];
-                    clauses.push((Occur::Must, Box::new(BooleanQuery::new(term_shoulds))));
-                }
-                if !clauses.is_empty() {
-                    let q: Box<dyn Query> = Box::new(BooleanQuery::new(clauses));
-                    let _ = searcher.search(&q, &TopDocs::with_limit(1).order_by_score());
-                }
-            }
-        })
-        .ok()?;
-    Some((tx, handle))
 }
 
 fn cached_hit_from(hit: &SearchHit) -> CachedHit {
@@ -8298,85 +7058,6 @@ fn hit_matches_query_cached(hit: &CachedHit, query: &str) -> bool {
     hit_matches_query_cached_precomputed(hit, &terms)
 }
 
-fn is_prefix_only(query: &str) -> bool {
-    let tokens: Vec<&str> = query.split_whitespace().collect();
-    // Only strictly optimize single-term prefix queries.
-    // Multi-term queries benefit from Tantivy's snippet generation (highlighting both terms).
-    if tokens.len() != 1 {
-        return false;
-    }
-    tokens[0].chars().all(char::is_alphanumeric)
-}
-
-fn quick_prefix_snippet(content: &str, query: &str, max_chars: usize) -> String {
-    // Handle empty query case first
-    if query.is_empty() {
-        let mut chars = content.chars();
-        let snippet: String = chars.by_ref().take(max_chars).collect();
-        return if chars.next().is_some() {
-            format!("{snippet}…")
-        } else {
-            snippet
-        };
-    }
-
-    let lc_content = content.to_lowercase();
-    let lc_query = query.to_lowercase();
-
-    if let Some(pos) = lc_content.find(&lc_query) {
-        // Convert byte index in the lowercased string to a character index.
-        let match_start_char_idx = lc_content[..pos].chars().count();
-        let query_char_len = lc_query.chars().count();
-
-        // Determine where to start the snippet (aim for 15 chars before match)
-        let start_char = match_start_char_idx.saturating_sub(15);
-        let mut chars_iter = content.chars().skip(start_char);
-        let mut snippet = String::new();
-        let mut chars_taken = 0;
-        let mut current_idx = start_char;
-
-        while chars_taken < max_chars {
-            if current_idx == match_start_char_idx {
-                snippet.push_str("**");
-                for _ in 0..query_char_len {
-                    if let Some(ch) = chars_iter.next() {
-                        snippet.push(ch);
-                        chars_taken += 1;
-                        current_idx += 1;
-                    }
-                }
-                snippet.push_str("**");
-                if chars_taken >= max_chars {
-                    break;
-                }
-                continue;
-            }
-
-            if let Some(ch) = chars_iter.next() {
-                snippet.push(ch);
-                chars_taken += 1;
-                current_idx += 1;
-            } else {
-                break;
-            }
-        }
-
-        if chars_iter.next().is_some() {
-            format!("{snippet}…")
-        } else {
-            snippet
-        }
-    } else {
-        let mut chars = content.chars();
-        let snippet: String = chars.by_ref().take(max_chars).collect();
-        if chars.next().is_some() {
-            format!("{snippet}…")
-        } else {
-            snippet
-        }
-    }
-}
-
 fn cached_prefix_snippet(content: &str, query: &str, max_chars: usize) -> Option<String> {
     if query.trim().is_empty() {
         return None;
@@ -8469,50 +7150,32 @@ fn filters_fingerprint(filters: &SearchFilters) -> String {
 }
 
 impl SearchClient {
-    /// Return the total number of indexed Tantivy documents.
+    /// Return the total number of indexed `lex_docs` rows (W2-6 Task2:
+    /// FTS5-domain replacement for the old Tantivy segment doc count).
     pub fn total_docs(&self) -> usize {
-        if let Some((reader, _)) = &self.reader {
-            return reader.searcher().num_docs() as usize;
-        }
-        self.federated_readers()
-            .map(|readers| {
-                readers
-                    .iter()
-                    .map(|shard| shard.reader.searcher().num_docs() as usize)
-                    .sum()
-            })
-            .unwrap_or(0)
+        let Ok(sqlite_guard) = self.sqlite_guard() else {
+            return 0;
+        };
+        let Some(conn) = sqlite_guard.as_ref() else {
+            return 0;
+        };
+        let empty_params: [ParamValue; 0] = [];
+        franken_query_map_collect_retry(
+            conn,
+            "SELECT COUNT(*) FROM lex_docs",
+            &empty_params,
+            |row| row.get_typed::<i64>(0),
+        )
+        .ok()
+        .and_then(|rows| rows.into_iter().next())
+        .map(|count| count.max(0) as usize)
+        .unwrap_or(0)
     }
 
-    /// Returns `true` if the Tantivy search index is available.
-    pub fn has_tantivy(&self) -> bool {
-        self.reader.is_some() || self.federated_readers().is_some()
-    }
-
-    fn maybe_reload_reader(&self, reader: &IndexReader) -> Result<()> {
-        if !self.reload_on_search {
-            return Ok(());
-        }
-        const MIN_RELOAD_INTERVAL: Duration = Duration::from_millis(300);
-        let now = Instant::now();
-        let mut guard = self.last_reload.lock().unwrap_or_else(|e| e.into_inner());
-        if guard
-            .map(|t| now.duration_since(t) >= MIN_RELOAD_INTERVAL)
-            .unwrap_or(true)
-        {
-            let reload_started = Instant::now();
-            reader.reload()?;
-            let elapsed = reload_started.elapsed();
-            *guard = Some(now);
-            let epoch = self.reload_epoch.fetch_add(1, Ordering::SeqCst) + 1;
-            self.metrics.record_reload(elapsed);
-            tracing::debug!(
-                duration_ms = elapsed.as_millis() as u64,
-                reload_epoch = epoch,
-                "tantivy_reader_reload"
-            );
-        }
-        Ok(())
+    /// Returns `true` if the `fts_lex` (SQLite FTS5) lexical index has
+    /// content (W2-6 Task2: renamed from the pre-migration `has_tantivy`).
+    pub fn has_lexical_index(&self) -> bool {
+        self.has_populated_fts_lex()
     }
 
     fn maybe_log_cache_metrics(&self, event: &str) {
@@ -8576,72 +7239,6 @@ impl SearchClient {
             "global".into()
         }
     }
-    fn cached_prefix_key_exists_in_shard(
-        &self,
-        shard: &LruCache<Arc<str>, Vec<CachedHit>>,
-        query: &str,
-        filters: &SearchFilters,
-    ) -> bool {
-        let mut byte_indices: Vec<usize> = query.char_indices().map(|(i, _)| i).collect();
-        byte_indices.push(query.len());
-        let query_len = query.len();
-        for &end in byte_indices.iter().rev() {
-            if end == 0 || end == query_len {
-                continue;
-            }
-            let key = self.cache_key(&query[..end], filters);
-            if shard.contains(&key) {
-                return true;
-            }
-        }
-        false
-    }
-
-    fn maybe_schedule_adaptive_query_prewarm(&self, query: &str, filters: &SearchFilters) {
-        if query.is_empty() {
-            return;
-        }
-        let Some(tx) = &self.warm_tx else {
-            return;
-        };
-
-        let shard_name = self.shard_name(filters);
-        let decision = match self.prefix_cache.lock() {
-            Ok(cache) => {
-                let hot_prefix = cache.shard_opt(&shard_name).is_some_and(|shard| {
-                    self.cached_prefix_key_exists_in_shard(shard, query, filters)
-                });
-                if !hot_prefix {
-                    AdaptivePrewarmDecision::SkipCold
-                } else if cache.prewarm_pressure() {
-                    AdaptivePrewarmDecision::SkipPressure
-                } else {
-                    AdaptivePrewarmDecision::Schedule
-                }
-            }
-            Err(_) => return,
-        };
-
-        if decision == AdaptivePrewarmDecision::SkipPressure {
-            self.metrics.inc_prewarm_skipped_pressure();
-            return;
-        }
-        if decision == AdaptivePrewarmDecision::SkipCold {
-            return;
-        }
-
-        if tx
-            .send(WarmJob {
-                query: query.to_string(),
-                filters_fingerprint: filters_fingerprint(filters),
-                shard_name,
-            })
-            .is_ok()
-        {
-            self.metrics.inc_prewarm_scheduled();
-        }
-    }
-
     fn cached_prefix_hits(&self, query: &str, filters: &SearchFilters) -> Option<Vec<CachedHit>> {
         if query.is_empty() {
             return None;
@@ -8680,7 +7277,11 @@ impl SearchClient {
     pub fn cache_stats(&self) -> CacheStats {
         let (hits, miss, shortfall, reloads, reload_ms_total) = self.metrics.snapshot_all();
         let (prewarm_scheduled, prewarm_skipped_pressure) = self.metrics.snapshot_prewarm();
-        let reader_generation = self.last_generation.lock().ok().and_then(|guard| *guard);
+        // W2-6 Task2: no more Tantivy reader generation to track; kept as a
+        // permanent `None` for JSON output-shape stability (control-plane
+        // ruling: don't touch the documented `cass search --output json`
+        // schema as a side effect of this deletion).
+        let reader_generation: Option<u64> = None;
         let (
             total_cap,
             total_cost,
@@ -8730,7 +7331,6 @@ mod tests {
     use super::*;
     use crate::connectors::{NormalizedConversation, NormalizedMessage, NormalizedSnippet};
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
-    use crate::search::tantivy::TantivyIndex;
     use crate::storage::api::Profile;
     use crate::storage::sqlite::FrankenStorage;
     use serde_json::json;
@@ -9068,12 +7668,6 @@ mod tests {
         source_paths: Vec<String>,
     }
 
-    struct ProgressiveHybridFixture {
-        _dir: TempDir,
-        client: Arc<SearchClient>,
-        query: String,
-    }
-
     /// Builds a minimal SearchHit that a `--fields minimal` / `--fields
     /// summary` projection would produce: the real metadata is intact, but
     /// `content` and `snippet` have been scrubbed to empty strings by the
@@ -9308,10 +7902,10 @@ mod tests {
     #[test]
     fn quality_mode_does_not_reuse_fast_only_two_tier_cache() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
-        index.commit()?;
+        let db_path = dir.path().join("placeholder.db");
+        std::fs::write(&db_path, b"")?;
 
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
         let embedder = Arc::new(crate::search::hash_embedder::HashEmbedder::new(256));
         let fast_path = dir.path().join(format!("index-{}.fsvi", embedder.id()));
         let writer = VectorIndex::create_with_revision(
@@ -9356,10 +7950,10 @@ mod tests {
     #[test]
     fn failed_quality_probe_does_not_block_fast_only_two_tier_load() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
-        index.commit()?;
+        let db_path = dir.path().join("placeholder.db");
+        std::fs::write(&db_path, b"")?;
 
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
         let embedder = Arc::new(crate::search::hash_embedder::HashEmbedder::new(256));
         let fast_path = dir.path().join(format!("index-{}.fsvi", embedder.id()));
         let writer = VectorIndex::create_with_revision(
@@ -9405,10 +7999,10 @@ mod tests {
     #[test]
     fn progressive_context_error_does_not_poison_future_attempts() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
-        index.commit()?;
+        let db_path = dir.path().join("placeholder.db");
+        std::fs::write(&db_path, b"")?;
 
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
         let embedder = Arc::new(crate::search::hash_embedder::HashEmbedder::new(256));
         let fast_path = dir.path().join(format!("index-{}.fsvi", embedder.id()));
         let writer = VectorIndex::create_with_revision(
@@ -9616,236 +8210,6 @@ mod tests {
         })
     }
 
-    fn build_progressive_hybrid_fixture() -> Result<ProgressiveHybridFixture> {
-        let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
-        let workspace_path = dir.path().join("workspace");
-        std::fs::create_dir_all(&workspace_path)?;
-        let agent_id = 1_i64;
-        let workspace_id = 1_i64;
-        let source_id = crate::sources::provenance::LOCAL_SOURCE_ID;
-        let source_hash = crc32fast::hash(source_id.as_bytes());
-        let conn = Connection::open_memory()?;
-        conn.execute_batch(
-            r#"
-            CREATE TABLE agents (
-                id INTEGER PRIMARY KEY,
-                slug TEXT NOT NULL
-            );
-            CREATE TABLE workspaces (
-                id INTEGER PRIMARY KEY,
-                path TEXT NOT NULL
-            );
-            CREATE TABLE sources (
-                id TEXT PRIMARY KEY,
-                kind TEXT NOT NULL
-            );
-            CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                agent_id INTEGER NOT NULL,
-                workspace_id INTEGER,
-                title TEXT,
-                source_path TEXT NOT NULL,
-                source_id TEXT NOT NULL,
-                origin_host TEXT,
-                started_at INTEGER
-            );
-            CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER NOT NULL,
-                idx INTEGER NOT NULL,
-                role TEXT NOT NULL,
-                created_at INTEGER,
-                content TEXT NOT NULL
-            );
-            "#,
-        )?;
-        conn.execute(
-            "INSERT INTO agents (id, slug) VALUES (?1, ?2)",
-            fparams![agent_id, "codex"],
-        )?;
-        conn.execute(
-            "INSERT INTO workspaces (id, path) VALUES (?1, ?2)",
-            fparams![workspace_id, workspace_path.to_string_lossy().to_string()],
-        )?;
-        conn.execute(
-            "INSERT INTO sources (id, kind) VALUES (?1, ?2)",
-            fparams![source_id, "local"],
-        )?;
-
-        let query = "oauth refresh token middleware session cache".to_string();
-        let filler = " context window ranking provenance semantic upgrade lexical overlay";
-        let base_ts = 1_700_000_100_000_i64;
-        let doc_count = 64usize;
-        let mut message_rows = Vec::with_capacity(doc_count);
-
-        for idx in 0..doc_count {
-            let conversation_id = i64::try_from(idx + 1)?;
-            let message_id = u64::try_from(idx + 1)?;
-            let source_path = dir.path().join(format!("progressive-{idx:03}.jsonl"));
-            let repeated = filler.repeat(48);
-            let content = if idx % 4 == 0 {
-                format!(
-                    "{query} hot path candidate {idx} with detailed search diagnostics.{repeated}"
-                )
-            } else if idx % 4 == 1 {
-                format!(
-                    "search pipeline benchmark {idx} with lexical overlay and semantic ranking.{repeated}"
-                )
-            } else if idx % 4 == 2 {
-                format!(
-                    "interactive typing debounce benchmark {idx} for hybrid two tier search.{repeated}"
-                )
-            } else {
-                format!(
-                    "unrelated background chatter {idx} about build systems and formatting checks.{repeated}"
-                )
-            };
-            let created_at = base_ts + idx as i64;
-            let source_path_str = source_path.to_string_lossy().to_string();
-            let title = format!("progressive fixture {idx}");
-
-            conn.execute(
-                "INSERT INTO conversations (
-                    id, agent_id, workspace_id, title, source_path, source_id, origin_host, started_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)",
-                fparams![
-                    conversation_id,
-                    agent_id,
-                    workspace_id,
-                    title,
-                    source_path_str.clone(),
-                    source_id,
-                    created_at
-                ],
-            )?;
-            conn.execute(
-                "INSERT INTO messages (
-                    id, conversation_id, idx, role, created_at, content
-                 ) VALUES (?1, ?2, 0, 'user', ?3, ?4)",
-                fparams![
-                    i64::try_from(message_id)?,
-                    conversation_id,
-                    created_at,
-                    content.clone()
-                ],
-            )?;
-            message_rows.push((message_id, created_at, content.clone()));
-
-            let normalized = NormalizedConversation {
-                agent_slug: "codex".into(),
-                external_id: Some(format!("progressive-{idx}")),
-                title: Some(format!("progressive fixture {idx}")),
-                workspace: Some(workspace_path.clone()),
-                source_path,
-                started_at: Some(created_at),
-                ended_at: Some(created_at),
-                metadata: json!({}),
-                messages: vec![NormalizedMessage {
-                    idx: 0,
-                    role: "user".into(),
-                    author: Some("user".into()),
-                    created_at: Some(created_at),
-                    content,
-                    extra: json!({}),
-                    snippets: Vec::new(),
-                    invocations: Vec::new(),
-                }],
-            };
-            index.add_conversation(&normalized)?;
-        }
-        index.commit()?;
-
-        assert_eq!(
-            message_rows.len(),
-            doc_count,
-            "fixture should create the requested number of messages"
-        );
-
-        let fast_embedder = Arc::new(crate::search::hash_embedder::HashEmbedder::new(256));
-        let quality_embedder = crate::search::hash_embedder::HashEmbedder::new(384);
-        let filter_maps = SemanticFilterMaps::for_tests(
-            HashMap::from([("codex".to_string(), u32::try_from(agent_id)?)]),
-            HashMap::from([(
-                workspace_path.to_string_lossy().to_string(),
-                u32::try_from(workspace_id)?,
-            )]),
-            HashMap::from([(source_id.to_string(), source_hash)]),
-            HashSet::new(),
-        );
-        let fast_path = dir.path().join("vector.fast.idx");
-        let quality_path = dir.path().join("vector.quality.idx");
-
-        let mut fast_writer = VectorIndex::create_with_revision(
-            &fast_path,
-            fast_embedder.id(),
-            "rev-progressive-fast",
-            fast_embedder.dimension(),
-            frankensearch::index::Quantization::F16,
-        )?;
-        let mut quality_writer = VectorIndex::create_with_revision(
-            &quality_path,
-            quality_embedder.id(),
-            "rev-progressive-quality",
-            quality_embedder.dimension(),
-            frankensearch::index::Quantization::F16,
-        )?;
-
-        for (message_id, created_at_ms, content) in &message_rows {
-            let canonical = canonicalize_for_embedding(content);
-            let doc_id = SemanticDocId {
-                message_id: *message_id,
-                chunk_idx: 0,
-                agent_id: u32::try_from(agent_id)?,
-                workspace_id: u32::try_from(workspace_id)?,
-                source_id: source_hash,
-                role: ROLE_USER,
-                created_at_ms: *created_at_ms,
-                content_hash: Some(content_hash(&canonical)),
-            }
-            .to_doc_id_string();
-
-            let fast_vec = fast_embedder.embed_sync(content)?;
-            fast_writer.write_record(&doc_id, &fast_vec)?;
-            let quality_vec = quality_embedder.embed_sync(content)?;
-            quality_writer.write_record(&doc_id, &quality_vec)?;
-        }
-        fast_writer.finish()?;
-        quality_writer.finish()?;
-
-        let reader = fs_cass_open_search_reader(dir.path(), ReloadPolicy::Manual).ok();
-        let client = SearchClient {
-            reader,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
-            sqlite_path: None,
-            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
-            metrics: Metrics::default(),
-            cache_namespace: format!("v{}|schema:{}", CACHE_KEY_VERSION, FS_CASS_SCHEMA_HASH),
-            semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
-        };
-        let semantic_embedder: Arc<dyn Embedder> = fast_embedder;
-        client.set_semantic_context(
-            semantic_embedder,
-            VectorIndex::open(&fast_path)?,
-            filter_maps,
-            None,
-            Some(fast_path),
-        )?;
-
-        Ok(ProgressiveHybridFixture {
-            _dir: dir,
-            client: Arc::new(client),
-            query,
-        })
-    }
-
     fn sanitize_query(raw: &str) -> String {
         nfc_sanitize_query(raw)
     }
@@ -9867,85 +8231,66 @@ mod tests {
     type WildcardPattern = FsCassWildcardPattern;
     type QueryTokenList = Vec<QueryToken>;
 
-    #[test]
-    #[ignore = "profiling harness for live hybrid progressive search"]
-    fn progressive_hybrid_profile_harness() -> Result<()> {
-        let fixture = build_progressive_hybrid_fixture()?;
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-            .build()
-            .map_err(|err| anyhow!("build test runtime failed: {err}"))?;
-        let iterations = 24usize;
-
-        runtime.block_on(async {
-            let cx = FsCx::for_request();
-            fixture
-                .client
-                .search_progressive_with_callback(
-                    ProgressiveSearchRequest {
-                        cx: &cx,
-                        query: &fixture.query,
-                        filters: SearchFilters::default(),
-                        limit: 16,
-                        sparse_threshold: 0,
-                        field_mask: FieldMask::new(false, true, true, true),
-                        mode: SearchMode::Hybrid,
-                    },
-                    |_| {},
-                )
-                .await
-        })?;
-
-        let mut initial_events = 0usize;
-        let mut refined_events = 0usize;
-        let mut total_hits = 0usize;
-        for _ in 0..iterations {
-            let mut refinement_error = None;
-            runtime.block_on(async {
-                let cx = FsCx::for_request();
-                fixture
-                    .client
-                    .search_progressive_with_callback(
-                        ProgressiveSearchRequest {
-                            cx: &cx,
-                            query: &fixture.query,
-                            filters: SearchFilters::default(),
-                            limit: 16,
-                            sparse_threshold: 0,
-                            field_mask: FieldMask::new(false, true, true, true),
-                            mode: SearchMode::Hybrid,
-                        },
-                        |event| match event {
-                            ProgressiveSearchEvent::Phase { kind, result, .. } => {
-                                assert!(
-                                    !result.hits.is_empty(),
-                                    "progressive harness expects non-empty hits for each phase"
-                                );
-                                total_hits += result.hits.len();
-                                match kind {
-                                    ProgressivePhaseKind::Initial => initial_events += 1,
-                                    ProgressivePhaseKind::Refined => refined_events += 1,
-                                }
-                            }
-                            ProgressiveSearchEvent::RefinementFailed { error, .. } => {
-                                refinement_error = Some(error);
-                            }
-                        },
-                    )
-                    .await
-            })?;
-            if let Some(error) = refinement_error {
-                bail!("progressive harness refinement failed: {error}");
-            }
+    /// W2-6 Task甲 exec35: pre-migration fixtures in this module seeded a
+    /// `TantivyIndex` directory and then called `SearchClient::open(dir,
+    /// None)` -- both the writer and the two-arg `open` signature are gone
+    /// (`db_path: None` now always yields `Ok(None)`). This is the
+    /// production-fidelity replacement: it goes through the exact same
+    /// `FrankenStorage::insert_conversation_tree` + `sync_lexical_domain_
+    /// for_conversation_in_tx` path the real indexer uses, so `lex_docs`/
+    /// `fts_lex` (the new primary lexical backend `client.search()`
+    /// actually reads, not the legacy `fts_messages` fallback) come out
+    /// populated the same way a real index run would populate them.
+    fn seed_conversations_for_search_client(
+        conversations: &[NormalizedConversation],
+    ) -> Result<(TempDir, PathBuf)> {
+        let dir = TempDir::new()?;
+        let db_path = dir.path().join("fixture.db");
+        let storage = FrankenStorage::open(&db_path)?;
+        let mut agent_ids: HashMap<String, i64> = HashMap::new();
+        // W2-6 exec36 Task甲4诊断②-⑥ (control-plane 2026-08-31 ruling, 批准修):
+        // this helper used to hardcode `workspace_id: None` for every seeded
+        // conversation, silently dropping `NormalizedConversation.workspace`
+        // -- the production write path (`sync_lexical_domain_for_conversation_
+        // in_tx`) and the fts_lex hydrate/filter path were both verified
+        // correct; the gap was entirely in this test-only seeding shortcut
+        // never having called `ensure_workspace`. Resolve it the same way
+        // `agent_id` is resolved above, so workspace-filter tests actually
+        // exercise the real workspace_id join instead of always seeing NULL.
+        let mut workspace_ids: HashMap<String, i64> = HashMap::new();
+        for conv in conversations {
+            let agent_id = match agent_ids.get(&conv.agent_slug) {
+                Some(id) => *id,
+                None => {
+                    let id = storage.ensure_agent(&Agent {
+                        id: None,
+                        slug: conv.agent_slug.clone(),
+                        name: conv.agent_slug.clone(),
+                        version: None,
+                        kind: AgentKind::Cli,
+                    })?;
+                    agent_ids.insert(conv.agent_slug.clone(), id);
+                    id
+                }
+            };
+            let workspace_id = match &conv.workspace {
+                None => None,
+                Some(ws) => {
+                    let key = ws.to_string_lossy().into_owned();
+                    match workspace_ids.get(&key) {
+                        Some(id) => Some(*id),
+                        None => {
+                            let id = storage.ensure_workspace(ws, None)?;
+                            workspace_ids.insert(key, id);
+                            Some(id)
+                        }
+                    }
+                }
+            };
+            let internal = crate::indexer::persist::map_to_internal(conv);
+            storage.insert_conversation_tree(agent_id, workspace_id, &internal)?;
         }
-
-        assert_eq!(initial_events, iterations);
-        assert_eq!(refined_events, iterations);
-        assert!(
-            total_hits >= iterations.saturating_mul(16),
-            "harness should observe a full page for each phase"
-        );
-
-        Ok(())
+        Ok((dir, db_path))
     }
 
     // ==========================================================================
@@ -10189,97 +8534,6 @@ mod tests {
         }
     }
 
-    fn make_federated_merge_hit(id: &str, agent: &str) -> SearchHit {
-        SearchHit {
-            title: id.into(),
-            snippet: String::new(),
-            content: id.into(),
-            content_hash: stable_content_hash(id),
-            score: 0.0,
-            source_path: format!("{id}.jsonl"),
-            agent: agent.into(),
-            workspace: "workspace".into(),
-            workspace_original: None,
-            created_at: Some(1_700_000_000_000),
-            line_number: Some(1),
-            match_type: MatchType::Exact,
-            source_id: "local".into(),
-            origin_kind: "local".into(),
-            origin_host: None,
-            conversation_id: None,
-        }
-    }
-
-    fn make_federated_ranked_hit(
-        shard_index: usize,
-        shard_rank: usize,
-        id: &str,
-    ) -> FederatedRankedHit {
-        FederatedRankedHit {
-            hit: make_federated_merge_hit(id, &format!("shard-{shard_index}")),
-            shard_index,
-            shard_rank,
-            fused_score: federated_rrf_score(shard_rank),
-        }
-    }
-
-    #[test]
-    fn federated_merge_orders_equal_rank_hits_by_stable_hit_key() {
-        let merged = merge_federated_ranked_hits(vec![
-            make_federated_ranked_hit(2, 0, "zeta"),
-            make_federated_ranked_hit(0, 0, "bravo"),
-            make_federated_ranked_hit(1, 0, "alpha"),
-        ]);
-
-        let paths = merged
-            .iter()
-            .map(|hit| hit.source_path.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(paths, vec!["alpha.jsonl", "bravo.jsonl", "zeta.jsonl"]);
-        assert!(
-            merged
-                .iter()
-                .all(|hit| (hit.score - federated_rrf_score(0)).abs() < f32::EPSILON),
-            "equal per-shard rank should produce equal RRF scores"
-        );
-    }
-
-    #[test]
-    fn federated_merge_keeps_rrf_rank_ahead_of_stable_key() {
-        let merged = merge_federated_ranked_hits(vec![
-            make_federated_ranked_hit(0, 1, "alpha"),
-            make_federated_ranked_hit(1, 0, "zeta"),
-        ]);
-
-        let paths = merged
-            .iter()
-            .map(|hit| hit.source_path.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(paths, vec!["zeta.jsonl", "alpha.jsonl"]);
-        assert!(merged[0].score > merged[1].score);
-    }
-
-    #[test]
-    fn federated_merge_uses_shard_index_as_duplicate_final_tiebreak() {
-        let merged = merge_federated_ranked_hits(vec![
-            FederatedRankedHit {
-                hit: make_federated_merge_hit("same", "shard-2"),
-                shard_index: 2,
-                shard_rank: 0,
-                fused_score: federated_rrf_score(0),
-            },
-            FederatedRankedHit {
-                hit: make_federated_merge_hit("same", "shard-0"),
-                shard_index: 0,
-                shard_rank: 0,
-                fused_score: federated_rrf_score(0),
-            },
-        ]);
-
-        assert_eq!(merged[0].agent, "shard-0");
-        assert_eq!(merged[1].agent, "shard-2");
-    }
-
     #[test]
     fn top_k_fused_basic() {
         let hits = vec![
@@ -10511,10 +8765,6 @@ mod tests {
         // pages. Global pagination still has to happen after deduplication, but
         // dedup itself only coalesces hits that share message-level provenance.
 
-        let dir = TempDir::new().unwrap();
-        let index_path = dir.path();
-        let mut index = TantivyIndex::open_or_create(index_path).unwrap();
-
         // Add two documents with IDENTICAL content but distinct other fields.
         // Tantivy scores them. If query matches both equally, one comes first.
         // We'll use different source paths to ensure they are distinct hits initially.
@@ -10562,11 +8812,10 @@ mod tests {
             messages: vec![msg2],
         };
 
-        index.add_conversation(&conv1).unwrap();
-        index.add_conversation(&conv2).unwrap();
-        index.commit().unwrap();
-
-        let client = SearchClient::open(index_path, None).unwrap().unwrap();
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv1, conv2]).unwrap();
+        let client = SearchClient::open(dir.path(), Some(&db_path))
+            .unwrap()
+            .unwrap();
 
         // Search page 1: limit 1, offset 0
         let page1 = client
@@ -10586,20 +8835,12 @@ mod tests {
     #[test]
     fn cache_skips_complex_queries() {
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         // Wildcard query should skip cache logic entirely (no miss recorded)
@@ -10636,20 +8877,12 @@ mod tests {
     #[test]
     fn cache_prefix_lookup_handles_utf8_boundaries() {
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hits = vec![SearchHit {
@@ -10756,20 +8989,12 @@ mod tests {
     #[test]
     fn progressive_phase_reuses_lexical_cache_without_db_hydration() -> Result<()> {
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
         let field_mask = FieldMask::new(false, true, true, true);
         let lexical_hit = SearchHit {
@@ -10838,7 +9063,6 @@ mod tests {
     #[test]
     fn search_returns_results_with_filters_and_pagination() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
         let conv = NormalizedConversation {
             agent_slug: "codex".into(),
             external_id: None,
@@ -10865,10 +9089,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
         let mut filters = SearchFilters::default();
         filters.agents.insert("codex".into());
 
@@ -10882,7 +9104,6 @@ mod tests {
     #[test]
     fn search_honors_created_range_and_workspace() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
 
         let conv_a = NormalizedConversation {
             agent_slug: "codex".into(),
@@ -10936,11 +9157,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv_a)?;
-        index.add_conversation(&conv_b)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv_a, conv_b])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
         let mut filters = SearchFilters::default();
         filters.workspaces.insert("/ws/b".into());
         filters.created_from = Some(15);
@@ -10956,7 +9174,7 @@ mod tests {
     #[test]
     fn pagination_skips_results() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+        let mut conversations = Vec::new();
         for i in 0..3 {
             let conv = NormalizedConversation {
                 agent_slug: "codex".into(),
@@ -10985,11 +9203,11 @@ mod tests {
                     invocations: Vec::new(),
                 }],
             };
-            index.add_conversation(&conv)?;
+            conversations.push(conv);
         }
-        index.commit()?;
+        let (dir, db_path) = seed_conversations_for_search_client(&conversations)?;
 
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
         let hits = client.search(
             "pagination",
             SearchFilters::default(),
@@ -11004,7 +9222,7 @@ mod tests {
     #[test]
     fn search_matches_hyphenated_term() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
         let conv = NormalizedConversation {
             agent_slug: "codex".into(),
             external_id: None,
@@ -11031,10 +9249,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
         let hits = client.search("cma-es", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
         assert_eq!(hits.len(), 1);
         assert!(hits[0].snippet.to_lowercase().contains("cma"));
@@ -11044,7 +9260,7 @@ mod tests {
     #[test]
     fn search_matches_prefix_edge_ngram() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
         let conv = NormalizedConversation {
             agent_slug: "codex".into(),
             external_id: None,
@@ -11065,10 +9281,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // "cal" should match "calculate"
         let hits = client.search("cal", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
@@ -11085,7 +9299,7 @@ mod tests {
     #[test]
     fn search_matches_snake_case() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
         let conv = NormalizedConversation {
             agent_slug: "codex".into(),
             external_id: None,
@@ -11106,10 +9320,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // "vari" should match "variable" inside "my_variable_name"
         let hits = client.search("vari", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
@@ -11131,7 +9343,7 @@ mod tests {
     #[test]
     fn search_matches_symbols_stripped() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
         let conv = NormalizedConversation {
             agent_slug: "codex".into(),
             external_id: None,
@@ -11152,10 +9364,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // "c++" -> "c"
         let hits = client.search("c++", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
@@ -11171,7 +9381,7 @@ mod tests {
     #[test]
     fn search_sets_match_type_for_wildcards() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         let conv = NormalizedConversation {
             agent_slug: "codex".into(),
@@ -11193,10 +9403,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         let exact = client.search("handler", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
         assert_eq!(exact[0].match_type, MatchType::Exact);
@@ -11215,9 +9423,19 @@ mod tests {
     }
 
     #[test]
-    fn search_with_fallback_marks_implicit_wildcard() -> Result<()> {
+    // W2-6 exec37 Task甲⑦ (structural-extinction ruling, w2-d4 family): renamed
+    // from `search_with_fallback_marks_implicit_wildcard`. `fts_lex`'s trigram
+    // tokenizer already substring-matches a bare query term (probe-verified:
+    // `andle` finds "handler" directly via the baseline MATCH), so the sparse
+    // -> wildcard-retry heuristic in `search_with_fallback` never has anything
+    // to add here -- baseline hits are already complete and honestly labeled
+    // `Exact` (the raw query carries no literal `*`). The old assertion that
+    // this case flips `wildcard_fallback` to true and relabels the hit
+    // `ImplicitWildcard` asserted Tantivy-era behavior that the trigram
+    // backend structurally cannot reproduce.
+    fn search_with_fallback_never_triggers_when_trigram_baseline_already_matches() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         let conv = NormalizedConversation {
             agent_slug: "codex".into(),
@@ -11239,12 +9457,11 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv)?;
-        index.commit()?;
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
-
-        // Base search for "andle" finds nothing; fallback "*andle*" should hit and mark implicit.
+        // "andle" is a substring of "handler" -- the trigram baseline finds it
+        // directly, so the sparse-retry heuristic never fires.
         let result = client.search_with_fallback(
             "andle",
             SearchFilters::default(),
@@ -11253,32 +9470,36 @@ mod tests {
             2,
             FieldMask::FULL,
         )?;
-        assert!(result.wildcard_fallback);
+        assert!(!result.wildcard_fallback);
         assert_eq!(result.hits.len(), 1);
-        assert_eq!(result.hits[0].match_type, MatchType::ImplicitWildcard);
+        assert_eq!(result.hits[0].match_type, MatchType::Exact);
 
         Ok(())
     }
 
     #[test]
     fn sqlite_backend_skips_wildcard_queries() -> Result<()> {
-        // Build a client with SQLite only; wildcard queries should short-circuit without errors.
-        let conn = Connection::open_memory()?;
+        // W2-6 Task戊: `search()`'s dispatch reads `meta`/`lex_docs` state up
+        // front regardless of query shape, so the fixture needs a real
+        // production schema (FrankenStorage::open) even though the wildcard
+        // query itself never touches any seeded content.
+        let temp_dir = TempDir::new()?;
+        let db_path = temp_dir.path().join("wildcard-skip.db");
+        {
+            let storage = FrankenStorage::open(&db_path)?;
+            // No conversations at all -- mark the (empty) lex domain rebuild
+            // completed via the real production path so `search()`'s
+            // dispatch sees a ready index instead of "absent".
+            storage.rebuild_lex_domain_from_db(None)?;
+        }
+
         let client = SearchClient {
-            reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
-            sqlite_path: None,
+            sqlite: Mutex::new(None),
+            sqlite_path: Some(db_path),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hits = client.search("*handler", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
@@ -11292,72 +9513,54 @@ mod tests {
 
     #[test]
     fn sqlite_backend_handles_null_workspace() -> Result<()> {
-        let conn = Connection::open_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
-             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
-             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
-             CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                agent_id INTEGER,
-                workspace_id INTEGER,
-                source_id TEXT,
-                origin_host TEXT,
-                title TEXT,
-                source_path TEXT
-             );
-             CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER,
-                idx INTEGER,
-                content TEXT,
-                created_at INTEGER
-             );
-             CREATE VIRTUAL TABLE fts_messages USING fts5(
-                content,
-                title,
-                agent,
-                workspace,
-                source_path,
-                created_at UNINDEXED,
-                content='',
-                tokenize='porter'
-             );",
-        )?;
-        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')", &[])?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
-        conn.execute(
-            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path) VALUES(1, 1, NULL, 'local', NULL, 't', '/tmp/session.jsonl')",
-        &[])?;
-        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(1, 1, 0, 'auth token failure', 42)", &[])?;
-        conn.execute(
-            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
-             VALUES(?1, ?2, ?3, ?4, NULL, ?5, ?6)",
-            fparams![
-                1_i64,
-                "auth token failure",
-                "t",
-                "codex",
-                "/tmp/session.jsonl",
-                42_i64
-            ],
-        )?;
+        // W2-6 Task戊: fixture rebuilt on the real fts_lex/lex_docs write path
+        // (see `sqlite_backend_orders_hits_by_bm25_score` for rationale).
+        let temp_dir = TempDir::new()?;
+        let db_path = temp_dir.path().join("null-workspace.db");
+        {
+            let storage = FrankenStorage::open(&db_path)?;
+            let agent = Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            };
+            let agent_id = storage.ensure_agent(&agent)?;
+            let conversation = Conversation {
+                id: None,
+                agent_slug: agent.slug.clone(),
+                workspace: None,
+                external_id: Some("null-workspace".into()),
+                title: Some("t".into()),
+                source_path: temp_dir.path().join("session.jsonl"),
+                started_at: Some(42),
+                ended_at: Some(42),
+                approx_tokens: Some(16),
+                metadata_json: serde_json::Value::Null,
+                messages: vec![Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: Some("user".into()),
+                    created_at: Some(42),
+                    content: "auth token failure".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                }],
+                source_id: "local".into(),
+                origin_host: None,
+            };
+            storage.insert_conversation_tree(agent_id, None, &conversation)?;
+        }
 
         let client = SearchClient {
-            reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
-            sqlite_path: None,
+            sqlite: Mutex::new(None),
+            sqlite_path: Some(db_path),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hits = client.search("auth", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
@@ -11369,202 +9572,85 @@ mod tests {
         Ok(())
     }
 
+    /// R1-B3 regression: a genuine SQL execution failure inside
+    /// `search_fts_lex_domain` (candidate/hydrate/corpus-stats query) used
+    /// to be swallowed into `Ok(Vec::new())` -- indistinguishable from a
+    /// genuinely empty result, a false-green search. It must now propagate.
     #[test]
-    fn sqlite_backend_supports_legacy_fts_message_id_schema() -> Result<()> {
-        let conn = Connection::open_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
-             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
-             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
-             CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                agent_id INTEGER,
-                workspace_id INTEGER,
-                source_id TEXT,
-                origin_host TEXT,
-                title TEXT,
-                source_path TEXT
-             );
-             CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER,
-                idx INTEGER,
-                content TEXT,
-                created_at INTEGER
-             );
-             CREATE VIRTUAL TABLE fts_messages USING fts5(
-                content,
-                title,
-                agent,
-                workspace,
-                source_path,
-                created_at UNINDEXED,
-                message_id UNINDEXED,
-                tokenize='porter'
-             );",
-        )?;
-        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')", &[])?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
-        conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/legacy')", &[])?;
-        conn.execute(
-            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
-             VALUES(1, 1, 1, 'local', NULL, 'legacy title', '/tmp/legacy.jsonl')",
-        &[])?;
-        conn.execute(
-            "INSERT INTO messages(id, conversation_id, idx, content, created_at)
-             VALUES(42, 1, 4, 'legacy auth token failure', 99)",
-        &[])?;
-        conn.execute(
-            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at, message_id)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            fparams![
-                1_i64,
-                "legacy auth token failure",
-                "legacy title",
-                "codex",
-                "/legacy",
-                "/tmp/legacy.jsonl",
-                99_i64,
-                42_i64
-            ],
-        )?;
+    fn search_fts_lex_domain_propagates_candidate_query_failure_instead_of_going_silent()
+    -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let db_path = temp_dir.path().join("candidate-query-failure.db");
+        {
+            let storage = FrankenStorage::open(&db_path)?;
+            let agent = Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            };
+            let agent_id = storage.ensure_agent(&agent)?;
+            let conversation = Conversation {
+                id: None,
+                agent_slug: agent.slug.clone(),
+                workspace: None,
+                external_id: Some("candidate-query-failure".into()),
+                title: Some("t".into()),
+                source_path: temp_dir.path().join("session.jsonl"),
+                started_at: Some(42),
+                ended_at: Some(42),
+                approx_tokens: Some(16),
+                metadata_json: serde_json::Value::Null,
+                messages: vec![Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: Some("user".into()),
+                    created_at: Some(42),
+                    content: "r1b3livemarker".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                }],
+                source_id: "local".into(),
+                origin_host: None,
+            };
+            storage.insert_conversation_tree(agent_id, None, &conversation)?;
+
+            // `search_fts_lex_domain` itself only checks `sqlite_master`
+            // for a table *named* `fts_lex` before dispatching to the
+            // candidate query (an outright-missing table is the deliberate
+            // "genuinely absent" `Ok(Vec::new())` this fix leaves alone).
+            // Swap the real FTS5 virtual table for an ordinary table of the
+            // same name and shape: `sqlite_master` still reports it exists,
+            // but `bm25(fts_lex, ...)`/`MATCH` against a non-FTS5 table is a
+            // genuine SQL execution failure -- the "bad table" injection
+            // this regression needs to reach the candidate-query site.
+            storage.raw().execute("DROP TABLE fts_lex", &[])?;
+            storage.raw().execute(
+                "CREATE TABLE fts_lex (content TEXT, title TEXT, agent TEXT, workspace TEXT, source_path TEXT)",
+                &[],
+            )?;
+        }
 
         let client = SearchClient {
-            reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
-            sqlite_path: None,
+            sqlite: Mutex::new(None),
+            sqlite_path: Some(db_path),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
-        let hits = client.search("auth", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].title, "legacy title");
-        assert_eq!(hits[0].source_path, "/tmp/legacy.jsonl");
-        assert_eq!(hits[0].workspace, "/legacy");
-        assert_eq!(hits[0].line_number, Some(5));
-        assert_eq!(hits[0].content, "legacy auth token failure");
-        Ok(())
-    }
-
-    #[test]
-    fn tantivy_reader_skips_sqlite_fallback_on_empty_lexical_results() -> Result<()> {
-        let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
-        index.commit()?;
-        let reader = fs_cass_open_search_reader(dir.path(), ReloadPolicy::Manual).ok();
-        assert!(
-            reader.is_some(),
-            "test fixture should open a Tantivy reader even with an empty index"
+        let result =
+            client.search("r1b3livemarker", SearchFilters::default(), 5, 0, FieldMask::FULL);
+        let err = result.expect_err(
+            "a broken fts_lex candidate query must surface as an error, not a silent empty result",
         );
-
-        let conn = Connection::open_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
-             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
-             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
-             CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                agent_id INTEGER,
-                workspace_id INTEGER,
-                source_id TEXT,
-                origin_host TEXT,
-                title TEXT,
-                source_path TEXT
-             );
-             CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER,
-                idx INTEGER,
-                content TEXT,
-                created_at INTEGER
-             );
-             CREATE VIRTUAL TABLE fts_messages USING fts5(
-                content,
-                title,
-                agent,
-                workspace,
-                source_path,
-                created_at UNINDEXED,
-                content='',
-                tokenize='porter'
-             );",
-        )?;
-        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')", &[])?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
-        conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/sqlite-only')", &[])?;
-        conn.execute(
-            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
-             VALUES(1, 1, 1, 'local', NULL, 'sqlite fallback only', '/tmp/sqlite-only.jsonl')",
-        &[])?;
-        conn.execute(
-            "INSERT INTO messages(id, conversation_id, idx, content, created_at)
-             VALUES(1, 1, 0, 'sqliteonlytoken overflow candidate', 42)",
-        &[])?;
-        conn.execute(
-            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            fparams![
-                1_i64,
-                "sqliteonlytoken overflow candidate",
-                "sqlite fallback only",
-                "codex",
-                "/sqlite-only",
-                "/tmp/sqlite-only.jsonl",
-                42_i64
-            ],
-        )?;
-
-        let client = SearchClient {
-            reader,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
-            sqlite_path: None,
-            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
-            metrics: Metrics::default(),
-            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
-            semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
-        };
-
-        let sqlite_hits = client.search_sqlite_fts5(
-            Path::new(":memory:"),
-            "sqliteonlytoken",
-            SearchFilters::default(),
-            5,
-            0,
-            FieldMask::FULL,
-        )?;
-        assert_eq!(
-            sqlite_hits.len(),
-            1,
-            "fixture should prove sqlite fallback would have produced a hit"
-        );
-
-        let tantivy_authoritative_hits = client.search(
-            "sqliteonlytoken",
-            SearchFilters::default(),
-            5,
-            0,
-            FieldMask::FULL,
-        )?;
+        let chain = format!("{err:#}");
         assert!(
-            tantivy_authoritative_hits.is_empty(),
-            "a live Tantivy reader should prevent sqlite fallback from populating empty lexical results"
+            chain.contains("fts_lex candidate query failed"),
+            "error chain must carry the propagated failure context, got: {chain}"
         );
         Ok(())
     }
@@ -11629,20 +9715,12 @@ mod tests {
         // Opening via sqlite_guard() must remain read-only. A search path
         // should not trigger heavyweight derived-index repair.
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: Some(db_path.clone()),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let guard = client
@@ -11686,138 +9764,92 @@ mod tests {
 
     #[test]
     fn sqlite_path_rusqlite_fallback_matches_hyphenated_ids_with_workspace_filter() -> Result<()> {
-        fn fts_match_count(conn: &Connection, fts_query: &str) -> Result<Option<usize>> {
-            let match_mode = SearchClient::sqlite_fts_match_mode(conn)?;
-            let sql = format!(
-                "SELECT COUNT(*) FROM fts_messages WHERE {}",
-                SearchClient::sqlite_fts5_match_clause(match_mode)
-            );
-            let mut params = Vec::new();
-            SearchClient::push_sqlite_fts5_match_params(&mut params, fts_query, match_mode);
-            match franken_query_map_collect_retry(conn, &sql, &params, |row| row.get_typed(0)) {
-                Ok(rows) => {
-                    let count: i64 = rows.into_iter().next().unwrap_or(0);
-                    Ok(Some(usize::try_from(count.max(0)).unwrap_or(usize::MAX)))
-                }
-                Err(err) if err.to_string().contains("no such function: MATCH/2") => Ok(None),
-                Err(err) => Err(err.into()),
-            }
-        }
-
+        // W2-6 Task戊: fixture rebuilt on the real fts_lex/lex_docs write path
+        // (FrankenStorage::open + insert_conversation_tree) after fts_messages
+        // DROP -- raw `INSERT INTO messages` against the storage connection
+        // bypasses the lex_docs sync that only runs through the real
+        // conversation-tree write path, and `search()`'s dispatch now
+        // requires `meta`/`lex_docs` state a hand-rolled fts_messages-only
+        // fixture never populated. `transpile_to_fts5`/hyphen-and-dot query
+        // handling is still exercised end-to-end via `client.search()`.
         let temp_dir = TempDir::new()?;
         let db_path = temp_dir.path().join("hyphenated-rusqlite-fallback.db");
+        let alpha_workspace = temp_dir.path().join("ws-alpha");
+        let beta_workspace = temp_dir.path().join("ws-beta");
+        let beta_workspace_str = beta_workspace.to_string_lossy().to_string();
+        let alpha_source_path = temp_dir.path().join("alpha.jsonl");
+        let beta_source_path = temp_dir.path().join("beta.jsonl");
+        let beta_source_path_str = beta_source_path.to_string_lossy().to_string();
 
         {
             let storage = FrankenStorage::open(&db_path)?;
-            // V14 drops fts_messages during migration — run the lazy repair
-            // so the direct INSERT INTO fts_messages below can land.
-            storage.ensure_search_fallback_fts_consistency()?;
-            let conn = storage.raw();
-            conn.execute(
-                "INSERT INTO agents(id, slug, name, kind, created_at, updated_at)
-                 VALUES(1, 'codex', 'Codex', 'codex', 1, 1)",
-                &[],
-            )?;
-            conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/ws/alpha')", &[])?;
-            conn.execute("INSERT INTO workspaces(id, path) VALUES(2, '/ws/beta')", &[])?;
-            conn.execute(
-                "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
-                 VALUES(1, 1, 1, 'local', NULL, 'alpha bead', '/tmp/alpha.jsonl')",
-                &[],
-            )?;
-            conn.execute(
-                "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
-                 VALUES(2, 1, 2, 'local', NULL, 'beta bead', '/tmp/beta.jsonl')",
-                &[],
-            )?;
-            conn.execute(
-                "INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
-                 VALUES(11, 1, 0, 'user', 'Need follow-up on br-123 root cause', 100)",
-                &[],
-            )?;
-            conn.execute(
-                "INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
-                 VALUES(12, 2, 0, 'user', 'Need follow-up on br-123 user report', 101)",
-                &[],
-            )?;
-            conn.execute(
-                "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                &[
-                    ParamValue::from(11_i64),
-                    ParamValue::from("Need follow-up on br-123 root cause"),
-                    ParamValue::from("alpha bead"),
-                    ParamValue::from("codex"),
-                    ParamValue::from("/ws/alpha"),
-                    ParamValue::from("/tmp/alpha.jsonl"),
-                    ParamValue::from(100_i64),
-                ],
-            )?;
-            conn.execute(
-                "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                &[
-                    ParamValue::from(12_i64),
-                    ParamValue::from("Need follow-up on br-123 user report"),
-                    ParamValue::from("beta bead"),
-                    ParamValue::from("codex"),
-                    ParamValue::from("/ws/beta"),
-                    ParamValue::from("/tmp/beta.jsonl"),
-                    ParamValue::from(101_i64),
-                ],
-            )?;
-            let preclose_total_rows: i64 =
-                conn.query_row_map("SELECT COUNT(*) FROM fts_messages", fparams![], |row| {
-                    row.get_typed(0)
-                })?;
-            assert_eq!(
-                preclose_total_rows, 2,
-                "freshly seeded file-backed FTS should retain the inserted rows"
-            );
-            let transpiled = transpile_to_fts5("br-123").expect("transpiled fallback query");
-            if let Some(match_count) = fts_match_count(conn, transpiled.as_str())? {
-                assert_eq!(
-                    match_count, 2,
-                    "freshly seeded file-backed FTS should match the transpiled hyphenated query before reopen"
-                );
+            let agent = Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            };
+            let agent_id = storage.ensure_agent(&agent)?;
+            std::fs::create_dir_all(&alpha_workspace)?;
+            std::fs::create_dir_all(&beta_workspace)?;
+            let alpha_workspace_id = storage.ensure_workspace(&alpha_workspace, None)?;
+            let beta_workspace_id = storage.ensure_workspace(&beta_workspace, None)?;
+
+            for (external_id, title, workspace_path, workspace_id, source_path, content) in [
+                (
+                    "hyphenated-alpha",
+                    "alpha bead",
+                    &alpha_workspace,
+                    alpha_workspace_id,
+                    &alpha_source_path,
+                    "Need follow-up on br-123 root cause",
+                ),
+                (
+                    "hyphenated-beta",
+                    "beta bead",
+                    &beta_workspace,
+                    beta_workspace_id,
+                    &beta_source_path,
+                    "Need follow-up on br-123 user report",
+                ),
+            ] {
+                let conversation = Conversation {
+                    id: None,
+                    agent_slug: agent.slug.clone(),
+                    workspace: Some(workspace_path.clone()),
+                    external_id: Some(external_id.to_string()),
+                    title: Some(title.to_string()),
+                    source_path: source_path.clone(),
+                    started_at: Some(100),
+                    ended_at: Some(100),
+                    approx_tokens: Some(16),
+                    metadata_json: serde_json::Value::Null,
+                    messages: vec![Message {
+                        id: None,
+                        idx: 0,
+                        role: MessageRole::User,
+                        author: Some("user".into()),
+                        created_at: Some(100),
+                        content: content.to_string(),
+                        extra_json: serde_json::Value::Null,
+                        snippets: Vec::new(),
+                    }],
+                    source_id: "local".into(),
+                    origin_host: None,
+                };
+                storage.insert_conversation_tree(agent_id, Some(workspace_id), &conversation)?;
             }
         }
 
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: Some(db_path),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
-
-        let guard = client.sqlite_guard()?;
-        let conn = guard.as_ref().expect("sqlite guard should reopen file db");
-        let reopened_total_rows: i64 =
-            conn.query_row_map("SELECT COUNT(*) FROM fts_messages", fparams![], |row| {
-                row.get_typed(0)
-            })?;
-        assert_eq!(
-            reopened_total_rows, 2,
-            "reopened file-backed FTS should still contain the seeded rows"
-        );
-        let transpiled = transpile_to_fts5("br-123").expect("transpiled fallback query");
-        if let Some(match_count) = fts_match_count(conn, transpiled.as_str())? {
-            assert_eq!(
-                match_count, 2,
-                "reopened file-backed FTS should still match the transpiled hyphenated query"
-            );
-        }
-        drop(guard);
 
         let all_hits = client.search("br-123", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
         assert_eq!(all_hits.len(), 2);
@@ -11860,7 +9892,7 @@ mod tests {
         let filtered_hits = client.search(
             "br-123",
             SearchFilters {
-                workspaces: HashSet::from_iter(["/ws/beta".to_string()]),
+                workspaces: HashSet::from_iter([beta_workspace_str.clone()]),
                 ..SearchFilters::default()
             },
             10,
@@ -11868,8 +9900,8 @@ mod tests {
             FieldMask::FULL,
         )?;
         assert_eq!(filtered_hits.len(), 1);
-        assert_eq!(filtered_hits[0].workspace, "/ws/beta");
-        assert_eq!(filtered_hits[0].source_path, "/tmp/beta.jsonl");
+        assert_eq!(filtered_hits[0].workspace, beta_workspace_str);
+        assert_eq!(filtered_hits[0].source_path, beta_source_path_str);
         assert!(filtered_hits[0].content.contains("br-123"));
 
         Ok(())
@@ -11877,100 +9909,66 @@ mod tests {
 
     #[test]
     fn sqlite_backend_orders_hits_by_bm25_score() -> Result<()> {
-        let conn = Connection::open_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                agent_id INTEGER,
-                workspace_id INTEGER,
-                source_id TEXT,
-                origin_host TEXT,
-                title TEXT,
-                source_path TEXT
-             );
-             CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER,
-                idx INTEGER,
-                content TEXT,
-                created_at INTEGER
-             );
-             CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
-             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
-             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
-             CREATE VIRTUAL TABLE fts_messages USING fts5(
-                content,
-                title,
-                agent,
-                workspace,
-                source_path,
-                created_at UNINDEXED,
-                content='',
-                tokenize='porter'
-             );",
-        )?;
-        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')", &[])?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
-        conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/ws')", &[])?;
-        conn.execute(
-            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path) VALUES(1, 1, 1, 'local', NULL, 'best', '/tmp/best.jsonl')",
-        &[])?;
-        conn.execute(
-            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path) VALUES(2, 1, 1, 'local', NULL, 'worse', '/tmp/worse.jsonl')",
-        &[])?;
-        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(7, 1, 0, 'auth auth auth failure', 42)", &[])?;
-        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(8, 2, 0, 'auth failure', 43)", &[])?;
-        conn.execute(
-            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            fparams![
-                7_i64,
-                "auth auth auth failure",
-                "best",
-                "codex",
-                "/ws",
-                "/tmp/best.jsonl",
-                42_i64
-            ],
-        )?;
-        conn.execute(
-            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            fparams![
-                8_i64,
-                "auth failure",
-                "worse",
-                "codex",
-                "/ws",
-                "/tmp/worse.jsonl",
-                43_i64
-            ],
-        )?;
+        // W2-6 Task戊: fixture rebuilt on the real fts_lex/lex_docs write path
+        // (FrankenStorage::open + insert_conversation_tree) after fts_messages
+        // DROP -- a hand-rolled fts_messages CREATE TABLE fixture skips the
+        // `meta`/`lex_docs` setup `search()`'s dispatch now requires.
+        let temp_dir = TempDir::new()?;
+        let db_path = temp_dir.path().join("bm25-order.db");
+        {
+            let storage = FrankenStorage::open(&db_path)?;
+            let agent = Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            };
+            let agent_id = storage.ensure_agent(&agent)?;
+            let workspace_path = temp_dir.path().join("ws");
+            std::fs::create_dir_all(&workspace_path)?;
+            let workspace_id = storage.ensure_workspace(&workspace_path, None)?;
+
+            for (title, source_name, content) in [
+                ("best", "best.jsonl", "auth auth auth failure"),
+                ("worse", "worse.jsonl", "auth failure"),
+            ] {
+                let conversation = Conversation {
+                    id: None,
+                    agent_slug: agent.slug.clone(),
+                    workspace: Some(workspace_path.clone()),
+                    external_id: Some(format!("bm25-{title}")),
+                    title: Some(title.to_string()),
+                    source_path: temp_dir.path().join(source_name),
+                    started_at: Some(1_700_000_000_000),
+                    ended_at: Some(1_700_000_000_100),
+                    approx_tokens: Some(16),
+                    metadata_json: serde_json::Value::Null,
+                    messages: vec![Message {
+                        id: None,
+                        idx: 0,
+                        role: MessageRole::User,
+                        author: Some("user".into()),
+                        created_at: Some(1_700_000_000_050),
+                        content: content.to_string(),
+                        extra_json: serde_json::Value::Null,
+                        snippets: Vec::new(),
+                    }],
+                    source_id: "local".into(),
+                    origin_host: None,
+                };
+                storage.insert_conversation_tree(agent_id, Some(workspace_id), &conversation)?;
+            }
+        }
+
         let client = SearchClient {
-            reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
-            sqlite_path: None,
+            sqlite: Mutex::new(None),
+            sqlite_path: Some(db_path),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
-        let direct_hits = client.search_sqlite_fts5(
-            Path::new(":memory:"),
-            "auth",
-            SearchFilters::default(),
-            5,
-            0,
-            FieldMask::FULL,
-        )?;
-        assert_eq!(direct_hits.len(), 2);
 
         let hits = client.search("auth", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
         assert_eq!(hits.len(), 2);
@@ -11982,254 +9980,58 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_fts5_ranked_phase_defers_content_decode_until_after_limit() {
-        let (rank_sql, params) = SearchClient::sqlite_fts5_rank_query(
-            "auth",
-            &SearchFilters::default(),
-            50,
-            0,
-            false,
-            SqliteFtsMatchMode::Table,
-        );
-        let hydrate_sql = SearchClient::sqlite_fts5_hydrate_query(
-            2,
-            FieldMask::new(true, true, true, true),
-            false,
-        );
-
-        assert!(
-            !rank_sql.contains("fts_messages.content"),
-            "rank query must not decode large content rows before LIMIT"
-        );
-        assert!(
-            hydrate_sql.contains("fts_messages.content"),
-            "hydration query should still provide requested content"
-        );
-        assert!(
-            rank_sql.contains("LIMIT ? OFFSET ?"),
-            "rank query must apply page bounds before hydration"
-        );
-        assert_eq!(params.len(), 3, "fts query plus limit and offset params");
-    }
-
-    #[test]
-    fn sqlite_fts5_hydration_chunks_stay_below_bind_variable_limit() {
-        let oversized_row_count = SQLITE_MAX_VARIABLE_NUMBER + 1;
-        let unchunked_sql = SearchClient::sqlite_fts5_hydrate_query(
-            oversized_row_count,
-            FieldMask::new(true, true, true, true),
-            false,
-        );
-        assert!(
-            unchunked_sql.matches('?').count() > SQLITE_MAX_VARIABLE_NUMBER,
-            "the pre-fix one-shot hydration query would exceed the legacy embedded engine's bind limit"
-        );
-
-        let ranked_rows: Vec<(i64, f64)> = (0..(SQLITE_FTS5_HYDRATE_PARAM_CHUNK + 17))
-            .map(|idx| (idx as i64, idx as f64))
-            .collect();
-        let chunk_sizes: Vec<usize> = SearchClient::sqlite_fts5_hydrate_row_chunks(&ranked_rows)
-            .map(<[(i64, f64)]>::len)
-            .collect();
-
-        assert_eq!(
-            chunk_sizes,
-            vec![SQLITE_FTS5_HYDRATE_PARAM_CHUNK, 17],
-            "large fallback pages must hydrate in bounded chunks while preserving rank windows"
-        );
-        assert!(
-            chunk_sizes
-                .iter()
-                .all(|chunk_size| *chunk_size <= SQLITE_MAX_VARIABLE_NUMBER),
-            "every hydration chunk must fit under the legacy embedded engine's bind-variable ceiling"
-        );
-    }
-
-    #[test]
-    fn tantivy_fallback_hydration_narrows_by_normalized_source_before_message_lookup() -> Result<()>
-    {
-        let conn = Connection::open_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                source_id TEXT,
-                origin_host TEXT,
-                source_path TEXT NOT NULL
-             );
-             CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER NOT NULL,
-                idx INTEGER NOT NULL,
-                content TEXT NOT NULL,
-                UNIQUE(conversation_id, idx)
-             );
-             CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);",
-        )?;
-        conn.execute(
-            "INSERT INTO conversations(id, source_id, origin_host, source_path)
-             VALUES(1, '', 'devbox', '/tmp/shared-fallback.jsonl')",
-        &[])?;
-        conn.execute(
-            "INSERT INTO conversations(id, source_id, origin_host, source_path)
-             VALUES(2, 'local', NULL, '/tmp/shared-fallback.jsonl')",
-        &[])?;
-        conn.execute(
-            "INSERT INTO messages(id, conversation_id, idx, content)
-             VALUES(10, 1, 2, 'remote fallback content')",
-        &[])?;
-        conn.execute(
-            "INSERT INTO messages(id, conversation_id, idx, content)
-             VALUES(20, 2, 2, 'local content must not win')",
-        &[])?;
-
-        let client = SearchClient {
-            reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
-            sqlite_path: None,
-            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
-            metrics: Metrics::default(),
-            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
-            semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
-        };
-
-        let fallback_key = (
-            "devbox".to_string(),
-            "/tmp/shared-fallback.jsonl".to_string(),
-            2,
-        );
-        let (_, hydrated_fallback) =
-            client.hydrate_tantivy_hit_contents(&[], std::slice::from_ref(&fallback_key))?;
-
-        assert_eq!(
-            hydrated_fallback.get(&fallback_key).map(String::as_str),
-            Some("remote fallback content")
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn exact_content_hydration_returns_only_requested_message_indices() -> Result<()> {
-        let conn = Connection::open_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER NOT NULL,
-                idx INTEGER NOT NULL,
-                content TEXT NOT NULL,
-                UNIQUE(conversation_id, idx)
-             );",
-        )?;
-
-        for idx in 0..8 {
-            conn.execute(&format!(
-                "INSERT INTO messages(conversation_id, idx, content)
-                 VALUES(1, {idx}, 'conversation one row {idx}')"
-            ), &[])?;
-        }
-        conn.execute(
-            "INSERT INTO messages(conversation_id, idx, content)
-             VALUES(2, 0, 'conversation two row 0')",
-        &[])?;
-
-        let hydrated =
-            hydrate_message_content_by_conversation(&conn, &[(1, 6), (1, 2), (2, 0), (1, 99)])?;
-
-        assert_eq!(hydrated.len(), 3);
-        assert_eq!(
-            hydrated.get(&(1, 2)).map(String::as_str),
-            Some("conversation one row 2")
-        );
-        assert_eq!(
-            hydrated.get(&(1, 6)).map(String::as_str),
-            Some("conversation one row 6")
-        );
-        assert_eq!(
-            hydrated.get(&(2, 0)).map(String::as_str),
-            Some("conversation two row 0")
-        );
-        assert!(!hydrated.contains_key(&(1, 99)));
-
-        Ok(())
-    }
-
-    #[test]
     fn sqlite_backend_generates_snippet_from_content() -> Result<()> {
-        let conn = Connection::open_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                agent_id INTEGER,
-                workspace_id INTEGER,
-                source_id TEXT,
-                origin_host TEXT,
-                title TEXT,
-                source_path TEXT
-             );
-             CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER,
-                idx INTEGER,
-                content TEXT,
-                created_at INTEGER
-             );
-             CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
-             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
-             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
-             CREATE VIRTUAL TABLE fts_messages USING fts5(
-                content,
-                title,
-                agent,
-                workspace,
-                source_path,
-                created_at UNINDEXED,
-                content='',
-                tokenize='porter'
-             );",
-        )?;
-        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')", &[])?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
-        conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/ws')", &[])?;
-        conn.execute(
-            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path) VALUES(1, 1, 1, 'local', NULL, 'snippet title', '/tmp/snippet.jsonl')",
-        &[])?;
-        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(1, 1, 0, 'alpha beta gamma delta epsilon zeta eta theta', 42)", &[])?;
-        conn.execute(
-            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            fparams![
-                1_i64,
-                "alpha beta gamma delta epsilon zeta eta theta",
-                "snippet title",
-                "codex",
-                "/ws",
-                "/tmp/snippet.jsonl",
-                42_i64
-            ],
-        )?;
+        // W2-6 Task戊: fixture rebuilt on the real fts_lex/lex_docs write path
+        // (see `sqlite_backend_orders_hits_by_bm25_score` for rationale).
+        let temp_dir = TempDir::new()?;
+        let db_path = temp_dir.path().join("snippet.db");
+        {
+            let storage = FrankenStorage::open(&db_path)?;
+            let agent = Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            };
+            let agent_id = storage.ensure_agent(&agent)?;
+            let workspace_path = temp_dir.path().join("ws");
+            std::fs::create_dir_all(&workspace_path)?;
+            let workspace_id = storage.ensure_workspace(&workspace_path, None)?;
+            let conversation = Conversation {
+                id: None,
+                agent_slug: agent.slug.clone(),
+                workspace: Some(workspace_path.clone()),
+                external_id: Some("snippet".into()),
+                title: Some("snippet title".into()),
+                source_path: temp_dir.path().join("snippet.jsonl"),
+                started_at: Some(42),
+                ended_at: Some(42),
+                approx_tokens: Some(16),
+                metadata_json: serde_json::Value::Null,
+                messages: vec![Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: Some("user".into()),
+                    created_at: Some(42),
+                    content: "alpha beta gamma delta epsilon zeta eta theta".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                }],
+                source_id: "local".into(),
+                origin_host: None,
+            };
+            storage.insert_conversation_tree(agent_id, Some(workspace_id), &conversation)?;
+        }
 
         let client = SearchClient {
-            reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
-            sqlite_path: None,
+            sqlite: Mutex::new(None),
+            sqlite_path: Some(db_path),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hits = client.search("delta", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
@@ -12243,91 +10045,91 @@ mod tests {
 
     #[test]
     fn sqlite_backend_respects_source_filter() -> Result<()> {
-        let conn = Connection::open_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
-             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
-             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
-             CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                agent_id INTEGER,
-                workspace_id INTEGER,
-                source_id TEXT,
-                origin_host TEXT,
-                title TEXT,
-                source_path TEXT
-             );
-             CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER,
-                idx INTEGER,
-                content TEXT,
-                created_at INTEGER
-             );
-             CREATE VIRTUAL TABLE fts_messages USING fts5(
-                content,
-                title,
-                agent,
-                workspace,
-                source_path,
-                created_at UNINDEXED,
-                content='',
-                tokenize='porter'
-             );",
-        )?;
-        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')", &[])?;
-        conn.execute("INSERT INTO sources(id, kind) VALUES('laptop', 'ssh')", &[])?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
-        conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/local')", &[])?;
-        conn.execute("INSERT INTO workspaces(id, path) VALUES(2, '/remote')", &[])?;
-        conn.execute(
-            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path) VALUES(1, 1, 1, '  local  ', NULL, 'local title', '/tmp/local.jsonl')",
-        &[])?;
-        conn.execute("INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path) VALUES(2, 1, 2, 'laptop', 'dev@laptop', 'remote title', '/tmp/remote.jsonl')", &[])?;
-        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(1, 1, 0, 'auth token failure', 42)", &[])?;
-        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(2, 2, 0, 'auth token failure', 43)", &[])?;
-        conn.execute(
-            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            fparams![
-                1_i64,
-                "auth token failure",
-                "local title",
-                "codex",
-                "/local",
-                "/tmp/local.jsonl",
-                42_i64
-            ],
-        )?;
-        conn.execute(
-            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            fparams![
-                2_i64,
-                "auth token failure",
-                "remote title",
-                "codex",
-                "/remote",
-                "/tmp/remote.jsonl",
-                43_i64
-            ],
-        )?;
+        // W2-6 Task戊: fixture rebuilt on the real production write path
+        // (FrankenStorage::open + insert_conversation_tree) -- this test
+        // exercises `browse_by_date`'s source filter, which never touches
+        // FTS at all, so (unlike its `client.search()` siblings) it never
+        // needed a hand-rolled fts_messages fixture in the first place; the
+        // old raw-SQL version carried one anyway as pure dead weight.
+        let temp_dir = TempDir::new()?;
+        let db_path = temp_dir.path().join("source-filter.db");
+        {
+            let storage = FrankenStorage::open(&db_path)?;
+            let agent = Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            };
+            let agent_id = storage.ensure_agent(&agent)?;
+            let local_workspace = temp_dir.path().join("local");
+            let remote_workspace = temp_dir.path().join("remote");
+            std::fs::create_dir_all(&local_workspace)?;
+            std::fs::create_dir_all(&remote_workspace)?;
+            let local_workspace_id = storage.ensure_workspace(&local_workspace, None)?;
+            let remote_workspace_id = storage.ensure_workspace(&remote_workspace, None)?;
+
+            let local_conversation = Conversation {
+                id: None,
+                agent_slug: agent.slug.clone(),
+                workspace: Some(local_workspace.clone()),
+                external_id: Some("local-conv".into()),
+                title: Some("local title".into()),
+                source_path: temp_dir.path().join("local.jsonl"),
+                started_at: Some(42),
+                ended_at: Some(42),
+                approx_tokens: Some(16),
+                metadata_json: serde_json::Value::Null,
+                messages: vec![Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: Some("user".into()),
+                    created_at: Some(42),
+                    content: "auth token failure".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                }],
+                source_id: "  local  ".into(),
+                origin_host: None,
+            };
+            storage.insert_conversation_tree(agent_id, Some(local_workspace_id), &local_conversation)?;
+
+            let remote_conversation = Conversation {
+                id: None,
+                agent_slug: agent.slug.clone(),
+                workspace: Some(remote_workspace.clone()),
+                external_id: Some("remote-conv".into()),
+                title: Some("remote title".into()),
+                source_path: temp_dir.path().join("remote.jsonl"),
+                started_at: Some(43),
+                ended_at: Some(43),
+                approx_tokens: Some(16),
+                metadata_json: serde_json::Value::Null,
+                messages: vec![Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: Some("user".into()),
+                    created_at: Some(43),
+                    content: "auth token failure".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                }],
+                source_id: "laptop".into(),
+                origin_host: Some("dev@laptop".into()),
+            };
+            storage.insert_conversation_tree(agent_id, Some(remote_workspace_id), &remote_conversation)?;
+        }
 
         let client = SearchClient {
-            reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
-            sqlite_path: None,
+            sqlite: Mutex::new(None),
+            sqlite_path: Some(db_path),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let local_hits = client.browse_by_date(
@@ -12363,75 +10165,54 @@ mod tests {
     #[test]
     fn sqlite_backend_remote_source_filter_matches_blank_source_id_with_origin_host() -> Result<()>
     {
-        let conn = Connection::open_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
-             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
-             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
-             CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                agent_id INTEGER,
-                workspace_id INTEGER,
-                source_id TEXT,
-                origin_host TEXT,
-                title TEXT,
-                source_path TEXT
-             );
-             CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER,
-                idx INTEGER,
-                content TEXT,
-                created_at INTEGER
-             );
-             CREATE VIRTUAL TABLE fts_messages USING fts5(
-                content,
-                title,
-                agent,
-                workspace,
-                source_path,
-                created_at UNINDEXED,
-                content='',
-                tokenize='porter'
-             );",
-        )?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
-        conn.execute(
-            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
-             VALUES(1, 1, NULL, '   ', 'dev@laptop', 'remote title', '/tmp/remote-filter.jsonl')",
-        &[])?;
-        conn.execute(
-            "INSERT INTO messages(id, conversation_id, idx, content, created_at)
-             VALUES(1, 1, 0, 'remote filter proof', 42)",
-        &[])?;
-        conn.execute(
-            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
-             VALUES(?1, ?2, ?3, ?4, NULL, ?5, ?6)",
-            fparams![
-                1_i64,
-                "remote filter proof",
-                "remote title",
-                "codex",
-                "/tmp/remote-filter.jsonl",
-                42_i64
-            ],
-        )?;
+        // W2-6 Task戊: fixture rebuilt on the real fts_lex/lex_docs write path
+        // (see `sqlite_backend_orders_hits_by_bm25_score` for rationale).
+        let temp_dir = TempDir::new()?;
+        let db_path = temp_dir.path().join("remote-filter.db");
+        {
+            let storage = FrankenStorage::open(&db_path)?;
+            let agent = Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            };
+            let agent_id = storage.ensure_agent(&agent)?;
+            let conversation = Conversation {
+                id: None,
+                agent_slug: agent.slug.clone(),
+                workspace: None,
+                external_id: Some("remote-filter".into()),
+                title: Some("remote title".into()),
+                source_path: temp_dir.path().join("remote-filter.jsonl"),
+                started_at: Some(42),
+                ended_at: Some(42),
+                approx_tokens: Some(16),
+                metadata_json: serde_json::Value::Null,
+                messages: vec![Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: Some("user".into()),
+                    created_at: Some(42),
+                    content: "remote filter proof".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                }],
+                source_id: "   ".into(),
+                origin_host: Some("dev@laptop".into()),
+            };
+            storage.insert_conversation_tree(agent_id, None, &conversation)?;
+        }
 
         let client = SearchClient {
-            reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
-            sqlite_path: None,
+            sqlite: Mutex::new(None),
+            sqlite_path: Some(db_path),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let remote_hits = client.search(
@@ -12468,92 +10249,92 @@ mod tests {
 
     #[test]
     fn sqlite_backend_workspace_filter_matches_null_workspace_as_empty_string() -> Result<()> {
-        let conn = Connection::open_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
-             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
-             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
-             CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                agent_id INTEGER,
-                workspace_id INTEGER,
-                source_id TEXT,
-                origin_host TEXT,
-                title TEXT,
-                source_path TEXT
-             );
-             CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER,
-                idx INTEGER,
-                content TEXT,
-                created_at INTEGER
-             );
-             CREATE VIRTUAL TABLE fts_messages USING fts5(
-                content,
-                title,
-                agent,
-                workspace,
-                source_path,
-                created_at UNINDEXED,
-                content='',
-                tokenize='porter'
-             );",
-        )?;
-        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')", &[])?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
-        conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/named')", &[])?;
-        // Conversation 1: no workspace (workspace_id=NULL)
-        conn.execute(
-            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path) VALUES(1, 1, NULL, 'local', NULL, 'null workspace', '/tmp/null-workspace.jsonl')",
-        &[])?;
-        // Conversation 2: with workspace
-        conn.execute(
-            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path) VALUES(2, 1, 1, 'local', NULL, 'named workspace', '/tmp/named-workspace.jsonl')",
-        &[])?;
-        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(1, 1, 0, 'auth token failure', 42)", &[])?;
-        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(2, 2, 0, 'auth token failure', 43)", &[])?;
-        conn.execute(
-            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
-             VALUES(?1, ?2, ?3, ?4, NULL, ?5, ?6)",
-            fparams![
-                1_i64,
-                "auth token failure",
-                "null workspace",
-                "codex",
-                "/tmp/null-workspace.jsonl",
-                42_i64
-            ],
-        )?;
-        conn.execute(
-            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            fparams![
-                2_i64,
-                "auth token failure",
-                "named workspace",
-                "codex",
-                "/named",
-                "/tmp/named-workspace.jsonl",
-                43_i64
-            ],
-        )?;
+        // W2-6 Task戊: fixture rebuilt on the real fts_lex/lex_docs write path
+        // (see `sqlite_backend_orders_hits_by_bm25_score` for rationale).
+        let temp_dir = TempDir::new()?;
+        let db_path = temp_dir.path().join("workspace-filter.db");
+        let null_workspace_source_path = temp_dir.path().join("null-workspace.jsonl");
+        let null_workspace_source_path_str = null_workspace_source_path.to_string_lossy().to_string();
+        {
+            let storage = FrankenStorage::open(&db_path)?;
+            let agent = Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            };
+            let agent_id = storage.ensure_agent(&agent)?;
+            let named_workspace = temp_dir.path().join("named");
+            std::fs::create_dir_all(&named_workspace)?;
+            let named_workspace_id = storage.ensure_workspace(&named_workspace, None)?;
+
+            // Conversation 1: no workspace.
+            let no_workspace_conversation = Conversation {
+                id: None,
+                agent_slug: agent.slug.clone(),
+                workspace: None,
+                external_id: Some("null-workspace".into()),
+                title: Some("null workspace".into()),
+                source_path: null_workspace_source_path.clone(),
+                started_at: Some(42),
+                ended_at: Some(42),
+                approx_tokens: Some(16),
+                metadata_json: serde_json::Value::Null,
+                messages: vec![Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: Some("user".into()),
+                    created_at: Some(42),
+                    content: "auth token failure".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                }],
+                source_id: "local".into(),
+                origin_host: None,
+            };
+            storage.insert_conversation_tree(agent_id, None, &no_workspace_conversation)?;
+
+            // Conversation 2: with workspace.
+            let named_workspace_conversation = Conversation {
+                id: None,
+                agent_slug: agent.slug.clone(),
+                workspace: Some(named_workspace.clone()),
+                external_id: Some("named-workspace".into()),
+                title: Some("named workspace".into()),
+                source_path: temp_dir.path().join("named-workspace.jsonl"),
+                started_at: Some(43),
+                ended_at: Some(43),
+                approx_tokens: Some(16),
+                metadata_json: serde_json::Value::Null,
+                messages: vec![Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: Some("user".into()),
+                    created_at: Some(43),
+                    content: "auth token failure".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                }],
+                source_id: "local".into(),
+                origin_host: None,
+            };
+            storage.insert_conversation_tree(
+                agent_id,
+                Some(named_workspace_id),
+                &named_workspace_conversation,
+            )?;
+        }
 
         let client = SearchClient {
-            reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
-            sqlite_path: None,
+            sqlite: Mutex::new(None),
+            sqlite_path: Some(db_path),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hits = client.search(
@@ -12568,59 +10349,9 @@ mod tests {
         )?;
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].workspace, "");
-        assert_eq!(hits[0].source_path, "/tmp/null-workspace.jsonl");
+        assert_eq!(hits[0].source_path, null_workspace_source_path_str);
 
         Ok(())
-    }
-
-    #[test]
-    fn sqlite_message_scan_preserves_boolean_or_precedence() {
-        let simple_or =
-            SearchClient::sqlite_message_scan_query("alpha OR beta").expect("simple OR scan query");
-        assert!(SearchClient::sqlite_message_scan_score("alpha", &simple_or) > 0.0);
-        assert!(SearchClient::sqlite_message_scan_score("beta", &simple_or) > 0.0);
-        assert_eq!(
-            SearchClient::sqlite_message_scan_score("gamma", &simple_or),
-            0.0
-        );
-
-        let and_then_or = SearchClient::sqlite_message_scan_query("alpha AND beta OR gamma")
-            .expect("AND followed by OR scan query");
-        assert!(
-            SearchClient::sqlite_message_scan_score("alpha gamma", &and_then_or) > 0.0,
-            "alpha AND (beta OR gamma) should accept the gamma branch"
-        );
-        assert_eq!(
-            SearchClient::sqlite_message_scan_score("alpha", &and_then_or),
-            0.0
-        );
-        assert_eq!(
-            SearchClient::sqlite_message_scan_score("beta gamma", &and_then_or),
-            0.0
-        );
-
-        let or_then_and = SearchClient::sqlite_message_scan_query("alpha OR beta AND gamma")
-            .expect("OR followed by AND scan query");
-        assert!(
-            SearchClient::sqlite_message_scan_score("alpha gamma", &or_then_and) > 0.0,
-            "(alpha OR beta) AND gamma should accept the alpha branch"
-        );
-        assert!(
-            SearchClient::sqlite_message_scan_score("beta gamma", &or_then_and) > 0.0,
-            "(alpha OR beta) AND gamma should accept the beta branch"
-        );
-        assert_eq!(
-            SearchClient::sqlite_message_scan_score("alpha", &or_then_and),
-            0.0
-        );
-
-        let binary_not =
-            SearchClient::sqlite_message_scan_query("alpha NOT beta").expect("NOT scan query");
-        assert!(SearchClient::sqlite_message_scan_score("alpha", &binary_not) > 0.0);
-        assert_eq!(
-            SearchClient::sqlite_message_scan_score("alpha beta", &binary_not),
-            0.0
-        );
     }
 
     #[test]
@@ -12658,20 +10389,12 @@ mod tests {
         &[])?;
 
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hits = client.browse_by_date(
@@ -12750,20 +10473,12 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hits = client.hydrate_semantic_hits_with_ids(
@@ -12830,20 +10545,12 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hits = client.hydrate_semantic_hits_with_ids(
@@ -12902,20 +10609,12 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hits = client.hydrate_semantic_hits_with_ids(
@@ -12990,20 +10689,12 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let first_hit = SearchHit {
@@ -13106,20 +10797,12 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hits = client.hydrate_semantic_hits_with_ids(
@@ -13191,20 +10874,12 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let first_hit = SearchHit {
@@ -13283,20 +10958,12 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -13365,20 +11032,12 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -13447,20 +11106,12 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -13530,20 +11181,12 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -13626,20 +11269,12 @@ mod tests {
         )?;
 
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hits = client.browse_by_date(
@@ -13657,172 +11292,16 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn cache_invalidates_on_new_data() -> Result<()> {
-        let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
-
-        // 1. Add initial doc
-        let conv1 = NormalizedConversation {
-            agent_slug: "codex".into(),
-            external_id: None,
-            title: Some("first".into()),
-            workspace: None,
-            source_path: dir.path().join("1.jsonl"),
-            started_at: Some(1),
-            ended_at: None,
-            metadata: serde_json::json!({}),
-            messages: vec![NormalizedMessage {
-                idx: 0,
-                role: "user".into(),
-                author: None,
-                created_at: Some(1),
-                content: "apple banana".into(),
-                extra: serde_json::json!({}),
-                snippets: vec![],
-                invocations: Vec::new(),
-            }],
-        };
-        index.add_conversation(&conv1)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
-
-        // 2. Search "app" -> should hit "apple"
-        let hits = client.search("app", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].content, "apple banana");
-
-        // 3. Verify it's cached (peek internal state)
-        {
-            let cache = client.prefix_cache.lock().unwrap();
-            let shard = cache.shard_opt("global").unwrap();
-            // "app" should be in cache
-            assert!(shard.contains(&client.cache_key("app", &SearchFilters::default())));
-        }
-
-        // 4. Add new doc with "apricot"
-        let conv2 = NormalizedConversation {
-            agent_slug: "codex".into(),
-            external_id: None,
-            title: Some("second".into()),
-            workspace: None,
-            source_path: dir.path().join("2.jsonl"),
-            started_at: Some(2),
-            ended_at: None,
-            metadata: serde_json::json!({}),
-            messages: vec![NormalizedMessage {
-                idx: 0,
-                role: "user".into(),
-                author: None,
-                created_at: Some(2),
-                content: "apricot".into(),
-                extra: serde_json::json!({}),
-                snippets: vec![],
-                invocations: Vec::new(),
-            }],
-        };
-        index.add_conversation(&conv2)?;
-        index.commit()?;
-
-        // 5. Force reload (mocking time passing or just ensuring reload triggers)
-        // In test, maybe_reload_reader uses 300ms debounce.
-        // We can rely on opstamp check logic which runs AFTER reload.
-        // We need to sleep briefly to bypass debounce or just modify test to not rely on time?
-        // Actually SearchClient::maybe_reload_reader checks duration.
-        std::thread::sleep(std::time::Duration::from_millis(350));
-
-        // 6. Search "ap" (prefix of apricot and apple)
-        // The cache for "app" should be cleared if opstamp changed.
-        let _hits = client.search("app", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
-        // Should now find 1 doc still ("apple"), but cache should have been cleared first
-
-        // Search "apr" -> should find "apricot"
-        let hits = client.search("apr", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].content, "apricot");
-
-        // Check that cache was cleared by verifying a stale key is gone?
-        // Or rely on correctness of results if we searched a common prefix?
-
-        Ok(())
-    }
-
-    #[test]
-    fn track_generation_clears_cache_on_change() {
-        let client = SearchClient {
-            reader: None,
-            sqlite: Mutex::new(None),
-            sqlite_path: None,
-            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
-            metrics: Metrics::default(),
-            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
-            semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
-        };
-
-        let hit = SearchHit {
-            title: "hello world".into(),
-            snippet: "hello".into(),
-            content: "hello world".into(),
-            content_hash: stable_content_hash("hello world"),
-            score: 1.0,
-            source_path: "p".into(),
-            agent: "a".into(),
-            workspace: "w".into(),
-            workspace_original: None,
-            created_at: None,
-            line_number: None,
-            match_type: MatchType::Exact,
-            source_id: "local".into(),
-            origin_kind: "local".into(),
-            origin_host: None,
-            conversation_id: None,
-        };
-        let hits = vec![hit];
-
-        client.put_cache("hello", &SearchFilters::default(), &hits);
-        {
-            let cache = client.prefix_cache.lock().unwrap();
-            assert!(!cache.shards.is_empty());
-        }
-
-        client.track_generation(1);
-        {
-            let cache = client.prefix_cache.lock().unwrap();
-            assert!(!cache.shards.is_empty());
-        }
-
-        client.track_generation(2);
-        {
-            let cache = client.prefix_cache.lock().unwrap();
-            assert!(cache.shards.is_empty());
-        }
-    }
 
     #[test]
     fn cache_total_cap_evicts_across_shards() {
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(2, 0)), // tiny entry cap, no byte cap
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -13863,20 +11342,12 @@ mod tests {
     #[test]
     fn cache_stats_reflect_metrics() {
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         client.metrics.inc_cache_hits();
@@ -13898,127 +11369,15 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_query_prewarm_schedules_only_after_hot_prefix_cache_entry() {
-        let (tx, rx) = mpsc::unbounded();
-        let client = SearchClient {
-            reader: None,
-            sqlite: Mutex::new(None),
-            sqlite_path: None,
-            prefix_cache: Mutex::new(CacheShards::new(10, 0)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: Some(tx),
-            _warm_handle: None,
-            metrics: Metrics::default(),
-            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
-            semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
-        };
-        let mut filters = SearchFilters::default();
-        filters.workspaces.insert("/tmp/cass-workspace".into());
-
-        client.maybe_schedule_adaptive_query_prewarm("hel", &filters);
-        assert!(
-            rx.try_recv().is_err(),
-            "cold prefixes should not schedule adaptive prewarm"
-        );
-
-        let mut hit = projected_minimal_fields_search_hit("hello title", "p");
-        hit.snippet = "hello".into();
-        hit.content = "hello world".into();
-        hit.content_hash = stable_content_hash(&hit.content);
-        client.put_cache("hel", &filters, std::slice::from_ref(&hit));
-
-        let total_cost_before = client.cache_stats().total_cost;
-        client.maybe_schedule_adaptive_query_prewarm("hel", &filters);
-        assert!(
-            rx.try_recv().is_err(),
-            "an exact cached query should not schedule redundant prewarm"
-        );
-        client.maybe_schedule_adaptive_query_prewarm("hello", &filters);
-
-        let job = rx
-            .try_recv()
-            .expect("hot prefix should schedule adaptive prewarm");
-        assert_eq!(job.query, "hello");
-        assert_eq!(job.shard_name, "workspace:/tmp/cass-workspace");
-        assert_eq!(job.filters_fingerprint, filters_fingerprint(&filters));
-        let stats = client.cache_stats();
-        assert_eq!(stats.prewarm_scheduled, 1);
-        assert_eq!(stats.prewarm_skipped_pressure, 0);
-        assert_eq!(
-            stats.total_cost, total_cost_before,
-            "prewarm scheduling should not mutate result-cache contents"
-        );
-    }
-
-    #[test]
-    fn adaptive_query_prewarm_skips_when_cache_byte_cap_is_under_pressure() {
-        let mut hit = projected_minimal_fields_search_hit("hello title", "p");
-        hit.snippet = "hello".into();
-        hit.content = "hello world with enough content to consume the small byte budget".into();
-        hit.content_hash = stable_content_hash(&hit.content);
-        let byte_cap = cached_hit_from(&hit).approx_bytes();
-
-        let (tx, rx) = mpsc::unbounded();
-        let client = SearchClient {
-            reader: None,
-            sqlite: Mutex::new(None),
-            sqlite_path: None,
-            prefix_cache: Mutex::new(CacheShards::new(10, byte_cap)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: Some(tx),
-            _warm_handle: None,
-            metrics: Metrics::default(),
-            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
-            semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
-        };
-        let filters = SearchFilters::default();
-
-        client.put_cache("hel", &filters, std::slice::from_ref(&hit));
-        client.maybe_schedule_adaptive_query_prewarm("zebra", &filters);
-        assert_eq!(
-            client.cache_stats().prewarm_skipped_pressure,
-            0,
-            "cold queries should not be counted as pressure-skipped prewarm jobs"
-        );
-
-        client.maybe_schedule_adaptive_query_prewarm("hello", &filters);
-
-        assert!(
-            rx.try_recv().is_err(),
-            "prewarm should be disabled while cache byte pressure is high"
-        );
-        let stats = client.cache_stats();
-        assert_eq!(stats.prewarm_scheduled, 0);
-        assert_eq!(stats.prewarm_skipped_pressure, 1);
-        assert!(stats.approx_bytes <= stats.byte_cap);
-    }
-
-    #[test]
     fn cache_eviction_count_tracks_evictions() {
         // tiny entry cap (2 entries), no byte cap - forces evictions
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(2, 0)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -14216,20 +11575,12 @@ mod tests {
     fn cache_byte_cap_triggers_eviction() {
         // Large entry cap (1000), tiny byte cap (100 bytes) - forces byte-based evictions
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(1000, 100)), // byte cap of 100
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         // Large content to exceed byte cap quickly
@@ -15120,33 +12471,12 @@ mod tests {
         assert!(deduped.iter().any(|h| h.source_id == "work-laptop"));
     }
 
-    #[test]
-    fn wildcard_fallback_sparse_check_uses_effective_limit() {
-        assert!(
-            !should_try_wildcard_fallback(1, 1, 0, 3),
-            "a filled one-result page is not sparse for fallback purposes"
-        );
-        assert!(
-            !should_try_wildcard_fallback(2, 2, 0, 3),
-            "a filled two-result page is not sparse for fallback purposes"
-        );
-        assert!(
-            should_try_wildcard_fallback(0, 1, 0, 3),
-            "zero hits should still trigger fallback even for tiny pages"
-        );
-        assert!(
-            should_try_wildcard_fallback(1, 2, 0, 3),
-            "a partially filled page should still trigger fallback"
-        );
-        assert!(
-            !should_try_wildcard_fallback(0, 5, 10, 3),
-            "pagination should not trigger wildcard fallback"
-        );
-        assert!(
-            should_try_wildcard_fallback(1, 0, 0, 3),
-            "limit zero preserves the legacy sparse-threshold semantics"
-        );
-    }
+    // W2-6 exec37 Task甲⑦ (structural-extinction ruling, w2-d4 family): the
+    // sibling test `wildcard_fallback_sparse_check_uses_effective_limit`
+    // (for the deleted `should_try_wildcard_fallback`) is removed here --
+    // the sparse-retry heuristic it locked down has no remaining caller now
+    // that `search_with_fallback`'s wildcard retry itself is gone. See
+    // `search_with_fallback`'s doc comment for the closed-form argument.
 
     #[test]
     fn snippet_preview_fast_path_requires_snippet_only_match() {
@@ -15182,9 +12512,9 @@ mod tests {
     #[test]
     fn search_with_fallback_returns_exact_when_sufficient() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
 
         // Add enough docs to exceed threshold - each with UNIQUE content to avoid dedup
+        let mut conversations = Vec::new();
         for i in 0..5 {
             let conv = NormalizedConversation {
                 agent_slug: "codex".into(),
@@ -15207,11 +12537,11 @@ mod tests {
                     invocations: Vec::new(),
                 }],
             };
-            index.add_conversation(&conv)?;
+            conversations.push(conv);
         }
-        index.commit()?;
+        let (dir, db_path) = seed_conversations_for_search_client(&conversations)?;
 
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // Search with low threshold - should not trigger fallback
         let result = client.search_with_fallback(
@@ -15225,7 +12555,14 @@ mod tests {
 
         assert!(!result.wildcard_fallback);
         assert!(result.hits.len() >= 3); // has enough results
-        assert_eq!(result.total_count, Some(5));
+        // W2-6 exec36 Task甲4-⑤ (control-plane 2026-08-31 ruling, 接受现状):
+        // `fts_lex` has no cheap exact-total-count path (the old Tantivy-only
+        // fast path this used to capture is gone with the engine) --
+        // `search_with_fallback` deliberately reports `None` rather than a
+        // stale/fabricated count (see the `tantivy_total` comment in
+        // `search_with_fallback`). This is a documented W2-6 Task2 product
+        // decision, not a regression; align the assertion with it.
+        assert_eq!(result.total_count, None);
 
         Ok(())
     }
@@ -15233,7 +12570,7 @@ mod tests {
     #[test]
     fn search_with_fallback_triggers_on_sparse_results() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         // Add docs with substring that won't match exact prefix
         let conv = NormalizedConversation {
@@ -15256,10 +12593,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // Search for "config" which should match "configuration" via prefix
         let result = client.search_with_fallback(
@@ -15281,7 +12616,7 @@ mod tests {
     #[test]
     fn search_with_fallback_skips_when_query_has_wildcards() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         let conv = NormalizedConversation {
             agent_slug: "codex".into(),
@@ -15303,10 +12638,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // Query already has wildcards - should not trigger fallback
         let result = client.search_with_fallback(
@@ -15323,12 +12656,28 @@ mod tests {
     }
 
     #[test]
-    fn search_with_fallback_prefers_wildcards_when_they_add_hits() -> Result<()> {
+    // W2-6 exec37 Task甲⑦ (structural-extinction ruling, w2-d4 family): renamed
+    // from `search_with_fallback_prefers_wildcards_when_they_add_hits`. This
+    // was the fixture the old Tantivy-era heuristic needed most -- a token
+    // ("bet") whose only matches are as a substring of a longer word
+    // ("alphabet") -- but `fts_lex`'s trigram baseline already substring-
+    // matches it directly, so `search_with_fallback`'s own baseline call
+    // finds both documents before the sparse-retry step is even reached.
+    // There is no remaining case in the trigram backend where the wildcard
+    // retry's candidate set is a strict superset of the baseline's -- see
+    // `search_with_fallback`'s doc comment for the closed-form argument (any
+    // reachable query resolves through either an FTS5 MATCH clause that
+    // transpiles byte-identically with or without `*`-decoration, or a LIKE
+    // scan where decoration only narrows the pattern) -- so this fixture now
+    // locks down that the baseline alone already carries the full result.
+    fn search_with_fallback_stays_inert_when_baseline_trigram_already_matches_substring(
+    ) -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         // None of these documents contain the exact token "bet",
         // but they do contain it as a substring ("alphabet").
+        let mut conversations = Vec::new();
         for (i, body) in [
             "alphabet soup for coders",
             "mapping the alphabet city blocks",
@@ -15356,11 +12705,10 @@ mod tests {
                     invocations: Vec::new(),
                 }],
             };
-            index.add_conversation(&conv)?;
+            conversations.push(conv);
         }
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&conversations)?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         let result = client.search_with_fallback(
             "bet",
@@ -15372,29 +12720,33 @@ mod tests {
         )?;
 
         assert!(
-            result.wildcard_fallback,
-            "should switch to wildcard fallback when it yields more hits"
+            !result.wildcard_fallback,
+            "trigram baseline already substring-matches; the retry heuristic has nothing to add"
         );
         assert_eq!(
             result.hits.len(),
             2,
-            "fallback should surface all alphabet docs"
+            "baseline alone should already surface all alphabet docs"
         );
-        assert!(
-            result
-                .hits
-                .iter()
-                .all(|h| h.match_type == MatchType::ImplicitWildcard)
-        );
+        assert!(result.hits.iter().all(|h| h.match_type == MatchType::Exact));
         assert!(result.hits.iter().all(|h| h.content.contains("alphabet")));
 
         Ok(())
     }
 
     #[test]
+    // W2-6 exec37 Task甲⑦ (structural-extinction ruling, w2-d4 family): the
+    // first half (long zero-hit token skips retry entirely) is untouched --
+    // `should_skip_automatic_wildcard_fallback_for_long_zero_hit_query` is a
+    // pure token-length guard, orthogonal to trigram substring semantics, and
+    // stays load-bearing. The second half's `short_result` assertions are
+    // rewritten: "pple" is a trigram substring of "apple" in the fixture, so
+    // the baseline call inside `search_with_fallback` already finds it and
+    // the sparse-retry step has nothing to add (same closed-form argument as
+    // the two renamed sibling tests above).
     fn automatic_wildcard_fallback_skips_long_zero_hit_token() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         let conv = NormalizedConversation {
             agent_slug: "codex".into(),
@@ -15416,10 +12768,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         let result = client.search_with_fallback(
             "zzzzzzunlikelyterm",
@@ -15447,88 +12797,12 @@ mod tests {
             1,
             FieldMask::FULL,
         )?;
-        assert!(short_result.wildcard_fallback);
+        assert!(
+            !short_result.wildcard_fallback,
+            "trigram baseline already substring-matches \"pple\"; retry has nothing to add"
+        );
         assert_eq!(short_result.hits.len(), 1);
-        assert_eq!(short_result.hits[0].match_type, MatchType::ImplicitWildcard);
-
-        Ok(())
-    }
-
-    #[test]
-    fn nohit_suggestions_do_not_lazy_open_sqlite_when_tantivy_is_present() -> Result<()> {
-        let dir = TempDir::new()?;
-        let index_path = dir.path().join("index");
-        let db_path = dir.path().join("cass.db");
-
-        let storage = FrankenStorage::open(&db_path)?;
-        storage.close()?;
-
-        let mut index = TantivyIndex::open_or_create(&index_path)?;
-        let conv = NormalizedConversation {
-            agent_slug: "codex".into(),
-            external_id: None,
-            title: Some("fruit".into()),
-            workspace: Some(std::path::PathBuf::from("/ws")),
-            source_path: dir.path().join("fruit.jsonl"),
-            started_at: Some(100),
-            ended_at: None,
-            metadata: serde_json::json!({}),
-            messages: vec![NormalizedMessage {
-                idx: 0,
-                role: "user".into(),
-                author: None,
-                created_at: Some(100),
-                content: "apple pear banana".into(),
-                extra: serde_json::json!({}),
-                snippets: vec![],
-                invocations: Vec::new(),
-            }],
-        };
-        index.add_conversation(&conv)?;
-        index.commit()?;
-
-        let client = SearchClient::open(&index_path, Some(&db_path))?.expect("index present");
-        assert!(
-            client
-                .sqlite
-                .lock()
-                .map(|guard| guard.is_none())
-                .unwrap_or(false),
-            "sqlite should start closed"
-        );
-
-        let result = client.search_with_fallback(
-            "zzzzzzunlikelyterm",
-            SearchFilters::default(),
-            10,
-            0,
-            1,
-            FieldMask::FULL,
-        )?;
-
-        assert!(result.hits.is_empty());
-        assert!(
-            result
-                .suggestions
-                .iter()
-                .any(|s| matches!(s.kind, SuggestionKind::WildcardQuery)),
-            "manual wildcard suggestion should remain available"
-        );
-        assert!(
-            result
-                .suggestions
-                .iter()
-                .all(|s| !matches!(s.kind, SuggestionKind::AlternateAgent)),
-            "alternate-agent suggestions should not force a SQLite open"
-        );
-        assert!(
-            client
-                .sqlite
-                .lock()
-                .map(|guard| guard.is_none())
-                .unwrap_or(false),
-            "sqlite should stay closed after Tantivy no-hit suggestions"
-        );
+        assert_eq!(short_result.hits[0].match_type, MatchType::Exact);
 
         Ok(())
     }
@@ -15536,20 +12810,12 @@ mod tests {
     #[test]
     fn search_with_fallback_emits_wildcard_suggestion_on_zero_hits() -> Result<()> {
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: "vtest|schema:none".into(),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let result = client.search_with_fallback(
@@ -15583,7 +12849,7 @@ mod tests {
     #[test]
     fn search_with_fallback_skips_empty_query() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         let conv = NormalizedConversation {
             agent_slug: "codex".into(),
@@ -15605,10 +12871,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // Empty query - should not trigger fallback
         let result = client.search_with_fallback(
@@ -15628,20 +12892,12 @@ mod tests {
     fn search_with_fallback_skips_for_nonzero_offset() -> Result<()> {
         // Even with zero hits, fallback should not run when paginating (offset > 0)
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: "vtest|schema:none".into(),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let result = client.search_with_fallback(
@@ -15672,20 +12928,12 @@ mod tests {
     fn generate_suggestions_limits_and_sets_shortcuts() -> Result<()> {
         // Build a client without backends; suggestions are purely local heuristics
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: "vtest|schema:none".into(),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let mut filters = SearchFilters::default();
@@ -15942,178 +13190,12 @@ mod tests {
     // Verify filters are never violated in search results
     // ============================================================
 
-    #[test]
-    fn tantivy_search_hydrates_long_content_when_content_field_is_not_stored() -> Result<()> {
-        let dir = TempDir::new()?;
-        let db_path = dir.path().join("cass.db");
-        let storage = FrankenStorage::open(&db_path)?;
-        let workspace_id = storage.ensure_workspace(dir.path(), None)?;
-        let agent = Agent {
-            id: None,
-            slug: "codex".into(),
-            name: "Codex".into(),
-            version: None,
-            kind: AgentKind::Cli,
-        };
-        let agent_id = storage.ensure_agent(&agent)?;
-        let long_content = format!(
-            "{}needle appears past the preview boundary for hydration proof",
-            "padding ".repeat(70)
-        );
-        let short_content = "shortneedle fits entirely inside the stored preview".to_string();
-        let conversation = Conversation {
-            id: None,
-            agent_slug: "codex".into(),
-            workspace: Some(dir.path().to_path_buf()),
-            external_id: Some("hydrate-long-content".into()),
-            title: Some("hydrated lexical doc".into()),
-            source_path: dir.path().join("hydrate.jsonl"),
-            started_at: Some(1_700_000_123_000),
-            ended_at: Some(1_700_000_123_000),
-            approx_tokens: Some(32),
-            metadata_json: json!({}),
-            messages: vec![
-                Message {
-                    id: None,
-                    idx: 0,
-                    role: MessageRole::User,
-                    author: Some("user".into()),
-                    created_at: Some(1_700_000_123_000),
-                    content: long_content.clone(),
-                    extra_json: json!({}),
-                    snippets: Vec::new(),
-                },
-                Message {
-                    id: None,
-                    idx: 1,
-                    role: MessageRole::Agent,
-                    author: Some("assistant".into()),
-                    created_at: Some(1_700_000_124_000),
-                    content: short_content.clone(),
-                    extra_json: json!({}),
-                    snippets: Vec::new(),
-                },
-            ],
-            source_id: crate::sources::provenance::LOCAL_SOURCE_ID.to_string(),
-            origin_host: None,
-        };
-        storage.insert_conversation_tree(agent_id, Some(workspace_id), &conversation)?;
-        storage.close()?;
-
-        let index_path = dir.path().join("search-index");
-        let mut index = TantivyIndex::open_or_create(&index_path)?;
-        let normalized = NormalizedConversation {
-            agent_slug: "codex".into(),
-            external_id: Some("hydrate-long-content".into()),
-            title: Some("hydrated lexical doc".into()),
-            workspace: Some(dir.path().to_path_buf()),
-            source_path: dir.path().join("hydrate.jsonl"),
-            started_at: Some(1_700_000_123_000),
-            ended_at: Some(1_700_000_123_000),
-            metadata: json!({}),
-            messages: vec![
-                NormalizedMessage {
-                    idx: 0,
-                    role: "user".into(),
-                    author: Some("user".into()),
-                    created_at: Some(1_700_000_123_000),
-                    content: long_content.clone(),
-                    extra: json!({}),
-                    snippets: vec![],
-                    invocations: Vec::new(),
-                },
-                NormalizedMessage {
-                    idx: 1,
-                    role: "assistant".into(),
-                    author: Some("assistant".into()),
-                    created_at: Some(1_700_000_124_000),
-                    content: short_content.clone(),
-                    extra: json!({}),
-                    snippets: vec![],
-                    invocations: Vec::new(),
-                },
-            ],
-        };
-        index.add_conversation(&normalized)?;
-        index.commit()?;
-
-        let client = SearchClient::open(&index_path, Some(&db_path))?.expect("db-backed client");
-        let hits = client.search("needle", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
-
-        assert_eq!(hits.len(), 1, "expected one lexical hit");
-        assert_eq!(hits[0].title, "hydrated lexical doc");
-        assert!(
-            hits[0]
-                .content
-                .contains("needle appears past the preview boundary"),
-            "lexical hit should hydrate full content from sqlite when Tantivy content is not stored"
-        );
-        assert!(
-            hits[0].snippet.to_lowercase().contains("needle"),
-            "snippet should still be rendered from hydrated content"
-        );
-
-        let bounded_hits = client.search(
-            "needle",
-            SearchFilters::default(),
-            5,
-            0,
-            FieldMask::FULL.with_preview_content_limit(Some(200)),
-        )?;
-
-        assert_eq!(bounded_hits.len(), 1, "expected one lexical hit");
-        assert!(
-            bounded_hits[0].content.starts_with("padding padding"),
-            "bounded content may be served from the stored preview prefix"
-        );
-        assert!(
-            !bounded_hits[0]
-                .content
-                .contains("needle appears past the preview boundary"),
-            "bounded preview content should not hydrate the full sqlite row"
-        );
-
-        let short_client =
-            SearchClient::open(&index_path, Some(&db_path))?.expect("db-backed client");
-        assert!(
-            short_client
-                .sqlite
-                .lock()
-                .map(|guard| guard.is_none())
-                .unwrap_or(false),
-            "sqlite should start closed for short preview hit"
-        );
-
-        let short_hits = short_client.search(
-            "shortneedle",
-            SearchFilters::default(),
-            5,
-            0,
-            FieldMask::FULL,
-        )?;
-
-        assert_eq!(short_hits.len(), 1, "expected one short lexical hit");
-        assert_eq!(
-            short_hits[0].content, short_content,
-            "untruncated stored preview is exact full content"
-        );
-        assert!(
-            short_client
-                .sqlite
-                .lock()
-                .map(|guard| guard.is_none())
-                .unwrap_or(false),
-            "short full-content hit should not lazy-open sqlite"
-        );
-
-        Ok(())
-    }
 
     #[test]
     fn filter_fidelity_agent_filter_respected() -> Result<()> {
         // Multiple agents; filter should return only matching agent
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         // Agent A (codex)
         let conv_a = NormalizedConversation {
@@ -16157,11 +13239,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv_a)?;
-        index.add_conversation(&conv_b)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv_a, conv_b])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // Search with agent filter for codex only
         let mut filters = SearchFilters::default();
@@ -16192,7 +13271,7 @@ mod tests {
     fn filter_fidelity_workspace_filter_respected() -> Result<()> {
         // Multiple workspaces; filter should return only matching workspace
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         // Workspace A
         let conv_a = NormalizedConversation {
@@ -16236,11 +13315,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv_a)?;
-        index.add_conversation(&conv_b)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv_a, conv_b])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // Search with workspace filter for beta only
         let mut filters = SearchFilters::default();
@@ -16274,7 +13350,7 @@ mod tests {
     fn filter_fidelity_date_range_respected() -> Result<()> {
         // Multiple dates; filter should return only within range
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         // Early doc (ts=100)
         let conv_early = NormalizedConversation {
@@ -16339,12 +13415,9 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv_early)?;
-        index.add_conversation(&conv_middle)?;
-        index.add_conversation(&conv_late)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) =
+            seed_conversations_for_search_client(&[conv_early, conv_middle, conv_late])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // Filter for middle range only (400-600)
         let filters = SearchFilters {
@@ -16385,7 +13458,7 @@ mod tests {
     fn filter_fidelity_combined_filters_respected() -> Result<()> {
         // Combine agent + workspace + date filters
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         // Create 4 docs with different combinations
         let combinations = [
@@ -16395,6 +13468,7 @@ mod tests {
             ("claude", "/ws/prod", 900), // correct agent, correct ws, wrong date
         ];
 
+        let mut conversations = Vec::new();
         for (i, (agent, ws, ts)) in combinations.iter().enumerate() {
             let conv = NormalizedConversation {
                 agent_slug: (*agent).into(),
@@ -16416,11 +13490,10 @@ mod tests {
                     invocations: Vec::new(),
                 }],
             };
-            index.add_conversation(&conv)?;
+            conversations.push(conv);
         }
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&conversations)?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // Filter: claude + /ws/prod + date 400-600
         let mut filters = SearchFilters::default();
@@ -16452,7 +13525,7 @@ mod tests {
     #[test]
     fn lexical_hits_normalize_trimmed_local_source_metadata() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         let conv = NormalizedConversation {
             agent_slug: "codex".into(),
@@ -16481,10 +13554,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
         let hits = client.search("trimmed", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
 
         assert_eq!(hits.len(), 1);
@@ -16497,7 +13568,7 @@ mod tests {
     #[test]
     fn lexical_hits_normalize_remote_origin_kind_without_source_id() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         let conv = NormalizedConversation {
             agent_slug: "codex".into(),
@@ -16527,10 +13598,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
         let hits = client.search("remote", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
 
         assert_eq!(hits.len(), 1);
@@ -16544,7 +13613,7 @@ mod tests {
     #[test]
     fn lexical_hits_infer_remote_origin_from_host_without_kind() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         let conv = NormalizedConversation {
             agent_slug: "codex".into(),
@@ -16573,10 +13642,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
         let hits = client.search("legacy", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
 
         assert_eq!(hits.len(), 1);
@@ -16591,7 +13658,7 @@ mod tests {
     fn filter_fidelity_source_filter_respected() -> Result<()> {
         // P3.1: Source filter should filter by origin_kind or source_id
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         // Local source doc
         let conv_local = NormalizedConversation {
@@ -16616,10 +13683,8 @@ mod tests {
         };
         // Remote source doc (would need to be indexed with ssh origin_kind)
         // For now, test that local filter returns local docs
-        index.add_conversation(&conv_local)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv_local])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // Filter for local sources
         let filters = SearchFilters {
@@ -16665,20 +13730,12 @@ mod tests {
     fn filter_fidelity_cache_key_isolation() {
         // Different filters should have different cache keys
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let filters_empty = SearchFilters::default();
@@ -16828,21 +13885,32 @@ mod tests {
     #[test]
     fn transpile_to_fts5_ignores_leading_or() {
         assert_eq!(transpile_to_fts5("OR test"), Some("test".to_string()));
+        // W2-6 exec36 Task甲4-④ (Ivan 2026-08-31 ruling): hyphenated compound
+        // terms are now phrase-quoted rather than split (see the sibling
+        // `transpile_to_fts5_keeps_hyphenated_subterm_as_phrase_for_sqlite_
+        // fts` test).
         assert_eq!(
             transpile_to_fts5("OR foo-bar"),
-            Some("(foo AND bar)".to_string())
+            Some("\"foo-bar\"".to_string())
         );
     }
 
     #[test]
-    fn transpile_to_fts5_splits_hyphenated_subterms_for_sqlite_fts() {
+    fn transpile_to_fts5_keeps_hyphenated_subterm_as_phrase_for_sqlite_fts() {
+        // W2-6 exec36 Task甲4-④ (Ivan 2026-08-31 ruling): renamed from
+        // `..._splits_hyphenated_subterms_...` -- a hyphenated compound
+        // sub-term (dot-separated from the rest) is now phrase-quoted
+        // instead of split into separate AND'd words, matching
+        // `fs_cass_sanitize_query`'s own documented "hyphens preserved as
+        // compound-word glue" design. Probe-verified against both `fts_lex`
+        // (trigram) and the legacy `fts_messages` (porter) tokenizers.
         assert_eq!(
             transpile_to_fts5("br-123.jsonl"),
-            Some("(br AND 123 AND jsonl)".to_string())
+            Some("(\"br-123\" AND jsonl)".to_string())
         );
         assert_eq!(
             transpile_to_fts5("br-123.json*"),
-            Some("(br AND 123 AND json*)".to_string())
+            Some("(\"br-123\" AND json*)".to_string())
         );
     }
 
@@ -16854,253 +13922,8 @@ mod tests {
         );
         assert_eq!(
             transpile_to_fts5("foo NOT bar-baz"),
-            Some("foo NOT (bar AND baz)".to_string())
+            Some("foo NOT \"bar-baz\"".to_string())
         );
-    }
-
-    #[test]
-    fn search_sqlite_fts5_returns_empty_when_sqlite_is_unavailable() {
-        let client = SearchClient {
-            reader: None,
-            sqlite: Mutex::new(None),
-            sqlite_path: None,
-            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: false,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
-            metrics: Metrics::default(),
-            cache_namespace: "fts5-disabled".to_string(),
-            semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
-        };
-
-        let hits = client.search_sqlite_fts5(
-            Path::new("/nonexistent"),
-            "test query",
-            SearchFilters::default(),
-            10,
-            0,
-            FieldMask::FULL,
-        );
-
-        assert!(hits.is_ok(), "disabled FTS5 path should stay non-fatal");
-        assert!(
-            hits.unwrap().is_empty(),
-            "unavailable SQLite fallback should keep returning an empty result set"
-        );
-    }
-
-    /// `coding_agent_session_search-k0e5p` (ibuuh.24.2 sub-bead):
-    /// E2E equivalence gate for the rank+hydrate FTS5 fallback split
-    /// landed in peer commit c91ea038. The peer's existing unit test
-    /// pins the rank-SQL SHAPE (no content columns referenced) but
-    /// nothing pins the user-facing RESULT-SET equivalence. A
-    /// regression where the hydrate phase silently re-orders, drops,
-    /// or re-filters hits would slip past the SQL-shape check and
-    /// produce user-visible quality changes.
-    ///
-    /// This test pins the prefix invariant (same pattern as bead
-    /// 1dd5u for the lexical search path): seed N ranked hits in the
-    /// FTS5 fallback DB, run search_sqlite_fts5 at limit=K and
-    /// limit=N, assert the smaller-limit result is a prefix of the
-    /// larger-limit result. A regression in either rank or hydrate
-    /// (re-order, drop, re-filter) trips immediately.
-    ///
-    /// Pins three invariants:
-    /// 1. Smaller-limit hits are a strict prefix of larger-limit hits.
-    /// 2. Limit=N returns exactly N matches when ≥N candidates exist.
-    /// 3. Limit=0 returns empty (boundary case the rank+hydrate
-    ///    split could break by hydrating before honoring the limit).
-    #[test]
-    fn search_sqlite_fts5_rank_and_hydrate_split_preserves_limit_prefix_invariant() -> Result<()> {
-        let conn = Connection::open_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
-             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
-             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
-             CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                agent_id INTEGER,
-                workspace_id INTEGER,
-                source_id TEXT,
-                origin_host TEXT,
-                title TEXT,
-                source_path TEXT
-             );
-             CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER,
-                idx INTEGER,
-                content TEXT,
-                created_at INTEGER
-             );
-             CREATE VIRTUAL TABLE fts_messages USING fts5(
-                content,
-                title,
-                agent,
-                workspace,
-                source_path,
-                created_at UNINDEXED,
-                message_id UNINDEXED,
-                tokenize='porter'
-             );",
-        )?;
-        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')", &[])?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
-        conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/tmp/k0e5p')", &[])?;
-
-        // Seed N=6 messages all matching the same query token. Each
-        // gets a distinct message_id + content shape so the prefix
-        // assertion can pin specific ordering rather than just
-        // counts. The bm25 score depends on per-row term frequency;
-        // we vary `rankprobe` repetition (1×..6×) so the rank phase
-        // produces a deterministic descending order.
-        for (i, repeats) in (1..=6_i64).enumerate() {
-            let conv_id = i as i64 + 1;
-            let msg_id = (i as i64 + 1) * 10;
-            conn.execute(
-                "INSERT INTO conversations(id, agent_id, workspace_id, source_id, \
-                 origin_host, title, source_path) \
-                 VALUES(?1, 1, 1, 'local', NULL, ?2, ?3)",
-                fparams![
-                    conv_id,
-                    format!("k0e5p-{}", i),
-                    format!("/tmp/k0e5p/{}.jsonl", i),
-                ],
-            )?;
-            let content = "rankprobe ".repeat(repeats as usize);
-            conn.execute(
-                "INSERT INTO messages(id, conversation_id, idx, content, created_at) \
-                 VALUES(?1, ?2, ?3, ?4, ?5)",
-                fparams![
-                    msg_id,
-                    conv_id,
-                    i as i64,
-                    content.as_str(),
-                    1_700_000_000_i64 + i as i64
-                ],
-            )?;
-            conn.execute(
-                "INSERT INTO fts_messages(rowid, content, title, agent, workspace, \
-                 source_path, created_at, message_id) \
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                fparams![
-                    msg_id,
-                    content.as_str(),
-                    format!("k0e5p-{}", i),
-                    "codex",
-                    "/tmp/k0e5p",
-                    format!("/tmp/k0e5p/{}.jsonl", i),
-                    1_700_000_000_i64 + i as i64,
-                    msg_id,
-                ],
-            )?;
-        }
-
-        let client = SearchClient {
-            reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
-            sqlite_path: None,
-            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: false,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
-            metrics: Metrics::default(),
-            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:k0e5p"),
-            semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
-        };
-
-        // Hit-key tuple: (source_path, line_number) is the stable
-        // operator-visible identity. Two limits that share a prefix
-        // must produce hits with the same identities in the same
-        // order across that prefix.
-        fn hit_keys(hits: &[SearchHit]) -> Vec<(String, Option<usize>)> {
-            hits.iter()
-                .map(|h| (h.source_path.clone(), h.line_number))
-                .collect()
-        }
-
-        let large_hits = client.search_sqlite_fts5(
-            Path::new(":memory:"),
-            "rankprobe",
-            SearchFilters::default(),
-            6,
-            0,
-            FieldMask::FULL,
-        )?;
-        assert_eq!(
-            large_hits.len(),
-            6,
-            "limit=N must return all N candidates when the corpus has exactly N matches"
-        );
-
-        let small_hits = client.search_sqlite_fts5(
-            Path::new(":memory:"),
-            "rankprobe",
-            SearchFilters::default(),
-            3,
-            0,
-            FieldMask::FULL,
-        )?;
-        assert_eq!(small_hits.len(), 3, "limit=3 must return exactly 3 hits");
-
-        // Invariant 1: smaller-limit hits are a STRICT prefix of the
-        // larger-limit hits — same identity, same order.
-        let large_keys = hit_keys(&large_hits);
-        let small_keys = hit_keys(&small_hits);
-        assert_eq!(
-            small_keys,
-            large_keys[..3],
-            "limit=3 hit keys MUST be the first 3 of limit=6 hit keys (rank+hydrate \
-             split must not re-order or re-filter); small={small_keys:?} \
-             large_prefix={:?}",
-            &large_keys[..3]
-        );
-
-        // Invariant 2: hit content is also identical across the
-        // shared prefix — the hydrate phase preserves the content
-        // string the rank phase ranked. A regression where hydrate
-        // pulled from a different DB row than rank pointed at would
-        // trip this even if the keys aligned.
-        for (idx, (small, large)) in small_hits.iter().zip(large_hits.iter()).enumerate() {
-            assert_eq!(
-                small.content, large.content,
-                "hit[{idx}] content must agree across limit=3 and limit=6: \
-                 small={:?} large={:?}",
-                small.content, large.content
-            );
-            assert_eq!(
-                small.title, large.title,
-                "hit[{idx}] title must agree across limit=3 and limit=6"
-            );
-        }
-
-        // Invariant 3: limit=0 boundary. The rank+hydrate split could
-        // break this by hydrating before honoring the limit; pinning
-        // it directly catches that regression class.
-        let zero_hits = client.search_sqlite_fts5(
-            Path::new(":memory:"),
-            "rankprobe",
-            SearchFilters::default(),
-            0,
-            0,
-            FieldMask::FULL,
-        )?;
-        assert!(
-            zero_hits.is_empty(),
-            "limit=0 must return zero hits even though the rank phase has candidates; \
-             got {} hits",
-            zero_hits.len()
-        );
-
-        Ok(())
     }
 
     // --- levenshtein_distance tests ---
@@ -17159,7 +13982,7 @@ mod tests {
     #[test]
     fn search_boolean_and_filters_results() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         // Create documents with different word combinations
         let conv1 = NormalizedConversation {
@@ -17202,11 +14025,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv1)?;
-        index.add_conversation(&conv2)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv1, conv2])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // "alpha AND beta" should only match doc1
         let hits = client.search(
@@ -17236,7 +14056,7 @@ mod tests {
     #[test]
     fn search_boolean_or_expands_results() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         let conv1 = NormalizedConversation {
             agent_slug: "codex".into(),
@@ -17278,11 +14098,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv1)?;
-        index.add_conversation(&conv2)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv1, conv2])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // "xyzzy OR plugh" should match both docs
         let hits = client.search(
@@ -17300,7 +14117,7 @@ mod tests {
     #[test]
     fn search_boolean_not_excludes_results() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         let conv1 = NormalizedConversation {
             agent_slug: "codex".into(),
@@ -17342,11 +14159,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv1)?;
-        index.add_conversation(&conv2)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv1, conv2])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // "nottest NOT exclude" should only match doc1 (has nottest but NOT exclude)
         let hits = client.search(
@@ -17383,7 +14197,7 @@ mod tests {
     #[test]
     fn search_phrase_query_matches_exact_sequence() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         let conv1 = NormalizedConversation {
             agent_slug: "codex".into(),
@@ -17425,11 +14239,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv1)?;
-        index.add_conversation(&conv2)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv1, conv2])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // "quick brown" (without quotes) should match both (words just need to be present)
         let hits = client.search(
@@ -17458,7 +14269,7 @@ mod tests {
     #[test]
     fn search_dot_punctuation_splits_terms_but_hyphens_preserve_compound_semantics() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         let conv = NormalizedConversation {
             agent_slug: "codex".into(),
@@ -17480,10 +14291,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         let hits = client.search("foo.bar", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
         assert_eq!(hits.len(), 1);
@@ -17645,7 +14454,7 @@ mod tests {
     fn search_multi_filter_agent_workspace_time() -> Result<()> {
         // Test combining agent, workspace, and time range filters
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         // Create 4 conversations with different combinations
         let convs = [
@@ -17655,6 +14464,7 @@ mod tests {
             ("codex", "/ws/alpha", 300, "needle alpha codex late"),
         ];
 
+        let mut conversations = Vec::new();
         for (i, (agent, ws, ts, content)) in convs.iter().enumerate() {
             let conv = NormalizedConversation {
                 agent_slug: (*agent).into(),
@@ -17676,11 +14486,10 @@ mod tests {
                     invocations: Vec::new(),
                 }],
             };
-            index.add_conversation(&conv)?;
+            conversations.push(conv);
         }
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&conversations)?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // Filter: codex + alpha + time 50-250
         let mut filters = SearchFilters::default();
@@ -17707,8 +14516,9 @@ mod tests {
     fn search_multi_agent_filter() -> Result<()> {
         // Test filtering by multiple agents
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
 
+
+        let mut conversations = Vec::new();
         for agent in ["codex", "claude", "cline", "gemini"] {
             let conv = NormalizedConversation {
                 agent_slug: agent.into(),
@@ -17730,11 +14540,10 @@ mod tests {
                     invocations: Vec::new(),
                 }],
             };
-            index.add_conversation(&conv)?;
+            conversations.push(conv);
         }
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&conversations)?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // Filter for codex and claude only
         let mut filters = SearchFilters::default();
@@ -17759,20 +14568,12 @@ mod tests {
     #[test]
     fn cache_metrics_incremented_on_operations() {
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         // Initial metrics should be zero
@@ -17797,20 +14598,12 @@ mod tests {
     fn cache_shard_name_deterministic() {
         // Verify that shard name generation is deterministic for same filters
         let client = SearchClient {
-            reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            reload_on_search: true,
-            last_reload: Mutex::new(None),
-            last_generation: Mutex::new(None),
-            reload_epoch: Arc::new(AtomicU64::new(0)),
-            warm_tx: None,
-            _warm_handle: None,
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
-            last_tantivy_total_count: Mutex::new(None),
         };
 
         let filters1 = SearchFilters::default();
@@ -17849,7 +14642,7 @@ mod tests {
     #[test]
     fn wildcard_fallback_respects_filter_constraints() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         // Create conversations that would match wildcard but not filter
         let conv_match = NormalizedConversation {
@@ -17894,11 +14687,8 @@ mod tests {
             }],
         };
 
-        index.add_conversation(&conv_match)?;
-        index.add_conversation(&conv_other)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv_match, conv_other])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // Search with filter that only matches conv_match
         let mut filters = SearchFilters::default();
@@ -17915,7 +14705,7 @@ mod tests {
     #[test]
     fn wildcard_fallback_short_query_triggers_prefix() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         let conv = NormalizedConversation {
             agent_slug: "codex".into(),
@@ -17937,10 +14727,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // Short prefix "auth" should match "authentication" and "authorization"
         let result = client.search_with_fallback(
@@ -17967,7 +14755,7 @@ mod tests {
     #[test]
     fn search_real_fixture_multiple_messages() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         // Create a realistic conversation with multiple messages
         let conv = NormalizedConversation {
@@ -18021,10 +14809,8 @@ mod tests {
                 },
             ],
         };
-        index.add_conversation(&conv)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // Search for various terms that should match
         let hits = client.search(
@@ -18071,9 +14857,10 @@ mod tests {
     #[test]
     fn search_deduplication_with_similar_content() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         // Create two conversations with very similar content
+        let mut conversations = Vec::new();
         for i in 0..2 {
             let conv = NormalizedConversation {
                 agent_slug: "codex".into(),
@@ -18096,11 +14883,10 @@ mod tests {
                     invocations: Vec::new(),
                 }],
             };
-            index.add_conversation(&conv)?;
+            conversations.push(conv);
         }
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&conversations)?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
         let result = client.search_with_fallback(
             "sorting algorithm",
             SearchFilters::default(),
@@ -18125,7 +14911,7 @@ mod tests {
     fn search_session_paths_filter() -> Result<()> {
         // Test filtering by specific session source paths (for chained searches)
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         // Create 3 conversations with different source paths
         let paths = [
@@ -18134,6 +14920,7 @@ mod tests {
             dir.path().join("session-c.jsonl"),
         ];
 
+        let mut conversations = Vec::new();
         for (i, path) in paths.iter().enumerate() {
             let conv = NormalizedConversation {
                 agent_slug: "claude".into(),
@@ -18155,11 +14942,10 @@ mod tests {
                     invocations: Vec::new(),
                 }],
             };
-            index.add_conversation(&conv)?;
+            conversations.push(conv);
         }
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&conversations)?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // First, search without filter - should get all 3
         let hits_all = client.search("needle", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
@@ -18196,9 +14982,10 @@ mod tests {
     #[test]
     fn lexical_session_paths_filter_retries_past_initial_page() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
         let requested_path = dir.path().join("requested-session.jsonl");
 
+        let mut conversations = Vec::new();
         for i in 0..4 {
             let conv = NormalizedConversation {
                 agent_slug: "claude".into(),
@@ -18220,7 +15007,7 @@ mod tests {
                     invocations: Vec::new(),
                 }],
             };
-            index.add_conversation(&conv)?;
+            conversations.push(conv);
         }
 
         let requested = NormalizedConversation {
@@ -18243,10 +15030,10 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&requested)?;
-        index.commit()?;
+        conversations.push(requested);
+        let (dir, db_path) = seed_conversations_for_search_client(&conversations)?;
 
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
         let mut filters = SearchFilters::default();
         filters
             .session_paths
@@ -18264,7 +15051,7 @@ mod tests {
     fn search_session_paths_empty_filter_returns_all() -> Result<()> {
         // Empty session_paths filter should not restrict results
         let dir = TempDir::new()?;
-        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
 
         let conv = NormalizedConversation {
             agent_slug: "claude".into(),
@@ -18286,10 +15073,8 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        index.add_conversation(&conv)?;
-        index.commit()?;
-
-        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
         // Empty session_paths should not filter
         let filters = SearchFilters::default();
@@ -18297,133 +15082,6 @@ mod tests {
 
         let hits = client.search("needle", filters, 10, 0, FieldMask::FULL)?;
         assert_eq!(hits.len(), 1);
-
-        Ok(())
-    }
-
-    #[test]
-    fn search_client_reads_federated_lexical_bundle_as_one_corpus() -> Result<()> {
-        let root = TempDir::new()?;
-        let shard_a = root.path().join("shard-a");
-        let shard_b = root.path().join("shard-b");
-        let published = root.path().join("published");
-
-        let mut shard_a_index = TantivyIndex::open_or_create(&shard_a)?;
-        let mut shard_b_index = TantivyIndex::open_or_create(&shard_b)?;
-
-        let make_conv =
-            |external_id: &str, title: &str, source_path: &str, tag: &str| NormalizedConversation {
-                agent_slug: "codex".into(),
-                external_id: Some(external_id.into()),
-                title: Some(title.into()),
-                workspace: Some(std::path::PathBuf::from("/ws")),
-                source_path: std::path::PathBuf::from(source_path),
-                started_at: Some(1_700_000_100_000),
-                ended_at: Some(1_700_000_100_100),
-                metadata: json!({}),
-                messages: vec![
-                    NormalizedMessage {
-                        idx: 0,
-                        role: "user".into(),
-                        author: None,
-                        created_at: Some(1_700_000_100_010),
-                        content: format!("shared federated needle {tag} user"),
-                        extra: json!({}),
-                        snippets: vec![],
-                        invocations: Vec::new(),
-                    },
-                    NormalizedMessage {
-                        idx: 1,
-                        role: "assistant".into(),
-                        author: None,
-                        created_at: Some(1_700_000_100_020),
-                        content: format!("shared federated needle {tag} assistant"),
-                        extra: json!({}),
-                        snippets: vec![],
-                        invocations: Vec::new(),
-                    },
-                ],
-            };
-
-        let conv_a = make_conv(
-            "fed-query-a",
-            "Fed Query A",
-            "/tmp/fed-query-a.jsonl",
-            "alpha",
-        );
-        let conv_b = make_conv(
-            "fed-query-b",
-            "Fed Query B",
-            "/tmp/fed-query-b.jsonl",
-            "beta",
-        );
-
-        shard_a_index.add_conversation(&conv_a)?;
-        shard_b_index.add_conversation(&conv_b)?;
-        shard_a_index.commit()?;
-        shard_b_index.commit()?;
-        drop(shard_a_index);
-        drop(shard_b_index);
-
-        crate::search::tantivy::publish_federated_searchable_index_directories(
-            &published,
-            &[&shard_a, &shard_b],
-        )?;
-
-        let client = SearchClient::open(&published, None)?.expect("federated index present");
-        assert!(client.has_tantivy());
-        assert_eq!(client.total_docs(), 4);
-
-        let hits = client.search(
-            "shared federated needle",
-            SearchFilters::default(),
-            10,
-            0,
-            FieldMask::FULL,
-        )?;
-        assert_eq!(hits.len(), 4);
-        let observed_order = hits
-            .iter()
-            .map(|hit| {
-                (
-                    hit.source_path.clone(),
-                    hit.line_number,
-                    hit.content.clone(),
-                    hit.score.to_bits(),
-                )
-            })
-            .collect::<Vec<_>>();
-        let hit_paths = hits
-            .iter()
-            .map(|hit| hit.source_path.as_str())
-            .collect::<std::collections::HashSet<_>>();
-        assert!(hit_paths.contains("/tmp/fed-query-a.jsonl"));
-        assert!(hit_paths.contains("/tmp/fed-query-b.jsonl"));
-
-        for attempt in 0..3 {
-            let repeated = client.search(
-                "shared federated needle",
-                SearchFilters::default(),
-                10,
-                0,
-                FieldMask::FULL,
-            )?;
-            let repeated_order = repeated
-                .iter()
-                .map(|hit| {
-                    (
-                        hit.source_path.clone(),
-                        hit.line_number,
-                        hit.content.clone(),
-                        hit.score.to_bits(),
-                    )
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(
-                repeated_order, observed_order,
-                "federated lexical query order drifted on repeated attempt {attempt}"
-            );
-        }
 
         Ok(())
     }
@@ -18718,33 +15376,14 @@ mod tests {
         assert_eq!(cap, NO_LIMIT_RESULT_MIN);
     }
 
-    #[test]
-    fn exact_total_count_policy_allows_small_indexes_only() {
-        assert!(should_collect_exact_total_count(49_999, 50_000));
-        assert!(should_collect_exact_total_count(50_000, 50_000));
-        assert!(!should_collect_exact_total_count(50_001, 50_000));
-    }
-
-    #[test]
-    fn exact_total_count_policy_zero_limit_disables_recount() {
-        assert!(!should_collect_exact_total_count(0, 0));
-        assert!(!should_collect_exact_total_count(1, 0));
-        assert!(!should_collect_exact_total_count(usize::MAX, 0));
-    }
-
-    #[test]
-    fn automatic_wildcard_fallback_policy_allows_small_indexes_only() {
-        assert!(should_allow_automatic_wildcard_fallback(9_999, 10_000));
-        assert!(should_allow_automatic_wildcard_fallback(10_000, 10_000));
-        assert!(!should_allow_automatic_wildcard_fallback(10_001, 10_000));
-    }
-
-    #[test]
-    fn automatic_wildcard_fallback_policy_zero_limit_disables_fallback() {
-        assert!(!should_allow_automatic_wildcard_fallback(0, 0));
-        assert!(!should_allow_automatic_wildcard_fallback(1, 0));
-        assert!(!should_allow_automatic_wildcard_fallback(usize::MAX, 0));
-    }
+    // W2-6 exec37 Task甲⑦ (structural-extinction ruling, w2-d4 family): the
+    // sibling tests `automatic_wildcard_fallback_policy_allows_small_indexes_only`
+    // and `automatic_wildcard_fallback_policy_zero_limit_disables_fallback`
+    // (for the deleted `should_allow_automatic_wildcard_fallback` /
+    // `automatic_wildcard_fallback_max_docs`) are removed here -- the
+    // large-index opt-out they locked down has no remaining caller now that
+    // `search_with_fallback`'s wildcard retry itself is gone. See
+    // `search_with_fallback`'s doc comment for the closed-form argument.
 
     #[test]
     fn compute_no_limit_result_cap_uses_meminfo_when_no_env_override() {
@@ -19738,7 +16377,12 @@ mod tests {
         let sanitized = sanitize_query("[a-z]+");
         let parts: Vec<&str> = sanitized.split_whitespace().collect();
         assert_eq!(parts, vec!["a-z"]);
-        assert_eq!(normalize_term_parts("[a-z]+"), vec!["a", "z"]);
+        // W2-6 exec36 Task甲4-④ (Ivan 2026-08-31 ruling): `normalize_term_
+        // parts` now keeps an internal hyphen inside its fragment instead of
+        // splitting on it (see that function's doc comment) -- "a-z" is
+        // indistinguishable from any other hyphenated compound fragment at
+        // this layer.
+        assert_eq!(normalize_term_parts("[a-z]+"), vec!["a-z"]);
     }
 
     #[test]
@@ -20971,15 +17615,26 @@ mod tests {
         // Wildcards (allowed trailing)
         assert_eq!(transpile_to_fts5("foo*"), Some("foo*".to_string()));
 
-        // Unsupported wildcards (leading/internal)
-        assert_eq!(transpile_to_fts5("*foo"), None);
+        // W2-6 exec36 Task甲4-② (Ivan 2026-08-31 ruling): a leading-star
+        // (suffix) term downgrades to its bare core instead of being
+        // rejected -- `fts_lex`'s trigram tokenizer already substring
+        // matches any plain term. Internal wildcards (Complex) remain
+        // unsupported.
+        assert_eq!(transpile_to_fts5("*foo"), Some("foo".to_string()));
         assert_eq!(transpile_to_fts5("f*o"), None);
 
-        // SQLite FTS5's porter tokenizer splits punctuation into separate
-        // fragments, so fallback queries must do the same.
+        // W2-6 exec36 Task甲4-④ (Ivan 2026-08-31 ruling): a bare hyphenated
+        // compound term is kept as ONE quoted FTS5 phrase (probe-verified
+        // against both `fts_lex`'s trigram tokenizer and the legacy
+        // `fts_messages` porter tokenizer -- phrase re-tokenization makes
+        // this consistent either way), instead of being split into
+        // `(foo AND bar)`. Non-punctuation splitting (dot-separated tokens,
+        // e.g. "br-123.jsonl" -> two boolean-query terms "br-123" AND
+        // "jsonl") and trailing-wildcard forms (which fall outside the
+        // "bare hyphenated compound" check) are unaffected.
         assert_eq!(
             transpile_to_fts5("foo-bar"),
-            Some("(foo AND bar)".to_string())
+            Some("\"foo-bar\"".to_string())
         );
         assert_eq!(
             transpile_to_fts5("foo-bar*"),
@@ -20987,11 +17642,11 @@ mod tests {
         );
         assert_eq!(
             transpile_to_fts5("br-123.jsonl"),
-            Some("(br AND 123 AND jsonl)".to_string())
+            Some("(\"br-123\" AND jsonl)".to_string())
         );
         assert_eq!(
             transpile_to_fts5("br-123.json*"),
-            Some("(br AND 123 AND json*)".to_string())
+            Some("(\"br-123\" AND json*)".to_string())
         );
 
         // Leading unary-NOT forms are not valid FTS5 queries.
@@ -21156,6 +17811,250 @@ mod tests {
         assert!(
             hit_is_noise(&hit, ""),
             "bare tool-ack 'ok' with content present should still be dropped as noise"
+        );
+    }
+
+    // ============================================================
+    // W2-5 Step 1: KU3 short-CJK-query LIKE fallback
+    // ============================================================
+
+    /// The trigram floor is a codepoint-count property, not a CJK-specific
+    /// one (see `is_lexical_ku3_short_query`'s doc comment for the measured
+    /// evidence) -- ASCII and emoji queries under 3 codepoints degrade too.
+    #[test]
+    fn ku3_gate_triggers_below_three_chars_regardless_of_script() {
+        assert!(is_lexical_ku3_short_query("事务"), "2-char CJK must degrade");
+        assert!(is_lexical_ku3_short_query("中"), "1-char CJK must degrade");
+        assert!(
+            !is_lexical_ku3_short_query("事务提交"),
+            "4-char CJK is long enough for trigram MATCH, must not degrade"
+        );
+        assert!(
+            !is_lexical_ku3_short_query("三字中文"),
+            "3+ char CJK must not degrade (trigram floor is exactly 3)"
+        );
+        assert!(
+            is_lexical_ku3_short_query("ok"),
+            "short ASCII query must ALSO degrade -- measured: fts_lex MATCH 'ok' finds nothing \
+             even when 'ok' is present in indexed content, same trigram floor as CJK"
+        );
+        assert!(
+            !is_lexical_ku3_short_query("age"),
+            "3-char ASCII is long enough for trigram MATCH, must not degrade"
+        );
+        assert!(is_lexical_ku3_short_query("🎉🎊"), "short emoji query must ALSO degrade");
+        assert!(!is_lexical_ku3_short_query(""), "empty query is not a degrade case");
+        assert!(!is_lexical_ku3_short_query("  "), "whitespace-only query is not a degrade case");
+    }
+
+    #[test]
+    fn like_substring_pattern_escapes_percent_and_underscore_and_backslash() {
+        assert_eq!(like_substring_pattern("事务"), "%事务%");
+        assert_eq!(like_substring_pattern("中%"), "%中\\%%");
+        assert_eq!(like_substring_pattern("中_"), "%中\\_%");
+        assert_eq!(like_substring_pattern("中\\文"), "%中\\\\文%");
+    }
+
+    fn insert_v2_lex_message(storage: &FrankenStorage, agent_id: i64, external_id: &str, content: &str) {
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: None,
+            external_id: Some(external_id.to_string()),
+            title: Some(external_id.to_string()),
+            source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
+            started_at: Some(1_700_000_000_000),
+            ended_at: None,
+            approx_tokens: None,
+            metadata_json: json!({}),
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: Some("user".into()),
+                created_at: Some(1_700_000_000_000),
+                content: content.to_string(),
+                extra_json: json!({}),
+                snippets: Vec::new(),
+            }],
+            source_id: crate::sources::provenance::LOCAL_SOURCE_ID.to_string(),
+            origin_host: None,
+        };
+        storage
+            .insert_conversation_tree(agent_id, None, &conversation)
+            .expect("insert conversation through the real write path (syncs lex_docs/fts_lex)");
+    }
+
+    /// KU3 end-to-end: a two-character Chinese query recalls a hit via the
+    /// public `SearchClient::search()` API that plain `fts_lex MATCH` cannot
+    /// (structurally, per `fts_lex_trigram_matches_three_char_chinese`'s
+    /// sibling fact in tests/w2_fts_schema.rs -- trigram needs 3+ chars).
+    #[test]
+    fn search_finds_two_char_chinese_query_via_ku3_like_fallback() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        insert_v2_lex_message(&storage, agent_id, "ku3-hit", "本次事务提交失败，需要重试");
+        insert_v2_lex_message(&storage, agent_id, "ku3-miss", "完全不相关的内容，没有目标词");
+        storage.close().unwrap();
+
+        // No Tantivy index at all -- exercises the pure fts_lex/lex_docs path.
+        let missing_index_path = dir.path().join("no-such-index");
+        let client = SearchClient::open(&missing_index_path, Some(&db_path))
+            .unwrap()
+            .expect("sqlite-only client should still open");
+
+        // Sanity: plain MATCH structurally cannot find a 2-char CJK term
+        // (mirrors tests/w2_fts_schema.rs's 3-char pinning test).
+        let (match_sql, match_params) = SearchClient::fts_lex_match_candidates_query("事务", 10_000);
+        let guard = client.sqlite_guard().unwrap();
+        let conn = guard.as_ref().unwrap();
+        let match_rows: Vec<(i64, f64)> = conn
+            .query_all_map(&match_sql, &match_params, |row| Ok((row.get_typed(0)?, row.get_typed(1)?)))
+            .unwrap();
+        assert!(match_rows.is_empty(), "sanity: plain fts_lex MATCH must not find a 2-char CJK term");
+        drop(guard);
+
+        let hits = client
+            .search("事务", SearchFilters::default(), 10, 0, FieldMask::FULL)
+            .unwrap();
+        assert_eq!(hits.len(), 1, "KU3 LIKE fallback must recall the exact one matching conversation");
+        assert_eq!(hits[0].title, "ku3-hit");
+    }
+
+    /// Short ASCII queries also hit the trigram floor (see
+    /// `is_lexical_ku3_short_query`'s doc comment) and must still be
+    /// findable end-to-end via the LIKE degrade -- not skipped just because
+    /// they aren't CJK. A 3+ char ASCII query, long enough for MATCH, must
+    /// still work too.
+    #[test]
+    fn search_finds_short_ascii_query_via_ku3_like_fallback_and_long_ascii_via_match() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        insert_v2_lex_message(&storage, agent_id, "ok-hit", "the deploy is ok now");
+        storage.close().unwrap();
+
+        let missing_index_path = dir.path().join("no-such-index");
+        let client = SearchClient::open(&missing_index_path, Some(&db_path))
+            .unwrap()
+            .expect("sqlite-only client should still open");
+
+        let short_hits = client.search("ok", SearchFilters::default(), 10, 0, FieldMask::FULL).unwrap();
+        assert_eq!(short_hits.len(), 1, "2-char ASCII query must be found via the LIKE degrade");
+
+        let long_hits = client.search("deploy", SearchFilters::default(), 10, 0, FieldMask::FULL).unwrap();
+        assert_eq!(long_hits.len(), 1, "3+ char ASCII query must be found via ordinary MATCH");
+    }
+
+    #[test]
+    fn ku3_like_fallback_handles_meta_character_query() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        // Literal "中%" substring; a naive unescaped LIKE '%中%%' would also
+        // match plain "中" content -- this fixture would let that leak
+        // through, proving the ESCAPE clause actually matters.
+        insert_v2_lex_message(&storage, agent_id, "meta-hit", "标记为 中% 的项目");
+        insert_v2_lex_message(&storage, agent_id, "meta-decoy", "只有中，没有百分号");
+        storage.close().unwrap();
+
+        let missing_index_path = dir.path().join("no-such-index");
+        let client = SearchClient::open(&missing_index_path, Some(&db_path))
+            .unwrap()
+            .expect("sqlite-only client should still open");
+
+        let hits = client
+            .search("中%", SearchFilters::default(), 10, 0, FieldMask::FULL)
+            .unwrap();
+        assert_eq!(hits.len(), 1, "ESCAPE must treat '%' as a literal, not a wildcard");
+        assert_eq!(hits[0].title, "meta-hit");
+    }
+
+    #[test]
+    fn fts_lex_match_candidates_query_does_not_scan_lex_docs() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        insert_v2_lex_message(&storage, agent_id, "plan-fixture", "porter trigram query plan fixture");
+        let conn = storage.raw();
+
+        let (sql, params) = SearchClient::fts_lex_match_candidates_query("trigram", 10_000);
+        let plan_details: Vec<String> = conn
+            .query_all_map(&format!("EXPLAIN QUERY PLAN {sql}"), &params, |row| row.get_typed(3))
+            .unwrap();
+        assert!(
+            plan_details.iter().any(|d| d.to_lowercase().contains("fts_lex")),
+            "MATCH query plan must touch the fts_lex virtual table index, got {plan_details:?}"
+        );
+        assert!(
+            !plan_details.iter().any(|d| d.contains("SCAN lex_docs")),
+            "MATCH query plan must not fall back to a lex_docs table scan, got {plan_details:?}"
+        );
+    }
+
+    #[test]
+    fn lex_docs_like_candidates_query_is_a_genuine_table_scan() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        insert_v2_lex_message(&storage, agent_id, "plan-fixture", "事务处理示例");
+        let conn = storage.raw();
+
+        let (sql, params) = SearchClient::lex_docs_like_candidates_query("事务", 10_000);
+        let plan_details: Vec<String> = conn
+            .query_all_map(&format!("EXPLAIN QUERY PLAN {sql}"), &params, |row| row.get_typed(3))
+            .unwrap();
+        assert!(
+            plan_details
+                .iter()
+                .any(|d| d.contains("SCAN") && d.contains("lex_docs")),
+            "KU3 LIKE fallback must be a genuine lex_docs table scan (full-corpus correctness), got {plan_details:?}"
         );
     }
 }

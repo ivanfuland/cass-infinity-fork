@@ -1,5 +1,5 @@
 use assert_cmd::Command;
-use coding_agent_search::search::tantivy::expected_index_dir;
+use coding_agent_search::indexer::expected_index_dir;
 use serde_json::{Value, json};
 use std::fs;
 use std::path::Path;

@@ -1,7 +1,6 @@
 use coding_agent_search::connectors::{NormalizedConversation, NormalizedMessage};
 use coding_agent_search::indexer::persist::persist_conversation;
 use coding_agent_search::search::query::SearchClient;
-use coding_agent_search::search::tantivy::index_dir;
 use coding_agent_search::search::vector_index::{dot_product_scalar_bench, dot_product_simd_bench};
 use coding_agent_search::storage::sqlite::SqliteStorage;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
@@ -40,21 +39,18 @@ fn seed_index(conv_count: i64, msgs: i64) -> (TempDir, SearchClient) {
     let temp = TempDir::new().expect("tempdir");
     let data_dir = temp.path().to_path_buf();
     let db_path = data_dir.join("bench.db");
-    let index_path = index_dir(&data_dir).expect("index path");
 
     let storage = SqliteStorage::open(&db_path).expect("open db");
-    let mut t_index =
-        coding_agent_search::search::tantivy::TantivyIndex::open_or_create(&index_path).unwrap();
 
     for i in 0..conv_count {
         let conv = sample_conv(i, msgs);
-        persist_conversation(&storage, &mut t_index, &conv).expect("persist");
+        persist_conversation(&storage, &conv).expect("persist");
     }
-    t_index.commit().unwrap();
 
-    // For perf benches we rely solely on Tantivy (no SQLite fallback) to avoid
-    // FTS quirks impacting measurements.
-    let client = SearchClient::open(&index_path, None)
+    // W2-6 Task丙②: sqlite-fts5 is the only lexical backend now (Tantivy
+    // retired), so db_path must be Some for search to hit the real backend
+    // instead of the empty `backend="none"` fallback.
+    let client = SearchClient::open(&data_dir, Some(&db_path))
         .expect("open client")
         .expect("client available");
 
@@ -68,21 +64,14 @@ fn bench_indexing(c: &mut Criterion) {
                 let temp = TempDir::new().unwrap();
                 let data_dir = temp.path().to_path_buf();
                 let db_path = data_dir.join("bench.db");
-                let index_path = index_dir(&data_dir).unwrap();
-                (
-                    temp,
-                    SqliteStorage::open(&db_path).unwrap(),
-                    coding_agent_search::search::tantivy::TantivyIndex::open_or_create(&index_path)
-                        .unwrap(),
-                )
+                (temp, SqliteStorage::open(&db_path).unwrap())
             },
-            |(temp, storage, mut idx)| {
+            |(temp, storage)| {
                 let _keep = temp; // keep tempdir alive
                 for i in 0..10 {
                     let conv = sample_conv(i, 10);
-                    persist_conversation(&storage, &mut idx, &conv).unwrap();
+                    persist_conversation(&storage, &conv).unwrap();
                 }
-                idx.commit().unwrap();
             },
             BatchSize::SmallInput,
         );
@@ -191,19 +180,15 @@ fn seed_wildcard_index(conv_count: i64, msgs_per_conv: i64) -> (TempDir, SearchC
     let temp = TempDir::new().expect("tempdir");
     let data_dir = temp.path().to_path_buf();
     let db_path = data_dir.join("wildcard_bench.db");
-    let index_path = index_dir(&data_dir).expect("index path");
 
     let storage = SqliteStorage::open(&db_path).expect("open db");
-    let mut t_index =
-        coding_agent_search::search::tantivy::TantivyIndex::open_or_create(&index_path).unwrap();
 
     for i in 0..conv_count {
         let conv = wildcard_sample_conv(i, msgs_per_conv);
-        persist_conversation(&storage, &mut t_index, &conv).expect("persist");
+        persist_conversation(&storage, &conv).expect("persist");
     }
-    t_index.commit().unwrap();
 
-    let client = SearchClient::open(&index_path, Some(&db_path))
+    let client = SearchClient::open(&data_dir, Some(&db_path))
         .expect("open client")
         .expect("client available");
 

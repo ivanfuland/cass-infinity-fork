@@ -17,11 +17,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use fs2::FileExt;
 
-use crate::indexer::{
-    LEXICAL_REBUILD_PAGE_SIZE_PUBLIC, LexicalRebuildCheckpoint,
-    lexical_rebuild_page_size_is_compatible, lexical_storage_fingerprint_for_db,
-    load_lexical_rebuild_checkpoint,
-};
+use crate::indexer::lexical_storage_fingerprint_for_db;
+#[cfg(test)]
+use crate::storage::sqlite::LexDomainRebuildMarkerState;
 use crate::search::ann_index::hnsw_index_path;
 use crate::search::embedder::Embedder;
 use crate::search::fastembed_embedder::FastEmbedder;
@@ -36,7 +34,6 @@ use crate::search::semantic_manifest::{
     ArtifactRecord, BuildCheckpoint, SemanticManifest, SemanticShardManifest, SemanticShardRecord,
     TierKind, semantic_shard_artifact_path_is_safe,
 };
-use crate::search::tantivy::SCHEMA_HASH;
 use crate::search::vector_index::{VECTOR_INDEX_DIR, vector_index_path};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -593,49 +590,6 @@ pub(crate) struct InspectSearchAssetsInput<'a> {
     pub inspect_semantic: bool,
 }
 
-const LEXICAL_STORAGE_FINGERPRINT_MTIME_TOLERANCE_MS: i64 = 1_000;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ParsedLexicalStorageFingerprint {
-    db_len: u64,
-    db_mtime_ms: i64,
-    wal_len: u64,
-    wal_mtime_ms: i64,
-}
-
-fn parse_lexical_storage_fingerprint(raw: &str) -> Option<ParsedLexicalStorageFingerprint> {
-    let mut parts = raw.split(':');
-    let fingerprint = ParsedLexicalStorageFingerprint {
-        db_len: parts.next()?.parse().ok()?,
-        db_mtime_ms: parts.next()?.parse().ok()?,
-        wal_len: parts.next()?.parse().ok()?,
-        wal_mtime_ms: parts.next()?.parse().ok()?,
-    };
-    if parts.next().is_some() {
-        return None;
-    }
-    Some(fingerprint)
-}
-
-pub(crate) fn lexical_storage_fingerprints_match(current: &str, saved: &str) -> bool {
-    match (
-        parse_lexical_storage_fingerprint(current),
-        parse_lexical_storage_fingerprint(saved),
-    ) {
-        (Some(current), Some(saved)) => {
-            current.db_len == saved.db_len
-                && current.wal_len == saved.wal_len
-                && current.db_mtime_ms.abs_diff(saved.db_mtime_ms)
-                    <= u64::try_from(LEXICAL_STORAGE_FINGERPRINT_MTIME_TOLERANCE_MS)
-                        .unwrap_or(u64::MAX)
-                && current.wal_mtime_ms.abs_diff(saved.wal_mtime_ms)
-                    <= u64::try_from(LEXICAL_STORAGE_FINGERPRINT_MTIME_TOLERANCE_MS)
-                        .unwrap_or(u64::MAX)
-        }
-        _ => current == saved,
-    }
-}
-
 pub(crate) fn inspect_search_assets(
     input: InspectSearchAssetsInput<'_>,
 ) -> Result<SearchAssetSnapshot> {
@@ -653,7 +607,6 @@ pub(crate) fn inspect_search_assets(
     } = input;
 
     let lexical = inspect_lexical_assets(InspectLexicalAssetsInput {
-        data_dir,
         db_path,
         stale_threshold,
         last_indexed_at_ms,
@@ -1245,7 +1198,6 @@ fn semantic_checkpoint_progress_state(
 }
 
 struct InspectLexicalAssetsInput<'a> {
-    data_dir: &'a Path,
     db_path: &'a Path,
     stale_threshold: u64,
     last_indexed_at_ms: Option<i64>,
@@ -1261,7 +1213,6 @@ struct InspectLexicalAssetsInput<'a> {
 
 fn inspect_lexical_assets(input: InspectLexicalAssetsInput<'_>) -> Result<LexicalAssetState> {
     let InspectLexicalAssetsInput {
-        data_dir,
         db_path,
         stale_threshold,
         last_indexed_at_ms,
@@ -1270,9 +1221,33 @@ fn inspect_lexical_assets(input: InspectLexicalAssetsInput<'_>) -> Result<Lexica
         db_available,
         compute_lexical_fingerprint,
     } = input;
-    let index_path = crate::search::tantivy::expected_index_dir(data_dir);
-    let checkpoint = load_lexical_rebuild_checkpoint(&index_path)
-        .with_context(|| format!("loading lexical checkpoint from {}", index_path.display()))?;
+    // W2-6 Task B 续二 (control-plane 2026-08-30 ruling, ③ "reseat the
+    // reader, not the writer"): the retired tantivy checkpoint file
+    // (.lexical-rebuild-state.json) is no longer read here. This asset-state
+    // surface is a real, unconditional consumer (`cass status`-style JSON) --
+    // reseated onto Task A's `lex_domain_rebuild_state` DB meta marker
+    // (storage::sqlite::lex_domain_rebuild_marker_status), the single source
+    // of truth for "did the last full lex_domain rebuild finish". The old
+    // version/schema-hash/page-size/fingerprint matching that used to gate
+    // `contract_mismatch` is delta w2-d4 dead code (no DB-domain equivalent);
+    // replaced with a live `validate_searchable_index_contract_quick` probe.
+    // W2-6 exec36 Task甲1 (control-plane 2026-08-30 ruling, ⑤b): the retired
+    // JSON checkpoint file degraded to "no state" whenever it couldn't be
+    // read (missing file, bad path); mirror that here. `db_available` only
+    // promises the caller *believes* the db is usable -- a path that exists
+    // but isn't a valid SQLite file (e.g. a directory, per
+    // `inspect_search_assets_trusts_db_probe_for_semantic_metadata_probe`)
+    // still fails on open/query with a hard I/O error. Downgrade any such
+    // failure to `Absent` instead of propagating it and panicking every
+    // caller that trusts the `db_available` signal.
+    let marker = if db_available {
+        crate::storage::api::Conn::open_read(db_path)
+            .ok()
+            .and_then(|conn| crate::storage::sqlite::lex_domain_rebuild_marker_status(&conn).ok())
+            .unwrap_or(crate::storage::sqlite::LexDomainRebuildMarkerState::Absent)
+    } else {
+        crate::storage::sqlite::LexDomainRebuildMarkerState::Absent
+    };
     let current_db_fingerprint = if db_available && compute_lexical_fingerprint {
         Some(
             lexical_storage_fingerprint_for_db(db_path).with_context(|| {
@@ -1287,56 +1262,70 @@ fn inspect_lexical_assets(input: InspectLexicalAssetsInput<'_>) -> Result<Lexica
     };
 
     Ok(lexical_state_from_observations(LexicalObservationInput {
-        index_path: &index_path,
         db_path,
         stale_threshold,
         last_indexed_at_ms,
         now_ms,
         maintenance,
-        checkpoint: checkpoint.as_ref(),
+        marker,
         current_db_fingerprint: current_db_fingerprint.as_deref(),
     }))
 }
 
 struct LexicalObservationInput<'a> {
-    index_path: &'a Path,
     db_path: &'a Path,
     stale_threshold: u64,
     last_indexed_at_ms: Option<i64>,
     /// Full-precision wall clock (F4); see [`InspectSearchAssetsInput::now_ms`].
     now_ms: i64,
     maintenance: SearchMaintenanceSnapshot,
-    checkpoint: Option<&'a LexicalRebuildCheckpoint>,
+    marker: crate::storage::sqlite::LexDomainRebuildMarkerState,
     current_db_fingerprint: Option<&'a str>,
 }
 
 fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> LexicalAssetState {
     let LexicalObservationInput {
-        index_path,
         db_path,
         stale_threshold,
         last_indexed_at_ms,
         now_ms,
         maintenance,
-        checkpoint,
+        marker,
         current_db_fingerprint,
     } = input;
-    let exists = crate::search::tantivy::searchable_index_exists(index_path);
-    let checkpoint_db_matches =
-        checkpoint.map(|state| crate::stored_path_identity_matches(&state.db_path, db_path));
-    let schema_matches = checkpoint.map(|state| state.schema_hash == SCHEMA_HASH);
-    let page_size_matches =
-        checkpoint.map(|state| state.page_size == LEXICAL_REBUILD_PAGE_SIZE_PUBLIC);
-    let page_size_compatible =
-        checkpoint.map(|state| lexical_rebuild_page_size_is_compatible(state.page_size));
-    let checkpoint_fingerprint = checkpoint.map(|state| state.storage_fingerprint.as_str());
-    let fingerprint_matches = match (current_db_fingerprint, checkpoint_fingerprint) {
-        (Some(current), Some(saved)) => Some(lexical_storage_fingerprints_match(current, saved)),
-        _ => None,
+    // W2-6 Task1: reseated onto the lex_docs/fts_lex SQLite domain (db_path),
+    // not the retired tantivy index directory -- see search::lexical_index_health
+    // module docs.
+    let exists = crate::search::lexical_index_health::searchable_index_exists(db_path);
+    use crate::storage::sqlite::LexDomainRebuildMarkerState;
+    let checkpoint_present = !matches!(marker, LexDomainRebuildMarkerState::Absent);
+    let checkpoint_completed = match marker {
+        LexDomainRebuildMarkerState::Absent => None,
+        LexDomainRebuildMarkerState::Building => Some(false),
+        LexDomainRebuildMarkerState::Completed { .. } => Some(true),
     };
-    let checkpoint_incomplete = checkpoint.is_some_and(|state| !state.completed);
+    // W2-6 Task B 续二 (delta w2-d4): the retired checkpoint file's
+    // db-path/schema-hash/page-size matching has no DB-domain equivalent --
+    // the lex domain marker lives in the same database it describes, so
+    // "points at a different database" is now structurally impossible, and
+    // schema/page-size are DB migration concerns, not per-checkpoint ones.
+    let checkpoint_db_matches: Option<bool> = None;
+    let schema_matches: Option<bool> = None;
+    let page_size_matches: Option<bool> = None;
+    let page_size_compatible: Option<bool> = None;
+    // The marker carries no content fingerprint (w2-d4 retired that
+    // matching too); `current_db_fingerprint` is still a live, independent
+    // computation over current DB content, so it survives on its own.
+    let checkpoint_fingerprint: Option<String> = None;
+    let fingerprint_matches: Option<bool> = None;
+    let checkpoint_incomplete = checkpoint_completed == Some(false);
     let checkpoint_db_mismatch = checkpoint_db_matches == Some(false);
-    let contract_mismatch = schema_matches == Some(false) || page_size_compatible == Some(false);
+    // Reseated onto Task1's DB-domain contract probe (same cost class as the
+    // retired tantivy schema/page-size check it replaces) instead of the
+    // dead checkpoint-file matching above.
+    let contract_mismatch =
+        crate::search::lexical_index_health::validate_searchable_index_contract_quick(db_path)
+            .is_err();
     let fingerprint_mismatch = fingerprint_matches == Some(false);
     // F4 (cass tech debt): derive the (legacy) second-resolution clock
     // from `now_ms` rather than the other way around so the comparison
@@ -1364,7 +1353,6 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
         && maintenance
             .mode
             .is_some_and(SearchMaintenanceMode::rebuild_active);
-    let active_rebuild_progress = rebuilding;
     // Forward-progress liveness check (issue #258): when a rebuild is
     // active but the indexing thread has not posted progress within
     // `CASS_REBUILD_STALL_DETECT_SECS` (default 120 s), report
@@ -1434,35 +1422,25 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
     } else {
         None
     };
-    let checkpoint_progress_usable = checkpoint.is_some()
-        && checkpoint_db_matches == Some(true)
-        && schema_matches == Some(true)
-        && page_size_compatible == Some(true)
-        && if active_rebuild_progress {
-            true
-        } else {
-            current_db_fingerprint.is_some() && fingerprint_matches == Some(true)
-        };
-    let pending_sessions = checkpoint
-        .filter(|_| checkpoint_progress_usable)
-        .map(|state| {
-            state
-                .total_conversations
-                .saturating_sub(state.processed_conversations) as u64
-        })
-        .unwrap_or(0);
+    // The marker only ever carries totals for the `Completed` variant (no
+    // partial-progress tracking, per its own doc -- a crash mid-rebuild
+    // leaves it at `Building` with no counts, and the next run reruns from
+    // zero). `pending_sessions`/activity-from-checkpoint have no signal
+    // outside that variant; active-rebuild progress is already covered by
+    // `maintenance`-derived fields (`rebuilding`/`stalled`/
+    // `last_progress_age_ms`), not by this marker.
+    let (marker_total_conversations, marker_lex_docs_count) = match marker {
+        LexDomainRebuildMarkerState::Completed {
+            total_conversations,
+            lex_docs_count,
+        } => (Some(total_conversations as u64), Some(lex_docs_count as u64)),
+        _ => (None, None),
+    };
+    let pending_sessions = 0u64;
     let maintenance_activity_at_ms = maintenance_targets_current_db
         .then_some(())
         .and(maintenance.updated_at_ms.or(maintenance.started_at_ms));
-    let checkpoint_activity_at_ms = checkpoint
-        .filter(|_| checkpoint_progress_usable)
-        .and_then(|state| (state.updated_at_ms > 0).then_some(state.updated_at_ms));
-    let activity_at_ms = match (checkpoint_activity_at_ms, maintenance_activity_at_ms) {
-        (Some(checkpoint_ts), Some(maintenance_ts)) => Some(checkpoint_ts.max(maintenance_ts)),
-        (Some(checkpoint_ts), None) => Some(checkpoint_ts),
-        (None, Some(maintenance_ts)) => Some(maintenance_ts),
-        (None, None) => None,
-    };
+    let activity_at_ms = maintenance_activity_at_ms;
 
     LexicalAssetState {
         status,
@@ -1479,24 +1457,22 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
         stale_threshold_seconds: stale_threshold,
         activity_at_ms,
         pending_sessions,
-        processed_conversations: checkpoint
-            .filter(|_| checkpoint_progress_usable)
-            .map(|state| state.processed_conversations as u64),
-        total_conversations: checkpoint
-            .filter(|_| checkpoint_progress_usable)
-            .map(|state| state.total_conversations as u64),
-        indexed_docs: checkpoint
-            .filter(|_| checkpoint_progress_usable)
-            .map(|state| state.indexed_docs as u64),
+        // The marker's `Completed` variant never tracked a distinct
+        // "processed" count separate from its final total (no
+        // partial-progress resume, per its own doc) -- there is nothing
+        // honest to report here beyond the final totals below.
+        processed_conversations: None,
+        total_conversations: marker_total_conversations,
+        indexed_docs: marker_lex_docs_count,
         status_reason,
         fingerprint: LexicalFingerprintState {
             current_db_fingerprint: current_db_fingerprint.map(ToOwned::to_owned),
-            checkpoint_fingerprint: checkpoint.map(|state| state.storage_fingerprint.clone()),
+            checkpoint_fingerprint,
             matches_current_db_fingerprint: fingerprint_matches,
         },
         checkpoint: LexicalCheckpointState {
-            present: checkpoint.is_some(),
-            completed: checkpoint.map(|state| state.completed),
+            present: checkpoint_present,
+            completed: checkpoint_completed,
             db_matches: checkpoint_db_matches,
             schema_matches,
             page_size_matches,
@@ -2257,154 +2233,18 @@ mod tests {
     }
 
     #[test]
-    fn lexical_storage_fingerprint_matching_handles_jitter_and_size_drift() {
-        let cases = [
-            (
-                "small mtime settle jitter",
-                "323584:1776310228000:329632:1776310227824",
-                "323584:1776310227832:329632:1776310227824",
-                true,
-            ),
-            (
-                "wal size drift",
-                "323584:1776310228000:329632:1776310227824",
-                "323584:1776310227832:400000:1776310227824",
-                false,
-            ),
-        ];
-
-        for (label, current, saved, expected) in cases {
-            assert_eq!(
-                lexical_storage_fingerprints_match(current, saved),
-                expected,
-                "{label}"
-            );
-        }
-    }
-
-    #[test]
-    fn lexical_state_marks_fingerprint_mismatch_stale() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let index_path = temp.path().join("index").join("v4");
-        std::fs::create_dir_all(&index_path).expect("create index dir");
-        // Simulate an existing tantivy index (meta.json present) so the
-        // "missing" branch in lexical_state_from_observations doesn't short
-        // circuit before the fingerprint check we want to exercise.
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
-        let db_path = temp.path().join("agent_search.db");
-        std::fs::write(&db_path, b"db").expect("write db file");
-
-        let checkpoint = LexicalRebuildCheckpoint {
-            db_path: db_path.display().to_string(),
-            total_conversations: 10,
-            storage_fingerprint: "before".to_string(),
-            committed_offset: 10,
-            committed_conversation_id: Some(10),
-            processed_conversations: 10,
-            indexed_docs: 100,
-            schema_hash: SCHEMA_HASH.to_string(),
-            page_size: LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
-            completed: true,
-            updated_at_ms: 1_733_000_000_000,
-        };
-
-        let state = lexical_state_from_observations(LexicalObservationInput {
-            index_path: &index_path,
-            db_path: &db_path,
-            stale_threshold: 60,
-            last_indexed_at_ms: Some(1_733_000_000_000),
-            now_ms: 1_733_000_001_000,
-            maintenance: SearchMaintenanceSnapshot::default(),
-            checkpoint: Some(&checkpoint),
-            current_db_fingerprint: Some("after"),
-        });
-
-        assert_eq!(state.status, "stale");
-        assert_eq!(
-            state.fingerprint.matches_current_db_fingerprint,
-            Some(false)
-        );
-        assert!(
-            state
-                .status_reason
-                .as_deref()
-                .is_some_and(|reason| reason.contains("fingerprint"))
-        );
-        assert_eq!(state.pending_sessions, 0);
-        assert_eq!(state.processed_conversations, None);
-        assert_eq!(state.total_conversations, None);
-        assert_eq!(state.indexed_docs, None);
-    }
-
-    #[test]
-    fn lexical_state_marks_checkpoint_db_mismatch_stale_without_fingerprint_probe() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let index_path = temp.path().join("index").join("v4");
-        std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
-        let db_path = temp.path().join("agent_search.db");
-        let other_db_path = temp.path().join("other_agent_search.db");
-        std::fs::write(&db_path, b"db").expect("write db file");
-        std::fs::write(&other_db_path, b"other db").expect("write other db file");
-
-        let checkpoint = LexicalRebuildCheckpoint {
-            db_path: other_db_path.display().to_string(),
-            total_conversations: 10,
-            storage_fingerprint: "old-db-fingerprint".to_string(),
-            committed_offset: 10,
-            committed_conversation_id: Some(10),
-            processed_conversations: 10,
-            indexed_docs: 100,
-            schema_hash: SCHEMA_HASH.to_string(),
-            page_size: LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
-            completed: true,
-            updated_at_ms: 1_733_000_000_000,
-        };
-
-        let state = lexical_state_from_observations(LexicalObservationInput {
-            index_path: &index_path,
-            db_path: &db_path,
-            stale_threshold: 60,
-            last_indexed_at_ms: Some(1_733_000_000_000),
-            now_ms: 1_733_000_001_000,
-            maintenance: SearchMaintenanceSnapshot::default(),
-            checkpoint: Some(&checkpoint),
-            current_db_fingerprint: None,
-        });
-
-        assert_eq!(state.status, "stale");
-        assert!(state.stale);
-        assert!(!state.fresh);
-        assert_eq!(state.checkpoint.db_matches, Some(false));
-        assert_eq!(state.fingerprint.matches_current_db_fingerprint, None);
-        assert_eq!(state.pending_sessions, 0);
-        assert_eq!(state.processed_conversations, None);
-        assert_eq!(state.total_conversations, None);
-        assert_eq!(state.indexed_docs, None);
-        assert!(
-            state
-                .status_reason
-                .as_deref()
-                .is_some_and(|reason| reason.contains("different database"))
-        );
-    }
-
-    #[test]
     fn lexical_state_missing_index_is_not_marked_stale_until_initialized() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let index_path = temp.path().join("index").join("v4");
-        std::fs::create_dir_all(&index_path).expect("create index dir");
         let db_path = temp.path().join("agent_search.db");
         std::fs::write(&db_path, b"db").expect("write db file");
 
         let state = lexical_state_from_observations(LexicalObservationInput {
-            index_path: &index_path,
             db_path: &db_path,
             stale_threshold: 60,
             last_indexed_at_ms: None,
             now_ms: 1_733_000_001_000,
             maintenance: SearchMaintenanceSnapshot::default(),
-            checkpoint: None,
+            marker: LexDomainRebuildMarkerState::Absent,
             current_db_fingerprint: None,
         });
 
@@ -2419,140 +2259,12 @@ mod tests {
     }
 
     #[test]
-    fn lexical_state_keeps_progress_visible_during_active_rebuild_despite_fingerprint_drift() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let index_path = temp.path().join("index").join("v4");
-        std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
-        let db_path = temp.path().join("agent_search.db");
-        std::fs::write(&db_path, b"db").expect("write db file");
-
-        let checkpoint = LexicalRebuildCheckpoint {
-            db_path: db_path.display().to_string(),
-            total_conversations: 10,
-            storage_fingerprint: "before".to_string(),
-            committed_offset: 4,
-            committed_conversation_id: Some(4),
-            processed_conversations: 4,
-            indexed_docs: 20,
-            schema_hash: SCHEMA_HASH.to_string(),
-            page_size: 200,
-            completed: false,
-            updated_at_ms: 1_733_000_123_000,
-        };
-
-        let state = lexical_state_from_observations(LexicalObservationInput {
-            index_path: &index_path,
-            db_path: &db_path,
-            stale_threshold: 60,
-            last_indexed_at_ms: Some(1_733_000_000_000),
-            now_ms: 1_733_000_001_000,
-            maintenance: SearchMaintenanceSnapshot {
-                active: true,
-                pid: Some(std::process::id()),
-                started_at_ms: Some(1_733_000_111_000),
-                db_path: Some(db_path.clone()),
-                mode: Some(SearchMaintenanceMode::Index),
-                job_id: None,
-                job_kind: None,
-                phase: None,
-                updated_at_ms: None,
-                last_progress_at_ms: None,
-                orphaned: false,
-            },
-            checkpoint: Some(&checkpoint),
-            current_db_fingerprint: Some("after"),
-        });
-
-        assert_eq!(state.status, "building");
-        assert!(!state.stale);
-        assert!(!state.fresh);
-        assert_eq!(state.pending_sessions, 6);
-        assert_eq!(state.processed_conversations, Some(4));
-        assert_eq!(state.total_conversations, Some(10));
-        assert_eq!(state.indexed_docs, Some(20));
-        assert_eq!(state.checkpoint.page_size_matches, Some(false));
-        assert_eq!(state.checkpoint.page_size_compatible, Some(true));
-        assert_eq!(
-            state.status_reason.as_deref(),
-            Some("lexical rebuild is in progress")
-        );
-    }
-
-    #[test]
-    fn lexical_state_hides_progress_for_incompatible_page_size_checkpoint() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let index_path = temp.path().join("index").join("v4");
-        std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
-        let db_path = temp.path().join("agent_search.db");
-        std::fs::write(&db_path, b"db").expect("write db file");
-
-        let checkpoint = LexicalRebuildCheckpoint {
-            db_path: db_path.display().to_string(),
-            total_conversations: 10,
-            storage_fingerprint: "before".to_string(),
-            committed_offset: 4,
-            committed_conversation_id: Some(4),
-            processed_conversations: 4,
-            indexed_docs: 20,
-            schema_hash: SCHEMA_HASH.to_string(),
-            page_size: 13,
-            completed: false,
-            updated_at_ms: 1_733_000_123_000,
-        };
-
-        let state = lexical_state_from_observations(LexicalObservationInput {
-            index_path: &index_path,
-            db_path: &db_path,
-            stale_threshold: 60,
-            last_indexed_at_ms: Some(1_733_000_000_000),
-            now_ms: 1_733_000_001_000,
-            maintenance: SearchMaintenanceSnapshot::default(),
-            checkpoint: Some(&checkpoint),
-            current_db_fingerprint: Some("before"),
-        });
-
-        assert_eq!(state.status, "stale");
-        assert!(state.stale);
-        assert_eq!(state.pending_sessions, 0);
-        assert_eq!(state.processed_conversations, None);
-        assert_eq!(state.total_conversations, None);
-        assert_eq!(state.indexed_docs, None);
-        assert_eq!(state.checkpoint.page_size_matches, Some(false));
-        assert_eq!(state.checkpoint.page_size_compatible, Some(false));
-        assert!(
-            state
-                .status_reason
-                .as_deref()
-                .is_some_and(|reason| reason.contains("contract"))
-        );
-    }
-
-    #[test]
     fn lexical_state_prefers_newer_maintenance_heartbeat_over_stale_checkpoint_timestamp() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let index_path = temp.path().join("index").join("v4");
-        std::fs::create_dir_all(&index_path).expect("create index dir");
         let db_path = temp.path().join("agent_search.db");
         std::fs::write(&db_path, b"db").expect("write db file");
 
-        let checkpoint = LexicalRebuildCheckpoint {
-            db_path: db_path.display().to_string(),
-            total_conversations: 10,
-            storage_fingerprint: "before".to_string(),
-            committed_offset: 4,
-            committed_conversation_id: Some(4),
-            processed_conversations: 4,
-            indexed_docs: 20,
-            schema_hash: SCHEMA_HASH.to_string(),
-            page_size: LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
-            completed: false,
-            updated_at_ms: 1_733_000_123_000,
-        };
-
         let state = lexical_state_from_observations(LexicalObservationInput {
-            index_path: &index_path,
             db_path: &db_path,
             stale_threshold: 60,
             last_indexed_at_ms: Some(1_733_000_000_000),
@@ -2570,7 +2282,7 @@ mod tests {
                 last_progress_at_ms: None,
                 orphaned: false,
             },
-            checkpoint: Some(&checkpoint),
+            marker: LexDomainRebuildMarkerState::Building,
             current_db_fingerprint: Some("after"),
         });
 
@@ -2579,84 +2291,19 @@ mod tests {
     }
 
     #[test]
-    fn lexical_state_ignores_rebuild_lock_for_different_database() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let index_path = temp.path().join("index").join("v4");
-        std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
-        let db_path = temp.path().join("agent_search.db");
-        std::fs::write(&db_path, b"db").expect("write db file");
-        let other_db_path = temp.path().join("other.db");
-        std::fs::write(&other_db_path, b"other").expect("write other db file");
-
-        let checkpoint = LexicalRebuildCheckpoint {
-            db_path: db_path.display().to_string(),
-            total_conversations: 10,
-            storage_fingerprint: "before".to_string(),
-            committed_offset: 4,
-            committed_conversation_id: Some(4),
-            processed_conversations: 4,
-            indexed_docs: 20,
-            schema_hash: SCHEMA_HASH.to_string(),
-            page_size: LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
-            completed: false,
-            updated_at_ms: 1_733_000_123_000,
-        };
-
-        let state = lexical_state_from_observations(LexicalObservationInput {
-            index_path: &index_path,
-            db_path: &db_path,
-            stale_threshold: 60,
-            last_indexed_at_ms: Some(1_733_000_000_000),
-            now_ms: 1_733_000_001_000,
-            maintenance: SearchMaintenanceSnapshot {
-                active: true,
-                pid: Some(std::process::id()),
-                started_at_ms: Some(1_733_000_111_000),
-                db_path: Some(other_db_path),
-                mode: Some(SearchMaintenanceMode::Index),
-                job_id: None,
-                job_kind: None,
-                phase: None,
-                updated_at_ms: None,
-                last_progress_at_ms: None,
-                orphaned: false,
-            },
-            checkpoint: Some(&checkpoint),
-            current_db_fingerprint: Some("after"),
-        });
-
-        assert_eq!(state.status, "stale");
-        assert!(state.stale);
-        assert!(!state.fresh);
-        assert!(!state.rebuilding);
-        assert!(!state.watch_active);
-        assert_eq!(state.activity_at_ms, None);
-        assert_eq!(state.pending_sessions, 0);
-        assert_eq!(state.processed_conversations, None);
-        assert_eq!(state.total_conversations, None);
-        assert_eq!(state.indexed_docs, None);
-        assert!(
-            state
-                .status_reason
-                .as_deref()
-                .is_some_and(|reason| reason.contains("fingerprint"))
-        );
-    }
-
-    #[test]
     fn lexical_state_ignores_watch_lock_for_different_database() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let index_path = temp.path().join("index").join("v4");
-        std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
         let db_path = temp.path().join("agent_search.db");
-        std::fs::write(&db_path, b"db").expect("write db file");
+        // W2-6 Task1: `exists` is reseated onto the lex_docs/fts_lex SQLite
+        // domain, which requires a real, schema-migrated database file (an
+        // empty one is enough -- this test's subject is lock scoping, not
+        // lexical content); a bare byte-string fixture no longer reads as
+        // "exists" the way a fake tantivy meta.json used to.
+        drop(crate::storage::sqlite::SqliteStorage::open(&db_path).expect("seed schema-migrated db"));
         let other_db_path = temp.path().join("other.db");
         std::fs::write(&other_db_path, b"other").expect("write other db file");
 
         let state = lexical_state_from_observations(LexicalObservationInput {
-            index_path: &index_path,
             db_path: &db_path,
             stale_threshold: 60,
             last_indexed_at_ms: Some(1_733_000_000_000),
@@ -2674,7 +2321,7 @@ mod tests {
                 last_progress_at_ms: None,
                 orphaned: false,
             },
-            checkpoint: None,
+            marker: LexDomainRebuildMarkerState::Absent,
             current_db_fingerprint: None,
         });
 
@@ -2696,9 +2343,6 @@ mod tests {
     #[test]
     fn lexical_state_reports_stalled_when_progress_is_stale_despite_fresh_heartbeat() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let index_path = temp.path().join("index").join("v4");
-        std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
         let db_path = temp.path().join("agent_search.db");
         std::fs::write(&db_path, b"db").expect("write db file");
 
@@ -2711,7 +2355,6 @@ mod tests {
         let now_ms: i64 = 1_733_000_300_000;
 
         let state = lexical_state_from_observations(LexicalObservationInput {
-            index_path: &index_path,
             db_path: &db_path,
             stale_threshold: 60,
             last_indexed_at_ms: Some(1_733_000_000_000),
@@ -2729,7 +2372,7 @@ mod tests {
                 last_progress_at_ms: Some(now_ms - 300_000),
                 orphaned: false,
             },
-            checkpoint: None,
+            marker: LexDomainRebuildMarkerState::Absent,
             current_db_fingerprint: None,
         });
 
@@ -2768,9 +2411,6 @@ mod tests {
     #[test]
     fn lexical_state_stays_building_when_progress_is_recent() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let index_path = temp.path().join("index").join("v4");
-        std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
         let db_path = temp.path().join("agent_search.db");
         std::fs::write(&db_path, b"db").expect("write db file");
 
@@ -2780,7 +2420,6 @@ mod tests {
         let now_ms: i64 = 1_733_000_300_000;
 
         let state = lexical_state_from_observations(LexicalObservationInput {
-            index_path: &index_path,
             db_path: &db_path,
             stale_threshold: 60,
             last_indexed_at_ms: Some(1_733_000_000_000),
@@ -2798,7 +2437,7 @@ mod tests {
                 last_progress_at_ms: Some(now_ms - 1_000),
                 orphaned: false,
             },
-            checkpoint: None,
+            marker: LexDomainRebuildMarkerState::Absent,
             current_db_fingerprint: None,
         });
 
@@ -2814,9 +2453,6 @@ mod tests {
     #[test]
     fn lexical_state_does_not_stall_when_legacy_lock_omits_progress_field() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let index_path = temp.path().join("index").join("v4");
-        std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
         let db_path = temp.path().join("agent_search.db");
         std::fs::write(&db_path, b"db").expect("write db file");
 
@@ -2826,7 +2462,6 @@ mod tests {
         let now_ms: i64 = 1_733_000_300_000;
 
         let state = lexical_state_from_observations(LexicalObservationInput {
-            index_path: &index_path,
             db_path: &db_path,
             stale_threshold: 60,
             last_indexed_at_ms: Some(1_733_000_000_000),
@@ -2844,7 +2479,7 @@ mod tests {
                 last_progress_at_ms: None,
                 orphaned: false,
             },
-            checkpoint: None,
+            marker: LexDomainRebuildMarkerState::Absent,
             current_db_fingerprint: None,
         });
 
@@ -2868,9 +2503,6 @@ mod tests {
     #[test]
     fn lexical_state_progress_age_is_ms_precision_not_seconds_quantised() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let index_path = temp.path().join("index").join("v4");
-        std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
         let db_path = temp.path().join("agent_search.db");
         std::fs::write(&db_path, b"db").expect("write db file");
 
@@ -2880,7 +2512,6 @@ mod tests {
         let last_progress_at_ms = now_ms - 119_500;
 
         let state = lexical_state_from_observations(LexicalObservationInput {
-            index_path: &index_path,
             db_path: &db_path,
             stale_threshold: 60,
             last_indexed_at_ms: Some(1_733_000_000_000),
@@ -2898,7 +2529,7 @@ mod tests {
                 last_progress_at_ms: Some(last_progress_at_ms),
                 orphaned: false,
             },
-            checkpoint: None,
+            marker: LexDomainRebuildMarkerState::Absent,
             current_db_fingerprint: None,
         });
 

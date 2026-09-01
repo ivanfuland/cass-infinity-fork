@@ -2,7 +2,6 @@ use coding_agent_search::connectors::{Connector, ScanContext, amp::AmpConnector}
 use coding_agent_search::connectors::{NormalizedConversation, NormalizedMessage};
 use coding_agent_search::indexer::{IndexOptions, persist::persist_conversation, run_index};
 use coding_agent_search::search::query::{FieldMask, SearchClient, SearchFilters};
-use coding_agent_search::search::tantivy::{TantivyIndex, index_dir};
 use coding_agent_search::storage::sqlite::SqliteStorage;
 use serial_test::serial;
 use tempfile::TempDir;
@@ -26,7 +25,8 @@ fn search_logs_backend_selection() {
     let _guard = trace.install();
 
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
     let conv = NormalizedConversation {
         agent_slug: "codex".into(),
         external_id: None,
@@ -38,10 +38,9 @@ fn search_logs_backend_selection() {
         metadata: serde_json::json!({}),
         messages: vec![norm_msg(0)],
     };
-    index.add_conversation(&conv).unwrap();
-    index.commit().unwrap();
+    persist_conversation(&storage, &conv).unwrap();
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
     client
@@ -62,8 +61,8 @@ fn search_logs_backend_selection() {
         .find(|line| line.contains("search_start"))
         .unwrap_or_else(|| panic!("trace output must contain a `search_start` event; got:\n{out}"));
     assert!(
-        search_start_line.contains("backend=\"tantivy\""),
-        "search_start span must name the tantivy backend; got line:\n{search_start_line}"
+        search_start_line.contains("backend=\"sqlite-fts5\""),
+        "search_start span must name the sqlite-fts5 backend (W2-6: tantivy backend retired); got line:\n{search_start_line}"
     );
     assert!(
         search_start_line.contains("query=") && search_start_line.contains("hello"),
@@ -124,7 +123,6 @@ fn persist_conversation_logs_counts() {
     std::fs::create_dir_all(&data_dir).unwrap();
     let db_path = data_dir.join("db.sqlite");
     let storage = SqliteStorage::open(&db_path).unwrap();
-    let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
 
     let conv = NormalizedConversation {
         agent_slug: "tester".into(),
@@ -138,7 +136,7 @@ fn persist_conversation_logs_counts() {
         messages: vec![norm_msg(0), norm_msg(1)],
     };
 
-    persist_conversation(&storage, &mut index, &conv).unwrap();
+    persist_conversation(&storage, &conv).unwrap();
 
     let out = trace.output();
     assert!(out.contains("persist_conversation"));

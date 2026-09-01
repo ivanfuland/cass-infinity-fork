@@ -23290,7 +23290,7 @@ pub fn run_tui_ftui(
     model.latency_trace = latency_trace.clone();
     model.refresh_theme_config_from_data_dir();
     model.bootstrap_persisted_state();
-    model.search_service = match crate::search::tantivy::index_dir(&data_dir) {
+    model.search_service = match crate::indexer::index_dir(&data_dir) {
         Ok(index_path) => match crate::search::query::SearchClient::open_with_options(
             &index_path,
             Some(&model.db_path),

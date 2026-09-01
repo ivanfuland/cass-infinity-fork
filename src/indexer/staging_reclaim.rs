@@ -180,7 +180,7 @@ pub(crate) fn reclaim_orphaned_staging_dirs_for_data_dir(
     data_dir: &Path,
     now: SystemTime,
 ) -> StagingReclaimReport {
-    let staging_root = crate::search::tantivy::expected_index_dir(data_dir)
+    let staging_root = crate::indexer::expected_index_dir(data_dir)
         .parent()
         .map_or_else(|| data_dir.join("index"), Path::to_path_buf);
 

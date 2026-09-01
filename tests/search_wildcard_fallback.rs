@@ -1,5 +1,6 @@
+use coding_agent_search::indexer::persist::persist_conversation;
 use coding_agent_search::search::query::{FieldMask, MatchType, SearchClient, SearchFilters};
-use coding_agent_search::search::tantivy::TantivyIndex;
+use coding_agent_search::storage::sqlite::SqliteStorage;
 use tempfile::TempDir;
 
 mod util;
@@ -7,7 +8,8 @@ mod util;
 #[test]
 fn implicit_wildcard_fallback_finds_substrings() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     // Seed index with "apple"
     let conv = util::ConversationFixtureBuilder::new("tester")
@@ -18,10 +20,9 @@ fn implicit_wildcard_fallback_finds_substrings() {
         .with_content(0, "I like eating an apple everyday")
         .build_normalized();
 
-    index.add_conversation(&conv).unwrap();
-    index.commit().unwrap();
+    persist_conversation(&storage, &conv).unwrap();
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
     let filters = SearchFilters::default();
@@ -46,7 +47,8 @@ fn implicit_wildcard_fallback_finds_substrings() {
 #[test]
 fn explicit_wildcard_works_without_fallback() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     let conv = util::ConversationFixtureBuilder::new("tester")
         .title("wild test")
@@ -56,10 +58,9 @@ fn explicit_wildcard_works_without_fallback() {
         .with_content(0, "config_file_v2.json")
         .build_normalized();
 
-    index.add_conversation(&conv).unwrap();
-    index.commit().unwrap();
+    persist_conversation(&storage, &conv).unwrap();
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
     let filters = SearchFilters::default();

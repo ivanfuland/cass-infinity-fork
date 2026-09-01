@@ -663,7 +663,7 @@ mod tests {
 
     #[test]
     fn api_conn_memory_smoke() {
-        let mut c = Conn::open_memory().unwrap();
+        let c = Conn::open_memory().unwrap();
         c.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY, s TEXT);").unwrap();
         c.execute("INSERT INTO t(s) VALUES (?1)", &params!["hi"]).unwrap();
         let s: String = c
@@ -685,7 +685,7 @@ mod tests {
 
     #[test]
     fn api_tx_drop_without_commit_rolls_back() {
-        let mut c = Conn::open_memory().unwrap();
+        let c = Conn::open_memory().unwrap();
         c.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY, s TEXT);").unwrap();
         {
             let tx = c.transaction().unwrap();
