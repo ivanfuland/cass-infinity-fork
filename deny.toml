@@ -105,11 +105,6 @@ expression = "MIT"
 license-files = []
 
 [[licenses.clarify]]
-name = "frankensearch-lexical"
-expression = "MIT"
-license-files = []
-
-[[licenses.clarify]]
 name = "frankensearch-rerank"
 expression = "MIT"
 license-files = []

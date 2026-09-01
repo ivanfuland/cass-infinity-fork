@@ -171,39 +171,6 @@ fn handle_fatal_error(err: coding_agent_search::CliError) -> ! {
     std::process::exit(err.code);
 }
 
-/// Bound the legacy embedded engine per-cursor `read_witnesses` Vec so a long B-tree
-/// descent against a multi-GB index cannot balloon RSS into the multi-GB range.
-///
-/// The legacy embedded engine default is `0` ("unbounded") to preserve historical SSI
-/// provenance semantics. cass is a read-mostly analytical workload that does
-/// not need the per-cursor witness cache — the canonical SSI evidence still
-/// flows into the pager regardless of this cap, so the cap is safe to apply
-/// here without weakening isolation.
-///
-/// Issue #252 reproduced this regression on v0.5.1: `SELECT COUNT(*)` over a
-/// 3.3 GB index allocated ~5.5 GB RSS because the cursor's `read_witnesses`
-/// vec grew one entry per page touched. Capping at 16384 keeps the cursor
-/// cache well under a few MB while leaving the SSI source of truth intact.
-///
-/// Operators who need full per-cursor provenance can override by exporting
-/// `FSQLITE_READ_WITNESS_CAP=0` (or any value) before launching cass.
-fn apply_default_fsqlite_read_witness_cap() {
-    // The env var is parsed once by the legacy embedded engine at first cursor construction
-    // and cached in a process-wide OnceLock, so a later `set_var` after a
-    // cursor opens would have no effect. We must set it here, in main, before
-    // any code path that touches the SQL store. Use `var_os` so we don't
-    // accidentally clobber an explicit operator override (including the empty
-    // string, which is meaningful to operators who want the legacy embedded engine to
-    // observe and reject the value rather than fall back to our default).
-    if std::env::var_os("FSQLITE_READ_WITNESS_CAP").is_none() {
-        // SAFETY: set_var is sound at single-threaded program startup, which
-        // is exactly where this runs (main, before any runtime is built).
-        unsafe {
-            std::env::set_var("FSQLITE_READ_WITNESS_CAP", "16384");
-        }
-    }
-}
-
 fn main() -> anyhow::Result<()> {
     // Check for AVX2 support before anything else. The prebuilt ONNX Runtime
     // binary linked by semantic builds can execute AVX2 instructions during
@@ -227,12 +194,6 @@ fn main() -> anyhow::Result<()> {
 
     // Load .env early; ignore if missing.
     dotenvy::dotenv().ok();
-
-    // Apply cass-tuned defaults before any code path constructs a legacy embedded engine
-    // cursor (which caches the FSQLITE_READ_WITNESS_CAP value once and ignores
-    // later mutations). The Health fast path below may open the SQL store, so
-    // this must run before try_run_with_parsed_fast.
-    apply_default_fsqlite_read_witness_cap();
 
     let raw_args: Vec<String> = std::env::args().collect();
     let parsed = match coding_agent_search::parse_cli(raw_args) {
