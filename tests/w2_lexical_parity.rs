@@ -1,9 +1,10 @@
 //! W2-5 Step 2: parity gate consuming the W2-1 predetermined query set
 //! (`tests/fixtures/w2_parity_queries.jsonl`, frozen -- see
 //! `W2_ARTIFACTS/w2-lexical-parity-preregistration.md` for the judged
-//! thresholds and `W2_ARTIFACTS/w2-tantivy-baseline-run.jsonl` for the
-//! frozen Tantivy-side denominator, both under the control-plane artifact
-//! root, not this repo).
+//! thresholds and `W2_ARTIFACTS/w2-tantivy-baseline-v2.jsonl` for the
+//! frozen Tantivy-side denominator (baseline-v2, exec28 recast per amendment
+//! #2 -- supersedes the original `w2-tantivy-baseline-run.jsonl`), both
+//! under the control-plane artifact root, not this repo).
 //!
 //! Two tests:
 //! - `w2_parity_fixture_matches_frozen_shape`: fast, always runs, guards the
@@ -94,9 +95,10 @@ struct SearchJsonResponse {
     hits: Vec<SearchHitPath>,
 }
 
-/// One frozen baseline row, keyed by `query` (the preregistration doc's
-/// `W2_ARTIFACTS/w2-tantivy-baseline-run.jsonl`, produced once during W2-1
-/// Step 3 and never rerun -- "供W2-5直接消费比对，不重跑不重算").
+/// One frozen baseline row, keyed by `query` (current denominator is
+/// `W2_ARTIFACTS/w2-tantivy-baseline-v2.jsonl`, exec28's amendment #2 recast
+/// of the original `w2-tantivy-baseline-run.jsonl` produced during W2-1
+/// Step 3 -- "供W2-5直接消费比对，不重跑不重算").
 #[derive(Debug, Deserialize)]
 struct BaselineRow {
     query: String,
@@ -163,7 +165,7 @@ fn w2_lexical_parity_gate() {
     let config_dir = std::env::var("CASS_W2_PARITY_CONFIG_DIR")
         .expect("set CASS_W2_PARITY_CONFIG_DIR to the w2 staging XDG_CONFIG_HOME");
     let baseline_path = std::env::var("CASS_W2_PARITY_BASELINE")
-        .expect("set CASS_W2_PARITY_BASELINE to W2_ARTIFACTS/w2-tantivy-baseline-run.jsonl");
+        .expect("set CASS_W2_PARITY_BASELINE to W2_ARTIFACTS/w2-tantivy-baseline-v2.jsonl");
 
     let fixture = load_fixture();
     let baseline = load_baseline(&baseline_path);
