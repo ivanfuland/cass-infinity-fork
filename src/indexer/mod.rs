@@ -2301,6 +2301,16 @@ fn should_skip_noop_final_lexical_checkpoint_refresh(
         && completed_checkpoint_present_at_run_end
 }
 
+/// R2-B1 (exec48 round 2): for an explicit `--full` request, skipping the
+/// post-scan authoritative rebuild is only safe when *this call* already
+/// completed one authoritative whole-archive rebuild earlier (the
+/// `rebuild_from_canonical_only`/`incremental_canonical_lexical_repair`
+/// branches above, both of which set `exact_completed_lexical_checkpoint`) --
+/// exec41's original double-rebuild-prevention intent. Without this
+/// condition, a matching on-disk checkpoint from a *prior* `cass index` run
+/// could permit skipping the only rebuild this specific `--full` invocation
+/// would otherwise perform, defeating `--full`'s explicit-rebuild contract
+/// even though the guaranteed tail block still runs something.
 fn should_skip_post_full_scan_authoritative_rebuild(
     full_rebuild: bool,
     rebuild_was_required: bool,
@@ -2308,6 +2318,7 @@ fn should_skip_post_full_scan_authoritative_rebuild(
     initial_checkpoint_status: &MatchingLexicalRebuildStateStatus,
     scan_canonical_mutations: CanonicalMutationCounts,
     observed_tantivy_docs: Option<usize>,
+    already_completed_authoritative_rebuild_this_call: bool,
 ) -> bool {
     full_rebuild
         && !rebuild_was_required
@@ -2315,6 +2326,7 @@ fn should_skip_post_full_scan_authoritative_rebuild(
         && !scan_canonical_mutations.changed()
         && initial_checkpoint_status.has_completed_checkpoint
         && initial_checkpoint_status.completed_indexed_docs == observed_tantivy_docs
+        && already_completed_authoritative_rebuild_this_call
 }
 
 struct RunIndexProgressReset {
@@ -9741,6 +9753,7 @@ pub fn run_index(
                         &initial_matching_lexical_checkpoint,
                         scan_canonical_mutations,
                         post_scan_observed_tantivy_docs,
+                        exact_completed_lexical_checkpoint,
                     ) {
                         tracing::info!(
                             db_path = %opts.db_path.display(),
@@ -33935,6 +33948,23 @@ mod tests {
             &checkpoint,
             CanonicalMutationCounts::default(),
             Some(42),
+            true,
+        ));
+        // R2-B1 (exec48 round 2): with every other condition unchanged, skip
+        // must NOT fire when this call has not yet completed an
+        // authoritative rebuild -- a matching checkpoint from a *prior* run
+        // is not grounds to skip an explicit `--full` invocation's own
+        // rebuild. Mutation target: drop the new `&&
+        // already_completed_authoritative_rebuild_this_call` clause and this
+        // assertion goes red.
+        assert!(!should_skip_post_full_scan_authoritative_rebuild(
+            true,
+            false,
+            0,
+            &checkpoint,
+            CanonicalMutationCounts::default(),
+            Some(42),
+            false,
         ));
         assert!(!should_skip_post_full_scan_authoritative_rebuild(
             false,
@@ -33943,6 +33973,7 @@ mod tests {
             &checkpoint,
             CanonicalMutationCounts::default(),
             Some(42),
+            true,
         ));
         assert!(!should_skip_post_full_scan_authoritative_rebuild(
             true,
@@ -33951,6 +33982,7 @@ mod tests {
             &checkpoint,
             CanonicalMutationCounts::default(),
             Some(42),
+            true,
         ));
         assert!(!should_skip_post_full_scan_authoritative_rebuild(
             true,
@@ -33959,6 +33991,7 @@ mod tests {
             &checkpoint,
             CanonicalMutationCounts::default(),
             Some(42),
+            true,
         ));
         assert!(!should_skip_post_full_scan_authoritative_rebuild(
             true,
@@ -33970,6 +34003,7 @@ mod tests {
                 inserted_messages: 0,
             },
             Some(42),
+            true,
         ));
         assert!(!should_skip_post_full_scan_authoritative_rebuild(
             true,
@@ -33978,6 +34012,7 @@ mod tests {
             &MatchingLexicalRebuildStateStatus::default(),
             CanonicalMutationCounts::default(),
             Some(42),
+            true,
         ));
         assert!(!should_skip_post_full_scan_authoritative_rebuild(
             true,
@@ -33986,6 +34021,7 @@ mod tests {
             &checkpoint,
             CanonicalMutationCounts::default(),
             Some(41),
+            true,
         ));
         assert!(!should_skip_post_full_scan_authoritative_rebuild(
             true,
@@ -33994,6 +34030,7 @@ mod tests {
             &checkpoint,
             CanonicalMutationCounts::default(),
             None,
+            true,
         ));
     }
 
