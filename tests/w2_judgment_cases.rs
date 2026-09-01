@@ -14,13 +14,17 @@
 //! Two tests:
 //! - `w2_judgment_fixture_matches_frozen_shape`: fast, always runs, guards
 //!   the fixture's structure against accidental edits.
-//! - `w2_judgment_cases_gate`: `#[ignore]`d (needs a real candidate binary +
-//!   the multi-GB w2 staging DB). Runs each case at a high `--limit` (ranks
-//!   in this corpus have been observed in the hundreds, not just within
-//!   top-10 -- see the exec46 Task乙 report) and reports rank(A)/rank(B)
-//!   per case; does not force a PASS/FAIL judgment by fiat -- each case's
-//!   outcome is asserted mechanically and a failing case's reasoning
-//!   belongs in the control-plane report, not a doctored threshold here.
+//! - `w2_judgment_cases_gate`: a manually-run acceptance gate, `#[ignore]`d
+//!   because it needs a real candidate binary + the multi-GB w2 staging DB
+//!   (staging-dependent, not runnable in CI). Runs each case at a high
+//!   `--limit` (ranks in this corpus have been observed in the hundreds, not
+//!   just within top-10 -- see the exec46 Task乙 report) and reports
+//!   rank(A)/rank(B) per case; does not force a PASS/FAIL judgment by fiat
+//!   -- each case's outcome is asserted mechanically and a failing case's
+//!   reasoning belongs in the control-plane report, not a doctored
+//!   threshold here. Its run record and current known result (0/5 -- an
+//!   Ivan-adjudicated disclosed gap, not a silently-tolerated regression)
+//!   are in `W2_ARTIFACTS/w2-7-gate-certification.md`, not tracked by CI.
 //!   Invoke explicitly:
 //!   `CASS_W2_JUDGMENT_BINARY=... CASS_W2_JUDGMENT_DATA_DIR=... \
 //!    CASS_W2_JUDGMENT_CONFIG_DIR=... \

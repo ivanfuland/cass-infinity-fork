@@ -1,24 +1,34 @@
 //! W2-5 Step 2: parity gate consuming the W2-1 predetermined query set
 //! (`tests/fixtures/w2_parity_queries.jsonl`, frozen -- see
 //! `W2_ARTIFACTS/w2-lexical-parity-preregistration.md` for the judged
-//! thresholds and `W2_ARTIFACTS/w2-tantivy-baseline-v2.jsonl` for the
-//! frozen Tantivy-side denominator (baseline-v2, exec28 recast per amendment
-//! #2 -- supersedes the original `w2-tantivy-baseline-run.jsonl`), both
-//! under the control-plane artifact root, not this repo).
+//! thresholds, under the control-plane artifact root, not this repo).
+//!
+//! R1-B5 (exec48): the baseline denominator now defaults to
+//! `tests/fixtures/w2-baseline-v3.jsonl`, committed in-repo (see
+//! `tests/fixtures/w2-baseline-v3-provenance.md` for what it records and why
+//! it is self-referential, not tantivy-comparative, from v3 onward). The
+//! older `w2-tantivy-baseline-v2.jsonl` (exec28's tantivy-era denominator)
+//! stays archived under the control-plane `W2_ARTIFACTS/` root, not copied
+//! into this repo; `CASS_W2_PARITY_BASELINE` still overrides the default if
+//! a v2 comparison run is ever needed again.
 //!
 //! Two tests:
 //! - `w2_parity_fixture_matches_frozen_shape`: fast, always runs, guards the
 //!   frozen fixture's structure (category counts, required fields) against
 //!   accidental edits -- catches "someone touched the fixture" before it
 //!   ever reaches the real gate.
-//! - `w2_lexical_parity_gate`: `#[ignore]`d (needs a real candidate binary
-//!   and the multi-GB w2 staging DB, not a `cargo test --lib`-scale
-//!   fixture) -- runs `cass search --mode lexical --json` for all 40
-//!   queries against the candidate binary, computes the three frozen
-//!   judgment criteria against the frozen Tantivy baseline, and panics with
-//!   a full report if any non-HOLD criterion fails. Invoke explicitly:
+//! - `w2_lexical_parity_gate`: a manually-run acceptance gate, `#[ignore]`d
+//!   because it needs a real candidate binary and the multi-GB w2 staging DB
+//!   (not a `cargo test --lib`-scale fixture) -- runs `cass search --mode
+//!   lexical --json` for all 40 queries against the candidate binary,
+//!   computes the three frozen judgment criteria against the frozen
+//!   baseline, and panics with a full report if any non-HOLD criterion
+//!   fails. Its run record and current known result (PASS 1.0/1.0/1.0 on
+//!   the v3 self-referential first run) are in
+//!   `W2_ARTIFACTS/w2-7-gate-certification.md`, not tracked by CI. Invoke
+//!   explicitly:
 //!   `CASS_W2_PARITY_BINARY=... CASS_W2_PARITY_DATA_DIR=... \
-//!    CASS_W2_PARITY_CONFIG_DIR=... CASS_W2_PARITY_BASELINE=... \
+//!    CASS_W2_PARITY_CONFIG_DIR=... [CASS_W2_PARITY_BASELINE=...] \
 //!    cargo test --test w2_lexical_parity -- --ignored --nocapture`
 
 use serde::Deserialize;
@@ -26,6 +36,7 @@ use std::collections::BTreeSet;
 use std::process::Command;
 
 const FIXTURE_PATH: &str = "tests/fixtures/w2_parity_queries.jsonl";
+const DEFAULT_BASELINE_PATH: &str = "tests/fixtures/w2-baseline-v3.jsonl";
 
 #[derive(Debug, Deserialize, Clone)]
 struct FixtureQuery {
@@ -95,10 +106,13 @@ struct SearchJsonResponse {
     hits: Vec<SearchHitPath>,
 }
 
-/// One frozen baseline row, keyed by `query` (current denominator is
-/// `W2_ARTIFACTS/w2-tantivy-baseline-v2.jsonl`, exec28's amendment #2 recast
-/// of the original `w2-tantivy-baseline-run.jsonl` produced during W2-1
-/// Step 3 -- "供W2-5直接消费比对，不重跑不重算").
+/// One frozen baseline row, keyed by `query` (current default denominator is
+/// `tests/fixtures/w2-baseline-v3.jsonl` -- see its sibling
+/// `w2-baseline-v3-provenance.md` for why v3 onward is self-referential, not
+/// a tantivy-comparative baseline. The older `w2-tantivy-baseline-v2.jsonl`,
+/// exec28's amendment #2 recast of the original `w2-tantivy-baseline-run.jsonl`
+/// produced during W2-1 Step 3, stays archived under the control-plane
+/// `W2_ARTIFACTS/` root, reachable via `CASS_W2_PARITY_BASELINE`).
 #[derive(Debug, Deserialize)]
 struct BaselineRow {
     query: String,
@@ -165,7 +179,7 @@ fn w2_lexical_parity_gate() {
     let config_dir = std::env::var("CASS_W2_PARITY_CONFIG_DIR")
         .expect("set CASS_W2_PARITY_CONFIG_DIR to the w2 staging XDG_CONFIG_HOME");
     let baseline_path = std::env::var("CASS_W2_PARITY_BASELINE")
-        .expect("set CASS_W2_PARITY_BASELINE to W2_ARTIFACTS/w2-tantivy-baseline-v2.jsonl");
+        .unwrap_or_else(|_| DEFAULT_BASELINE_PATH.to_string());
 
     let fixture = load_fixture();
     let baseline = load_baseline(&baseline_path);
