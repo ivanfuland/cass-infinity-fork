@@ -2997,30 +2997,71 @@ impl FrankenStorage {
                 "repairing missing current-schema tables on an already-versioned cass database"
             );
 
-            for batch in current_schema_repair_batches_for_missing_tables(&missing_tables)? {
-                self.conn
-                    .execute_batch(batch.sql)
-                    .with_context(|| format!("repairing current-schema batch {}", batch.name))?;
-            }
+            let repair_batches = current_schema_repair_batches_for_missing_tables(&missing_tables)?;
 
-            // R1-B2: `CREATE VIRTUAL TABLE IF NOT EXISTS fts_lex` above only
-            // recreates the *shape* of the external-content FTS5 index. When
-            // fts_lex alone went missing while lex_docs survived with rows,
-            // the freshly created shadow table has no entries pointing at
-            // that content -- MATCH queries return nothing, permanently,
-            // with no error. FTS5's `rebuild` command repopulates the shadow
-            // index from the external content table in one pass.
-            if missing_tables.contains(&"fts_lex") {
-                let lex_docs_count: i64 = self
-                    .conn
-                    .query_row_map("SELECT COUNT(*) FROM lex_docs", &[], |row| {
-                        row.get_typed(0)
-                    })
-                    .context("counting lex_docs before rebuilding fts_lex shadow index")?;
-                if lex_docs_count > 0 {
+            // R3-B2: the repair batches (which recreate `fts_lex`'s *shape*)
+            // and the `rebuild` below (which repopulates it from surviving
+            // `lex_docs` content) used to run as independent autocommit
+            // steps. A crash or a `rebuild` failure (e.g. disk full) between
+            // the two left a permanent empty-shell `fts_lex`: `sqlite_master`
+            // shows the table, so the missing-table probe above no longer
+            // fires on the next open, and MATCH queries return nothing
+            // forever with no error -- the exact false-green the fix in
+            // R1-B2 (64bd722e) exists to prevent. Running both steps as one
+            // transaction makes the repair atomic: any failure rolls back to
+            // "table still missing", so the next open retries the repair
+            // instead of freezing on the half-repaired state.
+            self.conn
+                .execute("BEGIN IMMEDIATE;", &[])
+                .with_context(|| "starting current-schema repair transaction")?;
+            let repair_result = (|| -> Result<()> {
+                for batch in repair_batches {
                     self.conn
-                        .execute("INSERT INTO fts_lex(fts_lex) VALUES('rebuild')", &[])
-                        .context("rebuilding fts_lex shadow index from surviving lex_docs content")?;
+                        .execute_batch(batch.sql)
+                        .with_context(|| format!("repairing current-schema batch {}", batch.name))?;
+                }
+
+                // R1-B2: `CREATE VIRTUAL TABLE IF NOT EXISTS fts_lex` above
+                // only recreates the *shape* of the external-content FTS5
+                // index. When fts_lex alone went missing while lex_docs
+                // survived with rows, the freshly created shadow table has
+                // no entries pointing at that content -- MATCH queries
+                // return nothing, permanently, with no error. FTS5's
+                // `rebuild` command repopulates the shadow index from the
+                // external content table in one pass.
+                if missing_tables.contains(&"fts_lex") {
+                    let lex_docs_count: i64 = self
+                        .conn
+                        .query_row_map("SELECT COUNT(*) FROM lex_docs", &[], |row| {
+                            row.get_typed(0)
+                        })
+                        .context("counting lex_docs before rebuilding fts_lex shadow index")?;
+                    if lex_docs_count > 0 {
+                        self.conn
+                            .execute("INSERT INTO fts_lex(fts_lex) VALUES('rebuild')", &[])
+                            .context("rebuilding fts_lex shadow index from surviving lex_docs content")?;
+                    }
+                }
+                Ok(())
+            })();
+            match repair_result {
+                Ok(()) => {
+                    if let Err(commit_err) = self
+                        .conn
+                        .execute("COMMIT;", &[])
+                        .with_context(|| "committing current-schema repair transaction")
+                    {
+                        // as in `restore_scan_watermarks`: the legacy embedded
+                        // engine keeps the transaction ACTIVE after a failed
+                        // COMMIT -- roll it back explicitly so this connection
+                        // is not returned to any pool with an open transaction.
+                        let _ = self.conn.execute("ROLLBACK;", &[]);
+                        return Err(commit_err);
+                    }
+                }
+                Err(e) => {
+                    let _ = self.conn.execute("ROLLBACK;", &[]);
+                    return Err(e);
                 }
             }
 
@@ -25369,6 +25410,108 @@ mod tests {
             hits, 1,
             "self-heal must rebuild the fts_lex shadow index from surviving lex_docs content, \
              not just recreate an empty shadow table that silently matches nothing"
+        );
+    }
+
+    /// R3-B2: if the `rebuild` step fails after the repair batch already
+    /// recreated `fts_lex`'s shape, the whole repair must roll back to
+    /// "fts_lex still missing" -- not leave the freshly (re)created shadow
+    /// table sitting there empty, which is exactly the permanent false-green
+    /// state R1-B2 fixed. Forcing a real crash mid-repair isn't a low-cost
+    /// injection point, so this test forces the `rebuild` statement itself
+    /// to fail (by breaking `lex_docs`'s schema out from under it, after
+    /// `fts_lex` shape recreation would otherwise have succeeded) and checks
+    /// the transaction actually undid the `CREATE VIRTUAL TABLE`.
+    #[test]
+    fn franken_storage_open_rolls_back_fts_lex_shape_when_rebuild_fails_mid_repair() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test_repair_fts_lex_rebuild_failure.db");
+
+        let agent = Agent {
+            id: None,
+            slug: "repair-check".into(),
+            name: "repair-check".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        };
+        let conv = Conversation {
+            id: None,
+            agent_slug: "repair-check".into(),
+            workspace: None,
+            external_id: Some("r3b2-repair-1".into()),
+            title: Some("R3-B2 rollback check".into()),
+            source_path: std::path::PathBuf::from("/fixtures/r3b2-repair.jsonl"),
+            started_at: Some(1),
+            ended_at: Some(2),
+            approx_tokens: None,
+            metadata_json: serde_json::json!({}),
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(1),
+                content: "r3b2 marker for the forced rebuild failure".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: vec![],
+            }],
+            source_id: "local".into(),
+            origin_host: None,
+        };
+
+        {
+            let storage = FrankenStorage::open(&db_path).unwrap();
+            let agent_id = storage.ensure_agent(&agent).unwrap();
+            storage
+                .insert_conversations_batched(&[(agent_id, None, &conv)])
+                .unwrap();
+        }
+
+        {
+            let conn = FrankenConnection::open_writable(
+                std::path::Path::new(&(db_path.to_string_lossy().into_owned())),
+                crate::storage::api::Profile::Production,
+            )
+            .unwrap();
+            conn.execute("DROP TABLE IF EXISTS fts_lex", &[]).unwrap();
+            // `lex_docs` survives (like the R1-B2 case above) but loses one
+            // of the five columns the fts5 shape maps 1:1 onto. `CREATE
+            // VIRTUAL TABLE fts_lex USING fts5(...)` only declares the shape
+            // and does not validate `lex_docs` at creation time, so it would
+            // still succeed; the `INSERT INTO fts_lex(fts_lex)
+            // VALUES('rebuild')` that reads `lex_docs.workspace` is what
+            // fails -- the same "shape recreated, rebuild fails" ordering
+            // the real disk-full/crash scenario hits.
+            conn.execute("ALTER TABLE lex_docs DROP COLUMN workspace", &[])
+                .unwrap();
+        }
+
+        let open_err = FrankenStorage::open(&db_path)
+            .err()
+            .expect("open must surface the forced rebuild failure, not silently succeed");
+        let err_text = format!("{open_err:#}");
+        assert!(
+            err_text.contains("rebuilding fts_lex shadow index"),
+            "error should be attributed to the fts_lex rebuild step, got: {err_text}"
+        );
+
+        let raw = FrankenConnection::open_writable(
+            std::path::Path::new(&(db_path.to_string_lossy().into_owned())),
+            crate::storage::api::Profile::Production,
+        )
+        .unwrap();
+        let fts_lex_exists: i64 = raw
+            .query_row_map(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='fts_lex'",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            fts_lex_exists, 0,
+            "a failed rebuild must roll back the whole repair transaction -- fts_lex must stay \
+             missing (so the next open retries the repair), not survive as an empty shell that \
+             the missing-table probe no longer catches"
         );
     }
 
