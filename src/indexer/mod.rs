@@ -11515,7 +11515,7 @@ fn canonical_archive_unhealthy_for_index_error(db_path: &Path, reason: &str) -> 
          cass index will not replace or truncate the SQLite source of truth. \
          Run 'cass doctor check --json' to inspect the archive. If the canonical \
          rows are readable but a derived/FTS5 structure is corrupt, run \
-         'cass doctor --rebuild-canonical-fts --yes' to drop and rebuild the FTS5 \
+         'cass index --full' to drop and rebuild the lex_docs/fts_lex \
          shadow tables in place. If the archive cannot be opened, recover the \
          source tree from cass's own preserved events with \
          'cass doctor --recover-from-archive <DIR>' (rebuilds source JSONL from the \

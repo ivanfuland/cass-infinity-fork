@@ -8467,7 +8467,7 @@ async fn execute_cli(
                             code: 4,
                             kind: "refused-unsafe",
                             message: "`cass doctor --rebuild-canonical-fts` has been retired: the in-DB fts_messages shadow it rebuilt no longer exists (search runs entirely on the fts_lex/lex_docs index).".to_string(),
-                            hint: Some("No action needed -- there is no fts_messages shadow left to repair.".to_string()),
+                            hint: Some("No action needed for fts_messages -- to rebuild the current fts_lex/lex_docs index instead, run 'cass index --full'.".to_string()),
                             retryable: false,
                         });
                     }
