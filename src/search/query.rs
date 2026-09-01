@@ -6248,9 +6248,15 @@ impl SearchClient {
                 tracing::warn!(
                     error = %err,
                     ku3_like_fallback,
-                    "fts_lex candidate query failed; returning no lexical hits"
+                    "fts_lex candidate query failed"
                 );
-                return Ok(Vec::new());
+                // R1-B3: an execution failure is not the same fact as "zero
+                // matches" -- silently returning Ok(Vec::new()) made a
+                // broken query indistinguishable from a genuinely empty
+                // result (a false-green search). Propagate honestly, same
+                // doctrine as the marker-state three-way match in
+                // `search()` above.
+                return Err(err).context("fts_lex candidate query failed");
             }
         };
         if candidate_rows.is_empty() {
@@ -6312,9 +6318,11 @@ impl SearchClient {
                 Err(err) => {
                     tracing::warn!(
                         error = %err,
-                        "fts_lex message hydration query failed; returning no lexical hits"
+                        "fts_lex message hydration query failed"
                     );
-                    return Ok(Vec::new());
+                    // R1-B3: see the candidate-query site above -- propagate
+                    // rather than mask a real failure as an empty result.
+                    return Err(err).context("fts_lex message hydration query failed");
                 }
             };
             metadata_by_message_id.extend(rows.into_iter().map(|row| (row.0, row)));
@@ -6326,9 +6334,11 @@ impl SearchClient {
             Err(err) => {
                 tracing::warn!(
                     error = %err,
-                    "fts_lex corpus stats computation failed; returning no lexical hits"
+                    "fts_lex corpus stats computation failed"
                 );
-                return Ok(Vec::new());
+                // R1-B3: see the candidate-query site above -- propagate
+                // rather than mask a real failure as an empty result.
+                return Err(err).context("fts_lex corpus stats computation failed");
             }
         };
 
@@ -9559,6 +9569,89 @@ mod tests {
         assert_eq!(hits[0].line_number, Some(1));
         assert_eq!(hits[0].source_id, "local");
         assert_eq!(hits[0].origin_kind, "local");
+        Ok(())
+    }
+
+    /// R1-B3 regression: a genuine SQL execution failure inside
+    /// `search_fts_lex_domain` (candidate/hydrate/corpus-stats query) used
+    /// to be swallowed into `Ok(Vec::new())` -- indistinguishable from a
+    /// genuinely empty result, a false-green search. It must now propagate.
+    #[test]
+    fn search_fts_lex_domain_propagates_candidate_query_failure_instead_of_going_silent()
+    -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let db_path = temp_dir.path().join("candidate-query-failure.db");
+        {
+            let storage = FrankenStorage::open(&db_path)?;
+            let agent = Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            };
+            let agent_id = storage.ensure_agent(&agent)?;
+            let conversation = Conversation {
+                id: None,
+                agent_slug: agent.slug.clone(),
+                workspace: None,
+                external_id: Some("candidate-query-failure".into()),
+                title: Some("t".into()),
+                source_path: temp_dir.path().join("session.jsonl"),
+                started_at: Some(42),
+                ended_at: Some(42),
+                approx_tokens: Some(16),
+                metadata_json: serde_json::Value::Null,
+                messages: vec![Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: Some("user".into()),
+                    created_at: Some(42),
+                    content: "r1b3livemarker".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                }],
+                source_id: "local".into(),
+                origin_host: None,
+            };
+            storage.insert_conversation_tree(agent_id, None, &conversation)?;
+
+            // `search_fts_lex_domain` itself only checks `sqlite_master`
+            // for a table *named* `fts_lex` before dispatching to the
+            // candidate query (an outright-missing table is the deliberate
+            // "genuinely absent" `Ok(Vec::new())` this fix leaves alone).
+            // Swap the real FTS5 virtual table for an ordinary table of the
+            // same name and shape: `sqlite_master` still reports it exists,
+            // but `bm25(fts_lex, ...)`/`MATCH` against a non-FTS5 table is a
+            // genuine SQL execution failure -- the "bad table" injection
+            // this regression needs to reach the candidate-query site.
+            storage.raw().execute("DROP TABLE fts_lex", &[])?;
+            storage.raw().execute(
+                "CREATE TABLE fts_lex (content TEXT, title TEXT, agent TEXT, workspace TEXT, source_path TEXT)",
+                &[],
+            )?;
+        }
+
+        let client = SearchClient {
+            sqlite: Mutex::new(None),
+            sqlite_path: Some(db_path),
+            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            metrics: Metrics::default(),
+            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
+            semantic: Mutex::new(None),
+        };
+
+        let result =
+            client.search("r1b3livemarker", SearchFilters::default(), 5, 0, FieldMask::FULL);
+        let err = result.expect_err(
+            "a broken fts_lex candidate query must surface as an error, not a silent empty result",
+        );
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("fts_lex candidate query failed"),
+            "error chain must carry the propagated failure context, got: {chain}"
+        );
         Ok(())
     }
 
