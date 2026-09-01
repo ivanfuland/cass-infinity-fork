@@ -211,17 +211,65 @@ struct BaselineRow {
     top10_source_paths: Vec<String>,
 }
 
-fn load_baseline(path: &str) -> std::collections::HashMap<String, BaselineRow> {
+/// R2-N1 (exec48 round 2): raw parsed rows, duplicates and all -- unlike
+/// `load_baseline` below (a `HashMap` keyed by `query`, which silently
+/// collapses a duplicate query onto whichever row lost the collision), this
+/// is what the non-`#[ignore]`d shape test actually needs to detect a
+/// duplicate query landing in the frozen baseline file.
+fn load_baseline_rows(path: &str) -> Vec<BaselineRow> {
     let text = std::fs::read_to_string(path)
         .unwrap_or_else(|err| panic!("reading frozen tantivy baseline {path}: {err}"));
     text.lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| {
-            let row: BaselineRow = serde_json::from_str(line)
-                .unwrap_or_else(|err| panic!("parsing baseline line {line:?}: {err}"));
-            (row.query.clone(), row)
+            serde_json::from_str(line)
+                .unwrap_or_else(|err| panic!("parsing baseline line {line:?}: {err}"))
         })
         .collect()
+}
+
+fn load_baseline(path: &str) -> std::collections::HashMap<String, BaselineRow> {
+    load_baseline_rows(path)
+        .into_iter()
+        .map(|row| (row.query.clone(), row))
+        .collect()
+}
+
+/// R2-N1 (exec48 round 2): fast, always-runs guard on the frozen v3 baseline
+/// file's own shape -- same "catch an accidental edit before it reaches the
+/// real gate" role as `w2_parity_fixture_matches_frozen_shape` plays for the
+/// query fixture, but for the baseline denominator, which previously had no
+/// non-`#[ignore]`d coverage at all.
+#[test]
+fn w2_baseline_v3_matches_frozen_shape() {
+    let rows = load_baseline_rows(DEFAULT_BASELINE_PATH);
+    assert_eq!(rows.len(), 40, "frozen v3 baseline must have exactly 40 rows");
+
+    let mut seen_queries = std::collections::HashSet::with_capacity(rows.len());
+    for row in &rows {
+        assert!(!row.query.trim().is_empty(), "baseline row must have a non-empty query: {row:?}");
+        assert!(
+            seen_queries.insert(row.query.as_str()),
+            "baseline query must be unique, found a duplicate: {:?}",
+            row.query
+        );
+        // anchor fields must actually be present/coherent, not just
+        // deserialize to defaults: a hit must carry a plausible rank and at
+        // least one top-10 path; a miss's own top10_source_paths (used
+        // elsewhere as the criterion-2 overlap denominator) may legitimately
+        // be empty, but anchor_rank must still be in-bounds.
+        assert!(
+            row.anchor_rank >= 1 && row.anchor_rank <= 11,
+            "baseline row anchor_rank must be in [1, 11]: {row:?}"
+        );
+        if row.anchor_hit {
+            assert!(
+                !row.top10_source_paths.is_empty(),
+                "baseline row with anchor_hit=true must carry a non-empty top10_source_paths: {row:?}"
+            );
+        }
+    }
+    assert_eq!(seen_queries.len(), 40, "all 40 baseline queries must be unique");
 }
 
 fn run_fts5_lexical_search(binary: &str, data_dir: &str, config_dir: &str, query: &str) -> Vec<String> {
