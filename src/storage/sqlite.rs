@@ -3003,6 +3003,27 @@ impl FrankenStorage {
                     .with_context(|| format!("repairing current-schema batch {}", batch.name))?;
             }
 
+            // R1-B2: `CREATE VIRTUAL TABLE IF NOT EXISTS fts_lex` above only
+            // recreates the *shape* of the external-content FTS5 index. When
+            // fts_lex alone went missing while lex_docs survived with rows,
+            // the freshly created shadow table has no entries pointing at
+            // that content -- MATCH queries return nothing, permanently,
+            // with no error. FTS5's `rebuild` command repopulates the shadow
+            // index from the external content table in one pass.
+            if missing_tables.contains(&"fts_lex") {
+                let lex_docs_count: i64 = self
+                    .conn
+                    .query_row_map("SELECT COUNT(*) FROM lex_docs", &[], |row| {
+                        row.get_typed(0)
+                    })
+                    .context("counting lex_docs before rebuilding fts_lex shadow index")?;
+                if lex_docs_count > 0 {
+                    self.conn
+                        .execute("INSERT INTO fts_lex(fts_lex) VALUES('rebuild')", &[])
+                        .context("rebuilding fts_lex shadow index from surviving lex_docs content")?;
+                }
+            }
+
             for &(table_name, probe_sql) in REQUIRED_CURRENT_SCHEMA_TABLE_PROBES {
                 if !missing_tables.contains(&table_name) {
                     continue;
@@ -25262,6 +25283,92 @@ mod tests {
         assert_eq!(
             hits, 1,
             "the repaired fts_lex table must actually be writable and MATCH-able, not just present"
+        );
+    }
+
+    /// R1-B2: when `fts_lex` alone goes missing (e.g. corruption wipes just
+    /// the virtual table) while `lex_docs` survives with rows, self-heal
+    /// must not leave a permanently empty, "healthy-looking" shadow index --
+    /// it has to `rebuild` from the surviving external content so
+    /// pre-existing rows stay MATCH-able, not just rows written after repair.
+    #[test]
+    fn franken_storage_open_rebuilds_fts_lex_from_surviving_lex_docs_when_only_fts_lex_is_missing()
+     {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test_repair_fts_lex_only.db");
+
+        let agent = Agent {
+            id: None,
+            slug: "repair-check".into(),
+            name: "repair-check".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        };
+        let conv = Conversation {
+            id: None,
+            agent_slug: "repair-check".into(),
+            workspace: None,
+            external_id: Some("r1b2-repair-1".into()),
+            title: Some("R1-B2 repair check".into()),
+            source_path: std::path::PathBuf::from("/fixtures/r1b2-repair.jsonl"),
+            started_at: Some(1),
+            ended_at: Some(2),
+            approx_tokens: None,
+            metadata_json: serde_json::json!({}),
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(1),
+                content: "r1b2fixmarker survives the fts_lex-only drop".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: vec![],
+            }],
+            source_id: "local".into(),
+            origin_host: None,
+        };
+
+        {
+            let storage = FrankenStorage::open(&db_path).unwrap();
+            let agent_id = storage.ensure_agent(&agent).unwrap();
+            storage
+                .insert_conversations_batched(&[(agent_id, None, &conv)])
+                .unwrap();
+        }
+
+        {
+            let conn = FrankenConnection::open_writable(
+                std::path::Path::new(&(db_path.to_string_lossy().into_owned())),
+                crate::storage::api::Profile::Production,
+            )
+            .unwrap();
+            conn.execute("DROP TABLE IF EXISTS fts_lex", &[]).unwrap();
+        }
+
+        let repaired = FrankenStorage::open(&db_path).unwrap();
+
+        let lex_docs_count: i64 = repaired
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM lex_docs", &[], |row| row.get_typed(0))
+            .unwrap();
+        assert_eq!(
+            lex_docs_count, 1,
+            "lex_docs must have survived the fts_lex-only drop untouched"
+        );
+
+        let hits: i64 = repaired
+            .raw()
+            .query_row_map(
+                "SELECT count(*) FROM fts_lex WHERE fts_lex MATCH 'r1b2fixmarker'",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            hits, 1,
+            "self-heal must rebuild the fts_lex shadow index from surviving lex_docs content, \
+             not just recreate an empty shadow table that silently matches nothing"
         );
     }
 
