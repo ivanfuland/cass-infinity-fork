@@ -11893,8 +11893,34 @@ pub(crate) fn rebuild_lex_domain_from_db_full(
     db_path: &Path,
     progress: Option<Arc<IndexingProgress>>,
 ) -> Result<usize> {
-    let storage = FrankenStorage::open(db_path)
-        .with_context(|| format!("opening database for full lex domain rebuild: {}", db_path.display()))?;
+    // R1-B4: unconditional drop+recreate before resync, matching
+    // `repair_lexical_index_from_canonical_db_for_search`'s pattern below --
+    // `rebuild_lex_domain_from_db` only resyncs conversations that still
+    // exist, so a plain open on a lex domain carrying pre-existing desync
+    // residue (stale rows not covered by any live conversation) leaves that
+    // residue in place while still reporting the rebuild "completed".
+    // `--full`'s cost is already O(every row) either way, so the extra wipe
+    // is free and removes the residue outright.
+    let lex_conn = crate::storage::api::Conn::open_writable(
+        db_path,
+        crate::storage::api::Profile::Production,
+    )
+    .with_context(|| {
+        format!("opening database (raw) for full lex domain rebuild: {}", db_path.display())
+    })?;
+    crate::storage::schema::recreate_lex_domain_tables(&lex_conn).with_context(|| {
+        format!(
+            "recreating lex domain tables for full lex domain rebuild: {}",
+            db_path.display()
+        )
+    })?;
+    let storage = FrankenStorage::from_writer_handle_conn(lex_conn, db_path.to_path_buf())
+        .with_context(|| {
+            format!(
+                "wrapping recreated lex domain connection for full lex domain rebuild: {}",
+                db_path.display()
+            )
+        })?;
     let stats = storage
         .rebuild_lex_domain_from_db(progress.as_ref())
         .with_context(|| format!("rebuilding lex domain from db: {}", db_path.display()))?;
@@ -30448,6 +30474,133 @@ mod tests {
             calls == 1,
             "cass index --full must rebuild the whole-archive lex domain exactly once, got {calls} calls"
         );
+        Ok(())
+    }
+
+    /// R1-B4 regression: `rebuild_lex_domain_from_db_full` used to resync
+    /// `lex_docs`/`fts_lex` in place, only ever touching conversations that
+    /// still exist in `conversations` -- so pre-existing desync residue (a
+    /// row with no corresponding live conversation) survived a `--full`
+    /// rebuild while it still reported completion. It must now wipe (drop +
+    /// recreate) the lex domain before resyncing, matching what
+    /// `repair_lexical_index_from_canonical_db_for_search` already does.
+    #[test]
+    fn rebuild_lex_domain_from_db_full_clears_desync_residue_from_a_stray_lex_row() -> Result<()> {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("full_rebuild_desync.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+
+        let agent = crate::model::types::Agent {
+            id: None,
+            slug: "r1b4-tester".into(),
+            name: "R1-B4 Tester".into(),
+            version: None,
+            kind: crate::model::types::AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        let conversation = crate::model::types::Conversation {
+            id: None,
+            agent_slug: "r1b4-tester".into(),
+            workspace: None,
+            external_id: Some("r1b4-real-1".into()),
+            title: Some("R1-B4 real conversation".into()),
+            source_path: std::path::PathBuf::from("/tmp/r1b4-real.jsonl"),
+            started_at: Some(1),
+            ended_at: Some(2),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![crate::model::types::Message {
+                id: None,
+                idx: 0,
+                role: crate::model::types::MessageRole::User,
+                author: None,
+                created_at: Some(1),
+                content: "r1b4livemarker still present after full rebuild".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: "local".into(),
+            origin_host: None,
+        };
+        storage
+            .insert_conversations_batched(&[(agent_id, None, &conversation)])
+            .unwrap();
+
+        // Bypass FK enforcement -- deliberate, narrow test-fixture exception
+        // (same rationale as
+        // `cleanup_orphan_fk_rows_removes_orphans_and_is_noop_on_clean_db` in
+        // storage::sqlite): plant a stray lex_docs/fts_lex row with no
+        // corresponding message row at all, simulating desync residue an
+        // in-place resync would never touch (it only iterates conversations
+        // that currently exist).
+        storage
+            .raw()
+            .execute_batch_bypassing_foreign_keys_guard("PRAGMA foreign_keys = OFF")
+            .unwrap();
+        storage
+            .raw()
+            .execute(
+                "INSERT INTO lex_docs(doc_id, content, title, agent, workspace, source_path) \
+                 VALUES(999999, 'r1b4strayresidue', 'stray', 'stray-agent', 'stray-ws', '/stray')",
+                &[],
+            )
+            .unwrap();
+        storage
+            .raw()
+            .execute(
+                "INSERT INTO fts_lex(rowid, content, title, agent, workspace, source_path) \
+                 VALUES(999999, 'r1b4strayresidue', 'stray', 'stray-agent', 'stray-ws', '/stray')",
+                &[],
+            )
+            .unwrap();
+        storage
+            .raw()
+            .execute_batch_bypassing_foreign_keys_guard("PRAGMA foreign_keys = ON")
+            .unwrap();
+
+        let stray_hits_before: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT count(*) FROM fts_lex WHERE fts_lex MATCH 'r1b4strayresidue'",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        anyhow::ensure!(
+            stray_hits_before == 1,
+            "sanity: the stray desync row must be planted before the full rebuild"
+        );
+        storage.close().unwrap();
+
+        rebuild_lex_domain_from_db_full(&db_path, None)?;
+
+        let reopened = FrankenStorage::open_readonly(&db_path).unwrap();
+        let stray_hits_after: i64 = reopened
+            .raw()
+            .query_row_map(
+                "SELECT count(*) FROM fts_lex WHERE fts_lex MATCH 'r1b4strayresidue'",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stray_hits_after, 0,
+            "--full must wipe desync residue, not just resync live conversations in place"
+        );
+
+        let live_hits: i64 = reopened
+            .raw()
+            .query_row_map(
+                "SELECT count(*) FROM fts_lex WHERE fts_lex MATCH 'r1b4livemarker'",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            live_hits, 1,
+            "--full must still rebuild the live conversation's lex content"
+        );
+        reopened.close_without_checkpoint().unwrap();
         Ok(())
     }
 
