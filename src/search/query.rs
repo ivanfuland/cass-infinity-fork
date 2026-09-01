@@ -2788,6 +2788,20 @@ static CACHE_EVICTION_POLICY: Lazy<CacheEvictionPolicy> = Lazy::new(|| {
     cache_eviction_policy_from_env_value(dotenvy::var("CASS_CACHE_EVICTION_POLICY").ok().as_deref())
 });
 
+// Task甲 (design doc B', window position quota): per-session seat cap
+// within the top-10 lexical rerank window. Default is
+// `lexical_rerank::DEFAULT_SESSION_WINDOW_CAP` (Google host-crowding
+// convention, not fitted); `0` disables the pass entirely (kill-switch).
+// Unlike the cache caps above, `0` is a valid, meaningful value here, so
+// there is no `.filter(|v| *v > 0)` -- any malformed/unset env falls back
+// to the default via `.unwrap_or`.
+static LEXICAL_SESSION_WINDOW_CAP: Lazy<usize> = Lazy::new(|| {
+    dotenvy::var("CASS_LEXICAL_SESSION_WINDOW_CAP")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(lexical_rerank::DEFAULT_SESSION_WINDOW_CAP)
+});
+
 const DEFAULT_CACHE_BYTE_CAP_FALLBACK: usize = 64 * 1024 * 1024;
 const DEFAULT_CACHE_BYTE_CAP_MEMORY_FRACTION_DENOMINATOR: u64 = 128;
 const DEFAULT_CACHE_BYTE_CAP_CEILING: u64 = 2 * 1024 * 1024 * 1024;
@@ -6329,6 +6343,10 @@ impl SearchClient {
                     title: meta.1.clone(),
                     legacy_score,
                     score: 0.0,
+                    // conversation identity for the Task甲 window quota
+                    // (design doc B') -- `meta.8` is `c.id` from the
+                    // hydrate query's `LEFT JOIN conversations c`.
+                    conversation_key: meta.8,
                 })
             })
             .collect();
@@ -6338,6 +6356,7 @@ impl SearchClient {
             &query_terms,
             &corpus_stats.avgdl,
             corpus_stats.total_docs,
+            *LEXICAL_SESSION_WINDOW_CAP,
         );
 
         let mut hits = Vec::with_capacity(ranked.len().min(offset.saturating_add(limit)));

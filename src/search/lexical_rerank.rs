@@ -215,6 +215,12 @@ pub(crate) struct RerankCandidate {
     pub legacy_score: f64,
     /// Filled in by [`rerank_candidates`]; `0.0` until then.
     pub score: f64,
+    /// Conversation identity for the Task甲 window quota pass (design doc
+    /// B'). `None` when the caller's hydrate join can't resolve one
+    /// (defensive -- LEFT JOIN in the caller can yield NULL) -- grouped as
+    /// a single shared bucket by [`apply_session_window_quota`], same cap
+    /// applies to it as any real session.
+    pub conversation_key: Option<i64>,
 }
 
 /// Corpus-wide average field length (token count, not character count --
@@ -225,17 +231,34 @@ pub(crate) struct FieldAvgdl {
     pub title: f64,
 }
 
+/// Design doc B' window size: quota is enforced within the leading `N`
+/// positions of the final order, matching Google host-crowding's "front
+/// page" scope (not a global cap across the whole candidate set).
+const SESSION_WINDOW_SIZE: usize = 10;
+
+/// Default per-session seat cap `K` within [`SESSION_WINDOW_SIZE`] (design
+/// doc §四: Google host-crowding twenty-year convention value, not fitted).
+/// The env override is read by the caller (`CASS_LEXICAL_SESSION_WINDOW_CAP`
+/// in `query.rs`) and passed in explicitly -- this module stays free of env
+/// I/O so its tests are hermetic.
+pub(crate) const DEFAULT_SESSION_WINDOW_CAP: usize = 2;
+
 /// Scores and sorts `candidates` in place (consuming and returning them),
 /// final order: BM25F score descending (content+title independent BM25
 /// summed, tantivy's real multi-field semantics -- see module doc) →
 /// legacy_score descending (tie-break for the score==0.0 upgrade-surface
 /// candidates) → doc_id ascending (deterministic final tie-break, mirrors
-/// the existing `ORDER BY bm25(), rowid` convention in `query.rs`).
+/// the existing `ORDER BY bm25(), rowid` convention in `query.rs`) → then
+/// the Task甲 window quota pass (design doc B'): at most `session_window_cap`
+/// seats per `conversation_key` within the leading [`SESSION_WINDOW_SIZE`]
+/// positions, `0` disables the pass entirely (kill-switch, byte-identical
+/// to pre-Task甲 behavior).
 pub(crate) fn rerank_candidates(
     mut candidates: Vec<RerankCandidate>,
     query_terms: &[String],
     avgdl: &FieldAvgdl,
     total_docs: u64,
+    session_window_cap: usize,
 ) -> Vec<RerankCandidate> {
     let term_groups: Vec<Vec<String>> = query_terms
         .iter()
@@ -250,7 +273,7 @@ pub(crate) fn rerank_candidates(
                 .unwrap_or(Ordering::Equal)
                 .then_with(|| a.doc_id.cmp(&b.doc_id))
         });
-        return candidates;
+        return apply_session_window_quota(candidates, session_window_cap);
     }
 
     struct Prepared<'a> {
@@ -320,7 +343,58 @@ pub(crate) fn rerank_candidates(
             .then_with(|| b.legacy_score.partial_cmp(&a.legacy_score).unwrap_or(Ordering::Equal))
             .then_with(|| a.doc_id.cmp(&b.doc_id))
     });
-    candidates
+    apply_session_window_quota(candidates, session_window_cap)
+}
+
+/// Design doc B' (window position quota, Task甲): greedily re-ranks the
+/// already-final-ordered `candidates` so no single `conversation_key`
+/// occupies more than `cap` seats within the leading [`SESSION_WINDOW_SIZE`]
+/// positions -- ports Google's host-crowding model ("front page: at most
+/// two hits per site") to conversation identity.
+///
+/// - `cap == 0` is the kill-switch: returns `candidates` completely
+///   unmoved (byte-identical to pre-Task甲 behavior).
+/// - Only demotes, never drops: the candidate set and its length are
+///   untouched, only position moves -- `total_matches` downstream is
+///   unaffected.
+/// - Within a session, relative order is preserved (a single forward pass
+///   over the already-sorted input can only ever place same-key candidates
+///   in their original relative sequence, whether they land in the window
+///   or the overflow tail).
+/// - "Natural backfill": when quota-eligible candidates can't fill all
+///   `SESSION_WINDOW_SIZE` seats (too few distinct sessions competing --
+///   the single-session-has-the-only-answer case), the window is topped
+///   off from the overflow in original order, quota-unconstrained -- an
+///   uncontested session is never starved down below the window just
+///   because it hit its own cap early.
+fn apply_session_window_quota(
+    candidates: Vec<RerankCandidate>,
+    cap: usize,
+) -> Vec<RerankCandidate> {
+    if cap == 0 {
+        return candidates;
+    }
+
+    let mut window: Vec<RerankCandidate> = Vec::with_capacity(SESSION_WINDOW_SIZE);
+    let mut overflow: Vec<RerankCandidate> = Vec::new();
+    let mut session_seats: HashMap<Option<i64>, usize> = HashMap::new();
+
+    for candidate in candidates {
+        let seats = session_seats.entry(candidate.conversation_key).or_insert(0);
+        if window.len() < SESSION_WINDOW_SIZE && *seats < cap {
+            *seats += 1;
+            window.push(candidate);
+        } else {
+            overflow.push(candidate);
+        }
+    }
+
+    while window.len() < SESSION_WINDOW_SIZE && !overflow.is_empty() {
+        window.push(overflow.remove(0));
+    }
+
+    window.extend(overflow);
+    window
 }
 
 #[cfg(test)]
@@ -413,6 +487,7 @@ mod tests {
             },
             legacy_score: 0.0,
             score: 0.0,
+            conversation_key: None,
         });
         for i in 0..199 {
             candidates.push(RerankCandidate {
@@ -421,6 +496,7 @@ mod tests {
                 title: "x".to_string(),
                 legacy_score: 0.0,
                 score: 0.0,
+                conversation_key: None,
             });
         }
         for i in 0..19 {
@@ -430,6 +506,7 @@ mod tests {
                 title: "needle".to_string(),
                 legacy_score: 0.0,
                 score: 0.0,
+                conversation_key: None,
             });
         }
         for i in 0..(N as usize - candidates.len()) {
@@ -439,12 +516,14 @@ mod tests {
                 title: "nothing".to_string(),
                 legacy_score: 0.0,
                 score: 0.0,
+                conversation_key: None,
             });
         }
         assert_eq!(candidates.len(), N as usize);
 
         let avgdl = FieldAvgdl { content: 1125.0, title: 54.0 };
-        let ranked = rerank_candidates(candidates, &["needle".to_string()], &avgdl, N);
+        // cap=0: this test's job is BM25F sum semantics, not window quota.
+        let ranked = rerank_candidates(candidates, &["needle".to_string()], &avgdl, N, 0);
         let top = ranked.iter().find(|c| c.doc_id == 1).expect("candidate present");
         // Not asserting the exact oracle from the design doc's hand-picked
         // dl/avgdl/df combination (this test builds its own consistent
@@ -469,9 +548,10 @@ mod tests {
             title: "also nothing".to_string(),
             legacy_score: -1.2,
             score: 0.0,
+            conversation_key: None,
         }];
         let avgdl = FieldAvgdl { content: 100.0, title: 20.0 };
-        let ranked = rerank_candidates(candidates, &["needle".to_string()], &avgdl, N);
+        let ranked = rerank_candidates(candidates, &["needle".to_string()], &avgdl, N, 0);
         approx(ranked[0].score, 0.0);
     }
 
@@ -500,12 +580,12 @@ mod tests {
         // caller-negated values this function actually receives are 1.2
         // and 3.5.
         let candidates = vec![
-            RerankCandidate { doc_id: 10, content: "hit here".to_string(), title: String::new(), legacy_score: 0.0, score: 0.0 },
-            RerankCandidate { doc_id: 20, content: String::new(), title: String::new(), legacy_score: 1.2, score: 0.0 },
-            RerankCandidate { doc_id: 30, content: String::new(), title: String::new(), legacy_score: 3.5, score: 0.0 },
+            RerankCandidate { doc_id: 10, content: "hit here".to_string(), title: String::new(), legacy_score: 0.0, score: 0.0, conversation_key: None },
+            RerankCandidate { doc_id: 20, content: String::new(), title: String::new(), legacy_score: 1.2, score: 0.0, conversation_key: None },
+            RerankCandidate { doc_id: 30, content: String::new(), title: String::new(), legacy_score: 3.5, score: 0.0, conversation_key: None },
         ];
         let avgdl = FieldAvgdl { content: 100.0, title: 20.0 };
-        let ranked = rerank_candidates(candidates, &["hit".to_string()], &avgdl, N);
+        let ranked = rerank_candidates(candidates, &["hit".to_string()], &avgdl, N, 0);
         let ids: Vec<i64> = ranked.iter().map(|c| c.doc_id).collect();
         // doc 10 has a real content match (score>0) so it's first; among
         // the two zero-score candidates, 3.5 > 1.2 so doc 30 (the more-
@@ -567,6 +647,87 @@ mod tests {
         assert_eq!(
             tokenize("--force-rebuild now"),
             vec!["force-rebuild", "force", "rebuild", "now"]
+        );
+    }
+
+    // Task甲 (design doc B'): window position quota tests. All use empty
+    // `query_terms` so `rerank_candidates` takes its early-return path
+    // (BM25F scoring skipped entirely, order governed purely by
+    // legacy_score desc -> doc_id asc) -- isolates the quota mechanism
+    // from BM25F scoring, which T1-T8 above already cover.
+    fn quota_test_avgdl() -> FieldAvgdl {
+        FieldAvgdl { content: 100.0, title: 20.0 }
+    }
+
+    fn quota_candidate(doc_id: i64, legacy_score: f64, conversation_key: Option<i64>) -> RerankCandidate {
+        RerankCandidate {
+            doc_id,
+            content: String::new(),
+            title: String::new(),
+            legacy_score,
+            score: 0.0,
+            conversation_key,
+        }
+    }
+
+    // Closed-form kill-switch (design doc §五 判据4): K=0 on heavy
+    // single-session dumping (15 hits, one session) must pass through
+    // completely unmoved -- byte-identical to pre-Task甲 behavior.
+    #[test]
+    fn session_window_quota_disabled_is_byte_identical_to_unquotaed_order() {
+        let candidates: Vec<RerankCandidate> =
+            (1..=15).map(|id| quota_candidate(id, 100.0 - id as f64, Some(1))).collect();
+        let avgdl = quota_test_avgdl();
+        let ranked = rerank_candidates(candidates, &[], &avgdl, N, 0);
+        let ids: Vec<i64> = ranked.iter().map(|c| c.doc_id).collect();
+        assert_eq!(ids, (1..=15).collect::<Vec<i64>>());
+    }
+
+    // Quota behavior (mission Task甲 "3 条同会话→第 3 条出窗"): 3 same-
+    // session hits ranked 1st/2nd/3rd overall, cap=2 (default) -> the 3rd
+    // is demoted out of the top-10 window; nothing is dropped, and it
+    // lands immediately after the window in its original relative order.
+    #[test]
+    fn session_window_quota_demotes_third_same_session_hit_out_of_window() {
+        let mut candidates = vec![
+            quota_candidate(1, 12.0, Some(1)),
+            quota_candidate(2, 11.0, Some(1)),
+            quota_candidate(3, 10.0, Some(1)),
+        ];
+        for i in 4..=12i64 {
+            candidates.push(quota_candidate(i, 9.0 - (i - 4) as f64 * 0.1, Some(100 + i)));
+        }
+        assert_eq!(candidates.len(), 12);
+        let avgdl = quota_test_avgdl();
+        let ranked = rerank_candidates(candidates, &[], &avgdl, N, DEFAULT_SESSION_WINDOW_CAP);
+        assert_eq!(ranked.len(), 12, "no candidate dropped, only repositioned");
+        let window_ids: Vec<i64> =
+            ranked[..SESSION_WINDOW_SIZE].iter().map(|c| c.doc_id).collect();
+        assert!(window_ids.contains(&1), "session's 1st hit stays in window");
+        assert!(window_ids.contains(&2), "session's 2nd hit stays in window");
+        assert!(!window_ids.contains(&3), "session's 3rd hit is demoted out of the window (cap=2)");
+        assert_eq!(
+            ranked[SESSION_WINDOW_SIZE].doc_id,
+            3,
+            "demoted hit lands right after the window, in original relative order"
+        );
+    }
+
+    // Natural backfill / graceful degradation (design doc §三 B' "优雅降
+    // 级"): when a single session holds every candidate (nothing else can
+    // compete for the freed seats), the window quota must not truncate or
+    // starve it -- final order is identical to the K=0 case.
+    #[test]
+    fn session_window_quota_backfills_when_one_session_has_every_candidate() {
+        let candidates: Vec<RerankCandidate> =
+            (1..=15).map(|id| quota_candidate(id, 100.0 - id as f64, Some(1))).collect();
+        let avgdl = quota_test_avgdl();
+        let ranked = rerank_candidates(candidates, &[], &avgdl, N, DEFAULT_SESSION_WINDOW_CAP);
+        let ids: Vec<i64> = ranked.iter().map(|c| c.doc_id).collect();
+        assert_eq!(
+            ids,
+            (1..=15).collect::<Vec<i64>>(),
+            "no other session can compete for the freed seats, so the window backfills from the same session and order is unchanged"
         );
     }
 }
