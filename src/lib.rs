@@ -18946,6 +18946,16 @@ fn state_meta_json_inner(
     }
     let lexical = &assets.lexical;
     let semantic = &assets.semantic;
+    // W3-4 Step2-2 (task book #62): a parallel, additive DB-vector-domain
+    // status section -- reads embedding_generations directly instead of
+    // going through the fsvi-policy-driven `semantic` block above (which
+    // keeps reporting exactly as before). Only attempted when the DB was
+    // actually opened and this call wasn't the cheap skip-DB-open fast
+    // path, mirroring how `inspect_semantic`/`db_opened` already gate
+    // the rest of this function's DB-backed sections.
+    let db_vector_domain = (inspect_semantic && db_opened)
+        .then(|| crate::search::model_manager::probe_db_vector_domain_status(db_path))
+        .flatten();
     let lexical_rebuild_pipeline = if skip_db_open {
         crate::indexer::lexical_rebuild_pipeline_settings_snapshot_passive()
     } else {
@@ -19236,6 +19246,20 @@ fn state_meta_json_inner(
                     .and_then(format_timestamp_millis_rfc3339),
             },
         },
+        // W3-4 Step2-2 (task book #62): DB-vector-domain identity/audit
+        // status, read directly from embedding_generations -- additive
+        // and parallel to "semantic" above (which stays fsvi/policy
+        // driven, unchanged, for the W3-3..W3-5 coexistence window).
+        // `null` when the DB wasn't opened for this call (skip-DB-open
+        // fast path, or `--no-semantic`).
+        "db_vector_domain": db_vector_domain.as_ref().map(|s| serde_json::json!({
+            "active": s.active,
+            "embedder_id": s.embedder_id,
+            "dim": s.dim,
+            "audit_status": s.audit_status,
+            "embedded_count": s.embedded_count,
+            "any_generation": s.any_generation,
+        })),
         "ingest_quarantine": ingest_quarantine_json,
         "policy_registry": policy_registry,
         "_meta": {
@@ -70771,6 +70795,10 @@ fn run_status(
             "rebuild": state.get("rebuild").cloned().unwrap_or(serde_json::Value::Null),
             "rebuild_progress": rebuild_progress_summary_json(&state),
             "semantic": state.get("semantic").cloned().unwrap_or(serde_json::Value::Null),
+            // W3-4 Step2-2 (task book #62): pass the parallel DB-vector-
+            // domain status section through from `state_meta_json_inner`
+            // the same way "semantic" itself is passed through above.
+            "db_vector_domain": state.get("db_vector_domain").cloned().unwrap_or(serde_json::Value::Null),
             "ingest_quarantine": state.get("ingest_quarantine").cloned().unwrap_or(serde_json::Value::Null),
             "policy_registry": policy_registry,
             "topology_budget": topology_budget,

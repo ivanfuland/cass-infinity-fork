@@ -27,6 +27,7 @@ use crate::search::semantic_manifest::{
 use crate::search::vector_index::{
     ROLE_ASSISTANT, ROLE_USER, SemanticFilterMaps, VectorIndex, vector_index_path,
 };
+use crate::storage::api::params;
 use crate::storage::sqlite::FrankenStorage;
 
 /// Unified TUI state machine for semantic search availability.
@@ -544,6 +545,68 @@ fn probe_db_vector_domain_availability(db_path: &Path) -> SemanticAvailability {
     }
 
     SemanticAvailability::IndexMissing { index_path: db_path.to_path_buf() }
+}
+
+/// Richer DB-vector-domain snapshot for `cass status`'s dedicated section
+/// (W3-4 Step2-2, task book #62): same three-state read as
+/// [`probe_db_vector_domain_availability`] plus the identity/count/audit
+/// detail an operator actually wants from a status surface. This is a
+/// parallel, additive status section -- it does not replace or change
+/// the existing fsvi-driven `semantic` section, which keeps reporting
+/// exactly as it always has during the W3-3..W3-5 coexistence window.
+#[derive(Debug, Clone)]
+pub(crate) struct DbVectorDomainStatus {
+    pub active: bool,
+    pub embedder_id: Option<String>,
+    pub dim: Option<i64>,
+    pub audit_status: Option<String>,
+    pub embedded_count: Option<i64>,
+    pub any_generation: bool,
+}
+
+/// `None` only when the database itself cannot be opened read-only --
+/// callers that already know `db_opened` is false should skip calling
+/// this rather than treat `None` as a meaningful status of its own.
+pub(crate) fn probe_db_vector_domain_status(db_path: &Path) -> Option<DbVectorDomainStatus> {
+    let storage = FrankenStorage::open_readonly(db_path).ok()?;
+    let conn = storage.raw();
+    let active: Option<(i64, String, i64, String)> = conn
+        .query_opt_map(
+            "SELECT id, embedder_id, dim, audit_status FROM embedding_generations WHERE is_active = 1",
+            &[],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?, row.get_typed(3)?)),
+        )
+        .ok()
+        .flatten();
+    if let Some((generation_id, embedder_id, dim, audit_status)) = active {
+        let embedded_count: i64 = conn
+            .query_row_map(
+                "SELECT COUNT(*) FROM message_embeddings WHERE generation_id = ?1",
+                &params![generation_id],
+                |row| row.get_typed(0),
+            )
+            .unwrap_or(0);
+        return Some(DbVectorDomainStatus {
+            active: true,
+            embedder_id: Some(embedder_id),
+            dim: Some(dim),
+            audit_status: Some(audit_status),
+            embedded_count: Some(embedded_count),
+            any_generation: true,
+        });
+    }
+
+    let any_generation: i64 = conn
+        .query_row_map("SELECT COUNT(*) FROM embedding_generations", &[], |row| row.get_typed(0))
+        .unwrap_or(0);
+    Some(DbVectorDomainStatus {
+        active: false,
+        embedder_id: None,
+        dim: None,
+        audit_status: None,
+        embedded_count: None,
+        any_generation: any_generation > 0,
+    })
 }
 
 pub(crate) fn probe_semantic_availability_for_embedder(
@@ -1121,6 +1184,8 @@ pub fn default_model_manifest() -> ModelManifest {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+    use crate::storage::api::{TxMode, params};
+    use crate::storage::schema;
 
     type AvailabilityTuiCase = (
         SemanticAvailability,
@@ -1504,6 +1569,63 @@ mod tests {
         assert!(
             matches!(availability, SemanticAvailability::IndexMissing { .. }),
             "expected IndexMissing (absent), got {availability:?}"
+        );
+    }
+
+    /// The "building" leg (task book #62 Step2, advisor ruling: all three
+    /// legs of the d7 contract need a real green test, not "logically
+    /// covered"). An active-but-not-yet-`passed` generation (exactly
+    /// staging generation_id=1's real starting state pre-W3-4 Step1,
+    /// per the backfill report) must report `IndexBuilding`, not `Ready`
+    /// and not `IndexMissing`.
+    fn db_with_active_pending_generation(dir: &std::path::Path) -> PathBuf {
+        let db_path = dir.join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).expect("open production storage");
+        let gen_id = storage
+            .raw()
+            .with_tx_no_replay(TxMode::Immediate, |tx| schema::create_embedding_generation(tx, "BAAI/bge-m3", 1024, 1, 0))
+            .expect("create embedding generation");
+        storage
+            .raw()
+            .execute("UPDATE embedding_generations SET is_active = 1 WHERE id = ?1", &params![gen_id])
+            .expect("mark generation active");
+        storage.close().unwrap();
+        db_path
+    }
+
+    #[test]
+    fn probe_db_vector_domain_availability_reports_building_for_an_active_unaudited_generation() {
+        let dir = tempdir().unwrap();
+        let db_path = db_with_active_pending_generation(dir.path());
+        let availability = probe_db_vector_domain_availability(&db_path);
+        assert!(
+            matches!(availability, SemanticAvailability::IndexBuilding { .. }),
+            "expected IndexBuilding, got {availability:?}"
+        );
+    }
+
+    #[test]
+    fn probe_semantic_availability_for_embedder_reports_building_for_bge_m3_pre_audit() {
+        let dir = tempdir().unwrap();
+        let db_path = db_with_active_pending_generation(dir.path());
+        let availability = probe_semantic_availability_for_embedder(dir.path(), &db_path, "bge-m3");
+        assert!(
+            matches!(availability, SemanticAvailability::IndexBuilding { .. }),
+            "expected IndexBuilding, got {availability:?}"
+        );
+    }
+
+    #[cfg(feature = "infinity")]
+    #[test]
+    fn load_infinity_semantic_context_reports_building_structured_state_pre_audit() {
+        let dir = tempdir().unwrap();
+        let db_path = db_with_active_pending_generation(dir.path());
+        let setup = load_infinity_semantic_context(dir.path(), &db_path);
+        assert!(setup.context.is_none(), "a not-yet-certified generation must never hand back a context");
+        assert!(
+            matches!(setup.availability, SemanticAvailability::IndexBuilding { .. }),
+            "expected IndexBuilding, got {:?}",
+            setup.availability
         );
     }
 
