@@ -385,3 +385,38 @@ fn audit_check3_tolerates_a_zero_distance_content_twin_tie() {
     );
     assert_eq!(audit_status_of(&storage, gen_id), "passed");
 }
+
+/// R1-W3-B5: none of checks ①-⑥ ever count `vec0`'s rows overall -- ①/②/④
+/// only read `message_embeddings`, and ③'s KNN probe only confirms one
+/// specific row is present. Deleting a `vec0` row for a doc_id that check
+/// ③ never happens to anchor on (both fixture docs still self-hit fine
+/// individually) must still fail the audit once check ⑦ exists.
+#[test]
+fn audit_fails_on_vec0_row_count_deficit_against_message_embeddings() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let storage = open_storage(&dir.path().join("db.sqlite"));
+    let (gen_id, _doc_a, doc_b) = clean_two_message_fixture(&storage);
+
+    // Silently drop one row from the derived vec0 index without touching
+    // the authoritative message_embeddings table -- exactly the "rebuild
+    // populated fewer rows than it read" class of defect check ⑦ exists
+    // to catch, and one checks ①-⑥ have no way to see (check ③'s anchor
+    // is auto-picked as MIN(doc_id), i.e. doc_a, which still self-hits
+    // fine after doc_b's row is gone).
+    let vec0_table = format!("vec_index_gen_{gen_id}");
+    storage.raw().execute(&format!("DELETE FROM {vec0_table} WHERE rowid = ?1"), fparams![doc_b]).unwrap();
+
+    let report = run_activation_audit_and_record(&storage, gen_id, 100, None).expect("audit runs, verdict is failure not an error");
+    assert!(
+        !report.passed,
+        "a vec0 row-count deficit against message_embeddings must fail the audit"
+    );
+    assert_eq!(report.vec0_row_count, 1, "vec0 must report the actual post-deletion row count");
+    assert_eq!(report.message_embeddings_row_count, 2, "message_embeddings must be untouched by the vec0-only deletion");
+    assert!(
+        report.failure_reasons.iter().any(|r| r.contains('⑦')),
+        "failure reasons must name check ⑦: {:?}",
+        report.failure_reasons
+    );
+    assert_eq!(audit_status_of(&storage, gen_id), "failed");
+}

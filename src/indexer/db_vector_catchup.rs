@@ -477,6 +477,12 @@ pub struct ActivationAuditReport {
     /// (the pragma itself has no generation scope; a dangling FK anywhere
     /// is disqualifying).
     pub foreign_key_violation_count: usize,
+    /// ⑦ vec0-vs-authoritative-table row-count reconciliation (R1-W3-B5):
+    /// `-1` for `vec0_row_count` means the count itself errored (most
+    /// commonly the `vec0` table not existing for this generation at
+    /// all), distinct from a genuine `0`.
+    pub vec0_row_count: i64,
+    pub message_embeddings_row_count: i64,
     pub failure_reasons: Vec<String>,
 }
 
@@ -674,6 +680,36 @@ pub fn run_activation_audit(
         failures.push(format!("⑥ PRAGMA foreign_key_check reported {foreign_key_violation_count} violation(s)"));
     }
 
+    // ⑦ vec0-vs-authoritative-table row-count reconciliation (R1-W3-B5):
+    // none of checks ①-⑥ would ever notice `vec0` missing rows wholesale
+    // -- ①/②/④ only ever read `message_embeddings`, and ③'s KNN probe
+    // only ever confirms one specific row's presence in `vec0`, never the
+    // total. A rebuild that silently populated fewer rows than it read
+    // (or one simply never re-run after `message_embeddings` grew) would
+    // otherwise sail through every prior check and still get certified
+    // `passed`. A cheap `COUNT(*)` on each side closes that gap.
+    let message_embeddings_row_count: i64 = conn.query_row_map(
+        "SELECT COUNT(*) FROM message_embeddings WHERE generation_id = ?1",
+        &params![generation_id],
+        |row| row.get_typed(0),
+    )?;
+    let vec0_row_count = match vector_domain::count_vec0_rows_for_generation(conn, generation_id) {
+        Ok(count) => count,
+        Err(e) => {
+            failures.push(format!(
+                "⑦ vec0 row-count reconciliation errored for generation {generation_id} \
+                 (vec0 table missing or unreadable): {e}"
+            ));
+            -1
+        }
+    };
+    if vec0_row_count >= 0 && vec0_row_count != message_embeddings_row_count {
+        failures.push(format!(
+            "⑦ vec0 row-count mismatch for generation {generation_id}: vec0 has \
+             {vec0_row_count} row(s), message_embeddings has {message_embeddings_row_count}"
+        ));
+    }
+
     let passed = failures.is_empty();
     Ok(ActivationAuditReport {
         generation_id,
@@ -690,6 +726,8 @@ pub fn run_activation_audit(
         canonicalize_version_expected: CANONICALIZE_PIPELINE_VERSION,
         canonicalize_version_actual,
         foreign_key_violation_count,
+        vec0_row_count,
+        message_embeddings_row_count,
         failure_reasons: failures,
     })
 }

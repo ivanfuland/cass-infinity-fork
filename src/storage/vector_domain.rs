@@ -105,6 +105,25 @@ pub fn enumerate_vec0_tables_for_generation(
     )
 }
 
+/// Row count of `generation_id`'s main `vec0` table (never a shadow
+/// table) -- the exact same table [`rebuild_vec0_table_for_generation`]
+/// populates and [`vec0_knn`] scans. Activation audit check ⑦ (R1-W3-B5)
+/// compares this against `COUNT(*) FROM message_embeddings WHERE
+/// generation_id = ?`: every other check either reads `message_embeddings`
+/// directly or probes `vec0` for one specific row's presence, so none of
+/// them would ever notice `vec0` missing rows wholesale (a rebuild that
+/// silently populated fewer rows than it read, or one that was simply
+/// never re-run after `message_embeddings` grew). Errors (most commonly
+/// "no such table" if the `vec0` table was never created for this
+/// generation) propagate as `StorageError`, not `Ok(0)` -- a missing
+/// table is a different failure than a genuinely empty one and callers
+/// must be able to tell them apart.
+pub fn count_vec0_rows_for_generation(conn: &Conn, generation_id: i64) -> Result<i64, StorageError> {
+    validate_generation_id_for_ddl(generation_id)?;
+    let table = vec0_table_name(generation_id);
+    conn.query_row_map(&format!("SELECT COUNT(*) FROM {table}"), &[], |row| row.get_typed(0))
+}
+
 /// Rebuild `generation_id`'s `vec0` index from `message_embeddings` in one
 /// transaction (drop + recreate + bulk-populate) — w3-d9②'s atomicity
 /// discipline: an interruption anywhere in this function leaves the
