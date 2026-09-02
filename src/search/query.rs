@@ -4331,9 +4331,23 @@ impl SearchClient {
                 has_more_candidates = false;
             }
 
+            // Do NOT truncate to `fetch_limit` here: `filtered` is already a
+            // bounded overfetch window (`first_k`, or the full generation on
+            // retry) sized independently of the caller's raw `fetch_limit`,
+            // matching the fsvi exact-search contract
+            // (`semantic_exact_candidate_limit`/`collapse_semantic_results`)
+            // that `search_semantic_with_tier` relies on: it applies
+            // post-hoc filters (session_paths, dedup) and its own
+            // limit/offset paging AFTER candidate search, on the full
+            // returned window, not on a pre-truncated slice. Truncating to
+            // `fetch_limit` here silently dropped the domain-passing
+            // candidates a caller-side filter still needed to search
+            // through (W3-3 Step C regression: `has_more_candidates` was
+            // computed relative to the KNN retrieval window, not relative
+            // to whether candidates beyond a `fetch_limit`-sized `take()`
+            // were discarded, so the outer retry loop never re-fetched).
             let results: Vec<VectorSearchResult> = filtered
                 .into_iter()
-                .take(fetch_limit)
                 .map(|(doc_id, distance)| VectorSearchResult {
                     // vec0's cosine `distance` is `1 - cosine_similarity`;
                     // `score` is a higher-is-better similarity, matching
@@ -4615,6 +4629,55 @@ impl SearchClient {
             fs_filter,
         )?;
         Ok((results, truncated, None))
+    }
+
+    /// `CASS_SEMANTIC_USE_FSVI=1` (or `true`/`yes`/`on`) forces the legacy
+    /// filesystem-vector-index candidate path (`search_semantic_candidates`)
+    /// instead of the DB vector domain (`search_db_vector_domain`), which is
+    /// the default as of W3-3. This escape valve exists only for the W3-3..
+    /// W3-5 co-existence window; it and this whole branch are removed in
+    /// W3-5 alongside fsvi retirement.
+    fn semantic_use_fsvi_escape_hatch() -> bool {
+        matches!(
+            dotenvy::var("CASS_SEMANTIC_USE_FSVI").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        )
+    }
+
+    /// Dispatches a semantic candidate fetch to either the DB vector domain
+    /// (default) or the legacy fsvi path (`CASS_SEMANTIC_USE_FSVI=1`).
+    ///
+    /// w3-d7① three-state contract: a `building`/`absent` vector-domain
+    /// error from `search_db_vector_domain` is propagated as-is (mapped to
+    /// the caller's `Result`, not swallowed) — it must never fall back to
+    /// the fsvi path, and callers must never paper over it with an empty
+    /// result (that would be a silent scan, the exact thing d7 forbids).
+    fn search_semantic_candidates_dispatch(
+        &self,
+        context: &SemanticCandidateContext,
+        embedding: &[f32],
+        filters: &SearchFilters,
+        request: SemanticCandidateSearchRequest<'_>,
+    ) -> Result<(
+        Vec<VectorSearchResult>,
+        SemanticCandidateRetryState,
+        Option<crate::search::ann_index::AnnSearchStats>,
+    )> {
+        if Self::semantic_use_fsvi_escape_hatch() {
+            return self.search_semantic_candidates(context, embedding, filters, request);
+        }
+        let sqlite_guard = self.sqlite_guard()?;
+        let conn = sqlite_guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("db vector domain search requires a database connection"))?;
+        let (results, retry_state) = Self::search_db_vector_domain(
+            conn,
+            embedding,
+            filters,
+            context.roles.as_ref(),
+            request.fetch_limit,
+        )?;
+        Ok((results, retry_state, None))
     }
 
     pub fn can_progressively_refine(&self) -> bool {
@@ -5736,7 +5799,7 @@ impl SearchClient {
                     Ok(self.postprocess_hits_page(hits, query, &filters, limit, offset))
                 };
 
-            let (results, retry_state, mut ann_stats) = self.search_semantic_candidates(
+            let (results, retry_state, mut ann_stats) = self.search_semantic_candidates_dispatch(
                 &candidate_context,
                 &embedding,
                 &filters,
@@ -5767,7 +5830,7 @@ impl SearchClient {
                     fallback_fetch_limit,
                     "retrying semantic fetch due to candidate-window shortfall"
                 );
-                let (retry_results, _, retry_ann_stats) = self.search_semantic_candidates(
+                let (retry_results, _, retry_ann_stats) = self.search_semantic_candidates_dispatch(
                     &candidate_context,
                     &embedding,
                     &filters,
@@ -7617,6 +7680,7 @@ mod tests {
     use crate::storage::api::Profile;
     use crate::storage::sqlite::FrankenStorage;
     use serde_json::json;
+    use serial_test::serial;
     use tempfile::TempDir;
 
     // Reference implementation of the stable dedup key prior to bead num7z.
@@ -8407,8 +8471,8 @@ mod tests {
             storage.insert_conversation_tree(agent_id, Some(workspace_id), &conversation)?;
         }
 
-        let message_rows: Vec<(u64, i64)> = storage.raw().query_all_map(
-            "SELECT m.id, COALESCE(m.created_at, c.started_at, 0)
+        let message_rows: Vec<(u64, i64, i64)> = storage.raw().query_all_map(
+            "SELECT m.id, COALESCE(m.created_at, c.started_at, 0), c.id
              FROM messages m
              JOIN conversations c ON m.conversation_id = c.id
              ORDER BY c.id",
@@ -8416,7 +8480,12 @@ mod tests {
             |row: &FrankenRow| {
                 let message_id: i64 = row.get_typed(0)?;
                 let created_at: i64 = row.get_typed(1)?;
-                Ok((u64::try_from(message_id).unwrap_or(u64::MAX), created_at))
+                let conversation_id: i64 = row.get_typed(2)?;
+                Ok((
+                    u64::try_from(message_id).unwrap_or(u64::MAX),
+                    created_at,
+                    conversation_id,
+                ))
             },
         )?;
         assert_eq!(
@@ -8432,7 +8501,9 @@ mod tests {
         std::fs::create_dir_all(&vector_dir)?;
         let mut vector_records = Vec::with_capacity(documents.len());
 
-        for ((message_id, created_at_ms), (_, _, vector)) in message_rows.iter().zip(documents) {
+        for ((message_id, created_at_ms, _conversation_id), (_, _, vector)) in
+            message_rows.iter().zip(documents)
+        {
             let doc_id = SemanticDocId {
                 message_id: *message_id,
                 chunk_idx: 0,
@@ -8479,6 +8550,33 @@ mod tests {
             }
             writer.finish()?;
             vector_indexes.push(VectorIndex::open(&vector_path)?);
+
+            // W3-3 fixture-fidelity: this (unsharded) fixture also feeds
+            // callers of `search_semantic`/`search_semantic_with_tier`,
+            // which now default to the DB vector domain
+            // (`search_db_vector_domain`) rather than the fsvi index built
+            // above. Seed an equivalent active generation through the same
+            // production write path (`create_embedding_generation` +
+            // `insert_message_embedding` + `switch_active_generation` +
+            // `rebuild_vec0_table_for_generation`, see
+            // `seed_active_generation_with_vectors`) so DB-path semantic
+            // search sees the same three documents/vectors as the fsvi
+            // index does. The sharded fixture deliberately does NOT get
+            // this treatment: it exists specifically to pin fsvi's
+            // multi-shard-index-merge behavior, which has no DB-domain
+            // analogue (one flat `vec0` table per generation).
+            let db_vectors: Vec<(i64, i64, Vec<f32>)> = message_rows
+                .iter()
+                .zip(documents)
+                .map(|((message_id, _created_at_ms, conversation_id), (_, _, vector))| {
+                    (
+                        i64::try_from(*message_id).unwrap_or(i64::MAX),
+                        *conversation_id,
+                        vector.to_vec(),
+                    )
+                })
+                .collect();
+            seed_active_generation_with_vectors(&storage, 2, &db_vectors);
         }
         drop(storage);
 
@@ -15436,28 +15534,54 @@ mod tests {
         Ok(())
     }
 
+    // W3-3 bucket (b): this test pins fsvi's multi-shard-index-merge
+    // behavior specifically (`build_sharded_semantic_test_fixture` writes
+    // the fixture's three documents across two separate `.fsvi` shard
+    // files, and this test asserts the fsvi candidate path transparently
+    // merges hits across them in similarity order). That mechanism has no
+    // DB-vector-domain analogue -- `search_db_vector_domain` reads one flat
+    // `vec0` table per generation, so a DB-path run of this fixture would
+    // pass "by accident" without ever exercising the merge logic the test
+    // is named for. Force the legacy fsvi candidate path explicitly rather
+    // than rely on default dispatch. Remove this override (and the escape
+    // hatch it exercises) when fsvi retires in W3-5.
     #[test]
+    #[serial]
     fn semantic_search_merges_sharded_vector_indexes() -> Result<()> {
-        let fixture = build_sharded_semantic_test_fixture()?;
-        let (hits, ann_stats) = fixture.client.search_semantic(
-            "semantic fixture query",
-            SearchFilters::default(),
-            3,
-            0,
-            FieldMask::FULL,
-            false,
-        )?;
+        // SAFETY: test-local env mutation; restored at end, --test-threads=1
+        // is this repo's mandatory test invocation (see EXEC.md disk law).
+        let prior = std::env::var("CASS_SEMANTIC_USE_FSVI").ok();
+        unsafe {
+            std::env::set_var("CASS_SEMANTIC_USE_FSVI", "1");
+        }
+        let result = (|| -> Result<()> {
+            let fixture = build_sharded_semantic_test_fixture()?;
+            let (hits, ann_stats) = fixture.client.search_semantic(
+                "semantic fixture query",
+                SearchFilters::default(),
+                3,
+                0,
+                FieldMask::FULL,
+                false,
+            )?;
 
-        assert!(
-            ann_stats.is_none(),
-            "sharded exact search should not emit ANN stats"
-        );
-        assert_eq!(hits.len(), 3);
-        assert_eq!(hits[0].source_path, fixture.source_paths[0]);
-        assert_eq!(hits[1].source_path, fixture.source_paths[1]);
-        assert_eq!(hits[2].source_path, fixture.source_paths[2]);
-
-        Ok(())
+            assert!(
+                ann_stats.is_none(),
+                "sharded exact search should not emit ANN stats"
+            );
+            assert_eq!(hits.len(), 3);
+            assert_eq!(hits[0].source_path, fixture.source_paths[0]);
+            assert_eq!(hits[1].source_path, fixture.source_paths[1]);
+            assert_eq!(hits[2].source_path, fixture.source_paths[2]);
+            Ok(())
+        })();
+        unsafe {
+            match &prior {
+                Some(v) => std::env::set_var("CASS_SEMANTIC_USE_FSVI", v),
+                None => std::env::remove_var("CASS_SEMANTIC_USE_FSVI"),
+            }
+        }
+        result
     }
 
     #[test]
