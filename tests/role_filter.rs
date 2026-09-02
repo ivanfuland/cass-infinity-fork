@@ -17,8 +17,10 @@
 //! `client.search()` (pure lexical), so the riskiest untested logic --
 //! an explicit `--role` overriding the semantic engine's default
 //! user+assistant role filter (`src/search/query.rs`
-//! `search_semantic_candidates`, and `SemanticFilter::from_search_filters`
-//! in `src/search/vector_index.rs`) -- had no coverage at all.
+//! `search_db_vector_domain`'s `effective_roles` override, W3-5's
+//! DB-vector-domain successor to the retired fsvi
+//! `search_semantic_candidates`/`SemanticFilter::from_search_filters` path)
+//! -- had no coverage at all.
 
 use std::collections::HashSet;
 

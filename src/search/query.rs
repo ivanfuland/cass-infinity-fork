@@ -5,14 +5,10 @@ use frankensearch::{
     QueryClass as FsQueryClass, RrfConfig as FsRrfConfig, ScoreSource as FsScoreSource,
     ScoredResult as FsScoredResult, SearchError as FsSearchError, SearchFuture as FsSearchFuture,
     SearchPhase as FsSearchPhase, SyncEmbedderAdapter as FsSyncEmbedderAdapter,
-    SyncTwoTierSearcher as FsSyncTwoTierSearcher, TwoTierConfig as FsTwoTierConfig,
-    TwoTierIndex as FsTwoTierIndex, TwoTierSearcher as FsTwoTierSearcher, VectorHit as FsVectorHit,
+    TwoTierConfig as FsTwoTierConfig, TwoTierIndex as FsTwoTierIndex,
+    TwoTierSearcher as FsTwoTierSearcher, VectorHit as FsVectorHit,
     candidate_count as fs_candidate_count,
-    core::filter::SearchFilter as FsSearchFilter,
-    index::{
-        HNSW_DEFAULT_EF_SEARCH as FS_HNSW_DEFAULT_EF_SEARCH, HnswIndex as FsHnswIndex,
-        VectorIndex as FsVectorIndex,
-    },
+    index::{HnswIndex as FsHnswIndex, VectorIndex as FsVectorIndex},
     rrf_fuse as fs_rrf_fuse,
 };
 use lru::LruCache;
@@ -310,7 +306,6 @@ type SqliteFtsMessageRow = (
 // empty fallback result sets.
 const SQLITE_FTS5_HYDRATE_PARAM_CHUNK: usize = 30_000;
 const SEARCH_SQLITE_HYDRATION_CACHE_KIB: i64 = 4_096;
-const SEMANTIC_EXACT_CHUNK_OVERFETCH_MULTIPLIER: usize = 4;
 
 // Safety: Rc fields inside Connection are not cloned or shared externally.
 // The Mutex<Option<SendConnection>> in SearchClient ensures exclusive access.
@@ -649,7 +644,6 @@ impl SemanticTierMode {
 }
 
 const PROGRESSIVE_EMBEDDING_CACHE_CAPACITY: usize = 64;
-const ANN_CANDIDATE_MULTIPLIER: usize = 4;
 const HYBRID_NO_LIMIT_PLANNING_WINDOW: usize = 64;
 const HYBRID_NO_LIMIT_SEMANTIC_CAP: usize = 2048;
 
@@ -2206,18 +2200,6 @@ impl QueryCache {
         self.align_embedder(embedder);
         self.embeddings.put(canonical.to_string(), embedding);
     }
-}
-
-/// Returns `Some(&filter)` when the filter has at least one active constraint,
-/// `None` when unrestricted (skip filtering for performance).
-fn semantic_filter_as_search_filter(filter: &SemanticFilter) -> Option<&dyn FsSearchFilter> {
-    let unrestricted = filter.agents.is_none()
-        && filter.workspaces.is_none()
-        && filter.sources.is_none()
-        && filter.roles.is_none()
-        && filter.created_from.is_none()
-        && filter.created_to.is_none();
-    if unrestricted { None } else { Some(filter) }
 }
 
 fn open_fs_semantic_ann_index(fs_index: &FsVectorIndex, ann_path: &Path) -> Result<FsHnswIndex> {
@@ -4024,74 +4006,6 @@ impl SearchClient {
         }
     }
 
-    fn collapse_semantic_results(
-        best_by_message: HashMap<u64, VectorSearchResult>,
-        fetch_limit: usize,
-    ) -> Vec<VectorSearchResult> {
-        let mut collapsed: Vec<VectorSearchResult> = best_by_message.into_values().collect();
-        collapsed.sort_by(|a, b| {
-            b.score
-                .total_cmp(&a.score)
-                .then_with(|| a.message_id.cmp(&b.message_id))
-        });
-        if collapsed.len() > fetch_limit {
-            collapsed.truncate(fetch_limit);
-        }
-        collapsed
-    }
-
-    fn semantic_exact_candidate_limit(fetch_limit: usize, record_count: usize) -> usize {
-        fetch_limit
-            .saturating_mul(SEMANTIC_EXACT_CHUNK_OVERFETCH_MULTIPLIER)
-            .max(fetch_limit)
-            .min(record_count)
-    }
-
-    fn semantic_window_may_omit_competitor(
-        collapsed: &[VectorSearchResult],
-        fetch_limit: usize,
-        max_omitted_score: Option<f32>,
-    ) -> bool {
-        if fetch_limit == 0 {
-            return false;
-        }
-        let Some(max_omitted_score) = max_omitted_score else {
-            return false;
-        };
-        if collapsed.len() < fetch_limit {
-            return true;
-        }
-        let Some(last_in_requested_window) = collapsed.get(fetch_limit - 1) else {
-            return true;
-        };
-        !last_in_requested_window
-            .score
-            .total_cmp(&max_omitted_score)
-            .is_gt()
-    }
-
-    fn record_fs_semantic_hit(
-        best_by_message: &mut HashMap<u64, VectorSearchResult>,
-        hit: &FsVectorHit,
-    ) {
-        let Some(parsed) = parse_semantic_doc_id(&hit.doc_id) else {
-            return;
-        };
-        best_by_message
-            .entry(parsed.message_id)
-            .and_modify(|entry| {
-                if hit.score > entry.score {
-                    entry.score = hit.score;
-                    entry.chunk_idx = parsed.chunk_idx;
-                }
-            })
-            .or_insert(VectorSearchResult {
-                message_id: parsed.message_id,
-                chunk_idx: parsed.chunk_idx,
-                score: hit.score,
-            });
-    }
-
     /// All string variants `role_code_from_str` maps onto `code` (its
     /// inverse, many-to-one) -- needed to build a `role IN (...)` SQL
     /// clause from a `SemanticFilter`-shaped `HashSet<u8>` role-code
@@ -4389,293 +4303,17 @@ impl SearchClient {
         .map_err(|err: crate::storage::api::StorageError| anyhow!(err.to_string()))
     }
 
-    fn search_exact_semantic_indexes(
-        context: &SemanticCandidateContext,
-        embedding: &[f32],
-        fetch_limit: usize,
-        fs_filter: Option<&dyn FsSearchFilter>,
-    ) -> Result<(Vec<VectorSearchResult>, SemanticCandidateRetryState)> {
-        if context.fs_semantic_indexes.len() == 1 {
-            // `fs_semantic_indexes.len() == 1` already guarantees a real
-            // fsvi index -- index off the authoritative Vec rather than
-            // the convenience singular field (`Option` since W3-4
-            // Step2-1: it's `None` on a DB-vector-domain-only context,
-            // which never reaches this escape-hatch-only function).
-            let fs_semantic_index = &context.fs_semantic_indexes[0];
-            let record_count = fs_semantic_index.record_count();
-            let candidate_limit = Self::semantic_exact_candidate_limit(fetch_limit, record_count);
-            let fs_hits = fs_semantic_index
-                .search_top_k(embedding, candidate_limit, fs_filter)
-                .map_err(|err| anyhow!("frankensearch semantic search failed: {err}"))?;
-            let mut best_by_message = HashMap::with_capacity(fs_hits.len());
-            for hit in &fs_hits {
-                Self::record_fs_semantic_hit(&mut best_by_message, hit);
-            }
-            let collapsed = Self::collapse_semantic_results(best_by_message, candidate_limit);
-            let has_more_candidates =
-                fs_hits.len() >= candidate_limit && candidate_limit < record_count;
-            let max_omitted_score = if has_more_candidates {
-                fs_hits.last().map(|hit| hit.score)
-            } else {
-                None
-            };
-            let exact_window_may_omit_competitor = Self::semantic_window_may_omit_competitor(
-                &collapsed,
-                fetch_limit,
-                max_omitted_score,
-            );
-            return Ok((
-                collapsed,
-                SemanticCandidateRetryState {
-                    has_more_candidates,
-                    exact_window_may_omit_competitor,
-                },
-            ));
-        }
-
-        let mut best_by_message = HashMap::new();
-        let mut raw_hits = 0usize;
-        let mut max_omitted_score: Option<f32> = None;
-        let mut has_more_candidates = false;
-        for index in context.fs_semantic_indexes.iter() {
-            let shard_record_count = index.record_count();
-            // Search chunks, then collapse by message. A message can have many
-            // high-scoring chunks, so per-shard top-k chunks alone is not a
-            // proof of per-message top-k. Use a bounded overfetch window and
-            // retry only when the omitted-score bound can still beat the last
-            // collapsed message in the requested window.
-            let shard_limit = Self::semantic_exact_candidate_limit(fetch_limit, shard_record_count);
-            if shard_limit == 0 {
-                continue;
-            }
-            let fs_hits = index
-                .search_top_k(embedding, shard_limit, fs_filter)
-                .map_err(|err| anyhow!("frankensearch sharded semantic search failed: {err}"))?;
-            if fs_hits.len() >= shard_limit
-                && shard_limit < shard_record_count
-                && let Some(last_hit) = fs_hits.last()
-            {
-                has_more_candidates = true;
-                max_omitted_score = Some(
-                    max_omitted_score
-                        .map(|current| current.max(last_hit.score))
-                        .unwrap_or(last_hit.score),
-                );
-            }
-            raw_hits = raw_hits.saturating_add(fs_hits.len());
-            best_by_message.reserve(fs_hits.len());
-            for hit in &fs_hits {
-                Self::record_fs_semantic_hit(&mut best_by_message, hit);
-            }
-        }
-        let candidate_return_limit = Self::semantic_exact_candidate_limit(fetch_limit, raw_hits);
-        let collapsed = Self::collapse_semantic_results(best_by_message, candidate_return_limit);
-        let exact_window_may_omit_competitor =
-            Self::semantic_window_may_omit_competitor(&collapsed, fetch_limit, max_omitted_score);
-        tracing::debug!(
-            shard_count = context.fs_semantic_indexes.len(),
-            raw_hits,
-            returned = collapsed.len(),
-            "semantic sharded exact merge complete"
-        );
-        Ok((
-            collapsed,
-            SemanticCandidateRetryState {
-                has_more_candidates,
-                exact_window_may_omit_competitor,
-            },
-        ))
-    }
-
-    fn search_semantic_candidates(
-        &self,
-        context: &SemanticCandidateContext,
-        embedding: &[f32],
-        filters: &SearchFilters,
-        request: SemanticCandidateSearchRequest<'_>,
-    ) -> Result<(
-        Vec<VectorSearchResult>,
-        SemanticCandidateRetryState,
-        Option<crate::search::ann_index::AnnSearchStats>,
-    )> {
-        let mut semantic_filter =
-            SemanticFilter::from_search_filters(filters, &context.filter_maps)?;
-        // `filters.roles` (from an explicit `--role`) overrides the semantic
-        // engine's default user+assistant role filter rather than
-        // intersecting with it: only fall back to the context default when
-        // the caller didn't ask for specific roles.
-        if semantic_filter.roles.is_none()
-            && let Some(roles) = context.roles.clone()
-        {
-            semantic_filter = semantic_filter.with_roles(Some(roles));
-        }
-
-        if request.tier_mode.wants_two_tier() && !request.approximate {
-            let fs_filter = semantic_filter_as_search_filter(&semantic_filter);
-            if let Some(two_tier_index) = request.in_memory_two_tier_index {
-                let config = request.tier_mode.to_frankensearch_config();
-                let searcher = FsSyncTwoTierSearcher::new(Arc::clone(two_tier_index), config);
-                let (tier_hits, metrics) = searcher
-                    .search_collect_with_filter(embedding, request.fetch_limit, fs_filter)
-                    .map_err(|err| {
-                        anyhow!("frankensearch two-tier semantic search failed: {err}")
-                    })?;
-
-                tracing::debug!(
-                    tier_mode = ?request.tier_mode,
-                    phase1_ms = metrics.phase1_total_ms,
-                    phase2_ms = metrics.phase2_total_ms,
-                    skip_reason = ?metrics.skip_reason,
-                    returned = tier_hits.len(),
-                    "semantic two-tier search executed"
-                );
-
-                let mut best_by_message: HashMap<u64, VectorSearchResult> =
-                    HashMap::with_capacity(tier_hits.len());
-                for hit in tier_hits.iter() {
-                    let Some(parsed) = parse_semantic_doc_id(&hit.doc_id) else {
-                        continue;
-                    };
-                    best_by_message
-                        .entry(parsed.message_id)
-                        .and_modify(|entry| {
-                            if hit.score > entry.score {
-                                entry.score = hit.score;
-                                entry.chunk_idx = parsed.chunk_idx;
-                            }
-                        })
-                        .or_insert(VectorSearchResult {
-                            message_id: parsed.message_id,
-                            chunk_idx: parsed.chunk_idx,
-                            score: hit.score,
-                        });
-                }
-
-                return Ok((
-                    Self::collapse_semantic_results(best_by_message, request.fetch_limit),
-                    SemanticCandidateRetryState {
-                        has_more_candidates: tier_hits.len() >= request.fetch_limit,
-                        exact_window_may_omit_competitor: false,
-                    },
-                    None,
-                ));
-            }
-
-            tracing::debug!(
-                tier_mode = ?request.tier_mode,
-                "two-tier semantic unavailable; falling back to exact single-tier search"
-            );
-
-            let fs_filter = semantic_filter_as_search_filter(&semantic_filter);
-            let (results, truncated) = Self::search_exact_semantic_indexes(
-                context,
-                embedding,
-                request.fetch_limit,
-                fs_filter,
-            )?;
-            return Ok((results, truncated, None));
-        }
-
-        if request.approximate {
-            if request.tier_mode.wants_two_tier() {
-                tracing::debug!(
-                    tier_mode = ?request.tier_mode,
-                    "approximate search requested; bypassing two-tier mode"
-                );
-            }
-
-            let ann = request
-                .ann_index
-                .ok_or_else(|| anyhow!("HNSW index failed to initialize"))?;
-            let candidate = request
-                .fetch_limit
-                .saturating_mul(ANN_CANDIDATE_MULTIPLIER)
-                .max(request.fetch_limit);
-            let ef = FS_HNSW_DEFAULT_EF_SEARCH.max(candidate);
-            let (ann_results, search_stats) =
-                ann.knn_search_with_stats(embedding, candidate, ef)
-                    .map_err(|err| anyhow!("frankensearch approximate search failed: {err}"))?;
-            let ann_stats = Some(crate::search::ann_index::AnnSearchStats {
-                index_size: search_stats.index_size,
-                dimension: search_stats.dimension,
-                ef_search: search_stats.ef_search,
-                k_requested: search_stats.k_requested,
-                k_returned: search_stats.k_returned,
-                search_time_us: search_stats.search_time_us,
-                estimated_recall: search_stats.estimated_recall as f32,
-                is_approximate: search_stats.is_approximate,
-            });
-
-            let fs_filter = semantic_filter_as_search_filter(&semantic_filter);
-
-            let mut best_by_message: HashMap<u64, VectorSearchResult> =
-                HashMap::with_capacity(ann_results.len());
-            for hit in ann_results.iter() {
-                if let Some(filter) = fs_filter
-                    && !filter.matches(&hit.doc_id, None)
-                {
-                    continue;
-                }
-                let Some(parsed) = parse_semantic_doc_id(&hit.doc_id) else {
-                    continue;
-                };
-                best_by_message
-                    .entry(parsed.message_id)
-                    .and_modify(|entry| {
-                        if hit.score > entry.score {
-                            entry.score = hit.score;
-                            entry.chunk_idx = parsed.chunk_idx;
-                        }
-                    })
-                    .or_insert(VectorSearchResult {
-                        message_id: parsed.message_id,
-                        chunk_idx: parsed.chunk_idx,
-                        score: hit.score,
-                    });
-            }
-
-            return Ok((
-                Self::collapse_semantic_results(best_by_message, request.fetch_limit),
-                SemanticCandidateRetryState {
-                    has_more_candidates: ann_results.len() >= candidate,
-                    exact_window_may_omit_competitor: false,
-                },
-                ann_stats,
-            ));
-        }
-
-        let fs_filter = semantic_filter_as_search_filter(&semantic_filter);
-        let (results, truncated) = Self::search_exact_semantic_indexes(
-            context,
-            embedding,
-            request.fetch_limit,
-            fs_filter,
-        )?;
-        Ok((results, truncated, None))
-    }
-
-    /// `CASS_SEMANTIC_USE_FSVI=1` (or `true`/`yes`/`on`) forces the legacy
-    /// filesystem-vector-index candidate path (`search_semantic_candidates`)
-    /// instead of the DB vector domain (`search_db_vector_domain`), which is
-    /// the default as of W3-3. This escape valve exists only for the W3-3..
-    /// W3-5 co-existence window; it and this whole branch are removed in
-    /// W3-5 alongside fsvi retirement.
-    fn semantic_use_fsvi_escape_hatch() -> bool {
-        // W3-4 Step2-1 (task book #62): single source of truth shared
-        // with `model_manager.rs`'s own loader-time check for the same
-        // env var -- the loader and this per-query dispatch must never
-        // disagree about which mode a process is running in.
-        crate::search::model_manager::semantic_use_fsvi_escape_hatch()
-    }
-
-    /// Dispatches a semantic candidate fetch to either the DB vector domain
-    /// (default) or the legacy fsvi path (`CASS_SEMANTIC_USE_FSVI=1`).
+    /// Dispatches a semantic candidate fetch to the DB vector domain.
     ///
     /// w3-d7① three-state contract: a `building`/`absent` vector-domain
     /// error from `search_db_vector_domain` is propagated as-is (mapped to
-    /// the caller's `Result`, not swallowed) — it must never fall back to
-    /// the fsvi path, and callers must never paper over it with an empty
-    /// result (that would be a silent scan, the exact thing d7 forbids).
+    /// the caller's `Result`, not swallowed) — callers must never paper
+    /// over it with an empty result (that would be a silent scan, the
+    /// exact thing d7 forbids).
+    ///
+    /// W3-5: the legacy fsvi/`CASS_SEMANTIC_USE_FSVI=1` escape-hatch branch
+    /// (and the two-tier/HNSW-ANN candidate machinery it was the sole
+    /// production caller of) has been retired; this is now the only path.
     fn search_semantic_candidates_dispatch(
         &self,
         context: &SemanticCandidateContext,
@@ -4687,9 +4325,6 @@ impl SearchClient {
         SemanticCandidateRetryState,
         Option<crate::search::ann_index::AnnSearchStats>,
     )> {
-        if Self::semantic_use_fsvi_escape_hatch() {
-            return self.search_semantic_candidates(context, embedding, filters, request);
-        }
         let sqlite_guard = self.sqlite_guard()?;
         let conn = sqlite_guard
             .as_ref()
@@ -7703,7 +7338,6 @@ mod tests {
     use crate::storage::api::Profile;
     use crate::storage::sqlite::FrankenStorage;
     use serde_json::json;
-    use serial_test::serial;
     use tempfile::TempDir;
 
     // Reference implementation of the stable dedup key prior to bead num7z.
@@ -7748,52 +7382,6 @@ mod tests {
             hasher.update(ts.to_string().as_bytes());
         }
         hasher.digest()
-    }
-
-    fn vector_result(message_id: u64, score: f32) -> VectorSearchResult {
-        VectorSearchResult {
-            message_id,
-            chunk_idx: 0,
-            score,
-        }
-    }
-
-    #[test]
-    fn semantic_exact_candidate_limit_overfetches_chunks_without_full_scan() {
-        assert_eq!(SearchClient::semantic_exact_candidate_limit(10, 1_000), 40);
-        assert_eq!(SearchClient::semantic_exact_candidate_limit(10, 25), 25);
-        assert_eq!(SearchClient::semantic_exact_candidate_limit(0, 1_000), 0);
-        assert_eq!(SearchClient::semantic_exact_candidate_limit(10, 0), 0);
-    }
-
-    #[test]
-    fn semantic_window_detects_possible_hidden_chunk_competitors() {
-        let complete = vec![
-            vector_result(1, 0.9),
-            vector_result(2, 0.8),
-            vector_result(3, 0.7),
-        ];
-        assert!(
-            !SearchClient::semantic_window_may_omit_competitor(&complete, 3, Some(0.6)),
-            "strictly lower omitted chunks cannot alter the top message window"
-        );
-        assert!(
-            SearchClient::semantic_window_may_omit_competitor(&complete, 3, Some(0.7)),
-            "equal-score omitted chunks can still alter deterministic tie-breaking"
-        );
-
-        let duplicate_collapsed_shortfall = vec![vector_result(1, 0.9)];
-        assert!(
-            SearchClient::semantic_window_may_omit_competitor(
-                &duplicate_collapsed_shortfall,
-                3,
-                Some(0.2),
-            ),
-            "a short collapsed window means high-scoring duplicate chunks may have hidden messages"
-        );
-        assert!(!SearchClient::semantic_window_may_omit_competitor(
-            &complete, 3, None
-        ));
     }
 
     #[test]
@@ -8426,10 +8014,6 @@ mod tests {
 
     fn build_semantic_test_fixture() -> Result<SemanticTestFixture> {
         build_semantic_test_fixture_with_shards(false)
-    }
-
-    fn build_sharded_semantic_test_fixture() -> Result<SemanticTestFixture> {
-        build_semantic_test_fixture_with_shards(true)
     }
 
     fn build_semantic_test_fixture_with_shards(sharded: bool) -> Result<SemanticTestFixture> {
@@ -15557,56 +15141,6 @@ mod tests {
         Ok(())
     }
 
-    // W3-3 bucket (b): this test pins fsvi's multi-shard-index-merge
-    // behavior specifically (`build_sharded_semantic_test_fixture` writes
-    // the fixture's three documents across two separate `.fsvi` shard
-    // files, and this test asserts the fsvi candidate path transparently
-    // merges hits across them in similarity order). That mechanism has no
-    // DB-vector-domain analogue -- `search_db_vector_domain` reads one flat
-    // `vec0` table per generation, so a DB-path run of this fixture would
-    // pass "by accident" without ever exercising the merge logic the test
-    // is named for. Force the legacy fsvi candidate path explicitly rather
-    // than rely on default dispatch. Remove this override (and the escape
-    // hatch it exercises) when fsvi retires in W3-5.
-    #[test]
-    #[serial]
-    fn semantic_search_merges_sharded_vector_indexes() -> Result<()> {
-        // SAFETY: test-local env mutation; restored at end, --test-threads=1
-        // is this repo's mandatory test invocation (see EXEC.md disk law).
-        let prior = std::env::var("CASS_SEMANTIC_USE_FSVI").ok();
-        unsafe {
-            std::env::set_var("CASS_SEMANTIC_USE_FSVI", "1");
-        }
-        let result = (|| -> Result<()> {
-            let fixture = build_sharded_semantic_test_fixture()?;
-            let (hits, ann_stats) = fixture.client.search_semantic(
-                "semantic fixture query",
-                SearchFilters::default(),
-                3,
-                0,
-                FieldMask::FULL,
-                false,
-            )?;
-
-            assert!(
-                ann_stats.is_none(),
-                "sharded exact search should not emit ANN stats"
-            );
-            assert_eq!(hits.len(), 3);
-            assert_eq!(hits[0].source_path, fixture.source_paths[0]);
-            assert_eq!(hits[1].source_path, fixture.source_paths[1]);
-            assert_eq!(hits[2].source_path, fixture.source_paths[2]);
-            Ok(())
-        })();
-        unsafe {
-            match &prior {
-                Some(v) => std::env::set_var("CASS_SEMANTIC_USE_FSVI", v),
-                None => std::env::remove_var("CASS_SEMANTIC_USE_FSVI"),
-            }
-        }
-        result
-    }
-
     #[test]
     fn progressive_phase_overfetches_before_session_paths_filtering() -> Result<()> {
         let fixture = build_semantic_test_fixture()?;
@@ -18114,58 +17648,6 @@ mod tests {
         assert!(!filter.matches("m|42|2|99|7|11|1|1700000000001", None));
         assert!(!filter.matches("m|42|2|3|7|11|1|1699999999999", None));
         assert!(!filter.matches("not-a-doc-id", None));
-    }
-
-    #[test]
-    fn fs_semantic_index_runs_filtered_search() -> Result<()> {
-        let temp = TempDir::new()?;
-        let index_path = crate::search::vector_index::vector_index_path(temp.path(), "embed-fast");
-        if let Some(parent) = index_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        let hash_a = "00".repeat(32);
-        let hash_b = "11".repeat(32);
-        let doc_a = format!("m|101|0|1|10|100|1|1700000000001|{hash_a}");
-        let doc_b = format!("m|202|0|2|20|200|1|1700000000002|{hash_b}");
-
-        let mut writer = VectorIndex::create_with_revision(
-            &index_path,
-            "embed-fast",
-            "rev-1",
-            2,
-            frankensearch::index::Quantization::F16,
-        )
-        .map_err(|err| anyhow!("create fsvi index failed: {err}"))?;
-        writer
-            .write_record(&doc_a, &[1.0, 0.0])
-            .map_err(|err| anyhow!("write_record failed: {err}"))?;
-        writer
-            .write_record(&doc_b, &[0.0, 1.0])
-            .map_err(|err| anyhow!("write_record failed: {err}"))?;
-        writer
-            .finish()
-            .map_err(|err| anyhow!("finish fsvi index failed: {err}"))?;
-
-        let fs_index =
-            VectorIndex::open(&index_path).map_err(|err| anyhow!("open fsvi failed: {err}"))?;
-        let filter = SemanticFilter {
-            agents: Some(HashSet::from([1])),
-            workspaces: None,
-            sources: None,
-            roles: None,
-            created_from: None,
-            created_to: None,
-        };
-        let fs_filter = semantic_filter_as_search_filter(&filter).expect("expected active filter");
-        let hits = fs_index
-            .search_top_k(&[1.0, 0.0], 5, Some(fs_filter))
-            .map_err(|err| anyhow!("frankensearch search failed: {err}"))?;
-        assert_eq!(hits.len(), 1);
-        let parsed = parse_semantic_doc_id(&hits[0].doc_id).expect("parse bridged doc_id");
-        assert_eq!(parsed.message_id, 101);
-        assert_eq!(parsed.agent_id, 1);
-        Ok(())
     }
 
     // Regression guard for bead coding_agent_session_search-q6xf9
