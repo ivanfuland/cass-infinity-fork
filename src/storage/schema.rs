@@ -52,7 +52,7 @@
 //! needs to keep those legacy fields in sync for other code that still
 //! reads them is that wiring step's decision, not this module's.
 
-use super::api::{Conn, StorageError, TxMode};
+use super::api::{Conn, StorageError, Tx, TxMode, params};
 
 /// The schema version [`ensure`] currently knows how to produce. There is
 /// no migration path defined above this yet — bump this and add a real
@@ -74,7 +74,17 @@ use super::api::{Conn, StorageError, TxMode};
 /// shadow tables -- `_data`/`_idx`/`_docsize`/`_config`, all four of them,
 /// verified empirically since this table is contentless (`content=''`) and
 /// therefore never had a `_content` shadow to begin with).
-pub const CURRENT_SCHEMA_VERSION: i64 = 3;
+///
+/// Version 4 (w3 Task W3-1, spec §3.1 向量域) adds the vector-domain tables:
+/// `embedding_generations` (代际元数据: embedder_id/dim/canonicalize_version/
+/// byte_order/audit_status/single-active pointer via a partial unique
+/// index), `message_embeddings` (权威向量表, `UNIQUE(generation_id, doc_id)`,
+/// `doc_id` cascades from `messages`), and `embedding_holes` (R4-B5 hole
+/// ledger -- parallel catch-up completeness tracking; only the table shape
+/// ships here, consumption logic is W3-2's job). No `vec0` virtual table and
+/// no `sqlite-vec` dependency yet -- that is W3-3's retrieval-segment scope;
+/// this version only ships the authoritative relational shape.
+pub const CURRENT_SCHEMA_VERSION: i64 = 4;
 
 /// The `lex_docs`/`fts_lex` domain DDL (w2 Task W2-2, OQ2: external-content
 /// mode) — **must stay byte-for-byte identical** to the matching two lines
@@ -109,6 +119,57 @@ pub(crate) fn recreate_lex_domain_tables(conn: &Conn) -> Result<(), StorageError
     conn.execute_batch(V2_LEX_DOMAIN_DDL)?;
     Ok(())
 }
+
+/// The vector-domain DDL (w3 Task W3-1, spec §3.1) — **must stay byte-for-byte
+/// identical** to the matching tail of [`FRESH_SCHEMA_DDL`] below, for the
+/// same reason [`V2_LEX_DOMAIN_DDL`] is a separate duplicated constant
+/// rather than something `FRESH_SCHEMA_DDL` references (`concat!` only
+/// accepts literal tokens). Used by the version 3 → 4 upgrade path in
+/// [`ensure`] to backfill the vector domain into a pre-existing
+/// version-&lt;4 database (a unit test,
+/// `fresh_schema_ddl_tail_matches_v4_vector_domain_migration_ddl`, enforces
+/// the two copies cannot silently drift apart).
+///
+/// Column shape decisions (spec §3.1 interface line, R4-B4/B5/N8, R0-B07):
+/// - `embedding_generations`: `dim`/`embedder_id`/`canonicalize_version`/
+///   `byte_order` are the代际 identity fields; `audit_status` tracks the
+///   W3-4 activation-audit outcome (`pending`/`passed`/`failed` — a
+///   migrator or catch-up writer stamps `pending` per Task W3-2's
+///   interface); `is_active` is the active-generation pointer, with
+///   `idx_embedding_generations_single_active` (a `WHERE is_active = 1`
+///   partial unique index) making "at most one active generation" a DDL
+///   invariant rather than an application-level promise — a plain `SELECT
+///   ... WHERE is_active = 1` inside the same read transaction as a
+///   `message_embeddings` read is therefore automatically the "same SQLite
+///   snapshot" reader spec's R4-B4 requires, with no separate pointer table
+///   needed.
+/// - `message_embeddings`: DDL `CHECK(length(embedding) % 4 = 0)` is the
+///   cross-row-agnostic backstop (a per-generation exact-dim check cannot
+///   live in a table CHECK — it would need a cross-table lookup, which
+///   SQLite CHECK constraints cannot express); the strict per-generation
+///   dim check, the finite (non-NaN/non-Inf) check, and the norm/BLOB
+///   recompute consistency all live in the write-side helpers below
+///   ([`insert_message_embedding`]). `CHECK(norm > 0)` is a second DDL
+///   backstop for R4-N8's zero-norm rejection (also catches a NaN norm,
+///   since IEEE-754 `NaN > 0` is `false`). `doc_id` cascades from
+///   `messages` (R0-B07's `ON DELETE CASCADE`); `generation_id` does not
+///   cascade from `embedding_generations` — deleting a generation's rows in
+///   bulk is W3-4's explicit "旧代际延迟清理" job, not an implicit
+///   side-effect of dropping the generation's metadata row.
+/// - `embedding_holes`: R4-B5's hole ledger — `PRIMARY KEY
+///   (generation_id, doc_id)` makes re-detecting the same hole an idempotent
+///   `INSERT OR IGNORE`, not a fresh duplicate row; `doc_id` cascades from
+///   `messages` (a hole for a message that no longer exists is moot).
+///   Consumption (writing/resolving holes during catch-up) is W3-2's job —
+///   this version only ships the table shape plus basic CRUD capability.
+const V4_VECTOR_DOMAIN_DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS embedding_generations (id INTEGER PRIMARY KEY AUTOINCREMENT, embedder_id TEXT NOT NULL, dim INTEGER NOT NULL CHECK (dim > 0), canonicalize_version INTEGER NOT NULL, byte_order TEXT NOT NULL DEFAULT 'le' CHECK (byte_order IN ('le', 'be')), audit_status TEXT NOT NULL DEFAULT 'pending' CHECK (audit_status IN ('pending', 'passed', 'failed')), is_active INTEGER NOT NULL DEFAULT 0 CHECK (is_active IN (0, 1)), created_at INTEGER NOT NULL, activated_at INTEGER);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_embedding_generations_single_active ON embedding_generations(is_active) WHERE is_active = 1;
+CREATE TABLE IF NOT EXISTS message_embeddings (generation_id INTEGER NOT NULL REFERENCES embedding_generations (id), doc_id INTEGER NOT NULL REFERENCES messages (id) ON DELETE CASCADE, conversation_id INTEGER NOT NULL, embedding BLOB NOT NULL CHECK (length(embedding) % 4 = 0), norm REAL NOT NULL CHECK (norm > 0), content_hash TEXT NOT NULL, content_version INTEGER, created_at INTEGER NOT NULL, UNIQUE (generation_id, doc_id));
+CREATE INDEX IF NOT EXISTS idx_message_embeddings_generation ON message_embeddings(generation_id);
+CREATE INDEX IF NOT EXISTS idx_message_embeddings_doc ON message_embeddings(doc_id);
+CREATE TABLE IF NOT EXISTS embedding_holes (generation_id INTEGER NOT NULL REFERENCES embedding_generations (id), doc_id INTEGER NOT NULL REFERENCES messages (id) ON DELETE CASCADE, detected_at INTEGER NOT NULL, reason TEXT, PRIMARY KEY (generation_id, doc_id));
+"#;
 
 /// Full DDL for a version-2 database, applied verbatim inside a single
 /// transaction. See the module doc comment for provenance and the two
@@ -187,6 +248,12 @@ CREATE TABLE IF NOT EXISTS conversation_external_tail_lookup (lookup_key TEXT PR
 CREATE TABLE IF NOT EXISTS operation_commit_receipt (id INTEGER PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE, operation TEXT NOT NULL, state TEXT NOT NULL, snapshot_root TEXT, committed_at_ms INTEGER NOT NULL, detail TEXT);
 CREATE TABLE IF NOT EXISTS lex_docs (doc_id INTEGER PRIMARY KEY REFERENCES messages (id) ON DELETE CASCADE, content TEXT NOT NULL, title TEXT NOT NULL, agent TEXT NOT NULL, workspace TEXT NOT NULL, source_path TEXT NOT NULL);
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_lex USING fts5(content, title, agent, workspace, source_path, content = 'lex_docs', content_rowid = 'doc_id', tokenize = 'porter trigram');
+CREATE TABLE IF NOT EXISTS embedding_generations (id INTEGER PRIMARY KEY AUTOINCREMENT, embedder_id TEXT NOT NULL, dim INTEGER NOT NULL CHECK (dim > 0), canonicalize_version INTEGER NOT NULL, byte_order TEXT NOT NULL DEFAULT 'le' CHECK (byte_order IN ('le', 'be')), audit_status TEXT NOT NULL DEFAULT 'pending' CHECK (audit_status IN ('pending', 'passed', 'failed')), is_active INTEGER NOT NULL DEFAULT 0 CHECK (is_active IN (0, 1)), created_at INTEGER NOT NULL, activated_at INTEGER);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_embedding_generations_single_active ON embedding_generations(is_active) WHERE is_active = 1;
+CREATE TABLE IF NOT EXISTS message_embeddings (generation_id INTEGER NOT NULL REFERENCES embedding_generations (id), doc_id INTEGER NOT NULL REFERENCES messages (id) ON DELETE CASCADE, conversation_id INTEGER NOT NULL, embedding BLOB NOT NULL CHECK (length(embedding) % 4 = 0), norm REAL NOT NULL CHECK (norm > 0), content_hash TEXT NOT NULL, content_version INTEGER, created_at INTEGER NOT NULL, UNIQUE (generation_id, doc_id));
+CREATE INDEX IF NOT EXISTS idx_message_embeddings_generation ON message_embeddings(generation_id);
+CREATE INDEX IF NOT EXISTS idx_message_embeddings_doc ON message_embeddings(doc_id);
+CREATE TABLE IF NOT EXISTS embedding_holes (generation_id INTEGER NOT NULL REFERENCES embedding_generations (id), doc_id INTEGER NOT NULL REFERENCES messages (id) ON DELETE CASCADE, detected_at INTEGER NOT NULL, reason TEXT, PRIMARY KEY (generation_id, doc_id));
 "#;
 
 /// `PRAGMA user_version` is not parameterizable, so it is spliced into a
@@ -249,6 +316,10 @@ fn reject(detail: impl Into<String>) -> StorageError {
 ///   - `version < 3` (W2-6 Task戊): `DROP TABLE IF EXISTS fts_messages` —
 ///     the legacy FTS5 shadow, superseded by the `fts_lex`/`lex_docs`
 ///     domain. Idempotent via `IF EXISTS`.
+///   - `version < 4` (w3 Task W3-1): add the vector domain
+///     ([`V4_VECTOR_DOMAIN_DDL`]: `embedding_generations`/
+///     `message_embeddings`/`embedding_holes`). Idempotent via `IF NOT
+///     EXISTS` on every statement.
 /// - `user_version == CURRENT_SCHEMA_VERSION` → already built, nothing to do.
 /// - `user_version > CURRENT_SCHEMA_VERSION` → this binary is older than
 ///   the database it's looking at. Rejected: opening it would silently
@@ -296,6 +367,9 @@ pub fn ensure(conn: &Conn) -> Result<(), StorageError> {
             if version < 3 {
                 tx.execute_batch("DROP TABLE IF EXISTS fts_messages;")?;
             }
+            if version < 4 {
+                tx.execute_batch(V4_VECTOR_DOMAIN_DDL)?;
+            }
             tx.execute_batch(&set_user_version_sql(CURRENT_SCHEMA_VERSION))?;
             Ok(())
         });
@@ -303,6 +377,212 @@ pub fn ensure(conn: &Conn) -> Result<(), StorageError> {
 
     // version == CURRENT_SCHEMA_VERSION: already built, nothing to do.
     Ok(())
+}
+
+// =============================================================================
+// Vector domain write-side helpers (w3 Task W3-1, spec §3.1).
+//
+// DDL CHECK constraints in [`V4_VECTOR_DOMAIN_DDL`] are the cross-row-agnostic
+// backstop only (`length(embedding) % 4 = 0`, `norm > 0`) -- everything a DDL
+// CHECK cannot express (exact per-generation dim, per-element finiteness, and
+// norm/BLOB recompute consistency) is enforced here, at the single write path
+// this module exposes for the table. There is deliberately no other sanctioned
+// way to insert a row: any caller reaching for raw SQL `INSERT INTO
+// message_embeddings` bypasses these checks and only gets the DDL backstop.
+// =============================================================================
+
+/// Only byte order this version's write path produces or accepts. Matches
+/// [`V4_VECTOR_DOMAIN_DDL`]'s `byte_order` column default; `'be'` is a valid
+/// DDL value (schema-level extension point) but has no producer yet.
+pub const VECTOR_BYTE_ORDER_LE: &str = "le";
+
+/// Serialize an f32 vector to its little-endian BLOB encoding (the only
+/// encoding this version's write path produces -- see
+/// [`VECTOR_BYTE_ORDER_LE`]). Manual byte-by-byte encoding, not
+/// `bytemuck::cast_slice`, because the round trip back
+/// ([`le_blob_to_f32_vector`]) reads a BLOB `Vec<u8>` handed back by SQLite
+/// with no alignment guarantee, and `bytemuck` would have to make the same
+/// concession on that side anyway -- one manual codec on both sides is
+/// simpler than a fast path for the write direction only.
+pub fn f32_vector_to_le_blob(vector: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(vector.len() * 4);
+    for x in vector {
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    out
+}
+
+/// Decode a little-endian BLOB back into an f32 vector. The DDL's
+/// `CHECK(length(embedding) % 4 = 0)` guarantees `blob.len()` is a multiple
+/// of 4 for any row that made it into the table, but this function is also
+/// used by tests against hand-built byte slices, so it re-checks rather
+/// than trusting the DDL invariant by assumption.
+pub fn le_blob_to_f32_vector(blob: &[u8]) -> Result<Vec<f32>, StorageError> {
+    if blob.len() % 4 != 0 {
+        return Err(StorageError::Constraint {
+            detail: format!(
+                "embedding BLOB length {} is not a multiple of 4 bytes",
+                blob.len()
+            ),
+        });
+    }
+    Ok(blob
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
+}
+
+/// L2 norm, accumulated in `f64` (matching the `norm REAL` column's SQLite
+/// storage class) for the same value both at write time and when a test
+/// recomputes it from a stored BLOB to check norm/BLOB consistency (spec
+/// §3.1's "norm 与 BLOB 重算一致性").
+pub fn l2_norm(vector: &[f32]) -> f64 {
+    vector.iter().map(|x| f64::from(*x) * f64::from(*x)).sum::<f64>().sqrt()
+}
+
+/// Insert a new, empty (`audit_status = 'pending'`, `is_active = 0`)
+/// embedding generation and return its `id`. Callers needing "just landed a
+/// new generation" semantics (Task W3-2's migrator, catch-up writers) call
+/// this once per generation, then [`insert_message_embedding`] per row.
+pub fn create_embedding_generation(
+    tx: &Tx,
+    embedder_id: &str,
+    dim: i64,
+    canonicalize_version: u32,
+    created_at_ms: i64,
+) -> Result<i64, StorageError> {
+    tx.execute(
+        "INSERT INTO embedding_generations \
+         (embedder_id, dim, canonicalize_version, byte_order, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        &params![
+            embedder_id,
+            dim,
+            i64::from(canonicalize_version),
+            VECTOR_BYTE_ORDER_LE,
+            created_at_ms
+        ],
+    )?;
+    Ok(tx.last_insert_rowid())
+}
+
+/// The write-side validation gate for `message_embeddings` (spec §3.1 Step
+/// 1's four invariants, in order): strict per-generation dimension match
+/// (DDL only checks `% 4 == 0`), per-element finiteness (rejects
+/// NaN/Inf -- `f32::is_finite` catches both), non-zero norm (R4-N8), and the
+/// stored `norm` column is always the same recomputation
+/// ([`l2_norm`]) that also drives the zero-norm check, so norm/BLOB
+/// consistency is a structural guarantee of this being the sole write path
+/// rather than something checked after the fact.
+#[allow(clippy::too_many_arguments)]
+pub fn insert_message_embedding(
+    tx: &Tx,
+    generation_id: i64,
+    doc_id: i64,
+    conversation_id: i64,
+    vector: &[f32],
+    content_hash: &str,
+    content_version: Option<i64>,
+    created_at_ms: i64,
+) -> Result<(), StorageError> {
+    let expected_dim: i64 = tx.query_row_map(
+        "SELECT dim FROM embedding_generations WHERE id = ?1",
+        &params![generation_id],
+        |row| row.get_typed(0),
+    )?;
+
+    let actual_dim = i64::try_from(vector.len()).map_err(|_| StorageError::Constraint {
+        detail: format!("vector length {} does not fit in i64", vector.len()),
+    })?;
+    if actual_dim != expected_dim {
+        return Err(StorageError::Constraint {
+            detail: format!(
+                "generation {generation_id} expects dim={expected_dim}, got vector of \
+                 dim={actual_dim} for doc_id={doc_id}"
+            ),
+        });
+    }
+
+    if let Some(bad_idx) = vector.iter().position(|x| !x.is_finite()) {
+        return Err(StorageError::Constraint {
+            detail: format!(
+                "embedding for doc_id={doc_id} has a non-finite element at index {bad_idx} \
+                 (NaN/Inf are rejected)"
+            ),
+        });
+    }
+
+    let norm = l2_norm(vector);
+    if !(norm > 0.0) {
+        return Err(StorageError::Constraint {
+            detail: format!(
+                "embedding for doc_id={doc_id} has zero (or non-positive) norm {norm}; \
+                 zero-norm vectors are rejected (R4-N8)"
+            ),
+        });
+    }
+
+    let blob = f32_vector_to_le_blob(vector);
+    tx.execute(
+        "INSERT INTO message_embeddings \
+         (generation_id, doc_id, conversation_id, embedding, norm, content_hash, \
+          content_version, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        &params![
+            generation_id,
+            doc_id,
+            conversation_id,
+            blob,
+            norm,
+            content_hash,
+            content_version,
+            created_at_ms
+        ],
+    )?;
+    Ok(())
+}
+
+/// Read the current active generation's `id`, if any. A plain `SELECT`
+/// against the `WHERE is_active = 1` partial-unique-indexed column -- when
+/// called inside the same read transaction as a `message_embeddings` query,
+/// this is the "same SQLite snapshot" active-pointer read spec's R4-B4
+/// requires, with no separate pointer table or extra locking needed.
+pub fn active_generation_id(conn: &Conn) -> Result<Option<i64>, StorageError> {
+    conn.query_opt_map(
+        "SELECT id FROM embedding_generations WHERE is_active = 1",
+        &[],
+        |row| row.get_typed(0),
+    )
+}
+
+/// Switch the active-generation pointer to `new_generation_id`, atomically
+/// with `verify` (spec §3.1's "指针切换与完整性校验同一事务", w3-d9②'s
+///修复原子性判例): `verify` runs first, inside the same `Immediate`
+/// transaction as the pointer flip. If `verify` returns `Err`, the whole
+/// transaction rolls back via `Tx`'s `Drop` -- the previous active
+/// generation (if any) is left untouched, not just "not yet switched".
+/// `verify`'s own contract here is intentionally minimal (an
+/// application-supplied predicate over the transaction) — the full W3-4
+/// activation audit (`COUNT(length != 4*dim) = 0` + finite/norm resample +
+/// positive-content check + identity-set anti-join + canonicalize-version
+/// match + `PRAGMA foreign_key_check`) is that task's scope, not built here;
+/// this function only guarantees the atomicity contract the audit will run
+/// inside of.
+pub fn switch_active_generation(
+    conn: &Conn,
+    new_generation_id: i64,
+    activated_at_ms: i64,
+    verify: impl FnOnce(&Tx) -> Result<(), StorageError>,
+) -> Result<(), StorageError> {
+    conn.with_tx_no_replay(TxMode::Immediate, |tx| {
+        verify(tx)?;
+        tx.execute("UPDATE embedding_generations SET is_active = 0 WHERE is_active = 1", &[])?;
+        tx.execute(
+            "UPDATE embedding_generations SET is_active = 1, activated_at = ?1 WHERE id = ?2",
+            &params![activated_at_ms, new_generation_id],
+        )?;
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -361,6 +641,12 @@ mod tests {
             !names.contains(&"fts_lex_content".to_string()),
             "external-content mode must not maintain its own content shadow"
         );
+        // w3 Task W3-1: the vector domain (embedding_generations,
+        // message_embeddings, embedding_holes) must exist on a fresh build.
+        assert!(names.contains(&"embedding_generations".to_string()));
+        assert!(names.contains(&"message_embeddings".to_string()));
+        assert!(names.contains(&"embedding_holes".to_string()));
+        assert!(names.contains(&"idx_embedding_generations_single_active".to_string()));
     }
 
     /// Regression guard for the seed-data gap a `.schema`-only dump cannot
@@ -430,16 +716,35 @@ mod tests {
         );
     }
 
+    /// Guards against the two DDL copies (`FRESH_SCHEMA_DDL`'s
+    /// lex-domain section and `V2_LEX_DOMAIN_DDL`) silently drifting apart
+    /// — see both constants' doc comments for why they are duplicated
+    /// instead of shared. `V4_VECTOR_DOMAIN_DDL` was appended after the lex
+    /// domain in `FRESH_SCHEMA_DDL` (w3 Task W3-1), so this is no longer a
+    /// literal-tail check (see
+    /// `fresh_schema_ddl_tail_matches_v4_vector_domain_migration_ddl` for
+    /// that check against the new tail) -- a contiguous-substring check is
+    /// exactly as strong a drift guard.
+    #[test]
+    fn fresh_schema_ddl_lex_domain_section_matches_v2_lex_domain_migration_ddl() {
+        assert!(
+            FRESH_SCHEMA_DDL.contains(V2_LEX_DOMAIN_DDL.trim()),
+            "FRESH_SCHEMA_DDL must contain V2_LEX_DOMAIN_DDL's text verbatim (the version \
+             1 -> 2 migration applies exactly this text to a pre-existing database, and it \
+             must produce the same lex_docs/fts_lex shape a fresh build gets)"
+        );
+    }
+
     /// Guards against the two DDL copies (`FRESH_SCHEMA_DDL`'s tail and
-    /// `V2_LEX_DOMAIN_DDL`) silently drifting apart — see both constants'
+    /// `V4_VECTOR_DOMAIN_DDL`) silently drifting apart — see both constants'
     /// doc comments for why they are duplicated instead of shared.
     #[test]
-    fn fresh_schema_ddl_tail_matches_v2_lex_domain_migration_ddl() {
+    fn fresh_schema_ddl_tail_matches_v4_vector_domain_migration_ddl() {
         assert!(
-            FRESH_SCHEMA_DDL.trim_end().ends_with(V2_LEX_DOMAIN_DDL.trim()),
-            "FRESH_SCHEMA_DDL's final two statements must be byte-for-byte identical to \
-             V2_LEX_DOMAIN_DDL (the version 1 -> 2 migration applies exactly this text to a \
-             pre-existing database, and it must produce the same lex_docs/fts_lex shape a \
+            FRESH_SCHEMA_DDL.trim_end().ends_with(V4_VECTOR_DOMAIN_DDL.trim()),
+            "FRESH_SCHEMA_DDL's final statements must be byte-for-byte identical to \
+             V4_VECTOR_DOMAIN_DDL (the version 3 -> 4 migration applies exactly this text to \
+             a pre-existing database, and it must produce the same vector-domain shape a \
              fresh build gets)"
         );
     }
@@ -456,11 +761,17 @@ mod tests {
 
         // Build a version-1 shape directly (the pre-W2-2 DDL: everything up
         // to and including fts_messages -- the legacy FTS5 shadow a real
-        // wave-1 database still had -- but not lex_docs/fts_lex).
-        let v1_ddl = FRESH_SCHEMA_DDL
+        // wave-1 database still had -- but not lex_docs/fts_lex, and not the
+        // w3 vector domain either). Strip the tails in the order they were
+        // appended: V4 (newest) first, then V2.
+        let v3_shape_ddl = FRESH_SCHEMA_DDL
+            .trim_end()
+            .strip_suffix(V4_VECTOR_DOMAIN_DDL.trim())
+            .expect("FRESH_SCHEMA_DDL must end with V4_VECTOR_DOMAIN_DDL's text");
+        let v1_ddl = v3_shape_ddl
             .trim_end()
             .strip_suffix(V2_LEX_DOMAIN_DDL.trim())
-            .expect("FRESH_SCHEMA_DDL must end with V2_LEX_DOMAIN_DDL's text");
+            .expect("FRESH_SCHEMA_DDL minus the vector domain must end with V2_LEX_DOMAIN_DDL's text");
         conn.execute_batch(v1_ddl).unwrap();
         conn.execute_batch(LEGACY_FTS_MESSAGES_DDL_FOR_TEST).unwrap();
         conn.execute_batch(&set_user_version_sql(1)).unwrap();
@@ -486,6 +797,15 @@ mod tests {
             !names.contains(&"fts_messages".to_string()),
             "a version-1 database must also get the version 2->3 fts_messages drop"
         );
+        // w3 Task W3-1 (plan ⑥ "vN->latest e2e"): a version-1 database more
+        // than one migration step behind must also land the vector domain
+        // added at version 4 -- this is the v1->4 end-to-end case.
+        assert!(
+            names.contains(&"embedding_generations".to_string()),
+            "a version-1 database must also get the version 3->4 vector domain add"
+        );
+        assert!(names.contains(&"message_embeddings".to_string()));
+        assert!(names.contains(&"embedding_holes".to_string()));
 
         // Idempotent: a second call (simulating either a deliberate re-run or
         // recovery after an interrupted first migration) must not fail.
@@ -504,13 +824,24 @@ mod tests {
         let (_dir, path) = scratch_db_path();
         let conn = open_sqlite_writer(&path);
 
-        conn.execute_batch(FRESH_SCHEMA_DDL).unwrap();
+        // A real wave-2 database predates the w3 vector domain (added at
+        // version 4) -- strip it off `FRESH_SCHEMA_DDL` before using it as
+        // this fixture's base, same reasoning as the v1 fixture above.
+        let v3_shape_ddl = FRESH_SCHEMA_DDL
+            .trim_end()
+            .strip_suffix(V4_VECTOR_DOMAIN_DDL.trim())
+            .expect("FRESH_SCHEMA_DDL must end with V4_VECTOR_DOMAIN_DDL's text");
+        conn.execute_batch(v3_shape_ddl).unwrap();
         conn.execute_batch(LEGACY_FTS_MESSAGES_DDL_FOR_TEST).unwrap();
         conn.execute_batch(&set_user_version_sql(2)).unwrap();
         let v2_names = table_names(&conn);
         assert!(
             v2_names.contains(&"fts_messages".to_string()),
             "sanity: the hand-built v2 shape must have fts_messages"
+        );
+        assert!(
+            !v2_names.contains(&"embedding_generations".to_string()),
+            "sanity: the hand-built v2 shape must not already have the vector domain"
         );
 
         ensure(&conn).expect("ensure must migrate a version-2 database forward");
@@ -528,9 +859,69 @@ mod tests {
             names.contains(&"lex_docs".to_string()),
             "the fts_messages drop must not touch the unrelated lex_docs/fts_lex domain"
         );
+        // w3 Task W3-1: a version-2 database must also get the version 3->4
+        // vector domain add (a single `ensure` call catches all the way up).
+        assert!(names.contains(&"embedding_generations".to_string()));
+        assert!(names.contains(&"message_embeddings".to_string()));
+        assert!(names.contains(&"embedding_holes".to_string()));
 
         // Idempotent: a second call (simulating either a deliberate re-run or
         // recovery after an interrupted first migration) must not fail.
+        ensure(&conn).expect("a second ensure call on an already-migrated database must be a no-op");
+        assert_eq!(read_user_version(&conn).unwrap(), CURRENT_SCHEMA_VERSION);
+        assert_eq!(table_names(&conn), names, "re-running the migration must not change the table set");
+    }
+
+    /// w3 Task W3-1 Step 2b (R1-X-N1 + w3-d6②, "与波2同款"): open a real
+    /// wave-2-terminal-state database at `user_version = 3` (the shape every
+    /// real database produced before this task -- `FRESH_SCHEMA_DDL` minus
+    /// the vector-domain tail, exactly what the pre-W3-1 production
+    /// `ensure` wrote for a fresh build) and assert the upgrade path lands
+    /// the vector domain and reaches `CURRENT_SCHEMA_VERSION`, idempotently.
+    /// This is the "波间升级" case the plan calls out distinctly from the
+    /// v1/v2 hand-built fixtures above: it is byte-identical production DDL
+    /// (not a re-derived subset), i.e. exactly what real wave-2 databases
+    /// (like the w3 staging snapshot, itself confirmed `user_version = 3`)
+    /// look like schema-wise.
+    #[test]
+    fn ensure_migrates_a_real_wave2_terminal_v3_database_to_the_vector_domain_and_is_idempotent() {
+        let (_dir, path) = scratch_db_path();
+        let conn = open_sqlite_writer(&path);
+
+        let v3_ddl = FRESH_SCHEMA_DDL
+            .trim_end()
+            .strip_suffix(V4_VECTOR_DOMAIN_DDL.trim())
+            .expect("FRESH_SCHEMA_DDL must end with V4_VECTOR_DOMAIN_DDL's text");
+        conn.execute_batch(v3_ddl).unwrap();
+        conn.execute_batch(&set_user_version_sql(3)).unwrap();
+        let v3_names = table_names(&conn);
+        assert!(
+            !v3_names.contains(&"fts_messages".to_string()),
+            "sanity: a real wave-2-terminal (v3) database must not have fts_messages"
+        );
+        assert!(
+            v3_names.contains(&"lex_docs".to_string()),
+            "sanity: a real v3 database must already have the lex domain"
+        );
+        assert!(
+            !v3_names.contains(&"embedding_generations".to_string()),
+            "sanity: a real v3 database must not yet have the vector domain"
+        );
+
+        ensure(&conn).expect("ensure must migrate a version-3 database forward");
+        assert_eq!(read_user_version(&conn).unwrap(), CURRENT_SCHEMA_VERSION);
+        let names = table_names(&conn);
+        assert!(names.contains(&"embedding_generations".to_string()));
+        assert!(names.contains(&"message_embeddings".to_string()));
+        assert!(names.contains(&"embedding_holes".to_string()));
+        assert!(names.contains(&"idx_embedding_generations_single_active".to_string()));
+        // The vector-domain add must not touch the pre-existing relational
+        // or lexical domains.
+        assert!(names.contains(&"lex_docs".to_string()));
+        assert!(names.contains(&"messages".to_string()));
+
+        // Idempotent: a second call (either a deliberate re-run or recovery
+        // after an interrupted first migration) must not fail or duplicate.
         ensure(&conn).expect("a second ensure call on an already-migrated database must be a no-op");
         assert_eq!(read_user_version(&conn).unwrap(), CURRENT_SCHEMA_VERSION);
         assert_eq!(table_names(&conn), names, "re-running the migration must not change the table set");
@@ -679,8 +1070,11 @@ mod tests {
     /// "every statement ran, only the version pragma is missing" -- the
     /// latest possible interruption point inside the transaction. Bumped
     /// from 58 to 60 by w2 Task W2-2's `lex_docs`/`fts_lex` addition, then
-    /// down to 59 by W2-6 Task戊 removing the `fts_messages` statement.
-    const FRESH_SCHEMA_DDL_STATEMENT_COUNT_FOR_TEST: usize = 59;
+    /// down to 59 by W2-6 Task戊 removing the `fts_messages` statement, then
+    /// up to 65 by w3 Task W3-1's `V4_VECTOR_DOMAIN_DDL` (6 statements:
+    /// `embedding_generations` table + its single-active partial index,
+    /// `message_embeddings` table + 2 indexes, `embedding_holes` table).
+    const FRESH_SCHEMA_DDL_STATEMENT_COUNT_FOR_TEST: usize = 65;
 
     /// The historical `fts_messages` DDL, byte-for-byte identical to the
     /// statement W2-6 Task戊 removed from [`FRESH_SCHEMA_DDL`]. A real
