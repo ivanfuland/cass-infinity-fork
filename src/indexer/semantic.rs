@@ -666,12 +666,6 @@ impl SemanticCheckpointCaps {
     }
 }
 
-pub(crate) struct CanonicalIncrementalEmbeddingBatch {
-    pub inputs: Vec<EmbeddingInput>,
-    pub conversations_in_batch: u64,
-    pub raw_max_message_id: Option<i64>,
-}
-
 fn total_semantic_conversations(storage: &FrankenStorage) -> Result<u64> {
     let hinted_fallback_sql = "SELECT c.id
              FROM conversations c
@@ -1282,6 +1276,7 @@ fn select_checkpoint_capped_conversations(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn packet_embedding_inputs_from_storage(
     storage: &FrankenStorage,
 ) -> Result<Vec<EmbeddingInput>> {
@@ -1351,6 +1346,18 @@ where
     (inputs, raw_max_message_id)
 }
 
+// W3-5: fsvi-backed watermark incremental indexing is retired (see
+// indexer::run_semantic_db_vector_catchup); the tests below that still
+// exercise "since" selection semantics are earmarked for the Step1 test
+// cleanup pass, not deleted here to keep this wiring commit's diff scoped.
+#[cfg(test)]
+pub(crate) struct CanonicalIncrementalEmbeddingBatch {
+    pub inputs: Vec<EmbeddingInput>,
+    pub conversations_in_batch: u64,
+    pub raw_max_message_id: Option<i64>,
+}
+
+#[cfg(test)]
 pub(crate) fn packet_embedding_inputs_from_storage_since(
     storage: &FrankenStorage,
     since_message_id: i64,

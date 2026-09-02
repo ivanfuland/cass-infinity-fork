@@ -97425,6 +97425,99 @@ fn run_models_backfill(
         hint: Some("Run 'cass health --json' to inspect the archive database".into()),
         retryable: true,
     })?;
+
+    // W3-5: frankensearch/fsvi retired. The infinity-backed quality tier no
+    // longer builds a .fsvi file -- it drains the DB vector domain's
+    // `embedding_holes` via the same catch-up `cass index --semantic` uses
+    // (ingest-time hooks already register a hole per new message; this
+    // drains them + does a genesis-eligibility rescan as a self-healing
+    // safety net -- W3-5 task book #63 advisor ruling). hash/fastembed
+    // tiers still use the fsvi path below until Step1's dependency removal
+    // forces their disposition.
+    if embedder_type == "infinity" {
+        #[cfg(feature = "infinity")]
+        {
+            let batch_size = SemanticIndexer::new("infinity", None)
+                .map_err(|e| CliError {
+                    code: 20,
+                    kind: CliErrorKind::Model.kind_str(),
+                    message: format!("Failed to initialize infinity embedder: {e}"),
+                    hint: Some(
+                        "Check CASS_INFINITY_* env vars and that the Infinity service is reachable"
+                            .into(),
+                    ),
+                    retryable: true,
+                })?
+                .batch_size();
+            let report = crate::indexer::db_vector_catchup::run_db_vector_catchup_backfill(
+                &storage,
+                batch_size,
+            )
+            .map_err(|e| CliError {
+                code: 5,
+                kind: CliErrorKind::SemanticBackfill.kind_str(),
+                message: format!("DB vector domain catch-up failed: {e:#}"),
+                hint: Some(
+                    "Retry the command; the catch-up is idempotent (embedding_holes-driven)"
+                        .into(),
+                ),
+                retryable: true,
+            })?;
+
+            let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+                if matches!(fmt, RobotFormat::Sessions) {
+                    RobotFormat::Compact
+                } else {
+                    fmt
+                }
+            });
+            if structured_format.is_some() {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "status": if report.activated { "published" } else { "in_progress" },
+                        "next_step": if report.activated {
+                            "semantic tier is ready"
+                        } else {
+                            "rerun the same command to continue draining embedding_holes"
+                        },
+                        "tier": "quality",
+                        "embedder_id": report.embedder_id,
+                        "data_dir": data_dir.display().to_string(),
+                        "db_path": db_path.display().to_string(),
+                        "generation_id": report.generation_id,
+                        "reused_existing_generation": report.reused_existing_generation,
+                        "eligible_seeded": report.eligible_seeded,
+                        "embedded_inserted": report.embedded_inserted,
+                        "stale_skipped": report.stale_skipped,
+                        "holes_before": report.holes_before,
+                        "holes_after": report.holes_after,
+                        "activated": report.activated,
+                    }))
+                    .unwrap_or_default()
+                );
+            } else {
+                println!("{}", "Semantic backfill (DB vector domain)".bold());
+                println!("  Generation: {}", report.generation_id);
+                println!("  Embedder: {}", report.embedder_id);
+                println!("  Embedded (this run): {}", report.embedded_inserted);
+                println!("  Holes remaining: {}", report.holes_after);
+                println!("  Activated: {}", report.activated);
+            }
+            return Ok(());
+        }
+        #[cfg(not(feature = "infinity"))]
+        {
+            return Err(CliError {
+                code: 20,
+                kind: CliErrorKind::Model.kind_str(),
+                message: "embedder 'infinity' requires the `infinity` build feature".to_string(),
+                hint: Some("Rebuild with --features infinity".into()),
+                retryable: false,
+            });
+        }
+    }
+
     let mut manifest = SemanticManifest::load_or_default(&data_dir).map_err(|e| CliError {
         code: 5,
         kind: CliErrorKind::SemanticManifest.kind_str(),
@@ -97561,6 +97654,114 @@ fn run_models_backfill(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod w3_5_models_backfill_infinity_wiring_tests {
+    use super::*;
+    use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+    use crate::storage::sqlite::FrankenStorage;
+    use tempfile::TempDir;
+
+    /// W3-5 wiring proof (task book #63, advisor ruling: "先接线后拆除"):
+    /// `cass models backfill --embedder infinity` must reach the same
+    /// DB-vector-domain catch-up (`db_vector_catchup::
+    /// run_db_vector_catchup_backfill`) that `cass index --semantic` now
+    /// uses, not the retired fsvi path -- positive proof the capability
+    /// silently disappearing (the risk this wiring commit exists to close)
+    /// did not happen. Requires a live Infinity at CASS_INFINITY_URL
+    /// (127.0.0.1:7997 default); run explicitly with `--ignored`.
+    #[test]
+    #[ignore = "requires a live Infinity service at 127.0.0.1:7997 (CASS_INFINITY_URL)"]
+    #[cfg(feature = "infinity")]
+    fn cli_models_backfill_infinity_reaches_db_vector_domain_catchup() {
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("agent_search.db");
+
+        {
+            let storage = FrankenStorage::open(&db_path).unwrap();
+            let agent_id = storage
+                .ensure_agent(&Agent {
+                    id: None,
+                    slug: "claude_code".into(),
+                    name: "Claude Code".into(),
+                    version: Some("1.0".into()),
+                    kind: AgentKind::Cli,
+                })
+                .unwrap();
+            let conv = Conversation {
+                id: None,
+                agent_slug: "claude_code".into(),
+                workspace: None,
+                external_id: Some("w3-5-cli-wiring-e2e".into()),
+                title: Some("w3-5 CLI wiring e2e fixture".into()),
+                source_path: std::path::PathBuf::from("/fixtures/w3-5-cli-wiring-e2e.jsonl"),
+                started_at: Some(1_000),
+                ended_at: Some(4_000),
+                approx_tokens: None,
+                metadata_json: serde_json::json!(null),
+                messages: vec![
+                    Message {
+                        id: None,
+                        idx: 0,
+                        role: MessageRole::User,
+                        author: None,
+                        created_at: Some(1_000),
+                        content: "w3-5 cli wiring: rust borrow checker lifetimes question".into(),
+                        extra_json: serde_json::json!(null),
+                        snippets: vec![],
+                    },
+                    Message {
+                        id: None,
+                        idx: 1,
+                        role: MessageRole::Agent,
+                        author: None,
+                        created_at: Some(2_000),
+                        content: "w3-5 cli wiring: reply about ownership rules".into(),
+                        extra_json: serde_json::json!(null),
+                        snippets: vec![],
+                    },
+                ],
+                source_id: "local".into(),
+                origin_host: None,
+            };
+            storage
+                .insert_conversation_tree(agent_id, None, &conv)
+                .expect("seed conversation");
+        }
+
+        run_models_backfill(
+            "quality",
+            Some("infinity"),
+            10_000,
+            false,
+            Some(data_dir.clone()),
+            Some(db_path.clone()),
+            None,
+        )
+        .expect("cass models backfill --embedder infinity must reach the DB vector domain");
+
+        let storage = FrankenStorage::open_readonly(&db_path).unwrap();
+        let active = crate::storage::schema::active_generation_id(storage.raw()).unwrap();
+        assert!(
+            active.is_some(),
+            "CLI backfill must activate a DB-vector-domain generation"
+        );
+        let embedded_count: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM message_embeddings WHERE generation_id = ?1",
+                &crate::storage::api::params![active.unwrap()],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            embedded_count, 2,
+            "both seeded messages must be embedded via the CLI path"
+        );
+    }
 }
 
 /// Remove model files
