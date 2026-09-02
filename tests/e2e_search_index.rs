@@ -2412,3 +2412,111 @@ fn incremental_index_repairs_sparse_tantivy_from_canonical_db_before_scanning_ne
     );
     tracker.flush();
 }
+
+/// R1-W3-B7 (2026-09-02 W3 PR round-1 review, task book #68): `--rerank`
+/// requesting a reranker that cannot actually be constructed used to be a
+/// silent, deterministic no-op -- `Ok`, unmodified results, and (outside a
+/// `!use_daemon`-gated `tracing::debug!`) not even a log line. This
+/// build's local cross-encoder reranker (`FastEmbedReranker`) is a
+/// *permanent* stub (`src/search/fastembed_reranker.rs`'s `load_from_dir`
+/// always returns `RerankerError::RerankerUnavailable`, by design,
+/// cass#256), and no `--daemon`/Infinity rerank is configured here, so
+/// `--rerank` on this CLI invocation deterministically hits the
+/// no-reranker-available branch every time -- no mocking needed to
+/// exercise it.
+#[test]
+#[serial]
+fn rerank_flag_with_no_reranker_available_reports_dishonest_success_as_fixed() {
+    let tracker = tracker_for("rerank_flag_with_no_reranker_available_reports_dishonest_success_as_fixed");
+    let _trace_guard = tracker.trace_env_guard();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let home = tmp.path();
+    let codex_home = home.to_path_buf();
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
+    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+
+    make_codex_session(
+        &codex_home,
+        "2024/11/20",
+        "rollout-rerank-noop.jsonl",
+        "b7_rerank_noop_fixture_token",
+        1_732_118_400_000u64,
+    );
+
+    cargo_bin_cmd!("cass")
+        .args(["index", "--full", "--data-dir"])
+        .arg(&data_dir)
+        .current_dir(home)
+        .env("CODEX_HOME", &codex_home)
+        .env("HOME", home)
+        .assert()
+        .success();
+
+    // Human-mode invocation (no --json/--robot/--robot-meta): robot/quiet
+    // modes pin the tracing filter to `error` by design (CLI stdout/stderr
+    // hygiene, `robot_aware_log_directive` in src/lib.rs) so a `warn!`
+    // would never reach a robot caller's stderr regardless of this fix --
+    // the warning is specifically for a human watching the terminal, and
+    // this invocation is where it must actually show up.
+    let human_output = cargo_bin_cmd!("cass")
+        .args(["search", "b7_rerank_noop_fixture_token", "--rerank", "--data-dir"])
+        .arg(&data_dir)
+        .current_dir(home)
+        .env("CODEX_HOME", &codex_home)
+        .env("HOME", home)
+        .output()
+        .expect("human-mode search --rerank with no reranker available");
+    assert!(
+        human_output.status.success(),
+        "search --rerank must still succeed (returning unreranked results), not error out\nstderr:\n{}",
+        String::from_utf8_lossy(&human_output.stderr)
+    );
+    let human_stderr = String::from_utf8_lossy(&human_output.stderr);
+    assert!(
+        human_stderr.contains("--rerank requested but no reranker is available"),
+        "must warn loudly (not just a debug-level, easily-missed log line) that --rerank was a \
+         no-op\nstderr:\n{human_stderr}"
+    );
+
+    // Robot-mode invocation: the machine-readable channel (`_meta.
+    // rerank_applied`) a caller that never inspects logs actually gets --
+    // this is the field the CLI hygiene policy above makes necessary in
+    // the first place.
+    let robot_output = cargo_bin_cmd!("cass")
+        .args([
+            "search",
+            "b7_rerank_noop_fixture_token",
+            "--rerank",
+            "--json",
+            "--robot-meta",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .current_dir(home)
+        .env("CODEX_HOME", &codex_home)
+        .env("HOME", home)
+        .output()
+        .expect("robot-mode search --rerank with no reranker available");
+    assert!(
+        robot_output.status.success(),
+        "search --rerank --json must still succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&robot_output.stderr)
+    );
+
+    let payload: serde_json::Value =
+        serde_json::from_slice(&robot_output.stdout).expect("search --json output must parse as JSON");
+    let rerank_applied = payload
+        .get("_meta")
+        .and_then(|meta| meta.get("rerank_applied"))
+        .and_then(serde_json::Value::as_bool)
+        .expect("_meta.rerank_applied must be present and boolean");
+    assert!(
+        !rerank_applied,
+        "rerank_applied must honestly report false when no reranker could be constructed: {payload}"
+    );
+
+    tracker.flush();
+}

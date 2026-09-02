@@ -23458,6 +23458,16 @@ fn run_cli_search(
 
     // Apply reranking if enabled (bd-2t2d)
     let rerank_start = Instant::now();
+    // R1-W3-B7: tracks whether reranking was *actually* applied to `result`
+    // below, independent of whether it was requested. `--rerank` requested
+    // with no reranker available (the local cross-encoder is a permanent
+    // stub in this build, cass#256; daemon rerank unconfigured or
+    // unreachable) used to be an indistinguishable, deterministic no-op --
+    // `Ok(())`, unmodified results, and (outside `!use_daemon`-gated
+    // `tracing::debug!`) not even a log line. Threaded into
+    // `output_robot_results` below as `rerank_applied` so a caller that
+    // never inspects logs still gets an honest answer.
+    let mut rerank_applied = false;
     let result = if semantic_opts.rerank && !result.hits.is_empty() {
         use crate::search::fastembed_reranker::FastEmbedReranker;
         use crate::search::reranker::{Reranker, rerank_texts};
@@ -23566,6 +23576,7 @@ fn run_cli_search(
                             hits_reranked = scored_hits.len(),
                             "Reranking complete"
                         );
+                        rerank_applied = true;
 
                         crate::search::query::SearchResult {
                             hits: scored_hits,
@@ -23585,6 +23596,19 @@ fn run_cli_search(
                 }
             }
         } else {
+            // R1-W3-B7: `--rerank` was requested but no reranker at all
+            // could be constructed (permanent local stub + daemon
+            // unconfigured/unreachable) -- previously a fully silent,
+            // deterministic no-op outside a `!use_daemon`-gated
+            // `tracing::debug!`. Warn unconditionally at a level visible
+            // under default log settings; `rerank_applied=false` in the
+            // output (below) carries the same fact to a caller that never
+            // inspects logs.
+            tracing::warn!(
+                "--rerank requested but no reranker is available (local cross-encoder is a \
+                 permanent stub in this build, cass#256; daemon rerank is unconfigured or \
+                 unreachable); returning unreranked results"
+            );
             result
         }
     } else {
@@ -23845,6 +23869,7 @@ fn run_cli_search(
             mode_meta,
             search_ms,
             rerank_ms,
+            rerank_applied,
         )?;
     } else if display_result.hits.is_empty() {
         eprintln!("No results found.");
@@ -25923,6 +25948,14 @@ fn output_robot_results(
     search_mode_meta: SearchModeMeta,
     search_ms: u64,
     rerank_ms: u64,
+    // R1-W3-B7: whether reranking actually changed `result`'s hit order --
+    // `false` covers both "never requested" and "requested but no
+    // reranker was available", same convention as `rerank_ms` (0 covers
+    // both cases too). Distinguishing those two `false` cases is what the
+    // `tracing::warn!` at the call site is for; this field's job is only
+    // to make the fact machine-readable for callers that never look at
+    // logs.
+    rerank_applied: bool,
 ) -> CliResult<()> {
     use std::io::{BufWriter, Write};
 
@@ -26476,6 +26509,12 @@ fn output_robot_results(
                         "rerank_ms": rerank_ms,
                         "other_ms": elapsed_ms.saturating_sub(search_ms).saturating_sub(rerank_ms),
                     },
+                    // R1-W3-B7: honest signal for a caller that never
+                    // inspects logs -- false whenever `--rerank` was
+                    // never requested, or was requested but no reranker
+                    // could be constructed (see the `tracing::warn!` at
+                    // the rerank call site for why, in the latter case).
+                    "rerank_applied": rerank_applied,
                     "tokens_estimated": tokens_estimated,
                     "max_tokens": max_tokens,
                     "request_id": request_id,
@@ -82209,6 +82248,10 @@ fn response_schema_search_meta() -> serde_json::Value {
         ("cursor_manifest", response_schema_cursor_manifest()),
         ("explanation_cards", response_schema_explanation_cards()),
         ("timing", response_schema_search_timing()),
+        (
+            "rerank_applied",
+            serde_json::json!({ "type": "boolean" }),
+        ),
         (
             "tokens_estimated",
             serde_json::json!({ "type": ["integer", "null"] }),
