@@ -23323,7 +23323,9 @@ pub fn run_tui_ftui(
                     );
                     let mut indexes =
                         Vec::with_capacity(context.additional_indexes.len().saturating_add(1));
-                    indexes.push(context.index);
+                    if let Some(index) = context.index {
+                        indexes.push(index);
+                    }
                     indexes.extend(context.additional_indexes);
                     if let Err(err) = client.set_semantic_indexes_context(
                         context.embedder,

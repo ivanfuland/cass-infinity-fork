@@ -23258,8 +23258,14 @@ fn run_cli_search(
                     .join(crate::search::vector_index::VECTOR_INDEX_DIR)
                     .join(format!("hnsw-{}.chsw", embedder.id())),
             );
+            // W3-4 Step2-1 (task book #62): `index` is `None` for a
+            // DB-vector-domain-only context (no legacy .fsvi file for
+            // this embedder) -- `set_semantic_indexes_context` now
+            // accepts zero indexes for exactly that case.
             let mut indexes = Vec::with_capacity(additional_indexes.len().saturating_add(1));
-            indexes.push(index);
+            if let Some(index) = index {
+                indexes.push(index);
+            }
             indexes.extend(additional_indexes);
             if let Err(err) =
                 client.set_semantic_indexes_context(embedder, indexes, filter_maps, roles, ann_path)

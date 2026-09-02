@@ -693,7 +693,7 @@ pub(crate) fn inspect_semantic_assets(
     }
 
     let availability = match preference {
-        SemanticPreference::DefaultModel => probe_semantic_availability(data_dir),
+        SemanticPreference::DefaultModel => probe_semantic_availability(data_dir, db_path),
         SemanticPreference::HashFallback => probe_hash_semantic_availability(data_dir),
     };
     semantic_state_from_availability(data_dir, &availability, preference, current_db_fingerprint)

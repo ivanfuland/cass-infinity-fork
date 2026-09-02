@@ -272,7 +272,12 @@ impl SemanticAvailability {
 
 pub struct SemanticContext {
     pub embedder: Arc<dyn Embedder>,
-    pub index: VectorIndex,
+    /// `None` for a DB-vector-domain-only context (W3-4 Step2-1, task
+    /// book #62): no legacy `.fsvi` file exists for this embedder, and
+    /// none is required -- `search_db_vector_domain` is the default
+    /// candidate-fetch path and never reads this field.
+    /// `SearchClient::set_semantic_indexes_context` accepts `None` here.
+    pub index: Option<VectorIndex>,
     pub additional_indexes: Vec<VectorIndex>,
     pub filter_maps: SemanticFilterMaps,
     pub roles: Option<HashSet<u8>>,
@@ -461,14 +466,94 @@ pub fn load_semantic_context_for_embedder(
 /// Probe semantic availability without loading the embedder, vector index, or
 /// DB-backed filter maps. Status/health surfaces use this to report readiness
 /// cheaply; actual semantic search still calls `load_semantic_context`.
-pub(crate) fn probe_semantic_availability(data_dir: &Path) -> SemanticAvailability {
-    probe_semantic_availability_for_embedder(data_dir, active_policy_embedder_name())
+pub(crate) fn probe_semantic_availability(data_dir: &Path, db_path: &Path) -> SemanticAvailability {
+    probe_semantic_availability_for_embedder(data_dir, db_path, active_policy_embedder_name())
+}
+
+/// `true` for the Infinity-served embedder's own names (`bge-m3`/`infinity`
+/// -- the same pair `lib.rs`'s CLI dispatch matches on to route to
+/// [`load_infinity_semantic_context`]). Every other name is a FastEmbed
+/// model.
+fn is_infinity_embedder_name(embedder_name: &str) -> bool {
+    matches!(embedder_name, "bge-m3" | "infinity")
+}
+
+/// `CASS_SEMANTIC_USE_FSVI=1` (or `true`/`yes`/`on`) forces the legacy
+/// filesystem-vector-index (`.fsvi`) path for the Infinity/bge-m3 embedder
+/// instead of DB-vector-domain awareness (W3-4 Step2-1, task book #62).
+/// Shared with `query.rs`'s own candidate-fetch dispatch (same env var,
+/// same accepted values) so the two layers can never disagree about which
+/// mode is active for a given process.
+pub(crate) fn semantic_use_fsvi_escape_hatch() -> bool {
+    matches!(
+        dotenvy::var("CASS_SEMANTIC_USE_FSVI").ok().as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
+}
+
+/// DB-vector-domain-aware availability probe (W3-4 Step2-1): reads
+/// `embedding_generations` directly instead of the legacy `.fsvi`
+/// file-existence short-circuit. w3-d7① three-state contract:
+/// `is_active=1 && audit_status='passed'` -> `Ready`; a generation exists
+/// but isn't certified/active yet (no active row with any row present, or
+/// an active row that hasn't passed its W3-4 activation audit) ->
+/// `IndexBuilding`; no generation at all -> `IndexMissing` (this domain's
+/// "absent" -- reusing the existing variant rather than adding a new one
+/// the enum's other consumers would all need to learn about).
+fn probe_db_vector_domain_availability(db_path: &Path) -> SemanticAvailability {
+    let storage = match FrankenStorage::open_readonly(db_path) {
+        Ok(storage) => storage,
+        Err(err) => {
+            return SemanticAvailability::DatabaseUnavailable {
+                db_path: db_path.to_path_buf(),
+                error: err.to_string(),
+            };
+        }
+    };
+    let conn = storage.raw();
+    let active: Option<(String, String)> = conn
+        .query_opt_map(
+            "SELECT embedder_id, audit_status FROM embedding_generations WHERE is_active = 1",
+            &[],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+        )
+        .unwrap_or(None);
+    if let Some((embedder_id, audit_status)) = active {
+        return if audit_status == "passed" {
+            SemanticAvailability::Ready { embedder_id }
+        } else {
+            SemanticAvailability::IndexBuilding {
+                embedder_id,
+                progress_pct: None,
+                items_indexed: 0,
+                total_items: 0,
+            }
+        };
+    }
+
+    let any_generation: i64 = conn
+        .query_row_map("SELECT COUNT(*) FROM embedding_generations", &[], |row| row.get_typed(0))
+        .unwrap_or(0);
+    if any_generation > 0 {
+        return SemanticAvailability::IndexBuilding {
+            embedder_id: String::new(),
+            progress_pct: None,
+            items_indexed: 0,
+            total_items: 0,
+        };
+    }
+
+    SemanticAvailability::IndexMissing { index_path: db_path.to_path_buf() }
 }
 
 pub(crate) fn probe_semantic_availability_for_embedder(
     data_dir: &Path,
+    db_path: &Path,
     embedder_name: &str,
 ) -> SemanticAvailability {
+    if is_infinity_embedder_name(embedder_name) && !semantic_use_fsvi_escape_hatch() {
+        return probe_db_vector_domain_availability(db_path);
+    }
     let canonical_name = FastEmbedder::canonical_name(embedder_name).unwrap_or("minilm");
     let Some(config) = FastEmbedder::config_for(canonical_name) else {
         return SemanticAvailability::LoadFailed {
@@ -586,7 +671,7 @@ pub fn load_hash_semantic_context(data_dir: &Path, db_path: &Path) -> SemanticSe
         availability: SemanticAvailability::HashFallback,
         context: Some(SemanticContext {
             embedder,
-            index,
+            index: Some(index),
             additional_indexes,
             filter_maps,
             roles,
@@ -614,6 +699,56 @@ pub fn load_infinity_semantic_context(data_dir: &Path, db_path: &Path) -> Semant
         }
     };
     let embedder_id = embedder.id().to_string();
+
+    // W3-4 Step2-1 (task book #62): DB-vector-domain awareness is
+    // authoritative by default -- a cold library that only ever wrote
+    // the DB vector domain (no legacy `.fsvi` file for this embedder)
+    // must not be gated on file existence here. `CASS_SEMANTIC_USE_FSVI`
+    // is the one escape hatch that still takes the pre-W3-4 fsvi-only
+    // path below, unchanged, for the W3-3..W3-5 coexistence window.
+    let use_fsvi = semantic_use_fsvi_escape_hatch();
+    if !use_fsvi {
+        return match probe_db_vector_domain_availability(db_path) {
+            SemanticAvailability::Ready { embedder_id } => {
+                let storage = match FrankenStorage::open_readonly(db_path) {
+                    Ok(storage) => storage,
+                    Err(err) => {
+                        return SemanticSetup {
+                            availability: SemanticAvailability::DatabaseUnavailable {
+                                db_path: db_path.to_path_buf(),
+                                error: err.to_string(),
+                            },
+                            context: None,
+                        };
+                    }
+                };
+                let filter_maps = match SemanticFilterMaps::from_storage(&storage) {
+                    Ok(maps) => maps,
+                    Err(err) => {
+                        return SemanticSetup {
+                            availability: SemanticAvailability::LoadFailed {
+                                context: format!("filter maps: {err}"),
+                            },
+                            context: None,
+                        };
+                    }
+                };
+                let roles = Some(HashSet::from([ROLE_USER, ROLE_ASSISTANT]));
+                SemanticSetup {
+                    availability: SemanticAvailability::Ready { embedder_id },
+                    context: Some(SemanticContext {
+                        embedder: Arc::new(embedder) as Arc<dyn Embedder>,
+                        index: None,
+                        additional_indexes: Vec::new(),
+                        filter_maps,
+                        roles,
+                    }),
+                }
+            }
+            other => SemanticSetup { availability: other, context: None },
+        };
+    }
+
     let index_path = vector_index_path(data_dir, &embedder_id);
     let monolithic_present = index_path.is_file();
     let shard_indexes = if monolithic_present
@@ -684,7 +819,7 @@ pub fn load_infinity_semantic_context(data_dir: &Path, db_path: &Path) -> Semant
         availability: SemanticAvailability::Ready { embedder_id },
         context: Some(SemanticContext {
             embedder,
-            index,
+            index: Some(index),
             additional_indexes,
             filter_maps,
             roles,
@@ -823,7 +958,7 @@ fn load_semantic_context_inner(
         },
         context: Some(SemanticContext {
             embedder,
-            index,
+            index: Some(index),
             additional_indexes,
             filter_maps,
             roles,
@@ -1324,12 +1459,65 @@ mod tests {
             1,
             "complete current shards must not be shadowed by an older monolithic vector file"
         );
-        let loaded_records = context.index.record_count()
+        let loaded_records = context
+            .index
+            .as_ref()
+            .expect("hash loader always populates a real fsvi index")
+            .record_count()
             + context
                 .additional_indexes
                 .iter()
                 .map(VectorIndex::record_count)
                 .sum::<usize>();
         assert_eq!(loaded_records, 2);
+    }
+
+    // W3-4 Step2-1 (task book #62): the "no向量域" leg of the three-state
+    // contract -- a library with a real, freshly-`schema::ensure`d
+    // database but zero `embedding_generations` rows must report the
+    // structured `IndexMissing` ("absent") availability, not error out,
+    // not silently scan, and not need a real fsvi file to reach that
+    // verdict.
+    fn empty_db(dir: &std::path::Path) -> PathBuf {
+        let db_path = dir.join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).expect("open production storage");
+        storage.close().unwrap();
+        db_path
+    }
+
+    #[test]
+    fn probe_db_vector_domain_availability_reports_absent_for_a_library_with_no_generations() {
+        let dir = tempdir().unwrap();
+        let db_path = empty_db(dir.path());
+        let availability = probe_db_vector_domain_availability(&db_path);
+        assert!(
+            matches!(availability, SemanticAvailability::IndexMissing { .. }),
+            "expected IndexMissing (absent), got {availability:?}"
+        );
+    }
+
+    #[test]
+    fn probe_semantic_availability_for_embedder_reports_absent_for_bge_m3_on_an_empty_library() {
+        let dir = tempdir().unwrap();
+        let db_path = empty_db(dir.path());
+        let availability = probe_semantic_availability_for_embedder(dir.path(), &db_path, "bge-m3");
+        assert!(
+            matches!(availability, SemanticAvailability::IndexMissing { .. }),
+            "expected IndexMissing (absent), got {availability:?}"
+        );
+    }
+
+    #[cfg(feature = "infinity")]
+    #[test]
+    fn load_infinity_semantic_context_reports_absent_structured_error_for_an_empty_library() {
+        let dir = tempdir().unwrap();
+        let db_path = empty_db(dir.path());
+        let setup = load_infinity_semantic_context(dir.path(), &db_path);
+        assert!(setup.context.is_none(), "an absent domain must never hand back a context");
+        assert!(
+            matches!(setup.availability, SemanticAvailability::IndexMissing { .. }),
+            "expected IndexMissing (absent), got {:?}",
+            setup.availability
+        );
     }
 }

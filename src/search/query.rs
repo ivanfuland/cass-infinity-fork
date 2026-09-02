@@ -2246,7 +2246,13 @@ fn open_fs_semantic_ann_index(fs_index: &FsVectorIndex, ann_path: &Path) -> Resu
 struct SemanticSearchState {
     context_token: Arc<()>,
     embedder: Arc<dyn Embedder>,
-    fs_semantic_index: Arc<FsVectorIndex>,
+    /// `None` when this state has no legacy fsvi backing at all (W3-4
+    /// Step2-1: a DB-vector-domain-only generation, no `.fsvi` file ever
+    /// written for this embedder). Every consumer that genuinely needs a
+    /// real fsvi file (the `CASS_SEMANTIC_USE_FSVI` escape hatch, HNSW
+    /// ANN, progressive two-tier refinement) reports its own
+    /// unavailability rather than panicking on `None`.
+    fs_semantic_index: Option<Arc<FsVectorIndex>>,
     fs_semantic_indexes: Arc<Vec<Arc<FsVectorIndex>>>,
     fs_ann_index: Option<Arc<FsHnswIndex>>,
     ann_path: Option<PathBuf>,
@@ -2296,7 +2302,6 @@ struct ProgressiveTwoTierContext {
 
 #[derive(Clone)]
 struct SemanticCandidateContext {
-    fs_semantic_index: Arc<FsVectorIndex>,
     fs_semantic_indexes: Arc<Vec<Arc<FsVectorIndex>>>,
     filter_maps: SemanticFilterMaps,
     roles: Option<HashSet<u8>>,
@@ -3748,10 +3753,15 @@ impl SearchClient {
         roles: Option<HashSet<u8>>,
         ann_path: Option<PathBuf>,
     ) -> Result<()> {
-        if fs_semantic_indexes.is_empty() {
-            bail!("semantic context requires at least one vector index");
-        }
-
+        // W3-4 Step2-1 (task book #62): a DB-vector-domain-backed loader
+        // (no legacy .fsvi file for this embedder) hands in zero indexes
+        // here -- that is no longer an error. `embedder_id`/`dimension`
+        // then come straight from `embedder` itself (it always carries
+        // both) rather than being read off a `VectorIndex`, since there
+        // may be none. Any real fsvi index still goes through the exact
+        // same per-index embedder/dimension cross-check as before (this
+        // path's behavior is unchanged whenever a real .fsvi file backs
+        // the call -- w3-4 Step2-1 constraint②).
         let fs_semantic_indexes = fs_semantic_indexes
             .into_iter()
             .map(|index| {
@@ -3774,11 +3784,13 @@ impl SearchClient {
                 Ok(Arc::new(index))
             })
             .collect::<Result<Vec<_>>>()?;
-        let fs_semantic_index = Arc::clone(&fs_semantic_indexes[0]);
+        let fs_semantic_index = fs_semantic_indexes.first().cloned();
         let shard_count = fs_semantic_indexes.len();
         let ann_path = if shard_count == 1 { ann_path } else { None };
-        let embedder_id = fs_semantic_index.embedder_id().to_string();
-        let dimension = fs_semantic_index.dimension();
+        let embedder_id = fs_semantic_index
+            .as_ref()
+            .map_or_else(|| embedder.id().to_string(), |index| index.embedder_id().to_string());
+        let dimension = fs_semantic_index.as_ref().map_or_else(|| embedder.dimension(), |index| index.dimension());
         let fs_semantic_indexes = Arc::new(fs_semantic_indexes);
 
         let capacity = NonZeroUsize::new(100).ok_or_else(|| anyhow!("invalid cache size"))?;
@@ -3978,7 +3990,13 @@ impl SearchClient {
                         "approximate search unavailable: HNSW index missing (run 'cass index --semantic --build-hnsw')"
                     )
                 })?;
-                (ann_path, Arc::clone(&state.fs_semantic_index))
+                let fs_semantic_index = state.fs_semantic_index.clone().ok_or_else(|| {
+                    anyhow!(
+                        "approximate search unavailable: no fsvi index backs this semantic domain \
+                         (this generation is DB-vector-domain-only; HNSW ANN requires a legacy .fsvi file)"
+                    )
+                })?;
+                (ann_path, fs_semantic_index)
             };
 
             let ann = Arc::new(open_fs_semantic_ann_index(
@@ -3997,7 +4015,7 @@ impl SearchClient {
                 return Ok(Arc::clone(existing));
             }
             if state.ann_path.as_ref() != Some(&ann_path)
-                || !Arc::ptr_eq(&state.fs_semantic_index, &fs_semantic_index)
+                || !state.fs_semantic_index.as_ref().is_some_and(|current| Arc::ptr_eq(current, &fs_semantic_index))
             {
                 continue;
             }
@@ -4378,10 +4396,15 @@ impl SearchClient {
         fs_filter: Option<&dyn FsSearchFilter>,
     ) -> Result<(Vec<VectorSearchResult>, SemanticCandidateRetryState)> {
         if context.fs_semantic_indexes.len() == 1 {
-            let record_count = context.fs_semantic_index.record_count();
+            // `fs_semantic_indexes.len() == 1` already guarantees a real
+            // fsvi index -- index off the authoritative Vec rather than
+            // the convenience singular field (`Option` since W3-4
+            // Step2-1: it's `None` on a DB-vector-domain-only context,
+            // which never reaches this escape-hatch-only function).
+            let fs_semantic_index = &context.fs_semantic_indexes[0];
+            let record_count = fs_semantic_index.record_count();
             let candidate_limit = Self::semantic_exact_candidate_limit(fetch_limit, record_count);
-            let fs_hits = context
-                .fs_semantic_index
+            let fs_hits = fs_semantic_index
                 .search_top_k(embedding, candidate_limit, fs_filter)
                 .map_err(|err| anyhow!("frankensearch semantic search failed: {err}"))?;
             let mut best_by_message = HashMap::with_capacity(fs_hits.len());
@@ -4638,10 +4661,11 @@ impl SearchClient {
     /// W3-5 co-existence window; it and this whole branch are removed in
     /// W3-5 alongside fsvi retirement.
     fn semantic_use_fsvi_escape_hatch() -> bool {
-        matches!(
-            dotenvy::var("CASS_SEMANTIC_USE_FSVI").ok().as_deref(),
-            Some("1") | Some("true") | Some("yes") | Some("on")
-        )
+        // W3-4 Step2-1 (task book #62): single source of truth shared
+        // with `model_manager.rs`'s own loader-time check for the same
+        // env var -- the loader and this per-query dispatch must never
+        // disagree about which mode a process is running in.
+        crate::search::model_manager::semantic_use_fsvi_escape_hatch()
     }
 
     /// Dispatches a semantic candidate fetch to either the DB vector domain
@@ -5752,7 +5776,6 @@ impl SearchClient {
                     })?;
                     (
                         SemanticCandidateContext {
-                            fs_semantic_index: Arc::clone(&state.fs_semantic_index),
                             fs_semantic_indexes: Arc::clone(&state.fs_semantic_indexes),
                             filter_maps: state.filter_maps.clone(),
                             roles: state.roles.clone(),
