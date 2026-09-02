@@ -2984,7 +2984,6 @@ Update check state is stored in the data directory:
 |------------|-----------------|
 | `franken-agent-detection` | `6be142d` (fork: ivanfuland/my_franken_agent_detection, fix/codex-legacy-token-count-shape) |
 | `asupersync` | `=0.3.5` |
-| `frankensearch` | `2cad158f` (`hash`, `ann` features -- `lexical` dropped w2 Task W2-6: it pulled in tantivy, the source dependency of cass's now-retired tantivy-backed search engine) |
 | `frankentui` | `5f78cfa0` |
 | `toon` (`tru`) | `5669b72a` |
 | `rusqlite` | `0.39.0` (crates.io; `bundled,modern_sqlite` features — w1b Stage B production SQLite backend; `bundled` links and pins its own libsqlite3 build for reproducibility, not build.rs-guarded like the sibling forks above since it carries no git revision to drift) |
@@ -2997,7 +2996,6 @@ Update check state is stored in the data directory:
 
 **Expected interface contract**
 - `franken-agent-detection`: `AgentDetectOptions` and `detect_installed_agents(...)`.
-- `frankensearch`: `ModelCategory` and `ModelTier` (the `lexical::*` surface retired with w2 Task W2-6's tantivy engine removal).
 - `frankentui`: `ftui::Frame`, `GraphemePool`, `Style`, `ftui-runtime`, `ftui-tty`, and the `ftui-extras` features enabled by cass.
 - `asupersync`: `runtime::RuntimeBuilder` and `http::h1::HttpClient::builder()`.
 - `toon` (`tru`): `toon::encode(...)`.

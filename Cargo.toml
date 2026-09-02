@@ -91,21 +91,13 @@ bytemuck = "1.25.0"
 # with STATUS_ILLEGAL_INSTRUCTION (#256). The `semantic` feature gate
 # below carries this dep so we can ship a `-baseline` artifact without it.
 fastembed = { version = "5.13.4", default-features = false, features = ["ort-download-binaries-rustls-tls"], optional = true }
-# `frankensearch/fastembed-reranker` pulls in the same `fastembed` crate
-# transitively (via `frankensearch-rerank`), so it must be gated by the
-# same `semantic` feature for the baseline build to be ORT-free.
-# W2-6 Task2: "lexical" dropped -- it pulled in tantivy, the source of the
-# retired tantivy-backed search engine (search::tantivy). "hash"/"ann" stay:
-# wave-3 W3-2's migrator still reads .fsvi via frankensearch (R2-X2 ordering
-# constraint), and hash is the always-on fallback embedder path.
-frankensearch = { version = "0.3.2", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "2cad158f4468ece7076e3fe529c8e5c20b2e020e", default-features = false, features = ["hash", "ann"] }
 # w3 Task W3-3 (spec 3.4 D4, KU2 basis: probe/sqlite-vec-eval @969c29b9, real
 # 101.6万x1024 bge-m3 corpus) -- vec0 KNN over message_embeddings. Pinned to
 # the last stable release, not the newest crates.io publish: v0.1.10-alpha.4
 # ships a broken tarball missing sqlite-vec-diskann.c and fails to compile.
 sqlite-vec = "=0.1.9"
 franken-agent-detection = { version = "0.1.9", git = "https://github.com/ivanfuland/my_franken_agent_detection", rev = "6be142d9e6ccb1c9a1dc27a986f6e30ed151d71a", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "hermes"] }
-ahash = "0.8.12"  # W3-5: hasher for the verbatim-restored RRF fusion hot map (was a transitive frankensearch-fusion dep)
+ahash = "0.8.12"  # W3-5: hasher for the verbatim-restored RRF fusion hot map (was a transitive upstream-fusion dep)
 wide = "1.4.0"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "0.7.6"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization
 bloomfilter = "3.0.1"  # Probabilistic membership testing for P2 Opt 3.3: Workspace Cache
@@ -162,14 +154,17 @@ backtrace = []
 # `--no-default-features --features qr,encryption,infinity` for an ORT-free yet
 # semantic-capable (and Chinese-capable) build.
 infinity = []
-# `semantic` enables ONNX-runtime-backed embedding/reranking via fastembed +
-# frankensearch/fastembed-reranker. Disabling it (e.g. via `--no-default-features
-# --features qr,encryption`) builds the `-baseline` artifact that does not pull
-# in the prebuilt Microsoft ONNX Runtime binary, so pre-AVX2 CPUs no longer
-# crash with STATUS_ILLEGAL_INSTRUCTION at static init (cass#256). Semantic
-# search modes return a clear error in baseline builds; lexical search and
-# all other functionality remain fully available.
-semantic = ["dep:fastembed", "frankensearch/fastembed-reranker"]
+# `semantic` enables ONNX-runtime-backed embedding via fastembed. Disabling
+# it (e.g. via `--no-default-features --features qr,encryption`) builds the
+# `-baseline` artifact that does not pull in the prebuilt Microsoft ONNX
+# Runtime binary, so pre-AVX2 CPUs no longer crash with
+# STATUS_ILLEGAL_INSTRUCTION at static init (cass#256). Semantic search modes
+# return a clear error in baseline builds; lexical search and all other
+# functionality remain fully available. W3-5: the cross-encoder reranker
+# (`search::fastembed_reranker`) is an unconditional stub regardless of this
+# feature now that its upstream backing dependency is retired -- see that
+# module's doc comment.
+semantic = ["dep:fastembed"]
 # Opt-in: upgrade sibling repo rev/worktree drift from warning to hard error and
 # validate the optional /data/projects path checkouts before enabling local overrides.
 strict-path-dep-validation = []
@@ -226,8 +221,8 @@ debug = "line-tables-only"
 strip = false
 
 # The dependency graph is pinned to the asupersync 0.3.x line. Keep
-# frankensearch and franken-agent-detection revs aligned so Cargo.lock does
-# not reintroduce a parallel asupersync 0.2.x stack.
+# franken-agent-detection's rev aligned so Cargo.lock does not reintroduce
+# a parallel asupersync 0.2.x stack.
 #
 # If you need to build against a local checkout of asupersync (sibling
 # at ../asupersync) during runtime-level hacking, add the following
@@ -255,17 +250,6 @@ strip = false
 # [patch."https://github.com/Dicklesworthstone/franken_agent_detection"]
 # franken-agent-detection = { path = "../franken_agent_detection" }
 #
-# Enable strict validation before uncommenting any additional sibling path overrides:
-# cargo check --features strict-path-dep-validation
-# [patch."https://github.com/Dicklesworthstone/frankensearch"]
-# frankensearch = { path = "../frankensearch/frankensearch" }
-# frankensearch-core = { path = "../frankensearch/crates/frankensearch-core" }
-# frankensearch-index = { path = "../frankensearch/crates/frankensearch-index" }
-# frankensearch-embed = { path = "../frankensearch/crates/frankensearch-embed" }
-# frankensearch-fusion = { path = "../frankensearch/crates/frankensearch-fusion" }
-# frankensearch-lexical = { path = "../frankensearch/crates/frankensearch-lexical" }
-# frankensearch-rerank = { path = "../frankensearch/crates/frankensearch-rerank" }
-
 [workspace.metadata.dist]
 targets = ["x86_64-unknown-linux-gnu"]
 installers = ["shell", "powershell"]

@@ -517,14 +517,6 @@ fn test_path_dependency_compile_contracts() {
         ..Default::default()
     };
 
-    // W2-6 Task丙②: cass no longer depends on frankensearch's `lexical`
-    // feature (Tantivy retired in favor of sqlite-fts5), so this contract no
-    // longer pins that surface.
-    assert_eq!(
-        frankensearch::ModelCategory::HashEmbedder.default_tier(),
-        frankensearch::ModelTier::Fast
-    );
-
     let mut pool = ftui::GraphemePool::new();
     let mut frame = ftui::Frame::new(8, 4, &mut pool);
     frame.set_degradation(ftui::render::budget::DegradationLevel::Full);
