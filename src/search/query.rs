@@ -1,14 +1,9 @@
 use anyhow::{Context, Result, anyhow, bail};
 use frankensearch::{
-    Cx as FsCx, InMemoryTwoTierIndex as FsInMemoryTwoTierIndex,
-    InMemoryVectorIndex as FsInMemoryVectorIndex, LexicalSearch as FsLexicalSearch,
     QueryClass as FsQueryClass, RrfConfig as FsRrfConfig, ScoreSource as FsScoreSource,
-    ScoredResult as FsScoredResult, SearchError as FsSearchError, SearchFuture as FsSearchFuture,
-    SearchPhase as FsSearchPhase, SyncEmbedderAdapter as FsSyncEmbedderAdapter,
-    TwoTierConfig as FsTwoTierConfig, TwoTierIndex as FsTwoTierIndex,
-    TwoTierSearcher as FsTwoTierSearcher, VectorHit as FsVectorHit,
+    ScoredResult as FsScoredResult, VectorHit as FsVectorHit,
     candidate_count as fs_candidate_count,
-    index::{HnswIndex as FsHnswIndex, VectorIndex as FsVectorIndex},
+    index::VectorIndex as FsVectorIndex,
     rrf_fuse as fs_rrf_fuse,
 };
 use lru::LruCache;
@@ -441,12 +436,7 @@ fn semantic_message_id_from_db(message_id: i64) -> std::io::Result<u64> {
     u64::try_from(message_id).map_err(|_| std::io::Error::other("negative message_id"))
 }
 
-fn semantic_doc_component_id_from_db(raw: Option<i64>) -> u32 {
-    raw.map(|value| u32::try_from(value.max(0)).unwrap_or(u32::MAX))
-        .unwrap_or(0)
-}
-
-use crate::search::canonicalize::{canonicalize_for_embedding, content_hash, is_search_noise_text};
+use crate::search::canonicalize::{canonicalize_for_embedding, is_search_noise_text};
 use crate::search::embedder::Embedder;
 use crate::search::lexical_rerank::{self, FieldAvgdl, RerankCandidate};
 use crate::search::vector_index::{
@@ -606,44 +596,6 @@ impl SearchMode {
     }
 }
 
-/// Execution strategy for semantic search.
-///
-/// `Single` preserves existing exact vector behavior.
-/// Other modes attempt to use frankensearch's sync two-tier searcher when a
-/// compatible in-memory two-tier index is available; otherwise they fall back
-/// to `Single`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SemanticTierMode {
-    #[default]
-    Single,
-    Progressive,
-    FastOnly,
-    QualityOnly,
-}
-
-impl SemanticTierMode {
-    const fn wants_two_tier(self) -> bool {
-        !matches!(self, Self::Single)
-    }
-
-    fn to_frankensearch_config(self) -> FsTwoTierConfig {
-        let mut config = frankensearch_two_tier_config();
-        match self {
-            Self::Single | Self::Progressive => {}
-            Self::FastOnly => {
-                config.fast_only = true;
-            }
-            Self::QualityOnly => {
-                config.fast_only = false;
-                config.quality_weight = 1.0;
-            }
-        }
-        config
-    }
-}
-
-const PROGRESSIVE_EMBEDDING_CACHE_CAPACITY: usize = 64;
 const HYBRID_NO_LIMIT_PLANNING_WINDOW: usize = 64;
 const HYBRID_NO_LIMIT_SEMANTIC_CAP: usize = 2048;
 
@@ -753,19 +705,6 @@ fn no_limit_available_memory_budget(available_bytes: Option<u64>) -> Option<u64>
     available_bytes.map(|avail| {
         (avail / NO_LIMIT_RAM_DIVISOR).clamp(NO_LIMIT_BYTES_FLOOR, NO_LIMIT_BYTES_CEILING)
     })
-}
-
-static FRANKENSEARCH_TWO_TIER_CONFIG: Lazy<FsTwoTierConfig> =
-    Lazy::new(|| FsTwoTierConfig::optimized().with_env_overrides());
-
-fn frankensearch_two_tier_config() -> FsTwoTierConfig {
-    FRANKENSEARCH_TWO_TIER_CONFIG.clone()
-}
-
-#[inline]
-const fn progressive_phase_fetch_limit(limit: usize) -> usize {
-    let limit = if limit == 0 { 1 } else { limit };
-    limit.saturating_mul(3)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1604,39 +1543,6 @@ pub struct SearchResult {
     pub total_count: Option<usize>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProgressivePhaseKind {
-    Initial,
-    Refined,
-}
-
-// Phase events intentionally carry a complete SearchResult so consumers can
-// react without reloading auxiliary state or keeping cross-event caches.
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone)]
-pub enum ProgressiveSearchEvent {
-    Phase {
-        kind: ProgressivePhaseKind,
-        result: SearchResult,
-        elapsed_ms: u128,
-    },
-    RefinementFailed {
-        latency_ms: u128,
-        error: String,
-    },
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct ProgressiveSearchRequest<'a> {
-    pub(crate) cx: &'a FsCx,
-    pub(crate) query: &'a str,
-    pub(crate) filters: SearchFilters,
-    pub(crate) limit: usize,
-    pub(crate) sparse_threshold: usize,
-    pub(crate) field_mask: FieldMask,
-    pub(crate) mode: SearchMode,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SearchHitKey {
     source_id: String,
@@ -2202,99 +2108,31 @@ impl QueryCache {
     }
 }
 
-fn open_fs_semantic_ann_index(fs_index: &FsVectorIndex, ann_path: &Path) -> Result<FsHnswIndex> {
-    if !ann_path.is_file() {
-        bail!(
-            "approximate search unavailable: HNSW index not found at {}",
-            ann_path.display()
-        );
-    }
-
-    let ann = FsHnswIndex::load(ann_path, fs_index)
-        .map_err(|err| anyhow!("open HNSW index failed: {err}"))?;
-    let matches = ann
-        .matches_vector_index(fs_index)
-        .map_err(|err| anyhow!("validate HNSW index failed: {err}"))?;
-    if !matches {
-        bail!(
-            "approximate search unavailable: HNSW index at {} is stale for current semantic index (run 'cass index --semantic --build-hnsw')",
-            ann_path.display()
-        );
-    }
-
-    Ok(ann)
-}
-
 struct SemanticSearchState {
     context_token: Arc<()>,
     embedder: Arc<dyn Embedder>,
     /// `None` when this state has no legacy fsvi backing at all (W3-4
     /// Step2-1: a DB-vector-domain-only generation, no `.fsvi` file ever
-    /// written for this embedder). Every consumer that genuinely needs a
-    /// real fsvi file (the `CASS_SEMANTIC_USE_FSVI` escape hatch, HNSW
-    /// ANN, progressive two-tier refinement) reports its own
-    /// unavailability rather than panicking on `None`.
+    /// written for this embedder).
     fs_semantic_index: Option<Arc<FsVectorIndex>>,
     fs_semantic_indexes: Arc<Vec<Arc<FsVectorIndex>>>,
-    fs_ann_index: Option<Arc<FsHnswIndex>>,
+    /// W3-5: retained but no longer read by any search path -- populated
+    /// by model_manager.rs's loaders (the still-pending "four loaders"
+    /// slice of ③-1). Restructuring the loader-side population is that
+    /// commit's call, not this one's.
     ann_path: Option<PathBuf>,
-    fs_in_memory_two_tier_index: Option<Arc<FsInMemoryTwoTierIndex>>,
-    in_memory_two_tier_unavailable: InMemoryTwoTierUnavailable,
-    progressive_context: Option<Arc<ProgressiveTwoTierContext>>,
-    progressive_context_unavailable: bool,
     filter_maps: SemanticFilterMaps,
     roles: Option<HashSet<u8>>,
     query_cache: QueryCache,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-struct InMemoryTwoTierUnavailable {
-    fast_only: bool,
-    quality: bool,
-}
-
-impl InMemoryTwoTierUnavailable {
-    fn is_known_unavailable(self, tier_mode: SemanticTierMode) -> bool {
-        match tier_mode {
-            SemanticTierMode::Single => false,
-            SemanticTierMode::FastOnly => self.fast_only,
-            SemanticTierMode::Progressive | SemanticTierMode::QualityOnly => self.quality,
-        }
-    }
-
-    fn mark_unavailable(&mut self, tier_mode: SemanticTierMode) {
-        match tier_mode {
-            SemanticTierMode::Single => {}
-            SemanticTierMode::FastOnly => {
-                self.fast_only = true;
-            }
-            SemanticTierMode::Progressive | SemanticTierMode::QualityOnly => {
-                self.quality = true;
-            }
-        }
-    }
-}
-
-struct ProgressiveTwoTierContext {
-    context_token: Arc<()>,
-    index: Arc<FsTwoTierIndex>,
-    fast_embedder: Arc<dyn frankensearch::Embedder>,
-    quality_embedder: Option<Arc<dyn frankensearch::Embedder>>,
-}
-
 #[derive(Clone)]
 struct SemanticCandidateContext {
-    fs_semantic_indexes: Arc<Vec<Arc<FsVectorIndex>>>,
-    filter_maps: SemanticFilterMaps,
     roles: Option<HashSet<u8>>,
 }
 
-struct SemanticCandidateSearchRequest<'a> {
+struct SemanticCandidateSearchRequest {
     fetch_limit: usize,
-    approximate: bool,
-    tier_mode: SemanticTierMode,
-    in_memory_two_tier_index: Option<&'a Arc<FsInMemoryTwoTierIndex>>,
-    ann_index: Option<&'a Arc<FsHnswIndex>>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -2306,361 +2144,6 @@ struct SemanticCandidateRetryState {
 struct SemanticQueryEmbedding {
     context_token: Arc<()>,
     vector: Vec<f32>,
-}
-
-struct SharedCassSyncEmbedder {
-    inner: Arc<dyn Embedder>,
-    cache: Mutex<LruCache<String, Vec<f32>>>,
-}
-
-impl SharedCassSyncEmbedder {
-    fn new(inner: Arc<dyn Embedder>) -> Self {
-        let cache_capacity =
-            NonZeroUsize::new(PROGRESSIVE_EMBEDDING_CACHE_CAPACITY).expect("cache capacity > 0");
-        Self {
-            inner,
-            cache: Mutex::new(LruCache::new(cache_capacity)),
-        }
-    }
-}
-
-impl Embedder for SharedCassSyncEmbedder {
-    fn embed_sync(&self, text: &str) -> crate::search::embedder::EmbedderResult<Vec<f32>> {
-        if let Ok(mut cache) = self.cache.lock()
-            && let Some(embedding) = cache.get(text).cloned()
-        {
-            return Ok(embedding);
-        }
-
-        let embedding = self.inner.embed_sync(text)?;
-        if let Ok(mut cache) = self.cache.lock() {
-            cache.put(text.to_owned(), embedding.clone());
-        }
-        Ok(embedding)
-    }
-
-    fn embed_batch_sync(
-        &self,
-        texts: &[&str],
-    ) -> crate::search::embedder::EmbedderResult<Vec<Vec<f32>>> {
-        self.inner.embed_batch_sync(texts)
-    }
-
-    fn dimension(&self) -> usize {
-        self.inner.dimension()
-    }
-
-    fn id(&self) -> &str {
-        self.inner.id()
-    }
-
-    fn model_name(&self) -> &str {
-        self.inner.model_name()
-    }
-
-    fn is_ready(&self) -> bool {
-        self.inner.is_ready()
-    }
-
-    fn is_semantic(&self) -> bool {
-        self.inner.is_semantic()
-    }
-
-    fn category(&self) -> frankensearch::ModelCategory {
-        self.inner.category()
-    }
-
-    fn tier(&self) -> frankensearch::ModelTier {
-        self.inner.tier()
-    }
-
-    fn supports_mrl(&self) -> bool {
-        self.inner.supports_mrl()
-    }
-}
-
-fn build_in_memory_two_tier_index(
-    ann_path: Option<PathBuf>,
-    embedder_id: &str,
-    tier_mode: SemanticTierMode,
-) -> Option<Arc<FsInMemoryTwoTierIndex>> {
-    let index_dir = ann_path
-        .as_ref()
-        .and_then(|path| path.parent().map(Path::to_path_buf));
-    let Some(index_dir) = index_dir else {
-        tracing::debug!("two-tier semantic unavailable: ann/index directory path missing");
-        return None;
-    };
-
-    match FsInMemoryTwoTierIndex::from_dir(&index_dir) {
-        Ok(index) => return Some(Arc::new(index)),
-        Err(err) => {
-            tracing::debug!(
-                dir = %index_dir.display(),
-                error = %err,
-                "two-tier semantic index load failed; considering fallback"
-            );
-        }
-    }
-
-    if !matches!(tier_mode, SemanticTierMode::FastOnly) {
-        return None;
-    }
-
-    let fallback_fast = index_dir.join(format!("index-{embedder_id}.fsvi"));
-    if !fallback_fast.is_file() {
-        return None;
-    }
-
-    match FsInMemoryVectorIndex::from_fsvi(&fallback_fast) {
-        Ok(fast) => Some(Arc::new(FsInMemoryTwoTierIndex::new(fast, None))),
-        Err(err) => {
-            tracing::debug!(
-                path = %fallback_fast.display(),
-                error = %err,
-                "fast-only semantic fallback index load failed"
-            );
-            None
-        }
-    }
-}
-
-fn two_tier_index_supports_mode(
-    index: &FsInMemoryTwoTierIndex,
-    tier_mode: SemanticTierMode,
-) -> bool {
-    !matches!(
-        tier_mode,
-        SemanticTierMode::Progressive | SemanticTierMode::QualityOnly
-    ) || index.has_quality_index()
-}
-
-#[derive(Debug, Clone)]
-struct ResolvedSemanticDocId {
-    message_id: u64,
-    doc_id: String,
-}
-
-type ProgressiveLookupKey = (String, String, Option<i64>, String, i64, Option<i64>, u64);
-type ProgressiveExactQueryKey = (i64, i64);
-type ProgressiveFallbackQueryKey = (String, String, i64);
-type ResolvedSemanticLookupRow = Option<(ProgressiveLookupKey, ResolvedSemanticDocId)>;
-
-#[derive(Debug, Clone)]
-struct ProgressiveLexicalHit {
-    title: String,
-    snippet: String,
-    content: String,
-    content_hash: u64,
-    conversation_id: Option<i64>,
-    source_path: String,
-    agent: String,
-    workspace: String,
-    workspace_original: Option<String>,
-    created_at: Option<i64>,
-    match_type: MatchType,
-    line_number: Option<usize>,
-    source_id: String,
-    origin_kind: String,
-    origin_host: Option<String>,
-}
-
-impl ProgressiveLexicalHit {
-    fn from_search_hit(hit: &SearchHit, field_mask: FieldMask) -> Self {
-        Self {
-            title: if field_mask.wants_title() {
-                hit.title.clone()
-            } else {
-                String::new()
-            },
-            snippet: if field_mask.wants_snippet() {
-                hit.snippet.clone()
-            } else {
-                String::new()
-            },
-            content: if field_mask.needs_content() {
-                hit.content.clone()
-            } else {
-                String::new()
-            },
-            content_hash: hit.content_hash,
-            conversation_id: hit.conversation_id,
-            source_path: hit.source_path.clone(),
-            agent: hit.agent.clone(),
-            workspace: hit.workspace.clone(),
-            workspace_original: hit.workspace_original.clone(),
-            created_at: hit.created_at,
-            match_type: hit.match_type,
-            line_number: hit.line_number,
-            source_id: hit.source_id.clone(),
-            origin_kind: hit.origin_kind.clone(),
-            origin_host: hit.origin_host.clone(),
-        }
-    }
-
-    fn to_search_hit(&self, score: f32) -> SearchHit {
-        SearchHit {
-            title: self.title.clone(),
-            snippet: self.snippet.clone(),
-            content: self.content.clone(),
-            content_hash: self.content_hash,
-            conversation_id: self.conversation_id,
-            score,
-            source_path: self.source_path.clone(),
-            agent: self.agent.clone(),
-            workspace: self.workspace.clone(),
-            workspace_original: self.workspace_original.clone(),
-            created_at: self.created_at,
-            line_number: self.line_number,
-            match_type: self.match_type,
-            source_id: self.source_id.clone(),
-            origin_kind: self.origin_kind.clone(),
-            origin_host: self.origin_host.clone(),
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-struct ProgressiveLexicalCache {
-    hits_by_message: HashMap<u64, ProgressiveLexicalHit>,
-    wildcard_fallback: bool,
-    suggestions: Vec<QuerySuggestion>,
-}
-
-#[derive(Clone, Copy)]
-struct ProgressivePhaseContext<'a> {
-    query: &'a str,
-    filters: &'a SearchFilters,
-    field_mask: FieldMask,
-    lexical_cache: Option<&'a ProgressiveLexicalCache>,
-    limit: usize,
-    fetch_limit: usize,
-}
-
-type ProgressiveLexicalSnapshot = Arc<ProgressiveLexicalCache>;
-
-struct CassProgressiveLexicalAdapter {
-    client: Arc<SearchClient>,
-    filters: SearchFilters,
-    field_mask: FieldMask,
-    sparse_threshold: usize,
-    shared: Arc<Mutex<ProgressiveLexicalSnapshot>>,
-}
-
-impl CassProgressiveLexicalAdapter {
-    fn new(
-        client: Arc<SearchClient>,
-        filters: SearchFilters,
-        field_mask: FieldMask,
-        sparse_threshold: usize,
-        shared: Arc<Mutex<ProgressiveLexicalSnapshot>>,
-    ) -> Self {
-        Self {
-            client,
-            filters,
-            field_mask,
-            sparse_threshold,
-            shared,
-        }
-    }
-}
-
-impl FsLexicalSearch for CassProgressiveLexicalAdapter {
-    fn search<'a>(
-        &'a self,
-        cx: &'a FsCx,
-        query: &'a str,
-        limit: usize,
-    ) -> FsSearchFuture<'a, Vec<FsScoredResult>> {
-        Box::pin(async move {
-            if cx.is_cancel_requested() {
-                return Err(FsSearchError::Cancelled {
-                    phase: "lexical".to_string(),
-                    reason: "cancel requested".to_string(),
-                });
-            }
-
-            let result = self
-                .client
-                .search_with_fallback(
-                    query,
-                    self.filters.clone(),
-                    limit,
-                    0,
-                    self.sparse_threshold,
-                    self.field_mask,
-                )
-                .map_err(|err| FsSearchError::SubsystemError {
-                    subsystem: "cass_lexical_adapter",
-                    source: Box::new(std::io::Error::other(err.to_string())),
-                })?;
-
-            let resolved = self
-                .client
-                .resolve_semantic_doc_ids_for_hits(&result.hits)
-                .map_err(|err| FsSearchError::SubsystemError {
-                    subsystem: "cass_lexical_adapter",
-                    source: Box::new(std::io::Error::other(err.to_string())),
-                })?;
-
-            let mut scored = Vec::with_capacity(result.hits.len());
-            let mut hits_by_message = HashMap::with_capacity(result.hits.len());
-
-            for (hit, resolved_doc) in result.hits.iter().zip(resolved) {
-                let Some(resolved_doc) = resolved_doc else {
-                    continue;
-                };
-                hits_by_message
-                    .entry(resolved_doc.message_id)
-                    .or_insert_with(|| {
-                        ProgressiveLexicalHit::from_search_hit(hit, self.field_mask)
-                    });
-                scored.push(FsScoredResult {
-                    doc_id: resolved_doc.doc_id,
-                    score: hit.score,
-                    source: FsScoreSource::Lexical,
-                    index: None,
-                    fast_score: None,
-                    quality_score: None,
-                    lexical_score: Some(hit.score),
-                    rerank_score: None,
-                    explanation: None,
-                    metadata: None,
-                });
-            }
-
-            if let Ok(mut guard) = self.shared.lock() {
-                *guard = Arc::new(ProgressiveLexicalCache {
-                    hits_by_message,
-                    wildcard_fallback: result.wildcard_fallback,
-                    suggestions: result.suggestions,
-                });
-            }
-
-            Ok(scored)
-        })
-    }
-
-    fn index_document<'a>(
-        &'a self,
-        _cx: &'a FsCx,
-        _doc: &'a frankensearch::IndexableDocument,
-    ) -> FsSearchFuture<'a, ()> {
-        Box::pin(async move {
-            Err(FsSearchError::SubsystemError {
-                subsystem: "cass_lexical_adapter",
-                source: Box::new(std::io::Error::other("cass lexical adapter is read-only")),
-            })
-        })
-    }
-
-    fn commit<'a>(&'a self, _cx: &'a FsCx) -> FsSearchFuture<'a, ()> {
-        Box::pin(async move { Ok(()) })
-    }
-
-    fn doc_count(&self) -> usize {
-        self.client.total_docs()
-    }
 }
 
 pub struct SearchClient {
@@ -3786,12 +3269,7 @@ impl SearchClient {
             embedder,
             fs_semantic_index,
             fs_semantic_indexes,
-            fs_ann_index: None,
             ann_path,
-            fs_in_memory_two_tier_index: None,
-            in_memory_two_tier_unavailable: InMemoryTwoTierUnavailable::default(),
-            progressive_context: None,
-            progressive_context_unavailable: false,
             filter_maps,
             roles,
             query_cache: QueryCache::new(embedder_id.as_str(), capacity),
@@ -3884,128 +3362,6 @@ impl SearchClient {
         }
     }
 
-    fn in_memory_two_tier_index(
-        &self,
-        tier_mode: SemanticTierMode,
-    ) -> Result<Option<Arc<FsInMemoryTwoTierIndex>>> {
-        loop {
-            let (ann_path, embedder_id, context_token) = {
-                let mut guard = self
-                    .semantic
-                    .lock()
-                    .map_err(|_| anyhow!("semantic lock poisoned"))?;
-                let state = guard.as_mut().ok_or_else(|| {
-                    anyhow!("semantic search unavailable (no embedder or vector index)")
-                })?;
-                if let Some(index) = state.fs_in_memory_two_tier_index.as_ref()
-                    && two_tier_index_supports_mode(index.as_ref(), tier_mode)
-                {
-                    return Ok(Some(Arc::clone(index)));
-                }
-                if state
-                    .in_memory_two_tier_unavailable
-                    .is_known_unavailable(tier_mode)
-                {
-                    return Ok(None);
-                }
-                (
-                    state.ann_path.clone(),
-                    state.embedder.id().to_string(),
-                    Arc::clone(&state.context_token),
-                )
-            };
-
-            let index = build_in_memory_two_tier_index(ann_path.clone(), &embedder_id, tier_mode);
-
-            let mut guard = self
-                .semantic
-                .lock()
-                .map_err(|_| anyhow!("semantic lock poisoned"))?;
-            let state = guard.as_mut().ok_or_else(|| {
-                anyhow!("semantic search unavailable (no embedder or vector index)")
-            })?;
-            if let Some(existing) = state.fs_in_memory_two_tier_index.as_ref()
-                && two_tier_index_supports_mode(existing.as_ref(), tier_mode)
-            {
-                return Ok(Some(Arc::clone(existing)));
-            }
-            if !Arc::ptr_eq(&state.context_token, &context_token) {
-                continue;
-            }
-            let Some(index) = index else {
-                state
-                    .in_memory_two_tier_unavailable
-                    .mark_unavailable(tier_mode);
-                return Ok(None);
-            };
-            if !two_tier_index_supports_mode(index.as_ref(), tier_mode) {
-                state
-                    .in_memory_two_tier_unavailable
-                    .mark_unavailable(tier_mode);
-                return Ok(None);
-            }
-            state.fs_in_memory_two_tier_index = Some(Arc::clone(&index));
-            if index.has_quality_index() {
-                state.in_memory_two_tier_unavailable = InMemoryTwoTierUnavailable::default();
-            } else {
-                state.in_memory_two_tier_unavailable.fast_only = false;
-            }
-            return Ok(Some(index));
-        }
-    }
-
-    fn ann_index(&self) -> Result<Arc<FsHnswIndex>> {
-        loop {
-            let (ann_path, fs_semantic_index) = {
-                let mut guard = self
-                    .semantic
-                    .lock()
-                    .map_err(|_| anyhow!("semantic lock poisoned"))?;
-                let state = guard.as_mut().ok_or_else(|| {
-                    anyhow!("semantic search unavailable (no embedder or vector index)")
-                })?;
-                if let Some(index) = state.fs_ann_index.as_ref() {
-                    return Ok(Arc::clone(index));
-                }
-                let ann_path = state.ann_path.clone().ok_or_else(|| {
-                    anyhow!(
-                        "approximate search unavailable: HNSW index missing (run 'cass index --semantic --build-hnsw')"
-                    )
-                })?;
-                let fs_semantic_index = state.fs_semantic_index.clone().ok_or_else(|| {
-                    anyhow!(
-                        "approximate search unavailable: no fsvi index backs this semantic domain \
-                         (this generation is DB-vector-domain-only; HNSW ANN requires a legacy .fsvi file)"
-                    )
-                })?;
-                (ann_path, fs_semantic_index)
-            };
-
-            let ann = Arc::new(open_fs_semantic_ann_index(
-                fs_semantic_index.as_ref(),
-                &ann_path,
-            )?);
-
-            let mut guard = self
-                .semantic
-                .lock()
-                .map_err(|_| anyhow!("semantic lock poisoned"))?;
-            let state = guard.as_mut().ok_or_else(|| {
-                anyhow!("semantic search unavailable (no embedder or vector index)")
-            })?;
-            if let Some(existing) = state.fs_ann_index.as_ref() {
-                return Ok(Arc::clone(existing));
-            }
-            if state.ann_path.as_ref() != Some(&ann_path)
-                || !state.fs_semantic_index.as_ref().is_some_and(|current| Arc::ptr_eq(current, &fs_semantic_index))
-            {
-                continue;
-            }
-            state.fs_ann_index = Some(Arc::clone(&ann));
-            return Ok(ann);
-        }
-    }
-
     /// All string variants `role_code_from_str` maps onto `code` (its
     /// inverse, many-to-one) -- needed to build a `role IN (...)` SQL
     /// clause from a `SemanticFilter`-shaped `HashSet<u8>` role-code
@@ -4025,11 +3381,12 @@ impl SearchClient {
     }
 
     /// R4-B4 (spec §3.1) + w3-d7①/②: the vec0/`message_embeddings`-backed
-    /// counterpart to [`Self::search_exact_semantic_indexes`]'s fsvi
-    /// brute-force scan. Reads the active generation and scans its `vec0`
+    /// successor to the retired fsvi brute-force scan (W3-5). Reads the
+    /// active generation and scans its `vec0`
     /// index inside **one** read transaction (the same-SQLite-snapshot
     /// requirement R4-B4 mandates for "active pointer read" + "vector row
-    /// read"), then applies `SemanticFilter`'s six dimensions as a SQL
+    /// read"), then applies the same six filter dimensions the retired
+    /// `SemanticFilter` used to embody, now as a SQL
     /// `WHERE` joined against `messages`/`conversations`/`agents`/
     /// `workspaces`/`sources` -- not a doc_id-string decode (that
     /// indirection existed only because the fsvi format had no relational
@@ -4319,7 +3676,7 @@ impl SearchClient {
         context: &SemanticCandidateContext,
         embedding: &[f32],
         filters: &SearchFilters,
-        request: SemanticCandidateSearchRequest<'_>,
+        request: SemanticCandidateSearchRequest,
     ) -> Result<(
         Vec<VectorSearchResult>,
         SemanticCandidateRetryState,
@@ -4339,497 +3696,137 @@ impl SearchClient {
         Ok((results, retry_state, None))
     }
 
-    pub fn can_progressively_refine(&self) -> bool {
-        self.progressive_context()
-            .map(|context| {
-                context.as_ref().is_some_and(|ctx| {
-                    ctx.quality_embedder.is_some() && ctx.index.has_quality_index()
-                })
-            })
-            .unwrap_or(false)
-    }
-
-    fn progressive_context(&self) -> Result<Option<Arc<ProgressiveTwoTierContext>>> {
+    /// Semantic search result containing hits and optional ANN statistics.
+    ///
+    /// W3-5: `ann_stats` in the return type is retained for robot-output/TUI
+    /// schema compatibility, but is always `None` now -- the HNSW
+    /// approximate-search path (`--approximate`) and the progressive
+    /// two-tier execution strategy (`search_semantic_with_tier`,
+    /// `SemanticTierMode`) were both fsvi-era acceleration surfaces with no
+    /// DB-vector-domain equivalent, retired alongside the fsvi candidate
+    /// path (KU2: an exact db_vector_domain scan is <2s at 101.6万 scale,
+    /// removing the accuracy/speed tradeoff motive for either).
+    pub fn search_semantic(
+        &self,
+        query: &str,
+        filters: SearchFilters,
+        limit: usize,
+        offset: usize,
+        field_mask: FieldMask,
+    ) -> Result<(
+        Vec<SearchHit>,
+        Option<crate::search::ann_index::AnnSearchStats>,
+    )> {
+        let field_mask = effective_field_mask(field_mask);
+        let canonical = canonicalize_for_embedding(query);
+        if canonical.trim().is_empty() {
+            return Ok((Vec::new(), None));
+        }
+        let limit = if limit == 0 {
+            self.total_docs().min(no_limit_result_cap()).max(1)
+        } else {
+            limit
+        };
+        let target_hits = limit.saturating_add(offset);
+        if target_hits == 0 {
+            return Ok((Vec::new(), None));
+        }
+        let initial_fetch_limit = target_hits;
+        let fallback_fetch_limit = target_hits.saturating_mul(3);
         loop {
-            let (ann_path, embedder, context_token) = {
-                let mut guard = self
-                    .semantic
-                    .lock()
-                    .map_err(|_| anyhow!("semantic lock poisoned"))?;
-                let state = guard.as_mut().ok_or_else(|| {
-                    anyhow!("semantic search unavailable (no embedder or vector index)")
-                })?;
-                if let Some(context) = state.progressive_context.as_ref() {
-                    return Ok(Some(Arc::clone(context)));
-                }
-                if state.progressive_context_unavailable {
-                    return Ok(None);
-                }
-                (
-                    state.ann_path.clone(),
-                    Arc::clone(&state.embedder),
-                    Arc::clone(&state.context_token),
-                )
-            };
-
-            let context = match self.build_progressive_context(
-                ann_path.clone(),
-                embedder,
-                Arc::clone(&context_token),
-            ) {
-                Ok(context) => context,
-                Err(err) => {
-                    let mut guard = self
+            let (embedding, candidate_context, context_token) = loop {
+                let embedding = self.semantic_query_embedding(&canonical)?;
+                let (candidate_context, context_token) = {
+                    let guard = self
                         .semantic
                         .lock()
                         .map_err(|_| anyhow!("semantic lock poisoned"))?;
-                    let state = guard.as_mut().ok_or_else(|| {
+                    let state = guard.as_ref().ok_or_else(|| {
                         anyhow!("semantic search unavailable (no embedder or vector index)")
                     })?;
-                    if let Some(existing) = state.progressive_context.as_ref() {
-                        return Ok(Some(Arc::clone(existing)));
-                    }
-                    if !Arc::ptr_eq(&state.context_token, &context_token) {
-                        continue;
-                    }
-                    return Err(err);
+                    (
+                        SemanticCandidateContext {
+                            roles: state.roles.clone(),
+                        },
+                        Arc::clone(&state.context_token),
+                    )
+                };
+                if !Arc::ptr_eq(&embedding.context_token, &context_token) {
+                    continue;
                 }
-            };
 
-            let Some(context) = context else {
-                let mut guard = self
+                let guard = self
                     .semantic
                     .lock()
                     .map_err(|_| anyhow!("semantic lock poisoned"))?;
-                let state = guard.as_mut().ok_or_else(|| {
+                let state = guard.as_ref().ok_or_else(|| {
                     anyhow!("semantic search unavailable (no embedder or vector index)")
                 })?;
-                if let Some(existing) = state.progressive_context.as_ref() {
-                    return Ok(Some(Arc::clone(existing)));
-                }
                 if !Arc::ptr_eq(&state.context_token, &context_token) {
                     continue;
                 }
-                state.progressive_context_unavailable = true;
-                return Ok(None);
+                break (embedding.vector, candidate_context, context_token);
             };
 
-            let mut guard = self
-                .semantic
-                .lock()
-                .map_err(|_| anyhow!("semantic lock poisoned"))?;
-            let state = guard.as_mut().ok_or_else(|| {
-                anyhow!("semantic search unavailable (no embedder or vector index)")
-            })?;
-            if let Some(existing) = state.progressive_context.as_ref() {
-                return Ok(Some(Arc::clone(existing)));
-            }
-            if !Arc::ptr_eq(&state.context_token, &context_token) {
+            let finalize_hits =
+                |results: &[VectorSearchResult]| -> Result<(usize, Vec<SearchHit>)> {
+                    let hits = self.hydrate_semantic_hits(results, field_mask)?;
+                    Ok(self.postprocess_hits_page(hits, query, &filters, limit, offset))
+                };
+
+            let (results, retry_state, mut ann_stats) = self.search_semantic_candidates_dispatch(
+                &candidate_context,
+                &embedding,
+                &filters,
+                SemanticCandidateSearchRequest {
+                    fetch_limit: initial_fetch_limit,
+                },
+            )?;
+            if !self.semantic_context_matches(&context_token)? {
+                tracing::debug!("semantic context changed during candidate search; retrying");
                 continue;
             }
-            state.progressive_context_unavailable = false;
-            state.progressive_context = Some(Arc::clone(&context));
-            return Ok(Some(context));
-        }
-    }
+            let (mut available_hits, mut paged_hits) = finalize_hits(&results)?;
 
-    fn build_progressive_context(
-        &self,
-        ann_path: Option<PathBuf>,
-        embedder: Arc<dyn Embedder>,
-        context_token: Arc<()>,
-    ) -> Result<Option<Arc<ProgressiveTwoTierContext>>> {
-        let Some(index_dir) = ann_path
-            .as_ref()
-            .and_then(|path| path.parent().map(Path::to_path_buf))
-        else {
-            return Ok(None);
-        };
+            let needs_retry = initial_fetch_limit < fallback_fetch_limit
+                && ((available_hits < target_hits && retry_state.has_more_candidates)
+                    || retry_state.exact_window_may_omit_competitor);
 
-        let fast_path = {
-            let explicit = index_dir.join("vector.fast.idx");
-            if explicit.is_file() {
-                explicit
-            } else {
-                let fallback = index_dir.join("vector.idx");
-                if fallback.is_file() {
-                    fallback
-                } else {
-                    return Ok(None);
-                }
-            }
-        };
-        let quality_path = index_dir.join("vector.quality.idx");
-        if !quality_path.is_file() {
-            return Ok(None);
-        }
-
-        let fast_index = FsVectorIndex::open(&fast_path)
-            .map_err(|err| anyhow!("open fast-tier index failed: {err}"))?;
-        let quality_index = FsVectorIndex::open(&quality_path)
-            .map_err(|err| anyhow!("open quality-tier index failed: {err}"))?;
-        let index = Arc::new(
-            FsTwoTierIndex::open(&index_dir, frankensearch_two_tier_config())
-                .map_err(|err| anyhow!("open progressive two-tier index failed: {err}"))?,
-        );
-
-        let fast_embedder = self.load_embedder_for_progressive_id(
-            &embedder,
-            fast_index.embedder_id(),
-            fast_index.dimension(),
-        )?;
-        let fast_embedder: Arc<dyn frankensearch::Embedder> = Arc::new(FsSyncEmbedderAdapter(
-            SharedCassSyncEmbedder::new(fast_embedder),
-        ));
-        let quality_embedder = Some(self.load_embedder_for_progressive_id(
-            &embedder,
-            quality_index.embedder_id(),
-            quality_index.dimension(),
-        )?);
-        let quality_embedder = quality_embedder.map(|embedder| {
-            Arc::new(FsSyncEmbedderAdapter(SharedCassSyncEmbedder::new(embedder)))
-                as Arc<dyn frankensearch::Embedder>
-        });
-
-        Ok(Some(Arc::new(ProgressiveTwoTierContext {
-            context_token,
-            index,
-            fast_embedder,
-            quality_embedder,
-        })))
-    }
-
-    fn load_embedder_for_progressive_id(
-        &self,
-        current_embedder: &Arc<dyn Embedder>,
-        embedder_id: &str,
-        dimension: usize,
-    ) -> Result<Arc<dyn Embedder>> {
-        if current_embedder.id() == embedder_id {
-            return Ok(Arc::clone(current_embedder));
-        }
-
-        if let Some(dim) = embedder_id.strip_prefix("fnv1a-")
-            && let Ok(parsed) = dim.parse::<usize>()
-        {
-            return Ok(Arc::new(crate::search::hash_embedder::HashEmbedder::new(
-                parsed.max(dimension),
-            )));
-        }
-
-        if let Some(embedder_name) =
-            crate::search::fastembed_embedder::FastEmbedder::canonical_name(embedder_id)
-        {
-            let data_dir = self
-                .sqlite_path
-                .as_ref()
-                .and_then(|path| path.parent())
-                .ok_or_else(|| anyhow!("cannot resolve data dir for progressive embedder load"))?;
-            let embedder = crate::search::fastembed_embedder::FastEmbedder::load_by_name(
-                data_dir,
-                embedder_name,
-            )
-            .with_context(|| format!("loading FastEmbed model for {embedder_name}"))?;
-            if embedder.dimension() != dimension {
-                bail!(
-                    "progressive embedder dimension mismatch: {} index expects {}, model has {}",
-                    embedder_id,
-                    dimension,
-                    embedder.dimension()
+            if needs_retry {
+                tracing::debug!(
+                    query = canonical,
+                    target_hits,
+                    available_hits,
+                    initial_fetch_limit,
+                    fallback_fetch_limit,
+                    "retrying semantic fetch due to candidate-window shortfall"
                 );
-            }
-            return Ok(Arc::new(embedder));
-        }
-
-        bail!("unsupported progressive embedder id: {embedder_id}");
-    }
-
-    fn resolve_semantic_doc_ids_for_hits(
-        &self,
-        hits: &[SearchHit],
-    ) -> Result<Vec<Option<ResolvedSemanticDocId>>> {
-        if hits.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let lookup_keys: Vec<Option<ProgressiveLookupKey>> = hits
-            .iter()
-            .map(|hit| {
-                let idx = hit
-                    .line_number
-                    .and_then(|line| line.checked_sub(1))
-                    .map(i64::try_from)
-                    .transpose()
-                    .ok()
-                    .flatten()?;
-                Some((
-                    normalized_search_hit_source_id(hit),
-                    hit.source_path.clone(),
-                    hit.conversation_id,
-                    hit.title.trim().to_string(),
-                    idx,
-                    hit.created_at,
-                    hit.content_hash,
-                ))
-            })
-            .collect();
-
-        let mut seen_exact = HashSet::new();
-        let mut exact_query_keys = Vec::new();
-        let mut seen_fallback = HashSet::new();
-        let mut fallback_query_keys = Vec::new();
-        for (source_id, source_path, conversation_id, _title, idx, _created_at, _content_hash) in
-            lookup_keys.iter().flatten()
-        {
-            if let Some(conversation_id) = conversation_id {
-                let query_key: ProgressiveExactQueryKey = (*conversation_id, *idx);
-                if seen_exact.insert(query_key) {
-                    exact_query_keys.push(query_key);
+                let (retry_results, _, retry_ann_stats) = self.search_semantic_candidates_dispatch(
+                    &candidate_context,
+                    &embedding,
+                    &filters,
+                    SemanticCandidateSearchRequest {
+                        fetch_limit: fallback_fetch_limit,
+                    },
+                )?;
+                if !self.semantic_context_matches(&context_token)? {
+                    tracing::debug!("semantic context changed during retry fetch; retrying");
+                    continue;
                 }
-            } else {
-                let query_key: ProgressiveFallbackQueryKey =
-                    (source_id.clone(), source_path.clone(), *idx);
-                if seen_fallback.insert(query_key.clone()) {
-                    fallback_query_keys.push(query_key);
-                }
+                (available_hits, paged_hits) = finalize_hits(&retry_results)?;
+                ann_stats = retry_ann_stats;
             }
-        }
 
-        if exact_query_keys.is_empty() && fallback_query_keys.is_empty() {
-            return Ok(vec![None; hits.len()]);
-        }
-
-        let sqlite_guard = self.sqlite_guard()?;
-        let conn = sqlite_guard
-            .as_ref()
-            .ok_or_else(|| anyhow!("progressive search requires database connection"))?;
-
-        let mut resolved_by_key = HashMap::new();
-        let normalized_source_sql =
-            normalized_search_source_id_sql_expr("c.source_id", "s.kind", "c.origin_host");
-
-        const CHUNK_SIZE: usize = 300;
-        for chunk in exact_query_keys.chunks(CHUNK_SIZE) {
-            let mut sql = String::from("SELECT c.id, ");
-            sql.push_str(&normalized_source_sql);
-            sql.push_str(
-                ", c.source_path, m.idx, m.id, c.agent_id, c.workspace_id, m.role, m.created_at, m.content, c.title
-                 FROM messages m
-                 JOIN conversations c ON m.conversation_id = c.id
-                 LEFT JOIN sources s ON c.source_id = s.id
-                 WHERE ",
+            tracing::trace!(
+                query = canonical,
+                target_hits,
+                available_hits,
+                returned = paged_hits.len(),
+                "semantic fetch complete"
             );
-            let mut params = Vec::with_capacity(chunk.len().saturating_mul(2));
-            for (idx, (conversation_id, line_idx)) in chunk.iter().enumerate() {
-                if idx > 0 {
-                    sql.push_str(" OR ");
-                }
-                sql.push_str("(c.id = ? AND m.idx = ?)");
-                params.push(ParamValue::from(*conversation_id));
-                params.push(ParamValue::from(*line_idx));
-            }
 
-            let chunk_rows: Vec<ResolvedSemanticLookupRow> =
-                conn.query_all_map(&sql, &params, |row: &FrankenRow| {
-                    let conversation_id: i64 = row.get_typed(0)?;
-                    let source_id: String = row.get_typed(1)?;
-                    let source_path: String = row.get_typed(2)?;
-                    let idx: i64 = row.get_typed(3)?;
-                    let message_id_raw: i64 = row.get_typed(4)?;
-                    // agent_id is nullable for legacy V1 conversations; treat
-                    // NULL the same as the negative-sentinel branch below (0).
-                    let agent_id_raw: Option<i64> = row.get_typed(5)?;
-                    let workspace_id_raw: Option<i64> = row.get_typed(6)?;
-                    let role_raw: String = row.get_typed(7)?;
-                    let created_at_ms: Option<i64> = row.get_typed(8)?;
-                    let content: String = row.get_typed(9)?;
-                    let title: Option<String> = row.get_typed(10)?;
-
-                    let canonical = canonicalize_for_embedding(&content);
-                    if canonical.is_empty() {
-                        return Ok(None);
-                    }
-
-                    let message_id = u64::try_from(message_id_raw).map_err(|_| StorageError::Other {
-                        code: None,
-                        detail: "message id out of range for progressive doc_id".to_string(),
-                    })?;
-                    let agent_id = semantic_doc_component_id_from_db(agent_id_raw);
-                    let workspace_id = semantic_doc_component_id_from_db(workspace_id_raw);
-                    let role = role_code_from_str(&role_raw).unwrap_or(ROLE_USER);
-                    let doc_id = SemanticDocId {
-                        message_id,
-                        chunk_idx: 0,
-                        agent_id,
-                        workspace_id,
-                        source_id: crc32fast::hash(source_id.as_bytes()),
-                        role,
-                        created_at_ms: created_at_ms.unwrap_or(0),
-                        content_hash: Some(content_hash(&canonical)),
-                    }
-                    .to_doc_id_string();
-                    let line_number = usize::try_from(idx).ok().map(|line| line.saturating_add(1));
-                    let lookup_key = (
-                        source_id,
-                        source_path.clone(),
-                        Some(conversation_id),
-                        title.unwrap_or_default().trim().to_string(),
-                        idx,
-                        created_at_ms,
-                        stable_hit_hash(&content, &source_path, line_number, created_at_ms),
-                    );
-
-                    Ok(Some((
-                        lookup_key,
-                        ResolvedSemanticDocId { message_id, doc_id },
-                    )))
-                })?;
-
-            for row in chunk_rows.into_iter().flatten() {
-                resolved_by_key.insert(row.0, row.1);
-            }
+            return Ok((paged_hits, ann_stats));
         }
-
-        for chunk in fallback_query_keys.chunks(CHUNK_SIZE) {
-            let mut sql = String::from("SELECT ");
-            sql.push_str(&normalized_source_sql);
-            sql.push_str(
-                ", c.source_path, m.idx, m.id, c.agent_id, c.workspace_id, m.role, m.created_at, m.content, c.title
-                 FROM messages m
-                 JOIN conversations c ON m.conversation_id = c.id
-                 LEFT JOIN sources s ON c.source_id = s.id
-                 WHERE ",
-            );
-            let mut params = Vec::with_capacity(chunk.len().saturating_mul(3));
-            for (idx, (source_id, source_path, line_idx)) in chunk.iter().enumerate() {
-                if idx > 0 {
-                    sql.push_str(" OR ");
-                }
-                sql.push_str(&format!(
-                    "({normalized_source_sql} = ? AND c.source_path = ? AND m.idx = ?)"
-                ));
-                params.push(ParamValue::from(normalize_search_source_filter_value(
-                    source_id,
-                )));
-                params.push(ParamValue::from(source_path.clone()));
-                params.push(ParamValue::from(*line_idx));
-            }
-
-            let chunk_rows: Vec<ResolvedSemanticLookupRow> =
-                conn.query_all_map(&sql, &params, |row: &FrankenRow| {
-                    let source_id: String = row.get_typed(0)?;
-                    let source_path: String = row.get_typed(1)?;
-                    let idx: i64 = row.get_typed(2)?;
-                    let message_id_raw: i64 = row.get_typed(3)?;
-                    // agent_id is nullable for legacy V1 conversations; treat
-                    // NULL the same as the negative-sentinel branch below (0).
-                    let agent_id_raw: Option<i64> = row.get_typed(4)?;
-                    let workspace_id_raw: Option<i64> = row.get_typed(5)?;
-                    let role_raw: String = row.get_typed(6)?;
-                    let created_at_ms: Option<i64> = row.get_typed(7)?;
-                    let content: String = row.get_typed(8)?;
-                    let title: Option<String> = row.get_typed(9)?;
-
-                    let canonical = canonicalize_for_embedding(&content);
-                    if canonical.is_empty() {
-                        return Ok(None);
-                    }
-
-                    let message_id = u64::try_from(message_id_raw).map_err(|_| StorageError::Other {
-                        code: None,
-                        detail: "message id out of range for progressive doc_id".to_string(),
-                    })?;
-                    let agent_id = semantic_doc_component_id_from_db(agent_id_raw);
-                    let workspace_id = semantic_doc_component_id_from_db(workspace_id_raw);
-                    let role = role_code_from_str(&role_raw).unwrap_or(ROLE_USER);
-                    let doc_id = SemanticDocId {
-                        message_id,
-                        chunk_idx: 0,
-                        agent_id,
-                        workspace_id,
-                        source_id: crc32fast::hash(source_id.as_bytes()),
-                        role,
-                        created_at_ms: created_at_ms.unwrap_or(0),
-                        content_hash: Some(content_hash(&canonical)),
-                    }
-                    .to_doc_id_string();
-                    let line_number = usize::try_from(idx).ok().map(|line| line.saturating_add(1));
-                    let lookup_key = (
-                        source_id,
-                        source_path.clone(),
-                        None,
-                        title.unwrap_or_default().trim().to_string(),
-                        idx,
-                        created_at_ms,
-                        stable_hit_hash(&content, &source_path, line_number, created_at_ms),
-                    );
-
-                    Ok(Some((
-                        lookup_key,
-                        ResolvedSemanticDocId { message_id, doc_id },
-                    )))
-                })?;
-
-            for row in chunk_rows.into_iter().flatten() {
-                resolved_by_key.insert(row.0, row.1);
-            }
-        }
-
-        Ok(lookup_keys
-            .into_iter()
-            .map(|key| key.and_then(|lookup| resolved_by_key.get(&lookup).cloned()))
-            .collect())
-    }
-
-    fn load_message_text_by_id(&self, message_id: u64) -> Result<Option<String>> {
-        let sqlite_guard = self.sqlite_guard()?;
-        let conn = sqlite_guard
-            .as_ref()
-            .ok_or_else(|| anyhow!("progressive search requires database connection"))?;
-        let rows: Vec<String> = conn.query_all_map(
-            "SELECT content FROM messages WHERE id = ?",
-            &[ParamValue::from(i64::try_from(message_id)?)],
-            |row: &FrankenRow| row.get_typed(0),
-        )?;
-        Ok(rows.into_iter().next())
-    }
-
-    fn collapse_progressive_scored_results(
-        &self,
-        results: &[FsScoredResult],
-        fetch_limit: usize,
-    ) -> Vec<VectorSearchResult> {
-        let fetch = fetch_limit.max(1);
-        let mut best_by_message: HashMap<u64, VectorSearchResult> =
-            HashMap::with_capacity(results.len());
-        for hit in results {
-            let Some(parsed) = parse_semantic_doc_id(&hit.doc_id) else {
-                continue;
-            };
-            best_by_message
-                .entry(parsed.message_id)
-                .and_modify(|entry| {
-                    if hit.score > entry.score {
-                        entry.score = hit.score;
-                        entry.chunk_idx = parsed.chunk_idx;
-                    }
-                })
-                .or_insert(VectorSearchResult {
-                    message_id: parsed.message_id,
-                    chunk_idx: parsed.chunk_idx,
-                    score: hit.score,
-                });
-        }
-        let mut collapsed: Vec<VectorSearchResult> = best_by_message.into_values().collect();
-        collapsed.sort_by(|a, b| {
-            b.score
-                .total_cmp(&a.score)
-                .then_with(|| a.message_id.cmp(&b.message_id))
-        });
-        if collapsed.len() > fetch {
-            collapsed.truncate(fetch);
-        }
-        collapsed
     }
 
     fn hydrate_semantic_hits_with_ids(
@@ -5053,473 +4050,6 @@ impl SearchClient {
         Ok(ordered)
     }
 
-    fn overlay_progressive_lexical_hit(
-        &self,
-        hit: &mut SearchHit,
-        lexical: &ProgressiveLexicalHit,
-        field_mask: FieldMask,
-    ) {
-        if field_mask.wants_title() && !lexical.title.is_empty() {
-            hit.title = lexical.title.clone();
-        }
-        if field_mask.wants_snippet() && !lexical.snippet.is_empty() {
-            hit.snippet = lexical.snippet.clone();
-        }
-        if field_mask.needs_content() && !lexical.content.is_empty() {
-            hit.content = lexical.content.clone();
-        }
-        hit.match_type = lexical.match_type;
-        hit.line_number = lexical.line_number.or(hit.line_number);
-    }
-
-    fn progressive_phase_to_result(
-        &self,
-        results: &[FsScoredResult],
-        ctx: ProgressivePhaseContext<'_>,
-    ) -> Result<SearchResult> {
-        let collapsed = self.collapse_progressive_scored_results(results, ctx.fetch_limit);
-        let missing: Vec<VectorSearchResult> = collapsed
-            .iter()
-            .filter(|result| {
-                ctx.lexical_cache
-                    .and_then(|cache| cache.hits_by_message.get(&result.message_id))
-                    .is_none()
-            })
-            .map(|result| VectorSearchResult {
-                message_id: result.message_id,
-                chunk_idx: result.chunk_idx,
-                score: result.score,
-            })
-            .collect();
-        let mut hydrated_by_id: HashMap<u64, SearchHit> = self
-            .hydrate_semantic_hits_with_ids(&missing, ctx.field_mask)?
-            .into_iter()
-            .collect();
-
-        let mut hydrated: Vec<(u64, SearchHit)> = Vec::with_capacity(collapsed.len());
-        for result in &collapsed {
-            if let Some(cache) = ctx.lexical_cache
-                && let Some(lexical) = cache.hits_by_message.get(&result.message_id)
-            {
-                hydrated.push((result.message_id, lexical.to_search_hit(result.score)));
-                continue;
-            }
-            if let Some(mut hit) = hydrated_by_id.remove(&result.message_id) {
-                if let Some(cache) = ctx.lexical_cache
-                    && let Some(lexical) = cache.hits_by_message.get(&result.message_id)
-                {
-                    self.overlay_progressive_lexical_hit(&mut hit, lexical, ctx.field_mask);
-                }
-                hydrated.push((result.message_id, hit));
-            }
-        }
-
-        let mut hits: Vec<SearchHit> = hydrated.into_iter().map(|(_, hit)| hit).collect();
-        (_, hits) = self.postprocess_hits_page(hits, ctx.query, ctx.filters, ctx.limit, 0);
-
-        let (wildcard_fallback, suggestions) = ctx
-            .lexical_cache
-            .map(|cache| {
-                let suggestions = if hits.is_empty() {
-                    cache.suggestions.clone()
-                } else {
-                    Vec::new()
-                };
-                (cache.wildcard_fallback, suggestions)
-            })
-            .unwrap_or((false, Vec::new()));
-
-        Ok(SearchResult {
-            hits,
-            wildcard_fallback,
-            cache_stats: self.cache_stats(),
-            suggestions,
-            ann_stats: None,
-            total_count: None,
-        })
-    }
-
-    pub(crate) async fn search_progressive_with_callback(
-        self: &Arc<Self>,
-        request: ProgressiveSearchRequest<'_>,
-        mut on_event: impl FnMut(ProgressiveSearchEvent) + Send,
-    ) -> Result<()> {
-        let ProgressiveSearchRequest {
-            cx,
-            query,
-            filters,
-            limit,
-            sparse_threshold,
-            field_mask,
-            mode,
-        } = request;
-        let field_mask = effective_field_mask(field_mask);
-        let limit = limit.max(1);
-        let fetch_limit = progressive_phase_fetch_limit(limit);
-
-        match mode {
-            SearchMode::Lexical => {
-                let started = Instant::now();
-                let result = self.search_with_fallback(
-                    query,
-                    filters,
-                    limit,
-                    0,
-                    sparse_threshold,
-                    field_mask,
-                )?;
-                on_event(ProgressiveSearchEvent::Phase {
-                    kind: ProgressivePhaseKind::Initial,
-                    elapsed_ms: started.elapsed().as_millis(),
-                    result,
-                });
-                return Ok(());
-            }
-            SearchMode::Semantic | SearchMode::Hybrid => {}
-        }
-
-        let progressive_context = {
-            self.progressive_context()?
-                .ok_or_else(|| anyhow!("progressive two-tier context unavailable"))?
-        };
-        let progressive_context_token = Arc::clone(&progressive_context.context_token);
-
-        let lexical_cache: Arc<Mutex<ProgressiveLexicalSnapshot>> =
-            Arc::new(Mutex::new(Arc::new(ProgressiveLexicalCache::default())));
-        let text_cache: Arc<Mutex<HashMap<u64, String>>> = Arc::new(Mutex::new(HashMap::new()));
-        let text_client = Arc::clone(self);
-        let text_cache_for_lookup = Arc::clone(&text_cache);
-        let text_fn = move |doc_id: &str| -> Option<String> {
-            let parsed = parse_semantic_doc_id(doc_id)?;
-            if let Ok(cache) = text_cache_for_lookup.lock()
-                && let Some(text) = cache.get(&parsed.message_id)
-            {
-                return Some(text.clone());
-            }
-            let loaded = text_client
-                .load_message_text_by_id(parsed.message_id)
-                .ok()
-                .flatten()?;
-            if let Ok(mut cache) = text_cache_for_lookup.lock() {
-                cache.insert(parsed.message_id, loaded.clone());
-            }
-            Some(loaded)
-        };
-
-        let mut searcher = FsTwoTierSearcher::new(
-            Arc::clone(&progressive_context.index),
-            Arc::clone(&progressive_context.fast_embedder),
-            frankensearch_two_tier_config(),
-        );
-
-        if let Some(quality_embedder) = progressive_context.quality_embedder.as_ref() {
-            searcher = searcher.with_quality_embedder(Arc::clone(quality_embedder));
-        }
-
-        if matches!(mode, SearchMode::Hybrid) {
-            let lexical = Arc::new(CassProgressiveLexicalAdapter::new(
-                Arc::clone(self),
-                filters.clone(),
-                field_mask,
-                sparse_threshold,
-                Arc::clone(&lexical_cache),
-            ));
-            searcher = searcher.with_lexical(lexical);
-        }
-
-        let phase_client = Arc::clone(self);
-        let phase_filters = filters.clone();
-        let phase_cache = Arc::clone(&lexical_cache);
-        let mut phase_error: Option<anyhow::Error> = None;
-
-        let search_result = searcher
-            .search(cx, query, fetch_limit, text_fn, |phase| {
-                if phase_error.is_some() {
-                    return;
-                }
-                match phase_client.semantic_context_matches(&progressive_context_token) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        phase_error = Some(anyhow!(
-                            "progressive search aborted: semantic context changed"
-                        ));
-                        cx.set_cancel_requested(true);
-                        return;
-                    }
-                    Err(err) => {
-                        phase_error = Some(err);
-                        cx.set_cancel_requested(true);
-                        return;
-                    }
-                }
-                let lexical_snapshot = phase_cache.lock().ok().map(|guard| Arc::clone(&guard));
-                let event_result = match phase {
-                    FsSearchPhase::Initial {
-                        results, latency, ..
-                    } => phase_client
-                        .progressive_phase_to_result(
-                            &results,
-                            ProgressivePhaseContext {
-                                query,
-                                filters: &phase_filters,
-                                field_mask,
-                                lexical_cache: lexical_snapshot.as_deref(),
-                                limit,
-                                fetch_limit,
-                            },
-                        )
-                        .map(|result| ProgressiveSearchEvent::Phase {
-                            kind: ProgressivePhaseKind::Initial,
-                            elapsed_ms: latency.as_millis(),
-                            result,
-                        }),
-                    FsSearchPhase::Refined {
-                        results, latency, ..
-                    } => phase_client
-                        .progressive_phase_to_result(
-                            &results,
-                            ProgressivePhaseContext {
-                                query,
-                                filters: &phase_filters,
-                                field_mask,
-                                lexical_cache: lexical_snapshot.as_deref(),
-                                limit,
-                                fetch_limit,
-                            },
-                        )
-                        .map(|result| ProgressiveSearchEvent::Phase {
-                            kind: ProgressivePhaseKind::Refined,
-                            elapsed_ms: latency.as_millis(),
-                            result,
-                        }),
-                    // frankensearch may emit a final reranked phase after the
-                    // quality-refined pass. cass's progressive consumers only
-                    // distinguish fast initial results from a better upgraded
-                    // replacement set, so reranked results flow through the
-                    // existing refined/upgrade path.
-                    FsSearchPhase::Reranked {
-                        results, latency, ..
-                    } => phase_client
-                        .progressive_phase_to_result(
-                            &results,
-                            ProgressivePhaseContext {
-                                query,
-                                filters: &phase_filters,
-                                field_mask,
-                                lexical_cache: lexical_snapshot.as_deref(),
-                                limit,
-                                fetch_limit,
-                            },
-                        )
-                        .map(|result| ProgressiveSearchEvent::Phase {
-                            kind: ProgressivePhaseKind::Refined,
-                            elapsed_ms: latency.as_millis(),
-                            result,
-                        }),
-                    FsSearchPhase::RefinementFailed { error, latency, .. } => {
-                        Ok(ProgressiveSearchEvent::RefinementFailed {
-                            latency_ms: latency.as_millis(),
-                            error: error.to_string(),
-                        })
-                    }
-                };
-
-                match event_result {
-                    Ok(event) => on_event(event),
-                    Err(err) => {
-                        phase_error = Some(err);
-                        cx.set_cancel_requested(true);
-                    }
-                }
-            })
-            .await;
-
-        if let Some(err) = phase_error {
-            return Err(err);
-        }
-
-        search_result
-            .map(|_| ())
-            .map_err(|err| anyhow!("progressive search failed: {err}"))
-    }
-
-    /// Semantic search result containing hits and optional ANN statistics.
-    pub fn search_semantic(
-        &self,
-        query: &str,
-        filters: SearchFilters,
-        limit: usize,
-        offset: usize,
-        field_mask: FieldMask,
-        approximate: bool,
-    ) -> Result<(
-        Vec<SearchHit>,
-        Option<crate::search::ann_index::AnnSearchStats>,
-    )> {
-        self.search_semantic_with_tier(
-            query,
-            filters,
-            limit,
-            offset,
-            field_mask,
-            approximate,
-            SemanticTierMode::Single,
-        )
-    }
-
-    /// Semantic search with optional progressive two-tier execution strategy.
-    #[allow(clippy::too_many_arguments)]
-    pub fn search_semantic_with_tier(
-        &self,
-        query: &str,
-        filters: SearchFilters,
-        limit: usize,
-        offset: usize,
-        field_mask: FieldMask,
-        approximate: bool,
-        tier_mode: SemanticTierMode,
-    ) -> Result<(
-        Vec<SearchHit>,
-        Option<crate::search::ann_index::AnnSearchStats>,
-    )> {
-        let field_mask = effective_field_mask(field_mask);
-        let canonical = canonicalize_for_embedding(query);
-        if canonical.trim().is_empty() {
-            return Ok((Vec::new(), None));
-        }
-        let limit = if limit == 0 {
-            self.total_docs().min(no_limit_result_cap()).max(1)
-        } else {
-            limit
-        };
-        let target_hits = limit.saturating_add(offset);
-        if target_hits == 0 {
-            return Ok((Vec::new(), None));
-        }
-        let initial_fetch_limit = target_hits;
-        let fallback_fetch_limit = target_hits.saturating_mul(3);
-        loop {
-            let (embedding, candidate_context, in_memory_two_tier_index, ann_index, context_token) = loop {
-                let embedding = self.semantic_query_embedding(&canonical)?;
-                let (candidate_context, context_token) = {
-                    let guard = self
-                        .semantic
-                        .lock()
-                        .map_err(|_| anyhow!("semantic lock poisoned"))?;
-                    let state = guard.as_ref().ok_or_else(|| {
-                        anyhow!("semantic search unavailable (no embedder or vector index)")
-                    })?;
-                    (
-                        SemanticCandidateContext {
-                            fs_semantic_indexes: Arc::clone(&state.fs_semantic_indexes),
-                            filter_maps: state.filter_maps.clone(),
-                            roles: state.roles.clone(),
-                        },
-                        Arc::clone(&state.context_token),
-                    )
-                };
-                if !Arc::ptr_eq(&embedding.context_token, &context_token) {
-                    continue;
-                }
-                let in_memory_two_tier_index = if tier_mode.wants_two_tier() && !approximate {
-                    self.in_memory_two_tier_index(tier_mode)?
-                } else {
-                    None
-                };
-                let ann_index = if approximate {
-                    Some(self.ann_index()?)
-                } else {
-                    None
-                };
-
-                let guard = self
-                    .semantic
-                    .lock()
-                    .map_err(|_| anyhow!("semantic lock poisoned"))?;
-                let state = guard.as_ref().ok_or_else(|| {
-                    anyhow!("semantic search unavailable (no embedder or vector index)")
-                })?;
-                if !Arc::ptr_eq(&state.context_token, &context_token) {
-                    continue;
-                }
-                break (
-                    embedding.vector,
-                    candidate_context,
-                    in_memory_two_tier_index,
-                    ann_index,
-                    context_token,
-                );
-            };
-
-            let finalize_hits =
-                |results: &[VectorSearchResult]| -> Result<(usize, Vec<SearchHit>)> {
-                    let hits = self.hydrate_semantic_hits(results, field_mask)?;
-                    Ok(self.postprocess_hits_page(hits, query, &filters, limit, offset))
-                };
-
-            let (results, retry_state, mut ann_stats) = self.search_semantic_candidates_dispatch(
-                &candidate_context,
-                &embedding,
-                &filters,
-                SemanticCandidateSearchRequest {
-                    fetch_limit: initial_fetch_limit,
-                    approximate,
-                    tier_mode,
-                    in_memory_two_tier_index: in_memory_two_tier_index.as_ref(),
-                    ann_index: ann_index.as_ref(),
-                },
-            )?;
-            if !self.semantic_context_matches(&context_token)? {
-                tracing::debug!("semantic context changed during candidate search; retrying");
-                continue;
-            }
-            let (mut available_hits, mut paged_hits) = finalize_hits(&results)?;
-
-            let needs_retry = initial_fetch_limit < fallback_fetch_limit
-                && ((available_hits < target_hits && retry_state.has_more_candidates)
-                    || retry_state.exact_window_may_omit_competitor);
-
-            if needs_retry {
-                tracing::debug!(
-                    query = canonical,
-                    target_hits,
-                    available_hits,
-                    initial_fetch_limit,
-                    fallback_fetch_limit,
-                    "retrying semantic fetch due to candidate-window shortfall"
-                );
-                let (retry_results, _, retry_ann_stats) = self.search_semantic_candidates_dispatch(
-                    &candidate_context,
-                    &embedding,
-                    &filters,
-                    SemanticCandidateSearchRequest {
-                        fetch_limit: fallback_fetch_limit,
-                        approximate,
-                        tier_mode,
-                        in_memory_two_tier_index: in_memory_two_tier_index.as_ref(),
-                        ann_index: ann_index.as_ref(),
-                    },
-                )?;
-                if !self.semantic_context_matches(&context_token)? {
-                    tracing::debug!("semantic context changed during retry fetch; retrying");
-                    continue;
-                }
-                (available_hits, paged_hits) = finalize_hits(&retry_results)?;
-                ann_stats = retry_ann_stats;
-            }
-
-            tracing::trace!(
-                query = canonical,
-                target_hits,
-                available_hits,
-                returned = paged_hits.len(),
-                "semantic fetch complete"
-            );
-
-            return Ok((paged_hits, ann_stats));
-        }
-    }
-
     fn hydrate_semantic_hits(
         &self,
         results: &[VectorSearchResult],
@@ -5691,35 +4221,6 @@ impl SearchClient {
         offset: usize,
         sparse_threshold: usize,
         field_mask: FieldMask,
-        approximate: bool,
-    ) -> Result<SearchResult> {
-        self.search_hybrid_with_tier(
-            lexical_query,
-            semantic_query,
-            filters,
-            limit,
-            offset,
-            sparse_threshold,
-            field_mask,
-            approximate,
-            SemanticTierMode::Single,
-        )
-    }
-
-    /// Hybrid search that fuses lexical + semantic results with optional
-    /// progressive two-tier semantic execution.
-    #[allow(clippy::too_many_arguments)]
-    pub fn search_hybrid_with_tier(
-        &self,
-        lexical_query: &str,
-        semantic_query: &str,
-        filters: SearchFilters,
-        limit: usize,
-        offset: usize,
-        sparse_threshold: usize,
-        field_mask: FieldMask,
-        approximate: bool,
-        semantic_tier_mode: SemanticTierMode,
     ) -> Result<SearchResult> {
         let requested_limit = limit;
         let total_docs = self.total_docs().max(1);
@@ -5761,14 +4262,12 @@ impl SearchClient {
             sparse_threshold,
             field_mask,
         )?;
-        let (semantic_hits, semantic_ann_stats) = self.search_semantic_with_tier(
+        let (semantic_hits, semantic_ann_stats) = self.search_semantic(
             semantic_query,
             filters,
             budget.semantic_candidates,
             0,
             field_mask,
-            approximate,
-            semantic_tier_mode,
         )?;
         let fused = rrf_fuse_hits(&lexical.hits, &semantic_hits, semantic_query, limit, offset);
         let suggestions = if fused.is_empty() {
@@ -7436,18 +5935,6 @@ mod tests {
     }
 
     #[test]
-    fn semantic_doc_component_id_from_db_clamps_bounds() {
-        assert_eq!(semantic_doc_component_id_from_db(None), 0);
-        assert_eq!(semantic_doc_component_id_from_db(Some(-7)), 0);
-        assert_eq!(semantic_doc_component_id_from_db(Some(0)), 0);
-        assert_eq!(semantic_doc_component_id_from_db(Some(7)), 7);
-        assert_eq!(
-            semantic_doc_component_id_from_db(Some(i64::from(u32::MAX) + 123)),
-            u32::MAX
-        );
-    }
-
-    #[test]
     fn search_hit_key_doc_id_matches_reference_byte_for_byte() {
         let fixtures = [
             SearchHitKey {
@@ -7765,7 +6252,6 @@ mod tests {
                 3,
                 0,
                 FieldMask::FULL,
-                false,
             )
         });
 
@@ -7852,161 +6338,6 @@ mod tests {
             embedding,
             vec![0.0, 1.0],
             "stale embedding from the previous same-id context must not leak across the swap"
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn quality_mode_does_not_reuse_fast_only_two_tier_cache() -> Result<()> {
-        let dir = TempDir::new()?;
-        let db_path = dir.path().join("placeholder.db");
-        std::fs::write(&db_path, b"")?;
-
-        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
-        let embedder = Arc::new(crate::search::hash_embedder::HashEmbedder::new(256));
-        let fast_path = dir.path().join(format!("index-{}.fsvi", embedder.id()));
-        let writer = VectorIndex::create_with_revision(
-            &fast_path,
-            embedder.id(),
-            "rev-fast-only",
-            embedder.dimension(),
-            frankensearch::index::Quantization::F16,
-        )?;
-        writer.finish()?;
-
-        client.set_semantic_context(
-            embedder,
-            VectorIndex::open(&fast_path)?,
-            SemanticFilterMaps::for_tests(
-                HashMap::new(),
-                HashMap::new(),
-                HashMap::new(),
-                HashSet::new(),
-            ),
-            None,
-            Some(fast_path),
-        )?;
-
-        let fast_only_index = client
-            .in_memory_two_tier_index(SemanticTierMode::FastOnly)?
-            .expect("fast-only index should load");
-        assert!(
-            !fast_only_index.has_quality_index(),
-            "fixture should only provide the fast tier"
-        );
-
-        let quality_index = client.in_memory_two_tier_index(SemanticTierMode::QualityOnly)?;
-        assert!(
-            quality_index.is_none(),
-            "quality mode must not reuse a cached fast-only two-tier index"
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn failed_quality_probe_does_not_block_fast_only_two_tier_load() -> Result<()> {
-        let dir = TempDir::new()?;
-        let db_path = dir.path().join("placeholder.db");
-        std::fs::write(&db_path, b"")?;
-
-        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
-        let embedder = Arc::new(crate::search::hash_embedder::HashEmbedder::new(256));
-        let fast_path = dir.path().join(format!("index-{}.fsvi", embedder.id()));
-        let writer = VectorIndex::create_with_revision(
-            &fast_path,
-            embedder.id(),
-            "rev-fast-only",
-            embedder.dimension(),
-            frankensearch::index::Quantization::F16,
-        )?;
-        writer.finish()?;
-
-        client.set_semantic_context(
-            embedder,
-            VectorIndex::open(&fast_path)?,
-            SemanticFilterMaps::for_tests(
-                HashMap::new(),
-                HashMap::new(),
-                HashMap::new(),
-                HashSet::new(),
-            ),
-            None,
-            Some(fast_path),
-        )?;
-
-        assert!(
-            client
-                .in_memory_two_tier_index(SemanticTierMode::QualityOnly)?
-                .is_none(),
-            "quality-only lookup should fail for a fast-only fixture"
-        );
-
-        let fast_only_index = client
-            .in_memory_two_tier_index(SemanticTierMode::FastOnly)?
-            .expect("a failed quality-only probe must not poison fast-only loads");
-        assert!(
-            !fast_only_index.has_quality_index(),
-            "fixture should still resolve to the fast-only tier"
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn progressive_context_error_does_not_poison_future_attempts() -> Result<()> {
-        let dir = TempDir::new()?;
-        let db_path = dir.path().join("placeholder.db");
-        std::fs::write(&db_path, b"")?;
-
-        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
-        let embedder = Arc::new(crate::search::hash_embedder::HashEmbedder::new(256));
-        let fast_path = dir.path().join(format!("index-{}.fsvi", embedder.id()));
-        let writer = VectorIndex::create_with_revision(
-            &fast_path,
-            embedder.id(),
-            "rev-progressive-error",
-            embedder.dimension(),
-            frankensearch::index::Quantization::F16,
-        )?;
-        writer.finish()?;
-        std::fs::write(dir.path().join("vector.fast.idx"), b"not-a-valid-index")?;
-        std::fs::write(dir.path().join("vector.quality.idx"), b"not-a-valid-index")?;
-
-        client.set_semantic_context(
-            embedder,
-            VectorIndex::open(&fast_path)?,
-            SemanticFilterMaps::for_tests(
-                HashMap::new(),
-                HashMap::new(),
-                HashMap::new(),
-                HashSet::new(),
-            ),
-            None,
-            Some(fast_path),
-        )?;
-
-        let first_err = client
-            .progressive_context()
-            .err()
-            .expect("invalid progressive index files should fail to load");
-        assert!(
-            first_err
-                .to_string()
-                .contains("open fast-tier index failed"),
-            "unexpected first progressive-context error: {first_err}"
-        );
-
-        let second_err = client
-            .progressive_context()
-            .err()
-            .expect("a failed progressive load must not be memoized as None");
-        assert!(
-            second_err
-                .to_string()
-                .contains("open fast-tier index failed"),
-            "unexpected second progressive-context error: {second_err}"
         );
 
         Ok(())
@@ -8932,120 +7263,6 @@ mod tests {
         metrics.inc_reload();
         let (hits, miss, shortfall, reloads, _) = metrics.snapshot_all();
         assert_eq!((hits, miss, shortfall, reloads), (1, 1, 1, 1));
-    }
-
-    #[test]
-    fn progressive_lexical_hit_omits_unused_content() {
-        let hit = SearchHit {
-            title: "hello world".into(),
-            snippet: "hello **world**".into(),
-            content: "hello world from a much larger conversation body".into(),
-            content_hash: stable_content_hash("hello world from a much larger conversation body"),
-            score: 1.0,
-            source_path: "p".into(),
-            agent: "a".into(),
-            workspace: "w".into(),
-            workspace_original: None,
-            created_at: None,
-            line_number: Some(3),
-            match_type: MatchType::Exact,
-            source_id: "local".into(),
-            origin_kind: "local".into(),
-            origin_host: None,
-            conversation_id: None,
-        };
-
-        let snippet_only =
-            ProgressiveLexicalHit::from_search_hit(&hit, FieldMask::new(false, true, true, true));
-        assert_eq!(snippet_only.title, hit.title);
-        assert_eq!(snippet_only.snippet, hit.snippet);
-        assert!(
-            snippet_only.content.is_empty(),
-            "snippet-only progressive cache should not retain full content"
-        );
-        assert_eq!(snippet_only.match_type, hit.match_type);
-        assert_eq!(snippet_only.line_number, hit.line_number);
-        assert_eq!(snippet_only.source_path, hit.source_path);
-        assert_eq!(snippet_only.agent, hit.agent);
-        assert_eq!(snippet_only.workspace, hit.workspace);
-
-        let full =
-            ProgressiveLexicalHit::from_search_hit(&hit, FieldMask::new(true, true, true, true));
-        assert_eq!(full.content, hit.content);
-    }
-
-    #[test]
-    fn progressive_phase_reuses_lexical_cache_without_db_hydration() -> Result<()> {
-        let client = SearchClient {
-            sqlite: Mutex::new(None),
-            sqlite_path: None,
-            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            metrics: Metrics::default(),
-            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
-            semantic: Mutex::new(None),
-        };
-        let field_mask = FieldMask::new(false, true, true, true);
-        let lexical_hit = SearchHit {
-            title: "lexical title".into(),
-            snippet: "lexical snippet".into(),
-            content: "full lexical body".into(),
-            content_hash: stable_content_hash("full lexical body"),
-            score: 0.0,
-            source_path: "/tmp/session.jsonl".into(),
-            agent: "codex".into(),
-            workspace: "/tmp".into(),
-            workspace_original: Some("/original".into()),
-            created_at: Some(1_700_000_000_000),
-            line_number: Some(7),
-            match_type: MatchType::Exact,
-            source_id: "local".into(),
-            origin_kind: "local".into(),
-            origin_host: None,
-            conversation_id: None,
-        };
-        let mut lexical_cache = ProgressiveLexicalCache::default();
-        lexical_cache.hits_by_message.insert(
-            42,
-            ProgressiveLexicalHit::from_search_hit(&lexical_hit, field_mask),
-        );
-
-        let hash_hex = "00".repeat(32);
-        let results = vec![FsScoredResult {
-            doc_id: format!("m|42|0|1|1|1|1|1700000000000|{hash_hex}"),
-            score: 0.91,
-            source: FsScoreSource::Lexical,
-            index: None,
-            fast_score: None,
-            quality_score: None,
-            lexical_score: Some(0.91),
-            rerank_score: None,
-            explanation: None,
-            metadata: None,
-        }];
-
-        let result = client.progressive_phase_to_result(
-            &results,
-            ProgressivePhaseContext {
-                query: "merged title",
-                filters: &SearchFilters::default(),
-                field_mask,
-                lexical_cache: Some(&lexical_cache),
-                limit: 1,
-                fetch_limit: 1,
-            },
-        )?;
-
-        assert_eq!(result.hits.len(), 1);
-        assert_eq!(result.hits[0].title, lexical_hit.title);
-        assert_eq!(result.hits[0].snippet, lexical_hit.snippet);
-        assert!(
-            result.hits[0].content.is_empty(),
-            "masked lexical cache should still avoid carrying full content"
-        );
-        assert_eq!(result.hits[0].source_path, lexical_hit.source_path);
-        assert_eq!(result.hits[0].score, 0.91);
-
-        Ok(())
     }
 
     #[test]
@@ -10617,588 +8834,6 @@ mod tests {
         assert_eq!(hits[0].1.source_id, "laptop");
         assert_eq!(hits[0].1.origin_kind, "remote");
         assert_eq!(hits[0].1.origin_host.as_deref(), Some("dev@laptop"));
-
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_semantic_doc_ids_for_hits_distinguishes_same_source_path_line_by_content_hash()
-    -> Result<()> {
-        let conn = Connection::open_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
-             CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
-             CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                agent_id INTEGER NOT NULL,
-                workspace_id INTEGER,
-                source_id TEXT,
-                origin_host TEXT,
-                title TEXT,
-                source_path TEXT NOT NULL
-             );
-             CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER NOT NULL,
-                idx INTEGER,
-                role TEXT,
-                content TEXT NOT NULL,
-                created_at INTEGER
-             );",
-        )?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
-        conn.execute(
-            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
-             VALUES(1, 1, NULL, 'local', NULL, 'Shared Session', '/tmp/progressive-shared.jsonl')",
-        &[])?;
-        conn.execute(
-            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
-             VALUES(2, 1, NULL, 'local', NULL, 'Shared Session', '/tmp/progressive-shared.jsonl')",
-        &[])?;
-        let first = "same prefix first tail".to_string();
-        let second = "same prefix second tail".to_string();
-        conn.execute(
-            "INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
-             VALUES(?1, ?2, 0, 'assistant', ?3, 100)",
-            &[
-                crate::storage::api::Value::Integer(11),
-                crate::storage::api::Value::Integer(1),
-                crate::storage::api::Value::Text(first.clone().into()),
-            ],
-        )?;
-        conn.execute(
-            "INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
-             VALUES(?1, ?2, 0, 'assistant', ?3, 100)",
-            &[
-                crate::storage::api::Value::Integer(22),
-                crate::storage::api::Value::Integer(2),
-                crate::storage::api::Value::Text(second.clone().into()),
-            ],
-        )?;
-
-        let client = SearchClient {
-            sqlite: Mutex::new(Some(SendConnection(conn))),
-            sqlite_path: None,
-            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            metrics: Metrics::default(),
-            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
-            semantic: Mutex::new(None),
-        };
-
-        let first_hit = SearchHit {
-            title: "Shared Session".into(),
-            snippet: String::new(),
-            content: String::new(),
-            content_hash: stable_hit_hash(
-                &first,
-                "/tmp/progressive-shared.jsonl",
-                Some(1),
-                Some(100),
-            ),
-            score: 0.0,
-            source_path: "/tmp/progressive-shared.jsonl".into(),
-            agent: "codex".into(),
-            workspace: String::new(),
-            workspace_original: None,
-            created_at: Some(100),
-            line_number: Some(1),
-            match_type: MatchType::Exact,
-            source_id: "local".into(),
-            origin_kind: "local".into(),
-            origin_host: None,
-            conversation_id: None,
-        };
-        let second_hit = SearchHit {
-            title: "Shared Session".into(),
-            snippet: String::new(),
-            content: String::new(),
-            content_hash: stable_hit_hash(
-                &second,
-                "/tmp/progressive-shared.jsonl",
-                Some(1),
-                Some(100),
-            ),
-            score: 0.0,
-            source_path: "/tmp/progressive-shared.jsonl".into(),
-            agent: "codex".into(),
-            workspace: String::new(),
-            workspace_original: None,
-            created_at: Some(100),
-            line_number: Some(1),
-            match_type: MatchType::Exact,
-            source_id: "local".into(),
-            origin_kind: "local".into(),
-            origin_host: None,
-            conversation_id: None,
-        };
-
-        let resolved = client.resolve_semantic_doc_ids_for_hits(&[first_hit, second_hit])?;
-        assert_eq!(resolved.len(), 2);
-        assert_eq!(resolved[0].as_ref().map(|hit| hit.message_id), Some(11));
-        assert_eq!(resolved[1].as_ref().map(|hit| hit.message_id), Some(22));
-        assert_ne!(
-            resolved[0].as_ref().map(|hit| hit.doc_id.as_str()),
-            resolved[1].as_ref().map(|hit| hit.doc_id.as_str())
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn hydrate_semantic_hits_with_ids_keeps_missing_title_empty() -> Result<()> {
-        let conn = Connection::open_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
-             CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                agent_id INTEGER NOT NULL,
-                workspace_id INTEGER,
-                source_id TEXT,
-                origin_host TEXT,
-                title TEXT,
-                source_path TEXT NOT NULL,
-                started_at INTEGER
-             );
-             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL);
-             CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER NOT NULL,
-                idx INTEGER,
-                role TEXT,
-                content TEXT NOT NULL,
-                created_at INTEGER
-             );
-             CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);",
-        )?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
-        conn.execute(
-            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path, started_at)
-             VALUES(1, 1, NULL, 'local', NULL, NULL, '/tmp/untitled-semantic.jsonl', 100)",
-        &[])?;
-        conn.execute(
-            "INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
-             VALUES(?1, 1, 0, 'assistant', ?2, 101)",
-            &[
-                crate::storage::api::Value::Integer(1),
-                crate::storage::api::Value::Text("untitled semantic body".into()),
-            ],
-        )?;
-
-        let client = SearchClient {
-            sqlite: Mutex::new(Some(SendConnection(conn))),
-            sqlite_path: None,
-            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            metrics: Metrics::default(),
-            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
-            semantic: Mutex::new(None),
-        };
-
-        let hits = client.hydrate_semantic_hits_with_ids(
-            &[VectorSearchResult {
-                message_id: 1,
-                chunk_idx: 0,
-                score: 0.9,
-            }],
-            FieldMask::new(false, true, true, true),
-        )?;
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].1.title, "");
-
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_semantic_doc_ids_for_hits_prefers_conversation_id_over_ambiguous_provenance()
-    -> Result<()> {
-        let conn = Connection::open_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
-             CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
-             CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                agent_id INTEGER NOT NULL,
-                workspace_id INTEGER,
-                source_id TEXT,
-                origin_host TEXT,
-                title TEXT,
-                source_path TEXT NOT NULL
-             );
-             CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER NOT NULL,
-                idx INTEGER,
-                role TEXT,
-                content TEXT NOT NULL,
-                created_at INTEGER
-             );",
-        )?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
-        conn.execute(
-            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
-             VALUES(1, 1, NULL, 'local', NULL, 'Shared Session', '/tmp/progressive-conversation-id.jsonl')",
-        &[])?;
-        conn.execute(
-            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
-             VALUES(2, 1, NULL, 'local', NULL, 'Shared Session', '/tmp/progressive-conversation-id.jsonl')",
-        &[])?;
-        let content = "same ambiguous content".to_string();
-        conn.execute(
-            "INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
-             VALUES(?1, ?2, 0, 'assistant', ?3, 100)",
-            &[
-                crate::storage::api::Value::Integer(11),
-                crate::storage::api::Value::Integer(1),
-                crate::storage::api::Value::Text(content.clone().into()),
-            ],
-        )?;
-        conn.execute(
-            "INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
-             VALUES(?1, ?2, 0, 'assistant', ?3, 100)",
-            &[
-                crate::storage::api::Value::Integer(22),
-                crate::storage::api::Value::Integer(2),
-                crate::storage::api::Value::Text(content.clone().into()),
-            ],
-        )?;
-
-        let client = SearchClient {
-            sqlite: Mutex::new(Some(SendConnection(conn))),
-            sqlite_path: None,
-            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            metrics: Metrics::default(),
-            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
-            semantic: Mutex::new(None),
-        };
-
-        let first_hit = SearchHit {
-            title: "Shared Session".into(),
-            snippet: String::new(),
-            content: String::new(),
-            content_hash: stable_hit_hash(
-                &content,
-                "/tmp/progressive-conversation-id.jsonl",
-                Some(1),
-                Some(100),
-            ),
-            score: 0.0,
-            source_path: "/tmp/progressive-conversation-id.jsonl".into(),
-            agent: "codex".into(),
-            workspace: String::new(),
-            workspace_original: None,
-            created_at: Some(100),
-            line_number: Some(1),
-            match_type: MatchType::Exact,
-            source_id: "local".into(),
-            origin_kind: "local".into(),
-            origin_host: None,
-            conversation_id: Some(1),
-        };
-        let second_hit = SearchHit {
-            conversation_id: Some(2),
-            ..first_hit.clone()
-        };
-
-        let resolved = client.resolve_semantic_doc_ids_for_hits(&[first_hit, second_hit])?;
-        assert_eq!(resolved.len(), 2);
-        assert_eq!(resolved[0].as_ref().map(|hit| hit.message_id), Some(11));
-        assert_eq!(resolved[1].as_ref().map(|hit| hit.message_id), Some(22));
-
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_semantic_doc_ids_for_hits_treats_null_source_as_local() -> Result<()> {
-        let conn = Connection::open_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
-             CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
-             CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                agent_id INTEGER NOT NULL,
-                workspace_id INTEGER,
-                source_id TEXT,
-                origin_host TEXT,
-                title TEXT,
-                source_path TEXT NOT NULL
-             );
-             CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER NOT NULL,
-                idx INTEGER,
-                role TEXT,
-                content TEXT NOT NULL,
-                created_at INTEGER
-             );",
-        )?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
-        conn.execute(
-            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
-             VALUES(1, 1, NULL, NULL, NULL, 'Legacy Local', '/tmp/legacy-local.jsonl')",
-        &[])?;
-        let content = "legacy local semantic message".to_string();
-        conn.execute(
-            "INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
-             VALUES(?1, 1, 0, 'assistant', ?2, 100)",
-            &[
-                crate::storage::api::Value::Integer(11),
-                crate::storage::api::Value::Text(content.clone().into()),
-            ],
-        )?;
-
-        let client = SearchClient {
-            sqlite: Mutex::new(Some(SendConnection(conn))),
-            sqlite_path: None,
-            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            metrics: Metrics::default(),
-            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
-            semantic: Mutex::new(None),
-        };
-
-        let hit = SearchHit {
-            title: "Legacy Local".into(),
-            snippet: String::new(),
-            content: String::new(),
-            content_hash: stable_hit_hash(&content, "/tmp/legacy-local.jsonl", Some(1), Some(100)),
-            score: 0.0,
-            source_path: "/tmp/legacy-local.jsonl".into(),
-            agent: "codex".into(),
-            workspace: String::new(),
-            workspace_original: None,
-            created_at: Some(100),
-            line_number: Some(1),
-            match_type: MatchType::Exact,
-            source_id: "local".into(),
-            origin_kind: "local".into(),
-            origin_host: None,
-            conversation_id: None,
-        };
-
-        let resolved = client.resolve_semantic_doc_ids_for_hits(&[hit])?;
-        assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].as_ref().map(|hit| hit.message_id), Some(11));
-
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_semantic_doc_ids_for_hits_matches_trimmed_local_source_id() -> Result<()> {
-        let conn = Connection::open_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
-             CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
-             CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                agent_id INTEGER NOT NULL,
-                workspace_id INTEGER,
-                source_id TEXT,
-                origin_host TEXT,
-                title TEXT,
-                source_path TEXT NOT NULL
-             );
-             CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER NOT NULL,
-                idx INTEGER,
-                role TEXT,
-                content TEXT NOT NULL,
-                created_at INTEGER
-             );",
-        )?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
-        conn.execute(
-            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
-             VALUES(1, 1, NULL, '  local  ', NULL, 'Trimmed Local', '/tmp/trimmed-local.jsonl')",
-        &[])?;
-        let content = "trimmed local semantic message".to_string();
-        conn.execute(
-            "INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
-             VALUES(?1, 1, 0, 'assistant', ?2, 100)",
-            &[
-                crate::storage::api::Value::Integer(11),
-                crate::storage::api::Value::Text(content.clone().into()),
-            ],
-        )?;
-
-        let client = SearchClient {
-            sqlite: Mutex::new(Some(SendConnection(conn))),
-            sqlite_path: None,
-            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            metrics: Metrics::default(),
-            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
-            semantic: Mutex::new(None),
-        };
-
-        let hit = SearchHit {
-            title: "Trimmed Local".into(),
-            snippet: String::new(),
-            content: String::new(),
-            content_hash: stable_hit_hash(&content, "/tmp/trimmed-local.jsonl", Some(1), Some(100)),
-            score: 0.0,
-            source_path: "/tmp/trimmed-local.jsonl".into(),
-            agent: "codex".into(),
-            workspace: String::new(),
-            workspace_original: None,
-            created_at: Some(100),
-            line_number: Some(1),
-            match_type: MatchType::Exact,
-            source_id: "local".into(),
-            origin_kind: "local".into(),
-            origin_host: None,
-            conversation_id: None,
-        };
-
-        let resolved = client.resolve_semantic_doc_ids_for_hits(&[hit])?;
-        assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].as_ref().map(|doc| doc.message_id), Some(11));
-
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_semantic_doc_ids_for_hits_normalizes_blank_local_source_id() -> Result<()> {
-        let conn = Connection::open_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
-             CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
-             CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                agent_id INTEGER NOT NULL,
-                workspace_id INTEGER,
-                source_id TEXT,
-                origin_host TEXT,
-                title TEXT,
-                source_path TEXT NOT NULL
-             );
-             CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER NOT NULL,
-                idx INTEGER,
-                role TEXT,
-                content TEXT NOT NULL,
-                created_at INTEGER
-             );",
-        )?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
-        conn.execute(
-            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
-             VALUES(1, 1, NULL, 'local', NULL, 'Blank Local', '/tmp/blank-local.jsonl')",
-        &[])?;
-        let content = "blank local semantic message".to_string();
-        conn.execute(
-            "INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
-             VALUES(?1, 1, 0, 'assistant', ?2, 100)",
-            &[
-                crate::storage::api::Value::Integer(11),
-                crate::storage::api::Value::Text(content.clone().into()),
-            ],
-        )?;
-
-        let client = SearchClient {
-            sqlite: Mutex::new(Some(SendConnection(conn))),
-            sqlite_path: None,
-            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            metrics: Metrics::default(),
-            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
-            semantic: Mutex::new(None),
-        };
-
-        let hit = SearchHit {
-            title: "Blank Local".into(),
-            snippet: String::new(),
-            content: String::new(),
-            content_hash: stable_hit_hash(&content, "/tmp/blank-local.jsonl", Some(1), Some(100)),
-            score: 0.0,
-            source_path: "/tmp/blank-local.jsonl".into(),
-            agent: "codex".into(),
-            workspace: String::new(),
-            workspace_original: None,
-            created_at: Some(100),
-            line_number: Some(1),
-            match_type: MatchType::Exact,
-            source_id: "   ".into(),
-            origin_kind: "local".into(),
-            origin_host: None,
-            conversation_id: None,
-        };
-
-        let resolved = client.resolve_semantic_doc_ids_for_hits(&[hit])?;
-        assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].as_ref().map(|doc| doc.message_id), Some(11));
-
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_semantic_doc_ids_for_hits_infers_remote_source_from_origin_host_when_source_id_blank()
-    -> Result<()> {
-        let conn = Connection::open_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
-             CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
-             CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                agent_id INTEGER NOT NULL,
-                workspace_id INTEGER,
-                source_id TEXT,
-                origin_host TEXT,
-                title TEXT,
-                source_path TEXT NOT NULL
-             );
-             CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER NOT NULL,
-                idx INTEGER,
-                role TEXT,
-                content TEXT NOT NULL,
-                created_at INTEGER
-             );",
-        )?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
-        conn.execute(
-            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
-             VALUES(1, 1, NULL, '   ', 'dev@laptop', 'Legacy Remote', '/tmp/legacy-remote.jsonl')",
-        &[])?;
-        let content = "legacy remote semantic message".to_string();
-        conn.execute(
-            "INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
-             VALUES(?1, 1, 0, 'assistant', ?2, 100)",
-            &[
-                crate::storage::api::Value::Integer(11),
-                crate::storage::api::Value::Text(content.clone().into()),
-            ],
-        )?;
-
-        let client = SearchClient {
-            sqlite: Mutex::new(Some(SendConnection(conn))),
-            sqlite_path: None,
-            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            metrics: Metrics::default(),
-            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
-            semantic: Mutex::new(None),
-        };
-
-        let hit = SearchHit {
-            title: "Legacy Remote".into(),
-            snippet: String::new(),
-            content: String::new(),
-            content_hash: stable_hit_hash(&content, "/tmp/legacy-remote.jsonl", Some(1), Some(100)),
-            score: 0.0,
-            source_path: "/tmp/legacy-remote.jsonl".into(),
-            agent: "codex".into(),
-            workspace: String::new(),
-            workspace_original: None,
-            created_at: Some(100),
-            line_number: Some(1),
-            match_type: MatchType::Exact,
-            source_id: "dev@laptop".into(),
-            origin_kind: "remote".into(),
-            origin_host: Some("dev@laptop".into()),
-            conversation_id: None,
-        };
-
-        let resolved = client.resolve_semantic_doc_ids_for_hits(&[hit])?;
-        assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].as_ref().map(|doc| doc.message_id), Some(11));
 
         Ok(())
     }
@@ -15088,7 +12723,6 @@ mod tests {
             1,
             0,
             FieldMask::FULL,
-            false,
         )?;
 
         assert!(
@@ -15125,7 +12759,6 @@ mod tests {
             1,
             1,
             FieldMask::FULL,
-            false,
         )?;
 
         assert_eq!(
@@ -15136,78 +12769,6 @@ mod tests {
         assert_eq!(
             hits[0].source_path, fixture.source_paths[2],
             "offset must apply after semantic deduplication and session path filtering"
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn progressive_phase_overfetches_before_session_paths_filtering() -> Result<()> {
-        let fixture = build_semantic_test_fixture()?;
-        let mut filters = SearchFilters::default();
-        filters
-            .session_paths
-            .insert(fixture.source_paths[2].clone());
-
-        let results = vec![
-            FsScoredResult {
-                doc_id: fixture.doc_ids[0].clone(),
-                score: 1.0,
-                source: FsScoreSource::SemanticFast,
-                index: None,
-                fast_score: Some(1.0),
-                quality_score: None,
-                lexical_score: None,
-                rerank_score: None,
-                explanation: None,
-                metadata: None,
-            },
-            FsScoredResult {
-                doc_id: fixture.doc_ids[1].clone(),
-                score: 0.9,
-                source: FsScoreSource::SemanticFast,
-                index: None,
-                fast_score: Some(0.9),
-                quality_score: None,
-                lexical_score: None,
-                rerank_score: None,
-                explanation: None,
-                metadata: None,
-            },
-            FsScoredResult {
-                doc_id: fixture.doc_ids[2].clone(),
-                score: 0.8,
-                source: FsScoreSource::SemanticFast,
-                index: None,
-                fast_score: Some(0.8),
-                quality_score: None,
-                lexical_score: None,
-                rerank_score: None,
-                explanation: None,
-                metadata: None,
-            },
-        ];
-
-        let result = fixture.client.progressive_phase_to_result(
-            &results,
-            ProgressivePhaseContext {
-                query: "session path filter",
-                filters: &filters,
-                field_mask: FieldMask::FULL,
-                lexical_cache: None,
-                limit: 1,
-                fetch_limit: 3,
-            },
-        )?;
-
-        assert_eq!(
-            result.hits.len(),
-            1,
-            "progressive phase should retain enough overfetched hits to satisfy post-search session path filtering"
-        );
-        assert_eq!(
-            result.hits[0].source_path, fixture.source_paths[2],
-            "progressive phase should page after session path filtering"
         );
 
         Ok(())

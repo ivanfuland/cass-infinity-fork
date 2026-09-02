@@ -367,7 +367,10 @@ pub enum Commands {
         semantic: bool,
 
         /// Build HNSW index for approximate nearest neighbor search (requires --semantic).
-        /// Enables O(log n) search with `--approximate` flag at query time.
+        /// W3-5: `cass search --approximate` (the query-time consumer of this
+        /// index) was retired alongside the fsvi candidate-search path; this
+        /// flag remains for potential future ANN consumers but currently
+        /// has no query-time reader.
         #[arg(long, default_value_t = false)]
         build_hnsw: bool,
 
@@ -518,13 +521,6 @@ pub enum Commands {
         #[arg(long, value_enum)]
         mode: Option<crate::search::query::SearchMode>,
 
-        /// Use approximate nearest neighbor (ANN) search with HNSW for faster semantic/hybrid queries.
-        /// Trades slight accuracy loss for O(log n) search complexity instead of O(n).
-        /// Only affects semantic and hybrid modes; ignored for lexical search.
-        /// Requires an HNSW index built with `cass index --semantic --approximate`.
-        #[arg(long, default_value_t = false)]
-        approximate: bool,
-
         // ==========================================================================
         // Model / Reranker / Daemon flags (bd-3bbv)
         // ==========================================================================
@@ -552,26 +548,6 @@ pub enum Commands {
         /// Disable daemon usage even if available (force direct inference).
         #[arg(long, default_value_t = false)]
         no_daemon: bool,
-
-        // ==========================================================================
-        // Two-tier progressive search flags (bd-3dcw)
-        // ==========================================================================
-        /// Enable two-tier progressive search: fast results immediately, refined via daemon.
-        /// Returns initial results from fast embedder (~1ms), then refines with quality
-        /// embedder via daemon (~130ms). Best of both worlds for interactive search.
-        #[arg(long, default_value_t = false)]
-        two_tier: bool,
-
-        /// Fast-only search: use lightweight embedder for instant results, no refinement.
-        /// Ideal for real-time search-as-you-type scenarios where latency is critical.
-        #[arg(long, default_value_t = false)]
-        fast_only: bool,
-
-        /// Quality-only search: wait for full transformer model results.
-        /// Higher latency (~130ms) but most accurate semantic matching.
-        /// Requires daemon to be available; falls back to fast if unavailable.
-        #[arg(long, default_value_t = false)]
-        quality_only: bool,
 
         /// Run an incremental `cass index` pass before the search so new
         /// conversations created since the last index are matched. No-op
@@ -4488,17 +4464,10 @@ fn search_like_option_value_count(command: &str, arg: &str) -> Option<usize> {
             | "dry-run"
             | "dry_run"
             | "highlight"
-            | "approximate"
             | "rerank"
             | "daemon"
             | "no-daemon"
             | "no_daemon"
-            | "two-tier"
-            | "two_tier"
-            | "fast-only"
-            | "fast_only"
-            | "quality-only"
-            | "quality_only"
             | "refresh"
             | "catch-up"
             | "catch_up"
@@ -5181,7 +5150,6 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         "resume",
         "non-interactive",
         // Missing flags added
-        "approximate",
         "build-hnsw",
         "export-only",
         "verify",
@@ -5197,8 +5165,6 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         "robot-meta",
         "robot-format",
         "max-content-length",
-        "fast-only",
-        "quality-only",
         "once",
         "reset-state",
         "asciicast",
@@ -6922,32 +6888,13 @@ async fn execute_cli(
                     source,
                     sessions_from,
                     mode,
-                    approximate,
                     model,
                     rerank,
                     reranker,
                     daemon,
                     no_daemon,
-                    two_tier,
-                    fast_only,
-                    quality_only,
                     refresh,
                 } => {
-                    // Validate mutually exclusive two-tier flags
-                    let tier_count = [two_tier, fast_only, quality_only]
-                        .iter()
-                        .filter(|&&b| b)
-                        .count();
-                    if tier_count > 1 {
-                        return Err(CliError::usage(
-                            "Cannot specify multiple tier flags",
-                            Some(
-                                "Use only one of --two-tier, --fast-only, or --quality-only"
-                                    .to_string(),
-                            ),
-                        ));
-                    }
-
                     // Validate mutually exclusive flags
                     if daemon && no_daemon {
                         return Err(CliError::usage(
@@ -6966,32 +6913,15 @@ async fn execute_cli(
                         );
                     }
 
-                    // --refresh runs *after* flag validation so an invocation
-                    // like `cass search --refresh --two-tier --fast-only`
-                    // rejects fast on the bad flag combo instead of burning a
-                    // ~30s incremental index before failing usage.
                     if refresh {
                         refresh_index_inline(cli.db.clone(), data_dir.clone());
                     }
-
-                    // Build semantic options from new flags
-                    let tier_mode = if two_tier {
-                        crate::search::query::SemanticTierMode::Progressive
-                    } else if fast_only {
-                        crate::search::query::SemanticTierMode::FastOnly
-                    } else if quality_only {
-                        crate::search::query::SemanticTierMode::QualityOnly
-                    } else {
-                        crate::search::query::SemanticTierMode::Single
-                    };
 
                     let semantic_opts = SemanticSearchOptions {
                         model: model.clone(),
                         rerank,
                         reranker: reranker.clone(),
                         use_daemon: daemon && !no_daemon,
-                        approximate,
-                        tier_mode,
                     };
 
                     // Only pass through robot_format when it was explicitly
@@ -21998,10 +21928,6 @@ pub struct SemanticSearchOptions {
     pub reranker: Option<String>,
     /// Use daemon for warm model inference
     pub use_daemon: bool,
-    /// Use approximate nearest neighbor search when available
-    pub approximate: bool,
-    /// Optional two-tier execution strategy for semantic mode.
-    pub tier_mode: crate::search::query::SemanticTierMode,
 }
 
 impl TimeFilter {
@@ -23167,12 +23093,6 @@ fn run_cli_search(
     let mut mode_meta = SearchModeMeta::new(mode.unwrap_or_default(), mode.is_none());
     let hybrid_fail_open = mode_meta.fail_open_on_semantic_unavailable();
 
-    if semantic_opts.tier_mode != crate::search::query::SemanticTierMode::Single
-        && !matches!(mode_meta.requested, SearchMode::Semantic)
-    {
-        eprintln!("Warning: tier flags currently only affect --mode semantic.");
-    }
-
     if matches!(
         mode_meta.requested,
         SearchMode::Semantic | SearchMode::Hybrid
@@ -23338,14 +23258,6 @@ fn run_cli_search(
         }
     }
 
-    let approximate =
-        if semantic_opts.approximate && matches!(mode_meta.realized, SearchMode::Lexical) {
-            eprintln!("Warning: --approximate has no effect in lexical mode.");
-            false
-        } else {
-            semantic_opts.approximate
-        };
-
     // Use search_with_fallback to get full metadata (wildcard_fallback, cache_stats)
     let sparse_threshold = 3; // Threshold for triggering wildcard fallback
 
@@ -23400,16 +23312,12 @@ fn run_cli_search(
         || semantic_opts.rerank
         || semantic_opts.reranker.is_some()
         || semantic_opts.use_daemon
-        || semantic_opts.approximate
-        || semantic_opts.tier_mode != crate::search::query::SemanticTierMode::Single
     {
         tracing::debug!(
             model = ?semantic_opts.model,
             rerank = semantic_opts.rerank,
             reranker = ?semantic_opts.reranker,
             use_daemon = semantic_opts.use_daemon,
-            approximate = semantic_opts.approximate,
-            tier_mode = ?semantic_opts.tier_mode,
             "Semantic search options configured"
         );
     }
@@ -23452,15 +23360,7 @@ fn run_cli_search(
             {
                 // Suppress unused-binding warnings in the baseline arm:
                 // every input is consumed by the documented error envelope.
-                let _ = (
-                    approximate,
-                    &semantic_opts,
-                    &filters,
-                    &field_mask,
-                    query,
-                    search_limit,
-                    search_offset,
-                );
+                let _ = (&semantic_opts, &filters, &field_mask, query, search_limit, search_offset);
                 let _ = client;
                 Err::<crate::search::query::SearchResult, CliError>(CliError {
                     code: 15,
@@ -23478,30 +23378,10 @@ fn run_cli_search(
             #[cfg(any(feature = "semantic", feature = "infinity"))]
             {
                 let (hits, ann_stats) = client
-                    .search_semantic_with_tier(
-                        query,
-                        filters.clone(),
-                        search_limit,
-                        search_offset,
-                        field_mask,
-                        approximate,
-                        semantic_opts.tier_mode,
-                    )
+                    .search_semantic(query, filters.clone(), search_limit, search_offset, field_mask)
                     .map_err(|e| {
                         let err_str = e.to_string();
-                        if err_str.contains("HNSW index") {
-                            CliError {
-                                code: 15,
-                                kind: CliErrorKind::SemanticUnavailable.kind_str(),
-                                message: "Approximate search unavailable (HNSW index missing)"
-                                    .to_string(),
-                                hint: Some(
-                                    "Run 'cass index --semantic --build-hnsw' to build the ANN index, or omit --approximate"
-                                        .to_string(),
-                                ),
-                                retryable: false,
-                            }
-                        } else if err_str.contains("unavailable")
+                        if err_str.contains("unavailable")
                             || err_str.contains("no embedder")
                         {
                             CliError {
@@ -23545,7 +23425,6 @@ fn run_cli_search(
             search_offset,
             search_sparse_threshold,
             field_mask,
-            approximate,
         ) {
             Ok(result) => result,
             Err(e) => {

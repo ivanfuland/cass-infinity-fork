@@ -15236,6 +15236,19 @@ pub trait SearchService: Send + Sync {
     fn execute(&self, params: &SearchParams) -> Result<SearchResult, String>;
 }
 
+/// W3-5 debt note: `Upgrade` was the second phase of the progressive
+/// two-tier refinement flow (fast `Interactive` results, then a background
+/// `Upgrade` pass with quality-tier scores). That refinement machinery was
+/// retired (`run_live_search_stream` now always runs a single synchronous
+/// search), so `Upgrade` is no longer reachable through the normal
+/// interactive search flow -- it's still referenced by status text
+/// ("Refining…") and pagination's shared page-size branch
+/// (`Upgrade | Pagination`), and by tests that construct it directly.
+/// Not deleted here: doing so cleanly would mean re-deriving which of
+/// those remaining call sites still make sense with only two passes,
+/// which is a state-machine-shape decision, not a mechanical retirement
+/// one. If you're reading this because `Upgrade` looked unreachable and
+/// confusing -- that's why; it's tracked debt, not a bug.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchPass {
     Interactive,
@@ -15381,6 +15394,20 @@ impl TantivySearchService {
         Self::request_is_progressive_eligible(params, self.live_runtime.is_some())
     }
 
+    /// W3-5: the progressive two-tier refinement path (fast in-process
+    /// results immediately, refined via daemon/quality-tier embeddings
+    /// shortly after) was retired alongside `search_progressive_with_callback`
+    /// and the two-tier machinery it depended on -- the quality tier never
+    /// had production data (hnsw=null, per wave-1 attestation) and the new
+    /// DB-vector-domain engine's exact scan is <2s at 101.6万 scale (KU2),
+    /// removing the speed/accuracy tradeoff motive "fast then refined"
+    /// existed for. This always runs a single synchronous search now; the
+    /// eligibility/runtime plumbing above (`progressive_enabled`,
+    /// `request_is_progressive_eligible`, `request_eligible_for_progressive`,
+    /// `live_runtime`) is kept as-is since it still gates whether
+    /// `CassMsg::SearchRequested` routes through the async subscription
+    /// path or dispatches inline -- either path lands here and returns the
+    /// same single-pass result.
     fn run_live_search_stream(
         &self,
         params: SearchParams,
@@ -15388,137 +15415,28 @@ impl TantivySearchService {
         sender: std::sync::mpsc::Sender<CassMsg>,
         stop: StopSignal,
     ) {
-        if !self.request_eligible_for_progressive(&params)
-            || !self.client.can_progressively_refine()
-        {
-            let message = match self.execute(&params) {
-                Ok(result) => CassMsg::SearchCompleted {
-                    generation,
-                    pass: params.pass,
-                    requested_limit: params.limit,
-                    hits: result.hits,
-                    elapsed_ms: result.elapsed_ms,
-                    suggestions: result.suggestions,
-                    wildcard_fallback: result.wildcard_fallback,
-                    append: matches!(params.pass, SearchPass::Pagination),
-                },
-                Err(error) => CassMsg::SearchFailed { generation, error },
-            };
-            let _ = sender.send(message);
-            let _ = sender.send(CassMsg::SearchStreamFinished { generation });
-            return;
-        }
-
-        let Some(runtime) = self.live_runtime.clone() else {
-            let message = match self.execute(&params) {
-                Ok(result) => CassMsg::SearchCompleted {
-                    generation,
-                    pass: params.pass,
-                    requested_limit: params.limit,
-                    hits: result.hits,
-                    elapsed_ms: result.elapsed_ms,
-                    suggestions: result.suggestions,
-                    wildcard_fallback: result.wildcard_fallback,
-                    append: matches!(params.pass, SearchPass::Pagination),
-                },
-                Err(error) => CassMsg::SearchFailed { generation, error },
-            };
-            let _ = sender.send(message);
-            let _ = sender.send(CassMsg::SearchStreamFinished { generation });
-            return;
-        };
-
-        let cx = frankensearch::Cx::for_request();
-        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let cancel_done = Arc::clone(&done);
-        let cancel_stop = stop.clone();
-        let cancel_cx = cx.clone();
-        let cancel_thread = std::thread::spawn(move || {
-            while !cancel_done.load(std::sync::atomic::Ordering::Acquire) {
-                if cancel_stop.wait_timeout(Duration::from_millis(4)) {
-                    cancel_cx.set_cancel_requested(true);
-                    break;
-                }
-            }
-        });
-
-        let client = Arc::clone(&self.client);
-        let phase_sender = sender.clone();
-        let phase_stop = stop.clone();
-        let live_result = runtime.block_on(async move {
-            client
-                .search_progressive_with_callback(
-                    crate::search::query::ProgressiveSearchRequest {
-                        cx: &cx,
-                        query: &params.query,
-                        filters: params.filters.clone(),
-                        limit: params.limit,
-                        sparse_threshold: 0,
-                        field_mask: crate::search::query::FieldMask::new(false, true, true, true),
-                        mode: params.mode,
-                    },
-                    |event| {
-                        if phase_stop.is_stopped() {
-                            return;
-                        }
-                        let message = match event {
-                            crate::search::query::ProgressiveSearchEvent::Phase {
-                                kind,
-                                result,
-                                elapsed_ms,
-                            } => CassMsg::SearchCompleted {
-                                generation,
-                                pass: match kind {
-                                    crate::search::query::ProgressivePhaseKind::Initial => {
-                                        SearchPass::Interactive
-                                    }
-                                    crate::search::query::ProgressivePhaseKind::Refined => {
-                                        SearchPass::Upgrade
-                                    }
-                                },
-                                requested_limit: params.limit,
-                                hits: result.hits,
-                                elapsed_ms,
-                                suggestions: result.suggestions,
-                                wildcard_fallback: result.wildcard_fallback,
-                                append: false,
-                            },
-                            crate::search::query::ProgressiveSearchEvent::RefinementFailed {
-                                latency_ms,
-                                error,
-                            } => CassMsg::SearchRefinementFailed {
-                                generation,
-                                latency_ms,
-                                error,
-                            },
-                        };
-                        let _ = phase_sender.send(message);
-                    },
-                )
-                .await
-        });
-
-        done.store(true, std::sync::atomic::Ordering::Release);
-        let _ = cancel_thread.join();
-
-        if let Err(err) = live_result
-            && !stop.is_stopped()
-        {
-            let _ = sender.send(CassMsg::SearchFailed {
+        let _ = stop;
+        let message = match self.execute(&params) {
+            Ok(result) => CassMsg::SearchCompleted {
                 generation,
-                error: err.to_string(),
-            });
-        }
-
+                pass: params.pass,
+                requested_limit: params.limit,
+                hits: result.hits,
+                elapsed_ms: result.elapsed_ms,
+                suggestions: result.suggestions,
+                wildcard_fallback: result.wildcard_fallback,
+                append: matches!(params.pass, SearchPass::Pagination),
+            },
+            Err(error) => CassMsg::SearchFailed { generation, error },
+        };
+        let _ = sender.send(message);
         let _ = sender.send(CassMsg::SearchStreamFinished { generation });
     }
 }
 
 impl SearchService for TantivySearchService {
     fn execute(&self, params: &SearchParams) -> Result<SearchResult, String> {
-        use crate::search::query::{
-            FieldMask, SearchResult as BackendSearchResult, SemanticTierMode,
-        };
+        use crate::search::query::{FieldMask, SearchResult as BackendSearchResult};
 
         let started = Instant::now();
         let limit = params.limit;
@@ -15528,15 +15446,6 @@ impl SearchService for TantivySearchService {
             FieldMask::new(false, true, true, true)
         } else {
             FieldMask::new(true, true, true, true)
-        };
-        let two_tier_enabled = Self::progressive_enabled();
-        let semantic_tier_mode = if two_tier_enabled {
-            match params.pass {
-                SearchPass::Interactive => SemanticTierMode::FastOnly,
-                SearchPass::Upgrade | SearchPass::Pagination => SemanticTierMode::Progressive,
-            }
-        } else {
-            SemanticTierMode::Single
         };
 
         // Fix #79: Empty queries bypass BM25 and use date-sorted browsing.
@@ -15581,15 +15490,7 @@ impl SearchService for TantivySearchService {
                 SearchMode::Semantic => {
                     let (hits, ann_stats) = self
                         .client
-                        .search_semantic_with_tier(
-                            &params.query,
-                            params.filters.clone(),
-                            limit,
-                            offset,
-                            field_mask,
-                            false,
-                            semantic_tier_mode,
-                        )
+                        .search_semantic(&params.query, params.filters.clone(), limit, offset, field_mask)
                         .map_err(|e| e.to_string())?;
                     Ok(crate::search::query::SearchResult {
                         hits,
@@ -15602,7 +15503,7 @@ impl SearchService for TantivySearchService {
                 }
                 SearchMode::Hybrid => self
                     .client
-                    .search_hybrid_with_tier(
+                    .search_hybrid(
                         &params.query,
                         &params.query,
                         params.filters.clone(),
@@ -15610,8 +15511,6 @@ impl SearchService for TantivySearchService {
                         offset,
                         sparse_threshold,
                         field_mask,
-                        false,
-                        semantic_tier_mode,
                     )
                     .map_err(|e| e.to_string()),
             }
