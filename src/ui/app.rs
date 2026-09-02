@@ -27766,6 +27766,86 @@ mod tests {
         ));
     }
 
+    /// W3-5 ⓪ (task book #65): positive-path coverage for
+    /// `TantivySearchService::execute()`, the method `run_live_search_stream`
+    /// collapsed onto as its sole real call after the progressive/two-tier
+    /// machinery was retired (3f7aa054). This is the deepest reachable real
+    /// assertion: `run_live_search_stream` itself additionally requires a
+    /// `StopSignal`, but `ftui_runtime::subscription::StopSignal::new()` is
+    /// `pub(crate)` to the `ftui-runtime` crate -- cass has no public
+    /// constructor for one, and driving it would mean either reaching into
+    /// a foreign crate's private API (not our call to make) or standing up
+    /// a full ftui `Subscription`-dispatching runtime harness (a much
+    /// larger undertaking than this decommission task). `execute()` is the
+    /// entire synchronous search body `run_live_search_stream` now wraps,
+    /// so exercising it here with a real `SearchClient` over a real
+    /// `persist_conversation`-built fixture (SQLite + Tantivy, same
+    /// production path `tests/role_filter.rs` uses) verifies "the collapsed
+    /// TUI search path still finds results" without needing that
+    /// unreachable `StopSignal` layer.
+    #[test]
+    fn tantivy_search_service_execute_finds_persisted_message() {
+        use crate::connectors::{NormalizedConversation, NormalizedMessage};
+        use crate::indexer::persist::persist_conversation;
+        use crate::search::query::SearchClient;
+        use serde_json::json;
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = dir.path();
+        let db_path = data_dir.join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).expect("open storage");
+
+        let unique_token = "tantivyexecutefixturemarkerz4q8";
+        let normalized = NormalizedConversation {
+            agent_slug: "tester".into(),
+            external_id: Some("tantivy-execute-fixture".into()),
+            title: Some("tantivy execute fixture".into()),
+            workspace: None,
+            source_path: data_dir.join("tantivy-execute-fixture.jsonl"),
+            started_at: Some(4000),
+            ended_at: Some(4001),
+            metadata: json!({}),
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "user".into(),
+                author: Some("user".into()),
+                created_at: Some(4000),
+                content: format!(
+                    "Investigate why the {unique_token} search regression appeared."
+                ),
+                extra: json!({}),
+                snippets: vec![],
+                invocations: Vec::new(),
+            }],
+        };
+        persist_conversation(&storage, &normalized).expect("persist fixture conversation");
+
+        let client = Arc::new(
+            SearchClient::open(data_dir, Some(&db_path))
+                .expect("open search client")
+                .expect("search client should be available for a freshly indexed dir"),
+        );
+        let service = TantivySearchService::new(Arc::clone(&client));
+
+        let params = SearchParams {
+            query: unique_token.to_string(),
+            filters: SearchFilters::default(),
+            pass: SearchPass::Interactive,
+            mode: SearchMode::Lexical,
+            match_mode: MatchMode::Standard,
+            ranking: RankingMode::Balanced,
+            context_window: ContextWindow::Medium,
+            limit: 16,
+            offset: 0,
+        };
+
+        let result = service.execute(&params).expect("execute should succeed");
+        assert!(
+            !result.hits.is_empty(),
+            "execute() should recall the persisted fixture message for its unique token"
+        );
+    }
+
     #[test]
     fn search_requested_dispatches_with_service() {
         use std::sync::atomic::{AtomicBool, Ordering};
