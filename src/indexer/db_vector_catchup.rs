@@ -18,6 +18,8 @@
 //! [`run_db_vector_catchup_backfill`] (ruling ④, this being a `pub fn`
 //! rather than a test-only bridge).
 
+use std::collections::HashSet;
+
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::indexer::semantic::{EmbeddedMessage, EmbeddingInput, SemanticIndexer, fetch_canonical_embedding_batch};
@@ -344,21 +346,30 @@ pub fn run_db_vector_catchup_backfill(
     let vec0_rows = vector_domain::rebuild_vec0_table_for_generation(storage.raw(), generation_id, dim)
         .context("rebuilding vec0 table for generation")?;
 
+    // W3-4 Step1 (task book #62): the full six-invariant activation audit
+    // replaces the old minimal "embedded_count > 0" verify closure here.
+    // Checks run read-only first (this single-worker flow has nothing
+    // else writing to `generation_id` between here and the switch below),
+    // then the verdict is written atomically with the pointer flip inside
+    // `switch_active_generation`'s own transaction -- "全过才许切", and a
+    // failure aborts before `switch_active_generation` is even called, so
+    // the pointer is provably untouched (spec §3.1's atomicity contract,
+    // reused rather than re-implemented).
     let mut activated = false;
     if holes_after == 0 {
+        let audit_report = run_activation_audit(storage, generation_id, ACTIVATION_AUDIT_DEFAULT_FINITE_NORM_SAMPLE_SIZE, None)
+            .context("running the W3-4 activation audit before activating a db-vector generation")?;
+        if !audit_report.passed {
+            bail!(
+                "generation {generation_id} failed activation audit, refusing to activate: {}",
+                audit_report.failure_reasons.join("; ")
+            );
+        }
         schema::switch_active_generation(storage.raw(), generation_id, FrankenStorage::now_millis(), |tx| {
-            let embedded_count: i64 = tx.query_row_map(
-                "SELECT COUNT(*) FROM message_embeddings WHERE generation_id = ?1",
+            tx.execute(
+                "UPDATE embedding_generations SET audit_status = 'passed' WHERE id = ?1",
                 &params![generation_id],
-                |row| row.get_typed(0),
             )?;
-            if embedded_count <= 0 {
-                return Err(StorageError::Constraint {
-                    detail: format!(
-                        "generation {generation_id} has zero embedded rows; refusing to activate"
-                    ),
-                });
-            }
             Ok(())
         })
         .context("activating db-vector generation")?;
@@ -378,4 +389,267 @@ pub fn run_db_vector_catchup_backfill(
         vec0_rows,
         activated,
     })
+}
+
+// =============================================================================
+// W3-4 Step1 (task book #62): full activation audit. `switch_active_
+// generation`'s doc comment (`src/storage/schema.rs`) deliberately left
+// its `verify` closure minimal and named the six invariants this section
+// implements: ① exact per-generation dim/length match, ② finite+norm
+// resample, ③ positive self-hit content check, ④ bidirectional
+// identity-set anti-join against the same eligibility chain backfill
+// used, ⑤ canonicalize-version identity match, ⑥ `PRAGMA
+// foreign_key_check`. All six must pass for `passed`; any failure is
+// recorded in `failure_reasons` (never stop-at-first -- a caller deciding
+// whether to activate/keep-active wants the whole picture).
+// =============================================================================
+
+/// Default finite/norm resample size for [`run_activation_audit`] callers
+/// that don't have a task-specific number of their own (the switch-time
+/// activation call site above). Task book #62's own real-scale audit
+/// against staging generation_id=1 passes an explicit, larger,
+/// report-documented sample size instead of this constant.
+const ACTIVATION_AUDIT_DEFAULT_FINITE_NORM_SAMPLE_SIZE: usize = 500;
+
+/// Verdict + evidence from [`run_activation_audit`]. `passed` is the
+/// single verdict every other field explains.
+#[derive(Debug, Clone)]
+pub struct ActivationAuditReport {
+    pub generation_id: i64,
+    pub passed: bool,
+    /// ① full-table (not sampled) `COUNT(length(embedding) != 4*dim)`.
+    pub dim_mismatch_count: i64,
+    /// ② finite/norm resample: rows requested vs. rows actually present
+    /// to check (the latter is smaller only if the generation itself has
+    /// fewer than `finite_norm_sample_size` rows) vs. violations found.
+    pub finite_norm_sample_size: usize,
+    pub finite_norm_checked: usize,
+    pub finite_norm_violation_count: usize,
+    /// ③ positive-content self-hit: the anchor doc_id used and what
+    /// `vec0_knn(k=1)` returned for a fresh re-read of its own vector.
+    pub positive_check_doc_id: i64,
+    pub positive_check_top_hit_doc_id: i64,
+    pub positive_check_distance: f64,
+    /// ④ bidirectional identity-set anti-join counts (never a bare
+    /// count-equality check -- R1-W3-N3 forbids treating "same size" as
+    /// "same set").
+    pub eligible_not_embedded_count: usize,
+    pub embedded_not_eligible_count: usize,
+    /// ⑤ canonicalize-version identity match.
+    pub canonicalize_version_expected: u32,
+    pub canonicalize_version_actual: i64,
+    /// ⑥ `PRAGMA foreign_key_check` violation row count -- database-wide
+    /// (the pragma itself has no generation scope; a dangling FK anywhere
+    /// is disqualifying).
+    pub foreign_key_violation_count: usize,
+    pub failure_reasons: Vec<String>,
+}
+
+/// Run the full W3-4 activation audit against `generation_id`'s persisted
+/// rows. Read-only -- see [`run_activation_audit_and_record`] for the
+/// atomic verdict write. `finite_norm_sample_size` bounds check ②'s
+/// resample; `positive_check_doc_id` picks check ③'s self-hit anchor
+/// (`None` auto-picks `MIN(doc_id)` in this generation -- a fresh
+/// candidate generation has no a-priori "known good" anchor the way a
+/// real-scale backfill report's verified self-hits do).
+///
+/// Deliberately does not touch `is_active` or `audit_status` -- callers
+/// decide what a verdict means for those (switch-time activation vs. a
+/// standalone re-audit of an already-active generation are different call
+/// sites with different atomicity needs; see
+/// [`run_activation_audit_and_record`] and this task's own
+/// `examples/w3_4_activation_audit_run.rs`).
+pub fn run_activation_audit(
+    storage: &FrankenStorage,
+    generation_id: i64,
+    finite_norm_sample_size: usize,
+    positive_check_doc_id: Option<i64>,
+) -> Result<ActivationAuditReport> {
+    let conn = storage.raw();
+    let mut failures: Vec<String> = Vec::new();
+
+    let (dim, canonicalize_version_actual): (i64, i64) = conn
+        .query_row_map(
+            "SELECT dim, canonicalize_version FROM embedding_generations WHERE id = ?1",
+            &params![generation_id],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+        )
+        .with_context(|| format!("generation {generation_id} not found for activation audit"))?;
+
+    // ① exact per-generation dim/length match.
+    let dim_mismatch_count: i64 = conn.query_row_map(
+        "SELECT COUNT(*) FROM message_embeddings WHERE generation_id = ?1 AND length(embedding) != 4 * ?2",
+        &params![generation_id, dim],
+        |row| row.get_typed(0),
+    )?;
+    if dim_mismatch_count != 0 {
+        failures.push(format!("① dim/length mismatch: {dim_mismatch_count} row(s) have a BLOB length != 4*dim={dim}"));
+    }
+
+    // ② finite/norm resample: decode each sampled BLOB back to f32 and
+    // recheck both invariants `insert_message_embedding` enforced at
+    // write time (per-element finiteness, norm/BLOB recompute
+    // consistency) -- this audit exists precisely because a row already
+    // past that write-time gate could still have been corrupted since
+    // (disk bitrot, a different write path's bug, manual DB surgery).
+    let sample_rows: Vec<(i64, Vec<u8>, f64)> = conn.query_all_map(
+        "SELECT doc_id, embedding, norm FROM message_embeddings WHERE generation_id = ?1 ORDER BY RANDOM() LIMIT ?2",
+        &params![generation_id, i64::try_from(finite_norm_sample_size).unwrap_or(i64::MAX)],
+        |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+    )?;
+    let finite_norm_checked = sample_rows.len();
+    let mut finite_norm_violation_count = 0usize;
+    for (doc_id, blob, stored_norm) in &sample_rows {
+        let decoded = match schema::le_blob_to_f32_vector(blob) {
+            Ok(v) => v,
+            Err(e) => {
+                finite_norm_violation_count += 1;
+                failures.push(format!("② doc_id={doc_id} BLOB failed to decode: {e}"));
+                continue;
+            }
+        };
+        if let Some(bad_idx) = decoded.iter().position(|x| !x.is_finite()) {
+            finite_norm_violation_count += 1;
+            failures.push(format!("② doc_id={doc_id} has a non-finite element at index {bad_idx}"));
+            continue;
+        }
+        let recomputed = schema::l2_norm(&decoded);
+        let tolerance = 1e-6_f64.max(stored_norm.abs() * 1e-6);
+        if (recomputed - stored_norm).abs() > tolerance {
+            finite_norm_violation_count += 1;
+            failures.push(format!("② doc_id={doc_id} norm/BLOB mismatch: stored={stored_norm} recomputed={recomputed}"));
+        }
+    }
+
+    // ③ positive content check: a known row's own (freshly re-read)
+    // vector must self-hit via the same vec0 read path production
+    // queries use -- catches vec0 drifting stale relative to the
+    // authoritative table (KU2: vec0 is a derived index, never a second
+    // source of truth).
+    let anchor_doc_id = match positive_check_doc_id {
+        Some(id) => id,
+        None => {
+            let min_doc_id: Option<i64> = conn.query_row_map(
+                "SELECT MIN(doc_id) FROM message_embeddings WHERE generation_id = ?1",
+                &params![generation_id],
+                |row| row.get_typed::<Option<i64>>(0),
+            )?;
+            min_doc_id.ok_or_else(|| anyhow!("generation {generation_id} has zero embedded rows; nothing to positive-check"))?
+        }
+    };
+    // A corrupted anchor row (already flagged by ①/② above) must fail
+    // this check too, not crash the whole audit -- an audit that panics
+    // on the very corruption it exists to detect defeats its own
+    // purpose, so every fallible step here is caught rather than `?`-ed
+    // straight out of `run_activation_audit`.
+    let positive_check_result: Result<(i64, f64)> = (|| {
+        let anchor_blob: Vec<u8> = conn
+            .query_row_map(
+                "SELECT embedding FROM message_embeddings WHERE generation_id = ?1 AND doc_id = ?2",
+                &params![generation_id, anchor_doc_id],
+                |row| row.get_typed(0),
+            )
+            .with_context(|| format!("positive-check anchor doc_id={anchor_doc_id} not found in generation {generation_id}"))?;
+        let anchor_vector = schema::le_blob_to_f32_vector(&anchor_blob)?;
+        let hits = vector_domain::vec0_knn(conn, generation_id, &anchor_vector, 1)?;
+        Ok(hits.first().copied().unwrap_or((-1, f64::INFINITY)))
+    })();
+    let mut positive_check_errored = false;
+    let (top_hit_doc_id, distance) = match positive_check_result {
+        Ok(pair) => pair,
+        Err(e) => {
+            positive_check_errored = true;
+            failures.push(format!(
+                "③ positive content check errored on anchor doc_id={anchor_doc_id} (likely a downstream symptom of an ①/② corruption already reported above): {e}"
+            ));
+            (-1, f64::INFINITY)
+        }
+    };
+    if !positive_check_errored && (top_hit_doc_id != anchor_doc_id || !(distance <= 1e-6)) {
+        failures.push(format!(
+            "③ positive content check failed: anchor doc_id={anchor_doc_id} top vec0 hit={top_hit_doc_id} distance={distance}"
+        ));
+    }
+
+    // ④ bidirectional identity-set anti-join: the eligibility chain is
+    // the exact same one backfill used to seed holes
+    // (`scan_eligible_message_ids`), so "对账基线=backfill报告数字" holds
+    // by construction rather than by re-deriving a parallel definition of
+    // eligibility that could drift from it.
+    let eligible_ids: HashSet<i64> = scan_eligible_message_ids(storage)?.into_iter().collect();
+    let embedded_ids: HashSet<i64> = conn
+        .query_all_map("SELECT doc_id FROM message_embeddings WHERE generation_id = ?1", &params![generation_id], |row| row.get_typed(0))?
+        .into_iter()
+        .collect();
+    let eligible_not_embedded_count = eligible_ids.difference(&embedded_ids).count();
+    let embedded_not_eligible_count = embedded_ids.difference(&eligible_ids).count();
+    if eligible_not_embedded_count != 0 {
+        failures.push(format!(
+            "④ identity-set anti-join: {eligible_not_embedded_count} eligible message(s) have no embedding row in generation {generation_id}"
+        ));
+    }
+    if embedded_not_eligible_count != 0 {
+        failures.push(format!(
+            "④ identity-set anti-join: {embedded_not_eligible_count} embedded doc_id(s) in generation {generation_id} are no longer in the eligible set"
+        ));
+    }
+
+    // ⑤ canonicalize-version identity match against the running binary's
+    // W3-0 fingerprint.
+    if canonicalize_version_actual != i64::from(CANONICALIZE_PIPELINE_VERSION) {
+        failures.push(format!(
+            "⑤ canonicalize_version mismatch: generation has {canonicalize_version_actual}, running binary expects {CANONICALIZE_PIPELINE_VERSION}"
+        ));
+    }
+
+    // ⑥ PRAGMA foreign_key_check: database-wide, not generation-scoped --
+    // a non-empty result is an unconditional reject (R2-W3-B5).
+    let foreign_key_violation_count = conn.query_all_map("PRAGMA foreign_key_check", &[], |_row| Ok(()))?.len();
+    if foreign_key_violation_count != 0 {
+        failures.push(format!("⑥ PRAGMA foreign_key_check reported {foreign_key_violation_count} violation(s)"));
+    }
+
+    let passed = failures.is_empty();
+    Ok(ActivationAuditReport {
+        generation_id,
+        passed,
+        dim_mismatch_count,
+        finite_norm_sample_size,
+        finite_norm_checked,
+        finite_norm_violation_count,
+        positive_check_doc_id: anchor_doc_id,
+        positive_check_top_hit_doc_id: top_hit_doc_id,
+        positive_check_distance: distance,
+        eligible_not_embedded_count,
+        embedded_not_eligible_count,
+        canonicalize_version_expected: CANONICALIZE_PIPELINE_VERSION,
+        canonicalize_version_actual,
+        foreign_key_violation_count,
+        failure_reasons: failures,
+    })
+}
+
+/// Run [`run_activation_audit`] and atomically record its verdict into
+/// `audit_status` ('passed'/'failed') -- the standalone re-audit entry
+/// point for a generation that is already `is_active` (task book #62's
+/// own real-scale run against staging generation_id=1, activated under
+/// exec54's old minimal verify and sitting at `audit_status='pending'`
+/// ever since). Never touches `is_active`: a re-audit's job is only to
+/// upgrade/demote certification, not to pick which generation serves
+/// reads.
+pub fn run_activation_audit_and_record(
+    storage: &FrankenStorage,
+    generation_id: i64,
+    finite_norm_sample_size: usize,
+    positive_check_doc_id: Option<i64>,
+) -> Result<ActivationAuditReport> {
+    let report = run_activation_audit(storage, generation_id, finite_norm_sample_size, positive_check_doc_id)?;
+    let new_status = if report.passed { "passed" } else { "failed" };
+    storage
+        .raw()
+        .with_tx_no_replay(TxMode::Immediate, |tx| {
+            tx.execute("UPDATE embedding_generations SET audit_status = ?1 WHERE id = ?2", &params![new_status, generation_id])
+        })
+        .context("recording activation audit verdict")?;
+    Ok(report)
 }

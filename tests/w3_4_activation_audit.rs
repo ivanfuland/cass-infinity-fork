@@ -1,0 +1,334 @@
+//! W3-4 Step1 (task book #62): full activation-audit test matrix, one test
+//! per spec-numbered assertion (spec 逐款) plus one all-pass baseline.
+//! Replaces `switch_active_generation`'s old minimal verify closure (which
+//! only checked `embedded_count > 0`) with a real six-invariant audit:
+//! ① exact dim/length match, ② finite+norm resample, ③ positive
+//! self-hit content check, ④ bidirectional identity-set anti-join,
+//! ⑤ canonicalize-version match, ⑥ `PRAGMA foreign_key_check`.
+//!
+//! Fixtures use the same production write entry points as
+//! `w3_vector_lifecycle.rs` (`insert_conversation_tree`,
+//! `schema::insert_message_embedding`) -- raw-SQL bypass is used only to
+//! *simulate corruption* a live write path could never itself produce
+//! (dim/finite/norm/FK violations), exactly the class of defect this
+//! audit exists to catch post-hoc.
+
+use coding_agent_search::indexer::db_vector_catchup::run_activation_audit_and_record;
+use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+use coding_agent_search::search::canonicalize::CANONICALIZE_PIPELINE_VERSION;
+use coding_agent_search::storage::api::{TxMode, Value as V};
+use coding_agent_search::storage::schema;
+use coding_agent_search::storage::sqlite::FrankenStorage;
+use coding_agent_search::storage::vector_domain;
+
+macro_rules! fparams {
+    () => {
+        &[] as &[V]
+    };
+    ($($val:expr),+ $(,)?) => {
+        &[$(coding_agent_search::storage::api::IntoValue::into_value($val)),+] as &[V]
+    };
+}
+
+const TS: i64 = 1_770_551_400_000;
+const DIM: i64 = 4;
+
+fn open_storage(path: &std::path::Path) -> FrankenStorage {
+    FrankenStorage::open(path).expect("open production storage")
+}
+
+fn ensure_agent(storage: &FrankenStorage) -> i64 {
+    storage
+        .ensure_agent(&Agent { id: None, slug: "claude_code".into(), name: "Claude Code".into(), version: Some("1.0".into()), kind: AgentKind::Cli })
+        .expect("ensure agent")
+}
+
+fn msg(idx: i64, role: MessageRole, content: &str) -> Message {
+    Message { id: None, idx, role, author: None, created_at: Some(TS + idx * 1_000), content: content.into(), extra_json: serde_json::Value::Null, snippets: vec![] }
+}
+
+fn conversation(external_id: &str, messages: Vec<Message>) -> Conversation {
+    Conversation {
+        id: None,
+        agent_slug: "claude_code".into(),
+        workspace: None,
+        external_id: Some(external_id.into()),
+        title: Some("w3-4 activation-audit fixture".into()),
+        source_path: std::path::PathBuf::from(format!("/fixtures/{external_id}.jsonl")),
+        started_at: Some(TS),
+        ended_at: Some(TS + 60_000),
+        approx_tokens: None,
+        metadata_json: serde_json::Value::Null,
+        messages,
+        source_id: "local".into(),
+        origin_host: None,
+    }
+}
+
+fn conv_id_of(storage: &FrankenStorage, external_id: &str) -> i64 {
+    storage.raw().query_row_map("SELECT id FROM conversations WHERE external_id = ?1", fparams![external_id], |row| row.get_typed::<i64>(0)).unwrap()
+}
+
+fn message_id_at_idx(storage: &FrankenStorage, conv_id: i64, idx: i64) -> i64 {
+    storage.raw().query_row_map("SELECT id FROM messages WHERE conversation_id = ?1 AND idx = ?2", fparams![conv_id, idx], |row| row.get_typed(0)).unwrap()
+}
+
+fn audit_status_of(storage: &FrankenStorage, generation_id: i64) -> String {
+    storage.raw().query_row_map("SELECT audit_status FROM embedding_generations WHERE id = ?1", fparams![generation_id], |row| row.get_typed(0)).unwrap()
+}
+
+fn create_generation(storage: &FrankenStorage, canonicalize_version: u32) -> i64 {
+    storage.raw().with_tx_no_replay(TxMode::Immediate, |tx| schema::create_embedding_generation(tx, "bge-m3", DIM, canonicalize_version, TS)).unwrap()
+}
+
+fn embed(storage: &FrankenStorage, gen_id: i64, doc_id: i64, conv_id: i64, vector: &[f32]) {
+    storage
+        .raw()
+        .with_tx_no_replay(TxMode::Immediate, |tx| schema::insert_message_embedding(tx, gen_id, doc_id, conv_id, vector, "seed-hash", None, TS))
+        .unwrap();
+}
+
+fn rebuild_vec0(storage: &FrankenStorage, gen_id: i64) {
+    vector_domain::create_vec0_table_for_generation(storage.raw(), gen_id, DIM).unwrap();
+    vector_domain::rebuild_vec0_table_for_generation(storage.raw(), gen_id, DIM).unwrap();
+}
+
+/// One eligible conversation with two distinct-content messages, both
+/// embedded (orthonormal dim=4 vectors), generation identity matches
+/// production (`CANONICALIZE_PIPELINE_VERSION`), vec0 freshly rebuilt.
+/// Every one of the six checks passes against this fixture unmodified --
+/// callers corrupt exactly one thing per test from this baseline.
+fn clean_two_message_fixture(storage: &FrankenStorage) -> (i64, i64, i64) {
+    let agent_id = ensure_agent(storage);
+    let conv = conversation(
+        "w3-4-clean",
+        vec![msg(0, MessageRole::User, "the quick brown fox jumps"), msg(1, MessageRole::Agent, "over the lazy dog")],
+    );
+    storage.insert_conversation_tree(agent_id, None, &conv).expect("insert fixture conversation");
+    let conv_id = conv_id_of(storage, "w3-4-clean");
+    let doc_a = message_id_at_idx(storage, conv_id, 0);
+    let doc_b = message_id_at_idx(storage, conv_id, 1);
+
+    let gen_id = create_generation(storage, CANONICALIZE_PIPELINE_VERSION);
+    embed(storage, gen_id, doc_a, conv_id, &[1.0, 0.0, 0.0, 0.0]);
+    embed(storage, gen_id, doc_b, conv_id, &[0.0, 1.0, 0.0, 0.0]);
+    rebuild_vec0(storage, gen_id);
+    (gen_id, doc_a, doc_b)
+}
+
+#[test]
+fn full_audit_passes_and_records_passed_on_a_clean_generation() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let storage = open_storage(&dir.path().join("db.sqlite"));
+    let (gen_id, _doc_a, _doc_b) = clean_two_message_fixture(&storage);
+
+    assert_eq!(audit_status_of(&storage, gen_id), "pending", "前置：新代际起始为 pending");
+
+    let report = run_activation_audit_and_record(&storage, gen_id, 100, None).expect("audit must run without a hard error");
+    assert!(report.passed, "clean fixture must pass every check: {:?}", report.failure_reasons);
+    assert_eq!(audit_status_of(&storage, gen_id), "passed", "全过必须把 audit_status 落 passed");
+}
+
+#[test]
+fn audit_fails_on_dim_length_mismatch() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let storage = open_storage(&dir.path().join("db.sqlite"));
+    let (gen_id, doc_a, _doc_b) = clean_two_message_fixture(&storage);
+
+    // Simulate corruption a live write path can never itself produce: a
+    // BLOB whose length satisfies the DDL's `% 4 = 0` backstop but not
+    // this generation's exact dim=4 (8 floats instead of 4).
+    let bad_blob = schema::f32_vector_to_le_blob(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    storage.raw().execute("UPDATE message_embeddings SET embedding = ?1 WHERE generation_id = ?2 AND doc_id = ?3", fparams![bad_blob, gen_id, doc_a]).unwrap();
+
+    let report = run_activation_audit_and_record(&storage, gen_id, 100, None).expect("audit runs, verdict is failure not an error");
+    assert!(!report.passed, "dim-length mismatch must fail the audit");
+    assert_eq!(report.dim_mismatch_count, 1);
+    assert_eq!(audit_status_of(&storage, gen_id), "failed");
+}
+
+#[test]
+fn audit_fails_on_non_finite_element_in_sample() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let storage = open_storage(&dir.path().join("db.sqlite"));
+    let (gen_id, doc_a, _doc_b) = clean_two_message_fixture(&storage);
+
+    let nan_blob = schema::f32_vector_to_le_blob(&[f32::NAN, 0.0, 0.0, 0.0]);
+    storage.raw().execute("UPDATE message_embeddings SET embedding = ?1 WHERE generation_id = ?2 AND doc_id = ?3", fparams![nan_blob, gen_id, doc_a]).unwrap();
+
+    let report = run_activation_audit_and_record(&storage, gen_id, 100, None).expect("audit runs, verdict is failure not an error");
+    assert!(!report.passed, "a NaN element must fail the audit");
+    assert!(report.finite_norm_violation_count >= 1);
+    assert_eq!(audit_status_of(&storage, gen_id), "failed");
+}
+
+#[test]
+fn audit_fails_on_norm_recompute_mismatch() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let storage = open_storage(&dir.path().join("db.sqlite"));
+    let (gen_id, doc_a, _doc_b) = clean_two_message_fixture(&storage);
+
+    // Vector stays a valid finite unit vector; only the stored `norm`
+    // column is corrupted so it disagrees with a fresh recompute off the
+    // BLOB -- the norm/BLOB consistency invariant this check exists for.
+    storage.raw().execute("UPDATE message_embeddings SET norm = 999.0 WHERE generation_id = ?1 AND doc_id = ?2", fparams![gen_id, doc_a]).unwrap();
+
+    let report = run_activation_audit_and_record(&storage, gen_id, 100, None).expect("audit runs, verdict is failure not an error");
+    assert!(!report.passed, "a stored norm that disagrees with recompute must fail the audit");
+    assert!(report.finite_norm_violation_count >= 1);
+    assert_eq!(audit_status_of(&storage, gen_id), "failed");
+}
+
+#[test]
+fn audit_fails_on_stale_vec0_self_hit_drift() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let storage = open_storage(&dir.path().join("db.sqlite"));
+    let (gen_id, doc_a, _doc_b) = clean_two_message_fixture(&storage);
+
+    // Authoritative table now disagrees with the already-built vec0
+    // index (no rebuild issued after this write) -- the KU2 "vec0 is a
+    // derived index, never a second source of truth" drift this check
+    // exists to catch. Still a valid finite unit vector, orthogonal to
+    // what vec0 has on file for this doc_id.
+    storage
+        .raw()
+        .execute(
+            "UPDATE message_embeddings SET embedding = ?1, norm = 1.0 WHERE generation_id = ?2 AND doc_id = ?3",
+            fparams![schema::f32_vector_to_le_blob(&[0.0, 0.0, 1.0, 0.0]), gen_id, doc_a],
+        )
+        .unwrap();
+
+    let report = run_activation_audit_and_record(&storage, gen_id, 100, Some(doc_a)).expect("audit runs, verdict is failure not an error");
+    assert!(!report.passed, "a vec0 index stale relative to message_embeddings must fail the positive-content self-hit check");
+    assert_eq!(audit_status_of(&storage, gen_id), "failed");
+}
+
+#[test]
+fn audit_fails_on_eligible_message_missing_its_embedding() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let storage = open_storage(&dir.path().join("db.sqlite"));
+    let agent_id = ensure_agent(&storage);
+
+    // Two eligible messages exist in `messages`, but only one gets
+    // embedded -- the generation is missing coverage for a real,
+    // embeddable message (R1-W3-N3 territory: a genuine hole, not one
+    // this audit is allowed to wave through).
+    let conv = conversation("w3-4-missing-embedding", vec![msg(0, MessageRole::User, "eligible message one"), msg(1, MessageRole::Agent, "eligible message two")]);
+    storage.insert_conversation_tree(agent_id, None, &conv).expect("insert fixture conversation");
+    let conv_id = conv_id_of(&storage, "w3-4-missing-embedding");
+    let doc_a = message_id_at_idx(&storage, conv_id, 0);
+
+    let gen_id = create_generation(&storage, CANONICALIZE_PIPELINE_VERSION);
+    embed(&storage, gen_id, doc_a, conv_id, &[1.0, 0.0, 0.0, 0.0]);
+    rebuild_vec0(&storage, gen_id);
+
+    let report = run_activation_audit_and_record(&storage, gen_id, 100, Some(doc_a)).expect("audit runs, verdict is failure not an error");
+    assert!(!report.passed, "an eligible message with no embedding row must fail the identity-set check");
+    assert_eq!(report.eligible_not_embedded_count, 1);
+    assert_eq!(audit_status_of(&storage, gen_id), "failed");
+}
+
+#[test]
+fn audit_fails_on_embedded_doc_not_in_eligible_set() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let storage = open_storage(&dir.path().join("db.sqlite"));
+    let agent_id = ensure_agent(&storage);
+
+    // One real eligible+embedded message, plus a second message whose
+    // content is empty -- excluded by the packet-projection filter
+    // before canonicalize even runs (same exclusion the 8MiB-truncation
+    // debt in the backfill report relies on) -- yet it still has a
+    // (spurious) embedding row, simulating a stale/orphaned embedding
+    // for content that is no longer eligible.
+    let conv = conversation("w3-4-spurious-embedding", vec![msg(0, MessageRole::User, "eligible message one"), msg(1, MessageRole::Agent, "")]);
+    storage.insert_conversation_tree(agent_id, None, &conv).expect("insert fixture conversation");
+    let conv_id = conv_id_of(&storage, "w3-4-spurious-embedding");
+    let doc_a = message_id_at_idx(&storage, conv_id, 0);
+    let doc_empty = message_id_at_idx(&storage, conv_id, 1);
+
+    let gen_id = create_generation(&storage, CANONICALIZE_PIPELINE_VERSION);
+    embed(&storage, gen_id, doc_a, conv_id, &[1.0, 0.0, 0.0, 0.0]);
+    embed(&storage, gen_id, doc_empty, conv_id, &[0.0, 1.0, 0.0, 0.0]);
+    rebuild_vec0(&storage, gen_id);
+
+    let report = run_activation_audit_and_record(&storage, gen_id, 100, Some(doc_a)).expect("audit runs, verdict is failure not an error");
+    assert!(!report.passed, "an embedded doc_id no longer in the eligible set must fail the identity-set check");
+    assert_eq!(report.embedded_not_eligible_count, 1);
+    assert_eq!(audit_status_of(&storage, gen_id), "failed");
+}
+
+#[test]
+fn audit_fails_on_canonicalize_version_mismatch() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let storage = open_storage(&dir.path().join("db.sqlite"));
+    let agent_id = ensure_agent(&storage);
+    let conv = conversation("w3-4-version-mismatch", vec![msg(0, MessageRole::User, "the quick brown fox jumps")]);
+    storage.insert_conversation_tree(agent_id, None, &conv).expect("insert fixture conversation");
+    let conv_id = conv_id_of(&storage, "w3-4-version-mismatch");
+    let doc_a = message_id_at_idx(&storage, conv_id, 0);
+
+    // Generation identity carries a canonicalize_version that no longer
+    // matches the running binary's W3-0 fingerprint (an upgrade landed
+    // without a fresh generation) -- must be rejected even though every
+    // other invariant is clean.
+    let gen_id = create_generation(&storage, CANONICALIZE_PIPELINE_VERSION + 1);
+    embed(&storage, gen_id, doc_a, conv_id, &[1.0, 0.0, 0.0, 0.0]);
+    rebuild_vec0(&storage, gen_id);
+
+    let report = run_activation_audit_and_record(&storage, gen_id, 100, Some(doc_a)).expect("audit runs, verdict is failure not an error");
+    assert!(!report.passed, "a canonicalize_version mismatch must fail the audit");
+    assert_ne!(report.canonicalize_version_actual, i64::from(report.canonicalize_version_expected));
+    assert_eq!(audit_status_of(&storage, gen_id), "failed");
+}
+
+#[test]
+fn audit_fails_on_foreign_key_violation() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let storage = open_storage(&dir.path().join("db.sqlite"));
+    let (gen_id, doc_a, _doc_b) = clean_two_message_fixture(&storage);
+
+    // Orphan a message_embeddings row by deleting its parent `messages`
+    // row with FK enforcement suspended on a second raw connection (the
+    // crate's own `execute_batch_bypassing_foreign_keys_guard` is
+    // `pub(crate)`, unreachable from this external test crate -- a bare
+    // second `rusqlite` connection to the same file is this test's own
+    // bypass, same spirit as the existing r2b1 stray-residue test in
+    // src/indexer/mod.rs). Simulates a corruption class this
+    // generation's own write path (always CASCADE) could never itself
+    // produce.
+    storage.close_without_checkpoint().unwrap();
+    {
+        let raw = rusqlite::Connection::open(dir.path().join("db.sqlite")).unwrap();
+        raw.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        raw.execute("DELETE FROM messages WHERE id = ?1", rusqlite::params![doc_a]).unwrap();
+        raw.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    }
+    let storage = open_storage(&dir.path().join("db.sqlite"));
+
+    let report = run_activation_audit_and_record(&storage, gen_id, 100, None).expect("audit runs, verdict is failure not an error");
+    assert!(!report.passed, "an orphaned message_embeddings row must fail PRAGMA foreign_key_check");
+    assert!(report.foreign_key_violation_count >= 1);
+    assert_eq!(audit_status_of(&storage, gen_id), "failed");
+}
+
+#[test]
+fn audit_never_touches_the_active_generation_pointer() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let storage = open_storage(&dir.path().join("db.sqlite"));
+    let (gen_id, doc_a, _doc_b) = clean_two_message_fixture(&storage);
+
+    // Mark active first (simulating switch's minimal-verify-era
+    // activation, exactly staging generation_id=1's real starting state
+    // per the backfill report: is_active=1, audit_status='pending').
+    storage.raw().execute("UPDATE embedding_generations SET is_active = 1 WHERE id = ?1", fparams![gen_id]).unwrap();
+
+    // Corrupt it so the audit fails.
+    let bad_blob = schema::f32_vector_to_le_blob(&[1.0, 0.0]);
+    storage.raw().execute("UPDATE message_embeddings SET embedding = ?1 WHERE generation_id = ?2 AND doc_id = ?3", fparams![bad_blob, gen_id, doc_a]).unwrap();
+
+    let report = run_activation_audit_and_record(&storage, gen_id, 100, None).expect("audit runs, verdict is failure not an error");
+    assert!(!report.passed);
+
+    let is_active: i64 = storage.raw().query_row_map("SELECT is_active FROM embedding_generations WHERE id = ?1", fparams![gen_id], |row| row.get_typed(0)).unwrap();
+    assert_eq!(is_active, 1, "a failed audit must never move the is_active pointer -- it only ever writes audit_status");
+}
