@@ -9,6 +9,7 @@
 //! `UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test golden_readiness`
 
 use assert_cmd::Command;
+use coding_agent_search::search::canonicalize::CANONICALIZE_PIPELINE_VERSION;
 use coding_agent_search::search::policy::{CHUNKING_STRATEGY_VERSION, SEMANTIC_SCHEMA_VERSION};
 use coding_agent_search::search::semantic_manifest::{
     ArtifactRecord, BacklogLedger, BuildCheckpoint, SemanticManifest, TierKind,
@@ -204,6 +205,7 @@ fn seed_semantic_progress_fixture(
             model_revision: "hash".to_string(),
             schema_version: SEMANTIC_SCHEMA_VERSION,
             chunking_version: CHUNKING_STRATEGY_VERSION,
+            canonicalize_version: Some(CANONICALIZE_PIPELINE_VERSION),
             dimension: 256,
             doc_count: 120,
             conversation_count: 12,

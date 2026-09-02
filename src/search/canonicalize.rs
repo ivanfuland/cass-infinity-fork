@@ -19,6 +19,30 @@
 use frankensearch::{Canonicalizer, DefaultCanonicalizer};
 use ring::digest::{self, SHA256};
 
+/// Canonicalization pipeline version fingerprint.
+///
+/// Bump this whenever a commit changes the *output* of
+/// [`canonicalize_for_embedding`] for any input — markdown stripping rules,
+/// code block collapsing thresholds, whitespace normalization, the
+/// low-signal filter table, truncation length, fast/slow path equivalence,
+/// or NFC handling. A version mismatch is the explicit, checked signal that
+/// `content_hash` reuse across embedding generations is unsafe (the same
+/// raw text now canonicalizes to different bytes), replacing what would
+/// otherwise be a silent hash-based staleness bug. Do NOT bump for changes
+/// that provably do not alter output (internal caching, comments, doc-only
+/// edits, test-only code).
+///
+/// Consumers must not assume "absent fingerprint" means "matches v1" —
+/// see `R1-W3-N1` in the wave-3 plan: a manifest written before this
+/// constant existed carries no fingerprint at all, and the correct
+/// disposition for that case is a source-diff attestation
+/// (`git diff <legacy-source-commit>..HEAD -- src/search/canonicalize.rs`),
+/// not a silent pass. Runtime readiness checks therefore treat a missing
+/// or mismatched fingerprint as failing generation activation by default;
+/// callers that have performed the attestation stamp the accepted version
+/// explicitly rather than relying on an inferred match.
+pub const CANONICALIZE_PIPELINE_VERSION: u32 = 1;
+
 /// Maximum characters to keep after canonicalization.
 pub const MAX_EMBED_CHARS: usize = 2000;
 

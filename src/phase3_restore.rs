@@ -9947,6 +9947,7 @@ mod e7_restore_journal_tests {
             model_revision: "hash".into(),
             schema_version: 1,
             chunking_version: 1,
+            canonicalize_version: Some(crate::search::canonicalize::CANONICALIZE_PIPELINE_VERSION),
             dimension: 8,
             shard_index: 0,
             shard_count: 1,

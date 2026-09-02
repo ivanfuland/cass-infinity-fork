@@ -24,7 +24,9 @@ use crate::indexer::semantic_progress::{
 };
 use crate::model::conversation_packet::{ConversationPacket, ConversationPacketProvenance};
 use crate::model::types::{Conversation, Message};
-use crate::search::canonicalize::{canonicalize_for_embedding, content_hash};
+use crate::search::canonicalize::{
+    CANONICALIZE_PIPELINE_VERSION, canonicalize_for_embedding, content_hash,
+};
 use crate::search::embedder::Embedder;
 use crate::search::fastembed_embedder::FastEmbedder;
 use crate::search::hash_embedder::HashEmbedder;
@@ -2021,6 +2023,7 @@ impl SemanticIndexer {
             model_revision: plan.model_revision.clone(),
             schema_version: SEMANTIC_SCHEMA_VERSION,
             chunking_version: CHUNKING_STRATEGY_VERSION,
+            canonicalize_version: Some(CANONICALIZE_PIPELINE_VERSION),
             dimension: self.embedder_dimension(),
             shard_index,
             shard_count: 0,
@@ -2315,6 +2318,7 @@ impl SemanticIndexer {
                 model_revision: plan.model_revision,
                 schema_version: SEMANTIC_SCHEMA_VERSION,
                 chunking_version: CHUNKING_STRATEGY_VERSION,
+                canonicalize_version: Some(CANONICALIZE_PIPELINE_VERSION),
                 dimension: self.embedder_dimension(),
                 doc_count: u64::try_from(published_index.record_count()).unwrap_or(u64::MAX),
                 conversation_count: conversations_processed,

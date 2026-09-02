@@ -52,7 +52,7 @@ use crate::model::conversation_packet::{
     ConversationPacketProvenance, ConversationPacketSinkProjections,
 };
 use crate::search::asset_state::{SearchMaintenanceJobKind, SearchMaintenanceMode};
-use crate::search::canonicalize::is_hard_message_noise;
+use crate::search::canonicalize::{CANONICALIZE_PIPELINE_VERSION, is_hard_message_noise};
 use crate::search::vector_index::{
     ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_TOOL, ROLE_USER, vector_index_path,
 };
@@ -4963,6 +4963,7 @@ fn publish_direct_semantic_artifact(
         model_revision,
         schema_version: SEMANTIC_SCHEMA_VERSION,
         chunking_version: CHUNKING_STRATEGY_VERSION,
+        canonicalize_version: Some(CANONICALIZE_PIPELINE_VERSION),
         dimension: embedder_dimension,
         doc_count: embedded_doc_count,
         conversation_count: total_conversations,
@@ -11043,6 +11044,7 @@ fn publish_semantic_watch_once_artifact(
         model_revision: semantic_model_revision_for_embedder_id(indexer.embedder_id()),
         schema_version: SEMANTIC_SCHEMA_VERSION,
         chunking_version: CHUNKING_STRATEGY_VERSION,
+        canonicalize_version: Some(CANONICALIZE_PIPELINE_VERSION),
         dimension: indexer.embedder_dimension(),
         doc_count,
         conversation_count: selection.total_conversations,
