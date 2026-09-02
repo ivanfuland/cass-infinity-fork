@@ -19,11 +19,11 @@
 use std::io;
 use std::time::Duration;
 
-use frankensearch::ModelCategory;
 use serde::Deserialize;
 
 use crate::search::daemon_client::{DaemonClient, DaemonError};
 use crate::search::embedder::{Embedder, EmbedderError, EmbedderResult};
+use crate::search::frankensearch_types::ModelCategory;
 
 /// bge-m3 embedding dimension.
 const DIMENSION: usize = 1024;
@@ -423,8 +423,8 @@ impl Embedder for InfinityEmbedder {
         ModelCategory::ApiEmbedder
     }
 
-    fn tier(&self) -> frankensearch::ModelTier {
-        frankensearch::ModelTier::Quality
+    fn tier(&self) -> crate::search::frankensearch_types::ModelTier {
+        crate::search::frankensearch_types::ModelTier::Quality
     }
 }
 

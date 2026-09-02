@@ -1,10 +1,8 @@
-use anyhow::{Context, Result, anyhow, bail};
-use frankensearch::{
+use anyhow::{Context, Result, anyhow};
+use crate::search::frankensearch_rrf::{
     QueryClass as FsQueryClass, RrfConfig as FsRrfConfig, ScoreSource as FsScoreSource,
     ScoredResult as FsScoredResult, VectorHit as FsVectorHit,
-    candidate_count as fs_candidate_count,
-    index::VectorIndex as FsVectorIndex,
-    rrf_fuse as fs_rrf_fuse,
+    candidate_count as fs_candidate_count, rrf_fuse as fs_rrf_fuse,
 };
 use lru::LruCache;
 use once_cell::sync::Lazy;
@@ -440,8 +438,7 @@ use crate::search::canonicalize::{canonicalize_for_embedding, is_search_noise_te
 use crate::search::embedder::Embedder;
 use crate::search::lexical_rerank::{self, FieldAvgdl, RerankCandidate};
 use crate::search::vector_index::{
-    ROLE_USER, SemanticDocId, SemanticFilterMaps, VectorIndex, VectorSearchResult,
-    parse_semantic_doc_id, role_code_from_str,
+    ROLE_USER, SemanticDocId, VectorSearchResult, parse_semantic_doc_id, role_code_from_str,
 };
 use crate::sources::provenance::SourceFilter;
 
@@ -1534,8 +1531,6 @@ pub struct SearchResult {
     pub cache_stats: CacheStats,
     /// Did-you-mean suggestions when hits are empty or sparse
     pub suggestions: Vec<QuerySuggestion>,
-    /// ANN search statistics (present when --approximate was used)
-    pub ann_stats: Option<crate::search::ann_index::AnnSearchStats>,
     /// True total matching documents from the search engine when that is cheap
     /// and available. Large saturated lexical pages intentionally leave this as
     /// `None`; robot output then reports `total_matches` as a lower bound
@@ -2111,17 +2106,6 @@ impl QueryCache {
 struct SemanticSearchState {
     context_token: Arc<()>,
     embedder: Arc<dyn Embedder>,
-    /// `None` when this state has no legacy fsvi backing at all (W3-4
-    /// Step2-1: a DB-vector-domain-only generation, no `.fsvi` file ever
-    /// written for this embedder).
-    fs_semantic_index: Option<Arc<FsVectorIndex>>,
-    fs_semantic_indexes: Arc<Vec<Arc<FsVectorIndex>>>,
-    /// W3-5: retained but no longer read by any search path -- populated
-    /// by model_manager.rs's loaders (the still-pending "four loaders"
-    /// slice of ③-1). Restructuring the loader-side population is that
-    /// commit's call, not this one's.
-    ann_path: Option<PathBuf>,
-    filter_maps: SemanticFilterMaps,
     roles: Option<HashSet<u8>>,
     query_cache: QueryCache,
 }
@@ -3193,73 +3177,28 @@ impl SearchClient {
         }
     }
 
+    /// Install the DB-vector-domain semantic search context.
+    ///
+    /// W3-5: the legacy fsvi vector-index plumbing this used to thread
+    /// through (`fs_semantic_index`/`fs_semantic_indexes`/`ann_path`,
+    /// cross-checked embedder/dimension per shard) has been retired --
+    /// DB-vector-domain (`embedding_generations`/`message_embeddings`,
+    /// via `search_db_vector_domain`) is the sole candidate-fetch path and
+    /// never needed those fields (W3-4 Step2-1 already made them `None`/
+    /// empty on every call site; nothing ever read them back out).
+    /// `SemanticFilterMaps` (agent/workspace/source lookup tables) is
+    /// dropped from this call for the same reason: `search_db_vector_domain`
+    /// filters by role (`roles` below) and its own SQL joins, never by
+    /// those lookup maps -- grep-verified 2026-09-02, zero read sites ever
+    /// existed for them beyond construction.
     pub fn set_semantic_context(
         &self,
         embedder: Arc<dyn Embedder>,
-        fs_semantic_index: VectorIndex,
-        filter_maps: SemanticFilterMaps,
         roles: Option<HashSet<u8>>,
-        ann_path: Option<PathBuf>,
     ) -> Result<()> {
-        self.set_semantic_indexes_context(
-            embedder,
-            vec![fs_semantic_index],
-            filter_maps,
-            roles,
-            ann_path,
-        )
-    }
-
-    pub fn set_semantic_indexes_context(
-        &self,
-        embedder: Arc<dyn Embedder>,
-        fs_semantic_indexes: Vec<VectorIndex>,
-        filter_maps: SemanticFilterMaps,
-        roles: Option<HashSet<u8>>,
-        ann_path: Option<PathBuf>,
-    ) -> Result<()> {
-        // W3-4 Step2-1 (task book #62): a DB-vector-domain-backed loader
-        // (no legacy .fsvi file for this embedder) hands in zero indexes
-        // here -- that is no longer an error. `embedder_id`/`dimension`
-        // then come straight from `embedder` itself (it always carries
-        // both) rather than being read off a `VectorIndex`, since there
-        // may be none. Any real fsvi index still goes through the exact
-        // same per-index embedder/dimension cross-check as before (this
-        // path's behavior is unchanged whenever a real .fsvi file backs
-        // the call -- w3-4 Step2-1 constraint②).
-        let fs_semantic_indexes = fs_semantic_indexes
-            .into_iter()
-            .map(|index| {
-                let embedder_id = index.embedder_id().to_string();
-                let dimension = index.dimension();
-                if embedder_id != embedder.id() {
-                    bail!(
-                        "embedder mismatch: index uses {}, embedder is {}",
-                        embedder_id,
-                        embedder.id()
-                    );
-                }
-                if dimension != embedder.dimension() {
-                    bail!(
-                        "embedder dimension mismatch: index uses {}, embedder is {}",
-                        dimension,
-                        embedder.dimension()
-                    );
-                }
-                Ok(Arc::new(index))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let fs_semantic_index = fs_semantic_indexes.first().cloned();
-        let shard_count = fs_semantic_indexes.len();
-        let ann_path = if shard_count == 1 { ann_path } else { None };
-        let embedder_id = fs_semantic_index
-            .as_ref()
-            .map_or_else(|| embedder.id().to_string(), |index| index.embedder_id().to_string());
-        let dimension = fs_semantic_index.as_ref().map_or_else(|| embedder.dimension(), |index| index.dimension());
-        let fs_semantic_indexes = Arc::new(fs_semantic_indexes);
-
         let capacity = NonZeroUsize::new(100).ok_or_else(|| anyhow!("invalid cache size"))?;
         let context_token = Arc::new(());
+        let embedder_id = embedder.id().to_string();
         let mut state_guard = self
             .semantic
             .lock()
@@ -3267,21 +3206,9 @@ impl SearchClient {
         *state_guard = Some(SemanticSearchState {
             context_token,
             embedder,
-            fs_semantic_index,
-            fs_semantic_indexes,
-            ann_path,
-            filter_maps,
             roles,
             query_cache: QueryCache::new(embedder_id.as_str(), capacity),
         });
-        if shard_count > 1 {
-            tracing::info!(
-                shard_count,
-                dimension,
-                embedder = embedder_id,
-                "semantic search context loaded sharded vector generation"
-            );
-        }
         Ok(())
     }
 
@@ -3677,35 +3604,33 @@ impl SearchClient {
         embedding: &[f32],
         filters: &SearchFilters,
         request: SemanticCandidateSearchRequest,
-    ) -> Result<(
-        Vec<VectorSearchResult>,
-        SemanticCandidateRetryState,
-        Option<crate::search::ann_index::AnnSearchStats>,
-    )> {
+    ) -> Result<(Vec<VectorSearchResult>, SemanticCandidateRetryState)> {
         let sqlite_guard = self.sqlite_guard()?;
         let conn = sqlite_guard
             .as_ref()
             .ok_or_else(|| anyhow!("db vector domain search requires a database connection"))?;
-        let (results, retry_state) = Self::search_db_vector_domain(
+        Self::search_db_vector_domain(
             conn,
             embedding,
             filters,
             context.roles.as_ref(),
             request.fetch_limit,
-        )?;
-        Ok((results, retry_state, None))
+        )
     }
 
-    /// Semantic search result containing hits and optional ANN statistics.
+    /// Semantic search over the DB-vector-domain candidate path.
     ///
-    /// W3-5: `ann_stats` in the return type is retained for robot-output/TUI
-    /// schema compatibility, but is always `None` now -- the HNSW
+    /// W3-5: this used to also return `Option<AnnSearchStats>` for
+    /// robot-output/TUI schema compatibility with the retired HNSW
     /// approximate-search path (`--approximate`) and the progressive
     /// two-tier execution strategy (`search_semantic_with_tier`,
-    /// `SemanticTierMode`) were both fsvi-era acceleration surfaces with no
-    /// DB-vector-domain equivalent, retired alongside the fsvi candidate
-    /// path (KU2: an exact db_vector_domain scan is <2s at 101.6万 scale,
-    /// removing the accuracy/speed tradeoff motive for either).
+    /// `SemanticTierMode`) -- both fsvi-era acceleration surfaces with no
+    /// DB-vector-domain equivalent (KU2: an exact db_vector_domain scan is
+    /// <2s at 101.6万 scale, removing the accuracy/speed tradeoff motive for
+    /// either). That field was always `None` post-retirement (nothing ever
+    /// constructed a `Some`), so it -- and `ann_index.rs`, its sole source
+    /// -- are dropped rather than threaded through for a value that could
+    /// never be anything but absent.
     pub fn search_semantic(
         &self,
         query: &str,
@@ -3713,14 +3638,11 @@ impl SearchClient {
         limit: usize,
         offset: usize,
         field_mask: FieldMask,
-    ) -> Result<(
-        Vec<SearchHit>,
-        Option<crate::search::ann_index::AnnSearchStats>,
-    )> {
+    ) -> Result<Vec<SearchHit>> {
         let field_mask = effective_field_mask(field_mask);
         let canonical = canonicalize_for_embedding(query);
         if canonical.trim().is_empty() {
-            return Ok((Vec::new(), None));
+            return Ok(Vec::new());
         }
         let limit = if limit == 0 {
             self.total_docs().min(no_limit_result_cap()).max(1)
@@ -3729,7 +3651,7 @@ impl SearchClient {
         };
         let target_hits = limit.saturating_add(offset);
         if target_hits == 0 {
-            return Ok((Vec::new(), None));
+            return Ok(Vec::new());
         }
         let initial_fetch_limit = target_hits;
         let fallback_fetch_limit = target_hits.saturating_mul(3);
@@ -3774,7 +3696,7 @@ impl SearchClient {
                     Ok(self.postprocess_hits_page(hits, query, &filters, limit, offset))
                 };
 
-            let (results, retry_state, mut ann_stats) = self.search_semantic_candidates_dispatch(
+            let (results, retry_state) = self.search_semantic_candidates_dispatch(
                 &candidate_context,
                 &embedding,
                 &filters,
@@ -3801,7 +3723,7 @@ impl SearchClient {
                     fallback_fetch_limit,
                     "retrying semantic fetch due to candidate-window shortfall"
                 );
-                let (retry_results, _, retry_ann_stats) = self.search_semantic_candidates_dispatch(
+                let (retry_results, _) = self.search_semantic_candidates_dispatch(
                     &candidate_context,
                     &embedding,
                     &filters,
@@ -3814,7 +3736,6 @@ impl SearchClient {
                     continue;
                 }
                 (available_hits, paged_hits) = finalize_hits(&retry_results)?;
-                ann_stats = retry_ann_stats;
             }
 
             tracing::trace!(
@@ -3825,7 +3746,7 @@ impl SearchClient {
                 "semantic fetch complete"
             );
 
-            return Ok((paged_hits, ann_stats));
+            return Ok(paged_hits);
         }
     }
 
@@ -4205,7 +4126,6 @@ impl SearchClient {
             wildcard_fallback: false,
             cache_stats: baseline_stats,
             suggestions,
-            ann_stats: None,
             total_count: tantivy_total,
         })
     }
@@ -4236,7 +4156,6 @@ impl SearchClient {
                 wildcard_fallback: false,
                 cache_stats: self.cache_stats(),
                 suggestions: Vec::new(),
-                ann_stats: None,
                 total_count: None,
             });
         }
@@ -4262,7 +4181,7 @@ impl SearchClient {
             sparse_threshold,
             field_mask,
         )?;
-        let (semantic_hits, semantic_ann_stats) = self.search_semantic(
+        let semantic_hits = self.search_semantic(
             semantic_query,
             filters,
             budget.semantic_candidates,
@@ -4280,7 +4199,6 @@ impl SearchClient {
             wildcard_fallback: lexical.wildcard_fallback,
             cache_stats: lexical.cache_stats,
             suggestions,
-            ann_stats: semantic_ann_stats,
             total_count: None,
         })
     }
@@ -6079,8 +5997,8 @@ mod tests {
             false
         }
 
-        fn category(&self) -> frankensearch::ModelCategory {
-            frankensearch::ModelCategory::HashEmbedder
+        fn category(&self) -> crate::search::frankensearch_types::ModelCategory {
+            crate::search::frankensearch_types::ModelCategory::HashEmbedder
         }
     }
 
@@ -6101,8 +6019,8 @@ mod tests {
             false
         }
 
-        fn category(&self) -> frankensearch::ModelCategory {
-            frankensearch::ModelCategory::HashEmbedder
+        fn category(&self) -> crate::search::frankensearch_types::ModelCategory {
+            crate::search::frankensearch_types::ModelCategory::HashEmbedder
         }
     }
 
@@ -6344,10 +6262,6 @@ mod tests {
     }
 
     fn build_semantic_test_fixture() -> Result<SemanticTestFixture> {
-        build_semantic_test_fixture_with_shards(false)
-    }
-
-    fn build_semantic_test_fixture_with_shards(sharded: bool) -> Result<SemanticTestFixture> {
         let dir = TempDir::new()?;
         let db_path = dir.path().join("cass.db");
         let storage = FrankenStorage::open(&db_path)?;
@@ -6432,14 +6346,10 @@ mod tests {
             "fixture should create 3 messages"
         );
 
-        let filter_maps = SemanticFilterMaps::from_storage(&storage)?;
         let embedder = Arc::new(FixedTestEmbedder::new("test-fixed-2d", &[1.0, 0.0]));
         let source_hash = crc32fast::hash(crate::sources::provenance::LOCAL_SOURCE_ID.as_bytes());
-        let vector_dir = dir.path().join("vector_index");
-        std::fs::create_dir_all(&vector_dir)?;
-        let mut vector_records = Vec::with_capacity(documents.len());
 
-        for ((message_id, created_at_ms, _conversation_id), (_, _, vector)) in
+        for ((message_id, created_at_ms, _conversation_id), (_, _, _vector)) in
             message_rows.iter().zip(documents)
         {
             let doc_id = SemanticDocId {
@@ -6453,73 +6363,35 @@ mod tests {
                 content_hash: None,
             }
             .to_doc_id_string();
-            doc_ids.push(doc_id.clone());
-            vector_records.push((doc_id, vector));
+            doc_ids.push(doc_id);
         }
 
-        let mut vector_indexes = Vec::new();
-        if sharded {
-            for (shard_index, chunk) in vector_records.chunks(2).enumerate() {
-                let vector_path = vector_dir.join(format!("shard-{shard_index}.fsvi"));
-                let mut writer = VectorIndex::create_with_revision(
-                    &vector_path,
-                    embedder.id(),
-                    "rev-1",
-                    embedder.dimension(),
-                    frankensearch::index::Quantization::F16,
-                )?;
-                for (doc_id, vector) in chunk {
-                    writer.write_record(doc_id, vector)?;
-                }
-                writer.finish()?;
-                vector_indexes.push(VectorIndex::open(&vector_path)?);
-            }
-        } else {
-            let vector_path = vector_dir.join("index-test-fixed-2d.fsvi");
-            let mut writer = VectorIndex::create_with_revision(
-                &vector_path,
-                embedder.id(),
-                "rev-1",
-                embedder.dimension(),
-                frankensearch::index::Quantization::F16,
-            )?;
-            for (doc_id, vector) in &vector_records {
-                writer.write_record(doc_id, vector)?;
-            }
-            writer.finish()?;
-            vector_indexes.push(VectorIndex::open(&vector_path)?);
-
-            // W3-3 fixture-fidelity: this (unsharded) fixture also feeds
-            // callers of `search_semantic`/`search_semantic_with_tier`,
-            // which now default to the DB vector domain
-            // (`search_db_vector_domain`) rather than the fsvi index built
-            // above. Seed an equivalent active generation through the same
-            // production write path (`create_embedding_generation` +
-            // `insert_message_embedding` + `switch_active_generation` +
-            // `rebuild_vec0_table_for_generation`, see
-            // `seed_active_generation_with_vectors`) so DB-path semantic
-            // search sees the same three documents/vectors as the fsvi
-            // index does. The sharded fixture deliberately does NOT get
-            // this treatment: it exists specifically to pin fsvi's
-            // multi-shard-index-merge behavior, which has no DB-domain
-            // analogue (one flat `vec0` table per generation).
-            let db_vectors: Vec<(i64, i64, Vec<f32>)> = message_rows
-                .iter()
-                .zip(documents)
-                .map(|((message_id, _created_at_ms, conversation_id), (_, _, vector))| {
-                    (
-                        i64::try_from(*message_id).unwrap_or(i64::MAX),
-                        *conversation_id,
-                        vector.to_vec(),
-                    )
-                })
-                .collect();
-            seed_active_generation_with_vectors(&storage, 2, &db_vectors);
-        }
+        // W3-5: DB-vector-domain (`search_db_vector_domain`) is the sole
+        // semantic candidate-fetch path now -- seed an active generation
+        // through the same production write path
+        // (`create_embedding_generation` + `insert_message_embedding` +
+        // `switch_active_generation` + `rebuild_vec0_table_for_generation`,
+        // see `seed_active_generation_with_vectors`) instead of the retired
+        // fsvi `VectorIndex` writer this fixture used to build (previously
+        // this also had a `sharded: bool` mode pinning fsvi's multi-shard-
+        // index-merge behavior; that had zero real callers even before the
+        // fsvi retirement and is dropped along with it).
+        let db_vectors: Vec<(i64, i64, Vec<f32>)> = message_rows
+            .iter()
+            .zip(documents)
+            .map(|((message_id, _created_at_ms, conversation_id), (_, _, vector))| {
+                (
+                    i64::try_from(*message_id).unwrap_or(i64::MAX),
+                    *conversation_id,
+                    vector.to_vec(),
+                )
+            })
+            .collect();
+        seed_active_generation_with_vectors(&storage, 2, &db_vectors);
         drop(storage);
 
         let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("db-backed client");
-        client.set_semantic_indexes_context(embedder, vector_indexes, filter_maps, None, None)?;
+        client.set_semantic_context(embedder, None)?;
 
         Ok(SemanticTestFixture {
             _dir: dir,
@@ -12717,7 +12589,7 @@ mod tests {
             .session_paths
             .insert(fixture.source_paths[2].clone());
 
-        let (hits, ann_stats) = fixture.client.search_semantic(
+        let hits = fixture.client.search_semantic(
             "semantic fixture query",
             filters,
             1,
@@ -12725,10 +12597,6 @@ mod tests {
             FieldMask::FULL,
         )?;
 
-        assert!(
-            ann_stats.is_none(),
-            "exact search should not emit ANN stats"
-        );
         assert_eq!(
             hits.len(),
             1,
@@ -12753,7 +12621,7 @@ mod tests {
             .session_paths
             .insert(fixture.source_paths[2].clone());
 
-        let (hits, _) = fixture.client.search_semantic(
+        let hits = fixture.client.search_semantic(
             "semantic fixture query",
             filters,
             1,

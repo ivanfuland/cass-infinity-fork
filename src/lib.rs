@@ -161,7 +161,6 @@ struct IndexEntrypointDiagnostics {
     watch: bool,
     watch_once_path_count: usize,
     semantic: bool,
-    build_hnsw: bool,
     migration_state: &'static str,
 }
 
@@ -171,8 +170,11 @@ fn index_entrypoint_diagnostics(
     watch: bool,
     watch_once_path_count: usize,
     semantic: bool,
-    build_hnsw: bool,
 ) -> IndexEntrypointDiagnostics {
+    // W3-5: the "semantic_hnsw" kind (semantic && build_hnsw) is dropped
+    // along with the retired `--build-hnsw` flag -- `cass index --build-hnsw`
+    // has had no query-time reader since 3f7aa054 (`--approximate` removal),
+    // and the flag itself is now gone.
     let kind = if watch_once_path_count > 0 {
         if watch { "watch_cycle" } else { "watch_once" }
     } else if watch {
@@ -181,8 +183,6 @@ fn index_entrypoint_diagnostics(
         "full_rebuild"
     } else if force_rebuild {
         "force_rebuild"
-    } else if semantic && build_hnsw {
-        "semantic_hnsw"
     } else if semantic {
         "semantic_backfill"
     } else {
@@ -196,7 +196,6 @@ fn index_entrypoint_diagnostics(
         watch,
         watch_once_path_count,
         semantic,
-        build_hnsw,
         migration_state: "tin8o_entrypoint_observed",
     }
 }
@@ -365,14 +364,6 @@ pub enum Commands {
         /// Build semantic vector index after text indexing
         #[arg(long)]
         semantic: bool,
-
-        /// Build HNSW index for approximate nearest neighbor search (requires --semantic).
-        /// W3-5: `cass search --approximate` (the query-time consumer of this
-        /// index) was retired alongside the fsvi candidate-search path; this
-        /// flag remains for potential future ANN consumers but currently
-        /// has no query-time reader.
-        #[arg(long, default_value_t = false)]
-        build_hnsw: bool,
 
         /// Embedder to use for semantic indexing (hash, fastembed)
         #[arg(long, default_value = "fastembed")]
@@ -5150,7 +5141,6 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         "resume",
         "non-interactive",
         // Missing flags added
-        "build-hnsw",
         "export-only",
         "verify",
         "scan-secrets",
@@ -6830,7 +6820,6 @@ async fn execute_cli(
                     watch_interval,
                     data_dir,
                     semantic,
-                    build_hnsw,
                     embedder,
                     idempotency_key,
                     json,
@@ -6848,7 +6837,6 @@ async fn execute_cli(
                         watch_interval,
                         data_dir,
                         semantic,
-                        build_hnsw,
                         embedder,
                         progress,
                         structured_format,
@@ -23152,9 +23140,6 @@ fn run_cli_search(
 
         if let Some(context) = setup.context {
             let embedder = context.embedder;
-            let index = context.index;
-            let additional_indexes = context.additional_indexes;
-            let filter_maps = context.filter_maps;
             let roles = context.roles;
 
             let embedder: Arc<dyn crate::search::embedder::Embedder> = if semantic_opts.use_daemon {
@@ -23197,23 +23182,7 @@ fn run_cli_search(
                 embedder
             };
 
-            let ann_path = Some(
-                data_dir
-                    .join(crate::search::vector_index::VECTOR_INDEX_DIR)
-                    .join(format!("hnsw-{}.chsw", embedder.id())),
-            );
-            // W3-4 Step2-1 (task book #62): `index` is `None` for a
-            // DB-vector-domain-only context (no legacy .fsvi file for
-            // this embedder) -- `set_semantic_indexes_context` now
-            // accepts zero indexes for exactly that case.
-            let mut indexes = Vec::with_capacity(additional_indexes.len().saturating_add(1));
-            if let Some(index) = index {
-                indexes.push(index);
-            }
-            indexes.extend(additional_indexes);
-            if let Err(err) =
-                client.set_semantic_indexes_context(embedder, indexes, filter_maps, roles, ann_path)
-            {
+            if let Err(err) = client.set_semantic_context(embedder, roles) {
                 let hint = if prefer_hash {
                     "Run 'cass index --semantic --embedder hash' to rebuild the hash vector index, or omit --mode semantic when lexical evidence is acceptable"
                         .to_string()
@@ -23377,7 +23346,7 @@ fn run_cli_search(
             }
             #[cfg(any(feature = "semantic", feature = "infinity"))]
             {
-                let (hits, ann_stats) = client
+                let hits = client
                     .search_semantic(query, filters.clone(), search_limit, search_offset, field_mask)
                     .map_err(|e| {
                         let err_str = e.to_string();
@@ -23412,7 +23381,6 @@ fn run_cli_search(
                     wildcard_fallback: false,
                     cache_stats: crate::search::query::CacheStats::default(),
                     suggestions: Vec::new(),
-                    ann_stats,
                     total_count: None,
                 }
             }
@@ -23604,7 +23572,6 @@ fn run_cli_search(
                             wildcard_fallback: result.wildcard_fallback,
                             cache_stats: result.cache_stats,
                             suggestions: result.suggestions,
-                            ann_stats: result.ann_stats,
                             total_count: result.total_count,
                         }
                     }
@@ -23670,7 +23637,6 @@ fn run_cli_search(
                 wildcard_fallback: result.wildcard_fallback,
                 cache_stats: result.cache_stats,
                 suggestions: result.suggestions.clone(),
-                ann_stats: result.ann_stats.clone(),
                 total_count: result.total_count,
             };
             let has_more = total > offset_val + display.hits.len();
@@ -23698,7 +23664,6 @@ fn run_cli_search(
                 wildcard_fallback: result.wildcard_fallback,
                 cache_stats: result.cache_stats,
                 suggestions: result.suggestions,
-                ann_stats: result.ann_stats,
                 total_count: result.total_count,
             };
             (
@@ -26554,15 +26519,6 @@ fn output_robot_results(
                         m.insert("partial_results".to_string(), serde_json::json!(true));
                     }
                 }
-                // Add ANN stats to _meta if approximate search was used
-                if let Some(ref ann_stats) = result.ann_stats
-                    && let serde_json::Value::Object(ref mut m) = meta
-                {
-                    m.insert(
-                        "ann_stats".to_string(),
-                        serde_json::to_value(ann_stats).unwrap_or_default(),
-                    );
-                }
                 map.insert("_meta".to_string(), meta);
 
                 if let Some(warn) = &warning {
@@ -26865,15 +26821,6 @@ fn output_robot_results(
                         m.insert("partial_results".to_string(), serde_json::json!(true));
                     }
                 }
-                // Add ANN stats to _meta if approximate search was used
-                if let Some(ref ann_stats) = result.ann_stats
-                    && let serde_json::Value::Object(ref mut m) = meta
-                {
-                    m.insert(
-                        "ann_stats".to_string(),
-                        serde_json::to_value(ann_stats).unwrap_or_default(),
-                    );
-                }
                 map.insert("_meta".to_string(), meta);
                 if let Some(warn) = &warning {
                     map.insert(
@@ -26997,15 +26944,6 @@ fn output_robot_results(
                     if timed_out {
                         m.insert("partial_results".to_string(), serde_json::json!(true));
                     }
-                }
-                // Add ANN stats to _meta if approximate search was used
-                if let Some(ref ann_stats) = result.ann_stats
-                    && let serde_json::Value::Object(ref mut m) = meta
-                {
-                    m.insert(
-                        "ann_stats".to_string(),
-                        serde_json::to_value(ann_stats).unwrap_or_default(),
-                    );
                 }
                 map.insert("_meta".to_string(), meta);
                 if let Some(warn) = &warning {
@@ -75587,7 +75525,6 @@ pub(crate) fn run_doctor_impl(
                     db_path: db_path.clone(),
                     data_dir: data_dir.clone(),
                     semantic: false,
-                    build_hnsw: false,
                     embedder: "fastembed".to_string(),
                     progress: Some(progress.clone()),
                     watch_interval_secs: 30,
@@ -85358,7 +85295,6 @@ fn refresh_index_inline(db_override: Option<PathBuf>, data_dir_override: Option<
         db_path,
         data_dir,
         semantic: false,
-        build_hnsw: false,
         embedder: "fastembed".to_string(),
         progress: Some(Arc::clone(&progress)),
         watch_interval_secs: 30,
@@ -85454,7 +85390,6 @@ fn run_index_with_data(
     watch_interval: u64,
     data_dir_override: Option<PathBuf>,
     semantic: bool,
-    build_hnsw: bool,
     embedder: String,
     progress: ProgressResolved,
     output_format: Option<RobotFormat>,
@@ -85487,7 +85422,6 @@ fn run_index_with_data(
         force_rebuild.hash(&mut hasher);
         watch.hash(&mut hasher);
         semantic.hash(&mut hasher);
-        build_hnsw.hash(&mut hasher);
         embedder.hash(&mut hasher);
         robot_trace_ingest.hash(&mut hasher);
         format!("{}", data_dir.display()).hash(&mut hasher);
@@ -85575,7 +85509,6 @@ fn run_index_with_data(
             .map(std::vec::Vec::len)
             .unwrap_or_default(),
         semantic,
-        build_hnsw,
     );
 
     // Decide whether to emit NDJSON progress events on stderr (structured output only).
@@ -85617,7 +85550,6 @@ fn run_index_with_data(
             "watch": watch,
             "entrypoint": entrypoint.kind,
             "semantic": semantic,
-            "build_hnsw": build_hnsw,
             "embedder": embedder,
             "data_dir": data_dir.display().to_string(),
             "db_path": db_path.display().to_string(),
@@ -85660,7 +85592,6 @@ fn run_index_with_data(
         db_path: db_path.clone(),
         data_dir: data_dir.clone(),
         semantic,
-        build_hnsw,
         embedder: embedder.clone(),
         progress: Some(index_progress.clone()),
         watch_interval_secs: watch_interval,
@@ -95308,7 +95239,6 @@ fn run_sources_sync(
             30,             // watch_interval (default)
             Some(data_dir), // data_dir
             false,          // semantic
-            false,          // build_hnsw
             "fastembed".to_string(),
             progress,
             output_format,
@@ -95461,7 +95391,6 @@ fn run_sources_reingest(
         30,                     // watch_interval (default)
         Some(data_dir.clone()), // data_dir (existing mirror root is discovered here)
         false,                  // semantic
-        false,                  // build_hnsw
         "fastembed".to_string(),
         progress,
         output_format,

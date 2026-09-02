@@ -1,32 +1,28 @@
 //! FastEmbed-based cross-encoder reranker (ms-marco-MiniLM-L-6-v2).
 //!
-//! Re-exports [`FastEmbedReranker`] from `frankensearch::rerank::fastembed_reranker`.
-//! The implementation lives in the `frankensearch-rerank` crate.
+//! # OQ3 (W3-5): unconditional local no-op stub
 //!
-//! # `semantic` feature gate (cass#256)
-//!
-//! When the `semantic` Cargo feature is **disabled** (i.e. baseline build), the
-//! upstream `frankensearch::FastEmbedReranker` is not available because
-//! `frankensearch/fastembed-reranker` is the feature path that drags in
-//! `fastembed` and the prebuilt Microsoft ONNX Runtime binary. In that build a
-//! local stub `FastEmbedReranker` is exposed: it has the same public surface
-//! the rest of the crate relies on (`default_model_dir`, `load_from_dir`,
-//! `reranker_id_static`) but the loader returns a stable
-//! `RerankerError::RerankerUnavailable` and the reranker cannot be
-//! instantiated. Lexical search remains fully available.
+//! Previously this module re-exported `frankensearch::FastEmbedReranker`
+//! (backed by the `frankensearch-rerank` crate, which pulls in `fastembed`)
+//! when the `semantic` Cargo feature was enabled, and fell back to a local
+//! stub otherwise. Now that the `frankensearch` dependency itself is
+//! retired, both branches collapse onto the same stub unconditionally: it
+//! has the same public surface the rest of the crate relies on
+//! (`default_model_dir`, `load_from_dir`, `reranker_id_static`) but the
+//! loader always returns a stable `RerankerError::RerankerUnavailable` and
+//! the reranker cannot be instantiated. Lexical search remains fully
+//! available. A real local cross-encoder reranker (e.g. via the `fastembed`
+//! crate's own `TextRerank`, already a direct cass dependency under the
+//! `semantic` feature) is a deliberately out-of-scope future decision, not
+//! silently reintroduced here.
 
-#[cfg(feature = "semantic")]
-pub use frankensearch::FastEmbedReranker;
-
-#[cfg(not(feature = "semantic"))]
 pub use stub::FastEmbedReranker;
 
-#[cfg(not(feature = "semantic"))]
 mod stub {
     use std::path::{Path, PathBuf};
 
+    use crate::search::frankensearch_types::{RerankDocument, RerankScore};
     use crate::search::reranker::{Reranker, RerankerError, RerankerResult};
-    use frankensearch::{RerankDocument, RerankScore};
 
     const MS_MARCO_RERANKER_ID: &str = "ms-marco-minilm-l6-v2";
     const MS_MARCO_DIR_NAME: &str = "ms-marco-MiniLM-L-6-v2";

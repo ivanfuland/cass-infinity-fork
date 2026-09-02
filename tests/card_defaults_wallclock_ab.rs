@@ -108,7 +108,6 @@ fn run_cell(label: &str, governor: &str, combine: &str, shadow: &str, corpus_siz
         db_path,
         data_dir: data_dir.clone(),
         semantic: false,
-        build_hnsw: false,
         embedder: "fastembed".to_string(),
         progress: None,
         watch_interval_secs: 30,

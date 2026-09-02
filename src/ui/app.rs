@@ -15488,7 +15488,7 @@ impl SearchService for TantivySearchService {
                     )
                     .map_err(|e| e.to_string()),
                 SearchMode::Semantic => {
-                    let (hits, ann_stats) = self
+                    let hits = self
                         .client
                         .search_semantic(&params.query, params.filters.clone(), limit, offset, field_mask)
                         .map_err(|e| e.to_string())?;
@@ -15497,7 +15497,6 @@ impl SearchService for TantivySearchService {
                         wildcard_fallback: false,
                         cache_stats: crate::search::query::CacheStats::default(),
                         suggestions: Vec::new(),
-                        ann_stats,
                         total_count: None,
                     })
                 }
@@ -19431,7 +19430,6 @@ impl super::ftui_adapter::Model for CassApp {
                             db_path,
                             data_dir,
                             semantic: false,
-                            build_hnsw: false,
                             embedder: "fastembed".to_string(),
                             progress: Some(progress),
                             watch_interval_secs: 30,
@@ -23215,24 +23213,9 @@ pub fn run_tui_ftui(
                 model.semantic_availability = setup.availability.clone();
 
                 if let Some(context) = setup.context {
-                    let ann_path = Some(
-                        data_dir
-                            .join(crate::search::vector_index::VECTOR_INDEX_DIR)
-                            .join(format!("hnsw-{}.chsw", context.embedder.id())),
-                    );
-                    let mut indexes =
-                        Vec::with_capacity(context.additional_indexes.len().saturating_add(1));
-                    if let Some(index) = context.index {
-                        indexes.push(index);
-                    }
-                    indexes.extend(context.additional_indexes);
-                    if let Err(err) = client.set_semantic_indexes_context(
-                        context.embedder,
-                        indexes,
-                        context.filter_maps,
-                        context.roles,
-                        ann_path,
-                    ) {
+                    if let Err(err) =
+                        client.set_semantic_context(context.embedder, context.roles)
+                    {
                         tracing::debug!(error = %err, "tui semantic context unavailable");
                         let _ = client.clear_semantic_context();
                     }

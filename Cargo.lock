@@ -984,6 +984,7 @@ name = "coding-agent-search"
 version = "0.6.17"
 dependencies = [
  "aes-gcm",
+ "ahash",
  "anyhow",
  "arbitrary",
  "argon2",

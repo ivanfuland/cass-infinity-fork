@@ -5514,7 +5514,6 @@ mod e5_p30_blob_read_tests {
             db_path: data_dir.join("db.sqlite"),
             data_dir: data_dir.to_path_buf(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,

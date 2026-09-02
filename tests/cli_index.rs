@@ -322,7 +322,6 @@ fn index_refresh_data_dir_scopes_rebuild_semantic_and_watch_once_controls() -> R
             "--full",
             "--force-rebuild",
             "--semantic",
-            "--build-hnsw",
             "--watch-once",
             "/sessions/one.jsonl,/sessions/two.jsonl",
             "--json",
@@ -336,7 +335,6 @@ fn index_refresh_data_dir_scopes_rebuild_semantic_and_watch_once_controls() -> R
             full: true,
             force_rebuild: true,
             semantic: true,
-            build_hnsw: true,
             watch_once: Some(paths),
             json: true,
             ..

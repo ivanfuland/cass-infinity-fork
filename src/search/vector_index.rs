@@ -1,21 +1,23 @@
 //! Vector index facade for cass.
 //!
-//! cass uses the frankensearch FSVI vector index format and search primitives
-//! (via the `frankensearch` crate). The older CVVI format has been retired.
-//!
-//! This module keeps cass-specific helpers (paths, role codes) in one place.
+//! W3-5: the frankensearch-backed FSVI vector index format (`VectorIndex`/
+//! `VectorIndexWriter`/`Quantization`/`SearchParams`, plus the query-time
+//! HNSW-ANN path and `cass index --build-hnsw`) has been retired -- a
+//! builder with no reader (search-side HNSW consumption was already cut in
+//! 3f7aa054) whose two stated reasons for staying (a W3-2 migrator that
+//! still needed to read `.fsvi`, and hash being the "always-on" fallback
+//! embedder) both no longer hold: W3-2 itself was cancelled, and the hash
+//! embedder's own write path was retired in 4064e8fc. The DB-vector-domain
+//! (`message_embeddings` + sqlite-vec) engine is the sole vector search
+//! path now. This module keeps the still-live cass-specific helpers (doc_id
+//! encoding, role codes, portable-SIMD dot product) in one place.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow};
-use crate::storage::api::Conn as FrankenConnection;
 use half::f16;
-
-pub use frankensearch::index::{Quantization, SearchParams, VectorIndex, VectorIndexWriter};
-
-use crate::sources::provenance::SourceKind;
-use crate::storage::sqlite::FrankenStorage;
+use wide::f32x8;
 
 /// Directory under the cass data dir where vector artifacts are stored.
 pub const VECTOR_INDEX_DIR: &str = "vector_index";
@@ -161,102 +163,6 @@ pub fn parse_semantic_doc_id(doc_id: &str) -> Option<SemanticDocId> {
     Some(parsed)
 }
 
-fn source_id_hash(source_id: &str) -> u32 {
-    let mut hasher = crc32fast::Hasher::new();
-    hasher.update(source_id.as_bytes());
-    hasher.finalize()
-}
-
-/// Lookup maps for converting human filters (agent slug, workspace path, source id)
-/// into compact numeric IDs embedded into semantic doc_id strings.
-#[derive(Debug, Clone)]
-pub struct SemanticFilterMaps {
-    agent_slug_to_id: HashMap<String, u32>,
-    workspace_path_to_id: HashMap<String, u32>,
-    source_id_to_id: HashMap<String, u32>,
-    remote_source_ids: HashSet<u32>,
-}
-
-impl SemanticFilterMaps {
-    pub fn from_storage(storage: &FrankenStorage) -> Result<Self> {
-        Self::from_connection(storage.raw())
-    }
-
-    pub fn from_connection(conn: &FrankenConnection) -> Result<Self> {
-        let mut agent_slug_to_id = HashMap::new();
-        let agent_rows = conn.query_all_map(
-            "SELECT id, slug FROM agents",
-            &[],
-            |row| {
-                let id: i64 = row.get_typed(0)?;
-                let slug: String = row.get_typed(1)?;
-                Ok((id, slug))
-            },
-        )?;
-        for (id, slug) in agent_rows {
-            let id_u32 = u32::try_from(id).map_err(|_| anyhow!("agent id out of range"))?;
-            agent_slug_to_id.insert(slug, id_u32);
-        }
-
-        let mut workspace_path_to_id = HashMap::new();
-        let workspace_rows = conn.query_all_map(
-            "SELECT id, path FROM workspaces",
-            &[],
-            |row| {
-                let id: i64 = row.get_typed(0)?;
-                let path: String = row.get_typed(1)?;
-                Ok((id, path))
-            },
-        )?;
-        for (id, path) in workspace_rows {
-            let id_u32 = u32::try_from(id).map_err(|_| anyhow!("workspace id out of range"))?;
-            workspace_path_to_id.insert(path, id_u32);
-        }
-
-        let mut source_id_to_id = HashMap::new();
-        let mut remote_source_ids = HashSet::new();
-        let source_rows = conn.query_all_map(
-            "SELECT id, kind FROM sources",
-            &[],
-            |row| {
-                let id: String = row.get_typed(0)?;
-                let kind: String = row.get_typed(1)?;
-                Ok((id, kind))
-            },
-        )?;
-        for (id, kind) in source_rows {
-            let id_u32 = source_id_hash(&id);
-            if SourceKind::parse(&kind).is_none_or(|k| k.is_remote()) {
-                remote_source_ids.insert(id_u32);
-            }
-            source_id_to_id.insert(id, id_u32);
-        }
-
-        Ok(Self {
-            agent_slug_to_id,
-            workspace_path_to_id,
-            source_id_to_id,
-            remote_source_ids,
-        })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_tests(
-        agent_slug_to_id: HashMap<String, u32>,
-        workspace_path_to_id: HashMap<String, u32>,
-        source_id_to_id: HashMap<String, u32>,
-        remote_source_ids: HashSet<u32>,
-    ) -> Self {
-        Self {
-            agent_slug_to_id,
-            workspace_path_to_id,
-            source_id_to_id,
-            remote_source_ids,
-        }
-    }
-
-}
-
 /// Collapsed semantic search hit (best chunk per message).
 #[derive(Debug, Clone)]
 pub struct VectorSearchResult {
@@ -271,10 +177,10 @@ pub fn dot_product_scalar_bench(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
-/// SIMD dot product benchmark helper (uses frankensearch's portable SIMD).
+/// SIMD dot product benchmark helper (portable SIMD via `wide`).
 #[must_use]
 pub fn dot_product_simd_bench(a: &[f32], b: &[f32]) -> f32 {
-    frankensearch::index::dot_product_f32_f32(a, b).expect("dot product inputs must match length")
+    dot_product_f32_f32(a, b).expect("dot product inputs must match length")
 }
 
 /// Scalar dot product benchmark helper for f16 stored vectors vs f32 query.
@@ -286,8 +192,122 @@ pub fn dot_product_f16_scalar_bench(stored: &[f16], query: &[f32]) -> f32 {
 /// SIMD dot product benchmark helper for f16 stored vectors vs f32 query.
 #[must_use]
 pub fn dot_product_f16_simd_bench(stored: &[f16], query: &[f32]) -> f32 {
-    frankensearch::index::dot_product_f16_f32(stored, query)
-        .expect("dot product inputs must match length")
+    dot_product_f16_f32(stored, query).expect("dot product inputs must match length")
+}
+
+// ============================================================================
+// W3-5 verbatim restore of `frankensearch-index/src/simd.rs`'s portable-SIMD
+// dot product primitives (git rev `2cad158f4468ece7076e3fe529c8e5c20b2e020e`,
+// <https://github.com/Dicklesworthstone/frankensearch>), now that the
+// `frankensearch` Cargo dependency itself is retired. These two functions
+// are pure SIMD arithmetic (`wide::f32x8`), unrelated to the FSVI file
+// format retired above; their only consumers are `benches/runtime_perf.rs`,
+// `benches/search_perf.rs`, and `tests/simd_tests.rs` (SIMD-vs-scalar
+// correctness/speed validation), which is why they're restored rather than
+// deleted alongside the FSVI format. `dot_product_f16_bytes_f32`/
+// `dot_product_f32_bytes_f32`/`cosine_similarity_f16` from the same
+// upstream file are dropped: zero consumers in this crate.
+// ============================================================================
+
+/// Dot product between two f32 vectors.
+///
+/// # Errors
+///
+/// Returns an error when slice lengths differ.
+pub fn dot_product_f32_f32(a: &[f32], b: &[f32]) -> Result<f32> {
+    ensure_same_len(a.len(), b.len())?;
+    Ok(dot_product_f32_f32_unchecked(a, b))
+}
+
+/// Dot product between an f16 stored vector and an f32 query vector.
+///
+/// # Errors
+///
+/// Returns an error when slice lengths differ.
+pub fn dot_product_f16_f32(stored: &[f16], query: &[f32]) -> Result<f32> {
+    ensure_same_len(stored.len(), query.len())?;
+
+    let mut sum = f32x8::splat(0.0);
+    let mut stored_chunks = stored.chunks_exact(8);
+    let mut query_chunks = query.chunks_exact(8);
+
+    for (stored_chunk, query_chunk) in stored_chunks.by_ref().zip(query_chunks.by_ref()) {
+        let s = [
+            stored_chunk[0].to_f32(),
+            stored_chunk[1].to_f32(),
+            stored_chunk[2].to_f32(),
+            stored_chunk[3].to_f32(),
+            stored_chunk[4].to_f32(),
+            stored_chunk[5].to_f32(),
+            stored_chunk[6].to_f32(),
+            stored_chunk[7].to_f32(),
+        ];
+        let q = [
+            query_chunk[0],
+            query_chunk[1],
+            query_chunk[2],
+            query_chunk[3],
+            query_chunk[4],
+            query_chunk[5],
+            query_chunk[6],
+            query_chunk[7],
+        ];
+        sum += f32x8::from(s) * f32x8::from(q);
+    }
+
+    let mut result = sum.reduce_add();
+    for (s, q) in stored_chunks
+        .remainder()
+        .iter()
+        .zip(query_chunks.remainder())
+    {
+        result += s.to_f32() * q;
+    }
+    Ok(result)
+}
+
+fn dot_product_f32_f32_unchecked(a: &[f32], b: &[f32]) -> f32 {
+    let mut sum = f32x8::splat(0.0);
+    let mut a_chunks = a.chunks_exact(8);
+    let mut b_chunks = b.chunks_exact(8);
+
+    for (a_chunk, b_chunk) in a_chunks.by_ref().zip(b_chunks.by_ref()) {
+        let a_arr = [
+            a_chunk[0], a_chunk[1], a_chunk[2], a_chunk[3], a_chunk[4], a_chunk[5], a_chunk[6],
+            a_chunk[7],
+        ];
+        let b_arr = [
+            b_chunk[0], b_chunk[1], b_chunk[2], b_chunk[3], b_chunk[4], b_chunk[5], b_chunk[6],
+            b_chunk[7],
+        ];
+        sum += f32x8::from(a_arr) * f32x8::from(b_arr);
+    }
+
+    let mut result = sum.reduce_add();
+    for (x, y) in a_chunks.remainder().iter().zip(b_chunks.remainder()) {
+        result += x * y;
+    }
+    result
+}
+
+fn ensure_same_len(expected: usize, found: usize) -> Result<()> {
+    if expected != found {
+        return Err(anyhow!(
+            "dot product dimension mismatch: expected {expected}, found {found}"
+        ));
+    }
+    Ok(())
+}
+
+/// Default on-disk location for the (now-retired-writer) HNSW index for a
+/// given embedder. W3-5: `cass index --build-hnsw` (the sole writer) is
+/// retired -- kept only so `cass doctor`/asset-state reporting can still
+/// detect a leftover `.chsw` file from a pre-decommission install.
+#[must_use]
+pub fn hnsw_index_path(data_dir: &Path, embedder_id: &str) -> PathBuf {
+    data_dir
+        .join(VECTOR_INDEX_DIR)
+        .join(format!("hnsw-{embedder_id}.chsw"))
 }
 
 #[cfg(test)]

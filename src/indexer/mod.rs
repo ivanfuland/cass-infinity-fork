@@ -1521,8 +1521,6 @@ pub struct IndexOptions {
     pub data_dir: PathBuf,
     /// Build semantic vector index after text indexing.
     pub semantic: bool,
-    /// Build HNSW index for approximate nearest neighbor search (requires semantic).
-    pub build_hnsw: bool,
     /// Embedder ID to use for semantic indexing (hash, fastembed).
     pub embedder: String,
     pub progress: Option<Arc<IndexingProgress>>,
@@ -1759,7 +1757,6 @@ fn is_plain_populated_incremental_index_run(
         && !opts.force_rebuild
         && !opts.watch
         && !opts.semantic
-        && !opts.build_hnsw
         && opts
             .watch_once_paths
             .as_ref()
@@ -2076,7 +2073,6 @@ fn should_try_readonly_canonical_force_rebuild(opts: &IndexOptions) -> bool {
         && !opts.full
         && !opts.watch
         && !opts.semantic
-        && !opts.build_hnsw
         && opts
             .watch_once_paths
             .as_ref()
@@ -5176,7 +5172,7 @@ fn should_run_targeted_watch_once_only(
 }
 
 fn should_skip_absent_explicit_watch_once_paths(opts: &IndexOptions) -> bool {
-    if opts.watch || opts.full || opts.force_rebuild || opts.semantic || opts.build_hnsw {
+    if opts.watch || opts.full || opts.force_rebuild || opts.semantic {
         return false;
     }
 
@@ -5232,7 +5228,7 @@ fn should_skip_unchanged_explicit_watch_once_paths(
     storage: &FrankenStorage,
     roots: &[(ConnectorKind, ScanRoot)],
 ) -> Result<bool> {
-    if opts.watch || opts.full || opts.force_rebuild || opts.semantic || opts.build_hnsw {
+    if opts.watch || opts.full || opts.force_rebuild || opts.semantic {
         return Ok(false);
     }
 
@@ -5262,7 +5258,7 @@ fn can_skip_unchanged_explicit_watch_once_index_run(
     opts: &IndexOptions,
     storage: &FrankenStorage,
 ) -> Result<bool> {
-    if opts.watch || opts.full || opts.force_rebuild || opts.semantic || opts.build_hnsw {
+    if opts.watch || opts.full || opts.force_rebuild || opts.semantic {
         return Ok(false);
     }
     if opts
@@ -10544,7 +10540,6 @@ fn should_run_targeted_semantic_watch_once(opts: &IndexOptions) -> bool {
         && !opts.watch
         && !opts.full
         && !opts.force_rebuild
-        && !opts.build_hnsw
         && opts
             .watch_once_paths
             .as_ref()
@@ -18015,7 +18010,6 @@ pub mod persist {
                 db_path,
                 data_dir,
                 semantic: false,
-                build_hnsw: false,
                 embedder: "fnv1a-384".to_string(),
                 progress: None,
                 watch_interval_secs: 30,
@@ -19853,7 +19847,6 @@ mod tests {
             db_path: db_path.clone(),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
@@ -20854,7 +20847,6 @@ mod tests {
             db_path,
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
@@ -25632,7 +25624,6 @@ mod tests {
                 db_path: db_path.clone(),
                 data_dir: data_dir.clone(),
                 semantic: true,
-                build_hnsw: false,
                 embedder: "definitely-invalid".to_string(),
                 progress: None,
                 watch_once_paths: None,
@@ -25703,7 +25694,6 @@ mod tests {
                 db_path: db_path.clone(),
                 data_dir: data_dir.clone(),
                 semantic: true,
-                build_hnsw: false,
                 embedder: "definitely-invalid".to_string(),
                 progress: None,
                 watch_once_paths: None,
@@ -25781,7 +25771,6 @@ mod tests {
                 db_path: db_path.clone(),
                 data_dir: data_dir.clone(),
                 semantic: false,
-                build_hnsw: false,
                 embedder: "fastembed".to_string(),
                 progress: None,
                 watch_once_paths: None,
@@ -27305,7 +27294,6 @@ mod tests {
             db_path,
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: String::from("fastembed"),
             progress: Some(progress),
             watch_interval_secs: 30,
@@ -27388,7 +27376,6 @@ mod tests {
             db_path,
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: String::from("fastembed"),
             progress: Some(progress),
             watch_interval_secs: 30,
@@ -27432,7 +27419,6 @@ mod tests {
             db_path,
             data_dir,
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: Some(progress.clone()),
             watch_interval_secs: 30,
@@ -27494,7 +27480,6 @@ mod tests {
             db_path,
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: String::from("fastembed"),
             progress: Some(progress),
             watch_interval_secs: 30,
@@ -27578,7 +27563,6 @@ mod tests {
             db_path,
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: String::from("fastembed"),
             progress: Some(progress),
             watch_interval_secs: 30,
@@ -27630,7 +27614,6 @@ mod tests {
                 db_path,
                 data_dir,
                 semantic: false,
-                build_hnsw: false,
                 embedder: String::from("fastembed"),
                 progress: Some(progress.clone()),
                 watch_interval_secs: 30,
@@ -27701,7 +27684,6 @@ mod tests {
             db_path,
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: Some(progress.clone()),
             watch_interval_secs: 30,
@@ -28827,7 +28809,6 @@ mod tests {
             db_path: data_dir.join("agent_search.db"),
             data_dir,
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
@@ -28950,10 +28931,8 @@ mod tests {
         assert!(!should_skip_absent_explicit_watch_once_paths(
             &semantic_opts
         ));
-
-        let mut hnsw_opts = watch_once_skip_test_options(data_dir, Some(vec![missing]));
-        hnsw_opts.build_hnsw = true;
-        assert!(!should_skip_absent_explicit_watch_once_paths(&hnsw_opts));
+        let _ = data_dir;
+        let _ = missing;
     }
 
     #[test]
@@ -29412,7 +29391,6 @@ mod tests {
             db_path: data_dir.join("db.sqlite"),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
@@ -29461,7 +29439,6 @@ mod tests {
             db_path: data_dir.join("db.sqlite"),
             data_dir: data_dir.to_path_buf(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
@@ -29520,7 +29497,6 @@ mod tests {
             db_path: data_dir.join("db.sqlite"),
             data_dir: data_dir.to_path_buf(),
             semantic: true,
-            build_hnsw: false,
             embedder: "hash".to_string(),
             progress: Some(progress),
             watch_interval_secs: 30,
@@ -29587,7 +29563,6 @@ mod tests {
             db_path: db_path.clone(),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
@@ -29623,7 +29598,6 @@ mod tests {
             db_path: db_path.clone(),
             data_dir,
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
@@ -29729,7 +29703,6 @@ mod tests {
             db_path: db_path.clone(),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
@@ -29762,7 +29735,6 @@ mod tests {
             db_path: db_path.clone(),
             data_dir,
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
@@ -29839,7 +29811,6 @@ mod tests {
             db_path: db_path.clone(),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
@@ -29875,7 +29846,6 @@ mod tests {
             db_path: db_path.clone(),
             data_dir,
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
@@ -30261,7 +30231,6 @@ mod tests {
             db_path: data_dir.join("agent_search.db"),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_once_paths: None,
@@ -30348,7 +30317,6 @@ mod tests {
             db_path: data_dir.join("agent_search.db"),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: Some(progress.clone()),
             watch_once_paths: None,
@@ -30432,7 +30400,6 @@ mod tests {
             db_path: data_dir.join("agent_search.db"),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_once_paths: None,
@@ -30500,7 +30467,6 @@ mod tests {
             db_path: data_dir.join("agent_search.db"),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_once_paths: None,
@@ -30581,7 +30547,6 @@ mod tests {
             db_path: data_dir.join("agent_search.db"),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_once_paths: None,
@@ -30668,7 +30633,6 @@ mod tests {
             db_path: data_dir.join("agent_search.db"),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_once_paths: None,
@@ -30757,7 +30721,6 @@ mod tests {
             db_path: data_dir.join("agent_search.db"),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_once_paths: None,
@@ -30904,7 +30867,6 @@ mod tests {
             db_path: data_dir.join("agent_search.db"),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: Some(progress.clone()),
             watch_once_paths: None,
@@ -30976,7 +30938,6 @@ mod tests {
             db_path: data_dir.join("agent_search.db"),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_once_paths: Some(vec![amp_file.clone()]),
@@ -31068,7 +31029,6 @@ mod tests {
             db_path: data_dir.join("agent_search.db"),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_once_paths: Some(vec![amp_file.clone()]),
@@ -31151,7 +31111,6 @@ mod tests {
             db_path: data_dir.join("agent_search.db"),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_once_paths: None,
@@ -31273,7 +31232,6 @@ mod tests {
             db_path: data_dir.join("agent_search.db"),
             data_dir: data_dir.clone(),
             semantic: true,
-            build_hnsw: false,
             embedder: "hash".to_string(),
             progress: None,
             watch_once_paths: None,
@@ -31387,7 +31345,6 @@ mod tests {
             db_path: data_dir.join("db.sqlite"),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
@@ -31440,7 +31397,6 @@ mod tests {
             db_path: data_dir.join("db.sqlite"),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
@@ -31524,7 +31480,6 @@ mod tests {
             db_path: data_dir.join("db.sqlite"),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: Some(progress.clone()),
             watch_interval_secs: 30,
@@ -31592,7 +31547,6 @@ mod tests {
             db_path: data_dir.join("db.sqlite"),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: Some(progress.clone()),
             watch_interval_secs: 30,
@@ -31663,7 +31617,6 @@ mod tests {
             db_path: data_dir.join("db.sqlite"),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
@@ -31783,7 +31736,6 @@ mod tests {
             db_path: data_dir.join("db.sqlite"),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,

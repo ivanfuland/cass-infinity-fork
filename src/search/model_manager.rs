@@ -21,12 +21,7 @@ use crate::search::model_download::{
     classify_model_cache_metadata,
 };
 use crate::search::policy::{CliSemanticOverrides, SemanticPolicy};
-use crate::search::semantic_manifest::{
-    SemanticShardManifest, SemanticShardRecord, TierKind, semantic_shard_artifact_path_is_safe,
-};
-use crate::search::vector_index::{
-    ROLE_ASSISTANT, ROLE_USER, SemanticFilterMaps, VectorIndex, vector_index_path,
-};
+use crate::search::vector_index::{ROLE_ASSISTANT, ROLE_USER, vector_index_path};
 use crate::storage::api::params;
 use crate::storage::sqlite::FrankenStorage;
 
@@ -273,179 +268,12 @@ impl SemanticAvailability {
 
 pub struct SemanticContext {
     pub embedder: Arc<dyn Embedder>,
-    /// `None` for a DB-vector-domain-only context (W3-4 Step2-1, task
-    /// book #62): no legacy `.fsvi` file exists for this embedder, and
-    /// none is required -- `search_db_vector_domain` is the default
-    /// candidate-fetch path and never reads this field.
-    /// `SearchClient::set_semantic_indexes_context` accepts `None` here.
-    pub index: Option<VectorIndex>,
-    pub additional_indexes: Vec<VectorIndex>,
-    pub filter_maps: SemanticFilterMaps,
     pub roles: Option<HashSet<u8>>,
 }
 
 pub struct SemanticSetup {
     pub availability: SemanticAvailability,
     pub context: Option<SemanticContext>,
-}
-
-fn semantic_sidecar_path(data_dir: &Path, recorded_path: &str) -> Option<PathBuf> {
-    semantic_shard_artifact_path_is_safe(recorded_path).then(|| data_dir.join(recorded_path))
-}
-
-fn matching_complete_shard_records(
-    data_dir: &Path,
-    tier: TierKind,
-    embedder_id: &str,
-    db_fingerprint: &str,
-) -> Result<Option<Vec<SemanticShardRecord>>, String> {
-    let manifest = match SemanticShardManifest::load(data_dir) {
-        Ok(Some(manifest)) => manifest,
-        Ok(None) => return Ok(None),
-        Err(err) => return Err(format!("semantic shard manifest: {err}")),
-    };
-    let summary = manifest.summary(tier, embedder_id, db_fingerprint);
-    if !summary.complete {
-        return Ok(None);
-    }
-
-    let mut records = manifest
-        .shards
-        .into_iter()
-        .filter(|shard| shard.matches_generation(tier, embedder_id, db_fingerprint))
-        .collect::<Vec<_>>();
-    records.sort_by_key(|shard| shard.shard_index);
-    if records.len() != usize::try_from(summary.shard_count).unwrap_or(usize::MAX) {
-        return Ok(None);
-    }
-
-    let Some(first) = records.first() else {
-        return Ok(None);
-    };
-    for (expected_index, shard) in records.iter().enumerate() {
-        if shard.shard_index != u32::try_from(expected_index).unwrap_or(u32::MAX)
-            || !shard.ready
-            || !shard.mmap_ready
-            || shard.model_revision != first.model_revision
-            || shard.schema_version != crate::search::policy::SEMANTIC_SCHEMA_VERSION
-            || shard.chunking_version != crate::search::policy::CHUNKING_STRATEGY_VERSION
-            || shard.dimension == 0
-            || shard.dimension != first.dimension
-            || shard.total_conversations != first.total_conversations
-        {
-            return Ok(None);
-        }
-        let Some(path) = semantic_sidecar_path(data_dir, &shard.index_path) else {
-            return Ok(None);
-        };
-        if !path.is_file() {
-            return Ok(None);
-        }
-    }
-
-    Ok(Some(records))
-}
-
-fn load_complete_shard_indexes(
-    data_dir: &Path,
-    embedder_id: &str,
-    db_fingerprint: &str,
-) -> Result<Option<Vec<VectorIndex>>, String> {
-    for tier in [TierKind::Quality, TierKind::Fast] {
-        let Some(records) =
-            matching_complete_shard_records(data_dir, tier, embedder_id, db_fingerprint)?
-        else {
-            continue;
-        };
-
-        let mut indexes = Vec::with_capacity(records.len());
-        for shard in records {
-            let Some(path) = semantic_sidecar_path(data_dir, &shard.index_path) else {
-                return Ok(None);
-            };
-            let index = VectorIndex::open(&path)
-                .map_err(|err| format!("semantic shard vector index {}: {err}", path.display()))?;
-            if index.embedder_id() != embedder_id || index.dimension() != shard.dimension {
-                return Err(format!(
-                    "semantic shard vector index {} metadata mismatch",
-                    path.display()
-                ));
-            }
-            indexes.push(index);
-        }
-        if !indexes.is_empty() {
-            tracing::info!(
-                tier = tier.as_str(),
-                embedder = embedder_id,
-                shard_count = indexes.len(),
-                "loaded complete semantic shard generation"
-            );
-            return Ok(Some(indexes));
-        }
-    }
-
-    Ok(None)
-}
-
-fn complete_shard_generation_candidate_exists(data_dir: &Path, embedder_id: &str) -> bool {
-    let manifest = match SemanticShardManifest::load(data_dir) {
-        Ok(Some(manifest)) => manifest,
-        Ok(None) => return false,
-        Err(err) => {
-            tracing::debug!(
-                error = %err,
-                embedder = embedder_id,
-                "semantic shard candidate probe could not load manifest"
-            );
-            return false;
-        }
-    };
-
-    let mut candidates = std::collections::HashSet::new();
-    for shard in manifest
-        .shards
-        .iter()
-        .filter(|shard| shard.embedder_id == embedder_id)
-    {
-        candidates.insert((shard.tier, shard.db_fingerprint.as_str()));
-    }
-
-    candidates
-        .into_iter()
-        .any(|(tier, db_fingerprint)| manifest.summary(tier, embedder_id, db_fingerprint).complete)
-}
-
-fn load_complete_shard_indexes_for_current_db(
-    data_dir: &Path,
-    db_path: &Path,
-    embedder_id: &str,
-    context_label: &'static str,
-) -> Option<Vec<VectorIndex>> {
-    let db_fingerprint = match crate::indexer::lexical_storage_fingerprint_for_db(db_path) {
-        Ok(fingerprint) => fingerprint,
-        Err(err) => {
-            tracing::debug!(
-                error = %err,
-                embedder = embedder_id,
-                context = context_label,
-                "semantic shard context unavailable: failed to fingerprint current DB"
-            );
-            return None;
-        }
-    };
-
-    match load_complete_shard_indexes(data_dir, embedder_id, &db_fingerprint) {
-        Ok(indexes) => indexes,
-        Err(err) => {
-            tracing::debug!(
-                error = %err,
-                embedder = embedder_id,
-                context = context_label,
-                "semantic shard context unavailable"
-            );
-            None
-        }
-    }
 }
 
 /// Load semantic context with optional version mismatch checking.
@@ -477,19 +305,6 @@ pub(crate) fn probe_semantic_availability(data_dir: &Path, db_path: &Path) -> Se
 /// model.
 fn is_infinity_embedder_name(embedder_name: &str) -> bool {
     matches!(embedder_name, "bge-m3" | "infinity")
-}
-
-/// `CASS_SEMANTIC_USE_FSVI=1` (or `true`/`yes`/`on`) forces the legacy
-/// filesystem-vector-index (`.fsvi`) path for the Infinity/bge-m3 embedder
-/// instead of DB-vector-domain awareness (W3-4 Step2-1, task book #62).
-/// Shared with `query.rs`'s own candidate-fetch dispatch (same env var,
-/// same accepted values) so the two layers can never disagree about which
-/// mode is active for a given process.
-pub(crate) fn semantic_use_fsvi_escape_hatch() -> bool {
-    matches!(
-        dotenvy::var("CASS_SEMANTIC_USE_FSVI").ok().as_deref(),
-        Some("1") | Some("true") | Some("yes") | Some("on")
-    )
 }
 
 /// DB-vector-domain-aware availability probe (W3-4 Step2-1): reads
@@ -614,7 +429,7 @@ pub(crate) fn probe_semantic_availability_for_embedder(
     db_path: &Path,
     embedder_name: &str,
 ) -> SemanticAvailability {
-    if is_infinity_embedder_name(embedder_name) && !semantic_use_fsvi_escape_hatch() {
+    if is_infinity_embedder_name(embedder_name) {
         return probe_db_vector_domain_availability(db_path);
     }
     let canonical_name = FastEmbedder::canonical_name(embedder_name).unwrap_or("minilm");
@@ -661,95 +476,40 @@ pub(crate) fn probe_hash_semantic_availability(data_dir: &Path) -> SemanticAvail
     }
 }
 
-/// Load hash-based semantic context (no model download required).
-pub fn load_hash_semantic_context(data_dir: &Path, db_path: &Path) -> SemanticSetup {
+/// Load hash-based semantic context.
+///
+/// W3-5: the legacy fsvi vector-index loading this used to open (monolithic
+/// + sharded) has been retired as a builder-without-reader (search-side
+/// consumption of `.fsvi` files was already cut in 3f7aa054), and there is
+/// no DB-vector-domain writer for the hash embedder either -- `models
+/// backfill --embedder hash` was itself retired in 4064e8fc. There is no
+/// substrate left to report `Ready` against, so this now always reports the
+/// index as missing rather than pretend a stale on-disk `.fsvi` file (which
+/// this build can no longer open) is usable.
+pub fn load_hash_semantic_context(data_dir: &Path, _db_path: &Path) -> SemanticSetup {
     let embedder = HashEmbedder::default();
     let index_path = vector_index_path(data_dir, embedder.id());
-    let monolithic_present = index_path.is_file();
-    let shard_indexes = if monolithic_present
-        || complete_shard_generation_candidate_exists(data_dir, embedder.id())
-    {
-        load_complete_shard_indexes_for_current_db(
-            data_dir,
-            db_path,
-            embedder.id(),
-            "hash semantic",
-        )
-    } else {
-        None
-    };
-    if !monolithic_present && shard_indexes.is_none() {
-        return SemanticSetup {
-            availability: SemanticAvailability::IndexMissing { index_path },
-            context: None,
-        };
-    }
-
-    let storage = match FrankenStorage::open_readonly(db_path) {
-        Ok(storage) => storage,
-        Err(err) => {
-            return SemanticSetup {
-                availability: SemanticAvailability::DatabaseUnavailable {
-                    db_path: db_path.to_path_buf(),
-                    error: err.to_string(),
-                },
-                context: None,
-            };
-        }
-    };
-
-    let filter_maps = match SemanticFilterMaps::from_storage(&storage) {
-        Ok(maps) => maps,
-        Err(err) => {
-            return SemanticSetup {
-                availability: SemanticAvailability::LoadFailed {
-                    context: format!("filter maps: {err}"),
-                },
-                context: None,
-            };
-        }
-    };
-
-    let (index, additional_indexes) = if let Some(mut indexes) = shard_indexes {
-        let index = indexes.remove(0);
-        (index, indexes)
-    } else {
-        match VectorIndex::open(&index_path) {
-            Ok(index) => (index, Vec::new()),
-            Err(err) => {
-                return SemanticSetup {
-                    availability: SemanticAvailability::LoadFailed {
-                        context: format!("vector index: {err}"),
-                    },
-                    context: None,
-                };
-            }
-        }
-    };
-
-    let roles = Some(HashSet::from([ROLE_USER, ROLE_ASSISTANT]));
-    let embedder = Arc::new(embedder) as Arc<dyn Embedder>;
-
     SemanticSetup {
-        availability: SemanticAvailability::HashFallback,
-        context: Some(SemanticContext {
-            embedder,
-            index: Some(index),
-            additional_indexes,
-            filter_maps,
-            roles,
-        }),
+        availability: SemanticAvailability::IndexMissing { index_path },
+        context: None,
     }
 }
 
 /// Load Infinity-backed semantic context (M4-pre spike).
 ///
-/// Mirrors [`load_hash_semantic_context`] but uses the HTTP `InfinityEmbedder`
-/// (bge-m3, 1024-dim) — no local model files / ONNX / cache-state machinery.
-/// The query is embedded via the daemon path (Infinity) at search time; this
-/// in-proc embedder supplies the matching id/dimension for the `bge-m3` index.
+/// Uses the HTTP `InfinityEmbedder` (bge-m3, 1024-dim) — no local model
+/// files / ONNX / cache-state machinery. The query is embedded via the
+/// daemon path (Infinity) at search time; this in-proc embedder supplies
+/// the matching id/dimension.
+///
+/// W3-5: DB-vector-domain (`embedding_generations`/`message_embeddings`) is
+/// the sole substrate now -- the legacy fsvi-file path this used to fall
+/// back to (behind `CASS_SEMANTIC_USE_FSVI`) is retired along with the
+/// escape hatch itself, for the same builder-without-reader reason as
+/// [`load_hash_semantic_context`].
 #[cfg(feature = "infinity")]
 pub fn load_infinity_semantic_context(data_dir: &Path, db_path: &Path) -> SemanticSetup {
+    let _ = data_dir;
     let embedder = match crate::search::infinity::InfinityEmbedder::new() {
         Ok(e) => e,
         Err(err) => {
@@ -761,132 +521,22 @@ pub fn load_infinity_semantic_context(data_dir: &Path, db_path: &Path) -> Semant
             };
         }
     };
-    let embedder_id = embedder.id().to_string();
 
-    // W3-4 Step2-1 (task book #62): DB-vector-domain awareness is
-    // authoritative by default -- a cold library that only ever wrote
-    // the DB vector domain (no legacy `.fsvi` file for this embedder)
-    // must not be gated on file existence here. `CASS_SEMANTIC_USE_FSVI`
-    // is the one escape hatch that still takes the pre-W3-4 fsvi-only
-    // path below, unchanged, for the W3-3..W3-5 coexistence window.
-    let use_fsvi = semantic_use_fsvi_escape_hatch();
-    if !use_fsvi {
-        return match probe_db_vector_domain_availability(db_path) {
-            SemanticAvailability::Ready { embedder_id } => {
-                let storage = match FrankenStorage::open_readonly(db_path) {
-                    Ok(storage) => storage,
-                    Err(err) => {
-                        return SemanticSetup {
-                            availability: SemanticAvailability::DatabaseUnavailable {
-                                db_path: db_path.to_path_buf(),
-                                error: err.to_string(),
-                            },
-                            context: None,
-                        };
-                    }
-                };
-                let filter_maps = match SemanticFilterMaps::from_storage(&storage) {
-                    Ok(maps) => maps,
-                    Err(err) => {
-                        return SemanticSetup {
-                            availability: SemanticAvailability::LoadFailed {
-                                context: format!("filter maps: {err}"),
-                            },
-                            context: None,
-                        };
-                    }
-                };
-                let roles = Some(HashSet::from([ROLE_USER, ROLE_ASSISTANT]));
-                SemanticSetup {
-                    availability: SemanticAvailability::Ready { embedder_id },
-                    context: Some(SemanticContext {
-                        embedder: Arc::new(embedder) as Arc<dyn Embedder>,
-                        index: None,
-                        additional_indexes: Vec::new(),
-                        filter_maps,
-                        roles,
-                    }),
-                }
+    match probe_db_vector_domain_availability(db_path) {
+        SemanticAvailability::Ready { embedder_id } => {
+            let roles = Some(HashSet::from([ROLE_USER, ROLE_ASSISTANT]));
+            SemanticSetup {
+                availability: SemanticAvailability::Ready { embedder_id },
+                context: Some(SemanticContext {
+                    embedder: Arc::new(embedder) as Arc<dyn Embedder>,
+                    roles,
+                }),
             }
-            other => SemanticSetup { availability: other, context: None },
-        };
-    }
-
-    let index_path = vector_index_path(data_dir, &embedder_id);
-    let monolithic_present = index_path.is_file();
-    let shard_indexes = if monolithic_present
-        || complete_shard_generation_candidate_exists(data_dir, &embedder_id)
-    {
-        load_complete_shard_indexes_for_current_db(
-            data_dir,
-            db_path,
-            &embedder_id,
-            "infinity semantic",
-        )
-    } else {
-        None
-    };
-    if !monolithic_present && shard_indexes.is_none() {
-        return SemanticSetup {
-            availability: SemanticAvailability::IndexMissing { index_path },
+        }
+        other => SemanticSetup {
+            availability: other,
             context: None,
-        };
-    }
-
-    let storage = match FrankenStorage::open_readonly(db_path) {
-        Ok(storage) => storage,
-        Err(err) => {
-            return SemanticSetup {
-                availability: SemanticAvailability::DatabaseUnavailable {
-                    db_path: db_path.to_path_buf(),
-                    error: err.to_string(),
-                },
-                context: None,
-            };
-        }
-    };
-
-    let filter_maps = match SemanticFilterMaps::from_storage(&storage) {
-        Ok(maps) => maps,
-        Err(err) => {
-            return SemanticSetup {
-                availability: SemanticAvailability::LoadFailed {
-                    context: format!("filter maps: {err}"),
-                },
-                context: None,
-            };
-        }
-    };
-
-    let (index, additional_indexes) = if let Some(mut indexes) = shard_indexes {
-        let index = indexes.remove(0);
-        (index, indexes)
-    } else {
-        match VectorIndex::open(&index_path) {
-            Ok(index) => (index, Vec::new()),
-            Err(err) => {
-                return SemanticSetup {
-                    availability: SemanticAvailability::LoadFailed {
-                        context: format!("vector index: {err}"),
-                    },
-                    context: None,
-                };
-            }
-        }
-    };
-
-    let roles = Some(HashSet::from([ROLE_USER, ROLE_ASSISTANT]));
-    let embedder = Arc::new(embedder) as Arc<dyn Embedder>;
-
-    SemanticSetup {
-        availability: SemanticAvailability::Ready { embedder_id },
-        context: Some(SemanticContext {
-            embedder,
-            index: Some(index),
-            additional_indexes,
-            filter_maps,
-            roles,
-        }),
+        },
     }
 }
 
@@ -938,94 +588,19 @@ fn load_semantic_context_inner(
         };
     }
 
+    // W3-5: the legacy fsvi vector-index loading this used to open
+    // (monolithic + sharded) has been retired as a builder-without-reader,
+    // and DB-vector-domain has no writer for non-infinity FastEmbed models
+    // either -- `cass index --semantic` was cut over to infinity-only in
+    // 4745367f. Model cache validation above still gives a real diagnostic
+    // (not installed / downloading / verifying / update available); once
+    // the model itself is acquired, there is simply no vector substrate
+    // left for it to search against.
     let index_path = vector_index_path(data_dir, &config.embedder_id);
-    let monolithic_present = index_path.is_file();
-    let shard_indexes = if monolithic_present
-        || complete_shard_generation_candidate_exists(data_dir, &config.embedder_id)
-    {
-        load_complete_shard_indexes_for_current_db(
-            data_dir,
-            db_path,
-            &config.embedder_id,
-            "semantic",
-        )
-    } else {
-        None
-    };
-    if !monolithic_present && shard_indexes.is_none() {
-        return SemanticSetup {
-            availability: SemanticAvailability::IndexMissing { index_path },
-            context: None,
-        };
-    }
-
-    let storage = match FrankenStorage::open_readonly(db_path) {
-        Ok(storage) => storage,
-        Err(err) => {
-            return SemanticSetup {
-                availability: SemanticAvailability::DatabaseUnavailable {
-                    db_path: db_path.to_path_buf(),
-                    error: err.to_string(),
-                },
-                context: None,
-            };
-        }
-    };
-
-    let filter_maps = match SemanticFilterMaps::from_storage(&storage) {
-        Ok(maps) => maps,
-        Err(err) => {
-            return SemanticSetup {
-                availability: SemanticAvailability::LoadFailed {
-                    context: format!("filter maps: {err}"),
-                },
-                context: None,
-            };
-        }
-    };
-
-    let (index, additional_indexes) = if let Some(mut indexes) = shard_indexes {
-        let index = indexes.remove(0);
-        (index, indexes)
-    } else {
-        match VectorIndex::open(&index_path) {
-            Ok(index) => (index, Vec::new()),
-            Err(err) => {
-                return SemanticSetup {
-                    availability: SemanticAvailability::LoadFailed {
-                        context: format!("vector index: {err}"),
-                    },
-                    context: None,
-                };
-            }
-        }
-    };
-
-    let embedder = match FastEmbedder::load_by_name(data_dir, canonical_name) {
-        Ok(embedder) => Arc::new(embedder) as Arc<dyn Embedder>,
-        Err(err) => {
-            return SemanticSetup {
-                availability: SemanticAvailability::LoadFailed {
-                    context: format!("model load: {err}"),
-                },
-                context: None,
-            };
-        }
-    };
-
-    let roles = Some(HashSet::from([ROLE_USER, ROLE_ASSISTANT]));
-
+    let _ = db_path;
     SemanticSetup {
-        availability: SemanticAvailability::Ready {
-            embedder_id: embedder.id().to_string(),
-        },
-        context: Some(SemanticContext {
-            embedder,
-            index: Some(index),
-            additional_indexes,
-            filter_maps,
-            roles,
-        }),
+        availability: SemanticAvailability::IndexMissing { index_path },
+        context: None,
     }
 }
 
@@ -1119,35 +694,6 @@ fn semantic_availability_from_cache_state(
     }
 }
 
-/// Check if the vector index needs rebuilding after a model upgrade.
-///
-/// This compares the embedder ID in the vector index header with the expected
-/// embedder ID. If they differ, the index was built with a different model
-/// and needs to be rebuilt.
-///
-/// Returns `true` if rebuild is needed, `false` otherwise.
-pub fn needs_index_rebuild(data_dir: &Path) -> bool {
-    let index_path = vector_index_path(data_dir, FastEmbedder::embedder_id_static());
-
-    if !index_path.is_file() {
-        // Index doesn't exist, so it needs to be built (not rebuilt)
-        return false;
-    }
-
-    // Try to load the index and check its embedder ID
-    match VectorIndex::open(&index_path) {
-        Ok(index) => {
-            // Check if the index was built with a different embedder
-            // The vector index stores the embedder ID in its header
-            let expected_id = FastEmbedder::embedder_id_static();
-            index.embedder_id() != expected_id
-        }
-        Err(_) => {
-            // Index is corrupted or unreadable, needs rebuild
-            true
-        }
-    }
-}
 
 /// Delete the vector index to force a rebuild.
 ///
@@ -1203,32 +749,6 @@ mod tests {
         assert!(!ready.has_update());
         assert!(ready.can_search());
         assert_eq!(ready.status_label(), "SEM");
-    }
-
-    #[test]
-    fn semantic_sidecar_path_rejects_paths_outside_data_dir() {
-        let tmp = tempdir().unwrap();
-        let safe = semantic_sidecar_path(tmp.path(), "vector_index/shards/hash/shard-0.fsvi")
-            .expect("safe relative shard path");
-        assert_eq!(
-            safe,
-            tmp.path().join("vector_index/shards/hash/shard-0.fsvi")
-        );
-
-        for unsafe_path in [
-            tmp.path()
-                .join("outside.fsvi")
-                .to_string_lossy()
-                .to_string(),
-            "../outside.fsvi".to_string(),
-            "vector_index/../outside.fsvi".to_string(),
-            "./vector_index/shards/hash/shard-0.fsvi".to_string(),
-        ] {
-            assert!(
-                semantic_sidecar_path(tmp.path(), &unsafe_path).is_none(),
-                "unsafe semantic sidecar path should be rejected: {unsafe_path}"
-            );
-        }
     }
 
     #[test]
@@ -1331,11 +851,6 @@ mod tests {
         assert_eq!(db_unavail.status_label(), "NODB");
     }
 
-    #[test]
-    fn test_needs_index_rebuild_no_index() {
-        let tmp = tempdir().unwrap();
-        assert!(!needs_index_rebuild(tmp.path()));
-    }
 
     #[test]
     fn test_delete_vector_index_no_file() {
@@ -1345,197 +860,6 @@ mod tests {
         assert!(!result.unwrap());
     }
 
-    fn write_hash_vector_index(path: &Path, record_count: usize) {
-        let embedder = HashEmbedder::default();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).expect("create vector index parent");
-        }
-        let mut writer = VectorIndex::create_with_revision(
-            path,
-            embedder.id(),
-            "hash",
-            embedder.dimension(),
-            frankensearch::index::Quantization::F16,
-        )
-        .expect("create hash vector index");
-        let mut vector = vec![0.0_f32; embedder.dimension()];
-        vector[0] = 1.0;
-        for idx in 0..record_count {
-            writer
-                .write_record(&format!("doc-{idx}"), &vector)
-                .expect("write hash vector record");
-        }
-        writer.finish().expect("finish hash vector index");
-    }
-
-    fn semantic_shard_record(
-        tier: TierKind,
-        embedder_id: &str,
-        db_fingerprint: &str,
-        shard_index: u32,
-        shard_count: u32,
-    ) -> SemanticShardRecord {
-        SemanticShardRecord {
-            tier,
-            embedder_id: embedder_id.to_string(),
-            model_revision: "test-revision".to_string(),
-            schema_version: crate::search::policy::SEMANTIC_SCHEMA_VERSION,
-            chunking_version: crate::search::policy::CHUNKING_STRATEGY_VERSION,
-            canonicalize_version: Some(crate::search::canonicalize::CANONICALIZE_PIPELINE_VERSION),
-            dimension: 384,
-            shard_index,
-            shard_count,
-            doc_count: 1,
-            total_conversations: 1,
-            db_fingerprint: db_fingerprint.to_string(),
-            index_path: format!("vector_index/shards/{embedder_id}/shard-{shard_index}.fsvi"),
-            quantization: "f16".to_string(),
-            mmap_ready: true,
-            ann_index_path: None,
-            ann_size_bytes: 0,
-            ann_ready: false,
-            size_bytes: 128,
-            started_at_ms: 1_733_100_000_000,
-            completed_at_ms: 1_733_100_000_000 + i64::from(shard_index),
-            ready: true,
-        }
-    }
-
-    #[test]
-    fn shard_candidate_probe_is_false_without_manifest() {
-        let tmp = tempdir().unwrap();
-        assert!(
-            !complete_shard_generation_candidate_exists(tmp.path(), "fnv1a-384"),
-            "missing shard manifest must not trigger a current-DB fingerprint"
-        );
-    }
-
-    #[test]
-    fn shard_candidate_probe_is_false_for_unreadable_manifest() {
-        let tmp = tempdir().unwrap();
-        let path = SemanticShardManifest::path(tmp.path());
-        std::fs::create_dir_all(path.parent().expect("manifest parent"))
-            .expect("create shard manifest dir");
-        std::fs::write(&path, b"not json").expect("write invalid shard manifest");
-
-        assert!(
-            !complete_shard_generation_candidate_exists(tmp.path(), "fnv1a-384"),
-            "corrupt shard metadata must not trigger a query-time current-DB fingerprint"
-        );
-    }
-
-    #[test]
-    fn shard_candidate_probe_ignores_other_or_incomplete_generations() {
-        let tmp = tempdir().unwrap();
-        let mut manifest = SemanticShardManifest {
-            shards: vec![
-                semantic_shard_record(TierKind::Fast, "other-384", "fp-other", 0, 1),
-                semantic_shard_record(TierKind::Fast, "fnv1a-384", "fp-partial", 0, 2),
-            ],
-            ..Default::default()
-        };
-        manifest.save(tmp.path()).expect("save shard manifest");
-
-        assert!(
-            !complete_shard_generation_candidate_exists(tmp.path(), "fnv1a-384"),
-            "incomplete or unrelated shard generations must not trigger a current-DB fingerprint"
-        );
-    }
-
-    #[test]
-    fn shard_candidate_probe_detects_complete_generation_for_embedder() {
-        let tmp = tempdir().unwrap();
-        let mut manifest = SemanticShardManifest {
-            shards: vec![
-                semantic_shard_record(TierKind::Fast, "fnv1a-384", "fp-current", 0, 2),
-                semantic_shard_record(TierKind::Fast, "fnv1a-384", "fp-current", 1, 2),
-            ],
-            ..Default::default()
-        };
-        manifest.save(tmp.path()).expect("save shard manifest");
-
-        assert!(
-            complete_shard_generation_candidate_exists(tmp.path(), "fnv1a-384"),
-            "complete candidate generations should allow the current-DB fingerprint check"
-        );
-    }
-
-    #[test]
-    fn load_hash_context_prefers_current_complete_shards_over_monolithic_file() {
-        let tmp = tempdir().unwrap();
-        let db_path = tmp.path().join("cass.db");
-        let storage = FrankenStorage::open(&db_path).expect("create cass db");
-        drop(storage);
-        let db_fingerprint = crate::indexer::lexical_storage_fingerprint_for_db(&db_path)
-            .expect("fingerprint cass db");
-
-        let embedder = HashEmbedder::default();
-        write_hash_vector_index(&vector_index_path(tmp.path(), embedder.id()), 1);
-
-        let mut records = Vec::new();
-        for shard_index in 0..2_u32 {
-            let relative_path = format!("vector_index/shards/hash/shard-{shard_index}.fsvi");
-            let shard_path = tmp.path().join(&relative_path);
-            write_hash_vector_index(&shard_path, 1);
-            records.push(SemanticShardRecord {
-                tier: TierKind::Fast,
-                embedder_id: embedder.id().to_string(),
-                model_revision: "hash".to_string(),
-                schema_version: crate::search::policy::SEMANTIC_SCHEMA_VERSION,
-                chunking_version: crate::search::policy::CHUNKING_STRATEGY_VERSION,
-                canonicalize_version: Some(crate::search::canonicalize::CANONICALIZE_PIPELINE_VERSION),
-                dimension: embedder.dimension(),
-                shard_index,
-                shard_count: 2,
-                doc_count: 1,
-                total_conversations: 1,
-                db_fingerprint: db_fingerprint.clone(),
-                index_path: relative_path,
-                quantization: "f16".to_string(),
-                mmap_ready: true,
-                ann_index_path: None,
-                ann_size_bytes: 0,
-                ann_ready: false,
-                size_bytes: std::fs::metadata(&shard_path)
-                    .expect("stat hash shard")
-                    .len(),
-                started_at_ms: 1_733_100_000_000,
-                completed_at_ms: 1_733_100_000_000 + i64::from(shard_index),
-                ready: true,
-            });
-        }
-        let mut manifest = SemanticShardManifest {
-            shards: records,
-            ..Default::default()
-        };
-        manifest.save(tmp.path()).expect("save shard manifest");
-
-        let setup = load_hash_semantic_context(tmp.path(), &db_path);
-        assert!(
-            matches!(setup.availability, SemanticAvailability::HashFallback),
-            "hash semantic availability should remain ready: {:?}",
-            setup.availability
-        );
-        let context = setup
-            .context
-            .expect("complete current shards should load a semantic context");
-        assert_eq!(
-            context.additional_indexes.len(),
-            1,
-            "complete current shards must not be shadowed by an older monolithic vector file"
-        );
-        let loaded_records = context
-            .index
-            .as_ref()
-            .expect("hash loader always populates a real fsvi index")
-            .record_count()
-            + context
-                .additional_indexes
-                .iter()
-                .map(VectorIndex::record_count)
-                .sum::<usize>();
-        assert_eq!(loaded_records, 2);
-    }
 
     // W3-4 Step2-1 (task book #62): the "no向量域" leg of the three-state
     // contract -- a library with a real, freshly-`schema::ensure`d

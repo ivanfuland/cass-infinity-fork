@@ -20,7 +20,7 @@ use fs2::FileExt;
 use crate::indexer::lexical_storage_fingerprint_for_db;
 #[cfg(test)]
 use crate::storage::sqlite::LexDomainRebuildMarkerState;
-use crate::search::ann_index::hnsw_index_path;
+use crate::search::vector_index::hnsw_index_path;
 use crate::search::embedder::Embedder;
 use crate::search::fastembed_embedder::FastEmbedder;
 use crate::search::hash_embedder::HashEmbedder;

@@ -209,7 +209,6 @@ fn run_index_does_not_drop_storage_without_explicit_close() {
         db_path: data_dir.join("agent_search.db"),
         data_dir,
         semantic: false,
-        build_hnsw: false,
         embedder: "fastembed".to_string(),
         progress: None,
         watch_interval_secs: 30,

@@ -1350,59 +1350,6 @@ fn test_approximate_flag_hybrid_mode() {
     }
 }
 
-/// Test: index --build-hnsw flag is accepted
-#[test]
-fn test_index_build_hnsw_flag() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let home = tmp.path();
-    let codex_home = home.join(".codex");
-    let data_dir = home.join("cass_data");
-    fs::create_dir_all(&data_dir).unwrap();
-
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
-
-    // Create fixture
-    make_codex_session(
-        &codex_home,
-        "2024/11/20",
-        "rollout-build-hnsw.jsonl",
-        "build_hnsw_test_content",
-        1732118400000,
-    );
-
-    // Index with --build-hnsw (requires --semantic to be meaningful)
-    // This tests that the flag is parsed correctly
-    let output = cargo_bin_cmd!("cass")
-        .args([
-            "index",
-            "--full",
-            "--semantic",
-            "--build-hnsw",
-            "--data-dir",
-        ])
-        .arg(&data_dir)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", home)
-        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
-        .output()
-        .expect("index with --build-hnsw");
-
-    // May fail if semantic model not installed, but should parse the flag
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // Should fail due to model not installed, not due to flag parsing
-        assert!(
-            stderr.contains("model")
-                || stderr.contains("semantic")
-                || stderr.contains("embedder")
-                || stderr.contains("install"),
-            "If indexing fails, should be due to model unavailability, not flag parsing. Got: {}",
-            stderr
-        );
-    }
-}
-
 // =============================================================================
 // Introspect Tests
 // =============================================================================

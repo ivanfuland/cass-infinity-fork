@@ -105,6 +105,7 @@ frankensearch = { version = "0.3.2", git = "https://github.com/Dicklesworthstone
 # ships a broken tarball missing sqlite-vec-diskann.c and fails to compile.
 sqlite-vec = "=0.1.9"
 franken-agent-detection = { version = "0.1.9", git = "https://github.com/ivanfuland/my_franken_agent_detection", rev = "6be142d9e6ccb1c9a1dc27a986f6e30ed151d71a", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "hermes"] }
+ahash = "0.8.12"  # W3-5: hasher for the verbatim-restored RRF fusion hot map (was a transitive frankensearch-fusion dep)
 wide = "1.4.0"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "0.7.6"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization
 bloomfilter = "3.0.1"  # Probabilistic membership testing for P2 Opt 3.3: Workspace Cache
