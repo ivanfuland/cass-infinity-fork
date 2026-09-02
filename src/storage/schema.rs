@@ -875,6 +875,30 @@ pub fn register_embedding_hole_for_new_message_in_tx(
     Ok(())
 }
 
+/// Write off (delete) an `embedding_holes` row for `doc_id` under
+/// `generation_id` once the catch-up drain loop has confirmed the message
+/// is *ineligible* for embedding (canonicalizes to an empty string, e.g. a
+/// short acknowledgement like "OK." -- `register_embedding_hole_for_new_
+/// message_in_tx` above registers a hole for every new message
+/// unconditionally, with no eligibility filter of its own, R1-W3-B1).
+///
+/// The hole ledger's contract is an exact accounting of *eligible*
+/// messages awaiting embedding, not of every message that ever existed --
+/// an ineligible message can never resolve its hole through the normal
+/// embed-and-CAS-write path (`insert_message_embedding_cas` only deletes a
+/// hole on a successful embedding write), so leaving it registered would
+/// keep `holes_after` permanently above zero and self-lock the generation
+/// out of activation forever (the exact failure `run_db_vector_catchup_
+/// backfill`'s draining loop must not reproduce). A no-op `DELETE` if the
+/// hole was already resolved or never existed.
+pub fn write_off_ineligible_hole_in_tx(tx: &Tx, generation_id: i64, doc_id: i64) -> Result<(), StorageError> {
+    tx.execute(
+        "DELETE FROM embedding_holes WHERE generation_id = ?1 AND doc_id = ?2",
+        &params![generation_id, doc_id],
+    )?;
+    Ok(())
+}
+
 /// Demote the active generation's certified-ready status (`audit_status`)
 /// back to `'pending'`, if one exists and is not already `'pending'`.
 /// Called in the same transaction as any relational write that mutates the

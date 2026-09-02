@@ -54,6 +54,12 @@ pub struct DbVectorCatchupReport {
     pub holes_after: u64,
     pub vec0_rows: usize,
     pub activated: bool,
+    /// Holes deleted (R1-W3-B1 fix) because their `doc_id` canonicalizes to
+    /// an empty string and can therefore never resolve through the normal
+    /// embed-and-CAS-write path -- see
+    /// [`crate::storage::schema::write_off_ineligible_hole_in_tx`]'s doc
+    /// comment for why leaving them registered would self-lock activation.
+    pub holes_written_off_ineligible: u64,
 }
 
 /// One row of embedding-hole work: the message content/role to embed,
@@ -245,6 +251,7 @@ pub fn run_db_vector_catchup_backfill(
 
     let mut embedded_inserted = 0u64;
     let mut stale_skipped = 0u64;
+    let mut holes_written_off_ineligible = 0u64;
 
     loop {
         let rows = fetch_hole_batch(storage, generation_id, batch_size)?;
@@ -254,30 +261,57 @@ pub fn run_db_vector_catchup_backfill(
 
         // Defensive re-check (w3-3 Step0 design §3): genesis seeding
         // already guarantees every seeded doc_id canonicalizes non-empty,
-        // but this loop must never assume it -- a silent drop inside
-        // `embed_messages_with_sink`'s own prepare step would misalign
-        // the positional zip below and attribute the wrong embedding to
-        // the wrong doc_id. Filtering here first makes that impossible:
-        // every input handed to the embedder is already known-non-empty,
-        // so `embed_messages_with_sink` cannot drop any of them.
+        // but this loop must never assume it -- ingest-time hook
+        // registration (`register_embedding_hole_for_new_message_in_tx`)
+        // has no eligibility filter of its own and *will* register a hole
+        // for a short-acknowledgement message like "OK." that can never
+        // resolve through the normal embed-and-CAS-write path. R1-W3-B1:
+        // leaving such a hole registered self-locks this generation out of
+        // activation forever (`holes_after` never reaches zero), so an
+        // ineligible row is written off (its hole row deleted) here rather
+        // than left "for investigation" -- the hole ledger's contract is an
+        // exact accounting of *eligible* messages, and an ineligible one
+        // was never a valid ledger entry to begin with. Filtering first
+        // also keeps the positional zip below safe: every input handed to
+        // the embedder is already known-non-empty, so
+        // `embed_messages_with_sink` cannot drop any of them.
         let filtered: Vec<&HoleMessageRow> = rows
             .iter()
             .filter(|row| !canonicalize_for_embedding(&row.content).is_empty())
             .collect();
         if filtered.len() != rows.len() {
+            let ineligible: Vec<&HoleMessageRow> = rows
+                .iter()
+                .filter(|row| canonicalize_for_embedding(&row.content).is_empty())
+                .collect();
             tracing::warn!(
                 generation_id,
                 total = rows.len(),
                 kept = filtered.len(),
+                written_off = ineligible.len(),
                 "db_vector_catchup: hole row canonicalized to empty text despite genesis \
-                 eligibility filtering; leaving its hole unresolved for investigation"
+                 eligibility filtering; writing off its hole as ineligible (R1-W3-B1)"
             );
+            storage
+                .raw()
+                .with_tx(TxMode::Immediate, |tx| {
+                    for row in &ineligible {
+                        schema::write_off_ineligible_hole_in_tx(tx, generation_id, row.doc_id)?;
+                    }
+                    Ok(())
+                })
+                .context("writing off ineligible embedding_holes rows")?;
+            holes_written_off_ineligible =
+                holes_written_off_ineligible.saturating_add(u64::try_from(ineligible.len()).unwrap_or(0));
         }
         if filtered.is_empty() {
-            // Every row in this batch was the defensive case above; avoid
-            // spinning on the same non-empty-but-unembeddable rows forever
-            // by stopping here rather than looping on an unchanged queue.
-            break;
+            // Every row in this batch was just written off above, so the
+            // queue has strictly shrunk -- looping back to `fetch_hole_
+            // batch` cannot refetch the same rows and spin forever; it
+            // either drains further eligible holes or the queue is now
+            // truly empty and the `rows.is_empty()` check above ends the
+            // loop.
+            continue;
         }
 
         let inputs: Vec<EmbeddingInput> = filtered
@@ -388,6 +422,7 @@ pub fn run_db_vector_catchup_backfill(
         holes_after,
         vec0_rows,
         activated,
+        holes_written_off_ineligible,
     })
 }
 

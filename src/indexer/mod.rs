@@ -8434,8 +8434,18 @@ impl Drop for ScanWatermarkRestoreGuard {
 /// by nothing. The genesis eligibility rescan this also performs each call is
 /// kept as a self-healing safety net for any hook that was missed, not an
 /// optimization target (W3-5 task book #63 advisor ruling).
+/// Returns the underlying `run_db_vector_catchup_backfill` report's
+/// `activated` flag (R1-W3-B1: previously discarded as `Ok(())`, which is
+/// exactly what let every caller -- including `run_targeted_semantic_
+/// watch_once_publish` -- report success/`published: true` regardless of
+/// whether the generation ever actually reached `active+passed`). Callers
+/// must not treat `Ok(false)` as an error: a catch-up call draining a
+/// large hole backlog in bounded batches, or one that just wrote off an
+/// ineligible hole this pass, is expected to return without activating
+/// and needs a subsequent call to finish -- that is the documented
+/// "idempotent, safe to rerun" contract, not a failure.
 #[cfg(feature = "infinity")]
-fn run_semantic_db_vector_catchup(opts: &IndexOptions, caller: &str) -> Result<()> {
+fn run_semantic_db_vector_catchup(opts: &IndexOptions, caller: &str) -> Result<bool> {
     if opts.embedder != "infinity" {
         anyhow::bail!(
             "{caller}: --embedder {} is retired (W3-5, frankensearch/fsvi removed); \
@@ -8465,14 +8475,25 @@ fn run_semantic_db_vector_catchup(opts: &IndexOptions, caller: &str) -> Result<(
         stale_skipped = report.stale_skipped,
         holes_before = report.holes_before,
         holes_after = report.holes_after,
+        holes_written_off_ineligible = report.holes_written_off_ineligible,
         activated = report.activated,
         "db vector domain catch-up complete"
     );
-    Ok(())
+    if !report.activated {
+        tracing::info!(
+            caller,
+            generation_id = report.generation_id,
+            holes_after = report.holes_after,
+            "{caller}: db vector domain catch-up did not activate this pass \
+             (holes remain, or activation audit has not run yet); rerun the \
+             same command to continue draining embedding_holes"
+        );
+    }
+    Ok(report.activated)
 }
 
 #[cfg(not(feature = "infinity"))]
-fn run_semantic_db_vector_catchup(_opts: &IndexOptions, caller: &str) -> Result<()> {
+fn run_semantic_db_vector_catchup(_opts: &IndexOptions, caller: &str) -> Result<bool> {
     anyhow::bail!(
         "{caller}: semantic indexing requires the `infinity` feature (fsvi-backed semantic \
          indexing was retired in W3-5); rebuild with --features infinity"
@@ -10167,7 +10188,7 @@ pub fn run_index(
                             &opts_clone,
                             "cass index --semantic (watch)",
                         ) {
-                            Ok(()) => {
+                            Ok(_activated) => {
                                 if let Ok(mut t) = last_semantic_embed.lock() {
                                     *t = Instant::now();
                                 }
@@ -10552,6 +10573,13 @@ fn should_run_targeted_semantic_watch_once(opts: &IndexOptions) -> bool {
 /// what's eligible via `embedding_holes` -- but the zero-conversations
 /// refusal is kept: publishing a "semantic ready" claim off a watch-once
 /// pass that indexed nothing would be misleading either way.
+///
+/// R1-W3-B1: `published` must mirror the catch-up's actual `activated`
+/// result, not a hardcoded `true` -- a watch-once pass that ingested
+/// conversations but left the generation's holes undrained (large backlog,
+/// or holes just written off as ineligible this pass) has not actually
+/// published anything, and claiming otherwise is the same false-green this
+/// finding covers for the plain `cass index --semantic` path.
 fn run_targeted_semantic_watch_once_publish(
     opts: &IndexOptions,
     indexed_conversations: usize,
@@ -10561,16 +10589,23 @@ fn run_targeted_semantic_watch_once_publish(
             "semantic watch-once indexed zero conversations; refusing to publish semantic success"
         );
     }
-    run_semantic_db_vector_catchup(opts, "cass index --semantic --watch-once")?;
+    let activated = run_semantic_db_vector_catchup(opts, "cass index --semantic --watch-once")?;
     Ok(SemanticWatchOnceStats {
-        published: true,
+        published: activated,
         selected_docs: indexed_conversations,
         embedded_docs: indexed_conversations,
         tier: "quality".to_string(),
         vector_index_path: String::new(),
         manifest_before_db_fingerprint: None,
         manifest_after_db_fingerprint: None,
-        reason: "db-vector-domain catch-up (W3-5: fsvi manifest retired)".to_string(),
+        reason: if activated {
+            "db-vector-domain catch-up (W3-5: fsvi manifest retired)".to_string()
+        } else {
+            "db-vector-domain catch-up ingested but has not activated yet (holes remain or \
+             activation audit has not run this pass); rerun to continue draining \
+             embedding_holes (W3-5: fsvi manifest retired)"
+                .to_string()
+        },
     })
 }
 
