@@ -577,30 +577,60 @@ pub fn run_activation_audit(
     // on the very corruption it exists to detect defeats its own
     // purpose, so every fallible step here is caught rather than `?`-ed
     // straight out of `run_activation_audit`.
-    let positive_check_result: Result<(i64, f64)> = (|| {
-        let anchor_blob: Vec<u8> = conn
+    let positive_check_result: Result<(i64, f64, bool)> = (|| {
+        let (anchor_blob, anchor_content_hash): (Vec<u8>, String) = conn
             .query_row_map(
-                "SELECT embedding FROM message_embeddings WHERE generation_id = ?1 AND doc_id = ?2",
+                "SELECT embedding, content_hash FROM message_embeddings WHERE generation_id = ?1 AND doc_id = ?2",
                 &params![generation_id, anchor_doc_id],
-                |row| row.get_typed(0),
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
             )
             .with_context(|| format!("positive-check anchor doc_id={anchor_doc_id} not found in generation {generation_id}"))?;
         let anchor_vector = schema::le_blob_to_f32_vector(&anchor_blob)?;
         let hits = vector_domain::vec0_knn(conn, generation_id, &anchor_vector, 1)?;
-        Ok(hits.first().copied().unwrap_or((-1, f64::INFINITY)))
+        let (top_hit_doc_id, distance) = hits.first().copied().unwrap_or((-1, f64::INFINITY));
+        // R1-W3-B8 (exec60 real-corpus gate run, 2026-09-02): a
+        // zero-distance *tie* between the anchor and a genuine content twin
+        // (another message with byte-identical content, hence an
+        // identical embedding) is not corruption -- vec0's ORDER BY
+        // distance has no secondary key, so which of two exactly-tied rows
+        // sorts first is unspecified, and it is under no obligation to be
+        // the anchor itself. Real corpora routinely contain repeated short
+        // messages (this is the same benign phenomenon the Step2 backfill
+        // report's staging KNN sample already documented as "genuine
+        // twin, not a bug" for a different KNN call). A tied hit whose own
+        // content_hash matches the anchor's is semantically the same
+        // self-hit, just realized through a different row id -- record
+        // that as `tied_content_twin` without touching the raw
+        // `top_hit_doc_id`/`distance` evidence below, so the report still
+        // shows what vec0 actually returned.
+        let tied_content_twin = top_hit_doc_id != anchor_doc_id
+            && distance <= 1e-6
+            && conn
+                .query_opt_map(
+                    "SELECT content_hash FROM message_embeddings WHERE generation_id = ?1 AND doc_id = ?2",
+                    &params![generation_id, top_hit_doc_id],
+                    |row| row.get_typed::<String>(0),
+                )
+                .ok()
+                .flatten()
+                .is_some_and(|top_hit_content_hash| top_hit_content_hash == anchor_content_hash);
+        Ok((top_hit_doc_id, distance, tied_content_twin))
     })();
     let mut positive_check_errored = false;
-    let (top_hit_doc_id, distance) = match positive_check_result {
-        Ok(pair) => pair,
+    let (top_hit_doc_id, distance, tied_content_twin) = match positive_check_result {
+        Ok(triple) => triple,
         Err(e) => {
             positive_check_errored = true;
             failures.push(format!(
                 "③ positive content check errored on anchor doc_id={anchor_doc_id} (likely a downstream symptom of an ①/② corruption already reported above): {e}"
             ));
-            (-1, f64::INFINITY)
+            (-1, f64::INFINITY, false)
         }
     };
-    if !positive_check_errored && (top_hit_doc_id != anchor_doc_id || !(distance <= 1e-6)) {
+    if !positive_check_errored
+        && !tied_content_twin
+        && (top_hit_doc_id != anchor_doc_id || !(distance <= 1e-6))
+    {
         failures.push(format!(
             "③ positive content check failed: anchor doc_id={anchor_doc_id} top vec0 hit={top_hit_doc_id} distance={distance}"
         ));

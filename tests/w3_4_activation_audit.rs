@@ -332,3 +332,56 @@ fn audit_never_touches_the_active_generation_pointer() {
     let is_active: i64 = storage.raw().query_row_map("SELECT is_active FROM embedding_generations WHERE id = ?1", fparams![gen_id], |row| row.get_typed(0)).unwrap();
     assert_eq!(is_active, 1, "a failed audit must never move the is_active pointer -- it only ever writes audit_status");
 }
+
+/// R1-W3-B8 (exec60 real-corpus gate run, 2026-09-02): two messages with
+/// byte-identical content -- and therefore, in production, an identical
+/// embedding -- produce an exact zero-distance *tie* in check ③'s
+/// `vec0_knn(k=1)` self-hit query. `ORDER BY distance` has no secondary
+/// key, so which of the two tied rows sorts first is unspecified; it need
+/// not be the anchor row itself. Both `embed()` calls below share the
+/// exact same vector *and* the exact same `content_hash` literal
+/// (`"seed-hash"`, this file's placeholder for "identical content"),
+/// simulating the genuine content-twin case the fix must tolerate.
+fn duplicate_content_two_message_fixture(storage: &FrankenStorage) -> (i64, i64, i64, [f32; 4]) {
+    let agent_id = ensure_agent(storage);
+    let conv = conversation(
+        "w3-8-duplicate-content",
+        vec![msg(0, MessageRole::User, "same message twice"), msg(1, MessageRole::User, "same message twice")],
+    );
+    storage.insert_conversation_tree(agent_id, None, &conv).expect("insert fixture conversation");
+    let conv_id = conv_id_of(storage, "w3-8-duplicate-content");
+    let doc_a = message_id_at_idx(storage, conv_id, 0);
+    let doc_b = message_id_at_idx(storage, conv_id, 1);
+
+    let gen_id = create_generation(storage, CANONICALIZE_PIPELINE_VERSION);
+    let twin_vector = [0.6, 0.8, 0.0, 0.0];
+    embed(storage, gen_id, doc_a, conv_id, &twin_vector);
+    embed(storage, gen_id, doc_b, conv_id, &twin_vector);
+    rebuild_vec0(storage, gen_id);
+    (gen_id, doc_a, doc_b, twin_vector)
+}
+
+#[test]
+fn audit_check3_tolerates_a_zero_distance_content_twin_tie() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let storage = open_storage(&dir.path().join("db.sqlite"));
+    let (gen_id, doc_a, doc_b, twin_vector) = duplicate_content_two_message_fixture(&storage);
+
+    // Which of the two tied rows vec0 actually returns first for an exact
+    // tie is implementation-defined (no secondary sort key) -- don't
+    // hardcode an assumption about it. Anchor the audit on whichever one
+    // is NOT the natural top-1, so this test always exercises the tie
+    // path (anchoring on the natural winner would trivially pass even
+    // without the fix and prove nothing).
+    let hits = vector_domain::vec0_knn(storage.raw(), gen_id, &twin_vector, 2).expect("knn probe for test setup");
+    let natural_winner = hits.first().map(|(id, _)| *id).expect("both twin rows must be present in vec0");
+    let anchor = if natural_winner == doc_a { doc_b } else { doc_a };
+
+    let report = run_activation_audit_and_record(&storage, gen_id, 100, Some(anchor)).expect("audit must run without a hard error");
+    assert!(
+        report.passed,
+        "an exact content-identical tie must still pass check ③ (twin content, not corruption): {:?}",
+        report.failure_reasons
+    );
+    assert_eq!(audit_status_of(&storage, gen_id), "passed");
+}
