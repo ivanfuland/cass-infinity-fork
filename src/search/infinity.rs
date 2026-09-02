@@ -185,6 +185,98 @@ fn http_rerank(
     Ok(scores)
 }
 
+// ---- served-model identity probe (w3-3 Step0/Step1, d3④) --------------------
+
+#[derive(Deserialize)]
+struct ModelsResponse {
+    data: Vec<ModelsResponseItem>,
+}
+
+#[derive(Deserialize)]
+struct ModelsResponseItem {
+    id: String,
+    #[serde(default)]
+    capabilities: Vec<String>,
+}
+
+/// Identity of the embedding model Infinity is *actually* serving right
+/// now, established by talking to the live service — never a hardcoded
+/// literal. Used to stamp a new `embedding_generations` row's
+/// `embedder_id`/`dim` so the vector domain's generation identity can
+/// never silently drift from the model that produced its vectors (the
+/// same discipline `insert_message_embedding`'s `expected_dim` check
+/// already enforces per-write, moved up to generation-creation time).
+pub struct InfinityServedIdentity {
+    pub model_id: String,
+    pub dimension: usize,
+}
+
+/// Probe Infinity's OpenAI-compatible `/models` for the currently served
+/// embed-capable model id, then confirm its real output dimension with one
+/// live `/embeddings` call (never assumed from the [`DIMENSION`] constant,
+/// for the same "identity from the actual service, not a literal" reason).
+/// Fails loudly (`Err`) rather than falling back to a hardcoded id/dim —
+/// per w3-3 Step0 design ruling ①, a missing/unreachable identity is a
+/// precondition failure, not something a fallback literal should paper
+/// over (a wrong fallback would open a "same dimension, wrong model"
+/// hole with no defense left to catch it).
+pub fn probe_served_embed_identity(
+    config: &InfinityConfig,
+) -> Result<InfinityServedIdentity, String> {
+    let client = build_client(config.timeout)?;
+
+    let models_resp = client
+        .get(format!("{}/models", config.base_url))
+        .send()
+        .map_err(|e| format!("infinity /models request failed: {e}"))?;
+    if !models_resp.status().is_success() {
+        let status = models_resp.status();
+        let text = models_resp.text().unwrap_or_default();
+        return Err(format!("infinity /models HTTP {status}: {text}"));
+    }
+    let parsed_models: ModelsResponse = models_resp
+        .json()
+        .map_err(|e| format!("infinity /models decode failed: {e}"))?;
+    let model_id = parsed_models
+        .data
+        .into_iter()
+        .find(|m| m.capabilities.iter().any(|c| c == "embed"))
+        .map(|m| m.id)
+        .ok_or_else(|| "infinity /models reported no embed-capable model".to_string())?;
+
+    // Confirm the real output dimension with a live call -- `/models`
+    // itself does not report it, and a hardcoded constant is exactly the
+    // "same dimension, wrong model" hole this probe exists to close.
+    let embed_resp = client
+        .post(format!("{}/embeddings", config.base_url))
+        .json(&serde_json::json!({
+            "model": model_id,
+            "input": ["cass-infinity-served-identity-probe"],
+        }))
+        .send()
+        .map_err(|e| format!("infinity identity-probe embeddings request failed: {e}"))?;
+    if !embed_resp.status().is_success() {
+        let status = embed_resp.status();
+        let text = embed_resp.text().unwrap_or_default();
+        return Err(format!(
+            "infinity identity-probe embeddings HTTP {status}: {text}"
+        ));
+    }
+    let parsed_embed: EmbeddingsResponse = embed_resp
+        .json()
+        .map_err(|e| format!("infinity identity-probe embeddings decode failed: {e}"))?;
+    let dimension = parsed_embed
+        .data
+        .first()
+        .map(|item| item.embedding.len())
+        .ok_or_else(|| "infinity identity-probe returned no embedding".to_string())?;
+    if dimension == 0 {
+        return Err("infinity identity-probe returned a zero-length embedding".to_string());
+    }
+
+    Ok(InfinityServedIdentity { model_id, dimension })
+}
+
 // ---- pure helpers -----------------------------------------------------------
 
 /// Returns the number of chunks needed to cover `len` items with at most `max`

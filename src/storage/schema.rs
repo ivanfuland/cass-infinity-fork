@@ -446,6 +446,88 @@ pub fn l2_norm(vector: &[f32]) -> f64 {
 /// embedding generation and return its `id`. Callers needing "just landed a
 /// new generation" semantics (Task W3-2's migrator, catch-up writers) call
 /// this once per generation, then [`insert_message_embedding`] per row.
+/// Find the newest `embedding_generations` row whose identity
+/// (`embedder_id`+`dim`+`canonicalize_version`) matches exactly and whose
+/// `audit_status` is `'pending'`, if any (w3-3 Step0/Step1 design ruling
+/// ②). A catch-up worker calls this before deciding whether to create a
+/// new generation: an identity match means there is already an
+/// in-progress (or demoted-back-to-pending, R4-N... `demote_active_
+/// generation_readiness_in_tx`) generation for this exact model, and its
+/// `embedding_holes` are the worker's queue to keep draining rather than
+/// abandoning hours of prior embedding work. A generation with a
+/// *different* identity (model/dim/canonicalize upgrade) never matches
+/// here and is intentionally left behind as-is -- W3-5's orphan-generation
+/// collection, not this function's job.
+///
+/// `is_active` is deliberately NOT filtered: an already-active generation
+/// can legitimately be `'pending'` again (new writes demoted it), and
+/// resuming its holes is exactly the right behavior, not a special case.
+pub fn find_reusable_pending_generation(
+    conn: &Conn,
+    embedder_id: &str,
+    dim: i64,
+    canonicalize_version: u32,
+) -> Result<Option<i64>, StorageError> {
+    conn.query_opt_map(
+        "SELECT id FROM embedding_generations \
+         WHERE embedder_id = ?1 AND dim = ?2 AND canonicalize_version = ?3 \
+           AND audit_status = 'pending' \
+         ORDER BY id DESC LIMIT 1",
+        &params![embedder_id, dim, i64::from(canonicalize_version)],
+        |row| row.get_typed(0),
+    )
+}
+
+/// Bulk-seed `embedding_holes` for `generation_id` from a caller-supplied
+/// list of already-eligible `doc_id`s (w3-3 Step0/Step1: genesis backfill
+/// bootstrap). `register_embedding_hole_for_new_message_in_tx` only fires
+/// for messages inserted *after* a generation exists -- it has no way to
+/// retroactively register holes for a corpus that predates the
+/// generation, which is exactly genesis backfill's starting condition.
+///
+/// The caller is responsible for eligibility filtering (w3-3 Step0's
+/// eligibility chain, `packet.projections.semantic.message_indices` plus
+/// the caller's own canonicalize-non-empty check -- R1-W3-N3 forbids
+/// seeding a hole for a `doc_id` that can never resolve to a real
+/// embedding).
+///
+/// Idempotent and safe to call repeatedly, including against a
+/// resumed generation that already fully or partially embedded some of
+/// `doc_ids` (w3-3 Step0's "no resume machinery" design: a caller does
+/// not need to know what a prior run already finished before calling
+/// this again) -- `NOT EXISTS` against `message_embeddings` skips any
+/// `doc_id` already embedded under `generation_id` (re-seeding its hole
+/// would otherwise resurrect a hole this generation already resolved,
+/// and the worker's next pass would then hit `message_embeddings`'s
+/// `UNIQUE (generation_id, doc_id)` trying to embed it a second time),
+/// and `INSERT OR IGNORE` skips any `doc_id` whose hole is already
+/// pending from an unfinished prior run.
+///
+/// Returns the number of rows this call actually inserted (rows already
+/// present, or already embedded, are not recounted).
+pub fn seed_embedding_holes(
+    tx: &Tx,
+    generation_id: i64,
+    doc_ids: &[i64],
+    detected_at_ms: i64,
+    reason: &str,
+) -> Result<u64, StorageError> {
+    let mut inserted = 0u64;
+    for &doc_id in doc_ids {
+        let changed = tx.execute(
+            "INSERT OR IGNORE INTO embedding_holes (generation_id, doc_id, detected_at, reason) \
+             SELECT ?1, ?2, ?3, ?4 \
+             WHERE NOT EXISTS ( \
+                 SELECT 1 FROM message_embeddings \
+                 WHERE generation_id = ?1 AND doc_id = ?2 \
+             )",
+            &params![generation_id, doc_id, detected_at_ms, reason],
+        )?;
+        inserted = inserted.saturating_add(u64::try_from(changed).unwrap_or(0));
+    }
+    Ok(inserted)
+}
+
 pub fn create_embedding_generation(
     tx: &Tx,
     embedder_id: &str,

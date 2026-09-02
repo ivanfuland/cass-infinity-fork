@@ -1,3 +1,5 @@
+#[cfg(feature = "infinity")]
+pub mod db_vector_catchup;
 pub(crate) mod lexical_generation;
 pub(crate) mod memoization;
 pub(crate) mod parallel_wal_shadow;

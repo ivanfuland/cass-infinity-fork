@@ -614,12 +614,12 @@ struct CanonicalEmbeddingConversationRow {
     origin_host: Option<String>,
 }
 
-struct CanonicalEmbeddingBatch {
-    inputs: Vec<EmbeddingInput>,
-    conversations_in_batch: u64,
-    last_conversation_id: i64,
-    total_conversations: u64,
-    cursor_exhausted: bool,
+pub(crate) struct CanonicalEmbeddingBatch {
+    pub(crate) inputs: Vec<EmbeddingInput>,
+    pub(crate) conversations_in_batch: u64,
+    pub(crate) last_conversation_id: i64,
+    pub(crate) total_conversations: u64,
+    pub(crate) cursor_exhausted: bool,
     /// Highest canonical message PK selected anywhere in this batch,
     /// paired with the conversation it came from. Message ids are NOT
     /// monotonic with conversation ids (a conversation can keep
@@ -993,7 +993,7 @@ pub(crate) fn semantic_inputs_from_packets(
     Ok(inputs)
 }
 
-fn fetch_canonical_embedding_batch(
+pub(crate) fn fetch_canonical_embedding_batch(
     storage: &FrankenStorage,
     after_conversation_id: i64,
     max_conversations: usize,

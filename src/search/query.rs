@@ -19065,4 +19065,132 @@ mod tests {
         );
         assert_ne!(gen_a, gen_b);
     }
+
+    /// w3-3 Step1 (task book #61): first real end-to-end light-up of the
+    /// full db-vector-domain loop -- genesis-seed -> Infinity embed ->
+    /// CAS write -> hole resolution -> vec0 rebuild -> activation -> a
+    /// real hit through this file's own `search_db_vector_domain` read
+    /// path. Requires a live Infinity at `CASS_INFINITY_URL`
+    /// (127.0.0.1:7997 by default); run explicitly with `--ignored`.
+    #[test]
+    #[ignore = "requires a live Infinity service at 127.0.0.1:7997 (CASS_INFINITY_URL)"]
+    #[cfg(feature = "infinity")]
+    fn db_vector_catchup_end_to_end_via_live_infinity() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "claude_code".into(),
+                name: "Claude Code".into(),
+                version: Some("1.0".into()),
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+
+        fn msg(idx: i64, role: MessageRole, content: &str) -> Message {
+            Message {
+                id: None,
+                idx,
+                role,
+                author: None,
+                created_at: Some(1_000 + idx * 1_000),
+                content: content.into(),
+                extra_json: json!(null),
+                snippets: vec![],
+            }
+        }
+
+        // Three conversations, 7 messages each = 21 total. Each
+        // conversation carries one raw-non-empty-but-canonicalize-empty
+        // "noise" message ("ok", in `LOW_SIGNAL_CONTENT`) -- eligible per the packet's weak
+        // `!content.is_empty()` projection but never embeddable, so this
+        // corpus also proves the stricter canonicalize-non-empty genesis
+        // filter (w3-3 Step0 design §2) actually excludes it end-to-end.
+        let mut total_messages = 0usize;
+        let mut noise_messages = 0usize;
+        for c in 0..3i64 {
+            let messages = vec![
+                msg(0, MessageRole::User, &format!("conversation {c} message about rust borrow checker lifetimes")),
+                msg(1, MessageRole::Agent, &format!("conversation {c} reply about ownership and ownership rules")),
+                msg(2, MessageRole::User, "ok"),
+                msg(3, MessageRole::User, &format!("conversation {c} question about async runtime scheduling")),
+                msg(4, MessageRole::Agent, &format!("conversation {c} answer about tokio executor internals")),
+                msg(5, MessageRole::User, &format!("conversation {c} follow-up on garbage collection tradeoffs")),
+                msg(6, MessageRole::Agent, &format!("conversation {c} closing remark on memory safety guarantees")),
+            ];
+            total_messages += messages.len();
+            noise_messages += 1;
+            let conv = Conversation {
+                id: None,
+                agent_slug: "claude_code".into(),
+                workspace: None,
+                external_id: Some(format!("w3-3-step1-e2e-{c}")),
+                title: Some("w3-3 Step1 e2e fixture".into()),
+                source_path: std::path::PathBuf::from(format!("/fixtures/w3-3-step1-e2e-{c}.jsonl")),
+                started_at: Some(1_000),
+                ended_at: Some(8_000),
+                approx_tokens: None,
+                metadata_json: json!(null),
+                messages,
+                source_id: "local".into(),
+                origin_host: None,
+            };
+            storage.insert_conversation_tree(agent_id, None, &conv).expect("seed conversation");
+        }
+        let expected_eligible = (total_messages - noise_messages) as u64;
+
+        let report = crate::indexer::db_vector_catchup::run_db_vector_catchup_backfill(&storage, 8)
+            .expect("first backfill run");
+
+        assert!(report.generation_id > 0);
+        assert!(!report.reused_existing_generation, "first call must create, not reuse");
+        assert_eq!(report.embedder_id, "BAAI/bge-m3");
+        assert_eq!(report.dim, 1024);
+        assert_eq!(report.eligible_seeded, expected_eligible, "genesis seeding must exclude the noise messages");
+        assert_eq!(report.embedded_inserted, expected_eligible);
+        assert_eq!(report.stale_skipped, 0, "no concurrent writer in this test -- nothing should ever go stale");
+        assert_eq!(report.holes_before, expected_eligible);
+        assert_eq!(report.holes_after, 0, "every eligible hole must be resolved by the end of one run");
+        assert_eq!(report.vec0_rows, expected_eligible as usize);
+        assert!(report.activated);
+
+        let active = crate::storage::schema::active_generation_id(storage.raw()).unwrap();
+        assert_eq!(active, Some(report.generation_id));
+
+        // Real read-path light-up: pull back one message's own stored
+        // vector and self-query `search_db_vector_domain` with it -- the
+        // nearest hit must be that same message, at near-1.0 cosine score.
+        let (sample_doc_id, sample_blob): (i64, Vec<u8>) = storage
+            .raw()
+            .query_row_map(
+                "SELECT doc_id, embedding FROM message_embeddings WHERE generation_id = ?1 LIMIT 1",
+                &crate::storage::api::params![report.generation_id],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )
+            .unwrap();
+        let sample_vector = crate::storage::schema::le_blob_to_f32_vector(&sample_blob).unwrap();
+        let (hits, _) = SearchClient::search_db_vector_domain(
+            storage.raw(),
+            &sample_vector,
+            &SearchFilters::default(),
+            None,
+            5,
+        )
+        .expect("db vector domain search must succeed once activated");
+        assert!(!hits.is_empty(), "self-query must return at least one hit");
+        assert_eq!(hits[0].message_id, u64::try_from(sample_doc_id).unwrap());
+        assert!(hits[0].score > 0.99, "self-query must score near-exact, got {}", hits[0].score);
+
+        // Ruling ② (w3-3 Step0 design, approved): a second call with no
+        // new eligible work must resume the same generation by identity
+        // match, not create a fresh one or re-embed anything.
+        let second = crate::indexer::db_vector_catchup::run_db_vector_catchup_backfill(&storage, 8)
+            .expect("second backfill run (resume path)");
+        assert!(second.reused_existing_generation, "second call must find and reuse the pending generation");
+        assert_eq!(second.generation_id, report.generation_id);
+        assert_eq!(second.embedded_inserted, 0, "nothing new to embed on the resume pass");
+        assert_eq!(second.holes_after, 0);
+        assert!(second.activated);
+    }
 }
