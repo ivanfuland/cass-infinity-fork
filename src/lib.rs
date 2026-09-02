@@ -76317,6 +76317,12 @@ pub(crate) fn run_doctor_impl(
             "event_log": operation_event_log,
             "lexical": readiness_snapshot.get("index").cloned().unwrap_or(serde_json::Value::Null),
             "semantic": readiness_snapshot.get("semantic").cloned().unwrap_or(serde_json::Value::Null),
+            // W3-4 Step2-3 (task book #62): same parallel DB-vector-domain
+            // section `cass status` gained in Step2-2, passed through
+            // from the same `readiness_snapshot` this function already
+            // computed via `state_meta_json_inner` -- no extra DB open
+            // beyond what Step2-2 already introduced.
+            "db_vector_domain": readiness_snapshot.get("db_vector_domain").cloned().unwrap_or(serde_json::Value::Null),
             "derived_semantic_assets": derived_semantic_assets,
             "storage_pressure": storage_pressure,
             "storage_integrity": storage_integrity_report,
