@@ -206,6 +206,7 @@ struct ModelsResponseItem {
 /// never silently drift from the model that produced its vectors (the
 /// same discipline `insert_message_embedding`'s `expected_dim` check
 /// already enforces per-write, moved up to generation-creation time).
+#[derive(Debug)]
 pub struct InfinityServedIdentity {
     pub model_id: String,
     pub dimension: usize,
@@ -237,12 +238,42 @@ pub fn probe_served_embed_identity(
     let parsed_models: ModelsResponse = models_resp
         .json()
         .map_err(|e| format!("infinity /models decode failed: {e}"))?;
-    let model_id = parsed_models
+
+    // R1-W3-B4: select by `config.embed_model` -- the exact identity the
+    // real embed calls use (`InfinityEmbedder`/`SemanticIndexer` re-read
+    // `CASS_INFINITY_EMBED_MODEL` from env at call time, independently of
+    // this probe) -- never "the first embed-capable model /models happens
+    // to list". Two served models can share the "embed" capability *and*
+    // the same output dimension (the "same dimension, different model"
+    // hole this whole probe exists to close per its own doc comment
+    // above); picking an arbitrary one here would silently stamp a
+    // generation with an identity that is not what actually produced its
+    // vectors, with no defense left downstream to catch it (insert-time
+    // dimension checks pass either way). Refusing loudly when the
+    // configured model isn't even in the served list, rather than
+    // guessing a substitute, is the same "fail closed on a precondition
+    // failure" discipline this function's own doc comment already commits
+    // to for a missing/unreachable identity.
+    let served_model = parsed_models
         .data
         .into_iter()
-        .find(|m| m.capabilities.iter().any(|c| c == "embed"))
-        .map(|m| m.id)
-        .ok_or_else(|| "infinity /models reported no embed-capable model".to_string())?;
+        .find(|m| m.id == config.embed_model)
+        .ok_or_else(|| {
+            format!(
+                "infinity /models does not list the configured embed model {:?} \
+                 (CASS_INFINITY_EMBED_MODEL); refusing to substitute a different \
+                 served model for identity purposes",
+                config.embed_model
+            )
+        })?;
+    if !served_model.capabilities.iter().any(|c| c == "embed") {
+        return Err(format!(
+            "infinity model {:?} (CASS_INFINITY_EMBED_MODEL) is served but does not \
+             advertise the 'embed' capability (capabilities: {:?})",
+            served_model.id, served_model.capabilities
+        ));
+    }
+    let model_id = served_model.id;
 
     // Confirm the real output dimension with a live call -- `/models`
     // itself does not report it, and a hardcoded constant is exactly the
@@ -511,6 +542,211 @@ impl DaemonClient for InfinityDaemonClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, TcpListener, TcpStream};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+
+    // ---- R1-W3-B4: minimal hand-rolled mock Infinity HTTP server ----------
+    //
+    // No HTTP mocking crate is a dependency of this workspace (checked:
+    // no wiremock/mockito/httpmock in Cargo.toml); the model_download.rs
+    // test module already establishes the pattern of a raw `TcpListener`
+    // mock for this codebase, so this follows the same shape rather than
+    // introducing a new one. Serves exactly the two routes
+    // `probe_served_embed_identity` calls: `GET /models` (fixed canned
+    // body) and `POST /embeddings` (dispatches on the request's `model`
+    // field so a wrong model selection surfaces as a probe `Err`, not a
+    // silently-accepted wrong dimension).
+    struct MockInfinityServer {
+        base_url: String,
+        stop: Arc<AtomicBool>,
+        wake_addr: String,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl Drop for MockInfinityServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Ok(stream) = TcpStream::connect(&self.wake_addr) {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn start_mock_infinity_server(
+        models_json: &'static str,
+        expected_embed_model: &'static str,
+        embed_dim: usize,
+    ) -> MockInfinityServer {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock infinity server");
+        listener
+            .set_nonblocking(true)
+            .expect("set mock infinity server nonblocking");
+        let addr = listener.local_addr().expect("read mock server address");
+        let wake_addr = addr.to_string();
+        let base_url = format!("http://{wake_addr}");
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            while !stop_flag.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        handle_mock_infinity_request(stream, models_json, expected_embed_model, embed_dim);
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        MockInfinityServer {
+            base_url,
+            stop,
+            wake_addr,
+            handle: Some(handle),
+        }
+    }
+
+    fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    fn handle_mock_infinity_request(
+        mut stream: TcpStream,
+        models_json: &str,
+        expected_embed_model: &str,
+        embed_dim: usize,
+    ) {
+        let mut buf = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        let header_end = loop {
+            let n = match stream.read(&mut chunk) {
+                Ok(0) => return,
+                Ok(n) => n,
+                Err(_) => return,
+            };
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
+                break pos + 4;
+            }
+            if buf.len() > 65536 {
+                return;
+            }
+        };
+        let header_str = String::from_utf8_lossy(&buf[..header_end]).to_string();
+        let mut lines = header_str.lines();
+        let request_line = lines.next().unwrap_or("");
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().unwrap_or("GET").to_string();
+        let path = parts.next().unwrap_or("/").to_string();
+        let content_length: usize = lines
+            .find_map(|l| {
+                let (name, value) = l.split_once(':')?;
+                if name.eq_ignore_ascii_case("content-length") {
+                    value.trim().parse().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+        while buf.len() < header_end + content_length {
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Err(_) => break,
+            }
+        }
+        let body = &buf[header_end..buf.len().min(header_end + content_length)];
+
+        let response = if method == "GET" && path == "/models" {
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                models_json.len(),
+                models_json
+            )
+        } else if method == "POST" && path == "/embeddings" {
+            let requested_model = serde_json::from_slice::<serde_json::Value>(body)
+                .ok()
+                .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string))
+                .unwrap_or_default();
+            if requested_model == expected_embed_model {
+                let embedding: Vec<f32> = (0..embed_dim).map(|i| i as f32 + 1.0).collect();
+                let body_json =
+                    serde_json::json!({ "data": [{ "embedding": embedding, "index": 0 }] }).to_string();
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body_json.len(),
+                    body_json
+                )
+            } else {
+                let msg = format!("mock infinity: unexpected model {requested_model:?} in /embeddings request");
+                format!(
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    msg.len(),
+                    msg
+                )
+            }
+        } else {
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+        };
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+    }
+
+    /// R1-W3-B4 regression: `/models` lists two embed-capable models; the
+    /// probe must select the one named by `config.embed_model`
+    /// (`CASS_INFINITY_EMBED_MODEL`), not whichever one happens to come
+    /// first in Infinity's response order.
+    #[test]
+    fn probe_served_embed_identity_selects_the_configured_model_among_several() {
+        let server = start_mock_infinity_server(
+            r#"{"data":[{"id":"BAAI/bge-m3","capabilities":["embed"]},{"id":"other/embed-model","capabilities":["embed"]}]}"#,
+            "other/embed-model",
+            4,
+        );
+        let config = InfinityConfig {
+            base_url: server.base_url.clone(),
+            embed_model: "other/embed-model".to_string(),
+            rerank_model: "unused".to_string(),
+            timeout: Duration::from_secs(5),
+            max_batch: MAX_BATCH,
+        };
+        let identity =
+            probe_served_embed_identity(&config).expect("probe must select the env-configured model, not the first listed one");
+        assert_eq!(identity.model_id, "other/embed-model");
+        assert_eq!(identity.dimension, 4);
+    }
+
+    /// R1-W3-B4 regression: when the configured embed model is not in
+    /// `/models`' served list at all, the probe must fail loudly rather
+    /// than silently substituting a different served model.
+    #[test]
+    fn probe_served_embed_identity_errors_loudly_when_configured_model_is_not_served() {
+        let server = start_mock_infinity_server(
+            r#"{"data":[{"id":"BAAI/bge-m3","capabilities":["embed"]},{"id":"other/embed-model","capabilities":["embed"]}]}"#,
+            "irrelevant-because-this-test-must-never-reach-/embeddings",
+            4,
+        );
+        let config = InfinityConfig {
+            base_url: server.base_url.clone(),
+            embed_model: "not-served/model".to_string(),
+            rerank_model: "unused".to_string(),
+            timeout: Duration::from_secs(5),
+            max_batch: MAX_BATCH,
+        };
+        let err = probe_served_embed_identity(&config)
+            .expect_err("a configured model absent from /models must error, not fall back to a substitute");
+        assert!(
+            err.contains("not-served/model"),
+            "error must name the missing configured model so an operator can act on it: {err}"
+        );
+    }
 
     #[test]
     fn config_from_env_defaults_and_overrides() {
