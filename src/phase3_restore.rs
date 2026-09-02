@@ -8466,7 +8466,194 @@ fn restore_invalidate_embeddings(journal: &RestoreJournal) -> anyhow::Result<()>
             .save(data_dir)
             .map_err(|e| anyhow::anyhow!("save semantic manifest: {e}"))?;
     }
+
+    restore_invalidate_db_vector_domain(journal)?;
     Ok(())
+}
+
+/// DB 向量域侧的显式作废（W3-4 Step2-4，task book #62）。上面两段 fsvi 侧的
+/// 作废在 W3-3..W3-5 共存期间原样保留；这里补的是 exec50 点名的唯一真生产
+/// 自愈路径缺的那一半。第 1 格（db-committed）真正写候选库内容的生产入口
+/// （`franken_replace_conversation_messages_in_tx`/`insert_conversation_tree`）
+/// 已经在同一事务里做过一次"新 doc_id 登记洞账 + 代际就绪失效"（W3-3 Step3
+/// 布线,`register_embedding_hole_for_new_message_in_tx`/
+/// `demote_active_generation_readiness_in_tx`）——但那是深埋在写路径里的
+/// 副作用,第 3 格自己的"作废"语义不该只靠隐式继承它托底。这里显式再跑一遍
+/// 资格链重扫 + 洞账补种 + 就绪失效,让 DB 向量域的作废是这一格自己站得住
+/// 的动作。全部复用既有生产原语（`scan_eligible_message_ids`/
+/// `seed_embedding_holes`/`demote_active_generation_readiness_in_tx`）,
+/// 零第二定义；`seed_embedding_holes` 本身 `INSERT OR IGNORE` +
+/// `NOT EXISTS`，`demote_active_generation_readiness_in_tx` 本身
+/// no-op-safe,整体重跑幂等。
+#[cfg(feature = "infinity")]
+fn restore_invalidate_db_vector_domain(journal: &RestoreJournal) -> anyhow::Result<()> {
+    let storage = crate::storage::sqlite::FrankenStorage::open_writer(&journal.db_path)
+        .map_err(|e| anyhow::anyhow!("open candidate db for db-vector-domain invalidation: {e}"))?;
+
+    let has_active_generation = storage
+        .raw()
+        .query_opt_map("SELECT id FROM embedding_generations WHERE is_active = 1", &[], |row| {
+            row.get_typed::<i64>(0)
+        })
+        .map_err(|e| anyhow::anyhow!("checking for an active embedding generation: {e}"))?
+        .is_some();
+    if !has_active_generation {
+        // 没有活跃代际就没有"作废"这回事可做——db_vector_catchup 下一次全量
+        // backfill 本来就会用当下的资格链重新播种,不需要这里预先动手。
+        return Ok(());
+    }
+
+    let eligible_ids = crate::indexer::db_vector_catchup::scan_eligible_message_ids(&storage).map_err(|e| {
+        anyhow::anyhow!("re-scanning semantic eligibility for db-vector-domain invalidation: {e}")
+    })?;
+    let now_ms = crate::storage::sqlite::FrankenStorage::now_millis();
+    storage
+        .raw()
+        .with_tx(crate::storage::api::TxMode::Immediate, |tx| {
+            let generation_id: i64 = tx.query_row_map(
+                "SELECT id FROM embedding_generations WHERE is_active = 1",
+                &[],
+                |row| row.get_typed(0),
+            )?;
+            crate::storage::schema::seed_embedding_holes(tx, generation_id, &eligible_ids, now_ms, "restore-invalidation")?;
+            crate::storage::schema::demote_active_generation_readiness_in_tx(tx)
+        })
+        .map_err(|e| anyhow::anyhow!("re-seeding embedding_holes / demoting readiness after restore: {e}"))?;
+    Ok(())
+}
+
+#[cfg(not(feature = "infinity"))]
+fn restore_invalidate_db_vector_domain(_journal: &RestoreJournal) -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[cfg(all(test, feature = "infinity"))]
+mod w3_4_step2_4_db_vector_domain_invalidation_tests {
+    use super::*;
+    use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+    use crate::storage::api::{TxMode, params};
+    use crate::storage::schema;
+
+    const TS: i64 = 1_770_551_400_000;
+
+    fn open_storage(path: &Path) -> crate::storage::sqlite::FrankenStorage {
+        crate::storage::sqlite::FrankenStorage::open(path).expect("open production storage")
+    }
+
+    fn minimal_journal(db_path: PathBuf) -> RestoreJournal {
+        RestoreJournal {
+            schema_version: 1,
+            operation_id: "w3-4-step2-4-test".into(),
+            state: RestoreJournalState::Planned,
+            data_dir: PathBuf::from("/fixtures/w3-4-step2-4"),
+            scratch_dir: PathBuf::from("/fixtures/w3-4-step2-4/scratch"),
+            db_path,
+            marker_path: PathBuf::from("/fixtures/w3-4-step2-4/marker.json"),
+            snapshot_root: "w3-4-step2-4-root".into(),
+            generation: "g1".into(),
+            planned: Vec::new(),
+            holds_count: 0,
+            origin_unmapped_count: 0,
+            committed: Vec::new(),
+            published: Vec::new(),
+            analytics_now_ms: Some(TS),
+        }
+    }
+
+    /// The point of this test: a message inserted via raw SQL -- deliberately
+    /// **bypassing** every hooked production write path
+    /// (`insert_conversation_tree`/`franken_replace_conversation_messages_in_tx`,
+    /// which already register a hole + demote readiness themselves,
+    /// W3-3 Step3) -- still gets picked up by
+    /// `restore_invalidate_db_vector_domain`. That is exactly the gap this
+    /// task closes: phase 3's own invalidation must not depend on some
+    /// other phase's write path having run a particular hook.
+    #[test]
+    fn restore_invalidate_db_vector_domain_reseeds_holes_and_demotes_readiness_for_unhooked_writes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let storage = open_storage(&db_path);
+
+        let agent_id = storage
+            .ensure_agent(&Agent { id: None, slug: "claude_code".into(), name: "Claude Code".into(), version: Some("1.0".into()), kind: AgentKind::Cli })
+            .unwrap();
+        let conv = Conversation {
+            id: None,
+            agent_slug: "claude_code".into(),
+            workspace: None,
+            external_id: Some("w3-4-step2-4-conv".into()),
+            title: Some("fixture".into()),
+            source_path: PathBuf::from("/fixtures/w3-4-step2-4.jsonl"),
+            started_at: Some(TS),
+            ended_at: Some(TS + 60_000),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message { id: None, idx: 0, role: MessageRole::User, author: None, created_at: Some(TS), content: "already embedded".into(), extra_json: serde_json::Value::Null, snippets: vec![] }],
+            source_id: "local".into(),
+            origin_host: None,
+        };
+        storage.insert_conversation_tree(agent_id, None, &conv).unwrap();
+        let conv_id: i64 = storage
+            .raw()
+            .query_row_map("SELECT id FROM conversations WHERE external_id = ?1", &params!["w3-4-step2-4-conv"], |row| row.get_typed(0))
+            .unwrap();
+        let doc_a: i64 = storage
+            .raw()
+            .query_row_map("SELECT id FROM messages WHERE conversation_id = ?1 AND idx = 0", &params![conv_id], |row| row.get_typed(0))
+            .unwrap();
+
+        let gen_id = storage
+            .raw()
+            .with_tx_no_replay(TxMode::Immediate, |tx| schema::create_embedding_generation(tx, "BAAI/bge-m3", 4, 1, TS))
+            .unwrap();
+        storage
+            .raw()
+            .with_tx_no_replay(TxMode::Immediate, |tx| schema::insert_message_embedding(tx, gen_id, doc_a, conv_id, &[1.0, 0.0, 0.0, 0.0], "seed-hash", None, TS))
+            .unwrap();
+        storage.raw().execute("UPDATE embedding_generations SET is_active = 1, audit_status = 'passed' WHERE id = ?1", &params![gen_id]).unwrap();
+
+        // Simulate "restore's phase 1 already wrote replacement content" via
+        // a raw SQL insert with NO hook running -- this is the doc_id the
+        // hooked write path would have registered a hole for, had it run.
+        let doc_b: i64 = doc_a + 1;
+        storage
+            .raw()
+            .execute(
+                "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (?1, ?2, 1, 'user', 'restored replacement content')",
+                &params![doc_b, conv_id],
+            )
+            .unwrap();
+
+        // `restore_invalidate_db_vector_domain` opens its own writer handle
+        // to `db_path` internally -- exactly the real restore shape (phase
+        // 3 runs as its own step, independent of whatever wrote content in
+        // phase 1). `storage` here stays open concurrently, same as two
+        // real process phases each holding their own connection.
+        let journal = minimal_journal(db_path.clone());
+        restore_invalidate_db_vector_domain(&journal).expect("db-vector-domain invalidation must succeed");
+
+        let hole_doc_ids: Vec<i64> = storage
+            .raw()
+            .query_all_map("SELECT doc_id FROM embedding_holes WHERE generation_id = ?1", &params![gen_id], |row| row.get_typed(0))
+            .unwrap();
+        assert_eq!(hole_doc_ids, vec![doc_b], "the unhooked doc_id must get a hole; the already-embedded one must not");
+
+        let audit_status: String = storage
+            .raw()
+            .query_row_map("SELECT audit_status FROM embedding_generations WHERE id = ?1", &params![gen_id], |row| row.get_typed(0))
+            .unwrap();
+        assert_eq!(audit_status, "pending", "readiness must be demoted after restore touched this generation's eligible set");
+    }
+
+    #[test]
+    fn restore_invalidate_db_vector_domain_is_a_noop_with_no_active_generation() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let _storage = open_storage(&db_path);
+
+        let journal = minimal_journal(db_path);
+        restore_invalidate_db_vector_domain(&journal).expect("must not error with no active generation");
+    }
 }
 
 /// 第 4 格 · analytics 失效并重算（幂等）。**直接用 E6 Step 1b 那个函数**，

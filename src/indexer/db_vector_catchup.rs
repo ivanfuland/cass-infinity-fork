@@ -119,7 +119,7 @@ fn find_reusable_or_create_generation(
 /// a `doc_id` would create exactly the unresolvable "fake hole" R1-W3-N3
 /// forbids, so this function applies the stricter
 /// canonicalize-non-empty check itself before returning a `message_id`.
-fn scan_eligible_message_ids(storage: &FrankenStorage) -> Result<Vec<i64>> {
+pub(crate) fn scan_eligible_message_ids(storage: &FrankenStorage) -> Result<Vec<i64>> {
     let mut eligible = Vec::new();
     let mut after_conversation_id = 0i64;
 
