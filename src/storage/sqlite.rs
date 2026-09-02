@@ -3903,6 +3903,15 @@ fn delete_orphan_message_id_chunk_once(conn: &FrankenConnection, ids: &[i64]) ->
                 anyhow_error_into_storage_error(err.context("deleting orphan rows from messages"))
             })?;
         deleted = deleted.saturating_add(more);
+        if more > 0 {
+            // w3-3 Step 3 (R2-W3-B4, D类): CASCADE already removed any
+            // embedding/hole rows the deleted orphans carried; demote in
+            // the same transaction. Gated on `more > 0` because this runs
+            // unconditionally at the top of every `cass index` invocation
+            // (see `cleanup_orphan_fk_rows`) and the zero-orphans case is
+            // the overwhelming common path.
+            crate::storage::schema::demote_active_generation_readiness_in_tx(tx)?;
+        }
         Ok(deleted)
     })?)
 }
@@ -5700,6 +5709,11 @@ impl FrankenStorage {
                    )",
                 fparams![agent_id],
             )?;
+            // w3-3 Step 3 (R2-W3-B4, C类): CASCADE already removed every
+            // embedding/hole row belonging to the purged messages; the
+            // active generation's readiness claim over what remains still
+            // needs demoting in this same transaction.
+            crate::storage::schema::demote_active_generation_readiness_in_tx(tx)?;
             Ok(())
         })?;
 
@@ -5827,6 +5841,9 @@ impl FrankenStorage {
                 &format!("DELETE FROM conversations WHERE id IN ({id_list})"),
                 fparams![],
             )?;
+            // w3-3 Step 3 (R2-W3-B4, C类) -- see `purge_agent_archive_data`'s
+            // identical comment.
+            crate::storage::schema::demote_active_generation_readiness_in_tx(tx)?;
             Ok(())
         })?;
 
@@ -5966,6 +5983,10 @@ impl FrankenStorage {
                 // so there is nothing conversation-scoped to delete there.
                 tx.execute("DELETE FROM conversations WHERE id = ?1", fparams![drop_id])?;
             }
+            // w3-3 Step 3 (R2-W3-B4, C类) -- see `purge_agent_archive_data`'s
+            // identical comment. Once per transaction (not per-pair): the
+            // guard above already ensures `result.pairs` is non-empty here.
+            crate::storage::schema::demote_active_generation_readiness_in_tx(tx)?;
             Ok(())
         })?;
 
@@ -10613,6 +10634,19 @@ fn franken_append_insert_new_messages<'a>(
         if let Some(message_id) =
             franken_insert_new_message_ignore_duplicate(tx, conversation_id, msg)?
         {
+            // w3-3 Step 3 (R2-W3-B4): same-transaction lifecycle
+            // invalidation for a newly appended message -- see the two
+            // primitives' doc comments (storage::schema) for why this can't
+            // wait for an async catch-up worker. No-op in the overwhelming
+            // majority of calls (no active generation yet).
+            let now_ms = FrankenStorage::now_millis();
+            crate::storage::schema::register_embedding_hole_for_new_message_in_tx(
+                tx,
+                message_id,
+                now_ms,
+                "new_message",
+            )?;
+            crate::storage::schema::demote_active_generation_readiness_in_tx(tx)?;
             inserted.push((message_id, *msg));
         }
     }
@@ -10659,6 +10693,23 @@ fn franken_batch_insert_new_messages_with_batch_size(
                 )
             })?;
         inserted_ids.extend((0..chunk.len()).map(|offset| first_id + offset as i64));
+    }
+
+    // w3-3 Step 3 (R2-W3-B4): same-transaction lifecycle invalidation --
+    // see `franken_append_insert_new_messages`'s identical comment. One
+    // `demote` call for the whole batch (idempotent, no per-row cost) plus
+    // one hole registration per newly inserted id.
+    if !inserted_ids.is_empty() {
+        let now_ms = FrankenStorage::now_millis();
+        for &message_id in &inserted_ids {
+            crate::storage::schema::register_embedding_hole_for_new_message_in_tx(
+                tx,
+                message_id,
+                now_ms,
+                "new_message",
+            )?;
+        }
+        crate::storage::schema::demote_active_generation_readiness_in_tx(tx)?;
     }
 
     Ok(inserted_ids)
@@ -12201,6 +12252,30 @@ pub(crate) fn franken_replace_conversation_messages_in_tx(
         tail_last_idx,
         tail_last_created_at,
     )?;
+
+    // w3-3 Step 3 (R2-W3-B4, advisor ruling B类: this primitive is the
+    // future canonical `cass mirror-restore --apply` write path -- the
+    // invalidation belongs at the transaction site itself, not deferred to
+    // whichever orchestration eventually calls it): `deleted_message_count`
+    // rows just had their `message_embeddings`/`embedding_holes` rows
+    // cascade-removed by the `DELETE FROM messages` above (nothing to do
+    // for that half explicitly); `inserted_message_ids` are brand new ids
+    // with no embedding yet, each needs a hole registered. Either
+    // direction alone already broke any 'passed' certification the active
+    // generation held for this conversation, so demote unconditionally
+    // whenever this function did anything at all.
+    if deleted_message_count > 0 || !inserted_message_ids.is_empty() {
+        let now_ms = FrankenStorage::now_millis();
+        for &message_id in &inserted_message_ids {
+            crate::storage::schema::register_embedding_hole_for_new_message_in_tx(
+                tx,
+                message_id,
+                now_ms,
+                "replaced_conversation",
+            )?;
+        }
+        crate::storage::schema::demote_active_generation_readiness_in_tx(tx)?;
+    }
 
     Ok(ReplaceConversationMessagesOutcome {
         inserted_message_ids,
@@ -27687,5 +27762,166 @@ mod e5_replace_tests {
             "分辨力断言：文本探针必须在这份含 NUL 的样本上**丢字节**（{text_len} < {bin_len}）；\
              若两者相等，说明这份样本压根没触发截断，本条旁证不成立"
         );
+    }
+
+    // =====================================================================
+    // w3-3 Step 3/4 (R2-W3-B4/R4-B5, spec 门③): replace 事务的向量域失效接线
+    // + 回滚原子性（w3-d9②）。复用本模块既有的 seed_original/replacement/
+    // open_storage 夹具——replace 生产侧目前唯一的真实调用面就是这个模块自己
+    // 的测试（w3-3 Step3 写入口清单已核实：B类零生产调用点，advisor 裁定失效
+    // 仍须接在原语内部）。
+    // =====================================================================
+
+    fn active_generation_audit_status(storage: &FrankenStorage) -> String {
+        storage
+            .raw()
+            .query_row_map(
+                "SELECT audit_status FROM embedding_generations WHERE is_active = 1",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap()
+    }
+
+    fn embedding_row_count(storage: &FrankenStorage, generation_id: i64) -> i64 {
+        storage
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM message_embeddings WHERE generation_id = ?1",
+                fparams![generation_id],
+                |row| row.get_typed(0),
+            )
+            .unwrap()
+    }
+
+    fn hole_doc_ids(storage: &FrankenStorage, generation_id: i64) -> Vec<i64> {
+        let mut ids: Vec<i64> = storage
+            .raw()
+            .query_all_map(
+                "SELECT doc_id FROM embedding_holes WHERE generation_id = ?1",
+                fparams![generation_id],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Creates an active, `audit_status = 'passed'` generation (dim=4) and
+    /// seeds one embedding row per message currently in `conv_id`, so the
+    /// replace below has real "old嵌入" to clear, not an empty domain.
+    fn seed_active_passed_generation_with_embeddings_for(storage: &FrankenStorage, conv_id: i64) -> i64 {
+        let message_ids: Vec<i64> = storage
+            .raw()
+            .query_all_map(
+                "SELECT id FROM messages WHERE conversation_id = ?1 ORDER BY idx",
+                fparams![conv_id],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        let tx = storage.raw().transaction().unwrap();
+        let gen_id = crate::storage::schema::create_embedding_generation(&tx, "bge-m3", 4, 1, TS).unwrap();
+        for message_id in &message_ids {
+            crate::storage::schema::insert_message_embedding(
+                &tx,
+                gen_id,
+                *message_id,
+                conv_id,
+                &[1.0, 0.0, 0.0, 0.0],
+                &format!("seed-hash-{message_id}"),
+                None,
+                TS,
+            )
+            .unwrap();
+        }
+        tx.execute(
+            "UPDATE embedding_generations SET is_active = 1, audit_status = 'passed' WHERE id = ?1",
+            fparams![gen_id],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        gen_id
+    }
+
+    #[test]
+    #[serial]
+    fn w3_3_replace_clears_old_embeddings_registers_holes_and_demotes_readiness_in_the_same_transaction() {
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open_storage(&dir);
+        let conv_id = seed_original(&storage, agent_id, "w3-3-replace-lifecycle");
+        let gen_id = seed_active_passed_generation_with_embeddings_for(&storage, conv_id);
+        assert_eq!(embedding_row_count(&storage, gen_id), 3, "前置：三条旧消息各自有一行旧嵌入");
+        assert_eq!(active_generation_audit_status(&storage), "passed", "前置：代际起始为 passed");
+
+        let new_conv = replacement("w3-3-replace-lifecycle");
+        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+        let tx = storage.raw().transaction().unwrap();
+        let outcome =
+            franken_replace_conversation_messages_in_tx(&tx, conv_id, agent_id, None, &new_conv, &pricing).unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(outcome.deleted_message_count, 3, "sanity: replace 删掉了三条旧消息");
+        assert_eq!(outcome.inserted_message_ids.len(), 2, "sanity: replace 插入了两条新消息");
+
+        // 旧嵌入清除：CASCADE 应把三条旧行全部带走，代际里现在应该零行
+        // （新消息还没真实嵌入，只应该有洞账，不应该有嵌入行）。
+        assert_eq!(embedding_row_count(&storage, gen_id), 0, "旧嵌入必须被同事务清除（CASCADE）");
+
+        // 洞账：精确等于两条新消息的 id 集合，不多不少。
+        let mut expected_holes = outcome.inserted_message_ids.clone();
+        expected_holes.sort_unstable();
+        assert_eq!(
+            hole_doc_ids(&storage, gen_id),
+            expected_holes,
+            "洞账必须精确等于本次 replace 新插入的消息 id 集合"
+        );
+
+        // 代际就绪失效：曾经 passed 的代际必须被打回 pending。
+        assert_eq!(active_generation_audit_status(&storage), "pending", "代际就绪必须在同事务内失效");
+    }
+
+    /// w3-d9②：关系事务在失效语句之后回滚，断言 embedding 行/ready 标志/
+    /// 洞账三者全部恢复原态——不是"回滚了大部分"，是恰好一行都不多不少。
+    #[test]
+    #[serial]
+    fn w3_3_replace_rollback_restores_embeddings_ready_flag_and_holes_to_their_original_state() {
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open_storage(&dir);
+        let conv_id = seed_original(&storage, agent_id, "w3-3-replace-rollback");
+        let gen_id = seed_active_passed_generation_with_embeddings_for(&storage, conv_id);
+        assert_eq!(embedding_row_count(&storage, gen_id), 3);
+        assert!(hole_doc_ids(&storage, gen_id).is_empty(), "前置：起始无洞账");
+        assert_eq!(active_generation_audit_status(&storage), "passed");
+
+        let new_conv = replacement("w3-3-replace-rollback");
+        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+        let tx = storage.raw().transaction().unwrap();
+        let outcome =
+            franken_replace_conversation_messages_in_tx(&tx, conv_id, agent_id, None, &new_conv, &pricing).unwrap();
+        // 同一事务内可见：证明失效语句确实跑过，不是下面的断言在验证一个空转的 no-op。
+        let in_tx_holes: i64 = tx
+            .query_row_map(
+                "SELECT COUNT(*) FROM embedding_holes WHERE generation_id = ?1",
+                fparams![gen_id],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(in_tx_holes, outcome.inserted_message_ids.len() as i64, "事务内应看得到新登记的洞账");
+        let in_tx_embeddings: i64 = tx
+            .query_row_map(
+                "SELECT COUNT(*) FROM message_embeddings WHERE generation_id = ?1",
+                fparams![gen_id],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(in_tx_embeddings, 0, "事务内旧嵌入应已被清空");
+
+        // 模拟"失效语句之后崩溃"：不 commit，直接回滚。
+        tx.rollback().unwrap();
+
+        // 三者必须**全部**恢复原态，不是部分恢复。
+        assert_eq!(embedding_row_count(&storage, gen_id), 3, "回滚后旧嵌入必须原样恢复");
+        assert!(hole_doc_ids(&storage, gen_id).is_empty(), "回滚后洞账必须恢复成空（新登记的两条必须消失）");
+        assert_eq!(active_generation_audit_status(&storage), "passed", "回滚后代际就绪状态必须恢复成 passed");
     }
 }
