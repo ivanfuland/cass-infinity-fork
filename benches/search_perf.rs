@@ -12,12 +12,11 @@ use coding_agent_search::search::query::{
 };
 use coding_agent_search::indexer::index_dir;
 use coding_agent_search::search::vector_index::{
-    Quantization, SemanticDocId, SemanticFilter, VectorIndex, dot_product_f16_scalar_bench,
+    Quantization, SemanticDocId, VectorIndex, dot_product_f16_scalar_bench,
     dot_product_f16_simd_bench, dot_product_scalar_bench, dot_product_simd_bench,
 };
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use half::f16;
-use std::collections::HashSet;
 use std::hint::black_box;
 use std::mem::size_of;
 use tempfile::TempDir;
@@ -557,40 +556,6 @@ fn bench_vector_index_search_50k(c: &mut Criterion) {
     });
 }
 
-/// Benchmark vector search with 50k entries and filtering.
-/// Target: <20ms
-fn bench_vector_index_search_50k_filtered(c: &mut Criterion) {
-    let dimension = 384;
-    let count = 50_000;
-    let (_tmp, index) =
-        build_temp_fsvi_index("bench-embedder", dimension, Quantization::F16, count);
-    let query = build_query(dimension);
-
-    // Filter to agents 0, 1, 2 (out of 8 possible)
-    let mut agent_filter = HashSet::new();
-    agent_filter.insert(0u32);
-    agent_filter.insert(1u32);
-    agent_filter.insert(2u32);
-
-    let filter = SemanticFilter {
-        agents: Some(agent_filter),
-        workspaces: None,
-        sources: None,
-        roles: None,
-        created_from: None,
-        created_to: None,
-    };
-
-    c.bench_function("vector_index_search_50k_filtered", |b| {
-        b.iter(|| {
-            let results = index
-                .search_top_k(black_box(&query), 25, Some(&filter))
-                .unwrap_or_default();
-            black_box(results);
-        });
-    });
-}
-
 /// Parameterized benchmark for different index sizes.
 fn bench_vector_search_scaling(c: &mut Criterion) {
     let dimension = 384;
@@ -799,7 +764,6 @@ criterion_group!(
     bench_empty_search,
     bench_vector_index_search_10k,
     bench_vector_index_search_50k,
-    bench_vector_index_search_50k_filtered,
     bench_vector_index_search_50k_loaded,
     bench_vector_search_scaling,
     // Opt 1.1: Dot product benchmarks (scalar vs SIMD)

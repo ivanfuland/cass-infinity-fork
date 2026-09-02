@@ -450,7 +450,7 @@ use crate::search::canonicalize::{canonicalize_for_embedding, content_hash, is_s
 use crate::search::embedder::Embedder;
 use crate::search::lexical_rerank::{self, FieldAvgdl, RerankCandidate};
 use crate::search::vector_index::{
-    ROLE_USER, SemanticDocId, SemanticFilter, SemanticFilterMaps, VectorIndex, VectorSearchResult,
+    ROLE_USER, SemanticDocId, SemanticFilterMaps, VectorIndex, VectorSearchResult,
     parse_semantic_doc_id, role_code_from_str,
 };
 use crate::sources::provenance::SourceFilter;
@@ -17629,25 +17629,6 @@ mod tests {
         assert_eq!(parsed.source_id, 11);
         assert_eq!(parsed.role, 1);
         assert_eq!(parsed.created_at_ms, 1_700_000_000_000);
-    }
-
-    #[test]
-    fn semantic_filter_applies_all_constraints() {
-        use frankensearch::core::filter::SearchFilter;
-
-        let filter = SemanticFilter {
-            agents: Some(HashSet::from([3])),
-            workspaces: Some(HashSet::from([7])),
-            sources: Some(HashSet::from([11])),
-            roles: Some(HashSet::from([1])),
-            created_from: Some(1_700_000_000_000),
-            created_to: Some(1_700_000_000_100),
-        };
-
-        assert!(filter.matches("m|42|2|3|7|11|1|1700000000001", None));
-        assert!(!filter.matches("m|42|2|99|7|11|1|1700000000001", None));
-        assert!(!filter.matches("m|42|2|3|7|11|1|1699999999999", None));
-        assert!(!filter.matches("not-a-doc-id", None));
     }
 
     // Regression guard for bead coding_agent_session_search-q6xf9

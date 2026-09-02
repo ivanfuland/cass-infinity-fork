@@ -9,9 +9,8 @@
 //! 3. Produce equivalent search results
 
 use coding_agent_search::search::vector_index::{
-    Quantization, SearchParams, SemanticDocId, SemanticFilter, VectorIndex, parse_semantic_doc_id,
+    Quantization, SearchParams, SemanticDocId, VectorIndex, parse_semantic_doc_id,
 };
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tempfile::{TempDir, tempdir};
@@ -258,61 +257,6 @@ fn f16_preconvert_equivalence() {
 }
 
 /// Test that filtering works correctly with parallel search.
-#[test]
-fn e2e_parallel_search_with_filters() {
-    println!("=== E2E Parallel Search with Filters ===");
-
-    let (_dir, _path, loaded_index) = create_test_index();
-    let query = create_query_vector();
-    let k = 25;
-
-    // Test filter by agent
-    println!("Testing filter by agent_id=0");
-    let filter = SemanticFilter {
-        agents: Some(HashSet::from([0u32])),
-        ..Default::default()
-    };
-    let filtered_results = loaded_index
-        .search_top_k(&query, k, Some(&filter))
-        .expect("Search failed");
-
-    // Verify all results have correct agent_id
-    for result in &filtered_results {
-        let parsed = parse_semantic_doc_id(&result.doc_id).expect("parse doc_id");
-        assert_eq!(
-            parsed.agent_id, 0,
-            "Filter returned wrong agent_id: {}",
-            parsed.agent_id
-        );
-    }
-    println!("  All {} results have agent_id=0", filtered_results.len());
-
-    // Test filter by multiple agents
-    println!("Testing filter by agent_id in [0, 1]");
-    let filter = SemanticFilter {
-        agents: Some(HashSet::from([0u32, 1u32])),
-        ..Default::default()
-    };
-    let multi_filtered = loaded_index
-        .search_top_k(&query, k, Some(&filter))
-        .expect("Search failed");
-
-    for result in &multi_filtered {
-        let parsed = parse_semantic_doc_id(&result.doc_id).expect("parse doc_id");
-        assert!(
-            parsed.agent_id == 0 || parsed.agent_id == 1,
-            "Filter returned wrong agent_id: {}",
-            parsed.agent_id
-        );
-    }
-    println!(
-        "  All {} results have agent_id in [0, 1]",
-        multi_filtered.len()
-    );
-
-    println!("=== Parallel Filter Test PASSED ===");
-}
-
 /// Test search performance scales reasonably with corpus size.
 #[test]
 fn e2e_performance_scaling() {

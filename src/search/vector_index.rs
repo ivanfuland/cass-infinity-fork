@@ -14,8 +14,7 @@ use half::f16;
 
 pub use frankensearch::index::{Quantization, SearchParams, VectorIndex, VectorIndexWriter};
 
-use crate::search::query::SearchFilters;
-use crate::sources::provenance::{LOCAL_SOURCE_ID, SourceFilter, SourceKind};
+use crate::sources::provenance::SourceKind;
 use crate::storage::sqlite::FrankenStorage;
 
 /// Directory under the cass data dir where vector artifacts are stored.
@@ -162,108 +161,10 @@ pub fn parse_semantic_doc_id(doc_id: &str) -> Option<SemanticDocId> {
     Some(parsed)
 }
 
-/// Lean filter-only view of a parsed semantic doc_id.
-///
-/// Drops the content_hash (which requires hex::decode_to_slice on 64 bytes)
-/// plus the unused message_id and chunk_idx. Used by
-/// `SemanticFilter::matches`, which runs once per HNSW-visited node during
-/// ANN traversal — often thousands of times per query — and never reads the
-/// content_hash or message identifiers.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct SemanticDocIdFilterView {
-    pub agent_id: u32,
-    pub workspace_id: u32,
-    pub source_id: u32,
-    pub role: u8,
-    pub created_at_ms: i64,
-}
-
-/// Parse only the filter-relevant fields of a cass semantic doc_id string.
-///
-/// ~5x cheaper than `parse_semantic_doc_id` when the content_hash is present,
-/// because it skips the 64-byte hex decode that dominates the full-parse cost.
-#[must_use]
-pub(crate) fn parse_semantic_doc_id_filter_view(doc_id: &str) -> Option<SemanticDocIdFilterView> {
-    let rest = doc_id.strip_prefix("m|")?;
-    let mut parts = rest.splitn(8, '|');
-    // message_id + chunk_idx: we only need to advance the iterator past them.
-    parts.next()?;
-    parts.next()?;
-    let agent_id: u32 = parts.next()?.parse().ok()?;
-    let workspace_id: u32 = parts.next()?.parse().ok()?;
-    let source_id: u32 = parts.next()?.parse().ok()?;
-    let role: u8 = parts.next()?.parse().ok()?;
-    let created_at_ms: i64 = parts.next()?.parse().ok()?;
-    Some(SemanticDocIdFilterView {
-        agent_id,
-        workspace_id,
-        source_id,
-        role,
-        created_at_ms,
-    })
-}
-
-fn map_filter_set(keys: &HashSet<String>, map: &HashMap<String, u32>) -> Option<HashSet<u32>> {
-    if keys.is_empty() {
-        return None;
-    }
-    let mut set = HashSet::new();
-    for key in keys {
-        if let Some(id) = map.get(key) {
-            set.insert(*id);
-        }
-    }
-    Some(set)
-}
-
 fn source_id_hash(source_id: &str) -> u32 {
     let mut hasher = crc32fast::Hasher::new();
     hasher.update(source_id.as_bytes());
     hasher.finalize()
-}
-
-/// Semantic filter constraints expressed in numeric IDs for fast evaluation.
-#[derive(Debug, Clone, Default)]
-pub struct SemanticFilter {
-    pub agents: Option<HashSet<u32>>,
-    pub workspaces: Option<HashSet<u32>>,
-    pub sources: Option<HashSet<u32>>,
-    pub roles: Option<HashSet<u8>>,
-    pub created_from: Option<i64>,
-    pub created_to: Option<i64>,
-}
-
-impl SemanticFilter {
-    pub fn from_search_filters(filters: &SearchFilters, maps: &SemanticFilterMaps) -> Result<Self> {
-        let agents = map_filter_set(&filters.agents, &maps.agent_slug_to_id);
-        let workspaces = map_filter_set(&filters.workspaces, &maps.workspace_path_to_id);
-        let sources = maps.sources_from_filter(&filters.source_filter)?;
-
-        Ok(Self {
-            agents,
-            workspaces,
-            sources,
-            roles: filters.roles.clone(),
-            created_from: filters.created_from,
-            created_to: filters.created_to,
-        })
-    }
-
-    #[must_use]
-    pub fn is_unrestricted(&self) -> bool {
-        self.agents.is_none()
-            && self.workspaces.is_none()
-            && self.sources.is_none()
-            && self.roles.is_none()
-            && self.created_from.is_none()
-            && self.created_to.is_none()
-    }
-
-    #[must_use]
-    pub fn with_roles(mut self, roles: Option<HashSet<u8>>) -> Self {
-        self.roles = roles;
-        self
-    }
 }
 
 /// Lookup maps for converting human filters (agent slug, workspace path, source id)
@@ -354,22 +255,6 @@ impl SemanticFilterMaps {
         }
     }
 
-    fn sources_from_filter(&self, filter: &SourceFilter) -> Result<Option<HashSet<u32>>> {
-        let result = match filter {
-            SourceFilter::All => None,
-            SourceFilter::Local => Some(HashSet::from([self.source_id(LOCAL_SOURCE_ID)])),
-            SourceFilter::Remote => Some(self.remote_source_ids.clone()),
-            SourceFilter::SourceId(id) => Some(HashSet::from([self.source_id(id)])),
-        };
-        Ok(result)
-    }
-
-    fn source_id(&self, source_id: &str) -> u32 {
-        self.source_id_to_id
-            .get(source_id)
-            .copied()
-            .unwrap_or_else(|| source_id_hash(source_id))
-    }
 }
 
 /// Collapsed semantic search hit (best chunk per message).
@@ -378,61 +263,6 @@ pub struct VectorSearchResult {
     pub message_id: u64,
     pub chunk_idx: u8,
     pub score: f32,
-}
-
-impl frankensearch::core::filter::SearchFilter for SemanticFilter {
-    fn matches(&self, doc_id: &str, _metadata: Option<&serde_json::Value>) -> bool {
-        // Use the filter-view parse: skips the expensive 64-byte hex decode
-        // of content_hash that the full parse runs on every call.
-        let Some(parsed) = parse_semantic_doc_id_filter_view(doc_id) else {
-            return false;
-        };
-
-        if let Some(agents) = &self.agents
-            && !agents.contains(&parsed.agent_id)
-        {
-            return false;
-        }
-        if let Some(workspaces) = &self.workspaces
-            && !workspaces.contains(&parsed.workspace_id)
-        {
-            return false;
-        }
-        if let Some(sources) = &self.sources
-            && !sources.contains(&parsed.source_id)
-        {
-            return false;
-        }
-        if let Some(roles) = &self.roles
-            && !roles.contains(&parsed.role)
-        {
-            return false;
-        }
-        if let Some(from) = self.created_from
-            && parsed.created_at_ms < from
-        {
-            return false;
-        }
-        if let Some(to) = self.created_to
-            && parsed.created_at_ms > to
-        {
-            return false;
-        }
-
-        true
-    }
-
-    fn matches_doc_id_hash(
-        &self,
-        _doc_id_hash: u64,
-        _metadata: Option<&serde_json::Value>,
-    ) -> Option<bool> {
-        None
-    }
-
-    fn name(&self) -> &str {
-        "cass_semantic_filter"
-    }
 }
 
 /// Scalar dot product benchmark helper.
@@ -492,57 +322,6 @@ mod tests {
     fn parse_role_codes_rejects_unknown_roles() {
         let err = parse_role_codes(["user", "bogus"]).unwrap_err();
         assert!(err.to_string().contains("unknown role"));
-    }
-
-    /// Regression coverage for Task 2.2b's riskiest untested logic: an
-    /// explicit `--role` must override the semantic engine's default
-    /// user+assistant role filter rather than being silently dropped or
-    /// merged with it.
-    ///
-    /// `SemanticFilter::from_search_filters` is the first of two production
-    /// sites in that override: it must carry `filters.roles` through
-    /// unchanged (`Some` stays `Some`, `None` stays `None`) so that the
-    /// caller-side guard in `search_semantic_candidates`
-    /// (`src/search/query.rs`, `if semantic_filter.roles.is_none() && let
-    /// Some(roles) = context.roles.clone() { ... }`) can tell "explicit
-    /// roles given" apart from "apply the default". If this function ever
-    /// started overwriting or dropping explicit roles, that guard would
-    /// silently clobber every `--role` query with the user+assistant
-    /// default. The guard itself (the second site) is exercised
-    /// end-to-end, offline, via the `--embedder hash` harness in
-    /// `tests/role_filter.rs::role_filter_semantic_mode_role_overrides_default`.
-    #[test]
-    fn semantic_filter_from_search_filters_preserves_explicit_role_override() {
-        let maps = SemanticFilterMaps::for_tests(
-            HashMap::new(),
-            HashMap::new(),
-            HashMap::new(),
-            HashSet::new(),
-        );
-
-        // Explicit `--role tool` must survive untouched, not be overwritten.
-        let mut explicit_filters = SearchFilters::default();
-        explicit_filters.roles = Some(HashSet::from([ROLE_TOOL]));
-        let explicit = SemanticFilter::from_search_filters(&explicit_filters, &maps)
-            .expect("from_search_filters with explicit roles");
-        assert_eq!(
-            explicit.roles,
-            Some(HashSet::from([ROLE_TOOL])),
-            "explicit --role must be carried through, not overwritten by the semantic default"
-        );
-
-        // Default case: no explicit --role -> roles must stay None so the
-        // `search_semantic_candidates` guard falls through to the engine's
-        // user+assistant default instead of misreading "no roles" as
-        // "filter to nothing".
-        let default_filters = SearchFilters::default();
-        let default = SemanticFilter::from_search_filters(&default_filters, &maps)
-            .expect("from_search_filters with no roles");
-        assert_eq!(
-            default.roles, None,
-            "absent --role must leave roles as None, not Some(empty set) or the default, \
-             so the caller can distinguish \"apply default\" from \"explicit filter\""
-        );
     }
 
     #[test]

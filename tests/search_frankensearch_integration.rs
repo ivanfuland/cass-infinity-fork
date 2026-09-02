@@ -2,18 +2,20 @@
 //!
 //! Validates that:
 //! 1. All search operations go through frankensearch (no direct tantivy imports remain)
-//! 2. SemanticFilter directly implements frankensearch::core::filter::SearchFilter
-//! 3. No duplicate FsSemanticFilterAdapter exists
-//! 4. Vector search via frankensearch VectorIndex produces correct results
-//! 5. RRF hybrid fusion uses frankensearch::rrf_fuse
-//! 6. Query parsing and search pipeline work end-to-end through frankensearch
+//! 2. Vector search via frankensearch VectorIndex produces correct results
+//! 3. RRF hybrid fusion uses frankensearch::rrf_fuse
+//! 4. Query parsing and search pipeline work end-to-end through frankensearch
+//!
+//! W3-5: cass's own `SemanticFilter` (a `frankensearch::core::filter::SearchFilter`
+//! adapter over numeric-ID doc_id filtering) was retired alongside the fsvi
+//! candidate-search path it existed for -- `search_db_vector_domain` filters
+//! via SQL against the relational schema instead. The tests that verified
+//! `SemanticFilter`'s trait impl directly were retired with it.
 
 use coding_agent_search::search::query::{FieldMask, SearchClient, SearchFilters};
 use coding_agent_search::indexer::persist::persist_conversation;
 use coding_agent_search::storage::sqlite::SqliteStorage;
-use coding_agent_search::search::vector_index::{
-    SemanticFilter, VectorIndex, parse_semantic_doc_id,
-};
+use coding_agent_search::search::vector_index::{VectorIndex, parse_semantic_doc_id};
 use std::collections::HashSet;
 use tempfile::TempDir;
 
@@ -87,85 +89,6 @@ fn no_direct_tantivy_in_cargo_toml() {
             );
         }
     }
-}
-
-// =============================================================================
-// SEARCHFILTER UNIFICATION
-// =============================================================================
-
-/// Verify SemanticFilter directly implements frankensearch::core::filter::SearchFilter.
-/// This proves the adapter pattern (FsSemanticFilterAdapter) has been eliminated.
-#[test]
-fn semantic_filter_implements_search_filter_directly() {
-    use frankensearch::core::filter::SearchFilter;
-
-    let filter = SemanticFilter {
-        agents: Some(HashSet::from([3])),
-        workspaces: Some(HashSet::from([7])),
-        sources: Some(HashSet::from([11])),
-        roles: Some(HashSet::from([1])),
-        created_from: Some(1_700_000_000_000),
-        created_to: Some(1_700_000_000_100),
-    };
-
-    // Matching doc_id
-    assert!(
-        filter.matches("m|42|2|3|7|11|1|1700000000050", None),
-        "filter should match doc_id with correct agent/workspace/source/role/timestamp"
-    );
-
-    // Wrong agent
-    assert!(
-        !filter.matches("m|42|2|99|7|11|1|1700000000050", None),
-        "filter should reject wrong agent_id"
-    );
-
-    // Wrong workspace
-    assert!(
-        !filter.matches("m|42|2|3|99|11|1|1700000000050", None),
-        "filter should reject wrong workspace_id"
-    );
-
-    // Wrong source
-    assert!(
-        !filter.matches("m|42|2|3|7|99|1|1700000000050", None),
-        "filter should reject wrong source_id"
-    );
-
-    // Wrong role
-    assert!(
-        !filter.matches("m|42|2|3|7|11|9|1700000000050", None),
-        "filter should reject wrong role"
-    );
-
-    // Timestamp before range
-    assert!(
-        !filter.matches("m|42|2|3|7|11|1|1699999999999", None),
-        "filter should reject timestamp before created_from"
-    );
-
-    // Timestamp after range
-    assert!(
-        !filter.matches("m|42|2|3|7|11|1|1700000000200", None),
-        "filter should reject timestamp after created_to"
-    );
-
-    // Invalid doc_id
-    assert!(
-        !filter.matches("not-a-valid-doc-id", None),
-        "filter should reject invalid doc_id format"
-    );
-}
-
-/// Verify unrestricted filter (all None) matches everything.
-#[test]
-fn unrestricted_semantic_filter_matches_all() {
-    use frankensearch::core::filter::SearchFilter;
-
-    let filter = SemanticFilter::default();
-
-    assert!(filter.matches("m|1|0|5|10|20|0|1700000000000", None));
-    assert!(filter.matches("m|999|3|99|99|99|2|1800000000000", None));
 }
 
 // =============================================================================
@@ -254,54 +177,6 @@ fn frankensearch_vector_index_write_and_search() {
     let top = &results[0];
     let parsed = parse_semantic_doc_id(&top.doc_id).expect("parse top result doc_id");
     assert_eq!(parsed.message_id, 101, "top result should be doc_a");
-}
-
-/// Verify vector search with SemanticFilter integration.
-#[test]
-fn frankensearch_vector_search_with_semantic_filter() {
-    use frankensearch::core::filter::SearchFilter;
-
-    let dir = TempDir::new().unwrap();
-    let index_path = dir.path().join("vector_index").join("index-filtered.fsvi");
-    std::fs::create_dir_all(index_path.parent().unwrap()).unwrap();
-
-    let hash = "00".repeat(32);
-    let doc_agent1 = format!("m|101|0|1|10|100|1|1700000000001|{hash}");
-    let doc_agent2 = format!("m|202|0|2|20|200|1|1700000000002|{hash}");
-
-    let mut writer = VectorIndex::create_with_revision(
-        &index_path,
-        "test-embedder",
-        "rev-1",
-        2,
-        frankensearch::index::Quantization::F16,
-    )
-    .expect("create index");
-
-    // Both vectors point in same direction so both would match
-    writer
-        .write_record(&doc_agent1, &[1.0, 0.0])
-        .expect("write");
-    writer
-        .write_record(&doc_agent2, &[0.9, 0.1])
-        .expect("write");
-    writer.finish().expect("finish");
-
-    let index = VectorIndex::open(&index_path).expect("open");
-
-    // Filter to agent_id=1 only
-    let filter = SemanticFilter {
-        agents: Some(HashSet::from([1])),
-        ..Default::default()
-    };
-
-    let results = index
-        .search_top_k(&[1.0, 0.0], 5, Some(&filter as &dyn SearchFilter))
-        .expect("filtered search");
-
-    assert_eq!(results.len(), 1, "should return only agent_id=1 result");
-    let parsed = parse_semantic_doc_id(&results[0].doc_id).expect("parse");
-    assert_eq!(parsed.agent_id, 1);
 }
 
 // =============================================================================
