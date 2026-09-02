@@ -160,8 +160,10 @@ pub(crate) fn recreate_lex_domain_tables(conn: &Conn) -> Result<(), StorageError
 ///   (generation_id, doc_id)` makes re-detecting the same hole an idempotent
 ///   `INSERT OR IGNORE`, not a fresh duplicate row; `doc_id` cascades from
 ///   `messages` (a hole for a message that no longer exists is moot).
-///   Consumption (writing/resolving holes during catch-up) is W3-2's job —
-///   this version only ships the table shape plus basic CRUD capability.
+///   Consumption (writing/resolving holes during catch-up) is w3-3 Step 3/4's
+///   job (W3-2, the embedding-reuse migrator originally slated to consume
+///   this, was cancelled per w3-d10 and its scope folded into w3-3) — this
+///   version only ships the table shape plus basic CRUD capability.
 const V4_VECTOR_DOMAIN_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS embedding_generations (id INTEGER PRIMARY KEY AUTOINCREMENT, embedder_id TEXT NOT NULL, dim INTEGER NOT NULL CHECK (dim > 0), canonicalize_version INTEGER NOT NULL, byte_order TEXT NOT NULL DEFAULT 'le' CHECK (byte_order IN ('le', 'be')), audit_status TEXT NOT NULL DEFAULT 'pending' CHECK (audit_status IN ('pending', 'passed', 'failed')), is_active INTEGER NOT NULL DEFAULT 0 CHECK (is_active IN (0, 1)), created_at INTEGER NOT NULL, activated_at INTEGER);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_embedding_generations_single_active ON embedding_generations(is_active) WHERE is_active = 1;
@@ -542,6 +544,167 @@ pub fn insert_message_embedding(
     Ok(())
 }
 
+/// Recall-filter metadata *view* version (R4-N1, w3-3 Step 2, plan §3.1
+/// "含召回过滤元数据视图版本口径"): a single global constant, **not** a
+/// per-row derived value. It versions the *definition* of which message
+/// fields feed [`insert_message_embedding_cas`]'s staleness check (today:
+/// `content` + `role`) — bump it only when that definition itself changes
+/// (e.g. a future field joins the check), never per message. Per-message
+/// `content`/`role` drift is already caught by the dedicated hash/equality
+/// comparisons in [`insert_message_embedding_cas`]; this constant lets a
+/// *view* change (not a *row* change) be told apart from those, so rows
+/// written under an older view definition remain identifiable.
+///
+/// **Bump discipline**: any change to the staleness-check field set in
+/// [`insert_message_embedding_cas`] must increment this constant in the
+/// same commit.
+pub const RECALL_FILTER_METADATA_VIEW_VERSION: i64 = 1;
+
+/// Why a message's content-hash-plus-role went stale before `insert_message_embedding_cas` ran.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CasStaleReason {
+    /// `doc_id` no longer exists in `messages` — deleted (replace/forget/
+    /// dedup/purge, `ON DELETE CASCADE` already removed any prior embedding
+    /// row for it) between the worker's read and this write.
+    MessageMissing,
+    /// `messages.content` changed under the worker: the freshly recomputed
+    /// hash does not match what the caller embedded.
+    ContentChanged { expected_content_hash: String, current_content_hash: String },
+    /// `messages.role` changed under the worker (R4-N1: role/agent-scoped
+    /// filter metadata changing must invalidate the same way content does).
+    RoleChanged { expected_role: String, current_role: String },
+}
+
+/// Outcome of a CAS-guarded embedding insert.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CasInsertOutcome {
+    Inserted,
+    /// Discarded, not written. The caller (async embedding worker) is
+    /// responsible for re-queuing `doc_id` for a fresh embedding pass — this
+    /// function never writes a stale vector and never blocks waiting for
+    /// one.
+    Stale(CasStaleReason),
+}
+
+/// CAS-guarded [`insert_message_embedding`] (R3-B2, w3-3 Step 2): the async
+/// embedding worker reads a message's `content`/`role`, spends real
+/// wall-clock time computing the embedding, then comes back to write it. If
+/// the source row changed in between ("读旧内容→源更新→旧结果迟到"),
+/// writing the now-stale vector would silently poison the vector domain
+/// with a result nobody asked for, and nothing would ever notice it needs
+/// re-embedding.
+///
+/// This function re-reads `messages.content`/`role` for `doc_id` **inside
+/// the same write transaction** as the insert. SQLite's single-writer model
+/// (this crate's D2 concurrency contract) makes that read-then-write
+/// atomic — no other transaction can interleave a write to this row between
+/// the `SELECT` and the `INSERT` below — so the comparison below is a true
+/// compare-and-set, not a check that can itself race. `expected_content_hash`
+/// must be `content_hash_hex(canonicalize_for_embedding(content))` computed
+/// by the caller when it read the content it embedded (same recipe this
+/// function uses to recompute the current value); `expected_role` is the
+/// raw `messages.role` string the caller read at that time.
+///
+/// Returns `Ok(CasInsertOutcome::Stale(..))` — never an `Err` — for every
+/// staleness case this function itself detects (message deleted / content
+/// changed / role changed): discarding a stale write is expected, routine
+/// behavior for an async worker racing relational writers, not a failure.
+///
+/// On success (w3-3 Step 4, R4-B5), also resolves — in this same
+/// transaction — any `embedding_holes` row previously registered for
+/// `(generation_id, doc_id)` (a no-op `DELETE` if none exists, e.g. this is
+/// a first-pass embed with no catch-up gap involved). The hole ledger is
+/// this crate's completeness watermark (R4-B5 forbids a single-max-id
+/// watermark precisely because it misses holes left behind by out-of-order
+/// catch-up retries); resolving a hole is therefore as much a part of "the
+/// write" as the embedding row itself, and a crash between committing the
+/// embedding and resolving its hole would leave completeness tracking
+/// wrong in either direction — hence one transaction, not two.
+#[allow(clippy::too_many_arguments)]
+pub fn insert_message_embedding_cas(
+    tx: &Tx,
+    generation_id: i64,
+    doc_id: i64,
+    conversation_id: i64,
+    vector: &[f32],
+    expected_content_hash: &str,
+    expected_role: &str,
+    created_at_ms: i64,
+) -> Result<CasInsertOutcome, StorageError> {
+    let current = tx.query_opt_map(
+        "SELECT content, role FROM messages WHERE id = ?1",
+        &params![doc_id],
+        |row| -> Result<(String, String), StorageError> {
+            Ok((row.get_typed::<String>(0)?, row.get_typed::<String>(1)?))
+        },
+    )?;
+    let Some((current_content, current_role)) = current else {
+        return Ok(CasInsertOutcome::Stale(CasStaleReason::MessageMissing));
+    };
+
+    let current_content_hash = crate::search::canonicalize::content_hash_hex(
+        &crate::search::canonicalize::canonicalize_for_embedding(&current_content),
+    );
+    if current_content_hash != expected_content_hash {
+        return Ok(CasInsertOutcome::Stale(CasStaleReason::ContentChanged {
+            expected_content_hash: expected_content_hash.to_string(),
+            current_content_hash,
+        }));
+    }
+    if current_role != expected_role {
+        return Ok(CasInsertOutcome::Stale(CasStaleReason::RoleChanged {
+            expected_role: expected_role.to_string(),
+            current_role,
+        }));
+    }
+
+    match insert_message_embedding(
+        tx,
+        generation_id,
+        doc_id,
+        conversation_id,
+        vector,
+        expected_content_hash,
+        Some(RECALL_FILTER_METADATA_VIEW_VERSION),
+        created_at_ms,
+    ) {
+        Ok(()) => {
+            // w3-3 Step 4 (R4-B5): resolving a hole is completeness-tracking
+            // state, exactly like the hole's own registration -- it must
+            // commit atomically with the embedding row it resolves, in this
+            // same transaction, not as a separate follow-up write a crash
+            // between the two could leave inconsistent (an embedding row
+            // with no matching resolved-hole update, or vice versa).
+            // `DELETE ... WHERE` matching zero rows (no hole was ever
+            // registered for this doc_id/generation, e.g. it was embedded
+            // on the first pass with no catch-up involved) is a correct
+            // no-op, not an error.
+            tx.execute(
+                "DELETE FROM embedding_holes WHERE generation_id = ?1 AND doc_id = ?2",
+                &params![generation_id, doc_id],
+            )?;
+            Ok(CasInsertOutcome::Inserted)
+        }
+        // Defense in depth, not the primary guard: the read-check above
+        // already makes this branch unreachable under the single-writer
+        // model documented on this function (nothing can delete `doc_id`
+        // between our SELECT and this INSERT within one transaction). It
+        // exists so that IF a future refactor ever split the read and the
+        // write across transactions, a late `FOREIGN KEY constraint failed`
+        // here still degrades to the same graceful `Stale` signal instead
+        // of propagating as a fatal error that would abort an entire
+        // catch-up batch over one message that lost its race.
+        Err(StorageError::Constraint { detail }) if detail_indicates_foreign_key_violation(&detail) => {
+            Ok(CasInsertOutcome::Stale(CasStaleReason::MessageMissing))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn detail_indicates_foreign_key_violation(detail: &str) -> bool {
+    detail.to_ascii_uppercase().contains("FOREIGN KEY")
+}
+
 /// Read the current active generation's `id`, if any. A plain `SELECT`
 /// against the `WHERE is_active = 1` partial-unique-indexed column -- when
 /// called inside the same read transaction as a `message_embeddings` query,
@@ -583,6 +746,77 @@ pub fn switch_active_generation(
         )?;
         Ok(())
     })
+}
+
+// -------------------------------------------------------------------------
+// w3-3 Step 3 (spec 门③, R2-W3-B4): same-transaction lifecycle invalidation
+// primitives. `ON DELETE CASCADE` on `message_embeddings.doc_id` and
+// `embedding_holes.doc_id` already removes both rows for a deleted message
+// as a structural side effect of the `DELETE FROM messages` statement
+// itself (no code below does that part) — what CASCADE cannot do is (a)
+// register a hole for a *newly inserted* message id (nothing about an
+// `INSERT INTO messages` implies "this needs an embedding" to SQLite) or
+// (b) demote a generation's certified-ready status when the message set it
+// was certified against has since changed. Both of those are this module's
+// job, and per R2-W3-B4 they must run in the *same* transaction as the
+// relational write — the async catch-up worker has no way to retroactively
+// join an already-committed transaction.
+// -------------------------------------------------------------------------
+
+/// Register `doc_id` as needing an embedding under the currently active
+/// generation, if one exists. Called for every newly inserted message
+/// (w3-3 Step 3, A类/B类 write entry points) in the same transaction as the
+/// `INSERT INTO messages` that created it.
+///
+/// No-op when there is no active generation (bootstrap / vector domain not
+/// yet activated) — there is nothing to register a hole against, and that
+/// is the overwhelmingly common case for every write entry point that does
+/// not yet involve the vector domain at all (unaffected by this call).
+/// `INSERT OR IGNORE` makes re-registering the same `(generation_id,
+/// doc_id)` pair idempotent, matching the table's own doc comment.
+pub fn register_embedding_hole_for_new_message_in_tx(
+    tx: &Tx,
+    doc_id: i64,
+    detected_at_ms: i64,
+    reason: &str,
+) -> Result<(), StorageError> {
+    let active: Option<i64> =
+        tx.query_opt_map("SELECT id FROM embedding_generations WHERE is_active = 1", &[], |row| row.get_typed(0))?;
+    let Some(generation_id) = active else {
+        return Ok(());
+    };
+    tx.execute(
+        "INSERT OR IGNORE INTO embedding_holes (generation_id, doc_id, detected_at, reason) \
+         VALUES (?1, ?2, ?3, ?4)",
+        &params![generation_id, doc_id, detected_at_ms, reason],
+    )?;
+    Ok(())
+}
+
+/// Demote the active generation's certified-ready status (`audit_status`)
+/// back to `'pending'`, if one exists and is not already `'pending'`.
+/// Called in the same transaction as any relational write that mutates the
+/// `messages` set a generation's `'passed'` audit_status certified
+/// completeness against (w3-3 Step 3, all four lifecycle categories:
+/// insert/更新(=replace)/delete/replace) — the mutation may have just
+/// broken that certification (a new message with no embedding yet exists,
+/// or a message the certification covered no longer does), so the claim
+/// must not survive uninvalidated. Intentionally unconditional (not
+/// case-by-case per mutation kind): over-invalidating just means W3-4's
+/// activation audit re-verifies before the next promotion, which is cheap;
+/// under-invalidating would let a stale "ready" claim keep serving results
+/// with an unverified/broken coverage guarantee, which is not.
+///
+/// No-op when there is no active generation, or the active generation is
+/// already `'pending'` — the common case for every write entry point that
+/// does not yet involve the vector domain at all.
+pub fn demote_active_generation_readiness_in_tx(tx: &Tx) -> Result<(), StorageError> {
+    tx.execute(
+        "UPDATE embedding_generations SET audit_status = 'pending' \
+         WHERE is_active = 1 AND audit_status != 'pending'",
+        &[],
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1083,4 +1317,456 @@ mod tests {
     /// tests can hand-build an authentic pre-drop fixture instead of
     /// depending on production DDL that must no longer contain it.
     const LEGACY_FTS_MESSAGES_DDL_FOR_TEST: &str = "CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, content = '', tokenize = 'porter');";
+
+    // -------------------------------------------------------------------
+    // w3-3 Step 2: `insert_message_embedding_cas` (R3-B2) failure tests
+    // -------------------------------------------------------------------
+
+    fn insert_test_message_parent_chain(conn: &Conn, agent_id: i64, conversation_id: i64, message_id: i64, role: &str, content: &str) {
+        conn.execute(
+            "INSERT OR IGNORE INTO agents(id, slug, name, kind, created_at, updated_at) VALUES (?1, ?2, ?2, 'cli', 0, 0)",
+            &params![agent_id, format!("agent-{agent_id}")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO conversations(id, agent_id, title, source_path) VALUES (?1, ?2, 't', ?3)",
+            &params![conversation_id, agent_id, format!("/tmp/c-{conversation_id}.jsonl")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages(id, conversation_id, idx, role, content) VALUES (?1, ?2, ?1, ?3, ?4)",
+            &params![message_id, conversation_id, role, content],
+        )
+        .unwrap();
+    }
+
+    fn embedding_row_count_for_doc(conn: &Conn, generation_id: i64, doc_id: i64) -> i64 {
+        conn.query_row_map(
+            "SELECT COUNT(*) FROM message_embeddings WHERE generation_id = ?1 AND doc_id = ?2",
+            &params![generation_id, doc_id],
+            |row| row.get_typed(0),
+        )
+        .unwrap()
+    }
+
+    fn expected_hash_for(content: &str) -> String {
+        crate::search::canonicalize::content_hash_hex(&crate::search::canonicalize::canonicalize_for_embedding(content))
+    }
+
+    /// Happy path: content and role at write time still match what the
+    /// caller embedded -- the row must land, exactly like a plain
+    /// `insert_message_embedding` call would.
+    #[test]
+    fn insert_message_embedding_cas_inserts_when_content_and_role_still_match() {
+        let (_dir, path) = scratch_db_path();
+        let conn = open_sqlite_writer(&path);
+        ensure(&conn).expect("ensure should build a fresh schema");
+        insert_test_message_parent_chain(&conn, 1, 1, 1, "user", "hello world");
+        let gen_id = conn
+            .with_tx_no_replay(TxMode::Immediate, |tx| create_embedding_generation(tx, "bge-m3", 4, 1, 1_000))
+            .unwrap();
+        let expected_hash = expected_hash_for("hello world");
+
+        let outcome = conn
+            .with_tx_no_replay(TxMode::Immediate, |tx| {
+                insert_message_embedding_cas(tx, gen_id, 1, 1, &[1.0, 0.0, 0.0, 0.0], &expected_hash, "user", 1_000)
+            })
+            .expect("CAS insert must not error when content/role still match");
+
+        assert_eq!(outcome, CasInsertOutcome::Inserted);
+        assert_eq!(embedding_row_count_for_doc(&conn, gen_id, 1), 1);
+    }
+
+    /// The core race this function exists to close ("读旧内容→源更新→旧结果
+    /// 迟到"): the worker read `content` at t0 and is only now (t2) trying to
+    /// write the embedding it computed from it, but the row's content
+    /// changed at t1. The raw `UPDATE` below is fixture-only -- production
+    /// has no in-place content-update write path for an existing message id
+    /// (w3-3 Step 3 write-entry-point survey confirmed this; content changes
+    /// happen via replace, which reassigns a new id and so is caught by the
+    /// `MessageMissing` case below, not this one) -- but the CAS primitive's
+    /// own compare-and-set logic must be correct regardless of *which*
+    /// mechanism produces a content change under a stable id, so the fixture
+    /// drives that signal directly and deterministically.
+    #[test]
+    fn insert_message_embedding_cas_discards_stale_content_and_writes_nothing() {
+        let (_dir, path) = scratch_db_path();
+        let conn = open_sqlite_writer(&path);
+        ensure(&conn).expect("ensure should build a fresh schema");
+        insert_test_message_parent_chain(&conn, 1, 1, 1, "user", "old content");
+        let gen_id = conn
+            .with_tx_no_replay(TxMode::Immediate, |tx| create_embedding_generation(tx, "bge-m3", 4, 1, 1_000))
+            .unwrap();
+        // t0: worker reads "old content" and computes its hash.
+        let stale_hash = expected_hash_for("old content");
+        // t1: source updates while the worker is still embedding.
+        conn.execute("UPDATE messages SET content = ?1 WHERE id = 1", &params!["new content"]).unwrap();
+
+        // t2: worker's late write, still carrying the t0 hash.
+        let outcome = conn
+            .with_tx_no_replay(TxMode::Immediate, |tx| {
+                insert_message_embedding_cas(tx, gen_id, 1, 1, &[1.0, 0.0, 0.0, 0.0], &stale_hash, "user", 1_000)
+            })
+            .expect("a stale CAS write must resolve to Ok(Stale(..)), not Err");
+
+        assert_eq!(
+            outcome,
+            CasInsertOutcome::Stale(CasStaleReason::ContentChanged {
+                expected_content_hash: stale_hash,
+                current_content_hash: expected_hash_for("new content"),
+            })
+        );
+        assert_eq!(
+            embedding_row_count_for_doc(&conn, gen_id, 1),
+            0,
+            "the stale vector must not land in message_embeddings"
+        );
+    }
+
+    /// R4-N1: role/agent-scoped filter metadata changing must invalidate the
+    /// same way content does, independently reported (not folded into the
+    /// content check).
+    #[test]
+    fn insert_message_embedding_cas_discards_stale_role_and_writes_nothing() {
+        let (_dir, path) = scratch_db_path();
+        let conn = open_sqlite_writer(&path);
+        ensure(&conn).expect("ensure should build a fresh schema");
+        insert_test_message_parent_chain(&conn, 1, 1, 1, "user", "same content");
+        let gen_id = conn
+            .with_tx_no_replay(TxMode::Immediate, |tx| create_embedding_generation(tx, "bge-m3", 4, 1, 1_000))
+            .unwrap();
+        let expected_hash = expected_hash_for("same content");
+        conn.execute("UPDATE messages SET role = 'tool_call' WHERE id = 1", &[]).unwrap();
+
+        let outcome = conn
+            .with_tx_no_replay(TxMode::Immediate, |tx| {
+                insert_message_embedding_cas(tx, gen_id, 1, 1, &[1.0, 0.0, 0.0, 0.0], &expected_hash, "user", 1_000)
+            })
+            .expect("a stale-role CAS write must resolve to Ok(Stale(..)), not Err");
+
+        assert_eq!(
+            outcome,
+            CasInsertOutcome::Stale(CasStaleReason::RoleChanged {
+                expected_role: "user".to_string(),
+                current_role: "tool_call".to_string(),
+            })
+        );
+        assert_eq!(embedding_row_count_for_doc(&conn, gen_id, 1), 0);
+    }
+
+    /// A worker that lost the race entirely (its doc_id was deleted --
+    /// replace/forget/dedup/purge -- before it got back to write) must be
+    /// told gracefully, not crash the caller. This exercises the primary
+    /// guard (the upfront `SELECT` finds no row and returns `MessageMissing`
+    /// directly) -- see
+    /// [`insert_message_embedding_rejects_a_missing_doc_id_with_a_foreign_key_constraint`]
+    /// below for the defense-in-depth `FOREIGN KEY` path.
+    #[test]
+    fn insert_message_embedding_cas_missing_doc_id_is_graceful_stale_not_an_error() {
+        let (_dir, path) = scratch_db_path();
+        let conn = open_sqlite_writer(&path);
+        ensure(&conn).expect("ensure should build a fresh schema");
+        let gen_id = conn
+            .with_tx_no_replay(TxMode::Immediate, |tx| create_embedding_generation(tx, "bge-m3", 4, 1, 1_000))
+            .unwrap();
+
+        let outcome = conn
+            .with_tx_no_replay(TxMode::Immediate, |tx| {
+                insert_message_embedding_cas(tx, gen_id, 999_999, 1, &[1.0, 0.0, 0.0, 0.0], "deadbeef", "user", 1_000)
+            })
+            .expect("writing to a doc_id that never existed must not error");
+
+        assert_eq!(outcome, CasInsertOutcome::Stale(CasStaleReason::MessageMissing));
+        assert_eq!(embedding_row_count_for_doc(&conn, gen_id, 999_999), 0);
+    }
+
+    /// Defense-in-depth path (advisor ruling ④, w3-3 Step 2): directly
+    /// exercises `insert_message_embedding`'s own `FOREIGN KEY` failure (by
+    /// calling it on a nonexistent `doc_id` the way the upfront `SELECT`
+    /// would never let `insert_message_embedding_cas` reach in practice) and
+    /// asserts the surfaced error is the ordinary `StorageError::Constraint`
+    /// shape `detail_indicates_foreign_key_violation` is built to recognize
+    /// -- proving that fallback match arm in `insert_message_embedding_cas`
+    /// would actually fire (not dead code) if the upfront check were ever
+    /// bypassed by a future refactor.
+    #[test]
+    fn insert_message_embedding_rejects_a_missing_doc_id_with_a_foreign_key_constraint() {
+        let (_dir, path) = scratch_db_path();
+        let conn = open_sqlite_writer(&path);
+        ensure(&conn).expect("ensure should build a fresh schema");
+        let gen_id = conn
+            .with_tx_no_replay(TxMode::Immediate, |tx| create_embedding_generation(tx, "bge-m3", 4, 1, 1_000))
+            .unwrap();
+
+        let err = conn
+            .with_tx_no_replay(TxMode::Immediate, |tx| {
+                insert_message_embedding(tx, gen_id, 999_999, 1, &[1.0, 0.0, 0.0, 0.0], "deadbeef", None, 1_000)
+            })
+            .expect_err("inserting an embedding for a doc_id absent from messages must fail the FK constraint");
+
+        match err {
+            StorageError::Constraint { detail } => assert!(
+                detail_indicates_foreign_key_violation(&detail),
+                "expected a FOREIGN KEY constraint detail, got: {detail}"
+            ),
+            other => panic!("expected StorageError::Constraint, got: {other:?}"),
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // w3-3 Step 3: lifecycle invalidation primitives (unit level; the full
+    // insert/replace/delete matrix against the real write entry points
+    // lives in `tests/w3_vector_lifecycle.rs`)
+    // -------------------------------------------------------------------
+
+    fn active_audit_status(conn: &Conn) -> String {
+        conn.query_row_map(
+            "SELECT audit_status FROM embedding_generations WHERE is_active = 1",
+            &[],
+            |row| row.get_typed(0),
+        )
+        .unwrap()
+    }
+
+    fn set_generation_active_and_passed(conn: &Conn, generation_id: i64) {
+        conn.execute(
+            "UPDATE embedding_generations SET is_active = 1, audit_status = 'passed' WHERE id = ?1",
+            &params![generation_id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn register_embedding_hole_for_new_message_is_a_noop_with_no_active_generation() {
+        let (_dir, path) = scratch_db_path();
+        let conn = open_sqlite_writer(&path);
+        ensure(&conn).expect("ensure should build a fresh schema");
+        insert_test_message_parent_chain(&conn, 1, 1, 1, "user", "c");
+        // A generation exists but is not active -- must still no-op, this
+        // is the "vector domain not yet activated" case every ordinary
+        // `cass index` run hits today.
+        conn.with_tx_no_replay(TxMode::Immediate, |tx| create_embedding_generation(tx, "bge-m3", 4, 1, 1_000)).unwrap();
+
+        conn.with_tx_no_replay(TxMode::Immediate, |tx| register_embedding_hole_for_new_message_in_tx(tx, 1, 1_000, "new_message"))
+            .expect("must not error with no active generation");
+
+        let holes: i64 =
+            conn.query_row_map("SELECT COUNT(*) FROM embedding_holes", &[], |row| row.get_typed(0)).unwrap();
+        assert_eq!(holes, 0);
+    }
+
+    #[test]
+    fn register_embedding_hole_for_new_message_registers_against_the_active_generation() {
+        let (_dir, path) = scratch_db_path();
+        let conn = open_sqlite_writer(&path);
+        ensure(&conn).expect("ensure should build a fresh schema");
+        insert_test_message_parent_chain(&conn, 1, 1, 1, "user", "c");
+        let gen_id = conn
+            .with_tx_no_replay(TxMode::Immediate, |tx| create_embedding_generation(tx, "bge-m3", 4, 1, 1_000))
+            .unwrap();
+        set_generation_active_and_passed(&conn, gen_id);
+
+        conn.with_tx_no_replay(TxMode::Immediate, |tx| register_embedding_hole_for_new_message_in_tx(tx, 1, 1_000, "new_message"))
+            .unwrap();
+
+        let holes: Vec<(i64, i64, String)> = conn
+            .query_all_map(
+                "SELECT generation_id, doc_id, reason FROM embedding_holes",
+                &[],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+            )
+            .unwrap();
+        assert_eq!(holes, vec![(gen_id, 1, "new_message".to_string())]);
+    }
+
+    #[test]
+    fn register_embedding_hole_for_new_message_is_idempotent() {
+        let (_dir, path) = scratch_db_path();
+        let conn = open_sqlite_writer(&path);
+        ensure(&conn).expect("ensure should build a fresh schema");
+        insert_test_message_parent_chain(&conn, 1, 1, 1, "user", "c");
+        let gen_id = conn
+            .with_tx_no_replay(TxMode::Immediate, |tx| create_embedding_generation(tx, "bge-m3", 4, 1, 1_000))
+            .unwrap();
+        set_generation_active_and_passed(&conn, gen_id);
+
+        conn.with_tx_no_replay(TxMode::Immediate, |tx| register_embedding_hole_for_new_message_in_tx(tx, 1, 1_000, "new_message"))
+            .unwrap();
+        conn.with_tx_no_replay(TxMode::Immediate, |tx| register_embedding_hole_for_new_message_in_tx(tx, 1, 2_000, "new_message"))
+            .expect("re-registering the same (generation_id, doc_id) pair must not error");
+
+        let holes: i64 =
+            conn.query_row_map("SELECT COUNT(*) FROM embedding_holes", &[], |row| row.get_typed(0)).unwrap();
+        assert_eq!(holes, 1, "INSERT OR IGNORE must not create a duplicate row");
+    }
+
+    #[test]
+    fn demote_active_generation_readiness_is_a_noop_with_no_active_generation() {
+        let (_dir, path) = scratch_db_path();
+        let conn = open_sqlite_writer(&path);
+        ensure(&conn).expect("ensure should build a fresh schema");
+
+        conn.with_tx_no_replay(TxMode::Immediate, |tx| demote_active_generation_readiness_in_tx(tx))
+            .expect("must not error with no active generation at all");
+    }
+
+    #[test]
+    fn demote_active_generation_readiness_flips_passed_active_generation_to_pending() {
+        let (_dir, path) = scratch_db_path();
+        let conn = open_sqlite_writer(&path);
+        ensure(&conn).expect("ensure should build a fresh schema");
+        let gen_id = conn
+            .with_tx_no_replay(TxMode::Immediate, |tx| create_embedding_generation(tx, "bge-m3", 4, 1, 1_000))
+            .unwrap();
+        set_generation_active_and_passed(&conn, gen_id);
+        assert_eq!(active_audit_status(&conn), "passed", "sanity: must start passed");
+
+        conn.with_tx_no_replay(TxMode::Immediate, |tx| demote_active_generation_readiness_in_tx(tx)).unwrap();
+
+        assert_eq!(active_audit_status(&conn), "pending");
+    }
+
+    #[test]
+    fn demote_active_generation_readiness_leaves_a_non_active_generation_untouched() {
+        let (_dir, path) = scratch_db_path();
+        let conn = open_sqlite_writer(&path);
+        ensure(&conn).expect("ensure should build a fresh schema");
+        // Two generations: gen_a active+passed, gen_b inactive+passed (e.g.
+        // a superseded generation awaiting W3-4's delayed cleanup). Only the
+        // active one's readiness claim is what live writers can invalidate.
+        let gen_a = conn
+            .with_tx_no_replay(TxMode::Immediate, |tx| create_embedding_generation(tx, "bge-m3", 4, 1, 1_000))
+            .unwrap();
+        let gen_b = conn
+            .with_tx_no_replay(TxMode::Immediate, |tx| create_embedding_generation(tx, "bge-m3", 4, 1, 1_000))
+            .unwrap();
+        set_generation_active_and_passed(&conn, gen_a);
+        conn.execute(
+            "UPDATE embedding_generations SET audit_status = 'passed' WHERE id = ?1",
+            &params![gen_b],
+        )
+        .unwrap();
+
+        conn.with_tx_no_replay(TxMode::Immediate, |tx| demote_active_generation_readiness_in_tx(tx)).unwrap();
+
+        let gen_b_status: String = conn
+            .query_row_map("SELECT audit_status FROM embedding_generations WHERE id = ?1", &params![gen_b], |row| row.get_typed(0))
+            .unwrap();
+        assert_eq!(gen_b_status, "passed", "the inactive generation's own certification must be untouched");
+        assert_eq!(active_audit_status(&conn), "pending");
+    }
+
+    // -------------------------------------------------------------------
+    // w3-3 Step 4 (R4-B5): hole-ledger resolution must commit atomically
+    // with the embedding row it resolves ("watermark 同事务").
+    // -------------------------------------------------------------------
+
+    fn hole_count_for(conn: &Conn, generation_id: i64, doc_id: i64) -> i64 {
+        conn.query_row_map(
+            "SELECT COUNT(*) FROM embedding_holes WHERE generation_id = ?1 AND doc_id = ?2",
+            &params![generation_id, doc_id],
+            |row| row.get_typed(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn insert_message_embedding_cas_resolves_a_registered_hole_on_success() {
+        let (_dir, path) = scratch_db_path();
+        let conn = open_sqlite_writer(&path);
+        ensure(&conn).expect("ensure should build a fresh schema");
+        insert_test_message_parent_chain(&conn, 1, 1, 1, "user", "hello world");
+        let gen_id = conn
+            .with_tx_no_replay(TxMode::Immediate, |tx| create_embedding_generation(tx, "bge-m3", 4, 1, 1_000))
+            .unwrap();
+        set_generation_active_and_passed(&conn, gen_id);
+        conn.with_tx_no_replay(TxMode::Immediate, |tx| register_embedding_hole_for_new_message_in_tx(tx, 1, 500, "new_message"))
+            .unwrap();
+        assert_eq!(hole_count_for(&conn, gen_id, 1), 1, "sanity: hole must exist before the CAS write");
+        let expected_hash = expected_hash_for("hello world");
+
+        let outcome = conn
+            .with_tx_no_replay(TxMode::Immediate, |tx| {
+                insert_message_embedding_cas(tx, gen_id, 1, 1, &[1.0, 0.0, 0.0, 0.0], &expected_hash, "user", 1_000)
+            })
+            .unwrap();
+
+        assert_eq!(outcome, CasInsertOutcome::Inserted);
+        assert_eq!(hole_count_for(&conn, gen_id, 1), 0, "the resolved hole must be gone after a successful CAS write");
+    }
+
+    #[test]
+    fn insert_message_embedding_cas_stale_write_does_not_resolve_the_hole() {
+        let (_dir, path) = scratch_db_path();
+        let conn = open_sqlite_writer(&path);
+        ensure(&conn).expect("ensure should build a fresh schema");
+        insert_test_message_parent_chain(&conn, 1, 1, 1, "user", "old content");
+        let gen_id = conn
+            .with_tx_no_replay(TxMode::Immediate, |tx| create_embedding_generation(tx, "bge-m3", 4, 1, 1_000))
+            .unwrap();
+        set_generation_active_and_passed(&conn, gen_id);
+        conn.with_tx_no_replay(TxMode::Immediate, |tx| register_embedding_hole_for_new_message_in_tx(tx, 1, 500, "new_message"))
+            .unwrap();
+        let stale_hash = expected_hash_for("old content");
+        conn.execute("UPDATE messages SET content = 'new content' WHERE id = 1", &[]).unwrap();
+
+        let outcome = conn
+            .with_tx_no_replay(TxMode::Immediate, |tx| {
+                insert_message_embedding_cas(tx, gen_id, 1, 1, &[1.0, 0.0, 0.0, 0.0], &stale_hash, "user", 1_000)
+            })
+            .unwrap();
+
+        assert!(matches!(outcome, CasInsertOutcome::Stale(CasStaleReason::ContentChanged { .. })));
+        assert_eq!(
+            hole_count_for(&conn, gen_id, 1),
+            1,
+            "a stale/discarded write must leave the hole registered for a future retry"
+        );
+    }
+
+    /// The core atomicity claim: the embedding insert and the hole-ledger
+    /// delete that resolves it are two separate SQL statements inside
+    /// `insert_message_embedding_cas` -- this proves they are still one
+    /// atomic unit under a crash between "the write logically succeeded"
+    /// and "the transaction commits", not two independent writes that
+    /// could be split. Returning `Err` after a successful CAS call stands
+    /// in for "the transaction failed to commit for any reason" (crash,
+    /// disk full, a later statement in the same transaction failing) --
+    /// `with_tx_no_replay` never reaches `Tx::commit`, so `Tx::drop` rolls
+    /// the whole transaction back.
+    #[test]
+    fn insert_message_embedding_cas_hole_resolution_is_atomic_with_the_embedding_insert() {
+        let (_dir, path) = scratch_db_path();
+        let conn = open_sqlite_writer(&path);
+        ensure(&conn).expect("ensure should build a fresh schema");
+        insert_test_message_parent_chain(&conn, 1, 1, 1, "user", "hello world");
+        let gen_id = conn
+            .with_tx_no_replay(TxMode::Immediate, |tx| create_embedding_generation(tx, "bge-m3", 4, 1, 1_000))
+            .unwrap();
+        set_generation_active_and_passed(&conn, gen_id);
+        conn.with_tx_no_replay(TxMode::Immediate, |tx| register_embedding_hole_for_new_message_in_tx(tx, 1, 500, "new_message"))
+            .unwrap();
+        assert_eq!(hole_count_for(&conn, gen_id, 1), 1, "sanity: hole must exist before the CAS write");
+        let expected_hash = expected_hash_for("hello world");
+
+        let result: Result<(), StorageError> = conn.with_tx_no_replay(TxMode::Immediate, |tx| {
+            let outcome = insert_message_embedding_cas(tx, gen_id, 1, 1, &[1.0, 0.0, 0.0, 0.0], &expected_hash, "user", 1_000)?;
+            assert_eq!(outcome, CasInsertOutcome::Inserted, "sanity: the write itself must have succeeded pre-crash");
+            Err(StorageError::Other { code: None, detail: "simulated mid-transaction crash".to_string() })
+        });
+        assert!(result.is_err(), "the forced error must propagate to the caller");
+
+        // Both statements must have rolled back together -- not just the
+        // insert, not just the hole delete.
+        assert_eq!(
+            embedding_row_count_for_doc(&conn, gen_id, 1),
+            0,
+            "the embedding row must not have survived the rollback"
+        );
+        assert_eq!(
+            hole_count_for(&conn, gen_id, 1),
+            1,
+            "the hole must still be registered -- its resolution rolled back with everything else"
+        );
+    }
 }
