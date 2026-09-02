@@ -653,3 +653,95 @@ pub fn run_activation_audit_and_record(
         .context("recording activation audit verdict")?;
     Ok(report)
 }
+
+// =============================================================================
+// W3-4 Step3 (task book #62): delayed cleanup of orphaned (non-active)
+// embedding generations. Only ever deletes rows for a generation that is
+// already `is_active = 0` *and* old enough that no in-flight reader could
+// plausibly still be depending on it -- `search_db_vector_domain` (spec
+// R4-B4) reads the active-generation pointer and that generation's rows
+// inside one `Deferred` transaction/snapshot, so a reader that already
+// captured a snapshot is isolated from a concurrent DELETE by SQLite's own
+// MVCC (proven in `tests/w3_vector_generation_cleanup.rs`, R4-B5) --
+// deleting a *recently* demoted generation would still be memory-safe for
+// that reason, but the age threshold exists anyway as an operational
+// safety margin (R4-B5's "delayed", not "immediate", cleanup), not as a
+// correctness requirement this module depends on.
+// =============================================================================
+
+/// Default delayed-cleanup age threshold (task book #62 Step3: 24h).
+/// Env-tunable (`CASS_EMBEDDING_GENERATION_CLEANUP_AGE_MS`) -- not a new
+/// config-file surface, just an escape valve for tests/ops, matching this
+/// task's "不新增配置面" constraint.
+const GENERATION_CLEANUP_AGE_THRESHOLD_MS_DEFAULT: i64 = 24 * 60 * 60 * 1000;
+
+fn generation_cleanup_age_threshold_ms() -> i64 {
+    std::env::var("CASS_EMBEDDING_GENERATION_CLEANUP_AGE_MS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|&v| v >= 0)
+        .unwrap_or(GENERATION_CLEANUP_AGE_THRESHOLD_MS_DEFAULT)
+}
+
+/// Delete every non-active `embedding_generations` row whose `created_at`
+/// is older than the cleanup threshold, along with its `message_embeddings`
+/// / `embedding_holes` rows and `vec0` table -- none of that cascades from
+/// deleting the generation row itself (`V4_VECTOR_DOMAIN_DDL`'s doc comment:
+/// `generation_id` does not cascade from `embedding_generations`), so this
+/// function is the one place that tears down all four pieces together.
+/// Never touches the currently-active generation, regardless of age. Each
+/// candidate is deleted in its own transaction (`is_active = 0` is
+/// re-checked in the same `DELETE`'s `WHERE` clause, not just the earlier
+/// `SELECT`, so a generation that got reactivated between the scan and the
+/// delete is safely skipped rather than deleted out from under a new
+/// active pointer) -- one candidate's delete failing never blocks the rest.
+/// Returns the `generation_id`s actually deleted.
+pub fn cleanup_orphaned_generations(storage: &FrankenStorage, now_ms: i64) -> Result<Vec<i64>> {
+    let cutoff_ms = now_ms.saturating_sub(generation_cleanup_age_threshold_ms());
+    let candidates: Vec<i64> = storage
+        .raw()
+        .query_all_map(
+            "SELECT id FROM embedding_generations WHERE is_active = 0 AND created_at < ?1",
+            &params![cutoff_ms],
+            |row| row.get_typed(0),
+        )
+        .context("scanning for orphaned embedding generations")?;
+
+    let mut deleted = Vec::with_capacity(candidates.len());
+    for generation_id in candidates {
+        let rows_deleted = storage
+            .raw()
+            .with_tx(TxMode::Immediate, |tx| {
+                // Re-check `is_active` inside this same transaction before
+                // touching anything -- if this generation got reactivated
+                // between the scan above and here, the two DELETEs below
+                // must never run at all (they are not themselves gated on
+                // is_active, so running them unconditionally could wipe a
+                // *currently active* generation's rows out from under it).
+                let still_inactive: Option<bool> = tx.query_opt_map(
+                    "SELECT is_active = 0 FROM embedding_generations WHERE id = ?1",
+                    &params![generation_id],
+                    |row| row.get_typed(0),
+                )?;
+                if still_inactive != Some(true) {
+                    return Ok(0);
+                }
+                tx.execute("DELETE FROM embedding_holes WHERE generation_id = ?1", &params![generation_id])?;
+                tx.execute("DELETE FROM message_embeddings WHERE generation_id = ?1", &params![generation_id])?;
+                tx.execute(
+                    "DELETE FROM embedding_generations WHERE id = ?1 AND is_active = 0",
+                    &params![generation_id],
+                )
+            })
+            .with_context(|| format!("deleting orphaned generation {generation_id}"))?;
+        if rows_deleted == 0 {
+            // Reactivated (or already gone) between the scan and here --
+            // nothing was touched, safe to skip.
+            continue;
+        }
+        vector_domain::drop_vec0_table_for_generation(storage.raw(), generation_id)
+            .with_context(|| format!("dropping vec0 table for deleted generation {generation_id}"))?;
+        deleted.push(generation_id);
+    }
+    Ok(deleted)
+}
