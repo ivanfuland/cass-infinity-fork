@@ -17,7 +17,6 @@
 //! - **[`semantic_manifest`]**: Durable semantic asset manifests, backlog ledger, and checkpoints.
 //! - **[`canonicalize`]**: Text preprocessing for consistent embedding input.
 //! - **[`ann_index`]**: HNSW-based approximate nearest neighbor index (Opt 9).
-//! - **[`two_tier_search`]**: Two-tier progressive search with fast/quality embeddings (bd-3dcw).
 //! - **[`pack_planner`]**: Deterministic answer-pack evidence selection core.
 
 pub mod ann_index;
@@ -71,7 +70,6 @@ pub(crate) mod storage_integrity;
 pub(crate) mod storage_salvage;
 pub mod trust_correlation;
 pub mod trust_scoring;
-pub mod two_tier_search;
 pub mod vector_index;
 pub(crate) mod watch_exit_envelope;
 pub(crate) mod watch_recovery;
