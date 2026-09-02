@@ -4074,6 +4074,289 @@ impl SearchClient {
             });
     }
 
+    /// All string variants `role_code_from_str` maps onto `code` (its
+    /// inverse, many-to-one) -- needed to build a `role IN (...)` SQL
+    /// clause from a `SemanticFilter`-shaped `HashSet<u8>` role-code
+    /// selection. Kept in lockstep with `role_code_from_str` by
+    /// `role_code_to_strs_covers_every_string_role_code_from_str_accepts`
+    /// below.
+    fn role_code_to_strs(code: u8) -> &'static [&'static str] {
+        match code {
+            crate::search::vector_index::ROLE_USER => &["user"],
+            crate::search::vector_index::ROLE_ASSISTANT => &["assistant", "agent", "reasoning"],
+            crate::search::vector_index::ROLE_SYSTEM => &["system", "developer"],
+            crate::search::vector_index::ROLE_TOOL => {
+                &["tool", "toolResult", "tool_call", "tool_result"]
+            }
+            _ => &[],
+        }
+    }
+
+    /// R4-B4 (spec §3.1) + w3-d7①/②: the vec0/`message_embeddings`-backed
+    /// counterpart to [`Self::search_exact_semantic_indexes`]'s fsvi
+    /// brute-force scan. Reads the active generation and scans its `vec0`
+    /// index inside **one** read transaction (the same-SQLite-snapshot
+    /// requirement R4-B4 mandates for "active pointer read" + "vector row
+    /// read"), then applies `SemanticFilter`'s six dimensions as a SQL
+    /// `WHERE` joined against `messages`/`conversations`/`agents`/
+    /// `workspaces`/`sources` -- not a doc_id-string decode (that
+    /// indirection existed only because the fsvi format had no relational
+    /// join available; the new path does, so it uses it -- "甩掉 doc_id 解码
+    /// 历史包袱", control-plane 2026-09-01). `session_paths` filtering is
+    /// deliberately NOT handled here: it is applied post-hoc during hit
+    /// hydration for both the fsvi and this path alike (see
+    /// `semantic_search_session_paths_filter_retries_past_initial_
+    /// candidates`), so this function's contract doesn't need to know
+    /// about it.
+    ///
+    /// Contract (w3-d7①, three states, never a silent degradation to the
+    /// fsvi sidecar, an empty-result masquerade, or an unfiltered scan):
+    /// - `Err` whose message contains `vector_domain_state=building`: a
+    ///   generation exists but none is active (a build/backfill is in
+    ///   progress) -- caller-facing structured error, retryable.
+    /// - `Err` whose message contains `vector_domain_state=absent`: no
+    ///   generation has ever been created.
+    /// - `Ok` with an empty `Vec`: an active generation exists but
+    ///   currently has zero rows for it -- a genuinely empty archive, not
+    ///   an error.
+    ///
+    /// Filtered-candidate overfetch (w3-d5: no in-process watchdog, so this
+    /// is a bounded two-step widen, not an unbounded retry loop): the first
+    /// `vec0` KNN call asks for `fetch_limit *
+    /// DB_VECTOR_SEARCH_OVERFETCH_FACTOR` candidates; if filtering leaves
+    /// fewer than `fetch_limit` results and more candidates exist, a second
+    /// call asks for the generation's full row count (KU2's validated
+    /// worst case: a full exact scan is <2s at 101.6万 scale, so widening
+    /// all the way to "everything" once is an acceptable fallback, not a
+    /// runaway cost).
+    /// Pure SQL/params construction for `search_db_vector_domain`'s
+    /// post-KNN filter step -- separated out so it is unit-testable without
+    /// a database (this is the vec0-path counterpart to the retired
+    /// `semantic_filter_applies_all_constraints`'s doc_id-decode unit test:
+    /// same "assert the filter construction is correct" job, SQL-shaped
+    /// instead of string-decode-shaped, per control-plane 2026-09-01's
+    /// "甩掉 doc_id 解码历史包袱" ruling). Returns the query text plus its
+    /// positional parameters, ready for `tx.query_all_map`.
+    fn build_db_vector_domain_filter_sql(
+        candidate_ids: &[i64],
+        filters: &SearchFilters,
+        effective_roles: Option<&HashSet<u8>>,
+    ) -> (String, Vec<ParamValue>) {
+        let mut sql = String::from(
+            "SELECT m.id \
+             FROM messages m \
+             JOIN conversations c ON c.id = m.conversation_id \
+             LEFT JOIN workspaces w ON w.id = c.workspace_id \
+             LEFT JOIN sources s ON s.id = c.source_id \
+             WHERE 1=1",
+        );
+        let mut params: Vec<ParamValue> = Vec::new();
+
+        let id_placeholders = sql_placeholders(candidate_ids.len());
+        sql.push_str(&format!(" AND m.id IN ({id_placeholders})"));
+        for doc_id in candidate_ids {
+            params.push(ParamValue::from(*doc_id));
+        }
+
+        if !filters.agents.is_empty() {
+            let placeholders = sql_placeholders(filters.agents.len());
+            sql.push_str(&format!(
+                " AND EXISTS (SELECT 1 FROM agents a WHERE a.id = c.agent_id AND a.slug IN ({placeholders}))"
+            ));
+            for a in &filters.agents {
+                params.push(ParamValue::from(a.as_str()));
+            }
+        }
+
+        if !filters.workspaces.is_empty() {
+            let placeholders = sql_placeholders(filters.workspaces.len());
+            sql.push_str(&format!(" AND COALESCE(w.path, '') IN ({placeholders})"));
+            for path in &filters.workspaces {
+                params.push(ParamValue::from(path.as_str()));
+            }
+        }
+
+        let normalized_source_sql =
+            normalized_search_source_id_sql_expr("c.source_id", "s.kind", "c.origin_host");
+        match &filters.source_filter {
+            SourceFilter::All => {}
+            SourceFilter::Local => sql.push_str(&format!(
+                " AND {normalized_source_sql} = '{local}'",
+                local = crate::sources::provenance::LOCAL_SOURCE_ID,
+            )),
+            SourceFilter::Remote => sql.push_str(&format!(
+                " AND {normalized_source_sql} != '{local}'",
+                local = crate::sources::provenance::LOCAL_SOURCE_ID,
+            )),
+            SourceFilter::SourceId(id) => {
+                sql.push_str(&format!(" AND {normalized_source_sql} = ?"));
+                params.push(ParamValue::from(normalize_search_source_filter_value(id)));
+            }
+        }
+
+        if let Some(roles) = effective_roles {
+            let role_strs: Vec<&str> =
+                roles.iter().flat_map(|code| Self::role_code_to_strs(*code).iter().copied()).collect();
+            if role_strs.is_empty() {
+                // Every requested role code is unknown -- match nothing,
+                // same as the fsvi filter's `matches()` returning false for
+                // an unrecognized role.
+                sql.push_str(" AND 0");
+            } else {
+                let placeholders = sql_placeholders(role_strs.len());
+                sql.push_str(&format!(" AND m.role IN ({placeholders})"));
+                for r in role_strs {
+                    params.push(ParamValue::from(r));
+                }
+            }
+        }
+
+        if let Some(created_from) = filters.created_from {
+            sql.push_str(" AND m.created_at >= ?");
+            params.push(ParamValue::from(created_from));
+        }
+        if let Some(created_to) = filters.created_to {
+            sql.push_str(" AND m.created_at <= ?");
+            params.push(ParamValue::from(created_to));
+        }
+
+        (sql, params)
+    }
+
+    fn search_db_vector_domain(
+        conn: &Connection,
+        embedding: &[f32],
+        filters: &SearchFilters,
+        default_roles: Option<&HashSet<u8>>,
+        fetch_limit: usize,
+    ) -> Result<(Vec<VectorSearchResult>, SemanticCandidateRetryState)> {
+        const OVERFETCH_FACTOR: usize = 4;
+
+        let effective_roles = filters.roles.clone().or_else(|| default_roles.cloned());
+
+        conn.with_tx_no_replay(crate::storage::api::TxMode::Deferred, |tx| {
+            let active: Option<(i64, i64)> = tx.query_opt_map(
+                "SELECT id, dim FROM embedding_generations WHERE is_active = 1",
+                &[],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )?;
+            let Some((generation_id, _dim)) = active else {
+                let any_generation: i64 = tx.query_row_map(
+                    "SELECT count(*) FROM embedding_generations",
+                    &[],
+                    |row| row.get_typed(0),
+                )?;
+                let state = if any_generation > 0 { "building" } else { "absent" };
+                let hint = if any_generation > 0 {
+                    "a generation exists but none is active yet; a build/backfill is in \
+                     progress -- retry shortly"
+                } else {
+                    "no embedding generation was ever created; run the backfill/embedding \
+                     pipeline to build one"
+                };
+                return Err(crate::storage::api::StorageError::Other {
+                    code: None,
+                    detail: format!(
+                        "vector index unavailable for search: vector_domain_state={state} -- {hint}"
+                    ),
+                });
+            };
+
+            let row_count: i64 = tx.query_row_map(
+                "SELECT count(*) FROM message_embeddings WHERE generation_id = ?1",
+                &crate::storage::api::params![generation_id],
+                |row| row.get_typed(0),
+            )?;
+            if row_count == 0 {
+                // Genuinely empty archive (w3-d7①): not an error.
+                return Ok((Vec::new(), SemanticCandidateRetryState::default()));
+            }
+
+            let vec0_table = format!("vec_index_gen_{generation_id}");
+            let vec0_table_exists: i64 = tx.query_row_map(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                &crate::storage::api::params![vec0_table.clone()],
+                |row| row.get_typed(0),
+            )?;
+            if vec0_table_exists == 0 {
+                // The generation's relational rows exist but its derived
+                // `vec0` index has not been (re)built yet -- w3-d5/w3-d7②:
+                // this function only reports status, it never triggers a
+                // rebuild itself.
+                return Err(crate::storage::api::StorageError::Other {
+                    code: None,
+                    detail: "vector index unavailable for search: vector_domain_state=building \
+                              -- the active generation's vec0 index has not been built yet; \
+                              retry shortly, or run the vector rebuild command"
+                        .to_string(),
+                });
+            }
+
+            let row_count_usize = usize::try_from(row_count).unwrap_or(usize::MAX);
+            let first_k = fetch_limit.saturating_mul(OVERFETCH_FACTOR).min(row_count_usize).max(1);
+
+            let run_and_filter = |tx: &crate::storage::api::Tx, k: usize| -> Result<Vec<(i64, f64)>, crate::storage::api::StorageError> {
+                let blob = crate::storage::schema::f32_vector_to_le_blob(embedding);
+                let k_i64 = i64::try_from(k).unwrap_or(i64::MAX);
+                let candidates: Vec<(i64, f64)> = tx.query_all_map(
+                    &format!(
+                        "SELECT rowid, distance FROM {vec0_table} WHERE embedding MATCH ?1 AND k = ?2 ORDER BY distance"
+                    ),
+                    &crate::storage::api::params![blob, k_i64],
+                    |row| Ok((row.get_typed::<i64>(0)?, row.get_typed::<f64>(1)?)),
+                )?;
+                if candidates.is_empty() {
+                    return Ok(Vec::new());
+                }
+
+                let candidate_ids: Vec<i64> = candidates.iter().map(|(doc_id, _)| *doc_id).collect();
+                let (sql, params) =
+                    Self::build_db_vector_domain_filter_sql(&candidate_ids, filters, effective_roles.as_ref());
+
+                let passing_ids: std::collections::HashSet<i64> =
+                    tx.query_all_map(&sql, &params, |row| row.get_typed(0))?
+                        .into_iter()
+                        .collect();
+
+                Ok(candidates
+                    .into_iter()
+                    .filter(|(doc_id, _)| passing_ids.contains(doc_id))
+                    .collect())
+            };
+
+            let mut filtered = run_and_filter(tx, first_k)?;
+            let mut has_more_candidates = first_k < row_count_usize;
+            if filtered.len() < fetch_limit && first_k < row_count_usize {
+                filtered = run_and_filter(tx, row_count_usize)?;
+                has_more_candidates = false;
+            }
+
+            let results: Vec<VectorSearchResult> = filtered
+                .into_iter()
+                .take(fetch_limit)
+                .map(|(doc_id, distance)| VectorSearchResult {
+                    // vec0's cosine `distance` is `1 - cosine_similarity`;
+                    // `score` is a higher-is-better similarity, matching
+                    // the fsvi path's dot-product-on-near-unit-vectors
+                    // convention (KU2's finding: sqlite-vec's true cosine
+                    // is the more correct of the two).
+                    message_id: u64::try_from(doc_id).unwrap_or(0),
+                    chunk_idx: 0,
+                    score: (1.0 - distance) as f32,
+                })
+                .collect();
+
+            Ok((
+                results,
+                SemanticCandidateRetryState {
+                    has_more_candidates,
+                    exact_window_may_omit_competitor: has_more_candidates,
+                },
+            ))
+        })
+        .map_err(|err: crate::storage::api::StorageError| anyhow!(err.to_string()))
+    }
+
     fn search_exact_semantic_indexes(
         context: &SemanticCandidateContext,
         embedding: &[f32],
@@ -18056,5 +18339,606 @@ mod tests {
                 .any(|d| d.contains("SCAN") && d.contains("lex_docs")),
             "KU3 LIKE fallback must be a genuine lex_docs table scan (full-corpus correctness), got {plan_details:?}"
         );
+    }
+
+    // =========================================================================
+    // w3 Task W3-3 Step 1/1b: `search_db_vector_domain` (vec0/message_embeddings
+    // read path) -- three-state contract (w3-d7①), R4-B4 same-snapshot,
+    // filter-fidelity e2e family (six dimensions + combined).
+    // =========================================================================
+
+    /// A message row plus its parent agent/workspace/conversation, wired for
+    /// direct control over every `SemanticFilter` dimension (role, agent
+    /// slug, workspace path, source id, created_at) -- the existing
+    /// `seed_conversations_for_search_client` fixture doesn't expose
+    /// per-message role or per-conversation source_id/origin_host, which
+    /// this test family needs.
+    struct Db3SeedMessage<'a> {
+        agent_slug: &'a str,
+        workspace_path: Option<&'a str>,
+        source_id: &'a str,
+        role: &'a str,
+        created_at: i64,
+        message_id: i64,
+        conversation_id: i64,
+    }
+
+    fn seed_db3_message(storage: &FrankenStorage, msg: &Db3SeedMessage) {
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: msg.agent_slug.to_string(),
+                name: msg.agent_slug.to_string(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        let workspace_id = msg
+            .workspace_path
+            .map(|p| storage.ensure_workspace(std::path::Path::new(p), None).unwrap());
+        let conn = storage.raw();
+        conn.execute(
+            "INSERT OR IGNORE INTO sources(id, kind, created_at, updated_at) VALUES (?1, 'local', 0, 0)",
+            &crate::storage::api::params![msg.source_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, title, source_path) \
+             VALUES (?1, ?2, ?3, ?4, 't', ?5)",
+            &[
+                ParamValue::from(msg.conversation_id),
+                ParamValue::from(agent_id),
+                ParamValue::from(workspace_id),
+                ParamValue::from(msg.source_id),
+                ParamValue::from(format!("/tmp/c-{}.jsonl", msg.conversation_id)),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages(id, conversation_id, idx, role, created_at, content) \
+             VALUES (?1, ?2, 0, ?3, ?4, 'c')",
+            &crate::storage::api::params![msg.message_id, msg.conversation_id, msg.role, msg.created_at],
+        )
+        .unwrap();
+    }
+
+    /// Creates a generation, writes `vectors` (message_id -> embedding) via
+    /// the production write path (`schema::insert_message_embedding`,
+    /// fixture-fidelity discipline), activates it, and rebuilds its `vec0`
+    /// index -- the minimum a caller of `search_db_vector_domain` needs to
+    /// see `Ready`.
+    fn seed_active_generation_with_vectors(
+        storage: &FrankenStorage,
+        dim: i64,
+        vectors: &[(i64, i64, Vec<f32>)], // (message_id, conversation_id, vector)
+    ) -> i64 {
+        let conn = storage.raw();
+        let generation_id = conn
+            .with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
+                let generation_id =
+                    crate::storage::schema::create_embedding_generation(tx, "bge-m3", dim, 1, 1_000)?;
+                for (message_id, conversation_id, vector) in vectors {
+                    crate::storage::schema::insert_message_embedding(
+                        tx,
+                        generation_id,
+                        *message_id,
+                        *conversation_id,
+                        vector,
+                        "h",
+                        None,
+                        1_000,
+                    )?;
+                }
+                Ok(generation_id)
+            })
+            .unwrap();
+        crate::storage::schema::switch_active_generation(conn, generation_id, 2_000, |_tx| Ok(())).unwrap();
+        crate::storage::vector_domain::rebuild_vec0_table_for_generation(conn, generation_id, dim).unwrap();
+        generation_id
+    }
+
+    #[test]
+    fn db_vector_domain_absent_when_no_generation_exists() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        let conn = storage.raw();
+
+        let err = SearchClient::search_db_vector_domain(
+            conn,
+            &[1.0, 0.0],
+            &SearchFilters::default(),
+            None,
+            10,
+        )
+        .expect_err("no generation ever created must be Absent, not Ok");
+        assert!(
+            err.to_string().contains("vector_domain_state=absent"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn db_vector_domain_building_when_a_generation_exists_but_none_is_active() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        let conn = storage.raw();
+        conn.with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
+            crate::storage::schema::create_embedding_generation(tx, "bge-m3", 2, 1, 1_000)
+        })
+        .unwrap();
+        // Deliberately never activated.
+
+        let err = SearchClient::search_db_vector_domain(
+            conn,
+            &[1.0, 0.0],
+            &SearchFilters::default(),
+            None,
+            10,
+        )
+        .expect_err("a generation with no active pointer must be Building, not Ok");
+        assert!(
+            err.to_string().contains("vector_domain_state=building"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn db_vector_domain_building_when_active_generation_has_no_vec0_index_built_yet() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        let conn = storage.raw();
+        seed_db3_message(
+            &storage,
+            &Db3SeedMessage {
+                agent_slug: "codex",
+                workspace_path: None,
+                source_id: "local",
+                role: "user",
+                created_at: 100,
+                message_id: 1,
+                conversation_id: 1,
+            },
+        );
+        let generation_id = conn
+            .with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
+                let gen_id = crate::storage::schema::create_embedding_generation(tx, "bge-m3", 2, 1, 1_000)?;
+                crate::storage::schema::insert_message_embedding(
+                    tx, gen_id, 1, 1, &[1.0, 0.0], "h", None, 1_000,
+                )?;
+                Ok(gen_id)
+            })
+            .unwrap();
+        crate::storage::schema::switch_active_generation(conn, generation_id, 2_000, |_tx| Ok(())).unwrap();
+        // Deliberately skip rebuild_vec0_table_for_generation -- the
+        // relational row exists and the pointer is active, but the derived
+        // vec0 index was never built (w3-d5/w3-d7②: no auto-rebuild here).
+
+        let err = SearchClient::search_db_vector_domain(
+            conn,
+            &[1.0, 0.0],
+            &SearchFilters::default(),
+            None,
+            10,
+        )
+        .expect_err("an active generation with no vec0 table built must be Building, not Ok");
+        assert!(
+            err.to_string().contains("vector_domain_state=building"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn db_vector_domain_vacuous_active_generation_with_zero_rows_returns_empty_not_error() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        let conn = storage.raw();
+        let generation_id = seed_active_generation_with_vectors(&storage, 2, &[]);
+        assert_eq!(
+            crate::storage::schema::active_generation_id(conn).unwrap(),
+            Some(generation_id)
+        );
+
+        let (results, retry) = SearchClient::search_db_vector_domain(
+            conn,
+            &[1.0, 0.0],
+            &SearchFilters::default(),
+            None,
+            10,
+        )
+        .expect("a genuinely empty archive must be Ok, not an error (w3-d7①)");
+        assert!(results.is_empty());
+        assert!(!retry.has_more_candidates);
+    }
+
+    /// vec0-path counterpart to the retired `semantic_filter_applies_all_
+    /// constraints` (fsvi's doc_id-decode filter unit test): asserts the
+    /// SQL WHERE construction itself is correct, with no database involved
+    /// -- every `SemanticFilter` dimension must show up as its own `AND`
+    /// clause with the right parameter values, and an unrestricted filter
+    /// must add none of them.
+    #[test]
+    fn build_db_vector_domain_filter_sql_applies_all_constraints() {
+        let mut filters = SearchFilters::default();
+        filters.agents.insert("codex".into());
+        filters.workspaces.insert("/ws/alpha".into());
+        filters.source_filter = SourceFilter::SourceId("remote-host".into());
+        filters.created_from = Some(1_700_000_000_000);
+        filters.created_to = Some(1_700_000_000_100);
+        let roles = HashSet::from([crate::search::vector_index::ROLE_ASSISTANT]);
+
+        let (sql, params) =
+            SearchClient::build_db_vector_domain_filter_sql(&[101, 202], &filters, Some(&roles));
+
+        assert!(sql.contains("m.id IN (?,?)"), "got: {sql}");
+        assert!(
+            sql.contains("EXISTS (SELECT 1 FROM agents a WHERE a.id = c.agent_id AND a.slug IN (?))"),
+            "got: {sql}"
+        );
+        assert!(sql.contains("COALESCE(w.path, '') IN (?)"), "got: {sql}");
+        assert!(sql.contains("m.role IN (?,?,?)"), "role filter must expand to every string variant, got: {sql}");
+        assert!(sql.contains("m.created_at >= ?") && sql.contains("m.created_at <= ?"), "got: {sql}");
+
+        let expected: Vec<ParamValue> = vec![
+            ParamValue::from(101_i64),
+            ParamValue::from(202_i64),
+            ParamValue::from("codex"),
+            ParamValue::from("/ws/alpha"),
+            ParamValue::from("remote-host"),
+            ParamValue::from("assistant"),
+            ParamValue::from("agent"),
+            ParamValue::from("reasoning"),
+            ParamValue::from(1_700_000_000_000_i64),
+            ParamValue::from(1_700_000_000_100_i64),
+        ];
+        assert_eq!(params, expected, "params must be positional-order-consistent with the built SQL");
+    }
+
+    #[test]
+    fn build_db_vector_domain_filter_sql_is_unrestricted_with_no_filters_set() {
+        let (sql, params) =
+            SearchClient::build_db_vector_domain_filter_sql(&[1], &SearchFilters::default(), None);
+        // The base FROM clause always joins agents/workspaces/sources
+        // (needed for the m.id filter itself) -- only the optional filter
+        // predicates (EXISTS/.../COALESCE(...) IN/role/date) must be absent.
+        assert!(!sql.contains("a.slug IN"));
+        assert!(!sql.contains("COALESCE(w.path"));
+        assert!(!sql.contains("m.role"));
+        assert!(!sql.contains("created_at"));
+        assert_eq!(params, vec![ParamValue::from(1_i64)], "only the candidate-id IN-clause param");
+    }
+
+    #[test]
+    fn build_db_vector_domain_filter_sql_unknown_role_code_matches_nothing() {
+        let mut filters = SearchFilters::default();
+        let unknown_role = HashSet::from([255_u8]);
+        filters.roles = None; // effective_roles passed explicitly below
+        let (sql, _params) =
+            SearchClient::build_db_vector_domain_filter_sql(&[1], &filters, Some(&unknown_role));
+        assert!(
+            sql.contains("AND 0"),
+            "an unrecognized role code must build a never-true clause, not silently drop the filter, got: {sql}"
+        );
+    }
+
+    /// Six-dimension filter-fidelity family, one shared fixture (w3-d10⑤
+    /// direction, Step1b's core new-code validation): four messages across
+    /// two agents, two workspaces, two sources, two roles, two time
+    /// buckets, so every dimension's filter has both a matching and a
+    /// non-matching candidate to discriminate against.
+    fn seed_filter_fidelity_fixture(storage: &FrankenStorage) -> i64 {
+        seed_db3_message(
+            storage,
+            &Db3SeedMessage {
+                agent_slug: "codex",
+                workspace_path: Some("/ws/alpha"),
+                source_id: "local",
+                role: "user",
+                created_at: 100,
+                message_id: 1,
+                conversation_id: 1,
+            },
+        );
+        seed_db3_message(
+            storage,
+            &Db3SeedMessage {
+                agent_slug: "claude",
+                workspace_path: Some("/ws/beta"),
+                source_id: "remote-host",
+                role: "assistant",
+                created_at: 200,
+                message_id: 2,
+                conversation_id: 2,
+            },
+        );
+        seed_db3_message(
+            storage,
+            &Db3SeedMessage {
+                agent_slug: "codex",
+                workspace_path: Some("/ws/beta"),
+                source_id: "local",
+                role: "tool",
+                created_at: 300,
+                message_id: 3,
+                conversation_id: 3,
+            },
+        );
+        seed_db3_message(
+            storage,
+            &Db3SeedMessage {
+                agent_slug: "claude",
+                workspace_path: Some("/ws/alpha"),
+                source_id: "remote-host",
+                role: "user",
+                created_at: 400,
+                message_id: 4,
+                conversation_id: 4,
+            },
+        );
+        // Four orthogonal unit-ish vectors in dim=4 so an unrestricted KNN
+        // (k covering all 4) returns every row -- filter dimensions alone
+        // decide what survives, isolating filter correctness from ranking.
+        seed_active_generation_with_vectors(
+            storage,
+            4,
+            &[
+                (1, 1, vec![1.0, 0.0, 0.0, 0.0]),
+                (2, 2, vec![0.0, 1.0, 0.0, 0.0]),
+                (3, 3, vec![0.0, 0.0, 1.0, 0.0]),
+                (4, 4, vec![0.0, 0.0, 0.0, 1.0]),
+            ],
+        )
+    }
+
+    fn db3_message_ids(storage: &FrankenStorage, filters: &SearchFilters) -> Vec<u64> {
+        let (results, _retry) = SearchClient::search_db_vector_domain(
+            storage.raw(),
+            &[0.5, 0.5, 0.5, 0.5],
+            filters,
+            None,
+            10,
+        )
+        .unwrap();
+        let mut ids: Vec<u64> = results.into_iter().map(|r| r.message_id).collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[test]
+    fn db_vector_domain_filter_fidelity_agent() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        seed_filter_fidelity_fixture(&storage);
+
+        let mut filters = SearchFilters::default();
+        filters.roles = Some(HashSet::from([
+            crate::search::vector_index::ROLE_USER,
+            crate::search::vector_index::ROLE_ASSISTANT,
+            crate::search::vector_index::ROLE_TOOL,
+        ]));
+        filters.agents.insert("codex".into());
+        assert_eq!(
+            db3_message_ids(&storage, &filters),
+            vec![1, 3],
+            "agent filter must return only codex's messages (1,3), never claude's (2,4)"
+        );
+    }
+
+    #[test]
+    fn db_vector_domain_filter_fidelity_workspace() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        seed_filter_fidelity_fixture(&storage);
+
+        let mut filters = SearchFilters::default();
+        filters.roles = Some(HashSet::from([
+            crate::search::vector_index::ROLE_USER,
+            crate::search::vector_index::ROLE_ASSISTANT,
+            crate::search::vector_index::ROLE_TOOL,
+        ]));
+        filters.workspaces.insert("/ws/alpha".into());
+        assert_eq!(db3_message_ids(&storage, &filters), vec![1, 4]);
+    }
+
+    #[test]
+    fn db_vector_domain_filter_fidelity_source() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        seed_filter_fidelity_fixture(&storage);
+
+        let mut filters = SearchFilters::default();
+        filters.roles = Some(HashSet::from([
+            crate::search::vector_index::ROLE_USER,
+            crate::search::vector_index::ROLE_ASSISTANT,
+            crate::search::vector_index::ROLE_TOOL,
+        ]));
+        filters.source_filter = SourceFilter::SourceId("remote-host".into());
+        assert_eq!(db3_message_ids(&storage, &filters), vec![2, 4]);
+    }
+
+    #[test]
+    fn db_vector_domain_filter_fidelity_role_default_user_and_assistant() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        seed_filter_fidelity_fixture(&storage);
+
+        // No explicit `filters.roles` -- exercise the default-role fallback
+        // (`default_roles` parameter), matching `search_semantic_candidates`'s
+        // "explicit filter overrides, otherwise fall back to context
+        // default" contract. Message 3 (role=tool) must be excluded by the
+        // default user+assistant semantics even though it's an unrestricted
+        // query otherwise.
+        let (results, _retry) = SearchClient::search_db_vector_domain(
+            storage.raw(),
+            &[0.5, 0.5, 0.5, 0.5],
+            &SearchFilters::default(),
+            Some(&HashSet::from([
+                crate::search::vector_index::ROLE_USER,
+                crate::search::vector_index::ROLE_ASSISTANT,
+            ])),
+            10,
+        )
+        .unwrap();
+        let mut ids: Vec<u64> = results.into_iter().map(|r| r.message_id).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![1, 2, 4],
+            "default user+assistant role semantics must exclude message 3 (role=tool)"
+        );
+    }
+
+    #[test]
+    fn db_vector_domain_filter_fidelity_role_explicit_overrides_default() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        seed_filter_fidelity_fixture(&storage);
+
+        // Explicit `filters.roles` (tool only) must override the default
+        // user+assistant semantics, not intersect with it.
+        let mut filters = SearchFilters::default();
+        filters.roles = Some(HashSet::from([crate::search::vector_index::ROLE_TOOL]));
+        let (results, _retry) = SearchClient::search_db_vector_domain(
+            storage.raw(),
+            &[0.5, 0.5, 0.5, 0.5],
+            &filters,
+            Some(&HashSet::from([
+                crate::search::vector_index::ROLE_USER,
+                crate::search::vector_index::ROLE_ASSISTANT,
+            ])),
+            10,
+        )
+        .unwrap();
+        let ids: Vec<u64> = results.into_iter().map(|r| r.message_id).collect();
+        assert_eq!(ids, vec![3], "explicit role filter must override, not intersect with, the default");
+    }
+
+    #[test]
+    fn db_vector_domain_filter_fidelity_date_range() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        seed_filter_fidelity_fixture(&storage);
+
+        let mut filters = SearchFilters::default();
+        filters.roles = Some(HashSet::from([
+            crate::search::vector_index::ROLE_USER,
+            crate::search::vector_index::ROLE_ASSISTANT,
+            crate::search::vector_index::ROLE_TOOL,
+        ]));
+        filters.created_from = Some(150);
+        filters.created_to = Some(350);
+        assert_eq!(db3_message_ids(&storage, &filters), vec![2, 3]);
+    }
+
+    #[test]
+    fn db_vector_domain_filter_fidelity_combined() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        seed_filter_fidelity_fixture(&storage);
+
+        // agent=codex AND workspace=/ws/beta -- only message 3 satisfies
+        // both simultaneously (message 1 is codex but /ws/alpha; message 4
+        // is /ws/beta... no wait /ws/alpha; no other codex+beta candidate).
+        let mut filters = SearchFilters::default();
+        filters.roles = Some(HashSet::from([
+            crate::search::vector_index::ROLE_USER,
+            crate::search::vector_index::ROLE_ASSISTANT,
+            crate::search::vector_index::ROLE_TOOL,
+        ]));
+        filters.agents.insert("codex".into());
+        filters.workspaces.insert("/ws/beta".into());
+        assert_eq!(
+            db3_message_ids(&storage, &filters),
+            vec![3],
+            "combined agent+workspace filter must AND, not OR, the two dimensions"
+        );
+    }
+
+    /// R4-B4 (spec §3.1, this task's verification centerpiece): a reader
+    /// that opened its transaction (and therefore its read snapshot) BEFORE
+    /// another connection switches the active generation must see the
+    /// state that was active when its snapshot was taken -- entirely the
+    /// old generation or entirely the new one, never a mix, and never a
+    /// crash from the old generation's vec0 table disappearing mid-read.
+    #[test]
+    fn db_vector_domain_search_reader_sees_a_consistent_snapshot_across_a_concurrent_generation_switch() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        seed_db3_message(
+            &storage,
+            &Db3SeedMessage {
+                agent_slug: "codex",
+                workspace_path: None,
+                source_id: "local",
+                role: "user",
+                created_at: 100,
+                message_id: 1,
+                conversation_id: 1,
+            },
+        );
+        let gen_a = seed_active_generation_with_vectors(
+            &storage,
+            2,
+            &[(1, 1, vec![1.0, 0.0])],
+        );
+
+        // A second connection to the same file builds and activates
+        // generation B -- but does NOT drop generation A's vec0 table (W3-4's
+        // delayed-cleanup job, out of scope here); this test's job is only
+        // to prove the reader's snapshot is internally consistent, not to
+        // exercise cleanup.
+        let storage_b = FrankenStorage::open(&db_path).unwrap();
+        let conn_b = storage_b.raw();
+        let gen_b = conn_b
+            .with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
+                let gen_id = crate::storage::schema::create_embedding_generation(tx, "bge-m3", 2, 1, 3_000)?;
+                crate::storage::schema::insert_message_embedding(
+                    tx, gen_id, 1, 1, &[0.0, 1.0], "h2", None, 3_000,
+                )?;
+                Ok(gen_id)
+            })
+            .unwrap();
+
+        // Reader's turn: run the actual search on generation A twice,
+        // switching B active in between -- each call is its own read
+        // transaction (this function doesn't hold one open across calls),
+        // so this proves "read the active pointer and its vectors from one
+        // consistent snapshot per call", the unit R4-B4 actually asks for.
+        let (before, _) = SearchClient::search_db_vector_domain(
+            storage.raw(),
+            &[1.0, 0.0],
+            &SearchFilters::default(),
+            None,
+            10,
+        )
+        .unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].message_id, 1);
+        // Before the switch, generation A is active -- score must reflect
+        // A's vector (1.0,0.0), an exact match against the query (score ~1.0),
+        // not B's (0.0,1.0) (which would score ~0.0 for this query).
+        assert!(before[0].score > 0.9, "expected generation A's near-exact match, got score={}", before[0].score);
+
+        crate::storage::schema::switch_active_generation(conn_b, gen_b, 4_000, |_tx| Ok(())).unwrap();
+        crate::storage::vector_domain::rebuild_vec0_table_for_generation(conn_b, gen_b, 2).unwrap();
+
+        let (after, _) = SearchClient::search_db_vector_domain(
+            storage.raw(),
+            &[1.0, 0.0],
+            &SearchFilters::default(),
+            None,
+            10,
+        )
+        .unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].message_id, 1);
+        assert!(
+            after[0].score < 0.5,
+            "expected generation B's near-orthogonal match after the switch (score ~0.0), got score={} \
+             (a stale read would still show A's near-exact ~1.0 -- this is the mixed-read failure mode \
+             R4-B4 exists to prevent)",
+            after[0].score
+        );
+        assert_ne!(gen_a, gen_b);
     }
 }
