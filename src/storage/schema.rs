@@ -830,6 +830,64 @@ pub fn switch_active_generation(
     })
 }
 
+/// R1-W3-B2: cheap in-transaction re-verification of the two invariants a
+/// concurrent writer could have invalidated between the full activation
+/// audit (necessarily out-of-transaction -- an expensive multi-query audit
+/// must not hold a write lock open for its whole duration) reading them
+/// and this transaction's pointer flip. Not a second full audit: just the
+/// O(1) recheck that is actually worth the write-lock hold time.
+///
+/// Meant to be called as (or from) [`switch_active_generation`]'s `verify`
+/// closure, with `pre_audit_watermark_message_id` set to `SELECT
+/// COALESCE(MAX(id), 0) FROM messages` read *before* the full audit ran.
+/// An `Err` here aborts the whole switch transaction -- the pointer flip
+/// and the `audit_status='passed'` write the caller's closure typically
+/// makes alongside this call never happen -- so the caller's next call
+/// re-scans and re-audits `new_generation_id` from scratch; no
+/// partial/stale promotion is ever committed.
+///
+/// Two invariants, both cheap:
+/// - `embedding_holes` for `new_generation_id` must still be empty (a
+///   fresh `COUNT`, not the audit's now-stale read).
+/// - `messages`' high-water mark must not have grown since the audit
+///   started. Growth means a message landed while this candidate
+///   generation was not yet active -- ingest-time hooks only register a
+///   hole against the *currently active* generation, so this candidate
+///   would never have gotten a hole for it and would otherwise be
+///   promoted still silently missing that message.
+pub fn verify_no_activation_toctou_drift_in_tx(
+    tx: &Tx,
+    generation_id: i64,
+    pre_audit_watermark_message_id: i64,
+) -> Result<(), StorageError> {
+    let holes_now: i64 = tx.query_row_map(
+        "SELECT COUNT(*) FROM embedding_holes WHERE generation_id = ?1",
+        &params![generation_id],
+        |row| row.get_typed(0),
+    )?;
+    if holes_now != 0 {
+        return Err(StorageError::Constraint {
+            detail: format!(
+                "generation {generation_id} gained {holes_now} embedding_holes row(s) between \
+                 the activation audit and this switch transaction; refusing to activate \
+                 (TOCTOU guard, R1-W3-B2)"
+            ),
+        });
+    }
+    let watermark_now: i64 =
+        tx.query_row_map("SELECT COALESCE(MAX(id), 0) FROM messages", &[], |row| row.get_typed(0))?;
+    if watermark_now != pre_audit_watermark_message_id {
+        return Err(StorageError::Constraint {
+            detail: format!(
+                "messages high-water mark drifted from {pre_audit_watermark_message_id} to \
+                 {watermark_now} between the activation audit and this switch transaction; \
+                 refusing to activate generation {generation_id} (TOCTOU guard, R1-W3-B2)"
+            ),
+        });
+    }
+    Ok(())
+}
+
 // -------------------------------------------------------------------------
 // w3-3 Step 3 (spec 门③, R2-W3-B4): same-transaction lifecycle invalidation
 // primitives. `ON DELETE CASCADE` on `message_embeddings.doc_id` and

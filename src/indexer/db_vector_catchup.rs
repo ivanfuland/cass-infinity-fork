@@ -382,13 +382,31 @@ pub fn run_db_vector_catchup_backfill(
 
     // W3-4 Step1 (task book #62): the full six-invariant activation audit
     // replaces the old minimal "embedded_count > 0" verify closure here.
-    // Checks run read-only first (this single-worker flow has nothing
-    // else writing to `generation_id` between here and the switch below),
-    // then the verdict is written atomically with the pointer flip inside
-    // `switch_active_generation`'s own transaction -- "全过才许切", and a
-    // failure aborts before `switch_active_generation` is even called, so
-    // the pointer is provably untouched (spec §3.1's atomicity contract,
-    // reused rather than re-implemented).
+    // Checks run read-only first (a fresh watertight snapshot is what the
+    // audit itself validates), then the verdict is written atomically with
+    // the pointer flip inside `switch_active_generation`'s own transaction
+    // -- "全过才许切", and a failure aborts before `switch_active_
+    // generation` is even called, so the pointer is provably untouched
+    // (spec §3.1's atomicity contract, reused rather than re-implemented).
+    //
+    // R1-W3-B2: the full audit runs *outside* a transaction (an expensive
+    // multi-query audit must not hold a write lock open for its whole
+    // duration) -- exec55's single-writer assumption for this flow does
+    // not hold in general (a concurrent index/watch/restore connection can
+    // land a new message while this audit is running), so a TOCTOU window
+    // exists between "audit read holes==0 and verified everything" and
+    // "the switch transaction below actually flips the pointer". A message
+    // landing in that window registers no hole against this candidate
+    // generation (ingest-time hooks only touch the *currently active*
+    // generation, and this one isn't active yet), so the candidate would
+    // still show holes==0 and would still get promoted -- silently missing
+    // that message forever. `pre_audit_watermark_message_id` plus the
+    // cheap in-tx recheck below close that window without paying for a
+    // second full audit.
+    let pre_audit_watermark_message_id: i64 = storage
+        .raw()
+        .query_row_map("SELECT COALESCE(MAX(id), 0) FROM messages", &[], |row| row.get_typed(0))
+        .context("reading pre-audit messages high-water mark")?;
     let mut activated = false;
     if holes_after == 0 {
         let audit_report = run_activation_audit(storage, generation_id, ACTIVATION_AUDIT_DEFAULT_FINITE_NORM_SAMPLE_SIZE, None)
@@ -400,6 +418,16 @@ pub fn run_db_vector_catchup_backfill(
             );
         }
         schema::switch_active_generation(storage.raw(), generation_id, FrankenStorage::now_millis(), |tx| {
+            // R1-W3-B2: cheap in-transaction re-verification of the two
+            // invariants a concurrent writer could have invalidated since
+            // the full audit above read them -- see
+            // `verify_no_activation_toctou_drift_in_tx`'s doc comment.
+            // Either violation aborts the whole transaction (the pointer
+            // flip and the `audit_status='passed'` write below never
+            // happen); the caller's *next* call re-scans and re-audits
+            // from scratch, so no partial/stale promotion is ever
+            // committed.
+            schema::verify_no_activation_toctou_drift_in_tx(tx, generation_id, pre_audit_watermark_message_id)?;
             tx.execute(
                 "UPDATE embedding_generations SET audit_status = 'passed' WHERE id = ?1",
                 &params![generation_id],
