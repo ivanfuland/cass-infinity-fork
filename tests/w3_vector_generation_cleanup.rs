@@ -1,3 +1,13 @@
+// W3-5 ⑤ (task book #66): `indexer::db_vector_catchup` (the module this file
+// tests) is itself `#[cfg(feature = "infinity")]`-gated (src/indexer/mod.rs).
+// This integration test unconditionally imported from it (a pre-existing gap
+// left by W3-4/exec55, first flagged by exec56 -- see
+// W3_ARTIFACTS/w3-5-exec56-handoff.md §2), which broke
+// `cargo check --all-targets` under the baseline feature combo (no
+// `infinity`, no `semantic`). Whole-file gate: the module, and therefore
+// this test's entire premise, does not exist outside the `infinity` build.
+#![cfg(feature = "infinity")]
+
 //! W3-4 Step3 (task book #62): delayed cleanup of orphaned (non-active)
 //! embedding generations, plus the R4-B5 concurrency proof the task book
 //! calls for: "搜索停在读指针 × 并发清理" -- a reader that already opened a

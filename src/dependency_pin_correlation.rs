@@ -325,7 +325,9 @@ mod tests {
         assert_eq!(value["pin_state"], "stale");
         assert_eq!(value["observed_local_rev"], "0000abc");
         assert_eq!(value["upstream_fix_possibly_missing"], false);
-        assert!(value["known_issue_ids"].as_array().unwrap().is_empty());
+        // `known_issue_ids` has `skip_serializing_if = "Vec::is_empty"`, so an
+        // empty catalog match omits the key entirely rather than serializing `[]`.
+        assert!(value.get("known_issue_ids").is_none());
         let back: PinAssessment = serde_json::from_value(value).unwrap();
         assert_eq!(back, a);
     }
