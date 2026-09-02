@@ -99,6 +99,11 @@ fastembed = { version = "5.13.4", default-features = false, features = ["ort-dow
 # wave-3 W3-2's migrator still reads .fsvi via frankensearch (R2-X2 ordering
 # constraint), and hash is the always-on fallback embedder path.
 frankensearch = { version = "0.3.2", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "2cad158f4468ece7076e3fe529c8e5c20b2e020e", default-features = false, features = ["hash", "ann"] }
+# w3 Task W3-3 (spec 3.4 D4, KU2 basis: probe/sqlite-vec-eval @969c29b9, real
+# 101.6万x1024 bge-m3 corpus) -- vec0 KNN over message_embeddings. Pinned to
+# the last stable release, not the newest crates.io publish: v0.1.10-alpha.4
+# ships a broken tarball missing sqlite-vec-diskann.c and fails to compile.
+sqlite-vec = "=0.1.9"
 franken-agent-detection = { version = "0.1.9", git = "https://github.com/ivanfuland/my_franken_agent_detection", rev = "6be142d9e6ccb1c9a1dc27a986f6e30ed151d71a", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "hermes"] }
 wide = "1.4.0"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "0.7.6"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization

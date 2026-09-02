@@ -3,3 +3,4 @@ pub mod api;
 pub mod schema;
 pub mod sqlite;
 pub mod testing;
+pub mod vector_domain;
