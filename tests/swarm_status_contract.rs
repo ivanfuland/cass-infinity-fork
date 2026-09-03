@@ -1199,7 +1199,7 @@ fn swarm_work_packet_collision_simulation_classifies_assignment_risks() -> Resul
                 collision_simulation_bead(
                     "cass-sibling",
                     "Sibling dependency contract",
-                    ["Cargo.toml", "../frankensearch/src/lib.rs"],
+                    ["Cargo.toml", "../asupersync/src/lib.rs"],
                     []
                 ),
                 collision_simulation_bead(
@@ -2381,11 +2381,11 @@ fn swarm_dependency_drift_cli_flags_pin_dirty_missing_and_network_risks()
                         "sibling_status": "dirty"
                     },
                     {
-                        "name": "frankensearch",
-                        "package": "frankensearch",
-                        "manifest_key": "frankensearch",
+                        "name": "fixture-dep",
+                        "package": "fixture-dep",
+                        "manifest_key": "fixture-dep",
                         "source_kind": "git",
-                        "git": "https://github.com/thisismypassport/frankensearch",
+                        "git": "https://github.com/thisismypassport/fixture-dep",
                         "pinned_rev": "1111111",
                         "local_head": "2222222",
                         "dirty": false,

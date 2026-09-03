@@ -77,15 +77,6 @@ const DEPENDENCY_SPECS: &[DependencySpec] = &[
         required_tests: &[STRICT_CHECK_COMMAND, FULL_CHECK_COMMAND],
     },
     DependencySpec {
-        name: "frankensearch",
-        package: "frankensearch",
-        manifest_table: "dependencies",
-        manifest_key: "frankensearch",
-        source_kind: "git",
-        repo_rel: "../frankensearch",
-        required_tests: &[STRICT_CHECK_COMMAND, FULL_CHECK_COMMAND],
-    },
-    DependencySpec {
         name: "ftui",
         package: "ftui",
         manifest_table: "dependencies",
@@ -874,7 +865,7 @@ mod tests {
             "dependency drift live mode must see Cargo.toml dependency pins",
         )?;
         ensure(
-            dependencies.contains_key("frankensearch"),
+            dependencies.contains_key("franken-agent-detection"),
             "dependency drift live mode must see git dependency pins",
         )
     }

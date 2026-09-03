@@ -34,6 +34,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::storage::sqlite::SourceContentGenerationVerdict;
 
+use super::canonicalize::CANONICALIZE_PIPELINE_VERSION;
 use super::policy::{
     CHUNKING_STRATEGY_VERSION, InvalidationAction, SEMANTIC_SCHEMA_VERSION,
     SemanticAssetManifest as PolicyManifest, SemanticPolicy,
@@ -154,6 +155,18 @@ pub struct ArtifactRecord {
     pub schema_version: u32,
     /// Chunking strategy version at build time.
     pub chunking_version: u32,
+    /// [`CANONICALIZE_PIPELINE_VERSION`] fingerprint at build time.
+    ///
+    /// `None` means this record predates the fingerprint (wave-3 W3-0
+    /// introduction) or was adopted from a legacy artifact whose
+    /// canonicalizer generation was never attested — see `R1-W3-N1`.
+    /// [`ArtifactRecord::readiness`] treats a missing or mismatched
+    /// fingerprint as generation-activation failure by default; only a
+    /// caller that performed the source-diff attestation may stamp the
+    /// accepted version explicitly. `#[serde(default)]` keeps pre-fingerprint
+    /// manifests on disk loading cleanly as `None` rather than failing parse.
+    #[serde(default)]
+    pub canonicalize_version: Option<u32>,
     /// Output dimension of the embedder.
     pub dimension: usize,
     /// Number of documents (message chunks) embedded.
@@ -202,6 +215,20 @@ impl ArtifactRecord {
         current_db_fingerprint: &str,
         current_model_revision: &str,
     ) -> TierReadiness {
+        // Generation-activation audit (W3-0 Step 1, R1-W3-N1): a missing or
+        // mismatched canonicalizer fingerprint fails closed. This check runs
+        // before schema/chunking/embedder checks because a canonicalizer
+        // mismatch invalidates the very content_hash keys those checks
+        // otherwise trust for reuse.
+        if self.canonicalize_version != Some(CANONICALIZE_PIPELINE_VERSION) {
+            return TierReadiness::Incompatible {
+                reason: format!(
+                    "canonicalizer version fingerprint missing or mismatched (found {:?}, expected {CANONICALIZE_PIPELINE_VERSION})",
+                    self.canonicalize_version
+                ),
+            };
+        }
+
         let action = self.to_policy_manifest().invalidation_action(
             policy,
             current_model_revision,
@@ -275,6 +302,11 @@ pub struct SemanticShardRecord {
     pub schema_version: u32,
     /// Chunking strategy version at build time.
     pub chunking_version: u32,
+    /// [`CANONICALIZE_PIPELINE_VERSION`] fingerprint at build time. See
+    /// [`ArtifactRecord::canonicalize_version`] for the disposition of
+    /// `None` (pre-fingerprint / unattested legacy shard).
+    #[serde(default)]
+    pub canonicalize_version: Option<u32>,
     /// Output dimension of the embedder.
     pub dimension: usize,
     /// Zero-based shard number within the generation.
@@ -566,6 +598,7 @@ impl SemanticShardManifest {
             }
             if shard.schema_version != SEMANTIC_SCHEMA_VERSION
                 || shard.chunking_version != CHUNKING_STRATEGY_VERSION
+                || shard.canonicalize_version != Some(CANONICALIZE_PIPELINE_VERSION)
                 || shard.dimension == 0
             {
                 generation_consistent = false;
@@ -1087,6 +1120,11 @@ impl SemanticManifest {
             model_revision: model_revision.to_owned(),
             schema_version: SEMANTIC_SCHEMA_VERSION,
             chunking_version: CHUNKING_STRATEGY_VERSION,
+            // Legacy adoption predates the canonicalizer fingerprint and has
+            // not gone through the R1-W3-N1 source-diff attestation here —
+            // `None` correctly fails the generation-activation audit closed
+            // until a caller with an attestation result stamps a real value.
+            canonicalize_version: None,
             dimension,
             doc_count,
             conversation_count,
@@ -1397,6 +1435,7 @@ mod tests {
             model_revision: "abc123".to_owned(),
             schema_version: SEMANTIC_SCHEMA_VERSION,
             chunking_version: CHUNKING_STRATEGY_VERSION,
+            canonicalize_version: Some(CANONICALIZE_PIPELINE_VERSION),
             dimension: 384,
             doc_count: 1000,
             conversation_count: 250,
@@ -1434,6 +1473,7 @@ mod tests {
             model_revision: "hash".to_owned(),
             schema_version: SEMANTIC_SCHEMA_VERSION,
             chunking_version: CHUNKING_STRATEGY_VERSION,
+            canonicalize_version: Some(CANONICALIZE_PIPELINE_VERSION),
             dimension: 384,
             shard_index,
             shard_count,
@@ -1493,6 +1533,14 @@ mod tests {
 
     fn set_schema_version_to_zero(artifact: &mut ArtifactRecord) {
         artifact.schema_version = 0;
+    }
+
+    fn clear_canonicalize_version(artifact: &mut ArtifactRecord) {
+        artifact.canonicalize_version = None;
+    }
+
+    fn set_canonicalize_version_mismatch(artifact: &mut ArtifactRecord) {
+        artifact.canonicalize_version = Some(CANONICALIZE_PIPELINE_VERSION + 1);
     }
 
     fn assert_tier_readiness(actual: TierReadiness, expected: ExpectedTierReadiness, label: &str) {
@@ -1744,6 +1792,24 @@ mod tests {
                 db_fp,
                 model_rev,
                 set_schema_version_to_zero,
+                ExpectedTierReadiness::Incompatible,
+            ),
+            (
+                "canonicalizer fingerprint absent (legacy, unattested — R1-W3-N1)",
+                TierKind::Quality,
+                true,
+                db_fp,
+                model_rev,
+                clear_canonicalize_version,
+                ExpectedTierReadiness::Incompatible,
+            ),
+            (
+                "canonicalizer fingerprint mismatched",
+                TierKind::Quality,
+                true,
+                db_fp,
+                model_rev,
+                set_canonicalize_version_mismatch,
                 ExpectedTierReadiness::Incompatible,
             ),
             (
@@ -2331,6 +2397,48 @@ mod tests {
         assert!(
             !stale_schema_summary.complete,
             "stale schema shards must not summarize as complete"
+        );
+    }
+
+    #[test]
+    fn shard_summary_rejects_missing_canonicalize_fingerprint() {
+        // R1-W3-N1 generation-activation audit, shard-level surface: a shard
+        // with no canonicalizer fingerprint (legacy/unattested) must not let
+        // the generation summarize as complete, mirroring the tier-level
+        // `stale_schema_summary` case above.
+        let mut shards = SemanticShardManifest::default();
+        let mut missing_fingerprint = test_shard(0, 1, true);
+        missing_fingerprint.canonicalize_version = None;
+        shards.replace_shards_for_generation(
+            TierKind::Fast,
+            "fnv1a-384",
+            "fp-sharded",
+            vec![missing_fingerprint],
+        );
+        let summary = shards.summary(TierKind::Fast, "fnv1a-384", "fp-sharded");
+        assert_eq!(summary.shard_count, 1);
+        assert_eq!(summary.ready_shards, 1);
+        assert!(
+            !summary.complete,
+            "shards missing the canonicalizer fingerprint must not summarize as complete"
+        );
+    }
+
+    #[test]
+    fn shard_summary_rejects_mismatched_canonicalize_fingerprint() {
+        let mut shards = SemanticShardManifest::default();
+        let mut mismatched = test_shard(0, 1, true);
+        mismatched.canonicalize_version = Some(CANONICALIZE_PIPELINE_VERSION + 1);
+        shards.replace_shards_for_generation(
+            TierKind::Fast,
+            "fnv1a-384",
+            "fp-sharded",
+            vec![mismatched],
+        );
+        let summary = shards.summary(TierKind::Fast, "fnv1a-384", "fp-sharded");
+        assert!(
+            !summary.complete,
+            "shards with a mismatched canonicalizer fingerprint must not summarize as complete"
         );
     }
 

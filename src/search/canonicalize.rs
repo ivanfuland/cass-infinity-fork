@@ -16,8 +16,425 @@
 //! let hash = content_hash(&canonical);
 //! ```
 
-use frankensearch::{Canonicalizer, DefaultCanonicalizer};
 use ring::digest::{self, SHA256};
+use unicode_normalization::UnicodeNormalization;
+
+// ============================================================================
+// W3-5 verbatim restore of `frankensearch-core/src/canonicalize.rs`
+// (git rev `2cad158f4468ece7076e3fe529c8e5c20b2e020e`,
+// <https://github.com/Dicklesworthstone/frankensearch>), now that the
+// `frankensearch` Cargo dependency itself is retired. **Canonicalize
+// equivalence is load-bearing**: `content_hash` reuse across embedding
+// generations assumes byte-identical canonicalization output for the same
+// input, so `Canonicalizer`/`DefaultCanonicalizer` below are copied
+// byte-for-byte from upstream -- zero behavior change,
+// `CANONICALIZE_PIPELINE_VERSION` is NOT bumped for this move. The existing
+// `content_hash`/`canonicalize_for_embedding` tests further down this file
+// pass unchanged against this restored implementation, and
+// `canonicalize_restore_pins_fixed_sample_hashes` below pins fixed-sample
+// content hashes as a regression nail against future silent drift.
+// ============================================================================
+
+/// Low-signal content to filter out (exact matches, case-insensitive).
+///
+/// When the entire canonicalized text matches one of these patterns,
+/// the result is an empty string (the message carries no semantic value).
+const FS_LOW_SIGNAL_CONTENT: &[&str] = &[
+    "ok",
+    "done",
+    "done.",
+    "got it",
+    "got it.",
+    "understood",
+    "understood.",
+    "sure",
+    "sure.",
+    "yes",
+    "no",
+    "thanks",
+    "thanks.",
+    "thank you",
+    "thank you.",
+];
+
+/// Trait for text preprocessing before embedding.
+///
+/// Custom implementations can add domain-specific preprocessing
+/// (e.g., abbreviation expansion, jargon normalization).
+pub trait Canonicalizer: Send + Sync {
+    /// Preprocess document text for embedding.
+    fn canonicalize(&self, text: &str) -> String;
+
+    /// Preprocess a search query.
+    ///
+    /// Typically simpler than document canonicalization since queries
+    /// are short and don't contain markdown or code blocks.
+    fn canonicalize_query(&self, query: &str) -> String;
+}
+
+/// Default canonicalization pipeline.
+///
+/// Applies NFC normalization, markdown stripping, code block collapsing,
+/// whitespace normalization, low-signal filtering, and length truncation.
+pub struct DefaultCanonicalizer {
+    /// Maximum characters for canonicalized text. Default: 2000.
+    pub max_length: usize,
+    /// Maximum lines to keep from the start of a fenced code block. Default: 20.
+    pub code_head_lines: usize,
+    /// Maximum lines to keep from the end of a fenced code block. Default: 10.
+    pub code_tail_lines: usize,
+}
+
+impl Default for DefaultCanonicalizer {
+    fn default() -> Self {
+        Self {
+            max_length: 2000,
+            code_head_lines: 20,
+            code_tail_lines: 10,
+        }
+    }
+}
+
+impl Canonicalizer for DefaultCanonicalizer {
+    fn canonicalize(&self, text: &str) -> String {
+        // 1. NFC Unicode normalization (critical for hash stability)
+        let normalized: String = text.nfc().collect();
+        // 2. Strip markdown and collapse code blocks
+        let stripped = self.strip_markdown_and_code(&normalized);
+        // 3. Normalize whitespace
+        let ws_normalized = fs_normalize_whitespace(&stripped);
+        // 4. Filter low-signal content
+        let filtered = fs_filter_low_signal(&ws_normalized);
+        // 5. Truncate to max length
+        fs_truncate_to_chars(&filtered, self.max_length)
+    }
+
+    fn canonicalize_query(&self, query: &str) -> String {
+        // Queries are short — just NFC normalize and trim
+        let normalized: String = query.nfc().collect();
+        let trimmed = normalized.trim();
+        fs_truncate_to_chars(trimmed, self.max_length)
+    }
+}
+
+impl DefaultCanonicalizer {
+    /// Strip markdown formatting and collapse code blocks.
+    fn strip_markdown_and_code(&self, text: &str) -> String {
+        let mut result = String::with_capacity(text.len());
+        let mut in_code_block = false;
+        let mut code_block_lang = String::new();
+        let mut code_lines: Vec<&str> = Vec::new();
+
+        for line in text.lines() {
+            if line.starts_with("```") {
+                if in_code_block {
+                    // End of code block — collapse it
+                    result.push_str(&fs_collapse_code_block(
+                        &code_block_lang,
+                        &code_lines,
+                        self.code_head_lines,
+                        self.code_tail_lines,
+                    ));
+                    result.push('\n');
+                    code_lines.clear();
+                    code_block_lang.clear();
+                    in_code_block = false;
+                } else {
+                    // Start of code block
+                    in_code_block = true;
+                    code_block_lang = line.trim_start_matches('`').trim().to_string();
+                }
+            } else if in_code_block {
+                code_lines.push(line);
+            } else {
+                // Strip markdown from regular text
+                let stripped = fs_strip_markdown_line(line);
+                if !stripped.is_empty() {
+                    result.push_str(&stripped);
+                    result.push('\n');
+                }
+            }
+        }
+
+        // Handle unclosed code block
+        if in_code_block && !code_lines.is_empty() {
+            result.push_str(&fs_collapse_code_block(
+                &code_block_lang,
+                &code_lines,
+                self.code_head_lines,
+                self.code_tail_lines,
+            ));
+            result.push('\n');
+        }
+
+        result
+    }
+}
+
+/// Collapse a code block to first N + last M lines.
+fn fs_collapse_code_block(lang: &str, lines: &[&str], head: usize, tail: usize) -> String {
+    let lang_label = if lang.is_empty() {
+        "code".to_string()
+    } else {
+        format!("code: {lang}")
+    };
+
+    if lines.len() <= head + tail {
+        // Short enough to keep in full
+        format!("[{lang_label}]\n{}", lines.join("\n"))
+    } else {
+        // Collapse middle
+        let head_part: Vec<_> = lines.iter().take(head).copied().collect();
+        let tail_part: Vec<_> = lines.iter().skip(lines.len() - tail).copied().collect();
+        let omitted = lines.len() - head - tail;
+        format!(
+            "[{lang_label}]\n{}\n[... {omitted} lines omitted ...]\n{}",
+            head_part.join("\n"),
+            tail_part.join("\n")
+        )
+    }
+}
+
+/// Strip markdown formatting from a single line.
+fn fs_strip_markdown_line(line: &str) -> String {
+    let mut result = line.to_string();
+
+    // Remove bold/italic markers
+    result = result.replace("**", "");
+    result = result.replace("__", "");
+    result = result.replace('*', "");
+    result = fs_strip_italic_underscores(&result);
+
+    // Remove inline code backticks
+    result = result.replace('`', "");
+
+    // Convert links [text](url) to just text
+    result = fs_strip_markdown_links(&result);
+
+    // Remove headers (# prefix)
+    result = result.trim_start_matches('#').trim_start().to_string();
+
+    // Remove blockquote prefix
+    result = result.trim_start_matches('>').trim_start().to_string();
+
+    // Remove list markers
+    result = fs_strip_list_marker(&result);
+
+    result
+}
+
+/// Strip italic underscore markers (`_word_`) while preserving underscores inside
+/// identifiers (`snake_case`). An underscore is treated as an italic marker only
+/// when it lies on a word boundary: no adjacent alphanumeric or underscore on
+/// the side facing away from the emphasized span.
+fn fs_strip_italic_underscores(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let mut keep = vec![true; n];
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+
+    for i in 0..n {
+        if chars[i] != '_' {
+            continue;
+        }
+        let prev_is_word = i > 0 && is_word(chars[i - 1]) && chars[i - 1] != '_';
+        let next_is_word = i + 1 < n && is_word(chars[i + 1]) && chars[i + 1] != '_';
+        // Opening marker: preceded by non-word (or BOL), followed by word
+        // Closing marker: preceded by word, followed by non-word (or EOL)
+        if (!prev_is_word && next_is_word) || (prev_is_word && !next_is_word) {
+            keep[i] = false;
+        }
+    }
+
+    chars
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(c, k)| if k { Some(c) } else { None })
+        .collect()
+}
+
+/// Strip markdown links: `[text](url)` → `text`.
+fn fs_strip_markdown_links(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '[' {
+            // Potential link start
+            let mut link_text = String::new();
+            let mut found_close = false;
+            let mut bracket_depth = 1;
+
+            for inner in chars.by_ref() {
+                if inner == '[' {
+                    bracket_depth += 1;
+                } else if inner == ']' {
+                    bracket_depth -= 1;
+                    if bracket_depth == 0 {
+                        found_close = true;
+                        break;
+                    }
+                }
+                link_text.push(inner);
+            }
+
+            if found_close && chars.peek() == Some(&'(') {
+                // Potential URL start
+                chars.next(); // consume '('
+                let mut url_part = String::from("(");
+                let mut depth = 1;
+                let mut valid_link = false;
+
+                for inner in chars.by_ref() {
+                    url_part.push(inner);
+                    match inner {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                valid_link = true;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                if valid_link {
+                    // Valid link: [text](url) -> text
+                    result.push_str(&link_text);
+                } else {
+                    // Unbalanced parens or EOF: restore everything
+                    result.push('[');
+                    result.push_str(&link_text);
+                    result.push(']');
+                    result.push_str(&url_part);
+                }
+            } else {
+                // Not a proper link (no '(' after ']'), keep original
+                result.push('[');
+                result.push_str(&link_text);
+                if found_close {
+                    result.push(']');
+                }
+            }
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
+}
+
+/// Strip markdown list markers from the start of a line.
+///
+/// Strips unordered (`- `, `+ `) and ordered (`1. `, `10. `) markers.
+/// Does NOT strip arbitrary numbers (`3.14159` stays intact).
+fn fs_strip_list_marker(line: &str) -> String {
+    let trimmed = line.trim_start();
+
+    // Check for unordered list markers: "- " or "+ "
+    if let Some(rest) = trimmed.strip_prefix("- ") {
+        return rest.to_string();
+    }
+    if let Some(rest) = trimmed.strip_prefix("+ ") {
+        return rest.to_string();
+    }
+
+    // Check for ordered list markers: digits followed by ". "
+    let mut chars = trimmed.chars().peekable();
+    let mut digit_count = 0;
+
+    while let Some(&c) = chars.peek() {
+        if c.is_ascii_digit() {
+            digit_count += 1;
+            chars.next();
+        } else {
+            break;
+        }
+    }
+
+    // Must have at least one digit, followed by ". " (dot then space)
+    if digit_count > 0 && chars.next() == Some('.') && chars.peek() == Some(&' ') {
+        chars.next(); // consume the space
+        return chars.collect();
+    }
+
+    // Not a list marker, return original
+    line.to_string()
+}
+
+/// Normalize whitespace: collapse runs to single space, trim.
+fn fs_normalize_whitespace(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut prev_whitespace = true; // Start as true to trim leading
+
+    for c in text.chars() {
+        if c.is_whitespace() {
+            if !prev_whitespace {
+                result.push(' ');
+                prev_whitespace = true;
+            }
+        } else {
+            result.push(c);
+            prev_whitespace = false;
+        }
+    }
+
+    // Trim trailing whitespace
+    result.trim_end().to_string()
+}
+
+/// Filter out low-signal content.
+///
+/// If the entire text (after trimming and lowercasing) matches a known
+/// low-signal pattern, returns empty string.
+fn fs_filter_low_signal(text: &str) -> String {
+    let trimmed = text.trim();
+    let lower = trimmed.to_lowercase();
+
+    for pattern in FS_LOW_SIGNAL_CONTENT {
+        if lower == *pattern {
+            return String::new();
+        }
+    }
+
+    text.to_string()
+}
+
+/// Truncate string to at most N characters, respecting char boundaries.
+fn fs_truncate_to_chars(text: &str, max_chars: usize) -> String {
+    for (count, (idx, _)) in text.char_indices().enumerate() {
+        if count == max_chars {
+            return text[..idx].to_owned();
+        }
+    }
+    text.to_owned()
+}
+
+/// Canonicalization pipeline version fingerprint.
+///
+/// Bump this whenever a commit changes the *output* of
+/// [`canonicalize_for_embedding`] for any input — markdown stripping rules,
+/// code block collapsing thresholds, whitespace normalization, the
+/// low-signal filter table, truncation length, fast/slow path equivalence,
+/// or NFC handling. A version mismatch is the explicit, checked signal that
+/// `content_hash` reuse across embedding generations is unsafe (the same
+/// raw text now canonicalizes to different bytes), replacing what would
+/// otherwise be a silent hash-based staleness bug. Do NOT bump for changes
+/// that provably do not alter output (internal caching, comments, doc-only
+/// edits, test-only code).
+///
+/// Consumers must not assume "absent fingerprint" means "matches v1" —
+/// see `R1-W3-N1` in the wave-3 plan: a manifest written before this
+/// constant existed carries no fingerprint at all, and the correct
+/// disposition for that case is a source-diff attestation
+/// (`git diff <legacy-source-commit>..HEAD -- src/search/canonicalize.rs`),
+/// not a silent pass. Runtime readiness checks therefore treat a missing
+/// or mismatched fingerprint as failing generation activation by default;
+/// callers that have performed the attestation stamp the accepted version
+/// explicitly rather than relying on an inferred match.
+pub const CANONICALIZE_PIPELINE_VERSION: u32 = 1;
 
 /// Maximum characters to keep after canonicalization.
 pub const MAX_EMBED_CHARS: usize = 2000;
@@ -668,5 +1085,47 @@ See [docs](http://docs.rs) for more.
         let canonical = canonicalize_for_embedding(text);
         assert!(canonical.contains("Next sentence"));
         assert!(canonical.contains("unbalanced"));
+    }
+
+    /// W3-5 regression nail: pins `content_hash_hex` for a fixed sample set
+    /// spanning the fast path (pure ASCII, no markdown), the slow path
+    /// (markdown/code-block/NFC-triggering input), and the low-signal filter,
+    /// against the exact hex digests produced by this file's restored
+    /// `DefaultCanonicalizer`/`Canonicalizer` (byte-for-byte copy of
+    /// frankensearch-core's `canonicalize.rs`, git rev
+    /// `2cad158f4468ece7076e3fe529c8e5c20b2e020e`). If a future edit to this
+    /// file (or its `unicode-normalization`/markdown-stripping helpers)
+    /// silently changes canonicalization output, this test fails loudly
+    /// instead of letting stale `content_hash` reuse across embedding
+    /// generations go undetected -- see `CANONICALIZE_PIPELINE_VERSION`'s
+    /// doc comment above for why that matters.
+    #[test]
+    fn canonicalize_restore_pins_fixed_sample_hashes() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "plain ascii fast-path input",
+                "b0918a54d7ef0bdada25231588aa3b681fe81c4fcb0e71731617acd1f97ba68f",
+            ),
+            (
+                "**bold** _italic_ [link](http://example.com) and `code`\n\n```rust\nfn main() {}\n```",
+                "f7e12d641f8d760a791219163ec59961d2cc0782651ef71d031a9f4434d6f2e3",
+            ),
+            (
+                "caf\u{0065}\u{0301} au lait",
+                "7c413039fbb2248e2b18b98e7a8d4d85bdcac7cd79b9477a0923f97e3a1f2b50",
+            ),
+            (
+                "OK",
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
+        ];
+        for (input, expected_hex) in cases {
+            let canonical = canonicalize_for_embedding(input);
+            let hex = content_hash_hex(&canonical);
+            assert_eq!(
+                &hex, expected_hex,
+                "content_hash_hex drifted for input {input:?} -- canonicalize equivalence broken"
+            );
+        }
     }
 }

@@ -6,7 +6,7 @@ use coding_agent_search::bakeoff::{
     EvaluationConfig, EvaluationCorpus, EvaluationHarness, ModelMetadata, format_comparison_table,
 };
 use coding_agent_search::search::embedder::{Embedder, EmbedderError, EmbedderResult};
-use frankensearch::ModelCategory;
+use coding_agent_search::search::embedder::ModelCategory;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// A fixture embedder for testing the harness.

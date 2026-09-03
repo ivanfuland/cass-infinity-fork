@@ -1,19 +1,8 @@
-use anyhow::{Context, Result, anyhow, bail};
-use frankensearch::{
-    Cx as FsCx, InMemoryTwoTierIndex as FsInMemoryTwoTierIndex,
-    InMemoryVectorIndex as FsInMemoryVectorIndex, LexicalSearch as FsLexicalSearch,
+use anyhow::{Context, Result, anyhow};
+use crate::search::frankensearch_rrf::{
     QueryClass as FsQueryClass, RrfConfig as FsRrfConfig, ScoreSource as FsScoreSource,
-    ScoredResult as FsScoredResult, SearchError as FsSearchError, SearchFuture as FsSearchFuture,
-    SearchPhase as FsSearchPhase, SyncEmbedderAdapter as FsSyncEmbedderAdapter,
-    SyncTwoTierSearcher as FsSyncTwoTierSearcher, TwoTierConfig as FsTwoTierConfig,
-    TwoTierIndex as FsTwoTierIndex, TwoTierSearcher as FsTwoTierSearcher, VectorHit as FsVectorHit,
-    candidate_count as fs_candidate_count,
-    core::filter::SearchFilter as FsSearchFilter,
-    index::{
-        HNSW_DEFAULT_EF_SEARCH as FS_HNSW_DEFAULT_EF_SEARCH, HnswIndex as FsHnswIndex,
-        VectorIndex as FsVectorIndex,
-    },
-    rrf_fuse as fs_rrf_fuse,
+    ScoredResult as FsScoredResult, VectorHit as FsVectorHit,
+    candidate_count as fs_candidate_count, rrf_fuse as fs_rrf_fuse,
 };
 use lru::LruCache;
 use once_cell::sync::Lazy;
@@ -310,7 +299,6 @@ type SqliteFtsMessageRow = (
 // empty fallback result sets.
 const SQLITE_FTS5_HYDRATE_PARAM_CHUNK: usize = 30_000;
 const SEARCH_SQLITE_HYDRATION_CACHE_KIB: i64 = 4_096;
-const SEMANTIC_EXACT_CHUNK_OVERFETCH_MULTIPLIER: usize = 4;
 
 // Safety: Rc fields inside Connection are not cloned or shared externally.
 // The Mutex<Option<SendConnection>> in SearchClient ensures exclusive access.
@@ -446,17 +434,11 @@ fn semantic_message_id_from_db(message_id: i64) -> std::io::Result<u64> {
     u64::try_from(message_id).map_err(|_| std::io::Error::other("negative message_id"))
 }
 
-fn semantic_doc_component_id_from_db(raw: Option<i64>) -> u32 {
-    raw.map(|value| u32::try_from(value.max(0)).unwrap_or(u32::MAX))
-        .unwrap_or(0)
-}
-
-use crate::search::canonicalize::{canonicalize_for_embedding, content_hash, is_search_noise_text};
+use crate::search::canonicalize::{canonicalize_for_embedding, is_search_noise_text};
 use crate::search::embedder::Embedder;
 use crate::search::lexical_rerank::{self, FieldAvgdl, RerankCandidate};
 use crate::search::vector_index::{
-    ROLE_USER, SemanticDocId, SemanticFilter, SemanticFilterMaps, VectorIndex, VectorSearchResult,
-    parse_semantic_doc_id, role_code_from_str,
+    ROLE_USER, SemanticDocId, VectorSearchResult, parse_semantic_doc_id, role_code_from_str,
 };
 use crate::sources::provenance::SourceFilter;
 
@@ -611,45 +593,6 @@ impl SearchMode {
     }
 }
 
-/// Execution strategy for semantic search.
-///
-/// `Single` preserves existing exact vector behavior.
-/// Other modes attempt to use frankensearch's sync two-tier searcher when a
-/// compatible in-memory two-tier index is available; otherwise they fall back
-/// to `Single`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SemanticTierMode {
-    #[default]
-    Single,
-    Progressive,
-    FastOnly,
-    QualityOnly,
-}
-
-impl SemanticTierMode {
-    const fn wants_two_tier(self) -> bool {
-        !matches!(self, Self::Single)
-    }
-
-    fn to_frankensearch_config(self) -> FsTwoTierConfig {
-        let mut config = frankensearch_two_tier_config();
-        match self {
-            Self::Single | Self::Progressive => {}
-            Self::FastOnly => {
-                config.fast_only = true;
-            }
-            Self::QualityOnly => {
-                config.fast_only = false;
-                config.quality_weight = 1.0;
-            }
-        }
-        config
-    }
-}
-
-const PROGRESSIVE_EMBEDDING_CACHE_CAPACITY: usize = 64;
-const ANN_CANDIDATE_MULTIPLIER: usize = 4;
 const HYBRID_NO_LIMIT_PLANNING_WINDOW: usize = 64;
 const HYBRID_NO_LIMIT_SEMANTIC_CAP: usize = 2048;
 
@@ -759,19 +702,6 @@ fn no_limit_available_memory_budget(available_bytes: Option<u64>) -> Option<u64>
     available_bytes.map(|avail| {
         (avail / NO_LIMIT_RAM_DIVISOR).clamp(NO_LIMIT_BYTES_FLOOR, NO_LIMIT_BYTES_CEILING)
     })
-}
-
-static FRANKENSEARCH_TWO_TIER_CONFIG: Lazy<FsTwoTierConfig> =
-    Lazy::new(|| FsTwoTierConfig::optimized().with_env_overrides());
-
-fn frankensearch_two_tier_config() -> FsTwoTierConfig {
-    FRANKENSEARCH_TWO_TIER_CONFIG.clone()
-}
-
-#[inline]
-const fn progressive_phase_fetch_limit(limit: usize) -> usize {
-    let limit = if limit == 0 { 1 } else { limit };
-    limit.saturating_mul(3)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1601,46 +1531,11 @@ pub struct SearchResult {
     pub cache_stats: CacheStats,
     /// Did-you-mean suggestions when hits are empty or sparse
     pub suggestions: Vec<QuerySuggestion>,
-    /// ANN search statistics (present when --approximate was used)
-    pub ann_stats: Option<crate::search::ann_index::AnnSearchStats>,
     /// True total matching documents from the search engine when that is cheap
     /// and available. Large saturated lexical pages intentionally leave this as
     /// `None`; robot output then reports `total_matches` as a lower bound
     /// instead of forcing an expensive exact recount.
     pub total_count: Option<usize>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProgressivePhaseKind {
-    Initial,
-    Refined,
-}
-
-// Phase events intentionally carry a complete SearchResult so consumers can
-// react without reloading auxiliary state or keeping cross-event caches.
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone)]
-pub enum ProgressiveSearchEvent {
-    Phase {
-        kind: ProgressivePhaseKind,
-        result: SearchResult,
-        elapsed_ms: u128,
-    },
-    RefinementFailed {
-        latency_ms: u128,
-        error: String,
-    },
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct ProgressiveSearchRequest<'a> {
-    pub(crate) cx: &'a FsCx,
-    pub(crate) query: &'a str,
-    pub(crate) filters: SearchFilters,
-    pub(crate) limit: usize,
-    pub(crate) sparse_threshold: usize,
-    pub(crate) field_mask: FieldMask,
-    pub(crate) mode: SearchMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -2208,472 +2103,63 @@ impl QueryCache {
     }
 }
 
-/// Returns `Some(&filter)` when the filter has at least one active constraint,
-/// `None` when unrestricted (skip filtering for performance).
-fn semantic_filter_as_search_filter(filter: &SemanticFilter) -> Option<&dyn FsSearchFilter> {
-    let unrestricted = filter.agents.is_none()
-        && filter.workspaces.is_none()
-        && filter.sources.is_none()
-        && filter.roles.is_none()
-        && filter.created_from.is_none()
-        && filter.created_to.is_none();
-    if unrestricted { None } else { Some(filter) }
-}
-
-fn open_fs_semantic_ann_index(fs_index: &FsVectorIndex, ann_path: &Path) -> Result<FsHnswIndex> {
-    if !ann_path.is_file() {
-        bail!(
-            "approximate search unavailable: HNSW index not found at {}",
-            ann_path.display()
-        );
-    }
-
-    let ann = FsHnswIndex::load(ann_path, fs_index)
-        .map_err(|err| anyhow!("open HNSW index failed: {err}"))?;
-    let matches = ann
-        .matches_vector_index(fs_index)
-        .map_err(|err| anyhow!("validate HNSW index failed: {err}"))?;
-    if !matches {
-        bail!(
-            "approximate search unavailable: HNSW index at {} is stale for current semantic index (run 'cass index --semantic --build-hnsw')",
-            ann_path.display()
-        );
-    }
-
-    Ok(ann)
-}
-
 struct SemanticSearchState {
     context_token: Arc<()>,
     embedder: Arc<dyn Embedder>,
-    fs_semantic_index: Arc<FsVectorIndex>,
-    fs_semantic_indexes: Arc<Vec<Arc<FsVectorIndex>>>,
-    fs_ann_index: Option<Arc<FsHnswIndex>>,
-    ann_path: Option<PathBuf>,
-    fs_in_memory_two_tier_index: Option<Arc<FsInMemoryTwoTierIndex>>,
-    in_memory_two_tier_unavailable: InMemoryTwoTierUnavailable,
-    progressive_context: Option<Arc<ProgressiveTwoTierContext>>,
-    progressive_context_unavailable: bool,
-    filter_maps: SemanticFilterMaps,
     roles: Option<HashSet<u8>>,
     query_cache: QueryCache,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-struct InMemoryTwoTierUnavailable {
-    fast_only: bool,
-    quality: bool,
-}
-
-impl InMemoryTwoTierUnavailable {
-    fn is_known_unavailable(self, tier_mode: SemanticTierMode) -> bool {
-        match tier_mode {
-            SemanticTierMode::Single => false,
-            SemanticTierMode::FastOnly => self.fast_only,
-            SemanticTierMode::Progressive | SemanticTierMode::QualityOnly => self.quality,
-        }
-    }
-
-    fn mark_unavailable(&mut self, tier_mode: SemanticTierMode) {
-        match tier_mode {
-            SemanticTierMode::Single => {}
-            SemanticTierMode::FastOnly => {
-                self.fast_only = true;
-            }
-            SemanticTierMode::Progressive | SemanticTierMode::QualityOnly => {
-                self.quality = true;
-            }
-        }
-    }
-}
-
-struct ProgressiveTwoTierContext {
-    context_token: Arc<()>,
-    index: Arc<FsTwoTierIndex>,
-    fast_embedder: Arc<dyn frankensearch::Embedder>,
-    quality_embedder: Option<Arc<dyn frankensearch::Embedder>>,
-}
-
 #[derive(Clone)]
 struct SemanticCandidateContext {
-    fs_semantic_index: Arc<FsVectorIndex>,
-    fs_semantic_indexes: Arc<Vec<Arc<FsVectorIndex>>>,
-    filter_maps: SemanticFilterMaps,
     roles: Option<HashSet<u8>>,
 }
 
-struct SemanticCandidateSearchRequest<'a> {
+struct SemanticCandidateSearchRequest {
     fetch_limit: usize,
-    approximate: bool,
-    tier_mode: SemanticTierMode,
-    in_memory_two_tier_index: Option<&'a Arc<FsInMemoryTwoTierIndex>>,
-    ann_index: Option<&'a Arc<FsHnswIndex>>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 struct SemanticCandidateRetryState {
     has_more_candidates: bool,
     exact_window_may_omit_competitor: bool,
+    /// R2-B6: observability signal for whether the streaming full-scan
+    /// retry actually ran (distinct from `has_more_candidates`, which is
+    /// about the *caller's* widen-further decision, not this fact). Test-
+    /// visible via the returned struct rather than a `cfg(test)`-only
+    /// counter.
+    second_pass_taken: bool,
+}
+
+/// R2-B6: max-heap ordering for the streaming full-scan retry's bounded
+/// top-`fetch_limit` candidate set -- keeps the *largest* distance at the
+/// heap's root so it's the one evicted when a closer candidate arrives.
+/// `f64` has no `Ord` (NaN), so this wraps it with a `partial_cmp` that
+/// falls back to `Equal`, matching the existing sort fallback this
+/// function's non-streaming sibling already used.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DbVectorFullScanCandidate {
+    distance: f64,
+    doc_id: i64,
+}
+
+impl Eq for DbVectorFullScanCandidate {}
+
+impl PartialOrd for DbVectorFullScanCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for DbVectorFullScanCandidate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.distance.partial_cmp(&other.distance).unwrap_or(std::cmp::Ordering::Equal)
+    }
 }
 
 struct SemanticQueryEmbedding {
     context_token: Arc<()>,
     vector: Vec<f32>,
-}
-
-struct SharedCassSyncEmbedder {
-    inner: Arc<dyn Embedder>,
-    cache: Mutex<LruCache<String, Vec<f32>>>,
-}
-
-impl SharedCassSyncEmbedder {
-    fn new(inner: Arc<dyn Embedder>) -> Self {
-        let cache_capacity =
-            NonZeroUsize::new(PROGRESSIVE_EMBEDDING_CACHE_CAPACITY).expect("cache capacity > 0");
-        Self {
-            inner,
-            cache: Mutex::new(LruCache::new(cache_capacity)),
-        }
-    }
-}
-
-impl Embedder for SharedCassSyncEmbedder {
-    fn embed_sync(&self, text: &str) -> crate::search::embedder::EmbedderResult<Vec<f32>> {
-        if let Ok(mut cache) = self.cache.lock()
-            && let Some(embedding) = cache.get(text).cloned()
-        {
-            return Ok(embedding);
-        }
-
-        let embedding = self.inner.embed_sync(text)?;
-        if let Ok(mut cache) = self.cache.lock() {
-            cache.put(text.to_owned(), embedding.clone());
-        }
-        Ok(embedding)
-    }
-
-    fn embed_batch_sync(
-        &self,
-        texts: &[&str],
-    ) -> crate::search::embedder::EmbedderResult<Vec<Vec<f32>>> {
-        self.inner.embed_batch_sync(texts)
-    }
-
-    fn dimension(&self) -> usize {
-        self.inner.dimension()
-    }
-
-    fn id(&self) -> &str {
-        self.inner.id()
-    }
-
-    fn model_name(&self) -> &str {
-        self.inner.model_name()
-    }
-
-    fn is_ready(&self) -> bool {
-        self.inner.is_ready()
-    }
-
-    fn is_semantic(&self) -> bool {
-        self.inner.is_semantic()
-    }
-
-    fn category(&self) -> frankensearch::ModelCategory {
-        self.inner.category()
-    }
-
-    fn tier(&self) -> frankensearch::ModelTier {
-        self.inner.tier()
-    }
-
-    fn supports_mrl(&self) -> bool {
-        self.inner.supports_mrl()
-    }
-}
-
-fn build_in_memory_two_tier_index(
-    ann_path: Option<PathBuf>,
-    embedder_id: &str,
-    tier_mode: SemanticTierMode,
-) -> Option<Arc<FsInMemoryTwoTierIndex>> {
-    let index_dir = ann_path
-        .as_ref()
-        .and_then(|path| path.parent().map(Path::to_path_buf));
-    let Some(index_dir) = index_dir else {
-        tracing::debug!("two-tier semantic unavailable: ann/index directory path missing");
-        return None;
-    };
-
-    match FsInMemoryTwoTierIndex::from_dir(&index_dir) {
-        Ok(index) => return Some(Arc::new(index)),
-        Err(err) => {
-            tracing::debug!(
-                dir = %index_dir.display(),
-                error = %err,
-                "two-tier semantic index load failed; considering fallback"
-            );
-        }
-    }
-
-    if !matches!(tier_mode, SemanticTierMode::FastOnly) {
-        return None;
-    }
-
-    let fallback_fast = index_dir.join(format!("index-{embedder_id}.fsvi"));
-    if !fallback_fast.is_file() {
-        return None;
-    }
-
-    match FsInMemoryVectorIndex::from_fsvi(&fallback_fast) {
-        Ok(fast) => Some(Arc::new(FsInMemoryTwoTierIndex::new(fast, None))),
-        Err(err) => {
-            tracing::debug!(
-                path = %fallback_fast.display(),
-                error = %err,
-                "fast-only semantic fallback index load failed"
-            );
-            None
-        }
-    }
-}
-
-fn two_tier_index_supports_mode(
-    index: &FsInMemoryTwoTierIndex,
-    tier_mode: SemanticTierMode,
-) -> bool {
-    !matches!(
-        tier_mode,
-        SemanticTierMode::Progressive | SemanticTierMode::QualityOnly
-    ) || index.has_quality_index()
-}
-
-#[derive(Debug, Clone)]
-struct ResolvedSemanticDocId {
-    message_id: u64,
-    doc_id: String,
-}
-
-type ProgressiveLookupKey = (String, String, Option<i64>, String, i64, Option<i64>, u64);
-type ProgressiveExactQueryKey = (i64, i64);
-type ProgressiveFallbackQueryKey = (String, String, i64);
-type ResolvedSemanticLookupRow = Option<(ProgressiveLookupKey, ResolvedSemanticDocId)>;
-
-#[derive(Debug, Clone)]
-struct ProgressiveLexicalHit {
-    title: String,
-    snippet: String,
-    content: String,
-    content_hash: u64,
-    conversation_id: Option<i64>,
-    source_path: String,
-    agent: String,
-    workspace: String,
-    workspace_original: Option<String>,
-    created_at: Option<i64>,
-    match_type: MatchType,
-    line_number: Option<usize>,
-    source_id: String,
-    origin_kind: String,
-    origin_host: Option<String>,
-}
-
-impl ProgressiveLexicalHit {
-    fn from_search_hit(hit: &SearchHit, field_mask: FieldMask) -> Self {
-        Self {
-            title: if field_mask.wants_title() {
-                hit.title.clone()
-            } else {
-                String::new()
-            },
-            snippet: if field_mask.wants_snippet() {
-                hit.snippet.clone()
-            } else {
-                String::new()
-            },
-            content: if field_mask.needs_content() {
-                hit.content.clone()
-            } else {
-                String::new()
-            },
-            content_hash: hit.content_hash,
-            conversation_id: hit.conversation_id,
-            source_path: hit.source_path.clone(),
-            agent: hit.agent.clone(),
-            workspace: hit.workspace.clone(),
-            workspace_original: hit.workspace_original.clone(),
-            created_at: hit.created_at,
-            match_type: hit.match_type,
-            line_number: hit.line_number,
-            source_id: hit.source_id.clone(),
-            origin_kind: hit.origin_kind.clone(),
-            origin_host: hit.origin_host.clone(),
-        }
-    }
-
-    fn to_search_hit(&self, score: f32) -> SearchHit {
-        SearchHit {
-            title: self.title.clone(),
-            snippet: self.snippet.clone(),
-            content: self.content.clone(),
-            content_hash: self.content_hash,
-            conversation_id: self.conversation_id,
-            score,
-            source_path: self.source_path.clone(),
-            agent: self.agent.clone(),
-            workspace: self.workspace.clone(),
-            workspace_original: self.workspace_original.clone(),
-            created_at: self.created_at,
-            line_number: self.line_number,
-            match_type: self.match_type,
-            source_id: self.source_id.clone(),
-            origin_kind: self.origin_kind.clone(),
-            origin_host: self.origin_host.clone(),
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-struct ProgressiveLexicalCache {
-    hits_by_message: HashMap<u64, ProgressiveLexicalHit>,
-    wildcard_fallback: bool,
-    suggestions: Vec<QuerySuggestion>,
-}
-
-#[derive(Clone, Copy)]
-struct ProgressivePhaseContext<'a> {
-    query: &'a str,
-    filters: &'a SearchFilters,
-    field_mask: FieldMask,
-    lexical_cache: Option<&'a ProgressiveLexicalCache>,
-    limit: usize,
-    fetch_limit: usize,
-}
-
-type ProgressiveLexicalSnapshot = Arc<ProgressiveLexicalCache>;
-
-struct CassProgressiveLexicalAdapter {
-    client: Arc<SearchClient>,
-    filters: SearchFilters,
-    field_mask: FieldMask,
-    sparse_threshold: usize,
-    shared: Arc<Mutex<ProgressiveLexicalSnapshot>>,
-}
-
-impl CassProgressiveLexicalAdapter {
-    fn new(
-        client: Arc<SearchClient>,
-        filters: SearchFilters,
-        field_mask: FieldMask,
-        sparse_threshold: usize,
-        shared: Arc<Mutex<ProgressiveLexicalSnapshot>>,
-    ) -> Self {
-        Self {
-            client,
-            filters,
-            field_mask,
-            sparse_threshold,
-            shared,
-        }
-    }
-}
-
-impl FsLexicalSearch for CassProgressiveLexicalAdapter {
-    fn search<'a>(
-        &'a self,
-        cx: &'a FsCx,
-        query: &'a str,
-        limit: usize,
-    ) -> FsSearchFuture<'a, Vec<FsScoredResult>> {
-        Box::pin(async move {
-            if cx.is_cancel_requested() {
-                return Err(FsSearchError::Cancelled {
-                    phase: "lexical".to_string(),
-                    reason: "cancel requested".to_string(),
-                });
-            }
-
-            let result = self
-                .client
-                .search_with_fallback(
-                    query,
-                    self.filters.clone(),
-                    limit,
-                    0,
-                    self.sparse_threshold,
-                    self.field_mask,
-                )
-                .map_err(|err| FsSearchError::SubsystemError {
-                    subsystem: "cass_lexical_adapter",
-                    source: Box::new(std::io::Error::other(err.to_string())),
-                })?;
-
-            let resolved = self
-                .client
-                .resolve_semantic_doc_ids_for_hits(&result.hits)
-                .map_err(|err| FsSearchError::SubsystemError {
-                    subsystem: "cass_lexical_adapter",
-                    source: Box::new(std::io::Error::other(err.to_string())),
-                })?;
-
-            let mut scored = Vec::with_capacity(result.hits.len());
-            let mut hits_by_message = HashMap::with_capacity(result.hits.len());
-
-            for (hit, resolved_doc) in result.hits.iter().zip(resolved) {
-                let Some(resolved_doc) = resolved_doc else {
-                    continue;
-                };
-                hits_by_message
-                    .entry(resolved_doc.message_id)
-                    .or_insert_with(|| {
-                        ProgressiveLexicalHit::from_search_hit(hit, self.field_mask)
-                    });
-                scored.push(FsScoredResult {
-                    doc_id: resolved_doc.doc_id,
-                    score: hit.score,
-                    source: FsScoreSource::Lexical,
-                    index: None,
-                    fast_score: None,
-                    quality_score: None,
-                    lexical_score: Some(hit.score),
-                    rerank_score: None,
-                    explanation: None,
-                    metadata: None,
-                });
-            }
-
-            if let Ok(mut guard) = self.shared.lock() {
-                *guard = Arc::new(ProgressiveLexicalCache {
-                    hits_by_message,
-                    wildcard_fallback: result.wildcard_fallback,
-                    suggestions: result.suggestions,
-                });
-            }
-
-            Ok(scored)
-        })
-    }
-
-    fn index_document<'a>(
-        &'a self,
-        _cx: &'a FsCx,
-        _doc: &'a frankensearch::IndexableDocument,
-    ) -> FsSearchFuture<'a, ()> {
-        Box::pin(async move {
-            Err(FsSearchError::SubsystemError {
-                subsystem: "cass_lexical_adapter",
-                source: Box::new(std::io::Error::other("cass lexical adapter is read-only")),
-            })
-        })
-    }
-
-    fn commit<'a>(&'a self, _cx: &'a FsCx) -> FsSearchFuture<'a, ()> {
-        Box::pin(async move { Ok(()) })
-    }
-
-    fn doc_count(&self) -> usize {
-        self.client.total_docs()
-    }
 }
 
 pub struct SearchClient {
@@ -3723,66 +3209,28 @@ impl SearchClient {
         }
     }
 
+    /// Install the DB-vector-domain semantic search context.
+    ///
+    /// W3-5: the legacy fsvi vector-index plumbing this used to thread
+    /// through (`fs_semantic_index`/`fs_semantic_indexes`/`ann_path`,
+    /// cross-checked embedder/dimension per shard) has been retired --
+    /// DB-vector-domain (`embedding_generations`/`message_embeddings`,
+    /// via `search_db_vector_domain`) is the sole candidate-fetch path and
+    /// never needed those fields (W3-4 Step2-1 already made them `None`/
+    /// empty on every call site; nothing ever read them back out).
+    /// `SemanticFilterMaps` (agent/workspace/source lookup tables) is
+    /// dropped from this call for the same reason: `search_db_vector_domain`
+    /// filters by role (`roles` below) and its own SQL joins, never by
+    /// those lookup maps -- grep-verified 2026-09-02, zero read sites ever
+    /// existed for them beyond construction.
     pub fn set_semantic_context(
         &self,
         embedder: Arc<dyn Embedder>,
-        fs_semantic_index: VectorIndex,
-        filter_maps: SemanticFilterMaps,
         roles: Option<HashSet<u8>>,
-        ann_path: Option<PathBuf>,
     ) -> Result<()> {
-        self.set_semantic_indexes_context(
-            embedder,
-            vec![fs_semantic_index],
-            filter_maps,
-            roles,
-            ann_path,
-        )
-    }
-
-    pub fn set_semantic_indexes_context(
-        &self,
-        embedder: Arc<dyn Embedder>,
-        fs_semantic_indexes: Vec<VectorIndex>,
-        filter_maps: SemanticFilterMaps,
-        roles: Option<HashSet<u8>>,
-        ann_path: Option<PathBuf>,
-    ) -> Result<()> {
-        if fs_semantic_indexes.is_empty() {
-            bail!("semantic context requires at least one vector index");
-        }
-
-        let fs_semantic_indexes = fs_semantic_indexes
-            .into_iter()
-            .map(|index| {
-                let embedder_id = index.embedder_id().to_string();
-                let dimension = index.dimension();
-                if embedder_id != embedder.id() {
-                    bail!(
-                        "embedder mismatch: index uses {}, embedder is {}",
-                        embedder_id,
-                        embedder.id()
-                    );
-                }
-                if dimension != embedder.dimension() {
-                    bail!(
-                        "embedder dimension mismatch: index uses {}, embedder is {}",
-                        dimension,
-                        embedder.dimension()
-                    );
-                }
-                Ok(Arc::new(index))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let fs_semantic_index = Arc::clone(&fs_semantic_indexes[0]);
-        let shard_count = fs_semantic_indexes.len();
-        let ann_path = if shard_count == 1 { ann_path } else { None };
-        let embedder_id = fs_semantic_index.embedder_id().to_string();
-        let dimension = fs_semantic_index.dimension();
-        let fs_semantic_indexes = Arc::new(fs_semantic_indexes);
-
         let capacity = NonZeroUsize::new(100).ok_or_else(|| anyhow!("invalid cache size"))?;
         let context_token = Arc::new(());
+        let embedder_id = embedder.id().to_string();
         let mut state_guard = self
             .semantic
             .lock()
@@ -3790,26 +3238,9 @@ impl SearchClient {
         *state_guard = Some(SemanticSearchState {
             context_token,
             embedder,
-            fs_semantic_index,
-            fs_semantic_indexes,
-            fs_ann_index: None,
-            ann_path,
-            fs_in_memory_two_tier_index: None,
-            in_memory_two_tier_unavailable: InMemoryTwoTierUnavailable::default(),
-            progressive_context: None,
-            progressive_context_unavailable: false,
-            filter_maps,
             roles,
             query_cache: QueryCache::new(embedder_id.as_str(), capacity),
         });
-        if shard_count > 1 {
-            tracing::info!(
-                shard_count,
-                dimension,
-                embedder = embedder_id,
-                "semantic search context loaded sharded vector generation"
-            );
-        }
         Ok(())
     }
 
@@ -3890,941 +3321,677 @@ impl SearchClient {
         }
     }
 
-    fn in_memory_two_tier_index(
-        &self,
-        tier_mode: SemanticTierMode,
-    ) -> Result<Option<Arc<FsInMemoryTwoTierIndex>>> {
-        loop {
-            let (ann_path, embedder_id, context_token) = {
-                let mut guard = self
-                    .semantic
-                    .lock()
-                    .map_err(|_| anyhow!("semantic lock poisoned"))?;
-                let state = guard.as_mut().ok_or_else(|| {
-                    anyhow!("semantic search unavailable (no embedder or vector index)")
-                })?;
-                if let Some(index) = state.fs_in_memory_two_tier_index.as_ref()
-                    && two_tier_index_supports_mode(index.as_ref(), tier_mode)
-                {
-                    return Ok(Some(Arc::clone(index)));
-                }
-                if state
-                    .in_memory_two_tier_unavailable
-                    .is_known_unavailable(tier_mode)
-                {
-                    return Ok(None);
-                }
-                (
-                    state.ann_path.clone(),
-                    state.embedder.id().to_string(),
-                    Arc::clone(&state.context_token),
-                )
-            };
-
-            let index = build_in_memory_two_tier_index(ann_path.clone(), &embedder_id, tier_mode);
-
-            let mut guard = self
-                .semantic
-                .lock()
-                .map_err(|_| anyhow!("semantic lock poisoned"))?;
-            let state = guard.as_mut().ok_or_else(|| {
-                anyhow!("semantic search unavailable (no embedder or vector index)")
-            })?;
-            if let Some(existing) = state.fs_in_memory_two_tier_index.as_ref()
-                && two_tier_index_supports_mode(existing.as_ref(), tier_mode)
-            {
-                return Ok(Some(Arc::clone(existing)));
+    /// All string variants `role_code_from_str` maps onto `code` (its
+    /// inverse, many-to-one) -- needed to build a `role IN (...)` SQL
+    /// clause from a `SemanticFilter`-shaped `HashSet<u8>` role-code
+    /// selection. Kept in lockstep with `role_code_from_str` by
+    /// `role_code_to_strs_covers_every_string_role_code_from_str_accepts`
+    /// below.
+    fn role_code_to_strs(code: u8) -> &'static [&'static str] {
+        match code {
+            crate::search::vector_index::ROLE_USER => &["user"],
+            crate::search::vector_index::ROLE_ASSISTANT => &["assistant", "agent", "reasoning"],
+            crate::search::vector_index::ROLE_SYSTEM => &["system", "developer"],
+            crate::search::vector_index::ROLE_TOOL => {
+                &["tool", "toolResult", "tool_call", "tool_result"]
             }
-            if !Arc::ptr_eq(&state.context_token, &context_token) {
-                continue;
-            }
-            let Some(index) = index else {
-                state
-                    .in_memory_two_tier_unavailable
-                    .mark_unavailable(tier_mode);
-                return Ok(None);
-            };
-            if !two_tier_index_supports_mode(index.as_ref(), tier_mode) {
-                state
-                    .in_memory_two_tier_unavailable
-                    .mark_unavailable(tier_mode);
-                return Ok(None);
-            }
-            state.fs_in_memory_two_tier_index = Some(Arc::clone(&index));
-            if index.has_quality_index() {
-                state.in_memory_two_tier_unavailable = InMemoryTwoTierUnavailable::default();
-            } else {
-                state.in_memory_two_tier_unavailable.fast_only = false;
-            }
-            return Ok(Some(index));
+            _ => &[],
         }
     }
 
-    fn ann_index(&self) -> Result<Arc<FsHnswIndex>> {
-        loop {
-            let (ann_path, fs_semantic_index) = {
-                let mut guard = self
-                    .semantic
-                    .lock()
-                    .map_err(|_| anyhow!("semantic lock poisoned"))?;
-                let state = guard.as_mut().ok_or_else(|| {
-                    anyhow!("semantic search unavailable (no embedder or vector index)")
-                })?;
-                if let Some(index) = state.fs_ann_index.as_ref() {
-                    return Ok(Arc::clone(index));
-                }
-                let ann_path = state.ann_path.clone().ok_or_else(|| {
-                    anyhow!(
-                        "approximate search unavailable: HNSW index missing (run 'cass index --semantic --build-hnsw')"
-                    )
-                })?;
-                (ann_path, Arc::clone(&state.fs_semantic_index))
-            };
-
-            let ann = Arc::new(open_fs_semantic_ann_index(
-                fs_semantic_index.as_ref(),
-                &ann_path,
-            )?);
-
-            let mut guard = self
-                .semantic
-                .lock()
-                .map_err(|_| anyhow!("semantic lock poisoned"))?;
-            let state = guard.as_mut().ok_or_else(|| {
-                anyhow!("semantic search unavailable (no embedder or vector index)")
-            })?;
-            if let Some(existing) = state.fs_ann_index.as_ref() {
-                return Ok(Arc::clone(existing));
-            }
-            if state.ann_path.as_ref() != Some(&ann_path)
-                || !Arc::ptr_eq(&state.fs_semantic_index, &fs_semantic_index)
-            {
-                continue;
-            }
-            state.fs_ann_index = Some(Arc::clone(&ann));
-            return Ok(ann);
-        }
-    }
-
-    fn collapse_semantic_results(
-        best_by_message: HashMap<u64, VectorSearchResult>,
-        fetch_limit: usize,
-    ) -> Vec<VectorSearchResult> {
-        let mut collapsed: Vec<VectorSearchResult> = best_by_message.into_values().collect();
-        collapsed.sort_by(|a, b| {
-            b.score
-                .total_cmp(&a.score)
-                .then_with(|| a.message_id.cmp(&b.message_id))
-        });
-        if collapsed.len() > fetch_limit {
-            collapsed.truncate(fetch_limit);
-        }
-        collapsed
-    }
-
-    fn semantic_exact_candidate_limit(fetch_limit: usize, record_count: usize) -> usize {
-        fetch_limit
-            .saturating_mul(SEMANTIC_EXACT_CHUNK_OVERFETCH_MULTIPLIER)
-            .max(fetch_limit)
-            .min(record_count)
-    }
-
-    fn semantic_window_may_omit_competitor(
-        collapsed: &[VectorSearchResult],
-        fetch_limit: usize,
-        max_omitted_score: Option<f32>,
-    ) -> bool {
-        if fetch_limit == 0 {
-            return false;
-        }
-        let Some(max_omitted_score) = max_omitted_score else {
-            return false;
-        };
-        if collapsed.len() < fetch_limit {
-            return true;
-        }
-        let Some(last_in_requested_window) = collapsed.get(fetch_limit - 1) else {
-            return true;
-        };
-        !last_in_requested_window
-            .score
-            .total_cmp(&max_omitted_score)
-            .is_gt()
-    }
-
-    fn record_fs_semantic_hit(
-        best_by_message: &mut HashMap<u64, VectorSearchResult>,
-        hit: &FsVectorHit,
+    /// R4-B4 (spec §3.1) + w3-d7①/②: the vec0/`message_embeddings`-backed
+    /// successor to the retired fsvi brute-force scan (W3-5). Reads the
+    /// active generation and scans its `vec0`
+    /// index inside **one** read transaction (the same-SQLite-snapshot
+    /// requirement R4-B4 mandates for "active pointer read" + "vector row
+    /// read"), then applies the same six filter dimensions the retired
+    /// `SemanticFilter` used to embody, now as a SQL
+    /// `WHERE` joined against `messages`/`conversations`/`agents`/
+    /// `workspaces`/`sources` -- not a doc_id-string decode (that
+    /// indirection existed only because the fsvi format had no relational
+    /// join available; the new path does, so it uses it -- "甩掉 doc_id 解码
+    /// 历史包袱", control-plane 2026-09-01). `session_paths` is also
+    /// pushed into this `WHERE` (R3-2: a restrictive `session_paths` filter
+    /// left post-hoc-only starved the full-scan retry's capped heap with
+    /// non-matching rows, evicting genuine matches ranked beyond the cap);
+    /// `postprocess_hits_page`'s own post-hoc `session_paths` retain()
+    /// (see `semantic_search_session_paths_filter_retries_past_initial_
+    /// candidates`) stays as a no-op safety net over this already-filtered
+    /// set.
+    ///
+    /// Contract (w3-d7①, three states, never a silent degradation to the
+    /// fsvi sidecar, an empty-result masquerade, or an unfiltered scan):
+    /// - `Err` whose message contains `vector_domain_state=building`: a
+    ///   generation exists but none is active (a build/backfill is in
+    ///   progress) -- caller-facing structured error, retryable.
+    /// - `Err` whose message contains `vector_domain_state=absent`: no
+    ///   generation has ever been created.
+    /// - `Ok` with an empty `Vec`: an active generation exists but
+    ///   currently has zero rows for it -- a genuinely empty archive, not
+    ///   an error.
+    ///
+    /// Filtered-candidate overfetch (w3-d5: no in-process watchdog, so this
+    /// is a bounded two-step widen, not an unbounded retry loop): the first
+    /// `vec0` KNN call asks for `fetch_limit *
+    /// DB_VECTOR_SEARCH_OVERFETCH_FACTOR` candidates; if filtering leaves
+    /// fewer than `fetch_limit` results and more candidates exist, a second
+    /// call asks for the generation's full row count (KU2's validated
+    /// worst case: a full exact scan is <2s at 101.6万 scale, so widening
+    /// all the way to "everything" once is an acceptable fallback, not a
+    /// runaway cost).
+    /// Pure SQL/params construction for `search_db_vector_domain`'s
+    /// post-KNN filter step -- separated out so it is unit-testable without
+    /// a database (this is the vec0-path counterpart to the retired
+    /// `semantic_filter_applies_all_constraints`'s doc_id-decode unit test:
+    /// same "assert the filter construction is correct" job, SQL-shaped
+    /// instead of string-decode-shaped, per control-plane 2026-09-01's
+    /// "甩掉 doc_id 解码历史包袱" ruling). Returns the query text plus its
+    /// positional parameters, ready for `tx.query_all_map`.
+    /// Shared relational filter clauses (agents/workspaces/source/role/
+    /// created_from/created_to/session_paths) for both DB-vector-domain SQL builders
+    /// below -- extracted (R1-W3-B6/N1/B9) so the post-KNN id-filter path
+    /// and the full-scan path can never drift apart on what "passes the
+    /// filters" means. Appends `AND ...` clauses onto `sql` and their
+    /// positional params onto `params` in place; assumes the query's
+    /// `FROM`/`JOIN`s already bind `m`=messages, `c`=conversations,
+    /// `w`=workspaces (LEFT JOIN), `s`=sources (LEFT JOIN).
+    fn push_db_vector_domain_relational_filters(
+        sql: &mut String,
+        params: &mut Vec<ParamValue>,
+        filters: &SearchFilters,
+        effective_roles: Option<&HashSet<u8>>,
     ) {
-        let Some(parsed) = parse_semantic_doc_id(&hit.doc_id) else {
-            return;
-        };
-        best_by_message
-            .entry(parsed.message_id)
-            .and_modify(|entry| {
-                if hit.score > entry.score {
-                    entry.score = hit.score;
-                    entry.chunk_idx = parsed.chunk_idx;
+        if !filters.agents.is_empty() {
+            let placeholders = sql_placeholders(filters.agents.len());
+            sql.push_str(&format!(
+                " AND EXISTS (SELECT 1 FROM agents a WHERE a.id = c.agent_id AND a.slug IN ({placeholders}))"
+            ));
+            for a in &filters.agents {
+                params.push(ParamValue::from(a.as_str()));
+            }
+        }
+
+        if !filters.workspaces.is_empty() {
+            let placeholders = sql_placeholders(filters.workspaces.len());
+            sql.push_str(&format!(" AND COALESCE(w.path, '') IN ({placeholders})"));
+            for path in &filters.workspaces {
+                params.push(ParamValue::from(path.as_str()));
+            }
+        }
+
+        let normalized_source_sql =
+            normalized_search_source_id_sql_expr("c.source_id", "s.kind", "c.origin_host");
+        match &filters.source_filter {
+            SourceFilter::All => {}
+            SourceFilter::Local => sql.push_str(&format!(
+                " AND {normalized_source_sql} = '{local}'",
+                local = crate::sources::provenance::LOCAL_SOURCE_ID,
+            )),
+            SourceFilter::Remote => sql.push_str(&format!(
+                " AND {normalized_source_sql} != '{local}'",
+                local = crate::sources::provenance::LOCAL_SOURCE_ID,
+            )),
+            SourceFilter::SourceId(id) => {
+                sql.push_str(&format!(" AND {normalized_source_sql} = ?"));
+                params.push(ParamValue::from(normalize_search_source_filter_value(id)));
+            }
+        }
+
+        if let Some(roles) = effective_roles {
+            let role_strs: Vec<&str> =
+                roles.iter().flat_map(|code| Self::role_code_to_strs(*code).iter().copied()).collect();
+            if role_strs.is_empty() {
+                // Every requested role code is unknown -- match nothing,
+                // same as the fsvi filter's `matches()` returning false for
+                // an unrecognized role.
+                sql.push_str(" AND 0");
+            } else {
+                let placeholders = sql_placeholders(role_strs.len());
+                sql.push_str(&format!(" AND m.role IN ({placeholders})"));
+                for r in role_strs {
+                    params.push(ParamValue::from(r));
                 }
-            })
-            .or_insert(VectorSearchResult {
-                message_id: parsed.message_id,
-                chunk_idx: parsed.chunk_idx,
-                score: hit.score,
-            });
+            }
+        }
+
+        if let Some(created_from) = filters.created_from {
+            sql.push_str(" AND m.created_at >= ?");
+            params.push(ParamValue::from(created_from));
+        }
+        if let Some(created_to) = filters.created_to {
+            sql.push_str(" AND m.created_at <= ?");
+            params.push(ParamValue::from(created_to));
+        }
+
+        // R3-2: pushed into the shared SQL filter (was post-hoc-only, see
+        // the retired claim this replaces below) so the full-scan retry's
+        // heap-capped ranking competes only among session-path-matching
+        // rows, not the entire (unfiltered) generation -- a restrictive
+        // `session_paths` filter combined with a cap smaller than the
+        // unfiltered candidate count used to starve the heap with
+        // non-matching rows, evicting a genuine match ranked at
+        // `cap+1`+ purely by distance among rows post-hoc filtering would
+        // have discarded anyway. `postprocess_hits_page`'s own
+        // `session_paths` retain() stays in place as a harmless no-op
+        // safety net over this now-already-filtered set.
+        if !filters.session_paths.is_empty() {
+            let placeholders = sql_placeholders(filters.session_paths.len());
+            sql.push_str(&format!(" AND c.source_path IN ({placeholders})"));
+            for path in &filters.session_paths {
+                params.push(ParamValue::from(path.as_str()));
+            }
+        }
     }
 
-    fn search_exact_semantic_indexes(
-        context: &SemanticCandidateContext,
+    fn build_db_vector_domain_filter_sql(
+        candidate_ids: &[i64],
+        filters: &SearchFilters,
+        effective_roles: Option<&HashSet<u8>>,
+    ) -> (String, Vec<ParamValue>) {
+        let mut sql = String::from(
+            "SELECT m.id \
+             FROM messages m \
+             JOIN conversations c ON c.id = m.conversation_id \
+             LEFT JOIN workspaces w ON w.id = c.workspace_id \
+             LEFT JOIN sources s ON s.id = c.source_id \
+             WHERE 1=1",
+        );
+        let mut params: Vec<ParamValue> = Vec::new();
+
+        let id_placeholders = sql_placeholders(candidate_ids.len());
+        sql.push_str(&format!(" AND m.id IN ({id_placeholders})"));
+        for doc_id in candidate_ids {
+            params.push(ParamValue::from(*doc_id));
+        }
+
+        Self::push_db_vector_domain_relational_filters(&mut sql, &mut params, filters, effective_roles);
+
+        (sql, params)
+    }
+
+    /// R1-W3-B6/N1/B9's full-scan path: select `(doc_id, embedding)` for
+    /// every row of `generation_id` that passes the same relational
+    /// filters `build_db_vector_domain_filter_sql` applies post-KNN --
+    /// but *before* any distance computation, not after a `vec0` KNN call.
+    /// This is what lets the "widen to full coverage" retry in
+    /// `search_db_vector_domain` avoid `vec0`'s hard `k<=4096` ceiling
+    /// entirely: it never asks `vec0` for a k at all, it reads the
+    /// authoritative `message_embeddings` table directly and ranks the
+    /// (expected-small, precisely because this path only runs when the
+    /// filter was too selective for the first KNN pass to satisfy)
+    /// filtered subset by an application-layer cosine distance instead.
+    fn build_db_vector_domain_full_scan_sql(
+        generation_id: i64,
+        filters: &SearchFilters,
+        effective_roles: Option<&HashSet<u8>>,
+    ) -> (String, Vec<ParamValue>) {
+        let mut sql = String::from(
+            "SELECT me.doc_id, me.embedding \
+             FROM message_embeddings me \
+             JOIN messages m ON m.id = me.doc_id \
+             JOIN conversations c ON c.id = m.conversation_id \
+             LEFT JOIN workspaces w ON w.id = c.workspace_id \
+             LEFT JOIN sources s ON s.id = c.source_id \
+             WHERE me.generation_id = ?",
+        );
+        let mut params: Vec<ParamValue> = vec![ParamValue::from(generation_id)];
+
+        Self::push_db_vector_domain_relational_filters(&mut sql, &mut params, filters, effective_roles);
+
+        (sql, params)
+    }
+
+    /// Cosine distance matching `vec0`'s `distance_metric=cosine` (`1 -
+    /// cosine_similarity`) exactly, so a hit's distance/score is
+    /// indistinguishable to a caller whether it came from `vec0`'s KNN
+    /// scan (first round) or this application-layer computation (R1-W3-B6/
+    /// N1/B9's full-scan retry round). A degenerate zero vector on either
+    /// side has no defined direction, so it is treated as maximally
+    /// distant (`1.0`) rather than dividing by zero.
+    fn cosine_distance(a: &[f32], b: &[f32]) -> f64 {
+        let dot: f64 = a.iter().zip(b).map(|(&x, &y)| f64::from(x) * f64::from(y)).sum();
+        let norm_a: f64 = a.iter().map(|&x| f64::from(x) * f64::from(x)).sum::<f64>().sqrt();
+        let norm_b: f64 = b.iter().map(|&x| f64::from(x) * f64::from(x)).sum::<f64>().sqrt();
+        if norm_a == 0.0 || norm_b == 0.0 {
+            return 1.0;
+        }
+        1.0 - (dot / (norm_a * norm_b))
+    }
+
+    fn search_db_vector_domain(
+        conn: &Connection,
         embedding: &[f32],
+        filters: &SearchFilters,
+        default_roles: Option<&HashSet<u8>>,
         fetch_limit: usize,
-        fs_filter: Option<&dyn FsSearchFilter>,
     ) -> Result<(Vec<VectorSearchResult>, SemanticCandidateRetryState)> {
-        if context.fs_semantic_indexes.len() == 1 {
-            let record_count = context.fs_semantic_index.record_count();
-            let candidate_limit = Self::semantic_exact_candidate_limit(fetch_limit, record_count);
-            let fs_hits = context
-                .fs_semantic_index
-                .search_top_k(embedding, candidate_limit, fs_filter)
-                .map_err(|err| anyhow!("frankensearch semantic search failed: {err}"))?;
-            let mut best_by_message = HashMap::with_capacity(fs_hits.len());
-            for hit in &fs_hits {
-                Self::record_fs_semantic_hit(&mut best_by_message, hit);
-            }
-            let collapsed = Self::collapse_semantic_results(best_by_message, candidate_limit);
-            let has_more_candidates =
-                fs_hits.len() >= candidate_limit && candidate_limit < record_count;
-            let max_omitted_score = if has_more_candidates {
-                fs_hits.last().map(|hit| hit.score)
-            } else {
-                None
+        const OVERFETCH_FACTOR: usize = 4;
+        // R1-W3-B6/N1/B9: sqlite-vec 0.1.10's vec0 KNN implementation hard-
+        // rejects `k > 4096` as a genuine `SQLITE_ERROR` (`SQLITE_VEC_VEC0_
+        // K_MAX`, verified against the vendored C source, not a documented
+        // assumption) -- not a silent clamp. Any caller upstream of this
+        // function deriving a large `fetch_limit` (hybrid fusion's semantic-
+        // leg candidate budget compounding with this function's own
+        // `OVERFETCH_FACTOR`, B9's exec60-observed `--limit 5000` ->
+        // `k=80016` crash) must never let `first_k` below reach vec0 above
+        // this ceiling. This is the single choke point every DB-vector-
+        // domain KNN call passes through, so clamping here protects every
+        // caller at once rather than requiring each upstream candidate-
+        // budget computation to know about vec0's internal limit.
+        const SQLITE_VEC_KNN_K_MAX: usize = 4096;
+
+        let effective_roles = filters.roles.clone().or_else(|| default_roles.cloned());
+
+        conn.with_tx_no_replay(crate::storage::api::TxMode::Deferred, |tx| {
+            let active: Option<(i64, i64)> = tx.query_opt_map(
+                "SELECT id, dim FROM embedding_generations WHERE is_active = 1",
+                &[],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )?;
+            let Some((generation_id, _dim)) = active else {
+                let any_generation: i64 = tx.query_row_map(
+                    "SELECT count(*) FROM embedding_generations",
+                    &[],
+                    |row| row.get_typed(0),
+                )?;
+                let state = if any_generation > 0 { "building" } else { "absent" };
+                let hint = if any_generation > 0 {
+                    "a generation exists but none is active yet; a build/backfill is in \
+                     progress -- retry shortly"
+                } else {
+                    "no embedding generation was ever created; run the backfill/embedding \
+                     pipeline to build one"
+                };
+                return Err(crate::storage::api::StorageError::Other {
+                    code: None,
+                    detail: format!(
+                        "vector index unavailable for search: vector_domain_state={state} -- {hint}"
+                    ),
+                });
             };
-            let exact_window_may_omit_competitor = Self::semantic_window_may_omit_competitor(
-                &collapsed,
-                fetch_limit,
-                max_omitted_score,
-            );
-            return Ok((
-                collapsed,
+
+            let row_count: i64 = tx.query_row_map(
+                "SELECT count(*) FROM message_embeddings WHERE generation_id = ?1",
+                &crate::storage::api::params![generation_id],
+                |row| row.get_typed(0),
+            )?;
+            if row_count == 0 {
+                // Genuinely empty archive (w3-d7①): not an error.
+                return Ok((Vec::new(), SemanticCandidateRetryState::default()));
+            }
+
+            let vec0_table = format!("vec_index_gen_{generation_id}");
+            let vec0_table_exists: i64 = tx.query_row_map(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                &crate::storage::api::params![vec0_table.clone()],
+                |row| row.get_typed(0),
+            )?;
+            if vec0_table_exists == 0 {
+                // The generation's relational rows exist but its derived
+                // `vec0` index has not been (re)built yet -- w3-d5/w3-d7②:
+                // this function only reports status, it never triggers a
+                // rebuild itself.
+                return Err(crate::storage::api::StorageError::Other {
+                    code: None,
+                    detail: "vector index unavailable for search: vector_domain_state=building \
+                              -- the active generation's vec0 index has not been built yet; \
+                              retry shortly, or run the vector rebuild command"
+                        .to_string(),
+                });
+            }
+
+            let row_count_usize = usize::try_from(row_count).unwrap_or(usize::MAX);
+            let first_k = fetch_limit
+                .saturating_mul(OVERFETCH_FACTOR)
+                .min(row_count_usize)
+                .min(SQLITE_VEC_KNN_K_MAX)
+                .max(1);
+
+            let run_and_filter = |tx: &crate::storage::api::Tx, k: usize| -> Result<Vec<(i64, f64)>, crate::storage::api::StorageError> {
+                let blob = crate::storage::schema::f32_vector_to_le_blob(embedding);
+                let k_i64 = i64::try_from(k).unwrap_or(i64::MAX);
+                let candidates: Vec<(i64, f64)> = tx.query_all_map(
+                    &format!(
+                        "SELECT rowid, distance FROM {vec0_table} WHERE embedding MATCH ?1 AND k = ?2 ORDER BY distance"
+                    ),
+                    &crate::storage::api::params![blob, k_i64],
+                    |row| Ok((row.get_typed::<i64>(0)?, row.get_typed::<f64>(1)?)),
+                )?;
+                if candidates.is_empty() {
+                    return Ok(Vec::new());
+                }
+
+                let candidate_ids: Vec<i64> = candidates.iter().map(|(doc_id, _)| *doc_id).collect();
+                let (sql, params) =
+                    Self::build_db_vector_domain_filter_sql(&candidate_ids, filters, effective_roles.as_ref());
+
+                let passing_ids: std::collections::HashSet<i64> =
+                    tx.query_all_map(&sql, &params, |row| row.get_typed(0))?
+                        .into_iter()
+                        .collect();
+
+                Ok(candidates
+                    .into_iter()
+                    .filter(|(doc_id, _)| passing_ids.contains(doc_id))
+                    .collect())
+            };
+
+            // R1-W3-B6/N1/B9: the "widen to full coverage" retry no longer
+            // asks `vec0` for a bigger `k` at all (that path is exactly what
+            // used to hard-error past `SQLITE_VEC_KNN_K_MAX`, or -- pre-fix,
+            // for a generation small enough to dodge that limit -- falsely
+            // report `has_more_candidates=false` for a scan that a caller
+            // upstream might not actually have widened all the way to
+            // `row_count_usize`). This retry only fires when the first
+            // KNN pass's overfetch window left fewer than `fetch_limit`
+            // *filtered* hits -- i.e. the relational filter is selective --
+            // so filtering *before* ranking (SQL `WHERE` over
+            // `message_embeddings` directly) and then computing distance
+            // only for that already-small passing subset in Rust is cheap
+            // in exactly the case that triggers it; a query whose filter
+            // isn't selective never gets here because the first pass
+            // already found enough.
+            // R2-B6: streaming, not `query_all_map`-then-collect-then-sort --
+            // the old version's `Vec<(i64, Vec<u8>)>` held every row's
+            // decoded BLOB simultaneously (~4.16GB @ 101.6万×1024f32), which
+            // is exactly the OOM this retry was supposed to be the *safe*
+            // fallback from. Each row's BLOB is decoded, scored, and
+            // discarded immediately; only a bounded max-heap of (distance,
+            // doc_id) survives past a single row's scope. Heap capacity is
+            // `first_k.max(fetch_limit)`, not the bare `fetch_limit`
+            // parameter: `first_k` is already `fetch_limit *
+            // OVERFETCH_FACTOR` (the same overfetch budget the first KNN
+            // pass used) whenever it isn't clamp-limited, and the `.max`
+            // keeps the cap from dropping *below* `fetch_limit` itself in
+            // the (K-max-clamped) shape where `first_k` came out smaller.
+            // Capping below `first_k` here would silently truncate the
+            // exact-search caller's overfetch window on the retry path even
+            // though the first-pass path deliberately never does (see the
+            // "Do NOT truncate to `fetch_limit`" note below) -- this is why
+            // the primary correctness test's 3-of-3 and the perf
+            // disclosure's 5-of-5 target docs both still come back whole
+            // (their filtered universes are `<= first_k`), while a filtered
+            // universe genuinely larger than the overfetch budget now
+            // reports `has_more_candidates=true` (`total_seen > cap`)
+            // instead of the old code's unconditional "retry always
+            // covered everything" claim, which stopped being true the
+            // moment a cap existed at all.
+            let full_scan_by_distance_streaming = |tx: &crate::storage::api::Tx,
+                                                     cap: usize|
+             -> Result<(Vec<(i64, f64)>, bool), crate::storage::api::StorageError> {
+                let (sql, params) = Self::build_db_vector_domain_full_scan_sql(
+                    generation_id,
+                    filters,
+                    effective_roles.as_ref(),
+                );
+                // R3-3: `cap` (`first_k.max(fetch_limit)` at the call site)
+                // comes directly from an unclamped `usize` `--limit` --
+                // `with_capacity(cap + 1)` on a pathological value (e.g.
+                // `usize::MAX - 1`) either overflows the `+ 1` or tries an
+                // allocation far larger than the generation could ever need,
+                // aborting the process. The heap can never usefully hold
+                // more than the generation's own row count, so clamp to
+                // that (already computed above as `row_count_usize`) before
+                // sizing the allocation.
+                let cap = cap.min(row_count_usize).max(1);
+                let heap: std::cell::RefCell<std::collections::BinaryHeap<DbVectorFullScanCandidate>> =
+                    std::cell::RefCell::new(std::collections::BinaryHeap::with_capacity(cap + 1));
+                let total_seen = std::cell::Cell::new(0usize);
+                tx.query_all_map(&sql, &params, |row| -> Result<(), crate::storage::api::StorageError> {
+                    let doc_id: i64 = row.get_typed(0)?;
+                    let blob: Vec<u8> = row.get_typed(1)?;
+                    let vector = crate::storage::schema::le_blob_to_f32_vector(&blob)?;
+                    let distance = Self::cosine_distance(&vector, embedding);
+                    let candidate = DbVectorFullScanCandidate { distance, doc_id };
+                    total_seen.set(total_seen.get() + 1);
+                    let mut heap = heap.borrow_mut();
+                    if heap.len() < cap {
+                        heap.push(candidate);
+                    } else if heap.peek().is_some_and(|worst| candidate < *worst) {
+                        heap.pop();
+                        heap.push(candidate);
+                    }
+                    Ok(())
+                })?;
+                let mut ranked: Vec<(i64, f64)> = heap
+                    .into_inner()
+                    .into_iter()
+                    .map(|c| (c.doc_id, c.distance))
+                    .collect();
+                ranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                let truncated = total_seen.get() > cap;
+                Ok((ranked, truncated))
+            };
+
+            let mut filtered = run_and_filter(tx, first_k)?;
+            // R2-B6: a large `fetch_limit` alone (clamp-limited `first_k`,
+            // e.g. `SQLITE_VEC_KNN_K_MAX`) is not evidence the relational
+            // filter is selective -- if the filter passed every candidate
+            // the first KNN pass found (`filtered.len() == first_k`), the
+            // corpus genuinely has more matches than the clamp let this
+            // pass see, and `has_more_candidates=true` already tells the
+            // caller that; a full-scan retry in that shape would re-read
+            // (up to) the *entire* generation for a filter that eliminated
+            // nothing, which is the resource-exhaustion path this retry
+            // exists to avoid, not resolve. The retry is only for the
+            // opposite shape: the filter genuinely thinned the KNN window
+            // (`filtered.len() < first_k`) down below what the caller asked
+            // for, so widening past `first_k` to the full (filtered, and
+            // thus expected-small) generation is the correct fix.
+            let filter_eliminated_candidates = filtered.len() < first_k;
+            let mut has_more_candidates = first_k < row_count_usize;
+            let mut second_pass_taken = false;
+            if filter_eliminated_candidates
+                && filtered.len() < fetch_limit
+                && first_k < row_count_usize
+            {
+                second_pass_taken = true;
+                let (scanned, truncated) = full_scan_by_distance_streaming(tx, first_k.max(fetch_limit))?;
+                filtered = scanned;
+                has_more_candidates = truncated;
+            }
+
+            // Do NOT truncate to `fetch_limit` here: `filtered` is already a
+            // bounded overfetch window (`first_k`, or the retry's own
+            // `fetch_limit`-capped heap), matching the fsvi exact-search contract
+            // (`semantic_exact_candidate_limit`/`collapse_semantic_results`)
+            // that `search_semantic_with_tier` relies on: it applies
+            // post-hoc filters (session_paths, dedup) and its own
+            // limit/offset paging AFTER candidate search, on the full
+            // returned window, not on a pre-truncated slice. Truncating to
+            // `fetch_limit` here silently dropped the domain-passing
+            // candidates a caller-side filter still needed to search
+            // through (W3-3 Step C regression: `has_more_candidates` was
+            // computed relative to the KNN retrieval window, not relative
+            // to whether candidates beyond a `fetch_limit`-sized `take()`
+            // were discarded, so the outer retry loop never re-fetched).
+            let results: Vec<VectorSearchResult> = filtered
+                .into_iter()
+                .map(|(doc_id, distance)| VectorSearchResult {
+                    // vec0's cosine `distance` is `1 - cosine_similarity`;
+                    // `score` is a higher-is-better similarity, matching
+                    // the fsvi path's dot-product-on-near-unit-vectors
+                    // convention (KU2's finding: sqlite-vec's true cosine
+                    // is the more correct of the two).
+                    message_id: u64::try_from(doc_id).unwrap_or(0),
+                    chunk_idx: 0,
+                    score: (1.0 - distance) as f32,
+                })
+                .collect();
+
+            Ok((
+                results,
                 SemanticCandidateRetryState {
                     has_more_candidates,
-                    exact_window_may_omit_competitor,
+                    exact_window_may_omit_competitor: has_more_candidates,
+                    second_pass_taken,
                 },
-            ));
-        }
-
-        let mut best_by_message = HashMap::new();
-        let mut raw_hits = 0usize;
-        let mut max_omitted_score: Option<f32> = None;
-        let mut has_more_candidates = false;
-        for index in context.fs_semantic_indexes.iter() {
-            let shard_record_count = index.record_count();
-            // Search chunks, then collapse by message. A message can have many
-            // high-scoring chunks, so per-shard top-k chunks alone is not a
-            // proof of per-message top-k. Use a bounded overfetch window and
-            // retry only when the omitted-score bound can still beat the last
-            // collapsed message in the requested window.
-            let shard_limit = Self::semantic_exact_candidate_limit(fetch_limit, shard_record_count);
-            if shard_limit == 0 {
-                continue;
-            }
-            let fs_hits = index
-                .search_top_k(embedding, shard_limit, fs_filter)
-                .map_err(|err| anyhow!("frankensearch sharded semantic search failed: {err}"))?;
-            if fs_hits.len() >= shard_limit
-                && shard_limit < shard_record_count
-                && let Some(last_hit) = fs_hits.last()
-            {
-                has_more_candidates = true;
-                max_omitted_score = Some(
-                    max_omitted_score
-                        .map(|current| current.max(last_hit.score))
-                        .unwrap_or(last_hit.score),
-                );
-            }
-            raw_hits = raw_hits.saturating_add(fs_hits.len());
-            best_by_message.reserve(fs_hits.len());
-            for hit in &fs_hits {
-                Self::record_fs_semantic_hit(&mut best_by_message, hit);
-            }
-        }
-        let candidate_return_limit = Self::semantic_exact_candidate_limit(fetch_limit, raw_hits);
-        let collapsed = Self::collapse_semantic_results(best_by_message, candidate_return_limit);
-        let exact_window_may_omit_competitor =
-            Self::semantic_window_may_omit_competitor(&collapsed, fetch_limit, max_omitted_score);
-        tracing::debug!(
-            shard_count = context.fs_semantic_indexes.len(),
-            raw_hits,
-            returned = collapsed.len(),
-            "semantic sharded exact merge complete"
-        );
-        Ok((
-            collapsed,
-            SemanticCandidateRetryState {
-                has_more_candidates,
-                exact_window_may_omit_competitor,
-            },
-        ))
+            ))
+        })
+        .map_err(|err: crate::storage::api::StorageError| anyhow!(err.to_string()))
     }
 
-    fn search_semantic_candidates(
+    /// Dispatches a semantic candidate fetch to the DB vector domain.
+    ///
+    /// w3-d7① three-state contract: a `building`/`absent` vector-domain
+    /// error from `search_db_vector_domain` is propagated as-is (mapped to
+    /// the caller's `Result`, not swallowed) — callers must never paper
+    /// over it with an empty result (that would be a silent scan, the
+    /// exact thing d7 forbids).
+    ///
+    /// W3-5: the legacy fsvi/`CASS_SEMANTIC_USE_FSVI=1` escape-hatch branch
+    /// (and the two-tier/HNSW-ANN candidate machinery it was the sole
+    /// production caller of) has been retired; this is now the only path.
+    fn search_semantic_candidates_dispatch(
         &self,
         context: &SemanticCandidateContext,
         embedding: &[f32],
         filters: &SearchFilters,
-        request: SemanticCandidateSearchRequest<'_>,
-    ) -> Result<(
-        Vec<VectorSearchResult>,
-        SemanticCandidateRetryState,
-        Option<crate::search::ann_index::AnnSearchStats>,
-    )> {
-        let mut semantic_filter =
-            SemanticFilter::from_search_filters(filters, &context.filter_maps)?;
-        // `filters.roles` (from an explicit `--role`) overrides the semantic
-        // engine's default user+assistant role filter rather than
-        // intersecting with it: only fall back to the context default when
-        // the caller didn't ask for specific roles.
-        if semantic_filter.roles.is_none()
-            && let Some(roles) = context.roles.clone()
-        {
-            semantic_filter = semantic_filter.with_roles(Some(roles));
-        }
-
-        if request.tier_mode.wants_two_tier() && !request.approximate {
-            let fs_filter = semantic_filter_as_search_filter(&semantic_filter);
-            if let Some(two_tier_index) = request.in_memory_two_tier_index {
-                let config = request.tier_mode.to_frankensearch_config();
-                let searcher = FsSyncTwoTierSearcher::new(Arc::clone(two_tier_index), config);
-                let (tier_hits, metrics) = searcher
-                    .search_collect_with_filter(embedding, request.fetch_limit, fs_filter)
-                    .map_err(|err| {
-                        anyhow!("frankensearch two-tier semantic search failed: {err}")
-                    })?;
-
-                tracing::debug!(
-                    tier_mode = ?request.tier_mode,
-                    phase1_ms = metrics.phase1_total_ms,
-                    phase2_ms = metrics.phase2_total_ms,
-                    skip_reason = ?metrics.skip_reason,
-                    returned = tier_hits.len(),
-                    "semantic two-tier search executed"
-                );
-
-                let mut best_by_message: HashMap<u64, VectorSearchResult> =
-                    HashMap::with_capacity(tier_hits.len());
-                for hit in tier_hits.iter() {
-                    let Some(parsed) = parse_semantic_doc_id(&hit.doc_id) else {
-                        continue;
-                    };
-                    best_by_message
-                        .entry(parsed.message_id)
-                        .and_modify(|entry| {
-                            if hit.score > entry.score {
-                                entry.score = hit.score;
-                                entry.chunk_idx = parsed.chunk_idx;
-                            }
-                        })
-                        .or_insert(VectorSearchResult {
-                            message_id: parsed.message_id,
-                            chunk_idx: parsed.chunk_idx,
-                            score: hit.score,
-                        });
-                }
-
-                return Ok((
-                    Self::collapse_semantic_results(best_by_message, request.fetch_limit),
-                    SemanticCandidateRetryState {
-                        has_more_candidates: tier_hits.len() >= request.fetch_limit,
-                        exact_window_may_omit_competitor: false,
-                    },
-                    None,
-                ));
-            }
-
-            tracing::debug!(
-                tier_mode = ?request.tier_mode,
-                "two-tier semantic unavailable; falling back to exact single-tier search"
-            );
-
-            let fs_filter = semantic_filter_as_search_filter(&semantic_filter);
-            let (results, truncated) = Self::search_exact_semantic_indexes(
-                context,
-                embedding,
-                request.fetch_limit,
-                fs_filter,
-            )?;
-            return Ok((results, truncated, None));
-        }
-
-        if request.approximate {
-            if request.tier_mode.wants_two_tier() {
-                tracing::debug!(
-                    tier_mode = ?request.tier_mode,
-                    "approximate search requested; bypassing two-tier mode"
-                );
-            }
-
-            let ann = request
-                .ann_index
-                .ok_or_else(|| anyhow!("HNSW index failed to initialize"))?;
-            let candidate = request
-                .fetch_limit
-                .saturating_mul(ANN_CANDIDATE_MULTIPLIER)
-                .max(request.fetch_limit);
-            let ef = FS_HNSW_DEFAULT_EF_SEARCH.max(candidate);
-            let (ann_results, search_stats) =
-                ann.knn_search_with_stats(embedding, candidate, ef)
-                    .map_err(|err| anyhow!("frankensearch approximate search failed: {err}"))?;
-            let ann_stats = Some(crate::search::ann_index::AnnSearchStats {
-                index_size: search_stats.index_size,
-                dimension: search_stats.dimension,
-                ef_search: search_stats.ef_search,
-                k_requested: search_stats.k_requested,
-                k_returned: search_stats.k_returned,
-                search_time_us: search_stats.search_time_us,
-                estimated_recall: search_stats.estimated_recall as f32,
-                is_approximate: search_stats.is_approximate,
-            });
-
-            let fs_filter = semantic_filter_as_search_filter(&semantic_filter);
-
-            let mut best_by_message: HashMap<u64, VectorSearchResult> =
-                HashMap::with_capacity(ann_results.len());
-            for hit in ann_results.iter() {
-                if let Some(filter) = fs_filter
-                    && !filter.matches(&hit.doc_id, None)
-                {
-                    continue;
-                }
-                let Some(parsed) = parse_semantic_doc_id(&hit.doc_id) else {
-                    continue;
-                };
-                best_by_message
-                    .entry(parsed.message_id)
-                    .and_modify(|entry| {
-                        if hit.score > entry.score {
-                            entry.score = hit.score;
-                            entry.chunk_idx = parsed.chunk_idx;
-                        }
-                    })
-                    .or_insert(VectorSearchResult {
-                        message_id: parsed.message_id,
-                        chunk_idx: parsed.chunk_idx,
-                        score: hit.score,
-                    });
-            }
-
-            return Ok((
-                Self::collapse_semantic_results(best_by_message, request.fetch_limit),
-                SemanticCandidateRetryState {
-                    has_more_candidates: ann_results.len() >= candidate,
-                    exact_window_may_omit_competitor: false,
-                },
-                ann_stats,
-            ));
-        }
-
-        let fs_filter = semantic_filter_as_search_filter(&semantic_filter);
-        let (results, truncated) = Self::search_exact_semantic_indexes(
-            context,
+        request: SemanticCandidateSearchRequest,
+    ) -> Result<(Vec<VectorSearchResult>, SemanticCandidateRetryState)> {
+        let sqlite_guard = self.sqlite_guard()?;
+        let conn = sqlite_guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("db vector domain search requires a database connection"))?;
+        Self::search_db_vector_domain(
+            conn,
             embedding,
+            filters,
+            context.roles.as_ref(),
             request.fetch_limit,
-            fs_filter,
-        )?;
-        Ok((results, truncated, None))
+        )
     }
 
-    pub fn can_progressively_refine(&self) -> bool {
-        self.progressive_context()
-            .map(|context| {
-                context.as_ref().is_some_and(|ctx| {
-                    ctx.quality_embedder.is_some() && ctx.index.has_quality_index()
-                })
-            })
-            .unwrap_or(false)
-    }
-
-    fn progressive_context(&self) -> Result<Option<Arc<ProgressiveTwoTierContext>>> {
+    /// Semantic search over the DB-vector-domain candidate path.
+    ///
+    /// W3-5: this used to also return `Option<AnnSearchStats>` for
+    /// robot-output/TUI schema compatibility with the retired HNSW
+    /// approximate-search path (`--approximate`) and the progressive
+    /// two-tier execution strategy (`search_semantic_with_tier`,
+    /// `SemanticTierMode`) -- both fsvi-era acceleration surfaces with no
+    /// DB-vector-domain equivalent (KU2: an exact db_vector_domain scan is
+    /// <2s at 101.6万 scale, removing the accuracy/speed tradeoff motive for
+    /// either). That field was always `None` post-retirement (nothing ever
+    /// constructed a `Some`), so it -- and `ann_index.rs`, its sole source
+    /// -- are dropped rather than threaded through for a value that could
+    /// never be anything but absent.
+    pub fn search_semantic(
+        &self,
+        query: &str,
+        filters: SearchFilters,
+        limit: usize,
+        offset: usize,
+        field_mask: FieldMask,
+    ) -> Result<Vec<SearchHit>> {
+        let field_mask = effective_field_mask(field_mask);
+        let canonical = canonicalize_for_embedding(query);
+        if canonical.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let limit = if limit == 0 {
+            self.total_docs().min(no_limit_result_cap()).max(1)
+        } else {
+            limit
+        };
+        let target_hits = limit.saturating_add(offset);
+        if target_hits == 0 {
+            return Ok(Vec::new());
+        }
+        let initial_fetch_limit = target_hits;
+        let fallback_fetch_limit = target_hits.saturating_mul(3);
         loop {
-            let (ann_path, embedder, context_token) = {
-                let mut guard = self
-                    .semantic
-                    .lock()
-                    .map_err(|_| anyhow!("semantic lock poisoned"))?;
-                let state = guard.as_mut().ok_or_else(|| {
-                    anyhow!("semantic search unavailable (no embedder or vector index)")
-                })?;
-                if let Some(context) = state.progressive_context.as_ref() {
-                    return Ok(Some(Arc::clone(context)));
-                }
-                if state.progressive_context_unavailable {
-                    return Ok(None);
-                }
-                (
-                    state.ann_path.clone(),
-                    Arc::clone(&state.embedder),
-                    Arc::clone(&state.context_token),
-                )
-            };
-
-            let context = match self.build_progressive_context(
-                ann_path.clone(),
-                embedder,
-                Arc::clone(&context_token),
-            ) {
-                Ok(context) => context,
-                Err(err) => {
-                    let mut guard = self
+            let (embedding, candidate_context, context_token) = loop {
+                let embedding = self.semantic_query_embedding(&canonical)?;
+                let (candidate_context, context_token) = {
+                    let guard = self
                         .semantic
                         .lock()
                         .map_err(|_| anyhow!("semantic lock poisoned"))?;
-                    let state = guard.as_mut().ok_or_else(|| {
+                    let state = guard.as_ref().ok_or_else(|| {
                         anyhow!("semantic search unavailable (no embedder or vector index)")
                     })?;
-                    if let Some(existing) = state.progressive_context.as_ref() {
-                        return Ok(Some(Arc::clone(existing)));
-                    }
-                    if !Arc::ptr_eq(&state.context_token, &context_token) {
-                        continue;
-                    }
-                    return Err(err);
+                    (
+                        SemanticCandidateContext {
+                            roles: state.roles.clone(),
+                        },
+                        Arc::clone(&state.context_token),
+                    )
+                };
+                if !Arc::ptr_eq(&embedding.context_token, &context_token) {
+                    continue;
                 }
-            };
 
-            let Some(context) = context else {
-                let mut guard = self
+                let guard = self
                     .semantic
                     .lock()
                     .map_err(|_| anyhow!("semantic lock poisoned"))?;
-                let state = guard.as_mut().ok_or_else(|| {
+                let state = guard.as_ref().ok_or_else(|| {
                     anyhow!("semantic search unavailable (no embedder or vector index)")
                 })?;
-                if let Some(existing) = state.progressive_context.as_ref() {
-                    return Ok(Some(Arc::clone(existing)));
-                }
                 if !Arc::ptr_eq(&state.context_token, &context_token) {
                     continue;
                 }
-                state.progressive_context_unavailable = true;
-                return Ok(None);
+                break (embedding.vector, candidate_context, context_token);
             };
 
-            let mut guard = self
-                .semantic
-                .lock()
-                .map_err(|_| anyhow!("semantic lock poisoned"))?;
-            let state = guard.as_mut().ok_or_else(|| {
-                anyhow!("semantic search unavailable (no embedder or vector index)")
-            })?;
-            if let Some(existing) = state.progressive_context.as_ref() {
-                return Ok(Some(Arc::clone(existing)));
-            }
-            if !Arc::ptr_eq(&state.context_token, &context_token) {
+            let finalize_hits =
+                |results: &[VectorSearchResult]| -> Result<(usize, Vec<SearchHit>)> {
+                    let hits = self.hydrate_semantic_hits(results, field_mask)?;
+                    Ok(self.postprocess_hits_page(hits, query, &filters, limit, offset))
+                };
+
+            let (results, retry_state) = self.search_semantic_candidates_dispatch(
+                &candidate_context,
+                &embedding,
+                &filters,
+                SemanticCandidateSearchRequest {
+                    fetch_limit: initial_fetch_limit,
+                },
+            )?;
+            if !self.semantic_context_matches(&context_token)? {
+                tracing::debug!("semantic context changed during candidate search; retrying");
                 continue;
             }
-            state.progressive_context_unavailable = false;
-            state.progressive_context = Some(Arc::clone(&context));
-            return Ok(Some(context));
-        }
-    }
+            let (mut available_hits, mut paged_hits) = finalize_hits(&results)?;
 
-    fn build_progressive_context(
-        &self,
-        ann_path: Option<PathBuf>,
-        embedder: Arc<dyn Embedder>,
-        context_token: Arc<()>,
-    ) -> Result<Option<Arc<ProgressiveTwoTierContext>>> {
-        let Some(index_dir) = ann_path
-            .as_ref()
-            .and_then(|path| path.parent().map(Path::to_path_buf))
-        else {
-            return Ok(None);
-        };
+            let needs_retry = initial_fetch_limit < fallback_fetch_limit
+                && ((available_hits < target_hits && retry_state.has_more_candidates)
+                    || retry_state.exact_window_may_omit_competitor);
 
-        let fast_path = {
-            let explicit = index_dir.join("vector.fast.idx");
-            if explicit.is_file() {
-                explicit
-            } else {
-                let fallback = index_dir.join("vector.idx");
-                if fallback.is_file() {
-                    fallback
-                } else {
-                    return Ok(None);
-                }
-            }
-        };
-        let quality_path = index_dir.join("vector.quality.idx");
-        if !quality_path.is_file() {
-            return Ok(None);
-        }
-
-        let fast_index = FsVectorIndex::open(&fast_path)
-            .map_err(|err| anyhow!("open fast-tier index failed: {err}"))?;
-        let quality_index = FsVectorIndex::open(&quality_path)
-            .map_err(|err| anyhow!("open quality-tier index failed: {err}"))?;
-        let index = Arc::new(
-            FsTwoTierIndex::open(&index_dir, frankensearch_two_tier_config())
-                .map_err(|err| anyhow!("open progressive two-tier index failed: {err}"))?,
-        );
-
-        let fast_embedder = self.load_embedder_for_progressive_id(
-            &embedder,
-            fast_index.embedder_id(),
-            fast_index.dimension(),
-        )?;
-        let fast_embedder: Arc<dyn frankensearch::Embedder> = Arc::new(FsSyncEmbedderAdapter(
-            SharedCassSyncEmbedder::new(fast_embedder),
-        ));
-        let quality_embedder = Some(self.load_embedder_for_progressive_id(
-            &embedder,
-            quality_index.embedder_id(),
-            quality_index.dimension(),
-        )?);
-        let quality_embedder = quality_embedder.map(|embedder| {
-            Arc::new(FsSyncEmbedderAdapter(SharedCassSyncEmbedder::new(embedder)))
-                as Arc<dyn frankensearch::Embedder>
-        });
-
-        Ok(Some(Arc::new(ProgressiveTwoTierContext {
-            context_token,
-            index,
-            fast_embedder,
-            quality_embedder,
-        })))
-    }
-
-    fn load_embedder_for_progressive_id(
-        &self,
-        current_embedder: &Arc<dyn Embedder>,
-        embedder_id: &str,
-        dimension: usize,
-    ) -> Result<Arc<dyn Embedder>> {
-        if current_embedder.id() == embedder_id {
-            return Ok(Arc::clone(current_embedder));
-        }
-
-        if let Some(dim) = embedder_id.strip_prefix("fnv1a-")
-            && let Ok(parsed) = dim.parse::<usize>()
-        {
-            return Ok(Arc::new(crate::search::hash_embedder::HashEmbedder::new(
-                parsed.max(dimension),
-            )));
-        }
-
-        if let Some(embedder_name) =
-            crate::search::fastembed_embedder::FastEmbedder::canonical_name(embedder_id)
-        {
-            let data_dir = self
-                .sqlite_path
-                .as_ref()
-                .and_then(|path| path.parent())
-                .ok_or_else(|| anyhow!("cannot resolve data dir for progressive embedder load"))?;
-            let embedder = crate::search::fastembed_embedder::FastEmbedder::load_by_name(
-                data_dir,
-                embedder_name,
-            )
-            .with_context(|| format!("loading FastEmbed model for {embedder_name}"))?;
-            if embedder.dimension() != dimension {
-                bail!(
-                    "progressive embedder dimension mismatch: {} index expects {}, model has {}",
-                    embedder_id,
-                    dimension,
-                    embedder.dimension()
+            if needs_retry {
+                tracing::debug!(
+                    query = canonical,
+                    target_hits,
+                    available_hits,
+                    initial_fetch_limit,
+                    fallback_fetch_limit,
+                    "retrying semantic fetch due to candidate-window shortfall"
                 );
-            }
-            return Ok(Arc::new(embedder));
-        }
-
-        bail!("unsupported progressive embedder id: {embedder_id}");
-    }
-
-    fn resolve_semantic_doc_ids_for_hits(
-        &self,
-        hits: &[SearchHit],
-    ) -> Result<Vec<Option<ResolvedSemanticDocId>>> {
-        if hits.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let lookup_keys: Vec<Option<ProgressiveLookupKey>> = hits
-            .iter()
-            .map(|hit| {
-                let idx = hit
-                    .line_number
-                    .and_then(|line| line.checked_sub(1))
-                    .map(i64::try_from)
-                    .transpose()
-                    .ok()
-                    .flatten()?;
-                Some((
-                    normalized_search_hit_source_id(hit),
-                    hit.source_path.clone(),
-                    hit.conversation_id,
-                    hit.title.trim().to_string(),
-                    idx,
-                    hit.created_at,
-                    hit.content_hash,
-                ))
-            })
-            .collect();
-
-        let mut seen_exact = HashSet::new();
-        let mut exact_query_keys = Vec::new();
-        let mut seen_fallback = HashSet::new();
-        let mut fallback_query_keys = Vec::new();
-        for (source_id, source_path, conversation_id, _title, idx, _created_at, _content_hash) in
-            lookup_keys.iter().flatten()
-        {
-            if let Some(conversation_id) = conversation_id {
-                let query_key: ProgressiveExactQueryKey = (*conversation_id, *idx);
-                if seen_exact.insert(query_key) {
-                    exact_query_keys.push(query_key);
+                let (retry_results, _) = self.search_semantic_candidates_dispatch(
+                    &candidate_context,
+                    &embedding,
+                    &filters,
+                    SemanticCandidateSearchRequest {
+                        fetch_limit: fallback_fetch_limit,
+                    },
+                )?;
+                if !self.semantic_context_matches(&context_token)? {
+                    tracing::debug!("semantic context changed during retry fetch; retrying");
+                    continue;
                 }
-            } else {
-                let query_key: ProgressiveFallbackQueryKey =
-                    (source_id.clone(), source_path.clone(), *idx);
-                if seen_fallback.insert(query_key.clone()) {
-                    fallback_query_keys.push(query_key);
-                }
+                (available_hits, paged_hits) = finalize_hits(&retry_results)?;
             }
-        }
 
-        if exact_query_keys.is_empty() && fallback_query_keys.is_empty() {
-            return Ok(vec![None; hits.len()]);
-        }
-
-        let sqlite_guard = self.sqlite_guard()?;
-        let conn = sqlite_guard
-            .as_ref()
-            .ok_or_else(|| anyhow!("progressive search requires database connection"))?;
-
-        let mut resolved_by_key = HashMap::new();
-        let normalized_source_sql =
-            normalized_search_source_id_sql_expr("c.source_id", "s.kind", "c.origin_host");
-
-        const CHUNK_SIZE: usize = 300;
-        for chunk in exact_query_keys.chunks(CHUNK_SIZE) {
-            let mut sql = String::from("SELECT c.id, ");
-            sql.push_str(&normalized_source_sql);
-            sql.push_str(
-                ", c.source_path, m.idx, m.id, c.agent_id, c.workspace_id, m.role, m.created_at, m.content, c.title
-                 FROM messages m
-                 JOIN conversations c ON m.conversation_id = c.id
-                 LEFT JOIN sources s ON c.source_id = s.id
-                 WHERE ",
+            tracing::trace!(
+                query = canonical,
+                target_hits,
+                available_hits,
+                returned = paged_hits.len(),
+                "semantic fetch complete"
             );
-            let mut params = Vec::with_capacity(chunk.len().saturating_mul(2));
-            for (idx, (conversation_id, line_idx)) in chunk.iter().enumerate() {
-                if idx > 0 {
-                    sql.push_str(" OR ");
-                }
-                sql.push_str("(c.id = ? AND m.idx = ?)");
-                params.push(ParamValue::from(*conversation_id));
-                params.push(ParamValue::from(*line_idx));
-            }
 
-            let chunk_rows: Vec<ResolvedSemanticLookupRow> =
-                conn.query_all_map(&sql, &params, |row: &FrankenRow| {
-                    let conversation_id: i64 = row.get_typed(0)?;
-                    let source_id: String = row.get_typed(1)?;
-                    let source_path: String = row.get_typed(2)?;
-                    let idx: i64 = row.get_typed(3)?;
-                    let message_id_raw: i64 = row.get_typed(4)?;
-                    // agent_id is nullable for legacy V1 conversations; treat
-                    // NULL the same as the negative-sentinel branch below (0).
-                    let agent_id_raw: Option<i64> = row.get_typed(5)?;
-                    let workspace_id_raw: Option<i64> = row.get_typed(6)?;
-                    let role_raw: String = row.get_typed(7)?;
-                    let created_at_ms: Option<i64> = row.get_typed(8)?;
-                    let content: String = row.get_typed(9)?;
-                    let title: Option<String> = row.get_typed(10)?;
-
-                    let canonical = canonicalize_for_embedding(&content);
-                    if canonical.is_empty() {
-                        return Ok(None);
-                    }
-
-                    let message_id = u64::try_from(message_id_raw).map_err(|_| StorageError::Other {
-                        code: None,
-                        detail: "message id out of range for progressive doc_id".to_string(),
-                    })?;
-                    let agent_id = semantic_doc_component_id_from_db(agent_id_raw);
-                    let workspace_id = semantic_doc_component_id_from_db(workspace_id_raw);
-                    let role = role_code_from_str(&role_raw).unwrap_or(ROLE_USER);
-                    let doc_id = SemanticDocId {
-                        message_id,
-                        chunk_idx: 0,
-                        agent_id,
-                        workspace_id,
-                        source_id: crc32fast::hash(source_id.as_bytes()),
-                        role,
-                        created_at_ms: created_at_ms.unwrap_or(0),
-                        content_hash: Some(content_hash(&canonical)),
-                    }
-                    .to_doc_id_string();
-                    let line_number = usize::try_from(idx).ok().map(|line| line.saturating_add(1));
-                    let lookup_key = (
-                        source_id,
-                        source_path.clone(),
-                        Some(conversation_id),
-                        title.unwrap_or_default().trim().to_string(),
-                        idx,
-                        created_at_ms,
-                        stable_hit_hash(&content, &source_path, line_number, created_at_ms),
-                    );
-
-                    Ok(Some((
-                        lookup_key,
-                        ResolvedSemanticDocId { message_id, doc_id },
-                    )))
-                })?;
-
-            for row in chunk_rows.into_iter().flatten() {
-                resolved_by_key.insert(row.0, row.1);
-            }
+            return Ok(paged_hits);
         }
-
-        for chunk in fallback_query_keys.chunks(CHUNK_SIZE) {
-            let mut sql = String::from("SELECT ");
-            sql.push_str(&normalized_source_sql);
-            sql.push_str(
-                ", c.source_path, m.idx, m.id, c.agent_id, c.workspace_id, m.role, m.created_at, m.content, c.title
-                 FROM messages m
-                 JOIN conversations c ON m.conversation_id = c.id
-                 LEFT JOIN sources s ON c.source_id = s.id
-                 WHERE ",
-            );
-            let mut params = Vec::with_capacity(chunk.len().saturating_mul(3));
-            for (idx, (source_id, source_path, line_idx)) in chunk.iter().enumerate() {
-                if idx > 0 {
-                    sql.push_str(" OR ");
-                }
-                sql.push_str(&format!(
-                    "({normalized_source_sql} = ? AND c.source_path = ? AND m.idx = ?)"
-                ));
-                params.push(ParamValue::from(normalize_search_source_filter_value(
-                    source_id,
-                )));
-                params.push(ParamValue::from(source_path.clone()));
-                params.push(ParamValue::from(*line_idx));
-            }
-
-            let chunk_rows: Vec<ResolvedSemanticLookupRow> =
-                conn.query_all_map(&sql, &params, |row: &FrankenRow| {
-                    let source_id: String = row.get_typed(0)?;
-                    let source_path: String = row.get_typed(1)?;
-                    let idx: i64 = row.get_typed(2)?;
-                    let message_id_raw: i64 = row.get_typed(3)?;
-                    // agent_id is nullable for legacy V1 conversations; treat
-                    // NULL the same as the negative-sentinel branch below (0).
-                    let agent_id_raw: Option<i64> = row.get_typed(4)?;
-                    let workspace_id_raw: Option<i64> = row.get_typed(5)?;
-                    let role_raw: String = row.get_typed(6)?;
-                    let created_at_ms: Option<i64> = row.get_typed(7)?;
-                    let content: String = row.get_typed(8)?;
-                    let title: Option<String> = row.get_typed(9)?;
-
-                    let canonical = canonicalize_for_embedding(&content);
-                    if canonical.is_empty() {
-                        return Ok(None);
-                    }
-
-                    let message_id = u64::try_from(message_id_raw).map_err(|_| StorageError::Other {
-                        code: None,
-                        detail: "message id out of range for progressive doc_id".to_string(),
-                    })?;
-                    let agent_id = semantic_doc_component_id_from_db(agent_id_raw);
-                    let workspace_id = semantic_doc_component_id_from_db(workspace_id_raw);
-                    let role = role_code_from_str(&role_raw).unwrap_or(ROLE_USER);
-                    let doc_id = SemanticDocId {
-                        message_id,
-                        chunk_idx: 0,
-                        agent_id,
-                        workspace_id,
-                        source_id: crc32fast::hash(source_id.as_bytes()),
-                        role,
-                        created_at_ms: created_at_ms.unwrap_or(0),
-                        content_hash: Some(content_hash(&canonical)),
-                    }
-                    .to_doc_id_string();
-                    let line_number = usize::try_from(idx).ok().map(|line| line.saturating_add(1));
-                    let lookup_key = (
-                        source_id,
-                        source_path.clone(),
-                        None,
-                        title.unwrap_or_default().trim().to_string(),
-                        idx,
-                        created_at_ms,
-                        stable_hit_hash(&content, &source_path, line_number, created_at_ms),
-                    );
-
-                    Ok(Some((
-                        lookup_key,
-                        ResolvedSemanticDocId { message_id, doc_id },
-                    )))
-                })?;
-
-            for row in chunk_rows.into_iter().flatten() {
-                resolved_by_key.insert(row.0, row.1);
-            }
-        }
-
-        Ok(lookup_keys
-            .into_iter()
-            .map(|key| key.and_then(|lookup| resolved_by_key.get(&lookup).cloned()))
-            .collect())
-    }
-
-    fn load_message_text_by_id(&self, message_id: u64) -> Result<Option<String>> {
-        let sqlite_guard = self.sqlite_guard()?;
-        let conn = sqlite_guard
-            .as_ref()
-            .ok_or_else(|| anyhow!("progressive search requires database connection"))?;
-        let rows: Vec<String> = conn.query_all_map(
-            "SELECT content FROM messages WHERE id = ?",
-            &[ParamValue::from(i64::try_from(message_id)?)],
-            |row: &FrankenRow| row.get_typed(0),
-        )?;
-        Ok(rows.into_iter().next())
-    }
-
-    fn collapse_progressive_scored_results(
-        &self,
-        results: &[FsScoredResult],
-        fetch_limit: usize,
-    ) -> Vec<VectorSearchResult> {
-        let fetch = fetch_limit.max(1);
-        let mut best_by_message: HashMap<u64, VectorSearchResult> =
-            HashMap::with_capacity(results.len());
-        for hit in results {
-            let Some(parsed) = parse_semantic_doc_id(&hit.doc_id) else {
-                continue;
-            };
-            best_by_message
-                .entry(parsed.message_id)
-                .and_modify(|entry| {
-                    if hit.score > entry.score {
-                        entry.score = hit.score;
-                        entry.chunk_idx = parsed.chunk_idx;
-                    }
-                })
-                .or_insert(VectorSearchResult {
-                    message_id: parsed.message_id,
-                    chunk_idx: parsed.chunk_idx,
-                    score: hit.score,
-                });
-        }
-        let mut collapsed: Vec<VectorSearchResult> = best_by_message.into_values().collect();
-        collapsed.sort_by(|a, b| {
-            b.score
-                .total_cmp(&a.score)
-                .then_with(|| a.message_id.cmp(&b.message_id))
-        });
-        if collapsed.len() > fetch {
-            collapsed.truncate(fetch);
-        }
-        collapsed
     }
 
     fn hydrate_semantic_hits_with_ids(
@@ -5048,474 +4215,6 @@ impl SearchClient {
         Ok(ordered)
     }
 
-    fn overlay_progressive_lexical_hit(
-        &self,
-        hit: &mut SearchHit,
-        lexical: &ProgressiveLexicalHit,
-        field_mask: FieldMask,
-    ) {
-        if field_mask.wants_title() && !lexical.title.is_empty() {
-            hit.title = lexical.title.clone();
-        }
-        if field_mask.wants_snippet() && !lexical.snippet.is_empty() {
-            hit.snippet = lexical.snippet.clone();
-        }
-        if field_mask.needs_content() && !lexical.content.is_empty() {
-            hit.content = lexical.content.clone();
-        }
-        hit.match_type = lexical.match_type;
-        hit.line_number = lexical.line_number.or(hit.line_number);
-    }
-
-    fn progressive_phase_to_result(
-        &self,
-        results: &[FsScoredResult],
-        ctx: ProgressivePhaseContext<'_>,
-    ) -> Result<SearchResult> {
-        let collapsed = self.collapse_progressive_scored_results(results, ctx.fetch_limit);
-        let missing: Vec<VectorSearchResult> = collapsed
-            .iter()
-            .filter(|result| {
-                ctx.lexical_cache
-                    .and_then(|cache| cache.hits_by_message.get(&result.message_id))
-                    .is_none()
-            })
-            .map(|result| VectorSearchResult {
-                message_id: result.message_id,
-                chunk_idx: result.chunk_idx,
-                score: result.score,
-            })
-            .collect();
-        let mut hydrated_by_id: HashMap<u64, SearchHit> = self
-            .hydrate_semantic_hits_with_ids(&missing, ctx.field_mask)?
-            .into_iter()
-            .collect();
-
-        let mut hydrated: Vec<(u64, SearchHit)> = Vec::with_capacity(collapsed.len());
-        for result in &collapsed {
-            if let Some(cache) = ctx.lexical_cache
-                && let Some(lexical) = cache.hits_by_message.get(&result.message_id)
-            {
-                hydrated.push((result.message_id, lexical.to_search_hit(result.score)));
-                continue;
-            }
-            if let Some(mut hit) = hydrated_by_id.remove(&result.message_id) {
-                if let Some(cache) = ctx.lexical_cache
-                    && let Some(lexical) = cache.hits_by_message.get(&result.message_id)
-                {
-                    self.overlay_progressive_lexical_hit(&mut hit, lexical, ctx.field_mask);
-                }
-                hydrated.push((result.message_id, hit));
-            }
-        }
-
-        let mut hits: Vec<SearchHit> = hydrated.into_iter().map(|(_, hit)| hit).collect();
-        (_, hits) = self.postprocess_hits_page(hits, ctx.query, ctx.filters, ctx.limit, 0);
-
-        let (wildcard_fallback, suggestions) = ctx
-            .lexical_cache
-            .map(|cache| {
-                let suggestions = if hits.is_empty() {
-                    cache.suggestions.clone()
-                } else {
-                    Vec::new()
-                };
-                (cache.wildcard_fallback, suggestions)
-            })
-            .unwrap_or((false, Vec::new()));
-
-        Ok(SearchResult {
-            hits,
-            wildcard_fallback,
-            cache_stats: self.cache_stats(),
-            suggestions,
-            ann_stats: None,
-            total_count: None,
-        })
-    }
-
-    pub(crate) async fn search_progressive_with_callback(
-        self: &Arc<Self>,
-        request: ProgressiveSearchRequest<'_>,
-        mut on_event: impl FnMut(ProgressiveSearchEvent) + Send,
-    ) -> Result<()> {
-        let ProgressiveSearchRequest {
-            cx,
-            query,
-            filters,
-            limit,
-            sparse_threshold,
-            field_mask,
-            mode,
-        } = request;
-        let field_mask = effective_field_mask(field_mask);
-        let limit = limit.max(1);
-        let fetch_limit = progressive_phase_fetch_limit(limit);
-
-        match mode {
-            SearchMode::Lexical => {
-                let started = Instant::now();
-                let result = self.search_with_fallback(
-                    query,
-                    filters,
-                    limit,
-                    0,
-                    sparse_threshold,
-                    field_mask,
-                )?;
-                on_event(ProgressiveSearchEvent::Phase {
-                    kind: ProgressivePhaseKind::Initial,
-                    elapsed_ms: started.elapsed().as_millis(),
-                    result,
-                });
-                return Ok(());
-            }
-            SearchMode::Semantic | SearchMode::Hybrid => {}
-        }
-
-        let progressive_context = {
-            self.progressive_context()?
-                .ok_or_else(|| anyhow!("progressive two-tier context unavailable"))?
-        };
-        let progressive_context_token = Arc::clone(&progressive_context.context_token);
-
-        let lexical_cache: Arc<Mutex<ProgressiveLexicalSnapshot>> =
-            Arc::new(Mutex::new(Arc::new(ProgressiveLexicalCache::default())));
-        let text_cache: Arc<Mutex<HashMap<u64, String>>> = Arc::new(Mutex::new(HashMap::new()));
-        let text_client = Arc::clone(self);
-        let text_cache_for_lookup = Arc::clone(&text_cache);
-        let text_fn = move |doc_id: &str| -> Option<String> {
-            let parsed = parse_semantic_doc_id(doc_id)?;
-            if let Ok(cache) = text_cache_for_lookup.lock()
-                && let Some(text) = cache.get(&parsed.message_id)
-            {
-                return Some(text.clone());
-            }
-            let loaded = text_client
-                .load_message_text_by_id(parsed.message_id)
-                .ok()
-                .flatten()?;
-            if let Ok(mut cache) = text_cache_for_lookup.lock() {
-                cache.insert(parsed.message_id, loaded.clone());
-            }
-            Some(loaded)
-        };
-
-        let mut searcher = FsTwoTierSearcher::new(
-            Arc::clone(&progressive_context.index),
-            Arc::clone(&progressive_context.fast_embedder),
-            frankensearch_two_tier_config(),
-        );
-
-        if let Some(quality_embedder) = progressive_context.quality_embedder.as_ref() {
-            searcher = searcher.with_quality_embedder(Arc::clone(quality_embedder));
-        }
-
-        if matches!(mode, SearchMode::Hybrid) {
-            let lexical = Arc::new(CassProgressiveLexicalAdapter::new(
-                Arc::clone(self),
-                filters.clone(),
-                field_mask,
-                sparse_threshold,
-                Arc::clone(&lexical_cache),
-            ));
-            searcher = searcher.with_lexical(lexical);
-        }
-
-        let phase_client = Arc::clone(self);
-        let phase_filters = filters.clone();
-        let phase_cache = Arc::clone(&lexical_cache);
-        let mut phase_error: Option<anyhow::Error> = None;
-
-        let search_result = searcher
-            .search(cx, query, fetch_limit, text_fn, |phase| {
-                if phase_error.is_some() {
-                    return;
-                }
-                match phase_client.semantic_context_matches(&progressive_context_token) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        phase_error = Some(anyhow!(
-                            "progressive search aborted: semantic context changed"
-                        ));
-                        cx.set_cancel_requested(true);
-                        return;
-                    }
-                    Err(err) => {
-                        phase_error = Some(err);
-                        cx.set_cancel_requested(true);
-                        return;
-                    }
-                }
-                let lexical_snapshot = phase_cache.lock().ok().map(|guard| Arc::clone(&guard));
-                let event_result = match phase {
-                    FsSearchPhase::Initial {
-                        results, latency, ..
-                    } => phase_client
-                        .progressive_phase_to_result(
-                            &results,
-                            ProgressivePhaseContext {
-                                query,
-                                filters: &phase_filters,
-                                field_mask,
-                                lexical_cache: lexical_snapshot.as_deref(),
-                                limit,
-                                fetch_limit,
-                            },
-                        )
-                        .map(|result| ProgressiveSearchEvent::Phase {
-                            kind: ProgressivePhaseKind::Initial,
-                            elapsed_ms: latency.as_millis(),
-                            result,
-                        }),
-                    FsSearchPhase::Refined {
-                        results, latency, ..
-                    } => phase_client
-                        .progressive_phase_to_result(
-                            &results,
-                            ProgressivePhaseContext {
-                                query,
-                                filters: &phase_filters,
-                                field_mask,
-                                lexical_cache: lexical_snapshot.as_deref(),
-                                limit,
-                                fetch_limit,
-                            },
-                        )
-                        .map(|result| ProgressiveSearchEvent::Phase {
-                            kind: ProgressivePhaseKind::Refined,
-                            elapsed_ms: latency.as_millis(),
-                            result,
-                        }),
-                    // frankensearch may emit a final reranked phase after the
-                    // quality-refined pass. cass's progressive consumers only
-                    // distinguish fast initial results from a better upgraded
-                    // replacement set, so reranked results flow through the
-                    // existing refined/upgrade path.
-                    FsSearchPhase::Reranked {
-                        results, latency, ..
-                    } => phase_client
-                        .progressive_phase_to_result(
-                            &results,
-                            ProgressivePhaseContext {
-                                query,
-                                filters: &phase_filters,
-                                field_mask,
-                                lexical_cache: lexical_snapshot.as_deref(),
-                                limit,
-                                fetch_limit,
-                            },
-                        )
-                        .map(|result| ProgressiveSearchEvent::Phase {
-                            kind: ProgressivePhaseKind::Refined,
-                            elapsed_ms: latency.as_millis(),
-                            result,
-                        }),
-                    FsSearchPhase::RefinementFailed { error, latency, .. } => {
-                        Ok(ProgressiveSearchEvent::RefinementFailed {
-                            latency_ms: latency.as_millis(),
-                            error: error.to_string(),
-                        })
-                    }
-                };
-
-                match event_result {
-                    Ok(event) => on_event(event),
-                    Err(err) => {
-                        phase_error = Some(err);
-                        cx.set_cancel_requested(true);
-                    }
-                }
-            })
-            .await;
-
-        if let Some(err) = phase_error {
-            return Err(err);
-        }
-
-        search_result
-            .map(|_| ())
-            .map_err(|err| anyhow!("progressive search failed: {err}"))
-    }
-
-    /// Semantic search result containing hits and optional ANN statistics.
-    pub fn search_semantic(
-        &self,
-        query: &str,
-        filters: SearchFilters,
-        limit: usize,
-        offset: usize,
-        field_mask: FieldMask,
-        approximate: bool,
-    ) -> Result<(
-        Vec<SearchHit>,
-        Option<crate::search::ann_index::AnnSearchStats>,
-    )> {
-        self.search_semantic_with_tier(
-            query,
-            filters,
-            limit,
-            offset,
-            field_mask,
-            approximate,
-            SemanticTierMode::Single,
-        )
-    }
-
-    /// Semantic search with optional progressive two-tier execution strategy.
-    #[allow(clippy::too_many_arguments)]
-    pub fn search_semantic_with_tier(
-        &self,
-        query: &str,
-        filters: SearchFilters,
-        limit: usize,
-        offset: usize,
-        field_mask: FieldMask,
-        approximate: bool,
-        tier_mode: SemanticTierMode,
-    ) -> Result<(
-        Vec<SearchHit>,
-        Option<crate::search::ann_index::AnnSearchStats>,
-    )> {
-        let field_mask = effective_field_mask(field_mask);
-        let canonical = canonicalize_for_embedding(query);
-        if canonical.trim().is_empty() {
-            return Ok((Vec::new(), None));
-        }
-        let limit = if limit == 0 {
-            self.total_docs().min(no_limit_result_cap()).max(1)
-        } else {
-            limit
-        };
-        let target_hits = limit.saturating_add(offset);
-        if target_hits == 0 {
-            return Ok((Vec::new(), None));
-        }
-        let initial_fetch_limit = target_hits;
-        let fallback_fetch_limit = target_hits.saturating_mul(3);
-        loop {
-            let (embedding, candidate_context, in_memory_two_tier_index, ann_index, context_token) = loop {
-                let embedding = self.semantic_query_embedding(&canonical)?;
-                let (candidate_context, context_token) = {
-                    let guard = self
-                        .semantic
-                        .lock()
-                        .map_err(|_| anyhow!("semantic lock poisoned"))?;
-                    let state = guard.as_ref().ok_or_else(|| {
-                        anyhow!("semantic search unavailable (no embedder or vector index)")
-                    })?;
-                    (
-                        SemanticCandidateContext {
-                            fs_semantic_index: Arc::clone(&state.fs_semantic_index),
-                            fs_semantic_indexes: Arc::clone(&state.fs_semantic_indexes),
-                            filter_maps: state.filter_maps.clone(),
-                            roles: state.roles.clone(),
-                        },
-                        Arc::clone(&state.context_token),
-                    )
-                };
-                if !Arc::ptr_eq(&embedding.context_token, &context_token) {
-                    continue;
-                }
-                let in_memory_two_tier_index = if tier_mode.wants_two_tier() && !approximate {
-                    self.in_memory_two_tier_index(tier_mode)?
-                } else {
-                    None
-                };
-                let ann_index = if approximate {
-                    Some(self.ann_index()?)
-                } else {
-                    None
-                };
-
-                let guard = self
-                    .semantic
-                    .lock()
-                    .map_err(|_| anyhow!("semantic lock poisoned"))?;
-                let state = guard.as_ref().ok_or_else(|| {
-                    anyhow!("semantic search unavailable (no embedder or vector index)")
-                })?;
-                if !Arc::ptr_eq(&state.context_token, &context_token) {
-                    continue;
-                }
-                break (
-                    embedding.vector,
-                    candidate_context,
-                    in_memory_two_tier_index,
-                    ann_index,
-                    context_token,
-                );
-            };
-
-            let finalize_hits =
-                |results: &[VectorSearchResult]| -> Result<(usize, Vec<SearchHit>)> {
-                    let hits = self.hydrate_semantic_hits(results, field_mask)?;
-                    Ok(self.postprocess_hits_page(hits, query, &filters, limit, offset))
-                };
-
-            let (results, retry_state, mut ann_stats) = self.search_semantic_candidates(
-                &candidate_context,
-                &embedding,
-                &filters,
-                SemanticCandidateSearchRequest {
-                    fetch_limit: initial_fetch_limit,
-                    approximate,
-                    tier_mode,
-                    in_memory_two_tier_index: in_memory_two_tier_index.as_ref(),
-                    ann_index: ann_index.as_ref(),
-                },
-            )?;
-            if !self.semantic_context_matches(&context_token)? {
-                tracing::debug!("semantic context changed during candidate search; retrying");
-                continue;
-            }
-            let (mut available_hits, mut paged_hits) = finalize_hits(&results)?;
-
-            let needs_retry = initial_fetch_limit < fallback_fetch_limit
-                && ((available_hits < target_hits && retry_state.has_more_candidates)
-                    || retry_state.exact_window_may_omit_competitor);
-
-            if needs_retry {
-                tracing::debug!(
-                    query = canonical,
-                    target_hits,
-                    available_hits,
-                    initial_fetch_limit,
-                    fallback_fetch_limit,
-                    "retrying semantic fetch due to candidate-window shortfall"
-                );
-                let (retry_results, _, retry_ann_stats) = self.search_semantic_candidates(
-                    &candidate_context,
-                    &embedding,
-                    &filters,
-                    SemanticCandidateSearchRequest {
-                        fetch_limit: fallback_fetch_limit,
-                        approximate,
-                        tier_mode,
-                        in_memory_two_tier_index: in_memory_two_tier_index.as_ref(),
-                        ann_index: ann_index.as_ref(),
-                    },
-                )?;
-                if !self.semantic_context_matches(&context_token)? {
-                    tracing::debug!("semantic context changed during retry fetch; retrying");
-                    continue;
-                }
-                (available_hits, paged_hits) = finalize_hits(&retry_results)?;
-                ann_stats = retry_ann_stats;
-            }
-
-            tracing::trace!(
-                query = canonical,
-                target_hits,
-                available_hits,
-                returned = paged_hits.len(),
-                "semantic fetch complete"
-            );
-
-            return Ok((paged_hits, ann_stats));
-        }
-    }
-
     fn hydrate_semantic_hits(
         &self,
         results: &[VectorSearchResult],
@@ -5671,7 +4370,6 @@ impl SearchClient {
             wildcard_fallback: false,
             cache_stats: baseline_stats,
             suggestions,
-            ann_stats: None,
             total_count: tantivy_total,
         })
     }
@@ -5687,35 +4385,6 @@ impl SearchClient {
         offset: usize,
         sparse_threshold: usize,
         field_mask: FieldMask,
-        approximate: bool,
-    ) -> Result<SearchResult> {
-        self.search_hybrid_with_tier(
-            lexical_query,
-            semantic_query,
-            filters,
-            limit,
-            offset,
-            sparse_threshold,
-            field_mask,
-            approximate,
-            SemanticTierMode::Single,
-        )
-    }
-
-    /// Hybrid search that fuses lexical + semantic results with optional
-    /// progressive two-tier semantic execution.
-    #[allow(clippy::too_many_arguments)]
-    pub fn search_hybrid_with_tier(
-        &self,
-        lexical_query: &str,
-        semantic_query: &str,
-        filters: SearchFilters,
-        limit: usize,
-        offset: usize,
-        sparse_threshold: usize,
-        field_mask: FieldMask,
-        approximate: bool,
-        semantic_tier_mode: SemanticTierMode,
     ) -> Result<SearchResult> {
         let requested_limit = limit;
         let total_docs = self.total_docs().max(1);
@@ -5731,7 +4400,6 @@ impl SearchClient {
                 wildcard_fallback: false,
                 cache_stats: self.cache_stats(),
                 suggestions: Vec::new(),
-                ann_stats: None,
                 total_count: None,
             });
         }
@@ -5757,14 +4425,12 @@ impl SearchClient {
             sparse_threshold,
             field_mask,
         )?;
-        let (semantic_hits, semantic_ann_stats) = self.search_semantic_with_tier(
+        let semantic_hits = self.search_semantic(
             semantic_query,
             filters,
             budget.semantic_candidates,
             0,
             field_mask,
-            approximate,
-            semantic_tier_mode,
         )?;
         let fused = rrf_fuse_hits(&lexical.hits, &semantic_hits, semantic_query, limit, offset);
         let suggestions = if fused.is_empty() {
@@ -5777,7 +4443,6 @@ impl SearchClient {
             wildcard_fallback: lexical.wildcard_fallback,
             cache_stats: lexical.cache_stats,
             suggestions,
-            ann_stats: semantic_ann_stats,
             total_count: None,
         })
     }
@@ -7380,52 +6045,6 @@ mod tests {
         hasher.digest()
     }
 
-    fn vector_result(message_id: u64, score: f32) -> VectorSearchResult {
-        VectorSearchResult {
-            message_id,
-            chunk_idx: 0,
-            score,
-        }
-    }
-
-    #[test]
-    fn semantic_exact_candidate_limit_overfetches_chunks_without_full_scan() {
-        assert_eq!(SearchClient::semantic_exact_candidate_limit(10, 1_000), 40);
-        assert_eq!(SearchClient::semantic_exact_candidate_limit(10, 25), 25);
-        assert_eq!(SearchClient::semantic_exact_candidate_limit(0, 1_000), 0);
-        assert_eq!(SearchClient::semantic_exact_candidate_limit(10, 0), 0);
-    }
-
-    #[test]
-    fn semantic_window_detects_possible_hidden_chunk_competitors() {
-        let complete = vec![
-            vector_result(1, 0.9),
-            vector_result(2, 0.8),
-            vector_result(3, 0.7),
-        ];
-        assert!(
-            !SearchClient::semantic_window_may_omit_competitor(&complete, 3, Some(0.6)),
-            "strictly lower omitted chunks cannot alter the top message window"
-        );
-        assert!(
-            SearchClient::semantic_window_may_omit_competitor(&complete, 3, Some(0.7)),
-            "equal-score omitted chunks can still alter deterministic tie-breaking"
-        );
-
-        let duplicate_collapsed_shortfall = vec![vector_result(1, 0.9)];
-        assert!(
-            SearchClient::semantic_window_may_omit_competitor(
-                &duplicate_collapsed_shortfall,
-                3,
-                Some(0.2),
-            ),
-            "a short collapsed window means high-scoring duplicate chunks may have hidden messages"
-        );
-        assert!(!SearchClient::semantic_window_may_omit_competitor(
-            &complete, 3, None
-        ));
-    }
-
     #[test]
     fn stable_hit_hash_matches_reference_and_is_deterministic() {
         let fixtures = [
@@ -7475,18 +6094,6 @@ mod tests {
             "unexpected error: {err}"
         );
         assert_eq!(semantic_message_id_from_db(42).expect("positive id"), 42);
-    }
-
-    #[test]
-    fn semantic_doc_component_id_from_db_clamps_bounds() {
-        assert_eq!(semantic_doc_component_id_from_db(None), 0);
-        assert_eq!(semantic_doc_component_id_from_db(Some(-7)), 0);
-        assert_eq!(semantic_doc_component_id_from_db(Some(0)), 0);
-        assert_eq!(semantic_doc_component_id_from_db(Some(7)), 7);
-        assert_eq!(
-            semantic_doc_component_id_from_db(Some(i64::from(u32::MAX) + 123)),
-            u32::MAX
-        );
     }
 
     #[test]
@@ -7634,8 +6241,8 @@ mod tests {
             false
         }
 
-        fn category(&self) -> frankensearch::ModelCategory {
-            frankensearch::ModelCategory::HashEmbedder
+        fn category(&self) -> crate::search::frankensearch_types::ModelCategory {
+            crate::search::frankensearch_types::ModelCategory::HashEmbedder
         }
     }
 
@@ -7656,8 +6263,8 @@ mod tests {
             false
         }
 
-        fn category(&self) -> frankensearch::ModelCategory {
-            frankensearch::ModelCategory::HashEmbedder
+        fn category(&self) -> crate::search::frankensearch_types::ModelCategory {
+            crate::search::frankensearch_types::ModelCategory::HashEmbedder
         }
     }
 
@@ -7807,7 +6414,6 @@ mod tests {
                 3,
                 0,
                 FieldMask::FULL,
-                false,
             )
         });
 
@@ -7899,170 +6505,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn quality_mode_does_not_reuse_fast_only_two_tier_cache() -> Result<()> {
-        let dir = TempDir::new()?;
-        let db_path = dir.path().join("placeholder.db");
-        std::fs::write(&db_path, b"")?;
-
-        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
-        let embedder = Arc::new(crate::search::hash_embedder::HashEmbedder::new(256));
-        let fast_path = dir.path().join(format!("index-{}.fsvi", embedder.id()));
-        let writer = VectorIndex::create_with_revision(
-            &fast_path,
-            embedder.id(),
-            "rev-fast-only",
-            embedder.dimension(),
-            frankensearch::index::Quantization::F16,
-        )?;
-        writer.finish()?;
-
-        client.set_semantic_context(
-            embedder,
-            VectorIndex::open(&fast_path)?,
-            SemanticFilterMaps::for_tests(
-                HashMap::new(),
-                HashMap::new(),
-                HashMap::new(),
-                HashSet::new(),
-            ),
-            None,
-            Some(fast_path),
-        )?;
-
-        let fast_only_index = client
-            .in_memory_two_tier_index(SemanticTierMode::FastOnly)?
-            .expect("fast-only index should load");
-        assert!(
-            !fast_only_index.has_quality_index(),
-            "fixture should only provide the fast tier"
-        );
-
-        let quality_index = client.in_memory_two_tier_index(SemanticTierMode::QualityOnly)?;
-        assert!(
-            quality_index.is_none(),
-            "quality mode must not reuse a cached fast-only two-tier index"
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn failed_quality_probe_does_not_block_fast_only_two_tier_load() -> Result<()> {
-        let dir = TempDir::new()?;
-        let db_path = dir.path().join("placeholder.db");
-        std::fs::write(&db_path, b"")?;
-
-        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
-        let embedder = Arc::new(crate::search::hash_embedder::HashEmbedder::new(256));
-        let fast_path = dir.path().join(format!("index-{}.fsvi", embedder.id()));
-        let writer = VectorIndex::create_with_revision(
-            &fast_path,
-            embedder.id(),
-            "rev-fast-only",
-            embedder.dimension(),
-            frankensearch::index::Quantization::F16,
-        )?;
-        writer.finish()?;
-
-        client.set_semantic_context(
-            embedder,
-            VectorIndex::open(&fast_path)?,
-            SemanticFilterMaps::for_tests(
-                HashMap::new(),
-                HashMap::new(),
-                HashMap::new(),
-                HashSet::new(),
-            ),
-            None,
-            Some(fast_path),
-        )?;
-
-        assert!(
-            client
-                .in_memory_two_tier_index(SemanticTierMode::QualityOnly)?
-                .is_none(),
-            "quality-only lookup should fail for a fast-only fixture"
-        );
-
-        let fast_only_index = client
-            .in_memory_two_tier_index(SemanticTierMode::FastOnly)?
-            .expect("a failed quality-only probe must not poison fast-only loads");
-        assert!(
-            !fast_only_index.has_quality_index(),
-            "fixture should still resolve to the fast-only tier"
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn progressive_context_error_does_not_poison_future_attempts() -> Result<()> {
-        let dir = TempDir::new()?;
-        let db_path = dir.path().join("placeholder.db");
-        std::fs::write(&db_path, b"")?;
-
-        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
-        let embedder = Arc::new(crate::search::hash_embedder::HashEmbedder::new(256));
-        let fast_path = dir.path().join(format!("index-{}.fsvi", embedder.id()));
-        let writer = VectorIndex::create_with_revision(
-            &fast_path,
-            embedder.id(),
-            "rev-progressive-error",
-            embedder.dimension(),
-            frankensearch::index::Quantization::F16,
-        )?;
-        writer.finish()?;
-        std::fs::write(dir.path().join("vector.fast.idx"), b"not-a-valid-index")?;
-        std::fs::write(dir.path().join("vector.quality.idx"), b"not-a-valid-index")?;
-
-        client.set_semantic_context(
-            embedder,
-            VectorIndex::open(&fast_path)?,
-            SemanticFilterMaps::for_tests(
-                HashMap::new(),
-                HashMap::new(),
-                HashMap::new(),
-                HashSet::new(),
-            ),
-            None,
-            Some(fast_path),
-        )?;
-
-        let first_err = client
-            .progressive_context()
-            .err()
-            .expect("invalid progressive index files should fail to load");
-        assert!(
-            first_err
-                .to_string()
-                .contains("open fast-tier index failed"),
-            "unexpected first progressive-context error: {first_err}"
-        );
-
-        let second_err = client
-            .progressive_context()
-            .err()
-            .expect("a failed progressive load must not be memoized as None");
-        assert!(
-            second_err
-                .to_string()
-                .contains("open fast-tier index failed"),
-            "unexpected second progressive-context error: {second_err}"
-        );
-
-        Ok(())
-    }
-
     fn build_semantic_test_fixture() -> Result<SemanticTestFixture> {
-        build_semantic_test_fixture_with_shards(false)
-    }
-
-    fn build_sharded_semantic_test_fixture() -> Result<SemanticTestFixture> {
-        build_semantic_test_fixture_with_shards(true)
-    }
-
-    fn build_semantic_test_fixture_with_shards(sharded: bool) -> Result<SemanticTestFixture> {
         let dir = TempDir::new()?;
         let db_path = dir.path().join("cass.db");
         let storage = FrankenStorage::open(&db_path)?;
@@ -8124,8 +6567,8 @@ mod tests {
             storage.insert_conversation_tree(agent_id, Some(workspace_id), &conversation)?;
         }
 
-        let message_rows: Vec<(u64, i64)> = storage.raw().query_all_map(
-            "SELECT m.id, COALESCE(m.created_at, c.started_at, 0)
+        let message_rows: Vec<(u64, i64, i64)> = storage.raw().query_all_map(
+            "SELECT m.id, COALESCE(m.created_at, c.started_at, 0), c.id
              FROM messages m
              JOIN conversations c ON m.conversation_id = c.id
              ORDER BY c.id",
@@ -8133,7 +6576,12 @@ mod tests {
             |row: &FrankenRow| {
                 let message_id: i64 = row.get_typed(0)?;
                 let created_at: i64 = row.get_typed(1)?;
-                Ok((u64::try_from(message_id).unwrap_or(u64::MAX), created_at))
+                let conversation_id: i64 = row.get_typed(2)?;
+                Ok((
+                    u64::try_from(message_id).unwrap_or(u64::MAX),
+                    created_at,
+                    conversation_id,
+                ))
             },
         )?;
         assert_eq!(
@@ -8142,14 +6590,12 @@ mod tests {
             "fixture should create 3 messages"
         );
 
-        let filter_maps = SemanticFilterMaps::from_storage(&storage)?;
         let embedder = Arc::new(FixedTestEmbedder::new("test-fixed-2d", &[1.0, 0.0]));
         let source_hash = crc32fast::hash(crate::sources::provenance::LOCAL_SOURCE_ID.as_bytes());
-        let vector_dir = dir.path().join("vector_index");
-        std::fs::create_dir_all(&vector_dir)?;
-        let mut vector_records = Vec::with_capacity(documents.len());
 
-        for ((message_id, created_at_ms), (_, _, vector)) in message_rows.iter().zip(documents) {
+        for ((message_id, created_at_ms, _conversation_id), (_, _, _vector)) in
+            message_rows.iter().zip(documents)
+        {
             let doc_id = SemanticDocId {
                 message_id: *message_id,
                 chunk_idx: 0,
@@ -8161,46 +6607,35 @@ mod tests {
                 content_hash: None,
             }
             .to_doc_id_string();
-            doc_ids.push(doc_id.clone());
-            vector_records.push((doc_id, vector));
+            doc_ids.push(doc_id);
         }
 
-        let mut vector_indexes = Vec::new();
-        if sharded {
-            for (shard_index, chunk) in vector_records.chunks(2).enumerate() {
-                let vector_path = vector_dir.join(format!("shard-{shard_index}.fsvi"));
-                let mut writer = VectorIndex::create_with_revision(
-                    &vector_path,
-                    embedder.id(),
-                    "rev-1",
-                    embedder.dimension(),
-                    frankensearch::index::Quantization::F16,
-                )?;
-                for (doc_id, vector) in chunk {
-                    writer.write_record(doc_id, vector)?;
-                }
-                writer.finish()?;
-                vector_indexes.push(VectorIndex::open(&vector_path)?);
-            }
-        } else {
-            let vector_path = vector_dir.join("index-test-fixed-2d.fsvi");
-            let mut writer = VectorIndex::create_with_revision(
-                &vector_path,
-                embedder.id(),
-                "rev-1",
-                embedder.dimension(),
-                frankensearch::index::Quantization::F16,
-            )?;
-            for (doc_id, vector) in &vector_records {
-                writer.write_record(doc_id, vector)?;
-            }
-            writer.finish()?;
-            vector_indexes.push(VectorIndex::open(&vector_path)?);
-        }
+        // W3-5: DB-vector-domain (`search_db_vector_domain`) is the sole
+        // semantic candidate-fetch path now -- seed an active generation
+        // through the same production write path
+        // (`create_embedding_generation` + `insert_message_embedding` +
+        // `switch_active_generation` + `rebuild_vec0_table_for_generation`,
+        // see `seed_active_generation_with_vectors`) instead of the retired
+        // fsvi `VectorIndex` writer this fixture used to build (previously
+        // this also had a `sharded: bool` mode pinning fsvi's multi-shard-
+        // index-merge behavior; that had zero real callers even before the
+        // fsvi retirement and is dropped along with it).
+        let db_vectors: Vec<(i64, i64, Vec<f32>)> = message_rows
+            .iter()
+            .zip(documents)
+            .map(|((message_id, _created_at_ms, conversation_id), (_, _, vector))| {
+                (
+                    i64::try_from(*message_id).unwrap_or(i64::MAX),
+                    *conversation_id,
+                    vector.to_vec(),
+                )
+            })
+            .collect();
+        seed_active_generation_with_vectors(&storage, 2, &db_vectors);
         drop(storage);
 
         let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("db-backed client");
-        client.set_semantic_indexes_context(embedder, vector_indexes, filter_maps, None, None)?;
+        client.set_semantic_context(embedder, None)?;
 
         Ok(SemanticTestFixture {
             _dir: dir,
@@ -8944,120 +7379,6 @@ mod tests {
         metrics.inc_reload();
         let (hits, miss, shortfall, reloads, _) = metrics.snapshot_all();
         assert_eq!((hits, miss, shortfall, reloads), (1, 1, 1, 1));
-    }
-
-    #[test]
-    fn progressive_lexical_hit_omits_unused_content() {
-        let hit = SearchHit {
-            title: "hello world".into(),
-            snippet: "hello **world**".into(),
-            content: "hello world from a much larger conversation body".into(),
-            content_hash: stable_content_hash("hello world from a much larger conversation body"),
-            score: 1.0,
-            source_path: "p".into(),
-            agent: "a".into(),
-            workspace: "w".into(),
-            workspace_original: None,
-            created_at: None,
-            line_number: Some(3),
-            match_type: MatchType::Exact,
-            source_id: "local".into(),
-            origin_kind: "local".into(),
-            origin_host: None,
-            conversation_id: None,
-        };
-
-        let snippet_only =
-            ProgressiveLexicalHit::from_search_hit(&hit, FieldMask::new(false, true, true, true));
-        assert_eq!(snippet_only.title, hit.title);
-        assert_eq!(snippet_only.snippet, hit.snippet);
-        assert!(
-            snippet_only.content.is_empty(),
-            "snippet-only progressive cache should not retain full content"
-        );
-        assert_eq!(snippet_only.match_type, hit.match_type);
-        assert_eq!(snippet_only.line_number, hit.line_number);
-        assert_eq!(snippet_only.source_path, hit.source_path);
-        assert_eq!(snippet_only.agent, hit.agent);
-        assert_eq!(snippet_only.workspace, hit.workspace);
-
-        let full =
-            ProgressiveLexicalHit::from_search_hit(&hit, FieldMask::new(true, true, true, true));
-        assert_eq!(full.content, hit.content);
-    }
-
-    #[test]
-    fn progressive_phase_reuses_lexical_cache_without_db_hydration() -> Result<()> {
-        let client = SearchClient {
-            sqlite: Mutex::new(None),
-            sqlite_path: None,
-            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            metrics: Metrics::default(),
-            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
-            semantic: Mutex::new(None),
-        };
-        let field_mask = FieldMask::new(false, true, true, true);
-        let lexical_hit = SearchHit {
-            title: "lexical title".into(),
-            snippet: "lexical snippet".into(),
-            content: "full lexical body".into(),
-            content_hash: stable_content_hash("full lexical body"),
-            score: 0.0,
-            source_path: "/tmp/session.jsonl".into(),
-            agent: "codex".into(),
-            workspace: "/tmp".into(),
-            workspace_original: Some("/original".into()),
-            created_at: Some(1_700_000_000_000),
-            line_number: Some(7),
-            match_type: MatchType::Exact,
-            source_id: "local".into(),
-            origin_kind: "local".into(),
-            origin_host: None,
-            conversation_id: None,
-        };
-        let mut lexical_cache = ProgressiveLexicalCache::default();
-        lexical_cache.hits_by_message.insert(
-            42,
-            ProgressiveLexicalHit::from_search_hit(&lexical_hit, field_mask),
-        );
-
-        let hash_hex = "00".repeat(32);
-        let results = vec![FsScoredResult {
-            doc_id: format!("m|42|0|1|1|1|1|1700000000000|{hash_hex}"),
-            score: 0.91,
-            source: FsScoreSource::Lexical,
-            index: None,
-            fast_score: None,
-            quality_score: None,
-            lexical_score: Some(0.91),
-            rerank_score: None,
-            explanation: None,
-            metadata: None,
-        }];
-
-        let result = client.progressive_phase_to_result(
-            &results,
-            ProgressivePhaseContext {
-                query: "merged title",
-                filters: &SearchFilters::default(),
-                field_mask,
-                lexical_cache: Some(&lexical_cache),
-                limit: 1,
-                fetch_limit: 1,
-            },
-        )?;
-
-        assert_eq!(result.hits.len(), 1);
-        assert_eq!(result.hits[0].title, lexical_hit.title);
-        assert_eq!(result.hits[0].snippet, lexical_hit.snippet);
-        assert!(
-            result.hits[0].content.is_empty(),
-            "masked lexical cache should still avoid carrying full content"
-        );
-        assert_eq!(result.hits[0].source_path, lexical_hit.source_path);
-        assert_eq!(result.hits[0].score, 0.91);
-
-        Ok(())
     }
 
     #[test]
@@ -10629,588 +8950,6 @@ mod tests {
         assert_eq!(hits[0].1.source_id, "laptop");
         assert_eq!(hits[0].1.origin_kind, "remote");
         assert_eq!(hits[0].1.origin_host.as_deref(), Some("dev@laptop"));
-
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_semantic_doc_ids_for_hits_distinguishes_same_source_path_line_by_content_hash()
-    -> Result<()> {
-        let conn = Connection::open_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
-             CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
-             CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                agent_id INTEGER NOT NULL,
-                workspace_id INTEGER,
-                source_id TEXT,
-                origin_host TEXT,
-                title TEXT,
-                source_path TEXT NOT NULL
-             );
-             CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER NOT NULL,
-                idx INTEGER,
-                role TEXT,
-                content TEXT NOT NULL,
-                created_at INTEGER
-             );",
-        )?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
-        conn.execute(
-            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
-             VALUES(1, 1, NULL, 'local', NULL, 'Shared Session', '/tmp/progressive-shared.jsonl')",
-        &[])?;
-        conn.execute(
-            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
-             VALUES(2, 1, NULL, 'local', NULL, 'Shared Session', '/tmp/progressive-shared.jsonl')",
-        &[])?;
-        let first = "same prefix first tail".to_string();
-        let second = "same prefix second tail".to_string();
-        conn.execute(
-            "INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
-             VALUES(?1, ?2, 0, 'assistant', ?3, 100)",
-            &[
-                crate::storage::api::Value::Integer(11),
-                crate::storage::api::Value::Integer(1),
-                crate::storage::api::Value::Text(first.clone().into()),
-            ],
-        )?;
-        conn.execute(
-            "INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
-             VALUES(?1, ?2, 0, 'assistant', ?3, 100)",
-            &[
-                crate::storage::api::Value::Integer(22),
-                crate::storage::api::Value::Integer(2),
-                crate::storage::api::Value::Text(second.clone().into()),
-            ],
-        )?;
-
-        let client = SearchClient {
-            sqlite: Mutex::new(Some(SendConnection(conn))),
-            sqlite_path: None,
-            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            metrics: Metrics::default(),
-            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
-            semantic: Mutex::new(None),
-        };
-
-        let first_hit = SearchHit {
-            title: "Shared Session".into(),
-            snippet: String::new(),
-            content: String::new(),
-            content_hash: stable_hit_hash(
-                &first,
-                "/tmp/progressive-shared.jsonl",
-                Some(1),
-                Some(100),
-            ),
-            score: 0.0,
-            source_path: "/tmp/progressive-shared.jsonl".into(),
-            agent: "codex".into(),
-            workspace: String::new(),
-            workspace_original: None,
-            created_at: Some(100),
-            line_number: Some(1),
-            match_type: MatchType::Exact,
-            source_id: "local".into(),
-            origin_kind: "local".into(),
-            origin_host: None,
-            conversation_id: None,
-        };
-        let second_hit = SearchHit {
-            title: "Shared Session".into(),
-            snippet: String::new(),
-            content: String::new(),
-            content_hash: stable_hit_hash(
-                &second,
-                "/tmp/progressive-shared.jsonl",
-                Some(1),
-                Some(100),
-            ),
-            score: 0.0,
-            source_path: "/tmp/progressive-shared.jsonl".into(),
-            agent: "codex".into(),
-            workspace: String::new(),
-            workspace_original: None,
-            created_at: Some(100),
-            line_number: Some(1),
-            match_type: MatchType::Exact,
-            source_id: "local".into(),
-            origin_kind: "local".into(),
-            origin_host: None,
-            conversation_id: None,
-        };
-
-        let resolved = client.resolve_semantic_doc_ids_for_hits(&[first_hit, second_hit])?;
-        assert_eq!(resolved.len(), 2);
-        assert_eq!(resolved[0].as_ref().map(|hit| hit.message_id), Some(11));
-        assert_eq!(resolved[1].as_ref().map(|hit| hit.message_id), Some(22));
-        assert_ne!(
-            resolved[0].as_ref().map(|hit| hit.doc_id.as_str()),
-            resolved[1].as_ref().map(|hit| hit.doc_id.as_str())
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn hydrate_semantic_hits_with_ids_keeps_missing_title_empty() -> Result<()> {
-        let conn = Connection::open_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
-             CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                agent_id INTEGER NOT NULL,
-                workspace_id INTEGER,
-                source_id TEXT,
-                origin_host TEXT,
-                title TEXT,
-                source_path TEXT NOT NULL,
-                started_at INTEGER
-             );
-             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL);
-             CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER NOT NULL,
-                idx INTEGER,
-                role TEXT,
-                content TEXT NOT NULL,
-                created_at INTEGER
-             );
-             CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);",
-        )?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
-        conn.execute(
-            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path, started_at)
-             VALUES(1, 1, NULL, 'local', NULL, NULL, '/tmp/untitled-semantic.jsonl', 100)",
-        &[])?;
-        conn.execute(
-            "INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
-             VALUES(?1, 1, 0, 'assistant', ?2, 101)",
-            &[
-                crate::storage::api::Value::Integer(1),
-                crate::storage::api::Value::Text("untitled semantic body".into()),
-            ],
-        )?;
-
-        let client = SearchClient {
-            sqlite: Mutex::new(Some(SendConnection(conn))),
-            sqlite_path: None,
-            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            metrics: Metrics::default(),
-            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
-            semantic: Mutex::new(None),
-        };
-
-        let hits = client.hydrate_semantic_hits_with_ids(
-            &[VectorSearchResult {
-                message_id: 1,
-                chunk_idx: 0,
-                score: 0.9,
-            }],
-            FieldMask::new(false, true, true, true),
-        )?;
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].1.title, "");
-
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_semantic_doc_ids_for_hits_prefers_conversation_id_over_ambiguous_provenance()
-    -> Result<()> {
-        let conn = Connection::open_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
-             CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
-             CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                agent_id INTEGER NOT NULL,
-                workspace_id INTEGER,
-                source_id TEXT,
-                origin_host TEXT,
-                title TEXT,
-                source_path TEXT NOT NULL
-             );
-             CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER NOT NULL,
-                idx INTEGER,
-                role TEXT,
-                content TEXT NOT NULL,
-                created_at INTEGER
-             );",
-        )?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
-        conn.execute(
-            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
-             VALUES(1, 1, NULL, 'local', NULL, 'Shared Session', '/tmp/progressive-conversation-id.jsonl')",
-        &[])?;
-        conn.execute(
-            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
-             VALUES(2, 1, NULL, 'local', NULL, 'Shared Session', '/tmp/progressive-conversation-id.jsonl')",
-        &[])?;
-        let content = "same ambiguous content".to_string();
-        conn.execute(
-            "INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
-             VALUES(?1, ?2, 0, 'assistant', ?3, 100)",
-            &[
-                crate::storage::api::Value::Integer(11),
-                crate::storage::api::Value::Integer(1),
-                crate::storage::api::Value::Text(content.clone().into()),
-            ],
-        )?;
-        conn.execute(
-            "INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
-             VALUES(?1, ?2, 0, 'assistant', ?3, 100)",
-            &[
-                crate::storage::api::Value::Integer(22),
-                crate::storage::api::Value::Integer(2),
-                crate::storage::api::Value::Text(content.clone().into()),
-            ],
-        )?;
-
-        let client = SearchClient {
-            sqlite: Mutex::new(Some(SendConnection(conn))),
-            sqlite_path: None,
-            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            metrics: Metrics::default(),
-            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
-            semantic: Mutex::new(None),
-        };
-
-        let first_hit = SearchHit {
-            title: "Shared Session".into(),
-            snippet: String::new(),
-            content: String::new(),
-            content_hash: stable_hit_hash(
-                &content,
-                "/tmp/progressive-conversation-id.jsonl",
-                Some(1),
-                Some(100),
-            ),
-            score: 0.0,
-            source_path: "/tmp/progressive-conversation-id.jsonl".into(),
-            agent: "codex".into(),
-            workspace: String::new(),
-            workspace_original: None,
-            created_at: Some(100),
-            line_number: Some(1),
-            match_type: MatchType::Exact,
-            source_id: "local".into(),
-            origin_kind: "local".into(),
-            origin_host: None,
-            conversation_id: Some(1),
-        };
-        let second_hit = SearchHit {
-            conversation_id: Some(2),
-            ..first_hit.clone()
-        };
-
-        let resolved = client.resolve_semantic_doc_ids_for_hits(&[first_hit, second_hit])?;
-        assert_eq!(resolved.len(), 2);
-        assert_eq!(resolved[0].as_ref().map(|hit| hit.message_id), Some(11));
-        assert_eq!(resolved[1].as_ref().map(|hit| hit.message_id), Some(22));
-
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_semantic_doc_ids_for_hits_treats_null_source_as_local() -> Result<()> {
-        let conn = Connection::open_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
-             CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
-             CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                agent_id INTEGER NOT NULL,
-                workspace_id INTEGER,
-                source_id TEXT,
-                origin_host TEXT,
-                title TEXT,
-                source_path TEXT NOT NULL
-             );
-             CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER NOT NULL,
-                idx INTEGER,
-                role TEXT,
-                content TEXT NOT NULL,
-                created_at INTEGER
-             );",
-        )?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
-        conn.execute(
-            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
-             VALUES(1, 1, NULL, NULL, NULL, 'Legacy Local', '/tmp/legacy-local.jsonl')",
-        &[])?;
-        let content = "legacy local semantic message".to_string();
-        conn.execute(
-            "INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
-             VALUES(?1, 1, 0, 'assistant', ?2, 100)",
-            &[
-                crate::storage::api::Value::Integer(11),
-                crate::storage::api::Value::Text(content.clone().into()),
-            ],
-        )?;
-
-        let client = SearchClient {
-            sqlite: Mutex::new(Some(SendConnection(conn))),
-            sqlite_path: None,
-            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            metrics: Metrics::default(),
-            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
-            semantic: Mutex::new(None),
-        };
-
-        let hit = SearchHit {
-            title: "Legacy Local".into(),
-            snippet: String::new(),
-            content: String::new(),
-            content_hash: stable_hit_hash(&content, "/tmp/legacy-local.jsonl", Some(1), Some(100)),
-            score: 0.0,
-            source_path: "/tmp/legacy-local.jsonl".into(),
-            agent: "codex".into(),
-            workspace: String::new(),
-            workspace_original: None,
-            created_at: Some(100),
-            line_number: Some(1),
-            match_type: MatchType::Exact,
-            source_id: "local".into(),
-            origin_kind: "local".into(),
-            origin_host: None,
-            conversation_id: None,
-        };
-
-        let resolved = client.resolve_semantic_doc_ids_for_hits(&[hit])?;
-        assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].as_ref().map(|hit| hit.message_id), Some(11));
-
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_semantic_doc_ids_for_hits_matches_trimmed_local_source_id() -> Result<()> {
-        let conn = Connection::open_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
-             CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
-             CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                agent_id INTEGER NOT NULL,
-                workspace_id INTEGER,
-                source_id TEXT,
-                origin_host TEXT,
-                title TEXT,
-                source_path TEXT NOT NULL
-             );
-             CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER NOT NULL,
-                idx INTEGER,
-                role TEXT,
-                content TEXT NOT NULL,
-                created_at INTEGER
-             );",
-        )?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
-        conn.execute(
-            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
-             VALUES(1, 1, NULL, '  local  ', NULL, 'Trimmed Local', '/tmp/trimmed-local.jsonl')",
-        &[])?;
-        let content = "trimmed local semantic message".to_string();
-        conn.execute(
-            "INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
-             VALUES(?1, 1, 0, 'assistant', ?2, 100)",
-            &[
-                crate::storage::api::Value::Integer(11),
-                crate::storage::api::Value::Text(content.clone().into()),
-            ],
-        )?;
-
-        let client = SearchClient {
-            sqlite: Mutex::new(Some(SendConnection(conn))),
-            sqlite_path: None,
-            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            metrics: Metrics::default(),
-            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
-            semantic: Mutex::new(None),
-        };
-
-        let hit = SearchHit {
-            title: "Trimmed Local".into(),
-            snippet: String::new(),
-            content: String::new(),
-            content_hash: stable_hit_hash(&content, "/tmp/trimmed-local.jsonl", Some(1), Some(100)),
-            score: 0.0,
-            source_path: "/tmp/trimmed-local.jsonl".into(),
-            agent: "codex".into(),
-            workspace: String::new(),
-            workspace_original: None,
-            created_at: Some(100),
-            line_number: Some(1),
-            match_type: MatchType::Exact,
-            source_id: "local".into(),
-            origin_kind: "local".into(),
-            origin_host: None,
-            conversation_id: None,
-        };
-
-        let resolved = client.resolve_semantic_doc_ids_for_hits(&[hit])?;
-        assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].as_ref().map(|doc| doc.message_id), Some(11));
-
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_semantic_doc_ids_for_hits_normalizes_blank_local_source_id() -> Result<()> {
-        let conn = Connection::open_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
-             CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
-             CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                agent_id INTEGER NOT NULL,
-                workspace_id INTEGER,
-                source_id TEXT,
-                origin_host TEXT,
-                title TEXT,
-                source_path TEXT NOT NULL
-             );
-             CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER NOT NULL,
-                idx INTEGER,
-                role TEXT,
-                content TEXT NOT NULL,
-                created_at INTEGER
-             );",
-        )?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
-        conn.execute(
-            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
-             VALUES(1, 1, NULL, 'local', NULL, 'Blank Local', '/tmp/blank-local.jsonl')",
-        &[])?;
-        let content = "blank local semantic message".to_string();
-        conn.execute(
-            "INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
-             VALUES(?1, 1, 0, 'assistant', ?2, 100)",
-            &[
-                crate::storage::api::Value::Integer(11),
-                crate::storage::api::Value::Text(content.clone().into()),
-            ],
-        )?;
-
-        let client = SearchClient {
-            sqlite: Mutex::new(Some(SendConnection(conn))),
-            sqlite_path: None,
-            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            metrics: Metrics::default(),
-            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
-            semantic: Mutex::new(None),
-        };
-
-        let hit = SearchHit {
-            title: "Blank Local".into(),
-            snippet: String::new(),
-            content: String::new(),
-            content_hash: stable_hit_hash(&content, "/tmp/blank-local.jsonl", Some(1), Some(100)),
-            score: 0.0,
-            source_path: "/tmp/blank-local.jsonl".into(),
-            agent: "codex".into(),
-            workspace: String::new(),
-            workspace_original: None,
-            created_at: Some(100),
-            line_number: Some(1),
-            match_type: MatchType::Exact,
-            source_id: "   ".into(),
-            origin_kind: "local".into(),
-            origin_host: None,
-            conversation_id: None,
-        };
-
-        let resolved = client.resolve_semantic_doc_ids_for_hits(&[hit])?;
-        assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].as_ref().map(|doc| doc.message_id), Some(11));
-
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_semantic_doc_ids_for_hits_infers_remote_source_from_origin_host_when_source_id_blank()
-    -> Result<()> {
-        let conn = Connection::open_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
-             CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
-             CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                agent_id INTEGER NOT NULL,
-                workspace_id INTEGER,
-                source_id TEXT,
-                origin_host TEXT,
-                title TEXT,
-                source_path TEXT NOT NULL
-             );
-             CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER NOT NULL,
-                idx INTEGER,
-                role TEXT,
-                content TEXT NOT NULL,
-                created_at INTEGER
-             );",
-        )?;
-        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", &[])?;
-        conn.execute(
-            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
-             VALUES(1, 1, NULL, '   ', 'dev@laptop', 'Legacy Remote', '/tmp/legacy-remote.jsonl')",
-        &[])?;
-        let content = "legacy remote semantic message".to_string();
-        conn.execute(
-            "INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
-             VALUES(?1, 1, 0, 'assistant', ?2, 100)",
-            &[
-                crate::storage::api::Value::Integer(11),
-                crate::storage::api::Value::Text(content.clone().into()),
-            ],
-        )?;
-
-        let client = SearchClient {
-            sqlite: Mutex::new(Some(SendConnection(conn))),
-            sqlite_path: None,
-            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
-            metrics: Metrics::default(),
-            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
-            semantic: Mutex::new(None),
-        };
-
-        let hit = SearchHit {
-            title: "Legacy Remote".into(),
-            snippet: String::new(),
-            content: String::new(),
-            content_hash: stable_hit_hash(&content, "/tmp/legacy-remote.jsonl", Some(1), Some(100)),
-            score: 0.0,
-            source_path: "/tmp/legacy-remote.jsonl".into(),
-            agent: "codex".into(),
-            workspace: String::new(),
-            workspace_original: None,
-            created_at: Some(100),
-            line_number: Some(1),
-            match_type: MatchType::Exact,
-            source_id: "dev@laptop".into(),
-            origin_kind: "remote".into(),
-            origin_host: Some("dev@laptop".into()),
-            conversation_id: None,
-        };
-
-        let resolved = client.resolve_semantic_doc_ids_for_hits(&[hit])?;
-        assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].as_ref().map(|doc| doc.message_id), Some(11));
 
         Ok(())
     }
@@ -15094,19 +12833,14 @@ mod tests {
             .session_paths
             .insert(fixture.source_paths[2].clone());
 
-        let (hits, ann_stats) = fixture.client.search_semantic(
+        let hits = fixture.client.search_semantic(
             "semantic fixture query",
             filters,
             1,
             0,
             FieldMask::FULL,
-            false,
         )?;
 
-        assert!(
-            ann_stats.is_none(),
-            "exact search should not emit ANN stats"
-        );
         assert_eq!(
             hits.len(),
             1,
@@ -15131,13 +12865,12 @@ mod tests {
             .session_paths
             .insert(fixture.source_paths[2].clone());
 
-        let (hits, _) = fixture.client.search_semantic(
+        let hits = fixture.client.search_semantic(
             "semantic fixture query",
             filters,
             1,
             1,
             FieldMask::FULL,
-            false,
         )?;
 
         assert_eq!(
@@ -15148,102 +12881,6 @@ mod tests {
         assert_eq!(
             hits[0].source_path, fixture.source_paths[2],
             "offset must apply after semantic deduplication and session path filtering"
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn semantic_search_merges_sharded_vector_indexes() -> Result<()> {
-        let fixture = build_sharded_semantic_test_fixture()?;
-        let (hits, ann_stats) = fixture.client.search_semantic(
-            "semantic fixture query",
-            SearchFilters::default(),
-            3,
-            0,
-            FieldMask::FULL,
-            false,
-        )?;
-
-        assert!(
-            ann_stats.is_none(),
-            "sharded exact search should not emit ANN stats"
-        );
-        assert_eq!(hits.len(), 3);
-        assert_eq!(hits[0].source_path, fixture.source_paths[0]);
-        assert_eq!(hits[1].source_path, fixture.source_paths[1]);
-        assert_eq!(hits[2].source_path, fixture.source_paths[2]);
-
-        Ok(())
-    }
-
-    #[test]
-    fn progressive_phase_overfetches_before_session_paths_filtering() -> Result<()> {
-        let fixture = build_semantic_test_fixture()?;
-        let mut filters = SearchFilters::default();
-        filters
-            .session_paths
-            .insert(fixture.source_paths[2].clone());
-
-        let results = vec![
-            FsScoredResult {
-                doc_id: fixture.doc_ids[0].clone(),
-                score: 1.0,
-                source: FsScoreSource::SemanticFast,
-                index: None,
-                fast_score: Some(1.0),
-                quality_score: None,
-                lexical_score: None,
-                rerank_score: None,
-                explanation: None,
-                metadata: None,
-            },
-            FsScoredResult {
-                doc_id: fixture.doc_ids[1].clone(),
-                score: 0.9,
-                source: FsScoreSource::SemanticFast,
-                index: None,
-                fast_score: Some(0.9),
-                quality_score: None,
-                lexical_score: None,
-                rerank_score: None,
-                explanation: None,
-                metadata: None,
-            },
-            FsScoredResult {
-                doc_id: fixture.doc_ids[2].clone(),
-                score: 0.8,
-                source: FsScoreSource::SemanticFast,
-                index: None,
-                fast_score: Some(0.8),
-                quality_score: None,
-                lexical_score: None,
-                rerank_score: None,
-                explanation: None,
-                metadata: None,
-            },
-        ];
-
-        let result = fixture.client.progressive_phase_to_result(
-            &results,
-            ProgressivePhaseContext {
-                query: "session path filter",
-                filters: &filters,
-                field_mask: FieldMask::FULL,
-                lexical_cache: None,
-                limit: 1,
-                fetch_limit: 3,
-            },
-        )?;
-
-        assert_eq!(
-            result.hits.len(),
-            1,
-            "progressive phase should retain enough overfetched hits to satisfy post-search session path filtering"
-        );
-        assert_eq!(
-            result.hits[0].source_path, fixture.source_paths[2],
-            "progressive phase should page after session path filtering"
         );
 
         Ok(())
@@ -17667,77 +15304,6 @@ mod tests {
         assert_eq!(parsed.created_at_ms, 1_700_000_000_000);
     }
 
-    #[test]
-    fn semantic_filter_applies_all_constraints() {
-        use frankensearch::core::filter::SearchFilter;
-
-        let filter = SemanticFilter {
-            agents: Some(HashSet::from([3])),
-            workspaces: Some(HashSet::from([7])),
-            sources: Some(HashSet::from([11])),
-            roles: Some(HashSet::from([1])),
-            created_from: Some(1_700_000_000_000),
-            created_to: Some(1_700_000_000_100),
-        };
-
-        assert!(filter.matches("m|42|2|3|7|11|1|1700000000001", None));
-        assert!(!filter.matches("m|42|2|99|7|11|1|1700000000001", None));
-        assert!(!filter.matches("m|42|2|3|7|11|1|1699999999999", None));
-        assert!(!filter.matches("not-a-doc-id", None));
-    }
-
-    #[test]
-    fn fs_semantic_index_runs_filtered_search() -> Result<()> {
-        let temp = TempDir::new()?;
-        let index_path = crate::search::vector_index::vector_index_path(temp.path(), "embed-fast");
-        if let Some(parent) = index_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        let hash_a = "00".repeat(32);
-        let hash_b = "11".repeat(32);
-        let doc_a = format!("m|101|0|1|10|100|1|1700000000001|{hash_a}");
-        let doc_b = format!("m|202|0|2|20|200|1|1700000000002|{hash_b}");
-
-        let mut writer = VectorIndex::create_with_revision(
-            &index_path,
-            "embed-fast",
-            "rev-1",
-            2,
-            frankensearch::index::Quantization::F16,
-        )
-        .map_err(|err| anyhow!("create fsvi index failed: {err}"))?;
-        writer
-            .write_record(&doc_a, &[1.0, 0.0])
-            .map_err(|err| anyhow!("write_record failed: {err}"))?;
-        writer
-            .write_record(&doc_b, &[0.0, 1.0])
-            .map_err(|err| anyhow!("write_record failed: {err}"))?;
-        writer
-            .finish()
-            .map_err(|err| anyhow!("finish fsvi index failed: {err}"))?;
-
-        let fs_index =
-            VectorIndex::open(&index_path).map_err(|err| anyhow!("open fsvi failed: {err}"))?;
-        let filter = SemanticFilter {
-            agents: Some(HashSet::from([1])),
-            workspaces: None,
-            sources: None,
-            roles: None,
-            created_from: None,
-            created_to: None,
-        };
-        let fs_filter = semantic_filter_as_search_filter(&filter).expect("expected active filter");
-        let hits = fs_index
-            .search_top_k(&[1.0, 0.0], 5, Some(fs_filter))
-            .map_err(|err| anyhow!("frankensearch search failed: {err}"))?;
-        assert_eq!(hits.len(), 1);
-        let parsed = parse_semantic_doc_id(&hits[0].doc_id).expect("parse bridged doc_id");
-        assert_eq!(parsed.message_id, 101);
-        assert_eq!(parsed.agent_id, 1);
-        Ok(())
-    }
-
     // Regression guard for bead coding_agent_session_search-q6xf9
     // (`cass search --fields minimal` silently returned zero hits even when
     // matches existed). Root cause: the dedup pass called `hit_is_noise`,
@@ -18056,5 +15622,1448 @@ mod tests {
                 .any(|d| d.contains("SCAN") && d.contains("lex_docs")),
             "KU3 LIKE fallback must be a genuine lex_docs table scan (full-corpus correctness), got {plan_details:?}"
         );
+    }
+
+    // =========================================================================
+    // w3 Task W3-3 Step 1/1b: `search_db_vector_domain` (vec0/message_embeddings
+    // read path) -- three-state contract (w3-d7①), R4-B4 same-snapshot,
+    // filter-fidelity e2e family (six dimensions + combined).
+    // =========================================================================
+
+    /// A message row plus its parent agent/workspace/conversation, wired for
+    /// direct control over every `SemanticFilter` dimension (role, agent
+    /// slug, workspace path, source id, created_at) -- the existing
+    /// `seed_conversations_for_search_client` fixture doesn't expose
+    /// per-message role or per-conversation source_id/origin_host, which
+    /// this test family needs.
+    struct Db3SeedMessage<'a> {
+        agent_slug: &'a str,
+        workspace_path: Option<&'a str>,
+        source_id: &'a str,
+        role: &'a str,
+        created_at: i64,
+        message_id: i64,
+        conversation_id: i64,
+    }
+
+    fn seed_db3_message(storage: &FrankenStorage, msg: &Db3SeedMessage) {
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: msg.agent_slug.to_string(),
+                name: msg.agent_slug.to_string(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        let workspace_id = msg
+            .workspace_path
+            .map(|p| storage.ensure_workspace(std::path::Path::new(p), None).unwrap());
+        let conn = storage.raw();
+        conn.execute(
+            "INSERT OR IGNORE INTO sources(id, kind, created_at, updated_at) VALUES (?1, 'local', 0, 0)",
+            &crate::storage::api::params![msg.source_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, title, source_path) \
+             VALUES (?1, ?2, ?3, ?4, 't', ?5)",
+            &[
+                ParamValue::from(msg.conversation_id),
+                ParamValue::from(agent_id),
+                ParamValue::from(workspace_id),
+                ParamValue::from(msg.source_id),
+                ParamValue::from(format!("/tmp/c-{}.jsonl", msg.conversation_id)),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages(id, conversation_id, idx, role, created_at, content) \
+             VALUES (?1, ?2, 0, ?3, ?4, 'c')",
+            &crate::storage::api::params![msg.message_id, msg.conversation_id, msg.role, msg.created_at],
+        )
+        .unwrap();
+    }
+
+    /// Creates a generation, writes `vectors` (message_id -> embedding) via
+    /// the production write path (`schema::insert_message_embedding`,
+    /// fixture-fidelity discipline), activates it, and rebuilds its `vec0`
+    /// index -- the minimum a caller of `search_db_vector_domain` needs to
+    /// see `Ready`.
+    fn seed_active_generation_with_vectors(
+        storage: &FrankenStorage,
+        dim: i64,
+        vectors: &[(i64, i64, Vec<f32>)], // (message_id, conversation_id, vector)
+    ) -> i64 {
+        let conn = storage.raw();
+        let generation_id = conn
+            .with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
+                let generation_id =
+                    crate::storage::schema::create_embedding_generation(tx, "bge-m3", dim, 1, 1_000)?;
+                for (message_id, conversation_id, vector) in vectors {
+                    crate::storage::schema::insert_message_embedding(
+                        tx,
+                        generation_id,
+                        *message_id,
+                        *conversation_id,
+                        vector,
+                        "h",
+                        None,
+                        1_000,
+                    )?;
+                }
+                Ok(generation_id)
+            })
+            .unwrap();
+        crate::storage::schema::switch_active_generation(conn, generation_id, 2_000, |_tx| Ok(())).unwrap();
+        crate::storage::vector_domain::rebuild_vec0_table_for_generation(conn, generation_id, dim).unwrap();
+        generation_id
+    }
+
+    #[test]
+    fn db_vector_domain_absent_when_no_generation_exists() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        let conn = storage.raw();
+
+        let err = SearchClient::search_db_vector_domain(
+            conn,
+            &[1.0, 0.0],
+            &SearchFilters::default(),
+            None,
+            10,
+        )
+        .expect_err("no generation ever created must be Absent, not Ok");
+        assert!(
+            err.to_string().contains("vector_domain_state=absent"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn db_vector_domain_building_when_a_generation_exists_but_none_is_active() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        let conn = storage.raw();
+        conn.with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
+            crate::storage::schema::create_embedding_generation(tx, "bge-m3", 2, 1, 1_000)
+        })
+        .unwrap();
+        // Deliberately never activated.
+
+        let err = SearchClient::search_db_vector_domain(
+            conn,
+            &[1.0, 0.0],
+            &SearchFilters::default(),
+            None,
+            10,
+        )
+        .expect_err("a generation with no active pointer must be Building, not Ok");
+        assert!(
+            err.to_string().contains("vector_domain_state=building"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn db_vector_domain_building_when_active_generation_has_no_vec0_index_built_yet() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        let conn = storage.raw();
+        seed_db3_message(
+            &storage,
+            &Db3SeedMessage {
+                agent_slug: "codex",
+                workspace_path: None,
+                source_id: "local",
+                role: "user",
+                created_at: 100,
+                message_id: 1,
+                conversation_id: 1,
+            },
+        );
+        let generation_id = conn
+            .with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
+                let gen_id = crate::storage::schema::create_embedding_generation(tx, "bge-m3", 2, 1, 1_000)?;
+                crate::storage::schema::insert_message_embedding(
+                    tx, gen_id, 1, 1, &[1.0, 0.0], "h", None, 1_000,
+                )?;
+                Ok(gen_id)
+            })
+            .unwrap();
+        crate::storage::schema::switch_active_generation(conn, generation_id, 2_000, |_tx| Ok(())).unwrap();
+        // Deliberately skip rebuild_vec0_table_for_generation -- the
+        // relational row exists and the pointer is active, but the derived
+        // vec0 index was never built (w3-d5/w3-d7②: no auto-rebuild here).
+
+        let err = SearchClient::search_db_vector_domain(
+            conn,
+            &[1.0, 0.0],
+            &SearchFilters::default(),
+            None,
+            10,
+        )
+        .expect_err("an active generation with no vec0 table built must be Building, not Ok");
+        assert!(
+            err.to_string().contains("vector_domain_state=building"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn db_vector_domain_vacuous_active_generation_with_zero_rows_returns_empty_not_error() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        let conn = storage.raw();
+        let generation_id = seed_active_generation_with_vectors(&storage, 2, &[]);
+        assert_eq!(
+            crate::storage::schema::active_generation_id(conn).unwrap(),
+            Some(generation_id)
+        );
+
+        let (results, retry) = SearchClient::search_db_vector_domain(
+            conn,
+            &[1.0, 0.0],
+            &SearchFilters::default(),
+            None,
+            10,
+        )
+        .expect("a genuinely empty archive must be Ok, not an error (w3-d7①)");
+        assert!(results.is_empty());
+        assert!(!retry.has_more_candidates);
+    }
+
+    /// vec0-path counterpart to the retired `semantic_filter_applies_all_
+    /// constraints` (fsvi's doc_id-decode filter unit test): asserts the
+    /// SQL WHERE construction itself is correct, with no database involved
+    /// -- every `SemanticFilter` dimension must show up as its own `AND`
+    /// clause with the right parameter values, and an unrestricted filter
+    /// must add none of them.
+    #[test]
+    fn build_db_vector_domain_filter_sql_applies_all_constraints() {
+        let mut filters = SearchFilters::default();
+        filters.agents.insert("codex".into());
+        filters.workspaces.insert("/ws/alpha".into());
+        filters.source_filter = SourceFilter::SourceId("remote-host".into());
+        filters.created_from = Some(1_700_000_000_000);
+        filters.created_to = Some(1_700_000_000_100);
+        let roles = HashSet::from([crate::search::vector_index::ROLE_ASSISTANT]);
+
+        let (sql, params) =
+            SearchClient::build_db_vector_domain_filter_sql(&[101, 202], &filters, Some(&roles));
+
+        assert!(sql.contains("m.id IN (?,?)"), "got: {sql}");
+        assert!(
+            sql.contains("EXISTS (SELECT 1 FROM agents a WHERE a.id = c.agent_id AND a.slug IN (?))"),
+            "got: {sql}"
+        );
+        assert!(sql.contains("COALESCE(w.path, '') IN (?)"), "got: {sql}");
+        assert!(sql.contains("m.role IN (?,?,?)"), "role filter must expand to every string variant, got: {sql}");
+        assert!(sql.contains("m.created_at >= ?") && sql.contains("m.created_at <= ?"), "got: {sql}");
+
+        let expected: Vec<ParamValue> = vec![
+            ParamValue::from(101_i64),
+            ParamValue::from(202_i64),
+            ParamValue::from("codex"),
+            ParamValue::from("/ws/alpha"),
+            ParamValue::from("remote-host"),
+            ParamValue::from("assistant"),
+            ParamValue::from("agent"),
+            ParamValue::from("reasoning"),
+            ParamValue::from(1_700_000_000_000_i64),
+            ParamValue::from(1_700_000_000_100_i64),
+        ];
+        assert_eq!(params, expected, "params must be positional-order-consistent with the built SQL");
+    }
+
+    #[test]
+    fn build_db_vector_domain_filter_sql_is_unrestricted_with_no_filters_set() {
+        let (sql, params) =
+            SearchClient::build_db_vector_domain_filter_sql(&[1], &SearchFilters::default(), None);
+        // The base FROM clause always joins agents/workspaces/sources
+        // (needed for the m.id filter itself) -- only the optional filter
+        // predicates (EXISTS/.../COALESCE(...) IN/role/date) must be absent.
+        assert!(!sql.contains("a.slug IN"));
+        assert!(!sql.contains("COALESCE(w.path"));
+        assert!(!sql.contains("m.role"));
+        assert!(!sql.contains("created_at"));
+        assert_eq!(params, vec![ParamValue::from(1_i64)], "only the candidate-id IN-clause param");
+    }
+
+    #[test]
+    fn build_db_vector_domain_filter_sql_unknown_role_code_matches_nothing() {
+        let mut filters = SearchFilters::default();
+        let unknown_role = HashSet::from([255_u8]);
+        filters.roles = None; // effective_roles passed explicitly below
+        let (sql, _params) =
+            SearchClient::build_db_vector_domain_filter_sql(&[1], &filters, Some(&unknown_role));
+        assert!(
+            sql.contains("AND 0"),
+            "an unrecognized role code must build a never-true clause, not silently drop the filter, got: {sql}"
+        );
+    }
+
+    /// Six-dimension filter-fidelity family, one shared fixture (w3-d10⑤
+    /// direction, Step1b's core new-code validation): four messages across
+    /// two agents, two workspaces, two sources, two roles, two time
+    /// buckets, so every dimension's filter has both a matching and a
+    /// non-matching candidate to discriminate against.
+    fn seed_filter_fidelity_fixture(storage: &FrankenStorage) -> i64 {
+        seed_db3_message(
+            storage,
+            &Db3SeedMessage {
+                agent_slug: "codex",
+                workspace_path: Some("/ws/alpha"),
+                source_id: "local",
+                role: "user",
+                created_at: 100,
+                message_id: 1,
+                conversation_id: 1,
+            },
+        );
+        seed_db3_message(
+            storage,
+            &Db3SeedMessage {
+                agent_slug: "claude",
+                workspace_path: Some("/ws/beta"),
+                source_id: "remote-host",
+                role: "assistant",
+                created_at: 200,
+                message_id: 2,
+                conversation_id: 2,
+            },
+        );
+        seed_db3_message(
+            storage,
+            &Db3SeedMessage {
+                agent_slug: "codex",
+                workspace_path: Some("/ws/beta"),
+                source_id: "local",
+                role: "tool",
+                created_at: 300,
+                message_id: 3,
+                conversation_id: 3,
+            },
+        );
+        seed_db3_message(
+            storage,
+            &Db3SeedMessage {
+                agent_slug: "claude",
+                workspace_path: Some("/ws/alpha"),
+                source_id: "remote-host",
+                role: "user",
+                created_at: 400,
+                message_id: 4,
+                conversation_id: 4,
+            },
+        );
+        // Four orthogonal unit-ish vectors in dim=4 so an unrestricted KNN
+        // (k covering all 4) returns every row -- filter dimensions alone
+        // decide what survives, isolating filter correctness from ranking.
+        seed_active_generation_with_vectors(
+            storage,
+            4,
+            &[
+                (1, 1, vec![1.0, 0.0, 0.0, 0.0]),
+                (2, 2, vec![0.0, 1.0, 0.0, 0.0]),
+                (3, 3, vec![0.0, 0.0, 1.0, 0.0]),
+                (4, 4, vec![0.0, 0.0, 0.0, 1.0]),
+            ],
+        )
+    }
+
+    fn db3_message_ids(storage: &FrankenStorage, filters: &SearchFilters) -> Vec<u64> {
+        let (results, _retry) = SearchClient::search_db_vector_domain(
+            storage.raw(),
+            &[0.5, 0.5, 0.5, 0.5],
+            filters,
+            None,
+            10,
+        )
+        .unwrap();
+        let mut ids: Vec<u64> = results.into_iter().map(|r| r.message_id).collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[test]
+    fn db_vector_domain_filter_fidelity_agent() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        seed_filter_fidelity_fixture(&storage);
+
+        let mut filters = SearchFilters::default();
+        filters.roles = Some(HashSet::from([
+            crate::search::vector_index::ROLE_USER,
+            crate::search::vector_index::ROLE_ASSISTANT,
+            crate::search::vector_index::ROLE_TOOL,
+        ]));
+        filters.agents.insert("codex".into());
+        assert_eq!(
+            db3_message_ids(&storage, &filters),
+            vec![1, 3],
+            "agent filter must return only codex's messages (1,3), never claude's (2,4)"
+        );
+    }
+
+    #[test]
+    fn db_vector_domain_filter_fidelity_workspace() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        seed_filter_fidelity_fixture(&storage);
+
+        let mut filters = SearchFilters::default();
+        filters.roles = Some(HashSet::from([
+            crate::search::vector_index::ROLE_USER,
+            crate::search::vector_index::ROLE_ASSISTANT,
+            crate::search::vector_index::ROLE_TOOL,
+        ]));
+        filters.workspaces.insert("/ws/alpha".into());
+        assert_eq!(db3_message_ids(&storage, &filters), vec![1, 4]);
+    }
+
+    #[test]
+    fn db_vector_domain_filter_fidelity_source() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        seed_filter_fidelity_fixture(&storage);
+
+        let mut filters = SearchFilters::default();
+        filters.roles = Some(HashSet::from([
+            crate::search::vector_index::ROLE_USER,
+            crate::search::vector_index::ROLE_ASSISTANT,
+            crate::search::vector_index::ROLE_TOOL,
+        ]));
+        filters.source_filter = SourceFilter::SourceId("remote-host".into());
+        assert_eq!(db3_message_ids(&storage, &filters), vec![2, 4]);
+    }
+
+    #[test]
+    fn db_vector_domain_filter_fidelity_role_default_user_and_assistant() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        seed_filter_fidelity_fixture(&storage);
+
+        // No explicit `filters.roles` -- exercise the default-role fallback
+        // (`default_roles` parameter), matching `search_semantic_candidates`'s
+        // "explicit filter overrides, otherwise fall back to context
+        // default" contract. Message 3 (role=tool) must be excluded by the
+        // default user+assistant semantics even though it's an unrestricted
+        // query otherwise.
+        let (results, _retry) = SearchClient::search_db_vector_domain(
+            storage.raw(),
+            &[0.5, 0.5, 0.5, 0.5],
+            &SearchFilters::default(),
+            Some(&HashSet::from([
+                crate::search::vector_index::ROLE_USER,
+                crate::search::vector_index::ROLE_ASSISTANT,
+            ])),
+            10,
+        )
+        .unwrap();
+        let mut ids: Vec<u64> = results.into_iter().map(|r| r.message_id).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![1, 2, 4],
+            "default user+assistant role semantics must exclude message 3 (role=tool)"
+        );
+    }
+
+    #[test]
+    fn db_vector_domain_filter_fidelity_role_explicit_overrides_default() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        seed_filter_fidelity_fixture(&storage);
+
+        // Explicit `filters.roles` (tool only) must override the default
+        // user+assistant semantics, not intersect with it.
+        let mut filters = SearchFilters::default();
+        filters.roles = Some(HashSet::from([crate::search::vector_index::ROLE_TOOL]));
+        let (results, _retry) = SearchClient::search_db_vector_domain(
+            storage.raw(),
+            &[0.5, 0.5, 0.5, 0.5],
+            &filters,
+            Some(&HashSet::from([
+                crate::search::vector_index::ROLE_USER,
+                crate::search::vector_index::ROLE_ASSISTANT,
+            ])),
+            10,
+        )
+        .unwrap();
+        let ids: Vec<u64> = results.into_iter().map(|r| r.message_id).collect();
+        assert_eq!(ids, vec![3], "explicit role filter must override, not intersect with, the default");
+    }
+
+    #[test]
+    fn db_vector_domain_filter_fidelity_date_range() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        seed_filter_fidelity_fixture(&storage);
+
+        let mut filters = SearchFilters::default();
+        filters.roles = Some(HashSet::from([
+            crate::search::vector_index::ROLE_USER,
+            crate::search::vector_index::ROLE_ASSISTANT,
+            crate::search::vector_index::ROLE_TOOL,
+        ]));
+        filters.created_from = Some(150);
+        filters.created_to = Some(350);
+        assert_eq!(db3_message_ids(&storage, &filters), vec![2, 3]);
+    }
+
+    #[test]
+    fn db_vector_domain_filter_fidelity_combined() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        seed_filter_fidelity_fixture(&storage);
+
+        // agent=codex AND workspace=/ws/beta -- only message 3 satisfies
+        // both simultaneously (message 1 is codex but /ws/alpha; message 4
+        // is /ws/beta... no wait /ws/alpha; no other codex+beta candidate).
+        let mut filters = SearchFilters::default();
+        filters.roles = Some(HashSet::from([
+            crate::search::vector_index::ROLE_USER,
+            crate::search::vector_index::ROLE_ASSISTANT,
+            crate::search::vector_index::ROLE_TOOL,
+        ]));
+        filters.agents.insert("codex".into());
+        filters.workspaces.insert("/ws/beta".into());
+        assert_eq!(
+            db3_message_ids(&storage, &filters),
+            vec![3],
+            "combined agent+workspace filter must AND, not OR, the two dimensions"
+        );
+    }
+
+    /// R1-W3-B6/N1/B9: the "widen to full coverage" retry no longer asks
+    /// `vec0` for a bigger `k` -- it filters `message_embeddings` directly
+    /// via SQL, then ranks the (small, by construction) passing subset by
+    /// an application-layer `cosine_distance`. This test forces that retry
+    /// path to actually fire (a selective workspace filter that excludes
+    /// every doc in the first KNN pass's overfetch window) and checks two
+    /// things: (a) the retry finds exactly the filter-passing docs, in the
+    /// correct nearest-first order; (b) the distance/score
+    /// `cosine_distance` computes for each of them is numerically
+    /// indistinguishable (matches to `f64` epsilon) from `vec0`'s own
+    /// distance for the exact same vectors -- i.e. the two ranking paths
+    /// are provably the same metric, not just "close enough" by
+    /// construction of this particular fixture.
+    #[test]
+    fn db_vector_domain_full_scan_retry_matches_vec0_distance_and_order() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        const DIM: i64 = 2;
+        const TOTAL_DOCS: i64 = 20;
+        // Three of the twenty docs (the farthest three from the query
+        // vector by construction) live in "/ws/target"; the other
+        // seventeen live in "/ws/other". Query vector is [1.0, 0.0];
+        // doc i's vector is [cos(theta_i), sin(theta_i)] with theta_i
+        // strictly increasing in i, so cosine distance from the query
+        // (1 - cos(theta_i)) is strictly increasing in i too -- doc 0 is
+        // the nearest, doc 19 the farthest, by construction, and the
+        // three target-workspace docs (17, 18, 19) are guaranteed to be
+        // the three farthest of all twenty.
+        let target_indices = [17_i64, 18, 19];
+        let mut vectors: Vec<(i64, i64, Vec<f32>)> = Vec::new();
+        for i in 0..TOTAL_DOCS {
+            let theta = (i as f32) * 0.1;
+            let message_id = 1000 + i;
+            let conversation_id = 1000 + i;
+            let workspace = if target_indices.contains(&i) { "/ws/target" } else { "/ws/other" };
+            seed_db3_message(
+                &storage,
+                &Db3SeedMessage {
+                    agent_slug: "codex",
+                    workspace_path: Some(workspace),
+                    source_id: "local",
+                    role: "user",
+                    created_at: 100 + i,
+                    message_id,
+                    conversation_id,
+                },
+            );
+            vectors.push((message_id, conversation_id, vec![theta.cos(), theta.sin()]));
+        }
+        let generation_id = seed_active_generation_with_vectors(&storage, DIM, &vectors);
+        let query_vector = [1.0_f32, 0.0];
+
+        // fetch_limit=2 -> OVERFETCH_FACTOR(4) -> first_k=8, comfortably
+        // less than TOTAL_DOCS(20) so the retry condition
+        // (`first_k < row_count_usize`) is live, and the 8 nearest docs
+        // (indices 0..8) contain zero /ws/target docs, so the first pass's
+        // `filtered.len()` is 0 < fetch_limit(2) -- the retry must fire.
+        let mut filters = SearchFilters::default();
+        filters.workspaces.insert("/ws/target".to_string());
+        let (results, retry) = SearchClient::search_db_vector_domain(
+            storage.raw(),
+            &query_vector,
+            &filters,
+            Some(&HashSet::from([
+                crate::search::vector_index::ROLE_USER,
+                crate::search::vector_index::ROLE_ASSISTANT,
+            ])),
+            2,
+        )
+        .unwrap();
+
+        assert!(!retry.has_more_candidates, "the full-scan retry covers the entire filtered universe");
+
+        let got_ids: Vec<u64> = results.iter().map(|r| r.message_id).collect();
+        assert_eq!(
+            got_ids,
+            vec![1017, 1018, 1019],
+            "must find exactly the three /ws/target docs, nearest-first (theta strictly increasing in doc index)"
+        );
+
+        // Ground truth: ask vec0 itself (k=20, nowhere near the 4096 cap)
+        // for every doc's distance from the same query vector, then
+        // restrict to the three target ids -- this is what `vec0` itself
+        // says their distances are, independent of the full-scan path
+        // under test.
+        let vec0_truth: std::collections::HashMap<i64, f64> =
+            crate::storage::vector_domain::vec0_knn(storage.raw(), generation_id, &query_vector, 20)
+                .unwrap()
+                .into_iter()
+                .collect();
+        for hit in &results {
+            let doc_id = i64::try_from(hit.message_id).unwrap();
+            let vec0_distance = *vec0_truth.get(&doc_id).expect("vec0 must have scored every doc");
+            let full_scan_distance = f64::from(1.0 - hit.score);
+            assert!(
+                (vec0_distance - full_scan_distance).abs() < 1e-6,
+                "doc {doc_id}: vec0 distance {vec0_distance} vs full-scan distance {full_scan_distance} must match"
+            );
+        }
+    }
+
+    /// R1-W3-B9 (exec60 real-corpus gate run, 2026-09-02): `search_hybrid`'s
+    /// semantic leg fetch_limit (`hybrid_candidate_budget`'s
+    /// `semantic_candidates`, itself a multiplier on the caller's raw
+    /// `--limit`) compounds with this function's own `OVERFETCH_FACTOR`
+    /// before ever reaching vec0 -- exec60 observed `--limit 5000` derive
+    /// `k=80016`, a hard SQL crash (rc=9) pre-fix. Rather than replicate
+    /// hybrid's exact multiplier chain (which would also need a working
+    /// lexical index, unrelated to what this is actually testing), this
+    /// calls `search_db_vector_domain` directly with a `fetch_limit` far
+    /// past `SQLITE_VEC_KNN_K_MAX` on its own -- proving the clamp at this
+    /// single choke point protects the DB-vector-domain KNN call
+    /// regardless of which upstream caller (hybrid fusion, a future
+    /// caller, or hybrid's real formula for this exact scenario) derived
+    /// an oversized number.
+    ///
+    /// The corpus must exceed `SQLITE_VEC_KNN_K_MAX`(4096) itself: with a
+    /// small corpus, `first_k`'s existing `.min(row_count_usize)` term
+    /// alone already keeps `first_k` under the limit regardless of whether
+    /// the dedicated k-max clamp exists, which would make this test pass
+    /// even with that clamp deleted (verified: an earlier draft of this
+    /// test using a 4-doc fixture did exactly that -- caught by this
+    /// item's mutation-kill check, not by review). 4200 docs at dim=4 (not
+    /// bge-m3's real 1024) keeps fixture setup fast; only the k-value
+    /// itself is under test here, not distance correctness (that's
+    /// `db_vector_domain_full_scan_retry_matches_vec0_distance_and_order`'s
+    /// job) or realistic-scale latency (that's the perf disclosure probe
+    /// below).
+    #[test]
+    fn db_vector_domain_fetch_limit_far_past_sqlite_vec_k_max_does_not_crash() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        const DIM: i64 = 4;
+        const TOTAL_DOCS: i64 = 4_200;
+
+        let agent_id = storage
+            .ensure_agent(&Agent { id: None, slug: "codex".to_string(), name: "codex".to_string(), version: None, kind: AgentKind::Cli })
+            .unwrap();
+        let conn = storage.raw();
+        conn.execute(
+            "INSERT OR IGNORE INTO sources(id, kind, created_at, updated_at) VALUES ('local', 'local', 0, 0)",
+            &[],
+        )
+        .unwrap();
+        let mut vectors: Vec<(i64, i64, Vec<f32>)> = Vec::with_capacity(TOTAL_DOCS as usize);
+        conn.with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
+            for i in 0..TOTAL_DOCS {
+                let message_id = 3_000_000 + i;
+                let conversation_id = 3_000_000 + i;
+                tx.execute(
+                    "INSERT INTO conversations(id, agent_id, source_id, title, source_path) \
+                     VALUES (?1, ?2, 'local', 't', ?3)",
+                    &[
+                        ParamValue::from(conversation_id),
+                        ParamValue::from(agent_id),
+                        ParamValue::from(format!("/tmp/c-{conversation_id}.jsonl")),
+                    ],
+                )?;
+                tx.execute(
+                    "INSERT INTO messages(id, conversation_id, idx, role, created_at, content) \
+                     VALUES (?1, ?2, 0, 'user', ?3, 'c')",
+                    &crate::storage::api::params![message_id, conversation_id, 100 + i],
+                )?;
+                let theta = (i as f32) * 0.001;
+                vectors.push((message_id, conversation_id, vec![theta.cos(), theta.sin(), 0.0, 0.0]));
+            }
+            Ok(())
+        })
+        .unwrap();
+        seed_active_generation_with_vectors(&storage, DIM, &vectors);
+
+        // 80_016 mirrors exec60's exact observed derived-k crash value for
+        // `--limit 5000` in hybrid mode.
+        let (results, retry) = SearchClient::search_db_vector_domain(
+            storage.raw(),
+            &[1.0, 0.0, 0.0, 0.0],
+            &SearchFilters::default(),
+            Some(&HashSet::from([
+                crate::search::vector_index::ROLE_USER,
+                crate::search::vector_index::ROLE_ASSISTANT,
+                crate::search::vector_index::ROLE_TOOL,
+            ])),
+            80_016,
+        )
+        .expect("an oversized fetch_limit must never reach vec0's k<=4096 hard limit");
+        // R2-B6: this query is unfiltered -- every doc the first KNN pass
+        // finds passes the relational filter, so `filtered.len() ==
+        // first_k` (the k-max clamp, not filter selectivity, is why it fell
+        // short of `fetch_limit`). That must NOT trigger the full-scan
+        // retry (it would re-read and score all 4_200 docs' BLOBs for a
+        // filter that eliminated nothing -- the resource-exhaustion shape
+        // this item fixes); the correct response is "here's the clamped
+        // first_k window, and yes, there's more" via `has_more_candidates`.
+        assert!(
+            !retry.second_pass_taken,
+            "an unfiltered query that only hit the k-max clamp must not take the full-scan retry"
+        );
+        assert!(
+            retry.has_more_candidates,
+            "first_k was clamped below row_count -- there genuinely are more candidates beyond this window"
+        );
+        assert_eq!(
+            results.len(),
+            4_096,
+            "first_k clamps to SQLITE_VEC_KNN_K_MAX(4096) regardless of fetch_limit or row_count"
+        );
+    }
+
+    /// R3-3: unlike the k-max-clamp test above (which never reaches the
+    /// full-scan retry because its query is unfiltered), a *selective*
+    /// filter drives `filtered.len() < first_k` and triggers the retry --
+    /// whose heap capacity is `first_k.max(fetch_limit)`, not `first_k`
+    /// alone. Pre-fix, an unclamped pathological `fetch_limit` (a raw
+    /// `usize` from `--limit`, e.g. `usize::MAX - 1`) flows straight into
+    /// `BinaryHeap::with_capacity(cap + 1)`, aborting the process (a
+    /// `+ 1` overflow, or an allocation request no allocator can satisfy)
+    /// before a single row is ever scanned. `cap.min(row_count_usize)`
+    /// bounds the heap to what the generation could ever actually fill
+    /// with, regardless of how large `fetch_limit` claims to be.
+    #[test]
+    fn db_vector_domain_full_scan_retry_with_pathological_fetch_limit_does_not_abort() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        const DIM: i64 = 4;
+        const FILLER_DOCS: i64 = 4_990;
+        const TARGET_DOCS: i64 = 10;
+        const FETCH_LIMIT: usize = usize::MAX - 1;
+
+        let agent_id = storage
+            .ensure_agent(&Agent { id: None, slug: "codex".to_string(), name: "codex".to_string(), version: None, kind: AgentKind::Cli })
+            .unwrap();
+        let other_ws = storage.ensure_workspace(std::path::Path::new("/ws/other"), None).unwrap();
+        let target_ws = storage.ensure_workspace(std::path::Path::new("/ws/target"), None).unwrap();
+        let conn = storage.raw();
+        conn.execute(
+            "INSERT OR IGNORE INTO sources(id, kind, created_at, updated_at) VALUES ('local', 'local', 0, 0)",
+            &[],
+        )
+        .unwrap();
+
+        let mut vectors: Vec<(i64, i64, Vec<f32>)> = Vec::with_capacity((FILLER_DOCS + TARGET_DOCS) as usize);
+        conn.with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
+            // Filler: nearest to the query, none in `/ws/target` -- fills
+            // the first KNN pass's (k-max-clamped) window entirely, so the
+            // relational filter (workspace=/ws/target) eliminates every
+            // first-pass candidate and the row count (5,000) exceeds
+            // SQLITE_VEC_KNN_K_MAX(4096), driving the full-scan retry.
+            for i in 0..FILLER_DOCS {
+                let message_id = 2_000_000 + i;
+                tx.execute(
+                    "INSERT INTO conversations(id, agent_id, workspace_id, source_id, title, source_path) \
+                     VALUES (?1, ?2, ?3, 'local', 't', ?4)",
+                    &[
+                        ParamValue::from(message_id),
+                        ParamValue::from(agent_id),
+                        ParamValue::from(other_ws),
+                        ParamValue::from(format!("/tmp/c-{message_id}.jsonl")),
+                    ],
+                )?;
+                tx.execute(
+                    "INSERT INTO messages(id, conversation_id, idx, role, created_at, content) \
+                     VALUES (?1, ?2, 0, 'user', ?3, 'c')",
+                    &crate::storage::api::params![message_id, message_id, 100 + message_id],
+                )?;
+                let theta = (i as f32) * 0.0001;
+                vectors.push((message_id, message_id, vec![theta.cos(), theta.sin(), 0.0, 0.0]));
+            }
+
+            // Target: farther than every filler, in `/ws/target`.
+            for k in 0..TARGET_DOCS {
+                let message_id = 2_900_000 + k;
+                tx.execute(
+                    "INSERT INTO conversations(id, agent_id, workspace_id, source_id, title, source_path) \
+                     VALUES (?1, ?2, ?3, 'local', 't', ?4)",
+                    &[
+                        ParamValue::from(message_id),
+                        ParamValue::from(agent_id),
+                        ParamValue::from(target_ws),
+                        ParamValue::from(format!("/tmp/c-{message_id}.jsonl")),
+                    ],
+                )?;
+                tx.execute(
+                    "INSERT INTO messages(id, conversation_id, idx, role, created_at, content) \
+                     VALUES (?1, ?2, 0, 'user', ?3, 'c')",
+                    &crate::storage::api::params![message_id, message_id, 100 + message_id],
+                )?;
+                let theta = 1.0_f32 + (k as f32) * 0.001;
+                vectors.push((message_id, message_id, vec![theta.cos(), theta.sin(), 0.0, 0.0]));
+            }
+            Ok(())
+        })
+        .unwrap();
+        seed_active_generation_with_vectors(&storage, DIM, &vectors);
+
+        let mut filters = SearchFilters::default();
+        filters.workspaces.insert("/ws/target".to_string());
+        let (results, retry) = SearchClient::search_db_vector_domain(
+            storage.raw(),
+            &[1.0, 0.0, 0.0, 0.0],
+            &filters,
+            Some(&HashSet::from([
+                crate::search::vector_index::ROLE_USER,
+                crate::search::vector_index::ROLE_ASSISTANT,
+            ])),
+            FETCH_LIMIT,
+        )
+        .expect("a pathological fetch_limit must never abort the full-scan retry");
+
+        assert!(retry.second_pass_taken, "the selective workspace filter must drive the streaming retry");
+        assert!(
+            !retry.has_more_candidates,
+            "all 10 /ws/target docs fit comfortably under a row_count-bounded cap -- nothing was truncated"
+        );
+        assert_eq!(results.len(), TARGET_DOCS as usize, "must find every /ws/target doc, none lost to a bogus cap");
+        let got_ids: std::collections::HashSet<u64> = results.iter().map(|r| r.message_id).collect();
+        let want_ids: std::collections::HashSet<u64> = (0..TARGET_DOCS).map(|k| (2_900_000 + k) as u64).collect();
+        assert_eq!(got_ids, want_ids, "must return exactly the 10 /ws/target docs");
+    }
+
+    /// R2-B6 test (b): the full-scan retry's streaming top-K heap must
+    /// never surface more than its cap (`first_k.max(fetch_limit)` -- here
+    /// `first_k` = FETCH_LIMIT(3)*OVERFETCH_FACTOR(4) = 12, so cap=12), and
+    /// must pick the *closest* 12 among however many rows the retry
+    /// actually scans -- not merely the first 12 rows SQLite happens to
+    /// iterate. The 20 `/ws/target` docs (more than the cap, so truncation
+    /// genuinely happens) are seeded in strictly *descending* distance
+    /// order (farthest inserted first) precisely so a broken "keep the
+    /// first `cap` rows seen" implementation would return the wrong
+    /// (farthest) 12 instead of the correct (nearest) 12 -- the assertion
+    /// on `got_ids`'s exact order/identity, not just its length, is what
+    /// catches that mutation.
+    #[test]
+    fn db_vector_domain_full_scan_retry_streams_and_caps_at_first_k() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        const DIM: i64 = 4;
+        const FILLER_DOCS: i64 = 4_980;
+        const TARGET_DOCS: i64 = 20;
+        const FETCH_LIMIT: usize = 3;
+        const CAP: i64 = 12; // FETCH_LIMIT(3) * OVERFETCH_FACTOR(4)
+
+        let agent_id = storage
+            .ensure_agent(&Agent { id: None, slug: "codex".to_string(), name: "codex".to_string(), version: None, kind: AgentKind::Cli })
+            .unwrap();
+        let other_ws = storage.ensure_workspace(std::path::Path::new("/ws/other"), None).unwrap();
+        let target_ws = storage.ensure_workspace(std::path::Path::new("/ws/target"), None).unwrap();
+        let conn = storage.raw();
+        conn.execute(
+            "INSERT OR IGNORE INTO sources(id, kind, created_at, updated_at) VALUES ('local', 'local', 0, 0)",
+            &[],
+        )
+        .unwrap();
+
+        let mut vectors: Vec<(i64, i64, Vec<f32>)> =
+            Vec::with_capacity((FILLER_DOCS + TARGET_DOCS) as usize);
+        conn.with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
+            // Filler: 4,980 docs at tiny theta -- the nearest vectors in the
+            // whole corpus, guaranteeing the first KNN pass's overfetch
+            // window (`first_k` = FETCH_LIMIT*OVERFETCH_FACTOR = 12) fills
+            // entirely with these, none of which is `/ws/target`, so
+            // `filtered.len() == 0 < first_k` after the relational filter
+            // -- the streaming retry fires.
+            for i in 0..FILLER_DOCS {
+                let message_id = 4_000_000 + i;
+                tx.execute(
+                    "INSERT INTO conversations(id, agent_id, workspace_id, source_id, title, source_path) \
+                     VALUES (?1, ?2, ?3, 'local', 't', ?4)",
+                    &[
+                        ParamValue::from(message_id),
+                        ParamValue::from(agent_id),
+                        ParamValue::from(other_ws),
+                        ParamValue::from(format!("/tmp/c-{message_id}.jsonl")),
+                    ],
+                )?;
+                tx.execute(
+                    "INSERT INTO messages(id, conversation_id, idx, role, created_at, content) \
+                     VALUES (?1, ?2, 0, 'user', ?3, 'c')",
+                    &crate::storage::api::params![message_id, message_id, 100 + message_id],
+                )?;
+                let theta = (i as f32) * 0.0001;
+                vectors.push((message_id, message_id, vec![theta.cos(), theta.sin(), 0.0, 0.0]));
+            }
+
+            // Target: 20 `/ws/target` docs at theta far past the filler
+            // range (so none leak into the first pass's window), seeded in
+            // descending distance order (k=19's theta=1.019, farthest,
+            // inserted first; k=0's theta=1.000, nearest, inserted last).
+            for k in (0..TARGET_DOCS).rev() {
+                let message_id = 5_000_000 + (TARGET_DOCS - 1 - k);
+                tx.execute(
+                    "INSERT INTO conversations(id, agent_id, workspace_id, source_id, title, source_path) \
+                     VALUES (?1, ?2, ?3, 'local', 't', ?4)",
+                    &[
+                        ParamValue::from(message_id),
+                        ParamValue::from(agent_id),
+                        ParamValue::from(target_ws),
+                        ParamValue::from(format!("/tmp/c-{message_id}.jsonl")),
+                    ],
+                )?;
+                tx.execute(
+                    "INSERT INTO messages(id, conversation_id, idx, role, created_at, content) \
+                     VALUES (?1, ?2, 0, 'user', ?3, 'c')",
+                    &crate::storage::api::params![message_id, message_id, 100 + message_id],
+                )?;
+                let theta = 1.0_f32 + (k as f32) * 0.001;
+                vectors.push((message_id, message_id, vec![theta.cos(), theta.sin(), 0.0, 0.0]));
+            }
+            Ok(())
+        })
+        .unwrap();
+        seed_active_generation_with_vectors(&storage, DIM, &vectors);
+
+        let mut filters = SearchFilters::default();
+        filters.workspaces.insert("/ws/target".to_string());
+        let (results, retry) = SearchClient::search_db_vector_domain(
+            storage.raw(),
+            &[1.0, 0.0, 0.0, 0.0],
+            &filters,
+            Some(&HashSet::from([
+                crate::search::vector_index::ROLE_USER,
+                crate::search::vector_index::ROLE_ASSISTANT,
+            ])),
+            FETCH_LIMIT,
+        )
+        .unwrap();
+
+        assert!(
+            retry.second_pass_taken,
+            "the filter eliminated every first-pass candidate -- the streaming retry must fire"
+        );
+        assert!(
+            retry.has_more_candidates,
+            "20 target docs exist but the heap caps at 12 -- 8 genuinely didn't fit, has_more must say so"
+        );
+        assert_eq!(
+            results.len(),
+            CAP as usize,
+            "20 matching docs exist but the heap must cap output at first_k={CAP}"
+        );
+
+        // The 12 nearest target docs are k=0..12 (theta=1.000..1.011);
+        // message_id = 5_000_000 + (TARGET_DOCS - 1 - k) maps k=0..12 to
+        // message_ids 5_000_019 down to 5_000_008, nearest-first.
+        let got_ids: Vec<u64> = results.iter().map(|r| r.message_id).collect();
+        let want_ids: Vec<u64> = (0..CAP).map(|k| 5_000_000 + (TARGET_DOCS - 1 - k) as u64).collect();
+        assert_eq!(
+            got_ids, want_ids,
+            "must surface the 12 nearest target docs, nearest-first -- not the first 12 rows SQLite iterated"
+        );
+    }
+
+    /// R3-2 regression: `session_paths` used to be excluded from
+    /// `push_db_vector_domain_relational_filters` entirely (applied only
+    /// post-hoc, after `search_db_vector_domain` returns) -- so the
+    /// full-scan retry's capped heap ranked candidates by distance across
+    /// the *whole* (session-path-unaware) generation. A single target doc
+    /// whose distance rank among the unfiltered universe fell at `cap+1`
+    /// (here: 12 nearer non-matching filler docs, target 13th) was evicted
+    /// by the heap before `search_db_vector_domain` even returned, so the
+    /// post-hoc `session_paths` filter downstream had nothing left to find
+    /// it in -- a silent empty result the caller-side retry
+    /// (`search_semantic`'s `fallback_fetch_limit` widen) could never fix,
+    /// since widening `fetch_limit` doesn't change which rows the heap
+    /// competes against. Pushing `session_paths` into the shared SQL
+    /// filter fixes this: the full-scan retry's universe excludes the 12
+    /// non-matching fillers outright, so the target -- alone in its
+    /// filtered universe -- is trivially within the cap.
+    #[test]
+    fn db_vector_domain_full_scan_retry_session_paths_reaches_cap_plus_one_target() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        const DIM: i64 = 4;
+        const FILLER_DOCS: i64 = 12; // == CAP, so the target lands at rank cap+1
+        const FETCH_LIMIT: usize = 3;
+
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".to_string(),
+                name: "codex".to_string(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        let ws = storage.ensure_workspace(std::path::Path::new("/ws/shared"), None).unwrap();
+        let conn = storage.raw();
+        conn.execute(
+            "INSERT OR IGNORE INTO sources(id, kind, created_at, updated_at) VALUES ('local', 'local', 0, 0)",
+            &[],
+        )
+        .unwrap();
+
+        let target_path = "/tmp/target-session.jsonl".to_string();
+        let mut vectors: Vec<(i64, i64, Vec<f32>)> = Vec::with_capacity((FILLER_DOCS + 1) as usize);
+        conn.with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
+            // 12 filler docs, all closer to the query vector than the
+            // target and none matching `target_path` -- pre-fix, these
+            // alone fill the cap-12 heap in the full-scan retry.
+            for i in 0..FILLER_DOCS {
+                let message_id = 6_000_000 + i;
+                tx.execute(
+                    "INSERT INTO conversations(id, agent_id, workspace_id, source_id, title, source_path) \
+                     VALUES (?1, ?2, ?3, 'local', 't', ?4)",
+                    &[
+                        ParamValue::from(message_id),
+                        ParamValue::from(agent_id),
+                        ParamValue::from(ws),
+                        ParamValue::from(format!("/tmp/filler-{message_id}.jsonl")),
+                    ],
+                )?;
+                tx.execute(
+                    "INSERT INTO messages(id, conversation_id, idx, role, created_at, content) \
+                     VALUES (?1, ?2, 0, 'user', ?3, 'c')",
+                    &crate::storage::api::params![message_id, message_id, 100 + message_id],
+                )?;
+                let theta = (i as f32) * 0.0001;
+                vectors.push((message_id, message_id, vec![theta.cos(), theta.sin(), 0.0, 0.0]));
+            }
+
+            // Target: 1 doc, farther than every filler, in `target_path`.
+            let message_id = 7_000_000_i64;
+            tx.execute(
+                "INSERT INTO conversations(id, agent_id, workspace_id, source_id, title, source_path) \
+                 VALUES (?1, ?2, ?3, 'local', 't', ?4)",
+                &[
+                    ParamValue::from(message_id),
+                    ParamValue::from(agent_id),
+                    ParamValue::from(ws),
+                    ParamValue::from(target_path.clone()),
+                ],
+            )?;
+            tx.execute(
+                "INSERT INTO messages(id, conversation_id, idx, role, created_at, content) \
+                 VALUES (?1, ?2, 0, 'user', ?3, 'c')",
+                &crate::storage::api::params![message_id, message_id, 100 + message_id],
+            )?;
+            let theta = 1.0_f32;
+            vectors.push((message_id, message_id, vec![theta.cos(), theta.sin(), 0.0, 0.0]));
+            Ok(())
+        })
+        .unwrap();
+        seed_active_generation_with_vectors(&storage, DIM, &vectors);
+
+        let mut filters = SearchFilters::default();
+        filters.session_paths.insert(target_path.clone());
+        let (results, retry) = SearchClient::search_db_vector_domain(
+            storage.raw(),
+            &[1.0, 0.0, 0.0, 0.0],
+            &filters,
+            Some(&HashSet::from([
+                crate::search::vector_index::ROLE_USER,
+                crate::search::vector_index::ROLE_ASSISTANT,
+            ])),
+            FETCH_LIMIT,
+        )
+        .unwrap();
+
+        assert!(
+            retry.second_pass_taken,
+            "the session_paths filter eliminated every first-pass candidate -- the streaming retry must fire"
+        );
+        assert_eq!(
+            results.len(),
+            1,
+            "the single session_paths-matching doc must be found even though it ranks 13th (cap+1) among the unfiltered universe"
+        );
+        assert_eq!(
+            results[0].message_id, 7_000_000,
+            "must return the session_paths-matching target, not a filler"
+        );
+        assert!(
+            !retry.has_more_candidates,
+            "session_paths pruning leaves exactly 1 candidate in the retry's universe -- nothing was truncated"
+        );
+    }
+
+    /// R1-W3-B6/N1/B9 real-scale performance disclosure. Advisor's
+    /// acceptance criteria called for a real probe against a
+    /// low-selectivity query that triggers the full-scan retry at
+    /// production-representative scale ("staging, expect sub-second").
+    /// This worktree's isolation contract (task book #68) forbids
+    /// touching the staging DB or its vecsnapshot -- exec60's live gate
+    /// run is using both concurrently -- so this probe substitutes a
+    /// synthetic corpus instead: 20,000 rows at bge-m3's real production
+    /// dimension (1024), ~5x past `SQLITE_VEC_KNN_K_MAX`, with a filter
+    /// selective enough (5 of 20,000 rows, 0.025%) that the first KNN
+    /// pass's overfetch window (`first_k` capped at 4096) is virtually
+    /// guaranteed to miss all of them, forcing the retry every run. Vector
+    /// *content* doesn't affect the retry's cost model (BLOB read +
+    /// decode + dot product is the same work regardless of whether the
+    /// numbers are real embeddings or synthetic), so synthetic vectors are
+    /// a legitimate substitute for the cost measurement itself; the
+    /// distance/order *correctness* claim is already independently proven
+    /// by `db_vector_domain_full_scan_retry_matches_vec0_distance_and_order`
+    /// above.
+    /// `#[ignore]`d (not part of the default suite -- a 20k-row seed plus
+    /// a full-scan measurement is disk/CPU work with no assertion beyond
+    /// "printed a number", not a correctness regression test); run
+    /// explicitly with `--ignored` to reproduce this disclosure's numbers.
+    #[test]
+    #[ignore = "perf disclosure probe (R1-W3-B6/N1/B9); run explicitly with --ignored"]
+    fn db_vector_domain_full_scan_retry_perf_disclosure_at_20k_rows() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        const DIM: i64 = 1024;
+        const TOTAL_DOCS: i64 = 20_000;
+        const TARGET_DOCS: i64 = 5;
+
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".to_string(),
+                name: "codex".to_string(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        let other_ws = storage.ensure_workspace(std::path::Path::new("/ws/other"), None).unwrap();
+        let target_ws = storage.ensure_workspace(std::path::Path::new("/ws/target"), None).unwrap();
+
+        let seed_start = std::time::Instant::now();
+        let conn = storage.raw();
+        conn.execute(
+            "INSERT OR IGNORE INTO sources(id, kind, created_at, updated_at) VALUES ('local', 'local', 0, 0)",
+            &[],
+        )
+        .unwrap();
+        let mut vectors: Vec<(i64, i64, Vec<f32>)> = Vec::with_capacity(TOTAL_DOCS as usize);
+        conn.with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
+            for i in 0..TOTAL_DOCS {
+                let message_id = 2_000_000 + i;
+                let conversation_id = 2_000_000 + i;
+                let is_target = i >= TOTAL_DOCS - TARGET_DOCS;
+                let workspace_id = if is_target { target_ws } else { other_ws };
+                tx.execute(
+                    "INSERT INTO conversations(id, agent_id, workspace_id, source_id, title, source_path) \
+                     VALUES (?1, ?2, ?3, 'local', 't', ?4)",
+                    &[
+                        ParamValue::from(conversation_id),
+                        ParamValue::from(agent_id),
+                        ParamValue::from(workspace_id),
+                        ParamValue::from(format!("/tmp/c-{conversation_id}.jsonl")),
+                    ],
+                )?;
+                tx.execute(
+                    "INSERT INTO messages(id, conversation_id, idx, role, created_at, content) \
+                     VALUES (?1, ?2, 0, 'user', ?3, 'c')",
+                    &crate::storage::api::params![message_id, conversation_id, 100 + i],
+                )?;
+                // Deterministic pseudo-random unit-ish vector -- content
+                // doesn't matter for a cost measurement, only that it's a
+                // valid non-zero DIM-wide f32 vector.
+                let vector: Vec<f32> =
+                    (0..DIM).map(|d| ((i * 1_103_515_245 + d * 12_345 + 1) as f32 * 0.618_034).sin()).collect();
+                vectors.push((message_id, conversation_id, vector));
+            }
+            Ok(())
+        })
+        .unwrap();
+        let generation_id = seed_active_generation_with_vectors(&storage, DIM, &vectors);
+        let seed_elapsed = seed_start.elapsed();
+
+        let mut filters = SearchFilters::default();
+        filters.workspaces.insert("/ws/target".to_string());
+        let query_vector: Vec<f32> = (0..DIM).map(|d| (d as f32 * 0.001).cos()).collect();
+
+        let search_start = std::time::Instant::now();
+        let (results, retry) = SearchClient::search_db_vector_domain(
+            storage.raw(),
+            &query_vector,
+            &filters,
+            Some(&HashSet::from([
+                crate::search::vector_index::ROLE_USER,
+                crate::search::vector_index::ROLE_ASSISTANT,
+            ])),
+            2,
+        )
+        .unwrap();
+        let search_elapsed = search_start.elapsed();
+        // R2-B6: coarse peak-RSS disclosure (Linux `/proc/self/status`
+        // `VmHWM` -- the process' high-water mark, not a delta isolated to
+        // this one call, but the whole point of B6 is that this streaming
+        // retry must not be the thing that drives that high-water mark up
+        // by materializing every row's BLOB at once). Best-effort: absent
+        // (non-Linux, or a `/proc` read failure) prints "unavailable"
+        // rather than failing a perf-disclosure-only probe.
+        let peak_rss_kb: Option<u64> = std::fs::read_to_string("/proc/self/status").ok().and_then(|status| {
+            status.lines().find_map(|line| {
+                line.strip_prefix("VmHWM:")
+                    .and_then(|rest| rest.trim().strip_suffix(" kB"))
+                    .and_then(|kb| kb.trim().parse::<u64>().ok())
+            })
+        });
+
+        assert!(!retry.has_more_candidates, "full-scan retry must have covered the entire filtered universe");
+        assert_eq!(
+            results.len(),
+            TARGET_DOCS as usize,
+            "must find exactly the {TARGET_DOCS} /ws/target docs out of {TOTAL_DOCS} total"
+        );
+
+        // Disclosure, not an assertion of a specific bound -- generation_id
+        // is asserted live so a future run against a rebuilt fixture stays
+        // meaningful.
+        assert!(generation_id > 0);
+        let peak_rss_display = peak_rss_kb.map(|kb| format!("{kb}kB")).unwrap_or_else(|| "unavailable".to_string());
+        eprintln!(
+            "[R2-B6 perf disclosure] rows={TOTAL_DOCS} dim={DIM} target_docs={TARGET_DOCS} \
+             seed_ms={} search_ms={} peak_rss={peak_rss_display}",
+            seed_elapsed.as_millis(),
+            search_elapsed.as_millis()
+        );
+    }
+
+    /// R4-B4 (spec §3.1, this task's verification centerpiece): a reader
+    /// that opened its transaction (and therefore its read snapshot) BEFORE
+    /// another connection switches the active generation must see the
+    /// state that was active when its snapshot was taken -- entirely the
+    /// old generation or entirely the new one, never a mix, and never a
+    /// crash from the old generation's vec0 table disappearing mid-read.
+    #[test]
+    fn db_vector_domain_search_reader_sees_a_consistent_snapshot_across_a_concurrent_generation_switch() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        seed_db3_message(
+            &storage,
+            &Db3SeedMessage {
+                agent_slug: "codex",
+                workspace_path: None,
+                source_id: "local",
+                role: "user",
+                created_at: 100,
+                message_id: 1,
+                conversation_id: 1,
+            },
+        );
+        let gen_a = seed_active_generation_with_vectors(
+            &storage,
+            2,
+            &[(1, 1, vec![1.0, 0.0])],
+        );
+
+        // A second connection to the same file builds and activates
+        // generation B -- but does NOT drop generation A's vec0 table (W3-4's
+        // delayed-cleanup job, out of scope here); this test's job is only
+        // to prove the reader's snapshot is internally consistent, not to
+        // exercise cleanup.
+        let storage_b = FrankenStorage::open(&db_path).unwrap();
+        let conn_b = storage_b.raw();
+        let gen_b = conn_b
+            .with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
+                let gen_id = crate::storage::schema::create_embedding_generation(tx, "bge-m3", 2, 1, 3_000)?;
+                crate::storage::schema::insert_message_embedding(
+                    tx, gen_id, 1, 1, &[0.0, 1.0], "h2", None, 3_000,
+                )?;
+                Ok(gen_id)
+            })
+            .unwrap();
+
+        // Reader's turn: run the actual search on generation A twice,
+        // switching B active in between -- each call is its own read
+        // transaction (this function doesn't hold one open across calls),
+        // so this proves "read the active pointer and its vectors from one
+        // consistent snapshot per call", the unit R4-B4 actually asks for.
+        let (before, _) = SearchClient::search_db_vector_domain(
+            storage.raw(),
+            &[1.0, 0.0],
+            &SearchFilters::default(),
+            None,
+            10,
+        )
+        .unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].message_id, 1);
+        // Before the switch, generation A is active -- score must reflect
+        // A's vector (1.0,0.0), an exact match against the query (score ~1.0),
+        // not B's (0.0,1.0) (which would score ~0.0 for this query).
+        assert!(before[0].score > 0.9, "expected generation A's near-exact match, got score={}", before[0].score);
+
+        crate::storage::schema::switch_active_generation(conn_b, gen_b, 4_000, |_tx| Ok(())).unwrap();
+        crate::storage::vector_domain::rebuild_vec0_table_for_generation(conn_b, gen_b, 2).unwrap();
+
+        let (after, _) = SearchClient::search_db_vector_domain(
+            storage.raw(),
+            &[1.0, 0.0],
+            &SearchFilters::default(),
+            None,
+            10,
+        )
+        .unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].message_id, 1);
+        assert!(
+            after[0].score < 0.5,
+            "expected generation B's near-orthogonal match after the switch (score ~0.0), got score={} \
+             (a stale read would still show A's near-exact ~1.0 -- this is the mixed-read failure mode \
+             R4-B4 exists to prevent)",
+            after[0].score
+        );
+        assert_ne!(gen_a, gen_b);
+    }
+
+    /// w3-3 Step1 (task book #61): first real end-to-end light-up of the
+    /// full db-vector-domain loop -- genesis-seed -> Infinity embed ->
+    /// CAS write -> hole resolution -> vec0 rebuild -> activation -> a
+    /// real hit through this file's own `search_db_vector_domain` read
+    /// path. Requires a live Infinity at `CASS_INFINITY_URL`
+    /// (127.0.0.1:7997 by default); run explicitly with `--ignored`.
+    #[test]
+    #[ignore = "requires a live Infinity service at 127.0.0.1:7997 (CASS_INFINITY_URL)"]
+    #[cfg(feature = "infinity")]
+    fn db_vector_catchup_end_to_end_via_live_infinity() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "claude_code".into(),
+                name: "Claude Code".into(),
+                version: Some("1.0".into()),
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+
+        fn msg(idx: i64, role: MessageRole, content: &str) -> Message {
+            Message {
+                id: None,
+                idx,
+                role,
+                author: None,
+                created_at: Some(1_000 + idx * 1_000),
+                content: content.into(),
+                extra_json: json!(null),
+                snippets: vec![],
+            }
+        }
+
+        // Three conversations, 7 messages each = 21 total. Each
+        // conversation carries one raw-non-empty-but-canonicalize-empty
+        // "noise" message ("ok", in `LOW_SIGNAL_CONTENT`) -- eligible per the packet's weak
+        // `!content.is_empty()` projection but never embeddable, so this
+        // corpus also proves the stricter canonicalize-non-empty genesis
+        // filter (w3-3 Step0 design §2) actually excludes it end-to-end.
+        let mut total_messages = 0usize;
+        let mut noise_messages = 0usize;
+        for c in 0..3i64 {
+            let messages = vec![
+                msg(0, MessageRole::User, &format!("conversation {c} message about rust borrow checker lifetimes")),
+                msg(1, MessageRole::Agent, &format!("conversation {c} reply about ownership and ownership rules")),
+                msg(2, MessageRole::User, "ok"),
+                msg(3, MessageRole::User, &format!("conversation {c} question about async runtime scheduling")),
+                msg(4, MessageRole::Agent, &format!("conversation {c} answer about tokio executor internals")),
+                msg(5, MessageRole::User, &format!("conversation {c} follow-up on garbage collection tradeoffs")),
+                msg(6, MessageRole::Agent, &format!("conversation {c} closing remark on memory safety guarantees")),
+            ];
+            total_messages += messages.len();
+            noise_messages += 1;
+            let conv = Conversation {
+                id: None,
+                agent_slug: "claude_code".into(),
+                workspace: None,
+                external_id: Some(format!("w3-3-step1-e2e-{c}")),
+                title: Some("w3-3 Step1 e2e fixture".into()),
+                source_path: std::path::PathBuf::from(format!("/fixtures/w3-3-step1-e2e-{c}.jsonl")),
+                started_at: Some(1_000),
+                ended_at: Some(8_000),
+                approx_tokens: None,
+                metadata_json: json!(null),
+                messages,
+                source_id: "local".into(),
+                origin_host: None,
+            };
+            storage.insert_conversation_tree(agent_id, None, &conv).expect("seed conversation");
+        }
+        let expected_eligible = (total_messages - noise_messages) as u64;
+
+        let report = crate::indexer::db_vector_catchup::run_db_vector_catchup_backfill(&storage, 8)
+            .expect("first backfill run");
+
+        assert!(report.generation_id > 0);
+        assert!(!report.reused_existing_generation, "first call must create, not reuse");
+        assert_eq!(report.embedder_id, "BAAI/bge-m3");
+        assert_eq!(report.dim, 1024);
+        assert_eq!(report.eligible_seeded, expected_eligible, "genesis seeding must exclude the noise messages");
+        assert_eq!(report.embedded_inserted, expected_eligible);
+        assert_eq!(report.stale_skipped, 0, "no concurrent writer in this test -- nothing should ever go stale");
+        assert_eq!(report.holes_before, expected_eligible);
+        assert_eq!(report.holes_after, 0, "every eligible hole must be resolved by the end of one run");
+        assert_eq!(report.vec0_rows, expected_eligible as usize);
+        assert!(report.activated);
+
+        let active = crate::storage::schema::active_generation_id(storage.raw()).unwrap();
+        assert_eq!(active, Some(report.generation_id));
+
+        // Real read-path light-up: pull back one message's own stored
+        // vector and self-query `search_db_vector_domain` with it -- the
+        // nearest hit must be that same message, at near-1.0 cosine score.
+        let (sample_doc_id, sample_blob): (i64, Vec<u8>) = storage
+            .raw()
+            .query_row_map(
+                "SELECT doc_id, embedding FROM message_embeddings WHERE generation_id = ?1 LIMIT 1",
+                &crate::storage::api::params![report.generation_id],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )
+            .unwrap();
+        let sample_vector = crate::storage::schema::le_blob_to_f32_vector(&sample_blob).unwrap();
+        let (hits, _) = SearchClient::search_db_vector_domain(
+            storage.raw(),
+            &sample_vector,
+            &SearchFilters::default(),
+            None,
+            5,
+        )
+        .expect("db vector domain search must succeed once activated");
+        assert!(!hits.is_empty(), "self-query must return at least one hit");
+        assert_eq!(hits[0].message_id, u64::try_from(sample_doc_id).unwrap());
+        assert!(hits[0].score > 0.99, "self-query must score near-exact, got {}", hits[0].score);
+
+        // Ruling ② (w3-3 Step0 design, approved): a second call with no
+        // new eligible work must resume the same generation by identity
+        // match, not create a fresh one or re-embed anything.
+        let second = crate::indexer::db_vector_catchup::run_db_vector_catchup_backfill(&storage, 8)
+            .expect("second backfill run (resume path)");
+        assert!(second.reused_existing_generation, "second call must find and reuse the pending generation");
+        assert_eq!(second.generation_id, report.generation_id);
+        assert_eq!(second.embedded_inserted, 0, "nothing new to embed on the resume pass");
+        assert_eq!(second.holes_after, 0);
+        assert!(second.activated);
     }
 }

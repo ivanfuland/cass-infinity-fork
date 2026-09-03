@@ -148,6 +148,21 @@ impl ModelDownloadPolicy {
 pub const DEFAULT_FAST_TIER_EMBEDDER: &str = "hash";
 
 /// Default quality-tier embedder name (requires ML model files).
+///
+/// R1-W3-N2: `minilm` is a FastEmbed/ONNX model, which requires the
+/// `semantic` build feature -- retired in this build (W3-5,
+/// `--no-default-features --features qr,encryption,infinity`, ORT-free).
+/// Defaulting to it anyway meant every default-configuration semantic
+/// search/index/TUI path (nothing consults this constant besides through
+/// `SemanticPolicy::resolve`'s own default) silently pointed at an
+/// unreachable model, forcing every caller to know to pass an explicit
+/// override just to reach the DB vector domain this build actually ships.
+/// `infinity` is `is_infinity_embedder_name`'s (`search::model_manager`)
+/// own routing name for the DB-vector-domain path, so this default now
+/// matches what the build can actually serve.
+#[cfg(feature = "infinity")]
+pub const DEFAULT_QUALITY_TIER_EMBEDDER: &str = "infinity";
+#[cfg(not(feature = "infinity"))]
 pub const DEFAULT_QUALITY_TIER_EMBEDDER: &str = "minilm";
 
 /// Default reranker name (requires cross-encoder model files).
@@ -996,6 +1011,16 @@ impl SemanticArtifactKind {
 mod tests {
     use super::*;
 
+    /// R1-W3-N2: under this build's actual feature (ORT-free, `semantic`
+    /// retired), the quality-tier default must be the routing name for
+    /// the DB vector domain this build can actually serve, not a
+    /// FastEmbed/ONNX model that can never load here.
+    #[cfg(feature = "infinity")]
+    #[test]
+    fn default_quality_tier_embedder_is_infinity_under_the_infinity_feature() {
+        assert_eq!(DEFAULT_QUALITY_TIER_EMBEDDER, "infinity");
+    }
+
     // ── Precedence resolution ──────────────────────────────────────────
 
     #[test]
@@ -1003,7 +1028,11 @@ mod tests {
         let p = SemanticPolicy::compiled_defaults();
         assert_eq!(p.mode, SemanticMode::HybridPreferred);
         assert_eq!(p.fast_tier_embedder, "hash");
-        assert_eq!(p.quality_tier_embedder, "minilm");
+        // R1-W3-N2: this build's default quality-tier embedder tracks
+        // DEFAULT_QUALITY_TIER_EMBEDDER, which is feature-conditional
+        // (see its own doc comment for why "minilm" would be an
+        // unreachable default under `infinity`).
+        assert_eq!(p.quality_tier_embedder, DEFAULT_QUALITY_TIER_EMBEDDER);
         assert_eq!(p.download_policy, ModelDownloadPolicy::OptIn);
         assert_eq!(p.fast_dimension, 256);
         assert_eq!(p.quality_dimension, 384);
@@ -1408,7 +1437,7 @@ mod tests {
         let report = SemanticCapabilityReport::from_policy(&policy, cap, 0);
 
         assert_eq!(report.capability, SemanticCapability::FastTierOnly);
-        assert_eq!(report.quality_tier_embedder, "minilm");
+        assert_eq!(report.quality_tier_embedder, DEFAULT_QUALITY_TIER_EMBEDDER);
         assert_eq!(report.download_policy, ModelDownloadPolicy::OptIn);
     }
 

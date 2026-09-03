@@ -161,7 +161,6 @@ struct IndexEntrypointDiagnostics {
     watch: bool,
     watch_once_path_count: usize,
     semantic: bool,
-    build_hnsw: bool,
     migration_state: &'static str,
 }
 
@@ -171,8 +170,11 @@ fn index_entrypoint_diagnostics(
     watch: bool,
     watch_once_path_count: usize,
     semantic: bool,
-    build_hnsw: bool,
 ) -> IndexEntrypointDiagnostics {
+    // W3-5: the "semantic_hnsw" kind (semantic && build_hnsw) is dropped
+    // along with the retired `--build-hnsw` flag -- `cass index --build-hnsw`
+    // has had no query-time reader since 3f7aa054 (`--approximate` removal),
+    // and the flag itself is now gone.
     let kind = if watch_once_path_count > 0 {
         if watch { "watch_cycle" } else { "watch_once" }
     } else if watch {
@@ -181,8 +183,6 @@ fn index_entrypoint_diagnostics(
         "full_rebuild"
     } else if force_rebuild {
         "force_rebuild"
-    } else if semantic && build_hnsw {
-        "semantic_hnsw"
     } else if semantic {
         "semantic_backfill"
     } else {
@@ -196,7 +196,6 @@ fn index_entrypoint_diagnostics(
         watch,
         watch_once_path_count,
         semantic,
-        build_hnsw,
         migration_state: "tin8o_entrypoint_observed",
     }
 }
@@ -366,13 +365,13 @@ pub enum Commands {
         #[arg(long)]
         semantic: bool,
 
-        /// Build HNSW index for approximate nearest neighbor search (requires --semantic).
-        /// Enables O(log n) search with `--approximate` flag at query time.
-        #[arg(long, default_value_t = false)]
-        build_hnsw: bool,
-
-        /// Embedder to use for semantic indexing (hash, fastembed)
-        #[arg(long, default_value = "fastembed")]
+        /// Embedder to use for semantic indexing (infinity, hash; `fastembed`
+        /// requires the `semantic` build feature, retired in this build --
+        /// R1-W3-N2: defaults to `infinity` under the `infinity` feature so
+        /// a bare `cass index --semantic` reaches the DB vector domain
+        /// instead of the retired default)
+        #[cfg_attr(feature = "infinity", arg(long, default_value = "infinity"))]
+        #[cfg_attr(not(feature = "infinity"), arg(long, default_value = "fastembed"))]
         embedder: String,
 
         /// Override data dir (index + db). Defaults to platform data dir.
@@ -518,13 +517,6 @@ pub enum Commands {
         #[arg(long, value_enum)]
         mode: Option<crate::search::query::SearchMode>,
 
-        /// Use approximate nearest neighbor (ANN) search with HNSW for faster semantic/hybrid queries.
-        /// Trades slight accuracy loss for O(log n) search complexity instead of O(n).
-        /// Only affects semantic and hybrid modes; ignored for lexical search.
-        /// Requires an HNSW index built with `cass index --semantic --approximate`.
-        #[arg(long, default_value_t = false)]
-        approximate: bool,
-
         // ==========================================================================
         // Model / Reranker / Daemon flags (bd-3bbv)
         // ==========================================================================
@@ -552,26 +544,6 @@ pub enum Commands {
         /// Disable daemon usage even if available (force direct inference).
         #[arg(long, default_value_t = false)]
         no_daemon: bool,
-
-        // ==========================================================================
-        // Two-tier progressive search flags (bd-3dcw)
-        // ==========================================================================
-        /// Enable two-tier progressive search: fast results immediately, refined via daemon.
-        /// Returns initial results from fast embedder (~1ms), then refines with quality
-        /// embedder via daemon (~130ms). Best of both worlds for interactive search.
-        #[arg(long, default_value_t = false)]
-        two_tier: bool,
-
-        /// Fast-only search: use lightweight embedder for instant results, no refinement.
-        /// Ideal for real-time search-as-you-type scenarios where latency is critical.
-        #[arg(long, default_value_t = false)]
-        fast_only: bool,
-
-        /// Quality-only search: wait for full transformer model results.
-        /// Higher latency (~130ms) but most accurate semantic matching.
-        /// Requires daemon to be available; falls back to fast if unavailable.
-        #[arg(long, default_value_t = false)]
-        quality_only: bool,
 
         /// Run an incremental `cass index` pass before the search so new
         /// conversations created since the last index are matched. No-op
@@ -4488,17 +4460,10 @@ fn search_like_option_value_count(command: &str, arg: &str) -> Option<usize> {
             | "dry-run"
             | "dry_run"
             | "highlight"
-            | "approximate"
             | "rerank"
             | "daemon"
             | "no-daemon"
             | "no_daemon"
-            | "two-tier"
-            | "two_tier"
-            | "fast-only"
-            | "fast_only"
-            | "quality-only"
-            | "quality_only"
             | "refresh"
             | "catch-up"
             | "catch_up"
@@ -5181,8 +5146,6 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         "resume",
         "non-interactive",
         // Missing flags added
-        "approximate",
-        "build-hnsw",
         "export-only",
         "verify",
         "scan-secrets",
@@ -5197,8 +5160,6 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         "robot-meta",
         "robot-format",
         "max-content-length",
-        "fast-only",
-        "quality-only",
         "once",
         "reset-state",
         "asciicast",
@@ -6864,7 +6825,6 @@ async fn execute_cli(
                     watch_interval,
                     data_dir,
                     semantic,
-                    build_hnsw,
                     embedder,
                     idempotency_key,
                     json,
@@ -6882,7 +6842,6 @@ async fn execute_cli(
                         watch_interval,
                         data_dir,
                         semantic,
-                        build_hnsw,
                         embedder,
                         progress,
                         structured_format,
@@ -6922,32 +6881,13 @@ async fn execute_cli(
                     source,
                     sessions_from,
                     mode,
-                    approximate,
                     model,
                     rerank,
                     reranker,
                     daemon,
                     no_daemon,
-                    two_tier,
-                    fast_only,
-                    quality_only,
                     refresh,
                 } => {
-                    // Validate mutually exclusive two-tier flags
-                    let tier_count = [two_tier, fast_only, quality_only]
-                        .iter()
-                        .filter(|&&b| b)
-                        .count();
-                    if tier_count > 1 {
-                        return Err(CliError::usage(
-                            "Cannot specify multiple tier flags",
-                            Some(
-                                "Use only one of --two-tier, --fast-only, or --quality-only"
-                                    .to_string(),
-                            ),
-                        ));
-                    }
-
                     // Validate mutually exclusive flags
                     if daemon && no_daemon {
                         return Err(CliError::usage(
@@ -6966,32 +6906,15 @@ async fn execute_cli(
                         );
                     }
 
-                    // --refresh runs *after* flag validation so an invocation
-                    // like `cass search --refresh --two-tier --fast-only`
-                    // rejects fast on the bad flag combo instead of burning a
-                    // ~30s incremental index before failing usage.
                     if refresh {
                         refresh_index_inline(cli.db.clone(), data_dir.clone());
                     }
-
-                    // Build semantic options from new flags
-                    let tier_mode = if two_tier {
-                        crate::search::query::SemanticTierMode::Progressive
-                    } else if fast_only {
-                        crate::search::query::SemanticTierMode::FastOnly
-                    } else if quality_only {
-                        crate::search::query::SemanticTierMode::QualityOnly
-                    } else {
-                        crate::search::query::SemanticTierMode::Single
-                    };
 
                     let semantic_opts = SemanticSearchOptions {
                         model: model.clone(),
                         rerank,
                         reranker: reranker.clone(),
                         use_daemon: daemon && !no_daemon,
-                        approximate,
-                        tier_mode,
                     };
 
                     // Only pass through robot_format when it was explicitly
@@ -18946,6 +18869,16 @@ fn state_meta_json_inner(
     }
     let lexical = &assets.lexical;
     let semantic = &assets.semantic;
+    // W3-4 Step2-2 (task book #62): a parallel, additive DB-vector-domain
+    // status section -- reads embedding_generations directly instead of
+    // going through the fsvi-policy-driven `semantic` block above (which
+    // keeps reporting exactly as before). Only attempted when the DB was
+    // actually opened and this call wasn't the cheap skip-DB-open fast
+    // path, mirroring how `inspect_semantic`/`db_opened` already gate
+    // the rest of this function's DB-backed sections.
+    let db_vector_domain = (inspect_semantic && db_opened)
+        .then(|| crate::search::model_manager::probe_db_vector_domain_status(db_path))
+        .flatten();
     let lexical_rebuild_pipeline = if skip_db_open {
         crate::indexer::lexical_rebuild_pipeline_settings_snapshot_passive()
     } else {
@@ -19236,6 +19169,24 @@ fn state_meta_json_inner(
                     .and_then(format_timestamp_millis_rfc3339),
             },
         },
+        // W3-4 Step2-2 (task book #62): DB-vector-domain identity/audit
+        // status, read directly from embedding_generations -- additive
+        // and parallel to "semantic" above (which stays fsvi/policy
+        // driven, unchanged, for the W3-3..W3-5 coexistence window).
+        // `null` when the DB wasn't opened for this call (skip-DB-open
+        // fast path, or `--no-semantic`).
+        "db_vector_domain": db_vector_domain.as_ref().map(|s| serde_json::json!({
+            "active": s.active,
+            "embedder_id": s.embedder_id,
+            "dim": s.dim,
+            "audit_status": s.audit_status,
+            "embedded_count": s.embedded_count,
+            "any_generation": s.any_generation,
+            // R1-N7: Some(detail) here means a query against an already-
+            // opened DB failed -- the fields above are NOT a trustworthy
+            // "no generation" absence signal in that case.
+            "error": s.error,
+        })),
         "ingest_quarantine": ingest_quarantine_json,
         "policy_registry": policy_registry,
         "_meta": {
@@ -21974,10 +21925,6 @@ pub struct SemanticSearchOptions {
     pub reranker: Option<String>,
     /// Use daemon for warm model inference
     pub use_daemon: bool,
-    /// Use approximate nearest neighbor search when available
-    pub approximate: bool,
-    /// Optional two-tier execution strategy for semantic mode.
-    pub tier_mode: crate::search::query::SemanticTierMode,
 }
 
 impl TimeFilter {
@@ -23143,12 +23090,6 @@ fn run_cli_search(
     let mut mode_meta = SearchModeMeta::new(mode.unwrap_or_default(), mode.is_none());
     let hybrid_fail_open = mode_meta.fail_open_on_semantic_unavailable();
 
-    if semantic_opts.tier_mode != crate::search::query::SemanticTierMode::Single
-        && !matches!(mode_meta.requested, SearchMode::Semantic)
-    {
-        eprintln!("Warning: tier flags currently only affect --mode semantic.");
-    }
-
     if matches!(
         mode_meta.requested,
         SearchMode::Semantic | SearchMode::Hybrid
@@ -23208,9 +23149,6 @@ fn run_cli_search(
 
         if let Some(context) = setup.context {
             let embedder = context.embedder;
-            let index = context.index;
-            let additional_indexes = context.additional_indexes;
-            let filter_maps = context.filter_maps;
             let roles = context.roles;
 
             let embedder: Arc<dyn crate::search::embedder::Embedder> = if semantic_opts.use_daemon {
@@ -23253,17 +23191,7 @@ fn run_cli_search(
                 embedder
             };
 
-            let ann_path = Some(
-                data_dir
-                    .join(crate::search::vector_index::VECTOR_INDEX_DIR)
-                    .join(format!("hnsw-{}.chsw", embedder.id())),
-            );
-            let mut indexes = Vec::with_capacity(additional_indexes.len().saturating_add(1));
-            indexes.push(index);
-            indexes.extend(additional_indexes);
-            if let Err(err) =
-                client.set_semantic_indexes_context(embedder, indexes, filter_maps, roles, ann_path)
-            {
+            if let Err(err) = client.set_semantic_context(embedder, roles) {
                 let hint = if prefer_hash {
                     "Run 'cass index --semantic --embedder hash' to rebuild the hash vector index, or omit --mode semantic when lexical evidence is acceptable"
                         .to_string()
@@ -23307,14 +23235,6 @@ fn run_cli_search(
             }
         }
     }
-
-    let approximate =
-        if semantic_opts.approximate && matches!(mode_meta.realized, SearchMode::Lexical) {
-            eprintln!("Warning: --approximate has no effect in lexical mode.");
-            false
-        } else {
-            semantic_opts.approximate
-        };
 
     // Use search_with_fallback to get full metadata (wildcard_fallback, cache_stats)
     let sparse_threshold = 3; // Threshold for triggering wildcard fallback
@@ -23370,16 +23290,12 @@ fn run_cli_search(
         || semantic_opts.rerank
         || semantic_opts.reranker.is_some()
         || semantic_opts.use_daemon
-        || semantic_opts.approximate
-        || semantic_opts.tier_mode != crate::search::query::SemanticTierMode::Single
     {
         tracing::debug!(
             model = ?semantic_opts.model,
             rerank = semantic_opts.rerank,
             reranker = ?semantic_opts.reranker,
             use_daemon = semantic_opts.use_daemon,
-            approximate = semantic_opts.approximate,
-            tier_mode = ?semantic_opts.tier_mode,
             "Semantic search options configured"
         );
     }
@@ -23422,15 +23338,7 @@ fn run_cli_search(
             {
                 // Suppress unused-binding warnings in the baseline arm:
                 // every input is consumed by the documented error envelope.
-                let _ = (
-                    approximate,
-                    &semantic_opts,
-                    &filters,
-                    &field_mask,
-                    query,
-                    search_limit,
-                    search_offset,
-                );
+                let _ = (&semantic_opts, &filters, &field_mask, query, search_limit, search_offset);
                 let _ = client;
                 Err::<crate::search::query::SearchResult, CliError>(CliError {
                     code: 15,
@@ -23447,31 +23355,11 @@ fn run_cli_search(
             }
             #[cfg(any(feature = "semantic", feature = "infinity"))]
             {
-                let (hits, ann_stats) = client
-                    .search_semantic_with_tier(
-                        query,
-                        filters.clone(),
-                        search_limit,
-                        search_offset,
-                        field_mask,
-                        approximate,
-                        semantic_opts.tier_mode,
-                    )
+                let hits = client
+                    .search_semantic(query, filters.clone(), search_limit, search_offset, field_mask)
                     .map_err(|e| {
                         let err_str = e.to_string();
-                        if err_str.contains("HNSW index") {
-                            CliError {
-                                code: 15,
-                                kind: CliErrorKind::SemanticUnavailable.kind_str(),
-                                message: "Approximate search unavailable (HNSW index missing)"
-                                    .to_string(),
-                                hint: Some(
-                                    "Run 'cass index --semantic --build-hnsw' to build the ANN index, or omit --approximate"
-                                        .to_string(),
-                                ),
-                                retryable: false,
-                            }
-                        } else if err_str.contains("unavailable")
+                        if err_str.contains("unavailable")
                             || err_str.contains("no embedder")
                         {
                             CliError {
@@ -23502,7 +23390,6 @@ fn run_cli_search(
                     wildcard_fallback: false,
                     cache_stats: crate::search::query::CacheStats::default(),
                     suggestions: Vec::new(),
-                    ann_stats,
                     total_count: None,
                 }
             }
@@ -23515,7 +23402,6 @@ fn run_cli_search(
             search_offset,
             search_sparse_threshold,
             field_mask,
-            approximate,
         ) {
             Ok(result) => result,
             Err(e) => {
@@ -23581,6 +23467,16 @@ fn run_cli_search(
 
     // Apply reranking if enabled (bd-2t2d)
     let rerank_start = Instant::now();
+    // R1-W3-B7: tracks whether reranking was *actually* applied to `result`
+    // below, independent of whether it was requested. `--rerank` requested
+    // with no reranker available (the local cross-encoder is a permanent
+    // stub in this build, cass#256; daemon rerank unconfigured or
+    // unreachable) used to be an indistinguishable, deterministic no-op --
+    // `Ok(())`, unmodified results, and (outside `!use_daemon`-gated
+    // `tracing::debug!`) not even a log line. Threaded into
+    // `output_robot_results` below as `rerank_applied` so a caller that
+    // never inspects logs still gets an honest answer.
+    let mut rerank_applied = false;
     let result = if semantic_opts.rerank && !result.hits.is_empty() {
         use crate::search::fastembed_reranker::FastEmbedReranker;
         use crate::search::reranker::{Reranker, rerank_texts};
@@ -23689,13 +23585,13 @@ fn run_cli_search(
                             hits_reranked = scored_hits.len(),
                             "Reranking complete"
                         );
+                        rerank_applied = true;
 
                         crate::search::query::SearchResult {
                             hits: scored_hits,
                             wildcard_fallback: result.wildcard_fallback,
                             cache_stats: result.cache_stats,
                             suggestions: result.suggestions,
-                            ann_stats: result.ann_stats,
                             total_count: result.total_count,
                         }
                     }
@@ -23709,6 +23605,19 @@ fn run_cli_search(
                 }
             }
         } else {
+            // R1-W3-B7: `--rerank` was requested but no reranker at all
+            // could be constructed (permanent local stub + daemon
+            // unconfigured/unreachable) -- previously a fully silent,
+            // deterministic no-op outside a `!use_daemon`-gated
+            // `tracing::debug!`. Warn unconditionally at a level visible
+            // under default log settings; `rerank_applied=false` in the
+            // output (below) carries the same fact to a caller that never
+            // inspects logs.
+            tracing::warn!(
+                "--rerank requested but no reranker is available (local cross-encoder is a \
+                 permanent stub in this build, cass#256; daemon rerank is unconfigured or \
+                 unreachable); returning unreranked results"
+            );
             result
         }
     } else {
@@ -23761,7 +23670,6 @@ fn run_cli_search(
                 wildcard_fallback: result.wildcard_fallback,
                 cache_stats: result.cache_stats,
                 suggestions: result.suggestions.clone(),
-                ann_stats: result.ann_stats.clone(),
                 total_count: result.total_count,
             };
             let has_more = total > offset_val + display.hits.len();
@@ -23789,7 +23697,6 @@ fn run_cli_search(
                 wildcard_fallback: result.wildcard_fallback,
                 cache_stats: result.cache_stats,
                 suggestions: result.suggestions,
-                ann_stats: result.ann_stats,
                 total_count: result.total_count,
             };
             (
@@ -23971,6 +23878,8 @@ fn run_cli_search(
             mode_meta,
             search_ms,
             rerank_ms,
+            rerank_applied,
+            semantic_opts.rerank,
         )?;
     } else if display_result.hits.is_empty() {
         eprintln!("No results found.");
@@ -26049,6 +25958,21 @@ fn output_robot_results(
     search_mode_meta: SearchModeMeta,
     search_ms: u64,
     rerank_ms: u64,
+    // R1-W3-B7: whether reranking actually changed `result`'s hit order --
+    // `false` covers both "never requested" and "requested but no
+    // reranker was available", same convention as `rerank_ms` (0 covers
+    // both cases too). Distinguishing those two `false` cases is what the
+    // `tracing::warn!` at the call site is for; this field's job is only
+    // to make the fact machine-readable for callers that never look at
+    // logs.
+    rerank_applied: bool,
+    // R2-B5: distinct from `rerank_applied` -- `--rerank` was requested at
+    // all, regardless of whether it ended up applying. Needed because
+    // `rerank_applied` alone conflates "never requested" with "requested
+    // but no reranker was available" (see its own doc comment above); the
+    // JSON/JSONL top-level fields this gates must appear whenever the
+    // caller asked for `--rerank`, not only when it succeeded.
+    rerank_requested: bool,
 ) -> CliResult<()> {
     use std::io::{BufWriter, Write};
 
@@ -26102,6 +26026,10 @@ fn output_robot_results(
 
     // Fast path: summary-field JSON output without optional metadata/features.
     // Avoid intermediary serde_json::Value maps and string clones per hit.
+    // R2-B5: `!rerank_requested` added -- this path's `FastSummaryJsonPayload`
+    // has no `rerank_requested`/`rerank_applied` fields, so a `--rerank` run
+    // must fall through to the slower `match format` path below (the one
+    // that actually emits them) instead of silently bypassing it here.
     if matches!(format, RobotFormat::Json)
         && summary_projection
         && !needs_truncation
@@ -26112,6 +26040,7 @@ fn output_robot_results(
         && result.suggestions.is_empty()
         && explanation.is_none()
         && !timed_out
+        && !rerank_requested
     {
         use serde::ser::{SerializeMap, SerializeSeq};
         use serde::{Serialize, Serializer};
@@ -26205,6 +26134,13 @@ fn output_robot_results(
     // Fast path: full-field JSON output without optional metadata/features.
     // Serialize hits directly with compatibility formatting to avoid
     // materializing intermediary serde_json::Value hits.
+    // R2-B5: `!rerank_requested` added -- this path's `FastJsonPayload` has
+    // no `rerank_requested`/`rerank_applied` fields, so a `--rerank` run
+    // must fall through to the slower `match format` path below (the one
+    // that actually emits them) instead of silently bypassing it here. This
+    // was the actual root cause of the `--json --rerank` (no
+    // `--robot-meta`) silent no-op this item reports: this exact fast path
+    // is what a bare `cass search ... --json --rerank` hits.
     if matches!(format, RobotFormat::Json)
         && all_fields_requested
         && !needs_truncation
@@ -26215,6 +26151,7 @@ fn output_robot_results(
         && result.suggestions.is_empty()
         && explanation.is_none()
         && !timed_out
+        && !rerank_requested
     {
         use serde::ser::{SerializeMap, SerializeSeq};
         use serde::{Serialize, Serializer};
@@ -26553,6 +26490,21 @@ fn output_robot_results(
                 "hits_clamped": hits_clamped,
             });
 
+            // R2-B5: unconditional (not gated on `--robot-meta`/`include_meta`
+            // the way `rerank_applied` alone still is inside the `_meta`
+            // block below) whenever `--rerank` was requested -- a caller
+            // that passes `--json --rerank` without `--robot-meta` was
+            // previously getting a silent no-op: `rerank_applied` lived
+            // only in `_meta`, and the `tracing::warn!` explaining *why*
+            // no reranker could be constructed is filtered out entirely
+            // under `--json`'s error-only robot logging.
+            if rerank_requested
+                && let serde_json::Value::Object(ref mut map) = payload
+            {
+                map.insert("rerank_requested".to_string(), serde_json::json!(true));
+                map.insert("rerank_applied".to_string(), serde_json::json!(rerank_applied));
+            }
+
             // Add suggestions if present
             if !result.suggestions.is_empty()
                 && let serde_json::Value::Object(ref mut map) = payload
@@ -26602,6 +26554,12 @@ fn output_robot_results(
                         "rerank_ms": rerank_ms,
                         "other_ms": elapsed_ms.saturating_sub(search_ms).saturating_sub(rerank_ms),
                     },
+                    // R1-W3-B7: honest signal for a caller that never
+                    // inspects logs -- false whenever `--rerank` was
+                    // never requested, or was requested but no reranker
+                    // could be constructed (see the `tracing::warn!` at
+                    // the rerank call site for why, in the latter case).
+                    "rerank_applied": rerank_applied,
                     "tokens_estimated": tokens_estimated,
                     "max_tokens": max_tokens,
                     "request_id": request_id,
@@ -26644,15 +26602,6 @@ fn output_robot_results(
                     if timed_out {
                         m.insert("partial_results".to_string(), serde_json::json!(true));
                     }
-                }
-                // Add ANN stats to _meta if approximate search was used
-                if let Some(ref ann_stats) = result.ann_stats
-                    && let serde_json::Value::Object(ref mut m) = meta
-                {
-                    m.insert(
-                        "ann_stats".to_string(),
-                        serde_json::to_value(ann_stats).unwrap_or_default(),
-                    );
                 }
                 map.insert("_meta".to_string(), meta);
 
@@ -26705,11 +26654,18 @@ fn output_robot_results(
             let stdout = std::io::stdout();
             let mut out = BufWriter::new(stdout.lock());
 
-            // JSONL: one object per line, optional _meta header
+            // JSONL: one object per line, optional _meta header. R2-B5:
+            // `rerank_requested` added to the trigger list -- without
+            // it, a `--jsonl --rerank` run with none of the other
+            // meta-triggering flags set emitted no `_meta` line at all, so
+            // `rerank_requested`/`rerank_applied` (inserted below,
+            // unconditional on `include_meta` like the `RobotFormat::Json`
+            // case above) would have had nowhere to land.
             if include_meta
                 || agg_json.is_some()
                 || !result.suggestions.is_empty()
                 || explanation.is_some()
+                || rerank_requested
             {
                 let mut meta = serde_json::json!({
                     "_meta": {
@@ -26771,6 +26727,18 @@ fn output_robot_results(
                     && let serde_json::Value::Object(ref mut m) = meta
                 {
                     m.insert("storage_integrity".to_string(), si.clone());
+                }
+                // R2-B5: sibling to `_meta` (this line's own top level),
+                // matching `storage_integrity` above -- not nested inside
+                // `_meta`, which is what `include_meta`/`--robot-meta`
+                // alone still gates. See the `RobotFormat::Json` arm's
+                // identical fix for why this must be unconditional on
+                // `--rerank` having been requested at all.
+                if rerank_requested
+                    && let serde_json::Value::Object(ref mut m) = meta
+                {
+                    m.insert("rerank_requested".to_string(), serde_json::json!(true));
+                    m.insert("rerank_applied".to_string(), serde_json::json!(rerank_applied));
                 }
                 // Add suggestions to meta line
                 if !result.suggestions.is_empty()
@@ -26956,15 +26924,6 @@ fn output_robot_results(
                         m.insert("partial_results".to_string(), serde_json::json!(true));
                     }
                 }
-                // Add ANN stats to _meta if approximate search was used
-                if let Some(ref ann_stats) = result.ann_stats
-                    && let serde_json::Value::Object(ref mut m) = meta
-                {
-                    m.insert(
-                        "ann_stats".to_string(),
-                        serde_json::to_value(ann_stats).unwrap_or_default(),
-                    );
-                }
                 map.insert("_meta".to_string(), meta);
                 if let Some(warn) = &warning {
                     map.insert(
@@ -27088,15 +27047,6 @@ fn output_robot_results(
                     if timed_out {
                         m.insert("partial_results".to_string(), serde_json::json!(true));
                     }
-                }
-                // Add ANN stats to _meta if approximate search was used
-                if let Some(ref ann_stats) = result.ann_stats
-                    && let serde_json::Value::Object(ref mut m) = meta
-                {
-                    m.insert(
-                        "ann_stats".to_string(),
-                        serde_json::to_value(ann_stats).unwrap_or_default(),
-                    );
                 }
                 map.insert("_meta".to_string(), meta);
                 if let Some(warn) = &warning {
@@ -70765,6 +70715,10 @@ fn run_status(
             "rebuild": state.get("rebuild").cloned().unwrap_or(serde_json::Value::Null),
             "rebuild_progress": rebuild_progress_summary_json(&state),
             "semantic": state.get("semantic").cloned().unwrap_or(serde_json::Value::Null),
+            // W3-4 Step2-2 (task book #62): pass the parallel DB-vector-
+            // domain status section through from `state_meta_json_inner`
+            // the same way "semantic" itself is passed through above.
+            "db_vector_domain": state.get("db_vector_domain").cloned().unwrap_or(serde_json::Value::Null),
             "ingest_quarantine": state.get("ingest_quarantine").cloned().unwrap_or(serde_json::Value::Null),
             "policy_registry": policy_registry,
             "topology_budget": topology_budget,
@@ -75674,7 +75628,6 @@ pub(crate) fn run_doctor_impl(
                     db_path: db_path.clone(),
                     data_dir: data_dir.clone(),
                     semantic: false,
-                    build_hnsw: false,
                     embedder: "fastembed".to_string(),
                     progress: Some(progress.clone()),
                     watch_interval_secs: 30,
@@ -76283,6 +76236,12 @@ pub(crate) fn run_doctor_impl(
             "event_log": operation_event_log,
             "lexical": readiness_snapshot.get("index").cloned().unwrap_or(serde_json::Value::Null),
             "semantic": readiness_snapshot.get("semantic").cloned().unwrap_or(serde_json::Value::Null),
+            // W3-4 Step2-3 (task book #62): same parallel DB-vector-domain
+            // section `cass status` gained in Step2-2, passed through
+            // from the same `readiness_snapshot` this function already
+            // computed via `state_meta_json_inner` -- no extra DB open
+            // beyond what Step2-2 already introduced.
+            "db_vector_domain": readiness_snapshot.get("db_vector_domain").cloned().unwrap_or(serde_json::Value::Null),
             "derived_semantic_assets": derived_semantic_assets,
             "storage_pressure": storage_pressure,
             "storage_integrity": storage_integrity_report,
@@ -82354,6 +82313,10 @@ fn response_schema_search_meta() -> serde_json::Value {
         ("explanation_cards", response_schema_explanation_cards()),
         ("timing", response_schema_search_timing()),
         (
+            "rerank_applied",
+            serde_json::json!({ "type": "boolean" }),
+        ),
+        (
             "tokens_estimated",
             serde_json::json!({ "type": ["integer", "null"] }),
         ),
@@ -85439,7 +85402,6 @@ fn refresh_index_inline(db_override: Option<PathBuf>, data_dir_override: Option<
         db_path,
         data_dir,
         semantic: false,
-        build_hnsw: false,
         embedder: "fastembed".to_string(),
         progress: Some(Arc::clone(&progress)),
         watch_interval_secs: 30,
@@ -85525,6 +85487,29 @@ fn refresh_index_inline(db_override: Option<PathBuf>, data_dir_override: Option<
     }
 }
 
+/// R4-2: pure extraction of the Bars-mode completion line's activation
+/// suffix (previously inlined directly in `run_index_with_data` below).
+/// The prior regression test for this line
+/// (`bars_mode_completion_message_discloses_semantic_activated_false`,
+/// src/indexer/mod.rs) re-typed this exact three-way branch by hand
+/// against a bare `String` rather than calling the real production code,
+/// so deleting the real call site below -- or the real code no longer
+/// reading `semantic_activated` at all -- left that test unable to
+/// notice (R4-2 finding). Now the production call site and its test both
+/// call this same function. `None` means this run didn't request
+/// semantic indexing at all (`semantic_activated: None`), the one case
+/// that must add no suffix.
+fn semantic_activation_suffix(stats: &indexer::IndexingStats) -> Option<String> {
+    stats.semantic_activated.map(|activated| {
+        if activated {
+            ", semantic index: activated".to_string()
+        } else {
+            ", semantic index: not activated yet (holes remain; rerun to continue draining embedding_holes)"
+                .to_string()
+        }
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_index_with_data(
     db_override: Option<PathBuf>,
@@ -85535,7 +85520,6 @@ fn run_index_with_data(
     watch_interval: u64,
     data_dir_override: Option<PathBuf>,
     semantic: bool,
-    build_hnsw: bool,
     embedder: String,
     progress: ProgressResolved,
     output_format: Option<RobotFormat>,
@@ -85568,7 +85552,6 @@ fn run_index_with_data(
         force_rebuild.hash(&mut hasher);
         watch.hash(&mut hasher);
         semantic.hash(&mut hasher);
-        build_hnsw.hash(&mut hasher);
         embedder.hash(&mut hasher);
         robot_trace_ingest.hash(&mut hasher);
         format!("{}", data_dir.display()).hash(&mut hasher);
@@ -85656,7 +85639,6 @@ fn run_index_with_data(
             .map(std::vec::Vec::len)
             .unwrap_or_default(),
         semantic,
-        build_hnsw,
     );
 
     // Decide whether to emit NDJSON progress events on stderr (structured output only).
@@ -85698,7 +85680,6 @@ fn run_index_with_data(
             "watch": watch,
             "entrypoint": entrypoint.kind,
             "semantic": semantic,
-            "build_hnsw": build_hnsw,
             "embedder": embedder,
             "data_dir": data_dir.display().to_string(),
             "db_path": db_path.display().to_string(),
@@ -85741,7 +85722,6 @@ fn run_index_with_data(
         db_path: db_path.clone(),
         data_dir: data_dir.clone(),
         semantic,
-        build_hnsw,
         embedder: embedder.clone(),
         progress: Some(index_progress.clone()),
         watch_interval_secs: watch_interval,
@@ -86054,10 +86034,35 @@ fn run_index_with_data(
 
     if let Some((pb, conversations, agents)) = progress_completion {
         match &res {
-            Ok(_) => pb.finish_with_message(format!(
-                "Done: {} conversations from {} agent(s)",
-                conversations, agents
-            )),
+            Ok(_) => {
+                let mut message =
+                    format!("Done: {conversations} conversations from {agents} agent(s)");
+                // R3-4: R2-B1 disclosed `semantic_activated` unconditionally
+                // in the JSON payload and the Plain-mode `eprintln!` below,
+                // but left this Bars-mode completion line -- the default
+                // interactive-TTY path -- with no mention of it at all, so
+                // a TTY user running `cass index --semantic` never saw
+                // whether the semantic index actually became searchable
+                // this run.
+                if let Ok(stats) = index_progress.stats.lock() {
+                    if let Some(suffix) = semantic_activation_suffix(&stats) {
+                        message.push_str(&suffix);
+                    }
+                    // R4-4: same disclosure as the JSON (`indexing_stats.
+                    // cleanup_failures`) and Plain (`eprintln!` below)
+                    // paths -- a TTY user must see the same signal, not
+                    // just "activated: true/false" with a housekeeping
+                    // failure silently missing from the one line they
+                    // actually watch.
+                    if !stats.cleanup_failures.is_empty() {
+                        message.push_str(&format!(
+                            ", cleanup failures: {}",
+                            stats.cleanup_failures.len()
+                        ));
+                    }
+                }
+                pb.finish_with_message(message);
+            }
             Err(err) => pb.abandon_with_message(format!("Failed: {}", err)),
         }
     }
@@ -86119,16 +86124,18 @@ fn run_index_with_data(
                 ))
             })
             .unwrap_or((0, 0));
-        let (quarantined_conversations, lexical_update_deferred) = index_progress
-            .stats
-            .lock()
-            .map(|stats| {
-                (
-                    stats.quarantined_conversations,
-                    stats.lexical_update_deferred,
-                )
-            })
-            .unwrap_or_default();
+        let (quarantined_conversations, lexical_update_deferred, semantic_activated) =
+            index_progress
+                .stats
+                .lock()
+                .map(|stats| {
+                    (
+                        stats.quarantined_conversations,
+                        stats.lexical_update_deferred,
+                        stats.semantic_activated,
+                    )
+                })
+                .unwrap_or_default();
         let mut payload = serde_json::json!({
             "success": true,
             "elapsed_ms": elapsed_ms,
@@ -86142,6 +86149,15 @@ fn run_index_with_data(
             "quarantined_conversations": quarantined_conversations,
             "lexical_update_deferred": lexical_update_deferred,
         });
+        // R2-B1: unconditional (true or false) whenever this run requested
+        // semantic indexing -- `false` is a legitimate "ingested, holes not
+        // yet drained" state, not an error, but it must never be silently
+        // absent the way a discarded bool previously left it: exit 0 alone
+        // told a caller nothing about whether this run's semantic index
+        // actually became searchable.
+        if let Some(activated) = semantic_activated {
+            payload["activated"] = serde_json::json!(activated);
+        }
 
         // Add structured indexing stats if available (T7.4)
         if let Ok(stats) = index_progress.stats.lock()
@@ -86194,6 +86210,31 @@ fn run_index_with_data(
 
     if show_plain {
         eprintln!("index completed");
+        // R2-B1: same unconditional true/false disclosure as the JSON path
+        // -- `false` means this run ingested but the generation's holes
+        // weren't fully drained yet (rerun to continue), not a failure.
+        if let Ok(stats) = index_progress.stats.lock() {
+            if let Some(activated) = stats.semantic_activated {
+                eprintln!(
+                    "semantic index: {}",
+                    if activated {
+                        "activated"
+                    } else {
+                        "not activated yet (holes remain; rerun to continue draining embedding_holes)"
+                    }
+                );
+            }
+            // R4-4: same `cleanup_failures` disclosure as the JSON
+            // (`indexing_stats.cleanup_failures`) and Bars paths above --
+            // previously only `cass models backfill`'s human-output branch
+            // (lib.rs:97460-97465) printed this for its own catch-up call.
+            if !stats.cleanup_failures.is_empty() {
+                eprintln!("semantic index cleanup failures: {}", stats.cleanup_failures.len());
+                for failure in &stats.cleanup_failures {
+                    eprintln!("  - generation {}: {}", failure.generation_id, failure.error);
+                }
+            }
+        }
     }
 
     match res {
@@ -95389,7 +95430,6 @@ fn run_sources_sync(
             30,             // watch_interval (default)
             Some(data_dir), // data_dir
             false,          // semantic
-            false,          // build_hnsw
             "fastembed".to_string(),
             progress,
             output_format,
@@ -95542,7 +95582,6 @@ fn run_sources_reingest(
         30,                     // watch_interval (default)
         Some(data_dir.clone()), // data_dir (existing mirror root is discovered here)
         false,                  // semantic
-        false,                  // build_hnsw
         "fastembed".to_string(),
         progress,
         output_format,
@@ -97243,12 +97282,10 @@ fn run_models_backfill(
     output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
     use crate::indexer::semantic::{
-        SemanticBackfillSchedulerSignals, SemanticBackfillStoragePlan, SemanticIndexer,
-        semantic_backfill_scheduler_decision,
+        SemanticBackfillSchedulerSignals, SemanticIndexer, semantic_backfill_scheduler_decision,
     };
-    use crate::search::model_download::ModelManifest;
     use crate::search::policy::{CliSemanticOverrides, SemanticPolicy};
-    use crate::search::semantic_manifest::{SemanticManifest, TierKind};
+    use crate::search::semantic_manifest::TierKind;
     use crate::storage::sqlite::FrankenStorage;
     use colored::Colorize;
 
@@ -97281,7 +97318,14 @@ fn run_models_backfill(
         .map(str::to_string)
         .unwrap_or_else(|| match tier {
             TierKind::Fast => "hash".to_string(),
-            TierKind::Quality => "fastembed".to_string(),
+            // R1-W3-N2: default to `infinity` under this build's actual
+            // feature (fastembed/ONNX is retired here) so a bare `cass
+            // models backfill` (no `--embedder`) reaches the DB vector
+            // domain instead of immediately hitting the "embedder
+            // 'fastembed' is retired" error below.
+            TierKind::Quality => {
+                if cfg!(feature = "infinity") { "infinity".to_string() } else { "fastembed".to_string() }
+            }
         });
     let embedder_type = resolve_semantic_index_embedder(&embedder_type);
     let embedder_valid = embedder_type == "hash"
@@ -97358,26 +97402,6 @@ fn run_models_backfill(
         return Ok(());
     }
 
-    let effective_batch_conversations = scheduler_decision
-        .as_ref()
-        .map_or(batch_conversations, |decision| {
-            decision.scheduled_batch_conversations
-        });
-
-    let db_fingerprint =
-        crate::indexer::lexical_storage_fingerprint_for_db(&db_path).map_err(|e| CliError {
-            code: 5,
-            kind: CliErrorKind::StorageFingerprint.kind_str(),
-            message: format!(
-                "Failed to fingerprint cass database {}: {e}",
-                db_path.display()
-            ),
-            hint: Some(
-                "Run 'cass doctor check --json' if the archive is corrupt; index --force-rebuild only rebuilds derived assets from a healthy canonical archive."
-                    .into(),
-            ),
-            retryable: true,
-        })?;
     let storage = FrankenStorage::open_writer(&db_path).map_err(|e| CliError {
         code: 5,
         kind: CliErrorKind::Storage.kind_str(),
@@ -97385,142 +97409,233 @@ fn run_models_backfill(
         hint: Some("Run 'cass health --json' to inspect the archive database".into()),
         retryable: true,
     })?;
-    let mut manifest = SemanticManifest::load_or_default(&data_dir).map_err(|e| CliError {
-        code: 5,
-        kind: CliErrorKind::SemanticManifest.kind_str(),
-        message: format!("Failed to load semantic manifest: {e}"),
-        hint: Some("Check permissions under the cass data directory".into()),
-        retryable: true,
-    })?;
-    let model_manifest =
-        crate::search::fastembed_embedder::FastEmbedder::canonical_name(&embedder_type)
-            .and_then(ModelManifest::for_embedder)
-            .unwrap_or_else(ModelManifest::minilm_v2);
-    let model_revision = if embedder_type == "hash" {
-        "hash".to_string()
-    } else if embedder_type == "infinity" {
-        "infinity-bge-m3".to_string()
-    } else {
-        model_manifest.revision.clone()
-    };
-    let indexer = SemanticIndexer::new(&embedder_type, Some(&data_dir)).map_err(|e| CliError {
-        code: 20,
-        kind: CliErrorKind::Model.kind_str(),
-        message: format!("Failed to initialize semantic embedder '{embedder_type}': {e}"),
-        hint: Some(if embedder_type == "fastembed" {
-            "Run 'cass models install -y' or retry with --embedder hash".into()
-        } else {
-            "Use --embedder hash or install the selected embedder model".into()
-        }),
-        retryable: embedder_type != "hash",
-    })?;
 
-    // Sub-fix 1 for cass#257: open a JSONL progress sink whose
-    // destination is taken from `CASS_SEMANTIC_PROGRESS_JSONL`. The
-    // sink is silent when the env var is unset, so behaviour for
-    // existing operators is unchanged. The sink threads through to
-    // selection / packet replay / embed / staging / checkpoint /
-    // publish events.
-    let progress_sink = crate::indexer::semantic_progress::SemanticProgressSink::open(
-        tier.as_str(),
-        indexer.embedder_id(),
-    );
-    let outcome = indexer
-        .run_capped_backfill_from_storage_with_sink(
-            &storage,
-            &data_dir,
-            &mut manifest,
-            SemanticBackfillStoragePlan {
-                tier,
-                db_fingerprint,
-                model_revision,
-                max_conversations: effective_batch_conversations,
-            },
-            &progress_sink,
-        )
-        .map_err(|e| CliError {
-            code: 5,
-            kind: CliErrorKind::SemanticBackfill.kind_str(),
-            message: format!("Semantic backfill failed: {e}"),
-            hint: Some(
-                "Retry the command; resumable checkpoints are kept in the semantic manifest".into(),
-            ),
-            retryable: true,
-        })?;
+    // W3-5: frankensearch/fsvi retired. The infinity-backed quality tier no
+    // longer builds a .fsvi file -- it drains the DB vector domain's
+    // `embedding_holes` via the same catch-up `cass index --semantic` uses
+    // (ingest-time hooks already register a hole per new message; this
+    // drains them + does a genesis-eligibility rescan as a self-healing
+    // safety net -- W3-5 task book #63 advisor ruling). hash/fastembed
+    // tiers still use the fsvi path below until Step1's dependency removal
+    // forces their disposition.
+    if embedder_type == "infinity" {
+        #[cfg(feature = "infinity")]
+        {
+            let batch_size = SemanticIndexer::new("infinity", None)
+                .map_err(|e| CliError {
+                    code: 20,
+                    kind: CliErrorKind::Model.kind_str(),
+                    message: format!("Failed to initialize infinity embedder: {e}"),
+                    hint: Some(
+                        "Check CASS_INFINITY_* env vars and that the Infinity service is reachable"
+                            .into(),
+                    ),
+                    retryable: true,
+                })?
+                .batch_size();
+            let report = crate::indexer::db_vector_catchup::run_db_vector_catchup_backfill(
+                &storage,
+                batch_size,
+            )
+            .map_err(|e| CliError {
+                code: 5,
+                kind: CliErrorKind::SemanticBackfill.kind_str(),
+                message: format!("DB vector domain catch-up failed: {e:#}"),
+                hint: Some(
+                    "Retry the command; the catch-up is idempotent (embedding_holes-driven)"
+                        .into(),
+                ),
+                retryable: true,
+            })?;
 
-    let progress_pct = outcome.progress_pct();
-    let status = if outcome.published {
-        "published"
-    } else if outcome.checkpoint_saved {
-        "checkpointed"
-    } else {
-        "idle"
-    };
-    let next_step = if outcome.published {
-        "semantic tier is ready"
-    } else if outcome.checkpoint_saved {
-        "rerun the same command to continue the resumable backfill"
-    } else {
-        "no pending canonical conversations for this tier"
-    };
-    let backlog = serde_json::json!({
-        "total_conversations": manifest.backlog.total_conversations,
-        "fast_tier_processed": manifest.backlog.fast_tier_processed,
-        "quality_tier_processed": manifest.backlog.quality_tier_processed,
-        "computed_at_ms": manifest.backlog.computed_at_ms,
-    });
-    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
-        if matches!(fmt, RobotFormat::Sessions) {
-            RobotFormat::Compact
-        } else {
-            fmt
+            let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+                if matches!(fmt, RobotFormat::Sessions) {
+                    RobotFormat::Compact
+                } else {
+                    fmt
+                }
+            });
+            if structured_format.is_some() {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "status": if report.activated { "published" } else { "in_progress" },
+                        "next_step": if report.activated {
+                            "semantic tier is ready"
+                        } else {
+                            "rerun the same command to continue draining embedding_holes"
+                        },
+                        "tier": "quality",
+                        "embedder_id": report.embedder_id,
+                        "data_dir": data_dir.display().to_string(),
+                        "db_path": db_path.display().to_string(),
+                        "generation_id": report.generation_id,
+                        "reused_existing_generation": report.reused_existing_generation,
+                        "eligible_seeded": report.eligible_seeded,
+                        "embedded_inserted": report.embedded_inserted,
+                        "stale_skipped": report.stale_skipped,
+                        "holes_before": report.holes_before,
+                        "holes_after": report.holes_after,
+                        "activated": report.activated,
+                        // R3-6: previously discarded entirely (only
+                        // `cleanup_deleted_generation_ids` was ever computed
+                        // downstream of this report, and nothing surfaced
+                        // even that) -- a candidate-level delete failure or
+                        // the orphan-scan query itself failing (sentinel
+                        // `generation_id=0`) is real operational signal a
+                        // structured-output consumer must be able to see.
+                        "cleanup_failures": report.cleanup_failures.iter().map(|(generation_id, detail)| serde_json::json!({
+                            "generation_id": generation_id,
+                            "error": detail,
+                        })).collect::<Vec<_>>(),
+                    }))
+                    .unwrap_or_default()
+                );
+            } else {
+                println!("{}", "Semantic backfill (DB vector domain)".bold());
+                println!("  Generation: {}", report.generation_id);
+                println!("  Embedder: {}", report.embedder_id);
+                println!("  Embedded (this run): {}", report.embedded_inserted);
+                println!("  Holes remaining: {}", report.holes_after);
+                println!("  Activated: {}", report.activated);
+                if !report.cleanup_failures.is_empty() {
+                    println!("  Cleanup failures: {}", report.cleanup_failures.len());
+                    for (generation_id, detail) in &report.cleanup_failures {
+                        println!("    - generation {generation_id}: {detail}");
+                    }
+                }
+            }
+            return Ok(());
         }
-    });
-
-    if let Some(_fmt) = structured_format {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "status": status,
-                "next_step": next_step,
-                "tier": outcome.tier.as_str(),
-                "embedder_id": outcome.embedder_id,
-                "data_dir": data_dir.display().to_string(),
-                "db_path": db_path.display().to_string(),
-                "batch_conversations_limit": effective_batch_conversations,
-                "requested_batch_conversations_limit": batch_conversations,
-                "scheduler": scheduler_decision,
-                "embedded_docs": outcome.embedded_docs,
-                "conversations_processed": outcome.conversations_processed,
-                "total_conversations": outcome.total_conversations,
-                "progress_pct": progress_pct,
-                "last_offset": outcome.last_offset,
-                "checkpoint_saved": outcome.checkpoint_saved,
-                "published": outcome.published,
-                "index_path": outcome.index_path.display().to_string(),
-                "manifest_path": outcome.manifest_path.display().to_string(),
-                "backlog": backlog,
-            }))
-            .unwrap_or_default()
-        );
-    } else {
-        println!("{}", "Semantic backfill batch".bold());
-        println!("  Status: {}", status);
-        println!("  Tier: {}", outcome.tier.as_str());
-        println!("  Embedder: {}", outcome.embedder_id);
-        println!("  Embedded docs: {}", outcome.embedded_docs);
-        println!(
-            "  Conversations: {}/{} ({:.1}%)",
-            outcome.conversations_processed, outcome.total_conversations, progress_pct
-        );
-        println!("  Last offset: {}", outcome.last_offset);
-        println!("  Index: {}", outcome.index_path.display());
-        println!("  Manifest: {}", outcome.manifest_path.display());
-        println!();
-        println!("{}", next_step);
+        #[cfg(not(feature = "infinity"))]
+        {
+            return Err(CliError {
+                code: 20,
+                kind: CliErrorKind::Model.kind_str(),
+                message: "embedder 'infinity' requires the `infinity` build feature".to_string(),
+                hint: Some("Rebuild with --features infinity".into()),
+                retryable: false,
+            });
+        }
     }
 
-    Ok(())
+    Err(CliError {
+        code: 20,
+        kind: CliErrorKind::Model.kind_str(),
+        message: format!(
+            "embedder '{embedder_type}' is retired (W3-5, frankensearch/fsvi removed); use --embedder infinity"
+        ),
+        hint: Some("Rebuild with --features infinity and rerun with --embedder infinity".into()),
+        retryable: false,
+    })
+}
+
+#[cfg(test)]
+mod w3_5_models_backfill_infinity_wiring_tests {
+    use super::*;
+    use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+    use crate::storage::sqlite::FrankenStorage;
+    use tempfile::TempDir;
+
+    /// W3-5 wiring proof (task book #63, advisor ruling: "先接线后拆除"):
+    /// `cass models backfill --embedder infinity` must reach the same
+    /// DB-vector-domain catch-up (`db_vector_catchup::
+    /// run_db_vector_catchup_backfill`) that `cass index --semantic` now
+    /// uses, not the retired fsvi path -- positive proof the capability
+    /// silently disappearing (the risk this wiring commit exists to close)
+    /// did not happen. Requires a live Infinity at CASS_INFINITY_URL
+    /// (127.0.0.1:7997 default); run explicitly with `--ignored`.
+    #[test]
+    #[ignore = "requires a live Infinity service at 127.0.0.1:7997 (CASS_INFINITY_URL)"]
+    #[cfg(feature = "infinity")]
+    fn cli_models_backfill_infinity_reaches_db_vector_domain_catchup() {
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("agent_search.db");
+
+        {
+            let storage = FrankenStorage::open(&db_path).unwrap();
+            let agent_id = storage
+                .ensure_agent(&Agent {
+                    id: None,
+                    slug: "claude_code".into(),
+                    name: "Claude Code".into(),
+                    version: Some("1.0".into()),
+                    kind: AgentKind::Cli,
+                })
+                .unwrap();
+            let conv = Conversation {
+                id: None,
+                agent_slug: "claude_code".into(),
+                workspace: None,
+                external_id: Some("w3-5-cli-wiring-e2e".into()),
+                title: Some("w3-5 CLI wiring e2e fixture".into()),
+                source_path: std::path::PathBuf::from("/fixtures/w3-5-cli-wiring-e2e.jsonl"),
+                started_at: Some(1_000),
+                ended_at: Some(4_000),
+                approx_tokens: None,
+                metadata_json: serde_json::json!(null),
+                messages: vec![
+                    Message {
+                        id: None,
+                        idx: 0,
+                        role: MessageRole::User,
+                        author: None,
+                        created_at: Some(1_000),
+                        content: "w3-5 cli wiring: rust borrow checker lifetimes question".into(),
+                        extra_json: serde_json::json!(null),
+                        snippets: vec![],
+                    },
+                    Message {
+                        id: None,
+                        idx: 1,
+                        role: MessageRole::Agent,
+                        author: None,
+                        created_at: Some(2_000),
+                        content: "w3-5 cli wiring: reply about ownership rules".into(),
+                        extra_json: serde_json::json!(null),
+                        snippets: vec![],
+                    },
+                ],
+                source_id: "local".into(),
+                origin_host: None,
+            };
+            storage
+                .insert_conversation_tree(agent_id, None, &conv)
+                .expect("seed conversation");
+        }
+
+        run_models_backfill(
+            "quality",
+            Some("infinity"),
+            10_000,
+            false,
+            Some(data_dir.clone()),
+            Some(db_path.clone()),
+            None,
+        )
+        .expect("cass models backfill --embedder infinity must reach the DB vector domain");
+
+        let storage = FrankenStorage::open_readonly(&db_path).unwrap();
+        let active = crate::storage::schema::active_generation_id(storage.raw()).unwrap();
+        assert!(
+            active.is_some(),
+            "CLI backfill must activate a DB-vector-domain generation"
+        );
+        let embedded_count: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM message_embeddings WHERE generation_id = ?1",
+                &crate::storage::api::params![active.unwrap()],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            embedded_count, 2,
+            "both seeded messages must be embedded via the CLI path"
+        );
+    }
 }
 
 /// Remove model files

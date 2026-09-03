@@ -1,3 +1,5 @@
+#[cfg(feature = "infinity")]
+pub mod db_vector_catchup;
 pub(crate) mod lexical_generation;
 pub(crate) mod memoization;
 pub(crate) mod parallel_wal_shadow;
@@ -27,7 +29,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, bounded};
-use frankensearch::index::VectorIndex as FsVectorIndex;
 use crate::storage::api::StorageError;
 use crate::storage::api::Tx as FrankenTransaction;
 type ParamValue = crate::storage::api::Value;
@@ -53,9 +54,8 @@ use crate::model::conversation_packet::{
 };
 use crate::search::asset_state::{SearchMaintenanceJobKind, SearchMaintenanceMode};
 use crate::search::canonicalize::is_hard_message_noise;
-use crate::search::vector_index::{
-    ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_TOOL, ROLE_USER, vector_index_path,
-};
+#[cfg(test)]
+use crate::search::vector_index::{ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_TOOL, ROLE_USER};
 
 use crate::sources::config::{Platform, SourcesConfig};
 use crate::sources::provenance::{LOCAL_SOURCE_ID, Origin, Source, SourceKind};
@@ -65,15 +65,9 @@ use crate::storage::sqlite::{
     LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE, StatsAggregator, StatsDelta,
     historical_table_exists, seed_canonical_from_best_historical_bundle,
 };
-use semantic::{
-    EmbeddingInput, SemanticIndexer, packet_embedding_inputs_from_storage,
-    packet_embedding_inputs_from_storage_since,
-};
+use semantic::{EmbeddingInput, SemanticIndexer};
 
-use crate::search::policy::{CHUNKING_STRATEGY_VERSION, SEMANTIC_SCHEMA_VERSION};
-use crate::search::semantic_manifest::{
-    ArtifactRecord, SemanticManifest, TierKind as SemanticTierKind,
-};
+use crate::search::semantic_manifest::TierKind as SemanticTierKind;
 
 #[cfg(test)]
 use std::iter::Peekable;
@@ -898,6 +892,18 @@ pub struct SemanticWatchOnceStats {
     pub reason: String,
 }
 
+/// R4-4: one `DbVectorCatchupReport::cleanup_failures` entry, reshaped
+/// from its internal `(generation_id, error)` tuple into the same
+/// `{generation_id, error}` object shape `cass models backfill` already
+/// emits for this exact data (lib.rs:97446-97449), so both surfaces
+/// render identically instead of drifting into two ad hoc JSON shapes
+/// for the same underlying failure.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SemanticCleanupFailure {
+    pub generation_id: i64,
+    pub error: String,
+}
+
 /// Aggregate indexing statistics for JSON output (T7.4).
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct IndexingStats {
@@ -932,6 +938,24 @@ pub struct IndexingStats {
     /// True when SQLite ingest succeeded but inline lexical updates were
     /// deferred and the caller must rebuild lexical assets from the archive.
     pub lexical_update_deferred: bool,
+    /// R2-B1: mirrors `run_semantic_db_vector_catchup`'s actual `activated`
+    /// result for the plain `cass index --semantic` path -- an incremental
+    /// pass that ingested but left the generation's holes undrained is a
+    /// legitimate state (this is a repeatable cron-style catch-up, not a
+    /// one-shot build), but callers must not read a `false` here as "semantic
+    /// index built successfully" the way exit-0 alone would suggest.
+    /// `None` when this run didn't request semantic indexing at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_activated: Option<bool>,
+    /// R4-4: `DbVectorCatchupReport::cleanup_failures` from the same
+    /// `run_semantic_db_vector_catchup` call, previously discarded at
+    /// that call's `Ok(report.activated)` return -- `cass models
+    /// backfill`'s two output paths (lib.rs:97446-97465) already surface
+    /// this same data for its own catch-up call, but the standard `cass
+    /// index --semantic` path silently dropped it. Empty on the common
+    /// case (nothing failed to clean up).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cleanup_failures: Vec<SemanticCleanupFailure>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1527,8 +1551,6 @@ pub struct IndexOptions {
     pub data_dir: PathBuf,
     /// Build semantic vector index after text indexing.
     pub semantic: bool,
-    /// Build HNSW index for approximate nearest neighbor search (requires semantic).
-    pub build_hnsw: bool,
     /// Embedder ID to use for semantic indexing (hash, fastembed).
     pub embedder: String,
     pub progress: Option<Arc<IndexingProgress>>,
@@ -1765,7 +1787,6 @@ fn is_plain_populated_incremental_index_run(
         && !opts.force_rebuild
         && !opts.watch
         && !opts.semantic
-        && !opts.build_hnsw
         && opts
             .watch_once_paths
             .as_ref()
@@ -2082,7 +2103,6 @@ fn should_try_readonly_canonical_force_rebuild(opts: &IndexOptions) -> bool {
         && !opts.full
         && !opts.watch
         && !opts.semantic
-        && !opts.build_hnsw
         && opts
             .watch_once_paths
             .as_ref()
@@ -4867,12 +4887,6 @@ fn count_total_conversations_exact(storage: &FrankenStorage) -> Result<usize> {
     Ok(usize::try_from(total_conversations.max(0)).unwrap_or(usize::MAX))
 }
 
-fn semantic_indexing_now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-}
-
 fn system_time_to_epoch_millis(time: SystemTime) -> Option<i64> {
     time.duration_since(UNIX_EPOCH)
         .ok()
@@ -4901,90 +4915,6 @@ fn semantic_model_revision_for_embedder_id(embedder_id: &str) -> String {
             .revision
             .clone(),
     }
-}
-
-/// Republish the semantic manifest after a direct `cass index --semantic`
-/// pass so `cass status` reflects the freshly-built vector index.
-///
-/// The manifest-backed `cass models backfill` path already does this via
-/// `manifest.publish_artifact(...)` inside `run_backfill_batch`. The
-/// direct path at the call-site below previously skipped the manifest
-/// update entirely, leaving status pointed at stale artifact metadata
-/// even after a successful republish — see issue #203.
-#[allow(clippy::too_many_arguments)]
-fn publish_direct_semantic_artifact(
-    storage: &FrankenStorage,
-    data_dir: &Path,
-    index_path: &Path,
-    embedder_id: &str,
-    embedder_dimension: usize,
-    embedded_doc_count: u64,
-    build_started_at_ms: i64,
-) -> Result<()> {
-    let Some(tier) = semantic_tier_for_embedder_id(embedder_id) else {
-        tracing::debug!(
-            embedder = embedder_id,
-            "skipping direct semantic manifest publish: unknown embedder tier"
-        );
-        return Ok(());
-    };
-
-    // Compute conversation count and fingerprint from the SAME storage
-    // handle so the manifest's `conversation_count` and the count
-    // embedded in `db_fingerprint` (the `content-v1:N:M:K` string) can
-    // never disagree by one. Also avoids re-opening the DB in
-    // `lexical_storage_fingerprint_for_db`, which is a no-op cost on
-    // SQLite but still pointless work.
-    let total_conversations_raw = count_total_conversations_exact(storage)?;
-    let db_fingerprint = lexical_rebuild_content_fingerprint(storage, total_conversations_raw)?;
-    let total_conversations = u64::try_from(total_conversations_raw).unwrap_or(u64::MAX);
-    let size_bytes = fs::metadata(index_path)
-        .with_context(|| {
-            format!(
-                "stat published semantic index {} for direct manifest publish",
-                index_path.display()
-            )
-        })?
-        .len();
-    let relative_index_path = index_path
-        .strip_prefix(data_dir)
-        .unwrap_or(index_path)
-        .to_string_lossy()
-        .into_owned();
-    let model_revision = semantic_model_revision_for_embedder_id(embedder_id);
-
-    let mut manifest = SemanticManifest::load_or_default(data_dir).map_err(|err| {
-        anyhow::anyhow!("loading semantic manifest for direct artifact publish: {err}")
-    })?;
-    let now = semantic_indexing_now_ms();
-    manifest.publish_artifact(ArtifactRecord {
-        tier,
-        embedder_id: embedder_id.to_string(),
-        model_revision,
-        schema_version: SEMANTIC_SCHEMA_VERSION,
-        chunking_version: CHUNKING_STRATEGY_VERSION,
-        dimension: embedder_dimension,
-        doc_count: embedded_doc_count,
-        conversation_count: total_conversations,
-        db_fingerprint: db_fingerprint.clone(),
-        index_path: relative_index_path,
-        size_bytes,
-        started_at_ms: build_started_at_ms,
-        completed_at_ms: now,
-        ready: true,
-    });
-    manifest.refresh_backlog(total_conversations, &db_fingerprint);
-    manifest
-        .save(data_dir)
-        .map_err(|err| anyhow::anyhow!("saving semantic manifest after direct publish: {err}"))?;
-    tracing::info!(
-        embedder = embedder_id,
-        tier = tier.as_str(),
-        doc_count = embedded_doc_count,
-        conversation_count = total_conversations,
-        "published direct semantic artifact to manifest"
-    );
-    Ok(())
 }
 
 fn count_total_messages_exact(storage: &FrankenStorage) -> Result<usize> {
@@ -5272,7 +5202,7 @@ fn should_run_targeted_watch_once_only(
 }
 
 fn should_skip_absent_explicit_watch_once_paths(opts: &IndexOptions) -> bool {
-    if opts.watch || opts.full || opts.force_rebuild || opts.semantic || opts.build_hnsw {
+    if opts.watch || opts.full || opts.force_rebuild || opts.semantic {
         return false;
     }
 
@@ -5328,7 +5258,7 @@ fn should_skip_unchanged_explicit_watch_once_paths(
     storage: &FrankenStorage,
     roots: &[(ConnectorKind, ScanRoot)],
 ) -> Result<bool> {
-    if opts.watch || opts.full || opts.force_rebuild || opts.semantic || opts.build_hnsw {
+    if opts.watch || opts.full || opts.force_rebuild || opts.semantic {
         return Ok(false);
     }
 
@@ -5358,7 +5288,7 @@ fn can_skip_unchanged_explicit_watch_once_index_run(
     opts: &IndexOptions,
     storage: &FrankenStorage,
 ) -> Result<bool> {
-    if opts.watch || opts.full || opts.force_rebuild || opts.semantic || opts.build_hnsw {
+    if opts.watch || opts.full || opts.force_rebuild || opts.semantic {
         return Ok(false);
     }
     if opts
@@ -8524,6 +8454,101 @@ impl Drop for ScanWatermarkRestoreGuard {
     }
 }
 
+/// W3-5: fsvi-backed semantic indexing (frankensearch) is retired. The DB
+/// vector domain replaces the old two-machine design (bulk build + a
+/// `last_embedded_message_id` watermark gating incremental append) with a
+/// single idempotent catch-up: ingest-time hooks
+/// (`register_embedding_hole_for_new_message_in_tx`, wave-1 T7#4) already
+/// register a hole for every new message as it lands, so draining holes here
+/// *is* the incremental step -- the watermark was superseded, not replaced
+/// by nothing. The genesis eligibility rescan this also performs each call is
+/// kept as a self-healing safety net for any hook that was missed, not an
+/// optimization target (W3-5 task book #63 advisor ruling).
+/// Returns the underlying `run_db_vector_catchup_backfill` report's
+/// `activated` flag (R1-W3-B1: previously discarded as `Ok(())`, which is
+/// exactly what let every caller -- including `run_targeted_semantic_
+/// watch_once_publish` -- report success/`published: true` regardless of
+/// whether the generation ever actually reached `active+passed`) and,
+/// separately (R4-4), the same report's `cleanup_failures` -- also
+/// previously discarded here (only the `cass models backfill` call site
+/// that hits `run_db_vector_catchup_backfill` directly, lib.rs:97395-
+/// 97465, ever saw it; this function's callers, including the standard
+/// `cass index --semantic` path, could not). Callers must not treat
+/// `activated: false` as an error: a catch-up call draining a large hole
+/// backlog in bounded batches, or one that just wrote off an ineligible
+/// hole this pass, is expected to return without activating and needs a
+/// subsequent call to finish -- that is the documented "idempotent, safe
+/// to rerun" contract, not a failure.
+struct SemanticDbVectorCatchupOutcome {
+    activated: bool,
+    cleanup_failures: Vec<(i64, String)>,
+}
+
+#[cfg(feature = "infinity")]
+fn run_semantic_db_vector_catchup(
+    opts: &IndexOptions,
+    caller: &str,
+) -> Result<SemanticDbVectorCatchupOutcome> {
+    if opts.embedder != "infinity" {
+        anyhow::bail!(
+            "{caller}: --embedder {} is retired (W3-5, frankensearch/fsvi removed); \
+             use --embedder infinity",
+            opts.embedder
+        );
+    }
+    let storage = FrankenStorage::open_writer(&opts.db_path).with_context(|| {
+        format!(
+            "opening writer storage for DB-vector-domain catch-up: {}",
+            opts.db_path.display()
+        )
+    })?;
+    let batch_size = SemanticIndexer::new("infinity", None)?.batch_size();
+    let report = crate::indexer::db_vector_catchup::run_db_vector_catchup_backfill(
+        &storage,
+        batch_size,
+    )
+    .map_err(|e| anyhow::anyhow!("{caller}: db vector catchup failed: {e:#}"))?;
+    tracing::info!(
+        caller,
+        generation_id = report.generation_id,
+        reused_existing_generation = report.reused_existing_generation,
+        embedder_id = %report.embedder_id,
+        eligible_seeded = report.eligible_seeded,
+        embedded_inserted = report.embedded_inserted,
+        stale_skipped = report.stale_skipped,
+        holes_before = report.holes_before,
+        holes_after = report.holes_after,
+        holes_written_off_ineligible = report.holes_written_off_ineligible,
+        activated = report.activated,
+        "db vector domain catch-up complete"
+    );
+    if !report.activated {
+        tracing::info!(
+            caller,
+            generation_id = report.generation_id,
+            holes_after = report.holes_after,
+            "{caller}: db vector domain catch-up did not activate this pass \
+             (holes remain, or activation audit has not run yet); rerun the \
+             same command to continue draining embedding_holes"
+        );
+    }
+    Ok(SemanticDbVectorCatchupOutcome {
+        activated: report.activated,
+        cleanup_failures: report.cleanup_failures,
+    })
+}
+
+#[cfg(not(feature = "infinity"))]
+fn run_semantic_db_vector_catchup(
+    _opts: &IndexOptions,
+    caller: &str,
+) -> Result<SemanticDbVectorCatchupOutcome> {
+    anyhow::bail!(
+        "{caller}: semantic indexing requires the `infinity` feature (fsvi-backed semantic \
+         indexing was retired in W3-5); rebuild with --features infinity"
+    );
+}
+
 pub fn run_index(
     opts: IndexOptions,
     event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
@@ -9913,134 +9938,26 @@ pub fn run_index(
         }
     }
 
-    // Semantic indexing (if enabled)
+    // Semantic indexing (if enabled). W3-5: fsvi/frankensearch retired --
+    // the DB vector domain catch-up (ingest-time hole registration + genesis
+    // rescan safety net) replaces the old bulk-build/watermark-gated design;
+    // see run_semantic_db_vector_catchup's doc comment.
     if opts.semantic && targeted_semantic_watch_once {
         tracing::info!(
             embedder = %opts.embedder,
             "deferring broad semantic indexing until targeted watch-once ingest completes"
         );
     } else if opts.semantic {
-        // In watch mode, skip the expensive bulk re-embed if a vector index and
-        // watermark already exist. The incremental path in the watch callback
-        // will pick up any new messages via WAL append.
-        let vi_dir = opts
-            .data_dir
-            .join(crate::search::vector_index::VECTOR_INDEX_DIR);
-        let has_existing_index = vi_dir.is_dir()
-            && std::fs::read_dir(&vi_dir)
-                .map(|entries| {
-                    entries
-                        .filter_map(|e| e.ok())
-                        .any(|e| e.path().extension().is_some_and(|ext| ext == "fsvi"))
-                })
-                .unwrap_or(false);
-        let has_watermark = storage.get_last_embedded_message_id()?.is_some();
-
-        if opts.watch && has_existing_index && has_watermark {
-            tracing::info!(
-                dir = %vi_dir.display(),
-                "skipping bulk semantic re-embed (existing index + watermark found); \
-                 incremental watch callback will handle new messages"
-            );
-        } else {
-            tracing::info!(embedder = %opts.embedder, "starting semantic indexing");
-
-            let semantic_indexer = SemanticIndexer::new(&opts.embedder, Some(&opts.data_dir))?;
-            let mut semantic_read_storage = FrankenStorage::open_readonly(&opts.db_path)
-                .with_context(|| {
-                    format!(
-                        "opening fresh readonly canonical storage for semantic indexing: {}",
-                        opts.db_path.display()
-                    )
-                })?;
-
-            let mut embedding_inputs =
-                packet_embedding_inputs_from_storage(&semantic_read_storage)?;
-            tracing::info!(
-                message_count = embedding_inputs.len(),
-                packet_driven = true,
-                "built semantic inputs from canonical ConversationPacket replay"
-            );
-
-            embedding_inputs.retain(|message| {
-                !is_hard_message_noise(semantic_role_name(message.role), &message.content)
-            });
-
-            // Generate embeddings
-            let embedded_messages = semantic_indexer.embed_messages(&embedding_inputs)?;
-            tracing::info!(
-                embedded_count = embedded_messages.len(),
-                "generated embeddings"
-            );
-
-            if !embedded_messages.is_empty() {
-                let embedded_doc_count = embedded_messages.len();
-                let build_started_at_ms = semantic_indexing_now_ms();
-                let vector_index =
-                    semantic_indexer.build_and_save_index(embedded_messages, &opts.data_dir)?;
-                let index_path = crate::search::vector_index::vector_index_path(
-                    &opts.data_dir,
-                    semantic_indexer.embedder_id(),
-                );
-                tracing::info!(
-                    path = %index_path.display(),
-                    embedder = semantic_indexer.embedder_id(),
-                    "saved semantic vector index"
-                );
-
-                // Build HNSW index for approximate nearest neighbor search (if enabled)
-                if opts.build_hnsw {
-                    let hnsw_path = semantic_indexer.build_hnsw_index(
-                        &vector_index,
-                        &opts.data_dir,
-                        None, // Use default M
-                        None, // Use default ef_construction
-                    )?;
-                    tracing::info!(
-                        path = %hnsw_path.display(),
-                        embedder = semantic_indexer.embedder_id(),
-                        "saved HNSW index for approximate search"
-                    );
-                }
-
-                // Publish the artifact to the semantic manifest so `cass
-                // status` reflects the freshly-built index. Without this,
-                // `index --semantic` republishes the .fsvi file but leaves
-                // semantic_manifest.json pointed at stale metadata, so
-                // status reports `semantic: stale / available: false`
-                // even though semantic search works (issue #203).
-                if let Err(err) = publish_direct_semantic_artifact(
-                    &semantic_read_storage,
-                    &opts.data_dir,
-                    &index_path,
-                    semantic_indexer.embedder_id(),
-                    semantic_indexer.embedder_dimension(),
-                    u64::try_from(embedded_doc_count).unwrap_or(u64::MAX),
-                    build_started_at_ms,
-                ) {
-                    tracing::warn!(
-                        embedder = semantic_indexer.embedder_id(),
-                        error = %err,
-                        "direct semantic artifact published to disk but \
-                         manifest update failed; cass status may report \
-                         stale/unavailable until next backfill cycle"
-                    );
-                }
-            }
-            semantic_read_storage.close_best_effort_in_place();
-
-            // Set watermark so incremental watch-mode embedding only sees new messages
-            if let Some(max_id) = embedding_inputs.iter().map(|e| e.message_id).max() {
-                persist::with_ephemeral_writer(
-                    &storage,
-                    false,
-                    "updating semantic indexing watermark",
-                    |writer| {
-                        writer
-                            .set_last_embedded_message_id(i64::try_from(max_id).unwrap_or(i64::MAX))
-                    },
-                )?;
-            }
+        let outcome = run_semantic_db_vector_catchup(&opts, "cass index --semantic")?;
+        if let Some(p) = &opts.progress
+            && let Ok(mut stats) = p.stats.lock()
+        {
+            stats.semantic_activated = Some(outcome.activated);
+            stats.cleanup_failures = outcome
+                .cleanup_failures
+                .into_iter()
+                .map(|(generation_id, error)| SemanticCleanupFailure { generation_id, error })
+                .collect();
         }
     }
 
@@ -10217,16 +10134,6 @@ pub fn run_index(
         // from now — the cooldown must elapse before the first incremental pass.
         let semantic_enabled = opts.semantic;
         let targeted_semantic_watch_once = targeted_semantic_watch_once && watch_once_mode;
-        let embedder_id = opts.embedder.clone();
-        let data_dir_for_semantic = opts.data_dir.clone();
-        let pre_watch_semantic_conversations = if targeted_semantic_watch_once {
-            let storage = storage.lock().map_err(|err| {
-                anyhow::anyhow!("storage lock poisoned before semantic watch-once: {err}")
-            })?;
-            count_total_conversations_exact(&storage)?
-        } else {
-            0
-        };
         let semantic_cooldown = Duration::from_secs(
             dotenvy::var("CASS_WATCH_SEMANTIC_COOLDOWN_SECS")
                 .ok()
@@ -10301,13 +10208,8 @@ pub fn run_index(
                     )?;
 
                     if targeted_semantic_watch_once {
-                        let stats = run_targeted_semantic_watch_once_publish(
-                            &embedder_id,
-                            &data_dir_for_semantic,
-                            &storage_for_watch,
-                            indexed,
-                            pre_watch_semantic_conversations,
-                        )?;
+                        let stats =
+                            run_targeted_semantic_watch_once_publish(&opts_clone, indexed)?;
                         record_semantic_watch_once_stats(opts_clone.progress.as_ref(), stats);
                     }
                     indexed
@@ -10328,34 +10230,24 @@ pub fn run_index(
                     )
                 };
 
-                // Incremental semantic embedding with cooldown
+                // Incremental semantic embedding with cooldown. W3-5: the
+                // per-callback delta (`semantic_delta`) is no longer needed
+                // -- ingest-time hooks already registered a hole for every
+                // new message, so the cooldown just gates how often this
+                // watch loop calls the same DB-vector-domain catch-up used
+                // by `cass index --semantic` and `cass models backfill`.
+                let _ = &semantic_delta;
                 if semantic_enabled && indexed > 0 && !targeted_semantic_watch_once {
                     let should_embed = last_semantic_embed
                         .lock()
                         .map(|t| t.elapsed() >= semantic_cooldown)
                         .unwrap_or(false);
                     if should_embed {
-                        let embed_result = if semantic_delta.max_message_id.is_some() {
-                            incremental_semantic_embed_from_delta(
-                                &embedder_id,
-                                &data_dir_for_semantic,
-                                &storage_for_watch,
-                                semantic_delta,
-                            )
-                        } else {
-                            incremental_semantic_embed(
-                                &embedder_id,
-                                &data_dir_for_semantic,
-                                &storage_for_watch,
-                            )
-                        };
-                        match embed_result {
-                            Ok(0) => {} // no new messages to embed
-                            Ok(n) => {
-                                tracing::info!(
-                                    count = n,
-                                    "incremental semantic embedding complete"
-                                );
+                        match run_semantic_db_vector_catchup(
+                            &opts_clone,
+                            "cass index --semantic (watch)",
+                        ) {
+                            Ok(_outcome) => {
                                 if let Ok(mut t) = last_semantic_embed.lock() {
                                     *t = Instant::now();
                                 }
@@ -10690,6 +10582,7 @@ fn release_watch_storage_after_index(
     }
 }
 
+#[cfg(test)]
 fn semantic_role_name(role: u8) -> Option<&'static str> {
     match role {
         ROLE_USER => Some("user"),
@@ -10722,553 +10615,58 @@ impl WatchSemanticDelta {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SemanticContentFingerprint {
-    total_conversations: usize,
-    max_conversation_id: i64,
-    max_message_id: i64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TargetedSemanticWatchOnceMode {
-    RebuildAll,
-    AppendToExisting,
-    AlreadyCovered,
-}
-
-#[derive(Debug)]
-struct TargetedSemanticWatchOnceSelection {
-    mode: TargetedSemanticWatchOnceMode,
-    inputs: Vec<EmbeddingInput>,
-    raw_max_message_id: Option<i64>,
-    tier: SemanticTierKind,
-    index_path: PathBuf,
-    total_conversations: u64,
-    current_db_fingerprint: String,
-    manifest_before_db_fingerprint: Option<String>,
-    reason: &'static str,
-}
-
 fn should_run_targeted_semantic_watch_once(opts: &IndexOptions) -> bool {
     opts.semantic
         && !opts.watch
         && !opts.full
         && !opts.force_rebuild
-        && !opts.build_hnsw
         && opts
             .watch_once_paths
             .as_ref()
             .is_some_and(|paths| !paths.is_empty())
 }
 
-fn parse_semantic_content_fingerprint(raw: &str) -> Option<SemanticContentFingerprint> {
-    let mut parts = raw.strip_prefix("content-v1:")?.split(':');
-    let total_conversations = parts.next()?.parse::<usize>().ok()?;
-    let max_conversation_id = parts.next()?.parse::<i64>().ok()?;
-    let max_message_id = parts.next()?.parse::<i64>().ok()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    Some(SemanticContentFingerprint {
-        total_conversations,
-        max_conversation_id,
-        max_message_id,
-    })
-}
-
-fn semantic_artifact_for_tier(
-    manifest: &SemanticManifest,
-    tier: SemanticTierKind,
-) -> Option<&ArtifactRecord> {
-    match tier {
-        SemanticTierKind::Fast => manifest.fast_tier.as_ref(),
-        SemanticTierKind::Quality => manifest.quality_tier.as_ref(),
-    }
-}
-
-fn semantic_artifact_index_path(data_dir: &Path, artifact: &ArtifactRecord) -> Result<PathBuf> {
-    let path = PathBuf::from(&artifact.index_path);
-    if path.is_absolute() {
-        return Ok(path);
-    }
-
-    let mut resolved = data_dir.to_path_buf();
-    for component in path.components() {
-        let std::path::Component::Normal(part) = component else {
-            anyhow::bail!(
-                "semantic watch-once cannot use unsafe relative vector artifact path {}",
-                artifact.index_path
-            );
-        };
-        resolved.push(part);
-    }
-    Ok(resolved)
-}
-
-fn validate_semantic_watch_once_artifact(
-    data_dir: &Path,
-    artifact: &ArtifactRecord,
-    indexer: &SemanticIndexer,
-    tier: SemanticTierKind,
-) -> Result<PathBuf> {
-    if !artifact.ready {
-        anyhow::bail!("semantic watch-once cannot reuse artifact that is not ready");
-    }
-    let artifact_matches_indexer = artifact.tier.eq(&tier)
-        && artifact.embedder_id.as_str().eq(indexer.embedder_id())
-        && artifact.dimension.eq(&indexer.embedder_dimension())
-        && artifact.schema_version.eq(&SEMANTIC_SCHEMA_VERSION)
-        && artifact.chunking_version.eq(&CHUNKING_STRATEGY_VERSION);
-    if !artifact_matches_indexer {
-        anyhow::bail!(
-            "semantic watch-once cannot prove coverage from incompatible semantic artifact"
-        );
-    }
-
-    let index_path = semantic_artifact_index_path(data_dir, artifact)?;
-    let canonical_index_path = vector_index_path(data_dir, indexer.embedder_id());
-    if !index_path.eq(&canonical_index_path) {
-        anyhow::bail!(
-            "semantic watch-once cannot append to non-canonical vector path {}; expected {}",
-            index_path.display(),
-            canonical_index_path.display()
-        );
-    }
-    let index = FsVectorIndex::open(&index_path).map_err(|err| {
-        anyhow::anyhow!(
-            "semantic watch-once cannot open existing vector artifact {}: {err}",
-            index_path.display()
-        )
-    })?;
-    let observed_docs = u64::try_from(index.record_count()).unwrap_or(u64::MAX);
-    if !observed_docs.eq(&artifact.doc_count) {
-        anyhow::bail!(
-            "semantic watch-once cannot prove existing vector prefix: manifest doc_count={} but index has {} records",
-            artifact.doc_count,
-            observed_docs
-        );
-    }
-    Ok(index_path)
-}
-
-fn semantic_artifact_is_append_only_prefix(
-    storage: &FrankenStorage,
-    artifact_fingerprint: SemanticContentFingerprint,
-    current_fingerprint: SemanticContentFingerprint,
-) -> Result<bool> {
-    if artifact_fingerprint.total_conversations > current_fingerprint.total_conversations
-        || artifact_fingerprint.max_conversation_id > current_fingerprint.max_conversation_id
-        || artifact_fingerprint.max_message_id > current_fingerprint.max_message_id
-    {
-        return Ok(false);
-    }
-
-    let prefix_conversations: i64 = storage
-        .raw()
-        .query_row_map(
-            "SELECT COUNT(*)
-             FROM conversations
-             WHERE id <= ?1",
-            &[ParamValue::from(artifact_fingerprint.max_conversation_id)],
-            |row| row.get_typed(0),
-        )
-        .context("checking semantic watch-once prefix conversation count")?;
-    let observed_prefix_conversations =
-        usize::try_from(prefix_conversations.max(0)).unwrap_or(usize::MAX);
-    Ok(observed_prefix_conversations.eq(&artifact_fingerprint.total_conversations))
-}
-
-fn filter_semantic_watch_once_inputs(inputs: &mut Vec<EmbeddingInput>) {
-    inputs.retain(|message| {
-        !is_hard_message_noise(semantic_role_name(message.role), &message.content)
-    });
-}
-
-fn select_targeted_semantic_watch_once_inputs(
-    storage: &FrankenStorage,
-    data_dir: &Path,
-    indexer: &SemanticIndexer,
-    pre_watch_conversations: usize,
-) -> Result<TargetedSemanticWatchOnceSelection> {
-    let total_conversations = count_total_conversations_exact(storage)?;
-    if total_conversations == 0 {
-        anyhow::bail!(
-            "semantic watch-once indexed zero conversations; refusing to publish semantic success"
-        );
-    }
-    let current_db_fingerprint = lexical_rebuild_content_fingerprint(storage, total_conversations)?;
-    let current_fingerprint = parse_semantic_content_fingerprint(&current_db_fingerprint)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "semantic watch-once could not parse current DB fingerprint {current_db_fingerprint}"
-            )
-        })?;
-    let tier = semantic_tier_for_embedder_id(indexer.embedder_id()).ok_or_else(|| {
-        anyhow::anyhow!(
-            "semantic watch-once cannot publish unknown embedder tier for {}",
-            indexer.embedder_id()
-        )
-    })?;
-    let manifest = SemanticManifest::load_or_default(data_dir).map_err(|err| {
-        anyhow::anyhow!("loading semantic manifest for semantic watch-once: {err}")
-    })?;
-    let artifact = semantic_artifact_for_tier(&manifest, tier)
-        .filter(|artifact| artifact.embedder_id.as_str().eq(indexer.embedder_id()))
-        .cloned();
-    let manifest_before_db_fingerprint = artifact
-        .as_ref()
-        .map(|artifact| artifact.db_fingerprint.clone());
-
-    if let Some(artifact) = artifact.as_ref()
-        && artifact.db_fingerprint.eq(&current_db_fingerprint)
-    {
-        let index_path = validate_semantic_watch_once_artifact(data_dir, artifact, indexer, tier)?;
-        return Ok(TargetedSemanticWatchOnceSelection {
-            mode: TargetedSemanticWatchOnceMode::AlreadyCovered,
-            inputs: Vec::new(),
-            raw_max_message_id: (current_fingerprint.max_message_id > 0)
-                .then_some(current_fingerprint.max_message_id),
-            tier,
-            index_path,
-            total_conversations: u64::try_from(total_conversations).unwrap_or(u64::MAX),
-            current_db_fingerprint,
-            manifest_before_db_fingerprint,
-            reason: "semantic_artifact_already_covers_db",
-        });
-    }
-
-    if pre_watch_conversations == 0 {
-        let mut inputs = packet_embedding_inputs_from_storage(storage)?;
-        let raw_max_message_id = inputs
-            .iter()
-            .filter_map(|input| i64::try_from(input.message_id).ok())
-            .max()
-            .or_else(|| {
-                (current_fingerprint.max_message_id > 0)
-                    .then_some(current_fingerprint.max_message_id)
-            });
-        filter_semantic_watch_once_inputs(&mut inputs);
-        return Ok(TargetedSemanticWatchOnceSelection {
-            mode: TargetedSemanticWatchOnceMode::RebuildAll,
-            inputs,
-            raw_max_message_id,
-            tier,
-            index_path: vector_index_path(data_dir, indexer.embedder_id()),
-            total_conversations: u64::try_from(total_conversations).unwrap_or(u64::MAX),
-            current_db_fingerprint,
-            manifest_before_db_fingerprint,
-            reason: "fresh_watch_once_db",
-        });
-    }
-
-    let artifact = artifact.ok_or_else(|| {
-        anyhow::anyhow!(
-            "semantic watch-once cannot prove bounded coverage: no existing {} artifact for populated DB",
-            tier.as_str()
-        )
-    })?;
-    let artifact_fingerprint = parse_semantic_content_fingerprint(&artifact.db_fingerprint)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "semantic watch-once cannot parse existing artifact fingerprint {}",
-                artifact.db_fingerprint
-            )
-        })?;
-    let artifact_fingerprint_conversations =
-        u64::try_from(artifact_fingerprint.total_conversations).unwrap_or(u64::MAX);
-    if !artifact
-        .conversation_count
-        .eq(&artifact_fingerprint_conversations)
-    {
-        anyhow::bail!(
-            "semantic watch-once cannot prove existing vector prefix: manifest conversation_count={} but fingerprint has {} conversations",
-            artifact.conversation_count,
-            artifact_fingerprint.total_conversations
-        );
-    }
-    let index_path = validate_semantic_watch_once_artifact(data_dir, &artifact, indexer, tier)?;
-    if !semantic_artifact_is_append_only_prefix(storage, artifact_fingerprint, current_fingerprint)?
-    {
-        anyhow::bail!(
-            "semantic watch-once cannot prove bounded coverage: existing semantic artifact is not an append-only prefix of the current DB"
-        );
-    }
-
-    let mut batch =
-        packet_embedding_inputs_from_storage_since(storage, artifact_fingerprint.max_message_id)?;
-    let raw_max_message_id = batch.raw_max_message_id.or_else(|| {
-        (current_fingerprint.max_message_id > 0).then_some(current_fingerprint.max_message_id)
-    });
-    filter_semantic_watch_once_inputs(&mut batch.inputs);
-    Ok(TargetedSemanticWatchOnceSelection {
-        mode: TargetedSemanticWatchOnceMode::AppendToExisting,
-        inputs: batch.inputs,
-        raw_max_message_id,
-        tier,
-        index_path,
-        total_conversations: u64::try_from(total_conversations).unwrap_or(u64::MAX),
-        current_db_fingerprint,
-        manifest_before_db_fingerprint,
-        reason: "semantic_artifact_is_append_only_prefix",
-    })
-}
-
-fn publish_semantic_watch_once_artifact(
-    data_dir: &Path,
-    indexer: &SemanticIndexer,
-    selection: &TargetedSemanticWatchOnceSelection,
-    doc_count: u64,
-    build_started_at_ms: i64,
-) -> Result<()> {
-    let size_bytes = fs::metadata(&selection.index_path)
-        .with_context(|| {
-            format!(
-                "stat semantic watch-once index {}",
-                selection.index_path.display()
-            )
-        })?
-        .len();
-    let relative_index_path = selection
-        .index_path
-        .strip_prefix(data_dir)
-        .unwrap_or(selection.index_path.as_path())
-        .to_string_lossy()
-        .to_string();
-    let mut manifest = SemanticManifest::load_or_default(data_dir).map_err(|err| {
-        anyhow::anyhow!("loading semantic manifest for semantic watch-once publish: {err}")
-    })?;
-    manifest.publish_artifact(ArtifactRecord {
-        tier: selection.tier,
-        embedder_id: indexer.embedder_id().to_string(),
-        model_revision: semantic_model_revision_for_embedder_id(indexer.embedder_id()),
-        schema_version: SEMANTIC_SCHEMA_VERSION,
-        chunking_version: CHUNKING_STRATEGY_VERSION,
-        dimension: indexer.embedder_dimension(),
-        doc_count,
-        conversation_count: selection.total_conversations,
-        db_fingerprint: selection.current_db_fingerprint.clone(),
-        index_path: relative_index_path,
-        size_bytes,
-        started_at_ms: build_started_at_ms,
-        completed_at_ms: semantic_indexing_now_ms(),
-        ready: true,
-    });
-    manifest.refresh_backlog(
-        selection.total_conversations,
-        &selection.current_db_fingerprint,
-    );
-    manifest
-        .save(data_dir)
-        .map_err(|err| anyhow::anyhow!("saving semantic watch-once manifest: {err}"))
-}
-
+/// W3-5: replaces the old fsvi rebuild-or-append-then-set-watermark
+/// machinery. `indexed_conversations`/`pre_watch_conversations` no longer
+/// gate a selection query -- the DB-vector-domain catch-up itself decides
+/// what's eligible via `embedding_holes` -- but the zero-conversations
+/// refusal is kept: publishing a "semantic ready" claim off a watch-once
+/// pass that indexed nothing would be misleading either way.
+///
+/// R1-W3-B1: `published` must mirror the catch-up's actual `activated`
+/// result, not a hardcoded `true` -- a watch-once pass that ingested
+/// conversations but left the generation's holes undrained (large backlog,
+/// or holes just written off as ineligible this pass) has not actually
+/// published anything, and claiming otherwise is the same false-green this
+/// finding covers for the plain `cass index --semantic` path.
 fn run_targeted_semantic_watch_once_publish(
-    embedder: &str,
-    data_dir: &Path,
-    storage: &Mutex<FrankenStorage>,
+    opts: &IndexOptions,
     indexed_conversations: usize,
-    pre_watch_conversations: usize,
 ) -> Result<SemanticWatchOnceStats> {
     if indexed_conversations == 0 {
         anyhow::bail!(
             "semantic watch-once indexed zero conversations; refusing to publish semantic success"
         );
     }
-
-    let indexer = SemanticIndexer::new(embedder, Some(data_dir))?;
-    let selection = {
-        let storage = storage.lock().map_err(|err| {
-            anyhow::anyhow!("lock storage for semantic watch-once selection: {err}")
-        })?;
-        select_targeted_semantic_watch_once_inputs(
-            &storage,
-            data_dir,
-            &indexer,
-            pre_watch_conversations,
-        )?
-    };
-    let selected_docs = selection.inputs.len();
-    let build_started_at_ms = semantic_indexing_now_ms();
-    let embedded = if selection.inputs.is_empty() {
-        Vec::new()
-    } else {
-        indexer.embed_messages(&selection.inputs)?
-    };
-    let embedded_docs = embedded.len();
-
-    let doc_count = match selection.mode {
-        TargetedSemanticWatchOnceMode::AlreadyCovered => {
-            let index = FsVectorIndex::open(&selection.index_path).map_err(|err| {
-                anyhow::anyhow!(
-                    "open already-covered semantic watch-once index {}: {err}",
-                    selection.index_path.display()
-                )
-            })?;
-            u64::try_from(index.record_count()).unwrap_or(u64::MAX)
-        }
-        TargetedSemanticWatchOnceMode::RebuildAll => {
-            let index = indexer.build_and_save_index(embedded, data_dir)?;
-            u64::try_from(index.record_count()).unwrap_or(u64::MAX)
-        }
-        TargetedSemanticWatchOnceMode::AppendToExisting => {
-            if embedded_docs > 0 {
-                let appended = indexer.append_to_index(embedded, data_dir)?;
-                if !appended.eq(&embedded_docs) {
-                    anyhow::bail!(
-                        "semantic watch-once append count mismatch: appended {appended}, embedded {embedded_docs}"
-                    );
-                }
-            }
-            let index = FsVectorIndex::open(&selection.index_path).map_err(|err| {
-                anyhow::anyhow!(
-                    "open appended semantic watch-once index {}: {err}",
-                    selection.index_path.display()
-                )
-            })?;
-            u64::try_from(index.record_count()).unwrap_or(u64::MAX)
-        }
-    };
-
-    publish_semantic_watch_once_artifact(
-        data_dir,
-        &indexer,
-        &selection,
-        doc_count,
-        build_started_at_ms,
-    )?;
-    if let Some(raw_max_message_id) = selection.raw_max_message_id {
-        update_incremental_semantic_watermark(
-            storage,
-            raw_max_message_id,
-            "updating semantic watch-once watermark",
-        )?;
-    }
-
+    let activated =
+        run_semantic_db_vector_catchup(opts, "cass index --semantic --watch-once")?.activated;
     Ok(SemanticWatchOnceStats {
-        published: true,
-        selected_docs,
-        embedded_docs,
-        tier: selection.tier.as_str().to_string(),
-        vector_index_path: selection.index_path.display().to_string(),
-        manifest_before_db_fingerprint: selection.manifest_before_db_fingerprint,
-        manifest_after_db_fingerprint: Some(selection.current_db_fingerprint),
-        reason: selection.reason.to_string(),
+        published: activated,
+        selected_docs: indexed_conversations,
+        embedded_docs: indexed_conversations,
+        tier: "quality".to_string(),
+        vector_index_path: String::new(),
+        manifest_before_db_fingerprint: None,
+        manifest_after_db_fingerprint: None,
+        reason: if activated {
+            "db-vector-domain catch-up (W3-5: fsvi manifest retired)".to_string()
+        } else {
+            "db-vector-domain catch-up ingested but has not activated yet (holes remain or \
+             activation audit has not run this pass); rerun to continue draining \
+             embedding_holes (W3-5: fsvi manifest retired)"
+                .to_string()
+        },
     })
-}
-
-fn update_incremental_semantic_watermark(
-    storage: &Mutex<FrankenStorage>,
-    raw_max_id: i64,
-    context: &str,
-) -> Result<()> {
-    let guard = storage
-        .lock()
-        .map_err(|e| anyhow::anyhow!("lock storage for watermark write: {e}"))?;
-    persist::with_ephemeral_writer(&guard, false, context, |writer| {
-        writer.set_last_embedded_message_id(raw_max_id)
-    })?;
-    Ok(())
-}
-
-fn embed_incremental_semantic_inputs(
-    embedder: &str,
-    data_dir: &Path,
-    storage: &Mutex<FrankenStorage>,
-    embedding_inputs: Vec<EmbeddingInput>,
-    raw_max_id: i64,
-    filtered_watermark_context: &str,
-    success_watermark_context: &str,
-) -> Result<usize> {
-    if embedding_inputs.is_empty() {
-        update_incremental_semantic_watermark(storage, raw_max_id, filtered_watermark_context)?;
-        return Ok(0);
-    }
-
-    let semantic_indexer = SemanticIndexer::new(embedder, Some(data_dir))?;
-    let embedded = semantic_indexer.embed_messages(&embedding_inputs)?;
-    let count = semantic_indexer.append_to_index(embedded, data_dir)?;
-
-    update_incremental_semantic_watermark(storage, raw_max_id, success_watermark_context)?;
-    Ok(count)
-}
-
-fn incremental_semantic_embed_from_delta(
-    embedder: &str,
-    data_dir: &Path,
-    storage: &Mutex<FrankenStorage>,
-    semantic_delta: WatchSemanticDelta,
-) -> Result<usize> {
-    let Some(raw_max_id) = semantic_delta.max_message_id else {
-        return Ok(0);
-    };
-
-    let embedding_inputs: Vec<EmbeddingInput> = semantic_delta
-        .inputs
-        .into_iter()
-        .filter(|msg| !is_hard_message_noise(semantic_role_name(msg.role), &msg.content))
-        .collect();
-
-    embed_incremental_semantic_inputs(
-        embedder,
-        data_dir,
-        storage,
-        embedding_inputs,
-        raw_max_id,
-        "advancing incremental semantic watermark for filtered packet delta",
-        "updating incremental semantic watermark from packet delta",
-    )
-}
-
-/// Perform incremental semantic embedding for messages added since the last
-/// watermark. Loads the ONNX model, embeds the batch, appends to the existing
-/// FSVI index via WAL, and updates the watermark.
-fn incremental_semantic_embed(
-    embedder: &str,
-    data_dir: &Path,
-    storage: &Mutex<FrankenStorage>,
-) -> Result<usize> {
-    // 1. Read watermark
-    let watermark = storage
-        .lock()
-        .map_err(|e| anyhow::anyhow!("lock storage for watermark read: {e}"))?
-        .get_last_embedded_message_id()?
-        .unwrap_or(0);
-
-    // 2. Fetch new packet-derived canonical batches since watermark.
-    let batch = {
-        let storage = storage
-            .lock()
-            .map_err(|e| anyhow::anyhow!("lock storage for message fetch: {e}"))?;
-        packet_embedding_inputs_from_storage_since(&storage, watermark)?
-    };
-
-    let Some(raw_max_id) = batch.raw_max_message_id else {
-        return Ok(0);
-    };
-
-    tracing::info!(
-        since_id = watermark,
-        conversations = batch.conversations_in_batch,
-        count = batch.inputs.len(),
-        packet_driven = true,
-        "incremental semantic: fetched canonical packet catch-up batch"
-    );
-
-    let embedding_inputs: Vec<EmbeddingInput> = batch
-        .inputs
-        .into_iter()
-        .filter(|msg| !is_hard_message_noise(semantic_role_name(msg.role), &msg.content))
-        .collect();
-
-    embed_incremental_semantic_inputs(
-        embedder,
-        data_dir,
-        storage,
-        embedding_inputs,
-        raw_max_id,
-        "advancing incremental semantic watermark for filtered batch",
-        "updating incremental semantic watermark",
-    )
 }
 
 /// Open the legacy embedded engine storage for indexing without replacing canonical data.
@@ -18707,7 +18105,6 @@ pub mod persist {
                 db_path,
                 data_dir,
                 semantic: false,
-                build_hnsw: false,
                 embedder: "fnv1a-384".to_string(),
                 progress: None,
                 watch_interval_secs: 30,
@@ -20545,7 +19942,6 @@ mod tests {
             db_path: db_path.clone(),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
@@ -21546,7 +20942,6 @@ mod tests {
             db_path,
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
@@ -26324,7 +25719,6 @@ mod tests {
                 db_path: db_path.clone(),
                 data_dir: data_dir.clone(),
                 semantic: true,
-                build_hnsw: false,
                 embedder: "definitely-invalid".to_string(),
                 progress: None,
                 watch_once_paths: None,
@@ -26395,7 +25789,6 @@ mod tests {
                 db_path: db_path.clone(),
                 data_dir: data_dir.clone(),
                 semantic: true,
-                build_hnsw: false,
                 embedder: "definitely-invalid".to_string(),
                 progress: None,
                 watch_once_paths: None,
@@ -26473,7 +25866,6 @@ mod tests {
                 db_path: db_path.clone(),
                 data_dir: data_dir.clone(),
                 semantic: false,
-                build_hnsw: false,
                 embedder: "fastembed".to_string(),
                 progress: None,
                 watch_once_paths: None,
@@ -27997,7 +27389,6 @@ mod tests {
             db_path,
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: String::from("fastembed"),
             progress: Some(progress),
             watch_interval_secs: 30,
@@ -28080,7 +27471,6 @@ mod tests {
             db_path,
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: String::from("fastembed"),
             progress: Some(progress),
             watch_interval_secs: 30,
@@ -28124,7 +27514,6 @@ mod tests {
             db_path,
             data_dir,
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: Some(progress.clone()),
             watch_interval_secs: 30,
@@ -28186,7 +27575,6 @@ mod tests {
             db_path,
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: String::from("fastembed"),
             progress: Some(progress),
             watch_interval_secs: 30,
@@ -28270,7 +27658,6 @@ mod tests {
             db_path,
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: String::from("fastembed"),
             progress: Some(progress),
             watch_interval_secs: 30,
@@ -28322,7 +27709,6 @@ mod tests {
                 db_path,
                 data_dir,
                 semantic: false,
-                build_hnsw: false,
                 embedder: String::from("fastembed"),
                 progress: Some(progress.clone()),
                 watch_interval_secs: 30,
@@ -28393,7 +27779,6 @@ mod tests {
             db_path,
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: Some(progress.clone()),
             watch_interval_secs: 30,
@@ -29519,7 +28904,6 @@ mod tests {
             db_path: data_dir.join("agent_search.db"),
             data_dir,
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
@@ -29642,10 +29026,8 @@ mod tests {
         assert!(!should_skip_absent_explicit_watch_once_paths(
             &semantic_opts
         ));
-
-        let mut hnsw_opts = watch_once_skip_test_options(data_dir, Some(vec![missing]));
-        hnsw_opts.build_hnsw = true;
-        assert!(!should_skip_absent_explicit_watch_once_paths(&hnsw_opts));
+        let _ = data_dir;
+        let _ = missing;
     }
 
     #[test]
@@ -30104,7 +29486,6 @@ mod tests {
             db_path: data_dir.join("db.sqlite"),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
@@ -30153,7 +29534,6 @@ mod tests {
             db_path: data_dir.join("db.sqlite"),
             data_dir: data_dir.to_path_buf(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
@@ -30212,87 +29592,21 @@ mod tests {
             db_path: data_dir.join("db.sqlite"),
             data_dir: data_dir.to_path_buf(),
             semantic: true,
-            build_hnsw: false,
             embedder: "hash".to_string(),
             progress: Some(progress),
             watch_interval_secs: 30,
         }
     }
 
-    fn semantic_watch_once_stats(
-        progress: &Arc<IndexingProgress>,
-    ) -> Result<SemanticWatchOnceStats> {
-        let stats = progress
-            .stats
-            .lock()
-            .map_err(|err| anyhow::anyhow!("semantic watch-once stats lock poisoned: {err}"))?;
-        stats
-            .semantic_watch_once
-            .clone()
-            .context("semantic watch-once proof")
-    }
-
-    #[test]
-    #[serial]
-    fn run_index_semantic_watch_once_publishes_targeted_manifest() -> Result<()> {
-        let tmp = tempfile::tempdir()?;
-        let data_dir = tmp.path().join("cass-data");
-        std::fs::create_dir_all(&data_dir)?;
-        let session = tmp
-            .path()
-            .join(".codex")
-            .join("sessions")
-            .join("2026")
-            .join("05")
-            .join("28")
-            .join("rollout-semantic-watch-once.jsonl");
-        write_semantic_watch_once_codex_session(
-            &session,
-            "semantic-watch-once-fresh",
-            "swonce-fresh",
-        )?;
-
-        let progress = Arc::new(IndexingProgress::default());
-        run_index(
-            semantic_watch_once_opts(&data_dir, &session, Arc::clone(&progress)),
-            None,
-        )?;
-
-        let stats = semantic_watch_once_stats(&progress)?;
-        anyhow::ensure!(stats.published, "semantic watch-once did not publish");
-        anyhow::ensure!(
-            matches!(stats.reason.as_str(), "fresh_watch_once_db"),
-            "wrong reason"
-        );
-        anyhow::ensure!(matches!(stats.tier.as_str(), "fast"), "wrong tier");
-        anyhow::ensure!(matches!(stats.selected_docs, 2), "wrong selected doc count");
-        anyhow::ensure!(matches!(stats.embedded_docs, 2), "wrong embedded doc count");
-        anyhow::ensure!(
-            matches!(
-                stats.manifest_after_db_fingerprint.as_deref(),
-                Some("content-v1:1:1:2")
-            ),
-            "wrong post-publish fingerprint"
-        );
-
-        let manifest = SemanticManifest::load_or_default(&data_dir)?;
-        let artifact = manifest.fast_tier.as_ref().context("fast artifact")?;
-        anyhow::ensure!(
-            matches!(artifact.conversation_count, 1),
-            "wrong conversation count"
-        );
-        anyhow::ensure!(matches!(artifact.doc_count, 2), "wrong doc count");
-        anyhow::ensure!(
-            matches!(artifact.db_fingerprint.as_str(), "content-v1:1:1:2"),
-            "wrong artifact fingerprint"
-        );
-        let index = FsVectorIndex::open(&vector_index_path(&data_dir, "fnv1a-384"))?;
-        anyhow::ensure!(
-            matches!(index.record_count(), 2),
-            "wrong vector record count"
-        );
-        Ok(())
-    }
+    // W3-5: run_index_semantic_watch_once_publishes_targeted_manifest deleted
+    // (task book #63 Step1 test cleanup, delete bucket) -- asserted on
+    // fsvi-era machine internals (`stats.tier`, `manifest.fast_tier`,
+    // `FsVectorIndex::open`) that no longer exist now that
+    // run_targeted_semantic_watch_once_publish calls the DB-vector-domain
+    // catch-up. Coverage successor: query.rs's
+    // `db_vector_catchup_end_to_end_via_live_infinity` (first-call-creates
+    // semantics) plus this file's `run_index_semantic_watch_once_fails_when_no_conversation_is_indexed`
+    // (kept below -- the zero-conversations refusal is unchanged).
 
     /// w2 W2-4 closeout regression (X-1, control-plane ruling): `cass index
     /// --force-rebuild` on a populated canonical DB with no --semantic/
@@ -30344,7 +29658,6 @@ mod tests {
             db_path: db_path.clone(),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
@@ -30380,7 +29693,6 @@ mod tests {
             db_path: db_path.clone(),
             data_dir,
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
@@ -30486,7 +29798,6 @@ mod tests {
             db_path: db_path.clone(),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
@@ -30519,7 +29830,6 @@ mod tests {
             db_path: db_path.clone(),
             data_dir,
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
@@ -30596,7 +29906,6 @@ mod tests {
             db_path: db_path.clone(),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
@@ -30632,7 +29941,6 @@ mod tests {
             db_path: db_path.clone(),
             data_dir,
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
@@ -30783,158 +30091,13 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    #[serial]
-    fn run_index_semantic_watch_once_catches_up_append_only_prefix_manifest() -> Result<()> {
-        let tmp = tempfile::tempdir()?;
-        let data_dir = tmp.path().join("cass-data");
-        std::fs::create_dir_all(&data_dir)?;
-        let first = tmp
-            .path()
-            .join(".codex")
-            .join("sessions")
-            .join("2026")
-            .join("05")
-            .join("28")
-            .join("rollout-semantic-watch-once-first.jsonl");
-        let second = first.with_file_name("rollout-semantic-watch-once-second.jsonl");
-        write_semantic_watch_once_codex_session(&first, "semantic-watch-once-first", "swonce-one")?;
-        write_semantic_watch_once_codex_session(
-            &second,
-            "semantic-watch-once-second",
-            "swonce-two",
-        )?;
-
-        let first_progress = Arc::new(IndexingProgress::default());
-        run_index(
-            semantic_watch_once_opts(&data_dir, &first, first_progress),
-            None,
-        )?;
-
-        let second_progress = Arc::new(IndexingProgress::default());
-        run_index(
-            semantic_watch_once_opts(&data_dir, &second, Arc::clone(&second_progress)),
-            None,
-        )?;
-
-        let stats = semantic_watch_once_stats(&second_progress)?;
-        anyhow::ensure!(stats.published, "semantic watch-once did not publish");
-        anyhow::ensure!(
-            matches!(
-                stats.reason.as_str(),
-                "semantic_artifact_is_append_only_prefix"
-            ),
-            "wrong reason"
-        );
-        anyhow::ensure!(
-            matches!(
-                stats.manifest_before_db_fingerprint.as_deref(),
-                Some("content-v1:1:1:2")
-            ),
-            "wrong pre-publish fingerprint"
-        );
-        anyhow::ensure!(
-            matches!(
-                stats.manifest_after_db_fingerprint.as_deref(),
-                Some("content-v1:2:2:4")
-            ),
-            "wrong post-publish fingerprint"
-        );
-        anyhow::ensure!(matches!(stats.selected_docs, 2), "wrong selected doc count");
-        anyhow::ensure!(matches!(stats.embedded_docs, 2), "wrong embedded doc count");
-
-        let manifest = SemanticManifest::load_or_default(&data_dir)?;
-        let artifact = manifest.fast_tier.as_ref().context("fast artifact")?;
-        anyhow::ensure!(
-            matches!(artifact.conversation_count, 2),
-            "wrong conversation count"
-        );
-        anyhow::ensure!(matches!(artifact.doc_count, 4), "wrong doc count");
-        anyhow::ensure!(
-            matches!(artifact.db_fingerprint.as_str(), "content-v1:2:2:4"),
-            "wrong artifact fingerprint"
-        );
-        let index = FsVectorIndex::open(&vector_index_path(&data_dir, "fnv1a-384"))?;
-        anyhow::ensure!(
-            matches!(index.record_count(), 4),
-            "wrong vector record count"
-        );
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn run_index_semantic_watch_once_reports_already_covered_manifest() -> Result<()> {
-        let tmp = tempfile::tempdir()?;
-        let data_dir = tmp.path().join("cass-data");
-        std::fs::create_dir_all(&data_dir)?;
-        let session = tmp
-            .path()
-            .join(".codex")
-            .join("sessions")
-            .join("2026")
-            .join("05")
-            .join("28")
-            .join("rollout-semantic-watch-once-rerun.jsonl");
-        write_semantic_watch_once_codex_session(
-            &session,
-            "semantic-watch-once-rerun",
-            "swonce-rerun",
-        )?;
-
-        let first_progress = Arc::new(IndexingProgress::default());
-        run_index(
-            semantic_watch_once_opts(&data_dir, &session, first_progress),
-            None,
-        )?;
-
-        let second_progress = Arc::new(IndexingProgress::default());
-        run_index(
-            semantic_watch_once_opts(&data_dir, &session, Arc::clone(&second_progress)),
-            None,
-        )?;
-
-        let stats = semantic_watch_once_stats(&second_progress)?;
-        anyhow::ensure!(stats.published, "semantic watch-once did not publish");
-        anyhow::ensure!(
-            matches!(stats.reason.as_str(), "semantic_artifact_already_covers_db"),
-            "wrong reason"
-        );
-        anyhow::ensure!(
-            matches!(
-                stats.manifest_before_db_fingerprint.as_deref(),
-                Some("content-v1:1:1:2")
-            ),
-            "wrong pre-publish fingerprint"
-        );
-        anyhow::ensure!(
-            matches!(
-                stats.manifest_after_db_fingerprint.as_deref(),
-                Some("content-v1:1:1:2")
-            ),
-            "wrong post-publish fingerprint"
-        );
-        anyhow::ensure!(matches!(stats.selected_docs, 0), "wrong selected doc count");
-        anyhow::ensure!(matches!(stats.embedded_docs, 0), "wrong embedded doc count");
-
-        let manifest = SemanticManifest::load_or_default(&data_dir)?;
-        let artifact = manifest.fast_tier.as_ref().context("fast artifact")?;
-        anyhow::ensure!(
-            matches!(artifact.conversation_count, 1),
-            "wrong conversation count"
-        );
-        anyhow::ensure!(matches!(artifact.doc_count, 2), "wrong doc count");
-        anyhow::ensure!(
-            matches!(artifact.db_fingerprint.as_str(), "content-v1:1:1:2"),
-            "wrong artifact fingerprint"
-        );
-        let index = FsVectorIndex::open(&vector_index_path(&data_dir, "fnv1a-384"))?;
-        anyhow::ensure!(
-            matches!(index.record_count(), 2),
-            "wrong vector record count"
-        );
-        Ok(())
-    }
+    // W3-5: run_index_semantic_watch_once_catches_up_append_only_prefix_manifest
+    // and run_index_semantic_watch_once_reports_already_covered_manifest
+    // deleted (task book #63 Step1 test cleanup, delete bucket) -- same
+    // fsvi-machine-internals rationale as the fresh-publish test above.
+    // The "resume without redoing work" concept they covered has a
+    // successor: query.rs's `db_vector_catchup_end_to_end_via_live_infinity`
+    // asserts the second call reuses the generation and does not re-embed.
 
     #[test]
     #[serial]
@@ -31163,7 +30326,6 @@ mod tests {
             db_path: data_dir.join("agent_search.db"),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_once_paths: None,
@@ -31250,7 +30412,6 @@ mod tests {
             db_path: data_dir.join("agent_search.db"),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: Some(progress.clone()),
             watch_once_paths: None,
@@ -31334,7 +30495,6 @@ mod tests {
             db_path: data_dir.join("agent_search.db"),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_once_paths: None,
@@ -31402,7 +30562,6 @@ mod tests {
             db_path: data_dir.join("agent_search.db"),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_once_paths: None,
@@ -31483,7 +30642,6 @@ mod tests {
             db_path: data_dir.join("agent_search.db"),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_once_paths: None,
@@ -31570,7 +30728,6 @@ mod tests {
             db_path: data_dir.join("agent_search.db"),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_once_paths: None,
@@ -31659,7 +30816,6 @@ mod tests {
             db_path: data_dir.join("agent_search.db"),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_once_paths: None,
@@ -31806,7 +30962,6 @@ mod tests {
             db_path: data_dir.join("agent_search.db"),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: Some(progress.clone()),
             watch_once_paths: None,
@@ -31878,7 +31033,6 @@ mod tests {
             db_path: data_dir.join("agent_search.db"),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_once_paths: Some(vec![amp_file.clone()]),
@@ -31970,7 +31124,6 @@ mod tests {
             db_path: data_dir.join("agent_search.db"),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_once_paths: Some(vec![amp_file.clone()]),
@@ -32053,7 +31206,6 @@ mod tests {
             db_path: data_dir.join("agent_search.db"),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_once_paths: None,
@@ -32175,7 +31327,6 @@ mod tests {
             db_path: data_dir.join("agent_search.db"),
             data_dir: data_dir.clone(),
             semantic: true,
-            build_hnsw: false,
             embedder: "hash".to_string(),
             progress: None,
             watch_once_paths: None,
@@ -32289,7 +31440,6 @@ mod tests {
             db_path: data_dir.join("db.sqlite"),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
@@ -32342,7 +31492,6 @@ mod tests {
             db_path: data_dir.join("db.sqlite"),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
@@ -32426,7 +31575,6 @@ mod tests {
             db_path: data_dir.join("db.sqlite"),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: Some(progress.clone()),
             watch_interval_secs: 30,
@@ -32494,7 +31642,6 @@ mod tests {
             db_path: data_dir.join("db.sqlite"),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: Some(progress.clone()),
             watch_interval_secs: 30,
@@ -32565,7 +31712,6 @@ mod tests {
             db_path: data_dir.join("db.sqlite"),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
@@ -32685,7 +31831,6 @@ mod tests {
             db_path: data_dir.join("db.sqlite"),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
@@ -34608,6 +33753,193 @@ mod tests {
         let json = serde_json::to_string(&stats).unwrap();
         assert!(json.contains("consecutive_zero_scans"));
         assert!(json.contains("total_ingests"));
+    }
+
+    /// R2-B1: `semantic_activated` must be present (`true` or `false`) in
+    /// `IndexingStats`'s serialized form whenever a semantic pass ran --
+    /// the whole point of this field is that `false` (an unresolved
+    /// increment, a legitimate cron-model state) is never silently
+    /// indistinguishable from "no semantic pass ran at all" the way a
+    /// discarded bool at the `run_index` call site previously left it.
+    /// `None` (no semantic pass requested) is the one case allowed to
+    /// disappear from the JSON entirely (`skip_serializing_if`).
+    #[test]
+    fn indexing_stats_semantic_activated_serializes_unconditionally_when_present() {
+        let activated_false = IndexingStats { semantic_activated: Some(false), ..Default::default() };
+        let json = serde_json::to_value(&activated_false).unwrap();
+        assert_eq!(
+            json.get("semantic_activated"),
+            Some(&serde_json::json!(false)),
+            "an incomplete increment must still surface `activated: false`, not be silently absent"
+        );
+
+        let activated_true = IndexingStats { semantic_activated: Some(true), ..Default::default() };
+        let json = serde_json::to_value(&activated_true).unwrap();
+        assert_eq!(json.get("semantic_activated"), Some(&serde_json::json!(true)));
+
+        let no_semantic_pass = IndexingStats { semantic_activated: None, ..Default::default() };
+        let json = serde_json::to_value(&no_semantic_pass).unwrap();
+        assert!(
+            json.get("semantic_activated").is_none(),
+            "a run that never requested semantic indexing must omit the field, not report `null`"
+        );
+    }
+
+    /// R4-4: `IndexingStats.cleanup_failures` must mirror the `semantic_
+    /// activated` disclosure rule above -- present (a JSON array of
+    /// `{generation_id, error}` objects, the same shape `cass models
+    /// backfill` already emits for this data, lib.rs:97446-97449) whenever
+    /// the DB-vector-domain catch-up recorded a cleanup failure, absent
+    /// entirely on the common case (nothing failed to clean up), never a
+    /// bare `[]`.
+    #[test]
+    fn indexing_stats_cleanup_failures_serializes_only_when_non_empty() {
+        let with_failure = IndexingStats {
+            cleanup_failures: vec![SemanticCleanupFailure {
+                generation_id: 7,
+                error: "delete failed: disk I/O error".to_string(),
+            }],
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&with_failure).unwrap();
+        assert_eq!(
+            json.get("cleanup_failures"),
+            Some(&serde_json::json!([{"generation_id": 7, "error": "delete failed: disk I/O error"}])),
+            "a real cleanup failure must surface in the same {{generation_id, error}} shape `cass models backfill` already uses"
+        );
+
+        let no_failures = IndexingStats::default();
+        let json = serde_json::to_value(&no_failures).unwrap();
+        assert!(
+            json.get("cleanup_failures").is_none(),
+            "the common case (nothing failed to clean up) must omit the field, not report an empty array"
+        );
+    }
+
+    /// R4-4: the standard `cass index --semantic` path (`run_index`'s
+    /// `opts.semantic` branch) previously discarded `DbVectorCatchupReport
+    /// ::cleanup_failures` entirely -- `run_semantic_db_vector_catchup`
+    /// returned only `Ok(report.activated)`. Reuses the exact R3-6 scan-
+    /// failure fixture (`cleanup_folds_a_scan_failure_into_ok_outcome_
+    /// failures_instead_of_propagating_as_err`, tests/w3_vector_generation
+    /// _cleanup.rs) -- renaming `embedding_generations.created_at` breaks
+    /// only the orphan-scan query's own `WHERE` clause (no pre-existing
+    /// generation rows needed to trigger it) -- to get a *real* cleanup
+    /// failure out of production code, not a hand-typed string, then
+    /// applies the exact outcome-to-stats mapping `run_index`'s `opts.
+    /// semantic` branch applies, and confirms the result is both present
+    /// on `IndexingStats` and reaches its JSON serialization -- the
+    /// disclosure surface this finding is actually about. Does not call
+    /// `run_semantic_db_vector_catchup` itself: that function starts with
+    /// `probe_served_embed_identity`, an unconditional live-Infinity HTTP
+    /// call this workspace has no mock server for (the existing `#[ignore
+    /// = "requires a live Infinity service..."]` tests in tests/w3_5_n3_
+    /// generation_reuse.rs hit the same constraint for the same reason).
+    #[test]
+    #[cfg(feature = "infinity")]
+    fn cleanup_failure_from_a_real_scan_failure_maps_into_stats_and_its_json() {
+        let dir = TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).expect("open db");
+        storage
+            .raw()
+            .execute(
+                "ALTER TABLE embedding_generations RENAME COLUMN created_at TO created_at_renamed_for_test",
+                &[],
+            )
+            .expect("break the orphan-scan query's own WHERE clause");
+
+        let cleanup_outcome = crate::indexer::db_vector_catchup::cleanup_orphaned_generations(
+            &storage,
+            FrankenStorage::now_millis(),
+        )
+        .expect("R3-6: a scan-level failure must fold into Ok(outcome.failures), not propagate as Err");
+        assert_eq!(
+            cleanup_outcome.failures.len(),
+            1,
+            "the scan failure itself must be recorded: {:?}",
+            cleanup_outcome.failures
+        );
+        assert_eq!(cleanup_outcome.failures[0].0, 0, "a scan-level failure has no real generation_id");
+        assert!(cleanup_outcome.failures[0].1.contains("orphan-scan"));
+
+        // The exact mapping `run_index`'s `opts.semantic` branch applies to
+        // `run_semantic_db_vector_catchup`'s return value.
+        let db_outcome = SemanticDbVectorCatchupOutcome {
+            activated: false,
+            cleanup_failures: cleanup_outcome.failures,
+        };
+        let mut stats = IndexingStats::default();
+        stats.semantic_activated = Some(db_outcome.activated);
+        stats.cleanup_failures = db_outcome
+            .cleanup_failures
+            .into_iter()
+            .map(|(generation_id, error)| SemanticCleanupFailure { generation_id, error })
+            .collect();
+
+        assert_eq!(stats.cleanup_failures.len(), 1);
+        assert_eq!(stats.cleanup_failures[0].generation_id, 0);
+        assert!(stats.cleanup_failures[0].error.contains("orphan-scan"));
+
+        let json = serde_json::to_value(&stats).unwrap();
+        let failures_json = json
+            .get("cleanup_failures")
+            .expect("cleanup_failures must be present in JSON when non-empty");
+        assert_eq!(failures_json[0]["generation_id"], serde_json::json!(0));
+        assert!(failures_json[0]["error"].as_str().unwrap().contains("orphan-scan"));
+    }
+
+    /// R4-2: R3-4 originally proved the Bars-mode completion line
+    /// discloses `semantic_activated` by re-typing its message-building
+    /// logic by hand against a bare `String`/`ProgressBar`, never calling
+    /// the real production code -- round-4 review's R4-2 finding: deleting
+    /// the real call site in `run_index_with_data`, or that code no
+    /// longer reading `semantic_activated` at all, left this test unable
+    /// to notice either regression. The activation suffix is now
+    /// `crate::semantic_activation_suffix` (src/lib.rs), a pure function
+    /// both the production call site and this test call, so this test
+    /// now asserts its actual output across all three `semantic_
+    /// activated` states instead of a hand-copied three-way branch.
+    #[test]
+    fn semantic_activation_suffix_discloses_all_three_states() {
+        let activated_true = IndexingStats { semantic_activated: Some(true), ..Default::default() };
+        assert_eq!(
+            crate::semantic_activation_suffix(&activated_true).as_deref(),
+            Some(", semantic index: activated"),
+            "activated=true must report bare \"activated\""
+        );
+
+        let activated_false = IndexingStats { semantic_activated: Some(false), ..Default::default() };
+        assert_eq!(
+            crate::semantic_activation_suffix(&activated_false).as_deref(),
+            Some(
+                ", semantic index: not activated yet (holes remain; rerun to continue draining embedding_holes)"
+            ),
+            "activated=false must not be mistaken for \"no semantic pass ran\""
+        );
+
+        let no_semantic_pass = IndexingStats { semantic_activated: None, ..Default::default() };
+        assert_eq!(
+            crate::semantic_activation_suffix(&no_semantic_pass),
+            None,
+            "a run that never requested semantic indexing must add no suffix at all"
+        );
+    }
+
+    /// R4-2: grep-level proof that `run_index_with_data`'s Bars-mode
+    /// completion line still calls `semantic_activation_suffix` -- not a
+    /// PTY integration test (Ivan boundary ruling: no test hooks/harness
+    /// for interactive-TTY rendering). The unit test above proves the
+    /// function's own output is correct in isolation; it cannot see
+    /// whether the real call site still calls it, which is exactly the
+    /// false-green class R4-2 flagged.
+    #[test]
+    fn bars_mode_completion_line_calls_semantic_activation_suffix() {
+        let lib_rs = include_str!("../lib.rs");
+        assert!(
+            lib_rs.contains("semantic_activation_suffix(&stats)"),
+            "run_index_with_data's Bars-mode completion line must still call semantic_activation_suffix"
+        );
     }
 
     #[test]

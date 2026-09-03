@@ -682,6 +682,7 @@ mod tests {
     use crate::policy_registry::{
         PolicyControllerStatus, PolicyFallbackState, policy_registry_snapshot,
     };
+    use crate::search::canonicalize::CANONICALIZE_PIPELINE_VERSION;
     use crate::search::policy::{
         CHUNKING_STRATEGY_VERSION, SEMANTIC_SCHEMA_VERSION, SemanticPolicy,
     };
@@ -729,6 +730,7 @@ mod tests {
             model_revision: "hash".to_string(),
             schema_version: SEMANTIC_SCHEMA_VERSION,
             chunking_version: CHUNKING_STRATEGY_VERSION,
+            canonicalize_version: Some(CANONICALIZE_PIPELINE_VERSION),
             dimension: 384,
             doc_count: 13,
             conversation_count: 5,

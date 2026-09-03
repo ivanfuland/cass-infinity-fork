@@ -72,8 +72,8 @@ const CONTRACTS: &[DependencyContract] = &[
         crate_package_name: "asupersync",
         manifest_package_field: None,
         // crates.io-only exact pin after the 0.3.x migration unified every source
-        // (direct dep, frankensqlite transitive, frankensearch transitive)
-        // onto a single published release. Empty `expected_git` signals
+        // (direct dep, frankensqlite transitive) onto a single published
+        // release. Empty `expected_git` signals
         // `validate_manifest_dependency_spec` to skip git/rev checks.
         expected_git: "",
         expected_rev: "",
@@ -82,35 +82,6 @@ const CONTRACTS: &[DependencyContract] = &[
         expected_default_features: None,
         repo_rel: "../asupersync",
         manifest_rel: "Cargo.toml",
-        patch_url: None,
-        patch_key: None,
-        mode: ValidationMode::StrictOptIn,
-    },
-    DependencyContract {
-        label: "frankensearch",
-        dep_table: "dependencies",
-        dep_key: "frankensearch",
-        crate_package_name: "frankensearch",
-        manifest_package_field: None,
-        expected_git: "https://github.com/Dicklesworthstone/frankensearch",
-        // Bumped from 831b3b13 to pick up bounded cass content-prefix
-        // indexing plus the self-contained Git dependency packaging fix.
-        expected_rev: "2cad158f4468ece7076e3fe529c8e5c20b2e020e",
-        expected_version: "0.3.2",
-        // cass#256: `fastembed-reranker` no longer appears in the static
-        // `[dependencies]` table; it is enabled by the cass `semantic`
-        // feature so the baseline build (`--no-default-features --features
-        // qr,encryption`) can drop the prebuilt Microsoft ONNX Runtime
-        // binary that crashes pre-AVX2 CPUs. The contract therefore only
-        // pins the always-on features here; the conditional one is
-        // validated by Cargo's own feature graph.
-        // W2-6 Task2: "lexical" dropped with the tantivy-backed engine it
-        // pulled in (search::tantivy). Contract must move in lockstep with
-        // Cargo.toml's feature list -- see the comment there.
-        expected_features: &["ann", "hash"],
-        expected_default_features: Some(false),
-        repo_rel: "../frankensearch",
-        manifest_rel: "frankensearch/Cargo.toml",
         patch_url: None,
         patch_key: None,
         mode: ValidationMode::StrictOptIn,

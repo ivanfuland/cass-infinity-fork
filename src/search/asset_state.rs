@@ -20,7 +20,7 @@ use fs2::FileExt;
 use crate::indexer::lexical_storage_fingerprint_for_db;
 #[cfg(test)]
 use crate::storage::sqlite::LexDomainRebuildMarkerState;
-use crate::search::ann_index::hnsw_index_path;
+use crate::search::vector_index::hnsw_index_path;
 use crate::search::embedder::Embedder;
 use crate::search::fastembed_embedder::FastEmbedder;
 use crate::search::hash_embedder::HashEmbedder;
@@ -693,7 +693,7 @@ pub(crate) fn inspect_semantic_assets(
     }
 
     let availability = match preference {
-        SemanticPreference::DefaultModel => probe_semantic_availability(data_dir),
+        SemanticPreference::DefaultModel => probe_semantic_availability(data_dir, db_path),
         SemanticPreference::HashFallback => probe_hash_semantic_availability(data_dir),
     };
     semantic_state_from_availability(data_dir, &availability, preference, current_db_fingerprint)
@@ -2713,12 +2713,20 @@ mod tests {
     #[test]
     fn semantic_preference_surface_preserves_backend_and_model_dir_projection() {
         let data_dir = Path::new("/tmp/cass");
+        // R1-W3-N2 fallout: `active_policy_model_dir` -> `FastEmbedder::
+        // canonical_name(&policy.quality_tier_embedder)` returns `None`
+        // for the infinity-routing names ("infinity"/"bge-m3") -- correct
+        // behavior, not a bug, DEFAULT_QUALITY_TIER_EMBEDDER's default
+        // under `infinity` is `is_infinity_embedder_name`-shaped, and the
+        // Infinity-served model lives on a remote HTTP service with no
+        // on-disk FastEmbed directory to project a path for at all.
+        let default_model_dir = if cfg!(feature = "infinity") {
+            None
+        } else {
+            Some(FastEmbedder::default_model_dir(data_dir))
+        };
         let cases = [
-            (
-                SemanticPreference::DefaultModel,
-                "fastembed",
-                Some(FastEmbedder::default_model_dir(data_dir)),
-            ),
+            (SemanticPreference::DefaultModel, "fastembed", default_model_dir),
             (SemanticPreference::HashFallback, "hash", None),
         ];
 
@@ -2769,6 +2777,7 @@ mod tests {
                 model_revision: "hash".to_string(),
                 schema_version: crate::search::policy::SEMANTIC_SCHEMA_VERSION,
                 chunking_version: crate::search::policy::CHUNKING_STRATEGY_VERSION,
+                canonicalize_version: Some(crate::search::canonicalize::CANONICALIZE_PIPELINE_VERSION),
                 dimension: 256,
                 doc_count: 12,
                 conversation_count: 3,
@@ -2835,6 +2844,7 @@ mod tests {
                 model_revision: "hash".to_string(),
                 schema_version: crate::search::policy::SEMANTIC_SCHEMA_VERSION,
                 chunking_version: crate::search::policy::CHUNKING_STRATEGY_VERSION,
+                canonicalize_version: Some(crate::search::canonicalize::CANONICALIZE_PIPELINE_VERSION),
                 dimension: 256,
                 doc_count: 12,
                 conversation_count: 3,
@@ -2886,6 +2896,7 @@ mod tests {
                 model_revision: "hash".to_string(),
                 schema_version: crate::search::policy::SEMANTIC_SCHEMA_VERSION,
                 chunking_version: crate::search::policy::CHUNKING_STRATEGY_VERSION,
+                canonicalize_version: Some(crate::search::canonicalize::CANONICALIZE_PIPELINE_VERSION),
                 dimension: 256,
                 doc_count: 249,
                 conversation_count: 21,
@@ -2937,6 +2948,7 @@ mod tests {
                 model_revision: "hash".to_string(),
                 schema_version: SEMANTIC_SCHEMA_VERSION,
                 chunking_version: CHUNKING_STRATEGY_VERSION,
+                canonicalize_version: Some(crate::search::canonicalize::CANONICALIZE_PIPELINE_VERSION),
                 dimension: HashEmbedder::default().dimension(),
                 shard_index,
                 shard_count: 2,
@@ -2998,6 +3010,7 @@ mod tests {
                 model_revision: "hash".to_string(),
                 schema_version: SEMANTIC_SCHEMA_VERSION,
                 chunking_version: CHUNKING_STRATEGY_VERSION,
+                canonicalize_version: Some(crate::search::canonicalize::CANONICALIZE_PIPELINE_VERSION),
                 dimension: HashEmbedder::default().dimension(),
                 shard_index: 0,
                 shard_count: 1,

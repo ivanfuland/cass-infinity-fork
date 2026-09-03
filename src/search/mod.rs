@@ -16,11 +16,8 @@
 //! - **[`policy`]**: Semantic policy contract: model defaults, tiers, budgets, invalidation.
 //! - **[`semantic_manifest`]**: Durable semantic asset manifests, backlog ledger, and checkpoints.
 //! - **[`canonicalize`]**: Text preprocessing for consistent embedding input.
-//! - **[`ann_index`]**: HNSW-based approximate nearest neighbor index (Opt 9).
-//! - **[`two_tier_search`]**: Two-tier progressive search with fast/quality embeddings (bd-3dcw).
 //! - **[`pack_planner`]**: Deterministic answer-pack evidence selection core.
 
-pub mod ann_index;
 pub mod asset_state;
 pub(crate) mod bounded_discovery;
 pub mod canonicalize;
@@ -34,6 +31,10 @@ pub mod embedder_registry;
 pub mod fastembed_embedder;
 pub mod fastembed_reranker;
 pub(crate) mod fleet_cheap_probes;
+pub(crate) mod frankensearch_daemon;
+pub(crate) mod frankensearch_hash_embedder;
+pub(crate) mod frankensearch_rrf;
+pub(crate) mod frankensearch_types;
 pub mod hash_embedder;
 pub(crate) mod human_readiness_summary;
 pub(crate) mod incident_categories;
@@ -71,7 +72,6 @@ pub(crate) mod storage_integrity;
 pub(crate) mod storage_salvage;
 pub mod trust_correlation;
 pub mod trust_scoring;
-pub mod two_tier_search;
 pub mod vector_index;
 pub(crate) mod watch_exit_envelope;
 pub(crate) mod watch_recovery;

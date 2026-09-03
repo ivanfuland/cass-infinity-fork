@@ -3075,6 +3075,35 @@ impl FrankenStorage {
             }
         }
         self.repair_missing_conversation_token_columns()?;
+        self.repair_missing_single_active_generation_index()?;
+        Ok(())
+    }
+
+    /// R3-5: `repair_missing_current_schema_objects`'s missing-table probe
+    /// (`REQUIRED_CURRENT_SCHEMA_TABLE_PROBES`) only detects the
+    /// `embedding_generations` *table* going missing -- if only its
+    /// `idx_embedding_generations_single_active` unique partial index (the
+    /// DB-level single-writer guard R2-N1 restored to the vector_domain
+    /// repair batch's SQL) was lost while the table itself survived, no
+    /// probe here ever fires and the missing-index case is invisible to
+    /// this self-heal pass entirely. `CREATE UNIQUE INDEX IF NOT EXISTS` is
+    /// naturally idempotent (a no-op once the index exists), so running it
+    /// unconditionally on every open -- rather than adding a second,
+    /// index-shaped probe/repair-batch mechanism alongside the
+    /// table-shaped one -- is the smaller fix (R3 ledger: "取改动更小
+    /// 者"). Safe to call unconditionally here: by this point
+    /// `embedding_generations` is guaranteed to exist, whether it already
+    /// did or the vector_domain repair batch above (which already contains
+    /// this same `CREATE UNIQUE INDEX IF NOT EXISTS` statement) just
+    /// (re)created it moments ago.
+    fn repair_missing_single_active_generation_index(&self) -> Result<()> {
+        self.conn
+            .execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_embedding_generations_single_active \
+                 ON embedding_generations(is_active) WHERE is_active = 1;",
+                &[],
+            )
+            .context("ensuring idx_embedding_generations_single_active exists")?;
         Ok(())
     }
 
@@ -3627,11 +3656,49 @@ CREATE INDEX IF NOT EXISTS idx_umd_workspace_day ON usage_models_daily(workspace
 CREATE INDEX IF NOT EXISTS idx_umd_source_day ON usage_models_daily(source_id, day_id);
 ";
 
+// R1-W3-N5: verbatim copy of `V4_VECTOR_DOMAIN_DDL`'s three-table shape
+// (`src/storage/schema.rs`) -- must stay byte-for-byte identical to that
+// source of truth, the same discipline the module doc comment there
+// already enforces between `FRESH_SCHEMA_DDL`'s tail and
+// `V2_LEX_DOMAIN_DDL`. `message_embeddings`/`embedding_holes` both
+// reference `embedding_generations`, so all three are one repair batch
+// (like `lex_domain`'s `lex_docs`+`fts_lex` pairing above), never
+// recreated independently of each other.
+//
+// R2-N1: the "byte-for-byte identical" claim above was not actually
+// enforced by any test (unlike the lex_domain pairing, which has
+// `fresh_schema_ddl_tail_matches_v2_lex_domain_migration_ddl`) -- this SQL
+// had silently drifted from `V4_VECTOR_DOMAIN_DDL`, missing its
+// `idx_embedding_generations_single_active` unique partial index
+// entirely. A database that lost the vector_domain tables and got them
+// back through this repair path (as opposed to a fresh-build `ensure()`)
+// would have no DB-level guard against two `is_active=1` rows coexisting.
+// Restored here; `current_schema_repair_vector_domain_sql_creates_the_
+// single_active_unique_index` below is this repair batch's first-ever
+// index-presence probe.
+const CURRENT_SCHEMA_REPAIR_VECTOR_DOMAIN_SQL: &str = r"
+CREATE TABLE IF NOT EXISTS embedding_generations (id INTEGER PRIMARY KEY AUTOINCREMENT, embedder_id TEXT NOT NULL, dim INTEGER NOT NULL CHECK (dim > 0), canonicalize_version INTEGER NOT NULL, byte_order TEXT NOT NULL DEFAULT 'le' CHECK (byte_order IN ('le', 'be')), audit_status TEXT NOT NULL DEFAULT 'pending' CHECK (audit_status IN ('pending', 'passed', 'failed')), is_active INTEGER NOT NULL DEFAULT 0 CHECK (is_active IN (0, 1)), created_at INTEGER NOT NULL, activated_at INTEGER);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_embedding_generations_single_active ON embedding_generations(is_active) WHERE is_active = 1;
+CREATE TABLE IF NOT EXISTS message_embeddings (generation_id INTEGER NOT NULL REFERENCES embedding_generations (id), doc_id INTEGER NOT NULL REFERENCES messages (id) ON DELETE CASCADE, conversation_id INTEGER NOT NULL, embedding BLOB NOT NULL CHECK (length(embedding) % 4 = 0), norm REAL NOT NULL CHECK (norm > 0), content_hash TEXT NOT NULL, content_version INTEGER, created_at INTEGER NOT NULL, UNIQUE (generation_id, doc_id));
+CREATE INDEX IF NOT EXISTS idx_message_embeddings_generation ON message_embeddings(generation_id);
+CREATE INDEX IF NOT EXISTS idx_message_embeddings_doc ON message_embeddings(doc_id);
+CREATE TABLE IF NOT EXISTS embedding_holes (generation_id INTEGER NOT NULL REFERENCES embedding_generations (id), doc_id INTEGER NOT NULL REFERENCES messages (id) ON DELETE CASCADE, detected_at INTEGER NOT NULL, reason TEXT, PRIMARY KEY (generation_id, doc_id));
+";
+
 const CURRENT_SCHEMA_REPAIR_BATCHES: &[SchemaRepairBatch] = &[
     SchemaRepairBatch {
         name: "sources",
         tables: &["sources"],
         sql: CURRENT_SCHEMA_REPAIR_SOURCES_SQL,
+    },
+    SchemaRepairBatch {
+        name: "vector_domain",
+        tables: &[
+            "embedding_generations",
+            "message_embeddings",
+            "embedding_holes",
+        ],
+        sql: CURRENT_SCHEMA_REPAIR_VECTOR_DOMAIN_SQL,
     },
     SchemaRepairBatch {
         name: "daily_stats",
@@ -3754,6 +3821,23 @@ const REQUIRED_CURRENT_SCHEMA_TABLE_PROBES: &[(&str, &str)] = &[
     // table: lex_docs"/"no such table: fts_lex" instead of self-healing.
     ("lex_docs", "SELECT doc_id FROM lex_docs LIMIT 1;"),
     ("fts_lex", "SELECT rowid FROM fts_lex LIMIT 1;"),
+    // R1-W3-N5: the W3 DB-vector-domain tables (`V4_VECTOR_DOMAIN_DDL`,
+    // `src/storage/schema.rs`) had no probe here at all -- a v4+ database
+    // that lost these three tables to incomplete restore / derived-index
+    // corruption was invisible to this self-heal pass, same class of gap
+    // the w2 F4 fix above closed for `lex_docs`/`fts_lex`.
+    (
+        "embedding_generations",
+        "SELECT id FROM embedding_generations LIMIT 1;",
+    ),
+    (
+        "message_embeddings",
+        "SELECT generation_id FROM message_embeddings LIMIT 1;",
+    ),
+    (
+        "embedding_holes",
+        "SELECT generation_id FROM embedding_holes LIMIT 1;",
+    ),
 ];
 
 const REQUIRED_CONVERSATION_TOKEN_COLUMNS: &[(&str, &str)] = &[
@@ -3903,6 +3987,15 @@ fn delete_orphan_message_id_chunk_once(conn: &FrankenConnection, ids: &[i64]) ->
                 anyhow_error_into_storage_error(err.context("deleting orphan rows from messages"))
             })?;
         deleted = deleted.saturating_add(more);
+        if more > 0 {
+            // w3-3 Step 3 (R2-W3-B4, D类): CASCADE already removed any
+            // embedding/hole rows the deleted orphans carried; demote in
+            // the same transaction. Gated on `more > 0` because this runs
+            // unconditionally at the top of every `cass index` invocation
+            // (see `cleanup_orphan_fk_rows`) and the zero-orphans case is
+            // the overwhelming common path.
+            crate::storage::schema::demote_active_generation_readiness_in_tx(tx)?;
+        }
         Ok(deleted)
     })?)
 }
@@ -5700,6 +5793,11 @@ impl FrankenStorage {
                    )",
                 fparams![agent_id],
             )?;
+            // w3-3 Step 3 (R2-W3-B4, C类): CASCADE already removed every
+            // embedding/hole row belonging to the purged messages; the
+            // active generation's readiness claim over what remains still
+            // needs demoting in this same transaction.
+            crate::storage::schema::demote_active_generation_readiness_in_tx(tx)?;
             Ok(())
         })?;
 
@@ -5827,6 +5925,9 @@ impl FrankenStorage {
                 &format!("DELETE FROM conversations WHERE id IN ({id_list})"),
                 fparams![],
             )?;
+            // w3-3 Step 3 (R2-W3-B4, C类) -- see `purge_agent_archive_data`'s
+            // identical comment.
+            crate::storage::schema::demote_active_generation_readiness_in_tx(tx)?;
             Ok(())
         })?;
 
@@ -5966,6 +6067,10 @@ impl FrankenStorage {
                 // so there is nothing conversation-scoped to delete there.
                 tx.execute("DELETE FROM conversations WHERE id = ?1", fparams![drop_id])?;
             }
+            // w3-3 Step 3 (R2-W3-B4, C类) -- see `purge_agent_archive_data`'s
+            // identical comment. Once per transaction (not per-pair): the
+            // guard above already ensures `result.pairs` is non-empty here.
+            crate::storage::schema::demote_active_generation_readiness_in_tx(tx)?;
             Ok(())
         })?;
 
@@ -10613,6 +10718,19 @@ fn franken_append_insert_new_messages<'a>(
         if let Some(message_id) =
             franken_insert_new_message_ignore_duplicate(tx, conversation_id, msg)?
         {
+            // w3-3 Step 3 (R2-W3-B4): same-transaction lifecycle
+            // invalidation for a newly appended message -- see the two
+            // primitives' doc comments (storage::schema) for why this can't
+            // wait for an async catch-up worker. No-op in the overwhelming
+            // majority of calls (no active generation yet).
+            let now_ms = FrankenStorage::now_millis();
+            crate::storage::schema::register_embedding_hole_for_new_message_in_tx(
+                tx,
+                message_id,
+                now_ms,
+                "new_message",
+            )?;
+            crate::storage::schema::demote_active_generation_readiness_in_tx(tx)?;
             inserted.push((message_id, *msg));
         }
     }
@@ -10659,6 +10777,23 @@ fn franken_batch_insert_new_messages_with_batch_size(
                 )
             })?;
         inserted_ids.extend((0..chunk.len()).map(|offset| first_id + offset as i64));
+    }
+
+    // w3-3 Step 3 (R2-W3-B4): same-transaction lifecycle invalidation --
+    // see `franken_append_insert_new_messages`'s identical comment. One
+    // `demote` call for the whole batch (idempotent, no per-row cost) plus
+    // one hole registration per newly inserted id.
+    if !inserted_ids.is_empty() {
+        let now_ms = FrankenStorage::now_millis();
+        for &message_id in &inserted_ids {
+            crate::storage::schema::register_embedding_hole_for_new_message_in_tx(
+                tx,
+                message_id,
+                now_ms,
+                "new_message",
+            )?;
+        }
+        crate::storage::schema::demote_active_generation_readiness_in_tx(tx)?;
     }
 
     Ok(inserted_ids)
@@ -12201,6 +12336,30 @@ pub(crate) fn franken_replace_conversation_messages_in_tx(
         tail_last_idx,
         tail_last_created_at,
     )?;
+
+    // w3-3 Step 3 (R2-W3-B4, advisor ruling B类: this primitive is the
+    // future canonical `cass mirror-restore --apply` write path -- the
+    // invalidation belongs at the transaction site itself, not deferred to
+    // whichever orchestration eventually calls it): `deleted_message_count`
+    // rows just had their `message_embeddings`/`embedding_holes` rows
+    // cascade-removed by the `DELETE FROM messages` above (nothing to do
+    // for that half explicitly); `inserted_message_ids` are brand new ids
+    // with no embedding yet, each needs a hole registered. Either
+    // direction alone already broke any 'passed' certification the active
+    // generation held for this conversation, so demote unconditionally
+    // whenever this function did anything at all.
+    if deleted_message_count > 0 || !inserted_message_ids.is_empty() {
+        let now_ms = FrankenStorage::now_millis();
+        for &message_id in &inserted_message_ids {
+            crate::storage::schema::register_embedding_hole_for_new_message_in_tx(
+                tx,
+                message_id,
+                now_ms,
+                "replaced_conversation",
+            )?;
+        }
+        crate::storage::schema::demote_active_generation_readiness_in_tx(tx)?;
+    }
 
     Ok(ReplaceConversationMessagesOutcome {
         inserted_message_ids,
@@ -25235,6 +25394,196 @@ mod tests {
         );
     }
 
+    /// R1-W3-N5 regression: a v4+ database that lost the three W3
+    /// DB-vector-domain tables (`embedding_generations`/`message_
+    /// embeddings`/`embedding_holes`, `V4_VECTOR_DOMAIN_DDL` in
+    /// `src/storage/schema.rs`) to incomplete restore / derived-index
+    /// corruption had no probe here at all before this fix -- the
+    /// self-heal pass above (which already catches the analogous gap for
+    /// the analytics tables) was blind to this one. Same shape as
+    /// `franken_storage_open_repairs_missing_analytics_tables_when_
+    /// version_markers_lie` above: drop the tables, lie that the schema
+    /// version is already current, and confirm a fresh `open()` still
+    /// recreates them.
+    #[test]
+    fn franken_storage_open_repairs_missing_vector_domain_tables_when_version_markers_lie() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test_repair_missing_vector_domain.db");
+
+        {
+            let storage = FrankenStorage::open(&db_path).unwrap();
+            assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+        }
+
+        {
+            let conn = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().into_owned())), crate::storage::api::Profile::Production).unwrap();
+            for table in &["embedding_holes", "message_embeddings", "embedding_generations"] {
+                conn.execute(&format!("DROP TABLE IF EXISTS {table}"), &[])
+                    .unwrap();
+            }
+            conn.execute(
+                "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+                &[ParamValue::from(CURRENT_SCHEMA_VERSION.to_string())],
+            )
+            .unwrap();
+        }
+
+        let repaired = FrankenStorage::open(&db_path).unwrap();
+        assert_eq!(repaired.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+
+        let vector_domain_table_count: i64 = repaired
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='table'
+                   AND name IN (
+                     'embedding_generations',
+                     'message_embeddings',
+                     'embedding_holes'
+                   )",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            vector_domain_table_count, 3,
+            "open() should recreate all three missing vector-domain tables even when schema_version already says current"
+        );
+
+        // Not just present -- actually usable: this is the production
+        // write path the moment a new generation is created.
+        let gen_a = repaired
+            .raw()
+            .with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
+                crate::storage::schema::create_embedding_generation(tx, "bge-m3", 1024, 1, 1_000)
+            })
+            .expect("the repaired embedding_generations table must accept a real write");
+
+        // R2-N1: the repair batch's own `idx_embedding_generations_single_active`
+        // unique partial index -- previously missing entirely (silently
+        // drifted from `V4_VECTOR_DOMAIN_DDL`, the fresh-build DDL this
+        // repair batch claims to mirror byte-for-byte). A real single-writer
+        // guard, not just a name check: the second `is_active=1` write below
+        // must be rejected at the DB level.
+        let index_exists: i64 = repaired
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_embedding_generations_single_active'",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            index_exists, 1,
+            "the repair batch must recreate idx_embedding_generations_single_active, not just the three tables"
+        );
+
+        repaired
+            .raw()
+            .execute("UPDATE embedding_generations SET is_active = 1 WHERE id = ?1", &[ParamValue::from(gen_a)])
+            .expect("activating the first generation must succeed");
+        let gen_b = repaired
+            .raw()
+            .with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
+                crate::storage::schema::create_embedding_generation(tx, "bge-m3-v2", 1024, 1, 2_000)
+            })
+            .unwrap();
+        let second_active_result = repaired
+            .raw()
+            .execute("UPDATE embedding_generations SET is_active = 1 WHERE id = ?1", &[ParamValue::from(gen_b)]);
+        assert!(
+            second_active_result.is_err(),
+            "a second is_active=1 row must be rejected by the repaired index, not silently accepted"
+        );
+    }
+
+    /// R3-5: the test above proves the vector_domain repair *batch* now
+    /// recreates `idx_embedding_generations_single_active`, but that batch
+    /// only ever runs when `REQUIRED_CURRENT_SCHEMA_TABLE_PROBES` sees one
+    /// of its three *tables* missing. If only the index itself is lost
+    /// (surviving corruption/restore shape distinct from a whole-table
+    /// drop) while all three tables stay intact, that probe never fires,
+    /// and the missing-index case would be invisible to this self-heal
+    /// pass entirely -- no DB-level guard against two `is_active=1` rows,
+    /// with `sqlite_master` otherwise looking completely normal. Proves
+    /// `repair_missing_single_active_generation_index`'s unconditional
+    /// `CREATE UNIQUE INDEX IF NOT EXISTS` closes exactly that gap: drop
+    /// only the index, leave the three tables untouched, reopen, and
+    /// confirm both presence and real enforcement.
+    #[test]
+    fn franken_storage_open_repairs_missing_single_active_index_when_only_the_index_is_lost() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test_repair_missing_single_active_index.db");
+
+        {
+            let storage = FrankenStorage::open(&db_path).unwrap();
+            assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+        }
+
+        {
+            let conn = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().into_owned())), crate::storage::api::Profile::Production).unwrap();
+            conn.execute("DROP INDEX IF EXISTS idx_embedding_generations_single_active", &[])
+                .unwrap();
+            let index_gone: i64 = conn
+                .query_row_map(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_embedding_generations_single_active'",
+                    &[],
+                    |row| row.get_typed(0),
+                )
+                .unwrap();
+            assert_eq!(index_gone, 0, "sanity: the index must actually be gone before reopening");
+            let table_count: i64 = conn
+                .query_row_map(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' \
+                     AND name IN ('embedding_generations', 'message_embeddings', 'embedding_holes')",
+                    &[],
+                    |row| row.get_typed(0),
+                )
+                .unwrap();
+            assert_eq!(table_count, 3, "sanity: all three vector-domain tables must survive untouched");
+        }
+
+        let repaired = FrankenStorage::open(&db_path).unwrap();
+
+        let index_exists: i64 = repaired
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_embedding_generations_single_active'",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            index_exists, 1,
+            "reopening must recreate the index even though no vector-domain table was ever missing"
+        );
+
+        // Real enforcement, not just a name check.
+        let gen_a = repaired
+            .raw()
+            .with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
+                crate::storage::schema::create_embedding_generation(tx, "bge-m3", 1024, 1, 1_000)
+            })
+            .unwrap();
+        repaired
+            .raw()
+            .execute("UPDATE embedding_generations SET is_active = 1 WHERE id = ?1", &[ParamValue::from(gen_a)])
+            .expect("activating the first generation must succeed");
+        let gen_b = repaired
+            .raw()
+            .with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
+                crate::storage::schema::create_embedding_generation(tx, "bge-m3-v2", 1024, 1, 2_000)
+            })
+            .unwrap();
+        let second_active_result = repaired
+            .raw()
+            .execute("UPDATE embedding_generations SET is_active = 1 WHERE id = ?1", &[ParamValue::from(gen_b)]);
+        assert!(
+            second_active_result.is_err(),
+            "the reopened, re-repaired index must reject a second is_active=1 row, not silently accept it"
+        );
+    }
+
     /// w2 F4 regression: a version-2 database that lost `lex_docs`/`fts_lex`
     /// (incomplete restore / derived-index corruption -- not the version
     /// 1 -> 2 migration case, which is covered elsewhere) must be
@@ -27687,5 +28036,166 @@ mod e5_replace_tests {
             "分辨力断言：文本探针必须在这份含 NUL 的样本上**丢字节**（{text_len} < {bin_len}）；\
              若两者相等，说明这份样本压根没触发截断，本条旁证不成立"
         );
+    }
+
+    // =====================================================================
+    // w3-3 Step 3/4 (R2-W3-B4/R4-B5, spec 门③): replace 事务的向量域失效接线
+    // + 回滚原子性（w3-d9②）。复用本模块既有的 seed_original/replacement/
+    // open_storage 夹具——replace 生产侧目前唯一的真实调用面就是这个模块自己
+    // 的测试（w3-3 Step3 写入口清单已核实：B类零生产调用点，advisor 裁定失效
+    // 仍须接在原语内部）。
+    // =====================================================================
+
+    fn active_generation_audit_status(storage: &FrankenStorage) -> String {
+        storage
+            .raw()
+            .query_row_map(
+                "SELECT audit_status FROM embedding_generations WHERE is_active = 1",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap()
+    }
+
+    fn embedding_row_count(storage: &FrankenStorage, generation_id: i64) -> i64 {
+        storage
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM message_embeddings WHERE generation_id = ?1",
+                fparams![generation_id],
+                |row| row.get_typed(0),
+            )
+            .unwrap()
+    }
+
+    fn hole_doc_ids(storage: &FrankenStorage, generation_id: i64) -> Vec<i64> {
+        let mut ids: Vec<i64> = storage
+            .raw()
+            .query_all_map(
+                "SELECT doc_id FROM embedding_holes WHERE generation_id = ?1",
+                fparams![generation_id],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Creates an active, `audit_status = 'passed'` generation (dim=4) and
+    /// seeds one embedding row per message currently in `conv_id`, so the
+    /// replace below has real "old嵌入" to clear, not an empty domain.
+    fn seed_active_passed_generation_with_embeddings_for(storage: &FrankenStorage, conv_id: i64) -> i64 {
+        let message_ids: Vec<i64> = storage
+            .raw()
+            .query_all_map(
+                "SELECT id FROM messages WHERE conversation_id = ?1 ORDER BY idx",
+                fparams![conv_id],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        let tx = storage.raw().transaction().unwrap();
+        let gen_id = crate::storage::schema::create_embedding_generation(&tx, "bge-m3", 4, 1, TS).unwrap();
+        for message_id in &message_ids {
+            crate::storage::schema::insert_message_embedding(
+                &tx,
+                gen_id,
+                *message_id,
+                conv_id,
+                &[1.0, 0.0, 0.0, 0.0],
+                &format!("seed-hash-{message_id}"),
+                None,
+                TS,
+            )
+            .unwrap();
+        }
+        tx.execute(
+            "UPDATE embedding_generations SET is_active = 1, audit_status = 'passed' WHERE id = ?1",
+            fparams![gen_id],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        gen_id
+    }
+
+    #[test]
+    #[serial]
+    fn w3_3_replace_clears_old_embeddings_registers_holes_and_demotes_readiness_in_the_same_transaction() {
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open_storage(&dir);
+        let conv_id = seed_original(&storage, agent_id, "w3-3-replace-lifecycle");
+        let gen_id = seed_active_passed_generation_with_embeddings_for(&storage, conv_id);
+        assert_eq!(embedding_row_count(&storage, gen_id), 3, "前置：三条旧消息各自有一行旧嵌入");
+        assert_eq!(active_generation_audit_status(&storage), "passed", "前置：代际起始为 passed");
+
+        let new_conv = replacement("w3-3-replace-lifecycle");
+        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+        let tx = storage.raw().transaction().unwrap();
+        let outcome =
+            franken_replace_conversation_messages_in_tx(&tx, conv_id, agent_id, None, &new_conv, &pricing).unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(outcome.deleted_message_count, 3, "sanity: replace 删掉了三条旧消息");
+        assert_eq!(outcome.inserted_message_ids.len(), 2, "sanity: replace 插入了两条新消息");
+
+        // 旧嵌入清除：CASCADE 应把三条旧行全部带走，代际里现在应该零行
+        // （新消息还没真实嵌入，只应该有洞账，不应该有嵌入行）。
+        assert_eq!(embedding_row_count(&storage, gen_id), 0, "旧嵌入必须被同事务清除（CASCADE）");
+
+        // 洞账：精确等于两条新消息的 id 集合，不多不少。
+        let mut expected_holes = outcome.inserted_message_ids.clone();
+        expected_holes.sort_unstable();
+        assert_eq!(
+            hole_doc_ids(&storage, gen_id),
+            expected_holes,
+            "洞账必须精确等于本次 replace 新插入的消息 id 集合"
+        );
+
+        // 代际就绪失效：曾经 passed 的代际必须被打回 pending。
+        assert_eq!(active_generation_audit_status(&storage), "pending", "代际就绪必须在同事务内失效");
+    }
+
+    /// w3-d9②：关系事务在失效语句之后回滚，断言 embedding 行/ready 标志/
+    /// 洞账三者全部恢复原态——不是"回滚了大部分"，是恰好一行都不多不少。
+    #[test]
+    #[serial]
+    fn w3_3_replace_rollback_restores_embeddings_ready_flag_and_holes_to_their_original_state() {
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open_storage(&dir);
+        let conv_id = seed_original(&storage, agent_id, "w3-3-replace-rollback");
+        let gen_id = seed_active_passed_generation_with_embeddings_for(&storage, conv_id);
+        assert_eq!(embedding_row_count(&storage, gen_id), 3);
+        assert!(hole_doc_ids(&storage, gen_id).is_empty(), "前置：起始无洞账");
+        assert_eq!(active_generation_audit_status(&storage), "passed");
+
+        let new_conv = replacement("w3-3-replace-rollback");
+        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+        let tx = storage.raw().transaction().unwrap();
+        let outcome =
+            franken_replace_conversation_messages_in_tx(&tx, conv_id, agent_id, None, &new_conv, &pricing).unwrap();
+        // 同一事务内可见：证明失效语句确实跑过，不是下面的断言在验证一个空转的 no-op。
+        let in_tx_holes: i64 = tx
+            .query_row_map(
+                "SELECT COUNT(*) FROM embedding_holes WHERE generation_id = ?1",
+                fparams![gen_id],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(in_tx_holes, outcome.inserted_message_ids.len() as i64, "事务内应看得到新登记的洞账");
+        let in_tx_embeddings: i64 = tx
+            .query_row_map(
+                "SELECT COUNT(*) FROM message_embeddings WHERE generation_id = ?1",
+                fparams![gen_id],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(in_tx_embeddings, 0, "事务内旧嵌入应已被清空");
+
+        // 模拟"失效语句之后崩溃"：不 commit，直接回滚。
+        tx.rollback().unwrap();
+
+        // 三者必须**全部**恢复原态，不是部分恢复。
+        assert_eq!(embedding_row_count(&storage, gen_id), 3, "回滚后旧嵌入必须原样恢复");
+        assert!(hole_doc_ids(&storage, gen_id).is_empty(), "回滚后洞账必须恢复成空（新登记的两条必须消失）");
+        assert_eq!(active_generation_audit_status(&storage), "passed", "回滚后代际就绪状态必须恢复成 passed");
     }
 }

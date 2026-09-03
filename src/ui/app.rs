@@ -15236,6 +15236,19 @@ pub trait SearchService: Send + Sync {
     fn execute(&self, params: &SearchParams) -> Result<SearchResult, String>;
 }
 
+/// W3-5 debt note: `Upgrade` was the second phase of the progressive
+/// two-tier refinement flow (fast `Interactive` results, then a background
+/// `Upgrade` pass with quality-tier scores). That refinement machinery was
+/// retired (`run_live_search_stream` now always runs a single synchronous
+/// search), so `Upgrade` is no longer reachable through the normal
+/// interactive search flow -- it's still referenced by status text
+/// ("Refining…") and pagination's shared page-size branch
+/// (`Upgrade | Pagination`), and by tests that construct it directly.
+/// Not deleted here: doing so cleanly would mean re-deriving which of
+/// those remaining call sites still make sense with only two passes,
+/// which is a state-machine-shape decision, not a mechanical retirement
+/// one. If you're reading this because `Upgrade` looked unreachable and
+/// confusing -- that's why; it's tracked debt, not a bug.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchPass {
     Interactive,
@@ -15381,6 +15394,20 @@ impl TantivySearchService {
         Self::request_is_progressive_eligible(params, self.live_runtime.is_some())
     }
 
+    /// W3-5: the progressive two-tier refinement path (fast in-process
+    /// results immediately, refined via daemon/quality-tier embeddings
+    /// shortly after) was retired alongside `search_progressive_with_callback`
+    /// and the two-tier machinery it depended on -- the quality tier never
+    /// had production data (hnsw=null, per wave-1 attestation) and the new
+    /// DB-vector-domain engine's exact scan is <2s at 101.6万 scale (KU2),
+    /// removing the speed/accuracy tradeoff motive "fast then refined"
+    /// existed for. This always runs a single synchronous search now; the
+    /// eligibility/runtime plumbing above (`progressive_enabled`,
+    /// `request_is_progressive_eligible`, `request_eligible_for_progressive`,
+    /// `live_runtime`) is kept as-is since it still gates whether
+    /// `CassMsg::SearchRequested` routes through the async subscription
+    /// path or dispatches inline -- either path lands here and returns the
+    /// same single-pass result.
     fn run_live_search_stream(
         &self,
         params: SearchParams,
@@ -15388,137 +15415,28 @@ impl TantivySearchService {
         sender: std::sync::mpsc::Sender<CassMsg>,
         stop: StopSignal,
     ) {
-        if !self.request_eligible_for_progressive(&params)
-            || !self.client.can_progressively_refine()
-        {
-            let message = match self.execute(&params) {
-                Ok(result) => CassMsg::SearchCompleted {
-                    generation,
-                    pass: params.pass,
-                    requested_limit: params.limit,
-                    hits: result.hits,
-                    elapsed_ms: result.elapsed_ms,
-                    suggestions: result.suggestions,
-                    wildcard_fallback: result.wildcard_fallback,
-                    append: matches!(params.pass, SearchPass::Pagination),
-                },
-                Err(error) => CassMsg::SearchFailed { generation, error },
-            };
-            let _ = sender.send(message);
-            let _ = sender.send(CassMsg::SearchStreamFinished { generation });
-            return;
-        }
-
-        let Some(runtime) = self.live_runtime.clone() else {
-            let message = match self.execute(&params) {
-                Ok(result) => CassMsg::SearchCompleted {
-                    generation,
-                    pass: params.pass,
-                    requested_limit: params.limit,
-                    hits: result.hits,
-                    elapsed_ms: result.elapsed_ms,
-                    suggestions: result.suggestions,
-                    wildcard_fallback: result.wildcard_fallback,
-                    append: matches!(params.pass, SearchPass::Pagination),
-                },
-                Err(error) => CassMsg::SearchFailed { generation, error },
-            };
-            let _ = sender.send(message);
-            let _ = sender.send(CassMsg::SearchStreamFinished { generation });
-            return;
-        };
-
-        let cx = frankensearch::Cx::for_request();
-        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let cancel_done = Arc::clone(&done);
-        let cancel_stop = stop.clone();
-        let cancel_cx = cx.clone();
-        let cancel_thread = std::thread::spawn(move || {
-            while !cancel_done.load(std::sync::atomic::Ordering::Acquire) {
-                if cancel_stop.wait_timeout(Duration::from_millis(4)) {
-                    cancel_cx.set_cancel_requested(true);
-                    break;
-                }
-            }
-        });
-
-        let client = Arc::clone(&self.client);
-        let phase_sender = sender.clone();
-        let phase_stop = stop.clone();
-        let live_result = runtime.block_on(async move {
-            client
-                .search_progressive_with_callback(
-                    crate::search::query::ProgressiveSearchRequest {
-                        cx: &cx,
-                        query: &params.query,
-                        filters: params.filters.clone(),
-                        limit: params.limit,
-                        sparse_threshold: 0,
-                        field_mask: crate::search::query::FieldMask::new(false, true, true, true),
-                        mode: params.mode,
-                    },
-                    |event| {
-                        if phase_stop.is_stopped() {
-                            return;
-                        }
-                        let message = match event {
-                            crate::search::query::ProgressiveSearchEvent::Phase {
-                                kind,
-                                result,
-                                elapsed_ms,
-                            } => CassMsg::SearchCompleted {
-                                generation,
-                                pass: match kind {
-                                    crate::search::query::ProgressivePhaseKind::Initial => {
-                                        SearchPass::Interactive
-                                    }
-                                    crate::search::query::ProgressivePhaseKind::Refined => {
-                                        SearchPass::Upgrade
-                                    }
-                                },
-                                requested_limit: params.limit,
-                                hits: result.hits,
-                                elapsed_ms,
-                                suggestions: result.suggestions,
-                                wildcard_fallback: result.wildcard_fallback,
-                                append: false,
-                            },
-                            crate::search::query::ProgressiveSearchEvent::RefinementFailed {
-                                latency_ms,
-                                error,
-                            } => CassMsg::SearchRefinementFailed {
-                                generation,
-                                latency_ms,
-                                error,
-                            },
-                        };
-                        let _ = phase_sender.send(message);
-                    },
-                )
-                .await
-        });
-
-        done.store(true, std::sync::atomic::Ordering::Release);
-        let _ = cancel_thread.join();
-
-        if let Err(err) = live_result
-            && !stop.is_stopped()
-        {
-            let _ = sender.send(CassMsg::SearchFailed {
+        let _ = stop;
+        let message = match self.execute(&params) {
+            Ok(result) => CassMsg::SearchCompleted {
                 generation,
-                error: err.to_string(),
-            });
-        }
-
+                pass: params.pass,
+                requested_limit: params.limit,
+                hits: result.hits,
+                elapsed_ms: result.elapsed_ms,
+                suggestions: result.suggestions,
+                wildcard_fallback: result.wildcard_fallback,
+                append: matches!(params.pass, SearchPass::Pagination),
+            },
+            Err(error) => CassMsg::SearchFailed { generation, error },
+        };
+        let _ = sender.send(message);
         let _ = sender.send(CassMsg::SearchStreamFinished { generation });
     }
 }
 
 impl SearchService for TantivySearchService {
     fn execute(&self, params: &SearchParams) -> Result<SearchResult, String> {
-        use crate::search::query::{
-            FieldMask, SearchResult as BackendSearchResult, SemanticTierMode,
-        };
+        use crate::search::query::{FieldMask, SearchResult as BackendSearchResult};
 
         let started = Instant::now();
         let limit = params.limit;
@@ -15528,15 +15446,6 @@ impl SearchService for TantivySearchService {
             FieldMask::new(false, true, true, true)
         } else {
             FieldMask::new(true, true, true, true)
-        };
-        let two_tier_enabled = Self::progressive_enabled();
-        let semantic_tier_mode = if two_tier_enabled {
-            match params.pass {
-                SearchPass::Interactive => SemanticTierMode::FastOnly,
-                SearchPass::Upgrade | SearchPass::Pagination => SemanticTierMode::Progressive,
-            }
-        } else {
-            SemanticTierMode::Single
         };
 
         // Fix #79: Empty queries bypass BM25 and use date-sorted browsing.
@@ -15579,30 +15488,21 @@ impl SearchService for TantivySearchService {
                     )
                     .map_err(|e| e.to_string()),
                 SearchMode::Semantic => {
-                    let (hits, ann_stats) = self
+                    let hits = self
                         .client
-                        .search_semantic_with_tier(
-                            &params.query,
-                            params.filters.clone(),
-                            limit,
-                            offset,
-                            field_mask,
-                            false,
-                            semantic_tier_mode,
-                        )
+                        .search_semantic(&params.query, params.filters.clone(), limit, offset, field_mask)
                         .map_err(|e| e.to_string())?;
                     Ok(crate::search::query::SearchResult {
                         hits,
                         wildcard_fallback: false,
                         cache_stats: crate::search::query::CacheStats::default(),
                         suggestions: Vec::new(),
-                        ann_stats,
                         total_count: None,
                     })
                 }
                 SearchMode::Hybrid => self
                     .client
-                    .search_hybrid_with_tier(
+                    .search_hybrid(
                         &params.query,
                         &params.query,
                         params.filters.clone(),
@@ -15610,8 +15510,6 @@ impl SearchService for TantivySearchService {
                         offset,
                         sparse_threshold,
                         field_mask,
-                        false,
-                        semantic_tier_mode,
                     )
                     .map_err(|e| e.to_string()),
             }
@@ -19532,7 +19430,6 @@ impl super::ftui_adapter::Model for CassApp {
                             db_path,
                             data_dir,
                             semantic: false,
-                            build_hnsw: false,
                             embedder: "fastembed".to_string(),
                             progress: Some(progress),
                             watch_interval_secs: 30,
@@ -23316,22 +23213,9 @@ pub fn run_tui_ftui(
                 model.semantic_availability = setup.availability.clone();
 
                 if let Some(context) = setup.context {
-                    let ann_path = Some(
-                        data_dir
-                            .join(crate::search::vector_index::VECTOR_INDEX_DIR)
-                            .join(format!("hnsw-{}.chsw", context.embedder.id())),
-                    );
-                    let mut indexes =
-                        Vec::with_capacity(context.additional_indexes.len().saturating_add(1));
-                    indexes.push(context.index);
-                    indexes.extend(context.additional_indexes);
-                    if let Err(err) = client.set_semantic_indexes_context(
-                        context.embedder,
-                        indexes,
-                        context.filter_maps,
-                        context.roles,
-                        ann_path,
-                    ) {
+                    if let Err(err) =
+                        client.set_semantic_context(context.embedder, context.roles)
+                    {
                         tracing::debug!(error = %err, "tui semantic context unavailable");
                         let _ = client.clear_semantic_context();
                     }
@@ -27863,6 +27747,86 @@ mod tests {
         assert!(!TantivySearchService::request_is_progressive_eligible(
             &paged, false
         ));
+    }
+
+    /// W3-5 ⓪ (task book #65): positive-path coverage for
+    /// `TantivySearchService::execute()`, the method `run_live_search_stream`
+    /// collapsed onto as its sole real call after the progressive/two-tier
+    /// machinery was retired (3f7aa054). This is the deepest reachable real
+    /// assertion: `run_live_search_stream` itself additionally requires a
+    /// `StopSignal`, but `ftui_runtime::subscription::StopSignal::new()` is
+    /// `pub(crate)` to the `ftui-runtime` crate -- cass has no public
+    /// constructor for one, and driving it would mean either reaching into
+    /// a foreign crate's private API (not our call to make) or standing up
+    /// a full ftui `Subscription`-dispatching runtime harness (a much
+    /// larger undertaking than this decommission task). `execute()` is the
+    /// entire synchronous search body `run_live_search_stream` now wraps,
+    /// so exercising it here with a real `SearchClient` over a real
+    /// `persist_conversation`-built fixture (SQLite + Tantivy, same
+    /// production path `tests/role_filter.rs` uses) verifies "the collapsed
+    /// TUI search path still finds results" without needing that
+    /// unreachable `StopSignal` layer.
+    #[test]
+    fn tantivy_search_service_execute_finds_persisted_message() {
+        use crate::connectors::{NormalizedConversation, NormalizedMessage};
+        use crate::indexer::persist::persist_conversation;
+        use crate::search::query::SearchClient;
+        use serde_json::json;
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = dir.path();
+        let db_path = data_dir.join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).expect("open storage");
+
+        let unique_token = "tantivyexecutefixturemarkerz4q8";
+        let normalized = NormalizedConversation {
+            agent_slug: "tester".into(),
+            external_id: Some("tantivy-execute-fixture".into()),
+            title: Some("tantivy execute fixture".into()),
+            workspace: None,
+            source_path: data_dir.join("tantivy-execute-fixture.jsonl"),
+            started_at: Some(4000),
+            ended_at: Some(4001),
+            metadata: json!({}),
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "user".into(),
+                author: Some("user".into()),
+                created_at: Some(4000),
+                content: format!(
+                    "Investigate why the {unique_token} search regression appeared."
+                ),
+                extra: json!({}),
+                snippets: vec![],
+                invocations: Vec::new(),
+            }],
+        };
+        persist_conversation(&storage, &normalized).expect("persist fixture conversation");
+
+        let client = Arc::new(
+            SearchClient::open(data_dir, Some(&db_path))
+                .expect("open search client")
+                .expect("search client should be available for a freshly indexed dir"),
+        );
+        let service = TantivySearchService::new(Arc::clone(&client));
+
+        let params = SearchParams {
+            query: unique_token.to_string(),
+            filters: SearchFilters::default(),
+            pass: SearchPass::Interactive,
+            mode: SearchMode::Lexical,
+            match_mode: MatchMode::Standard,
+            ranking: RankingMode::Balanced,
+            context_window: ContextWindow::Medium,
+            limit: 16,
+            offset: 0,
+        };
+
+        let result = service.execute(&params).expect("execute should succeed");
+        assert!(
+            !result.hits.is_empty(),
+            "execute() should recall the persisted fixture message for its unique token"
+        );
     }
 
     #[test]

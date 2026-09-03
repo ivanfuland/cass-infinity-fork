@@ -42,13 +42,8 @@
 
 use coding_agent_search::connectors::{ScanContext, ScanRoot, preflight_codex_explicit_file_roots};
 use coding_agent_search::indexer::redact_secrets::redact_text;
-use coding_agent_search::indexer::semantic::{
-    EmbeddingInput, SemanticIndexer, SemanticShardBuildPlan,
-};
 use coding_agent_search::indexer::{IndexOptions, get_connector_factories, run_index};
-use coding_agent_search::search::semantic_manifest::{SemanticShardManifest, TierKind};
 use coding_agent_search::indexer::index_dir;
-use coding_agent_search::search::vector_index::{VectorIndex as FsVectorIndex, vector_index_path};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::fs;
 use std::io::Write;
@@ -102,7 +97,6 @@ fn bench_index_full(c: &mut Criterion) {
         db_path,
         data_dir: data_dir.clone(),
         semantic: false,
-        build_hnsw: false,
         embedder: "fastembed".to_string(),
         progress: None,
         watch_interval_secs: 30,
@@ -168,7 +162,6 @@ fn bench_streaming_vs_batch(c: &mut Criterion) {
             db_path: db_path.clone(),
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
@@ -235,7 +228,6 @@ fn bench_channel_overhead(c: &mut Criterion) {
         db_path,
         data_dir: data_dir.clone(),
         semantic: false,
-        build_hnsw: false,
         embedder: "fastembed".to_string(),
         progress: None,
         watch_interval_secs: 30,
@@ -322,333 +314,6 @@ fn bench_codex_scan_preflight(c: &mut Criterion) {
     group.finish();
 }
 
-/// Build a representative semantic-embedding input corpus. Mixes short,
-/// long, markdown, and code-block inputs so the canonicalizer is exercised
-/// across all of its branches.
-fn build_semantic_corpus(count: usize) -> Vec<EmbeddingInput> {
-    (0..count)
-        .map(|i| {
-            let content = match i % 7 {
-                0 => format!("Plain message number {i} with some ordinary words to embed."),
-                1 => format!("**Bold** and _italic_ markdown line {i}"),
-                2 => format!(
-                    "```rust\nfn example_{i}() {{\n    println!(\"code block {i}\");\n}}\n```\nfollow-up text"
-                ),
-                3 => format!("short line {i}"),
-                4 => format!("   whitespace   galore   {i}   "),
-                5 => format!(
-                    "Unicode \u{00E9}\u{0301} (combining accent) and emoji \u{1F600} line {i}"
-                ),
-                _ => format!(
-                    "Mixed line {i}: `inline_code`, [link](http://x), {{braces}}, \u{201C}curly quotes\u{201D}, \
-                     and a moderately long tail so the canonicalizer has something to truncate when it hits \
-                     its default cap of 2000 characters, well not really at this length but on longer inputs."
-                ),
-            };
-            EmbeddingInput::new(i as u64, content)
-        })
-        .collect()
-}
-
-/// Benchmark the semantic embedding prep + embed loop.
-///
-/// Sweeps `CASS_SEMANTIC_BATCH_SIZE` across 32/128/256 and
-/// `CASS_SEMANTIC_PREP_PARALLEL` on/off so we can measure the impact of the
-/// parallel canonicalize+hash prep (perf refactor introduced with the
-/// responsiveness governor work) against the legacy serial prep. Uses the
-/// hash embedder so the benchmark stays fast, deterministic, and dependency-
-/// free (no ONNX model download).
-fn bench_semantic_embedding(c: &mut Criterion) {
-    let mut group = c.benchmark_group("semantic_embedding");
-    group.sample_size(20);
-    let messages = build_semantic_corpus(2_000);
-
-    for &batch_size in &[32usize, 128, 256] {
-        for &serial_label in &["parallel", "serial"] {
-            let id = format!("batch{batch_size}_{serial_label}");
-            // SAFETY: Criterion runs benchmarks single-threaded per fn so
-            // env mutation is safe within this closure. We reset at the end.
-            unsafe {
-                std::env::set_var("CASS_SEMANTIC_BATCH_SIZE", batch_size.to_string());
-                std::env::set_var(
-                    "CASS_SEMANTIC_PREP_PARALLEL",
-                    if serial_label == "serial" { "0" } else { "1" },
-                );
-            }
-            // Build a fresh indexer per configuration so it picks up the env.
-            let indexer = SemanticIndexer::new("hash", None).unwrap();
-            group.bench_with_input(BenchmarkId::new("embed_messages", id), &(), |b, _| {
-                b.iter(|| {
-                    let out = indexer.embed_messages(&messages).unwrap();
-                    std::hint::black_box(out);
-                });
-            });
-        }
-    }
-
-    // Reset env so downstream benches are not polluted.
-    // SAFETY: single-threaded cleanup outside any iter loop.
-    unsafe {
-        std::env::remove_var("CASS_SEMANTIC_BATCH_SIZE");
-        std::env::remove_var("CASS_SEMANTIC_PREP_PARALLEL");
-    }
-    group.finish();
-}
-
-/// Benchmark the prototype sharded semantic writer against the existing
-/// monolithic FSVI writer. The corpus uses the hash embedder so this isolates
-/// file publishing, per-shard manifest cost, and optional shard-local ANN build
-/// without depending on model downloads.
-fn bench_semantic_shard_generation(c: &mut Criterion) {
-    let mut group = c.benchmark_group("semantic_shard_generation");
-    group.sample_size(10);
-    let indexer = SemanticIndexer::new("hash", None).unwrap();
-    let messages = build_semantic_corpus(128);
-    let embeddings = indexer.embed_messages(&messages).unwrap();
-
-    group.bench_function("monolithic_fsvi_build", |b| {
-        b.iter(|| {
-            let tmp = TempDir::new().unwrap();
-            let index = indexer
-                .build_and_save_index(embeddings.clone(), tmp.path())
-                .unwrap();
-            std::hint::black_box(index.record_count());
-        });
-    });
-
-    group.bench_function("sharded_fsvi_build_32", |b| {
-        b.iter(|| {
-            let tmp = TempDir::new().unwrap();
-            let outcome = indexer
-                .build_and_save_index_shards(
-                    embeddings.clone(),
-                    tmp.path(),
-                    SemanticShardBuildPlan {
-                        tier: TierKind::Fast,
-                        db_fingerprint: "bench-db-fp".to_string(),
-                        model_revision: "hash".to_string(),
-                        total_conversations: 128,
-                        max_records_per_shard: 32,
-                        build_ann: false,
-                    },
-                )
-                .unwrap();
-            std::hint::black_box(outcome.shard_count);
-        });
-    });
-
-    group.bench_function("sharded_fsvi_hnsw_build_32", |b| {
-        b.iter(|| {
-            let tmp = TempDir::new().unwrap();
-            let outcome = indexer
-                .build_and_save_index_shards(
-                    embeddings.clone(),
-                    tmp.path(),
-                    SemanticShardBuildPlan {
-                        tier: TierKind::Fast,
-                        db_fingerprint: "bench-db-fp-ann".to_string(),
-                        model_revision: "hash".to_string(),
-                        total_conversations: 128,
-                        max_records_per_shard: 32,
-                        build_ann: true,
-                    },
-                )
-                .unwrap();
-            std::hint::black_box(outcome.ann_index_paths.len());
-        });
-    });
-
-    let manifest_tmp = TempDir::new().unwrap();
-    indexer
-        .build_and_save_index_shards(
-            embeddings.clone(),
-            manifest_tmp.path(),
-            SemanticShardBuildPlan {
-                tier: TierKind::Fast,
-                db_fingerprint: "bench-db-fp-open".to_string(),
-                model_revision: "hash".to_string(),
-                total_conversations: 128,
-                max_records_per_shard: 32,
-                build_ann: true,
-            },
-        )
-        .unwrap();
-    group.bench_function("shard_manifest_load_summary", |b| {
-        b.iter(|| {
-            let manifest = SemanticShardManifest::load(manifest_tmp.path())
-                .unwrap()
-                .unwrap();
-            let summary =
-                manifest.summary(TierKind::Fast, indexer.embedder_id(), "bench-db-fp-open");
-            std::hint::black_box((summary.ready_shards, summary.ann_ready_shards));
-        });
-    });
-
-    let open_tmp = TempDir::new().unwrap();
-    let monolithic_open_index = indexer
-        .build_and_save_index(embeddings.clone(), open_tmp.path())
-        .unwrap();
-    std::hint::black_box(monolithic_open_index.record_count());
-    drop(monolithic_open_index);
-    let monolithic_open_path = vector_index_path(open_tmp.path(), indexer.embedder_id());
-
-    let sharded_open_outcome = indexer
-        .build_and_save_index_shards(
-            embeddings.clone(),
-            open_tmp.path(),
-            SemanticShardBuildPlan {
-                tier: TierKind::Fast,
-                db_fingerprint: "bench-db-fp-vector-open".to_string(),
-                model_revision: "hash".to_string(),
-                total_conversations: 128,
-                max_records_per_shard: 32,
-                build_ann: false,
-            },
-        )
-        .unwrap();
-    let sharded_open_paths = sharded_open_outcome.index_paths;
-    assert_eq!(sharded_open_paths.len(), 4);
-
-    group.bench_function("monolithic_fsvi_mmap_open_128", |b| {
-        b.iter(|| {
-            let index = FsVectorIndex::open(&monolithic_open_path).unwrap();
-            std::hint::black_box((index.record_count(), index.dimension()));
-        });
-    });
-
-    group.bench_function("sharded_fsvi_mmap_open_all_4x32", |b| {
-        b.iter(|| {
-            let mut records = 0usize;
-            for path in &sharded_open_paths {
-                let index = FsVectorIndex::open(path).unwrap();
-                records = records.saturating_add(index.record_count());
-                std::hint::black_box(index.dimension());
-            }
-            std::hint::black_box(records);
-        });
-    });
-
-    let stability_query = embeddings[42].embedding.clone();
-    let monolithic_search_index = FsVectorIndex::open(&monolithic_open_path).unwrap();
-    let sharded_search_indexes: Vec<_> = sharded_open_paths
-        .iter()
-        .map(|path| FsVectorIndex::open(path).unwrap())
-        .collect();
-    // Fetch every candidate for the stability proof. Per-shard top-k can drop
-    // equal-score records before the global merge sees them, which is exactly
-    // the sort of boundary artifact this benchmark should expose.
-    let monolithic_signature = {
-        let mut hits = monolithic_search_index
-            .search_top_k(
-                &stability_query,
-                monolithic_search_index.record_count(),
-                None,
-            )
-            .unwrap();
-        hits.sort_by(|left, right| {
-            left.cmp_by_score(right)
-                .then_with(|| left.doc_id.cmp(&right.doc_id))
-        });
-        hits.truncate(10);
-        hits.into_iter()
-            .map(|hit| (hit.doc_id, hit.score.to_bits()))
-            .collect::<Vec<_>>()
-    };
-    let sharded_signature = {
-        let mut hits = Vec::new();
-        for index in &sharded_search_indexes {
-            hits.extend(
-                index
-                    .search_top_k(&stability_query, index.record_count(), None)
-                    .unwrap(),
-            );
-        }
-        hits.sort_by(|left, right| {
-            left.cmp_by_score(right)
-                .then_with(|| left.doc_id.cmp(&right.doc_id))
-        });
-        hits.truncate(10);
-        hits.into_iter()
-            .map(|hit| (hit.doc_id, hit.score.to_bits()))
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(monolithic_signature, sharded_signature);
-
-    group.bench_function("monolithic_fsvi_search_top10_128", |b| {
-        b.iter(|| {
-            let hits = monolithic_search_index
-                .search_top_k(&stability_query, 10, None)
-                .unwrap();
-            std::hint::black_box(hits);
-        });
-    });
-
-    group.bench_function("sharded_exact_full_merge_search_top10_4x32", |b| {
-        b.iter(|| {
-            let mut hits = Vec::new();
-            for index in &sharded_search_indexes {
-                hits.extend(
-                    index
-                        .search_top_k(&stability_query, index.record_count(), None)
-                        .unwrap(),
-                );
-            }
-            hits.sort_by(|left, right| {
-                left.cmp_by_score(right)
-                    .then_with(|| left.doc_id.cmp(&right.doc_id))
-            });
-            hits.truncate(10);
-            std::hint::black_box(hits);
-        });
-    });
-
-    group.finish();
-}
-
-/// Larger semantic shard build probe intended for external peak-RSS wrappers
-/// such as `/usr/bin/time -v`. Criterion does not report memory itself, so keep
-/// these rows narrow and filterable: run one row at a time when collecting RSS.
-fn bench_semantic_shard_generation_large(c: &mut Criterion) {
-    let mut group = c.benchmark_group("semantic_shard_generation_large");
-    group.sample_size(10);
-    let indexer = SemanticIndexer::new("hash", None).unwrap();
-    let messages = build_semantic_corpus(4_096);
-    let embeddings = indexer.embed_messages(&messages).unwrap();
-
-    group.bench_function("monolithic_fsvi_build_4096", |b| {
-        b.iter(|| {
-            let tmp = TempDir::new().unwrap();
-            let index = indexer
-                .build_and_save_index(embeddings.clone(), tmp.path())
-                .unwrap();
-            std::hint::black_box(index.record_count());
-        });
-    });
-
-    group.bench_function("sharded_fsvi_build_4096x256", |b| {
-        b.iter(|| {
-            let tmp = TempDir::new().unwrap();
-            let outcome = indexer
-                .build_and_save_index_shards(
-                    embeddings.clone(),
-                    tmp.path(),
-                    SemanticShardBuildPlan {
-                        tier: TierKind::Fast,
-                        db_fingerprint: "bench-db-fp-large-rss".to_string(),
-                        model_revision: "hash".to_string(),
-                        total_conversations: 4_096,
-                        max_records_per_shard: 256,
-                        build_ann: false,
-                    },
-                )
-                .unwrap();
-            std::hint::black_box((outcome.shard_count, outcome.doc_count));
-        });
-    });
-
-    group.finish();
-}
-
 /// Benchmark the full ingest pipeline with and without the parallel
 /// pre-compute of `map_to_internal`. The `CASS_STREAMING_INDEX` toggle
 /// doesn't affect the hoist; both modes exercise it. We compare a
@@ -673,7 +338,6 @@ fn bench_ingest_with_responsiveness(c: &mut Criterion) {
             db_path,
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
@@ -744,7 +408,6 @@ fn bench_card_defaults_ab(c: &mut Criterion) {
             db_path,
             data_dir: data_dir.clone(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
@@ -783,9 +446,6 @@ criterion_group!(
     bench_streaming_vs_batch,
     bench_channel_overhead,
     bench_codex_scan_preflight,
-    bench_semantic_embedding,
-    bench_semantic_shard_generation,
-    bench_semantic_shard_generation_large,
     bench_ingest_with_responsiveness,
     bench_card_defaults_ab,
 );

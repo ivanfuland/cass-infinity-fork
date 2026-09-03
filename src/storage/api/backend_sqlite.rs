@@ -23,12 +23,14 @@ pub(crate) struct SqliteBackend {
 
 impl SqliteBackend {
     pub(crate) fn open_writable(path: &str, profile: Profile) -> Result<Self, StorageError> {
+        super::ensure_vec0_extension_registered();
         let conn = rusqlite::Connection::open(path).map_err(map_sqlite_err)?;
         apply_profile(&conn, profile)?;
         Ok(Self { conn: Some(conn) })
     }
 
     pub(crate) fn open_read_only(path: &str) -> Result<Self, StorageError> {
+        super::ensure_vec0_extension_registered();
         let conn = rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(map_sqlite_err)?;
         apply_profile(&conn, Profile::ReadOnly)?;
@@ -36,6 +38,7 @@ impl SqliteBackend {
     }
 
     pub(crate) fn open_memory() -> Result<Self, StorageError> {
+        super::ensure_vec0_extension_registered();
         let conn = rusqlite::Connection::open_in_memory().map_err(map_sqlite_err)?;
         apply_profile(&conn, Profile::Memory)?;
         Ok(Self { conn: Some(conn) })

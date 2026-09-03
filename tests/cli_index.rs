@@ -77,13 +77,22 @@ fn index_parses_semantic_flags() -> Result<(), String> {
     }
 }
 
+/// R1-W3-N2: `fastembed` requires the `semantic`/ONNX build feature,
+/// retired in this build (W3-5, ORT-free `--features qr,encryption,
+/// infinity`). Defaulting a bare `cass index --semantic` to it meant it
+/// deterministically hit `run_semantic_db_vector_catchup`'s "embedder
+/// fastembed is retired... use --embedder infinity" bail under this
+/// build's actual feature set -- the default itself was the retired
+/// choice. Feature-conditional so a hypothetical build with `semantic`
+/// (not `infinity`) still gets the old default.
 #[test]
-fn index_default_embedder_is_fastembed() -> Result<(), String> {
+fn index_default_embedder_matches_this_builds_working_semantic_path() -> Result<(), String> {
     let cli = parse_cli_ok(["cass", "index", "--semantic"], "parse index flags");
 
+    let expected = if cfg!(feature = "infinity") { "infinity" } else { "fastembed" };
     match cli.command {
         Some(Commands::Index { embedder, .. }) => {
-            assert_eq!(embedder, "fastembed");
+            assert_eq!(embedder, expected);
             Ok(())
         }
         other => Err(format!("expected index command, got {other:?}")),
@@ -322,7 +331,6 @@ fn index_refresh_data_dir_scopes_rebuild_semantic_and_watch_once_controls() -> R
             "--full",
             "--force-rebuild",
             "--semantic",
-            "--build-hnsw",
             "--watch-once",
             "/sessions/one.jsonl,/sessions/two.jsonl",
             "--json",
@@ -336,7 +344,6 @@ fn index_refresh_data_dir_scopes_rebuild_semantic_and_watch_once_controls() -> R
             full: true,
             force_rebuild: true,
             semantic: true,
-            build_hnsw: true,
             watch_once: Some(paths),
             json: true,
             ..

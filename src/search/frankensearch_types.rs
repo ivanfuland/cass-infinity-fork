@@ -1,0 +1,1004 @@
+//! W3-5 verbatim restore of the `frankensearch` core traits/error types this
+//! crate still actively consumes (`SyncEmbed`/`SyncRerank` adapters,
+//! `SearchError`/`SearchResult`, `ModelCategory`/`ModelTier`), now that the
+//! `frankensearch` Cargo dependency itself is retired.
+//!
+//! Source: `frankensearch` git rev `2cad158f4468ece7076e3fe529c8e5c20b2e020e`
+//! (<https://github.com/Dicklesworthstone/frankensearch>).
+//! - `crates/frankensearch-core/src/traits.rs` -- `ModelCategory`, `ModelTier`,
+//!   `SearchFuture`, `Embedder`, `SyncEmbed`, `SyncEmbedderAdapter`,
+//!   `RerankDocument`, `RerankScore`, `Reranker`, `SyncRerank`,
+//!   `SyncRerankerAdapter`, `l2_normalize`, `cosine_similarity`,
+//!   `truncate_embedding` copied verbatim below. `ModelInfo`, `LexicalSearch`,
+//!   `MetricsExporter`, `NoOpMetricsExporter` are dropped: zero consumers in
+//!   this crate (grep-verified 2026-09-02), and porting them would only
+//!   re-introduce dead code the W3-5 decommission is retiring elsewhere.
+//! - `crates/frankensearch-core/src/error.rs` -- `SearchError`, `SearchResult`
+//!   copied verbatim below.
+//!
+//! Each item below is byte-for-byte identical to its upstream source (modulo
+//! this dropped-item trim); do not "improve" it in the same commit that
+//! moves it.
+
+use std::fmt;
+use std::future::Future;
+use std::path::PathBuf;
+use std::pin::Pin;
+
+use asupersync::Cx;
+use serde::{Deserialize, Serialize};
+
+// ============================================================================
+// frankensearch-core/src/error.rs (verbatim)
+// ============================================================================
+
+/// Unified error type covering all failure modes across the frankensearch search pipeline.
+///
+/// Every variant includes an actionable error message guiding the consumer toward resolution.
+/// The `TwoTierSearcher` catches transient errors and degrades gracefully: fast embedding
+/// failures can still yield lexical-only initial results when lexical retrieval is available,
+/// `RerankFailed` skips reranking, and `SearchTimeout` yields initial results.
+/// Only `IndexNotFound` and `InvalidConfig` prevent search from starting.
+#[derive(Debug, thiserror::Error)]
+pub enum SearchError {
+    // === Embedding errors ===
+    /// An embedding model is not available (not compiled in, or model files missing).
+    #[error(
+        "Embedder unavailable: {model} — {reason}. Set FRANKENSEARCH_MODEL_DIR or enable the corresponding feature flag."
+    )]
+    EmbedderUnavailable {
+        /// Identifier of the unavailable model.
+        model: String,
+        /// Why it is unavailable.
+        reason: String,
+    },
+
+    /// Embedding inference failed for a given model.
+    #[error(
+        "Embedding failed for {model}: {source}. Transient error; retry or use lexical fallback when configured."
+    )]
+    EmbeddingFailed {
+        /// Which model failed.
+        model: String,
+        /// The underlying error.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    /// Model files were not found at any searched path.
+    #[error("Model {name} not found. Run download or set FRANKENSEARCH_MODEL_DIR.")]
+    ModelNotFound {
+        /// Model identifier.
+        name: String,
+    },
+
+    /// Model files exist but failed to load (corrupted, incompatible version, etc.).
+    #[error("Failed to load model from {path}: {source}")]
+    ModelLoadFailed {
+        /// Path that was attempted.
+        path: PathBuf,
+        /// The underlying error.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    // === Index errors ===
+    /// The vector index file is corrupted (bad magic, CRC mismatch, truncated).
+    #[error(
+        "Vector index corrupted at {path}: {detail}. Delete and rebuild with index_documents()."
+    )]
+    IndexCorrupted {
+        /// Path to the corrupted file.
+        path: PathBuf,
+        /// Nature of the corruption.
+        detail: String,
+    },
+
+    /// The FSVI file version does not match what this build expects.
+    #[error(
+        "Index version mismatch at index: expected v{expected}, found v{found}. Rebuild the index."
+    )]
+    IndexVersionMismatch {
+        /// The version this library expects.
+        expected: u16,
+        /// The version found in the file.
+        found: u16,
+    },
+
+    /// Query vector dimension does not match the index dimension.
+    #[error(
+        "Dimension mismatch: index has {expected}-dim vectors, query has {found}-dim. Use matching embedder."
+    )]
+    DimensionMismatch {
+        /// Dimension the index was built with.
+        expected: usize,
+        /// Dimension of the query vector.
+        found: usize,
+    },
+
+    /// No vector index file exists at the expected path.
+    #[error(
+        "Vector index not found at {path}. Run index_documents() first, or check FRANKENSEARCH_DATA_DIR."
+    )]
+    IndexNotFound {
+        /// Expected path.
+        path: PathBuf,
+    },
+
+    // === Search errors ===
+    /// The query string could not be parsed.
+    #[error("Query parse error for \"{query}\": {detail}")]
+    QueryParseError {
+        /// The problematic query.
+        query: String,
+        /// What went wrong.
+        detail: String,
+    },
+
+    /// A search phase exceeded its time budget.
+    #[error(
+        "Search timed out after {elapsed_ms}ms (budget: {budget_ms}ms). Increase timeout in TwoTierConfig."
+    )]
+    SearchTimeout {
+        /// How long the operation ran.
+        elapsed_ms: u64,
+        /// The configured budget.
+        budget_ms: u64,
+    },
+
+    /// Federated search did not receive enough successful shard responses.
+    #[error(
+        "Federated search required at least {required} index responses, but only {received} succeeded."
+    )]
+    FederatedInsufficientResponses {
+        /// Minimum responses required by config.
+        required: usize,
+        /// Number of successful shard responses observed.
+        received: usize,
+    },
+
+    // === Reranker errors ===
+    /// The reranking model is not available.
+    #[error(
+        "Reranker unavailable: {model}. Results are valid without reranking; enable 'rerank' feature."
+    )]
+    RerankerUnavailable {
+        /// Model identifier.
+        model: String,
+    },
+
+    /// Reranking inference failed.
+    #[error(
+        "Reranking failed for {model}: {source}. Results still valid with original RRF scores."
+    )]
+    RerankFailed {
+        /// Which reranker model failed.
+        model: String,
+        /// The underlying error.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    // === I/O errors ===
+    /// Wraps `std::io::Error` for file operations.
+    #[error("I/O error: {0}. Check file permissions and disk space.")]
+    Io(#[from] std::io::Error),
+
+    // === Configuration errors ===
+    /// A configuration value is invalid.
+    #[error("Invalid config: {field} = \"{value}\" — {reason}")]
+    InvalidConfig {
+        /// Which config field.
+        field: String,
+        /// The invalid value.
+        value: String,
+        /// Why it is invalid.
+        reason: String,
+    },
+
+    // === Hash verification ===
+    /// Downloaded or loaded file does not match expected hash.
+    #[error("Hash mismatch for {path}: expected {expected}, got {actual}. File may be corrupted.")]
+    HashMismatch {
+        /// Path to the file.
+        path: PathBuf,
+        /// Expected hash (hex string).
+        expected: String,
+        /// Actual computed hash.
+        actual: String,
+    },
+
+    // === Cancellation ===
+    /// Operation was cancelled via the asupersync structured concurrency protocol.
+    #[error("Operation cancelled during {phase}: {reason}")]
+    Cancelled {
+        /// Which phase was active when cancelled.
+        phase: String,
+        /// Cancellation reason.
+        reason: String,
+    },
+
+    // === Queue errors ===
+    /// The embedding job queue is full.
+    #[error(
+        "Embedding queue full ({pending}/{capacity} pending). Apply backpressure or increase capacity."
+    )]
+    QueueFull {
+        /// Number of pending items.
+        pending: usize,
+        /// Queue capacity.
+        capacity: usize,
+    },
+
+    // === Subsystem errors ===
+    /// Wraps errors from optional subsystems (storage, durability, FTS5, etc.).
+    ///
+    /// Always present in the enum regardless of feature flags, avoiding
+    /// match-arm breakage across feature combinations.
+    #[error("{subsystem} error: {source}")]
+    SubsystemError {
+        /// Which subsystem produced the error (e.g., "storage", "durability", "fts5").
+        subsystem: &'static str,
+        /// The underlying error.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    /// A durability/repair feature was requested but is not compiled in.
+    #[error(
+        "Durability feature is not enabled. Enable the 'durability' Cargo feature for self-healing indices."
+    )]
+    DurabilityDisabled,
+}
+
+/// Convenience alias used throughout the frankensearch crate hierarchy.
+pub type SearchResult<T> = Result<T, SearchError>;
+
+// ============================================================================
+// frankensearch-core/src/traits.rs (verbatim, trimmed to consumed items --
+// see module doc comment)
+// ============================================================================
+
+/// Boxed future carrying a `SearchResult<T>`.
+pub type SearchFuture<'a, T> = Pin<Box<dyn Future<Output = SearchResult<T>> + Send + 'a>>;
+
+// ─── Model Category ─────────────────────────────────────────────────────────
+
+/// Classification of an embedding model by its speed/quality tradeoff.
+///
+/// Used by `EmbedderStack` to pair a fast-tier and quality-tier embedder
+/// for the two-tier progressive search pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ModelCategory {
+    /// Hash-based (FNV-1a): ultra-fast, deterministic, not semantically meaningful.
+    HashEmbedder,
+    /// Static token embeddings (Model2Vec/potion): fast with good semantic quality.
+    StaticEmbedder,
+    /// Transformer inference (MiniLM/BGE): highest quality but slower.
+    TransformerEmbedder,
+    /// Cloud API embeddings (`OpenAI`, Gemini): high quality, network-dependent latency.
+    ApiEmbedder,
+}
+
+impl fmt::Display for ModelCategory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HashEmbedder => write!(f, "hash_embedder"),
+            Self::StaticEmbedder => write!(f, "static_embedder"),
+            Self::TransformerEmbedder => write!(f, "transformer_embedder"),
+            Self::ApiEmbedder => write!(f, "api_embedder"),
+        }
+    }
+}
+
+impl ModelCategory {
+    /// Returns the default progressive tier for this model category.
+    #[must_use]
+    pub const fn default_tier(self) -> ModelTier {
+        match self {
+            Self::HashEmbedder | Self::StaticEmbedder => ModelTier::Fast,
+            Self::TransformerEmbedder | Self::ApiEmbedder => ModelTier::Quality,
+        }
+    }
+
+    /// Whether this category is semantically meaningful by default.
+    #[must_use]
+    pub const fn default_semantic_flag(self) -> bool {
+        !matches!(self, Self::HashEmbedder)
+    }
+}
+
+/// Tier assignment in the progressive two-tier pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ModelTier {
+    /// Ultra-fast path for immediate results.
+    Fast,
+    /// Higher-quality path for deferred refinement.
+    Quality,
+}
+
+impl fmt::Display for ModelTier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Fast => write!(f, "fast"),
+            Self::Quality => write!(f, "quality"),
+        }
+    }
+}
+
+// ─── Embedder Trait ─────────────────────────────────────────────────────────
+
+/// Core trait for text embedding models.
+///
+/// Implementations run under structured concurrency, so each async operation
+/// receives a capability context (`&Cx`) as its first parameter.
+///
+/// # Contract
+///
+/// - `embed()` and `embed_batch()` are cancel-aware and return boxed futures.
+/// - `dimension()` must be constant for the lifetime of the embedder.
+/// - `id()` must be stable across process restarts (it's stored in FSVI headers).
+pub trait Embedder: Send + Sync {
+    /// Embed a single text string into a vector of f32 floats.
+    ///
+    /// The returned vector has exactly `self.dimension()` elements.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError` if embedding inference fails.
+    fn embed<'a>(&'a self, cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>>;
+
+    /// Embed a batch of text strings.
+    ///
+    /// Default implementation calls `embed` in a loop. Neural models should
+    /// override this to exploit batch inference (ONNX has high fixed overhead
+    /// but low marginal cost per additional input).
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError` if any embedding inference fails.
+    fn embed_batch<'a>(
+        &'a self,
+        cx: &'a Cx,
+        texts: &'a [&'a str],
+    ) -> SearchFuture<'a, Vec<Vec<f32>>> {
+        Box::pin(async move {
+            let mut out = Vec::with_capacity(texts.len());
+            for text in texts {
+                out.push(self.embed(cx, text).await?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// The dimensionality of embedding vectors produced by this model.
+    fn dimension(&self) -> usize;
+
+    /// A unique, stable identifier for this embedder.
+    ///
+    /// Examples: `"fnv-hash-384"`, `"potion-multilingual-128M"`, `"all-MiniLM-L6-v2"`.
+    /// Stored in FSVI index headers for embedder-revision matching.
+    fn id(&self) -> &str;
+
+    /// Human-readable model name.
+    fn model_name(&self) -> &str;
+
+    /// Whether this embedder is loaded and operational.
+    fn is_ready(&self) -> bool {
+        true
+    }
+
+    /// Whether this embedder produces semantically meaningful vectors.
+    ///
+    /// Hash embedders return `false`; neural models return `true`.
+    fn is_semantic(&self) -> bool;
+
+    /// The speed/quality category of this embedder.
+    fn category(&self) -> ModelCategory;
+
+    /// Default progressive tier assignment.
+    fn tier(&self) -> ModelTier {
+        self.category().default_tier()
+    }
+
+    /// Whether this model supports Matryoshka Representation Learning
+    /// (dimension truncation for faster search with controlled quality loss).
+    fn supports_mrl(&self) -> bool {
+        false
+    }
+
+    /// Truncate and re-normalize embedding to `target_dim`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidConfig` when `target_dim` is zero.
+    fn truncate_embedding(&self, embedding: &[f32], target_dim: usize) -> SearchResult<Vec<f32>> {
+        if target_dim == 0 {
+            return Err(SearchError::InvalidConfig {
+                field: "target_dim".to_owned(),
+                value: "0".to_owned(),
+                reason: "target dimension must be at least 1".to_owned(),
+            });
+        }
+
+        if target_dim >= embedding.len() {
+            return Ok(embedding.to_vec());
+        }
+
+        Ok(l2_normalize(&embedding[..target_dim]))
+    }
+}
+
+// ─── Synchronous Embedder Bridge ─────────────────────────────────────────
+
+/// Synchronous embedding interface for host projects that call embedders from
+/// non-async contexts.
+///
+/// Implement this trait for embedders whose `embed` operations are inherently
+/// synchronous (e.g., hash embedders, CPU-only ONNX inference). The companion
+/// [`SyncEmbedderAdapter`] wraps any `SyncEmbed` implementor into a full
+/// async [`Embedder`], suitable for use anywhere frankensearch expects one.
+pub trait SyncEmbed: Send + Sync {
+    /// Synchronously embed a single text into a vector.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] when embedding fails (for example model load,
+    /// inference, or input validation failures).
+    fn embed_sync(&self, text: &str) -> SearchResult<Vec<f32>>;
+
+    /// Synchronously embed a batch of texts.
+    ///
+    /// Default implementation calls [`embed_sync`](Self::embed_sync) for each text.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first [`SearchError`] encountered while embedding any item
+    /// in the batch.
+    fn embed_batch_sync(&self, texts: &[&str]) -> SearchResult<Vec<Vec<f32>>> {
+        texts.iter().map(|t| self.embed_sync(t)).collect()
+    }
+
+    /// The output dimensionality of embedding vectors.
+    fn dimension(&self) -> usize;
+
+    /// Unique, stable identifier for this embedder (stored in index headers).
+    fn id(&self) -> &str;
+
+    /// Human-readable model name.
+    fn model_name(&self) -> &str {
+        self.id()
+    }
+
+    /// Whether the embedder is loaded and operational.
+    fn is_ready(&self) -> bool {
+        true
+    }
+
+    /// Whether this embedder produces semantically meaningful vectors.
+    fn is_semantic(&self) -> bool;
+
+    /// The speed/quality category of this embedder.
+    fn category(&self) -> ModelCategory;
+
+    /// Default progressive tier assignment.
+    fn tier(&self) -> ModelTier {
+        self.category().default_tier()
+    }
+
+    /// Whether this model supports Matryoshka Representation Learning.
+    fn supports_mrl(&self) -> bool {
+        false
+    }
+}
+
+/// Adapts a [`SyncEmbed`] implementor into a full async [`Embedder`].
+///
+/// The sync `embed_sync()` call is wrapped in `Box::pin(async move { ... })`,
+/// which is zero-cost for pure computation (hash embedders) and acceptable for
+/// blocking ONNX inference when called from a `spawn_blocking` context.
+pub struct SyncEmbedderAdapter<T: SyncEmbed>(pub T);
+
+impl<T: SyncEmbed + 'static> Embedder for SyncEmbedderAdapter<T> {
+    fn embed<'a>(&'a self, _cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+        Box::pin(async move { self.0.embed_sync(text) })
+    }
+
+    fn embed_batch<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        texts: &'a [&'a str],
+    ) -> SearchFuture<'a, Vec<Vec<f32>>> {
+        Box::pin(async move { self.0.embed_batch_sync(texts) })
+    }
+
+    fn dimension(&self) -> usize {
+        self.0.dimension()
+    }
+
+    fn id(&self) -> &str {
+        self.0.id()
+    }
+
+    fn model_name(&self) -> &str {
+        self.0.model_name()
+    }
+
+    fn is_ready(&self) -> bool {
+        self.0.is_ready()
+    }
+
+    fn is_semantic(&self) -> bool {
+        self.0.is_semantic()
+    }
+
+    fn category(&self) -> ModelCategory {
+        self.0.category()
+    }
+
+    fn tier(&self) -> ModelTier {
+        self.0.tier()
+    }
+
+    fn supports_mrl(&self) -> bool {
+        self.0.supports_mrl()
+    }
+}
+
+// ─── Embedding Utilities ──────────────────────────────────────────────────
+
+/// L2-normalizes a vector to unit length.
+///
+/// Returns a zero vector if the input has zero norm (avoids division by zero).
+#[must_use]
+pub fn l2_normalize(vec: &[f32]) -> Vec<f32> {
+    let norm_sq: f32 = vec.iter().map(|x| x * x).sum();
+    if !norm_sq.is_finite() || norm_sq < f32::EPSILON {
+        return vec![0.0; vec.len()];
+    }
+    let inv_norm = 1.0 / norm_sq.sqrt();
+    vec.iter().map(|x| x * inv_norm).collect()
+}
+
+/// Computes cosine similarity between two vectors.
+///
+/// Returns 0.0 if either vector has zero norm.
+///
+/// # Panics
+///
+/// Panics in debug mode if the vectors have different lengths.
+#[must_use]
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    // Runtime length check — debug_assert is stripped in release builds,
+    // and zip would silently truncate mismatched vectors.
+    if a.len() != b.len() {
+        return 0.0;
+    }
+
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+
+    let denom = norm_a * norm_b;
+    if !denom.is_finite() || denom < f32::EPSILON {
+        return 0.0;
+    }
+    dot / denom
+}
+
+/// Truncates an embedding to a target dimension and re-normalizes.
+///
+/// Only meaningful for models that support Matryoshka Representation Learning (MRL),
+/// where the first N dimensions capture most of the variance.
+///
+/// Returns the original vector unchanged if `target_dim >= embedding.len()`.
+#[must_use]
+pub fn truncate_embedding(embedding: &[f32], target_dim: usize) -> Vec<f32> {
+    if target_dim >= embedding.len() {
+        return embedding.to_vec();
+    }
+    l2_normalize(&embedding[..target_dim])
+}
+
+// ─── Reranker Trait ─────────────────────────────────────────────────────────
+
+/// A document for reranking: pairs a document ID with its text content.
+///
+/// Text must be provided because cross-encoders process query+document
+/// pairs through a transformer. `ScoredResult` intentionally does not
+/// carry text to avoid memory waste in the common case.
+#[derive(Debug, Clone)]
+pub struct RerankDocument {
+    /// Document identifier.
+    pub doc_id: String,
+    /// Document text content for cross-encoder input.
+    pub text: String,
+}
+
+/// A reranking score for a single document.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RerankScore {
+    /// Document identifier.
+    pub doc_id: String,
+    /// Cross-encoder relevance score (typically sigmoid-activated logit).
+    pub score: f32,
+    /// Position before reranking (for rank-change tracking).
+    pub original_rank: usize,
+    /// Raw pre-sigmoid logit, when the backend exposes it.
+    ///
+    /// Some cross-encoder implementations only emit a final score (after sigmoid
+    /// activation). When the raw logit is unavailable, this field is `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_logit: Option<f32>,
+}
+
+/// Core trait for cross-encoder reranking models.
+///
+/// Cross-encoders process query+document pairs together through a transformer,
+/// producing more accurate relevance scores than bi-encoder cosine similarity.
+/// This accuracy comes at the cost of not being able to pre-compute anything:
+/// every query-document pair requires a full inference pass.
+///
+/// # Graceful Failure
+///
+/// The reranking step should never block search results. If the model is
+/// unavailable or inference fails, implementations should return
+/// `Err(SearchError::RerankFailed { .. })` and callers should fall back
+/// to the original RRF scores.
+pub trait Reranker: Send + Sync {
+    /// Score and re-rank documents against a query.
+    ///
+    /// Returns documents sorted by descending cross-encoder score.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError::RerankFailed` if cross-encoder inference fails.
+    fn rerank<'a>(
+        &'a self,
+        cx: &'a Cx,
+        query: &'a str,
+        documents: &'a [RerankDocument],
+    ) -> SearchFuture<'a, Vec<RerankScore>>;
+
+    /// A unique identifier for this reranker model.
+    fn id(&self) -> &str;
+
+    /// Human-friendly reranker model name.
+    fn model_name(&self) -> &str;
+
+    /// Maximum supported token length for query+document pair input.
+    fn max_length(&self) -> usize {
+        512
+    }
+
+    /// Whether this reranker is loaded and ready for inference.
+    fn is_available(&self) -> bool {
+        true
+    }
+}
+
+// ─── Synchronous Reranker Bridge ────────────────────────────────────────────
+
+/// Synchronous reranking interface for host projects that call rerankers from
+/// non-async contexts.
+///
+/// Implement this trait for rerankers whose `rerank` operations are inherently
+/// synchronous (e.g., blocking ONNX inference). The companion
+/// [`SyncRerankerAdapter`] wraps any `SyncRerank` implementor into a full
+/// async [`Reranker`], suitable for use anywhere frankensearch expects one.
+pub trait SyncRerank: Send + Sync {
+    /// Synchronously rerank documents against a query.
+    ///
+    /// Returns documents sorted by descending cross-encoder score.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] when reranking fails (for example model load,
+    /// inference, or input validation failures).
+    fn rerank_sync(
+        &self,
+        query: &str,
+        documents: &[RerankDocument],
+    ) -> SearchResult<Vec<RerankScore>>;
+
+    /// A unique identifier for this reranker model.
+    fn id(&self) -> &str;
+
+    /// Human-friendly reranker model name.
+    fn model_name(&self) -> &str;
+
+    /// Maximum supported token length for query+document pair input.
+    fn max_length(&self) -> usize {
+        512
+    }
+
+    /// Whether this reranker is loaded and ready for inference.
+    fn is_available(&self) -> bool {
+        true
+    }
+}
+
+/// Adapts a [`SyncRerank`] implementor into a full async [`Reranker`].
+///
+/// The sync `rerank_sync()` call is wrapped in `Box::pin(async move { ... })`,
+/// which is acceptable for blocking ONNX inference when called from a
+/// `spawn_blocking` context.
+pub struct SyncRerankerAdapter<T: SyncRerank>(pub T);
+
+impl<T: SyncRerank + 'static> Reranker for SyncRerankerAdapter<T> {
+    fn rerank<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        query: &'a str,
+        documents: &'a [RerankDocument],
+    ) -> SearchFuture<'a, Vec<RerankScore>> {
+        Box::pin(async move {
+            let mut scores = self.0.rerank_sync(query, documents)?;
+            scores.sort_by(|lhs, rhs| {
+                rhs.score
+                    .total_cmp(&lhs.score)
+                    .then_with(|| lhs.original_rank.cmp(&rhs.original_rank))
+                    .then_with(|| lhs.doc_id.cmp(&rhs.doc_id))
+            });
+            Ok(scores)
+        })
+    }
+
+    fn id(&self) -> &str {
+        self.0.id()
+    }
+
+    fn model_name(&self) -> &str {
+        self.0.model_name()
+    }
+
+    fn max_length(&self) -> usize {
+        self.0.max_length()
+    }
+
+    fn is_available(&self) -> bool {
+        self.0.is_available()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use asupersync::test_utils::run_test_with_cx;
+
+    use super::*;
+
+    struct UnsortedSyncReranker;
+
+    impl SyncRerank for UnsortedSyncReranker {
+        fn rerank_sync(
+            &self,
+            _query: &str,
+            _documents: &[RerankDocument],
+        ) -> SearchResult<Vec<RerankScore>> {
+            Ok(vec![
+                RerankScore {
+                    doc_id: "doc-a".to_owned(),
+                    score: 0.8,
+                    original_rank: 2,
+                    raw_logit: None,
+                },
+                RerankScore {
+                    doc_id: "doc-b".to_owned(),
+                    score: 0.8,
+                    original_rank: 1,
+                    raw_logit: None,
+                },
+                RerankScore {
+                    doc_id: "doc-c".to_owned(),
+                    score: 0.3,
+                    original_rank: 0,
+                    raw_logit: None,
+                },
+            ])
+        }
+
+        fn id(&self) -> &'static str {
+            "unsorted-sync-reranker"
+        }
+
+        fn model_name(&self) -> &'static str {
+            "Unsorted Sync Reranker"
+        }
+    }
+
+    #[test]
+    fn model_category_display() {
+        assert_eq!(ModelCategory::HashEmbedder.to_string(), "hash_embedder");
+        assert_eq!(ModelCategory::StaticEmbedder.to_string(), "static_embedder");
+        assert_eq!(
+            ModelCategory::TransformerEmbedder.to_string(),
+            "transformer_embedder"
+        );
+    }
+
+    #[test]
+    fn model_category_serialization() {
+        let json = serde_json::to_string(&ModelCategory::StaticEmbedder).unwrap();
+        let decoded: ModelCategory = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, ModelCategory::StaticEmbedder);
+    }
+
+    #[test]
+    fn model_category_equality() {
+        assert_eq!(ModelCategory::HashEmbedder, ModelCategory::HashEmbedder);
+        assert_ne!(ModelCategory::HashEmbedder, ModelCategory::StaticEmbedder);
+        assert_ne!(
+            ModelCategory::StaticEmbedder,
+            ModelCategory::TransformerEmbedder
+        );
+    }
+
+    #[test]
+    fn model_category_default_tier() {
+        assert_eq!(ModelCategory::HashEmbedder.default_tier(), ModelTier::Fast);
+        assert_eq!(
+            ModelCategory::StaticEmbedder.default_tier(),
+            ModelTier::Fast
+        );
+        assert_eq!(
+            ModelCategory::TransformerEmbedder.default_tier(),
+            ModelTier::Quality
+        );
+    }
+
+    #[test]
+    fn model_tier_display() {
+        assert_eq!(ModelTier::Fast.to_string(), "fast");
+        assert_eq!(ModelTier::Quality.to_string(), "quality");
+    }
+
+    #[test]
+    fn rerank_document_construction() {
+        let doc = RerankDocument {
+            doc_id: "doc-1".into(),
+            text: "Some content".into(),
+        };
+        assert_eq!(doc.doc_id, "doc-1");
+        assert_eq!(doc.text, "Some content");
+    }
+
+    #[test]
+    fn rerank_score_serialization() {
+        let score = RerankScore {
+            doc_id: "doc-1".into(),
+            score: 0.92,
+            original_rank: 3,
+            raw_logit: None,
+        };
+
+        let json = serde_json::to_string(&score).unwrap();
+        let decoded: RerankScore = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.doc_id, "doc-1");
+        assert!((decoded.score - 0.92).abs() < 1e-6);
+        assert_eq!(decoded.original_rank, 3);
+    }
+
+    // Compile-time checks for trait object safety
+    #[test]
+    fn embedder_trait_is_object_safe() {
+        fn _takes_dyn_embedder(_: &dyn Embedder) {}
+    }
+
+    #[test]
+    fn reranker_trait_is_object_safe() {
+        fn _takes_dyn_reranker(_: &dyn Reranker) {}
+    }
+
+    #[test]
+    fn sync_reranker_adapter_sorts_descending_for_trait_contract() {
+        run_test_with_cx(|cx| async move {
+            let adapter = SyncRerankerAdapter(UnsortedSyncReranker);
+            let docs = vec![
+                RerankDocument {
+                    doc_id: "doc-a".to_owned(),
+                    text: "alpha".to_owned(),
+                },
+                RerankDocument {
+                    doc_id: "doc-b".to_owned(),
+                    text: "beta".to_owned(),
+                },
+                RerankDocument {
+                    doc_id: "doc-c".to_owned(),
+                    text: "gamma".to_owned(),
+                },
+            ];
+            let scores = adapter
+                .rerank(&cx, "query", &docs)
+                .await
+                .expect("adapter rerank should succeed");
+            let ids = scores
+                .iter()
+                .map(|score| score.doc_id.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(ids, vec!["doc-b", "doc-a", "doc-c"]);
+        });
+    }
+
+    // ─── Utility function tests ─────────────────────────────────────────
+
+    #[test]
+    fn l2_normalize_produces_unit_vector() {
+        let v = vec![3.0, 4.0];
+        let normalized = l2_normalize(&v);
+        let norm: f32 = normalized.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn l2_normalize_zero_vector() {
+        let v = vec![0.0, 0.0, 0.0];
+        let normalized = l2_normalize(&v);
+        assert!(normalized.iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn cosine_similarity_identical() {
+        let v = vec![1.0, 2.0, 3.0];
+        let sim = cosine_similarity(&v, &v);
+        assert!((sim - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_similarity_orthogonal() {
+        let a = vec![1.0, 0.0];
+        let b = vec![0.0, 1.0];
+        assert!(cosine_similarity(&a, &b).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_similarity_zero_vector() {
+        let a = vec![1.0, 2.0];
+        let b = vec![0.0, 0.0];
+        assert!(cosine_similarity(&a, &b).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn truncate_embedding_reduces_dim() {
+        let v = vec![1.0, 2.0, 3.0, 4.0];
+        let t = truncate_embedding(&v, 2);
+        assert_eq!(t.len(), 2);
+        let norm: f32 = t.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn truncate_embedding_noop_when_larger() {
+        let v = vec![1.0, 2.0];
+        assert_eq!(truncate_embedding(&v, 10), v);
+    }
+
+    #[test]
+    fn model_category_default_semantic_flag() {
+        assert!(!ModelCategory::HashEmbedder.default_semantic_flag());
+        assert!(ModelCategory::StaticEmbedder.default_semantic_flag());
+        assert!(ModelCategory::TransformerEmbedder.default_semantic_flag());
+    }
+
+    #[test]
+    fn error_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<SearchError>();
+    }
+
+    #[test]
+    fn io_error_conversion() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "gone");
+        let search_err: SearchError = io_err.into();
+        assert!(matches!(search_err, SearchError::Io(_)));
+        assert!(search_err.to_string().contains("gone"));
+    }
+
+    #[test]
+    fn search_result_alias_works() {
+        let ok: SearchResult<u32> = Ok(42);
+        assert!(ok.is_ok());
+
+        let err: SearchResult<u32> = Err(SearchError::DurabilityDisabled);
+        assert!(err.is_err());
+    }
+}
