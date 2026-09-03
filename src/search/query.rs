@@ -2123,6 +2123,38 @@ struct SemanticCandidateSearchRequest {
 struct SemanticCandidateRetryState {
     has_more_candidates: bool,
     exact_window_may_omit_competitor: bool,
+    /// R2-B6: observability signal for whether the streaming full-scan
+    /// retry actually ran (distinct from `has_more_candidates`, which is
+    /// about the *caller's* widen-further decision, not this fact). Test-
+    /// visible via the returned struct rather than a `cfg(test)`-only
+    /// counter.
+    second_pass_taken: bool,
+}
+
+/// R2-B6: max-heap ordering for the streaming full-scan retry's bounded
+/// top-`fetch_limit` candidate set -- keeps the *largest* distance at the
+/// heap's root so it's the one evicted when a closer candidate arrives.
+/// `f64` has no `Ord` (NaN), so this wraps it with a `partial_cmp` that
+/// falls back to `Equal`, matching the existing sort fallback this
+/// function's non-streaming sibling already used.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DbVectorFullScanCandidate {
+    distance: f64,
+    doc_id: i64,
+}
+
+impl Eq for DbVectorFullScanCandidate {}
+
+impl PartialOrd for DbVectorFullScanCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for DbVectorFullScanCandidate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.distance.partial_cmp(&other.distance).unwrap_or(std::cmp::Ordering::Equal)
+    }
 }
 
 struct SemanticQueryEmbedding {
@@ -3638,34 +3670,100 @@ impl SearchClient {
             // in exactly the case that triggers it; a query whose filter
             // isn't selective never gets here because the first pass
             // already found enough.
-            let full_scan_by_distance = |tx: &crate::storage::api::Tx| -> Result<Vec<(i64, f64)>, crate::storage::api::StorageError> {
+            // R2-B6: streaming, not `query_all_map`-then-collect-then-sort --
+            // the old version's `Vec<(i64, Vec<u8>)>` held every row's
+            // decoded BLOB simultaneously (~4.16GB @ 101.6万×1024f32), which
+            // is exactly the OOM this retry was supposed to be the *safe*
+            // fallback from. Each row's BLOB is decoded, scored, and
+            // discarded immediately; only a bounded max-heap of (distance,
+            // doc_id) survives past a single row's scope. Heap capacity is
+            // `first_k.max(fetch_limit)`, not the bare `fetch_limit`
+            // parameter: `first_k` is already `fetch_limit *
+            // OVERFETCH_FACTOR` (the same overfetch budget the first KNN
+            // pass used) whenever it isn't clamp-limited, and the `.max`
+            // keeps the cap from dropping *below* `fetch_limit` itself in
+            // the (K-max-clamped) shape where `first_k` came out smaller.
+            // Capping below `first_k` here would silently truncate the
+            // exact-search caller's overfetch window on the retry path even
+            // though the first-pass path deliberately never does (see the
+            // "Do NOT truncate to `fetch_limit`" note below) -- this is why
+            // the primary correctness test's 3-of-3 and the perf
+            // disclosure's 5-of-5 target docs both still come back whole
+            // (their filtered universes are `<= first_k`), while a filtered
+            // universe genuinely larger than the overfetch budget now
+            // reports `has_more_candidates=true` (`total_seen > cap`)
+            // instead of the old code's unconditional "retry always
+            // covered everything" claim, which stopped being true the
+            // moment a cap existed at all.
+            let full_scan_by_distance_streaming = |tx: &crate::storage::api::Tx,
+                                                     cap: usize|
+             -> Result<(Vec<(i64, f64)>, bool), crate::storage::api::StorageError> {
                 let (sql, params) = Self::build_db_vector_domain_full_scan_sql(
                     generation_id,
                     filters,
                     effective_roles.as_ref(),
                 );
-                let rows: Vec<(i64, Vec<u8>)> =
-                    tx.query_all_map(&sql, &params, |row| Ok((row.get_typed(0)?, row.get_typed(1)?)))?;
-                let mut ranked = Vec::with_capacity(rows.len());
-                for (doc_id, blob) in rows {
+                let cap = cap.max(1);
+                let heap: std::cell::RefCell<std::collections::BinaryHeap<DbVectorFullScanCandidate>> =
+                    std::cell::RefCell::new(std::collections::BinaryHeap::with_capacity(cap + 1));
+                let total_seen = std::cell::Cell::new(0usize);
+                tx.query_all_map(&sql, &params, |row| -> Result<(), crate::storage::api::StorageError> {
+                    let doc_id: i64 = row.get_typed(0)?;
+                    let blob: Vec<u8> = row.get_typed(1)?;
                     let vector = crate::storage::schema::le_blob_to_f32_vector(&blob)?;
-                    ranked.push((doc_id, Self::cosine_distance(&vector, embedding)));
-                }
+                    let distance = Self::cosine_distance(&vector, embedding);
+                    let candidate = DbVectorFullScanCandidate { distance, doc_id };
+                    total_seen.set(total_seen.get() + 1);
+                    let mut heap = heap.borrow_mut();
+                    if heap.len() < cap {
+                        heap.push(candidate);
+                    } else if heap.peek().is_some_and(|worst| candidate < *worst) {
+                        heap.pop();
+                        heap.push(candidate);
+                    }
+                    Ok(())
+                })?;
+                let mut ranked: Vec<(i64, f64)> = heap
+                    .into_inner()
+                    .into_iter()
+                    .map(|c| (c.doc_id, c.distance))
+                    .collect();
                 ranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-                Ok(ranked)
+                let truncated = total_seen.get() > cap;
+                Ok((ranked, truncated))
             };
 
             let mut filtered = run_and_filter(tx, first_k)?;
+            // R2-B6: a large `fetch_limit` alone (clamp-limited `first_k`,
+            // e.g. `SQLITE_VEC_KNN_K_MAX`) is not evidence the relational
+            // filter is selective -- if the filter passed every candidate
+            // the first KNN pass found (`filtered.len() == first_k`), the
+            // corpus genuinely has more matches than the clamp let this
+            // pass see, and `has_more_candidates=true` already tells the
+            // caller that; a full-scan retry in that shape would re-read
+            // (up to) the *entire* generation for a filter that eliminated
+            // nothing, which is the resource-exhaustion path this retry
+            // exists to avoid, not resolve. The retry is only for the
+            // opposite shape: the filter genuinely thinned the KNN window
+            // (`filtered.len() < first_k`) down below what the caller asked
+            // for, so widening past `first_k` to the full (filtered, and
+            // thus expected-small) generation is the correct fix.
+            let filter_eliminated_candidates = filtered.len() < first_k;
             let mut has_more_candidates = first_k < row_count_usize;
-            if filtered.len() < fetch_limit && first_k < row_count_usize {
-                filtered = full_scan_by_distance(tx)?;
-                has_more_candidates = false;
+            let mut second_pass_taken = false;
+            if filter_eliminated_candidates
+                && filtered.len() < fetch_limit
+                && first_k < row_count_usize
+            {
+                second_pass_taken = true;
+                let (scanned, truncated) = full_scan_by_distance_streaming(tx, first_k.max(fetch_limit))?;
+                filtered = scanned;
+                has_more_candidates = truncated;
             }
 
             // Do NOT truncate to `fetch_limit` here: `filtered` is already a
-            // bounded overfetch window (`first_k`, or the full generation on
-            // retry) sized independently of the caller's raw `fetch_limit`,
-            // matching the fsvi exact-search contract
+            // bounded overfetch window (`first_k`, or the retry's own
+            // `fetch_limit`-capped heap), matching the fsvi exact-search contract
             // (`semantic_exact_candidate_limit`/`collapse_semantic_results`)
             // that `search_semantic_with_tier` relies on: it applies
             // post-hoc filters (session_paths, dedup) and its own
@@ -3696,6 +3794,7 @@ impl SearchClient {
                 SemanticCandidateRetryState {
                     has_more_candidates,
                     exact_window_may_omit_competitor: has_more_candidates,
+                    second_pass_taken,
                 },
             ))
         })
@@ -16192,8 +16291,159 @@ mod tests {
             80_016,
         )
         .expect("an oversized fetch_limit must never reach vec0's k<=4096 hard limit");
-        assert!(!retry.has_more_candidates, "a fetch_limit this far past row_count must exhaust the corpus");
-        assert_eq!(results.len(), TOTAL_DOCS as usize, "an unfiltered query must return every doc in the corpus");
+        // R2-B6: this query is unfiltered -- every doc the first KNN pass
+        // finds passes the relational filter, so `filtered.len() ==
+        // first_k` (the k-max clamp, not filter selectivity, is why it fell
+        // short of `fetch_limit`). That must NOT trigger the full-scan
+        // retry (it would re-read and score all 4_200 docs' BLOBs for a
+        // filter that eliminated nothing -- the resource-exhaustion shape
+        // this item fixes); the correct response is "here's the clamped
+        // first_k window, and yes, there's more" via `has_more_candidates`.
+        assert!(
+            !retry.second_pass_taken,
+            "an unfiltered query that only hit the k-max clamp must not take the full-scan retry"
+        );
+        assert!(
+            retry.has_more_candidates,
+            "first_k was clamped below row_count -- there genuinely are more candidates beyond this window"
+        );
+        assert_eq!(
+            results.len(),
+            4_096,
+            "first_k clamps to SQLITE_VEC_KNN_K_MAX(4096) regardless of fetch_limit or row_count"
+        );
+    }
+
+    /// R2-B6 test (b): the full-scan retry's streaming top-K heap must
+    /// never surface more than its cap (`first_k.max(fetch_limit)` -- here
+    /// `first_k` = FETCH_LIMIT(3)*OVERFETCH_FACTOR(4) = 12, so cap=12), and
+    /// must pick the *closest* 12 among however many rows the retry
+    /// actually scans -- not merely the first 12 rows SQLite happens to
+    /// iterate. The 20 `/ws/target` docs (more than the cap, so truncation
+    /// genuinely happens) are seeded in strictly *descending* distance
+    /// order (farthest inserted first) precisely so a broken "keep the
+    /// first `cap` rows seen" implementation would return the wrong
+    /// (farthest) 12 instead of the correct (nearest) 12 -- the assertion
+    /// on `got_ids`'s exact order/identity, not just its length, is what
+    /// catches that mutation.
+    #[test]
+    fn db_vector_domain_full_scan_retry_streams_and_caps_at_first_k() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        const DIM: i64 = 4;
+        const FILLER_DOCS: i64 = 4_980;
+        const TARGET_DOCS: i64 = 20;
+        const FETCH_LIMIT: usize = 3;
+        const CAP: i64 = 12; // FETCH_LIMIT(3) * OVERFETCH_FACTOR(4)
+
+        let agent_id = storage
+            .ensure_agent(&Agent { id: None, slug: "codex".to_string(), name: "codex".to_string(), version: None, kind: AgentKind::Cli })
+            .unwrap();
+        let other_ws = storage.ensure_workspace(std::path::Path::new("/ws/other"), None).unwrap();
+        let target_ws = storage.ensure_workspace(std::path::Path::new("/ws/target"), None).unwrap();
+        let conn = storage.raw();
+        conn.execute(
+            "INSERT OR IGNORE INTO sources(id, kind, created_at, updated_at) VALUES ('local', 'local', 0, 0)",
+            &[],
+        )
+        .unwrap();
+
+        let mut vectors: Vec<(i64, i64, Vec<f32>)> =
+            Vec::with_capacity((FILLER_DOCS + TARGET_DOCS) as usize);
+        conn.with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
+            // Filler: 4,980 docs at tiny theta -- the nearest vectors in the
+            // whole corpus, guaranteeing the first KNN pass's overfetch
+            // window (`first_k` = FETCH_LIMIT*OVERFETCH_FACTOR = 12) fills
+            // entirely with these, none of which is `/ws/target`, so
+            // `filtered.len() == 0 < first_k` after the relational filter
+            // -- the streaming retry fires.
+            for i in 0..FILLER_DOCS {
+                let message_id = 4_000_000 + i;
+                tx.execute(
+                    "INSERT INTO conversations(id, agent_id, workspace_id, source_id, title, source_path) \
+                     VALUES (?1, ?2, ?3, 'local', 't', ?4)",
+                    &[
+                        ParamValue::from(message_id),
+                        ParamValue::from(agent_id),
+                        ParamValue::from(other_ws),
+                        ParamValue::from(format!("/tmp/c-{message_id}.jsonl")),
+                    ],
+                )?;
+                tx.execute(
+                    "INSERT INTO messages(id, conversation_id, idx, role, created_at, content) \
+                     VALUES (?1, ?2, 0, 'user', ?3, 'c')",
+                    &crate::storage::api::params![message_id, message_id, 100 + message_id],
+                )?;
+                let theta = (i as f32) * 0.0001;
+                vectors.push((message_id, message_id, vec![theta.cos(), theta.sin(), 0.0, 0.0]));
+            }
+
+            // Target: 20 `/ws/target` docs at theta far past the filler
+            // range (so none leak into the first pass's window), seeded in
+            // descending distance order (k=19's theta=1.019, farthest,
+            // inserted first; k=0's theta=1.000, nearest, inserted last).
+            for k in (0..TARGET_DOCS).rev() {
+                let message_id = 5_000_000 + (TARGET_DOCS - 1 - k);
+                tx.execute(
+                    "INSERT INTO conversations(id, agent_id, workspace_id, source_id, title, source_path) \
+                     VALUES (?1, ?2, ?3, 'local', 't', ?4)",
+                    &[
+                        ParamValue::from(message_id),
+                        ParamValue::from(agent_id),
+                        ParamValue::from(target_ws),
+                        ParamValue::from(format!("/tmp/c-{message_id}.jsonl")),
+                    ],
+                )?;
+                tx.execute(
+                    "INSERT INTO messages(id, conversation_id, idx, role, created_at, content) \
+                     VALUES (?1, ?2, 0, 'user', ?3, 'c')",
+                    &crate::storage::api::params![message_id, message_id, 100 + message_id],
+                )?;
+                let theta = 1.0_f32 + (k as f32) * 0.001;
+                vectors.push((message_id, message_id, vec![theta.cos(), theta.sin(), 0.0, 0.0]));
+            }
+            Ok(())
+        })
+        .unwrap();
+        seed_active_generation_with_vectors(&storage, DIM, &vectors);
+
+        let mut filters = SearchFilters::default();
+        filters.workspaces.insert("/ws/target".to_string());
+        let (results, retry) = SearchClient::search_db_vector_domain(
+            storage.raw(),
+            &[1.0, 0.0, 0.0, 0.0],
+            &filters,
+            Some(&HashSet::from([
+                crate::search::vector_index::ROLE_USER,
+                crate::search::vector_index::ROLE_ASSISTANT,
+            ])),
+            FETCH_LIMIT,
+        )
+        .unwrap();
+
+        assert!(
+            retry.second_pass_taken,
+            "the filter eliminated every first-pass candidate -- the streaming retry must fire"
+        );
+        assert!(
+            retry.has_more_candidates,
+            "20 target docs exist but the heap caps at 12 -- 8 genuinely didn't fit, has_more must say so"
+        );
+        assert_eq!(
+            results.len(),
+            CAP as usize,
+            "20 matching docs exist but the heap must cap output at first_k={CAP}"
+        );
+
+        // The 12 nearest target docs are k=0..12 (theta=1.000..1.011);
+        // message_id = 5_000_000 + (TARGET_DOCS - 1 - k) maps k=0..12 to
+        // message_ids 5_000_019 down to 5_000_008, nearest-first.
+        let got_ids: Vec<u64> = results.iter().map(|r| r.message_id).collect();
+        let want_ids: Vec<u64> = (0..CAP).map(|k| 5_000_000 + (TARGET_DOCS - 1 - k) as u64).collect();
+        assert_eq!(
+            got_ids, want_ids,
+            "must surface the 12 nearest target docs, nearest-first -- not the first 12 rows SQLite iterated"
+        );
     }
 
     /// R1-W3-B6/N1/B9 real-scale performance disclosure. Advisor's
@@ -16299,6 +16549,20 @@ mod tests {
         )
         .unwrap();
         let search_elapsed = search_start.elapsed();
+        // R2-B6: coarse peak-RSS disclosure (Linux `/proc/self/status`
+        // `VmHWM` -- the process' high-water mark, not a delta isolated to
+        // this one call, but the whole point of B6 is that this streaming
+        // retry must not be the thing that drives that high-water mark up
+        // by materializing every row's BLOB at once). Best-effort: absent
+        // (non-Linux, or a `/proc` read failure) prints "unavailable"
+        // rather than failing a perf-disclosure-only probe.
+        let peak_rss_kb: Option<u64> = std::fs::read_to_string("/proc/self/status").ok().and_then(|status| {
+            status.lines().find_map(|line| {
+                line.strip_prefix("VmHWM:")
+                    .and_then(|rest| rest.trim().strip_suffix(" kB"))
+                    .and_then(|kb| kb.trim().parse::<u64>().ok())
+            })
+        });
 
         assert!(!retry.has_more_candidates, "full-scan retry must have covered the entire filtered universe");
         assert_eq!(
@@ -16311,9 +16575,10 @@ mod tests {
         // is asserted live so a future run against a rebuilt fixture stays
         // meaningful.
         assert!(generation_id > 0);
+        let peak_rss_display = peak_rss_kb.map(|kb| format!("{kb}kB")).unwrap_or_else(|| "unavailable".to_string());
         eprintln!(
-            "[R1-W3-B6/N1/B9 perf disclosure] rows={TOTAL_DOCS} dim={DIM} target_docs={TARGET_DOCS} \
-             seed_ms={} search_ms={}",
+            "[R2-B6 perf disclosure] rows={TOTAL_DOCS} dim={DIM} target_docs={TARGET_DOCS} \
+             seed_ms={} search_ms={} peak_rss={peak_rss_display}",
             seed_elapsed.as_millis(),
             search_elapsed.as_millis()
         );
