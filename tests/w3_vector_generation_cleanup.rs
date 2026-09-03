@@ -116,8 +116,9 @@ fn cleanup_deletes_an_old_non_active_generation_and_leaves_the_active_one_alone(
         .unwrap();
     schema::switch_active_generation(storage.raw(), gen_new, TS, |_tx| Ok(())).unwrap();
 
-    let deleted = cleanup_orphaned_generations(&storage, TS).expect("cleanup must succeed");
-    assert_eq!(deleted, vec![gen_old], "only the old, now-inactive generation should be cleaned up");
+    let outcome = cleanup_orphaned_generations(&storage, TS).expect("cleanup must succeed");
+    assert_eq!(outcome.deleted_ids, vec![gen_old], "only the old, now-inactive generation should be cleaned up");
+    assert!(outcome.failures.is_empty());
 
     let gen_old_row_count: i64 = storage
         .raw()
@@ -162,8 +163,9 @@ fn cleanup_leaves_a_recently_demoted_generation_alone_until_it_ages_past_the_thr
         .unwrap();
     schema::switch_active_generation(storage.raw(), gen_new, TS, |_tx| Ok(())).unwrap();
 
-    let deleted = cleanup_orphaned_generations(&storage, TS + 1_000).expect("cleanup must succeed");
-    assert!(deleted.is_empty(), "a just-demoted generation must not be cleaned up before it ages past the threshold");
+    let outcome = cleanup_orphaned_generations(&storage, TS + 1_000).expect("cleanup must succeed");
+    assert!(outcome.deleted_ids.is_empty(), "a just-demoted generation must not be cleaned up before it ages past the threshold");
+    assert!(outcome.failures.is_empty());
 
     let gen_old_row_count: i64 = storage
         .raw()
@@ -210,8 +212,9 @@ fn a_reader_holding_an_open_snapshot_is_unaffected_by_concurrent_generation_clea
         .with_tx_no_replay(TxMode::Immediate, |tx| schema::create_embedding_generation(tx, "bge-m3", DIM, 1, TS))
         .unwrap();
     schema::switch_active_generation(writer_storage.raw(), gen_new, TS, |_tx| Ok(())).unwrap();
-    let deleted = cleanup_orphaned_generations(&writer_storage, TS).expect("cleanup must succeed");
-    assert_eq!(deleted, vec![gen_old], "gen_old must actually get cleaned up by this point");
+    let outcome = cleanup_orphaned_generations(&writer_storage, TS).expect("cleanup must succeed");
+    assert_eq!(outcome.deleted_ids, vec![gen_old], "gen_old must actually get cleaned up by this point");
+    assert!(outcome.failures.is_empty());
 
     // Sanity: a FRESH read (new connection, no prior snapshot) now sees
     // gen_old truly gone -- proving the cleanup above was real, not a
@@ -271,6 +274,12 @@ fn a_reader_holding_an_open_snapshot_is_unaffected_by_concurrent_generation_clea
 /// refuses to splice one into DDL text). Pre-fix (drop-after-commit),
 /// that guard fires *after* the metadata is already gone; post-fix
 /// (drop-first-in-tx), it fires before anything is touched.
+///
+/// R2-N2: this candidate's rejected delete is now caught and recorded in
+/// `outcome.failures`, not propagated as an `Err` from the whole
+/// function -- this test's outer assertion was updated for that (`Ok`
+/// with a `failures` entry, not `Err`), but everything below it about the
+/// per-candidate transaction rolling back cleanly is unchanged.
 #[test]
 fn cleanup_never_deletes_metadata_when_its_vec0_drop_is_rejected() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -300,8 +309,22 @@ fn cleanup_never_deletes_metadata_when_its_vec0_drop_is_rejected() {
         })
         .unwrap();
 
-    let result = cleanup_orphaned_generations(&storage, TS);
-    assert!(result.is_err(), "an invalid generation_id must be rejected, not silently produce a malformed DROP TABLE statement");
+    // R2-N2: a second, entirely legitimate orphan candidate alongside the
+    // malformed one -- proves the fix's actual point (one candidate
+    // failing must not block the rest), not just "the whole call no
+    // longer errors".
+    let (conv_id_b, doc_id_b) = insert_one_message_conversation(&storage, "w3-n4-legit-sibling");
+    let gen_legit = build_active_passed_generation(&storage, doc_id_b, conv_id_b, old_created_at);
+    let gen_new = storage
+        .raw()
+        .with_tx_no_replay(TxMode::Immediate, |tx| schema::create_embedding_generation(tx, "bge-m3", DIM, 1, TS))
+        .unwrap();
+    schema::switch_active_generation(storage.raw(), gen_new, TS, |_tx| Ok(())).unwrap();
+
+    let outcome = cleanup_orphaned_generations(&storage, TS).expect("the whole cleanup call must still succeed -- only the malformed candidate is rejected");
+    assert_eq!(outcome.deleted_ids, vec![gen_legit], "the legitimate sibling candidate must still be deleted despite the other candidate's failure");
+    assert_eq!(outcome.failures.len(), 1, "the rejected candidate must be recorded in failures: {:?}", outcome.failures);
+    assert_eq!(outcome.failures[0].0, -7);
 
     let row_count: i64 = storage
         .raw()
