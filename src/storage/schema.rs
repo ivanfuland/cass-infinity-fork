@@ -1059,13 +1059,17 @@ pub fn register_embedding_hole_for_new_message_in_tx(
 /// keep `holes_after` permanently above zero and self-lock the generation
 /// out of activation forever (the exact failure `run_db_vector_catchup_
 /// backfill`'s draining loop must not reproduce). A no-op `DELETE` if the
-/// hole was already resolved or never existed.
-pub fn write_off_ineligible_hole_in_tx(tx: &Tx, generation_id: i64, doc_id: i64) -> Result<(), StorageError> {
-    tx.execute(
+/// hole was already resolved or never existed. Returns the number of rows
+/// actually deleted (0 or 1) -- task book #81 R2-N4, same discipline as
+/// [`prune_ineligible_message_embedding_in_tx`]'s R1-N3 fix: a caller
+/// tallying `holes_written_off_ineligible` must report what was actually
+/// affected, not the size of a candidate list computed before this ran.
+pub fn write_off_ineligible_hole_in_tx(tx: &Tx, generation_id: i64, doc_id: i64) -> Result<u64, StorageError> {
+    let affected = tx.execute(
         "DELETE FROM embedding_holes WHERE generation_id = ?1 AND doc_id = ?2",
         &params![generation_id, doc_id],
     )?;
-    Ok(())
+    Ok(u64::try_from(affected).unwrap_or(0))
 }
 
 /// Prune a `message_embeddings` row that was embedded but has since fallen
@@ -1144,6 +1148,31 @@ pub fn demote_active_generation_readiness_in_tx(tx: &Tx) -> Result<(), StorageEr
         "UPDATE embedding_generations SET audit_status = 'pending' \
          WHERE is_active = 1 AND audit_status != 'pending'",
         &[],
+    )?;
+    Ok(())
+}
+
+/// Like [`demote_active_generation_readiness_in_tx`], but scoped to one
+/// specific `generation_id` -- task book #81 R2-N3: the unscoped version
+/// demotes *whatever* generation currently holds `is_active = 1`, which is
+/// exactly right for the write entry points above (they always mutate
+/// against the active generation, by construction). A caller that instead
+/// knows the specific `generation_id` its own mutation targeted --
+/// [`prune_ineligible_message_embedding_in_tx`]'s caller, in particular --
+/// must not reach for the unscoped version: if that `generation_id` is
+/// ever a *not-yet-active* candidate (a real generation reuse/upgrade
+/// scenario, ruling ②) while some *other* generation is the currently
+/// active one, the unscoped version would demote the wrong (currently
+/// serving) generation instead of leaving it alone. This version demotes
+/// `generation_id` if and only if it is both the row this call means to
+/// touch and the currently active one.
+///
+/// No-op when `generation_id` is not active, or is already `'pending'`.
+pub fn demote_generation_readiness_if_active_in_tx(tx: &Tx, generation_id: i64) -> Result<(), StorageError> {
+    tx.execute(
+        "UPDATE embedding_generations SET audit_status = 'pending' \
+         WHERE id = ?1 AND is_active = 1 AND audit_status != 'pending'",
+        &params![generation_id],
     )?;
     Ok(())
 }

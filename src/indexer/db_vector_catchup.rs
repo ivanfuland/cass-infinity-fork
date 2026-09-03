@@ -402,18 +402,21 @@ pub fn run_db_vector_catchup_backfill(
                 "db_vector_catchup: writing off ineligible embedding_holes rows before spending an \
                  Infinity call on them (R1-W3-B1 / task book #81 R2)"
             );
-            storage
+            let written_off = storage
                 .raw()
                 .with_tx(TxMode::Immediate, |tx| {
+                    let mut written_off = 0u64;
                     for row in canonicalize_empty.iter().chain(out_of_eligibility_scope.iter()) {
-                        schema::write_off_ineligible_hole_in_tx(tx, generation_id, row.doc_id)?;
+                        written_off =
+                            written_off.saturating_add(schema::write_off_ineligible_hole_in_tx(tx, generation_id, row.doc_id)?);
                     }
-                    Ok(())
+                    Ok(written_off)
                 })
                 .context("writing off ineligible embedding_holes rows")?;
-            holes_written_off_ineligible = holes_written_off_ineligible
-                .saturating_add(u64::try_from(canonicalize_empty.len()).unwrap_or(0))
-                .saturating_add(u64::try_from(out_of_eligibility_scope.len()).unwrap_or(0));
+            // R2-N4: report what the DELETEs actually affected, not the
+            // size of the two candidate lists -- same discipline as
+            // R1-N3's fix to the reverse-reconciliation prune step below.
+            holes_written_off_ineligible = holes_written_off_ineligible.saturating_add(written_off);
         }
         if filtered.is_empty() {
             // Every row in this batch was just written off above, so the
@@ -569,15 +572,24 @@ pub fn run_db_vector_catchup_backfill(
                 // that certification would leave a *currently-serving*
                 // generation reporting `passed` between this commit and
                 // whatever later call re-audits it, i.e. exactly the
-                // false-green window `demote_active_generation_readiness_
-                // in_tx` exists to prevent for every other mutation
-                // category. Folding it into this same transaction, gated
-                // on `pruned > 0`, makes the demotion atomic with the
-                // delete it is compensating for -- no window where the
-                // deleted row is committed but the stale 'passed' status
-                // still reads back.
+                // false-green window this demotion exists to prevent for
+                // every other mutation category. Folding it into this same
+                // transaction, gated on `pruned > 0`, makes the demotion
+                // atomic with the delete it is compensating for -- no
+                // window where the deleted row is committed but the stale
+                // 'passed' status still reads back.
+                //
+                // R2-N3: scoped to this specific `generation_id`, not the
+                // unscoped `demote_active_generation_readiness_in_tx` --
+                // `generation_id` here is whatever `find_reusable_or_
+                // create_generation` returned at the top of this call,
+                // which by ruling ② can be a *not-yet-active* pending
+                // candidate while some *other* generation is the one
+                // currently serving reads. The unscoped demote would wrongly
+                // touch that other, currently-active generation instead of
+                // (correctly) doing nothing here.
                 if pruned > 0 {
-                    schema::demote_active_generation_readiness_in_tx(tx)?;
+                    schema::demote_generation_readiness_if_active_in_tx(tx, generation_id)?;
                 }
                 Ok(pruned)
             })
@@ -1438,7 +1450,7 @@ mod ineligible_embedding_prune_tests {
             .with_tx(TxMode::Immediate, |tx| {
                 let pruned = schema::prune_ineligible_message_embedding_in_tx(tx, generation_id, doc_b)?;
                 if pruned > 0 {
-                    schema::demote_active_generation_readiness_in_tx(tx)?;
+                    schema::demote_generation_readiness_if_active_in_tx(tx, generation_id)?;
                 }
                 Ok(pruned)
             })
@@ -1644,5 +1656,67 @@ mod ineligible_embedding_prune_tests {
         let eligible = scan_eligible_message_ids(&storage).expect("scan eligibility");
         assert!(eligible.contains(&doc_head), "the truncated-but-nonempty head message must stay eligible");
         assert!(!eligible.contains(&doc_tail), "the fully-cleared tail message must not be eligible");
+    }
+
+    /// Task book #81 R2-N3: `demote_generation_readiness_if_active_in_tx`
+    /// must only ever touch the exact `generation_id` it was called with,
+    /// even when that row is not (or is no longer) the active one --
+    /// unlike the unscoped `demote_active_generation_readiness_in_tx`,
+    /// which would demote whatever generation *is* currently active
+    /// instead, silently invalidating a certification the caller's own
+    /// mutation never touched.
+    #[test]
+    fn demote_generation_readiness_if_active_never_touches_a_different_active_generation() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_storage(&dir.path().join("db.sqlite"));
+
+        let gen_active = storage
+            .raw()
+            .with_tx(TxMode::Immediate, |tx| {
+                schema::create_embedding_generation(tx, "bge-m3", DIM, CANONICALIZE_PIPELINE_VERSION, TS)
+            })
+            .unwrap();
+        let gen_other = storage
+            .raw()
+            .with_tx(TxMode::Immediate, |tx| {
+                schema::create_embedding_generation(tx, "bge-m3", DIM, CANONICALIZE_PIPELINE_VERSION, TS + 1)
+            })
+            .unwrap();
+        storage
+            .raw()
+            .execute(
+                "UPDATE embedding_generations SET is_active = 1, audit_status = 'passed' WHERE id = ?1",
+                &params![gen_active],
+            )
+            .unwrap();
+        storage
+            .raw()
+            .execute("UPDATE embedding_generations SET is_active = 0, audit_status = 'passed' WHERE id = ?1", &params![gen_other])
+            .unwrap();
+
+        // Calling it for `gen_other` -- not active -- must be a true no-op
+        // for both rows: `gen_other` itself stays 'passed' (it is not the
+        // row this call is entitled to demote, since it is not active),
+        // and `gen_active` (a wholly different generation this call was
+        // never told about) must not be touched either.
+        storage
+            .raw()
+            .with_tx(TxMode::Immediate, |tx| schema::demote_generation_readiness_if_active_in_tx(tx, gen_other))
+            .unwrap();
+        assert_eq!(audit_status(&storage, gen_other), "passed", "a non-active generation must never be demoted by this call");
+        assert_eq!(
+            audit_status(&storage, gen_active),
+            "passed",
+            "a different generation (even the currently active one) must never be touched by a call scoped to gen_other"
+        );
+
+        // Calling it for `gen_active` -- the one actually active -- must
+        // demote exactly that row.
+        storage
+            .raw()
+            .with_tx(TxMode::Immediate, |tx| schema::demote_generation_readiness_if_active_in_tx(tx, gen_active))
+            .unwrap();
+        assert_eq!(audit_status(&storage, gen_active), "pending", "the active generation this call was scoped to must be demoted");
+        assert_eq!(audit_status(&storage, gen_other), "passed", "gen_other must still be untouched");
     }
 }

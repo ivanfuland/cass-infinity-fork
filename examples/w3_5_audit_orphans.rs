@@ -15,12 +15,18 @@
 //! from this binary regardless of which database path it is pointed at.
 //!
 //! `APPLY=1` switches to a writer connection and additionally *applies*
-//! the task book #80 fix's reverse-reconciliation step against whatever
-//! database `CASS_DATA_DIR` points at -- exactly what `run_db_vector_
-//! catchup_backfill`'s new prune step does (prune, then rebuild `vec0`),
-//! followed by the real `run_activation_audit` (no Infinity call inside
-//! it) to prove audit ④ actually recovers. Only ever point this at the
-//! read-only diagnostic copy, never at a production data dir.
+//! the task book #80/#81 fix's reverse-reconciliation step against
+//! whatever database `CASS_DATA_DIR` points at -- the same prune-then-
+//! demote-then-rebuild sequence `run_db_vector_catchup_backfill`'s own
+//! reverse-reconciliation step runs (not a byte-for-byte reproduction of
+//! the whole function: this drill only ever prunes, it never drains holes
+//! or embeds anything, since it has no Infinity indexer of its own) --
+//! then always runs the real `run_activation_audit` (no Infinity call
+//! inside it) regardless of whether there was anything to prune (R2-B2),
+//! so a clean database still gets a real pass/fail verdict instead of a
+//! silent "nothing to do". The process exit code reflects that verdict
+//! (R2-N5): 0 only if the audit actually passed. Only ever point this at
+//! the read-only diagnostic copy, never at a production data dir.
 //!
 //! R1-N4: no `examples/` target in this crate declares `required-features`
 //! in `Cargo.toml` (none exist there at all, including the sibling
@@ -211,10 +217,16 @@ fn main() -> Result<()> {
             storage
                 .raw()
                 .with_tx(TxMode::Immediate, |tx| {
+                    let mut pruned = 0u64;
                     for doc_id in &embedded_not_eligible {
-                        schema::prune_ineligible_message_embedding_in_tx(tx, generation_id, *doc_id)?;
+                        pruned = pruned.saturating_add(schema::prune_ineligible_message_embedding_in_tx(tx, generation_id, *doc_id)?);
                     }
-                    Ok(())
+                    // R1-B1/R2-N3: same atomic-demote discipline as the
+                    // production prune step, scoped to this generation_id.
+                    if pruned > 0 {
+                        schema::demote_generation_readiness_if_active_in_tx(tx, generation_id)?;
+                    }
+                    Ok(pruned)
                 })
                 .context("APPLY: pruning ineligible message_embeddings rows")?;
 
@@ -227,27 +239,35 @@ fn main() -> Result<()> {
             let vec0_rows = vector_domain::rebuild_vec0_table_for_generation(storage.raw(), generation_id, dim)
                 .context("APPLY: rebuilding vec0 table for generation")?;
             println!("APPLY: vec0_rows after rebuild = {vec0_rows}");
+        }
 
-            eprintln!("APPLY: running the real activation audit (no Infinity call) post-prune...");
-            let audit = run_activation_audit(&storage, generation_id, 5_000, None)
-                .context("APPLY: running activation audit post-prune")?;
-            println!(
-                "APPLY: post-prune activation audit passed={} embedded_not_eligible_count={} eligible_not_embedded_count={} \
-                 dim_mismatch_count={} finite_norm_violation_count={} foreign_key_violation_count={} \
-                 message_embeddings_rows_missing_from_vec0={} vec0_rows_missing_from_message_embeddings={} failure_reasons={:?}",
-                audit.passed,
-                audit.embedded_not_eligible_count,
-                audit.eligible_not_embedded_count,
-                audit.dim_mismatch_count,
-                audit.finite_norm_violation_count,
-                audit.foreign_key_violation_count,
-                audit.message_embeddings_rows_missing_from_vec0,
-                audit.vec0_rows_missing_from_message_embeddings,
-                audit.failure_reasons,
-            );
-            if !audit.passed {
-                anyhow::bail!("APPLY: activation audit still failing after the reverse-reconciliation prune -- fix is not sufficient");
-            }
+        // R2-B2: always run the real audit, whether or not there was
+        // anything to prune -- a clean database (already fully
+        // reconciled, or with nothing ever ineligible) deserves a real
+        // pass/fail verdict too, not a silently-skipped "nothing to do"
+        // that never actually confirmed the generation is activatable.
+        eprintln!("APPLY: running the real activation audit (no Infinity call)...");
+        let audit =
+            run_activation_audit(&storage, generation_id, 5_000, None).context("APPLY: running activation audit")?;
+        println!(
+            "APPLY: activation audit passed={} embedded_not_eligible_count={} eligible_not_embedded_count={} \
+             dim_mismatch_count={} finite_norm_violation_count={} foreign_key_violation_count={} \
+             message_embeddings_rows_missing_from_vec0={} vec0_rows_missing_from_message_embeddings={} failure_reasons={:?}",
+            audit.passed,
+            audit.embedded_not_eligible_count,
+            audit.eligible_not_embedded_count,
+            audit.dim_mismatch_count,
+            audit.finite_norm_violation_count,
+            audit.foreign_key_violation_count,
+            audit.message_embeddings_rows_missing_from_vec0,
+            audit.vec0_rows_missing_from_message_embeddings,
+            audit.failure_reasons,
+        );
+        // R2-N5: the exit code is the audit verdict, not merely "the
+        // prune-and-rebuild sequence didn't error" -- a caller scripting
+        // this drill must be able to trust `$?` alone.
+        if !audit.passed {
+            anyhow::bail!("APPLY: activation audit failed -- fix is not sufficient");
         }
     }
 
