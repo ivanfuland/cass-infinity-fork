@@ -1002,9 +1002,25 @@ pub fn write_off_ineligible_hole_in_tx(tx: &Tx, generation_id: i64, doc_id: i64)
 /// or a message the certification covered no longer does), so the claim
 /// must not survive uninvalidated. Intentionally unconditional (not
 /// case-by-case per mutation kind): over-invalidating just means W3-4's
-/// activation audit re-verifies before the next promotion, which is cheap;
-/// under-invalidating would let a stale "ready" claim keep serving results
-/// with an unverified/broken coverage guarantee, which is not.
+/// activation audit re-verifies before the next promotion, which is cheap.
+///
+/// **Known behavioral debt (R1-W3-B3, 2026-09-02 round-1 review, disclosed
+/// to Ivan, DEFERRED not fixed by task book #68):** demoting to
+/// `'pending'` here does *not* stop this generation from continuing to
+/// serve reads. `search_db_vector_domain` (`src/search/query.rs`) gates
+/// solely on `is_active = 1` and never consults `audit_status` at read
+/// time, so a demoted-but-still-active generation keeps answering queries
+/// off its now-uncertified `vec0` index -- this function only ever blocks
+/// *re-promotion* (the next activation audit must re-pass before
+/// `audit_status` can read `'passed'` again), it does not gate *current*
+/// service. The accepted tradeoff (same family as R1-W3-N6's daemon-
+/// acceptance debt): hard-blocking search on `audit_status` would make the
+/// vector domain unavailable for the entire ingest-to-catchup gap on every
+/// single write, which is availability-hostile for a corpus under active
+/// use; serving a brief coverage-gap window is the deliberate choice
+/// instead. Not a false claim of correctness -- see W3-4's own six/seven-
+/// invariant audit, which this demotion feeds -- but a real staleness
+/// window a reader should know this function does not close.
 ///
 /// No-op when there is no active generation, or the active generation is
 /// already `'pending'` — the common case for every write entry point that
