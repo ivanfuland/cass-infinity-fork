@@ -86017,16 +86017,18 @@ fn run_index_with_data(
                 ))
             })
             .unwrap_or((0, 0));
-        let (quarantined_conversations, lexical_update_deferred) = index_progress
-            .stats
-            .lock()
-            .map(|stats| {
-                (
-                    stats.quarantined_conversations,
-                    stats.lexical_update_deferred,
-                )
-            })
-            .unwrap_or_default();
+        let (quarantined_conversations, lexical_update_deferred, semantic_activated) =
+            index_progress
+                .stats
+                .lock()
+                .map(|stats| {
+                    (
+                        stats.quarantined_conversations,
+                        stats.lexical_update_deferred,
+                        stats.semantic_activated,
+                    )
+                })
+                .unwrap_or_default();
         let mut payload = serde_json::json!({
             "success": true,
             "elapsed_ms": elapsed_ms,
@@ -86040,6 +86042,15 @@ fn run_index_with_data(
             "quarantined_conversations": quarantined_conversations,
             "lexical_update_deferred": lexical_update_deferred,
         });
+        // R2-B1: unconditional (true or false) whenever this run requested
+        // semantic indexing -- `false` is a legitimate "ingested, holes not
+        // yet drained" state, not an error, but it must never be silently
+        // absent the way a discarded bool previously left it: exit 0 alone
+        // told a caller nothing about whether this run's semantic index
+        // actually became searchable.
+        if let Some(activated) = semantic_activated {
+            payload["activated"] = serde_json::json!(activated);
+        }
 
         // Add structured indexing stats if available (T7.4)
         if let Ok(stats) = index_progress.stats.lock()
@@ -86092,6 +86103,21 @@ fn run_index_with_data(
 
     if show_plain {
         eprintln!("index completed");
+        // R2-B1: same unconditional true/false disclosure as the JSON path
+        // -- `false` means this run ingested but the generation's holes
+        // weren't fully drained yet (rerun to continue), not a failure.
+        if let Ok(stats) = index_progress.stats.lock()
+            && let Some(activated) = stats.semantic_activated
+        {
+            eprintln!(
+                "semantic index: {}",
+                if activated {
+                    "activated"
+                } else {
+                    "not activated yet (holes remain; rerun to continue draining embedding_holes)"
+                }
+            );
+        }
     }
 
     match res {

@@ -926,6 +926,15 @@ pub struct IndexingStats {
     /// True when SQLite ingest succeeded but inline lexical updates were
     /// deferred and the caller must rebuild lexical assets from the archive.
     pub lexical_update_deferred: bool,
+    /// R2-B1: mirrors `run_semantic_db_vector_catchup`'s actual `activated`
+    /// result for the plain `cass index --semantic` path -- an incremental
+    /// pass that ingested but left the generation's holes undrained is a
+    /// legitimate state (this is a repeatable cron-style catch-up, not a
+    /// one-shot build), but callers must not read a `false` here as "semantic
+    /// index built successfully" the way exit-0 alone would suggest.
+    /// `None` when this run didn't request semantic indexing at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_activated: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -9899,7 +9908,12 @@ pub fn run_index(
             "deferring broad semantic indexing until targeted watch-once ingest completes"
         );
     } else if opts.semantic {
-        run_semantic_db_vector_catchup(&opts, "cass index --semantic")?;
+        let activated = run_semantic_db_vector_catchup(&opts, "cass index --semantic")?;
+        if let Some(p) = &opts.progress
+            && let Ok(mut stats) = p.stats.lock()
+        {
+            stats.semantic_activated = Some(activated);
+        }
     }
 
     if targeted_watch_once_only_run {
@@ -33693,6 +33707,36 @@ mod tests {
         let json = serde_json::to_string(&stats).unwrap();
         assert!(json.contains("consecutive_zero_scans"));
         assert!(json.contains("total_ingests"));
+    }
+
+    /// R2-B1: `semantic_activated` must be present (`true` or `false`) in
+    /// `IndexingStats`'s serialized form whenever a semantic pass ran --
+    /// the whole point of this field is that `false` (an unresolved
+    /// increment, a legitimate cron-model state) is never silently
+    /// indistinguishable from "no semantic pass ran at all" the way a
+    /// discarded bool at the `run_index` call site previously left it.
+    /// `None` (no semantic pass requested) is the one case allowed to
+    /// disappear from the JSON entirely (`skip_serializing_if`).
+    #[test]
+    fn indexing_stats_semantic_activated_serializes_unconditionally_when_present() {
+        let activated_false = IndexingStats { semantic_activated: Some(false), ..Default::default() };
+        let json = serde_json::to_value(&activated_false).unwrap();
+        assert_eq!(
+            json.get("semantic_activated"),
+            Some(&serde_json::json!(false)),
+            "an incomplete increment must still surface `activated: false`, not be silently absent"
+        );
+
+        let activated_true = IndexingStats { semantic_activated: Some(true), ..Default::default() };
+        let json = serde_json::to_value(&activated_true).unwrap();
+        assert_eq!(json.get("semantic_activated"), Some(&serde_json::json!(true)));
+
+        let no_semantic_pass = IndexingStats { semantic_activated: None, ..Default::default() };
+        let json = serde_json::to_value(&no_semantic_pass).unwrap();
+        assert!(
+            json.get("semantic_activated").is_none(),
+            "a run that never requested semantic indexing must omit the field, not report `null`"
+        );
     }
 
     #[test]
