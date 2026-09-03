@@ -3353,27 +3353,20 @@ impl SearchClient {
     /// instead of string-decode-shaped, per control-plane 2026-09-01's
     /// "甩掉 doc_id 解码历史包袱" ruling). Returns the query text plus its
     /// positional parameters, ready for `tx.query_all_map`.
-    fn build_db_vector_domain_filter_sql(
-        candidate_ids: &[i64],
+    /// Shared relational filter clauses (agents/workspaces/source/role/
+    /// created_from/created_to) for both DB-vector-domain SQL builders
+    /// below -- extracted (R1-W3-B6/N1/B9) so the post-KNN id-filter path
+    /// and the full-scan path can never drift apart on what "passes the
+    /// filters" means. Appends `AND ...` clauses onto `sql` and their
+    /// positional params onto `params` in place; assumes the query's
+    /// `FROM`/`JOIN`s already bind `m`=messages, `c`=conversations,
+    /// `w`=workspaces (LEFT JOIN), `s`=sources (LEFT JOIN).
+    fn push_db_vector_domain_relational_filters(
+        sql: &mut String,
+        params: &mut Vec<ParamValue>,
         filters: &SearchFilters,
         effective_roles: Option<&HashSet<u8>>,
-    ) -> (String, Vec<ParamValue>) {
-        let mut sql = String::from(
-            "SELECT m.id \
-             FROM messages m \
-             JOIN conversations c ON c.id = m.conversation_id \
-             LEFT JOIN workspaces w ON w.id = c.workspace_id \
-             LEFT JOIN sources s ON s.id = c.source_id \
-             WHERE 1=1",
-        );
-        let mut params: Vec<ParamValue> = Vec::new();
-
-        let id_placeholders = sql_placeholders(candidate_ids.len());
-        sql.push_str(&format!(" AND m.id IN ({id_placeholders})"));
-        for doc_id in candidate_ids {
-            params.push(ParamValue::from(*doc_id));
-        }
-
+    ) {
         if !filters.agents.is_empty() {
             let placeholders = sql_placeholders(filters.agents.len());
             sql.push_str(&format!(
@@ -3435,8 +3428,81 @@ impl SearchClient {
             sql.push_str(" AND m.created_at <= ?");
             params.push(ParamValue::from(created_to));
         }
+    }
+
+    fn build_db_vector_domain_filter_sql(
+        candidate_ids: &[i64],
+        filters: &SearchFilters,
+        effective_roles: Option<&HashSet<u8>>,
+    ) -> (String, Vec<ParamValue>) {
+        let mut sql = String::from(
+            "SELECT m.id \
+             FROM messages m \
+             JOIN conversations c ON c.id = m.conversation_id \
+             LEFT JOIN workspaces w ON w.id = c.workspace_id \
+             LEFT JOIN sources s ON s.id = c.source_id \
+             WHERE 1=1",
+        );
+        let mut params: Vec<ParamValue> = Vec::new();
+
+        let id_placeholders = sql_placeholders(candidate_ids.len());
+        sql.push_str(&format!(" AND m.id IN ({id_placeholders})"));
+        for doc_id in candidate_ids {
+            params.push(ParamValue::from(*doc_id));
+        }
+
+        Self::push_db_vector_domain_relational_filters(&mut sql, &mut params, filters, effective_roles);
 
         (sql, params)
+    }
+
+    /// R1-W3-B6/N1/B9's full-scan path: select `(doc_id, embedding)` for
+    /// every row of `generation_id` that passes the same relational
+    /// filters `build_db_vector_domain_filter_sql` applies post-KNN --
+    /// but *before* any distance computation, not after a `vec0` KNN call.
+    /// This is what lets the "widen to full coverage" retry in
+    /// `search_db_vector_domain` avoid `vec0`'s hard `k<=4096` ceiling
+    /// entirely: it never asks `vec0` for a k at all, it reads the
+    /// authoritative `message_embeddings` table directly and ranks the
+    /// (expected-small, precisely because this path only runs when the
+    /// filter was too selective for the first KNN pass to satisfy)
+    /// filtered subset by an application-layer cosine distance instead.
+    fn build_db_vector_domain_full_scan_sql(
+        generation_id: i64,
+        filters: &SearchFilters,
+        effective_roles: Option<&HashSet<u8>>,
+    ) -> (String, Vec<ParamValue>) {
+        let mut sql = String::from(
+            "SELECT me.doc_id, me.embedding \
+             FROM message_embeddings me \
+             JOIN messages m ON m.id = me.doc_id \
+             JOIN conversations c ON c.id = m.conversation_id \
+             LEFT JOIN workspaces w ON w.id = c.workspace_id \
+             LEFT JOIN sources s ON s.id = c.source_id \
+             WHERE me.generation_id = ?",
+        );
+        let mut params: Vec<ParamValue> = vec![ParamValue::from(generation_id)];
+
+        Self::push_db_vector_domain_relational_filters(&mut sql, &mut params, filters, effective_roles);
+
+        (sql, params)
+    }
+
+    /// Cosine distance matching `vec0`'s `distance_metric=cosine` (`1 -
+    /// cosine_similarity`) exactly, so a hit's distance/score is
+    /// indistinguishable to a caller whether it came from `vec0`'s KNN
+    /// scan (first round) or this application-layer computation (R1-W3-B6/
+    /// N1/B9's full-scan retry round). A degenerate zero vector on either
+    /// side has no defined direction, so it is treated as maximally
+    /// distant (`1.0`) rather than dividing by zero.
+    fn cosine_distance(a: &[f32], b: &[f32]) -> f64 {
+        let dot: f64 = a.iter().zip(b).map(|(&x, &y)| f64::from(x) * f64::from(y)).sum();
+        let norm_a: f64 = a.iter().map(|&x| f64::from(x) * f64::from(x)).sum::<f64>().sqrt();
+        let norm_b: f64 = b.iter().map(|&x| f64::from(x) * f64::from(x)).sum::<f64>().sqrt();
+        if norm_a == 0.0 || norm_b == 0.0 {
+            return 1.0;
+        }
+        1.0 - (dot / (norm_a * norm_b))
     }
 
     fn search_db_vector_domain(
@@ -3447,6 +3513,19 @@ impl SearchClient {
         fetch_limit: usize,
     ) -> Result<(Vec<VectorSearchResult>, SemanticCandidateRetryState)> {
         const OVERFETCH_FACTOR: usize = 4;
+        // R1-W3-B6/N1/B9: sqlite-vec 0.1.10's vec0 KNN implementation hard-
+        // rejects `k > 4096` as a genuine `SQLITE_ERROR` (`SQLITE_VEC_VEC0_
+        // K_MAX`, verified against the vendored C source, not a documented
+        // assumption) -- not a silent clamp. Any caller upstream of this
+        // function deriving a large `fetch_limit` (hybrid fusion's semantic-
+        // leg candidate budget compounding with this function's own
+        // `OVERFETCH_FACTOR`, B9's exec60-observed `--limit 5000` ->
+        // `k=80016` crash) must never let `first_k` below reach vec0 above
+        // this ceiling. This is the single choke point every DB-vector-
+        // domain KNN call passes through, so clamping here protects every
+        // caller at once rather than requiring each upstream candidate-
+        // budget computation to know about vec0's internal limit.
+        const SQLITE_VEC_KNN_K_MAX: usize = 4096;
 
         let effective_roles = filters.roles.clone().or_else(|| default_roles.cloned());
 
@@ -3509,7 +3588,11 @@ impl SearchClient {
             }
 
             let row_count_usize = usize::try_from(row_count).unwrap_or(usize::MAX);
-            let first_k = fetch_limit.saturating_mul(OVERFETCH_FACTOR).min(row_count_usize).max(1);
+            let first_k = fetch_limit
+                .saturating_mul(OVERFETCH_FACTOR)
+                .min(row_count_usize)
+                .min(SQLITE_VEC_KNN_K_MAX)
+                .max(1);
 
             let run_and_filter = |tx: &crate::storage::api::Tx, k: usize| -> Result<Vec<(i64, f64)>, crate::storage::api::StorageError> {
                 let blob = crate::storage::schema::f32_vector_to_le_blob(embedding);
@@ -3540,10 +3623,42 @@ impl SearchClient {
                     .collect())
             };
 
+            // R1-W3-B6/N1/B9: the "widen to full coverage" retry no longer
+            // asks `vec0` for a bigger `k` at all (that path is exactly what
+            // used to hard-error past `SQLITE_VEC_KNN_K_MAX`, or -- pre-fix,
+            // for a generation small enough to dodge that limit -- falsely
+            // report `has_more_candidates=false` for a scan that a caller
+            // upstream might not actually have widened all the way to
+            // `row_count_usize`). This retry only fires when the first
+            // KNN pass's overfetch window left fewer than `fetch_limit`
+            // *filtered* hits -- i.e. the relational filter is selective --
+            // so filtering *before* ranking (SQL `WHERE` over
+            // `message_embeddings` directly) and then computing distance
+            // only for that already-small passing subset in Rust is cheap
+            // in exactly the case that triggers it; a query whose filter
+            // isn't selective never gets here because the first pass
+            // already found enough.
+            let full_scan_by_distance = |tx: &crate::storage::api::Tx| -> Result<Vec<(i64, f64)>, crate::storage::api::StorageError> {
+                let (sql, params) = Self::build_db_vector_domain_full_scan_sql(
+                    generation_id,
+                    filters,
+                    effective_roles.as_ref(),
+                );
+                let rows: Vec<(i64, Vec<u8>)> =
+                    tx.query_all_map(&sql, &params, |row| Ok((row.get_typed(0)?, row.get_typed(1)?)))?;
+                let mut ranked = Vec::with_capacity(rows.len());
+                for (doc_id, blob) in rows {
+                    let vector = crate::storage::schema::le_blob_to_f32_vector(&blob)?;
+                    ranked.push((doc_id, Self::cosine_distance(&vector, embedding)));
+                }
+                ranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                Ok(ranked)
+            };
+
             let mut filtered = run_and_filter(tx, first_k)?;
             let mut has_more_candidates = first_k < row_count_usize;
             if filtered.len() < fetch_limit && first_k < row_count_usize {
-                filtered = run_and_filter(tx, row_count_usize)?;
+                filtered = full_scan_by_distance(tx)?;
                 has_more_candidates = false;
             }
 
@@ -15889,6 +16004,318 @@ mod tests {
             db3_message_ids(&storage, &filters),
             vec![3],
             "combined agent+workspace filter must AND, not OR, the two dimensions"
+        );
+    }
+
+    /// R1-W3-B6/N1/B9: the "widen to full coverage" retry no longer asks
+    /// `vec0` for a bigger `k` -- it filters `message_embeddings` directly
+    /// via SQL, then ranks the (small, by construction) passing subset by
+    /// an application-layer `cosine_distance`. This test forces that retry
+    /// path to actually fire (a selective workspace filter that excludes
+    /// every doc in the first KNN pass's overfetch window) and checks two
+    /// things: (a) the retry finds exactly the filter-passing docs, in the
+    /// correct nearest-first order; (b) the distance/score
+    /// `cosine_distance` computes for each of them is numerically
+    /// indistinguishable (matches to `f64` epsilon) from `vec0`'s own
+    /// distance for the exact same vectors -- i.e. the two ranking paths
+    /// are provably the same metric, not just "close enough" by
+    /// construction of this particular fixture.
+    #[test]
+    fn db_vector_domain_full_scan_retry_matches_vec0_distance_and_order() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        const DIM: i64 = 2;
+        const TOTAL_DOCS: i64 = 20;
+        // Three of the twenty docs (the farthest three from the query
+        // vector by construction) live in "/ws/target"; the other
+        // seventeen live in "/ws/other". Query vector is [1.0, 0.0];
+        // doc i's vector is [cos(theta_i), sin(theta_i)] with theta_i
+        // strictly increasing in i, so cosine distance from the query
+        // (1 - cos(theta_i)) is strictly increasing in i too -- doc 0 is
+        // the nearest, doc 19 the farthest, by construction, and the
+        // three target-workspace docs (17, 18, 19) are guaranteed to be
+        // the three farthest of all twenty.
+        let target_indices = [17_i64, 18, 19];
+        let mut vectors: Vec<(i64, i64, Vec<f32>)> = Vec::new();
+        for i in 0..TOTAL_DOCS {
+            let theta = (i as f32) * 0.1;
+            let message_id = 1000 + i;
+            let conversation_id = 1000 + i;
+            let workspace = if target_indices.contains(&i) { "/ws/target" } else { "/ws/other" };
+            seed_db3_message(
+                &storage,
+                &Db3SeedMessage {
+                    agent_slug: "codex",
+                    workspace_path: Some(workspace),
+                    source_id: "local",
+                    role: "user",
+                    created_at: 100 + i,
+                    message_id,
+                    conversation_id,
+                },
+            );
+            vectors.push((message_id, conversation_id, vec![theta.cos(), theta.sin()]));
+        }
+        let generation_id = seed_active_generation_with_vectors(&storage, DIM, &vectors);
+        let query_vector = [1.0_f32, 0.0];
+
+        // fetch_limit=2 -> OVERFETCH_FACTOR(4) -> first_k=8, comfortably
+        // less than TOTAL_DOCS(20) so the retry condition
+        // (`first_k < row_count_usize`) is live, and the 8 nearest docs
+        // (indices 0..8) contain zero /ws/target docs, so the first pass's
+        // `filtered.len()` is 0 < fetch_limit(2) -- the retry must fire.
+        let mut filters = SearchFilters::default();
+        filters.workspaces.insert("/ws/target".to_string());
+        let (results, retry) = SearchClient::search_db_vector_domain(
+            storage.raw(),
+            &query_vector,
+            &filters,
+            Some(&HashSet::from([
+                crate::search::vector_index::ROLE_USER,
+                crate::search::vector_index::ROLE_ASSISTANT,
+            ])),
+            2,
+        )
+        .unwrap();
+
+        assert!(!retry.has_more_candidates, "the full-scan retry covers the entire filtered universe");
+
+        let got_ids: Vec<u64> = results.iter().map(|r| r.message_id).collect();
+        assert_eq!(
+            got_ids,
+            vec![1017, 1018, 1019],
+            "must find exactly the three /ws/target docs, nearest-first (theta strictly increasing in doc index)"
+        );
+
+        // Ground truth: ask vec0 itself (k=20, nowhere near the 4096 cap)
+        // for every doc's distance from the same query vector, then
+        // restrict to the three target ids -- this is what `vec0` itself
+        // says their distances are, independent of the full-scan path
+        // under test.
+        let vec0_truth: std::collections::HashMap<i64, f64> =
+            crate::storage::vector_domain::vec0_knn(storage.raw(), generation_id, &query_vector, 20)
+                .unwrap()
+                .into_iter()
+                .collect();
+        for hit in &results {
+            let doc_id = i64::try_from(hit.message_id).unwrap();
+            let vec0_distance = *vec0_truth.get(&doc_id).expect("vec0 must have scored every doc");
+            let full_scan_distance = f64::from(1.0 - hit.score);
+            assert!(
+                (vec0_distance - full_scan_distance).abs() < 1e-6,
+                "doc {doc_id}: vec0 distance {vec0_distance} vs full-scan distance {full_scan_distance} must match"
+            );
+        }
+    }
+
+    /// R1-W3-B9 (exec60 real-corpus gate run, 2026-09-02): `search_hybrid`'s
+    /// semantic leg fetch_limit (`hybrid_candidate_budget`'s
+    /// `semantic_candidates`, itself a multiplier on the caller's raw
+    /// `--limit`) compounds with this function's own `OVERFETCH_FACTOR`
+    /// before ever reaching vec0 -- exec60 observed `--limit 5000` derive
+    /// `k=80016`, a hard SQL crash (rc=9) pre-fix. Rather than replicate
+    /// hybrid's exact multiplier chain (which would also need a working
+    /// lexical index, unrelated to what this is actually testing), this
+    /// calls `search_db_vector_domain` directly with a `fetch_limit` far
+    /// past `SQLITE_VEC_KNN_K_MAX` on its own -- proving the clamp at this
+    /// single choke point protects the DB-vector-domain KNN call
+    /// regardless of which upstream caller (hybrid fusion, a future
+    /// caller, or hybrid's real formula for this exact scenario) derived
+    /// an oversized number.
+    ///
+    /// The corpus must exceed `SQLITE_VEC_KNN_K_MAX`(4096) itself: with a
+    /// small corpus, `first_k`'s existing `.min(row_count_usize)` term
+    /// alone already keeps `first_k` under the limit regardless of whether
+    /// the dedicated k-max clamp exists, which would make this test pass
+    /// even with that clamp deleted (verified: an earlier draft of this
+    /// test using a 4-doc fixture did exactly that -- caught by this
+    /// item's mutation-kill check, not by review). 4200 docs at dim=4 (not
+    /// bge-m3's real 1024) keeps fixture setup fast; only the k-value
+    /// itself is under test here, not distance correctness (that's
+    /// `db_vector_domain_full_scan_retry_matches_vec0_distance_and_order`'s
+    /// job) or realistic-scale latency (that's the perf disclosure probe
+    /// below).
+    #[test]
+    fn db_vector_domain_fetch_limit_far_past_sqlite_vec_k_max_does_not_crash() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        const DIM: i64 = 4;
+        const TOTAL_DOCS: i64 = 4_200;
+
+        let agent_id = storage
+            .ensure_agent(&Agent { id: None, slug: "codex".to_string(), name: "codex".to_string(), version: None, kind: AgentKind::Cli })
+            .unwrap();
+        let conn = storage.raw();
+        conn.execute(
+            "INSERT OR IGNORE INTO sources(id, kind, created_at, updated_at) VALUES ('local', 'local', 0, 0)",
+            &[],
+        )
+        .unwrap();
+        let mut vectors: Vec<(i64, i64, Vec<f32>)> = Vec::with_capacity(TOTAL_DOCS as usize);
+        conn.with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
+            for i in 0..TOTAL_DOCS {
+                let message_id = 3_000_000 + i;
+                let conversation_id = 3_000_000 + i;
+                tx.execute(
+                    "INSERT INTO conversations(id, agent_id, source_id, title, source_path) \
+                     VALUES (?1, ?2, 'local', 't', ?3)",
+                    &[
+                        ParamValue::from(conversation_id),
+                        ParamValue::from(agent_id),
+                        ParamValue::from(format!("/tmp/c-{conversation_id}.jsonl")),
+                    ],
+                )?;
+                tx.execute(
+                    "INSERT INTO messages(id, conversation_id, idx, role, created_at, content) \
+                     VALUES (?1, ?2, 0, 'user', ?3, 'c')",
+                    &crate::storage::api::params![message_id, conversation_id, 100 + i],
+                )?;
+                let theta = (i as f32) * 0.001;
+                vectors.push((message_id, conversation_id, vec![theta.cos(), theta.sin(), 0.0, 0.0]));
+            }
+            Ok(())
+        })
+        .unwrap();
+        seed_active_generation_with_vectors(&storage, DIM, &vectors);
+
+        // 80_016 mirrors exec60's exact observed derived-k crash value for
+        // `--limit 5000` in hybrid mode.
+        let (results, retry) = SearchClient::search_db_vector_domain(
+            storage.raw(),
+            &[1.0, 0.0, 0.0, 0.0],
+            &SearchFilters::default(),
+            Some(&HashSet::from([
+                crate::search::vector_index::ROLE_USER,
+                crate::search::vector_index::ROLE_ASSISTANT,
+                crate::search::vector_index::ROLE_TOOL,
+            ])),
+            80_016,
+        )
+        .expect("an oversized fetch_limit must never reach vec0's k<=4096 hard limit");
+        assert!(!retry.has_more_candidates, "a fetch_limit this far past row_count must exhaust the corpus");
+        assert_eq!(results.len(), TOTAL_DOCS as usize, "an unfiltered query must return every doc in the corpus");
+    }
+
+    /// R1-W3-B6/N1/B9 real-scale performance disclosure. Advisor's
+    /// acceptance criteria called for a real probe against a
+    /// low-selectivity query that triggers the full-scan retry at
+    /// production-representative scale ("staging, expect sub-second").
+    /// This worktree's isolation contract (task book #68) forbids
+    /// touching the staging DB or its vecsnapshot -- exec60's live gate
+    /// run is using both concurrently -- so this probe substitutes a
+    /// synthetic corpus instead: 20,000 rows at bge-m3's real production
+    /// dimension (1024), ~5x past `SQLITE_VEC_KNN_K_MAX`, with a filter
+    /// selective enough (5 of 20,000 rows, 0.025%) that the first KNN
+    /// pass's overfetch window (`first_k` capped at 4096) is virtually
+    /// guaranteed to miss all of them, forcing the retry every run. Vector
+    /// *content* doesn't affect the retry's cost model (BLOB read +
+    /// decode + dot product is the same work regardless of whether the
+    /// numbers are real embeddings or synthetic), so synthetic vectors are
+    /// a legitimate substitute for the cost measurement itself; the
+    /// distance/order *correctness* claim is already independently proven
+    /// by `db_vector_domain_full_scan_retry_matches_vec0_distance_and_order`
+    /// above.
+    /// `#[ignore]`d (not part of the default suite -- a 20k-row seed plus
+    /// a full-scan measurement is disk/CPU work with no assertion beyond
+    /// "printed a number", not a correctness regression test); run
+    /// explicitly with `--ignored` to reproduce this disclosure's numbers.
+    #[test]
+    #[ignore = "perf disclosure probe (R1-W3-B6/N1/B9); run explicitly with --ignored"]
+    fn db_vector_domain_full_scan_retry_perf_disclosure_at_20k_rows() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        const DIM: i64 = 1024;
+        const TOTAL_DOCS: i64 = 20_000;
+        const TARGET_DOCS: i64 = 5;
+
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".to_string(),
+                name: "codex".to_string(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        let other_ws = storage.ensure_workspace(std::path::Path::new("/ws/other"), None).unwrap();
+        let target_ws = storage.ensure_workspace(std::path::Path::new("/ws/target"), None).unwrap();
+
+        let seed_start = std::time::Instant::now();
+        let conn = storage.raw();
+        conn.execute(
+            "INSERT OR IGNORE INTO sources(id, kind, created_at, updated_at) VALUES ('local', 'local', 0, 0)",
+            &[],
+        )
+        .unwrap();
+        let mut vectors: Vec<(i64, i64, Vec<f32>)> = Vec::with_capacity(TOTAL_DOCS as usize);
+        conn.with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
+            for i in 0..TOTAL_DOCS {
+                let message_id = 2_000_000 + i;
+                let conversation_id = 2_000_000 + i;
+                let is_target = i >= TOTAL_DOCS - TARGET_DOCS;
+                let workspace_id = if is_target { target_ws } else { other_ws };
+                tx.execute(
+                    "INSERT INTO conversations(id, agent_id, workspace_id, source_id, title, source_path) \
+                     VALUES (?1, ?2, ?3, 'local', 't', ?4)",
+                    &[
+                        ParamValue::from(conversation_id),
+                        ParamValue::from(agent_id),
+                        ParamValue::from(workspace_id),
+                        ParamValue::from(format!("/tmp/c-{conversation_id}.jsonl")),
+                    ],
+                )?;
+                tx.execute(
+                    "INSERT INTO messages(id, conversation_id, idx, role, created_at, content) \
+                     VALUES (?1, ?2, 0, 'user', ?3, 'c')",
+                    &crate::storage::api::params![message_id, conversation_id, 100 + i],
+                )?;
+                // Deterministic pseudo-random unit-ish vector -- content
+                // doesn't matter for a cost measurement, only that it's a
+                // valid non-zero DIM-wide f32 vector.
+                let vector: Vec<f32> =
+                    (0..DIM).map(|d| ((i * 1_103_515_245 + d * 12_345 + 1) as f32 * 0.618_034).sin()).collect();
+                vectors.push((message_id, conversation_id, vector));
+            }
+            Ok(())
+        })
+        .unwrap();
+        let generation_id = seed_active_generation_with_vectors(&storage, DIM, &vectors);
+        let seed_elapsed = seed_start.elapsed();
+
+        let mut filters = SearchFilters::default();
+        filters.workspaces.insert("/ws/target".to_string());
+        let query_vector: Vec<f32> = (0..DIM).map(|d| (d as f32 * 0.001).cos()).collect();
+
+        let search_start = std::time::Instant::now();
+        let (results, retry) = SearchClient::search_db_vector_domain(
+            storage.raw(),
+            &query_vector,
+            &filters,
+            Some(&HashSet::from([
+                crate::search::vector_index::ROLE_USER,
+                crate::search::vector_index::ROLE_ASSISTANT,
+            ])),
+            2,
+        )
+        .unwrap();
+        let search_elapsed = search_start.elapsed();
+
+        assert!(!retry.has_more_candidates, "full-scan retry must have covered the entire filtered universe");
+        assert_eq!(
+            results.len(),
+            TARGET_DOCS as usize,
+            "must find exactly the {TARGET_DOCS} /ws/target docs out of {TOTAL_DOCS} total"
+        );
+
+        // Disclosure, not an assertion of a specific bound -- generation_id
+        // is asserted live so a future run against a rebuilt fixture stays
+        // meaningful.
+        assert!(generation_id > 0);
+        eprintln!(
+            "[R1-W3-B6/N1/B9 perf disclosure] rows={TOTAL_DOCS} dim={DIM} target_docs={TARGET_DOCS} \
+             seed_ms={} search_ms={}",
+            seed_elapsed.as_millis(),
+            search_elapsed.as_millis()
         );
     }
 
