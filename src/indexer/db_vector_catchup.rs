@@ -867,12 +867,49 @@ pub fn run_activation_audit_and_record(
     finite_norm_sample_size: usize,
     positive_check_doc_id: Option<i64>,
 ) -> Result<ActivationAuditReport> {
+    // R3-1: this standalone re-audit entry point runs the same
+    // out-of-transaction, multi-query audit `switch_active_generation`'s
+    // activation path does (see the `pre_audit_watermark_message_id`
+    // block above) and is exposed to the identical TOCTOU window -- a
+    // message landing, or a non-max-id message getting deleted, between
+    // the audit's reads and this function's `audit_status` write would
+    // otherwise get silently certified `passed` over a now-stale
+    // snapshot. Reuses `verify_no_activation_toctou_drift_in_tx` (R2-B2's
+    // guard) rather than reinventing it.
+    let pre_audit_watermark_message_id: i64 = storage
+        .raw()
+        .query_row_map("SELECT COALESCE(MAX(id), 0) FROM messages", &[], |row| row.get_typed(0))
+        .context("reading pre-audit messages high-water mark")?;
+    let pre_audit_message_count: i64 = storage
+        .raw()
+        .query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0))
+        .context("reading pre-audit messages row count")?;
     let report = run_activation_audit(storage, generation_id, finite_norm_sample_size, positive_check_doc_id)?;
     let new_status = if report.passed { "passed" } else { "failed" };
     storage
         .raw()
         .with_tx_no_replay(TxMode::Immediate, |tx| {
-            tx.execute("UPDATE embedding_generations SET audit_status = ?1 WHERE id = ?2", &params![new_status, generation_id])
+            if new_status == "passed" {
+                schema::verify_no_activation_toctou_drift_in_tx(
+                    tx,
+                    generation_id,
+                    pre_audit_watermark_message_id,
+                    pre_audit_message_count,
+                )?;
+            }
+            let changed = tx.execute(
+                "UPDATE embedding_generations SET audit_status = ?1 WHERE id = ?2",
+                &params![new_status, generation_id],
+            )?;
+            if changed != 1 {
+                return Err(StorageError::Constraint {
+                    detail: format!(
+                        "run_activation_audit_and_record: expected to update exactly 1 row for \
+                         generation {generation_id}, changed {changed} (R3-1)"
+                    ),
+                });
+            }
+            Ok(())
         })
         .context("recording activation audit verdict")?;
     Ok(report)

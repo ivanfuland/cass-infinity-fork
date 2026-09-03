@@ -13,7 +13,7 @@
 //! (dim/finite/norm/FK violations), exactly the class of defect this
 //! audit exists to catch post-hoc.
 
-use coding_agent_search::indexer::db_vector_catchup::run_activation_audit_and_record;
+use coding_agent_search::indexer::db_vector_catchup::{run_activation_audit, run_activation_audit_and_record};
 use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
 use coding_agent_search::search::canonicalize::CANONICALIZE_PIPELINE_VERSION;
 use coding_agent_search::storage::api::{TxMode, Value as V};
@@ -530,5 +530,81 @@ fn audit_check7_anti_join_cost_disclosure_at_20k_rows() {
         seed_elapsed.as_millis(),
         anti_join_elapsed.as_millis(),
         full_audit_elapsed.as_millis()
+    );
+}
+
+/// R3-1 (2026-09-02 W3 PR round-3 review): `run_activation_audit_and_record`
+/// -- the standalone re-audit entry point for a generation that is already
+/// `is_active` -- used to write `audit_status='passed'` unconditionally,
+/// with none of the in-transaction TOCTOU re-verification the activation
+/// path (`run_db_vector_catchup_backfill`, wired through
+/// `switch_active_generation`'s `verify` closure -- see
+/// `w3_b2_activation_toctou_guard.rs`) already applies before *its*
+/// `audit_status='passed'` write. Both call sites run the identical
+/// out-of-transaction, multi-query audit and are exposed to the identical
+/// window: a non-max-id message deleted between the audit's reads and the
+/// write would otherwise get silently certified `passed` over a
+/// now-stale snapshot (R2-B2: the row-count leg of the guard, not the
+/// watermark leg, is what catches this specific shape -- deleting a
+/// non-max-id message never moves `MAX(id)`).
+///
+/// The fix reuses `verify_no_activation_toctou_drift_in_tx` inside
+/// `run_activation_audit_and_record`'s own write transaction, exactly as
+/// `w3_b2_activation_toctou_guard.rs`'s
+/// `switch_aborts_when_a_non_max_id_message_is_deleted_after_the_count_was_captured`
+/// already proves for the sibling call site. This test reproduces
+/// `run_activation_audit_and_record`'s fixed control flow by hand --
+/// capture the same pre-audit watermark/count it does, run the real
+/// [`run_activation_audit`], delete a non-max-id message, then attempt
+/// the exact guarded write the fix performs -- for the same reason that
+/// file's tests do: injecting a real concurrent write strictly *inside*
+/// a single already-returned function call needs either a timing race
+/// (flaky) or a test-only instrumentation hook in production code
+/// (over-engineering for this call site); reproducing the composition
+/// with the real primitives is deterministic and exercises the identical
+/// guard call this fix adds.
+#[test]
+fn audit_and_record_write_path_aborts_when_a_non_max_id_message_is_deleted_after_the_audit_snapshot() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let storage = open_storage(&dir.path().join("db.sqlite"));
+    let (gen_id, doc_a, doc_b) = clean_two_message_fixture(&storage);
+    assert_eq!(audit_status_of(&storage, gen_id), "pending", "前置：新代际起始为 pending");
+
+    // Mirrors `run_activation_audit_and_record`'s own first two reads,
+    // captured -- as the real function does -- before the audit runs.
+    let pre_audit_watermark_message_id: i64 =
+        storage.raw().query_row_map("SELECT COALESCE(MAX(id), 0) FROM messages", fparams![], |row| row.get_typed(0)).unwrap();
+    let pre_audit_message_count: i64 =
+        storage.raw().query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| row.get_typed(0)).unwrap();
+    assert_eq!(pre_audit_watermark_message_id, doc_b, "sanity: doc_b (the later message) is the watermark");
+
+    let report = run_activation_audit(&storage, gen_id, 100, None).expect("audit must run without a hard error");
+    assert!(report.passed, "clean fixture must pass every check before the simulated drift: {:?}", report.failure_reasons);
+
+    // Simulate a concurrent forget/purge of the *earlier* message -- not
+    // the one at the watermark -- landing between the audit's reads and
+    // the write below.
+    storage.raw().execute("DELETE FROM messages WHERE id = ?1", fparams![doc_a]).unwrap();
+    let watermark_after_delete: i64 =
+        storage.raw().query_row_map("SELECT COALESCE(MAX(id), 0) FROM messages", fparams![], |row| row.get_typed(0)).unwrap();
+    assert_eq!(
+        watermark_after_delete, pre_audit_watermark_message_id,
+        "sanity: the watermark itself must be unchanged by this delete -- otherwise the watermark leg alone would already catch it"
+    );
+
+    // The exact write `run_activation_audit_and_record`'s fix performs.
+    let result = storage.raw().with_tx_no_replay(TxMode::Immediate, |tx| {
+        schema::verify_no_activation_toctou_drift_in_tx(tx, gen_id, pre_audit_watermark_message_id, pre_audit_message_count)?;
+        tx.execute("UPDATE embedding_generations SET audit_status = 'passed' WHERE id = ?1", fparams![gen_id])
+    });
+
+    assert!(
+        result.is_err(),
+        "a non-max-id message deletion between the audit's reads and the write must abort the passed-write"
+    );
+    assert_eq!(
+        audit_status_of(&storage, gen_id),
+        "pending",
+        "an aborted audit-and-record write must never leave audit_status='passed'"
     );
 }
