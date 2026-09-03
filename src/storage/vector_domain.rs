@@ -138,6 +138,60 @@ pub fn count_vec0_rows_for_generation(conn: &Conn, generation_id: i64) -> Result
     conn.query_row_map(&format!("SELECT COUNT(*) FROM {table}"), &[], |row| row.get_typed(0))
 }
 
+/// R2-B4: bidirectional identity-set anti-join between `message_embeddings`
+/// and `generation_id`'s `vec0` table -- activation audit check ⑦'s
+/// original `COUNT(*)` comparison ([`count_vec0_rows_for_generation`] vs.
+/// `COUNT(*) FROM message_embeddings`) only catches a *size* mismatch. An
+/// equal-size swap (N rows missing from one side exactly offset by N
+/// different extra rows on the other -- e.g. a rebuild racing a concurrent
+/// forget/replace that drops doc A and adds doc B between the read and the
+/// populate) sails through a plain count comparison with both sides
+/// reporting the same number, passing an audit over a `vec0` index that is
+/// silently indexing the wrong document for at least one entry. Same
+/// "same size != same set" discipline check ④
+/// ([`eligible_not_embedded_count`]/[`embedded_not_eligible_count`] in
+/// `db_vector_catchup.rs`) already applies one layer up, in
+/// `message_embeddings` vs. eligibility; this closes the analogous gap one
+/// layer down, between `message_embeddings` and its derived `vec0` index.
+///
+/// Returns `(missing_from_vec0, extra_in_vec0)`: the count of
+/// `message_embeddings` doc_ids for `generation_id` absent from `vec0`'s
+/// rowid set, and the count of `vec0` rowids absent from
+/// `message_embeddings`'s doc_id set for `generation_id`. Both must be `0`
+/// for the two sides to hold the identical identity set; `vec0`'s `rowid`
+/// is `message_embeddings.doc_id` by construction
+/// ([`rebuild_vec0_table_for_generation`]'s `INSERT INTO {table}(rowid,
+/// embedding)`), so a plain `NOT EXISTS` anti-join on `rowid = doc_id` is
+/// exact, not an approximation.
+pub fn count_vec0_message_embeddings_set_mismatch_for_generation(
+    conn: &Conn,
+    generation_id: i64,
+) -> Result<(i64, i64), StorageError> {
+    validate_generation_id_for_ddl(generation_id)?;
+    let table = vec0_table_name(generation_id);
+    let missing_from_vec0: i64 = conn.query_row_map(
+        &format!(
+            "SELECT COUNT(*) FROM message_embeddings me \
+             WHERE me.generation_id = ?1 \
+               AND NOT EXISTS (SELECT 1 FROM {table} v WHERE v.rowid = me.doc_id)"
+        ),
+        &params![generation_id],
+        |row| row.get_typed(0),
+    )?;
+    let extra_in_vec0: i64 = conn.query_row_map(
+        &format!(
+            "SELECT COUNT(*) FROM {table} v \
+             WHERE NOT EXISTS ( \
+                 SELECT 1 FROM message_embeddings me \
+                 WHERE me.generation_id = ?1 AND me.doc_id = v.rowid \
+             )"
+        ),
+        &params![generation_id],
+        |row| row.get_typed(0),
+    )?;
+    Ok((missing_from_vec0, extra_in_vec0))
+}
+
 /// Rebuild `generation_id`'s `vec0` index from `message_embeddings` in one
 /// transaction (drop + recreate + bulk-populate) — w3-d9②'s atomicity
 /// discipline: an interruption anywhere in this function leaves the

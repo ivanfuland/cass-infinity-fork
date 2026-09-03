@@ -420,3 +420,115 @@ fn audit_fails_on_vec0_row_count_deficit_against_message_embeddings() {
     );
     assert_eq!(audit_status_of(&storage, gen_id), "failed");
 }
+
+/// R2-B4: the equal-size shape check ⑦'s original plain `COUNT(*)`
+/// comparison could not see -- vec0 loses `doc_b`'s row but gains a
+/// different, unrelated one, so `vec0_row_count` (2) still equals
+/// `message_embeddings_row_count` (2) even though the two tables no
+/// longer hold the same identity set. A pre-fix count-only check ⑦ would
+/// have reported this generation `passed`; the bidirectional anti-join
+/// must catch it.
+#[test]
+fn audit_fails_on_equal_size_vec0_identity_set_swap() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let storage = open_storage(&dir.path().join("db.sqlite"));
+    let (gen_id, _doc_a, doc_b) = clean_two_message_fixture(&storage);
+
+    let vec0_table = format!("vec_index_gen_{gen_id}");
+    // Swap doc_b's row out for an unrelated bogus rowid -- vec0's row
+    // count stays 2 (equal to message_embeddings' 2), but the identity
+    // sets now disagree: message_embeddings has {doc_a, doc_b}, vec0 has
+    // {doc_a, 999_999}.
+    storage.raw().execute(&format!("DELETE FROM {vec0_table} WHERE rowid = ?1"), fparams![doc_b]).unwrap();
+    let bogus_blob = coding_agent_search::storage::schema::f32_vector_to_le_blob(&[0.0, 0.0, 1.0, 0.0]);
+    storage
+        .raw()
+        .execute(&format!("INSERT INTO {vec0_table}(rowid, embedding) VALUES (999999, ?1)"), fparams![bogus_blob])
+        .unwrap();
+
+    let report = run_activation_audit_and_record(&storage, gen_id, 100, None).expect("audit runs, verdict is failure not an error");
+    assert!(
+        !report.passed,
+        "an equal-size but mismatched-identity-set vec0 index must fail the audit, not pass on count alone"
+    );
+    assert_eq!(report.vec0_row_count, 2, "sanity: vec0's plain row count must equal message_embeddings' (the shape this test targets)");
+    assert_eq!(report.message_embeddings_row_count, 2);
+    assert_eq!(report.message_embeddings_rows_missing_from_vec0, 1, "doc_b must be reported missing from vec0");
+    assert_eq!(report.vec0_rows_missing_from_message_embeddings, 1, "the bogus rowid must be reported extra in vec0");
+    assert!(
+        report.failure_reasons.iter().any(|r| r.contains('⑦')),
+        "failure reasons must name check ⑦: {:?}",
+        report.failure_reasons
+    );
+    assert_eq!(audit_status_of(&storage, gen_id), "failed");
+}
+
+/// R2-B4 real-scale cost disclosure: the bidirectional anti-join
+/// ([`vector_domain::count_vec0_message_embeddings_set_mismatch_for_generation`])
+/// runs two `NOT EXISTS` subqueries per activation audit, replacing what
+/// was a single `COUNT(*)` comparison -- this discloses what that costs at
+/// a 20k-row generation, the scale item B6 already used for its own
+/// disclosure. `dim=4` (not bge-m3's real 1024): the anti-join only
+/// compares `rowid`/`doc_id` identity, never decodes a vector, so the
+/// embedding dimension does not affect this specific check's cost --
+/// check ②'s finite/norm resample is the only audit step that does, and
+/// its `finite_norm_sample_size` is fixed regardless of corpus size.
+/// `#[ignore]`d for the same reason as B6's sibling probe: 20k rows of
+/// direct-`tx.execute` seeding is disk/CPU work with no correctness
+/// assertion beyond "printed a number", not a regression test; run
+/// explicitly with `--ignored` to reproduce this disclosure's numbers.
+#[test]
+#[ignore = "perf disclosure probe (R2-B4); run explicitly with --ignored"]
+fn audit_check7_anti_join_cost_disclosure_at_20k_rows() {
+    use coding_agent_search::storage::api::TxMode as TM;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let storage = open_storage(&dir.path().join("db.sqlite"));
+    const TOTAL_DOCS: i64 = 20_000;
+    const DIM: i64 = 4;
+
+    let agent_id = ensure_agent(&storage);
+    let conn = storage.raw();
+    conn.execute("INSERT OR IGNORE INTO sources(id, kind, created_at, updated_at) VALUES ('local', 'local', 0, 0)", fparams![])
+        .unwrap();
+
+    let seed_start = std::time::Instant::now();
+    let gen_id = conn.with_tx_no_replay(TM::Immediate, |tx| schema::create_embedding_generation(tx, "bge-m3", DIM, CANONICALIZE_PIPELINE_VERSION, TS)).unwrap();
+    conn.with_tx_no_replay(TM::Immediate, |tx| {
+        for i in 0..TOTAL_DOCS {
+            let message_id = 9_000_000 + i;
+            tx.execute(
+                "INSERT INTO conversations(id, agent_id, source_id, title, source_path) VALUES (?1, ?2, 'local', 't', ?3)",
+                fparams![message_id, agent_id, format!("/tmp/c-{message_id}.jsonl")],
+            )?;
+            tx.execute(
+                "INSERT INTO messages(id, conversation_id, idx, role, created_at, content) VALUES (?1, ?2, 0, 'user', ?3, 'c')",
+                fparams![message_id, message_id, TS + i],
+            )?;
+            let theta = (i as f32) * 0.001;
+            schema::insert_message_embedding(tx, gen_id, message_id, message_id, &[theta.cos(), theta.sin(), 0.0, 0.0], "seed-hash", None, TS)?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    vector_domain::create_vec0_table_for_generation(conn, gen_id, DIM).unwrap();
+    vector_domain::rebuild_vec0_table_for_generation(conn, gen_id, DIM).unwrap();
+    let seed_elapsed = seed_start.elapsed();
+
+    let anti_join_start = std::time::Instant::now();
+    let (missing_from_vec0, extra_in_vec0) = vector_domain::count_vec0_message_embeddings_set_mismatch_for_generation(conn, gen_id).unwrap();
+    let anti_join_elapsed = anti_join_start.elapsed();
+    assert_eq!((missing_from_vec0, extra_in_vec0), (0, 0), "sanity: freshly rebuilt vec0 must match message_embeddings exactly");
+
+    let full_audit_start = std::time::Instant::now();
+    let report = run_activation_audit_and_record(&storage, gen_id, 100, None).expect("audit runs on a clean 20k-row generation");
+    let full_audit_elapsed = full_audit_start.elapsed();
+    assert!(report.passed, "a freshly seeded, freshly rebuilt 20k-row generation must pass every check");
+
+    eprintln!(
+        "[R2-B4 perf disclosure] rows={TOTAL_DOCS} dim={DIM} seed_ms={} anti_join_only_ms={} full_audit_ms={}",
+        seed_elapsed.as_millis(),
+        anti_join_elapsed.as_millis(),
+        full_audit_elapsed.as_millis()
+    );
+}

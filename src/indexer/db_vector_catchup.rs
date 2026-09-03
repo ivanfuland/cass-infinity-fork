@@ -558,12 +558,22 @@ pub struct ActivationAuditReport {
     /// (the pragma itself has no generation scope; a dangling FK anywhere
     /// is disqualifying).
     pub foreign_key_violation_count: usize,
-    /// ⑦ vec0-vs-authoritative-table row-count reconciliation (R1-W3-B5):
-    /// `-1` for `vec0_row_count` means the count itself errored (most
-    /// commonly the `vec0` table not existing for this generation at
-    /// all), distinct from a genuine `0`.
+    /// ⑦ vec0-vs-authoritative-table reconciliation (R1-W3-B5, upgraded to
+    /// a bidirectional anti-join by R2-B4). `-1` for `vec0_row_count` means
+    /// the count itself errored (most commonly the `vec0` table not
+    /// existing for this generation at all), distinct from a genuine `0`;
+    /// `message_embeddings_rows_missing_from_vec0`/
+    /// `vec0_rows_missing_from_message_embeddings` stay `0` in that same
+    /// errored case (the anti-join is skipped, not run against a missing
+    /// table). The plain row counts are kept as a cheap diagnostic pair,
+    /// not the pass/fail signal -- the anti-join counts are (see
+    /// [`crate::storage::vector_domain::count_vec0_message_embeddings_set_mismatch_for_generation`]'s
+    /// doc comment for why a size-only comparison can miss an equal-size
+    /// identity-set swap).
     pub vec0_row_count: i64,
     pub message_embeddings_row_count: i64,
+    pub message_embeddings_rows_missing_from_vec0: i64,
+    pub vec0_rows_missing_from_message_embeddings: i64,
     pub failure_reasons: Vec<String>,
 }
 
@@ -761,14 +771,19 @@ pub fn run_activation_audit(
         failures.push(format!("⑥ PRAGMA foreign_key_check reported {foreign_key_violation_count} violation(s)"));
     }
 
-    // ⑦ vec0-vs-authoritative-table row-count reconciliation (R1-W3-B5):
-    // none of checks ①-⑥ would ever notice `vec0` missing rows wholesale
-    // -- ①/②/④ only ever read `message_embeddings`, and ③'s KNN probe
-    // only ever confirms one specific row's presence in `vec0`, never the
-    // total. A rebuild that silently populated fewer rows than it read
-    // (or one simply never re-run after `message_embeddings` grew) would
-    // otherwise sail through every prior check and still get certified
-    // `passed`. A cheap `COUNT(*)` on each side closes that gap.
+    // ⑦ vec0-vs-authoritative-table reconciliation (R1-W3-B5, upgraded to
+    // a bidirectional anti-join by R2-B4): none of checks ①-⑥ would ever
+    // notice `vec0` disagreeing with `message_embeddings` on *which* rows
+    // it holds -- ①/②/④ only ever read `message_embeddings`, and ③'s KNN
+    // probe only ever confirms one specific row's presence in `vec0`,
+    // never the full set. A plain `COUNT(*)` comparison closes the
+    // wholesale-loss gap (a rebuild that silently populated fewer rows
+    // than it read) but not an equal-size identity-set swap (N rows
+    // missing from one side exactly offset by N different extra rows on
+    // the other -- both counts still match). The anti-join closes that:
+    // both `message_embeddings_rows_missing_from_vec0` and
+    // `vec0_rows_missing_from_message_embeddings` must be `0` to pass;
+    // the plain counts are retained purely as a cheap diagnostic pair.
     let message_embeddings_row_count: i64 = conn.query_row_map(
         "SELECT COUNT(*) FROM message_embeddings WHERE generation_id = ?1",
         &params![generation_id],
@@ -784,10 +799,18 @@ pub fn run_activation_audit(
             -1
         }
     };
-    if vec0_row_count >= 0 && vec0_row_count != message_embeddings_row_count {
+    let (message_embeddings_rows_missing_from_vec0, vec0_rows_missing_from_message_embeddings) =
+        if vec0_row_count >= 0 {
+            vector_domain::count_vec0_message_embeddings_set_mismatch_for_generation(conn, generation_id)?
+        } else {
+            (0, 0)
+        };
+    if message_embeddings_rows_missing_from_vec0 != 0 || vec0_rows_missing_from_message_embeddings != 0 {
         failures.push(format!(
-            "⑦ vec0 row-count mismatch for generation {generation_id}: vec0 has \
-             {vec0_row_count} row(s), message_embeddings has {message_embeddings_row_count}"
+            "⑦ vec0/message_embeddings identity-set mismatch for generation {generation_id}: \
+             {message_embeddings_rows_missing_from_vec0} message_embeddings row(s) missing from vec0, \
+             {vec0_rows_missing_from_message_embeddings} vec0 row(s) missing from message_embeddings \
+             (vec0 has {vec0_row_count} row(s), message_embeddings has {message_embeddings_row_count})"
         ));
     }
 
@@ -809,6 +832,8 @@ pub fn run_activation_audit(
         foreign_key_violation_count,
         vec0_row_count,
         message_embeddings_row_count,
+        message_embeddings_rows_missing_from_vec0,
+        vec0_rows_missing_from_message_embeddings,
         failure_reasons: failures,
     })
 }
