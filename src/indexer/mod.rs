@@ -892,6 +892,18 @@ pub struct SemanticWatchOnceStats {
     pub reason: String,
 }
 
+/// R4-4: one `DbVectorCatchupReport::cleanup_failures` entry, reshaped
+/// from its internal `(generation_id, error)` tuple into the same
+/// `{generation_id, error}` object shape `cass models backfill` already
+/// emits for this exact data (lib.rs:97446-97449), so both surfaces
+/// render identically instead of drifting into two ad hoc JSON shapes
+/// for the same underlying failure.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SemanticCleanupFailure {
+    pub generation_id: i64,
+    pub error: String,
+}
+
 /// Aggregate indexing statistics for JSON output (T7.4).
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct IndexingStats {
@@ -935,6 +947,15 @@ pub struct IndexingStats {
     /// `None` when this run didn't request semantic indexing at all.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub semantic_activated: Option<bool>,
+    /// R4-4: `DbVectorCatchupReport::cleanup_failures` from the same
+    /// `run_semantic_db_vector_catchup` call, previously discarded at
+    /// that call's `Ok(report.activated)` return -- `cass models
+    /// backfill`'s two output paths (lib.rs:97446-97465) already surface
+    /// this same data for its own catch-up call, but the standard `cass
+    /// index --semantic` path silently dropped it. Empty on the common
+    /// case (nothing failed to clean up).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cleanup_failures: Vec<SemanticCleanupFailure>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -8447,14 +8468,27 @@ impl Drop for ScanWatermarkRestoreGuard {
 /// `activated` flag (R1-W3-B1: previously discarded as `Ok(())`, which is
 /// exactly what let every caller -- including `run_targeted_semantic_
 /// watch_once_publish` -- report success/`published: true` regardless of
-/// whether the generation ever actually reached `active+passed`). Callers
-/// must not treat `Ok(false)` as an error: a catch-up call draining a
-/// large hole backlog in bounded batches, or one that just wrote off an
-/// ineligible hole this pass, is expected to return without activating
-/// and needs a subsequent call to finish -- that is the documented
-/// "idempotent, safe to rerun" contract, not a failure.
+/// whether the generation ever actually reached `active+passed`) and,
+/// separately (R4-4), the same report's `cleanup_failures` -- also
+/// previously discarded here (only the `cass models backfill` call site
+/// that hits `run_db_vector_catchup_backfill` directly, lib.rs:97395-
+/// 97465, ever saw it; this function's callers, including the standard
+/// `cass index --semantic` path, could not). Callers must not treat
+/// `activated: false` as an error: a catch-up call draining a large hole
+/// backlog in bounded batches, or one that just wrote off an ineligible
+/// hole this pass, is expected to return without activating and needs a
+/// subsequent call to finish -- that is the documented "idempotent, safe
+/// to rerun" contract, not a failure.
+struct SemanticDbVectorCatchupOutcome {
+    activated: bool,
+    cleanup_failures: Vec<(i64, String)>,
+}
+
 #[cfg(feature = "infinity")]
-fn run_semantic_db_vector_catchup(opts: &IndexOptions, caller: &str) -> Result<bool> {
+fn run_semantic_db_vector_catchup(
+    opts: &IndexOptions,
+    caller: &str,
+) -> Result<SemanticDbVectorCatchupOutcome> {
     if opts.embedder != "infinity" {
         anyhow::bail!(
             "{caller}: --embedder {} is retired (W3-5, frankensearch/fsvi removed); \
@@ -8498,11 +8532,17 @@ fn run_semantic_db_vector_catchup(opts: &IndexOptions, caller: &str) -> Result<b
              same command to continue draining embedding_holes"
         );
     }
-    Ok(report.activated)
+    Ok(SemanticDbVectorCatchupOutcome {
+        activated: report.activated,
+        cleanup_failures: report.cleanup_failures,
+    })
 }
 
 #[cfg(not(feature = "infinity"))]
-fn run_semantic_db_vector_catchup(_opts: &IndexOptions, caller: &str) -> Result<bool> {
+fn run_semantic_db_vector_catchup(
+    _opts: &IndexOptions,
+    caller: &str,
+) -> Result<SemanticDbVectorCatchupOutcome> {
     anyhow::bail!(
         "{caller}: semantic indexing requires the `infinity` feature (fsvi-backed semantic \
          indexing was retired in W3-5); rebuild with --features infinity"
@@ -9908,11 +9948,16 @@ pub fn run_index(
             "deferring broad semantic indexing until targeted watch-once ingest completes"
         );
     } else if opts.semantic {
-        let activated = run_semantic_db_vector_catchup(&opts, "cass index --semantic")?;
+        let outcome = run_semantic_db_vector_catchup(&opts, "cass index --semantic")?;
         if let Some(p) = &opts.progress
             && let Ok(mut stats) = p.stats.lock()
         {
-            stats.semantic_activated = Some(activated);
+            stats.semantic_activated = Some(outcome.activated);
+            stats.cleanup_failures = outcome
+                .cleanup_failures
+                .into_iter()
+                .map(|(generation_id, error)| SemanticCleanupFailure { generation_id, error })
+                .collect();
         }
     }
 
@@ -10202,7 +10247,7 @@ pub fn run_index(
                             &opts_clone,
                             "cass index --semantic (watch)",
                         ) {
-                            Ok(_activated) => {
+                            Ok(_outcome) => {
                                 if let Ok(mut t) = last_semantic_embed.lock() {
                                     *t = Instant::now();
                                 }
@@ -10603,7 +10648,8 @@ fn run_targeted_semantic_watch_once_publish(
             "semantic watch-once indexed zero conversations; refusing to publish semantic success"
         );
     }
-    let activated = run_semantic_db_vector_catchup(opts, "cass index --semantic --watch-once")?;
+    let activated =
+        run_semantic_db_vector_catchup(opts, "cass index --semantic --watch-once")?.activated;
     Ok(SemanticWatchOnceStats {
         published: activated,
         selected_docs: indexed_conversations,
@@ -33737,6 +33783,110 @@ mod tests {
             json.get("semantic_activated").is_none(),
             "a run that never requested semantic indexing must omit the field, not report `null`"
         );
+    }
+
+    /// R4-4: `IndexingStats.cleanup_failures` must mirror the `semantic_
+    /// activated` disclosure rule above -- present (a JSON array of
+    /// `{generation_id, error}` objects, the same shape `cass models
+    /// backfill` already emits for this data, lib.rs:97446-97449) whenever
+    /// the DB-vector-domain catch-up recorded a cleanup failure, absent
+    /// entirely on the common case (nothing failed to clean up), never a
+    /// bare `[]`.
+    #[test]
+    fn indexing_stats_cleanup_failures_serializes_only_when_non_empty() {
+        let with_failure = IndexingStats {
+            cleanup_failures: vec![SemanticCleanupFailure {
+                generation_id: 7,
+                error: "delete failed: disk I/O error".to_string(),
+            }],
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&with_failure).unwrap();
+        assert_eq!(
+            json.get("cleanup_failures"),
+            Some(&serde_json::json!([{"generation_id": 7, "error": "delete failed: disk I/O error"}])),
+            "a real cleanup failure must surface in the same {{generation_id, error}} shape `cass models backfill` already uses"
+        );
+
+        let no_failures = IndexingStats::default();
+        let json = serde_json::to_value(&no_failures).unwrap();
+        assert!(
+            json.get("cleanup_failures").is_none(),
+            "the common case (nothing failed to clean up) must omit the field, not report an empty array"
+        );
+    }
+
+    /// R4-4: the standard `cass index --semantic` path (`run_index`'s
+    /// `opts.semantic` branch) previously discarded `DbVectorCatchupReport
+    /// ::cleanup_failures` entirely -- `run_semantic_db_vector_catchup`
+    /// returned only `Ok(report.activated)`. Reuses the exact R3-6 scan-
+    /// failure fixture (`cleanup_folds_a_scan_failure_into_ok_outcome_
+    /// failures_instead_of_propagating_as_err`, tests/w3_vector_generation
+    /// _cleanup.rs) -- renaming `embedding_generations.created_at` breaks
+    /// only the orphan-scan query's own `WHERE` clause (no pre-existing
+    /// generation rows needed to trigger it) -- to get a *real* cleanup
+    /// failure out of production code, not a hand-typed string, then
+    /// applies the exact outcome-to-stats mapping `run_index`'s `opts.
+    /// semantic` branch applies, and confirms the result is both present
+    /// on `IndexingStats` and reaches its JSON serialization -- the
+    /// disclosure surface this finding is actually about. Does not call
+    /// `run_semantic_db_vector_catchup` itself: that function starts with
+    /// `probe_served_embed_identity`, an unconditional live-Infinity HTTP
+    /// call this workspace has no mock server for (the existing `#[ignore
+    /// = "requires a live Infinity service..."]` tests in tests/w3_5_n3_
+    /// generation_reuse.rs hit the same constraint for the same reason).
+    #[test]
+    #[cfg(feature = "infinity")]
+    fn cleanup_failure_from_a_real_scan_failure_maps_into_stats_and_its_json() {
+        let dir = TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).expect("open db");
+        storage
+            .raw()
+            .execute(
+                "ALTER TABLE embedding_generations RENAME COLUMN created_at TO created_at_renamed_for_test",
+                &[],
+            )
+            .expect("break the orphan-scan query's own WHERE clause");
+
+        let cleanup_outcome = crate::indexer::db_vector_catchup::cleanup_orphaned_generations(
+            &storage,
+            FrankenStorage::now_millis(),
+        )
+        .expect("R3-6: a scan-level failure must fold into Ok(outcome.failures), not propagate as Err");
+        assert_eq!(
+            cleanup_outcome.failures.len(),
+            1,
+            "the scan failure itself must be recorded: {:?}",
+            cleanup_outcome.failures
+        );
+        assert_eq!(cleanup_outcome.failures[0].0, 0, "a scan-level failure has no real generation_id");
+        assert!(cleanup_outcome.failures[0].1.contains("orphan-scan"));
+
+        // The exact mapping `run_index`'s `opts.semantic` branch applies to
+        // `run_semantic_db_vector_catchup`'s return value.
+        let db_outcome = SemanticDbVectorCatchupOutcome {
+            activated: false,
+            cleanup_failures: cleanup_outcome.failures,
+        };
+        let mut stats = IndexingStats::default();
+        stats.semantic_activated = Some(db_outcome.activated);
+        stats.cleanup_failures = db_outcome
+            .cleanup_failures
+            .into_iter()
+            .map(|(generation_id, error)| SemanticCleanupFailure { generation_id, error })
+            .collect();
+
+        assert_eq!(stats.cleanup_failures.len(), 1);
+        assert_eq!(stats.cleanup_failures[0].generation_id, 0);
+        assert!(stats.cleanup_failures[0].error.contains("orphan-scan"));
+
+        let json = serde_json::to_value(&stats).unwrap();
+        let failures_json = json
+            .get("cleanup_failures")
+            .expect("cleanup_failures must be present in JSON when non-empty");
+        assert_eq!(failures_json[0]["generation_id"], serde_json::json!(0));
+        assert!(failures_json[0]["error"].as_str().unwrap().contains("orphan-scan"));
     }
 
     /// R3-4: R2-B1 above proves `semantic_activated` reaches the JSON

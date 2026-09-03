@@ -86021,14 +86021,26 @@ fn run_index_with_data(
                 // a TTY user running `cass index --semantic` never saw
                 // whether the semantic index actually became searchable
                 // this run.
-                if let Ok(stats) = index_progress.stats.lock()
-                    && let Some(activated) = stats.semantic_activated
-                {
-                    message.push_str(if activated {
-                        ", semantic index: activated"
-                    } else {
-                        ", semantic index: not activated yet (holes remain; rerun to continue draining embedding_holes)"
-                    });
+                if let Ok(stats) = index_progress.stats.lock() {
+                    if let Some(activated) = stats.semantic_activated {
+                        message.push_str(if activated {
+                            ", semantic index: activated"
+                        } else {
+                            ", semantic index: not activated yet (holes remain; rerun to continue draining embedding_holes)"
+                        });
+                    }
+                    // R4-4: same disclosure as the JSON (`indexing_stats.
+                    // cleanup_failures`) and Plain (`eprintln!` below)
+                    // paths -- a TTY user must see the same signal, not
+                    // just "activated: true/false" with a housekeeping
+                    // failure silently missing from the one line they
+                    // actually watch.
+                    if !stats.cleanup_failures.is_empty() {
+                        message.push_str(&format!(
+                            ", cleanup failures: {}",
+                            stats.cleanup_failures.len()
+                        ));
+                    }
                 }
                 pb.finish_with_message(message);
             }
@@ -86182,17 +86194,27 @@ fn run_index_with_data(
         // R2-B1: same unconditional true/false disclosure as the JSON path
         // -- `false` means this run ingested but the generation's holes
         // weren't fully drained yet (rerun to continue), not a failure.
-        if let Ok(stats) = index_progress.stats.lock()
-            && let Some(activated) = stats.semantic_activated
-        {
-            eprintln!(
-                "semantic index: {}",
-                if activated {
-                    "activated"
-                } else {
-                    "not activated yet (holes remain; rerun to continue draining embedding_holes)"
+        if let Ok(stats) = index_progress.stats.lock() {
+            if let Some(activated) = stats.semantic_activated {
+                eprintln!(
+                    "semantic index: {}",
+                    if activated {
+                        "activated"
+                    } else {
+                        "not activated yet (holes remain; rerun to continue draining embedding_holes)"
+                    }
+                );
+            }
+            // R4-4: same `cleanup_failures` disclosure as the JSON
+            // (`indexing_stats.cleanup_failures`) and Bars paths above --
+            // previously only `cass models backfill`'s human-output branch
+            // (lib.rs:97460-97465) printed this for its own catch-up call.
+            if !stats.cleanup_failures.is_empty() {
+                eprintln!("semantic index cleanup failures: {}", stats.cleanup_failures.len());
+                for failure in &stats.cleanup_failures {
+                    eprintln!("  - generation {}: {}", failure.generation_id, failure.error);
                 }
-            );
+            }
         }
     }
 
