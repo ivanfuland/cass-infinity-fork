@@ -19182,6 +19182,10 @@ fn state_meta_json_inner(
             "audit_status": s.audit_status,
             "embedded_count": s.embedded_count,
             "any_generation": s.any_generation,
+            // R1-N7: Some(detail) here means a query against an already-
+            // opened DB failed -- the fields above are NOT a trustworthy
+            // "no generation" absence signal in that case.
+            "error": s.error,
         })),
         "ingest_quarantine": ingest_quarantine_json,
         "policy_registry": policy_registry,

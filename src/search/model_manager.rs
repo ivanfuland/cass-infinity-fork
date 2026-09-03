@@ -327,13 +327,29 @@ fn probe_db_vector_domain_availability(db_path: &Path) -> SemanticAvailability {
         }
     };
     let conn = storage.raw();
-    let active: Option<(String, String)> = conn
-        .query_opt_map(
-            "SELECT embedder_id, audit_status FROM embedding_generations WHERE is_active = 1",
-            &[],
-            |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
-        )
-        .unwrap_or(None);
+    // R1-N7: a genuine SQL error here (corrupted table, malformed schema
+    // after a botched migration, etc.) previously fell through
+    // `.unwrap_or(None)`/`.unwrap_or(0)` as if it meant "no active
+    // generation" / "zero generations" -- indistinguishable from the
+    // db_path's own honest empty/absent state below, so a real error
+    // reported the same `IndexBuilding`/`IndexMissing` a caller would see
+    // for a perfectly healthy but genuinely-not-ready-yet database. Both
+    // queries now propagate their error through the same
+    // `DatabaseUnavailable` variant `open_readonly`'s own failure already
+    // uses above, instead of being swallowed into a default.
+    let active: Option<(String, String)> = match conn.query_opt_map(
+        "SELECT embedder_id, audit_status FROM embedding_generations WHERE is_active = 1",
+        &[],
+        |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+    ) {
+        Ok(active) => active,
+        Err(err) => {
+            return SemanticAvailability::DatabaseUnavailable {
+                db_path: db_path.to_path_buf(),
+                error: err.to_string(),
+            };
+        }
+    };
     if let Some((embedder_id, audit_status)) = active {
         return if audit_status == "passed" {
             SemanticAvailability::Ready { embedder_id }
@@ -347,9 +363,15 @@ fn probe_db_vector_domain_availability(db_path: &Path) -> SemanticAvailability {
         };
     }
 
-    let any_generation: i64 = conn
-        .query_row_map("SELECT COUNT(*) FROM embedding_generations", &[], |row| row.get_typed(0))
-        .unwrap_or(0);
+    let any_generation: i64 = match conn.query_row_map("SELECT COUNT(*) FROM embedding_generations", &[], |row| row.get_typed(0)) {
+        Ok(count) => count,
+        Err(err) => {
+            return SemanticAvailability::DatabaseUnavailable {
+                db_path: db_path.to_path_buf(),
+                error: err.to_string(),
+            };
+        }
+    };
     if any_generation > 0 {
         return SemanticAvailability::IndexBuilding {
             embedder_id: String::new(),
@@ -377,30 +399,53 @@ pub(crate) struct DbVectorDomainStatus {
     pub audit_status: Option<String>,
     pub embedded_count: Option<i64>,
     pub any_generation: bool,
+    /// R1-N7: a genuine SQL error against an already-opened database (as
+    /// opposed to the database itself failing to open at all, which stays
+    /// `None` from this function per its own doc comment) used to be
+    /// swallowed into the same fields a real "no active generation"/"zero
+    /// generations" absence produces -- indistinguishable from a
+    /// perfectly healthy but genuinely-empty database. `Some(detail)`
+    /// here means the fields above are NOT a trustworthy absence signal;
+    /// `None` means they are.
+    pub error: Option<String>,
 }
 
 /// `None` only when the database itself cannot be opened read-only --
 /// callers that already know `db_opened` is false should skip calling
-/// this rather than treat `None` as a meaningful status of its own.
+/// this rather than treat `None` as a meaningful status of its own. R1-N7:
+/// a query failing against a database that DID open is a different,
+/// distinguishable failure -- reported via `DbVectorDomainStatus.error`,
+/// not folded into the same fields a genuine "no active generation"/"zero
+/// generations" absence produces.
 pub(crate) fn probe_db_vector_domain_status(db_path: &Path) -> Option<DbVectorDomainStatus> {
     let storage = FrankenStorage::open_readonly(db_path).ok()?;
     let conn = storage.raw();
-    let active: Option<(i64, String, i64, String)> = conn
-        .query_opt_map(
-            "SELECT id, embedder_id, dim, audit_status FROM embedding_generations WHERE is_active = 1",
-            &[],
-            |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?, row.get_typed(3)?)),
-        )
-        .ok()
-        .flatten();
+    let error_status = |err: &dyn std::fmt::Display| DbVectorDomainStatus {
+        active: false,
+        embedder_id: None,
+        dim: None,
+        audit_status: None,
+        embedded_count: None,
+        any_generation: false,
+        error: Some(err.to_string()),
+    };
+    let active: Option<(i64, String, i64, String)> = match conn.query_opt_map(
+        "SELECT id, embedder_id, dim, audit_status FROM embedding_generations WHERE is_active = 1",
+        &[],
+        |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?, row.get_typed(3)?)),
+    ) {
+        Ok(active) => active,
+        Err(err) => return Some(error_status(&err)),
+    };
     if let Some((generation_id, embedder_id, dim, audit_status)) = active {
-        let embedded_count: i64 = conn
-            .query_row_map(
-                "SELECT COUNT(*) FROM message_embeddings WHERE generation_id = ?1",
-                &params![generation_id],
-                |row| row.get_typed(0),
-            )
-            .unwrap_or(0);
+        let embedded_count: i64 = match conn.query_row_map(
+            "SELECT COUNT(*) FROM message_embeddings WHERE generation_id = ?1",
+            &params![generation_id],
+            |row| row.get_typed(0),
+        ) {
+            Ok(count) => count,
+            Err(err) => return Some(error_status(&err)),
+        };
         return Some(DbVectorDomainStatus {
             active: true,
             embedder_id: Some(embedder_id),
@@ -408,12 +453,14 @@ pub(crate) fn probe_db_vector_domain_status(db_path: &Path) -> Option<DbVectorDo
             audit_status: Some(audit_status),
             embedded_count: Some(embedded_count),
             any_generation: true,
+            error: None,
         });
     }
 
-    let any_generation: i64 = conn
-        .query_row_map("SELECT COUNT(*) FROM embedding_generations", &[], |row| row.get_typed(0))
-        .unwrap_or(0);
+    let any_generation: i64 = match conn.query_row_map("SELECT COUNT(*) FROM embedding_generations", &[], |row| row.get_typed(0)) {
+        Ok(count) => count,
+        Err(err) => return Some(error_status(&err)),
+    };
     Some(DbVectorDomainStatus {
         active: false,
         embedder_id: None,
@@ -421,6 +468,7 @@ pub(crate) fn probe_db_vector_domain_status(db_path: &Path) -> Option<DbVectorDo
         audit_status: None,
         embedded_count: None,
         any_generation: any_generation > 0,
+        error: None,
     })
 }
 
@@ -981,6 +1029,45 @@ mod tests {
             matches!(availability, SemanticAvailability::IndexBuilding { .. }),
             "expected IndexBuilding, got {availability:?}"
         );
+    }
+
+    /// R1-N7: a genuine SQL error querying `embedding_generations` (here,
+    /// the table itself vanishing -- corruption, a botched migration, a
+    /// concurrent DROP-and-recreate race -- but any SQL error takes the
+    /// same code path) previously fell through `.unwrap_or(None)`/
+    /// `.unwrap_or(0)` and reported the exact same `IndexMissing`/
+    /// `IndexBuilding` states a genuinely absent/building library
+    /// produces -- indistinguishable from those two legitimate states.
+    /// Must now report `DatabaseUnavailable` instead.
+    fn db_with_embedding_generations_table_dropped(dir: &std::path::Path) -> PathBuf {
+        let db_path = dir.join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).expect("open production storage");
+        storage.raw().execute("DROP TABLE embedding_generations", &[]).expect("drop the table to force a real SQL error");
+        storage.close().unwrap();
+        db_path
+    }
+
+    #[test]
+    fn probe_db_vector_domain_availability_reports_database_unavailable_on_sql_error_not_absent_or_building() {
+        let dir = tempdir().unwrap();
+        let db_path = db_with_embedding_generations_table_dropped(dir.path());
+        let availability = probe_db_vector_domain_availability(&db_path);
+        assert!(
+            matches!(availability, SemanticAvailability::DatabaseUnavailable { .. }),
+            "a genuine SQL error must report DatabaseUnavailable, not IndexMissing/IndexBuilding: {availability:?}"
+        );
+        assert!(!matches!(availability, SemanticAvailability::IndexMissing { .. }));
+        assert!(!matches!(availability, SemanticAvailability::IndexBuilding { .. }));
+    }
+
+    #[test]
+    fn probe_db_vector_domain_status_reports_the_error_field_on_sql_error_not_a_fabricated_absence() {
+        let dir = tempdir().unwrap();
+        let db_path = db_with_embedding_generations_table_dropped(dir.path());
+        let status = probe_db_vector_domain_status(&db_path).expect("the database itself opened fine -- only the query inside it failed");
+        assert!(status.error.is_some(), "a genuine SQL error must be reported via the error field, not silently absorbed into active=false/any_generation=false");
+        assert!(!status.active);
+        assert!(!status.any_generation);
     }
 
     #[cfg(feature = "infinity")]
