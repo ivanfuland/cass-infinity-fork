@@ -91,6 +91,47 @@ struct HoleMessageRow {
     role: String,
 }
 
+/// What to do with one drained `embedding_holes` row (task book #81, R2
+/// review). A pure function -- no I/O -- so the two write-off reasons are
+/// directly unit-testable without a database or a live Infinity service.
+///
+/// Root cause this closes: before this fix, the drain loop's own
+/// defensive filter only checked `canonicalize_for_embedding(&row.content)
+/// .is_empty()`, never whether `row.doc_id` was actually in the
+/// eligibility snapshot the same call already computed. A hole gets
+/// registered unconditionally for every newly-ingested message
+/// (`register_embedding_hole_for_new_message_in_tx` has no eligibility
+/// filter of its own), including one whose conversation has already
+/// crossed the shared 8 MiB per-conversation content cap (`#290`) -- such
+/// a row's *raw* content is non-empty (canonicalize check passes) even
+/// though it is not, and never was, in `eligible_ids` for this call. The
+/// old loop embedded it anyway (a real Infinity call, GPU cycles spent),
+/// only for the reverse-reconciliation prune step further down to delete
+/// it again immediately -- and worse, since that embed happens *during*
+/// this call (`created_at >= now_ms`), the R1-N2 snapshot scope on that
+/// prune step correctly refuses to touch it, so it survives to fail
+/// activation audit ④ instead (the diag3 exit-9 failure this fix
+/// resolves). Catching it here, at the same triage point the
+/// canonicalize-empty case already used, avoids the wasted embed *and*
+/// the possibility of it ever reaching `message_embeddings` in the first
+/// place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HoleDisposition {
+    Embed,
+    WriteOffCanonicalizeEmpty,
+    WriteOffOutOfEligibilityScope,
+}
+
+fn classify_hole_row(row: &HoleMessageRow, eligible_id_set: &HashSet<i64>) -> HoleDisposition {
+    if canonicalize_for_embedding(&row.content).is_empty() {
+        HoleDisposition::WriteOffCanonicalizeEmpty
+    } else if !eligible_id_set.contains(&row.doc_id) {
+        HoleDisposition::WriteOffOutOfEligibilityScope
+    } else {
+        HoleDisposition::Embed
+    }
+}
+
 /// w3-3 Step0 design ruling ①/②, extended by R1-W3-N3: find an
 /// identity-matching (`embedder_id` + `dim` + `canonicalize_version`, all
 /// three exact) generation to keep draining holes on, in priority order,
@@ -289,6 +330,13 @@ pub fn run_db_vector_catchup_backfill(
         find_reusable_or_create_generation(storage.raw(), &identity, dim, now_ms)?;
 
     let eligible_ids = scan_eligible_message_ids(storage)?;
+    // Task book #81 (R2 review, root cause of the exit-9 diag3 gate②
+    // failure): the *drain loop* below and the reverse-reconciliation
+    // prune step near the end of this function both need "is this doc_id
+    // in the eligibility snapshot" -- built once, right after the scan
+    // that produced `eligible_ids`, and reused by both, so neither can
+    // drift from a second, later re-derivation of the same set.
+    let eligible_id_set: HashSet<i64> = eligible_ids.iter().copied().collect();
     let eligible_seeded = storage
         .raw()
         .with_tx(TxMode::Immediate, |tx| {
@@ -311,50 +359,61 @@ pub fn run_db_vector_catchup_backfill(
             break;
         }
 
-        // Defensive re-check (w3-3 Step0 design §3): genesis seeding
-        // already guarantees every seeded doc_id canonicalizes non-empty,
-        // but this loop must never assume it -- ingest-time hook
-        // registration (`register_embedding_hole_for_new_message_in_tx`)
-        // has no eligibility filter of its own and *will* register a hole
-        // for a short-acknowledgement message like "OK." that can never
-        // resolve through the normal embed-and-CAS-write path. R1-W3-B1:
-        // leaving such a hole registered self-locks this generation out of
-        // activation forever (`holes_after` never reaches zero), so an
-        // ineligible row is written off (its hole row deleted) here rather
-        // than left "for investigation" -- the hole ledger's contract is an
-        // exact accounting of *eligible* messages, and an ineligible one
-        // was never a valid ledger entry to begin with. Filtering first
-        // also keeps the positional zip below safe: every input handed to
-        // the embedder is already known-non-empty, so
-        // `embed_messages_with_sink` cannot drop any of them.
-        let filtered: Vec<&HoleMessageRow> = rows
-            .iter()
-            .filter(|row| !canonicalize_for_embedding(&row.content).is_empty())
-            .collect();
+        // Defensive re-check (w3-3 Step0 design §3, extended by task book
+        // #81 R2 review): genesis seeding already guarantees every seeded
+        // doc_id both canonicalizes non-empty and is in `eligible_ids`,
+        // but this loop must never assume either stays true -- ingest-time
+        // hook registration (`register_embedding_hole_for_new_message_in_
+        // tx`) has no eligibility filter of its own and *will* register a
+        // hole for (a) a short-acknowledgement message like "OK." that can
+        // never resolve through the normal embed-and-CAS-write path
+        // (R1-W3-B1), or (b) a message whose conversation has already
+        // crossed the shared 8 MiB per-conversation content cap by the
+        // time this call's own eligibility snapshot was taken (task book
+        // #81 R2: `classify_hole_row`'s own doc comment has the full
+        // mechanism). Either kind self-locks this generation out of
+        // activation forever if left registered (`holes_after` never
+        // reaches zero) or, worse for (b), gets embedded anyway only to
+        // fail activation audit ④ once its now-stale row is caught later
+        // -- so both are written off (their hole rows deleted) here rather
+        // than left "for investigation": the hole ledger's contract is an
+        // exact accounting of *eligible* messages, and neither kind was
+        // ever a valid ledger entry to begin with. Filtering first also
+        // keeps the positional zip below safe: every input handed to the
+        // embedder is already known-eligible, so `embed_messages_with_
+        // sink` cannot drop any of them.
+        let filtered: Vec<&HoleMessageRow> =
+            rows.iter().filter(|row| classify_hole_row(row, &eligible_id_set) == HoleDisposition::Embed).collect();
         if filtered.len() != rows.len() {
-            let ineligible: Vec<&HoleMessageRow> = rows
+            let canonicalize_empty: Vec<&HoleMessageRow> = rows
                 .iter()
-                .filter(|row| canonicalize_for_embedding(&row.content).is_empty())
+                .filter(|row| classify_hole_row(row, &eligible_id_set) == HoleDisposition::WriteOffCanonicalizeEmpty)
+                .collect();
+            let out_of_eligibility_scope: Vec<&HoleMessageRow> = rows
+                .iter()
+                .filter(|row| classify_hole_row(row, &eligible_id_set) == HoleDisposition::WriteOffOutOfEligibilityScope)
                 .collect();
             tracing::warn!(
                 generation_id,
                 total = rows.len(),
                 kept = filtered.len(),
-                written_off = ineligible.len(),
-                "db_vector_catchup: hole row canonicalized to empty text despite genesis \
-                 eligibility filtering; writing off its hole as ineligible (R1-W3-B1)"
+                written_off_canonicalize_empty = canonicalize_empty.len(),
+                written_off_out_of_eligibility_scope = out_of_eligibility_scope.len(),
+                "db_vector_catchup: writing off ineligible embedding_holes rows before spending an \
+                 Infinity call on them (R1-W3-B1 / task book #81 R2)"
             );
             storage
                 .raw()
                 .with_tx(TxMode::Immediate, |tx| {
-                    for row in &ineligible {
+                    for row in canonicalize_empty.iter().chain(out_of_eligibility_scope.iter()) {
                         schema::write_off_ineligible_hole_in_tx(tx, generation_id, row.doc_id)?;
                     }
                     Ok(())
                 })
                 .context("writing off ineligible embedding_holes rows")?;
-            holes_written_off_ineligible =
-                holes_written_off_ineligible.saturating_add(u64::try_from(ineligible.len()).unwrap_or(0));
+            holes_written_off_ineligible = holes_written_off_ineligible
+                .saturating_add(u64::try_from(canonicalize_empty.len()).unwrap_or(0))
+                .saturating_add(u64::try_from(out_of_eligibility_scope.len()).unwrap_or(0));
         }
         if filtered.is_empty() {
             // Every row in this batch was just written off above, so the
@@ -463,7 +522,9 @@ pub fn run_db_vector_catchup_backfill(
     // after `now_ms`), leaving only rows that were already sitting in
     // `message_embeddings` before this call started -- the only rows
     // `eligible_ids` could possibly have a stale opinion about.
-    let eligible_id_set: HashSet<i64> = eligible_ids.iter().copied().collect();
+    // (`eligible_id_set` itself was built once, right after `eligible_ids`
+    // was scanned, and reused by the drain loop's `classify_hole_row`
+    // calls above -- see that construction's own doc comment.)
     let embedded_rows: Vec<(i64, i64)> = storage.raw().query_all_map(
         "SELECT me.doc_id, m.conversation_id \
          FROM message_embeddings me JOIN messages m ON m.id = me.doc_id \
@@ -1467,5 +1528,121 @@ mod ineligible_embedding_prune_tests {
             )
             .unwrap();
         assert_eq!(candidates, vec![doc_old], "only the pre-snapshot row may ever become a prune candidate");
+    }
+
+    /// Task book #81 R2 review: `classify_hole_row` is the pure triage
+    /// point that closes the diag3 exit-9 root cause (a hole whose doc_id
+    /// fell outside the eligibility snapshot, but whose raw content is
+    /// non-empty, used to sail past the old canonicalize-only filter and
+    /// get embedded). All three dispositions in one table-driven test
+    /// since there is no I/O to isolate them across.
+    #[test]
+    fn classify_hole_row_covers_all_three_dispositions() {
+        let eligible_id_set: HashSet<i64> = [1i64, 2].into_iter().collect();
+        let row = |doc_id: i64, content: &str| HoleMessageRow {
+            doc_id,
+            conversation_id: 1,
+            content: content.to_string(),
+            role: "user".to_string(),
+        };
+
+        assert_eq!(
+            classify_hole_row(&row(1, "OK"), &eligible_id_set),
+            HoleDisposition::WriteOffCanonicalizeEmpty,
+            "a short acknowledgement must never reach the embedder, regardless of eligibility"
+        );
+        assert_eq!(
+            classify_hole_row(&row(3, "real content, plenty of it"), &eligible_id_set),
+            HoleDisposition::WriteOffOutOfEligibilityScope,
+            "real (non-canonicalize-empty) content whose doc_id fell outside this call's eligibility \
+             snapshot must be written off, not embedded -- the diag3 exit-9 root cause"
+        );
+        assert_eq!(
+            classify_hole_row(&row(1, "real content, plenty of it"), &eligible_id_set),
+            HoleDisposition::Embed,
+            "real content whose doc_id is in the eligibility snapshot must be embedded"
+        );
+    }
+
+    /// Task book #81 R2 review: proves `scan_eligible_message_ids` itself
+    /// -- not just `classify_hole_row`'s consumption of its output -- puts
+    /// the 8 MiB per-conversation truncation cap (#290) into the
+    /// eligibility snapshot. A conversation with one message just over the
+    /// cap followed by a second (tail) message: the cap boundary lands
+    /// inside the first message (truncated, but still non-empty) and
+    /// clears the second entirely, so only the first message's doc_id can
+    /// ever be eligible.
+    #[test]
+    fn scan_eligible_message_ids_excludes_a_tail_message_past_the_byte_cap() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_storage(&dir.path().join("db.sqlite"));
+        let agent_id = ensure_agent(&storage);
+
+        // One byte over `LEXICAL_MAX_CONVERSATION_CONTENT_BYTES_DEFAULT`
+        // (8 * 1024 * 1024) on its own -- guarantees truncation kicks in
+        // within this single conversation regardless of the second
+        // message's size.
+        let big_content = "x".repeat(8 * 1024 * 1024 + 1);
+        let conv = Conversation {
+            id: None,
+            agent_slug: "claude_code".into(),
+            workspace: None,
+            external_id: Some("exec72-r2-byte-cap-tail".into()),
+            title: Some("exec72 R2 byte-cap fixture".into()),
+            source_path: std::path::PathBuf::from("/fixtures/exec72-r2-byte-cap-tail.jsonl"),
+            started_at: Some(TS),
+            ended_at: Some(TS + 60_000),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![
+                Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: None,
+                    created_at: Some(TS),
+                    content: big_content,
+                    extra_json: serde_json::Value::Null,
+                    snippets: vec![],
+                },
+                Message {
+                    id: None,
+                    idx: 1,
+                    role: MessageRole::Assistant,
+                    author: None,
+                    created_at: Some(TS + 1_000),
+                    content: "this tail message must fall outside the eligibility snapshot".to_string(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: vec![],
+                },
+            ],
+            source_id: "local".into(),
+            origin_host: None,
+        };
+        storage.insert_conversation_tree(agent_id, None, &conv).expect("insert fixture conversation");
+        let conv_id: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT id FROM conversations WHERE external_id = ?1",
+                &params!["exec72-r2-byte-cap-tail"],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        let doc_head: i64 = storage
+            .raw()
+            .query_row_map("SELECT id FROM messages WHERE conversation_id = ?1 AND idx = 0", &params![conv_id], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        let doc_tail: i64 = storage
+            .raw()
+            .query_row_map("SELECT id FROM messages WHERE conversation_id = ?1 AND idx = 1", &params![conv_id], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+
+        let eligible = scan_eligible_message_ids(&storage).expect("scan eligibility");
+        assert!(eligible.contains(&doc_head), "the truncated-but-nonempty head message must stay eligible");
+        assert!(!eligible.contains(&doc_tail), "the fully-cleared tail message must not be eligible");
     }
 }
