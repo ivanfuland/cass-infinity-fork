@@ -60,6 +60,10 @@ pub struct DbVectorCatchupReport {
     /// [`crate::storage::schema::write_off_ineligible_hole_in_tx`]'s doc
     /// comment for why leaving them registered would self-lock activation.
     pub holes_written_off_ineligible: u64,
+    /// Orphaned (non-active, past the cleanup age threshold) generations
+    /// deleted at the tail of this call (R1-W3-N3). Empty on the common
+    /// case (nothing old enough to prune yet).
+    pub cleanup_deleted_generation_ids: Vec<i64>,
 }
 
 /// One row of embedding-hole work: the message content/role to embed,
@@ -72,20 +76,53 @@ struct HoleMessageRow {
     role: String,
 }
 
-/// w3-3 Step0 design ruling ①/②: find an identity-matching (`embedder_id`
-/// + `dim` + `canonicalize_version`, all three exact) generation whose
-/// `audit_status` is still `'pending'` and keep draining its holes;
-/// only create a new generation when no such match exists. This is what
-/// keeps a mid-run crash from burning hours of prior Infinity work: the
-/// hole ledger itself is the resumable state (w3-3 Step0 design §3), so
-/// resuming is just "find the right generation_id", not a checkpoint
-/// replay.
+/// w3-3 Step0 design ruling ①/②, extended by R1-W3-N3: find an
+/// identity-matching (`embedder_id` + `dim` + `canonicalize_version`, all
+/// three exact) generation to keep draining holes on, in priority order,
+/// only creating a new generation when neither match exists:
+///
+/// 1. The identity-matching *active* generation, regardless of its
+///    current `audit_status` (R1-W3-N3). This is the steady-state case a
+///    production cron actually hits every run: the active generation is
+///    `passed` with zero outstanding holes, so before this fix nothing
+///    ever matched here (only `audit_status='pending'` did) and the
+///    worker created a brand-new empty-holes generation and re-embedded
+///    the *entire* corpus from scratch on every single call -- the exact
+///    thing that makes an hourly cron model impossible. New messages
+///    landing on this active generation between runs already registered
+///    a hole against it directly (ingest-time hooks only ever touch the
+///    *currently active* generation), so reusing it is a hole-driven
+///    incremental catch-up with no new drain logic needed -- and if
+///    `holes_after` reaches zero, the caller re-runs the full activation
+///    audit and re-promotes through the same `switch_active_generation`
+///    call as any other candidate (idempotent to re-certify an
+///    already-active generation).
+/// 2. The identity-matching *pending* (not-yet-promoted, or demoted-back-
+///    to-pending by new writes) generation -- the original w3-3 Step0
+///    behavior, still needed for the "candidate not yet certified" case.
+/// 3. Neither found: create a new, empty generation.
+///
+/// This is what keeps a mid-run crash from burning hours of prior
+/// Infinity work: the hole ledger itself is the resumable state (w3-3
+/// Step0 design §3), so resuming is just "find the right generation_id",
+/// not a checkpoint replay.
 fn find_reusable_or_create_generation(
     conn: &Conn,
     identity: &InfinityServedIdentity,
     dim: i64,
     created_at_ms: i64,
 ) -> Result<(i64, bool)> {
+    if let Some(existing) = schema::find_active_generation_matching_identity(
+        conn,
+        &identity.model_id,
+        dim,
+        CANONICALIZE_PIPELINE_VERSION,
+    )
+    .context("looking up an identity-matching active embedding_generations row")?
+    {
+        return Ok((existing, true));
+    }
+
     if let Some(existing) = schema::find_reusable_pending_generation(
         conn,
         &identity.model_id,
@@ -438,6 +475,21 @@ pub fn run_db_vector_catchup_backfill(
         activated = true;
     }
 
+    // R1-W3-N3: without this, N3's own fix (reusing the identity-matching
+    // active generation instead of always creating a new one on a
+    // steady-state cron run) is the only thing that would ever stop
+    // orphaned generations from accumulating -- but a real model/dim
+    // upgrade, or any run that *did* still need to create a new
+    // generation, still leaves its predecessor(s) behind with no
+    // production caller ever pruning them (task book #62 Step3's
+    // `cleanup_orphaned_generations` existed, but nothing in this worker
+    // -- the actual production entry point -- ever called it). Runs
+    // unconditionally at the tail, regardless of this call's own
+    // activation outcome: pruning old orphans is this run's own
+    // housekeeping, not contingent on what this run did.
+    let cleanup_deleted_generation_ids =
+        cleanup_orphaned_generations(storage, FrankenStorage::now_millis()).context("cleaning up orphaned embedding generations")?;
+
     Ok(DbVectorCatchupReport {
         generation_id,
         reused_existing_generation,
@@ -451,6 +503,7 @@ pub fn run_db_vector_catchup_backfill(
         vec0_rows,
         activated,
         holes_written_off_ineligible,
+        cleanup_deleted_generation_ids,
     })
 }
 

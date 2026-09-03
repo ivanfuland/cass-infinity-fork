@@ -478,6 +478,41 @@ pub fn find_reusable_pending_generation(
     )
 }
 
+/// Find the currently *active* `embedding_generations` row whose identity
+/// (`embedder_id`+`dim`+`canonicalize_version`) matches exactly, if any
+/// (R1-W3-N3). A catch-up worker started on a steady-state, fully-`passed`
+/// corpus previously found no match here at all -- `find_reusable_pending_
+/// generation` only ever looks at `audit_status='pending'`, and a
+/// `passed`, `is_active=1` generation with zero outstanding holes stays
+/// `passed` until a genuinely new message demotes it -- so the worker
+/// created a brand-new, empty-holes generation and re-seeded + re-embedded
+/// the *entire* corpus from scratch every run, which is exactly what makes
+/// an hourly production cron model impossible. Checking for an
+/// identity-matching active generation *first* (regardless of its current
+/// `audit_status` -- it may be `passed` in the steady-state case this
+/// exists for, or `pending` if new messages already demoted it, in which
+/// case this and `find_reusable_pending_generation` would find the same
+/// row) lets the worker resume draining the generation actually serving
+/// reads: its `embedding_holes` are hole-driven and already correctly
+/// incremental (new messages only ever register a hole against whichever
+/// generation is currently active), so reusing it needs no new drain
+/// logic, only this different generation-selection step.
+pub fn find_active_generation_matching_identity(
+    conn: &Conn,
+    embedder_id: &str,
+    dim: i64,
+    canonicalize_version: u32,
+) -> Result<Option<i64>, StorageError> {
+    conn.query_opt_map(
+        "SELECT id FROM embedding_generations \
+         WHERE embedder_id = ?1 AND dim = ?2 AND canonicalize_version = ?3 \
+           AND is_active = 1 \
+         LIMIT 1",
+        &params![embedder_id, dim, i64::from(canonicalize_version)],
+        |row| row.get_typed(0),
+    )
+}
+
 /// Bulk-seed `embedding_holes` for `generation_id` from a caller-supplied
 /// list of already-eligible `doc_id`s (w3-3 Step0/Step1: genesis backfill
 /// bootstrap). `register_embedding_hole_for_new_message_in_tx` only fires
