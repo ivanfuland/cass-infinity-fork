@@ -16675,13 +16675,11 @@ pub mod persist {
             ended_at: conv.ended_at,
             approx_tokens: None,
             metadata_json: if should_redact {
-                let s = serde_json::to_string(&conv.metadata).unwrap_or_default();
-                let redacted = if let Some(r) = redactor.as_mut() {
-                    r.redact_text(&s)
+                if let Some(r) = redactor.as_mut() {
+                    r.redact_json(&conv.metadata)
                 } else {
-                    super::redact_secrets::redact_text(&s).into_owned()
-                };
-                serde_json::from_str(&redacted).unwrap_or_else(|_| conv.metadata.clone())
+                    super::redact_secrets::redact_json(&conv.metadata)
+                }
             } else {
                 conv.metadata.clone()
             },
@@ -17872,6 +17870,186 @@ pub mod persist {
                 2,
                 "LexicalPopulationStrategy no longer gates lex_docs writes (Tantivy retired); \
                  only CASS_DEFER_LEXICAL_UPDATES does"
+            );
+        }
+
+        /// Known-answer acceptance for structured JSON credential redaction
+        /// by key semantics (cherry-picked in spirit from upstream cass
+        /// commit 97757e67634dc019a2f543e741a31bd746db3fd6, gh#419). Seeds a
+        /// message whose `extra` is a structured JSON object with a bare
+        /// (unlabeled-in-string) credential value under a sensitive key,
+        /// through the real production write entry point
+        /// (`persist_conversations_batched`, which calls
+        /// `map_to_internal_with_redactor` internally) rather than a
+        /// hand-crafted INSERT, then reads the persisted `extra_json` back
+        /// from SQLite. The `password`/`api_key` values deliberately do not
+        /// match any plain-text `SECRET_PATTERNS` regex on their own (no
+        /// `key=value` shape, no known key-prefix) so this exercises only
+        /// the key-semantic path, not the older text-pattern path.
+        #[test]
+        #[serial]
+        fn persist_conversations_batched_redacts_structured_json_credentials_by_key_semantics() {
+            use crate::connectors::NormalizedConversation;
+
+            let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
+            let _redact_guard = set_env("CASS_REDACT_SECRETS", "1");
+
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("known-answer-json-credential-redaction.db");
+
+            let storage = create_franken_db(&db_path);
+            let convs = vec![NormalizedConversation {
+                agent_slug: "serial-agent".into(),
+                external_id: Some("known-answer-credential-1".into()),
+                title: Some("Known Answer Credential Redaction".into()),
+                workspace: Some(std::path::PathBuf::from("/ws/serial")),
+                source_path: std::path::PathBuf::from("/log/serial-credential.jsonl"),
+                started_at: Some(10),
+                ended_at: Some(20),
+                metadata: serde_json::json!({}),
+                messages: vec![NormalizedMessage {
+                    idx: 0,
+                    role: "user".into(),
+                    author: Some("tester".into()),
+                    created_at: Some(10),
+                    content: "tool result with structured credential payload".into(),
+                    extra: serde_json::json!({
+                        "password": "hunter2-plain-not-a-pattern",
+                        "api_key": "plainlookingvalue12345",
+                        "note": "ok",
+                    }),
+                    snippets: vec![],
+                    invocations: Vec::new(),
+                }],
+            }];
+
+            persist_conversations_batched(
+                &storage,
+                &convs,
+                LexicalPopulationStrategy::IncrementalInline,
+                false,
+            )
+            .expect("serial batched persist should succeed");
+
+            // Non-empty `extra` serializes into `extra_bin` (msgpack),
+            // leaving the `extra_json` TEXT column NULL (see
+            // `franken_message_insert_payload` in storage/sqlite.rs) --
+            // `fetch_messages` is the real read path that decodes it back,
+            // so use it rather than reading the `extra_json` column raw.
+            let conversation_id: i64 = storage
+                .raw()
+                .query_row_map(
+                    "SELECT id FROM conversations WHERE external_id = ?1",
+                    &[SqliteValue::from("known-answer-credential-1")],
+                    |row| row.get_typed(0),
+                )
+                .unwrap();
+            let stored = storage.fetch_messages(conversation_id).unwrap();
+            assert_eq!(stored.len(), 1);
+            let extra = &stored[0].extra_json;
+
+            assert_eq!(
+                extra["password"],
+                serde_json::json!("[REDACTED]"),
+                "bare structured credential value under a sensitive key must be redacted \
+                 in the persisted row: {extra}"
+            );
+            assert_eq!(
+                extra["api_key"],
+                serde_json::json!("[REDACTED]"),
+                "bare structured credential value under a sensitive key must be redacted \
+                 in the persisted row: {extra}"
+            );
+            assert_eq!(
+                extra["note"],
+                serde_json::json!("ok"),
+                "non-sensitive sibling field must survive ingestion unchanged: {extra}"
+            );
+        }
+
+        /// PR2 review R1-1: `map_to_internal_with_redactor`'s `metadata_json`
+        /// branch previously serialized `conv.metadata` to a JSON string,
+        /// ran the plain-text `redact_text` regex pass over that string, and
+        /// deserialized the result -- a path that never reaches
+        /// `redact_json`/`is_sensitive_json_field` at all, so a bare
+        /// structured credential under a sensitive key
+        /// (`{"password":"hunter2-plain"}`) survived into `metadata_json`
+        /// unredacted (upstream 97757e6763 calls `redact_json(&conv.metadata)`
+        /// directly at the equivalent site). Known-answer acceptance for the
+        /// fix: seed conversation-level `metadata` (not per-message `extra`)
+        /// with a structured credential, drive it through the real
+        /// production write path, and read the persisted conversation back
+        /// via the real `list_conversations` read path (which decodes
+        /// `metadata_bin`/`metadata_json` the same way `fetch_messages` does
+        /// for message `extra_bin`).
+        #[test]
+        #[serial]
+        fn persist_conversations_batched_redacts_conversation_metadata_by_key_semantics() {
+            use crate::connectors::NormalizedConversation;
+
+            let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
+            let _redact_guard = set_env("CASS_REDACT_SECRETS", "1");
+
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("known-answer-conversation-metadata-redaction.db");
+
+            let storage = create_franken_db(&db_path);
+            let convs = vec![NormalizedConversation {
+                agent_slug: "serial-agent".into(),
+                external_id: Some("known-answer-conversation-metadata-1".into()),
+                title: Some("Known Answer Conversation Metadata Redaction".into()),
+                workspace: Some(std::path::PathBuf::from("/ws/serial")),
+                source_path: std::path::PathBuf::from("/log/serial-conv-metadata.jsonl"),
+                started_at: Some(10),
+                ended_at: Some(20),
+                metadata: serde_json::json!({
+                    "password": "hunter2-plain-not-a-pattern",
+                    "api_key": "plainlookingvalue12345",
+                    "note": "ok",
+                }),
+                messages: vec![NormalizedMessage {
+                    idx: 0,
+                    role: "user".into(),
+                    author: Some("tester".into()),
+                    created_at: Some(10),
+                    content: "conversation-level metadata credential probe".into(),
+                    extra: serde_json::json!({}),
+                    snippets: vec![],
+                    invocations: Vec::new(),
+                }],
+            }];
+
+            persist_conversations_batched(
+                &storage,
+                &convs,
+                LexicalPopulationStrategy::IncrementalInline,
+                false,
+            )
+            .expect("serial batched persist should succeed");
+
+            let conversations = storage.list_conversations(10, 0).unwrap();
+            let stored = conversations
+                .iter()
+                .find(|c| c.external_id.as_deref() == Some("known-answer-conversation-metadata-1"))
+                .expect("seeded conversation must be listed back");
+            let metadata = &stored.metadata_json;
+
+            assert_eq!(
+                metadata["password"],
+                serde_json::json!("[REDACTED]"),
+                "bare structured credential value under a sensitive key must be redacted \
+                 in the persisted conversation metadata: {metadata}"
+            );
+            assert_eq!(
+                metadata["api_key"],
+                serde_json::json!("[REDACTED]"),
+                "bare structured credential value under a sensitive key must be redacted \
+                 in the persisted conversation metadata: {metadata}"
+            );
+            assert_eq!(
+                metadata["note"],
+                serde_json::json!("ok"),
+                "non-sensitive sibling field must survive ingestion unchanged: {metadata}"
             );
         }
 
