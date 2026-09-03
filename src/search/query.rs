@@ -3724,7 +3724,16 @@ impl SearchClient {
                     filters,
                     effective_roles.as_ref(),
                 );
-                let cap = cap.max(1);
+                // R3-3: `cap` (`first_k.max(fetch_limit)` at the call site)
+                // comes directly from an unclamped `usize` `--limit` --
+                // `with_capacity(cap + 1)` on a pathological value (e.g.
+                // `usize::MAX - 1`) either overflows the `+ 1` or tries an
+                // allocation far larger than the generation could ever need,
+                // aborting the process. The heap can never usefully hold
+                // more than the generation's own row count, so clamp to
+                // that (already computed above as `row_count_usize`) before
+                // sizing the allocation.
+                let cap = cap.min(row_count_usize).max(1);
                 let heap: std::cell::RefCell<std::collections::BinaryHeap<DbVectorFullScanCandidate>> =
                     std::cell::RefCell::new(std::collections::BinaryHeap::with_capacity(cap + 1));
                 let total_seen = std::cell::Cell::new(0usize);
@@ -16333,6 +16342,117 @@ mod tests {
             4_096,
             "first_k clamps to SQLITE_VEC_KNN_K_MAX(4096) regardless of fetch_limit or row_count"
         );
+    }
+
+    /// R3-3: unlike the k-max-clamp test above (which never reaches the
+    /// full-scan retry because its query is unfiltered), a *selective*
+    /// filter drives `filtered.len() < first_k` and triggers the retry --
+    /// whose heap capacity is `first_k.max(fetch_limit)`, not `first_k`
+    /// alone. Pre-fix, an unclamped pathological `fetch_limit` (a raw
+    /// `usize` from `--limit`, e.g. `usize::MAX - 1`) flows straight into
+    /// `BinaryHeap::with_capacity(cap + 1)`, aborting the process (a
+    /// `+ 1` overflow, or an allocation request no allocator can satisfy)
+    /// before a single row is ever scanned. `cap.min(row_count_usize)`
+    /// bounds the heap to what the generation could ever actually fill
+    /// with, regardless of how large `fetch_limit` claims to be.
+    #[test]
+    fn db_vector_domain_full_scan_retry_with_pathological_fetch_limit_does_not_abort() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        const DIM: i64 = 4;
+        const FILLER_DOCS: i64 = 4_990;
+        const TARGET_DOCS: i64 = 10;
+        const FETCH_LIMIT: usize = usize::MAX - 1;
+
+        let agent_id = storage
+            .ensure_agent(&Agent { id: None, slug: "codex".to_string(), name: "codex".to_string(), version: None, kind: AgentKind::Cli })
+            .unwrap();
+        let other_ws = storage.ensure_workspace(std::path::Path::new("/ws/other"), None).unwrap();
+        let target_ws = storage.ensure_workspace(std::path::Path::new("/ws/target"), None).unwrap();
+        let conn = storage.raw();
+        conn.execute(
+            "INSERT OR IGNORE INTO sources(id, kind, created_at, updated_at) VALUES ('local', 'local', 0, 0)",
+            &[],
+        )
+        .unwrap();
+
+        let mut vectors: Vec<(i64, i64, Vec<f32>)> = Vec::with_capacity((FILLER_DOCS + TARGET_DOCS) as usize);
+        conn.with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
+            // Filler: nearest to the query, none in `/ws/target` -- fills
+            // the first KNN pass's (k-max-clamped) window entirely, so the
+            // relational filter (workspace=/ws/target) eliminates every
+            // first-pass candidate and the row count (5,000) exceeds
+            // SQLITE_VEC_KNN_K_MAX(4096), driving the full-scan retry.
+            for i in 0..FILLER_DOCS {
+                let message_id = 2_000_000 + i;
+                tx.execute(
+                    "INSERT INTO conversations(id, agent_id, workspace_id, source_id, title, source_path) \
+                     VALUES (?1, ?2, ?3, 'local', 't', ?4)",
+                    &[
+                        ParamValue::from(message_id),
+                        ParamValue::from(agent_id),
+                        ParamValue::from(other_ws),
+                        ParamValue::from(format!("/tmp/c-{message_id}.jsonl")),
+                    ],
+                )?;
+                tx.execute(
+                    "INSERT INTO messages(id, conversation_id, idx, role, created_at, content) \
+                     VALUES (?1, ?2, 0, 'user', ?3, 'c')",
+                    &crate::storage::api::params![message_id, message_id, 100 + message_id],
+                )?;
+                let theta = (i as f32) * 0.0001;
+                vectors.push((message_id, message_id, vec![theta.cos(), theta.sin(), 0.0, 0.0]));
+            }
+
+            // Target: farther than every filler, in `/ws/target`.
+            for k in 0..TARGET_DOCS {
+                let message_id = 2_900_000 + k;
+                tx.execute(
+                    "INSERT INTO conversations(id, agent_id, workspace_id, source_id, title, source_path) \
+                     VALUES (?1, ?2, ?3, 'local', 't', ?4)",
+                    &[
+                        ParamValue::from(message_id),
+                        ParamValue::from(agent_id),
+                        ParamValue::from(target_ws),
+                        ParamValue::from(format!("/tmp/c-{message_id}.jsonl")),
+                    ],
+                )?;
+                tx.execute(
+                    "INSERT INTO messages(id, conversation_id, idx, role, created_at, content) \
+                     VALUES (?1, ?2, 0, 'user', ?3, 'c')",
+                    &crate::storage::api::params![message_id, message_id, 100 + message_id],
+                )?;
+                let theta = 1.0_f32 + (k as f32) * 0.001;
+                vectors.push((message_id, message_id, vec![theta.cos(), theta.sin(), 0.0, 0.0]));
+            }
+            Ok(())
+        })
+        .unwrap();
+        seed_active_generation_with_vectors(&storage, DIM, &vectors);
+
+        let mut filters = SearchFilters::default();
+        filters.workspaces.insert("/ws/target".to_string());
+        let (results, retry) = SearchClient::search_db_vector_domain(
+            storage.raw(),
+            &[1.0, 0.0, 0.0, 0.0],
+            &filters,
+            Some(&HashSet::from([
+                crate::search::vector_index::ROLE_USER,
+                crate::search::vector_index::ROLE_ASSISTANT,
+            ])),
+            FETCH_LIMIT,
+        )
+        .expect("a pathological fetch_limit must never abort the full-scan retry");
+
+        assert!(retry.second_pass_taken, "the selective workspace filter must drive the streaming retry");
+        assert!(
+            !retry.has_more_candidates,
+            "all 10 /ws/target docs fit comfortably under a row_count-bounded cap -- nothing was truncated"
+        );
+        assert_eq!(results.len(), TARGET_DOCS as usize, "must find every /ws/target doc, none lost to a bogus cap");
+        let got_ids: std::collections::HashSet<u64> = results.iter().map(|r| r.message_id).collect();
+        let want_ids: std::collections::HashSet<u64> = (0..TARGET_DOCS).map(|k| (2_900_000 + k) as u64).collect();
+        assert_eq!(got_ids, want_ids, "must return exactly the 10 /ws/target docs");
     }
 
     /// R2-B6 test (b): the full-scan retry's streaming top-K heap must
