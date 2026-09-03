@@ -8059,3 +8059,97 @@ fn stats_on_empty_indexed_db_reports_zeroes_and_empty_by_agent() {
         by_agent.len()
     );
 }
+
+/// R2-B5: `--json --rerank` without `--robot-meta` used to be a silent
+/// no-op -- `rerank_applied` lived only inside the `_meta` block
+/// `--robot-meta` gates, and the `tracing::warn!` explaining why no
+/// reranker could be constructed is filtered out entirely under `--json`'s
+/// error-only robot logging, so a caller with no `--robot-meta` had no way
+/// to tell "reranking happened" from "reranking silently did nothing".
+/// `--no-daemon` forces the local-reranker path, which this build's
+/// `FastEmbedReranker` stub (`src/search/fastembed_reranker.rs`, cass#256
+/// ORT-free baseline) always fails to construct -- a deterministic,
+/// network-free way to reach the exact "requested but not applied" shape
+/// the finding is about.
+#[test]
+fn search_rerank_without_robot_meta_reports_top_level_activation_fields_json() -> Result<(), Box<dyn Error>> {
+    let fixture = isolated_search_demo_data()?;
+
+    let mut cmd = base_cmd();
+    cmd.args([
+        "search",
+        "hello",
+        "--json",
+        "--rerank",
+        "--no-daemon",
+        "--limit",
+        "1",
+        "--data-dir",
+        fixture.path().to_str().expect("utf8 fixture path"),
+    ]);
+
+    let assert = cmd.assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    let json: Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+
+    assert_eq!(
+        json.get("rerank_requested").and_then(Value::as_bool),
+        Some(true),
+        "rerank_requested must be present and true at the top level without --robot-meta; got {json}"
+    );
+    assert_eq!(
+        json.get("rerank_applied").and_then(Value::as_bool),
+        Some(false),
+        "this build's reranker stub always fails to construct, so rerank_applied must be honestly false, not absent; got {json}"
+    );
+    assert!(
+        json.get("_meta").is_none(),
+        "sanity: without --robot-meta, _meta itself must still be absent (only the two rerank fields are unconditional)"
+    );
+    Ok(())
+}
+
+/// R2-B5 JSONL sibling: same silent-no-op gap, but JSONL had it worse --
+/// without any of `--robot-meta`/aggregations/suggestions/explanation, no
+/// `_meta` line was emitted at all, so there was nowhere for
+/// `rerank_requested`/`rerank_applied` to land even if they had been added
+/// unconditionally to an existing `_meta` block.
+#[test]
+fn search_rerank_without_robot_meta_reports_top_level_activation_fields_jsonl() -> Result<(), Box<dyn Error>> {
+    let fixture = isolated_search_demo_data()?;
+
+    let mut cmd = base_cmd();
+    cmd.args([
+        "search",
+        "hello",
+        "--robot-format",
+        "jsonl",
+        "--rerank",
+        "--no-daemon",
+        "--limit",
+        "1",
+        "--data-dir",
+        fixture.path().to_str().expect("utf8 fixture path"),
+    ]);
+
+    let assert = cmd.assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    let first_line = stdout.lines().next().expect("jsonl output must have at least one line");
+    let first: Value = serde_json::from_str(first_line).expect("first jsonl line must be valid JSON");
+
+    assert!(
+        first.get("_meta").is_some(),
+        "the _meta header line must now be emitted purely because --rerank was requested, even with no other meta-triggering flag; got {first}"
+    );
+    assert_eq!(
+        first.get("rerank_requested").and_then(Value::as_bool),
+        Some(true),
+        "rerank_requested must be present and true, sibling to _meta (not nested inside it); got {first}"
+    );
+    assert_eq!(
+        first.get("rerank_applied").and_then(Value::as_bool),
+        Some(false),
+        "this build's reranker stub always fails to construct, so rerank_applied must be honestly false, not absent; got {first}"
+    );
+    Ok(())
+}

@@ -23875,6 +23875,7 @@ fn run_cli_search(
             search_ms,
             rerank_ms,
             rerank_applied,
+            semantic_opts.rerank,
         )?;
     } else if display_result.hits.is_empty() {
         eprintln!("No results found.");
@@ -25961,6 +25962,13 @@ fn output_robot_results(
     // to make the fact machine-readable for callers that never look at
     // logs.
     rerank_applied: bool,
+    // R2-B5: distinct from `rerank_applied` -- `--rerank` was requested at
+    // all, regardless of whether it ended up applying. Needed because
+    // `rerank_applied` alone conflates "never requested" with "requested
+    // but no reranker was available" (see its own doc comment above); the
+    // JSON/JSONL top-level fields this gates must appear whenever the
+    // caller asked for `--rerank`, not only when it succeeded.
+    rerank_requested: bool,
 ) -> CliResult<()> {
     use std::io::{BufWriter, Write};
 
@@ -26014,6 +26022,10 @@ fn output_robot_results(
 
     // Fast path: summary-field JSON output without optional metadata/features.
     // Avoid intermediary serde_json::Value maps and string clones per hit.
+    // R2-B5: `!rerank_requested` added -- this path's `FastSummaryJsonPayload`
+    // has no `rerank_requested`/`rerank_applied` fields, so a `--rerank` run
+    // must fall through to the slower `match format` path below (the one
+    // that actually emits them) instead of silently bypassing it here.
     if matches!(format, RobotFormat::Json)
         && summary_projection
         && !needs_truncation
@@ -26024,6 +26036,7 @@ fn output_robot_results(
         && result.suggestions.is_empty()
         && explanation.is_none()
         && !timed_out
+        && !rerank_requested
     {
         use serde::ser::{SerializeMap, SerializeSeq};
         use serde::{Serialize, Serializer};
@@ -26117,6 +26130,13 @@ fn output_robot_results(
     // Fast path: full-field JSON output without optional metadata/features.
     // Serialize hits directly with compatibility formatting to avoid
     // materializing intermediary serde_json::Value hits.
+    // R2-B5: `!rerank_requested` added -- this path's `FastJsonPayload` has
+    // no `rerank_requested`/`rerank_applied` fields, so a `--rerank` run
+    // must fall through to the slower `match format` path below (the one
+    // that actually emits them) instead of silently bypassing it here. This
+    // was the actual root cause of the `--json --rerank` (no
+    // `--robot-meta`) silent no-op this item reports: this exact fast path
+    // is what a bare `cass search ... --json --rerank` hits.
     if matches!(format, RobotFormat::Json)
         && all_fields_requested
         && !needs_truncation
@@ -26127,6 +26147,7 @@ fn output_robot_results(
         && result.suggestions.is_empty()
         && explanation.is_none()
         && !timed_out
+        && !rerank_requested
     {
         use serde::ser::{SerializeMap, SerializeSeq};
         use serde::{Serialize, Serializer};
@@ -26465,6 +26486,21 @@ fn output_robot_results(
                 "hits_clamped": hits_clamped,
             });
 
+            // R2-B5: unconditional (not gated on `--robot-meta`/`include_meta`
+            // the way `rerank_applied` alone still is inside the `_meta`
+            // block below) whenever `--rerank` was requested -- a caller
+            // that passes `--json --rerank` without `--robot-meta` was
+            // previously getting a silent no-op: `rerank_applied` lived
+            // only in `_meta`, and the `tracing::warn!` explaining *why*
+            // no reranker could be constructed is filtered out entirely
+            // under `--json`'s error-only robot logging.
+            if rerank_requested
+                && let serde_json::Value::Object(ref mut map) = payload
+            {
+                map.insert("rerank_requested".to_string(), serde_json::json!(true));
+                map.insert("rerank_applied".to_string(), serde_json::json!(rerank_applied));
+            }
+
             // Add suggestions if present
             if !result.suggestions.is_empty()
                 && let serde_json::Value::Object(ref mut map) = payload
@@ -26614,11 +26650,18 @@ fn output_robot_results(
             let stdout = std::io::stdout();
             let mut out = BufWriter::new(stdout.lock());
 
-            // JSONL: one object per line, optional _meta header
+            // JSONL: one object per line, optional _meta header. R2-B5:
+            // `rerank_requested` added to the trigger list -- without
+            // it, a `--jsonl --rerank` run with none of the other
+            // meta-triggering flags set emitted no `_meta` line at all, so
+            // `rerank_requested`/`rerank_applied` (inserted below,
+            // unconditional on `include_meta` like the `RobotFormat::Json`
+            // case above) would have had nowhere to land.
             if include_meta
                 || agg_json.is_some()
                 || !result.suggestions.is_empty()
                 || explanation.is_some()
+                || rerank_requested
             {
                 let mut meta = serde_json::json!({
                     "_meta": {
@@ -26680,6 +26723,18 @@ fn output_robot_results(
                     && let serde_json::Value::Object(ref mut m) = meta
                 {
                     m.insert("storage_integrity".to_string(), si.clone());
+                }
+                // R2-B5: sibling to `_meta` (this line's own top level),
+                // matching `storage_integrity` above -- not nested inside
+                // `_meta`, which is what `include_meta`/`--robot-meta`
+                // alone still gates. See the `RobotFormat::Json` arm's
+                // identical fix for why this must be unconditional on
+                // `--rerank` having been requested at all.
+                if rerank_requested
+                    && let serde_json::Value::Object(ref mut m) = meta
+                {
+                    m.insert("rerank_requested".to_string(), serde_json::json!(true));
+                    m.insert("rerank_applied".to_string(), serde_json::json!(rerank_applied));
                 }
                 // Add suggestions to meta line
                 if !result.suggestions.is_empty()
