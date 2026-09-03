@@ -2713,12 +2713,20 @@ mod tests {
     #[test]
     fn semantic_preference_surface_preserves_backend_and_model_dir_projection() {
         let data_dir = Path::new("/tmp/cass");
+        // R1-W3-N2 fallout: `active_policy_model_dir` -> `FastEmbedder::
+        // canonical_name(&policy.quality_tier_embedder)` returns `None`
+        // for the infinity-routing names ("infinity"/"bge-m3") -- correct
+        // behavior, not a bug, DEFAULT_QUALITY_TIER_EMBEDDER's default
+        // under `infinity` is `is_infinity_embedder_name`-shaped, and the
+        // Infinity-served model lives on a remote HTTP service with no
+        // on-disk FastEmbed directory to project a path for at all.
+        let default_model_dir = if cfg!(feature = "infinity") {
+            None
+        } else {
+            Some(FastEmbedder::default_model_dir(data_dir))
+        };
         let cases = [
-            (
-                SemanticPreference::DefaultModel,
-                "fastembed",
-                Some(FastEmbedder::default_model_dir(data_dir)),
-            ),
+            (SemanticPreference::DefaultModel, "fastembed", default_model_dir),
             (SemanticPreference::HashFallback, "hash", None),
         ];
 
