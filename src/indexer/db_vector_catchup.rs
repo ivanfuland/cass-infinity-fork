@@ -64,6 +64,14 @@ pub struct DbVectorCatchupReport {
     /// deleted at the tail of this call (R1-W3-N3). Empty on the common
     /// case (nothing old enough to prune yet).
     pub cleanup_deleted_generation_ids: Vec<i64>,
+    /// R3-6: cleanup failures from this same tail call --
+    /// [`GenerationCleanupOutcome::failures`] verbatim (a candidate whose
+    /// delete errored, or a sentinel `generation_id=0` entry if the
+    /// orphan-scan query itself failed) -- previously discarded entirely
+    /// (only `deleted_ids` was projected into this report), silently
+    /// hiding a real cleanup failure from every attestation consumer
+    /// (JSON/human CLI output alike). Empty on the common case.
+    pub cleanup_failures: Vec<(i64, String)>,
 }
 
 /// One row of embedding-hole work: the message content/role to embed,
@@ -501,9 +509,16 @@ pub fn run_db_vector_catchup_backfill(
     // unconditionally at the tail, regardless of this call's own
     // activation outcome: pruning old orphans is this run's own
     // housekeeping, not contingent on what this run did.
-    let cleanup_deleted_generation_ids = cleanup_orphaned_generations(storage, FrankenStorage::now_millis())
-        .context("scanning for orphaned embedding generations to clean up")?
-        .deleted_ids;
+    // R3-6: `cleanup_orphaned_generations` itself never returns `Err`
+    // (both a per-candidate delete failure and a scan-level failure are
+    // folded into `.failures` -- see its own doc comment), so there is no
+    // `?`/`.context(...)` left here to lose this run's already-committed
+    // activation to a housekeeping failure.
+    let cleanup_outcome = cleanup_orphaned_generations(storage, FrankenStorage::now_millis());
+    let (cleanup_deleted_generation_ids, cleanup_failures) = match cleanup_outcome {
+        Ok(outcome) => (outcome.deleted_ids, outcome.failures),
+        Err(e) => (Vec::new(), vec![(0, format!("cleanup_orphaned_generations errored: {e}"))]),
+    };
 
     Ok(DbVectorCatchupReport {
         generation_id,
@@ -519,6 +534,7 @@ pub fn run_db_vector_catchup_backfill(
         activated,
         holes_written_off_ineligible,
         cleanup_deleted_generation_ids,
+        cleanup_failures,
     })
 }
 
@@ -944,13 +960,15 @@ fn generation_cleanup_age_threshold_ms() -> i64 {
         .unwrap_or(GENERATION_CLEANUP_AGE_THRESHOLD_MS_DEFAULT)
 }
 
-/// Per-candidate outcome of [`cleanup_orphaned_generations`] (R2-N2):
-/// `deleted_ids` for candidates actually torn down, `failures` for
-/// candidates whose delete transaction itself errored (the generation_id
-/// and a rendered error detail). A candidate landing in `failures` is
-/// simply left in place -- exactly what would already be true of it before
-/// this function ever ran -- so it is retried the next time this cleanup
-/// runs, same as it always was for a `still_inactive != Some(true)` skip.
+/// Outcome of [`cleanup_orphaned_generations`] (R2-N2/R3-6): `deleted_ids`
+/// for candidates actually torn down, `failures` for either a candidate
+/// whose delete transaction itself errored (its real `generation_id` and a
+/// rendered error detail) or the initial orphan-scan query itself failing
+/// (sentinel `generation_id=0`, never a real `AUTOINCREMENT` id). Either
+/// way, whatever `failures` covers is simply left in place -- exactly what
+/// would already be true of it before this function ever ran -- so it is
+/// retried the next time this cleanup runs, same as it always was for a
+/// `still_inactive != Some(true)` skip.
 #[derive(Debug, Default, Clone)]
 pub struct GenerationCleanupOutcome {
     pub deleted_ids: Vec<i64>,
@@ -978,19 +996,43 @@ pub struct GenerationCleanupOutcome {
 /// "one candidate's delete failing never blocks the rest", which this
 /// early-return directly violated). Each candidate's error is now caught
 /// and recorded into `failures` instead, and the loop continues to the
-/// next candidate; this function itself never returns `Err` for a
-/// candidate-level failure (only the initial orphan-scan query can still
-/// fail the whole call, since there is nothing to iterate without it).
+/// next candidate.
+///
+/// R3-6: the initial orphan-scan query itself used to still `?` straight
+/// out (same bug, same call site, just the one remaining `?` R2-N2's own
+/// fix left standing) -- it too is now caught and folded into `failures`
+/// (sentinel `generation_id=0`, never a real `AUTOINCREMENT` id) rather
+/// than propagated. This function never returns `Err`; the caller reads
+/// `failures` to learn whether anything went wrong.
 pub fn cleanup_orphaned_generations(storage: &FrankenStorage, now_ms: i64) -> Result<GenerationCleanupOutcome> {
     let cutoff_ms = now_ms.saturating_sub(generation_cleanup_age_threshold_ms());
-    let candidates: Vec<i64> = storage
-        .raw()
-        .query_all_map(
-            "SELECT id FROM embedding_generations WHERE is_active = 0 AND created_at < ?1",
-            &params![cutoff_ms],
-            |row| row.get_typed(0),
-        )
-        .context("scanning for orphaned embedding generations")?;
+    let candidates: Vec<i64> = match storage.raw().query_all_map(
+        "SELECT id FROM embedding_generations WHERE is_active = 0 AND created_at < ?1",
+        &params![cutoff_ms],
+        |row| row.get_typed(0),
+    ) {
+        Ok(ids) => ids,
+        Err(e) => {
+            // R3-6: the initial orphan-scan query erroring used to `?`
+            // straight out of this function -- called at the tail of
+            // `run_db_vector_catchup_backfill`, after that call's own
+            // activation had already committed, that turned an otherwise-
+            // successful run into an `Err`, the exact same-shaped bug
+            // R2-N2 already fixed for a per-candidate delete failure.
+            // `0` is never a real `id` (`embedding_generations.id` is
+            // `AUTOINCREMENT`, starting at 1) -- an unambiguous sentinel
+            // for "this failure isn't about any one candidate".
+            tracing::warn!(
+                error = %e,
+                "cleanup_orphaned_generations: the orphan-scan query itself failed; skipping this \
+                 cleanup pass, leaving every candidate in place for the next one (R3-6)"
+            );
+            return Ok(GenerationCleanupOutcome {
+                deleted_ids: Vec::new(),
+                failures: vec![(0, format!("orphan-scan query failed: {e}"))],
+            });
+        }
+    };
 
     let mut outcome = GenerationCleanupOutcome { deleted_ids: Vec::with_capacity(candidates.len()), failures: Vec::new() };
     for generation_id in candidates {

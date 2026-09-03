@@ -342,3 +342,53 @@ fn cleanup_never_deletes_metadata_when_its_vec0_drop_is_rejected() {
         .unwrap();
     assert_eq!(embeddings_count, 1, "its message_embeddings row must survive too -- nothing partially committed");
 }
+
+/// R3-6: the *initial orphan-scan query itself* failing used to `?`
+/// straight out of `cleanup_orphaned_generations` -- called at the tail
+/// of `run_db_vector_catchup_backfill`, after that same call's own
+/// `switch_active_generation` had already committed an activation, so a
+/// housekeeping-only failure here turned an otherwise fully successful
+/// run into an `Err` (the exact same-shaped bug R2-N2 fixed for a
+/// per-candidate delete failure, just the one remaining `?` its own fix
+/// left standing). Drops `embedding_generations` out from under the scan
+/// query to force a real SQL error deterministically, mirroring this
+/// file's convention (see `cleanup_never_deletes_metadata_when_its_vec0_
+/// drop_is_rejected`'s doc comment) of using raw-SQL corruption only to
+/// simulate a condition a live write path could never itself produce.
+#[test]
+fn cleanup_folds_a_scan_failure_into_ok_outcome_failures_instead_of_propagating_as_err() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = open_storage(&db_path);
+    let (conv_id, doc_id) = insert_one_message_conversation(&storage, "w3-r3-6-scan-failure");
+
+    // A genuine orphan candidate exists (superseded by a switch that has
+    // already committed), so this test also proves the scan-failure path
+    // is reached before any candidate work -- not merely "there was
+    // nothing to clean up anyway".
+    let old_created_at = TS - 2 * DAY_MS;
+    let _gen_orphan = build_active_passed_generation(&storage, doc_id, conv_id, old_created_at);
+    let gen_new = storage
+        .raw()
+        .with_tx_no_replay(TxMode::Immediate, |tx| schema::create_embedding_generation(tx, "bge-m3", DIM, 1, TS))
+        .unwrap();
+    schema::switch_active_generation(storage.raw(), gen_new, TS, |_tx| Ok(())).unwrap();
+
+    // Renaming the column the scan's own `WHERE` clause depends on breaks
+    // just that query ("no such column") without touching the table's FK
+    // relationships at all (unlike dropping/renaming the table itself,
+    // which `message_embeddings`/`embedding_holes` reference by FK, and
+    // which `storage::api` deliberately refuses to let raw SQL bypass).
+    storage.raw().execute("ALTER TABLE embedding_generations RENAME COLUMN created_at TO created_at_renamed_for_test", fparams![]).unwrap();
+
+    let outcome = cleanup_orphaned_generations(&storage, TS)
+        .expect("R3-6: a scan-level failure must be folded into Ok(outcome.failures), not propagated as Err");
+    assert!(outcome.deleted_ids.is_empty(), "nothing could have been scanned, let alone deleted");
+    assert_eq!(outcome.failures.len(), 1, "the scan failure itself must be recorded: {:?}", outcome.failures);
+    assert_eq!(outcome.failures[0].0, 0, "a scan-level failure has no real generation_id -- 0 is never a real AUTOINCREMENT id");
+    assert!(
+        outcome.failures[0].1.contains("orphan-scan"),
+        "failure detail must be traceable to the scan query, not a generic/opaque message: {:?}",
+        outcome.failures[0]
+    );
+}

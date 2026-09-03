@@ -97419,6 +97419,17 @@ fn run_models_backfill(
                         "holes_before": report.holes_before,
                         "holes_after": report.holes_after,
                         "activated": report.activated,
+                        // R3-6: previously discarded entirely (only
+                        // `cleanup_deleted_generation_ids` was ever computed
+                        // downstream of this report, and nothing surfaced
+                        // even that) -- a candidate-level delete failure or
+                        // the orphan-scan query itself failing (sentinel
+                        // `generation_id=0`) is real operational signal a
+                        // structured-output consumer must be able to see.
+                        "cleanup_failures": report.cleanup_failures.iter().map(|(generation_id, detail)| serde_json::json!({
+                            "generation_id": generation_id,
+                            "error": detail,
+                        })).collect::<Vec<_>>(),
                     }))
                     .unwrap_or_default()
                 );
@@ -97429,6 +97440,12 @@ fn run_models_backfill(
                 println!("  Embedded (this run): {}", report.embedded_inserted);
                 println!("  Holes remaining: {}", report.holes_after);
                 println!("  Activated: {}", report.activated);
+                if !report.cleanup_failures.is_empty() {
+                    println!("  Cleanup failures: {}", report.cleanup_failures.len());
+                    for (generation_id, detail) in &report.cleanup_failures {
+                        println!("    - generation {generation_id}: {detail}");
+                    }
+                }
             }
             return Ok(());
         }
