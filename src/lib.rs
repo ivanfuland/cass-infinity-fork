@@ -86011,10 +86011,27 @@ fn run_index_with_data(
 
     if let Some((pb, conversations, agents)) = progress_completion {
         match &res {
-            Ok(_) => pb.finish_with_message(format!(
-                "Done: {} conversations from {} agent(s)",
-                conversations, agents
-            )),
+            Ok(_) => {
+                let mut message =
+                    format!("Done: {conversations} conversations from {agents} agent(s)");
+                // R3-4: R2-B1 disclosed `semantic_activated` unconditionally
+                // in the JSON payload and the Plain-mode `eprintln!` below,
+                // but left this Bars-mode completion line -- the default
+                // interactive-TTY path -- with no mention of it at all, so
+                // a TTY user running `cass index --semantic` never saw
+                // whether the semantic index actually became searchable
+                // this run.
+                if let Ok(stats) = index_progress.stats.lock()
+                    && let Some(activated) = stats.semantic_activated
+                {
+                    message.push_str(if activated {
+                        ", semantic index: activated"
+                    } else {
+                        ", semantic index: not activated yet (holes remain; rerun to continue draining embedding_holes)"
+                    });
+                }
+                pb.finish_with_message(message);
+            }
             Err(err) => pb.abandon_with_message(format!("Failed: {}", err)),
         }
     }

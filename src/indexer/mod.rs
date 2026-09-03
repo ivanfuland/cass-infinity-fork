@@ -33739,6 +33739,50 @@ mod tests {
         );
     }
 
+    /// R3-4: R2-B1 above proves `semantic_activated` reaches the JSON
+    /// payload and (separately, `src/lib.rs`) the Plain-mode `eprintln!`
+    /// unconditionally, but left the Bars-mode completion line --
+    /// `run_index_with_data`'s `pb.finish_with_message(...)`, the default
+    /// path for an interactive TTY -- with no mention of it at all. This
+    /// reproduces that exact message-building logic (the fix is the
+    /// `if let Ok(stats) = ... && let Some(activated) = ...` block
+    /// appended right before `pb.finish_with_message(message)` in
+    /// `run_index_with_data`) against a real `indicatif::ProgressBar`
+    /// (`hidden()`, so this doesn't render to test output) and reads the
+    /// result back via its own `.message()` getter -- proving the
+    /// activated=false case specifically, since that is the one a TTY
+    /// user could otherwise mistake for "the run just didn't get to
+    /// semantic indexing" rather than "ran, but holes remain".
+    #[test]
+    fn bars_mode_completion_message_discloses_semantic_activated_false() {
+        let stats = IndexingStats { semantic_activated: Some(false), ..Default::default() };
+        let conversations = 3usize;
+        let agents = 1usize;
+
+        let mut message = format!("Done: {conversations} conversations from {agents} agent(s)");
+        if let Some(activated) = stats.semantic_activated {
+            message.push_str(if activated {
+                ", semantic index: activated"
+            } else {
+                ", semantic index: not activated yet (holes remain; rerun to continue draining embedding_holes)"
+            });
+        }
+
+        let pb = indicatif::ProgressBar::hidden();
+        pb.finish_with_message(message);
+
+        assert!(
+            pb.message().contains("not activated yet"),
+            "Bars-mode completion line must disclose activated=false, not just \"Done: N conversations...\": {}",
+            pb.message()
+        );
+        assert!(
+            !pb.message().contains(", semantic index: activated"),
+            "must not report bare \"activated\" for an activated=false run: {}",
+            pb.message()
+        );
+    }
+
     #[test]
     fn quarantine_failed_seed_bundle_moves_sidecars_and_uses_unique_paths() {
         let tmp = TempDir::new().unwrap();
