@@ -3075,6 +3075,35 @@ impl FrankenStorage {
             }
         }
         self.repair_missing_conversation_token_columns()?;
+        self.repair_missing_single_active_generation_index()?;
+        Ok(())
+    }
+
+    /// R3-5: `repair_missing_current_schema_objects`'s missing-table probe
+    /// (`REQUIRED_CURRENT_SCHEMA_TABLE_PROBES`) only detects the
+    /// `embedding_generations` *table* going missing -- if only its
+    /// `idx_embedding_generations_single_active` unique partial index (the
+    /// DB-level single-writer guard R2-N1 restored to the vector_domain
+    /// repair batch's SQL) was lost while the table itself survived, no
+    /// probe here ever fires and the missing-index case is invisible to
+    /// this self-heal pass entirely. `CREATE UNIQUE INDEX IF NOT EXISTS` is
+    /// naturally idempotent (a no-op once the index exists), so running it
+    /// unconditionally on every open -- rather than adding a second,
+    /// index-shaped probe/repair-batch mechanism alongside the
+    /// table-shaped one -- is the smaller fix (R3 ledger: "取改动更小
+    /// 者"). Safe to call unconditionally here: by this point
+    /// `embedding_generations` is guaranteed to exist, whether it already
+    /// did or the vector_domain repair batch above (which already contains
+    /// this same `CREATE UNIQUE INDEX IF NOT EXISTS` statement) just
+    /// (re)created it moments ago.
+    fn repair_missing_single_active_generation_index(&self) -> Result<()> {
+        self.conn
+            .execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_embedding_generations_single_active \
+                 ON embedding_generations(is_active) WHERE is_active = 1;",
+                &[],
+            )
+            .context("ensuring idx_embedding_generations_single_active exists")?;
         Ok(())
     }
 
@@ -25465,6 +25494,93 @@ mod tests {
         assert!(
             second_active_result.is_err(),
             "a second is_active=1 row must be rejected by the repaired index, not silently accepted"
+        );
+    }
+
+    /// R3-5: the test above proves the vector_domain repair *batch* now
+    /// recreates `idx_embedding_generations_single_active`, but that batch
+    /// only ever runs when `REQUIRED_CURRENT_SCHEMA_TABLE_PROBES` sees one
+    /// of its three *tables* missing. If only the index itself is lost
+    /// (surviving corruption/restore shape distinct from a whole-table
+    /// drop) while all three tables stay intact, that probe never fires,
+    /// and the missing-index case would be invisible to this self-heal
+    /// pass entirely -- no DB-level guard against two `is_active=1` rows,
+    /// with `sqlite_master` otherwise looking completely normal. Proves
+    /// `repair_missing_single_active_generation_index`'s unconditional
+    /// `CREATE UNIQUE INDEX IF NOT EXISTS` closes exactly that gap: drop
+    /// only the index, leave the three tables untouched, reopen, and
+    /// confirm both presence and real enforcement.
+    #[test]
+    fn franken_storage_open_repairs_missing_single_active_index_when_only_the_index_is_lost() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test_repair_missing_single_active_index.db");
+
+        {
+            let storage = FrankenStorage::open(&db_path).unwrap();
+            assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+        }
+
+        {
+            let conn = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().into_owned())), crate::storage::api::Profile::Production).unwrap();
+            conn.execute("DROP INDEX IF EXISTS idx_embedding_generations_single_active", &[])
+                .unwrap();
+            let index_gone: i64 = conn
+                .query_row_map(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_embedding_generations_single_active'",
+                    &[],
+                    |row| row.get_typed(0),
+                )
+                .unwrap();
+            assert_eq!(index_gone, 0, "sanity: the index must actually be gone before reopening");
+            let table_count: i64 = conn
+                .query_row_map(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' \
+                     AND name IN ('embedding_generations', 'message_embeddings', 'embedding_holes')",
+                    &[],
+                    |row| row.get_typed(0),
+                )
+                .unwrap();
+            assert_eq!(table_count, 3, "sanity: all three vector-domain tables must survive untouched");
+        }
+
+        let repaired = FrankenStorage::open(&db_path).unwrap();
+
+        let index_exists: i64 = repaired
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_embedding_generations_single_active'",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            index_exists, 1,
+            "reopening must recreate the index even though no vector-domain table was ever missing"
+        );
+
+        // Real enforcement, not just a name check.
+        let gen_a = repaired
+            .raw()
+            .with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
+                crate::storage::schema::create_embedding_generation(tx, "bge-m3", 1024, 1, 1_000)
+            })
+            .unwrap();
+        repaired
+            .raw()
+            .execute("UPDATE embedding_generations SET is_active = 1 WHERE id = ?1", &[ParamValue::from(gen_a)])
+            .expect("activating the first generation must succeed");
+        let gen_b = repaired
+            .raw()
+            .with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
+                crate::storage::schema::create_embedding_generation(tx, "bge-m3-v2", 1024, 1, 2_000)
+            })
+            .unwrap();
+        let second_active_result = repaired
+            .raw()
+            .execute("UPDATE embedding_generations SET is_active = 1 WHERE id = ?1", &[ParamValue::from(gen_b)]);
+        assert!(
+            second_active_result.is_err(),
+            "the reopened, re-repaired index must reject a second is_active=1 row, not silently accept it"
         );
     }
 
