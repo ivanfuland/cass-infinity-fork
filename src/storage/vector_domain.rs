@@ -19,7 +19,7 @@
 //! Table naming encodes the generation id so multiple generations' indexes
 //! can coexist during the delayed-cleanup window (W3-4).
 
-use super::api::{Conn, StorageError, TxMode, Value, params};
+use super::api::{Conn, StorageError, Tx, TxMode, Value, params};
 
 /// `vec0` table name for a given generation. `doc_id` (not a synthetic
 /// autoincrement id) is used as the table's `rowid` on insert — unique
@@ -83,6 +83,20 @@ pub fn drop_vec0_table_for_generation(
     validate_generation_id_for_ddl(generation_id)?;
     let table = vec0_table_name(generation_id);
     conn.execute_batch(&format!("DROP TABLE IF EXISTS {table};"))
+}
+
+/// Same DDL as [`drop_vec0_table_for_generation`], but issued against an
+/// already-open [`Tx`] instead of opening (and committing) its own
+/// statement -- R1-W3-N4: lets a caller fold the vec0 drop into the same
+/// transaction as a relational metadata delete, so the two either commit
+/// together or neither does. SQLite's DDL is transactional, so `DROP
+/// TABLE` inside an open transaction participates in its rollback like
+/// any other statement (`rebuild_vec0_table_for_generation` above already
+/// relies on exactly this to make its own drop+recreate atomic).
+pub fn drop_vec0_table_for_generation_in_tx(tx: &Tx, generation_id: i64) -> Result<(), StorageError> {
+    validate_generation_id_for_ddl(generation_id)?;
+    let table = vec0_table_name(generation_id);
+    tx.execute_batch(&format!("DROP TABLE IF EXISTS {table};"))
 }
 
 /// Real `sqlite_master` enumeration of `generation_id`'s `vec0` table and

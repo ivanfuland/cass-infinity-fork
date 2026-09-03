@@ -247,3 +247,75 @@ fn a_reader_holding_an_open_snapshot_is_unaffected_by_concurrent_generation_clea
 
     drop(reader_tx);
 }
+
+/// R1-W3-N4: the vec0 `DROP TABLE` used to run as its own statement
+/// *after* the metadata-delete transaction had already committed -- a
+/// failure in that separate, later, non-transactional drop left the
+/// metadata row gone forever (this function's own candidate-scan query
+/// can never find it again) while the vec0 table (and its shadow tables)
+/// stayed on disk, orphaned with no code path left that would ever
+/// revisit it. Folding the drop into the *same* transaction, issued
+/// first, closes exactly that gap: if the drop itself fails, the whole
+/// transaction (metadata deletes included) never even runs.
+///
+/// Proves this with a real failure at the vec0-drop step specifically
+/// (not the metadata deletes -- a trigger-aborted metadata delete doesn't
+/// distinguish old from new code here, since old code's separate vec0
+/// drop is only ever reached *after* a successful metadata commit, so it
+/// is simply never attempted either way when the metadata delete itself
+/// fails; verified while designing this test, see this item's mutation
+/// report). A negative `generation_id` is a real, deterministic way to
+/// make `drop_vec0_table_for_generation(_in_tx)`'s own `validate_
+/// generation_id_for_ddl` guard reject the DROP outright (SQLite virtual
+/// tables can't be created with such a name, and the crate defensively
+/// refuses to splice one into DDL text). Pre-fix (drop-after-commit),
+/// that guard fires *after* the metadata is already gone; post-fix
+/// (drop-first-in-tx), it fires before anything is touched.
+#[test]
+fn cleanup_never_deletes_metadata_when_its_vec0_drop_is_rejected() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = open_storage(&db_path);
+    let (conv_id, doc_id) = insert_one_message_conversation(&storage, "w3-n4-invalid-id");
+
+    // A malformed orphan candidate: negative generation_id. The real
+    // `create_embedding_generation` path (AUTOINCREMENT) never produces
+    // one -- this simulates whatever real-world condition could someday
+    // hand the DDL layer a generation_id `validate_generation_id_for_ddl`
+    // must refuse, while still exercising this function's real SQL path
+    // end to end.
+    let old_created_at = TS - 2 * DAY_MS;
+    storage
+        .raw()
+        .execute(
+            "INSERT INTO embedding_generations (id, embedder_id, dim, canonicalize_version, byte_order, created_at, is_active, audit_status) \
+             VALUES (-7, 'bge-m3', ?1, 1, 'le', ?2, 0, 'passed')",
+            fparams![DIM, old_created_at],
+        )
+        .unwrap();
+    storage
+        .raw()
+        .with_tx_no_replay(TxMode::Immediate, |tx| {
+            schema::insert_message_embedding(tx, -7, doc_id, conv_id, &[1.0, 0.0, 0.0, 0.0], "seed-hash", None, old_created_at)
+        })
+        .unwrap();
+
+    let result = cleanup_orphaned_generations(&storage, TS);
+    assert!(result.is_err(), "an invalid generation_id must be rejected, not silently produce a malformed DROP TABLE statement");
+
+    let row_count: i64 = storage
+        .raw()
+        .query_row_map("SELECT COUNT(*) FROM embedding_generations WHERE id = -7", &[] as &[V], |row| row.get_typed(0))
+        .unwrap();
+    assert_eq!(
+        row_count, 1,
+        "the metadata row for the rejected candidate must survive intact -- the vec0-drop \
+         rejection happens first, inside the same transaction as the metadata deletes, so \
+         nothing downstream of it ever runs either"
+    );
+    let embeddings_count: i64 = storage
+        .raw()
+        .query_row_map("SELECT COUNT(*) FROM message_embeddings WHERE generation_id = -7", &[] as &[V], |row| row.get_typed(0))
+        .unwrap();
+    assert_eq!(embeddings_count, 1, "its message_embeddings row must survive too -- nothing partially committed");
+}

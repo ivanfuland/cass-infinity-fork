@@ -898,10 +898,11 @@ pub fn cleanup_orphaned_generations(storage: &FrankenStorage, now_ms: i64) -> Re
             .with_tx(TxMode::Immediate, |tx| {
                 // Re-check `is_active` inside this same transaction before
                 // touching anything -- if this generation got reactivated
-                // between the scan above and here, the two DELETEs below
-                // must never run at all (they are not themselves gated on
-                // is_active, so running them unconditionally could wipe a
-                // *currently active* generation's rows out from under it).
+                // between the scan above and here, none of the drops/
+                // deletes below must run at all (they are not themselves
+                // gated on is_active, so running them unconditionally
+                // could wipe a *currently active* generation's rows out
+                // from under it).
                 let still_inactive: Option<bool> = tx.query_opt_map(
                     "SELECT is_active = 0 FROM embedding_generations WHERE id = ?1",
                     &params![generation_id],
@@ -910,6 +911,18 @@ pub fn cleanup_orphaned_generations(storage: &FrankenStorage, now_ms: i64) -> Re
                 if still_inactive != Some(true) {
                     return Ok(0);
                 }
+                // R1-W3-N4: the vec0 DROP used to run as its own statement
+                // *after* this transaction had already committed the
+                // metadata deletes below. SQLite DDL is transactional
+                // (`rebuild_vec0_table_for_generation` already relies on
+                // this for its own drop+recreate), so folding the drop
+                // into this same transaction -- issued first -- means a
+                // failure here rolls back the metadata deletes too: no
+                // window where the metadata row is gone but the vec0
+                // table (and its shadow tables) are still on disk with no
+                // `embedding_generations` row left to ever find them
+                // again via this function's own candidate-scan query.
+                vector_domain::drop_vec0_table_for_generation_in_tx(tx, generation_id)?;
                 tx.execute("DELETE FROM embedding_holes WHERE generation_id = ?1", &params![generation_id])?;
                 tx.execute("DELETE FROM message_embeddings WHERE generation_id = ?1", &params![generation_id])?;
                 tx.execute(
@@ -923,8 +936,6 @@ pub fn cleanup_orphaned_generations(storage: &FrankenStorage, now_ms: i64) -> Re
             // nothing was touched, safe to skip.
             continue;
         }
-        vector_domain::drop_vec0_table_for_generation(storage.raw(), generation_id)
-            .with_context(|| format!("dropping vec0 table for deleted generation {generation_id}"))?;
         deleted.push(generation_id);
     }
     Ok(deleted)
