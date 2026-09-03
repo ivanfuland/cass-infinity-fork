@@ -604,9 +604,32 @@ fn load_semantic_context_inner(
     }
 }
 
+/// R1-W3-N2: pulled out of [`active_policy_embedder_name`] so it's
+/// directly unit-testable without going through `SemanticPolicy::resolve`
+/// (which reads process env and would make a test of this exact
+/// canonicalization hermetically unsafe under parallel test execution).
+///
+/// This used to be `FastEmbedder::canonical_name(name).unwrap_or("minilm")`
+/// unconditionally, which only recognizes FastEmbed model aliases -- an
+/// infinity-routing name (`"infinity"`/`"bge-m3"`, `is_infinity_embedder_
+/// name` above) always fell through to `None` there and got silently
+/// mangled back to `"minilm"` by the `.unwrap_or`. That made it impossible
+/// for `DEFAULT_QUALITY_TIER_EMBEDDER = "infinity"` (under the `infinity`
+/// feature) to ever actually reach `load_semantic_context`/`probe_
+/// semantic_availability`'s `is_infinity_embedder_name` routing check --
+/// the plumbing to route to the DB vector domain by default already
+/// existed, this was the one place quietly discarding the name before it
+/// got there.
+fn canonicalize_active_embedder_name(quality_tier_embedder: &str) -> &'static str {
+    if is_infinity_embedder_name(quality_tier_embedder) {
+        return "infinity";
+    }
+    FastEmbedder::canonical_name(quality_tier_embedder).unwrap_or("minilm")
+}
+
 fn active_policy_embedder_name() -> &'static str {
     let semantic_policy = SemanticPolicy::resolve(&CliSemanticOverrides::default());
-    FastEmbedder::canonical_name(&semantic_policy.quality_tier_embedder).unwrap_or("minilm")
+    canonicalize_active_embedder_name(&semantic_policy.quality_tier_embedder)
 }
 
 fn semantic_availability_from_cache_state(
@@ -732,6 +755,27 @@ mod tests {
     use tempfile::tempdir;
     use crate::storage::api::{TxMode, params};
     use crate::storage::schema;
+
+    /// R1-W3-N2: `canonicalize_active_embedder_name` must preserve the two
+    /// infinity-routing names, not push them through `FastEmbedder::
+    /// canonical_name` (which knows nothing about them and always mangled
+    /// them to `"minilm"` pre-fix, silently defeating `DEFAULT_QUALITY_
+    /// TIER_EMBEDDER = "infinity"` under the `infinity` feature).
+    #[test]
+    fn canonicalize_active_embedder_name_preserves_infinity_routing_names() {
+        assert_eq!(canonicalize_active_embedder_name("infinity"), "infinity");
+        assert_eq!(canonicalize_active_embedder_name("bge-m3"), "infinity");
+    }
+
+    /// Every other name must still canonicalize through FastEmbed as
+    /// before -- the fix must not widen what counts as an infinity name.
+    #[test]
+    fn canonicalize_active_embedder_name_still_canonicalizes_fastembed_aliases() {
+        assert_eq!(canonicalize_active_embedder_name("fastembed"), "minilm");
+        assert_eq!(canonicalize_active_embedder_name("minilm"), "minilm");
+        assert_eq!(canonicalize_active_embedder_name("snowflake-arctic-s-384"), "snowflake-arctic-s");
+        assert_eq!(canonicalize_active_embedder_name("totally-unknown-model"), "minilm");
+    }
 
     type AvailabilityTuiCase = (
         SemanticAvailability,

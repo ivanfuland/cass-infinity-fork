@@ -365,8 +365,13 @@ pub enum Commands {
         #[arg(long)]
         semantic: bool,
 
-        /// Embedder to use for semantic indexing (hash, fastembed)
-        #[arg(long, default_value = "fastembed")]
+        /// Embedder to use for semantic indexing (infinity, hash; `fastembed`
+        /// requires the `semantic` build feature, retired in this build --
+        /// R1-W3-N2: defaults to `infinity` under the `infinity` feature so
+        /// a bare `cass index --semantic` reaches the DB vector domain
+        /// instead of the retired default)
+        #[cfg_attr(feature = "infinity", arg(long, default_value = "infinity"))]
+        #[cfg_attr(not(feature = "infinity"), arg(long, default_value = "fastembed"))]
         embedder: String,
 
         /// Override data dir (index + db). Defaults to platform data dir.
@@ -97170,7 +97175,14 @@ fn run_models_backfill(
         .map(str::to_string)
         .unwrap_or_else(|| match tier {
             TierKind::Fast => "hash".to_string(),
-            TierKind::Quality => "fastembed".to_string(),
+            // R1-W3-N2: default to `infinity` under this build's actual
+            // feature (fastembed/ONNX is retired here) so a bare `cass
+            // models backfill` (no `--embedder`) reaches the DB vector
+            // domain instead of immediately hitting the "embedder
+            // 'fastembed' is retired" error below.
+            TierKind::Quality => {
+                if cfg!(feature = "infinity") { "infinity".to_string() } else { "fastembed".to_string() }
+            }
         });
     let embedder_type = resolve_semantic_index_embedder(&embedder_type);
     let embedder_valid = embedder_type == "hash"
