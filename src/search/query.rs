@@ -3350,12 +3350,14 @@ impl SearchClient {
     /// `workspaces`/`sources` -- not a doc_id-string decode (that
     /// indirection existed only because the fsvi format had no relational
     /// join available; the new path does, so it uses it -- "甩掉 doc_id 解码
-    /// 历史包袱", control-plane 2026-09-01). `session_paths` filtering is
-    /// deliberately NOT handled here: it is applied post-hoc during hit
-    /// hydration for both the fsvi and this path alike (see
-    /// `semantic_search_session_paths_filter_retries_past_initial_
-    /// candidates`), so this function's contract doesn't need to know
-    /// about it.
+    /// 历史包袱", control-plane 2026-09-01). `session_paths` is also
+    /// pushed into this `WHERE` (R3-2: a restrictive `session_paths` filter
+    /// left post-hoc-only starved the full-scan retry's capped heap with
+    /// non-matching rows, evicting genuine matches ranked beyond the cap);
+    /// `postprocess_hits_page`'s own post-hoc `session_paths` retain()
+    /// (see `semantic_search_session_paths_filter_retries_past_initial_
+    /// candidates`) stays as a no-op safety net over this already-filtered
+    /// set.
     ///
     /// Contract (w3-d7①, three states, never a silent degradation to the
     /// fsvi sidecar, an empty-result masquerade, or an unfiltered scan):
@@ -3386,7 +3388,7 @@ impl SearchClient {
     /// "甩掉 doc_id 解码历史包袱" ruling). Returns the query text plus its
     /// positional parameters, ready for `tx.query_all_map`.
     /// Shared relational filter clauses (agents/workspaces/source/role/
-    /// created_from/created_to) for both DB-vector-domain SQL builders
+    /// created_from/created_to/session_paths) for both DB-vector-domain SQL builders
     /// below -- extracted (R1-W3-B6/N1/B9) so the post-KNN id-filter path
     /// and the full-scan path can never drift apart on what "passes the
     /// filters" means. Appends `AND ...` clauses onto `sql` and their
@@ -3459,6 +3461,25 @@ impl SearchClient {
         if let Some(created_to) = filters.created_to {
             sql.push_str(" AND m.created_at <= ?");
             params.push(ParamValue::from(created_to));
+        }
+
+        // R3-2: pushed into the shared SQL filter (was post-hoc-only, see
+        // the retired claim this replaces below) so the full-scan retry's
+        // heap-capped ranking competes only among session-path-matching
+        // rows, not the entire (unfiltered) generation -- a restrictive
+        // `session_paths` filter combined with a cap smaller than the
+        // unfiltered candidate count used to starve the heap with
+        // non-matching rows, evicting a genuine match ranked at
+        // `cap+1`+ purely by distance among rows post-hoc filtering would
+        // have discarded anyway. `postprocess_hits_page`'s own
+        // `session_paths` retain() stays in place as a harmless no-op
+        // safety net over this now-already-filtered set.
+        if !filters.session_paths.is_empty() {
+            let placeholders = sql_placeholders(filters.session_paths.len());
+            sql.push_str(&format!(" AND c.source_path IN ({placeholders})"));
+            for path in &filters.session_paths {
+                params.push(ParamValue::from(path.as_str()));
+            }
         }
     }
 
@@ -16443,6 +16464,131 @@ mod tests {
         assert_eq!(
             got_ids, want_ids,
             "must surface the 12 nearest target docs, nearest-first -- not the first 12 rows SQLite iterated"
+        );
+    }
+
+    /// R3-2 regression: `session_paths` used to be excluded from
+    /// `push_db_vector_domain_relational_filters` entirely (applied only
+    /// post-hoc, after `search_db_vector_domain` returns) -- so the
+    /// full-scan retry's capped heap ranked candidates by distance across
+    /// the *whole* (session-path-unaware) generation. A single target doc
+    /// whose distance rank among the unfiltered universe fell at `cap+1`
+    /// (here: 12 nearer non-matching filler docs, target 13th) was evicted
+    /// by the heap before `search_db_vector_domain` even returned, so the
+    /// post-hoc `session_paths` filter downstream had nothing left to find
+    /// it in -- a silent empty result the caller-side retry
+    /// (`search_semantic`'s `fallback_fetch_limit` widen) could never fix,
+    /// since widening `fetch_limit` doesn't change which rows the heap
+    /// competes against. Pushing `session_paths` into the shared SQL
+    /// filter fixes this: the full-scan retry's universe excludes the 12
+    /// non-matching fillers outright, so the target -- alone in its
+    /// filtered universe -- is trivially within the cap.
+    #[test]
+    fn db_vector_domain_full_scan_retry_session_paths_reaches_cap_plus_one_target() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        const DIM: i64 = 4;
+        const FILLER_DOCS: i64 = 12; // == CAP, so the target lands at rank cap+1
+        const FETCH_LIMIT: usize = 3;
+
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".to_string(),
+                name: "codex".to_string(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        let ws = storage.ensure_workspace(std::path::Path::new("/ws/shared"), None).unwrap();
+        let conn = storage.raw();
+        conn.execute(
+            "INSERT OR IGNORE INTO sources(id, kind, created_at, updated_at) VALUES ('local', 'local', 0, 0)",
+            &[],
+        )
+        .unwrap();
+
+        let target_path = "/tmp/target-session.jsonl".to_string();
+        let mut vectors: Vec<(i64, i64, Vec<f32>)> = Vec::with_capacity((FILLER_DOCS + 1) as usize);
+        conn.with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
+            // 12 filler docs, all closer to the query vector than the
+            // target and none matching `target_path` -- pre-fix, these
+            // alone fill the cap-12 heap in the full-scan retry.
+            for i in 0..FILLER_DOCS {
+                let message_id = 6_000_000 + i;
+                tx.execute(
+                    "INSERT INTO conversations(id, agent_id, workspace_id, source_id, title, source_path) \
+                     VALUES (?1, ?2, ?3, 'local', 't', ?4)",
+                    &[
+                        ParamValue::from(message_id),
+                        ParamValue::from(agent_id),
+                        ParamValue::from(ws),
+                        ParamValue::from(format!("/tmp/filler-{message_id}.jsonl")),
+                    ],
+                )?;
+                tx.execute(
+                    "INSERT INTO messages(id, conversation_id, idx, role, created_at, content) \
+                     VALUES (?1, ?2, 0, 'user', ?3, 'c')",
+                    &crate::storage::api::params![message_id, message_id, 100 + message_id],
+                )?;
+                let theta = (i as f32) * 0.0001;
+                vectors.push((message_id, message_id, vec![theta.cos(), theta.sin(), 0.0, 0.0]));
+            }
+
+            // Target: 1 doc, farther than every filler, in `target_path`.
+            let message_id = 7_000_000_i64;
+            tx.execute(
+                "INSERT INTO conversations(id, agent_id, workspace_id, source_id, title, source_path) \
+                 VALUES (?1, ?2, ?3, 'local', 't', ?4)",
+                &[
+                    ParamValue::from(message_id),
+                    ParamValue::from(agent_id),
+                    ParamValue::from(ws),
+                    ParamValue::from(target_path.clone()),
+                ],
+            )?;
+            tx.execute(
+                "INSERT INTO messages(id, conversation_id, idx, role, created_at, content) \
+                 VALUES (?1, ?2, 0, 'user', ?3, 'c')",
+                &crate::storage::api::params![message_id, message_id, 100 + message_id],
+            )?;
+            let theta = 1.0_f32;
+            vectors.push((message_id, message_id, vec![theta.cos(), theta.sin(), 0.0, 0.0]));
+            Ok(())
+        })
+        .unwrap();
+        seed_active_generation_with_vectors(&storage, DIM, &vectors);
+
+        let mut filters = SearchFilters::default();
+        filters.session_paths.insert(target_path.clone());
+        let (results, retry) = SearchClient::search_db_vector_domain(
+            storage.raw(),
+            &[1.0, 0.0, 0.0, 0.0],
+            &filters,
+            Some(&HashSet::from([
+                crate::search::vector_index::ROLE_USER,
+                crate::search::vector_index::ROLE_ASSISTANT,
+            ])),
+            FETCH_LIMIT,
+        )
+        .unwrap();
+
+        assert!(
+            retry.second_pass_taken,
+            "the session_paths filter eliminated every first-pass candidate -- the streaming retry must fire"
+        );
+        assert_eq!(
+            results.len(),
+            1,
+            "the single session_paths-matching doc must be found even though it ranks 13th (cap+1) among the unfiltered universe"
+        );
+        assert_eq!(
+            results[0].message_id, 7_000_000,
+            "must return the session_paths-matching target, not a filler"
+        );
+        assert!(
+            !retry.has_more_candidates,
+            "session_paths pruning leaves exactly 1 candidate in the retry's universe -- nothing was truncated"
         );
     }
 
