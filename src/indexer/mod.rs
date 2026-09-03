@@ -33889,47 +33889,56 @@ mod tests {
         assert!(failures_json[0]["error"].as_str().unwrap().contains("orphan-scan"));
     }
 
-    /// R3-4: R2-B1 above proves `semantic_activated` reaches the JSON
-    /// payload and (separately, `src/lib.rs`) the Plain-mode `eprintln!`
-    /// unconditionally, but left the Bars-mode completion line --
-    /// `run_index_with_data`'s `pb.finish_with_message(...)`, the default
-    /// path for an interactive TTY -- with no mention of it at all. This
-    /// reproduces that exact message-building logic (the fix is the
-    /// `if let Ok(stats) = ... && let Some(activated) = ...` block
-    /// appended right before `pb.finish_with_message(message)` in
-    /// `run_index_with_data`) against a real `indicatif::ProgressBar`
-    /// (`hidden()`, so this doesn't render to test output) and reads the
-    /// result back via its own `.message()` getter -- proving the
-    /// activated=false case specifically, since that is the one a TTY
-    /// user could otherwise mistake for "the run just didn't get to
-    /// semantic indexing" rather than "ran, but holes remain".
+    /// R4-2: R3-4 originally proved the Bars-mode completion line
+    /// discloses `semantic_activated` by re-typing its message-building
+    /// logic by hand against a bare `String`/`ProgressBar`, never calling
+    /// the real production code -- round-4 review's R4-2 finding: deleting
+    /// the real call site in `run_index_with_data`, or that code no
+    /// longer reading `semantic_activated` at all, left this test unable
+    /// to notice either regression. The activation suffix is now
+    /// `crate::semantic_activation_suffix` (src/lib.rs), a pure function
+    /// both the production call site and this test call, so this test
+    /// now asserts its actual output across all three `semantic_
+    /// activated` states instead of a hand-copied three-way branch.
     #[test]
-    fn bars_mode_completion_message_discloses_semantic_activated_false() {
-        let stats = IndexingStats { semantic_activated: Some(false), ..Default::default() };
-        let conversations = 3usize;
-        let agents = 1usize;
-
-        let mut message = format!("Done: {conversations} conversations from {agents} agent(s)");
-        if let Some(activated) = stats.semantic_activated {
-            message.push_str(if activated {
-                ", semantic index: activated"
-            } else {
-                ", semantic index: not activated yet (holes remain; rerun to continue draining embedding_holes)"
-            });
-        }
-
-        let pb = indicatif::ProgressBar::hidden();
-        pb.finish_with_message(message);
-
-        assert!(
-            pb.message().contains("not activated yet"),
-            "Bars-mode completion line must disclose activated=false, not just \"Done: N conversations...\": {}",
-            pb.message()
+    fn semantic_activation_suffix_discloses_all_three_states() {
+        let activated_true = IndexingStats { semantic_activated: Some(true), ..Default::default() };
+        assert_eq!(
+            crate::semantic_activation_suffix(&activated_true).as_deref(),
+            Some(", semantic index: activated"),
+            "activated=true must report bare \"activated\""
         );
+
+        let activated_false = IndexingStats { semantic_activated: Some(false), ..Default::default() };
+        assert_eq!(
+            crate::semantic_activation_suffix(&activated_false).as_deref(),
+            Some(
+                ", semantic index: not activated yet (holes remain; rerun to continue draining embedding_holes)"
+            ),
+            "activated=false must not be mistaken for \"no semantic pass ran\""
+        );
+
+        let no_semantic_pass = IndexingStats { semantic_activated: None, ..Default::default() };
+        assert_eq!(
+            crate::semantic_activation_suffix(&no_semantic_pass),
+            None,
+            "a run that never requested semantic indexing must add no suffix at all"
+        );
+    }
+
+    /// R4-2: grep-level proof that `run_index_with_data`'s Bars-mode
+    /// completion line still calls `semantic_activation_suffix` -- not a
+    /// PTY integration test (Ivan boundary ruling: no test hooks/harness
+    /// for interactive-TTY rendering). The unit test above proves the
+    /// function's own output is correct in isolation; it cannot see
+    /// whether the real call site still calls it, which is exactly the
+    /// false-green class R4-2 flagged.
+    #[test]
+    fn bars_mode_completion_line_calls_semantic_activation_suffix() {
+        let lib_rs = include_str!("../lib.rs");
         assert!(
-            !pb.message().contains(", semantic index: activated"),
-            "must not report bare \"activated\" for an activated=false run: {}",
-            pb.message()
+            lib_rs.contains("semantic_activation_suffix(&stats)"),
+            "run_index_with_data's Bars-mode completion line must still call semantic_activation_suffix"
         );
     }
 

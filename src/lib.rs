@@ -85487,6 +85487,29 @@ fn refresh_index_inline(db_override: Option<PathBuf>, data_dir_override: Option<
     }
 }
 
+/// R4-2: pure extraction of the Bars-mode completion line's activation
+/// suffix (previously inlined directly in `run_index_with_data` below).
+/// The prior regression test for this line
+/// (`bars_mode_completion_message_discloses_semantic_activated_false`,
+/// src/indexer/mod.rs) re-typed this exact three-way branch by hand
+/// against a bare `String` rather than calling the real production code,
+/// so deleting the real call site below -- or the real code no longer
+/// reading `semantic_activated` at all -- left that test unable to
+/// notice (R4-2 finding). Now the production call site and its test both
+/// call this same function. `None` means this run didn't request
+/// semantic indexing at all (`semantic_activated: None`), the one case
+/// that must add no suffix.
+fn semantic_activation_suffix(stats: &indexer::IndexingStats) -> Option<String> {
+    stats.semantic_activated.map(|activated| {
+        if activated {
+            ", semantic index: activated".to_string()
+        } else {
+            ", semantic index: not activated yet (holes remain; rerun to continue draining embedding_holes)"
+                .to_string()
+        }
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_index_with_data(
     db_override: Option<PathBuf>,
@@ -86022,12 +86045,8 @@ fn run_index_with_data(
                 // whether the semantic index actually became searchable
                 // this run.
                 if let Ok(stats) = index_progress.stats.lock() {
-                    if let Some(activated) = stats.semantic_activated {
-                        message.push_str(if activated {
-                            ", semantic index: activated"
-                        } else {
-                            ", semantic index: not activated yet (holes remain; rerun to continue draining embedding_holes)"
-                        });
+                    if let Some(suffix) = semantic_activation_suffix(&stats) {
+                        message.push_str(&suffix);
                     }
                     // R4-4: same disclosure as the JSON (`indexing_stats.
                     // cleanup_failures`) and Plain (`eprintln!` below)
