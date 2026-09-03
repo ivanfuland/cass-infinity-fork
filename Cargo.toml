@@ -96,7 +96,7 @@ fastembed = { version = "5.13.4", default-features = false, features = ["ort-dow
 # the last stable release, not the newest crates.io publish: v0.1.10-alpha.4
 # ships a broken tarball missing sqlite-vec-diskann.c and fails to compile.
 sqlite-vec = "=0.1.9"
-franken-agent-detection = { version = "0.1.9", git = "https://github.com/ivanfuland/my_franken_agent_detection", rev = "6be142d9e6ccb1c9a1dc27a986f6e30ed151d71a", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "hermes"] }
+franken-agent-detection = { version = "0.1.10", git = "https://github.com/ivanfuland/my_franken_agent_detection", rev = "bc0f4d3c02356eac4d4dbc48e6f7d830d2caa9e8", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "hermes"] }
 ahash = "0.8.12"  # W3-5: hasher for the verbatim-restored RRF fusion hot map (was a transitive upstream-fusion dep)
 wide = "1.4.0"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "0.7.6"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization

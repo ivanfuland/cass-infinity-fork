@@ -2982,7 +2982,7 @@ Update check state is stored in the data directory:
 
 | Dependency | Pinned source |
 |------------|-----------------|
-| `franken-agent-detection` | `6be142d` (fork: ivanfuland/my_franken_agent_detection, fix/codex-legacy-token-count-shape) |
+| `franken-agent-detection` | `bc0f4d3` (fork: ivanfuland/my_franken_agent_detection, main) |
 | `asupersync` | `=0.3.5` |
 | `frankentui` | `5f78cfa0` |
 | `toon` (`tru`) | `5669b72a` |
