@@ -8519,6 +8519,7 @@ fn run_semantic_db_vector_catchup(
         holes_before = report.holes_before,
         holes_after = report.holes_after,
         holes_written_off_ineligible = report.holes_written_off_ineligible,
+        embeddings_pruned_ineligible = report.embeddings_pruned_ineligible,
         activated = report.activated,
         "db vector domain catch-up complete"
     );

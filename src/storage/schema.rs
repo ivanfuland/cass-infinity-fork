@@ -1059,13 +1059,55 @@ pub fn register_embedding_hole_for_new_message_in_tx(
 /// keep `holes_after` permanently above zero and self-lock the generation
 /// out of activation forever (the exact failure `run_db_vector_catchup_
 /// backfill`'s draining loop must not reproduce). A no-op `DELETE` if the
-/// hole was already resolved or never existed.
-pub fn write_off_ineligible_hole_in_tx(tx: &Tx, generation_id: i64, doc_id: i64) -> Result<(), StorageError> {
-    tx.execute(
+/// hole was already resolved or never existed. Returns the number of rows
+/// actually deleted (0 or 1) -- task book #81 R2-N4, same discipline as
+/// [`prune_ineligible_message_embedding_in_tx`]'s R1-N3 fix: a caller
+/// tallying `holes_written_off_ineligible` must report what was actually
+/// affected, not the size of a candidate list computed before this ran.
+pub fn write_off_ineligible_hole_in_tx(tx: &Tx, generation_id: i64, doc_id: i64) -> Result<u64, StorageError> {
+    let affected = tx.execute(
         "DELETE FROM embedding_holes WHERE generation_id = ?1 AND doc_id = ?2",
         &params![generation_id, doc_id],
     )?;
-    Ok(())
+    Ok(u64::try_from(affected).unwrap_or(0))
+}
+
+/// Prune a `message_embeddings` row that was embedded but has since fallen
+/// out of the eligibility chain (task book #80, exec72) -- the reverse of
+/// [`write_off_ineligible_hole_in_tx`] above (that one retires a hole for a
+/// message that was *never* eligible; this one retires an already-written
+/// embedding for a message that *used to be* eligible and no longer is,
+/// most commonly a conversation's cumulative content crossing the shared
+/// per-conversation content cap -- `FrankenStorage::fetch_messages_for_
+/// lexical_rebuild`'s truncation, #290 -- which silently clears an
+/// already-embedded tail message's content out of the same eligibility
+/// scan that cap was never designed to gate).
+///
+/// Left in place, such a row makes activation audit ④'s bidirectional
+/// anti-join (`embedded_not_eligible_count` in `db_vector_catchup.rs`)
+/// permanently non-zero -- `run_db_vector_catchup_backfill`'s hole-driven
+/// drain loop only ever grows `message_embeddings` toward the eligible set
+/// and has no path that shrinks it back, so nothing else in this codebase
+/// would ever delete this row. Callers do not need a matching `vec0`-side
+/// delete: `run_db_vector_catchup_backfill` unconditionally calls
+/// `vector_domain::rebuild_vec0_table_for_generation` right after its own
+/// reverse-reconciliation step, which fully repopulates `vec0` from
+/// `message_embeddings` in one drop+recreate+bulk-insert transaction, so a
+/// row deleted here before that call never makes it into the rebuilt
+/// index.
+///
+/// A no-op `DELETE` if the row was already gone (idempotent, matching
+/// `write_off_ineligible_hole_in_tx`'s style). Returns the number of rows
+/// actually deleted (0 or 1, `UNIQUE(generation_id, doc_id)`) -- R1-N3:
+/// callers must report what was actually affected, not the size of a
+/// candidate list computed before this ran, since a concurrent writer
+/// could have already resolved/deleted the same row in between.
+pub fn prune_ineligible_message_embedding_in_tx(tx: &Tx, generation_id: i64, doc_id: i64) -> Result<u64, StorageError> {
+    let affected = tx.execute(
+        "DELETE FROM message_embeddings WHERE generation_id = ?1 AND doc_id = ?2",
+        &params![generation_id, doc_id],
+    )?;
+    Ok(u64::try_from(affected).unwrap_or(0))
 }
 
 /// Demote the active generation's certified-ready status (`audit_status`)
@@ -1106,6 +1148,31 @@ pub fn demote_active_generation_readiness_in_tx(tx: &Tx) -> Result<(), StorageEr
         "UPDATE embedding_generations SET audit_status = 'pending' \
          WHERE is_active = 1 AND audit_status != 'pending'",
         &[],
+    )?;
+    Ok(())
+}
+
+/// Like [`demote_active_generation_readiness_in_tx`], but scoped to one
+/// specific `generation_id` -- task book #81 R2-N3: the unscoped version
+/// demotes *whatever* generation currently holds `is_active = 1`, which is
+/// exactly right for the write entry points above (they always mutate
+/// against the active generation, by construction). A caller that instead
+/// knows the specific `generation_id` its own mutation targeted --
+/// [`prune_ineligible_message_embedding_in_tx`]'s caller, in particular --
+/// must not reach for the unscoped version: if that `generation_id` is
+/// ever a *not-yet-active* candidate (a real generation reuse/upgrade
+/// scenario, ruling ②) while some *other* generation is the currently
+/// active one, the unscoped version would demote the wrong (currently
+/// serving) generation instead of leaving it alone. This version demotes
+/// `generation_id` if and only if it is both the row this call means to
+/// touch and the currently active one.
+///
+/// No-op when `generation_id` is not active, or is already `'pending'`.
+pub fn demote_generation_readiness_if_active_in_tx(tx: &Tx, generation_id: i64) -> Result<(), StorageError> {
+    tx.execute(
+        "UPDATE embedding_generations SET audit_status = 'pending' \
+         WHERE id = ?1 AND is_active = 1 AND audit_status != 'pending'",
+        &params![generation_id],
     )?;
     Ok(())
 }
