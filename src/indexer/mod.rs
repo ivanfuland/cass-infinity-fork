@@ -17892,6 +17892,7 @@ pub mod persist {
             use crate::connectors::NormalizedConversation;
 
             let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
+            let _redact_guard = set_env("CASS_REDACT_SECRETS", "1");
 
             let dir = tempfile::TempDir::new().unwrap();
             let db_path = dir.path().join("known-answer-json-credential-redaction.db");
@@ -17987,6 +17988,7 @@ pub mod persist {
             use crate::connectors::NormalizedConversation;
 
             let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
+            let _redact_guard = set_env("CASS_REDACT_SECRETS", "1");
 
             let dir = tempfile::TempDir::new().unwrap();
             let db_path = dir.path().join("known-answer-conversation-metadata-redaction.db");
