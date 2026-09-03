@@ -3627,11 +3627,36 @@ CREATE INDEX IF NOT EXISTS idx_umd_workspace_day ON usage_models_daily(workspace
 CREATE INDEX IF NOT EXISTS idx_umd_source_day ON usage_models_daily(source_id, day_id);
 ";
 
+// R1-W3-N5: verbatim copy of `V4_VECTOR_DOMAIN_DDL`'s three-table shape
+// (`src/storage/schema.rs`) -- must stay byte-for-byte identical to that
+// source of truth, the same discipline the module doc comment there
+// already enforces between `FRESH_SCHEMA_DDL`'s tail and
+// `V2_LEX_DOMAIN_DDL`. `message_embeddings`/`embedding_holes` both
+// reference `embedding_generations`, so all three are one repair batch
+// (like `lex_domain`'s `lex_docs`+`fts_lex` pairing above), never
+// recreated independently of each other.
+const CURRENT_SCHEMA_REPAIR_VECTOR_DOMAIN_SQL: &str = r"
+CREATE TABLE IF NOT EXISTS embedding_generations (id INTEGER PRIMARY KEY AUTOINCREMENT, embedder_id TEXT NOT NULL, dim INTEGER NOT NULL CHECK (dim > 0), canonicalize_version INTEGER NOT NULL, byte_order TEXT NOT NULL DEFAULT 'le' CHECK (byte_order IN ('le', 'be')), audit_status TEXT NOT NULL DEFAULT 'pending' CHECK (audit_status IN ('pending', 'passed', 'failed')), is_active INTEGER NOT NULL DEFAULT 0 CHECK (is_active IN (0, 1)), created_at INTEGER NOT NULL, activated_at INTEGER);
+CREATE TABLE IF NOT EXISTS message_embeddings (generation_id INTEGER NOT NULL REFERENCES embedding_generations (id), doc_id INTEGER NOT NULL REFERENCES messages (id) ON DELETE CASCADE, conversation_id INTEGER NOT NULL, embedding BLOB NOT NULL CHECK (length(embedding) % 4 = 0), norm REAL NOT NULL CHECK (norm > 0), content_hash TEXT NOT NULL, content_version INTEGER, created_at INTEGER NOT NULL, UNIQUE (generation_id, doc_id));
+CREATE INDEX IF NOT EXISTS idx_message_embeddings_generation ON message_embeddings(generation_id);
+CREATE INDEX IF NOT EXISTS idx_message_embeddings_doc ON message_embeddings(doc_id);
+CREATE TABLE IF NOT EXISTS embedding_holes (generation_id INTEGER NOT NULL REFERENCES embedding_generations (id), doc_id INTEGER NOT NULL REFERENCES messages (id) ON DELETE CASCADE, detected_at INTEGER NOT NULL, reason TEXT, PRIMARY KEY (generation_id, doc_id));
+";
+
 const CURRENT_SCHEMA_REPAIR_BATCHES: &[SchemaRepairBatch] = &[
     SchemaRepairBatch {
         name: "sources",
         tables: &["sources"],
         sql: CURRENT_SCHEMA_REPAIR_SOURCES_SQL,
+    },
+    SchemaRepairBatch {
+        name: "vector_domain",
+        tables: &[
+            "embedding_generations",
+            "message_embeddings",
+            "embedding_holes",
+        ],
+        sql: CURRENT_SCHEMA_REPAIR_VECTOR_DOMAIN_SQL,
     },
     SchemaRepairBatch {
         name: "daily_stats",
@@ -3754,6 +3779,23 @@ const REQUIRED_CURRENT_SCHEMA_TABLE_PROBES: &[(&str, &str)] = &[
     // table: lex_docs"/"no such table: fts_lex" instead of self-healing.
     ("lex_docs", "SELECT doc_id FROM lex_docs LIMIT 1;"),
     ("fts_lex", "SELECT rowid FROM fts_lex LIMIT 1;"),
+    // R1-W3-N5: the W3 DB-vector-domain tables (`V4_VECTOR_DOMAIN_DDL`,
+    // `src/storage/schema.rs`) had no probe here at all -- a v4+ database
+    // that lost these three tables to incomplete restore / derived-index
+    // corruption was invisible to this self-heal pass, same class of gap
+    // the w2 F4 fix above closed for `lex_docs`/`fts_lex`.
+    (
+        "embedding_generations",
+        "SELECT id FROM embedding_generations LIMIT 1;",
+    ),
+    (
+        "message_embeddings",
+        "SELECT generation_id FROM message_embeddings LIMIT 1;",
+    ),
+    (
+        "embedding_holes",
+        "SELECT generation_id FROM embedding_holes LIMIT 1;",
+    ),
 ];
 
 const REQUIRED_CONVERSATION_TOKEN_COLUMNS: &[(&str, &str)] = &[
@@ -25308,6 +25350,72 @@ mod tests {
             analytics_count, 9,
             "open() should recreate the missing analytics tables even when schema_version already says current"
         );
+    }
+
+    /// R1-W3-N5 regression: a v4+ database that lost the three W3
+    /// DB-vector-domain tables (`embedding_generations`/`message_
+    /// embeddings`/`embedding_holes`, `V4_VECTOR_DOMAIN_DDL` in
+    /// `src/storage/schema.rs`) to incomplete restore / derived-index
+    /// corruption had no probe here at all before this fix -- the
+    /// self-heal pass above (which already catches the analogous gap for
+    /// the analytics tables) was blind to this one. Same shape as
+    /// `franken_storage_open_repairs_missing_analytics_tables_when_
+    /// version_markers_lie` above: drop the tables, lie that the schema
+    /// version is already current, and confirm a fresh `open()` still
+    /// recreates them.
+    #[test]
+    fn franken_storage_open_repairs_missing_vector_domain_tables_when_version_markers_lie() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test_repair_missing_vector_domain.db");
+
+        {
+            let storage = FrankenStorage::open(&db_path).unwrap();
+            assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+        }
+
+        {
+            let conn = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().into_owned())), crate::storage::api::Profile::Production).unwrap();
+            for table in &["embedding_holes", "message_embeddings", "embedding_generations"] {
+                conn.execute(&format!("DROP TABLE IF EXISTS {table}"), &[])
+                    .unwrap();
+            }
+            conn.execute(
+                "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+                &[ParamValue::from(CURRENT_SCHEMA_VERSION.to_string())],
+            )
+            .unwrap();
+        }
+
+        let repaired = FrankenStorage::open(&db_path).unwrap();
+        assert_eq!(repaired.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+
+        let vector_domain_table_count: i64 = repaired
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='table'
+                   AND name IN (
+                     'embedding_generations',
+                     'message_embeddings',
+                     'embedding_holes'
+                   )",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            vector_domain_table_count, 3,
+            "open() should recreate all three missing vector-domain tables even when schema_version already says current"
+        );
+
+        // Not just present -- actually usable: this is the production
+        // write path the moment a new generation is created.
+        repaired
+            .raw()
+            .with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
+                crate::storage::schema::create_embedding_generation(tx, "bge-m3", 1024, 1, 1_000)
+            })
+            .expect("the repaired embedding_generations table must accept a real write");
     }
 
     /// w2 F4 regression: a version-2 database that lost `lex_docs`/`fts_lex`
