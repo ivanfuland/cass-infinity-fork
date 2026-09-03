@@ -3635,8 +3635,21 @@ CREATE INDEX IF NOT EXISTS idx_umd_source_day ON usage_models_daily(source_id, d
 // reference `embedding_generations`, so all three are one repair batch
 // (like `lex_domain`'s `lex_docs`+`fts_lex` pairing above), never
 // recreated independently of each other.
+//
+// R2-N1: the "byte-for-byte identical" claim above was not actually
+// enforced by any test (unlike the lex_domain pairing, which has
+// `fresh_schema_ddl_tail_matches_v2_lex_domain_migration_ddl`) -- this SQL
+// had silently drifted from `V4_VECTOR_DOMAIN_DDL`, missing its
+// `idx_embedding_generations_single_active` unique partial index
+// entirely. A database that lost the vector_domain tables and got them
+// back through this repair path (as opposed to a fresh-build `ensure()`)
+// would have no DB-level guard against two `is_active=1` rows coexisting.
+// Restored here; `current_schema_repair_vector_domain_sql_creates_the_
+// single_active_unique_index` below is this repair batch's first-ever
+// index-presence probe.
 const CURRENT_SCHEMA_REPAIR_VECTOR_DOMAIN_SQL: &str = r"
 CREATE TABLE IF NOT EXISTS embedding_generations (id INTEGER PRIMARY KEY AUTOINCREMENT, embedder_id TEXT NOT NULL, dim INTEGER NOT NULL CHECK (dim > 0), canonicalize_version INTEGER NOT NULL, byte_order TEXT NOT NULL DEFAULT 'le' CHECK (byte_order IN ('le', 'be')), audit_status TEXT NOT NULL DEFAULT 'pending' CHECK (audit_status IN ('pending', 'passed', 'failed')), is_active INTEGER NOT NULL DEFAULT 0 CHECK (is_active IN (0, 1)), created_at INTEGER NOT NULL, activated_at INTEGER);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_embedding_generations_single_active ON embedding_generations(is_active) WHERE is_active = 1;
 CREATE TABLE IF NOT EXISTS message_embeddings (generation_id INTEGER NOT NULL REFERENCES embedding_generations (id), doc_id INTEGER NOT NULL REFERENCES messages (id) ON DELETE CASCADE, conversation_id INTEGER NOT NULL, embedding BLOB NOT NULL CHECK (length(embedding) % 4 = 0), norm REAL NOT NULL CHECK (norm > 0), content_hash TEXT NOT NULL, content_version INTEGER, created_at INTEGER NOT NULL, UNIQUE (generation_id, doc_id));
 CREATE INDEX IF NOT EXISTS idx_message_embeddings_generation ON message_embeddings(generation_id);
 CREATE INDEX IF NOT EXISTS idx_message_embeddings_doc ON message_embeddings(doc_id);
@@ -25410,12 +25423,49 @@ mod tests {
 
         // Not just present -- actually usable: this is the production
         // write path the moment a new generation is created.
-        repaired
+        let gen_a = repaired
             .raw()
             .with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
                 crate::storage::schema::create_embedding_generation(tx, "bge-m3", 1024, 1, 1_000)
             })
             .expect("the repaired embedding_generations table must accept a real write");
+
+        // R2-N1: the repair batch's own `idx_embedding_generations_single_active`
+        // unique partial index -- previously missing entirely (silently
+        // drifted from `V4_VECTOR_DOMAIN_DDL`, the fresh-build DDL this
+        // repair batch claims to mirror byte-for-byte). A real single-writer
+        // guard, not just a name check: the second `is_active=1` write below
+        // must be rejected at the DB level.
+        let index_exists: i64 = repaired
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_embedding_generations_single_active'",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            index_exists, 1,
+            "the repair batch must recreate idx_embedding_generations_single_active, not just the three tables"
+        );
+
+        repaired
+            .raw()
+            .execute("UPDATE embedding_generations SET is_active = 1 WHERE id = ?1", &[ParamValue::from(gen_a)])
+            .expect("activating the first generation must succeed");
+        let gen_b = repaired
+            .raw()
+            .with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
+                crate::storage::schema::create_embedding_generation(tx, "bge-m3-v2", 1024, 1, 2_000)
+            })
+            .unwrap();
+        let second_active_result = repaired
+            .raw()
+            .execute("UPDATE embedding_generations SET is_active = 1 WHERE id = ?1", &[ParamValue::from(gen_b)]);
+        assert!(
+            second_active_result.is_err(),
+            "a second is_active=1 row must be rejected by the repaired index, not silently accepted"
+        );
     }
 
     /// w2 F4 regression: a version-2 database that lost `lex_docs`/`fts_lex`
