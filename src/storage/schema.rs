@@ -864,6 +864,16 @@ pub fn active_generation_id(conn: &Conn) -> Result<Option<i64>, StorageError> {
 /// match + `PRAGMA foreign_key_check`) is that task's scope, not built here;
 /// this function only guarantees the atomicity contract the audit will run
 /// inside of.
+/// R2-B3(a): before this fix, an UPDATE against a nonexistent
+/// `new_generation_id` still reported `Ok(())` (SQLite's `UPDATE` against
+/// zero matching rows is not an error) -- after already having cleared
+/// `is_active` on the real, previously-active row, leaving the database
+/// with NO active generation at all and the caller none the wiser. This
+/// checks the target's existence in the same transaction, *before*
+/// touching the current active pointer, and separately confirms the
+/// activating `UPDATE` itself actually changed exactly one row -- either
+/// failure aborts the whole transaction (SQLite rolls back both `UPDATE`s
+/// together), so the old active generation is provably left intact.
 pub fn switch_active_generation(
     conn: &Conn,
     new_generation_id: i64,
@@ -872,11 +882,32 @@ pub fn switch_active_generation(
 ) -> Result<(), StorageError> {
     conn.with_tx_no_replay(TxMode::Immediate, |tx| {
         verify(tx)?;
+        let target_exists: i64 = tx.query_row_map(
+            "SELECT COUNT(*) FROM embedding_generations WHERE id = ?1",
+            &params![new_generation_id],
+            |row| row.get_typed(0),
+        )?;
+        if target_exists == 0 {
+            return Err(StorageError::Constraint {
+                detail: format!(
+                    "switch_active_generation: target generation {new_generation_id} does not \
+                     exist; refusing to switch (R2-B3)"
+                ),
+            });
+        }
         tx.execute("UPDATE embedding_generations SET is_active = 0 WHERE is_active = 1", &[])?;
-        tx.execute(
+        let changed = tx.execute(
             "UPDATE embedding_generations SET is_active = 1, activated_at = ?1 WHERE id = ?2",
             &params![activated_at_ms, new_generation_id],
         )?;
+        if changed != 1 {
+            return Err(StorageError::Constraint {
+                detail: format!(
+                    "switch_active_generation: expected to activate exactly 1 row for generation \
+                     {new_generation_id}, changed {changed} (R2-B3)"
+                ),
+            });
+        }
         Ok(())
     })
 }

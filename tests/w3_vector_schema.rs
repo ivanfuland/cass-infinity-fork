@@ -399,6 +399,37 @@ fn switch_active_generation_leaves_the_pointer_untouched_when_verify_fails_mid_t
     assert_eq!(gen_b_is_active, 0, "generation B's row must not have been flipped to active either");
 }
 
+/// R2-B3(a): before the fix, `UPDATE ... WHERE id = <nonexistent>` still
+/// reported `Ok(())` -- SQLite's `UPDATE` matching zero rows is not an
+/// error -- after the *first* `UPDATE` in this function had already
+/// cleared `is_active` on the real, previously-active generation. Net
+/// effect: `switch_active_generation(nonexistent_id, ...)` silently left
+/// the database with NO active generation at all, reported success, and
+/// every subsequent search would have hit the `absent`/`building`
+/// vector-domain-state error path with no clue why.
+#[test]
+fn switch_active_generation_rejects_a_nonexistent_target_and_leaves_the_old_active_intact() {
+    let (_dir, path) = scratch_db_path();
+    let storage = open_storage(&path);
+    insert_message_parent_chain(&storage, 1, 1, 1);
+
+    let gen_a = create_generation(&storage, "bge-m3", 4, 1);
+    schema::switch_active_generation(storage.raw(), gen_a, 1_000, |_tx| Ok(()))
+        .expect("activate generation A");
+
+    let nonexistent_id = gen_a + 999_999;
+    let err = schema::switch_active_generation(storage.raw(), nonexistent_id, 2_000, |_tx| Ok(()))
+        .expect_err("switching to a nonexistent generation id must fail, not silently succeed");
+    assert!(matches!(err, StorageError::Constraint { .. }));
+
+    assert_eq!(
+        schema::active_generation_id(storage.raw()).unwrap(),
+        Some(gen_a),
+        "a switch to a nonexistent target must leave the old active generation untouched, \
+         not clear is_active with nothing to replace it"
+    );
+}
+
 #[test]
 fn switch_active_generation_moves_the_pointer_when_verify_succeeds() {
     let (_dir, path) = scratch_db_path();
