@@ -439,11 +439,20 @@ pub fn run_db_vector_catchup_backfill(
     // still show holes==0 and would still get promoted -- silently missing
     // that message forever. `pre_audit_watermark_message_id` plus the
     // cheap in-tx recheck below close that window without paying for a
-    // second full audit.
+    // second full audit. R2-B2: `pre_audit_message_count` closes the
+    // complementary gap the watermark alone leaves -- a concurrent delete
+    // of a non-max-id message doesn't move MAX(id), so only a row-count
+    // recheck catches it (see `verify_no_activation_toctou_drift_in_tx`'s
+    // doc comment for why a full mutation-epoch mechanism was rejected in
+    // favor of this).
     let pre_audit_watermark_message_id: i64 = storage
         .raw()
         .query_row_map("SELECT COALESCE(MAX(id), 0) FROM messages", &[], |row| row.get_typed(0))
         .context("reading pre-audit messages high-water mark")?;
+    let pre_audit_message_count: i64 = storage
+        .raw()
+        .query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0))
+        .context("reading pre-audit messages row count")?;
     let mut activated = false;
     if holes_after == 0 {
         let audit_report = run_activation_audit(storage, generation_id, ACTIVATION_AUDIT_DEFAULT_FINITE_NORM_SAMPLE_SIZE, None)
@@ -464,7 +473,12 @@ pub fn run_db_vector_catchup_backfill(
             // happen); the caller's *next* call re-scans and re-audits
             // from scratch, so no partial/stale promotion is ever
             // committed.
-            schema::verify_no_activation_toctou_drift_in_tx(tx, generation_id, pre_audit_watermark_message_id)?;
+            schema::verify_no_activation_toctou_drift_in_tx(
+                tx,
+                generation_id,
+                pre_audit_watermark_message_id,
+                pre_audit_message_count,
+            )?;
             tx.execute(
                 "UPDATE embedding_generations SET audit_status = 'passed' WHERE id = ?1",
                 &params![generation_id],

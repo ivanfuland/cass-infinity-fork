@@ -890,14 +890,15 @@ pub fn switch_active_generation(
 ///
 /// Meant to be called as (or from) [`switch_active_generation`]'s `verify`
 /// closure, with `pre_audit_watermark_message_id` set to `SELECT
-/// COALESCE(MAX(id), 0) FROM messages` read *before* the full audit ran.
+/// COALESCE(MAX(id), 0) FROM messages` and `pre_audit_message_count` set to
+/// `SELECT COUNT(*) FROM messages`, both read *before* the full audit ran.
 /// An `Err` here aborts the whole switch transaction -- the pointer flip
 /// and the `audit_status='passed'` write the caller's closure typically
 /// makes alongside this call never happen -- so the caller's next call
 /// re-scans and re-audits `new_generation_id` from scratch; no
 /// partial/stale promotion is ever committed.
 ///
-/// Two invariants, both cheap:
+/// Three invariants, all cheap:
 /// - `embedding_holes` for `new_generation_id` must still be empty (a
 ///   fresh `COUNT`, not the audit's now-stale read).
 /// - `messages`' high-water mark must not have grown since the audit
@@ -906,10 +907,28 @@ pub fn switch_active_generation(
 ///   hole against the *currently active* generation, so this candidate
 ///   would never have gotten a hole for it and would otherwise be
 ///   promoted still silently missing that message.
+/// - R2-B2: `messages`' row count must not have *shrunk*, closing the gap
+///   the watermark alone leaves open -- a concurrent delete of a
+///   non-max-id message (forget/purge) doesn't move `MAX(id)` at all, so
+///   the watermark check alone would miss it. This candidate generation
+///   still carries an embedding for the now-deleted doc_id (its hole was
+///   already resolved before the delete, or it was never eligible to
+///   begin with), so promoting it anyway would activate an index with a
+///   stale row check ④'s eligibility anti-join has no way to catch after
+///   the fact (the deleted message can no longer even be read back to
+///   compare against). Deliberately just a row count, not a full
+///   corpus-mutation epoch/generation counter (control-plane-adjudicated
+///   REJECTED as over-engineering for this call site: insert is caught by
+///   the watermark, delete by this count, and in-place content edits have
+///   no production write path at all per w3-3 Step 3's write-entry-point
+///   survey -- the three together already cover every mutation shape that
+///   actually exists, so a generalized epoch mechanism would be tracking
+///   mutation shapes this codebase cannot produce).
 pub fn verify_no_activation_toctou_drift_in_tx(
     tx: &Tx,
     generation_id: i64,
     pre_audit_watermark_message_id: i64,
+    pre_audit_message_count: i64,
 ) -> Result<(), StorageError> {
     let holes_now: i64 = tx.query_row_map(
         "SELECT COUNT(*) FROM embedding_holes WHERE generation_id = ?1",
@@ -933,6 +952,16 @@ pub fn verify_no_activation_toctou_drift_in_tx(
                 "messages high-water mark drifted from {pre_audit_watermark_message_id} to \
                  {watermark_now} between the activation audit and this switch transaction; \
                  refusing to activate generation {generation_id} (TOCTOU guard, R1-W3-B2)"
+            ),
+        });
+    }
+    let count_now: i64 = tx.query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0))?;
+    if count_now != pre_audit_message_count {
+        return Err(StorageError::Constraint {
+            detail: format!(
+                "messages row count drifted from {pre_audit_message_count} to {count_now} between \
+                 the activation audit and this switch transaction (a deletion the watermark alone \
+                 cannot see); refusing to activate generation {generation_id} (TOCTOU guard, R2-B2)"
             ),
         });
     }
