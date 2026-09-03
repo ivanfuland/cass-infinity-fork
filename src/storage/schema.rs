@@ -488,15 +488,31 @@ pub fn find_reusable_pending_generation(
 /// created a brand-new, empty-holes generation and re-seeded + re-embedded
 /// the *entire* corpus from scratch every run, which is exactly what makes
 /// an hourly production cron model impossible. Checking for an
-/// identity-matching active generation *first* (regardless of its current
-/// `audit_status` -- it may be `passed` in the steady-state case this
-/// exists for, or `pending` if new messages already demoted it, in which
-/// case this and `find_reusable_pending_generation` would find the same
-/// row) lets the worker resume draining the generation actually serving
+/// identity-matching active generation *first* (regardless of whether its
+/// current `audit_status` is `passed` -- the steady-state case this
+/// exists for -- or `pending` if new messages already demoted it, in
+/// which case this and `find_reusable_pending_generation` would find the
+/// same row; `failed` is the one status excluded below, R2-B7) lets the
+/// worker resume draining the generation actually serving
 /// reads: its `embedding_holes` are hole-driven and already correctly
 /// incremental (new messages only ever register a hole against whichever
 /// generation is currently active), so reusing it needs no new drain
 /// logic, only this different generation-selection step.
+/// R2-B7: `audit_status = 'failed'` is excluded -- a re-audit
+/// (`run_activation_audit_and_record`) can flip an already-`is_active`
+/// generation to `'failed'` (e.g. a corrupted BLOB found after the fact)
+/// without touching `is_active` itself (that function's own contract: a
+/// re-audit only upgrades/demotes certification, never picks which
+/// generation serves reads). Reusing that row here would keep draining new
+/// holes into a generation already known to be broken, permanently
+/// self-locking it out of ever becoming clean -- there is no amount of
+/// incremental catch-up that fixes BLOBs already written wrong. Excluding
+/// it routes the caller to `find_reusable_pending_generation` or a fresh
+/// generation instead, so a full rebuild actually happens; the old
+/// failed-active row is untouched here and keeps serving reads (this
+/// function's own doc comment above: `is_active` is a separate concern)
+/// until the new candidate passes audit and `switch_active_generation`
+/// flips the pointer.
 pub fn find_active_generation_matching_identity(
     conn: &Conn,
     embedder_id: &str,
@@ -506,7 +522,7 @@ pub fn find_active_generation_matching_identity(
     conn.query_opt_map(
         "SELECT id FROM embedding_generations \
          WHERE embedder_id = ?1 AND dim = ?2 AND canonicalize_version = ?3 \
-           AND is_active = 1 \
+           AND is_active = 1 AND audit_status != 'failed' \
          LIMIT 1",
         &params![embedder_id, dim, i64::from(canonicalize_version)],
         |row| row.get_typed(0),
@@ -1667,6 +1683,43 @@ mod tests {
             })
         );
         assert_eq!(embedding_row_count_for_doc(&conn, gen_id, 1), 0);
+    }
+
+    /// R2-B7: a re-audit (`run_activation_audit_and_record`) can flip an
+    /// already-`is_active` generation to `audit_status='failed'` without
+    /// touching `is_active` -- reusing that row here would permanently
+    /// self-lock the catch-up worker into re-draining a generation already
+    /// known broken (no amount of incremental hole-draining fixes a BLOB
+    /// already written wrong). Mutation-relevant: the second assertion
+    /// (still found once `audit_status` flips back to `passed`) proves the
+    /// exclusion is specific to `'failed'`, not an accidental over-filter
+    /// on `is_active` or identity that would also break the steady-state
+    /// (`passed`) reuse case R1-W3-N3 exists for.
+    #[test]
+    fn find_active_generation_matching_identity_excludes_failed_audit_status() {
+        let (_dir, path) = scratch_db_path();
+        let conn = open_sqlite_writer(&path);
+        ensure(&conn).expect("ensure should build a fresh schema");
+
+        let gen_id = conn
+            .with_tx_no_replay(TxMode::Immediate, |tx| create_embedding_generation(tx, "bge-m3", 4, 1, 1_000))
+            .unwrap();
+        conn.execute(
+            "UPDATE embedding_generations SET is_active = 1, audit_status = 'failed' WHERE id = ?1",
+            &params![gen_id],
+        )
+        .unwrap();
+
+        let found = find_active_generation_matching_identity(&conn, "bge-m3", 4, 1).unwrap();
+        assert_eq!(
+            found, None,
+            "an active-but-failed generation must not be reused by the catch-up worker"
+        );
+
+        conn.execute("UPDATE embedding_generations SET audit_status = 'passed' WHERE id = ?1", &params![gen_id])
+            .unwrap();
+        let found_passed = find_active_generation_matching_identity(&conn, "bge-m3", 4, 1).unwrap();
+        assert_eq!(found_passed, Some(gen_id), "a passed active generation must still be found (not an over-filter)");
     }
 
     /// A worker that lost the race entirely (its doc_id was deleted --
