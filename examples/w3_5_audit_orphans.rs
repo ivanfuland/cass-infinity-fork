@@ -22,9 +22,17 @@
 //! it) to prove audit ④ actually recovers. Only ever point this at the
 //! read-only diagnostic copy, never at a production data dir.
 //!
-//! Usage: `CASS_DATA_DIR=<dir containing agent_search.db>
-//! [XDG_CONFIG_HOME=<empty dir>] [APPLY=1] cargo run --release --example
-//! w3_5_audit_orphans`
+//! R1-N4: no `examples/` target in this crate declares `required-features`
+//! in `Cargo.toml` (none exist there at all, including the sibling
+//! `w3_3`/`w3_4` drills this one is modeled on), so this file follows that
+//! same convention rather than introducing the first one -- the
+//! requirement is documented here instead. `run_activation_audit`'s own
+//! dependency chain needs the `infinity` feature compiled in.
+//!
+//! Usage: `cargo run --release --no-default-features --features
+//! qr,encryption,infinity --example w3_5_audit_orphans`, with
+//! `CASS_DATA_DIR=<dir containing agent_search.db>
+//! [XDG_CONFIG_HOME=<empty dir>] [APPLY=1]` set on the resulting binary.
 
 use std::collections::{HashMap, HashSet};
 

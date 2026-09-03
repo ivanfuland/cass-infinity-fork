@@ -427,13 +427,13 @@ pub fn run_db_vector_catchup_backfill(
         }
     }
 
-    // Task book #80 (exec72): reverse reconciliation, the half of the
-    // eligibility<->embedded accounting the loop above never did. Every
-    // path above only ever grows `message_embeddings` toward the eligible
-    // set (`eligible_ids` -> `seed_embedding_holes` -> drain); nothing
-    // shrinks it back when a message that used to be eligible no longer
-    // is (most commonly: a conversation's cumulative content crosses the
-    // shared 8 MiB per-conversation cap -- `FrankenStorage::
+    // Task book #80 (exec72, R1 review fixes): reverse reconciliation, the
+    // half of the eligibility<->embedded accounting the loop above never
+    // did. Every path above only ever grows `message_embeddings` toward
+    // the eligible set (`eligible_ids` -> `seed_embedding_holes` -> drain);
+    // nothing shrinks it back when a message that used to be eligible no
+    // longer is (most commonly: a conversation's cumulative content
+    // crosses the shared 8 MiB per-conversation cap -- `FrankenStorage::
     // fetch_messages_for_lexical_rebuild`'s `truncate_lexical_rebuild_
     // conversation_content`, #290 -- which `scan_eligible_message_ids`
     // reuses and which silently clears an already-embedded tail message's
@@ -446,17 +446,40 @@ pub fn run_db_vector_catchup_backfill(
     // re-scanning -- can't introduce a second, later eligibility snapshot
     // that disagrees with what this same call already seeded holes
     // against.
+    //
+    // R1-N2: `eligible_ids` was scanned once, before the drain loop, but a
+    // concurrent writer can land a brand-new message during the loop --
+    // its ingest-time hook registers a hole against this same active
+    // generation (`register_embedding_hole_for_new_message_in_tx` touches
+    // only the currently-active generation), the drain loop above can pick
+    // that hole up and embed it within this same call, yet that doc_id
+    // never appears in the *already-captured* `eligible_ids` snapshot.
+    // Diffing embedded-vs-`eligible_ids` naively would misclassify that
+    // brand-new, genuinely-eligible row as an orphan and prune what this
+    // same call just wrote. `now_ms` (captured above, before the
+    // eligibility scan) is the snapshot boundary: scoping the candidate
+    // scan to `created_at < now_ms` excludes every row written by this
+    // call's own drain loop (all timestamped with a `write_now_ms` taken
+    // after `now_ms`), leaving only rows that were already sitting in
+    // `message_embeddings` before this call started -- the only rows
+    // `eligible_ids` could possibly have a stale opinion about.
     let eligible_id_set: HashSet<i64> = eligible_ids.iter().copied().collect();
     let embedded_rows: Vec<(i64, i64)> = storage.raw().query_all_map(
         "SELECT me.doc_id, m.conversation_id \
          FROM message_embeddings me JOIN messages m ON m.id = me.doc_id \
-         WHERE me.generation_id = ?1",
-        &params![generation_id],
+         WHERE me.generation_id = ?1 AND me.created_at < ?2",
+        &params![generation_id, now_ms],
         |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
     )?;
     let ineligible_embedded: Vec<(i64, i64)> =
         embedded_rows.into_iter().filter(|(doc_id, _)| !eligible_id_set.contains(doc_id)).collect();
-    let embeddings_pruned_ineligible = u64::try_from(ineligible_embedded.len()).unwrap_or(0);
+    // R1-N3: report the rows the DELETEs below actually affected, not the
+    // size of the candidate list computed above -- a candidate whose hole
+    // (or embedding row) another concurrent writer already resolved/
+    // deleted between this SELECT and the prune transaction would
+    // otherwise be double-counted here despite the DELETE affecting zero
+    // rows for it.
+    let mut embeddings_pruned_ineligible: u64 = 0;
     if !ineligible_embedded.is_empty() {
         let mut per_conversation_counts: std::collections::BTreeMap<i64, u64> = std::collections::BTreeMap::new();
         for (_, conversation_id) in &ineligible_embedded {
@@ -472,13 +495,30 @@ pub fn run_db_vector_catchup_backfill(
             );
         }
         let doc_ids: Vec<i64> = ineligible_embedded.iter().map(|(doc_id, _)| *doc_id).collect();
-        storage
+        embeddings_pruned_ineligible = storage
             .raw()
             .with_tx(TxMode::Immediate, |tx| {
+                let mut pruned = 0u64;
                 for doc_id in &doc_ids {
-                    schema::prune_ineligible_message_embedding_in_tx(tx, generation_id, *doc_id)?;
+                    pruned = pruned.saturating_add(schema::prune_ineligible_message_embedding_in_tx(tx, generation_id, *doc_id)?);
                 }
-                Ok(())
+                // R1-B1: this generation may already be `is_active=1,
+                // audit_status='passed'` (the steady-state reuse case,
+                // ruling ①) -- a row deleted here without also demoting
+                // that certification would leave a *currently-serving*
+                // generation reporting `passed` between this commit and
+                // whatever later call re-audits it, i.e. exactly the
+                // false-green window `demote_active_generation_readiness_
+                // in_tx` exists to prevent for every other mutation
+                // category. Folding it into this same transaction, gated
+                // on `pruned > 0`, makes the demotion atomic with the
+                // delete it is compensating for -- no window where the
+                // deleted row is committed but the stale 'passed' status
+                // still reads back.
+                if pruned > 0 {
+                    schema::demote_active_generation_readiness_in_tx(tx)?;
+                }
+                Ok(pruned)
             })
             .context("pruning embedded-but-ineligible message_embeddings rows")?;
     }
@@ -1249,6 +1289,15 @@ mod ineligible_embedding_prune_tests {
             .unwrap()
     }
 
+    fn audit_status(storage: &FrankenStorage, generation_id: i64) -> String {
+        storage
+            .raw()
+            .query_row_map("SELECT audit_status FROM embedding_generations WHERE id = ?1", &params![generation_id], |row| {
+                row.get_typed(0)
+            })
+            .unwrap()
+    }
+
     /// Positive case: an embedded message falls out of the eligibility
     /// chain (simulated here the way the task's own drill (`examples/w3_5_
     /// audit_orphans.rs`) proved the real 40-row incident worked -- content
@@ -1284,6 +1333,18 @@ mod ineligible_embedding_prune_tests {
         vector_domain::create_vec0_table_for_generation(storage.raw(), generation_id, DIM).unwrap();
         vector_domain::rebuild_vec0_table_for_generation(storage.raw(), generation_id, DIM).unwrap();
 
+        // R1-B1 setup: certify this generation active+passed, the
+        // steady-state case (ruling ①) the demotion below must actually
+        // protect -- a fresh never-activated generation would make the
+        // demotion below a no-op that proves nothing.
+        storage
+            .raw()
+            .execute(
+                "UPDATE embedding_generations SET is_active = 1, audit_status = 'passed' WHERE id = ?1",
+                &params![generation_id],
+            )
+            .unwrap();
+
         // Sanity: both messages start eligible and embedded -- audit ④
         // must be clean before the simulated fall-out below, or the rest
         // of this test would pass for the wrong reason.
@@ -1302,20 +1363,109 @@ mod ineligible_embedding_prune_tests {
             "audit ④ must count exactly the one row that fell out: {before_prune:?}"
         );
         assert_eq!(embedding_row_count(&storage, generation_id, doc_b), 1, "sanity: the orphaned row is still present pre-prune");
+        assert_eq!(audit_status(&storage, generation_id), "passed", "sanity: still certified passed pre-prune");
 
         // Positive proof: prune the row exactly as `run_db_vector_catchup_
-        // backfill`'s reverse-reconciliation step does (delete, then
-        // rebuild vec0 from what remains) -- audit ④ must now pass.
-        storage
+        // backfill`'s reverse-reconciliation step does -- delete inside a
+        // transaction that also demotes this (still-active, still-
+        // certified) generation's `audit_status` back to 'pending' (R1-B1:
+        // atomic with the delete, so there is no window where the deleted
+        // row is committed but a stale 'passed' status still reads back),
+        // then rebuild vec0 from what remains.
+        let pruned = storage
             .raw()
-            .with_tx(TxMode::Immediate, |tx| schema::prune_ineligible_message_embedding_in_tx(tx, generation_id, doc_b))
+            .with_tx(TxMode::Immediate, |tx| {
+                let pruned = schema::prune_ineligible_message_embedding_in_tx(tx, generation_id, doc_b)?;
+                if pruned > 0 {
+                    schema::demote_active_generation_readiness_in_tx(tx)?;
+                }
+                Ok(pruned)
+            })
             .unwrap();
-        vector_domain::rebuild_vec0_table_for_generation(storage.raw(), generation_id, DIM).unwrap();
-
+        assert_eq!(pruned, 1, "R1-N3: the primitive must report the one row it actually deleted");
         assert_eq!(embedding_row_count(&storage, generation_id, doc_b), 0, "the pruned row must actually be deleted, not merely uncounted");
+        // R1-B1: read this *before* rebuild/audit below -- the demotion
+        // must already be visible immediately after the prune transaction
+        // committed, not merely as a side effect of the audit that follows.
+        assert_eq!(audit_status(&storage, generation_id), "pending", "R1-B1: pruning a row from an active+passed generation must demote it atomically, closing the false-green window");
+
+        vector_domain::rebuild_vec0_table_for_generation(storage.raw(), generation_id, DIM).unwrap();
         let after_prune = run_activation_audit(&storage, generation_id, 10, Some(doc_a)).expect("post-prune audit");
         assert!(after_prune.passed, "activation audit must fully pass once the orphaned row is pruned: {after_prune:?}");
         assert_eq!(after_prune.embedded_not_eligible_count, 0);
         assert_eq!(after_prune.eligible_not_embedded_count, 0, "doc_b's message itself is still there, just empty -- correctly no longer eligible either");
+
+        // A second prune attempt on the same (already-gone) row must be a
+        // true no-op: 0 rows affected, and it must not demote an
+        // already-'pending' generation into some other observable state.
+        let repeat_pruned = storage
+            .raw()
+            .with_tx(TxMode::Immediate, |tx| schema::prune_ineligible_message_embedding_in_tx(tx, generation_id, doc_b))
+            .unwrap();
+        assert_eq!(repeat_pruned, 0, "R1-N3: pruning an already-gone row must report 0 affected rows, not 1");
+    }
+
+    /// R1-N2 (optional per task book, included since it is cheap and
+    /// proves the exact SQL shape `run_db_vector_catchup_backfill` uses):
+    /// a row embedded *after* the eligibility snapshot boundary must never
+    /// be a prune candidate, even if it would otherwise look
+    /// embedded-but-not-in-some-older-eligible-set -- this is what stops a
+    /// concurrently-landed, genuinely-eligible message (embedded within
+    /// this same catch-up call's own drain loop, timestamped after
+    /// `now_ms`) from being misclassified as an orphan and deleted by the
+    /// very call that just wrote it.
+    #[test]
+    fn candidate_scan_excludes_rows_created_at_or_after_the_snapshot() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_storage(&dir.path().join("db.sqlite"));
+
+        let (conv_old, doc_old) = insert_one_message_conversation(&storage, "exec72-n2-old-row", "embedded before the snapshot");
+        let (conv_new, doc_new) = insert_one_message_conversation(&storage, "exec72-n2-new-row", "embedded during this call's own drain loop");
+
+        let generation_id = storage
+            .raw()
+            .with_tx(TxMode::Immediate, |tx| {
+                schema::create_embedding_generation(tx, "bge-m3", DIM, CANONICALIZE_PIPELINE_VERSION, TS)
+            })
+            .unwrap();
+        let snapshot_ms = TS + 1_000;
+        storage
+            .raw()
+            .with_tx(TxMode::Immediate, |tx| {
+                // Written well before the snapshot boundary -- eligible to
+                // be pruned if it ever falls out of the eligible set.
+                schema::insert_message_embedding(tx, generation_id, doc_old, conv_old, &[1.0, 0.0, 0.0, 0.0], "seed-hash-old", None, TS)?;
+                // Written at-or-after the snapshot boundary -- simulates a
+                // row this same call's own drain loop just wrote; must
+                // never be pruned regardless of eligibility-set staleness.
+                schema::insert_message_embedding(
+                    tx,
+                    generation_id,
+                    doc_new,
+                    conv_new,
+                    &[0.0, 1.0, 0.0, 0.0],
+                    "seed-hash-new",
+                    None,
+                    snapshot_ms,
+                )
+            })
+            .unwrap();
+
+        // The exact query shape `run_db_vector_catchup_backfill` uses,
+        // scoped to `created_at < snapshot_ms`. Neither row is in an
+        // eligible-id set here (there is none in this focused test), so
+        // both would qualify as candidates on eligibility grounds alone --
+        // the `created_at` scope is the only thing standing between
+        // `doc_new` and a wrongful delete.
+        let candidates: Vec<i64> = storage
+            .raw()
+            .query_all_map(
+                "SELECT me.doc_id FROM message_embeddings me JOIN messages m ON m.id = me.doc_id \
+                 WHERE me.generation_id = ?1 AND me.created_at < ?2",
+                &params![generation_id, snapshot_ms],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(candidates, vec![doc_old], "only the pre-snapshot row may ever become a prune candidate");
     }
 }

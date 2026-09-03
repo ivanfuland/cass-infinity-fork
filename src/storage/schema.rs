@@ -1093,13 +1093,17 @@ pub fn write_off_ineligible_hole_in_tx(tx: &Tx, generation_id: i64, doc_id: i64)
 /// index.
 ///
 /// A no-op `DELETE` if the row was already gone (idempotent, matching
-/// `write_off_ineligible_hole_in_tx`'s style).
-pub fn prune_ineligible_message_embedding_in_tx(tx: &Tx, generation_id: i64, doc_id: i64) -> Result<(), StorageError> {
-    tx.execute(
+/// `write_off_ineligible_hole_in_tx`'s style). Returns the number of rows
+/// actually deleted (0 or 1, `UNIQUE(generation_id, doc_id)`) -- R1-N3:
+/// callers must report what was actually affected, not the size of a
+/// candidate list computed before this ran, since a concurrent writer
+/// could have already resolved/deleted the same row in between.
+pub fn prune_ineligible_message_embedding_in_tx(tx: &Tx, generation_id: i64, doc_id: i64) -> Result<u64, StorageError> {
+    let affected = tx.execute(
         "DELETE FROM message_embeddings WHERE generation_id = ?1 AND doc_id = ?2",
         &params![generation_id, doc_id],
     )?;
-    Ok(())
+    Ok(u64::try_from(affected).unwrap_or(0))
 }
 
 /// Demote the active generation's certified-ready status (`audit_status`)
