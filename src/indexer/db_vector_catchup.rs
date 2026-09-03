@@ -60,6 +60,13 @@ pub struct DbVectorCatchupReport {
     /// [`crate::storage::schema::write_off_ineligible_hole_in_tx`]'s doc
     /// comment for why leaving them registered would self-lock activation.
     pub holes_written_off_ineligible: u64,
+    /// Embedded `message_embeddings` rows deleted (task book #80, exec72
+    /// fix) because their `doc_id` was found embedded but no longer in the
+    /// eligibility chain -- see the reverse-reconciliation step in
+    /// [`run_db_vector_catchup_backfill`], right before `holes_after` is
+    /// computed, for why leaving them in place would self-lock activation
+    /// audit ④ forever.
+    pub embeddings_pruned_ineligible: u64,
     /// Orphaned (non-active, past the cleanup age threshold) generations
     /// deleted at the tail of this call (R1-W3-N3). Empty on the common
     /// case (nothing old enough to prune yet).
@@ -420,6 +427,62 @@ pub fn run_db_vector_catchup_backfill(
         }
     }
 
+    // Task book #80 (exec72): reverse reconciliation, the half of the
+    // eligibility<->embedded accounting the loop above never did. Every
+    // path above only ever grows `message_embeddings` toward the eligible
+    // set (`eligible_ids` -> `seed_embedding_holes` -> drain); nothing
+    // shrinks it back when a message that used to be eligible no longer
+    // is (most commonly: a conversation's cumulative content crosses the
+    // shared 8 MiB per-conversation cap -- `FrankenStorage::
+    // fetch_messages_for_lexical_rebuild`'s `truncate_lexical_rebuild_
+    // conversation_content`, #290 -- which `scan_eligible_message_ids`
+    // reuses and which silently clears an already-embedded tail message's
+    // content out of the eligibility scan). Left unpruned, such a row
+    // makes activation audit ④'s `embedded_not_eligible_count` check
+    // permanently non-zero and this generation can never activate again.
+    // `eligible_ids` (collected above, before the drain loop) is the same
+    // eligibility snapshot the drain loop and `holes_after` below are
+    // already consistent with, so diffing against it here -- rather than
+    // re-scanning -- can't introduce a second, later eligibility snapshot
+    // that disagrees with what this same call already seeded holes
+    // against.
+    let eligible_id_set: HashSet<i64> = eligible_ids.iter().copied().collect();
+    let embedded_rows: Vec<(i64, i64)> = storage.raw().query_all_map(
+        "SELECT me.doc_id, m.conversation_id \
+         FROM message_embeddings me JOIN messages m ON m.id = me.doc_id \
+         WHERE me.generation_id = ?1",
+        &params![generation_id],
+        |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+    )?;
+    let ineligible_embedded: Vec<(i64, i64)> =
+        embedded_rows.into_iter().filter(|(doc_id, _)| !eligible_id_set.contains(doc_id)).collect();
+    let embeddings_pruned_ineligible = u64::try_from(ineligible_embedded.len()).unwrap_or(0);
+    if !ineligible_embedded.is_empty() {
+        let mut per_conversation_counts: std::collections::BTreeMap<i64, u64> = std::collections::BTreeMap::new();
+        for (_, conversation_id) in &ineligible_embedded {
+            *per_conversation_counts.entry(*conversation_id).or_insert(0) += 1;
+        }
+        for (conversation_id, count) in &per_conversation_counts {
+            tracing::warn!(
+                generation_id,
+                conversation_id,
+                count,
+                "db_vector_catchup: pruning embedded doc_id(s) whose message fell out of the \
+                 eligibility chain since they were embedded (task book #80)"
+            );
+        }
+        let doc_ids: Vec<i64> = ineligible_embedded.iter().map(|(doc_id, _)| *doc_id).collect();
+        storage
+            .raw()
+            .with_tx(TxMode::Immediate, |tx| {
+                for doc_id in &doc_ids {
+                    schema::prune_ineligible_message_embedding_in_tx(tx, generation_id, *doc_id)?;
+                }
+                Ok(())
+            })
+            .context("pruning embedded-but-ineligible message_embeddings rows")?;
+    }
+
     let holes_after = count_holes(storage.raw(), generation_id)?;
 
     let vec0_rows = vector_domain::rebuild_vec0_table_for_generation(storage.raw(), generation_id, dim)
@@ -533,6 +596,7 @@ pub fn run_db_vector_catchup_backfill(
         vec0_rows,
         activated,
         holes_written_off_ineligible,
+        embeddings_pruned_ineligible,
         cleanup_deleted_generation_ids,
         cleanup_failures,
     })
@@ -1089,4 +1153,169 @@ pub fn cleanup_orphaned_generations(storage: &FrankenStorage, now_ms: i64) -> Re
         }
     }
     Ok(outcome)
+}
+
+// =============================================================================
+// Task book #80 (exec72): reverse-reconciliation prune. These tests exercise
+// `schema::prune_ineligible_message_embedding_in_tx` and its effect on
+// `run_activation_audit`'s check ④ directly -- not through
+// `run_db_vector_catchup_backfill`, which unconditionally probes a live
+// Infinity service before it does anything else (`w3_b2_activation_toctou_
+// guard.rs`'s own doc comment states the same rationale for testing
+// `switch_active_generation` directly instead of the full backfill
+// wrapper). `run_activation_audit` itself never touches Infinity -- it only
+// reads already-persisted rows -- so it, and the new prune primitive, are
+// both exercisable here without live infra.
+// =============================================================================
+#[cfg(test)]
+mod ineligible_embedding_prune_tests {
+    use super::*;
+    use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+
+    const TS: i64 = 1_770_551_400_000;
+    const DIM: i64 = 4;
+
+    fn open_storage(path: &std::path::Path) -> FrankenStorage {
+        FrankenStorage::open(path).expect("open production storage")
+    }
+
+    fn ensure_agent(storage: &FrankenStorage) -> i64 {
+        storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "claude_code".into(),
+                name: "Claude Code".into(),
+                version: Some("1.0".into()),
+                kind: AgentKind::Cli,
+            })
+            .expect("ensure agent")
+    }
+
+    /// Insert a brand-new one-message conversation through the real
+    /// production write path, matching `w3_5_b1_ineligible_hole_write_off
+    /// .rs`/`w3_b2_activation_toctou_guard.rs`'s own fixture helper.
+    fn insert_one_message_conversation(storage: &FrankenStorage, external_id: &str, content: &str) -> (i64, i64) {
+        let agent_id = ensure_agent(storage);
+        let conv = Conversation {
+            id: None,
+            agent_slug: "claude_code".into(),
+            workspace: None,
+            external_id: Some(external_id.into()),
+            title: Some("exec72 prune fixture".into()),
+            source_path: std::path::PathBuf::from(format!("/fixtures/{external_id}.jsonl")),
+            started_at: Some(TS),
+            ended_at: Some(TS + 60_000),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(TS),
+                content: content.to_string(),
+                extra_json: serde_json::Value::Null,
+                snippets: vec![],
+            }],
+            source_id: "local".into(),
+            origin_host: None,
+        };
+        storage.insert_conversation_tree(agent_id, None, &conv).expect("insert fixture conversation");
+        let conv_id: i64 = storage
+            .raw()
+            .query_row_map("SELECT id FROM conversations WHERE external_id = ?1", &params![external_id], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        let doc_id: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT id FROM messages WHERE conversation_id = ?1 AND idx = 0",
+                &params![conv_id],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        (conv_id, doc_id)
+    }
+
+    fn embedding_row_count(storage: &FrankenStorage, generation_id: i64, doc_id: i64) -> i64 {
+        storage
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM message_embeddings WHERE generation_id = ?1 AND doc_id = ?2",
+                &params![generation_id, doc_id],
+                |row| row.get_typed(0),
+            )
+            .unwrap()
+    }
+
+    /// Positive case: an embedded message falls out of the eligibility
+    /// chain (simulated here the way the task's own drill (`examples/w3_5_
+    /// audit_orphans.rs`) proved the real 40-row incident worked -- content
+    /// that used to be non-empty ends up empty by the time the eligibility
+    /// scan reads it; #290's byte-cap truncation does this at read time
+    /// without ever touching the `messages` row, this test does it by
+    /// writing the row directly, an accepted equivalent per the task book
+    /// since the prune logic only cares about the eligible/embedded set
+    /// diff, not *why* a doc_id fell out). Before the prune, audit ④ must
+    /// be the one thing that catches it (red). After the prune, the
+    /// generation must fully pass.
+    #[test]
+    fn embedded_ineligible_row_is_pruned_and_audit_four_recovers() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_storage(&dir.path().join("db.sqlite"));
+
+        let (conv_a, doc_a) = insert_one_message_conversation(&storage, "exec72-stays-eligible", "real content, stays eligible");
+        let (conv_b, doc_b) = insert_one_message_conversation(&storage, "exec72-falls-ineligible", "real content, will fall out");
+
+        let generation_id = storage
+            .raw()
+            .with_tx(TxMode::Immediate, |tx| {
+                schema::create_embedding_generation(tx, "bge-m3", DIM, CANONICALIZE_PIPELINE_VERSION, TS)
+            })
+            .unwrap();
+        storage
+            .raw()
+            .with_tx(TxMode::Immediate, |tx| {
+                schema::insert_message_embedding(tx, generation_id, doc_a, conv_a, &[1.0, 0.0, 0.0, 0.0], "seed-hash-a", None, TS)?;
+                schema::insert_message_embedding(tx, generation_id, doc_b, conv_b, &[0.0, 1.0, 0.0, 0.0], "seed-hash-b", None, TS)
+            })
+            .unwrap();
+        vector_domain::create_vec0_table_for_generation(storage.raw(), generation_id, DIM).unwrap();
+        vector_domain::rebuild_vec0_table_for_generation(storage.raw(), generation_id, DIM).unwrap();
+
+        // Sanity: both messages start eligible and embedded -- audit ④
+        // must be clean before the simulated fall-out below, or the rest
+        // of this test would pass for the wrong reason.
+        let baseline = run_activation_audit(&storage, generation_id, 10, Some(doc_a)).expect("baseline audit");
+        assert_eq!(baseline.embedded_not_eligible_count, 0, "sanity: both rows must start eligible: {baseline:?}");
+
+        // Simulate doc_b falling out of the eligibility chain.
+        storage.raw().execute("UPDATE messages SET content = '' WHERE id = ?1", &params![doc_b]).unwrap();
+
+        // Variant (mutation) proof: with no prune, audit ④ is the gate
+        // that catches the now-orphaned embedding and refuses to pass.
+        let before_prune = run_activation_audit(&storage, generation_id, 10, Some(doc_a)).expect("pre-prune audit");
+        assert!(!before_prune.passed, "an embedded-but-ineligible row must fail activation audit");
+        assert_eq!(
+            before_prune.embedded_not_eligible_count, 1,
+            "audit ④ must count exactly the one row that fell out: {before_prune:?}"
+        );
+        assert_eq!(embedding_row_count(&storage, generation_id, doc_b), 1, "sanity: the orphaned row is still present pre-prune");
+
+        // Positive proof: prune the row exactly as `run_db_vector_catchup_
+        // backfill`'s reverse-reconciliation step does (delete, then
+        // rebuild vec0 from what remains) -- audit ④ must now pass.
+        storage
+            .raw()
+            .with_tx(TxMode::Immediate, |tx| schema::prune_ineligible_message_embedding_in_tx(tx, generation_id, doc_b))
+            .unwrap();
+        vector_domain::rebuild_vec0_table_for_generation(storage.raw(), generation_id, DIM).unwrap();
+
+        assert_eq!(embedding_row_count(&storage, generation_id, doc_b), 0, "the pruned row must actually be deleted, not merely uncounted");
+        let after_prune = run_activation_audit(&storage, generation_id, 10, Some(doc_a)).expect("post-prune audit");
+        assert!(after_prune.passed, "activation audit must fully pass once the orphaned row is pruned: {after_prune:?}");
+        assert_eq!(after_prune.embedded_not_eligible_count, 0);
+        assert_eq!(after_prune.eligible_not_embedded_count, 0, "doc_b's message itself is still there, just empty -- correctly no longer eligible either");
+    }
 }

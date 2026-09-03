@@ -1068,6 +1068,40 @@ pub fn write_off_ineligible_hole_in_tx(tx: &Tx, generation_id: i64, doc_id: i64)
     Ok(())
 }
 
+/// Prune a `message_embeddings` row that was embedded but has since fallen
+/// out of the eligibility chain (task book #80, exec72) -- the reverse of
+/// [`write_off_ineligible_hole_in_tx`] above (that one retires a hole for a
+/// message that was *never* eligible; this one retires an already-written
+/// embedding for a message that *used to be* eligible and no longer is,
+/// most commonly a conversation's cumulative content crossing the shared
+/// per-conversation content cap -- `FrankenStorage::fetch_messages_for_
+/// lexical_rebuild`'s truncation, #290 -- which silently clears an
+/// already-embedded tail message's content out of the same eligibility
+/// scan that cap was never designed to gate).
+///
+/// Left in place, such a row makes activation audit ④'s bidirectional
+/// anti-join (`embedded_not_eligible_count` in `db_vector_catchup.rs`)
+/// permanently non-zero -- `run_db_vector_catchup_backfill`'s hole-driven
+/// drain loop only ever grows `message_embeddings` toward the eligible set
+/// and has no path that shrinks it back, so nothing else in this codebase
+/// would ever delete this row. Callers do not need a matching `vec0`-side
+/// delete: `run_db_vector_catchup_backfill` unconditionally calls
+/// `vector_domain::rebuild_vec0_table_for_generation` right after its own
+/// reverse-reconciliation step, which fully repopulates `vec0` from
+/// `message_embeddings` in one drop+recreate+bulk-insert transaction, so a
+/// row deleted here before that call never makes it into the rebuilt
+/// index.
+///
+/// A no-op `DELETE` if the row was already gone (idempotent, matching
+/// `write_off_ineligible_hole_in_tx`'s style).
+pub fn prune_ineligible_message_embedding_in_tx(tx: &Tx, generation_id: i64, doc_id: i64) -> Result<(), StorageError> {
+    tx.execute(
+        "DELETE FROM message_embeddings WHERE generation_id = ?1 AND doc_id = ?2",
+        &params![generation_id, doc_id],
+    )?;
+    Ok(())
+}
+
 /// Demote the active generation's certified-ready status (`audit_status`)
 /// back to `'pending'`, if one exists and is not already `'pending'`.
 /// Called in the same transaction as any relational write that mutates the
