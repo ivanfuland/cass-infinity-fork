@@ -37,7 +37,7 @@ use fastembed::{
 };
 
 use super::embedder::{Embedder, EmbedderError, EmbedderResult};
-use frankensearch::{ModelCategory, ModelTier};
+use crate::search::frankensearch_types::{ModelCategory, ModelTier};
 
 /// Stand-in for `fastembed::Pooling` when the `semantic` feature is disabled.
 ///

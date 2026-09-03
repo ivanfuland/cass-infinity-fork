@@ -1,17 +1,10 @@
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use frankensearch::index::{
-    HNSW_DEFAULT_EF_CONSTRUCTION as FS_HNSW_DEFAULT_EF_CONSTRUCTION,
-    HNSW_DEFAULT_M as FS_HNSW_DEFAULT_M, HnswConfig as FsHnswConfig, HnswIndex as FsHnswIndex,
-    Quantization as FsQuantization, VectorIndex as FsVectorIndex,
-    VectorIndexWriter as FsVectorIndexWriter,
-};
-use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
+use crate::storage::api::Value as ParamValue;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rayon::prelude::*;
 
@@ -28,17 +21,12 @@ use crate::search::canonicalize::{canonicalize_for_embedding, content_hash};
 use crate::search::embedder::Embedder;
 use crate::search::fastembed_embedder::FastEmbedder;
 use crate::search::hash_embedder::HashEmbedder;
-use crate::search::policy::{CHUNKING_STRATEGY_VERSION, SEMANTIC_SCHEMA_VERSION, SemanticPolicy};
-use crate::search::semantic_manifest::{
-    ArtifactRecord, BuildCheckpoint, SemanticManifest, SemanticShardManifest, SemanticShardRecord,
-    TierKind,
-};
-use crate::search::tantivy::{
+use crate::search::policy::SemanticPolicy;
+use crate::search::semantic_manifest::TierKind;
+use crate::search::index_provenance::{
     normalized_index_origin_host, normalized_index_origin_kind, normalized_index_source_id,
 };
-use crate::search::vector_index::{
-    ROLE_USER, SemanticDocId, VECTOR_INDEX_DIR, role_code_from_str, vector_index_path,
-};
+use crate::search::vector_index::{ROLE_USER, role_code_from_str};
 use crate::storage::sqlite::FrankenStorage;
 
 /// Default embedder batch size — the **maximum row count** per embed batch.
@@ -62,8 +50,6 @@ const DEFAULT_SEMANTIC_EMBED_BATCH_CHAR_BUDGET: usize = 16 * 1024;
 const DEFAULT_SEMANTIC_PREP_MEMO_CAPACITY: usize = 4_096;
 const DEFAULT_SEMANTIC_EMBED_BATCH_WARN_AFTER_MS: u64 = 30_000;
 const DEFAULT_SEMANTIC_EMBED_BATCH_FAIL_AFTER_MS: u64 = 300_000;
-const DEFAULT_SEMANTIC_MAX_MESSAGES_PER_CHECKPOINT: usize = 10_000;
-const DEFAULT_SEMANTIC_MAX_BYTES_PER_CHECKPOINT: u64 = 8 * 1024 * 1024;
 const SEMANTIC_PREP_MEMO_ALGORITHM: &str = "semantic_prepare_window";
 const SEMANTIC_PREP_MEMO_VERSION: &str = "canonicalize_for_embedding:v2:stable-content-hash";
 
@@ -483,120 +469,6 @@ fn stopped_scheduler_decision(
     decision
 }
 
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or(0)
-}
-
-fn hnsw_index_path(data_dir: &Path, embedder_id: &str) -> PathBuf {
-    data_dir
-        .join(VECTOR_INDEX_DIR)
-        .join(format!("hnsw-{embedder_id}.chsw"))
-}
-
-fn safe_path_component(raw: &str) -> String {
-    raw.chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-fn semantic_staging_index_path(
-    data_dir: &Path,
-    tier: TierKind,
-    embedder_id: &str,
-    db_fingerprint: &str,
-) -> PathBuf {
-    let fingerprint_hash = crc32fast::hash(db_fingerprint.as_bytes());
-    data_dir.join(VECTOR_INDEX_DIR).join(format!(
-        ".staging-{}-{}-{fingerprint_hash:08x}.fsvi",
-        tier.as_str(),
-        safe_path_component(embedder_id)
-    ))
-}
-
-fn semantic_generation_fingerprint_component(db_fingerprint: &str) -> String {
-    blake3::hash(db_fingerprint.as_bytes())
-        .to_hex()
-        .chars()
-        .take(16)
-        .collect()
-}
-
-fn semantic_shard_generation_dir(
-    data_dir: &Path,
-    tier: TierKind,
-    embedder_id: &str,
-    db_fingerprint: &str,
-) -> PathBuf {
-    let fingerprint_hash = semantic_generation_fingerprint_component(db_fingerprint);
-    data_dir.join(VECTOR_INDEX_DIR).join("shards").join(format!(
-        "{}-{}-{fingerprint_hash}",
-        tier.as_str(),
-        safe_path_component(embedder_id),
-    ))
-}
-
-fn semantic_shard_index_path(
-    data_dir: &Path,
-    tier: TierKind,
-    embedder_id: &str,
-    db_fingerprint: &str,
-    shard_index: u32,
-) -> PathBuf {
-    semantic_shard_generation_dir(data_dir, tier, embedder_id, db_fingerprint)
-        .join(format!("shard-{shard_index:05}.fsvi"))
-}
-
-fn semantic_shard_ann_index_path(
-    data_dir: &Path,
-    tier: TierKind,
-    embedder_id: &str,
-    db_fingerprint: &str,
-    shard_index: u32,
-) -> PathBuf {
-    semantic_shard_generation_dir(data_dir, tier, embedder_id, db_fingerprint)
-        .join(format!("shard-{shard_index:05}.chsw"))
-}
-
-#[cfg(not(windows))]
-fn sync_parent_directory(path: &Path) -> Result<()> {
-    let Some(parent) = path.parent() else {
-        return Ok(());
-    };
-    let directory = fs::File::open(parent)
-        .with_context(|| format!("opening parent directory {}", parent.display()))?;
-    directory
-        .sync_all()
-        .with_context(|| format!("syncing parent directory {}", parent.display()))
-}
-
-#[cfg(windows)]
-fn sync_parent_directory(_path: &Path) -> Result<()> {
-    Ok(())
-}
-
-fn semantic_doc_id_for_embedded(embedded: &EmbeddedMessage) -> String {
-    SemanticDocId {
-        message_id: embedded.message_id,
-        chunk_idx: embedded.chunk_idx,
-        agent_id: embedded.agent_id,
-        workspace_id: embedded.workspace_id,
-        source_id: embedded.source_id,
-        role: embedded.role,
-        created_at_ms: embedded.created_at_ms,
-        content_hash: Some(embedded.content_hash),
-    }
-    .to_doc_id_string()
-}
-
 struct CanonicalEmbeddingConversationRow {
     conversation_id: i64,
     agent_slug: String,
@@ -612,12 +484,20 @@ struct CanonicalEmbeddingConversationRow {
     origin_host: Option<String>,
 }
 
-struct CanonicalEmbeddingBatch {
-    inputs: Vec<EmbeddingInput>,
-    conversations_in_batch: u64,
-    last_conversation_id: i64,
-    total_conversations: u64,
-    cursor_exhausted: bool,
+pub(crate) struct CanonicalEmbeddingBatch {
+    pub(crate) inputs: Vec<EmbeddingInput>,
+    pub(crate) conversations_in_batch: u64,
+    pub(crate) last_conversation_id: i64,
+    pub(crate) total_conversations: u64,
+    pub(crate) cursor_exhausted: bool,
+    /// Highest canonical message PK selected anywhere in this batch,
+    /// paired with the conversation it came from. Message ids are NOT
+    /// monotonic with conversation ids (a conversation can keep
+    /// receiving new messages, with fresh ids, long after later
+    /// conversations already exist), so this pair must travel together
+    /// — see `fetch_canonical_embedding_batch_inner`'s doc comment.
+    raw_max_message_id: Option<i64>,
+    raw_max_message_id_conversation_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -634,18 +514,6 @@ impl SemanticCheckpointCaps {
         }
     }
 
-    fn from_env() -> Self {
-        Self {
-            max_messages: resolved_env_usize(
-                "CASS_SEMANTIC_MAX_MESSAGES_PER_CHECKPOINT",
-                DEFAULT_SEMANTIC_MAX_MESSAGES_PER_CHECKPOINT,
-            ),
-            max_bytes: resolved_env_u64(
-                "CASS_SEMANTIC_MAX_BYTES_PER_CHECKPOINT",
-                DEFAULT_SEMANTIC_MAX_BYTES_PER_CHECKPOINT,
-            ),
-        }
-    }
 
     fn message_limited(self) -> bool {
         self.max_messages > 0
@@ -654,12 +522,6 @@ impl SemanticCheckpointCaps {
     fn byte_limited(self) -> bool {
         self.max_bytes > 0
     }
-}
-
-pub(crate) struct CanonicalIncrementalEmbeddingBatch {
-    pub inputs: Vec<EmbeddingInput>,
-    pub conversations_in_batch: u64,
-    pub raw_max_message_id: Option<i64>,
 }
 
 fn total_semantic_conversations(storage: &FrankenStorage) -> Result<u64> {
@@ -692,7 +554,7 @@ fn total_semantic_conversations(storage: &FrankenStorage) -> Result<u64> {
             }
             let conversation_ids: Vec<i64> = storage
                 .raw()
-                .query_map_collect(hinted_fallback_sql, &[] as &[ParamValue], |row| {
+                .query_all_map(hinted_fallback_sql, &[] as &[ParamValue], |row| {
                     row.get_typed(0)
                 })
                 .or_else(|err| {
@@ -700,7 +562,7 @@ fn total_semantic_conversations(storage: &FrankenStorage) -> Result<u64> {
                         .to_string()
                         .contains("no such index: sqlite_autoindex_messages_1")
                     {
-                        return storage.raw().query_map_collect(
+                        return storage.raw().query_all_map(
                             fallback_sql,
                             &[] as &[ParamValue],
                             |row| row.get_typed(0),
@@ -877,7 +739,7 @@ fn fetch_canonical_embedding_conversations(
 
     storage
         .raw()
-        .query_map_collect(&envelope_sql, &params, |row| {
+        .query_all_map(&envelope_sql, &params, |row| {
             let workspace_path: Option<String> = row.get_typed(4)?;
             Ok(CanonicalEmbeddingConversationRow {
                 conversation_id: row.get_typed(0)?,
@@ -983,12 +845,18 @@ pub(crate) fn semantic_inputs_from_packets(
     Ok(inputs)
 }
 
-fn fetch_canonical_embedding_batch(
+pub(crate) fn fetch_canonical_embedding_batch(
     storage: &FrankenStorage,
     after_conversation_id: i64,
     max_conversations: usize,
 ) -> Result<CanonicalEmbeddingBatch> {
-    fetch_canonical_embedding_batch_inner(storage, after_conversation_id, max_conversations, None)
+    fetch_canonical_embedding_batch_inner(
+        storage,
+        after_conversation_id,
+        max_conversations,
+        None,
+        None,
+    )
 }
 
 /// Variant of [`fetch_canonical_embedding_batch`] that additionally
@@ -996,17 +864,33 @@ fn fetch_canonical_embedding_batch(
 /// when set. This is how sub-fix 2 (`last_message_id` cursor) enforces
 /// the "resume MUST advance past `last_message_id`" rule on a partially
 /// embedded conversation.
+///
+/// `after_message_id_conversation_id` pairs the cursor with the single
+/// conversation it was captured from (see doc comment on
+/// `CanonicalEmbeddingBatch::raw_max_message_id_conversation_id`). The
+/// floor is applied ONLY to that conversation's candidacy/messages;
+/// every other conversation in the fetched range is evaluated on
+/// whole-conversation-candidate rules, unaffected by the cursor. A
+/// `None` conversation id (legacy checkpoint, or no prior cursor)
+/// disables the floor entirely rather than defaulting to a global
+/// filter (bead w1c-C5-B1: the previous unscoped floor could exclude
+/// every conversation whose messages happen to sit below the cursor's
+/// conversation, when that conversation's message ids are not
+/// monotonic with its conversation id — e.g. a long-lived conversation
+/// repeatedly appended to across many later ingest passes).
 fn fetch_canonical_embedding_batch_inner(
     storage: &FrankenStorage,
     after_conversation_id: i64,
     max_conversations: usize,
     after_message_id: Option<i64>,
+    after_message_id_conversation_id: Option<i64>,
 ) -> Result<CanonicalEmbeddingBatch> {
     fetch_canonical_embedding_batch_inner_with_caps(
         storage,
         after_conversation_id,
         max_conversations,
         after_message_id,
+        after_message_id_conversation_id,
         SemanticCheckpointCaps::unlimited(),
     )
 }
@@ -1016,6 +900,7 @@ fn fetch_canonical_embedding_batch_inner_with_caps(
     after_conversation_id: i64,
     max_conversations: usize,
     after_message_id: Option<i64>,
+    after_message_id_conversation_id: Option<i64>,
     caps: SemanticCheckpointCaps,
 ) -> Result<CanonicalEmbeddingBatch> {
     let total_conversations = total_semantic_conversations(storage)?;
@@ -1026,11 +911,24 @@ fn fetch_canonical_embedding_batch_inner_with_caps(
         ParamValue::from(after_conversation_id),
         ParamValue::from(query_limit_i64),
     ];
-    let message_cursor_predicate = if let Some(after_message_id) = after_message_id {
-        params.push(ParamValue::from(after_message_id));
-        " AND id > ?3"
-    } else {
-        ""
+    // The message-id floor only ever meant to constrain the single
+    // conversation it was captured from (see doc comment on the
+    // function above). Pairing both the message-id and the owning
+    // conversation-id lets us scope the SQL predicate to exactly that
+    // conversation via `conversation_id != ?4 OR id > ?3`: every other
+    // conversation's `EXISTS` check degenerates to "has any message"
+    // (unaffected), while the paired conversation still enforces the
+    // floor if it were ever re-examined. A bare `after_message_id`
+    // with no paired conversation id is intentionally NOT applied —
+    // silently defaulting to a global floor is exactly the bug this
+    // scoping fixes.
+    let message_cursor_predicate = match (after_message_id, after_message_id_conversation_id) {
+        (Some(after_message_id), Some(scoped_conversation_id)) => {
+            params.push(ParamValue::from(after_message_id));
+            params.push(ParamValue::from(scoped_conversation_id));
+            " AND (conversation_id != ?4 OR id > ?3)"
+        }
+        _ => "",
     };
     let hinted_sql = format!(
         "SELECT c.id
@@ -1060,7 +958,7 @@ fn fetch_canonical_embedding_batch_inner_with_caps(
     );
     let mut conversation_ids: Vec<i64> = storage
         .raw()
-        .query_map_collect(&hinted_sql, &params, |row| row.get_typed(0))
+        .query_all_map(&hinted_sql, &params, |row| row.get_typed(0))
         .or_else(|err| {
             if err
                 .to_string()
@@ -1068,7 +966,7 @@ fn fetch_canonical_embedding_batch_inner_with_caps(
             {
                 return storage
                     .raw()
-                    .query_map_collect(&fallback_sql, &params, |row| row.get_typed(0));
+                    .query_all_map(&fallback_sql, &params, |row| row.get_typed(0));
             }
             Err(err)
         })
@@ -1083,6 +981,8 @@ fn fetch_canonical_embedding_batch_inner_with_caps(
             last_conversation_id: after_conversation_id,
             total_conversations,
             cursor_exhausted: true,
+            raw_max_message_id: None,
+            raw_max_message_id_conversation_id: None,
         });
     }
 
@@ -1103,8 +1003,27 @@ fn fetch_canonical_embedding_batch_inner_with_caps(
         conversations,
         &mut grouped_messages,
         after_message_id,
+        after_message_id_conversation_id,
         caps,
     );
+
+    // Compute the paired (max message id, owning conversation id) from
+    // the messages we are actually about to embed, before the packet
+    // build below consumes `grouped_messages`. This is what the next
+    // checkpoint's scoped floor will pair with.
+    let mut raw_max_message_id: Option<i64> = None;
+    let mut raw_max_message_id_conversation_id: Option<i64> = None;
+    for conversation in &conversations {
+        if let Some(messages) = grouped_messages.get(&conversation.conversation_id) {
+            if let Some(conversation_max) = messages.iter().filter_map(|m| m.id).max()
+                && raw_max_message_id.is_none_or(|current| conversation_max > current)
+            {
+                raw_max_message_id = Some(conversation_max);
+                raw_max_message_id_conversation_id = Some(conversation.conversation_id);
+            }
+        }
+    }
+
     let (inputs, _) = packet_embedding_inputs_from_materialized_canonical_messages(
         &conversations,
         &mut grouped_messages,
@@ -1130,6 +1049,8 @@ fn fetch_canonical_embedding_batch_inner_with_caps(
         last_conversation_id: last_conversation_id.unwrap_or(after_conversation_id),
         total_conversations,
         cursor_exhausted,
+        raw_max_message_id,
+        raw_max_message_id_conversation_id,
     })
 }
 
@@ -1143,6 +1064,7 @@ fn select_checkpoint_capped_conversations(
     conversations: Vec<CanonicalEmbeddingConversationRow>,
     grouped_messages: &mut HashMap<i64, Vec<Message>>,
     after_message_id: Option<i64>,
+    after_message_id_conversation_id: Option<i64>,
     caps: SemanticCheckpointCaps,
 ) -> CheckpointCappedSelection {
     let mut selected = Vec::new();
@@ -1155,7 +1077,16 @@ fn select_checkpoint_capped_conversations(
         let mut messages = grouped_messages
             .remove(&conversation.conversation_id)
             .unwrap_or_default();
-        if let Some(min_exclusive) = after_message_id {
+        // Scoped floor: only the conversation the cursor was captured
+        // from is filtered by it. Every other conversation's messages
+        // are evaluated in full — a conversation elsewhere in the
+        // corpus having low message ids (because it hasn't been
+        // touched by a later ingest pass) is not evidence it was
+        // already embedded.
+        if let (Some(min_exclusive), Some(scoped_conversation_id)) =
+            (after_message_id, after_message_id_conversation_id)
+            && conversation.conversation_id == scoped_conversation_id
+        {
             messages.retain(|message| message.id.is_some_and(|id| id > min_exclusive));
         }
         if messages.is_empty() {
@@ -1203,6 +1134,7 @@ fn select_checkpoint_capped_conversations(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn packet_embedding_inputs_from_storage(
     storage: &FrankenStorage,
 ) -> Result<Vec<EmbeddingInput>> {
@@ -1272,13 +1204,25 @@ where
     (inputs, raw_max_message_id)
 }
 
+// W3-5: fsvi-backed watermark incremental indexing is retired (see
+// indexer::run_semantic_db_vector_catchup); the tests below that still
+// exercise "since" selection semantics are earmarked for the Step1 test
+// cleanup pass, not deleted here to keep this wiring commit's diff scoped.
+#[cfg(test)]
+pub(crate) struct CanonicalIncrementalEmbeddingBatch {
+    pub inputs: Vec<EmbeddingInput>,
+    pub conversations_in_batch: u64,
+    pub raw_max_message_id: Option<i64>,
+}
+
+#[cfg(test)]
 pub(crate) fn packet_embedding_inputs_from_storage_since(
     storage: &FrankenStorage,
     since_message_id: i64,
 ) -> Result<CanonicalIncrementalEmbeddingBatch> {
     let conversation_ids: Vec<i64> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT DISTINCT m.conversation_id
              FROM messages m
              WHERE m.id > ?1
@@ -1773,846 +1717,6 @@ impl SemanticIndexer {
         pb.finish_with_message("Embedding complete");
         Ok(embeddings)
     }
-
-    pub fn build_and_save_index<I>(
-        &self,
-        embedded_messages: I,
-        data_dir: &Path,
-    ) -> Result<FsVectorIndex>
-    where
-        I: IntoIterator<Item = EmbeddedMessage>,
-    {
-        let index_path = vector_index_path(data_dir, self.embedder_id());
-        self.build_and_save_index_at_path(embedded_messages, &index_path)
-    }
-
-    pub fn build_and_save_index_shards<I>(
-        &self,
-        embedded_messages: I,
-        data_dir: &Path,
-        plan: SemanticShardBuildPlan,
-    ) -> Result<SemanticShardBuildOutcome>
-    where
-        I: IntoIterator<Item = EmbeddedMessage>,
-    {
-        if plan.db_fingerprint.trim().is_empty() {
-            bail!("semantic shard build requires a non-empty DB fingerprint");
-        }
-        if plan.max_records_per_shard == 0 {
-            bail!("semantic shard build requires max_records_per_shard > 0");
-        }
-
-        let mut shard_records = Vec::new();
-        let mut index_paths = Vec::new();
-        let mut ann_index_paths = Vec::new();
-        let mut current_records = Vec::with_capacity(plan.max_records_per_shard);
-        let mut shard_index = 0u32;
-        let mut total_docs = 0u64;
-
-        for embedded in embedded_messages {
-            current_records.push(embedded);
-            if current_records.len() >= plan.max_records_per_shard {
-                let records = std::mem::take(&mut current_records);
-                let (record, path, ann_path) =
-                    self.write_semantic_shard(records, data_dir, &plan, shard_index)?;
-                total_docs = total_docs.saturating_add(record.doc_count);
-                shard_records.push(record);
-                index_paths.push(path);
-                if let Some(path) = ann_path {
-                    ann_index_paths.push(path);
-                }
-                shard_index = shard_index
-                    .checked_add(1)
-                    .context("semantic shard index overflow")?;
-            }
-        }
-
-        if !current_records.is_empty() {
-            let records = std::mem::take(&mut current_records);
-            let (record, path, ann_path) =
-                self.write_semantic_shard(records, data_dir, &plan, shard_index)?;
-            total_docs = total_docs.saturating_add(record.doc_count);
-            shard_records.push(record);
-            index_paths.push(path);
-            if let Some(path) = ann_path {
-                ann_index_paths.push(path);
-            }
-        }
-
-        let shard_count = u32::try_from(shard_records.len())
-            .context("semantic shard generation exceeded u32 shard count")?;
-        for record in &mut shard_records {
-            record.shard_count = shard_count;
-        }
-
-        let mut shard_manifest = SemanticShardManifest::load_or_default(data_dir)
-            .map_err(|err| anyhow::anyhow!("loading semantic shard manifest for publish: {err}"))?;
-        shard_manifest.replace_shards_for_generation(
-            plan.tier,
-            self.embedder_id(),
-            &plan.db_fingerprint,
-            shard_records,
-        );
-        shard_manifest
-            .save(data_dir)
-            .map_err(|err| anyhow::anyhow!("saving semantic shard manifest: {err}"))?;
-        let summary = shard_manifest.summary(plan.tier, self.embedder_id(), &plan.db_fingerprint);
-
-        tracing::info!(
-            tier = plan.tier.as_str(),
-            embedder = self.embedder_id(),
-            shard_count,
-            doc_count = total_docs,
-            total_conversations = plan.total_conversations,
-            "published semantic shard generation sidecar"
-        );
-
-        Ok(SemanticShardBuildOutcome {
-            tier: plan.tier,
-            embedder_id: self.embedder_id().to_string(),
-            shard_count,
-            doc_count: total_docs,
-            total_conversations: plan.total_conversations,
-            index_paths,
-            ann_index_paths,
-            shard_manifest_path: SemanticShardManifest::path(data_dir),
-            complete: summary.complete,
-        })
-    }
-
-    fn write_semantic_shard(
-        &self,
-        embedded_messages: Vec<EmbeddedMessage>,
-        data_dir: &Path,
-        plan: &SemanticShardBuildPlan,
-        shard_index: u32,
-    ) -> Result<(SemanticShardRecord, PathBuf, Option<PathBuf>)> {
-        let started_at_ms = now_ms();
-        let shard_path = semantic_shard_index_path(
-            data_dir,
-            plan.tier,
-            self.embedder_id(),
-            &plan.db_fingerprint,
-            shard_index,
-        );
-        let shard_index_file = self.build_and_save_index_at_path(embedded_messages, &shard_path)?;
-        let size_bytes = fs::metadata(&shard_path)
-            .with_context(|| format!("stat semantic shard {}", shard_path.display()))?
-            .len();
-        let (ann_index_path, ann_size_bytes, ann_ready, ann_absolute_path) = if plan.build_ann {
-            let ann_path = semantic_shard_ann_index_path(
-                data_dir,
-                plan.tier,
-                self.embedder_id(),
-                &plan.db_fingerprint,
-                shard_index,
-            );
-            let config = FsHnswConfig {
-                m: FS_HNSW_DEFAULT_M,
-                ef_construction: FS_HNSW_DEFAULT_EF_CONSTRUCTION,
-                ..FsHnswConfig::default()
-            };
-            let hnsw = FsHnswIndex::build_from_vector_index(&shard_index_file, config)
-                .map_err(|err| anyhow::anyhow!("build shard HNSW index failed: {err}"))?;
-            hnsw.save(&ann_path)
-                .map_err(|err| anyhow::anyhow!("save shard HNSW index failed: {err}"))?;
-            let ann_size_bytes = fs::metadata(&ann_path)
-                .with_context(|| format!("stat semantic shard ANN {}", ann_path.display()))?
-                .len();
-            let relative_ann_path = ann_path
-                .strip_prefix(data_dir)
-                .unwrap_or(ann_path.as_path())
-                .to_string_lossy()
-                .to_string();
-            (
-                Some(relative_ann_path),
-                ann_size_bytes,
-                true,
-                Some(ann_path),
-            )
-        } else {
-            (None, 0, false, None)
-        };
-        let relative_index_path = shard_path
-            .strip_prefix(data_dir)
-            .unwrap_or(shard_path.as_path())
-            .to_string_lossy()
-            .to_string();
-        let record = SemanticShardRecord {
-            tier: plan.tier,
-            embedder_id: self.embedder_id().to_string(),
-            model_revision: plan.model_revision.clone(),
-            schema_version: SEMANTIC_SCHEMA_VERSION,
-            chunking_version: CHUNKING_STRATEGY_VERSION,
-            dimension: self.embedder_dimension(),
-            shard_index,
-            shard_count: 0,
-            doc_count: u64::try_from(shard_index_file.record_count()).unwrap_or(u64::MAX),
-            total_conversations: plan.total_conversations,
-            db_fingerprint: plan.db_fingerprint.clone(),
-            index_path: relative_index_path,
-            quantization: "f16".to_string(),
-            mmap_ready: true,
-            ann_index_path,
-            ann_size_bytes,
-            ann_ready,
-            size_bytes,
-            started_at_ms,
-            completed_at_ms: now_ms(),
-            ready: true,
-        };
-        Ok((record, shard_path, ann_absolute_path))
-    }
-
-    fn build_and_save_index_at_path<I>(
-        &self,
-        embedded_messages: I,
-        index_path: &Path,
-    ) -> Result<FsVectorIndex>
-    where
-        I: IntoIterator<Item = EmbeddedMessage>,
-    {
-        if let Some(parent) = index_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        // Store as f16 by default (smaller, faster I/O). Embeddings are validated by the writer.
-        let mut writer: FsVectorIndexWriter = FsVectorIndex::create_with_revision(
-            index_path,
-            self.embedder_id(),
-            "1.0",
-            self.embedder_dimension(),
-            FsQuantization::F16,
-        )
-        .map_err(|err| anyhow::anyhow!("create fsvi index failed: {err}"))?;
-
-        let write_result: Result<()> = (|| {
-            for embedded in embedded_messages {
-                if embedded.embedding.len() != self.embedder_dimension() {
-                    bail!(
-                        "embedding dimension mismatch: expected {}, got {}",
-                        self.embedder_dimension(),
-                        embedded.embedding.len()
-                    );
-                }
-                let doc_id = semantic_doc_id_for_embedded(&embedded);
-                writer
-                    .write_record(&doc_id, &embedded.embedding)
-                    .map_err(|err| anyhow::anyhow!("write fsvi record failed: {err}"))?;
-            }
-            Ok(())
-        })();
-
-        if let Err(e) = &write_result {
-            // Clean up partial index file to prevent corruption
-            tracing::warn!("removing partial vector index after write failure: {e}");
-            if let Err(rm_err) = std::fs::remove_file(index_path) {
-                tracing::error!(
-                    "failed to remove partial index file {}: {rm_err}",
-                    index_path.display()
-                );
-            }
-            return Err(anyhow::anyhow!("{e}"));
-        }
-
-        writer
-            .finish()
-            .map_err(|err| anyhow::anyhow!("finish fsvi index failed: {err}"))?;
-
-        FsVectorIndex::open(index_path)
-            .map_err(|err| anyhow::anyhow!("open fsvi index failed: {err}"))
-    }
-
-    /// Append new embeddings to an existing FSVI index via the WAL.
-    ///
-    /// Used for incremental semantic indexing in watch mode. Opens the
-    /// existing index, appends a batch of new embeddings, and compacts if
-    /// the WAL has grown large enough.
-    ///
-    /// Returns the number of entries appended.
-    pub fn append_to_index(
-        &self,
-        embedded_messages: impl IntoIterator<Item = EmbeddedMessage>,
-        data_dir: &Path,
-    ) -> Result<usize> {
-        let index_path = vector_index_path(data_dir, self.embedder_id());
-        self.append_to_index_path(embedded_messages, &index_path)
-    }
-
-    fn append_to_index_path(
-        &self,
-        embedded_messages: impl IntoIterator<Item = EmbeddedMessage>,
-        index_path: &Path,
-    ) -> Result<usize> {
-        let mut index = FsVectorIndex::open(index_path)
-            .map_err(|err| anyhow::anyhow!("open fsvi index for append: {err}"))?;
-
-        let entries: Vec<(String, Vec<f32>)> = embedded_messages
-            .into_iter()
-            .map(|em| {
-                let doc_id = semantic_doc_id_for_embedded(&em);
-                (doc_id, em.embedding)
-            })
-            .collect();
-
-        let count = entries.len();
-        if count == 0 {
-            return Ok(0);
-        }
-
-        index
-            .append_batch(&entries)
-            .map_err(|err| anyhow::anyhow!("append_batch: {err}"))?;
-
-        if index.needs_compaction() {
-            index
-                .compact()
-                .map_err(|err| anyhow::anyhow!("compaction: {err}"))?;
-        }
-
-        Ok(count)
-    }
-
-    fn write_backfill_staging_index(
-        &self,
-        embedded_messages: Vec<EmbeddedMessage>,
-        staging_path: &Path,
-        resume_existing: bool,
-    ) -> Result<FsVectorIndex> {
-        if resume_existing && staging_path.exists() {
-            self.append_to_index_path(embedded_messages, staging_path)?;
-            FsVectorIndex::open(staging_path)
-                .map_err(|err| anyhow::anyhow!("open staged semantic index failed: {err}"))
-        } else {
-            self.build_and_save_index_at_path(embedded_messages, staging_path)
-        }
-    }
-
-    pub fn run_backfill_batch(
-        &self,
-        messages: &[EmbeddingInput],
-        data_dir: &Path,
-        manifest: &mut SemanticManifest,
-        plan: SemanticBackfillBatchPlan,
-    ) -> Result<SemanticBackfillBatchOutcome> {
-        self.run_backfill_batch_with_sink(
-            messages,
-            data_dir,
-            manifest,
-            plan,
-            None,
-            &SemanticProgressSink::disabled(),
-        )
-    }
-
-    /// Variant of [`run_backfill_batch`] that emits semantic progress
-    /// events to the given JSONL sink and persists `last_message_id`
-    /// into the resumable checkpoint when supplied. The sink is silent
-    /// unless `CASS_SEMANTIC_PROGRESS_JSONL` is set, so this path is
-    /// safe to take in production.
-    pub fn run_backfill_batch_with_sink(
-        &self,
-        messages: &[EmbeddingInput],
-        data_dir: &Path,
-        manifest: &mut SemanticManifest,
-        plan: SemanticBackfillBatchPlan,
-        last_message_id: Option<i64>,
-        sink: &SemanticProgressSink,
-    ) -> Result<SemanticBackfillBatchOutcome> {
-        if plan.db_fingerprint.trim().is_empty() {
-            bail!("semantic backfill requires a non-empty DB fingerprint");
-        }
-        if plan.total_conversations == 0 && plan.conversations_in_batch > 0 {
-            bail!("semantic backfill batch cannot process conversations when total is zero");
-        }
-
-        let manifest_path = SemanticManifest::path(data_dir);
-        let staging_path = semantic_staging_index_path(
-            data_dir,
-            plan.tier,
-            self.embedder_id(),
-            &plan.db_fingerprint,
-        );
-        let final_path = vector_index_path(data_dir, self.embedder_id());
-
-        let prior_checkpoint = manifest
-            .checkpoint
-            .as_ref()
-            .filter(|checkpoint| {
-                checkpoint.tier == plan.tier
-                    && checkpoint.embedder_id == self.embedder_id()
-                    && checkpoint.is_valid(&plan.db_fingerprint)
-            })
-            .cloned();
-        let prior_conversations = prior_checkpoint
-            .as_ref()
-            .map_or(0, |checkpoint| checkpoint.conversations_processed);
-        let prior_docs = prior_checkpoint
-            .as_ref()
-            .map_or(0, |checkpoint| checkpoint.docs_embedded);
-
-        let embeddings = self.embed_messages_with_sink(messages, sink)?;
-        let embedded_docs = u64::try_from(embeddings.len()).unwrap_or(u64::MAX);
-        if sink.is_active() {
-            sink.emit(
-                SemanticProgressEvent::StagingWriteStart,
-                SemanticProgressFields {
-                    batch_rows: Some(embedded_docs),
-                    note: Some(staging_path.display().to_string()),
-                    ..Default::default()
-                },
-            );
-        }
-        let mut staged_index = self.write_backfill_staging_index(
-            embeddings,
-            &staging_path,
-            prior_checkpoint.is_some(),
-        )?;
-        if sink.is_active() {
-            sink.emit(
-                SemanticProgressEvent::StagingWriteDone,
-                SemanticProgressFields {
-                    batch_rows: Some(embedded_docs),
-                    note: Some(staging_path.display().to_string()),
-                    ..Default::default()
-                },
-            );
-        }
-        let counted_conversations_processed =
-            prior_conversations.saturating_add(plan.conversations_in_batch);
-        let conversations_processed = if plan.cursor_exhausted {
-            plan.total_conversations
-        } else {
-            counted_conversations_processed.min(plan.total_conversations)
-        };
-        let complete = plan.cursor_exhausted;
-
-        manifest.refresh_backlog(plan.total_conversations, &plan.db_fingerprint);
-
-        if complete {
-            let db_fingerprint = plan.db_fingerprint.clone();
-            if staged_index.wal_record_count() > 0 {
-                staged_index.compact().map_err(|err| {
-                    anyhow::anyhow!("compact staged semantic index failed: {err}")
-                })?;
-            }
-            drop(staged_index);
-            if sink.is_active() {
-                sink.emit(
-                    SemanticProgressEvent::PublishStart,
-                    SemanticProgressFields {
-                        rows_processed: Some(conversations_processed),
-                        rows_total: Some(plan.total_conversations),
-                        last_conversation_id: Some(plan.last_offset),
-                        last_message_id,
-                        note: Some(final_path.display().to_string()),
-                        ..Default::default()
-                    },
-                );
-            }
-            fs::rename(&staging_path, &final_path).with_context(|| {
-                format!(
-                    "publishing staged semantic index {} to {}",
-                    staging_path.display(),
-                    final_path.display()
-                )
-            })?;
-            sync_parent_directory(&final_path)?;
-            let published_index = FsVectorIndex::open(&final_path)
-                .map_err(|err| anyhow::anyhow!("open published semantic index failed: {err}"))?;
-            let size_bytes = fs::metadata(&final_path)
-                .with_context(|| format!("stat published semantic index {}", final_path.display()))?
-                .len();
-            let relative_index_path = final_path
-                .strip_prefix(data_dir)
-                .unwrap_or(final_path.as_path())
-                .to_string_lossy()
-                .to_string();
-            manifest.publish_artifact(ArtifactRecord {
-                tier: plan.tier,
-                embedder_id: self.embedder_id().to_string(),
-                model_revision: plan.model_revision,
-                schema_version: SEMANTIC_SCHEMA_VERSION,
-                chunking_version: CHUNKING_STRATEGY_VERSION,
-                dimension: self.embedder_dimension(),
-                doc_count: u64::try_from(published_index.record_count()).unwrap_or(u64::MAX),
-                conversation_count: conversations_processed,
-                db_fingerprint: plan.db_fingerprint,
-                index_path: relative_index_path,
-                size_bytes,
-                started_at_ms: prior_checkpoint
-                    .as_ref()
-                    .map_or_else(now_ms, |checkpoint| checkpoint.saved_at_ms),
-                completed_at_ms: now_ms(),
-                ready: true,
-            });
-            manifest.refresh_backlog(plan.total_conversations, &db_fingerprint);
-            manifest.save(data_dir)?;
-            if sink.is_active() {
-                sink.emit(
-                    SemanticProgressEvent::PublishDone,
-                    SemanticProgressFields {
-                        rows_processed: Some(conversations_processed),
-                        rows_total: Some(plan.total_conversations),
-                        last_conversation_id: Some(plan.last_offset),
-                        last_message_id,
-                        note: Some(final_path.display().to_string()),
-                        ..Default::default()
-                    },
-                );
-            }
-        } else {
-            let docs_embedded_on_disk =
-                u64::try_from(staged_index.record_count()).unwrap_or(u64::MAX);
-            let checkpoint_docs = prior_docs
-                .saturating_add(embedded_docs)
-                .max(docs_embedded_on_disk);
-            if sink.is_active() {
-                sink.emit(
-                    SemanticProgressEvent::CheckpointSaveStart,
-                    SemanticProgressFields {
-                        rows_processed: Some(conversations_processed),
-                        rows_total: Some(plan.total_conversations),
-                        last_conversation_id: Some(plan.last_offset),
-                        last_message_id,
-                        ..Default::default()
-                    },
-                );
-            }
-            // Preserve any existing `last_message_id` cursor when the
-            // caller did not supply a fresher one — see sub-fix 2 for
-            // why durable message-PK resume matters.
-            let prior_last_message_id = prior_checkpoint
-                .as_ref()
-                .and_then(|checkpoint| checkpoint.last_message_id);
-            manifest.save_checkpoint(BuildCheckpoint {
-                tier: plan.tier,
-                embedder_id: self.embedder_id().to_string(),
-                last_offset: plan.last_offset,
-                docs_embedded: checkpoint_docs,
-                conversations_processed,
-                total_conversations: plan.total_conversations,
-                db_fingerprint: plan.db_fingerprint,
-                schema_version: SEMANTIC_SCHEMA_VERSION,
-                chunking_version: CHUNKING_STRATEGY_VERSION,
-                saved_at_ms: now_ms(),
-                last_message_id: last_message_id.or(prior_last_message_id),
-                cursor_exhausted: plan.cursor_exhausted,
-            });
-            manifest.save(data_dir)?;
-            if sink.is_active() {
-                sink.emit(
-                    SemanticProgressEvent::CheckpointSaveDone,
-                    SemanticProgressFields {
-                        rows_processed: Some(conversations_processed),
-                        rows_total: Some(plan.total_conversations),
-                        last_conversation_id: Some(plan.last_offset),
-                        last_message_id: last_message_id.or(prior_last_message_id),
-                        ..Default::default()
-                    },
-                );
-            }
-        }
-
-        Ok(SemanticBackfillBatchOutcome {
-            tier: plan.tier,
-            embedder_id: self.embedder_id().to_string(),
-            embedded_docs,
-            conversations_processed,
-            total_conversations: plan.total_conversations,
-            last_offset: plan.last_offset,
-            checkpoint_saved: !complete,
-            published: complete,
-            index_path: if complete { final_path } else { staging_path },
-            manifest_path,
-        })
-    }
-
-    pub fn run_backfill_from_storage(
-        &self,
-        storage: &FrankenStorage,
-        data_dir: &Path,
-        manifest: &mut SemanticManifest,
-        plan: SemanticBackfillStoragePlan,
-    ) -> Result<SemanticBackfillBatchOutcome> {
-        self.run_backfill_from_storage_with_sink(
-            storage,
-            data_dir,
-            manifest,
-            plan,
-            &SemanticProgressSink::disabled(),
-        )
-    }
-
-    /// Variant of [`run_backfill_from_storage`] that emits semantic
-    /// progress events to a JSONL sink and persists `last_message_id`
-    /// in the resumable checkpoint. The sink is silent unless
-    /// `CASS_SEMANTIC_PROGRESS_JSONL` is set.
-    pub fn run_backfill_from_storage_with_sink(
-        &self,
-        storage: &FrankenStorage,
-        data_dir: &Path,
-        manifest: &mut SemanticManifest,
-        plan: SemanticBackfillStoragePlan,
-        sink: &SemanticProgressSink,
-    ) -> Result<SemanticBackfillBatchOutcome> {
-        self.run_backfill_from_storage_with_caps_and_sink(
-            storage,
-            data_dir,
-            manifest,
-            plan,
-            SemanticCheckpointCaps::unlimited(),
-            sink,
-        )
-    }
-
-    /// Variant of [`run_backfill_from_storage_with_sink`] for CLI backfill
-    /// runs. It applies operator checkpoint caps from
-    /// `CASS_SEMANTIC_MAX_MESSAGES_PER_CHECKPOINT` and
-    /// `CASS_SEMANTIC_MAX_BYTES_PER_CHECKPOINT` while keeping each selected
-    /// conversation whole, so message-cursor resume cannot strand the tail of
-    /// a partially selected conversation.
-    pub fn run_capped_backfill_from_storage_with_sink(
-        &self,
-        storage: &FrankenStorage,
-        data_dir: &Path,
-        manifest: &mut SemanticManifest,
-        plan: SemanticBackfillStoragePlan,
-        sink: &SemanticProgressSink,
-    ) -> Result<SemanticBackfillBatchOutcome> {
-        self.run_backfill_from_storage_with_caps_and_sink(
-            storage,
-            data_dir,
-            manifest,
-            plan,
-            SemanticCheckpointCaps::from_env(),
-            sink,
-        )
-    }
-
-    fn run_backfill_from_storage_with_caps_and_sink(
-        &self,
-        storage: &FrankenStorage,
-        data_dir: &Path,
-        manifest: &mut SemanticManifest,
-        plan: SemanticBackfillStoragePlan,
-        caps: SemanticCheckpointCaps,
-        sink: &SemanticProgressSink,
-    ) -> Result<SemanticBackfillBatchOutcome> {
-        let prior_checkpoint = manifest.checkpoint.as_ref().filter(|checkpoint| {
-            checkpoint.tier == plan.tier
-                && checkpoint.embedder_id == self.embedder_id()
-                && checkpoint.is_valid(&plan.db_fingerprint)
-        });
-        let after_conversation_id = prior_checkpoint.map_or(0, |checkpoint| checkpoint.last_offset);
-        let prior_last_message_id =
-            prior_checkpoint.and_then(|checkpoint| checkpoint.last_message_id);
-
-        if sink.is_active() {
-            sink.emit(
-                SemanticProgressEvent::SelectionStart,
-                SemanticProgressFields {
-                    last_conversation_id: Some(after_conversation_id),
-                    last_message_id: prior_last_message_id,
-                    rows_total: Some(saturating_u64_from_usize(plan.max_conversations)),
-                    note: Some(plan.tier.as_str().to_string()),
-                    ..Default::default()
-                },
-            );
-        }
-
-        let batch = match fetch_canonical_embedding_batch_inner_with_caps(
-            storage,
-            after_conversation_id,
-            plan.max_conversations,
-            prior_last_message_id,
-            caps,
-        ) {
-            Ok(batch) => batch,
-            Err(err) => {
-                if sink.is_active() {
-                    sink.emit(
-                        SemanticProgressEvent::Error,
-                        SemanticProgressFields {
-                            error: Some(format!("selection: {err}")),
-                            last_conversation_id: Some(after_conversation_id),
-                            last_message_id: prior_last_message_id,
-                            ..Default::default()
-                        },
-                    );
-                }
-                return Err(err);
-            }
-        };
-
-        if sink.is_active() {
-            sink.emit(
-                SemanticProgressEvent::SelectionDone,
-                SemanticProgressFields {
-                    last_conversation_id: Some(batch.last_conversation_id),
-                    last_message_id: prior_last_message_id,
-                    conversations_in_batch: Some(batch.conversations_in_batch),
-                    rows_total: Some(batch.total_conversations),
-                    ..Default::default()
-                },
-            );
-            // PacketReplay {start,progress,done} bracket the
-            // envelope/messages/packet build done by
-            // `fetch_canonical_embedding_batch`. We can't easily plumb
-            // a callback inside that helper without refactoring it, so
-            // the start/done bracket here straddles the work that
-            // already happened (replay always finishes before we see
-            // the result). A future refactor — flagged in the
-            // SQL-shape follow-up — can move the packet-replay work
-            // into a streaming iterator and emit `progress` ticks
-            // per conversation. For now, the bracket still gives
-            // operators a clear "we got past replay" signal.
-            sink.emit(
-                SemanticProgressEvent::PacketReplayStart,
-                SemanticProgressFields {
-                    conversations_in_batch: Some(batch.conversations_in_batch),
-                    ..Default::default()
-                },
-            );
-            sink.emit(
-                SemanticProgressEvent::PacketReplayProgress,
-                SemanticProgressFields {
-                    conversations_in_batch: Some(batch.conversations_in_batch),
-                    rows_processed: Some(saturating_u64_from_usize(batch.inputs.len())),
-                    bytes: Some(
-                        batch
-                            .inputs
-                            .iter()
-                            .map(|i| saturating_u64_from_usize(i.content.len()))
-                            .sum(),
-                    ),
-                    ..Default::default()
-                },
-            );
-            sink.emit(
-                SemanticProgressEvent::PacketReplayDone,
-                SemanticProgressFields {
-                    conversations_in_batch: Some(batch.conversations_in_batch),
-                    rows_processed: Some(saturating_u64_from_usize(batch.inputs.len())),
-                    ..Default::default()
-                },
-            );
-        }
-
-        // Compute the freshest `last_message_id` from the inputs we are
-        // about to embed. EmbeddingInput.message_id is u64 (canonical
-        // message PK); we coerce to i64 since the manifest stores i64.
-        let batch_last_message_id = batch
-            .inputs
-            .iter()
-            .map(|input| i64::try_from(input.message_id).unwrap_or(i64::MAX))
-            .max();
-        let next_last_message_id = match (prior_last_message_id, batch_last_message_id) {
-            (Some(prior), Some(batch_max)) => Some(prior.max(batch_max)),
-            (Some(prior), None) => Some(prior),
-            (None, Some(batch_max)) => Some(batch_max),
-            (None, None) => None,
-        };
-
-        let outcome = self.run_backfill_batch_with_sink(
-            &batch.inputs,
-            data_dir,
-            manifest,
-            SemanticBackfillBatchPlan {
-                tier: plan.tier,
-                db_fingerprint: plan.db_fingerprint,
-                model_revision: plan.model_revision,
-                total_conversations: batch.total_conversations,
-                conversations_in_batch: batch.conversations_in_batch,
-                last_offset: batch.last_conversation_id,
-                cursor_exhausted: batch.cursor_exhausted,
-            },
-            next_last_message_id,
-            sink,
-        );
-
-        match &outcome {
-            Ok(o) => {
-                if sink.is_active() {
-                    sink.emit(
-                        SemanticProgressEvent::Complete,
-                        SemanticProgressFields {
-                            rows_processed: Some(o.conversations_processed),
-                            rows_total: Some(o.total_conversations),
-                            last_conversation_id: Some(o.last_offset),
-                            last_message_id: next_last_message_id,
-                            ..Default::default()
-                        },
-                    );
-                }
-            }
-            Err(err) => {
-                if sink.is_active() {
-                    sink.emit(
-                        SemanticProgressEvent::Error,
-                        SemanticProgressFields {
-                            error: Some(err.to_string()),
-                            last_conversation_id: Some(batch.last_conversation_id),
-                            last_message_id: next_last_message_id,
-                            ..Default::default()
-                        },
-                    );
-                }
-            }
-        }
-
-        outcome
-    }
-
-    /// Build and save an HNSW index for approximate nearest neighbor search.
-    ///
-    /// This creates an HNSW graph structure from the existing VectorIndex,
-    /// enabling O(log n) approximate search with the `--approximate` flag.
-    ///
-    /// # Arguments
-    /// * `vector_index` - The VectorIndex to build HNSW from
-    /// * `data_dir` - Directory to save the HNSW index
-    /// * `m` - Max connections per node (default: 16)
-    /// * `ef_construction` - Search width during build (default: 200)
-    ///
-    /// # Returns
-    /// Path to the saved HNSW index file
-    pub fn build_hnsw_index(
-        &self,
-        vector_index: &FsVectorIndex,
-        data_dir: &Path,
-        m: Option<usize>,
-        ef_construction: Option<usize>,
-    ) -> Result<PathBuf> {
-        let m = m.unwrap_or(FS_HNSW_DEFAULT_M);
-        let ef_construction = ef_construction.unwrap_or(FS_HNSW_DEFAULT_EF_CONSTRUCTION);
-
-        tracing::info!(
-            embedder = self.embedder_id(),
-            count = vector_index.record_count(),
-            m,
-            ef_construction,
-            "Building HNSW index for approximate nearest neighbor search"
-        );
-
-        let config = FsHnswConfig {
-            m,
-            ef_construction,
-            ..FsHnswConfig::default()
-        };
-        let hnsw = FsHnswIndex::build_from_vector_index(vector_index, config)
-            .map_err(|err| anyhow::anyhow!("build HNSW index failed: {err}"))?;
-
-        let hnsw_path = hnsw_index_path(data_dir, self.embedder_id());
-        if let Some(parent) = hnsw_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        hnsw.save(&hnsw_path)
-            .map_err(|err| anyhow::anyhow!("save HNSW index failed: {err}"))?;
-
-        tracing::info!(?hnsw_path, "Saved HNSW index");
-        Ok(hnsw_path)
-    }
 }
 
 #[cfg(test)]
@@ -2956,148 +2060,6 @@ mod tests {
     }
 
     #[test]
-    fn test_build_and_save_index() {
-        let indexer = SemanticIndexer::new("hash", None).unwrap();
-        let messages = vec![
-            EmbeddingInput::new(1, "Hello world"),
-            EmbeddingInput::new(2, "Goodbye world"),
-        ];
-
-        let embeddings = indexer.embed_messages(&messages).unwrap();
-        let tmp = tempdir().unwrap();
-        let index = indexer
-            .build_and_save_index(embeddings, tmp.path())
-            .unwrap();
-        assert_eq!(index.embedder_id(), indexer.embedder_id());
-        assert_eq!(index.dimension(), indexer.embedder_dimension());
-        assert_eq!(index.record_count(), 2);
-    }
-
-    #[test]
-    fn sharded_index_build_writes_sidecar_without_runtime_publish() {
-        let indexer = SemanticIndexer::new("hash", None).unwrap();
-        let messages: Vec<_> = (0..5)
-            .map(|idx| EmbeddingInput::new(idx, format!("semantic shard message {idx}")))
-            .collect();
-        let embeddings = indexer.embed_messages(&messages).unwrap();
-        let tmp = tempdir().unwrap();
-
-        let outcome = indexer
-            .build_and_save_index_shards(
-                embeddings,
-                tmp.path(),
-                SemanticShardBuildPlan {
-                    tier: TierKind::Fast,
-                    db_fingerprint: "db-fp-sharded-build".to_string(),
-                    model_revision: "hash".to_string(),
-                    total_conversations: 5,
-                    max_records_per_shard: 2,
-                    build_ann: false,
-                },
-            )
-            .unwrap();
-
-        assert_eq!(outcome.shard_count, 3);
-        assert_eq!(outcome.doc_count, 5);
-        assert_eq!(outcome.total_conversations, 5);
-        assert!(outcome.complete);
-        assert_eq!(outcome.index_paths.len(), 3);
-        for path in &outcome.index_paths {
-            let shard = FsVectorIndex::open(path).unwrap();
-            assert_eq!(shard.embedder_id(), indexer.embedder_id());
-            assert!(shard.record_count() > 0);
-        }
-
-        let shards = SemanticShardManifest::load(tmp.path()).unwrap().unwrap();
-        let summary = shards.summary(TierKind::Fast, indexer.embedder_id(), "db-fp-sharded-build");
-        assert!(summary.complete);
-        assert_eq!(summary.ready_shards, 3);
-        assert_eq!(summary.ann_ready_shards, 0);
-        assert_eq!(summary.doc_count, 5);
-        assert_eq!(summary.total_conversations, 5);
-
-        assert!(
-            SemanticManifest::load(tmp.path()).unwrap().is_none(),
-            "sidecar shards must not publish the main runtime manifest"
-        );
-        assert!(!vector_index_path(tmp.path(), indexer.embedder_id()).exists());
-    }
-
-    #[test]
-    fn sharded_index_build_rejects_zero_sized_shards() {
-        let indexer = SemanticIndexer::new("hash", None).unwrap();
-        let err = indexer
-            .build_and_save_index_shards(
-                std::iter::empty(),
-                tempdir().unwrap().path(),
-                SemanticShardBuildPlan {
-                    tier: TierKind::Fast,
-                    db_fingerprint: "db-fp-sharded-build".to_string(),
-                    model_revision: "hash".to_string(),
-                    total_conversations: 0,
-                    max_records_per_shard: 0,
-                    build_ann: false,
-                },
-            )
-            .unwrap_err();
-
-        assert!(err.to_string().contains("max_records_per_shard > 0"));
-    }
-
-    #[test]
-    fn sharded_ann_build_records_per_shard_accelerators() {
-        let indexer = SemanticIndexer::new("hash", None).unwrap();
-        let messages: Vec<_> = (0..8)
-            .map(|idx| EmbeddingInput::new(idx, format!("semantic ann shard message {idx}")))
-            .collect();
-        let embeddings = indexer.embed_messages(&messages).unwrap();
-        let tmp = tempdir().unwrap();
-
-        let outcome = indexer
-            .build_and_save_index_shards(
-                embeddings,
-                tmp.path(),
-                SemanticShardBuildPlan {
-                    tier: TierKind::Fast,
-                    db_fingerprint: "db-fp-sharded-ann-build".to_string(),
-                    model_revision: "hash".to_string(),
-                    total_conversations: 8,
-                    max_records_per_shard: 4,
-                    build_ann: true,
-                },
-            )
-            .unwrap();
-
-        assert_eq!(outcome.shard_count, 2);
-        assert_eq!(outcome.ann_index_paths.len(), 2);
-        for path in &outcome.ann_index_paths {
-            assert!(path.exists(), "ANN shard missing at {}", path.display());
-        }
-
-        let shards = SemanticShardManifest::load(tmp.path()).unwrap().unwrap();
-        let summary = shards.summary(
-            TierKind::Fast,
-            indexer.embedder_id(),
-            "db-fp-sharded-ann-build",
-        );
-        assert!(summary.complete);
-        assert_eq!(summary.ann_ready_shards, 2);
-        assert!(summary.ann_size_bytes > 0);
-        assert!(
-            shards
-                .shards
-                .iter()
-                .all(|record| record.ann_index_path.is_some() && record.ann_ready)
-        );
-    }
-
-    /// Golden-output regression: any change to the embedding prep pipeline,
-    /// the canonicalizer, the hash embedder's deterministic projection, or
-    /// the ordering semantics of `embed_messages` must not silently mutate
-    /// the bytes we write to the vector index. This digest is derived from a
-    /// frozen 64-message corpus processed through the hash embedder; a
-    /// mismatch means one of those contracts moved.
-    #[test]
     fn embed_messages_golden_digest_hash_embedder() {
         use ring::digest::{Context, SHA256};
 
@@ -3362,342 +2324,6 @@ mod tests {
     }
 
     #[test]
-    fn backfill_batch_saves_checkpoint_and_staged_index_until_complete() {
-        let temp = tempdir().unwrap();
-        let mut manifest = SemanticManifest::default();
-        let indexer = SemanticIndexer::new("hash", None).unwrap();
-        let messages = vec![
-            EmbeddingInput::new(10, "first staged semantic message"),
-            EmbeddingInput::new(11, "second staged semantic message"),
-        ];
-
-        let outcome = indexer
-            .run_backfill_batch(
-                &messages,
-                temp.path(),
-                &mut manifest,
-                SemanticBackfillBatchPlan {
-                    tier: TierKind::Fast,
-                    db_fingerprint: "db-fp-backfill-partial".to_string(),
-                    model_revision: "hash".to_string(),
-                    total_conversations: 2,
-                    conversations_in_batch: 1,
-                    last_offset: 1,
-                    cursor_exhausted: false,
-                },
-            )
-            .unwrap();
-
-        assert!(!outcome.published);
-        assert!(outcome.checkpoint_saved);
-        assert!(outcome.index_path.exists());
-        assert!(!vector_index_path(temp.path(), indexer.embedder_id()).exists());
-        let checkpoint = manifest.checkpoint.as_ref().expect("checkpoint");
-        assert_eq!(checkpoint.tier, TierKind::Fast);
-        assert_eq!(checkpoint.conversations_processed, 1);
-        assert_eq!(checkpoint.docs_embedded, 2);
-        assert_eq!(manifest.backlog.total_conversations, 2);
-        assert!(SemanticManifest::path(temp.path()).exists());
-    }
-
-    #[test]
-    fn backfill_batch_does_not_publish_until_cursor_exhausted() -> Result<()> {
-        let temp = tempdir()?;
-        let mut manifest = SemanticManifest::default();
-        let indexer = SemanticIndexer::new("hash", None)?;
-        let db_fingerprint = "db-fp-backfill-cursor-not-exhausted";
-
-        let first = vec![EmbeddingInput::new(30, "first cursor batch")];
-        let first_outcome = indexer.run_backfill_batch(
-            &first,
-            temp.path(),
-            &mut manifest,
-            SemanticBackfillBatchPlan {
-                tier: TierKind::Fast,
-                db_fingerprint: db_fingerprint.to_string(),
-                model_revision: "hash".to_string(),
-                total_conversations: 2,
-                conversations_in_batch: 1,
-                last_offset: 1,
-                cursor_exhausted: false,
-            },
-        )?;
-        anyhow::ensure!(!first_outcome.published, "first batch must not publish");
-        anyhow::ensure!(
-            first_outcome.checkpoint_saved,
-            "first batch should save a checkpoint"
-        );
-
-        let second = vec![EmbeddingInput::new(31, "second cursor batch")];
-        let second_outcome = indexer.run_backfill_batch(
-            &second,
-            temp.path(),
-            &mut manifest,
-            SemanticBackfillBatchPlan {
-                tier: TierKind::Fast,
-                db_fingerprint: db_fingerprint.to_string(),
-                model_revision: "hash".to_string(),
-                total_conversations: 2,
-                conversations_in_batch: 1,
-                last_offset: 2,
-                cursor_exhausted: false,
-            },
-        )?;
-
-        anyhow::ensure!(
-            !second_outcome.published,
-            "count-based completion would publish here; cursor state must win"
-        );
-        anyhow::ensure!(
-            second_outcome.checkpoint_saved,
-            "second batch should save a checkpoint"
-        );
-        anyhow::ensure!(
-            !vector_index_path(temp.path(), indexer.embedder_id()).exists(),
-            "non-exhausted cursor must not publish the final vector index"
-        );
-        let Some(checkpoint) = manifest.checkpoint.as_ref() else {
-            bail!("checkpoint should remain after a non-exhausted cursor");
-        };
-        anyhow::ensure!(
-            checkpoint.conversations_processed == 2,
-            "wanted 2 processed conversations, got {}",
-            checkpoint.conversations_processed
-        );
-        anyhow::ensure!(
-            checkpoint.total_conversations == 2,
-            "checkpoint should preserve the real DB total, got {}",
-            checkpoint.total_conversations
-        );
-        anyhow::ensure!(
-            !checkpoint.cursor_exhausted,
-            "saved checkpoint should preserve the non-exhausted cursor state"
-        );
-        anyhow::ensure!(
-            !checkpoint.is_complete(),
-            "non-exhausted cursor checkpoint must not be complete"
-        );
-        anyhow::ensure!(
-            checkpoint.progress_pct() == 99,
-            "non-exhausted cursor checkpoint should report 99% progress, got {}",
-            checkpoint.progress_pct()
-        );
-        anyhow::ensure!(
-            second_outcome.conversations_processed == 2,
-            "wanted outcome to report 2 processed conversations, got {}",
-            second_outcome.conversations_processed
-        );
-        anyhow::ensure!(
-            second_outcome.total_conversations == 2,
-            "wanted outcome to preserve total 2, got {}",
-            second_outcome.total_conversations
-        );
-        let progress_pct = second_outcome.progress_pct();
-        anyhow::ensure!(
-            (progress_pct - 99.0).abs() < f64::EPSILON,
-            "non-published outcome should cap progress below 100%, got {}",
-            progress_pct
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn backfill_batch_resumes_staged_index_and_publishes_manifest_atomically() {
-        let temp = tempdir().unwrap();
-        let mut manifest = SemanticManifest::default();
-        let indexer = SemanticIndexer::new("hash", None).unwrap();
-        let db_fingerprint = "db-fp-backfill-complete";
-        let staging_path = semantic_staging_index_path(
-            temp.path(),
-            TierKind::Fast,
-            indexer.embedder_id(),
-            db_fingerprint,
-        );
-
-        let first = vec![EmbeddingInput::new(20, "first resume batch")];
-        let first_outcome = indexer
-            .run_backfill_batch(
-                &first,
-                temp.path(),
-                &mut manifest,
-                SemanticBackfillBatchPlan {
-                    tier: TierKind::Fast,
-                    db_fingerprint: db_fingerprint.to_string(),
-                    model_revision: "hash".to_string(),
-                    total_conversations: 2,
-                    conversations_in_batch: 1,
-                    last_offset: 1,
-                    cursor_exhausted: false,
-                },
-            )
-            .unwrap();
-        assert_eq!(first_outcome.index_path, staging_path);
-        assert!(staging_path.exists());
-
-        let second = vec![EmbeddingInput::new(21, "second resume batch")];
-        let second_outcome = indexer
-            .run_backfill_batch(
-                &second,
-                temp.path(),
-                &mut manifest,
-                SemanticBackfillBatchPlan {
-                    tier: TierKind::Fast,
-                    db_fingerprint: db_fingerprint.to_string(),
-                    model_revision: "hash".to_string(),
-                    total_conversations: 2,
-                    conversations_in_batch: 1,
-                    last_offset: 2,
-                    cursor_exhausted: true,
-                },
-            )
-            .unwrap();
-
-        assert!(second_outcome.published);
-        assert!(!second_outcome.checkpoint_saved);
-        assert!((second_outcome.progress_pct() - 100.0).abs() < f64::EPSILON);
-        assert!(!staging_path.exists());
-        let final_path = vector_index_path(temp.path(), indexer.embedder_id());
-        assert_eq!(second_outcome.index_path, final_path);
-        assert!(final_path.exists());
-        assert!(manifest.checkpoint.is_none());
-        let artifact = manifest.fast_tier.as_ref().expect("published fast tier");
-        assert!(artifact.ready);
-        assert_eq!(artifact.conversation_count, 2);
-        assert_eq!(artifact.doc_count, 2);
-        assert_eq!(manifest.backlog.fast_tier_processed, 2);
-
-        let loaded = SemanticManifest::load(temp.path()).unwrap().unwrap();
-        assert!(loaded.checkpoint.is_none());
-        assert!(loaded.fast_tier.as_ref().is_some_and(|record| record.ready));
-    }
-
-    #[test]
-    fn backfill_publish_compacts_resumed_wal_before_rename() {
-        let temp = tempdir().unwrap();
-        let mut manifest = SemanticManifest::default();
-        let indexer = SemanticIndexer::new("hash", None).unwrap();
-        let db_fingerprint = "db-fp-backfill-small-resume";
-        let first: Vec<EmbeddingInput> = (0..20)
-            .map(|idx| EmbeddingInput::new(100 + idx, format!("first batch message {idx}")))
-            .collect();
-
-        let first_outcome = indexer
-            .run_backfill_batch(
-                &first,
-                temp.path(),
-                &mut manifest,
-                SemanticBackfillBatchPlan {
-                    tier: TierKind::Fast,
-                    db_fingerprint: db_fingerprint.to_string(),
-                    model_revision: "hash".to_string(),
-                    total_conversations: 2,
-                    conversations_in_batch: 1,
-                    last_offset: 1,
-                    cursor_exhausted: false,
-                },
-            )
-            .unwrap();
-        assert!(first_outcome.checkpoint_saved);
-
-        let second = vec![EmbeddingInput::new(200, "small final resume batch")];
-        let second_outcome = indexer
-            .run_backfill_batch(
-                &second,
-                temp.path(),
-                &mut manifest,
-                SemanticBackfillBatchPlan {
-                    tier: TierKind::Fast,
-                    db_fingerprint: db_fingerprint.to_string(),
-                    model_revision: "hash".to_string(),
-                    total_conversations: 2,
-                    conversations_in_batch: 1,
-                    last_offset: 2,
-                    cursor_exhausted: true,
-                },
-            )
-            .unwrap();
-
-        assert!(second_outcome.published);
-        let final_path = vector_index_path(temp.path(), indexer.embedder_id());
-        let mut final_wal_path = final_path.as_os_str().to_os_string();
-        final_wal_path.push(".wal");
-        assert!(!PathBuf::from(final_wal_path).exists());
-
-        let published_index = FsVectorIndex::open(&final_path).unwrap();
-        assert_eq!(published_index.record_count(), 21);
-        let artifact = manifest.fast_tier.as_ref().expect("published fast tier");
-        assert_eq!(artifact.doc_count, 21);
-        assert_eq!(artifact.conversation_count, 2);
-    }
-
-    #[test]
-    fn backfill_from_storage_fetches_canonical_batches_and_resumes() -> Result<()> {
-        let temp = tempdir().unwrap();
-        let db_path = temp.path().join("agent_search.db");
-        let storage = FrankenStorage::open(&db_path)?;
-        let agent_id = storage.ensure_agent(&Agent {
-            id: None,
-            slug: "codex".to_string(),
-            name: "Codex".to_string(),
-            version: None,
-            kind: AgentKind::Cli,
-        })?;
-        storage.insert_conversation_tree(
-            agent_id,
-            None,
-            &test_conversation("first", "first canonical semantic message"),
-        )?;
-        storage.insert_conversation_tree(
-            agent_id,
-            None,
-            &test_conversation("second", "second canonical semantic message"),
-        )?;
-
-        let mut manifest = SemanticManifest::default();
-        let indexer = SemanticIndexer::new("hash", None)?;
-
-        let first = indexer.run_backfill_from_storage(
-            &storage,
-            temp.path(),
-            &mut manifest,
-            SemanticBackfillStoragePlan {
-                tier: TierKind::Fast,
-                db_fingerprint: "canonical-db-fp".to_string(),
-                model_revision: "hash".to_string(),
-                max_conversations: 1,
-            },
-        )?;
-        assert!(!first.published);
-        assert!(first.checkpoint_saved);
-        assert_eq!(first.conversations_processed, 1);
-        assert_eq!(first.total_conversations, 2);
-        assert_eq!(first.embedded_docs, 1);
-        assert!(first.last_offset > 0);
-
-        let second = indexer.run_backfill_from_storage(
-            &storage,
-            temp.path(),
-            &mut manifest,
-            SemanticBackfillStoragePlan {
-                tier: TierKind::Fast,
-                db_fingerprint: "canonical-db-fp".to_string(),
-                model_revision: "hash".to_string(),
-                max_conversations: 1,
-            },
-        )?;
-        assert!(second.published);
-        assert!(!second.checkpoint_saved);
-        assert_eq!(second.conversations_processed, 2);
-        assert_eq!(second.embedded_docs, 1);
-        assert!(manifest.checkpoint.is_none());
-        assert_eq!(
-            manifest.fast_tier.as_ref().map(|record| record.doc_count),
-            Some(2)
-        );
-        Ok(())
-    }
-
-    #[test]
     fn canonical_embedding_batch_uses_conversation_packet_semantic_projection() -> Result<()> {
         let temp = tempdir().unwrap();
         let db_path = temp.path().join("agent_search.db");
@@ -3765,8 +2391,12 @@ mod tests {
         Ok(())
     }
 
+    /// The message-id floor, when paired with the conversation it was
+    /// captured from, still does its original job: resuming past
+    /// messages already embedded for THAT conversation.
     #[test]
-    fn canonical_embedding_batch_pushes_last_message_id_filter_into_selection() -> Result<()> {
+    fn canonical_embedding_batch_scoped_message_id_filter_applies_to_its_own_conversation()
+    -> Result<()> {
         let temp = tempdir().unwrap();
         let db_path = temp.path().join("agent_search.db");
         let storage = FrankenStorage::open(&db_path)?;
@@ -3780,26 +2410,78 @@ mod tests {
         storage.insert_conversation_tree(
             agent_id,
             None,
-            &test_conversation("before-watermark", "old semantic message"),
+            &test_conversation_with_messages(
+                "before-watermark",
+                vec![Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: None,
+                    created_at: Some(1_700_000_000_500),
+                    content: "old semantic message".to_string(),
+                    extra_json: json!({}),
+                    snippets: Vec::new(),
+                }],
+            ),
+        )?;
+        let watermark_conversation_id: i64 = storage.raw().query_row_map(
+            "SELECT id FROM conversations WHERE external_id = 'before-watermark'",
+            &[] as &[ParamValue],
+            |row| row.get_typed(0),
         )?;
         let watermark: i64 = storage.raw().query_row_map(
             "SELECT MAX(id) FROM messages",
             &[] as &[ParamValue],
             |row| row.get_typed(0),
         )?;
+        // A later batch that revisited the SAME conversation and staged
+        // a newer message onto it (idx 1) is the only realistic way
+        // `last_message_id` and `last_offset` end up pointing at the
+        // same conversation in production — model that directly rather
+        // than a second, unrelated conversation.
         storage.insert_conversation_tree(
             agent_id,
             None,
-            &test_conversation("after-watermark", "new semantic message"),
+            &test_conversation_with_messages(
+                "before-watermark",
+                vec![
+                    Message {
+                        id: None,
+                        idx: 0,
+                        role: MessageRole::User,
+                        author: None,
+                        created_at: Some(1_700_000_000_500),
+                        content: "old semantic message".to_string(),
+                        extra_json: json!({}),
+                        snippets: Vec::new(),
+                    },
+                    Message {
+                        id: None,
+                        idx: 1,
+                        role: MessageRole::Agent,
+                        author: None,
+                        created_at: Some(1_700_000_000_600),
+                        content: "new semantic message".to_string(),
+                        extra_json: json!({}),
+                        snippets: Vec::new(),
+                    },
+                ],
+            ),
         )?;
 
-        let batch = fetch_canonical_embedding_batch_inner(&storage, 0, 8, Some(watermark))?;
+        let batch = fetch_canonical_embedding_batch_inner(
+            &storage,
+            0,
+            8,
+            Some(watermark),
+            Some(watermark_conversation_id),
+        )?;
 
         assert_eq!(
             batch.conversations_in_batch, 1,
-            "last_message_id must be pushed into candidate selection so old conversations are not counted in the batch"
+            "the paired conversation's already-embedded message must not be re-selected"
         );
-        assert_eq!(batch.total_conversations, 2);
+        assert_eq!(batch.total_conversations, 1);
         anyhow::ensure!(
             batch.cursor_exhausted,
             "message-cursor selection should exhaust the remaining cursor"
@@ -3809,6 +2491,224 @@ mod tests {
         assert!(
             i64::try_from(batch.inputs[0].message_id).unwrap_or(i64::MAX) > watermark,
             "selected semantic input must be strictly newer than the checkpoint message id"
+        );
+        Ok(())
+    }
+
+    /// w1c-C5-B1 regression fixture: a message-id floor captured from
+    /// one long-lived conversation (repeatedly appended to across many
+    /// later ingest passes, so its message ids sprawl far past
+    /// conversations created after it) must NOT strand sibling
+    /// conversations whose own message ids happen to sit below that
+    /// floor. This reproduces the exact shape observed in staging:
+    /// conversation 224 spanned message ids 17501..1192932, and the
+    /// next checkpoint round silently dropped conversations 225..4611
+    /// because the old code applied that floor globally.
+    #[test]
+    fn canonical_embedding_batch_message_id_floor_does_not_strand_sibling_conversations()
+    -> Result<()> {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path)?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".to_string(),
+            name: "Codex".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+
+        // Conversation 1: created first (low conversation id), one
+        // early message (low message id). Uses
+        // `test_conversation_with_messages` (not `test_conversation`)
+        // so its source_id matches the later append below — canonical
+        // identity is keyed by (source_id, agent_id, external_id), and
+        // a mismatched source_id would spawn a second conversation
+        // instead of appending to this one.
+        storage.insert_conversation_tree(
+            agent_id,
+            None,
+            &test_conversation_with_messages(
+                "long-lived",
+                vec![Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: None,
+                    created_at: Some(1_700_000_000_500),
+                    content: "long-lived first message".to_string(),
+                    extra_json: json!({}),
+                    snippets: Vec::new(),
+                }],
+            ),
+        )?;
+        let long_lived_conversation_id: i64 = storage.raw().query_row_map(
+            "SELECT id FROM conversations WHERE external_id = 'long-lived'",
+            &[] as &[ParamValue],
+            |row| row.get_typed(0),
+        )?;
+
+        // Two ordinary sibling conversations created next, each with
+        // one message — moderate message ids, both below where the
+        // long-lived conversation's next message will land.
+        storage.insert_conversation_tree(
+            agent_id,
+            None,
+            &test_conversation("sibling-a", "sibling a message"),
+        )?;
+        storage.insert_conversation_tree(
+            agent_id,
+            None,
+            &test_conversation("sibling-b", "sibling b message"),
+        )?;
+
+        // The long-lived conversation gets revisited by a later ingest
+        // pass and appended to — its new message gets the highest
+        // message id in the whole corpus despite being conversation 1.
+        storage.insert_conversation_tree(
+            agent_id,
+            None,
+            &test_conversation_with_messages(
+                "long-lived",
+                vec![
+                    Message {
+                        id: None,
+                        idx: 0,
+                        role: MessageRole::User,
+                        author: None,
+                        created_at: Some(1_700_000_000_500),
+                        content: "long-lived first message".to_string(),
+                        extra_json: json!({}),
+                        snippets: Vec::new(),
+                    },
+                    Message {
+                        id: None,
+                        idx: 1,
+                        role: MessageRole::Agent,
+                        author: None,
+                        created_at: Some(1_900_000_000_600),
+                        content: "long-lived much later message".to_string(),
+                        extra_json: json!({}),
+                        snippets: Vec::new(),
+                    },
+                ],
+            ),
+        )?;
+        let long_lived_max_message_id: i64 = storage.raw().query_row_map(
+            "SELECT MAX(id) FROM messages",
+            &[] as &[ParamValue],
+            |row| row.get_typed(0),
+        )?;
+
+        // Round 1: process just the long-lived conversation (as the
+        // real backfill loop would with `--batch-conversations 1`),
+        // capturing the checkpoint pairing a caller would persist.
+        let round1 = fetch_canonical_embedding_batch_inner_with_caps(
+            &storage,
+            0,
+            1,
+            None,
+            None,
+            SemanticCheckpointCaps::unlimited(),
+        )?;
+        assert_eq!(round1.last_conversation_id, long_lived_conversation_id);
+        assert_eq!(
+            round1.raw_max_message_id,
+            Some(long_lived_max_message_id),
+            "batch must report the paired max message id it actually selected"
+        );
+        assert_eq!(
+            round1.raw_max_message_id_conversation_id,
+            Some(long_lived_conversation_id),
+            "the paired max message id must be attributed to the conversation it came from"
+        );
+
+        // Round 2: resume using round 1's checkpoint pairing. The two
+        // sibling conversations — never touched before, with message
+        // ids well below the floor — must still be selected in full.
+        let round2 = fetch_canonical_embedding_batch_inner_with_caps(
+            &storage,
+            round1.last_conversation_id,
+            8,
+            round1.raw_max_message_id,
+            round1.raw_max_message_id_conversation_id,
+            SemanticCheckpointCaps::unlimited(),
+        )?;
+
+        assert_eq!(
+            round2.conversations_in_batch, 2,
+            "both sibling conversations must survive resume; the long-lived conversation's \
+             message-id floor must not leak onto conversations it was never captured from"
+        );
+        assert_eq!(round2.inputs.len(), 2);
+        let sibling_contents: std::collections::BTreeSet<&str> = round2
+            .inputs
+            .iter()
+            .map(|input| input.content.as_str())
+            .collect();
+        assert!(sibling_contents.contains("sibling a message"));
+        assert!(sibling_contents.contains("sibling b message"));
+        anyhow::ensure!(
+            round2.cursor_exhausted,
+            "both siblings fitting under an unlimited cap should exhaust the cursor"
+        );
+        Ok(())
+    }
+
+    /// Old checkpoints (pre-w1c-C5-B1, or hand-edited manifests) carry
+    /// `last_message_id` without the new paired
+    /// `last_message_id_conversation_id`. Compatibility contract: an
+    /// unpaired message-id floor applies NO filtering at all, never
+    /// falling back to the old global-floor behavior — a few messages
+    /// getting harmlessly re-embedded (memoized/idempotent) is the
+    /// correct trade against silently stranding whole conversations.
+    #[test]
+    fn canonical_embedding_batch_unpaired_message_id_floor_applies_no_filter() -> Result<()> {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path)?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".to_string(),
+            name: "Codex".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        storage.insert_conversation_tree(
+            agent_id,
+            None,
+            &test_conversation("unpaired-a", "unpaired a message"),
+        )?;
+        storage.insert_conversation_tree(
+            agent_id,
+            None,
+            &test_conversation("unpaired-b", "unpaired b message"),
+        )?;
+        let high_watermark: i64 = storage.raw().query_row_map(
+            "SELECT MAX(id) FROM messages",
+            &[] as &[ParamValue],
+            |row| row.get_typed(0),
+        )?;
+
+        // A floor at (or above) every existing message id, but with no
+        // paired conversation — simulating a pre-fix checkpoint.
+        let batch = fetch_canonical_embedding_batch_inner(
+            &storage,
+            0,
+            8,
+            Some(high_watermark),
+            None,
+        )?;
+
+        assert_eq!(
+            batch.conversations_in_batch, 2,
+            "an unpaired message-id floor must not exclude any conversation"
+        );
+        assert_eq!(
+            batch.inputs.len(),
+            2,
+            "an unpaired message-id floor must not filter out any message, \
+             even ones at or below the floor value"
         );
         Ok(())
     }
@@ -3836,7 +2736,7 @@ mod tests {
             &test_conversation("limit-second", "second limit semantic message"),
         )?;
 
-        let first = fetch_canonical_embedding_batch_inner(&storage, 0, 1, None)?;
+        let first = fetch_canonical_embedding_batch_inner(&storage, 0, 1, None, None)?;
         anyhow::ensure!(
             first.conversations_in_batch == 1,
             "wanted first batch to select 1 conversation, got {}",
@@ -3847,8 +2747,13 @@ mod tests {
             "over-fetching one candidate should prove another conversation remains"
         );
 
-        let second =
-            fetch_canonical_embedding_batch_inner(&storage, first.last_conversation_id, 1, None)?;
+        let second = fetch_canonical_embedding_batch_inner(
+            &storage,
+            first.last_conversation_id,
+            1,
+            None,
+            None,
+        )?;
         anyhow::ensure!(
             second.conversations_in_batch == 1,
             "wanted second batch to select 1 conversation, got {}",
@@ -3914,6 +2819,7 @@ mod tests {
             &storage,
             0,
             8,
+            None,
             None,
             SemanticCheckpointCaps {
                 max_messages: 3,
@@ -4338,7 +3244,7 @@ mod tests {
         )?;
 
         let since_batch = packet_embedding_inputs_from_storage_since(&storage, watermark)?;
-        let conversation_ids: Vec<i64> = storage.raw().query_map_collect(
+        let conversation_ids: Vec<i64> = storage.raw().query_all_map(
             "SELECT DISTINCT conversation_id
              FROM messages
              WHERE id > ?1
@@ -4348,7 +3254,7 @@ mod tests {
         )?;
         let selected_message_ids: HashSet<i64> = storage
             .raw()
-            .query_map_collect(
+            .query_all_map(
                 "SELECT id
                  FROM messages
                  WHERE id > ?1
@@ -4384,8 +3290,6 @@ mod tests {
     fn semantic_watchdog_and_checkpoint_caps_have_derived_defaults() {
         let _warn = EnvVarGuard::remove("CASS_SEMANTIC_EMBED_BATCH_WARN_AFTER_MS");
         let _fail = EnvVarGuard::remove("CASS_SEMANTIC_EMBED_BATCH_FAIL_AFTER_MS");
-        let _messages = EnvVarGuard::remove("CASS_SEMANTIC_MAX_MESSAGES_PER_CHECKPOINT");
-        let _bytes = EnvVarGuard::remove("CASS_SEMANTIC_MAX_BYTES_PER_CHECKPOINT");
 
         assert_eq!(
             resolved_semantic_embed_batch_warn_after_ms(),
@@ -4394,13 +3298,6 @@ mod tests {
         assert_eq!(
             resolved_semantic_embed_batch_fail_after_ms(),
             DEFAULT_SEMANTIC_EMBED_BATCH_FAIL_AFTER_MS
-        );
-        assert_eq!(
-            SemanticCheckpointCaps::from_env(),
-            SemanticCheckpointCaps {
-                max_messages: DEFAULT_SEMANTIC_MAX_MESSAGES_PER_CHECKPOINT,
-                max_bytes: DEFAULT_SEMANTIC_MAX_BYTES_PER_CHECKPOINT,
-            }
         );
     }
 
@@ -4545,7 +3442,7 @@ mod tests {
         // would normally pair with packets), then convert those rows
         // into ConversationPackets via canonical replay and feed them
         // through `semantic_inputs_from_packets`.
-        let conversation_ids: Vec<i64> = storage.raw().query_map_collect(
+        let conversation_ids: Vec<i64> = storage.raw().query_all_map(
             "SELECT DISTINCT m.conversation_id
              FROM messages m
              JOIN conversations c ON c.id = m.conversation_id

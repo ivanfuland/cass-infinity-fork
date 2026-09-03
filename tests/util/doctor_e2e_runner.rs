@@ -4,9 +4,9 @@ use super::cass_bin;
 use super::doctor_fixture::{
     DoctorFixtureFactory, DoctorFixtureScenario, default_expected_artifact_keys,
 };
+use coding_agent_search::storage::api::Profile;
 use coding_agent_search::storage::sqlite::SqliteStorage;
-use frankensqlite::Connection as FrankenConnection;
-use frankensqlite::compat::ConnectionExt;
+use coding_agent_search::storage::testing::open_test_writer;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -2201,12 +2201,26 @@ fn doctor_e2e_ignored_diagnostic_mutation_diffs(
 }
 
 fn doctor_e2e_ignores_diagnostic_mutation_diff(spec: &DoctorE2eScenarioSpec, diff: &str) -> bool {
-    if spec.command_mode != DoctorE2eCommandMode::SupportBundleAfterFailure {
-        return false;
-    }
     let Some((_, path)) = diff.rsplit_once(':') else {
         return false;
     };
+    // W2-6 exec39 (control-plane ruling, 波1 sidecar写集豁免判例
+    // exec13/14-era precedent applied): opening the archive DB in WAL
+    // mode materializes `-wal`/`-shm` sidecar files as vanilla SQLite
+    // behavior, not a doctor mutation -- a read-only `cass doctor check`
+    // has no way to avoid this. Excluded unconditionally (not gated to
+    // any one command_mode) because the underlying cause is inherent to
+    // opening a WAL-journal SQLite database at all, not specific to any
+    // scenario or repair mode. Everything else -- most importantly the
+    // archive DB's own main-file bytes -- remains strictly compared;
+    // this exclusion only ever suppresses the two known-benign sidecar
+    // filenames, never the database file itself.
+    if path == "data/agent_search.db-wal" || path == "data/agent_search.db-shm" {
+        return true;
+    }
+    if spec.command_mode != DoctorE2eCommandMode::SupportBundleAfterFailure {
+        return false;
+    }
     path == "data/doctor"
         || path == "data/doctor/support-bundles"
         || path.starts_with("data/doctor/support-bundles/")
@@ -2395,12 +2409,18 @@ fn build_post_repair_probes(
 ) -> Value {
     let data_dir = fixture.data_dir();
     let db_open_probe = read_fixture_db_row_counts(data_dir, redactor);
-    let index_path = coding_agent_search::search::tantivy::expected_index_dir(data_dir);
+    // W2-6 Task丙②: the Tantivy-backed on-disk index directory no longer
+    // exists; the lexical backend is `fts_lex` (SQLite FTS5, same-transaction
+    // with the canonical tables), keyed off `db_path` instead of a separate
+    // index directory. `lexical_index_health` is the DB-domain successor to
+    // the deleted `search::tantivy` readiness probes below.
+    let db_path = data_dir.join("agent_search.db");
     let lexical_searchable =
-        coding_agent_search::search::tantivy::searchable_index_exists(&index_path);
+        coding_agent_search::search::lexical_index_health::searchable_index_exists(&db_path);
     let lexical_contract = if lexical_searchable {
-        match coding_agent_search::search::tantivy::validate_searchable_index_contract(&index_path)
-        {
+        match coding_agent_search::search::lexical_index_health::validate_searchable_index_contract_full(
+            &db_path,
+        ) {
             Ok(()) => json!({
                 "status": "pass",
                 "error": Value::Null,
@@ -2487,7 +2507,10 @@ fn build_post_repair_probes(
         "data_dir": redactor.redact(&data_dir.display().to_string()),
         "db_open_probe": db_open_probe,
         "search_readiness": {
-            "lexical_index_path": redactor.redact(&index_path.display().to_string()),
+            // W2-6 Task丙②: field name kept for JSON shape stability; now
+            // reports db_path (the sqlite-fts5 source of truth) instead of
+            // the retired Tantivy index directory path.
+            "lexical_index_path": redactor.redact(&db_path.display().to_string()),
             "lexical_searchable": lexical_searchable,
             "lexical_contract": lexical_contract,
             "derived_semantic_assets": derived_semantic_assets,
@@ -3142,20 +3165,22 @@ fn write_doctor_e2e_sqlite_marker_db(path: &Path, marker: &str) -> Result<(), St
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| format!("create sqlite parent: {err}"))?;
     }
-    let conn = FrankenConnection::open(path.to_string_lossy().into_owned())
+    let mut guard = open_test_writer(path, Profile::Production)
         .map_err(|err| format!("create doctor backup fixture sqlite db: {err}"))?;
-    conn.execute_compat(
+    let conn = guard.storage().raw();
+    conn.execute(
         "CREATE TABLE IF NOT EXISTS restore_probe(marker TEXT NOT NULL)",
-        frankensqlite::params![],
+        &[],
     )
     .map_err(|err| format!("create doctor backup fixture marker table: {err}"))?;
-    conn.execute_compat(
+    conn.execute(
         "INSERT INTO restore_probe(marker) VALUES (?1)",
-        frankensqlite::params![marker],
+        &[coding_agent_search::storage::api::IntoValue::into_value(marker)],
     )
     .map_err(|err| format!("write doctor backup fixture sqlite marker: {err}"))?;
-    let _ = conn.query("PRAGMA wal_checkpoint(TRUNCATE);");
-    drop(conn);
+    let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+    guard.mark_committed();
+    drop(guard);
     Ok(())
 }
 
@@ -3606,7 +3631,7 @@ pub fn default_doctor_e2e_scenarios() -> Vec<DoctorE2eScenarioSpec> {
         .require_json_pointer("/operation_state/mutating_doctor_allowed"),
         DoctorE2eScenarioSpec::new(
             "derived-index-corrupt-read-only",
-            DoctorFixtureScenario::IndexCorrupt,
+            DoctorFixtureScenario::DerivedLexicalDesyncBlindSpot,
             ["quick", "derived", "read-only"],
         )
         .require_json_pointer("/risk_level")
@@ -3715,7 +3740,7 @@ pub fn default_doctor_e2e_scenarios() -> Vec<DoctorE2eScenarioSpec> {
         .require_json_pointer("/checks"),
         DoctorE2eScenarioSpec::new(
             "safe-auto-stale-derived-metadata-rebuild",
-            DoctorFixtureScenario::IndexCorrupt,
+            DoctorFixtureScenario::DerivedLexicalDesyncBlindSpot,
             ["safe-auto", "derived", "metadata", "mutation"],
         )
         .allow_mutation(true)
@@ -4113,7 +4138,7 @@ fn doctor_e2e_fixture_scenario_name(scenario: DoctorFixtureScenario) -> &'static
         DoctorFixtureScenario::DbCorrupt => "db-corrupt",
         DoctorFixtureScenario::DbCorruptWithStaleIndex => "db-corrupt-with-stale-index",
         DoctorFixtureScenario::CoverageReducingCandidate => "coverage-reducing-candidate",
-        DoctorFixtureScenario::IndexCorrupt => "index-corrupt",
+        DoctorFixtureScenario::DerivedLexicalDesyncBlindSpot => "derived-lexical-desync-blind-spot",
         DoctorFixtureScenario::StaleLock => "stale-lock",
         DoctorFixtureScenario::ActiveLock => "active-lock",
         DoctorFixtureScenario::InterruptedRepair => "interrupted-repair",

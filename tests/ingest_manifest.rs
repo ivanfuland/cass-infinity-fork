@@ -1,0 +1,971 @@
+//! C1 (plan v6 Stage C, Task C1): `cass ingest manifest` candidate-inventory
+//! contract. Mini 3-session fixture: 1 eligible, 1 excluded (empty session,
+//! d19: exclude_reason="connector_filtered"), 1 duplicate source across two
+//! scan roots that must collapse into a single manifest entry.
+
+use assert_cmd::Command;
+use blake3::Hasher;
+use serde_json::Value;
+use std::fs;
+use std::path::Path;
+use tempfile::TempDir;
+
+/// Independent re-implementation of the plan-specified digest formula
+/// (R1-S14/NG4 + R3-N5): blake3 over each message's raw UTF-8 content,
+/// each one length-prefixed (u32 LE) to prevent concatenation ambiguity.
+/// Computed here from scratch (not by calling production code) so the test
+/// proves the contract, not just mirrors the implementation.
+fn expected_digest(contents: &[&str]) -> String {
+    let mut hasher = Hasher::new();
+    for content in contents {
+        let bytes = content.as_bytes();
+        hasher.update(&(bytes.len() as u32).to_le_bytes());
+        hasher.update(bytes);
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn write_session(path: &Path, content: &str) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, content).unwrap();
+}
+
+fn base_cmd() -> Command {
+    Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+}
+
+#[test]
+fn manifest_reports_eligible_excluded_and_deduped_sessions() {
+    let tmp = TempDir::new().unwrap();
+    let root_a = tmp.path().join("root-a");
+    let root_b = tmp.path().join("root-b");
+    fs::create_dir_all(&root_a).unwrap();
+    fs::create_dir_all(&root_b).unwrap();
+
+    // 1. Eligible session: two plain-string messages, no filtering applies.
+    write_session(
+        &root_a.join("eligible.jsonl"),
+        concat!(
+            r#"{"type":"user","cwd":"/workspace/proj","sessionId":"sess-eligible","message":{"role":"user","content":"Hello from eligible session"},"timestamp":"2025-01-01T00:00:00.000Z"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"role":"assistant","content":"Hi there!"},"timestamp":"2025-01-01T00:00:01.000Z"}"#,
+            "\n",
+        ),
+    );
+
+    // 2. Empty session: every line has blank/whitespace-only content, so the
+    // connector's own `messages.is_empty()` guard drops the whole file
+    // (zero conversations emitted) while discover_source_files() still lists
+    // it as a candidate file -> discovered-minus-scanned diff -> connector_filtered.
+    write_session(
+        &root_a.join("empty.jsonl"),
+        concat!(
+            r#"{"type":"user","message":{"role":"user","content":""}}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":"   "}}"#,
+            "\n",
+        ),
+    );
+
+    // 3. Duplicate source: byte-identical session file mirrored under two
+    // different --scan-root roots (same relative filename under each root
+    // -> same connector-derived external_id -> same identity_key).
+    let dup_content = concat!(
+        r#"{"type":"user","cwd":"/workspace/dup","sessionId":"sess-dup","message":{"role":"user","content":"Duplicate content across mirrors"},"timestamp":"2025-01-02T00:00:00.000Z"}"#,
+        "\n",
+    );
+    write_session(&root_a.join("dup.jsonl"), dup_content);
+    write_session(&root_b.join("dup.jsonl"), dup_content);
+
+    let mirror_dir = tmp.path().join("mirror");
+    fs::create_dir_all(&mirror_dir).unwrap();
+    let out_path = tmp.path().join("manifest.jsonl");
+
+    let mut cmd = base_cmd();
+    cmd.args([
+        "ingest",
+        "manifest",
+        "--scan-root",
+        root_a.to_str().unwrap(),
+        "--scan-root",
+        root_b.to_str().unwrap(),
+        "--mirror",
+        mirror_dir.to_str().unwrap(),
+        "--out",
+        out_path.to_str().unwrap(),
+    ]);
+    cmd.assert().success();
+
+    let manifest_text = fs::read_to_string(&out_path)
+        .unwrap_or_else(|e| panic!("manifest output file missing at {out_path:?}: {e}"));
+    let mut all_lines: Vec<Value> = manifest_text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad manifest line {l:?}: {e}")))
+        .collect();
+    assert!(!all_lines.is_empty(), "manifest is empty: {manifest_text}");
+
+    // First line is the root-set attestation header (plan v6 Stage C Task C2:
+    // "manifest 头部记录生成时的扫描根全集摘要" -- reconcile's --expected-roots
+    // check needs this). Distinguished from candidate entries by the
+    // scan_roots key, which no candidate line carries.
+    let header = all_lines.remove(0);
+    let mut header_roots: Vec<String> = header["scan_roots"]
+        .as_array()
+        .unwrap_or_else(|| panic!("manifest header missing scan_roots array: {header}"))
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    header_roots.sort();
+    let mut expected_roots = vec![
+        root_a.to_str().unwrap().to_string(),
+        root_b.to_str().unwrap().to_string(),
+    ];
+    expected_roots.sort();
+    assert_eq!(
+        header_roots, expected_roots,
+        "manifest header scan_roots must record the exact --scan-root set"
+    );
+
+    let lines = all_lines;
+    assert_eq!(
+        lines.len(),
+        3,
+        "expected 3 manifest entries (eligible + excluded + deduped dup), got {}: {manifest_text}",
+        lines.len()
+    );
+
+    let find_by_source = |suffix: &str| -> &Value {
+        lines
+            .iter()
+            .find(|entry| {
+                entry["sources"]
+                    .as_array()
+                    .expect("sources must be an array")
+                    .iter()
+                    .any(|s| s.as_str().unwrap().ends_with(suffix))
+            })
+            .unwrap_or_else(|| panic!("no manifest entry with a source ending in {suffix}: {manifest_text}"))
+    };
+
+    let eligible_entry = find_by_source("eligible.jsonl");
+    assert_eq!(eligible_entry["eligible"], true);
+    assert_eq!(eligible_entry["exclude_reason"], Value::Null);
+    assert_eq!(eligible_entry["message_count"], 2);
+    assert_eq!(eligible_entry["sources"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        eligible_entry["content_digest"].as_str().unwrap(),
+        expected_digest(&["Hello from eligible session", "Hi there!"]),
+        "eligible entry: {eligible_entry}"
+    );
+
+    let empty_entry = find_by_source("empty.jsonl");
+    assert_eq!(empty_entry["eligible"], false);
+    assert_eq!(empty_entry["exclude_reason"], "connector_filtered");
+    assert_eq!(empty_entry["message_count"], 0);
+    assert_eq!(
+        empty_entry["content_digest"].as_str().unwrap(),
+        expected_digest(&[]),
+        "excluded entry: {empty_entry}"
+    );
+
+    let dup_entry = find_by_source("dup.jsonl");
+    assert_eq!(dup_entry["eligible"], true);
+    assert_eq!(dup_entry["exclude_reason"], Value::Null);
+    assert_eq!(dup_entry["message_count"], 1);
+    let sources: Vec<String> = dup_entry["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        sources.len(),
+        2,
+        "duplicate session mirrored across two scan roots must collapse into one entry with two sources: {sources:?}"
+    );
+    assert!(sources.iter().any(|s| s.contains("root-a")));
+    assert!(sources.iter().any(|s| s.contains("root-b")));
+    assert_eq!(
+        dup_entry["content_digest"].as_str().unwrap(),
+        expected_digest(&["Duplicate content across mirrors"]),
+        "dup entry: {dup_entry}"
+    );
+}
+
+/// Subagent transcripts (Claude Code's `<session>/subagents/agent-*.jsonl`)
+/// are content-parseable and eligible-by-default (d20: production `cass
+/// index` ingests them unless the operator opts in to
+/// `CASS_SKIP_SUBAGENTS`, so the manifest's default classification must
+/// match that live behavior -- treating them as structurally excluded
+/// unconditionally was the modeling error). This must hold independent of
+/// whatever `CASS_SKIP_SUBAGENTS` happens to be set to in the operator's
+/// environment: the manifest's own `--skip-subagents` flag is the only
+/// thing that flips it, mirrored below in
+/// `manifest_subagent_excluded_with_skip_flag_set`.
+fn write_subagent_fixture(root: &Path) {
+    write_session(
+        &root.join("session-a/session-a.jsonl"),
+        concat!(
+            r#"{"type":"user","message":{"role":"user","content":"Top-level session"},"timestamp":"2025-01-03T00:00:00.000Z"}"#,
+            "\n",
+        ),
+    );
+    write_session(
+        &root.join("session-a/subagents/agent-1.jsonl"),
+        concat!(
+            r#"{"type":"user","message":{"role":"user","content":"Subagent scratchpad"},"timestamp":"2025-01-03T00:00:01.000Z"}"#,
+            "\n",
+        ),
+    );
+}
+
+#[test]
+fn manifest_subagent_eligible_by_default() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("root");
+    write_subagent_fixture(&root);
+
+    let mirror_dir = tmp.path().join("mirror");
+    fs::create_dir_all(&mirror_dir).unwrap();
+    let out_path = tmp.path().join("manifest.jsonl");
+
+    let mut cmd = base_cmd();
+    cmd.args([
+        "ingest",
+        "manifest",
+        "--scan-root",
+        root.to_str().unwrap(),
+        "--mirror",
+        mirror_dir.to_str().unwrap(),
+        "--out",
+        out_path.to_str().unwrap(),
+    ]);
+    // Deliberately unset and no --skip-subagents flag: default classification
+    // must not depend on the operator's live-index env toggle.
+    cmd.env_remove("CASS_SKIP_SUBAGENTS");
+    cmd.assert().success();
+
+    let manifest_text = fs::read_to_string(&out_path).unwrap();
+    let mut all_lines: Vec<Value> = manifest_text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad manifest line {l:?}: {e}")))
+        .collect();
+    assert!(!all_lines.is_empty(), "manifest is empty: {manifest_text}");
+    let header = all_lines.remove(0);
+    assert_eq!(
+        header["scan_roots"].as_array().unwrap(),
+        &vec![Value::String(root.to_str().unwrap().to_string())],
+        "manifest header scan_roots must record the single --scan-root given: {header}"
+    );
+    assert_eq!(
+        header["skip_subagents"], false,
+        "manifest header must record the effective --skip-subagents value (default false): {header}"
+    );
+    let lines = all_lines;
+    assert_eq!(
+        lines.len(),
+        2,
+        "expected 2 manifest entries (top-level + subagent, both eligible by default), got {}: {manifest_text}",
+        lines.len()
+    );
+
+    let top_level = lines
+        .iter()
+        .find(|entry| {
+            entry["sources"].as_array().unwrap().iter().any(|s| {
+                s.as_str().unwrap().ends_with("session-a.jsonl")
+                    && !s.as_str().unwrap().contains("subagents")
+            })
+        })
+        .unwrap_or_else(|| panic!("no top-level manifest entry: {manifest_text}"));
+    assert_eq!(top_level["eligible"], true);
+    assert_eq!(top_level["exclude_reason"], Value::Null);
+    assert_eq!(top_level["message_count"], 1);
+    assert_eq!(
+        top_level["content_digest"].as_str().unwrap(),
+        expected_digest(&["Top-level session"]),
+        "top-level entry: {top_level}"
+    );
+
+    // The subagent transcript must be treated exactly like any other
+    // eligible session by default: real identity_key, real message_count,
+    // real content_digest -- not a half-flip that only changed the
+    // `eligible` bit while leaving the excluded-branch's placeholder fields
+    // (message_count=0, empty-message digest) in place.
+    let subagent_entry = lines
+        .iter()
+        .find(|entry| {
+            entry["sources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s.as_str().unwrap().contains("subagents"))
+        })
+        .unwrap_or_else(|| panic!("no subagent manifest entry: {manifest_text}"));
+    assert_eq!(subagent_entry["eligible"], true);
+    assert_eq!(subagent_entry["exclude_reason"], Value::Null);
+    assert_eq!(subagent_entry["message_count"], 1);
+    assert_eq!(
+        subagent_entry["content_digest"].as_str().unwrap(),
+        expected_digest(&["Subagent scratchpad"]),
+        "subagent entry: {subagent_entry}"
+    );
+    let identity_key = subagent_entry["identity_key"].as_str().unwrap();
+    assert!(
+        !identity_key.is_empty(),
+        "subagent entry must carry a real identity_key like any other eligible session: {subagent_entry}"
+    );
+}
+
+#[test]
+fn manifest_subagent_excluded_with_skip_flag_set() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("root");
+    write_subagent_fixture(&root);
+
+    let mirror_dir = tmp.path().join("mirror");
+    fs::create_dir_all(&mirror_dir).unwrap();
+    let out_path = tmp.path().join("manifest.jsonl");
+
+    let mut cmd = base_cmd();
+    cmd.args([
+        "ingest",
+        "manifest",
+        "--scan-root",
+        root.to_str().unwrap(),
+        "--mirror",
+        mirror_dir.to_str().unwrap(),
+        "--out",
+        out_path.to_str().unwrap(),
+        "--skip-subagents",
+    ]);
+    cmd.assert().success();
+
+    let manifest_text = fs::read_to_string(&out_path).unwrap();
+    let mut all_lines: Vec<Value> = manifest_text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad manifest line {l:?}: {e}")))
+        .collect();
+    assert!(!all_lines.is_empty(), "manifest is empty: {manifest_text}");
+    let header = all_lines.remove(0);
+    assert_eq!(
+        header["skip_subagents"], true,
+        "manifest header must record --skip-subagents=true when the flag is passed: {header}"
+    );
+    let lines = all_lines;
+    assert_eq!(
+        lines.len(),
+        2,
+        "expected 2 manifest entries (top-level eligible + subagent excluded), got {}: {manifest_text}",
+        lines.len()
+    );
+
+    let top_level = lines
+        .iter()
+        .find(|entry| {
+            entry["sources"].as_array().unwrap().iter().any(|s| {
+                s.as_str().unwrap().ends_with("session-a.jsonl")
+                    && !s.as_str().unwrap().contains("subagents")
+            })
+        })
+        .unwrap_or_else(|| panic!("no top-level manifest entry: {manifest_text}"));
+    assert_eq!(
+        top_level["eligible"], true,
+        "--skip-subagents must not affect the non-subagent entry: {top_level}"
+    );
+    assert_eq!(top_level["message_count"], 1);
+
+    let subagent_entry = lines
+        .iter()
+        .find(|entry| {
+            entry["sources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s.as_str().unwrap().contains("subagents"))
+        })
+        .unwrap_or_else(|| panic!("no subagent manifest entry: {manifest_text}"));
+    assert_eq!(subagent_entry["eligible"], false);
+    assert_eq!(subagent_entry["exclude_reason"], "subagent");
+    assert_eq!(subagent_entry["message_count"], 0);
+    assert_eq!(
+        subagent_entry["content_digest"].as_str().unwrap(),
+        expected_digest(&[]),
+        "excluded subagent entry: {subagent_entry}"
+    );
+}
+
+/// `identity_key`'s agent-slug component must be the connector's own
+/// per-conversation `NormalizedConversation.agent_slug` (the exact value
+/// `src/indexer/mod.rs` uses when it writes the `agents.slug` DB column --
+/// `let agent_slug = conv.agent_slug.clone();`), not the `get_connector_factories()`
+/// registry key used only to dispatch to the connector. The claude_code
+/// connector sets `agent_slug: "claude_code"` on every conversation it
+/// emits, while its registry key is `"claude"` -- a real-world reconcile run
+/// (2026-08-28, C3 Step 4) found this exact divergence caused ~100% of
+/// claude-connector sessions to show up as both `missing` (manifest side,
+/// keyed `claude|...`) and `unexpected` (DB side, keyed `claude_code|...`).
+#[test]
+fn manifest_identity_key_canonicalizes_claude_external_id_like_the_indexer_does() {
+    // `src/indexer/mod.rs::canonicalize_claude_external_id` (gh #302) exists
+    // precisely because the claude connector's raw `external_id` differs by
+    // a leading `projects/` segment depending on which scan-root form
+    // produced it: `detect_installed_agents` reports `~/.claude` (root
+    // basename `.claude`), which -- because `--scan-root` is used literally,
+    // not root-relative -- yields a `projects/`-prefixed external_id, while
+    // C3's earlier synthetic fixtures (a flat, non-`.claude`-named root)
+    // happened to already land on the canonical bare form and never
+    // exercised this path. The indexer strips the prefix before writing the
+    // DB row; a real reconcile run (2026-08-28, C3 Step 4 second pass)
+    // found the manifest side still emitting the prefixed form for content
+    // scanned via a real `~/.claude`-shaped root, so every such session's
+    // identity_key never matched the DB's recomputed one despite the
+    // agent_slug fix above.
+    let tmp = TempDir::new().unwrap();
+    let claude_home = tmp.path().join(".claude");
+    write_session(
+        &claude_home.join("projects/-workspace-proj/sess-prefixed.jsonl"),
+        concat!(
+            r#"{"type":"user","cwd":"/workspace/proj","sessionId":"sess-prefixed","message":{"role":"user","content":"hi"},"timestamp":"2025-01-01T00:00:00.000Z"}"#,
+            "\n",
+        ),
+    );
+
+    let mirror_dir = tmp.path().join("mirror");
+    fs::create_dir_all(&mirror_dir).unwrap();
+    let out_path = tmp.path().join("manifest.jsonl");
+
+    let mut cmd = base_cmd();
+    cmd.args([
+        "ingest",
+        "manifest",
+        "--scan-root",
+        claude_home.to_str().unwrap(),
+        "--mirror",
+        mirror_dir.to_str().unwrap(),
+        "--out",
+        out_path.to_str().unwrap(),
+    ]);
+    cmd.assert().success();
+
+    let manifest_text = fs::read_to_string(&out_path).unwrap();
+    let mut all_lines: Vec<Value> = manifest_text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad manifest line {l:?}: {e}")))
+        .collect();
+    all_lines.remove(0); // header
+    assert_eq!(all_lines.len(), 1, "expected 1 manifest entry: {manifest_text}");
+
+    let identity_key = all_lines[0]["identity_key"].as_str().unwrap();
+    assert!(
+        !identity_key.contains("|projects/") && !identity_key.contains("|projects\\"),
+        "identity_key must canonicalize away the leading `projects/` segment \
+         from a `~/.claude`-rooted scan the same way \
+         indexer::canonicalize_claude_external_id does before the DB write, \
+         so reconcile's DB-side recomputation (which reads the already-\
+         canonicalized external_id column) can match it: got {identity_key:?}"
+    );
+}
+
+#[test]
+fn manifest_identity_key_uses_conversations_own_agent_slug_not_registry_key() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("root");
+
+    write_session(
+        &root.join("session.jsonl"),
+        concat!(
+            r#"{"type":"user","cwd":"/workspace/proj","sessionId":"sess-claude","message":{"role":"user","content":"hi"},"timestamp":"2025-01-01T00:00:00.000Z"}"#,
+            "\n",
+        ),
+    );
+
+    let mirror_dir = tmp.path().join("mirror");
+    fs::create_dir_all(&mirror_dir).unwrap();
+    let out_path = tmp.path().join("manifest.jsonl");
+
+    let mut cmd = base_cmd();
+    cmd.args([
+        "ingest",
+        "manifest",
+        "--scan-root",
+        root.to_str().unwrap(),
+        "--mirror",
+        mirror_dir.to_str().unwrap(),
+        "--out",
+        out_path.to_str().unwrap(),
+    ]);
+    cmd.assert().success();
+
+    let manifest_text = fs::read_to_string(&out_path).unwrap();
+    let mut all_lines: Vec<Value> = manifest_text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad manifest line {l:?}: {e}")))
+        .collect();
+    all_lines.remove(0); // header
+    assert_eq!(all_lines.len(), 1, "expected 1 manifest entry: {manifest_text}");
+
+    let entry = &all_lines[0];
+    let identity_key = entry["identity_key"].as_str().unwrap();
+    assert!(
+        identity_key.starts_with("claude_code|"),
+        "identity_key must use the conversation's own agent_slug (\"claude_code\", matching \
+         the agents.slug DB column the indexer writes), not the connector registry key \
+         (\"claude\"): got {identity_key:?}"
+    );
+}
+
+/// OpenClaw sessions are attributed to a per-sub-agent identity
+/// (`openclaw/<name>`, computed inside the connector itself from the
+/// `<root>/.openclaw/agents/<name>/sessions/` directory shape) rather than a
+/// flat `"openclaw"` slug -- this is a real 1-to-N split the indexer's DB
+/// write path (`conv.agent_slug`) already respects. The manifest's
+/// identity_key must follow the same per-sub-agent attribution, or every
+/// OpenClaw session in the corpus mismatches reconcile the same way the
+/// claude_code case does.
+#[test]
+fn manifest_identity_key_attributes_openclaw_sessions_to_their_subagent() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("root");
+    let wood_sessions = root.join(".openclaw/agents/wood/sessions");
+    fs::create_dir_all(&wood_sessions).unwrap();
+
+    write_session(
+        &wood_sessions.join("s1.jsonl"),
+        concat!(
+            r#"{"type":"session","id":"s1","timestamp":"2026-02-01T16:00:00.000Z","cwd":"/tmp/wood"}"#,
+            "\n",
+            r#"{"type":"message","id":"m1","timestamp":"2026-02-01T16:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"hello wood"}]}}"#,
+            "\n",
+        ),
+    );
+
+    let mirror_dir = tmp.path().join("mirror");
+    fs::create_dir_all(&mirror_dir).unwrap();
+    let out_path = tmp.path().join("manifest.jsonl");
+
+    let mut cmd = base_cmd();
+    cmd.args([
+        "ingest",
+        "manifest",
+        "--scan-root",
+        root.to_str().unwrap(),
+        "--mirror",
+        mirror_dir.to_str().unwrap(),
+        "--out",
+        out_path.to_str().unwrap(),
+    ]);
+    cmd.assert().success();
+
+    let manifest_text = fs::read_to_string(&out_path).unwrap();
+    let mut all_lines: Vec<Value> = manifest_text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad manifest line {l:?}: {e}")))
+        .collect();
+    all_lines.remove(0); // header
+
+    // The fixture's generic JSON-lines shape also matches the claude_code
+    // connector's own (extension-based, not directory-structure-based) file
+    // discovery, so it may produce an unrelated extra candidate entry for
+    // the same file under a different connector -- find the OpenClaw entry
+    // specifically rather than assuming there is exactly one entry total.
+    let openclaw_entries: Vec<&Value> = all_lines
+        .iter()
+        .filter(|entry| {
+            entry["identity_key"]
+                .as_str()
+                .is_some_and(|k| k.starts_with("openclaw"))
+        })
+        .collect();
+    assert_eq!(
+        openclaw_entries.len(),
+        1,
+        "expected exactly 1 openclaw-attributed manifest entry: {manifest_text}"
+    );
+
+    let identity_key = openclaw_entries[0]["identity_key"].as_str().unwrap();
+    assert!(
+        identity_key.starts_with("openclaw/wood|"),
+        "identity_key must attribute this session to its OpenClaw sub-agent \
+         (\"openclaw/wood\", matching the agents.slug DB column the indexer writes \
+         via conv.agent_slug), not the flat connector registry key (\"openclaw\"): \
+         got {identity_key:?}"
+    );
+}
+
+/// d21: a `--scan-root <slug>:<path>` root must be fed only to the
+/// connector registered under that slug -- not broadcast to every
+/// connector the way an unscoped root still is (back-compat). This is the
+/// real over-discovery bug a reconcile run traced to ~2700 manifest rows:
+/// giving connectors a shared broad root let generic extension-based
+/// connectors (claude_code, codex) recurse into another connector's own
+/// nested session directories. Reuses the OpenClaw sub-agent fixture from
+/// `manifest_identity_key_attributes_openclaw_sessions_to_their_subagent`
+/// above, whose own comment already documents that this exact generic
+/// JSON-lines shape gets independently discovered by the claude_code
+/// connector's extension-based matching when the root is broadcast --
+/// scoping the root to `openclaw:` must suppress that cross-connector hit
+/// entirely, not just leave it for the test to filter around.
+#[test]
+fn manifest_scan_root_dispatch_does_not_feed_connector_a_root_to_connector_b() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("root");
+    let wood_sessions = root.join(".openclaw/agents/wood/sessions");
+    fs::create_dir_all(&wood_sessions).unwrap();
+
+    write_session(
+        &wood_sessions.join("s1.jsonl"),
+        concat!(
+            r#"{"type":"session","id":"s1","timestamp":"2026-02-01T16:00:00.000Z","cwd":"/tmp/wood"}"#,
+            "\n",
+            r#"{"type":"message","id":"m1","timestamp":"2026-02-01T16:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"hello wood"}]}}"#,
+            "\n",
+        ),
+    );
+
+    let mirror_dir = tmp.path().join("mirror");
+    fs::create_dir_all(&mirror_dir).unwrap();
+    let out_path = tmp.path().join("manifest.jsonl");
+
+    let scoped_root = format!("openclaw:{}", root.to_str().unwrap());
+    let mut cmd = base_cmd();
+    cmd.args([
+        "ingest",
+        "manifest",
+        "--scan-root",
+        &scoped_root,
+        "--mirror",
+        mirror_dir.to_str().unwrap(),
+        "--out",
+        out_path.to_str().unwrap(),
+    ]);
+    cmd.assert().success();
+
+    let manifest_text = fs::read_to_string(&out_path).unwrap();
+    let mut all_lines: Vec<Value> = manifest_text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad manifest line {l:?}: {e}")))
+        .collect();
+    let header = all_lines.remove(0);
+    assert_eq!(
+        header["scan_roots"].as_array().unwrap(),
+        &vec![Value::String(scoped_root.clone())],
+        "manifest header must record the raw slug-prefixed --scan-root string verbatim: {header}"
+    );
+
+    // Scoping the root to "openclaw" must mean ONLY the openclaw connector
+    // ever sees it -- no other connector (e.g. claude_code, which the sibling
+    // test above documents as independently discovering this exact fixture
+    // shape when the root is broadcast) may produce a candidate entry for
+    // this file at all.
+    assert_eq!(
+        all_lines.len(),
+        1,
+        "a root scoped to \"openclaw:\" must be fed to no other connector, so exactly 1 \
+         manifest entry (the openclaw one) is expected, got {}: {manifest_text}",
+        all_lines.len()
+    );
+    let identity_key = all_lines[0]["identity_key"].as_str().unwrap();
+    assert!(
+        identity_key.starts_with("openclaw/wood|"),
+        "the sole manifest entry from a root scoped to \"openclaw:\" must be the OpenClaw \
+         sub-agent session, not a cross-connector hit: got {identity_key:?}"
+    );
+}
+
+/// d21: an unscoped (no `<slug>:` prefix) `--scan-root` must still be
+/// broadcast to every connector, exactly like before d21 -- this is the
+/// explicit back-compat path the plan calls for.
+#[test]
+fn manifest_scan_root_without_slug_prefix_still_broadcasts_to_every_connector() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("root");
+    write_session(
+        &root.join("session.jsonl"),
+        concat!(
+            r#"{"type":"user","cwd":"/workspace/proj","sessionId":"sess-broadcast","message":{"role":"user","content":"hi"},"timestamp":"2025-01-01T00:00:00.000Z"}"#,
+            "\n",
+        ),
+    );
+
+    let mirror_dir = tmp.path().join("mirror");
+    fs::create_dir_all(&mirror_dir).unwrap();
+    let out_path = tmp.path().join("manifest.jsonl");
+
+    let mut cmd = base_cmd();
+    cmd.args([
+        "ingest",
+        "manifest",
+        "--scan-root",
+        root.to_str().unwrap(),
+        "--mirror",
+        mirror_dir.to_str().unwrap(),
+        "--out",
+        out_path.to_str().unwrap(),
+    ]);
+    cmd.assert().success();
+
+    let manifest_text = fs::read_to_string(&out_path).unwrap();
+    let mut all_lines: Vec<Value> = manifest_text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad manifest line {l:?}: {e}")))
+        .collect();
+    all_lines.remove(0); // header
+    assert_eq!(
+        all_lines.len(),
+        1,
+        "expected 1 manifest entry (claude_code, the only connector this generic fixture's \
+         extension-based discovery matches): {manifest_text}"
+    );
+    let identity_key = all_lines[0]["identity_key"].as_str().unwrap();
+    assert!(
+        identity_key.starts_with("claude_code|"),
+        "unscoped root must still broadcast to the connector that discovers it, same as \
+         pre-d21 behavior: got {identity_key:?}"
+    );
+}
+
+/// d21: an invalid `--scan-root` slug (no registered connector under that
+/// name) must fail loud rather than silently producing an empty manifest.
+#[test]
+fn manifest_scan_root_rejects_unknown_slug() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("root");
+    fs::create_dir_all(&root).unwrap();
+
+    let mirror_dir = tmp.path().join("mirror");
+    fs::create_dir_all(&mirror_dir).unwrap();
+    let out_path = tmp.path().join("manifest.jsonl");
+
+    let bogus_root = format!("not-a-real-connector:{}", root.to_str().unwrap());
+    let mut cmd = base_cmd();
+    cmd.args([
+        "ingest",
+        "manifest",
+        "--scan-root",
+        &bogus_root,
+        "--mirror",
+        mirror_dir.to_str().unwrap(),
+        "--out",
+        out_path.to_str().unwrap(),
+    ]);
+    cmd.assert().failure();
+}
+
+/// R1-N1: the same identity can legitimately show up twice across scan
+/// roots with different message counts (a stale mirror snapshot vs. a
+/// newer live scan). The manifest must keep the larger message_count (and
+/// its matching content_digest), mirroring the DB's own append-only merge
+/// semantics, rather than pinning to whichever source this run visits
+/// first.
+#[test]
+fn manifest_folds_duplicate_identity_keeping_the_larger_message_count() {
+    let tmp = TempDir::new().unwrap();
+    let root_mirror = tmp.path().join("root-mirror");
+    let root_live = tmp.path().join("root-live");
+    fs::create_dir_all(&root_mirror).unwrap();
+    fs::create_dir_all(&root_live).unwrap();
+
+    // Same cwd + sessionId in both -> same identity_key. Mirror snapshot has
+    // 3 messages (stale); live snapshot has 5 (current).
+    let mirror_content = concat!(
+        r#"{"type":"user","cwd":"/workspace/fold","sessionId":"sess-fold","message":{"role":"user","content":"m1"},"timestamp":"2025-01-01T00:00:00.000Z"}"#, "\n",
+        r#"{"type":"assistant","message":{"role":"assistant","content":"m2"},"timestamp":"2025-01-01T00:00:01.000Z"}"#, "\n",
+        r#"{"type":"user","message":{"role":"user","content":"m3"},"timestamp":"2025-01-01T00:00:02.000Z"}"#, "\n",
+    );
+    let live_content = concat!(
+        r#"{"type":"user","cwd":"/workspace/fold","sessionId":"sess-fold","message":{"role":"user","content":"m1"},"timestamp":"2025-01-01T00:00:00.000Z"}"#, "\n",
+        r#"{"type":"assistant","message":{"role":"assistant","content":"m2"},"timestamp":"2025-01-01T00:00:01.000Z"}"#, "\n",
+        r#"{"type":"user","message":{"role":"user","content":"m3"},"timestamp":"2025-01-01T00:00:02.000Z"}"#, "\n",
+        r#"{"type":"assistant","message":{"role":"assistant","content":"m4"},"timestamp":"2025-01-01T00:00:03.000Z"}"#, "\n",
+        r#"{"type":"user","message":{"role":"user","content":"m5"},"timestamp":"2025-01-01T00:00:04.000Z"}"#, "\n",
+    );
+    write_session(&root_mirror.join("fold.jsonl"), mirror_content);
+    write_session(&root_live.join("fold.jsonl"), live_content);
+
+    let mirror_dir = tmp.path().join("mirror");
+    fs::create_dir_all(&mirror_dir).unwrap();
+    let out_path = tmp.path().join("manifest.jsonl");
+
+    let mut cmd = base_cmd();
+    cmd.args([
+        "ingest",
+        "manifest",
+        "--scan-root",
+        root_mirror.to_str().unwrap(),
+        "--scan-root",
+        root_live.to_str().unwrap(),
+        "--mirror",
+        mirror_dir.to_str().unwrap(),
+        "--out",
+        out_path.to_str().unwrap(),
+    ]);
+    cmd.assert().success();
+
+    let manifest_text = fs::read_to_string(&out_path).unwrap();
+    let entries: Vec<Value> = manifest_text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .skip(1) // header
+        .collect();
+    assert_eq!(
+        entries.len(),
+        1,
+        "same identity across two roots must collapse into one entry: {manifest_text}"
+    );
+    let entry = &entries[0];
+    assert_eq!(
+        entry["message_count"], 5,
+        "must keep the larger message_count, not whichever source was visited first: {entry}"
+    );
+    assert_eq!(
+        entry["content_digest"].as_str().unwrap(),
+        expected_digest(&["m1", "m2", "m3", "m4", "m5"]),
+        "content_digest must match the message_count it was folded to: {entry}"
+    );
+    assert_eq!(
+        entry["sources"].as_array().unwrap().len(),
+        2,
+        "both sources must still be recorded even though only one side's counts win: {entry}"
+    );
+}
+
+/// R1-B10: the production persistence path redacts every message's content
+/// before it reaches `messages.content` (`src/indexer/mod.rs`
+/// `map_to_internal_with_redactor`, security fix for #112), but the manifest
+/// tool's `content_digest` used to hash the connector's raw, unredacted
+/// content -- so any session that trips a redaction rule got a digest that
+/// could never match `cass ingest reconcile`'s DB-side recomputation. This
+/// hashes the *actual production* `redact_text` output (imported from the
+/// lib crate, not reimplemented here) to prove the manifest tool now applies
+/// the same transformation, not just a plausible-looking one.
+#[test]
+fn manifest_content_digest_reflects_production_redaction_for_secret_content() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("root");
+    fs::create_dir_all(&root).unwrap();
+
+    let raw_content = "DATABASE_URL=postgres://user:pass@host/db";
+    let session_line = format!(
+        r#"{{"type":"user","cwd":"/workspace/secret","sessionId":"sess-secret","message":{{"role":"user","content":"{}"}},"timestamp":"2025-01-01T00:00:00.000Z"}}"#,
+        raw_content
+    ) + "\n";
+    write_session(&root.join("secret.jsonl"), &session_line);
+
+    let mirror_dir = tmp.path().join("mirror");
+    fs::create_dir_all(&mirror_dir).unwrap();
+    let out_path = tmp.path().join("manifest.jsonl");
+
+    let mut cmd = base_cmd();
+    cmd.args([
+        "ingest",
+        "manifest",
+        "--scan-root",
+        root.to_str().unwrap(),
+        "--mirror",
+        mirror_dir.to_str().unwrap(),
+        "--out",
+        out_path.to_str().unwrap(),
+    ]);
+    cmd.assert().success();
+
+    let manifest_text = fs::read_to_string(&out_path).unwrap();
+    let entries: Vec<Value> = manifest_text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .skip(1) // header
+        .collect();
+    assert_eq!(
+        entries.len(),
+        1,
+        "expected exactly one session entry: {manifest_text}"
+    );
+    let entry = &entries[0];
+
+    let redacted_content =
+        coding_agent_search::indexer::redact_secrets::redact_text(raw_content).into_owned();
+    assert_ne!(
+        redacted_content, raw_content,
+        "fixture must actually trip a redaction rule, or this test proves nothing"
+    );
+
+    assert_eq!(
+        entry["content_digest"].as_str().unwrap(),
+        expected_digest(&[&redacted_content]),
+        "manifest content_digest must be computed over the same redacted bytes \
+         the production indexer persists to messages.content, not the raw \
+         connector content: {entry}"
+    );
+    assert_ne!(
+        entry["content_digest"].as_str().unwrap(),
+        expected_digest(&[raw_content]),
+        "manifest content_digest must NOT match a digest of the raw, \
+         unredacted content: {entry}"
+    );
+}
+
+/// Reverse control for the fix above: a session with no secret-shaped
+/// content must produce the exact same digest as before the R1-B10 fix
+/// (redaction is a byte-identical no-op when no pattern matches), so the fix
+/// cannot be read as "hash something else entirely".
+#[test]
+fn manifest_content_digest_unchanged_when_no_secret_present() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("root");
+    fs::create_dir_all(&root).unwrap();
+
+    let benign_content = "Just a normal message about refactoring the parser, no secrets here.";
+    let session_line = format!(
+        r#"{{"type":"user","cwd":"/workspace/benign","sessionId":"sess-benign","message":{{"role":"user","content":"{}"}},"timestamp":"2025-01-01T00:00:00.000Z"}}"#,
+        benign_content
+    ) + "\n";
+    write_session(&root.join("benign.jsonl"), &session_line);
+
+    let mirror_dir = tmp.path().join("mirror");
+    fs::create_dir_all(&mirror_dir).unwrap();
+    let out_path = tmp.path().join("manifest.jsonl");
+
+    let mut cmd = base_cmd();
+    cmd.args([
+        "ingest",
+        "manifest",
+        "--scan-root",
+        root.to_str().unwrap(),
+        "--mirror",
+        mirror_dir.to_str().unwrap(),
+        "--out",
+        out_path.to_str().unwrap(),
+    ]);
+    cmd.assert().success();
+
+    let manifest_text = fs::read_to_string(&out_path).unwrap();
+    let entries: Vec<Value> = manifest_text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .skip(1) // header
+        .collect();
+    assert_eq!(
+        entries.len(),
+        1,
+        "expected exactly one session entry: {manifest_text}"
+    );
+    let entry = &entries[0];
+
+    assert_eq!(
+        entry["content_digest"].as_str().unwrap(),
+        expected_digest(&[benign_content]),
+        "content without secrets must digest identically before and after \
+         the R1-B10 redaction-alignment fix: {entry}"
+    );
+}

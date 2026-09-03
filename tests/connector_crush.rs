@@ -2,37 +2,65 @@
 
 use coding_agent_search::connectors::crush::CrushConnector;
 use coding_agent_search::connectors::{Connector, ScanContext};
-use frankensqlite::Connection;
-use frankensqlite::compat::ConnectionExt;
-use frankensqlite::params;
+use coding_agent_search::storage::api::Conn as Connection;
 use std::fs::{self, OpenOptions};
 use std::path::Path;
 use tempfile::TempDir;
 
-fn create_crush_db(path: &Path) -> Connection {
-    let conn = Connection::open(path.to_string_lossy().as_ref()).expect("open crush db");
-    conn.execute(
-        "CREATE TABLE sessions (
-            id TEXT PRIMARY KEY,
-            title TEXT,
-            prompt_tokens INTEGER,
-            completion_tokens INTEGER,
-            cost REAL
-        )",
-    )
-    .expect("create sessions");
-    conn.execute(
-        "CREATE TABLE messages (
-            session_id TEXT,
-            role TEXT,
-            parts TEXT,
-            created_at INTEGER,
-            model TEXT,
-            provider TEXT
-        )",
-    )
-    .expect("create messages");
-    conn
+/// Test-only parameter list builder (this integration test is a separate
+/// crate and can't reach `storage::api`'s crate-private `params!` shim):
+/// borrows + handles the zero-arg case, mirroring sqlite.rs's own `fparams!`.
+macro_rules! params {
+    () => {
+        &[] as &[coding_agent_search::storage::api::Value]
+    };
+    ($($val:expr),+ $(,)?) => {
+        &[$(coding_agent_search::storage::api::IntoValue::into_value($val)),+]
+            as &[coding_agent_search::storage::api::Value]
+    };
+}
+
+/// Fix (plan delta d8 investigation, 2026-08-25): `FrankenStorage::open` is
+/// NOT schema-free -- it runs cass's real migrations first, which already
+/// create a `messages` table and collided with this fixture's own
+/// `CREATE TABLE messages` ("table messages already exists", confirmed by a
+/// baseline-vs-candidate equivalence-gate diff: this file's tests passed on
+/// the pre-Stage-A baseline and failed on Stage A HEAD). Routes through
+/// `storage::testing::open_test_writer` instead (w1b Task B4 Q3's sanctioned
+/// schema-free bridge for `tests/`, replacing the old `FrankenConnectionManager`
+/// bridge used by tests/pages_fts.rs and tests/storage.rs's own fixtures).
+/// Each caller reopens its own writer afterward -- there is no shared
+/// "manager" to hand back anymore, every `open_test_writer` call is an
+/// independent connection on the same path.
+fn create_crush_db(path: &Path) {
+    {
+        let mut guard =
+            coding_agent_search::storage::testing::open_test_writer(path, coding_agent_search::storage::api::Profile::Production)
+                .expect("open crush db");
+        let conn = guard.storage().raw();
+        conn.execute(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                title TEXT,
+                prompt_tokens INTEGER,
+                completion_tokens INTEGER,
+                cost REAL
+            )", &[],
+        )
+        .expect("create sessions");
+        conn.execute(
+            "CREATE TABLE messages (
+                session_id TEXT,
+                role TEXT,
+                parts TEXT,
+                created_at INTEGER,
+                model TEXT,
+                provider TEXT
+            )", &[],
+        )
+        .expect("create messages");
+        guard.mark_committed();
+    }
 }
 
 fn scan_db(path: &Path) -> Vec<coding_agent_search::connectors::NormalizedConversation> {
@@ -49,7 +77,7 @@ fn insert_crush_session(
     completion_tokens: i64,
     cost: f64,
 ) {
-    conn.execute_compat(
+    conn.execute(
         "INSERT INTO sessions (id, title, prompt_tokens, completion_tokens, cost)
          VALUES (?1, ?2, ?3, ?4, ?5)",
         params![id, title, prompt_tokens, completion_tokens, cost],
@@ -67,7 +95,7 @@ fn insert_crush_message(
     provider: Option<&str>,
 ) {
     let parts = format!(r#"[{{"type":"text","text":"{text}"}}]"#);
-    conn.execute_compat(
+    conn.execute(
         "INSERT INTO messages (session_id, role, parts, created_at, model, provider)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![session_id, role, parts, created_at, model, provider],
@@ -79,15 +107,17 @@ fn insert_crush_message(
 fn crush_happy_path_preserves_sqlite_session_fields() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("crush.db");
-    let conn = create_crush_db(&db_path);
+    create_crush_db(&db_path);
+    let mut guard = coding_agent_search::storage::testing::open_test_writer(&db_path, coding_agent_search::storage::api::Profile::Production).expect("acquire crush fixture writer");
+    let conn = guard.storage().raw();
 
-    conn.execute_compat(
+    conn.execute(
         "INSERT INTO sessions (id, title, prompt_tokens, completion_tokens, cost)
          VALUES (?1, ?2, ?3, ?4, ?5)",
         params!["sess-crush-1", "Crush fixture", 11_i64, 7_i64, 0.42_f64],
     )
     .expect("insert session");
-    conn.execute_compat(
+    conn.execute(
         "INSERT INTO messages (session_id, role, parts, created_at, model, provider)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
@@ -100,7 +130,7 @@ fn crush_happy_path_preserves_sqlite_session_fields() {
         ],
     )
     .expect("insert user message");
-    conn.execute_compat(
+    conn.execute(
         "INSERT INTO messages (session_id, role, parts, created_at, model, provider)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
@@ -113,7 +143,8 @@ fn crush_happy_path_preserves_sqlite_session_fields() {
         ],
     )
     .expect("insert assistant message");
-    drop(conn);
+    guard.mark_committed();
+    drop(guard);
 
     let convs = scan_db(&db_path);
     assert_eq!(convs.len(), 1);
@@ -147,7 +178,9 @@ fn crush_happy_path_preserves_sqlite_session_fields() {
 fn crush_multiple_sessions_ignore_orphans_and_preserve_metadata_ownership() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("crush-multi.db");
-    let conn = create_crush_db(&db_path);
+    create_crush_db(&db_path);
+    let mut guard = coding_agent_search::storage::testing::open_test_writer(&db_path, coding_agent_search::storage::api::Profile::Production).expect("acquire crush fixture writer");
+    let conn = guard.storage().raw();
 
     // Insert sessions in reverse lexical order; the connector contract sorts
     // by session id and then message timestamp.
@@ -190,7 +223,8 @@ fn crush_multiple_sessions_ignore_orphans_and_preserve_metadata_ownership() {
         None,
         None,
     );
-    drop(conn);
+    guard.mark_committed();
+    drop(guard);
 
     let convs = scan_db(&db_path);
     assert_eq!(
@@ -243,12 +277,29 @@ fn crush_empty_zero_byte_db_returns_empty_result() {
 
 #[test]
 fn crush_malformed_schema_returns_empty_result_without_panic() {
+    // R1-N4 (PR-front code review, control-plane adjudicated 2026-08-25): was
+    // using `FrankenStorage::open().into_raw()`, which on a fresh file runs
+    // cass's real migrations first -- those already create a `messages`
+    // table, so the incomplete-schema fixture below never actually modeled
+    // "messages missing" (the table this test's name claims to cover was
+    // present all along, just via cass's own schema, not crush's). Routes
+    // through the same schema-free `storage::testing::open_test_writer`
+    // bridge as `create_crush_db` above so only the fixture's own
+    // `sessions` table exists and the "messages missing" branch is
+    // genuinely exercised.
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("malformed.db");
-    let conn = Connection::open(db_path.to_string_lossy().as_ref()).expect("open db");
-    conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY)")
-        .expect("create incomplete sessions table");
-    drop(conn);
+    {
+        let mut guard = coding_agent_search::storage::testing::open_test_writer(
+            &db_path,
+            coding_agent_search::storage::api::Profile::Production,
+        )
+        .expect("open malformed crush db");
+        let conn = guard.storage().raw();
+        conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY)", &[])
+            .expect("create incomplete sessions table");
+        guard.mark_committed();
+    }
 
     assert!(scan_db(&db_path).is_empty());
 }

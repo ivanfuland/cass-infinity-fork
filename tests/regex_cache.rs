@@ -6,8 +6,10 @@
 //! - Is thread-safe under concurrent access
 //! - Can be disabled via CASS_REGEX_CACHE=0
 
+use coding_agent_search::indexer::persist::persist_conversation;
 use coding_agent_search::search::query::{FieldMask, SearchClient, SearchFilters};
-use coding_agent_search::search::tantivy::TantivyIndex;
+use coding_agent_search::storage::sqlite::SqliteStorage;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 use tempfile::TempDir;
@@ -15,8 +17,11 @@ use tempfile::TempDir;
 mod util;
 
 /// Create a test index with content that includes patterns for regex matching.
-fn create_test_index_with_patterns(dir: &TempDir) -> TantivyIndex {
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+/// Returns the db_path (sqlite-fts5 content lives in the same DB as the
+/// canonical tables now; there is no separate on-disk index to hand back).
+fn create_test_index_with_patterns(dir: &TempDir) -> PathBuf {
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     // Create conversations with suffix-matchable content
     let conv1 = util::ConversationFixtureBuilder::new("tester")
@@ -46,12 +51,11 @@ fn create_test_index_with_patterns(dir: &TempDir) -> TantivyIndex {
         .with_content(1, "Configuration file needs updating")
         .build_normalized();
 
-    index.add_conversation(&conv1).unwrap();
-    index.add_conversation(&conv2).unwrap();
-    index.add_conversation(&conv3).unwrap();
-    index.commit().unwrap();
+    persist_conversation(&storage, &conv1).unwrap();
+    persist_conversation(&storage, &conv2).unwrap();
+    persist_conversation(&storage, &conv3).unwrap();
 
-    index
+    db_path
 }
 
 // =============================================================================
@@ -62,12 +66,12 @@ fn create_test_index_with_patterns(dir: &TempDir) -> TantivyIndex {
 fn test_regex_cache_equivalence_suffix_pattern() {
     // Test that suffix pattern (*handler) returns same results with/without cache
     let dir = TempDir::new().unwrap();
-    let _index = create_test_index_with_patterns(&dir);
+    let db_path = create_test_index_with_patterns(&dir);
 
     let filters = SearchFilters::default();
 
     // Search with cache enabled (default)
-    let client_cached = SearchClient::open(dir.path(), None)
+    let client_cached = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
     let results_cached = client_cached
@@ -81,7 +85,7 @@ fn test_regex_cache_equivalence_suffix_pattern() {
 
     // Use a different client to potentially pick up the env var change
     // (though the static is already initialized, the bypass check happens per-call)
-    let client_uncached = SearchClient::open(dir.path(), None)
+    let client_uncached = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
     let results_uncached = client_uncached
@@ -116,12 +120,12 @@ fn test_regex_cache_equivalence_suffix_pattern() {
 fn test_regex_cache_equivalence_substring_pattern() {
     // Test that substring pattern (*config*) returns same results with/without cache
     let dir = TempDir::new().unwrap();
-    let _index = create_test_index_with_patterns(&dir);
+    let db_path = create_test_index_with_patterns(&dir);
 
     let filters = SearchFilters::default();
 
     // Search with cache enabled
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
     let results_cached = client
@@ -149,9 +153,9 @@ fn test_regex_cache_equivalence_substring_pattern() {
 fn test_regex_cache_equivalence_multiple_patterns() {
     // Test multiple different patterns all return consistent results
     let dir = TempDir::new().unwrap();
-    let _index = create_test_index_with_patterns(&dir);
+    let db_path = create_test_index_with_patterns(&dir);
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
     let filters = SearchFilters::default();
@@ -197,9 +201,9 @@ fn test_regex_cache_equivalence_multiple_patterns() {
 fn test_regex_cache_repeated_queries_consistent() {
     // Repeated identical suffix queries should return consistent results
     let dir = TempDir::new().unwrap();
-    let _index = create_test_index_with_patterns(&dir);
+    let db_path = create_test_index_with_patterns(&dir);
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
     let filters = SearchFilters::default();
@@ -236,9 +240,9 @@ fn test_regex_cache_repeated_queries_consistent() {
 fn test_regex_cache_different_patterns_independent() {
     // Different patterns should be cached independently
     let dir = TempDir::new().unwrap();
-    let _index = create_test_index_with_patterns(&dir);
+    let db_path = create_test_index_with_patterns(&dir);
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
     let filters = SearchFilters::default();
@@ -291,18 +295,20 @@ fn test_regex_cache_concurrent_reads() {
     // Multiple threads reading with the same pattern should be safe
     // Each thread creates its own SearchClient, but they all hit the global RegexCache
     let dir = TempDir::new().unwrap();
-    let _index = create_test_index_with_patterns(&dir);
+    let db_path = create_test_index_with_patterns(&dir);
 
     let index_path = Arc::new(dir.path().to_path_buf());
+    let db_path = Arc::new(db_path);
 
     let mut handles = Vec::new();
 
     // Spawn 10 threads all searching the same pattern
     for i in 0..10 {
         let path = Arc::clone(&index_path);
+        let db_path = Arc::clone(&db_path);
         let handle = thread::spawn(move || {
             // Each thread creates its own client
-            let client = SearchClient::open(&path, None).unwrap().expect("client");
+            let client = SearchClient::open(&path, Some(&db_path)).unwrap().expect("client");
             let filters = SearchFilters::default();
             let results = client
                 .search("*handler", filters, 10, 0, FieldMask::FULL)
@@ -334,9 +340,10 @@ fn test_regex_cache_concurrent_reads() {
 fn test_regex_cache_concurrent_different_patterns() {
     // Multiple threads searching different patterns should be safe
     let dir = TempDir::new().unwrap();
-    let _index = create_test_index_with_patterns(&dir);
+    let db_path = create_test_index_with_patterns(&dir);
 
     let index_path = Arc::new(dir.path().to_path_buf());
+    let db_path = Arc::new(db_path);
 
     let patterns = vec![
         "*handler",
@@ -354,9 +361,10 @@ fn test_regex_cache_concurrent_different_patterns() {
     // Each thread searches a different pattern
     for (i, pattern) in patterns.into_iter().enumerate() {
         let path = Arc::clone(&index_path);
+        let db_path = Arc::clone(&db_path);
         let pattern = pattern.to_string();
         let handle = thread::spawn(move || {
-            let client = SearchClient::open(&path, None).unwrap().expect("client");
+            let client = SearchClient::open(&path, Some(&db_path)).unwrap().expect("client");
             let filters = SearchFilters::default();
             let results = client
                 .search(&pattern, filters, 10, 0, FieldMask::FULL)
@@ -382,19 +390,21 @@ fn test_regex_cache_concurrent_read_write() {
     // Concurrent reads while cache is being populated should be safe
     // The global RegexCache uses RwLock for thread-safe access
     let dir = TempDir::new().unwrap();
-    let _index = create_test_index_with_patterns(&dir);
+    let db_path = create_test_index_with_patterns(&dir);
 
     let index_path = Arc::new(dir.path().to_path_buf());
+    let db_path = Arc::new(db_path);
 
     let mut handles = Vec::new();
 
     // Spawn threads that will hit the cache and potentially cause new entries
     for i in 0..20 {
         let path = Arc::clone(&index_path);
+        let db_path = Arc::clone(&db_path);
         // Use a mix of patterns - some will cache hit, some will miss
         let pattern = format!("*thread{}*", i % 5);
         let handle = thread::spawn(move || {
-            let client = SearchClient::open(&path, None).unwrap().expect("client");
+            let client = SearchClient::open(&path, Some(&db_path)).unwrap().expect("client");
             let filters = SearchFilters::default();
             // Run multiple searches to increase contention on the global cache
             for _ in 0..5 {
@@ -422,12 +432,12 @@ fn test_regex_cache_concurrent_read_write() {
 fn test_regex_cache_disabled_via_env() {
     // When CASS_REGEX_CACHE=0, regex queries should still work correctly
     let dir = TempDir::new().unwrap();
-    let _index = create_test_index_with_patterns(&dir);
+    let db_path = create_test_index_with_patterns(&dir);
 
     // Set env var to disable cache
     let _guard = util::EnvGuard::set("CASS_REGEX_CACHE", "0");
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
     let filters = SearchFilters::default();
@@ -459,11 +469,11 @@ fn test_regex_cache_disabled_via_env() {
 fn test_regex_cache_disabled_false_string() {
     // CASS_REGEX_CACHE=false should also disable cache
     let dir = TempDir::new().unwrap();
-    let _index = create_test_index_with_patterns(&dir);
+    let db_path = create_test_index_with_patterns(&dir);
 
     let _guard = util::EnvGuard::set("CASS_REGEX_CACHE", "false");
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
     let filters = SearchFilters::default();
@@ -489,9 +499,9 @@ fn test_regex_cache_disabled_false_string() {
 fn test_regex_cache_empty_pattern_core() {
     // Patterns that resolve to empty core (like just "*") should be handled
     let dir = TempDir::new().unwrap();
-    let _index = create_test_index_with_patterns(&dir);
+    let db_path = create_test_index_with_patterns(&dir);
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
     let filters = SearchFilters::default();
@@ -510,7 +520,8 @@ fn test_regex_cache_empty_pattern_core() {
 fn test_regex_cache_special_regex_chars() {
     // Patterns with regex metacharacters should be properly escaped
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     // Add content with regex-special characters
     let conv = util::ConversationFixtureBuilder::new("tester")
@@ -521,10 +532,9 @@ fn test_regex_cache_special_regex_chars() {
         .with_content(0, "The function foo.bar() handles [array] items")
         .build_normalized();
 
-    index.add_conversation(&conv).unwrap();
-    index.commit().unwrap();
+    persist_conversation(&storage, &conv).unwrap();
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
     let filters = SearchFilters::default();
@@ -549,7 +559,8 @@ fn test_regex_cache_special_regex_chars() {
 fn test_regex_cache_unicode_patterns() {
     // Unicode patterns should work correctly
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     // Add content with unicode
     let conv = util::ConversationFixtureBuilder::new("tester")
@@ -560,10 +571,9 @@ fn test_regex_cache_unicode_patterns() {
         .with_content(0, "Handle emoji: rocket and international: cafe")
         .build_normalized();
 
-    index.add_conversation(&conv).unwrap();
-    index.commit().unwrap();
+    persist_conversation(&storage, &conv).unwrap();
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
     let filters = SearchFilters::default();
@@ -581,9 +591,9 @@ fn test_regex_cache_unicode_patterns() {
 fn test_regex_cache_very_long_pattern() {
     // Very long patterns should be handled (cache key limits)
     let dir = TempDir::new().unwrap();
-    let _index = create_test_index_with_patterns(&dir);
+    let db_path = create_test_index_with_patterns(&dir);
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
     let filters = SearchFilters::default();

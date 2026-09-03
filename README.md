@@ -2982,12 +2982,11 @@ Update check state is stored in the data directory:
 
 | Dependency | Pinned source |
 |------------|-----------------|
-| `frankensqlite` / `fsqlite-types` | `=0.1.11` (crates.io; #95 BtCursor + #106 MVCC grow + FTS5 shadow-table persistence/lazy-reopen + MAX/MIN(rowid) leaf-seek + 0.1.11 FTS5 merge/finalize O(N²)→O(N) spin fix [cass#301] + composite-UNIQUE FK INSERT [#116] + correlated NOT EXISTS planner [#117] fixes) |
-| `franken-agent-detection` | `068f423` (fork: ivanfuland/my_franken_agent_detection, connector-storage-contract) |
+| `franken-agent-detection` | `0.1.10 @ bc0f4d3c02356eac4d4dbc48e6f7d830d2caa9e8` (fork: ivanfuland/my_franken_agent_detection, main) |
 | `asupersync` | `=0.3.5` |
-| `frankensearch` | `2cad158f` |
 | `frankentui` | `5f78cfa0` |
 | `toon` (`tru`) | `5669b72a` |
+| `rusqlite` | `0.39.0` (crates.io; `bundled,modern_sqlite` features — w1b Stage B production SQLite backend; `bundled` links and pins its own libsqlite3 build for reproducibility, not build.rs-guarded like the sibling forks above since it carries no git revision to drift) |
 
 **Build-time validation**
 - `build.rs` validates the committed dependency source contract against the expected package name, package version, Cargo feature/default-features contract, and git source where applicable.
@@ -2996,9 +2995,7 @@ Update check state is stored in the data directory:
 - Use `cass swarm dependency-drift --json` for a fast read-only preflight. It reports each manifest pin, optional sibling checkout HEAD/dirty state, upstream status as `not_checked`, and the exact strict-validation commands to run; it never fetches remotes or mutates files.
 
 **Expected interface contract**
-- `frankensqlite` (`fsqlite`): `Connection`, `params!`, and `compat::{ConnectionExt, RowExt}` with `row.get_typed(...)`.
 - `franken-agent-detection`: `AgentDetectOptions` and `detect_installed_agents(...)`.
-- `frankensearch`: `lexical::cass_open_search_reader`, `lexical::ReloadPolicy`, `ModelCategory`, and `ModelTier`.
 - `frankentui`: `ftui::Frame`, `GraphemePool`, `Style`, `ftui-runtime`, `ftui-tty`, and the `ftui-extras` features enabled by cass.
 - `asupersync`: `runtime::RuntimeBuilder` and `http::h1::HttpClient::builder()`.
 - `toon` (`tru`): `toon::encode(...)`.

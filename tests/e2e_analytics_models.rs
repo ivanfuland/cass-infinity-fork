@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 /// Build a minimal fixture data dir with an analytics database. We only need
 /// the directory to exist for the empty-DB / missing-DB scenarios; richer
-/// fixtures spin up an in-memory frankensqlite to populate usage rows.
+/// fixtures spin up an in-memory the legacy embedded engine to populate usage rows.
 fn fresh_data_dir(label: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

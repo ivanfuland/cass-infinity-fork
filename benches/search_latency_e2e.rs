@@ -12,7 +12,8 @@ use coding_agent_search::search::query::{
     CacheStats, FieldMask, SearchClient, SearchClientOptions, SearchFilters, SearchHit,
     SearchResult as BackendSearchResult,
 };
-use coding_agent_search::search::tantivy::{TantivyIndex, index_dir};
+use coding_agent_search::indexer::persist::persist_conversation;
+use coding_agent_search::storage::sqlite::SqliteStorage;
 use coding_agent_search::ui::app::RankingMode;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::cmp::Ordering;
@@ -30,7 +31,7 @@ const PREFIX_SEQUENCES: usize = 6;
 const TYPICAL_P95_BUDGET_MS: f64 = 60.0;
 const FILTER_OVERHEAD_MAX_RATIO: f64 = 2.0;
 
-const EXACT_QUERY: &str = "frankensqlite write conflict";
+const EXACT_QUERY: &str = "legacy embedded engine write conflict";
 const PHRASE_QUERY: &str = "\"distributed tracing handshake\"";
 const WILDCARD_QUERY: &str = "*token*";
 const PREFIX_SEQUENCE: [&str; 4] = ["a", "au", "aut", "auth"];
@@ -139,7 +140,7 @@ fn build_fixture_conversation(
 
         if highlight_filtered_lane || (conv_idx + msg_idx).is_multiple_of(7) {
             content.push_str(
-                " The incident reproduced a frankensqlite write conflict during concurrent indexing.",
+                " The incident reproduced a legacy embedded engine write conflict during concurrent indexing.",
             );
         }
         if highlight_filtered_lane || (conv_idx + msg_idx).is_multiple_of(11) {
@@ -208,21 +209,20 @@ fn build_fixture() -> Result<SearchFixture> {
     let data_dir = temp.path().join("24k_msgs");
     std::fs::create_dir_all(&data_dir).context("create data dir")?;
 
-    let index_path = index_dir(&data_dir).context("resolve index path")?;
-    let mut t_index = TantivyIndex::open_or_create(&index_path).context("open tantivy index")?;
+    let db_path = data_dir.join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).context("open storage")?;
 
     let corpus: Vec<FixtureConversation> = (0..CONVERSATION_COUNT)
         .map(|idx| build_fixture_conversation(idx, MESSAGES_PER_CONVERSATION))
         .collect();
 
     for conv in &corpus {
-        t_index
-            .add_conversation(&conv.normalized)
+        persist_conversation(&storage, &conv.normalized)
             .context("index benchmark conversation")?;
     }
-    t_index.commit().context("commit tantivy index")?;
 
-    let client = SearchClient::open_with_options(&index_path, None, bench_client_options())
+    let client =
+        SearchClient::open_with_options(&data_dir, Some(&db_path), bench_client_options())
         .context("open search client")?
         .context("search client unavailable")?;
 
@@ -231,7 +231,7 @@ fn build_fixture() -> Result<SearchFixture> {
 
     Ok(SearchFixture {
         _temp: temp,
-        _index_path: index_path,
+        _index_path: data_dir,
         client,
         label: "24k_msgs",
         total_messages: CONVERSATION_COUNT * MESSAGES_PER_CONVERSATION,

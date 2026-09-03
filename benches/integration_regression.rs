@@ -2,7 +2,7 @@
 //!
 //! `SqliteStorage` is now a compatibility alias for `FrankenStorage`, so this
 //! benchmark suite no longer compares rusqlite/legacy SQLite against
-//! frankensqlite. Instead it compares two distinct cass-owned paths:
+//! the legacy embedded engine. Instead it compares two distinct cass-owned paths:
 //! - `persist_conversation`: normalized ingestion + lexical index updates
 //! - direct `FrankenStorage` calls: pre-resolved IDs + storage-only writes
 //!
@@ -20,12 +20,8 @@ use bench_utils::configure_criterion;
 use coding_agent_search::connectors::{NormalizedConversation, NormalizedMessage};
 use coding_agent_search::indexer::persist::persist_conversation;
 use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
-use coding_agent_search::search::tantivy::{TantivyIndex, index_dir};
-use coding_agent_search::storage::sqlite::{
-    ConnectionManagerConfig, FrankenConnectionManager, FrankenStorage,
-};
+use coding_agent_search::storage::sqlite::FrankenStorage;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use frankensqlite::FrankenError;
 use std::hint::black_box;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -153,16 +149,13 @@ fn make_agent(id: i64) -> Agent {
 fn setup_persist_seeded_db(conv_count: i64, msgs_per_conv: i64) -> (TempDir, FrankenStorage) {
     let temp = TempDir::new().expect("create tempdir");
     let db_path = temp.path().join("persist.db");
-    let index_path = index_dir(temp.path()).expect("index path");
 
     let storage = FrankenStorage::open(&db_path).expect("open persist-seeded db");
-    let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
 
     for i in 0..conv_count {
         let conv = generate_conversation(i, msgs_per_conv);
-        persist_conversation(&storage, &mut t_index, &conv).expect("persist");
+        persist_conversation(&storage, &conv).expect("persist");
     }
-    t_index.commit().unwrap();
 
     (temp, storage)
 }
@@ -256,14 +249,12 @@ fn bench_insert_comparison(c: &mut Criterion) {
             |b, &msg_count| {
                 let temp = TempDir::new().unwrap();
                 let db_path = temp.path().join("bench.db");
-                let index_path = index_dir(temp.path()).expect("index path");
                 let storage = FrankenStorage::open(&db_path).unwrap();
-                let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
                 let mut conv_id = 0i64;
 
                 b.iter(|| {
                     let conv = generate_conversation(conv_id, msg_count);
-                    persist_conversation(&storage, &mut t_index, &conv).unwrap();
+                    persist_conversation(&storage, &conv).unwrap();
                     conv_id += 1;
                 })
             },
@@ -322,21 +313,15 @@ fn bench_insert_remote_source_reuse(c: &mut Criterion) {
             |b, &msg_count| {
                 let temp = TempDir::new().unwrap();
                 let db_path = temp.path().join("bench.db");
-                let index_path = index_dir(temp.path()).expect("index path");
                 let storage = FrankenStorage::open(&db_path).unwrap();
-                let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
 
-                persist_conversation(
-                    &storage,
-                    &mut t_index,
-                    &generate_remote_conversation(0, msg_count),
-                )
-                .unwrap();
+                persist_conversation(&storage, &generate_remote_conversation(0, msg_count))
+                    .unwrap();
 
                 let mut conv_id = 1i64;
                 b.iter(|| {
                     let conv = generate_remote_conversation(conv_id, msg_count);
-                    persist_conversation(&storage, &mut t_index, &conv).unwrap();
+                    persist_conversation(&storage, &conv).unwrap();
                     conv_id += 1;
                 })
             },
@@ -397,25 +382,21 @@ fn bench_append_remote_source_merge(c: &mut Criterion) {
             |b, &msg_count| {
                 let temp = TempDir::new().unwrap();
                 let db_path = temp.path().join("bench.db");
-                let index_path = index_dir(temp.path()).expect("index path");
                 let storage = FrankenStorage::open(&db_path).unwrap();
-                let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
 
                 for conv_id in 0..WORKLOAD_CONVERSATIONS {
                     persist_conversation(
                         &storage,
-                        &mut t_index,
                         &generate_remote_conversation(conv_id, msg_count),
                     )
                     .unwrap();
                 }
-                t_index.commit().unwrap();
 
                 let mut conv_id = 0i64;
                 b.iter(|| {
                     let scenario_id = conv_id % WORKLOAD_CONVERSATIONS;
                     let conv = generate_remote_conversation(scenario_id, msg_count * 2);
-                    persist_conversation(&storage, &mut t_index, &conv).unwrap();
+                    persist_conversation(&storage, &conv).unwrap();
                     conv_id += 1;
                 })
             },
@@ -531,7 +512,9 @@ fn bench_query_comparison(c: &mut Criterion) {
             black_box(
                 direct_storage
                     .raw()
-                    .query("SELECT COUNT(*) FROM conversations")
+                    .query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| {
+                        row.get_typed::<i64>(0)
+                    })
                     .unwrap(),
             )
         })
@@ -541,51 +524,20 @@ fn bench_query_comparison(c: &mut Criterion) {
 }
 
 // =============================================================================
-// Retry helper for concurrent writes
+// 4. CONCURRENT WRITE THROUGHPUT (WriterHandle)
 // =============================================================================
-
-fn with_retry<F, T>(max_retries: usize, mut f: F) -> anyhow::Result<T>
-where
-    F: FnMut() -> Result<T, anyhow::Error>,
-{
-    let mut backoff_ms = 2_u64;
-    for attempt in 0..=max_retries {
-        match f() {
-            Ok(val) => return Ok(val),
-            Err(err) => {
-                let is_retryable = err
-                    .downcast_ref::<FrankenError>()
-                    .or_else(|| err.root_cause().downcast_ref::<FrankenError>())
-                    .is_some_and(|inner| {
-                        matches!(
-                            inner,
-                            FrankenError::Busy
-                                | FrankenError::BusyRecovery
-                                | FrankenError::BusySnapshot { .. }
-                                | FrankenError::WriteConflict { .. }
-                                | FrankenError::SerializationFailure { .. }
-                                | FrankenError::DatabaseCorrupt { .. }
-                        )
-                    });
-                if attempt < max_retries && is_retryable {
-                    std::thread::sleep(Duration::from_millis(backoff_ms));
-                    backoff_ms = (backoff_ms * 2).min(128);
-                    continue;
-                }
-                return Err(err);
-            }
-        }
-    }
-    Err(anyhow::anyhow!("exhausted retries"))
-}
-
-// =============================================================================
-// 4. CONCURRENT WRITE THROUGHPUT (FrankenConnectionManager)
-// =============================================================================
+// w1b Task B4 (secondary contract #4): this used to benchmark N *real*
+// concurrent the legacy embedded engine MVCC writer connections (`ConnectionManagerConfig
+// { max_writers: 4 }` + `.concurrent_writer()`), each committing its own
+// `BEGIN CONCURRENT` transaction and retrying on snapshot conflicts. That
+// capability is retired -- the process now holds at most 1 live writer
+// connection per db path (`storage::api::WriterHandle`). The benchmark below
+// measures the modern equivalent: N submitter threads racing to push work
+// through the single writer queue, which is the throughput characteristic
+// that actually matters post-B4 (there is no more "4 real writers" scenario
+// to benchmark).
 
 fn bench_concurrent_writes(c: &mut Criterion) {
-    use frankensqlite::compat::TransactionExt;
-
     let mut group = c.benchmark_group("concurrent_writes");
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(5));
@@ -626,50 +578,52 @@ fn bench_concurrent_writes(c: &mut Criterion) {
         );
     });
 
-    // ConnectionManager with 4 concurrent writers using raw SQL.
-    // Uses raw INSERT + retry to benchmark the MVCC concurrent write path
-    // independent of the full insert_conversation_tree complexity.
+    // 4 submitter threads racing to push raw INSERTs through one
+    // `WriterHandle` (the post-B4 single-writer queue) -- the direct
+    // replacement for the old "4 real MVCC writers" benchmark above.
     group.throughput(Throughput::Elements(400));
-    group.bench_function("4_writers_raw_400_rows", |b| {
+    group.bench_function("writer_handle_4_submitters_400_rows", |b| {
         b.iter_with_setup(
             || {
                 let temp = TempDir::new().unwrap();
                 let db_path = temp.path().join("bench.db");
-                let fs = FrankenStorage::open(&db_path).unwrap();
-                // Create a simple table for raw concurrent writes
-                fs.raw()
-                    .execute("CREATE TABLE IF NOT EXISTS bench_raw (id INTEGER PRIMARY KEY, tid INTEGER, seq INTEGER, val TEXT)")
-                    .unwrap();
-                drop(fs);
-
-                let config = ConnectionManagerConfig {
-                    reader_count: 2,
-                    max_writers: 4,
-                };
-                let mgr = FrankenConnectionManager::new(&db_path, config).unwrap();
-                (temp, mgr)
+                {
+                    let fs = FrankenStorage::open(&db_path).unwrap();
+                    fs.raw()
+                        .execute("CREATE TABLE IF NOT EXISTS bench_raw (id INTEGER PRIMARY KEY, tid INTEGER, seq INTEGER, val TEXT)", &[])
+                        .unwrap();
+                }
+                let (handle, join) = coding_agent_search::storage::api::WriterHandle::<
+                    coding_agent_search::storage::api::Conn,
+                >::spawn(
+                    db_path.clone(),
+                    coding_agent_search::storage::api::Profile::Production,
+                    Ok,
+                )
+                .unwrap();
+                (temp, handle, join)
             },
-            |(_temp, mgr)| {
+            |(_temp, handle, join)| {
                 std::thread::scope(|s| {
                     for tid in 0..4 {
-                        let m = &mgr;
+                        let h = handle.clone();
                         s.spawn(move || {
                             for seq in 0..100 {
-                                let mut guard = m.concurrent_writer().unwrap();
-                                with_retry(50, || {
-                                    let mut tx = guard.storage().raw().transaction()?;
-                                    tx.execute(&format!(
-                                        "INSERT INTO bench_raw (tid, seq, val) VALUES ({tid}, {seq}, 'bench-{tid}-{seq}')"
-                                    ))?;
-                                    tx.commit().map_err(anyhow::Error::new)?;
-                                    Ok(())
+                                h.submit(move |conn: &coding_agent_search::storage::api::Conn| {
+                                    conn.execute(
+                                        &format!(
+                                            "INSERT INTO bench_raw (tid, seq, val) VALUES ({tid}, {seq}, 'bench-{tid}-{seq}')"
+                                        ),
+                                        &[],
+                                    )
                                 })
-                                .expect("concurrent raw insert should succeed");
-                                guard.mark_committed();
+                                .expect("insert via WriterHandle should succeed");
                             }
                         });
                     }
                 });
+                drop(handle);
+                join.join().expect("writer thread teardown");
             },
         );
     });
@@ -693,19 +647,16 @@ fn bench_insert_scaling(c: &mut Criterion) {
                 || {
                     let temp = TempDir::new().unwrap();
                     let db_path = temp.path().join("bench.db");
-                    let index_path = index_dir(temp.path()).expect("index path");
                     let storage = FrankenStorage::open(&db_path).unwrap();
-                    let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
                     let convs: Vec<_> = (0..count as i64)
                         .map(|i| generate_conversation(i, 10))
                         .collect();
-                    (temp, storage, t_index, convs)
+                    (temp, storage, convs)
                 },
-                |(_temp, storage, mut t_index, convs)| {
+                |(_temp, storage, convs)| {
                     for conv in &convs {
-                        persist_conversation(&storage, &mut t_index, conv).unwrap();
+                        persist_conversation(&storage, conv).unwrap();
                     }
-                    t_index.commit().unwrap();
                 },
             );
         });

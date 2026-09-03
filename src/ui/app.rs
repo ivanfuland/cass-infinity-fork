@@ -15236,6 +15236,19 @@ pub trait SearchService: Send + Sync {
     fn execute(&self, params: &SearchParams) -> Result<SearchResult, String>;
 }
 
+/// W3-5 debt note: `Upgrade` was the second phase of the progressive
+/// two-tier refinement flow (fast `Interactive` results, then a background
+/// `Upgrade` pass with quality-tier scores). That refinement machinery was
+/// retired (`run_live_search_stream` now always runs a single synchronous
+/// search), so `Upgrade` is no longer reachable through the normal
+/// interactive search flow -- it's still referenced by status text
+/// ("Refining…") and pagination's shared page-size branch
+/// (`Upgrade | Pagination`), and by tests that construct it directly.
+/// Not deleted here: doing so cleanly would mean re-deriving which of
+/// those remaining call sites still make sense with only two passes,
+/// which is a state-machine-shape decision, not a mechanical retirement
+/// one. If you're reading this because `Upgrade` looked unreachable and
+/// confusing -- that's why; it's tracked debt, not a bug.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchPass {
     Interactive,
@@ -15381,6 +15394,20 @@ impl TantivySearchService {
         Self::request_is_progressive_eligible(params, self.live_runtime.is_some())
     }
 
+    /// W3-5: the progressive two-tier refinement path (fast in-process
+    /// results immediately, refined via daemon/quality-tier embeddings
+    /// shortly after) was retired alongside `search_progressive_with_callback`
+    /// and the two-tier machinery it depended on -- the quality tier never
+    /// had production data (hnsw=null, per wave-1 attestation) and the new
+    /// DB-vector-domain engine's exact scan is <2s at 101.6万 scale (KU2),
+    /// removing the speed/accuracy tradeoff motive "fast then refined"
+    /// existed for. This always runs a single synchronous search now; the
+    /// eligibility/runtime plumbing above (`progressive_enabled`,
+    /// `request_is_progressive_eligible`, `request_eligible_for_progressive`,
+    /// `live_runtime`) is kept as-is since it still gates whether
+    /// `CassMsg::SearchRequested` routes through the async subscription
+    /// path or dispatches inline -- either path lands here and returns the
+    /// same single-pass result.
     fn run_live_search_stream(
         &self,
         params: SearchParams,
@@ -15388,137 +15415,28 @@ impl TantivySearchService {
         sender: std::sync::mpsc::Sender<CassMsg>,
         stop: StopSignal,
     ) {
-        if !self.request_eligible_for_progressive(&params)
-            || !self.client.can_progressively_refine()
-        {
-            let message = match self.execute(&params) {
-                Ok(result) => CassMsg::SearchCompleted {
-                    generation,
-                    pass: params.pass,
-                    requested_limit: params.limit,
-                    hits: result.hits,
-                    elapsed_ms: result.elapsed_ms,
-                    suggestions: result.suggestions,
-                    wildcard_fallback: result.wildcard_fallback,
-                    append: matches!(params.pass, SearchPass::Pagination),
-                },
-                Err(error) => CassMsg::SearchFailed { generation, error },
-            };
-            let _ = sender.send(message);
-            let _ = sender.send(CassMsg::SearchStreamFinished { generation });
-            return;
-        }
-
-        let Some(runtime) = self.live_runtime.clone() else {
-            let message = match self.execute(&params) {
-                Ok(result) => CassMsg::SearchCompleted {
-                    generation,
-                    pass: params.pass,
-                    requested_limit: params.limit,
-                    hits: result.hits,
-                    elapsed_ms: result.elapsed_ms,
-                    suggestions: result.suggestions,
-                    wildcard_fallback: result.wildcard_fallback,
-                    append: matches!(params.pass, SearchPass::Pagination),
-                },
-                Err(error) => CassMsg::SearchFailed { generation, error },
-            };
-            let _ = sender.send(message);
-            let _ = sender.send(CassMsg::SearchStreamFinished { generation });
-            return;
-        };
-
-        let cx = frankensearch::Cx::for_request();
-        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let cancel_done = Arc::clone(&done);
-        let cancel_stop = stop.clone();
-        let cancel_cx = cx.clone();
-        let cancel_thread = std::thread::spawn(move || {
-            while !cancel_done.load(std::sync::atomic::Ordering::Acquire) {
-                if cancel_stop.wait_timeout(Duration::from_millis(4)) {
-                    cancel_cx.set_cancel_requested(true);
-                    break;
-                }
-            }
-        });
-
-        let client = Arc::clone(&self.client);
-        let phase_sender = sender.clone();
-        let phase_stop = stop.clone();
-        let live_result = runtime.block_on(async move {
-            client
-                .search_progressive_with_callback(
-                    crate::search::query::ProgressiveSearchRequest {
-                        cx: &cx,
-                        query: &params.query,
-                        filters: params.filters.clone(),
-                        limit: params.limit,
-                        sparse_threshold: 0,
-                        field_mask: crate::search::query::FieldMask::new(false, true, true, true),
-                        mode: params.mode,
-                    },
-                    |event| {
-                        if phase_stop.is_stopped() {
-                            return;
-                        }
-                        let message = match event {
-                            crate::search::query::ProgressiveSearchEvent::Phase {
-                                kind,
-                                result,
-                                elapsed_ms,
-                            } => CassMsg::SearchCompleted {
-                                generation,
-                                pass: match kind {
-                                    crate::search::query::ProgressivePhaseKind::Initial => {
-                                        SearchPass::Interactive
-                                    }
-                                    crate::search::query::ProgressivePhaseKind::Refined => {
-                                        SearchPass::Upgrade
-                                    }
-                                },
-                                requested_limit: params.limit,
-                                hits: result.hits,
-                                elapsed_ms,
-                                suggestions: result.suggestions,
-                                wildcard_fallback: result.wildcard_fallback,
-                                append: false,
-                            },
-                            crate::search::query::ProgressiveSearchEvent::RefinementFailed {
-                                latency_ms,
-                                error,
-                            } => CassMsg::SearchRefinementFailed {
-                                generation,
-                                latency_ms,
-                                error,
-                            },
-                        };
-                        let _ = phase_sender.send(message);
-                    },
-                )
-                .await
-        });
-
-        done.store(true, std::sync::atomic::Ordering::Release);
-        let _ = cancel_thread.join();
-
-        if let Err(err) = live_result
-            && !stop.is_stopped()
-        {
-            let _ = sender.send(CassMsg::SearchFailed {
+        let _ = stop;
+        let message = match self.execute(&params) {
+            Ok(result) => CassMsg::SearchCompleted {
                 generation,
-                error: err.to_string(),
-            });
-        }
-
+                pass: params.pass,
+                requested_limit: params.limit,
+                hits: result.hits,
+                elapsed_ms: result.elapsed_ms,
+                suggestions: result.suggestions,
+                wildcard_fallback: result.wildcard_fallback,
+                append: matches!(params.pass, SearchPass::Pagination),
+            },
+            Err(error) => CassMsg::SearchFailed { generation, error },
+        };
+        let _ = sender.send(message);
         let _ = sender.send(CassMsg::SearchStreamFinished { generation });
     }
 }
 
 impl SearchService for TantivySearchService {
     fn execute(&self, params: &SearchParams) -> Result<SearchResult, String> {
-        use crate::search::query::{
-            FieldMask, SearchResult as BackendSearchResult, SemanticTierMode,
-        };
+        use crate::search::query::{FieldMask, SearchResult as BackendSearchResult};
 
         let started = Instant::now();
         let limit = params.limit;
@@ -15528,15 +15446,6 @@ impl SearchService for TantivySearchService {
             FieldMask::new(false, true, true, true)
         } else {
             FieldMask::new(true, true, true, true)
-        };
-        let two_tier_enabled = Self::progressive_enabled();
-        let semantic_tier_mode = if two_tier_enabled {
-            match params.pass {
-                SearchPass::Interactive => SemanticTierMode::FastOnly,
-                SearchPass::Upgrade | SearchPass::Pagination => SemanticTierMode::Progressive,
-            }
-        } else {
-            SemanticTierMode::Single
         };
 
         // Fix #79: Empty queries bypass BM25 and use date-sorted browsing.
@@ -15579,30 +15488,21 @@ impl SearchService for TantivySearchService {
                     )
                     .map_err(|e| e.to_string()),
                 SearchMode::Semantic => {
-                    let (hits, ann_stats) = self
+                    let hits = self
                         .client
-                        .search_semantic_with_tier(
-                            &params.query,
-                            params.filters.clone(),
-                            limit,
-                            offset,
-                            field_mask,
-                            false,
-                            semantic_tier_mode,
-                        )
+                        .search_semantic(&params.query, params.filters.clone(), limit, offset, field_mask)
                         .map_err(|e| e.to_string())?;
                     Ok(crate::search::query::SearchResult {
                         hits,
                         wildcard_fallback: false,
                         cache_stats: crate::search::query::CacheStats::default(),
                         suggestions: Vec::new(),
-                        ann_stats,
                         total_count: None,
                     })
                 }
                 SearchMode::Hybrid => self
                     .client
-                    .search_hybrid_with_tier(
+                    .search_hybrid(
                         &params.query,
                         &params.query,
                         params.filters.clone(),
@@ -15610,8 +15510,6 @@ impl SearchService for TantivySearchService {
                         offset,
                         sparse_threshold,
                         field_mask,
-                        false,
-                        semantic_tier_mode,
                     )
                     .map_err(|e| e.to_string()),
             }
@@ -19532,7 +19430,6 @@ impl super::ftui_adapter::Model for CassApp {
                             db_path,
                             data_dir,
                             semantic: false,
-                            build_hnsw: false,
                             embedder: "fastembed".to_string(),
                             progress: Some(progress),
                             watch_interval_secs: 30,
@@ -20395,7 +20292,7 @@ impl super::ftui_adapter::Model for CassApp {
                                             has_messages && needs_rebuild
                                         }
                                         Err(e) => {
-                                            // query_status failed (likely frankensqlite compat) —
+                                            // query_status failed (likely the legacy embedded engine compat) —
                                             // try rebuild anyway since we have no data to show.
                                             tracing::warn!(
                                                 error = %e,
@@ -20410,7 +20307,8 @@ impl super::ftui_adapter::Model for CassApp {
 
                                 if should_auto_rebuild {
                                     tracing::info!("analytics auto-rebuild triggered");
-                                    match crate::storage::sqlite::FrankenStorage::open(&db_path) {
+                                    // w1b Task B8 (d16, open-consumer audit): write path.
+                                    match crate::storage::sqlite::FrankenStorage::open_writer(&db_path) {
                                         Ok(db_rw) => match db_rw.rebuild_analytics() {
                                             Ok(_) => {
                                                 // Re-open with FrankenStorage to load refreshed data
@@ -22780,8 +22678,10 @@ fn load_indexed_export_view(
         return Ok(None);
     }
 
-    let storage =
-        FrankenStorage::open(db_path).map_err(|err| format!("Failed to open database: {err}"))?;
+    // w1b Task B8 (d16, open-consumer audit): pure read (session load for
+    // display), switched to the read-only open.
+    let storage = FrankenStorage::open_readonly(db_path)
+        .map_err(|err| format!("Failed to open database: {err}"))?;
     load_conversation_for_hit(&storage, hit).map_err(|err| format!("Failed to load session: {err}"))
 }
 
@@ -23287,7 +23187,7 @@ pub fn run_tui_ftui(
     model.latency_trace = latency_trace.clone();
     model.refresh_theme_config_from_data_dir();
     model.bootstrap_persisted_state();
-    model.search_service = match crate::search::tantivy::index_dir(&data_dir) {
+    model.search_service = match crate::indexer::index_dir(&data_dir) {
         Ok(index_path) => match crate::search::query::SearchClient::open_with_options(
             &index_path,
             Some(&model.db_path),
@@ -23313,22 +23213,9 @@ pub fn run_tui_ftui(
                 model.semantic_availability = setup.availability.clone();
 
                 if let Some(context) = setup.context {
-                    let ann_path = Some(
-                        data_dir
-                            .join(crate::search::vector_index::VECTOR_INDEX_DIR)
-                            .join(format!("hnsw-{}.chsw", context.embedder.id())),
-                    );
-                    let mut indexes =
-                        Vec::with_capacity(context.additional_indexes.len().saturating_add(1));
-                    indexes.push(context.index);
-                    indexes.extend(context.additional_indexes);
-                    if let Err(err) = client.set_semantic_indexes_context(
-                        context.embedder,
-                        indexes,
-                        context.filter_maps,
-                        context.roles,
-                        ann_path,
-                    ) {
+                    if let Err(err) =
+                        client.set_semantic_context(context.embedder, context.roles)
+                    {
                         tracing::debug!(error = %err, "tui semantic context unavailable");
                         let _ = client.clear_semantic_context();
                     }
@@ -27862,6 +27749,86 @@ mod tests {
         ));
     }
 
+    /// W3-5 ⓪ (task book #65): positive-path coverage for
+    /// `TantivySearchService::execute()`, the method `run_live_search_stream`
+    /// collapsed onto as its sole real call after the progressive/two-tier
+    /// machinery was retired (3f7aa054). This is the deepest reachable real
+    /// assertion: `run_live_search_stream` itself additionally requires a
+    /// `StopSignal`, but `ftui_runtime::subscription::StopSignal::new()` is
+    /// `pub(crate)` to the `ftui-runtime` crate -- cass has no public
+    /// constructor for one, and driving it would mean either reaching into
+    /// a foreign crate's private API (not our call to make) or standing up
+    /// a full ftui `Subscription`-dispatching runtime harness (a much
+    /// larger undertaking than this decommission task). `execute()` is the
+    /// entire synchronous search body `run_live_search_stream` now wraps,
+    /// so exercising it here with a real `SearchClient` over a real
+    /// `persist_conversation`-built fixture (SQLite + Tantivy, same
+    /// production path `tests/role_filter.rs` uses) verifies "the collapsed
+    /// TUI search path still finds results" without needing that
+    /// unreachable `StopSignal` layer.
+    #[test]
+    fn tantivy_search_service_execute_finds_persisted_message() {
+        use crate::connectors::{NormalizedConversation, NormalizedMessage};
+        use crate::indexer::persist::persist_conversation;
+        use crate::search::query::SearchClient;
+        use serde_json::json;
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = dir.path();
+        let db_path = data_dir.join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).expect("open storage");
+
+        let unique_token = "tantivyexecutefixturemarkerz4q8";
+        let normalized = NormalizedConversation {
+            agent_slug: "tester".into(),
+            external_id: Some("tantivy-execute-fixture".into()),
+            title: Some("tantivy execute fixture".into()),
+            workspace: None,
+            source_path: data_dir.join("tantivy-execute-fixture.jsonl"),
+            started_at: Some(4000),
+            ended_at: Some(4001),
+            metadata: json!({}),
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "user".into(),
+                author: Some("user".into()),
+                created_at: Some(4000),
+                content: format!(
+                    "Investigate why the {unique_token} search regression appeared."
+                ),
+                extra: json!({}),
+                snippets: vec![],
+                invocations: Vec::new(),
+            }],
+        };
+        persist_conversation(&storage, &normalized).expect("persist fixture conversation");
+
+        let client = Arc::new(
+            SearchClient::open(data_dir, Some(&db_path))
+                .expect("open search client")
+                .expect("search client should be available for a freshly indexed dir"),
+        );
+        let service = TantivySearchService::new(Arc::clone(&client));
+
+        let params = SearchParams {
+            query: unique_token.to_string(),
+            filters: SearchFilters::default(),
+            pass: SearchPass::Interactive,
+            mode: SearchMode::Lexical,
+            match_mode: MatchMode::Standard,
+            ranking: RankingMode::Balanced,
+            context_window: ContextWindow::Medium,
+            limit: 16,
+            offset: 0,
+        };
+
+        let result = service.execute(&params).expect("execute should succeed");
+        assert!(
+            !result.hits.is_empty(),
+            "execute() should recall the persisted fixture message for its unique token"
+        );
+    }
+
     #[test]
     fn search_requested_dispatches_with_service() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -30649,26 +30616,26 @@ mod tests {
         let db_path = tmp.path().join("cass.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
         let conn = storage.raw();
-        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'remote', 0, 0)").unwrap();
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'remote', 0, 0)", &[]).unwrap();
         conn.execute(
-            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (1, 1, 'local-ext', 'Local Session', '/fake/shared-md.jsonl', 'local', 10)",
+            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (1, 1, 'local-ext', 'Local Session', '/fake/shared-md.jsonl', 'local', 10)", &[],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO sources (id, kind, host_label, created_at, updated_at) VALUES ('work-laptop', 'ssh', 'work-laptop', 0, 0)",
+            "INSERT INTO sources (id, kind, host_label, created_at, updated_at) VALUES ('work-laptop', 'ssh', 'work-laptop', 0, 0)", &[],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (2, 1, 'remote-ext', 'Remote Session', '/fake/shared-md.jsonl', 'work-laptop', 10)",
+            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (2, 1, 'remote-ext', 'Remote Session', '/fake/shared-md.jsonl', 'work-laptop', 10)", &[],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'local markdown body')"
-        )
+        , &[])
         .unwrap();
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (2, 2, 0, 'user', 'remote markdown body')"
-        )
+        , &[])
         .unwrap();
 
         let output_path = tmp.path().join("shared.md");
@@ -30702,22 +30669,22 @@ mod tests {
         let db_path = tmp.path().join("cass.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
         let conn = storage.raw();
-        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'remote', 0, 0)").unwrap();
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'remote', 0, 0)", &[]).unwrap();
         conn.execute(
-            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (1, 1, 'old-ext', 'Old Session', '/fake/shared-md-same-source.jsonl', 'local', 10)",
+            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (1, 1, 'old-ext', 'Old Session', '/fake/shared-md-same-source.jsonl', 'local', 10)", &[],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (2, 1, 'new-ext', 'New Session', '/fake/shared-md-same-source.jsonl', 'local', 10)",
+            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (2, 1, 'new-ext', 'New Session', '/fake/shared-md-same-source.jsonl', 'local', 10)", &[],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'old markdown body')"
-        )
+        , &[])
         .unwrap();
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (2, 2, 0, 'user', 'new markdown body')"
-        )
+        , &[])
         .unwrap();
 
         let output_path = tmp.path().join("shared-same-source.md");
@@ -30759,21 +30726,21 @@ mod tests {
         let db_path = tmp.path().join("cass.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
         let conn = storage.raw();
-        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)").unwrap();
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)", &[]).unwrap();
         {
-            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            use crate::storage::api::Value as ParamValue;
             let params = [
                 ParamValue::from(1_i64),
                 ParamValue::from(session_path.display().to_string()),
             ];
-            conn.execute_with_params(
+            conn.execute(
                 "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (?1, 1, 'stale-ext', 'Stale Session', ?2, 'local', 10)",
-                &param_slice_to_values(&params),
+                &params,
             )
             .unwrap();
         }
         conn.execute(
-            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'stale indexed markdown body')",
+            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'stale indexed markdown body')", &[],
         )
         .unwrap();
 
@@ -30816,21 +30783,21 @@ mod tests {
         let db_path = tmp.path().join("cass.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
         let conn = storage.raw();
-        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)").unwrap();
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)", &[]).unwrap();
         {
-            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            use crate::storage::api::Value as ParamValue;
             let params = [
                 ParamValue::from(1_i64),
                 ParamValue::from(session_path.display().to_string()),
             ];
-            conn.execute_with_params(
+            conn.execute(
                 "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (?1, 1, 'indexed-ext', 'Indexed Session', ?2, 'local', 10)",
-                &param_slice_to_values(&params),
+                &params,
             )
             .unwrap();
         }
         conn.execute(
-            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'indexed markdown fallback body')",
+            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'indexed markdown fallback body')", &[],
         )
         .unwrap();
 
@@ -30870,21 +30837,21 @@ not jsonl",
         let db_path = tmp.path().join("cass.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
         let conn = storage.raw();
-        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'aider', 'Aider', 'local', 0, 0)").unwrap();
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'aider', 'Aider', 'local', 0, 0)", &[]).unwrap();
         {
-            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            use crate::storage::api::Value as ParamValue;
             let params = [
                 ParamValue::from(1_i64),
                 ParamValue::from(session_path.display().to_string()),
             ];
-            conn.execute_with_params(
+            conn.execute(
                 "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (?1, 1, 'aider-ext', 'Aider Session', ?2, 'local', 10)",
-                &param_slice_to_values(&params),
+                &params,
             )
             .unwrap();
         }
         conn.execute(
-            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'indexed aider markdown body')",
+            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'indexed aider markdown body')", &[],
         )
         .unwrap();
 
@@ -30917,17 +30884,17 @@ not jsonl",
         let storage = FrankenStorage::open(&db_path).unwrap();
 
         let conn = storage.raw();
-        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'remote', 0, 0)").unwrap();
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'remote', 0, 0)", &[]).unwrap();
         conn.execute(
             "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) 
-             VALUES (1, 1, 'ext', 'Test', '/fake/session.jsonl', 'local', 10)",
+             VALUES (1, 1, 'ext', 'Test', '/fake/session.jsonl', 'local', 10)", &[],
         ).unwrap();
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'hello')"
-        ).unwrap();
+        , &[]).unwrap();
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (2, 1, 1, 'assistant', 'hi')"
-        ).unwrap();
+        , &[]).unwrap();
 
         let session_path = "/fake/session.jsonl";
 
@@ -30978,26 +30945,26 @@ not jsonl",
         let db_path = tmp.path().join("cass.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
         let conn = storage.raw();
-        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'remote', 0, 0)").unwrap();
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'remote', 0, 0)", &[]).unwrap();
         conn.execute(
-            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (1, 1, 'local-ext', 'Local Session', '/fake/shared.jsonl', 'local', 10)",
+            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (1, 1, 'local-ext', 'Local Session', '/fake/shared.jsonl', 'local', 10)", &[],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO sources (id, kind, host_label, created_at, updated_at) VALUES ('work-laptop', 'ssh', 'work-laptop', 0, 0)",
+            "INSERT INTO sources (id, kind, host_label, created_at, updated_at) VALUES ('work-laptop', 'ssh', 'work-laptop', 0, 0)", &[],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (2, 1, 'remote-ext', 'Remote Session', '/fake/shared.jsonl', 'work-laptop', 10)",
+            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (2, 1, 'remote-ext', 'Remote Session', '/fake/shared.jsonl', 'work-laptop', 10)", &[],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'local export body')"
-        )
+        , &[])
         .unwrap();
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (2, 2, 0, 'user', 'remote export body')"
-        )
+        , &[])
         .unwrap();
 
         let output_path = tmp.path().join("shared.html");
@@ -31037,22 +31004,22 @@ not jsonl",
         let db_path = tmp.path().join("cass.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
         let conn = storage.raw();
-        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'remote', 0, 0)").unwrap();
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'remote', 0, 0)", &[]).unwrap();
         conn.execute(
-            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (1, 1, 'old-ext', 'Old Session', '/fake/shared-same-source.jsonl', 'local', 10)",
+            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (1, 1, 'old-ext', 'Old Session', '/fake/shared-same-source.jsonl', 'local', 10)", &[],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (2, 1, 'new-ext', 'New Session', '/fake/shared-same-source.jsonl', 'local', 10)",
+            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (2, 1, 'new-ext', 'New Session', '/fake/shared-same-source.jsonl', 'local', 10)", &[],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'old export body')"
-        )
+        , &[])
         .unwrap();
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (2, 2, 0, 'user', 'new export body')"
-        )
+        , &[])
         .unwrap();
 
         let output_path = tmp.path().join("shared-same-source.html");
@@ -31104,21 +31071,21 @@ not jsonl",
         let db_path = tmp.path().join("cass.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
         let conn = storage.raw();
-        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)").unwrap();
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)", &[]).unwrap();
         {
-            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            use crate::storage::api::Value as ParamValue;
             let params = [
                 ParamValue::from(1_i64),
                 ParamValue::from(session_path.display().to_string()),
             ];
-            conn.execute_with_params(
+            conn.execute(
                 "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (?1, 1, 'stale-ext', 'Stale Session', ?2, 'local', 10)",
-                &param_slice_to_values(&params),
+                &params,
             )
             .unwrap();
         }
         conn.execute(
-            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'stale indexed html body')",
+            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'stale indexed html body')", &[],
         )
         .unwrap();
 
@@ -31166,21 +31133,21 @@ not jsonl",
         let db_path = tmp.path().join("cass.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
         let conn = storage.raw();
-        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)").unwrap();
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)", &[]).unwrap();
         {
-            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            use crate::storage::api::Value as ParamValue;
             let params = [
                 ParamValue::from(1_i64),
                 ParamValue::from(session_path.display().to_string()),
             ];
-            conn.execute_with_params(
+            conn.execute(
                 "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (?1, 1, 'indexed-ext', 'Indexed Session', ?2, 'local', 10)",
-                &param_slice_to_values(&params),
+                &params,
             )
             .unwrap();
         }
         conn.execute(
-            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'indexed html fallback body')",
+            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'indexed html fallback body')", &[],
         )
         .unwrap();
 
@@ -31230,21 +31197,21 @@ not jsonl",
         let db_path = tmp.path().join("cass.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
         let conn = storage.raw();
-        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'aider', 'Aider', 'local', 0, 0)").unwrap();
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'aider', 'Aider', 'local', 0, 0)", &[]).unwrap();
         {
-            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            use crate::storage::api::Value as ParamValue;
             let params = [
                 ParamValue::from(1_i64),
                 ParamValue::from(session_path.display().to_string()),
             ];
-            conn.execute_with_params(
+            conn.execute(
                 "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (?1, 1, 'aider-ext', 'Aider Session', ?2, 'local', 10)",
-                &param_slice_to_values(&params),
+                &params,
             )
             .unwrap();
         }
         conn.execute(
-            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'indexed aider html body')",
+            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'indexed aider html body')", &[],
         )
         .unwrap();
 
@@ -34174,7 +34141,7 @@ not jsonl",
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("analytics_loading.db");
         let storage =
-            FrankenStorage::open(&db_path).expect("open frankensqlite for analytics test");
+            FrankenStorage::open(&db_path).expect("open the legacy embedded engine for analytics test");
         app.db_reader = Some(Arc::new(storage));
 
         let cmd = app.schedule_analytics_reload();
@@ -34249,7 +34216,7 @@ not jsonl",
     fn analytics_entered_sets_loading_context_when_cache_empty() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("analytics_enter.db");
-        let storage = FrankenStorage::open(&db_path).expect("open frankensqlite");
+        let storage = FrankenStorage::open(&db_path).expect("open the legacy embedded engine");
         let mut app = CassApp::default();
         app.db_reader = Some(Arc::new(storage));
         app.analytics_cache = None;

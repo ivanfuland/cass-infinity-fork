@@ -1,32 +1,33 @@
-// Dead-code tolerated module-wide: this concurrency / busy-lock / WAL-sidecar /
-// stale-cache contention classifier (bead cass-fleet-resilience-20260608-uojcg.14.3)
+// Dead-code tolerated module-wide: this concurrency / busy-lock / WAL-sidecar
+// contention classifier (bead cass-fleet-resilience-20260608-uojcg.14.3)
 // lands the classification contract ahead of its projection into the
 // health/status/doctor/search robot surfaces and the real-binary contention
 // E2E gate (.14.4). It populates the .14.1 StorageState taxonomy that the .14.2
 // salvage planner already consumes.
 #![allow(dead_code)]
 
-//! Concurrency, busy-lock, WAL-sidecar, and stale-cache contention
-//! diagnostics (bead cass-fleet-resilience-20260608-uojcg.14.3).
+//! Concurrency, busy-lock, and WAL-sidecar contention diagnostics (bead
+//! cass-fleet-resilience-20260608-uojcg.14.3).
 //!
 //! Several failure classes are *contention or transient sidecar state*, not
 //! corrupt user data: the CLI, daemon, and indexer can collide on busy locks;
-//! a killed process can leave a hot WAL/SHM sidecar; a cached searcher can
-//! serve an old segment generation after a publish. cass must explain
+//! a killed process can leave a hot WAL/SHM sidecar. cass must explain
 //! contention **as contention** — with bounded retry/wait guidance — rather
 //! than as missing data or archive loss.
 //!
 //! This module is the classification contract:
-//! - [`ContentionClass`] separates busy/locked, busy-recovery, snapshot
-//!   conflict, stale WAL/SHM sidecar, stale searcher/cache, and host-pressure.
-//! - [`classify_franken_error`] maps a real `frankensqlite::FrankenError` to
+//! - [`ContentionClass`] separates busy-timeout, WAL-checkpoint-stall, and
+//!   host-pressure (w1b Task B5, plan delta d14: redesigned for the stock
+//!   SQLite lock model — the original six-class taxonomy carried three
+//!   variants scoped to the legacy embedded engine's `BEGIN CONCURRENT` MVCC mode or to a
+//!   cached-searcher-generation concern this module never actually owned;
+//!   see [`ContentionClass::BusyTimeout`]'s doc comment for which of those
+//!   three still had a real, reachable error branch worth preserving).
+//! - [`classify_storage_error`] maps a `storage::api::StorageError` to
 //!   its contention class (or `None` when the error is not contention — e.g.
 //!   corruption, which is a `.14.1` integrity state, not a transient).
 //! - [`Retryability`] + [`BoundedWaitGuidance`] give retry/backoff advice that
 //!   is **always bounded** — robot commands never block indefinitely.
-//! - [`CacheStaleness`] classifies a cached searcher relative to the published
-//!   generation; a stale cache is *invalidated/reported*, never treated as
-//!   archive loss.
 //! - [`ContentionReport`] is the projected verdict: class, retryability,
 //!   bounded wait, the [`StorageState`] it maps to, best-effort
 //!   [`LockEvidence`], a concrete (never bare/destructive) recommended
@@ -38,6 +39,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::search::storage_integrity::StorageState;
+use crate::storage::api::StorageError;
 
 /// Schema version for the contention-report JSON contract.
 pub(crate) const CONTENTION_REPORT_SCHEMA_VERSION: u32 = 1;
@@ -47,24 +49,40 @@ const CONTENTION_REPORT_KIND: &str = "contention_diagnostic";
 /// A distinct contention / transient-state class. None of these is archive
 /// data loss — they resolve by waiting, inspecting a sidecar, or relieving
 /// host pressure.
+///
+/// w1b Task B5 (plan delta d14, 2026-08-26): three classes, down from six.
+/// The retired variants (`BusyRecovery`, `SnapshotConflict`,
+/// `StaleSearcherCache`) are recorded in
+/// `~/projects/cc-cass-w1-artifacts/w1b-b4-deleted-tests.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ContentionClass {
     /// No contention observed.
     None,
-    /// Another writer holds the lock (`SQLITE_BUSY` / `FrankenError::Busy`).
-    BusyLocked,
-    /// The database is recovering a hot journal/WAL (`BusyRecovery`).
-    BusyRecovery,
-    /// An MVCC snapshot/serialization conflict (`BusySnapshot` /
-    /// `WriteConflict` / `SerializationFailure`) — retry the transaction.
-    SnapshotConflict,
+    /// Another writer holds the lock and the caller should retry after a
+    /// bounded backoff (`SQLITE_BUSY` / `SQLITE_LOCKED`, any scope).
+    ///
+    /// This absorbs what B4-and-earlier called `BusyLocked` (`Busy{Statement}`/
+    /// `Locked`) *and* `SnapshotConflict` (`Busy{Snapshot}`) as one class:
+    /// `SQLITE_BUSY_SNAPSHOT` is a standard SQLite extended error code
+    /// (`rusqlite::ffi::SQLITE_BUSY_SNAPSHOT`), not an MVCC-only concept —
+    /// `backend_sqlite.rs::map_sqlite_failure` produces it for real under the
+    /// stock engine, and B3's `Conn::with_tx` whole-transaction replay exists
+    /// specifically for this scope and has run end-to-end against the
+    /// rusqlite backend. Folding it into `BusyTimeout` (control-plane
+    /// adjudicated 2026-08-26) keeps that error branch classified instead of
+    /// silently dropping to `None` — a `Busy{Snapshot}` classifying as
+    /// "not contention" would be a real regression, worse than losing a
+    /// distinct variant name. `BusyRecovery` needed no separate treatment:
+    /// both backends already collapse it into the same `Busy{Statement}`
+    /// bucket `BusyLocked` handled (see `classify_storage_error`'s doc
+    /// comment), so it never had an independent error branch to preserve.
+    BusyTimeout,
     /// A WAL/SHM sidecar is stale or orphaned (a process was killed
-    /// mid-write); the canonical rows survive.
-    StaleWalSidecar,
-    /// A cached searcher / derived artifact is serving an older generation
-    /// than was last published; reload or report, never treat as loss.
-    StaleSearcherCache,
+    /// mid-write); the canonical rows survive. Renamed from `StaleWalSidecar`
+    /// (B5); still a zero-construction-site scaffolding contract, per the
+    /// module doc comment, ahead of its projection into a real detector.
+    WalCheckpointStall,
     /// Host resource pressure (disk/memory/load) is the proximate cause;
     /// waiting will not clear it.
     HostPressure,
@@ -74,29 +92,22 @@ impl ContentionClass {
     pub(crate) fn stable_name(self) -> &'static str {
         match self {
             Self::None => "none",
-            Self::BusyLocked => "busy_locked",
-            Self::BusyRecovery => "busy_recovery",
-            Self::SnapshotConflict => "snapshot_conflict",
-            Self::StaleWalSidecar => "stale_wal_sidecar",
-            Self::StaleSearcherCache => "stale_searcher_cache",
+            Self::BusyTimeout => "busy_timeout",
+            Self::WalCheckpointStall => "wal_checkpoint_stall",
             Self::HostPressure => "host_pressure",
         }
     }
 
     /// The invariant: contention is **never** archive/source data loss. A
-    /// busy lock, a stale sidecar, and a stale cache all leave the canonical
-    /// rows intact.
+    /// busy lock and a stale sidecar both leave the canonical rows intact.
     pub(crate) fn is_archive_loss(self) -> bool {
         false
     }
 
-    /// Whether this class resolves on its own by waiting (a transient lock or
-    /// recovery), as opposed to needing inspection or host action.
+    /// Whether this class resolves on its own by waiting (a transient lock),
+    /// as opposed to needing inspection or host action.
     pub(crate) fn is_transient_lock(self) -> bool {
-        matches!(
-            self,
-            Self::BusyLocked | Self::BusyRecovery | Self::SnapshotConflict
-        )
+        matches!(self, Self::BusyTimeout)
     }
 
     /// How this class may be retried.
@@ -104,13 +115,11 @@ impl ContentionClass {
         match self {
             // Nothing to retry.
             Self::None => Retryability::NotRetryable,
-            // Transient locks/conflicts clear with bounded backoff.
-            Self::BusyLocked | Self::BusyRecovery | Self::SnapshotConflict => {
-                Retryability::RetryAfterBackoff
-            }
-            // Sidecar / cache states need a read-only inspection or reload
-            // before a retry is meaningful.
-            Self::StaleWalSidecar | Self::StaleSearcherCache => Retryability::RetryAfterInspection,
+            // A transient lock clears with bounded backoff.
+            Self::BusyTimeout => Retryability::RetryAfterBackoff,
+            // Sidecar state needs a read-only inspection before a retry is
+            // meaningful.
+            Self::WalCheckpointStall => Retryability::RetryAfterInspection,
             // Waiting will not free disk/memory; this needs operator action.
             Self::HostPressure => Retryability::NotRetryable,
         }
@@ -127,18 +136,14 @@ impl ContentionClass {
     }
 
     /// The storage-integrity state this contention maps to, when it implies
-    /// one. Busy variants are `BusyOrLocked`; a stale sidecar is
-    /// `WalSidecarSuspect`; a stale searcher cache is `DerivedOnlyDrift`
-    /// (derived assets drifted, canonical intact). `None`/`HostPressure` do
-    /// not by themselves imply a storage-integrity fault.
+    /// one. A busy timeout is `BusyOrLocked`; a WAL-checkpoint stall is
+    /// `WalSidecarSuspect`. `None`/`HostPressure` do not by themselves imply
+    /// a storage-integrity fault.
     pub(crate) fn to_storage_state(self) -> Option<StorageState> {
         match self {
             Self::None | Self::HostPressure => None,
-            Self::BusyLocked | Self::BusyRecovery | Self::SnapshotConflict => {
-                Some(StorageState::BusyOrLocked)
-            }
-            Self::StaleWalSidecar => Some(StorageState::WalSidecarSuspect),
-            Self::StaleSearcherCache => Some(StorageState::DerivedOnlyDrift),
+            Self::BusyTimeout => Some(StorageState::BusyOrLocked),
+            Self::WalCheckpointStall => Some(StorageState::WalSidecarSuspect),
         }
     }
 
@@ -148,13 +153,9 @@ impl ContentionClass {
         match self {
             // Transient: re-check readiness; the command succeeds once the
             // other writer releases.
-            Self::BusyLocked | Self::BusyRecovery | Self::SnapshotConflict => {
-                Some("cass status --json")
-            }
+            Self::BusyTimeout => Some("cass status --json"),
             // Sidecar suspect: read-only inspection.
-            Self::StaleWalSidecar => Some("cass doctor check --json"),
-            // Stale cache: status reports the live generation after reload.
-            Self::StaleSearcherCache => Some("cass status --json"),
+            Self::WalCheckpointStall => Some("cass doctor check --json"),
             // Host pressure: status surfaces the pressure; the fix is
             // host-level (free disk / memory), reflected in the explanation.
             Self::HostPressure => Some("cass status --json"),
@@ -166,20 +167,11 @@ impl ContentionClass {
     pub(crate) fn explanation(self) -> &'static str {
         match self {
             Self::None => "no storage contention observed",
-            Self::BusyLocked => {
-                "another writer holds the lock; this is contention, not missing data — retry after a bounded backoff"
+            Self::BusyTimeout => {
+                "another writer holds the lock or the transaction's snapshot conflicted with a concurrent write; this is contention, not missing data — retry after a bounded backoff"
             }
-            Self::BusyRecovery => {
-                "the database is recovering a hot WAL; this is transient, not corruption — retry after a bounded backoff"
-            }
-            Self::SnapshotConflict => {
-                "an MVCC snapshot/serialization conflict; the transaction can be retried after a bounded backoff"
-            }
-            Self::StaleWalSidecar => {
+            Self::WalCheckpointStall => {
                 "a WAL/SHM sidecar is stale or orphaned; the canonical rows are intact — checkpoint/recover, do not treat as loss"
-            }
-            Self::StaleSearcherCache => {
-                "a cached searcher is serving an older generation; reload/invalidate it — the published index is not lost"
             }
             Self::HostPressure => {
                 "host resource pressure (disk/memory/load) is the proximate cause; waiting will not clear it — relieve host pressure"
@@ -188,31 +180,34 @@ impl ContentionClass {
     }
 }
 
-/// Map a real `frankensqlite::FrankenError` to its contention class, or `None`
+/// Map a `storage::api::StorageError` to its contention class, or `None`
 /// when the error is not a transient/contention class (e.g. corruption, which
 /// is a `.14.1` integrity state). The struct variants are matched with `{ .. }`
 /// so this stays robust to field-shape changes, with a catch-all for any
 /// future non-contention variant.
-pub(crate) fn classify_franken_error(err: &frankensqlite::FrankenError) -> Option<ContentionClass> {
-    use frankensqlite::FrankenError as E;
+///
+/// w1b Task B5 (plan delta d14): `Busy { .. }` (either scope) and `Locked`
+/// all fold into [`ContentionClass::BusyTimeout`] — see that variant's doc
+/// comment for why the `Snapshot` scope stays classified here instead of
+/// falling to `None`. Renamed from `classify_franken_error`: nothing about
+/// this function is franken-specific, and it never was (both backends'
+/// error-mapping functions already produced the same `StorageError` shape
+/// this matches on).
+pub(crate) fn classify_storage_error(err: &StorageError) -> Option<ContentionClass> {
     match err {
-        E::Busy => Some(ContentionClass::BusyLocked),
-        E::BusyRecovery => Some(ContentionClass::BusyRecovery),
-        E::BusySnapshot { .. } | E::WriteConflict { .. } | E::SerializationFailure { .. } => {
-            Some(ContentionClass::SnapshotConflict)
-        }
+        StorageError::Busy { .. } | StorageError::Locked => Some(ContentionClass::BusyTimeout),
         // Corruption is NOT contention — it is a `.14.1` IntegrityFailed state
         // handled by the storage-integrity probe, never auto-retried here.
         _ => None,
     }
 }
 
-/// Whether a `frankensqlite::FrankenError` is a retryable contention error
-/// (busy/recovery/snapshot conflict). Mirrors the retry predicate used by the
-/// connection-manager backoff loop, but driven by the shared classifier so the
+/// Whether a `storage::api::StorageError` is a retryable contention error
+/// (busy timeout, either scope). Mirrors the retry predicate used by the
+/// writer-thread retry loop, but driven by the shared classifier so the
 /// two never disagree.
-pub(crate) fn is_retryable_contention(err: &frankensqlite::FrankenError) -> bool {
-    classify_franken_error(err)
+pub(crate) fn is_retryable_contention(err: &StorageError) -> bool {
+    classify_storage_error(err)
         .is_some_and(|c| matches!(c.retryability(), Retryability::RetryAfterBackoff))
 }
 
@@ -271,49 +266,6 @@ impl BoundedWaitGuidance {
     /// explicit, assertable invariant for consumers.
     pub(crate) fn is_bounded(&self) -> bool {
         self.max_attempts > 0 && self.max_total_wait_ms > 0 && self.max_total_wait_ms < u64::MAX
-    }
-}
-
-/// How a cached searcher relates to the published index generation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum CacheStaleness {
-    /// The cache matches the published generation.
-    Fresh,
-    /// The cache is serving an older generation than published.
-    StaleGeneration,
-    /// A reload was attempted and failed; the cache may be stale.
-    ReloadFailed,
-}
-
-impl CacheStaleness {
-    /// Classify a cached searcher from the published vs cached generation
-    /// signatures and whether the last reload succeeded.
-    pub(crate) fn classify(
-        published_generation: Option<&str>,
-        cached_generation: Option<&str>,
-        reload_ok: bool,
-    ) -> Self {
-        if !reload_ok {
-            return Self::ReloadFailed;
-        }
-        match (published_generation, cached_generation) {
-            (Some(p), Some(c)) if p == c => Self::Fresh,
-            // Unknown generations are treated as fresh: absence of a signature
-            // is not evidence of staleness (and never of loss).
-            (None, _) | (_, None) => Self::Fresh,
-            _ => Self::StaleGeneration,
-        }
-    }
-
-    /// The contention class this staleness implies, if any. A fresh cache is
-    /// no contention; stale/reload-failed is a `StaleSearcherCache` to report
-    /// or invalidate — never archive loss.
-    pub(crate) fn to_contention_class(self) -> ContentionClass {
-        match self {
-            Self::Fresh => ContentionClass::None,
-            Self::StaleGeneration | Self::ReloadFailed => ContentionClass::StaleSearcherCache,
-        }
     }
 }
 
@@ -382,10 +334,10 @@ impl ContentionReport {
         }
     }
 
-    /// Build the verdict directly from a `frankensqlite::FrankenError`, or
+    /// Build the verdict directly from a `storage::api::StorageError`, or
     /// `None` when the error is not a contention class (e.g. corruption).
-    pub(crate) fn from_franken_error(err: &frankensqlite::FrankenError) -> Option<Self> {
-        classify_franken_error(err).map(|class| Self::classify(class, None))
+    pub(crate) fn from_storage_error(err: &StorageError) -> Option<Self> {
+        classify_storage_error(err).map(|class| Self::classify(class, None))
     }
 }
 
@@ -395,11 +347,8 @@ mod tests {
 
     const ALL_CLASSES: &[ContentionClass] = &[
         ContentionClass::None,
-        ContentionClass::BusyLocked,
-        ContentionClass::BusyRecovery,
-        ContentionClass::SnapshotConflict,
-        ContentionClass::StaleWalSidecar,
-        ContentionClass::StaleSearcherCache,
+        ContentionClass::BusyTimeout,
+        ContentionClass::WalCheckpointStall,
         ContentionClass::HostPressure,
     ];
 
@@ -407,11 +356,8 @@ mod tests {
     fn classes_serialize_snake_case_and_are_stable() {
         let pairs: &[(ContentionClass, &str)] = &[
             (ContentionClass::None, "none"),
-            (ContentionClass::BusyLocked, "busy_locked"),
-            (ContentionClass::BusyRecovery, "busy_recovery"),
-            (ContentionClass::SnapshotConflict, "snapshot_conflict"),
-            (ContentionClass::StaleWalSidecar, "stale_wal_sidecar"),
-            (ContentionClass::StaleSearcherCache, "stale_searcher_cache"),
+            (ContentionClass::BusyTimeout, "busy_timeout"),
+            (ContentionClass::WalCheckpointStall, "wal_checkpoint_stall"),
             (ContentionClass::HostPressure, "host_pressure"),
         ];
         for (variant, want) in pairs {
@@ -422,6 +368,25 @@ mod tests {
             assert_eq!(variant.stable_name(), *want);
         }
         assert_eq!(pairs.len(), ALL_CLASSES.len());
+    }
+
+    /// w1b Task B5 Step 1: the old six-class taxonomy's variant names must
+    /// not resurface anywhere serde/`stable_name` can produce a string —
+    /// this is the "旧类名不再出现" negative half of the mapping-coverage
+    /// assertion (the full-仓 grep check is a separate, external validation
+    /// step; this test pins the in-module surface).
+    #[test]
+    fn retired_class_names_do_not_resurface_in_any_serialized_form() {
+        let retired_snake_case_names =
+            ["busy_locked", "busy_recovery", "snapshot_conflict", "stale_wal_sidecar", "stale_searcher_cache"];
+        for &class in ALL_CLASSES {
+            let serialized = serde_json::to_string(&class).expect("serialize class");
+            let stable = class.stable_name();
+            for retired in retired_snake_case_names {
+                assert_ne!(serialized, format!("\"{retired}\""), "{class:?} must not serialize as a retired name");
+                assert_ne!(stable, retired, "{class:?} must not stable_name as a retired name");
+            }
+        }
     }
 
     #[test]
@@ -439,23 +404,11 @@ mod tests {
     #[test]
     fn retryability_matches_class_semantics() {
         assert_eq!(
-            ContentionClass::BusyLocked.retryability(),
+            ContentionClass::BusyTimeout.retryability(),
             Retryability::RetryAfterBackoff
         );
         assert_eq!(
-            ContentionClass::BusyRecovery.retryability(),
-            Retryability::RetryAfterBackoff
-        );
-        assert_eq!(
-            ContentionClass::SnapshotConflict.retryability(),
-            Retryability::RetryAfterBackoff
-        );
-        assert_eq!(
-            ContentionClass::StaleWalSidecar.retryability(),
-            Retryability::RetryAfterInspection
-        );
-        assert_eq!(
-            ContentionClass::StaleSearcherCache.retryability(),
+            ContentionClass::WalCheckpointStall.retryability(),
             Retryability::RetryAfterInspection
         );
         assert_eq!(
@@ -490,20 +443,12 @@ mod tests {
     #[test]
     fn storage_state_mapping_is_consistent_with_taxonomy() {
         assert_eq!(
-            ContentionClass::BusyLocked.to_storage_state(),
+            ContentionClass::BusyTimeout.to_storage_state(),
             Some(StorageState::BusyOrLocked)
         );
         assert_eq!(
-            ContentionClass::SnapshotConflict.to_storage_state(),
-            Some(StorageState::BusyOrLocked)
-        );
-        assert_eq!(
-            ContentionClass::StaleWalSidecar.to_storage_state(),
+            ContentionClass::WalCheckpointStall.to_storage_state(),
             Some(StorageState::WalSidecarSuspect)
-        );
-        assert_eq!(
-            ContentionClass::StaleSearcherCache.to_storage_state(),
-            Some(StorageState::DerivedOnlyDrift)
         );
         // Host pressure / none are not by themselves storage-integrity faults.
         assert_eq!(ContentionClass::HostPressure.to_storage_state(), None);
@@ -531,45 +476,14 @@ mod tests {
     }
 
     #[test]
-    fn cache_staleness_classification() {
-        assert_eq!(
-            CacheStaleness::classify(Some("g7"), Some("g7"), true),
-            CacheStaleness::Fresh
-        );
-        assert_eq!(
-            CacheStaleness::classify(Some("g8"), Some("g7"), true),
-            CacheStaleness::StaleGeneration
-        );
-        assert_eq!(
-            CacheStaleness::classify(Some("g8"), Some("g7"), false),
-            CacheStaleness::ReloadFailed
-        );
-        // Unknown generation is treated as fresh (absence ≠ staleness ≠ loss).
-        assert_eq!(
-            CacheStaleness::classify(None, Some("g7"), true),
-            CacheStaleness::Fresh
-        );
-        // Stale / reload-failed map to a reportable cache contention, never loss.
-        assert_eq!(
-            CacheStaleness::StaleGeneration.to_contention_class(),
-            ContentionClass::StaleSearcherCache
-        );
-        assert!(
-            !CacheStaleness::ReloadFailed
-                .to_contention_class()
-                .is_archive_loss()
-        );
-    }
-
-    #[test]
     fn report_round_trips_through_json_with_invariant() {
         let report = ContentionReport::classify(
-            ContentionClass::BusyLocked,
+            ContentionClass::BusyTimeout,
             Some(LockEvidence::from_busy_timeout()),
         );
         let json = serde_json::to_string(&report).expect("serialize report");
         assert!(json.contains("\"report_kind\":\"contention_diagnostic\""));
-        assert!(json.contains("\"class\":\"busy_locked\""));
+        assert!(json.contains("\"class\":\"busy_timeout\""));
         assert!(json.contains("\"is_archive_loss\":false"));
         assert!(json.contains("\"retryability\":\"retry_after_backoff\""));
         let parsed: ContentionReport = serde_json::from_str(&json).expect("parse report");
@@ -585,184 +499,128 @@ mod tests {
         assert!(ev.note.is_some());
     }
 
+    /// w1b Task B5 Step 1: full mapping coverage for both `Busy` scopes
+    /// (`Statement` and `Snapshot`) plus `Locked`, all landing on
+    /// `BusyTimeout` -- this is the assertion that would have caught a
+    /// regression back to the "Snapshot scope silently drops to `None`"
+    /// option the control plane explicitly rejected (plan delta d14).
     #[test]
-    fn classify_franken_error_maps_busy_variants_and_skips_corruption() {
-        use frankensqlite::FrankenError as E;
-        // Busy / recovery are concrete unit variants — safe to construct.
+    fn classify_storage_error_maps_busy_variants_and_skips_corruption() {
+        use crate::storage::api::BusyScope;
         assert_eq!(
-            classify_franken_error(&E::Busy),
-            Some(ContentionClass::BusyLocked)
+            classify_storage_error(&StorageError::Busy { scope: BusyScope::Statement }),
+            Some(ContentionClass::BusyTimeout)
         );
         assert_eq!(
-            classify_franken_error(&E::BusyRecovery),
-            Some(ContentionClass::BusyRecovery)
+            classify_storage_error(&StorageError::Locked),
+            Some(ContentionClass::BusyTimeout)
         );
-        assert!(is_retryable_contention(&E::Busy));
-        assert!(is_retryable_contention(&E::BusyRecovery));
+        assert_eq!(
+            classify_storage_error(&StorageError::Busy { scope: BusyScope::Snapshot }),
+            Some(ContentionClass::BusyTimeout),
+            "Busy{{Snapshot}} must classify as contention, not silently drop to None \
+             (SQLITE_BUSY_SNAPSHOT is a real, reachable stock-SQLite error code)"
+        );
+        assert!(is_retryable_contention(&StorageError::Busy { scope: BusyScope::Statement }));
+        assert!(is_retryable_contention(&StorageError::Busy { scope: BusyScope::Snapshot }));
         // A non-contention error classifies to None and is not retryable here.
-        assert_eq!(classify_franken_error(&E::QueryReturnedNoRows), None);
-        assert!(!is_retryable_contention(&E::QueryReturnedNoRows));
+        assert_eq!(
+            classify_storage_error(&StorageError::Other { code: None, detail: String::new() }),
+            None
+        );
+        assert!(!is_retryable_contention(&StorageError::Other { code: None, detail: String::new() }));
     }
 }
 
-/// Integration coverage: real reader/writer contention on a frankensqlite-backed
-/// temp DB. Mirrors the proven concurrent-stress pattern (anyhow + downcast to
-/// `FrankenError`, `concurrent_writer`, `execute_compat`) but drives the retry
-/// loop through this module's shared classifier, proving that every MVCC commit
-/// conflict is classified as a retryable contention class (never archive loss),
-/// that bounded retry converges, and that no update is lost.
+
+/// Integration coverage, rewritten for w1b Task B4 (secondary contract #4):
+/// this used to drive real MVCC write-write conflicts through N genuinely
+/// concurrent `FrankenConnectionManager::concurrent_writer()` connections
+/// and assert every conflict classified as `ContentionClass::SnapshotConflict`
+/// (a retryable, non-archive-loss class). B4 retires the capability to have
+/// more than 1 live writer connection on a path at all -- `WriterHandle`
+/// serializes every write through a single dedicated thread, so a real
+/// snapshot conflict can no longer occur here by construction.
+///
+/// This is a deliberate B4/B5 boundary (write-topology inventory §⑥, item
+/// 4, control-plane adjudicated 2026-08-26): B4's job was to make this
+/// compile and pass under the single-writer model; retiring
+/// `ContentionClass::SnapshotConflict` itself from the taxonomy (six
+/// classes -> three, since done -- see [`ContentionClass::BusyTimeout`])
+/// was B5's job. So this test keeps proving the property that actually
+/// matters across the migration -- N threads hammering the same hot row
+/// through `WriterHandle` never lose an update -- without the
+/// now-unreachable conflict-classification assertions.
 #[cfg(test)]
 mod contention_integration_tests {
-    use super::{ContentionClass, classify_franken_error};
-    use crate::storage::sqlite::{ConnectionManagerConfig, FrankenConnectionManager, WriterGuard};
-    use frankensqlite::compat::{RowExt, TransactionExt};
-    use frankensqlite::params as fparams;
+    use crate::storage::api::{Conn, Profile, WriterHandle};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
     use tempfile::TempDir;
 
-    /// One blind-increment transaction against the hot counter row. A fresh
-    /// transaction per call reads the latest committed value, so a retried
-    /// commit lands exactly one increment — no lost updates. Returns the raw
-    /// `anyhow` error so the caller can downcast to `FrankenError` and classify
-    /// the contention, mirroring the production retry loop.
-    fn try_increment(guard: &WriterGuard<'_>) -> anyhow::Result<()> {
-        let mut tx = guard.storage().raw().transaction()?;
-        tx.execute_compat(
-            "UPDATE counter SET v = v + ?1 WHERE id = 1",
-            fparams![1_i64],
-        )?;
-        tx.commit()?;
-        Ok(())
-    }
-
     #[test]
-    fn concurrent_writers_on_hot_row_classify_as_retryable_contention_and_converge() {
+    fn writer_handle_serializes_hot_row_increments_with_no_lost_updates() {
         let dir = TempDir::new().expect("temp dir");
         let db_path = dir.path().join("contention.db");
-        let config = ConnectionManagerConfig {
-            reader_count: 2,
-            max_writers: 4,
-        };
-        let mgr = FrankenConnectionManager::new(&db_path, config).expect("open manager");
+        let (handle, join) =
+            WriterHandle::<Conn>::spawn(db_path, Profile::Production, Ok).expect("spawn writer");
 
-        // One hot counter row that every writer contends on — maximizes the
-        // chance the MVCC engine raises a real write-write conflict.
-        {
-            let mut guard = mgr.writer().expect("writer");
-            guard
-                .storage()
-                .raw()
-                .execute("CREATE TABLE counter (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)")
-                .expect("create table");
-            guard
-                .storage()
-                .raw()
-                .execute("INSERT INTO counter (id, v) VALUES (1, 0)")
-                .expect("seed counter");
-            guard.mark_committed();
-        }
+        // One hot counter row that every submitter thread contends on --
+        // under the pre-B4 MVCC-concurrent-writer model this was the row
+        // engineered to maximize real write-write conflicts; under
+        // WriterHandle it just exercises normal serialized contention.
+        handle
+            .submit(|conn: &Conn| {
+                conn.execute_batch(
+                    "CREATE TABLE counter (id INTEGER PRIMARY KEY, v INTEGER NOT NULL); \
+                     INSERT INTO counter (id, v) VALUES (1, 0);",
+                )
+            })
+            .expect("seed counter");
 
         let num_threads = 6;
         let incr_per_thread = 60;
-        let classified_conflicts = Arc::new(AtomicUsize::new(0));
-        let archive_loss_seen = Arc::new(AtomicUsize::new(0));
-        let non_contention_errors = Arc::new(AtomicUsize::new(0));
+        let unexpected_errors = Arc::new(AtomicUsize::new(0));
 
         std::thread::scope(|s| {
             for _ in 0..num_threads {
-                let m = &mgr;
-                let conflicts = Arc::clone(&classified_conflicts);
-                let losses = Arc::clone(&archive_loss_seen);
-                let unexpected = Arc::clone(&non_contention_errors);
+                let h = handle.clone();
+                let unexpected = Arc::clone(&unexpected_errors);
                 s.spawn(move || {
                     for _ in 0..incr_per_thread {
-                        let mut attempt: u32 = 0;
-                        loop {
-                            let mut guard = m.concurrent_writer().expect("concurrent writer");
-                            let result = try_increment(&guard);
-
-                            match result {
-                                Ok(()) => {
-                                    guard.mark_committed();
-                                    break;
-                                }
-                                Err(err) => {
-                                    let franken = err
-                                        .downcast_ref::<frankensqlite::FrankenError>()
-                                        .or_else(|| {
-                                            err.root_cause()
-                                                .downcast_ref::<frankensqlite::FrankenError>()
-                                        });
-                                    let class = franken.and_then(classify_franken_error);
-                                    match class {
-                                        Some(c) => {
-                                            conflicts.fetch_add(1, Ordering::Relaxed);
-                                            if c.is_archive_loss() {
-                                                losses.fetch_add(1, Ordering::Relaxed);
-                                            }
-                                            // Bounded jittered backoff, capped so
-                                            // the loop can never spin forever.
-                                            attempt += 1;
-                                            assert!(
-                                                attempt < 500,
-                                                "bounded retry must converge, not spin"
-                                            );
-                                            let backoff = (1u64 << attempt.min(8)).min(256);
-                                            std::thread::sleep(Duration::from_millis(backoff));
-                                        }
-                                        None => {
-                                            // A non-contention error here is a
-                                            // genuine failure; record and stop
-                                            // this increment's loop.
-                                            unexpected.fetch_add(1, Ordering::Relaxed);
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
+                        let result = h.submit(|conn: &Conn| {
+                            let tx = conn.transaction()?;
+                            tx.execute("UPDATE counter SET v = v + 1 WHERE id = 1", &[])?;
+                            tx.commit()
+                        });
+                        if result.is_err() {
+                            unexpected.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 });
             }
         });
 
-        // No spurious non-contention error surfaced under pure write contention.
+        // Single-writer serialization means there is structurally no
+        // conflict to retry away -- every submitted increment must simply
+        // succeed.
         assert_eq!(
-            non_contention_errors.load(Ordering::Relaxed),
+            unexpected_errors.load(Ordering::Relaxed),
             0,
-            "all errors under write contention must be contention classes"
+            "WriterHandle must never surface an error under pure write contention"
         );
-        // Contention is never archive loss.
-        assert_eq!(
-            archive_loss_seen.load(Ordering::Relaxed),
-            0,
-            "no contention error may report archive loss"
-        );
-        // Bounded retry converged with no lost updates: the hot counter equals
-        // every successful increment.
-        let reader = mgr.reader();
-        let rows = reader
-            .query("SELECT v FROM counter WHERE id = 1")
+
+        // No lost updates: the hot counter equals every successful increment.
+        let final_v: i64 = handle
+            .submit(|conn: &Conn| conn.query_row_map("SELECT v FROM counter WHERE id = 1", &[], |row| row.get_typed(0)))
             .expect("read counter");
-        let final_v: i64 = rows[0].get_typed(0).expect("typed counter");
         assert_eq!(
             final_v,
             (num_threads * incr_per_thread) as i64,
             "every increment must be durably applied (no lost updates)"
         );
-        // The classifier was actually exercised by real MVCC contention.
-        let observed = classified_conflicts.load(Ordering::Relaxed);
-        eprintln!("hot-row contention: {observed} classified retryable conflicts");
-        assert!(
-            observed >= 1,
-            "hot-row contention should raise at least one classified conflict"
-        );
-        // Sanity: the contention class observed maps to a busy-or-locked
-        // storage state and is retryable.
-        let busy = ContentionClass::SnapshotConflict;
-        assert!(busy.to_storage_state().is_some());
-        assert!(!busy.is_archive_loss());
+
+        drop(handle);
+        join.join().expect("writer thread teardown");
     }
 }

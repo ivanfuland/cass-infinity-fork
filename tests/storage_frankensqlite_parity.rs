@@ -1,12 +1,12 @@
 //! FrankenStorage parity tests.
 //!
-//! These tests exercise FrankenStorage (the primary frankensqlite-backed storage
+//! These tests exercise FrankenStorage (the primary legacy-engine-backed storage
 //! engine) against the full range of SQL patterns cass uses. `SqliteStorage` is a
 //! type alias for `FrankenStorage`.
 //!
 //! Covers: CRUD operations, queries (JOIN, GROUP BY, ORDER BY, LIMIT, LIKE, FTS),
 //! transaction behavior, edge cases (Unicode, NULL, empty DB, large content),
-//! and cross-format file reads (rusqlite ↔ frankensqlite interop).
+//! and cross-format file reads (rusqlite ↔ the legacy embedded engine interop).
 
 use coding_agent_search::model::types::{
     Agent, AgentKind, Conversation, Message, MessageRole, Snippet,
@@ -586,38 +586,6 @@ fn parity_scan_timestamp_roundtrip() {
 }
 
 // ============================================================================
-// 8. FTS PARITY
-// ============================================================================
-
-#[test]
-fn parity_rebuild_fts_and_query() {
-    let (_dir, sql, frank) = open_both();
-
-    let agent = make_agent("claude", "Claude");
-    let sql_agent_id = sql.ensure_agent(&agent).unwrap();
-    let frank_agent_id = frank.ensure_agent(&agent).unwrap();
-
-    let conv = make_conversation(
-        "claude",
-        "fts-test",
-        "FTS Parity",
-        vec![
-            make_message(0, MessageRole::User, "searchable keyword alpha"),
-            make_message(1, MessageRole::Agent, "response with beta keyword"),
-        ],
-    );
-
-    sql.insert_conversation_tree(sql_agent_id, None, &conv)
-        .unwrap();
-    frank
-        .insert_conversation_tree(frank_agent_id, None, &conv)
-        .unwrap();
-
-    sql.rebuild_fts().unwrap();
-    frank.rebuild_fts().unwrap();
-}
-
-// ============================================================================
 // 9. EDGE CASES
 // ============================================================================
 
@@ -1004,7 +972,7 @@ fn transition_rusqlite_db_readable_by_frankenstorage_basic() {
     // Verify sources readable
     let src = frank.get_source("local").unwrap();
     // Bead 7k7pl: pin the EXACT id — migration must preserve the
-    // well-known "local" id through the rusqlite→frankensqlite
+    // well-known "local" id through the rusqlite→the legacy embedded engine
     // transition. A regression that renamed the id would slip past
     // `.is_some()` while silently breaking source lookup by id.
     let src = src.expect("local source must exist after transition");

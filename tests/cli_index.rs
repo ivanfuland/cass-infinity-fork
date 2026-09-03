@@ -77,13 +77,22 @@ fn index_parses_semantic_flags() -> Result<(), String> {
     }
 }
 
+/// R1-W3-N2: `fastembed` requires the `semantic`/ONNX build feature,
+/// retired in this build (W3-5, ORT-free `--features qr,encryption,
+/// infinity`). Defaulting a bare `cass index --semantic` to it meant it
+/// deterministically hit `run_semantic_db_vector_catchup`'s "embedder
+/// fastembed is retired... use --embedder infinity" bail under this
+/// build's actual feature set -- the default itself was the retired
+/// choice. Feature-conditional so a hypothetical build with `semantic`
+/// (not `infinity`) still gets the old default.
 #[test]
-fn index_default_embedder_is_fastembed() -> Result<(), String> {
+fn index_default_embedder_matches_this_builds_working_semantic_path() -> Result<(), String> {
     let cli = parse_cli_ok(["cass", "index", "--semantic"], "parse index flags");
 
+    let expected = if cfg!(feature = "infinity") { "infinity" } else { "fastembed" };
     match cli.command {
         Some(Commands::Index { embedder, .. }) => {
-            assert_eq!(embedder, "fastembed");
+            assert_eq!(embedder, expected);
             Ok(())
         }
         other => Err(format!("expected index command, got {other:?}")),
@@ -322,7 +331,6 @@ fn index_refresh_data_dir_scopes_rebuild_semantic_and_watch_once_controls() -> R
             "--full",
             "--force-rebuild",
             "--semantic",
-            "--build-hnsw",
             "--watch-once",
             "/sessions/one.jsonl,/sessions/two.jsonl",
             "--json",
@@ -336,7 +344,6 @@ fn index_refresh_data_dir_scopes_rebuild_semantic_and_watch_once_controls() -> R
             full: true,
             force_rebuild: true,
             semantic: true,
-            build_hnsw: true,
             watch_once: Some(paths),
             json: true,
             ..
@@ -618,7 +625,7 @@ fn index_handles_existing_schema_13_db() {
     let storage = SqliteStorage::open(&db_path).expect("seed sqlite db");
     storage
         .raw()
-        .execute("UPDATE meta SET value = '13' WHERE key = 'schema_version'")
+        .execute("UPDATE meta SET value = '13' WHERE key = 'schema_version'", &[])
         .expect("set schema_version to 13");
     drop(storage);
 
@@ -947,7 +954,7 @@ fn repeat_full_json_preserves_exact_totals_when_noop_scan_underreports() {
     // embedded updated_at_ms field) changes ONLY when cass rewrites
     // the file, independent of filesystem mtime resolution, so a
     // byte-for-byte comparison is both tighter and portable.
-    let checkpoint_path = coding_agent_search::search::tantivy::index_dir(&data_dir)
+    let checkpoint_path = coding_agent_search::indexer::index_dir(&data_dir)
         .unwrap()
         .join(".lexical-rebuild-state.json");
     let checkpoint_bytes_before =
@@ -1065,7 +1072,7 @@ fn index_full_persists_lexical_rebuild_equivalence_ledger() {
         "expected at least 2 seeded conversations, got {reported_conversations}"
     );
 
-    let index_path = coding_agent_search::search::tantivy::index_dir(&data_dir)
+    let index_path = coding_agent_search::indexer::index_dir(&data_dir)
         .expect("resolve tantivy index dir");
     let ledger_path = index_path.join(".lexical-rebuild-equivalence.json");
     assert!(
@@ -1309,7 +1316,7 @@ fn plain_index_recreates_missing_lexical_checkpoint_from_live_assets() {
         .arg(&data_dir);
     initial_index.assert().success();
 
-    let index_path = coding_agent_search::search::tantivy::index_dir(&data_dir)
+    let index_path = coding_agent_search::indexer::index_dir(&data_dir)
         .expect("resolve versioned tantivy index path");
     let state_path = index_path.join(".lexical-rebuild-state.json");
     let state_backup_path = index_path.join(".lexical-rebuild-state.backup.json");
@@ -1580,7 +1587,7 @@ fn plain_index_self_heals_when_entire_lexical_index_directory_is_missing() {
         db_path.exists(),
         "canonical DB must exist after initial index"
     );
-    let index_path = coding_agent_search::search::tantivy::index_dir(&data_dir)
+    let index_path = coding_agent_search::indexer::index_dir(&data_dir)
         .expect("resolve versioned tantivy index path");
     assert!(
         index_path.exists(),
@@ -1662,25 +1669,26 @@ fn plain_index_self_heals_when_entire_lexical_index_directory_is_missing() {
         "self-heal rebuild must report a non-zero conversation count; payload: {heal_payload}"
     );
 
-    // The rebuilt Tantivy index must have at least as many docs as the
-    // rebuild reported messages — there's one Tantivy doc per canonical
+    // The rebuilt lexical index must have at least as many docs as the
+    // rebuild reported messages — there's one lexical doc per canonical
     // message. This is the "self-heal produced a searchable index"
     // contract at the storage layer, independent of any CLI search
     // filter behavior. Proves the rebuild path actually populated
-    // Tantivy rather than leaving an empty shell.
-    let tantivy_summary =
-        coding_agent_search::search::tantivy::searchable_index_summary(&index_path)
+    // sqlite-fts5 rather than leaving an empty shell. (W2-6 Task丙②:
+    // DB-domain successor to the deleted search::tantivy summary probe.)
+    let lexical_summary =
+        coding_agent_search::search::lexical_index_health::searchable_index_summary(&db_path)
             .expect("searchable_index_summary must succeed after self-heal")
-            .expect("rebuilt index must have a readable Tantivy summary");
+            .expect("rebuilt index must have a readable lexical summary");
     assert!(
-        tantivy_summary.docs > 0,
-        "self-heal rebuild must populate the Tantivy index with at least one doc; \
+        lexical_summary.docs > 0,
+        "self-heal rebuild must populate the lexical index with at least one doc; \
          got docs={}",
-        tantivy_summary.docs
+        lexical_summary.docs
     );
     assert_eq!(
-        tantivy_summary.docs as i64, reported_messages,
-        "Tantivy doc count must match the rebuild's reported message count \
+        lexical_summary.docs as i64, reported_messages,
+        "lexical doc count must match the rebuild's reported message count \
          (one lexical doc per canonical message)"
     );
 }

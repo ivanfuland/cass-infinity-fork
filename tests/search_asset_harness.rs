@@ -23,6 +23,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tempfile::TempDir;
 
+use coding_agent_search::search::canonicalize::CANONICALIZE_PIPELINE_VERSION;
 use coding_agent_search::search::policy::{
     CHUNKING_STRATEGY_VERSION, SEMANTIC_SCHEMA_VERSION, SemanticPolicy,
 };
@@ -296,6 +297,7 @@ impl CorruptionInjector {
                 model_revision: "abc123".to_owned(),
                 schema_version: 0, // mismatch!
                 chunking_version: CHUNKING_STRATEGY_VERSION,
+                canonicalize_version: Some(CANONICALIZE_PIPELINE_VERSION),
                 dimension: 384,
                 doc_count: 100,
                 conversation_count: 25,
@@ -373,6 +375,7 @@ impl CorruptionInjector {
                 chunking_version: CHUNKING_STRATEGY_VERSION,
                 saved_at_ms: now_ms(),
                 last_message_id: None,
+                last_message_id_conversation_id: None,
                 cursor_exhausted: false,
             }),
             ..Default::default()
@@ -778,6 +781,7 @@ mod tests {
                 model_revision: "hash".to_owned(),
                 schema_version: SEMANTIC_SCHEMA_VERSION,
                 chunking_version: CHUNKING_STRATEGY_VERSION,
+                canonicalize_version: Some(CANONICALIZE_PIPELINE_VERSION),
                 dimension: 384,
                 doc_count: 40,
                 conversation_count: 10,

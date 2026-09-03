@@ -4,8 +4,8 @@
 //! exporting/encrypting data that would exceed GitHub Pages limits.
 
 use anyhow::{Context, Result, bail};
-use frankensqlite::Row;
-use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
+use crate::storage::api::Row;
+type ParamValue = crate::storage::api::Value;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -65,7 +65,7 @@ impl SizeEstimate {
         let conn = super::open_existing_sqlite_db(db_path.as_ref())
             .context("Failed to open database for size estimation")?;
 
-        conn.execute("PRAGMA busy_timeout = 5000;")?;
+        conn.execute("PRAGMA busy_timeout = 5000;", &[])?;
 
         // Build filter conditions
         let mut conditions = Vec::new();
@@ -108,9 +108,9 @@ impl SizeEstimate {
         let params_slice = &param_values;
 
         // Query conversation count. We read the COUNT(*) cell as Option<i64>
-        // because frankensqlite can return NULL from `COUNT(*)` when the
+        // because the legacy embedded engine can return NULL from `COUNT(*)` when the
         // WHERE clause excludes all rows (e.g., the empty-agent-filter "1=0"
-        // path) — standard SQLite returns 0, fsqlite currently returns NULL.
+        // path) — standard SQLite returns 0, the legacy engine crate currently returns NULL.
         // The Option<i64>.unwrap_or(0) shim absorbs the difference without a
         // type-mismatch panic.
         let conv_sql = format!("SELECT COUNT(*) FROM conversations c{}", where_clause);
@@ -413,7 +413,7 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use frankensqlite::Connection;
+    use crate::storage::api::Conn as Connection;
 
     #[test]
     fn test_size_estimate_from_plaintext() {
@@ -503,7 +503,7 @@ mod tests {
     fn test_from_database_filters_agents_through_agents_table() -> Result<()> {
         let temp = tempfile::TempDir::new()?;
         let db_path = temp.path().join("cass.db");
-        let conn = Connection::open(db_path.to_string_lossy().as_ref())?;
+        let conn = Connection::open_writable(&db_path, crate::storage::api::Profile::Production)?;
         conn.execute_batch(
             "CREATE TABLE agents (
                 id INTEGER PRIMARY KEY,
@@ -554,7 +554,7 @@ mod tests {
     fn test_from_database_allows_read_only_source_db() -> Result<()> {
         let temp = tempfile::TempDir::new()?;
         let db_path = temp.path().join("cass-read-only.db");
-        let conn = Connection::open(db_path.to_string_lossy().as_ref())?;
+        let conn = Connection::open_writable(&db_path, crate::storage::api::Profile::Production)?;
         conn.execute_batch(
             "CREATE TABLE agents (
                 id INTEGER PRIMARY KEY,

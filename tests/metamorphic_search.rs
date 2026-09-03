@@ -13,8 +13,9 @@
 
 use std::collections::HashSet;
 
+use coding_agent_search::indexer::persist::persist_conversation;
 use coding_agent_search::search::query::{FieldMask, SearchClient, SearchFilters};
-use coding_agent_search::search::tantivy::TantivyIndex;
+use coding_agent_search::storage::sqlite::SqliteStorage;
 use tempfile::TempDir;
 
 mod util;
@@ -35,7 +36,7 @@ const AGENTS: &[&str] = &["claude", "codex", "amp"];
 ///   - Timestamps span a 60-day window ending at `now_ms`
 ///   - A shared keyword "metamorphic_sentinel" appears in every conversation
 ///     so we always have a non-empty result set to reason about.
-fn seed_corpus(index: &mut TantivyIndex, dir: &std::path::Path, now_ms: i64) {
+fn seed_corpus(storage: &SqliteStorage, dir: &std::path::Path, now_ms: i64) {
     let day_ms: i64 = 86_400_000;
 
     for (agent_idx, &agent) in AGENTS.iter().enumerate() {
@@ -65,10 +66,9 @@ fn seed_corpus(index: &mut TantivyIndex, dir: &std::path::Path, now_ms: i64) {
                 )
                 .build_normalized();
 
-            index.add_conversation(&conv).unwrap();
+            persist_conversation(storage, &conv).unwrap();
         }
     }
-    index.commit().unwrap();
 }
 
 /// Stable "now" timestamp (ms) used across tests so age-based filters are
@@ -116,10 +116,11 @@ fn hit_key_set(hits: &[coding_agent_search::search::query::SearchHit]) -> HashSe
 #[test]
 fn mr1_search_idempotence() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
-    seed_corpus(&mut index, dir.path(), fixed_now_ms());
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
+    seed_corpus(&storage, dir.path(), fixed_now_ms());
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("search client");
 
@@ -165,10 +166,11 @@ fn mr1_search_idempotence() {
 #[test]
 fn mr2_limit_prefix() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
-    seed_corpus(&mut index, dir.path(), fixed_now_ms());
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
+    seed_corpus(&storage, dir.path(), fixed_now_ms());
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("search client");
 
@@ -212,10 +214,11 @@ fn mr2_limit_prefix() {
 #[test]
 fn mr3_agent_filter_union() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
-    seed_corpus(&mut index, dir.path(), fixed_now_ms());
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
+    seed_corpus(&storage, dir.path(), fixed_now_ms());
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("search client");
 
@@ -276,12 +279,13 @@ fn mr3_agent_filter_union() {
 #[test]
 fn mr4_reindex_idempotence() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     // First index
-    seed_corpus(&mut index, dir.path(), fixed_now_ms());
+    seed_corpus(&storage, dir.path(), fixed_now_ms());
 
-    let client1 = SearchClient::open(dir.path(), None)
+    let client1 = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client after first index");
     let hits1 = client1
@@ -297,12 +301,19 @@ fn mr4_reindex_idempotence() {
     let keys1 = hit_key_set(&hits1);
     drop(client1);
 
-    // Delete all and reindex the same corpus
-    index.delete_all().unwrap();
-    index.commit().unwrap();
-    seed_corpus(&mut index, dir.path(), fixed_now_ms());
+    // Delete all and reindex the same corpus. W2-6 Task丙②: there is no
+    // Tantivy `delete_all` anymore; the DB-domain equivalent of "wipe the
+    // lexical index and rebuild" is a fresh SQLite DB (sqlite-fts5 content
+    // lives in the same file as the canonical tables).
+    std::fs::remove_file(&db_path).unwrap();
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = dir.path().join(format!("agent_search.db{suffix}"));
+        let _ = std::fs::remove_file(sidecar);
+    }
+    let storage = SqliteStorage::open(&db_path).unwrap();
+    seed_corpus(&storage, dir.path(), fixed_now_ms());
 
-    let client2 = SearchClient::open(dir.path(), None)
+    let client2 = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client after reindex");
     let hits2 = client2
@@ -336,11 +347,12 @@ fn mr4_reindex_idempotence() {
 #[test]
 fn mr5_days_filter_subset() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
     let now = fixed_now_ms();
-    seed_corpus(&mut index, dir.path(), now);
+    seed_corpus(&storage, dir.path(), now);
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("search client");
 
@@ -417,10 +429,11 @@ fn mr5_days_filter_subset() {
 #[test]
 fn mr6_case_invariance() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
-    seed_corpus(&mut index, dir.path(), fixed_now_ms());
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
+    seed_corpus(&storage, dir.path(), fixed_now_ms());
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("search client");
 
@@ -466,10 +479,11 @@ fn mr6_case_invariance() {
 #[test]
 fn mr7_offset_pagination_consistency() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
-    seed_corpus(&mut index, dir.path(), fixed_now_ms());
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
+    seed_corpus(&storage, dir.path(), fixed_now_ms());
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("search client");
 
@@ -513,10 +527,11 @@ fn mr7_offset_pagination_consistency() {
 #[test]
 fn mr8_agent_filter_exclusivity() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
-    seed_corpus(&mut index, dir.path(), fixed_now_ms());
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
+    seed_corpus(&storage, dir.path(), fixed_now_ms());
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("search client");
 

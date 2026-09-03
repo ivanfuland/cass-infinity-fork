@@ -3,12 +3,12 @@
 //! Bead: coding_agent_session_search-cass-fleet-resilience-20260608-uojcg.2.1
 //! ("Audit and enforce stdout/stderr hygiene for robot commands").
 //!
-//! The source report observed `cass view` emitting extensive frankensqlite INFO
+//! The source report observed `cass view` emitting extensive legacy-embedded-engine INFO
 //! tracing and corrupting machine-readable output. These tests pin the
 //! contract: every robot-mode command keeps **stdout = data-only** (pure JSON)
 //! and never lets dependency tracing interleave with the data stream — even when
 //! `RUST_LOG` is set to a deliberately noisy level that would otherwise flood
-//! the process with frankensqlite trace/info events.
+//! the process with the legacy embedded engine trace/info events.
 //!
 //! The enforcement chokepoint under test lives in `src/lib.rs`
 //! (`robot_aware_log_directive` / `build_robot_aware_log_filter`): robot/quiet
@@ -21,7 +21,7 @@ use tempfile::TempDir;
 mod util;
 use util::cass_bin;
 
-/// A `RUST_LOG` value loud enough that any unfiltered frankensqlite span would
+/// A `RUST_LOG` value loud enough that any unfiltered legacy-embedded-engine span would
 /// land on stderr (or worse, stdout) if the robot hygiene guard regressed.
 const NOISY_RUST_LOG: &str = "trace,fsqlite=trace,fsqlite_core=trace,fsqlite_vdbe=trace";
 
@@ -59,7 +59,7 @@ fn assert_no_dependency_tracing(label: &str, stderr: &str) {
     let lower = stderr.to_lowercase();
     assert!(
         !lower.contains("fsqlite"),
-        "{label}: robot-mode stderr leaked frankensqlite tracing despite the error-level \
+        "{label}: robot-mode stderr leaked the legacy embedded engine tracing despite the error-level \
          filter; stderr was:\n{stderr}\n--- end stderr ---"
     );
     // Tracing fmt lines carry an uppercase level token; INFO/DEBUG/TRACE must
@@ -139,7 +139,7 @@ fn diag_stdout_is_pure_json_under_noisy_logging() {
 #[test]
 fn view_stdout_is_pure_json_under_noisy_logging() {
     // The exact command from the source report. `view` reading a plain file must
-    // not interleave frankensqlite tracing with the JSON payload.
+    // not interleave the legacy embedded engine tracing with the JSON payload.
     let json = assert_robot_hygiene(
         "view",
         &[

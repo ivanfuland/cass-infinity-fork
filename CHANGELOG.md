@@ -17,6 +17,22 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 ## Unreleased
 
+### Removed
+
+- **In-process `cass index` stall-detection watchdog retired.** The
+  `IndexStallWatchdog` (F4, first shipped in the entry above) and its
+  `stall_detected`/`stall_aborting` NDJSON events, its `exit(70)` abort on a
+  detected wedge, and its three env vars (`CASS_INDEX_STALL_DETECT_SECS`,
+  `CASS_INDEX_STALL_ABORT_SECS`, `CASS_INDEX_FINALIZE_ABORT_SECS`) are gone;
+  setting any of them is now a no-op. Progress monitoring moves external to
+  the process: the same underlying signals it read (the index-run lock
+  file's `phase=`/`last_progress_at_ms=` fields, and the "Indexed N/M"
+  progress atomics/print) remain available for an external supervisor
+  (e.g. an orchestration layer's own liveness ledger) to sample and decide
+  what counts as a stall for its own SLA -- that policy no longer lives
+  hardcoded inside cass. `--progress-interval-ms` is unaffected; it still
+  paces NDJSON progress events independent of the retired watchdog.
+
 ## [v0.6.9] -- 2026-05-30
 
 **Two correctness fixes uncovered by a fresh-eyes review of the v0.6.7

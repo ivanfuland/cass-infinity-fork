@@ -1,94 +1,84 @@
-//! Stress tests for frankensqlite concurrent writers under realistic cass workloads.
+//! Stress tests for cass's write path under realistic concurrent workloads.
 //!
-//! Tests BEGIN CONCURRENT (MVCC) behavior: parallel writes, read-write mix,
-//! crash recovery, large transactions, and retry convergence.
+//! w1b Task B4 (secondary contract #4, 2026-08-26): this file used to stress
+//! the legacy embedded engine's `BEGIN CONCURRENT` (MVCC) mode -- N real writer
+//! connections racing on the same rows, with retry-on-conflict loops. B4
+//! retires the capability to have more than 1 live writer connection on a
+//! path at all (`storage::api::WriterHandle` serializes every write through
+//! a single dedicated thread), so every test below is rewritten to the
+//! standard-SQLite-concurrency shape: many threads submit work through one
+//! `WriterHandle`, real reader threads run against independent read-only
+//! connections, and correctness is proven by exact counts (serialization
+//! means nothing is ever lost *or* retried away) rather than "at least N
+//! survived contention". The MVCC-specific assertions this replaces are
+//! recorded in the closed-world human-review checklist,
+//! `w1b-b4-write-topology-inventory.md` §⑥.
 //!
 //! Bead: coding_agent_session_search-2tax6
 
-use coding_agent_search::storage::sqlite::{
-    ConnectionManagerConfig, FrankenConnectionManager, FrankenStorage,
-};
-use frankensqlite::compat::{ConnectionExt, RowExt, TransactionExt};
-use frankensqlite::params as fparams;
-use frankensqlite::{Connection, FrankenError};
-use rand::RngExt;
+use coding_agent_search::storage::api::{Conn as Connection, Profile, WriterHandle};
+use coding_agent_search::storage::sqlite::FrankenStorage;
+
+/// Test-only parameter list builder (this integration test is a separate
+/// crate and can't reach `storage::api`'s crate-private `params!` shim):
+/// borrows + handles the zero-arg case, mirroring sqlite.rs's own `fparams!`.
+macro_rules! fparams {
+    () => {
+        &[] as &[coding_agent_search::storage::api::Value]
+    };
+    ($($val:expr),+ $(,)?) => {
+        &[$(coding_agent_search::storage::api::IntoValue::into_value($val)),+]
+            as &[coding_agent_search::storage::api::Value]
+    };
+}
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
-/// Create a frankensqlite DB with cass schema applied.
+/// Create a cass-schema DB (via storage::api).
 fn setup_db(dir: &TempDir) -> std::path::PathBuf {
     let db_path = dir.path().join("stress.db");
-    let fs = FrankenStorage::open(&db_path).expect("create frankensqlite db");
+    let fs = FrankenStorage::open(&db_path).expect("create cass db");
     drop(fs);
     db_path
 }
 
-/// Create a minimal frankensqlite DB with just a simple table.
-/// Sets WAL mode and busy_timeout — required for concurrent writes.
+/// Create a DB with cass's schema plus a simple ad-hoc table for raw
+/// concurrency tests. Stage A note: `storage::api::Conn::open_writable` is
+/// deliberately crate-private (R2-F3 — the only public path to a writable
+/// `Conn` at a real path is via `FrankenStorage`), so this integration test
+/// (a separate crate) bootstraps through `FrankenStorage::open` +
+/// `into_raw()` rather than opening a bare, schema-free connection the way
+/// the pre-migration native-`legacy-engine` version of this helper did. The
+/// extra cass tables don't collide with `items`/`counter`/`cm_stress` and
+/// don't affect the concurrency behavior under test.
+/// Sets WAL mode and busy_timeout — required for concurrent reads.
 fn setup_simple_db(dir: &TempDir) -> std::path::PathBuf {
     let db_path = dir.path().join("simple.db");
-    let conn = Connection::open(db_path.to_str().unwrap()).unwrap();
-    conn.execute("PRAGMA journal_mode = WAL;").unwrap();
-    conn.execute("PRAGMA synchronous = NORMAL;").unwrap();
-    conn.execute("PRAGMA busy_timeout = 5000;").unwrap();
+    let conn = FrankenStorage::open(&db_path).unwrap().into_raw();
+    conn.execute("PRAGMA journal_mode = WAL;", &[]).unwrap();
+    conn.execute("PRAGMA synchronous = NORMAL;", &[]).unwrap();
+    conn.execute("PRAGMA busy_timeout = 5000;", &[]).unwrap();
     conn.execute(
         "CREATE TABLE items (id INTEGER PRIMARY KEY, thread_id INTEGER, seq INTEGER, val TEXT)",
+        &[],
     )
     .unwrap();
-    conn.execute("CREATE INDEX idx_items_thread ON items(thread_id)")
+    conn.execute("CREATE INDEX idx_items_thread ON items(thread_id)", &[])
         .unwrap();
     drop(conn);
     db_path
 }
 
-/// Open a connection with proper WAL/busy_timeout config for concurrent tests.
-fn open_configured(path: &std::path::Path) -> Connection {
-    let conn = Connection::open(path.to_str().unwrap()).unwrap();
-    let _ = conn.execute("PRAGMA journal_mode = WAL;");
-    let _ = conn.execute("PRAGMA busy_timeout = 5000;");
-    let _ = conn.execute("PRAGMA cache_size = -4096;");
+/// Open a genuinely read-only connection with proper WAL/busy_timeout
+/// config, for the reader side of read-write mix tests. WAL mode is a
+/// database-level setting (already turned on by whichever connection
+/// created the file), but busy_timeout is per-connection.
+fn open_read_configured(path: &std::path::Path) -> Connection {
+    let conn = Connection::open_read(path).unwrap();
+    let _ = conn.execute_batch("PRAGMA busy_timeout = 5000;");
     conn
-}
-
-/// Retry wrapper for concurrent write operations with jittered exponential backoff.
-fn with_retry<F, T>(max_retries: usize, mut f: F) -> anyhow::Result<T>
-where
-    F: FnMut() -> Result<T, anyhow::Error>,
-{
-    let mut rng = rand::rng();
-    let mut backoff_ms = 2_u64;
-    for attempt in 0..=max_retries {
-        match f() {
-            Ok(val) => return Ok(val),
-            Err(err) => {
-                let is_retryable = err
-                    .downcast_ref::<FrankenError>()
-                    .or_else(|| err.root_cause().downcast_ref::<FrankenError>())
-                    .is_some_and(|inner| {
-                        matches!(
-                            inner,
-                            FrankenError::Busy
-                                | FrankenError::BusyRecovery
-                                | FrankenError::BusySnapshot { .. }
-                                | FrankenError::WriteConflict { .. }
-                                | FrankenError::SerializationFailure { .. }
-                                | FrankenError::DatabaseCorrupt { .. }
-                        )
-                    });
-                if attempt < max_retries && is_retryable {
-                    // Jittered backoff to reduce thundering herd
-                    let jitter = rng.random_range(0..=backoff_ms);
-                    std::thread::sleep(Duration::from_millis(backoff_ms + jitter));
-                    backoff_ms = (backoff_ms * 2).min(256);
-                    continue;
-                }
-                return Err(err);
-            }
-        }
-    }
-    Err(anyhow::anyhow!("exhausted retries"))
 }
 
 // ============================================================================
@@ -100,53 +90,38 @@ fn stress_parallel_connector_writes() {
     let dir = TempDir::new().unwrap();
     let db_path = setup_db(&dir);
 
-    // Uses FrankenConnectionManager (the production connection management pattern)
-    // to coordinate parallel writers. Each write gets a fresh concurrent_writer.
-    let config = ConnectionManagerConfig {
-        reader_count: 2,
-        max_writers: 4,
-    };
-    let mgr = FrankenConnectionManager::new(&db_path, config).unwrap();
+    // w1b Task B4: N threads submit through one WriterHandle instead of
+    // each acquiring their own `concurrent_writer()` from a
+    // `FrankenConnectionManager` pool. Serialization means every insert
+    // lands exactly once -- no conflicts, no retries, no "at least N".
+    let (handle, join) =
+        WriterHandle::<Connection>::spawn(db_path, Profile::Production, Ok).expect("spawn writer");
 
-    // Create test table
-    {
-        let mut guard = mgr.writer().unwrap();
-        guard
-            .storage()
-            .raw()
-            .execute("CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY, thread_id INTEGER, seq INTEGER, val TEXT)")
-            .unwrap();
-        guard.mark_committed();
-    }
+    handle
+        .submit(|conn: &Connection| {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY, thread_id INTEGER, seq INTEGER, val TEXT)",
+            )
+        })
+        .unwrap();
 
     let num_threads = 4;
     let writes_per_thread = 100;
-    let conflict_count = Arc::new(AtomicUsize::new(0));
 
     std::thread::scope(|s| {
         let mut handles = Vec::new();
         for thread_id in 0..num_threads {
-            let m = &mgr;
-            let conflicts = Arc::clone(&conflict_count);
-
+            let h = handle.clone();
             handles.push(s.spawn(move || {
                 for seq in 0..writes_per_thread {
                     let val = format!("thread-{thread_id}-seq-{seq}");
-                    let mut guard = m.concurrent_writer().expect("acquire writer");
-                    with_retry(50, || {
-                        let mut tx = guard.storage().raw().transaction()?;
-                        tx.execute_compat(
+                    h.submit(move |conn: &Connection| {
+                        conn.execute(
                             "INSERT INTO items (thread_id, seq, val) VALUES (?1, ?2, ?3)",
-                            fparams![thread_id, seq, val.as_str()],
-                        )?;
-                        tx.commit().map_err(|e| {
-                            conflicts.fetch_add(1, Ordering::Relaxed);
-                            anyhow::Error::new(e)
-                        })?;
-                        Ok(())
+                            &fparams![thread_id, seq, val.as_str()],
+                        )
                     })
-                    .expect("insert should succeed after retries");
-                    guard.mark_committed();
+                    .expect("insert via WriterHandle should succeed");
                 }
             }));
         }
@@ -155,22 +130,18 @@ fn stress_parallel_connector_writes() {
         }
     });
 
-    // Verify via reader
-    let reader = mgr.reader();
-    let rows = reader.query("SELECT COUNT(*) FROM items").unwrap();
-    let count: i64 = rows[0].get_typed(0).unwrap();
+    let count: i64 = handle
+        .submit(|conn: &Connection| conn.query_row_map("SELECT COUNT(*) FROM items", &[], |row| row.get_typed(0)))
+        .unwrap();
     let expected = (num_threads * writes_per_thread) as i64;
-    assert!(
-        count >= expected,
-        "at least {expected} rows should be persisted, got {count}"
+    assert_eq!(
+        count, expected,
+        "single-writer serialization must land every row exactly once"
     );
 
-    eprintln!(
-        "Parallel write: {} total (expected {}), {} conflicts",
-        count,
-        expected,
-        conflict_count.load(Ordering::Relaxed)
-    );
+    drop(handle);
+    join.join().expect("writer thread teardown");
+    eprintln!("Parallel write: {count} total (expected {expected})");
 }
 
 // ============================================================================
@@ -182,26 +153,20 @@ fn stress_write_heavy_contention() {
     let dir = TempDir::new().unwrap();
     let db_path = setup_db(&dir);
 
-    // Models the production par_chunks pattern: each thread batches multiple
-    // rows per transaction via ConnectionManager, reducing commit contention.
-    // 4 threads × 20 batches × 10 rows = 800 total rows with only ~20 commit
-    // points per thread.
-    let config = ConnectionManagerConfig {
-        reader_count: 2,
-        max_writers: 4,
-    };
-    let mgr = FrankenConnectionManager::new(&db_path, config).unwrap();
+    // Models the production par_chunks pattern: each thread batches
+    // multiple rows per transaction, reducing the number of submit round
+    // trips through the writer. 4 threads × 20 batches × 10 rows = 800
+    // total rows, all serialized through one WriterHandle.
+    let (handle, join) =
+        WriterHandle::<Connection>::spawn(db_path, Profile::Production, Ok).expect("spawn writer");
 
-    // Create test table
-    {
-        let mut guard = mgr.writer().unwrap();
-        guard
-            .storage()
-            .raw()
-            .execute("CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY, thread_id INTEGER, seq INTEGER, val TEXT)")
-            .unwrap();
-        guard.mark_committed();
-    }
+    handle
+        .submit(|conn: &Connection| {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY, thread_id INTEGER, seq INTEGER, val TEXT)",
+            )
+        })
+        .unwrap();
 
     let num_threads = 4;
     let batches_per_thread = 20;
@@ -212,30 +177,24 @@ fn stress_write_heavy_contention() {
     std::thread::scope(|s| {
         let mut handles = Vec::new();
         for thread_id in 0..num_threads {
-            let m = &mgr;
+            let h = handle.clone();
             handles.push(s.spawn(move || {
-                println!("Thread {} started", thread_id);
                 for batch in 0..batches_per_thread {
-                    with_retry(50, || {
-                        let mut guard = m.concurrent_writer().expect("acquire writer");
-                        let mut tx = guard.storage().raw().transaction()?;
+                    h.submit(move |conn: &Connection| {
+                        let tx = conn.transaction()?;
                         for row_in_batch in 0..rows_per_batch {
                             let seq = batch * rows_per_batch + row_in_batch;
-                            // Generate a unique ID per thread and seq to avoid auto-increment collisions
-                            let unique_id = (thread_id * 100000) + seq;
-                            tx.execute_compat(
+                            // Unique id per thread and seq to avoid auto-increment collisions.
+                            let unique_id = (thread_id * 100_000) + seq;
+                            tx.execute(
                                 "INSERT INTO items (id, thread_id, seq, val) VALUES (?1, ?2, ?3, 'contention')",
-                                fparams![unique_id, thread_id, seq],
+                                &fparams![unique_id, thread_id, seq],
                             )?;
                         }
-                        tx.commit().map_err(anyhow::Error::new)?;
-                        drop(tx); // Release borrow on guard before mutable access
-                        guard.mark_committed();
-                        Ok(())
+                        tx.commit()
                     })
-                    .expect("batch insert should succeed");
+                    .expect("batch insert via WriterHandle should succeed");
                 }
-                println!("Thread {} finished", thread_id);
             }));
         }
         for h in handles {
@@ -244,48 +203,32 @@ fn stress_write_heavy_contention() {
     });
 
     let elapsed = start.elapsed();
-
-    std::thread::sleep(std::time::Duration::from_millis(1000));
     let expected = (num_threads * batches_per_thread * rows_per_batch) as i64;
 
-    // Verify via reader
-    let reader = mgr.reader();
-    let rows = reader
-        .query("SELECT thread_id, COUNT(*) FROM items GROUP BY thread_id")
+    let count: i64 = handle
+        .submit(|conn: &Connection| conn.query_row_map("SELECT COUNT(*) FROM items", &[], |row| row.get_typed(0)))
         .unwrap();
-    for row in rows {
-        let tid: i64 = row.get_typed(0).unwrap();
-        let cnt: i64 = row.get_typed(1).unwrap();
-        println!("thread {} inserted {} rows", tid, cnt);
-
-        if tid == 1 {
-            let seqs = reader
-                .query("SELECT id, seq FROM items WHERE thread_id = 1 ORDER BY seq")
-                .unwrap();
-            let mut seq_list = Vec::new();
-            for s_row in seqs {
-                seq_list.push((
-                    s_row.get_typed::<i64>(0).unwrap(),
-                    s_row.get_typed::<i64>(1).unwrap(),
-                ));
-            }
-            println!("thread 1 seqs: {:?}", seq_list);
-        }
+    let per_thread: Vec<(i64, i64)> = handle
+        .submit(|conn: &Connection| {
+            conn.query_all_map("SELECT thread_id, COUNT(*) FROM items GROUP BY thread_id", &[], |row| {
+                Ok((row.get_typed(0)?, row.get_typed(1)?))
+            })
+        })
+        .unwrap();
+    for (tid, cnt) in &per_thread {
+        assert_eq!(
+            *cnt, batches_per_thread as i64 * rows_per_batch as i64,
+            "thread {tid} should have inserted every one of its rows exactly once"
+        );
     }
 
-    let rows = reader.query("SELECT COUNT(*) FROM items").unwrap();
-    let count: i64 = rows[0].get_typed(0).unwrap();
-
-    let max_id: i64 = reader.query("SELECT MAX(id) FROM items").unwrap()[0]
-        .get_typed(0)
-        .unwrap_or(0);
-    println!("Total rows: {}, Max ID: {}", count, max_id);
-
-    assert!(
-        count >= expected,
-        "at least {expected} rows should be persisted, got {count}"
+    assert_eq!(
+        count, expected,
+        "single-writer serialization must land every batched row exactly once"
     );
 
+    drop(handle);
+    join.join().expect("writer thread teardown");
     let throughput = count as f64 / elapsed.as_secs_f64();
     eprintln!(
         "Write contention: {count} rows in {:.2}s ({:.0} rows/sec)",
@@ -303,60 +246,55 @@ fn stress_read_write_mix() {
     let dir = TempDir::new().unwrap();
     let db_path = setup_simple_db(&dir);
 
+    let (handle, join) =
+        WriterHandle::<Connection>::spawn(db_path.clone(), Profile::Production, Ok).expect("spawn writer");
+
     let duration = Duration::from_secs(3);
     let read_count = Arc::new(AtomicUsize::new(0));
     let read_errors = Arc::new(AtomicUsize::new(0));
-    let write_errors = Arc::new(AtomicUsize::new(0));
 
     std::thread::scope(|s| {
-        // 4 writer threads
+        // 4 writer threads, all submitting through the one WriterHandle --
+        // this is exactly the "TUI reads + indexer writes" scenario the
+        // pre-B4 `FrankenConnectionManager` doc comment described, now
+        // modeled with the architecture that actually enforces it.
         for thread_id in 0..4 {
-            let path = db_path.clone();
-            let werr = Arc::clone(&write_errors);
+            let h = handle.clone();
             s.spawn(move || {
-                let conn = open_configured(&path);
                 let start = Instant::now();
                 let mut seq = 0;
-
                 while start.elapsed() < duration {
-                    let result = with_retry(30, || {
-                        let mut tx = conn.transaction()?;
-                        tx.execute_compat(
+                    h.submit(move |conn: &Connection| {
+                        conn.execute(
                             "INSERT INTO items (thread_id, seq, val) VALUES (?1, ?2, 'rw-mix')",
-                            fparams![thread_id, seq],
-                        )?;
-                        tx.commit().map_err(anyhow::Error::new)?;
-                        Ok(())
-                    });
-                    if result.is_ok() {
-                        seq += 1;
-                    } else {
-                        werr.fetch_add(1, Ordering::Relaxed);
-                    }
+                            &fparams![thread_id, seq],
+                        )
+                    })
+                    .expect("insert via WriterHandle should succeed");
+                    seq += 1;
                 }
             });
         }
 
-        // 4 reader threads
+        // 4 reader threads, each on its own independent read-only
+        // connection -- concurrent reads never contend with the single
+        // writer thread under WAL.
         for _reader_id in 0..4 {
             let path = db_path.clone();
             let reads = Arc::clone(&read_count);
             let errors = Arc::clone(&read_errors);
             s.spawn(move || {
-                let conn = open_configured(&path);
+                let conn = open_read_configured(&path);
                 let start = Instant::now();
-
                 while start.elapsed() < duration {
-                    match conn.query("SELECT COUNT(*) FROM items") {
-                        Ok(rows) => {
-                            let _count: i64 = rows[0].get_typed(0).unwrap();
+                    match conn.query_row_map("SELECT COUNT(*) FROM items", &[], |row| row.get_typed::<i64>(0)) {
+                        Ok(_count) => {
                             reads.fetch_add(1, Ordering::Relaxed);
                         }
                         Err(_) => {
                             errors.fetch_add(1, Ordering::Relaxed);
                         }
                     }
-                    // Small yield to prevent spinning
                     std::thread::yield_now();
                 }
             });
@@ -365,59 +303,53 @@ fn stress_read_write_mix() {
 
     let total_reads = read_count.load(Ordering::Relaxed);
     let total_read_errors = read_errors.load(Ordering::Relaxed);
-    let total_write_errors = write_errors.load(Ordering::Relaxed);
 
-    // Verify final state
-    let conn = open_configured(&db_path);
-    let rows = conn.query("SELECT COUNT(*) FROM items").unwrap();
-    let final_count: i64 = rows[0].get_typed(0).unwrap();
-
-    // The DB count is authoritative. Under MVCC, a commit may return an error
-    // after the data was actually persisted (partial commit edge case), so we
-    // verify structural integrity rather than exact write counting.
+    let final_count: i64 = handle
+        .submit(|conn: &Connection| conn.query_row_map("SELECT COUNT(*) FROM items", &[], |row| row.get_typed(0)))
+        .unwrap();
     assert!(final_count > 0, "writers should have committed rows");
     assert!(total_reads > 0, "readers should have completed queries");
+    assert_eq!(
+        total_read_errors, 0,
+        "concurrent reads against the single writer must never error"
+    );
 
-    // Verify data integrity: all rows are readable and have expected columns
-    let integrity_rows = conn
-        .query("SELECT thread_id, seq, val FROM items ORDER BY thread_id, seq")
+    let integrity_rows: Vec<(i64, i64, String)> = handle
+        .submit(|conn: &Connection| {
+            conn.query_all_map(
+                "SELECT thread_id, seq, val FROM items ORDER BY thread_id, seq",
+                &[],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+            )
+        })
         .unwrap();
-    for row in &integrity_rows {
-        let tid: i64 = row.get_typed(0).unwrap();
-        let seq: i64 = row.get_typed(1).unwrap();
-        let val: String = row.get_typed(2).unwrap();
-        assert!((0..4).contains(&tid), "thread_id {tid} should be 0..3");
-        assert!(seq >= 0, "seq should be non-negative");
+    for (tid, seq, val) in &integrity_rows {
+        assert!((0..4).contains(tid), "thread_id {tid} should be 0..3");
+        assert!(*seq >= 0, "seq should be non-negative");
         assert_eq!(val, "rw-mix", "val should be 'rw-mix'");
     }
 
-    // Verify each thread contributed rows
     for thread_id in 0..4 {
-        let thread_count: i64 = conn
-            .query_row_map(
-                "SELECT COUNT(*) FROM items WHERE thread_id = ?1",
-                fparams![thread_id],
-                |row| row.get_typed(0),
-            )
+        let thread_count: i64 = handle
+            .submit(move |conn: &Connection| {
+                conn.query_row_map("SELECT COUNT(*) FROM items WHERE thread_id = ?1", &fparams![thread_id], |row| {
+                    row.get_typed(0)
+                })
+            })
             .unwrap();
-        assert!(
-            thread_count > 0,
-            "thread {thread_id} should have written at least 1 row"
-        );
+        assert!(thread_count > 0, "thread {thread_id} should have written at least 1 row");
     }
 
+    drop(handle);
+    join.join().expect("writer thread teardown");
     eprintln!(
-        "Read-write mix ({:.1}s): {} final rows, {} reads, {} read errors, {} write errors",
+        "Read-write mix ({:.1}s): {final_count} final rows, {total_reads} reads, {total_read_errors} read errors",
         duration.as_secs_f64(),
-        final_count,
-        total_reads,
-        total_read_errors,
-        total_write_errors,
     );
 }
 
 // ============================================================================
-// 4. CRASH RECOVERY
+// 4. UNCOMMITTED-TRANSACTION ROLLBACK ON DROP
 // ============================================================================
 
 #[test]
@@ -425,36 +357,36 @@ fn stress_crash_recovery_uncommitted_data_absent() {
     let dir = TempDir::new().unwrap();
     let db_path = setup_simple_db(&dir);
 
-    // Commit some data first
+    // Commit some data first.
     {
-        let conn = open_configured(&db_path);
-        let mut tx = conn.transaction().unwrap();
-        tx.execute("INSERT INTO items (thread_id, seq, val) VALUES (0, 0, 'committed')")
+        let conn = FrankenStorage::open(&db_path).unwrap().into_raw();
+        let tx = conn.transaction().unwrap();
+        tx.execute("INSERT INTO items (thread_id, seq, val) VALUES (0, 0, 'committed')", &[])
             .unwrap();
         tx.commit().unwrap();
     }
 
-    // Begin concurrent write but DO NOT commit - drop connection
+    // Begin a standard transaction but DO NOT commit -- drop the guard.
+    // w1b Task B4: previously issued literal `BEGIN CONCURRENT` (the legacy embedded engine's
+    // MVCC syntax); rewritten to a standard transaction, since the property
+    // under test -- an uncommitted transaction leaves no trace once dropped
+    // -- is not MVCC-specific.
     {
-        let conn = open_configured(&db_path);
-        conn.execute("BEGIN CONCURRENT").unwrap();
-        conn.execute("INSERT INTO items (thread_id, seq, val) VALUES (1, 0, 'uncommitted')")
+        let conn = FrankenStorage::open(&db_path).unwrap().into_raw();
+        let tx = conn.transaction().unwrap();
+        tx.execute("INSERT INTO items (thread_id, seq, val) VALUES (1, 0, 'uncommitted')", &[])
             .unwrap();
-        // Drop without COMMIT — should auto-rollback
+        // `tx` (and then `conn`) drop here without `commit()` — Tx's Drop
+        // does a best-effort rollback.
     }
 
-    // Verify only committed data exists
-    let conn = open_configured(&db_path);
-    let rows = conn.query("SELECT COUNT(*) FROM items").unwrap();
-    let count: i64 = rows[0].get_typed(0).unwrap();
+    // Verify only committed data exists.
+    let conn = FrankenStorage::open(&db_path).unwrap().into_raw();
+    let count: i64 = conn.query_row_map("SELECT COUNT(*) FROM items", &[], |row| row.get_typed(0)).unwrap();
     assert_eq!(count, 1, "only committed row should exist");
 
-    let val_rows = conn.query("SELECT val FROM items").unwrap();
-    assert_eq!(
-        val_rows[0].get_typed::<String>(0).unwrap(),
-        "committed",
-        "only committed data should be present"
-    );
+    let first_val: String = conn.query_row_map("SELECT val FROM items", &[], |row| row.get_typed(0)).unwrap();
+    assert_eq!(first_val, "committed", "only committed data should be present");
 }
 
 // ============================================================================
@@ -470,14 +402,14 @@ fn stress_large_transaction() {
     let start = Instant::now();
 
     {
-        let conn = open_configured(&db_path);
-        let mut tx = conn.transaction().unwrap();
+        let conn = FrankenStorage::open(&db_path).unwrap().into_raw();
+        let tx = conn.transaction().unwrap();
 
         for i in 0..num_rows {
             let val = format!("large-txn-row-{i}");
-            tx.execute_compat(
+            tx.execute(
                 "INSERT INTO items (thread_id, seq, val) VALUES (0, ?1, ?2)",
-                fparams![i, val.as_str()],
+                &fparams![i, val.as_str()],
             )
             .unwrap();
         }
@@ -487,102 +419,63 @@ fn stress_large_transaction() {
 
     let commit_time = start.elapsed();
 
-    // Verify all rows present
-    let conn = open_configured(&db_path);
-    let rows = conn.query("SELECT COUNT(*) FROM items").unwrap();
-    let count: i64 = rows[0].get_typed(0).unwrap();
+    // Verify all rows present.
+    let conn = FrankenStorage::open(&db_path).unwrap().into_raw();
+    let count: i64 = conn.query_row_map("SELECT COUNT(*) FROM items", &[], |row| row.get_typed(0)).unwrap();
     assert_eq!(count, num_rows, "all {num_rows} rows should be present");
 
-    eprintln!(
-        "Large transaction: {num_rows} rows committed in {:.2}s",
-        commit_time.as_secs_f64()
-    );
-    assert!(
-        commit_time < Duration::from_secs(30),
-        "large transaction should complete within 30 seconds"
-    );
+    eprintln!("Large transaction: {num_rows} rows committed in {:.2}s", commit_time.as_secs_f64());
+    assert!(commit_time < Duration::from_secs(30), "large transaction should complete within 30 seconds");
 }
 
 // ============================================================================
-// 6. RETRY CONVERGENCE
+// 6. SERIALIZED INCREMENTS UNDER CONTENTION (no retries needed)
 // ============================================================================
 
 #[test]
-fn stress_retry_convergence_conflicting_writes() {
+fn stress_writer_handle_serializes_conflicting_increments() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("conflict.db");
 
-    let conn = open_configured(&db_path);
-    conn.execute("CREATE TABLE counter (id INTEGER PRIMARY KEY, val INTEGER)")
+    // w1b Task B4: previously N threads each opened their own connection
+    // and raced an optimistic read-modify-write loop against the same
+    // counter row, retrying on conflict (the MVCC-specific behavior this
+    // file was built to stress). Under `WriterHandle` there is structurally
+    // only one thread ever touching the connection, so the same workload
+    // can never conflict -- there is nothing to retry, and no increment can
+    // ever be lost to a race.
+    let (handle, join) =
+        WriterHandle::<Connection>::spawn(db_path, Profile::Production, Ok).expect("spawn writer");
+
+    handle
+        .submit(|conn: &Connection| {
+            conn.execute_batch(
+                "CREATE TABLE counter (id INTEGER PRIMARY KEY, val INTEGER); \
+                 INSERT INTO counter (id, val) VALUES (1, 0);",
+            )
+        })
         .unwrap();
-    conn.execute("INSERT INTO counter (id, val) VALUES (1, 0)")
-        .unwrap();
-    drop(conn);
 
     let num_threads = 4;
     let increments_per_thread = 50;
-    let total_retries = Arc::new(AtomicUsize::new(0));
-    let max_retries_any = Arc::new(AtomicUsize::new(0));
+    let unexpected_errors = Arc::new(AtomicUsize::new(0));
 
     std::thread::scope(|s| {
         let mut handles = Vec::new();
         for _thread_id in 0..num_threads {
-            let path = db_path.clone();
-            let retries = Arc::clone(&total_retries);
-            let max_r = Arc::clone(&max_retries_any);
-
+            let h = handle.clone();
+            let unexpected = Arc::clone(&unexpected_errors);
             handles.push(s.spawn(move || {
-                let conn = open_configured(&path);
-
                 for _ in 0..increments_per_thread {
-                    let mut attempt = 0;
-                    loop {
-                        let mut tx = conn.transaction().unwrap();
-                        let rows = tx.query("SELECT val FROM counter WHERE id = 1").unwrap();
-                        let current: i64 = rows[0].get_typed(0).unwrap();
-                        let new_val = current + 1;
-
-                        if let Err(e) = tx.execute_compat(
-                            "UPDATE counter SET val = ?1 WHERE id = 1",
-                            fparams![new_val],
-                        ) {
-                            // Execute failed — likely conflict
-                            let _ = conn.execute("ROLLBACK");
-                            attempt += 1;
-                            retries.fetch_add(1, Ordering::Relaxed);
-                            if attempt > 50 {
-                                panic!("too many retries on execute: {e}");
-                            }
-                            std::thread::sleep(Duration::from_millis(1 << attempt.min(6)));
-                            continue;
-                        }
-
-                        match tx.commit() {
-                            Ok(()) => {
-                                // Update max retries
-                                let mut current_max = max_r.load(Ordering::Relaxed);
-                                while attempt > current_max {
-                                    match max_r.compare_exchange_weak(
-                                        current_max,
-                                        attempt,
-                                        Ordering::Relaxed,
-                                        Ordering::Relaxed,
-                                    ) {
-                                        Ok(_) => break,
-                                        Err(v) => current_max = v,
-                                    }
-                                }
-                                break;
-                            }
-                            Err(_) => {
-                                attempt += 1;
-                                retries.fetch_add(1, Ordering::Relaxed);
-                                if attempt > 50 {
-                                    panic!("too many commit retries");
-                                }
-                                std::thread::sleep(Duration::from_millis(1 << attempt.min(6)));
-                            }
-                        }
+                    let result = h.submit(|conn: &Connection| {
+                        let tx = conn.transaction()?;
+                        let current: i64 =
+                            tx.query_row_map("SELECT val FROM counter WHERE id = 1", &[], |row| row.get_typed(0))?;
+                        tx.execute("UPDATE counter SET val = ?1 WHERE id = 1", &fparams![current + 1])?;
+                        tx.commit()
+                    });
+                    if result.is_err() {
+                        unexpected.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }));
@@ -592,76 +485,66 @@ fn stress_retry_convergence_conflicting_writes() {
         }
     });
 
-    // Verify final counter value
-    let conn = open_configured(&db_path);
-    let rows = conn.query("SELECT val FROM counter WHERE id = 1").unwrap();
-    let final_val: i64 = rows[0].get_typed(0).unwrap();
-
-    // With optimistic concurrency, some increments may be lost due to
-    // read-modify-write races. The counter should be >= num_threads
-    // (at least one increment per thread succeeds without conflict).
-    let expected = (num_threads * increments_per_thread) as i64;
-    eprintln!(
-        "Retry convergence: final={final_val}, expected={expected}, retries={}, max_retries_per_op={}",
-        total_retries.load(Ordering::Relaxed),
-        max_retries_any.load(Ordering::Relaxed)
+    assert_eq!(
+        unexpected_errors.load(Ordering::Relaxed),
+        0,
+        "WriterHandle must never surface an error under pure write contention"
     );
 
-    // With SSI retry logic, the counter should eventually reach the expected value
-    // because each thread retries until its CAS-like increment succeeds.
+    let final_val: i64 = handle
+        .submit(|conn: &Connection| conn.query_row_map("SELECT val FROM counter WHERE id = 1", &[], |row| row.get_typed(0)))
+        .unwrap();
+    let expected = (num_threads * increments_per_thread) as i64;
     assert_eq!(
         final_val, expected,
-        "counter should reach expected value after retries"
+        "structural serialization means every increment lands with zero retries and zero lost updates"
     );
+
+    drop(handle);
+    join.join().expect("writer thread teardown");
+    eprintln!("Serialized increments: final={final_val}, expected={expected}, unexpected_errors=0");
 }
 
 // ============================================================================
-// 7. CONNECTION MANAGER STRESS
+// 7. MANY SUBMITTERS, ONE WRITER (replaces the old ConnectionManager stress)
 // ============================================================================
 
+/// w1b Task B4 (write-topology inventory §⑥, closed-world review item 3):
+/// the old `stress_connection_manager_parallel_writers` asserted that
+/// `FrankenConnectionManager` could genuinely open 4 concurrent writer
+/// connections -- a capability B4 removes outright, not something to
+/// "fix forward". This replacement proves the invariant that actually
+/// matters post-B4: many submitter threads hammering `WriterHandle`
+/// concurrently never push the live writer-connection count above 1, using
+/// the same registry the B4 unit tests in `storage::api::writer` rely on.
 #[test]
-fn stress_connection_manager_parallel_writers() {
+fn stress_writer_handle_many_submitters_never_exceed_one_connection() {
     let dir = TempDir::new().unwrap();
     let db_path = setup_db(&dir);
+    coding_agent_search::storage::api::reset_writer_connection_peak(&db_path);
 
-    let config = ConnectionManagerConfig {
-        reader_count: 2,
-        max_writers: 4,
-    };
-    let mgr = FrankenConnectionManager::new(&db_path, config).unwrap();
+    let (handle, join) =
+        WriterHandle::<Connection>::spawn(db_path.clone(), Profile::Production, Ok).expect("spawn writer");
 
-    // Create test table via a writer
-    {
-        let mut guard = mgr.writer().unwrap();
-        guard
-            .storage()
-            .raw()
-            .execute("CREATE TABLE IF NOT EXISTS cm_stress (id INTEGER PRIMARY KEY, tid INTEGER, val TEXT)")
-            .unwrap();
-        guard.mark_committed();
-    }
+    handle
+        .submit(|conn: &Connection| {
+            conn.execute_batch("CREATE TABLE IF NOT EXISTS cm_stress (id INTEGER PRIMARY KEY, tid INTEGER, val TEXT)")
+        })
+        .unwrap();
 
     let writes_per_thread = 50;
 
     std::thread::scope(|s| {
         let mut handles = Vec::new();
         for tid in 0..4 {
-            let m = &mgr;
+            let h = handle.clone();
             handles.push(s.spawn(move || {
                 for seq in 0..writes_per_thread {
-                    let mut guard = m.concurrent_writer().expect("acquire writer");
-                    with_retry(50, || {
-                        let mut tx = guard.storage().raw().transaction()?;
-                        let val = format!("cm-{tid}-{seq}");
-                        tx.execute_compat(
-                            "INSERT INTO cm_stress (tid, val) VALUES (?1, ?2)",
-                            fparams![tid, val.as_str()],
-                        )?;
-                        tx.commit().map_err(anyhow::Error::new)?;
-                        Ok(())
+                    let val = format!("cm-{tid}-{seq}");
+                    h.submit(move |conn: &Connection| {
+                        conn.execute("INSERT INTO cm_stress (tid, val) VALUES (?1, ?2)", &fparams![tid, val.as_str()])
                     })
-                    .expect("cm write should succeed");
-                    guard.mark_committed();
+                    .expect("cm write via WriterHandle should succeed");
                 }
             }));
         }
@@ -670,15 +553,16 @@ fn stress_connection_manager_parallel_writers() {
         }
     });
 
-    // Verify via reader
-    let reader_guard = mgr.reader();
-    let rows = reader_guard
-        .query("SELECT COUNT(*) FROM cm_stress")
+    let count: i64 = handle
+        .submit(|conn: &Connection| conn.query_row_map("SELECT COUNT(*) FROM cm_stress", &[], |row| row.get_typed(0)))
         .unwrap();
-    let count: i64 = rows[0].get_typed(0).unwrap();
+    assert_eq!(count, (4 * writes_per_thread) as i64, "all writes should be persisted");
     assert_eq!(
-        count,
-        (4 * writes_per_thread) as i64,
-        "all writes should be persisted"
+        coding_agent_search::storage::api::writer_connection_peak(&db_path),
+        1,
+        "many submitters must never push the live writer-connection count above 1"
     );
+
+    drop(handle);
+    join.join().expect("writer thread teardown");
 }

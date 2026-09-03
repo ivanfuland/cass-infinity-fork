@@ -26,8 +26,8 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
-use frankensqlite::compat::{ConnectionExt, RowExt};
-use frankensqlite::{Connection, Row};
+use crate::storage::api::{Conn as Connection, Row};
+type ParamValue = crate::storage::api::Value;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -376,7 +376,7 @@ impl<'a> AnalyticsGenerator<'a> {
 
         // Per-agent stats
         let mut agents: BTreeMap<String, AgentStats> = BTreeMap::new();
-        let agent_conv_rows: Vec<(String, i64)> = self.db.query_map_collect(
+        let agent_conv_rows: Vec<(String, i64)> = self.db.query_all_map(
             "SELECT agent, COUNT(*) as conv_count FROM conversations GROUP BY agent",
             &[],
             |row: &Row| Ok((row.get_typed::<String>(0)?, row.get_typed::<i64>(1)?)),
@@ -392,7 +392,7 @@ impl<'a> AnalyticsGenerator<'a> {
         }
 
         // Fill in message counts per agent
-        let msg_rows: Vec<(String, i64)> = self.db.query_map_collect(
+        let msg_rows: Vec<(String, i64)> = self.db.query_all_map(
             "SELECT c.agent, COUNT(m.id) FROM messages m
              JOIN conversations c ON m.conversation_id = c.id
              GROUP BY c.agent",
@@ -407,7 +407,7 @@ impl<'a> AnalyticsGenerator<'a> {
 
         // Per-role counts
         let mut roles: BTreeMap<String, usize> = BTreeMap::new();
-        let role_rows: Vec<(String, i64)> = self.db.query_map_collect(
+        let role_rows: Vec<(String, i64)> = self.db.query_all_map(
             "SELECT role, COUNT(*) FROM messages GROUP BY role",
             &[],
             |row: &Row| Ok((row.get_typed::<String>(0)?, row.get_typed::<i64>(1)?)),
@@ -450,7 +450,7 @@ impl<'a> AnalyticsGenerator<'a> {
     fn generate_timeline(&self) -> Result<Timeline> {
         info!("Generating timeline...");
 
-        let timeline_rows: Vec<(Option<String>, String, i64, i64)> = self.db.query_map_collect(
+        let timeline_rows: Vec<(Option<String>, String, i64, i64)> = self.db.query_all_map(
             "SELECT DATE(m.created_at/1000, 'unixepoch') as date,
                     COALESCE(c.agent, 'unknown') as agent,
                     m.conversation_id,
@@ -520,7 +520,7 @@ impl<'a> AnalyticsGenerator<'a> {
 
         // Query 1: base workspace rows with conversation/time aggregates.
         let workspace_rows: Vec<(String, i64, Option<i64>, Option<i64>)> =
-            self.db.query_map_collect(
+            self.db.query_all_map(
                 "SELECT workspace, COUNT(*) as conv_count,
                     MIN(started_at), MAX(started_at)
              FROM conversations
@@ -540,7 +540,7 @@ impl<'a> AnalyticsGenerator<'a> {
 
         // Query 2: message counts for every workspace.
         let mut messages_by_workspace: HashMap<String, i64> = HashMap::new();
-        let ws_msg_rows: Vec<(String, i64)> = self.db.query_map_collect(
+        let ws_msg_rows: Vec<(String, i64)> = self.db.query_all_map(
             "SELECT c.workspace, COUNT(m.id)
              FROM conversations c
              LEFT JOIN messages m ON m.conversation_id = c.id
@@ -555,7 +555,7 @@ impl<'a> AnalyticsGenerator<'a> {
 
         // Query 3: distinct agents for every workspace.
         let mut agents_by_workspace: HashMap<String, Vec<String>> = HashMap::new();
-        let ws_agent_rows: Vec<(String, String)> = self.db.query_map_collect(
+        let ws_agent_rows: Vec<(String, String)> = self.db.query_all_map(
             "SELECT workspace, agent
              FROM conversations
              WHERE workspace IS NOT NULL
@@ -573,7 +573,7 @@ impl<'a> AnalyticsGenerator<'a> {
 
         // Query 4: recent titles per workspace (sorted by started_at DESC, top 5 per workspace in Rust).
         let mut recent_titles_by_workspace: HashMap<String, Vec<String>> = HashMap::new();
-        let ws_title_rows: Vec<(String, String)> = self.db.query_map_collect(
+        let ws_title_rows: Vec<(String, String)> = self.db.query_all_map(
             "SELECT workspace, title
              FROM conversations
              WHERE workspace IS NOT NULL AND title IS NOT NULL
@@ -637,7 +637,7 @@ impl<'a> AnalyticsGenerator<'a> {
         let mut agents: Vec<AgentEntry> = Vec::new();
 
         // Query 1: base agent rows with conversation/time aggregates.
-        let agent_rows: Vec<(String, i64, Option<i64>, Option<i64>)> = self.db.query_map_collect(
+        let agent_rows: Vec<(String, i64, Option<i64>, Option<i64>)> = self.db.query_all_map(
             "SELECT agent, COUNT(*) as conv_count,
                     MIN(started_at), MAX(started_at)
              FROM conversations
@@ -656,7 +656,7 @@ impl<'a> AnalyticsGenerator<'a> {
 
         // Query 2: message counts for every agent.
         let mut messages_by_agent: HashMap<String, i64> = HashMap::new();
-        let agent_msg_rows: Vec<(String, i64)> = self.db.query_map_collect(
+        let agent_msg_rows: Vec<(String, i64)> = self.db.query_all_map(
             "SELECT c.agent, COUNT(m.id)
              FROM conversations c
              LEFT JOIN messages m ON m.conversation_id = c.id
@@ -670,7 +670,7 @@ impl<'a> AnalyticsGenerator<'a> {
 
         // Query 3: distinct workspaces for every agent.
         let mut workspaces_by_agent: HashMap<String, Vec<String>> = HashMap::new();
-        let agent_ws_rows: Vec<(String, String)> = self.db.query_map_collect(
+        let agent_ws_rows: Vec<(String, String)> = self.db.query_all_map(
             "SELECT agent, workspace
              FROM conversations
              WHERE workspace IS NOT NULL
@@ -730,7 +730,7 @@ impl<'a> AnalyticsGenerator<'a> {
         let stop_words: HashSet<&str> = STOP_WORDS.iter().copied().collect();
 
         // Get all titles
-        let titles: Vec<String> = self.db.query_map_collect(
+        let titles: Vec<String> = self.db.query_all_map(
             "SELECT title FROM conversations WHERE title IS NOT NULL",
             &[],
             |row: &Row| row.get_typed::<String>(0),
@@ -913,7 +913,8 @@ mod tests {
     fn create_test_db() -> (TempDir, Connection) {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test.db");
-        let conn = Connection::open(db_path.to_string_lossy().as_ref()).unwrap();
+        let conn = Connection::open_writable(&db_path, crate::storage::api::Profile::Production)
+            .unwrap();
 
         // Create schema
         conn.execute_batch(
@@ -947,15 +948,15 @@ mod tests {
         // Insert conversations
         conn.execute(
             "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, message_count)
-             VALUES (1, 'claude-code', '/home/user/project-a', 'Debug authentication flow', '/path/a.jsonl', 1700000000000, 5)",
+             VALUES (1, 'claude-code', '/home/user/project-a', 'Debug authentication flow', '/path/a.jsonl', 1700000000000, 5)", &[],
         ).unwrap();
         conn.execute(
             "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, message_count)
-             VALUES (2, 'claude-code', '/home/user/project-a', 'Fix database connection', '/path/b.jsonl', 1700100000000, 3)",
+             VALUES (2, 'claude-code', '/home/user/project-a', 'Fix database connection', '/path/b.jsonl', 1700100000000, 3)", &[],
         ).unwrap();
         conn.execute(
             "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, message_count)
-             VALUES (3, 'codex', '/home/user/project-b', 'Add user authentication', '/path/c.jsonl', 1700200000000, 4)",
+             VALUES (3, 'codex', '/home/user/project-b', 'Add user authentication', '/path/c.jsonl', 1700200000000, 4)", &[],
         ).unwrap();
 
         // Insert messages
@@ -981,10 +982,10 @@ mod tests {
                 } else {
                     format!("Message {} for conv {}", idx, conv_id)
                 };
-                conn.execute_compat(
+                conn.execute(
                     "INSERT INTO messages (conversation_id, idx, role, content, created_at)
                      VALUES (?1, ?2, ?3, ?4, ?5)",
-                    frankensqlite::params![
+                    &crate::storage::api::params![
                         conv_id as i64,
                         idx as i64,
                         role,
@@ -1042,7 +1043,7 @@ mod tests {
         // stay pinned to the SQL surface.
         let mut packets: Vec<ConversationPacket> = Vec::new();
         let conv_rows: Vec<(i64, String, Option<String>, Option<i64>)> = conn
-            .query_map_collect(
+            .query_all_map(
                 "SELECT id, agent, source_path, started_at FROM conversations ORDER BY id ASC",
                 &[],
                 |row: &Row| {
@@ -1058,12 +1059,12 @@ mod tests {
 
         for (conv_id, agent, source_path, started_at) in conv_rows {
             let msg_rows: Vec<(i64, String, String, Option<i64>)> = conn
-                .query_map_collect(
+                .query_all_map(
                     "SELECT idx, role, content, created_at
                      FROM messages
                      WHERE conversation_id = ?1
                      ORDER BY idx ASC",
-                    &[frankensqlite::compat::ParamValue::from(conv_id)],
+                    &[ParamValue::from(conv_id)],
                     |row: &Row| {
                         Ok((
                             row.get_typed::<i64>(0)?,
@@ -1234,12 +1235,12 @@ mod tests {
 
         conn.execute(
             "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, message_count)
-             VALUES (1, 'codex', '/tmp/project', 'Multi-day conversation', '/path/one.jsonl', 1704067200000, 2)",
+             VALUES (1, 'codex', '/tmp/project', 'Multi-day conversation', '/path/one.jsonl', 1704067200000, 2)", &[],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, message_count)
-             VALUES (2, 'codex', '/tmp/project', 'Second conversation', '/path/two.jsonl', 1704153600000, 1)",
+             VALUES (2, 'codex', '/tmp/project', 'Second conversation', '/path/two.jsonl', 1704153600000, 1)", &[],
         )
         .unwrap();
 
@@ -1248,10 +1249,10 @@ mod tests {
             (1_i64, 1_i64, 1_704_153_600_000_i64),
             (2_i64, 0_i64, 1_704_153_600_000_i64),
         ] {
-            conn.execute_compat(
+            conn.execute(
                 "INSERT INTO messages (conversation_id, idx, role, content, created_at)
                  VALUES (?1, ?2, 'assistant', 'message', ?3)",
-                frankensqlite::params![conv_id, idx, created_at],
+                &crate::storage::api::params![conv_id, idx, created_at],
             )
             .unwrap();
         }
@@ -1304,10 +1305,10 @@ mod tests {
 
         for (id, title) in [(1_i64, "banana"), (2_i64, "apple"), (3_i64, "cherry")] {
             let source_path = format!("/path/{id}.jsonl");
-            conn.execute_compat(
+            conn.execute(
                 "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, message_count)
                  VALUES (?1, 'codex', '/tmp/project', ?2, ?3, 1704067200000, 0)",
-                frankensqlite::params![id, title, source_path.as_str()],
+                &crate::storage::api::params![id, title, source_path.as_str()],
             )
             .unwrap();
         }
@@ -1394,10 +1395,10 @@ mod tests {
             let started_at = 1_700_000_000_000i64 + i as i64 * 1_000;
             let title = format!("Claude conversation {}", i);
             let source = format!("/path/{}.jsonl", conv_id);
-            conn.execute_compat(
+            conn.execute(
                 "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, message_count)
                  VALUES (?1, 'claude-code', ?2, ?3, ?4, ?5, 1)",
-                frankensqlite::params![
+                &crate::storage::api::params![
                     conv_id,
                     workspace.as_str(),
                     title.as_str(),
@@ -1407,10 +1408,10 @@ mod tests {
             )
             .unwrap();
             let content = format!("message {}", i);
-            conn.execute_compat(
+            conn.execute(
                 "INSERT INTO messages (conversation_id, idx, role, content, created_at)
                  VALUES (?1, 0, 'assistant', ?2, ?3)",
-                frankensqlite::params![conv_id, content.as_str(), started_at],
+                &crate::storage::api::params![conv_id, content.as_str(), started_at],
             )
             .unwrap();
             conv_id += 1;
@@ -1421,10 +1422,10 @@ mod tests {
             let started_at = 1_700_100_000_000i64 + i as i64 * 1_000;
             let title = format!("Codex conversation {}", i);
             let source = format!("/path/{}.jsonl", conv_id);
-            conn.execute_compat(
+            conn.execute(
                 "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, message_count)
                  VALUES (?1, 'codex', '/home/user/codex-ws', ?2, ?3, ?4, 1)",
-                frankensqlite::params![
+                &crate::storage::api::params![
                     conv_id,
                     title.as_str(),
                     source.as_str(),
@@ -1433,10 +1434,10 @@ mod tests {
             )
             .unwrap();
             let content = format!("codex {}", i);
-            conn.execute_compat(
+            conn.execute(
                 "INSERT INTO messages (conversation_id, idx, role, content, created_at)
                  VALUES (?1, 0, 'assistant', ?2, ?3)",
-                frankensqlite::params![conv_id, content.as_str(), started_at],
+                &crate::storage::api::params![conv_id, content.as_str(), started_at],
             )
             .unwrap();
             conv_id += 1;

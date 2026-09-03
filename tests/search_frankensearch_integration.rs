@@ -1,19 +1,27 @@
-//! Integration tests verifying the frankensearch search migration (bead s3ho2).
+//! Integration tests for cass's lexical search pipeline and doc_id parsing.
 //!
-//! Validates that:
-//! 1. All search operations go through frankensearch (no direct tantivy imports remain)
-//! 2. SemanticFilter directly implements frankensearch::core::filter::SearchFilter
-//! 3. No duplicate FsSemanticFilterAdapter exists
-//! 4. Vector search via frankensearch VectorIndex produces correct results
-//! 5. RRF hybrid fusion uses frankensearch::rrf_fuse
-//! 6. Query parsing and search pipeline work end-to-end through frankensearch
+//! W3-5: this file originally verified the frankensearch search migration
+//! (bead s3ho2) -- both lexical (tantivy-backed) and vector (fsvi) search
+//! routed through the `frankensearch` crate. That crate dependency has since
+//! been retired: RRF fusion was verbatim-restored locally into
+//! `src/search/frankensearch_rrf.rs` (with its own unit test coverage), and
+//! fsvi vector search was replaced by DB-vector-domain search. The tests
+//! that exercised `frankensearch::` types directly (fsvi VectorIndex
+//! roundtrip, upstream `rrf_fuse`) were retired with the dependency; what
+//! remains here is durable coverage independent of that migration: no
+//! stray `tantivy::` imports/deps (dependency-hygiene sentinel), doc_id
+//! parsing, and `SearchClient`'s lexical BM25 pipeline end-to-end.
+//!
+//! Earlier W3-5: cass's own `SemanticFilter` (a `frankensearch::core::filter::SearchFilter`
+//! adapter over numeric-ID doc_id filtering) was retired alongside the fsvi
+//! candidate-search path it existed for -- `search_db_vector_domain` filters
+//! via SQL against the relational schema instead. The tests that verified
+//! `SemanticFilter`'s trait impl directly were retired with it.
 
 use coding_agent_search::search::query::{FieldMask, SearchClient, SearchFilters};
-use coding_agent_search::search::tantivy::TantivyIndex;
-use coding_agent_search::search::vector_index::{
-    SemanticFilter, VectorIndex, parse_semantic_doc_id,
-};
-use std::collections::HashSet;
+use coding_agent_search::indexer::persist::persist_conversation;
+use coding_agent_search::storage::sqlite::SqliteStorage;
+use coding_agent_search::search::vector_index::parse_semantic_doc_id;
 use tempfile::TempDir;
 
 mod util;
@@ -89,85 +97,6 @@ fn no_direct_tantivy_in_cargo_toml() {
 }
 
 // =============================================================================
-// SEARCHFILTER UNIFICATION
-// =============================================================================
-
-/// Verify SemanticFilter directly implements frankensearch::core::filter::SearchFilter.
-/// This proves the adapter pattern (FsSemanticFilterAdapter) has been eliminated.
-#[test]
-fn semantic_filter_implements_search_filter_directly() {
-    use frankensearch::core::filter::SearchFilter;
-
-    let filter = SemanticFilter {
-        agents: Some(HashSet::from([3])),
-        workspaces: Some(HashSet::from([7])),
-        sources: Some(HashSet::from([11])),
-        roles: Some(HashSet::from([1])),
-        created_from: Some(1_700_000_000_000),
-        created_to: Some(1_700_000_000_100),
-    };
-
-    // Matching doc_id
-    assert!(
-        filter.matches("m|42|2|3|7|11|1|1700000000050", None),
-        "filter should match doc_id with correct agent/workspace/source/role/timestamp"
-    );
-
-    // Wrong agent
-    assert!(
-        !filter.matches("m|42|2|99|7|11|1|1700000000050", None),
-        "filter should reject wrong agent_id"
-    );
-
-    // Wrong workspace
-    assert!(
-        !filter.matches("m|42|2|3|99|11|1|1700000000050", None),
-        "filter should reject wrong workspace_id"
-    );
-
-    // Wrong source
-    assert!(
-        !filter.matches("m|42|2|3|7|99|1|1700000000050", None),
-        "filter should reject wrong source_id"
-    );
-
-    // Wrong role
-    assert!(
-        !filter.matches("m|42|2|3|7|11|9|1700000000050", None),
-        "filter should reject wrong role"
-    );
-
-    // Timestamp before range
-    assert!(
-        !filter.matches("m|42|2|3|7|11|1|1699999999999", None),
-        "filter should reject timestamp before created_from"
-    );
-
-    // Timestamp after range
-    assert!(
-        !filter.matches("m|42|2|3|7|11|1|1700000000200", None),
-        "filter should reject timestamp after created_to"
-    );
-
-    // Invalid doc_id
-    assert!(
-        !filter.matches("not-a-valid-doc-id", None),
-        "filter should reject invalid doc_id format"
-    );
-}
-
-/// Verify unrestricted filter (all None) matches everything.
-#[test]
-fn unrestricted_semantic_filter_matches_all() {
-    use frankensearch::core::filter::SearchFilter;
-
-    let filter = SemanticFilter::default();
-
-    assert!(filter.matches("m|1|0|5|10|20|0|1700000000000", None));
-    assert!(filter.matches("m|999|3|99|99|99|2|1800000000000", None));
-}
-
-// =============================================================================
 // DOC_ID PARSING
 // =============================================================================
 
@@ -210,100 +139,6 @@ fn parse_semantic_doc_id_rejects_invalid() {
 }
 
 // =============================================================================
-// FRANKENSEARCH VECTOR INDEX INTEGRATION
-// =============================================================================
-
-/// Verify frankensearch VectorIndex write + search roundtrip works correctly.
-#[test]
-fn frankensearch_vector_index_write_and_search() {
-    let dir = TempDir::new().unwrap();
-    let index_path = dir.path().join("vector_index").join("index-test.fsvi");
-    std::fs::create_dir_all(index_path.parent().unwrap()).unwrap();
-
-    let hash_a = "00".repeat(32);
-    let hash_b = "11".repeat(32);
-    let doc_a = format!("m|101|0|1|10|100|1|1700000000001|{hash_a}");
-    let doc_b = format!("m|202|0|2|20|200|1|1700000000002|{hash_b}");
-
-    // Write two vectors
-    let mut writer = VectorIndex::create_with_revision(
-        &index_path,
-        "test-embedder",
-        "rev-1",
-        2, // dimension
-        frankensearch::index::Quantization::F16,
-    )
-    .expect("create vector index");
-
-    writer
-        .write_record(&doc_a, &[1.0, 0.0])
-        .expect("write doc_a");
-    writer
-        .write_record(&doc_b, &[0.0, 1.0])
-        .expect("write doc_b");
-    writer.finish().expect("finish writing");
-
-    // Read and search
-    let index = VectorIndex::open(&index_path).expect("open vector index");
-
-    // Search for vector similar to doc_a
-    let results = index.search_top_k(&[1.0, 0.0], 5, None).expect("search");
-    assert!(!results.is_empty(), "should find at least one result");
-
-    let top = &results[0];
-    let parsed = parse_semantic_doc_id(&top.doc_id).expect("parse top result doc_id");
-    assert_eq!(parsed.message_id, 101, "top result should be doc_a");
-}
-
-/// Verify vector search with SemanticFilter integration.
-#[test]
-fn frankensearch_vector_search_with_semantic_filter() {
-    use frankensearch::core::filter::SearchFilter;
-
-    let dir = TempDir::new().unwrap();
-    let index_path = dir.path().join("vector_index").join("index-filtered.fsvi");
-    std::fs::create_dir_all(index_path.parent().unwrap()).unwrap();
-
-    let hash = "00".repeat(32);
-    let doc_agent1 = format!("m|101|0|1|10|100|1|1700000000001|{hash}");
-    let doc_agent2 = format!("m|202|0|2|20|200|1|1700000000002|{hash}");
-
-    let mut writer = VectorIndex::create_with_revision(
-        &index_path,
-        "test-embedder",
-        "rev-1",
-        2,
-        frankensearch::index::Quantization::F16,
-    )
-    .expect("create index");
-
-    // Both vectors point in same direction so both would match
-    writer
-        .write_record(&doc_agent1, &[1.0, 0.0])
-        .expect("write");
-    writer
-        .write_record(&doc_agent2, &[0.9, 0.1])
-        .expect("write");
-    writer.finish().expect("finish");
-
-    let index = VectorIndex::open(&index_path).expect("open");
-
-    // Filter to agent_id=1 only
-    let filter = SemanticFilter {
-        agents: Some(HashSet::from([1])),
-        ..Default::default()
-    };
-
-    let results = index
-        .search_top_k(&[1.0, 0.0], 5, Some(&filter as &dyn SearchFilter))
-        .expect("filtered search");
-
-    assert_eq!(results.len(), 1, "should return only agent_id=1 result");
-    let parsed = parse_semantic_doc_id(&results[0].doc_id).expect("parse");
-    assert_eq!(parsed.agent_id, 1);
-}
-
-// =============================================================================
 // LEXICAL SEARCH THROUGH FRANKENSEARCH
 // =============================================================================
 
@@ -312,7 +147,8 @@ fn frankensearch_vector_search_with_semantic_filter() {
 #[test]
 fn lexical_search_through_frankensearch_pipeline() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     let conv = util::ConversationFixtureBuilder::new("claude_code")
         .title("frankensearch integration test")
@@ -324,10 +160,9 @@ fn lexical_search_through_frankensearch_pipeline() {
         .with_content(2, "Rate limiting prevents abuse of the API endpoint")
         .build_normalized();
 
-    index.add_conversation(&conv).unwrap();
-    index.commit().unwrap();
+    persist_conversation(&storage, &conv).unwrap();
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
     let filters = SearchFilters::default();
@@ -359,7 +194,8 @@ fn lexical_search_through_frankensearch_pipeline() {
 #[test]
 fn agent_filter_through_frankensearch_pipeline() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     let conv_claude = util::ConversationFixtureBuilder::new("claude_code")
         .title("claude session")
@@ -377,11 +213,10 @@ fn agent_filter_through_frankensearch_pipeline() {
         .with_content(0, "debugging the cache invalidation logic")
         .build_normalized();
 
-    index.add_conversation(&conv_claude).unwrap();
-    index.add_conversation(&conv_codex).unwrap();
-    index.commit().unwrap();
+    persist_conversation(&storage, &conv_claude).unwrap();
+    persist_conversation(&storage, &conv_codex).unwrap();
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
 
@@ -404,91 +239,6 @@ fn agent_filter_through_frankensearch_pipeline() {
 }
 
 // =============================================================================
-// RRF FUSION VERIFICATION
-// =============================================================================
-
-/// Verify that frankensearch rrf_fuse is available and produces valid scores.
-/// This tests the function signature and basic correctness, not the full hybrid
-/// pipeline (which requires both lexical and semantic indexes).
-#[test]
-fn frankensearch_rrf_fuse_produces_valid_scores() {
-    use frankensearch::{RrfConfig, ScoreSource, ScoredResult, VectorHit, rrf_fuse};
-
-    let lexical_results = vec![
-        ScoredResult {
-            doc_id: "doc_a".to_string(),
-            score: 10.0,
-            source: ScoreSource::Lexical,
-            index: None,
-            fast_score: None,
-            quality_score: None,
-            lexical_score: Some(10.0),
-            rerank_score: None,
-            explanation: None,
-            metadata: None,
-        },
-        ScoredResult {
-            doc_id: "doc_b".to_string(),
-            score: 5.0,
-            source: ScoreSource::Lexical,
-            index: None,
-            fast_score: None,
-            quality_score: None,
-            lexical_score: Some(5.0),
-            rerank_score: None,
-            explanation: None,
-            metadata: None,
-        },
-    ];
-
-    let semantic_results = vec![
-        VectorHit {
-            index: 0,
-            score: 0.95,
-            doc_id: "doc_b".to_string(),
-        },
-        VectorHit {
-            index: 1,
-            score: 0.8,
-            doc_id: "doc_c".to_string(),
-        },
-    ];
-
-    let config = RrfConfig { k: 60.0 };
-    let fused = rrf_fuse(&lexical_results, &semantic_results, 100, 0, &config);
-
-    assert!(!fused.is_empty(), "RRF fusion should produce results");
-
-    // doc_b appears in both lists, so should have highest RRF score
-    let top = &fused[0];
-    assert_eq!(
-        top.doc_id, "doc_b",
-        "doc_b should be ranked highest (appears in both lists)"
-    );
-
-    // Verify all scores are positive
-    for result in &fused {
-        assert!(result.rrf_score > 0.0, "RRF scores should be positive");
-    }
-
-    // Bead 7k7pl: pin the EXACT set of doc_ids, not just presence of
-    // each. The fusion contract says: given two input lists with doc_a
-    // + doc_b and doc_b + doc_c, RRF must produce EXACTLY {doc_a,
-    // doc_b, doc_c} — no extras (would indicate phantom docs leaking
-    // from another source), no missing ids (would indicate a dedup
-    // bug). Three separate `.contains()` probes accept a regression
-    // that also introduces extra doc_ids.
-    let doc_ids: HashSet<&str> = fused.iter().map(|r| r.doc_id.as_str()).collect();
-    let expected: HashSet<&str> = ["doc_a", "doc_b", "doc_c"].into_iter().collect();
-    assert_eq!(
-        doc_ids, expected,
-        "RRF fusion output must contain EXACTLY the union of the two input \
-         lists with no phantom ids; got {:?}",
-        doc_ids
-    );
-}
-
-// =============================================================================
 // SEARCH RESULT CONSISTENCY
 // =============================================================================
 
@@ -497,7 +247,8 @@ fn frankensearch_rrf_fuse_produces_valid_scores() {
 #[test]
 fn search_results_are_deterministic() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     let conv = util::ConversationFixtureBuilder::new("claude_code")
         .title("determinism test")
@@ -511,10 +262,9 @@ fn search_results_are_deterministic() {
         .with_content(4, "authentication flow diagram and documentation")
         .build_normalized();
 
-    index.add_conversation(&conv).unwrap();
-    index.commit().unwrap();
+    persist_conversation(&storage, &conv).unwrap();
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
     let filters = SearchFilters::default();
@@ -551,7 +301,8 @@ fn search_results_are_deterministic() {
 #[test]
 fn search_results_have_expected_fields() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
 
     let conv = util::ConversationFixtureBuilder::new("claude_code")
         .title("field test session")
@@ -564,10 +315,9 @@ fn search_results_have_expected_fields() {
         )
         .build_normalized();
 
-    index.add_conversation(&conv).unwrap();
-    index.commit().unwrap();
+    persist_conversation(&storage, &conv).unwrap();
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
     let filters = SearchFilters::default();

@@ -152,6 +152,8 @@ claude_*.html
 session_export_test.html
 tests/fixtures/search_demo_data/*.db-shm
 tests/fixtures/search_demo_data/*.db-wal
+tests/fixtures/search_demo_data/*.db-fsqlite-ns-gate
+tests/fixtures/search_demo_data/*.db-fsqlite-ns-use
 session_export.html
 
 # Local sqlite artifacts in repo root

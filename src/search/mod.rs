@@ -2,8 +2,7 @@
 //!
 //! This module provides the search infrastructure for cass, including:
 //!
-//! - **[`query`]**: Query parsing, execution, and caching for Tantivy-based full-text search.
-//! - **[`tantivy`]**: Tantivy index creation, schema management, and document indexing.
+//! - **[`query`]**: Query parsing, execution, and caching for FTS5-based full-text search.
 //! - **[`embedder`]**: Embedder trait for semantic search (hash and ML implementations).
 //! - **[`embedder_registry`]**: Embedder registry for model selection (bd-2mbe).
 //! - **[`hash_embedder`]**: FNV-1a feature hashing embedder (deterministic fallback).
@@ -17,11 +16,8 @@
 //! - **[`policy`]**: Semantic policy contract: model defaults, tiers, budgets, invalidation.
 //! - **[`semantic_manifest`]**: Durable semantic asset manifests, backlog ledger, and checkpoints.
 //! - **[`canonicalize`]**: Text preprocessing for consistent embedding input.
-//! - **[`ann_index`]**: HNSW-based approximate nearest neighbor index (Opt 9).
-//! - **[`two_tier_search`]**: Two-tier progressive search with fast/quality embeddings (bd-3dcw).
 //! - **[`pack_planner`]**: Deterministic answer-pack evidence selection core.
 
-pub mod ann_index;
 pub mod asset_state;
 pub(crate) mod bounded_discovery;
 pub mod canonicalize;
@@ -35,12 +31,19 @@ pub mod embedder_registry;
 pub mod fastembed_embedder;
 pub mod fastembed_reranker;
 pub(crate) mod fleet_cheap_probes;
+pub(crate) mod frankensearch_daemon;
+pub(crate) mod frankensearch_hash_embedder;
+pub(crate) mod frankensearch_rrf;
+pub(crate) mod frankensearch_types;
 pub mod hash_embedder;
 pub(crate) mod human_readiness_summary;
 pub(crate) mod incident_categories;
 pub(crate) mod incident_redaction;
 #[cfg(feature = "infinity")]
 pub mod infinity;
+pub(crate) mod index_provenance;
+pub mod lexical_index_health;
+pub(crate) mod lexical_rerank;
 pub(crate) mod liveness_fixtures;
 pub(crate) mod model_acquisition;
 pub mod model_download;
@@ -67,10 +70,8 @@ pub(crate) mod semantic_readiness;
 pub(crate) mod source_provenance;
 pub(crate) mod storage_integrity;
 pub(crate) mod storage_salvage;
-pub mod tantivy;
 pub mod trust_correlation;
 pub mod trust_scoring;
-pub mod two_tier_search;
 pub mod vector_index;
 pub(crate) mod watch_exit_envelope;
 pub(crate) mod watch_recovery;

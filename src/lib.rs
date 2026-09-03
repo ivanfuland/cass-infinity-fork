@@ -34,6 +34,8 @@ pub mod guide_planner;
 pub mod html_export;
 pub mod incident_discovery;
 pub mod indexer;
+pub mod ingest_manifest;
+pub mod ingest_reconcile;
 pub mod lessons;
 pub mod lessons_extraction;
 pub mod metric_integrity;
@@ -76,10 +78,27 @@ use anyhow::Result;
 use base64::prelude::*;
 use chrono::Utc;
 use clap::{Arg, ArgAction, Command, CommandFactory, Parser, Subcommand, ValueEnum, ValueHint};
-use frankensqlite::compat::{
-    ConnectionExt, OpenFlags as FrankenOpenFlags, RowExt,
-    open_with_flags as open_franken_with_flags,
-};
+// w1a Task A5 (mirrors sqlite.rs Task A4a): resolve the historical
+// `the legacy embedded engine` imports through the backend-agnostic `storage::api` facade.
+use storage::api::{Conn as FrankenConnection, Row as FrankenRow, StorageError, Value};
+type ParamValue = Value;
+type SqliteValue = Value;
+
+/// The original crate's `compat::OpenFlags` had many variants; this crate only ever
+/// requested `SQLITE_OPEN_READ_ONLY` (mirrors sqlite.rs's Task A4a shim).
+#[derive(Debug, Clone, Copy)]
+#[allow(non_camel_case_types)]
+enum FrankenOpenFlags {
+    SQLITE_OPEN_READ_ONLY,
+}
+
+fn open_franken_with_flags(
+    path: &str,
+    _flags: FrankenOpenFlags,
+) -> Result<FrankenConnection, StorageError> {
+    FrankenConnection::open_read(Path::new(path))
+}
+
 use indexer::IndexOptions;
 use model::cli_error_kind::ErrorKind as CliErrorKind;
 use serde::{Deserialize, Serialize};
@@ -142,7 +161,6 @@ struct IndexEntrypointDiagnostics {
     watch: bool,
     watch_once_path_count: usize,
     semantic: bool,
-    build_hnsw: bool,
     migration_state: &'static str,
 }
 
@@ -152,8 +170,11 @@ fn index_entrypoint_diagnostics(
     watch: bool,
     watch_once_path_count: usize,
     semantic: bool,
-    build_hnsw: bool,
 ) -> IndexEntrypointDiagnostics {
+    // W3-5: the "semantic_hnsw" kind (semantic && build_hnsw) is dropped
+    // along with the retired `--build-hnsw` flag -- `cass index --build-hnsw`
+    // has had no query-time reader since 3f7aa054 (`--approximate` removal),
+    // and the flag itself is now gone.
     let kind = if watch_once_path_count > 0 {
         if watch { "watch_cycle" } else { "watch_once" }
     } else if watch {
@@ -162,8 +183,6 @@ fn index_entrypoint_diagnostics(
         "full_rebuild"
     } else if force_rebuild {
         "force_rebuild"
-    } else if semantic && build_hnsw {
-        "semantic_hnsw"
     } else if semantic {
         "semantic_backfill"
     } else {
@@ -177,7 +196,6 @@ fn index_entrypoint_diagnostics(
         watch,
         watch_once_path_count,
         semantic,
-        build_hnsw,
         migration_state: "tin8o_entrypoint_observed",
     }
 }
@@ -186,11 +204,11 @@ fn with_frankensqlite_connection<T, F>(
     db_path: &Path,
     context: &str,
     op: F,
-) -> std::result::Result<T, frankensqlite::FrankenError>
+) -> std::result::Result<T, StorageError>
 where
-    F: FnOnce(&frankensqlite::Connection) -> std::result::Result<T, frankensqlite::FrankenError>,
+    F: FnOnce(&FrankenConnection) -> std::result::Result<T, StorageError>,
 {
-    let mut conn = frankensqlite::Connection::open(db_path.to_string_lossy().as_ref())?;
+    let mut conn = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().as_ref())), crate::storage::api::Profile::Production)?;
     let result = op(&conn);
     let close_result = conn.close_in_place();
     match (result, close_result) {
@@ -347,13 +365,13 @@ pub enum Commands {
         #[arg(long)]
         semantic: bool,
 
-        /// Build HNSW index for approximate nearest neighbor search (requires --semantic).
-        /// Enables O(log n) search with `--approximate` flag at query time.
-        #[arg(long, default_value_t = false)]
-        build_hnsw: bool,
-
-        /// Embedder to use for semantic indexing (hash, fastembed)
-        #[arg(long, default_value = "fastembed")]
+        /// Embedder to use for semantic indexing (infinity, hash; `fastembed`
+        /// requires the `semantic` build feature, retired in this build --
+        /// R1-W3-N2: defaults to `infinity` under the `infinity` feature so
+        /// a bare `cass index --semantic` reaches the DB vector domain
+        /// instead of the retired default)
+        #[cfg_attr(feature = "infinity", arg(long, default_value = "infinity"))]
+        #[cfg_attr(not(feature = "infinity"), arg(long, default_value = "fastembed"))]
         embedder: String,
 
         /// Override data dir (index + db). Defaults to platform data dir.
@@ -499,13 +517,6 @@ pub enum Commands {
         #[arg(long, value_enum)]
         mode: Option<crate::search::query::SearchMode>,
 
-        /// Use approximate nearest neighbor (ANN) search with HNSW for faster semantic/hybrid queries.
-        /// Trades slight accuracy loss for O(log n) search complexity instead of O(n).
-        /// Only affects semantic and hybrid modes; ignored for lexical search.
-        /// Requires an HNSW index built with `cass index --semantic --approximate`.
-        #[arg(long, default_value_t = false)]
-        approximate: bool,
-
         // ==========================================================================
         // Model / Reranker / Daemon flags (bd-3bbv)
         // ==========================================================================
@@ -533,26 +544,6 @@ pub enum Commands {
         /// Disable daemon usage even if available (force direct inference).
         #[arg(long, default_value_t = false)]
         no_daemon: bool,
-
-        // ==========================================================================
-        // Two-tier progressive search flags (bd-3dcw)
-        // ==========================================================================
-        /// Enable two-tier progressive search: fast results immediately, refined via daemon.
-        /// Returns initial results from fast embedder (~1ms), then refines with quality
-        /// embedder via daemon (~130ms). Best of both worlds for interactive search.
-        #[arg(long, default_value_t = false)]
-        two_tier: bool,
-
-        /// Fast-only search: use lightweight embedder for instant results, no refinement.
-        /// Ideal for real-time search-as-you-type scenarios where latency is critical.
-        #[arg(long, default_value_t = false)]
-        fast_only: bool,
-
-        /// Quality-only search: wait for full transformer model results.
-        /// Higher latency (~130ms) but most accurate semantic matching.
-        /// Requires daemon to be available; falls back to fast if unavailable.
-        #[arg(long, default_value_t = false)]
-        quality_only: bool,
 
         /// Run an incremental `cass index` pass before the search so new
         /// conversations created since the last index are matched. No-op
@@ -1641,6 +1632,9 @@ pub enum Commands {
     /// Import data from external sources
     #[command(subcommand)]
     Import(ImportCommand),
+    /// Staging reingest candidate-inventory and coverage tooling (plan v6 Stage C)
+    #[command(subcommand)]
+    Ingest(IngestCommand),
     /// Token usage, tool, and model analytics
     ///
     /// Subcommands: status, tokens, tools, models, rebuild, validate.
@@ -2331,6 +2325,58 @@ pub enum SourcesCommand {
         /// Output progress as JSON (implies non-interactive, for scripting)
         #[arg(long, visible_alias = "robot")]
         json: bool,
+    },
+}
+
+/// Subcommands for staging reingest candidate-inventory tooling (plan v6 Stage C).
+#[derive(Subcommand, Debug, Clone)]
+pub enum IngestCommand {
+    /// Enumerate connector-discovered sessions under explicit scan roots into a
+    /// sealed candidate manifest (JSONL), one line per stable session identity.
+    Manifest {
+        /// Root directory to scan (repeatable). No default-detection fallback:
+        /// all roots must be given explicitly. Either a plain path
+        /// (broadcast to every connector, back-compat) or
+        /// `<slug>:<path>` (d21: fed only to the connector registered
+        /// under that slug, e.g. `openclaw:/path/to/.openclaw`).
+        #[arg(long = "scan-root", required = true)]
+        scan_root: Vec<String>,
+
+        /// Raw-mirror directory associated with this manifest generation
+        /// (accepted for interface parity with plan C3; not yet consumed).
+        #[arg(long)]
+        mirror: PathBuf,
+
+        /// Output path for the manifest JSONL file.
+        #[arg(long)]
+        out: PathBuf,
+
+        /// d20: classify subagent transcripts as structurally excluded
+        /// (`exclude_reason = "subagent"`), mirroring the live indexer's
+        /// `CASS_SKIP_SUBAGENTS` opt-in. Default (flag absent): subagent
+        /// transcripts are eligible, matching production `cass index`'s
+        /// default ingestion behavior. The effective value is sealed into
+        /// the manifest header.
+        #[arg(long = "skip-subagents", default_value_t = false)]
+        skip_subagents: bool,
+    },
+    /// Reconcile a sealed manifest against a database: coverage (forward +
+    /// reverse anti-join), root-set attestation, and content conservation.
+    /// Exit 0 = closed; exit 1 = any discrepancy (each listed in the report).
+    /// The database is the top-level `--db` flag (global in this CLI), not a
+    /// subcommand flag -- `--db` is unconditionally lifted to the front of
+    /// the argument list by `normalize_args`, so a per-subcommand `--db`
+    /// field here would never receive a value.
+    Reconcile {
+        /// Path to a manifest JSONL file produced by `cass ingest manifest`.
+        #[arg(long)]
+        manifest: PathBuf,
+
+        /// Root-set truth file (one scan root per line) independent of the
+        /// manifest itself -- asserted equal to the manifest header's
+        /// scan-root attestation.
+        #[arg(long = "expected-roots")]
+        expected_roots: PathBuf,
     },
 }
 
@@ -4414,17 +4460,10 @@ fn search_like_option_value_count(command: &str, arg: &str) -> Option<usize> {
             | "dry-run"
             | "dry_run"
             | "highlight"
-            | "approximate"
             | "rerank"
             | "daemon"
             | "no-daemon"
             | "no_daemon"
-            | "two-tier"
-            | "two_tier"
-            | "fast-only"
-            | "fast_only"
-            | "quality-only"
-            | "quality_only"
             | "refresh"
             | "catch-up"
             | "catch_up"
@@ -5107,8 +5146,6 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         "resume",
         "non-interactive",
         // Missing flags added
-        "approximate",
-        "build-hnsw",
         "export-only",
         "verify",
         "scan-secrets",
@@ -5123,8 +5160,6 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         "robot-meta",
         "robot-format",
         "max-content-length",
-        "fast-only",
-        "quality-only",
         "once",
         "reset-state",
         "asciicast",
@@ -6790,7 +6825,6 @@ async fn execute_cli(
                     watch_interval,
                     data_dir,
                     semantic,
-                    build_hnsw,
                     embedder,
                     idempotency_key,
                     json,
@@ -6808,7 +6842,6 @@ async fn execute_cli(
                         watch_interval,
                         data_dir,
                         semantic,
-                        build_hnsw,
                         embedder,
                         progress,
                         structured_format,
@@ -6848,32 +6881,13 @@ async fn execute_cli(
                     source,
                     sessions_from,
                     mode,
-                    approximate,
                     model,
                     rerank,
                     reranker,
                     daemon,
                     no_daemon,
-                    two_tier,
-                    fast_only,
-                    quality_only,
                     refresh,
                 } => {
-                    // Validate mutually exclusive two-tier flags
-                    let tier_count = [two_tier, fast_only, quality_only]
-                        .iter()
-                        .filter(|&&b| b)
-                        .count();
-                    if tier_count > 1 {
-                        return Err(CliError::usage(
-                            "Cannot specify multiple tier flags",
-                            Some(
-                                "Use only one of --two-tier, --fast-only, or --quality-only"
-                                    .to_string(),
-                            ),
-                        ));
-                    }
-
                     // Validate mutually exclusive flags
                     if daemon && no_daemon {
                         return Err(CliError::usage(
@@ -6892,32 +6906,15 @@ async fn execute_cli(
                         );
                     }
 
-                    // --refresh runs *after* flag validation so an invocation
-                    // like `cass search --refresh --two-tier --fast-only`
-                    // rejects fast on the bad flag combo instead of burning a
-                    // ~30s incremental index before failing usage.
                     if refresh {
                         refresh_index_inline(cli.db.clone(), data_dir.clone());
                     }
-
-                    // Build semantic options from new flags
-                    let tier_mode = if two_tier {
-                        crate::search::query::SemanticTierMode::Progressive
-                    } else if fast_only {
-                        crate::search::query::SemanticTierMode::FastOnly
-                    } else if quality_only {
-                        crate::search::query::SemanticTierMode::QualityOnly
-                    } else {
-                        crate::search::query::SemanticTierMode::Single
-                    };
 
                     let semantic_opts = SemanticSearchOptions {
                         model: model.clone(),
                         rerank,
                         reranker: reranker.clone(),
                         use_daemon: daemon && !no_daemon,
-                        approximate,
-                        tier_mode,
                     };
 
                     // Only pass through robot_format when it was explicitly
@@ -8382,16 +8379,20 @@ async fn execute_cli(
                         )?;
                         return Ok(());
                     }
-                    // #285: `cass doctor --rebuild-canonical-fts --yes` — drop
-                    // and rebuild the canonical FTS5 shadow tables in place.
+                    // W2-6 Task戊: `cass doctor --rebuild-canonical-fts` rebuilt
+                    // the in-DB `fts_messages` shadow, which this task DROPs
+                    // entirely -- there is no longer anything for this flag to
+                    // rebuild. Kept parseable (rather than an "unknown flag"
+                    // error) so a user with an old script gets an explicit
+                    // retirement message instead of a confusing parse failure.
                     if rebuild_canonical_fts {
-                        doctor_recover::run_doctor_rebuild_canonical_fts(
-                            data_dir,
-                            cli.db.clone(),
-                            yes,
-                            structured_format,
-                        )?;
-                        return Ok(());
+                        return Err(CliError {
+                            code: 4,
+                            kind: "refused-unsafe",
+                            message: "`cass doctor --rebuild-canonical-fts` has been retired: the in-DB fts_messages shadow it rebuilt no longer exists (search runs entirely on the fts_lex/lex_docs index).".to_string(),
+                            hint: Some("No action needed for fts_messages -- to rebuild the current fts_lex/lex_docs index instead, run 'cass index --full'.".to_string()),
+                            retryable: false,
+                        });
                     }
                     // #285: `cass doctor --cleanup-interrupted-artifacts --yes`
                     // — quarantine interrupted raw_mirror_capture artifacts.
@@ -8744,6 +8745,9 @@ async fn execute_cli(
                 Commands::Import(subcmd) => {
                     handle_import(subcmd, cli).await?;
                 }
+                Commands::Ingest(subcmd) => {
+                    run_ingest_command(subcmd, cli)?;
+                }
                 #[cfg(unix)]
                 Commands::Daemon {
                     socket,
@@ -8766,6 +8770,56 @@ async fn handle_import(cmd: ImportCommand, cli: &Cli) -> CliResult<()> {
         ImportCommand::Chatgpt { path, output_dir } => {
             let structured_format = cli.robot_format.or_else(robot_format_from_env);
             import_chatgpt_export(&path, output_dir.as_deref(), structured_format).await
+        }
+    }
+}
+
+fn run_ingest_command(cmd: IngestCommand, cli: &Cli) -> CliResult<()> {
+    match cmd {
+        IngestCommand::Manifest {
+            scan_root,
+            mirror,
+            out,
+            skip_subagents,
+        } => crate::ingest_manifest::run_manifest(crate::ingest_manifest::ManifestArgs {
+            scan_roots: scan_root,
+            mirror,
+            out,
+            skip_subagents,
+        })
+        .map_err(|error| CliError::unknown(error.to_string())),
+        IngestCommand::Reconcile {
+            manifest,
+            expected_roots,
+        } => {
+            let db = cli.db.clone().ok_or_else(|| {
+                CliError::usage(
+                    "cass ingest reconcile requires --db (the staging database to reconcile; \
+                     there is deliberately no fallback to the production data dir)",
+                    None,
+                )
+            })?;
+            let report = crate::ingest_reconcile::run_reconcile(crate::ingest_reconcile::ReconcileArgs {
+                manifest,
+                db,
+                expected_roots,
+            })
+            .map_err(|error| CliError::unknown(error.to_string()))?;
+            let report_json = serde_json::to_string_pretty(&report)
+                .map_err(|error| CliError::unknown(error.to_string()))?;
+            println!("{report_json}");
+            if report.is_closed() {
+                Ok(())
+            } else {
+                Err(CliError {
+                    code: 1,
+                    kind: "reconcile_discrepancy",
+                    message: "reconcile found coverage/content discrepancies (see report above)"
+                        .to_string(),
+                    hint: None,
+                    retryable: false,
+                })
+            }
         }
     }
 }
@@ -9161,7 +9215,7 @@ fn run_forget_command(
         });
     }
 
-    let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
+    let storage = FrankenStorage::open_writer(&db_path).map_err(|e| CliError {
         code: 5,
         kind: "forget",
         message: format!("failed to open canonical database: {e}"),
@@ -9182,14 +9236,10 @@ fn run_forget_command(
             retryable: false,
         })?;
 
-    // After an actual deletion, rebuild derived assets so search/analytics stay
-    // consistent (mirrors the agent-purge path). The lexical index also
-    // self-heals on next search, but rebuilding FTS now keeps DB-resident
-    // surfaces correct.
+    // After an actual deletion, rebuild derived assets so analytics stay
+    // consistent (mirrors the agent-purge path). The lexical index
+    // self-heals on next search.
     if apply && report.conversations_deleted > 0 {
-        if let Err(e) = storage.rebuild_fts() {
-            tracing::warn!(error = %e, "forget: failed to rebuild FTS after deletion");
-        }
         if let Err(e) = storage.rebuild_analytics() {
             tracing::warn!(error = %e, "forget: failed to rebuild analytics after deletion");
         }
@@ -14323,26 +14373,14 @@ struct FailurePatternRule {
 
 fn swarm_failure_pattern_rules() -> Vec<FailurePatternRule> {
     vec![
-        FailurePatternRule {
-            kind: "fsqlite-query-shape-regression",
-            severity: "high",
-            title: "FrankenSQLite query-shape regression",
-            summary: "Evidence mentions fsqlite planner/query-shape failures that should become targeted SQL regression tests.",
-            keywords: &[
-                "frankensqlite",
-                "fsqlite",
-                "execute_join_select",
-                "fts5",
-                "query-shape",
-                "planner",
-                "join select",
-            ],
-            suggested_test: "Add a fixture-backed SQL regression that reproduces the exact fsqlite query shape and expected rows.",
-            suggested_test_target: "tests/frankensqlite_*.rs or upstream /data/projects/frankensqlite reproducer",
-            candidate_bead_title: "Pin fsqlite query-shape regression with downstream cass fixture coverage",
-            candidate_bead_type: "test",
-            candidate_bead_priority: 1,
-        },
+        // w1b Task B5 (plan delta d14, 2026-08-26): the `fsqlite-query-shape-regression`
+        // rule that used to live here (matching "frankensqlite"/"fsqlite"/
+        // "execute_join_select"/"fts5"/"query-shape"/"planner"/"join select" in
+        // evidence text) is retired -- the legacy embedded engine's query planner is not
+        // this crate's pin to regression-test against once the storage
+        // engine converges on stock SQLite (see contention_diagnostics.rs's
+        // matching six-to-three-class retirement for the storage-contention
+        // side of this same wave). Identity is `w1b-b4-deleted-tests.md`.
         FailurePatternRule {
             kind: "panic-surface-regression",
             severity: "high",
@@ -14558,9 +14596,6 @@ fn swarm_failure_pattern_false_positive_controls(kind: &str) -> Vec<&'static str
         }
         "flaky-or-toxic-suite" => {
             controls.push("distinguish explicitly ignored stress proofs from required gates");
-        }
-        "fsqlite-query-shape-regression" => {
-            controls.push("confirm the failing query shape against the pinned fsqlite revision");
         }
         _ => {}
     }
@@ -16834,10 +16869,9 @@ fn analytics_build_filters(common: &AnalyticsCommon) -> Vec<String> {
 }
 
 fn resolve_analytics_workspace_ids(
-    conn: &frankensqlite::Connection,
+    conn: &FrankenConnection,
     workspace_paths: &[String],
 ) -> CliResult<Vec<i64>> {
-    use frankensqlite::compat::{ParamValue, RowExt};
 
     let requested_paths: Vec<String> = workspace_paths
         .iter()
@@ -16857,10 +16891,10 @@ fn resolve_analytics_workspace_ids(
     let mut workspace_ids = std::collections::BTreeSet::new();
     for workspace in requested_paths {
         let ids: Vec<i64> = conn
-            .query_map_collect(
+            .query_all_map(
                 "SELECT id FROM workspaces WHERE path = ?1",
                 &[ParamValue::from(workspace.as_str())],
-                |row: &frankensqlite::Row| row.get_typed(0),
+                |row: &FrankenRow| row.get_typed(0),
             )
             .map_err(|e| CliError {
                 code: 9,
@@ -16880,7 +16914,7 @@ fn resolve_analytics_workspace_ids(
 }
 
 fn analytics_query_filter(
-    conn: &frankensqlite::Connection,
+    conn: &FrankenConnection,
     common: &AnalyticsCommon,
 ) -> CliResult<analytics::AnalyticsFilter> {
     let mut filter = analytics::AnalyticsFilter::from(common);
@@ -16888,11 +16922,11 @@ fn analytics_query_filter(
     Ok(filter)
 }
 
-/// Open a read-only frankensqlite connection for analytics queries.
+/// Open a read-only the legacy embedded engine connection for analytics queries.
 fn open_franken_analytics_db(
     data_dir: &Option<PathBuf>,
     db_path_override: Option<&PathBuf>,
-) -> CliResult<frankensqlite::Connection> {
+) -> CliResult<FrankenConnection> {
     open_franken_cli_read_db(
         analytics_db_path(data_dir, db_path_override),
         "analytics",
@@ -16911,7 +16945,7 @@ fn open_franken_cli_read_db(
     path: PathBuf,
     reason: &str,
     busy_timeout: Duration,
-) -> CliResult<frankensqlite::Connection> {
+) -> CliResult<FrankenConnection> {
     if !path.exists() {
         return Err(CliError {
             code: 3,
@@ -16944,11 +16978,6 @@ fn open_franken_cli_read_db(
                         "Failed to open {reason} database at {}: readonly storage open failed ({err}); raw readonly open failed ({raw_readonly_err})",
                         path.display()
                     );
-                    if let Some(fts_err) =
-                        crate::storage::sqlite::fts_messages_integrity_error_from_message(&message)
-                    {
-                        return Err(fts_messages_integrity_cli_error(reason, fts_err.into()));
-                    }
                     return Err(CliError {
                         code: 9,
                         kind: CliErrorKind::DbOpen.kind_str(),
@@ -16962,8 +16991,8 @@ fn open_franken_cli_read_db(
     };
 
     let timeout_ms = busy_timeout.as_millis().clamp(1, u128::from(u32::MAX));
-    let _ = conn.execute(&format!("PRAGMA busy_timeout = {timeout_ms};"));
-    let _ = conn.execute("PRAGMA query_only = 1;");
+    let _ = conn.execute(&format!("PRAGMA busy_timeout = {timeout_ms};"), &[]);
+    let _ = conn.execute("PRAGMA query_only = 1;", &[]);
 
     Ok(conn)
 }
@@ -16972,7 +17001,7 @@ fn open_franken_cli_read_db_with_hard_timeout(
     path: PathBuf,
     reason: &str,
     timeout: Duration,
-) -> CliResult<frankensqlite::Connection> {
+) -> CliResult<FrankenConnection> {
     let display_path = path.display().to_string();
     let reason = reason.to_string();
     if let Some(err) = sqlite_header_preflight_error(&path, &display_path, &reason) {
@@ -17039,7 +17068,7 @@ fn receive_franken_cli_read_db_open_result_with_hard_timeout(
     display_path: String,
     reason: String,
     timeout: Duration,
-) -> CliResult<frankensqlite::Connection> {
+) -> CliResult<FrankenConnection> {
     match rx.recv_timeout(timeout) {
         Ok(Ok(conn)) => Ok(conn.into_parts().0),
         Ok(Err(err)) => Err(err),
@@ -17066,7 +17095,7 @@ fn receive_franken_cli_read_db_open_result_with_hard_timeout(
 }
 
 fn close_franken_cli_read_db(
-    mut conn: frankensqlite::Connection,
+    mut conn: FrankenConnection,
     path: &Path,
     reason: &str,
 ) -> CliResult<()> {
@@ -17082,32 +17111,14 @@ fn close_franken_cli_read_db(
     Ok(())
 }
 
-fn fts_messages_integrity_cli_error(surface: &str, err: anyhow::Error) -> CliError {
-    CliError {
-        code: 5,
-        kind: CliErrorKind::Storage.kind_str(),
-        message: format!("{surface} cannot continue: {err:#}"),
-        hint: Some(crate::storage::sqlite::FTS_MESSAGES_CORRUPTION_RECOVERY_HINT.to_string()),
-        retryable: false,
-    }
-}
-
-fn validate_fts_messages_integrity_for_cli(
-    conn: &frankensqlite::Connection,
-    surface: &str,
-) -> CliResult<()> {
-    crate::storage::sqlite::validate_fts_messages_integrity_for_connection(conn)
-        .map_err(|err| fts_messages_integrity_cli_error(surface, err))
-}
-
 fn franken_query_row_map_retry<T, F>(
-    conn: &frankensqlite::Connection,
+    conn: &FrankenConnection,
     sql: &str,
-    params: &[frankensqlite::compat::ParamValue],
+    params: &[ParamValue],
     map: F,
-) -> Result<T, frankensqlite::FrankenError>
+) -> Result<T, StorageError>
 where
-    F: Copy + Fn(&frankensqlite::Row) -> Result<T, frankensqlite::FrankenError>,
+    F: Copy + Fn(&FrankenRow) -> Result<T, StorageError>,
 {
     let deadline = std::time::Instant::now() + CLI_DB_QUERY_RETRY_TIMEOUT;
     let mut backoff = Duration::from_millis(4);
@@ -17132,18 +17143,18 @@ where
 }
 
 fn franken_query_map_collect_retry<T, F>(
-    conn: &frankensqlite::Connection,
+    conn: &FrankenConnection,
     sql: &str,
-    params: &[frankensqlite::compat::ParamValue],
+    params: &[ParamValue],
     map: F,
-) -> Result<Vec<T>, frankensqlite::FrankenError>
+) -> Result<Vec<T>, StorageError>
 where
-    F: Copy + Fn(&frankensqlite::Row) -> Result<T, frankensqlite::FrankenError>,
+    F: Copy + Fn(&FrankenRow) -> Result<T, StorageError>,
 {
     let deadline = std::time::Instant::now() + CLI_DB_QUERY_RETRY_TIMEOUT;
     let mut backoff = Duration::from_millis(4);
     loop {
-        match conn.query_map_collect(sql, params, |row| map(row)) {
+        match conn.query_all_map(sql, params, |row| map(row)) {
             Ok(values) => return Ok(values),
             Err(err) if crate::storage::sqlite::retryable_franken_error(&err) => {
                 let now = std::time::Instant::now();
@@ -17167,7 +17178,7 @@ fn fresh_franken_count_retry(
     reason: &str,
     busy_timeout: Duration,
     sql: &str,
-    params: &[frankensqlite::compat::ParamValue],
+    params: &[ParamValue],
 ) -> Option<i64> {
     let deadline = std::time::Instant::now() + CLI_DB_QUERY_RETRY_TIMEOUT;
     let mut backoff = Duration::from_millis(4);
@@ -17294,7 +17305,7 @@ fn run_analytics_rebuild(
     // Progress diagnostics go to stderr.
     eprintln!("Rebuilding analytics (Track A)...");
 
-    let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
+    let storage = FrankenStorage::open_writer(&db_path).map_err(|e| CliError {
         code: 9,
         kind: CliErrorKind::DbError.kind_str(),
         message: format!("Failed to open database: {e}"),
@@ -17501,7 +17512,7 @@ fn run_analytics_validate(
                         .into_iter()
                         .all(|table| analytics::query::table_exists(&pre_conn, table))
                     {
-                        let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
+                        let storage = FrankenStorage::open_writer(&db_path).map_err(|e| CliError {
                             code: 9,
                             kind: CliErrorKind::DbError.kind_str(),
                             message: format!("Failed to open database for analytics repair: {e}"),
@@ -17544,7 +17555,7 @@ fn run_analytics_validate(
                     // the intact `token_usage` ledger into fresh
                     // `token_daily_stats` rows. Transactional inside
                     // rebuild_token_daily_stats.
-                    let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
+                    let storage = FrankenStorage::open_writer(&db_path).map_err(|e| CliError {
                         code: 9,
                         kind: CliErrorKind::DbError.kind_str(),
                         message: format!(
@@ -17986,14 +17997,12 @@ fn probe_state_db_modes(
         }
     };
 
-    use frankensqlite::compat::RowExt;
-    use frankensqlite::params;
 
     snapshot.opened = true;
     snapshot.last_indexed_at = franken_query_row_map_retry(
         &conn,
         "SELECT value FROM meta WHERE key = 'last_indexed_at'",
-        params![],
+        &[],
         |r| r.get_typed::<String>(0),
     )
     .ok()
@@ -18001,7 +18010,7 @@ fn probe_state_db_modes(
     snapshot.last_scan_ts = franken_query_row_map_retry(
         &conn,
         "SELECT value FROM meta WHERE key = 'last_scan_ts'",
-        params![],
+        &[],
         |r| r.get_typed::<String>(0),
     )
     .ok()
@@ -18010,12 +18019,12 @@ fn probe_state_db_modes(
         snapshot.conversation_count = franken_query_row_map_retry(
             &conn,
             "SELECT COUNT(*) FROM conversations",
-            params![],
+            &[],
             |r| r.get_typed(0),
         )
         .unwrap_or(0);
         snapshot.message_count =
-            franken_query_row_map_retry(&conn, "SELECT COUNT(*) FROM messages", params![], |r| {
+            franken_query_row_map_retry(&conn, "SELECT COUNT(*) FROM messages", &[], |r| {
                 r.get_typed(0)
             })
             .unwrap_or(0);
@@ -18025,7 +18034,7 @@ fn probe_state_db_modes(
                 reason,
                 timeout,
                 "SELECT COUNT(*) FROM conversations",
-                params![],
+                &[],
             )
             .unwrap_or(0);
         }
@@ -18035,7 +18044,7 @@ fn probe_state_db_modes(
                 reason,
                 timeout,
                 "SELECT COUNT(*) FROM messages",
-                params![],
+                &[],
             )
             .unwrap_or(0);
         }
@@ -18211,10 +18220,6 @@ pub(crate) fn path_identities_match(lhs: &Path, rhs: &Path) -> bool {
     normalize_path_identity(lhs) == normalize_path_identity(rhs)
 }
 
-pub(crate) fn stored_path_identity_matches(saved: &str, current: &Path) -> bool {
-    path_identities_match(Path::new(saved), current)
-}
-
 fn read_index_run_lock_snapshot(
     data_dir: &Path,
 ) -> crate::search::asset_state::SearchMaintenanceSnapshot {
@@ -18264,6 +18269,42 @@ fn error_chain_indicates_orphan_fk_cleanup_blocked(chain: &str) -> bool {
 
 fn error_chain_indicates_archive_health_blocked(chain: &str) -> bool {
     chain.contains("will not replace or truncate the SQLite source of truth")
+}
+
+// W2-6 exec41 (Task戊): `SearchClient::search` reports these when
+// `lex_docs` is empty and the self-heal ahead of it
+// (`ensure_lexical_assets_for_search`) either didn't run or didn't leave a
+// populated index -- an honest structured error, in place of the retired
+// silent fallback to the stale `fts_messages` legacy table.
+fn error_chain_indicates_lexical_index_building(chain: &str) -> bool {
+    chain.contains("lexical index unavailable for search") && chain.contains("state=building")
+}
+
+fn error_chain_indicates_lexical_index_absent(chain: &str) -> bool {
+    chain.contains("lexical index unavailable for search") && chain.contains("state=absent")
+}
+
+fn search_lexical_index_building_cli_error(chain: &str) -> CliError {
+    CliError {
+        code: 7,
+        kind: CliErrorKind::IndexBusy.kind_str(),
+        message: format!("search failed: {chain}"),
+        hint: Some(
+            "A lexical rebuild is currently in progress. Retry shortly, or run 'cass index' and wait for it to finish."
+                .to_string(),
+        ),
+        retryable: true,
+    }
+}
+
+fn search_lexical_index_absent_cli_error(chain: &str) -> CliError {
+    CliError {
+        code: 3,
+        kind: CliErrorKind::MissingIndex.kind_str(),
+        message: format!("search failed: {chain}"),
+        hint: Some("Run 'cass index --full' to build the lexical index.".to_string()),
+        retryable: true,
+    }
 }
 
 fn index_storage_contention_cli_error(chain: &str) -> CliError {
@@ -18379,9 +18420,8 @@ fn cli_error_json_payload(err: &CliError, elapsed_ms: u128) -> serde_json::Value
 }
 
 fn cass_lexical_index_initialized(data_dir: &Path) -> bool {
-    crate::search::tantivy::searchable_index_exists(&crate::search::tantivy::expected_index_dir(
-        data_dir,
-    ))
+    // W2-6 Task1: reseated onto the lex_docs/fts_lex SQLite domain.
+    crate::search::lexical_index_health::searchable_index_exists(&data_dir.join("agent_search.db"))
 }
 
 fn cass_not_initialized(
@@ -18676,10 +18716,13 @@ fn state_meta_json_inner(
     let counts_skipped = db_snapshot.counts_skipped;
     let open_skipped = db_snapshot.open_skipped;
 
-    let index_path = crate::search::tantivy::expected_index_dir(data_dir);
-    let lexical_index_initialized = crate::search::tantivy::searchable_index_exists(&index_path);
+    let index_path = crate::indexer::expected_index_dir(data_dir);
+    // W2-6 Task1: reseated onto the lex_docs/fts_lex SQLite domain (db_path);
+    // index_path is still needed below for the generation-manifest doc-count
+    // lookup (lexical_manifest_indexed_doc_count).
+    let lexical_index_initialized = crate::search::lexical_index_health::searchable_index_exists(db_path);
     if last_indexed_at.is_none() && lexical_index_initialized {
-        last_indexed_at = crate::search::tantivy::searchable_index_modified_time(&index_path)
+        last_indexed_at = crate::search::lexical_index_health::searchable_index_modified_time(db_path)
             .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_millis() as i64);
     }
@@ -18826,17 +18869,20 @@ fn state_meta_json_inner(
     }
     let lexical = &assets.lexical;
     let semantic = &assets.semantic;
+    // W3-4 Step2-2 (task book #62): a parallel, additive DB-vector-domain
+    // status section -- reads embedding_generations directly instead of
+    // going through the fsvi-policy-driven `semantic` block above (which
+    // keeps reporting exactly as before). Only attempted when the DB was
+    // actually opened and this call wasn't the cheap skip-DB-open fast
+    // path, mirroring how `inspect_semantic`/`db_opened` already gate
+    // the rest of this function's DB-backed sections.
+    let db_vector_domain = (inspect_semantic && db_opened)
+        .then(|| crate::search::model_manager::probe_db_vector_domain_status(db_path))
+        .flatten();
     let lexical_rebuild_pipeline = if skip_db_open {
         crate::indexer::lexical_rebuild_pipeline_settings_snapshot_passive()
     } else {
         crate::indexer::lexical_rebuild_pipeline_settings_snapshot()
-    };
-    let lexical_rebuild_pipeline_runtime = if lexical.rebuilding {
-        crate::indexer::load_active_lexical_rebuild_pipeline_runtime(&index_path, db_path)
-            .ok()
-            .flatten()
-    } else {
-        None
     };
     let mut lexical_rebuild_pipeline_json =
         serde_json::to_value(&lexical_rebuild_pipeline).unwrap_or(serde_json::Value::Null);
@@ -18861,67 +18907,16 @@ fn state_meta_json_inner(
                 .map(serde_json::Value::from)
                 .unwrap_or(serde_json::Value::Null),
         );
-        let runtime_value = lexical_rebuild_pipeline_runtime
-            .map(|runtime| {
-                let queue_capacity = lexical_rebuild_pipeline.pipeline_channel_size;
-                let inflight_message_bytes_limit = if runtime.max_message_bytes_in_flight > 0 {
-                    runtime.max_message_bytes_in_flight
-                } else {
-                    lexical_rebuild_pipeline.pipeline_max_message_bytes_in_flight.max(1)
-                };
-                serde_json::json!({
-                    "queue_depth": runtime.queue_depth,
-                    "queue_capacity": queue_capacity,
-                    "queue_headroom": queue_capacity.saturating_sub(runtime.queue_depth),
-                    "inflight_message_bytes": runtime.inflight_message_bytes,
-                    "max_message_bytes_in_flight": inflight_message_bytes_limit,
-                    "inflight_message_bytes_headroom": inflight_message_bytes_limit
-                        .saturating_sub(runtime.inflight_message_bytes),
-                    "pending_batch_conversations": runtime.pending_batch_conversations,
-                    "pending_batch_message_bytes": runtime.pending_batch_message_bytes,
-                    "page_prep_workers": runtime.page_prep_workers,
-                    "active_page_prep_jobs": runtime.active_page_prep_jobs,
-                    "ordered_buffered_pages": runtime.ordered_buffered_pages,
-                    "budget_generation": runtime.budget_generation,
-                    "producer_budget_wait_count": runtime.producer_budget_wait_count,
-                    "producer_budget_wait_ms": runtime.producer_budget_wait_ms,
-                    "producer_handoff_wait_count": runtime.producer_handoff_wait_count,
-                    "producer_handoff_wait_ms": runtime.producer_handoff_wait_ms,
-                    "host_loadavg_1m": runtime.host_loadavg_1m_milli.map(|value| f64::from(value) / 1000.0),
-                    "controller_mode": if runtime.controller_mode.is_empty() {
-                        serde_json::Value::Null
-                    } else {
-                        serde_json::json!(runtime.controller_mode)
-                    },
-                    "controller_reason": if runtime.controller_reason.is_empty() {
-                        serde_json::Value::Null
-                    } else {
-                        serde_json::json!(runtime.controller_reason)
-                    },
-                    "staged_merge_workers_max": runtime.staged_merge_workers_max,
-                    "staged_merge_allowed_jobs": runtime.staged_merge_allowed_jobs,
-                    "staged_merge_active_jobs": runtime.staged_merge_active_jobs,
-                    "staged_merge_ready_artifacts": runtime.staged_merge_ready_artifacts,
-                    "staged_merge_ready_groups": runtime.staged_merge_ready_groups,
-                    "staged_merge_controller_reason": if runtime.staged_merge_controller_reason.is_empty() {
-                        serde_json::Value::Null
-                    } else {
-                        serde_json::json!(runtime.staged_merge_controller_reason)
-                    },
-                    "staged_shard_build_workers_max": runtime.staged_shard_build_workers_max,
-                    "staged_shard_build_allowed_jobs": runtime.staged_shard_build_allowed_jobs,
-                    "staged_shard_build_active_jobs": runtime.staged_shard_build_active_jobs,
-                    "staged_shard_build_pending_jobs": runtime.staged_shard_build_pending_jobs,
-                    "staged_shard_build_controller_reason": if runtime.staged_shard_build_controller_reason.is_empty() {
-                        serde_json::Value::Null
-                    } else {
-                        serde_json::json!(runtime.staged_shard_build_controller_reason)
-                    },
-                    "updated_at": format_timestamp_millis_rfc3339(runtime.updated_at_ms),
-                })
-            })
-            .unwrap_or(serde_json::Value::Null);
-        pipeline.insert("runtime".to_string(), runtime_value);
+        // W2-6 Task B (reader②, control-plane 2026-08-30 ruling): the
+        // shard-build pipeline that used to populate this field's live
+        // telemetry is retired along with tantivy, and `state_meta_json_inner`
+        // is a cross-process disk-introspection call (backs `cass status`/
+        // `cass health`) with no way to read another process's in-memory
+        // `IndexingProgress` -- there is no live source left for this field,
+        // so it always reports null now (JSON shape kept for existing
+        // consumers, same "no DB-domain equivalent -> None" precedent as the
+        // W2-6 Task1 asset-state reseat).
+        pipeline.insert("runtime".to_string(), serde_json::Value::Null);
     }
     let semantic_policy = crate::search::policy::SemanticPolicy::resolve(
         &crate::search::policy::CliSemanticOverrides::default(),
@@ -18940,17 +18935,16 @@ fn state_meta_json_inner(
         serde_json::to_value(&ingest_quarantine_summary).unwrap_or(serde_json::Value::Null);
 
     // Probe the live lexical document count when the DB has messages. Prefer
-    // the published generation manifest: status only needs the durable count
-    // for stale/empty diagnostics, while opening a large Tantivy reader here
-    // fans out across every segment file on the hot robot path.
+    // the published generation manifest for the durable count; fall back to
+    // a direct lex_docs row count (W2-6 Task2: FTS5-domain replacement for
+    // the old Tantivy reader fallback, same "how many docs" semantics via
+    // Task1's searchable_index_summary).
     let index_doc_count: Option<u64> = if db_opened && message_count > 0 && lexical.exists {
         lexical_manifest_indexed_doc_count(&index_path).or_else(|| {
-            frankensearch::lexical::cass_open_search_reader(
-                &index_path,
-                frankensearch::lexical::ReloadPolicy::Manual,
-            )
-            .ok()
-            .map(|(reader, _fields)| reader.searcher().num_docs())
+            crate::search::lexical_index_health::searchable_index_summary(db_path)
+                .ok()
+                .flatten()
+                .map(|summary| summary.docs as u64)
         })
     } else {
         None
@@ -19175,6 +19169,24 @@ fn state_meta_json_inner(
                     .and_then(format_timestamp_millis_rfc3339),
             },
         },
+        // W3-4 Step2-2 (task book #62): DB-vector-domain identity/audit
+        // status, read directly from embedding_generations -- additive
+        // and parallel to "semantic" above (which stays fsvi/policy
+        // driven, unchanged, for the W3-3..W3-5 coexistence window).
+        // `null` when the DB wasn't opened for this call (skip-DB-open
+        // fast path, or `--no-semantic`).
+        "db_vector_domain": db_vector_domain.as_ref().map(|s| serde_json::json!({
+            "active": s.active,
+            "embedder_id": s.embedder_id,
+            "dim": s.dim,
+            "audit_status": s.audit_status,
+            "embedded_count": s.embedded_count,
+            "any_generation": s.any_generation,
+            // R1-N7: Some(detail) here means a query against an already-
+            // opened DB failed -- the fields above are NOT a trustworthy
+            // "no generation" absence signal in that case.
+            "error": s.error,
+        })),
         "ingest_quarantine": ingest_quarantine_json,
         "policy_registry": policy_registry,
         "_meta": {
@@ -20055,7 +20067,7 @@ fn prepare_headless_once_tui_artifacts(
     let db_path = data_dir.join("agent_search.db");
     {
         let _conn =
-            frankensqlite::Connection::open(db_path.to_string_lossy().as_ref()).map_err(|e| {
+            FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().as_ref())), crate::storage::api::Profile::Production).map_err(|e| {
                 anyhow::anyhow!(
                     "initialize SQLite database for headless --once at {}: {e}",
                     db_path.display()
@@ -20063,7 +20075,7 @@ fn prepare_headless_once_tui_artifacts(
             })?;
     }
 
-    let _index_path = crate::search::tantivy::index_dir(data_dir).map_err(|e| {
+    let _index_path = crate::indexer::index_dir(data_dir).map_err(|e| {
         anyhow::anyhow!(
             "initialize index directory for headless --once at {}: {e}",
             data_dir.display()
@@ -20562,6 +20574,7 @@ fn describe_command(cli: &Cli) -> String {
         #[cfg(unix)]
         Some(Commands::Daemon { .. }) => "daemon".to_string(),
         Some(Commands::Import(..)) => "import".to_string(),
+        Some(Commands::Ingest(..)) => "ingest".to_string(),
         Some(Commands::Analytics(..)) => "analytics".to_string(),
         None => "(default)".to_string(),
     }
@@ -20587,10 +20600,10 @@ fn analytics_requests_structured_output(cmd: &AnalyticsCommand, cli: &Cli) -> bo
 }
 
 /// Default tracing directive for interactive human mode: emit INFO and above
-/// but suppress frankensqlite internal telemetry that spams at INFO level.
+/// but suppress the legacy embedded engine internal telemetry that spams at INFO level.
 ///
-/// `EnvFilter` uses `::` as the hierarchy separator, so `fsqlite=warn` covers
-/// `fsqlite::runtime`, `fsqlite::cx`, etc. Crate-level targets like
+/// `EnvFilter` uses a colon-separated hierarchy, so `fsqlite=warn` covers
+/// `fsqlite`'s `runtime`/`cx` sub-targets, etc. Crate-level targets like
 /// `fsqlite_vdbe` and `fsqlite_core` need their own directives. Custom
 /// dot-separated targets (`fsqlite.statement_reuse`, `fsqlite.compat`, etc.) are
 /// NOT matched by the hierarchical prefix, so each must be listed explicitly.
@@ -20655,7 +20668,7 @@ const DEFAULT_DEP_LOG_SUPPRESSION: &str = concat!(
 ///
 /// Robot and quiet modes are machine-consumed: they pin the filter to `error`
 /// (unless the operator explicitly opts into `--verbose`) so that dependency
-/// INFO/WARN logging — frankensqlite telemetry in particular — can never
+/// INFO/WARN logging — the legacy embedded engine telemetry in particular — can never
 /// interleave with a JSON stream, even when `RUST_LOG` is set in the
 /// environment. This is the single source of truth for robot stdout/stderr
 /// hygiene; the regression suite in `tests/cli_robot_log_hygiene.rs` exercises it
@@ -20685,7 +20698,7 @@ fn build_robot_aware_log_filter(robot_mode: bool, verbose: bool, quiet: bool) ->
 /// (coding_agent_session_search-cass-fleet-resilience-20260608-uojcg.2.5).
 ///
 /// When an operator opts into `--trace-file`, dependency-level diagnostics
-/// (frankensqlite / frankensearch / asupersync, etc.) are captured at `debug`
+/// (the legacy embedded engine / frankensearch / asupersync, etc.) are captured at `debug`
 /// into that file as a deliberate trace artifact, while the stderr layer stays
 /// pinned to its robot-aware level so machine output is never corrupted. This is
 /// the "explicit trace surface" the bead requires: deep logs are available on
@@ -20783,7 +20796,7 @@ mod log_hygiene_tests {
 
     #[test]
     fn dep_suppression_quiets_fsqlite_targets() {
-        // The fallback list must keep frankensqlite telemetry below INFO so even
+        // The fallback list must keep the legacy embedded engine telemetry below INFO so even
         // human-mode stderr is not flooded.
         assert!(DEFAULT_DEP_LOG_SUPPRESSION.starts_with("info"));
         assert!(DEFAULT_DEP_LOG_SUPPRESSION.contains("fsqlite=warn"));
@@ -21912,10 +21925,6 @@ pub struct SemanticSearchOptions {
     pub reranker: Option<String>,
     /// Use daemon for warm model inference
     pub use_daemon: bool,
-    /// Use approximate nearest neighbor search when available
-    pub approximate: bool,
-    /// Optional two-tier execution strategy for semantic mode.
-    pub tier_mode: crate::search::query::SemanticTierMode,
 }
 
 impl TimeFilter {
@@ -22192,103 +22201,45 @@ impl SearchLexicalSelfHealDiagnosis {
         }
     }
 
-    fn existing_index(reason: impl Into<String>) -> Self {
-        Self {
-            reason: reason.into(),
-            checkpoint_refresh_allowed: false,
-            existing_index_search_allowed: true,
-        }
-    }
-
-    fn checkpoint(reason: impl Into<String>) -> Self {
-        Self {
-            reason: reason.into(),
-            checkpoint_refresh_allowed: true,
-            existing_index_search_allowed: false,
-        }
-    }
-
     fn permits_existing_index_during_active_rebuild(&self) -> bool {
         self.existing_index_search_allowed
     }
 }
 
+// W2-6 Task B (reader③, control-plane 2026-08-30 ruling): the
+// schema_hash/page_size/storage_fingerprint checkpoint-drift comparison this
+// function used to run below the quick-contract check is retired, not
+// reseated -- the desync class it protected against (sidecar tantivy index
+// silently out of sync with a DB that was copied/restored to an older
+// snapshot) is structurally eliminated by W2's single-file architecture:
+// lex_docs/fts_lex/the rebuild marker now all live inside the same .db file,
+// so replacing/restoring that file carries its own self-consistent index
+// along with it atomically -- there is no longer a second artifact that can
+// drift independently. Storing a fingerprint back into the marker (the
+// naive "reseat" option) would compare the DB's own fingerprint against
+// itself, a self-referential check that can never fail. Remaining failure
+// modes this used to help catch have their own owners: a stalled/incomplete
+// rebuild is caught by the marker + recovery path; corruption is caught by
+// this function's quick try-open probe (and the full-tier integrity-check on
+// 门①); dual-write bugs are caught by parity/judgment gates. None of those
+// is a fingerprint-comparison problem.
 fn search_lexical_self_heal_diagnosis(
-    index_path: &Path,
     db_path: &Path,
 ) -> CliResult<Option<SearchLexicalSelfHealDiagnosis>> {
-    if !crate::search::tantivy::searchable_index_exists(index_path) {
+    // W2-6 Task1: reseated onto the lex_docs/fts_lex SQLite domain (db_path).
+    if !crate::search::lexical_index_health::searchable_index_exists(db_path) {
         return Ok(Some(SearchLexicalSelfHealDiagnosis::rebuild(
             "searchable lexical metadata missing",
         )));
     }
 
-    if let Err(err) = crate::search::tantivy::validate_searchable_index_contract(index_path) {
+    // W2-6 Task1 (hot-path cost fix, control-plane 2026-08-30 amendment):
+    // this runs on every search -- quick tier only, never the full rank=1
+    // integrity-check.
+    if let Err(err) = crate::search::lexical_index_health::validate_searchable_index_contract_quick(db_path) {
         return Ok(Some(SearchLexicalSelfHealDiagnosis::rebuild(format!(
             "lexical artifact contract is unusable: {err:#}"
         ))));
-    }
-
-    let checkpoint =
-        crate::indexer::load_lexical_rebuild_checkpoint(index_path).map_err(|e| CliError {
-            code: 5,
-            kind: CliErrorKind::LexicalRebuild.kind_str(),
-            message: format!("failed to inspect lexical rebuild checkpoint: {e}"),
-            hint: Some(
-                "cass will rebuild the derived lexical index on the next search attempt"
-                    .to_string(),
-            ),
-            retryable: true,
-        })?;
-    let Some(checkpoint) = checkpoint else {
-        return Ok(Some(SearchLexicalSelfHealDiagnosis::existing_index(
-            "lexical rebuild checkpoint missing",
-        )));
-    };
-
-    if !stored_path_identity_matches(&checkpoint.db_path, db_path) {
-        return Ok(Some(SearchLexicalSelfHealDiagnosis::rebuild(format!(
-            "lexical checkpoint references {}, but active database is {}",
-            checkpoint.db_path,
-            db_path.display()
-        ))));
-    }
-    if !checkpoint.completed {
-        return Ok(Some(SearchLexicalSelfHealDiagnosis::checkpoint(
-            "lexical rebuild checkpoint is incomplete",
-        )));
-    }
-    if checkpoint.schema_hash != crate::search::tantivy::SCHEMA_HASH {
-        return Ok(Some(SearchLexicalSelfHealDiagnosis::checkpoint(
-            "lexical checkpoint schema no longer matches this cass binary",
-        )));
-    }
-    if !crate::indexer::lexical_rebuild_page_size_is_compatible(checkpoint.page_size) {
-        return Ok(Some(SearchLexicalSelfHealDiagnosis::checkpoint(
-            "lexical checkpoint page-size contract is incompatible with this cass binary",
-        )));
-    }
-    let current_storage_fingerprint =
-        crate::indexer::lexical_storage_fingerprint_for_db(db_path).map_err(|e| CliError {
-            code: 5,
-            kind: CliErrorKind::StorageFingerprint.kind_str(),
-            message: format!(
-                "failed to fingerprint cass database {} while validating lexical assets: {e}",
-                db_path.display()
-            ),
-            hint: Some(
-                "cass will rebuild the derived lexical index after the canonical database can be fingerprinted"
-                    .to_string(),
-            ),
-            retryable: true,
-        })?;
-    if !crate::search::asset_state::lexical_storage_fingerprints_match(
-        &current_storage_fingerprint,
-        &checkpoint.storage_fingerprint,
-    ) {
-        return Ok(Some(SearchLexicalSelfHealDiagnosis::existing_index(
-            "lexical checkpoint storage fingerprint no longer matches active database",
-        )));
     }
 
     Ok(None)
@@ -22309,13 +22260,16 @@ fn search_active_rebuild_wait_duration(timeout_ms: Option<u64>, started_at: Inst
 fn wait_for_searchable_index_after_active_rebuild(
     data_dir: &Path,
     db_path: &Path,
-    index_path: &Path,
+    // W2-6 Task1: no longer read -- the reseated existence check below uses
+    // db_path. Kept for now to avoid rippling a signature change through
+    // this function's callers outside Task1's scope.
+    _index_path: &Path,
     max_wait: Duration,
 ) -> bool {
     let deadline = Instant::now() + max_wait;
     loop {
         let rebuild_active = probe_index_run_lock(data_dir, db_path).active;
-        if crate::search::tantivy::searchable_index_exists(index_path) && !rebuild_active {
+        if crate::search::lexical_index_health::searchable_index_exists(db_path) && !rebuild_active {
             return true;
         }
         if Instant::now() >= deadline {
@@ -22344,11 +22298,12 @@ fn lexical_repair_error_is_active_index_run(rendered: &str) -> bool {
     rendered.contains("already holds")
 }
 
-/// #287: bounded degraded refusal for robot search callers. `kind` carries the
-/// stable machine-readable reason code (`checkpoint_incomplete` or
-/// `quarantine_circuit_breaker`) so an agent can branch on the structured
-/// error envelope instead of timing out against a silent multi-minute inline
-/// lexical rebuild.
+/// #287: bounded degraded refusal for robot search callers. `kind` carries a
+/// stable machine-readable reason code (currently only `quarantine_circuit_breaker`
+/// -- W2-6 Task B retired the `checkpoint_incomplete` caller along with the
+/// tantivy checkpoint file it diagnosed, see `search_lexical_self_heal_diagnosis`)
+/// so an agent can branch on the structured error envelope instead of timing
+/// out against a silent multi-minute inline lexical rebuild.
 fn search_robot_degraded_error(
     reason_code: &'static str,
     reason: &str,
@@ -22403,11 +22358,12 @@ fn ensure_lexical_assets_for_search(
         return Ok(SearchLexicalSelfHeal::skipped());
     }
 
-    let initial_index_exists = crate::search::tantivy::searchable_index_exists(index_path);
+    // W2-6 Task1: reseated onto the lex_docs/fts_lex SQLite domain (db_path).
+    let initial_index_exists = crate::search::lexical_index_health::searchable_index_exists(db_path);
     let initial_rebuild_active = probe_index_run_lock(data_dir, db_path).active;
     if initial_rebuild_active {
         if initial_index_exists {
-            let diagnosis = search_lexical_self_heal_diagnosis(index_path, db_path)?;
+            let diagnosis = search_lexical_self_heal_diagnosis(db_path)?;
             if diagnosis
                 .as_ref()
                 .is_none_or(|diagnosis| diagnosis.permits_existing_index_during_active_rebuild())
@@ -22430,7 +22386,7 @@ fn ensure_lexical_assets_for_search(
             return Err(search_lock_busy_error(data_dir));
         }
 
-        if search_lexical_self_heal_diagnosis(index_path, db_path)?.is_none() {
+        if search_lexical_self_heal_diagnosis(db_path)?.is_none() {
             return Ok(SearchLexicalSelfHeal {
                 action: "waited-for-active-rebuild",
                 reason: Some("foreground search waited for active lexical repair".to_string()),
@@ -22439,33 +22395,10 @@ fn ensure_lexical_assets_for_search(
         }
     }
 
-    let Some(diagnosis) = search_lexical_self_heal_diagnosis(index_path, db_path)? else {
+    let Some(diagnosis) = search_lexical_self_heal_diagnosis(db_path)? else {
         return Ok(SearchLexicalSelfHeal::skipped());
     };
     let reason = diagnosis.reason;
-
-    if initial_index_exists && diagnosis.checkpoint_refresh_allowed {
-        match crate::indexer::refresh_completed_lexical_rebuild_checkpoint_from_live_index(
-            db_path, data_dir,
-        ) {
-            Ok(()) => {
-                if search_lexical_self_heal_diagnosis(index_path, db_path)?.is_none() {
-                    return Ok(SearchLexicalSelfHeal {
-                        action: "refreshed-checkpoint",
-                        reason: Some(reason),
-                        indexed_docs: None,
-                    });
-                }
-            }
-            Err(err) => {
-                tracing::debug!(
-                    error = %err,
-                    reason = %reason,
-                    "live lexical checkpoint refresh did not repair search assets; falling back to canonical rebuild"
-                );
-            }
-        }
-    }
 
     if initial_index_exists && diagnosis.existing_index_search_allowed {
         tracing::warn!(
@@ -22540,7 +22473,7 @@ fn ensure_lexical_assets_for_search(
                 index_path,
                 search_active_rebuild_wait_duration(timeout_ms, started_at),
             );
-            if waited && search_lexical_self_heal_diagnosis(index_path, db_path)?.is_none() {
+            if waited && search_lexical_self_heal_diagnosis(db_path)?.is_none() {
                 return Ok(SearchLexicalSelfHeal {
                     action: "waited-for-concurrent-lexical-repair",
                     reason: Some(reason),
@@ -22565,7 +22498,6 @@ fn ensure_lexical_assets_for_search(
 #[cfg(test)]
 mod search_lexical_self_heal_tests {
     use super::*;
-    use crate::connectors::{NormalizedConversation, NormalizedMessage};
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
     use crate::search::query::{FieldMask, SearchClient, SearchFilters};
     use crate::storage::sqlite::FrankenStorage;
@@ -22620,84 +22552,43 @@ mod search_lexical_self_heal_tests {
         db_path
     }
 
-    fn seed_empty_canonical_search_db(data_dir: &Path) -> PathBuf {
-        let db_path = data_dir.join("agent_search.db");
-        let storage = FrankenStorage::open(&db_path).expect("open empty canonical db");
-        drop(storage);
-        db_path
-    }
-
-    fn build_standalone_lexical_index_without_checkpoint(data_dir: &Path, content: &str) {
-        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
-        let mut index =
-            crate::search::tantivy::TantivyIndex::open_or_create(&index_path).expect("open index");
-        let conversation = NormalizedConversation {
-            agent_slug: "codex".to_string(),
-            external_id: Some("standalone-no-checkpoint".to_string()),
-            title: Some("Standalone lexical fixture".to_string()),
-            workspace: Some(PathBuf::from("/tmp/search-self-heal")),
-            source_path: data_dir.join("standalone.jsonl"),
-            started_at: Some(1_770_000_000_000),
-            ended_at: Some(1_770_000_001_000),
-            metadata: serde_json::json!({}),
-            messages: vec![NormalizedMessage {
-                idx: 0,
-                role: "user".to_string(),
-                author: Some("tester".to_string()),
-                created_at: Some(1_770_000_000_000),
-                content: content.to_string(),
-                extra: serde_json::json!({}),
-                snippets: Vec::new(),
-                invocations: Vec::new(),
-            }],
-        };
-        index
-            .add_conversation(&conversation)
-            .expect("add standalone conversation");
-        index.commit().expect("commit standalone index");
-    }
-
-    fn hold_active_index_run_lock(data_dir: &Path, db_path: &Path) -> std::fs::File {
-        let lock_path = data_dir.join("index-run.lock");
-        let mut lock_file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-            .expect("open index-run lock");
-        fs2::FileExt::try_lock_exclusive(&lock_file).expect("hold active index-run lock");
-        let metadata = format!(
-            "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index\n",
-            std::process::id(),
-            1_733_000_111_000_i64,
-            db_path.display()
-        );
-        {
-            use std::io::{Seek, SeekFrom, Write};
-            lock_file.set_len(0).expect("truncate index-run lock");
-            lock_file
-                .seek(SeekFrom::Start(0))
-                .expect("rewind index-run lock");
-            lock_file
-                .write_all(metadata.as_bytes())
-                .expect("write index-run lock metadata");
-            lock_file.flush().expect("flush index-run lock metadata");
-        }
-        crate::search::asset_state::write_index_run_lock_metadata_sidecar(&lock_path, &metadata)
-            .expect("write index-run lock metadata sidecar");
-        lock_file
-    }
 
     #[test]
     fn search_self_heal_rebuilds_missing_lexical_index_from_canonical_db() {
         let temp = tempfile::tempdir().expect("tempdir");
         let data_dir = temp.path();
         let db_path = seed_canonical_search_db(data_dir);
-        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
-        assert!(!crate::search::tantivy::searchable_index_exists(
-            &index_path
-        ));
+        let index_path = crate::indexer::expected_index_dir(data_dir);
+
+        // W2-6 Task1: `seed_canonical_search_db` dual-writes lex_docs/fts_lex
+        // via the normal storage API, so there is nothing "missing" from the
+        // FTS5 domain's point of view yet. Simulate the scenario
+        // `searchable_index_exists`'s "has content but no coverage" semantics
+        // exist to catch -- a v1->v2-migrated-but-never-backfilled database --
+        // by wiping the domain the seed just populated, without touching
+        // `messages`. The old scenario here ("no tantivy index directory")
+        // stopped being what self-heal needs to detect once W2-5 switched the
+        // query path to FTS5 (control-plane 2026-08-30 ruling; original
+        // tantivy-directory scenario recorded in the W2-6 closed-world
+        // account).
+        {
+            let conn = crate::storage::api::Conn::open_writable(
+                &db_path,
+                crate::storage::api::Profile::Production,
+            )
+            .expect("open db for fault injection");
+            conn.execute("DELETE FROM fts_lex WHERE rowid IN (SELECT id FROM messages)", &[])
+                .expect("wipe fts_lex for fault injection");
+            conn.execute("DELETE FROM lex_docs", &[])
+                .expect("wipe lex_docs for fault injection");
+        }
+        // Probe validity check (波1 铁律): the injected fault must actually
+        // produce the "has content, no coverage" state before self-heal is
+        // trusted to detect it.
+        assert!(
+            !crate::search::lexical_index_health::searchable_index_exists(&db_path),
+            "fault injection must make the lexical domain read as missing"
+        );
 
         let repair = ensure_lexical_assets_for_search(
             data_dir,
@@ -22711,7 +22602,7 @@ mod search_lexical_self_heal_tests {
         .expect("search self-heal should rebuild missing lexical index");
         assert_eq!(repair.action, "rebuilt-from-canonical-db");
         assert_eq!(repair.indexed_docs, Some(1));
-        assert!(crate::search::tantivy::searchable_index_exists(&index_path));
+        assert!(crate::search::lexical_index_health::searchable_index_exists(&db_path));
 
         let client = SearchClient::open(&index_path, Some(&db_path))
             .expect("open search client")
@@ -22729,478 +22620,62 @@ mod search_lexical_self_heal_tests {
         assert!(hits[0].content.contains("autohealneedle"));
     }
 
+    // W2-6 Task1 closed-world account: `search_self_heal_rebuilds_incompatible_live_artifact`
+    // (stale tantivy schema_hash.json triggers a rebuild) retired here, not
+    // rewritten -- control-plane 2026-08-30 ruling. It tested a capability
+    // tied to tantivy's own on-disk schema versioning file, which has no
+    // SQLite-domain file to point at (table-level schema evolution is
+    // covered by `PRAGMA user_version`; there is no equivalent for lexical
+    // *projection* semantics changing between binary versions -- see the
+    // known-debt note in the W2-6 closeout report: "lexical projection
+    // version detection is absent; a binary upgrade that changes projection
+    // semantics (tokenization/truncation/eligibility) requires a manual
+    // `--force-rebuild`, silently otherwise").
     #[test]
-    fn search_self_heal_refreshes_stale_checkpoint_when_live_index_matches_db() {
+    fn search_self_heal_replaces_corrupt_live_fts5_artifact() {
         let temp = tempfile::tempdir().expect("tempdir");
         let data_dir = temp.path();
         let db_path = seed_canonical_search_db(data_dir);
-        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
-        ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect("initial rebuild");
+        let index_path = crate::indexer::expected_index_dir(data_dir);
 
-        let state_path = index_path.join(".lexical-rebuild-state.json");
-        let mut state: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&state_path).expect("read checkpoint"))
-                .expect("parse checkpoint");
-        state["schema_hash"] = serde_json::json!("old-schema-hash");
-        std::fs::write(
-            &state_path,
-            serde_json::to_vec_pretty(&state).expect("serialize checkpoint"),
-        )
-        .expect("write stale checkpoint");
-
-        let repair = ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect("search self-heal should refresh checkpoint");
-        assert_eq!(repair.action, "refreshed-checkpoint");
-
-        let checkpoint = crate::indexer::load_lexical_rebuild_checkpoint(&index_path)
-            .expect("load repaired checkpoint")
-            .expect("checkpoint present");
-        assert_eq!(checkpoint.schema_hash, crate::search::tantivy::SCHEMA_HASH);
-        assert!(checkpoint.completed);
-    }
-
-    #[test]
-    fn search_self_heal_rebuilds_when_checkpoint_references_different_db() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let data_dir = temp.path();
-        let old_db_path = data_dir.join("old_agent_search.db");
-        let db_path = data_dir.join("agent_search.db");
-        seed_search_db_at(
-            &old_db_path,
-            "oldautohealneedle exists only in the superseded database",
-            "old-search-self-heal-conversation",
-        );
-        seed_search_db_at(
-            &db_path,
-            "newautohealneedle exists only in the active database",
-            "new-search-self-heal-conversation",
-        );
-        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
-        ensure_lexical_assets_for_search(
-            data_dir,
-            &old_db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect("initial rebuild from old database");
-
-        let repair = ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect("search self-heal should rebuild for different active db");
-        assert_eq!(repair.action, "rebuilt-from-canonical-db");
-        assert_eq!(repair.indexed_docs, Some(1));
-
-        let checkpoint = crate::indexer::load_lexical_rebuild_checkpoint(&index_path)
-            .expect("load rebuilt checkpoint")
-            .expect("checkpoint present");
-        assert!(stored_path_identity_matches(&checkpoint.db_path, &db_path));
-
-        let client = SearchClient::open(&index_path, Some(&db_path))
-            .expect("open search client")
-            .expect("repaired index should open");
-        let new_hits = client
-            .search(
-                "newautohealneedle",
-                SearchFilters::default(),
-                5,
-                0,
-                FieldMask::FULL,
+        // Corrupt the FTS5 domain's own internal segment-data shadow table,
+        // instead of corrupting the retired tantivy meta.json -- self-heal's
+        // corruption detection now runs against the domain that actually
+        // serves queries post-W2-5 (control-plane 2026-08-30 ruling;
+        // original tantivy-directory scenario recorded in the W2-6
+        // closed-world account).
+        //
+        // This must be a corruption the *quick* tier (control-plane
+        // 2026-08-30 amendment) can actually see -- self-heal's per-search
+        // diagnosis only ever runs the cheap tier, not the full rank=1
+        // integrity-check (see `self_heal_diagnosis_never_calls_the_full_tier_contract_check`
+        // below). A content/index desync (e.g. a raw `UPDATE lex_docs SET
+        // content = ...`) is invisible to the quick tier by design and so
+        // would never trigger this repair path in the first place; deleting
+        // fts_lex's own shadow data breaks even a basic `SELECT ... LIMIT 1`
+        // probe, which the quick tier does catch.
+        //
+        // The repair path itself opens a *raw* writable connection (not
+        // `FrankenStorage::open`) specifically so this class of corruption
+        // doesn't also block the repair from running -- see
+        // `repair_lexical_index_from_canonical_db_for_search`'s comments.
+        {
+            let conn = crate::storage::api::Conn::open_writable(
+                &db_path,
+                crate::storage::api::Profile::Production,
             )
-            .expect("query rebuilt active-db index");
-        assert_eq!(new_hits.len(), 1);
-        let old_hits = client
-            .search(
-                "oldautohealneedle",
-                SearchFilters::default(),
-                5,
-                0,
-                FieldMask::FULL,
-            )
-            .expect("query superseded-db term");
-        assert_eq!(old_hits.len(), 0);
-    }
-
-    #[test]
-    fn search_self_heal_defers_same_db_content_drift_to_index_run() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let data_dir = temp.path();
-        let db_path = data_dir.join("agent_search.db");
-        seed_search_db_at(
-            &db_path,
-            "oldsamepathneedle is present in the first lexical generation",
-            "old-same-path-search-self-heal-conversation",
-        );
-        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
-        ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect("initial rebuild from active database");
-
-        seed_search_db_at(
-            &db_path,
-            "newsamepathneedle is appended to the same canonical database",
-            "new-same-path-search-self-heal-conversation",
-        );
-        let diagnosis = search_lexical_self_heal_diagnosis(&index_path, &db_path)
-            .expect("diagnose changed same-path database")
-            .expect("changed same-path database should require repair");
-        assert_eq!(
-            diagnosis.reason,
-            "lexical checkpoint storage fingerprint no longer matches active database"
-        );
-        assert!(
-            diagnosis.existing_index_search_allowed,
-            "same-db fingerprint drift should search the existing readable index and defer repair"
-        );
-
-        let repair = ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect("search self-heal should not rebuild inline after same-db content changes");
-        assert_eq!(repair.action, "deferred-repair-searching-existing-index");
-        assert_eq!(repair.indexed_docs, None);
-
-        let client = SearchClient::open(&index_path, Some(&db_path))
-            .expect("open search client")
-            .expect("existing stale index should still open");
-        let old_hits = client
-            .search(
-                "oldsamepathneedle",
-                SearchFilters::default(),
-                5,
-                0,
-                FieldMask::FULL,
-            )
-            .expect("query existing lexical generation");
-        assert_eq!(old_hits.len(), 1);
-        let new_hits = client
-            .search(
-                "newsamepathneedle",
-                SearchFilters::default(),
-                5,
-                0,
-                FieldMask::FULL,
-            )
-            .expect("query content that still needs the next index run");
-        assert_eq!(new_hits.len(), 0);
-    }
-
-    #[test]
-    fn active_rebuild_waits_instead_of_searching_stale_existing_index() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let data_dir = temp.path();
-        let old_db_path = data_dir.join("old_agent_search.db");
-        let db_path = data_dir.join("agent_search.db");
-        seed_search_db_at(
-            &old_db_path,
-            "oldactiverebuildneedle exists only in the superseded database",
-            "old-active-rebuild-search-self-heal-conversation",
-        );
-        seed_search_db_at(
-            &db_path,
-            "newactiverebuildneedle exists only in the active database",
-            "new-active-rebuild-search-self-heal-conversation",
-        );
-        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
-        ensure_lexical_assets_for_search(
-            data_dir,
-            &old_db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect("initial rebuild from old database");
-        let diagnosis = search_lexical_self_heal_diagnosis(&index_path, &db_path)
-            .expect("diagnose stale lexical index")
-            .expect("old database checkpoint should be stale for active db");
-        assert!(
-            diagnosis.reason.contains("lexical checkpoint references"),
-            "unexpected stale-index diagnosis: {}",
-            diagnosis.reason
-        );
-
-        let _lock_file = hold_active_index_run_lock(data_dir, &db_path);
-
-        let err = ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            Some(0),
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect_err(
-            "stale existing index should wait for active rebuild instead of being searched",
-        );
-        assert_eq!(err.code, 7);
-        assert_eq!(err.kind, CliErrorKind::IndexBusy.kind_str());
-        assert!(
-            err.message.contains("already repairing the search index"),
-            "unexpected error: {err:?}"
-        );
-    }
-
-    #[test]
-    fn active_rebuild_waits_instead_of_searching_incomplete_checkpoint() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let data_dir = temp.path();
-        let db_path = seed_canonical_search_db(data_dir);
-        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
-        ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect("initial rebuild from active database");
-
-        let state_path = index_path.join(".lexical-rebuild-state.json");
-        let mut state: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&state_path).expect("read checkpoint"))
-                .expect("parse checkpoint");
-        state["completed"] = serde_json::json!(false);
-        std::fs::write(
-            &state_path,
-            serde_json::to_vec_pretty(&state).expect("serialize checkpoint"),
-        )
-        .expect("write incomplete checkpoint");
-
-        let diagnosis = search_lexical_self_heal_diagnosis(&index_path, &db_path)
-            .expect("diagnose incomplete checkpoint")
-            .expect("incomplete checkpoint should require repair");
-        assert_eq!(diagnosis.reason, "lexical rebuild checkpoint is incomplete");
-        assert!(
-            !diagnosis.permits_existing_index_during_active_rebuild(),
-            "active rebuild must not search an index before checkpoint refresh proof"
-        );
-
-        let _lock_file = hold_active_index_run_lock(data_dir, &db_path);
-
-        let err = ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            Some(0),
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect_err(
-            "incomplete checkpoint should wait for active rebuild instead of being searched",
-        );
-        assert_eq!(err.code, 7);
-        assert_eq!(err.kind, CliErrorKind::IndexBusy.kind_str());
-        assert!(
-            err.message.contains("already repairing the search index"),
-            "unexpected error: {err:?}"
-        );
-    }
-
-    /// #287: a robot-mode search facing an incomplete lexical checkpoint that
-    /// the cheap live-index refresh cannot reconcile must return a bounded
-    /// structured refusal with the stable `checkpoint_incomplete` reason code
-    /// instead of silently launching a multi-minute inline rebuild.
-    #[test]
-    fn robot_search_returns_bounded_checkpoint_incomplete_instead_of_inline_rebuild() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let data_dir = temp.path();
-        let db_path = seed_canonical_search_db(data_dir);
-        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
-        ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect("initial rebuild from active database");
-
-        // Mark the checkpoint incomplete AND grow the canonical DB so the
-        // live-index doc count no longer matches — the cheap metadata-only
-        // checkpoint refresh then cannot reconcile, and only the heavyweight
-        // canonical rebuild path remains.
-        let state_path = index_path.join(".lexical-rebuild-state.json");
-        let mut state: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&state_path).expect("read checkpoint"))
-                .expect("parse checkpoint");
-        state["completed"] = serde_json::json!(false);
-        std::fs::write(
-            &state_path,
-            serde_json::to_vec_pretty(&state).expect("serialize checkpoint"),
-        )
-        .expect("write incomplete checkpoint");
-        seed_search_db_at(
-            &db_path,
-            "robotrefusalneedle appended after the incomplete checkpoint",
-            "robot-refusal-extra-conversation",
-        );
-
-        let err = ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            true,
-        )
-        .expect_err(
-            "robot search must refuse the heavyweight inline rebuild with a bounded verdict",
-        );
-        assert_eq!(err.kind, "checkpoint_incomplete");
-        assert_eq!(err.code, 5);
-        assert!(err.retryable);
-        assert!(
-            err.message
-                .contains("lexical rebuild checkpoint is incomplete"),
-            "unexpected error: {err:?}"
-        );
-
-        // Human-mode (non-robot) searches keep the self-healing inline rebuild.
-        let repair = ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect("human-mode search keeps the inline self-heal rebuild");
-        assert_eq!(repair.action, "rebuilt-from-canonical-db");
-    }
-
-    /// #287: an active ingest-quarantine circuit breaker means any inline
-    /// rebuild may never converge — robot-mode searches must surface the
-    /// stable `quarantine_circuit_breaker` reason code as a bounded refusal.
-    #[test]
-    fn robot_search_returns_bounded_quarantine_circuit_breaker_refusal() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let data_dir = temp.path();
-        let db_path = seed_canonical_search_db(data_dir);
-        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
-
-        // Trip the ingest-quarantine circuit breaker: at least
-        // INGEST_QUARANTINE_CIRCUIT_DEFAULT_LIMIT recent poison records.
-        let quarantine_dir = data_dir.join("quarantine");
-        std::fs::create_dir_all(&quarantine_dir).expect("create quarantine dir");
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        let mut lines = String::new();
-        for idx in 0..25 {
-            let record = serde_json::json!({
-                "schema_version": 1,
-                "conversation_id": format!("tester|/logs/demo-{idx}.jsonl|/workspace/demo|poison-{idx}|1|2|1"),
-                "schema_version_at_quarantine": crate::storage::sqlite::CURRENT_SCHEMA_VERSION,
-                "first_quarantined_at_ms": now_ms,
-                "last_attempt_at_ms": now_ms,
-                "attempt_count": 1,
-                "reason": "index-ingest-out-of-memory",
-                "error_kind": "out-of-memory",
-                "last_error": "out of memory",
-                "agent_slug": "tester",
-                "external_id": format!("poison-{idx}"),
-                "source_path": format!("/logs/demo-{idx}.jsonl"),
-                "workspace": "/workspace/demo",
-                "started_at": 1,
-                "ended_at": 2,
-                "message_count": 1
-            });
-            lines.push_str(&format!("{record}\n"));
+            .expect("open db for fault injection");
+            conn.execute("DELETE FROM fts_lex_data", &[])
+                .expect("corrupt fts_lex shadow table for fault injection");
         }
-        std::fs::write(quarantine_dir.join("index_ingest_poison.jsonl"), lines)
-            .expect("write poison records");
-        let summary = crate::indexer::conversation_ingest_quarantine_summary(data_dir);
+        // Probe validity check (波1 铁律): confirm the injected fault actually
+        // fails the quick tier self-heal actually relies on before trusting
+        // it to catch this.
         assert!(
-            summary.circuit_breaker_active,
-            "fixture must trip the ingest circuit breaker: {summary:?}"
+            crate::search::lexical_index_health::validate_searchable_index_contract_quick(&db_path)
+                .is_err(),
+            "fault injection must make the quick fts5 probe fail"
         );
-
-        // No lexical index exists, so the self-heal would normally launch the
-        // inline canonical rebuild; robot mode must refuse instead while the
-        // breaker is active.
-        let err = ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            true,
-        )
-        .expect_err("robot search must refuse inline rebuild behind an active circuit breaker");
-        assert_eq!(err.kind, "quarantine_circuit_breaker");
-        assert_eq!(err.code, 5);
-        assert!(err.retryable);
-        assert!(
-            err.hint
-                .as_deref()
-                .is_some_and(|hint| hint.contains("cass index --watch-once")),
-            "hint must name the recovery command: {err:?}"
-        );
-    }
-
-    #[test]
-    fn search_self_heal_defers_missing_checkpoint_when_index_is_readable() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let data_dir = temp.path();
-        build_standalone_lexical_index_without_checkpoint(
-            data_dir,
-            "orphanautohealneedle exists only in a standalone lexical artifact",
-        );
-        let db_path = data_dir.join("agent_search.db");
-        seed_search_db_at(
-            &db_path,
-            "checkpointmissingautohealneedle exists only in the active database",
-            "checkpoint-missing-search-self-heal-conversation",
-        );
-        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
 
         let repair = ensure_lexical_assets_for_search(
             data_dir,
@@ -23211,127 +22686,38 @@ mod search_lexical_self_heal_tests {
             false,
             false,
         )
-        .expect(
-            "search self-heal should not rebuild inline when only checkpoint metadata is missing",
-        );
-        assert_eq!(repair.action, "deferred-repair-searching-existing-index");
-        assert_eq!(repair.indexed_docs, None);
-
-        assert!(
-            crate::indexer::load_lexical_rebuild_checkpoint(&index_path)
-                .expect("load checkpoint")
-                .is_none(),
-            "foreground search should not synthesize unverifiable checkpoint metadata"
-        );
-
-        let client = SearchClient::open(&index_path, Some(&db_path))
-            .expect("open search client")
-            .expect("existing standalone index should still open");
-        let active_hits = client
-            .search(
-                "checkpointmissingautohealneedle",
-                SearchFilters::default(),
-                5,
-                0,
-                FieldMask::FULL,
-            )
-            .expect("query active-db term");
-        assert_eq!(active_hits.len(), 0);
-        let orphan_hits = client
-            .search(
-                "orphanautohealneedle",
-                SearchFilters::default(),
-                5,
-                0,
-                FieldMask::FULL,
-            )
-            .expect("query standalone lexical term");
-        assert_eq!(orphan_hits.len(), 1);
-    }
-
-    #[test]
-    fn search_self_heal_rebuilds_incompatible_live_artifact() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let data_dir = temp.path();
-        let db_path = seed_canonical_search_db(data_dir);
-        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
-        ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect("initial rebuild");
-
-        std::fs::write(
-            index_path.join("schema_hash.json"),
-            serde_json::to_vec(&serde_json::json!({"schema_hash": "old-schema-hash"}))
-                .expect("serialize stale schema hash"),
-        )
-        .expect("write stale schema hash");
-
-        let repair = ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect("search self-heal should rebuild incompatible lexical artifact");
+        .expect("search self-heal should repair the corrupt fts5 artifact");
         assert_eq!(repair.action, "rebuilt-from-canonical-db");
         assert_eq!(repair.indexed_docs, Some(1));
-        crate::search::tantivy::validate_searchable_index_contract(&index_path)
+        crate::search::lexical_index_health::validate_searchable_index_contract_full(&db_path)
             .expect("repaired lexical artifact contract");
-
-        let client = SearchClient::open(&index_path, Some(&db_path))
-            .expect("open search client")
-            .expect("repaired index should open");
-        let hits = client
-            .search(
-                "autohealneedle",
-                SearchFilters::default(),
-                5,
-                0,
-                FieldMask::FULL,
-            )
-            .expect("query rebuilt index");
-        assert_eq!(hits.len(), 1);
+        assert!(
+            crate::search::lexical_index_health::searchable_index_exists(&db_path),
+            "the fts5 domain must actually be repopulated, not just the retired tantivy side"
+        );
     }
 
+    /// Grep-level guard (control-plane 2026-08-30 amendment, W2-6 Task1): the
+    /// full rank=1 integrity-check costs minutes on a large corpus and must
+    /// never ride the per-search hot path again. Pins the function's source
+    /// body, not just today's behavior, so a future edit that adds a call to
+    /// the full tier here fails loudly instead of silently reintroducing the
+    /// regression this session found and fixed.
     #[test]
-    fn search_self_heal_replaces_corrupt_live_artifact_for_empty_db() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let data_dir = temp.path();
-        let db_path = seed_empty_canonical_search_db(data_dir);
-        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
-        std::fs::create_dir_all(&index_path).expect("create corrupt index dir");
-        std::fs::write(index_path.join("meta.json"), b"not-json").expect("write corrupt meta");
-
-        let repair = ensure_lexical_assets_for_search(
-            data_dir,
-            &db_path,
-            &index_path,
-            None,
-            Instant::now(),
-            false,
-            false,
-        )
-        .expect("search self-heal should publish a fresh empty lexical artifact");
-        assert_eq!(repair.action, "rebuilt-from-canonical-db");
-        assert_eq!(repair.indexed_docs, Some(0));
-        crate::search::tantivy::validate_searchable_index_contract(&index_path)
-            .expect("empty repaired lexical artifact contract");
-
-        let checkpoint = crate::indexer::load_lexical_rebuild_checkpoint(&index_path)
-            .expect("load empty repair checkpoint")
-            .expect("checkpoint present");
-        assert!(checkpoint.completed);
-        assert_eq!(checkpoint.indexed_docs, 0);
+    fn self_heal_diagnosis_never_calls_the_full_tier_contract_check() {
+        let source = include_str!("lib.rs");
+        let start = source
+            .find("fn search_lexical_self_heal_diagnosis(")
+            .expect("search_lexical_self_heal_diagnosis must still exist in lib.rs");
+        let after_start = &source[start..];
+        let body_end = after_start
+            .find("\nfn ")
+            .expect("a following top-level fn must terminate the body scan");
+        let body = &after_start[..body_end];
+        assert!(
+            !body.contains("validate_searchable_index_contract_full"),
+            "search_lexical_self_heal_diagnosis must only ever call the quick tier -- it runs on every search"
+        );
     }
 }
 
@@ -23466,7 +22852,7 @@ fn run_cli_search(
     let start_time = Instant::now();
 
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
-    let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
+    let index_path = crate::indexer::expected_index_dir(&data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     let db_exists = db_path.exists();
 
@@ -23615,7 +23001,8 @@ fn run_cli_search(
             "search lexical self-heal completed"
         );
     }
-    let tantivy_index_initialized = crate::search::tantivy::searchable_index_exists(&index_path);
+    // W2-6 Task1: reseated onto the lex_docs/fts_lex SQLite domain.
+    let tantivy_index_initialized = crate::search::lexical_index_health::searchable_index_exists(&db_path);
     let rebuild_active = probe_index_run_lock(&data_dir, &db_path).active;
 
     let client = SearchClient::open_with_options(
@@ -23688,9 +23075,9 @@ fn run_cli_search(
         }
     })?;
 
-    if !client.has_tantivy() {
+    if !client.has_lexical_index() {
         eprintln!(
-            "Warning: Tantivy search index not found at {}. \
+            "Warning: lexical search index not found at {}. \
              Results will be severely limited. \
              Run `cass index --full` to rebuild the index.",
             index_path.display()
@@ -23702,12 +23089,6 @@ fn run_cli_search(
     // while robot metadata reports the realized mode and fallback reason.
     let mut mode_meta = SearchModeMeta::new(mode.unwrap_or_default(), mode.is_none());
     let hybrid_fail_open = mode_meta.fail_open_on_semantic_unavailable();
-
-    if semantic_opts.tier_mode != crate::search::query::SemanticTierMode::Single
-        && !matches!(mode_meta.requested, SearchMode::Semantic)
-    {
-        eprintln!("Warning: tier flags currently only affect --mode semantic.");
-    }
 
     if matches!(
         mode_meta.requested,
@@ -23768,9 +23149,6 @@ fn run_cli_search(
 
         if let Some(context) = setup.context {
             let embedder = context.embedder;
-            let index = context.index;
-            let additional_indexes = context.additional_indexes;
-            let filter_maps = context.filter_maps;
             let roles = context.roles;
 
             let embedder: Arc<dyn crate::search::embedder::Embedder> = if semantic_opts.use_daemon {
@@ -23813,17 +23191,7 @@ fn run_cli_search(
                 embedder
             };
 
-            let ann_path = Some(
-                data_dir
-                    .join(crate::search::vector_index::VECTOR_INDEX_DIR)
-                    .join(format!("hnsw-{}.chsw", embedder.id())),
-            );
-            let mut indexes = Vec::with_capacity(additional_indexes.len().saturating_add(1));
-            indexes.push(index);
-            indexes.extend(additional_indexes);
-            if let Err(err) =
-                client.set_semantic_indexes_context(embedder, indexes, filter_maps, roles, ann_path)
-            {
+            if let Err(err) = client.set_semantic_context(embedder, roles) {
                 let hint = if prefer_hash {
                     "Run 'cass index --semantic --embedder hash' to rebuild the hash vector index, or omit --mode semantic when lexical evidence is acceptable"
                         .to_string()
@@ -23867,14 +23235,6 @@ fn run_cli_search(
             }
         }
     }
-
-    let approximate =
-        if semantic_opts.approximate && matches!(mode_meta.realized, SearchMode::Lexical) {
-            eprintln!("Warning: --approximate has no effect in lexical mode.");
-            false
-        } else {
-            semantic_opts.approximate
-        };
 
     // Use search_with_fallback to get full metadata (wildcard_fallback, cache_stats)
     let sparse_threshold = 3; // Threshold for triggering wildcard fallback
@@ -23930,16 +23290,12 @@ fn run_cli_search(
         || semantic_opts.rerank
         || semantic_opts.reranker.is_some()
         || semantic_opts.use_daemon
-        || semantic_opts.approximate
-        || semantic_opts.tier_mode != crate::search::query::SemanticTierMode::Single
     {
         tracing::debug!(
             model = ?semantic_opts.model,
             rerank = semantic_opts.rerank,
             reranker = ?semantic_opts.reranker,
             use_daemon = semantic_opts.use_daemon,
-            approximate = semantic_opts.approximate,
-            tier_mode = ?semantic_opts.tier_mode,
             "Semantic search options configured"
         );
     }
@@ -23956,12 +23312,21 @@ fn run_cli_search(
                 search_sparse_threshold,
                 field_mask,
             )
-            .map_err(|e| CliError {
-                code: 9,
-                kind: CliErrorKind::Search.kind_str(),
-                message: format!("search failed: {e}"),
-                hint: None,
-                retryable: true,
+            .map_err(|e| {
+                let chain = format!("{e:#}");
+                if error_chain_indicates_lexical_index_building(&chain) {
+                    search_lexical_index_building_cli_error(&chain)
+                } else if error_chain_indicates_lexical_index_absent(&chain) {
+                    search_lexical_index_absent_cli_error(&chain)
+                } else {
+                    CliError {
+                        code: 9,
+                        kind: CliErrorKind::Search.kind_str(),
+                        message: format!("search failed: {e}"),
+                        hint: None,
+                        retryable: true,
+                    }
+                }
             })?,
         SearchMode::Semantic => {
             // cass#256: in the `-baseline` build (the `semantic` Cargo
@@ -23973,15 +23338,7 @@ fn run_cli_search(
             {
                 // Suppress unused-binding warnings in the baseline arm:
                 // every input is consumed by the documented error envelope.
-                let _ = (
-                    approximate,
-                    &semantic_opts,
-                    &filters,
-                    &field_mask,
-                    query,
-                    search_limit,
-                    search_offset,
-                );
+                let _ = (&semantic_opts, &filters, &field_mask, query, search_limit, search_offset);
                 let _ = client;
                 Err::<crate::search::query::SearchResult, CliError>(CliError {
                     code: 15,
@@ -23998,31 +23355,11 @@ fn run_cli_search(
             }
             #[cfg(any(feature = "semantic", feature = "infinity"))]
             {
-                let (hits, ann_stats) = client
-                    .search_semantic_with_tier(
-                        query,
-                        filters.clone(),
-                        search_limit,
-                        search_offset,
-                        field_mask,
-                        approximate,
-                        semantic_opts.tier_mode,
-                    )
+                let hits = client
+                    .search_semantic(query, filters.clone(), search_limit, search_offset, field_mask)
                     .map_err(|e| {
                         let err_str = e.to_string();
-                        if err_str.contains("HNSW index") {
-                            CliError {
-                                code: 15,
-                                kind: CliErrorKind::SemanticUnavailable.kind_str(),
-                                message: "Approximate search unavailable (HNSW index missing)"
-                                    .to_string(),
-                                hint: Some(
-                                    "Run 'cass index --semantic --build-hnsw' to build the ANN index, or omit --approximate"
-                                        .to_string(),
-                                ),
-                                retryable: false,
-                            }
-                        } else if err_str.contains("unavailable")
+                        if err_str.contains("unavailable")
                             || err_str.contains("no embedder")
                         {
                             CliError {
@@ -24053,7 +23390,6 @@ fn run_cli_search(
                     wildcard_fallback: false,
                     cache_stats: crate::search::query::CacheStats::default(),
                     suggestions: Vec::new(),
-                    ann_stats,
                     total_count: None,
                 }
             }
@@ -24066,7 +23402,6 @@ fn run_cli_search(
             search_offset,
             search_sparse_threshold,
             field_mask,
-            approximate,
         ) {
             Ok(result) => result,
             Err(e) => {
@@ -24084,14 +23419,23 @@ fn run_cli_search(
                             search_sparse_threshold,
                             field_mask,
                         )
-                        .map_err(|fallback_err| CliError {
-                            code: 9,
-                            kind: CliErrorKind::Search.kind_str(),
-                            message: format!(
-                                "hybrid search failed ({e}); lexical fallback failed: {fallback_err}"
-                            ),
-                            hint: None,
-                            retryable: true,
+                        .map_err(|fallback_err| {
+                            let chain = format!("{fallback_err:#}");
+                            if error_chain_indicates_lexical_index_building(&chain) {
+                                search_lexical_index_building_cli_error(&chain)
+                            } else if error_chain_indicates_lexical_index_absent(&chain) {
+                                search_lexical_index_absent_cli_error(&chain)
+                            } else {
+                                CliError {
+                                    code: 9,
+                                    kind: CliErrorKind::Search.kind_str(),
+                                    message: format!(
+                                        "hybrid search failed ({e}); lexical fallback failed: {fallback_err}"
+                                    ),
+                                    hint: None,
+                                    retryable: true,
+                                }
+                            }
                         })?
                 } else if err_str.contains("unavailable") || err_str.contains("no embedder") {
                     return Err(CliError {
@@ -24123,6 +23467,16 @@ fn run_cli_search(
 
     // Apply reranking if enabled (bd-2t2d)
     let rerank_start = Instant::now();
+    // R1-W3-B7: tracks whether reranking was *actually* applied to `result`
+    // below, independent of whether it was requested. `--rerank` requested
+    // with no reranker available (the local cross-encoder is a permanent
+    // stub in this build, cass#256; daemon rerank unconfigured or
+    // unreachable) used to be an indistinguishable, deterministic no-op --
+    // `Ok(())`, unmodified results, and (outside `!use_daemon`-gated
+    // `tracing::debug!`) not even a log line. Threaded into
+    // `output_robot_results` below as `rerank_applied` so a caller that
+    // never inspects logs still gets an honest answer.
+    let mut rerank_applied = false;
     let result = if semantic_opts.rerank && !result.hits.is_empty() {
         use crate::search::fastembed_reranker::FastEmbedReranker;
         use crate::search::reranker::{Reranker, rerank_texts};
@@ -24231,13 +23585,13 @@ fn run_cli_search(
                             hits_reranked = scored_hits.len(),
                             "Reranking complete"
                         );
+                        rerank_applied = true;
 
                         crate::search::query::SearchResult {
                             hits: scored_hits,
                             wildcard_fallback: result.wildcard_fallback,
                             cache_stats: result.cache_stats,
                             suggestions: result.suggestions,
-                            ann_stats: result.ann_stats,
                             total_count: result.total_count,
                         }
                     }
@@ -24251,6 +23605,19 @@ fn run_cli_search(
                 }
             }
         } else {
+            // R1-W3-B7: `--rerank` was requested but no reranker at all
+            // could be constructed (permanent local stub + daemon
+            // unconfigured/unreachable) -- previously a fully silent,
+            // deterministic no-op outside a `!use_daemon`-gated
+            // `tracing::debug!`. Warn unconditionally at a level visible
+            // under default log settings; `rerank_applied=false` in the
+            // output (below) carries the same fact to a caller that never
+            // inspects logs.
+            tracing::warn!(
+                "--rerank requested but no reranker is available (local cross-encoder is a \
+                 permanent stub in this build, cass#256; daemon rerank is unconfigured or \
+                 unreachable); returning unreranked results"
+            );
             result
         }
     } else {
@@ -24303,7 +23670,6 @@ fn run_cli_search(
                 wildcard_fallback: result.wildcard_fallback,
                 cache_stats: result.cache_stats,
                 suggestions: result.suggestions.clone(),
-                ann_stats: result.ann_stats.clone(),
                 total_count: result.total_count,
             };
             let has_more = total > offset_val + display.hits.len();
@@ -24331,7 +23697,6 @@ fn run_cli_search(
                 wildcard_fallback: result.wildcard_fallback,
                 cache_stats: result.cache_stats,
                 suggestions: result.suggestions,
-                ann_stats: result.ann_stats,
                 total_count: result.total_count,
             };
             (
@@ -24513,6 +23878,8 @@ fn run_cli_search(
             mode_meta,
             search_ms,
             rerank_ms,
+            rerank_applied,
+            semantic_opts.rerank,
         )?;
     } else if display_result.hits.is_empty() {
         eprintln!("No results found.");
@@ -24637,7 +24004,7 @@ fn run_cli_pack(
     limits.validate().map_err(pack_invalid_limit_error)?;
 
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
-    let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
+    let index_path = crate::indexer::expected_index_dir(&data_dir);
     let db_path = db_override
         .clone()
         .unwrap_or_else(|| data_dir.join("agent_search.db"));
@@ -24688,7 +24055,8 @@ fn run_cli_pack(
         );
     }
 
-    let tantivy_index_initialized = crate::search::tantivy::searchable_index_exists(&index_path);
+    // W2-6 Task1: reseated onto the lex_docs/fts_lex SQLite domain.
+    let tantivy_index_initialized = crate::search::lexical_index_health::searchable_index_exists(&db_path);
     let rebuild_active = probe_index_run_lock(&data_dir, &db_path).active;
     let client = SearchClient::open_with_options(
         &index_path,
@@ -24763,15 +24131,24 @@ fn run_cli_pack(
             search_sparse_threshold,
             FieldMask::FULL,
         )
-        .map_err(|e| CliError {
-            code: 9,
-            kind: CliErrorKind::Search.kind_str(),
-            message: format!("pack search failed: {e}"),
-            hint: Some(
-                "Try `cass search <query> --robot --robot-meta` to inspect the search path."
-                    .to_string(),
-            ),
-            retryable: true,
+        .map_err(|e| {
+            let chain = format!("{e:#}");
+            if error_chain_indicates_lexical_index_building(&chain) {
+                search_lexical_index_building_cli_error(&chain)
+            } else if error_chain_indicates_lexical_index_absent(&chain) {
+                search_lexical_index_absent_cli_error(&chain)
+            } else {
+                CliError {
+                    code: 9,
+                    kind: CliErrorKind::Search.kind_str(),
+                    message: format!("pack search failed: {e}"),
+                    hint: Some(
+                        "Try `cass search <query> --robot --robot-meta` to inspect the search path."
+                            .to_string(),
+                    ),
+                    retryable: true,
+                }
+            }
         })?;
 
     if let Some(timeout) = timeout_duration
@@ -26581,6 +25958,21 @@ fn output_robot_results(
     search_mode_meta: SearchModeMeta,
     search_ms: u64,
     rerank_ms: u64,
+    // R1-W3-B7: whether reranking actually changed `result`'s hit order --
+    // `false` covers both "never requested" and "requested but no
+    // reranker was available", same convention as `rerank_ms` (0 covers
+    // both cases too). Distinguishing those two `false` cases is what the
+    // `tracing::warn!` at the call site is for; this field's job is only
+    // to make the fact machine-readable for callers that never look at
+    // logs.
+    rerank_applied: bool,
+    // R2-B5: distinct from `rerank_applied` -- `--rerank` was requested at
+    // all, regardless of whether it ended up applying. Needed because
+    // `rerank_applied` alone conflates "never requested" with "requested
+    // but no reranker was available" (see its own doc comment above); the
+    // JSON/JSONL top-level fields this gates must appear whenever the
+    // caller asked for `--rerank`, not only when it succeeded.
+    rerank_requested: bool,
 ) -> CliResult<()> {
     use std::io::{BufWriter, Write};
 
@@ -26634,6 +26026,10 @@ fn output_robot_results(
 
     // Fast path: summary-field JSON output without optional metadata/features.
     // Avoid intermediary serde_json::Value maps and string clones per hit.
+    // R2-B5: `!rerank_requested` added -- this path's `FastSummaryJsonPayload`
+    // has no `rerank_requested`/`rerank_applied` fields, so a `--rerank` run
+    // must fall through to the slower `match format` path below (the one
+    // that actually emits them) instead of silently bypassing it here.
     if matches!(format, RobotFormat::Json)
         && summary_projection
         && !needs_truncation
@@ -26644,6 +26040,7 @@ fn output_robot_results(
         && result.suggestions.is_empty()
         && explanation.is_none()
         && !timed_out
+        && !rerank_requested
     {
         use serde::ser::{SerializeMap, SerializeSeq};
         use serde::{Serialize, Serializer};
@@ -26737,6 +26134,13 @@ fn output_robot_results(
     // Fast path: full-field JSON output without optional metadata/features.
     // Serialize hits directly with compatibility formatting to avoid
     // materializing intermediary serde_json::Value hits.
+    // R2-B5: `!rerank_requested` added -- this path's `FastJsonPayload` has
+    // no `rerank_requested`/`rerank_applied` fields, so a `--rerank` run
+    // must fall through to the slower `match format` path below (the one
+    // that actually emits them) instead of silently bypassing it here. This
+    // was the actual root cause of the `--json --rerank` (no
+    // `--robot-meta`) silent no-op this item reports: this exact fast path
+    // is what a bare `cass search ... --json --rerank` hits.
     if matches!(format, RobotFormat::Json)
         && all_fields_requested
         && !needs_truncation
@@ -26747,6 +26151,7 @@ fn output_robot_results(
         && result.suggestions.is_empty()
         && explanation.is_none()
         && !timed_out
+        && !rerank_requested
     {
         use serde::ser::{SerializeMap, SerializeSeq};
         use serde::{Serialize, Serializer};
@@ -27085,6 +26490,21 @@ fn output_robot_results(
                 "hits_clamped": hits_clamped,
             });
 
+            // R2-B5: unconditional (not gated on `--robot-meta`/`include_meta`
+            // the way `rerank_applied` alone still is inside the `_meta`
+            // block below) whenever `--rerank` was requested -- a caller
+            // that passes `--json --rerank` without `--robot-meta` was
+            // previously getting a silent no-op: `rerank_applied` lived
+            // only in `_meta`, and the `tracing::warn!` explaining *why*
+            // no reranker could be constructed is filtered out entirely
+            // under `--json`'s error-only robot logging.
+            if rerank_requested
+                && let serde_json::Value::Object(ref mut map) = payload
+            {
+                map.insert("rerank_requested".to_string(), serde_json::json!(true));
+                map.insert("rerank_applied".to_string(), serde_json::json!(rerank_applied));
+            }
+
             // Add suggestions if present
             if !result.suggestions.is_empty()
                 && let serde_json::Value::Object(ref mut map) = payload
@@ -27134,6 +26554,12 @@ fn output_robot_results(
                         "rerank_ms": rerank_ms,
                         "other_ms": elapsed_ms.saturating_sub(search_ms).saturating_sub(rerank_ms),
                     },
+                    // R1-W3-B7: honest signal for a caller that never
+                    // inspects logs -- false whenever `--rerank` was
+                    // never requested, or was requested but no reranker
+                    // could be constructed (see the `tracing::warn!` at
+                    // the rerank call site for why, in the latter case).
+                    "rerank_applied": rerank_applied,
                     "tokens_estimated": tokens_estimated,
                     "max_tokens": max_tokens,
                     "request_id": request_id,
@@ -27176,15 +26602,6 @@ fn output_robot_results(
                     if timed_out {
                         m.insert("partial_results".to_string(), serde_json::json!(true));
                     }
-                }
-                // Add ANN stats to _meta if approximate search was used
-                if let Some(ref ann_stats) = result.ann_stats
-                    && let serde_json::Value::Object(ref mut m) = meta
-                {
-                    m.insert(
-                        "ann_stats".to_string(),
-                        serde_json::to_value(ann_stats).unwrap_or_default(),
-                    );
                 }
                 map.insert("_meta".to_string(), meta);
 
@@ -27237,11 +26654,18 @@ fn output_robot_results(
             let stdout = std::io::stdout();
             let mut out = BufWriter::new(stdout.lock());
 
-            // JSONL: one object per line, optional _meta header
+            // JSONL: one object per line, optional _meta header. R2-B5:
+            // `rerank_requested` added to the trigger list -- without
+            // it, a `--jsonl --rerank` run with none of the other
+            // meta-triggering flags set emitted no `_meta` line at all, so
+            // `rerank_requested`/`rerank_applied` (inserted below,
+            // unconditional on `include_meta` like the `RobotFormat::Json`
+            // case above) would have had nowhere to land.
             if include_meta
                 || agg_json.is_some()
                 || !result.suggestions.is_empty()
                 || explanation.is_some()
+                || rerank_requested
             {
                 let mut meta = serde_json::json!({
                     "_meta": {
@@ -27303,6 +26727,18 @@ fn output_robot_results(
                     && let serde_json::Value::Object(ref mut m) = meta
                 {
                     m.insert("storage_integrity".to_string(), si.clone());
+                }
+                // R2-B5: sibling to `_meta` (this line's own top level),
+                // matching `storage_integrity` above -- not nested inside
+                // `_meta`, which is what `include_meta`/`--robot-meta`
+                // alone still gates. See the `RobotFormat::Json` arm's
+                // identical fix for why this must be unconditional on
+                // `--rerank` having been requested at all.
+                if rerank_requested
+                    && let serde_json::Value::Object(ref mut m) = meta
+                {
+                    m.insert("rerank_requested".to_string(), serde_json::json!(true));
+                    m.insert("rerank_applied".to_string(), serde_json::json!(rerank_applied));
                 }
                 // Add suggestions to meta line
                 if !result.suggestions.is_empty()
@@ -27488,15 +26924,6 @@ fn output_robot_results(
                         m.insert("partial_results".to_string(), serde_json::json!(true));
                     }
                 }
-                // Add ANN stats to _meta if approximate search was used
-                if let Some(ref ann_stats) = result.ann_stats
-                    && let serde_json::Value::Object(ref mut m) = meta
-                {
-                    m.insert(
-                        "ann_stats".to_string(),
-                        serde_json::to_value(ann_stats).unwrap_or_default(),
-                    );
-                }
                 map.insert("_meta".to_string(), meta);
                 if let Some(warn) = &warning {
                     map.insert(
@@ -27621,15 +27048,6 @@ fn output_robot_results(
                         m.insert("partial_results".to_string(), serde_json::json!(true));
                     }
                 }
-                // Add ANN stats to _meta if approximate search was used
-                if let Some(ref ann_stats) = result.ann_stats
-                    && let serde_json::Value::Object(ref mut m) = meta
-                {
-                    m.insert(
-                        "ann_stats".to_string(),
-                        serde_json::to_value(ann_stats).unwrap_or_default(),
-                    );
-                }
                 map.insert("_meta".to_string(), meta);
                 if let Some(warn) = &warning {
                     map.insert(
@@ -27724,18 +27142,27 @@ fn stats_message_count_sql(source_where: &str) -> String {
 }
 
 fn stats_workspace_count_sql(source_where: &str) -> String {
+    // w1b Task B9 (2026-08-27, equivalence-gate-caught): `ORDER BY COUNT(*)
+    // DESC` alone has no tiebreaker for workspaces with equal counts, so
+    // SQLite's output order for tied groups is whatever its query plan
+    // happens to produce -- not a guarantee of the SQL itself, and it can
+    // (and did) flip between two databases with byte-identical logical
+    // content but a different physical page layout (a rebuilt fixture vs.
+    // the original file). `c.workspace_id ASC` makes tied groups
+    // deterministic without changing any single-workspace or
+    // clearly-ordered-by-count result.
     if source_where.is_empty() {
-        "SELECT c.workspace_id, COUNT(*) FROM conversations c WHERE c.workspace_id IS NOT NULL GROUP BY c.workspace_id ORDER BY COUNT(*) DESC".to_string()
+        "SELECT c.workspace_id, COUNT(*) FROM conversations c WHERE c.workspace_id IS NOT NULL GROUP BY c.workspace_id ORDER BY COUNT(*) DESC, c.workspace_id ASC".to_string()
     } else {
         format!(
-            "SELECT c.workspace_id, COUNT(*) FROM conversations c{source_where} AND c.workspace_id IS NOT NULL GROUP BY c.workspace_id ORDER BY COUNT(*) DESC"
+            "SELECT c.workspace_id, COUNT(*) FROM conversations c{source_where} AND c.workspace_id IS NOT NULL GROUP BY c.workspace_id ORDER BY COUNT(*) DESC, c.workspace_id ASC"
         )
     }
 }
 
 fn append_source_filter_condition(
     sql: &mut String,
-    params: &mut Vec<frankensqlite::compat::ParamValue>,
+    params: &mut Vec<ParamValue>,
     source_filter: &crate::sources::provenance::SourceFilter,
 ) {
     append_source_filter_condition_with_columns(
@@ -27749,7 +27176,7 @@ fn append_source_filter_condition(
 
 fn append_source_filter_condition_with_columns(
     sql: &mut String,
-    params: &mut Vec<frankensqlite::compat::ParamValue>,
+    params: &mut Vec<ParamValue>,
     source_filter: &crate::sources::provenance::SourceFilter,
     source_id_sql: &str,
     origin_host_sql: &str,
@@ -27792,12 +27219,10 @@ fn run_stats(
 ) -> CliResult<()> {
     use crate::sources::provenance::SourceFilter;
 
-    use frankensqlite::compat::{ParamValue, RowExt};
 
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     let conn = open_franken_cli_read_db(db_path.clone(), "stats", Duration::from_secs(30))?;
-    validate_fts_messages_integrity_for_cli(&conn, "stats")?;
     let conversation_columns = doctor_table_columns(&conn, "conversations");
     let source_id_sql = if conversation_columns.contains("source_id") {
         "c.source_id"
@@ -28398,7 +27823,7 @@ fn run_dedup(
     }
 
     let storage =
-        crate::storage::sqlite::FrankenStorage::open(&db_path).map_err(|err| CliError {
+        crate::storage::sqlite::FrankenStorage::open_writer(&db_path).map_err(|err| CliError {
             code: 3,
             kind: CliErrorKind::DbOpen.kind_str(),
             message: format!("failed to open canonical DB for dedup: {err}"),
@@ -28419,34 +27844,13 @@ fn run_dedup(
             retryable: false,
         })?;
 
-    // On apply, rebuild the lexical FTS index so the dropped twins stop
-    // surfacing in search. Only worth doing when something was removed.
-    let mut lexical_rebuilt = false;
-    if apply && result.conversations_affected > 0 {
-        match storage.rebuild_lexical_index_after_dedup() {
-            Ok(()) => lexical_rebuilt = true,
-            Err(err) => {
-                tracing::warn!(
-                    "duplicate cleanup removed rows but lexical rebuild failed: {err}; run 'cass index --full' to refresh search"
-                );
-            }
-        }
-    }
-
     let recommended_action = if result.conversations_affected == 0 {
         "No pre-existing duplicate conversations found. Nothing to do.".to_string()
     } else if apply {
-        if lexical_rebuilt {
-            format!(
-                "Collapsed {} duplicate conversation(s) and rebuilt the in-DB FTS shadow. Run 'cass index --full' to also refresh the on-disk lexical search index.",
-                result.conversations_affected
-            )
-        } else {
-            format!(
-                "Collapsed {} duplicate conversation(s). Run 'cass index --full' to refresh the lexical index.",
-                result.conversations_affected
-            )
-        }
+        format!(
+            "Collapsed {} duplicate conversation(s). Run 'cass index --full' to refresh the lexical index.",
+            result.conversations_affected
+        )
     } else {
         format!(
             "Found {} duplicate conversation(s) ({} message rows). Re-run with --apply to collapse them.",
@@ -28476,7 +27880,10 @@ fn run_dedup(
             "db_exists": true,
             "conversations_collapsed": result.conversations_affected,
             "messages_removed": result.messages_affected,
-            "lexical_rebuilt": lexical_rebuilt,
+            // W2-6 Task戊: the in-DB fts_messages shadow this field used to
+            // report on is retired; always false now (see the sibling
+            // no-op branch above, which already hardcoded this).
+            "lexical_rebuilt": false,
             "pairs": pairs,
             "recommended_action": recommended_action,
         });
@@ -28554,15 +27961,13 @@ fn run_diag(
     quarantine: bool,
     verbose: bool,
 ) -> CliResult<()> {
-    use frankensqlite::compat::RowExt;
-    use frankensqlite::params;
     use std::fs;
 
     let version = env!("CARGO_PKG_VERSION");
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     // Use the actual versioned lexical index path without creating it during diagnostics.
-    let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
+    let index_path = crate::indexer::expected_index_dir(&data_dir);
 
     // Check database existence and get stats
     let (db_exists, db_size, conversation_count, message_count) = if db_path.exists() {
@@ -28576,14 +27981,14 @@ fn run_diag(
                 let mut convs: i64 = franken_query_row_map_retry(
                     &conn,
                     "SELECT COUNT(*) FROM conversations",
-                    params![],
+                    &[],
                     |r| r.get_typed(0),
                 )
                 .unwrap_or(0);
                 let mut msgs: i64 = franken_query_row_map_retry(
                     &conn,
                     "SELECT COUNT(*) FROM messages",
-                    params![],
+                    &[],
                     |r| r.get_typed(0),
                 )
                 .unwrap_or(0);
@@ -28593,7 +27998,7 @@ fn run_diag(
                         "diagnostics",
                         CLI_DIAG_DB_OPEN_TIMEOUT,
                         "SELECT COUNT(*) FROM conversations",
-                        params![],
+                        &[],
                     )
                     .unwrap_or(0);
                 }
@@ -28603,7 +28008,7 @@ fn run_diag(
                         "diagnostics",
                         CLI_DIAG_DB_OPEN_TIMEOUT,
                         "SELECT COUNT(*) FROM messages",
-                        params![],
+                        &[],
                     )
                     .unwrap_or(0);
                 }
@@ -28619,9 +28024,12 @@ fn run_diag(
         (false, 0, 0, 0)
     };
 
-    // Check index existence
-    let (index_exists, index_size) = if crate::search::tantivy::searchable_index_exists(&index_path)
-    {
+    // Check index existence (W2-6 Task1: reseated onto the lex_docs/fts_lex
+    // SQLite domain; the reported size is still the tantivy directory's,
+    // which stays meaningful until Task2 retires it)
+    let (index_exists, index_size) = if crate::search::lexical_index_health::searchable_index_exists(
+        &db_path,
+    ) {
         let size = fs_dir_size(&index_path);
         (true, size)
     } else {
@@ -29189,6 +28597,7 @@ struct DoctorRootCauseIncident {
 struct DoctorDatabaseIntegrityProbe {
     quick_check_status: String,
     integrity_check_diagnostics: Vec<String>,
+    foreign_key_check_diagnostics: Vec<String>,
 }
 
 const DOCTOR_DATABASE_INTEGRITY_DIAGNOSTIC_LIMIT: usize = 20;
@@ -29420,12 +28829,11 @@ fn doctor_anomaly_taxonomy_report() -> Vec<DoctorAnomalyTaxonomyEntry> {
 }
 
 fn doctor_database_integrity_probe(
-    conn: &frankensqlite::Connection,
+    conn: &FrankenConnection,
 ) -> Result<DoctorDatabaseIntegrityProbe, String> {
-    use frankensqlite::compat::{ConnectionExt as _, RowExt as _};
 
     let quick_check_status: String = conn
-        .query_row_map("PRAGMA quick_check(1)", &[], |row: &frankensqlite::Row| {
+        .query_row_map("PRAGMA quick_check(1)", &[], |row: &FrankenRow| {
             row.get_typed(0)
         })
         .map_err(|err| format!("running PRAGMA quick_check(1): {err}"))?;
@@ -29434,14 +28842,11 @@ fn doctor_database_integrity_probe(
     let integrity_check_diagnostics = if quick_check_ok {
         let integrity_sql =
             format!("PRAGMA integrity_check({DOCTOR_DATABASE_INTEGRITY_DIAGNOSTIC_LIMIT});");
-        let rows = conn
-            .query(&integrity_sql)
+        let rows: Vec<String> = conn
+            .query_all_map(&integrity_sql, &[], |row: &FrankenRow| row.get_typed(0))
             .map_err(|err| format!("running PRAGMA integrity_check: {err}"))?;
         let mut diagnostics = Vec::new();
-        for row in rows {
-            let detail: String = row
-                .get_typed(0)
-                .map_err(|err| format!("reading PRAGMA integrity_check output: {err}"))?;
+        for detail in rows {
             let detail = detail.trim();
             if detail.eq_ignore_ascii_case("ok") || detail.is_empty() {
                 continue;
@@ -29456,9 +28861,41 @@ fn doctor_database_integrity_probe(
         Vec::new()
     };
 
+    // w1b Task B2c (spec v6.1 §10, R3-B2): `quick_check`/`integrity_check`
+    // are page-level b-tree probes and never inspect referential integrity,
+    // so a dangling FK reference passes both as "ok". `PRAGMA
+    // foreign_key_check` is the pragma that actually scans for existing FK
+    // violations. Gated on `quick_check_ok` like `integrity_check` above --
+    // no point scanning FK state on a database whose b-tree pages are
+    // already known-corrupt.
+    let foreign_key_check_diagnostics = if quick_check_ok {
+        let rows: Vec<(String, Option<i64>, String, i64)> = conn
+            .query_all_map("PRAGMA foreign_key_check;", &[], |row: &FrankenRow| {
+                Ok((
+                    row.get_typed(0)?,
+                    row.get_typed(1)?,
+                    row.get_typed(2)?,
+                    row.get_typed(3)?,
+                ))
+            })
+            .map_err(|err| format!("running PRAGMA foreign_key_check: {err}"))?;
+        rows.into_iter()
+            .take(DOCTOR_DATABASE_INTEGRITY_DIAGNOSTIC_LIMIT)
+            .map(|(table, rowid, parent, fkid)| {
+                let rowid = rowid
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "NULL".to_string());
+                format!("table={table} rowid={rowid} references={parent} fkid={fkid}")
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     Ok(DoctorDatabaseIntegrityProbe {
         quick_check_status,
         integrity_check_diagnostics,
+        foreign_key_check_diagnostics,
     })
 }
 
@@ -29466,13 +28903,16 @@ impl DoctorDatabaseIntegrityProbe {
     fn is_ok(&self) -> bool {
         self.quick_check_status.trim().eq_ignore_ascii_case("ok")
             && self.integrity_check_diagnostics.is_empty()
+            && self.foreign_key_check_diagnostics.is_empty()
     }
 
     fn failed_pragma_name(&self) -> &'static str {
-        if self.quick_check_status.trim().eq_ignore_ascii_case("ok") {
+        if !self.quick_check_status.trim().eq_ignore_ascii_case("ok") {
+            "quick_check"
+        } else if !self.integrity_check_diagnostics.is_empty() {
             "integrity_check"
         } else {
-            "quick_check"
+            "foreign_key_check"
         }
     }
 
@@ -29480,14 +28920,13 @@ impl DoctorDatabaseIntegrityProbe {
         if !self.quick_check_status.trim().eq_ignore_ascii_case("ok") {
             return self.quick_check_status.trim().to_string();
         }
-        let mut summary = self
-            .integrity_check_diagnostics
-            .iter()
-            .take(3)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join("; ");
-        let omitted = self.integrity_check_diagnostics.len().saturating_sub(3);
+        let diagnostics: &[String] = if !self.integrity_check_diagnostics.is_empty() {
+            &self.integrity_check_diagnostics
+        } else {
+            &self.foreign_key_check_diagnostics
+        };
+        let mut summary = diagnostics.iter().take(3).cloned().collect::<Vec<_>>().join("; ");
+        let omitted = diagnostics.len().saturating_sub(3);
         if omitted > 0 {
             if !summary.is_empty() {
                 summary.push_str("; ");
@@ -29499,6 +28938,92 @@ impl DoctorDatabaseIntegrityProbe {
         } else {
             summary
         }
+    }
+}
+
+#[cfg(test)]
+mod doctor_foreign_key_check_tests {
+    use super::*;
+    use crate::storage::sqlite::FrankenStorage;
+    use tempfile::TempDir;
+
+    // w1b Task B2c (spec v6.1 §10, R3-B2): `quick_check`/`integrity_check`
+    // are page-level b-tree probes -- they never inspect referential
+    // integrity, so a dangling FK reference sails through both as "ok".
+    // `PRAGMA foreign_key_check` is the only pragma that actually scans for
+    // existing FK violations (independent of whether the `foreign_keys`
+    // pragma was on when the orphan was written), which is why it needs its
+    // own doctor-probe wiring rather than piggybacking on integrity_check.
+    #[test]
+    fn doctor_database_integrity_probe_flags_orphan_foreign_key_rows() {
+        let dir = TempDir::new().expect("temp dir");
+        let db_path = dir.path().join("orphan_fk_doctor.db");
+        let storage = FrankenStorage::open(&db_path).expect("open db");
+
+        // Same fixture-construction pattern as
+        // `cleanup_orphan_fk_rows_removes_orphans_and_is_noop_on_clean_db`
+        // (storage/sqlite.rs): with FK enforcement genuinely on for every
+        // ordinary connection, an orphan child row is structurally
+        // unreachable through any normal insert, so the fixture must plant
+        // it via the same narrow test-only bypass B2b introduced for that
+        // purpose.
+        storage
+            .raw()
+            .execute_batch_bypassing_foreign_keys_guard("PRAGMA foreign_keys = OFF")
+            .expect("disable FK for fixture setup");
+        storage
+            .raw()
+            .execute(
+                "INSERT INTO agents(id, slug, name, kind, created_at, updated_at) \
+                 VALUES(1, 'test-agent', 'Test Agent', 'cli', 0, 0)",
+                &[],
+            )
+            .expect("insert agent");
+        storage
+            .raw()
+            .execute(
+                "INSERT INTO messages(id, conversation_id, idx, role, content) \
+                 VALUES(1, 99999, 0, 'user', 'orphan message')",
+                &[],
+            )
+            .expect("insert orphan message referencing a nonexistent conversation");
+        storage
+            .raw()
+            .execute_batch_bypassing_foreign_keys_guard("PRAGMA foreign_keys = ON")
+            .expect("restore FK enforcement");
+        drop(storage);
+
+        // Plan Step 1 calls for "关 FK 插入后重开" -- reopen fresh so the
+        // probe runs against a connection that never itself toggled FK off,
+        // matching how `cass doctor` would actually encounter this database.
+        let reopened = FrankenStorage::open(&db_path).expect("reopen db");
+        let probe = doctor_database_integrity_probe(reopened.raw())
+            .expect("probe should run without error even when it finds violations");
+
+        assert!(
+            !probe.is_ok(),
+            "expected the orphan FK row to fail the doctor integrity probe, got {probe:?}"
+        );
+        assert_eq!(probe.failed_pragma_name(), "foreign_key_check");
+        assert!(
+            probe.diagnostic_summary().contains("messages"),
+            "expected the foreign_key_check diagnostic to name the offending table, got: {}",
+            probe.diagnostic_summary()
+        );
+    }
+
+    #[test]
+    fn doctor_database_integrity_probe_is_healthy_on_clean_db() {
+        let dir = TempDir::new().expect("temp dir");
+        let db_path = dir.path().join("clean_doctor.db");
+        let storage = FrankenStorage::open(&db_path).expect("open db");
+
+        let probe = doctor_database_integrity_probe(storage.raw()).expect("probe should run");
+
+        assert!(
+            probe.is_ok(),
+            "expected a freshly-opened, empty database to pass the doctor integrity probe, got {probe:?}"
+        );
     }
 }
 
@@ -29519,7 +29044,10 @@ fn doctor_anomaly_for_check(name: &str, status: &str, message: &str) -> DoctorAn
             }
         }
         "database" => {
-            if message.contains("quick_check") || message.contains("integrity_check") {
+            if message.contains("quick_check")
+                || message.contains("integrity_check")
+                || message.contains("foreign_key_check")
+            {
                 DoctorAnomaly::ArchiveDbCorrupt
             } else {
                 DoctorAnomaly::ArchiveDbUnreadable
@@ -29527,7 +29055,7 @@ fn doctor_anomaly_for_check(name: &str, status: &str, message: &str) -> DoctorAn
         }
         "database_backup" => DoctorAnomaly::BackupUnverified,
         "safe_auto_archive_rebuild" => DoctorAnomaly::DegradedArchiveRisk,
-        "fts_table" | "index" | "index_sync" => DoctorAnomaly::DerivedLexicalStale,
+        "index" | "index_sync" => DoctorAnomaly::DerivedLexicalStale,
         "semantic_model" => DoctorAnomaly::DerivedSemanticStale,
         "rebuild" => DoctorAnomaly::RepairPreviouslyFailed,
         "repair_failure_marker" => DoctorAnomaly::RepairPreviouslyFailed,
@@ -29612,7 +29140,7 @@ fn doctor_safe_auto_action_for_check(check: &DoctorCheckReport) -> &'static str 
     match check.name.as_str() {
         "data_directory" => "create_missing_cass_data_dir",
         "lock_file" => "remove_stale_legacy_index_lock",
-        "index" | "index_sync" | "fts_table" | "rebuild" => {
+        "index" | "index_sync" | "rebuild" => {
             "rebuild_derived_lexical_index_from_archive_db"
         }
         "semantic_model" => "report_lexical_fallback_without_model_download",
@@ -36429,14 +35957,14 @@ fn doctor_source_inventory_stable_id(
     )
 }
 
-fn doctor_table_columns(conn: &frankensqlite::Connection, table: &str) -> HashSet<String> {
+fn doctor_table_columns(conn: &FrankenConnection, table: &str) -> HashSet<String> {
     if !table.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return HashSet::new();
     }
-    conn.query_map_collect(
+    conn.query_all_map(
         &format!("PRAGMA table_info({table})"),
         &[],
-        |row: &frankensqlite::Row| row.get_typed::<String>(1),
+        |row: &FrankenRow| row.get_typed::<String>(1),
     )
     .unwrap_or_default()
     .into_iter()
@@ -36444,9 +35972,8 @@ fn doctor_table_columns(conn: &frankensqlite::Connection, table: &str) -> HashSe
 }
 
 fn query_doctor_source_inventory_db_rows(
-    conn: &frankensqlite::Connection,
-) -> std::result::Result<Vec<DoctorSourceInventoryDbRow>, frankensqlite::FrankenError> {
-    use frankensqlite::compat::ConnectionExt as _;
+    conn: &FrankenConnection,
+) -> std::result::Result<Vec<DoctorSourceInventoryDbRow>, StorageError> {
 
     let conversation_columns = doctor_table_columns(conn, "conversations");
     if conversation_columns.is_empty() {
@@ -36500,7 +36027,7 @@ fn query_doctor_source_inventory_db_rows(
          ORDER BY 1, 3, 4, 2"
     );
 
-    conn.query_map_collect(&sql, &[], |row: &frankensqlite::Row| {
+    conn.query_all_map(&sql, &[], |row: &FrankenRow| {
         let count: i64 = row.get_typed(5)?;
         Ok(DoctorSourceInventoryDbRow {
             provider: row.get_typed(0)?,
@@ -39910,9 +39437,8 @@ pub(crate) fn run_doctor_archive_normalize_impl(
 }
 
 fn query_doctor_raw_mirror_backfill_candidates(
-    conn: &frankensqlite::Connection,
-) -> std::result::Result<Vec<DoctorRawMirrorBackfillCandidate>, frankensqlite::FrankenError> {
-    use frankensqlite::compat::ConnectionExt as _;
+    conn: &FrankenConnection,
+) -> std::result::Result<Vec<DoctorRawMirrorBackfillCandidate>, StorageError> {
 
     let conversation_columns = doctor_table_columns(conn, "conversations");
     if !conversation_columns.contains("id") {
@@ -39981,7 +39507,7 @@ fn query_doctor_raw_mirror_backfill_candidates(
          ORDER BY c.id"
     );
 
-    conn.query_map_collect(&sql, &[], |row: &frankensqlite::Row| {
+    conn.query_all_map(&sql, &[], |row: &FrankenRow| {
         let message_count: i64 = row.get_typed(7)?;
         Ok(DoctorRawMirrorBackfillCandidate {
             conversation_id: row.get_typed(0)?,
@@ -40547,7 +40073,7 @@ fn collect_doctor_raw_mirror_backfill_report(
                     operation_id: "doctor-raw-mirror-backfill",
                     data_dir,
                     db_path,
-                    index_path: &crate::search::tantivy::expected_index_dir(data_dir),
+                    index_path: &crate::indexer::expected_index_dir(data_dir),
                     plan: None,
                     quarantine_report: None,
                     extra_file_artifacts: &[],
@@ -42029,7 +41555,7 @@ fn doctor_candidate_copy_to_staging(
     })
 }
 
-fn doctor_candidate_table_count(conn: &frankensqlite::Connection, table: &str) -> Option<usize> {
+fn doctor_candidate_table_count(conn: &FrankenConnection, table: &str) -> Option<usize> {
     let table = match table {
         "conversations" | "messages" => table,
         _ => return None,
@@ -42038,7 +41564,7 @@ fn doctor_candidate_table_count(conn: &frankensqlite::Connection, table: &str) -
         conn.query_row_map(
             &format!("SELECT COUNT(*) FROM {table}"),
             &[],
-            |row: &frankensqlite::Row| row.get_typed::<i64>(0),
+            |row: &FrankenRow| row.get_typed::<i64>(0),
         )
         .ok()
         .map(|count| count.max(0) as usize)
@@ -42051,20 +41577,20 @@ fn doctor_candidate_probe_frankensqlite(
     candidate_db_path: &Path,
     candidate_id: &str,
 ) -> Result<(Option<usize>, Option<usize>), String> {
-    let conn = frankensqlite::Connection::open(candidate_db_path.to_string_lossy().as_ref())
+    let conn = FrankenConnection::open_writable(std::path::Path::new(&(candidate_db_path.to_string_lossy().as_ref())), crate::storage::api::Profile::Production)
         .map_err(|err| {
             format!(
-                "failed to open candidate archive DB with frankensqlite at {}: {err}",
+                "failed to open candidate archive DB with the legacy embedded engine at {}: {err}",
                 candidate_db_path.display()
             )
         })?;
-    conn.execute("PRAGMA journal_mode = WAL;").map_err(|err| {
+    conn.execute("PRAGMA journal_mode = WAL;", &[]).map_err(|err| {
         format!(
             "failed to set WAL mode on candidate archive DB {}: {err}",
             candidate_db_path.display()
         )
     })?;
-    conn.execute("PRAGMA busy_timeout = 5000;").map_err(|err| {
+    conn.execute("PRAGMA busy_timeout = 5000;", &[]).map_err(|err| {
         format!(
             "failed to set busy_timeout on candidate archive DB {}: {err}",
             candidate_db_path.display()
@@ -42076,18 +41602,18 @@ fn doctor_candidate_probe_frankensqlite(
             created_at_ms INTEGER NOT NULL,
             schema_version INTEGER NOT NULL
         );",
-    )
+    &[])
     .map_err(|err| {
         format!(
             "failed to create candidate metadata table in {}: {err}",
             candidate_db_path.display()
         )
     })?;
-    conn.execute_compat(
+    conn.execute(
         "INSERT OR REPLACE INTO cass_doctor_candidate_metadata
          (candidate_id, created_at_ms, schema_version)
          VALUES (?1, ?2, ?3)",
-        frankensqlite::params![
+        &crate::storage::api::params![
             candidate_id,
             doctor_now_ms(),
             DOCTOR_CANDIDATE_SCHEMA_VERSION as i64
@@ -42154,18 +41680,20 @@ fn doctor_candidate_live_archive_copy_probe(
             db_path.display()
         )
     })?;
-    let result: std::result::Result<(Option<usize>, Option<usize>), frankensqlite::FrankenError> =
+    let result: std::result::Result<(Option<usize>, Option<usize>), StorageError> =
         (|| {
             let conversations =
                 doctor_candidate_table_count(&conn, "conversations").ok_or_else(|| {
-                    frankensqlite::FrankenError::Internal(
-                        "live archive DB has no readable conversations table".to_string(),
-                    )
+                    StorageError::Other {
+                        code: None,
+                        detail: "live archive DB has no readable conversations table".to_string(),
+                    }
                 })?;
             let messages = doctor_candidate_table_count(&conn, "messages").ok_or_else(|| {
-                frankensqlite::FrankenError::Internal(
-                    "live archive DB has no readable messages table".to_string(),
-                )
+                StorageError::Other {
+                    code: None,
+                    detail: "live archive DB has no readable messages table".to_string(),
+                }
             })?;
             Ok((Some(conversations), Some(messages)))
         })();
@@ -42565,7 +42093,7 @@ fn doctor_candidate_reconstruct_archive_from_raw_mirror(
 ) -> std::result::Result<(usize, usize, Vec<String>, Vec<DoctorFsMutationReceipt>), String> {
     let storage = crate::storage::sqlite::SqliteStorage::open(candidate_db_path).map_err(|err| {
         format!(
-            "failed to initialize reconstructed candidate archive DB {} with frankensqlite storage: {err}",
+            "failed to initialize reconstructed candidate archive DB {} with the legacy embedded engine storage: {err}",
             candidate_db_path.display()
         )
     })?;
@@ -43850,11 +43378,11 @@ fn verify_doctor_backup_record(
                     drop(connection);
                     verification
                         .warnings
-                        .push("frankensqlite read-only probe passed".to_string());
+                        .push("the legacy embedded engine read-only probe passed".to_string());
                 }
                 Err(err) => {
                     verification.blocked_reasons.push(format!(
-                        "frankensqlite read-only probe failed for prior-live backup DB: {err}"
+                        "the legacy embedded engine read-only probe failed for prior-live backup DB: {err}"
                     ));
                 }
             }
@@ -43900,7 +43428,7 @@ fn doctor_restore_plan_payload(
 ) -> (serde_json::Value, String) {
     let live_inventory = doctor_candidate_live_inventory(
         db_path,
-        &crate::search::tantivy::expected_index_dir(data_dir),
+        &crate::indexer::expected_index_dir(data_dir),
     );
     let fingerprint_inputs =
         doctor_restore_fingerprint_inputs(backup_id, verification, &live_inventory);
@@ -44052,7 +43580,7 @@ fn run_doctor_backup_restore_rehearsal(
     let started_at_ms = doctor_now_ms();
     let live_inventory_before = doctor_candidate_live_inventory(
         db_path,
-        &crate::search::tantivy::expected_index_dir(data_dir),
+        &crate::indexer::expected_index_dir(data_dir),
     );
     let rehearsal_id = format!("{}-{backup_id}", started_at_ms);
     let rehearsal_dir = data_dir
@@ -44076,14 +43604,14 @@ fn run_doctor_backup_restore_rehearsal(
             ) {
                 Ok(connection) => drop(connection),
                 Err(err) => blocked_reasons.push(format!(
-                    "restore rehearsal frankensqlite probe failed: {err}"
+                    "restore rehearsal the legacy embedded engine probe failed: {err}"
                 )),
             }
         }
     }
     let live_inventory_after = doctor_candidate_live_inventory(
         db_path,
-        &crate::search::tantivy::expected_index_dir(data_dir),
+        &crate::indexer::expected_index_dir(data_dir),
     );
     let live_untouched = serde_json::to_value(&live_inventory_before).unwrap_or_default()
         == serde_json::to_value(&live_inventory_after).unwrap_or_default();
@@ -44225,7 +43753,7 @@ fn run_doctor_backup_restore_apply(
     requested_plan_fingerprint: &str,
     expected_plan_fingerprint: &str,
 ) -> serde_json::Value {
-    let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+    let index_path = crate::indexer::expected_index_dir(data_dir);
     if requested_plan_fingerprint != expected_plan_fingerprint {
         return doctor_restore_apply_payload_with_receipt(
             data_dir,
@@ -45243,6 +44771,24 @@ fn doctor_archive_export_verify_target(target_root: &Path, data_dir: &Path) -> s
             ) {
                 continue;
             }
+            // w1b Task B9 (2026-08-27, equivalence-gate-caught, control-
+            // plane ruling, same sidecar family as commit 7d325529): the
+            // manifest correctly excludes -shm/-wal sidecars from the
+            // exported asset set (policy: not exportable, vanilla SQLite
+            // engine-managed transient state) -- but this verify function's
+            // own frankensqlite_probe below opens the copied canonical db
+            // readonly to sanity-check it, and that mere open spontaneously
+            // recreates fresh -shm/-wal files right here in the target
+            // directory (reproduced directly: even a read-only connection
+            // to a WAL-mode database creates/touches these two files; see
+            // tests/cli_doctor.rs's doctor_no_write_snapshot and this
+            // file's own write_set_snapshot exemptions for the same root
+            // cause). Without this exemption, every archive-export verify
+            // pass self-inflicts a false-positive "extra_file" issue on the
+            // very files its own probe just created.
+            if relative.ends_with("-shm") || relative.ends_with("-wal") {
+                continue;
+            }
             if !expected_paths.contains(&relative) {
                 issues.push(serde_json::json!({
                     "kind": "extra_file",
@@ -45375,6 +44921,174 @@ fn doctor_archive_export_event_log(
         ),
     );
     doctor_event_log_from_events("embedded_archive_export_events", events)
+}
+
+/// R1-B2/R2-F1: checkpoint the source canonical db before archive export
+/// copies it. `doctor_archive_export_collect_assets` hashes/copies the main
+/// db file directly off disk, and `-wal`/`-shm` sidecars are never exported
+/// (`doctor_asset_policy` refuses `Export` for
+/// `DoctorAssetClass::ArchiveDbSidecar`) -- so any committed transaction
+/// still sitting only in `-wal` was silently excluded from the export
+/// unless the main db file already carries it.
+///
+/// This opens its own short-lived `Profile::Production` writer connection
+/// (a new write point distinct from any long-lived indexer/writer handle
+/// already open on the same path) and fails closed -- refusing the export
+/// rather than falling back to a stale copy -- when the checkpoint cannot
+/// fully drain and truncate the WAL (blocked by an active writer, or any
+/// open/PRAGMA error).
+///
+/// R2-F1: this runs *only* for `Apply`, and only after the caller's
+/// `plan_fingerprint` has already been matched against a plan computed from
+/// the pre-checkpoint state (see `run_doctor_archive_export_impl`) -- never
+/// for `Plan`/dry-run, which must be a true zero-write read of the current
+/// state. WAL-mode commits never touch the main db file's bytes (only a
+/// checkpoint does), so a pre-checkpoint plan's fingerprint is naturally
+/// stable between a Plan call and a later Apply call regardless of
+/// concurrent WAL commits landing in between; this function is the only
+/// thing in this path that is allowed to change those bytes.
+///
+/// Returns an [`DoctorArchiveExportQuiescenceProbe`] opened *after* this
+/// checkpoint has run and its writer connection has closed -- `None` if the
+/// source db does not exist. R2-F2 (probe-connection design, control-plane
+/// re-adjudicated after the original main-db-file-header change-counter
+/// design was disproven by direct experiment: in WAL mode that field tracks
+/// schema changes, not ordinary data commits, so it silently misses the
+/// exact "a writer's ordinary commit gets externally checkpointed during
+/// the copy window" case this exists to catch) uses the probe as the
+/// "quiescent" baseline: `doctor_archive_export_assert_source_quiescent`
+/// re-reads `PRAGMA data_version` on the *same* held connection after the
+/// copy to detect any change.
+fn doctor_archive_export_checkpoint_source(
+    db_path: &Path,
+) -> Result<Option<DoctorArchiveExportQuiescenceProbe>> {
+    if !db_path.exists() {
+        // Nothing to checkpoint yet -- `collect_assets` already tolerates a
+        // missing db_path (fresh/empty data dir).
+        return Ok(None);
+    }
+    let conn = crate::storage::api::Conn::open_writable(db_path, crate::storage::api::Profile::Production)
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "opening archive export source db for pre-export WAL checkpoint {}: {err}",
+                db_path.display()
+            )
+        })?;
+    let checkpoint_result = doctor_archive_export_run_checkpoint(&conn, db_path);
+    let close_result = conn.close().map_err(|err| {
+        anyhow::anyhow!(
+            "closing archive export pre-export checkpoint handle {}: {err}",
+            db_path.display()
+        )
+    });
+    checkpoint_result?;
+    close_result?;
+    doctor_archive_export_open_quiescence_probe(db_path).map(Some)
+}
+
+/// R2-F2: a read-only connection to the archive-export source db, opened
+/// immediately after this export's own pre-copy checkpoint and held open
+/// across the whole copy window, plus the `PRAGMA data_version` value read
+/// at the moment it was opened. `data_version` is SQLite's own "has another
+/// connection changed this database" signal and (unlike the main db file's
+/// header change counter) does reflect ordinary WAL-mode data commits from
+/// other connections -- but its value is only meaningful compared against
+/// an earlier read *on this same connection*, so the connection must stay
+/// open and be reused for the later comparison, not reopened.
+struct DoctorArchiveExportQuiescenceProbe {
+    conn: crate::storage::api::Conn,
+    baseline_data_version: i64,
+}
+
+fn doctor_archive_export_open_quiescence_probe(
+    db_path: &Path,
+) -> Result<DoctorArchiveExportQuiescenceProbe> {
+    let conn = crate::storage::api::Conn::open_read(db_path).map_err(|err| {
+        anyhow::anyhow!(
+            "opening archive export source db read-only quiescence probe {}: {err}",
+            db_path.display()
+        )
+    })?;
+    let baseline_data_version: i64 = conn
+        .query_row_map("PRAGMA data_version;", &[], |row| row.get_typed(0))
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "reading archive export source db data_version {}: {err}",
+                db_path.display()
+            )
+        })?;
+    Ok(DoctorArchiveExportQuiescenceProbe { conn, baseline_data_version })
+}
+
+/// R2-F2: assert the source db has not been written to since `probe` was
+/// opened. Called after the copy has finished but before verify is allowed
+/// to mark the export `verified`/`applied`.
+///
+/// Any committed transaction necessarily makes `-wal` non-empty (WAL-mode
+/// commits only ever append there) *unless* it has also been checkpointed
+/// by then -- checkpointing truncates `-wal` back to empty, so the `-wal`
+/// check alone would miss that case. But checkpointing a commit is itself a
+/// change another connection made to the database, which SQLite's
+/// `data_version` is specifically defined to detect. Together the two
+/// checks cover the whole copy window: still-uncommitted-to-main shows up
+/// as a non-empty `-wal`; already-checkpointed shows up as a moved
+/// `data_version` on `probe`'s held connection.
+fn doctor_archive_export_assert_source_quiescent(
+    db_path: &Path,
+    probe: &DoctorArchiveExportQuiescenceProbe,
+) -> Result<()> {
+    let wal_len = match doctor_sqlite_sidecar_path(db_path, "-wal") {
+        Some(wal_path) => match std::fs::metadata(&wal_path) {
+            Ok(metadata) => metadata.len(),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => 0,
+            Err(err) => {
+                return Err(anyhow::anyhow!(
+                    "checking archive export source -wal for post-copy quiescence {}: {err}",
+                    wal_path.display()
+                ));
+            }
+        },
+        None => 0,
+    };
+    let current_data_version: i64 = probe
+        .conn
+        .query_row_map("PRAGMA data_version;", &[], |row| row.get_typed(0))
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "reading archive export source db data_version for post-copy quiescence {}: {err}",
+                db_path.display()
+            )
+        })?;
+    if wal_len != 0 || current_data_version != probe.baseline_data_version {
+        anyhow::bail!("source database changed during export; retry when writers are idle");
+    }
+    Ok(())
+}
+
+fn doctor_archive_export_run_checkpoint(conn: &crate::storage::api::Conn, db_path: &Path) -> Result<()> {
+    let rows: Vec<(i64, i64, i64)> = conn
+        .query_all_map("PRAGMA wal_checkpoint(TRUNCATE);", &[], |row| {
+            Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?))
+        })
+        .map_err(|err| {
+            anyhow::anyhow!("running pre-export WAL checkpoint {}: {err}", db_path.display())
+        })?;
+    let (busy, log_frames, checkpointed_frames) = *rows.first().ok_or_else(|| {
+        anyhow::anyhow!(
+            "pre-export WAL checkpoint returned no status row: {}",
+            db_path.display()
+        )
+    })?;
+    let left_frames_uncheckpointed = log_frames > 0 && checkpointed_frames < log_frames;
+    if busy > 0 || left_frames_uncheckpointed {
+        anyhow::bail!(
+            "archive export pre-export WAL checkpoint was blocked (busy={busy}, \
+             log_frames={log_frames}, checkpointed_frames={checkpointed_frames}) -- the source \
+             db has an active writer; refusing to export a stale copy: {}",
+            db_path.display()
+        );
+    }
+    Ok(())
 }
 
 /// World-class-doctor pass-2: `cass doctor --ls`. Read-only; lists per-run
@@ -46732,7 +46446,16 @@ fn run_doctor_archive_export_impl(
         return Ok(());
     }
 
-    let (assets, warnings) = doctor_archive_export_collect_assets(&data_dir, &db_path);
+    // R2-F1: compute the plan from the *pre-checkpoint* state, for Plan and
+    // Apply alike. This is the plan a Plan/dry-run caller sees (Plan never
+    // checkpoints -- see below), and it is also what an Apply caller's
+    // `--plan-fingerprint` is matched against, *before* this function does
+    // any writing. `plan`/`plan_fingerprint` stay pinned to this
+    // pre-checkpoint value for the rest of the function (the manifest,
+    // receipt, and response report the plan identity that was approved,
+    // not a value recomputed after Apply's own checkpoint changes the
+    // source's bytes underneath it).
+    let (mut assets, warnings) = doctor_archive_export_collect_assets(&data_dir, &db_path);
     let plan = doctor_archive_export_plan_value(
         request.workflow,
         &data_dir,
@@ -46745,17 +46468,9 @@ fn run_doctor_archive_export_impl(
         .as_str()
         .unwrap_or_default()
         .to_string();
-    let required_bytes = plan["required_bytes"].as_u64().unwrap_or(0);
+    let mut required_bytes = plan["required_bytes"].as_u64().unwrap_or(0);
     let target_available_bytes = doctor_archive_export_target_available_bytes(target_root).ok();
     let mut blocked_reasons = Vec::new();
-    if let Some(available) = target_available_bytes
-        && request.command_mode == DoctorArchiveExportCommandMode::Apply
-        && available < required_bytes
-    {
-        blocked_reasons.push(format!(
-            "target has {available} available bytes but archive export requires {required_bytes}"
-        ));
-    }
     if request.command_mode == DoctorArchiveExportCommandMode::Apply
         && request.plan_fingerprint.as_deref() != Some(plan_fingerprint.as_str())
     {
@@ -46772,10 +46487,50 @@ fn run_doctor_archive_export_impl(
     });
     let mut event_log_path = serde_json::Value::Null;
     let status = if request.command_mode == DoctorArchiveExportCommandMode::Plan {
+        // R2-F1: Plan/dry-run is a true zero-write read -- no checkpoint,
+        // no `open_writable`, nothing beyond the `collect_assets` above.
         "planned"
     } else if !blocked_reasons.is_empty() {
+        // Fingerprint mismatch, discovered before any write -- blocked
+        // with zero writes, exactly like the pre-existing space/mismatch
+        // path below.
         "blocked"
     } else {
+        // R2-F1: fingerprint matched -- now (and only now) checkpoint the
+        // source, then recollect assets against the post-checkpoint main
+        // db file. `doctor_archive_export_copy_assets` verifies each
+        // copied byte against `asset.blake3`, so the assets driving the
+        // copy must reflect what the checkpoint just wrote into the main
+        // file, or every copy would fail its own hash check against the
+        // stale pre-checkpoint hash.
+        let quiescence_probe = doctor_archive_export_checkpoint_source(&db_path).map_err(|err| CliError {
+            code: 4,
+            kind: "io",
+            message: format!("{err:#}"),
+            hint: Some(
+                "Retry once the source database's active writer has finished; archive export \
+                 refuses to copy a stale, uncheckpointed source rather than silently drop data."
+                    .to_string(),
+            ),
+            retryable: true,
+        })?;
+        let (assets_post, _warnings_post) = doctor_archive_export_collect_assets(&data_dir, &db_path);
+        required_bytes = assets_post
+            .iter()
+            .filter(|asset| asset.included)
+            .map(|asset| asset.size_bytes)
+            .sum();
+        assets = assets_post;
+        if let Some(available) = target_available_bytes
+            && available < required_bytes
+        {
+            blocked_reasons.push(format!(
+                "target has {available} available bytes but archive export requires {required_bytes}"
+            ));
+        }
+        if !blocked_reasons.is_empty() {
+            "blocked"
+        } else {
         doctor_forensic_create_private_dir_all(target_root).map_err(|err| CliError {
             code: 4,
             kind: "io",
@@ -46823,6 +46578,27 @@ fn run_doctor_archive_export_impl(
                 hint: Some("Retry after checking target filesystem health.".to_string()),
                 retryable: true,
             })?;
+        // R2-F2: the copy is done but not yet verified -- assert the
+        // source hasn't changed since our own checkpoint (a live writer
+        // mid-commit shows up as a non-empty `-wal`; a completed external
+        // checkpoint bypassing WAL shows up as a moved `data_version` on
+        // the held probe connection) before allowing verify to mark this
+        // `verified`/`applied`. No probe means `db_path` didn't exist at
+        // checkpoint time (fresh/empty data dir) -- nothing to compare.
+        if let Some(probe) = quiescence_probe.as_ref() {
+            doctor_archive_export_assert_source_quiescent(&db_path, probe).map_err(|err| CliError {
+                code: 4,
+                kind: "io",
+                message: format!("{err:#}"),
+                hint: Some(
+                    "Retry once the source database's active writer has finished; archive export \
+                     refuses to mark an export verified when the source changed during the copy \
+                     window."
+                        .to_string(),
+                ),
+                retryable: true,
+            })?;
+        }
         verify_status = doctor_archive_export_verify_target(target_root, &data_dir);
         let event_log = doctor_archive_export_event_log(
             &plan_fingerprint,
@@ -46878,6 +46654,7 @@ fn run_doctor_archive_export_impl(
             "applied"
         } else {
             "blocked"
+        }
         }
     };
 
@@ -48026,7 +47803,7 @@ fn run_doctor_support_bundle_impl(
         });
     }
 
-    let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
+    let index_path = crate::indexer::expected_index_dir(&data_dir);
     let mut artifacts = Vec::new();
     let snapshot = build_doctor_baseline_snapshot(&data_dir, &db_path, &bundle_id, started);
     let redacted_report = snapshot
@@ -48814,7 +48591,7 @@ fn build_doctor_baseline_snapshot(
     baseline_id: &str,
     started: Instant,
 ) -> serde_json::Value {
-    let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+    let index_path = crate::indexer::expected_index_dir(data_dir);
     let sources_path = doctor_sources_config_path(data_dir);
     let config_path = data_dir.join("config.toml");
     let source_inventory = collect_doctor_source_inventory(data_dir, db_path);
@@ -48850,7 +48627,7 @@ fn build_doctor_baseline_snapshot(
         "shm_exists": doctor_sqlite_sidecar_path(db_path, "-shm").is_some_and(|path| path.exists()),
     });
     let derived_generation = serde_json::json!({
-        "lexical_index_exists": crate::search::tantivy::searchable_index_exists(&index_path),
+        "lexical_index_exists": crate::search::lexical_index_health::searchable_index_exists(db_path),
         "lexical_index_path_blake3": doctor_canonical_blake3(
             "doctor-baseline-index-path-v1",
             serde_json::json!({ "index_path": doctor_path_identity_for_fingerprint(&index_path) }),
@@ -53854,7 +53631,6 @@ fn run_doctor_archive_db_post_repair_probe(
     data_dir: &Path,
     db_path: &Path,
 ) -> DoctorPostRepairProbeReport {
-    use frankensqlite::compat::{ConnectionExt, RowExt};
 
     let probe_id = "archive-db-rollback-write-read";
     let target = DoctorPostRepairProbeTarget {
@@ -53894,16 +53670,20 @@ fn run_doctor_archive_db_post_repair_probe(
         }),
     );
 
-    let manager = match crate::storage::sqlite::FrankenConnectionManager::new(
+    // w1b Task B4: this used to go through `FrankenConnectionManager` (a
+    // reader pool + writer-token semaphore) purely to reach a writable
+    // connection past `Conn::open_writable`'s `pub(crate)` visibility --
+    // this module is inside the crate, so it can call it directly. The
+    // semaphore/pool machinery `FrankenConnectionManager` provided was
+    // never actually needed here: this probe opens exactly one connection,
+    // uses it, and closes it.
+    let writer_conn = match crate::storage::api::Conn::open_writable(
         db_path,
-        crate::storage::sqlite::ConnectionManagerConfig {
-            reader_count: 1,
-            max_writers: 1,
-        },
+        crate::storage::api::Profile::Production,
     ) {
-        Ok(manager) => {
-            steps.push("open_production_connection_manager".to_string());
-            manager
+        Ok(conn) => {
+            steps.push("open_writable_connection".to_string());
+            conn
         }
         Err(err) => {
             return doctor_post_repair_probe_report(
@@ -53911,9 +53691,7 @@ fn run_doctor_archive_db_post_repair_probe(
                 doctor_post_repair_probe_outcome(
                     "fail",
                     doctor_post_repair_probe_duration_ms(start),
-                    Some(format!(
-                        "failed to open archive DB through production frankensqlite manager: {err}"
-                    )),
+                    Some(format!("failed to open archive DB writer: {err}")),
                     true,
                     true,
                     false,
@@ -53922,29 +53700,8 @@ fn run_doctor_archive_db_post_repair_probe(
             );
         }
     };
-
-    let writer = match manager.writer() {
-        Ok(writer) => {
-            steps.push("acquire_production_writer".to_string());
-            writer
-        }
-        Err(err) => {
-            return doctor_post_repair_probe_report(
-                target,
-                doctor_post_repair_probe_outcome(
-                    "fail",
-                    doctor_post_repair_probe_duration_ms(start),
-                    Some(format!("failed to acquire archive DB writer: {err}")),
-                    true,
-                    true,
-                    false,
-                    steps,
-                ),
-            );
-        }
-    };
-    let conn = writer.storage().raw();
-    if let Err(err) = conn.execute("BEGIN;") {
+    let conn = &writer_conn;
+    if let Err(err) = conn.execute("BEGIN;", &[]) {
         return doctor_post_repair_probe_report(
             target,
             doctor_post_repair_probe_outcome(
@@ -53966,8 +53723,8 @@ fn run_doctor_archive_db_post_repair_probe(
             value TEXT NOT NULL
         );"
     );
-    if let Err(err) = conn.execute(&create_sql) {
-        let _ = conn.execute("ROLLBACK;");
+    if let Err(err) = conn.execute(&create_sql, &[]) {
+        let _ = conn.execute("ROLLBACK;", &[]);
         return doctor_post_repair_probe_report(
             target,
             doctor_post_repair_probe_outcome(
@@ -53984,11 +53741,11 @@ fn run_doctor_archive_db_post_repair_probe(
     steps.push("create_doctor_owned_probe_table".to_string());
 
     let insert_sql = format!("INSERT INTO {table_name} (probe_id, value) VALUES (?1, ?2)");
-    if let Err(err) = conn.execute_compat(
+    if let Err(err) = conn.execute(
         &insert_sql,
-        frankensqlite::params![probe_id, sentinel_value.as_str()],
+        &crate::storage::api::params![probe_id, sentinel_value.as_str()],
     ) {
-        let _ = conn.execute("ROLLBACK;");
+        let _ = conn.execute("ROLLBACK;", &[]);
         return doctor_post_repair_probe_report(
             target,
             doctor_post_repair_probe_outcome(
@@ -54009,15 +53766,15 @@ fn run_doctor_archive_db_post_repair_probe(
     let select_sql = format!("SELECT value FROM {table_name} WHERE probe_id = ?1");
     let mut read_back = match conn.query_row_map(
         &select_sql,
-        frankensqlite::params![probe_id],
-        |row: &frankensqlite::Row| row.get_typed::<String>(0),
+        &crate::storage::api::params![probe_id],
+        |row: &FrankenRow| row.get_typed::<String>(0),
     ) {
         Ok(value) => {
             steps.push("read_probe_sentinel".to_string());
             value
         }
         Err(err) => {
-            let _ = conn.execute("ROLLBACK;");
+            let _ = conn.execute("ROLLBACK;", &[]);
             return doctor_post_repair_probe_report(
                 target,
                 doctor_post_repair_probe_outcome(
@@ -54038,7 +53795,7 @@ fn run_doctor_archive_db_post_repair_probe(
         read_back.push_str("-forced-mismatch");
     }
     if read_back != sentinel_value {
-        let _ = conn.execute("ROLLBACK;");
+        let _ = conn.execute("ROLLBACK;", &[]);
         return doctor_post_repair_probe_report(
             target,
             doctor_post_repair_probe_outcome(
@@ -54056,7 +53813,7 @@ fn run_doctor_archive_db_post_repair_probe(
     }
 
     if fault.as_deref() == Some("archive_db_rollback_failure") {
-        let _ = conn.execute("ROLLBACK;");
+        let _ = conn.execute("ROLLBACK;", &[]);
         return doctor_post_repair_probe_report(
             target,
             doctor_post_repair_probe_outcome(
@@ -54070,7 +53827,7 @@ fn run_doctor_archive_db_post_repair_probe(
             ),
         );
     }
-    if let Err(err) = conn.execute("ROLLBACK;") {
+    if let Err(err) = conn.execute("ROLLBACK;", &[]) {
         return doctor_post_repair_probe_report(
             target,
             doctor_post_repair_probe_outcome(
@@ -54086,8 +53843,7 @@ fn run_doctor_archive_db_post_repair_probe(
     }
     let rollback_confirmed = true;
     steps.push("rollback_probe_transaction".to_string());
-    drop(writer);
-    drop(manager);
+    drop(writer_conn);
 
     let conn = match open_franken_cli_read_db(
         db_path.to_path_buf(),
@@ -54116,8 +53872,8 @@ fn run_doctor_archive_db_post_repair_probe(
     let durable_table_count: i64 = conn
         .query_row_map(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
-            frankensqlite::params![table_name.as_str()],
-            |row: &frankensqlite::Row| row.get_typed(0),
+            &crate::storage::api::params![table_name.as_str()],
+            |row: &FrankenRow| row.get_typed(0),
         )
         .unwrap_or(1);
     let _ = close_franken_cli_read_db(conn, db_path, "doctor post-repair probe");
@@ -54164,7 +53920,9 @@ fn run_doctor_lexical_post_repair_probe(
     };
     let start = Instant::now();
     let mut steps = Vec::new();
-    if !crate::search::tantivy::searchable_index_exists(index_path) {
+    // W2-6 Task1: reseated onto the lex_docs/fts_lex SQLite domain.
+    let db_path = data_dir.join("agent_search.db");
+    if !crate::search::lexical_index_health::searchable_index_exists(&db_path) {
         return doctor_post_repair_probe_report(
             target,
             doctor_post_repair_probe_outcome(
@@ -54199,7 +53957,9 @@ fn run_doctor_lexical_post_repair_probe(
         );
     }
     steps.push("detect_searchable_index".to_string());
-    if let Err(err) = crate::search::tantivy::validate_searchable_index_contract(index_path) {
+    // W2-6 Task1: doctor's post-repair probe is an explicit, infrequent
+    // scenario -- full tier.
+    if let Err(err) = crate::search::lexical_index_health::validate_searchable_index_contract_full(&db_path) {
         return doctor_post_repair_probe_report(
             target,
             doctor_post_repair_probe_outcome(
@@ -54216,7 +53976,7 @@ fn run_doctor_lexical_post_repair_probe(
         );
     }
     steps.push("open_search_reader".to_string());
-    match crate::search::tantivy::searchable_index_summary(index_path) {
+    match crate::search::lexical_index_health::searchable_index_summary(&db_path) {
         Ok(summary) => {
             steps.push("read_generation_summary".to_string());
             let mut report = doctor_post_repair_probe_report(
@@ -59437,8 +59197,8 @@ mod doctor_asset_taxonomy_tests {
         let durable_probe_tables: i64 = conn
             .query_row_map(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name LIKE 'cass_doctor_probe_%'",
-                frankensqlite::params![],
-                |row: &frankensqlite::Row| row.get_typed(0),
+                &[],
+                |row: &FrankenRow| row.get_typed(0),
             )
             .expect("count probe tables");
         let _ = close_franken_cli_read_db(conn, &db_path, "post-repair probe test");
@@ -59465,7 +59225,7 @@ mod doctor_asset_taxonomy_tests {
                 .failure_reason
                 .as_deref()
                 .unwrap_or_default()
-                .contains("production frankensqlite manager"),
+                .contains("failed to open archive DB writer"),
             "failure should name production open path: {probe:#?}"
         );
     }
@@ -59475,7 +59235,7 @@ mod doctor_asset_taxonomy_tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let data_dir = temp.path().join("cass-data");
         let db_path = data_dir.join("agent_search.db");
-        let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
+        let index_path = crate::indexer::expected_index_dir(&data_dir);
         std::fs::create_dir_all(&db_path).expect("create unopenable db path directory");
         let readiness_snapshot = serde_json::json!({
             "semantic": {
@@ -63386,17 +63146,17 @@ mod doctor_asset_taxonomy_tests {
     }
 
     fn seed_candidate_source_db(db_path: &Path) {
-        let conn = frankensqlite::Connection::open(db_path.to_string_lossy().as_ref())
+        let conn = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().as_ref())), crate::storage::api::Profile::Production)
             .expect("open source db");
-        conn.execute("PRAGMA journal_mode = WAL;")
+        conn.execute("PRAGMA journal_mode = WAL;", &[])
             .expect("set wal mode");
-        conn.execute("CREATE TABLE conversations (id INTEGER PRIMARY KEY);")
+        conn.execute("CREATE TABLE conversations (id INTEGER PRIMARY KEY);", &[])
             .expect("create conversations");
-        conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY);")
+        conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY);", &[])
             .expect("create messages");
-        conn.execute("INSERT INTO conversations (id) VALUES (1);")
+        conn.execute("INSERT INTO conversations (id) VALUES (1);", &[])
             .expect("insert conversation");
-        conn.execute("INSERT INTO messages (id) VALUES (1);")
+        conn.execute("INSERT INTO messages (id) VALUES (1);", &[])
             .expect("insert message");
     }
 
@@ -68301,6 +68061,245 @@ mod doctor_archive_export_path_safety_tests {
 }
 
 #[cfg(all(test, unix))]
+mod doctor_archive_export_quiescence_tests {
+    use super::*;
+
+    /// A fully checkpointed, quiescent source db with one committed row.
+    fn quiescent_fixture(db_path: &Path) {
+        std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
+        let conn = crate::storage::api::Conn::open_writable(
+            db_path,
+            crate::storage::api::Profile::Production,
+        )
+        .expect("open quiescence fixture writer");
+        conn.execute("CREATE TABLE quiescence_probe(marker TEXT NOT NULL)", &[])
+            .expect("create quiescence probe table");
+        conn.execute(
+            "INSERT INTO quiescence_probe(marker) VALUES (?1)",
+            &crate::storage::api::params!["seed"],
+        )
+        .expect("seed quiescence probe row");
+        conn.query_all_map("PRAGMA wal_checkpoint(TRUNCATE);", &[], |row| {
+            row.get_value(0)
+        })
+        .expect("checkpoint quiescence fixture");
+        conn.close().expect("close quiescence fixture writer");
+    }
+
+    #[test]
+    fn archive_export_assert_source_quiescent_passes_when_nothing_changed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("agent_search.db");
+        quiescent_fixture(&db_path);
+        let probe =
+            doctor_archive_export_open_quiescence_probe(&db_path).expect("open quiescence probe");
+
+        doctor_archive_export_assert_source_quiescent(&db_path, &probe)
+            .expect("an untouched source must be reported quiescent");
+    }
+
+    #[test]
+    fn archive_export_assert_source_quiescent_fails_when_wal_is_nonempty() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("agent_search.db");
+        quiescent_fixture(&db_path);
+        let probe =
+            doctor_archive_export_open_quiescence_probe(&db_path).expect("open quiescence probe");
+
+        // A live writer mid-commit: open a second connection and leave a
+        // committed transaction sitting only in -wal (don't checkpoint,
+        // don't close -- closing the last connection would auto-checkpoint
+        // and defeat the fixture).
+        let live_writer = crate::storage::api::Conn::open_writable(
+            &db_path,
+            crate::storage::api::Profile::Production,
+        )
+        .expect("open live writer");
+        live_writer
+            .execute(
+                "INSERT INTO quiescence_probe(marker) VALUES (?1)",
+                &crate::storage::api::params!["live-writer"],
+            )
+            .expect("commit a row that stays only in -wal");
+
+        let err = doctor_archive_export_assert_source_quiescent(&db_path, &probe)
+            .expect_err("a non-empty -wal must fail the quiescence assertion");
+        assert!(
+            format!("{err:#}")
+                .contains("source database changed during export; retry when writers are idle"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn archive_export_assert_source_quiescent_fails_when_the_data_version_moved() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("agent_search.db");
+        quiescent_fixture(&db_path);
+        let probe =
+            doctor_archive_export_open_quiescence_probe(&db_path).expect("open quiescence probe");
+
+        // An external checkpoint: another connection commits and then
+        // checkpoints (TRUNCATE), which truncates -wal back to empty -- the
+        // -wal check alone would miss this -- but bumps `data_version` as
+        // read back on `probe`'s still-open connection, since SQLite
+        // defines that pragma to detect exactly this: another connection
+        // changed the database (verified empirically: the main db file's
+        // header change counter this replaced does *not* move for this
+        // scenario -- only for schema changes -- which is why R2-F2 was
+        // re-adjudicated onto `data_version`).
+        let external_checkpointer = crate::storage::api::Conn::open_writable(
+            &db_path,
+            crate::storage::api::Profile::Production,
+        )
+        .expect("open external checkpointer");
+        external_checkpointer
+            .execute(
+                "INSERT INTO quiescence_probe(marker) VALUES (?1)",
+                &crate::storage::api::params!["external-checkpoint"],
+            )
+            .expect("commit a row ahead of the external checkpoint");
+        external_checkpointer
+            .query_all_map("PRAGMA wal_checkpoint(TRUNCATE);", &[], |row| {
+                row.get_value(0)
+            })
+            .expect("run external checkpoint");
+        external_checkpointer
+            .close()
+            .expect("close external checkpointer");
+
+        let err = doctor_archive_export_assert_source_quiescent(&db_path, &probe).expect_err(
+            "a moved data_version must fail the quiescence assertion even with an empty -wal",
+        );
+        assert!(
+            format!("{err:#}")
+                .contains("source database changed during export; retry when writers are idle"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    /// R2-F2 full-chain: races a real writer against
+    /// `run_doctor_archive_export_impl`'s Apply copy window -- as soon as
+    /// this Apply's own checkpoint truncates `-wal` back to empty, a
+    /// background thread commits a fresh transaction landing only in
+    /// `-wal`. The R2-F2 post-copy, pre-verify quiescence assertion must
+    /// catch this and fail closed rather than mark the export
+    /// verified/applied over a source that changed mid-copy.
+    #[test]
+    fn archive_export_apply_fails_closed_when_source_writer_commits_during_the_copy_window() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let target_root = temp.path().join("export");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        let db_path = data_dir.join("agent_search.db");
+        quiescent_fixture(&db_path);
+
+        // Widen the real copy window: give `doctor_archive_export_copy_assets`
+        // enough genuine file I/O to do that the racer thread has a
+        // realistic chance to land its commit before the post-copy
+        // quiescence check -- a single-row fixture's copy is fast enough
+        // that the race is not reliably winnable otherwise.
+        let padding_dir = data_dir.join("raw-mirror/v1/blobs");
+        std::fs::create_dir_all(&padding_dir).expect("create padding dir");
+        for i in 0..200 {
+            std::fs::write(padding_dir.join(format!("pad-{i:04}.bin")), vec![7_u8; 8192])
+                .expect("write padding asset");
+        }
+
+        let (assets, warnings) = doctor_archive_export_collect_assets(&data_dir, &db_path);
+        let plan = doctor_archive_export_plan_value(
+            DoctorArchiveExportWorkflow::Export,
+            &data_dir,
+            &db_path,
+            &target_root,
+            &assets,
+            &warnings,
+        );
+        let plan_fingerprint = plan["plan_fingerprint"]
+            .as_str()
+            .expect("fingerprint")
+            .to_string();
+
+        // Pre-open the racer's writer connection before the race starts, so
+        // the race is just "wait for the signal, then INSERT on an
+        // already-open connection" -- not also paying SQLite
+        // connection-open latency after the signal, which would make the
+        // race unrealistically hard to win on a fast machine. `crate::
+        // storage::api::Conn` isn't `Send` (it boxes a `dyn StorageBackend`),
+        // so this opens straight through `rusqlite` -- fine for a plain
+        // autocommit `INSERT`, and only this test needs `Send`.
+        let racer_conn = rusqlite::Connection::open(&db_path).expect("pre-open racer connection");
+        // R2-F2's own checkpoint truncates -wal to 0 *before* it opens the
+        // quiescence probe connection and reads its baseline `data_version`
+        // (see `doctor_archive_export_checkpoint_source`) -- so polling on
+        // "-wal is empty" fires too early: a commit landing right then races
+        // the probe's own open+baseline-read and can land *before* the
+        // baseline is captured, silently becoming part of the baseline
+        // instead of a detected post-baseline change. `target_root` is only
+        // created (`doctor_forensic_create_private_dir_all`) after the probe
+        // has already opened and captured its baseline, so it's the
+        // earliest externally observable signal that's guaranteed to be
+        // strictly after the baseline -- polling on it gives the racer the
+        // whole rest of the copy window (asset copy + manifest write) to
+        // land its commit, which is the window R2-F2 actually needs to
+        // defend.
+        let racer_target_root = target_root.clone();
+        let racer = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if racer_target_root.exists() {
+                    break;
+                }
+                if std::time::Instant::now() > deadline {
+                    return false;
+                }
+                // Deliberately a tight spin, not `yield_now()` -- on this
+                // box's 20 cores the poll needs to react promptly to the
+                // signal to leave real time inside the copy window; a
+                // cooperative yield adds scheduler-timeslice-scale latency.
+            }
+            racer_conn
+                .execute(
+                    "INSERT INTO quiescence_probe(marker) VALUES (?1)",
+                    rusqlite::params!["race"],
+                )
+                .is_ok()
+        });
+
+        let outcome = run_doctor_archive_export_impl(
+            DoctorArchiveExportRequest {
+                data_dir_override: Some(data_dir.clone()),
+                db_override: None,
+                output_format: None,
+                workflow: DoctorArchiveExportWorkflow::Export,
+                command_mode: DoctorArchiveExportCommandMode::Apply,
+                target_root: Some(target_root.clone()),
+                dry_run: false,
+                yes: true,
+                plan_fingerprint: Some(plan_fingerprint),
+                backup_id: None,
+                force_rebuild: false,
+                allow_repeated_repair: false,
+            },
+            WrapConfig::new(None, true),
+        );
+
+        let raced = racer.join().expect("racer thread panicked");
+        assert!(
+            raced,
+            "race thread never landed its commit inside the copy window; test is inconclusive"
+        );
+        let err = outcome.expect_err(
+            "archive export apply must fail closed when the source changes during the copy window",
+        );
+        assert!(
+            err.message.contains("source database changed during export"),
+            "unexpected error: {err:?}"
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
 mod doctor_support_bundle_path_safety_tests {
     use super::*;
 
@@ -69854,7 +69853,9 @@ fn gather_onboarding_observation(
     // "Existing indexed DB" means a DB that actually carries content, so an
     // empty/just-created DB still routes the user to a first index.
     let indexed_conversation_count = if db_path.exists() {
-        crate::storage::sqlite::FrankenStorage::open(db_path)
+        // w1b Task B8 (d16, open-consumer audit): pure read (onboarding
+        // observation), switched to the read-only open.
+        crate::storage::sqlite::FrankenStorage::open_readonly(db_path)
             .ok()
             .and_then(|storage| storage.total_conversation_count().ok())
             .unwrap_or(0) as u64
@@ -70259,7 +70260,7 @@ fn gather_projection_signals_from_state(
         ..Default::default()
     };
 
-    // frankensqlite storage: a non-retryable open failure whose error text names
+    // the legacy embedded engine storage: a non-retryable open failure whose error text names
     // a storage-engine fault (corruption / OpenRead / bad format) — not a
     // permission/not-found/busy condition, which are host/transient, not storage
     // corruption.
@@ -70625,7 +70626,7 @@ fn run_status(
             if status_budget.is_healthy() {
                 let quarantine_report = collect_diag_quarantine_report(
                     &data_dir,
-                    &crate::search::tantivy::expected_index_dir(&data_dir),
+                    &crate::indexer::expected_index_dir(&data_dir),
                 );
                 let coverage_risk = doctor_fast_coverage_risk_unchecked(db_exists);
                 let sources_path = doctor_sources_config_path(&data_dir);
@@ -70714,6 +70715,10 @@ fn run_status(
             "rebuild": state.get("rebuild").cloned().unwrap_or(serde_json::Value::Null),
             "rebuild_progress": rebuild_progress_summary_json(&state),
             "semantic": state.get("semantic").cloned().unwrap_or(serde_json::Value::Null),
+            // W3-4 Step2-2 (task book #62): pass the parallel DB-vector-
+            // domain status section through from `state_meta_json_inner`
+            // the same way "semantic" itself is passed through above.
+            "db_vector_domain": state.get("db_vector_domain").cloned().unwrap_or(serde_json::Value::Null),
             "ingest_quarantine": state.get("ingest_quarantine").cloned().unwrap_or(serde_json::Value::Null),
             "policy_registry": policy_registry,
             "topology_budget": topology_budget,
@@ -71734,19 +71739,15 @@ fn run_health(
 
 fn rebuild_tantivy_from_db(
     db_path: &Path,
-    data_dir: &Path,
-    total_conversations: usize,
     progress: Option<std::sync::Arc<indexer::IndexingProgress>>,
 ) -> CliResult<usize> {
-    indexer::rebuild_tantivy_from_db(db_path, data_dir, total_conversations, progress)
-        .map(|outcome| outcome.indexed_docs)
-        .map_err(|e| CliError {
-            code: 5,
-            kind: CliErrorKind::Doctor.kind_str(),
-            message: format!("failed to rebuild Tantivy index from database: {e}"),
-            hint: None,
-            retryable: true,
-        })
+    indexer::rebuild_lex_domain_from_db_full(db_path, progress).map_err(|e| CliError {
+        code: 5,
+        kind: CliErrorKind::Doctor.kind_str(),
+        message: format!("failed to rebuild lexical search index from database: {e}"),
+        hint: None,
+        retryable: true,
+    })
 }
 
 fn wait_with_progress<T>(
@@ -71945,104 +71946,6 @@ fn wait_with_progress<T>(
     result
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum DoctorFtsTableState {
-    QueryableViaFrankensqlite,
-    Missing { frankensqlite_error: String },
-}
-
-fn probe_doctor_fts_table(conn: &frankensqlite::Connection) -> DoctorFtsTableState {
-    match conn.query("SELECT rowid FROM fts_messages LIMIT 1;") {
-        Ok(_) => DoctorFtsTableState::QueryableViaFrankensqlite,
-        Err(frankensqlite_error) => DoctorFtsTableState::Missing {
-            frankensqlite_error: frankensqlite_error.to_string(),
-        },
-    }
-}
-
-#[cfg(test)]
-mod doctor_fts_tests {
-    use super::*;
-
-    fn create_search_schema(
-        conn: &frankensqlite::Connection,
-    ) -> Result<(), frankensqlite::FrankenError> {
-        conn.execute_batch(
-            "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
-             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
-             CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                agent_id INTEGER,
-                workspace_id INTEGER,
-                source_id TEXT,
-                origin_host TEXT,
-                title TEXT,
-                source_path TEXT
-             );
-             CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER,
-                idx INTEGER,
-                content TEXT,
-                created_at INTEGER
-             );",
-        )
-    }
-
-    #[test]
-    fn doctor_fts_probe_accepts_frankensqlite_fts_table() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let temp_dir = tempfile::TempDir::new()?;
-        let db_path = temp_dir.path().join("legacy-fts.db");
-
-        let conn = frankensqlite::Connection::open(db_path.to_string_lossy().as_ref())?;
-        create_search_schema(&conn)?;
-        conn.execute_batch(
-            "CREATE VIRTUAL TABLE fts_messages USING fts5(
-                content,
-                title,
-                agent,
-                workspace,
-                source_path,
-                created_at UNINDEXED,
-                message_id UNINDEXED,
-                tokenize='porter'
-             );
-             INSERT INTO agents(id, slug) VALUES(1, 'codex');
-             INSERT INTO workspaces(id, path) VALUES(1, '/ws');
-             INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
-             VALUES(1, 1, 1, 'local', NULL, 'retro', '/tmp/retro.jsonl');
-             INSERT INTO messages(id, conversation_id, idx, content, created_at)
-             VALUES(7, 1, 0, 'retro investigation', 42);
-             INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at, message_id)
-             VALUES(7, 'retro investigation', 'retro', 'codex', '/ws', '/tmp/retro.jsonl', 42, '7');",
-        )?;
-        let state = probe_doctor_fts_table(&conn);
-        assert!(
-            matches!(state, DoctorFtsTableState::QueryableViaFrankensqlite),
-            "frankensqlite FTS table should be accepted by doctor: {state:?}"
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn doctor_fts_probe_reports_missing_fts_table() -> Result<(), Box<dyn std::error::Error>> {
-        let temp_dir = tempfile::TempDir::new()?;
-        let db_path = temp_dir.path().join("missing-fts.db");
-
-        let conn = frankensqlite::Connection::open(db_path.to_string_lossy().as_ref())?;
-        create_search_schema(&conn)?;
-        let state = probe_doctor_fts_table(&conn);
-        assert!(
-            matches!(state, DoctorFtsTableState::Missing { .. }),
-            "missing FTS table should be reported as missing: {state:?}"
-        );
-
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod cli_read_db_tests {
     use super::*;
@@ -72087,7 +71990,7 @@ mod cli_read_db_tests {
         let conn = open_franken_analytics_db(&data_dir, None).expect("open readonly analytics db");
 
         let err = conn
-            .execute("CREATE TABLE cli_readonly_probe(id INTEGER PRIMARY KEY);")
+            .execute("CREATE TABLE cli_readonly_probe(id INTEGER PRIMARY KEY);", &[])
             .expect_err("analytics reader must not accept writes");
         let message = err.to_string().to_lowercase();
         assert!(
@@ -72118,34 +72021,51 @@ mod cli_read_db_tests {
 
     #[test]
     fn cli_read_db_refuses_corrupt_file_without_writable_fallback() {
+        // w1b Task B9 (2026-08-27, equivalence-gate-caught, control-plane
+        // ruling, same "problem C" family as commit 6ab417b3): franken's
+        // legacy engine validated the SQLite header eagerly, at connection-
+        // open time. Real SQLite (via rusqlite, now backing
+        // `open_franken_cli_read_db` through `storage::api::Conn`) validates
+        // lazily -- `Conn::open_read`'s `Profile::ReadOnly` pragma plan sets
+        // no `journal_mode` (a read-only connection can't change it anyway),
+        // so the only PRAGMA touched at open time is `foreign_keys`, which
+        // is a connection-level setting that never reads the file's page-1
+        // header. Reproduced directly with the underlying `rusqlite` crate
+        // against a copy of this fixture: `Connection::open_with_flags(...,
+        // SQLITE_OPEN_READ_ONLY)` succeeds outright, and even `PRAGMA
+        // foreign_keys;` returns cleanly; only a real schema-touching query
+        // (`SELECT COUNT(*) FROM sqlite_master`) surfaces
+        // `SqliteFailure(NotADatabase, "file is not a database")`. This is a
+        // permanent, structural engine difference, not a regression --
+        // rewritten to assert corruption at the point real SQLite actually
+        // exposes it, pinning both ends of the behavior shift so a future
+        // drift back to eager validation would be noticed either way.
         let temp = TempDir::new().expect("tempdir");
         let db_path = temp.path().join("agent_search.db");
         let corrupt_bytes = b"not a sqlite database";
         std::fs::write(&db_path, corrupt_bytes).expect("write corrupt db bytes");
 
-        let err = match open_franken_cli_read_db(
+        let conn = open_franken_cli_read_db(
             db_path.clone(),
             "corrupt preservation test",
             Duration::from_millis(250),
-        ) {
-            Ok(_) => panic!("corrupt db should not open"),
-            Err(err) => err,
-        };
+        )
+        .expect("vanilla SQLite opens a readonly connection lazily even against a corrupt file");
 
-        assert_eq!(err.kind, CliErrorKind::DbOpen.kind_str());
+        let query_err = conn
+            .query_row_map("SELECT COUNT(*) FROM sqlite_master", &[], |row| {
+                row.get_typed::<i64>(0)
+            })
+            .expect_err("the first real schema-touching query must surface the corruption");
         assert!(
-            err.message.contains("raw readonly open failed"),
-            "error should report the readonly failure chain: {}",
-            err.message
+            matches!(query_err, StorageError::Corrupt { .. }),
+            "corruption must surface as StorageError::Corrupt, got: {query_err:?}"
         );
-        assert!(
-            !err.message.contains("raw open failed"),
-            "read helper must not use a writable fallback: {}",
-            err.message
-        );
+
         assert_eq!(
-            std::fs::read(&db_path).expect("read db after failed open"),
-            corrupt_bytes
+            std::fs::read(&db_path).expect("read db after open+query"),
+            corrupt_bytes,
+            "a readonly connection (open or queried) must never write back to a corrupt file"
         );
     }
 
@@ -72169,6 +72089,19 @@ mod cli_read_db_tests {
 
     #[test]
     fn status_state_probes_large_regular_db_instead_of_trusting_index_mtime() {
+        // w1b Task B9 (2026-08-27, equivalence-gate-caught, control-plane
+        // ruling, same "problem C" family as commit 6ab417b3 and
+        // cli_read_db_refuses_corrupt_file_without_writable_fallback just
+        // above): this test's own sparse, all-zero placeholder is not a
+        // valid SQLite header either, and `probe_state_db_modes` opens it
+        // through the same `open_franken_cli_read_db` -> `Conn::open_read`
+        // path proven lazy there -- open succeeds regardless of the
+        // (invalid) header content; only a real query would fail. What
+        // this test actually guards -- confirmed unaffected by that shift
+        // -- is that a large "regular" db file still gets a real open
+        // attempt (`open_skipped=false`) rather than being short-circuited
+        // by the size heuristic into trusting the lexical index's mtime
+        // instead; that assertion is untouched below.
         let temp = TempDir::new().expect("tempdir");
         let db_path = temp.path().join("agent_search.db");
         let file = std::fs::File::create(&db_path).expect("create sparse db placeholder");
@@ -72185,17 +72118,18 @@ mod cli_read_db_tests {
         assert_eq!(database.get("exists").and_then(|v| v.as_bool()), Some(true));
         assert_eq!(
             database.get("open_skipped").and_then(|v| v.as_bool()),
-            Some(false)
+            Some(false),
+            "a large regular db must still get a real open attempt, not a size-based skip"
         );
         assert_eq!(
             database.get("opened").and_then(|v| v.as_bool()),
-            Some(false)
+            Some(true),
+            "vanilla SQLite opens a readonly connection lazily even against an invalid header"
         );
-        assert!(
-            database
-                .get("open_error")
-                .and_then(|v| v.as_str())
-                .is_some_and(|err| !err.is_empty())
+        assert_eq!(
+            database.get("open_error").and_then(|v| v.as_str()),
+            None,
+            "lazy open reports no open_error; corruption (if any) only surfaces on a real query"
         );
     }
 
@@ -72480,7 +72414,7 @@ mod cli_read_db_tests {
     }
 
     /// Regression for CASS #192: when `total_counts_exact` is false the code
-    /// previously reopened the live DB through frankensqlite to collect
+    /// previously reopened the live DB through the legacy embedded engine to collect
     /// `SELECT COUNT(*)` values, which triggered `Connection::open ->
     /// reload_memdb_from_pager_with_mode` and advanced the DB fingerprint past
     /// the just-written lexical checkpoint. The post-#192 path derives counts
@@ -72604,8 +72538,6 @@ mod cli_read_db_tests {
             "CASS_TANTIVY_REBUILD_PIPELINE_MAX_MESSAGE_BYTES_IN_FLIGHT",
             "888888",
         );
-        let _writer_threads = set_env("CASS_TANTIVY_MAX_WRITER_THREADS", "2");
-        let _shard_builders = set_env("CASS_TANTIVY_REBUILD_STAGED_SHARD_BUILDERS", "4");
         let _merge_workers = set_env("CASS_TANTIVY_REBUILD_STAGED_MERGE_WORKERS", "2");
 
         let (temp, db_path) = seed_cli_db();
@@ -72634,14 +72566,12 @@ mod cli_read_db_tests {
             pipeline["controller_loadavg_low_watermark_1m"].as_f64(),
             Some(6.25)
         );
-        assert_eq!(
-            pipeline["tantivy_writer_threads"].as_u64(),
-            Some(available_parallelism.min(2))
-        );
-        assert_eq!(
-            pipeline["staged_shard_builders"].as_u64(),
-            Some(crate::indexer::responsiveness::effective_worker_count(4).max(1) as u64)
-        );
+        // W2-6 Task丙①: CASS_TANTIVY_MAX_WRITER_THREADS and
+        // CASS_TANTIVY_REBUILD_STAGED_SHARD_BUILDERS no longer drive
+        // anything (retired, chain-of-custody audit confirmed no live
+        // consumer) -- both fields are now fixed at 0 regardless of env.
+        assert_eq!(pipeline["tantivy_writer_threads"].as_u64(), Some(0));
+        assert_eq!(pipeline["staged_shard_builders"].as_u64(), Some(0));
         assert_eq!(
             pipeline["staged_merge_workers"].as_u64(),
             Some(crate::indexer::responsiveness::effective_worker_count(2).max(1) as u64)
@@ -72689,183 +72619,25 @@ mod cli_read_db_tests {
     }
 
     #[test]
-    fn state_meta_json_reports_active_rebuild_pipeline_runtime() {
-        let (temp, db_path) = seed_cli_db();
-        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
-        std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
-        std::fs::write(
-            index_path.join(".lexical-rebuild-state.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "version": 2,
-                "schema_hash": crate::search::tantivy::SCHEMA_HASH,
-                "db": {
-                    "db_path": db_path.display().to_string(),
-                    "total_conversations": 10,
-                    "storage_fingerprint": "10:42:0:0"
-                },
-                "page_size": crate::indexer::LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
-                "committed_offset": 4,
-                "committed_conversation_id": 4,
-                "processed_conversations": 4,
-                "indexed_docs": 20,
-                "committed_meta_fingerprint": null,
-                "pending": null,
-                "completed": false,
-                "updated_at_ms": 1_733_000_123_000_i64,
-                "runtime": {
-                    "queue_depth": 3,
-                    "inflight_message_bytes": 65_536,
-                    "max_message_bytes_in_flight": 131_072,
-                    "pending_batch_conversations": 9,
-                    "pending_batch_message_bytes": 131_072,
-                    "page_prep_workers": 6,
-                    "active_page_prep_jobs": 2,
-                    "ordered_buffered_pages": 4,
-                    "budget_generation": 1,
-                    "producer_budget_wait_count": 2,
-                    "producer_budget_wait_ms": 17,
-                    "producer_handoff_wait_count": 1,
-                    "producer_handoff_wait_ms": 9,
-                    "host_loadavg_1m_milli": 7_250,
-                    "controller_mode": "pressure_limited",
-                    "controller_reason": "queue_depth_3_reached_pipeline_capacity_3",
-                    "staged_merge_workers_max": 3,
-                    "staged_merge_allowed_jobs": 1,
-                    "staged_merge_active_jobs": 1,
-                    "staged_merge_ready_artifacts": 5,
-                    "staged_merge_ready_groups": 1,
-                    "staged_merge_controller_reason": "page_prep_workers_saturated_6_of_6",
-                    "staged_shard_build_workers_max": 6,
-                    "staged_shard_build_allowed_jobs": 5,
-                    "staged_shard_build_active_jobs": 4,
-                    "staged_shard_build_pending_jobs": 2,
-                    "staged_shard_build_controller_reason": "reserving_1_slots_for_staged_merge_active_jobs_1_ready_groups_1",
-                    "updated_at_ms": 1_733_000_124_000_i64
-                }
-            }))
-            .expect("serialize rebuild state"),
-        )
-        .expect("write rebuild state");
-
-        let lock_path = temp.path().join("index-run.lock");
-        let mut lock_file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-            .expect("open lock file");
-        lock_file.try_lock_exclusive().expect("hold index lock");
-        write_index_lock_metadata(
-            &lock_path,
-            &mut lock_file,
-            &format!(
-                "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index\n",
-                std::process::id(),
-                1_733_000_111_000_i64,
-                db_path.display()
-            ),
-        );
-
-        let state = state_meta_json(temp.path(), &db_path, 60, true);
-        let runtime = &state["rebuild"]["pipeline"]["runtime"];
-        let pipeline = &state["rebuild"]["pipeline"];
-
-        assert_eq!(runtime["queue_depth"].as_u64(), Some(3));
-        assert_eq!(
-            runtime["queue_capacity"].as_u64(),
-            pipeline["pipeline_channel_size"].as_u64()
-        );
-        assert_eq!(
-            runtime["queue_headroom"].as_u64(),
-            runtime["queue_capacity"]
-                .as_u64()
-                .map(|value| value.saturating_sub(3))
-        );
-        assert_eq!(runtime["inflight_message_bytes"].as_u64(), Some(65_536));
-        assert_eq!(
-            runtime["max_message_bytes_in_flight"].as_u64(),
-            Some(131_072)
-        );
-        assert_eq!(
-            runtime["inflight_message_bytes_headroom"].as_u64(),
-            Some(65_536)
-        );
-        assert_eq!(runtime["pending_batch_conversations"].as_u64(), Some(9));
-        assert_eq!(
-            runtime["pending_batch_message_bytes"].as_u64(),
-            Some(131_072)
-        );
-        assert_eq!(runtime["page_prep_workers"].as_u64(), Some(6));
-        assert_eq!(runtime["active_page_prep_jobs"].as_u64(), Some(2));
-        assert_eq!(runtime["ordered_buffered_pages"].as_u64(), Some(4));
-        assert_eq!(runtime["budget_generation"].as_u64(), Some(1));
-        assert_eq!(runtime["producer_budget_wait_count"].as_u64(), Some(2));
-        assert_eq!(runtime["producer_budget_wait_ms"].as_u64(), Some(17));
-        assert_eq!(runtime["producer_handoff_wait_count"].as_u64(), Some(1));
-        assert_eq!(runtime["producer_handoff_wait_ms"].as_u64(), Some(9));
-        assert_eq!(runtime["host_loadavg_1m"].as_f64(), Some(7.25));
-        assert_eq!(
-            runtime["controller_mode"].as_str(),
-            Some("pressure_limited")
-        );
-        assert_eq!(
-            runtime["controller_reason"].as_str(),
-            Some("queue_depth_3_reached_pipeline_capacity_3")
-        );
-        assert_eq!(runtime["staged_merge_workers_max"].as_u64(), Some(3));
-        assert_eq!(runtime["staged_merge_allowed_jobs"].as_u64(), Some(1));
-        assert_eq!(runtime["staged_merge_active_jobs"].as_u64(), Some(1));
-        assert_eq!(runtime["staged_merge_ready_artifacts"].as_u64(), Some(5));
-        assert_eq!(runtime["staged_merge_ready_groups"].as_u64(), Some(1));
-        assert_eq!(
-            runtime["staged_merge_controller_reason"].as_str(),
-            Some("page_prep_workers_saturated_6_of_6")
-        );
-        assert_eq!(runtime["staged_shard_build_workers_max"].as_u64(), Some(6));
-        assert_eq!(runtime["staged_shard_build_allowed_jobs"].as_u64(), Some(5));
-        assert_eq!(runtime["staged_shard_build_active_jobs"].as_u64(), Some(4));
-        assert_eq!(runtime["staged_shard_build_pending_jobs"].as_u64(), Some(2));
-        assert_eq!(
-            runtime["staged_shard_build_controller_reason"].as_str(),
-            Some("reserving_1_slots_for_staged_merge_active_jobs_1_ready_groups_1")
-        );
-        assert_eq!(
-            runtime["updated_at"].as_str(),
-            format_timestamp_millis_rfc3339(1_733_000_124_000_i64).as_deref()
-        );
-    }
-
-    #[test]
     fn state_meta_json_hides_empty_active_rebuild_pipeline_runtime_before_first_heartbeat() {
+        // W2-6 exec39 (checkpoint-fixture item3, control-plane ruling):
+        // this test used to also write the retired
+        // `.lexical-rebuild-state.json` checkpoint file here (SCHEMA_HASH
+        // + a "runtime" telemetry blob). It was already dead weight
+        // before this edit -- `state["rebuild"]["pipeline"]["runtime"]`
+        // is unconditionally `Value::Null` regardless of any file content
+        // (see the `pipeline.insert("runtime", ...)` call this function
+        // exercises below), and `rebuilding`/`rebuild.active` come from
+        // the index-run.lock file's `mode=index`, not this checkpoint.
+        // The write never affected any assertion in this test; removed
+        // rather than left as a misleading no-op (third instance of the
+        // "adjacent test already migrated, this one wasn't" pattern --
+        // see `state_meta_json_reports_active_rebuild` below for the
+        // exec36 precedent that already made this exact move).
         let (temp, db_path) = seed_cli_db();
-        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        let index_path = crate::indexer::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
         std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
-        std::fs::write(
-            index_path.join(".lexical-rebuild-state.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "version": 2,
-                "schema_hash": crate::search::tantivy::SCHEMA_HASH,
-                "db": {
-                    "db_path": db_path.display().to_string(),
-                    "total_conversations": 10,
-                    "storage_fingerprint": "10:42:0:0"
-                },
-                "page_size": crate::indexer::LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
-                "committed_offset": 4,
-                "committed_conversation_id": 4,
-                "processed_conversations": 4,
-                "indexed_docs": 20,
-                "committed_meta_fingerprint": null,
-                "pending": null,
-                "completed": false,
-                "updated_at_ms": 1_733_000_123_000_i64
-            }))
-            .expect("serialize rebuild state"),
-        )
-        .expect("write rebuild state");
 
         let lock_path = temp.path().join("index-run.lock");
         let mut lock_file = std::fs::OpenOptions::new()
@@ -72899,32 +72671,30 @@ mod cli_read_db_tests {
     #[test]
     fn state_meta_json_reports_active_rebuild() {
         let (temp, db_path) = seed_cli_db();
-        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        let index_path = crate::indexer::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
         std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
-        std::fs::write(
-            index_path.join(".lexical-rebuild-state.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "version": 2,
-                "schema_hash": crate::search::tantivy::SCHEMA_HASH,
-                "db": {
-                    "db_path": db_path.display().to_string(),
-                    "total_conversations": 10,
-                    "storage_fingerprint": "10:42:0:0"
-                },
-                "page_size": crate::indexer::LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
-                "committed_offset": 4,
-                "committed_conversation_id": 4,
-                "processed_conversations": 4,
-                "indexed_docs": 20,
-                "committed_meta_fingerprint": null,
-                "pending": null,
-                "completed": false,
-                "updated_at_ms": 1_733_000_123_000_i64
-            }))
-            .expect("serialize rebuild state"),
-        )
-        .expect("write rebuild state");
+        // W2-6 exec36 Task甲2 (control-plane 2026-08-30 ruling, ③): the retired
+        // JSON checkpoint file is no longer read anywhere -- "a rebuild is in
+        // progress" is now carried by the SQLite `lex_domain_rebuild_state`
+        // meta marker (storage::sqlite::lex_domain_rebuild_marker_status).
+        // Plant the Building marker through a real write against the seeded
+        // db instead of the dead file, mirroring the real write path
+        // (storage/sqlite.rs's own `write_lex_domain_rebuild_marker_building`
+        // uses the identical statement against the same key/value pair).
+        {
+            let storage = FrankenStorage::open(&db_path).expect("reopen cass db for marker write");
+            storage
+                .raw()
+                .execute(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                    &crate::storage::api::params![
+                        crate::storage::sqlite::LEX_DOMAIN_REBUILD_STATE_META_KEY,
+                        "building"
+                    ],
+                )
+                .expect("write lex domain rebuild marker (building)");
+        }
 
         let lock_path = temp.path().join("index-run.lock");
         let mut lock_file = std::fs::OpenOptions::new()
@@ -72949,85 +72719,24 @@ mod cli_read_db_tests {
         let state = state_meta_json(temp.path(), &db_path, 60, true);
         assert_eq!(state["index"]["rebuilding"].as_bool(), Some(true));
         assert_eq!(state["rebuild"]["active"].as_bool(), Some(true));
-        assert_eq!(state["pending"]["sessions"].as_u64(), Some(6));
+        // The marker's Building variant carries no progress counters (no
+        // partial-progress resume, per its own doc -- see w2-d4) -- what it
+        // DOES report honestly is "a checkpoint exists and isn't finished".
         assert_eq!(
-            state["rebuild"]["processed_conversations"].as_u64(),
-            Some(4)
+            state["index"]["checkpoint"]["present"].as_bool(),
+            Some(true)
         );
-        assert_eq!(state["rebuild"]["total_conversations"].as_u64(), Some(10));
-    }
-
-    #[test]
-    fn state_meta_json_prefers_pending_rebuild_progress_when_present() {
-        let (temp, db_path) = seed_cli_db();
-        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
-        std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
-        std::fs::write(
-            index_path.join(".lexical-rebuild-state.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "version": 2,
-                "schema_hash": crate::search::tantivy::SCHEMA_HASH,
-                "db": {
-                    "db_path": db_path.display().to_string(),
-                    "total_conversations": 10,
-                    "storage_fingerprint": "10:42:0:0"
-                },
-                "page_size": crate::indexer::LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
-                "committed_offset": 4,
-                "committed_conversation_id": 4,
-                "processed_conversations": 4,
-                "indexed_docs": 20,
-                "committed_meta_fingerprint": null,
-                "pending": {
-                    "next_offset": 6,
-                    "next_conversation_id": 6,
-                    "processed_conversations": 6,
-                    "indexed_docs": 30,
-                    "base_meta_fingerprint": "stable-meta"
-                },
-                "completed": false,
-                "updated_at_ms": 1_733_000_223_000_i64
-            }))
-            .expect("serialize rebuild state"),
-        )
-        .expect("write rebuild state");
-
-        let lock_path = temp.path().join("index-run.lock");
-        let mut lock_file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-            .expect("open lock file");
-        lock_file.try_lock_exclusive().expect("hold index lock");
-        write_index_lock_metadata(
-            &lock_path,
-            &mut lock_file,
-            &format!(
-                "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index\n",
-                std::process::id(),
-                1_733_000_111_000_i64,
-                db_path.display()
-            ),
-        );
-
-        let state = state_meta_json(temp.path(), &db_path, 60, true);
-        assert_eq!(state["rebuild"]["active"].as_bool(), Some(true));
-        assert_eq!(state["pending"]["sessions"].as_u64(), Some(4));
         assert_eq!(
-            state["rebuild"]["processed_conversations"].as_u64(),
-            Some(6)
+            state["index"]["checkpoint"]["completed"].as_bool(),
+            Some(false)
         );
-        assert_eq!(state["rebuild"]["indexed_docs"].as_u64(), Some(30));
     }
 
     #[test]
     fn state_meta_json_matches_active_rebuild_for_equivalent_db_path_spellings() {
         let (temp, db_path) = seed_cli_db();
         let db_path_variant = temp.path().join(".").join("agent_search.db");
-        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        let index_path = crate::indexer::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
         std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
 
@@ -73099,7 +72808,7 @@ mod cli_read_db_tests {
     #[test]
     fn state_meta_json_reports_active_data_dir_lock_without_db_path_metadata() {
         let (temp, db_path) = seed_cli_db();
-        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        let index_path = crate::indexer::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
         std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
 
@@ -73157,7 +72866,7 @@ mod cli_read_db_tests {
     #[test]
     fn state_meta_json_reports_active_rebuild_before_lexical_snapshot_exists() {
         let (temp, db_path) = seed_cli_db();
-        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        let index_path = crate::indexer::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
         std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
 
@@ -73198,7 +72907,7 @@ mod cli_read_db_tests {
     #[test]
     fn state_meta_json_reports_watch_active_without_marking_rebuild() {
         let (temp, db_path) = seed_cli_db();
-        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        let index_path = crate::indexer::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
         std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
 
@@ -73237,7 +72946,7 @@ mod cli_read_db_tests {
         // and returns a clean default snapshot.  Verify that the state_meta
         // JSON reflects the reaped (clean) state.
         let (temp, db_path) = seed_cli_db();
-        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        let index_path = crate::indexer::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
         std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
 
@@ -73275,58 +72984,9 @@ mod cli_read_db_tests {
     }
 
     #[test]
-    fn state_meta_json_uses_latest_lock_heartbeat_when_asset_inspection_fails() {
-        let (temp, db_path) = seed_cli_db();
-        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
-        std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
-        std::fs::create_dir_all(index_path.join(".lexical-rebuild-state.json"))
-            .expect("create unreadable rebuild state path");
-
-        let lock_path = temp.path().join("index-run.lock");
-        let mut lock_file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-            .expect("open lock file");
-        lock_file.try_lock_exclusive().expect("hold index lock");
-        write_index_lock_metadata(
-            &lock_path,
-            &mut lock_file,
-            &format!(
-                concat!(
-                    "pid={}\n",
-                    "started_at_ms={}\n",
-                    "updated_at_ms={}\n",
-                    "db_path={}\n",
-                    "mode=index\n"
-                ),
-                std::process::id(),
-                1_733_000_555_000_i64,
-                1_733_000_666_000_i64,
-                db_path.display()
-            ),
-        );
-
-        let state = state_meta_json(temp.path(), &db_path, 60, true);
-        assert_eq!(state["index"]["status"].as_str(), Some("error"));
-        assert_eq!(
-            state["index"]["activity_at"].as_str(),
-            Some("2024-11-30T21:04:26+00:00")
-        );
-        assert!(
-            state["index"]["reason"]
-                .as_str()
-                .is_some_and(|reason| reason.contains("asset inspection failed"))
-        );
-    }
-
-    #[test]
     fn state_meta_json_does_not_infer_watch_activity_from_watch_state_file() {
         let (temp, db_path) = seed_cli_db();
-        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        let index_path = crate::indexer::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
         std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
         std::fs::write(
@@ -73338,61 +72998,6 @@ mod cli_read_db_tests {
         let state = state_meta_json(temp.path(), &db_path, 60, true);
         assert_eq!(state["pending"]["watch_active"].as_bool(), Some(false));
         assert_eq!(state["pending"]["sessions"].as_u64(), Some(0));
-    }
-
-    #[test]
-    fn state_meta_json_marks_lexical_fingerprint_mismatch_stale() {
-        let (temp, db_path) = seed_cli_db();
-        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
-        std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
-        std::fs::write(
-            index_path.join(".lexical-rebuild-state.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "version": 2,
-                "schema_hash": crate::search::tantivy::SCHEMA_HASH,
-                "db": {
-                    "db_path": db_path.display().to_string(),
-                    "total_conversations": 10,
-                    "storage_fingerprint": "stale-fingerprint"
-                },
-                "page_size": crate::indexer::LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
-                "committed_offset": 10,
-                "committed_conversation_id": 10,
-                "processed_conversations": 10,
-                "indexed_docs": 20,
-                "committed_meta_fingerprint": null,
-                "pending": null,
-                "completed": true,
-                "updated_at_ms": 1_733_000_123_000_i64
-            }))
-            .expect("serialize rebuild state"),
-        )
-        .expect("write rebuild state");
-
-        let state = state_meta_json(temp.path(), &db_path, 60, true);
-        assert_eq!(state["index"]["status"].as_str(), Some("stale"));
-        assert_eq!(state["index"]["stale"].as_bool(), Some(true));
-        assert_eq!(
-            state["index"]["fingerprint"]["matches_current_db_fingerprint"].as_bool(),
-            Some(false)
-        );
-        assert!(
-            state["index"]["reason"]
-                .as_str()
-                .is_some_and(|reason| reason.contains("fingerprint"))
-        );
-        assert_eq!(state["pending"]["sessions"].as_u64(), Some(0));
-        assert_eq!(
-            state["rebuild"]["processed_conversations"],
-            serde_json::Value::Null
-        );
-        assert_eq!(
-            state["rebuild"]["total_conversations"],
-            serde_json::Value::Null
-        );
-        assert_eq!(state["rebuild"]["indexed_docs"], serde_json::Value::Null);
-        assert_eq!(state["semantic"]["fallback_mode"].as_str(), Some("lexical"));
     }
 
     #[test]
@@ -74086,16 +73691,14 @@ mod cli_read_db_tests {
     }
 }
 
-/// Data gathered by the bounded archive-DB doctor probe (#287): row counts,
-/// the PRAGMA integrity verdict, and (when the database is healthy) the FTS
-/// visibility state — everything `run_doctor_impl` needs to reconstruct the
-/// `database`/`fts_table` checks without touching the connection on the main
-/// thread.
+/// Data gathered by the bounded archive-DB doctor probe (#287): row counts
+/// and the PRAGMA integrity verdict — everything `run_doctor_impl` needs to
+/// reconstruct the `database` check without touching the connection on the
+/// main thread.
 struct DoctorBoundedArchiveDbProbe {
     conv_count: Option<i64>,
     msg_count: Option<i64>,
     integrity: Option<Result<DoctorDatabaseIntegrityProbe, String>>,
-    fts_state: Option<DoctorFtsTableState>,
 }
 
 enum DoctorBoundedArchiveDbProbeOutcome {
@@ -74125,7 +73728,7 @@ fn doctor_archive_db_probe_hard_timeout() -> Duration {
 /// final JSON verdict. The abandoned worker stays detached — the same
 /// containment contract as `open_franken_cli_read_db_with_hard_timeout`.
 fn run_bounded_doctor_archive_db_probe(
-    conn: frankensqlite::Connection,
+    conn: FrankenConnection,
     db_path: &Path,
     timeout: Duration,
 ) -> DoctorBoundedArchiveDbProbeOutcome {
@@ -74135,7 +73738,6 @@ fn run_bounded_doctor_archive_db_probe(
     let worker_db_path = db_path.to_path_buf();
     let conn = crate::storage::sqlite::SendFrankenConnection::new(conn);
     let _probe_worker = std::thread::spawn(move || {
-        use frankensqlite::compat::{ConnectionExt as _, RowExt as _};
 
         let set_phase = |value: &'static str| {
             if let Ok(mut current) = worker_phase.lock() {
@@ -74147,7 +73749,7 @@ fn run_bounded_doctor_archive_db_probe(
             .query_row_map(
                 "SELECT COUNT(*) FROM conversations",
                 &[],
-                |r: &frankensqlite::Row| r.get_typed(0),
+                |r: &FrankenRow| r.get_typed(0),
             )
             .ok();
         set_phase("row_count_messages");
@@ -74155,20 +73757,13 @@ fn run_bounded_doctor_archive_db_probe(
             .query_row_map(
                 "SELECT COUNT(*) FROM messages",
                 &[],
-                |r: &frankensqlite::Row| r.get_typed(0),
+                |r: &FrankenRow| r.get_typed(0),
             )
             .ok();
         let mut integrity = None;
-        let mut fts_state = None;
         if conv_count.is_some() && msg_count.is_some() {
             set_phase("integrity_probe");
-            let probe = doctor_database_integrity_probe(&conn);
-            let healthy = matches!(&probe, Ok(result) if result.is_ok());
-            integrity = Some(probe);
-            if healthy {
-                set_phase("fts_probe");
-                fts_state = Some(probe_doctor_fts_table(&conn));
-            }
+            integrity = Some(doctor_database_integrity_probe(&conn));
         }
         set_phase("connection_close");
         let _ = close_franken_cli_read_db(conn, &worker_db_path, "doctor database health");
@@ -74176,7 +73771,6 @@ fn run_bounded_doctor_archive_db_probe(
             conv_count,
             msg_count,
             integrity,
-            fts_state,
         });
     });
 
@@ -74216,7 +73810,7 @@ pub(crate) fn run_doctor_impl(
     let start = Instant::now();
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
-    let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
+    let index_path = crate::indexer::expected_index_dir(&data_dir);
     let lock_path = data_dir.join(".index.lock");
     let mut timing_spans: Vec<DoctorTimingSpanReport> = Vec::new();
     let lock_probe_started = Instant::now();
@@ -74294,7 +73888,8 @@ pub(crate) fn run_doctor_impl(
     let not_initialized = !fix
         && cass_not_initialized(
             db_path.exists(),
-            crate::search::tantivy::searchable_index_exists(&index_path),
+            // W2-6 Task1: reseated onto the lex_docs/fts_lex SQLite domain.
+            crate::search::lexical_index_health::searchable_index_exists(&db_path),
             rebuild_active,
         );
     let explanation = not_initialized.then(|| cass_not_initialized_explanation(&data_dir));
@@ -74313,7 +73908,6 @@ pub(crate) fn run_doctor_impl(
     let mut checks: Vec<Check> = Vec::new();
     let mut needs_rebuild = force_rebuild;
     let mut db_ok = false;
-    let mut db_conversations: Option<usize> = None;
     let mut db_messages: Option<usize> = None;
     // `.14.1` storage-integrity signals (bead vl1cj): the read-only facts the
     // database + lexical-index checks below already observe, from which the
@@ -74617,7 +74211,6 @@ pub(crate) fn run_doctor_impl(
                         if let (Some(conv_count), Some(msg_count), Some(integrity_probe)) =
                             (probe.conv_count, probe.msg_count, probe.integrity)
                         {
-                            db_conversations = Some(conv_count.max(0) as usize);
                             db_messages = Some(msg_count.max(0) as usize);
                             match integrity_probe {
                                 Ok(integrity) if integrity.is_ok() => {
@@ -74631,40 +74224,6 @@ pub(crate) fn run_doctor_impl(
                                         ),
                                         false
                                     );
-
-                                    // Check whether the FTS table is visible through
-                                    // frankensqlite on this connection. Do not auto-register
-                                    // it here: on migrated databases with legacy rootpage=0
-                                    // FTS schema entries, CREATE VIRTUAL TABLE IF NOT EXISTS
-                                    // can persist duplicate sqlite_master rows.
-                                    match probe.fts_state {
-                                        Some(DoctorFtsTableState::QueryableViaFrankensqlite) => {
-                                            add_check!(
-                                                "fts_table",
-                                                "pass",
-                                                "FTS search table (fts_messages) is queryable via frankensqlite",
-                                                false
-                                            );
-                                        }
-                                        Some(DoctorFtsTableState::Missing {
-                                            frankensqlite_error,
-                                        }) => {
-                                            // An absent in-DB FTS shadow is benign
-                                            // here (lexical search falls back to
-                                            // Tantivy), so it does NOT feed the
-                                            // storage_state derivation — doctor
-                                            // reports it as a `pass` below.
-                                            add_check!(
-                                                "fts_table",
-                                                "pass",
-                                                format!(
-                                                    "Database-resident FTS table is absent or not queryable via frankensqlite ({frankensqlite_error}); lexical search relies on the Tantivy index instead"
-                                                ),
-                                                false
-                                            );
-                                        }
-                                        None => {}
-                                    }
                                 }
                                 Ok(integrity) => {
                                     storage_integrity_failed = true;
@@ -74673,7 +74232,7 @@ pub(crate) fn run_doctor_impl(
                                         "database",
                                         "fail",
                                         format!(
-                                            "Database failed frankensqlite {failed_pragma}: {} ({} conversations, {} messages)",
+                                            "Database failed the legacy embedded engine {failed_pragma}: {} ({} conversations, {} messages)",
                                             integrity.diagnostic_summary(),
                                             conv_count,
                                             msg_count
@@ -74688,7 +74247,7 @@ pub(crate) fn run_doctor_impl(
                                         "database",
                                         "fail",
                                         format!(
-                                            "Database health probe failed via frankensqlite: {err}"
+                                            "Database health probe failed via the legacy embedded engine: {err}"
                                         ),
                                         true
                                     );
@@ -74752,10 +74311,11 @@ pub(crate) fn run_doctor_impl(
         vec!["archive DB open, row counts, and integrity-style checks completed or were skipped by state".to_string()],
     );
 
-    // 4. Check Tantivy index exists and is readable
+    // 4. Check lexical index exists and is readable (W2-6 Task1: reseated
+    // onto the lex_docs/fts_lex SQLite domain).
     let lexical_probe_started = Instant::now();
-    if crate::search::tantivy::searchable_index_exists(&index_path) {
-        match crate::search::tantivy::searchable_index_summary(&index_path) {
+    if crate::search::lexical_index_health::searchable_index_exists(&db_path) {
+        match crate::search::lexical_index_health::searchable_index_summary(&db_path) {
             Ok(Some(summary)) => {
                 let num_docs = summary.docs;
                 add_check!(
@@ -75729,27 +75289,26 @@ pub(crate) fn run_doctor_impl(
                         Duration::from_secs(30),
                     ) {
                         Ok(conn) => {
-                            use frankensqlite::compat::{ConnectionExt as _, RowExt as _};
 
                             let conv_count: Option<i64> = conn
                                 .query_row_map(
                                     "SELECT COUNT(*) FROM conversations",
                                     &[],
-                                    |r: &frankensqlite::Row| r.get_typed(0),
+                                    |r: &FrankenRow| r.get_typed(0),
                                 )
                                 .ok();
                             let msg_count: Option<i64> = conn
                                 .query_row_map(
                                     "SELECT COUNT(*) FROM messages",
                                     &[],
-                                    |r: &frankensqlite::Row| r.get_typed(0),
+                                    |r: &FrankenRow| r.get_typed(0),
                                 )
                                 .ok();
                             let quick_check_status: Option<String> = conn
                                 .query_row_map(
                                     "PRAGMA quick_check(1)",
                                     &[],
-                                    |r: &frankensqlite::Row| r.get_typed(0),
+                                    |r: &FrankenRow| r.get_typed(0),
                                 )
                                 .ok();
 
@@ -75758,13 +75317,12 @@ pub(crate) fn run_doctor_impl(
                             {
                                 if status.trim().eq_ignore_ascii_case("ok") {
                                     db_ok = true;
-                                    db_conversations = Some(conv_count.max(0) as usize);
                                     db_messages = Some(msg_count.max(0) as usize);
                                     checks.push(Check {
                                         name: "database_after_candidate_promotion".to_string(),
                                         status: "pass".to_string(),
                                         message: format!(
-                                            "Promoted archive DB passed frankensqlite quick_check ({} conversations, {} messages)",
+                                            "Promoted archive DB passed the legacy embedded engine quick_check ({} conversations, {} messages)",
                                             conv_count, msg_count
                                         ),
                                         fix_available: false,
@@ -75785,7 +75343,7 @@ pub(crate) fn run_doctor_impl(
                                         name: "database_after_candidate_promotion".to_string(),
                                         status: "fail".to_string(),
                                         message: format!(
-                                            "Promoted archive DB failed frankensqlite quick_check: {}",
+                                            "Promoted archive DB failed the legacy embedded engine quick_check: {}",
                                             status.trim()
                                         ),
                                         fix_available: true,
@@ -75933,12 +75491,10 @@ pub(crate) fn run_doctor_impl(
         let rebuild_from_db = db_ok && db_messages.unwrap_or(0) > 0;
 
         if rebuild_from_db {
-            let total_convs = db_conversations.unwrap_or(0);
             let rebuild_handle = std::thread::spawn({
                 let progress = progress.clone();
                 let db_path = db_path.clone();
-                let data_dir = data_dir.clone();
-                move || rebuild_tantivy_from_db(&db_path, &data_dir, total_convs, Some(progress))
+                move || rebuild_tantivy_from_db(&db_path, Some(progress))
             });
 
             let rebuild_result = wait_with_progress(
@@ -76072,7 +75628,6 @@ pub(crate) fn run_doctor_impl(
                     db_path: db_path.clone(),
                     data_dir: data_dir.clone(),
                     semantic: false,
-                    build_hnsw: false,
                     embedder: "fastembed".to_string(),
                     progress: Some(progress.clone()),
                     watch_interval_secs: 30,
@@ -76681,6 +76236,12 @@ pub(crate) fn run_doctor_impl(
             "event_log": operation_event_log,
             "lexical": readiness_snapshot.get("index").cloned().unwrap_or(serde_json::Value::Null),
             "semantic": readiness_snapshot.get("semantic").cloned().unwrap_or(serde_json::Value::Null),
+            // W3-4 Step2-3 (task book #62): same parallel DB-vector-domain
+            // section `cass status` gained in Step2-2, passed through
+            // from the same `readiness_snapshot` this function already
+            // computed via `state_meta_json_inner` -- no extra DB open
+            // beyond what Step2-2 already introduced.
+            "db_vector_domain": readiness_snapshot.get("db_vector_domain").cloned().unwrap_or(serde_json::Value::Null),
             "derived_semantic_assets": derived_semantic_assets,
             "storage_pressure": storage_pressure,
             "storage_integrity": storage_integrity_report,
@@ -77062,7 +76623,6 @@ fn run_sessions(
     db_override: Option<PathBuf>,
     output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
-    use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
 
     let conn = open_franken_analytics_db(data_dir_override, db_override.as_ref())?;
     let target_workspace = match (workspace, current) {
@@ -77148,7 +76708,7 @@ fn run_sessions(
         Option<i64>,
         Option<i64>,
     )> = conn
-        .query_map_collect(&sessions_sql, params, |row: &frankensqlite::Row| {
+        .query_all_map(&sessions_sql, params, |row: &FrankenRow| {
             Ok((
                 row.get_typed(0)?,
                 row.get_typed(1)?,
@@ -77264,7 +76824,7 @@ fn run_sessions(
     }
 
     // Backfill message/human-turn counts for the surviving sessions only.
-    // Deliberately NOT a SQL aggregate: the frankensqlite planner executes
+    // Deliberately NOT a SQL aggregate: the legacy embedded engine planner executes
     // `SELECT COUNT(..) WHERE conversation_id = ?` as a full messages-table
     // scan even under an INDEXED BY hint (verified via live backtraces on a
     // 26 GB index). The plain indexed row-fetch shape below is the same one
@@ -77273,13 +76833,13 @@ fn run_sessions(
     // range scan on messages(conversation_id, idx) and the roles are
     // tallied in Rust — cost scales with the returned page, not the corpus.
     let count_session_messages =
-        |conversation_id: i64| -> Result<(i64, i64), frankensqlite::FrankenError> {
-            let roles: Vec<String> = conn.query_map_collect(
+        |conversation_id: i64| -> Result<(i64, i64), StorageError> {
+            let roles: Vec<String> = conn.query_all_map(
                 "SELECT role
                  FROM messages INDEXED BY sqlite_autoindex_messages_1
                  WHERE conversation_id = ?1",
                 &[ParamValue::from(conversation_id)],
-                |row: &frankensqlite::Row| row.get_typed::<String>(0),
+                |row: &FrankenRow| row.get_typed::<String>(0),
             )?;
             let message_count = roles.len() as i64;
             let human_turns = roles.iter().filter(|role| role.as_str() == "user").count() as i64;
@@ -77378,7 +76938,7 @@ fn run_sessions(
 /// "same agent" should skip that filter when agent_id is None.
 #[allow(clippy::type_complexity)]
 fn find_context_source_conversation(
-    conn: &frankensqlite::Connection,
+    conn: &FrankenConnection,
     path_str: &str,
     source_id: Option<&str>,
 ) -> Option<(
@@ -77390,7 +76950,6 @@ fn find_context_source_conversation(
     String,
     String,
 )> {
-    use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
 
     let normalized_source_sql = normalized_source_identity_sql_expr("c.source_id", "c.origin_host");
     let source_id = canonical_followup_source_id(source_id);
@@ -77410,7 +76969,7 @@ fn find_context_source_conversation(
             .query_row_map(
                 &query,
                 &[ParamValue::from(path_str), ParamValue::from(source_id)],
-                |r: &frankensqlite::Row| {
+                |r: &FrankenRow| {
                     Ok((
                         r.get_typed(0)?,
                         r.get_typed(1)?,
@@ -77437,7 +76996,7 @@ fn find_context_source_conversation(
     conn.query_row_map(
         &query,
         &[ParamValue::from(path_str)],
-        |r: &frankensqlite::Row| {
+        |r: &FrankenRow| {
             Ok((
                 r.get_typed(0)?,
                 r.get_typed(1)?,
@@ -77460,7 +77019,6 @@ fn run_context(
     output_format: Option<RobotFormat>,
     limit: usize,
 ) -> CliResult<()> {
-    use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
 
     let conn = open_franken_analytics_db(data_dir_override, db_override.as_ref())?;
 
@@ -77495,7 +77053,7 @@ fn run_context(
         conn.query_row_map(
             "SELECT path FROM workspaces WHERE id = ?",
             &[ParamValue::from(ws_id)],
-            |r: &frankensqlite::Row| r.get_typed(0),
+            |r: &FrankenRow| r.get_typed(0),
         )
         .ok()
     });
@@ -77514,14 +77072,14 @@ fn run_context(
                  ORDER BY c.started_at DESC
                  LIMIT ?"
             );
-        conn.query_map_collect(
+        conn.query_all_map(
             &query,
             &[
                 ParamValue::from(ws_id),
                 ParamValue::from(conv_id),
                 ParamValue::from(limit as i64),
             ],
-            |r: &frankensqlite::Row| {
+            |r: &FrankenRow| {
                 Ok((
                     r.get_typed(0)?,
                     r.get_typed::<Option<String>>(1)?.unwrap_or_default(),
@@ -77549,7 +77107,7 @@ fn run_context(
                  ORDER BY c.started_at DESC
                  LIMIT ?"
         );
-        conn.query_map_collect(
+        conn.query_all_map(
             &query,
             &[
                 ParamValue::from(day_start),
@@ -77557,7 +77115,7 @@ fn run_context(
                 ParamValue::from(conv_id),
                 ParamValue::from(limit as i64),
             ],
-            |r: &frankensqlite::Row| {
+            |r: &FrankenRow| {
                 Ok((
                     r.get_typed(0)?,
                     r.get_typed::<Option<String>>(1)?.unwrap_or_default(),
@@ -77583,14 +77141,14 @@ fn run_context(
                  ORDER BY c.started_at DESC
                  LIMIT ?"
         );
-        conn.query_map_collect(
+        conn.query_all_map(
             &query,
             &[
                 ParamValue::from(agent_id),
                 ParamValue::from(conv_id),
                 ParamValue::from(limit as i64),
             ],
-            |r: &frankensqlite::Row| {
+            |r: &FrankenRow| {
                 Ok((
                     r.get_typed(0)?,
                     r.get_typed::<Option<String>>(1)?.unwrap_or_default(),
@@ -82755,6 +82313,10 @@ fn response_schema_search_meta() -> serde_json::Value {
         ("explanation_cards", response_schema_explanation_cards()),
         ("timing", response_schema_search_timing()),
         (
+            "rerank_applied",
+            serde_json::json!({ "type": "boolean" }),
+        ),
+        (
             "tokens_estimated",
             serde_json::json!({ "type": ["integer", "null"] }),
         ),
@@ -85463,7 +85025,9 @@ fn try_load_indexed_conversation_from_db_with_source(
     if !db_path.exists() {
         return None;
     }
-    let storage = crate::storage::sqlite::FrankenStorage::open(db_path).ok()?;
+    // w1b Task B8 (d16, open-consumer audit): pure read (follow-up
+    // conversation load), switched to the read-only open.
+    let storage = crate::storage::sqlite::FrankenStorage::open_readonly(db_path).ok()?;
     let source_path = source_path.to_string_lossy();
     let source_id = canonical_followup_source_id(source_id);
     if let Some(source_id) = source_id.as_deref() {
@@ -85838,7 +85402,6 @@ fn refresh_index_inline(db_override: Option<PathBuf>, data_dir_override: Option<
         db_path,
         data_dir,
         semantic: false,
-        build_hnsw: false,
         embedder: "fastembed".to_string(),
         progress: Some(Arc::clone(&progress)),
         watch_interval_secs: 30,
@@ -85924,1073 +85487,27 @@ fn refresh_index_inline(db_override: Option<PathBuf>, data_dir_override: Option<
     }
 }
 
-/// Collect forensic context for a stalled `cass index` run so the JSON stall
-/// event carries enough on-disk state for issue triage without requiring the
-/// reporter to run secondary commands. All lookups are best-effort: if a path
-/// is missing or unreadable, we record the failure but never propagate an
-/// error out of the watchdog emitter.
-fn collect_stall_diagnostics(data_dir: &Path) -> serde_json::Value {
-    // Keep the snapshot compact — this is an observability event on stderr,
-    // not a full forensic bundle. If the reporter needs more, the event hint
-    // already tells them how to grab a stack trace.
-    const MAX_CHECKPOINT_BYTES: u64 = 64 * 1024;
-
-    let mut out = serde_json::Map::new();
-
-    let index_dir = data_dir.join("index");
-    out.insert(
-        "index_dir".into(),
-        serde_json::json!(index_dir.display().to_string()),
-    );
-    out.insert(
-        "index_dir_exists".into(),
-        serde_json::json!(index_dir.is_dir()),
-    );
-
-    // Candidate checkpoint filenames observed across cass versions. Recording
-    // any we find means the hang reporter doesn't need to hunt for the right
-    // name on their host.
-    let checkpoint_candidates = [
-        "lexical_rebuild_state.json",
-        "lexical_rebuild_state.v2.json",
-    ];
-    let mut checkpoints = serde_json::Map::new();
-    for name in checkpoint_candidates {
-        let path = index_dir.join(name);
-        if !path.exists() {
-            continue;
-        }
-        let meta = std::fs::metadata(&path).ok();
-        let size = meta.as_ref().map(std::fs::Metadata::len).unwrap_or(0);
-        let modified_ms = meta
-            .as_ref()
-            .and_then(|m| m.modified().ok())
-            .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as u64);
-        let mut entry = serde_json::Map::new();
-        entry.insert("path".into(), serde_json::json!(path.display().to_string()));
-        entry.insert("size_bytes".into(), serde_json::json!(size));
-        if let Some(ms) = modified_ms {
-            entry.insert("modified_ms".into(), serde_json::json!(ms));
-        }
-        if size <= MAX_CHECKPOINT_BYTES {
-            match std::fs::read_to_string(&path) {
-                Ok(contents) => {
-                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&contents) {
-                        entry.insert("content".into(), parsed);
-                    } else {
-                        entry.insert("content_raw".into(), serde_json::json!(contents));
-                    }
-                }
-                Err(err) => {
-                    entry.insert("read_error".into(), serde_json::json!(err.to_string()));
-                }
-            }
+/// R4-2: pure extraction of the Bars-mode completion line's activation
+/// suffix (previously inlined directly in `run_index_with_data` below).
+/// The prior regression test for this line
+/// (`bars_mode_completion_message_discloses_semantic_activated_false`,
+/// src/indexer/mod.rs) re-typed this exact three-way branch by hand
+/// against a bare `String` rather than calling the real production code,
+/// so deleting the real call site below -- or the real code no longer
+/// reading `semantic_activated` at all -- left that test unable to
+/// notice (R4-2 finding). Now the production call site and its test both
+/// call this same function. `None` means this run didn't request
+/// semantic indexing at all (`semantic_activated: None`), the one case
+/// that must add no suffix.
+fn semantic_activation_suffix(stats: &indexer::IndexingStats) -> Option<String> {
+    stats.semantic_activated.map(|activated| {
+        if activated {
+            ", semantic index: activated".to_string()
         } else {
-            entry.insert(
-                "content_omitted".into(),
-                serde_json::json!("file larger than 64 KiB; dump manually with `cat`"),
-            );
+            ", semantic index: not activated yet (holes remain; rerun to continue draining embedding_holes)"
+                .to_string()
         }
-        checkpoints.insert(name.to_string(), serde_json::Value::Object(entry));
-    }
-    out.insert(
-        "lexical_rebuild_checkpoint".into(),
-        serde_json::Value::Object(checkpoints),
-    );
-
-    // Tantivy segment count at stall time — catches the producer/consumer
-    // mismatch where segments are being written but the checkpoint still
-    // reports zero processed conversations.
-    if let Ok(entries) = std::fs::read_dir(&index_dir) {
-        let mut segment_count: u64 = 0;
-        let mut segment_bytes: u64 = 0;
-        for entry in entries.flatten() {
-            if let Some(ext) = entry.path().extension().and_then(|e| e.to_str())
-                && matches!(ext, "idx" | "pos" | "fast" | "term" | "store" | "fieldnorm")
-            {
-                segment_count = segment_count.saturating_add(1);
-                if let Ok(meta) = entry.metadata() {
-                    segment_bytes = segment_bytes.saturating_add(meta.len());
-                }
-            }
-        }
-        out.insert(
-            "tantivy_segment_files".into(),
-            serde_json::json!(segment_count),
-        );
-        out.insert(
-            "tantivy_segment_bytes".into(),
-            serde_json::json!(segment_bytes),
-        );
-    }
-
-    // Index run lock file — if heartbeating, tells the reporter another
-    // process may actually be holding the writer.
-    let lock_path = data_dir.join("index-run.lock");
-    if lock_path.exists() {
-        let mut lock = serde_json::Map::new();
-        lock.insert(
-            "path".into(),
-            serde_json::json!(lock_path.display().to_string()),
-        );
-        if let Ok(meta) = std::fs::metadata(&lock_path) {
-            lock.insert("size_bytes".into(), serde_json::json!(meta.len()));
-            if let Ok(modified) = meta.modified()
-                && let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH)
-            {
-                lock.insert(
-                    "modified_ms".into(),
-                    serde_json::json!(duration.as_millis() as u64),
-                );
-            }
-        }
-        if let Ok(contents) = std::fs::read_to_string(&lock_path) {
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&contents) {
-                lock.insert("content".into(), parsed);
-            } else {
-                lock.insert("content_raw".into(), serde_json::json!(contents));
-            }
-        }
-        out.insert("index_run_lock".into(), serde_json::Value::Object(lock));
-    }
-
-    serde_json::Value::Object(out)
-}
-
-const INDEX_STALL_HINT: &str = concat!(
-    "Indexer made no forward progress for the configured stall window. ",
-    "Capture a stack trace with `sudo cat /proc/$(pgrep -f 'cass index')/stack` ",
-    "and/or `sudo gdb -batch -ex 'thread apply all bt' -p $(pgrep -f 'cass index') 2>/dev/null | head -200` ",
-    "and attach to issue #244 (indexing-phase wedges) or #258 (watch_startup wedges where the lock-file ",
-    "heartbeat keeps refreshing while one thread spins). Set CASS_INDEX_STALL_DETECT_SECS=0 to disable detection; ",
-    "set CASS_INDEX_STALL_ABORT_SECS=0 to keep phase-2 stalls report-only. ",
-    "If `finalizing` is true in the diagnostics the indexer is inside the final WAL checkpoint of a large ",
-    "deferred bulk-ingest WAL (slow on macOS); CASS_INDEX_FINALIZE_ABORT_SECS (default 1800) bounds that window, ",
-    "and CASS_INDEX_WRITER_WAL_AUTOCHECKPOINT_PAGES=1000 caps WAL growth so the final checkpoint stays small."
-);
-
-fn index_stall_threshold(progress_interval: Duration) -> Option<Duration> {
-    let stall_threshold_secs = dotenvy::var("CASS_INDEX_STALL_DETECT_SECS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(120);
-    if stall_threshold_secs == 0 {
-        None
-    } else {
-        let min = progress_interval.saturating_add(Duration::from_secs(1));
-        Some(Duration::from_secs(stall_threshold_secs).max(min))
-    }
-}
-
-fn index_stall_abort_threshold(
-    progress_interval: Duration,
-    report_threshold: Option<Duration>,
-) -> Option<Duration> {
-    let report_threshold = report_threshold?;
-    let abort_threshold_secs = dotenvy::var("CASS_INDEX_STALL_ABORT_SECS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(300);
-    if abort_threshold_secs == 0 {
-        return None;
-    }
-    let min_after_report = report_threshold
-        .checked_add(progress_interval.max(Duration::from_secs(1)))
-        .unwrap_or(report_threshold);
-    Some(Duration::from_secs(abort_threshold_secs).max(min_after_report))
-}
-
-/// Bounded-but-generous abort grace for the post-publish *finalize* window
-/// (#319/#321).
-///
-/// A non-watch, non-semantic `cass index --full` ends by checkpointing the
-/// deferred bulk-ingest WAL inside `close_storage_after_index` — a synchronous,
-/// `!Send` frankensqlite `conn.close()` + `wal_checkpoint(TRUNCATE)` that runs
-/// on the indexer thread and cannot advance the progress atomics. On a large
-/// corpus (the #319 report: a ~1.1 GB / ~290k-frame WAL) that checkpoint
-/// legitimately takes minutes, especially on macOS where Darwin fsync/flock is
-/// slow. The generic finalize-wedge abort (`CASS_INDEX_STALL_ABORT_SECS`,
-/// default 300 s) misreads that active checkpoint as a #297 wedge and kills the
-/// process with `exit(70)` mid-checkpoint — stranding the un-truncated WAL and
-/// leaving the DB malformed to stock SQLite (#296/#321).
-///
-/// While the indexer signals `IndexingProgress::finalizing`, the watchdog uses
-/// this larger threshold instead, so a slow-but-progressing final checkpoint
-/// completes. Because the checkpoint is a single blocking `!Send` call on the
-/// indexer thread, it cannot be heartbeated — so a bound is the only liveness
-/// guard against a genuinely stuck finalize: once it elapses the abort still
-/// fires. `CASS_INDEX_FINALIZE_ABORT_SECS=0` makes the finalize window
-/// report-only (never abort). The floor is the ordinary abort threshold, so
-/// this can only ever *lengthen* the finalize grace, never shorten it.
-fn index_finalize_abort_threshold(abort_threshold: Option<Duration>) -> Option<Duration> {
-    let abort_threshold = abort_threshold?;
-    let finalize_secs = dotenvy::var("CASS_INDEX_FINALIZE_ABORT_SECS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(1800);
-    if finalize_secs == 0 {
-        return None;
-    }
-    Some(Duration::from_secs(finalize_secs).max(abort_threshold))
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum IndexStallAbortPolicy {
-    #[cfg(test)]
-    ReportOnly,
-    AbortPhaseTwo,
-}
-
-struct IndexStallWatchdog {
-    data_dir: PathBuf,
-    threshold: Option<Duration>,
-    abort_threshold: Option<Duration>,
-    /// Larger abort grace used only while `IndexingProgress::finalizing` is set
-    /// (the post-publish WAL-checkpoint window). `None` = never abort during
-    /// finalize (report-only). See `index_finalize_abort_threshold` (#319/#321).
-    finalize_abort_threshold: Option<Duration>,
-    abort_policy: IndexStallAbortPolicy,
-    /// True when supervising a long-lived `cass index --watch` daemon. In
-    /// watch mode the post-publish quiescent resting state (phase 0,
-    /// `current >= total`) is normal idle between rescans, not a wedge, so the
-    /// finalize-wedge detect/abort is suppressed (cass #311).
-    is_watch: bool,
-    /// True when this run is building semantic (vector) assets. The native
-    /// MiniLM embed + HNSW build + vector publish all run AFTER the lexical
-    /// rebuild has already parked the progress atomics in the quiescent
-    /// finalize state (phase 0 "preparing", `current >= total`), and they never
-    /// advance those atomics — so that multi-minute CPU-heavy work looks
-    /// identical to a #297 finalize wedge. Without this flag the abort fires
-    /// mid-embed and kills the process with exit(70) before any vector file is
-    /// published, so the next run starts over and semantic search never becomes
-    /// available (cass #315). Set on the semantic index path only.
-    semantic_build: bool,
-    last_phase: usize,
-    last_current: usize,
-    last_progress_advance: std::time::Instant,
-    stall_reported_for_phase: Option<usize>,
-    stall_abort_reported_for_phase: Option<usize>,
-}
-
-impl IndexStallWatchdog {
-    #[cfg(test)]
-    fn new(data_dir: PathBuf, progress_interval: Duration) -> Self {
-        Self::with_abort_policy(
-            data_dir,
-            progress_interval,
-            IndexStallAbortPolicy::ReportOnly,
-        )
-    }
-
-    fn aborting_phase_two(data_dir: PathBuf, progress_interval: Duration) -> Self {
-        Self::with_abort_policy(
-            data_dir,
-            progress_interval,
-            IndexStallAbortPolicy::AbortPhaseTwo,
-        )
-    }
-
-    /// Mark this watchdog as supervising a long-lived `cass index --watch`
-    /// daemon. In watch mode the post-publish, fully-quiescent resting state
-    /// (phase 0 "preparing", `current >= total`) is the NORMAL idle between
-    /// rescans — it is not a wedge. Without this flag the #297 finalize-wedge
-    /// abort fires after `abort_threshold` of that normal idle and crash-loops
-    /// the daemon with exit(70) (cass #311). Set on the watch path only.
-    fn watch_aware(mut self, is_watch: bool) -> Self {
-        self.is_watch = is_watch;
-        self
-    }
-
-    /// Mark this watchdog as supervising a one-shot semantic (vector) index
-    /// build. The native embedding pass, HNSW build, and vector publish all run
-    /// while the progress atomics are already parked in the quiescent finalize
-    /// state (phase 0 "preparing", `current >= total`) left by the preceding
-    /// lexical rebuild, and never advance them — so that legitimate multi-minute
-    /// work matches the #297 finalize-wedge shape exactly. Without this flag the
-    /// #297 abort fires after `abort_threshold` and kills the process with
-    /// exit(70) before any vector file is published (cass #315). Treating the
-    /// quiescent finalize state as healthy active work (like watch-mode idle)
-    /// lets the semantic build run to completion and publish. A genuine phase-2
-    /// (lexical indexing) wedge does not match and is still detected + aborted.
-    fn semantic_aware(mut self, semantic_build: bool) -> Self {
-        self.semantic_build = semantic_build;
-        self
-    }
-
-    fn data_dir(&self) -> &Path {
-        &self.data_dir
-    }
-
-    fn with_abort_policy(
-        data_dir: PathBuf,
-        progress_interval: Duration,
-        abort_policy: IndexStallAbortPolicy,
-    ) -> Self {
-        let threshold = index_stall_threshold(progress_interval);
-        let abort_threshold = index_stall_abort_threshold(progress_interval, threshold);
-        let finalize_abort_threshold = index_finalize_abort_threshold(abort_threshold);
-        Self {
-            data_dir,
-            threshold,
-            abort_threshold,
-            finalize_abort_threshold,
-            abort_policy,
-            is_watch: false,
-            semantic_build: false,
-            last_phase: usize::MAX,
-            last_current: 0,
-            last_progress_advance: std::time::Instant::now(),
-            stall_reported_for_phase: None,
-            stall_abort_reported_for_phase: None,
-        }
-    }
-
-    fn observe(
-        &mut self,
-        index_progress: &indexer::IndexingProgress,
-        elapsed_ms: u128,
-    ) -> Option<serde_json::Value> {
-        let phase_code = index_progress
-            .phase
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let current = index_progress
-            .current
-            .load(std::sync::atomic::Ordering::Relaxed);
-
-        if phase_code != self.last_phase {
-            self.last_phase = phase_code;
-            self.last_current = current;
-            self.last_progress_advance = std::time::Instant::now();
-            self.stall_reported_for_phase = None;
-            self.stall_abort_reported_for_phase = None;
-            return None;
-        }
-
-        if current != self.last_current {
-            self.last_progress_advance = std::time::Instant::now();
-            self.last_current = current;
-            self.stall_reported_for_phase = None;
-            self.stall_abort_reported_for_phase = None;
-            return None;
-        }
-
-        let threshold = self.threshold?;
-        let stall_elapsed = self.last_progress_advance.elapsed();
-        // cass #311: in `--watch` mode the daemon legitimately rests in a
-        // quiescent, fully-published state (phase 0 "preparing",
-        // `current >= total`) between rescans. That resting state matches the
-        // #297 finalize-wedge shape, so the watchdog used to emit a spurious
-        // `stall_detected` and then abort the long-lived watch process with
-        // exit(70) after `abort_threshold` of perfectly normal idle — a
-        // crash-loop (systemd restart -> repeat). Treat the quiescent resting
-        // state as healthy idle in watch mode (no detect, no abort). A genuine
-        // watch wedge in active work — phase 2, or phase 0 with `current < total`
-        // or a non-quiescent rebuild pipeline — does not match and is still
-        // detected and aborted below.
-        //
-        // cass #315: a one-shot `cass index --semantic` build has the same
-        // healthy-idle shape here for the entire semantic pass. The lexical
-        // rebuild finishes and parks progress at phase 0 / `current == total` /
-        // quiescent, then the native MiniLM embed + HNSW build + vector publish
-        // run for minutes WITHOUT ever advancing those atomics. That legitimate
-        // work is indistinguishable from a finalize wedge, so the abort used to
-        // kill the process (exit 70) before publishing any vector index. Treat
-        // the quiescent finalize state as healthy active work for semantic
-        // builds too, so the embed/publish runs to completion. A genuine phase-2
-        // lexical wedge does not match (phase_code != 0) and is still caught.
-        if (self.is_watch || self.semantic_build) && phase_code == 0 {
-            let total = index_progress
-                .total
-                .load(std::sync::atomic::Ordering::Relaxed);
-            if total > 0 && current >= total && index_progress.rebuild_pipeline_is_quiescent() {
-                return None;
-            }
-        }
-        // Historically this gated on `phase_code != 0` so the watchdog
-        // never fired during the "preparing" phase (phase=0). Issue #258
-        // is exactly that: the v0.6.2 watcher wedged at startup before
-        // ever advancing to Scanning/Indexing, the watchdog stayed
-        // silent for 4+ hours, and operators had no signal that the
-        // indexer was stuck. The fix is to also fire on phase=0 wedges
-        // — a startup that takes >120 s with no progress is, by any
-        // sensible definition, a stall worth reporting. The repeat
-        // guard `stall_reported_for_phase == Some(phase_code)` still
-        // prevents log spam from a single stalled phase.
-        if self.stall_reported_for_phase != Some(phase_code) {
-            if stall_elapsed < threshold {
-                return None;
-            }
-
-            self.stall_reported_for_phase = Some(phase_code);
-            return Some(self.stall_payload(
-                index_progress,
-                elapsed_ms,
-                stall_elapsed,
-                threshold,
-                "stall_detected",
-                None,
-            ));
-        }
-
-        let abort_threshold = self.abort_threshold?;
-        // The post-publish / post-rebuild finalize runs under the
-        // "preparing" phase (phase 0) with `current == total`. Issue #297:
-        // a wedge there (workers parked after the lexical publish, never
-        // woken to checkpoint/clean up) used to keep the process alive
-        // indefinitely, because the abort was historically gated on
-        // `phase == 2` only. Extend the abort to fire in any phase once the
-        // work is nominally complete (`current >= total > 0`) AND the
-        // rebuild pipeline is fully quiescent — so a legitimately
-        // slow-but-active sort/rebuild (#294) is never killed. The
-        // `abort_threshold` (default 300 s of zero forward progress) remains
-        // the outer safety margin on top of that.
-        let total = index_progress
-            .total
-            .load(std::sync::atomic::Ordering::Relaxed);
-        // `!self.is_watch`: in watch mode the quiescent `current >= total`
-        // resting state is normal idle (handled by the early return above), so
-        // it must never be treated as a finalize wedge (cass #311).
-        // `!self.semantic_build`: for a one-shot semantic build the same
-        // quiescent state is the active embed/publish window (also handled by
-        // the early return above); belt-and-suspenders so an off-by-one phase
-        // never resurrects the exit(70) that killed the build pre-publish (cass
-        // #315).
-        let finalize_wedge = !self.is_watch
-            && !self.semantic_build
-            && total > 0
-            && current >= total
-            && index_progress.rebuild_pipeline_is_quiescent();
-        let abort_eligible = phase_code == 2 || finalize_wedge;
-        // #319/#321: while the indexer signals `finalizing`, the phase-0 /
-        // current==total / quiescent shape is the post-publish WAL-checkpoint
-        // window, not a #297 wedge. The checkpoint is a synchronous, `!Send`
-        // frankensqlite call on the indexer thread that cannot advance the
-        // progress atomics, so it can only be recognised via this flag. Give it
-        // the larger `finalize_abort_threshold` so a slow-but-active checkpoint
-        // of a large deferred WAL completes instead of being killed mid-write
-        // (which strands the WAL and leaves the DB malformed). A genuine phase-2
-        // wedge (phase_code == 2) is unaffected and still aborts at the normal
-        // threshold. Because the checkpoint blocks a single thread and cannot be
-        // heartbeated, the bound is the only liveness guard: once it elapses the
-        // finalize is aborted too.
-        let effective_abort_threshold = if finalize_wedge
-            && phase_code != 2
-            && index_progress
-                .finalizing
-                .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            // Finalize aborts disabled (CASS_INDEX_FINALIZE_ABORT_SECS=0):
-            // treat the finalize window as report-only.
-            self.finalize_abort_threshold?
-        } else {
-            abort_threshold
-        };
-        if self.abort_policy != IndexStallAbortPolicy::AbortPhaseTwo
-            || !abort_eligible
-            || self.stall_abort_reported_for_phase == Some(phase_code)
-            || stall_elapsed < effective_abort_threshold
-        {
-            return None;
-        }
-
-        self.stall_abort_reported_for_phase = Some(phase_code);
-        Some(self.stall_payload(
-            index_progress,
-            elapsed_ms,
-            stall_elapsed,
-            threshold,
-            "stall_aborting",
-            Some(abort_threshold),
-        ))
-    }
-
-    fn stall_payload(
-        &self,
-        index_progress: &indexer::IndexingProgress,
-        elapsed_ms: u128,
-        stall_elapsed: Duration,
-        threshold: Duration,
-        event: &'static str,
-        abort_threshold: Option<Duration>,
-    ) -> serde_json::Value {
-        let stall_elapsed_ms = stall_elapsed.as_millis();
-        let mut payload = index_progress.snapshot_json(elapsed_ms);
-        if let serde_json::Value::Object(ref mut m) = payload {
-            m.insert("event".into(), serde_json::json!(event));
-            m.insert(
-                "ts_ms".into(),
-                serde_json::json!(chrono::Utc::now().timestamp_millis()),
-            );
-            m.insert(
-                "stall_elapsed_ms".into(),
-                serde_json::json!(stall_elapsed_ms as u64),
-            );
-            m.insert(
-                "stall_threshold_secs".into(),
-                serde_json::json!(threshold.as_secs()),
-            );
-            if let Some(abort_threshold) = abort_threshold {
-                m.insert(
-                    "abort_threshold_secs".into(),
-                    serde_json::json!(abort_threshold.as_secs()),
-                );
-                m.insert("abort_process".into(), serde_json::json!(true));
-                m.insert("exit_code".into(), serde_json::json!(70));
-            }
-            m.insert(
-                "diagnostics".into(),
-                collect_stall_diagnostics(&self.data_dir),
-            );
-            m.insert("hint".into(), serde_json::json!(INDEX_STALL_HINT));
-        }
-        payload
-    }
-}
-
-fn index_stall_warning_lines(payload: &serde_json::Value) -> (String, String) {
-    let phase = payload
-        .get("phase")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("unknown");
-    let elapsed_secs = payload
-        .get("stall_elapsed_ms")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or_default()
-        / 1000;
-    let summary = format!(
-        "Warning: cass index made no {phase} progress for {elapsed_secs}s; stall diagnostics follow."
-    );
-    let diagnostics = serde_json::to_string(payload)
-        .unwrap_or_else(|err| format!(r#"{{"event":"stall_detected","serialize_error":"{err}"}}"#));
-    (summary, diagnostics)
-}
-
-fn abort_after_index_stall_if_requested(payload: &serde_json::Value, data_dir: &Path) {
-    if payload
-        .get("abort_process")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
-        eprintln!(
-            "cass index made no indexing progress past the abort threshold; exiting with code 70."
-        );
-        // #296: before the bounded exit (which skips destructors), best-effort
-        // checkpoint the canonical WAL so the killed run leaves a recoverable
-        // DB instead of a multi-GB orphaned WAL. Stale locks are reaped by the
-        // next startup's flock-based recovery.
-        crate::indexer::best_effort_abort_wal_checkpoint(data_dir);
-        std::process::exit(70);
-    }
-}
-
-#[cfg(test)]
-mod stall_diagnostics_tests {
-    use super::collect_stall_diagnostics;
-    use tempfile::TempDir;
-
-    #[test]
-    fn empty_data_dir_produces_null_checkpoint_and_no_lock() {
-        let tmp = TempDir::new().expect("temp dir");
-        let diag = collect_stall_diagnostics(tmp.path());
-        let obj = diag.as_object().expect("object");
-        assert_eq!(obj["index_dir_exists"], serde_json::json!(false));
-        assert!(obj["lexical_rebuild_checkpoint"].is_object());
-        assert!(
-            obj["lexical_rebuild_checkpoint"]
-                .as_object()
-                .expect("object")
-                .is_empty()
-        );
-        assert!(!obj.contains_key("index_run_lock"));
-    }
-
-    #[test]
-    fn captures_checkpoint_contents_and_lock_when_present() {
-        let tmp = TempDir::new().expect("temp dir");
-        let index_dir = tmp.path().join("index");
-        std::fs::create_dir_all(&index_dir).expect("create index dir");
-        std::fs::write(
-            index_dir.join("lexical_rebuild_state.json"),
-            r#"{"completed": true, "committed_conversation_id": 42}"#,
-        )
-        .expect("write checkpoint");
-        std::fs::write(tmp.path().join("index-run.lock"), "pid=12345\nmode=index\n")
-            .expect("write lock");
-        // Synthetic Tantivy-like segment so we exercise the segment counter.
-        std::fs::write(index_dir.join("abcd.idx"), b"x").expect("write segment");
-
-        let diag = collect_stall_diagnostics(tmp.path());
-        let obj = diag.as_object().expect("object");
-        assert_eq!(obj["index_dir_exists"], serde_json::json!(true));
-        assert_eq!(obj["tantivy_segment_files"], serde_json::json!(1));
-        let checkpoint = obj["lexical_rebuild_checkpoint"]
-            .as_object()
-            .expect("checkpoint object");
-        let entry = checkpoint["lexical_rebuild_state.json"]
-            .as_object()
-            .expect("entry");
-        assert_eq!(
-            entry["content"]["completed"],
-            serde_json::json!(true),
-            "parsed checkpoint JSON should round-trip"
-        );
-        let lock = obj["index_run_lock"].as_object().expect("lock object");
-        assert_eq!(lock["size_bytes"], serde_json::json!(21));
-        assert!(lock.contains_key("modified_ms"));
-        assert!(
-            lock["content_raw"]
-                .as_str()
-                .expect("content_raw string")
-                .contains("pid=12345")
-        );
-    }
-
-    #[test]
-    fn oversized_checkpoint_omits_content_but_records_size() {
-        let tmp = TempDir::new().expect("temp dir");
-        let index_dir = tmp.path().join("index");
-        std::fs::create_dir_all(&index_dir).expect("create index dir");
-        let big = vec![b'x'; 128 * 1024];
-        std::fs::write(index_dir.join("lexical_rebuild_state.json"), &big)
-            .expect("write oversize checkpoint");
-
-        let diag = collect_stall_diagnostics(tmp.path());
-        let entry = diag["lexical_rebuild_checkpoint"]["lexical_rebuild_state.json"]
-            .as_object()
-            .expect("entry");
-        assert!(entry.contains_key("content_omitted"));
-        assert!(!entry.contains_key("content"));
-        assert_eq!(entry["size_bytes"], serde_json::json!(big.len() as u64));
-    }
-
-    /// Regression for #258: `IndexStallWatchdog` previously short-
-    /// circuited on `phase_code == 0` (the "preparing" phase before
-    /// Scanning/Indexing), so any startup wedge that never advanced
-    /// past phase=0 was invisible. The v0.6.2 watcher reporter saw
-    /// 4+ hours of silence on exactly that path. The watchdog now
-    /// fires whenever no progress is observed within the threshold,
-    /// regardless of phase.
-    #[test]
-    fn watchdog_fires_on_phase_zero_startup_wedge() {
-        use super::IndexStallWatchdog;
-        use crate::indexer::IndexingProgress;
-        use std::sync::Arc;
-        use std::sync::atomic::Ordering;
-        use std::time::Duration;
-
-        let tmp = TempDir::new().expect("temp dir");
-        let mut watchdog =
-            IndexStallWatchdog::new(tmp.path().to_path_buf(), Duration::from_millis(50));
-        // Force a tiny stall threshold so the test does not need to
-        // sleep 120 s. Using a smaller-than-default value still
-        // exercises the same code path because
-        // `index_stall_threshold` floors at `progress_interval + 1s`,
-        // but for the unit test we drive the watchdog by directly
-        // tampering with `last_progress_advance`.
-        watchdog.threshold = Some(Duration::from_millis(1));
-        // Simulate "indexer just started, phase=0, current=0". Force
-        // last_progress_advance into the past so the threshold has
-        // already elapsed by the time we call `observe`.
-        watchdog.last_phase = 0;
-        watchdog.last_current = 0;
-        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
-
-        let progress = Arc::new(IndexingProgress::default());
-        // Caller has not touched phase/current — still 0/0.
-        assert_eq!(progress.phase.load(Ordering::Relaxed), 0);
-        assert_eq!(progress.current.load(Ordering::Relaxed), 0);
-
-        let payload = watchdog.observe(&progress, 100);
-        let payload = payload.expect(
-            "phase=0 wedges past the stall threshold must emit a stall_detected event (#258)",
-        );
-        let obj = payload.as_object().expect("event payload is an object");
-        assert_eq!(obj["event"], serde_json::json!("stall_detected"));
-        assert!(
-            obj.contains_key("stall_elapsed_ms"),
-            "watchdog event missing stall_elapsed_ms",
-        );
-
-        // Second observe call with no progress must be silenced by
-        // the per-phase repeat guard.
-        let repeat = watchdog.observe(&progress, 200);
-        assert!(
-            repeat.is_none(),
-            "watchdog must not spam repeated events for the same phase",
-        );
-    }
-
-    #[test]
-    fn watchdog_reports_before_phase_two_abort_event() -> anyhow::Result<()> {
-        use super::{IndexStallAbortPolicy, IndexStallWatchdog};
-        use crate::indexer::IndexingProgress;
-        use std::sync::Arc;
-        use std::sync::atomic::Ordering;
-        use std::time::Duration;
-
-        let tmp = TempDir::new()?;
-        let mut watchdog = IndexStallWatchdog::with_abort_policy(
-            tmp.path().to_path_buf(),
-            Duration::from_millis(50),
-            IndexStallAbortPolicy::AbortPhaseTwo,
-        );
-        watchdog.threshold = Some(Duration::from_millis(1));
-        watchdog.abort_threshold = Some(Duration::from_millis(2));
-        watchdog.last_phase = 2;
-        watchdog.last_current = 0;
-        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
-
-        let progress = Arc::new(IndexingProgress::default());
-        progress.phase.store(2, Ordering::Relaxed);
-
-        let report = watchdog
-            .observe(&progress, 100)
-            .ok_or_else(|| anyhow::anyhow!("phase-2 stall observation did not report"))?;
-        assert_eq!(report["event"], serde_json::json!("stall_detected"));
-        assert_ne!(report["abort_process"], serde_json::json!(true));
-
-        let abort = watchdog
-            .observe(&progress, 200)
-            .ok_or_else(|| anyhow::anyhow!("phase-2 stall observation did not request abort"))?;
-        assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
-        assert_eq!(abort["abort_process"], serde_json::json!(true));
-        assert_eq!(abort["exit_code"], serde_json::json!(70));
-
-        let repeat = watchdog.observe(&progress, 300);
-        assert!(
-            repeat.is_none(),
-            "watchdog must not spam repeated abort events for the same stalled phase",
-        );
-        Ok(())
-    }
-
-    /// Regression for #297: the post-publish / post-rebuild finalize runs
-    /// under the "preparing" phase (phase 0) with `current == total`. A
-    /// wedge there used to hang forever because the abort was gated on
-    /// `phase == 2`. The abort now fires for a quiescent finalize wedge in
-    /// any phase.
-    #[test]
-    fn watchdog_aborts_on_quiescent_finalize_wedge() -> anyhow::Result<()> {
-        use super::{IndexStallAbortPolicy, IndexStallWatchdog};
-        use crate::indexer::IndexingProgress;
-        use std::sync::Arc;
-        use std::sync::atomic::Ordering;
-        use std::time::Duration;
-
-        let tmp = TempDir::new()?;
-        let mut watchdog = IndexStallWatchdog::with_abort_policy(
-            tmp.path().to_path_buf(),
-            Duration::from_millis(50),
-            IndexStallAbortPolicy::AbortPhaseTwo,
-        );
-        watchdog.threshold = Some(Duration::from_millis(1));
-        watchdog.abort_threshold = Some(Duration::from_millis(2));
-        watchdog.last_phase = 0;
-        watchdog.last_current = 100;
-        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
-
-        let progress = Arc::new(IndexingProgress::default());
-        // Post-publish finalize: phase back to "preparing" (0), all work
-        // accounted for (current == total), pipeline fully idle.
-        progress.phase.store(0, Ordering::Relaxed);
-        progress.total.store(100, Ordering::Relaxed);
-        progress.current.store(100, Ordering::Relaxed);
-        assert!(progress.rebuild_pipeline_is_quiescent());
-
-        let report = watchdog
-            .observe(&progress, 100)
-            .ok_or_else(|| anyhow::anyhow!("finalize stall did not report"))?;
-        assert_eq!(report["event"], serde_json::json!("stall_detected"));
-        assert_ne!(report["abort_process"], serde_json::json!(true));
-
-        let abort = watchdog.observe(&progress, 200).ok_or_else(|| {
-            anyhow::anyhow!("quiescent finalize wedge did not request abort (#297)")
-        })?;
-        assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
-        assert_eq!(abort["abort_process"], serde_json::json!(true));
-        assert_eq!(abort["exit_code"], serde_json::json!(70));
-        Ok(())
-    }
-
-    /// Regression for #311: in `cass index --watch` mode the post-publish
-    /// quiescent resting state (phase 0, `current == total`, pipeline idle) is
-    /// NORMAL idle between rescans, not a wedge. A watch-aware watchdog must
-    /// neither report a stall nor abort the long-lived daemon with exit(70)
-    /// (the bug: a deterministic exit-70 crash-loop, systemd restart, repeat).
-    /// A genuine phase-2 wedge must still abort even in watch mode.
-    #[test]
-    fn watchdog_does_not_abort_watch_idle_resting_state() -> anyhow::Result<()> {
-        use super::{IndexStallAbortPolicy, IndexStallWatchdog};
-        use crate::indexer::IndexingProgress;
-        use std::sync::Arc;
-        use std::sync::atomic::Ordering;
-        use std::time::Duration;
-
-        let tmp = TempDir::new()?;
-        let mut watchdog = IndexStallWatchdog::with_abort_policy(
-            tmp.path().to_path_buf(),
-            Duration::from_millis(50),
-            IndexStallAbortPolicy::AbortPhaseTwo,
-        )
-        .watch_aware(true);
-        watchdog.threshold = Some(Duration::from_millis(1));
-        watchdog.abort_threshold = Some(Duration::from_millis(2));
-        watchdog.last_phase = 0;
-        watchdog.last_current = 100;
-        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
-
-        let progress = Arc::new(IndexingProgress::default());
-        // Identical state to the #297 finalize-wedge test, but in watch mode
-        // this is healthy idle: the daemon published and awaits the next rescan.
-        progress.phase.store(0, Ordering::Relaxed);
-        progress.total.store(100, Ordering::Relaxed);
-        progress.current.store(100, Ordering::Relaxed);
-        assert!(progress.rebuild_pipeline_is_quiescent());
-
-        // Well past both detect and abort thresholds: a non-watch watchdog
-        // would emit stall_detected then stall_aborting(exit 70) here (see
-        // `watchdog_aborts_on_quiescent_finalize_wedge`). Watch-aware: silent.
-        assert!(
-            watchdog.observe(&progress, 100).is_none(),
-            "watch idle resting state must not be reported as a stall (#311)"
-        );
-        assert!(
-            watchdog.observe(&progress, 200).is_none(),
-            "watch idle resting state must never trigger exit(70) abort (#311)"
-        );
-
-        // A genuine phase-2 wedge in watch mode is still aborted.
-        progress.phase.store(2, Ordering::Relaxed);
-        // The phase change resets the watchdog's progress clock; re-arm it.
-        let _ = watchdog.observe(&progress, 250);
-        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
-        let detected = watchdog
-            .observe(&progress, 300)
-            .ok_or_else(|| anyhow::anyhow!("phase-2 watch stall did not report"))?;
-        assert_eq!(detected["event"], serde_json::json!("stall_detected"));
-        let abort = watchdog
-            .observe(&progress, 400)
-            .ok_or_else(|| anyhow::anyhow!("phase-2 watch stall did not abort"))?;
-        assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
-        assert_eq!(abort["exit_code"], serde_json::json!(70));
-        Ok(())
-    }
-
-    /// Regression for #315: a one-shot `cass index --semantic` build finishes
-    /// the lexical rebuild (parking progress at phase 0, `current == total`,
-    /// pipeline quiescent) and then runs the native embed + HNSW build + vector
-    /// publish for minutes WITHOUT advancing the progress atomics. That work is
-    /// shaped exactly like a #297 finalize wedge, so a non-semantic watchdog
-    /// used to abort mid-embed with exit(70) before publishing any vector index
-    /// — leaving semantic search permanently unavailable. A semantic-aware
-    /// watchdog must treat that quiescent finalize state as healthy active work
-    /// (no exit-70 abort), while a genuine phase-2 lexical wedge still aborts.
-    #[test]
-    fn watchdog_does_not_abort_semantic_finalize_build() -> anyhow::Result<()> {
-        use super::{IndexStallAbortPolicy, IndexStallWatchdog};
-        use crate::indexer::IndexingProgress;
-        use std::sync::Arc;
-        use std::sync::atomic::Ordering;
-        use std::time::Duration;
-
-        let tmp = TempDir::new()?;
-        let mut watchdog = IndexStallWatchdog::with_abort_policy(
-            tmp.path().to_path_buf(),
-            Duration::from_millis(50),
-            IndexStallAbortPolicy::AbortPhaseTwo,
-        )
-        .semantic_aware(true);
-        watchdog.threshold = Some(Duration::from_millis(1));
-        watchdog.abort_threshold = Some(Duration::from_millis(2));
-        watchdog.last_phase = 0;
-        watchdog.last_current = 100;
-        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
-
-        let progress = Arc::new(IndexingProgress::default());
-        // Identical state to the #297 finalize-wedge test, but this is the
-        // semantic embed/publish window: the lexical rebuild published and the
-        // native embedder is now grinding through vectors without touching the
-        // atomics. Well past both detect and abort thresholds.
-        progress.phase.store(0, Ordering::Relaxed);
-        progress.total.store(100, Ordering::Relaxed);
-        progress.current.store(100, Ordering::Relaxed);
-        assert!(progress.rebuild_pipeline_is_quiescent());
-
-        assert!(
-            watchdog.observe(&progress, 100).is_none(),
-            "semantic finalize build must not be reported as a stall (#315)"
-        );
-        assert!(
-            watchdog.observe(&progress, 200).is_none(),
-            "semantic finalize build must never trigger exit(70) before publish (#315)"
-        );
-
-        // A genuine phase-2 lexical wedge during a semantic run is still aborted.
-        progress.phase.store(2, Ordering::Relaxed);
-        // The phase change resets the watchdog's progress clock; re-arm it.
-        let _ = watchdog.observe(&progress, 250);
-        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
-        let detected = watchdog
-            .observe(&progress, 300)
-            .ok_or_else(|| anyhow::anyhow!("phase-2 semantic stall did not report"))?;
-        assert_eq!(detected["event"], serde_json::json!("stall_detected"));
-        let abort = watchdog
-            .observe(&progress, 400)
-            .ok_or_else(|| anyhow::anyhow!("phase-2 semantic stall did not abort"))?;
-        assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
-        assert_eq!(abort["exit_code"], serde_json::json!(70));
-        Ok(())
-    }
-
-    /// Regression for #319/#321: the post-publish finalize WAL checkpoint of a
-    /// large deferred bulk-ingest WAL runs as a synchronous, `!Send`
-    /// frankensqlite call on the indexer thread (inside
-    /// `close_storage_after_index`). It cannot advance the progress atomics, so
-    /// it looks exactly like a #297 finalize wedge — phase 0, `current == total`,
-    /// pipeline quiescent — while the process is actually alive and checkpointing
-    /// (minutes on macOS). Before this fix the watchdog aborted it at the normal
-    /// 300 s threshold with `exit(70)`, killing the checkpoint mid-write and
-    /// stranding the un-truncated ~1.1 GB WAL (leaving the DB malformed to stock
-    /// SQLite). The indexer now sets `IndexingProgress::finalizing`; the watchdog
-    /// must (a) NOT abort while finalizing until the larger
-    /// `finalize_abort_threshold` elapses, yet (b) still abort a genuinely stuck
-    /// finalize once that bound passes, and (c) still abort a normal phase-2
-    /// wedge at the ordinary threshold.
-    #[test]
-    fn watchdog_defers_abort_during_final_wal_checkpoint_finalize() -> anyhow::Result<()> {
-        use super::{IndexStallAbortPolicy, IndexStallWatchdog};
-        use crate::indexer::IndexingProgress;
-        use std::sync::Arc;
-        use std::sync::atomic::Ordering;
-        use std::time::Duration;
-
-        let tmp = TempDir::new()?;
-        let mut watchdog = IndexStallWatchdog::with_abort_policy(
-            tmp.path().to_path_buf(),
-            Duration::from_millis(50),
-            IndexStallAbortPolicy::AbortPhaseTwo,
-        );
-        watchdog.threshold = Some(Duration::from_millis(1));
-        watchdog.abort_threshold = Some(Duration::from_millis(2));
-        // Generous finalize grace: much larger than the ordinary abort threshold.
-        watchdog.finalize_abort_threshold = Some(Duration::from_millis(500));
-        watchdog.last_phase = 0;
-        watchdog.last_current = 100;
-        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
-
-        let progress = Arc::new(IndexingProgress::default());
-        // The exact #297 finalize-wedge shape, but the indexer has signalled it
-        // is inside the final WAL checkpoint.
-        progress.phase.store(0, Ordering::Relaxed);
-        progress.total.store(100, Ordering::Relaxed);
-        progress.current.store(100, Ordering::Relaxed);
-        progress.finalizing.store(true, Ordering::Relaxed);
-        assert!(progress.rebuild_pipeline_is_quiescent());
-
-        // Well past the ordinary abort threshold (2 ms) but under the finalize
-        // grace (500 ms): the first observe reports the stall, but the watchdog
-        // must NOT abort — the checkpoint is legitimate active work.
-        let detected = watchdog
-            .observe(&progress, 100)
-            .ok_or_else(|| anyhow::anyhow!("finalize stall did not report"))?;
-        assert_eq!(detected["event"], serde_json::json!("stall_detected"));
-        assert!(
-            detected.get("exit_code").is_none(),
-            "the stall_detected report must not carry an abort during finalize"
-        );
-        assert_eq!(detected["finalizing"], serde_json::json!(true));
-        for elapsed in [200_u128, 300, 400] {
-            assert!(
-                watchdog.observe(&progress, elapsed).is_none(),
-                "the finalize WAL checkpoint must not be aborted before the finalize grace elapses (#319/#321)"
-            );
-        }
-
-        // Liveness bound: once the finalize grace itself elapses, a genuinely
-        // stuck finalize is still aborted (the checkpoint blocks one thread and
-        // cannot be heartbeated, so this bound is the only guard).
-        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(600);
-        let abort = watchdog
-            .observe(&progress, 500)
-            .ok_or_else(|| anyhow::anyhow!("stuck finalize past the grace did not abort"))?;
-        assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
-        assert_eq!(abort["exit_code"], serde_json::json!(70));
-
-        // Control: with `finalizing` cleared, the identical quiescent shape is a
-        // #297 wedge again and aborts at the ordinary threshold.
-        let mut wedge_watchdog = IndexStallWatchdog::with_abort_policy(
-            tmp.path().to_path_buf(),
-            Duration::from_millis(50),
-            IndexStallAbortPolicy::AbortPhaseTwo,
-        );
-        wedge_watchdog.threshold = Some(Duration::from_millis(1));
-        wedge_watchdog.abort_threshold = Some(Duration::from_millis(2));
-        wedge_watchdog.finalize_abort_threshold = Some(Duration::from_millis(500));
-        wedge_watchdog.last_phase = 0;
-        wedge_watchdog.last_current = 100;
-        wedge_watchdog.last_progress_advance =
-            std::time::Instant::now() - Duration::from_millis(100);
-        progress.finalizing.store(false, Ordering::Relaxed);
-        let detected = wedge_watchdog
-            .observe(&progress, 100)
-            .ok_or_else(|| anyhow::anyhow!("non-finalizing wedge did not report"))?;
-        assert_eq!(detected["event"], serde_json::json!("stall_detected"));
-        let abort = wedge_watchdog.observe(&progress, 200).ok_or_else(|| {
-            anyhow::anyhow!("non-finalizing wedge did not abort at the ordinary threshold")
-        })?;
-        assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
-        assert_eq!(abort["exit_code"], serde_json::json!(70));
-        Ok(())
-    }
-
-    /// A legitimately slow but *active* rebuild (#294) must never be
-    /// aborted outside phase 2, even when `current == total` and the stall
-    /// threshold has elapsed: as long as the pipeline reports in-flight
-    /// work, the watchdog only reports, never aborts.
-    #[test]
-    fn watchdog_does_not_abort_active_rebuild_outside_phase_two() -> anyhow::Result<()> {
-        use super::{IndexStallAbortPolicy, IndexStallWatchdog};
-        use crate::indexer::IndexingProgress;
-        use std::sync::Arc;
-        use std::sync::atomic::Ordering;
-        use std::time::Duration;
-
-        let tmp = TempDir::new()?;
-        let mut watchdog = IndexStallWatchdog::with_abort_policy(
-            tmp.path().to_path_buf(),
-            Duration::from_millis(50),
-            IndexStallAbortPolicy::AbortPhaseTwo,
-        );
-        watchdog.threshold = Some(Duration::from_millis(1));
-        watchdog.abort_threshold = Some(Duration::from_millis(2));
-        watchdog.last_phase = 0;
-        watchdog.last_current = 100;
-        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
-
-        let progress = Arc::new(IndexingProgress::default());
-        progress.phase.store(0, Ordering::Relaxed);
-        progress.total.store(100, Ordering::Relaxed);
-        progress.current.store(100, Ordering::Relaxed);
-        // Still one staged shard build in flight: the rebuild is slow, not
-        // wedged.
-        progress
-            .rebuild_pipeline_staged_shard_build_active_jobs
-            .store(1, Ordering::Relaxed);
-        assert!(!progress.rebuild_pipeline_is_quiescent());
-
-        let report = watchdog
-            .observe(&progress, 100)
-            .ok_or_else(|| anyhow::anyhow!("finalize stall did not report"))?;
-        assert_eq!(report["event"], serde_json::json!("stall_detected"));
-
-        let again = watchdog.observe(&progress, 200);
-        assert!(
-            again.is_none(),
-            "an active (non-quiescent) rebuild must not be aborted outside phase 2 (#294)",
-        );
-        Ok(())
-    }
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -87003,7 +85520,6 @@ fn run_index_with_data(
     watch_interval: u64,
     data_dir_override: Option<PathBuf>,
     semantic: bool,
-    build_hnsw: bool,
     embedder: String,
     progress: ProgressResolved,
     output_format: Option<RobotFormat>,
@@ -87012,7 +85528,6 @@ fn run_index_with_data(
     no_progress_events: bool,
     robot_trace_ingest: bool,
 ) -> CliResult<()> {
-    use frankensqlite::compat::{ConnectionExt, RowExt};
     use std::time::Instant;
 
     let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
@@ -87037,7 +85552,6 @@ fn run_index_with_data(
         force_rebuild.hash(&mut hasher);
         watch.hash(&mut hasher);
         semantic.hash(&mut hasher);
-        build_hnsw.hash(&mut hasher);
         embedder.hash(&mut hasher);
         robot_trace_ingest.hash(&mut hasher);
         format!("{}", data_dir.display()).hash(&mut hasher);
@@ -87058,14 +85572,14 @@ fn run_index_with_data(
                         created_at INTEGER NOT NULL,
                         expires_at INTEGER NOT NULL
                     )",
-                ) {
+                &[]) {
                     tracing::warn!("Failed to create idempotency_keys table: {e}");
                 }
 
                 let now_ms = chrono::Utc::now().timestamp_millis();
-                if let Err(e) = conn.execute_compat(
+                if let Err(e) = conn.execute(
                     "DELETE FROM idempotency_keys WHERE expires_at < ?1",
-                    frankensqlite::params![now_ms],
+                    &crate::storage::api::params![now_ms],
                 ) {
                     tracing::warn!("Failed to clean expired idempotency keys: {e}");
                 }
@@ -87073,8 +85587,8 @@ fn run_index_with_data(
                 let cached: Option<(String, String)> = conn
                     .query_row_map(
                         "SELECT params_hash, result_json FROM idempotency_keys WHERE key = ?1 AND expires_at > ?2",
-                        frankensqlite::params![key.as_str(), now_ms],
-                        |r: &frankensqlite::Row| Ok((r.get_typed(0)?, r.get_typed(1)?)),
+                        &crate::storage::api::params![key.as_str(), now_ms],
+                        |r: &FrankenRow| Ok((r.get_typed(0)?, r.get_typed(1)?)),
                     )
                     .ok();
                 Ok(cached)
@@ -87125,7 +85639,6 @@ fn run_index_with_data(
             .map(std::vec::Vec::len)
             .unwrap_or_default(),
         semantic,
-        build_hnsw,
     );
 
     // Decide whether to emit NDJSON progress events on stderr (structured output only).
@@ -87151,23 +85664,6 @@ fn run_index_with_data(
         }
     };
 
-    // #287: machine-readable liveness for robot callers. Healthy structured
-    // runs still end with exactly one JSON document on stdout; but when the
-    // stall watchdog fires, a robot caller that only reads stdout used to see
-    // zero bytes until its external timeout killed the process. Emit the
-    // stall/abort payload as an NDJSON event line on stdout too (flushed, in
-    // case the caller kills us next) so the agent can distinguish "wedged
-    // indexer" from "slow command" before its deadline.
-    let emit_robot_stall_event_on_stdout = |payload: &serde_json::Value| {
-        if structured_format.is_some()
-            && let Ok(line) = serde_json::to_string(payload)
-        {
-            use std::io::Write as _;
-            println!("{line}");
-            let _ = std::io::stdout().flush();
-        }
-    };
-
     if let Some(notice) = &indexing_exclusion_notice {
         emit_indexing_exclusion_notice(notice, structured_output);
     }
@@ -87184,7 +85680,6 @@ fn run_index_with_data(
             "watch": watch,
             "entrypoint": entrypoint.kind,
             "semantic": semantic,
-            "build_hnsw": build_hnsw,
             "embedder": embedder,
             "data_dir": data_dir.display().to_string(),
             "db_path": db_path.display().to_string(),
@@ -87227,7 +85722,6 @@ fn run_index_with_data(
         db_path: db_path.clone(),
         data_dir: data_dir.clone(),
         semantic,
-        build_hnsw,
         embedder: embedder.clone(),
         progress: Some(index_progress.clone()),
         watch_interval_secs: watch_interval,
@@ -87282,10 +85776,6 @@ fn run_index_with_data(
         let mut last_current = usize::MAX;
         let mut last_agents = usize::MAX;
         let mut last_update = std::time::Instant::now();
-        let mut stall_watchdog =
-            IndexStallWatchdog::aborting_phase_two(data_dir.clone(), progress_interval)
-                .watch_aware(watch)
-                .semantic_aware(semantic);
 
         loop {
             // Check if indexer finished
@@ -87370,15 +85860,6 @@ fn run_index_with_data(
                 last_update = now;
             }
 
-            if let Some(payload) =
-                stall_watchdog.observe(&index_progress, start.elapsed().as_millis())
-            {
-                let (summary, diagnostics) = index_stall_warning_lines(&payload);
-                pb.println(summary);
-                pb.println(diagnostics);
-                abort_after_index_stall_if_requested(&payload, stall_watchdog.data_dir());
-            }
-
             std::thread::sleep(Duration::from_millis(50));
         }
 
@@ -87396,10 +85877,6 @@ fn run_index_with_data(
         let mut last_agents = 0;
         let mut last_current = 0;
         let mut last_scan_current = 0;
-        let mut stall_watchdog =
-            IndexStallWatchdog::aborting_phase_two(data_dir.clone(), progress_interval)
-                .watch_aware(watch)
-                .semantic_aware(semantic);
 
         loop {
             if index_handle.is_finished() {
@@ -87447,15 +85924,6 @@ fn run_index_with_data(
                 last_current = current;
             }
 
-            if let Some(payload) =
-                stall_watchdog.observe(&index_progress, start.elapsed().as_millis())
-            {
-                let (summary, diagnostics) = index_stall_warning_lines(&payload);
-                eprintln!("{summary}");
-                eprintln!("{diagnostics}");
-                abort_after_index_stall_if_requested(&payload, stall_watchdog.data_dir());
-            }
-
             std::thread::sleep(Duration::from_millis(200));
         }
     } else if emit_progress_events {
@@ -87468,10 +85936,6 @@ fn run_index_with_data(
         let mut last_emit = std::time::Instant::now()
             .checked_sub(progress_interval)
             .unwrap_or_else(std::time::Instant::now);
-        let mut stall_watchdog =
-            IndexStallWatchdog::aborting_phase_two(data_dir.clone(), progress_interval)
-                .watch_aware(watch)
-                .semantic_aware(semantic);
 
         // Finish-aware poll cadence: 100ms for snappy shutdown, but only emit a
         // `progress` event at `progress_interval`.
@@ -87510,34 +85974,12 @@ fn run_index_with_data(
                 last_emit = std::time::Instant::now();
             }
 
-            if let Some(payload) = stall_watchdog.observe(&index_progress, elapsed_ms) {
-                emit_event(payload.clone());
-                emit_robot_stall_event_on_stdout(&payload);
-                abort_after_index_stall_if_requested(&payload, stall_watchdog.data_dir());
-            }
-
             std::thread::sleep(Duration::from_millis(100));
         }
     } else {
         // No progress display (json mode with events disabled, or plain=none):
         // just wait for completion.
-        let mut stall_watchdog =
-            IndexStallWatchdog::aborting_phase_two(data_dir.clone(), progress_interval)
-                .watch_aware(watch)
-                .semantic_aware(semantic);
         while !index_handle.is_finished() {
-            if let Some(payload) =
-                stall_watchdog.observe(&index_progress, start.elapsed().as_millis())
-            {
-                let (summary, diagnostics) = index_stall_warning_lines(&payload);
-                eprintln!("{summary}");
-                eprintln!("{diagnostics}");
-                // #287: `--json --no-progress-events` callers still need a
-                // machine-readable stall signal on stdout before any external
-                // timeout kills the run.
-                emit_robot_stall_event_on_stdout(&payload);
-                abort_after_index_stall_if_requested(&payload, stall_watchdog.data_dir());
-            }
             std::thread::sleep(Duration::from_millis(100));
         }
     }
@@ -87592,10 +86034,35 @@ fn run_index_with_data(
 
     if let Some((pb, conversations, agents)) = progress_completion {
         match &res {
-            Ok(_) => pb.finish_with_message(format!(
-                "Done: {} conversations from {} agent(s)",
-                conversations, agents
-            )),
+            Ok(_) => {
+                let mut message =
+                    format!("Done: {conversations} conversations from {agents} agent(s)");
+                // R3-4: R2-B1 disclosed `semantic_activated` unconditionally
+                // in the JSON payload and the Plain-mode `eprintln!` below,
+                // but left this Bars-mode completion line -- the default
+                // interactive-TTY path -- with no mention of it at all, so
+                // a TTY user running `cass index --semantic` never saw
+                // whether the semantic index actually became searchable
+                // this run.
+                if let Ok(stats) = index_progress.stats.lock() {
+                    if let Some(suffix) = semantic_activation_suffix(&stats) {
+                        message.push_str(&suffix);
+                    }
+                    // R4-4: same disclosure as the JSON (`indexing_stats.
+                    // cleanup_failures`) and Plain (`eprintln!` below)
+                    // paths -- a TTY user must see the same signal, not
+                    // just "activated: true/false" with a housekeeping
+                    // failure silently missing from the one line they
+                    // actually watch.
+                    if !stats.cleanup_failures.is_empty() {
+                        message.push_str(&format!(
+                            ", cleanup failures: {}",
+                            stats.cleanup_failures.len()
+                        ));
+                    }
+                }
+                pb.finish_with_message(message);
+            }
             Err(err) => pb.abandon_with_message(format!("Failed: {}", err)),
         }
     }
@@ -87657,16 +86124,18 @@ fn run_index_with_data(
                 ))
             })
             .unwrap_or((0, 0));
-        let (quarantined_conversations, lexical_update_deferred) = index_progress
-            .stats
-            .lock()
-            .map(|stats| {
-                (
-                    stats.quarantined_conversations,
-                    stats.lexical_update_deferred,
-                )
-            })
-            .unwrap_or_default();
+        let (quarantined_conversations, lexical_update_deferred, semantic_activated) =
+            index_progress
+                .stats
+                .lock()
+                .map(|stats| {
+                    (
+                        stats.quarantined_conversations,
+                        stats.lexical_update_deferred,
+                        stats.semantic_activated,
+                    )
+                })
+                .unwrap_or_default();
         let mut payload = serde_json::json!({
             "success": true,
             "elapsed_ms": elapsed_ms,
@@ -87680,6 +86149,15 @@ fn run_index_with_data(
             "quarantined_conversations": quarantined_conversations,
             "lexical_update_deferred": lexical_update_deferred,
         });
+        // R2-B1: unconditional (true or false) whenever this run requested
+        // semantic indexing -- `false` is a legitimate "ingested, holes not
+        // yet drained" state, not an error, but it must never be silently
+        // absent the way a discarded bool previously left it: exit 0 alone
+        // told a caller nothing about whether this run's semantic index
+        // actually became searchable.
+        if let Some(activated) = semantic_activated {
+            payload["activated"] = serde_json::json!(activated);
+        }
 
         // Add structured indexing stats if available (T7.4)
         if let Ok(stats) = index_progress.stats.lock()
@@ -87704,9 +86182,9 @@ fn run_index_with_data(
                     let expires_ms = now_ms + 24 * 60 * 60 * 1000; // 24 hours
                     let result_json = serde_json::to_string(&payload).unwrap_or_default();
                     let hash_str = params_hash.to_string();
-                    conn.execute_compat(
+                    conn.execute(
                         "INSERT OR REPLACE INTO idempotency_keys (key, params_hash, result_json, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                        frankensqlite::params![key.as_str(), hash_str.as_str(), result_json.as_str(), now_ms, expires_ms],
+                        &crate::storage::api::params![key.as_str(), hash_str.as_str(), result_json.as_str(), now_ms, expires_ms],
                     )?;
                     Ok(())
                 },
@@ -87732,6 +86210,31 @@ fn run_index_with_data(
 
     if show_plain {
         eprintln!("index completed");
+        // R2-B1: same unconditional true/false disclosure as the JSON path
+        // -- `false` means this run ingested but the generation's holes
+        // weren't fully drained yet (rerun to continue), not a failure.
+        if let Ok(stats) = index_progress.stats.lock() {
+            if let Some(activated) = stats.semantic_activated {
+                eprintln!(
+                    "semantic index: {}",
+                    if activated {
+                        "activated"
+                    } else {
+                        "not activated yet (holes remain; rerun to continue draining embedding_holes)"
+                    }
+                );
+            }
+            // R4-4: same `cleanup_failures` disclosure as the JSON
+            // (`indexing_stats.cleanup_failures`) and Bars paths above --
+            // previously only `cass models backfill`'s human-output branch
+            // (lib.rs:97460-97465) printed this for its own catch-up call.
+            if !stats.cleanup_failures.is_empty() {
+                eprintln!("semantic index cleanup failures: {}", stats.cleanup_failures.len());
+                for failure in &stats.cleanup_failures {
+                    eprintln!("  - generation {}: {}", failure.generation_id, failure.error);
+                }
+            }
+        }
     }
 
     match res {
@@ -91478,7 +89981,6 @@ mod export_timestamp_tests {
 mod legacy_source_filter_tests {
     use super::*;
     use crate::sources::provenance::SourceFilter;
-    use frankensqlite::compat::{ConnectionExt, RowExt};
     use std::path::Path;
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -91489,14 +89991,14 @@ mod legacy_source_filter_tests {
         let shared_path = PathBuf::from("/legacy/shared/session.jsonl");
 
         with_frankensqlite_connection(&db_path, "legacy source test", |conn| {
-            conn.execute("PRAGMA journal_mode = WAL;")?;
-            conn.execute("CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);")?;
+            conn.execute("PRAGMA journal_mode = WAL;", &[])?;
+            conn.execute("CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);", &[])?;
             conn.execute(
                 "CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT, display_name TEXT);",
-            )?;
+            &[])?;
             conn.execute(
                 "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT, host_label TEXT);",
-            )?;
+            &[])?;
             conn.execute(
                 "CREATE TABLE conversations (
                     id INTEGER PRIMARY KEY,
@@ -91513,7 +90015,7 @@ mod legacy_source_filter_tests {
                     metadata_json TEXT,
                     metadata_bin BLOB
                 );",
-            )?;
+            &[])?;
             conn.execute(
                 "CREATE TABLE messages (
                     id INTEGER PRIMARY KEY,
@@ -91523,11 +90025,11 @@ mod legacy_source_filter_tests {
                     created_at INTEGER,
                     content TEXT
                 );",
-            )?;
-            conn.execute("INSERT INTO agents(id, slug) VALUES (1, 'codex')")?;
+            &[])?;
+            conn.execute("INSERT INTO agents(id, slug) VALUES (1, 'codex')", &[])?;
             conn.execute(
                 "INSERT INTO sources(id, kind, host_label) VALUES ('laptop', 'ssh', 'user@laptop')",
-            )?;
+            &[])?;
             conn.execute(
                 "INSERT INTO conversations(
                     id, agent_id, workspace_id, source_id, origin_host, title,
@@ -91538,7 +90040,7 @@ mod legacy_source_filter_tests {
                     '/legacy/shared/session.jsonl', 1700000000000, NULL, 10,
                     'legacy-local', '{}', NULL
                 )",
-            )?;
+            &[])?;
             conn.execute(
                 "INSERT INTO conversations(
                     id, agent_id, workspace_id, source_id, origin_host, title,
@@ -91549,15 +90051,15 @@ mod legacy_source_filter_tests {
                     '/legacy/shared/session.jsonl', 1700000100000, NULL, 10,
                     'remote-shared', '{}', NULL
                 )",
-            )?;
+            &[])?;
             conn.execute(
                 "INSERT INTO messages(id, conversation_id, idx, role, created_at, content)
                  VALUES (1, 1, 0, 'user', 1700000000100, 'local body')",
-            )?;
+            &[])?;
             conn.execute(
                 "INSERT INTO messages(id, conversation_id, idx, role, created_at, content)
                  VALUES (2, 2, 0, 'user', 1700000100100, 'remote body')",
-            )?;
+            &[])?;
             Ok(())
         })
         .expect("create legacy db");
@@ -91565,8 +90067,8 @@ mod legacy_source_filter_tests {
         (tmp, db_path, shared_path)
     }
 
-    fn open_legacy_local_db_for_update(db_path: &Path) -> frankensqlite::Connection {
-        frankensqlite::Connection::open(db_path.to_string_lossy().to_string())
+    fn open_legacy_local_db_for_update(db_path: &Path) -> FrankenConnection {
+        FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().to_string())), crate::storage::api::Profile::Production)
             .expect("open writable legacy source test db")
     }
 
@@ -91612,7 +90114,7 @@ mod legacy_source_filter_tests {
         );
         assert_eq!(
             stats_workspace_count_sql(""),
-            "SELECT c.workspace_id, COUNT(*) FROM conversations c WHERE c.workspace_id IS NOT NULL GROUP BY c.workspace_id ORDER BY COUNT(*) DESC",
+            "SELECT c.workspace_id, COUNT(*) FROM conversations c WHERE c.workspace_id IS NOT NULL GROUP BY c.workspace_id ORDER BY COUNT(*) DESC, c.workspace_id ASC",
             "unfiltered workspace stats can aggregate workspace IDs before path lookup"
         );
 
@@ -91638,7 +90140,7 @@ mod legacy_source_filter_tests {
     fn source_filter_helpers_match_blank_remote_source_id_via_origin_host() {
         let (_tmp, db_path, _shared_path) = make_legacy_local_db();
         let conn = open_legacy_local_db_for_update(&db_path);
-        conn.execute("UPDATE conversations SET source_id = '   ' WHERE id = 2")
+        conn.execute("UPDATE conversations SET source_id = '   ' WHERE id = 2", &[])
             .expect("blank remote source_id");
 
         let (where_sql, param) =
@@ -91646,7 +90148,7 @@ mod legacy_source_filter_tests {
         let sql = format!("SELECT COUNT(*) FROM conversations c{where_sql}");
         let params_vec = vec![param.expect("source id param").into()];
         let count: i64 = conn
-            .query_row_map(&sql, &params_vec, |r: &frankensqlite::Row| r.get_typed(0))
+            .query_row_map(&sql, &params_vec, |r: &FrankenRow| r.get_typed(0))
             .expect("count blank remote source rows");
         assert_eq!(count, 1);
 
@@ -91654,7 +90156,7 @@ mod legacy_source_filter_tests {
         assert!(param.is_none());
         let sql = format!("SELECT COUNT(*) FROM conversations c{where_sql}");
         let count: i64 = conn
-            .query_row_map(&sql, &[], |r: &frankensqlite::Row| r.get_typed(0))
+            .query_row_map(&sql, &[], |r: &FrankenRow| r.get_typed(0))
             .expect("count remote source rows");
         assert_eq!(count, 1);
 
@@ -91665,7 +90167,7 @@ mod legacy_source_filter_tests {
     fn source_filter_helpers_match_trimmed_local_source_id_in_db() {
         let (_tmp, db_path, _shared_path) = make_legacy_local_db();
         let conn = open_legacy_local_db_for_update(&db_path);
-        conn.execute("UPDATE conversations SET source_id = '  local  ' WHERE id = 1")
+        conn.execute("UPDATE conversations SET source_id = '  local  ' WHERE id = 1", &[])
             .expect("update legacy local source_id");
 
         let (where_sql, param) =
@@ -91673,7 +90175,7 @@ mod legacy_source_filter_tests {
         let sql = format!("SELECT COUNT(*) FROM conversations c{where_sql}");
         let params_vec = vec![param.expect("source id param").into()];
         let count: i64 = conn
-            .query_row_map(&sql, &params_vec, |r: &frankensqlite::Row| r.get_typed(0))
+            .query_row_map(&sql, &params_vec, |r: &FrankenRow| r.get_typed(0))
             .expect("count trimmed local source rows");
         assert_eq!(count, 1);
 
@@ -91681,7 +90183,7 @@ mod legacy_source_filter_tests {
         assert!(param.is_none());
         let sql = format!("SELECT COUNT(*) FROM conversations c{where_sql}");
         let count: i64 = conn
-            .query_row_map(&sql, &[], |r: &frankensqlite::Row| r.get_typed(0))
+            .query_row_map(&sql, &[], |r: &FrankenRow| r.get_typed(0))
             .expect("count local source rows");
         assert_eq!(count, 1);
 
@@ -91723,7 +90225,7 @@ mod legacy_source_filter_tests {
     fn find_context_source_conversation_matches_blank_remote_source_id_via_origin_host() {
         let (_tmp, db_path, shared_path) = make_legacy_local_db();
         let conn = open_legacy_local_db_for_update(&db_path);
-        conn.execute("UPDATE conversations SET source_id = '   ' WHERE id = 2")
+        conn.execute("UPDATE conversations SET source_id = '   ' WHERE id = 2", &[])
             .expect("blank remote source_id");
 
         let row = find_context_source_conversation(
@@ -91742,7 +90244,7 @@ mod legacy_source_filter_tests {
     fn find_context_source_conversation_matches_trimmed_local_source_id_in_db() {
         let (_tmp, db_path, shared_path) = make_legacy_local_db();
         let conn = open_legacy_local_db_for_update(&db_path);
-        conn.execute("UPDATE conversations SET source_id = '  local  ' WHERE id = 1")
+        conn.execute("UPDATE conversations SET source_id = '  local  ' WHERE id = 1", &[])
             .expect("update legacy local source_id");
 
         let row =
@@ -91779,7 +90281,7 @@ mod legacy_source_filter_tests {
              ORDER BY source_id"
         );
         let source_rows: Vec<(String, i64)> = conn
-            .query_map_collect(&source_sql, &[], |r: &frankensqlite::Row| {
+            .query_all_map(&source_sql, &[], |r: &FrankenRow| {
                 Ok((r.get_typed(0)?, r.get_typed(1)?))
             })
             .expect("query source rows");
@@ -91795,7 +90297,7 @@ mod legacy_source_filter_tests {
         );
 
         let timeline_rows: Vec<String> = conn
-            .query_map_collect(
+            .query_all_map(
                 "SELECT COALESCE(c.source_id, 'local')
                  FROM conversations c
                  JOIN agents a ON c.agent_id = a.id
@@ -91804,7 +90306,7 @@ mod legacy_source_filter_tests {
                  GROUP BY c.id
                  ORDER BY c.started_at DESC",
                 &[1_699_999_999_000_i64.into(), 1_700_000_200_000_i64.into()],
-                |r: &frankensqlite::Row| r.get_typed(0),
+                |r: &FrankenRow| r.get_typed(0),
             )
             .expect("query timeline rows");
         assert!(timeline_rows.iter().any(|source_id| source_id == "local"));
@@ -91816,7 +90318,7 @@ mod legacy_source_filter_tests {
     fn stats_source_grouping_uses_origin_host_when_remote_source_id_blank() {
         let (_tmp, db_path, _shared_path) = make_legacy_local_db();
         let conn = open_legacy_local_db_for_update(&db_path);
-        conn.execute("UPDATE conversations SET source_id = '   ' WHERE id = 2")
+        conn.execute("UPDATE conversations SET source_id = '   ' WHERE id = 2", &[])
             .expect("blank remote source_id");
 
         let normalized_source_sql =
@@ -91828,7 +90330,7 @@ mod legacy_source_filter_tests {
              ORDER BY source_id"
         );
         let source_rows: Vec<(String, i64)> = conn
-            .query_map_collect(&source_sql, &[], |r: &frankensqlite::Row| {
+            .query_all_map(&source_sql, &[], |r: &FrankenRow| {
                 Ok((r.get_typed(0)?, r.get_typed(1)?))
             })
             .expect("query normalized source rows");
@@ -91847,7 +90349,7 @@ mod legacy_source_filter_tests {
     fn stats_source_grouping_normalizes_trimmed_local_source_id_in_db() {
         let (_tmp, db_path, _shared_path) = make_legacy_local_db();
         let conn = open_legacy_local_db_for_update(&db_path);
-        conn.execute("UPDATE conversations SET source_id = '  local  ' WHERE id = 1")
+        conn.execute("UPDATE conversations SET source_id = '  local  ' WHERE id = 1", &[])
             .expect("update legacy local source_id");
 
         let normalized_source_sql = normalized_source_id_sql_expr("c.source_id");
@@ -91858,7 +90360,7 @@ mod legacy_source_filter_tests {
              ORDER BY source_id"
         );
         let source_rows: Vec<(String, i64)> = conn
-            .query_map_collect(&source_sql, &[], |r: &frankensqlite::Row| {
+            .query_all_map(&source_sql, &[], |r: &FrankenRow| {
                 Ok((r.get_typed(0)?, r.get_typed(1)?))
             })
             .expect("query normalized source rows");
@@ -94711,7 +93213,6 @@ fn run_timeline(
 ) -> CliResult<()> {
     use crate::sources::provenance::SourceFilter;
     use chrono::{Local, TimeZone, Utc};
-    use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
     use std::collections::HashMap;
 
     // Parse source filter (P3.2)
@@ -94793,7 +93294,7 @@ fn run_timeline(
     sql.push_str(" GROUP BY c.id ORDER BY c.started_at DESC");
 
     let rows = conn
-        .query_map_collect(&sql, &params, |row: &frankensqlite::Row| {
+        .query_all_map(&sql, &params, |row: &FrankenRow| {
             Ok((
                 row.get_typed::<i64>(0)?,            // id
                 row.get_typed::<String>(1)?,         // agent
@@ -95152,13 +93653,20 @@ fn run_sources_command(cmd: SourcesCommand, cli: &Cli) -> CliResult<()> {
     }
 }
 
-fn resolved_sources_artifact_manifest_index_path(
+/// W2-6 Task1: `--index-path`/`--data-dir` now resolve the `agent_search.db`
+/// file directly (there is no more tantivy index directory to point at);
+/// `lexical_search_evidence_bundle_manifest`'s federated-shard chunk-manifest
+/// model has no SQLite-domain equivalent, so this CLI surface's backing
+/// value is [`crate::search::lexical_index_health::LexicalDomainAttestation`]
+/// instead (control-plane 2026-08-30 ruling: db file sha256 + user_version +
+/// lex_docs/fts_lex row counts).
+fn resolved_sources_artifact_manifest_db_path(
     index_path: Option<PathBuf>,
     data_dir: Option<PathBuf>,
 ) -> PathBuf {
     index_path.unwrap_or_else(|| {
         let data_dir = data_dir.unwrap_or_else(default_data_dir);
-        search::tantivy::expected_index_dir(&data_dir)
+        data_dir.join("agent_search.db")
     })
 }
 
@@ -95166,7 +93674,7 @@ fn sources_artifact_manifest_error(e: anyhow::Error) -> CliError {
     CliError {
         code: 5,
         kind: CliErrorKind::LexicalGeneration.kind_str(),
-        message: format!("Failed to build lexical artifact evidence manifest: {e:#}"),
+        message: format!("Failed to build lexical domain attestation: {e:#}"),
         hint: Some(
             "Run `cass index --full --json` first, then retry the artifact manifest command."
                 .to_string(),
@@ -95184,71 +93692,43 @@ fn normalized_sources_artifact_manifest_format(fmt: RobotFormat) -> RobotFormat 
 }
 
 fn run_sources_verify_existing_artifact_manifest(
-    index_path: PathBuf,
+    db_path: PathBuf,
     expected_manifest: Option<PathBuf>,
     output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
-    let manifest_path = crate::evidence_bundle::EvidenceBundleManifest::path(&index_path);
-    let report =
-        crate::evidence_bundle::verify_evidence_bundle_manifest_file(&index_path, &manifest_path);
+    use crate::search::lexical_index_health::LexicalDomainAttestation;
+
+    let manifest_path = LexicalDomainAttestation::path(&db_path);
+    let live_attestation =
+        LexicalDomainAttestation::compute(&db_path).map_err(sources_artifact_manifest_error)?;
+    let recorded_attestation = LexicalDomainAttestation::load(&manifest_path).ok();
+    let attestation_matches_live = recorded_attestation
+        .as_ref()
+        .map(|recorded| *recorded == live_attestation);
+
     let expected_manifest_path = expected_manifest
         .as_ref()
         .map(|path| path.display().to_string());
-    let mut manifest_matches_expected = None;
-    let mut manifest_compare_error = None;
-    let mut actual_bundle_id = report.bundle_id.clone();
-    let mut expected_bundle_id = None;
-
-    if let Some(expected_manifest) = expected_manifest.as_ref() {
-        match (
-            crate::evidence_bundle::EvidenceBundleManifest::load(&manifest_path),
-            crate::evidence_bundle::EvidenceBundleManifest::load(expected_manifest),
-        ) {
-            (Ok(actual), Ok(expected)) => {
-                actual_bundle_id = Some(actual.bundle_id.clone());
-                expected_bundle_id = Some(expected.bundle_id.clone());
-                manifest_matches_expected = Some(actual == expected);
-            }
-            (actual, expected) => {
-                manifest_matches_expected = Some(false);
-                manifest_compare_error = Some(format!(
-                    "actual_manifest_load={}; expected_manifest_load={}",
-                    actual
-                        .as_ref()
-                        .map(|_| "ok".to_string())
-                        .unwrap_or_else(|err| format!("{err:#}")),
-                    expected
-                        .as_ref()
-                        .map(|_| "ok".to_string())
-                        .unwrap_or_else(|err| format!("{err:#}"))
-                ));
-                if let Ok(actual) = actual {
-                    actual_bundle_id = Some(actual.bundle_id);
-                }
-                if let Ok(expected) = expected {
-                    expected_bundle_id = Some(expected.bundle_id);
-                }
-            }
+    let expected_manifest_matches = expected_manifest.as_ref().map(|expected_manifest| {
+        match LexicalDomainAttestation::load(expected_manifest) {
+            Ok(expected) => recorded_attestation.as_ref() == Some(&expected),
+            Err(_) => false,
         }
-    }
+    });
 
-    let expected_manifest_matches = manifest_matches_expected.unwrap_or(true);
-    let complete = report.is_complete() && expected_manifest_matches;
+    let complete =
+        attestation_matches_live.unwrap_or(false) && expected_manifest_matches.unwrap_or(true);
     let status = if complete { "ok" } else { "error" };
-    let report_status = report.status;
-    let issue_count = report.issues.len();
-    let unsafe_issue_count = report.unsafe_issue_count;
 
     let payload = serde_json::json!({
         "status": status,
-        "index_path": index_path.display().to_string(),
+        "db_path": db_path.display().to_string(),
         "manifest_path": manifest_path.display().to_string(),
         "expected_manifest_path": expected_manifest_path,
-        "manifest_matches_expected": manifest_matches_expected,
-        "manifest_compare_error": manifest_compare_error,
-        "actual_bundle_id": actual_bundle_id,
-        "expected_bundle_id": expected_bundle_id,
-        "verification": report,
+        "live_attestation": live_attestation,
+        "recorded_attestation": recorded_attestation,
+        "attestation_matches_live": attestation_matches_live,
+        "expected_manifest_matches": expected_manifest_matches,
     });
 
     if let Some(fmt) = output_format {
@@ -95261,30 +93741,27 @@ fn run_sources_verify_existing_artifact_manifest(
             ));
         }
     } else {
-        println!("Lexical artifact evidence manifest verification");
-        println!("  index: {}", index_path.display());
+        println!("Lexical domain attestation verification");
+        println!("  db: {}", db_path.display());
         println!("  manifest: {}", manifest_path.display());
         if let Some(expected_manifest) = expected_manifest_path.as_deref() {
             println!("  expected_manifest: {expected_manifest}");
             println!(
-                "  manifest_matches_expected: {}",
-                manifest_matches_expected.unwrap_or(false)
+                "  expected_manifest_matches: {}",
+                expected_manifest_matches.unwrap_or(false)
             );
         }
-        println!("  status: {:?}", report_status);
-        println!("  issues: {issue_count} ({unsafe_issue_count} unsafe)");
+        println!("  status: {status}");
         if !complete {
             return Err(CliError {
                 code: 5,
                 kind: CliErrorKind::LexicalGeneration.kind_str(),
-                message: if !expected_manifest_matches {
-                    "Lexical artifact evidence manifest does not match the expected producer manifest"
+                message: if expected_manifest_matches == Some(false) {
+                    "Lexical domain attestation does not match the expected producer manifest"
                         .to_string()
                 } else {
-                    format!(
-                        "Lexical artifact evidence manifest verification failed: {:?}",
-                        report_status
-                    )
+                    "Lexical domain attestation verification failed against the live database"
+                        .to_string()
                 },
                 hint: Some(
                     "Reject this copied artifact and rebuild or copy it again from the source."
@@ -95306,71 +93783,54 @@ fn run_sources_artifact_manifest(
     expected_manifest: Option<PathBuf>,
     output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
-    let index_path = resolved_sources_artifact_manifest_index_path(index_path, data_dir);
+    use crate::search::lexical_index_health::LexicalDomainAttestation;
+
+    let db_path = resolved_sources_artifact_manifest_db_path(index_path, data_dir);
     if verify_existing {
         return run_sources_verify_existing_artifact_manifest(
-            index_path,
+            db_path,
             expected_manifest,
             output_format,
         );
     }
 
-    let manifest = search::tantivy::lexical_search_evidence_bundle_manifest(&index_path)
-        .map_err(sources_artifact_manifest_error)?;
-    let report = manifest.verify(&index_path);
-    if !report.is_complete() {
-        return Err(CliError {
-            code: 5,
-            kind: CliErrorKind::LexicalGeneration.kind_str(),
-            message: format!(
-                "Generated lexical artifact evidence manifest did not verify cleanly: {:?}",
-                report.status
-            ),
-            hint: Some(
-                "Re-run `cass index --full --json` before exchanging artifacts.".to_string(),
-            ),
-            retryable: true,
-        });
-    }
+    let attestation =
+        LexicalDomainAttestation::compute(&db_path).map_err(sources_artifact_manifest_error)?;
 
     let manifest_path = if write {
-        let path = manifest.save(&index_path).map_err(|e| CliError {
+        let path = attestation.save(&db_path).map_err(|e| CliError {
             code: 14,
             kind: CliErrorKind::IoError.kind_str(),
-            message: format!("Failed to write lexical artifact evidence manifest: {e:#}"),
-            hint: Some("Check that the index directory is writable.".to_string()),
+            message: format!("Failed to write lexical domain attestation: {e:#}"),
+            hint: Some("Check that the database's directory is writable.".to_string()),
             retryable: true,
         })?;
         Some(path)
     } else {
         None
     };
-    let expected_manifest_path = crate::evidence_bundle::EvidenceBundleManifest::path(&index_path);
-    let bundle_id = manifest.bundle_id.clone();
-    let kind = manifest.kind;
-    let chunk_count = manifest.chunks.len();
+    let expected_manifest_path = LexicalDomainAttestation::path(&db_path);
 
     let payload = serde_json::json!({
         "status": "ok",
-        "index_path": index_path.display().to_string(),
+        "db_path": db_path.display().to_string(),
         "manifest_path": manifest_path
             .as_ref()
             .unwrap_or(&expected_manifest_path)
             .display()
             .to_string(),
         "wrote_manifest": write,
-        "bundle_id": bundle_id,
-        "kind": kind,
-        "chunk_count": chunk_count,
-        "expected_bytes": report.expected_bytes,
-        "verification_status": report.status,
+        "db_sha256": attestation.db_sha256,
+        "user_version": attestation.user_version,
+        "lex_docs_rows": attestation.lex_docs_rows,
+        "fts_lex_rows": attestation.fts_lex_rows,
     });
 
     if let Some(fmt) = output_format {
         output_structured_value(payload, normalized_sources_artifact_manifest_format(fmt))?;
     } else {
-        println!("Lexical artifact evidence manifest");
-        println!("  index: {}", index_path.display());
+        println!("Lexical domain attestation");
+        println!("  db: {}", db_path.display());
         println!(
             "  manifest: {}{}",
             manifest_path
@@ -95379,15 +93839,10 @@ fn run_sources_artifact_manifest(
                 .display(),
             if write { "" } else { " (not written)" }
         );
-        println!(
-            "  bundle_id: {}",
-            payload["bundle_id"].as_str().unwrap_or("")
-        );
-        println!("  chunks: {}", payload["chunk_count"].as_u64().unwrap_or(0));
-        println!(
-            "  expected_bytes: {}",
-            payload["expected_bytes"].as_u64().unwrap_or(0)
-        );
+        println!("  db_sha256: {}", attestation.db_sha256);
+        println!("  user_version: {}", attestation.user_version);
+        println!("  lex_docs_rows: {}", attestation.lex_docs_rows);
+        println!("  fts_lex_rows: {}", attestation.fts_lex_rows);
     }
 
     Ok(())
@@ -96975,7 +95430,6 @@ fn run_sources_sync(
             30,             // watch_interval (default)
             Some(data_dir), // data_dir
             false,          // semantic
-            false,          // build_hnsw
             "fastembed".to_string(),
             progress,
             output_format,
@@ -97071,7 +95525,9 @@ fn run_sources_reingest(
     // can confirm the mirror is present before the (potentially long) ingest.
     let mut mirror_roots: Vec<String> = Vec::new();
     let mut missing_mirrors: Vec<String> = Vec::new();
-    if let Ok(storage) = crate::storage::sqlite::FrankenStorage::open(&db_path) {
+    // w1b Task B8 (d16, open-consumer audit): pure read (surfacing mirror
+    // roots for display), switched to the read-only open.
+    if let Ok(storage) = crate::storage::sqlite::FrankenStorage::open_readonly(&db_path) {
         let roots = crate::indexer::build_scan_roots(&storage, &data_dir);
         let selected_names: std::collections::HashSet<&str> =
             selected.iter().map(|s| s.name.as_str()).collect();
@@ -97126,7 +95582,6 @@ fn run_sources_reingest(
         30,                     // watch_interval (default)
         Some(data_dir.clone()), // data_dir (existing mirror root is discovered here)
         false,                  // semantic
-        false,                  // build_hnsw
         "fastembed".to_string(),
         progress,
         output_format,
@@ -97638,10 +96093,10 @@ fn local_archive_coverage(
 ) -> crate::fleet_archive_coverage::ArchiveCoverageSummary {
     use crate::fleet_archive_coverage::CoverageState;
     use crate::fleet_doctor_schema::ArchiveRisk;
-    let db_present = data_dir.join("agent_search.db").is_file();
-    let index_present = crate::search::tantivy::searchable_index_exists(
-        &crate::search::tantivy::expected_index_dir(data_dir),
-    );
+    let db_path = data_dir.join("agent_search.db");
+    let db_present = db_path.is_file();
+    // W2-6 Task1: reseated onto the lex_docs/fts_lex SQLite domain.
+    let index_present = crate::search::lexical_index_health::searchable_index_exists(&db_path);
     let (coverage_state, archive_risk) = if !db_present {
         (CoverageState::Unknown, ArchiveRisk::Unknown)
     } else if !index_present {
@@ -98827,12 +97282,10 @@ fn run_models_backfill(
     output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
     use crate::indexer::semantic::{
-        SemanticBackfillSchedulerSignals, SemanticBackfillStoragePlan, SemanticIndexer,
-        semantic_backfill_scheduler_decision,
+        SemanticBackfillSchedulerSignals, SemanticIndexer, semantic_backfill_scheduler_decision,
     };
-    use crate::search::model_download::ModelManifest;
     use crate::search::policy::{CliSemanticOverrides, SemanticPolicy};
-    use crate::search::semantic_manifest::{SemanticManifest, TierKind};
+    use crate::search::semantic_manifest::TierKind;
     use crate::storage::sqlite::FrankenStorage;
     use colored::Colorize;
 
@@ -98865,7 +97318,14 @@ fn run_models_backfill(
         .map(str::to_string)
         .unwrap_or_else(|| match tier {
             TierKind::Fast => "hash".to_string(),
-            TierKind::Quality => "fastembed".to_string(),
+            // R1-W3-N2: default to `infinity` under this build's actual
+            // feature (fastembed/ONNX is retired here) so a bare `cass
+            // models backfill` (no `--embedder`) reaches the DB vector
+            // domain instead of immediately hitting the "embedder
+            // 'fastembed' is retired" error below.
+            TierKind::Quality => {
+                if cfg!(feature = "infinity") { "infinity".to_string() } else { "fastembed".to_string() }
+            }
         });
     let embedder_type = resolve_semantic_index_embedder(&embedder_type);
     let embedder_valid = embedder_type == "hash"
@@ -98942,169 +97402,240 @@ fn run_models_backfill(
         return Ok(());
     }
 
-    let effective_batch_conversations = scheduler_decision
-        .as_ref()
-        .map_or(batch_conversations, |decision| {
-            decision.scheduled_batch_conversations
-        });
-
-    let db_fingerprint =
-        crate::indexer::lexical_storage_fingerprint_for_db(&db_path).map_err(|e| CliError {
-            code: 5,
-            kind: CliErrorKind::StorageFingerprint.kind_str(),
-            message: format!(
-                "Failed to fingerprint cass database {}: {e}",
-                db_path.display()
-            ),
-            hint: Some(
-                "Run 'cass doctor check --json' if the archive is corrupt; index --force-rebuild only rebuilds derived assets from a healthy canonical archive."
-                    .into(),
-            ),
-            retryable: true,
-        })?;
-    let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
+    let storage = FrankenStorage::open_writer(&db_path).map_err(|e| CliError {
         code: 5,
         kind: CliErrorKind::Storage.kind_str(),
         message: format!("Failed to open cass database {}: {e}", db_path.display()),
         hint: Some("Run 'cass health --json' to inspect the archive database".into()),
         retryable: true,
     })?;
-    let mut manifest = SemanticManifest::load_or_default(&data_dir).map_err(|e| CliError {
-        code: 5,
-        kind: CliErrorKind::SemanticManifest.kind_str(),
-        message: format!("Failed to load semantic manifest: {e}"),
-        hint: Some("Check permissions under the cass data directory".into()),
-        retryable: true,
-    })?;
-    let model_manifest =
-        crate::search::fastembed_embedder::FastEmbedder::canonical_name(&embedder_type)
-            .and_then(ModelManifest::for_embedder)
-            .unwrap_or_else(ModelManifest::minilm_v2);
-    let model_revision = if embedder_type == "hash" {
-        "hash".to_string()
-    } else if embedder_type == "infinity" {
-        "infinity-bge-m3".to_string()
-    } else {
-        model_manifest.revision.clone()
-    };
-    let indexer = SemanticIndexer::new(&embedder_type, Some(&data_dir)).map_err(|e| CliError {
-        code: 20,
-        kind: CliErrorKind::Model.kind_str(),
-        message: format!("Failed to initialize semantic embedder '{embedder_type}': {e}"),
-        hint: Some(if embedder_type == "fastembed" {
-            "Run 'cass models install -y' or retry with --embedder hash".into()
-        } else {
-            "Use --embedder hash or install the selected embedder model".into()
-        }),
-        retryable: embedder_type != "hash",
-    })?;
 
-    // Sub-fix 1 for cass#257: open a JSONL progress sink whose
-    // destination is taken from `CASS_SEMANTIC_PROGRESS_JSONL`. The
-    // sink is silent when the env var is unset, so behaviour for
-    // existing operators is unchanged. The sink threads through to
-    // selection / packet replay / embed / staging / checkpoint /
-    // publish events.
-    let progress_sink = crate::indexer::semantic_progress::SemanticProgressSink::open(
-        tier.as_str(),
-        indexer.embedder_id(),
-    );
-    let outcome = indexer
-        .run_capped_backfill_from_storage_with_sink(
-            &storage,
-            &data_dir,
-            &mut manifest,
-            SemanticBackfillStoragePlan {
-                tier,
-                db_fingerprint,
-                model_revision,
-                max_conversations: effective_batch_conversations,
-            },
-            &progress_sink,
-        )
-        .map_err(|e| CliError {
-            code: 5,
-            kind: CliErrorKind::SemanticBackfill.kind_str(),
-            message: format!("Semantic backfill failed: {e}"),
-            hint: Some(
-                "Retry the command; resumable checkpoints are kept in the semantic manifest".into(),
-            ),
-            retryable: true,
-        })?;
+    // W3-5: frankensearch/fsvi retired. The infinity-backed quality tier no
+    // longer builds a .fsvi file -- it drains the DB vector domain's
+    // `embedding_holes` via the same catch-up `cass index --semantic` uses
+    // (ingest-time hooks already register a hole per new message; this
+    // drains them + does a genesis-eligibility rescan as a self-healing
+    // safety net -- W3-5 task book #63 advisor ruling). hash/fastembed
+    // tiers still use the fsvi path below until Step1's dependency removal
+    // forces their disposition.
+    if embedder_type == "infinity" {
+        #[cfg(feature = "infinity")]
+        {
+            let batch_size = SemanticIndexer::new("infinity", None)
+                .map_err(|e| CliError {
+                    code: 20,
+                    kind: CliErrorKind::Model.kind_str(),
+                    message: format!("Failed to initialize infinity embedder: {e}"),
+                    hint: Some(
+                        "Check CASS_INFINITY_* env vars and that the Infinity service is reachable"
+                            .into(),
+                    ),
+                    retryable: true,
+                })?
+                .batch_size();
+            let report = crate::indexer::db_vector_catchup::run_db_vector_catchup_backfill(
+                &storage,
+                batch_size,
+            )
+            .map_err(|e| CliError {
+                code: 5,
+                kind: CliErrorKind::SemanticBackfill.kind_str(),
+                message: format!("DB vector domain catch-up failed: {e:#}"),
+                hint: Some(
+                    "Retry the command; the catch-up is idempotent (embedding_holes-driven)"
+                        .into(),
+                ),
+                retryable: true,
+            })?;
 
-    let progress_pct = outcome.progress_pct();
-    let status = if outcome.published {
-        "published"
-    } else if outcome.checkpoint_saved {
-        "checkpointed"
-    } else {
-        "idle"
-    };
-    let next_step = if outcome.published {
-        "semantic tier is ready"
-    } else if outcome.checkpoint_saved {
-        "rerun the same command to continue the resumable backfill"
-    } else {
-        "no pending canonical conversations for this tier"
-    };
-    let backlog = serde_json::json!({
-        "total_conversations": manifest.backlog.total_conversations,
-        "fast_tier_processed": manifest.backlog.fast_tier_processed,
-        "quality_tier_processed": manifest.backlog.quality_tier_processed,
-        "computed_at_ms": manifest.backlog.computed_at_ms,
-    });
-    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
-        if matches!(fmt, RobotFormat::Sessions) {
-            RobotFormat::Compact
-        } else {
-            fmt
+            let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+                if matches!(fmt, RobotFormat::Sessions) {
+                    RobotFormat::Compact
+                } else {
+                    fmt
+                }
+            });
+            if structured_format.is_some() {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "status": if report.activated { "published" } else { "in_progress" },
+                        "next_step": if report.activated {
+                            "semantic tier is ready"
+                        } else {
+                            "rerun the same command to continue draining embedding_holes"
+                        },
+                        "tier": "quality",
+                        "embedder_id": report.embedder_id,
+                        "data_dir": data_dir.display().to_string(),
+                        "db_path": db_path.display().to_string(),
+                        "generation_id": report.generation_id,
+                        "reused_existing_generation": report.reused_existing_generation,
+                        "eligible_seeded": report.eligible_seeded,
+                        "embedded_inserted": report.embedded_inserted,
+                        "stale_skipped": report.stale_skipped,
+                        "holes_before": report.holes_before,
+                        "holes_after": report.holes_after,
+                        "activated": report.activated,
+                        // R3-6: previously discarded entirely (only
+                        // `cleanup_deleted_generation_ids` was ever computed
+                        // downstream of this report, and nothing surfaced
+                        // even that) -- a candidate-level delete failure or
+                        // the orphan-scan query itself failing (sentinel
+                        // `generation_id=0`) is real operational signal a
+                        // structured-output consumer must be able to see.
+                        "cleanup_failures": report.cleanup_failures.iter().map(|(generation_id, detail)| serde_json::json!({
+                            "generation_id": generation_id,
+                            "error": detail,
+                        })).collect::<Vec<_>>(),
+                    }))
+                    .unwrap_or_default()
+                );
+            } else {
+                println!("{}", "Semantic backfill (DB vector domain)".bold());
+                println!("  Generation: {}", report.generation_id);
+                println!("  Embedder: {}", report.embedder_id);
+                println!("  Embedded (this run): {}", report.embedded_inserted);
+                println!("  Holes remaining: {}", report.holes_after);
+                println!("  Activated: {}", report.activated);
+                if !report.cleanup_failures.is_empty() {
+                    println!("  Cleanup failures: {}", report.cleanup_failures.len());
+                    for (generation_id, detail) in &report.cleanup_failures {
+                        println!("    - generation {generation_id}: {detail}");
+                    }
+                }
+            }
+            return Ok(());
         }
-    });
-
-    if let Some(_fmt) = structured_format {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "status": status,
-                "next_step": next_step,
-                "tier": outcome.tier.as_str(),
-                "embedder_id": outcome.embedder_id,
-                "data_dir": data_dir.display().to_string(),
-                "db_path": db_path.display().to_string(),
-                "batch_conversations_limit": effective_batch_conversations,
-                "requested_batch_conversations_limit": batch_conversations,
-                "scheduler": scheduler_decision,
-                "embedded_docs": outcome.embedded_docs,
-                "conversations_processed": outcome.conversations_processed,
-                "total_conversations": outcome.total_conversations,
-                "progress_pct": progress_pct,
-                "last_offset": outcome.last_offset,
-                "checkpoint_saved": outcome.checkpoint_saved,
-                "published": outcome.published,
-                "index_path": outcome.index_path.display().to_string(),
-                "manifest_path": outcome.manifest_path.display().to_string(),
-                "backlog": backlog,
-            }))
-            .unwrap_or_default()
-        );
-    } else {
-        println!("{}", "Semantic backfill batch".bold());
-        println!("  Status: {}", status);
-        println!("  Tier: {}", outcome.tier.as_str());
-        println!("  Embedder: {}", outcome.embedder_id);
-        println!("  Embedded docs: {}", outcome.embedded_docs);
-        println!(
-            "  Conversations: {}/{} ({:.1}%)",
-            outcome.conversations_processed, outcome.total_conversations, progress_pct
-        );
-        println!("  Last offset: {}", outcome.last_offset);
-        println!("  Index: {}", outcome.index_path.display());
-        println!("  Manifest: {}", outcome.manifest_path.display());
-        println!();
-        println!("{}", next_step);
+        #[cfg(not(feature = "infinity"))]
+        {
+            return Err(CliError {
+                code: 20,
+                kind: CliErrorKind::Model.kind_str(),
+                message: "embedder 'infinity' requires the `infinity` build feature".to_string(),
+                hint: Some("Rebuild with --features infinity".into()),
+                retryable: false,
+            });
+        }
     }
 
-    Ok(())
+    Err(CliError {
+        code: 20,
+        kind: CliErrorKind::Model.kind_str(),
+        message: format!(
+            "embedder '{embedder_type}' is retired (W3-5, frankensearch/fsvi removed); use --embedder infinity"
+        ),
+        hint: Some("Rebuild with --features infinity and rerun with --embedder infinity".into()),
+        retryable: false,
+    })
+}
+
+#[cfg(test)]
+mod w3_5_models_backfill_infinity_wiring_tests {
+    use super::*;
+    use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+    use crate::storage::sqlite::FrankenStorage;
+    use tempfile::TempDir;
+
+    /// W3-5 wiring proof (task book #63, advisor ruling: "先接线后拆除"):
+    /// `cass models backfill --embedder infinity` must reach the same
+    /// DB-vector-domain catch-up (`db_vector_catchup::
+    /// run_db_vector_catchup_backfill`) that `cass index --semantic` now
+    /// uses, not the retired fsvi path -- positive proof the capability
+    /// silently disappearing (the risk this wiring commit exists to close)
+    /// did not happen. Requires a live Infinity at CASS_INFINITY_URL
+    /// (127.0.0.1:7997 default); run explicitly with `--ignored`.
+    #[test]
+    #[ignore = "requires a live Infinity service at 127.0.0.1:7997 (CASS_INFINITY_URL)"]
+    #[cfg(feature = "infinity")]
+    fn cli_models_backfill_infinity_reaches_db_vector_domain_catchup() {
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("agent_search.db");
+
+        {
+            let storage = FrankenStorage::open(&db_path).unwrap();
+            let agent_id = storage
+                .ensure_agent(&Agent {
+                    id: None,
+                    slug: "claude_code".into(),
+                    name: "Claude Code".into(),
+                    version: Some("1.0".into()),
+                    kind: AgentKind::Cli,
+                })
+                .unwrap();
+            let conv = Conversation {
+                id: None,
+                agent_slug: "claude_code".into(),
+                workspace: None,
+                external_id: Some("w3-5-cli-wiring-e2e".into()),
+                title: Some("w3-5 CLI wiring e2e fixture".into()),
+                source_path: std::path::PathBuf::from("/fixtures/w3-5-cli-wiring-e2e.jsonl"),
+                started_at: Some(1_000),
+                ended_at: Some(4_000),
+                approx_tokens: None,
+                metadata_json: serde_json::json!(null),
+                messages: vec![
+                    Message {
+                        id: None,
+                        idx: 0,
+                        role: MessageRole::User,
+                        author: None,
+                        created_at: Some(1_000),
+                        content: "w3-5 cli wiring: rust borrow checker lifetimes question".into(),
+                        extra_json: serde_json::json!(null),
+                        snippets: vec![],
+                    },
+                    Message {
+                        id: None,
+                        idx: 1,
+                        role: MessageRole::Agent,
+                        author: None,
+                        created_at: Some(2_000),
+                        content: "w3-5 cli wiring: reply about ownership rules".into(),
+                        extra_json: serde_json::json!(null),
+                        snippets: vec![],
+                    },
+                ],
+                source_id: "local".into(),
+                origin_host: None,
+            };
+            storage
+                .insert_conversation_tree(agent_id, None, &conv)
+                .expect("seed conversation");
+        }
+
+        run_models_backfill(
+            "quality",
+            Some("infinity"),
+            10_000,
+            false,
+            Some(data_dir.clone()),
+            Some(db_path.clone()),
+            None,
+        )
+        .expect("cass models backfill --embedder infinity must reach the DB vector domain");
+
+        let storage = FrankenStorage::open_readonly(&db_path).unwrap();
+        let active = crate::storage::schema::active_generation_id(storage.raw()).unwrap();
+        assert!(
+            active.is_some(),
+            "CLI backfill must activate a DB-vector-domain generation"
+        );
+        let embedded_count: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM message_embeddings WHERE generation_id = ?1",
+                &crate::storage::api::params![active.unwrap()],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            embedded_count, 2,
+            "both seeded messages must be embedded via the CLI path"
+        );
+    }
 }
 
 /// Remove model files
@@ -99310,13 +97841,6 @@ fn archive_agent_slug_for_exclusion(agent: &str) -> String {
     }
 }
 
-fn archive_data_dir_for_agents_command(cli: &Cli) -> PathBuf {
-    cli.db
-        .as_ref()
-        .and_then(|db_path| db_path.parent().map(Path::to_path_buf))
-        .unwrap_or_else(default_data_dir)
-}
-
 fn purge_excluded_agent_archive_data(
     agent: &str,
     cli: &Cli,
@@ -99328,9 +97852,8 @@ fn purge_excluded_agent_archive_data(
         return Ok(AgentArchivePurgeResult::default());
     }
 
-    let data_dir = archive_data_dir_for_agents_command(cli);
     let archive_agent_slug = archive_agent_slug_for_exclusion(agent);
-    let storage = match FrankenStorage::open(&db_path) {
+    let storage = match FrankenStorage::open_writer(&db_path) {
         Ok(storage) => storage,
         Err(err) => {
             tracing::warn!(
@@ -99355,13 +97878,6 @@ fn purge_excluded_agent_archive_data(
         return Ok(purge);
     }
 
-    storage.rebuild_fts().map_err(|e| CliError {
-        code: 5,
-        kind: CliErrorKind::ArchiveFtsRebuild.kind_str(),
-        message: format!("Purged '{archive_agent_slug}' but failed to rebuild FTS: {e}"),
-        hint: Some("Run 'cass index --full' to refresh derived search data".into()),
-        retryable: false,
-    })?;
     storage.rebuild_analytics().map_err(|e| CliError {
         code: 5,
         kind: CliErrorKind::ArchiveAnalyticsRebuild.kind_str(),
@@ -99387,19 +97903,9 @@ fn purge_excluded_agent_archive_data(
         hint: Some("Run 'cass index --full' to refresh token analytics".into()),
         retryable: false,
     })?;
-    let remaining_conversations = storage.total_conversation_count().map_err(|e| CliError {
-        code: 5,
-        kind: CliErrorKind::ArchiveCount.kind_str(),
-        message: format!(
-            "Purged '{archive_agent_slug}' but failed to count remaining conversations: {e}"
-        ),
-        hint: Some("Run 'cass index --full' to refresh the archive".into()),
-        retryable: false,
-    })?;
     drop(storage);
 
-    crate::indexer::rebuild_tantivy_from_db(&db_path, &data_dir, remaining_conversations, None)
-        .map_err(|e| CliError {
+    crate::indexer::rebuild_lex_domain_from_db_full(&db_path, None).map_err(|e| CliError {
             code: 5,
             kind: CliErrorKind::LexicalRebuild.kind_str(),
             message: format!(
@@ -101563,31 +100069,30 @@ fn relink_identity_key(
 
 /// 读出 DB 里全部会话的身份投影。只读打开，绝不写。
 fn relink_load_conversations(db_path: &Path) -> Result<Vec<RelinkConversationRow>> {
-    use frankensqlite::compat::RowExt as _;
 
     let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(db_path)
         .map_err(|e| anyhow::anyhow!("open readonly db for relink {}: {e}", db_path.display()))?;
-    let rows = storage
+    let out = storage
         .raw()
-        .query(
+        .query_all_map(
             "SELECT c.id, c.source_id, c.origin_host, c.source_path, c.started_at, \
              (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id), a.slug \
              FROM conversations c JOIN agents a ON a.id = c.agent_id",
+            &[],
+            |row| {
+                Ok(RelinkConversationRow {
+                    conversation_id: row.get_typed::<i64>(0)?,
+                    source_id: row.get_typed::<String>(1)?,
+                    origin_host: row.get_typed::<String>(2).ok(),
+                    source_path: row.get_typed::<String>(3)?,
+                    started_at_ms: row.get_typed::<i64>(4).ok(),
+                    message_count: usize::try_from(row.get_typed::<i64>(5).unwrap_or(0).max(0))
+                        .unwrap_or(0),
+                    agent_slug: row.get_typed::<String>(6)?,
+                })
+            },
         )
         .map_err(|e| anyhow::anyhow!("query conversations for relink: {e}"))?;
-    let mut out = Vec::with_capacity(rows.len());
-    for row in &rows {
-        out.push(RelinkConversationRow {
-            conversation_id: row.get_typed::<i64>(0)?,
-            source_id: row.get_typed::<String>(1)?,
-            origin_host: row.get_typed::<String>(2).ok(),
-            source_path: row.get_typed::<String>(3)?,
-            started_at_ms: row.get_typed::<i64>(4).ok(),
-            message_count: usize::try_from(row.get_typed::<i64>(5).unwrap_or(0).max(0))
-                .unwrap_or(0),
-            agent_slug: row.get_typed::<String>(6)?,
-        });
-    }
     storage.close_best_effort_in_place();
     Ok(out)
 }
@@ -101973,13 +100478,12 @@ fn relink_pause_if_requested(boundary: &str) {
 
 /// 在一个事务里写 receipt。receipt 是 DB 侧唯一的提交事实。
 fn relink_write_receipt(db_path: &Path, operation_id: &str, state: &str) -> Result<()> {
-    use frankensqlite::compat::{ConnectionExt as _, ParamValue};
-    let storage = crate::storage::sqlite::FrankenStorage::open(db_path)
+    let storage = crate::storage::sqlite::FrankenStorage::open_writer(db_path)
         .map_err(|e| anyhow::anyhow!("open db for relink receipt {}: {e}", db_path.display()))?;
     let raw = storage.raw();
-    raw.execute("BEGIN IMMEDIATE;")
+    raw.execute("BEGIN IMMEDIATE;", &[])
         .map_err(|e| anyhow::anyhow!("begin relink receipt tx: {e}"))?;
-    let result = raw.execute_compat(
+    let result = raw.execute(
         "INSERT INTO operation_commit_receipt \
          (idempotency_key, operation, state, committed_at_ms) VALUES (?1, ?2, ?3, ?4) \
          ON CONFLICT(idempotency_key) DO UPDATE SET state = excluded.state",
@@ -101992,29 +100496,29 @@ fn relink_write_receipt(db_path: &Path, operation_id: &str, state: &str) -> Resu
     );
     match result {
         Ok(_) => {
-            raw.execute("COMMIT;")
+            raw.execute("COMMIT;", &[])
                 .map_err(|e| anyhow::anyhow!("commit relink receipt: {e}"))?;
             Ok(())
         }
         Err(err) => {
-            let _ = raw.execute("ROLLBACK;");
+            let _ = raw.execute("ROLLBACK;", &[]);
             Err(anyhow::anyhow!("write relink receipt: {err}"))
         }
     }
 }
 
 pub fn relink_receipt_state(db_path: &Path, operation_id: &str) -> Result<Option<String>> {
-    use frankensqlite::compat::RowExt as _;
     let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(db_path)
         .map_err(|e| anyhow::anyhow!("open db for receipt read {}: {e}", db_path.display()))?;
-    let rows = storage
+    let rows: Vec<String> = storage
         .raw()
-        .query_with_params(
+        .query_all_map(
             "SELECT state FROM operation_commit_receipt WHERE idempotency_key = ?1",
-            &[frankensqlite::SqliteValue::from(operation_id)],
+            &[SqliteValue::from(operation_id)],
+            |row| row.get_typed(0),
         )
         .map_err(|e| anyhow::anyhow!("read relink receipt: {e}"))?;
-    let out = rows.first().and_then(|row| row.get_typed::<String>(0).ok());
+    let out = rows.into_iter().next();
     storage.close_best_effort_in_place();
     Ok(out)
 }
@@ -102274,28 +100778,27 @@ mod mirror_relink_tests {
         let db_path = data_dir.join("agent_search.db");
         let storage = crate::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
         let raw = storage.raw();
-        use frankensqlite::compat::{ConnectionExt as _, ParamValue};
-        raw.execute_compat(
+        raw.execute(
             "INSERT INTO agents(id, slug, name, kind, created_at, updated_at) \
              VALUES(1, ?1, 'Agent', 'cli', 0, 0)",
             &[ParamValue::from(agent_slug)],
         )
         .unwrap();
-        raw.execute_compat(
+        raw.execute(
             "INSERT OR IGNORE INTO sources(id, kind, created_at, updated_at) \
              VALUES('local','local',0,0)",
             &[] as &[ParamValue],
         )
         .unwrap();
         let src_path = source_file.display().to_string();
-        raw.execute_compat(
+        raw.execute(
             "INSERT INTO conversations(id, agent_id, source_id, source_path, started_at) \
              VALUES(7, 1, 'local', ?1, 1710000000000)",
             &[ParamValue::from(src_path.as_str())],
         )
         .unwrap();
         for idx in 0..2i64 {
-            raw.execute_compat(
+            raw.execute(
                 "INSERT INTO messages(conversation_id, idx, role, content) VALUES(7, ?1, 'user', 'x')",
                 &[ParamValue::from(idx)],
             )
@@ -103198,15 +101701,14 @@ mod mirror_relink_tests {
         {
             let storage = crate::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
             let raw = storage.raw();
-            use frankensqlite::compat::{ConnectionExt as _, ParamValue};
-            raw.execute_compat(
+            raw.execute(
                 "INSERT INTO agents(id, slug, name, kind, created_at, updated_at) \
                  VALUES(2,'claude_code','Claude Code','cli',0,0)",
                 &[] as &[ParamValue],
             )
             .unwrap();
             let src_path = source_file.display().to_string();
-            raw.execute_compat(
+            raw.execute(
                 "INSERT INTO conversations(id, agent_id, source_id, source_path, started_at) \
                  VALUES(99, 2, 'local', ?1, 1710000000000)",
                 &[ParamValue::from(src_path.as_str())],
@@ -103218,7 +101720,6 @@ mod mirror_relink_tests {
         {
             let mut storage =
                 crate::storage::sqlite::FrankenStorage::open_readonly(&db_path).unwrap();
-            use frankensqlite::compat::{ConnectionExt as _, ParamValue, RowExt as _};
             let n: Option<i64> = storage
                 .raw()
                 .query_row_map(
@@ -103303,19 +101804,24 @@ mod mirror_relink_tests {
                 let Ok(meta) = std::fs::symlink_metadata(&path) else {
                     continue;
                 };
+                let rel = path
+                    .strip_prefix(base)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string();
                 if meta.is_dir() {
                     walk(&path, base, out);
+                } else if rel.ends_with("-shm") || rel.ends_with("-wal") {
+                    // w1b Task B9 (2026-08-27, equivalence-gate-caught,
+                    // control-plane ruling): same exemption and rationale as
+                    // tests/cli_doctor.rs's doctor_no_write_snapshot -- these
+                    // are vanilla SQLite WAL-mode engine sidecars, not
+                    // tracked write-set content; even a read-only connection
+                    // creates/touches them.
                 } else if meta.is_file() {
                     let bytes = std::fs::read(&path).unwrap_or_default();
                     let digest = blake3::hash(&bytes).to_hex().to_string();
-                    out.push((
-                        path.strip_prefix(base)
-                            .unwrap_or(&path)
-                            .display()
-                            .to_string(),
-                        meta.len(),
-                        digest,
-                    ));
+                    out.push((rel, meta.len(), digest));
                 }
             }
         }

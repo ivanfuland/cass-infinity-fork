@@ -22,8 +22,8 @@ use coding_agent_search::pages::bundle::{BundleBuilder, BundleResult};
 use coding_agent_search::pages::encrypt::{DecryptionEngine, EncryptionEngine, load_config};
 use coding_agent_search::pages::export::{ExportEngine, ExportFilter, PathMode};
 use coding_agent_search::pages::verify::verify_bundle;
+use coding_agent_search::storage::api::Conn as Connection;
 use coding_agent_search::storage::sqlite::FrankenStorage;
-use frankensqlite::Connection;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde_json::Value;
 use std::fs;
@@ -909,20 +909,19 @@ fn test_cli_pages_full_workflow_end_to_end() {
         .decrypt_to_file(&site_dir, &decrypted_path, |_, _| {})
         .expect("decrypt CLI-generated bundle");
     let conn =
-        Connection::open(decrypted_path.to_string_lossy().as_ref()).expect("open decrypted db");
-    use frankensqlite::compat::{ConnectionExt, RowExt};
+        Connection::open_read(&decrypted_path).expect("open decrypted db");
     let conversation_count: i64 = conn
         .query_row_map(
             "SELECT COUNT(*) FROM conversations",
             &[],
-            |row: &frankensqlite::Row| row.get_typed(0),
+            |row| row.get_typed(0),
         )
         .expect("count decrypted conversations");
     let message_count: i64 = conn
         .query_row_map(
             "SELECT COUNT(*) FROM messages",
             &[],
-            |row: &frankensqlite::Row| row.get_typed(0),
+            |row| row.get_typed(0),
         )
         .expect("count decrypted messages");
     assert_eq!(
@@ -1156,21 +1155,20 @@ fn test_pages_wizard_pty_respects_db_override_and_writes_bundle_root() {
     decryptor
         .decrypt_to_file(&site_dir, &decrypted_path, |_, _| {})
         .expect("decrypt wizard-generated bundle");
-    let conn = Connection::open(decrypted_path.to_string_lossy().as_ref())
+    let conn = Connection::open_read(&decrypted_path)
         .expect("open wizard decrypted db");
-    use frankensqlite::compat::{ConnectionExt, RowExt};
     let conversation_count: i64 = conn
         .query_row_map(
             "SELECT COUNT(*) FROM conversations",
             &[],
-            |row: &frankensqlite::Row| row.get_typed(0),
+            |row| row.get_typed(0),
         )
         .expect("count wizard decrypted conversations");
     let message_count: i64 = conn
         .query_row_map(
             "SELECT COUNT(*) FROM messages",
             &[],
-            |row: &frankensqlite::Row| row.get_typed(0),
+            |row| row.get_typed(0),
         )
         .expect("count wizard decrypted messages");
     assert_eq!(
@@ -1224,16 +1222,15 @@ fn test_search_in_decrypted_archive() {
         Some("Query decrypted database to verify schema"),
     );
     let conn =
-        Connection::open(decrypted_path.to_string_lossy().as_ref()).expect("open decrypted db");
+        Connection::open_read(&decrypted_path).expect("open decrypted db");
 
-    use frankensqlite::compat::{ConnectionExt, RowExt};
 
     // Verify conversations table exists and has data
     let conv_count: i64 = conn
         .query_row_map(
             "SELECT COUNT(*) FROM conversations",
             &[],
-            |row: &frankensqlite::Row| row.get_typed(0),
+            |row| row.get_typed(0),
         )
         .expect("count conversations");
     assert_eq!(conv_count, 5, "Should have 5 conversations");
@@ -1243,7 +1240,7 @@ fn test_search_in_decrypted_archive() {
         .query_row_map(
             "SELECT COUNT(*) FROM messages",
             &[],
-            |row: &frankensqlite::Row| row.get_typed(0),
+            |row| row.get_typed(0),
         )
         .expect("count messages");
     assert!(msg_count > 0, "Should have messages");
@@ -1253,7 +1250,7 @@ fn test_search_in_decrypted_archive() {
         .query_row_map(
             "SELECT value FROM export_meta WHERE key = 'schema_version'",
             &[],
-            |row: &frankensqlite::Row| row.get_typed(0),
+            |row| row.get_typed(0),
         )
         .expect("get schema version");
     assert_eq!(schema_version, "1", "Export schema version should be 1");
@@ -1348,7 +1345,7 @@ fn test_summary_generation_multi_agent_fixtures() {
         "generate_summary",
         Some("Generate summary from multi-agent database"),
     );
-    let conn = Connection::open(db_path.to_string_lossy().as_ref()).expect("open connection");
+    let conn = Connection::open_read(&db_path).expect("open connection");
     let generator = SummaryGenerator::new(&conn);
     let summary = generator.generate(None).expect("generate summary");
     tracker.end(
@@ -1466,7 +1463,7 @@ fn test_summary_with_agent_filter() {
         "filter_claude",
         Some("Generate summary filtered to Claude Code only"),
     );
-    let conn = Connection::open(db_path.to_string_lossy().as_ref()).expect("open connection");
+    let conn = Connection::open_read(&db_path).expect("open connection");
     let generator = SummaryGenerator::new(&conn);
 
     let filters = SummaryFilters {
@@ -1569,7 +1566,7 @@ fn test_summary_with_workspace_exclusions() {
         "generate_with_exclusions",
         Some("Generate summary with private workspace excluded"),
     );
-    let conn = Connection::open(db_path.to_string_lossy().as_ref()).expect("open connection");
+    let conn = Connection::open_read(&db_path).expect("open connection");
     let generator = SummaryGenerator::new(&conn);
 
     let mut exclusions = ExclusionSet::new();
@@ -1710,7 +1707,7 @@ fn test_export_filter_date_range() {
         "filter_date_range",
         Some("Filter to February-April date range"),
     );
-    let conn = Connection::open(db_path.to_string_lossy().as_ref()).expect("open connection");
+    let conn = Connection::open_read(&db_path).expect("open connection");
     let generator = SummaryGenerator::new(&conn);
 
     let feb_start = 1706745600000i64; // 2024-02-01
@@ -1894,7 +1891,7 @@ fn test_prepublish_summary_render() {
         "verify_render",
         Some("Verify summary render contains all sections"),
     );
-    let conn = Connection::open(db_path.to_string_lossy().as_ref()).expect("open connection");
+    let conn = Connection::open_read(&db_path).expect("open connection");
     let generator = SummaryGenerator::new(&conn);
     let summary = generator.generate(None).expect("generate");
     let rendered = summary.render_overview();

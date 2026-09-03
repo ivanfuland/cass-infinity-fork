@@ -30,8 +30,9 @@
 //! The test also pulls the governor telemetry at the end so the run log
 //! captures what the governor saw and decided.
 
+use coding_agent_search::indexer::persist::persist_conversation;
 use coding_agent_search::search::query::{FieldMask, SearchClient, SearchFilters};
-use coding_agent_search::search::tantivy::TantivyIndex;
+use coding_agent_search::storage::sqlite::SqliteStorage;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
@@ -44,7 +45,7 @@ mod util;
 /// Seed the index with enough baseline content that searches return hits
 /// immediately without cold-start variance. Keeps the corpus small so test
 /// wall-clock stays bounded.
-fn seed_baseline_corpus(index: &mut TantivyIndex, base_dir: &Path, count: usize) {
+fn seed_baseline_corpus(storage: &SqliteStorage, base_dir: &Path, count: usize) {
     for i in 0..count {
         let conv = util::ConversationFixtureBuilder::new("tester")
             .title(format!("baseline_{i}"))
@@ -55,9 +56,8 @@ fn seed_baseline_corpus(index: &mut TantivyIndex, base_dir: &Path, count: usize)
             .with_content(1, format!("user_message_{i} shared_token beta"))
             .with_content(2, format!("assistant_reply_{i} shared_token gamma"))
             .build_normalized();
-        index.add_conversation(&conv).unwrap();
+        persist_conversation(storage, &conv).unwrap();
     }
-    index.commit().unwrap();
 }
 
 /// Drive a background indexer thread that keeps adding documents and
@@ -65,12 +65,20 @@ fn seed_baseline_corpus(index: &mut TantivyIndex, base_dir: &Path, count: usize)
 /// Returns a join handle that yields the number of conversations indexed.
 fn spawn_background_indexer(
     index_path: std::path::PathBuf,
+    db_path: std::path::PathBuf,
     stop: Arc<AtomicBool>,
     ready: Arc<Barrier>,
     commit_every: usize,
 ) -> thread::JoinHandle<usize> {
     thread::spawn(move || {
-        let mut index = TantivyIndex::open_or_create(&index_path).unwrap();
+        // W2-6 Task丙②: Tantivy's writer lockfile / explicit segment-commit
+        // machinery is retired. `persist_conversation` writes and commits
+        // sqlite-fts5 content transactionally per call, so there is no
+        // separate "commit every N" step to simulate the old segment-flush
+        // disturbance -- `commit_every` is now unused (kept as a parameter
+        // for call-site stability; every write is its own commit).
+        let _ = commit_every;
+        let storage = SqliteStorage::open(&db_path).unwrap();
         ready.wait();
         let mut i: usize = 0;
         while !stop.load(Ordering::Relaxed) {
@@ -82,15 +90,9 @@ fn spawn_background_indexer(
                 .with_content(0, format!("bg_user_{i} shared_token load"))
                 .with_content(1, format!("bg_assistant_{i} shared_token reply"))
                 .build_normalized();
-            index.add_conversation(&conv).unwrap();
+            persist_conversation(&storage, &conv).unwrap();
             i += 1;
-            if i.is_multiple_of(commit_every) {
-                // Commits trigger segment flush — this is the thing most
-                // likely to disturb foreground readers.
-                index.commit().unwrap();
-            }
         }
-        index.commit().unwrap();
         i
     })
 }
@@ -130,10 +132,11 @@ impl LatencyReport {
 /// background indexer is hitting the same index. Returns a latency report.
 fn measure_foreground_latency(
     index_path: &Path,
+    db_path: &Path,
     query_count: usize,
     query_gap: Duration,
 ) -> LatencyReport {
-    let client = SearchClient::open(index_path, None)
+    let client = SearchClient::open(index_path, Some(db_path))
         .expect("opening SearchClient under load must succeed")
         .expect("SearchClient ready");
 
@@ -174,17 +177,15 @@ fn measure_foreground_latency(
 fn search_p95_stays_within_budget_while_indexing_in_background() {
     let dir = TempDir::new().unwrap();
     let index_path = dir.path().to_path_buf();
+    let db_path = index_path.join("agent_search.db");
     {
-        // Tantivy serializes the writer via a filesystem lockfile: only one
-        // `IndexWriter` may exist per directory at a time. We seed inside a
-        // scope so the writer is dropped (and the lock released) before the
-        // background indexer opens its own writer further down.
-        let mut index = TantivyIndex::open_or_create(&index_path).unwrap();
-        seed_baseline_corpus(&mut index, dir.path(), 100);
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        seed_baseline_corpus(&storage, dir.path(), 100);
     }
 
     // ---- Control: idle (no background indexer) ----
-    let idle_report = measure_foreground_latency(&index_path, 50, Duration::from_millis(5));
+    let idle_report =
+        measure_foreground_latency(&index_path, &db_path, 50, Duration::from_millis(5));
     eprintln!(
         "idle latency: samples={} p50={:?} p95={:?} max={:?}",
         idle_report.sample_count, idle_report.p50, idle_report.p95, idle_report.max
@@ -195,6 +196,7 @@ fn search_p95_stays_within_budget_while_indexing_in_background() {
     let ready = Arc::new(Barrier::new(2));
     let bg_handle = spawn_background_indexer(
         index_path.clone(),
+        db_path.clone(),
         Arc::clone(&stop),
         Arc::clone(&ready),
         10, // commit every 10 adds → ~every 20-40ms
@@ -206,7 +208,8 @@ fn search_p95_stays_within_budget_while_indexing_in_background() {
     // run actually overlaps with an active writer.
     thread::sleep(Duration::from_millis(50));
 
-    let pressured_report = measure_foreground_latency(&index_path, 50, Duration::from_millis(5));
+    let pressured_report =
+        measure_foreground_latency(&index_path, &db_path, 50, Duration::from_millis(5));
     stop.store(true, Ordering::Relaxed);
     let bg_conversations = bg_handle.join().expect("background indexer thread");
     eprintln!(
@@ -294,17 +297,17 @@ fn governor_disabled_run_matches_idle_baseline() {
 
     let dir = TempDir::new().unwrap();
     let index_path = dir.path().to_path_buf();
+    let db_path = index_path.join("agent_search.db");
     {
-        // Same lockfile rationale as in the primary test: drop the writer
-        // before the background indexer opens its own.
-        let mut index = TantivyIndex::open_or_create(&index_path).unwrap();
-        seed_baseline_corpus(&mut index, dir.path(), 100);
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        seed_baseline_corpus(&storage, dir.path(), 100);
     }
 
     let stop = Arc::new(AtomicBool::new(false));
     let ready = Arc::new(Barrier::new(2));
     let bg = spawn_background_indexer(
         index_path.clone(),
+        db_path.clone(),
         Arc::clone(&stop),
         Arc::clone(&ready),
         10,
@@ -312,7 +315,7 @@ fn governor_disabled_run_matches_idle_baseline() {
     ready.wait();
     thread::sleep(Duration::from_millis(50));
 
-    let report = measure_foreground_latency(&index_path, 50, Duration::from_millis(5));
+    let report = measure_foreground_latency(&index_path, &db_path, 50, Duration::from_millis(5));
     stop.store(true, Ordering::Relaxed);
     let bg_conversations = bg.join().unwrap();
 

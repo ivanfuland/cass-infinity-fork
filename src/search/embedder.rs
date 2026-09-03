@@ -1,13 +1,14 @@
 //! Embedder trait and types for semantic search.
 //!
-//! This module re-exports the canonical [`Embedder`] trait from frankensearch's
-//! [`SyncEmbed`](frankensearch::SyncEmbed) trait. All embedding implementations
-//! must satisfy `Embedder`, which provides a synchronous embedding interface
-//! suitable for cass's sync call sites.
+//! This module re-exports the canonical [`Embedder`] trait from the
+//! W3-5-restored (verbatim, ex-frankensearch) [`SyncEmbed`](crate::search::frankensearch_types::SyncEmbed)
+//! trait. All embedding implementations must satisfy `Embedder`, which
+//! provides a synchronous embedding interface suitable for cass's sync call
+//! sites.
 //!
-//! The [`SyncEmbedderAdapter`](frankensearch::SyncEmbedderAdapter) can wrap any
-//! `Embedder` implementor into frankensearch's async `Embedder` trait when needed
-//! for the frankensearch search pipeline.
+//! The [`SyncEmbedderAdapter`](crate::search::frankensearch_types::SyncEmbedderAdapter)
+//! can wrap any `Embedder` implementor into the restored async `Embedder`
+//! trait when needed for the frankensearch-derived search pipeline.
 //!
 //! # Implementations
 //!
@@ -16,9 +17,11 @@
 
 use std::fmt;
 
-pub use frankensearch::SearchError as EmbedderError;
-pub use frankensearch::SearchResult as EmbedderResult;
-pub use frankensearch::SyncEmbed as Embedder;
+pub use crate::search::frankensearch_types::ModelCategory;
+pub use crate::search::frankensearch_types::ModelTier;
+pub use crate::search::frankensearch_types::SearchError as EmbedderError;
+pub use crate::search::frankensearch_types::SearchResult as EmbedderResult;
+pub use crate::search::frankensearch_types::SyncEmbed as Embedder;
 
 /// Metadata about an embedder for display and logging.
 #[derive(Debug, Clone)]

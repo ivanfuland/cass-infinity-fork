@@ -42,64 +42,14 @@ const STRICT_PATH_DEP_ENV: &str = "CASS_STRICT_PATH_DEP_VALIDATION";
 
 const CONTRACTS: &[DependencyContract] = &[
     DependencyContract {
-        label: "frankensqlite facade",
-        dep_table: "dependencies",
-        dep_key: "frankensqlite",
-        crate_package_name: "fsqlite",
-        manifest_package_field: Some("fsqlite"),
-        // crates.io-only exact pin: fsqlite 0.1.16 carries everything from the
-        // 0.1.11 line (#95 BtCursor forward-progress, #106 MVCC grow, FTS5
-        // shadow-table persistence + lazy reopen [cass#282], FTS5 merge/finalize
-        // O(N^2)->O(N) spin fix [cass#301]) plus the correctness/durability
-        // hardening that motivated this bump: #127 (overflow-chain
-        // rollback/failure atomicity), #128 (freelist conflict surface),
-        // #124 (snapshot-consistency "mixing generations"), and the #133
-        // lock-byte integrity-check false positive fix. NOTE (verified 2026-07-16): the contentless-FTS
-        // incremental catch-up and legacy duplicate-schema repair paths are
-        // still NOT delivered on 0.1.16 — the three #[ignore]d gates in
-        // src/storage/sqlite.rs (cass y8n3i/cljkz) still fail when force-run
-        // (catch-up degrades to a full rebuild; legacy repair still reports
-        // "database disk image is malformed"). Keep them ignored, same as
-        // upstream at fsqlite 0.1.13. Empty `expected_git` signals
-        // `validate_manifest_dependency_spec` to skip git/rev checks.
-        expected_git: "",
-        expected_rev: "",
-        expected_version: "0.1.16",
-        expected_features: &["fts5"],
-        expected_default_features: None,
-        repo_rel: "../frankensqlite",
-        manifest_rel: "crates/fsqlite/Cargo.toml",
-        patch_url: Some("https://github.com/Dicklesworthstone/frankensqlite"),
-        patch_key: Some("fsqlite"),
-        mode: ValidationMode::StrictOptIn,
-    },
-    DependencyContract {
-        label: "frankensqlite shared types",
-        dep_table: "dev-dependencies",
-        dep_key: "fsqlite-types",
-        crate_package_name: "fsqlite-types",
-        manifest_package_field: Some("fsqlite-types"),
-        // crates.io-only exact pin aligned with the frankensqlite facade at 0.1.16.
-        expected_git: "",
-        expected_rev: "",
-        expected_version: "0.1.16",
-        expected_features: &[],
-        expected_default_features: None,
-        repo_rel: "../frankensqlite",
-        manifest_rel: "crates/fsqlite-types/Cargo.toml",
-        patch_url: Some("https://github.com/Dicklesworthstone/frankensqlite"),
-        patch_key: Some("fsqlite-types"),
-        mode: ValidationMode::StrictOptIn,
-    },
-    DependencyContract {
         label: "franken_agent_detection",
         dep_table: "dependencies",
         dep_key: "franken-agent-detection",
         crate_package_name: "franken-agent-detection",
         manifest_package_field: None,
         expected_git: "https://github.com/ivanfuland/my_franken_agent_detection",
-        expected_rev: "068f423be6ea213bc396f4bd3baba762927f1d14",
-        expected_version: "0.1.9",
+        expected_rev: "bc0f4d3c02356eac4d4dbc48e6f7d830d2caa9e8",
+        expected_version: "0.1.10",
         expected_features: &[
             "chatgpt",
             "connectors",
@@ -122,8 +72,8 @@ const CONTRACTS: &[DependencyContract] = &[
         crate_package_name: "asupersync",
         manifest_package_field: None,
         // crates.io-only exact pin after the 0.3.x migration unified every source
-        // (direct dep, frankensqlite transitive, frankensearch transitive)
-        // onto a single published release. Empty `expected_git` signals
+        // (direct dep, frankensqlite transitive) onto a single published
+        // release. Empty `expected_git` signals
         // `validate_manifest_dependency_spec` to skip git/rev checks.
         expected_git: "",
         expected_rev: "",
@@ -132,32 +82,6 @@ const CONTRACTS: &[DependencyContract] = &[
         expected_default_features: None,
         repo_rel: "../asupersync",
         manifest_rel: "Cargo.toml",
-        patch_url: None,
-        patch_key: None,
-        mode: ValidationMode::StrictOptIn,
-    },
-    DependencyContract {
-        label: "frankensearch",
-        dep_table: "dependencies",
-        dep_key: "frankensearch",
-        crate_package_name: "frankensearch",
-        manifest_package_field: None,
-        expected_git: "https://github.com/Dicklesworthstone/frankensearch",
-        // Bumped from 831b3b13 to pick up bounded cass content-prefix
-        // indexing plus the self-contained Git dependency packaging fix.
-        expected_rev: "2cad158f4468ece7076e3fe529c8e5c20b2e020e",
-        expected_version: "0.3.2",
-        // cass#256: `fastembed-reranker` no longer appears in the static
-        // `[dependencies]` table; it is enabled by the cass `semantic`
-        // feature so the baseline build (`--no-default-features --features
-        // qr,encryption`) can drop the prebuilt Microsoft ONNX Runtime
-        // binary that crashes pre-AVX2 CPUs. The contract therefore only
-        // pins the always-on features here; the conditional one is
-        // validated by Cargo's own feature graph.
-        expected_features: &["ann", "hash", "lexical"],
-        expected_default_features: Some(false),
-        repo_rel: "../frankensearch",
-        manifest_rel: "frankensearch/Cargo.toml",
         patch_url: None,
         patch_key: None,
         mode: ValidationMode::StrictOptIn,

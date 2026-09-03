@@ -3,10 +3,8 @@
 //! Provides persistent storage for bookmarked search results with user notes
 //! and tags. Uses a separate `SQLite` database file to avoid schema conflicts.
 
+use crate::storage::api::{Conn as Connection, Row, StorageError, TxMode, params};
 use anyhow::{Context, Result};
-use frankensqlite::Connection;
-use frankensqlite::compat::{ConnectionExt, OptionalExtension, RowExt, TransactionExt};
-use frankensqlite::params;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -115,15 +113,20 @@ impl BookmarkStore {
                 .with_context(|| format!("creating bookmarks directory {}", parent.display()))?;
         }
 
-        let conn = Connection::open(path.to_string_lossy().as_ref())
+        let conn = Connection::open_writable(path, crate::storage::api::Profile::Production)
             .with_context(|| format!("opening bookmarks db at {}", path.display()))?;
 
-        // Apply pragmas for performance and concurrency safety
+        // Apply pragmas for performance and concurrency safety. foreign_keys
+        // is no longer set here (w1b Task B2b, R0-B3): every storage::api
+        // connection now enforces it at open time (backend_franken.rs's
+        // `enforce_foreign_keys`), and the api layer rejects any SQL text
+        // mentioning `foreign_keys` as a defense-in-depth guard against
+        // toggling it (see `reject_foreign_keys_keyword`) -- this line would
+        // now be rejected, not just redundant.
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
-             PRAGMA busy_timeout = 5000;
-             PRAGMA foreign_keys = ON;",
+             PRAGMA busy_timeout = 5000;",
         )?;
 
         // Create schema if needed
@@ -142,10 +145,10 @@ impl BookmarkStore {
     pub fn add(&self, bookmark: &Bookmark) -> Result<i64> {
         let line_number = line_number_to_db(bookmark.line_number)?;
 
-        self.conn.execute_compat(
+        self.conn.execute(
             "INSERT INTO bookmarks (title, source_path, line_number, agent, workspace, note, tags, created_at, updated_at, snippet)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![
+            &params![
                 bookmark.title.as_str(),
                 bookmark.source_path.as_str(),
                 line_number,
@@ -167,9 +170,9 @@ impl BookmarkStore {
     pub fn update(&self, bookmark: &Bookmark) -> Result<bool> {
         let now = current_timestamp();
 
-        let rows = self.conn.execute_compat(
+        let rows = self.conn.execute(
             "UPDATE bookmarks SET title = ?1, note = ?2, tags = ?3, updated_at = ?4 WHERE id = ?5",
-            params![
+            &params![
                 bookmark.title.as_str(),
                 bookmark.note.as_str(),
                 bookmark.tags.as_str(),
@@ -185,20 +188,19 @@ impl BookmarkStore {
     pub fn remove(&self, id: i64) -> Result<bool> {
         let rows = self
             .conn
-            .execute_compat("DELETE FROM bookmarks WHERE id = ?1", params![id])?;
+            .execute("DELETE FROM bookmarks WHERE id = ?1", &params![id])?;
         Ok(rows > 0)
     }
 
     /// Get a bookmark by ID
     pub fn get(&self, id: i64) -> Result<Option<Bookmark>> {
         self.conn
-            .query_row_map(
+            .query_opt_map(
                 "SELECT id, title, source_path, line_number, agent, workspace, note, tags, created_at, updated_at, snippet
                  FROM bookmarks WHERE id = ?1",
-                params![id],
+                &params![id],
                 row_to_bookmark,
             )
-            .optional()
             .context("querying bookmark by id")
     }
 
@@ -208,7 +210,7 @@ impl BookmarkStore {
                    FROM bookmarks ORDER BY created_at DESC";
 
         let all_bookmarks: Vec<Bookmark> =
-            self.conn.query_map_collect(sql, &[], row_to_bookmark)?;
+            self.conn.query_all_map(sql, &[], row_to_bookmark)?;
 
         if let Some(tag) = tag_filter {
             Ok(all_bookmarks
@@ -230,12 +232,12 @@ impl BookmarkStore {
             .replace('_', "\\_");
         let pattern = format!("%{escaped}%");
 
-        let results = self.conn.query_map_collect(
+        let results = self.conn.query_all_map(
             "SELECT id, title, source_path, line_number, agent, workspace, note, tags, created_at, updated_at, snippet
              FROM bookmarks
              WHERE LOWER(title) LIKE ?1 ESCAPE '\\' OR LOWER(note) LIKE ?1 ESCAPE '\\' OR LOWER(snippet) LIKE ?1 ESCAPE '\\'
              ORDER BY created_at DESC",
-            params![pattern],
+            &params![pattern],
             row_to_bookmark,
         ).context("searching bookmarks")?;
         Ok(results)
@@ -260,7 +262,7 @@ impl BookmarkStore {
         let count: i64 = self.conn.query_row_map(
             "SELECT COUNT(*) FROM bookmarks",
             &[],
-            |row: &frankensqlite::Row| row.get_typed(0),
+            |row| row.get_typed(0),
         )?;
         usize::try_from(count).context("bookmark count is out of range")
     }
@@ -270,8 +272,8 @@ impl BookmarkStore {
         let line_number = line_number_to_db(line_number)?;
         let exists: i64 = self.conn.query_row_map(
             "SELECT EXISTS(SELECT 1 FROM bookmarks WHERE source_path = ?1 AND line_number IS ?2)",
-            params![source_path, line_number],
-            |row: &frankensqlite::Row| row.get_typed(0),
+            &params![source_path, line_number],
+            |row| row.get_typed(0),
         )?;
         Ok(exists != 0)
     }
@@ -286,55 +288,74 @@ impl BookmarkStore {
     pub fn import_json(&self, json: &str) -> Result<usize> {
         let bookmarks: Vec<Bookmark> =
             serde_json::from_str(json).context("parsing bookmark JSON")?;
-        let mut imported = 0;
 
-        let mut tx = self.conn.transaction()?;
+        // w1b Task B3 (D2): with_tx, TxMode::Immediate. Two changes from the
+        // pre-migration shape, both required by `Fn`'s "callable more than
+        // once" contract, not stylistic: `imported` moves inside the closure
+        // (a replay must start its count fresh, not add onto a prior failed
+        // attempt's partial count); `for mut bookmark in bookmarks` (by
+        // value) becomes `for bookmark in &bookmarks` (by reference) -- an
+        // `Fn` closure can't move-consume its captured `bookmarks: Vec<
+        // Bookmark>` on every call, only borrow it. Dropped `bookmark.id =
+        // 0` in the process: the INSERT below never lists an `id` column, so
+        // that assignment never affected anything to begin with -- it's
+        // already dead with `bookmark: &Bookmark` too, not a behavior change
+        // this migration is introducing.
+        Ok(self.conn.with_tx(TxMode::Immediate, |tx| -> Result<usize, StorageError> {
+            let mut imported = 0;
+            for bookmark in &bookmarks {
+                let line_number = line_number_to_db(bookmark.line_number)
+                    .map_err(crate::storage::sqlite::anyhow_error_into_storage_error)?;
 
-        for mut bookmark in bookmarks {
-            let line_number = line_number_to_db(bookmark.line_number)?;
+                // Check for duplicates. R1-B6 (PR-front code review, control-plane
+                // adjudicated 2026-08-25): `.unwrap_or(0)` around the whole
+                // query_row_map call swallowed any error -- including a real
+                // query-execution failure (Busy, lock recovery, etc.) -- as
+                // "no duplicate found", letting the INSERT below commit a
+                // duplicate row. Baseline (31628af8) split this into two error
+                // tiers: `tx.query_with_params(...)?` propagates execution
+                // errors, and only the per-row *value conversion*
+                // (`row.get_typed(0).ok()`) plus the "zero rows returned" case
+                // (`exists_row.first()` on an empty Vec) tolerate a fallback to
+                // 0. Restored that boundary: `query_opt_map`'s outer `?` still
+                // propagates execution errors; `Ok(None)` on zero rows and the
+                // inline `.unwrap_or(0)` on a row-conversion miss both fall
+                // back to 0, matching baseline exactly.
+                let exists: i64 = tx
+                    .query_opt_map(
+                        "SELECT EXISTS(SELECT 1 FROM bookmarks WHERE source_path = ?1 AND line_number IS ?2)",
+                        &params![bookmark.source_path.as_str(), line_number],
+                        |row| Ok(row.get_typed::<i64>(0).unwrap_or(0)),
+                    )?
+                    .unwrap_or(0);
 
-            // Check for duplicates
-            let check_params = params![bookmark.source_path.as_str(), line_number];
-            let check_values = frankensqlite::compat::param_slice_to_values(check_params);
-            let exists_row = tx.query_with_params(
-                "SELECT EXISTS(SELECT 1 FROM bookmarks WHERE source_path = ?1 AND line_number IS ?2)",
-                &check_values,
-            )?;
-            let exists: i64 = exists_row
-                .first()
-                .and_then(|row| row.get_typed(0).ok())
-                .unwrap_or(0);
-
-            if exists == 0 {
-                bookmark.id = 0; // Reset ID for new insert
-                tx.execute_compat(
-                    "INSERT INTO bookmarks (title, source_path, line_number, agent, workspace, note, tags, created_at, updated_at, snippet)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                    params![
-                        bookmark.title.as_str(),
-                        bookmark.source_path.as_str(),
-                        line_number,
-                        bookmark.agent.as_str(),
-                        bookmark.workspace.as_str(),
-                        bookmark.note.as_str(),
-                        bookmark.tags.as_str(),
-                        bookmark.created_at,
-                        bookmark.updated_at,
-                        bookmark.snippet.as_str(),
-                    ],
-                )?;
-                imported += 1;
+                if exists == 0 {
+                    tx.execute(
+                        "INSERT INTO bookmarks (title, source_path, line_number, agent, workspace, note, tags, created_at, updated_at, snippet)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                        &params![
+                            bookmark.title.as_str(),
+                            bookmark.source_path.as_str(),
+                            line_number,
+                            bookmark.agent.as_str(),
+                            bookmark.workspace.as_str(),
+                            bookmark.note.as_str(),
+                            bookmark.tags.as_str(),
+                            bookmark.created_at,
+                            bookmark.updated_at,
+                            bookmark.snippet.as_str(),
+                        ],
+                    )?;
+                    imported += 1;
+                }
             }
-        }
-
-        tx.commit()?;
-
-        Ok(imported)
+            Ok(imported)
+        })?)
     }
 }
 
 /// Convert a database row to a Bookmark
-fn row_to_bookmark(row: &frankensqlite::Row) -> Result<Bookmark, frankensqlite::FrankenError> {
+fn row_to_bookmark(row: &Row) -> Result<Bookmark, StorageError> {
     Ok(Bookmark {
         id: row.get_typed(0)?,
         title: row.get_typed(1)?,
@@ -575,10 +596,10 @@ mod tests {
         let now = current_timestamp();
         store
             .conn
-            .execute_compat(
+            .execute(
                 "INSERT INTO bookmarks (title, source_path, line_number, agent, workspace, note, tags, created_at, updated_at, snippet)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                params![
+                &params![
                     "NegLine",
                     "/neg.rs",
                     -12_i64,

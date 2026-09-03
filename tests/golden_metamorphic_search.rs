@@ -14,8 +14,9 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
+use coding_agent_search::indexer::persist::persist_conversation;
 use coding_agent_search::search::query::{FieldMask, SearchClient, SearchFilters};
-use coding_agent_search::search::tantivy::TantivyIndex;
+use coding_agent_search::storage::sqlite::SqliteStorage;
 use tempfile::TempDir;
 
 mod util;
@@ -30,7 +31,7 @@ fn fixed_now_ms() -> i64 {
     1_768_435_200_000 // 2026-01-15 00:00:00 UTC
 }
 
-fn seed_corpus(index: &mut TantivyIndex, dir: &std::path::Path, now_ms: i64) {
+fn seed_corpus(storage: &SqliteStorage, dir: &std::path::Path, now_ms: i64) {
     let day_ms: i64 = 86_400_000;
     for (agent_idx, &agent) in AGENTS.iter().enumerate() {
         for conv_idx in 0..5 {
@@ -57,10 +58,9 @@ fn seed_corpus(index: &mut TantivyIndex, dir: &std::path::Path, now_ms: i64) {
                     format!("metamorphic_sentinel {unique} debugging epsilon zeta"),
                 )
                 .build_normalized();
-            index.add_conversation(&conv).unwrap();
+            persist_conversation(storage, &conv).unwrap();
         }
     }
-    index.commit().unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -115,10 +115,11 @@ fn assert_golden(name: &str, actual: &str) {
 #[test]
 fn golden_corpus_shape() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
-    seed_corpus(&mut index, dir.path(), fixed_now_ms());
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
+    seed_corpus(&storage, dir.path(), fixed_now_ms());
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
 
@@ -158,10 +159,11 @@ fn golden_corpus_shape() {
 #[test]
 fn golden_limit_prefix_ordering() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
-    seed_corpus(&mut index, dir.path(), fixed_now_ms());
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
+    seed_corpus(&storage, dir.path(), fixed_now_ms());
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
 
@@ -237,10 +239,11 @@ fn golden_limit_prefix_ordering() {
 #[test]
 fn golden_agent_filter_breakdown() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
-    seed_corpus(&mut index, dir.path(), fixed_now_ms());
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
+    seed_corpus(&storage, dir.path(), fixed_now_ms());
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
 
@@ -286,11 +289,12 @@ fn golden_agent_filter_breakdown() {
 #[test]
 fn golden_days_filter_staircase() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
     let now = fixed_now_ms();
-    seed_corpus(&mut index, dir.path(), now);
+    seed_corpus(&storage, dir.path(), now);
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
 
@@ -344,10 +348,11 @@ fn golden_days_filter_staircase() {
 #[test]
 fn golden_case_invariance() {
     let dir = TempDir::new().unwrap();
-    let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
-    seed_corpus(&mut index, dir.path(), fixed_now_ms());
+    let db_path = dir.path().join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
+    seed_corpus(&storage, dir.path(), fixed_now_ms());
 
-    let client = SearchClient::open(dir.path(), None)
+    let client = SearchClient::open(dir.path(), Some(&db_path))
         .unwrap()
         .expect("client");
 

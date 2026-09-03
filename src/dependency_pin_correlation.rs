@@ -3,9 +3,9 @@
 //! Bead: coding_agent_session_search-cass-fleet-resilience-20260608-uojcg.9.4
 //! ("Track dependency pins and upstream fix correlation in diagnostics").
 //!
-//! CASS pins sibling crates (frankensqlite, frankensearch, asupersync, …) by git
-//! revision. When a symptom shows up — e.g. a frankensqlite FTS/`OpenRead`
-//! failure — the right diagnostic answer is often "this is already fixed upstream
+//! CASS pins sibling crates (asupersync, franken-agent-detection, frankentui, …)
+//! by git revision. When a symptom shows up — e.g. a known upstream bug in one of
+//! these sibling crates — the right diagnostic answer is often "this is already fixed upstream
 //! in rev X; your pin is behind" or "your local checkout is dirty/patched, so the
 //! pinned rev is not what is actually running". This module makes that correlation
 //! explicit instead of leaving an operator to guess from CASS source symptoms.
@@ -28,7 +28,7 @@ pub const DEPENDENCY_PIN_SCHEMA_VERSION: u32 = 1;
 /// rev Z" without a network call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KnownIssue {
-    /// Stable issue identifier (e.g. `"fsqlite-openread-001"`).
+    /// Stable issue identifier (e.g. `"asupersync-runtime-001"`).
     pub id: &'static str,
     /// The dependency package the issue lives in.
     pub package: &'static str,
@@ -41,31 +41,14 @@ pub struct KnownIssue {
 }
 
 /// The built-in catalog of known upstream fixes worth correlating. Kept small and
-/// curated; the report specifically called out frankensqlite FTS/`OpenRead`
-/// fixes. Extend as fixes land.
-pub const KNOWN_ISSUES: &[KnownIssue] = &[
-    KnownIssue {
-        id: "fsqlite-openread-001",
-        package: "frankensqlite",
-        symptom: "OpenRead error opening main DB",
-        family: RootCauseFamily::FrankensqliteStorage,
-        fixed_in_rev: "a4923d4",
-    },
-    KnownIssue {
-        id: "fsqlite-fts-002",
-        package: "frankensqlite",
-        symptom: "FTS query fails while plain reads succeed",
-        family: RootCauseFamily::FrankensqliteStorage,
-        fixed_in_rev: "a4923d4",
-    },
-    KnownIssue {
-        id: "frankensearch-tantivy-001",
-        package: "frankensearch",
-        symptom: "missing Tantivy metadata / segment error",
-        family: RootCauseFamily::FrankensearchSearch,
-        fixed_in_rev: "be455cc",
-    },
-];
+/// curated; extend as fixes land.
+///
+/// W3-5: the sole entry (a frankensearch Tantivy metadata issue) was retired
+/// alongside the `frankensearch` dependency itself -- there is no longer a
+/// live package for it to correlate against. Empty for now; the correlation
+/// mechanism below (`assess_pin`/`issues_for_package`) is unchanged and ready
+/// for the next curated entry.
+pub const KNOWN_ISSUES: &[KnownIssue] = &[];
 
 /// What a probe observed about a single dependency pin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -258,76 +241,47 @@ mod tests {
     #[test]
     fn current_pin_matches_and_needs_no_action() {
         let a = assess_pin(&obs(
-            "frankensqlite",
-            "a4923d4",
-            Some("a4923d4"),
+            "asupersync",
+            "be455cc",
+            Some("be455cc"),
             false,
             true,
         ));
         assert_eq!(a.pin_state, PinState::Current);
-        // Pin is at the fixed rev, so the known fixes are present.
         assert!(!a.upstream_fix_possibly_missing);
-        assert!(!a.known_issue_ids.is_empty());
-    }
-
-    #[test]
-    fn old_pin_is_stale_and_flags_missing_fix() {
-        let a = assess_pin(&obs(
-            "frankensqlite",
-            "a4923d4",
-            Some("0000abc"),
-            false,
-            true,
-        ));
-        assert_eq!(a.pin_state, PinState::Stale);
-        // Local rev does not carry the fix.
-        assert!(a.upstream_fix_possibly_missing);
-        assert!(
-            a.known_issue_ids
-                .contains(&"fsqlite-openread-001".to_string())
-        );
-        assert!(a.recommended_validation.contains("cargo update"));
+        // No catalog entries currently correlate to this package.
+        assert!(a.known_issue_ids.is_empty());
     }
 
     #[test]
     fn dirty_local_patch_is_unverifiable() {
         let a = assess_pin(&obs(
-            "frankensqlite",
-            "a4923d4",
-            Some("a4923d4"),
+            "asupersync",
+            "be455cc",
+            Some("be455cc"),
             true,
             true,
         ));
         assert_eq!(a.pin_state, PinState::DirtyLocalPatch);
-        // Even though the rev matches, dirtiness means the fix presence is unconfirmed.
-        assert!(a.upstream_fix_possibly_missing);
+        // No known issues for this package, so dirtiness alone doesn't flag a fix.
+        assert!(!a.upstream_fix_possibly_missing);
         assert!(a.recommended_validation.contains("dirty"));
     }
 
     #[test]
     fn missing_sibling_checkout_is_flagged() {
-        let a = assess_pin(&obs("frankensqlite", "a4923d4", None, false, false));
+        let a = assess_pin(&obs("asupersync", "be455cc", None, false, false));
         assert_eq!(a.pin_state, PinState::MissingCheckout);
-        assert!(a.upstream_fix_possibly_missing);
+        assert!(!a.upstream_fix_possibly_missing);
         assert!(a.recommended_validation.contains("no local checkout"));
     }
 
     #[test]
     fn no_network_mode_is_unverified_when_checkout_present_but_rev_unknown() {
-        let a = assess_pin(&obs("frankensearch", "be455cc", None, false, true));
+        let a = assess_pin(&obs("asupersync", "be455cc", None, false, true));
         assert_eq!(a.pin_state, PinState::Unverified);
-        // Pin is at the fixed rev, but we can't observe local rev → unconfirmed.
-        assert!(a.upstream_fix_possibly_missing);
+        assert!(!a.upstream_fix_possibly_missing);
         assert!(a.recommended_validation.contains("rev-parse"));
-    }
-
-    #[test]
-    fn unverified_with_pin_at_fixed_rev_still_lists_issues() {
-        let a = assess_pin(&obs("frankensearch", "be455cc", None, false, true));
-        assert!(
-            a.known_issue_ids
-                .contains(&"frankensearch-tantivy-001".to_string())
-        );
     }
 
     #[test]
@@ -357,38 +311,23 @@ mod tests {
     }
 
     #[test]
-    fn current_pin_at_fixed_rev_confirms_fix_present() {
-        // Long pinned rev whose prefix matches the catalog short rev.
-        let a = assess_pin(&obs(
-            "frankensqlite",
-            "a4923d4097899e6e9805cefe67bce70e1b04a289",
-            Some("a4923d4097899e6e9805cefe67bce70e1b04a289"),
-            false,
-            true,
-        ));
-        assert_eq!(a.pin_state, PinState::Current);
-        assert!(
-            !a.upstream_fix_possibly_missing,
-            "fix rev prefix-matches the pin"
-        );
-    }
-
-    #[test]
     fn assessment_serializes_with_stable_fields_and_round_trips() {
         let a = assess_pin(&obs(
-            "frankensqlite",
-            "a4923d4",
+            "asupersync",
+            "be455cc",
             Some("0000abc"),
             false,
             true,
         ));
         let value = serde_json::to_value(&a).unwrap();
         assert_eq!(value["schema_version"], DEPENDENCY_PIN_SCHEMA_VERSION);
-        assert_eq!(value["package"], "frankensqlite");
+        assert_eq!(value["package"], "asupersync");
         assert_eq!(value["pin_state"], "stale");
         assert_eq!(value["observed_local_rev"], "0000abc");
-        assert_eq!(value["upstream_fix_possibly_missing"], true);
-        assert!(!value["known_issue_ids"].as_array().unwrap().is_empty());
+        assert_eq!(value["upstream_fix_possibly_missing"], false);
+        // `known_issue_ids` has `skip_serializing_if = "Vec::is_empty"`, so an
+        // empty catalog match omits the key entirely rather than serializing `[]`.
+        assert!(value.get("known_issue_ids").is_none());
         let back: PinAssessment = serde_json::from_value(value).unwrap();
         assert_eq!(back, a);
     }
@@ -425,8 +364,8 @@ mod tests {
     #[test]
     fn assess_pins_maps_all_observations() {
         let observations = vec![
-            obs("frankensqlite", "a4923d4", Some("a4923d4"), false, true),
-            obs("frankensearch", "be455cc", None, false, false),
+            obs("asupersync", "a4923d4", Some("a4923d4"), false, true),
+            obs("franken-agent-detection", "be455cc", None, false, false),
         ];
         let assessments = assess_pins(&observations);
         assert_eq!(assessments.len(), 2);

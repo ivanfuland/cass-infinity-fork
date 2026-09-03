@@ -25,9 +25,8 @@ use crate::pages::encrypt::{KeySlot, SlotType};
 use crate::pages::secret_scan::{SecretScanReport, SecretScanSummary};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use frankensqlite::Connection;
-use frankensqlite::Row;
-use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
+use crate::storage::api::{Conn as Connection, Row};
+type ParamValue = crate::storage::api::Value;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -629,7 +628,7 @@ impl<'a> SummaryGenerator<'a> {
             );
             let (message_count, character_count): (i64, i64) = self
                 .db
-                .query_map_collect(&query, &params, |row: &Row| {
+                .query_all_map(&query, &params, |row: &Row| {
                     Ok((
                         row.get_typed::<Option<i64>>(0)?.unwrap_or(0),
                         row.get_typed::<Option<i64>>(1)?.unwrap_or(0),
@@ -662,7 +661,7 @@ impl<'a> SummaryGenerator<'a> {
             .context("Failed to count conversations")?;
 
         // Count messages and characters using subquery to avoid
-        // JOIN + aggregate without GROUP BY (frankensqlite limitation).
+        // JOIN + aggregate without GROUP BY (the legacy embedded engine limitation).
         let msg_query = format!(
             "SELECT COUNT(*), SUM(LENGTH(content))
              FROM messages
@@ -671,7 +670,7 @@ impl<'a> SummaryGenerator<'a> {
         );
         let (total_messages, total_characters): (i64, i64) = self
             .db
-            .query_map_collect(&msg_query, params, |row: &Row| {
+            .query_all_map(&msg_query, params, |row: &Row| {
                 Ok((
                     row.get_typed::<Option<i64>>(0)?.unwrap_or(0),
                     row.get_typed::<Option<i64>>(1)?.unwrap_or(0),
@@ -715,8 +714,8 @@ impl<'a> SummaryGenerator<'a> {
         params: &[ParamValue],
     ) -> Result<Vec<DateHistogramEntry>> {
         // Use integer day computation instead of DATE() which isn't supported
-        // by frankensqlite. The day_epoch is seconds-since-epoch / 86400.
-        // Use subquery instead of JOIN to avoid frankensqlite aggregate limitation.
+        // by the legacy embedded engine. The day_epoch is seconds-since-epoch / 86400.
+        // Use subquery instead of JOIN to avoid the legacy embedded engine aggregate limitation.
         let query = format!(
             "SELECT created_at / 1000 / 86400,
                     COUNT(*)
@@ -729,7 +728,7 @@ impl<'a> SummaryGenerator<'a> {
         );
 
         // Count distinct conversations per day using a subquery approach.
-        // The subquery is explicitly aliased as `day_pairs` so frankensqlite's
+        // The subquery is explicitly aliased as `day_pairs` so the legacy embedded engine's
         // query planner can resolve the outer GROUP BY without falling back to
         // an internal default-alias path (which currently surfaces as
         // "column not found: subquery.conversation_id").
@@ -745,7 +744,7 @@ impl<'a> SummaryGenerator<'a> {
             where_clause
         );
 
-        let day_msg_rows = self.db.query_map_collect(&query, params, |row: &Row| {
+        let day_msg_rows = self.db.query_all_map(&query, params, |row: &Row| {
             let day_epoch: i64 = row.get_typed::<Option<i64>>(0)?.unwrap_or(0);
             let msg_count: i64 = row.get_typed::<Option<i64>>(1)?.unwrap_or(0);
             Ok((day_epoch, msg_count as usize))
@@ -753,7 +752,7 @@ impl<'a> SummaryGenerator<'a> {
 
         let day_conv_rows = self
             .db
-            .query_map_collect(&conv_query, params, |row: &Row| {
+            .query_all_map(&conv_query, params, |row: &Row| {
                 let day_epoch: i64 = row.get_typed::<Option<i64>>(0)?.unwrap_or(0);
                 let conv_count: i64 = row.get_typed::<Option<i64>>(1)?.unwrap_or(0);
                 Ok((day_epoch, conv_count as usize))
@@ -794,7 +793,7 @@ impl<'a> SummaryGenerator<'a> {
             where_clause
         );
 
-        let conv_rows = self.db.query_map_collect(&query, params, |row: &Row| {
+        let conv_rows = self.db.query_all_map(&query, params, |row: &Row| {
             Ok((
                 row.get_typed::<i64>(0)?,
                 row.get_typed::<Option<i64>>(1)?,
@@ -822,7 +821,7 @@ impl<'a> SummaryGenerator<'a> {
             let workspace_query =
                 format!("SELECT id, path FROM workspaces WHERE id IN ({placeholders})");
             self.db
-                .query_map_collect(&workspace_query, &workspace_params, |row: &Row| {
+                .query_all_map(&workspace_query, &workspace_params, |row: &Row| {
                     Ok((row.get_typed::<i64>(0)?, row.get_typed::<String>(1)?))
                 })?
                 .into_iter()
@@ -881,7 +880,7 @@ impl<'a> SummaryGenerator<'a> {
             where_clause
         );
 
-        let conv_rows = self.db.query_map_collect(&query, params, |row: &Row| {
+        let conv_rows = self.db.query_all_map(&query, params, |row: &Row| {
             Ok((row.get_typed::<i64>(0)?, row.get_typed::<String>(1)?))
         })?;
 
@@ -943,7 +942,7 @@ impl<'a> SummaryGenerator<'a> {
             );
 
             for (conversation_id, day_epoch, message_count) in
-                self.db.query_map_collect(&query, &params, |row: &Row| {
+                self.db.query_all_map(&query, &params, |row: &Row| {
                     Ok((
                         row.get_typed::<i64>(0)?,
                         row.get_typed::<Option<i64>>(1)?.unwrap_or(0),
@@ -1003,7 +1002,7 @@ impl<'a> SummaryGenerator<'a> {
             );
 
             for (conversation_id, workspace, title, started_at) in
-                self.db.query_map_collect(&query, &params, |row: &Row| {
+                self.db.query_all_map(&query, &params, |row: &Row| {
                     Ok((
                         row.get_typed::<i64>(0)?,
                         row.get_typed::<String>(1)?,
@@ -1090,7 +1089,7 @@ impl<'a> SummaryGenerator<'a> {
             );
 
             for (conversation_id, agent_slug) in
-                self.db.query_map_collect(&query, &params, |row: &Row| {
+                self.db.query_all_map(&query, &params, |row: &Row| {
                     Ok((row.get_typed::<i64>(0)?, row.get_typed::<String>(1)?))
                 })?
             {
@@ -1146,7 +1145,7 @@ impl<'a> SummaryGenerator<'a> {
             where_clause
         );
 
-        let conv_rows = self.db.query_map_collect(&query, &params, |row: &Row| {
+        let conv_rows = self.db.query_all_map(&query, &params, |row: &Row| {
             Ok((
                 row.get_typed::<i64>(0)?,
                 row.get_typed::<Option<i64>>(1)?,
@@ -1172,7 +1171,7 @@ impl<'a> SummaryGenerator<'a> {
             let workspace_query =
                 format!("SELECT id, path FROM workspaces WHERE id IN ({placeholders})");
             self.db
-                .query_map_collect(&workspace_query, &workspace_params, |row: &Row| {
+                .query_all_map(&workspace_query, &workspace_params, |row: &Row| {
                     Ok((row.get_typed::<i64>(0)?, row.get_typed::<String>(1)?))
                 })?
                 .into_iter()
@@ -1363,7 +1362,8 @@ mod tests {
     fn create_test_db() -> (TempDir, Connection) {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test.db");
-        let conn = Connection::open(db_path.to_string_lossy().as_ref()).unwrap();
+        let conn = Connection::open_writable(&db_path, crate::storage::api::Profile::Production)
+            .unwrap();
 
         conn.execute_batch(
             "CREATE TABLE agents (
@@ -1405,7 +1405,8 @@ mod tests {
     fn create_test_db_without_message_count() -> (TempDir, Connection) {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test-no-message-count.db");
-        let conn = Connection::open(db_path.to_string_lossy().as_ref()).unwrap();
+        let conn = Connection::open_writable(&db_path, crate::storage::api::Profile::Production)
+            .unwrap();
 
         conn.execute_batch(
             "CREATE TABLE agents (
@@ -1444,32 +1445,31 @@ mod tests {
     }
 
     fn insert_test_data(conn: &Connection) {
-        use frankensqlite::compat::ConnectionExt;
-        use frankensqlite::params;
+        use crate::storage::api::params;
 
-        conn.execute("INSERT INTO agents (id, slug) VALUES (1, 'claude-code');")
+        conn.execute("INSERT INTO agents (id, slug) VALUES (1, 'claude-code');", &[])
             .unwrap();
-        conn.execute("INSERT INTO agents (id, slug) VALUES (2, 'aider');")
+        conn.execute("INSERT INTO agents (id, slug) VALUES (2, 'aider');", &[])
             .unwrap();
-        conn.execute("INSERT INTO workspaces (id, path) VALUES (1, '/home/user/project-a');")
+        conn.execute("INSERT INTO workspaces (id, path) VALUES (1, '/home/user/project-a');", &[])
             .unwrap();
-        conn.execute("INSERT INTO workspaces (id, path) VALUES (2, '/home/user/project-b');")
+        conn.execute("INSERT INTO workspaces (id, path) VALUES (2, '/home/user/project-b');", &[])
             .unwrap();
 
         // Insert conversations
         conn.execute(
             "INSERT INTO conversations (id, agent_id, workspace_id, title, source_path, started_at)
-             VALUES (1, 1, 1, 'Fix authentication bug', '/path/a.jsonl', 1700000000000);",
+             VALUES (1, 1, 1, 'Fix authentication bug', '/path/a.jsonl', 1700000000000);", &[],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO conversations (id, agent_id, workspace_id, title, source_path, started_at)
-             VALUES (2, 1, 1, 'Add user profile', '/path/b.jsonl', 1700100000000);",
+             VALUES (2, 1, 1, 'Add user profile', '/path/b.jsonl', 1700100000000);", &[],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO conversations (id, agent_id, workspace_id, title, source_path, started_at)
-             VALUES (3, 2, 2, 'Setup database', '/path/c.jsonl', 1700200000000);",
+             VALUES (3, 2, 2, 'Setup database', '/path/c.jsonl', 1700200000000);", &[],
         )
         .unwrap();
 
@@ -1484,10 +1484,10 @@ mod tests {
             for idx in 0..msg_count {
                 let role = if idx % 2 == 0 { "user" } else { "assistant" };
                 let created_at = 1700000000000i64 + (conv_id * 100000000) + (idx as i64 * 1000);
-                conn.execute_compat(
+                conn.execute(
                     "INSERT INTO messages (conversation_id, idx, role, content, created_at)
                      VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![
+                    &params![
                         conv_id,
                         idx as i64,
                         role,
@@ -1896,16 +1896,16 @@ mod tests {
 
         // Conversation without workspace should still be counted when exclusions
         // are active but do not match this conversation.
-        conn.execute("INSERT INTO agents (id, slug) VALUES (3, 'codex');")
+        conn.execute("INSERT INTO agents (id, slug) VALUES (3, 'codex');", &[])
             .unwrap();
         conn.execute(
             "INSERT INTO conversations (id, agent_id, workspace_id, title, source_path, started_at, message_count)
-             VALUES (10, 3, NULL, 'General session', '/path/no-workspace.jsonl', 1700300000000, 1);",
+             VALUES (10, 3, NULL, 'General session', '/path/no-workspace.jsonl', 1700300000000, 1);", &[],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO messages (conversation_id, idx, role, content, created_at)
-             VALUES (10, 0, 'user', 'Workspace-less message', 1700300001000);",
+             VALUES (10, 0, 'user', 'Workspace-less message', 1700300001000);", &[],
         )
         .unwrap();
 
@@ -1927,16 +1927,16 @@ mod tests {
         let (_dir, conn) = create_test_db();
         insert_test_data(&conn);
 
-        conn.execute("INSERT INTO agents (id, slug) VALUES (3, 'codex');")
+        conn.execute("INSERT INTO agents (id, slug) VALUES (3, 'codex');", &[])
             .unwrap();
         conn.execute(
             "INSERT INTO conversations (id, agent_id, workspace_id, title, source_path, started_at, message_count)
-             VALUES (10, 3, NULL, 'General session', '/path/no-workspace.jsonl', 1700300000000, 1);",
+             VALUES (10, 3, NULL, 'General session', '/path/no-workspace.jsonl', 1700300000000, 1);", &[],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO messages (conversation_id, idx, role, content, created_at)
-             VALUES (10, 0, 'user', 'Workspace-less message', 1700300001000);",
+             VALUES (10, 0, 'user', 'Workspace-less message', 1700300001000);", &[],
         )
         .unwrap();
 

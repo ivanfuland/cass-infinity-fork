@@ -18,6 +18,73 @@ use regex::{Regex, RegexSet};
 /// Placeholder inserted where a secret was found.
 const REDACTED: &str = "[REDACTED]";
 
+/// Return whether a JSON object key names a credential-bearing field.
+///
+/// Plain-text patterns can only redact a value when its label and value are in
+/// the same string (for example, `password=...`). Structured metadata stores
+/// them as separate JSON nodes, so the object walker must use the key's
+/// semantics. Normalization deliberately accepts the common snake/kebab/camel
+/// spellings while using an exact allowlist to avoid broad false positives such
+/// as `keyframe`, `monkey`, or `token_count`.
+fn is_sensitive_json_field(key: &str) -> bool {
+    let normalized = key
+        .bytes()
+        .filter(|byte| byte.is_ascii_alphanumeric())
+        .map(|byte| char::from(byte.to_ascii_lowercase()))
+        .collect::<String>();
+
+    matches!(
+        normalized.as_str(),
+        "password"
+            | "passwd"
+            | "pwd"
+            | "passphrase"
+            | "pin"
+            | "apikey"
+            | "apisecret"
+            | "token"
+            | "authtoken"
+            | "accesstoken"
+            | "refreshtoken"
+            | "idtoken"
+            | "sessiontoken"
+            | "bearertoken"
+            | "secrettoken"
+            | "secret"
+            | "secretkey"
+            | "accesskey"
+            | "awsaccesskeyid"
+            | "awssecretaccesskey"
+            | "awssessiontoken"
+            | "awssecuritytoken"
+            | "clientsecret"
+            | "clienttoken"
+            | "credential"
+            | "credentials"
+            | "authorization"
+            | "privatekey"
+            | "privatekeypem"
+            | "databasepassword"
+            | "dbpassword"
+    )
+}
+
+/// Cherry-picked in spirit from upstream cass commit
+/// 97757e67634dc019a2f543e741a31bd746db3fd6 (structured JSON credential
+/// redaction by key semantics). `otherwise` is the caller's normal
+/// (possibly memoized) recursive redaction path for non-sensitive values.
+fn redact_sensitive_json_value(
+    key: &str,
+    value: &serde_json::Value,
+    otherwise: impl FnOnce() -> serde_json::Value,
+) -> serde_json::Value {
+    if is_sensitive_json_field(key) && !value.is_null() {
+        serde_json::Value::String(REDACTED.to_owned())
+    } else {
+        otherwise()
+    }
+}
+
 /// A compiled secret-detection pattern.
 struct SecretPattern {
     pattern: &'static str,
@@ -115,7 +182,16 @@ pub fn redact_text(input: &str) -> Cow<'_, str> {
     if !matches.matched_any() {
         return Cow::Borrowed(input);
     }
+    apply_replacements(input, &matches)
+}
 
+/// Ordered per-pattern replacement passes for an input whose RegexSet
+/// prefilter already reported candidate matches. Shared by the plain
+/// [`redact_text`] path and the memoizing miss path so the candidate
+/// scan runs exactly once per input. Replacement order (ascending
+/// pattern index, sequential `replace_all`) is part of the frozen
+/// behavior contract — see `redact_text_reference` in the tests.
+fn apply_replacements<'a>(input: &'a str, matches: &regex::SetMatches) -> Cow<'a, str> {
     let mut output = Cow::Borrowed(input);
     for idx in matches.iter() {
         let replaced = SECRET_PATTERNS[idx]
@@ -146,7 +222,8 @@ pub fn redact_json(value: &serde_json::Value) -> serde_json::Value {
             let mut new_obj = serde_json::Map::new();
             for (k, v) in obj {
                 let redacted_key = redact_text(k).into_owned();
-                new_obj.insert(redacted_key, redact_json(v));
+                let redacted_value = redact_sensitive_json_value(k, v, || redact_json(v));
+                new_obj.insert(redacted_key, redacted_value);
             }
             serde_json::Value::Object(new_obj)
         }
@@ -207,6 +284,15 @@ pub fn redaction_algorithm_fingerprint() -> String {
 /// [`ContentAddressedMemoCache`] on the input bytes plus the algorithm
 /// fingerprint so repeated content stops paying the regex cost while a
 /// pattern bump invalidates every prior entry transparently.
+///
+/// Prefilter-first scope (redaction-perf campaign, xu3jq): the cache is
+/// consulted only for inputs whose RegexSet prefilter reports at least
+/// one candidate pattern match. Clean inputs — the overwhelming
+/// majority of real corpora — bypass hashing, LRU bookkeeping, and
+/// audit records entirely, because profiling showed that bookkeeping
+/// costing ~18x the actual regex scanning on a 21.8MB real codex
+/// corpus. Hit/miss/insert telemetry therefore describes
+/// candidate-bearing content only.
 ///
 /// The wrapper preserves the legacy [`redact_text`]/[`redact_json`]
 /// contract byte-for-byte: see
@@ -299,6 +385,25 @@ impl MemoizingRedactor {
         if input.is_empty() {
             return (String::new(), Vec::new());
         }
+        // Prefilter-first fast path (redaction-perf campaign, xu3jq):
+        // run the RegexSet candidate scan BEFORE any cache machinery.
+        // Profiling the previous shape on a real 21.8MB codex corpus
+        // showed the memo bookkeeping (blake3 content hashing, MemoKey
+        // clones, and O(capacity) VecDeque LRU scans in touch/retain)
+        // costing ~18x the actual secret scanning, because the
+        // overwhelming majority of message bodies contain no secret
+        // candidates at all. Clean inputs now pay exactly one RegexSet
+        // scan plus the one unavoidable copy into the owned return
+        // value — no hashing, no LRU traffic, no audit records. Only
+        // candidate-bearing inputs (rare, and the ones whose ordered
+        // replace_all passes are genuinely expensive) consult the
+        // cache. Consequence: cache hit/miss/insert audit telemetry now
+        // describes candidate-bearing content only; clean content is
+        // silent by design.
+        let matches = SECRET_REGEX_SET.matches(input);
+        if !matches.matched_any() {
+            return (input.to_owned(), Vec::new());
+        }
         let key = self.key_for(input);
         let (lookup, lookup_audit) = self.text_cache.get_with_audit(&key);
         Self::trace_audit(&lookup_audit);
@@ -315,11 +420,11 @@ impl MemoizingRedactor {
                     algorithm = %self.algorithm_fingerprint,
                     "redaction memo entry is quarantined; falling back to direct regex pass"
                 );
-                let redacted = redact_text(input).into_owned();
+                let redacted = apply_replacements(input, &matches).into_owned();
                 (redacted, vec![lookup_audit])
             }
             crate::indexer::memoization::MemoLookup::Miss => {
-                let redacted = redact_text(input).into_owned();
+                let redacted = apply_replacements(input, &matches).into_owned();
                 let insert_audit = self.text_cache.insert_with_audit(key, redacted.clone());
                 Self::trace_audit(&insert_audit);
                 (redacted, vec![lookup_audit, insert_audit])
@@ -423,7 +528,9 @@ impl MemoizingRedactor {
                 let mut new_obj = serde_json::Map::with_capacity(obj.len());
                 for (k, v) in obj {
                     let redacted_key = self.redact_text(k);
-                    new_obj.insert(redacted_key, self.redact_json(v));
+                    let redacted_value =
+                        redact_sensitive_json_value(k, v, || self.redact_json(v));
+                    new_obj.insert(redacted_key, redacted_value);
                 }
                 serde_json::Value::Object(new_obj)
             }
@@ -576,6 +683,68 @@ mod tests {
         assert_eq!(output["outer"]["inner"], json!("[REDACTED]"));
         assert_eq!(output["array"][0], json!("safe"));
         assert_eq!(output["array"][1], json!("[REDACTED]"));
+    }
+
+    /// Cherry-picked in spirit from upstream cass commit
+    /// 97757e67634dc019a2f543e741a31bd746db3fd6 (gh#419): structured JSON
+    /// credential values (separate key/value nodes) can't be caught by
+    /// plain-text patterns, which only see `label=value` in the same
+    /// string. `is_sensitive_json_field` uses the key's semantics instead.
+    #[test]
+    fn structured_credential_fields_redact_values_by_key_semantics() -> Result<(), String> {
+        let input = json!({
+            "password": "correct horse battery staple!", // ubs:ignore -- synthetic redaction fixture.
+            "API-Key": "abc.def$ghi", // ubs:ignore -- synthetic redaction fixture.
+            "aws_secret_access_key": "0123456789012345678901234567890123456789", // ubs:ignore -- synthetic redaction fixture.
+            "AWS_SESSION_TOKEN": "AQoEXAMPLE-session/value+=with.punctuation", // ubs:ignore -- synthetic redaction fixture.
+            "pin": 123456,
+            "credentials": {
+                "opaque": [true, 42, "not-pattern-shaped"]
+            },
+            "nested": {
+                "clientSecret": ["short", "values"],
+                "private_key_pem": {"body": "short"}
+            },
+            "null_password": null,
+            "keyframe": "animation-safe",
+            "monkey": "animal-safe",
+            "token_count": 2048,
+            "public_key": "ssh-ed25519 AAAATESTPUBLICMATERIAL",
+        });
+
+        let plain = redact_json(&input);
+        let memoized = MemoizingRedactor::with_capacity(32).redact_json(&input);
+        if plain != memoized {
+            return Err("plain and memoized key-aware JSON redaction diverged".to_owned());
+        }
+
+        for pointer in [
+            "/password",
+            "/API-Key",
+            "/aws_secret_access_key",
+            "/AWS_SESSION_TOKEN",
+            "/pin",
+            "/credentials",
+            "/nested/clientSecret",
+            "/nested/private_key_pem",
+        ] {
+            if plain.pointer(pointer) != Some(&json!(REDACTED)) {
+                return Err(format!("sensitive field was not fully redacted: {pointer}"));
+            }
+        }
+
+        for pointer in [
+            "/null_password",
+            "/keyframe",
+            "/monkey",
+            "/token_count",
+            "/public_key",
+        ] {
+            if plain.pointer(pointer) != input.pointer(pointer) {
+                return Err(format!("safe near-miss field changed: {pointer}"));
+            }
+        }
+        Ok(())
     }
 
     #[test]
@@ -766,20 +935,29 @@ mod tests {
         );
     }
 
-    /// Repeated metadata / extra_json structures are common in salvage
-    /// replays and assistant boilerplate. The memoized JSON walker must
-    /// reuse repeated object keys and repeated scalar values instead of
-    /// re-running the regex set for every copy.
+    /// Repeated secret-bearing values inside metadata / extra_json are
+    /// common in salvage replays. The memoized JSON walker must reuse
+    /// the cached redaction for repeated candidate-bearing scalars
+    /// instead of re-running the replacement passes for every copy —
+    /// while clean keys and clean values bypass the cache entirely
+    /// (prefilter-first, redaction-perf campaign).
     #[test]
     fn memoizing_redactor_redact_json_reuses_repeated_keys_and_values() {
         let repeated_secret =
             "Authorization: Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.payload.signature";
         let repeated_note = "same assistant boilerplate without secrets";
+        // The field name must NOT be a sensitive key (cherry-picked in spirit
+        // from upstream c833185fd701e0baa2b21c9247f98af884af00db, gh#419):
+        // the key-aware walker added above replaces values under sensitive
+        // keys (`token`, `secret`, …) wholesale without ever consulting the
+        // memo cache, so such a value can never exercise the cache reuse
+        // this test pins. A neutral key routes the candidate-bearing scalar
+        // through the cached text path instead.
         let value = json!({
             "events": [
-                {"token": repeated_secret, "note": repeated_note},
-                {"token": repeated_secret, "note": repeated_note},
-                {"token": repeated_secret, "note": repeated_note},
+                {"line": repeated_secret, "note": repeated_note},
+                {"line": repeated_secret, "note": repeated_note},
+                {"line": repeated_secret, "note": repeated_note},
             ],
             "footer": repeated_note,
         });
@@ -799,16 +977,16 @@ mod tests {
 
         let stats = redactor.stats();
         assert_eq!(
-            stats.misses, 6,
-            "first occurrences of root keys, repeated child keys, and scalar values should miss once"
+            stats.misses, 1,
+            "only the first occurrence of the candidate-bearing secret value should miss; clean keys/values bypass the cache"
         );
         assert_eq!(
-            stats.inserts, 6,
-            "each distinct JSON key/value string should be inserted once"
+            stats.inserts, 1,
+            "only the distinct candidate-bearing value should be inserted"
         );
         assert_eq!(
-            stats.hits, 9,
-            "repeated child keys and repeated scalar values should hit the memo cache"
+            stats.hits, 2,
+            "repeated candidate-bearing values should hit the memo cache; clean strings never do"
         );
     }
 
@@ -883,14 +1061,40 @@ mod tests {
         }
     }
 
+    /// Prefilter-first bypass (redaction-perf campaign): inputs with
+    /// no secret candidates must never touch the memo cache — no miss,
+    /// no insert, no audit records — while still returning the input
+    /// text unchanged. This pins the fast path that removed the ~18x
+    /// memo-bookkeeping overhead on clean corpora.
+    #[test]
+    fn memoizing_redactor_clean_input_bypasses_cache_entirely() {
+        let mut redactor = MemoizingRedactor::with_capacity(8);
+        let clean = "no secret here, just a sentence";
+        let (output, audit) = redactor.redact_text_with_audit(clean);
+        assert_eq!(output, clean, "clean input must pass through unchanged");
+        assert!(
+            audit.is_empty(),
+            "clean input must not produce cache audit records"
+        );
+        let _ = redactor.redact_text(clean);
+        let stats = redactor.stats();
+        assert_eq!(stats.misses, 0, "clean input must not count as miss");
+        assert_eq!(stats.hits, 0, "clean input must not count as hit");
+        assert_eq!(stats.inserts, 0, "clean input must not insert");
+        // Invalidate on never-cached clean content is a no-op.
+        assert!(!redactor.invalidate(clean));
+    }
+
     /// Invalidate must remove the cached entry so the next call is a
     /// miss + re-insert. Pin the changed/no-op semantics so a caller
     /// can rely on the boolean return value to know whether anything
-    /// was actually evicted.
+    /// was actually evicted. (Payload carries a secret candidate:
+    /// since the prefilter-first bypass, only candidate-bearing
+    /// content enters the cache at all.)
     #[test]
     fn memoizing_redactor_invalidate_drops_cached_entry() {
         let mut redactor = MemoizingRedactor::with_capacity(8);
-        let payload = "no secret here, just a sentence";
+        let payload = "token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij here";
 
         // Prime the cache.
         let _ = redactor.redact_text(payload);

@@ -7,10 +7,8 @@ use std::path::PathBuf;
 
 use coding_agent_search::indexer::persist;
 use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
-use coding_agent_search::search::tantivy::TantivyIndex;
 use coding_agent_search::sources::provenance::Source;
 use coding_agent_search::storage::sqlite::SqliteStorage;
-use frankensqlite::compat::{ConnectionExt, RowExt};
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -260,7 +258,7 @@ fn index_local_and_remote_sources_preserves_provenance() {
     // Verify origin_host is preserved for remote conversations
     let remote_with_host: Vec<(String, Option<String>)> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT source_id, origin_host FROM conversations WHERE source_id != 'local'",
             &[],
             |r| Ok((r.get_typed(0)?, r.get_typed(1)?)),
@@ -294,9 +292,6 @@ fn persist_conversation_extracts_provenance_from_metadata() {
         .upsert_source(&Source::remote("laptop", "user@laptop.local"))
         .expect("remote source");
 
-    let index_dir = data_dir.join("index");
-    std::fs::create_dir_all(&index_dir).unwrap();
-    let mut t_index = TantivyIndex::open_or_create(&index_dir).expect("create index");
 
     let now = 1700000000i64;
 
@@ -308,7 +303,7 @@ fn persist_conversation_extracts_provenance_from_metadata() {
         now,
         vec![norm_msg(0, now, "Local test message")],
     );
-    persist::persist_conversation(&storage, &mut t_index, &local_conv).unwrap();
+    persist::persist_conversation(&storage, &local_conv).unwrap();
 
     // Persist a remote conversation
     let remote_conv = norm_conv_with_provenance(
@@ -318,13 +313,12 @@ fn persist_conversation_extracts_provenance_from_metadata() {
         now + 1000,
         vec![norm_msg(0, now + 1000, "Remote test message")],
     );
-    persist::persist_conversation(&storage, &mut t_index, &remote_conv).unwrap();
-    t_index.commit().unwrap();
+    persist::persist_conversation(&storage, &remote_conv).unwrap();
 
     // Verify provenance was extracted correctly
     let results: Vec<(String, String, Option<String>)> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT external_id, source_id, origin_host FROM conversations ORDER BY external_id",
             &[],
             |r| Ok((r.get_typed(0)?, r.get_typed(1)?, r.get_typed(2)?)),
@@ -427,7 +421,7 @@ fn filter_conversations_local_only() {
     // Query local only
     let local_results: Vec<String> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT external_id FROM conversations WHERE source_id = 'local' ORDER BY external_id",
             &[],
             |r| r.get_typed(0),
@@ -514,7 +508,7 @@ fn filter_conversations_remote_only() {
     // Query remote only (source_id != 'local')
     let remote_results: Vec<String> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT external_id FROM conversations WHERE source_id != 'local' ORDER BY external_id",
             &[],
             |r| r.get_typed(0),
@@ -601,7 +595,7 @@ fn filter_conversations_specific_source() {
     // Query laptop only
     let laptop_results: Vec<String> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT external_id FROM conversations WHERE source_id = 'laptop' ORDER BY external_id",
             &[],
             |r| r.get_typed(0),
@@ -615,7 +609,7 @@ fn filter_conversations_specific_source() {
     // Query server only
     let server_results: Vec<String> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT external_id FROM conversations WHERE source_id = 'server' ORDER BY external_id",
             &[],
             |r| r.get_typed(0),
@@ -640,9 +634,6 @@ fn incremental_index_new_remote_source() {
     let db_path = data_dir.join("incremental.db");
     let storage = SqliteStorage::open(&db_path).expect("open db");
 
-    let index_dir = data_dir.join("index");
-    std::fs::create_dir_all(&index_dir).unwrap();
-    let mut t_index = TantivyIndex::open_or_create(&index_dir).expect("create index");
 
     // Setup sources
     storage
@@ -667,9 +658,8 @@ fn incremental_index_new_remote_source() {
         vec![norm_msg(0, now + 1000, "Local message 2")],
     );
 
-    persist::persist_conversation(&storage, &mut t_index, &local_conv1).unwrap();
-    persist::persist_conversation(&storage, &mut t_index, &local_conv2).unwrap();
-    t_index.commit().unwrap();
+    persist::persist_conversation(&storage, &local_conv1).unwrap();
+    persist::persist_conversation(&storage, &local_conv2).unwrap();
 
     let initial_count: i64 = storage
         .raw()
@@ -700,9 +690,8 @@ fn incremental_index_new_remote_source() {
         vec![norm_msg(0, now + 11000, "Laptop message 2")],
     );
 
-    persist::persist_conversation(&storage, &mut t_index, &remote_conv1).unwrap();
-    persist::persist_conversation(&storage, &mut t_index, &remote_conv2).unwrap();
-    t_index.commit().unwrap();
+    persist::persist_conversation(&storage, &remote_conv1).unwrap();
+    persist::persist_conversation(&storage, &remote_conv2).unwrap();
 
     let final_count: i64 = storage
         .raw()
@@ -748,9 +737,6 @@ fn incremental_append_to_remote_conversation() {
     let db_path = data_dir.join("append.db");
     let storage = SqliteStorage::open(&db_path).expect("open db");
 
-    let index_dir = data_dir.join("index");
-    std::fs::create_dir_all(&index_dir).unwrap();
-    let mut t_index = TantivyIndex::open_or_create(&index_dir).expect("create index");
 
     storage
         .upsert_source(&Source::local())
@@ -772,8 +758,7 @@ fn incremental_append_to_remote_conversation() {
             norm_msg(1, now + 100, "Second message"),
         ],
     );
-    persist::persist_conversation(&storage, &mut t_index, &conv_v1).unwrap();
-    t_index.commit().unwrap();
+    persist::persist_conversation(&storage, &conv_v1).unwrap();
 
     let initial_msg_count: i64 = storage
         .raw()
@@ -793,8 +778,7 @@ fn incremental_append_to_remote_conversation() {
             norm_msg(2, now + 200, "Third message"),
         ],
     );
-    persist::persist_conversation(&storage, &mut t_index, &conv_v2).unwrap();
-    t_index.commit().unwrap();
+    persist::persist_conversation(&storage, &conv_v2).unwrap();
 
     let final_msg_count: i64 = storage
         .raw()
@@ -903,7 +887,7 @@ fn stats_reflect_source_distribution() {
     // Query source distribution stats
     let distribution: Vec<(String, i64)> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT source_id, COUNT(*) as count FROM conversations GROUP BY source_id ORDER BY source_id",
             &[],
             |r| Ok((r.get_typed(0)?, r.get_typed(1)?)),
@@ -987,7 +971,7 @@ fn source_kind_available_via_join() {
     // Query with JOIN to get source kind
     let results: Vec<(String, String, String)> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT c.external_id, c.source_id, s.kind
              FROM conversations c
              LEFT JOIN sources s ON c.source_id = s.id
@@ -1024,9 +1008,6 @@ fn resync_same_conversation_updates_not_duplicates() {
     let db_path = data_dir.join("resync.db");
     let storage = SqliteStorage::open(&db_path).expect("open db");
 
-    let index_dir = data_dir.join("index");
-    std::fs::create_dir_all(&index_dir).unwrap();
-    let mut t_index = TantivyIndex::open_or_create(&index_dir).expect("create index");
 
     storage
         .upsert_source(&Source::local())
@@ -1048,8 +1029,7 @@ fn resync_same_conversation_updates_not_duplicates() {
             norm_msg(1, now + 100, "Second message"),
         ],
     );
-    persist::persist_conversation(&storage, &mut t_index, &conv_v1).unwrap();
-    t_index.commit().unwrap();
+    persist::persist_conversation(&storage, &conv_v1).unwrap();
 
     let count_after_first: i64 = storage
         .raw()
@@ -1074,8 +1054,7 @@ fn resync_same_conversation_updates_not_duplicates() {
             norm_msg(2, now + 200, "Third message (new)"),
         ],
     );
-    persist::persist_conversation(&storage, &mut t_index, &conv_v2).unwrap();
-    t_index.commit().unwrap();
+    persist::persist_conversation(&storage, &conv_v2).unwrap();
 
     let count_after_second: i64 = storage
         .raw()
@@ -1178,7 +1157,7 @@ fn same_id_different_sources_are_distinct() {
     // Verify each source has one entry
     let by_source: Vec<(String, i64)> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT source_id, COUNT(*) FROM conversations
              WHERE external_id = 'session-001'
              GROUP BY source_id
@@ -1204,9 +1183,6 @@ fn dedup_within_source_not_across() {
     let db_path = data_dir.join("dedup.db");
     let storage = SqliteStorage::open(&db_path).expect("open db");
 
-    let index_dir = data_dir.join("index");
-    std::fs::create_dir_all(&index_dir).unwrap();
-    let mut t_index = TantivyIndex::open_or_create(&index_dir).expect("create index");
 
     storage
         .upsert_source(&Source::local())
@@ -1230,9 +1206,8 @@ fn dedup_within_source_not_across() {
                 &format!("Laptop message {}", i),
             )],
         );
-        persist::persist_conversation(&storage, &mut t_index, &conv).unwrap();
+        persist::persist_conversation(&storage, &conv).unwrap();
     }
-    t_index.commit().unwrap();
 
     let initial_count: i64 = storage
         .raw()
@@ -1255,9 +1230,8 @@ fn dedup_within_source_not_across() {
                 &format!("Laptop message {}", i),
             )],
         );
-        persist::persist_conversation(&storage, &mut t_index, &conv).unwrap();
+        persist::persist_conversation(&storage, &conv).unwrap();
     }
-    t_index.commit().unwrap();
 
     // Should still have same count (deduplicated within source)
     let final_count: i64 = storage
@@ -1337,7 +1311,7 @@ fn composite_key_unique_constraint() {
     // Verify composite uniqueness via SQL
     let unique_pairs: Vec<(String, String, String)> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT source_id, agent_id, external_id FROM conversations
              WHERE external_id = 'unique-test'
              ORDER BY source_id",
@@ -1368,9 +1342,6 @@ fn update_conversation_preserves_metadata() {
     let db_path = data_dir.join("metadata.db");
     let storage = SqliteStorage::open(&db_path).expect("open db");
 
-    let index_dir = data_dir.join("index");
-    std::fs::create_dir_all(&index_dir).unwrap();
-    let mut t_index = TantivyIndex::open_or_create(&index_dir).expect("create index");
 
     storage
         .upsert_source(&Source::local())
@@ -1392,8 +1363,7 @@ fn update_conversation_preserves_metadata() {
             norm_msg(1, now + 100, "Message 2"),
         ],
     );
-    persist::persist_conversation(&storage, &mut t_index, &conv_v1).unwrap();
-    t_index.commit().unwrap();
+    persist::persist_conversation(&storage, &conv_v1).unwrap();
 
     // Get initial ended_at
     let initial_ended_at: i64 = storage
@@ -1422,8 +1392,7 @@ fn update_conversation_preserves_metadata() {
             norm_msg(2, now + 200, "Message 3 (new)"),
         ],
     );
-    persist::persist_conversation(&storage, &mut t_index, &conv_v2).unwrap();
-    t_index.commit().unwrap();
+    persist::persist_conversation(&storage, &conv_v2).unwrap();
 
     // Verify ended_at was updated
     let final_ended_at: i64 = storage

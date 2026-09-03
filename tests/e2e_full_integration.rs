@@ -2,14 +2,14 @@
 //!
 //! Exercises the complete cass pipeline with multiple agent types:
 //! 1. Create test session fixtures (Codex + Claude Code formats)
-//! 2. Run full indexing via CLI (agent detection + frankensqlite storage + tantivy index)
+//! 2. Run full indexing via CLI (agent detection + the legacy embedded engine storage + tantivy index)
 //! 3. Search via CLI (lexical, JSON robot output)
 //! 4. Verify data consistency across the pipeline
 //!
 //! Bead: coding_agent_session_search-1p9xd
 
 use coding_agent_search::storage::sqlite::SqliteStorage;
-use frankensqlite::compat::{ConnectionExt, RowExt};
+
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
@@ -438,20 +438,21 @@ fn e2e_database_integrity() {
         .expect("orphan conv check");
     assert_eq!(orphan_convs, 0, "No orphan conversations should exist");
 
-    // The current contentless FTS table is considered healthy if frankensqlite can
-    // query it and at least one row is visible through the canonical doctor probe.
+    // W2-6 Task戊: fts_messages is DROP'd -- search runs entirely on the
+    // fts_lex/lex_docs index, so the FTS health probe now targets that
+    // domain instead.
     let fts_probe_rows: Vec<i64> = conn
-        .query_map_collect("SELECT rowid FROM fts_messages LIMIT 1", &[], |r| {
+        .query_all_map("SELECT rowid FROM fts_lex LIMIT 1", &[], |r| {
             r.get_typed(0)
         })
-        .expect("fts probe");
+        .expect("fts_lex probe");
     let msg_count = count_messages(&db_path);
     assert!(
         !fts_probe_rows.is_empty(),
-        "FTS should expose at least one indexed row after indexing"
+        "fts_lex should expose at least one indexed row after indexing"
     );
     verbose!(
-        "DB integrity OK: {} messages, FTS queryable with {} visible probe rows, 0 orphans",
+        "DB integrity OK: {} messages, fts_lex queryable with {} visible probe rows, 0 orphans",
         msg_count,
         fts_probe_rows.len()
     );
@@ -486,7 +487,7 @@ fn e2e_database_integrity() {
 // 4. STATS COMMAND AFTER INDEX
 // ============================================================================
 
-/// Verify the stats command works after indexing (uses frankensqlite queries).
+/// Verify the stats command works after indexing (uses the legacy embedded engine queries).
 #[test]
 fn e2e_stats_after_index() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -527,7 +528,7 @@ fn e2e_stats_after_index() {
         String::from_utf8_lossy(&index_output.stderr)
     );
 
-    // Run stats command (exercises the frankensqlite-migrated run_stats path)
+    // Run stats command (exercises the legacy embedded engine-migrated run_stats path)
     let stats_output = Command::new(cass_bin())
         .args(["stats", "--data-dir"])
         .arg(&data_dir)
@@ -554,7 +555,7 @@ fn e2e_stats_after_index() {
 // 5. DIAG COMMAND INTEGRATION
 // ============================================================================
 
-/// Verify the diag command works (exercises frankensqlite-migrated run_diag path).
+/// Verify the diag command works (exercises the legacy embedded engine-migrated run_diag path).
 #[test]
 fn e2e_diag_after_index() {
     let tmp = tempfile::TempDir::new().unwrap();

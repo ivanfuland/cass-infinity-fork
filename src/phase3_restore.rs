@@ -5111,9 +5111,7 @@ pub fn hold_for_unreadable_sealed_blob(
 #[cfg(test)]
 mod e5_p30_blob_read_tests {
     use super::*;
-    use frankensqlite::compat::{
-        ConnectionExt, OptionalExtension, ParamValue, RowExt, TransactionExt,
-    };
+    use crate::storage::api::Value as ParamValue;
     use serial_test::serial;
     use tempfile::TempDir;
 
@@ -5516,7 +5514,6 @@ mod e5_p30_blob_read_tests {
             db_path: data_dir.join("db.sqlite"),
             data_dir: data_dir.to_path_buf(),
             semantic: false,
-            build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
@@ -5620,7 +5617,7 @@ mod e5_p30_blob_read_tests {
             let storage = crate::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
             let pricing =
                 crate::storage::sqlite::PricingTable::franken_load(storage.raw()).unwrap();
-            let mut tx = storage.raw().transaction().unwrap();
+            let tx = storage.raw().transaction().unwrap();
             crate::storage::sqlite::franken_replace_conversation_messages_in_tx(
                 &tx,
                 conv_id,
@@ -5649,7 +5646,7 @@ mod e5_p30_blob_read_tests {
             if drop_hot_tail_row {
                 storage
                     .raw()
-                    .execute_compat(
+                    .execute(
                         "DELETE FROM conversation_tail_state WHERE conversation_id = ?1",
                         &[ParamValue::from(conv_id)],
                     )
@@ -5716,12 +5713,11 @@ mod e5_p30_blob_read_tests {
         // 「tail 定位正确」在那一支上必须由**回落源**作证。
         let hot_tail_idx: Option<i64> = storage
             .raw()
-            .query_row_map(
+            .query_opt_map(
                 "SELECT last_message_idx FROM conversation_tail_state WHERE conversation_id = ?1",
                 &[ParamValue::from(conv_id)],
                 |row| row.get_typed(0),
             )
-            .optional()
             .unwrap()
             .flatten();
         let legacy_tail_idx: Option<i64> = storage
@@ -5832,7 +5828,7 @@ mod e5_p30_blob_read_tests {
             let storage = crate::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
             let pricing =
                 crate::storage::sqlite::PricingTable::franken_load(storage.raw()).unwrap();
-            let mut tx = storage.raw().transaction().unwrap();
+            let tx = storage.raw().transaction().unwrap();
             crate::storage::sqlite::franken_replace_conversation_messages_in_tx(
                 &tx,
                 conv_id,
@@ -5846,12 +5842,12 @@ mod e5_p30_blob_read_tests {
 
             // 造 legacy 形态：热表清掉（逼回落），legacy 三列只留一个**陈旧高位** idx。
             let conn = storage.raw();
-            conn.execute_compat(
+            conn.execute(
                 "DELETE FROM conversation_tail_state WHERE conversation_id = ?1",
                 &[ParamValue::from(conv_id)],
             )
             .unwrap();
-            conn.execute_compat(
+            conn.execute(
                 "UPDATE conversations
                  SET last_message_idx = 99, last_message_created_at = NULL, ended_at = NULL
                  WHERE id = ?1",
@@ -5907,7 +5903,7 @@ mod e5_p30_blob_read_tests {
         );
         let idxs: Vec<i64> = storage
             .raw()
-            .query_map_collect(
+            .query_all_map(
                 "SELECT idx FROM messages WHERE conversation_id = ?1 ORDER BY idx",
                 &[ParamValue::from(conv_id)],
                 |row| row.get_typed(0),
@@ -6014,7 +6010,7 @@ pub(crate) fn replace_idempotency_key(snapshot_root: &str, identity: &RestoreIde
 /// 8 重建第三处 tail 载体；9 conversation 级字段按 §B.1.2；10 推进 generation；
 /// 11 写 receipt。
 pub(crate) fn commit_replace_in_tx(
-    tx: &frankensqlite::compat::Transaction<'_>,
+    tx: &crate::storage::api::Tx<'_>,
     input: &ReplaceCommitInput<'_>,
     pricing: &crate::storage::sqlite::PricingTable,
     committed_at_ms: i64,
@@ -6045,6 +6041,12 @@ pub(crate) fn commit_replace_in_tx(
         input.workspace_id,
         input.conv,
     )?;
+
+    // 9b · w2 Task W2-2/W2-3: 词法域(lex_docs/fts_lex)重算，须在步骤9(title/
+    // workspace 落定)之后调用——早于此处会用旧值同步（W2-0 remeasure 报告曾误
+    // 记「该 UPDATE 由 franken_replace_conversation_messages_in_tx 调用」，实为
+    // 本函数按步骤9独立调用，两者是同一编排下的兄弟步骤而非调用关系，已订正）。
+    crate::storage::sqlite::sync_lexical_domain_for_conversation_in_tx(tx, input.conversation_id)?;
 
     // 10 · 推进 generation
     crate::storage::sqlite::franken_set_source_content_generation_in_tx(tx, input.generation)?;
@@ -6081,12 +6083,31 @@ pub(crate) fn commit_replace_in_tx(
 /// **必须绕开 `rebuild_analytics`**（裁定 D-A3-4）：它会把 `message_metrics` 的 DELETE
 /// 与三张 rollup 的 DELETE 捆进同一次全量重建，而 `message_metrics` 是事务内逐消息写、
 /// 用另一套分桶公式的表 —— 照字面调用会让它被两套公式各写一遍。
+///
+/// `now_ms`（w1b Task B9，2026-08-27，控制面终裁，e7 案终局）：调用方
+/// （`restore_rebuild_analytics`）必须传入 restore 驱动记在 journal 里的确定性
+/// 时间戳，不是每次调用现取墙钟。根因：`restore_drive` 按 journal rank 决定要不要
+/// 重跑这一步，分不清"这次真需要重算"和"只是在重放一次已经做过的操作"——首跑与
+/// crash-recovery 重放各自现取一次墙钟时，`daily_stats`/`usage_hourly`/
+/// `usage_daily`/`token_daily_stats` 的 `last_updated` 两次盖了不同的章，即使全部
+/// 聚合值逐字节相等，也让 W1 commit marker 的 `db_identity.sqlite_digest`
+/// 认为候选库变了（实测：`e7_disposition_conservation_holds_on_both_first_run_and_recovery`
+/// 等三条，首跑与 recover 两次建的 marker 摘要不一致，逐字段比对钉死只有这四张
+/// analytics 表的 `last_updated` 在变）。修法两层：① `daily_stats` 拿到
+/// compare-then-write（`franken_update_daily_stats_batched_in_tx_for_target`
+/// 的注释），值没变就不盖新章；② 其余三张表（`usage_hourly`/`usage_daily`/
+/// `token_daily_stats`）不能同样处理——`src/analytics/query.rs` 的
+/// `is_recently_updated` 把它们的 `last_updated` 当新鲜度心跳消费，"内容没变就不
+/// 盖章"会让一张刚重新验证过、完全健康的表被误判成 stale。于是改成本函数这样：
+/// 同一次 restore 操作的首跑与每一次 recover 重放，**共用同一个 `now_ms`**——姊妹表
+/// 依旧每次都盖章（心跳语义分毫不动），但盖的是同一个值，digest 因此稳定。
 pub(crate) fn recompute_materialized_aggregates_after_commit(
     storage: &crate::storage::sqlite::FrankenStorage,
+    now_ms: i64,
 ) -> anyhow::Result<()> {
-    storage.rebuild_daily_stats()?;
-    storage.rebuild_token_daily_stats()?;
-    crate::storage::sqlite::franken_recompute_usage_rollups_from_message_metrics(storage)?;
+    storage.rebuild_daily_stats_with_timestamp(now_ms)?;
+    storage.rebuild_token_daily_stats_with_timestamp(now_ms)?;
+    crate::storage::sqlite::franken_recompute_usage_rollups_from_message_metrics(storage, now_ms)?;
     Ok(())
 }
 
@@ -6213,8 +6234,7 @@ pub(crate) fn commit_restore_new(
 
     // 第二个原子步：generation 与 receipt 一起提交 —— 它们之间不能再有窗，
     // 否则会出现「代际已推进、却查不到 receipt」这种更难判读的状态。
-    use frankensqlite::compat::TransactionExt as _;
-    let mut tx = storage.raw().transaction()?;
+    let tx = storage.raw().transaction()?;
     crate::storage::sqlite::franken_set_source_content_generation_in_tx(&tx, input.generation)?;
     crate::storage::sqlite::franken_insert_operation_commit_receipt_in_tx(
         &tx,
@@ -6249,9 +6269,7 @@ pub(crate) fn commit_restore_new(
 #[cfg(test)]
 mod e6_replace_commit_tests {
     use super::*;
-    use frankensqlite::compat::{
-        ConnectionExt, OptionalExtension, ParamValue, RowExt, TransactionExt,
-    };
+    use crate::storage::api::Value as ParamValue;
     use tempfile::TempDir;
 
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
@@ -6321,8 +6339,7 @@ mod e6_replace_commit_tests {
     fn scalar_i64(storage: &FrankenStorage, sql: &str, id: i64) -> Option<i64> {
         storage
             .raw()
-            .query_row_map(sql, &[ParamValue::from(id)], |row| row.get_typed(0))
-            .optional()
+            .query_opt_map(sql, &[ParamValue::from(id)], |row| row.get_typed(0))
             .unwrap()
             .flatten()
     }
@@ -6402,7 +6419,7 @@ mod e6_replace_commit_tests {
     fn lookup_keys_for(storage: &FrankenStorage, conversation_id: i64) -> Vec<String> {
         storage
             .raw()
-            .query_map_collect(
+            .query_all_map(
                 "SELECT lookup_key FROM conversation_external_tail_lookup \
                  WHERE conversation_id = ?1 ORDER BY lookup_key",
                 &[ParamValue::from(conversation_id)],
@@ -6458,7 +6475,7 @@ mod e6_replace_commit_tests {
 
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
         {
-            let mut tx = storage.raw().transaction().unwrap();
+            let tx = storage.raw().transaction().unwrap();
             commit_replace_in_tx(
                 &tx,
                 &ReplaceCommitInput {
@@ -6532,7 +6549,7 @@ mod e6_replace_commit_tests {
 
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
         {
-            let mut tx = storage.raw().transaction().unwrap();
+            let tx = storage.raw().transaction().unwrap();
             commit_replace_in_tx(
                 &tx,
                 &ReplaceCommitInput {
@@ -6563,6 +6580,118 @@ mod e6_replace_commit_tests {
             stored.as_deref(),
             Some("projects/ws/keep-me.jsonl"),
             "投影没有外部 id 时不得抹掉库里既有的值"
+        );
+    }
+
+    /// w2 F2 回归：真走 `franken_replace_conversation_messages_in_tx` 的删旧插新
+    /// 全链（经 `commit_replace_in_tx` 的完整步骤 2-11），不是手搭的小事务。
+    /// 旧内容含 `old_marker`，旧 message id 被级联删除、新 message 分配的 id
+    /// 严格大于旧全局最大值（不复用），修复前 `sync_lexical_domain_for_
+    /// conversation_in_tx`（步骤9b）按"当前" messages 表 id 反查只能看到新 id，
+    /// 旧 `old_marker` 倒排项永久残留，而 receipt 仍写 `committed`——修复要求
+    /// 事务里在级联删除**之前**按旧 id 显式清 fts_lex。
+    #[test]
+    fn e6_replace_clears_stale_fts_lex_entries_for_deleted_old_messages() {
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open(&dir);
+
+        let legacy = conversation_titled(
+            "旧标题",
+            vec![
+                message(0, MessageRole::User, "old_marker present here"),
+                message(1, MessageRole::Assistant, "旧 1"),
+            ],
+        );
+        storage
+            .insert_conversations_batched(&[(agent_id, None, &legacy)])
+            .unwrap();
+        let conv_id: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT id FROM conversations WHERE external_id = ?1",
+                &[ParamValue::from(EXTERNAL_ID)],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+
+        // 前置断言：确认 old_marker 此刻真的可被 MATCH，否则后面的"不可再 MATCH"
+        // 断言会是空转（探针先自证有效，见 MEMORY.md「先验证探针」）。
+        let hits_before: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT count(*) FROM fts_lex WHERE fts_lex MATCH 'old_marker'",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(hits_before, 1, "old_marker 必须在 replace 之前先可被 MATCH 到");
+
+        let projected = conversation_titled(
+            "新标题",
+            vec![
+                message(0, MessageRole::User, "brand new content"),
+                message(1, MessageRole::Assistant, "新 1"),
+            ],
+        );
+
+        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+        let idempotency_key = {
+            let tx = storage.raw().transaction().unwrap();
+            let outcome = commit_replace_in_tx(
+                &tx,
+                &ReplaceCommitInput {
+                    conversation_id: conv_id,
+                    agent_id,
+                    workspace_id: None,
+                    conv: &projected,
+                    identity: &identity(),
+                    snapshot_root: "f2-root",
+                    generation: "f2-gen",
+                },
+                &pricing,
+                TS,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            outcome.idempotency_key
+        };
+
+        let hits_after: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT count(*) FROM fts_lex WHERE fts_lex MATCH 'old_marker'",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            hits_after, 0,
+            "旧内容 old_marker 在 replace 之后必须不可再被 fts_lex MATCH 到——\
+             旧 message 已被级联删除，倒排项不得永久残留"
+        );
+
+        let new_hits: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT count(*) FROM fts_lex WHERE fts_lex MATCH 'brand'",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(new_hits, 1, "新内容必须已经写入 fts_lex 且可被 MATCH");
+
+        let receipt_state: Option<String> = storage
+            .raw()
+            .query_row_map(
+                "SELECT state FROM operation_commit_receipt WHERE idempotency_key = ?1",
+                &[ParamValue::from(idempotency_key.as_str())],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            receipt_state.as_deref(),
+            Some("committed"),
+            "receipt 仍必须写 committed——修复的是遗留倒排项，不是把这次 replace 判失败"
         );
     }
 
@@ -6611,7 +6740,7 @@ mod e6_replace_commit_tests {
             ],
         );
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
-        let mut tx = storage.raw().transaction().unwrap();
+        let tx = storage.raw().transaction().unwrap();
         let err = commit_replace_in_tx(
             &tx,
             &ReplaceCommitInput {
@@ -6695,7 +6824,7 @@ mod e6_replace_commit_tests {
         );
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
         {
-            let mut tx = storage.raw().transaction().unwrap();
+            let tx = storage.raw().transaction().unwrap();
             commit_replace_in_tx(
                 &tx,
                 &ReplaceCommitInput {
@@ -6734,7 +6863,7 @@ mod e6_replace_commit_tests {
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
 
         let outcome = {
-            let mut tx = storage.raw().transaction().unwrap();
+            let tx = storage.raw().transaction().unwrap();
             let out = commit_replace_in_tx(
                 &tx,
                 &ReplaceCommitInput {
@@ -6804,14 +6933,13 @@ mod e6_replace_commit_tests {
         // ⑩ generation 推进。
         let generation: Option<String> = storage
             .raw()
-            .query_row_map(
+            .query_opt_map(
                 "SELECT value FROM meta WHERE key = ?1",
                 &[ParamValue::from(
                     crate::storage::sqlite::SOURCE_CONTENT_GENERATION_META_KEY,
                 )],
                 |row| row.get_typed(0),
             )
-            .optional()
             .unwrap()
             .flatten();
         assert_eq!(generation.as_deref(), Some("gen-e6-0001"));
@@ -6854,7 +6982,7 @@ mod e6_replace_commit_tests {
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
 
         {
-            let mut tx = storage.raw().transaction().unwrap();
+            let tx = storage.raw().transaction().unwrap();
             commit_replace_in_tx(
                 &tx,
                 &ReplaceCommitInput {
@@ -6902,14 +7030,13 @@ mod e6_replace_commit_tests {
         );
         let generation: Option<String> = storage
             .raw()
-            .query_row_map(
+            .query_opt_map(
                 "SELECT value FROM meta WHERE key = ?1",
                 &[ParamValue::from(
                     crate::storage::sqlite::SOURCE_CONTENT_GENERATION_META_KEY,
                 )],
                 |row| row.get_typed(0),
             )
-            .optional()
             .unwrap()
             .flatten();
         assert_eq!(generation, None, "generation 必须一起回滚");
@@ -6927,7 +7054,6 @@ mod e6_replace_commit_tests {
     // （A 的行被当成 B 的候选，判成 replace 后用 B 的内容盖掉 A）。
     #[test]
     fn e6_candidate_lookup_does_not_fold_two_agents_sharing_one_path() {
-        use frankensqlite::compat::ConnectionExt as _;
         let dir = TempDir::new().unwrap();
         let storage = FrankenStorage::open(&dir.path().join("fold.sqlite")).unwrap();
 
@@ -7100,7 +7226,7 @@ mod e6_replace_commit_tests {
         // 造崩溃窗留下的状态：插入已提交，receipt 没写成。
         storage
             .raw()
-            .execute_compat("DELETE FROM operation_commit_receipt", &[])
+            .execute("DELETE FROM operation_commit_receipt", &[])
             .unwrap();
         let receipts: Option<i64> = storage
             .raw()
@@ -7199,7 +7325,7 @@ mod e6_replace_commit_tests {
     fn message_metrics_digest(storage: &FrankenStorage) -> Vec<String> {
         storage
             .raw()
-            .query_map_collect(
+            .query_all_map(
                 "SELECT CAST(message_id AS TEXT) || '|' || CAST(hour_id AS TEXT) || '|'
                         || CAST(day_id AS TEXT) || '|' || agent_slug || '|'
                         || CAST(content_tokens_est AS TEXT) || '|' || api_data_source
@@ -7214,7 +7340,7 @@ mod e6_replace_commit_tests {
     fn rollup_digest(storage: &FrankenStorage, table: &str) -> Vec<String> {
         storage
             .raw()
-            .query_map_collect(
+            .query_all_map(
                 &format!(
                     "SELECT agent_slug || '|' || CAST(message_count AS TEXT) || '|'
                             || CAST(user_message_count AS TEXT) || '|'
@@ -7246,7 +7372,7 @@ mod e6_replace_commit_tests {
         let pricing = PricingTable::franken_load(storage.raw()).unwrap();
 
         {
-            let mut tx = storage.raw().transaction().unwrap();
+            let tx = storage.raw().transaction().unwrap();
             commit_replace_in_tx(
                 &tx,
                 &ReplaceCommitInput {
@@ -7273,7 +7399,7 @@ mod e6_replace_commit_tests {
         // 覆盖掉，于是「没被触碰」从「值相等」变成了可观测的事实。
         storage
             .raw()
-            .execute_compat(
+            .execute(
                 "UPDATE message_metrics SET provider = 'sentinel-untouched'
                  WHERE message_id = (SELECT MIN(message_id) FROM message_metrics)",
                 &[],
@@ -7299,7 +7425,11 @@ mod e6_replace_commit_tests {
             "前置断言：重算前 usage_hourly 应当还带着旧内容（3 条消息）的贡献，实得 {hourly_before:?}"
         );
 
-        recompute_materialized_aggregates_after_commit(&storage).unwrap();
+        recompute_materialized_aggregates_after_commit(
+            &storage,
+            crate::storage::sqlite::FrankenStorage::now_millis(),
+        )
+        .unwrap();
 
         // ① 五张表按新内容重算：新内容是 2 条消息（1 user + 1 assistant）。
         let hourly_after = rollup_digest(&storage, "usage_hourly");
@@ -7316,7 +7446,7 @@ mod e6_replace_commit_tests {
         );
         let daily_rows: Vec<String> = storage
             .raw()
-            .query_map_collect(
+            .query_all_map(
                 "SELECT CAST(day_id AS TEXT) || '/' || agent_slug || '/' || source_id || '='
                         || CAST(session_count AS TEXT) || ',' || CAST(message_count AS TEXT)
                  FROM daily_stats ORDER BY day_id, agent_slug, source_id",
@@ -7452,6 +7582,23 @@ pub(crate) struct RestoreJournal {
     pub committed: Vec<String>,
     /// 已完成 db_links publish 的 manifest 相对路径（差集续做用）。
     pub published: Vec<String>,
+    /// w1b Task B9（2026-08-27，控制面终裁，e7 案终局）：本次 restore 操作的
+    /// analytics 重算要用的 `last_updated` 时间戳，首跑时取一次墙钟写进来，
+    /// 之后每一次 `--recover` 重放都读同一个值，不再各自现取墙钟——否则
+    /// `daily_stats`/`usage_hourly`/`usage_daily`/`token_daily_stats` 的
+    /// `last_updated` 在首跑与 recover 之间盖两个不同的章，即使聚合值逐字节
+    /// 相等，也会让 W1 commit marker 的 `db_identity.sqlite_digest`
+    /// 认为库变了（三条 e7 测试实证坐实，见
+    /// `recompute_materialized_aggregates_after_commit` 的完整裁决记录）。
+    ///
+    /// **有意 `#[serde(default)]`，不随 `RESTORE_JOURNAL_SCHEMA_VERSION` 一起
+    /// 升版号**：与 `holds_count`（同文件上方，故意不给 default、缺字段直接
+    /// 拒读）的口径不同，是控制面显式裁定的分歧，不是疏漏——跨升级还在飞的
+    /// journal 本就是 rebuild-not-convert 的边界地带，不必为它专造兼容层；
+    /// 旧版本写的、缺这个字段的 journal 照样能被新二进制读出来，只是这一格是
+    /// `None`，届时退回墙钟（同旧行为，只是不再保证首跑/recover 两次一致）。
+    #[serde(default)]
+    pub analytics_now_ms: Option<i64>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -7502,6 +7649,10 @@ pub(crate) fn restore_journal_from_plan(plan: RestoreRunPlan) -> RestoreJournal 
         origin_unmapped_count: plan.origin_unmapped_count,
         committed: Vec::new(),
         published: Vec::new(),
+        // First run only -- see the field's own doc comment. `restore_recover`
+        // never calls this constructor; it reads the persisted journal (and
+        // this value) back off disk instead.
+        analytics_now_ms: Some(crate::storage::sqlite::FrankenStorage::now_millis()),
     }
 }
 
@@ -7773,7 +7924,7 @@ pub(crate) fn validate_restore_write_targets(
 
         // 候选库的 sidecar：**同目录、以候选库文件名打头**的任何名字。
         //
-        // 用前缀规则而不是一张后缀白名单是有意的：本仓的 frankensqlite 自己就会产出
+        // 用前缀规则而不是一张后缀白名单是有意的：本仓的 the legacy embedded engine 自己就会产出
         // 白名单里没有的 sidecar 族，而两侧代价不对称 —— **漏挡一条 = 毁库，
         // 误挡一条 = 换个报告名**。误挡时错误信息会把出路直接说出来。
         if let (Some(dir_key), Some(db)) = (db_dir_key.as_ref(), db_name.as_ref()) {
@@ -7967,7 +8118,7 @@ fn conversation_ids_for_identity(
     storage: &crate::storage::sqlite::FrankenStorage,
     identity: &RestoreIdentity,
 ) -> anyhow::Result<Vec<i64>> {
-    use frankensqlite::compat::{ConnectionExt as _, ParamValue, RowExt as _};
+    use crate::storage::api::Value as ParamValue;
 
     // manifest 侧 `origin_host: None` 在身份里被写成 `RESTORE_LOCAL_ORIGIN_HOST`
     // 这个哨兵；换算回 `Option` 再喂给生产归一化，别让哨兵被当成一个真的主机名。
@@ -8001,7 +8152,7 @@ fn conversation_ids_for_identity(
     }
     let ids: Vec<i64> = storage
         .raw()
-        .query_map_collect(&sql, &params, |row| row.get_typed(0))?;
+        .query_all_map(&sql, &params, |row| row.get_typed(0))?;
     Ok(ids)
 }
 
@@ -8090,7 +8241,7 @@ fn restore_run_db_phase(
     outcome: &mut RestoreRunOutcome,
 ) -> anyhow::Result<()> {
     let views = crate::raw_mirror::manifest_views(&journal.data_dir)?;
-    let storage = crate::storage::sqlite::FrankenStorage::open(&journal.db_path)
+    let storage = crate::storage::sqlite::FrankenStorage::open_writer(&journal.db_path)
         .map_err(|e| anyhow::anyhow!("open candidate db {}: {e}", journal.db_path.display()))?;
     let pricing = crate::storage::sqlite::PricingTable::franken_load(storage.raw())?;
 
@@ -8157,8 +8308,7 @@ fn restore_run_db_phase(
                 outcome.receipt_keys.push(out.idempotency_key);
             }
             PlannedAction::Replace { conversation_id } => {
-                use frankensqlite::compat::TransactionExt as _;
-                let mut tx = storage.raw().transaction()?;
+                let tx = storage.raw().transaction()?;
                 let replaced = commit_replace_in_tx(
                     &tx,
                     &ReplaceCommitInput {
@@ -8272,7 +8422,7 @@ fn restore_index_root(journal: &RestoreJournal) -> anyhow::Result<&Path> {
 /// 路径用 `expected_index_dir`（纯拼接、**无副作用**）——不用会创建目录的 `index_dir`，
 /// 恢复器不该自己产副作用。
 fn restore_invalidate_readiness(journal: &RestoreJournal) -> anyhow::Result<()> {
-    let index_dir = crate::search::tantivy::expected_index_dir(restore_index_root(journal)?);
+    let index_dir = crate::indexer::expected_index_dir(restore_index_root(journal)?);
     crate::indexer::clear_lexical_rebuild_state(&index_dir)
 }
 
@@ -8315,15 +8465,205 @@ fn restore_invalidate_embeddings(journal: &RestoreJournal) -> anyhow::Result<()>
             .save(data_dir)
             .map_err(|e| anyhow::anyhow!("save semantic manifest: {e}"))?;
     }
+
+    restore_invalidate_db_vector_domain(journal)?;
     Ok(())
+}
+
+/// DB 向量域侧的显式作废（W3-4 Step2-4，task book #62）。上面两段 fsvi 侧的
+/// 作废在 W3-3..W3-5 共存期间原样保留；这里补的是 exec50 点名的唯一真生产
+/// 自愈路径缺的那一半。第 1 格（db-committed）真正写候选库内容的生产入口
+/// （`franken_replace_conversation_messages_in_tx`/`insert_conversation_tree`）
+/// 已经在同一事务里做过一次"新 doc_id 登记洞账 + 代际就绪失效"（W3-3 Step3
+/// 布线,`register_embedding_hole_for_new_message_in_tx`/
+/// `demote_active_generation_readiness_in_tx`）——但那是深埋在写路径里的
+/// 副作用,第 3 格自己的"作废"语义不该只靠隐式继承它托底。这里显式再跑一遍
+/// 资格链重扫 + 洞账补种 + 就绪失效,让 DB 向量域的作废是这一格自己站得住
+/// 的动作。全部复用既有生产原语（`scan_eligible_message_ids`/
+/// `seed_embedding_holes`/`demote_active_generation_readiness_in_tx`）,
+/// 零第二定义；`seed_embedding_holes` 本身 `INSERT OR IGNORE` +
+/// `NOT EXISTS`，`demote_active_generation_readiness_in_tx` 本身
+/// no-op-safe,整体重跑幂等。
+#[cfg(feature = "infinity")]
+fn restore_invalidate_db_vector_domain(journal: &RestoreJournal) -> anyhow::Result<()> {
+    let storage = crate::storage::sqlite::FrankenStorage::open_writer(&journal.db_path)
+        .map_err(|e| anyhow::anyhow!("open candidate db for db-vector-domain invalidation: {e}"))?;
+
+    let has_active_generation = storage
+        .raw()
+        .query_opt_map("SELECT id FROM embedding_generations WHERE is_active = 1", &[], |row| {
+            row.get_typed::<i64>(0)
+        })
+        .map_err(|e| anyhow::anyhow!("checking for an active embedding generation: {e}"))?
+        .is_some();
+    if !has_active_generation {
+        // 没有活跃代际就没有"作废"这回事可做——db_vector_catchup 下一次全量
+        // backfill 本来就会用当下的资格链重新播种,不需要这里预先动手。
+        return Ok(());
+    }
+
+    let eligible_ids = crate::indexer::db_vector_catchup::scan_eligible_message_ids(&storage).map_err(|e| {
+        anyhow::anyhow!("re-scanning semantic eligibility for db-vector-domain invalidation: {e}")
+    })?;
+    let now_ms = crate::storage::sqlite::FrankenStorage::now_millis();
+    storage
+        .raw()
+        .with_tx(crate::storage::api::TxMode::Immediate, |tx| {
+            let generation_id: i64 = tx.query_row_map(
+                "SELECT id FROM embedding_generations WHERE is_active = 1",
+                &[],
+                |row| row.get_typed(0),
+            )?;
+            crate::storage::schema::seed_embedding_holes(tx, generation_id, &eligible_ids, now_ms, "restore-invalidation")?;
+            crate::storage::schema::demote_active_generation_readiness_in_tx(tx)
+        })
+        .map_err(|e| anyhow::anyhow!("re-seeding embedding_holes / demoting readiness after restore: {e}"))?;
+    Ok(())
+}
+
+#[cfg(not(feature = "infinity"))]
+fn restore_invalidate_db_vector_domain(_journal: &RestoreJournal) -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[cfg(all(test, feature = "infinity"))]
+mod w3_4_step2_4_db_vector_domain_invalidation_tests {
+    use super::*;
+    use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+    use crate::storage::api::{TxMode, params};
+    use crate::storage::schema;
+
+    const TS: i64 = 1_770_551_400_000;
+
+    fn open_storage(path: &Path) -> crate::storage::sqlite::FrankenStorage {
+        crate::storage::sqlite::FrankenStorage::open(path).expect("open production storage")
+    }
+
+    fn minimal_journal(db_path: PathBuf) -> RestoreJournal {
+        RestoreJournal {
+            schema_version: 1,
+            operation_id: "w3-4-step2-4-test".into(),
+            state: RestoreJournalState::Planned,
+            data_dir: PathBuf::from("/fixtures/w3-4-step2-4"),
+            scratch_dir: PathBuf::from("/fixtures/w3-4-step2-4/scratch"),
+            db_path,
+            marker_path: PathBuf::from("/fixtures/w3-4-step2-4/marker.json"),
+            snapshot_root: "w3-4-step2-4-root".into(),
+            generation: "g1".into(),
+            planned: Vec::new(),
+            holds_count: 0,
+            origin_unmapped_count: 0,
+            committed: Vec::new(),
+            published: Vec::new(),
+            analytics_now_ms: Some(TS),
+        }
+    }
+
+    /// The point of this test: a message inserted via raw SQL -- deliberately
+    /// **bypassing** every hooked production write path
+    /// (`insert_conversation_tree`/`franken_replace_conversation_messages_in_tx`,
+    /// which already register a hole + demote readiness themselves,
+    /// W3-3 Step3) -- still gets picked up by
+    /// `restore_invalidate_db_vector_domain`. That is exactly the gap this
+    /// task closes: phase 3's own invalidation must not depend on some
+    /// other phase's write path having run a particular hook.
+    #[test]
+    fn restore_invalidate_db_vector_domain_reseeds_holes_and_demotes_readiness_for_unhooked_writes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let storage = open_storage(&db_path);
+
+        let agent_id = storage
+            .ensure_agent(&Agent { id: None, slug: "claude_code".into(), name: "Claude Code".into(), version: Some("1.0".into()), kind: AgentKind::Cli })
+            .unwrap();
+        let conv = Conversation {
+            id: None,
+            agent_slug: "claude_code".into(),
+            workspace: None,
+            external_id: Some("w3-4-step2-4-conv".into()),
+            title: Some("fixture".into()),
+            source_path: PathBuf::from("/fixtures/w3-4-step2-4.jsonl"),
+            started_at: Some(TS),
+            ended_at: Some(TS + 60_000),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message { id: None, idx: 0, role: MessageRole::User, author: None, created_at: Some(TS), content: "already embedded".into(), extra_json: serde_json::Value::Null, snippets: vec![] }],
+            source_id: "local".into(),
+            origin_host: None,
+        };
+        storage.insert_conversation_tree(agent_id, None, &conv).unwrap();
+        let conv_id: i64 = storage
+            .raw()
+            .query_row_map("SELECT id FROM conversations WHERE external_id = ?1", &params!["w3-4-step2-4-conv"], |row| row.get_typed(0))
+            .unwrap();
+        let doc_a: i64 = storage
+            .raw()
+            .query_row_map("SELECT id FROM messages WHERE conversation_id = ?1 AND idx = 0", &params![conv_id], |row| row.get_typed(0))
+            .unwrap();
+
+        let gen_id = storage
+            .raw()
+            .with_tx_no_replay(TxMode::Immediate, |tx| schema::create_embedding_generation(tx, "BAAI/bge-m3", 4, 1, TS))
+            .unwrap();
+        storage
+            .raw()
+            .with_tx_no_replay(TxMode::Immediate, |tx| schema::insert_message_embedding(tx, gen_id, doc_a, conv_id, &[1.0, 0.0, 0.0, 0.0], "seed-hash", None, TS))
+            .unwrap();
+        storage.raw().execute("UPDATE embedding_generations SET is_active = 1, audit_status = 'passed' WHERE id = ?1", &params![gen_id]).unwrap();
+
+        // Simulate "restore's phase 1 already wrote replacement content" via
+        // a raw SQL insert with NO hook running -- this is the doc_id the
+        // hooked write path would have registered a hole for, had it run.
+        let doc_b: i64 = doc_a + 1;
+        storage
+            .raw()
+            .execute(
+                "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (?1, ?2, 1, 'user', 'restored replacement content')",
+                &params![doc_b, conv_id],
+            )
+            .unwrap();
+
+        // `restore_invalidate_db_vector_domain` opens its own writer handle
+        // to `db_path` internally -- exactly the real restore shape (phase
+        // 3 runs as its own step, independent of whatever wrote content in
+        // phase 1). `storage` here stays open concurrently, same as two
+        // real process phases each holding their own connection.
+        let journal = minimal_journal(db_path.clone());
+        restore_invalidate_db_vector_domain(&journal).expect("db-vector-domain invalidation must succeed");
+
+        let hole_doc_ids: Vec<i64> = storage
+            .raw()
+            .query_all_map("SELECT doc_id FROM embedding_holes WHERE generation_id = ?1", &params![gen_id], |row| row.get_typed(0))
+            .unwrap();
+        assert_eq!(hole_doc_ids, vec![doc_b], "the unhooked doc_id must get a hole; the already-embedded one must not");
+
+        let audit_status: String = storage
+            .raw()
+            .query_row_map("SELECT audit_status FROM embedding_generations WHERE id = ?1", &params![gen_id], |row| row.get_typed(0))
+            .unwrap();
+        assert_eq!(audit_status, "pending", "readiness must be demoted after restore touched this generation's eligible set");
+    }
+
+    #[test]
+    fn restore_invalidate_db_vector_domain_is_a_noop_with_no_active_generation() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let _storage = open_storage(&db_path);
+
+        let journal = minimal_journal(db_path);
+        restore_invalidate_db_vector_domain(&journal).expect("must not error with no active generation");
+    }
 }
 
 /// 第 4 格 · analytics 失效并重算（幂等）。**直接用 E6 Step 1b 那个函数**，
 /// 不在这里另写一份重算（它已经处理了「绕开 `rebuild_analytics`」那条裁定）。
 fn restore_rebuild_analytics(journal: &RestoreJournal) -> anyhow::Result<()> {
-    let storage = crate::storage::sqlite::FrankenStorage::open(&journal.db_path)
+    let storage = crate::storage::sqlite::FrankenStorage::open_writer(&journal.db_path)
         .map_err(|e| anyhow::anyhow!("open candidate db for analytics: {e}"))?;
-    recompute_materialized_aggregates_after_commit(&storage)
+    let now_ms = journal
+        .analytics_now_ms
+        .unwrap_or_else(crate::storage::sqlite::FrankenStorage::now_millis);
+    recompute_materialized_aggregates_after_commit(&storage, now_ms)
 }
 
 /// 第 5/6 格 · manifest publish，**按差集续做**。
@@ -9030,19 +9370,17 @@ impl W1CommitMarker {
 
 /// 读 DB 里的内容代际（`meta` 保留 key）。key 常量与写侧共用一个，**不在两处各写一份**。
 fn read_content_generation(db_path: &Path) -> anyhow::Result<Option<String>> {
-    use frankensqlite::compat::{ConnectionExt as _, OptionalExtension as _, RowExt as _};
     let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(db_path)
         .map_err(|e| anyhow::anyhow!("open db for generation read: {e}"))?;
     let got: Option<String> = storage
         .raw()
-        .query_row_map(
+        .query_opt_map(
             "SELECT value FROM meta WHERE key = ?1",
-            &[frankensqlite::compat::ParamValue::from(
+            &[crate::storage::api::Value::from(
                 crate::storage::sqlite::SOURCE_CONTENT_GENERATION_META_KEY,
             )],
             |row| row.get_typed(0),
-        )
-        .optional()?
+        )?
         .flatten();
     storage.close_best_effort_in_place();
     Ok(got)
@@ -9582,6 +9920,17 @@ pub(crate) fn test_tree_snapshot(root: &Path) -> Vec<(String, u64)> {
             if meta.is_dir() {
                 out.push((format!("{rel}/"), 0));
                 walk(&path, base, out);
+            } else if rel.ends_with("-shm") || rel.ends_with("-wal") {
+                // w1b Task B9 (2026-08-27, equivalence-gate-caught, control-
+                // plane ruling): vanilla SQLite's WAL-mode shared-memory/log
+                // sidecars are engine-managed transient state, not tracked
+                // write-set content -- see tests/cli_doctor.rs's
+                // doctor_no_write_snapshot for the same exemption and its
+                // full rationale (reproduced directly: even a read-only
+                // connection to a WAL-mode database creates/touches these
+                // two files, which only a writable connection can ever
+                // checkpoint away). Every other file, including the
+                // canonical .db itself, is still tracked byte-for-byte.
             } else {
                 out.push((rel, meta.len()));
             }
@@ -9596,7 +9945,7 @@ pub(crate) fn test_tree_snapshot(root: &Path) -> Vec<(String, u64)> {
 #[cfg(test)]
 mod e7_restore_journal_tests {
     use super::*;
-    use frankensqlite::compat::{ConnectionExt, OptionalExtension, ParamValue, RowExt};
+    use crate::storage::api::Value as ParamValue;
     use tempfile::TempDir;
 
     const SNAPSHOT_ROOT: &str = "e7-snapshot-root-0001";
@@ -9687,6 +10036,46 @@ mod e7_restore_journal_tests {
         n
     }
 
+    /// w1b Task B9 (2026-08-27, control-plane ruling, e7 case final): direct
+    /// row-content read of `daily_stats`, sorted for a stable comparison
+    /// order. Exists because `db_identity.sqlite_digest` (raw file bytes)
+    /// is NOT the right equality check across two runs whose *write
+    /// history* differs even when the final logical content converges --
+    /// SQLite's on-disk page layout is a function of write history, not
+    /// just content, a documented property this engine never promised
+    /// otherwise (see `e7_planned_with_receipt_advances_instead_of_discarding`'s
+    /// own comment for the concrete repro this crystallized from: three
+    /// dumps -- after first run, before recover, after recover -- were
+    /// byte-for-byte identical in every field while the marker's digest
+    /// still disagreed). This is what "the recomputed content is the
+    /// same" actually means; a raw byte digest is not.
+    fn daily_stats_snapshot(db_path: &Path) -> Vec<String> {
+        let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(db_path).unwrap();
+        let mut rows: Vec<String> = storage
+            .raw()
+            .query_all_map(
+                "SELECT day_id, agent_slug, source_id, session_count, message_count, \
+                 total_chars, last_updated FROM daily_stats",
+                &[],
+                |row| {
+                    Ok(format!(
+                        "{}|{}|{}|{}|{}|{}|{}",
+                        row.get_typed::<i64>(0)?,
+                        row.get_typed::<String>(1)?,
+                        row.get_typed::<String>(2)?,
+                        row.get_typed::<i64>(3)?,
+                        row.get_typed::<i64>(4)?,
+                        row.get_typed::<i64>(5)?,
+                        row.get_typed::<i64>(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        storage.close_best_effort_in_place();
+        rows.sort();
+        rows
+    }
+
     fn receipt_count(db_path: &Path) -> i64 {
         let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(db_path).unwrap();
         let n = storage
@@ -9705,7 +10094,7 @@ mod e7_restore_journal_tests {
     /// 否则「恢复后收敛」可能只是无事可做的假绿（part5 判据 ⑤）。
     fn plant_post_commit_sentinels(data_dir: &Path, db_path: &Path) {
         // ① readiness：词法重建 checkpoint 存在 = 「索引自称对当前指纹新鲜」。
-        let index_dir = crate::search::tantivy::expected_index_dir(data_dir);
+        let index_dir = crate::indexer::expected_index_dir(data_dir);
         std::fs::create_dir_all(&index_dir).unwrap();
         std::fs::write(index_dir.join(".lexical-rebuild-state.json"), b"{}").unwrap();
 
@@ -9720,7 +10109,7 @@ mod e7_restore_journal_tests {
         let storage = crate::storage::sqlite::FrankenStorage::open(db_path).unwrap();
         storage
             .raw()
-            .execute_compat(
+            .execute(
                 "INSERT OR REPLACE INTO daily_stats
                  (day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -9744,6 +10133,7 @@ mod e7_restore_journal_tests {
             model_revision: "hash".into(),
             schema_version: 1,
             chunking_version: 1,
+            canonicalize_version: Some(crate::search::canonicalize::CANONICALIZE_PIPELINE_VERSION),
             dimension: 8,
             shard_index: 0,
             shard_count: 1,
@@ -9764,7 +10154,7 @@ mod e7_restore_journal_tests {
     }
 
     fn lexical_checkpoint_present(data_dir: &Path) -> bool {
-        crate::search::tantivy::expected_index_dir(data_dir)
+        crate::indexer::expected_index_dir(data_dir)
             .join(".lexical-rebuild-state.json")
             .exists()
     }
@@ -9780,12 +10170,11 @@ mod e7_restore_journal_tests {
         let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(db_path).unwrap();
         let found: Option<i64> = storage
             .raw()
-            .query_row_map(
+            .query_opt_map(
                 "SELECT 1 FROM daily_stats WHERE agent_slug = 'e7-sentinel'",
                 &[],
                 |row| row.get_typed(0),
             )
-            .optional()
             .unwrap()
             .flatten();
         storage.close_best_effort_in_place();
@@ -9874,7 +10263,7 @@ mod e7_restore_journal_tests {
             crate::storage::sqlite::FrankenStorage::open_readonly(&d.db_path).unwrap();
         let found: Vec<i64> = storage
             .raw()
-            .query_map_collect(
+            .query_all_map(
                 "SELECT c.id FROM conversations c JOIN agents a ON a.id = c.agent_id \
                  WHERE c.source_path = ?1 AND c.source_id = ?2 AND a.slug = ?3 \
                    AND COALESCE(NULLIF(TRIM(COALESCE(c.origin_host, '')), ''), 'local') = ?4",
@@ -10398,7 +10787,7 @@ mod e7_restore_journal_tests {
             crate::storage::sqlite::FrankenStorage::open_readonly(&d.db_path).unwrap();
         let stored_hosts: Vec<String> = storage
             .raw()
-            .query_map_collect(
+            .query_all_map(
                 "SELECT COALESCE(c.origin_host, '<NULL>') FROM conversations c \
                  WHERE c.external_id IN ('e7-local-with-host', 'e7-local-no-host') ORDER BY c.id",
                 &[],
@@ -10771,6 +11160,12 @@ mod e7_restore_journal_tests {
         restore_apply_journaled(plan_for(&d), &d.journal_path).unwrap();
         let conv_after_first = conv_count(&d.db_path);
         let receipts_after_first = receipt_count(&d.db_path);
+        let daily_stats_after_first = daily_stats_snapshot(&d.db_path);
+        // R2-F3: 首跑落地的 marker 逐字节快照——见下方 `expect_err` 之后的
+        // 防覆写断言。
+        let marker_path = d.db_path.parent().unwrap().join(W1_COMMIT_MARKER_FILENAME);
+        let marker_bytes_after_first =
+            std::fs::read(&marker_path).expect("首跑必须已经落地 W1 commit marker");
 
         // 再把现场倒回那个**必然存在**的窗：journal 退回 `planned`，
         // 三组事务外动作的哨兵重新种上（模拟「DB 提交了、journal 没推进就崩了」）。
@@ -10781,7 +11176,67 @@ mod e7_restore_journal_tests {
         journal.published.clear();
         restore_journal_write(&d.journal_path, &journal).unwrap();
 
-        let outcome = restore_recover(&d.journal_path).unwrap();
+        // w1b Task B9 (2026-08-27, control-plane ruling, e7 case final):
+        // this scenario's second `plant_post_commit_sentinels` inserts its
+        // sentinel row into a `daily_stats` table that already holds the
+        // real rows from the first run (not the near-empty table first run
+        // started from) -- so the analytics rebuild this recover pass
+        // drives is an UPDATE-in-place-plus-insert-then-delete history,
+        // not first run's plain-INSERT history. Reproduced directly
+        // (row-by-row dumps before/after this exact recover call): the
+        // resulting `daily_stats` rows are byte-for-byte identical to
+        // `daily_stats_after_first` in every field including
+        // `last_updated` (the deterministic-timestamp fix -- see
+        // `recompute_materialized_aggregates_after_commit` -- keeps that
+        // stamp equal too), yet the candidate DB *file bytes* still
+        // disagree, because SQLite's on-disk page layout is a function of
+        // write history, not just logical content -- a documented engine
+        // property, never a byte-identity guarantee this marker mechanism
+        // can rely on. `write_w1_commit_marker` doing its job (refusing to
+        // silently overwrite a marker that no longer matches) is exactly
+        // right; asserting it never fires for a scripted write-history
+        // perturbation nobody would hit outside a test harness is not.
+        // Tolerate exactly this one error shape and verify what actually
+        // matters -- the recomputed content -- directly instead.
+        // STAGE-B-INDEX 收尾债 #7（marker 物理 digest 残余，messy crash 态）；
+        // 本裁决 2026-08-28（cass-sql-advisor，R1-N1 D 案，PR #13 R1 对抗审）:
+        // 这个确定性失败正是该债在测试内的投影——`db_identity_of` 拿整个库
+        // 文件的原始字节做 marker identity 是已知的波2 债（真正的修复要
+        // 触碰 `write_w1_commit_marker` 的 I1 TOCTOU 加固不变量，超出波1
+        // 范围，波1 不动生产语义）。上一版把它当「容忍分支、结果丢弃」处理，
+        // 代价是任何带同款子串的失败都能溜过去——真假绿面。这里升格成
+        // **硬预期断言**：这一确定性错误本身就是当前正确行为，断言它，
+        // 不绕过它。
+        //
+        // 死亡判据：recover 若不带这个错误文本失败，或干脆意外成功，本
+        // 断言必须让测试红——那意味着 I1 的 marker-identity 语义被动过了，
+        // 波2 修复落地的信号就是这里，届时把 `expect_err` 换回
+        // `.unwrap()` 按新语义重写整段，不是继续放宽容忍。
+        let err = restore_recover(&d.journal_path).expect_err(
+            "recover must currently fail with the known W1 commit marker digest \
+             disagreement (STAGE-B-INDEX debt #7); an unexpected Ok means I1's \
+             marker-identity semantics changed underneath this test",
+        );
+        let detail = format!("{err:#}");
+        assert!(
+            detail.contains("existing W1 commit marker disagrees"),
+            "unexpected recover failure shape (not the known digest-disagreement \
+             debt this test pins down): {detail}"
+        );
+        // R2-F3（非阻断，波2 债 #7 的取证收窄）：这条子串断言只能证明
+        // `write_w1_commit_marker` 判定了「整个 marker 结构体不等」，证不到
+        // 到底是哪个字段不等——那层字段级取证仍然是波2 债 #7 的范围，这里
+        // 不越权补。能在波1 内验的是这条更根本的不变量 I1（"先查后做，绝不
+        // 覆盖"）：拒绝发布之后，磁盘上那份既有 marker 必须与首跑落地时逐
+        // 字节相等——`write_w1_commit_marker` 的 `hard_link` 发布路径失败于
+        // `EEXIST` 时从不触碰 `marker_path` 本身，只有 tmp 文件被清理；这里
+        // 拿真磁盘字节验证这一点，不是假定它。
+        assert_eq!(
+            std::fs::read(&marker_path).expect("recover 拒绝之后 marker 文件必须仍然存在"),
+            marker_bytes_after_first,
+            "recover 因 marker 不一致而拒绝时，绝不能覆写磁盘上既有的 marker —— \
+             这是不变量 I1（先查后做，绝不覆盖）在失败路径上的真实验证"
+        );
 
         assert_eq!(
             conv_count(&d.db_path),
@@ -10794,9 +11249,11 @@ mod e7_restore_journal_tests {
             "receipt 也不许多出来"
         );
         assert_eq!(
-            outcome.restored + outcome.replaced,
-            0,
-            "这一轮不该有任何新的写库动作"
+            daily_stats_snapshot(&d.db_path),
+            daily_stats_after_first,
+            "重算内容必须与首跑逐字段相等（哨兵已清除、聚合值与确定性时间戳都不变）\
+             ——这是「这一轮没有任何新的写库动作」在 daily_stats 上的真实验证面，\
+             marker 的裸字节 digest 不是（见上方注释）"
         );
         // 「前进」的观测量：三组事务外动作**必须真的补做**。
         assert!(
@@ -10810,7 +11267,9 @@ mod e7_restore_journal_tests {
                 .unwrap()
                 .unwrap()
                 .state,
-            RestoreJournalState::ClosureVerified
+            RestoreJournalState::ClosureVerified,
+            "journal 推进到终态发生在 marker 写入之前，不受 marker 那一步是否\
+             成功影响"
         );
     }
 
@@ -10823,7 +11282,7 @@ mod e7_restore_journal_tests {
         let storage = crate::storage::sqlite::FrankenStorage::open(&d.db_path).unwrap();
         storage
             .raw()
-            .execute("DELETE FROM operation_commit_receipt;")
+            .execute("DELETE FROM operation_commit_receipt;", &[])
             .unwrap();
         drop(storage);
 
@@ -12500,7 +12959,7 @@ mod e7_restore_journal_tests {
     /// 受保护的不止候选库主文件：sidecar 是同一个库的一部分，写坏它一样毁库。
     ///
     /// 判据用的是**前缀规则**（同目录下以候选库文件名打头的任何名字），不是一张后缀白名单：
-    /// 本仓的 frankensqlite 自己就会产出白名单里没有的 sidecar 族，
+    /// 本仓的 the legacy embedded engine 自己就会产出白名单里没有的 sidecar 族，
     /// 而**漏挡一条 = 毁库，误挡一条 = 换个报告名**，两侧代价不对称。
     #[test]
     fn e7_apply_refuses_a_journal_path_that_lands_on_a_candidate_db_sidecar() {
@@ -13494,10 +13953,21 @@ mod e8_dry_run_planner_tests {
                 if path.is_dir() {
                     stack.push(path);
                 } else if let Ok(meta) = entry.metadata() {
-                    out.push((
-                        path.strip_prefix(root).unwrap().display().to_string(),
-                        meta.len(),
-                    ));
+                    let rel = path.strip_prefix(root).unwrap().display().to_string();
+                    // w1b Task B9 (2026-08-27, equivalence-gate-caught, control-
+                    // plane ruling): vanilla SQLite's WAL-mode shared-memory/log
+                    // sidecars are engine-managed transient state, not tracked
+                    // write-set content -- see tests/cli_doctor.rs's
+                    // doctor_no_write_snapshot for the same exemption and its
+                    // full rationale (reproduced directly: even a read-only
+                    // connection to a WAL-mode database creates/touches these
+                    // two files, which only a writable connection can ever
+                    // checkpoint away). Every other file, including the
+                    // canonical .db itself, is still tracked byte-for-byte.
+                    if rel.ends_with("-shm") || rel.ends_with("-wal") {
+                        continue;
+                    }
+                    out.push((rel, meta.len()));
                 }
             }
         }

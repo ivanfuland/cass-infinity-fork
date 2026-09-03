@@ -43,7 +43,10 @@ which = "8.0.2"
 shell-words = "1.1.1"
 dotenvy = "0.15.7"
 notify = "8.2.0"
-frankensqlite = { version = "=0.1.16", package = "fsqlite", features = ["fts5"] }
+# w1b (Stage B, plan Task B1): promoted from [dev-dependencies] -- backend_sqlite.rs
+# (Task B2) is a real production storage backend, not a test-only interop fixture.
+# `bundled` pins the linked SQLite version for build reproducibility (spec §6).
+rusqlite = { version = "0.39.0", features = ["bundled", "modern_sqlite"] }
 rayon = "1.12.0"
 crossbeam-channel = "0.5.15"
 parking_lot = "0.12.5"
@@ -88,16 +91,16 @@ bytemuck = "1.25.0"
 # with STATUS_ILLEGAL_INSTRUCTION (#256). The `semantic` feature gate
 # below carries this dep so we can ship a `-baseline` artifact without it.
 fastembed = { version = "5.13.4", default-features = false, features = ["ort-download-binaries-rustls-tls"], optional = true }
-# `frankensearch/fastembed-reranker` pulls in the same `fastembed` crate
-# transitively (via `frankensearch-rerank`), so it must be gated by the
-# same `semantic` feature for the baseline build to be ORT-free.
-frankensearch = { version = "0.3.2", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "2cad158f4468ece7076e3fe529c8e5c20b2e020e", default-features = false, features = ["hash", "lexical", "ann"] }
-franken-agent-detection = { version = "0.1.9", git = "https://github.com/ivanfuland/my_franken_agent_detection", rev = "068f423be6ea213bc396f4bd3baba762927f1d14", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "hermes"] }
+# w3 Task W3-3 (spec 3.4 D4, KU2 basis: probe/sqlite-vec-eval @969c29b9, real
+# 101.6万x1024 bge-m3 corpus) -- vec0 KNN over message_embeddings. Pinned to
+# the last stable release, not the newest crates.io publish: v0.1.10-alpha.4
+# ships a broken tarball missing sqlite-vec-diskann.c and fails to compile.
+sqlite-vec = "=0.1.9"
+franken-agent-detection = { version = "0.1.10", git = "https://github.com/ivanfuland/my_franken_agent_detection", rev = "bc0f4d3c02356eac4d4dbc48e6f7d830d2caa9e8", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "hermes"] }
+ahash = "0.8.12"  # W3-5: hasher for the verbatim-restored RRF fusion hot map (was a transitive upstream-fusion dep)
 wide = "1.4.0"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "0.7.6"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization
 bloomfilter = "3.0.1"  # Probabilistic membership testing for P2 Opt 3.3: Workspace Cache
-hnsw_rs = "0.3.4"  # Opt 9: Approximate Nearest Neighbor with HNSW
-ouroboros = "0.18.5"  # Safe self-referential wrapper for HNSW loader lifetime
 
 # Crypto for ChatGPT encrypted conversations and HTML export encryption.
 # The aes-gcm + digest + hkdf + hmac + sha2 family must stay on compatible
@@ -151,14 +154,17 @@ backtrace = []
 # `--no-default-features --features qr,encryption,infinity` for an ORT-free yet
 # semantic-capable (and Chinese-capable) build.
 infinity = []
-# `semantic` enables ONNX-runtime-backed embedding/reranking via fastembed +
-# frankensearch/fastembed-reranker. Disabling it (e.g. via `--no-default-features
-# --features qr,encryption`) builds the `-baseline` artifact that does not pull
-# in the prebuilt Microsoft ONNX Runtime binary, so pre-AVX2 CPUs no longer
-# crash with STATUS_ILLEGAL_INSTRUCTION at static init (cass#256). Semantic
-# search modes return a clear error in baseline builds; lexical search and
-# all other functionality remain fully available.
-semantic = ["dep:fastembed", "frankensearch/fastembed-reranker"]
+# `semantic` enables ONNX-runtime-backed embedding via fastembed. Disabling
+# it (e.g. via `--no-default-features --features qr,encryption`) builds the
+# `-baseline` artifact that does not pull in the prebuilt Microsoft ONNX
+# Runtime binary, so pre-AVX2 CPUs no longer crash with
+# STATUS_ILLEGAL_INSTRUCTION at static init (cass#256). Semantic search modes
+# return a clear error in baseline builds; lexical search and all other
+# functionality remain fully available. W3-5: the cross-encoder reranker
+# (`search::fastembed_reranker`) is an unconditional stub regardless of this
+# feature now that its upstream backing dependency is retired -- see that
+# module's doc comment.
+semantic = ["dep:fastembed"]
 # Opt-in: upgrade sibling repo rev/worktree drift from warning to hard error and
 # validate the optional /data/projects path checkouts before enabling local overrides.
 strict-path-dep-validation = []
@@ -179,12 +185,6 @@ arbitrary = { version = "1", features = ["derive"] }
 serde_yaml = "0.9.34"
 rand = "0.10"
 rand_chacha = "0.10"
-# rusqlite is retained only for C-SQLite interop fixtures in tests; production
-# storage and historical salvage paths use frankensqlite.
-rusqlite = { version = "0.39.0", features = ["bundled", "modern_sqlite"] }
-# frankensqlite compat gate tests (bead 3vvqa) — fsqlite-types needed for SqliteValue
-# enum variants in test assertions. The main fsqlite dep is available as `frankensqlite`.
-fsqlite-types = { version = "=0.1.16", package = "fsqlite-types" }
 
 [[bin]]
 name = "cass"
@@ -221,8 +221,8 @@ debug = "line-tables-only"
 strip = false
 
 # The dependency graph is pinned to the asupersync 0.3.x line. Keep
-# frankensqlite plus frankensearch and franken-agent-detection revs aligned so
-# Cargo.lock does not reintroduce a parallel asupersync 0.2.x stack.
+# franken-agent-detection's rev aligned so Cargo.lock does not reintroduce
+# a parallel asupersync 0.2.x stack.
 #
 # If you need to build against a local checkout of asupersync (sibling
 # at ../asupersync) during runtime-level hacking, add the following
@@ -247,23 +247,9 @@ strip = false
 # A fresh-clone build regression guard runs in CI (.github/workflows/fresh-clone-build.yml)
 # — if you re-enable any of these [patch] blocks, that workflow will fail.
 #
-# [patch."https://github.com/Dicklesworthstone/frankensqlite"]
-# fsqlite = { path = "../frankensqlite/crates/fsqlite" }
-# fsqlite-types = { path = "../frankensqlite/crates/fsqlite-types" }
 # [patch."https://github.com/Dicklesworthstone/franken_agent_detection"]
 # franken-agent-detection = { path = "../franken_agent_detection" }
 #
-# Enable strict validation before uncommenting any additional sibling path overrides:
-# cargo check --features strict-path-dep-validation
-# [patch."https://github.com/Dicklesworthstone/frankensearch"]
-# frankensearch = { path = "../frankensearch/frankensearch" }
-# frankensearch-core = { path = "../frankensearch/crates/frankensearch-core" }
-# frankensearch-index = { path = "../frankensearch/crates/frankensearch-index" }
-# frankensearch-embed = { path = "../frankensearch/crates/frankensearch-embed" }
-# frankensearch-fusion = { path = "../frankensearch/crates/frankensearch-fusion" }
-# frankensearch-lexical = { path = "../frankensearch/crates/frankensearch-lexical" }
-# frankensearch-rerank = { path = "../frankensearch/crates/frankensearch-rerank" }
-
 [workspace.metadata.dist]
 targets = ["x86_64-unknown-linux-gnu"]
 installers = ["shell", "powershell"]
@@ -299,10 +285,6 @@ harness = false
 
 [[bench]]
 name = "cache_micro"
-harness = false
-
-[[bench]]
-name = "regex_cache"
 harness = false
 
 [[bench]]

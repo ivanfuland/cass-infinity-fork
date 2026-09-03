@@ -33,9 +33,10 @@
 //! ```
 
 use super::embedder::{Embedder, EmbedderError, EmbedderResult};
-use frankensearch::{
-    HashAlgorithm as FsHashAlgorithm, HashEmbedder as FsHashEmbedder, ModelCategory, ModelTier,
+use super::frankensearch_hash_embedder::{
+    HashAlgorithm as FsHashAlgorithm, HashEmbedder as FsHashEmbedder,
 };
+use super::frankensearch_types::{ModelCategory, ModelTier};
 
 /// Default embedding dimension (matches MiniLM for compatibility).
 pub const DEFAULT_DIMENSION: usize = 384;
@@ -395,14 +396,22 @@ mod tests {
 
     #[test]
     fn test_sync_embedder_adapter_bridge() {
-        use frankensearch::SyncEmbedderAdapter;
+        use crate::search::frankensearch_types::SyncEmbedderAdapter;
 
         let embedder = HashEmbedder::new(256);
         let adapted = SyncEmbedderAdapter(embedder);
 
-        // The adapter implements frankensearch::Embedder (async trait)
-        assert_eq!(frankensearch::Embedder::dimension(&adapted), 256);
-        assert_eq!(frankensearch::Embedder::id(&adapted), "fnv1a-256");
-        assert!(!frankensearch::Embedder::is_semantic(&adapted));
+        // The adapter implements the restored async frankensearch_types::Embedder trait.
+        assert_eq!(
+            crate::search::frankensearch_types::Embedder::dimension(&adapted),
+            256
+        );
+        assert_eq!(
+            crate::search::frankensearch_types::Embedder::id(&adapted),
+            "fnv1a-256"
+        );
+        assert!(!crate::search::frankensearch_types::Embedder::is_semantic(
+            &adapted
+        ));
     }
 }

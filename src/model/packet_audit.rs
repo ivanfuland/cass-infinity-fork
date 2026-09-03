@@ -261,6 +261,12 @@ pub struct PacketSinkMigration {
 /// operators a single source of truth for "which derivative sinks
 /// have a packet-driven path today, where to find each helper, how
 /// to roll back, and where the equivalence proof lives."
+// W2-6 exec44 卫生修 (control-plane ruling): the `lexical` entry's paths below
+// point at `crate::search::tantivy`, a module retired in W2-6 (replaced by
+// SQLite FTS5). Left as-is deliberately -- this catalog is a historical
+// archive of "where the migration landed at the time", not a live index, so
+// the literal path is preserved rather than rewritten to avoid falsifying
+// the record.
 pub const PACKET_SINK_MIGRATIONS: &[PacketSinkMigration] = &[
     PacketSinkMigration {
         sink: "lexical",

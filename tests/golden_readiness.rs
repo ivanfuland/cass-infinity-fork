@@ -9,13 +9,12 @@
 //! `UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test golden_readiness`
 
 use assert_cmd::Command;
+use coding_agent_search::search::canonicalize::CANONICALIZE_PIPELINE_VERSION;
 use coding_agent_search::search::policy::{CHUNKING_STRATEGY_VERSION, SEMANTIC_SCHEMA_VERSION};
 use coding_agent_search::search::semantic_manifest::{
     ArtifactRecord, BacklogLedger, BuildCheckpoint, SemanticManifest, TierKind,
 };
-use coding_agent_search::search::tantivy::index_dir;
 use coding_agent_search::storage::sqlite::FrankenStorage;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 fn cass_cmd(test_home: &Path) -> Command {
@@ -198,10 +197,6 @@ fn seed_semantic_progress_fixture(
         .close()
         .expect("close canonical DB");
 
-    let index_path = index_dir(data_dir).expect("index dir");
-    fs::create_dir_all(&index_path).expect("create index dir");
-    fs::write(index_path.join("meta.json"), b"{}").expect("write index meta");
-
     let mut manifest = SemanticManifest::default();
     if fast_tier_ready {
         manifest.fast_tier = Some(ArtifactRecord {
@@ -210,6 +205,7 @@ fn seed_semantic_progress_fixture(
             model_revision: "hash".to_string(),
             schema_version: SEMANTIC_SCHEMA_VERSION,
             chunking_version: CHUNKING_STRATEGY_VERSION,
+            canonicalize_version: Some(CANONICALIZE_PIPELINE_VERSION),
             dimension: 256,
             doc_count: 120,
             conversation_count: 12,
@@ -240,6 +236,7 @@ fn seed_semantic_progress_fixture(
         chunking_version: CHUNKING_STRATEGY_VERSION,
         saved_at_ms: 1_733_100_300_000,
         last_message_id: None,
+        last_message_id_conversation_id: None,
         cursor_exhausted: false,
     });
     manifest.save(data_dir).expect("save semantic manifest");

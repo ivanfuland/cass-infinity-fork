@@ -10,7 +10,7 @@ use coding_agent_search::search::embedder::{Embedder, EmbedderResult};
 use coding_agent_search::search::reranker::{
     RerankDocument, RerankScore, Reranker, RerankerResult, rerank_texts,
 };
-use frankensearch::ModelCategory;
+use coding_agent_search::search::embedder::ModelCategory;
 use parking_lot::Mutex;
 
 #[derive(Clone, Copy)]

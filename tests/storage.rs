@@ -1,15 +1,9 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
 use coding_agent_search::sources::provenance::{LOCAL_SOURCE_ID, Source, SourceKind};
-use coding_agent_search::storage::sqlite::{MigrationError, SqliteStorage};
-use frankensqlite::Connection as FrankenConnection;
-use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
-
-fn open_fixture_db(path: impl AsRef<Path>) -> FrankenConnection {
-    let path = path.as_ref().to_string_lossy();
-    FrankenConnection::open(path.as_ref()).expect("open frankensqlite fixture database")
-}
+use coding_agent_search::storage::api::Value as ParamValue;
+use coding_agent_search::storage::sqlite::SqliteStorage;
 
 fn sample_agent() -> Agent {
     Agent {
@@ -52,87 +46,6 @@ fn msg(idx: i64, created_at: i64) -> Message {
     }
 }
 
-#[test]
-fn schema_version_uses_schema_migrations_after_open() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let db_path = tmp.path().join("store.db");
-    let storage = SqliteStorage::open(&db_path).expect("open");
-
-    assert_eq!(
-        storage.schema_version().unwrap(),
-        coding_agent_search::storage::sqlite::CURRENT_SCHEMA_VERSION
-    );
-
-    // `_schema_migrations` is authoritative now, so removing the legacy
-    // compatibility row must not break schema version reporting.
-    storage.raw().execute("DELETE FROM meta").unwrap();
-    assert!(
-        matches!(
-            storage.schema_version(),
-            Ok(coding_agent_search::storage::sqlite::CURRENT_SCHEMA_VERSION)
-        ),
-        "schema_version should continue reading from _schema_migrations after meta cleanup, got: {:?}",
-        storage.schema_version()
-    );
-}
-
-#[test]
-fn rebuild_fts_repopulates_rows() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let db_path = tmp.path().join("fts.db");
-    let storage = SqliteStorage::open(&db_path).expect("open");
-
-    let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
-    let ws_id = storage
-        .ensure_workspace(PathBuf::from("/workspace/demo").as_path(), Some("Demo"))
-        .unwrap();
-
-    let conv = sample_conv(Some("ext-1"), vec![msg(0, 10), msg(1, 20)]);
-    storage
-        .insert_conversation_tree(agent_id, Some(ws_id), &conv)
-        .unwrap();
-
-    let count_messages: i64 = storage
-        .raw()
-        .query_row_map("SELECT COUNT(*) FROM messages", &[], |r| r.get_typed(0))
-        .unwrap();
-    let fts_table_count: i64 = storage
-        .raw()
-        .query_row_map(
-            "SELECT COUNT(*) FROM sqlite_master WHERE name='fts_messages' AND type='table'",
-            &[],
-            |r| r.get_typed(0),
-        )
-        .unwrap();
-    assert_eq!(
-        fts_table_count, 0,
-        "fresh storage keeps db-resident FTS as a derived asset"
-    );
-
-    storage
-        .raw()
-        .execute("DROP TABLE IF EXISTS fts_messages")
-        .unwrap();
-    let fts_table_count: i64 = storage
-        .raw()
-        .query_row_map(
-            "SELECT COUNT(*) FROM sqlite_master WHERE name='fts_messages' AND type='table'",
-            &[],
-            |r| r.get_typed(0),
-        )
-        .unwrap();
-    assert_eq!(
-        fts_table_count, 0,
-        "fts_messages should be absent after drop"
-    );
-
-    storage.rebuild_fts().unwrap();
-    let fts_count: i64 = storage
-        .raw()
-        .query_row_map("SELECT COUNT(*) FROM fts_messages", &[], |r| r.get_typed(0))
-        .unwrap();
-    assert_eq!(fts_count, count_messages);
-}
 
 #[test]
 fn duplicate_idx_within_new_conversation_keeps_first_message() {
@@ -174,7 +87,7 @@ fn insert_conversation_tree_succeeds_without_db_resident_fts() {
     let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
     storage
         .raw()
-        .execute("DROP TABLE IF EXISTS fts_messages")
+        .execute("DROP TABLE IF EXISTS fts_messages", &[])
         .unwrap();
 
     let conv = sample_conv(None, vec![msg(0, 1)]);
@@ -225,7 +138,7 @@ fn insert_conversations_batched_succeeds_without_db_resident_fts() {
 
     storage
         .raw()
-        .execute("DROP TABLE IF EXISTS fts_messages")
+        .execute("DROP TABLE IF EXISTS fts_messages", &[])
         .unwrap();
 
     let result = storage.insert_conversations_batched(&refs);
@@ -285,7 +198,7 @@ fn append_only_updates_existing_conversation() {
 
     let rows: Vec<(i64, i64)> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT idx, created_at FROM messages ORDER BY idx",
             &[],
             |r| Ok((r.get_typed(0)?, r.get_typed::<Option<i64>>(1)?.unwrap())),
@@ -302,68 +215,6 @@ fn append_only_updates_existing_conversation() {
         )
         .unwrap();
     assert_eq!(ended_at, 300);
-}
-
-#[test]
-fn large_batch_insert_can_materialize_derived_fts() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let db_path = tmp.path().join("batch.db");
-    let storage = SqliteStorage::open(&db_path).expect("open");
-
-    let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
-
-    // Build a conversation with 200 messages
-    let mut msgs = Vec::new();
-    for idx in 0..200 {
-        msgs.push(msg(idx, 1_000 + idx));
-    }
-    let conv = sample_conv(Some("batch-1"), msgs);
-
-    let outcome = storage
-        .insert_conversation_tree(agent_id, None, &conv)
-        .expect("batch insert");
-    assert_eq!(outcome.inserted_indices.len(), 200);
-
-    let msg_count: i64 = storage
-        .raw()
-        .query_row_map("SELECT COUNT(*) FROM messages", &[], |r| r.get_typed(0))
-        .unwrap();
-    let fts_table_count: i64 = storage
-        .raw()
-        .query_row_map(
-            "SELECT COUNT(*) FROM sqlite_master WHERE name='fts_messages' AND type='table'",
-            &[],
-            |r| r.get_typed(0),
-        )
-        .unwrap();
-    assert_eq!(
-        fts_table_count, 0,
-        "db-resident FTS should remain absent until explicitly rebuilt"
-    );
-
-    storage.rebuild_fts().unwrap();
-    let fts_count: i64 = storage
-        .raw()
-        .query_row_map("SELECT COUNT(*) FROM fts_messages", &[], |r| r.get_typed(0))
-        .unwrap();
-
-    assert_eq!(msg_count, 200);
-    assert_eq!(fts_count, 200);
-
-    // Spot check a few message rows for correct ordering and timestamps
-    let rows: Vec<(i64, i64)> = storage
-        .raw()
-        .query_map_collect(
-            "SELECT idx, created_at FROM messages ORDER BY idx LIMIT 3 OFFSET 197",
-            &[],
-            |r| Ok((r.get_typed(0)?, r.get_typed::<Option<i64>>(1)?.unwrap())),
-        )
-        .unwrap();
-    assert_eq!(
-        rows,
-        vec![(197, 1_197), (198, 1_198), (199, 1_199)],
-        "tail rows should preserve order and timestamps"
-    );
 }
 
 #[test]
@@ -395,30 +246,6 @@ fn last_scan_ts_overwrite() {
     assert_eq!(storage.get_last_scan_ts().unwrap(), Some(20));
 }
 
-#[test]
-fn open_ignores_stale_meta_schema_version_once_schema_migrations_exist() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let db_path = tmp.path().join("schema.db");
-
-    // First open initializes schema to current version
-    let storage = SqliteStorage::open(&db_path).expect("initial open");
-    // Poison the schema_version to an unsupported future value
-    storage
-        .raw()
-        .execute("UPDATE meta SET value = '999' WHERE key = 'schema_version'")
-        .unwrap();
-    drop(storage); // Close connection before reopening
-
-    let reopen = SqliteStorage::open(&db_path);
-    assert!(
-        reopen.is_ok(),
-        "open() should rely on _schema_migrations, not the legacy meta mirror"
-    );
-    assert_eq!(
-        reopen.unwrap().schema_version().unwrap(),
-        coding_agent_search::storage::sqlite::CURRENT_SCHEMA_VERSION
-    );
-}
 
 // =============================================================================
 // Schema Migration Tests (tst.sto.schema)
@@ -434,7 +261,7 @@ fn fresh_db_creates_all_tables() {
     // Query sqlite_master for table names
     let tables: Vec<String> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
             &[],
             |r| r.get_typed(0),
@@ -467,9 +294,12 @@ fn fresh_db_creates_all_tables() {
         tables.contains(&"conversation_tags".to_string()),
         "conversation_tags table exists"
     );
+    // W2-6 Task戊: schema version 3 drops fts_messages -- a fresh database
+    // built through `schema::ensure` must never materialize it again (search
+    // runs entirely on the fts_lex/lex_docs index).
     assert!(
         !tables.contains(&"fts_messages".to_string()),
-        "fresh schema should not materialize derived fts_messages"
+        "fresh schema must not materialize the retired fts_messages table"
     );
     // Sources table (v4)
     assert!(
@@ -486,7 +316,7 @@ fn fresh_db_creates_all_indexes() {
 
     let indexes: Vec<String> = storage
         .raw()
-        .query_map_collect("SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%' ORDER BY name", &[], |r| r.get_typed(0))
+        .query_all_map("SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%' ORDER BY name", &[], |r| r.get_typed(0))
         .unwrap();
 
     assert!(
@@ -500,7 +330,7 @@ fn fresh_db_creates_all_indexes() {
 
     let message_indexes: Vec<String> = storage
         .raw()
-        .query_map_collect("PRAGMA index_list(messages)", &[], |r| r.get_typed(1))
+        .query_all_map("PRAGMA index_list(messages)", &[], |r| r.get_typed(1))
         .unwrap();
     assert!(
         message_indexes.contains(&"sqlite_autoindex_messages_1".to_string()),
@@ -512,73 +342,7 @@ fn fresh_db_creates_all_indexes() {
     );
 }
 
-#[test]
-fn migration_v16_drops_redundant_message_conv_idx() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let db_path = tmp.path().join("v16_drop_redundant_idx.db");
-    {
-        let storage = SqliteStorage::open(&db_path).expect("open");
-        storage
-            .raw()
-            .execute(
-                "CREATE INDEX IF NOT EXISTS idx_messages_conv_idx ON messages(conversation_id, idx)",
-            )
-            .unwrap();
-        storage
-            .raw()
-            .execute("DELETE FROM _schema_migrations WHERE version = 16")
-            .unwrap();
-        storage
-            .raw()
-            .execute("UPDATE meta SET value = '15' WHERE key = 'schema_version'")
-            .unwrap();
-    }
 
-    let storage = SqliteStorage::open(&db_path).expect("reopen migrated db");
-    let message_indexes: Vec<String> = storage
-        .raw()
-        .query_map_collect("PRAGMA index_list(messages)", &[], |r| r.get_typed(1))
-        .unwrap();
-    assert!(
-        message_indexes.contains(&"sqlite_autoindex_messages_1".to_string()),
-        "v16 must retain the UNIQUE(conversation_id, idx) autoindex, found: {message_indexes:?}"
-    );
-    assert!(
-        !message_indexes.contains(&"idx_messages_conv_idx".to_string()),
-        "v16 should drop the redundant named message index, found: {message_indexes:?}"
-    );
-}
-
-#[test]
-fn migration_v17_drops_message_created_idx() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let db_path = tmp.path().join("v17_drop_message_created_idx.db");
-    {
-        let storage = SqliteStorage::open(&db_path).expect("open");
-        storage
-            .raw()
-            .execute("CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at)")
-            .unwrap();
-        storage
-            .raw()
-            .execute("DELETE FROM _schema_migrations WHERE version = 17")
-            .unwrap();
-        storage
-            .raw()
-            .execute("UPDATE meta SET value = '16' WHERE key = 'schema_version'")
-            .unwrap();
-    }
-
-    let storage = SqliteStorage::open(&db_path).expect("reopen migrated db");
-    let message_indexes: Vec<String> = storage
-        .raw()
-        .query_map_collect("PRAGMA index_list(messages)", &[], |r| r.get_typed(1))
-        .unwrap();
-    assert!(
-        !message_indexes.contains(&"idx_messages_created".to_string()),
-        "v17 should drop the write-heavy created_at index, found: {message_indexes:?}"
-    );
-}
 
 #[test]
 fn agents_table_has_correct_columns() {
@@ -588,7 +352,7 @@ fn agents_table_has_correct_columns() {
 
     let columns: Vec<String> = storage
         .raw()
-        .query_map_collect("PRAGMA table_info(agents)", &[], |r| {
+        .query_all_map("PRAGMA table_info(agents)", &[], |r| {
             r.get_typed::<String>(1)
         })
         .unwrap();
@@ -622,7 +386,7 @@ fn conversations_table_has_correct_columns() {
 
     let columns: Vec<String> = storage
         .raw()
-        .query_map_collect("PRAGMA table_info(conversations)", &[], |r| {
+        .query_all_map("PRAGMA table_info(conversations)", &[], |r| {
             r.get_typed::<String>(1)
         })
         .unwrap();
@@ -662,7 +426,7 @@ fn messages_table_has_correct_columns() {
 
     let columns: Vec<String> = storage
         .raw()
-        .query_map_collect("PRAGMA table_info(messages)", &[], |r| {
+        .query_all_map("PRAGMA table_info(messages)", &[], |r| {
             r.get_typed::<String>(1)
         })
         .unwrap();
@@ -675,312 +439,6 @@ fn messages_table_has_correct_columns() {
     assert!(columns.contains(&"created_at".to_string()));
     assert!(columns.contains(&"content".to_string()));
     assert!(columns.contains(&"extra_json".to_string()));
-}
-
-#[test]
-fn fts_messages_is_fts5_virtual_table() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let db_path = tmp.path().join("fts5.db");
-    let storage = SqliteStorage::open(&db_path).expect("open");
-    storage
-        .rebuild_fts()
-        .expect("materialize derived FTS table");
-
-    // Check that fts_messages is an FTS5 virtual table
-    let sql: String = storage
-        .raw()
-        .query_row_map(
-            "SELECT sql FROM sqlite_master WHERE name='fts_messages' AND type='table'",
-            &[],
-            |r| r.get_typed(0),
-        )
-        .expect("fts_messages should exist");
-
-    assert!(
-        sql.contains("fts5"),
-        "fts_messages should be FTS5 virtual table"
-    );
-    assert!(sql.contains("content"), "fts_messages should have content");
-    assert!(sql.contains("title"), "fts_messages should have title");
-    assert!(sql.contains("agent"), "fts_messages should have agent");
-    assert!(
-        sql.contains("workspace"),
-        "fts_messages should have workspace"
-    );
-    assert!(
-        sql.contains("content=''") || sql.contains("content = ''"),
-        "fts_messages should use contentless storage"
-    );
-    assert!(
-        !sql.contains("message_id UNINDEXED"),
-        "fts_messages should no longer store legacy message_id payloads"
-    );
-    assert!(
-        sql.contains("porter"),
-        "fts_messages should use porter tokenizer"
-    );
-}
-
-#[test]
-fn fresh_database_fts_messages_is_queryable_via_frankensqlite() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let db_path = tmp.path().join("fresh-fts.db");
-    let storage = SqliteStorage::open(&db_path).expect("open");
-    storage
-        .rebuild_fts()
-        .expect("materialize derived FTS table");
-
-    let count: i64 = storage
-        .raw()
-        .query_row_map("SELECT COUNT(*) FROM fts_messages", &[], |row| {
-            row.get_typed(0)
-        })
-        .expect("fresh FTS table should be queryable via frankensqlite");
-    assert_eq!(count, 0, "fresh FTS table should start empty");
-}
-
-#[test]
-fn open_disables_frankensqlite_autocommit_retain() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let db_path = tmp.path().join("autocommit-retain.db");
-    let storage = SqliteStorage::open(&db_path).expect("open");
-
-    let namespaced: i64 = storage
-        .raw()
-        .query_row_map("PRAGMA fsqlite.autocommit_retain;", &[], |row| {
-            row.get_typed(0)
-        })
-        .expect("fsqlite.autocommit_retain pragma should be queryable");
-    assert_eq!(
-        namespaced, 0,
-        "storage open should disable retained autocommit"
-    );
-
-    let alias: i64 = storage
-        .raw()
-        .query_row_map("PRAGMA autocommit_retain;", &[], |row| row.get_typed(0))
-        .expect("autocommit_retain pragma alias should be queryable");
-    assert_eq!(alias, 0, "autocommit_retain alias should also be disabled");
-}
-
-#[test]
-fn migration_from_v1_requires_rebuild() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let db_path = tmp.path().join("migrate_v1.db");
-
-    // Manually create a v1 database
-    {
-        let conn = open_fixture_db(&db_path);
-        conn.execute_batch(
-            r"
-            PRAGMA foreign_keys = ON;
-
-            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            INSERT INTO meta(key, value) VALUES('schema_version', '1');
-
-            CREATE TABLE agents (
-                id INTEGER PRIMARY KEY,
-                slug TEXT NOT NULL UNIQUE,
-                name TEXT NOT NULL,
-                version TEXT,
-                kind TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
-
-            CREATE TABLE workspaces (
-                id INTEGER PRIMARY KEY,
-                path TEXT NOT NULL UNIQUE,
-                display_name TEXT
-            );
-
-            CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                agent_id INTEGER NOT NULL REFERENCES agents(id),
-                workspace_id INTEGER REFERENCES workspaces(id),
-                external_id TEXT,
-                title TEXT,
-                source_path TEXT NOT NULL,
-                started_at INTEGER,
-                ended_at INTEGER,
-                approx_tokens INTEGER,
-                metadata_json TEXT,
-                UNIQUE(agent_id, external_id)
-            );
-
-            CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-                idx INTEGER NOT NULL,
-                role TEXT NOT NULL,
-                author TEXT,
-                created_at INTEGER,
-                content TEXT NOT NULL,
-                extra_json TEXT,
-                UNIQUE(conversation_id, idx)
-            );
-
-            CREATE TABLE snippets (
-                id INTEGER PRIMARY KEY,
-                message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
-                file_path TEXT,
-                start_line INTEGER,
-                end_line INTEGER,
-                language TEXT,
-                snippet_text TEXT
-            );
-
-            CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
-
-            CREATE TABLE conversation_tags (
-                conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-                tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
-                PRIMARY KEY (conversation_id, tag_id)
-            );
-
-            CREATE INDEX idx_conversations_agent_started ON conversations(agent_id, started_at DESC);
-            CREATE INDEX idx_messages_conv_idx ON messages(conversation_id, idx);
-            CREATE INDEX idx_messages_created ON messages(created_at);
-            ",
-        )
-        .expect("create v1 schema");
-    }
-
-    let result = SqliteStorage::open_or_rebuild(&db_path);
-    match result {
-        Err(MigrationError::RebuildRequired {
-            reason,
-            backup_path,
-        }) => {
-            assert!(
-                reason.contains("too old for in-place migration"),
-                "unexpected rebuild reason: {reason}"
-            );
-            assert!(backup_path.is_some(), "legacy schema should be backed up");
-        }
-        Ok(_) => panic!("expected rebuild requirement for v1 schema"),
-        Err(err) => panic!("expected rebuild requirement for v1 schema, got {err}"),
-    }
-    assert!(
-        !db_path.exists(),
-        "legacy v1 database should be removed after rebuild requirement"
-    );
-}
-
-#[test]
-fn migration_from_v2_requires_rebuild() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let db_path = tmp.path().join("migrate_v2.db");
-
-    // Manually create a v2 database with FTS5 table
-    {
-        let conn = open_fixture_db(&db_path);
-        conn.execute_batch(
-            r"
-            PRAGMA foreign_keys = ON;
-
-            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            INSERT INTO meta(key, value) VALUES('schema_version', '2');
-
-            CREATE TABLE agents (
-                id INTEGER PRIMARY KEY,
-                slug TEXT NOT NULL UNIQUE,
-                name TEXT NOT NULL,
-                version TEXT,
-                kind TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
-
-            CREATE TABLE workspaces (
-                id INTEGER PRIMARY KEY,
-                path TEXT NOT NULL UNIQUE,
-                display_name TEXT
-            );
-
-            CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                agent_id INTEGER NOT NULL REFERENCES agents(id),
-                workspace_id INTEGER REFERENCES workspaces(id),
-                external_id TEXT,
-                title TEXT,
-                source_path TEXT NOT NULL,
-                started_at INTEGER,
-                ended_at INTEGER,
-                approx_tokens INTEGER,
-                metadata_json TEXT,
-                UNIQUE(agent_id, external_id)
-            );
-
-            CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-                idx INTEGER NOT NULL,
-                role TEXT NOT NULL,
-                author TEXT,
-                created_at INTEGER,
-                content TEXT NOT NULL,
-                extra_json TEXT,
-                UNIQUE(conversation_id, idx)
-            );
-
-            CREATE TABLE snippets (
-                id INTEGER PRIMARY KEY,
-                message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
-                file_path TEXT,
-                start_line INTEGER,
-                end_line INTEGER,
-                language TEXT,
-                snippet_text TEXT
-            );
-
-            CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
-
-            CREATE TABLE conversation_tags (
-                conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-                tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
-                PRIMARY KEY (conversation_id, tag_id)
-            );
-
-            CREATE INDEX idx_conversations_agent_started ON conversations(agent_id, started_at DESC);
-            CREATE INDEX idx_messages_conv_idx ON messages(conversation_id, idx);
-            CREATE INDEX idx_messages_created ON messages(created_at);
-
-            -- V2 FTS5 table
-            CREATE VIRTUAL TABLE fts_messages USING fts5(
-                content,
-                title,
-                agent,
-                workspace,
-                source_path,
-                created_at UNINDEXED,
-                message_id UNINDEXED,
-                tokenize='porter'
-            );
-            ",
-        )
-        .expect("create v2 schema");
-    }
-
-    let result = SqliteStorage::open_or_rebuild(&db_path);
-    match result {
-        Err(MigrationError::RebuildRequired {
-            reason,
-            backup_path,
-        }) => {
-            assert!(
-                reason.contains("too old for in-place migration"),
-                "unexpected rebuild reason: {reason}"
-            );
-            assert!(backup_path.is_some(), "legacy schema should be backed up");
-        }
-        Ok(_) => panic!("expected rebuild requirement for v2 schema"),
-        Err(err) => panic!("expected rebuild requirement for v2 schema, got {err}"),
-    }
-    assert!(
-        !db_path.exists(),
-        "legacy v2 database should be removed after rebuild requirement"
-    );
 }
 
 #[test]
@@ -1009,13 +467,13 @@ fn unique_constraints_work() {
     storage
         .raw()
         .execute(
-            "INSERT INTO agents(slug, name, kind, created_at, updated_at) VALUES('test', 'Test', 'cli', 0, 0)",
+            "INSERT INTO agents(slug, name, kind, created_at, updated_at) VALUES('test', 'Test', 'cli', 0, 0)", &[],
         )
         .expect("first insert");
 
     // Try to insert duplicate slug
     let result = storage.raw().execute(
-        "INSERT INTO agents(slug, name, kind, created_at, updated_at) VALUES('test', 'Test2', 'cli', 0, 0)",
+        "INSERT INTO agents(slug, name, kind, created_at, updated_at) VALUES('test', 'Test2', 'cli', 0, 0)", &[],
     );
 
     assert!(
@@ -1242,7 +700,7 @@ fn sources_table_has_correct_columns() {
 
     let columns: Vec<String> = storage
         .raw()
-        .query_map_collect("PRAGMA table_info(sources)", &[], |r| {
+        .query_all_map("PRAGMA table_info(sources)", &[], |r| {
             r.get_typed::<String>(1)
         })
         .unwrap();
@@ -1257,429 +715,20 @@ fn sources_table_has_correct_columns() {
     assert!(columns.contains(&"updated_at".to_string()));
 }
 
-#[test]
-fn migration_from_v3_requires_rebuild() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let db_path = tmp.path().join("migrate_v3.db");
-
-    // Manually create a v3 database (without sources table)
-    {
-        let conn = open_fixture_db(&db_path);
-        conn.execute_batch(
-            r"
-            PRAGMA foreign_keys = ON;
-
-            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            INSERT INTO meta(key, value) VALUES('schema_version', '3');
-
-            CREATE TABLE agents (
-                id INTEGER PRIMARY KEY,
-                slug TEXT NOT NULL UNIQUE,
-                name TEXT NOT NULL,
-                version TEXT,
-                kind TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
-
-            CREATE TABLE workspaces (
-                id INTEGER PRIMARY KEY,
-                path TEXT NOT NULL UNIQUE,
-                display_name TEXT
-            );
-
-            CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                agent_id INTEGER NOT NULL REFERENCES agents(id),
-                workspace_id INTEGER REFERENCES workspaces(id),
-                external_id TEXT,
-                title TEXT,
-                source_path TEXT NOT NULL,
-                started_at INTEGER,
-                ended_at INTEGER,
-                approx_tokens INTEGER,
-                metadata_json TEXT,
-                UNIQUE(agent_id, external_id)
-            );
-
-            CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-                idx INTEGER NOT NULL,
-                role TEXT NOT NULL,
-                author TEXT,
-                created_at INTEGER,
-                content TEXT NOT NULL,
-                extra_json TEXT,
-                UNIQUE(conversation_id, idx)
-            );
-
-            CREATE TABLE snippets (
-                id INTEGER PRIMARY KEY,
-                message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
-                file_path TEXT,
-                start_line INTEGER,
-                end_line INTEGER,
-                language TEXT,
-                snippet_text TEXT
-            );
-
-            CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
-
-            CREATE TABLE conversation_tags (
-                conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-                tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
-                PRIMARY KEY (conversation_id, tag_id)
-            );
-
-            CREATE INDEX idx_conversations_agent_started ON conversations(agent_id, started_at DESC);
-            CREATE INDEX idx_messages_conv_idx ON messages(conversation_id, idx);
-            CREATE INDEX idx_messages_created ON messages(created_at);
-
-            CREATE VIRTUAL TABLE fts_messages USING fts5(
-                content,
-                title,
-                agent,
-                workspace,
-                source_path,
-                created_at UNINDEXED,
-                message_id UNINDEXED,
-                tokenize='porter'
-            );
-            ",
-        )
-        .expect("create v3 schema");
-    }
-
-    let result = SqliteStorage::open_or_rebuild(&db_path);
-    match result {
-        Err(MigrationError::RebuildRequired {
-            reason,
-            backup_path,
-        }) => {
-            assert!(
-                reason.contains("too old for in-place migration"),
-                "unexpected rebuild reason: {reason}"
-            );
-            assert!(backup_path.is_some(), "legacy schema should be backed up");
-        }
-        Ok(_) => panic!("expected rebuild requirement for v3 schema"),
-        Err(err) => panic!("expected rebuild requirement for v3 schema, got {err}"),
-    }
-    assert!(
-        !db_path.exists(),
-        "legacy v3 database should be removed after rebuild requirement"
-    );
-}
 
 // -------------------------------------------------------------------------
 // P1.5 Migration Safety Tests
 // -------------------------------------------------------------------------
 
-use coding_agent_search::storage::sqlite::{
-    CURRENT_SCHEMA_VERSION, cleanup_old_backups, create_backup, is_user_data_file,
-};
 
-#[test]
-fn is_user_data_file_detects_protected_files() {
-    use std::path::Path;
 
-    // Protected files
-    assert!(is_user_data_file(Path::new("/data/bookmarks.db")));
-    assert!(is_user_data_file(Path::new("/data/tui_state.json")));
-    assert!(is_user_data_file(Path::new("/data/sources.toml")));
-    assert!(is_user_data_file(Path::new("/data/.env")));
 
-    // Not protected
-    assert!(!is_user_data_file(Path::new("/data/agent_search.db")));
-    assert!(!is_user_data_file(Path::new("/data/index")));
-    assert!(!is_user_data_file(Path::new("/data/something.txt")));
-}
 
-#[test]
-fn current_schema_version_matches_internal() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let db_path = tmp.path().join("version.db");
-    let storage = SqliteStorage::open(&db_path).expect("open");
 
-    assert_eq!(
-        storage.schema_version().unwrap(),
-        CURRENT_SCHEMA_VERSION,
-        "CURRENT_SCHEMA_VERSION should match actual schema version"
-    );
-}
 
-#[test]
-fn create_backup_creates_named_copy() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let db_path = tmp.path().join("backup_test.db");
 
-    // Create a database file
-    std::fs::write(&db_path, b"test database content").unwrap();
 
-    // Create backup
-    let backup = create_backup(&db_path).expect("create_backup");
-    assert!(backup.is_some(), "backup should be created");
 
-    let backup_path = backup.unwrap();
-    assert!(backup_path.exists(), "backup file should exist");
-    assert!(
-        backup_path
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .starts_with("backup_test.db.backup."),
-        "backup should have correct name pattern"
-    );
-
-    // Verify content matches
-    let original = std::fs::read(&db_path).unwrap();
-    let backed_up = std::fs::read(&backup_path).unwrap();
-    assert_eq!(original, backed_up, "backup content should match original");
-}
-
-#[test]
-fn create_backup_returns_none_for_nonexistent_file() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let db_path = tmp.path().join("nonexistent.db");
-
-    let backup = create_backup(&db_path).expect("create_backup");
-    assert!(
-        backup.is_none(),
-        "backup should be None for nonexistent file"
-    );
-}
-
-#[test]
-fn cleanup_old_backups_keeps_recent() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let db_path = tmp.path().join("cleanup_test.db");
-
-    // Create 5 backup files with different timestamps
-    for i in 0..5 {
-        let backup_name = format!("cleanup_test.db.backup.{}", 1000 + i);
-        let backup_path = tmp.path().join(&backup_name);
-        std::fs::write(&backup_path, format!("backup {}", i)).unwrap();
-        // Add small delay to ensure different mtimes
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-
-    // Keep only 2
-    cleanup_old_backups(&db_path, 2).expect("cleanup");
-
-    // Count remaining backups
-    let remaining: Vec<_> = std::fs::read_dir(tmp.path())
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_name()
-                .to_str()
-                .map(|n| n.starts_with("cleanup_test.db.backup."))
-                .unwrap_or(false)
-        })
-        .collect();
-
-    assert_eq!(remaining.len(), 2, "should keep only 2 backups");
-}
-
-#[test]
-fn open_or_rebuild_creates_fresh_db() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let db_path = tmp.path().join("fresh.db");
-
-    // Open fresh database
-    let storage = SqliteStorage::open_or_rebuild(&db_path).expect("open_or_rebuild");
-
-    assert_eq!(
-        storage.schema_version().unwrap(),
-        CURRENT_SCHEMA_VERSION,
-        "fresh db should have current schema version"
-    );
-}
-
-#[test]
-fn open_or_rebuild_requires_rebuild_for_legacy_v4_schema() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let db_path = tmp.path().join("migrate.db");
-
-    // Create a v4 database (without provenance columns in conversations)
-    {
-        let conn = open_fixture_db(&db_path);
-        conn.execute_batch(
-            r"
-            PRAGMA foreign_keys = ON;
-            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            INSERT INTO meta(key, value) VALUES('schema_version', '4');
-
-            CREATE TABLE agents (
-                id INTEGER PRIMARY KEY,
-                slug TEXT NOT NULL UNIQUE,
-                name TEXT NOT NULL,
-                version TEXT,
-                kind TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
-
-            CREATE TABLE workspaces (
-                id INTEGER PRIMARY KEY,
-                path TEXT NOT NULL UNIQUE,
-                display_name TEXT
-            );
-
-            CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                agent_id INTEGER NOT NULL REFERENCES agents(id),
-                workspace_id INTEGER REFERENCES workspaces(id),
-                external_id TEXT,
-                title TEXT,
-                source_path TEXT NOT NULL,
-                started_at INTEGER,
-                ended_at INTEGER,
-                approx_tokens INTEGER,
-                metadata_json TEXT,
-                UNIQUE(agent_id, external_id)
-            );
-
-            CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-                idx INTEGER NOT NULL,
-                role TEXT NOT NULL,
-                author TEXT,
-                created_at INTEGER,
-                content TEXT NOT NULL,
-                extra_json TEXT,
-                UNIQUE(conversation_id, idx)
-            );
-
-            CREATE TABLE snippets (
-                id INTEGER PRIMARY KEY,
-                message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
-                file_path TEXT,
-                start_line INTEGER,
-                end_line INTEGER,
-                language TEXT,
-                snippet_text TEXT
-            );
-
-            CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
-
-            CREATE TABLE conversation_tags (
-                conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-                tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
-                PRIMARY KEY (conversation_id, tag_id)
-            );
-
-            CREATE TABLE sources (
-                id TEXT PRIMARY KEY,
-                kind TEXT NOT NULL,
-                host_label TEXT,
-                machine_id TEXT,
-                platform TEXT,
-                config_json TEXT,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
-            INSERT INTO sources (id, kind, host_label, created_at, updated_at)
-            VALUES ('local', 'local', NULL, 0, 0);
-
-            CREATE VIRTUAL TABLE fts_messages USING fts5(
-                content, title, agent, workspace, source_path,
-                created_at UNINDEXED, message_id UNINDEXED,
-                tokenize='porter'
-            );
-            ",
-        )
-        .expect("create v4 schema");
-    }
-
-    // Open with open_or_rebuild - should migrate successfully
-    let result = SqliteStorage::open_or_rebuild(&db_path);
-    match result {
-        Err(MigrationError::RebuildRequired {
-            reason,
-            backup_path,
-        }) => {
-            assert!(
-                reason.contains("too old for in-place migration"),
-                "unexpected rebuild reason: {reason}"
-            );
-            assert!(backup_path.is_some(), "legacy schema should be backed up");
-        }
-        Ok(_) => panic!("expected rebuild requirement for v4 schema"),
-        Err(err) => panic!("expected rebuild requirement for v4 schema, got {err}"),
-    }
-    assert!(
-        !db_path.exists(),
-        "legacy v4 database should be removed after rebuild requirement"
-    );
-}
-
-#[test]
-fn open_or_rebuild_triggers_rebuild_for_future_version() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let db_path = tmp.path().join("future.db");
-
-    // Create a database with a future schema version
-    {
-        let conn = open_fixture_db(&db_path);
-        conn.execute_batch(
-            r"
-            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            INSERT INTO meta(key, value) VALUES('schema_version', '999');
-            ",
-        )
-        .expect("create future schema");
-    }
-
-    // Open with open_or_rebuild - should trigger rebuild
-    let result = SqliteStorage::open_or_rebuild(&db_path);
-
-    match result {
-        Err(MigrationError::RebuildRequired {
-            reason,
-            backup_path,
-        }) => {
-            assert!(
-                reason.contains("999"),
-                "reason should mention future version: {}",
-                reason
-            );
-            assert!(backup_path.is_some(), "backup should be created");
-            let backup = backup_path.unwrap();
-            assert!(backup.exists(), "backup file should exist");
-        }
-        Ok(_) => panic!("should have triggered rebuild for future version"),
-        Err(e) => panic!("unexpected error: {}", e),
-    }
-
-    // Original database should be deleted
-    assert!(!db_path.exists(), "original db should be deleted");
-}
-
-#[test]
-fn open_or_rebuild_handles_corrupted_db() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let db_path = tmp.path().join("corrupt.db");
-
-    // Create a corrupted database file
-    std::fs::write(&db_path, b"this is not a valid sqlite database").unwrap();
-
-    // Open with open_or_rebuild - should trigger rebuild
-    let result = SqliteStorage::open_or_rebuild(&db_path);
-
-    match result {
-        Err(MigrationError::RebuildRequired { backup_path, .. }) => {
-            assert!(backup_path.is_some(), "backup should be created");
-        }
-        Err(_) => {
-            // Also acceptable - database error during check
-        }
-        Ok(_) => panic!("should have failed for corrupted db"),
-    }
-}
 
 // =============================================================================
 // Timeline Source Filtering Tests (P7.8)
@@ -1761,7 +810,7 @@ fn timeline_source_filter_local_only() {
     // Query with source_id = 'local' filter
     let local_only: Vec<String> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT c.external_id FROM conversations c
              WHERE c.source_id = 'local'
              ORDER BY c.started_at DESC",
@@ -1826,7 +875,7 @@ fn timeline_source_filter_remote_only() {
     // Query with source_id != 'local' (remote filter)
     let remote_only: Vec<String> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT c.external_id FROM conversations c
              WHERE c.source_id != 'local'
              ORDER BY c.started_at DESC",
@@ -1898,7 +947,7 @@ fn timeline_source_filter_specific_source() {
     // Query with source_id = 'laptop' (specific source)
     let laptop_only: Vec<String> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT c.external_id FROM conversations c
              WHERE c.source_id = 'laptop'
              ORDER BY c.started_at DESC",
@@ -1953,7 +1002,7 @@ fn timeline_json_includes_source_id_field() {
     // Query with source_id field selection (simulates timeline JSON output)
     let result: Vec<(i64, String)> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT c.id, c.source_id FROM conversations c
              WHERE c.source_id IS NOT NULL",
             &[],
@@ -2018,7 +1067,7 @@ fn timeline_json_includes_origin_kind_field() {
     // Query with origin_kind from sources table (matches timeline SQL)
     let results: Vec<(String, String, String)> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT c.source_id, c.origin_host, s.kind as origin_kind
              FROM conversations c
              LEFT JOIN sources s ON c.source_id = s.id
@@ -2094,7 +1143,7 @@ fn timeline_json_includes_origin_host_field() {
     // Query origin_host field
     let results: Vec<(String, Option<String>)> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT c.source_id, c.origin_host FROM conversations c ORDER BY c.source_id",
             &[],
             |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
@@ -2169,7 +1218,7 @@ fn timeline_json_grouped_output_includes_provenance() {
     // Query all provenance fields as timeline JSON would
     let results: Vec<(i64, String, Option<String>, Option<String>)> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT c.id, c.source_id, c.origin_host, s.kind as origin_kind
              FROM conversations c
              LEFT JOIN sources s ON c.source_id = s.id",
@@ -2220,7 +1269,7 @@ fn daily_stats_table_created_on_fresh_db() {
     // Check that daily_stats table exists
     let tables: Vec<String> = storage
         .raw()
-        .query_map_collect(
+        .query_all_map(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='daily_stats'",
             &[],
             |r| r.get_typed(0),
@@ -2232,7 +1281,7 @@ fn daily_stats_table_created_on_fresh_db() {
     // Check columns
     let columns: Vec<String> = storage
         .raw()
-        .query_map_collect("PRAGMA table_info(daily_stats)", &[], |r| {
+        .query_all_map("PRAGMA table_info(daily_stats)", &[], |r| {
             r.get_typed::<String>(1)
         })
         .unwrap();
@@ -2603,7 +1652,7 @@ fn daily_stats_null_timestamp_consistency() {
     // Check that the session was placed at day_id=0, not a negative day_id
     let day_ids: Vec<i64> = storage
         .raw()
-        .query_map_collect("SELECT DISTINCT day_id FROM daily_stats WHERE agent_slug = 'all' AND source_id = 'all'", &[], |r| r.get_typed(0))
+        .query_all_map("SELECT DISTINCT day_id FROM daily_stats WHERE agent_slug = 'all' AND source_id = 'all'", &[], |r| r.get_typed(0))
         .unwrap();
 
     assert_eq!(day_ids.len(), 1, "should have exactly 1 day_id");
@@ -2746,14 +1795,14 @@ use coding_agent_search::storage::sqlite::IndexingCache;
 fn dump_agent_workspace_state(storage: &SqliteStorage) -> (Vec<(i64, String)>, Vec<(i64, String)>) {
     let agents: Vec<(i64, String)> = storage
         .raw()
-        .query_map_collect("SELECT id, slug FROM agents ORDER BY slug", &[], |r| {
+        .query_all_map("SELECT id, slug FROM agents ORDER BY slug", &[], |r| {
             Ok((r.get_typed(0)?, r.get_typed(1)?))
         })
         .unwrap();
 
     let workspaces: Vec<(i64, String)> = storage
         .raw()
-        .query_map_collect("SELECT id, path FROM workspaces ORDER BY path", &[], |r| {
+        .query_all_map("SELECT id, path FROM workspaces ORDER BY path", &[], |r| {
             Ok((r.get_typed(0)?, r.get_typed(1)?))
         })
         .unwrap();

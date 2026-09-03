@@ -1,13 +1,12 @@
 //! SQL query builders for analytics.
 //!
-//! All functions accept a `&frankensqlite::Connection` and an [`AnalyticsFilter`],
+//! All functions accept a `&storage::api::Conn` and an [`AnalyticsFilter`],
 //! keeping the SQL and bucketing logic in one place for both CLI and ftui.
 
 use std::collections::BTreeMap;
 
-use frankensqlite::Connection;
-use frankensqlite::Row;
-use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
+use crate::storage::api::{Conn as Connection, Row};
+type ParamValue = crate::storage::api::Value;
 
 use super::bucketing;
 use super::types::*;
@@ -23,7 +22,7 @@ pub fn table_exists(conn: &Connection, name: &str) -> bool {
         return false;
     }
     let rows =
-        match conn.query_map_collect(&format!("PRAGMA table_info({})", name), &[], |row: &Row| {
+        match conn.query_all_map(&format!("PRAGMA table_info({})", name), &[], |row: &Row| {
             row.get_typed::<String>(1)
         }) {
             Ok(rows) => rows,
@@ -40,7 +39,7 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> bool {
         return false;
     }
     let rows =
-        match conn.query_map_collect(&format!("PRAGMA table_info({table})"), &[], |row: &Row| {
+        match conn.query_all_map(&format!("PRAGMA table_info({table})"), &[], |row: &Row| {
             row.get_typed::<String>(1)
         }) {
             Ok(rows) => rows,
@@ -1334,7 +1333,7 @@ pub fn query_tokens_timeseries(
     let param_values: Vec<ParamValue> = bind_values.clone();
 
     let raw_buckets: Vec<(i64, UsageBucket)> = conn
-        .query_map_collect(&sql, &param_values, |row: &Row| {
+        .query_all_map(&sql, &param_values, |row: &Row| {
             Ok((
                 row.get_typed::<i64>(0)?,
                 UsageBucket {
@@ -1541,7 +1540,7 @@ fn query_track_a_timeseries_from_raw(
     );
 
     let row_buckets: Vec<(String, String, i64, UsageBucket)> = conn
-        .query_map_collect(&sql, &params, |row: &Row| {
+        .query_all_map(&sql, &params, |row: &Row| {
             // let _conversation_id: i64 = row.get_typed(0)?; // skipped
             let role: String = row.get_typed(1)?;
             let created_at_ms: i64 = row.get_typed(2)?;
@@ -1777,7 +1776,7 @@ fn query_cost_timeseries_from_token_usage(
     );
 
     let raw_rows: Vec<(i64, UsageBucket)> = conn
-        .query_map_collect(&sql, &params, |row: &Row| {
+        .query_all_map(&sql, &params, |row: &Row| {
             let raw_time_value: i64 = row.get_typed(0)?;
             let role: String = row.get_typed(1)?;
             let tool_calls: i64 = row.get_typed(2)?;
@@ -1957,7 +1956,7 @@ pub fn query_cost_timeseries(
     let param_values: Vec<ParamValue> = bind_values.clone();
 
     let raw_buckets: Vec<(i64, UsageBucket)> = conn
-        .query_map_collect(&sql, &param_values, |row: &Row| {
+        .query_all_map(&sql, &param_values, |row: &Row| {
             let day_id: i64 = row.get_typed(0)?;
             let api_call_count: i64 = row.get_typed(1)?;
             let user_msg: i64 = row.get_typed(2)?;
@@ -2171,7 +2170,7 @@ fn query_track_b_breakdown_from_token_usage(
     );
 
     let raw_rows = conn
-        .query_map_collect(&sql, &params, |row: &Row| {
+        .query_all_map(&sql, &params, |row: &Row| {
             let get_i64 = |idx| {
                 row.get_typed::<i64>(idx)
                     .or_else(|_| row.get_typed::<f64>(idx).map(|value| value.round() as i64))
@@ -2386,7 +2385,7 @@ fn query_track_a_breakdown_from_raw(
     );
 
     let row_buckets = conn
-        .query_map_collect(&sql, &params, |row: &Row| {
+        .query_all_map(&sql, &params, |row: &Row| {
             // let _conversation_id: i64 = row.get_typed(0)?; // skipped
             let dim_key: String = row.get_typed(1)?;
             let role: String = row.get_typed(2)?;
@@ -2770,7 +2769,7 @@ fn read_breakdown_rows_track_a(
     metric: &Metric,
 ) -> AnalyticsResult<Vec<BreakdownRow>> {
     let raw_rows = conn
-        .query_map_collect(sql, params, |row: &Row| {
+        .query_all_map(sql, params, |row: &Row| {
             let key: String = row.get_typed(0)?;
             let bucket = UsageBucket {
                 message_count: row.get_typed(1)?,
@@ -2825,7 +2824,7 @@ fn read_breakdown_rows_track_b(
     metric: &Metric,
 ) -> AnalyticsResult<Vec<BreakdownRow>> {
     let raw_rows = conn
-        .query_map_collect(sql, params, |row: &Row| {
+        .query_all_map(sql, params, |row: &Row| {
             let key: String = row.get_typed(0)?;
             let api_call_count: i64 = row.get_typed(1)?;
             let user_message_count: i64 = row.get_typed(2)?;
@@ -2999,7 +2998,7 @@ fn query_tools_from_raw(
     );
 
     let raw_rows = conn
-        .query_map_collect(&sql, &params, |row: &Row| {
+        .query_all_map(&sql, &params, |row: &Row| {
             // let _conversation_id: i64 = row.get_typed(0)?; // skipped
             let key: String = row.get_typed(1)?;
             let tool_call_count: i64 = row.get_typed(2)?;
@@ -3178,7 +3177,7 @@ pub fn query_tools(
     let param_values: Vec<ParamValue> = bind_values.clone();
 
     let tool_rows = conn
-        .query_map_collect(&sql, &param_values, |row: &Row| {
+        .query_all_map(&sql, &param_values, |row: &Row| {
             let key: String = row.get_typed(0)?;
             let tool_call_count: i64 = row.get_typed(1)?;
             let message_count: i64 = row.get_typed(2)?;
@@ -3476,7 +3475,7 @@ pub fn query_session_scatter(
     let param_values: Vec<ParamValue> = bind_values.clone();
 
     let points = conn
-        .query_map_collect(&sql, &param_values, |row: &Row| {
+        .query_all_map(&sql, &param_values, |row: &Row| {
             Ok(SessionScatterPoint {
                 source_id: row.get_typed(0)?,
                 source_path: row.get_typed(1)?,
@@ -3540,7 +3539,7 @@ pub fn query_unpriced_models(
     };
 
     let models: Vec<UnpricedModel> = conn
-        .query_map_collect(
+        .query_all_map(
             &models_sql,
             &[ParamValue::from(limit as i64)],
             |row: &Row| {
@@ -3737,7 +3736,7 @@ mod tests {
 
     /// Create an in-memory database with the usage_daily schema and seed data.
     fn setup_usage_daily_db() -> Connection {
-        let conn = Connection::open(":memory:").unwrap();
+        let conn = Connection::open_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE usage_daily (
                 day_id INTEGER NOT NULL,
@@ -3826,7 +3825,7 @@ mod tests {
         ];
 
         for r in &rows {
-            conn.execute_compat(
+            conn.execute(
                 "INSERT INTO usage_daily (day_id, agent_slug, workspace_id, source_id,
                     message_count, user_message_count, assistant_message_count,
                     tool_call_count, plan_message_count, api_coverage_message_count,
@@ -3835,7 +3834,7 @@ mod tests {
                     api_cache_read_tokens_total, api_cache_creation_tokens_total,
                     api_thinking_tokens_total)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
-                frankensqlite::params![
+                &crate::storage::api::params![
                     r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7, r.8, r.9, r.10, r.11, r.12, r.13, r.14,
                     r.15, r.16, r.17, r.18
                 ],
@@ -3849,7 +3848,7 @@ mod tests {
     #[allow(dead_code)]
     /// Legacy Track A schema fixture (pre plan-token rollup columns).
     fn setup_usage_daily_legacy_db() -> Connection {
-        let conn = Connection::open(":memory:").unwrap();
+        let conn = Connection::open_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE usage_daily (
                 day_id INTEGER NOT NULL,
@@ -3886,7 +3885,7 @@ mod tests {
     }
 
     fn setup_usage_hourly_db() -> Connection {
-        let conn = Connection::open(":memory:").unwrap();
+        let conn = Connection::open_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE usage_hourly (
                 hour_id INTEGER NOT NULL,
@@ -3916,7 +3915,7 @@ mod tests {
         )
         .unwrap();
 
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO usage_hourly (
                 hour_id, agent_slug, workspace_id, source_id,
                 message_count, user_message_count, assistant_message_count,
@@ -3935,11 +3934,11 @@ mod tests {
                  1200, 500, 700,
                  1400, 700, 550, 100, 25, 25,
                  ?2)",
-            frankensqlite::params![1000_i64, 1_i64],
+            &crate::storage::api::params![1000_i64, 1_i64],
         )
         .unwrap();
 
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO usage_hourly (
                 hour_id, agent_slug, workspace_id, source_id,
                 message_count, user_message_count, assistant_message_count,
@@ -3958,14 +3957,14 @@ mod tests {
                  2200, 900, 1300,
                  2600, 1300, 1000, 200, 50, 50,
                  ?2)",
-            frankensqlite::params![1001_i64, 2_i64],
+            &crate::storage::api::params![1001_i64, 2_i64],
         )
         .unwrap();
         conn
     }
 
     fn setup_tools_remote_source_fallback_db() -> Connection {
-        let conn = Connection::open(":memory:").unwrap();
+        let conn = Connection::open_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE agents (
                 id INTEGER PRIMARY KEY,
@@ -4025,32 +4024,32 @@ mod tests {
         )
         .unwrap();
 
-        conn.execute("INSERT INTO agents (id, slug) VALUES (1, 'codex')")
+        conn.execute("INSERT INTO agents (id, slug) VALUES (1, 'codex')", &[])
             .unwrap();
-        conn.execute("INSERT INTO agents (id, slug) VALUES (2, 'claude_code')")
+        conn.execute("INSERT INTO agents (id, slug) VALUES (2, 'claude_code')", &[])
             .unwrap();
 
         conn.execute(
             "INSERT INTO conversations
              (id, agent_id, workspace_id, source_id, origin_host, source_path, started_at)
-             VALUES (1, 1, 1, 'local', '', '/sessions/local.jsonl', 1700000000000)",
+             VALUES (1, 1, 1, 'local', '', '/sessions/local.jsonl', 1700000000000)", &[],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO conversations
              (id, agent_id, workspace_id, source_id, origin_host, source_path, started_at)
-             VALUES (2, 2, 2, '   ', 'remote-ci', '/sessions/remote.jsonl', 1700000001000)",
+             VALUES (2, 2, 2, '   ', 'remote-ci', '/sessions/remote.jsonl', 1700000001000)", &[],
         )
         .unwrap();
 
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, created_at, content)
-             VALUES (11, 1, 0, 'assistant', 1700000000000, 'local tool')",
+             VALUES (11, 1, 0, 'assistant', 1700000000000, 'local tool')", &[],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, created_at, content)
-             VALUES (21, 2, 0, 'assistant', 1700000001000, 'remote tool')",
+             VALUES (21, 2, 0, 'assistant', 1700000001000, 'remote tool')", &[],
         )
         .unwrap();
 
@@ -4059,7 +4058,7 @@ mod tests {
              (message_id, created_at_ms, tool_call_count, content_tokens_est,
               api_input_tokens, api_output_tokens, api_cache_read_tokens,
               api_cache_creation_tokens, api_thinking_tokens)
-             VALUES (11, 1700000000000, 2, 30, 10, 20, 0, 0, 0)",
+             VALUES (11, 1700000000000, 2, 30, 10, 20, 0, 0, 0)", &[],
         )
         .unwrap();
         conn.execute(
@@ -4067,7 +4066,7 @@ mod tests {
              (message_id, created_at_ms, tool_call_count, content_tokens_est,
               api_input_tokens, api_output_tokens, api_cache_read_tokens,
               api_cache_creation_tokens, api_thinking_tokens)
-             VALUES (21, 1700000001000, 7, 90, 30, 70, 0, 0, 0)",
+             VALUES (21, 1700000001000, 7, 90, 30, 70, 0, 0, 0)", &[],
         )
         .unwrap();
 
@@ -4077,7 +4076,7 @@ mod tests {
               assistant_message_count, tool_call_count, content_tokens_est_total,
               content_tokens_est_assistant, api_tokens_total, api_input_tokens_total,
               api_output_tokens_total, last_updated)
-             VALUES (20250, 'codex', 1, 'local', 1, 1, 2, 30, 30, 30, 10, 20, 1)",
+             VALUES (20250, 'codex', 1, 'local', 1, 1, 2, 30, 30, 30, 10, 20, 1)", &[],
         )
         .unwrap();
         conn.execute(
@@ -4086,7 +4085,7 @@ mod tests {
               assistant_message_count, tool_call_count, content_tokens_est_total,
               content_tokens_est_assistant, api_tokens_total, api_input_tokens_total,
               api_output_tokens_total, last_updated)
-             VALUES (20250, 'claude_code', 2, '   ', 1, 1, 7, 90, 90, 100, 30, 70, 1)",
+             VALUES (20250, 'claude_code', 2, '   ', 1, 1, 7, 90, 90, 100, 30, 70, 1)", &[],
         )
         .unwrap();
 
@@ -4095,7 +4094,7 @@ mod tests {
 
     /// Create an in-memory database with the token_daily_stats schema and seed data.
     fn setup_token_daily_stats_db() -> Connection {
-        let conn = Connection::open(":memory:").unwrap();
+        let conn = Connection::open_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE token_daily_stats (
                 day_id INTEGER NOT NULL,
@@ -4127,17 +4126,17 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO token_daily_stats VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
-            frankensqlite::params![20250, "claude_code", "local", "opus", 80, 40, 40, 5, 30000, 25000, 3000, 1500, 500, 60000, 160000, 20, 1.50, 3, now],
+            &crate::storage::api::params![20250, "claude_code", "local", "opus", 80, 40, 40, 5, 30000, 25000, 3000, 1500, 500, 60000, 160000, 20, 1.50, 3, now],
         ).unwrap();
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO token_daily_stats VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
-            frankensqlite::params![20250, "claude_code", "local", "sonnet", 40, 20, 20, 2, 10000, 8000, 1000, 500, 200, 19700, 80000, 8, 0.40, 2, now],
+            &crate::storage::api::params![20250, "claude_code", "local", "sonnet", 40, 20, 20, 2, 10000, 8000, 1000, 500, 200, 19700, 80000, 8, 0.40, 2, now],
         ).unwrap();
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO token_daily_stats VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
-            frankensqlite::params![20250, "codex", "local", "gpt-4o", 50, 25, 25, 3, 15000, 12000, 2000, 800, 0, 29800, 100000, 10, 0.80, 1, now],
+            &crate::storage::api::params![20250, "codex", "local", "gpt-4o", 50, 25, 25, 3, 15000, 12000, 2000, 800, 0, 29800, 100000, 10, 0.80, 1, now],
         ).unwrap();
 
         conn
@@ -4147,7 +4146,7 @@ mod tests {
         hourly_last_updated: i64,
         track_b_last_updated: i64,
     ) -> Connection {
-        let conn = Connection::open(":memory:").unwrap();
+        let conn = Connection::open_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE usage_hourly (
                 hour_id INTEGER NOT NULL,
@@ -4160,14 +4159,14 @@ mod tests {
         )
         .unwrap();
 
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO usage_hourly (hour_id, last_updated) VALUES (?1, ?2)",
-            frankensqlite::params![123_i64, hourly_last_updated],
+            &crate::storage::api::params![123_i64, hourly_last_updated],
         )
         .unwrap();
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO token_daily_stats (day_id, last_updated) VALUES (?1, ?2)",
-            frankensqlite::params![456_i64, track_b_last_updated],
+            &crate::storage::api::params![456_i64, track_b_last_updated],
         )
         .unwrap();
 
@@ -4175,7 +4174,7 @@ mod tests {
     }
 
     fn setup_session_scatter_db() -> Connection {
-        let conn = Connection::open(":memory:").unwrap();
+        let conn = Connection::open_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE agents (
                 id INTEGER PRIMARY KEY,
@@ -4210,80 +4209,80 @@ mod tests {
         )
         .unwrap();
 
-        conn.execute("INSERT INTO agents (id, slug) VALUES (1, 'codex')")
+        conn.execute("INSERT INTO agents (id, slug) VALUES (1, 'codex')", &[])
             .unwrap();
-        conn.execute("INSERT INTO agents (id, slug) VALUES (2, 'claude_code')")
+        conn.execute("INSERT INTO agents (id, slug) VALUES (2, 'claude_code')", &[])
             .unwrap();
 
         conn.execute(
             "INSERT INTO conversations
              (id, agent_id, workspace_id, source_id, source_path, started_at, grand_total_tokens)
-             VALUES (1, 1, 10, 'local', '/sessions/a.jsonl', 1700000000000, 1000)",
+             VALUES (1, 1, 10, 'local', '/sessions/a.jsonl', 1700000000000, 1000)", &[],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO conversations
              (id, agent_id, workspace_id, source_id, source_path, started_at, grand_total_tokens)
-             VALUES (2, 2, 20, 'remote-ci', '/sessions/b.jsonl', 1700000000000, 2300)",
+             VALUES (2, 2, 20, 'remote-ci', '/sessions/b.jsonl', 1700000000000, 2300)", &[],
         )
         .unwrap();
 
         // Session A: 2 messages, total api tokens = 1000.
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, created_at, content)
-             VALUES (11, 1, 0, 'user', 1700000001000, 'a1')",
+             VALUES (11, 1, 0, 'user', 1700000001000, 'a1')", &[],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, created_at, content)
-             VALUES (12, 1, 1, 'assistant', 1700000002000, 'a2')",
+             VALUES (12, 1, 1, 'assistant', 1700000002000, 'a2')", &[],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO message_metrics
              (message_id, api_input_tokens, api_output_tokens, api_cache_read_tokens, api_cache_creation_tokens, api_thinking_tokens)
-             VALUES (11, 200, 250, 0, 0, 50)",
+             VALUES (11, 200, 250, 0, 0, 50)", &[],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO message_metrics
              (message_id, api_input_tokens, api_output_tokens, api_cache_read_tokens, api_cache_creation_tokens, api_thinking_tokens)
-             VALUES (12, 200, 300, 0, 0, 0)",
+             VALUES (12, 200, 300, 0, 0, 0)", &[],
         )
         .unwrap();
 
         // Session B: 3 messages, total api tokens = 2300.
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, created_at, content)
-             VALUES (21, 2, 0, 'user', 1700000001000, 'b1')",
+             VALUES (21, 2, 0, 'user', 1700000001000, 'b1')", &[],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, created_at, content)
-             VALUES (22, 2, 1, 'assistant', 1700000002000, 'b2')",
+             VALUES (22, 2, 1, 'assistant', 1700000002000, 'b2')", &[],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, created_at, content)
-             VALUES (23, 2, 2, 'assistant', 1700000003000, 'b3')",
+             VALUES (23, 2, 2, 'assistant', 1700000003000, 'b3')", &[],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO message_metrics
              (message_id, api_input_tokens, api_output_tokens, api_cache_read_tokens, api_cache_creation_tokens, api_thinking_tokens)
-             VALUES (21, 300, 500, 0, 0, 0)",
+             VALUES (21, 300, 500, 0, 0, 0)", &[],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO message_metrics
              (message_id, api_input_tokens, api_output_tokens, api_cache_read_tokens, api_cache_creation_tokens, api_thinking_tokens)
-             VALUES (22, 500, 500, 0, 0, 0)",
+             VALUES (22, 500, 500, 0, 0, 0)", &[],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO message_metrics
              (message_id, api_input_tokens, api_output_tokens, api_cache_read_tokens, api_cache_creation_tokens, api_thinking_tokens)
-             VALUES (23, 200, 300, 0, 0, 0)",
+             VALUES (23, 200, 300, 0, 0, 0)", &[],
         )
         .unwrap();
 
@@ -4301,7 +4300,7 @@ mod tests {
         .unwrap();
 
         // Keep message 11 with concrete API split from message_metrics.
-        conn.execute("INSERT INTO token_usage (message_id, total_tokens) VALUES (11, 999)")
+        conn.execute("INSERT INTO token_usage (message_id, total_tokens) VALUES (11, 999)", &[])
             .unwrap();
         // Message 12 has message_metrics row but no API split; token_usage should be used.
         conn.execute(
@@ -4311,10 +4310,10 @@ mod tests {
                  api_cache_read_tokens = NULL,
                  api_cache_creation_tokens = NULL,
                  api_thinking_tokens = NULL
-             WHERE message_id = 12",
+             WHERE message_id = 12", &[],
         )
         .unwrap();
-        conn.execute("INSERT INTO token_usage (message_id, total_tokens) VALUES (12, 900)")
+        conn.execute("INSERT INTO token_usage (message_id, total_tokens) VALUES (12, 900)", &[])
             .unwrap();
 
         conn
@@ -4322,21 +4321,21 @@ mod tests {
 
     fn setup_session_scatter_with_api_source_column_db() -> Connection {
         let conn = setup_session_scatter_with_token_usage_fallback_db();
-        conn.execute("ALTER TABLE message_metrics ADD COLUMN api_data_source TEXT")
+        conn.execute("ALTER TABLE message_metrics ADD COLUMN api_data_source TEXT", &[])
             .unwrap();
         // Mark only session A rows as explicit API rows; keep session B rows NULL
         // to simulate legacy records after schema migration.
         conn.execute(
             "UPDATE message_metrics
              SET api_data_source = 'api'
-             WHERE message_id IN (11, 12)",
+             WHERE message_id IN (11, 12)", &[],
         )
         .unwrap();
         conn
     }
 
     fn setup_duplicate_message_metrics_raw_db() -> Connection {
-        let conn = Connection::open(":memory:").unwrap();
+        let conn = Connection::open_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE agents (
                 id INTEGER PRIMARY KEY,
@@ -4377,22 +4376,22 @@ mod tests {
         )
         .unwrap();
 
-        conn.execute("INSERT INTO agents (id, slug) VALUES (1, 'codex')")
+        conn.execute("INSERT INTO agents (id, slug) VALUES (1, 'codex')", &[])
             .unwrap();
         conn.execute(
             "INSERT INTO conversations
              (id, agent_id, workspace_id, source_id, source_path, started_at, grand_total_tokens)
-             VALUES (1, 1, 10, 'local', '/sessions/dup.jsonl', 1700000000000, 1200)",
+             VALUES (1, 1, 10, 'local', '/sessions/dup.jsonl', 1700000000000, 1200)", &[],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, created_at, content)
-             VALUES (11, 1, 0, 'user', 1700000001000, 'dup-a')",
+             VALUES (11, 1, 0, 'user', 1700000001000, 'dup-a')", &[],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, created_at, content)
-             VALUES (12, 1, 1, 'assistant', 1700000002000, 'dup-b')",
+             VALUES (12, 1, 1, 'assistant', 1700000002000, 'dup-b')", &[],
         )
         .unwrap();
         conn.execute_batch(
@@ -4411,7 +4410,7 @@ mod tests {
     }
 
     fn setup_status_filter_db() -> Connection {
-        let conn = Connection::open(":memory:").unwrap();
+        let conn = Connection::open_memory().unwrap();
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -4542,39 +4541,39 @@ mod tests {
         )
         .unwrap();
 
-        conn.execute("INSERT INTO agents (id, slug) VALUES (1, 'codex')")
+        conn.execute("INSERT INTO agents (id, slug) VALUES (1, 'codex')", &[])
             .unwrap();
-        conn.execute("INSERT INTO agents (id, slug) VALUES (2, 'claude_code')")
+        conn.execute("INSERT INTO agents (id, slug) VALUES (2, 'claude_code')", &[])
             .unwrap();
 
         conn.execute(&format!(
             "INSERT INTO conversations (id, agent_id, workspace_id, source_id, source_path, started_at)
              VALUES (1, 1, 1, 'local', '/sessions/a.jsonl', {day10_ms})"
-        ))
+        ), &[])
         .unwrap();
         conn.execute(&format!(
             "INSERT INTO conversations (id, agent_id, workspace_id, source_id, source_path, started_at)
              VALUES (2, 2, 2, 'remote-ci', '/sessions/b.jsonl', {day11_ms})"
-        ))
+        ), &[])
         .unwrap();
 
         conn.execute(&format!(
             "INSERT INTO messages (id, conversation_id, idx, role, created_at, content)
              VALUES (11, 1, 0, 'user', {}, 'a1')",
             day10_ms + 100,
-        ))
+        ), &[])
         .unwrap();
         conn.execute(&format!(
             "INSERT INTO messages (id, conversation_id, idx, role, created_at, content)
              VALUES (12, 1, 1, 'assistant', {}, 'a2')",
             day10_ms + 200,
-        ))
+        ), &[])
         .unwrap();
         conn.execute(&format!(
             "INSERT INTO messages (id, conversation_id, idx, role, created_at, content)
              VALUES (21, 2, 0, 'assistant', {}, 'b1')",
             day11_ms + 100,
-        ))
+        ), &[])
         .unwrap();
 
         conn.execute_batch(
@@ -4627,7 +4626,7 @@ mod tests {
     }
 
     fn setup_legacy_status_filter_db_without_message_metrics_created_at() -> Connection {
-        let conn = Connection::open(":memory:").unwrap();
+        let conn = Connection::open_memory().unwrap();
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -4720,24 +4719,24 @@ mod tests {
         )
         .unwrap();
 
-        conn.execute("INSERT INTO agents (id, slug) VALUES (1, 'codex')")
+        conn.execute("INSERT INTO agents (id, slug) VALUES (1, 'codex')", &[])
             .unwrap();
         conn.execute(&format!(
             "INSERT INTO conversations (id, agent_id, workspace_id, source_id, source_path, started_at)
              VALUES (1, 1, 1, 'local', '/sessions/legacy-a.jsonl', {day10_ms})"
-        ))
+        ), &[])
         .unwrap();
         conn.execute(&format!(
             "INSERT INTO messages (id, conversation_id, idx, role, created_at, content)
              VALUES (11, 1, 0, 'user', {}, 'legacy-a1')",
             day10_ms + 100,
-        ))
+        ), &[])
         .unwrap();
         conn.execute(&format!(
             "INSERT INTO messages (id, conversation_id, idx, role, created_at, content)
              VALUES (12, 1, 1, 'assistant', {}, 'legacy-a2')",
             day10_ms + 200,
-        ))
+        ), &[])
         .unwrap();
 
         conn.execute_batch(
@@ -4898,7 +4897,7 @@ mod tests {
              VALUES
                 (11, 1, 1, 1, 'local', {}, 10, NULL, 'gpt-4o', 12, 'estimated')",
             day10_ms + 100
-        ))
+        ), &[])
         .unwrap();
 
         let filter = AnalyticsFilter {
@@ -4920,7 +4919,7 @@ mod tests {
     fn query_status_blank_duplicate_token_usage_data_source_does_not_override_estimated() {
         let conn = setup_status_filter_db();
         let day11_ms = crate::storage::sqlite::FrankenStorage::millis_from_day_id(11);
-        conn.execute("UPDATE token_usage SET data_source = 'estimated' WHERE message_id = 21")
+        conn.execute("UPDATE token_usage SET data_source = 'estimated' WHERE message_id = 21", &[])
             .unwrap();
         conn.execute(&format!(
             "INSERT INTO token_usage
@@ -4929,7 +4928,7 @@ mod tests {
              VALUES
                 (21, 2, 2, 2, 'remote-ci', {}, 11, NULL, 'claude', 11, '   ')",
             day11_ms + 100
-        ))
+        ), &[])
         .unwrap();
 
         let filter = AnalyticsFilter {
@@ -4990,17 +4989,17 @@ mod tests {
         conn.execute(&format!(
             "UPDATE messages SET created_at = {} WHERE conversation_id = 1",
             day10_ms + 10_000
-        ))
+        ), &[])
         .unwrap();
         conn.execute(&format!(
             "UPDATE message_metrics SET created_at_ms = {} WHERE agent_slug = 'codex'",
             day10_ms + 10_000
-        ))
+        ), &[])
         .unwrap();
         conn.execute(&format!(
             "UPDATE token_usage SET timestamp_ms = {} WHERE agent_id = 1",
             day10_ms + 10_000
-        ))
+        ), &[])
         .unwrap();
 
         let filter = AnalyticsFilter {
@@ -5028,17 +5027,17 @@ mod tests {
         conn.execute(&format!(
             "UPDATE messages SET created_at = {} WHERE id = 12",
             day10_ms + 10_000
-        ))
+        ), &[])
         .unwrap();
         conn.execute(&format!(
             "UPDATE message_metrics SET created_at_ms = {} WHERE message_id = 12",
             day10_ms + 10_000
-        ))
+        ), &[])
         .unwrap();
         conn.execute(&format!(
             "UPDATE token_usage SET timestamp_ms = {}, model_name = NULL, data_source = 'estimated' WHERE message_id = 12",
             day10_ms + 10_000
-        ))
+        ), &[])
         .unwrap();
 
         let filter = AnalyticsFilter {
@@ -5063,7 +5062,7 @@ mod tests {
     #[test]
     fn query_status_uses_message_metrics_timestamp_when_message_created_at_missing() {
         let conn = setup_status_filter_db();
-        conn.execute("UPDATE messages SET created_at = NULL WHERE conversation_id = 1")
+        conn.execute("UPDATE messages SET created_at = NULL WHERE conversation_id = 1", &[])
             .unwrap();
 
         let day10_ms = crate::storage::sqlite::FrankenStorage::millis_from_day_id(10);
@@ -5089,7 +5088,7 @@ mod tests {
         conn.execute(&format!(
             "UPDATE messages SET created_at = {} WHERE conversation_id = 1",
             day10_ms + 10_000
-        ))
+        ), &[])
         .unwrap();
 
         let filter = AnalyticsFilter {
@@ -5114,12 +5113,12 @@ mod tests {
     {
         let conn = setup_legacy_status_filter_db_without_message_metrics_created_at();
         let day10_ms = crate::storage::sqlite::FrankenStorage::millis_from_day_id(10);
-        conn.execute("UPDATE messages SET created_at = NULL WHERE conversation_id = 1")
+        conn.execute("UPDATE messages SET created_at = NULL WHERE conversation_id = 1", &[])
             .unwrap();
         conn.execute(&format!(
             "UPDATE conversations SET started_at = {} WHERE id = 1",
             day10_ms + 10_000
-        ))
+        ), &[])
         .unwrap();
 
         let filter = AnalyticsFilter {
@@ -5146,7 +5145,7 @@ mod tests {
         conn.execute(&format!(
             "UPDATE conversations SET started_at = {} WHERE id = 1",
             day10_ms + 10_000
-        ))
+        ), &[])
         .unwrap();
 
         let filter = AnalyticsFilter {
@@ -5174,7 +5173,7 @@ mod tests {
         conn.execute(&format!(
             "UPDATE conversations SET started_at = {} WHERE id = 1",
             day10_ms + 10_000
-        ))
+        ), &[])
         .unwrap();
 
         let filter = AnalyticsFilter {
@@ -5201,7 +5200,7 @@ mod tests {
         conn.execute(&format!(
             "UPDATE conversations SET started_at = {} WHERE id = 1",
             day10_ms + 10_000
-        ))
+        ), &[])
         .unwrap();
 
         let filter = AnalyticsFilter {
@@ -5241,24 +5240,24 @@ mod tests {
     #[test]
     fn query_status_source_filter_matches_blank_remote_raw_source_ids_via_origin_host() {
         let conn = setup_status_filter_db();
-        conn.execute("ALTER TABLE conversations ADD COLUMN origin_host TEXT")
+        conn.execute("ALTER TABLE conversations ADD COLUMN origin_host TEXT", &[])
             .unwrap();
         conn.execute(
-            "UPDATE conversations SET source_id = '   ', origin_host = 'remote-ci' WHERE id = 2",
+            "UPDATE conversations SET source_id = '   ', origin_host = 'remote-ci' WHERE id = 2", &[],
         )
         .unwrap();
         conn.execute(
-            "UPDATE message_metrics SET source_id = '   ' WHERE agent_slug = 'claude_code'",
+            "UPDATE message_metrics SET source_id = '   ' WHERE agent_slug = 'claude_code'", &[],
         )
         .unwrap();
-        conn.execute("UPDATE usage_hourly SET source_id = '   ' WHERE agent_slug = 'claude_code'")
+        conn.execute("UPDATE usage_hourly SET source_id = '   ' WHERE agent_slug = 'claude_code'", &[])
             .unwrap();
-        conn.execute("UPDATE usage_daily SET source_id = '   ' WHERE agent_slug = 'claude_code'")
+        conn.execute("UPDATE usage_daily SET source_id = '   ' WHERE agent_slug = 'claude_code'", &[])
             .unwrap();
-        conn.execute("UPDATE token_usage SET source_id = '   ' WHERE conversation_id = 2")
+        conn.execute("UPDATE token_usage SET source_id = '   ' WHERE conversation_id = 2", &[])
             .unwrap();
         conn.execute(
-            "UPDATE token_daily_stats SET source_id = '   ' WHERE agent_slug = 'claude_code'",
+            "UPDATE token_daily_stats SET source_id = '   ' WHERE agent_slug = 'claude_code'", &[],
         )
         .unwrap();
 
@@ -5297,9 +5296,9 @@ mod tests {
     #[test]
     fn query_breakdown_by_agent_coalesces_trimmed_and_blank_agent_slugs() {
         let conn = setup_usage_daily_db();
-        conn.execute("UPDATE usage_daily SET agent_slug = '  codex  ' WHERE agent_slug = 'codex'")
+        conn.execute("UPDATE usage_daily SET agent_slug = '  codex  ' WHERE agent_slug = 'codex'", &[])
             .unwrap();
-        conn.execute("UPDATE usage_daily SET agent_slug = '   ' WHERE agent_slug = 'aider'")
+        conn.execute("UPDATE usage_daily SET agent_slug = '   ' WHERE agent_slug = 'aider'", &[])
             .unwrap();
 
         let result = query_breakdown(
@@ -5327,7 +5326,7 @@ mod tests {
                  WHEN 'claude_code' THEN 10
                  WHEN 'codex' THEN message_count
                  ELSE api_coverage_message_count
-             END",
+             END", &[],
         )
         .unwrap();
 
@@ -5379,7 +5378,7 @@ mod tests {
     #[test]
     fn query_breakdown_by_source_coalesces_trimmed_local_ids() {
         let conn = setup_usage_daily_db();
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO usage_daily (day_id, agent_slug, workspace_id, source_id,
                 message_count, user_message_count, assistant_message_count,
                 tool_call_count, plan_message_count, api_coverage_message_count,
@@ -5388,7 +5387,7 @@ mod tests {
                 api_cache_read_tokens_total, api_cache_creation_tokens_total,
                 api_thinking_tokens_total)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
-            frankensqlite::params![
+            &crate::storage::api::params![
                 20252,
                 "cursor",
                 3,
@@ -5437,9 +5436,9 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO token_daily_stats VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
-            frankensqlite::params![20251, "cursor", "  LOCAL  ", "sonnet", 10, 5, 5, 1, 1500, 1200, 0, 0, 0, 2700, 9000, 1, 0.25, 1, now],
+            &crate::storage::api::params![20251, "cursor", "  LOCAL  ", "sonnet", 10, 5, 5, 1, 1500, 1200, 0, 0, 0, 2700, 9000, 1, 0.25, 1, now],
         )
         .unwrap();
 
@@ -5464,9 +5463,9 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO token_daily_stats VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
-            frankensqlite::params![20250, "claude_code", "remote-ci", "sonnet", 5, 2, 3, 1, 1200, 900, 0, 0, 0, 2100, 6000, 1, 0.6, 1, now],
+            &crate::storage::api::params![20250, "claude_code", "remote-ci", "sonnet", 5, 2, 3, 1, 1200, 900, 0, 0, 0, 2100, 6000, 1, 0.6, 1, now],
         )
         .unwrap();
 
@@ -5487,13 +5486,13 @@ mod tests {
     fn query_breakdown_by_source_message_count_recovers_blank_remote_usage_daily_source_via_origin_host()
      {
         let conn = setup_status_filter_db();
-        conn.execute("ALTER TABLE conversations ADD COLUMN origin_host TEXT")
+        conn.execute("ALTER TABLE conversations ADD COLUMN origin_host TEXT", &[])
             .unwrap();
         conn.execute(
-            "UPDATE conversations SET source_id = '   ', origin_host = 'remote-ci' WHERE id = 2",
+            "UPDATE conversations SET source_id = '   ', origin_host = 'remote-ci' WHERE id = 2", &[],
         )
         .unwrap();
-        conn.execute("UPDATE usage_daily SET source_id = '   ' WHERE agent_slug = 'claude_code'")
+        conn.execute("UPDATE usage_daily SET source_id = '   ' WHERE agent_slug = 'claude_code'", &[])
             .unwrap();
 
         let result = query_breakdown(
@@ -5525,16 +5524,16 @@ mod tests {
     fn query_breakdown_by_source_api_total_matches_blank_remote_usage_daily_source_via_origin_host()
     {
         let conn = setup_status_filter_db();
-        conn.execute("ALTER TABLE conversations ADD COLUMN origin_host TEXT")
+        conn.execute("ALTER TABLE conversations ADD COLUMN origin_host TEXT", &[])
             .unwrap();
         conn.execute(
-            "UPDATE conversations SET source_id = '   ', origin_host = 'remote-ci' WHERE id = 2",
+            "UPDATE conversations SET source_id = '   ', origin_host = 'remote-ci' WHERE id = 2", &[],
         )
         .unwrap();
-        conn.execute("UPDATE usage_daily SET source_id = '   ' WHERE agent_slug = 'claude_code'")
+        conn.execute("UPDATE usage_daily SET source_id = '   ' WHERE agent_slug = 'claude_code'", &[])
             .unwrap();
         conn.execute(
-            "UPDATE message_metrics SET api_input_tokens = 13, api_output_tokens = 7, api_data_source = 'api' WHERE message_id = 21",
+            "UPDATE message_metrics SET api_input_tokens = 13, api_output_tokens = 7, api_data_source = 'api' WHERE message_id = 21", &[],
         )
         .unwrap();
 
@@ -5556,20 +5555,20 @@ mod tests {
     fn query_breakdown_source_with_cost_metric_source_filter_matches_blank_remote_token_usage_source_via_origin_host()
      {
         let conn = setup_status_filter_db();
-        conn.execute("ALTER TABLE conversations ADD COLUMN origin_host TEXT")
+        conn.execute("ALTER TABLE conversations ADD COLUMN origin_host TEXT", &[])
             .unwrap();
-        conn.execute("ALTER TABLE token_usage ADD COLUMN estimated_cost_usd REAL")
+        conn.execute("ALTER TABLE token_usage ADD COLUMN estimated_cost_usd REAL", &[])
             .unwrap();
         conn.execute(
-            "UPDATE conversations SET source_id = '   ', origin_host = 'remote-ci' WHERE id = 2",
+            "UPDATE conversations SET source_id = '   ', origin_host = 'remote-ci' WHERE id = 2", &[],
         )
         .unwrap();
         conn.execute(
-        "UPDATE token_usage SET source_id = '   ', estimated_cost_usd = 0.4 WHERE conversation_id = 2",
+        "UPDATE token_usage SET source_id = '   ', estimated_cost_usd = 0.4 WHERE conversation_id = 2", &[],
     )
     .unwrap();
         conn.execute(
-            "UPDATE token_daily_stats SET source_id = '   ' WHERE agent_slug = 'claude_code'",
+            "UPDATE token_daily_stats SET source_id = '   ' WHERE agent_slug = 'claude_code'", &[],
         )
         .unwrap();
 
@@ -5591,20 +5590,20 @@ mod tests {
     fn query_breakdown_agent_with_cost_metric_source_filter_matches_blank_remote_token_usage_source_via_origin_host()
      {
         let conn = setup_status_filter_db();
-        conn.execute("ALTER TABLE conversations ADD COLUMN origin_host TEXT")
+        conn.execute("ALTER TABLE conversations ADD COLUMN origin_host TEXT", &[])
             .unwrap();
-        conn.execute("ALTER TABLE token_usage ADD COLUMN estimated_cost_usd REAL")
+        conn.execute("ALTER TABLE token_usage ADD COLUMN estimated_cost_usd REAL", &[])
             .unwrap();
         conn.execute(
-            "UPDATE conversations SET source_id = '   ', origin_host = 'remote-ci' WHERE id = 2",
+            "UPDATE conversations SET source_id = '   ', origin_host = 'remote-ci' WHERE id = 2", &[],
         )
         .unwrap();
         conn.execute(
-        "UPDATE token_usage SET source_id = '   ', estimated_cost_usd = 0.4 WHERE conversation_id = 2",
+        "UPDATE token_usage SET source_id = '   ', estimated_cost_usd = 0.4 WHERE conversation_id = 2", &[],
     )
     .unwrap();
         conn.execute(
-            "UPDATE token_daily_stats SET source_id = '   ' WHERE agent_slug = 'claude_code'",
+            "UPDATE token_daily_stats SET source_id = '   ' WHERE agent_slug = 'claude_code'", &[],
         )
         .unwrap();
 
@@ -5626,20 +5625,20 @@ mod tests {
     fn query_breakdown_source_with_cost_metric_default_uses_token_usage_to_recover_blank_remote_source_via_origin_host()
      {
         let conn = setup_status_filter_db();
-        conn.execute("ALTER TABLE conversations ADD COLUMN origin_host TEXT")
+        conn.execute("ALTER TABLE conversations ADD COLUMN origin_host TEXT", &[])
             .unwrap();
-        conn.execute("ALTER TABLE token_usage ADD COLUMN estimated_cost_usd REAL")
+        conn.execute("ALTER TABLE token_usage ADD COLUMN estimated_cost_usd REAL", &[])
             .unwrap();
         conn.execute(
-            "UPDATE conversations SET source_id = '   ', origin_host = 'remote-ci' WHERE id = 2",
+            "UPDATE conversations SET source_id = '   ', origin_host = 'remote-ci' WHERE id = 2", &[],
         )
         .unwrap();
         conn.execute(
-        "UPDATE token_usage SET source_id = '   ', estimated_cost_usd = 0.4 WHERE conversation_id = 2",
+        "UPDATE token_usage SET source_id = '   ', estimated_cost_usd = 0.4 WHERE conversation_id = 2", &[],
     )
     .unwrap();
         conn.execute(
-        "UPDATE token_daily_stats SET source_id = '   ', estimated_cost_usd = 0.4 WHERE agent_slug = 'claude_code'",
+        "UPDATE token_daily_stats SET source_id = '   ', estimated_cost_usd = 0.4 WHERE agent_slug = 'claude_code'", &[],
     )
     .unwrap();
 
@@ -5698,9 +5697,9 @@ mod tests {
     fn query_breakdown_by_agent_plan_count_matches_blank_remote_usage_daily_source_via_origin_host()
     {
         let conn = setup_tools_remote_source_fallback_db();
-        conn.execute("ALTER TABLE message_metrics ADD COLUMN has_plan INTEGER NOT NULL DEFAULT 0")
+        conn.execute("ALTER TABLE message_metrics ADD COLUMN has_plan INTEGER NOT NULL DEFAULT 0", &[])
             .unwrap();
-        conn.execute("UPDATE message_metrics SET has_plan = 1 WHERE message_id = 21")
+        conn.execute("UPDATE message_metrics SET has_plan = 1 WHERE message_id = 21", &[])
             .unwrap();
         let filter = AnalyticsFilter {
             source: SourceFilter::Specific("remote-ci".into()),
@@ -5721,7 +5720,7 @@ mod tests {
     fn query_breakdown_by_agent_message_count_uses_message_metrics_timestamp_when_message_created_at_missing()
      {
         let conn = setup_tools_remote_source_fallback_db();
-        conn.execute("UPDATE messages SET created_at = NULL WHERE id = 21")
+        conn.execute("UPDATE messages SET created_at = NULL WHERE id = 21", &[])
             .unwrap();
         let filter = AnalyticsFilter {
             source: SourceFilter::Specific("remote-ci".into()),
@@ -5743,7 +5742,7 @@ mod tests {
     fn query_breakdown_by_agent_api_total_uses_message_metrics_timestamp_when_message_created_at_missing()
      {
         let conn = setup_tools_remote_source_fallback_db();
-        conn.execute("UPDATE messages SET created_at = NULL WHERE id = 21")
+        conn.execute("UPDATE messages SET created_at = NULL WHERE id = 21", &[])
             .unwrap();
         let filter = AnalyticsFilter {
             source: SourceFilter::Specific("remote-ci".into()),
@@ -5770,11 +5769,11 @@ mod tests {
 
         conn.execute(&format!(
             "UPDATE messages SET created_at = {later_ms} WHERE conversation_id = 1"
-        ))
+        ), &[])
         .unwrap();
         conn.execute(&format!(
             "UPDATE message_metrics SET created_at_ms = {later_ms} WHERE agent_slug = 'codex'"
-        ))
+        ), &[])
         .unwrap();
 
         let filter = AnalyticsFilter {
@@ -5800,7 +5799,7 @@ mod tests {
              VALUES
                 (11, 1, 1, 1, 'local', {}, 10, 'gpt-4o-mini', 'gpt-4o', 12, 'api')",
             day10_ms + 100
-        ))
+        ), &[])
         .unwrap();
 
         let filter = AnalyticsFilter {
@@ -5884,7 +5883,7 @@ mod tests {
 
         conn.execute(&format!(
             "UPDATE token_usage SET timestamp_ms = {later_ms} WHERE conversation_id = 1"
-        ))
+        ), &[])
         .unwrap();
 
         let filter = AnalyticsFilter {
@@ -5916,16 +5915,16 @@ mod tests {
     fn query_breakdown_model_workspace_filter_matches_blank_remote_token_usage_source_via_origin_host()
      {
         let conn = setup_status_filter_db();
-        conn.execute("ALTER TABLE conversations ADD COLUMN origin_host TEXT")
+        conn.execute("ALTER TABLE conversations ADD COLUMN origin_host TEXT", &[])
             .unwrap();
         conn.execute(
-            "UPDATE conversations SET source_id = '   ', origin_host = 'remote-ci' WHERE id = 2",
+            "UPDATE conversations SET source_id = '   ', origin_host = 'remote-ci' WHERE id = 2", &[],
         )
         .unwrap();
-        conn.execute("UPDATE token_usage SET source_id = '   ' WHERE conversation_id = 2")
+        conn.execute("UPDATE token_usage SET source_id = '   ' WHERE conversation_id = 2", &[])
             .unwrap();
         conn.execute(
-            "UPDATE token_daily_stats SET source_id = '   ' WHERE agent_slug = 'claude_code'",
+            "UPDATE token_daily_stats SET source_id = '   ' WHERE agent_slug = 'claude_code'", &[],
         )
         .unwrap();
 
@@ -5949,16 +5948,16 @@ mod tests {
     fn query_breakdown_model_source_filter_matches_blank_remote_token_daily_stats_source_via_origin_host()
      {
         let conn = setup_status_filter_db();
-        conn.execute("ALTER TABLE conversations ADD COLUMN origin_host TEXT")
+        conn.execute("ALTER TABLE conversations ADD COLUMN origin_host TEXT", &[])
             .unwrap();
         conn.execute(
-            "UPDATE conversations SET source_id = '   ', origin_host = 'remote-ci' WHERE id = 2",
+            "UPDATE conversations SET source_id = '   ', origin_host = 'remote-ci' WHERE id = 2", &[],
         )
         .unwrap();
-        conn.execute("UPDATE token_usage SET source_id = '   ' WHERE conversation_id = 2")
+        conn.execute("UPDATE token_usage SET source_id = '   ' WHERE conversation_id = 2", &[])
             .unwrap();
         conn.execute(
-            "UPDATE token_daily_stats SET source_id = '   ' WHERE agent_slug = 'claude_code'",
+            "UPDATE token_daily_stats SET source_id = '   ' WHERE agent_slug = 'claude_code'", &[],
         )
         .unwrap();
 
@@ -6000,7 +5999,7 @@ mod tests {
 
     #[test]
     fn query_breakdown_missing_table_returns_empty() {
-        let conn = Connection::open(":memory:").unwrap();
+        let conn = Connection::open_memory().unwrap();
         let filter = AnalyticsFilter::default();
         let result = query_breakdown(&conn, &filter, Dim::Agent, Metric::ApiTotal, 10).unwrap();
         assert!(result.rows.is_empty());
@@ -6022,7 +6021,7 @@ mod tests {
 
     #[test]
     fn query_unpriced_models_totals_include_hidden_models_beyond_limit() {
-        let conn = Connection::open(":memory:").unwrap();
+        let conn = Connection::open_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE token_usage (
                 model_name TEXT,
@@ -6048,7 +6047,7 @@ mod tests {
 
     #[test]
     fn query_unpriced_models_deduplicates_duplicate_token_usage_rows() {
-        let conn = Connection::open(":memory:").unwrap();
+        let conn = Connection::open_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE token_usage (
                 message_id INTEGER,
@@ -6080,7 +6079,7 @@ mod tests {
 
     #[test]
     fn query_unpriced_models_coalesces_blank_model_names_into_none_bucket() {
-        let conn = Connection::open(":memory:").unwrap();
+        let conn = Connection::open_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE token_usage (
                 model_name TEXT,
@@ -6107,7 +6106,7 @@ mod tests {
 
     #[test]
     fn query_unpriced_models_missing_estimated_cost_column_returns_empty_report() {
-        let conn = Connection::open(":memory:").unwrap();
+        let conn = Connection::open_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE token_usage (
                 model_name TEXT,
@@ -6128,7 +6127,7 @@ mod tests {
 
     #[test]
     fn query_unpriced_models_without_model_name_column_uses_none_bucket() {
-        let conn = Connection::open(":memory:").unwrap();
+        let conn = Connection::open_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE token_usage (
                 total_tokens INTEGER,
@@ -6170,9 +6169,9 @@ mod tests {
     #[test]
     fn query_tools_normalizes_grouped_agent_slugs() {
         let conn = setup_usage_daily_db();
-        conn.execute("UPDATE usage_daily SET agent_slug = '  codex  ' WHERE agent_slug = 'codex'")
+        conn.execute("UPDATE usage_daily SET agent_slug = '  codex  ' WHERE agent_slug = 'codex'", &[])
             .unwrap();
-        conn.execute("UPDATE usage_daily SET agent_slug = '' WHERE agent_slug = 'aider'")
+        conn.execute("UPDATE usage_daily SET agent_slug = '' WHERE agent_slug = 'aider'", &[])
             .unwrap();
 
         let result = query_tools(&conn, &AnalyticsFilter::default(), GroupBy::Day, 10).unwrap();
@@ -6257,11 +6256,11 @@ mod tests {
         let later_ms = day_ms + (12 * 60 * 60 * 1000);
         conn.execute(&format!(
             "UPDATE messages SET created_at = {later_ms} WHERE conversation_id = 1"
-        ))
+        ), &[])
         .unwrap();
         conn.execute(&format!(
             "UPDATE message_metrics SET created_at_ms = {later_ms} WHERE message_id = 11"
-        ))
+        ), &[])
         .unwrap();
 
         let filter = AnalyticsFilter {
@@ -6295,7 +6294,7 @@ mod tests {
 
     #[test]
     fn query_tools_missing_table_returns_empty() {
-        let conn = Connection::open(":memory:").unwrap();
+        let conn = Connection::open_memory().unwrap();
         let filter = AnalyticsFilter::default();
         let result = query_tools(&conn, &filter, GroupBy::Day, 10).unwrap();
         assert!(result.rows.is_empty());
@@ -6344,9 +6343,9 @@ mod tests {
     fn query_total_messages_filtered_uses_conversation_started_at_when_message_timestamps_missing()
     {
         let conn = setup_duplicate_message_metrics_raw_db();
-        conn.execute("UPDATE messages SET created_at = NULL")
+        conn.execute("UPDATE messages SET created_at = NULL", &[])
             .unwrap();
-        conn.execute("UPDATE message_metrics SET created_at_ms = NULL")
+        conn.execute("UPDATE message_metrics SET created_at_ms = NULL", &[])
             .unwrap();
         let filter = AnalyticsFilter {
             since_ms: Some(1_700_000_000_000),
@@ -6377,9 +6376,9 @@ mod tests {
     #[test]
     fn query_tokens_timeseries_uses_conversation_started_at_when_message_timestamps_missing() {
         let conn = setup_duplicate_message_metrics_raw_db();
-        conn.execute("UPDATE messages SET created_at = NULL")
+        conn.execute("UPDATE messages SET created_at = NULL", &[])
             .unwrap();
-        conn.execute("UPDATE message_metrics SET created_at_ms = NULL")
+        conn.execute("UPDATE message_metrics SET created_at_ms = NULL", &[])
             .unwrap();
         let filter = AnalyticsFilter {
             since_ms: Some(1_700_000_000_000),
@@ -6415,9 +6414,9 @@ mod tests {
     fn query_breakdown_by_agent_message_count_uses_conversation_started_at_when_message_timestamps_missing()
      {
         let conn = setup_duplicate_message_metrics_raw_db();
-        conn.execute("UPDATE messages SET created_at = NULL")
+        conn.execute("UPDATE messages SET created_at = NULL", &[])
             .unwrap();
-        conn.execute("UPDATE message_metrics SET created_at_ms = NULL")
+        conn.execute("UPDATE message_metrics SET created_at_ms = NULL", &[])
             .unwrap();
         let filter = AnalyticsFilter {
             since_ms: Some(1_700_000_000_000),
@@ -6453,9 +6452,9 @@ mod tests {
     #[test]
     fn query_tools_uses_conversation_started_at_when_message_timestamps_missing() {
         let conn = setup_duplicate_message_metrics_raw_db();
-        conn.execute("UPDATE messages SET created_at = NULL")
+        conn.execute("UPDATE messages SET created_at = NULL", &[])
             .unwrap();
-        conn.execute("UPDATE message_metrics SET created_at_ms = NULL")
+        conn.execute("UPDATE message_metrics SET created_at_ms = NULL", &[])
             .unwrap();
         let filter = AnalyticsFilter {
             since_ms: Some(1_700_000_000_000),
@@ -6528,7 +6527,7 @@ mod tests {
     #[test]
     fn query_session_scatter_with_missing_agent_row_keeps_session_without_filter() {
         let conn = setup_session_scatter_db();
-        conn.execute("DELETE FROM agents WHERE id = 2").unwrap();
+        conn.execute("DELETE FROM agents WHERE id = 2", &[]).unwrap();
 
         let points = query_session_scatter(&conn, &AnalyticsFilter::default(), 10).unwrap();
         assert_eq!(points.len(), 2);
@@ -6539,7 +6538,7 @@ mod tests {
     #[test]
     fn query_session_scatter_normalizes_trimmed_agent_filter_and_agent_slug() {
         let conn = setup_session_scatter_db();
-        conn.execute("UPDATE agents SET slug = '  codex  ' WHERE id = 1")
+        conn.execute("UPDATE agents SET slug = '  codex  ' WHERE id = 1", &[])
             .unwrap();
 
         let filter = AnalyticsFilter {
@@ -6556,7 +6555,7 @@ mod tests {
     #[test]
     fn query_session_scatter_normalizes_trimmed_local_source_ids() {
         let conn = setup_session_scatter_db();
-        conn.execute("UPDATE conversations SET source_id = '  LOCAL  ' WHERE id = 1")
+        conn.execute("UPDATE conversations SET source_id = '  LOCAL  ' WHERE id = 1", &[])
             .unwrap();
 
         let filter = AnalyticsFilter {
@@ -6575,7 +6574,7 @@ mod tests {
     fn query_session_scatter_matches_blank_remote_source_id_via_origin_host() {
         let conn = setup_session_scatter_db();
         conn.execute(
-            "UPDATE conversations SET source_id = '   ', origin_host = 'remote-ci' WHERE id = 2",
+            "UPDATE conversations SET source_id = '   ', origin_host = 'remote-ci' WHERE id = 2", &[],
         )
         .unwrap();
 
@@ -6621,9 +6620,9 @@ mod tests {
             );",
         )
         .unwrap();
-        conn.execute("INSERT INTO token_usage (id, message_id, total_tokens) VALUES (1, 11, 600)")
+        conn.execute("INSERT INTO token_usage (id, message_id, total_tokens) VALUES (1, 11, 600)", &[])
             .unwrap();
-        conn.execute("INSERT INTO token_usage (id, message_id, total_tokens) VALUES (2, 11, 700)")
+        conn.execute("INSERT INTO token_usage (id, message_id, total_tokens) VALUES (2, 11, 700)", &[])
             .unwrap();
 
         let filter = AnalyticsFilter {
@@ -6659,12 +6658,12 @@ mod tests {
                  api_cache_read_tokens = NULL,
                  api_cache_creation_tokens = NULL,
                  api_thinking_tokens = NULL
-             WHERE message_id = 12",
+             WHERE message_id = 12", &[],
         )
         .unwrap();
-        conn.execute("INSERT INTO token_usage (id, message_id, total_tokens) VALUES (1, 12, 400)")
+        conn.execute("INSERT INTO token_usage (id, message_id, total_tokens) VALUES (1, 12, 400)", &[])
             .unwrap();
-        conn.execute("INSERT INTO token_usage (id, message_id, total_tokens) VALUES (2, 12, 900)")
+        conn.execute("INSERT INTO token_usage (id, message_id, total_tokens) VALUES (2, 12, 900)", &[])
             .unwrap();
 
         let filter = AnalyticsFilter {
@@ -6692,7 +6691,7 @@ mod tests {
                  api_cache_read_tokens = NULL,
                  api_cache_creation_tokens = NULL,
                  api_thinking_tokens = NULL
-             WHERE message_id = 12",
+             WHERE message_id = 12", &[],
         )
         .unwrap();
 
@@ -6714,7 +6713,7 @@ mod tests {
     #[test]
     fn query_session_scatter_uses_message_metrics_timestamp_when_message_created_at_missing() {
         let conn = setup_session_scatter_db();
-        conn.execute("ALTER TABLE message_metrics ADD COLUMN created_at_ms INTEGER")
+        conn.execute("ALTER TABLE message_metrics ADD COLUMN created_at_ms INTEGER", &[])
             .unwrap();
         conn.execute(
             "UPDATE message_metrics
@@ -6725,10 +6724,10 @@ mod tests {
                  WHEN 22 THEN 1700000002000
                  WHEN 23 THEN 1700000003000
                  ELSE 0
-             END",
+             END", &[],
         )
         .unwrap();
-        conn.execute("UPDATE messages SET created_at = NULL WHERE conversation_id = 2")
+        conn.execute("UPDATE messages SET created_at = NULL WHERE conversation_id = 2", &[])
             .unwrap();
 
         let filter = AnalyticsFilter {
@@ -6747,7 +6746,7 @@ mod tests {
     #[test]
     fn query_session_scatter_uses_token_usage_timestamp_when_message_created_at_missing() {
         let conn = setup_session_scatter_with_token_usage_fallback_db();
-        conn.execute("ALTER TABLE token_usage ADD COLUMN timestamp_ms INTEGER")
+        conn.execute("ALTER TABLE token_usage ADD COLUMN timestamp_ms INTEGER", &[])
             .unwrap();
         conn.execute(
             "UPDATE token_usage
@@ -6755,10 +6754,10 @@ mod tests {
                  WHEN 11 THEN 1700000001000
                  WHEN 12 THEN 1700000002000
                  ELSE 0
-             END",
+             END", &[],
         )
         .unwrap();
-        conn.execute("UPDATE messages SET created_at = NULL WHERE conversation_id = 1")
+        conn.execute("UPDATE messages SET created_at = NULL WHERE conversation_id = 1", &[])
             .unwrap();
 
         let filter = AnalyticsFilter {
@@ -6780,7 +6779,7 @@ mod tests {
     fn query_cost_timeseries_deduplicates_duplicate_token_usage_rows() {
         let conn = setup_status_filter_db();
         let day10_ms = crate::storage::sqlite::FrankenStorage::millis_from_day_id(10);
-        conn.execute("ALTER TABLE token_usage ADD COLUMN estimated_cost_usd REAL")
+        conn.execute("ALTER TABLE token_usage ADD COLUMN estimated_cost_usd REAL", &[])
             .unwrap();
         conn.execute(
             "UPDATE token_usage
@@ -6789,7 +6788,7 @@ mod tests {
                  WHEN 12 THEN 0.3
                  WHEN 21 THEN 0.4
                  ELSE 0.0
-             END",
+             END", &[],
         )
         .unwrap();
         conn.execute(&format!(
@@ -6799,7 +6798,7 @@ mod tests {
              VALUES
                 (11, 1, 1, 1, 'local', {}, 10, 'gpt-4o-mini', 'gpt-4o', 12, 'api', 0.2)",
             day10_ms + 100
-        ))
+        ), &[])
         .unwrap();
 
         let filter = AnalyticsFilter {
@@ -6921,19 +6920,19 @@ mod tests {
     fn query_tokens_timeseries_source_filter_matches_blank_remote_usage_daily_source_via_origin_host()
      {
         let conn = setup_status_filter_db();
-        conn.execute("ALTER TABLE conversations ADD COLUMN origin_host TEXT")
+        conn.execute("ALTER TABLE conversations ADD COLUMN origin_host TEXT", &[])
             .unwrap();
         conn.execute(
-            "UPDATE conversations SET source_id = '   ', origin_host = 'remote-ci' WHERE id = 2",
+            "UPDATE conversations SET source_id = '   ', origin_host = 'remote-ci' WHERE id = 2", &[],
         )
         .unwrap();
         conn.execute(
-            "UPDATE message_metrics SET source_id = '   ' WHERE agent_slug = 'claude_code'",
+            "UPDATE message_metrics SET source_id = '   ' WHERE agent_slug = 'claude_code'", &[],
         )
         .unwrap();
-        conn.execute("UPDATE usage_hourly SET source_id = '   ' WHERE agent_slug = 'claude_code'")
+        conn.execute("UPDATE usage_hourly SET source_id = '   ' WHERE agent_slug = 'claude_code'", &[])
             .unwrap();
-        conn.execute("UPDATE usage_daily SET source_id = '   ' WHERE agent_slug = 'claude_code'")
+        conn.execute("UPDATE usage_daily SET source_id = '   ' WHERE agent_slug = 'claude_code'", &[])
             .unwrap();
 
         let filter = AnalyticsFilter {
@@ -6959,11 +6958,11 @@ mod tests {
 
         conn.execute(&format!(
             "UPDATE messages SET created_at = {later_ms} WHERE conversation_id = 1"
-        ))
+        ), &[])
         .unwrap();
         conn.execute(&format!(
             "UPDATE message_metrics SET created_at_ms = {later_ms} WHERE agent_slug = 'codex'"
-        ))
+        ), &[])
         .unwrap();
 
         let filter = AnalyticsFilter {
@@ -6987,11 +6986,11 @@ mod tests {
         let day10_ms = crate::storage::sqlite::FrankenStorage::millis_from_day_id(10);
         let second_ts = (day10_ms + 100) / 1000;
 
-        conn.execute("UPDATE messages SET created_at = NULL WHERE conversation_id = 1")
+        conn.execute("UPDATE messages SET created_at = NULL WHERE conversation_id = 1", &[])
             .unwrap();
         conn.execute(&format!(
             "UPDATE message_metrics SET created_at_ms = {second_ts} WHERE agent_slug = 'codex'"
-        ))
+        ), &[])
         .unwrap();
 
         let filter = AnalyticsFilter {
@@ -7015,18 +7014,18 @@ mod tests {
     fn query_cost_timeseries_source_filter_matches_blank_remote_token_daily_stats_source_via_origin_host()
      {
         let conn = setup_status_filter_db();
-        conn.execute("ALTER TABLE conversations ADD COLUMN origin_host TEXT")
+        conn.execute("ALTER TABLE conversations ADD COLUMN origin_host TEXT", &[])
             .unwrap();
-        conn.execute("ALTER TABLE token_usage ADD COLUMN estimated_cost_usd REAL")
+        conn.execute("ALTER TABLE token_usage ADD COLUMN estimated_cost_usd REAL", &[])
             .unwrap();
         conn.execute(
-            "UPDATE conversations SET source_id = '   ', origin_host = 'remote-ci' WHERE id = 2",
+            "UPDATE conversations SET source_id = '   ', origin_host = 'remote-ci' WHERE id = 2", &[],
         )
         .unwrap();
-        conn.execute("UPDATE token_usage SET source_id = '   ', estimated_cost_usd = 0.4 WHERE conversation_id = 2")
+        conn.execute("UPDATE token_usage SET source_id = '   ', estimated_cost_usd = 0.4 WHERE conversation_id = 2", &[])
             .unwrap();
         conn.execute(
-            "UPDATE token_daily_stats SET source_id = '   ' WHERE agent_slug = 'claude_code'",
+            "UPDATE token_daily_stats SET source_id = '   ' WHERE agent_slug = 'claude_code'", &[],
         )
         .unwrap();
 
@@ -7049,7 +7048,7 @@ mod tests {
         let conn = setup_status_filter_db();
         let day10_ms = crate::storage::sqlite::FrankenStorage::millis_from_day_id(10);
         let later_ms = day10_ms + (12 * 60 * 60 * 1000);
-        conn.execute("ALTER TABLE token_usage ADD COLUMN estimated_cost_usd REAL")
+        conn.execute("ALTER TABLE token_usage ADD COLUMN estimated_cost_usd REAL", &[])
             .unwrap();
         conn.execute(
             "UPDATE token_usage
@@ -7058,12 +7057,12 @@ mod tests {
                  WHEN 12 THEN 0.3
                  WHEN 21 THEN 0.4
                  ELSE 0.0
-             END",
+             END", &[],
         )
         .unwrap();
         conn.execute(&format!(
             "UPDATE token_usage SET timestamp_ms = {later_ms} WHERE conversation_id = 1"
-        ))
+        ), &[])
         .unwrap();
 
         let filter = AnalyticsFilter {
@@ -7086,7 +7085,7 @@ mod tests {
         let conn = setup_status_filter_db();
         let day10_ms = crate::storage::sqlite::FrankenStorage::millis_from_day_id(10);
         let second_ts = (day10_ms + 100) / 1000;
-        conn.execute("ALTER TABLE token_usage ADD COLUMN estimated_cost_usd REAL")
+        conn.execute("ALTER TABLE token_usage ADD COLUMN estimated_cost_usd REAL", &[])
             .unwrap();
         conn.execute(
             "UPDATE token_usage
@@ -7095,12 +7094,12 @@ mod tests {
                  WHEN 12 THEN 0.3
                  WHEN 21 THEN 0.4
                  ELSE 0.0
-             END",
+             END", &[],
         )
         .unwrap();
         conn.execute(&format!(
             "UPDATE token_usage SET timestamp_ms = {second_ts} WHERE conversation_id = 1"
-        ))
+        ), &[])
         .unwrap();
 
         let filter = AnalyticsFilter {
@@ -7123,7 +7122,7 @@ mod tests {
     #[test]
     fn query_cost_timeseries_hour_group_uses_token_usage_hour_buckets() {
         let conn = setup_status_filter_db();
-        conn.execute("ALTER TABLE token_usage ADD COLUMN estimated_cost_usd REAL")
+        conn.execute("ALTER TABLE token_usage ADD COLUMN estimated_cost_usd REAL", &[])
             .unwrap();
         conn.execute(
             "UPDATE token_usage
@@ -7132,7 +7131,7 @@ mod tests {
                  WHEN 12 THEN 0.3
                  WHEN 21 THEN 0.4
                  ELSE 0.0
-             END",
+             END", &[],
         )
         .unwrap();
 
@@ -7154,7 +7153,7 @@ mod tests {
 
     #[test]
     fn query_cost_timeseries_missing_table_returns_empty() {
-        let conn = Connection::open(":memory:").unwrap();
+        let conn = Connection::open_memory().unwrap();
         let filter = AnalyticsFilter::default();
         let result = query_cost_timeseries(&conn, &filter, GroupBy::Day).unwrap();
 
@@ -7167,7 +7166,7 @@ mod tests {
     fn query_breakdown_agent_with_cost_metric_normalizes_trimmed_agent_slug() {
         let conn = setup_token_daily_stats_db();
         conn.execute(
-            "UPDATE token_daily_stats SET agent_slug = '  codex  ' WHERE agent_slug = 'codex'",
+            "UPDATE token_daily_stats SET agent_slug = '  codex  ' WHERE agent_slug = 'codex'", &[],
         )
         .unwrap();
 

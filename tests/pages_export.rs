@@ -4,13 +4,44 @@ mod tests {
     use coding_agent_search::pages::export::{
         ExportEngine, ExportFilter, PathMode, run_pages_export,
     };
-    use frankensqlite::compat::{ConnectionExt, RowExt};
-    use frankensqlite::{Connection, Row as FrankenRow, params as fparams};
+    use coding_agent_search::storage::api::{Conn as Connection, Profile, Row as FrankenRow};
+    use coding_agent_search::storage::testing::open_test_writer;
     use std::path::Path;
     use tempfile::TempDir;
 
+    /// Test-only parameter list builder (this integration test is a separate
+    /// crate and can't reach `storage::api`'s crate-private `params!` shim):
+    /// borrows + handles the zero-arg case, mirroring sqlite.rs's own `fparams!`.
+    macro_rules! fparams {
+        () => {
+            &[] as &[coding_agent_search::storage::api::Value]
+        };
+        ($($val:expr),+ $(,)?) => {
+            &[$(coding_agent_search::storage::api::IntoValue::into_value($val)),+]
+                as &[coding_agent_search::storage::api::Value]
+        };
+    }
+
+    /// Stage A note: these fixtures deliberately reuse cass's own table names
+    /// (`conversations`/`messages`) with a simplified column set, so opening
+    /// through `FrankenStorage::open` (which would apply cass's real
+    /// migrations first) is not an option here -- it would collide on
+    /// `CREATE TABLE conversations`. `storage::api::Conn::open_writable` is
+    /// the schema-free public path, but it's deliberately crate-private
+    /// (R2-F3); `storage::testing::open_test_writer` (w1b Task B4 Q3's
+    /// sanctioned schema-free bridge for `tests/`) is the way to reach it
+    /// from outside the crate. `with_writable_db` runs a closure through it
+    /// and hands back its result; callers that only need to read afterward
+    /// reopen read-only via the always-public `Connection::open_read`.
+    fn with_writable_db<R>(path: &Path, write: impl FnOnce(&Connection) -> Result<R>) -> Result<R> {
+        let mut guard = open_test_writer(path, Profile::Production)?;
+        let result = write(guard.storage().raw())?;
+        guard.mark_committed();
+        Ok(result)
+    }
+
     fn setup_source_db(path: &Path) -> Result<()> {
-        let conn = open_franken_db(path)?;
+        with_writable_db(path, |conn| {
 
         conn.execute_batch(
             r#"
@@ -53,40 +84,40 @@ mod tests {
         )?;
 
         // Agents + workspaces
-        conn.execute("INSERT INTO agents (id, slug) VALUES (1, 'claude')")?;
-        conn.execute("INSERT INTO agents (id, slug) VALUES (2, 'codex')")?;
-        conn.execute("INSERT INTO workspaces (id, path) VALUES (1, '/home/user/proj1')")?;
-        conn.execute("INSERT INTO workspaces (id, path) VALUES (2, '/home/user/proj2')")?;
+        conn.execute("INSERT INTO agents (id, slug) VALUES (1, 'claude')", &[])?;
+        conn.execute("INSERT INTO agents (id, slug) VALUES (2, 'codex')", &[])?;
+        conn.execute("INSERT INTO workspaces (id, path) VALUES (1, '/home/user/proj1')", &[])?;
+        conn.execute("INSERT INTO workspaces (id, path) VALUES (2, '/home/user/proj2')", &[])?;
 
         // Insert test data
         conn.execute(
             "INSERT INTO conversations (id, agent_id, workspace_id, title, source_path, started_at, message_count)
              VALUES (1, 1, 1, 'Test Conv 1', '/home/user/proj1/.claude/1.json', 1600000000000, 2)"
+        , &[])?;
+        conn.execute(
+            "INSERT INTO messages (conversation_id, idx, role, content, created_at)
+             VALUES (1, 0, 'user', 'hello', 1600000000000)", &[],
         )?;
         conn.execute(
             "INSERT INTO messages (conversation_id, idx, role, content, created_at)
-             VALUES (1, 0, 'user', 'hello', 1600000000000)",
-        )?;
-        conn.execute(
-            "INSERT INTO messages (conversation_id, idx, role, content, created_at)
-             VALUES (1, 1, 'assistant', 'world', 1600000005000)",
+             VALUES (1, 1, 'assistant', 'world', 1600000005000)", &[],
         )?;
 
         conn.execute(
             "INSERT INTO conversations (id, agent_id, workspace_id, title, source_path, started_at, message_count)
              VALUES (2, 2, 2, 'Test Conv 2', '/home/user/proj2/.codex/session.json', 1700000000000, 1)"
-        )?;
+        , &[])?;
         conn.execute(
             "INSERT INTO messages (conversation_id, idx, role, content, created_at)
-             VALUES (2, 0, 'user', 'rust code', 1700000000000)",
+             VALUES (2, 0, 'user', 'rust code', 1700000000000)", &[],
         )?;
 
-        Ok(())
+            Ok(())
+        })
     }
 
     fn open_franken_db(path: &Path) -> Result<Connection> {
-        let path_str = path.to_string_lossy();
-        Ok(Connection::open(path_str.as_ref())?)
+        Ok(Connection::open_read(path)?)
     }
 
     fn query_i64(conn: &Connection, sql: &str) -> Result<i64> {
@@ -98,7 +129,7 @@ mod tests {
     }
 
     fn setup_franken_source_db(path: &Path) -> Result<()> {
-        let conn = open_franken_db(path)?;
+        with_writable_db(path, |conn| {
         conn.execute_batch(
             r#"
             CREATE TABLE agents (
@@ -137,28 +168,28 @@ mod tests {
             "#,
         )?;
 
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO agents (id, slug) VALUES (?1, ?2)",
             fparams![1_i64, "codex"],
         )?;
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO workspaces (id, path) VALUES (?1, ?2)",
             fparams![1_i64, "/home/user/franken"],
         )?;
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO conversations (id, agent_id, workspace_id, title, source_path, started_at, message_count)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             fparams![
                 1_i64,
                 1_i64,
                 1_i64,
-                "Frankensqlite Export",
+                "Legacy Embedded Engine Export",
                 "/home/user/franken/.codex/session.jsonl",
                 1_700_000_000_000_i64,
                 2_i64
             ],
         )?;
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content, created_at, updated_at, model, attachment_refs)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             fparams![
@@ -166,14 +197,14 @@ mod tests {
                 1_i64,
                 0_i64,
                 "user",
-                "please verify frankensqlite pages export",
+                "please verify legacy-embedded-engine pages export",
                 1_700_000_000_000_i64,
                 1_700_000_000_100_i64,
                 "gpt-5",
                 "[\"artifact-a\"]"
             ],
         )?;
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content, created_at, updated_at, model, attachment_refs)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             fparams![
@@ -181,7 +212,7 @@ mod tests {
                 1_i64,
                 1_i64,
                 "assistant",
-                "frankensqlite export payload is queryable",
+                "legacy-embedded-engine export payload is queryable",
                 1_700_000_000_500_i64,
                 1_700_000_000_600_i64,
                 "gpt-5",
@@ -189,7 +220,8 @@ mod tests {
             ],
         )?;
 
-        Ok(())
+            Ok(())
+        })
     }
 
     #[test]
@@ -298,11 +330,21 @@ mod tests {
         )?;
         assert_eq!(
             assistant_content,
-            "frankensqlite export payload is queryable"
+            "legacy-embedded-engine export payload is queryable"
         );
 
+        // w1b Task B9 (2026-08-27): the P1 text sweep (b743f695) renamed the
+        // franken/fsqlite prose this test's fixture content used to say into
+        // "legacy-embedded-engine" -- a hyphenated phrase, unlike the single
+        // word it replaced. Unquoted, FTS5's query-syntax parser treats
+        // hyphens specially (reproduced against stock sqlite3 directly: the
+        // exact same "no such column: embedded" error), so the term needs
+        // double-quoting to be treated as a literal phrase instead of parsed
+        // FTS5 query syntax. Not an engine behavior difference -- vanilla
+        // SQLite's FTS5 has always required this quoting for hyphenated
+        // MATCH terms.
         let fts_hits: i64 = output_conn.query_row_map(
-            "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'frankensqlite'",
+            "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH '\"legacy-embedded-engine\"'",
             &[],
             |row: &FrankenRow| row.get_typed(0),
         )?;
@@ -412,24 +454,25 @@ mod tests {
 
         setup_source_db(&source_path)?;
 
-        let source_conn = open_franken_db(&source_path)?;
-        source_conn.execute("ALTER TABLE messages ADD COLUMN attachment_refs TEXT")?;
+        let source_message_id: i64 = with_writable_db(&source_path, |source_conn| {
+            source_conn.execute("ALTER TABLE messages ADD COLUMN attachment_refs TEXT", &[])?;
 
-        let source_message_id: i64 = source_conn.query_row_map(
-            "SELECT id FROM messages WHERE conversation_id = 1 AND idx = 0",
-            &[],
-            |row: &FrankenRow| row.get_typed(0),
-        )?;
-        source_conn.execute_compat(
-            "UPDATE messages SET updated_at = ?1, model = ?2, attachment_refs = ?3 WHERE id = ?4",
-            fparams![
-                1_600_000_123_000_i64,
-                "claude-opus-4-6",
-                "[\"blob-a\",\"blob-b\"]",
-                source_message_id
-            ],
-        )?;
-        drop(source_conn);
+            let source_message_id: i64 = source_conn.query_row_map(
+                "SELECT id FROM messages WHERE conversation_id = 1 AND idx = 0",
+                &[],
+                |row: &FrankenRow| row.get_typed(0),
+            )?;
+            source_conn.execute(
+                "UPDATE messages SET updated_at = ?1, model = ?2, attachment_refs = ?3 WHERE id = ?4",
+                fparams![
+                    1_600_000_123_000_i64,
+                    "claude-opus-4-6",
+                    "[\"blob-a\",\"blob-b\"]",
+                    source_message_id
+                ],
+            )?;
+            Ok(source_message_id)
+        })?;
 
         let filter = ExportFilter {
             agents: None,
@@ -470,7 +513,7 @@ mod tests {
         let source_path = temp_dir.path().join("source.db");
         let output_path = temp_dir.path().join("export.db");
 
-        let conn = open_franken_db(&source_path)?;
+        with_writable_db(&source_path, |conn| {
         conn.execute_batch(
             r#"
             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
@@ -497,18 +540,20 @@ mod tests {
             );
             "#,
         )?;
-        conn.execute("INSERT INTO agents (id, slug) VALUES (1, 'claude')")?;
-        conn.execute("INSERT INTO workspaces (id, path) VALUES (1, '/home/user/proj1')")?;
+        conn.execute("INSERT INTO agents (id, slug) VALUES (1, 'claude')", &[])?;
+        conn.execute("INSERT INTO workspaces (id, path) VALUES (1, '/home/user/proj1')", &[])?;
         conn.execute(
             "INSERT INTO conversations (id, agent_id, workspace_id, title, source_path, started_at, message_count)
-             VALUES (1, 1, 1, 'Extra JSON model', '/home/user/proj1/.claude/extra.jsonl', 1600000000000, 1)"
+             VALUES (1, 1, 1, 'Extra JSON model', '/home/user/proj1/.claude/extra.jsonl', 1600000000000, 1)",
+            &[],
         )?;
-        conn.execute_compat(
+        conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content, created_at, extra_json)
              VALUES (101, 1, 0, 'assistant', 'hello', 1600000000000, ?1)",
             fparams![r#"{"message":{"model":"claude-sonnet-4"},"attachments":["blob-z"]}"#],
         )?;
-        drop(conn);
+            Ok(())
+        })?;
 
         let filter = ExportFilter {
             agents: None,

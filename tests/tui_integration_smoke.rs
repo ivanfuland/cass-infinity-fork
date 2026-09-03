@@ -1,7 +1,7 @@
 //! TUI Integration Smoke Tests (bead z61x9)
 //!
 //! These tests verify the TUI works correctly with the fully integrated stack:
-//! - frankensqlite (storage backend)
+//! - the legacy embedded engine (storage backend)
 //! - frankensearch (search pipeline)
 //! - franken_agent_detection (connector discovery)
 //!
@@ -10,13 +10,13 @@
 //! 2. Search query → verify pipeline executes without panic
 //! 3. Apply agent filter → verify filtered search executes
 //! 4. Switch search mode (lexical/semantic/hybrid) → verify no panic
-//! 5. Verify footer stats (from frankensqlite)
+//! 5. Verify footer stats (from the legacy embedded engine)
 //! 6. Verify asciicast recording with populated index
 //! 7. Multi-agent integrated stack exercise
 //!
-//! NOTE: Some search queries that return results currently fail with frankensqlite
+//! NOTE: Some search queries that return results currently fail with the legacy embedded engine
 //! "OpenRead" errors during the result-loading phase. This is a known limitation
-//! of the frankensqlite migration (the search index pipeline works, but loading
+//! of the legacy embedded engine migration (the search index pipeline works, but loading
 //! full conversation details from the DB fails for certain SQL patterns).
 //! Tests assert no-panic rather than success for these paths.
 //!
@@ -79,13 +79,13 @@ fn build_full_index(temp_home: &Path, data_dir: &Path, codex_home: &Path) {
 }
 
 /// Assert that a search command completes without panicking.
-/// Tolerates known frankensqlite "OpenRead" errors during migration.
+/// Tolerates known the legacy embedded engine "OpenRead" errors during migration.
 /// Returns (success: bool, stdout: String, stderr: String).
 fn assert_search_no_panic(output: &std::process::Output) -> (bool, String, String) {
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-    // Must not panic regardless of frankensqlite support
+    // Must not panic regardless of the legacy embedded engine support
     assert!(
         !stderr.contains("panicked") && !stderr.contains("RUST_BACKTRACE"),
         "search command panicked!\nstderr: {}",
@@ -139,7 +139,7 @@ fn integration_tui_launches_with_populated_index() {
 
     assert!(
         data_dir.join("agent_search.db").exists(),
-        "frankensqlite DB should exist"
+        "the legacy embedded engine DB should exist"
     );
     assert!(
         data_dir.join("index").exists(),
@@ -158,14 +158,14 @@ fn integration_tui_ftui_runtime_with_populated_index() {
 }
 
 // =============================================================================
-// 2. Search pipeline exercises (frankensearch + frankensqlite)
+// 2. Search pipeline exercises (frankensearch + the legacy embedded engine)
 // =============================================================================
 
 #[test]
 fn integration_search_pipeline_no_panic() {
     let (tmp, data_dir) = setup_codex_env();
 
-    // Query that triggers result-loading from DB. May fail with frankensqlite
+    // Query that triggers result-loading from DB. May fail with the legacy embedded engine
     // OpenRead error, but must never panic.
     let output = base_cmd(tmp.path())
         .env("CODEX_HOME", &data_dir)
@@ -186,7 +186,7 @@ fn integration_search_pipeline_no_panic() {
             "successful search should contain result data"
         );
     }
-    // If !success, it's the known frankensqlite OpenRead limitation - acceptable
+    // If !success, it's the known the legacy embedded engine OpenRead limitation - acceptable
 }
 
 #[test]
@@ -194,7 +194,7 @@ fn integration_search_lexical_mode() {
     let (tmp, data_dir) = setup_codex_env();
 
     // "hello world" returns 0 hits from index → exercises pipeline without
-    // triggering the frankensqlite result-loading path
+    // triggering the legacy embedded engine result-loading path
     let output = base_cmd(tmp.path())
         .env("CODEX_HOME", &data_dir)
         .args([
@@ -304,7 +304,7 @@ fn integration_search_mode_switching_no_panic() {
 }
 
 // =============================================================================
-// 5. Footer stats from frankensqlite
+// 5. Footer stats from the legacy embedded engine
 // =============================================================================
 
 #[test]
@@ -481,7 +481,7 @@ fn integration_search_completes_quickly() {
 
     // Must not panic
     assert_search_no_panic(&output);
-    // Whether it succeeds or fails with frankensqlite, should complete quickly
+    // Whether it succeeds or fails with the legacy embedded engine, should complete quickly
     assert!(
         elapsed.as_secs() < 10,
         "integrated search took too long: {:?}",

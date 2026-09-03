@@ -10,17 +10,15 @@ use coding_agent_search::search::pack_planner::{
 use coding_agent_search::search::query::{
     FieldMask, MatchType, SearchClient, SearchFilters, SearchHit, rrf_fuse_hits,
 };
-use coding_agent_search::search::tantivy::index_dir;
+use coding_agent_search::indexer::index_dir;
 use coding_agent_search::search::vector_index::{
-    Quantization, SemanticDocId, SemanticFilter, VectorIndex, dot_product_f16_scalar_bench,
-    dot_product_f16_simd_bench, dot_product_scalar_bench, dot_product_simd_bench,
+    dot_product_f16_scalar_bench, dot_product_f16_simd_bench, dot_product_scalar_bench,
+    dot_product_simd_bench,
 };
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use half::f16;
-use std::collections::HashSet;
 use std::hint::black_box;
 use std::mem::size_of;
-use tempfile::TempDir;
 
 const PACK_BENCH_NOW_MS: i64 = 1_764_000_000_000;
 const PACK_BENCH_FRESHNESS_WINDOW_SECONDS: i64 = 30 * 24 * 60 * 60;
@@ -519,181 +517,6 @@ fn bench_empty_search(c: &mut Criterion) {
     }
 }
 
-/// Benchmark vector search with 10k entries.
-/// Target: <5ms
-fn bench_vector_index_search_10k(c: &mut Criterion) {
-    let dimension = 384;
-    let count = 10_000;
-    let (_tmp, index) =
-        build_temp_fsvi_index("bench-embedder", dimension, Quantization::F16, count);
-    let query = build_query(dimension);
-
-    c.bench_function("vector_index_search_10k", |b| {
-        b.iter(|| {
-            let results = index
-                .search_top_k(black_box(&query), 25, None)
-                .unwrap_or_default();
-            black_box(results);
-        });
-    });
-}
-
-/// Benchmark vector search with 50k entries (no filter).
-/// Target: <20ms
-fn bench_vector_index_search_50k(c: &mut Criterion) {
-    let dimension = 384;
-    let count = 50_000;
-    let (_tmp, index) =
-        build_temp_fsvi_index("bench-embedder", dimension, Quantization::F16, count);
-    let query = build_query(dimension);
-
-    c.bench_function("vector_index_search_50k", |b| {
-        b.iter(|| {
-            let results = index
-                .search_top_k(black_box(&query), 25, None)
-                .unwrap_or_default();
-            black_box(results);
-        });
-    });
-}
-
-/// Benchmark vector search with 50k entries and filtering.
-/// Target: <20ms
-fn bench_vector_index_search_50k_filtered(c: &mut Criterion) {
-    let dimension = 384;
-    let count = 50_000;
-    let (_tmp, index) =
-        build_temp_fsvi_index("bench-embedder", dimension, Quantization::F16, count);
-    let query = build_query(dimension);
-
-    // Filter to agents 0, 1, 2 (out of 8 possible)
-    let mut agent_filter = HashSet::new();
-    agent_filter.insert(0u32);
-    agent_filter.insert(1u32);
-    agent_filter.insert(2u32);
-
-    let filter = SemanticFilter {
-        agents: Some(agent_filter),
-        workspaces: None,
-        sources: None,
-        roles: None,
-        created_from: None,
-        created_to: None,
-    };
-
-    c.bench_function("vector_index_search_50k_filtered", |b| {
-        b.iter(|| {
-            let results = index
-                .search_top_k(black_box(&query), 25, Some(&filter))
-                .unwrap_or_default();
-            black_box(results);
-        });
-    });
-}
-
-/// Parameterized benchmark for different index sizes.
-fn bench_vector_search_scaling(c: &mut Criterion) {
-    let dimension = 384;
-    let mut group = c.benchmark_group("vector_search_scaling");
-
-    for size in [1_000, 5_000, 10_000, 25_000, 50_000] {
-        let (_tmp, index) =
-            build_temp_fsvi_index("bench-embedder", dimension, Quantization::F16, size);
-        let query = build_query(dimension);
-
-        group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, _| {
-            b.iter(|| {
-                let results = index
-                    .search_top_k(black_box(&query), 25, None)
-                    .unwrap_or_default();
-                black_box(results);
-            });
-        });
-    }
-    group.finish();
-}
-
-fn build_temp_fsvi_index(
-    embedder_id: &str,
-    dimension: usize,
-    quantization: Quantization,
-    count: usize,
-) -> (TempDir, VectorIndex) {
-    let temp = TempDir::new().expect("tempdir");
-    let path = temp.path().join("bench.fsvi");
-    let mut writer =
-        VectorIndex::create_with_revision(&path, embedder_id, "bench", dimension, quantization)
-            .expect("create fsvi writer");
-
-    let mut vec_buf = vec![0.0f32; dimension];
-    for idx in 0..count {
-        for (d, slot) in vec_buf.iter_mut().enumerate() {
-            *slot = ((idx + d * 31) % 997) as f32 / 997.0;
-        }
-        normalize_in_place(&mut vec_buf);
-
-        let doc_id = SemanticDocId {
-            message_id: idx as u64,
-            chunk_idx: 0,
-            agent_id: (idx % 8) as u32,
-            workspace_id: 1,
-            source_id: 1,
-            role: 1,
-            created_at_ms: idx as i64,
-            content_hash: None,
-        }
-        .to_doc_id_string();
-
-        writer
-            .write_record(&doc_id, &vec_buf)
-            .expect("write_record");
-    }
-    writer.finish().expect("finish fsvi");
-
-    let index = VectorIndex::open(&path).expect("open fsvi");
-    (temp, index)
-}
-
-fn normalize_in_place(vec: &mut [f32]) {
-    let norm_sq: f32 = vec.iter().map(|v| v * v).sum();
-    let norm = norm_sq.sqrt();
-    if norm > 0.0 {
-        for v in vec {
-            *v /= norm;
-        }
-    }
-}
-
-fn build_query(dimension: usize) -> Vec<f32> {
-    let mut query = Vec::with_capacity(dimension);
-    for d in 0..dimension {
-        query.push((d % 17) as f32 / 17.0);
-    }
-    normalize_in_place(&mut query);
-    query
-}
-
-/// Benchmark vector search with 50k entries loaded from disk (F16 pre-conversion).
-/// This tests P0 Opt 1: Pre-Convert F16→F32 Slab at Load Time.
-/// Target (local, 2026-01-11): ~1.8ms with pre-conversion, ~4.6ms without.
-fn bench_vector_index_search_50k_loaded(c: &mut Criterion) {
-    let dimension = 384;
-    let count = 50_000;
-    let (temp, loaded) =
-        build_temp_fsvi_index("bench-embedder", dimension, Quantization::F16, count);
-    let query = build_query(dimension);
-
-    c.bench_function("vector_index_search_50k_loaded", |b| {
-        b.iter(|| {
-            let results = loaded
-                .search_top_k(black_box(&query), 25, None)
-                .unwrap_or_default();
-            black_box(results);
-        });
-    });
-    drop(temp);
-}
-
 // =============================================================================
 // Opt 1.1: F16 SIMD Dot Product Benchmarks
 // =============================================================================
@@ -797,11 +620,6 @@ criterion_group!(
     bench_answer_pack_token_budget_scaling,
     // Vector index benchmarks
     bench_empty_search,
-    bench_vector_index_search_10k,
-    bench_vector_index_search_50k,
-    bench_vector_index_search_50k_filtered,
-    bench_vector_index_search_50k_loaded,
-    bench_vector_search_scaling,
     // Opt 1.1: Dot product benchmarks (scalar vs SIMD)
     bench_dot_product_f32,
     bench_dot_product_f16,

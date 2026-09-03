@@ -1074,7 +1074,7 @@ mod tests {
     }
 
     /// fm-storage-frankensqlite-openread-cursor: file format incompatibility
-    /// between rusqlite-written DB and frankensqlite reader. Same quarantine
+    /// between rusqlite-written DB and the legacy embedded engine reader. Same quarantine
     /// repair as integrity-fail.
     #[test]
     fn pass6_fixture_fm_storage_frankensqlite_openread_cursor() {
@@ -1525,7 +1525,7 @@ mod tests {
         let data_dir = tmp.path().to_path_buf();
         // Inform-only: doctor does NOT auto-fix code regressions. Refusal
         // path proves it.
-        let outside = tmp.path().join("../src/search/two_tier_search.rs");
+        let outside = tmp.path().join("../src/search/query.rs");
         let run_id = RunId::from_parts("sha-search-uw", 1_700_000_000_000);
         let _ = crate::doctor_runs::create_run_dir(&data_dir, &run_id).unwrap();
         let res = mutate(MutationRequest {

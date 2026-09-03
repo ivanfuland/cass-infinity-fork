@@ -17,11 +17,12 @@
 mod util;
 
 use assert_cmd::Command;
+use coding_agent_search::search::canonicalize::CANONICALIZE_PIPELINE_VERSION;
 use coding_agent_search::search::policy::{CHUNKING_STRATEGY_VERSION, SEMANTIC_SCHEMA_VERSION};
 use coding_agent_search::search::semantic_manifest::{
     ArtifactRecord, BacklogLedger, BuildCheckpoint, SemanticManifest, TierKind,
 };
-use coding_agent_search::search::tantivy::{expected_index_dir, index_dir};
+use coding_agent_search::indexer::{expected_index_dir, index_dir};
 use coding_agent_search::storage::sqlite::FrankenStorage;
 use serde_json::{Value, json};
 use std::fs;
@@ -235,6 +236,7 @@ fn seed_semantic_progress_fixture(
             model_revision: "hash".to_string(),
             schema_version: SEMANTIC_SCHEMA_VERSION,
             chunking_version: CHUNKING_STRATEGY_VERSION,
+            canonicalize_version: Some(CANONICALIZE_PIPELINE_VERSION),
             dimension: 256,
             doc_count: 120,
             conversation_count: 12,
@@ -265,6 +267,7 @@ fn seed_semantic_progress_fixture(
         chunking_version: CHUNKING_STRATEGY_VERSION,
         saved_at_ms: 1_733_100_300_000,
         last_message_id: None,
+        last_message_id_conversation_id: None,
         cursor_exhausted: false,
     });
     manifest.save(data_dir).expect("save semantic manifest");

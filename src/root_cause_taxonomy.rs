@@ -7,7 +7,7 @@
 //! `status`, `doctor`, fleet probes, and incident mining attribute a failure to
 //! a *family* of root causes **without parsing human prose**. The motivating
 //! observation is that dependency and host issues routinely masquerade as CASS
-//! failures — frankensqlite `OpenRead`/FTS noise reads like a CASS bug, host
+//! failures — the legacy embedded engine's `OpenRead`/FTS noise reads like a CASS bug, host
 //! disk pressure or OOM reads like a hang, an old binary reads like a missing
 //! feature. Encoding the families as a closed enum with stable kebab-case wire
 //! values, per-family descriptors (examples, typical evidence, first probe,
@@ -43,7 +43,7 @@ pub enum RootCauseFamily {
     /// CASS's own derived state is wrong or stale (index, caches, summaries,
     /// quarantine, derived-asset truth-table drift).
     CassDerivedState,
-    /// The frankensqlite storage engine is the proximate cause (OpenRead/FTS
+    /// The legacy embedded engine storage engine is the proximate cause (OpenRead/FTS
     /// errors, WAL sidecar issues, busy locks, schema/migration failures).
     FrankensqliteStorage,
     /// The frankensearch search stack is the proximate cause (lexical/semantic
@@ -166,9 +166,9 @@ emptiness.",
             },
             RootCauseFamily::FrankensqliteStorage => RootCauseDescriptor {
                 family: self,
-                title: "frankensqlite storage engine fault",
+                title: "the legacy embedded engine storage engine fault",
                 examples: &[
-                    "OpenRead error opening the main DB under noisy fsqlite tracing",
+                    "OpenRead error opening the main DB under noisy the legacy engine crate tracing",
                     "FTS query fails while plain row reads succeed",
                     "WAL sidecar present but unreadable; busy-lock under concurrent writers",
                 ],
@@ -178,9 +178,9 @@ emptiness.",
                     "file:cass.db-wal",
                 ],
                 first_probe: "cass diag --json",
-                false_positive_guidance: "fsqlite INFO/TRACE log lines are noise, not evidence — \
+                false_positive_guidance: "the legacy engine crate INFO/TRACE log lines are noise, not evidence — \
 the robot hygiene chokepoint suppresses them in machine modes. Attribute here \
-only on a structured fsqlite error code or an OpenRead/FTS failure, never on \
+only on a structured the legacy engine crate error code or an OpenRead/FTS failure, never on \
 the presence of tracing output.",
             },
             RootCauseFamily::FrankensearchSearch => RootCauseDescriptor {
@@ -382,7 +382,7 @@ impl FromStr for RootCauseFamily {
 pub enum FaultLocus {
     /// The fault is in CASS proper.
     Cass,
-    /// The fault is in a bundled dependency (fsqlite/frankensearch/asupersync/…).
+    /// The fault is in a bundled dependency (the legacy engine crate/frankensearch/asupersync/…).
     Dependency,
     /// The fault is in the host environment (disk/OOM/load).
     Host,
@@ -398,7 +398,7 @@ pub enum FaultLocus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AttributionConfidence {
-    /// Direct, unambiguous evidence (e.g. an explicit fsqlite error code).
+    /// Direct, unambiguous evidence (e.g. an explicit the legacy engine crate error code).
     Confirmed,
     /// Strong but circumstantial evidence; the most likely single explanation.
     Probable,

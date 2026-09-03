@@ -27,7 +27,7 @@ use crate::pages::summary::{
     ExclusionSet, PrePublishSummary, SummaryFilters, SummaryGenerator, format_size,
 };
 use crate::storage::sqlite::FrankenStorage;
-use frankensqlite::Connection;
+use crate::storage::api::Conn as Connection;
 
 /// Deployment target for the export
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -976,15 +976,18 @@ impl PagesWizard {
     }
 
     /// Generate the pre-publish summary from the database.
+    ///
+    /// w1b Task B4 (Q4, control-plane approved 2026-08-26): this only ever
+    /// queries -- it never writes -- so it opens a genuine read-only
+    /// connection instead of a writable one. A writable open here would
+    /// have counted against the "at most 1 live writer connection per
+    /// path" invariant for no reason (write-topology inventory §②).
     fn generate_prepublish_summary(&self) -> Result<PrePublishSummary> {
-        let conn = Connection::open(self.state.db_path.to_string_lossy().as_ref())
-            .context("Failed to open database for summary generation")?;
-
-        conn.execute_batch(
-            "PRAGMA busy_timeout = 5000;
-             PRAGMA journal_mode = WAL;",
+        let conn = Connection::open_read_with(
+            &self.state.db_path,
+            crate::storage::api::OpenOptions { busy_timeout: std::time::Duration::from_millis(5000) },
         )
-        .context("Failed to set PRAGMAs for summary generation")?;
+        .context("Failed to open database for summary generation")?;
 
         let since_ts = self
             .state

@@ -11,7 +11,6 @@
 use coding_agent_search::connectors::{NormalizedConversation, NormalizedMessage};
 use coding_agent_search::indexer::persist::persist_conversation;
 use coding_agent_search::search::query::{FieldMask, SearchClient, SearchFilters};
-use coding_agent_search::search::tantivy::{TantivyIndex, index_dir};
 use coding_agent_search::storage::sqlite::SqliteStorage;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -57,22 +56,26 @@ fn generate_conversation(conv_id: i64, msg_count: i64) -> NormalizedConversation
 }
 
 /// Set up a test index with sample data.
+///
+/// W2-6 Task丙②: the returned `PathBuf` used to be a real Tantivy index
+/// directory; it is now just `data_dir` itself, passed through as
+/// `SearchClient::open`'s vestigial `index_path` arg (retained only for
+/// cache-namespace uniqueness -- lexical search is keyed entirely off
+/// `db_path` now). Kept as a distinct field (not folded into db_path) to
+/// avoid rippling the tuple shape through every call site below.
 fn setup_test_index(conv_count: i64, msgs_per_conv: i64) -> (TempDir, PathBuf, PathBuf) {
     let temp = TempDir::new().expect("create tempdir");
     let data_dir = temp.path().to_path_buf();
     let db_path = data_dir.join("concurrent_test.db");
-    let index_path = index_dir(&data_dir).expect("index path");
 
     let storage = SqliteStorage::open(&db_path).expect("open db");
-    let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
 
     for i in 0..conv_count {
         let conv = generate_conversation(i, msgs_per_conv);
-        persist_conversation(&storage, &mut t_index, &conv).expect("persist");
+        persist_conversation(&storage, &conv).expect("persist");
     }
-    t_index.commit().unwrap();
 
-    (temp, index_path, db_path)
+    (temp, data_dir, db_path)
 }
 
 // =============================================================================
@@ -303,22 +306,19 @@ fn concurrent_search_during_index() {
     let temp = TempDir::new().expect("create tempdir");
     let data_dir = temp.path().to_path_buf();
     let db_path = data_dir.join("concurrent_index.db");
-    let index_path = index_dir(&data_dir).expect("index path");
 
     // Create initial index with some data
     {
         let storage = SqliteStorage::open(&db_path).expect("open db");
-        let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
 
         for i in 0..500 {
             let conv = generate_conversation(i, 5);
-            persist_conversation(&storage, &mut t_index, &conv).expect("persist");
+            persist_conversation(&storage, &conv).expect("persist");
         }
-        t_index.commit().unwrap();
     }
 
     // Create search client
-    let client = SearchClient::open(&index_path, Some(&db_path))
+    let client = SearchClient::open(&data_dir, Some(&db_path))
         .expect("open")
         .expect("client");
 
@@ -326,10 +326,10 @@ fn concurrent_search_during_index() {
     let search_count = Arc::clone(&search_success);
 
     // Start search thread
-    let index_path_clone = index_path.clone();
+    let data_dir_clone = data_dir.clone();
     let db_path_clone = db_path.clone();
     let search_handle = thread::spawn(move || {
-        let client = SearchClient::open(&index_path_clone, Some(&db_path_clone))
+        let client = SearchClient::open(&data_dir_clone, Some(&db_path_clone))
             .expect("open")
             .expect("client");
 
@@ -348,16 +348,11 @@ fn concurrent_search_during_index() {
     // Perform indexing while searches are running
     let index_handle = thread::spawn(move || {
         let storage = SqliteStorage::open(&db_path).expect("open db");
-        let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
 
         for i in 500..1000 {
             let conv = generate_conversation(i, 5);
-            persist_conversation(&storage, &mut t_index, &conv).expect("persist");
-            if i % 100 == 0 {
-                t_index.commit().unwrap();
-            }
+            persist_conversation(&storage, &conv).expect("persist");
         }
-        t_index.commit().unwrap();
     });
 
     search_handle.join().expect("search thread");

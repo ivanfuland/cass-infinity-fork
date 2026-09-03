@@ -1,5 +1,5 @@
 use assert_cmd::cargo::cargo_bin_cmd;
-use coding_agent_search::search::tantivy::expected_index_dir;
+use coding_agent_search::search::lexical_index_health::searchable_index_exists;
 use std::fs;
 use std::path::Path;
 
@@ -150,7 +150,10 @@ fn index_then_tui_once_headless() {
     // Phase: verify artifacts
     let verify_start = tracker.start("verify_artifacts", Some("Checking index artifacts exist"));
     assert!(data_dir.join("agent_search.db").exists());
-    assert!(expected_index_dir(&data_dir).exists());
+    // W2-6 Task丙②: no more separate index directory (Tantivy retired); the
+    // DB-domain equivalent of "the index artifact exists" is a searchable
+    // sqlite-fts5 asset in the same DB checked above.
+    assert!(searchable_index_exists(&data_dir.join("agent_search.db")));
     let verify_ms = verify_start.elapsed().as_millis() as u64;
     tracker.end(
         "verify_artifacts",

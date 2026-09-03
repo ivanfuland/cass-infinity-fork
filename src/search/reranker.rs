@@ -1,13 +1,14 @@
 //! Reranker trait and types for cross-encoder reranking.
 //!
-//! This module re-exports the canonical [`Reranker`] trait from frankensearch's
-//! [`SyncRerank`](frankensearch::SyncRerank) trait. All reranking implementations
-//! must satisfy `Reranker`, which provides a synchronous reranking interface
-//! suitable for cass's sync call sites.
+//! This module re-exports the canonical [`Reranker`] trait from the
+//! W3-5-restored (verbatim, ex-frankensearch) [`SyncRerank`](crate::search::frankensearch_types::SyncRerank)
+//! trait. All reranking implementations must satisfy `Reranker`, which
+//! provides a synchronous reranking interface suitable for cass's sync call
+//! sites.
 //!
-//! The [`SyncRerankerAdapter`](frankensearch::SyncRerankerAdapter) can wrap any
-//! `Reranker` implementor into frankensearch's async `Reranker` trait when needed
-//! for the frankensearch search pipeline.
+//! The [`SyncRerankerAdapter`](crate::search::frankensearch_types::SyncRerankerAdapter)
+//! can wrap any `Reranker` implementor into the restored async `Reranker`
+//! trait when needed for the frankensearch-derived search pipeline.
 //!
 //! # Implementations
 //!
@@ -16,10 +17,10 @@
 
 use std::fmt;
 
-pub use frankensearch::SearchError as RerankerError;
-pub use frankensearch::SearchResult as RerankerResult;
-pub use frankensearch::SyncRerank as Reranker;
-pub use frankensearch::{RerankDocument, RerankScore};
+pub use crate::search::frankensearch_types::SearchError as RerankerError;
+pub use crate::search::frankensearch_types::SearchResult as RerankerResult;
+pub use crate::search::frankensearch_types::SyncRerank as Reranker;
+pub use crate::search::frankensearch_types::{RerankDocument, RerankScore};
 
 /// Convenience function to rerank raw text documents.
 ///

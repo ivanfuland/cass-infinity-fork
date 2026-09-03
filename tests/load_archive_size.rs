@@ -18,7 +18,6 @@
 use coding_agent_search::connectors::{NormalizedConversation, NormalizedMessage};
 use coding_agent_search::indexer::persist::persist_conversation;
 use coding_agent_search::search::query::{FieldMask, SearchClient, SearchFilters};
-use coding_agent_search::search::tantivy::{TantivyIndex, index_dir};
 use coding_agent_search::storage::sqlite::SqliteStorage;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -154,25 +153,22 @@ fn setup_load_index(
     let temp = TempDir::new().expect("create tempdir");
     let data_dir = temp.path().to_path_buf();
     let db_path = data_dir.join("load_test.db");
-    let index_path = index_dir(&data_dir).expect("index path");
 
     let storage = SqliteStorage::open(&db_path).expect("open db");
-    let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
 
     let start = Instant::now();
     for i in 0..conv_count {
         let conv = generate_conversation(i, msgs_per_conv, content_size);
-        persist_conversation(&storage, &mut t_index, &conv).expect("persist");
+        persist_conversation(&storage, &conv).expect("persist");
 
         // Progress logging for large tests
         if (i + 1) % 1000 == 0 {
             println!("  Indexed {}/{} conversations...", i + 1, conv_count);
         }
     }
-    t_index.commit().unwrap();
     let index_duration = start.elapsed();
 
-    let client = SearchClient::open(&index_path, Some(&db_path))
+    let client = SearchClient::open(&data_dir, Some(&db_path))
         .expect("open client")
         .expect("client available");
 

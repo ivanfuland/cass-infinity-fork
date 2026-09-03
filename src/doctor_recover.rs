@@ -3,13 +3,13 @@
 //! When the read-only pre-index health gate refuses to index because the
 //! canonical `agent_search.db` is corrupt, the operator previously hit a wall:
 //! `doctor repair` refuses an unreadable archive, a stock-sqlite `.recover`
-//! rebuild is rejected by frankensqlite on readonly open, and the only working
+//! rebuild is rejected by the legacy embedded engine on readonly open, and the only working
 //! path was a hand-rolled JSONL reconstruction from cass's own preserved
 //! events. This module turns that working recovery into first-class commands:
 //!
 //! * [`run_doctor_recover_from_archive`] rebuilds the source JSONL tree from the
 //!   canonical archive's preserved `extra_json`/`extra_bin` envelopes so the
-//!   data can be re-ingested into a fresh, frankensqlite-native archive — no
+//!   data can be re-ingested into a fresh, the legacy embedded engine-native archive — no
 //!   `.recover` and no external SQLite tool needed.
 //! * [`run_doctor_rebuild_canonical_fts`] drops and rebuilds the canonical FTS5
 //!   shadow tables in place (the exact out-of-band fix that resolved the
@@ -141,7 +141,7 @@ fn sanitize_path_component(raw: &str) -> String {
 /// `target_dir` receives one `.jsonl` file per reconstructable conversation.
 /// The canonical archive is opened read-only and never mutated. After this
 /// completes the operator can `cass index --full` over `target_dir` to produce
-/// a fresh frankensqlite-native archive.
+/// a fresh the legacy embedded engine-native archive.
 pub fn run_doctor_recover_from_archive(
     data_dir_override: Option<PathBuf>,
     db_override: Option<PathBuf>,
@@ -333,93 +333,6 @@ pub fn run_doctor_recover_from_archive(
     Ok(())
 }
 
-/// Drop and rebuild the canonical FTS5 shadow tables in place.
-///
-/// This is the supported equivalent of the reporter's out-of-band fix for
-/// derived/FTS5 corruption (malformed `fts_messages_docsize`, etc.) where the
-/// canonical `messages`/`conversations` rows are intact. The FTS5 shadow is a
-/// derived, fully-rebuildable structure: `rebuild_fts` drops `fts_messages` and
-/// regenerates every shadow row from the canonical `messages` table. The
-/// canonical rows are never touched.
-pub fn run_doctor_rebuild_canonical_fts(
-    data_dir_override: Option<PathBuf>,
-    db_override: Option<PathBuf>,
-    yes: bool,
-    structured_format: Option<RobotFormat>,
-) -> CliResult<()> {
-    let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
-    let db_path = resolve_db_path(&data_dir, db_override.as_deref());
-
-    if !yes {
-        return Err(CliError {
-            code: 4,
-            kind: "refused-unsafe",
-            message: "`cass doctor --rebuild-canonical-fts` mutates the canonical archive's derived FTS5 shadow and requires `--yes`".to_string(),
-            hint: Some(
-                "Re-run with `--rebuild-canonical-fts --yes`. The canonical messages/conversations rows are never modified; only the rebuildable FTS5 shadow tables are dropped and regenerated.".to_string(),
-            ),
-            retryable: false,
-        });
-    }
-
-    if !db_path.exists() {
-        return Err(storage_error(
-            format!("canonical archive {} does not exist", db_path.display()),
-            Some("Recover the source tree with 'cass doctor --recover-from-archive <DIR>' first."),
-        ));
-    }
-
-    // A read-write open is required to drop/recreate the shadow tables. The
-    // canonical rows are intact in this code path (corruption is in the derived
-    // FTS5 shadow), so a normal open is the right authority.
-    let storage = FrankenStorage::open(&db_path).map_err(|e| {
-        storage_error(
-            format!(
-                "could not open canonical archive {} for FTS5 rebuild: {e:#}",
-                db_path.display()
-            ),
-            Some(
-                "If the archive cannot be opened at all, the canonical rows are unreadable — use \
-                 'cass doctor --recover-from-archive <DIR>' to rebuild the source tree instead.",
-            ),
-        )
-    })?;
-
-    let message_count = storage
-        .total_message_count()
-        .map_err(|e| storage_error(format!("counting messages before FTS rebuild: {e:#}"), None))?;
-
-    storage.rebuild_fts().map_err(|e| {
-        storage_error(
-            format!("dropping and rebuilding canonical FTS5 shadow tables: {e:#}"),
-            Some(
-                "If the canonical messages table itself is unreadable, recover the source tree with \
-                 'cass doctor --recover-from-archive <DIR>' and re-ingest.",
-            ),
-        )
-    })?;
-
-    let envelope = serde_json::json!({
-        "schema_version": 1,
-        "doctor_contract_version": 1,
-        "kind": "rebuild_canonical_fts",
-        "db_path": db_path.display().to_string(),
-        "messages_reindexed": message_count,
-        "mutated_asset_class": "canonical_fts5_shadow",
-        "canonical_rows_modified": false,
-        "note": "Dropped fts_messages and regenerated every FTS5 shadow row from the canonical messages table. The canonical messages/conversations rows were not modified.",
-    });
-
-    if structured_format.is_some() {
-        print_json(&envelope)?;
-    } else {
-        println!(
-            "Rebuilt canonical FTS5 shadow tables ({message_count} messages re-indexed) in {}",
-            db_path.display()
-        );
-    }
-    Ok(())
-}
 
 /// Quarantine interrupted `raw_mirror_capture` staging artifacts.
 ///
@@ -559,7 +472,7 @@ pub fn run_doctor_cleanup_interrupted_artifacts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use frankensqlite::compat::{ConnectionExt as _, ParamValue, RowExt as _};
+    use crate::storage::api::Value as ParamValue;
 
     fn write_message(storage: &FrankenStorage, conversation_id: i64, idx: i64, raw_line: &str) {
         // Store the verbatim line via the historical-raw-json sentinel wrapper
@@ -568,7 +481,7 @@ mod tests {
         let extra = serde_json::to_string(&wrapper).unwrap();
         storage
             .raw()
-            .execute_compat(
+            .execute(
                 "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin) \
                  VALUES(?1, ?2, 'user', NULL, ?3, ?4, ?5, NULL)",
                 &[
@@ -587,7 +500,7 @@ mod tests {
         // migrations, so a conversation row needs a real agent first.
         storage
             .raw()
-            .execute_compat(
+            .execute(
                 "INSERT INTO agents(slug, name, version, kind, created_at, updated_at) \
                  VALUES('claude', 'Claude Code', NULL, 'cli', 1000, 1000)",
                 &[] as &[ParamValue],
@@ -609,7 +522,7 @@ mod tests {
     ) -> i64 {
         storage
             .raw()
-            .execute_compat(
+            .execute(
                 "INSERT INTO conversations(agent_id, external_id, title, source_path, started_at) \
                  VALUES(?1, ?2, ?3, ?4, 1000)",
                 &[
@@ -739,21 +652,5 @@ mod tests {
             .join("interrupted-artifacts");
         assert!(quarantine.join("capture.dead1").exists());
         assert!(quarantine.join("capture.dead2").exists());
-    }
-
-    #[test]
-    fn rebuild_canonical_fts_refuses_without_yes() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let db_path = tmp.path().join("agent_search.db");
-        {
-            let _storage = FrankenStorage::open(&db_path).expect("open db");
-        }
-        let refused = run_doctor_rebuild_canonical_fts(
-            Some(tmp.path().to_path_buf()),
-            Some(db_path),
-            false,
-            Some(RobotFormat::Json),
-        );
-        assert!(refused.is_err());
     }
 }
