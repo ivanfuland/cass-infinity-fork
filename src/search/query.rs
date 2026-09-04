@@ -1435,6 +1435,21 @@ pub struct SearchHit {
     /// Origin host label for remote sources
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin_host: Option<String>,
+    // Chunk-domain provenance (T9, plan v5.1): which message the hit came
+    // from at the block-search layer, and which of that message's chunks
+    // won the KNN/MaxSim fold. `None` for lexical-only hits (they never
+    // went through the chunk domain at all) and for semantic hits from a
+    // corpus with no `message_chunks` data for this message (should not
+    // happen once the chunk domain is active, but the type does not
+    // assume it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub winning_chunk_idx: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub winning_chunk_span: Option<(usize, usize)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub winning_chunk_hash: Option<String>,
 }
 
 static LAZY_FIELDS_ENABLED: Lazy<bool> = Lazy::new(|| {
@@ -1536,6 +1551,17 @@ pub struct SearchResult {
     /// `None`; robot output then reports `total_matches` as a lower bound
     /// instead of forcing an expensive exact recount.
     pub total_count: Option<usize>,
+    /// Chunk-domain semantic candidate-search diagnostics (T9, plan v5.1)
+    /// -- `None` for a lexical-only result (nothing to report) or a
+    /// hybrid result whose semantic leg degraded (`semantic_degraded`
+    /// carries that fact instead).
+    pub candidates: Option<CandidateMeta>,
+    /// T9 (plan v5.1) lexical fail-open: `true` when `search_hybrid`'s
+    /// semantic leg was skipped because the vector domain was
+    /// `absent`/`building` or Infinity was unreachable, and only the
+    /// lexical leg's hits are returned. `search_semantic` itself never
+    /// sets this -- it keeps reporting those conditions as a hard `Err`.
+    pub semantic_degraded: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -2119,42 +2145,120 @@ struct SemanticCandidateSearchRequest {
     fetch_limit: usize,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-struct SemanticCandidateRetryState {
-    has_more_candidates: bool,
-    exact_window_may_omit_competitor: bool,
-    /// R2-B6: observability signal for whether the streaming full-scan
-    /// retry actually ran (distinct from `has_more_candidates`, which is
-    /// about the *caller's* widen-further decision, not this fact). Test-
-    /// visible via the returned struct rather than a `cfg(test)`-only
-    /// counter.
-    second_pass_taken: bool,
+/// T9 (plan v5.1): chunk-domain candidate-search mode a caller can observe
+/// via `CandidateMeta.mode` -- whether the KNN window alone satisfied
+/// `fetch_limit`, or a second, budgeted exact scan had to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum CandidateMode {
+    #[serde(rename = "knn")]
+    Knn,
+    #[serde(rename = "knn+exact")]
+    KnnExact,
 }
 
-/// R2-B6: max-heap ordering for the streaming full-scan retry's bounded
-/// top-`fetch_limit` candidate set -- keeps the *largest* distance at the
-/// heap's root so it's the one evicted when a closer candidate arrives.
-/// `f64` has no `Ord` (NaN), so this wraps it with a `partial_cmp` that
-/// falls back to `Equal`, matching the existing sort fallback this
-/// function's non-streaming sibling already used.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct DbVectorFullScanCandidate {
+/// T9 (plan v5.1): observability/diagnostics envelope for one chunk-domain
+/// semantic candidate search, surfaced to callers via `SearchResult.
+/// candidates` and the `_meta.candidates` JSON/JSONL/robot envelope field.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CandidateMeta {
+    pub mode: CandidateMode,
+    /// The `k` passed to `vec0`'s KNN (`min(fetch_limit * 4, 4096)`).
+    pub k: usize,
+    /// Raw `vec0` KNN row count, before the message-id fold or any
+    /// relational filter.
+    pub first_round_rows: usize,
+    /// Final unique-message count in the returned candidate set (after
+    /// folding, filtering, and -- if it ran -- the exact-scan round).
+    pub unique_messages: usize,
+    /// `true` iff a triggered exact-scan round hit `EXACT_SCAN_ROW_BUDGET`
+    /// before it could confirm it had found every filter-passing message.
+    pub incomplete: bool,
+    pub reason: Option<String>,
+}
+
+impl CandidateMeta {
+    /// Degenerate zero-candidate meta for an empty/zero-limit query that
+    /// never reaches `search_db_vector_domain` at all.
+    fn empty() -> Self {
+        CandidateMeta { mode: CandidateMode::Knn, k: 0, first_round_rows: 0, unique_messages: 0, incomplete: false, reason: None }
+    }
+}
+
+/// Row budget for the chunk-domain exact-scan fallback (T9, plan v5.1
+/// parameter freeze): `max(6_000_000, 3 * chunks_total_v2)` rounded up to
+/// the nearest million, where `chunks_total_v2 = 1,998,705` is T2 Step 6's
+/// real `normalize_v2.py` count over the production corpus
+/// (`W4_ARTIFACTS/volume-stats.json`'s `v2.chunks_total_v2`) -> `3 *
+/// 1,998,705 = 5,996,115`, so the `max` picks the floor: `6,000,000`. The
+/// budget's job is "never truncate a single full-corpus exact scan of the
+/// active generation's own `message_chunks` rows" -- `3x` covers the worst
+/// case of three generations' rows coexisting (active + pending + one not
+/// yet cleaned up by T11's `cleanup_orphaned_generations`) while the exact
+/// scan itself only ever reads one (`generation_id`-scoped) generation's
+/// rows, so `1x` would already suffice; `3x` is deliberate headroom, not a
+/// derivation of an actual per-scan row count.
+/// R1-W3-B6/N1/B9 (inherited from the retired v4 path): the caller-side
+/// overfetch multiplier `search_semantic_with_meta` applies to `target_hits`
+/// (`limit + offset`) before dispatching to `search_db_vector_domain`, and
+/// (unchanged, same constant, same value) the multiplier that function's
+/// own KNN round applies to `fetch_limit` to derive vec0's `k`. Hoisted to
+/// module scope (T9, control-plane 2026-09-04 ruling, 方案②) so both
+/// layers share one definition rather than two numerically-coincidental
+/// constants: the candidate layer (`search_db_vector_domain`) fills
+/// `unique_messages` to exactly the `fetch_limit` it is given -- no
+/// internal headroom of its own -- so the caller is the one responsible
+/// for asking for enough candidates that `postprocess_hits_page`'s
+/// post-hoc dedup/session_paths/role filtering still has room to reach
+/// `limit` after its own reductions, exactly as the retired outer retry's
+/// `fallback_fetch_limit` used to paper over on a second dispatch; this
+/// makes the first (and now only) dispatch already ask for that headroom
+/// instead.
+const OVERFETCH_FACTOR: usize = 4;
+
+const EXACT_SCAN_ROW_BUDGET: usize = 6_000_000;
+
+/// Test-only override for `EXACT_SCAN_ROW_BUDGET` (`0` = unset, use the
+/// real constant) -- lets tests exercise the budget-exceeded path without
+/// scanning millions of synthetic rows. Plain `AtomicUsize`, not a
+/// `Mutex`/`RefCell`: this codebase's own testing discipline mandates
+/// `--test-threads=1` for `--lib` runs, so there is never genuine
+/// cross-test concurrency to race against.
+static EXACT_SCAN_ROW_BUDGET_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn set_exact_scan_row_budget_for_test(n: usize) {
+    EXACT_SCAN_ROW_BUDGET_OVERRIDE.store(n, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn reset_exact_scan_row_budget_for_test() {
+    EXACT_SCAN_ROW_BUDGET_OVERRIDE.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn effective_exact_scan_row_budget() -> usize {
+    let overridden = EXACT_SCAN_ROW_BUDGET_OVERRIDE.load(std::sync::atomic::Ordering::SeqCst);
+    if overridden == 0 { EXACT_SCAN_ROW_BUDGET } else { overridden }
+}
+
+/// Sentinel embedded in a `StorageError::Other` raised from inside the
+/// exact-scan streaming callback (`SearchClient::search_db_vector_domain`)
+/// to abort the SQLite read early once `EXACT_SCAN_ROW_BUDGET` rows have
+/// been scanned -- distinguished from a genuine error (which must still
+/// propagate, plan v5.1 Global Constraints "错误上抛") by this exact
+/// substring.
+const EXACT_SCAN_ROW_BUDGET_SENTINEL: &str = "__cass_exact_scan_row_budget_exceeded__";
+
+/// One winning-chunk candidate folded to its owning message (T9, plan
+/// v5.1: MaxSim -- the best-scoring chunk stands in for its whole
+/// message).
+#[derive(Debug, Clone)]
+struct ChunkFoldedCandidate {
+    message_id: i64,
     distance: f64,
-    doc_id: i64,
-}
-
-impl Eq for DbVectorFullScanCandidate {}
-
-impl PartialOrd for DbVectorFullScanCandidate {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for DbVectorFullScanCandidate {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.distance.partial_cmp(&other.distance).unwrap_or(std::cmp::Ordering::Equal)
-    }
+    chunk_idx: u32,
+    span: (usize, usize),
+    content_hash: String,
 }
 
 struct SemanticQueryEmbedding {
@@ -3520,19 +3624,28 @@ impl SearchClient {
     /// (expected-small, precisely because this path only runs when the
     /// filter was too selective for the first KNN pass to satisfy)
     /// filtered subset by an application-layer cosine distance instead.
-    fn build_db_vector_domain_full_scan_sql(
+    /// T9 (plan v5.1): chunk-domain counterpart of the retired v4
+    /// `message_embeddings`-backed full scan. Streams `(message_id,
+    /// chunk_id, chunk_idx, byte_start, byte_end, content_hash,
+    /// embedding)` for every `message_chunks` row of `generation_id` that
+    /// passes the same relational filters `build_db_vector_domain_filter_sql`
+    /// applies post-KNN -- the exact-scan fallback's source of truth when
+    /// the first `vec0` KNN pass's window was full but the relational
+    /// filter left too few *unique messages* to satisfy `fetch_limit`.
+    fn build_chunk_full_scan_sql(
         generation_id: i64,
         filters: &SearchFilters,
         effective_roles: Option<&HashSet<u8>>,
     ) -> (String, Vec<ParamValue>) {
         let mut sql = String::from(
-            "SELECT me.doc_id, me.embedding \
-             FROM message_embeddings me \
-             JOIN messages m ON m.id = me.doc_id \
+            "SELECT mc.message_id, mc.chunk_id, mc.chunk_idx, mc.byte_start, mc.byte_end, \
+                    mc.content_hash, mc.embedding \
+             FROM message_chunks mc \
+             JOIN messages m ON m.id = mc.message_id \
              JOIN conversations c ON c.id = m.conversation_id \
              LEFT JOIN workspaces w ON w.id = c.workspace_id \
              LEFT JOIN sources s ON s.id = c.source_id \
-             WHERE me.generation_id = ?",
+             WHERE mc.generation_id = ?",
         );
         let mut params: Vec<ParamValue> = vec![ParamValue::from(generation_id)];
 
@@ -3544,8 +3657,8 @@ impl SearchClient {
     /// Cosine distance matching `vec0`'s `distance_metric=cosine` (`1 -
     /// cosine_similarity`) exactly, so a hit's distance/score is
     /// indistinguishable to a caller whether it came from `vec0`'s KNN
-    /// scan (first round) or this application-layer computation (R1-W3-B6/
-    /// N1/B9's full-scan retry round). A degenerate zero vector on either
+    /// scan (first round) or this application-layer computation (the
+    /// exact-scan fallback round). A degenerate zero vector on either
     /// side has no defined direction, so it is treated as maximally
     /// distant (`1.0`) rather than dividing by zero.
     fn cosine_distance(a: &[f32], b: &[f32]) -> f64 {
@@ -3558,26 +3671,55 @@ impl SearchClient {
         1.0 - (dot / (norm_a * norm_b))
     }
 
+    /// T9 (plan v5.1) chunk-domain KNN + MaxSim fold + budgeted exact-scan
+    /// candidate search. Reads the active generation's `message_chunks` /
+    /// `vec_index_gen_<id>` (rowid = `chunk_id` for a v5 chunk-domain
+    /// generation) inside **one** read transaction, same same-snapshot
+    /// requirement the retired v4 path observed.
+    ///
+    /// Contract (unchanged three states, w3-d7①): `Err` with
+    /// `vector_domain_state=building`/`=absent`, or `Ok` with an empty
+    /// `Vec` for a genuinely empty active generation.
+    ///
+    /// Two-round design (plan v5.1 "KNN" parameter-freeze row):
+    /// - Round 1: `vec0` KNN over `chunk_id`s at `k = min(fetch_limit * 4,
+    ///   4096)`, `first_round_rows` = the raw row count `vec0` returned
+    ///   (before any JOIN/fold/filter); JOIN `message_chunks` for each
+    ///   `chunk_id` to recover its `message_id` and provenance, fold to
+    ///   one candidate per `message_id` keeping the *first* occurrence
+    ///   (the KNN result is already `ORDER BY distance`, so the first hit
+    ///   for a given message is its minimum-distance chunk -- MaxSim),
+    ///   then apply the same relational filters `build_db_vector_domain_
+    ///   filter_sql` always has (message-id keyed, domain-agnostic).
+    /// - Round 2 (only when the window was fully saturated *and* the
+    ///   filtered round-1 result still falls short of `fetch_limit` --
+    ///   i.e. the relational filter, not corpus size, is why round 1 came
+    ///   up short): a budgeted, streaming exact scan of every remaining
+    ///   `message_chunks` row for this generation (skipping messages round
+    ///   1 already resolved), folding the same way but across the *whole*
+    ///   filtered universe rather than just the KNN window, ranked by true
+    ///   cosine distance and truncated to however many more messages
+    ///   round 1 still needs. Bounded by `EXACT_SCAN_ROW_BUDGET` total
+    ///   rows scanned (not output size) -- a budget breach sets
+    ///   `incomplete=true, reason="exact_scan_row_budget"` rather than
+    ///   erroring; any other row-decode/SQL failure still propagates.
+    ///
+    /// Final order is always `(score desc, message_id asc)` -- stable
+    /// regardless of which round(s) contributed a given message.
     fn search_db_vector_domain(
         conn: &Connection,
         embedding: &[f32],
         filters: &SearchFilters,
         default_roles: Option<&HashSet<u8>>,
         fetch_limit: usize,
-    ) -> Result<(Vec<VectorSearchResult>, SemanticCandidateRetryState)> {
-        const OVERFETCH_FACTOR: usize = 4;
-        // R1-W3-B6/N1/B9: sqlite-vec 0.1.10's vec0 KNN implementation hard-
-        // rejects `k > 4096` as a genuine `SQLITE_ERROR` (`SQLITE_VEC_VEC0_
-        // K_MAX`, verified against the vendored C source, not a documented
-        // assumption) -- not a silent clamp. Any caller upstream of this
-        // function deriving a large `fetch_limit` (hybrid fusion's semantic-
-        // leg candidate budget compounding with this function's own
-        // `OVERFETCH_FACTOR`, B9's exec60-observed `--limit 5000` ->
-        // `k=80016` crash) must never let `first_k` below reach vec0 above
-        // this ceiling. This is the single choke point every DB-vector-
-        // domain KNN call passes through, so clamping here protects every
-        // caller at once rather than requiring each upstream candidate-
-        // budget computation to know about vec0's internal limit.
+    ) -> Result<(Vec<VectorSearchResult>, CandidateMeta)> {
+        // R1-W3-B6/N1/B9 (inherited from the retired v4 path, still true
+        // of this vec0 build): sqlite-vec's vec0 KNN implementation hard-
+        // rejects `k > 4096` as a genuine `SQLITE_ERROR`, not a silent
+        // clamp -- this is the single choke point every DB-vector-domain
+        // KNN call passes through, so clamping here protects every caller
+        // at once. Plan v5.1 parameter freeze: `k = min(fetch.saturating_
+        // mul(4), 4096)`.
         const SQLITE_VEC_KNN_K_MAX: usize = 4096;
 
         let effective_roles = filters.roles.clone().or_else(|| default_roles.cloned());
@@ -3611,13 +3753,23 @@ impl SearchClient {
             };
 
             let row_count: i64 = tx.query_row_map(
-                "SELECT count(*) FROM message_embeddings WHERE generation_id = ?1",
+                "SELECT count(*) FROM message_chunks WHERE generation_id = ?1",
                 &crate::storage::api::params![generation_id],
                 |row| row.get_typed(0),
             )?;
             if row_count == 0 {
                 // Genuinely empty archive (w3-d7①): not an error.
-                return Ok((Vec::new(), SemanticCandidateRetryState::default()));
+                return Ok((
+                    Vec::new(),
+                    CandidateMeta {
+                        mode: CandidateMode::Knn,
+                        k: 0,
+                        first_round_rows: 0,
+                        unique_messages: 0,
+                        incomplete: false,
+                        reason: None,
+                    },
+                ));
             }
 
             let vec0_table = format!("vec_index_gen_{generation_id}");
@@ -3641,191 +3793,218 @@ impl SearchClient {
             }
 
             let row_count_usize = usize::try_from(row_count).unwrap_or(usize::MAX);
-            let first_k = fetch_limit
+            let k = fetch_limit
                 .saturating_mul(OVERFETCH_FACTOR)
                 .min(row_count_usize)
                 .min(SQLITE_VEC_KNN_K_MAX)
                 .max(1);
 
-            let run_and_filter = |tx: &crate::storage::api::Tx, k: usize| -> Result<Vec<(i64, f64)>, crate::storage::api::StorageError> {
-                let blob = crate::storage::schema::f32_vector_to_le_blob(embedding);
-                let k_i64 = i64::try_from(k).unwrap_or(i64::MAX);
-                let candidates: Vec<(i64, f64)> = tx.query_all_map(
-                    &format!(
-                        "SELECT rowid, distance FROM {vec0_table} WHERE embedding MATCH ?1 AND k = ?2 ORDER BY distance"
-                    ),
-                    &crate::storage::api::params![blob, k_i64],
-                    |row| Ok((row.get_typed::<i64>(0)?, row.get_typed::<f64>(1)?)),
-                )?;
-                if candidates.is_empty() {
-                    return Ok(Vec::new());
-                }
+            let blob = crate::storage::schema::f32_vector_to_le_blob(embedding);
+            let k_i64 = i64::try_from(k).unwrap_or(i64::MAX);
+            // Round 1: raw vec0 KNN over chunk_id rowids, ORDER BY distance
+            // (ascending -- closest first). `first_round_rows` is this
+            // row count exactly as returned, before any JOIN/fold/filter.
+            let raw_knn: Vec<(i64, f64)> = tx.query_all_map(
+                &format!(
+                    "SELECT rowid, distance FROM {vec0_table} WHERE embedding MATCH ?1 AND k = ?2 ORDER BY distance"
+                ),
+                &crate::storage::api::params![blob, k_i64],
+                |row| Ok((row.get_typed::<i64>(0)?, row.get_typed::<f64>(1)?)),
+            )?;
+            let first_round_rows = raw_knn.len();
 
-                let candidate_ids: Vec<i64> = candidates.iter().map(|(doc_id, _)| *doc_id).collect();
-                let (sql, params) =
-                    Self::build_db_vector_domain_filter_sql(&candidate_ids, filters, effective_roles.as_ref());
-
-                let passing_ids: std::collections::HashSet<i64> =
-                    tx.query_all_map(&sql, &params, |row| row.get_typed(0))?
-                        .into_iter()
-                        .collect();
-
-                Ok(candidates
-                    .into_iter()
-                    .filter(|(doc_id, _)| passing_ids.contains(doc_id))
-                    .collect())
-            };
-
-            // R1-W3-B6/N1/B9: the "widen to full coverage" retry no longer
-            // asks `vec0` for a bigger `k` at all (that path is exactly what
-            // used to hard-error past `SQLITE_VEC_KNN_K_MAX`, or -- pre-fix,
-            // for a generation small enough to dodge that limit -- falsely
-            // report `has_more_candidates=false` for a scan that a caller
-            // upstream might not actually have widened all the way to
-            // `row_count_usize`). This retry only fires when the first
-            // KNN pass's overfetch window left fewer than `fetch_limit`
-            // *filtered* hits -- i.e. the relational filter is selective --
-            // so filtering *before* ranking (SQL `WHERE` over
-            // `message_embeddings` directly) and then computing distance
-            // only for that already-small passing subset in Rust is cheap
-            // in exactly the case that triggers it; a query whose filter
-            // isn't selective never gets here because the first pass
-            // already found enough.
-            // R2-B6: streaming, not `query_all_map`-then-collect-then-sort --
-            // the old version's `Vec<(i64, Vec<u8>)>` held every row's
-            // decoded BLOB simultaneously (~4.16GB @ 101.6万×1024f32), which
-            // is exactly the OOM this retry was supposed to be the *safe*
-            // fallback from. Each row's BLOB is decoded, scored, and
-            // discarded immediately; only a bounded max-heap of (distance,
-            // doc_id) survives past a single row's scope. Heap capacity is
-            // `first_k.max(fetch_limit)`, not the bare `fetch_limit`
-            // parameter: `first_k` is already `fetch_limit *
-            // OVERFETCH_FACTOR` (the same overfetch budget the first KNN
-            // pass used) whenever it isn't clamp-limited, and the `.max`
-            // keeps the cap from dropping *below* `fetch_limit` itself in
-            // the (K-max-clamped) shape where `first_k` came out smaller.
-            // Capping below `first_k` here would silently truncate the
-            // exact-search caller's overfetch window on the retry path even
-            // though the first-pass path deliberately never does (see the
-            // "Do NOT truncate to `fetch_limit`" note below) -- this is why
-            // the primary correctness test's 3-of-3 and the perf
-            // disclosure's 5-of-5 target docs both still come back whole
-            // (their filtered universes are `<= first_k`), while a filtered
-            // universe genuinely larger than the overfetch budget now
-            // reports `has_more_candidates=true` (`total_seen > cap`)
-            // instead of the old code's unconditional "retry always
-            // covered everything" claim, which stopped being true the
-            // moment a cap existed at all.
-            let full_scan_by_distance_streaming = |tx: &crate::storage::api::Tx,
-                                                     cap: usize|
-             -> Result<(Vec<(i64, f64)>, bool), crate::storage::api::StorageError> {
-                let (sql, params) = Self::build_db_vector_domain_full_scan_sql(
-                    generation_id,
-                    filters,
-                    effective_roles.as_ref(),
-                );
-                // R3-3: `cap` (`first_k.max(fetch_limit)` at the call site)
-                // comes directly from an unclamped `usize` `--limit` --
-                // `with_capacity(cap + 1)` on a pathological value (e.g.
-                // `usize::MAX - 1`) either overflows the `+ 1` or tries an
-                // allocation far larger than the generation could ever need,
-                // aborting the process. The heap can never usefully hold
-                // more than the generation's own row count, so clamp to
-                // that (already computed above as `row_count_usize`) before
-                // sizing the allocation.
-                let cap = cap.min(row_count_usize).max(1);
-                let heap: std::cell::RefCell<std::collections::BinaryHeap<DbVectorFullScanCandidate>> =
-                    std::cell::RefCell::new(std::collections::BinaryHeap::with_capacity(cap + 1));
-                let total_seen = std::cell::Cell::new(0usize);
-                tx.query_all_map(&sql, &params, |row| -> Result<(), crate::storage::api::StorageError> {
-                    let doc_id: i64 = row.get_typed(0)?;
-                    let blob: Vec<u8> = row.get_typed(1)?;
-                    let vector = crate::storage::schema::le_blob_to_f32_vector(&blob)?;
-                    let distance = Self::cosine_distance(&vector, embedding);
-                    let candidate = DbVectorFullScanCandidate { distance, doc_id };
-                    total_seen.set(total_seen.get() + 1);
-                    let mut heap = heap.borrow_mut();
-                    if heap.len() < cap {
-                        heap.push(candidate);
-                    } else if heap.peek().is_some_and(|worst| candidate < *worst) {
-                        heap.pop();
-                        heap.push(candidate);
-                    }
-                    Ok(())
-                })?;
-                let mut ranked: Vec<(i64, f64)> = heap
-                    .into_inner()
-                    .into_iter()
-                    .map(|c| (c.doc_id, c.distance))
-                    .collect();
-                ranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-                let truncated = total_seen.get() > cap;
-                Ok((ranked, truncated))
-            };
-
-            let mut filtered = run_and_filter(tx, first_k)?;
-            // R2-B6: a large `fetch_limit` alone (clamp-limited `first_k`,
-            // e.g. `SQLITE_VEC_KNN_K_MAX`) is not evidence the relational
-            // filter is selective -- if the filter passed every candidate
-            // the first KNN pass found (`filtered.len() == first_k`), the
-            // corpus genuinely has more matches than the clamp let this
-            // pass see, and `has_more_candidates=true` already tells the
-            // caller that; a full-scan retry in that shape would re-read
-            // (up to) the *entire* generation for a filter that eliminated
-            // nothing, which is the resource-exhaustion path this retry
-            // exists to avoid, not resolve. The retry is only for the
-            // opposite shape: the filter genuinely thinned the KNN window
-            // (`filtered.len() < first_k`) down below what the caller asked
-            // for, so widening past `first_k` to the full (filtered, and
-            // thus expected-small) generation is the correct fix.
-            let filter_eliminated_candidates = filtered.len() < first_k;
-            let mut has_more_candidates = first_k < row_count_usize;
-            let mut second_pass_taken = false;
-            if filter_eliminated_candidates
-                && filtered.len() < fetch_limit
-                && first_k < row_count_usize
-            {
-                second_pass_taken = true;
-                let (scanned, truncated) = full_scan_by_distance_streaming(tx, first_k.max(fetch_limit))?;
-                filtered = scanned;
-                has_more_candidates = truncated;
+            if raw_knn.is_empty() {
+                return Ok((
+                    Vec::new(),
+                    CandidateMeta {
+                        mode: CandidateMode::Knn,
+                        k,
+                        first_round_rows: 0,
+                        unique_messages: 0,
+                        incomplete: false,
+                        reason: None,
+                    },
+                ));
             }
 
-            // Do NOT truncate to `fetch_limit` here: `filtered` is already a
-            // bounded overfetch window (`first_k`, or the retry's own
-            // `fetch_limit`-capped heap), matching the fsvi exact-search contract
-            // (`semantic_exact_candidate_limit`/`collapse_semantic_results`)
-            // that `search_semantic_with_tier` relies on: it applies
-            // post-hoc filters (session_paths, dedup) and its own
-            // limit/offset paging AFTER candidate search, on the full
-            // returned window, not on a pre-truncated slice. Truncating to
-            // `fetch_limit` here silently dropped the domain-passing
-            // candidates a caller-side filter still needed to search
-            // through (W3-3 Step C regression: `has_more_candidates` was
-            // computed relative to the KNN retrieval window, not relative
-            // to whether candidates beyond a `fetch_limit`-sized `take()`
-            // were discarded, so the outer retry loop never re-fetched).
+            // JOIN message_chunks for each hit chunk_id's provenance,
+            // batched at IN_CLAUSE_BATCH_ROWS to stay well under SQLite's
+            // bound-variable ceiling even at k=4096.
+            const CHUNK_PROVENANCE_BATCH_ROWS: usize = 500;
+            let chunk_ids: Vec<i64> = raw_knn.iter().map(|(id, _)| *id).collect();
+            let mut provenance: HashMap<i64, (i64, u32, usize, usize, String)> =
+                HashMap::with_capacity(chunk_ids.len());
+            for batch in chunk_ids.chunks(CHUNK_PROVENANCE_BATCH_ROWS) {
+                let placeholders = sql_placeholders(batch.len());
+                let sql = format!(
+                    "SELECT chunk_id, message_id, chunk_idx, byte_start, byte_end, content_hash \
+                     FROM message_chunks WHERE chunk_id IN ({placeholders})"
+                );
+                let params: Vec<ParamValue> = batch.iter().map(|id| ParamValue::from(*id)).collect();
+                let rows: Vec<(i64, i64, i64, i64, i64, String)> = tx.query_all_map(&sql, &params, |row| {
+                    Ok((
+                        row.get_typed(0)?,
+                        row.get_typed(1)?,
+                        row.get_typed(2)?,
+                        row.get_typed(3)?,
+                        row.get_typed(4)?,
+                        row.get_typed(5)?,
+                    ))
+                })?;
+                for (chunk_id, message_id, chunk_idx, byte_start, byte_end, content_hash) in rows {
+                    provenance.insert(
+                        chunk_id,
+                        (
+                            message_id,
+                            u32::try_from(chunk_idx).unwrap_or(u32::MAX),
+                            usize::try_from(byte_start).unwrap_or(0),
+                            usize::try_from(byte_end).unwrap_or(0),
+                            content_hash,
+                        ),
+                    );
+                }
+            }
+
+            // MaxSim fold: raw_knn is already ORDER BY distance ascending,
+            // so the first chunk seen for a given message_id is that
+            // message's minimum-distance (best) chunk.
+            let mut seen_messages: std::collections::HashSet<i64> = std::collections::HashSet::new();
+            let mut folded: Vec<ChunkFoldedCandidate> = Vec::with_capacity(raw_knn.len());
+            for (chunk_id, distance) in &raw_knn {
+                let Some((message_id, chunk_idx, byte_start, byte_end, content_hash)) =
+                    provenance.get(chunk_id)
+                else {
+                    continue;
+                };
+                if seen_messages.insert(*message_id) {
+                    folded.push(ChunkFoldedCandidate {
+                        message_id: *message_id,
+                        distance: *distance,
+                        chunk_idx: *chunk_idx,
+                        span: (*byte_start, *byte_end),
+                        content_hash: content_hash.clone(),
+                    });
+                }
+            }
+
+            // Apply the same message-id-keyed relational filter every DB-
+            // vector-domain path uses (domain-agnostic: it only ever reads
+            // `messages`/`conversations`/... by id, never the vector
+            // table), same as the retired v4 path.
+            let candidate_message_ids: Vec<i64> = folded.iter().map(|f| f.message_id).collect();
+            let (sql, params) = Self::build_db_vector_domain_filter_sql(
+                &candidate_message_ids,
+                filters,
+                effective_roles.as_ref(),
+            );
+            let passing_ids: std::collections::HashSet<i64> =
+                tx.query_all_map(&sql, &params, |row| row.get_typed(0))?.into_iter().collect();
+            let mut filtered: Vec<ChunkFoldedCandidate> =
+                folded.into_iter().filter(|f| passing_ids.contains(&f.message_id)).collect();
+
+            let round1_unique_messages = filtered.len();
+            // Plan v5.1: "窗满 ⟺ first_round_rows == min(k, 该代际 vec0 总行数)".
+            let window_full = first_round_rows == k.min(row_count_usize);
+
+            let mut mode = CandidateMode::Knn;
+            let mut incomplete = false;
+            let mut reason: Option<String> = None;
+
+            if window_full && round1_unique_messages < fetch_limit {
+                mode = CandidateMode::KnnExact;
+                let still_needed = fetch_limit - round1_unique_messages;
+                let budget = effective_exact_scan_row_budget();
+                let (sql, params) =
+                    Self::build_chunk_full_scan_sql(generation_id, filters, effective_roles.as_ref());
+
+                let best_by_message: std::cell::RefCell<HashMap<i64, ChunkFoldedCandidate>> =
+                    std::cell::RefCell::new(HashMap::new());
+                let scanned = std::cell::Cell::new(0usize);
+                let sentinel = EXACT_SCAN_ROW_BUDGET_SENTINEL;
+                let scan_result = tx.query_all_map(&sql, &params, |row| -> Result<(), crate::storage::api::StorageError> {
+                    let message_id: i64 = row.get_typed(0)?;
+                    if seen_messages.contains(&message_id) {
+                        return Ok(());
+                    }
+                    let count = scanned.get() + 1;
+                    scanned.set(count);
+                    if count > budget {
+                        return Err(crate::storage::api::StorageError::Other {
+                            code: None,
+                            detail: sentinel.to_string(),
+                        });
+                    }
+                    let chunk_idx: i64 = row.get_typed(2)?;
+                    let byte_start: i64 = row.get_typed(3)?;
+                    let byte_end: i64 = row.get_typed(4)?;
+                    let content_hash: String = row.get_typed(5)?;
+                    let blob: Vec<u8> = row.get_typed(6)?;
+                    let vector = crate::storage::schema::le_blob_to_f32_vector(&blob)?;
+                    let distance = Self::cosine_distance(&vector, embedding);
+                    let candidate = ChunkFoldedCandidate {
+                        message_id,
+                        distance,
+                        chunk_idx: u32::try_from(chunk_idx).unwrap_or(u32::MAX),
+                        span: (usize::try_from(byte_start).unwrap_or(0), usize::try_from(byte_end).unwrap_or(0)),
+                        content_hash,
+                    };
+                    let mut best = best_by_message.borrow_mut();
+                    match best.get(&message_id) {
+                        Some(existing) if existing.distance <= candidate.distance => {}
+                        _ => {
+                            best.insert(message_id, candidate);
+                        }
+                    }
+                    Ok(())
+                });
+                match scan_result {
+                    Ok(_) => {}
+                    Err(crate::storage::api::StorageError::Other { detail, .. }) if detail == sentinel => {
+                        incomplete = true;
+                        reason = Some("exact_scan_row_budget".to_string());
+                    }
+                    Err(other) => return Err(other),
+                }
+
+                let mut extra: Vec<ChunkFoldedCandidate> = best_by_message.into_inner().into_values().collect();
+                extra.sort_by(|a, b| {
+                    a.distance
+                        .partial_cmp(&b.distance)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.message_id.cmp(&b.message_id))
+                });
+                extra.truncate(still_needed);
+                filtered.extend(extra);
+            }
+
+            let unique_messages = filtered.len();
+
+            // Final stable order (plan v5.1): score desc, message_id asc.
+            filtered.sort_by(|a, b| {
+                let score_a = (1.0 - a.distance) as f32;
+                let score_b = (1.0 - b.distance) as f32;
+                score_b
+                    .partial_cmp(&score_a)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.message_id.cmp(&b.message_id))
+            });
+
             let results: Vec<VectorSearchResult> = filtered
                 .into_iter()
-                .map(|(doc_id, distance)| VectorSearchResult {
+                .map(|c| VectorSearchResult {
                     // vec0's cosine `distance` is `1 - cosine_similarity`;
-                    // `score` is a higher-is-better similarity, matching
-                    // the fsvi path's dot-product-on-near-unit-vectors
-                    // convention (KU2's finding: sqlite-vec's true cosine
-                    // is the more correct of the two).
-                    message_id: u64::try_from(doc_id).unwrap_or(0),
-                    chunk_idx: 0,
-                    score: (1.0 - distance) as f32,
+                    // `score` is a higher-is-better similarity.
+                    message_id: u64::try_from(c.message_id).unwrap_or(0),
+                    chunk_idx: c.chunk_idx,
+                    chunk_span: Some(c.span),
+                    chunk_hash: Some(c.content_hash),
+                    score: (1.0 - c.distance) as f32,
                 })
                 .collect();
 
             Ok((
                 results,
-                SemanticCandidateRetryState {
-                    has_more_candidates,
-                    exact_window_may_omit_competitor: has_more_candidates,
-                    second_pass_taken,
-                },
+                CandidateMeta { mode, k, first_round_rows, unique_messages, incomplete, reason },
             ))
         })
         .map_err(|err: crate::storage::api::StorageError| anyhow!(err.to_string()))
@@ -3848,7 +4027,7 @@ impl SearchClient {
         embedding: &[f32],
         filters: &SearchFilters,
         request: SemanticCandidateSearchRequest,
-    ) -> Result<(Vec<VectorSearchResult>, SemanticCandidateRetryState)> {
+    ) -> Result<(Vec<VectorSearchResult>, CandidateMeta)> {
         let sqlite_guard = self.sqlite_guard()?;
         let conn = sqlite_guard
             .as_ref()
@@ -3875,18 +4054,38 @@ impl SearchClient {
     /// constructed a `Some`), so it -- and `ann_index.rs`, its sole source
     /// -- are dropped rather than threaded through for a value that could
     /// never be anything but absent.
-    pub fn search_semantic(
+    /// T9 (plan v5.1): `search_semantic`'s full-metadata sibling. Used to
+    /// return `Vec<SearchHit>` alone via an outer loop that re-dispatched
+    /// `search_semantic_candidates_dispatch` at a 3x larger `fetch_limit`
+    /// whenever the first pass's `SemanticCandidateRetryState` reported
+    /// more candidates might exist (`has_more_candidates`) or the exact-
+    /// window retry might have missed a closer competitor
+    /// (`exact_window_may_omit_competitor`) -- a heuristic outer retry
+    /// papering over the old candidate search's inability to say for
+    /// certain whether it had found enough. T9's `CandidateMeta` replaces
+    /// that heuristic with an explicit contract instead: `search_db_vector_
+    /// domain`'s own exact-scan round (triggered internally, see its doc
+    /// comment) already widens to the full filtered universe whenever the
+    /// KNN window was saturated and still came up short, so by the time
+    /// this function gets `results` back, it already contains every
+    /// filter-passing message the corpus has, up to `fetch_limit` -- there
+    /// is nothing a second, larger-`fetch_limit` dispatch could find that
+    /// the first one didn't already look for (control-plane 2026-09-04
+    /// ruling: "新 meta 语义吸收它"). The one condition worth retrying
+    /// for is unrelated to candidate completeness: `semantic_context_
+    /// matches` catching a concurrent embedder swap mid-search.
+    pub fn search_semantic_with_meta(
         &self,
         query: &str,
         filters: SearchFilters,
         limit: usize,
         offset: usize,
         field_mask: FieldMask,
-    ) -> Result<Vec<SearchHit>> {
+    ) -> Result<(Vec<SearchHit>, CandidateMeta)> {
         let field_mask = effective_field_mask(field_mask);
         let canonical = canonicalize_for_embedding(query);
         if canonical.trim().is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), CandidateMeta::empty()));
         }
         let limit = if limit == 0 {
             self.total_docs().min(no_limit_result_cap()).max(1)
@@ -3895,10 +4094,20 @@ impl SearchClient {
         };
         let target_hits = limit.saturating_add(offset);
         if target_hits == 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), CandidateMeta::empty()));
         }
-        let initial_fetch_limit = target_hits;
-        let fallback_fetch_limit = target_hits.saturating_mul(3);
+        // T9 (plan v5.1, control-plane 2026-09-04 ruling, 方案②): the
+        // candidate layer fills `unique_messages` to exactly the
+        // `fetch_limit` it receives, no headroom of its own -- so this
+        // caller asks for `OVERFETCH_FACTOR`x what it actually needs,
+        // giving `postprocess_hits_page`'s post-hoc dedup/session_paths/
+        // role filtering room to still reach `limit` after its own
+        // reductions (the retired outer retry's job, folded into the one
+        // dispatch instead of a second one). At `limit=5000`: `target_hits
+        // = 5000` -> `fetch_limit = 20,000` -> inside `search_db_vector_
+        // domain`, `k = min(20,000 * 4, 4096) = 4096` (still clamped, same
+        // as before this ruling).
+        let fetch_limit = target_hits.saturating_mul(OVERFETCH_FACTOR);
         loop {
             let (embedding, candidate_context, context_token) = loop {
                 let embedding = self.semantic_query_embedding(&canonical)?;
@@ -3934,53 +4143,18 @@ impl SearchClient {
                 break (embedding.vector, candidate_context, context_token);
             };
 
-            let finalize_hits =
-                |results: &[VectorSearchResult]| -> Result<(usize, Vec<SearchHit>)> {
-                    let hits = self.hydrate_semantic_hits(results, field_mask)?;
-                    Ok(self.postprocess_hits_page(hits, query, &filters, limit, offset))
-                };
-
-            let (results, retry_state) = self.search_semantic_candidates_dispatch(
+            let (results, meta) = self.search_semantic_candidates_dispatch(
                 &candidate_context,
                 &embedding,
                 &filters,
-                SemanticCandidateSearchRequest {
-                    fetch_limit: initial_fetch_limit,
-                },
+                SemanticCandidateSearchRequest { fetch_limit },
             )?;
             if !self.semantic_context_matches(&context_token)? {
                 tracing::debug!("semantic context changed during candidate search; retrying");
                 continue;
             }
-            let (mut available_hits, mut paged_hits) = finalize_hits(&results)?;
-
-            let needs_retry = initial_fetch_limit < fallback_fetch_limit
-                && ((available_hits < target_hits && retry_state.has_more_candidates)
-                    || retry_state.exact_window_may_omit_competitor);
-
-            if needs_retry {
-                tracing::debug!(
-                    query = canonical,
-                    target_hits,
-                    available_hits,
-                    initial_fetch_limit,
-                    fallback_fetch_limit,
-                    "retrying semantic fetch due to candidate-window shortfall"
-                );
-                let (retry_results, _) = self.search_semantic_candidates_dispatch(
-                    &candidate_context,
-                    &embedding,
-                    &filters,
-                    SemanticCandidateSearchRequest {
-                        fetch_limit: fallback_fetch_limit,
-                    },
-                )?;
-                if !self.semantic_context_matches(&context_token)? {
-                    tracing::debug!("semantic context changed during retry fetch; retrying");
-                    continue;
-                }
-                (available_hits, paged_hits) = finalize_hits(&retry_results)?;
-            }
+            let hits = self.hydrate_semantic_hits(&results, field_mask)?;
+            let (available_hits, paged_hits) = self.postprocess_hits_page(hits, query, &filters, limit, offset);
 
             tracing::trace!(
                 query = canonical,
@@ -3990,8 +4164,20 @@ impl SearchClient {
                 "semantic fetch complete"
             );
 
-            return Ok(paged_hits);
+            return Ok((paged_hits, meta));
         }
+    }
+
+    pub fn search_semantic(
+        &self,
+        query: &str,
+        filters: SearchFilters,
+        limit: usize,
+        offset: usize,
+        field_mask: FieldMask,
+    ) -> Result<Vec<SearchHit>> {
+        self.search_semantic_with_meta(query, filters, limit, offset, field_mask)
+            .map(|(hits, _meta)| hits)
     }
 
     fn hydrate_semantic_hits_with_ids(
@@ -4036,37 +4222,43 @@ impl SearchClient {
             }
         }
 
-        let message_placeholder_capacity =
-            unique_message_ids.len().saturating_mul(2).saturating_sub(1);
-        let mut message_placeholders = String::with_capacity(message_placeholder_capacity);
-        let mut message_params: Vec<ParamValue> = Vec::with_capacity(unique_message_ids.len());
-        for (idx, message_id) in unique_message_ids.iter().enumerate() {
-            if idx > 0 {
-                message_placeholders.push(',');
-            }
-            message_placeholders.push('?');
-            message_params.push(ParamValue::from(i64::try_from(*message_id)?));
+        // T9 (plan v5.1, T0's real-bug reproduction): a single `WHERE id IN
+        // (?,?,...)` sized to every unique candidate message id crashes
+        // once the candidate set exceeds SQLite's bound-variable ceiling
+        // ("hybrid search failed: storage error: too many SQL variables in
+        // SELECT id, conversation_id, content, created_at, idx FROM
+        // messages WHERE id IN (...)", `hybrid --limit 5000` ->
+        // `k=80016`-scale candidate sets). Batched at
+        // `HYDRATE_ID_BATCH_ROWS` ids per statement, results concatenated
+        // -- order does not need to be preserved here (the final ordering
+        // pass below re-derives it from `results`).
+        const HYDRATE_ID_BATCH_ROWS: usize = 900;
+        let message_i64_ids: Vec<i64> =
+            unique_message_ids.iter().map(|id| i64::try_from(*id)).collect::<std::result::Result<_, _>>()?;
+        let mut message_rows: Vec<MessageHydrationRow> = Vec::with_capacity(message_i64_ids.len());
+        for batch in message_i64_ids.chunks(HYDRATE_ID_BATCH_ROWS) {
+            let message_placeholders = sql_placeholders(batch.len());
+            let message_params: Vec<ParamValue> = batch.iter().map(|id| ParamValue::from(*id)).collect();
+            let message_sql = format!(
+                "SELECT id, conversation_id, content, created_at, idx
+                 FROM messages
+                 WHERE id IN ({message_placeholders})"
+            );
+            let batch_rows: Vec<MessageHydrationRow> =
+                conn.query_all_map(&message_sql, &message_params, |row: &FrankenRow| {
+                    let message_id: i64 = row.get_typed(0)?;
+                    Ok(MessageHydrationRow {
+                        message_id: semantic_message_id_from_db(message_id).map_err(|e| {
+                            StorageError::Other { code: None, detail: e.to_string() }
+                        })?,
+                        conversation_id: row.get_typed(1)?,
+                        full_content: row.get_typed(2)?,
+                        msg_created_at: row.get_typed(3)?,
+                        idx: row.get_typed(4)?,
+                    })
+                })?;
+            message_rows.extend(batch_rows);
         }
-
-        let message_sql = format!(
-            "SELECT id, conversation_id, content, created_at, idx
-             FROM messages
-             WHERE id IN ({message_placeholders})"
-        );
-
-        let message_rows: Vec<MessageHydrationRow> =
-            conn.query_all_map(&message_sql, &message_params, |row: &FrankenRow| {
-                let message_id: i64 = row.get_typed(0)?;
-                Ok(MessageHydrationRow {
-                    message_id: semantic_message_id_from_db(message_id).map_err(|e| {
-                        StorageError::Other { code: None, detail: e.to_string() }
-                    })?,
-                    conversation_id: row.get_typed(1)?,
-                    full_content: row.get_typed(2)?,
-                    msg_created_at: row.get_typed(3)?,
-                    idx: row.get_typed(4)?,
-                })
-            })?;
         if message_rows.is_empty() {
             return Ok(Vec::new());
         }
@@ -4085,53 +4277,49 @@ impl SearchClient {
                 conversation_ids.push(row.conversation_id);
             }
         }
-        let conversation_placeholder_capacity =
-            conversation_ids.len().saturating_mul(2).saturating_sub(1);
-        let mut conversation_placeholders =
-            String::with_capacity(conversation_placeholder_capacity);
-        let mut conversation_params: Vec<ParamValue> = Vec::with_capacity(conversation_ids.len());
-        for (idx, conversation_id) in conversation_ids.iter().enumerate() {
-            if idx > 0 {
-                conversation_placeholders.push(',');
-            }
-            conversation_placeholders.push('?');
-            conversation_params.push(ParamValue::from(*conversation_id));
-        }
         // LEFT JOIN + COALESCE on agents so search hits for conversations
         // with NULL agent_id (legacy V1 schema) still surface instead of
         // being silently dropped from results.  Consistent with the fts/
-        // lexical rebuild paths (8a0c547c, e1c08e7c).
-        let sql = format!(
-            "SELECT c.id, {title_expr}, c.source_path, {normalized_source_sql}, c.origin_host, COALESCE(a.slug, 'unknown'), w.path, s.kind, c.started_at
-             FROM conversations c
-             LEFT JOIN agents a ON c.agent_id = a.id
-             LEFT JOIN workspaces w ON c.workspace_id = w.id
-             LEFT JOIN sources s ON c.source_id = s.id
-             WHERE c.id IN ({conversation_placeholders})"
-        );
-
-        let conversation_rows: Vec<(i64, ConversationHydrationRow)> =
-            conn.query_all_map(&sql, &conversation_params, |row: &FrankenRow| {
-                let conversation_id: i64 = row.get_typed(0)?;
-                let title: Option<String> = if field_mask.wants_title() {
-                    row.get_typed(1)?
-                } else {
-                    None
-                };
-                Ok((
-                    conversation_id,
-                    ConversationHydrationRow {
-                        title,
-                        source_path: row.get_typed(2)?,
-                        source_id: row.get_typed(3)?,
-                        origin_host: row.get_typed(4)?,
-                        agent: row.get_typed(5)?,
-                        workspace: row.get_typed(6)?,
-                        origin_kind: row.get_typed(7)?,
-                        started_at: row.get_typed(8)?,
-                    },
-                ))
-            })?;
+        // lexical rebuild paths (8a0c547c, e1c08e7c). Same batching as the
+        // messages lookup above -- a candidate set large enough to need
+        // batched message ids can just as easily produce a conversation-id
+        // set past the same ceiling.
+        let mut conversation_rows: Vec<(i64, ConversationHydrationRow)> = Vec::with_capacity(conversation_ids.len());
+        for batch in conversation_ids.chunks(HYDRATE_ID_BATCH_ROWS) {
+            let conversation_placeholders = sql_placeholders(batch.len());
+            let conversation_params: Vec<ParamValue> = batch.iter().map(|id| ParamValue::from(*id)).collect();
+            let sql = format!(
+                "SELECT c.id, {title_expr}, c.source_path, {normalized_source_sql}, c.origin_host, COALESCE(a.slug, 'unknown'), w.path, s.kind, c.started_at
+                 FROM conversations c
+                 LEFT JOIN agents a ON c.agent_id = a.id
+                 LEFT JOIN workspaces w ON c.workspace_id = w.id
+                 LEFT JOIN sources s ON c.source_id = s.id
+                 WHERE c.id IN ({conversation_placeholders})"
+            );
+            let batch_rows: Vec<(i64, ConversationHydrationRow)> =
+                conn.query_all_map(&sql, &conversation_params, |row: &FrankenRow| {
+                    let conversation_id: i64 = row.get_typed(0)?;
+                    let title: Option<String> = if field_mask.wants_title() {
+                        row.get_typed(1)?
+                    } else {
+                        None
+                    };
+                    Ok((
+                        conversation_id,
+                        ConversationHydrationRow {
+                            title,
+                            source_path: row.get_typed(2)?,
+                            source_id: row.get_typed(3)?,
+                            origin_host: row.get_typed(4)?,
+                            agent: row.get_typed(5)?,
+                            workspace: row.get_typed(6)?,
+                            origin_kind: row.get_typed(7)?,
+                            started_at: row.get_typed(8)?,
+                        },
+                    ))
+                })?;
+            conversation_rows.extend(batch_rows);
+        }
 
         let conversations_by_id: HashMap<i64, ConversationHydrationRow> =
             conversation_rows.into_iter().collect();
@@ -4193,6 +4381,12 @@ impl SearchClient {
                     source_id,
                     origin_kind,
                     origin_host: conversation.origin_host.clone(),
+                    // Filled from the matching `VectorSearchResult` below,
+                    // once per (message_id, hit) pair.
+                    message_id: None,
+                    winning_chunk_idx: None,
+                    winning_chunk_span: None,
+                    winning_chunk_hash: None,
                 };
 
                 Some((message.message_id, hit))
@@ -4208,6 +4402,14 @@ impl SearchClient {
         for result in results {
             if let Some(mut hit) = hits_by_id.remove(&result.message_id) {
                 hit.score = result.score;
+                // T9 (plan v5.1): the chunk-domain candidate search's
+                // winning-chunk provenance, carried end to end via
+                // `VectorSearchResult` (the single carrier -- control-plane
+                // 2026-09-04 ruling against a parallel side-channel map).
+                hit.message_id = i64::try_from(result.message_id).ok();
+                hit.winning_chunk_idx = Some(result.chunk_idx);
+                hit.winning_chunk_span = result.chunk_span;
+                hit.winning_chunk_hash = result.chunk_hash.clone();
                 ordered.push((result.message_id, hit));
             }
         }
@@ -4371,10 +4573,37 @@ impl SearchClient {
             cache_stats: baseline_stats,
             suggestions,
             total_count: tantivy_total,
+            candidates: None,
+            semantic_degraded: false,
         })
     }
 
+    /// T9 (plan v5.1) lexical fail-open: is `err` (from `search_semantic_
+    /// with_meta`) one of the two conditions `search_hybrid` degrades to
+    /// lexical-only for -- the vector domain being `absent`/`building`
+    /// (`SearchClient::search_db_vector_domain`'s own error text), or
+    /// Infinity being unreachable (`http_embed`'s `"embeddings request
+    /// failed: {reqwest error}"`, the literal prefix it always uses for a
+    /// `.send()` failure -- connection refused, DNS failure, timeout, all
+    /// funnel through that one code path)? Anything else (a real bug, a
+    /// malformed query, a poisoned lock) is *not* matched here and must
+    /// keep propagating as a hard error -- fail-open only covers the two
+    /// conditions plan v5.1 names, not "any semantic failure whatsoever".
+    fn is_semantic_fail_open_condition(err: &anyhow::Error) -> bool {
+        let msg = err.to_string();
+        msg.contains("vector_domain_state=absent")
+            || msg.contains("vector_domain_state=building")
+            || msg.contains("embeddings request failed:")
+    }
+
     /// Hybrid search that fuses lexical + semantic results with RRF.
+    ///
+    /// T9 (plan v5.1) lexical fail-open: unlike `search_semantic` (which
+    /// keeps erroring hard on `vector_domain_state=absent`/`building` and
+    /// on an unreachable Infinity), this function degrades to lexical-only
+    /// for exactly those two conditions (`is_semantic_fail_open_
+    /// condition`), setting `SearchResult.semantic_degraded=true` and
+    /// `candidates=None`. Any other semantic-leg error still propagates.
     #[allow(clippy::too_many_arguments)]
     pub fn search_hybrid(
         &self,
@@ -4401,6 +4630,8 @@ impl SearchClient {
                 cache_stats: self.cache_stats(),
                 suggestions: Vec::new(),
                 total_count: None,
+                candidates: None,
+                semantic_degraded: false,
             });
         }
 
@@ -4425,13 +4656,23 @@ impl SearchClient {
             sparse_threshold,
             field_mask,
         )?;
-        let semantic_hits = self.search_semantic(
+        let (semantic_hits, candidates, semantic_degraded) = match self.search_semantic_with_meta(
             semantic_query,
             filters,
             budget.semantic_candidates,
             0,
             field_mask,
-        )?;
+        ) {
+            Ok((hits, meta)) => (hits, Some(meta), false),
+            Err(err) if Self::is_semantic_fail_open_condition(&err) => {
+                tracing::warn!(
+                    error = %err,
+                    "hybrid search: semantic leg degraded, falling open to lexical-only"
+                );
+                (Vec::new(), None, true)
+            }
+            Err(err) => return Err(err),
+        };
         let fused = rrf_fuse_hits(&lexical.hits, &semantic_hits, semantic_query, limit, offset);
         let suggestions = if fused.is_empty() {
             lexical.suggestions.clone()
@@ -4444,6 +4685,8 @@ impl SearchClient {
             cache_stats: lexical.cache_stats,
             suggestions,
             total_count: None,
+            candidates,
+            semantic_degraded,
         })
     }
 
@@ -5097,6 +5340,10 @@ impl SearchClient {
                 source_id,
                 origin_kind,
                 origin_host,
+                message_id: None,
+                winning_chunk_idx: None,
+                winning_chunk_span: None,
+                winning_chunk_hash: None,
             };
             if Self::sqlite_fts5_hit_matches_filters(&hit, &filters) {
                 hits.push(hit);
@@ -5275,6 +5522,10 @@ impl SearchClient {
                     source_id,
                     origin_kind,
                     origin_host,
+                    message_id: None,
+                    winning_chunk_idx: None,
+                    winning_chunk_span: None,
+                    winning_chunk_hash: None,
                 })
             })?;
         Ok(rows)
@@ -6298,6 +6549,10 @@ mod tests {
             source_id: "local".into(),
             origin_kind: "local".into(),
             origin_host: None,
+            message_id: None,
+            winning_chunk_idx: None,
+            winning_chunk_span: None,
+            winning_chunk_hash: None,
         }
     }
 
@@ -6612,14 +6867,18 @@ mod tests {
 
         // W3-5: DB-vector-domain (`search_db_vector_domain`) is the sole
         // semantic candidate-fetch path now -- seed an active generation
-        // through the same production write path
-        // (`create_embedding_generation` + `insert_message_embedding` +
-        // `switch_active_generation` + `rebuild_vec0_table_for_generation`,
-        // see `seed_active_generation_with_vectors`) instead of the retired
-        // fsvi `VectorIndex` writer this fixture used to build (previously
-        // this also had a `sharded: bool` mode pinning fsvi's multi-shard-
-        // index-merge behavior; that had zero real callers even before the
-        // fsvi retirement and is dropped along with it).
+        // through the same production write path (`create_embedding_
+        // generation_v5` + `insert_chunk_row_in_tx` + `switch_active_
+        // generation` + a vec0 rebuild, see `seed_active_generation_with_
+        // chunk_vectors`) instead of the retired fsvi `VectorIndex` writer
+        // this fixture used to build (previously this also had a
+        // `sharded: bool` mode pinning fsvi's multi-shard-index-merge
+        // behavior; that had zero real callers even before the fsvi
+        // retirement and is dropped along with it). T9 (plan v5.1):
+        // re-pointed from the retired v4 `message_embeddings` domain to
+        // the v5 chunk domain `search_db_vector_domain` now reads --
+        // one chunk per message (`chunk_idx=0`), same as every other
+        // fixture in this file re-pointed for T9.
         let db_vectors: Vec<(i64, i64, Vec<f32>)> = message_rows
             .iter()
             .zip(documents)
@@ -6631,7 +6890,7 @@ mod tests {
                 )
             })
             .collect();
-        seed_active_generation_with_vectors(&storage, 2, &db_vectors);
+        seed_active_generation_with_chunk_vectors(&storage, 2, &db_vectors);
         drop(storage);
 
         let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("db-backed client");
@@ -6910,6 +7169,10 @@ mod tests {
             origin_kind: "local".into(),
             origin_host: None,
             conversation_id: None,
+            message_id: None,
+            winning_chunk_idx: None,
+            winning_chunk_span: None,
+            winning_chunk_hash: None,
         };
         let cached = cached_hit_from(&hit);
 
@@ -6965,6 +7228,10 @@ mod tests {
                 origin_kind: "local".into(),
                 origin_host: None,
                 conversation_id: None,
+                message_id: None,
+                winning_chunk_idx: None,
+                winning_chunk_span: None,
+                winning_chunk_hash: None,
             },
         }
     }
@@ -7175,6 +7442,10 @@ mod tests {
             origin_kind: "local".into(),
             origin_host: None,
             conversation_id: None,
+            message_id: None,
+            winning_chunk_idx: None,
+            winning_chunk_span: None,
+            winning_chunk_hash: None,
         };
 
         let cached = CachedHit {
@@ -7337,6 +7608,10 @@ mod tests {
             origin_kind: "local".into(),
             origin_host: None,
             conversation_id: None,
+            message_id: None,
+            winning_chunk_idx: None,
+            winning_chunk_span: None,
+            winning_chunk_hash: None,
         }];
 
         client.put_cache("こん", &SearchFilters::default(), &hits);
@@ -7367,6 +7642,10 @@ mod tests {
             origin_kind: "local".into(),
             origin_host: None,
             conversation_id: None,
+            message_id: None,
+            winning_chunk_idx: None,
+            winning_chunk_span: None,
+            winning_chunk_hash: None,
         };
         let cached = cached_hit_from(&hit);
         assert!(hit_matches_query_cached(&cached, "hello"));
@@ -8807,11 +9086,15 @@ mod tests {
                 VectorSearchResult {
                     message_id: 1,
                     chunk_idx: 0,
+                    chunk_span: None,
+                    chunk_hash: None,
                     score: 0.9,
                 },
                 VectorSearchResult {
                     message_id: 2,
                     chunk_idx: 0,
+                    chunk_span: None,
+                    chunk_hash: None,
                     score: 0.8,
                 },
             ],
@@ -8878,6 +9161,8 @@ mod tests {
             &[VectorSearchResult {
                 message_id: 1,
                 chunk_idx: 0,
+                chunk_span: None,
+                chunk_hash: None,
                 score: 0.9,
             }],
             FieldMask::new(false, true, true, true),
@@ -8942,6 +9227,8 @@ mod tests {
             &[VectorSearchResult {
                 message_id: 1,
                 chunk_idx: 0,
+                chunk_span: None,
+                chunk_hash: None,
                 score: 0.9,
             }],
             FieldMask::new(false, true, true, true),
@@ -9060,6 +9347,10 @@ mod tests {
             origin_kind: "local".into(),
             origin_host: None,
             conversation_id: None,
+            message_id: None,
+            winning_chunk_idx: None,
+            winning_chunk_span: None,
+            winning_chunk_hash: None,
         };
         let hits = vec![hit.clone()];
 
@@ -9136,6 +9427,10 @@ mod tests {
             origin_kind: "local".into(),
             origin_host: None,
             conversation_id: None,
+            message_id: None,
+            winning_chunk_idx: None,
+            winning_chunk_span: None,
+            winning_chunk_hash: None,
         };
 
         // Put 3 entries - should trigger 1 eviction (cap is 2)
@@ -9246,6 +9541,10 @@ mod tests {
             origin_kind: "local".into(),
             origin_host: None,
             conversation_id: None,
+            message_id: None,
+            winning_chunk_idx: None,
+            winning_chunk_span: None,
+            winning_chunk_hash: None,
         };
         let cached = cached_hit_from(&hit);
         let byte_cap = cached.approx_bytes() + 1_024;
@@ -9297,6 +9596,10 @@ mod tests {
             origin_kind: "local".into(),
             origin_host: None,
             conversation_id: None,
+            message_id: None,
+            winning_chunk_idx: None,
+            winning_chunk_span: None,
+            winning_chunk_hash: None,
         };
         let cached = cached_hit_from(&hit);
         let byte_cap = cached.approx_bytes() + 1_024;
@@ -9341,6 +9644,10 @@ mod tests {
             origin_kind: "local".into(),
             origin_host: None,
             conversation_id: None,
+            message_id: None,
+            winning_chunk_idx: None,
+            winning_chunk_span: None,
+            winning_chunk_hash: None,
         };
 
         // Put 3 large entries - should trigger byte-based evictions
@@ -9376,6 +9683,10 @@ mod tests {
             origin_kind: "local".into(),
             origin_host: None,
             conversation_id: None,
+            message_id: None,
+            winning_chunk_idx: None,
+            winning_chunk_span: None,
+            winning_chunk_hash: None,
         };
         let large_content = "large".repeat(2_000);
         let large_hit = SearchHit {
@@ -9395,6 +9706,10 @@ mod tests {
             origin_kind: "local".into(),
             origin_host: None,
             conversation_id: None,
+            message_id: None,
+            winning_chunk_idx: None,
+            winning_chunk_span: None,
+            winning_chunk_hash: None,
         };
 
         let mut cache = CacheShards::new(100, 1_024);
@@ -9690,6 +10005,10 @@ mod tests {
                 origin_kind: "local".into(),
                 origin_host: None,
                 conversation_id: None,
+                message_id: None,
+                winning_chunk_idx: None,
+                winning_chunk_span: None,
+                winning_chunk_hash: None,
             },
             SearchHit {
                 title: "title1".into(),
@@ -9708,6 +10027,10 @@ mod tests {
                 origin_kind: "local".into(),
                 origin_host: None,
                 conversation_id: None,
+                message_id: None,
+                winning_chunk_idx: None,
+                winning_chunk_span: None,
+                winning_chunk_hash: None,
             },
         ];
 
@@ -9737,6 +10060,10 @@ mod tests {
                 origin_kind: "local".into(),
                 origin_host: None,
                 conversation_id: None,
+                message_id: None,
+                winning_chunk_idx: None,
+                winning_chunk_span: None,
+                winning_chunk_hash: None,
             },
             SearchHit {
                 title: "title1".into(),
@@ -9755,6 +10082,10 @@ mod tests {
                 origin_kind: "local".into(),
                 origin_host: None,
                 conversation_id: None,
+                message_id: None,
+                winning_chunk_idx: None,
+                winning_chunk_span: None,
+                winning_chunk_hash: None,
             },
         ];
 
@@ -9783,6 +10114,10 @@ mod tests {
             origin_kind: "local".into(),
             origin_host: None,
             conversation_id: None,
+            message_id: None,
+            winning_chunk_idx: None,
+            winning_chunk_span: None,
+            winning_chunk_hash: None,
         };
         let mut second = first.clone();
         second.line_number = Some(2);
@@ -9850,6 +10185,10 @@ mod tests {
                 origin_kind: "local".into(),
                 origin_host: None,
                 conversation_id: None,
+                message_id: None,
+                winning_chunk_idx: None,
+                winning_chunk_span: None,
+                winning_chunk_hash: None,
             },
             SearchHit {
                 title: "Evening Session".into(),
@@ -9868,6 +10207,10 @@ mod tests {
                 origin_kind: "local".into(),
                 origin_host: None,
                 conversation_id: None,
+                message_id: None,
+                winning_chunk_idx: None,
+                winning_chunk_span: None,
+                winning_chunk_hash: None,
             },
         ];
 
@@ -9897,6 +10240,10 @@ mod tests {
                 origin_kind: "local".into(),
                 origin_host: None,
                 conversation_id: None,
+                message_id: None,
+                winning_chunk_idx: None,
+                winning_chunk_span: None,
+                winning_chunk_hash: None,
             },
             SearchHit {
                 title: "title1".into(),
@@ -9915,6 +10262,10 @@ mod tests {
                 origin_kind: "local".into(),
                 origin_host: None,
                 conversation_id: None,
+                message_id: None,
+                winning_chunk_idx: None,
+                winning_chunk_span: None,
+                winning_chunk_hash: None,
             },
         ];
 
@@ -9942,6 +10293,10 @@ mod tests {
                 origin_kind: "local".into(),
                 origin_host: None,
                 conversation_id: None,
+                message_id: None,
+                winning_chunk_idx: None,
+                winning_chunk_span: None,
+                winning_chunk_hash: None,
             },
             SearchHit {
                 title: "title1".into(),
@@ -9960,6 +10315,10 @@ mod tests {
                 origin_kind: "local".into(),
                 origin_host: None,
                 conversation_id: None,
+                message_id: None,
+                winning_chunk_idx: None,
+                winning_chunk_span: None,
+                winning_chunk_hash: None,
             },
         ];
 
@@ -9988,6 +10347,10 @@ mod tests {
                 origin_kind: "local".into(),
                 origin_host: None,
                 conversation_id: None,
+                message_id: None,
+                winning_chunk_idx: None,
+                winning_chunk_span: None,
+                winning_chunk_hash: None,
             },
             SearchHit {
                 title: "title2".into(),
@@ -10006,6 +10369,10 @@ mod tests {
                 origin_kind: "local".into(),
                 origin_host: None,
                 conversation_id: None,
+                message_id: None,
+                winning_chunk_idx: None,
+                winning_chunk_span: None,
+                winning_chunk_hash: None,
             },
         ];
 
@@ -10034,6 +10401,10 @@ mod tests {
                 origin_kind: "local".into(),
                 origin_host: None,
                 conversation_id: None,
+                message_id: None,
+                winning_chunk_idx: None,
+                winning_chunk_span: None,
+                winning_chunk_hash: None,
             },
             SearchHit {
                 title: "real".into(),
@@ -10052,6 +10423,10 @@ mod tests {
                 origin_kind: "local".into(),
                 origin_host: None,
                 conversation_id: None,
+                message_id: None,
+                winning_chunk_idx: None,
+                winning_chunk_span: None,
+                winning_chunk_hash: None,
             },
         ];
 
@@ -10083,6 +10458,10 @@ mod tests {
             origin_kind: "local".into(),
             origin_host: None,
             conversation_id: None,
+            message_id: None,
+            winning_chunk_idx: None,
+            winning_chunk_span: None,
+            winning_chunk_hash: None,
         };
 
         assert!(
@@ -10114,6 +10493,10 @@ mod tests {
                 origin_kind: "local".into(),
                 origin_host: None,
                 conversation_id: None,
+                message_id: None,
+                winning_chunk_idx: None,
+                winning_chunk_span: None,
+                winning_chunk_hash: None,
             },
             SearchHit {
                 title: "title2".into(),
@@ -10132,6 +10515,10 @@ mod tests {
                 origin_kind: "local".into(),
                 origin_host: None,
                 conversation_id: None,
+                message_id: None,
+                winning_chunk_idx: None,
+                winning_chunk_span: None,
+                winning_chunk_hash: None,
             },
             SearchHit {
                 title: "title3".into(),
@@ -10150,6 +10537,10 @@ mod tests {
                 origin_kind: "local".into(),
                 origin_host: None,
                 conversation_id: None,
+                message_id: None,
+                winning_chunk_idx: None,
+                winning_chunk_span: None,
+                winning_chunk_hash: None,
             },
         ];
 
@@ -10179,6 +10570,10 @@ mod tests {
                 origin_kind: "local".into(),
                 origin_host: None,
                 conversation_id: None,
+                message_id: None,
+                winning_chunk_idx: None,
+                winning_chunk_span: None,
+                winning_chunk_hash: None,
             },
             SearchHit {
                 title: "remote title".into(),
@@ -10197,6 +10592,10 @@ mod tests {
                 origin_kind: "ssh".into(),
                 origin_host: Some("work-laptop.local".into()),
                 conversation_id: None,
+                message_id: None,
+                winning_chunk_idx: None,
+                winning_chunk_span: None,
+                winning_chunk_hash: None,
             },
         ];
 
@@ -13113,6 +13512,10 @@ mod tests {
             origin_kind: "local".to_string(),
             origin_host: None,
             conversation_id: None,
+            message_id: None,
+            winning_chunk_idx: None,
+            winning_chunk_span: None,
+            winning_chunk_hash: None,
         }
     }
 
@@ -15334,6 +15737,10 @@ mod tests {
             source_id: "local".to_string(),
             origin_kind: "local".to_string(),
             origin_host: None,
+            message_id: None,
+            winning_chunk_idx: None,
+            winning_chunk_span: None,
+            winning_chunk_hash: None,
         };
 
         // Query text doesn't matter — the point is that a hit stripped of
@@ -15372,6 +15779,10 @@ mod tests {
             source_id: "local".to_string(),
             origin_kind: "local".to_string(),
             origin_host: None,
+            message_id: None,
+            winning_chunk_idx: None,
+            winning_chunk_span: None,
+            winning_chunk_hash: None,
         };
 
         assert!(
@@ -15685,38 +16096,72 @@ mod tests {
         .unwrap();
     }
 
-    /// Creates a generation, writes `vectors` (message_id -> embedding) via
-    /// the production write path (`schema::insert_message_embedding`,
-    /// fixture-fidelity discipline), activates it, and rebuilds its `vec0`
-    /// index -- the minimum a caller of `search_db_vector_domain` needs to
-    /// see `Ready`.
-    fn seed_active_generation_with_vectors(
+    /// T9 (plan v5.1): the chunk-domain (v5) counterpart of the retired v4
+    /// `seed_active_generation_with_vectors` -- `search_db_vector_domain` now reads
+    /// `message_chunks`/its `vec0` table (rowid = `chunk_id`) instead of
+    /// the retired v4 `message_embeddings` domain, so every KNN/full-scan
+    /// mechanics test below needs a chunk-domain fixture instead. One
+    /// chunk per message (`chunk_idx = 0`, a synthetic `[0, 1)` span and a
+    /// deterministic-but-unique `content_hash`) -- these tests are about
+    /// KNN/exact-scan mechanics over the candidate set, not chunking
+    /// itself, so a message-to-chunk cardinality of 1 keeps the fixture
+    /// focused on what's under test.
+    fn seed_active_generation_with_chunk_vectors(
         storage: &FrankenStorage,
         dim: i64,
         vectors: &[(i64, i64, Vec<f32>)], // (message_id, conversation_id, vector)
     ) -> i64 {
         let conn = storage.raw();
+        let fingerprint = vec![0u8; 3 * usize::try_from(dim).unwrap_or(0) * 4];
         let generation_id = conn
-            .with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
-                let generation_id =
-                    crate::storage::schema::create_embedding_generation(tx, "bge-m3", dim, 1, 1_000)?;
+            .with_tx(crate::storage::api::TxMode::Immediate, |tx| {
+                let generation_id = crate::storage::schema::create_embedding_generation_v5(
+                    tx, "bge-m3", dim, 1, 1, &fingerprint, 1_000,
+                )?;
                 for (message_id, conversation_id, vector) in vectors {
-                    crate::storage::schema::insert_message_embedding(
+                    let norm = crate::storage::schema::l2_norm(vector) as f32;
+                    crate::storage::schema::insert_chunk_row_in_tx(
                         tx,
-                        generation_id,
-                        *message_id,
-                        *conversation_id,
-                        vector,
-                        "h",
-                        None,
-                        1_000,
+                        &crate::storage::schema::ChunkRow {
+                            generation_id,
+                            message_id: *message_id,
+                            conversation_id: *conversation_id,
+                            chunk_idx: 0,
+                            byte_start: 0,
+                            byte_end: 1,
+                            content_hash: format!("h{message_id}"),
+                            embedding: vector.clone(),
+                            norm,
+                            created_at_ms: 1_000,
+                        },
                     )?;
                 }
                 Ok(generation_id)
             })
             .unwrap();
+        crate::storage::vector_domain::create_vec0_table_for_generation(conn, generation_id, dim).unwrap();
+        let chunk_ids: Vec<i64> = conn
+            .query_all_map(
+                "SELECT chunk_id FROM message_chunks WHERE generation_id = ?1",
+                &crate::storage::api::params![generation_id],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        let blobs: Vec<(i64, Vec<u8>)> = conn
+            .query_all_map(
+                "SELECT chunk_id, embedding FROM message_chunks WHERE generation_id = ?1",
+                &crate::storage::api::params![generation_id],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )
+            .unwrap();
+        let _ = chunk_ids;
+        let vec0_rows: Vec<(i64, &[u8])> = blobs.iter().map(|(id, blob)| (*id, blob.as_slice())).collect();
+        conn.with_tx(crate::storage::api::TxMode::Immediate, |tx| {
+            crate::storage::vector_domain::insert_vec0_rows_in_tx(tx, generation_id, &vec0_rows)?;
+            Ok(())
+        })
+        .unwrap();
         crate::storage::schema::switch_active_generation(conn, generation_id, 2_000, |_tx| Ok(())).unwrap();
-        crate::storage::vector_domain::rebuild_vec0_table_for_generation(conn, generation_id, dim).unwrap();
         generation_id
     }
 
@@ -15783,18 +16228,34 @@ mod tests {
             },
         );
         let generation_id = conn
-            .with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
-                let gen_id = crate::storage::schema::create_embedding_generation(tx, "bge-m3", 2, 1, 1_000)?;
-                crate::storage::schema::insert_message_embedding(
-                    tx, gen_id, 1, 1, &[1.0, 0.0], "h", None, 1_000,
+            .with_tx(crate::storage::api::TxMode::Immediate, |tx| {
+                let gen_id = crate::storage::schema::create_embedding_generation_v5(
+                    tx, "bge-m3", 2, 1, 1, &[0u8; 24], 1_000,
+                )?;
+                crate::storage::schema::insert_chunk_row_in_tx(
+                    tx,
+                    &crate::storage::schema::ChunkRow {
+                        generation_id: gen_id,
+                        message_id: 1,
+                        conversation_id: 1,
+                        chunk_idx: 0,
+                        byte_start: 0,
+                        byte_end: 1,
+                        content_hash: "h".to_string(),
+                        embedding: vec![1.0, 0.0],
+                        norm: crate::storage::schema::l2_norm(&[1.0, 0.0]) as f32,
+                        created_at_ms: 1_000,
+                    },
                 )?;
                 Ok(gen_id)
             })
             .unwrap();
         crate::storage::schema::switch_active_generation(conn, generation_id, 2_000, |_tx| Ok(())).unwrap();
-        // Deliberately skip rebuild_vec0_table_for_generation -- the
-        // relational row exists and the pointer is active, but the derived
-        // vec0 index was never built (w3-d5/w3-d7②: no auto-rebuild here).
+        // Deliberately skip building the vec0 table -- the relational
+        // (`message_chunks`) row exists and the pointer is active, but the
+        // derived vec0 index was never built (w3-d5/w3-d7②: no auto-rebuild
+        // here; T9: re-pointed from v4 `message_embeddings` to the v5
+        // chunk domain `search_db_vector_domain` now reads).
 
         let err = SearchClient::search_db_vector_domain(
             conn,
@@ -15815,13 +16276,13 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
         let conn = storage.raw();
-        let generation_id = seed_active_generation_with_vectors(&storage, 2, &[]);
+        let generation_id = seed_active_generation_with_chunk_vectors(&storage, 2, &[]);
         assert_eq!(
             crate::storage::schema::active_generation_id(conn).unwrap(),
             Some(generation_id)
         );
 
-        let (results, retry) = SearchClient::search_db_vector_domain(
+        let (results, meta) = SearchClient::search_db_vector_domain(
             conn,
             &[1.0, 0.0],
             &SearchFilters::default(),
@@ -15830,7 +16291,7 @@ mod tests {
         )
         .expect("a genuinely empty archive must be Ok, not an error (w3-d7①)");
         assert!(results.is_empty());
-        assert!(!retry.has_more_candidates);
+        assert!(!meta.incomplete);
     }
 
     /// vec0-path counterpart to the retired `semantic_filter_applies_all_
@@ -15960,7 +16421,7 @@ mod tests {
         // Four orthogonal unit-ish vectors in dim=4 so an unrestricted KNN
         // (k covering all 4) returns every row -- filter dimensions alone
         // decide what survives, isolating filter correctness from ranking.
-        seed_active_generation_with_vectors(
+        seed_active_generation_with_chunk_vectors(
             storage,
             4,
             &[
@@ -16185,17 +16646,25 @@ mod tests {
             );
             vectors.push((message_id, conversation_id, vec![theta.cos(), theta.sin()]));
         }
-        let generation_id = seed_active_generation_with_vectors(&storage, DIM, &vectors);
+        let generation_id = seed_active_generation_with_chunk_vectors(&storage, DIM, &vectors);
         let query_vector = [1.0_f32, 0.0];
 
-        // fetch_limit=2 -> OVERFETCH_FACTOR(4) -> first_k=8, comfortably
-        // less than TOTAL_DOCS(20) so the retry condition
-        // (`first_k < row_count_usize`) is live, and the 8 nearest docs
-        // (indices 0..8) contain zero /ws/target docs, so the first pass's
-        // `filtered.len()` is 0 < fetch_limit(2) -- the retry must fire.
+        // T9 (plan v5.1): the exact-scan round now fills `unique_messages`
+        // to exactly the `fetch_limit` it is given (no `first_k.max(fetch_
+        // limit)` overfetch headroom of its own -- that's now the caller's
+        // job, control-plane 2026-09-04 ruling). `fetch_limit=5` (>= the 3
+        // real `/ws/target` docs) so this test's actual point --
+        // distance/order correctness against `vec0`'s own numbers -- isn't
+        // muddied by a fetch_limit smaller than the target set. k =
+        // min(5*4, 4096) = 20 = TOTAL_DOCS, comfortably less than
+        // TOTAL_DOCS is no longer guaranteed, but the 8-nearest-docs
+        // reasoning below still holds: k=20 covers every doc, but the
+        // relational filter (workspace=/ws/target) still leaves the first
+        // round with 0 passing (docs 0..17 are all `/ws/other`), which is
+        // `< fetch_limit(5)` -- the exact-scan round still fires.
         let mut filters = SearchFilters::default();
         filters.workspaces.insert("/ws/target".to_string());
-        let (results, retry) = SearchClient::search_db_vector_domain(
+        let (results, meta) = SearchClient::search_db_vector_domain(
             storage.raw(),
             &query_vector,
             &filters,
@@ -16203,24 +16672,38 @@ mod tests {
                 crate::search::vector_index::ROLE_USER,
                 crate::search::vector_index::ROLE_ASSISTANT,
             ])),
-            2,
+            5,
         )
         .unwrap();
 
-        assert!(!retry.has_more_candidates, "the full-scan retry covers the entire filtered universe");
+        assert!(!meta.incomplete, "the exact scan covers the entire filtered universe, well under budget");
+        assert_eq!(meta.mode, CandidateMode::KnnExact, "the relational filter must have driven the exact-scan round");
 
         let got_ids: Vec<u64> = results.iter().map(|r| r.message_id).collect();
         assert_eq!(
             got_ids,
             vec![1017, 1018, 1019],
-            "must find exactly the three /ws/target docs, nearest-first (theta strictly increasing in doc index)"
+            "must find exactly the three /ws/target docs, nearest-first (theta strictly increasing in doc index) -- \
+             fewer than fetch_limit(5) exist, so all of them come back"
         );
 
         // Ground truth: ask vec0 itself (k=20, nowhere near the 4096 cap)
-        // for every doc's distance from the same query vector, then
-        // restrict to the three target ids -- this is what `vec0` itself
-        // says their distances are, independent of the full-scan path
-        // under test.
+        // for every chunk's distance from the same query vector, then
+        // restrict to the three target messages' chunks -- this is what
+        // `vec0` itself says their distances are, independent of the
+        // exact-scan path under test. vec0's rowid is `chunk_id` (T9: the
+        // v5 chunk domain), not `message_id`, so translate through
+        // `message_chunks` first (one chunk per message in this fixture).
+        let chunk_id_by_message: std::collections::HashMap<i64, i64> = storage
+            .raw()
+            .query_all_map(
+                "SELECT message_id, chunk_id FROM message_chunks WHERE generation_id = ?1",
+                &crate::storage::api::params![generation_id],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )
+            .unwrap()
+            .into_iter()
+            .collect();
         let vec0_truth: std::collections::HashMap<i64, f64> =
             crate::storage::vector_domain::vec0_knn(storage.raw(), generation_id, &query_vector, 20)
                 .unwrap()
@@ -16228,11 +16711,12 @@ mod tests {
                 .collect();
         for hit in &results {
             let doc_id = i64::try_from(hit.message_id).unwrap();
-            let vec0_distance = *vec0_truth.get(&doc_id).expect("vec0 must have scored every doc");
+            let chunk_id = *chunk_id_by_message.get(&doc_id).expect("every result message must have a chunk");
+            let vec0_distance = *vec0_truth.get(&chunk_id).expect("vec0 must have scored every chunk");
             let full_scan_distance = f64::from(1.0 - hit.score);
             assert!(
                 (vec0_distance - full_scan_distance).abs() < 1e-6,
-                "doc {doc_id}: vec0 distance {vec0_distance} vs full-scan distance {full_scan_distance} must match"
+                "doc {doc_id}: vec0 distance {vec0_distance} vs exact-scan distance {full_scan_distance} must match"
             );
         }
     }
@@ -16305,11 +16789,11 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        seed_active_generation_with_vectors(&storage, DIM, &vectors);
+        seed_active_generation_with_chunk_vectors(&storage, DIM, &vectors);
 
         // 80_016 mirrors exec60's exact observed derived-k crash value for
         // `--limit 5000` in hybrid mode.
-        let (results, retry) = SearchClient::search_db_vector_domain(
+        let (results, meta) = SearchClient::search_db_vector_domain(
             storage.raw(),
             &[1.0, 0.0, 0.0, 0.0],
             &SearchFilters::default(),
@@ -16321,26 +16805,38 @@ mod tests {
             80_016,
         )
         .expect("an oversized fetch_limit must never reach vec0's k<=4096 hard limit");
-        // R2-B6: this query is unfiltered -- every doc the first KNN pass
-        // finds passes the relational filter, so `filtered.len() ==
-        // first_k` (the k-max clamp, not filter selectivity, is why it fell
-        // short of `fetch_limit`). That must NOT trigger the full-scan
-        // retry (it would re-read and score all 4_200 docs' BLOBs for a
-        // filter that eliminated nothing -- the resource-exhaustion shape
-        // this item fixes); the correct response is "here's the clamped
-        // first_k window, and yes, there's more" via `has_more_candidates`.
-        assert!(
-            !retry.second_pass_taken,
-            "an unfiltered query that only hit the k-max clamp must not take the full-scan retry"
+        // T9 (plan v5.1) behavior change from the retired v4 path, not a
+        // field rename: the v4 full-scan retry only fired when a selective
+        // *filter* thinned the first KNN pass below `fetch_limit` --
+        // "the k-max clamp alone, not filter selectivity" deliberately did
+        // NOT retry, to avoid re-scoring a corpus a filter never actually
+        // shrank. Plan v5.1's exact-scan trigger drops that "filter must
+        // have eliminated something" qualifier: `window_full &&
+        // unique_messages < fetch_limit` alone decides it -- an unfiltered
+        // query whose corpus is genuinely smaller than the caller's
+        // `fetch_limit` (here: 4,200 docs vs 80,016 requested) now
+        // legitimately gets *every* doc back, not just the k-max-clamped
+        // first 4,096 with `has_more_candidates=true`. The `SQLITE_VEC_
+        // KNN_K_MAX` clamp this test exists to prove is still fully in
+        // effect (it protects the KNN call itself; the exact-scan round is
+        // downstream, streamed, and covered by `EXACT_SCAN_ROW_BUDGET`,
+        // not this ceiling) -- the corpus here is deliberately small
+        // (4,200 docs, dim=4) precisely so this exact-scan round is cheap,
+        // matching its own doc comment ("only the k-value itself is under
+        // test here, not ... realistic-scale latency").
+        assert_eq!(
+            meta.mode,
+            CandidateMode::KnnExact,
+            "the k-max clamp leaves the corpus (4,200) short of fetch_limit(80,016), driving the exact-scan round"
         );
         assert!(
-            retry.has_more_candidates,
-            "first_k was clamped below row_count -- there genuinely are more candidates beyond this window"
+            !meta.incomplete,
+            "4,200 docs is nowhere near EXACT_SCAN_ROW_BUDGET -- the exact scan completes comfortably"
         );
         assert_eq!(
             results.len(),
-            4_096,
-            "first_k clamps to SQLITE_VEC_KNN_K_MAX(4096) regardless of fetch_limit or row_count"
+            TOTAL_DOCS as usize,
+            "an unfiltered corpus smaller than fetch_limit must come back in full, not clamped to k-max(4096)"
         );
     }
 
@@ -16428,11 +16924,11 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        seed_active_generation_with_vectors(&storage, DIM, &vectors);
+        seed_active_generation_with_chunk_vectors(&storage, DIM, &vectors);
 
         let mut filters = SearchFilters::default();
         filters.workspaces.insert("/ws/target".to_string());
-        let (results, retry) = SearchClient::search_db_vector_domain(
+        let (results, meta) = SearchClient::search_db_vector_domain(
             storage.raw(),
             &[1.0, 0.0, 0.0, 0.0],
             &filters,
@@ -16442,12 +16938,23 @@ mod tests {
             ])),
             FETCH_LIMIT,
         )
-        .expect("a pathological fetch_limit must never abort the full-scan retry");
+        .expect("a pathological fetch_limit must never abort the exact-scan round");
 
-        assert!(retry.second_pass_taken, "the selective workspace filter must drive the streaming retry");
+        // T9 (plan v5.1): unlike the retired v4 path, the exact-scan round
+        // never allocates any capacity sized by `fetch_limit` (no `BinaryHeap::
+        // with_capacity(cap + 1)` -- it folds into a `HashMap` bounded by
+        // however many *distinct messages* the streamed, budget-capped rows
+        // actually contain, then `Vec::truncate`s to `still_needed`, a no-op
+        // when `still_needed` -- derived from `FETCH_LIMIT` here -- exceeds
+        // the available count). So the specific overflow/oversized-
+        // allocation failure mode this test was written to catch cannot
+        // occur in this design at all; what's left worth asserting is the
+        // same completeness/identity claim the old assertions made, via the
+        // new meta fields.
+        assert_eq!(meta.mode, CandidateMode::KnnExact, "the selective workspace filter must drive the exact-scan round");
         assert!(
-            !retry.has_more_candidates,
-            "all 10 /ws/target docs fit comfortably under a row_count-bounded cap -- nothing was truncated"
+            !meta.incomplete,
+            "all 10 /ws/target docs are found well within EXACT_SCAN_ROW_BUDGET -- nothing was truncated by the budget"
         );
         assert_eq!(results.len(), TARGET_DOCS as usize, "must find every /ws/target doc, none lost to a bogus cap");
         let got_ids: std::collections::HashSet<u64> = results.iter().map(|r| r.message_id).collect();
@@ -16455,18 +16962,31 @@ mod tests {
         assert_eq!(got_ids, want_ids, "must return exactly the 10 /ws/target docs");
     }
 
-    /// R2-B6 test (b): the full-scan retry's streaming top-K heap must
-    /// never surface more than its cap (`first_k.max(fetch_limit)` -- here
-    /// `first_k` = FETCH_LIMIT(3)*OVERFETCH_FACTOR(4) = 12, so cap=12), and
-    /// must pick the *closest* 12 among however many rows the retry
-    /// actually scans -- not merely the first 12 rows SQLite happens to
-    /// iterate. The 20 `/ws/target` docs (more than the cap, so truncation
-    /// genuinely happens) are seeded in strictly *descending* distance
+    /// T9 (plan v5.1) rewrite, control-plane 2026-09-04 ruling: the retired
+    /// v4 full-scan retry's streaming top-K heap capped output at
+    /// `first_k.max(fetch_limit)` (here 12, an *overfetch* window a caller
+    /// like the old `search_semantic` would page down from) -- v5.1's
+    /// exact-scan round has no such intermediate cap of its own: it fills
+    /// `unique_messages` to exactly `fetch_limit` (the overfetch headroom,
+    /// if any, is now `search_semantic_with_meta`'s job, upstream of this
+    /// direct-candidate-layer test). So this test's cap is now `fetch_limit`
+    /// itself (3), not `first_k` (12) -- what's still worth proving,
+    /// unchanged from the original test's intent, is that the exact scan
+    /// picks the *closest* `fetch_limit` among however many rows it
+    /// actually scans, not merely the first ones SQLite happens to iterate.
+    /// The 20 `/ws/target` docs (more than `fetch_limit`, so truncation
+    /// genuinely happens) stay seeded in strictly *descending* distance
     /// order (farthest inserted first) precisely so a broken "keep the
-    /// first `cap` rows seen" implementation would return the wrong
-    /// (farthest) 12 instead of the correct (nearest) 12 -- the assertion
-    /// on `got_ids`'s exact order/identity, not just its length, is what
-    /// catches that mutation.
+    /// first N rows seen" implementation would return the wrong (farthest)
+    /// 3 instead of the correct (nearest) 3 -- the assertion on `got_ids`'s
+    /// exact order/identity, not just its length, is what catches that
+    /// mutation. The old `has_more_candidates` assertion (some `/ws/target`
+    /// docs beyond the cap existed) has no equivalent in the new design --
+    /// `meta.incomplete` means "the row-scan *budget* was exceeded", not
+    /// "more matches exist beyond what the caller asked for" (asking for
+    /// exactly `fetch_limit` and getting exactly that is complete, by
+    /// definition, once the caller's own ask is satisfied) -- so that
+    /// assertion is dropped, not renamed, per control-plane instruction.
     #[test]
     fn db_vector_domain_full_scan_retry_streams_and_caps_at_first_k() {
         let dir = TempDir::new().unwrap();
@@ -16475,7 +16995,7 @@ mod tests {
         const FILLER_DOCS: i64 = 4_980;
         const TARGET_DOCS: i64 = 20;
         const FETCH_LIMIT: usize = 3;
-        const CAP: i64 = 12; // FETCH_LIMIT(3) * OVERFETCH_FACTOR(4)
+        const CAP: i64 = 3; // T9: fetch_limit itself, not first_k(12)
 
         let agent_id = storage
             .ensure_agent(&Agent { id: None, slug: "codex".to_string(), name: "codex".to_string(), version: None, kind: AgentKind::Cli })
@@ -16546,11 +17066,11 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        seed_active_generation_with_vectors(&storage, DIM, &vectors);
+        seed_active_generation_with_chunk_vectors(&storage, DIM, &vectors);
 
         let mut filters = SearchFilters::default();
         filters.workspaces.insert("/ws/target".to_string());
-        let (results, retry) = SearchClient::search_db_vector_domain(
+        let (results, meta) = SearchClient::search_db_vector_domain(
             storage.raw(),
             &[1.0, 0.0, 0.0, 0.0],
             &filters,
@@ -16562,28 +17082,29 @@ mod tests {
         )
         .unwrap();
 
-        assert!(
-            retry.second_pass_taken,
-            "the filter eliminated every first-pass candidate -- the streaming retry must fire"
+        assert_eq!(
+            meta.mode,
+            CandidateMode::KnnExact,
+            "the filter eliminated every first-pass candidate -- the exact-scan round must fire"
         );
         assert!(
-            retry.has_more_candidates,
-            "20 target docs exist but the heap caps at 12 -- 8 genuinely didn't fit, has_more must say so"
+            !meta.incomplete,
+            "20 target docs is nowhere near EXACT_SCAN_ROW_BUDGET -- the scan completes comfortably"
         );
         assert_eq!(
             results.len(),
             CAP as usize,
-            "20 matching docs exist but the heap must cap output at first_k={CAP}"
+            "20 matching docs exist but the exact-scan round must cap output at fetch_limit={CAP}"
         );
 
-        // The 12 nearest target docs are k=0..12 (theta=1.000..1.011);
-        // message_id = 5_000_000 + (TARGET_DOCS - 1 - k) maps k=0..12 to
-        // message_ids 5_000_019 down to 5_000_008, nearest-first.
+        // The 3 nearest target docs are k=0..3 (theta=1.000..1.002);
+        // message_id = 5_000_000 + (TARGET_DOCS - 1 - k) maps k=0..3 to
+        // message_ids 5_000_019 down to 5_000_017, nearest-first.
         let got_ids: Vec<u64> = results.iter().map(|r| r.message_id).collect();
         let want_ids: Vec<u64> = (0..CAP).map(|k| 5_000_000 + (TARGET_DOCS - 1 - k) as u64).collect();
         assert_eq!(
             got_ids, want_ids,
-            "must surface the 12 nearest target docs, nearest-first -- not the first 12 rows SQLite iterated"
+            "must surface the 3 nearest target docs, nearest-first -- not the first rows SQLite happened to iterate"
         );
     }
 
@@ -16677,11 +17198,11 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        seed_active_generation_with_vectors(&storage, DIM, &vectors);
+        seed_active_generation_with_chunk_vectors(&storage, DIM, &vectors);
 
         let mut filters = SearchFilters::default();
         filters.session_paths.insert(target_path.clone());
-        let (results, retry) = SearchClient::search_db_vector_domain(
+        let (results, meta) = SearchClient::search_db_vector_domain(
             storage.raw(),
             &[1.0, 0.0, 0.0, 0.0],
             &filters,
@@ -16693,9 +17214,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(
-            retry.second_pass_taken,
-            "the session_paths filter eliminated every first-pass candidate -- the streaming retry must fire"
+        assert_eq!(
+            meta.mode,
+            CandidateMode::KnnExact,
+            "the session_paths filter eliminated every first-pass candidate -- the exact-scan round must fire"
         );
         assert_eq!(
             results.len(),
@@ -16707,8 +17229,8 @@ mod tests {
             "must return the session_paths-matching target, not a filler"
         );
         assert!(
-            !retry.has_more_candidates,
-            "session_paths pruning leaves exactly 1 candidate in the retry's universe -- nothing was truncated"
+            !meta.incomplete,
+            "session_paths pruning leaves exactly 1 candidate in the exact-scan's filtered universe -- nothing was truncated"
         );
     }
 
@@ -16795,15 +17317,22 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        let generation_id = seed_active_generation_with_vectors(&storage, DIM, &vectors);
+        let generation_id = seed_active_generation_with_chunk_vectors(&storage, DIM, &vectors);
         let seed_elapsed = seed_start.elapsed();
 
         let mut filters = SearchFilters::default();
         filters.workspaces.insert("/ws/target".to_string());
         let query_vector: Vec<f32> = (0..DIM).map(|d| (d as f32 * 0.001).cos()).collect();
 
+        // T9 (plan v5.1): fetch_limit=10 (>= TARGET_DOCS=5), not the
+        // original 2 -- the exact-scan round now fills `unique_messages`
+        // to exactly `fetch_limit`, no `first_k.max(fetch_limit)` overfetch
+        // headroom of its own (control-plane 2026-09-04 ruling), so a
+        // `fetch_limit` smaller than the real target count would silently
+        // truncate this disclosure's own "found every target doc" claim
+        // rather than exercising the retry's completeness.
         let search_start = std::time::Instant::now();
-        let (results, retry) = SearchClient::search_db_vector_domain(
+        let (results, meta) = SearchClient::search_db_vector_domain(
             storage.raw(),
             &query_vector,
             &filters,
@@ -16811,7 +17340,7 @@ mod tests {
                 crate::search::vector_index::ROLE_USER,
                 crate::search::vector_index::ROLE_ASSISTANT,
             ])),
-            2,
+            10,
         )
         .unwrap();
         let search_elapsed = search_start.elapsed();
@@ -16830,7 +17359,7 @@ mod tests {
             })
         });
 
-        assert!(!retry.has_more_candidates, "full-scan retry must have covered the entire filtered universe");
+        assert!(!meta.incomplete, "exact-scan round must have covered the entire filtered universe well within budget");
         assert_eq!(
             results.len(),
             TARGET_DOCS as usize,
@@ -16873,7 +17402,7 @@ mod tests {
                 conversation_id: 1,
             },
         );
-        let gen_a = seed_active_generation_with_vectors(
+        let gen_a = seed_active_generation_with_chunk_vectors(
             &storage,
             2,
             &[(1, 1, vec![1.0, 0.0])],
@@ -16883,14 +17412,29 @@ mod tests {
         // generation B -- but does NOT drop generation A's vec0 table (W3-4's
         // delayed-cleanup job, out of scope here); this test's job is only
         // to prove the reader's snapshot is internally consistent, not to
-        // exercise cleanup.
+        // exercise cleanup. T9: chunk-domain (v5) generation, like gen_a --
+        // `search_db_vector_domain` only ever reads `message_chunks` now.
         let storage_b = FrankenStorage::open(&db_path).unwrap();
         let conn_b = storage_b.raw();
         let gen_b = conn_b
-            .with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
-                let gen_id = crate::storage::schema::create_embedding_generation(tx, "bge-m3", 2, 1, 3_000)?;
-                crate::storage::schema::insert_message_embedding(
-                    tx, gen_id, 1, 1, &[0.0, 1.0], "h2", None, 3_000,
+            .with_tx(crate::storage::api::TxMode::Immediate, |tx| {
+                let gen_id = crate::storage::schema::create_embedding_generation_v5(
+                    tx, "bge-m3", 2, 1, 1, &[0u8; 24], 3_000,
+                )?;
+                crate::storage::schema::insert_chunk_row_in_tx(
+                    tx,
+                    &crate::storage::schema::ChunkRow {
+                        generation_id: gen_id,
+                        message_id: 1,
+                        conversation_id: 1,
+                        chunk_idx: 0,
+                        byte_start: 0,
+                        byte_end: 1,
+                        content_hash: "h2".to_string(),
+                        embedding: vec![0.0, 1.0],
+                        norm: crate::storage::schema::l2_norm(&[0.0, 1.0]) as f32,
+                        created_at_ms: 3_000,
+                    },
                 )?;
                 Ok(gen_id)
             })
@@ -16917,7 +17461,7 @@ mod tests {
         assert!(before[0].score > 0.9, "expected generation A's near-exact match, got score={}", before[0].score);
 
         crate::storage::schema::switch_active_generation(conn_b, gen_b, 4_000, |_tx| Ok(())).unwrap();
-        crate::storage::vector_domain::rebuild_vec0_table_for_generation(conn_b, gen_b, 2).unwrap();
+        crate::storage::vector_domain::rebuild_vec0_table_for_generation_v5(conn_b, gen_b, 2).unwrap();
 
         let (after, _) = SearchClient::search_db_vector_domain(
             storage.raw(),

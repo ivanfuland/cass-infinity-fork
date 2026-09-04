@@ -23360,8 +23360,8 @@ fn run_cli_search(
             }
             #[cfg(any(feature = "semantic", feature = "infinity"))]
             {
-                let hits = client
-                    .search_semantic(query, filters.clone(), search_limit, search_offset, field_mask)
+                let (hits, candidate_meta) = client
+                    .search_semantic_with_meta(query, filters.clone(), search_limit, search_offset, field_mask)
                     .map_err(|e| {
                         let err_str = e.to_string();
                         if err_str.contains("unavailable")
@@ -23396,6 +23396,8 @@ fn run_cli_search(
                     cache_stats: crate::search::query::CacheStats::default(),
                     suggestions: Vec::new(),
                     total_count: None,
+                    candidates: Some(candidate_meta),
+                    semantic_degraded: false,
                 }
             }
         }
@@ -23598,6 +23600,8 @@ fn run_cli_search(
                             cache_stats: result.cache_stats,
                             suggestions: result.suggestions,
                             total_count: result.total_count,
+                            candidates: result.candidates,
+                            semantic_degraded: result.semantic_degraded,
                         }
                     }
                     Err(e) => {
@@ -23676,6 +23680,8 @@ fn run_cli_search(
                 cache_stats: result.cache_stats,
                 suggestions: result.suggestions.clone(),
                 total_count: result.total_count,
+                candidates: result.candidates.clone(),
+                semantic_degraded: result.semantic_degraded,
             };
             let has_more = total > offset_val + display.hits.len();
             (aggs, display, total, has_more, false)
@@ -23703,6 +23709,8 @@ fn run_cli_search(
                 cache_stats: result.cache_stats,
                 suggestions: result.suggestions,
                 total_count: result.total_count,
+                candidates: result.candidates,
+                semantic_degraded: result.semantic_degraded,
             };
             (
                 Aggregations::default(),
@@ -91984,6 +91992,10 @@ mod robot_output_score_tests {
             source_id: "local".to_string(),
             origin_kind: "local".to_string(),
             origin_host: None,
+            message_id: None,
+            winning_chunk_idx: None,
+            winning_chunk_span: None,
+            winning_chunk_hash: None,
         }
     }
 
