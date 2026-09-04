@@ -1,8 +1,11 @@
 //! Text canonicalization for consistent embedding input.
 //!
-//! Delegates to [`frankensearch::DefaultCanonicalizer`] for the full preprocessing
-//! pipeline (NFC normalization, markdown stripping, code block collapsing,
-//! whitespace normalization, low-signal filtering, and truncation).
+//! Delegates to [`DefaultCanonicalizer`] for the full preprocessing pipeline
+//! (NFC normalization, markdown stripping that keeps link text and URLs,
+//! whitespace normalization that keeps newlines, and low-signal filtering).
+//! `CANONICALIZE_PIPELINE_VERSION = 2` (T1, plan v5.1): the ingest path is
+//! lossless -- no length truncation and no code-block collapsing. The query
+//! path (`canonicalize_query`) is unchanged and still truncates.
 //!
 //! This module adds content hashing on top of the shared canonicalization logic.
 //!
@@ -72,126 +75,68 @@ pub trait Canonicalizer: Send + Sync {
     fn canonicalize_query(&self, query: &str) -> String;
 }
 
-/// Default canonicalization pipeline.
+/// Default canonicalization pipeline (v2, lossless).
 ///
-/// Applies NFC normalization, markdown stripping, code block collapsing,
-/// whitespace normalization, low-signal filtering, and length truncation.
-pub struct DefaultCanonicalizer {
-    /// Maximum characters for canonicalized text. Default: 2000.
-    pub max_length: usize,
-    /// Maximum lines to keep from the start of a fenced code block. Default: 20.
-    pub code_head_lines: usize,
-    /// Maximum lines to keep from the end of a fenced code block. Default: 10.
-    pub code_tail_lines: usize,
-}
+/// Applies NFC normalization, markdown stripping (keeping link text and
+/// URLs), whitespace normalization (collapsing intra-line whitespace runs,
+/// keeping newlines, folding 3+ consecutive newlines to 2), and low-signal
+/// filtering. No length truncation, no code-block collapsing -- fenced code
+/// block content is kept verbatim, line by line.
+pub struct DefaultCanonicalizer;
 
 impl Default for DefaultCanonicalizer {
     fn default() -> Self {
-        Self {
-            max_length: 2000,
-            code_head_lines: 20,
-            code_tail_lines: 10,
-        }
+        Self
     }
 }
 
 impl Canonicalizer for DefaultCanonicalizer {
     fn canonicalize(&self, text: &str) -> String {
-        // 1. NFC Unicode normalization (critical for hash stability)
+        // v2 (lossless): 1. NFC  2. strip markdown, keep code block content
+        // and link URLs  3. normalize whitespace, keep newlines  4. filter
+        // low-signal content. No truncation.
         let normalized: String = text.nfc().collect();
-        // 2. Strip markdown and collapse code blocks
         let stripped = self.strip_markdown_and_code(&normalized);
-        // 3. Normalize whitespace
         let ws_normalized = fs_normalize_whitespace(&stripped);
-        // 4. Filter low-signal content
-        let filtered = fs_filter_low_signal(&ws_normalized);
-        // 5. Truncate to max length
-        fs_truncate_to_chars(&filtered, self.max_length)
+        fs_filter_low_signal(&ws_normalized)
     }
 
     fn canonicalize_query(&self, query: &str) -> String {
-        // Queries are short — just NFC normalize and trim
+        // Queries are short — just NFC normalize and trim. Truncation here
+        // is UNCHANGED by v2 (out of scope for the lossless-ingest change).
         let normalized: String = query.nfc().collect();
         let trimmed = normalized.trim();
-        fs_truncate_to_chars(trimmed, self.max_length)
+        fs_truncate_to_chars(trimmed, QUERY_MAX_CHARS)
     }
 }
 
 impl DefaultCanonicalizer {
-    /// Strip markdown formatting and collapse code blocks.
+    /// Strip markdown formatting from regular text; keep fenced code block
+    /// content verbatim. v2: fence marker lines are dropped, there is no
+    /// head/tail collapsing, and every line (including blank ones, which
+    /// matter for stage 3's 3+-newline fold) is preserved.
     fn strip_markdown_and_code(&self, text: &str) -> String {
         let mut result = String::with_capacity(text.len());
         let mut in_code_block = false;
-        let mut code_block_lang = String::new();
-        let mut code_lines: Vec<&str> = Vec::new();
 
         for line in text.lines() {
             if line.starts_with("```") {
-                if in_code_block {
-                    // End of code block — collapse it
-                    result.push_str(&fs_collapse_code_block(
-                        &code_block_lang,
-                        &code_lines,
-                        self.code_head_lines,
-                        self.code_tail_lines,
-                    ));
-                    result.push('\n');
-                    code_lines.clear();
-                    code_block_lang.clear();
-                    in_code_block = false;
-                } else {
-                    // Start of code block
-                    in_code_block = true;
-                    code_block_lang = line.trim_start_matches('`').trim().to_string();
-                }
-            } else if in_code_block {
-                code_lines.push(line);
+                // Fence line: delete it, just toggle code-block state.
+                in_code_block = !in_code_block;
+                continue;
+            }
+            if in_code_block {
+                // v2: keep code block content verbatim, line by line.
+                result.push_str(line);
+                result.push('\n');
             } else {
-                // Strip markdown from regular text
                 let stripped = fs_strip_markdown_line(line);
-                if !stripped.is_empty() {
-                    result.push_str(&stripped);
-                    result.push('\n');
-                }
+                result.push_str(&stripped);
+                result.push('\n');
             }
         }
 
-        // Handle unclosed code block
-        if in_code_block && !code_lines.is_empty() {
-            result.push_str(&fs_collapse_code_block(
-                &code_block_lang,
-                &code_lines,
-                self.code_head_lines,
-                self.code_tail_lines,
-            ));
-            result.push('\n');
-        }
-
         result
-    }
-}
-
-/// Collapse a code block to first N + last M lines.
-fn fs_collapse_code_block(lang: &str, lines: &[&str], head: usize, tail: usize) -> String {
-    let lang_label = if lang.is_empty() {
-        "code".to_string()
-    } else {
-        format!("code: {lang}")
-    };
-
-    if lines.len() <= head + tail {
-        // Short enough to keep in full
-        format!("[{lang_label}]\n{}", lines.join("\n"))
-    } else {
-        // Collapse middle
-        let head_part: Vec<_> = lines.iter().take(head).copied().collect();
-        let tail_part: Vec<_> = lines.iter().skip(lines.len() - tail).copied().collect();
-        let omitted = lines.len() - head - tail;
-        format!(
-            "[{lang_label}]\n{}\n[... {omitted} lines omitted ...]\n{}",
-            head_part.join("\n"),
-            tail_part.join("\n")
-        )
     }
 }
 
@@ -253,7 +198,7 @@ fn fs_strip_italic_underscores(text: &str) -> String {
         .collect()
 }
 
-/// Strip markdown links: `[text](url)` → `text`.
+/// Strip markdown links: `[text](url)` → `text url` (v2: keeps the URL).
 fn fs_strip_markdown_links(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
@@ -301,8 +246,11 @@ fn fs_strip_markdown_links(text: &str) -> String {
                 }
 
                 if valid_link {
-                    // Valid link: [text](url) -> text
+                    // v2: keep both link text and URL: [text](url) -> "text url"
                     result.push_str(&link_text);
+                    result.push(' ');
+                    // url_part is "(...)" including the outer parens; strip them.
+                    result.push_str(&url_part[1..url_part.len() - 1]);
                 } else {
                     // Unbalanced parens or EOF: restore everything
                     result.push('[');
@@ -364,25 +312,49 @@ fn fs_strip_list_marker(line: &str) -> String {
     line.to_string()
 }
 
-/// Normalize whitespace: collapse runs to single space, trim.
+/// Normalize whitespace (v2, keeps newlines): collapse intra-line
+/// whitespace runs to a single space, trim each line's head/tail, then fold
+/// runs of 3+ consecutive newlines down to exactly 2 (at most one blank
+/// line between paragraphs). v1 folded ALL whitespace -- including `\n` --
+/// to a single space; v2 keeps `\n` as the paragraph/line-break signal.
 fn fs_normalize_whitespace(text: &str) -> String {
-    let mut result = String::with_capacity(text.len());
-    let mut prev_whitespace = true; // Start as true to trim leading
+    let mut normalized_lines: Vec<String> = Vec::with_capacity(text.len() / 16 + 1);
+    for line in text.split('\n') {
+        let mut out = String::with_capacity(line.len());
+        let mut prev_space = true; // trim leading horizontal whitespace
+        for c in line.chars() {
+            if c.is_whitespace() {
+                if !prev_space {
+                    out.push(' ');
+                    prev_space = true;
+                }
+            } else {
+                out.push(c);
+                prev_space = false;
+            }
+        }
+        normalized_lines.push(out.trim_end().to_string());
+    }
+    let joined = normalized_lines.join("\n");
 
-    for c in text.chars() {
-        if c.is_whitespace() {
-            if !prev_whitespace {
-                result.push(' ');
-                prev_whitespace = true;
+    // Fold runs of 3+ consecutive newlines down to exactly 2.
+    let mut result = String::with_capacity(joined.len());
+    let mut newline_run = 0usize;
+    for c in joined.chars() {
+        if c == '\n' {
+            newline_run += 1;
+            if newline_run <= 2 {
+                result.push(c);
             }
         } else {
+            newline_run = 0;
             result.push(c);
-            prev_whitespace = false;
         }
     }
 
-    // Trim trailing whitespace
-    result.trim_end().to_string()
+    result
+        .trim_matches(|c: char| c == '\n' || c.is_whitespace())
+        .to_string()
 }
 
 /// Filter out low-signal content.
@@ -434,16 +406,12 @@ fn fs_truncate_to_chars(text: &str, max_chars: usize) -> String {
 /// or mismatched fingerprint as failing generation activation by default;
 /// callers that have performed the attestation stamp the accepted version
 /// explicitly rather than relying on an inferred match.
-pub const CANONICALIZE_PIPELINE_VERSION: u32 = 1;
+pub const CANONICALIZE_PIPELINE_VERSION: u32 = 2;
 
-/// Maximum characters to keep after canonicalization.
-pub const MAX_EMBED_CHARS: usize = 2000;
-
-/// Maximum lines to keep from the beginning of a code block.
-pub const CODE_HEAD_LINES: usize = 20;
-
-/// Maximum lines to keep from the end of a code block.
-pub const CODE_TAIL_LINES: usize = 10;
+/// Maximum characters to keep for a canonicalized *query* (unchanged by
+/// v2 -- the ingest path no longer truncates, but the query path still
+/// does; see `Canonicalizer::canonicalize_query`).
+pub const QUERY_MAX_CHARS: usize = 2000;
 
 thread_local! {
     /// Per-thread cached canonicalizer. DefaultCanonicalizer is a stateless
@@ -481,9 +449,11 @@ const LOW_SIGNAL_CONTENT: &[&str] = &[
 ///
 /// For the dominant tool-output message shape (short plain-ASCII strings
 /// without inline markdown markers, headers, links, blockquotes, or list
-/// markers), this skips NFC normalization, markdown line-by-line stripping,
-/// and code-block collapse — the expensive parts of the slow path — and just
-/// does whitespace collapse + low-signal filter + truncation.
+/// markers), this skips NFC normalization and markdown line-by-line
+/// stripping — the expensive parts of the slow path — and just does
+/// whitespace normalization (via the same [`fs_normalize_whitespace`] the
+/// slow path uses, so the two provably agree) + low-signal filter. v2: no
+/// truncation.
 fn canonicalize_fast_path(text: &str) -> Option<String> {
     // Pure-ASCII check implies NFC is a no-op; any non-ASCII byte must
     // flow through the full pipeline because NFC may re-encode composed
@@ -504,19 +474,13 @@ fn canonicalize_fast_path(text: &str) -> Option<String> {
         return None;
     }
 
-    // Whitespace-collapsed string: split_whitespace + join(' ') produces the
-    // same output as the slow path's char-by-char collapse + trim.
-    // Pre-size the buffer from the input length — collapsed output is always
-    // <= input length for ASCII.
-    let mut collapsed = String::with_capacity(text.len());
-    let mut first = true;
-    for token in text.split_whitespace() {
-        if !first {
-            collapsed.push(' ');
-        }
-        collapsed.push_str(token);
-        first = false;
-    }
+    // v2: reuse the shared whitespace normalizer directly (keeps newlines,
+    // collapses intra-line runs, folds 3+ newlines to 2) so the fast path is
+    // provably byte-identical to the slow path's stage 3 output for any
+    // input that reaches here (no markdown discriminator bytes and no
+    // markdown line prefixes, so the slow path's stage 2 would have been a
+    // no-op transform anyway).
+    let collapsed = fs_normalize_whitespace(text);
 
     // Low-signal filter: case-insensitive ASCII match against the shared
     // pattern list. `str::eq_ignore_ascii_case` walks both operands byte-by-
@@ -528,12 +492,6 @@ fn canonicalize_fast_path(text: &str) -> Option<String> {
                 return Some(String::new());
             }
         }
-    }
-
-    // Truncate to MAX_EMBED_CHARS. Pure-ASCII inputs let us slice by byte
-    // index == char index.
-    if collapsed.len() > MAX_EMBED_CHARS {
-        collapsed.truncate(MAX_EMBED_CHARS);
     }
 
     Some(collapsed)
@@ -797,13 +755,6 @@ mod tests {
     }
 
     #[test]
-    fn canonicalize_fast_path_truncates_to_max_embed_chars() {
-        let long_ascii: String = "a ".repeat(MAX_EMBED_CHARS);
-        let out = canonicalize_for_embedding(&long_ascii);
-        assert!(out.chars().count() <= MAX_EMBED_CHARS);
-    }
-
-    #[test]
     fn test_unicode_nfc_normalization() {
         let composed = "caf\u{00E9}";
         let decomposed = "cafe\u{0301}";
@@ -842,10 +793,11 @@ mod tests {
 
     #[test]
     fn test_strip_markdown_links() {
+        // v2: link text AND URL are both kept (v1 dropped the URL).
         let text = "Check out [this link](http://example.com) for more info.";
         let canonical = canonicalize_for_embedding(text);
         assert!(canonical.contains("this link"));
-        assert!(!canonical.contains("http://example.com"));
+        assert!(canonical.contains("http://example.com"));
     }
 
     #[test]
@@ -859,14 +811,20 @@ mod tests {
 
     #[test]
     fn test_code_block_short() {
+        // v2: fence lines are dropped, code content kept verbatim; no
+        // "[code: lang]" label (that was tied to the removed collapse
+        // formatter).
         let text = "```rust\nfn main() {\n    println!(\"Hello\");\n}\n```";
         let canonical = canonicalize_for_embedding(text);
-        assert!(canonical.contains("[code: rust]"));
+        assert!(!canonical.contains("```"));
         assert!(canonical.contains("fn main()"));
     }
 
     #[test]
-    fn test_code_block_collapse_long() {
+    fn test_code_block_no_collapse_long() {
+        // v2: no head/tail collapsing regardless of block length -- every
+        // line, including the middle, is kept and "lines omitted" never
+        // appears.
         let mut lines = Vec::new();
         for i in 0..50 {
             lines.push(format!("line {i}"));
@@ -876,10 +834,10 @@ mod tests {
 
         assert!(canonical.contains("line 0"));
         assert!(canonical.contains("line 19"));
+        assert!(canonical.contains("line 25"));
         assert!(canonical.contains("line 40"));
         assert!(canonical.contains("line 49"));
-        assert!(canonical.contains("lines omitted"));
-        assert!(!canonical.contains("line 25"));
+        assert!(!canonical.contains("lines omitted"));
     }
 
     #[test]
@@ -900,10 +858,11 @@ mod tests {
     }
 
     #[test]
-    fn test_truncation() {
+    fn test_no_truncation() {
+        // v2: the ingest path no longer truncates (v1 capped at 2000 chars).
         let long_text: String = "a".repeat(5000);
         let canonical = canonicalize_for_embedding(&long_text);
-        assert_eq!(canonical.chars().count(), 2000);
+        assert_eq!(canonical.chars().count(), 5000);
     }
 
     #[test]
@@ -1074,9 +1033,10 @@ See [docs](http://docs.rs) for more.
         assert!(canonical.contains("Welcome"));
         assert!(!canonical.contains("**"));
         assert!(canonical.contains("Bold"));
-        assert!(canonical.contains("[code: rust]"));
+        assert!(canonical.contains("fn hello()"));
         assert!(canonical.contains("docs"));
-        assert!(!canonical.contains("http://docs.rs"));
+        // v2: URL is kept (v1 dropped it).
+        assert!(canonical.contains("http://docs.rs"));
     }
 
     #[test]
@@ -1108,7 +1068,11 @@ See [docs](http://docs.rs) for more.
             ),
             (
                 "**bold** _italic_ [link](http://example.com) and `code`\n\n```rust\nfn main() {}\n```",
-                "f7e12d641f8d760a791219163ec59961d2cc0782651ef71d031a9f4434d6f2e3",
+                // v2 resample (T1, plan v5.1): markdown+code-block+link
+                // input is exactly what v2 changes (keeps URL, keeps code
+                // content, keeps newlines) -- old v1 hash was
+                // f7e12d641f8d760a791219163ec59961d2cc0782651ef71d031a9f4434d6f2e3.
+                "aef208e2cecd470d0a93ee28ad2a39c6d92ef41f8025d47723b28d3eef783655",
             ),
             (
                 "caf\u{0065}\u{0301} au lait",
@@ -1127,5 +1091,174 @@ See [docs](http://docs.rs) for more.
                 "content_hash_hex drifted for input {input:?} -- canonicalize equivalence broken"
             );
         }
+    }
+
+    // =========================================================================
+    // T1 (plan v5.1): lossless normalization v2 -- keep newlines, no length
+    // truncation, no code-block collapsing, keep link URLs. Written red
+    // against the v1 pipeline first (TDD); 6 of the 7 below were red, 1
+    // (query truncation) was already green because the query path is
+    // explicitly unchanged by v2.
+    // =========================================================================
+
+    #[test]
+    fn canonicalize_v2_keeps_code_block_middle() {
+        let mut lines = Vec::new();
+        for i in 0..40 {
+            lines.push(format!("line {i}"));
+        }
+        let code = format!("```python\n{}\n```", lines.join("\n"));
+        let canonical = canonicalize_for_embedding(&code);
+        assert!(
+            canonical.contains("line 25"),
+            "v2 must keep the middle of a long code block: {canonical}"
+        );
+        assert!(
+            !canonical.contains("lines omitted"),
+            "v2 must not collapse code blocks: {canonical}"
+        );
+    }
+
+    #[test]
+    fn canonicalize_v2_no_length_truncation() {
+        let long_text = format!("# heading\n{}", "b".repeat(2500));
+        let canonical = canonicalize_for_embedding(&long_text);
+        assert!(
+            canonical.chars().count() > 2000,
+            "v2 must not truncate to 2000 chars: got {} chars",
+            canonical.chars().count()
+        );
+    }
+
+    #[test]
+    fn canonicalize_v2_keeps_link_url() {
+        let text = "[Example](https://example.com/x?y=1)";
+        let canonical = canonicalize_for_embedding(text);
+        assert!(
+            canonical.contains("Example"),
+            "link text lost: {canonical}"
+        );
+        assert!(
+            canonical.contains("https://example.com/x?y=1"),
+            "v2 must keep the URL: {canonical}"
+        );
+    }
+
+    #[test]
+    fn canonicalize_v2_preserves_newlines_and_collapses_runs() {
+        let text = "line one\nline two\n\n\n\n\nline three";
+        let canonical = canonicalize_for_embedding(text);
+        assert_eq!(canonical, "line one\nline two\n\nline three");
+    }
+
+    #[test]
+    fn canonicalize_v2_markdown_strip_precedes_whitespace() {
+        // A header line that strips to nothing must be treated as a blank
+        // line (created by stage 2) BEFORE stage 3's 3+-newline fold runs --
+        // proving strip-then-normalize ordering, not the reverse. If
+        // whitespace normalization ran first, this 4-newline run would not
+        // exist yet (only two independent 2-newline gaps would), so the
+        // fold would never trigger and the output would keep 4 newlines.
+        let text = "para one\n\n# \n\npara two";
+        let canonical = canonicalize_for_embedding(text);
+        assert_eq!(canonical, "para one\n\npara two");
+    }
+
+    #[test]
+    fn canonicalize_v2_fast_and_slow_paths_agree_on_long_ascii() {
+        let long_ascii: String = "word ".repeat(700); // > 2000 chars, pure ASCII, no markdown bytes
+        assert!(long_ascii.len() > 2000);
+        let fast = canonicalize_fast_path(&long_ascii).expect("must be fast-path eligible");
+        let slow = CANONICALIZER.with(|c| c.canonicalize(&long_ascii));
+        assert_eq!(fast, slow, "fast/slow path diverged on long ASCII input");
+        assert!(
+            fast.chars().count() > 2000,
+            "neither path should truncate: got {} chars",
+            fast.chars().count()
+        );
+    }
+
+    #[test]
+    fn canonicalize_query_truncation_unchanged() {
+        let long_query = "q".repeat(5000);
+        let canonical = CANONICALIZER.with(|c| c.canonicalize_query(&long_query));
+        assert_eq!(
+            canonical.chars().count(),
+            2000,
+            "query truncation must stay unchanged at 2000 chars"
+        );
+    }
+
+    /// T1 (plan v5.1, Step 6b): `scripts/oracle/hard_noise_phrases.json` must
+    /// stay in sync with the actual `is_short_acknowledgement` /
+    /// `is_tool_acknowledgement` source logic it transcribes. This can't
+    /// enumerate the Rust `matches!` arms directly, so it verifies the
+    /// contract from both directions: every phrase/prefix the JSON claims is
+    /// noise really is (per the actual functions), the counts match the
+    /// frozen totals (catches JSON drift/typos), and a control phrase that
+    /// is NOT noise really isn't (catches a degenerate always-true stub).
+    #[test]
+    fn hard_noise_phrases_json_matches_source() {
+        let raw = std::fs::read_to_string("scripts/oracle/hard_noise_phrases.json")
+            .expect("reading scripts/oracle/hard_noise_phrases.json");
+        let doc: serde_json::Value =
+            serde_json::from_str(&raw).expect("parsing hard_noise_phrases.json");
+
+        let short_acks = doc["short_acknowledgements"]["phrases"]
+            .as_array()
+            .expect("short_acknowledgements.phrases must be an array");
+        assert_eq!(
+            short_acks.len(),
+            20,
+            "short_acknowledgements count drifted from source"
+        );
+        for phrase in short_acks {
+            let phrase = phrase.as_str().expect("phrase must be a string");
+            assert!(
+                is_tool_acknowledgement(None, phrase),
+                "short_acknowledgements phrase {phrase:?} is not recognized by is_tool_acknowledgement"
+            );
+        }
+
+        let short_tool_acks = doc["short_tool_acks"]["phrases"]
+            .as_array()
+            .expect("short_tool_acks.phrases must be an array");
+        assert_eq!(
+            short_tool_acks.len(),
+            6,
+            "short_tool_acks count drifted from source"
+        );
+        for phrase in short_tool_acks {
+            let phrase = phrase.as_str().expect("phrase must be a string");
+            // toolish=true (role=Some("tool")) isolates the phrase-membership
+            // check from the toolish/contains-file/contains-match condition.
+            assert!(
+                is_tool_acknowledgement(Some("tool"), phrase),
+                "short_tool_acks phrase {phrase:?} is not recognized by is_tool_acknowledgement"
+            );
+        }
+
+        let prefixes = doc["prefixed_tool_acks"]["prefixes"]
+            .as_array()
+            .expect("prefixed_tool_acks.prefixes must be an array");
+        assert_eq!(
+            prefixes.len(),
+            8,
+            "prefixed_tool_acks count drifted from source"
+        );
+        for prefix in prefixes {
+            let prefix = prefix.as_str().expect("prefix must be a string");
+            let text = format!("{prefix}/tmp/example.rs");
+            assert!(
+                is_tool_acknowledgement(Some("tool"), &text),
+                "prefixed_tool_acks prefix {prefix:?} is not recognized by is_tool_acknowledgement"
+            );
+        }
+
+        // Control: an ordinary sentence must NOT be classified as noise.
+        assert!(!is_tool_acknowledgement(
+            Some("assistant"),
+            "The authentication module needs a retry policy."
+        ));
     }
 }
