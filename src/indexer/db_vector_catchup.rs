@@ -494,12 +494,8 @@ pub fn run_db_vector_catchup_backfill(
     // did. Every path above only ever grows `message_embeddings` toward
     // the eligible set (`eligible_ids` -> `seed_embedding_holes` -> drain);
     // nothing shrinks it back when a message that used to be eligible no
-    // longer is (most commonly: a conversation's cumulative content
-    // crosses the shared 8 MiB per-conversation cap -- `FrankenStorage::
-    // fetch_messages_for_lexical_rebuild`'s `truncate_lexical_rebuild_
-    // conversation_content`, #290 -- which `scan_eligible_message_ids`
-    // reuses and which silently clears an already-embedded tail message's
-    // content out of the eligibility scan). Left unpruned, such a row
+    // longer is (e.g. its conversation is deleted or its content is edited
+    // out from under it between generations). Left unpruned, such a row
     // makes activation audit ④'s `embedded_not_eligible_count` check
     // permanently non-zero and this generation can never activate again.
     // `eligible_ids` (collected above, before the drain loop) is the same
@@ -1576,87 +1572,15 @@ mod ineligible_embedding_prune_tests {
         );
     }
 
-    /// Task book #81 R2 review: proves `scan_eligible_message_ids` itself
-    /// -- not just `classify_hole_row`'s consumption of its output -- puts
-    /// the 8 MiB per-conversation truncation cap (#290) into the
-    /// eligibility snapshot. A conversation with one message just over the
-    /// cap followed by a second (tail) message: the cap boundary lands
-    /// inside the first message (truncated, but still non-empty) and
-    /// clears the second entirely, so only the first message's doc_id can
-    /// ever be eligible.
-    #[test]
-    fn scan_eligible_message_ids_excludes_a_tail_message_past_the_byte_cap() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let storage = open_storage(&dir.path().join("db.sqlite"));
-        let agent_id = ensure_agent(&storage);
-
-        // One byte over `LEXICAL_MAX_CONVERSATION_CONTENT_BYTES_DEFAULT`
-        // (8 * 1024 * 1024) on its own -- guarantees truncation kicks in
-        // within this single conversation regardless of the second
-        // message's size.
-        let big_content = "x".repeat(8 * 1024 * 1024 + 1);
-        let conv = Conversation {
-            id: None,
-            agent_slug: "claude_code".into(),
-            workspace: None,
-            external_id: Some("exec72-r2-byte-cap-tail".into()),
-            title: Some("exec72 R2 byte-cap fixture".into()),
-            source_path: std::path::PathBuf::from("/fixtures/exec72-r2-byte-cap-tail.jsonl"),
-            started_at: Some(TS),
-            ended_at: Some(TS + 60_000),
-            approx_tokens: None,
-            metadata_json: serde_json::Value::Null,
-            messages: vec![
-                Message {
-                    id: None,
-                    idx: 0,
-                    role: MessageRole::User,
-                    author: None,
-                    created_at: Some(TS),
-                    content: big_content,
-                    extra_json: serde_json::Value::Null,
-                    snippets: vec![],
-                },
-                Message {
-                    id: None,
-                    idx: 1,
-                    role: MessageRole::Assistant,
-                    author: None,
-                    created_at: Some(TS + 1_000),
-                    content: "this tail message must fall outside the eligibility snapshot".to_string(),
-                    extra_json: serde_json::Value::Null,
-                    snippets: vec![],
-                },
-            ],
-            source_id: "local".into(),
-            origin_host: None,
-        };
-        storage.insert_conversation_tree(agent_id, None, &conv).expect("insert fixture conversation");
-        let conv_id: i64 = storage
-            .raw()
-            .query_row_map(
-                "SELECT id FROM conversations WHERE external_id = ?1",
-                &params!["exec72-r2-byte-cap-tail"],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-        let doc_head: i64 = storage
-            .raw()
-            .query_row_map("SELECT id FROM messages WHERE conversation_id = ?1 AND idx = 0", &params![conv_id], |row| {
-                row.get_typed(0)
-            })
-            .unwrap();
-        let doc_tail: i64 = storage
-            .raw()
-            .query_row_map("SELECT id FROM messages WHERE conversation_id = ?1 AND idx = 1", &params![conv_id], |row| {
-                row.get_typed(0)
-            })
-            .unwrap();
-
-        let eligible = scan_eligible_message_ids(&storage).expect("scan eligibility");
-        assert!(eligible.contains(&doc_head), "the truncated-but-nonempty head message must stay eligible");
-        assert!(!eligible.contains(&doc_tail), "the fully-cleared tail message must not be eligible");
-    }
+    // `scan_eligible_message_ids_excludes_a_tail_message_past_the_byte_cap`
+    // (task book #81 R2) retired under plan v5.1 T5: the 8 MiB
+    // per-conversation lexical truncation cap it exercised (#290) is gone,
+    // and `scan_eligible_message_ids` inherited that cap only as a
+    // transitive side effect of reusing the (now capless) single-conversation
+    // fetch helper for semantic/embedding checkpoint scanning. A tail
+    // message that used to fall outside the cap is now semantically
+    // eligible like any other message -- a real, intended behavior change
+    // from dropping the cap, not a regression in this function.
 
     /// Task book #81 R2-N3: `demote_generation_readiness_if_active_in_tx`
     /// must only ever touch the exact `generation_id` it was called with,

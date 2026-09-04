@@ -2300,93 +2300,6 @@ pub(crate) fn is_lexical_rebuild_tool_class_role(role: &str) -> bool {
     matches!(role, "tool" | "tool_result" | "toolResult")
 }
 
-/// Default per-conversation lexical-content byte ceiling (#290).
-///
-/// The staged lexical-rebuild shard cap
-/// (`CASS_TANTIVY_REBUILD_STAGED_SHARD_MAX_MESSAGE_BYTES`) defaults to 64 MiB with
-/// a 16 MiB floor. An indivisible single conversation whose materialized content
-/// exceeds the per-shard cap forces the OOM→bisect→quarantine path because the
-/// dominant resident cost is cass-side materialization of the whole conversation's
-/// text. We cap per-conversation indexed content at 8 MiB —
-/// `min(shard_cap/2, 8 MiB)` for the default 64 MiB shard cap, and comfortably
-/// below even the 16 MiB shard floor — so a normally-large (image/base64-heavy)
-/// conversation is admitted with a truncated lexical body instead of quarantined.
-/// 8 MiB of text is far more than lexical search needs (tokens, not raw blobs)
-/// while leaving headroom for the Tantivy arena and concurrent shard builders.
-pub const LEXICAL_MAX_CONVERSATION_CONTENT_BYTES_DEFAULT: usize = 8 * 1024 * 1024;
-
-/// Per-conversation lexical-content byte ceiling, overridable via
-/// `CASS_LEXICAL_MAX_CONVERSATION_CONTENT_BYTES` (#290).
-///
-/// `0` is rejected (treated as "use default") so the cap can never be disabled
-/// into the OOM-quarantine regime by accident; set a large value to effectively
-/// disable it.
-pub fn lexical_max_conversation_content_bytes() -> usize {
-    dotenvy::var("CASS_LEXICAL_MAX_CONVERSATION_CONTENT_BYTES")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(LEXICAL_MAX_CONVERSATION_CONTENT_BYTES_DEFAULT)
-}
-
-/// Largest byte length `<= cap` that ends on a UTF-8 char boundary of `content`.
-fn lexical_content_truncation_boundary(content: &str, cap: usize) -> usize {
-    if content.len() <= cap {
-        return content.len();
-    }
-    let mut boundary = cap;
-    while boundary > 0 && !content.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    boundary
-}
-
-/// Cap the cumulative per-conversation lexical content at `cap` bytes (#290).
-///
-/// Messages are visited in `idx` order (earliest first); once the running total
-/// reaches the cap, the message that straddles the boundary is truncated to the
-/// remaining budget on a UTF-8 char boundary and every later message's content is
-/// cleared. Message rows are preserved (count/structure unchanged) so the rest of
-/// the rebuild pipeline's per-message accounting stays consistent — only indexed
-/// text is dropped. Emits one `lexical_content_truncated` diagnostic per affected
-/// conversation. No-op when total content is within the cap.
-fn truncate_lexical_rebuild_conversation_content(
-    conversation_id: i64,
-    messages: &mut [Message],
-    cap: usize,
-) {
-    let original_bytes: usize = messages.iter().map(|message| message.content.len()).sum();
-    if original_bytes <= cap {
-        return;
-    }
-
-    let mut used = 0usize;
-    for message in messages.iter_mut() {
-        if used >= cap {
-            message.content.clear();
-            continue;
-        }
-        let remaining = cap - used;
-        if message.content.len() <= remaining {
-            used += message.content.len();
-        } else {
-            let boundary = lexical_content_truncation_boundary(&message.content, remaining);
-            message.content.truncate(boundary);
-            used += boundary;
-        }
-    }
-
-    let capped_bytes: usize = messages.iter().map(|message| message.content.len()).sum();
-    tracing::warn!(
-        diagnostic = "lexical_content_truncated",
-        conversation_id,
-        original_bytes,
-        capped_bytes,
-        cap,
-        "lexical rebuild conversation content exceeded the per-conversation cap; truncated indexed text to stay within budget instead of OOM-quarantining (#290)"
-    );
-}
-
 /// Compatibility alias retained while call sites finish converging on `FrankenStorage`.
 pub type SqliteStorage = FrankenStorage;
 
@@ -6740,29 +6653,6 @@ impl FrankenStorage {
         Ok(lines)
     }
 
-    /// Fetch messages for lexical index rebuilds without deserializing extra metadata.
-    ///
-    /// Tantivy only needs message text and core envelope fields, so avoiding
-    /// `extra_json` here prevents rebuilds from rehydrating enormous historical
-    /// payloads that are irrelevant to lexical search.
-    ///
-    /// The assembled per-conversation content is additionally capped at
-    /// [`lexical_max_conversation_content_bytes`] (see #290): an image/base64-heavy
-    /// conversation that materializes 10-40 MiB of indexed text would otherwise
-    /// exceed the per-shard byte budget and force the OOM→bisect→quarantine path.
-    /// Capping the *content* (not the message count/structure) admits the
-    /// conversation within budget with a truncated lexical body — lexical search
-    /// needs tokens, not the full multi-megabyte blob.
-    pub fn fetch_messages_for_lexical_rebuild(&self, conversation_id: i64) -> Result<Vec<Message>> {
-        let mut messages = self.fetch_messages_for_lexical_rebuild_uncapped(conversation_id)?;
-        truncate_lexical_rebuild_conversation_content(
-            conversation_id,
-            &mut messages,
-            lexical_max_conversation_content_bytes(),
-        );
-        Ok(messages)
-    }
-
     /// W2-4 Step 2: full `lex_docs`/`fts_lex` rebuild from the canonical
     /// `messages`/`conversations` tables — independent of, and run after,
     /// `rebuild_tantivy_from_db_with_options` (which opens the database
@@ -6866,10 +6756,18 @@ impl FrankenStorage {
         })
     }
 
-    /// Inner fetch without the per-conversation content cap. Kept separate so the
-    /// cap is applied at exactly one chokepoint (every lexical-rebuild content
-    /// load — batch and streaming — funnels through `fetch_messages_for_lexical_rebuild`).
-    fn fetch_messages_for_lexical_rebuild_uncapped(
+    /// Fetch messages for one conversation without deserializing extra
+    /// metadata (T5, plan v5.1: renamed from `fetch_messages_for_lexical_
+    /// rebuild`, merged with what used to be the separate `_uncapped` inner
+    /// helper -- once the 8 MiB per-conversation content cap is gone
+    /// entirely, capped and uncapped were the same function). Tantivy/lexical
+    /// callers only need message text and core envelope fields, so avoiding
+    /// `extra_json` here prevents rebuilds from rehydrating enormous
+    /// historical payloads irrelevant to lexical search. No truncation: T5
+    /// removes the 8 MiB cap (#290) entirely -- plan v5.1's "保真" (fidelity)
+    /// constraint forbids any session-, message-, or block-count cap on the
+    /// lexical whitelist.
+    pub fn fetch_messages_for_conversation(
         &self,
         conversation_id: i64,
     ) -> Result<Vec<Message>> {
@@ -6924,15 +6822,21 @@ impl FrankenStorage {
             })
     }
 
-    /// Fetch messages for multiple conversations during lexical rebuilds.
+    /// Fetch messages for multiple conversations in one call (T5, plan
+    /// v5.1: renamed from `fetch_messages_for_lexical_rebuild_batch` -- this
+    /// is a generic per-conversation message loader reused well beyond the
+    /// lexical domain, notably by `indexer/semantic.rs`'s embedding-input
+    /// checkpoint selection; the old name was misleading). The
+    /// `max_messages`/`max_content_bytes` guardrail params are removed:
+    /// every call site always passed `None, None` -- dead parameters, and
+    /// keeping them would contradict T5's "no cap" mandate (plan v5.1's
+    /// "保真" constraint).
     ///
-    /// This preserves the lightweight lexical-rebuild projection while avoiding
-    /// one round-trip per conversation when rebuilding large canonical indexes.
-    pub fn fetch_messages_for_lexical_rebuild_batch(
+    /// This preserves the lightweight message projection while avoiding one
+    /// round-trip per conversation when loading a large set of conversations.
+    pub fn fetch_messages_for_conversations_batch(
         &self,
         conversation_ids: &[i64],
-        max_messages: Option<usize>,
-        max_content_bytes: Option<usize>,
     ) -> Result<HashMap<i64, Vec<Message>>> {
         if conversation_ids.is_empty() {
             return Ok(HashMap::new());
@@ -6941,8 +6845,6 @@ impl FrankenStorage {
         let mut grouped: HashMap<i64, Vec<Message>> =
             HashMap::with_capacity(conversation_ids.len());
         let mut fetched_conversation_ids = HashSet::with_capacity(conversation_ids.len());
-        let mut total_messages = 0usize;
-        let mut total_content_bytes = 0usize;
 
         // The apparent single-query shape (`WHERE conversation_id IN (...) ORDER BY ...`)
         // is a bad the legacy embedded engine plan for large live databases: it can
@@ -6954,33 +6856,10 @@ impl FrankenStorage {
             }
 
             let messages = self
-                .fetch_messages_for_lexical_rebuild(*conversation_id)
+                .fetch_messages_for_conversation(*conversation_id)
                 .with_context(|| {
-                    format!("fetching lexical rebuild messages for conversation {conversation_id}")
+                    format!("fetching messages for conversation {conversation_id}")
                 })?;
-            total_messages = total_messages.saturating_add(messages.len());
-            if let Some(limit) = max_messages
-                && total_messages > limit
-            {
-                return Err(anyhow!(
-                    "lexical rebuild batch fetch exceeded message guardrail: messages={total_messages} limit={limit} conversations={}",
-                    conversation_ids.len()
-                ));
-            }
-
-            let message_bytes = messages
-                .iter()
-                .map(|message| message.content.len())
-                .sum::<usize>();
-            total_content_bytes = total_content_bytes.saturating_add(message_bytes);
-            if let Some(limit) = max_content_bytes
-                && total_content_bytes > limit
-            {
-                return Err(anyhow!(
-                    "lexical rebuild batch fetch exceeded content-byte guardrail: bytes={total_content_bytes} limit={limit} conversations={}",
-                    conversation_ids.len()
-                ));
-            }
 
             if !messages.is_empty() {
                 grouped.insert(*conversation_id, messages);
@@ -7016,7 +6895,7 @@ impl FrankenStorage {
 
         for conversation_id in conversation_ids {
             let messages = self
-                .fetch_messages_for_lexical_rebuild(conversation_id)
+                .fetch_messages_for_conversation(conversation_id)
                 .with_context(|| {
                     format!("streaming lexical rebuild messages for conversation {conversation_id}")
                 })?;
@@ -8195,6 +8074,7 @@ impl FrankenStorage {
                         let (inserted_last_idx, inserted_last_created_at) =
                             borrowed_messages_tail_state(&new_messages);
                         let mut inserted_indices = Vec::new();
+                        let mut inserted_message_ids = Vec::new();
                         let inserted_messages =
                             franken_append_insert_new_messages(tx, existing_id, &new_messages)?;
                         let inserted_chars = inserted_messages
@@ -8204,6 +8084,7 @@ impl FrankenStorage {
                         for (msg_id, msg) in inserted_messages {
                             franken_insert_snippets(tx, msg_id, &msg.snippets)?;
                             inserted_indices.push(msg.idx);
+                            inserted_message_ids.push(msg_id);
                         }
 
                         if idx_collision_count > 0 {
@@ -8216,8 +8097,12 @@ impl FrankenStorage {
                             );
                         }
 
+                        // T5 (plan v5.1): message-content change (new
+                        // messages appended during recovery merge) -> the
+                        // lexical sync is message-level, scoped to exactly
+                        // the messages this branch just inserted.
                         if !defer_lexical_updates {
-                            sync_lexical_domain_for_conversation_in_tx(tx, existing_id)?;
+                            sync_lexical_docs_for_messages_in_tx(tx, &inserted_message_ids)?;
                         }
 
                         let conv_last_ts = conversation_tail_ended_at_candidate(conv);
@@ -8292,7 +8177,7 @@ impl FrankenStorage {
                     new_messages.push(msg);
                 }
                 let inserted_message_ids = franken_batch_insert_new_messages(tx, conv_id, &new_messages)?;
-                for (msg_id, msg) in inserted_message_ids.into_iter().zip(new_messages) {
+                for (msg_id, msg) in inserted_message_ids.iter().copied().zip(new_messages) {
                     franken_insert_snippets(tx, msg_id, &msg.snippets)?;
                     total_chars += msg.content.len() as i64;
                     inserted_indices.push(msg.idx);
@@ -8306,8 +8191,10 @@ impl FrankenStorage {
                         "message idx collisions encountered while inserting a new conversation; retaining the first canonical variant per idx"
                     );
                 }
+                // T5 (plan v5.1): brand-new conversation -- every message
+                // just inserted is new content, message-level sync.
                 if !defer_lexical_updates {
-                    sync_lexical_domain_for_conversation_in_tx(tx, conv_id)?;
+                    sync_lexical_docs_for_messages_in_tx(tx, &inserted_message_ids)?;
                 }
 
                 if !defer_analytics_updates {
@@ -8702,6 +8589,7 @@ impl FrankenStorage {
         };
 
         let mut inserted_indices = Vec::new();
+        let mut inserted_message_ids = Vec::new();
         let (inserted_last_idx, inserted_last_created_at) =
             borrowed_messages_tail_state(&new_messages);
         let inserted_messages =
@@ -8713,6 +8601,7 @@ impl FrankenStorage {
         for (msg_id, msg) in inserted_messages {
             franken_insert_snippets(tx, msg_id, &msg.snippets)?;
             inserted_indices.push(msg.idx);
+            inserted_message_ids.push(msg_id);
         }
 
         if idx_collision_count > 0 {
@@ -8725,8 +8614,10 @@ impl FrankenStorage {
             );
         }
 
+        // T5 (plan v5.1): message-content change (append to an existing
+        // conversation) -> message-level sync scoped to the new messages.
         if !defer_lexical_updates {
-            sync_lexical_domain_for_conversation_in_tx(tx, conversation_id)?;
+            sync_lexical_docs_for_messages_in_tx(tx, &inserted_message_ids)?;
         }
 
         let mut exact_append_tail_set = false;
@@ -9479,17 +9370,51 @@ impl FrankenStorage {
                     // highest-traffic write path and previously never synced
                     // the lex_docs/fts_lex domain at all -- every conversation
                     // that landed via this path was invisible to fts_lex
-                    // MATCH. Unlike the tantivy fts_entries buffer above
-                    // (batched across all conversations in this call and
-                    // flushed only once size thresholds are crossed),
-                    // sync_lexical_domain_for_conversation_in_tx recomputes
-                    // the full projection straight from the messages table,
-                    // so it only needs one call per conversation, right here
-                    // where `conv_id` is settled for both the new-insert and
-                    // existing-append branches -- same `!defer_lexical_updates`
-                    // gate and same in-tx semantics as insert_conversation_tree.
+                    // MATCH. Right here is where `conv_id` is settled for
+                    // both the new-insert and existing-append branches --
+                    // same `!defer_lexical_updates` gate and same in-tx
+                    // semantics as insert_conversation_tree.
+                    //
+                    // T5 (plan v5.1): split into the two change categories
+                    // this path can actually produce. Message content
+                    // change: whatever this iteration inserted into
+                    // `inserted_messages` (empty for a re-ingest that added
+                    // no new messages) -> message-level sync. Envelope
+                    // change: this path never updated `conversations.title`/
+                    // `workspace_id` on a re-ingest of an existing
+                    // conversation at all before T5 (a real gap control-plane
+                    // ruling flagged: the same conversation can be re-ingested
+                    // with a changed title/workspace and unchanged messages)
+                    // -- compare the current row against the incoming `conv`
+                    // and, if either differs, apply the update and resync the
+                    // envelope projection on every existing lex_docs row for
+                    // this conversation (content untouched).
                     if !defer_lexical_updates {
-                        sync_lexical_domain_for_conversation_in_tx(tx, conv_id)?;
+                        let inserted_message_ids: Vec<i64> =
+                            inserted_messages.iter().map(|(id, _)| *id).collect();
+                        sync_lexical_docs_for_messages_in_tx(tx, &inserted_message_ids)?;
+
+                        let (current_title, current_workspace_id): (Option<String>, Option<i64>) = tx
+                            .query_row_map(
+                                "SELECT title, workspace_id FROM conversations WHERE id = ?1",
+                                fparams![conv_id],
+                                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+                            )
+                            .with_context(|| {
+                                format!("loading current title/workspace_id for envelope-change detection (conversation {conv_id})")
+                            })?;
+                        let envelope_changed =
+                            current_title != conv.title || current_workspace_id != workspace_id;
+                        if envelope_changed {
+                            tx.execute(
+                                "UPDATE conversations SET title = ?2, workspace_id = ?3 WHERE id = ?1",
+                                fparams![conv_id, conv.title.as_deref(), workspace_id],
+                            )
+                            .with_context(|| {
+                                format!("updating title/workspace_id for conversation {conv_id} (envelope change on re-ingest)")
+                            })?;
+                            resync_lexical_envelope_for_conversation_in_tx(tx, conv_id)?;
+                        }
                     }
 
                     if !defer_analytics_updates {
@@ -11348,79 +11273,167 @@ fn franken_collect_batched_existing_new_messages<'a>(
     ))
 }
 
-/// W2-2/W2-3 (spec G4, R2-W2-B1, R1-W2-B1): rebuild `lex_docs`/`fts_lex` for
-/// one conversation from scratch, in the same transaction as the caller's
-/// messages/conversations write.
-///
-/// Takes only `tx` (not `&FrankenStorage`) deliberately: the restore/backfill
-/// orchestration (`phase3_restore::commit_replace_in_tx`, which is the *real*
-/// caller of the parent-projection-field update — see below) only has a
-/// `Tx` in scope, not a `FrankenStorage` handle, so this cannot route through
-/// the `&self` method `FrankenStorage::fetch_messages_for_lexical_rebuild`.
-/// Reuses that method's exact query shape and its `truncate_lexical_rebuild_
-/// conversation_content` truncation call (the actual nontrivial 8 MiB
-/// business logic — the free function, not the `&self` wrapper around it) so
-/// the storage write path and the `--full` rebuild path apply the identical
-/// per-conversation cap. Eligibility is the same predicate
-/// `expected_live_lexical_doc_count` (`indexer/mod.rs`) composes from
-/// `is_lexical_rebuild_tool_class_role` + `is_hard_message_noise` — never
-/// duplicated, only called (W2-0 Step 3c's "复用同一投影实现，禁抄").
-///
-/// **Correction to the W2-0 remeasure report**: that report stated the
-/// title/workspace `UPDATE` "is called by `franken_replace_conversation_
-/// messages_in_tx`". That was never actually verified and is wrong — the two
-/// functions are *siblings*, both invoked in sequence by
-/// `phase3_restore::commit_replace_in_tx` (steps 2-7 then step 9). This
-/// function must therefore be wired in *after* step 9
-/// (`franken_update_conversation_projection_fields_in_tx`), not merely after
-/// `franken_replace_conversation_messages_in_tx`, or a replace would sync
-/// lexical rows against the *stale* pre-update title/workspace.
-///
-/// Full-conversation recompute (not incremental) is deliberate: the 8 MiB
-/// cap bounds per-conversation cost regardless of insert/append/replace, so
-/// recomputing from scratch on every call is trivially and provably
-/// consistent with the shared truncation logic for
-/// append/replace/parent-title-or-workspace-update alike — there is no
-/// separate incremental-truncation-state bookkeeping to get wrong. Deletes
-/// existing `fts_lex`/`lex_docs` rows for this conversation's message ids
-/// *before* touching `lex_docs` (external-content mode looks up the current
-/// `lex_docs` row via `content_rowid` to remove old index terms, so the
-/// content row must still be present at delete time), then reinserts the
-/// recomputed eligible set.
-///
-/// Fail-closed: every error here propagates via `?` — callers must not catch
-/// and continue. A lexical-domain write failure aborts the whole caller
-/// transaction, effective from the day this table exists (stricter than the
-/// spec's own "post-retirement" floor — R1-W2-B1 carried forward).
-pub(crate) fn sync_lexical_domain_for_conversation_in_tx(
+/// T5 (plan v5.1): outcome of a message-level lexical sync
+/// ([`sync_lexical_docs_for_messages_in_tx`]) -- which doc_ids had their old
+/// `lex_docs`/`fts_lex` rows removed, and which were (re)inserted (a
+/// message's doc_id can appear in `deleted_doc_ids` without appearing in
+/// `inserted_doc_ids`: it used to be lexically eligible and no longer is,
+/// e.g. its content changed into hard-noise).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LexicalSyncOutcome {
+    pub deleted_doc_ids: Vec<i64>,
+    pub inserted_doc_ids: Vec<i64>,
+}
+
+/// Row cap per batched `IN (...)` statement below -- same discipline as T4's
+/// `IN_CLAUSE_BATCH_ROWS` (`src/storage/schema.rs`), duplicated here because
+/// this module doesn't import from `schema` for such a small constant.
+const LEXICAL_SYNC_BATCH_ROWS: usize = 500;
+
+fn sql_in_placeholders(n: usize) -> String {
+    vec!["?"; n].join(",")
+}
+
+/// T5 (plan v5.1): message-level lexical (`fts_lex`/`lex_docs`) sync -- the
+/// single source of truth every write path funnels through when message
+/// *content* changed (a message was newly inserted, or an existing one's
+/// content was replaced). Deletes any existing `fts_lex`/`lex_docs` rows for
+/// `message_ids`, then re-inserts a row (content + the four
+/// conversation-derived projection columns) for whichever of `message_ids`
+/// is [`crate::search::eligibility::lexical_eligible`] -- T3's single source
+/// of truth for the role whitelist + hard-noise exclusion. No byte cap: T5
+/// removes the 8 MiB per-conversation truncation entirely (plan v5.1 "保真"
+/// constraint -- no session-level, message-level, or block-count cap on the
+/// lexical whitelist).
+pub(crate) fn sync_lexical_docs_for_messages_in_tx(
+    tx: &FrankenTransaction<'_>,
+    message_ids: &[i64],
+) -> Result<LexicalSyncOutcome> {
+    if message_ids.is_empty() {
+        return Ok(LexicalSyncOutcome::default());
+    }
+
+    let mut outcome = LexicalSyncOutcome::default();
+    for batch in message_ids.chunks(LEXICAL_SYNC_BATCH_ROWS) {
+        let placeholders = sql_in_placeholders(batch.len());
+        let id_params: Vec<Value> = batch.iter().map(|id| Value::from(*id)).collect();
+
+        let deleted: Vec<i64> = tx
+            .query_all_map(
+                &format!("SELECT doc_id FROM lex_docs WHERE doc_id IN ({placeholders})"),
+                &id_params,
+                |row| row.get_typed(0),
+            )
+            .context("finding existing lex_docs rows before message-level sync")?;
+        outcome.deleted_doc_ids.extend(deleted);
+
+        tx.execute(
+            &format!("DELETE FROM fts_lex WHERE rowid IN ({placeholders})"),
+            &id_params,
+        )
+        .context("clearing fts_lex before message-level sync")?;
+        tx.execute(
+            &format!("DELETE FROM lex_docs WHERE doc_id IN ({placeholders})"),
+            &id_params,
+        )
+        .context("clearing lex_docs before message-level sync")?;
+
+        let rows: Vec<(i64, String, String, String, String, String, String)> = tx
+            .query_all_map(
+                &format!(
+                    "SELECT m.id, m.role, m.content, COALESCE(c.title, ''), COALESCE(a.slug, ''), \
+                     COALESCE(w.path, ''), c.source_path \
+                     FROM messages m \
+                     JOIN conversations c ON c.id = m.conversation_id \
+                     JOIN agents a ON a.id = c.agent_id \
+                     LEFT JOIN workspaces w ON w.id = c.workspace_id \
+                     WHERE m.id IN ({placeholders})"
+                ),
+                &id_params,
+                |row| {
+                    Ok((
+                        row.get_typed::<i64>(0)?,
+                        row.get_typed::<String>(1)?,
+                        row.get_typed::<String>(2)?,
+                        row.get_typed::<String>(3)?,
+                        row.get_typed::<String>(4)?,
+                        row.get_typed::<String>(5)?,
+                        row.get_typed::<String>(6)?,
+                    ))
+                },
+            )
+            .context("loading message + conversation projection rows for message-level sync")?;
+
+        // Fail-closed: every id in `batch` is, by construction, a real
+        // `messages` row (callers only ever pass ids they just read from
+        // `messages` itself). The INNER JOINs above silently drop a message
+        // whose `conversation_id`/`agent_id` chain is broken (dangling FK on
+        // a corrupted row) instead of erroring -- without this check that
+        // corruption is invisible: the message is quietly left unindexed
+        // rather than aborting the transaction the way every other lexical
+        // sync failure in this module does.
+        if rows.len() != batch.len() {
+            let found: std::collections::HashSet<i64> = rows.iter().map(|row| row.0).collect();
+            let missing: Vec<i64> = batch.iter().copied().filter(|id| !found.contains(id)).collect();
+            anyhow::bail!(
+                "message-level lexical sync: {} of {} message id(s) in this batch resolved to zero rows \
+                 via the messages/conversations/agents join -- broken conversation_id or agent_id FK chain \
+                 (missing doc_ids: {missing:?})",
+                missing.len(),
+                batch.len()
+            );
+        }
+
+        for (doc_id, role, content, title, agent, workspace, source_path) in rows {
+            if !crate::search::eligibility::lexical_eligible(&role, &content) {
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO lex_docs(doc_id, content, title, agent, workspace, source_path) \
+                 VALUES (?1,?2,?3,?4,?5,?6)",
+                fparams![
+                    doc_id,
+                    content.as_str(),
+                    title.as_str(),
+                    agent.as_str(),
+                    workspace.as_str(),
+                    source_path.as_str()
+                ],
+            )
+            .with_context(|| format!("inserting lex_docs row for message {doc_id}"))?;
+            tx.execute(
+                "INSERT INTO fts_lex(rowid, content, title, agent, workspace, source_path) \
+                 VALUES (?1,?2,?3,?4,?5,?6)",
+                fparams![
+                    doc_id,
+                    content.as_str(),
+                    title.as_str(),
+                    agent.as_str(),
+                    workspace.as_str(),
+                    source_path.as_str()
+                ],
+            )
+            .with_context(|| format!("inserting fts_lex row for message {doc_id}"))?;
+            outcome.inserted_doc_ids.push(doc_id);
+        }
+    }
+
+    Ok(outcome)
+}
+
+/// T5 (plan v5.1): conversation-level lexical envelope resync -- when a
+/// conversation's title/agent/workspace/source_path projection changes
+/// (envelope change, not message content), every existing `lex_docs` row
+/// for that conversation gets its four projection columns `UPDATE`d
+/// (`content` untouched). `fts_lex`'s external-content protocol requires
+/// deleting each row's old indexed values and re-inserting the new ones (an
+/// `UPDATE` alone would leave the old projection values still searchable
+/// via `fts_lex` while `lex_docs` already shows the new ones). Returns the
+/// number of `lex_docs` rows touched.
+pub(crate) fn resync_lexical_envelope_for_conversation_in_tx(
     tx: &FrankenTransaction<'_>,
     conversation_id: i64,
-) -> Result<()> {
-    let mut messages: Vec<Message> = tx
-        .query_all_map(
-            "SELECT id, idx, role, author, created_at, content \
-             FROM messages WHERE conversation_id = ?1 ORDER BY idx",
-            fparams![conversation_id],
-            |row| {
-                let role: String = row.get_typed(2)?;
-                Ok(Message {
-                    id: Some(row.get_typed(0)?),
-                    idx: row.get_typed(1)?,
-                    role: role_from_str(&role),
-                    author: row.get_typed(3)?,
-                    created_at: row.get_typed(4)?,
-                    content: row.get_typed(5)?,
-                    extra_json: serde_json::Value::Null,
-                    snippets: Vec::new(),
-                })
-            },
-        )
-        .with_context(|| format!("fetching messages for lexical sync (conversation {conversation_id})"))?;
-    truncate_lexical_rebuild_conversation_content(
-        conversation_id,
-        &mut messages,
-        lexical_max_conversation_content_bytes(),
-    );
+) -> Result<u64> {
     let (title, workspace, agent, source_path): (String, String, String, String) = tx
         .query_row_map(
             "SELECT COALESCE(c.title, ''), COALESCE(w.path, ''), COALESCE(a.slug, ''), c.source_path \
@@ -11429,65 +11442,87 @@ pub(crate) fn sync_lexical_domain_for_conversation_in_tx(
              LEFT JOIN workspaces w ON w.id = c.workspace_id \
              WHERE c.id = ?1",
             fparams![conversation_id],
-            |row| {
-                Ok((
-                    row.get_typed(0)?,
-                    row.get_typed(1)?,
-                    row.get_typed(2)?,
-                    row.get_typed(3)?,
-                ))
-            },
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?, row.get_typed(3)?)),
         )
         .with_context(|| {
-            format!(
-                "loading conversation projection columns for lexical sync (conversation {conversation_id})"
-            )
+            format!("loading conversation projection columns for envelope resync (conversation {conversation_id})")
         })?;
 
-    tx.execute(
-        "DELETE FROM fts_lex WHERE rowid IN (SELECT id FROM messages WHERE conversation_id = ?1)",
-        fparams![conversation_id],
-    )
-    .with_context(|| format!("clearing fts_lex for conversation {conversation_id} before resync"))?;
-    tx.execute(
-        "DELETE FROM lex_docs WHERE doc_id IN (SELECT id FROM messages WHERE conversation_id = ?1)",
-        fparams![conversation_id],
-    )
-    .with_context(|| format!("clearing lex_docs for conversation {conversation_id} before resync"))?;
+    let rows: Vec<(i64, String)> = tx
+        .query_all_map(
+            "SELECT doc_id, content FROM lex_docs \
+             WHERE doc_id IN (SELECT id FROM messages WHERE conversation_id = ?1)",
+            fparams![conversation_id],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+        )
+        .with_context(|| format!("listing lex_docs rows for envelope resync (conversation {conversation_id})"))?;
 
-    for message in messages {
-        let is_tool_role = is_lexical_rebuild_tool_class_role(role_as_str(&message.role));
-        let noise_role_hint: Option<&str> = is_tool_role.then_some("tool");
-        if crate::search::canonicalize::is_hard_message_noise(noise_role_hint, &message.content) {
-            continue;
+    for (doc_id, content) in &rows {
+        let doc_id = *doc_id;
+        // External-content fts5: `DELETE FROM fts_lex WHERE rowid = ?1` looks
+        // up the CURRENT `lex_docs` row (via `content_rowid`) to know which
+        // tokens to remove from the index. It must run *before* the
+        // `lex_docs` UPDATE below -- deleting after would make fts5 remove
+        // the just-written *new* projection's tokens instead of the stale
+        // ones, leaving the old title/workspace terms permanently orphaned
+        // in the FTS index (caught by `lexical_envelope_change_reprojects_
+        // all_rows_in_conversation`'s old-term-unrecallable assertion).
+        tx.execute("DELETE FROM fts_lex WHERE rowid = ?1", fparams![doc_id])
+            .with_context(|| format!("clearing stale fts_lex row {doc_id} before envelope resync"))?;
+
+        tx.execute(
+            "UPDATE lex_docs SET title = ?2, agent = ?3, workspace = ?4, source_path = ?5 WHERE doc_id = ?1",
+            fparams![doc_id, title.as_str(), agent.as_str(), workspace.as_str(), source_path.as_str()],
+        )
+        .with_context(|| format!("updating lex_docs projection columns for row {doc_id}"))?;
+
+        tx.execute(
+            "INSERT INTO fts_lex(rowid, content, title, agent, workspace, source_path) VALUES (?1,?2,?3,?4,?5,?6)",
+            fparams![
+                doc_id,
+                content.as_str(),
+                title.as_str(),
+                agent.as_str(),
+                workspace.as_str(),
+                source_path.as_str()
+            ],
+        )
+        .with_context(|| format!("reinserting fts_lex row {doc_id} after envelope resync"))?;
+    }
+
+    Ok(rows.len() as u64)
+}
+
+/// T5 (plan v5.1): kept only for `--force-rebuild`'s internal use (and this
+/// module's own streaming full rebuild, [`FrankenStorage::rebuild_lex_domain_from_db`],
+/// which calls this once per conversation). Internally paginates by
+/// `message_id` and delegates each page to
+/// [`sync_lexical_docs_for_messages_in_tx`] instead of materializing the
+/// whole conversation's `Vec<Message>` -- this is what makes a full rebuild
+/// streaming with no code change needed in the rebuild loop itself.
+pub(crate) fn sync_lexical_domain_for_conversation_in_tx(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+) -> Result<()> {
+    const PAGE_SIZE: i64 = 500;
+    let mut after_id = 0i64;
+    loop {
+        let page: Vec<i64> = tx
+            .query_all_map(
+                "SELECT id FROM messages WHERE conversation_id = ?1 AND id > ?2 ORDER BY id LIMIT ?3",
+                fparams![conversation_id, after_id, PAGE_SIZE],
+                |row| row.get_typed(0),
+            )
+            .with_context(|| format!("paging messages for lexical sync (conversation {conversation_id})"))?;
+        if page.is_empty() {
+            break;
         }
-        let Some(doc_id) = message.id else { continue };
-        tx.execute(
-            "INSERT INTO lex_docs(doc_id, content, title, agent, workspace, source_path) \
-             VALUES (?1,?2,?3,?4,?5,?6)",
-            fparams![
-                doc_id,
-                message.content.as_str(),
-                title.as_str(),
-                agent.as_str(),
-                workspace.as_str(),
-                source_path.as_str()
-            ],
-        )
-        .with_context(|| format!("inserting lex_docs row for message {doc_id}"))?;
-        tx.execute(
-            "INSERT INTO fts_lex(rowid, content, title, agent, workspace, source_path) \
-             VALUES (?1,?2,?3,?4,?5,?6)",
-            fparams![
-                doc_id,
-                message.content.as_str(),
-                title.as_str(),
-                agent.as_str(),
-                workspace.as_str(),
-                source_path.as_str()
-            ],
-        )
-        .with_context(|| format!("inserting fts_lex row for message {doc_id}"))?;
+        after_id = *page.last().expect("page just checked non-empty");
+        let page_len = page.len();
+        sync_lexical_docs_for_messages_in_tx(tx, &page)?;
+        if (page_len as i64) < PAGE_SIZE {
+            break;
+        }
     }
     Ok(())
 }
@@ -15725,188 +15760,34 @@ mod tests {
         assert_eq!(stale_hits, 0, "the old title term must no longer be recallable after replace");
     }
 
-    /// W2-2 Step 3 (R2-W2-B1 必答项): a conversation crossing the
-    /// per-conversation lexical cap — verified end to end through the real
-    /// `insert_conversation_tree`/append wiring (not a direct call to the
-    /// sync function), so this exercises the actual production entry point.
-    /// Uses `CASS_LEXICAL_MAX_CONVERSATION_CONTENT_BYTES` to shrink the cap
-    /// to a lab-sized value instead of writing real 8 MiB of content.
+    // T5 (plan v5.1): `conversation_crossing_lexical_cap_truncates_and_
+    // clears_correctly_across_append` retired -- it tested the 8 MiB
+    // per-conversation lexical cap end to end through the real
+    // insert_conversation_tree/append wiring; T5 removes that cap
+    // entirely (plan v5.1 "保真" constraint), so its premise (content
+    // gets truncated/cleared past a byte budget) is now false by design
+    // -- an equivalent test would assert the opposite (full content
+    // survives), which is already covered by
+    // lexical_no_conversation_cap_indexes_tail_of_9mib_conversation below.
+
+
+    /// W2-3 Step 1/2 (spec 门②"回滚"场景 + fail-closed 语义): if a lexical
+    /// sync step fails, the *whole* caller transaction must roll back —
+    /// including relational rows inserted earlier in that same transaction,
+    /// not just the lex half. Uses a real failure rather than a mocked one
+    /// (per this project's "探针必须是真失败" convention).
     ///
-    /// Scope note: this checks `lex_docs`'s output is byte-identical to what
-    /// `truncate_lexical_rebuild_conversation_content` computes (the same
-    /// function this sync path calls) — it does not additionally cross-check
-    /// against `ConversationPacket::capped_for_inline_lexical_index` (the
-    /// *other* consumer of the same cap, on the incremental-inline Tantivy
-    /// path), which would need a full `NormalizedConversation` fixture. Both
-    /// read the identical `lexical_max_conversation_content_bytes()` cap and
-    /// implement the same left-to-right truncate/clear algorithm (see that
-    /// function's doc comment), so this is believed sufficient for W2-2; a
-    /// full cross-path comparison is left as a documented gap, not silently
-    /// dropped.
-    #[test]
-    #[serial]
-    fn conversation_crossing_lexical_cap_truncates_and_clears_correctly_across_append() {
-        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
-        use std::path::PathBuf;
-
-        const CAP_ENV: &str = "CASS_LEXICAL_MAX_CONVERSATION_CONTENT_BYTES";
-        // w2 F5 fix: the previous comment here claimed "no other test sets
-        // `CAP_ENV`" -- false. `fetch_messages_for_lexical_rebuild_
-        // truncates_oversized_conversation_content` (below, in this same
-        // file) also sets this exact process-global env var, to a different
-        // value ("1024" vs this test's "100"), without any coordination.
-        // Under `cargo test`'s default parallel execution the two could
-        // interleave and each observe the other's value mid-run, producing
-        // a nondeterministic truncation boundary. `#[serial]` on both tests
-        // (this crate's existing serialization mechanism -- no new
-        // dependency) is what actually prevents that race; this guard alone
-        // only restores the var on unwind, it does not exclude concurrent
-        // readers/writers.
-        struct EnvGuard;
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                unsafe {
-                    std::env::remove_var(CAP_ENV);
-                }
-            }
-        }
-        unsafe {
-            std::env::set_var(CAP_ENV, "100");
-        }
-        let _env_guard = EnvGuard;
-
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("agent_search.db");
-        let storage = SqliteStorage::open(&db_path).unwrap();
-
-        let agent = Agent {
-            id: None,
-            slug: "claude_code".into(),
-            name: "Claude Code".into(),
-            version: None,
-            kind: AgentKind::Cli,
-        };
-        let agent_id = storage.ensure_agent(&agent).unwrap();
-
-        // msg0: 60 bytes (fits fully, cap=100, 40 bytes of budget remain).
-        let msg0_content = "a".repeat(60);
-        let conversation = Conversation {
-            id: None,
-            agent_slug: "claude_code".into(),
-            workspace: None,
-            external_id: Some("conv-boundary-1".into()),
-            title: Some("boundary test".into()),
-            source_path: PathBuf::from("/tmp/conv-boundary-1.jsonl"),
-            started_at: Some(1_700_000_000_000),
-            ended_at: None,
-            approx_tokens: None,
-            metadata_json: serde_json::Value::Null,
-            messages: vec![Message {
-                id: None,
-                idx: 0,
-                role: MessageRole::User,
-                author: Some("user".into()),
-                created_at: Some(1_700_000_000_010),
-                content: msg0_content.clone(),
-                extra_json: serde_json::Value::Null,
-                snippets: Vec::new(),
-            }],
-            source_id: LOCAL_SOURCE_ID.into(),
-            origin_host: None,
-        };
-        storage.insert_conversation_tree(agent_id, None, &conversation).unwrap();
-
-        let conversation_id: i64 = storage
-            .conn
-            .query_row_map(
-                "SELECT id FROM conversations WHERE external_id = ?1",
-                fparams!["conv-boundary-1"],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-
-        // Before append: msg0 must be present in lex_docs, full 60 bytes.
-        let msg0_id: i64 = storage
-            .conn
-            .query_row_map(
-                "SELECT id FROM messages WHERE conversation_id = ?1 AND idx = 0",
-                fparams![conversation_id],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-        let lex_content_before: String = storage
-            .conn
-            .query_row_map(
-                "SELECT content FROM lex_docs WHERE doc_id = ?1",
-                fparams![msg0_id],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-        assert_eq!(lex_content_before, msg0_content, "msg0 must be indexed in full before any append");
-
-        // Append msg1 (idx 1): 60 more bytes. Cumulative 120 > cap 100, so
-        // only 40 bytes of msg1 fit (60 already used by msg0); msg1's lex
-        // content must be truncated to exactly those 40 bytes.
-        let msg1_content = "b".repeat(60);
-        let append_conv = Conversation {
-            messages: vec![Message {
-                id: None,
-                idx: 1,
-                role: MessageRole::User,
-                author: Some("user".into()),
-                created_at: Some(1_700_000_000_020),
-                content: msg1_content.clone(),
-                extra_json: serde_json::Value::Null,
-                snippets: Vec::new(),
-            }],
-            ..conversation.clone()
-        };
-        storage.insert_conversation_tree(agent_id, None, &append_conv).unwrap();
-
-        let msg1_id: i64 = storage
-            .conn
-            .query_row_map(
-                "SELECT id FROM messages WHERE conversation_id = ?1 AND idx = 1",
-                fparams![conversation_id],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-
-        // msg0 must be untouched by the later over-budget append (earlier
-        // messages are never retroactively affected by a later one crossing
-        // the cap -- only the message that straddles/exceeds the boundary
-        // is affected, matching `truncate_lexical_rebuild_conversation_content`'s
-        // left-to-right, earliest-first semantics).
-        let lex_content_msg0_after: String = storage
-            .conn
-            .query_row_map(
-                "SELECT content FROM lex_docs WHERE doc_id = ?1",
-                fparams![msg0_id],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-        assert_eq!(lex_content_msg0_after, msg0_content, "msg0 must remain full-length after a later append crosses the cap");
-
-        let lex_content_msg1: String = storage
-            .conn
-            .query_row_map(
-                "SELECT content FROM lex_docs WHERE doc_id = ?1",
-                fparams![msg1_id],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-        assert_eq!(lex_content_msg1, "b".repeat(40), "msg1 must be truncated to exactly the remaining 40-byte budget");
-    }
-
-    /// W2-3 Step 1/2 (spec 门②"回滚"场景 + fail-closed 语义): if
-    /// `sync_lexical_domain_for_conversation_in_tx` fails, the *whole*
-    /// caller transaction must roll back — including relational rows
-    /// inserted earlier in that same transaction, not just the lex
-    /// half. Uses a real failure (`sync_lexical_domain_for_conversation_in_tx`
-    /// called with a `conversation_id` that does not exist in
-    /// `conversations`, so its projection-column lookup genuinely fails with
-    /// zero rows) rather than a mocked error, per this project's "探针必须
-    /// 是真失败" convention.
+    /// T5 (plan v5.1): retargeted from `sync_lexical_domain_for_conversation_
+    /// in_tx` to `resync_lexical_envelope_for_conversation_in_tx` -- T5's
+    /// message-level sync no longer eagerly looks up a conversation's
+    /// projection columns when there are zero messages to sync (it returns
+    /// `Ok` immediately for an empty `message_ids` slice), so a bogus,
+    /// message-less `conversation_id` no longer fails that path at all. The
+    /// envelope resync still does an eager `query_row_map` join against
+    /// `conversations`/`agents` for the given `conversation_id` regardless
+    /// of message count, so it still genuinely fails (zero rows) for a
+    /// nonexistent conversation -- preserving this test's fail-closed intent
+    /// against a still-real T5 code path.
     #[test]
     fn lex_sync_failure_rolls_back_the_whole_transaction_fail_closed() {
         let dir = TempDir::new().unwrap();
@@ -15937,10 +15818,10 @@ mod tests {
                      VALUES (9001, 9001, 0, 'user', 'rollback test content')",
                     fparams![],
                 )?;
-                // The lex sync deliberately targets a conversation_id that was
-                // never inserted (not 9001), so its own internal query finds
-                // zero rows and genuinely fails.
-                sync_lexical_domain_for_conversation_in_tx(tx, BOGUS_CONVERSATION_ID)
+                // The envelope resync deliberately targets a conversation_id
+                // that was never inserted (not 9001), so its own internal
+                // projection-column join finds zero rows and genuinely fails.
+                resync_lexical_envelope_for_conversation_in_tx(tx, BOGUS_CONVERSATION_ID)
                     .map_err(anyhow_error_into_storage_error)?;
                 Ok(())
             });
@@ -15972,7 +15853,7 @@ mod tests {
     /// excluded as noise, an empty-content message that must also be
     /// excluded), computes the "eligible set" independently in this test
     /// (mirroring `indexer::expected_live_lexical_doc_count`'s own
-    /// composition of `fetch_messages_for_lexical_rebuild` +
+    /// composition of `fetch_messages_for_conversation` +
     /// `is_lexical_rebuild_tool_class_role` + `is_hard_message_noise` --
     /// the identical predicate, not a copy with drift risk), and asserts
     /// both `eligible EXCEPT lex_docs = ∅` and `lex_docs EXCEPT eligible = ∅`
@@ -16054,7 +15935,7 @@ mod tests {
             .unwrap();
         let mut eligible_ids: Vec<i64> = Vec::new();
         for conversation_id in conversation_ids {
-            for message in storage.fetch_messages_for_lexical_rebuild(conversation_id).unwrap() {
+            for message in storage.fetch_messages_for_conversation(conversation_id).unwrap() {
                 let is_tool_role = is_lexical_rebuild_tool_class_role(role_as_str(&message.role));
                 let noise_role_hint: Option<&str> = is_tool_role.then_some("tool");
                 if !crate::search::canonicalize::is_hard_message_noise(noise_role_hint, &message.content) {
@@ -16169,15 +16050,28 @@ mod tests {
         // `orphan_fk_self_heal`-style tests to construct a state that is
         // structurally unreachable through any normal insert while FK
         // enforcement is on: a conversation row whose `agent_id` points at
-        // no existing agent. `sync_lexical_domain_for_conversation_in_tx`'s
-        // `JOIN agents a ON a.id = c.agent_id` then returns zero rows for
-        // this one conversation, failing its batch with a real `Err`.
+        // no existing agent, carrying one message. T5's message-level sync
+        // (`sync_lexical_docs_for_messages_in_tx`, paginated per conversation
+        // by `sync_lexical_domain_for_conversation_in_tx`) only touches the
+        // `messages`/`conversations`/`agents` join for conversations that
+        // have at least one message -- a message-less poisoned conversation
+        // would sync as a silent no-op under T5, so this fixture needs a
+        // message row too (not just the poisoned conversation row) for its
+        // `JOIN agents a ON a.id = c.agent_id` to actually run and fail.
         storage.raw().execute_batch_bypassing_foreign_keys_guard("PRAGMA foreign_keys = OFF").unwrap();
         storage
             .raw()
             .execute(
                 "INSERT INTO conversations(id, agent_id, source_id, source_path, started_at) \
                  VALUES(?1, 999999999, 'local', '/tmp/heartbeat-poisoned.jsonl', 1700000000000)",
+                fparams![poisoned_id],
+            )
+            .unwrap();
+        storage
+            .raw()
+            .execute(
+                "INSERT INTO messages(id, conversation_id, idx, role, content) \
+                 VALUES(?1, ?1, 0, 'user', 'poisoned message content')",
                 fparams![poisoned_id],
             )
             .unwrap();
@@ -16502,210 +16396,380 @@ mod tests {
         assert!(again.pairs.is_empty());
     }
 
+    // T5 (plan v5.1): four tests retired here --
+    // lexical_content_truncation_caps_cumulative_bytes_and_keeps_message_count,
+    // lexical_content_truncation_is_noop_within_cap,
+    // lexical_content_truncation_respects_utf8_char_boundaries (all three
+    // exercised the per-conversation truncation helper and its boundary
+    // math directly, both deleted), and
+    // fetch_messages_for_conversation_truncates_oversized_conversation_content
+    // (exercised the size-cap override env var, also deleted). T5 removes
+    // the 8 MiB per-conversation lexical cap entirely (plan v5.1 "保真"
+    // constraint) -- their premise no longer holds.
+
+    // T5 Step 1: three tests that need direct `pub(crate)` access to the new
+    // sync functions / full rebuild themselves live here (inline, same as
+    // the `replace_with_new_title_and_workspace_refreshes_lex_docs_and_
+    // fts_lex` precedent above) rather than in the external
+    // `tests/w4_lexical_incremental.rs` file -- a deviation from the plan's
+    // single-file Files listing, documented in the T5 terminal report.
+
+    /// T5 Step 1: `sync_lexical_docs_for_messages_in_tx` scoped to one
+    /// message id must resync only that message's `lex_docs`/`fts_lex` row
+    /// -- a sibling message's row (never named in the call) must be
+    /// byte-for-byte untouched.
     #[test]
-    fn lexical_content_truncation_caps_cumulative_bytes_and_keeps_message_count() {
-        use crate::model::types::{Message, MessageRole};
-
-        let cap = 100usize;
-        let mut messages = vec![
-            Message {
-                id: Some(1),
-                idx: 0,
-                role: MessageRole::User,
-                author: None,
-                created_at: Some(1),
-                content: "a".repeat(60),
-                extra_json: serde_json::Value::Null,
-                snippets: Vec::new(),
-            },
-            Message {
-                id: Some(2),
-                idx: 1,
-                role: MessageRole::Agent,
-                author: None,
-                created_at: Some(2),
-                content: "b".repeat(60),
-                extra_json: serde_json::Value::Null,
-                snippets: Vec::new(),
-            },
-            Message {
-                id: Some(3),
-                idx: 2,
-                role: MessageRole::Agent,
-                author: None,
-                created_at: Some(3),
-                content: "c".repeat(60),
-                extra_json: serde_json::Value::Null,
-                snippets: Vec::new(),
-            },
-        ];
-
-        truncate_lexical_rebuild_conversation_content(42, &mut messages, cap);
-
-        // Structure (message count + ids) preserved; only indexed text trimmed.
-        assert_eq!(messages.len(), 3, "message rows must be preserved");
-        assert_eq!(
-            messages.iter().map(|m| m.id).collect::<Vec<_>>(),
-            vec![Some(1), Some(2), Some(3)]
-        );
-        let total: usize = messages.iter().map(|m| m.content.len()).sum();
-        assert_eq!(
-            total, cap,
-            "cumulative content is capped exactly at the cap"
-        );
-        // Earliest content is kept in full; the straddling message is truncated;
-        // later content is dropped.
-        assert_eq!(messages[0].content.len(), 60);
-        assert_eq!(messages[1].content.len(), 40);
-        assert!(messages[2].content.is_empty());
-    }
-
-    #[test]
-    fn lexical_content_truncation_is_noop_within_cap() {
-        use crate::model::types::{Message, MessageRole};
-
-        let mut messages = vec![Message {
-            id: Some(1),
-            idx: 0,
-            role: MessageRole::User,
-            author: None,
-            created_at: Some(1),
-            content: "short".to_string(),
-            extra_json: serde_json::Value::Null,
-            snippets: Vec::new(),
-        }];
-        truncate_lexical_rebuild_conversation_content(7, &mut messages, 1024);
-        assert_eq!(messages[0].content, "short", "within-cap content untouched");
-    }
-
-    #[test]
-    fn lexical_content_truncation_respects_utf8_char_boundaries() {
-        use crate::model::types::{Message, MessageRole};
-
-        // Each "é" is 2 bytes; a cap of 5 must not split a code point.
-        let mut messages = vec![Message {
-            id: Some(1),
-            idx: 0,
-            role: MessageRole::User,
-            author: None,
-            created_at: Some(1),
-            content: "ééé".to_string(), // 6 bytes
-            extra_json: serde_json::Value::Null,
-            snippets: Vec::new(),
-        }];
-        truncate_lexical_rebuild_conversation_content(1, &mut messages, 5);
-        // Largest char boundary <= 5 is 4 bytes ("éé").
-        assert_eq!(messages[0].content, "éé");
-        assert!(
-            messages[0]
-                .content
-                .is_char_boundary(messages[0].content.len())
-        );
-    }
-
-    /// #290: a conversation whose content exceeds the cap is admitted through the
-    /// lexical-rebuild fetch with truncated content, not OOM-quarantined.
-    ///
-    /// w2 F5 fix: `#[serial]` -- this test and
-    /// `conversation_crossing_lexical_cap_truncates_and_clears_correctly_across_append`
-    /// (above, in this same file) both set the same process-global
-    /// `CASS_LEXICAL_MAX_CONVERSATION_CONTENT_BYTES` env var to different
-    /// values ("1024" here, "100" there) with no coordination between them;
-    /// under default parallel test execution either could observe the
-    /// other's value mid-run. `#[serial]` on both is this crate's existing
-    /// mechanism for exactly this kind of process-env race (no new
-    /// dependency introduced).
-    #[test]
-    #[serial]
-    fn fetch_messages_for_lexical_rebuild_truncates_oversized_conversation_content() {
-        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
-        use std::path::PathBuf;
-
-        // Force a small, deterministic cap independent of host memory.
-        // SAFETY: `#[serial]` above excludes concurrent readers/writers of
-        // this env var; the value is read on each fetch call.
-        unsafe {
-            std::env::set_var("CASS_LEXICAL_MAX_CONVERSATION_CONTENT_BYTES", "1024");
-        }
-
+    fn lexical_message_update_resyncs_only_target() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("agent_search.db");
         let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&crate::model::types::Agent {
+                id: None,
+                slug: "claude_code".into(),
+                name: "Claude Code".into(),
+                version: None,
+                kind: crate::model::types::AgentKind::Cli,
+            })
+            .unwrap();
 
-        let agent = Agent {
-            id: None,
-            slug: "claude_code".into(),
-            name: "Claude Code".into(),
-            version: None,
-            kind: AgentKind::Cli,
-        };
-        let agent_id = storage.ensure_agent(&agent).unwrap();
-
-        // Three messages of 2 KiB each => 6 KiB total content, well over the
-        // 1 KiB cap. This models an image/base64-heavy conversation.
-        let big = "x".repeat(2048);
-        let conversation = Conversation {
+        let conv = crate::model::types::Conversation {
             id: None,
             agent_slug: "claude_code".into(),
-            workspace: Some(PathBuf::from("/tmp/workspace")),
-            external_id: Some("conv-big".into()),
-            title: Some("Oversized".into()),
-            source_path: PathBuf::from("/tmp/conv-big.jsonl"),
+            workspace: None,
+            external_id: Some("only-target-conv".into()),
+            title: Some("only target fixture".into()),
+            source_path: PathBuf::from("/tmp/only-target-conv.jsonl"),
             started_at: Some(1_700_000_000_000),
             ended_at: Some(1_700_000_000_100),
             approx_tokens: None,
             metadata_json: serde_json::Value::Null,
-            messages: (0..3)
-                .map(|idx| Message {
+            messages: vec![
+                crate::model::types::Message {
                     id: None,
-                    idx,
-                    role: MessageRole::Agent,
-                    author: Some("assistant".into()),
-                    created_at: Some(1_700_000_000_010 + idx),
-                    content: big.clone(),
+                    idx: 0,
+                    role: crate::model::types::MessageRole::User,
+                    author: None,
+                    created_at: Some(1_700_000_000_010),
+                    content: "messageAoriginaltermxyz body".into(),
                     extra_json: serde_json::Value::Null,
                     snippets: Vec::new(),
-                })
-                .collect(),
+                },
+                crate::model::types::Message {
+                    id: None,
+                    idx: 1,
+                    role: crate::model::types::MessageRole::Assistant,
+                    author: None,
+                    created_at: Some(1_700_000_000_020),
+                    content: "messageBoriginaltermxyz body".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                },
+            ],
             source_id: LOCAL_SOURCE_ID.into(),
             origin_host: None,
         };
-        storage
-            .insert_conversation_tree(agent_id, None, &conversation)
-            .unwrap();
-        let conversation_id = storage
+        storage.insert_conversation_tree(agent_id, None, &conv).unwrap();
+
+        let conversation_id: i64 = storage
             .conn
             .query_row_map(
                 "SELECT id FROM conversations WHERE external_id = ?1",
-                fparams!["conv-big"],
-                |row| row.get_typed::<i64>(0),
+                fparams!["only-target-conv"],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        let doc_id_a: i64 = storage
+            .conn
+            .query_row_map(
+                "SELECT id FROM messages WHERE conversation_id = ?1 AND idx = 0",
+                fparams![conversation_id],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        let doc_id_b: i64 = storage
+            .conn
+            .query_row_map(
+                "SELECT id FROM messages WHERE conversation_id = ?1 AND idx = 1",
+                fparams![conversation_id],
+                |row| row.get_typed(0),
             )
             .unwrap();
 
-        let messages = storage
-            .fetch_messages_for_lexical_rebuild(conversation_id)
+        let a_row_before: (String, String, String, String, String) = storage
+            .conn
+            .query_row_map(
+                "SELECT content, title, agent, workspace, source_path FROM lex_docs WHERE doc_id = ?1",
+                fparams![doc_id_a],
+                |row| {
+                    Ok((
+                        row.get_typed(0)?,
+                        row.get_typed(1)?,
+                        row.get_typed(2)?,
+                        row.get_typed(3)?,
+                        row.get_typed(4)?,
+                    ))
+                },
+            )
             .unwrap();
 
-        // All message rows survive (count/structure intact) ...
-        assert_eq!(messages.len(), 3, "message rows preserved");
-        // ... but the cumulative indexed content is capped, never the raw 6 KiB.
-        let total: usize = messages.iter().map(|m| m.content.len()).sum();
-        assert_eq!(
-            total, 1024,
-            "cumulative content capped at the configured cap"
-        );
-        assert!(
-            !messages[0].content.is_empty(),
-            "earliest content is retained for lexical tokens"
-        );
+        // Simulate B's content changing in place (idx unchanged, content
+        // rewritten -- what a real message-content-update produces upstream
+        // of the sync call), then resync only B's doc_id.
+        storage
+            .conn
+            .execute(
+                "UPDATE messages SET content = ?2 WHERE id = ?1",
+                fparams![doc_id_b, "messageBUPDATEDtermxyz new body"],
+            )
+            .unwrap();
+        storage
+            .conn
+            .with_tx(TxMode::Immediate, |tx| -> Result<(), StorageError> {
+                sync_lexical_docs_for_messages_in_tx(tx, &[doc_id_b])
+                    .map_err(anyhow_error_into_storage_error)?;
+                Ok(())
+            })
+            .unwrap();
 
-        // SAFETY: single-threaded test cleanup.
-        unsafe {
-            std::env::remove_var("CASS_LEXICAL_MAX_CONVERSATION_CONTENT_BYTES");
-        }
+        let a_row_after: (String, String, String, String, String) = storage
+            .conn
+            .query_row_map(
+                "SELECT content, title, agent, workspace, source_path FROM lex_docs WHERE doc_id = ?1",
+                fparams![doc_id_a],
+                |row| {
+                    Ok((
+                        row.get_typed(0)?,
+                        row.get_typed(1)?,
+                        row.get_typed(2)?,
+                        row.get_typed(3)?,
+                        row.get_typed(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(a_row_before, a_row_after, "message A's lex_docs row must be byte-for-byte untouched");
+
+        let b_content: String = storage
+            .conn
+            .query_row_map("SELECT content FROM lex_docs WHERE doc_id = ?1", fparams![doc_id_b], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(b_content, "messageBUPDATEDtermxyz new body");
+
+        let match_count = |term: &str| -> i64 {
+            storage
+                .conn
+                .query_row_map("SELECT COUNT(*) FROM fts_lex WHERE fts_lex MATCH ?1", fparams![term], |row| {
+                    row.get_typed(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(match_count("messageAoriginaltermxyz"), 1, "A's original term must still be recallable");
+        assert_eq!(match_count("messageBoriginaltermxyz"), 0, "B's stale term must no longer be recallable");
+        assert_eq!(match_count("messageBUPDATEDtermxyz"), 1, "B's new term must be recallable");
     }
 
+    /// T5 Step 1: the full-rebuild path (`rebuild_lex_domain_from_db`), the
+    /// incremental per-message sync path (`insert_conversation_tree`'s own
+    /// write-time sync), and `lexical_eligible` applied directly over the
+    /// raw `messages` table must all agree on exactly which doc_ids are
+    /// indexed, and (for the two DB-backed sites) their five projected
+    /// columns must match byte-for-byte.
+    #[test]
+    fn lexical_three_sites_agree() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&crate::model::types::Agent {
+                id: None,
+                slug: "claude_code".into(),
+                name: "Claude Code".into(),
+                version: None,
+                kind: crate::model::types::AgentKind::Cli,
+            })
+            .unwrap();
 
+        let roles = [
+            crate::model::types::MessageRole::User,
+            crate::model::types::MessageRole::Assistant,
+            crate::model::types::MessageRole::Other("reasoning".into()),
+            crate::model::types::MessageRole::Agent,
+            crate::model::types::MessageRole::Other("tool_call".into()),
+        ];
+        let messages = roles
+            .iter()
+            .enumerate()
+            .map(|(idx, role)| crate::model::types::Message {
+                id: None,
+                idx: idx as i64,
+                role: role.clone(),
+                author: None,
+                created_at: Some(1_700_000_000_010 + idx as i64 * 10),
+                content: format!("threesitesterm{idx}xyz body text"),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            })
+            .collect();
+        let conv = crate::model::types::Conversation {
+            id: None,
+            agent_slug: "claude_code".into(),
+            workspace: None,
+            external_id: Some("three-sites-conv".into()),
+            title: Some("three sites fixture".into()),
+            source_path: PathBuf::from("/tmp/three-sites-conv.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages,
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+        storage.insert_conversation_tree(agent_id, None, &conv).unwrap();
+
+        type LexRow = (i64, String, String, String, String, String);
+        let snapshot = |storage: &SqliteStorage| -> std::collections::BTreeMap<i64, (String, String, String, String, String)> {
+            storage
+                .conn
+                .query_all_map(
+                    "SELECT doc_id, content, title, agent, workspace, source_path FROM lex_docs ORDER BY doc_id",
+                    fparams![],
+                    |row| -> Result<LexRow, StorageError> {
+                        Ok((
+                            row.get_typed(0)?,
+                            row.get_typed(1)?,
+                            row.get_typed(2)?,
+                            row.get_typed(3)?,
+                            row.get_typed(4)?,
+                            row.get_typed(5)?,
+                        ))
+                    },
+                )
+                .unwrap()
+                .into_iter()
+                .map(|(doc_id, content, title, agent, workspace, source_path)| {
+                    (doc_id, (content, title, agent, workspace, source_path))
+                })
+                .collect()
+        };
+
+        // Site 1: incremental (already synced at insert time above).
+        let incremental_snapshot = snapshot(&storage);
+
+        // Site 3: `lexical_eligible` applied directly to the raw messages.
+        let raw_rows: Vec<(i64, String, String)> = storage
+            .conn
+            .query_all_map("SELECT id, role, content FROM messages", fparams![], |row| {
+                Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?))
+            })
+            .unwrap();
+        let eligible_doc_ids: std::collections::BTreeSet<i64> = raw_rows
+            .iter()
+            .filter(|(_, role, content)| crate::search::eligibility::lexical_eligible(role, content))
+            .map(|(id, _, _)| *id)
+            .collect();
+
+        // Ground-truth check independent of the two DB-backed sites'
+        // cross-comparison below: the reasoning-role message's doc_id
+        // (fixture idx 2) must never be eligible, full stop. Unlike the
+        // incremental-vs-rebuild-vs-eligible-set comparisons (which would
+        // all shift together and still "agree" if `lexical_eligible` itself
+        // were mutated to permit reasoning, since every site delegates to
+        // that one function), this literal assertion is what actually
+        // reddens under that mutation.
+        let reasoning_doc_id: i64 = raw_rows
+            .iter()
+            .find(|(_, role, _)| role == "reasoning")
+            .map(|(id, _, _)| *id)
+            .expect("fixture must contain the reasoning-role message");
+        assert!(
+            !eligible_doc_ids.contains(&reasoning_doc_id),
+            "reasoning role must never be lexically eligible -- mutation target for \
+             \"lexical_eligible 临时放行 reasoning\""
+        );
+
+        let incremental_doc_ids: std::collections::BTreeSet<i64> = incremental_snapshot.keys().copied().collect();
+        assert_eq!(
+            incremental_doc_ids, eligible_doc_ids,
+            "incremental sync's doc_id set must exactly equal lexical_eligible's derived set"
+        );
+
+        // Site 2: full rebuild -- drop and recompute lex_docs from scratch.
+        crate::storage::schema::recreate_lex_domain_tables(&storage.conn).unwrap();
+        storage.rebuild_lex_domain_from_db(None).unwrap();
+        let rebuild_snapshot = snapshot(&storage);
+        let rebuild_doc_ids: std::collections::BTreeSet<i64> = rebuild_snapshot.keys().copied().collect();
+        assert_eq!(rebuild_doc_ids, eligible_doc_ids, "full rebuild's doc_id set must exactly equal lexical_eligible's derived set");
+
+        assert_eq!(
+            incremental_snapshot, rebuild_snapshot,
+            "incremental sync and full rebuild must agree byte-for-byte on all five projected columns, not just doc_id set membership"
+        );
+    }
+
+    /// T5 Step 1: `rebuild_lex_domain_from_db` must process a conversation
+    /// whose message count spans multiple internal sync pages (`PAGE_SIZE`
+    /// = 500 in `sync_lexical_domain_for_conversation_in_tx`) correctly end
+    /// to end, without materializing the whole conversation as one
+    /// `Vec<Message>`. `#[ignore]`d here: this fixture (1200 synthetic
+    /// messages) exercises the multi-page *correctness* path cheaply, but
+    /// the actual memory-bound streaming *proof* (peak RSS independent of
+    /// corpus size) needs T10's large real fixture-3751-scale DB to be
+    /// meaningful -- run manually with `cargo test --lib -- --ignored
+    /// lexical_rebuild_is_streaming` once that fixture exists.
+    #[test]
+    #[ignore]
+    fn lexical_rebuild_is_streaming() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&crate::model::types::Agent {
+                id: None,
+                slug: "claude_code".into(),
+                name: "Claude Code".into(),
+                version: None,
+                kind: crate::model::types::AgentKind::Cli,
+            })
+            .unwrap();
+
+        const MESSAGE_COUNT: i64 = 1_200; // > 2x LEXICAL_SYNC_BATCH_ROWS/PAGE_SIZE (500)
+        let messages = (0..MESSAGE_COUNT)
+            .map(|idx| crate::model::types::Message {
+                id: None,
+                idx,
+                role: crate::model::types::MessageRole::User,
+                author: None,
+                created_at: Some(1_700_000_000_000 + idx),
+                content: format!("streamingfixtureterm{idx}xyz"),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            })
+            .collect();
+        let conv = crate::model::types::Conversation {
+            id: None,
+            agent_slug: "claude_code".into(),
+            workspace: None,
+            external_id: Some("streaming-conv".into()),
+            title: Some("streaming fixture".into()),
+            source_path: PathBuf::from("/tmp/streaming-conv.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_000 + MESSAGE_COUNT),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages,
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+        storage.insert_conversation_tree(agent_id, None, &conv).unwrap();
+
+        crate::storage::schema::recreate_lex_domain_tables(&storage.conn).unwrap();
+        let stats = storage.rebuild_lex_domain_from_db(None).unwrap();
+        assert_eq!(stats.lex_docs_count, MESSAGE_COUNT as usize, "every message across all sync pages must be indexed");
+    }
 
 
 
@@ -22037,7 +22101,7 @@ mod tests {
     }
 
     #[test]
-    fn fetch_messages_for_lexical_rebuild_skips_extra_json() {
+    fn fetch_messages_for_conversation_skips_extra_json() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test.db");
         let storage = SqliteStorage::open(&db_path).unwrap();
@@ -22089,7 +22153,7 @@ mod tests {
         assert!(!stored[0].extra_json.is_null());
 
         let lexical = storage
-            .fetch_messages_for_lexical_rebuild(conversation_id)
+            .fetch_messages_for_conversation(conversation_id)
             .unwrap();
         assert_eq!(lexical.len(), 1);
         assert_eq!(lexical[0].content, "indexed text");
@@ -22192,7 +22256,7 @@ mod tests {
         // agree — it shares the same `role_from_str` call, but assert it
         // directly since it used to be an independently hand-rolled parser.
         let lexical = storage
-            .fetch_messages_for_lexical_rebuild_uncapped(conversation_id)
+            .fetch_messages_for_conversation(conversation_id)
             .unwrap();
         assert_eq!(lexical.len(), 3);
         assert_eq!(role_as_str(&lexical[1].role), "assistant");
@@ -22299,7 +22363,7 @@ mod tests {
     }
 
     #[test]
-    fn fetch_messages_for_lexical_rebuild_batch_groups_and_orders_messages() {
+    fn fetch_messages_for_conversations_batch_groups_and_orders_messages() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test.db");
         let storage = SqliteStorage::open(&db_path).unwrap();
@@ -22405,7 +22469,7 @@ mod tests {
             .conversation_id;
 
         let lexical = storage
-            .fetch_messages_for_lexical_rebuild_batch(&[third_id, first_id], None, None)
+            .fetch_messages_for_conversations_batch(&[third_id, first_id])
             .unwrap();
 
         let first_messages = lexical.get(&first_id).expect("first conversation");
@@ -22429,73 +22493,13 @@ mod tests {
         assert!(third_messages[0].extra_json.is_null());
     }
 
-    #[test]
-    fn fetch_messages_for_lexical_rebuild_batch_enforces_content_byte_guardrail() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test.db");
-        let storage = SqliteStorage::open(&db_path).unwrap();
-
-        let agent = Agent {
-            id: None,
-            slug: "codex".into(),
-            name: "Codex".into(),
-            version: Some("0.2.3".into()),
-            kind: AgentKind::Cli,
-        };
-        let agent_id = storage.ensure_agent(&agent).unwrap();
-
-        let conversation = Conversation {
-            id: None,
-            agent_slug: "codex".into(),
-            workspace: Some(PathBuf::from("/tmp/workspace")),
-            external_id: Some("lexical-batch-guard".into()),
-            title: Some("Lexical batch guard".into()),
-            source_path: PathBuf::from("/tmp/lexical-batch-guard.jsonl"),
-            started_at: Some(1_700_000_000_000),
-            ended_at: Some(1_700_000_000_100),
-            approx_tokens: Some(42),
-            metadata_json: serde_json::Value::Null,
-            messages: vec![
-                Message {
-                    id: None,
-                    idx: 0,
-                    role: MessageRole::User,
-                    author: Some("user".into()),
-                    created_at: Some(1_700_000_000_010),
-                    content: "123456".into(),
-                    extra_json: serde_json::Value::Null,
-                    snippets: Vec::new(),
-                },
-                Message {
-                    id: None,
-                    idx: 1,
-                    role: MessageRole::Agent,
-                    author: Some("assistant".into()),
-                    created_at: Some(1_700_000_000_020),
-                    content: "abcdef".into(),
-                    extra_json: serde_json::Value::Null,
-                    snippets: Vec::new(),
-                },
-            ],
-            source_id: LOCAL_SOURCE_ID.into(),
-            origin_host: None,
-        };
-
-        let conversation_id = storage
-            .insert_conversation_tree(agent_id, None, &conversation)
-            .unwrap()
-            .conversation_id;
-
-        let error = storage
-            .fetch_messages_for_lexical_rebuild_batch(&[conversation_id], Some(10), Some(8))
-            .expect_err("guardrail should reject oversized batch content");
-
-        let message = format!("{error:#}");
-        assert!(
-            message.contains("content-byte guardrail"),
-            "expected guardrail reason in error, got {message}"
-        );
-    }
+    // T5 (plan v5.1): `fetch_messages_for_lexical_rebuild_batch_enforces_
+    // content_byte_guardrail` retired -- it tested the `max_messages`/
+    // `max_content_bytes` guardrail params, which are deleted along with
+    // `fetch_messages_for_conversations_batch`'s rename (every call site
+    // always passed `None, None`; dead parameters, and their whole premise
+    // -- capping how much lexical content a batch fetch may return --
+    // contradicts T5's "no cap" mandate).
 
     #[test]
     fn fetch_messages_handles_manual_rows_inserted_via_raw_connection() {
@@ -22522,7 +22526,7 @@ mod tests {
         &[])
         .unwrap();
 
-        let lexical = storage.fetch_messages_for_lexical_rebuild(1).unwrap();
+        let lexical = storage.fetch_messages_for_conversation(1).unwrap();
         assert_eq!(lexical.len(), 1);
         assert_eq!(lexical[0].content, "manual body");
 

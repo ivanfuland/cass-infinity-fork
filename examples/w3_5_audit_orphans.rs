@@ -7,7 +7,11 @@
 //! mechanism can be read off the evidence instead of guessed at.
 //!
 //! Read-only by default: only ever issues `SELECT`s and the public
-//! read-path methods (`fetch_messages_for_lexical_rebuild`) that the real
+//! read-path methods (`fetch_messages_for_conversation`, renamed from
+//! `fetch_messages_for_lexical_rebuild` under plan v5.1 T5, which also
+//! removed the 8 MiB per-conversation cap this drill originally diagnosed
+//! -- the "post-truncation"/"byte_cap_*" framing below is now historical:
+//! every conversation's content reaches this scan whole) that the real
 //! eligibility scan (`db_vector_catchup::scan_eligible_message_ids`, itself
 //! `pub(crate)` and therefore unreachable from an `examples/` binary) is
 //! built from. Opens via `FrankenStorage::open_readonly` so there is no
@@ -51,15 +55,18 @@ use coding_agent_search::storage::schema;
 use coding_agent_search::storage::sqlite::FrankenStorage;
 use coding_agent_search::storage::vector_domain;
 
-/// One conversation's post-truncation eligibility state, computed the exact
-/// same way `db_vector_catchup::scan_eligible_message_ids` computes it —
-/// `fetch_messages_for_lexical_rebuild` (idx order, already run through the
-/// 8 MiB per-conversation content cap, `#290`) then the same two filters
-/// (`!content.is_empty()`, `!canonicalize_for_embedding(content).is_empty()`).
+/// One conversation's eligibility state, computed the exact same way
+/// `db_vector_catchup::scan_eligible_message_ids` computes it --
+/// `fetch_messages_for_conversation` (idx order; capless since T5 retired
+/// the 8 MiB per-conversation content cap, `#290`) then the same two
+/// filters (`!content.is_empty()`, `!canonicalize_for_embedding(content).
+/// is_empty()`).
 struct ConversationEligibility {
     total_messages: usize,
     eligible_idx: HashSet<i64>,
-    /// idx -> post-truncation content length (0 means the cap cleared it).
+    /// idx -> content length as fetched (kept as a field name for
+    /// historical continuity with pre-T5 runs of this drill; no longer
+    /// truncation-shortened -- see the module doc comment).
     truncated_len_by_idx: HashMap<i64, usize>,
 }
 
@@ -101,8 +108,8 @@ fn main() -> Result<()> {
 
     for &cid in &conversation_ids {
         let messages = storage
-            .fetch_messages_for_lexical_rebuild(cid)
-            .with_context(|| format!("fetching lexical-rebuild (post-truncation) messages for conversation {cid}"))?;
+            .fetch_messages_for_conversation(cid)
+            .with_context(|| format!("fetching messages for conversation {cid}"))?;
         let mut eligible_idx = HashSet::new();
         let mut truncated_len_by_idx = HashMap::with_capacity(messages.len());
         for m in &messages {

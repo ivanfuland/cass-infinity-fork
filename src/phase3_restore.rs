@@ -6046,7 +6046,16 @@ pub(crate) fn commit_replace_in_tx(
     // workspace 落定)之后调用——早于此处会用旧值同步（W2-0 remeasure 报告曾误
     // 记「该 UPDATE 由 franken_replace_conversation_messages_in_tx 调用」，实为
     // 本函数按步骤9独立调用，两者是同一编排下的兄弟步骤而非调用关系，已订正）。
-    crate::storage::sqlite::sync_lexical_domain_for_conversation_in_tx(tx, input.conversation_id)?;
+    //
+    // T5 (plan v5.1): 拆两类。② 消息内容变化——步骤2-7整体 replace 掉了旧消息、
+    // 插入了新消息集（`replaced.inserted_message_ids`），对新集合做消息级同步。
+    // ② 会话 envelope 变化——步骤9刚把 title/workspace 落定，对该会话现有全部
+    // lex_docs 行重投影四列（content 不动，此处不重复同步内容）。旧消息行随
+    // `messages.id ... ON DELETE CASCADE` 物理删除时，其 `lex_docs` 行按同一
+    // 外键级联清除；`fts_lex` 侧无需在此额外处理——message 级同步只需覆盖
+    // 「当前会话最终应该有哪些行」，与旧版整会话重算达到同一末态。
+    crate::storage::sqlite::sync_lexical_docs_for_messages_in_tx(tx, &replaced.inserted_message_ids)?;
+    crate::storage::sqlite::resync_lexical_envelope_for_conversation_in_tx(tx, input.conversation_id)?;
 
     // 10 · 推进 generation
     crate::storage::sqlite::franken_set_source_content_generation_in_tx(tx, input.generation)?;
@@ -7475,6 +7484,102 @@ mod e6_replace_commit_tests {
             "重算全程 `message_metrics` 必须逐行不变（含那个哨兵值）—— 它是事务内逐消息写、\
              用另一套分桶公式的表，被重算路径顺手重写就等于让它被两套公式各写一遍"
         );
+    }
+
+    /// T5 (plan v5.1) Step 1: `commit_replace_in_tx` must dispatch BOTH
+    /// lexical sync categories in one call -- message content changed
+    /// (steps 2-7 wholesale-replace the message set) -> message-level sync
+    /// on the new set; envelope changed (step 9's title/workspace update)
+    /// -> envelope-level resync on every resulting row. Needs `pub(crate)`
+    /// access to `commit_replace_in_tx` itself, so this lives here (inline,
+    /// same module as `e6_replace_writes_back_the_recomputed_external_id`)
+    /// rather than in the external `tests/w4_lexical_incremental.rs` file --
+    /// a deviation from the plan's single-file Files listing, documented in
+    /// the T5 terminal report.
+    #[test]
+    fn lexical_replace_path_dispatches_message_and_envelope() {
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open(&dir);
+        let workspace_old = storage.ensure_workspace(std::path::Path::new("/tmp/replace-ws-old"), None).unwrap();
+        let workspace_new = storage.ensure_workspace(std::path::Path::new("/tmp/replace-ws-new"), None).unwrap();
+
+        let original = conversation_titled(
+            "oldtitletermxyz replace fixture",
+            vec![
+                message(0, MessageRole::User, "replaceAoriginaltermxyz body"),
+                message(1, MessageRole::Assistant, "replaceBoriginaltermxyz body"),
+            ],
+        );
+        storage
+            .insert_conversations_batched(&[(agent_id, Some(workspace_old), &original)])
+            .unwrap();
+        let conv_id: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT id FROM conversations WHERE external_id = ?1",
+                &[ParamValue::from(EXTERNAL_ID)],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+
+        let replaced_conv = conversation_titled(
+            "newtitletermxyz replace fixture",
+            vec![message(0, MessageRole::User, "replaceCnewtermxyz body")],
+        );
+
+        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+        let replaced = {
+            let tx = storage.raw().transaction().unwrap();
+            let outcome = commit_replace_in_tx(
+                &tx,
+                &ReplaceCommitInput {
+                    conversation_id: conv_id,
+                    agent_id,
+                    workspace_id: Some(workspace_new),
+                    conv: &replaced_conv,
+                    identity: &identity(),
+                    snapshot_root: "lexical-replace-root",
+                    generation: "lexical-replace-gen",
+                },
+                &pricing,
+                TS,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            outcome
+        };
+        assert_eq!(replaced.inserted_message_ids.len(), 1, "the replacement set has exactly one message");
+
+        let match_count = |term: &str| -> i64 {
+            storage
+                .raw()
+                .query_row_map("SELECT COUNT(*) FROM fts_lex WHERE fts_lex MATCH ?1", &[ParamValue::from(term)], |row| {
+                    row.get_typed(0)
+                })
+                .unwrap()
+        };
+        // Message-level dispatch: old messages' terms gone (their lex_docs
+        // rows were cascade-deleted with the old messages), new message's
+        // term indexed.
+        assert_eq!(match_count("replaceAoriginaltermxyz"), 0, "old message A's term must not survive the replace");
+        assert_eq!(match_count("replaceBoriginaltermxyz"), 0, "old message B's term must not survive the replace");
+        assert_eq!(match_count("replaceCnewtermxyz"), 1, "the new message's term must be indexed");
+
+        // Envelope-level dispatch: the surviving row's projection columns
+        // reflect the new title/workspace.
+        let new_doc_id = replaced.inserted_message_ids[0];
+        let (title, workspace): (String, String) = storage
+            .raw()
+            .query_row_map(
+                "SELECT title, workspace FROM lex_docs WHERE doc_id = ?1",
+                &[ParamValue::from(new_doc_id)],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )
+            .unwrap();
+        assert_eq!(title, "newtitletermxyz replace fixture");
+        assert_eq!(workspace, "/tmp/replace-ws-new");
+        assert_eq!(match_count("newtitletermxyz"), 1, "the new title term must be recallable via fts_lex");
+        assert_eq!(match_count("oldtitletermxyz"), 0, "the old title term must not survive the replace");
     }
 }
 

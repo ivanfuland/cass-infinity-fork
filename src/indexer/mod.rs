@@ -3389,10 +3389,6 @@ fn index_run_lock_heartbeat_interval() -> Duration {
     )
 }
 
-fn lexical_rebuild_noise_role(is_tool_role: bool) -> Option<&'static str> {
-    is_tool_role.then_some("tool")
-}
-
 /// Tool-class classification for the canonical-replay live lexical rebuild
 /// path, on `MessageRole` (post Task 2.1 codec) rather than a raw string.
 ///
@@ -5015,30 +5011,41 @@ fn lex_domain_matching_status(
     }
 }
 
-/// Count the tantivy docs a *healthy* live lexical index should hold for the
-/// current canonical data: one per reachable (live-conversation) message that
-/// the authoritative rebuild sink does NOT drop as hard-noise.
+/// Count the `lex_docs`/`fts_lex` rows a *healthy* live lexical index should
+/// hold for the current canonical data: one per reachable (live-conversation)
+/// message the actual write paths (`rebuild_lex_domain_from_db`,
+/// `sync_lexical_docs_for_messages_in_tx`) do NOT drop as ineligible.
 ///
-/// The lexical sink (`prebuilt_docs`) emits no doc for a hard-noise message —
-/// empty content or a tool-ack (`is_hard_message_noise`) — so the true expected
-/// doc count is `reachable_messages - hard_noise`, never the raw
-/// `COUNT(*) FROM messages`. cass#317: comparing the observed doc count against
-/// the raw message count made any corpus carrying tool-ack traffic look
-/// permanently sparse, firing a full authoritative rebuild on every index/watch
-/// run (the run then preserves `last_scan_ts`, so the same rebuild repeats).
+/// The lexical sink emits no doc for an ineligible message (role not in the
+/// whitelist, or hard-noise content) — so the true expected doc count is
+/// `reachable_messages - ineligible`, never the raw `COUNT(*) FROM messages`.
+/// cass#317: comparing the observed doc count against the raw message count
+/// made any corpus carrying tool-ack traffic look permanently sparse, firing
+/// a full authoritative rebuild on every index/watch run (the run then
+/// preserves `last_scan_ts`, so the same rebuild repeats).
+///
+/// Plan v5.1 T5 fix (probe② regression, discovered against fixture-3751):
+/// this used to classify with its own `is_lexical_rebuild_tool_class_message_
+/// role` + `is_hard_message_noise` composition, a *second*, independently
+/// maintained predicate that had drifted from `crate::search::eligibility::
+/// lexical_eligible` -- the one predicate `rebuild_lex_domain_from_db` and
+/// `sync_lexical_docs_for_messages_in_tx` actually write against since T5.
+/// That drift made every incremental `cass index` run see `observed_tantivy_
+/// docs < expected_lexical_docs` against a database that was already
+/// perfectly in sync, re-triggering this exact cass#317 sparse-repair
+/// false-positive on a *healthy* db every single time (measured: 15.5s of
+/// spurious full-rebuild lock time on an 81k-message fixture, dwarfing any
+/// real incremental work). Delegating to the same `lexical_eligible` the
+/// write paths use is what T5's "词法合格性 = lexical_eligible，三处同函数"
+/// mandate already required -- this was the third site, missed in the
+/// original file-scope read because the log/doc text here still called the
+/// sink "tantivy" from before it was migrated to the SQL lex_docs domain.
 ///
 /// Exactness comes from reusing the sink's own inputs rather than a SQL
-/// approximation that could drift from Rust trim semantics:
-///   - iterate live conversations only, via `fetch_messages_for_lexical_rebuild`
-///     — orphaned `messages` rows (no live conversation) are never indexed by
-///     the sink, so they must not inflate the expectation;
-///   - that fetch already applies the #290 per-conversation content cap
-///     (`truncate_lexical_rebuild_conversation_content`), so a conversation whose
-///     trailing body is cleared to empty is classified as hard-noise exactly as
-///     the sink drops it;
-///   - classify with the same `is_hard_message_noise(lexical_rebuild_noise_role(
-///     is_tool_role), content)` predicate and precise tool-role mapping the sink
-///     uses.
+/// approximation that could drift from Rust trim semantics: iterate live
+/// conversations only, via `fetch_messages_for_conversation` — orphaned
+/// `messages` rows (no live conversation) are never indexed by the sink, so
+/// they must not inflate the expectation.
 ///
 /// Content is read one conversation at a time, so peak memory is bounded to a
 /// single conversation regardless of corpus size. Only called on the
@@ -5055,9 +5062,9 @@ fn expected_live_lexical_doc_count(storage: &FrankenStorage) -> Result<usize> {
         .context("listing conversations for the noise-adjusted lexical doc expectation")?;
     let mut expected_docs = 0usize;
     for conversation_id in conversation_ids {
-        for message in storage.fetch_messages_for_lexical_rebuild(conversation_id)? {
-            let is_tool_role = is_lexical_rebuild_tool_class_message_role(&message.role);
-            if !is_hard_message_noise(lexical_rebuild_noise_role(is_tool_role), &message.content) {
+        for message in storage.fetch_messages_for_conversation(conversation_id)? {
+            let role_str = crate::model::types::role_as_str(&message.role);
+            if crate::search::eligibility::lexical_eligible(role_str, &message.content) {
                 expected_docs += 1;
             }
         }
@@ -6288,7 +6295,7 @@ fn rebuild_daily_stats_from_conversation_packets(
                 })
                 .collect::<Result<Vec<_>>>()?;
             let mut grouped_messages = storage
-                .fetch_messages_for_lexical_rebuild_batch(&conversation_ids, None, None)
+                .fetch_messages_for_conversations_batch(&conversation_ids)
                 .with_context(|| {
                     format!(
                         "fetching canonical message batch for packet daily_stats rebuild after id {}",
@@ -22689,7 +22696,7 @@ mod tests {
             .next()
             .expect("canonical replay row");
         let mut fetched = storage
-            .fetch_messages_for_lexical_rebuild_batch(&[inserted.conversation_id], None, None)
+            .fetch_messages_for_conversations_batch(&[inserted.conversation_id])
             .unwrap();
         let replay_messages = fetched
             .remove(&inserted.conversation_id)

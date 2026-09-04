@@ -994,7 +994,7 @@ fn fetch_canonical_embedding_batch_inner_with_caps(
     let conversations = fetch_canonical_embedding_conversations(storage, &conversation_ids)?;
 
     let mut grouped_messages =
-        storage.fetch_messages_for_lexical_rebuild_batch(&conversation_ids, None, None)?;
+        storage.fetch_messages_for_conversations_batch(&conversation_ids)?;
     let CheckpointCappedSelection {
         conversations,
         last_conversation_id,
@@ -1155,7 +1155,7 @@ where
 
     let conversations = fetch_canonical_embedding_conversations(storage, conversation_ids)?;
     let mut grouped_messages =
-        storage.fetch_messages_for_lexical_rebuild_batch(conversation_ids, None, None)?;
+        storage.fetch_messages_for_conversations_batch(conversation_ids)?;
     Ok(
         packet_embedding_inputs_from_materialized_canonical_messages(
             &conversations,
@@ -3452,7 +3452,7 @@ mod tests {
         )?;
         let envelopes = fetch_canonical_embedding_conversations(&storage, &conversation_ids)?;
         let mut grouped_messages =
-            storage.fetch_messages_for_lexical_rebuild_batch(&conversation_ids, None, None)?;
+            storage.fetch_messages_for_conversations_batch(&conversation_ids)?;
         let mut packets: Vec<ConversationPacket> = Vec::with_capacity(envelopes.len());
         let mut contexts: Vec<SemanticPacketContext> = Vec::with_capacity(envelopes.len());
         for envelope in &envelopes {
