@@ -2101,7 +2101,12 @@ mod tests {
         // implementation are all byte-preserving. If you intentionally
         // changed any of those, update this value AND record the reason
         // in the commit message.
-        const EXPECTED: &str = "22d9ae7076925a4b70a194b0f519dfb1d465cc757368c296ef24055a02038c2c";
+        //
+        // Re-captured 2026-09-04 (plan v5.1 T5.5): T1's canonicalize v2
+        // change intentionally shifted the digest (control-plane bisection
+        // confirmed T1/T3/T5 all reproduce this same new value, so it is
+        // stable, not still-drifting).
+        const EXPECTED: &str = "dcbe640f1f4d6084955e027c2a9432b7fa218ab58612773f457b33715f050865";
         assert_eq!(
             digest, EXPECTED,
             "embed_messages golden digest drifted; if this was intentional, \

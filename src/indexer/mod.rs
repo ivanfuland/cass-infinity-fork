@@ -28233,10 +28233,16 @@ mod tests {
             "a meta.schema_version above the legacy ceiling must not get the \
              legacy-specific rebuild guidance: {err}"
         );
+        // T5.5 (plan v5.1): T4's schema v5 rewrite replaced ensure()'s old
+        // generic "user_version=0-but-not-empty" text (checked via
+        // "schema::ensure"/"can open in place") with StorageError::
+        // SchemaRebuildRequired{found:0, required:5}'s own Display
+        // (`src/storage/api/error.rs`). Anchor on that Display's own stable
+        // substrings rather than the anyhow context wrapping around it.
         assert!(
-            err.contains("schema::ensure") && err.contains("can open in place"),
-            "diagnostic should be schema::ensure's own generic user_version=0-but-not-empty \
-             rejection, not a legacy-specific one: {err}"
+            err.contains("schema version 0") && err.contains("rebuild-only shape"),
+            "diagnostic should be StorageError::SchemaRebuildRequired's own generic \
+             user_version=0-but-not-empty rejection, not a legacy-specific one: {err}"
         );
         assert!(db_path.exists(), "canonical DB must remain in place");
     }
@@ -29851,21 +29857,46 @@ mod tests {
         run_index(seed_opts, None)?;
 
         // Revert to the real starting condition this bug lived in: a
-        // populated v1-shaped canonical DB with messages but no
-        // lex_docs/fts_lex at all -- exactly the exec25 staging DB's state
-        // when this bug was found (a W1 VACUUM INTO copy never opened by
-        // w2-aware code).
+        // populated canonical DB with messages but no lex_docs/fts_lex at
+        // all -- exactly the exec25 staging DB's state when this bug was
+        // found (a W1 VACUUM INTO copy never opened by w2-aware code).
+        //
+        // T5.5 (plan v5.1): this used to also revert `PRAGMA user_version`
+        // to 1 to match that historical DB's actual shape, but T4's
+        // rebuild-only v5 schema makes `ensure()` reject any `user_version`
+        // in `1..=4` outright (`SchemaRebuildRequired`) -- there is no
+        // in-place migration path left for that scenario, so a v1-shaped
+        // fixture no longer reaches this test's real target (the
+        // `--force-rebuild` dispatch actually opening a writable
+        // connection and rebuilding the lex domain, not a readonly no-op;
+        // see the doc comment above). Dropping only the two lex tables
+        // while leaving `user_version` honestly at CURRENT_SCHEMA_VERSION
+        // reproduces the same "lex domain missing" corruption without
+        // touching the version marker `ensure()` now gates on --
+        // `ensure()` is a no-op for `user_version == CURRENT_SCHEMA_
+        // VERSION` and never re-verifies table presence, so this fixture
+        // still opens cleanly and `recreate_lex_domain_tables` (the
+        // unconditional drop+recreate `--force-rebuild` already runs)
+        // still has real missing tables to repair.
         {
             let corrupt = FrankenStorage::open(&db_path)?;
             corrupt.raw().execute("DROP TABLE IF EXISTS fts_lex", &[])?;
             corrupt.raw().execute("DROP TABLE IF EXISTS lex_docs", &[])?;
-            corrupt.raw().execute("PRAGMA user_version = 1;", &[])?;
             corrupt.close()?;
         }
         let reverted = FrankenStorage::open_readonly(&db_path)?;
         anyhow::ensure!(
-            reverted.schema_version()? == 1,
-            "sanity: DB must be reverted to v1 before the force-rebuild call"
+            reverted.schema_version()? == crate::storage::schema::CURRENT_SCHEMA_VERSION,
+            "sanity: DB must stay at the current schema version (only the lex tables were dropped)"
+        );
+        let lex_tables_present: i64 = reverted.raw().query_row_map(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('fts_lex', 'lex_docs')",
+            &[],
+            |row| row.get_typed(0),
+        )?;
+        anyhow::ensure!(
+            lex_tables_present == 0,
+            "sanity: fts_lex/lex_docs must both be dropped before the force-rebuild call"
         );
         reverted.close_without_checkpoint()?;
 
