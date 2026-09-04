@@ -27,6 +27,7 @@ pub(crate) mod contention_diagnostics;
 pub mod daemon_client;
 pub(crate) mod drill_down;
 pub(crate) mod e2e_scenarios;
+pub mod eligibility;
 pub mod embedder;
 pub mod embedder_registry;
 pub mod fastembed_embedder;
