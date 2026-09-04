@@ -1119,6 +1119,69 @@ pub fn verify_no_activation_toctou_drift_in_tx(
     Ok(())
 }
 
+/// R2-B2 (chunk-domain class, T8.5 task book #92b): cheap in-transaction
+/// re-verification of the two invariants a concurrent writer could have
+/// invalidated between the v5 activation audit
+/// ([`crate::indexer::db_vector_catchup::activate_generation_v5`],
+/// necessarily out-of-transaction -- an expensive multi-query audit must
+/// not hold a write lock open for its whole duration) and the switch
+/// transaction that actually flips `is_active`. Mirrors
+/// [`verify_no_activation_toctou_drift_in_tx`]'s R1-W3-B2/R2-B2 guards but
+/// against the chunk domain's own tables (`chunk_holes`/`message_chunks`)
+/// instead of the v4 domain's `embedding_holes` -- that function only ever
+/// queries `embedding_holes`, so it is blind to chunk-domain mutations,
+/// and the v5 activation path (`db_vector_catchup.rs`'s
+/// `switch_active_generation` call in the "activate iff no holes remain"
+/// branch) previously called nothing here at all, a known gap left open
+/// at T8 hand-off and closed by this function.
+///
+/// Two invariants, both cheap:
+/// - `chunk_holes` for `generation_id` must still be empty (a fresh
+///   `COUNT`, not the audit's now-stale read) -- a message landing (or a
+///   content edit registering a new hole) in the audit-to-switch window
+///   would otherwise get silently promoted still missing that chunk.
+/// - `message_chunks` row count for `generation_id` must equal
+///   `pre_audit_chunk_count`, the count the activation audit observed and
+///   reported as `chunk_count` when it ran the completeness check (⑨).
+///   Catches a shrink (a concurrent chunk delete/prune) the
+///   `chunk_holes`-emptiness check alone cannot see -- deleting a stored
+///   chunk row does not itself create a hole.
+pub fn verify_no_activation_toctou_drift_v5_in_tx(
+    tx: &Tx,
+    generation_id: i64,
+    pre_audit_chunk_count: i64,
+) -> Result<(), StorageError> {
+    let holes_now: i64 = tx.query_row_map(
+        "SELECT COUNT(*) FROM chunk_holes WHERE generation_id = ?1",
+        &params![generation_id],
+        |row| row.get_typed(0),
+    )?;
+    if holes_now != 0 {
+        return Err(StorageError::Constraint {
+            detail: format!(
+                "generation {generation_id} gained {holes_now} chunk_holes row(s) between \
+                 the v5 activation audit and this switch transaction; refusing to activate \
+                 (TOCTOU guard, R2-B2 chunk-domain class)"
+            ),
+        });
+    }
+    let count_now: i64 = tx.query_row_map(
+        "SELECT COUNT(*) FROM message_chunks WHERE generation_id = ?1",
+        &params![generation_id],
+        |row| row.get_typed(0),
+    )?;
+    if count_now != pre_audit_chunk_count {
+        return Err(StorageError::Constraint {
+            detail: format!(
+                "generation {generation_id}'s message_chunks row count drifted from \
+                 {pre_audit_chunk_count} to {count_now} between the v5 activation audit and \
+                 this switch transaction; refusing to activate (TOCTOU guard, R2-B2 chunk-domain class)"
+            ),
+        });
+    }
+    Ok(())
+}
+
 // -------------------------------------------------------------------------
 // w3-3 Step 3 (spec 门③, R2-W3-B4): same-transaction lifecycle invalidation
 // primitives. `ON DELETE CASCADE` on `message_embeddings.doc_id` and

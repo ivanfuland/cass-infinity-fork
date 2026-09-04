@@ -29,7 +29,7 @@ use crate::search::chunking::canonical_role;
 use crate::search::eligibility::{ExpectedChunk, expected_chunks, for_each_expected_chunk};
 use crate::search::frankensearch_types::cosine_similarity;
 use crate::search::infinity::{InfinityConfig, InfinityServedIdentity, fingerprint_matches, probe_served_embed_identity};
-use crate::storage::api::{Conn, StorageError, TxMode, params};
+use crate::storage::api::{Conn, StorageError, Tx, TxMode, params};
 use crate::storage::schema::{self, CasInsertOutcome, ChunkRow};
 use crate::storage::sqlite::FrankenStorage;
 use crate::storage::vector_domain;
@@ -2015,6 +2015,21 @@ pub fn activate_generation_v5(
     )
 }
 
+/// The exact `switch_active_generation` verify closure the v5 activation
+/// path uses (T8.5, task book #92b) -- pulled out to a named function, not
+/// left as an inline closure, so the same TOCTOU-window tests that exercise
+/// this function also exercise the production wiring: a mutation that
+/// deletes the `verify_no_activation_toctou_drift_v5_in_tx` call *here*
+/// (rather than inside that function's own body) is caught by those tests
+/// too, closing the exact "verify function exists but the real switch
+/// closure never calls it" gap T8's own hand-off left open for the
+/// pre-T8.5 state of this call site.
+fn v5_switch_guard_in_tx(tx: &Tx, generation_id: i64, pre_audit_chunk_count: i64) -> Result<(), StorageError> {
+    schema::verify_no_activation_toctou_drift_v5_in_tx(tx, generation_id, pre_audit_chunk_count)?;
+    tx.execute("UPDATE embedding_generations SET audit_status = 'passed' WHERE id = ?1", &params![generation_id])?;
+    Ok(())
+}
+
 /// Drive one full v5 chunk-domain catch-up run (T8, plan v5.1, task book
 /// #92): find-or-create the generation by policy+fingerprint identity
 /// ([`find_reusable_or_create_generation_v5`]) -> claim/purge stale
@@ -2265,11 +2280,7 @@ pub fn run_db_vector_catchup_backfill_v5(
             );
         }
         schema::switch_active_generation(storage.raw(), generation_id, FrankenStorage::now_millis(), |tx| {
-            tx.execute(
-                "UPDATE embedding_generations SET audit_status = 'passed' WHERE id = ?1",
-                &params![generation_id],
-            )?;
-            Ok(())
+            v5_switch_guard_in_tx(tx, generation_id, audit_report.chunk_count)
         })
         .context("activating v5 chunk-domain generation")?;
         activated = true;
@@ -3236,6 +3247,106 @@ mod chunk_catchup_v5_tests {
         assert_eq!(report.ownership_seed, seed, "the seed passed in must be exactly what the report (and the tracing::info! log line) carries");
         assert_eq!(report.ownership_checked, 2, "min(200, chunk_count=2) = 2");
         assert!(report.fingerprint_ok);
+    }
+
+    fn is_active(storage: &FrankenStorage, generation_id: i64) -> bool {
+        storage
+            .raw()
+            .query_row_map("SELECT is_active FROM embedding_generations WHERE id = ?1", &params![generation_id], |row| row.get_typed::<i64>(0))
+            .unwrap()
+            == 1
+    }
+
+    fn audit_status(storage: &FrankenStorage, generation_id: i64) -> String {
+        storage.raw().query_row_map("SELECT audit_status FROM embedding_generations WHERE id = ?1", &params![generation_id], |row| row.get_typed(0)).unwrap()
+    }
+
+    /// T8.5 (task book #92b, R2-B2 chunk-domain class): the v5 activation
+    /// branch's `switch_active_generation` verify closure previously
+    /// called nothing beyond writing `audit_status='passed'` -- the full
+    /// audit (`activate_generation_v5`) necessarily runs *outside* the
+    /// switch transaction, opening a TOCTOU window between "the audit read
+    /// chunk_holes==0 and verified completeness" and "the switch
+    /// transaction actually flips `is_active`". A message landing in that
+    /// window via the real production insert path registers a fresh
+    /// `chunk_holes` row against this generation (`register_chunk_holes_
+    /// for_message_in_tx` matches `is_active=1 OR audit_status='pending'`,
+    /// and this fixture's generation is already active) -- the candidate
+    /// would otherwise get silently re-promoted still missing that chunk.
+    #[test]
+    fn activation_v5_aborts_when_chunk_hole_appears_after_audit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_storage(&dir.path().join("db.sqlite"));
+        let (generation_id, _chunk_id_a, _chunk_id_b) = clean_two_message_generation(&storage);
+        assert!(is_active(&storage, generation_id));
+        assert_eq!(audit_status(&storage, generation_id), "passed");
+
+        // Re-run the exact audit the real activation path runs (`db_vector_
+        // catchup.rs`'s activation branch calls this same function
+        // immediately before its `switch_active_generation` call),
+        // capturing the `chunk_count` watermark it observed.
+        let audit_report = activate_generation_v5(&storage, generation_id, &mock_embed, 42).unwrap();
+        assert!(audit_report.passed, "sanity: a clean generation must pass before we inject drift: {audit_report:?}");
+
+        // Simulate a concurrent writer landing a new message in the
+        // audit-to-switch window via the real production insert path. The
+        // same write entry point also runs the pre-existing (v4-era)
+        // `demote_active_generation_readiness_in_tx`, which independently
+        // flips this still-active generation's `audit_status` back to
+        // 'pending' -- exactly the staleness signal an unconditional
+        // `UPDATE ... SET audit_status = 'passed'` in the switch closure
+        // (the pre-T8.5 behavior) would have silently clobbered, on top of
+        // missing the chunk itself.
+        insert_conversation(&storage, "t8-5-concurrent-drift", &["a brand new message landing in the toctou window"]);
+        assert!(chunk_holes_count(&storage, generation_id) > 0, "sanity: the concurrent insert must have registered at least one chunk_holes row");
+        assert_eq!(audit_status(&storage, generation_id), "pending", "sanity: the concurrent insert's demotion must have already fired");
+
+        let result = schema::switch_active_generation(storage.raw(), generation_id, TS + 999_999, |tx| {
+            v5_switch_guard_in_tx(tx, generation_id, audit_report.chunk_count)
+        });
+
+        assert!(result.is_err(), "a chunk_holes row appearing between audit-time and switch-time must abort the switch");
+        assert!(is_active(&storage, generation_id), "an aborted re-switch must leave the pre-existing is_active flag untouched");
+        assert_eq!(
+            audit_status(&storage, generation_id),
+            "pending",
+            "an aborted re-switch must never write audit_status='passed', leaving the concurrent insert's demotion intact"
+        );
+    }
+
+    /// T8.5 (task book #92b, R2-B2 chunk-domain class): a `message_chunks`
+    /// shrink between audit-time and switch-time leaves `chunk_holes`
+    /// untouched (deleting a stored chunk row does not itself create a
+    /// hole) -- the reason this needs its own row-count recheck alongside
+    /// the `chunk_holes`-emptiness one.
+    #[test]
+    fn activation_v5_aborts_when_chunk_count_drifts_after_audit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_storage(&dir.path().join("db.sqlite"));
+        let (generation_id, chunk_id_a, _chunk_id_b) = clean_two_message_generation(&storage);
+        assert!(is_active(&storage, generation_id));
+        assert_eq!(audit_status(&storage, generation_id), "passed");
+
+        let audit_report = activate_generation_v5(&storage, generation_id, &mock_embed, 42).unwrap();
+        assert!(audit_report.passed, "sanity: a clean generation must pass before we inject drift: {audit_report:?}");
+        assert_eq!(audit_report.chunk_count, 2, "sanity: the fixture has exactly 2 chunks");
+
+        // Simulate a concurrent shrink -- a chunk row disappearing between
+        // audit-time and switch-time.
+        storage.raw().execute("DELETE FROM message_chunks WHERE chunk_id = ?1", &params![chunk_id_a]).unwrap();
+        assert_eq!(chunk_holes_count(&storage, generation_id), 0, "sanity: the direct delete must not have registered a hole");
+        assert_eq!(message_chunks_count(&storage, generation_id), 1);
+
+        let result = schema::switch_active_generation(storage.raw(), generation_id, TS + 999_999, |tx| {
+            v5_switch_guard_in_tx(tx, generation_id, audit_report.chunk_count)
+        });
+
+        assert!(
+            result.is_err(),
+            "a message_chunks count drift between audit-time and switch-time must abort the switch, even with chunk_holes still empty"
+        );
+        assert!(is_active(&storage, generation_id));
+        assert_eq!(audit_status(&storage, generation_id), "passed");
     }
 
     #[test]
