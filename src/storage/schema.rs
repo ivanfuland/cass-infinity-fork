@@ -52,7 +52,7 @@
 //! needs to keep those legacy fields in sync for other code that still
 //! reads them is that wiring step's decision, not this module's.
 
-use super::api::{Conn, StorageError, Tx, TxMode, params};
+use super::api::{Conn, StorageError, Tx, TxMode, Value, params};
 
 /// The schema version [`ensure`] currently knows how to produce. There is
 /// no migration path defined above this yet — bump this and add a real
@@ -84,7 +84,7 @@ use super::api::{Conn, StorageError, Tx, TxMode, params};
 /// ships here, consumption logic is W3-2's job). No `vec0` virtual table and
 /// no `sqlite-vec` dependency yet -- that is W3-3's retrieval-segment scope;
 /// this version only ships the authoritative relational shape.
-pub const CURRENT_SCHEMA_VERSION: i64 = 4;
+pub const CURRENT_SCHEMA_VERSION: i64 = 5;
 
 /// The `lex_docs`/`fts_lex` domain DDL (w2 Task W2-2, OQ2: external-content
 /// mode) — **must stay byte-for-byte identical** to the matching two lines
@@ -250,12 +250,18 @@ CREATE TABLE IF NOT EXISTS conversation_external_tail_lookup (lookup_key TEXT PR
 CREATE TABLE IF NOT EXISTS operation_commit_receipt (id INTEGER PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE, operation TEXT NOT NULL, state TEXT NOT NULL, snapshot_root TEXT, committed_at_ms INTEGER NOT NULL, detail TEXT);
 CREATE TABLE IF NOT EXISTS lex_docs (doc_id INTEGER PRIMARY KEY REFERENCES messages (id) ON DELETE CASCADE, content TEXT NOT NULL, title TEXT NOT NULL, agent TEXT NOT NULL, workspace TEXT NOT NULL, source_path TEXT NOT NULL);
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_lex USING fts5(content, title, agent, workspace, source_path, content = 'lex_docs', content_rowid = 'doc_id', tokenize = 'porter trigram');
-CREATE TABLE IF NOT EXISTS embedding_generations (id INTEGER PRIMARY KEY AUTOINCREMENT, embedder_id TEXT NOT NULL, dim INTEGER NOT NULL CHECK (dim > 0), canonicalize_version INTEGER NOT NULL, byte_order TEXT NOT NULL DEFAULT 'le' CHECK (byte_order IN ('le', 'be')), audit_status TEXT NOT NULL DEFAULT 'pending' CHECK (audit_status IN ('pending', 'passed', 'failed')), is_active INTEGER NOT NULL DEFAULT 0 CHECK (is_active IN (0, 1)), created_at INTEGER NOT NULL, activated_at INTEGER);
+CREATE TABLE IF NOT EXISTS embedding_generations (id INTEGER PRIMARY KEY AUTOINCREMENT, embedder_id TEXT NOT NULL, dim INTEGER NOT NULL CHECK (dim > 0), canonicalize_version INTEGER NOT NULL, chunking_policy_version INTEGER NOT NULL, fingerprint BLOB NOT NULL, byte_order TEXT NOT NULL DEFAULT 'le' CHECK (byte_order IN ('le', 'be')), audit_status TEXT NOT NULL DEFAULT 'pending' CHECK (audit_status IN ('pending', 'passed', 'failed')), is_active INTEGER NOT NULL DEFAULT 0 CHECK (is_active IN (0, 1)), created_at INTEGER NOT NULL, activated_at INTEGER);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_embedding_generations_single_active ON embedding_generations(is_active) WHERE is_active = 1;
 CREATE TABLE IF NOT EXISTS message_embeddings (generation_id INTEGER NOT NULL REFERENCES embedding_generations (id), doc_id INTEGER NOT NULL REFERENCES messages (id) ON DELETE CASCADE, conversation_id INTEGER NOT NULL, embedding BLOB NOT NULL CHECK (length(embedding) % 4 = 0), norm REAL NOT NULL CHECK (norm > 0), content_hash TEXT NOT NULL, content_version INTEGER, created_at INTEGER NOT NULL, UNIQUE (generation_id, doc_id));
 CREATE INDEX IF NOT EXISTS idx_message_embeddings_generation ON message_embeddings(generation_id);
 CREATE INDEX IF NOT EXISTS idx_message_embeddings_doc ON message_embeddings(doc_id);
 CREATE TABLE IF NOT EXISTS embedding_holes (generation_id INTEGER NOT NULL REFERENCES embedding_generations (id), doc_id INTEGER NOT NULL REFERENCES messages (id) ON DELETE CASCADE, detected_at INTEGER NOT NULL, reason TEXT, PRIMARY KEY (generation_id, doc_id));
+CREATE TABLE IF NOT EXISTS message_chunks (chunk_id INTEGER PRIMARY KEY, generation_id INTEGER NOT NULL REFERENCES embedding_generations(id), message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE, conversation_id INTEGER NOT NULL, chunk_idx INTEGER NOT NULL, byte_start INTEGER NOT NULL, byte_end INTEGER NOT NULL, content_hash TEXT NOT NULL, embedding BLOB NOT NULL CHECK(length(embedding) % 4 = 0), norm REAL NOT NULL CHECK(norm > 0), created_at INTEGER NOT NULL, UNIQUE(generation_id, message_id, chunk_idx));
+CREATE INDEX IF NOT EXISTS idx_message_chunks_generation ON message_chunks(generation_id);
+CREATE INDEX IF NOT EXISTS idx_message_chunks_message ON message_chunks(message_id);
+CREATE INDEX IF NOT EXISTS idx_message_chunks_gen_conv ON message_chunks(generation_id, conversation_id);
+CREATE TABLE IF NOT EXISTS chunk_holes (generation_id INTEGER NOT NULL REFERENCES embedding_generations(id), message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE, chunk_idx INTEGER NOT NULL, detected_at INTEGER NOT NULL, reason TEXT, PRIMARY KEY(generation_id, message_id, chunk_idx));
+CREATE TABLE IF NOT EXISTS chunk_staging (batch_id INTEGER NOT NULL, generation_id INTEGER NOT NULL REFERENCES embedding_generations(id), message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE, conversation_id INTEGER NOT NULL, chunk_idx INTEGER NOT NULL, byte_start INTEGER NOT NULL, byte_end INTEGER NOT NULL, content_hash TEXT NOT NULL, embedding BLOB NOT NULL CHECK(length(embedding) % 4 = 0), norm REAL NOT NULL CHECK(norm > 0), created_at INTEGER NOT NULL, PRIMARY KEY(generation_id, message_id, chunk_idx));
 "#;
 
 /// `PRAGMA user_version` is not parameterizable, so it is spliced into a
@@ -331,13 +337,15 @@ pub fn ensure(conn: &Conn) -> Result<(), StorageError> {
 
     if version == 0 {
         if !database_is_empty(conn)? {
-            return Err(reject(
-                "database has user_version=0 but is not empty; this is not a database \
-                 `schema::ensure` can open in place (it looks like a pre-rusqlite archive, \
-                 or a half-built database from an interrupted process that did not go \
-                 through a single transaction) -- rebuild the archive instead of trying to \
-                 convert this file",
-            ));
+            // T4 (plan v5.1): grouped with the 1-4 rejection below under the
+            // same SchemaRebuildRequired contract -- a user_version=0,
+            // non-empty database (a pre-rusqlite archive, or a half-built
+            // database from an interrupted process that never went through
+            // a single transaction) is exactly as much "not a database
+            // ensure can open in place" as a stale 1-4 database is; both
+            // get the same "rebuild from the corpus" story, not two
+            // different error shapes for callers to special-case.
+            return Err(StorageError::SchemaRebuildRequired { found: 0, required: CURRENT_SCHEMA_VERSION });
         }
         return conn.with_tx_no_replay(TxMode::Immediate, |tx| {
             tx.execute_batch(FRESH_SCHEMA_DDL)?;
@@ -354,27 +362,15 @@ pub fn ensure(conn: &Conn) -> Result<(), StorageError> {
     }
 
     if version < CURRENT_SCHEMA_VERSION {
-        // w2 Task W2-3 Step 4 (R1-X-N1) + W2-6 Task戊: a pre-existing database
-        // opened by newer code must not be silently left behind. Every
-        // pending step below is idempotent (`IF NOT EXISTS` / `IF EXISTS`),
-        // so applying steps the database already has is harmless -- a retry
-        // after an interrupted attempt, or a second `ensure` call on an
-        // already-current database, re-runs (or skips) harmlessly. All
-        // pending steps apply in one transaction so a single `ensure` call
-        // fully catches a database up regardless of how far behind it is.
-        return conn.with_tx_no_replay(TxMode::Immediate, |tx| {
-            if version < 2 {
-                tx.execute_batch(V2_LEX_DOMAIN_DDL)?;
-            }
-            if version < 3 {
-                tx.execute_batch("DROP TABLE IF EXISTS fts_messages;")?;
-            }
-            if version < 4 {
-                tx.execute_batch(V4_VECTOR_DOMAIN_DDL)?;
-            }
-            tx.execute_batch(&set_user_version_sql(CURRENT_SCHEMA_VERSION))?;
-            Ok(())
-        });
+        // T4 (plan v5.1): v5 is rebuild-only. Versions 1-4 predate the
+        // chunk-table shape and are no longer incrementally migrated in
+        // place (the v1->v2->v3->v4 DDL ladder above this comment, in
+        // earlier revisions of this function, is retired along with this
+        // branch) -- the caller's story for a pre-v5 database is "rebuild
+        // from the corpus" (T12), not "convert this file". `version == 0 &&
+        // non-empty` is handled above this branch and already rejects the
+        // same way; this covers `1 <= version < CURRENT_SCHEMA_VERSION`.
+        return Err(StorageError::SchemaRebuildRequired { found: version, required: CURRENT_SCHEMA_VERSION });
     }
 
     // version == CURRENT_SCHEMA_VERSION: already built, nothing to do.
@@ -579,6 +575,31 @@ pub fn seed_embedding_holes(
     Ok(inserted)
 }
 
+/// The `chunking_policy_version` a legacy (pre-T2) generation is stamped
+/// with (T4, plan v5.1): `0` is not a real chunking policy (T2's
+/// `CHUNKING_POLICY_VERSION` starts at `1`), so it can never collide with a
+/// real one, and it lets [`find_active_generation_matching_identity_v5`]/
+/// [`find_reusable_pending_generation_v5`] exclude legacy rows by a plain
+/// `chunking_policy_version != 0` (or `> 0`) filter rather than a nullable
+/// column.
+pub const LEGACY_CHUNKING_POLICY_VERSION: u32 = 0;
+
+/// The `fingerprint` a legacy (pre-T2) generation is stamped with (T4, plan
+/// v5.1) -- `fingerprint BLOB NOT NULL` has no default, so a row must carry
+/// *something*; this literal marks it as never having gone through T2's
+/// real fingerprinting.
+pub const LEGACY_GENERATION_FINGERPRINT: &[u8] = b"legacy-v4";
+
+/// **Deprecated thin wrapper (T4, plan v5.1): kept only so pre-T4 call
+/// sites keep compiling until T11 deletes it.** Writes
+/// `chunking_policy_version = `[`LEGACY_CHUNKING_POLICY_VERSION`]` (`0`) and
+/// `fingerprint = `[`LEGACY_GENERATION_FINGERPRINT`]` explicitly (the
+/// columns have no DDL default) so the row is well-formed but permanently
+/// invisible to [`find_active_generation_matching_identity_v5`]/
+/// [`find_reusable_pending_generation_v5`], which both require
+/// `chunking_policy_version` to match a real (non-zero) requested value.
+/// New call sites must use [`create_embedding_generation_v5`] instead.
+#[deprecated(note = "removed in T11")]
 pub fn create_embedding_generation(
     tx: &Tx,
     embedder_id: &str,
@@ -588,17 +609,116 @@ pub fn create_embedding_generation(
 ) -> Result<i64, StorageError> {
     tx.execute(
         "INSERT INTO embedding_generations \
-         (embedder_id, dim, canonicalize_version, byte_order, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+         (embedder_id, dim, canonicalize_version, chunking_policy_version, fingerprint, byte_order, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         &params![
             embedder_id,
             dim,
             i64::from(canonicalize_version),
+            i64::from(LEGACY_CHUNKING_POLICY_VERSION),
+            LEGACY_GENERATION_FINGERPRINT.to_vec(),
             VECTOR_BYTE_ORDER_LE,
             created_at_ms
         ],
     )?;
     Ok(tx.last_insert_rowid())
+}
+
+/// T4 (plan v5.1): identity now also includes `chunking_policy_version`
+/// (T2's `CHUNKING_POLICY_VERSION`), and every row must carry a real,
+/// non-empty `fingerprint` (three-sentinel cosine-similarity identity per
+/// the plan's parameter-freeze table). `fingerprint.is_empty()` is rejected
+/// with `Constraint` rather than silently accepted -- an empty fingerprint
+/// can never be meaningfully compared against a future re-fingerprint, so
+/// it is never a legitimate value, not even for a brand-new generation.
+/// Returns the new row's `id`.
+pub fn create_embedding_generation_v5(
+    tx: &Tx,
+    embedder_id: &str,
+    dim: i64,
+    canonicalize_version: u32,
+    chunking_policy_version: u32,
+    fingerprint: &[u8],
+    created_at_ms: i64,
+) -> Result<i64, StorageError> {
+    if fingerprint.is_empty() {
+        return Err(StorageError::Constraint {
+            detail: "fingerprint must not be empty".to_string(),
+        });
+    }
+    tx.execute(
+        "INSERT INTO embedding_generations \
+         (embedder_id, dim, canonicalize_version, chunking_policy_version, fingerprint, byte_order, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        &params![
+            embedder_id,
+            dim,
+            i64::from(canonicalize_version),
+            i64::from(chunking_policy_version),
+            fingerprint.to_vec(),
+            VECTOR_BYTE_ORDER_LE,
+            created_at_ms
+        ],
+    )?;
+    Ok(tx.last_insert_rowid())
+}
+
+/// T4 (plan v5.1) sibling of [`find_active_generation_matching_identity`]:
+/// identity now includes `chunking_policy_version`, and legacy rows (stamped
+/// `chunking_policy_version = 0` by the deprecated
+/// [`create_embedding_generation`] wrapper) never match here since callers
+/// always pass a real (non-zero) policy version -- `chunking_policy_version
+/// = ?4` with `?4` bound to a real value structurally excludes `0` rows,
+/// no separate filter needed. Returns `(id, fingerprint)` so a caller can
+/// compare the stored fingerprint against a freshly computed one without a
+/// second round trip.
+pub fn find_active_generation_matching_identity_v5(
+    conn: &Conn,
+    embedder_id: &str,
+    dim: i64,
+    canonicalize_version: u32,
+    chunking_policy_version: u32,
+) -> Result<Option<(i64, Vec<u8>)>, StorageError> {
+    conn.query_opt_map(
+        "SELECT id, fingerprint FROM embedding_generations \
+         WHERE embedder_id = ?1 AND dim = ?2 AND canonicalize_version = ?3 \
+           AND chunking_policy_version = ?4 AND is_active = 1 AND audit_status != 'failed' \
+         LIMIT 1",
+        &params![
+            embedder_id,
+            dim,
+            i64::from(canonicalize_version),
+            i64::from(chunking_policy_version)
+        ],
+        |row| Ok((row.get_typed::<i64>(0)?, row.get_typed::<Vec<u8>>(1)?)),
+    )
+}
+
+/// T4 (plan v5.1) sibling of [`find_reusable_pending_generation`]: same
+/// `chunking_policy_version = ?4` structural exclusion of legacy
+/// (policy-`0`) rows as
+/// [`find_active_generation_matching_identity_v5`] above. Returns `(id,
+/// fingerprint)`.
+pub fn find_reusable_pending_generation_v5(
+    conn: &Conn,
+    embedder_id: &str,
+    dim: i64,
+    canonicalize_version: u32,
+    chunking_policy_version: u32,
+) -> Result<Option<(i64, Vec<u8>)>, StorageError> {
+    conn.query_opt_map(
+        "SELECT id, fingerprint FROM embedding_generations \
+         WHERE embedder_id = ?1 AND dim = ?2 AND canonicalize_version = ?3 \
+           AND chunking_policy_version = ?4 AND audit_status = 'pending' \
+         ORDER BY id DESC LIMIT 1",
+        &params![
+            embedder_id,
+            dim,
+            i64::from(canonicalize_version),
+            i64::from(chunking_policy_version)
+        ],
+        |row| Ok((row.get_typed::<i64>(0)?, row.get_typed::<Vec<u8>>(1)?)),
+    )
 }
 
 /// The write-side validation gate for `message_embeddings` (spec §3.1 Step
@@ -1177,6 +1297,499 @@ pub fn demote_generation_readiness_if_active_in_tx(tx: &Tx, generation_id: i64) 
     Ok(())
 }
 
+// =============================================================================
+// Chunk domain (T4, plan v5.1): `message_chunks`/`chunk_holes`/`chunk_staging`,
+// span-aware staging/pruning, and the `_v5` generation primitives. Coexists
+// with the v4 vector domain above (not wired into any call site here -- T5/
+// T6/T8 do that); `message_embeddings`/`embedding_holes` and their `_v4`-era
+// (unsuffixed) generation functions are untouched and stay live until T11.
+// =============================================================================
+
+/// One row of `message_chunks`/`chunk_staging` (the two tables share this
+/// shape; `stage_chunk_rows_in_tx` writes it into staging, `insert_chunk_row_
+/// in_tx` writes it directly into `message_chunks`, and `move_staging_to_
+/// chunks_in_tx` moves a staged row from one to the other).
+#[derive(Clone, Debug)]
+pub struct ChunkRow {
+    pub generation_id: i64,
+    pub message_id: i64,
+    pub conversation_id: i64,
+    pub chunk_idx: u32,
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub content_hash: String,
+    pub embedding: Vec<f32>,
+    pub norm: f32,
+    pub created_at_ms: i64,
+}
+
+/// Outcome of a bulk-seed call ([`seed_chunk_holes`]). `statements` is
+/// logging-only (how many batched `INSERT` statements it took), never a
+/// pass/fail gate.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SeedOutcome {
+    pub rows_inserted: u64,
+    pub rows_conflicted: u64,
+    pub statements: u64,
+}
+
+/// Row cap per batched `INSERT` statement in [`seed_chunk_holes`]. Each row
+/// binds 5 parameters, so 1,000 rows is 5,000 bound values per statement --
+/// comfortably under SQLite's compiled-in variable limit on any build this
+/// crate targets, with headroom to spare (unlike, say, 250,001 rows in one
+/// statement, which the T4 mutation test drives past that limit on purpose).
+const CHUNK_HOLES_BATCH_ROWS: usize = 1_000;
+
+/// Row cap per batched `IN (...)` statement for the plain lookup/delete
+/// helpers below ([`collect_chunk_ids_for_messages`] and friends) -- same
+/// motivation as [`CHUNK_HOLES_BATCH_ROWS`], smaller because these bind one
+/// parameter per row (plus a fixed few) rather than five.
+const IN_CLAUSE_BATCH_ROWS: usize = 500;
+
+fn in_clause_placeholders(n: usize) -> String {
+    vec!["?"; n].join(",")
+}
+
+/// Bulk-seed `chunk_holes` for `generation_id` from a caller-supplied list
+/// of `(message_id, chunk_idx)` pairs (the [`crate::search::eligibility::
+/// ExpectedChunk`] key), batching at [`CHUNK_HOLES_BATCH_ROWS`] rows per
+/// statement. Each statement is `INSERT ... ON CONFLICT(generation_id,
+/// message_id, chunk_idx) DO NOTHING RETURNING message_id` -- idempotent
+/// (a hole already registered is silently skipped, not duplicated or
+/// errored), and `rows_inserted` is counted from the `RETURNING` set
+/// itself (only genuinely-inserted rows appear there), not inferred from a
+/// changed-row count that conflicts would also perturb.
+pub fn seed_chunk_holes(
+    tx: &Tx,
+    generation_id: i64,
+    holes: &[(i64, u32)],
+    detected_at_ms: i64,
+    reason: &str,
+) -> Result<SeedOutcome, StorageError> {
+    let mut outcome = SeedOutcome::default();
+    for batch in holes.chunks(CHUNK_HOLES_BATCH_ROWS) {
+        if batch.is_empty() {
+            continue;
+        }
+        let mut sql = String::from(
+            "INSERT INTO chunk_holes (generation_id, message_id, chunk_idx, detected_at, reason) VALUES ",
+        );
+        let mut params_vec: Vec<Value> = Vec::with_capacity(batch.len() * 5);
+        for (i, (message_id, chunk_idx)) in batch.iter().enumerate() {
+            if i > 0 {
+                sql.push(',');
+            }
+            sql.push_str("(?,?,?,?,?)");
+            params_vec.push(Value::from(generation_id));
+            params_vec.push(Value::from(*message_id));
+            params_vec.push(Value::from(*chunk_idx));
+            params_vec.push(Value::from(detected_at_ms));
+            params_vec.push(Value::from(reason.to_string()));
+        }
+        sql.push_str(
+            " ON CONFLICT(generation_id, message_id, chunk_idx) DO NOTHING RETURNING message_id",
+        );
+        let returned: Vec<i64> = tx.query_all_map(&sql, &params_vec, |row| row.get_typed(0))?;
+        outcome.rows_inserted += returned.len() as u64;
+        outcome.rows_conflicted += (batch.len() - returned.len()) as u64;
+        outcome.statements += 1;
+    }
+    Ok(outcome)
+}
+
+/// Register holes for `expected`'s `(message_id, chunk_idx)` keys against
+/// every currently active-or-pending generation (`is_active = 1 OR
+/// audit_status = 'pending'`) -- a message content change or a brand-new
+/// message needs its expected chunks re-embedded under whichever
+/// generation(s) are still live, not just the one the caller happens to be
+/// thinking about. No-op (`SeedOutcome::default()`) when there is no such
+/// generation, or `expected` is empty.
+pub fn register_chunk_holes_for_message_in_tx(
+    tx: &Tx,
+    expected: &[crate::search::eligibility::ExpectedChunk],
+    detected_at_ms: i64,
+    reason: &str,
+) -> Result<SeedOutcome, StorageError> {
+    if expected.is_empty() {
+        return Ok(SeedOutcome::default());
+    }
+    let generation_ids: Vec<i64> = tx.query_all_map(
+        "SELECT id FROM embedding_generations WHERE is_active = 1 OR audit_status = 'pending'",
+        &[],
+        |row| row.get_typed(0),
+    )?;
+    if generation_ids.is_empty() {
+        return Ok(SeedOutcome::default());
+    }
+    let holes: Vec<(i64, u32)> = expected.iter().map(|c| (c.message_id, c.chunk_idx)).collect();
+    let mut outcome = SeedOutcome::default();
+    for generation_id in generation_ids {
+        let o = seed_chunk_holes(tx, generation_id, &holes, detected_at_ms, reason)?;
+        outcome.rows_inserted += o.rows_inserted;
+        outcome.rows_conflicted += o.rows_conflicted;
+        outcome.statements += o.statements;
+    }
+    Ok(outcome)
+}
+
+/// `chunk_id`s of every `message_chunks` row for `generation_id` whose
+/// `message_id` is in `message_ids`. Read-only; batched at
+/// [`IN_CLAUSE_BATCH_ROWS`].
+pub fn collect_chunk_ids_for_messages(
+    tx: &Tx,
+    generation_id: i64,
+    message_ids: &[i64],
+) -> Result<Vec<i64>, StorageError> {
+    let mut ids = Vec::new();
+    for batch in message_ids.chunks(IN_CLAUSE_BATCH_ROWS) {
+        if batch.is_empty() {
+            continue;
+        }
+        let placeholders = in_clause_placeholders(batch.len());
+        let sql = format!(
+            "SELECT chunk_id FROM message_chunks WHERE generation_id = ? AND message_id IN ({placeholders})"
+        );
+        let mut params_vec: Vec<Value> = Vec::with_capacity(batch.len() + 1);
+        params_vec.push(Value::from(generation_id));
+        for id in batch {
+            params_vec.push(Value::from(*id));
+        }
+        let mut page: Vec<i64> = tx.query_all_map(&sql, &params_vec, |row| row.get_typed(0))?;
+        ids.append(&mut page);
+    }
+    Ok(ids)
+}
+
+/// Delete `message_chunks` rows by `chunk_id`. Returns the number of rows
+/// actually deleted.
+pub fn delete_chunks_by_ids_in_tx(tx: &Tx, chunk_ids: &[i64]) -> Result<u64, StorageError> {
+    let mut deleted = 0u64;
+    for batch in chunk_ids.chunks(IN_CLAUSE_BATCH_ROWS) {
+        if batch.is_empty() {
+            continue;
+        }
+        let placeholders = in_clause_placeholders(batch.len());
+        let sql = format!("DELETE FROM message_chunks WHERE chunk_id IN ({placeholders})");
+        let params_vec: Vec<Value> = batch.iter().map(|id| Value::from(*id)).collect();
+        deleted += tx.execute(&sql, &params_vec)? as u64;
+    }
+    Ok(deleted)
+}
+
+/// Delete `chunk_holes` rows for `generation_id` whose `message_id` is in
+/// `message_ids`. Returns the number of rows actually deleted.
+pub fn delete_chunk_holes_for_messages_in_tx(
+    tx: &Tx,
+    generation_id: i64,
+    message_ids: &[i64],
+) -> Result<u64, StorageError> {
+    let mut deleted = 0u64;
+    for batch in message_ids.chunks(IN_CLAUSE_BATCH_ROWS) {
+        if batch.is_empty() {
+            continue;
+        }
+        let placeholders = in_clause_placeholders(batch.len());
+        let sql = format!(
+            "DELETE FROM chunk_holes WHERE generation_id = ? AND message_id IN ({placeholders})"
+        );
+        let mut params_vec: Vec<Value> = Vec::with_capacity(batch.len() + 1);
+        params_vec.push(Value::from(generation_id));
+        for id in batch {
+            params_vec.push(Value::from(*id));
+        }
+        deleted += tx.execute(&sql, &params_vec)? as u64;
+    }
+    Ok(deleted)
+}
+
+/// Delete `chunk_staging` rows for `generation_id` whose `message_id` is in
+/// `message_ids`. Returns the number of rows actually deleted.
+pub fn delete_staging_for_messages_in_tx(
+    tx: &Tx,
+    generation_id: i64,
+    message_ids: &[i64],
+) -> Result<u64, StorageError> {
+    let mut deleted = 0u64;
+    for batch in message_ids.chunks(IN_CLAUSE_BATCH_ROWS) {
+        if batch.is_empty() {
+            continue;
+        }
+        let placeholders = in_clause_placeholders(batch.len());
+        let sql = format!(
+            "DELETE FROM chunk_staging WHERE generation_id = ? AND message_id IN ({placeholders})"
+        );
+        let mut params_vec: Vec<Value> = Vec::with_capacity(batch.len() + 1);
+        params_vec.push(Value::from(generation_id));
+        for id in batch {
+            params_vec.push(Value::from(*id));
+        }
+        deleted += tx.execute(&sql, &params_vec)? as u64;
+    }
+    Ok(deleted)
+}
+
+/// Insert one row directly into `message_chunks` (bypassing staging --
+/// callers that already know the row is final, e.g. a first-time embed with
+/// no reuse candidate). Returns the new `chunk_id`.
+pub fn insert_chunk_row_in_tx(tx: &Tx, row: &ChunkRow) -> Result<i64, StorageError> {
+    let blob = f32_vector_to_le_blob(&row.embedding);
+    tx.execute(
+        "INSERT INTO message_chunks \
+         (generation_id, message_id, conversation_id, chunk_idx, byte_start, byte_end, content_hash, embedding, norm, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        &params![
+            row.generation_id,
+            row.message_id,
+            row.conversation_id,
+            row.chunk_idx,
+            row.byte_start as i64,
+            row.byte_end as i64,
+            row.content_hash.clone(),
+            blob,
+            f64::from(row.norm),
+            row.created_at_ms
+        ],
+    )?;
+    Ok(tx.last_insert_rowid())
+}
+
+/// Insert `rows` into `chunk_staging` under `batch_id` (a caller-chosen
+/// grouping id -- `move_staging_to_chunks_in_tx` deliberately ignores it and
+/// moves by explicit `(message_id, chunk_idx)` key instead, so a batch_id
+/// collision or a caller that never learns the batch_id back is harmless).
+/// Returns the number of rows inserted.
+pub fn stage_chunk_rows_in_tx(tx: &Tx, batch_id: i64, rows: &[ChunkRow]) -> Result<u64, StorageError> {
+    let mut inserted = 0u64;
+    for row in rows {
+        let blob = f32_vector_to_le_blob(&row.embedding);
+        let changed = tx.execute(
+            "INSERT INTO chunk_staging \
+             (batch_id, generation_id, message_id, conversation_id, chunk_idx, byte_start, byte_end, content_hash, embedding, norm, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            &params![
+                batch_id,
+                row.generation_id,
+                row.message_id,
+                row.conversation_id,
+                row.chunk_idx,
+                row.byte_start as i64,
+                row.byte_end as i64,
+                row.content_hash.clone(),
+                blob,
+                f64::from(row.norm),
+                row.created_at_ms
+            ],
+        )?;
+        inserted += changed as u64;
+    }
+    Ok(inserted)
+}
+
+/// Move staged rows into `message_chunks` by explicit `(message_id,
+/// chunk_idx)` key -- **not** by `batch_id`: a key may have been staged in
+/// an earlier batch than the one that happens to trigger the move (e.g. a
+/// reuse candidate discovered later), and moving by key handles that
+/// uniformly. A key with nothing currently staged is silently skipped (not
+/// an error -- the caller's expected-chunk list and what's actually staged
+/// are allowed to diverge; this only moves what it finds). Same transaction
+/// also deletes the moved row's `chunk_staging` row and any matching
+/// `chunk_holes` row (the hole this chunk was filling is now resolved).
+/// Returns the new `chunk_id` for each key that had something staged, in
+/// the order `keys` were given (not necessarily the same length as `keys`).
+pub fn move_staging_to_chunks_in_tx(
+    tx: &Tx,
+    generation_id: i64,
+    keys: &[(i64, u32)],
+) -> Result<Vec<i64>, StorageError> {
+    let mut new_chunk_ids = Vec::with_capacity(keys.len());
+    for &(message_id, chunk_idx) in keys {
+        let staged: Option<(i64, i64, i64, String, Vec<u8>, f64, i64)> = tx.query_opt_map(
+            "SELECT conversation_id, byte_start, byte_end, content_hash, embedding, norm, created_at \
+             FROM chunk_staging WHERE generation_id = ?1 AND message_id = ?2 AND chunk_idx = ?3",
+            &params![generation_id, message_id, chunk_idx],
+            |row| {
+                Ok((
+                    row.get_typed::<i64>(0)?,
+                    row.get_typed::<i64>(1)?,
+                    row.get_typed::<i64>(2)?,
+                    row.get_typed::<String>(3)?,
+                    row.get_typed::<Vec<u8>>(4)?,
+                    row.get_typed::<f64>(5)?,
+                    row.get_typed::<i64>(6)?,
+                ))
+            },
+        )?;
+
+        let Some((conversation_id, byte_start, byte_end, content_hash, embedding, norm, created_at)) =
+            staged
+        else {
+            continue;
+        };
+
+        tx.execute(
+            "INSERT INTO message_chunks \
+             (generation_id, message_id, conversation_id, chunk_idx, byte_start, byte_end, content_hash, embedding, norm, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            &params![
+                generation_id,
+                message_id,
+                conversation_id,
+                chunk_idx,
+                byte_start,
+                byte_end,
+                content_hash,
+                embedding,
+                norm,
+                created_at
+            ],
+        )?;
+        new_chunk_ids.push(tx.last_insert_rowid());
+
+        tx.execute(
+            "DELETE FROM chunk_staging WHERE generation_id = ?1 AND message_id = ?2 AND chunk_idx = ?3",
+            &params![generation_id, message_id, chunk_idx],
+        )?;
+        tx.execute(
+            "DELETE FROM chunk_holes WHERE generation_id = ?1 AND message_id = ?2 AND chunk_idx = ?3",
+            &params![generation_id, message_id, chunk_idx],
+        )?;
+    }
+    Ok(new_chunk_ids)
+}
+
+/// Which of `expected`'s chunks already have a matching staged row for
+/// `generation_id` -- a match requires **both** `content_hash` and span
+/// (`byte_start`/`byte_end`) to agree with the staged row at that
+/// `(message_id, chunk_idx)` key, not just the hash (two different spans
+/// can coincidentally hash the same short prefix/suffix under a weaker
+/// check; span is part of `ExpectedChunk`'s own identity, see
+/// `expected_chunk_equality_includes_span` in `eligibility.rs`). A matched
+/// row is a genuine reuse candidate: the caller does *not* need to
+/// re-embed it, only call [`move_staging_to_chunks_in_tx`] with the
+/// returned keys. Does not modify `batch_id` or anything else about the
+/// staged row.
+pub fn find_reusable_staging_in_tx(
+    tx: &Tx,
+    generation_id: i64,
+    expected: &[crate::search::eligibility::ExpectedChunk],
+) -> Result<Vec<(i64, u32)>, StorageError> {
+    let mut reusable = Vec::new();
+    for chunk in expected {
+        let matched: Option<i64> = tx.query_opt_map(
+            "SELECT 1 FROM chunk_staging \
+             WHERE generation_id = ?1 AND message_id = ?2 AND chunk_idx = ?3 \
+               AND content_hash = ?4 AND byte_start = ?5 AND byte_end = ?6",
+            &params![
+                generation_id,
+                chunk.message_id,
+                chunk.chunk_idx,
+                chunk.content_hash.clone(),
+                chunk.byte_start as i64,
+                chunk.byte_end as i64
+            ],
+            |row| row.get_typed(0),
+        )?;
+        if matched.is_some() {
+            reusable.push((chunk.message_id, chunk.chunk_idx));
+        }
+    }
+    Ok(reusable)
+}
+
+/// Delete every `chunk_staging` row for `generation_id` whose
+/// `(message_id, chunk_idx)` key is **not** in `keep` -- staged rows a
+/// re-plan decided it no longer wants (e.g. the message's content changed
+/// again before the stale staged embedding was ever moved into
+/// `message_chunks`). Returns the number of rows deleted.
+pub fn purge_stale_staging_in_tx(
+    tx: &Tx,
+    generation_id: i64,
+    keep: &[(i64, u32)],
+) -> Result<u64, StorageError> {
+    let all_keys: Vec<(i64, u32)> = tx.query_all_map(
+        "SELECT message_id, chunk_idx FROM chunk_staging WHERE generation_id = ?1",
+        &params![generation_id],
+        |row| Ok((row.get_typed::<i64>(0)?, row.get_typed::<u32>(1)?)),
+    )?;
+    let keep_set: std::collections::HashSet<(i64, u32)> = keep.iter().copied().collect();
+    let mut deleted = 0u64;
+    for (message_id, chunk_idx) in all_keys {
+        if !keep_set.contains(&(message_id, chunk_idx)) {
+            deleted += tx.execute(
+                "DELETE FROM chunk_staging WHERE generation_id = ?1 AND message_id = ?2 AND chunk_idx = ?3",
+                &params![generation_id, message_id, chunk_idx],
+            )? as u64;
+        }
+    }
+    Ok(deleted)
+}
+
+/// Delete one specific `chunk_holes` row (the hole for `message_id`'s
+/// `chunk_idx` under `generation_id` was resolved by some means other than
+/// [`move_staging_to_chunks_in_tx`], which already deletes the hole itself
+/// as part of its own transaction). Returns the number of rows deleted (`0`
+/// or `1`).
+pub fn write_off_chunk_hole_in_tx(
+    tx: &Tx,
+    generation_id: i64,
+    message_id: i64,
+    chunk_idx: u32,
+) -> Result<u64, StorageError> {
+    let changed = tx.execute(
+        "DELETE FROM chunk_holes WHERE generation_id = ?1 AND message_id = ?2 AND chunk_idx = ?3",
+        &params![generation_id, message_id, chunk_idx],
+    )?;
+    Ok(changed as u64)
+}
+
+/// Delete every `message_chunks` row for `generation_id`+`message_id` whose
+/// `(chunk_idx, byte_start, byte_end, content_hash)` does not exactly match
+/// one of `expected`'s chunks for that same `message_id` -- content changed
+/// underneath an existing chunk set (different chunking, different
+/// content_hash, or a shrunk/grown chunk count) leaves stale chunks behind
+/// that must go, not linger indexed under a hash/span the current content
+/// no longer produces. Any single field mismatch is enough to drop the row
+/// (span-aware: two chunks with the same `content_hash` but a different
+/// span, e.g. from a chunking-policy edge-case shift, are NOT the same
+/// chunk). Returns the deleted `chunk_id`s.
+pub fn prune_chunks_not_in_expected_in_tx(
+    tx: &Tx,
+    generation_id: i64,
+    message_id: i64,
+    expected: &[crate::search::eligibility::ExpectedChunk],
+) -> Result<Vec<i64>, StorageError> {
+    let existing: Vec<(i64, u32, i64, i64, String)> = tx.query_all_map(
+        "SELECT chunk_id, chunk_idx, byte_start, byte_end, content_hash FROM message_chunks \
+         WHERE generation_id = ?1 AND message_id = ?2",
+        &params![generation_id, message_id],
+        |row| {
+            Ok((
+                row.get_typed::<i64>(0)?,
+                row.get_typed::<u32>(1)?,
+                row.get_typed::<i64>(2)?,
+                row.get_typed::<i64>(3)?,
+                row.get_typed::<String>(4)?,
+            ))
+        },
+    )?;
+
+    let expected_set: std::collections::HashSet<(u32, i64, i64, &str)> = expected
+        .iter()
+        .filter(|c| c.message_id == message_id)
+        .map(|c| (c.chunk_idx, c.byte_start as i64, c.byte_end as i64, c.content_hash.as_str()))
+        .collect();
+
+    let mut pruned = Vec::new();
+    for (chunk_id, chunk_idx, byte_start, byte_end, content_hash) in existing {
+        let key = (chunk_idx, byte_start, byte_end, content_hash.as_str());
+        if !expected_set.contains(&key) {
+            tx.execute("DELETE FROM message_chunks WHERE chunk_id = ?1", &params![chunk_id])?;
+            pruned.push(chunk_id);
+        }
+    }
+    Ok(pruned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1327,43 +1940,69 @@ mod tests {
         );
     }
 
-    /// Guards against the two DDL copies (`FRESH_SCHEMA_DDL`'s tail and
-    /// `V4_VECTOR_DOMAIN_DDL`) silently drifting apart — see both constants'
-    /// doc comments for why they are duplicated instead of shared.
+    /// **Retired by T4 (plan v5.1), replaced by
+    /// `fresh_schema_ddl_v4_message_embeddings_and_holes_survive_verbatim_into_v5`
+    /// below.** The premise this test checked -- `FRESH_SCHEMA_DDL`'s tail is
+    /// byte-for-byte identical to `V4_VECTOR_DOMAIN_DDL` as a whole -- is now
+    /// false by design: T4 adds two `NOT NULL` columns to
+    /// `embedding_generations` (`chunking_policy_version`/`fingerprint`) and
+    /// appends the new `message_chunks`/`chunk_holes`/`chunk_staging` tables
+    /// after it, so `FRESH_SCHEMA_DDL` no longer ends with
+    /// `V4_VECTOR_DOMAIN_DDL`'s exact text, nor does that text appear
+    /// anywhere else in `FRESH_SCHEMA_DDL` (the `embedding_generations`
+    /// statement itself now differs). `V4_VECTOR_DOMAIN_DDL` stays frozen as
+    /// the historical v4 shape (still used below to hand-build pre-v5
+    /// database fixtures for the `SchemaRebuildRequired` tests), but the
+    /// specific "whole-blob tail match" guarantee it used to enforce is gone.
     #[test]
-    fn fresh_schema_ddl_tail_matches_v4_vector_domain_migration_ddl() {
-        assert!(
-            FRESH_SCHEMA_DDL.trim_end().ends_with(V4_VECTOR_DOMAIN_DDL.trim()),
-            "FRESH_SCHEMA_DDL's final statements must be byte-for-byte identical to \
-             V4_VECTOR_DOMAIN_DDL (the version 3 -> 4 migration applies exactly this text to \
-             a pre-existing database, and it must produce the same vector-domain shape a \
-             fresh build gets)"
-        );
+    fn fresh_schema_ddl_v4_message_embeddings_and_holes_survive_verbatim_into_v5() {
+        for stmt in V4_VECTOR_DOMAIN_DDL.trim().split(';').map(str::trim).filter(|s| !s.is_empty()) {
+            if stmt.contains("message_embeddings") || stmt.contains("embedding_holes") {
+                assert!(
+                    FRESH_SCHEMA_DDL.contains(stmt),
+                    "FRESH_SCHEMA_DDL must still contain this v4 statement verbatim -- T4 keeps \
+                     message_embeddings/embedding_holes unchanged until T11 deletes them: {stmt}"
+                );
+            }
+        }
     }
 
-    /// w2 Task W2-3 Step 4 (R1-X-N1): opening a real wave-1-shaped database
-    /// (`user_version = 1`, no `lex_docs`/`fts_lex`) must not leave it behind
-    /// -- `ensure` must add the new domain and advance to version 2,
-    /// idempotently (a second `ensure` call, or a retry after an interrupted
-    /// first attempt, must not fail or duplicate anything).
+    /// Slice `FRESH_SCHEMA_DDL` at the first byte of the given anchor
+    /// statement's `CREATE TABLE` marker, returning everything strictly
+    /// before it. T4 (plan v5.1): replaces the old
+    /// `strip_suffix(V4_VECTOR_DOMAIN_DDL.trim())`/
+    /// `strip_suffix(V2_LEX_DOMAIN_DDL.trim())` technique the three
+    /// `ensure_migrates_*` fixtures below used to hand-build pre-v5 database
+    /// shapes -- that technique required `FRESH_SCHEMA_DDL`'s tail to be
+    /// byte-identical to the migration DDL constants, which T4 breaks
+    /// (`embedding_generations` gained two columns, so it no longer matches
+    /// `V4_VECTOR_DOMAIN_DDL`'s copy). Anchoring on a stable, unchanged table
+    /// name instead works regardless of what changed after that point.
+    fn fresh_schema_ddl_before_table_for_test(table_name: &str) -> &'static str {
+        let anchor = format!("CREATE TABLE IF NOT EXISTS {table_name} ");
+        FRESH_SCHEMA_DDL
+            .split_once(&anchor)
+            .unwrap_or_else(|| panic!("FRESH_SCHEMA_DDL must contain a `{anchor}` statement"))
+            .0
+    }
+
+    /// w2 Task W2-3 Step 4 (R1-X-N1), **rewritten by T4 (plan v5.1)**: v5 is
+    /// rebuild-only (Global Constraints + T4 `ensure()` contract) -- a
+    /// pre-existing version-1 database (`user_version = 1`, no
+    /// `lex_docs`/`fts_lex`) is no longer incrementally migrated forward.
+    /// `ensure` must reject it with `SchemaRebuildRequired{found: 1,
+    /// required: CURRENT_SCHEMA_VERSION}` and leave the database's table set
+    /// untouched (no partial DDL applied).
     #[test]
-    fn ensure_migrates_a_wave1_database_to_the_lex_domain_and_is_idempotent() {
+    fn ensure_rejects_a_wave1_database_with_schema_rebuild_required() {
         let (_dir, path) = scratch_db_path();
         let conn = open_sqlite_writer(&path);
 
         // Build a version-1 shape directly (the pre-W2-2 DDL: everything up
         // to and including fts_messages -- the legacy FTS5 shadow a real
         // wave-1 database still had -- but not lex_docs/fts_lex, and not the
-        // w3 vector domain either). Strip the tails in the order they were
-        // appended: V4 (newest) first, then V2.
-        let v3_shape_ddl = FRESH_SCHEMA_DDL
-            .trim_end()
-            .strip_suffix(V4_VECTOR_DOMAIN_DDL.trim())
-            .expect("FRESH_SCHEMA_DDL must end with V4_VECTOR_DOMAIN_DDL's text");
-        let v1_ddl = v3_shape_ddl
-            .trim_end()
-            .strip_suffix(V2_LEX_DOMAIN_DDL.trim())
-            .expect("FRESH_SCHEMA_DDL minus the vector domain must end with V2_LEX_DOMAIN_DDL's text");
+        // vector/chunk domains either).
+        let v1_ddl = fresh_schema_ddl_before_table_for_test("lex_docs");
         conn.execute_batch(v1_ddl).unwrap();
         conn.execute_batch(LEGACY_FTS_MESSAGES_DDL_FOR_TEST).unwrap();
         conn.execute_batch(&set_user_version_sql(1)).unwrap();
@@ -1377,52 +2016,24 @@ mod tests {
             "sanity: a real wave-1 database still had fts_messages"
         );
 
-        ensure(&conn).expect("ensure must migrate a version-1 database forward");
-        assert_eq!(read_user_version(&conn).unwrap(), CURRENT_SCHEMA_VERSION);
-        let names = table_names(&conn);
-        assert!(names.contains(&"lex_docs".to_string()));
-        assert!(names.contains(&"fts_lex_data".to_string()));
-        // W2-6 Task戊: a database more than one version behind must catch
-        // all the way up in a single `ensure` call -- fts_messages must be
-        // dropped too, not just the version 1->2 lex_docs add applied.
+        let err = ensure(&conn).expect_err("ensure must reject a version-1 database, not migrate it");
         assert!(
-            !names.contains(&"fts_messages".to_string()),
-            "a version-1 database must also get the version 2->3 fts_messages drop"
+            matches!(err, StorageError::SchemaRebuildRequired { found: 1, required: CURRENT_SCHEMA_VERSION }),
+            "expected SchemaRebuildRequired{{found: 1, required: {CURRENT_SCHEMA_VERSION}}}, got {err:?}"
         );
-        // w3 Task W3-1 (plan ⑥ "vN->latest e2e"): a version-1 database more
-        // than one migration step behind must also land the vector domain
-        // added at version 4 -- this is the v1->4 end-to-end case.
-        assert!(
-            names.contains(&"embedding_generations".to_string()),
-            "a version-1 database must also get the version 3->4 vector domain add"
-        );
-        assert!(names.contains(&"message_embeddings".to_string()));
-        assert!(names.contains(&"embedding_holes".to_string()));
-
-        // Idempotent: a second call (simulating either a deliberate re-run or
-        // recovery after an interrupted first migration) must not fail.
-        ensure(&conn).expect("a second ensure call on an already-migrated database must be a no-op");
-        assert_eq!(read_user_version(&conn).unwrap(), CURRENT_SCHEMA_VERSION);
-        assert_eq!(table_names(&conn), names, "re-running the migration must not change the table set");
+        assert_eq!(read_user_version(&conn).unwrap(), 1, "a rejected ensure call must not touch user_version");
+        assert_eq!(table_names(&conn), v1_names, "a rejected ensure call must not apply any DDL");
     }
 
-    /// W2-6 Task戊: a version-2 database (the `lex_docs`/`fts_lex` domain
-    /// already added by the version 1->2 step, but `fts_messages` not yet
-    /// dropped -- the shape every real database had right up until this
-    /// task) must get `fts_messages` dropped and land on version 3,
-    /// idempotently.
+    /// W2-6 Task戊, **rewritten by T4 (plan v5.1)**: a version-2 database
+    /// (the `lex_docs`/`fts_lex` domain already added, `fts_messages` not
+    /// yet dropped) is likewise rejected outright now, not migrated.
     #[test]
-    fn ensure_migrates_a_wave2_database_by_dropping_fts_messages_and_is_idempotent() {
+    fn ensure_rejects_a_wave2_database_with_schema_rebuild_required() {
         let (_dir, path) = scratch_db_path();
         let conn = open_sqlite_writer(&path);
 
-        // A real wave-2 database predates the w3 vector domain (added at
-        // version 4) -- strip it off `FRESH_SCHEMA_DDL` before using it as
-        // this fixture's base, same reasoning as the v1 fixture above.
-        let v3_shape_ddl = FRESH_SCHEMA_DDL
-            .trim_end()
-            .strip_suffix(V4_VECTOR_DOMAIN_DDL.trim())
-            .expect("FRESH_SCHEMA_DDL must end with V4_VECTOR_DOMAIN_DDL's text");
+        let v3_shape_ddl = fresh_schema_ddl_before_table_for_test("embedding_generations");
         conn.execute_batch(v3_shape_ddl).unwrap();
         conn.execute_batch(LEGACY_FTS_MESSAGES_DDL_FOR_TEST).unwrap();
         conn.execute_batch(&set_user_version_sql(2)).unwrap();
@@ -1436,54 +2047,27 @@ mod tests {
             "sanity: the hand-built v2 shape must not already have the vector domain"
         );
 
-        ensure(&conn).expect("ensure must migrate a version-2 database forward");
-        assert_eq!(read_user_version(&conn).unwrap(), CURRENT_SCHEMA_VERSION);
-        let names = table_names(&conn);
+        let err = ensure(&conn).expect_err("ensure must reject a version-2 database, not migrate it");
         assert!(
-            !names.contains(&"fts_messages".to_string()),
-            "fts_messages must be dropped"
+            matches!(err, StorageError::SchemaRebuildRequired { found: 2, required: CURRENT_SCHEMA_VERSION }),
+            "expected SchemaRebuildRequired{{found: 2, required: {CURRENT_SCHEMA_VERSION}}}, got {err:?}"
         );
-        assert!(
-            !names.contains(&"fts_messages_data".to_string()),
-            "fts_messages's FTS5 shadow tables must be dropped along with it"
-        );
-        assert!(
-            names.contains(&"lex_docs".to_string()),
-            "the fts_messages drop must not touch the unrelated lex_docs/fts_lex domain"
-        );
-        // w3 Task W3-1: a version-2 database must also get the version 3->4
-        // vector domain add (a single `ensure` call catches all the way up).
-        assert!(names.contains(&"embedding_generations".to_string()));
-        assert!(names.contains(&"message_embeddings".to_string()));
-        assert!(names.contains(&"embedding_holes".to_string()));
-
-        // Idempotent: a second call (simulating either a deliberate re-run or
-        // recovery after an interrupted first migration) must not fail.
-        ensure(&conn).expect("a second ensure call on an already-migrated database must be a no-op");
-        assert_eq!(read_user_version(&conn).unwrap(), CURRENT_SCHEMA_VERSION);
-        assert_eq!(table_names(&conn), names, "re-running the migration must not change the table set");
+        assert_eq!(read_user_version(&conn).unwrap(), 2);
+        assert_eq!(table_names(&conn), v2_names, "a rejected ensure call must not apply any DDL");
     }
 
-    /// w3 Task W3-1 Step 2b (R1-X-N1 + w3-d6②, "与波2同款"): open a real
-    /// wave-2-terminal-state database at `user_version = 3` (the shape every
-    /// real database produced before this task -- `FRESH_SCHEMA_DDL` minus
-    /// the vector-domain tail, exactly what the pre-W3-1 production
-    /// `ensure` wrote for a fresh build) and assert the upgrade path lands
-    /// the vector domain and reaches `CURRENT_SCHEMA_VERSION`, idempotently.
-    /// This is the "波间升级" case the plan calls out distinctly from the
-    /// v1/v2 hand-built fixtures above: it is byte-identical production DDL
-    /// (not a re-derived subset), i.e. exactly what real wave-2 databases
-    /// (like the w3 staging snapshot, itself confirmed `user_version = 3`)
-    /// look like schema-wise.
+    /// w3 Task W3-1 Step 2b, **rewritten by T4 (plan v5.1)**: a real
+    /// wave-2-terminal-state database at `user_version = 3` (byte-identical
+    /// production DDL, not a re-derived subset -- exactly what real wave-2
+    /// databases, like the w3 staging snapshot, look like schema-wise) is
+    /// likewise rejected outright now, not migrated forward to the vector
+    /// domain.
     #[test]
-    fn ensure_migrates_a_real_wave2_terminal_v3_database_to_the_vector_domain_and_is_idempotent() {
+    fn ensure_rejects_a_real_wave2_terminal_v3_database_with_schema_rebuild_required() {
         let (_dir, path) = scratch_db_path();
         let conn = open_sqlite_writer(&path);
 
-        let v3_ddl = FRESH_SCHEMA_DDL
-            .trim_end()
-            .strip_suffix(V4_VECTOR_DOMAIN_DDL.trim())
-            .expect("FRESH_SCHEMA_DDL must end with V4_VECTOR_DOMAIN_DDL's text");
+        let v3_ddl = fresh_schema_ddl_before_table_for_test("embedding_generations");
         conn.execute_batch(v3_ddl).unwrap();
         conn.execute_batch(&set_user_version_sql(3)).unwrap();
         let v3_names = table_names(&conn);
@@ -1500,23 +2084,76 @@ mod tests {
             "sanity: a real v3 database must not yet have the vector domain"
         );
 
-        ensure(&conn).expect("ensure must migrate a version-3 database forward");
-        assert_eq!(read_user_version(&conn).unwrap(), CURRENT_SCHEMA_VERSION);
-        let names = table_names(&conn);
-        assert!(names.contains(&"embedding_generations".to_string()));
-        assert!(names.contains(&"message_embeddings".to_string()));
-        assert!(names.contains(&"embedding_holes".to_string()));
-        assert!(names.contains(&"idx_embedding_generations_single_active".to_string()));
-        // The vector-domain add must not touch the pre-existing relational
-        // or lexical domains.
-        assert!(names.contains(&"lex_docs".to_string()));
-        assert!(names.contains(&"messages".to_string()));
+        let err = ensure(&conn).expect_err("ensure must reject a version-3 database, not migrate it");
+        assert!(
+            matches!(err, StorageError::SchemaRebuildRequired { found: 3, required: CURRENT_SCHEMA_VERSION }),
+            "expected SchemaRebuildRequired{{found: 3, required: {CURRENT_SCHEMA_VERSION}}}, got {err:?}"
+        );
+        assert_eq!(read_user_version(&conn).unwrap(), 3);
+        assert_eq!(table_names(&conn), v3_names, "a rejected ensure call must not apply any DDL");
+    }
 
-        // Idempotent: a second call (either a deliberate re-run or recovery
-        // after an interrupted first migration) must not fail or duplicate.
-        ensure(&conn).expect("a second ensure call on an already-migrated database must be a no-op");
-        assert_eq!(read_user_version(&conn).unwrap(), CURRENT_SCHEMA_VERSION);
-        assert_eq!(table_names(&conn), names, "re-running the migration must not change the table set");
+    /// T4 (plan v5.1): a version-4 database (the shape every real database
+    /// produced before this task -- `FRESH_SCHEMA_DDL`'s v4-era tail,
+    /// byte-identical production DDL) is likewise rejected, not migrated to
+    /// v5. The fourth case the parametrized
+    /// `schema_ensure_rejects_nonempty_user_version_0_1_2_3_4` test also
+    /// covers generically; kept here too for the same detailed table-shape
+    /// sanity checks the v1/v2/v3 siblings above have.
+    #[test]
+    fn ensure_rejects_a_v4_database_with_schema_rebuild_required() {
+        let (_dir, path) = scratch_db_path();
+        let conn = open_sqlite_writer(&path);
+
+        let v3_ddl = fresh_schema_ddl_before_table_for_test("embedding_generations");
+        conn.execute_batch(v3_ddl).unwrap();
+        conn.execute_batch(V4_VECTOR_DOMAIN_DDL).unwrap();
+        conn.execute_batch(&set_user_version_sql(4)).unwrap();
+        let v4_names = table_names(&conn);
+        assert!(v4_names.contains(&"embedding_generations".to_string()));
+        assert!(v4_names.contains(&"message_embeddings".to_string()));
+        assert!(v4_names.contains(&"embedding_holes".to_string()));
+        assert!(
+            !v4_names.contains(&"message_chunks".to_string()),
+            "sanity: the hand-built v4 shape must not already have the v5 chunk tables"
+        );
+
+        let err = ensure(&conn).expect_err("ensure must reject a version-4 database, not migrate it");
+        assert!(
+            matches!(err, StorageError::SchemaRebuildRequired { found: 4, required: CURRENT_SCHEMA_VERSION }),
+            "expected SchemaRebuildRequired{{found: 4, required: {CURRENT_SCHEMA_VERSION}}}, got {err:?}"
+        );
+        assert_eq!(read_user_version(&conn).unwrap(), 4);
+        assert_eq!(table_names(&conn), v4_names, "a rejected ensure call must not apply any DDL");
+    }
+
+    /// T4 (plan v5.1) Step 1: uniform, parametrized restatement of the four
+    /// detailed `ensure_rejects_*` siblings above (0-nonempty/1/2/3/4) --
+    /// deliberately doesn't inspect table shape at all (unlike the detailed
+    /// siblings), because `ensure`'s `1 <= version < CURRENT_SCHEMA_VERSION`
+    /// branch rejects on the bare version number alone, regardless of what
+    /// tables actually exist; this test's job is to prove exactly that
+    /// (no version in `{0-nonempty, 1, 2, 3, 4}` needs its real historical
+    /// shape to be rejected).
+    #[test]
+    fn schema_ensure_rejects_nonempty_user_version_0_1_2_3_4() {
+        for found in [0i64, 1, 2, 3, 4] {
+            let (_dir, path) = scratch_db_path();
+            let conn = open_sqlite_writer(&path);
+            conn.execute_batch("CREATE TABLE probe_marker (id INTEGER PRIMARY KEY);").unwrap();
+            conn.execute_batch(&set_user_version_sql(found)).unwrap();
+
+            let err = ensure(&conn)
+                .expect_err(&format!("ensure must reject a database at user_version={found}"));
+            assert!(
+                matches!(
+                    err,
+                    StorageError::SchemaRebuildRequired { found: f, required: CURRENT_SCHEMA_VERSION }
+                        if f == found
+                ),
+                "expected SchemaRebuildRequired{{found: {found}, required: {CURRENT_SCHEMA_VERSION}}}, got {err:?}"
+            );
+        }
     }
 
     #[test]
@@ -1665,8 +2302,14 @@ mod tests {
     /// down to 59 by W2-6 Task戊 removing the `fts_messages` statement, then
     /// up to 65 by w3 Task W3-1's `V4_VECTOR_DOMAIN_DDL` (6 statements:
     /// `embedding_generations` table + its single-active partial index,
-    /// `message_embeddings` table + 2 indexes, `embedding_holes` table).
-    const FRESH_SCHEMA_DDL_STATEMENT_COUNT_FOR_TEST: usize = 65;
+    /// `message_embeddings` table + 2 indexes, `embedding_holes` table),
+    /// then up to 71 by T4 (plan v5.1)'s chunk domain (6 statements:
+    /// `message_chunks` table + its 3 indexes, `chunk_holes` table,
+    /// `chunk_staging` table -- `embedding_generations`'s 2 new columns are
+    /// not a new statement, just a wider existing one). Verified against
+    /// `FRESH_SCHEMA_DDL.split(';').filter(...).count()` directly (not
+    /// hand-counted) each time this constant changed.
+    const FRESH_SCHEMA_DDL_STATEMENT_COUNT_FOR_TEST: usize = 71;
 
     /// The historical `fts_messages` DDL, byte-for-byte identical to the
     /// statement W2-6 Task戊 removed from [`FRESH_SCHEMA_DDL`]. A real

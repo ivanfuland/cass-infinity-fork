@@ -268,6 +268,152 @@ pub fn vec0_knn(
     )
 }
 
+// =============================================================================
+// T4 (plan v5.1) chunk-domain `vec0` primitives -- same one-table-per-
+// generation, rowid-keyed design as the v4 helpers above, but rowid =
+// `message_chunks.chunk_id` instead of `message_embeddings.doc_id`. Not
+// wired into any call site here (T5/T6/T8 do that).
+// =============================================================================
+
+/// Bidirectional identity-set anti-join between `message_chunks` and
+/// `generation_id`'s `vec0` table -- chunk-domain sibling of
+/// [`count_vec0_message_embeddings_set_mismatch_for_generation`] (same
+/// "same size != same set" discipline, see that function's doc comment).
+/// `vec0`'s `rowid` is `message_chunks.chunk_id` by construction
+/// ([`rebuild_vec0_table_for_generation_v5`]'s `INSERT INTO {table}(rowid,
+/// embedding)`), so a plain `NOT EXISTS` anti-join on `rowid = chunk_id` is
+/// exact. Returns `(missing_from_vec0, extra_in_vec0)`.
+pub fn count_vec0_chunks_set_mismatch_for_generation(
+    conn: &Conn,
+    generation_id: i64,
+) -> Result<(i64, i64), StorageError> {
+    validate_generation_id_for_ddl(generation_id)?;
+    let table = vec0_table_name(generation_id);
+    let missing_from_vec0: i64 = conn.query_row_map(
+        &format!(
+            "SELECT COUNT(*) FROM message_chunks mc \
+             WHERE mc.generation_id = ?1 \
+               AND NOT EXISTS (SELECT 1 FROM {table} v WHERE v.rowid = mc.chunk_id)"
+        ),
+        &params![generation_id],
+        |row| row.get_typed(0),
+    )?;
+    let extra_in_vec0: i64 = conn.query_row_map(
+        &format!(
+            "SELECT COUNT(*) FROM {table} v \
+             WHERE NOT EXISTS ( \
+                 SELECT 1 FROM message_chunks mc \
+                 WHERE mc.generation_id = ?1 AND mc.chunk_id = v.rowid \
+             )"
+        ),
+        &params![generation_id],
+        |row| row.get_typed(0),
+    )?;
+    Ok((missing_from_vec0, extra_in_vec0))
+}
+
+/// Rebuild `generation_id`'s `vec0` index from `message_chunks` in one
+/// transaction (drop + recreate + bulk-populate) -- chunk-domain sibling of
+/// [`rebuild_vec0_table_for_generation`], same atomicity discipline (an
+/// interruption anywhere leaves the generation's `vec0` table exactly as it
+/// was before the call). Returns the number of rows populated.
+pub fn rebuild_vec0_table_for_generation_v5(
+    conn: &Conn,
+    generation_id: i64,
+    dim: i64,
+) -> Result<usize, StorageError> {
+    validate_generation_id_for_ddl(generation_id)?;
+    if dim <= 0 {
+        return Err(reject(format!("dim must be positive, got {dim}")));
+    }
+    let table = vec0_table_name(generation_id);
+
+    conn.with_tx_no_replay(TxMode::Immediate, |tx| {
+        tx.execute_batch(&format!("DROP TABLE IF EXISTS {table};"))?;
+        tx.execute_batch(&format!(
+            "CREATE VIRTUAL TABLE {table} USING vec0(embedding float[{dim}] distance_metric=cosine);"
+        ))?;
+
+        let rows: Vec<(i64, Vec<u8>)> = tx.query_all_map(
+            "SELECT chunk_id, embedding FROM message_chunks WHERE generation_id = ?1",
+            &params![generation_id],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+        )?;
+
+        let insert_sql = format!("INSERT INTO {table}(rowid, embedding) VALUES (?1, ?2)");
+        for (chunk_id, embedding) in &rows {
+            tx.execute(&insert_sql, &[Value::from(*chunk_id), Value::from(embedding.clone())])?;
+        }
+
+        Ok(rows.len())
+    })
+}
+
+/// Insert `rows` (`(chunk_id, embedding_blob)` pairs) into `generation_id`'s
+/// `vec0` table -- the incremental-write counterpart to
+/// [`rebuild_vec0_table_for_generation_v5`]'s bulk rebuild, for a catch-up
+/// writer landing newly-embedded chunks one small batch at a time instead of
+/// re-populating the whole table. Returns the number of rows inserted.
+pub fn insert_vec0_rows_in_tx(
+    tx: &Tx,
+    generation_id: i64,
+    rows: &[(i64, &[u8])],
+) -> Result<u64, StorageError> {
+    validate_generation_id_for_ddl(generation_id)?;
+    let table = vec0_table_name(generation_id);
+    let insert_sql = format!("INSERT INTO {table}(rowid, embedding) VALUES (?1, ?2)");
+    let mut inserted = 0u64;
+    for (chunk_id, embedding) in rows {
+        tx.execute(&insert_sql, &[Value::from(*chunk_id), Value::from(embedding.to_vec())])?;
+        inserted += 1;
+    }
+    Ok(inserted)
+}
+
+/// Delete `chunk_ids` from `generation_id`'s `vec0` table -- the
+/// incremental-write counterpart for chunks that were pruned/deleted from
+/// `message_chunks` and must not linger in the derived index. Returns the
+/// number of rows deleted.
+pub fn delete_vec0_rows_in_tx(
+    tx: &Tx,
+    generation_id: i64,
+    chunk_ids: &[i64],
+) -> Result<u64, StorageError> {
+    validate_generation_id_for_ddl(generation_id)?;
+    let table = vec0_table_name(generation_id);
+    let delete_sql = format!("DELETE FROM {table} WHERE rowid = ?1");
+    let mut deleted = 0u64;
+    for chunk_id in chunk_ids {
+        deleted += tx.execute(&delete_sql, &params![*chunk_id])? as u64;
+    }
+    Ok(deleted)
+}
+
+/// Every `generation_id` with a live chunk-domain `vec0` table, discovered
+/// by real `sqlite_master` enumeration (never hardcoded) of tables whose
+/// name is *exactly* `vec_index_gen_<digits>` -- a strict, whole-name regex
+/// match (`^vec_index_gen_(\d+)$`), not a `LIKE 'vec_index_gen_%'` prefix
+/// scan followed by loose parsing, so `vec0`'s own shadow tables for the
+/// same generation (e.g. `..._info`, `..._chunks`, `..._rowids`) are never
+/// mistaken for a second, differently-shaped "generation". Deduplicated and
+/// returned in ascending order.
+pub fn list_vec0_generation_ids(conn: &Conn) -> Result<Vec<i64>, StorageError> {
+    let names: Vec<String> = conn.query_all_map(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'vec_index_gen_%' ORDER BY name",
+        &[],
+        |row| row.get_typed(0),
+    )?;
+    let pattern = regex::Regex::new(r"^vec_index_gen_(\d+)$").expect("static regex must compile");
+    let mut ids: Vec<i64> = names
+        .iter()
+        .filter_map(|name| pattern.captures(name))
+        .filter_map(|caps| caps.get(1).and_then(|m| m.as_str().parse::<i64>().ok()))
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(ids)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

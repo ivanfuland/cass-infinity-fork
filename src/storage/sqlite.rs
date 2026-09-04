@@ -3656,28 +3656,42 @@ CREATE INDEX IF NOT EXISTS idx_umd_workspace_day ON usage_models_daily(workspace
 CREATE INDEX IF NOT EXISTS idx_umd_source_day ON usage_models_daily(source_id, day_id);
 ";
 
-// R1-W3-N5: verbatim copy of `V4_VECTOR_DOMAIN_DDL`'s three-table shape
-// (`src/storage/schema.rs`) -- must stay byte-for-byte identical to that
-// source of truth, the same discipline the module doc comment there
-// already enforces between `FRESH_SCHEMA_DDL`'s tail and
-// `V2_LEX_DOMAIN_DDL`. `message_embeddings`/`embedding_holes` both
-// reference `embedding_generations`, so all three are one repair batch
-// (like `lex_domain`'s `lex_docs`+`fts_lex` pairing above), never
-// recreated independently of each other.
+// R1-W3-N5: originally a verbatim copy of `V4_VECTOR_DOMAIN_DDL`'s
+// three-table shape (`src/storage/schema.rs`). `message_embeddings`/
+// `embedding_holes` both reference `embedding_generations`, so all three
+// are one repair batch (like `lex_domain`'s `lex_docs`+`fts_lex` pairing
+// above), never recreated independently of each other.
 //
 // R2-N1: the "byte-for-byte identical" claim above was not actually
 // enforced by any test (unlike the lex_domain pairing, which has
 // `fresh_schema_ddl_tail_matches_v2_lex_domain_migration_ddl`) -- this SQL
-// had silently drifted from `V4_VECTOR_DOMAIN_DDL`, missing its
-// `idx_embedding_generations_single_active` unique partial index
-// entirely. A database that lost the vector_domain tables and got them
-// back through this repair path (as opposed to a fresh-build `ensure()`)
-// would have no DB-level guard against two `is_active=1` rows coexisting.
-// Restored here; `current_schema_repair_vector_domain_sql_creates_the_
-// single_active_unique_index` below is this repair batch's first-ever
-// index-presence probe.
+// had silently drifted from `V4_VECTOR_DOMAIN_DDL` once already, missing
+// its `idx_embedding_generations_single_active` unique partial index
+// entirely. Restored then; `current_schema_repair_vector_domain_sql_
+// creates_the_single_active_unique_index` below is this repair batch's
+// first-ever index-presence probe.
+//
+// T4 (plan v5.1): `embedding_generations` gained two `NOT NULL` columns
+// (`chunking_policy_version`/`fingerprint`) in `FRESH_SCHEMA_DDL`, and
+// `V4_VECTOR_DOMAIN_DDL` was deliberately frozen as historical v4-era text
+// (kept only to hand-build pre-v5 database fixtures for `schema::ensure`'s
+// `SchemaRebuildRequired` tests) -- from T4 on, this repair copy's source
+// of truth is `FRESH_SCHEMA_DDL`'s *current* `embedding_generations` shape,
+// not `V4_VECTOR_DOMAIN_DDL`'s frozen one; the two are expected to diverge.
+// Updated here (T4) to add the same two columns so a database whose vector
+// domain gets rebuilt through this repair path (as opposed to a fresh-build
+// `ensure()`) ends up with a schema-compatible `embedding_generations` --
+// a write through `schema::create_embedding_generation_v5`/the deprecated
+// legacy wrapper would otherwise fail with "no such column" against a
+// repaired table. Deliberately NOT extended to also (re)create
+// `message_chunks`/`chunk_holes`/`chunk_staging`: whether this self-heal
+// path should know about the v5 chunk domain at all is a T7/T11-scope
+// question (T11 must rewrite this whole constant when the v4 tables are
+// deleted; T7's catch-up path, if it ever relies on self-heal, decides
+// then), not a T4 one -- T4 only owns not leaving the pre-existing
+// `embedding_generations` repair broken by its own DDL change.
 const CURRENT_SCHEMA_REPAIR_VECTOR_DOMAIN_SQL: &str = r"
-CREATE TABLE IF NOT EXISTS embedding_generations (id INTEGER PRIMARY KEY AUTOINCREMENT, embedder_id TEXT NOT NULL, dim INTEGER NOT NULL CHECK (dim > 0), canonicalize_version INTEGER NOT NULL, byte_order TEXT NOT NULL DEFAULT 'le' CHECK (byte_order IN ('le', 'be')), audit_status TEXT NOT NULL DEFAULT 'pending' CHECK (audit_status IN ('pending', 'passed', 'failed')), is_active INTEGER NOT NULL DEFAULT 0 CHECK (is_active IN (0, 1)), created_at INTEGER NOT NULL, activated_at INTEGER);
+CREATE TABLE IF NOT EXISTS embedding_generations (id INTEGER PRIMARY KEY AUTOINCREMENT, embedder_id TEXT NOT NULL, dim INTEGER NOT NULL CHECK (dim > 0), canonicalize_version INTEGER NOT NULL, chunking_policy_version INTEGER NOT NULL, fingerprint BLOB NOT NULL, byte_order TEXT NOT NULL DEFAULT 'le' CHECK (byte_order IN ('le', 'be')), audit_status TEXT NOT NULL DEFAULT 'pending' CHECK (audit_status IN ('pending', 'passed', 'failed')), is_active INTEGER NOT NULL DEFAULT 0 CHECK (is_active IN (0, 1)), created_at INTEGER NOT NULL, activated_at INTEGER);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_embedding_generations_single_active ON embedding_generations(is_active) WHERE is_active = 1;
 CREATE TABLE IF NOT EXISTS message_embeddings (generation_id INTEGER NOT NULL REFERENCES embedding_generations (id), doc_id INTEGER NOT NULL REFERENCES messages (id) ON DELETE CASCADE, conversation_id INTEGER NOT NULL, embedding BLOB NOT NULL CHECK (length(embedding) % 4 = 0), norm REAL NOT NULL CHECK (norm > 0), content_hash TEXT NOT NULL, content_version INTEGER, created_at INTEGER NOT NULL, UNIQUE (generation_id, doc_id));
 CREATE INDEX IF NOT EXISTS idx_message_embeddings_generation ON message_embeddings(generation_id);
