@@ -389,20 +389,15 @@ pub fn delete_vec0_rows_in_tx(
     Ok(deleted)
 }
 
-/// Every `generation_id` with a live chunk-domain `vec0` table, discovered
-/// by real `sqlite_master` enumeration (never hardcoded) of tables whose
-/// name is *exactly* `vec_index_gen_<digits>` -- a strict, whole-name regex
-/// match (`^vec_index_gen_(\d+)$`), not a `LIKE 'vec_index_gen_%'` prefix
-/// scan followed by loose parsing, so `vec0`'s own shadow tables for the
-/// same generation (e.g. `..._info`, `..._chunks`, `..._rowids`) are never
+/// Shared strict-name-parsing half of `list_vec0_generation_ids`/
+/// `list_vec0_generation_ids_in_tx` (T6, plan v5.1): whole-name regex match
+/// (`^vec_index_gen_(\d+)$`), not a `LIKE 'vec_index_gen_%'` prefix scan
+/// followed by loose parsing, so `vec0`'s own shadow tables for the same
+/// generation (e.g. `..._info`, `..._chunks`, `..._rowids`) are never
 /// mistaken for a second, differently-shaped "generation". Deduplicated and
-/// returned in ascending order.
-pub fn list_vec0_generation_ids(conn: &Conn) -> Result<Vec<i64>, StorageError> {
-    let names: Vec<String> = conn.query_all_map(
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'vec_index_gen_%' ORDER BY name",
-        &[],
-        |row| row.get_typed(0),
-    )?;
+/// returned in ascending order. One regex compiled per caller-visible
+/// function, not duplicated as a second copy of the pattern string.
+fn parse_vec0_generation_table_names(names: &[String]) -> Vec<i64> {
     let pattern = regex::Regex::new(r"^vec_index_gen_(\d+)$").expect("static regex must compile");
     let mut ids: Vec<i64> = names
         .iter()
@@ -411,7 +406,30 @@ pub fn list_vec0_generation_ids(conn: &Conn) -> Result<Vec<i64>, StorageError> {
         .collect();
     ids.sort_unstable();
     ids.dedup();
-    Ok(ids)
+    ids
+}
+
+const LIST_VEC0_GENERATION_TABLE_NAMES_SQL: &str =
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'vec_index_gen_%' ORDER BY name";
+
+/// Every `generation_id` with a live chunk-domain `vec0` table, discovered
+/// by real `sqlite_master` enumeration (never hardcoded).
+pub fn list_vec0_generation_ids(conn: &Conn) -> Result<Vec<i64>, StorageError> {
+    let names: Vec<String> =
+        conn.query_all_map(LIST_VEC0_GENERATION_TABLE_NAMES_SQL, &[], |row| row.get_typed(0))?;
+    Ok(parse_vec0_generation_table_names(&names))
+}
+
+/// T6 (plan v5.1): `Tx`-scoped counterpart to [`list_vec0_generation_ids`] --
+/// `delete_messages_ordered_in_tx` and other same-transaction delete paths
+/// only ever hold a `&Tx<'_>`, which is a distinct type from `&Conn` (no
+/// `Deref`), so the `&Conn`-only original cannot be called mid-transaction.
+/// Identical query and parsing, over `tx.query_all_map` instead of
+/// `conn.query_all_map`.
+pub fn list_vec0_generation_ids_in_tx(tx: &Tx<'_>) -> Result<Vec<i64>, StorageError> {
+    let names: Vec<String> =
+        tx.query_all_map(LIST_VEC0_GENERATION_TABLE_NAMES_SQL, &[], |row| row.get_typed(0))?;
+    Ok(parse_vec0_generation_table_names(&names))
 }
 
 #[cfg(test)]

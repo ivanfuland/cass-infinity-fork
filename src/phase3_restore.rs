@@ -8610,6 +8610,25 @@ fn restore_invalidate_db_vector_domain(journal: &RestoreJournal) -> anyhow::Resu
     let eligible_ids = crate::indexer::db_vector_catchup::scan_eligible_message_ids(&storage).map_err(|e| {
         anyhow::anyhow!("re-scanning semantic eligibility for db-vector-domain invalidation: {e}")
     })?;
+
+    // T6 (plan v5.1): stream every live message's expected v5 chunks too --
+    // restore invalidation must re-seed chunk_holes for the chunk domain
+    // (message_chunks/chunk_holes), not just the legacy message_embeddings
+    // domain's embedding_holes above. for_each_expected_chunk pages through
+    // `messages` (bounded per-page memory at the source, T3), so only its
+    // lightweight ExpectedChunk output is accumulated here -- mirrors
+    // `eligible_ids` above: both reads stay outside the write transaction
+    // below, autocommit-consistent with the existing scan_eligible_
+    // message_ids call.
+    let mut expected_v5_chunks: Vec<crate::search::eligibility::ExpectedChunk> = Vec::new();
+    crate::search::eligibility::for_each_expected_chunk(&storage, 500, |chunk| {
+        expected_v5_chunks.push(chunk);
+        Ok(())
+    })
+    .map_err(|e| {
+        anyhow::anyhow!("streaming expected v5 chunks for db-vector-domain invalidation: {e}")
+    })?;
+
     let now_ms = crate::storage::sqlite::FrankenStorage::now_millis();
     storage
         .raw()
@@ -8620,9 +8639,15 @@ fn restore_invalidate_db_vector_domain(journal: &RestoreJournal) -> anyhow::Resu
                 |row| row.get_typed(0),
             )?;
             crate::storage::schema::seed_embedding_holes(tx, generation_id, &eligible_ids, now_ms, "restore-invalidation")?;
+            crate::storage::schema::register_chunk_holes_for_message_in_tx(
+                tx,
+                &expected_v5_chunks,
+                now_ms,
+                "restore-invalidation",
+            )?;
             crate::storage::schema::demote_active_generation_readiness_in_tx(tx)
         })
-        .map_err(|e| anyhow::anyhow!("re-seeding embedding_holes / demoting readiness after restore: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("re-seeding embedding_holes / chunk_holes / demoting readiness after restore: {e}"))?;
     Ok(())
 }
 

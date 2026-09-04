@@ -3889,6 +3889,13 @@ fn delete_orphan_message_id_chunk_once(conn: &FrankenConnection, ids: &[i64]) ->
     Ok(conn.with_tx(TxMode::Immediate, |tx| -> Result<usize, StorageError> {
         let mut deleted = 0usize;
         for entry in ORPHAN_MESSAGE_DEPENDENT_TABLES {
+            // T6 (plan v5.1): fts_lex is now handled by
+            // delete_messages_ordered_in_tx below (same batched
+            // fts_lex-then-lex_docs-then-messages discipline every other
+            // delete path uses) -- skip it here to avoid a redundant delete.
+            if entry.child_table == "fts_lex" {
+                continue;
+            }
             match delete_rows_by_i64_chunks(tx, entry.delete_many_sql_prefix, ids) {
                 Ok(count) => {
                     deleted = deleted.saturating_add(count);
@@ -3909,20 +3916,19 @@ fn delete_orphan_message_id_chunk_once(conn: &FrankenConnection, ids: &[i64]) ->
                 }
             }
         }
-        let more = delete_rows_by_i64_chunks(tx, "DELETE FROM messages WHERE id IN", ids)
-            .map_err(|err| {
-                anyhow_error_into_storage_error(err.context("deleting orphan rows from messages"))
-            })?;
-        deleted = deleted.saturating_add(more);
-        if more > 0 {
-            // w3-3 Step 3 (R2-W3-B4, D类): CASCADE already removed any
-            // embedding/hole rows the deleted orphans carried; demote in
-            // the same transaction. Gated on `more > 0` because this runs
-            // unconditionally at the top of every `cass index` invocation
-            // (see `cleanup_orphan_fk_rows`) and the zero-orphans case is
-            // the overwhelming common path.
-            crate::storage::schema::demote_active_generation_readiness_in_tx(tx)?;
-        }
+        // T6 (plan v5.1): route the orphan messages themselves through
+        // delete_messages_ordered_in_tx -- the previous plain `DELETE FROM
+        // messages WHERE id IN (...)` here relied on FK cascade for
+        // message_chunks/chunk_holes/chunk_staging/lex_docs (fine, those
+        // are FK-aware) but never touched vec0 at all (no FK/cascade tie),
+        // leaking any embedded chunk's vec0 row forever once its orphan
+        // parent message was cascade-deleted. Also folds in the same
+        // demote-if-anything-happened semantics the old `more > 0` gate had
+        // (delete_messages_ordered_in_tx no-ops, including its demote, for
+        // an empty id list).
+        let outcome =
+            delete_messages_ordered_in_tx(tx, ids).map_err(anyhow_error_into_storage_error)?;
+        deleted = deleted.saturating_add(outcome.messages as usize);
         Ok(deleted)
     })?)
 }
@@ -5693,21 +5699,23 @@ impl FrankenStorage {
                  )",
                 fparams![agent_id],
             )?;
-            // w2 Task W2-3 (spec 门②"删除"场景): fts_lex has no FK relationship
-            // to lex_docs (FTS5 external-content tables are not FK-aware), so
-            // ON DELETE CASCADE from messages -> lex_docs alone would leave
-            // fts_lex with stale, orphaned index entries pointing at rows the
-            // upcoming conversations delete is about to cascade away. Must run
-            // *before* the conversations delete, while `messages`/`lex_docs`
-            // still exist to resolve which fts_lex rowids belong to this agent.
-            tx.execute(
-                "DELETE FROM fts_lex WHERE rowid IN (
-                     SELECT m.id FROM messages m
-                     JOIN conversations c ON c.id = m.conversation_id
-                     WHERE c.agent_id = ?1
-                 )",
+            // T6 (plan v5.1): collect this agent's message ids first, then
+            // route the delete through delete_messages_ordered_in_tx --
+            // must run *before* the conversations delete below, while
+            // `messages` still exist to resolve which vec0/fts_lex rows
+            // belong to this agent (the old plain fts_lex delete here never
+            // touched vec0 at all -- no FK/cascade tie -- leaking any
+            // embedded chunk's vec0 row forever once the conversations
+            // delete cascade-removed its parent message).
+            let message_ids: Vec<i64> = tx.query_all_map(
+                "SELECT m.id FROM messages m
+                 JOIN conversations c ON c.id = m.conversation_id
+                 WHERE c.agent_id = ?1",
                 fparams![agent_id],
+                |row| row.get_typed(0),
             )?;
+            delete_messages_ordered_in_tx(tx, &message_ids)
+                .map_err(anyhow_error_into_storage_error)?;
             tx.execute(
                 "DELETE FROM conversations WHERE agent_id = ?1",
                 fparams![agent_id],
@@ -5720,11 +5728,6 @@ impl FrankenStorage {
                    )",
                 fparams![agent_id],
             )?;
-            // w3-3 Step 3 (R2-W3-B4, C类): CASCADE already removed every
-            // embedding/hole row belonging to the purged messages; the
-            // active generation's readiness claim over what remains still
-            // needs demoting in this same transaction.
-            crate::storage::schema::demote_active_generation_readiness_in_tx(tx)?;
             Ok(())
         })?;
 
@@ -5836,25 +5839,23 @@ impl FrankenStorage {
                 ),
                 fparams![],
             )?;
-            // w2 Task W2-3 (spec 门②"删除"场景): fts_lex has no FK to lex_docs
-            // (FTS5 external-content tables aren't FK-aware) -- must clear it
-            // before the cascading conversations delete below, same reasoning
-            // as `purge_agent_archive_data`.
-            tx.execute(
-                &format!(
-                    "DELETE FROM fts_lex WHERE rowid IN \
-                     (SELECT id FROM messages WHERE conversation_id IN ({id_list}))"
-                ),
+            // T6 (plan v5.1) -- see `purge_agent_archive_data`'s identical
+            // reasoning: collect message ids first, route the delete
+            // through delete_messages_ordered_in_tx (vec0 + fts_lex/lex_docs
+            // + messages + demote, in the order that keeps vec0 from being
+            // orphaned) *before* the cascading conversations delete below.
+            let message_ids: Vec<i64> = tx.query_all_map(
+                &format!("SELECT id FROM messages WHERE conversation_id IN ({id_list})"),
                 fparams![],
+                |row| row.get_typed(0),
             )?;
-            // The remaining child tables (messages, snippets, tags, ...) cascade.
+            delete_messages_ordered_in_tx(tx, &message_ids)
+                .map_err(anyhow_error_into_storage_error)?;
+            // The remaining child tables (snippets, tags, ...) cascade.
             tx.execute(
                 &format!("DELETE FROM conversations WHERE id IN ({id_list})"),
                 fparams![],
             )?;
-            // w3-3 Step 3 (R2-W3-B4, C类) -- see `purge_agent_archive_data`'s
-            // identical comment.
-            crate::storage::schema::demote_active_generation_readiness_in_tx(tx)?;
             Ok(())
         })?;
 
@@ -5966,21 +5967,19 @@ impl FrankenStorage {
                     "DELETE FROM conversation_external_tail_lookup WHERE conversation_id = ?1",
                     fparams![drop_id],
                 )?;
-                // w2 Task W2-3 (spec 门②"删除"场景): fts_lex has no FK to
-                // lex_docs (FTS5 external-content tables aren't FK-aware) --
-                // must clear it before the explicit messages delete below,
-                // while messages/lex_docs still exist to resolve the join.
-                tx.execute(
-                    "DELETE FROM fts_lex WHERE rowid IN \
-                     (SELECT id FROM messages WHERE conversation_id = ?1)",
+                // T6 (plan v5.1): collect this conversation's message ids,
+                // route the delete through delete_messages_ordered_in_tx
+                // (vec0 + fts_lex/lex_docs + messages + demote, explicit --
+                // not relying solely on cascade, same as the old code here
+                // -- in the order that keeps vec0 from being orphaned)
+                // before the conversations delete below.
+                let message_ids: Vec<i64> = tx.query_all_map(
+                    "SELECT id FROM messages WHERE conversation_id = ?1",
                     fparams![drop_id],
+                    |row| row.get_typed(0),
                 )?;
-                // Explicit message delete (do not rely solely on cascade) so the
-                // operation is correct even if FK enforcement is toggled off.
-                tx.execute(
-                    "DELETE FROM messages WHERE conversation_id = ?1",
-                    fparams![drop_id],
-                )?;
+                delete_messages_ordered_in_tx(tx, &message_ids)
+                    .map_err(anyhow_error_into_storage_error)?;
                 tx.execute(
                     "DELETE FROM conversation_tail_state WHERE conversation_id = ?1",
                     fparams![drop_id],
@@ -5994,10 +5993,6 @@ impl FrankenStorage {
                 // so there is nothing conversation-scoped to delete there.
                 tx.execute("DELETE FROM conversations WHERE id = ?1", fparams![drop_id])?;
             }
-            // w3-3 Step 3 (R2-W3-B4, C类) -- see `purge_agent_archive_data`'s
-            // identical comment. Once per transaction (not per-pair): the
-            // guard above already ensures `result.pairs` is non-empty here.
-            crate::storage::schema::demote_active_generation_readiness_in_tx(tx)?;
             Ok(())
         })?;
 
@@ -10663,9 +10658,15 @@ fn franken_append_insert_new_messages<'a>(
             // wait for an async catch-up worker. No-op in the overwhelming
             // majority of calls (no active generation yet).
             let now_ms = FrankenStorage::now_millis();
-            crate::storage::schema::register_embedding_hole_for_new_message_in_tx(
-                tx,
+            let expected = crate::search::eligibility::expected_chunks(
                 message_id,
+                conversation_id,
+                role_as_str(&msg.role),
+                &msg.content,
+            );
+            crate::storage::schema::register_chunk_holes_for_message_in_tx(
+                tx,
+                &expected,
                 now_ms,
                 "new_message",
             )?;
@@ -10721,17 +10722,32 @@ fn franken_batch_insert_new_messages_with_batch_size(
     // w3-3 Step 3 (R2-W3-B4): same-transaction lifecycle invalidation --
     // see `franken_append_insert_new_messages`'s identical comment. One
     // `demote` call for the whole batch (idempotent, no per-row cost) plus
-    // one hole registration per newly inserted id.
+    // one chunk-hole registration call covering every newly inserted id's
+    // expected chunks (`register_chunk_holes_for_message_in_tx` batches
+    // internally, so this is one call, not one per message). `inserted_ids`
+    // is built in exactly the same order as `messages` was iterated above
+    // (each chunk maps 1:1 onto a contiguous id range, single-row inserts
+    // included), so the zip pairs each id with its own message correctly.
     if !inserted_ids.is_empty() {
         let now_ms = FrankenStorage::now_millis();
-        for &message_id in &inserted_ids {
-            crate::storage::schema::register_embedding_hole_for_new_message_in_tx(
-                tx,
-                message_id,
-                now_ms,
-                "new_message",
-            )?;
-        }
+        let expected: Vec<crate::search::eligibility::ExpectedChunk> = inserted_ids
+            .iter()
+            .zip(messages.iter())
+            .flat_map(|(&message_id, msg)| {
+                crate::search::eligibility::expected_chunks(
+                    message_id,
+                    conversation_id,
+                    role_as_str(&msg.role),
+                    &msg.content,
+                )
+            })
+            .collect();
+        crate::storage::schema::register_chunk_holes_for_message_in_tx(
+            tx,
+            &expected,
+            now_ms,
+            "new_message",
+        )?;
         crate::storage::schema::demote_active_generation_readiness_in_tx(tx)?;
     }
 
@@ -11527,6 +11543,114 @@ pub(crate) fn sync_lexical_domain_for_conversation_in_tx(
     Ok(())
 }
 
+/// T6 (plan v5.1): outcome of [`delete_messages_ordered_in_tx`] -- rows
+/// actually removed from each layer. No `statement_order` self-reported
+/// field: the deletion order itself is proven by the behavior test
+/// (`tests/w4_lifecycle_zero_orphans.rs` judgment (f)), not asserted by
+/// this function about itself.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeleteOutcome {
+    pub vec0_rows: u64,
+    pub chunks: u64,
+    pub holes: u64,
+    pub staging: u64,
+    pub lex_docs: u64,
+    pub messages: u64,
+}
+
+/// T6 (plan v5.1): the single delete path every message-removal call site
+/// (session/agent/source-glob delete, duplicate-collapse, replace's delete
+/// segment) funnels through. Order is a hard invariant, not incidental:
+/// `vec0` tables have no FK/cascade tie to `messages` (they are independent
+/// virtual tables keyed by `rowid = chunk_id`), so their rows must be
+/// deleted *before* the parent `messages` row disappears -- and,
+/// perhaps-surprisingly, `message_chunks` itself must also be deleted
+/// *explicitly*, not left to `DELETE FROM messages`' own `ON DELETE
+/// CASCADE`: a `BEFORE DELETE ON message_chunks` trigger driven by that
+/// cascade observes the parent `messages` row as already gone (proven by
+/// `lifecycle_delete_order_proven_by_trigger` in `tests/w4_lifecycle_zero_
+/// orphans.rs`), which defeats the whole point of proving vec0-before-
+/// parent ordering by behavior. `chunk_holes`/`chunk_staging` still cascade
+/// from `messages` here (no test depends on their ordering relative to the
+/// parent the way `message_chunks` does), so this function counts them
+/// before the delete rather than removing them with a separate explicit
+/// call -- `delete_chunk_holes_for_messages_in_tx`/`delete_staging_for_
+/// messages_in_tx` (T4) stay reserved for a future in-place-update
+/// primitive, not called from here.
+pub(crate) fn delete_messages_ordered_in_tx(
+    tx: &FrankenTransaction<'_>,
+    message_ids: &[i64],
+) -> Result<DeleteOutcome> {
+    let mut outcome = DeleteOutcome::default();
+    if message_ids.is_empty() {
+        return Ok(outcome);
+    }
+
+    // vec0 first, then message_chunks itself, across every live generation
+    // (active + pending + stale) -- both explicit, not left to cascade.
+    // T6 discovery (`lifecycle_delete_order_proven_by_trigger`): SQLite
+    // fires a cascade-deleted child row's own `BEFORE DELETE` triggers
+    // *after* the parent row it cascades from is already gone from that
+    // trigger's own query view -- a `BEFORE DELETE ON message_chunks`
+    // trigger driven by `DELETE FROM messages`' cascade observes
+    // `parent_alive == 0`, not `1`, so it cannot prove vec0-before-parent
+    // ordering the way this project's fail-closed discipline wants proven.
+    // Deleting `message_chunks` explicitly here, strictly before the
+    // `DELETE FROM messages` below, makes the same trigger observe the
+    // parent row still alive -- the ordering guarantee is real, not just
+    // incidental to how cascade happens to fire.
+    let generation_ids = crate::storage::vector_domain::list_vec0_generation_ids_in_tx(tx)?;
+    for generation_id in &generation_ids {
+        let chunk_ids =
+            crate::storage::schema::collect_chunk_ids_for_messages(tx, *generation_id, message_ids)?;
+        if chunk_ids.is_empty() {
+            continue;
+        }
+        outcome.vec0_rows +=
+            crate::storage::vector_domain::delete_vec0_rows_in_tx(tx, *generation_id, &chunk_ids)?;
+        outcome.chunks += crate::storage::schema::delete_chunks_by_ids_in_tx(tx, &chunk_ids)?;
+    }
+
+    for batch in message_ids.chunks(LEXICAL_SYNC_BATCH_ROWS) {
+        let placeholders = sql_in_placeholders(batch.len());
+        let id_params: Vec<Value> = batch.iter().map(|id| Value::from(*id)).collect();
+
+        let holes: i64 = tx.query_row_map(
+            &format!("SELECT COUNT(*) FROM chunk_holes WHERE message_id IN ({placeholders})"),
+            &id_params,
+            |row| row.get_typed(0),
+        )?;
+        outcome.holes += holes.max(0) as u64;
+        let staging: i64 = tx.query_row_map(
+            &format!("SELECT COUNT(*) FROM chunk_staging WHERE message_id IN ({placeholders})"),
+            &id_params,
+            |row| row.get_typed(0),
+        )?;
+        outcome.staging += staging.max(0) as u64;
+
+        // External-content fts5: DELETE FROM fts_lex before the lex_docs
+        // content row it looks up is gone (same discipline as
+        // resync_lexical_envelope_for_conversation_in_tx above).
+        let existing_lex_docs: Vec<i64> = tx.query_all_map(
+            &format!("SELECT doc_id FROM lex_docs WHERE doc_id IN ({placeholders})"),
+            &id_params,
+            |row| row.get_typed(0),
+        )?;
+        outcome.lex_docs += existing_lex_docs.len() as u64;
+        tx.execute(&format!("DELETE FROM fts_lex WHERE rowid IN ({placeholders})"), &id_params)?;
+        tx.execute(&format!("DELETE FROM lex_docs WHERE doc_id IN ({placeholders})"), &id_params)?;
+
+        // Parent row last: message_chunks is already explicitly gone (above);
+        // this cascades away only chunk_holes/chunk_staging remnants.
+        outcome.messages +=
+            tx.execute(&format!("DELETE FROM messages WHERE id IN ({placeholders})"), &id_params)? as u64;
+    }
+
+    crate::storage::schema::demote_active_generation_readiness_in_tx(tx)?;
+
+    Ok(outcome)
+}
+
 /// Update daily stats within a legacy embedded engine transaction.
 fn franken_update_daily_stats_in_tx(
     storage: &FrankenStorage,
@@ -12281,28 +12405,25 @@ pub(crate) fn franken_replace_conversation_messages_in_tx(
         |row| row.get_typed(0),
     )?;
 
-    // w2 F2 fix: fts_lex has no FK relationship to lex_docs (FTS5
-    // external-content tables are not FK-aware), so ON DELETE CASCADE from
-    // messages -> lex_docs alone leaves fts_lex pointing at rowids the
-    // upcoming messages delete is about to cascade away. Must run *before*
-    // that delete, while `messages` still exist to resolve which fts_lex
-    // rowids belong to the *old* message ids -- sync_lexical_domain_for_
-    // conversation_in_tx runs later (post-insert, keyed off "current"
-    // messages) and can only ever see the *new* ids, so it cannot clean
-    // these up itself. Same precedent as the three delete-path call sites
-    // (W2-3): clear fts_lex first, while the old rowids are still resolvable.
-    tx.execute(
-        "DELETE FROM fts_lex WHERE rowid IN (SELECT id FROM messages WHERE conversation_id = ?1)",
+    // T6 (plan v5.1): collect the old message ids, then route the whole
+    // delete through delete_messages_ordered_in_tx -- unifies with the
+    // other 4 delete-path call sites and, crucially, cleans up vec0 rows
+    // for these old messages. The previous manual fts_lex-then-messages
+    // pair here never touched vec0 at all (no FK/cascade tie), leaking any
+    // embedded chunk's vec0 row forever once its parent message was
+    // cascade-deleted; delete_messages_ordered_in_tx collects chunk_ids per
+    // live generation and deletes their vec0 rows before the parent row
+    // goes away. `message_metrics` / `snippets` / `token_usage` all still
+    // cascade from `messages` on their own FK; `token_usage` additionally
+    // carries a non-FK `conversation_id` column, so it is still cleared
+    // explicitly below (unchanged from before).
+    let old_message_ids: Vec<i64> = tx.query_all_map(
+        "SELECT id FROM messages WHERE conversation_id = ?1",
         fparams![conversation_id],
+        |row| row.get_typed(0),
     )?;
-
-    // 删旧。`message_metrics` / `snippets` / `token_usage` 的 `message_id` 都带
-    // `ON DELETE CASCADE`；`token_usage` 另有一列 `conversation_id` 无外键，
-    // 故按基线 `cleanup_external_id_duplicates` 的做法再显式删一次（不依赖 cascade）。
-    let deleted_message_count = tx.execute(
-        "DELETE FROM messages WHERE conversation_id = ?1",
-        fparams![conversation_id],
-    )?;
+    let delete_outcome = delete_messages_ordered_in_tx(tx, &old_message_ids)?;
+    let deleted_message_count = delete_outcome.messages as usize;
     tx.execute(
         "DELETE FROM token_usage WHERE conversation_id = ?1",
         fparams![conversation_id],
@@ -12399,6 +12520,15 @@ pub(crate) fn franken_replace_conversation_messages_in_tx(
     // whenever this function did anything at all.
     if deleted_message_count > 0 || !inserted_message_ids.is_empty() {
         let now_ms = FrankenStorage::now_millis();
+        // T6 (plan v5.1) dual-write, kept until T11: the v4 message_
+        // embeddings-domain `embedding_holes` registration stays here
+        // alongside the new v5 chunk-domain one -- w3_3_replace_clears_
+        // old_embeddings_registers_holes_and_demotes_readiness_in_the_
+        // same_transaction and its rollback sibling both assert
+        // `embedding_holes` gets exactly the new message ids after a
+        // replace, and nothing else in the v4 domain writes that row for
+        // this path. T11 retires both this call and those two tests
+        // together with the rest of the v4 domain.
         for &message_id in &inserted_message_ids {
             crate::storage::schema::register_embedding_hole_for_new_message_in_tx(
                 tx,
@@ -12407,6 +12537,25 @@ pub(crate) fn franken_replace_conversation_messages_in_tx(
                 "replaced_conversation",
             )?;
         }
+        let expected: Vec<crate::search::eligibility::ExpectedChunk> = conv
+            .messages
+            .iter()
+            .zip(inserted_message_ids.iter())
+            .flat_map(|(msg, &message_id)| {
+                crate::search::eligibility::expected_chunks(
+                    message_id,
+                    conversation_id,
+                    role_as_str(&msg.role),
+                    &msg.content,
+                )
+            })
+            .collect();
+        crate::storage::schema::register_chunk_holes_for_message_in_tx(
+            tx,
+            &expected,
+            now_ms,
+            "replaced_conversation",
+        )?;
         crate::storage::schema::demote_active_generation_readiness_in_tx(tx)?;
     }
 
@@ -28215,5 +28364,294 @@ mod e5_replace_tests {
         assert_eq!(embedding_row_count(&storage, gen_id), 3, "回滚后旧嵌入必须原样恢复");
         assert!(hole_doc_ids(&storage, gen_id).is_empty(), "回滚后洞账必须恢复成空（新登记的两条必须消失）");
         assert_eq!(active_generation_audit_status(&storage), "passed", "回滚后代际就绪状态必须恢复成 passed");
+    }
+
+    // ---------------------------------------------------------------------
+    // T6 (plan v5.1) judgments (b)/(c): need `pub(crate)` access to
+    // `franken_replace_conversation_messages_in_tx`/`delete_messages_
+    // ordered_in_tx` directly, so they live here (inline, same module as
+    // every other replace-lifecycle test above) rather than in the
+    // external `tests/w4_lifecycle_zero_orphans.rs` file -- the same
+    // file-layout deviation already established for T5, documented in the
+    // T6 terminal report.
+    // ---------------------------------------------------------------------
+
+    /// Judgment (b), per control-plane ruling: plan T6's "update (content/
+    /// role change on a replace-path message)" has no real same-id
+    /// in-place-UPDATE call site in production code -- a replace always
+    /// deletes the old message ids wholesale and inserts brand new ones.
+    /// So "update" is proven here as the *composition* of delete (old id's
+    /// chunk/vec0/staging/lex_docs must not survive) + insert (new id's
+    /// chunk_holes must equal `expected_chunks`), driven through the real
+    /// replace path in one call, not a separate third primitive.
+    #[test]
+    fn lifecycle_replace_path_moves_chunk_lifecycle_to_new_ids_and_orphans_none() {
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open_storage(&dir);
+        let conv_id = seed_original(&storage, agent_id, "lifecycle-update-conv");
+        let old_rows = message_rows(&storage, conv_id);
+        assert_eq!(old_rows.len(), 3);
+        let old_message_id = old_rows[0].0;
+
+        let generation_id = storage
+            .raw()
+            .with_tx_no_replay(TxMode::Immediate, |tx| {
+                crate::storage::schema::create_embedding_generation_v5(
+                    tx,
+                    "lifecycle-update-embedder",
+                    8,
+                    1,
+                    1,
+                    b"fingerprint-bytes",
+                    1_000,
+                )
+            })
+            .unwrap();
+
+        // Seed an embedded chunk (+ vec0 row) AND a staging row for the old
+        // message, to prove both get cleaned up by the replace path.
+        storage
+            .raw()
+            .with_tx_no_replay(TxMode::Immediate, |tx| {
+                crate::storage::schema::insert_chunk_row_in_tx(
+                    tx,
+                    &crate::storage::schema::ChunkRow {
+                        generation_id,
+                        message_id: old_message_id,
+                        conversation_id: conv_id,
+                        chunk_idx: 0,
+                        byte_start: 0,
+                        byte_end: 5,
+                        content_hash: "old-hash".into(),
+                        embedding: vec![0.1f32; 8],
+                        norm: 1.0,
+                        created_at_ms: 1_000,
+                    },
+                )
+            })
+            .unwrap();
+        crate::storage::vector_domain::rebuild_vec0_table_for_generation_v5(storage.raw(), generation_id, 8).unwrap();
+        let vec0_before: i64 = storage
+            .raw()
+            .query_row_map(&format!("SELECT COUNT(*) FROM vec_index_gen_{generation_id}"), fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(vec0_before, 1, "sanity: old chunk's vec0 row exists before replace");
+        storage
+            .raw()
+            .with_tx_no_replay(TxMode::Immediate, |tx| {
+                crate::storage::schema::stage_chunk_rows_in_tx(
+                    tx,
+                    99,
+                    &[crate::storage::schema::ChunkRow {
+                        generation_id,
+                        message_id: old_message_id,
+                        conversation_id: conv_id,
+                        chunk_idx: 1,
+                        byte_start: 5,
+                        byte_end: 10,
+                        content_hash: "old-hash-2".into(),
+                        embedding: vec![0.2f32; 8],
+                        norm: 1.0,
+                        created_at_ms: 1_000,
+                    }],
+                )
+            })
+            .unwrap();
+
+        let new_conv = replacement("lifecycle-update-conv");
+        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+        let tx = storage.raw().transaction().unwrap();
+        let outcome =
+            franken_replace_conversation_messages_in_tx(&tx, conv_id, agent_id, None, &new_conv, &pricing).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(outcome.inserted_message_ids.len(), 2, "sanity: replace inserted 2 new messages");
+
+        let vec0_after: i64 = storage
+            .raw()
+            .query_row_map(&format!("SELECT COUNT(*) FROM vec_index_gen_{generation_id}"), fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(vec0_after, 0, "old chunk's vec0 row must not survive the replace");
+        let old_chunks: i64 = storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM message_chunks WHERE message_id = ?1", fparams![old_message_id], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(old_chunks, 0, "old message's message_chunks row must not survive the replace");
+        let old_staging: i64 = storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM chunk_staging WHERE message_id = ?1", fparams![old_message_id], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(old_staging, 0, "old message's chunk_staging row must not survive the replace");
+
+        let new_holes: Vec<(i64, u32)> = storage
+            .raw()
+            .query_all_map(
+                "SELECT message_id, chunk_idx FROM chunk_holes WHERE generation_id = ?1 ORDER BY message_id, chunk_idx",
+                fparams![generation_id],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )
+            .unwrap();
+        let new_msgs = [("user", "新消息 0"), ("agent", "新消息 1")];
+        let mut expected: Vec<(i64, u32)> = Vec::new();
+        for (&new_id, (role, content)) in outcome.inserted_message_ids.iter().zip(new_msgs.iter()) {
+            for c in crate::search::eligibility::expected_chunks(new_id, conv_id, role, content) {
+                expected.push((c.message_id, c.chunk_idx));
+            }
+        }
+        expected.sort_unstable();
+        assert_eq!(new_holes, expected, "new message ids' chunk_holes must equal expected_chunks exactly");
+    }
+
+    /// Judgment (c): deleting a single message (not a whole conversation)
+    /// via `delete_messages_ordered_in_tx` directly must leave zero orphans
+    /// for that message across chunks/holes/staging/lex_docs and vec0
+    /// (active + pending + a stale generation, three live `vec0` tables),
+    /// while a sibling message in the same conversation is left completely
+    /// untouched.
+    #[test]
+    fn lifecycle_delete_single_message_leaves_zero_orphans_across_all_generations() {
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open_storage(&dir);
+        let conv_id = seed_original(&storage, agent_id, "lifecycle-single-delete-conv");
+        let rows = message_rows(&storage, conv_id);
+        assert_eq!(rows.len(), 3);
+        let target_id = rows[1].0;
+        let sibling_id = rows[0].0;
+
+        let mut generation_ids = Vec::new();
+        for (label, mark_active, mark_stale) in [("active", true, false), ("pending", false, false), ("stale", false, true)] {
+            let generation_id = storage
+                .raw()
+                .with_tx_no_replay(TxMode::Immediate, |tx| {
+                    crate::storage::schema::create_embedding_generation_v5(
+                        tx,
+                        &format!("lifecycle-single-delete-{label}"),
+                        8,
+                        1,
+                        1,
+                        b"fingerprint-bytes",
+                        1_000,
+                    )
+                })
+                .unwrap();
+            if mark_active {
+                storage
+                    .raw()
+                    .execute(
+                        "UPDATE embedding_generations SET is_active = 1, audit_status = 'passed' WHERE id = ?1",
+                        fparams![generation_id],
+                    )
+                    .unwrap();
+            } else if mark_stale {
+                storage
+                    .raw()
+                    .execute(
+                        "UPDATE embedding_generations SET is_active = 0, audit_status = 'passed' WHERE id = ?1",
+                        fparams![generation_id],
+                    )
+                    .unwrap();
+            }
+            for (message_id, byte_start) in [(target_id, 0usize), (sibling_id, 100usize)] {
+                storage
+                    .raw()
+                    .with_tx_no_replay(TxMode::Immediate, |tx| {
+                        crate::storage::schema::insert_chunk_row_in_tx(
+                            tx,
+                            &crate::storage::schema::ChunkRow {
+                                generation_id,
+                                message_id,
+                                conversation_id: conv_id,
+                                chunk_idx: 0,
+                                byte_start,
+                                byte_end: byte_start + 5,
+                                content_hash: format!("hash-{message_id}"),
+                                embedding: vec![0.1f32; 8],
+                                norm: 1.0,
+                                created_at_ms: 1_000,
+                            },
+                        )
+                    })
+                    .unwrap();
+            }
+            crate::storage::vector_domain::rebuild_vec0_table_for_generation_v5(storage.raw(), generation_id, 8).unwrap();
+            let vec0_before: i64 = storage
+                .raw()
+                .query_row_map(&format!("SELECT COUNT(*) FROM vec_index_gen_{generation_id}"), fparams![], |row| {
+                    row.get_typed(0)
+                })
+                .unwrap();
+            assert_eq!(vec0_before, 2, "sanity: both target and sibling chunks seeded into vec0 for generation {generation_id}");
+            generation_ids.push(generation_id);
+        }
+
+        let tx = storage.raw().transaction().unwrap();
+        let outcome = delete_messages_ordered_in_tx(&tx, &[target_id]).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(outcome.messages, 1, "exactly the target message must be deleted");
+
+        for generation_id in &generation_ids {
+            let vec0_after: i64 = storage
+                .raw()
+                .query_row_map(&format!("SELECT COUNT(*) FROM vec_index_gen_{generation_id}"), fparams![], |row| {
+                    row.get_typed(0)
+                })
+                .unwrap();
+            assert_eq!(vec0_after, 1, "only the sibling's vec0 row must survive for generation {generation_id}");
+        }
+        let target_chunks: i64 = storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM message_chunks WHERE message_id = ?1", fparams![target_id], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(target_chunks, 0);
+        let target_holes: i64 = storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM chunk_holes WHERE message_id = ?1", fparams![target_id], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(target_holes, 0);
+        let target_staging: i64 = storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM chunk_staging WHERE message_id = ?1", fparams![target_id], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(target_staging, 0);
+        let target_lex: i64 = storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM lex_docs WHERE doc_id = ?1", fparams![target_id], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(target_lex, 0, "target's lex_docs row must be gone");
+
+        let sibling_chunks: i64 = storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM message_chunks WHERE message_id = ?1", fparams![sibling_id], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(sibling_chunks, 3, "sibling's message_chunks rows (one per generation) must survive untouched");
+        let sibling_lex: i64 = storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM lex_docs WHERE doc_id = ?1", fparams![sibling_id], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(sibling_lex, 1, "sibling's lex_docs row must survive untouched");
+
+        storage
+            .raw()
+            .execute("INSERT INTO fts_lex(fts_lex, rank) VALUES('integrity-check', 1)", fparams![])
+            .expect("fts_lex integrity-check must pass (no dangling/corrupt shadow rows)");
     }
 }

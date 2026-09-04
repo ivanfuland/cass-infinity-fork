@@ -53,7 +53,6 @@ use crate::model::conversation_packet::{
     ConversationPacketProvenance, ConversationPacketSinkProjections,
 };
 use crate::search::asset_state::{SearchMaintenanceJobKind, SearchMaintenanceMode};
-use crate::search::canonicalize::is_hard_message_noise;
 #[cfg(test)]
 use crate::search::vector_index::{ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_TOOL, ROLE_USER};
 
