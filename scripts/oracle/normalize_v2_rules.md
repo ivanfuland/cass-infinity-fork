@@ -51,20 +51,33 @@ blank lines created by stripping.
 
 ## ④ Hard-noise filtering
 
-Two independent judgments, both unchanged from v1:
+Two independent judgments, both unchanged from v1. **Both are in scope for
+the T2 python oracle**: `normalize()` implements the first (it's a step of
+`canonicalize_for_embedding` itself); `is_hard_noise(role, text)`
+implements the second (a separate, earlier gate the indexer applies before
+a message reaches `canonicalize()` at all).
 
-- **Whole-text low-signal filter** (inside `canonicalize()`, stage 4): if
-  the canonicalized text case-insensitively equals one of 15 short
-  acknowledgement phrases (`FS_LOW_SIGNAL_CONTENT` /
-  `LOW_SIGNAL_CONTENT`), the canonicalized output is the empty string.
+- **Whole-text low-signal filter** (inside `canonicalize()`, stage 4 --
+  part of `normalize()`'s own pipeline, applied *after* stages ①②③): if
+  the entire already-normalized text, trimmed and lowercased, exactly
+  equals one of 15 short acknowledgement phrases (`FS_LOW_SIGNAL_CONTENT`
+  in the slow path, byte-identical `LOW_SIGNAL_CONTENT` in the fast path),
+  the canonicalized output is the empty string. Full frozen list + the
+  Rust sync guard: `scripts/oracle/hard_noise_phrases.json` key
+  `canonicalize_low_signal` / test `low_signal_phrases_json_matches_source`
+  (this list was originally *not* frozen by T1 -- filled in as a T1
+  rules-doc gap fix folded into T2, plan v5.1).
   - Input: `"OK"` → Output: `""`
 - **Whole-message tool-acknowledgement filter** (`is_hard_message_noise`,
-  called by the indexer before a message even reaches `canonicalize()`):
-  a broader phrase table (`is_short_acknowledgement` +
+  called by the indexer before a message even reaches `canonicalize()`,
+  exposed to the T2 oracle as `is_hard_noise(role, text)`): a broader,
+  role-aware phrase table (`is_short_acknowledgement` +
   `is_tool_acknowledgement`), frozen verbatim in
-  `scripts/oracle/hard_noise_phrases.json`. See that file for the exact
-  phrase/prefix lists and `hard_noise_phrases_json_matches_source` (Rust
-  test) for the sync guard.
+  `scripts/oracle/hard_noise_phrases.json` (keys `short_acknowledgements` /
+  `short_tool_acks` / `prefixed_tool_acks`). See that file for the exact
+  phrase/prefix lists and match rules (trim/case/length/role conditions),
+  and `hard_noise_phrases_json_matches_source` (Rust test) for the sync
+  guard.
 
 ## ⑤ No truncation, no code-block collapsing, no base64/binary stripping
 

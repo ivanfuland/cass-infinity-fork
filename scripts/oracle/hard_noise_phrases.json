@@ -8,7 +8,7 @@
     },
     "consumed_by": "pub fn is_hard_message_noise (:687-689), via is_tool_acknowledgement",
     "sync_guard_test": "hard_noise_phrases_json_matches_source (src/search/canonicalize.rs)",
-    "note": "Frozen for T1 (plan v5.1); not modified by v2 -- canonicalize()'s own low-signal filter (stage 4, FS_LOW_SIGNAL_CONTENT, 15 exact-match phrases) is a SEPARATE, smaller list and is not this file's scope."
+    "note": "Frozen for T1 (plan v5.1); not modified by v2. `canonicalize_low_signal` below is a SEPARATE, smaller list -- canonicalize()'s own stage-4 whole-text low-signal filter (FS_LOW_SIGNAL_CONTENT / LOW_SIGNAL_CONTENT, 15 exact-match phrases), applied inside canonicalize()/canonicalize_fast_path() itself, not by the indexer's pre-filter. Frozen as a T1 rules-doc gap fix folded into T2 (plan v5.1)."
   },
   "short_acknowledgements": {
     "match": "trimmed text, ASCII-lowercased, exact equality; only applies when trimmed.len() <= 200",
@@ -57,6 +57,34 @@
       "successfully applied ",
       "applied patch",
       "patch applied"
+    ]
+  },
+  "canonicalize_low_signal": {
+    "_meta": {
+      "source_file": "src/search/canonicalize.rs",
+      "source_commit_base": "4423e48bf4295e4613e8feb6bd7701e586bdbaa9",
+      "verbatim_from": "const FS_LOW_SIGNAL_CONTENT (:45-61), identical to const LOW_SIGNAL_CONTENT (:427-443)",
+      "consumed_by": "fn fs_filter_low_signal (:364-375, slow/full pipeline stage 4) and fn canonicalize_fast_path (:457-498, fast-path low-signal check)",
+      "sync_guard_test": "low_signal_phrases_json_matches_source (src/search/canonicalize.rs)",
+      "note": "T1 rules-doc gap: this list was NOT originally frozen by T1 (see the top-level `note` above); frozen here as a T1 doc fix folded into T2 (plan v5.1), same commit."
+    },
+    "match": "whole (already-normalized, i.e. post NFC + markdown-strip + whitespace-normalize) text, trimmed, ASCII/Unicode-lowercased, exact equality against one of these phrases -> replaced with empty string",
+    "phrases": [
+      "ok",
+      "done",
+      "done.",
+      "got it",
+      "got it.",
+      "understood",
+      "understood.",
+      "sure",
+      "sure.",
+      "yes",
+      "no",
+      "thanks",
+      "thanks.",
+      "thank you",
+      "thank you."
     ]
   }
 }

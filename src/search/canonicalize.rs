@@ -1261,4 +1261,61 @@ See [docs](http://docs.rs) for more.
             "The authentication module needs a retry policy."
         ));
     }
+
+    /// Sync guard for `hard_noise_phrases.json`'s `canonicalize_low_signal`
+    /// key (T1 vRulesGap-01, folded into T2, plan v5.1): freezes
+    /// `FS_LOW_SIGNAL_CONTENT` (and, by the doc comment on `LOW_SIGNAL_CONTENT`
+    /// pinning the two in sync, the fast-path table too) as public JSON so the
+    /// T2 python oracle can implement `canonicalize()`'s stage-4 whole-text
+    /// empty-output filter without reading this source file.
+    #[test]
+    fn low_signal_phrases_json_matches_source() {
+        let raw = std::fs::read_to_string("scripts/oracle/hard_noise_phrases.json")
+            .expect("reading scripts/oracle/hard_noise_phrases.json");
+        let doc: serde_json::Value =
+            serde_json::from_str(&raw).expect("parsing hard_noise_phrases.json");
+
+        let phrases = doc["canonicalize_low_signal"]["phrases"]
+            .as_array()
+            .expect("canonicalize_low_signal.phrases must be an array");
+        assert_eq!(
+            phrases.len(),
+            FS_LOW_SIGNAL_CONTENT.len(),
+            "canonicalize_low_signal count drifted from FS_LOW_SIGNAL_CONTENT"
+        );
+        assert_eq!(
+            phrases.len(),
+            LOW_SIGNAL_CONTENT.len(),
+            "canonicalize_low_signal count drifted from LOW_SIGNAL_CONTENT"
+        );
+        for (i, phrase) in phrases.iter().enumerate() {
+            let phrase = phrase.as_str().expect("phrase must be a string");
+            assert_eq!(
+                phrase, FS_LOW_SIGNAL_CONTENT[i],
+                "canonicalize_low_signal[{i}] order/value drifted from FS_LOW_SIGNAL_CONTENT"
+            );
+            assert_eq!(
+                phrase, LOW_SIGNAL_CONTENT[i],
+                "canonicalize_low_signal[{i}] order/value drifted from LOW_SIGNAL_CONTENT"
+            );
+            // Exact-case match empties out via the slow-path filter.
+            assert_eq!(
+                fs_filter_low_signal(phrase),
+                "",
+                "phrase {phrase:?} must be filtered to empty by fs_filter_low_signal"
+            );
+            // Case-insensitivity: an uppercased variant must also empty out.
+            assert_eq!(
+                fs_filter_low_signal(&phrase.to_uppercase()),
+                "",
+                "uppercased {phrase:?} must also be filtered to empty (case-insensitive match)"
+            );
+        }
+
+        // Control: an ordinary sentence must NOT be filtered.
+        assert_eq!(
+            fs_filter_low_signal("The authentication module needs a retry policy."),
+            "The authentication module needs a retry policy."
+        );
+    }
 }
