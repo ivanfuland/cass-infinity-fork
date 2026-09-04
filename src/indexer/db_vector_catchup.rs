@@ -25,9 +25,12 @@ use anyhow::{Context, Result, anyhow, bail};
 use crate::indexer::semantic::{EmbeddedMessage, EmbeddingInput, SemanticIndexer, fetch_canonical_embedding_batch};
 use crate::indexer::semantic_progress::SemanticProgressSink;
 use crate::search::canonicalize::{CANONICALIZE_PIPELINE_VERSION, canonicalize_for_embedding};
-use crate::search::infinity::{InfinityConfig, InfinityServedIdentity, probe_served_embed_identity};
+use crate::search::chunking::canonical_role;
+use crate::search::eligibility::{ExpectedChunk, expected_chunks, for_each_expected_chunk};
+use crate::search::frankensearch_types::cosine_similarity;
+use crate::search::infinity::{InfinityConfig, InfinityServedIdentity, fingerprint_matches, probe_served_embed_identity};
 use crate::storage::api::{Conn, StorageError, TxMode, params};
-use crate::storage::schema::{self, CasInsertOutcome};
+use crate::storage::schema::{self, CasInsertOutcome, ChunkRow};
 use crate::storage::sqlite::FrankenStorage;
 use crate::storage::vector_domain;
 
@@ -79,6 +82,40 @@ pub struct DbVectorCatchupReport {
     /// hiding a real cleanup failure from every attestation consumer
     /// (JSON/human CLI output alike). Empty on the common case.
     pub cleanup_failures: Vec<(i64, String)>,
+    /// T8 (plan v5.1): chunks newly embedded and moved from `chunk_staging`
+    /// into `message_chunks` this run. `0` for a [`run_db_vector_catchup_
+    /// backfill`] (v4) call -- the chunk domain is a [`run_db_vector_
+    /// catchup_backfill_v5`]-only concept.
+    pub chunks_embedded: u64,
+    /// T8: `message_chunks` rows deleted by the reverse-reconciliation step
+    /// (`prune_chunks_not_in_expected_in_tx`) because the message's current
+    /// `ExpectedChunk` set no longer contains them (content/role changed
+    /// since they were embedded). The normal-path invariant is `0` -- a
+    /// non-zero value means this run itself did reconciliation work, not
+    /// that anything is wrong.
+    pub chunks_pruned: u64,
+    /// T8: `chunk_holes` rows written off with disposition
+    /// `WriteOffIndexBeyondExpected` (the hole's `chunk_idx` is no longer
+    /// covered by the message's current expected-chunk count) -- distinct
+    /// from `holes_written_off_ineligible` above, which is the v4
+    /// (message-level) write-off counter.
+    pub holes_written_off_beyond_expected: u64,
+    /// T8: `chunk_staging` rows this run recognized as already matching the
+    /// current expected chunk (same `content_hash`/span) and reused instead
+    /// of re-embedding -- `find_reusable_staging_in_tx`'s hit count, the
+    /// crash-resume fast path.
+    pub staging_reused: u64,
+    /// T8: stale `chunk_staging` rows purged (`purge_stale_staging_in_tx`)
+    /// because their content/span no longer matches what this run's fresh
+    /// expected-chunk computation says the hole should look like -- a prior
+    /// run's staged embedding invalidated by a content edit since.
+    pub staging_purged: u64,
+    /// T8: distinct messages `load_message_once` actually read from
+    /// `messages` this run -- must equal the number of distinct
+    /// `message_id`s among the drained hole keys, never more (the "load
+    /// each message once per run" invariant `catchup_loads_each_message_
+    /// once_per_run` proves).
+    pub messages_loaded: u64,
 }
 
 /// One row of embedding-hole work: the message content/role to embed,
@@ -708,6 +745,13 @@ pub fn run_db_vector_catchup_backfill(
         embeddings_pruned_ineligible,
         cleanup_deleted_generation_ids,
         cleanup_failures,
+        // T8 chunk-domain fields: not this (v4) function's concept.
+        chunks_embedded: 0,
+        chunks_pruned: 0,
+        holes_written_off_beyond_expected: 0,
+        staging_reused: 0,
+        staging_purged: 0,
+        messages_loaded: 0,
     })
 }
 
@@ -1265,6 +1309,1038 @@ pub fn cleanup_orphaned_generations(storage: &FrankenStorage, now_ms: i64) -> Re
 }
 
 // =============================================================================
+// T8 (plan v5.1, task book #92): chunk-level catch-up drain, key-paged
+// staging, generation reuse by policy+fingerprint identity, and the
+// audits-8-through-11 (plus a chunk-keyed ④ and a chunk-scoped ⑦)
+// activation audit. Coexists with the v4 (embedding_holes-driven) code
+// above -- neither replaces the other; v4 stays as-is until T11 retires it.
+// =============================================================================
+
+/// One drained `chunk_holes` key: which message and which expected
+/// `chunk_idx` within it. Deliberately carries no content -- the whole
+/// point of key-paged draining is to decide what to *do* with a key
+/// (embed / write off) without having read anything yet; content is read
+/// exactly once per distinct `message_id` via [`load_message_once`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HoleKey {
+    message_id: i64,
+    chunk_idx: u32,
+}
+
+/// The concrete slice of a message's normalized text one `Embed`-
+/// dispositioned hole must be embedded from, plus the content hash it must
+/// be written with -- everything [`classify_chunk_hole`] can determine
+/// about a hole from the message's already-computed `ExpectedChunk`s alone
+/// (no I/O of its own).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChunkSpanRef {
+    chunk_idx: u32,
+    byte_start: usize,
+    byte_end: usize,
+    content_hash: String,
+}
+
+/// What to do with one drained `chunk_holes` key, given the owning
+/// message's current `ExpectedChunk` set (T8; named `ChunkHoleDisposition`
+/// here, not `HoleDisposition`, to avoid colliding with the v4 enum of
+/// that name above -- both are kept per the "old names coexist" contract).
+///
+/// [`classify_chunk_hole`] itself only ever produces the first three
+/// variants (it has no visibility into the message's `role`, only its
+/// already-computed `expected` chunk list). `WriteOffOutOfEligibilityScope`
+/// is produced one level up, by the drain loop, for a hole whose message's
+/// `role_raw` is outside the embedding whitelist ([`canonical_role`]
+/// returns `None`) -- the v5 sibling of v4's "structurally never eligible"
+/// reason, kept distinct from `WriteOffCanonicalizeEmpty` (role is fine,
+/// but the *content* canonicalizes to nothing) the same way v4 keeps its
+/// two write-off reasons distinct.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ChunkHoleDisposition {
+    Embed(ChunkSpanRef),
+    WriteOffCanonicalizeEmpty,
+    WriteOffOutOfEligibilityScope,
+    WriteOffIndexBeyondExpected,
+}
+
+/// Pure triage: does `key.chunk_idx` land inside `expected` (the owning
+/// message's current, freshly-computed `ExpectedChunk` list)? `expected`
+/// empty means the message's content canonicalizes to nothing (the role
+/// itself was already filtered by the caller before `expected` was ever
+/// computed -- see [`ChunkHoleDisposition`]'s doc comment); a non-empty
+/// `expected` whose highest `chunk_idx` is below `key.chunk_idx` means the
+/// message used to chunk into more pieces than it does now (content
+/// shrank) -- `expected_chunks`' `chunk_idx` values are always the exact
+/// contiguous range `0..expected.len()` (T2/T3), so "not found but
+/// `expected` non-empty" and "index >= `expected.len()`" are the same
+/// condition, checked the cheap way.
+fn classify_chunk_hole(key: &HoleKey, expected: &[ExpectedChunk]) -> ChunkHoleDisposition {
+    if expected.is_empty() {
+        return ChunkHoleDisposition::WriteOffCanonicalizeEmpty;
+    }
+    match expected.iter().find(|c| c.chunk_idx == key.chunk_idx) {
+        Some(c) => ChunkHoleDisposition::Embed(ChunkSpanRef {
+            chunk_idx: c.chunk_idx,
+            byte_start: c.byte_start,
+            byte_end: c.byte_end,
+            content_hash: c.content_hash.clone(),
+        }),
+        None => ChunkHoleDisposition::WriteOffIndexBeyondExpected,
+    }
+}
+
+/// One page of `chunk_holes` keys for `generation_id`, ordered
+/// `(message_id, chunk_idx)` ascending, content-free (no `JOIN` against
+/// `messages` -- see [`load_message_once`] for the one-read-per-message
+/// content fetch this pairs with). `after` is the last key of the
+/// previous page (`None` for the first page); the `OR` shape below is the
+/// standard keyset-pagination predicate for a two-column ascending order,
+/// and works unmodified for the first page too since every real
+/// `message_id` is `>= 1` (`AUTOINCREMENT`), always `> 0`.
+fn fetch_hole_keys(
+    storage: &FrankenStorage,
+    generation_id: i64,
+    after: Option<(i64, u32)>,
+    limit: usize,
+) -> Result<Vec<HoleKey>> {
+    let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+    let (after_message_id, after_chunk_idx) = after.unwrap_or((0, 0));
+    storage
+        .raw()
+        .query_all_map(
+            "SELECT message_id, chunk_idx FROM chunk_holes \
+             WHERE generation_id = ?1 AND (message_id > ?2 OR (message_id = ?2 AND chunk_idx > ?3)) \
+             ORDER BY message_id, chunk_idx LIMIT ?4",
+            &params![generation_id, after_message_id, after_chunk_idx, limit_i64],
+            |row| Ok(HoleKey { message_id: row.get_typed(0)?, chunk_idx: row.get_typed(1)? }),
+        )
+        .context("fetching a page of chunk_holes keys")
+}
+
+/// Read one message's `(conversation_id, role, content)` fresh. The sole
+/// per-message read the T8 drain loop performs -- callers must cache the
+/// result across every `HoleKey` sharing the same `message_id` within a
+/// run (the "跨页保留 current 消息" contract; [`run_db_vector_catchup_
+/// backfill_v5`]'s loop is what actually enforces "exactly once", this
+/// function has no memory of its own). `chunk_holes.message_id REFERENCES
+/// messages(id) ON DELETE CASCADE` guarantees a hole's message can never
+/// be missing under normal operation -- an error here is a genuine
+/// invariant violation, not a race to paper over.
+fn load_message_once(storage: &FrankenStorage, message_id: i64) -> Result<(i64, String, String)> {
+    storage
+        .raw()
+        .query_row_map(
+            "SELECT conversation_id, role, content FROM messages WHERE id = ?1",
+            &params![message_id],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+        )
+        .with_context(|| format!("loading message {message_id} for T8 chunk catch-up (chunk_holes FK should make this impossible)"))
+}
+
+/// T8 sibling of [`find_reusable_or_create_generation`]: identity now
+/// includes `chunking_policy_version` (structural exclusion of legacy
+/// rows, see [`schema::find_active_generation_matching_identity_v5`]'s doc
+/// comment) *and* the generation fingerprint (plan v5.1 参数冻结 "代际身份"
+/// row) -- a same-`(embedder_id, dim, canonicalize_version,
+/// chunking_policy_version)` row whose *fingerprint* has drifted (the
+/// served model's weights changed under an unchanged id/dim, T7's whole
+/// reason for existing) is NOT a reuse match; the search falls through to
+/// the next priority tier exactly as if the row didn't exist at all.
+/// Same three-tier priority as v4: identity+fingerprint-matching active ->
+/// identity+fingerprint-matching pending -> create new.
+fn find_reusable_or_create_generation_v5(
+    conn: &Conn,
+    identity: &InfinityServedIdentity,
+    canonicalize_version: u32,
+    chunking_policy_version: u32,
+    fingerprint: &[u8],
+    now_ms: i64,
+) -> Result<(i64, bool)> {
+    let dim = i64::try_from(identity.dimension)
+        .map_err(|_| anyhow!("infinity dimension {} does not fit in i64", identity.dimension))?;
+
+    if let Some((existing, stored_fingerprint)) = schema::find_active_generation_matching_identity_v5(
+        conn,
+        &identity.model_id,
+        dim,
+        canonicalize_version,
+        chunking_policy_version,
+    )
+    .context("looking up an identity-matching active v5 embedding_generations row")?
+        && fingerprint_matches(&stored_fingerprint, fingerprint, identity.dimension)
+    {
+        return Ok((existing, true));
+    }
+
+    if let Some((existing, stored_fingerprint)) = schema::find_reusable_pending_generation_v5(
+        conn,
+        &identity.model_id,
+        dim,
+        canonicalize_version,
+        chunking_policy_version,
+    )
+    .context("looking up a reusable pending v5 embedding_generations row")?
+        && fingerprint_matches(&stored_fingerprint, fingerprint, identity.dimension)
+    {
+        return Ok((existing, true));
+    }
+
+    let generation_id = conn
+        .with_tx(TxMode::Immediate, |tx| {
+            schema::create_embedding_generation_v5(
+                tx,
+                &identity.model_id,
+                dim,
+                canonicalize_version,
+                chunking_policy_version,
+                fingerprint,
+                now_ms,
+            )
+        })
+        .context("creating a new v5 embedding_generations row")?;
+    Ok((generation_id, false))
+}
+
+// =============================================================================
+// T8: full v5 activation audit (checks ①②③⑤⑥ carried over from v4, scoped to
+// the chunk domain; ④⑦⑧⑨⑩⑪ new/rebuilt for it).
+// =============================================================================
+
+/// Deterministic, dependency-free seeded ranking key for ownership-check
+/// sampling (check ⑩): no new crate (`rand` is a workspace dependency
+/// elsewhere, but its exact 0.10 seeding API was not worth the risk of
+/// getting wrong sight-unseen when a few lines of splitmix64-style mixing
+/// do the same job -- deterministic given `(seed, chunk_id)`, roughly
+/// uniform, zero new dependency surface). Sampling = sort all chunk_ids by
+/// this key ascending, take the first N; reproducible for a given seed,
+/// which is exactly what makes `ownership_seed` meaningful to log.
+fn ownership_sample_key(seed: u64, chunk_id: i64) -> u64 {
+    let mut z = seed ^ (chunk_id as u64).wrapping_mul(0x9E3779B97F4A7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
+}
+
+/// Re-derive a fresh generation fingerprint through the injected
+/// `embedder` closure (not [`crate::search::infinity::compute_generation_
+/// fingerprint`], which insists on its own live `InfinityConfig`/HTTP
+/// client -- audit check ⑪ must be exercisable with a deterministic mock
+/// embedder in tests, same as check ⑩). Same wire format:
+/// [`crate::search::infinity::FINGERPRINT_SENTINELS`] embedded in order,
+/// concatenated as LE f32 bytes.
+fn compute_fresh_fingerprint_via(
+    embedder: &dyn Fn(&[&str]) -> std::result::Result<Vec<Vec<f32>>, String>,
+    dim: usize,
+) -> Result<Vec<u8>> {
+    let inputs: Vec<&str> = crate::search::infinity::FINGERPRINT_SENTINELS.to_vec();
+    let vectors = embedder(&inputs).map_err(|e| anyhow!("re-embedding fingerprint sentinels failed: {e}"))?;
+    if vectors.len() != inputs.len() {
+        bail!("fingerprint embedder returned {} vectors for {} sentinels", vectors.len(), inputs.len());
+    }
+    let mut out = Vec::with_capacity(vectors.len() * dim * 4);
+    for v in &vectors {
+        if v.len() != dim {
+            bail!("fingerprint sentinel vector has dim {} != expected {dim}", v.len());
+        }
+        out.extend_from_slice(&schema::f32_vector_to_le_blob(v));
+    }
+    Ok(out)
+}
+
+/// Verdict + evidence from [`run_activation_audit_v5`]. `passed` is the
+/// single verdict every other field explains. Field groups mirror
+/// [`ActivationAuditReport`] (v4) where the same check carries over
+/// (①②③⑤⑥, scoped to `message_chunks`/chunk identity instead of
+/// `message_embeddings`), plus T8's new/rebuilt checks ④⑦⑧⑨⑩⑪.
+#[derive(Debug, Clone)]
+pub struct ActivationAuditReportV5 {
+    pub generation_id: i64,
+    pub passed: bool,
+    /// ① full-table `COUNT(length(embedding) != 4*dim)` over `message_chunks`.
+    pub dim_mismatch_count: i64,
+    /// ② finite/norm resample over `message_chunks`.
+    pub finite_norm_sample_size: usize,
+    pub finite_norm_checked: usize,
+    pub finite_norm_violation_count: usize,
+    /// ③ positive content self-hit, chunk-domain: the message anchor used,
+    /// which of its chunk rows (`chunk_id`) that resolved to, and vec0's
+    /// top-1 self-hit for that chunk's own (freshly re-read) vector.
+    pub positive_check_message_id: i64,
+    pub positive_check_chunk_id: i64,
+    pub positive_check_top_hit_chunk_id: i64,
+    pub positive_check_distance: f64,
+    /// ④ bidirectional anti-join, element = `(message_id, chunk_idx)`.
+    pub eligible_not_embedded_count: usize,
+    pub embedded_not_eligible_count: usize,
+    /// ⑤ canonicalize-version identity match.
+    pub canonicalize_version_expected: u32,
+    pub canonicalize_version_actual: i64,
+    /// ⑥ `PRAGMA foreign_key_check` violation row count (database-wide).
+    pub foreign_key_violation_count: usize,
+    /// ⑦ vec0-vs-`message_chunks` bidirectional anti-join
+    /// (`count_vec0_chunks_set_mismatch_for_generation`), `== (0,0)` to pass.
+    pub chunk_count: i64,
+    pub vec0_row_count: i64,
+    pub chunks_missing_from_vec0: i64,
+    pub vec0_chunks_missing_from_message_chunks: i64,
+    /// ⑧ full-table (not sampled) recomputed-`content_hash` mismatch count.
+    pub hash_mismatch: u64,
+    /// ⑨ completeness: span mismatch (same key, different byte range),
+    /// missing (expected but not stored), extra (stored but not
+    /// expected), conversation_id mismatch, and outstanding `chunk_holes`
+    /// rows for this generation (must be `0` to pass).
+    pub span_mismatch: u64,
+    pub completeness_missing: u64,
+    pub completeness_extra: u64,
+    pub conversation_id_mismatch: u64,
+    pub chunk_holes_remaining: i64,
+    /// ⑩ ownership: `min(ownership_sample, chunk_count)` chunks re-embedded
+    /// and cross-checked (fresh-vs-stored cosine >= 0.999, vec0 self-hit at
+    /// distance ~0). `ownership_skipped=true` (embedder was `None`) always
+    /// implies `passed=false` -- only a `--no-ownership` diagnostic tool
+    /// may pass `None`, and even then the resulting report is never a
+    /// "clean" activation verdict.
+    pub ownership_checked: u64,
+    pub ownership_failed: u64,
+    pub ownership_seed: u64,
+    pub ownership_skipped: bool,
+    /// ⑪ generation fingerprint re-verification.
+    pub fingerprint_ok: bool,
+    pub failure_reasons: Vec<String>,
+}
+
+/// Default finite/norm resample size for [`run_activation_audit_v5`],
+/// mirroring v4's [`ACTIVATION_AUDIT_DEFAULT_FINITE_NORM_SAMPLE_SIZE`].
+const ACTIVATION_AUDIT_V5_DEFAULT_FINITE_NORM_SAMPLE_SIZE: usize = 500;
+
+/// Plan v5.1 参数冻结 "代际身份": ownership check ⑩'s per-generation-lifetime
+/// resample size, fixed for every real activation/re-audit call
+/// (`index --semantic` / `models backfill`) -- not a knob a caller
+/// chooses per-call, so it lives here, not as a parameter default.
+const OWNERSHIP_SAMPLE_SIZE_DEFAULT: usize = 200;
+
+/// Run the full T8 chunk-domain activation audit against `generation_id`.
+/// Read-only. `embedder`: `Some` for a real activation/re-audit call
+/// (checks ⑩/⑪ actually re-embed and compare); `None` only for a
+/// diagnostic tool that explicitly opted out of that cost -- the report
+/// still comes back (`ownership_skipped=true`), but `passed` is
+/// unconditionally `false` (plan v5.1: an audit that couldn't verify
+/// ownership/fingerprint is not a "clean" verdict, regardless of what
+/// checks ①-⑨ found).
+#[allow(clippy::too_many_arguments)]
+pub fn run_activation_audit_v5(
+    storage: &FrankenStorage,
+    generation_id: i64,
+    finite_norm_sample_size: usize,
+    positive_check_message_id: Option<i64>,
+    embedder: Option<&dyn Fn(&[&str]) -> std::result::Result<Vec<Vec<f32>>, String>>,
+    ownership_sample: usize,
+    ownership_seed: u64,
+) -> Result<ActivationAuditReportV5> {
+    let conn = storage.raw();
+    let mut failures: Vec<String> = Vec::new();
+
+    let (dim, canonicalize_version_actual, stored_fingerprint): (i64, i64, Vec<u8>) = conn
+        .query_row_map(
+            "SELECT dim, canonicalize_version, fingerprint FROM embedding_generations WHERE id = ?1",
+            &params![generation_id],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+        )
+        .with_context(|| format!("generation {generation_id} not found for T8 activation audit"))?;
+    let dim_usize = usize::try_from(dim).unwrap_or(0);
+
+    // ① dim/length match.
+    let dim_mismatch_count: i64 = conn.query_row_map(
+        "SELECT COUNT(*) FROM message_chunks WHERE generation_id = ?1 AND length(embedding) != 4 * ?2",
+        &params![generation_id, dim],
+        |row| row.get_typed(0),
+    )?;
+    if dim_mismatch_count != 0 {
+        failures.push(format!("① dim/length mismatch: {dim_mismatch_count} chunk row(s) have a BLOB length != 4*dim={dim}"));
+    }
+
+    // ② finite/norm resample.
+    let sample_rows: Vec<(i64, i64, u32, Vec<u8>, f64)> = conn.query_all_map(
+        "SELECT chunk_id, message_id, chunk_idx, embedding, norm FROM message_chunks WHERE generation_id = ?1 ORDER BY RANDOM() LIMIT ?2",
+        &params![generation_id, i64::try_from(finite_norm_sample_size).unwrap_or(i64::MAX)],
+        |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?, row.get_typed(3)?, row.get_typed(4)?)),
+    )?;
+    let finite_norm_checked = sample_rows.len();
+    let mut finite_norm_violation_count = 0usize;
+    for (chunk_id, message_id, chunk_idx, blob, stored_norm) in &sample_rows {
+        let decoded = match schema::le_blob_to_f32_vector(blob) {
+            Ok(v) => v,
+            Err(e) => {
+                finite_norm_violation_count += 1;
+                failures.push(format!("② chunk_id={chunk_id} (message_id={message_id}, chunk_idx={chunk_idx}) BLOB failed to decode: {e}"));
+                continue;
+            }
+        };
+        if let Some(bad_idx) = decoded.iter().position(|x| !x.is_finite()) {
+            finite_norm_violation_count += 1;
+            failures.push(format!("② chunk_id={chunk_id} has a non-finite element at index {bad_idx}"));
+            continue;
+        }
+        let recomputed = schema::l2_norm(&decoded);
+        let tolerance = 1e-6_f64.max(stored_norm.abs() * 1e-6);
+        if (recomputed - stored_norm).abs() > tolerance {
+            finite_norm_violation_count += 1;
+            failures.push(format!("② chunk_id={chunk_id} norm/BLOB mismatch: stored={stored_norm} recomputed={recomputed}"));
+        }
+    }
+
+    // ③ positive content self-hit, resolved to a chunk row.
+    let anchor: Result<(i64, i64, Vec<u8>)> = (|| {
+        Ok(match positive_check_message_id {
+            Some(mid) => conn.query_row_map(
+                "SELECT message_id, chunk_id, embedding FROM message_chunks \
+                 WHERE generation_id = ?1 AND message_id = ?2 ORDER BY chunk_idx LIMIT 1",
+                &params![generation_id, mid],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+            )
+            .with_context(|| format!("positive-check message_id={mid} has no chunk row in generation {generation_id}"))?,
+            None => conn
+                .query_row_map(
+                    "SELECT message_id, chunk_id, embedding FROM message_chunks WHERE generation_id = ?1 ORDER BY chunk_id LIMIT 1",
+                    &params![generation_id],
+                    |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+                )
+                .with_context(|| format!("generation {generation_id} has zero chunk rows; nothing to positive-check"))?,
+        })
+    })();
+    let mut positive_check_errored = false;
+    let (anchor_message_id, anchor_chunk_id, top_hit_chunk_id, distance) = match anchor {
+        Ok((message_id, chunk_id, blob)) => match schema::le_blob_to_f32_vector(&blob)
+            .map_err(anyhow::Error::from)
+            .and_then(|v| vector_domain::vec0_knn(conn, generation_id, &v, 1).map_err(anyhow::Error::from))
+        {
+            Ok(hits) => {
+                let (top_hit, distance) = hits.first().copied().unwrap_or((-1, f64::INFINITY));
+                (message_id, chunk_id, top_hit, distance)
+            }
+            Err(e) => {
+                positive_check_errored = true;
+                failures.push(format!("③ positive content check errored on message_id={message_id} chunk_id={chunk_id}: {e}"));
+                (message_id, chunk_id, -1, f64::INFINITY)
+            }
+        },
+        Err(e) => {
+            positive_check_errored = true;
+            failures.push(format!("③ positive content check anchor lookup failed: {e}"));
+            (positive_check_message_id.unwrap_or(-1), -1, -1, f64::INFINITY)
+        }
+    };
+    if !positive_check_errored && (top_hit_chunk_id != anchor_chunk_id || !(distance <= 1e-6)) {
+        failures.push(format!(
+            "③ positive content check failed: anchor chunk_id={anchor_chunk_id} (message_id={anchor_message_id}) top vec0 hit={top_hit_chunk_id} distance={distance}"
+        ));
+    }
+
+    // ④ bidirectional anti-join, element = (message_id, chunk_idx).
+    let mut eligible_keys: HashSet<(i64, u32)> = HashSet::new();
+    for_each_expected_chunk(storage, 200, |c| {
+        eligible_keys.insert((c.message_id, c.chunk_idx));
+        Ok(())
+    })?;
+    let embedded_keys: HashSet<(i64, u32)> = conn
+        .query_all_map(
+            "SELECT message_id, chunk_idx FROM message_chunks WHERE generation_id = ?1",
+            &params![generation_id],
+            |row| Ok((row.get_typed::<i64>(0)?, row.get_typed::<u32>(1)?)),
+        )?
+        .into_iter()
+        .collect();
+    let eligible_not_embedded_count = eligible_keys.difference(&embedded_keys).count();
+    let embedded_not_eligible_count = embedded_keys.difference(&eligible_keys).count();
+    if eligible_not_embedded_count != 0 {
+        failures.push(format!(
+            "④ identity-set anti-join: {eligible_not_embedded_count} eligible chunk(s) have no message_chunks row in generation {generation_id}"
+        ));
+    }
+    if embedded_not_eligible_count != 0 {
+        failures.push(format!(
+            "④ identity-set anti-join: {embedded_not_eligible_count} message_chunks row(s) in generation {generation_id} are no longer eligible"
+        ));
+    }
+
+    // ⑤ canonicalize-version identity match.
+    if canonicalize_version_actual != i64::from(CANONICALIZE_PIPELINE_VERSION) {
+        failures.push(format!(
+            "⑤ canonicalize_version mismatch: generation has {canonicalize_version_actual}, running binary expects {CANONICALIZE_PIPELINE_VERSION}"
+        ));
+    }
+
+    // ⑥ PRAGMA foreign_key_check.
+    let foreign_key_violation_count = conn.query_all_map("PRAGMA foreign_key_check", &[], |_row| Ok(()))?.len();
+    if foreign_key_violation_count != 0 {
+        failures.push(format!("⑥ PRAGMA foreign_key_check reported {foreign_key_violation_count} violation(s)"));
+    }
+
+    // ⑦ vec0-vs-message_chunks bidirectional anti-join.
+    let chunk_count: i64 = conn.query_row_map(
+        "SELECT COUNT(*) FROM message_chunks WHERE generation_id = ?1",
+        &params![generation_id],
+        |row| row.get_typed(0),
+    )?;
+    let vec0_row_count = match vector_domain::count_vec0_rows_for_generation(conn, generation_id) {
+        Ok(count) => count,
+        Err(e) => {
+            failures.push(format!("⑦ vec0 row-count reconciliation errored for generation {generation_id} (vec0 table missing or unreadable): {e}"));
+            -1
+        }
+    };
+    let (chunks_missing_from_vec0, vec0_chunks_missing_from_message_chunks) = if vec0_row_count >= 0 {
+        let (a, b) = vector_domain::count_vec0_chunks_set_mismatch_for_generation(conn, generation_id)?;
+        (a, b)
+    } else {
+        (0, 0)
+    };
+    if chunks_missing_from_vec0 != 0 || vec0_chunks_missing_from_message_chunks != 0 {
+        failures.push(format!(
+            "⑦ vec0/message_chunks identity-set mismatch for generation {generation_id}: \
+             {chunks_missing_from_vec0} message_chunks row(s) missing from vec0, \
+             {vec0_chunks_missing_from_message_chunks} vec0 row(s) missing from message_chunks \
+             (vec0 has {vec0_row_count} row(s), message_chunks has {chunk_count})"
+        ));
+    }
+
+    // ⑧⑨: one pass over expected-vs-stored, keyed by (message_id, chunk_idx)
+    // -- recomputed content_hash (⑧, full-table), span/conversation_id/
+    // completeness (⑨).
+    let mut expected_by_key: std::collections::HashMap<(i64, u32), (i64, usize, usize, String)> = std::collections::HashMap::new();
+    for_each_expected_chunk(storage, 200, |c| {
+        expected_by_key.insert((c.message_id, c.chunk_idx), (c.conversation_id, c.byte_start, c.byte_end, c.content_hash));
+        Ok(())
+    })?;
+    let stored_rows: Vec<(i64, i64, u32, i64, i64, String)> = conn.query_all_map(
+        "SELECT message_id, conversation_id, chunk_idx, byte_start, byte_end, content_hash FROM message_chunks WHERE generation_id = ?1",
+        &params![generation_id],
+        |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?, row.get_typed(3)?, row.get_typed(4)?, row.get_typed(5)?)),
+    )?;
+    let mut stored_by_key: std::collections::HashMap<(i64, u32), (i64, i64, i64, String)> = std::collections::HashMap::new();
+    for (message_id, conversation_id, chunk_idx, byte_start, byte_end, content_hash) in stored_rows {
+        stored_by_key.insert((message_id, chunk_idx), (conversation_id, byte_start, byte_end, content_hash));
+    }
+    let mut hash_mismatch = 0u64;
+    let mut span_mismatch = 0u64;
+    let mut conversation_id_mismatch = 0u64;
+    let mut completeness_missing = 0u64;
+    let mut completeness_extra = 0u64;
+    for (key, (exp_conv, exp_start, exp_end, exp_hash)) in &expected_by_key {
+        match stored_by_key.get(key) {
+            Some((st_conv, st_start, st_end, st_hash)) => {
+                if st_hash != exp_hash {
+                    hash_mismatch += 1;
+                }
+                if *st_start as usize != *exp_start || *st_end as usize != *exp_end {
+                    span_mismatch += 1;
+                }
+                if st_conv != exp_conv {
+                    conversation_id_mismatch += 1;
+                }
+            }
+            None => completeness_missing += 1,
+        }
+    }
+    for key in stored_by_key.keys() {
+        if !expected_by_key.contains_key(key) {
+            completeness_extra += 1;
+        }
+    }
+    let chunk_holes_remaining: i64 = conn.query_row_map(
+        "SELECT COUNT(*) FROM chunk_holes WHERE generation_id = ?1",
+        &params![generation_id],
+        |row| row.get_typed(0),
+    )?;
+    if hash_mismatch != 0 {
+        failures.push(format!("⑧ {hash_mismatch} chunk(s) have a stored content_hash that does not match the recomputed one"));
+    }
+    if span_mismatch != 0 {
+        failures.push(format!("⑨ {span_mismatch} chunk(s) have a stored byte span that does not match the recomputed one"));
+    }
+    if completeness_missing != 0 || completeness_extra != 0 {
+        failures.push(format!(
+            "⑨ completeness mismatch: {completeness_missing} expected chunk(s) missing from storage, {completeness_extra} stored chunk(s) not in the expected set"
+        ));
+    }
+    if conversation_id_mismatch != 0 {
+        failures.push(format!("⑨ {conversation_id_mismatch} chunk(s) have a stored conversation_id that does not match the owning message's"));
+    }
+    if chunk_holes_remaining != 0 {
+        failures.push(format!("⑨ {chunk_holes_remaining} chunk_holes row(s) remain outstanding for generation {generation_id}"));
+    }
+
+    // ⑩⑪: ownership resample + fingerprint re-verification, both gated on
+    // `embedder` being `Some` (plan v5.1: `None` => passed=false).
+    let mut ownership_checked = 0u64;
+    let mut ownership_failed = 0u64;
+    let mut ownership_skipped = false;
+    let mut fingerprint_ok = false;
+    match embedder {
+        None => {
+            ownership_skipped = true;
+            failures.push("⑩ ownership check skipped: embedder=None (only a --no-ownership diagnostic may pass None; the resulting report is never a clean activation verdict)".to_string());
+            failures.push("⑪ fingerprint re-verification skipped: embedder=None".to_string());
+        }
+        Some(embed_fn) => {
+            let n = usize::try_from(chunk_count).unwrap_or(0).min(ownership_sample);
+            let mut chunk_ids: Vec<i64> = conn.query_all_map(
+                "SELECT chunk_id FROM message_chunks WHERE generation_id = ?1",
+                &params![generation_id],
+                |row| row.get_typed(0),
+            )?;
+            chunk_ids.sort_by_key(|&id| ownership_sample_key(ownership_seed, id));
+            chunk_ids.truncate(n);
+            for chunk_id in &chunk_ids {
+                ownership_checked += 1;
+                let row: Option<(i64, i64, i64, Vec<u8>)> = conn.query_opt_map(
+                    "SELECT message_id, byte_start, byte_end, embedding FROM message_chunks WHERE generation_id = ?1 AND chunk_id = ?2",
+                    &params![generation_id, *chunk_id],
+                    |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?, row.get_typed(3)?)),
+                )?;
+                let Some((message_id, byte_start, byte_end, stored_blob)) = row else {
+                    ownership_failed += 1;
+                    failures.push(format!("⑩ chunk_id={chunk_id} disappeared mid-audit (concurrent write)"));
+                    continue;
+                };
+                let ownership_result: Result<()> = (|| {
+                    let (_conv_id, role, content) = load_message_once(storage, message_id)?;
+                    let normalized = crate::search::eligibility::normalized_for_chunks(&content);
+                    let (bs, be) = (usize::try_from(byte_start)?, usize::try_from(byte_end)?);
+                    if be > normalized.len() || bs > be {
+                        bail!("chunk span [{bs},{be}) out of bounds for message {message_id}'s normalized text (len {})", normalized.len());
+                    }
+                    let text = &normalized[bs..be];
+                    let stored_vec = schema::le_blob_to_f32_vector(&stored_blob)?;
+                    let fresh = embed_fn(&[text]).map_err(|e| anyhow!("re-embed failed: {e}"))?;
+                    let fresh_vec = fresh.first().ok_or_else(|| anyhow!("re-embed returned no vector"))?;
+                    let cos = cosine_similarity(&stored_vec, fresh_vec);
+                    if cos < 0.999 {
+                        bail!("fresh-vs-stored cosine {cos} < 0.999 (role={role})");
+                    }
+                    let hits = vector_domain::vec0_knn(conn, generation_id, &stored_vec, 1)?;
+                    let (top_hit, distance) = hits.first().copied().unwrap_or((-1, f64::INFINITY));
+                    if top_hit != *chunk_id || !(distance <= 1e-6) {
+                        bail!("vec0 row for chunk_id={chunk_id} does not match message_chunks' own BLOB (vec0 top hit={top_hit}, distance={distance})");
+                    }
+                    Ok(())
+                })();
+                if let Err(e) = ownership_result {
+                    ownership_failed += 1;
+                    failures.push(format!("⑩ ownership check failed for chunk_id={chunk_id}: {e}"));
+                }
+            }
+            if ownership_failed != 0 {
+                failures.push(format!("⑩ {ownership_failed}/{ownership_checked} sampled chunk(s) failed ownership verification"));
+            }
+
+            match compute_fresh_fingerprint_via(embed_fn, dim_usize) {
+                Ok(fresh_fingerprint) => {
+                    fingerprint_ok = fingerprint_matches(&stored_fingerprint, &fresh_fingerprint, dim_usize);
+                    if !fingerprint_ok {
+                        failures.push("⑪ fingerprint re-verification failed: fresh sentinel embeddings no longer match the stored generation fingerprint".to_string());
+                    }
+                }
+                Err(e) => {
+                    failures.push(format!("⑪ fingerprint re-verification errored: {e}"));
+                }
+            }
+        }
+    }
+
+    let passed = failures.is_empty() && !ownership_skipped;
+    Ok(ActivationAuditReportV5 {
+        generation_id,
+        passed,
+        dim_mismatch_count,
+        finite_norm_sample_size,
+        finite_norm_checked,
+        finite_norm_violation_count,
+        positive_check_message_id: anchor_message_id,
+        positive_check_chunk_id: anchor_chunk_id,
+        positive_check_top_hit_chunk_id: top_hit_chunk_id,
+        positive_check_distance: distance,
+        eligible_not_embedded_count,
+        embedded_not_eligible_count,
+        canonicalize_version_expected: CANONICALIZE_PIPELINE_VERSION,
+        canonicalize_version_actual,
+        foreign_key_violation_count,
+        chunk_count,
+        vec0_row_count,
+        chunks_missing_from_vec0,
+        vec0_chunks_missing_from_message_chunks,
+        hash_mismatch,
+        span_mismatch,
+        completeness_missing,
+        completeness_extra,
+        conversation_id_mismatch,
+        chunk_holes_remaining,
+        ownership_checked,
+        ownership_failed,
+        ownership_seed,
+        ownership_skipped,
+        fingerprint_ok,
+        failure_reasons: failures,
+    })
+}
+
+/// The fixed activation-time policy plan v5.1 mandates for every real
+/// caller ("激活路径（index --semantic / models backfill）必须传
+/// Some(embedder)、样本 200、seed 落日志"): run [`run_activation_audit_v5`]
+/// with a real embedder (never `None`), `OWNERSHIP_SAMPLE_SIZE_DEFAULT`
+/// (200), and log `ownership_seed` so a later investigation can find
+/// exactly which chunks a given run's ownership check sampled. Standalone
+/// (not folded into [`run_db_vector_catchup_backfill_v5`]) so both the
+/// backfill's own activation step and a future standalone re-audit entry
+/// point share one policy definition.
+pub fn activate_generation_v5(
+    storage: &FrankenStorage,
+    generation_id: i64,
+    embedder: &dyn Fn(&[&str]) -> std::result::Result<Vec<Vec<f32>>, String>,
+    ownership_seed: u64,
+) -> Result<ActivationAuditReportV5> {
+    tracing::info!(
+        generation_id,
+        ownership_seed,
+        ownership_sample = OWNERSHIP_SAMPLE_SIZE_DEFAULT,
+        "db_vector_catchup (T8): running v5 activation audit"
+    );
+    run_activation_audit_v5(
+        storage,
+        generation_id,
+        ACTIVATION_AUDIT_V5_DEFAULT_FINITE_NORM_SAMPLE_SIZE,
+        None,
+        Some(embedder),
+        OWNERSHIP_SAMPLE_SIZE_DEFAULT,
+        ownership_seed,
+    )
+}
+
+/// Drive one full v5 chunk-domain catch-up run (T8, plan v5.1, task book
+/// #92): find-or-create the generation by policy+fingerprint identity
+/// ([`find_reusable_or_create_generation_v5`]) -> claim/purge stale
+/// `chunk_staging` -> drain `chunk_holes` in key-paged batches (embed via
+/// `embedder`, small per-batch staging transaction, one message load per
+/// distinct `message_id` -- [`load_message_once`]/[`classify_chunk_hole`])
+/// -> move staged rows into `message_chunks` + `vec0` at each batch's end
+/// -> reverse-reconcile every touched message's stored chunks against its
+/// current expected set -> activate via [`activate_generation_v5`] iff no
+/// holes remain.
+///
+/// `identity`/`fingerprint` are caller-supplied (not probed internally)
+/// so this function -- and everything it calls -- is fully exercisable
+/// against a deterministic mock `embedder` in tests, with zero live
+/// Infinity dependency; the real CLI call sites probe them once via
+/// [`crate::search::infinity::probe_identity_and_fingerprint`] and pass
+/// the results straight through.
+#[allow(clippy::too_many_arguments)]
+pub fn run_db_vector_catchup_backfill_v5(
+    storage: &FrankenStorage,
+    batch_size: usize,
+    identity: &InfinityServedIdentity,
+    canonicalize_version: u32,
+    chunking_policy_version: u32,
+    fingerprint: &[u8],
+    embedder: &dyn Fn(&[&str]) -> std::result::Result<Vec<Vec<f32>>, String>,
+    ownership_seed: u64,
+) -> Result<DbVectorCatchupReport> {
+    if batch_size == 0 {
+        bail!("batch_size must be > 0");
+    }
+    let dim = i64::try_from(identity.dimension)
+        .map_err(|_| anyhow!("infinity dimension {} does not fit in i64", identity.dimension))?;
+    let now_ms = FrankenStorage::now_millis();
+
+    let (generation_id, reused_existing_generation) = find_reusable_or_create_generation_v5(
+        storage.raw(),
+        identity,
+        canonicalize_version,
+        chunking_policy_version,
+        fingerprint,
+        now_ms,
+    )?;
+    // Idempotent (`CREATE VIRTUAL TABLE IF NOT EXISTS`): a no-op for a
+    // reused generation, and the one place a brand-new generation's vec0
+    // table actually gets created (T8 populates it incrementally via
+    // `insert_vec0_rows_in_tx`, never a bulk rebuild, so nothing else in
+    // this function would ever create it otherwise).
+    vector_domain::create_vec0_table_for_generation(storage.raw(), generation_id, dim)
+        .context("ensuring the v5 chunk-domain vec0 table exists for this generation")?;
+
+    // Claim/purge stale staging up front (crash-resume): every currently
+    // expected chunk whose staging row already matches (same span+hash) is
+    // "reusable" and kept; anything else left over from a prior crashed
+    // run is purged, so a re-embed is never skipped for content that has
+    // since changed.
+    let mut all_expected: Vec<ExpectedChunk> = Vec::new();
+    for_each_expected_chunk(storage, 200, |c| {
+        all_expected.push(c);
+        Ok(())
+    })?;
+    let (reusable_staged_keys, staging_purged) = storage
+        .raw()
+        .with_tx(TxMode::Immediate, |tx| {
+            let reusable = schema::find_reusable_staging_in_tx(tx, generation_id, &all_expected)?;
+            let purged = schema::purge_stale_staging_in_tx(tx, generation_id, &reusable)?;
+            Ok((reusable, purged))
+        })
+        .context("claiming/purging chunk_staging at the start of the T8 catch-up run")?;
+    let staging_reused = reusable_staged_keys.len() as u64;
+    let reusable_staged_keys: HashSet<(i64, u32)> = reusable_staged_keys.into_iter().collect();
+
+    let mut chunks_embedded = 0u64;
+    let mut holes_written_off_beyond_expected = 0u64;
+    let mut messages_loaded = 0u64;
+    let mut touched_message_ids: HashSet<i64> = HashSet::new();
+
+    let mut after: Option<(i64, u32)> = None;
+    let mut current: Option<(i64, Vec<ExpectedChunk>)> = None; // (message_id, expected)
+    loop {
+        let keys = fetch_hole_keys(storage, generation_id, after, batch_size)?;
+        if keys.is_empty() {
+            break;
+        }
+        after = keys.last().map(|k| (k.message_id, k.chunk_idx));
+
+        let mut batch_rows: Vec<ChunkRow> = Vec::new();
+        let mut batch_keys: Vec<(i64, u32)> = Vec::new();
+        let mut resolved_off: Vec<(i64, u32)> = Vec::new();
+        let mut off_beyond_expected: Vec<(i64, u32)> = Vec::new();
+        // Collected here, embedded in one batched call below (control
+        // plane 2026-09-04: T12 shards ~2M chunks, one-Infinity-call-per-
+        // chunk is not viable at that scale -- a page's worth of pending
+        // embeds, up to `batch_size`, goes out as a single request, same
+        // batching discipline v4's `embed_messages_with_sink` already
+        // uses for `message_embeddings`).
+        let mut pending_embed: Vec<(i64, u32, i64, ChunkSpanRef, String)> = Vec::new();
+
+        for key in &keys {
+            touched_message_ids.insert(key.message_id);
+            if current.as_ref().map(|(mid, _)| *mid) != Some(key.message_id) {
+                let (conversation_id, role, content) = load_message_once(storage, key.message_id)?;
+                messages_loaded += 1;
+                let expected = if canonical_role(&role).is_none() {
+                    Vec::new()
+                } else {
+                    expected_chunks(key.message_id, conversation_id, &role, &content)
+                };
+                current = Some((key.message_id, expected));
+            }
+            let (_, expected) = current.as_ref().expect("just set above");
+
+            if canonical_role_is_excluded(storage, key.message_id, &current)? {
+                resolved_off.push((key.message_id, key.chunk_idx));
+                continue;
+            }
+
+            match classify_chunk_hole(key, expected) {
+                ChunkHoleDisposition::Embed(span) => {
+                    let map_key = (key.message_id, key.chunk_idx);
+                    if reusable_staged_keys.contains(&map_key) {
+                        // Crash-resume fast path: a prior (possibly
+                        // crashed) run already staged this exact chunk
+                        // (same span+hash, confirmed by `find_reusable_
+                        // staging_in_tx` up front) -- move it straight
+                        // into `message_chunks`/`vec0` without spending a
+                        // second (real, possibly expensive) Infinity call
+                        // re-embedding content that was already embedded.
+                        batch_keys.push(map_key);
+                    } else {
+                        let (conversation_id, _role, content) = load_message_once(storage, key.message_id)?;
+                        let normalized = crate::search::eligibility::normalized_for_chunks(&content);
+                        if span.byte_end > normalized.len() || span.byte_start > span.byte_end {
+                            bail!(
+                                "chunk span [{},{}) out of bounds for message {}'s normalized text (len {})",
+                                span.byte_start, span.byte_end, key.message_id, normalized.len()
+                            );
+                        }
+                        let text = normalized[span.byte_start..span.byte_end].to_string();
+                        pending_embed.push((key.message_id, key.chunk_idx, conversation_id, span, text));
+                    }
+                }
+                ChunkHoleDisposition::WriteOffCanonicalizeEmpty | ChunkHoleDisposition::WriteOffOutOfEligibilityScope => {
+                    resolved_off.push((key.message_id, key.chunk_idx));
+                }
+                ChunkHoleDisposition::WriteOffIndexBeyondExpected => {
+                    off_beyond_expected.push((key.message_id, key.chunk_idx));
+                }
+            }
+        }
+
+        if !pending_embed.is_empty() {
+            let texts: Vec<&str> = pending_embed.iter().map(|(_, _, _, _, t)| t.as_str()).collect();
+            let vectors = embedder(&texts).map_err(|e| anyhow!("batched embedding of {} chunk(s) failed: {e}", texts.len()))?;
+            if vectors.len() != pending_embed.len() {
+                bail!("embedder returned {} vector(s) for {} input(s) (batched embed)", vectors.len(), pending_embed.len());
+            }
+            for ((message_id, chunk_idx, conversation_id, span, _text), vector) in pending_embed.into_iter().zip(vectors) {
+                if vector.len() != identity.dimension {
+                    bail!("embedder returned dim {} != expected {} for message {message_id} chunk_idx {chunk_idx}", vector.len(), identity.dimension);
+                }
+                let norm = schema::l2_norm(&vector) as f32;
+                batch_rows.push(ChunkRow {
+                    generation_id,
+                    message_id,
+                    conversation_id,
+                    chunk_idx: span.chunk_idx,
+                    byte_start: span.byte_start,
+                    byte_end: span.byte_end,
+                    content_hash: span.content_hash,
+                    embedding: vector,
+                    norm,
+                    created_at_ms: FrankenStorage::now_millis(),
+                });
+                batch_keys.push((message_id, chunk_idx));
+            }
+        }
+
+        let batch_id = now_ms.wrapping_add(i64::try_from(chunks_embedded).unwrap_or(0));
+        storage
+            .raw()
+            .with_tx(TxMode::Immediate, |tx| {
+                if !batch_rows.is_empty() {
+                    schema::stage_chunk_rows_in_tx(tx, batch_id, &batch_rows)?;
+                }
+                if !batch_keys.is_empty() {
+                    // Moves *every* key in this batch -- both rows just
+                    // staged above and rows that were already reusably
+                    // staged from a prior run (skipped the embed, see the
+                    // `reusable_staged_keys` branch above) -- in one pass,
+                    // since `move_staging_to_chunks_in_tx` reads straight
+                    // from `chunk_staging` by key regardless of which
+                    // batch actually wrote that row.
+                    let new_chunk_ids = schema::move_staging_to_chunks_in_tx(tx, generation_id, &batch_keys)?;
+                    // Re-read the moved rows' own embedding BLOBs (not
+                    // `batch_rows`, which is missing the reused-staging
+                    // entries and would misalign with `new_chunk_ids`) to
+                    // populate vec0.
+                    let blobs: Vec<(i64, Vec<u8>)> = conn_blobs_for_chunk_ids(tx, &new_chunk_ids)?;
+                    let vec0_rows: Vec<(i64, &[u8])> = blobs.iter().map(|(id, blob)| (*id, blob.as_slice())).collect();
+                    vector_domain::insert_vec0_rows_in_tx(tx, generation_id, &vec0_rows)?;
+                }
+                for (message_id, chunk_idx) in resolved_off.iter().chain(off_beyond_expected.iter()) {
+                    schema::write_off_chunk_hole_in_tx(tx, generation_id, *message_id, *chunk_idx)?;
+                }
+                Ok(())
+            })
+            .context("writing a T8 chunk catch-up batch (stage -> move -> vec0 insert -> hole resolve)")?;
+
+        chunks_embedded = chunks_embedded.saturating_add(batch_rows.len() as u64);
+        holes_written_off_beyond_expected = holes_written_off_beyond_expected.saturating_add(off_beyond_expected.len() as u64);
+    }
+
+    // Reverse reconciliation: every message this run touched (had at least
+    // one hole key for) gets its full stored-chunk set pruned against its
+    // current expected set -- catches a message whose chunk count shrank
+    // (some of its old chunk rows are no longer expected at all, not just
+    // "index beyond expected" for a hole that never existed for them).
+    let mut chunks_pruned = 0u64;
+    for message_id in &touched_message_ids {
+        let expected: Vec<ExpectedChunk> = all_expected.iter().filter(|c| c.message_id == *message_id).cloned().collect();
+        let pruned = storage
+            .raw()
+            .with_tx(TxMode::Immediate, |tx| {
+                let pruned_chunk_ids = schema::prune_chunks_not_in_expected_in_tx(tx, generation_id, *message_id, &expected)?;
+                if !pruned_chunk_ids.is_empty() {
+                    vector_domain::delete_vec0_rows_in_tx(tx, generation_id, &pruned_chunk_ids)?;
+                }
+                Ok(pruned_chunk_ids.len() as u64)
+            })
+            .context("reverse-reconciling a touched message's stored chunks")?;
+        chunks_pruned = chunks_pruned.saturating_add(pruned);
+    }
+
+    let holes_after: i64 = storage.raw().query_row_map(
+        "SELECT COUNT(*) FROM chunk_holes WHERE generation_id = ?1",
+        &params![generation_id],
+        |row| row.get_typed(0),
+    )?;
+    let mut activated = false;
+    if holes_after == 0 {
+        let audit_report = activate_generation_v5(storage, generation_id, embedder, ownership_seed)
+            .context("running the T8 v5 activation audit before activating a chunk-domain generation")?;
+        if !audit_report.passed {
+            bail!(
+                "generation {generation_id} failed T8 activation audit, refusing to activate: {}",
+                audit_report.failure_reasons.join("; ")
+            );
+        }
+        schema::switch_active_generation(storage.raw(), generation_id, FrankenStorage::now_millis(), |tx| {
+            tx.execute(
+                "UPDATE embedding_generations SET audit_status = 'passed' WHERE id = ?1",
+                &params![generation_id],
+            )?;
+            Ok(())
+        })
+        .context("activating v5 chunk-domain generation")?;
+        activated = true;
+    }
+
+    let vec0_rows = usize::try_from(vector_domain::count_vec0_rows_for_generation(storage.raw(), generation_id).unwrap_or(0)).unwrap_or(0);
+
+    Ok(DbVectorCatchupReport {
+        generation_id,
+        reused_existing_generation,
+        embedder_id: identity.model_id.clone(),
+        dim,
+        eligible_seeded: 0,
+        embedded_inserted: 0,
+        stale_skipped: 0,
+        holes_before: 0,
+        holes_after: u64::try_from(holes_after).unwrap_or(0),
+        vec0_rows,
+        activated,
+        holes_written_off_ineligible: 0,
+        embeddings_pruned_ineligible: 0,
+        cleanup_deleted_generation_ids: Vec::new(),
+        cleanup_failures: Vec::new(),
+        chunks_embedded,
+        chunks_pruned,
+        holes_written_off_beyond_expected,
+        staging_reused,
+        staging_purged,
+        messages_loaded,
+    })
+}
+
+/// Re-read `message_chunks.embedding` for exactly the `chunk_id`s
+/// `move_staging_to_chunks_in_tx` just produced -- used instead of zipping
+/// against `batch_rows` because that Vec is missing an entry for every key
+/// that took the reused-staging fast path (never built a `ChunkRow` at
+/// all), which would misalign a positional zip against `new_chunk_ids`.
+fn conn_blobs_for_chunk_ids(tx: &crate::storage::api::Tx, chunk_ids: &[i64]) -> Result<Vec<(i64, Vec<u8>)>, StorageError> {
+    let mut out = Vec::with_capacity(chunk_ids.len());
+    for chunk_id in chunk_ids {
+        let blob: Vec<u8> = tx.query_row_map(
+            "SELECT embedding FROM message_chunks WHERE chunk_id = ?1",
+            &params![*chunk_id],
+            |row| row.get_typed(0),
+        )?;
+        out.push((*chunk_id, blob));
+    }
+    Ok(out)
+}
+
+/// `canonical_role`-exclusion re-check, factored out only to keep the
+/// drain loop's per-key body readable -- always reads the *already-cached*
+/// `current` message's role from `messages` again rather than caching the
+/// role itself alongside `expected`, since the empty-`expected` case alone
+/// cannot distinguish "role excluded" from "content canonicalizes empty"
+/// (see [`ChunkHoleDisposition`]'s doc comment). One extra indexed lookup
+/// per distinct message (not per hole key -- `current` still only changes
+/// once per message), not per key.
+fn canonical_role_is_excluded(storage: &FrankenStorage, message_id: i64, current: &Option<(i64, Vec<ExpectedChunk>)>) -> Result<bool> {
+    let Some((mid, expected)) = current else { return Ok(false) };
+    if *mid != message_id || !expected.is_empty() {
+        return Ok(false);
+    }
+    let role: String = storage
+        .raw()
+        .query_row_map("SELECT role FROM messages WHERE id = ?1", &params![message_id], |row| row.get_typed(0))
+        .with_context(|| format!("re-reading role for message {message_id}"))?;
+    Ok(canonical_role(&role).is_none())
+}
+
+// =============================================================================
 // Task book #80 (exec72): reverse-reconciliation prune. These tests exercise
 // `schema::prune_ineligible_message_embedding_in_tx` and its effect on
 // `run_activation_audit`'s check ④ directly -- not through
@@ -1642,5 +2718,828 @@ mod ineligible_embedding_prune_tests {
             .unwrap();
         assert_eq!(audit_status(&storage, gen_active), "pending", "the active generation this call was scoped to must be demoted");
         assert_eq!(audit_status(&storage, gen_other), "passed", "gen_other must still be untouched");
+    }
+}
+
+// =============================================================================
+// T8 (plan v5.1, task book #92) tests: chunk-level catch-up drain, staging
+// crash-resume, generation reuse by policy+fingerprint, audits ④⑦⑧⑨⑩⑪.
+// All non-`#[ignore]` tests use a deterministic mock embedder (no live
+// Infinity); `fingerprint_live_infinity_roundtrip`-style live proof is
+// `fingerprint_live_chunk_backfill_activates` at the bottom, `--ignored`.
+// =============================================================================
+#[cfg(test)]
+mod chunk_catchup_v5_tests {
+    use super::*;
+    use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+    use crate::search::chunking::CHUNKING_POLICY_VERSION;
+    use crate::search::infinity::FINGERPRINT_SENTINELS;
+
+    const TS: i64 = 1_770_600_000_000;
+    const DIM: usize = 4;
+
+    fn open_storage(path: &std::path::Path) -> FrankenStorage {
+        FrankenStorage::open(path).expect("open production storage")
+    }
+
+    fn ensure_agent(storage: &FrankenStorage) -> i64 {
+        storage
+            .ensure_agent(&Agent { id: None, slug: "claude_code".into(), name: "Claude Code".into(), version: Some("1.0".into()), kind: AgentKind::Cli })
+            .expect("ensure agent")
+    }
+
+    /// Deterministic, dependency-free "embedding": reproducible per exact
+    /// input text (critical for the ownership check's fresh-vs-stored
+    /// cosine to read exactly 1.0 for unmodified content), distinct with
+    /// overwhelming probability across different texts. Not cryptographic,
+    /// not `rand`-backed -- see [`ownership_sample_key`]'s doc comment for
+    /// the same "no new dependency, a few lines of hashing is enough"
+    /// reasoning applied here to embedding instead of sampling.
+    /// A long, pure-ASCII, non-repeating filler of exactly `char_len` bytes
+    /// (Champernowne-style increasing digit stream: "0123456789101112...",
+    /// truncated) -- unlike `"a".repeat(n)`, no two same-length windows of
+    /// this string are ever byte-identical, so slicing it into multiple
+    /// chunks never accidentally produces genuine content twins (which
+    /// would make [`deterministic_vector`] -- keyed purely on text --
+    /// produce the same vector for two different `chunk_id`s, confusing
+    /// audit ③'s self-hit check the same way v4's own `tied_content_twin`
+    /// doc comment describes for repeated short messages). No markdown
+    /// symbols or whitespace, so `canonicalize_for_embedding` passes it
+    /// through byte-for-byte -- the chunk math in these tests assumes that.
+    fn long_unique_filler(char_len: usize) -> String {
+        let mut s = String::with_capacity(char_len + 16);
+        let mut n: u64 = 0;
+        while s.len() < char_len {
+            s.push_str(&n.to_string());
+            n += 1;
+        }
+        s.truncate(char_len);
+        s
+    }
+
+    fn deterministic_vector(text: &str, dim: usize) -> Vec<f32> {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        (0..dim)
+            .map(|i| {
+                let mut hasher = DefaultHasher::new();
+                text.hash(&mut hasher);
+                i.hash(&mut hasher);
+                1.0 + (hasher.finish() % 1000) as f32 / 1000.0
+            })
+            .collect()
+    }
+
+    fn mock_embed(texts: &[&str]) -> std::result::Result<Vec<Vec<f32>>, String> {
+        Ok(texts.iter().map(|t| deterministic_vector(t, DIM)).collect())
+    }
+
+    fn mock_fingerprint() -> Vec<u8> {
+        let mut out = Vec::new();
+        for s in FINGERPRINT_SENTINELS {
+            out.extend_from_slice(&schema::f32_vector_to_le_blob(&deterministic_vector(s, DIM)));
+        }
+        out
+    }
+
+    fn mock_identity() -> InfinityServedIdentity {
+        InfinityServedIdentity { model_id: "mock-embedder-t8".to_string(), dimension: DIM }
+    }
+
+    fn insert_conversation(storage: &FrankenStorage, external_id: &str, contents: &[&str]) -> Vec<i64> {
+        let agent_id = ensure_agent(storage);
+        let messages: Vec<Message> = contents
+            .iter()
+            .enumerate()
+            .map(|(idx, content)| Message {
+                id: None,
+                idx: idx as i64,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(TS + idx as i64),
+                content: content.to_string(),
+                extra_json: serde_json::Value::Null,
+                snippets: vec![],
+            })
+            .collect();
+        let conv = Conversation {
+            id: None,
+            agent_slug: "claude_code".into(),
+            workspace: None,
+            external_id: Some(external_id.into()),
+            title: Some("T8 v5 fixture".into()),
+            source_path: std::path::PathBuf::from(format!("/fixtures/{external_id}.jsonl")),
+            started_at: Some(TS),
+            ended_at: Some(TS + contents.len() as i64),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages,
+            source_id: "local".into(),
+            origin_host: None,
+        };
+        storage.insert_conversation_tree(agent_id, None, &conv).expect("insert fixture conversation");
+        storage
+            .raw()
+            .query_all_map(
+                "SELECT m.id FROM messages m JOIN conversations c ON c.id = m.conversation_id WHERE c.external_id = ?1 ORDER BY m.idx",
+                &params![external_id],
+                |row| row.get_typed(0),
+            )
+            .unwrap()
+    }
+
+    fn chunk_holes_count(storage: &FrankenStorage, generation_id: i64) -> i64 {
+        storage.raw().query_row_map("SELECT COUNT(*) FROM chunk_holes WHERE generation_id = ?1", &params![generation_id], |row| row.get_typed(0)).unwrap()
+    }
+
+    fn message_chunks_count(storage: &FrankenStorage, generation_id: i64) -> i64 {
+        storage.raw().query_row_map("SELECT COUNT(*) FROM message_chunks WHERE generation_id = ?1", &params![generation_id], |row| row.get_typed(0)).unwrap()
+    }
+
+    fn chunk_staging_count(storage: &FrankenStorage, generation_id: i64) -> i64 {
+        storage.raw().query_row_map("SELECT COUNT(*) FROM chunk_staging WHERE generation_id = ?1", &params![generation_id], |row| row.get_typed(0)).unwrap()
+    }
+
+    /// Genesis call (empty DB -> creates+activates a fresh generation with
+    fn backfill(storage: &FrankenStorage) -> Result<DbVectorCatchupReport> {
+        run_db_vector_catchup_backfill_v5(storage, 100, &mock_identity(), CANONICALIZE_PIPELINE_VERSION, CHUNKING_POLICY_VERSION, &mock_fingerprint(), &mock_embed, 42)
+    }
+
+    /// Create the (pending, unactivated) generation + its empty vec0 table
+    /// directly -- *not* via [`backfill`] -- so a fixture's messages can be
+    /// inserted afterward with something for `register_chunk_holes_for_
+    /// message_in_tx` to register against (it matches `is_active=1 OR
+    /// audit_status='pending'`, and a freshly created row is already
+    /// `audit_status='pending'` by DDL default, no activation needed).
+    /// Deliberately does not run the full activate-audit path on a
+    /// zero-chunk generation -- ③'s positive-check has no anchor to pick
+    /// with nothing embedded yet, the same reason v4's own audit `?`-
+    /// propagates rather than reporting `passed=false` for an empty
+    /// generation; a real corpus is never actually empty in production.
+    fn genesis(storage: &FrankenStorage) -> i64 {
+        let identity = mock_identity();
+        let generation_id = storage
+            .raw()
+            .with_tx(TxMode::Immediate, |tx| {
+                schema::create_embedding_generation_v5(tx, &identity.model_id, DIM as i64, CANONICALIZE_PIPELINE_VERSION, CHUNKING_POLICY_VERSION, &mock_fingerprint(), TS)
+            })
+            .unwrap();
+        vector_domain::create_vec0_table_for_generation(storage.raw(), generation_id, DIM as i64).unwrap();
+        generation_id
+    }
+
+    #[test]
+    fn catchup_drains_multi_chunk_message_via_staging() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_storage(&dir.path().join("db.sqlite"));
+        let generation_id = genesis(&storage);
+
+        // "a"*2500, no separators -> 3 hard-cut chunks: [0,1000) [900,1900) [1800,2500).
+        insert_conversation(&storage, "t8-multi-chunk", &[long_unique_filler(2500).as_str()]);
+        assert_eq!(chunk_holes_count(&storage, generation_id), 3, "sanity: ingest-time hook must have registered 3 chunk_holes");
+
+        let report = backfill(&storage).unwrap();
+        assert_eq!(report.chunks_embedded, 3, "all 3 chunks must be embedded via staging: {report:?}");
+        assert_eq!(message_chunks_count(&storage, generation_id), 3);
+        assert_eq!(chunk_holes_count(&storage, generation_id), 0, "every hole must be resolved");
+        assert_eq!(chunk_staging_count(&storage, generation_id), 0, "staging must be empty once moved");
+        assert!(report.activated, "zero remaining holes must activate: {report:?}");
+    }
+
+    #[test]
+    fn catchup_loads_each_message_once_per_run() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_storage(&dir.path().join("db.sqlite"));
+        let generation_id = genesis(&storage);
+
+        // 269,600 'a's -> exactly 300 chunks (299 hard-cut + 1 final), by
+        // construction: chunk k (0-indexed) starts at 900*k; chunk 299
+        // starts at 269,100 with 500 chars remaining (<=1000 -> final).
+        insert_conversation(&storage, "t8-once-big", &[long_unique_filler(269_600).as_str()]);
+        for i in 0..5 {
+            insert_conversation(&storage, &format!("t8-once-small-{i}"), &[format!("a single-chunk message number {i} with plenty of distinct real content to embed").as_str()]);
+        }
+        assert_eq!(chunk_holes_count(&storage, generation_id), 305, "sanity: 300 + 5*1 holes registered");
+
+        let report = backfill(&storage).unwrap();
+        assert_eq!(report.chunks_embedded, 305);
+        // Direct evidence of the "load each message once" invariant: the
+        // per-message read counter incremented exactly once per distinct
+        // message_id, across however many pages (batch_size=100 -> the
+        // 300-chunk message spans 3 pages) that message's holes spanned.
+        assert_eq!(report.messages_loaded, 6, "6 distinct messages must each be loaded exactly once, regardless of how many pages/chunks they span: {report:?}");
+        assert_eq!(chunk_holes_count(&storage, generation_id), 0);
+    }
+
+    #[test]
+    fn catchup_resumes_from_staging_after_crash() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_storage(&dir.path().join("db.sqlite"));
+        let generation_id = genesis(&storage);
+
+        // "a"*1500 -> 2 chunks: [0,1000) hard-cut, [900,1500) final.
+        insert_conversation(&storage, "t8-resume", &["a".repeat(1500).as_str()]);
+        let message_id: i64 = storage.raw().query_row_map("SELECT id FROM messages LIMIT 1", &[], |row| row.get_typed(0)).unwrap();
+        let expected = crate::search::eligibility::expected_chunks(message_id, 0, "user", &"a".repeat(1500));
+        assert_eq!(expected.len(), 2);
+
+        // Simulate "chunk_idx=0 already embedded by a run that crashed
+        // before it could move staging into message_chunks": stage it
+        // directly with the real span/hash/vector a live run would have
+        // produced.
+        let chunk0 = &expected[0];
+        let normalized = crate::search::eligibility::normalized_for_chunks(&"a".repeat(1500));
+        let text0 = &normalized[chunk0.byte_start..chunk0.byte_end];
+        let vector0 = deterministic_vector(text0, DIM);
+        let norm0 = schema::l2_norm(&vector0) as f32;
+        storage
+            .raw()
+            .with_tx(TxMode::Immediate, |tx| {
+                schema::stage_chunk_rows_in_tx(
+                    tx,
+                    999_000, // fabricated batch_id, distinct from any real run's
+                    &[ChunkRow {
+                        generation_id,
+                        message_id,
+                        conversation_id: 0, // overwritten below to the real value before asserting
+                        chunk_idx: chunk0.chunk_idx,
+                        byte_start: chunk0.byte_start,
+                        byte_end: chunk0.byte_end,
+                        content_hash: chunk0.content_hash.clone(),
+                        embedding: vector0.clone(),
+                        norm: norm0,
+                        created_at_ms: TS,
+                    }],
+                )
+            })
+            .unwrap();
+        // conversation_id above was a placeholder (0) -- correct it so the
+        // reuse match (which does not check conversation_id) still lands
+        // on a row `move_staging_to_chunks_in_tx` can insert without a FK
+        // violation against the real conversations row.
+        let conv_id: i64 = storage.raw().query_row_map("SELECT conversation_id FROM messages WHERE id = ?1", &params![message_id], |row| row.get_typed(0)).unwrap();
+        storage
+            .raw()
+            .execute(
+                "UPDATE chunk_staging SET conversation_id = ?1 WHERE generation_id = ?2 AND message_id = ?3 AND chunk_idx = ?4",
+                &params![conv_id, generation_id, message_id, chunk0.chunk_idx],
+            )
+            .unwrap();
+
+        let report = backfill(&storage).unwrap();
+        assert_eq!(report.staging_reused, 1, "the pre-staged chunk_idx=0 must be recognized as reusable: {report:?}");
+        assert_eq!(message_chunks_count(&storage, generation_id), 2, "both chunks must land in message_chunks, the reused one and the freshly-embedded one");
+        assert_eq!(chunk_holes_count(&storage, generation_id), 0);
+        assert_eq!(chunk_staging_count(&storage, generation_id), 0);
+    }
+
+    #[test]
+    fn catchup_purges_stale_staging_on_hash_or_span_change() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_storage(&dir.path().join("db.sqlite"));
+        let generation_id = genesis(&storage);
+
+        insert_conversation(&storage, "t8-stale-staging", &["a single-chunk message with plenty of real content to embed"]);
+        let message_id: i64 = storage.raw().query_row_map("SELECT id FROM messages LIMIT 1", &[], |row| row.get_typed(0)).unwrap();
+        let conv_id: i64 = storage.raw().query_row_map("SELECT conversation_id FROM messages WHERE id = ?1", &params![message_id], |row| row.get_typed(0)).unwrap();
+
+        // A staged row for chunk_idx=0 whose content_hash does NOT match
+        // what `expected_chunks` currently says (simulates content that
+        // changed since a prior crashed run staged this chunk).
+        storage
+            .raw()
+            .with_tx(TxMode::Immediate, |tx| {
+                schema::stage_chunk_rows_in_tx(
+                    tx,
+                    999_001,
+                    &[ChunkRow {
+                        generation_id,
+                        message_id,
+                        conversation_id: conv_id,
+                        chunk_idx: 0,
+                        byte_start: 0,
+                        byte_end: 10,
+                        content_hash: "stale-hash-does-not-match-current-content".to_string(),
+                        embedding: vec![9.0; DIM],
+                        norm: 9.0,
+                        created_at_ms: TS,
+                    }],
+                )
+            })
+            .unwrap();
+        assert_eq!(chunk_staging_count(&storage, generation_id), 1, "sanity: the stale row is staged before the run");
+
+        let report = backfill(&storage).unwrap();
+        assert_eq!(report.staging_purged, 1, "the stale (hash-mismatched) staged row must be purged, not reused: {report:?}");
+        assert_eq!(report.staging_reused, 0);
+        assert_eq!(message_chunks_count(&storage, generation_id), 1, "the chunk must still get correctly (freshly) embedded despite the stale staging leftover");
+        assert_eq!(chunk_holes_count(&storage, generation_id), 0);
+    }
+
+    #[test]
+    fn catchup_active_generation_requires_policy_and_fingerprint() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_storage(&dir.path().join("db.sqlite"));
+        let identity = mock_identity();
+        let wrong_fingerprint = vec![0u8; mock_fingerprint().len()];
+
+        let stale_generation_id = storage
+            .raw()
+            .with_tx(TxMode::Immediate, |tx| {
+                schema::create_embedding_generation_v5(tx, &identity.model_id, DIM as i64, CANONICALIZE_PIPELINE_VERSION, CHUNKING_POLICY_VERSION, &wrong_fingerprint, TS)
+            })
+            .unwrap();
+        storage.raw().execute("UPDATE embedding_generations SET is_active = 1, audit_status = 'passed' WHERE id = ?1", &params![stale_generation_id]).unwrap();
+
+        let (generation_id, reused) =
+            find_reusable_or_create_generation_v5(storage.raw(), &identity, CANONICALIZE_PIPELINE_VERSION, CHUNKING_POLICY_VERSION, &mock_fingerprint(), TS + 1).unwrap();
+        assert_ne!(generation_id, stale_generation_id, "an active row with a drifted fingerprint must never be reused, even with matching embedder_id/dim/versions");
+        assert!(!reused, "a fingerprint mismatch must fall through to creating a new generation: reused={reused}");
+    }
+
+    #[test]
+    fn catchup_pending_generation_requires_policy_and_fingerprint() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_storage(&dir.path().join("db.sqlite"));
+        let identity = mock_identity();
+        let wrong_fingerprint = vec![0u8; mock_fingerprint().len()];
+
+        let stale_generation_id = storage
+            .raw()
+            .with_tx(TxMode::Immediate, |tx| {
+                schema::create_embedding_generation_v5(tx, &identity.model_id, DIM as i64, CANONICALIZE_PIPELINE_VERSION, CHUNKING_POLICY_VERSION, &wrong_fingerprint, TS)
+            })
+            .unwrap();
+        // Left is_active=0, audit_status='pending' (the DDL default) --
+        // the pending-reuse tier.
+
+        let (generation_id, reused) =
+            find_reusable_or_create_generation_v5(storage.raw(), &identity, CANONICALIZE_PIPELINE_VERSION, CHUNKING_POLICY_VERSION, &mock_fingerprint(), TS + 1).unwrap();
+        assert_ne!(generation_id, stale_generation_id, "a pending row with a drifted fingerprint must never be reused");
+        assert!(!reused);
+    }
+
+    /// Builds a small, fully-consistent generation (2 single-chunk
+    /// messages, cleanly activated) for the audit tests below to corrupt
+    /// in a targeted way and re-audit.
+    fn clean_two_message_generation(storage: &FrankenStorage) -> (i64, i64, i64) {
+        let generation_id = genesis(storage);
+        insert_conversation(storage, "t8-audit-a", &["message A has plenty of real content to embed and chunk"]);
+        insert_conversation(storage, "t8-audit-b", &["message B has plenty of real content to embed and chunk"]);
+        let report = backfill(storage).unwrap();
+        assert!(report.activated, "fixture setup must cleanly activate: {report:?}");
+        assert_eq!(message_chunks_count(storage, generation_id), 2);
+        let ids: Vec<i64> = storage.raw().query_all_map("SELECT chunk_id FROM message_chunks WHERE generation_id = ?1 ORDER BY chunk_id", &params![generation_id], |row| row.get_typed(0)).unwrap();
+        (generation_id, ids[0], ids[1])
+    }
+
+    #[test]
+    fn audit_4_bidirectional_anti_join_by_chunk() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_storage(&dir.path().join("db.sqlite"));
+        let (generation_id, chunk_id_a, _chunk_id_b) = clean_two_message_generation(&storage);
+
+        let baseline = run_activation_audit_v5(&storage, generation_id, 10, None, Some(&mock_embed), 10, 1).unwrap();
+        assert_eq!(baseline.eligible_not_embedded_count, 0);
+        assert_eq!(baseline.embedded_not_eligible_count, 0);
+
+        // Delete one message_chunks row directly (bypassing the catch-up
+        // worker) -- its message is still eligible, so this now leaves an
+        // "eligible but not embedded" gap check ④ must catch.
+        storage.raw().execute("DELETE FROM message_chunks WHERE chunk_id = ?1", &params![chunk_id_a]).unwrap();
+
+        let after = run_activation_audit_v5(&storage, generation_id, 10, None, Some(&mock_embed), 10, 1).unwrap();
+        assert!(!after.passed);
+        assert_eq!(after.eligible_not_embedded_count, 1, "④ must count exactly the one row removed: {after:?}");
+    }
+
+    #[test]
+    fn audit_7_detects_vec0_set_mismatch() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_storage(&dir.path().join("db.sqlite"));
+        let (generation_id, chunk_id_a, _chunk_id_b) = clean_two_message_generation(&storage);
+
+        storage.raw().with_tx(TxMode::Immediate, |tx| vector_domain::delete_vec0_rows_in_tx(tx, generation_id, &[chunk_id_a])).unwrap();
+
+        let after = run_activation_audit_v5(&storage, generation_id, 10, None, Some(&mock_embed), 10, 1).unwrap();
+        assert!(!after.passed);
+        assert_eq!(after.chunks_missing_from_vec0, 1, "⑦ must count the one message_chunks row now missing from vec0: {after:?}");
+        assert_eq!(after.vec0_chunks_missing_from_message_chunks, 0);
+    }
+
+    #[test]
+    fn audit_8_detects_stale_hash() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_storage(&dir.path().join("db.sqlite"));
+        let (generation_id, chunk_id_a, _chunk_id_b) = clean_two_message_generation(&storage);
+
+        storage.raw().execute("UPDATE message_chunks SET content_hash = 'deliberately-wrong-hash' WHERE chunk_id = ?1", &params![chunk_id_a]).unwrap();
+
+        let after = run_activation_audit_v5(&storage, generation_id, 10, None, Some(&mock_embed), 10, 1).unwrap();
+        assert!(!after.passed);
+        assert_eq!(after.hash_mismatch, 1, "⑧ must catch the one stored hash that no longer matches the recomputed one: {after:?}");
+        assert_eq!(after.span_mismatch, 0, "only the hash was corrupted, not the span");
+    }
+
+    #[test]
+    fn audit_9_detects_span_mismatch() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_storage(&dir.path().join("db.sqlite"));
+        let (generation_id, chunk_id_a, _chunk_id_b) = clean_two_message_generation(&storage);
+
+        storage.raw().execute("UPDATE message_chunks SET byte_start = byte_start + 1 WHERE chunk_id = ?1", &params![chunk_id_a]).unwrap();
+
+        let after = run_activation_audit_v5(&storage, generation_id, 10, None, Some(&mock_embed), 10, 1).unwrap();
+        assert_eq!(after.span_mismatch, 1, "⑨ must catch the one chunk whose stored span no longer matches the recomputed one: {after:?}");
+        assert!(!after.passed);
+    }
+
+    #[test]
+    fn audit_9_detects_missing_extra_and_conversation_id() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_storage(&dir.path().join("db.sqlite"));
+        let (generation_id, chunk_id_a, chunk_id_b) = clean_two_message_generation(&storage);
+
+        // Missing: delete A's row entirely (also exercises ④, but ⑨'s
+        // completeness_missing must independently count it too).
+        let (message_id_a, conv_id_a, chunk_idx_a, byte_start_a, byte_end_a, hash_a, embedding_a, norm_a): (i64, i64, u32, i64, i64, String, Vec<u8>, f64) = storage
+            .raw()
+            .query_row_map(
+                "SELECT message_id, conversation_id, chunk_idx, byte_start, byte_end, content_hash, embedding, norm FROM message_chunks WHERE chunk_id = ?1",
+                &params![chunk_id_a],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?, row.get_typed(3)?, row.get_typed(4)?, row.get_typed(5)?, row.get_typed(6)?, row.get_typed(7)?)),
+            )
+            .unwrap();
+        storage.raw().execute("DELETE FROM message_chunks WHERE chunk_id = ?1", &params![chunk_id_a]).unwrap();
+
+        // conversation_id mismatch: corrupt B's stored conversation_id.
+        storage.raw().execute("UPDATE message_chunks SET conversation_id = conversation_id + 999999 WHERE chunk_id = ?1", &params![chunk_id_b]).unwrap();
+
+        // Extra: insert a bogus row for message A at an index the current
+        // expected-chunk set does not have (message A only has chunk_idx=0).
+        storage
+            .raw()
+            .execute(
+                "INSERT INTO message_chunks (generation_id, message_id, conversation_id, chunk_idx, byte_start, byte_end, content_hash, embedding, norm, created_at) \
+                 VALUES (?1, ?2, ?3, 7, 0, 5, 'bogus-extra-hash', ?4, 1.0, ?5)",
+                &params![generation_id, message_id_a, conv_id_a, schema::f32_vector_to_le_blob(&deterministic_vector("bogus", DIM)), TS],
+            )
+            .unwrap();
+        let _ = (chunk_idx_a, byte_start_a, byte_end_a, hash_a, embedding_a, norm_a); // captured for readability, not reused
+
+        let after = run_activation_audit_v5(&storage, generation_id, 10, None, Some(&mock_embed), 10, 1).unwrap();
+        assert!(!after.passed);
+        assert_eq!(after.completeness_missing, 1, "⑨ missing: {after:?}");
+        assert_eq!(after.completeness_extra, 1, "⑨ extra: {after:?}");
+        assert_eq!(after.conversation_id_mismatch, 1, "⑨ conversation_id: {after:?}");
+    }
+
+    #[test]
+    fn audit_10_detects_swapped_vectors() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_storage(&dir.path().join("db.sqlite"));
+        let (generation_id, chunk_id_a, chunk_id_b) = clean_two_message_generation(&storage);
+
+        let embed_a: Vec<u8> = storage.raw().query_row_map("SELECT embedding FROM message_chunks WHERE chunk_id = ?1", &params![chunk_id_a], |row| row.get_typed(0)).unwrap();
+        let embed_b: Vec<u8> = storage.raw().query_row_map("SELECT embedding FROM message_chunks WHERE chunk_id = ?1", &params![chunk_id_b], |row| row.get_typed(0)).unwrap();
+        storage.raw().execute("UPDATE message_chunks SET embedding = ?1 WHERE chunk_id = ?2", &params![embed_b.clone(), chunk_id_a]).unwrap();
+        storage.raw().execute("UPDATE message_chunks SET embedding = ?1 WHERE chunk_id = ?2", &params![embed_a.clone(), chunk_id_b]).unwrap();
+
+        let after = run_activation_audit_v5(&storage, generation_id, 10, None, Some(&mock_embed), 10, 1).unwrap();
+        assert!(!after.passed);
+        assert_eq!(after.ownership_checked, 2);
+        assert_eq!(after.ownership_failed, 2, "⑩ both swapped chunks must fail ownership (fresh re-embed no longer matches stored, and/or vec0 no longer matches the swapped BLOB): {after:?}");
+        assert!(!after.ownership_skipped);
+    }
+
+    #[test]
+    fn audit_10_none_embedder_fails_activation() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_storage(&dir.path().join("db.sqlite"));
+        let (generation_id, _a, _b) = clean_two_message_generation(&storage);
+
+        let after = run_activation_audit_v5(&storage, generation_id, 10, None, None, 10, 1).unwrap();
+        assert!(after.ownership_skipped);
+        assert!(!after.passed, "embedder=None must always fail the verdict, even if ①-⑨ are otherwise clean: {after:?}");
+    }
+
+    #[test]
+    fn activation_path_passes_some_embedder_sample_200_and_logs_seed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_storage(&dir.path().join("db.sqlite"));
+        let (generation_id, _a, _b) = clean_two_message_generation(&storage);
+
+        let seed = 987_654_321_u64;
+        let report = activate_generation_v5(&storage, generation_id, &mock_embed, seed).unwrap();
+        assert!(report.passed, "a clean generation must pass the fixed activation policy: {report:?}");
+        assert!(!report.ownership_skipped, "activate_generation_v5 must always pass Some(embedder), never None");
+        assert_eq!(report.ownership_seed, seed, "the seed passed in must be exactly what the report (and the tracing::info! log line) carries");
+        assert_eq!(report.ownership_checked, 2, "min(200, chunk_count=2) = 2");
+        assert!(report.fingerprint_ok);
+    }
+
+    #[test]
+    fn audit_11_detects_fingerprint_drift() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_storage(&dir.path().join("db.sqlite"));
+        let identity = mock_identity();
+        let wrong_fingerprint = vec![0u8; mock_fingerprint().len()];
+        let generation_id = storage
+            .raw()
+            .with_tx(TxMode::Immediate, |tx| {
+                schema::create_embedding_generation_v5(tx, &identity.model_id, DIM as i64, CANONICALIZE_PIPELINE_VERSION, CHUNKING_POLICY_VERSION, &wrong_fingerprint, TS)
+            })
+            .unwrap();
+        vector_domain::create_vec0_table_for_generation(storage.raw(), generation_id, DIM as i64).unwrap();
+
+        let after = run_activation_audit_v5(&storage, generation_id, 10, None, Some(&mock_embed), 10, 1).unwrap();
+        assert!(!after.fingerprint_ok, "a stored fingerprint that does not match the embedder's real sentinel output must fail ⑪: {after:?}");
+        assert!(!after.passed);
+    }
+
+    #[test]
+    fn audit_normal_path_prune_and_writeoff_zero() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_storage(&dir.path().join("db.sqlite"));
+        let generation_id = genesis(&storage);
+        insert_conversation(&storage, "t8-normal-path", &["a normal message with plenty of real content to embed and chunk cleanly"]);
+
+        let report = backfill(&storage).unwrap();
+        assert_eq!(report.chunks_pruned, 0, "the normal path must never prune anything: {report:?}");
+        assert_eq!(report.holes_written_off_beyond_expected, 0);
+        assert!(report.activated);
+        let _ = generation_id;
+    }
+
+    /// plan v5.1 Global Constraints "三处同函数 + 独立 oracle": the drain
+    /// loop's per-message `expected_chunks` call, audit ④'s `for_each_
+    /// expected_chunk` eligible set, and audit ⑧⑨'s `for_each_expected_
+    /// chunk`-derived expected-by-key map must never diverge from each
+    /// other or from what actually ends up persisted -- there is exactly
+    /// one shared primitive (`crate::search::eligibility`) all three read
+    /// through, not three independent re-derivations that could drift.
+    #[test]
+    fn semantic_three_sites_agree() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_storage(&dir.path().join("db.sqlite"));
+        let generation_id = genesis(&storage);
+        insert_conversation(&storage, "t8-agree-a", &[long_unique_filler(2500).as_str(), "a short but real second message here"]);
+        insert_conversation(&storage, "t8-agree-b", &["another real message with enough content to chunk"]);
+        backfill(&storage).unwrap();
+
+        let mut independently_computed: HashSet<(i64, u32, i64, i64, String)> = HashSet::new();
+        for_each_expected_chunk(&storage, 200, |c| {
+            independently_computed.insert((c.message_id, c.chunk_idx, c.byte_start as i64, c.byte_end as i64, c.content_hash));
+            Ok(())
+        })
+        .unwrap();
+
+        let stored: HashSet<(i64, u32, i64, i64, String)> = storage
+            .raw()
+            .query_all_map(
+                "SELECT message_id, chunk_idx, byte_start, byte_end, content_hash FROM message_chunks WHERE generation_id = ?1",
+                &params![generation_id],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?, row.get_typed(3)?, row.get_typed(4)?)),
+            )
+            .unwrap()
+            .into_iter()
+            .collect();
+
+        assert_eq!(stored, independently_computed, "the drain-time (per-message expected_chunks), audit-time (for_each_expected_chunk), and persisted sets must be identical -- no divergent re-derivation");
+    }
+
+    /// Live proof (real Infinity at 127.0.0.1:7997): a real chunk-domain
+    /// backfill run must actually activate, using the real production
+    /// embedder wrapper (`InfinityEmbedder::embed_batch_sync`) instead of
+    /// the deterministic mock every other test in this module uses.
+    /// `#[ignore]`d -- run explicitly with `--ignored`.
+    #[test]
+    #[ignore]
+    fn fingerprint_live_chunk_backfill_activates() {
+        use crate::search::embedder::Embedder as _;
+        use crate::search::infinity::{InfinityConfig, InfinityEmbedder, probe_identity_and_fingerprint};
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_storage(&dir.path().join("db.sqlite"));
+
+        let config = InfinityConfig::from_env();
+        let (identity, fingerprint) = probe_identity_and_fingerprint(&config).expect("live infinity identity+fingerprint probe");
+        let embedder = InfinityEmbedder::new().expect("live infinity embedder");
+        let embed_fn = |texts: &[&str]| embedder.embed_batch_sync(texts).map_err(|e| e.to_string());
+
+        // Create the (pending) generation + its vec0 table directly --
+        // not via a genesis backfill call on zero messages -- for the same
+        // reason `genesis()` above does (③'s positive-check has no anchor
+        // to pick with nothing embedded yet; a real corpus is never
+        // actually empty in production).
+        let generation_id = storage
+            .raw()
+            .with_tx(TxMode::Immediate, |tx| {
+                schema::create_embedding_generation_v5(tx, &identity.model_id, i64::try_from(identity.dimension).unwrap(), CANONICALIZE_PIPELINE_VERSION, CHUNKING_POLICY_VERSION, &fingerprint, TS)
+            })
+            .unwrap();
+        vector_domain::create_vec0_table_for_generation(storage.raw(), generation_id, i64::try_from(identity.dimension).unwrap()).unwrap();
+
+        insert_conversation(&storage, "t8-live", &["a real message about how vec0 chunk-domain catch-up should behave against a live Infinity service"]);
+        let report = run_db_vector_catchup_backfill_v5(&storage, 32, &identity, CANONICALIZE_PIPELINE_VERSION, CHUNKING_POLICY_VERSION, &fingerprint, &embed_fn, 7).unwrap();
+        assert_eq!(report.generation_id, generation_id);
+        assert!(report.activated, "a real live drain of one small message must activate cleanly: {report:?}");
+        assert!(report.chunks_embedded >= 1);
+    }
+
+    /// mission #92 Step 4/5 (T-R's own v5 positive fixture source, per
+    /// control plane 2026-09-04): a synthetic 200-conversation corpus,
+    /// drained through the *real* candidate release binary (via the run
+    /// root wrapper, `$CASS_WRAP index --semantic`) against a real
+    /// Infinity, must activate cleanly with a zero-failure audit and
+    /// `ownership_checked == 200`. `#[ignore]`d, run with `--ignored`.
+    ///
+    /// No run-root path is hardcoded here (PUBLIC repo constraint,
+    /// control plane 2026-09-04): the data dir comes from
+    /// `CASS_W4_SYNTH_DIR` (falls back to an ephemeral tempdir if unset,
+    /// so the test still runs standalone) and the wrapper binary from
+    /// `CASS_WRAP` -- both set by whoever invokes this test, not baked
+    /// into the source.
+    ///
+    /// The 200 conversations are seeded via the production write path
+    /// directly (`insert_conversation_tree`) -- "走生产写入路径建库" -- not
+    /// via any CLI ingest command (there is no source file to scan); only
+    /// the *semantic* step goes through the real CLI subprocess. The
+    /// generation is pre-created (same reason `genesis()`/the single-
+    /// message live test above do it) via the exact same `probe_identity_
+    /// and_fingerprint` call the CLI subprocess will independently make
+    /// against the same live Infinity -- both resolve to the same
+    /// identity+fingerprint bytes, so the subprocess's own generation
+    /// lookup reuses this pre-created row (tier ① of `find_reusable_or_
+    /// create_generation_v5`) instead of creating a second one.
+    #[test]
+    #[ignore]
+    fn live_synth_200_v5_backfill_via_real_binary() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use crate::search::infinity::{InfinityConfig, InfinityEmbedder, probe_identity_and_fingerprint};
+
+        let synth_dir_env = std::env::var("CASS_W4_SYNTH_DIR").ok();
+        let _tempdir_keepalive;
+        let synth_dir: std::path::PathBuf = match &synth_dir_env {
+            Some(dir) => {
+                std::fs::create_dir_all(dir).expect("create CASS_W4_SYNTH_DIR");
+                _tempdir_keepalive = None;
+                std::path::PathBuf::from(dir)
+            }
+            None => {
+                let t = tempfile::TempDir::new().unwrap();
+                let p = t.path().to_path_buf();
+                _tempdir_keepalive = Some(t);
+                p
+            }
+        };
+        let db_path = synth_dir.join("agent_search.db");
+
+        let config = InfinityConfig::from_env();
+        let (identity, fingerprint) = probe_identity_and_fingerprint(&config).expect("live infinity identity+fingerprint probe");
+
+        let storage = FrankenStorage::open(&db_path).expect("open synth db");
+        let generation_id = storage
+            .raw()
+            .with_tx(TxMode::Immediate, |tx| {
+                schema::create_embedding_generation_v5(
+                    tx,
+                    &identity.model_id,
+                    i64::try_from(identity.dimension).unwrap(),
+                    CANONICALIZE_PIPELINE_VERSION,
+                    CHUNKING_POLICY_VERSION,
+                    &fingerprint,
+                    TS,
+                )
+            })
+            .unwrap();
+        vector_domain::create_vec0_table_for_generation(storage.raw(), generation_id, i64::try_from(identity.dimension).unwrap()).unwrap();
+
+        let agent_id = storage
+            .ensure_agent(&Agent { id: None, slug: "claude_code".into(), name: "Claude Code".into(), version: Some("1.0".into()), kind: AgentKind::Cli })
+            .unwrap();
+        for i in 0..200 {
+            let conv = Conversation {
+                id: None,
+                agent_slug: "claude_code".into(),
+                workspace: None,
+                external_id: Some(format!("t8-synth200-{i}")),
+                title: Some("T8 synth-200-v5 fixture".into()),
+                source_path: std::path::PathBuf::from(format!("/fixtures/synth200-{i}.jsonl")),
+                started_at: Some(TS),
+                ended_at: Some(TS + 1),
+                approx_tokens: None,
+                metadata_json: serde_json::Value::Null,
+                messages: vec![Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: None,
+                    created_at: Some(TS),
+                    content: format!("synthetic T-R fixture message number {i} with distinct real content for chunk-domain backfill"),
+                    extra_json: serde_json::Value::Null,
+                    snippets: vec![],
+                }],
+                source_id: "local".into(),
+                origin_host: None,
+            };
+            storage.insert_conversation_tree(agent_id, None, &conv).expect("insert synth conversation");
+        }
+        drop(storage);
+
+        let wrapper = std::env::var("CASS_WRAP").expect("CASS_WRAP env var must point at the run-root wrapper script (no path hardcoded in source)");
+        // control plane 2026-09-04 (root-cause correction): cass's built-in
+        // agent source discovery walks HOME (`~/.codex`, `~/.claude`, ...)
+        // directly, unaffected by XDG_CONFIG_HOME -- an inherited real HOME
+        // makes `index` (even scoped to an isolated CASS_DATA_DIR) discover
+        // and ingest the *real* local corpus. `CASS_W4_TEST_HOME` (an
+        // empty, run-root-scoped directory the caller creates) must be
+        // passed explicitly; no path is hardcoded in source.
+        let test_home = std::env::var("CASS_W4_TEST_HOME").expect("CASS_W4_TEST_HOME env var must point at an empty run-root-scoped HOME (no path hardcoded in source)");
+        // `$RUN_ROOT/cass-candidate` is T12's own setup-cass-fork.sh output
+        // position (sha-asserted there) -- this test must not pre-occupy
+        // it, so it points the wrapper at this run's own release build via
+        // the wrapper's CASS_CAND_BIN override instead.
+        let cand_bin = std::env::var("CASS_CAND_BIN").unwrap_or_else(|_| "/tmp/cc-cass-pr4-target/release/cass".to_string());
+
+        // Dry run first (no --semantic): proves HOME isolation actually
+        // worked -- the streaming-ingest summary must report exactly the
+        // 200 synthetic conversations/messages just seeded, not a real
+        // local corpus, before any Infinity call is ever made.
+        let dry_run = std::process::Command::new(&wrapper)
+            .arg("index")
+            .env("CASS_DATA_DIR", &synth_dir)
+            .env("HOME", &test_home)
+            .env("CASS_CAND_BIN", &cand_bin)
+            .output()
+            .expect("spawn $CASS_WRAP index (dry run, no --semantic)");
+        assert!(
+            dry_run.status.success(),
+            "dry-run `index` must exit 0: stdout={} stderr={}",
+            String::from_utf8_lossy(&dry_run.stdout),
+            String::from_utf8_lossy(&dry_run.stderr)
+        );
+        // HOME isolation proof: the 200 conversations were seeded directly
+        // via the production write path (not by `index` scanning source
+        // files), so a correctly-isolated `index` run finds *zero* new
+        // conversations to discover from disk -- `total_conversations=0`
+        // is the *positive* signal here, not a fluke; a real-corpus leak
+        // (this test's original failure mode) would instead show
+        // `discovered=true` for at least one connector and a large
+        // nonzero total_conversations/total_messages count.
+        let dry_run_stderr = String::from_utf8_lossy(&dry_run.stderr);
+        assert!(
+            dry_run_stderr.contains("total_conversations=0 total_messages=0"),
+            "HOME isolation must be proven BEFORE any Infinity call: expected zero newly-discovered conversations (the 200 fixture rows were seeded directly, not via source-file ingest), got: {dry_run_stderr}"
+        );
+        assert!(
+            !dry_run_stderr.contains("discovered=true"),
+            "no connector may discover a real local corpus once HOME is isolated: {dry_run_stderr}"
+        );
+        let seeded_message_count: i64 = FrankenStorage::open_readonly(&db_path)
+            .expect("reopen synth db read-only to confirm the 200 fixture rows survived the dry run")
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0))
+            .unwrap();
+        assert_eq!(seeded_message_count, 200, "the 200 directly-seeded messages must still be present after the dry run");
+
+        let output = std::process::Command::new(&wrapper)
+            .arg("index")
+            .arg("--semantic")
+            .env("CASS_DATA_DIR", &synth_dir)
+            .env("HOME", &test_home)
+            .env("CASS_CAND_BIN", &cand_bin)
+            .output()
+            .expect("spawn $CASS_WRAP index --semantic");
+        assert!(
+            output.status.success(),
+            "real candidate binary `index --semantic` must exit 0: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let storage = FrankenStorage::open_readonly(&db_path).expect("reopen synth db read-only");
+        let (active_generation_id, audit_status): (i64, String) = storage
+            .raw()
+            .query_row_map("SELECT id, audit_status FROM embedding_generations WHERE is_active = 1", &[], |row| Ok((row.get_typed(0)?, row.get_typed(1)?)))
+            .expect("an active generation must exist after a successful CLI run");
+        assert_eq!(active_generation_id, generation_id, "the CLI subprocess must have reused the pre-created generation (identity+fingerprint match), not created a second one");
+        assert_eq!(audit_status, "passed");
+
+        let embedder = InfinityEmbedder::new().expect("live infinity embedder for the re-verification audit");
+        use crate::search::embedder::Embedder as _;
+        let embed_fn = |texts: &[&str]| embedder.embed_batch_sync(texts).map_err(|e| e.to_string());
+        let report = run_activation_audit_v5(&storage, generation_id, 500, None, Some(&embed_fn), 200, 12345).expect("re-audit the CLI-produced generation");
+        assert!(report.passed, "the CLI-produced generation must re-audit clean: {report:?}");
+        assert_eq!(report.hash_mismatch, 0, "⑧: {report:?}");
+        assert_eq!(report.span_mismatch, 0, "⑨ span: {report:?}");
+        assert_eq!(report.completeness_missing, 0, "⑨ completeness missing: {report:?}");
+        assert_eq!(report.completeness_extra, 0, "⑨ completeness extra: {report:?}");
+        assert_eq!(report.ownership_failed, 0, "⑩: {report:?}");
+        assert!(report.fingerprint_ok, "⑪: {report:?}");
+        assert_eq!(report.ownership_checked, 200, "min(200, chunk_count) must be 200 for a 200-message, one-chunk-each corpus: {report:?}");
+
+        if synth_dir_env.is_some() {
+            eprintln!("live_synth_200_v5_backfill_via_real_binary: synth-200-v5 library left at {} (not cleaned up)", synth_dir.display());
+        }
     }
 }

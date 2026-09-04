@@ -8509,9 +8509,31 @@ fn run_semantic_db_vector_catchup(
         )
     })?;
     let batch_size = SemanticIndexer::new("infinity", None)?.batch_size();
-    let report = crate::indexer::db_vector_catchup::run_db_vector_catchup_backfill(
+
+    // T8 (plan v5.1, task book #92): `cass index --semantic` drains the
+    // chunk domain (`chunk_holes` -> `message_chunks`), not the retired
+    // v4 `embedding_holes` path -- the v4 function stays reachable (T11
+    // deletes it) but nothing production calls it any more as of this
+    // wiring commit.
+    let infinity_config = crate::search::infinity::InfinityConfig::from_env();
+    let (identity, fingerprint) = crate::search::infinity::probe_identity_and_fingerprint(&infinity_config)
+        .map_err(|e| anyhow::anyhow!("{caller}: infinity identity+fingerprint probe failed: {e}"))?;
+    let embedder = crate::search::infinity::InfinityEmbedder::new()
+        .map_err(|e| anyhow::anyhow!("{caller}: failed to construct infinity embedder: {e}"))?;
+    let embed_fn = |texts: &[&str]| -> std::result::Result<Vec<Vec<f32>>, String> {
+        use crate::search::embedder::Embedder as _;
+        embedder.embed_batch_sync(texts).map_err(|e| e.to_string())
+    };
+    let ownership_seed = FrankenStorage::now_millis() as u64;
+    let report = crate::indexer::db_vector_catchup::run_db_vector_catchup_backfill_v5(
         &storage,
         batch_size,
+        &identity,
+        crate::search::canonicalize::CANONICALIZE_PIPELINE_VERSION,
+        crate::search::chunking::CHUNKING_POLICY_VERSION,
+        &fingerprint,
+        &embed_fn,
+        ownership_seed,
     )
     .map_err(|e| anyhow::anyhow!("{caller}: db vector catchup failed: {e:#}"))?;
     tracing::info!(
@@ -8519,15 +8541,16 @@ fn run_semantic_db_vector_catchup(
         generation_id = report.generation_id,
         reused_existing_generation = report.reused_existing_generation,
         embedder_id = %report.embedder_id,
-        eligible_seeded = report.eligible_seeded,
-        embedded_inserted = report.embedded_inserted,
-        stale_skipped = report.stale_skipped,
-        holes_before = report.holes_before,
+        chunks_embedded = report.chunks_embedded,
+        chunks_pruned = report.chunks_pruned,
+        holes_written_off_beyond_expected = report.holes_written_off_beyond_expected,
+        staging_reused = report.staging_reused,
+        staging_purged = report.staging_purged,
+        messages_loaded = report.messages_loaded,
         holes_after = report.holes_after,
-        holes_written_off_ineligible = report.holes_written_off_ineligible,
-        embeddings_pruned_ineligible = report.embeddings_pruned_ineligible,
+        ownership_seed,
         activated = report.activated,
-        "db vector domain catch-up complete"
+        "db vector domain (v5 chunk) catch-up complete"
     );
     if !report.activated {
         tracing::info!(
@@ -8536,7 +8559,7 @@ fn run_semantic_db_vector_catchup(
             holes_after = report.holes_after,
             "{caller}: db vector domain catch-up did not activate this pass \
              (holes remain, or activation audit has not run yet); rerun the \
-             same command to continue draining embedding_holes"
+             same command to continue draining chunk_holes"
         );
     }
     Ok(SemanticDbVectorCatchupOutcome {
