@@ -527,6 +527,18 @@ fn ownership_sample_key(seed: u64, chunk_id: i64) -> u64 {
     z ^ (z >> 31)
 }
 
+/// Fresh (not cached) `content_hash` lookup for `chunk_id`, used only by
+/// the R1-B8 exact-content-twin tolerance in checks ③/⑩ (task book #98):
+/// `vec0`'s own rows carry no hash, so telling "this KNN tie is a genuine
+/// content twin" from "this is a real drift" requires a point read against
+/// `message_chunks` for whichever chunk_id vec0's tie-break actually
+/// returned. `Ok(None)` if the row is gone (concurrent write / already
+/// pruned) -- callers must not tolerate a tie against a chunk_id that no
+/// longer resolves to anything.
+fn chunk_content_hash(conn: &Conn, chunk_id: i64) -> Result<Option<String>, StorageError> {
+    conn.query_opt_map("SELECT content_hash FROM message_chunks WHERE chunk_id = ?1", &params![chunk_id], |row| row.get_typed(0))
+}
+
 /// Re-derive a fresh generation fingerprint through the injected
 /// `embedder` closure (not [`crate::search::infinity::compute_generation_
 /// fingerprint`], which insists on its own live `InfinityConfig`/HTTP
@@ -575,6 +587,14 @@ pub struct ActivationAuditReport {
     pub positive_check_chunk_id: i64,
     pub positive_check_top_hit_chunk_id: i64,
     pub positive_check_distance: f64,
+    /// R1-B8 (task book #98): `true` iff ③'s top-1 hit was not the anchor
+    /// chunk's own row but was tolerated as an exact-content twin
+    /// (`distance <= 1e-6` AND the two chunks' stored `content_hash` are
+    /// equal) rather than flagged as a self-hit failure.
+    pub positive_check_tied_twin: bool,
+    /// The sibling chunk_id ③'s self-hit tied with, set iff
+    /// `positive_check_tied_twin` is `true`.
+    pub positive_check_twin_chunk_id: Option<i64>,
     /// ④ bidirectional anti-join, element = `(message_id, chunk_idx)`.
     pub eligible_not_embedded_count: usize,
     pub embedded_not_eligible_count: usize,
@@ -608,6 +628,10 @@ pub struct ActivationAuditReport {
     /// "clean" activation verdict.
     pub ownership_checked: u64,
     pub ownership_failed: u64,
+    /// Same R1-B8 tolerance as ③'s `positive_check_tied_twin`, applied
+    /// per-sample: count of sampled chunks whose vec0 top-1 hit was an
+    /// exact-content twin (not itself) rather than a real ownership drift.
+    pub ownership_tied_twins: u64,
     pub ownership_seed: u64,
     pub ownership_skipped: bool,
     /// ⑪ generation fingerprint re-verification.
@@ -696,32 +720,48 @@ pub fn run_activation_audit(
     }
 
     // ③ positive content self-hit, resolved to a chunk row.
-    let anchor: Result<(i64, i64, Vec<u8>)> = (|| {
+    let anchor: Result<(i64, i64, Vec<u8>, String)> = (|| {
         Ok(match positive_check_message_id {
             Some(mid) => conn.query_row_map(
-                "SELECT message_id, chunk_id, embedding FROM message_chunks \
+                "SELECT message_id, chunk_id, embedding, content_hash FROM message_chunks \
                  WHERE generation_id = ?1 AND message_id = ?2 ORDER BY chunk_idx LIMIT 1",
                 &params![generation_id, mid],
-                |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?, row.get_typed(3)?)),
             )
             .with_context(|| format!("positive-check message_id={mid} has no chunk row in generation {generation_id}"))?,
             None => conn
                 .query_row_map(
-                    "SELECT message_id, chunk_id, embedding FROM message_chunks WHERE generation_id = ?1 ORDER BY chunk_id LIMIT 1",
+                    "SELECT message_id, chunk_id, embedding, content_hash FROM message_chunks WHERE generation_id = ?1 ORDER BY chunk_id LIMIT 1",
                     &params![generation_id],
-                    |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+                    |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?, row.get_typed(3)?)),
                 )
                 .with_context(|| format!("generation {generation_id} has zero chunk rows; nothing to positive-check"))?,
         })
     })();
     let mut positive_check_errored = false;
+    let mut positive_check_tied_twin = false;
+    let mut positive_check_twin_chunk_id: Option<i64> = None;
     let (anchor_message_id, anchor_chunk_id, top_hit_chunk_id, distance) = match anchor {
-        Ok((message_id, chunk_id, blob)) => match schema::le_blob_to_f32_vector(&blob)
+        Ok((message_id, chunk_id, blob, anchor_hash)) => match schema::le_blob_to_f32_vector(&blob)
             .map_err(anyhow::Error::from)
             .and_then(|v| vector_domain::vec0_knn(conn, generation_id, &v, 1).map_err(anyhow::Error::from))
         {
             Ok(hits) => {
                 let (top_hit, distance) = hits.first().copied().unwrap_or((-1, f64::INFINITY));
+                if top_hit != chunk_id && distance <= 1e-6 {
+                    // R1-B8 (task book #98): vec0's own KNN tie-break among
+                    // byte-identical vectors is not guaranteed to prefer a
+                    // chunk's own row -- before flagging this as a self-hit
+                    // failure, check whether the tie is a genuine
+                    // exact-content twin (same `content_hash`, read fresh
+                    // from `message_chunks` -- vec0 itself carries no hash).
+                    if let Ok(Some(top_hash)) = chunk_content_hash(conn, top_hit) {
+                        if top_hash == anchor_hash {
+                            positive_check_tied_twin = true;
+                            positive_check_twin_chunk_id = Some(top_hit);
+                        }
+                    }
+                }
                 (message_id, chunk_id, top_hit, distance)
             }
             Err(e) => {
@@ -736,7 +776,7 @@ pub fn run_activation_audit(
             (positive_check_message_id.unwrap_or(-1), -1, -1, f64::INFINITY)
         }
     };
-    if !positive_check_errored && (top_hit_chunk_id != anchor_chunk_id || !(distance <= 1e-6)) {
+    if !positive_check_errored && !positive_check_tied_twin && (top_hit_chunk_id != anchor_chunk_id || !(distance <= 1e-6)) {
         failures.push(format!(
             "③ positive content check failed: anchor chunk_id={anchor_chunk_id} (message_id={anchor_message_id}) top vec0 hit={top_hit_chunk_id} distance={distance}"
         ));
@@ -880,6 +920,7 @@ pub fn run_activation_audit(
     // `embedder` being `Some` (plan v5.1: `None` => passed=false).
     let mut ownership_checked = 0u64;
     let mut ownership_failed = 0u64;
+    let mut ownership_tied_twins = 0u64;
     let mut ownership_skipped = false;
     let mut fingerprint_ok = false;
     match embedder {
@@ -899,17 +940,19 @@ pub fn run_activation_audit(
             chunk_ids.truncate(n);
             for chunk_id in &chunk_ids {
                 ownership_checked += 1;
-                let row: Option<(i64, i64, i64, Vec<u8>)> = conn.query_opt_map(
-                    "SELECT message_id, byte_start, byte_end, embedding FROM message_chunks WHERE generation_id = ?1 AND chunk_id = ?2",
+                let row: Option<(i64, i64, i64, Vec<u8>, String)> = conn.query_opt_map(
+                    "SELECT message_id, byte_start, byte_end, embedding, content_hash FROM message_chunks WHERE generation_id = ?1 AND chunk_id = ?2",
                     &params![generation_id, *chunk_id],
-                    |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?, row.get_typed(3)?)),
+                    |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?, row.get_typed(3)?, row.get_typed(4)?)),
                 )?;
-                let Some((message_id, byte_start, byte_end, stored_blob)) = row else {
+                let Some((message_id, byte_start, byte_end, stored_blob, stored_hash)) = row else {
                     ownership_failed += 1;
                     failures.push(format!("⑩ chunk_id={chunk_id} disappeared mid-audit (concurrent write)"));
                     continue;
                 };
-                let ownership_result: Result<()> = (|| {
+                // `Ok(true)` = tolerated as an exact-content twin (R1-B8,
+                // task book #98); `Ok(false)` = ordinary clean pass.
+                let ownership_result: Result<bool> = (|| {
                     let (_conv_id, role, content) = load_message_once(storage, message_id)?;
                     let normalized = crate::search::eligibility::normalized_for_chunks(&content);
                     let (bs, be) = (usize::try_from(byte_start)?, usize::try_from(byte_end)?);
@@ -926,14 +969,23 @@ pub fn run_activation_audit(
                     }
                     let hits = vector_domain::vec0_knn(conn, generation_id, &stored_vec, 1)?;
                     let (top_hit, distance) = hits.first().copied().unwrap_or((-1, f64::INFINITY));
-                    if top_hit != *chunk_id || !(distance <= 1e-6) {
+                    if top_hit != *chunk_id {
+                        if distance <= 1e-6 && chunk_content_hash(conn, top_hit)?.as_deref() == Some(stored_hash.as_str()) {
+                            return Ok(true);
+                        }
+                        bail!("vec0 row for chunk_id={chunk_id} does not match message_chunks' own BLOB (vec0 top hit={top_hit}, distance={distance})");
+                    } else if !(distance <= 1e-6) {
                         bail!("vec0 row for chunk_id={chunk_id} does not match message_chunks' own BLOB (vec0 top hit={top_hit}, distance={distance})");
                     }
-                    Ok(())
+                    Ok(false)
                 })();
-                if let Err(e) = ownership_result {
-                    ownership_failed += 1;
-                    failures.push(format!("⑩ ownership check failed for chunk_id={chunk_id}: {e}"));
+                match ownership_result {
+                    Ok(true) => ownership_tied_twins += 1,
+                    Ok(false) => {}
+                    Err(e) => {
+                        ownership_failed += 1;
+                        failures.push(format!("⑩ ownership check failed for chunk_id={chunk_id}: {e}"));
+                    }
                 }
             }
             if ownership_failed != 0 {
@@ -966,6 +1018,8 @@ pub fn run_activation_audit(
         positive_check_chunk_id: anchor_chunk_id,
         positive_check_top_hit_chunk_id: top_hit_chunk_id,
         positive_check_distance: distance,
+        positive_check_tied_twin,
+        positive_check_twin_chunk_id,
         eligible_not_embedded_count,
         embedded_not_eligible_count,
         canonicalize_version_expected: CANONICALIZE_PIPELINE_VERSION,
@@ -983,6 +1037,7 @@ pub fn run_activation_audit(
         chunk_holes_remaining,
         ownership_checked,
         ownership_failed,
+        ownership_tied_twins,
         ownership_seed,
         ownership_skipped,
         fingerprint_ok,
@@ -1842,6 +1897,119 @@ mod chunk_catchup_v5_tests {
         assert_eq!(message_chunks_count(storage, generation_id), 2);
         let ids: Vec<i64> = storage.raw().query_all_map("SELECT chunk_id FROM message_chunks WHERE generation_id = ?1 ORDER BY chunk_id", &params![generation_id], |row| row.get_typed(0)).unwrap();
         (generation_id, ids[0], ids[1])
+    }
+
+    /// Two messages with byte-identical content -- a genuine "content
+    /// twin" (task book #98, R1-B8's W3 judgement carried to v5): real
+    /// production ingestion (`insert_conversation`) + drain (`backfill`)
+    /// naturally gives both chunks the same `content_hash` and the same
+    /// embedding (`deterministic_vector` is purely content-keyed), and
+    /// vec0's own KNN tie-break for either chunk's own vector is not
+    /// guaranteed to land on itself -- reproduced deterministically here
+    /// exactly as in production (T12 real-scale run): `backfill`'s own
+    /// automatic post-drain activation is expected to fail pre-fix, so its
+    /// `Result` is deliberately discarded; the per-batch chunk writes it
+    /// already committed before attempting activation are not affected by
+    /// that failure and are asserted below.
+    fn twin_two_message_generation(storage: &FrankenStorage) -> (i64, i64, i64, i64, i64) {
+        let generation_id = genesis(storage);
+        const TWIN_TEXT: &str = "identical twin content shared by two distinct messages for the audit tolerance test";
+        let ids_a = insert_conversation(storage, "t11-5-twin-a", &[TWIN_TEXT]);
+        let ids_b = insert_conversation(storage, "t11-5-twin-b", &[TWIN_TEXT]);
+        let _ = backfill(storage);
+        assert_eq!(message_chunks_count(storage, generation_id), 2, "both twin chunks must be embedded and moved out of staging regardless of whether the automatic post-drain activation itself passed");
+        let chunk_id_a: i64 = storage
+            .raw()
+            .query_row_map("SELECT chunk_id FROM message_chunks WHERE generation_id = ?1 AND message_id = ?2", &params![generation_id, ids_a[0]], |row| row.get_typed(0))
+            .unwrap();
+        let chunk_id_b: i64 = storage
+            .raw()
+            .query_row_map("SELECT chunk_id FROM message_chunks WHERE generation_id = ?1 AND message_id = ?2", &params![generation_id, ids_b[0]], |row| row.get_typed(0))
+            .unwrap();
+        (generation_id, ids_a[0], chunk_id_a, ids_b[0], chunk_id_b)
+    }
+
+    /// R1-B8 (task book #98, Step 1): a genuine content twin -- two chunks
+    /// under two different messages, byte-identical content, hence
+    /// byte-identical `content_hash` and embedding -- must not fail ③'s
+    /// self-hit check or ⑩'s per-chunk ownership check merely because
+    /// vec0's own KNN tie-break happened to return the sibling chunk_id
+    /// instead of the queried chunk's own rowid; the real T12 stall
+    /// evidence hit exactly this shape (anchor chunk_id=1, top hit=2,
+    /// distance=0, `content_hash` equal).
+    #[test]
+    fn audit_3_and_10_tolerate_exact_content_twins() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_storage(&dir.path().join("db.sqlite"));
+        let (generation_id, message_id_a, chunk_id_a, message_id_b, chunk_id_b) = twin_two_message_generation(&storage);
+        assert_ne!(chunk_id_a, chunk_id_b);
+
+        // Anchor on the twin whose own KNN query resolves to its sibling
+        // (chunk_id_a, per the deterministic tie-break this fixture
+        // reproduces) -- the case that must now be tolerated.
+        let report = run_activation_audit(&storage, generation_id, 10, Some(message_id_a), Some(&mock_embed), 10, 1).unwrap();
+        assert!(report.passed, "an exact-content twin tie must not fail the audit: {report:?}");
+        assert!(report.positive_check_tied_twin, "③ must record that the self-hit was tolerated as a tied twin, not a plain pass: {report:?}");
+        assert_eq!(report.positive_check_twin_chunk_id, Some(chunk_id_b), "the recorded twin must be the sibling chunk vec0 actually returned: {report:?}");
+        assert_eq!(report.positive_check_top_hit_chunk_id, chunk_id_b);
+        assert_eq!(report.positive_check_distance, 0.0);
+        assert_eq!(report.ownership_checked, 2);
+        assert_eq!(report.ownership_failed, 0, "⑩ must not count the tied-twin sample as a failure: {report:?}");
+        assert_eq!(report.ownership_tied_twins, 1, "exactly the one sampled chunk whose own KNN query ties onto its twin must be counted: {report:?}");
+        assert!(report.failure_reasons.is_empty(), "a clean twin tie must leave zero failure reasons: {report:?}");
+
+        // Anchor on the other twin, whose own query resolves to itself
+        // (no tie to tolerate) -- must stay an ordinary, non-twin pass.
+        let report_b = run_activation_audit(&storage, generation_id, 10, Some(message_id_b), Some(&mock_embed), 10, 1).unwrap();
+        assert!(report_b.passed, "{report_b:?}");
+        assert!(!report_b.positive_check_tied_twin, "the anchor whose own query already resolves to itself must not be misreported as a tied twin: {report_b:?}");
+        assert_eq!(report_b.positive_check_twin_chunk_id, None);
+    }
+
+    /// R1-B8's tolerance must not swallow a genuine anomaly: two chunks
+    /// whose *embeddings* happen to collide at distance 0 (forced here by
+    /// directly overwriting one chunk's stored embedding+vec0 row with the
+    /// other's) but whose real, independently-recomputable `content_hash`
+    /// still differ (their underlying message content is NOT the same)
+    /// must stay a hard ③/⑩ failure -- an embedding-space collision
+    /// between genuinely different content is exactly the kind of drift
+    /// the audit exists to catch, and is not the benign "verbatim-repeated
+    /// short message" case ③'s twin tolerance is scoped to.
+    #[test]
+    fn audit_3_and_10_still_flag_real_drift_despite_zero_distance() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_storage(&dir.path().join("db.sqlite"));
+        let (generation_id, chunk_id_a, chunk_id_b) = clean_two_message_generation(&storage);
+        let message_id_a: i64 = storage.raw().query_row_map("SELECT message_id FROM message_chunks WHERE chunk_id = ?1", &params![chunk_id_a], |row| row.get_typed(0)).unwrap();
+        let (embedding_a, norm_a): (Vec<u8>, f64) =
+            storage.raw().query_row_map("SELECT embedding, norm FROM message_chunks WHERE chunk_id = ?1", &params![chunk_id_a], |row| Ok((row.get_typed(0)?, row.get_typed(1)?))).unwrap();
+        // Force chunk_id_b's stored embedding (message_chunks AND its own
+        // vec0 row) to be byte-identical to chunk_id_a's, WITHOUT touching
+        // either chunk's `content_hash` -- the two chunks' real content
+        // (and therefore their genuinely different, self-consistent
+        // hashes) is left alone, isolating an embedding-space collision
+        // from a real content twin.
+        storage.raw().execute("UPDATE message_chunks SET embedding = ?1, norm = ?2 WHERE chunk_id = ?3", &params![embedding_a.clone(), norm_a, chunk_id_b]).unwrap();
+        storage
+            .raw()
+            .with_tx(TxMode::Immediate, |tx| {
+                vector_domain::delete_vec0_rows_in_tx(tx, generation_id, &[chunk_id_b])?;
+                vector_domain::insert_vec0_rows_in_tx(tx, generation_id, &[(chunk_id_b, embedding_a.as_slice())])?;
+                Ok(())
+            })
+            .unwrap();
+
+        let report = run_activation_audit(&storage, generation_id, 10, Some(message_id_a), Some(&mock_embed), 10, 1).unwrap();
+        assert!(!report.passed, "an embedding collision between chunks with genuinely different content_hash must still fail: {report:?}");
+        assert!(!report.positive_check_tied_twin, "different content_hash must never be tolerated as a tied twin: {report:?}");
+        assert_eq!(report.positive_check_twin_chunk_id, None);
+        assert_eq!(report.positive_check_top_hit_chunk_id, chunk_id_b);
+        assert_eq!(report.positive_check_distance, 0.0);
+        assert!(
+            report.failure_reasons.iter().any(|r| r.contains("③ positive content check failed") && r.contains(&format!("top vec0 hit={chunk_id_b} distance=0"))),
+            "③ must still report the mismatch verbatim when the tie is not a genuine content twin: {report:?}"
+        );
+        assert_eq!(report.ownership_tied_twins, 0, "no sampled chunk in this fixture is a genuine content twin: {report:?}");
     }
 
     #[test]
