@@ -117,7 +117,13 @@ def is_tool_acknowledgement(role: Optional[str], text: str) -> bool:
 
 
 def is_hard_noise(role: Optional[str], text: str) -> bool:
-    return is_tool_acknowledgement(role, text)
+    # Mirrors `is_hard_message_noise` (src/search/canonicalize.rs:687-689):
+    # `text.trim().is_empty() || is_tool_acknowledgement(role, text)`. The
+    # empty/whitespace-only branch was missing from this port (T11.7
+    # finding, 2026-09-05): lexical_oracle.py counted 6939 zero-length
+    # tool_result messages as lexically eligible when the candidate
+    # correctly excludes them via this branch.
+    return text.strip() == "" or is_tool_acknowledgement(role, text)
 
 
 # ---------------------------------------------------------------------------
@@ -392,6 +398,23 @@ def _selftest_normalize_examples() -> None:
     _assert(normalize(fenced) == "\n".join(lines), "fenced code verbatim, no collapse")
 
 
+def _selftest_is_hard_noise_empty_and_normal() -> None:
+    # T11.7 regression: empty/whitespace-only content is hard noise
+    # regardless of role (mirrors canonicalize.rs:687-689's
+    # `text.trim().is_empty()` branch), independent of the phrase table.
+    _assert(is_hard_noise("tool_result", "") is True, "empty tool_result must be hard noise")
+    _assert(is_hard_noise("tool_result", "   \n\t ") is True, "whitespace-only tool_result must be hard noise")
+    _assert(is_hard_noise("user", "") is True, "empty content is hard noise for any role")
+    # Phrase-table branch still fires for short-ack noise (regardless of emptiness check).
+    _assert(is_hard_noise("assistant", "OK") is True, "short-ack phrase must be hard noise")
+    _assert(is_hard_noise("tool_result", "no matches found") is True, "tool-ack phrase must be hard noise")
+    # A normal, substantive message must NOT be classified as hard noise.
+    _assert(
+        is_hard_noise("user", "This is a normal message with real content, not an ack.") is False,
+        "normal non-empty message must not be hard noise",
+    )
+
+
 def run_selftest() -> int:
     checks = [
         ("properties_cover_and_overlap", _selftest_properties),
@@ -399,6 +422,7 @@ def run_selftest() -> int:
         ("early_separator_does_not_stall", _selftest_early_separator_does_not_stall),
         ("role_alias_table", _selftest_role_alias_table),
         ("normalize_v2_rule_examples", _selftest_normalize_examples),
+        ("is_hard_noise_empty_and_normal", _selftest_is_hard_noise_empty_and_normal),
     ]
     failed = False
     for name, fn in checks:
