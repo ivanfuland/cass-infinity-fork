@@ -2249,6 +2249,36 @@ fn effective_exact_scan_row_budget() -> usize {
 /// substring.
 const EXACT_SCAN_ROW_BUDGET_SENTINEL: &str = "__cass_exact_scan_row_budget_exceeded__";
 
+/// Batch size for `hydrate_semantic_hits_with_ids`'s id-keyed lookups
+/// (T9, plan v5.1, T0's real-bug reproduction -- see that function's doc
+/// comment for the crash this batching fixes).
+const HYDRATE_ID_BATCH_ROWS: usize = 900;
+
+/// Test-only override for `HYDRATE_ID_BATCH_ROWS` (`0` = unset, use the
+/// real constant) -- lets a test widen the batch to cover an entire
+/// candidate set in one statement, to diff against the real (900-row)
+/// batched path over the *same* candidate set (T9 part 2:
+/// `hybrid_limit_5000_hydrates_in_batches`) without depending on the
+/// retired v4 path as a reference. Same `AtomicUsize`/`--test-threads=1`
+/// justification as `EXACT_SCAN_ROW_BUDGET_OVERRIDE` above.
+static HYDRATE_ID_BATCH_ROWS_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn set_hydrate_id_batch_rows_for_test(n: usize) {
+    HYDRATE_ID_BATCH_ROWS_OVERRIDE.store(n, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn reset_hydrate_id_batch_rows_for_test() {
+    HYDRATE_ID_BATCH_ROWS_OVERRIDE.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn effective_hydrate_id_batch_rows() -> usize {
+    let overridden = HYDRATE_ID_BATCH_ROWS_OVERRIDE.load(std::sync::atomic::Ordering::SeqCst);
+    if overridden == 0 { HYDRATE_ID_BATCH_ROWS } else { overridden }
+}
+
 /// One winning-chunk candidate folded to its owning message (T9, plan
 /// v5.1: MaxSim -- the best-scoring chunk stands in for its whole
 /// message).
@@ -4252,11 +4282,10 @@ impl SearchClient {
         // `HYDRATE_ID_BATCH_ROWS` ids per statement, results concatenated
         // -- order does not need to be preserved here (the final ordering
         // pass below re-derives it from `results`).
-        const HYDRATE_ID_BATCH_ROWS: usize = 900;
         let message_i64_ids: Vec<i64> =
             unique_message_ids.iter().map(|id| i64::try_from(*id)).collect::<std::result::Result<_, _>>()?;
         let mut message_rows: Vec<MessageHydrationRow> = Vec::with_capacity(message_i64_ids.len());
-        for batch in message_i64_ids.chunks(HYDRATE_ID_BATCH_ROWS) {
+        for batch in message_i64_ids.chunks(effective_hydrate_id_batch_rows()) {
             let message_placeholders = sql_placeholders(batch.len());
             let message_params: Vec<ParamValue> = batch.iter().map(|id| ParamValue::from(*id)).collect();
             let message_sql = format!(
@@ -4305,7 +4334,7 @@ impl SearchClient {
         // batched message ids can just as easily produce a conversation-id
         // set past the same ceiling.
         let mut conversation_rows: Vec<(i64, ConversationHydrationRow)> = Vec::with_capacity(conversation_ids.len());
-        for batch in conversation_ids.chunks(HYDRATE_ID_BATCH_ROWS) {
+        for batch in conversation_ids.chunks(effective_hydrate_id_batch_rows()) {
             let conversation_placeholders = sql_placeholders(batch.len());
             let conversation_params: Vec<ParamValue> = batch.iter().map(|id| ParamValue::from(*id)).collect();
             let sql = format!(
@@ -6922,6 +6951,310 @@ mod tests {
             doc_ids,
             source_paths,
         })
+    }
+
+    /// T9 part 2 (mission #93/#93b Step 1): an end-to-end `search_semantic`
+    /// hit must carry the message_id/winning-chunk provenance the chunk-
+    /// domain candidate search resolved for it, not just a score.
+    #[test]
+    fn search_hits_carry_message_id() -> Result<()> {
+        let fixture = build_semantic_test_fixture()?;
+        let hits = fixture.client.search_semantic(
+            "top semantic match",
+            SearchFilters::default(),
+            3,
+            0,
+            FieldMask::FULL,
+        )?;
+        assert!(!hits.is_empty(), "fixture seeds 3 semantically-indexed messages");
+        for hit in &hits {
+            assert!(hit.message_id.is_some(), "every semantic hit must carry its source message_id");
+            assert!(hit.winning_chunk_idx.is_some(), "every semantic hit must carry its winning chunk_idx");
+            assert!(hit.winning_chunk_span.is_some(), "every semantic hit must carry its winning chunk span");
+            assert!(
+                hit.winning_chunk_hash.is_some(),
+                "every semantic hit must carry its winning chunk content_hash"
+            );
+        }
+        // One chunk per message in this fixture -- always chunk_idx=0.
+        assert_eq!(hits[0].winning_chunk_idx, Some(0));
+        Ok(())
+    }
+
+    /// T9 part 2 (mission #93/#93b Step 1): hybrid RRF fusion must not
+    /// clobber a semantic-only hit's provenance fields -- `rrf_fuse_hits`
+    /// clones the whole `SearchHit` it keeps in `hit_by_doc_id`, only ever
+    /// overwriting `score` afterward.
+    #[test]
+    fn hybrid_preserves_winning_chunk_provenance_after_rrf() -> Result<()> {
+        let fixture = build_semantic_test_fixture()?;
+        // A lexical query that matches none of the fixture's 3 messages, so
+        // the semantic leg's hit(s) cannot collide (by doc_id) with a
+        // lexical hit that would otherwise win `rrf_fuse_hits`'s
+        // `hit_by_doc_id` map and paper over the semantic provenance with
+        // a lexical hit's (always-`None`) provenance fields.
+        let result = fixture.client.search_hybrid(
+            "zzz_no_lexical_match_zzz",
+            "top semantic match",
+            SearchFilters::default(),
+            3,
+            0,
+            0,
+            FieldMask::FULL,
+        )?;
+        assert!(!result.semantic_degraded, "the fixture has a live active generation");
+        assert!(!result.hits.is_empty());
+        let top = &result.hits[0];
+        assert!(top.message_id.is_some(), "RRF must preserve the semantic hit's message_id");
+        assert!(top.winning_chunk_idx.is_some(), "RRF must preserve the semantic hit's winning_chunk_idx");
+        assert!(top.winning_chunk_hash.is_some(), "RRF must preserve the semantic hit's winning_chunk_hash");
+        Ok(())
+    }
+
+    /// T9 part 2 (mission #93/#93b Step 1): `search_hybrid` must degrade to
+    /// lexical-only (`_meta.semantic_degraded=true`, `candidates=None`) when
+    /// the vector domain is `absent` -- no embedding generation was ever
+    /// created -- even with a live embedder set, since it is
+    /// `search_db_vector_domain`'s own error the fail-open must catch.
+    #[test]
+    fn hybrid_fails_open_to_lexical_when_vec0_missing() -> Result<()> {
+        let conv = NormalizedConversation {
+            agent_slug: "codex".into(),
+            external_id: None,
+            title: Some("lexical only".into()),
+            workspace: None,
+            source_path: std::path::PathBuf::from("/tmp/lexical-only-absent.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: None,
+            metadata: serde_json::json!({}),
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "user".into(),
+                author: Some("me".into()),
+                created_at: Some(1_700_000_000_000),
+                content: "hello lexical world".into(),
+                extra: serde_json::json!({}),
+                snippets: Vec::new(),
+                invocations: Vec::new(),
+            }],
+        };
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
+        // Live embedder, but deliberately *no* embedding_generation row --
+        // the vector domain is genuinely absent, not merely unconfigured.
+        client.set_semantic_context(Arc::new(FixedTestEmbedder::new("test-fixed-2d", &[1.0, 0.0])), None)?;
+
+        let result = client.search_hybrid(
+            "hello",
+            "hello lexical world",
+            SearchFilters::default(),
+            5,
+            0,
+            0,
+            FieldMask::FULL,
+        )?;
+
+        assert!(result.semantic_degraded, "vector_domain_state=absent must fail open, not error");
+        assert!(result.candidates.is_none());
+        assert!(!result.hits.is_empty(), "the lexical leg alone must still return the seeded message");
+        Ok(())
+    }
+
+    /// T9 part 2 (mission #93/#93b Step 1): `search_hybrid` must also fail
+    /// open when Infinity itself is unreachable -- a real `InfinityEmbedder`
+    /// pointed at a dead port, not a fixture double, so the actual
+    /// `http_embed` -> `"embeddings request failed:"` error text is what
+    /// `is_semantic_fail_open_condition` has to match.
+    #[test]
+    #[cfg(feature = "infinity")]
+    fn hybrid_fails_open_when_infinity_unreachable() -> Result<()> {
+        let conv = NormalizedConversation {
+            agent_slug: "codex".into(),
+            external_id: None,
+            title: Some("lexical only".into()),
+            workspace: None,
+            source_path: std::path::PathBuf::from("/tmp/lexical-only-unreachable.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: None,
+            metadata: serde_json::json!({}),
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "user".into(),
+                author: Some("me".into()),
+                created_at: Some(1_700_000_000_000),
+                content: "hello infinity world".into(),
+                extra: serde_json::json!({}),
+                snippets: Vec::new(),
+                invocations: Vec::new(),
+            }],
+        };
+        let (dir, db_path) = seed_conversations_for_search_client(&[conv])?;
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
+
+        // T9 part 2: point a real InfinityEmbedder at a dead local port
+        // (nothing listens on 127.0.0.1:1) -- `InfinityEmbedder::new()`
+        // only reads its base_url from `CASS_INFINITY_URL`
+        // (`InfinityConfig::from_env`), so setting/restoring the env var is
+        // the only public seam; safe under this codebase's own
+        // `--test-threads=1` testing discipline (same justification as
+        // `EXACT_SCAN_ROW_BUDGET_OVERRIDE` above).
+        let previous_url = std::env::var("CASS_INFINITY_URL").ok();
+        // SAFETY: `--test-threads=1` (this codebase's own testing
+        // discipline, see `EXACT_SCAN_ROW_BUDGET_OVERRIDE` above) means no
+        // other thread reads/writes env vars concurrently with this test.
+        unsafe {
+            std::env::set_var("CASS_INFINITY_URL", "http://127.0.0.1:1");
+        }
+        let embedder_result = crate::search::infinity::InfinityEmbedder::new();
+        unsafe {
+            match previous_url {
+                Some(url) => std::env::set_var("CASS_INFINITY_URL", url),
+                None => std::env::remove_var("CASS_INFINITY_URL"),
+            }
+        }
+        let embedder = embedder_result.expect("constructing the embedder itself does not touch the network");
+        client.set_semantic_context(Arc::new(embedder), None)?;
+
+        let result = client.search_hybrid(
+            "hello",
+            "hello infinity world",
+            SearchFilters::default(),
+            5,
+            0,
+            0,
+            FieldMask::FULL,
+        )?;
+
+        assert!(result.semantic_degraded, "an unreachable Infinity must fail open, not error");
+        assert!(result.candidates.is_none());
+        assert!(!result.hits.is_empty(), "the lexical leg alone must still return the seeded message");
+        Ok(())
+    }
+
+    /// T9 part 2 (mission #93/#93b Step 1, advisor 2026-09-04 addendum):
+    /// `hydrate_semantic_hits_with_ids`'s `HYDRATE_ID_BATCH_ROWS`-sized
+    /// batching (900 ids/statement) must produce the exact same result as
+    /// a single unbatched pass over the identical candidate set --
+    /// batching is purely a SQL-bound-variable-ceiling workaround, not a
+    /// behavior change. Diffs the real (900-row) batched path against a
+    /// reference run with the batch widened past the whole candidate
+    /// count (`set_hydrate_id_batch_rows_for_test`), not against the
+    /// retired v4 path.
+    #[test]
+    fn hybrid_limit_5000_hydrates_in_batches() -> Result<()> {
+        // Pinned: the real batch size must stay small enough that this
+        // test's candidate count genuinely spans multiple SQL statements
+        // (otherwise the "batched" and "reference" runs below would both
+        // collapse to a single batch and the comparison would prove
+        // nothing -- this is what a mutation widening `HYDRATE_ID_BATCH_
+        // ROWS` itself, e.g. to 100,000, must be caught by).
+        assert_eq!(HYDRATE_ID_BATCH_ROWS, 900);
+        const CANDIDATE_COUNT: i64 = 2_000; // > 2 * HYDRATE_ID_BATCH_ROWS(900)
+        const ROWS_PER_STATEMENT: usize = 300;
+
+        let dir = TempDir::new()?;
+        let db_path = dir.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path)?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".to_string(),
+            name: "codex".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        let conn = storage.raw();
+        conn.execute(
+            "INSERT OR IGNORE INTO sources(id, kind, created_at, updated_at) VALUES ('local', 'local', 0, 0)",
+            &[],
+        )?;
+
+        // Bulk, multi-row INSERTs (not `insert_conversation_tree`'s
+        // per-message object-graph API -- far too slow at this scale),
+        // chunked well under SQLite's bound-variable ceiling.
+        let ids: Vec<i64> = (0..CANDIDATE_COUNT).map(|i| 9_500_000 + i).collect();
+        conn.with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
+            for batch in ids.chunks(ROWS_PER_STATEMENT) {
+                let values_sql =
+                    batch.iter().map(|_| "(?, ?, 'local', 't', ?)").collect::<Vec<_>>().join(", ");
+                let sql = format!(
+                    "INSERT INTO conversations(id, agent_id, source_id, title, source_path) VALUES {values_sql}"
+                );
+                let mut params: Vec<ParamValue> = Vec::with_capacity(batch.len() * 3);
+                for id in batch {
+                    params.push(ParamValue::from(*id));
+                    params.push(ParamValue::from(agent_id));
+                    params.push(ParamValue::from(format!("/tmp/c-{id}.jsonl")));
+                }
+                tx.execute(&sql, &params)?;
+            }
+            for batch in ids.chunks(ROWS_PER_STATEMENT) {
+                let values_sql = batch
+                    .iter()
+                    .map(|_| "(?, ?, 0, 'user', ?, 'hydrate batch content')")
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    "INSERT INTO messages(id, conversation_id, idx, role, created_at, content) VALUES {values_sql}"
+                );
+                let mut params: Vec<ParamValue> = Vec::with_capacity(batch.len() * 3);
+                for id in batch {
+                    params.push(ParamValue::from(*id));
+                    params.push(ParamValue::from(*id));
+                    params.push(ParamValue::from(100_i64 + id));
+                }
+                tx.execute(&sql, &params)?;
+            }
+            Ok(())
+        })?;
+
+        // Descending score by construction order -- lets the ordering
+        // assertion below double as a check that hydration follows
+        // `results`' order, not id/insertion order.
+        let results: Vec<VectorSearchResult> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| VectorSearchResult {
+                message_id: u64::try_from(*id).unwrap(),
+                chunk_idx: 0,
+                chunk_span: Some((0, 1)),
+                chunk_hash: Some(format!("h{id}")),
+                score: 1.0 - (i as f32) * 0.0001,
+            })
+            .collect();
+
+        drop(storage);
+        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("db-backed client");
+
+        struct ResetBatchOnDrop;
+        impl Drop for ResetBatchOnDrop {
+            fn drop(&mut self) {
+                reset_hydrate_id_batch_rows_for_test();
+            }
+        }
+        let _reset_guard = ResetBatchOnDrop;
+
+        let batched = client.hydrate_semantic_hits_with_ids(&results, FieldMask::FULL)?;
+        set_hydrate_id_batch_rows_for_test(CANDIDATE_COUNT as usize + 10);
+        let reference = client.hydrate_semantic_hits_with_ids(&results, FieldMask::FULL)?;
+        reset_hydrate_id_batch_rows_for_test();
+
+        assert_eq!(
+            batched.len(),
+            CANDIDATE_COUNT as usize,
+            "must not report an error, and must not drop or duplicate a candidate"
+        );
+        assert_eq!(reference.len(), CANDIDATE_COUNT as usize);
+        for ((batched_id, batched_hit), (reference_id, reference_hit)) in batched.iter().zip(reference.iter()) {
+            assert_eq!(batched_id, reference_id, "batching must not change candidate identity or order");
+            assert_eq!(batched_hit.message_id, reference_hit.message_id);
+            assert_eq!(batched_hit.winning_chunk_idx, reference_hit.winning_chunk_idx);
+            assert_eq!(batched_hit.winning_chunk_hash, reference_hit.winning_chunk_hash);
+            assert_eq!(batched_hit.score, reference_hit.score);
+        }
+        let got_order: Vec<u64> = batched.iter().map(|(id, _)| *id).collect();
+        let want_order: Vec<u64> = results.iter().map(|r| r.message_id).collect();
+        assert_eq!(got_order, want_order, "hydration order must follow `results`' order");
+        Ok(())
     }
 
     fn sanitize_query(raw: &str) -> String {
@@ -16183,6 +16516,485 @@ mod tests {
         .unwrap();
         crate::storage::schema::switch_active_generation(conn, generation_id, 2_000, |_tx| Ok(())).unwrap();
         generation_id
+    }
+
+    /// T9 part 2: generalizes `seed_active_generation_with_chunk_vectors`
+    /// above (which pins `chunk_idx = 0`, one chunk per message) to
+    /// multiple chunks for the same message -- needed by the MaxSim-fold
+    /// test, which must construct one message with several chunks at
+    /// different distances from the query vector.
+    fn seed_active_generation_with_multi_chunk_vectors(
+        storage: &FrankenStorage,
+        dim: i64,
+        chunks: &[(i64, i64, u32, Vec<f32>)], // (message_id, conversation_id, chunk_idx, vector)
+    ) -> i64 {
+        let conn = storage.raw();
+        let fingerprint = vec![0u8; 3 * usize::try_from(dim).unwrap_or(0) * 4];
+        let generation_id = conn
+            .with_tx(crate::storage::api::TxMode::Immediate, |tx| {
+                let generation_id = crate::storage::schema::create_embedding_generation_v5(
+                    tx, "bge-m3", dim, 1, 1, &fingerprint, 1_000,
+                )?;
+                for (message_id, conversation_id, chunk_idx, vector) in chunks {
+                    let norm = crate::storage::schema::l2_norm(vector) as f32;
+                    crate::storage::schema::insert_chunk_row_in_tx(
+                        tx,
+                        &crate::storage::schema::ChunkRow {
+                            generation_id,
+                            message_id: *message_id,
+                            conversation_id: *conversation_id,
+                            chunk_idx: *chunk_idx,
+                            byte_start: 0,
+                            byte_end: 1,
+                            content_hash: format!("h{message_id}_{chunk_idx}"),
+                            embedding: vector.clone(),
+                            norm,
+                            created_at_ms: 1_000,
+                        },
+                    )?;
+                }
+                Ok(generation_id)
+            })
+            .unwrap();
+        crate::storage::vector_domain::create_vec0_table_for_generation(conn, generation_id, dim).unwrap();
+        let blobs: Vec<(i64, Vec<u8>)> = conn
+            .query_all_map(
+                "SELECT chunk_id, embedding FROM message_chunks WHERE generation_id = ?1",
+                &crate::storage::api::params![generation_id],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )
+            .unwrap();
+        let vec0_rows: Vec<(i64, &[u8])> = blobs.iter().map(|(id, blob)| (*id, blob.as_slice())).collect();
+        conn.with_tx(crate::storage::api::TxMode::Immediate, |tx| {
+            crate::storage::vector_domain::insert_vec0_rows_in_tx(tx, generation_id, &vec0_rows)?;
+            Ok(())
+        })
+        .unwrap();
+        crate::storage::schema::switch_active_generation(conn, generation_id, 2_000, |_tx| Ok(())).unwrap();
+        generation_id
+    }
+
+    /// T9 part 2 (mission #93/#93b Step 1): the MaxSim fold must pick the
+    /// *closest* chunk among several belonging to the same message, not
+    /// merely the first one `vec0`'s KNN scan happens to return.
+    #[test]
+    fn semantic_maxsim_folds_chunks_to_message() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        seed_db3_message(
+            &storage,
+            &Db3SeedMessage {
+                agent_slug: "codex",
+                workspace_path: None,
+                source_id: "local",
+                role: "user",
+                created_at: 100,
+                message_id: 9001,
+                conversation_id: 9001,
+            },
+        );
+        let chunks: Vec<(i64, i64, u32, Vec<f32>)> = vec![
+            (9001, 9001, 0, vec![0.0_f32, 1.0]), // farthest (distance 1.0)
+            (9001, 9001, 1, vec![0.9_f32, 0.1]), // middle
+            (9001, 9001, 2, vec![1.0_f32, 0.0]), // closest (distance 0.0)
+        ];
+        seed_active_generation_with_multi_chunk_vectors(&storage, 2, &chunks);
+
+        // fetch_limit=1 keeps this test purely about which chunk wins the
+        // fold -- exact-scan trigger semantics are a separate family of
+        // tests below.
+        let (results, meta) = SearchClient::search_db_vector_domain(
+            storage.raw(),
+            &[1.0, 0.0],
+            &SearchFilters::default(),
+            None,
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(results.len(), 1, "three chunks of one message must fold to a single hit");
+        assert_eq!(results[0].message_id, 9001);
+        assert_eq!(
+            results[0].chunk_idx, 2,
+            "MaxSim must pick chunk_idx=2 (distance 0.0), not chunk_idx=0 (insertion/provenance order)"
+        );
+        assert_eq!(meta.first_round_rows, 3, "raw KNN must see all three chunk rows before folding");
+        assert_eq!(meta.unique_messages, 1);
+        assert_eq!(meta.mode, CandidateMode::Knn);
+    }
+
+    /// T9 part 2 (mission #93/#93b Step 1): a KNN window saturated by a
+    /// handful of "big" messages (many chunks each, all closer than
+    /// everything else) starves out the *other* messages entirely -- after
+    /// the MaxSim fold, round 1 only ever sees the big messages'
+    /// message_ids, so the exact-scan round must widen past the window to
+    /// find the rest. The exact-scan phase's own full-generation scan
+    /// (unbounded by round1's window) also recovers any of the 3 big
+    /// messages round1's KNN tie-break happened not to surface, so this
+    /// test's assertions hold regardless of how vec0 breaks distance-0
+    /// ties among the 5,000 identically-scored big-message chunks.
+    #[test]
+    fn semantic_k_window_full_starvation_triggers_exact_scan() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        const BIG_MESSAGE_IDS: [i64; 3] = [8001, 8002, 8003];
+        const BIG_CHUNK_COUNTS: [u32; 3] = [1668, 1666, 1666]; // sums to 5,000
+        const SINGLE_COUNT: i64 = 100;
+
+        for message_id in BIG_MESSAGE_IDS {
+            seed_db3_message(
+                &storage,
+                &Db3SeedMessage {
+                    agent_slug: "codex",
+                    workspace_path: None,
+                    source_id: "local",
+                    role: "user",
+                    created_at: 100,
+                    message_id,
+                    conversation_id: message_id,
+                },
+            );
+        }
+        for i in 0..SINGLE_COUNT {
+            let message_id = 8101 + i;
+            seed_db3_message(
+                &storage,
+                &Db3SeedMessage {
+                    agent_slug: "codex",
+                    workspace_path: None,
+                    source_id: "local",
+                    role: "user",
+                    created_at: 100 + i,
+                    message_id,
+                    conversation_id: message_id,
+                },
+            );
+        }
+
+        let mut chunks: Vec<(i64, i64, u32, Vec<f32>)> = Vec::with_capacity(5100);
+        for (message_id, count) in BIG_MESSAGE_IDS.into_iter().zip(BIG_CHUNK_COUNTS) {
+            for chunk_idx in 0..count {
+                // Identical to the query vector -- distance 0, tied nearest.
+                chunks.push((message_id, message_id, chunk_idx, vec![1.0_f32, 0.0]));
+            }
+        }
+        for i in 0..SINGLE_COUNT {
+            let message_id = 8101 + i;
+            // Orthogonal to the query -- distance 1.0, guaranteed farther
+            // than every big-message chunk above.
+            chunks.push((message_id, message_id, 0, vec![0.0_f32, 1.0]));
+        }
+        seed_active_generation_with_multi_chunk_vectors(&storage, 2, &chunks);
+
+        let (results, meta) = SearchClient::search_db_vector_domain(
+            storage.raw(),
+            &[1.0, 0.0],
+            &SearchFilters::default(),
+            None,
+            20,
+        )
+        .unwrap();
+
+        assert_eq!(meta.first_round_rows, 80, "k = min(20*4, 4096) = 80");
+        assert_eq!(
+            meta.mode,
+            CandidateMode::KnnExact,
+            "round1's window is saturated entirely by the 3 big messages -- the 100 single-chunk \
+             messages are starved out and must be found by the exact-scan round"
+        );
+        assert!(!meta.incomplete);
+        assert_eq!(meta.unique_messages, 20);
+        assert_eq!(results.len(), 20);
+        let got_ids: std::collections::HashSet<i64> = results.iter().map(|r| r.message_id as i64).collect();
+        for big_id in BIG_MESSAGE_IDS {
+            assert!(
+                got_ids.contains(&big_id),
+                "the 3 big messages must all be present -- the exact-scan round's own full-\
+                 generation scan recovers any round1's tie-break happened to miss"
+            );
+        }
+    }
+
+    /// T9 part 2 (mission #93/#93b Step 1): round 1's raw KNN window can be
+    /// saturated entirely by non-matching messages when a selective filter
+    /// excludes every one of them -- the exact-scan round must then widen
+    /// past the window into the filtered-in remainder to find any matches
+    /// at all.
+    #[test]
+    fn semantic_exact_scan_triggers_when_filter_drops_all_topk() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        const OTHER_DOCS: i64 = 40;
+        const TARGET_DOCS: i64 = 10;
+
+        let mut vectors: Vec<(i64, i64, Vec<f32>)> = Vec::with_capacity((OTHER_DOCS + TARGET_DOCS) as usize);
+        for i in 0..OTHER_DOCS {
+            let message_id = 8501 + i;
+            seed_db3_message(
+                &storage,
+                &Db3SeedMessage {
+                    agent_slug: "codex",
+                    workspace_path: Some("/ws/other"),
+                    source_id: "local",
+                    role: "user",
+                    created_at: 100 + i,
+                    message_id,
+                    conversation_id: message_id,
+                },
+            );
+            let theta = (i as f32) * 0.001; // near the query
+            vectors.push((message_id, message_id, vec![theta.cos(), theta.sin()]));
+        }
+        for k in 0..TARGET_DOCS {
+            let message_id = 8601 + k;
+            seed_db3_message(
+                &storage,
+                &Db3SeedMessage {
+                    agent_slug: "codex",
+                    workspace_path: Some("/ws/target"),
+                    source_id: "local",
+                    role: "user",
+                    created_at: 200 + k,
+                    message_id,
+                    conversation_id: message_id,
+                },
+            );
+            let theta = 1.0_f32 + (k as f32) * 0.001; // far, guaranteed farther than every /ws/other doc
+            vectors.push((message_id, message_id, vec![theta.cos(), theta.sin()]));
+        }
+        seed_active_generation_with_chunk_vectors(&storage, 2, &vectors);
+
+        let mut filters = SearchFilters::default();
+        filters.workspaces.insert("/ws/target".to_string());
+        let (results, meta) = SearchClient::search_db_vector_domain(
+            storage.raw(),
+            &[1.0, 0.0],
+            &filters,
+            None,
+            10,
+        )
+        .unwrap();
+
+        assert_eq!(meta.first_round_rows, 40, "k = min(10*4, 50) = 40");
+        assert_eq!(
+            meta.mode,
+            CandidateMode::KnnExact,
+            "the filter drops every one of round1's 40 /ws/other candidates to zero"
+        );
+        assert!(!meta.incomplete);
+        assert_eq!(meta.unique_messages, 10);
+        let got_ids: std::collections::HashSet<i64> = results.iter().map(|r| r.message_id as i64).collect();
+        let want_ids: std::collections::HashSet<i64> = (0..TARGET_DOCS).map(|k| 8601 + k).collect();
+        assert_eq!(
+            got_ids, want_ids,
+            "every result must come from the /ws/target set that round1's window never saw"
+        );
+    }
+
+    /// T9 part 2 (mission #93/#93b Step 1): the exact-scan round's row
+    /// budget must cut a scan short (not error) once more filter-passing
+    /// rows exist than the budget allows, reporting the result as
+    /// incomplete rather than silently truncating without a signal.
+    #[test]
+    fn semantic_exact_scan_row_budget_marks_incomplete() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        const OTHER_DOCS: i64 = 80;
+        const TARGET_DOCS: i64 = 20;
+
+        struct ResetBudgetOnDrop;
+        impl Drop for ResetBudgetOnDrop {
+            fn drop(&mut self) {
+                reset_exact_scan_row_budget_for_test();
+            }
+        }
+        let _reset_guard = ResetBudgetOnDrop;
+        set_exact_scan_row_budget_for_test(10);
+
+        let mut vectors: Vec<(i64, i64, Vec<f32>)> = Vec::with_capacity((OTHER_DOCS + TARGET_DOCS) as usize);
+        for i in 0..OTHER_DOCS {
+            let message_id = 8701 + i;
+            seed_db3_message(
+                &storage,
+                &Db3SeedMessage {
+                    agent_slug: "codex",
+                    workspace_path: Some("/ws/other"),
+                    source_id: "local",
+                    role: "user",
+                    created_at: 100 + i,
+                    message_id,
+                    conversation_id: message_id,
+                },
+            );
+            let theta = (i as f32) * 0.001;
+            vectors.push((message_id, message_id, vec![theta.cos(), theta.sin()]));
+        }
+        for k in 0..TARGET_DOCS {
+            let message_id = 8801 + k;
+            seed_db3_message(
+                &storage,
+                &Db3SeedMessage {
+                    agent_slug: "codex",
+                    workspace_path: Some("/ws/target"),
+                    source_id: "local",
+                    role: "user",
+                    created_at: 200 + k,
+                    message_id,
+                    conversation_id: message_id,
+                },
+            );
+            let theta = 1.0_f32 + (k as f32) * 0.001;
+            vectors.push((message_id, message_id, vec![theta.cos(), theta.sin()]));
+        }
+        seed_active_generation_with_chunk_vectors(&storage, 2, &vectors);
+
+        let mut filters = SearchFilters::default();
+        filters.workspaces.insert("/ws/target".to_string());
+        let (results, meta) = SearchClient::search_db_vector_domain(
+            storage.raw(),
+            &[1.0, 0.0],
+            &filters,
+            None,
+            15,
+        )
+        .unwrap();
+
+        assert_eq!(meta.first_round_rows, 60, "k = min(15*4, 100) = 60");
+        assert_eq!(meta.mode, CandidateMode::KnnExact);
+        assert!(meta.incomplete, "the filtered universe (20 rows) exceeds the injected budget (10)");
+        assert_eq!(meta.reason.as_deref(), Some("exact_scan_row_budget"));
+        assert_eq!(
+            meta.unique_messages, 10,
+            "exactly `budget` rows make it into the result before the sentinel fires"
+        );
+        assert_eq!(results.len(), 10);
+    }
+
+    /// T9 part 2 (mission #93/#93b Step 1, plan v5.1 KNN row "语料本就少于
+    /// limit（窗未满）→ incomplete=false"): when the corpus is smaller than
+    /// `fetch_limit` and no filter excludes anything, round1's window
+    /// already covers every message that exists -- a second exact-scan
+    /// pass could not possibly find more, so `mode` must stay `Knn` (a
+    /// no-op `KnnExact` would misreport "a deeper scan ran" via
+    /// `CandidateMeta.mode`).
+    #[test]
+    fn semantic_incomplete_false_when_corpus_smaller_than_limit() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        const TOTAL_DOCS: i64 = 30;
+
+        let mut vectors: Vec<(i64, i64, Vec<f32>)> = Vec::with_capacity(TOTAL_DOCS as usize);
+        for i in 0..TOTAL_DOCS {
+            let message_id = 8901 + i;
+            seed_db3_message(
+                &storage,
+                &Db3SeedMessage {
+                    agent_slug: "codex",
+                    workspace_path: None,
+                    source_id: "local",
+                    role: "user",
+                    created_at: 100 + i,
+                    message_id,
+                    conversation_id: message_id,
+                },
+            );
+            let theta = (i as f32) * 0.01;
+            vectors.push((message_id, message_id, vec![theta.cos(), theta.sin()]));
+        }
+        seed_active_generation_with_chunk_vectors(&storage, 2, &vectors);
+
+        let (results, meta) = SearchClient::search_db_vector_domain(
+            storage.raw(),
+            &[1.0, 0.0],
+            &SearchFilters::default(),
+            None,
+            50,
+        )
+        .unwrap();
+
+        assert_eq!(meta.first_round_rows, 30, "k = min(50*4, 30) = 30 -- capped by the corpus itself");
+        assert!(!meta.incomplete);
+        assert_eq!(
+            meta.mode,
+            CandidateMode::Knn,
+            "the corpus (30) is smaller than fetch_limit (50) and nothing was filtered out -- \
+             round1 already has the exhaustive answer, a second exact-scan pass would be a no-op"
+        );
+        assert_eq!(meta.unique_messages, 30);
+        assert_eq!(results.len(), 30);
+    }
+
+    /// T9 part 2 (mission #93/#93b Step 1, plan v5.1 KNN row "最终稳定序
+    /// (score desc, message_id asc)"): when many exact-scan candidates tie
+    /// at the identical distance -- more than `still_needed` -- both the
+    /// exact-scan round's own truncation *and* the final result order must
+    /// break the tie the same way: message_id ascending, not scan order.
+    #[test]
+    fn semantic_exact_scan_tie_order_is_score_desc_message_id_asc() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        const OTHER_DOCS: i64 = 40;
+        const TARGET_DOCS: i64 = 20;
+
+        let mut vectors: Vec<(i64, i64, Vec<f32>)> = Vec::with_capacity((OTHER_DOCS + TARGET_DOCS) as usize);
+        for i in 0..OTHER_DOCS {
+            let message_id = 9101 + i;
+            seed_db3_message(
+                &storage,
+                &Db3SeedMessage {
+                    agent_slug: "codex",
+                    workspace_path: Some("/ws/other"),
+                    source_id: "local",
+                    role: "user",
+                    created_at: 100 + i,
+                    message_id,
+                    conversation_id: message_id,
+                },
+            );
+            let theta = (i as f32) * 0.0001;
+            vectors.push((message_id, message_id, vec![theta.cos(), theta.sin()]));
+        }
+        // All 20 target docs sit at the exact same vector -- tied distance,
+        // farther than every /ws/other doc above.
+        for k in 0..TARGET_DOCS {
+            let message_id = 9201 + k;
+            seed_db3_message(
+                &storage,
+                &Db3SeedMessage {
+                    agent_slug: "codex",
+                    workspace_path: Some("/ws/target"),
+                    source_id: "local",
+                    role: "user",
+                    created_at: 200 + k,
+                    message_id,
+                    conversation_id: message_id,
+                },
+            );
+            vectors.push((message_id, message_id, vec![0.0_f32, 1.0]));
+        }
+        seed_active_generation_with_chunk_vectors(&storage, 2, &vectors);
+
+        let mut filters = SearchFilters::default();
+        filters.workspaces.insert("/ws/target".to_string());
+        let (results, meta) = SearchClient::search_db_vector_domain(
+            storage.raw(),
+            &[1.0, 0.0],
+            &filters,
+            None,
+            10,
+        )
+        .unwrap();
+
+        assert_eq!(meta.mode, CandidateMode::KnnExact);
+        assert!(!meta.incomplete);
+        assert_eq!(meta.unique_messages, 10);
+        let got_ids: Vec<i64> = results.iter().map(|r| r.message_id as i64).collect();
+        let want_ids: Vec<i64> = (0..10).map(|k| 9201 + k).collect();
+        assert_eq!(
+            got_ids, want_ids,
+            "20 tied-distance targets exist but only 10 are needed -- both the exact-scan's own \
+             truncation and the final ordering must keep the lowest message_ids, not scan order"
+        );
     }
 
     #[test]

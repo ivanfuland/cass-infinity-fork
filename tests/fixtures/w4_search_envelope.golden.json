@@ -1,0 +1,11 @@
+{
+  "candidates": {
+    "mode": "knn",
+    "k": 1,
+    "first_round_rows": 1,
+    "unique_messages": 1,
+    "incomplete": false,
+    "reason": null
+  },
+  "semantic_degraded": false
+}
