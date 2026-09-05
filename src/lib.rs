@@ -19182,6 +19182,11 @@ fn state_meta_json_inner(
             "audit_status": s.audit_status,
             "embedded_count": s.embedded_count,
             "any_generation": s.any_generation,
+            // T8 (plan v5.1): chunk-domain identity/volume, same absence
+            // semantics as embedded_count (None when no active generation
+            // or a query error already reported via `error`).
+            "chunk_count": s.chunk_count,
+            "chunking_policy_version": s.chunking_policy_version,
             // R1-N7: Some(detail) here means a query against an already-
             // opened DB failed -- the fields above are NOT a trustworthy
             // "no generation" absence signal in that case.
@@ -23355,8 +23360,8 @@ fn run_cli_search(
             }
             #[cfg(any(feature = "semantic", feature = "infinity"))]
             {
-                let hits = client
-                    .search_semantic(query, filters.clone(), search_limit, search_offset, field_mask)
+                let (hits, candidate_meta) = client
+                    .search_semantic_with_meta(query, filters.clone(), search_limit, search_offset, field_mask)
                     .map_err(|e| {
                         let err_str = e.to_string();
                         if err_str.contains("unavailable")
@@ -23391,6 +23396,8 @@ fn run_cli_search(
                     cache_stats: crate::search::query::CacheStats::default(),
                     suggestions: Vec::new(),
                     total_count: None,
+                    candidates: Some(candidate_meta),
+                    semantic_degraded: false,
                 }
             }
         }
@@ -23593,6 +23600,8 @@ fn run_cli_search(
                             cache_stats: result.cache_stats,
                             suggestions: result.suggestions,
                             total_count: result.total_count,
+                            candidates: result.candidates,
+                            semantic_degraded: result.semantic_degraded,
                         }
                     }
                     Err(e) => {
@@ -23671,6 +23680,8 @@ fn run_cli_search(
                 cache_stats: result.cache_stats,
                 suggestions: result.suggestions.clone(),
                 total_count: result.total_count,
+                candidates: result.candidates.clone(),
+                semantic_degraded: result.semantic_degraded,
             };
             let has_more = total > offset_val + display.hits.len();
             (aggs, display, total, has_more, false)
@@ -23698,6 +23709,8 @@ fn run_cli_search(
                 cache_stats: result.cache_stats,
                 suggestions: result.suggestions,
                 total_count: result.total_count,
+                candidates: result.candidates,
+                semantic_degraded: result.semantic_degraded,
             };
             (
                 Aggregations::default(),
@@ -26537,6 +26550,16 @@ fn output_robot_results(
                     "mode_defaulted": search_mode_meta.defaulted,
                     "fallback_tier": search_mode_meta.fallback_tier,
                     "fallback_reason": search_mode_meta.fallback_reason.clone(),
+                    // T9 part 2 fix (plan v5.1 T9 Interfaces: "_meta.
+                    // candidates{…}" 与 "_meta.semantic_degraded（顶层）"):
+                    // this envelope construction never surfaced `SearchResult
+                    // .candidates`/`.semantic_degraded` before -- both fields
+                    // existed on the struct (T9 part 1) but had no JSON/JSONL
+                    // emission path, so `--robot-meta` callers had no way to
+                    // observe chunk-domain candidate diagnostics or a
+                    // hybrid-search lexical fail-open at all.
+                    "candidates": result.candidates,
+                    "semantic_degraded": result.semantic_degraded,
                     "semantic_refinement": search_mode_meta.semantic_refinement(),
                     "refinement_level": search_mode_meta.realized_refinement(),
                     "semantic_fallback_reason": search_mode_meta.semantic_fallback_reason(),
@@ -26680,6 +26703,11 @@ fn output_robot_results(
                         "mode_defaulted": search_mode_meta.defaulted,
                         "fallback_tier": search_mode_meta.fallback_tier,
                         "fallback_reason": search_mode_meta.fallback_reason.clone(),
+                        // T9 part 2 fix -- see the `RobotFormat::Json` arm's
+                        // identical addition above for why these two fields
+                        // had no emission path before this fix.
+                        "candidates": result.candidates,
+                        "semantic_degraded": result.semantic_degraded,
                         "semantic_refinement": search_mode_meta.semantic_refinement(),
                         "refinement_level": search_mode_meta.realized_refinement(),
                         "semantic_fallback_reason": search_mode_meta.semantic_fallback_reason(),
@@ -72133,6 +72161,81 @@ mod cli_read_db_tests {
         );
     }
 
+    /// T8 (plan v5.1, task book #92) "status JSON 同名字段；golden 更新":
+    /// the real `cass status` JSON (not just `DbVectorDomainStatus`'s own
+    /// serde shape) must carry `chunk_count`/`chunking_policy_version`
+    /// inside `db_vector_domain` for an active v5 generation with a
+    /// drained chunk.
+    #[test]
+    fn status_json_carries_chunk_count_and_policy() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use crate::storage::api::{TxMode, params};
+        use crate::storage::schema;
+
+        let (temp, db_path) = seed_cli_db();
+        let storage = FrankenStorage::open(&db_path).expect("reopen cass db");
+        let fingerprint = vec![1u8; 3 * 4 * 4];
+        let gen_id = storage
+            .raw()
+            .with_tx(TxMode::Immediate, |tx| {
+                schema::create_embedding_generation(
+                    tx,
+                    "mock-embedder-t8",
+                    4,
+                    crate::search::canonicalize::CANONICALIZE_PIPELINE_VERSION,
+                    crate::search::chunking::CHUNKING_POLICY_VERSION,
+                    &fingerprint,
+                    0,
+                )
+            })
+            .expect("create v5 embedding generation");
+        let agent_id = storage
+            .ensure_agent(&Agent { id: None, slug: "claude_code".into(), name: "Claude Code".into(), version: Some("1.0".into()), kind: AgentKind::Cli })
+            .expect("ensure agent");
+        let conv = Conversation {
+            id: None,
+            agent_slug: "claude_code".into(),
+            workspace: None,
+            external_id: Some("status-json-fixture".into()),
+            title: Some("status json fixture".into()),
+            source_path: PathBuf::from("/fixtures/status-json.jsonl"),
+            started_at: Some(0),
+            ended_at: Some(0),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message { id: None, idx: 0, role: MessageRole::User, author: None, created_at: Some(0), content: "status json fixture message".into(), extra_json: serde_json::Value::Null, snippets: vec![] }],
+            source_id: "local".into(),
+            origin_host: None,
+        };
+        storage.insert_conversation_tree(agent_id, None, &conv).expect("insert fixture conversation");
+        let message_id: i64 = storage.raw().query_row_map("SELECT id FROM messages LIMIT 1", &[], |row| row.get_typed(0)).unwrap();
+        let conversation_id: i64 =
+            storage.raw().query_row_map("SELECT conversation_id FROM messages WHERE id = ?1", &params![message_id], |row| row.get_typed(0)).unwrap();
+        storage
+            .raw()
+            .execute(
+                "INSERT INTO message_chunks (generation_id, message_id, conversation_id, chunk_idx, byte_start, byte_end, content_hash, embedding, norm, created_at) \
+                 VALUES (?1, ?2, ?3, 0, 0, 5, 'fixture-hash', ?4, 1.0, 0)",
+                &params![gen_id, message_id, conversation_id, schema::f32_vector_to_le_blob(&[1.0f32, 1.0, 1.0, 1.0])],
+            )
+            .expect("insert fixture message_chunks row");
+        storage
+            .raw()
+            .execute("UPDATE embedding_generations SET is_active = 1, audit_status = 'passed' WHERE id = ?1", &params![gen_id])
+            .expect("mark generation active");
+        drop(storage);
+
+        let state = state_meta_json_for_status(temp.path(), &db_path, 60);
+        let db_vector_domain = state.get("db_vector_domain").and_then(serde_json::Value::as_object).expect("db_vector_domain must be present (not null) once the DB is opened and has an active generation");
+        assert_eq!(db_vector_domain.get("active").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(db_vector_domain.get("chunk_count").and_then(|v| v.as_i64()), Some(1), "db_vector_domain.chunk_count must reflect the one seeded message_chunks row: {db_vector_domain:?}");
+        assert_eq!(
+            db_vector_domain.get("chunking_policy_version").and_then(|v| v.as_i64()),
+            Some(i64::from(crate::search::chunking::CHUNKING_POLICY_VERSION)),
+            "db_vector_domain.chunking_policy_version must reflect the real (non-legacy) policy version stamped at creation: {db_vector_domain:?}"
+        );
+    }
+
     #[test]
     fn status_state_marks_scan_ahead_of_projection_stale() {
         let (temp, db_path) = seed_cli_db();
@@ -85504,7 +85607,7 @@ fn semantic_activation_suffix(stats: &indexer::IndexingStats) -> Option<String> 
         if activated {
             ", semantic index: activated".to_string()
         } else {
-            ", semantic index: not activated yet (holes remain; rerun to continue draining embedding_holes)"
+            ", semantic index: not activated yet (holes remain; rerun to continue draining chunk_holes)"
                 .to_string()
         }
     })
@@ -86220,7 +86323,7 @@ fn run_index_with_data(
                     if activated {
                         "activated"
                     } else {
-                        "not activated yet (holes remain; rerun to continue draining embedding_holes)"
+                        "not activated yet (holes remain; rerun to continue draining chunk_holes)"
                     }
                 );
             }
@@ -91904,6 +92007,10 @@ mod robot_output_score_tests {
             source_id: "local".to_string(),
             origin_kind: "local".to_string(),
             origin_host: None,
+            message_id: None,
+            winning_chunk_idx: None,
+            winning_chunk_span: None,
+            winning_chunk_hash: None,
         }
     }
 
@@ -97412,7 +97519,7 @@ fn run_models_backfill(
 
     // W3-5: frankensearch/fsvi retired. The infinity-backed quality tier no
     // longer builds a .fsvi file -- it drains the DB vector domain's
-    // `embedding_holes` via the same catch-up `cass index --semantic` uses
+    // `chunk_holes` via the same catch-up `cass index --semantic` uses
     // (ingest-time hooks already register a hole per new message; this
     // drains them + does a genesis-eligibility rescan as a self-healing
     // safety net -- W3-5 task book #63 advisor ruling). hash/fastembed
@@ -97433,16 +97540,50 @@ fn run_models_backfill(
                     retryable: true,
                 })?
                 .batch_size();
+            // T8 (plan v5.1, task book #92): `cass models backfill` drains
+            // the chunk domain, matching `index --semantic`'s wiring --
+            // the retired v4 message-granularity engine T11 deleted is no
+            // longer reachable from anywhere.
+            let infinity_config = crate::search::infinity::InfinityConfig::from_env();
+            let (identity, fingerprint) =
+                crate::search::infinity::probe_identity_and_fingerprint(&infinity_config).map_err(|e| CliError {
+                    code: 20,
+                    kind: CliErrorKind::Model.kind_str(),
+                    message: format!("Infinity identity+fingerprint probe failed: {e}"),
+                    hint: Some(
+                        "Check CASS_INFINITY_* env vars and that the Infinity service is reachable"
+                            .into(),
+                    ),
+                    retryable: true,
+                })?;
+            let embedder = crate::search::infinity::InfinityEmbedder::new().map_err(|e| CliError {
+                code: 20,
+                kind: CliErrorKind::Model.kind_str(),
+                message: format!("Failed to construct infinity embedder: {e}"),
+                hint: None,
+                retryable: true,
+            })?;
+            let embed_fn = |texts: &[&str]| -> std::result::Result<Vec<Vec<f32>>, String> {
+                use crate::search::embedder::Embedder as _;
+                embedder.embed_batch_sync(texts).map_err(|e| e.to_string())
+            };
+            let ownership_seed = FrankenStorage::now_millis() as u64;
             let report = crate::indexer::db_vector_catchup::run_db_vector_catchup_backfill(
                 &storage,
                 batch_size,
+                &identity,
+                crate::search::canonicalize::CANONICALIZE_PIPELINE_VERSION,
+                crate::search::chunking::CHUNKING_POLICY_VERSION,
+                &fingerprint,
+                &embed_fn,
+                ownership_seed,
             )
             .map_err(|e| CliError {
                 code: 5,
                 kind: CliErrorKind::SemanticBackfill.kind_str(),
                 message: format!("DB vector domain catch-up failed: {e:#}"),
                 hint: Some(
-                    "Retry the command; the catch-up is idempotent (embedding_holes-driven)"
+                    "Retry the command; the catch-up is idempotent (chunk_holes-driven)"
                         .into(),
                 ),
                 retryable: true,
@@ -97463,7 +97604,7 @@ fn run_models_backfill(
                         "next_step": if report.activated {
                             "semantic tier is ready"
                         } else {
-                            "rerun the same command to continue draining embedding_holes"
+                            "rerun the same command to continue draining chunk_holes"
                         },
                         "tier": "quality",
                         "embedder_id": report.embedder_id,
@@ -97626,7 +97767,7 @@ mod w3_5_models_backfill_infinity_wiring_tests {
         let embedded_count: i64 = storage
             .raw()
             .query_row_map(
-                "SELECT COUNT(*) FROM message_embeddings WHERE generation_id = ?1",
+                "SELECT COUNT(DISTINCT message_id) FROM message_chunks WHERE generation_id = ?1",
                 &crate::storage::api::params![active.unwrap()],
                 |row| row.get_typed(0),
             )

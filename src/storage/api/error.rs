@@ -32,6 +32,11 @@ pub enum StorageError {
     Corrupt { detail: String },
     Constraint { detail: String },
     Other { code: Option<i32>, detail: String },
+    /// T4 (plan v5.1): `schema::ensure()` returns this for any database
+    /// whose `user_version` is `1..=4` (or `0` and non-empty) -- v5 is
+    /// rebuild-only, so there is no in-place migration path for a pre-v5
+    /// database; the caller's story is "rebuild from the corpus" (T12).
+    SchemaRebuildRequired { found: i64, required: i64 },
 }
 
 impl fmt::Display for StorageError {
@@ -50,6 +55,12 @@ impl fmt::Display for StorageError {
                 write!(f, "storage error [{c}]: {detail}")
             }
             StorageError::Other { code: None, detail } => write!(f, "storage error: {detail}"),
+            StorageError::SchemaRebuildRequired { found, required } => write!(
+                f,
+                "database schema version {found} predates version {required}'s rebuild-only \
+                 shape; full re-ingest required (in-place migration is not supported for this \
+                 version)"
+            ),
         }
     }
 }

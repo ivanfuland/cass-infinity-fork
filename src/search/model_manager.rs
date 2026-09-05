@@ -391,7 +391,7 @@ fn probe_db_vector_domain_availability(db_path: &Path) -> SemanticAvailability {
 /// parallel, additive status section -- it does not replace or change
 /// the existing fsvi-driven `semantic` section, which keeps reporting
 /// exactly as it always has during the W3-3..W3-5 coexistence window.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct DbVectorDomainStatus {
     pub active: bool,
     pub embedder_id: Option<String>,
@@ -399,6 +399,19 @@ pub(crate) struct DbVectorDomainStatus {
     pub audit_status: Option<String>,
     pub embedded_count: Option<i64>,
     pub any_generation: bool,
+    /// T8 (plan v5.1): `message_chunks` row count for the active
+    /// generation -- `None` under the same conditions `embedded_count`
+    /// is `None` (no active generation, or an SQL error already reported
+    /// via `error`). `Some(0)` is a real, distinguishable state: an
+    /// active v5 generation whose chunk-domain catch-up hasn't drained
+    /// anything into it yet (or a legacy v4-only generation, which never
+    /// has `message_chunks` rows at all).
+    pub chunk_count: Option<i64>,
+    /// T8: the active generation's `chunking_policy_version` column --
+    /// `None` under the same conditions as `chunk_count`. A legacy (pre-T2)
+    /// generation reads back `Some(0)` (`LEGACY_CHUNKING_POLICY_VERSION`),
+    /// distinguishable from a real v5 generation's `Some(1)`.
+    pub chunking_policy_version: Option<i64>,
     /// R1-N7: a genuine SQL error against an already-opened database (as
     /// opposed to the database itself failing to open at all, which stays
     /// `None` from this function per its own doc comment) used to be
@@ -427,19 +440,40 @@ pub(crate) fn probe_db_vector_domain_status(db_path: &Path) -> Option<DbVectorDo
         audit_status: None,
         embedded_count: None,
         any_generation: false,
+        chunk_count: None,
+        chunking_policy_version: None,
         error: Some(err.to_string()),
     };
-    let active: Option<(i64, String, i64, String)> = match conn.query_opt_map(
-        "SELECT id, embedder_id, dim, audit_status FROM embedding_generations WHERE is_active = 1",
+    let active: Option<(i64, String, i64, String, i64)> = match conn.query_opt_map(
+        "SELECT id, embedder_id, dim, audit_status, chunking_policy_version FROM embedding_generations WHERE is_active = 1",
         &[],
-        |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?, row.get_typed(3)?)),
+        |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?, row.get_typed(3)?, row.get_typed(4)?)),
     ) {
         Ok(active) => active,
         Err(err) => return Some(error_status(&err)),
     };
-    if let Some((generation_id, embedder_id, dim, audit_status)) = active {
+    if let Some((generation_id, embedder_id, dim, audit_status, chunking_policy_version)) = active {
+        // T11: `embedded_count` historically counted the retired v4
+        // message-granularity table's rows (one row per embedded message).
+        // Repointed to `message_chunks`, but `COUNT(DISTINCT message_id)`
+        // -- not `COUNT(*)` -- to preserve the field's semantics ("how many
+        // messages are embedded", not "how many chunks exist"; a message
+        // can own more than one chunk, and `chunk_count` below already
+        // reports the raw chunk-row count).
         let embedded_count: i64 = match conn.query_row_map(
-            "SELECT COUNT(*) FROM message_embeddings WHERE generation_id = ?1",
+            "SELECT COUNT(DISTINCT message_id) FROM message_chunks WHERE generation_id = ?1",
+            &params![generation_id],
+            |row| row.get_typed(0),
+        ) {
+            Ok(count) => count,
+            Err(err) => return Some(error_status(&err)),
+        };
+        // T8: `message_chunks` is a base-schema table (present regardless
+        // of whether this particular generation ever had anything drained
+        // into it -- a legacy v4-only generation simply reads back `0`
+        // here, not an error).
+        let chunk_count: i64 = match conn.query_row_map(
+            "SELECT COUNT(*) FROM message_chunks WHERE generation_id = ?1",
             &params![generation_id],
             |row| row.get_typed(0),
         ) {
@@ -453,6 +487,8 @@ pub(crate) fn probe_db_vector_domain_status(db_path: &Path) -> Option<DbVectorDo
             audit_status: Some(audit_status),
             embedded_count: Some(embedded_count),
             any_generation: true,
+            chunk_count: Some(chunk_count),
+            chunking_policy_version: Some(chunking_policy_version),
             error: None,
         });
     }
@@ -468,6 +504,8 @@ pub(crate) fn probe_db_vector_domain_status(db_path: &Path) -> Option<DbVectorDo
         audit_status: None,
         embedded_count: None,
         any_generation: any_generation > 0,
+        chunk_count: None,
+        chunking_policy_version: None,
         error: None,
     })
 }
@@ -550,7 +588,7 @@ pub fn load_hash_semantic_context(data_dir: &Path, _db_path: &Path) -> SemanticS
 /// daemon path (Infinity) at search time; this in-proc embedder supplies
 /// the matching id/dimension.
 ///
-/// W3-5: DB-vector-domain (`embedding_generations`/`message_embeddings`) is
+/// W3-5: DB-vector-domain (`embedding_generations`/`message_chunks`) is
 /// the sole substrate now -- the legacy fsvi-file path this used to fall
 /// back to (behind `CASS_SEMANTIC_USE_FSVI`) is retired along with the
 /// escape hatch itself, for the same builder-without-reader reason as
@@ -999,7 +1037,7 @@ mod tests {
         let storage = FrankenStorage::open(&db_path).expect("open production storage");
         let gen_id = storage
             .raw()
-            .with_tx_no_replay(TxMode::Immediate, |tx| schema::create_embedding_generation(tx, "BAAI/bge-m3", 1024, 1, 0))
+            .with_tx_no_replay(TxMode::Immediate, |tx| schema::create_embedding_generation(tx, "BAAI/bge-m3", 1024, 1, 1, b"test-fingerprint", 0))
             .expect("create embedding generation");
         storage
             .raw()
@@ -1058,6 +1096,85 @@ mod tests {
         );
         assert!(!matches!(availability, SemanticAvailability::IndexMissing { .. }));
         assert!(!matches!(availability, SemanticAvailability::IndexBuilding { .. }));
+    }
+
+    /// T8 (plan v5.1): active v5 generation with one drained `message_chunks`
+    /// row -- `db_with_active_pending_generation` above creates a generation
+    /// but never inserts any chunk rows, so it always reads back
+    /// `chunk_count=Some(0)` (`message_chunks` is a base-schema table,
+    /// always queryable, just empty). This fixture goes through the real
+    /// production write path (ingest a message, drain it into a chunk row)
+    /// to prove a *populated* chunk_count and the real chunking policy
+    /// version.
+    fn db_with_active_v5_generation_and_one_chunk(dir: &std::path::Path) -> PathBuf {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+
+        let db_path = dir.join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).expect("open production storage");
+        let fingerprint = vec![1u8; 3 * 4 * 4]; // 3 sentinels * dim=4 * 4 bytes/f32
+        let gen_id = storage
+            .raw()
+            .with_tx(TxMode::Immediate, |tx| {
+                schema::create_embedding_generation(tx, "mock-embedder-t8", 4, crate::search::canonicalize::CANONICALIZE_PIPELINE_VERSION, crate::search::chunking::CHUNKING_POLICY_VERSION, &fingerprint, 0)
+            })
+            .expect("create v5 embedding generation");
+
+        // Production write path for the message (same pattern db_vector_
+        // catchup.rs's own fixtures use) -- safer than a hand-rolled raw
+        // INSERT against conversations/agents/messages' exact column shape.
+        let agent_id = storage
+            .ensure_agent(&Agent { id: None, slug: "claude_code".into(), name: "Claude Code".into(), version: Some("1.0".into()), kind: AgentKind::Cli })
+            .expect("ensure agent");
+        let conv = Conversation {
+            id: None,
+            agent_slug: "claude_code".into(),
+            workspace: None,
+            external_id: Some("status-fixture".into()),
+            title: Some("status fixture".into()),
+            source_path: std::path::PathBuf::from("/fixtures/status.jsonl"),
+            started_at: Some(0),
+            ended_at: Some(0),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message { id: None, idx: 0, role: MessageRole::User, author: None, created_at: Some(0), content: "status fixture message".into(), extra_json: serde_json::Value::Null, snippets: vec![] }],
+            source_id: "local".into(),
+            origin_host: None,
+        };
+        storage.insert_conversation_tree(agent_id, None, &conv).expect("insert fixture conversation");
+        let message_id: i64 = storage.raw().query_row_map("SELECT id FROM messages LIMIT 1", &[], |row| row.get_typed(0)).unwrap();
+        let conversation_id: i64 = storage.raw().query_row_map("SELECT conversation_id FROM messages WHERE id = ?1", &params![message_id], |row| row.get_typed(0)).unwrap();
+
+        storage
+            .raw()
+            .execute(
+                "INSERT INTO message_chunks (generation_id, message_id, conversation_id, chunk_idx, byte_start, byte_end, content_hash, embedding, norm, created_at) \
+                 VALUES (?1, ?2, ?3, 0, 0, 5, 'fixture-hash', ?4, 1.0, 0)",
+                &params![gen_id, message_id, conversation_id, schema::f32_vector_to_le_blob(&[1.0f32, 1.0, 1.0, 1.0])],
+            )
+            .expect("insert fixture message_chunks row");
+        storage
+            .raw()
+            .execute("UPDATE embedding_generations SET is_active = 1, audit_status = 'passed' WHERE id = ?1", &params![gen_id])
+            .expect("mark generation active");
+        storage.close().unwrap();
+        db_path
+    }
+
+    #[test]
+    fn probe_db_vector_domain_status_reports_chunk_count_and_policy_version() {
+        let dir = tempdir().unwrap();
+        let db_path = db_with_active_v5_generation_and_one_chunk(dir.path());
+        let status = probe_db_vector_domain_status(&db_path).expect("database must open");
+        assert!(status.active);
+        assert_eq!(status.chunk_count, Some(1), "the one seeded message_chunks row must be counted: {status:?}");
+        assert_eq!(
+            status.chunking_policy_version,
+            Some(i64::from(crate::search::chunking::CHUNKING_POLICY_VERSION)),
+            "must read back the real (non-legacy) chunking_policy_version stamped at creation: {status:?}"
+        );
+        let json = serde_json::to_value(&status).expect("DbVectorDomainStatus must serialize");
+        assert_eq!(json["chunk_count"], serde_json::json!(1));
+        assert_eq!(json["chunking_policy_version"], serde_json::json!(i64::from(crate::search::chunking::CHUNKING_POLICY_VERSION)));
     }
 
     #[test]

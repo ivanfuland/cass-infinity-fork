@@ -2300,93 +2300,6 @@ pub(crate) fn is_lexical_rebuild_tool_class_role(role: &str) -> bool {
     matches!(role, "tool" | "tool_result" | "toolResult")
 }
 
-/// Default per-conversation lexical-content byte ceiling (#290).
-///
-/// The staged lexical-rebuild shard cap
-/// (`CASS_TANTIVY_REBUILD_STAGED_SHARD_MAX_MESSAGE_BYTES`) defaults to 64 MiB with
-/// a 16 MiB floor. An indivisible single conversation whose materialized content
-/// exceeds the per-shard cap forces the OOM→bisect→quarantine path because the
-/// dominant resident cost is cass-side materialization of the whole conversation's
-/// text. We cap per-conversation indexed content at 8 MiB —
-/// `min(shard_cap/2, 8 MiB)` for the default 64 MiB shard cap, and comfortably
-/// below even the 16 MiB shard floor — so a normally-large (image/base64-heavy)
-/// conversation is admitted with a truncated lexical body instead of quarantined.
-/// 8 MiB of text is far more than lexical search needs (tokens, not raw blobs)
-/// while leaving headroom for the Tantivy arena and concurrent shard builders.
-pub const LEXICAL_MAX_CONVERSATION_CONTENT_BYTES_DEFAULT: usize = 8 * 1024 * 1024;
-
-/// Per-conversation lexical-content byte ceiling, overridable via
-/// `CASS_LEXICAL_MAX_CONVERSATION_CONTENT_BYTES` (#290).
-///
-/// `0` is rejected (treated as "use default") so the cap can never be disabled
-/// into the OOM-quarantine regime by accident; set a large value to effectively
-/// disable it.
-pub fn lexical_max_conversation_content_bytes() -> usize {
-    dotenvy::var("CASS_LEXICAL_MAX_CONVERSATION_CONTENT_BYTES")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(LEXICAL_MAX_CONVERSATION_CONTENT_BYTES_DEFAULT)
-}
-
-/// Largest byte length `<= cap` that ends on a UTF-8 char boundary of `content`.
-fn lexical_content_truncation_boundary(content: &str, cap: usize) -> usize {
-    if content.len() <= cap {
-        return content.len();
-    }
-    let mut boundary = cap;
-    while boundary > 0 && !content.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    boundary
-}
-
-/// Cap the cumulative per-conversation lexical content at `cap` bytes (#290).
-///
-/// Messages are visited in `idx` order (earliest first); once the running total
-/// reaches the cap, the message that straddles the boundary is truncated to the
-/// remaining budget on a UTF-8 char boundary and every later message's content is
-/// cleared. Message rows are preserved (count/structure unchanged) so the rest of
-/// the rebuild pipeline's per-message accounting stays consistent — only indexed
-/// text is dropped. Emits one `lexical_content_truncated` diagnostic per affected
-/// conversation. No-op when total content is within the cap.
-fn truncate_lexical_rebuild_conversation_content(
-    conversation_id: i64,
-    messages: &mut [Message],
-    cap: usize,
-) {
-    let original_bytes: usize = messages.iter().map(|message| message.content.len()).sum();
-    if original_bytes <= cap {
-        return;
-    }
-
-    let mut used = 0usize;
-    for message in messages.iter_mut() {
-        if used >= cap {
-            message.content.clear();
-            continue;
-        }
-        let remaining = cap - used;
-        if message.content.len() <= remaining {
-            used += message.content.len();
-        } else {
-            let boundary = lexical_content_truncation_boundary(&message.content, remaining);
-            message.content.truncate(boundary);
-            used += boundary;
-        }
-    }
-
-    let capped_bytes: usize = messages.iter().map(|message| message.content.len()).sum();
-    tracing::warn!(
-        diagnostic = "lexical_content_truncated",
-        conversation_id,
-        original_bytes,
-        capped_bytes,
-        cap,
-        "lexical rebuild conversation content exceeded the per-conversation cap; truncated indexed text to stay within budget instead of OOM-quarantining (#290)"
-    );
-}
-
 /// Compatibility alias retained while call sites finish converging on `FrankenStorage`.
 pub type SqliteStorage = FrankenStorage;
 
@@ -3656,33 +3569,27 @@ CREATE INDEX IF NOT EXISTS idx_umd_workspace_day ON usage_models_daily(workspace
 CREATE INDEX IF NOT EXISTS idx_umd_source_day ON usage_models_daily(source_id, day_id);
 ";
 
-// R1-W3-N5: verbatim copy of `V4_VECTOR_DOMAIN_DDL`'s three-table shape
-// (`src/storage/schema.rs`) -- must stay byte-for-byte identical to that
-// source of truth, the same discipline the module doc comment there
-// already enforces between `FRESH_SCHEMA_DDL`'s tail and
-// `V2_LEX_DOMAIN_DDL`. `message_embeddings`/`embedding_holes` both
-// reference `embedding_generations`, so all three are one repair batch
-// (like `lex_domain`'s `lex_docs`+`fts_lex` pairing above), never
-// recreated independently of each other.
-//
-// R2-N1: the "byte-for-byte identical" claim above was not actually
-// enforced by any test (unlike the lex_domain pairing, which has
-// `fresh_schema_ddl_tail_matches_v2_lex_domain_migration_ddl`) -- this SQL
-// had silently drifted from `V4_VECTOR_DOMAIN_DDL`, missing its
-// `idx_embedding_generations_single_active` unique partial index
-// entirely. A database that lost the vector_domain tables and got them
-// back through this repair path (as opposed to a fresh-build `ensure()`)
-// would have no DB-level guard against two `is_active=1` rows coexisting.
-// Restored here; `current_schema_repair_vector_domain_sql_creates_the_
-// single_active_unique_index` below is this repair batch's first-ever
-// index-presence probe.
+// R1-W3-N5: originally a verbatim copy of the v4 vector-domain DDL's
+// three-table shape (`src/storage/schema.rs`) -- the v4 message-granularity
+// table and its parallel hole ledger both referenced `embedding_generations`,
+// so all three were one repair batch, never recreated independently of each
+// other. T4 (plan v5.1) widened `embedding_generations` with two `NOT NULL`
+// columns (`chunking_policy_version`/`fingerprint`); T11 finalized the
+// chunk domain as the sole vector schema and rewrote this repair batch to
+// match: `embedding_generations` (current six-identity-field shape) plus
+// the three chunk-domain tables (`message_chunks`/`chunk_holes`/
+// `chunk_staging`), matching `FRESH_SCHEMA_DDL`'s current shape exactly --
+// this self-heal path now recreates the same five-table batch a fresh
+// build produces, not a frozen historical subset of it.
 const CURRENT_SCHEMA_REPAIR_VECTOR_DOMAIN_SQL: &str = r"
-CREATE TABLE IF NOT EXISTS embedding_generations (id INTEGER PRIMARY KEY AUTOINCREMENT, embedder_id TEXT NOT NULL, dim INTEGER NOT NULL CHECK (dim > 0), canonicalize_version INTEGER NOT NULL, byte_order TEXT NOT NULL DEFAULT 'le' CHECK (byte_order IN ('le', 'be')), audit_status TEXT NOT NULL DEFAULT 'pending' CHECK (audit_status IN ('pending', 'passed', 'failed')), is_active INTEGER NOT NULL DEFAULT 0 CHECK (is_active IN (0, 1)), created_at INTEGER NOT NULL, activated_at INTEGER);
+CREATE TABLE IF NOT EXISTS embedding_generations (id INTEGER PRIMARY KEY AUTOINCREMENT, embedder_id TEXT NOT NULL, dim INTEGER NOT NULL CHECK (dim > 0), canonicalize_version INTEGER NOT NULL, chunking_policy_version INTEGER NOT NULL, fingerprint BLOB NOT NULL, byte_order TEXT NOT NULL DEFAULT 'le' CHECK (byte_order IN ('le', 'be')), audit_status TEXT NOT NULL DEFAULT 'pending' CHECK (audit_status IN ('pending', 'passed', 'failed')), is_active INTEGER NOT NULL DEFAULT 0 CHECK (is_active IN (0, 1)), created_at INTEGER NOT NULL, activated_at INTEGER);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_embedding_generations_single_active ON embedding_generations(is_active) WHERE is_active = 1;
-CREATE TABLE IF NOT EXISTS message_embeddings (generation_id INTEGER NOT NULL REFERENCES embedding_generations (id), doc_id INTEGER NOT NULL REFERENCES messages (id) ON DELETE CASCADE, conversation_id INTEGER NOT NULL, embedding BLOB NOT NULL CHECK (length(embedding) % 4 = 0), norm REAL NOT NULL CHECK (norm > 0), content_hash TEXT NOT NULL, content_version INTEGER, created_at INTEGER NOT NULL, UNIQUE (generation_id, doc_id));
-CREATE INDEX IF NOT EXISTS idx_message_embeddings_generation ON message_embeddings(generation_id);
-CREATE INDEX IF NOT EXISTS idx_message_embeddings_doc ON message_embeddings(doc_id);
-CREATE TABLE IF NOT EXISTS embedding_holes (generation_id INTEGER NOT NULL REFERENCES embedding_generations (id), doc_id INTEGER NOT NULL REFERENCES messages (id) ON DELETE CASCADE, detected_at INTEGER NOT NULL, reason TEXT, PRIMARY KEY (generation_id, doc_id));
+CREATE TABLE IF NOT EXISTS message_chunks (chunk_id INTEGER PRIMARY KEY, generation_id INTEGER NOT NULL REFERENCES embedding_generations(id), message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE, conversation_id INTEGER NOT NULL, chunk_idx INTEGER NOT NULL, byte_start INTEGER NOT NULL, byte_end INTEGER NOT NULL, content_hash TEXT NOT NULL, embedding BLOB NOT NULL CHECK(length(embedding) % 4 = 0), norm REAL NOT NULL CHECK(norm > 0), created_at INTEGER NOT NULL, UNIQUE(generation_id, message_id, chunk_idx));
+CREATE INDEX IF NOT EXISTS idx_message_chunks_generation ON message_chunks(generation_id);
+CREATE INDEX IF NOT EXISTS idx_message_chunks_message ON message_chunks(message_id);
+CREATE INDEX IF NOT EXISTS idx_message_chunks_gen_conv ON message_chunks(generation_id, conversation_id);
+CREATE TABLE IF NOT EXISTS chunk_holes (generation_id INTEGER NOT NULL REFERENCES embedding_generations(id), message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE, chunk_idx INTEGER NOT NULL, detected_at INTEGER NOT NULL, reason TEXT, PRIMARY KEY(generation_id, message_id, chunk_idx));
+CREATE TABLE IF NOT EXISTS chunk_staging (batch_id INTEGER NOT NULL, generation_id INTEGER NOT NULL REFERENCES embedding_generations(id), message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE, conversation_id INTEGER NOT NULL, chunk_idx INTEGER NOT NULL, byte_start INTEGER NOT NULL, byte_end INTEGER NOT NULL, content_hash TEXT NOT NULL, embedding BLOB NOT NULL CHECK(length(embedding) % 4 = 0), norm REAL NOT NULL CHECK(norm > 0), created_at INTEGER NOT NULL, PRIMARY KEY(generation_id, message_id, chunk_idx));
 ";
 
 const CURRENT_SCHEMA_REPAIR_BATCHES: &[SchemaRepairBatch] = &[
@@ -3695,8 +3602,9 @@ const CURRENT_SCHEMA_REPAIR_BATCHES: &[SchemaRepairBatch] = &[
         name: "vector_domain",
         tables: &[
             "embedding_generations",
-            "message_embeddings",
-            "embedding_holes",
+            "message_chunks",
+            "chunk_holes",
+            "chunk_staging",
         ],
         sql: CURRENT_SCHEMA_REPAIR_VECTOR_DOMAIN_SQL,
     },
@@ -3821,22 +3729,27 @@ const REQUIRED_CURRENT_SCHEMA_TABLE_PROBES: &[(&str, &str)] = &[
     // table: lex_docs"/"no such table: fts_lex" instead of self-healing.
     ("lex_docs", "SELECT doc_id FROM lex_docs LIMIT 1;"),
     ("fts_lex", "SELECT rowid FROM fts_lex LIMIT 1;"),
-    // R1-W3-N5: the W3 DB-vector-domain tables (`V4_VECTOR_DOMAIN_DDL`,
-    // `src/storage/schema.rs`) had no probe here at all -- a v4+ database
-    // that lost these three tables to incomplete restore / derived-index
-    // corruption was invisible to this self-heal pass, same class of gap
-    // the w2 F4 fix above closed for `lex_docs`/`fts_lex`.
+    // R1-W3-N5: the DB-vector-domain tables (`src/storage/schema.rs`) had
+    // no probe here at all -- a database that lost these tables to
+    // incomplete restore / derived-index corruption was invisible to this
+    // self-heal pass, same class of gap the w2 F4 fix above closed for
+    // `lex_docs`/`fts_lex`. T11: probes updated from the retired v4
+    // message-granularity tables to the chunk domain that replaced them.
     (
         "embedding_generations",
         "SELECT id FROM embedding_generations LIMIT 1;",
     ),
     (
-        "message_embeddings",
-        "SELECT generation_id FROM message_embeddings LIMIT 1;",
+        "message_chunks",
+        "SELECT generation_id FROM message_chunks LIMIT 1;",
     ),
     (
-        "embedding_holes",
-        "SELECT generation_id FROM embedding_holes LIMIT 1;",
+        "chunk_holes",
+        "SELECT generation_id FROM chunk_holes LIMIT 1;",
+    ),
+    (
+        "chunk_staging",
+        "SELECT generation_id FROM chunk_staging LIMIT 1;",
     ),
 ];
 
@@ -3962,6 +3875,13 @@ fn delete_orphan_message_id_chunk_once(conn: &FrankenConnection, ids: &[i64]) ->
     Ok(conn.with_tx(TxMode::Immediate, |tx| -> Result<usize, StorageError> {
         let mut deleted = 0usize;
         for entry in ORPHAN_MESSAGE_DEPENDENT_TABLES {
+            // T6 (plan v5.1): fts_lex is now handled by
+            // delete_messages_ordered_in_tx below (same batched
+            // fts_lex-then-lex_docs-then-messages discipline every other
+            // delete path uses) -- skip it here to avoid a redundant delete.
+            if entry.child_table == "fts_lex" {
+                continue;
+            }
             match delete_rows_by_i64_chunks(tx, entry.delete_many_sql_prefix, ids) {
                 Ok(count) => {
                     deleted = deleted.saturating_add(count);
@@ -3982,20 +3902,19 @@ fn delete_orphan_message_id_chunk_once(conn: &FrankenConnection, ids: &[i64]) ->
                 }
             }
         }
-        let more = delete_rows_by_i64_chunks(tx, "DELETE FROM messages WHERE id IN", ids)
-            .map_err(|err| {
-                anyhow_error_into_storage_error(err.context("deleting orphan rows from messages"))
-            })?;
-        deleted = deleted.saturating_add(more);
-        if more > 0 {
-            // w3-3 Step 3 (R2-W3-B4, D类): CASCADE already removed any
-            // embedding/hole rows the deleted orphans carried; demote in
-            // the same transaction. Gated on `more > 0` because this runs
-            // unconditionally at the top of every `cass index` invocation
-            // (see `cleanup_orphan_fk_rows`) and the zero-orphans case is
-            // the overwhelming common path.
-            crate::storage::schema::demote_active_generation_readiness_in_tx(tx)?;
-        }
+        // T6 (plan v5.1): route the orphan messages themselves through
+        // delete_messages_ordered_in_tx -- the previous plain `DELETE FROM
+        // messages WHERE id IN (...)` here relied on FK cascade for
+        // message_chunks/chunk_holes/chunk_staging/lex_docs (fine, those
+        // are FK-aware) but never touched vec0 at all (no FK/cascade tie),
+        // leaking any embedded chunk's vec0 row forever once its orphan
+        // parent message was cascade-deleted. Also folds in the same
+        // demote-if-anything-happened semantics the old `more > 0` gate had
+        // (delete_messages_ordered_in_tx no-ops, including its demote, for
+        // an empty id list).
+        let outcome =
+            delete_messages_ordered_in_tx(tx, ids).map_err(anyhow_error_into_storage_error)?;
+        deleted = deleted.saturating_add(outcome.messages as usize);
         Ok(deleted)
     })?)
 }
@@ -5766,21 +5685,23 @@ impl FrankenStorage {
                  )",
                 fparams![agent_id],
             )?;
-            // w2 Task W2-3 (spec 门②"删除"场景): fts_lex has no FK relationship
-            // to lex_docs (FTS5 external-content tables are not FK-aware), so
-            // ON DELETE CASCADE from messages -> lex_docs alone would leave
-            // fts_lex with stale, orphaned index entries pointing at rows the
-            // upcoming conversations delete is about to cascade away. Must run
-            // *before* the conversations delete, while `messages`/`lex_docs`
-            // still exist to resolve which fts_lex rowids belong to this agent.
-            tx.execute(
-                "DELETE FROM fts_lex WHERE rowid IN (
-                     SELECT m.id FROM messages m
-                     JOIN conversations c ON c.id = m.conversation_id
-                     WHERE c.agent_id = ?1
-                 )",
+            // T6 (plan v5.1): collect this agent's message ids first, then
+            // route the delete through delete_messages_ordered_in_tx --
+            // must run *before* the conversations delete below, while
+            // `messages` still exist to resolve which vec0/fts_lex rows
+            // belong to this agent (the old plain fts_lex delete here never
+            // touched vec0 at all -- no FK/cascade tie -- leaking any
+            // embedded chunk's vec0 row forever once the conversations
+            // delete cascade-removed its parent message).
+            let message_ids: Vec<i64> = tx.query_all_map(
+                "SELECT m.id FROM messages m
+                 JOIN conversations c ON c.id = m.conversation_id
+                 WHERE c.agent_id = ?1",
                 fparams![agent_id],
+                |row| row.get_typed(0),
             )?;
+            delete_messages_ordered_in_tx(tx, &message_ids)
+                .map_err(anyhow_error_into_storage_error)?;
             tx.execute(
                 "DELETE FROM conversations WHERE agent_id = ?1",
                 fparams![agent_id],
@@ -5793,11 +5714,6 @@ impl FrankenStorage {
                    )",
                 fparams![agent_id],
             )?;
-            // w3-3 Step 3 (R2-W3-B4, C类): CASCADE already removed every
-            // embedding/hole row belonging to the purged messages; the
-            // active generation's readiness claim over what remains still
-            // needs demoting in this same transaction.
-            crate::storage::schema::demote_active_generation_readiness_in_tx(tx)?;
             Ok(())
         })?;
 
@@ -5909,25 +5825,23 @@ impl FrankenStorage {
                 ),
                 fparams![],
             )?;
-            // w2 Task W2-3 (spec 门②"删除"场景): fts_lex has no FK to lex_docs
-            // (FTS5 external-content tables aren't FK-aware) -- must clear it
-            // before the cascading conversations delete below, same reasoning
-            // as `purge_agent_archive_data`.
-            tx.execute(
-                &format!(
-                    "DELETE FROM fts_lex WHERE rowid IN \
-                     (SELECT id FROM messages WHERE conversation_id IN ({id_list}))"
-                ),
+            // T6 (plan v5.1) -- see `purge_agent_archive_data`'s identical
+            // reasoning: collect message ids first, route the delete
+            // through delete_messages_ordered_in_tx (vec0 + fts_lex/lex_docs
+            // + messages + demote, in the order that keeps vec0 from being
+            // orphaned) *before* the cascading conversations delete below.
+            let message_ids: Vec<i64> = tx.query_all_map(
+                &format!("SELECT id FROM messages WHERE conversation_id IN ({id_list})"),
                 fparams![],
+                |row| row.get_typed(0),
             )?;
-            // The remaining child tables (messages, snippets, tags, ...) cascade.
+            delete_messages_ordered_in_tx(tx, &message_ids)
+                .map_err(anyhow_error_into_storage_error)?;
+            // The remaining child tables (snippets, tags, ...) cascade.
             tx.execute(
                 &format!("DELETE FROM conversations WHERE id IN ({id_list})"),
                 fparams![],
             )?;
-            // w3-3 Step 3 (R2-W3-B4, C类) -- see `purge_agent_archive_data`'s
-            // identical comment.
-            crate::storage::schema::demote_active_generation_readiness_in_tx(tx)?;
             Ok(())
         })?;
 
@@ -6039,21 +5953,19 @@ impl FrankenStorage {
                     "DELETE FROM conversation_external_tail_lookup WHERE conversation_id = ?1",
                     fparams![drop_id],
                 )?;
-                // w2 Task W2-3 (spec 门②"删除"场景): fts_lex has no FK to
-                // lex_docs (FTS5 external-content tables aren't FK-aware) --
-                // must clear it before the explicit messages delete below,
-                // while messages/lex_docs still exist to resolve the join.
-                tx.execute(
-                    "DELETE FROM fts_lex WHERE rowid IN \
-                     (SELECT id FROM messages WHERE conversation_id = ?1)",
+                // T6 (plan v5.1): collect this conversation's message ids,
+                // route the delete through delete_messages_ordered_in_tx
+                // (vec0 + fts_lex/lex_docs + messages + demote, explicit --
+                // not relying solely on cascade, same as the old code here
+                // -- in the order that keeps vec0 from being orphaned)
+                // before the conversations delete below.
+                let message_ids: Vec<i64> = tx.query_all_map(
+                    "SELECT id FROM messages WHERE conversation_id = ?1",
                     fparams![drop_id],
+                    |row| row.get_typed(0),
                 )?;
-                // Explicit message delete (do not rely solely on cascade) so the
-                // operation is correct even if FK enforcement is toggled off.
-                tx.execute(
-                    "DELETE FROM messages WHERE conversation_id = ?1",
-                    fparams![drop_id],
-                )?;
+                delete_messages_ordered_in_tx(tx, &message_ids)
+                    .map_err(anyhow_error_into_storage_error)?;
                 tx.execute(
                     "DELETE FROM conversation_tail_state WHERE conversation_id = ?1",
                     fparams![drop_id],
@@ -6067,10 +5979,6 @@ impl FrankenStorage {
                 // so there is nothing conversation-scoped to delete there.
                 tx.execute("DELETE FROM conversations WHERE id = ?1", fparams![drop_id])?;
             }
-            // w3-3 Step 3 (R2-W3-B4, C类) -- see `purge_agent_archive_data`'s
-            // identical comment. Once per transaction (not per-pair): the
-            // guard above already ensures `result.pairs` is non-empty here.
-            crate::storage::schema::demote_active_generation_readiness_in_tx(tx)?;
             Ok(())
         })?;
 
@@ -6726,29 +6634,6 @@ impl FrankenStorage {
         Ok(lines)
     }
 
-    /// Fetch messages for lexical index rebuilds without deserializing extra metadata.
-    ///
-    /// Tantivy only needs message text and core envelope fields, so avoiding
-    /// `extra_json` here prevents rebuilds from rehydrating enormous historical
-    /// payloads that are irrelevant to lexical search.
-    ///
-    /// The assembled per-conversation content is additionally capped at
-    /// [`lexical_max_conversation_content_bytes`] (see #290): an image/base64-heavy
-    /// conversation that materializes 10-40 MiB of indexed text would otherwise
-    /// exceed the per-shard byte budget and force the OOM→bisect→quarantine path.
-    /// Capping the *content* (not the message count/structure) admits the
-    /// conversation within budget with a truncated lexical body — lexical search
-    /// needs tokens, not the full multi-megabyte blob.
-    pub fn fetch_messages_for_lexical_rebuild(&self, conversation_id: i64) -> Result<Vec<Message>> {
-        let mut messages = self.fetch_messages_for_lexical_rebuild_uncapped(conversation_id)?;
-        truncate_lexical_rebuild_conversation_content(
-            conversation_id,
-            &mut messages,
-            lexical_max_conversation_content_bytes(),
-        );
-        Ok(messages)
-    }
-
     /// W2-4 Step 2: full `lex_docs`/`fts_lex` rebuild from the canonical
     /// `messages`/`conversations` tables — independent of, and run after,
     /// `rebuild_tantivy_from_db_with_options` (which opens the database
@@ -6852,10 +6737,18 @@ impl FrankenStorage {
         })
     }
 
-    /// Inner fetch without the per-conversation content cap. Kept separate so the
-    /// cap is applied at exactly one chokepoint (every lexical-rebuild content
-    /// load — batch and streaming — funnels through `fetch_messages_for_lexical_rebuild`).
-    fn fetch_messages_for_lexical_rebuild_uncapped(
+    /// Fetch messages for one conversation without deserializing extra
+    /// metadata (T5, plan v5.1: renamed from `fetch_messages_for_lexical_
+    /// rebuild`, merged with what used to be the separate `_uncapped` inner
+    /// helper -- once the 8 MiB per-conversation content cap is gone
+    /// entirely, capped and uncapped were the same function). Tantivy/lexical
+    /// callers only need message text and core envelope fields, so avoiding
+    /// `extra_json` here prevents rebuilds from rehydrating enormous
+    /// historical payloads irrelevant to lexical search. No truncation: T5
+    /// removes the 8 MiB cap (#290) entirely -- plan v5.1's "保真" (fidelity)
+    /// constraint forbids any session-, message-, or block-count cap on the
+    /// lexical whitelist.
+    pub fn fetch_messages_for_conversation(
         &self,
         conversation_id: i64,
     ) -> Result<Vec<Message>> {
@@ -6910,15 +6803,21 @@ impl FrankenStorage {
             })
     }
 
-    /// Fetch messages for multiple conversations during lexical rebuilds.
+    /// Fetch messages for multiple conversations in one call (T5, plan
+    /// v5.1: renamed from `fetch_messages_for_lexical_rebuild_batch` -- this
+    /// is a generic per-conversation message loader reused well beyond the
+    /// lexical domain, notably by `indexer/semantic.rs`'s embedding-input
+    /// checkpoint selection; the old name was misleading). The
+    /// `max_messages`/`max_content_bytes` guardrail params are removed:
+    /// every call site always passed `None, None` -- dead parameters, and
+    /// keeping them would contradict T5's "no cap" mandate (plan v5.1's
+    /// "保真" constraint).
     ///
-    /// This preserves the lightweight lexical-rebuild projection while avoiding
-    /// one round-trip per conversation when rebuilding large canonical indexes.
-    pub fn fetch_messages_for_lexical_rebuild_batch(
+    /// This preserves the lightweight message projection while avoiding one
+    /// round-trip per conversation when loading a large set of conversations.
+    pub fn fetch_messages_for_conversations_batch(
         &self,
         conversation_ids: &[i64],
-        max_messages: Option<usize>,
-        max_content_bytes: Option<usize>,
     ) -> Result<HashMap<i64, Vec<Message>>> {
         if conversation_ids.is_empty() {
             return Ok(HashMap::new());
@@ -6927,8 +6826,6 @@ impl FrankenStorage {
         let mut grouped: HashMap<i64, Vec<Message>> =
             HashMap::with_capacity(conversation_ids.len());
         let mut fetched_conversation_ids = HashSet::with_capacity(conversation_ids.len());
-        let mut total_messages = 0usize;
-        let mut total_content_bytes = 0usize;
 
         // The apparent single-query shape (`WHERE conversation_id IN (...) ORDER BY ...`)
         // is a bad the legacy embedded engine plan for large live databases: it can
@@ -6940,33 +6837,10 @@ impl FrankenStorage {
             }
 
             let messages = self
-                .fetch_messages_for_lexical_rebuild(*conversation_id)
+                .fetch_messages_for_conversation(*conversation_id)
                 .with_context(|| {
-                    format!("fetching lexical rebuild messages for conversation {conversation_id}")
+                    format!("fetching messages for conversation {conversation_id}")
                 })?;
-            total_messages = total_messages.saturating_add(messages.len());
-            if let Some(limit) = max_messages
-                && total_messages > limit
-            {
-                return Err(anyhow!(
-                    "lexical rebuild batch fetch exceeded message guardrail: messages={total_messages} limit={limit} conversations={}",
-                    conversation_ids.len()
-                ));
-            }
-
-            let message_bytes = messages
-                .iter()
-                .map(|message| message.content.len())
-                .sum::<usize>();
-            total_content_bytes = total_content_bytes.saturating_add(message_bytes);
-            if let Some(limit) = max_content_bytes
-                && total_content_bytes > limit
-            {
-                return Err(anyhow!(
-                    "lexical rebuild batch fetch exceeded content-byte guardrail: bytes={total_content_bytes} limit={limit} conversations={}",
-                    conversation_ids.len()
-                ));
-            }
 
             if !messages.is_empty() {
                 grouped.insert(*conversation_id, messages);
@@ -7002,7 +6876,7 @@ impl FrankenStorage {
 
         for conversation_id in conversation_ids {
             let messages = self
-                .fetch_messages_for_lexical_rebuild(conversation_id)
+                .fetch_messages_for_conversation(conversation_id)
                 .with_context(|| {
                     format!("streaming lexical rebuild messages for conversation {conversation_id}")
                 })?;
@@ -8181,6 +8055,7 @@ impl FrankenStorage {
                         let (inserted_last_idx, inserted_last_created_at) =
                             borrowed_messages_tail_state(&new_messages);
                         let mut inserted_indices = Vec::new();
+                        let mut inserted_message_ids = Vec::new();
                         let inserted_messages =
                             franken_append_insert_new_messages(tx, existing_id, &new_messages)?;
                         let inserted_chars = inserted_messages
@@ -8190,6 +8065,7 @@ impl FrankenStorage {
                         for (msg_id, msg) in inserted_messages {
                             franken_insert_snippets(tx, msg_id, &msg.snippets)?;
                             inserted_indices.push(msg.idx);
+                            inserted_message_ids.push(msg_id);
                         }
 
                         if idx_collision_count > 0 {
@@ -8202,8 +8078,12 @@ impl FrankenStorage {
                             );
                         }
 
+                        // T5 (plan v5.1): message-content change (new
+                        // messages appended during recovery merge) -> the
+                        // lexical sync is message-level, scoped to exactly
+                        // the messages this branch just inserted.
                         if !defer_lexical_updates {
-                            sync_lexical_domain_for_conversation_in_tx(tx, existing_id)?;
+                            sync_lexical_docs_for_messages_in_tx(tx, &inserted_message_ids)?;
                         }
 
                         let conv_last_ts = conversation_tail_ended_at_candidate(conv);
@@ -8278,7 +8158,7 @@ impl FrankenStorage {
                     new_messages.push(msg);
                 }
                 let inserted_message_ids = franken_batch_insert_new_messages(tx, conv_id, &new_messages)?;
-                for (msg_id, msg) in inserted_message_ids.into_iter().zip(new_messages) {
+                for (msg_id, msg) in inserted_message_ids.iter().copied().zip(new_messages) {
                     franken_insert_snippets(tx, msg_id, &msg.snippets)?;
                     total_chars += msg.content.len() as i64;
                     inserted_indices.push(msg.idx);
@@ -8292,8 +8172,10 @@ impl FrankenStorage {
                         "message idx collisions encountered while inserting a new conversation; retaining the first canonical variant per idx"
                     );
                 }
+                // T5 (plan v5.1): brand-new conversation -- every message
+                // just inserted is new content, message-level sync.
                 if !defer_lexical_updates {
-                    sync_lexical_domain_for_conversation_in_tx(tx, conv_id)?;
+                    sync_lexical_docs_for_messages_in_tx(tx, &inserted_message_ids)?;
                 }
 
                 if !defer_analytics_updates {
@@ -8688,6 +8570,7 @@ impl FrankenStorage {
         };
 
         let mut inserted_indices = Vec::new();
+        let mut inserted_message_ids = Vec::new();
         let (inserted_last_idx, inserted_last_created_at) =
             borrowed_messages_tail_state(&new_messages);
         let inserted_messages =
@@ -8699,6 +8582,7 @@ impl FrankenStorage {
         for (msg_id, msg) in inserted_messages {
             franken_insert_snippets(tx, msg_id, &msg.snippets)?;
             inserted_indices.push(msg.idx);
+            inserted_message_ids.push(msg_id);
         }
 
         if idx_collision_count > 0 {
@@ -8711,8 +8595,10 @@ impl FrankenStorage {
             );
         }
 
+        // T5 (plan v5.1): message-content change (append to an existing
+        // conversation) -> message-level sync scoped to the new messages.
         if !defer_lexical_updates {
-            sync_lexical_domain_for_conversation_in_tx(tx, conversation_id)?;
+            sync_lexical_docs_for_messages_in_tx(tx, &inserted_message_ids)?;
         }
 
         let mut exact_append_tail_set = false;
@@ -9465,17 +9351,51 @@ impl FrankenStorage {
                     // highest-traffic write path and previously never synced
                     // the lex_docs/fts_lex domain at all -- every conversation
                     // that landed via this path was invisible to fts_lex
-                    // MATCH. Unlike the tantivy fts_entries buffer above
-                    // (batched across all conversations in this call and
-                    // flushed only once size thresholds are crossed),
-                    // sync_lexical_domain_for_conversation_in_tx recomputes
-                    // the full projection straight from the messages table,
-                    // so it only needs one call per conversation, right here
-                    // where `conv_id` is settled for both the new-insert and
-                    // existing-append branches -- same `!defer_lexical_updates`
-                    // gate and same in-tx semantics as insert_conversation_tree.
+                    // MATCH. Right here is where `conv_id` is settled for
+                    // both the new-insert and existing-append branches --
+                    // same `!defer_lexical_updates` gate and same in-tx
+                    // semantics as insert_conversation_tree.
+                    //
+                    // T5 (plan v5.1): split into the two change categories
+                    // this path can actually produce. Message content
+                    // change: whatever this iteration inserted into
+                    // `inserted_messages` (empty for a re-ingest that added
+                    // no new messages) -> message-level sync. Envelope
+                    // change: this path never updated `conversations.title`/
+                    // `workspace_id` on a re-ingest of an existing
+                    // conversation at all before T5 (a real gap control-plane
+                    // ruling flagged: the same conversation can be re-ingested
+                    // with a changed title/workspace and unchanged messages)
+                    // -- compare the current row against the incoming `conv`
+                    // and, if either differs, apply the update and resync the
+                    // envelope projection on every existing lex_docs row for
+                    // this conversation (content untouched).
                     if !defer_lexical_updates {
-                        sync_lexical_domain_for_conversation_in_tx(tx, conv_id)?;
+                        let inserted_message_ids: Vec<i64> =
+                            inserted_messages.iter().map(|(id, _)| *id).collect();
+                        sync_lexical_docs_for_messages_in_tx(tx, &inserted_message_ids)?;
+
+                        let (current_title, current_workspace_id): (Option<String>, Option<i64>) = tx
+                            .query_row_map(
+                                "SELECT title, workspace_id FROM conversations WHERE id = ?1",
+                                fparams![conv_id],
+                                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+                            )
+                            .with_context(|| {
+                                format!("loading current title/workspace_id for envelope-change detection (conversation {conv_id})")
+                            })?;
+                        let envelope_changed =
+                            current_title != conv.title || current_workspace_id != workspace_id;
+                        if envelope_changed {
+                            tx.execute(
+                                "UPDATE conversations SET title = ?2, workspace_id = ?3 WHERE id = ?1",
+                                fparams![conv_id, conv.title.as_deref(), workspace_id],
+                            )
+                            .with_context(|| {
+                                format!("updating title/workspace_id for conversation {conv_id} (envelope change on re-ingest)")
+                            })?;
+                            resync_lexical_envelope_for_conversation_in_tx(tx, conv_id)?;
+                        }
                     }
 
                     if !defer_analytics_updates {
@@ -10724,9 +10644,15 @@ fn franken_append_insert_new_messages<'a>(
             // wait for an async catch-up worker. No-op in the overwhelming
             // majority of calls (no active generation yet).
             let now_ms = FrankenStorage::now_millis();
-            crate::storage::schema::register_embedding_hole_for_new_message_in_tx(
-                tx,
+            let expected = crate::search::eligibility::expected_chunks(
                 message_id,
+                conversation_id,
+                role_as_str(&msg.role),
+                &msg.content,
+            );
+            crate::storage::schema::register_chunk_holes_for_message_in_tx(
+                tx,
+                &expected,
                 now_ms,
                 "new_message",
             )?;
@@ -10782,17 +10708,32 @@ fn franken_batch_insert_new_messages_with_batch_size(
     // w3-3 Step 3 (R2-W3-B4): same-transaction lifecycle invalidation --
     // see `franken_append_insert_new_messages`'s identical comment. One
     // `demote` call for the whole batch (idempotent, no per-row cost) plus
-    // one hole registration per newly inserted id.
+    // one chunk-hole registration call covering every newly inserted id's
+    // expected chunks (`register_chunk_holes_for_message_in_tx` batches
+    // internally, so this is one call, not one per message). `inserted_ids`
+    // is built in exactly the same order as `messages` was iterated above
+    // (each chunk maps 1:1 onto a contiguous id range, single-row inserts
+    // included), so the zip pairs each id with its own message correctly.
     if !inserted_ids.is_empty() {
         let now_ms = FrankenStorage::now_millis();
-        for &message_id in &inserted_ids {
-            crate::storage::schema::register_embedding_hole_for_new_message_in_tx(
-                tx,
-                message_id,
-                now_ms,
-                "new_message",
-            )?;
-        }
+        let expected: Vec<crate::search::eligibility::ExpectedChunk> = inserted_ids
+            .iter()
+            .zip(messages.iter())
+            .flat_map(|(&message_id, msg)| {
+                crate::search::eligibility::expected_chunks(
+                    message_id,
+                    conversation_id,
+                    role_as_str(&msg.role),
+                    &msg.content,
+                )
+            })
+            .collect();
+        crate::storage::schema::register_chunk_holes_for_message_in_tx(
+            tx,
+            &expected,
+            now_ms,
+            "new_message",
+        )?;
         crate::storage::schema::demote_active_generation_readiness_in_tx(tx)?;
     }
 
@@ -11334,79 +11275,167 @@ fn franken_collect_batched_existing_new_messages<'a>(
     ))
 }
 
-/// W2-2/W2-3 (spec G4, R2-W2-B1, R1-W2-B1): rebuild `lex_docs`/`fts_lex` for
-/// one conversation from scratch, in the same transaction as the caller's
-/// messages/conversations write.
-///
-/// Takes only `tx` (not `&FrankenStorage`) deliberately: the restore/backfill
-/// orchestration (`phase3_restore::commit_replace_in_tx`, which is the *real*
-/// caller of the parent-projection-field update — see below) only has a
-/// `Tx` in scope, not a `FrankenStorage` handle, so this cannot route through
-/// the `&self` method `FrankenStorage::fetch_messages_for_lexical_rebuild`.
-/// Reuses that method's exact query shape and its `truncate_lexical_rebuild_
-/// conversation_content` truncation call (the actual nontrivial 8 MiB
-/// business logic — the free function, not the `&self` wrapper around it) so
-/// the storage write path and the `--full` rebuild path apply the identical
-/// per-conversation cap. Eligibility is the same predicate
-/// `expected_live_lexical_doc_count` (`indexer/mod.rs`) composes from
-/// `is_lexical_rebuild_tool_class_role` + `is_hard_message_noise` — never
-/// duplicated, only called (W2-0 Step 3c's "复用同一投影实现，禁抄").
-///
-/// **Correction to the W2-0 remeasure report**: that report stated the
-/// title/workspace `UPDATE` "is called by `franken_replace_conversation_
-/// messages_in_tx`". That was never actually verified and is wrong — the two
-/// functions are *siblings*, both invoked in sequence by
-/// `phase3_restore::commit_replace_in_tx` (steps 2-7 then step 9). This
-/// function must therefore be wired in *after* step 9
-/// (`franken_update_conversation_projection_fields_in_tx`), not merely after
-/// `franken_replace_conversation_messages_in_tx`, or a replace would sync
-/// lexical rows against the *stale* pre-update title/workspace.
-///
-/// Full-conversation recompute (not incremental) is deliberate: the 8 MiB
-/// cap bounds per-conversation cost regardless of insert/append/replace, so
-/// recomputing from scratch on every call is trivially and provably
-/// consistent with the shared truncation logic for
-/// append/replace/parent-title-or-workspace-update alike — there is no
-/// separate incremental-truncation-state bookkeeping to get wrong. Deletes
-/// existing `fts_lex`/`lex_docs` rows for this conversation's message ids
-/// *before* touching `lex_docs` (external-content mode looks up the current
-/// `lex_docs` row via `content_rowid` to remove old index terms, so the
-/// content row must still be present at delete time), then reinserts the
-/// recomputed eligible set.
-///
-/// Fail-closed: every error here propagates via `?` — callers must not catch
-/// and continue. A lexical-domain write failure aborts the whole caller
-/// transaction, effective from the day this table exists (stricter than the
-/// spec's own "post-retirement" floor — R1-W2-B1 carried forward).
-pub(crate) fn sync_lexical_domain_for_conversation_in_tx(
+/// T5 (plan v5.1): outcome of a message-level lexical sync
+/// ([`sync_lexical_docs_for_messages_in_tx`]) -- which doc_ids had their old
+/// `lex_docs`/`fts_lex` rows removed, and which were (re)inserted (a
+/// message's doc_id can appear in `deleted_doc_ids` without appearing in
+/// `inserted_doc_ids`: it used to be lexically eligible and no longer is,
+/// e.g. its content changed into hard-noise).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LexicalSyncOutcome {
+    pub deleted_doc_ids: Vec<i64>,
+    pub inserted_doc_ids: Vec<i64>,
+}
+
+/// Row cap per batched `IN (...)` statement below -- same discipline as T4's
+/// `IN_CLAUSE_BATCH_ROWS` (`src/storage/schema.rs`), duplicated here because
+/// this module doesn't import from `schema` for such a small constant.
+const LEXICAL_SYNC_BATCH_ROWS: usize = 500;
+
+fn sql_in_placeholders(n: usize) -> String {
+    vec!["?"; n].join(",")
+}
+
+/// T5 (plan v5.1): message-level lexical (`fts_lex`/`lex_docs`) sync -- the
+/// single source of truth every write path funnels through when message
+/// *content* changed (a message was newly inserted, or an existing one's
+/// content was replaced). Deletes any existing `fts_lex`/`lex_docs` rows for
+/// `message_ids`, then re-inserts a row (content + the four
+/// conversation-derived projection columns) for whichever of `message_ids`
+/// is [`crate::search::eligibility::lexical_eligible`] -- T3's single source
+/// of truth for the role whitelist + hard-noise exclusion. No byte cap: T5
+/// removes the 8 MiB per-conversation truncation entirely (plan v5.1 "保真"
+/// constraint -- no session-level, message-level, or block-count cap on the
+/// lexical whitelist).
+pub(crate) fn sync_lexical_docs_for_messages_in_tx(
+    tx: &FrankenTransaction<'_>,
+    message_ids: &[i64],
+) -> Result<LexicalSyncOutcome> {
+    if message_ids.is_empty() {
+        return Ok(LexicalSyncOutcome::default());
+    }
+
+    let mut outcome = LexicalSyncOutcome::default();
+    for batch in message_ids.chunks(LEXICAL_SYNC_BATCH_ROWS) {
+        let placeholders = sql_in_placeholders(batch.len());
+        let id_params: Vec<Value> = batch.iter().map(|id| Value::from(*id)).collect();
+
+        let deleted: Vec<i64> = tx
+            .query_all_map(
+                &format!("SELECT doc_id FROM lex_docs WHERE doc_id IN ({placeholders})"),
+                &id_params,
+                |row| row.get_typed(0),
+            )
+            .context("finding existing lex_docs rows before message-level sync")?;
+        outcome.deleted_doc_ids.extend(deleted);
+
+        tx.execute(
+            &format!("DELETE FROM fts_lex WHERE rowid IN ({placeholders})"),
+            &id_params,
+        )
+        .context("clearing fts_lex before message-level sync")?;
+        tx.execute(
+            &format!("DELETE FROM lex_docs WHERE doc_id IN ({placeholders})"),
+            &id_params,
+        )
+        .context("clearing lex_docs before message-level sync")?;
+
+        let rows: Vec<(i64, String, String, String, String, String, String)> = tx
+            .query_all_map(
+                &format!(
+                    "SELECT m.id, m.role, m.content, COALESCE(c.title, ''), COALESCE(a.slug, ''), \
+                     COALESCE(w.path, ''), c.source_path \
+                     FROM messages m \
+                     JOIN conversations c ON c.id = m.conversation_id \
+                     JOIN agents a ON a.id = c.agent_id \
+                     LEFT JOIN workspaces w ON w.id = c.workspace_id \
+                     WHERE m.id IN ({placeholders})"
+                ),
+                &id_params,
+                |row| {
+                    Ok((
+                        row.get_typed::<i64>(0)?,
+                        row.get_typed::<String>(1)?,
+                        row.get_typed::<String>(2)?,
+                        row.get_typed::<String>(3)?,
+                        row.get_typed::<String>(4)?,
+                        row.get_typed::<String>(5)?,
+                        row.get_typed::<String>(6)?,
+                    ))
+                },
+            )
+            .context("loading message + conversation projection rows for message-level sync")?;
+
+        // Fail-closed: every id in `batch` is, by construction, a real
+        // `messages` row (callers only ever pass ids they just read from
+        // `messages` itself). The INNER JOINs above silently drop a message
+        // whose `conversation_id`/`agent_id` chain is broken (dangling FK on
+        // a corrupted row) instead of erroring -- without this check that
+        // corruption is invisible: the message is quietly left unindexed
+        // rather than aborting the transaction the way every other lexical
+        // sync failure in this module does.
+        if rows.len() != batch.len() {
+            let found: std::collections::HashSet<i64> = rows.iter().map(|row| row.0).collect();
+            let missing: Vec<i64> = batch.iter().copied().filter(|id| !found.contains(id)).collect();
+            anyhow::bail!(
+                "message-level lexical sync: {} of {} message id(s) in this batch resolved to zero rows \
+                 via the messages/conversations/agents join -- broken conversation_id or agent_id FK chain \
+                 (missing doc_ids: {missing:?})",
+                missing.len(),
+                batch.len()
+            );
+        }
+
+        for (doc_id, role, content, title, agent, workspace, source_path) in rows {
+            if !crate::search::eligibility::lexical_eligible(&role, &content) {
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO lex_docs(doc_id, content, title, agent, workspace, source_path) \
+                 VALUES (?1,?2,?3,?4,?5,?6)",
+                fparams![
+                    doc_id,
+                    content.as_str(),
+                    title.as_str(),
+                    agent.as_str(),
+                    workspace.as_str(),
+                    source_path.as_str()
+                ],
+            )
+            .with_context(|| format!("inserting lex_docs row for message {doc_id}"))?;
+            tx.execute(
+                "INSERT INTO fts_lex(rowid, content, title, agent, workspace, source_path) \
+                 VALUES (?1,?2,?3,?4,?5,?6)",
+                fparams![
+                    doc_id,
+                    content.as_str(),
+                    title.as_str(),
+                    agent.as_str(),
+                    workspace.as_str(),
+                    source_path.as_str()
+                ],
+            )
+            .with_context(|| format!("inserting fts_lex row for message {doc_id}"))?;
+            outcome.inserted_doc_ids.push(doc_id);
+        }
+    }
+
+    Ok(outcome)
+}
+
+/// T5 (plan v5.1): conversation-level lexical envelope resync -- when a
+/// conversation's title/agent/workspace/source_path projection changes
+/// (envelope change, not message content), every existing `lex_docs` row
+/// for that conversation gets its four projection columns `UPDATE`d
+/// (`content` untouched). `fts_lex`'s external-content protocol requires
+/// deleting each row's old indexed values and re-inserting the new ones (an
+/// `UPDATE` alone would leave the old projection values still searchable
+/// via `fts_lex` while `lex_docs` already shows the new ones). Returns the
+/// number of `lex_docs` rows touched.
+pub(crate) fn resync_lexical_envelope_for_conversation_in_tx(
     tx: &FrankenTransaction<'_>,
     conversation_id: i64,
-) -> Result<()> {
-    let mut messages: Vec<Message> = tx
-        .query_all_map(
-            "SELECT id, idx, role, author, created_at, content \
-             FROM messages WHERE conversation_id = ?1 ORDER BY idx",
-            fparams![conversation_id],
-            |row| {
-                let role: String = row.get_typed(2)?;
-                Ok(Message {
-                    id: Some(row.get_typed(0)?),
-                    idx: row.get_typed(1)?,
-                    role: role_from_str(&role),
-                    author: row.get_typed(3)?,
-                    created_at: row.get_typed(4)?,
-                    content: row.get_typed(5)?,
-                    extra_json: serde_json::Value::Null,
-                    snippets: Vec::new(),
-                })
-            },
-        )
-        .with_context(|| format!("fetching messages for lexical sync (conversation {conversation_id})"))?;
-    truncate_lexical_rebuild_conversation_content(
-        conversation_id,
-        &mut messages,
-        lexical_max_conversation_content_bytes(),
-    );
+) -> Result<u64> {
     let (title, workspace, agent, source_path): (String, String, String, String) = tx
         .query_row_map(
             "SELECT COALESCE(c.title, ''), COALESCE(w.path, ''), COALESCE(a.slug, ''), c.source_path \
@@ -11415,67 +11444,197 @@ pub(crate) fn sync_lexical_domain_for_conversation_in_tx(
              LEFT JOIN workspaces w ON w.id = c.workspace_id \
              WHERE c.id = ?1",
             fparams![conversation_id],
-            |row| {
-                Ok((
-                    row.get_typed(0)?,
-                    row.get_typed(1)?,
-                    row.get_typed(2)?,
-                    row.get_typed(3)?,
-                ))
-            },
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?, row.get_typed(3)?)),
         )
         .with_context(|| {
-            format!(
-                "loading conversation projection columns for lexical sync (conversation {conversation_id})"
-            )
+            format!("loading conversation projection columns for envelope resync (conversation {conversation_id})")
         })?;
 
-    tx.execute(
-        "DELETE FROM fts_lex WHERE rowid IN (SELECT id FROM messages WHERE conversation_id = ?1)",
-        fparams![conversation_id],
-    )
-    .with_context(|| format!("clearing fts_lex for conversation {conversation_id} before resync"))?;
-    tx.execute(
-        "DELETE FROM lex_docs WHERE doc_id IN (SELECT id FROM messages WHERE conversation_id = ?1)",
-        fparams![conversation_id],
-    )
-    .with_context(|| format!("clearing lex_docs for conversation {conversation_id} before resync"))?;
+    let rows: Vec<(i64, String)> = tx
+        .query_all_map(
+            "SELECT doc_id, content FROM lex_docs \
+             WHERE doc_id IN (SELECT id FROM messages WHERE conversation_id = ?1)",
+            fparams![conversation_id],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+        )
+        .with_context(|| format!("listing lex_docs rows for envelope resync (conversation {conversation_id})"))?;
 
-    for message in messages {
-        let is_tool_role = is_lexical_rebuild_tool_class_role(role_as_str(&message.role));
-        let noise_role_hint: Option<&str> = is_tool_role.then_some("tool");
-        if crate::search::canonicalize::is_hard_message_noise(noise_role_hint, &message.content) {
-            continue;
+    for (doc_id, content) in &rows {
+        let doc_id = *doc_id;
+        // External-content fts5: `DELETE FROM fts_lex WHERE rowid = ?1` looks
+        // up the CURRENT `lex_docs` row (via `content_rowid`) to know which
+        // tokens to remove from the index. It must run *before* the
+        // `lex_docs` UPDATE below -- deleting after would make fts5 remove
+        // the just-written *new* projection's tokens instead of the stale
+        // ones, leaving the old title/workspace terms permanently orphaned
+        // in the FTS index (caught by `lexical_envelope_change_reprojects_
+        // all_rows_in_conversation`'s old-term-unrecallable assertion).
+        tx.execute("DELETE FROM fts_lex WHERE rowid = ?1", fparams![doc_id])
+            .with_context(|| format!("clearing stale fts_lex row {doc_id} before envelope resync"))?;
+
+        tx.execute(
+            "UPDATE lex_docs SET title = ?2, agent = ?3, workspace = ?4, source_path = ?5 WHERE doc_id = ?1",
+            fparams![doc_id, title.as_str(), agent.as_str(), workspace.as_str(), source_path.as_str()],
+        )
+        .with_context(|| format!("updating lex_docs projection columns for row {doc_id}"))?;
+
+        tx.execute(
+            "INSERT INTO fts_lex(rowid, content, title, agent, workspace, source_path) VALUES (?1,?2,?3,?4,?5,?6)",
+            fparams![
+                doc_id,
+                content.as_str(),
+                title.as_str(),
+                agent.as_str(),
+                workspace.as_str(),
+                source_path.as_str()
+            ],
+        )
+        .with_context(|| format!("reinserting fts_lex row {doc_id} after envelope resync"))?;
+    }
+
+    Ok(rows.len() as u64)
+}
+
+/// T5 (plan v5.1): kept only for `--force-rebuild`'s internal use (and this
+/// module's own streaming full rebuild, [`FrankenStorage::rebuild_lex_domain_from_db`],
+/// which calls this once per conversation). Internally paginates by
+/// `message_id` and delegates each page to
+/// [`sync_lexical_docs_for_messages_in_tx`] instead of materializing the
+/// whole conversation's `Vec<Message>` -- this is what makes a full rebuild
+/// streaming with no code change needed in the rebuild loop itself.
+pub(crate) fn sync_lexical_domain_for_conversation_in_tx(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+) -> Result<()> {
+    const PAGE_SIZE: i64 = 500;
+    let mut after_id = 0i64;
+    loop {
+        let page: Vec<i64> = tx
+            .query_all_map(
+                "SELECT id FROM messages WHERE conversation_id = ?1 AND id > ?2 ORDER BY id LIMIT ?3",
+                fparams![conversation_id, after_id, PAGE_SIZE],
+                |row| row.get_typed(0),
+            )
+            .with_context(|| format!("paging messages for lexical sync (conversation {conversation_id})"))?;
+        if page.is_empty() {
+            break;
         }
-        let Some(doc_id) = message.id else { continue };
-        tx.execute(
-            "INSERT INTO lex_docs(doc_id, content, title, agent, workspace, source_path) \
-             VALUES (?1,?2,?3,?4,?5,?6)",
-            fparams![
-                doc_id,
-                message.content.as_str(),
-                title.as_str(),
-                agent.as_str(),
-                workspace.as_str(),
-                source_path.as_str()
-            ],
-        )
-        .with_context(|| format!("inserting lex_docs row for message {doc_id}"))?;
-        tx.execute(
-            "INSERT INTO fts_lex(rowid, content, title, agent, workspace, source_path) \
-             VALUES (?1,?2,?3,?4,?5,?6)",
-            fparams![
-                doc_id,
-                message.content.as_str(),
-                title.as_str(),
-                agent.as_str(),
-                workspace.as_str(),
-                source_path.as_str()
-            ],
-        )
-        .with_context(|| format!("inserting fts_lex row for message {doc_id}"))?;
+        after_id = *page.last().expect("page just checked non-empty");
+        let page_len = page.len();
+        sync_lexical_docs_for_messages_in_tx(tx, &page)?;
+        if (page_len as i64) < PAGE_SIZE {
+            break;
+        }
     }
     Ok(())
+}
+
+/// T6 (plan v5.1): outcome of [`delete_messages_ordered_in_tx`] -- rows
+/// actually removed from each layer. No `statement_order` self-reported
+/// field: the deletion order itself is proven by the behavior test
+/// (`tests/w4_lifecycle_zero_orphans.rs` judgment (f)), not asserted by
+/// this function about itself.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeleteOutcome {
+    pub vec0_rows: u64,
+    pub chunks: u64,
+    pub holes: u64,
+    pub staging: u64,
+    pub lex_docs: u64,
+    pub messages: u64,
+}
+
+/// T6 (plan v5.1): the single delete path every message-removal call site
+/// (session/agent/source-glob delete, duplicate-collapse, replace's delete
+/// segment) funnels through. Order is a hard invariant, not incidental:
+/// `vec0` tables have no FK/cascade tie to `messages` (they are independent
+/// virtual tables keyed by `rowid = chunk_id`), so their rows must be
+/// deleted *before* the parent `messages` row disappears -- and,
+/// perhaps-surprisingly, `message_chunks` itself must also be deleted
+/// *explicitly*, not left to `DELETE FROM messages`' own `ON DELETE
+/// CASCADE`: a `BEFORE DELETE ON message_chunks` trigger driven by that
+/// cascade observes the parent `messages` row as already gone (proven by
+/// `lifecycle_delete_order_proven_by_trigger` in `tests/w4_lifecycle_zero_
+/// orphans.rs`), which defeats the whole point of proving vec0-before-
+/// parent ordering by behavior. `chunk_holes`/`chunk_staging` still cascade
+/// from `messages` here (no test depends on their ordering relative to the
+/// parent the way `message_chunks` does), so this function counts them
+/// before the delete rather than removing them with a separate explicit
+/// call -- `delete_chunk_holes_for_messages_in_tx`/`delete_staging_for_
+/// messages_in_tx` (T4) stay reserved for a future in-place-update
+/// primitive, not called from here.
+pub(crate) fn delete_messages_ordered_in_tx(
+    tx: &FrankenTransaction<'_>,
+    message_ids: &[i64],
+) -> Result<DeleteOutcome> {
+    let mut outcome = DeleteOutcome::default();
+    if message_ids.is_empty() {
+        return Ok(outcome);
+    }
+
+    // vec0 first, then message_chunks itself, across every live generation
+    // (active + pending + stale) -- both explicit, not left to cascade.
+    // T6 discovery (`lifecycle_delete_order_proven_by_trigger`): SQLite
+    // fires a cascade-deleted child row's own `BEFORE DELETE` triggers
+    // *after* the parent row it cascades from is already gone from that
+    // trigger's own query view -- a `BEFORE DELETE ON message_chunks`
+    // trigger driven by `DELETE FROM messages`' cascade observes
+    // `parent_alive == 0`, not `1`, so it cannot prove vec0-before-parent
+    // ordering the way this project's fail-closed discipline wants proven.
+    // Deleting `message_chunks` explicitly here, strictly before the
+    // `DELETE FROM messages` below, makes the same trigger observe the
+    // parent row still alive -- the ordering guarantee is real, not just
+    // incidental to how cascade happens to fire.
+    let generation_ids = crate::storage::vector_domain::list_vec0_generation_ids_in_tx(tx)?;
+    for generation_id in &generation_ids {
+        let chunk_ids =
+            crate::storage::schema::collect_chunk_ids_for_messages(tx, *generation_id, message_ids)?;
+        if chunk_ids.is_empty() {
+            continue;
+        }
+        outcome.vec0_rows +=
+            crate::storage::vector_domain::delete_vec0_rows_in_tx(tx, *generation_id, &chunk_ids)?;
+        outcome.chunks += crate::storage::schema::delete_chunks_by_ids_in_tx(tx, &chunk_ids)?;
+    }
+
+    for batch in message_ids.chunks(LEXICAL_SYNC_BATCH_ROWS) {
+        let placeholders = sql_in_placeholders(batch.len());
+        let id_params: Vec<Value> = batch.iter().map(|id| Value::from(*id)).collect();
+
+        let holes: i64 = tx.query_row_map(
+            &format!("SELECT COUNT(*) FROM chunk_holes WHERE message_id IN ({placeholders})"),
+            &id_params,
+            |row| row.get_typed(0),
+        )?;
+        outcome.holes += holes.max(0) as u64;
+        let staging: i64 = tx.query_row_map(
+            &format!("SELECT COUNT(*) FROM chunk_staging WHERE message_id IN ({placeholders})"),
+            &id_params,
+            |row| row.get_typed(0),
+        )?;
+        outcome.staging += staging.max(0) as u64;
+
+        // External-content fts5: DELETE FROM fts_lex before the lex_docs
+        // content row it looks up is gone (same discipline as
+        // resync_lexical_envelope_for_conversation_in_tx above).
+        let existing_lex_docs: Vec<i64> = tx.query_all_map(
+            &format!("SELECT doc_id FROM lex_docs WHERE doc_id IN ({placeholders})"),
+            &id_params,
+            |row| row.get_typed(0),
+        )?;
+        outcome.lex_docs += existing_lex_docs.len() as u64;
+        tx.execute(&format!("DELETE FROM fts_lex WHERE rowid IN ({placeholders})"), &id_params)?;
+        tx.execute(&format!("DELETE FROM lex_docs WHERE doc_id IN ({placeholders})"), &id_params)?;
+
+        // Parent row last: message_chunks is already explicitly gone (above);
+        // this cascades away only chunk_holes/chunk_staging remnants.
+        outcome.messages +=
+            tx.execute(&format!("DELETE FROM messages WHERE id IN ({placeholders})"), &id_params)? as u64;
+    }
+
+    crate::storage::schema::demote_active_generation_readiness_in_tx(tx)?;
+
+    Ok(outcome)
 }
 
 /// Update daily stats within a legacy embedded engine transaction.
@@ -12232,28 +12391,25 @@ pub(crate) fn franken_replace_conversation_messages_in_tx(
         |row| row.get_typed(0),
     )?;
 
-    // w2 F2 fix: fts_lex has no FK relationship to lex_docs (FTS5
-    // external-content tables are not FK-aware), so ON DELETE CASCADE from
-    // messages -> lex_docs alone leaves fts_lex pointing at rowids the
-    // upcoming messages delete is about to cascade away. Must run *before*
-    // that delete, while `messages` still exist to resolve which fts_lex
-    // rowids belong to the *old* message ids -- sync_lexical_domain_for_
-    // conversation_in_tx runs later (post-insert, keyed off "current"
-    // messages) and can only ever see the *new* ids, so it cannot clean
-    // these up itself. Same precedent as the three delete-path call sites
-    // (W2-3): clear fts_lex first, while the old rowids are still resolvable.
-    tx.execute(
-        "DELETE FROM fts_lex WHERE rowid IN (SELECT id FROM messages WHERE conversation_id = ?1)",
+    // T6 (plan v5.1): collect the old message ids, then route the whole
+    // delete through delete_messages_ordered_in_tx -- unifies with the
+    // other 4 delete-path call sites and, crucially, cleans up vec0 rows
+    // for these old messages. The previous manual fts_lex-then-messages
+    // pair here never touched vec0 at all (no FK/cascade tie), leaking any
+    // embedded chunk's vec0 row forever once its parent message was
+    // cascade-deleted; delete_messages_ordered_in_tx collects chunk_ids per
+    // live generation and deletes their vec0 rows before the parent row
+    // goes away. `message_metrics` / `snippets` / `token_usage` all still
+    // cascade from `messages` on their own FK; `token_usage` additionally
+    // carries a non-FK `conversation_id` column, so it is still cleared
+    // explicitly below (unchanged from before).
+    let old_message_ids: Vec<i64> = tx.query_all_map(
+        "SELECT id FROM messages WHERE conversation_id = ?1",
         fparams![conversation_id],
+        |row| row.get_typed(0),
     )?;
-
-    // 删旧。`message_metrics` / `snippets` / `token_usage` 的 `message_id` 都带
-    // `ON DELETE CASCADE`；`token_usage` 另有一列 `conversation_id` 无外键，
-    // 故按基线 `cleanup_external_id_duplicates` 的做法再显式删一次（不依赖 cascade）。
-    let deleted_message_count = tx.execute(
-        "DELETE FROM messages WHERE conversation_id = ?1",
-        fparams![conversation_id],
-    )?;
+    let delete_outcome = delete_messages_ordered_in_tx(tx, &old_message_ids)?;
+    let deleted_message_count = delete_outcome.messages as usize;
     tx.execute(
         "DELETE FROM token_usage WHERE conversation_id = ?1",
         fparams![conversation_id],
@@ -12341,23 +12497,34 @@ pub(crate) fn franken_replace_conversation_messages_in_tx(
     // future canonical `cass mirror-restore --apply` write path -- the
     // invalidation belongs at the transaction site itself, not deferred to
     // whichever orchestration eventually calls it): `deleted_message_count`
-    // rows just had their `message_embeddings`/`embedding_holes` rows
-    // cascade-removed by the `DELETE FROM messages` above (nothing to do
-    // for that half explicitly); `inserted_message_ids` are brand new ids
-    // with no embedding yet, each needs a hole registered. Either
-    // direction alone already broke any 'passed' certification the active
-    // generation held for this conversation, so demote unconditionally
-    // whenever this function did anything at all.
+    // rows just had their chunk-domain rows cascade-removed by the
+    // `DELETE FROM messages` above (nothing to do for that half
+    // explicitly); `inserted_message_ids` are brand new ids with no
+    // embedding yet, each needs its expected chunks registered as holes.
+    // Either direction alone already broke any 'passed' certification the
+    // active generation held for this conversation, so demote
+    // unconditionally whenever this function did anything at all.
     if deleted_message_count > 0 || !inserted_message_ids.is_empty() {
         let now_ms = FrankenStorage::now_millis();
-        for &message_id in &inserted_message_ids {
-            crate::storage::schema::register_embedding_hole_for_new_message_in_tx(
-                tx,
-                message_id,
-                now_ms,
-                "replaced_conversation",
-            )?;
-        }
+        let expected: Vec<crate::search::eligibility::ExpectedChunk> = conv
+            .messages
+            .iter()
+            .zip(inserted_message_ids.iter())
+            .flat_map(|(msg, &message_id)| {
+                crate::search::eligibility::expected_chunks(
+                    message_id,
+                    conversation_id,
+                    role_as_str(&msg.role),
+                    &msg.content,
+                )
+            })
+            .collect();
+        crate::storage::schema::register_chunk_holes_for_message_in_tx(
+            tx,
+            &expected,
+            now_ms,
+            "replaced_conversation",
+        )?;
         crate::storage::schema::demote_active_generation_readiness_in_tx(tx)?;
     }
 
@@ -15711,188 +15878,34 @@ mod tests {
         assert_eq!(stale_hits, 0, "the old title term must no longer be recallable after replace");
     }
 
-    /// W2-2 Step 3 (R2-W2-B1 必答项): a conversation crossing the
-    /// per-conversation lexical cap — verified end to end through the real
-    /// `insert_conversation_tree`/append wiring (not a direct call to the
-    /// sync function), so this exercises the actual production entry point.
-    /// Uses `CASS_LEXICAL_MAX_CONVERSATION_CONTENT_BYTES` to shrink the cap
-    /// to a lab-sized value instead of writing real 8 MiB of content.
+    // T5 (plan v5.1): `conversation_crossing_lexical_cap_truncates_and_
+    // clears_correctly_across_append` retired -- it tested the 8 MiB
+    // per-conversation lexical cap end to end through the real
+    // insert_conversation_tree/append wiring; T5 removes that cap
+    // entirely (plan v5.1 "保真" constraint), so its premise (content
+    // gets truncated/cleared past a byte budget) is now false by design
+    // -- an equivalent test would assert the opposite (full content
+    // survives), which is already covered by
+    // lexical_no_conversation_cap_indexes_tail_of_9mib_conversation below.
+
+
+    /// W2-3 Step 1/2 (spec 门②"回滚"场景 + fail-closed 语义): if a lexical
+    /// sync step fails, the *whole* caller transaction must roll back —
+    /// including relational rows inserted earlier in that same transaction,
+    /// not just the lex half. Uses a real failure rather than a mocked one
+    /// (per this project's "探针必须是真失败" convention).
     ///
-    /// Scope note: this checks `lex_docs`'s output is byte-identical to what
-    /// `truncate_lexical_rebuild_conversation_content` computes (the same
-    /// function this sync path calls) — it does not additionally cross-check
-    /// against `ConversationPacket::capped_for_inline_lexical_index` (the
-    /// *other* consumer of the same cap, on the incremental-inline Tantivy
-    /// path), which would need a full `NormalizedConversation` fixture. Both
-    /// read the identical `lexical_max_conversation_content_bytes()` cap and
-    /// implement the same left-to-right truncate/clear algorithm (see that
-    /// function's doc comment), so this is believed sufficient for W2-2; a
-    /// full cross-path comparison is left as a documented gap, not silently
-    /// dropped.
-    #[test]
-    #[serial]
-    fn conversation_crossing_lexical_cap_truncates_and_clears_correctly_across_append() {
-        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
-        use std::path::PathBuf;
-
-        const CAP_ENV: &str = "CASS_LEXICAL_MAX_CONVERSATION_CONTENT_BYTES";
-        // w2 F5 fix: the previous comment here claimed "no other test sets
-        // `CAP_ENV`" -- false. `fetch_messages_for_lexical_rebuild_
-        // truncates_oversized_conversation_content` (below, in this same
-        // file) also sets this exact process-global env var, to a different
-        // value ("1024" vs this test's "100"), without any coordination.
-        // Under `cargo test`'s default parallel execution the two could
-        // interleave and each observe the other's value mid-run, producing
-        // a nondeterministic truncation boundary. `#[serial]` on both tests
-        // (this crate's existing serialization mechanism -- no new
-        // dependency) is what actually prevents that race; this guard alone
-        // only restores the var on unwind, it does not exclude concurrent
-        // readers/writers.
-        struct EnvGuard;
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                unsafe {
-                    std::env::remove_var(CAP_ENV);
-                }
-            }
-        }
-        unsafe {
-            std::env::set_var(CAP_ENV, "100");
-        }
-        let _env_guard = EnvGuard;
-
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("agent_search.db");
-        let storage = SqliteStorage::open(&db_path).unwrap();
-
-        let agent = Agent {
-            id: None,
-            slug: "claude_code".into(),
-            name: "Claude Code".into(),
-            version: None,
-            kind: AgentKind::Cli,
-        };
-        let agent_id = storage.ensure_agent(&agent).unwrap();
-
-        // msg0: 60 bytes (fits fully, cap=100, 40 bytes of budget remain).
-        let msg0_content = "a".repeat(60);
-        let conversation = Conversation {
-            id: None,
-            agent_slug: "claude_code".into(),
-            workspace: None,
-            external_id: Some("conv-boundary-1".into()),
-            title: Some("boundary test".into()),
-            source_path: PathBuf::from("/tmp/conv-boundary-1.jsonl"),
-            started_at: Some(1_700_000_000_000),
-            ended_at: None,
-            approx_tokens: None,
-            metadata_json: serde_json::Value::Null,
-            messages: vec![Message {
-                id: None,
-                idx: 0,
-                role: MessageRole::User,
-                author: Some("user".into()),
-                created_at: Some(1_700_000_000_010),
-                content: msg0_content.clone(),
-                extra_json: serde_json::Value::Null,
-                snippets: Vec::new(),
-            }],
-            source_id: LOCAL_SOURCE_ID.into(),
-            origin_host: None,
-        };
-        storage.insert_conversation_tree(agent_id, None, &conversation).unwrap();
-
-        let conversation_id: i64 = storage
-            .conn
-            .query_row_map(
-                "SELECT id FROM conversations WHERE external_id = ?1",
-                fparams!["conv-boundary-1"],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-
-        // Before append: msg0 must be present in lex_docs, full 60 bytes.
-        let msg0_id: i64 = storage
-            .conn
-            .query_row_map(
-                "SELECT id FROM messages WHERE conversation_id = ?1 AND idx = 0",
-                fparams![conversation_id],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-        let lex_content_before: String = storage
-            .conn
-            .query_row_map(
-                "SELECT content FROM lex_docs WHERE doc_id = ?1",
-                fparams![msg0_id],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-        assert_eq!(lex_content_before, msg0_content, "msg0 must be indexed in full before any append");
-
-        // Append msg1 (idx 1): 60 more bytes. Cumulative 120 > cap 100, so
-        // only 40 bytes of msg1 fit (60 already used by msg0); msg1's lex
-        // content must be truncated to exactly those 40 bytes.
-        let msg1_content = "b".repeat(60);
-        let append_conv = Conversation {
-            messages: vec![Message {
-                id: None,
-                idx: 1,
-                role: MessageRole::User,
-                author: Some("user".into()),
-                created_at: Some(1_700_000_000_020),
-                content: msg1_content.clone(),
-                extra_json: serde_json::Value::Null,
-                snippets: Vec::new(),
-            }],
-            ..conversation.clone()
-        };
-        storage.insert_conversation_tree(agent_id, None, &append_conv).unwrap();
-
-        let msg1_id: i64 = storage
-            .conn
-            .query_row_map(
-                "SELECT id FROM messages WHERE conversation_id = ?1 AND idx = 1",
-                fparams![conversation_id],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-
-        // msg0 must be untouched by the later over-budget append (earlier
-        // messages are never retroactively affected by a later one crossing
-        // the cap -- only the message that straddles/exceeds the boundary
-        // is affected, matching `truncate_lexical_rebuild_conversation_content`'s
-        // left-to-right, earliest-first semantics).
-        let lex_content_msg0_after: String = storage
-            .conn
-            .query_row_map(
-                "SELECT content FROM lex_docs WHERE doc_id = ?1",
-                fparams![msg0_id],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-        assert_eq!(lex_content_msg0_after, msg0_content, "msg0 must remain full-length after a later append crosses the cap");
-
-        let lex_content_msg1: String = storage
-            .conn
-            .query_row_map(
-                "SELECT content FROM lex_docs WHERE doc_id = ?1",
-                fparams![msg1_id],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-        assert_eq!(lex_content_msg1, "b".repeat(40), "msg1 must be truncated to exactly the remaining 40-byte budget");
-    }
-
-    /// W2-3 Step 1/2 (spec 门②"回滚"场景 + fail-closed 语义): if
-    /// `sync_lexical_domain_for_conversation_in_tx` fails, the *whole*
-    /// caller transaction must roll back — including relational rows
-    /// inserted earlier in that same transaction, not just the lex
-    /// half. Uses a real failure (`sync_lexical_domain_for_conversation_in_tx`
-    /// called with a `conversation_id` that does not exist in
-    /// `conversations`, so its projection-column lookup genuinely fails with
-    /// zero rows) rather than a mocked error, per this project's "探针必须
-    /// 是真失败" convention.
+    /// T5 (plan v5.1): retargeted from `sync_lexical_domain_for_conversation_
+    /// in_tx` to `resync_lexical_envelope_for_conversation_in_tx` -- T5's
+    /// message-level sync no longer eagerly looks up a conversation's
+    /// projection columns when there are zero messages to sync (it returns
+    /// `Ok` immediately for an empty `message_ids` slice), so a bogus,
+    /// message-less `conversation_id` no longer fails that path at all. The
+    /// envelope resync still does an eager `query_row_map` join against
+    /// `conversations`/`agents` for the given `conversation_id` regardless
+    /// of message count, so it still genuinely fails (zero rows) for a
+    /// nonexistent conversation -- preserving this test's fail-closed intent
+    /// against a still-real T5 code path.
     #[test]
     fn lex_sync_failure_rolls_back_the_whole_transaction_fail_closed() {
         let dir = TempDir::new().unwrap();
@@ -15923,10 +15936,10 @@ mod tests {
                      VALUES (9001, 9001, 0, 'user', 'rollback test content')",
                     fparams![],
                 )?;
-                // The lex sync deliberately targets a conversation_id that was
-                // never inserted (not 9001), so its own internal query finds
-                // zero rows and genuinely fails.
-                sync_lexical_domain_for_conversation_in_tx(tx, BOGUS_CONVERSATION_ID)
+                // The envelope resync deliberately targets a conversation_id
+                // that was never inserted (not 9001), so its own internal
+                // projection-column join finds zero rows and genuinely fails.
+                resync_lexical_envelope_for_conversation_in_tx(tx, BOGUS_CONVERSATION_ID)
                     .map_err(anyhow_error_into_storage_error)?;
                 Ok(())
             });
@@ -15958,7 +15971,7 @@ mod tests {
     /// excluded as noise, an empty-content message that must also be
     /// excluded), computes the "eligible set" independently in this test
     /// (mirroring `indexer::expected_live_lexical_doc_count`'s own
-    /// composition of `fetch_messages_for_lexical_rebuild` +
+    /// composition of `fetch_messages_for_conversation` +
     /// `is_lexical_rebuild_tool_class_role` + `is_hard_message_noise` --
     /// the identical predicate, not a copy with drift risk), and asserts
     /// both `eligible EXCEPT lex_docs = ∅` and `lex_docs EXCEPT eligible = ∅`
@@ -16040,7 +16053,7 @@ mod tests {
             .unwrap();
         let mut eligible_ids: Vec<i64> = Vec::new();
         for conversation_id in conversation_ids {
-            for message in storage.fetch_messages_for_lexical_rebuild(conversation_id).unwrap() {
+            for message in storage.fetch_messages_for_conversation(conversation_id).unwrap() {
                 let is_tool_role = is_lexical_rebuild_tool_class_role(role_as_str(&message.role));
                 let noise_role_hint: Option<&str> = is_tool_role.then_some("tool");
                 if !crate::search::canonicalize::is_hard_message_noise(noise_role_hint, &message.content) {
@@ -16155,15 +16168,28 @@ mod tests {
         // `orphan_fk_self_heal`-style tests to construct a state that is
         // structurally unreachable through any normal insert while FK
         // enforcement is on: a conversation row whose `agent_id` points at
-        // no existing agent. `sync_lexical_domain_for_conversation_in_tx`'s
-        // `JOIN agents a ON a.id = c.agent_id` then returns zero rows for
-        // this one conversation, failing its batch with a real `Err`.
+        // no existing agent, carrying one message. T5's message-level sync
+        // (`sync_lexical_docs_for_messages_in_tx`, paginated per conversation
+        // by `sync_lexical_domain_for_conversation_in_tx`) only touches the
+        // `messages`/`conversations`/`agents` join for conversations that
+        // have at least one message -- a message-less poisoned conversation
+        // would sync as a silent no-op under T5, so this fixture needs a
+        // message row too (not just the poisoned conversation row) for its
+        // `JOIN agents a ON a.id = c.agent_id` to actually run and fail.
         storage.raw().execute_batch_bypassing_foreign_keys_guard("PRAGMA foreign_keys = OFF").unwrap();
         storage
             .raw()
             .execute(
                 "INSERT INTO conversations(id, agent_id, source_id, source_path, started_at) \
                  VALUES(?1, 999999999, 'local', '/tmp/heartbeat-poisoned.jsonl', 1700000000000)",
+                fparams![poisoned_id],
+            )
+            .unwrap();
+        storage
+            .raw()
+            .execute(
+                "INSERT INTO messages(id, conversation_id, idx, role, content) \
+                 VALUES(?1, ?1, 0, 'user', 'poisoned message content')",
                 fparams![poisoned_id],
             )
             .unwrap();
@@ -16488,210 +16514,380 @@ mod tests {
         assert!(again.pairs.is_empty());
     }
 
+    // T5 (plan v5.1): four tests retired here --
+    // lexical_content_truncation_caps_cumulative_bytes_and_keeps_message_count,
+    // lexical_content_truncation_is_noop_within_cap,
+    // lexical_content_truncation_respects_utf8_char_boundaries (all three
+    // exercised the per-conversation truncation helper and its boundary
+    // math directly, both deleted), and
+    // fetch_messages_for_conversation_truncates_oversized_conversation_content
+    // (exercised the size-cap override env var, also deleted). T5 removes
+    // the 8 MiB per-conversation lexical cap entirely (plan v5.1 "保真"
+    // constraint) -- their premise no longer holds.
+
+    // T5 Step 1: three tests that need direct `pub(crate)` access to the new
+    // sync functions / full rebuild themselves live here (inline, same as
+    // the `replace_with_new_title_and_workspace_refreshes_lex_docs_and_
+    // fts_lex` precedent above) rather than in the external
+    // `tests/w4_lexical_incremental.rs` file -- a deviation from the plan's
+    // single-file Files listing, documented in the T5 terminal report.
+
+    /// T5 Step 1: `sync_lexical_docs_for_messages_in_tx` scoped to one
+    /// message id must resync only that message's `lex_docs`/`fts_lex` row
+    /// -- a sibling message's row (never named in the call) must be
+    /// byte-for-byte untouched.
     #[test]
-    fn lexical_content_truncation_caps_cumulative_bytes_and_keeps_message_count() {
-        use crate::model::types::{Message, MessageRole};
-
-        let cap = 100usize;
-        let mut messages = vec![
-            Message {
-                id: Some(1),
-                idx: 0,
-                role: MessageRole::User,
-                author: None,
-                created_at: Some(1),
-                content: "a".repeat(60),
-                extra_json: serde_json::Value::Null,
-                snippets: Vec::new(),
-            },
-            Message {
-                id: Some(2),
-                idx: 1,
-                role: MessageRole::Agent,
-                author: None,
-                created_at: Some(2),
-                content: "b".repeat(60),
-                extra_json: serde_json::Value::Null,
-                snippets: Vec::new(),
-            },
-            Message {
-                id: Some(3),
-                idx: 2,
-                role: MessageRole::Agent,
-                author: None,
-                created_at: Some(3),
-                content: "c".repeat(60),
-                extra_json: serde_json::Value::Null,
-                snippets: Vec::new(),
-            },
-        ];
-
-        truncate_lexical_rebuild_conversation_content(42, &mut messages, cap);
-
-        // Structure (message count + ids) preserved; only indexed text trimmed.
-        assert_eq!(messages.len(), 3, "message rows must be preserved");
-        assert_eq!(
-            messages.iter().map(|m| m.id).collect::<Vec<_>>(),
-            vec![Some(1), Some(2), Some(3)]
-        );
-        let total: usize = messages.iter().map(|m| m.content.len()).sum();
-        assert_eq!(
-            total, cap,
-            "cumulative content is capped exactly at the cap"
-        );
-        // Earliest content is kept in full; the straddling message is truncated;
-        // later content is dropped.
-        assert_eq!(messages[0].content.len(), 60);
-        assert_eq!(messages[1].content.len(), 40);
-        assert!(messages[2].content.is_empty());
-    }
-
-    #[test]
-    fn lexical_content_truncation_is_noop_within_cap() {
-        use crate::model::types::{Message, MessageRole};
-
-        let mut messages = vec![Message {
-            id: Some(1),
-            idx: 0,
-            role: MessageRole::User,
-            author: None,
-            created_at: Some(1),
-            content: "short".to_string(),
-            extra_json: serde_json::Value::Null,
-            snippets: Vec::new(),
-        }];
-        truncate_lexical_rebuild_conversation_content(7, &mut messages, 1024);
-        assert_eq!(messages[0].content, "short", "within-cap content untouched");
-    }
-
-    #[test]
-    fn lexical_content_truncation_respects_utf8_char_boundaries() {
-        use crate::model::types::{Message, MessageRole};
-
-        // Each "é" is 2 bytes; a cap of 5 must not split a code point.
-        let mut messages = vec![Message {
-            id: Some(1),
-            idx: 0,
-            role: MessageRole::User,
-            author: None,
-            created_at: Some(1),
-            content: "ééé".to_string(), // 6 bytes
-            extra_json: serde_json::Value::Null,
-            snippets: Vec::new(),
-        }];
-        truncate_lexical_rebuild_conversation_content(1, &mut messages, 5);
-        // Largest char boundary <= 5 is 4 bytes ("éé").
-        assert_eq!(messages[0].content, "éé");
-        assert!(
-            messages[0]
-                .content
-                .is_char_boundary(messages[0].content.len())
-        );
-    }
-
-    /// #290: a conversation whose content exceeds the cap is admitted through the
-    /// lexical-rebuild fetch with truncated content, not OOM-quarantined.
-    ///
-    /// w2 F5 fix: `#[serial]` -- this test and
-    /// `conversation_crossing_lexical_cap_truncates_and_clears_correctly_across_append`
-    /// (above, in this same file) both set the same process-global
-    /// `CASS_LEXICAL_MAX_CONVERSATION_CONTENT_BYTES` env var to different
-    /// values ("1024" here, "100" there) with no coordination between them;
-    /// under default parallel test execution either could observe the
-    /// other's value mid-run. `#[serial]` on both is this crate's existing
-    /// mechanism for exactly this kind of process-env race (no new
-    /// dependency introduced).
-    #[test]
-    #[serial]
-    fn fetch_messages_for_lexical_rebuild_truncates_oversized_conversation_content() {
-        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
-        use std::path::PathBuf;
-
-        // Force a small, deterministic cap independent of host memory.
-        // SAFETY: `#[serial]` above excludes concurrent readers/writers of
-        // this env var; the value is read on each fetch call.
-        unsafe {
-            std::env::set_var("CASS_LEXICAL_MAX_CONVERSATION_CONTENT_BYTES", "1024");
-        }
-
+    fn lexical_message_update_resyncs_only_target() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("agent_search.db");
         let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&crate::model::types::Agent {
+                id: None,
+                slug: "claude_code".into(),
+                name: "Claude Code".into(),
+                version: None,
+                kind: crate::model::types::AgentKind::Cli,
+            })
+            .unwrap();
 
-        let agent = Agent {
-            id: None,
-            slug: "claude_code".into(),
-            name: "Claude Code".into(),
-            version: None,
-            kind: AgentKind::Cli,
-        };
-        let agent_id = storage.ensure_agent(&agent).unwrap();
-
-        // Three messages of 2 KiB each => 6 KiB total content, well over the
-        // 1 KiB cap. This models an image/base64-heavy conversation.
-        let big = "x".repeat(2048);
-        let conversation = Conversation {
+        let conv = crate::model::types::Conversation {
             id: None,
             agent_slug: "claude_code".into(),
-            workspace: Some(PathBuf::from("/tmp/workspace")),
-            external_id: Some("conv-big".into()),
-            title: Some("Oversized".into()),
-            source_path: PathBuf::from("/tmp/conv-big.jsonl"),
+            workspace: None,
+            external_id: Some("only-target-conv".into()),
+            title: Some("only target fixture".into()),
+            source_path: PathBuf::from("/tmp/only-target-conv.jsonl"),
             started_at: Some(1_700_000_000_000),
             ended_at: Some(1_700_000_000_100),
             approx_tokens: None,
             metadata_json: serde_json::Value::Null,
-            messages: (0..3)
-                .map(|idx| Message {
+            messages: vec![
+                crate::model::types::Message {
                     id: None,
-                    idx,
-                    role: MessageRole::Agent,
-                    author: Some("assistant".into()),
-                    created_at: Some(1_700_000_000_010 + idx),
-                    content: big.clone(),
+                    idx: 0,
+                    role: crate::model::types::MessageRole::User,
+                    author: None,
+                    created_at: Some(1_700_000_000_010),
+                    content: "messageAoriginaltermxyz body".into(),
                     extra_json: serde_json::Value::Null,
                     snippets: Vec::new(),
-                })
-                .collect(),
+                },
+                crate::model::types::Message {
+                    id: None,
+                    idx: 1,
+                    role: crate::model::types::MessageRole::Assistant,
+                    author: None,
+                    created_at: Some(1_700_000_000_020),
+                    content: "messageBoriginaltermxyz body".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                },
+            ],
             source_id: LOCAL_SOURCE_ID.into(),
             origin_host: None,
         };
-        storage
-            .insert_conversation_tree(agent_id, None, &conversation)
-            .unwrap();
-        let conversation_id = storage
+        storage.insert_conversation_tree(agent_id, None, &conv).unwrap();
+
+        let conversation_id: i64 = storage
             .conn
             .query_row_map(
                 "SELECT id FROM conversations WHERE external_id = ?1",
-                fparams!["conv-big"],
-                |row| row.get_typed::<i64>(0),
+                fparams!["only-target-conv"],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        let doc_id_a: i64 = storage
+            .conn
+            .query_row_map(
+                "SELECT id FROM messages WHERE conversation_id = ?1 AND idx = 0",
+                fparams![conversation_id],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        let doc_id_b: i64 = storage
+            .conn
+            .query_row_map(
+                "SELECT id FROM messages WHERE conversation_id = ?1 AND idx = 1",
+                fparams![conversation_id],
+                |row| row.get_typed(0),
             )
             .unwrap();
 
-        let messages = storage
-            .fetch_messages_for_lexical_rebuild(conversation_id)
+        let a_row_before: (String, String, String, String, String) = storage
+            .conn
+            .query_row_map(
+                "SELECT content, title, agent, workspace, source_path FROM lex_docs WHERE doc_id = ?1",
+                fparams![doc_id_a],
+                |row| {
+                    Ok((
+                        row.get_typed(0)?,
+                        row.get_typed(1)?,
+                        row.get_typed(2)?,
+                        row.get_typed(3)?,
+                        row.get_typed(4)?,
+                    ))
+                },
+            )
             .unwrap();
 
-        // All message rows survive (count/structure intact) ...
-        assert_eq!(messages.len(), 3, "message rows preserved");
-        // ... but the cumulative indexed content is capped, never the raw 6 KiB.
-        let total: usize = messages.iter().map(|m| m.content.len()).sum();
-        assert_eq!(
-            total, 1024,
-            "cumulative content capped at the configured cap"
-        );
-        assert!(
-            !messages[0].content.is_empty(),
-            "earliest content is retained for lexical tokens"
-        );
+        // Simulate B's content changing in place (idx unchanged, content
+        // rewritten -- what a real message-content-update produces upstream
+        // of the sync call), then resync only B's doc_id.
+        storage
+            .conn
+            .execute(
+                "UPDATE messages SET content = ?2 WHERE id = ?1",
+                fparams![doc_id_b, "messageBUPDATEDtermxyz new body"],
+            )
+            .unwrap();
+        storage
+            .conn
+            .with_tx(TxMode::Immediate, |tx| -> Result<(), StorageError> {
+                sync_lexical_docs_for_messages_in_tx(tx, &[doc_id_b])
+                    .map_err(anyhow_error_into_storage_error)?;
+                Ok(())
+            })
+            .unwrap();
 
-        // SAFETY: single-threaded test cleanup.
-        unsafe {
-            std::env::remove_var("CASS_LEXICAL_MAX_CONVERSATION_CONTENT_BYTES");
-        }
+        let a_row_after: (String, String, String, String, String) = storage
+            .conn
+            .query_row_map(
+                "SELECT content, title, agent, workspace, source_path FROM lex_docs WHERE doc_id = ?1",
+                fparams![doc_id_a],
+                |row| {
+                    Ok((
+                        row.get_typed(0)?,
+                        row.get_typed(1)?,
+                        row.get_typed(2)?,
+                        row.get_typed(3)?,
+                        row.get_typed(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(a_row_before, a_row_after, "message A's lex_docs row must be byte-for-byte untouched");
+
+        let b_content: String = storage
+            .conn
+            .query_row_map("SELECT content FROM lex_docs WHERE doc_id = ?1", fparams![doc_id_b], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(b_content, "messageBUPDATEDtermxyz new body");
+
+        let match_count = |term: &str| -> i64 {
+            storage
+                .conn
+                .query_row_map("SELECT COUNT(*) FROM fts_lex WHERE fts_lex MATCH ?1", fparams![term], |row| {
+                    row.get_typed(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(match_count("messageAoriginaltermxyz"), 1, "A's original term must still be recallable");
+        assert_eq!(match_count("messageBoriginaltermxyz"), 0, "B's stale term must no longer be recallable");
+        assert_eq!(match_count("messageBUPDATEDtermxyz"), 1, "B's new term must be recallable");
     }
 
+    /// T5 Step 1: the full-rebuild path (`rebuild_lex_domain_from_db`), the
+    /// incremental per-message sync path (`insert_conversation_tree`'s own
+    /// write-time sync), and `lexical_eligible` applied directly over the
+    /// raw `messages` table must all agree on exactly which doc_ids are
+    /// indexed, and (for the two DB-backed sites) their five projected
+    /// columns must match byte-for-byte.
+    #[test]
+    fn lexical_three_sites_agree() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&crate::model::types::Agent {
+                id: None,
+                slug: "claude_code".into(),
+                name: "Claude Code".into(),
+                version: None,
+                kind: crate::model::types::AgentKind::Cli,
+            })
+            .unwrap();
 
+        let roles = [
+            crate::model::types::MessageRole::User,
+            crate::model::types::MessageRole::Assistant,
+            crate::model::types::MessageRole::Other("reasoning".into()),
+            crate::model::types::MessageRole::Agent,
+            crate::model::types::MessageRole::Other("tool_call".into()),
+        ];
+        let messages = roles
+            .iter()
+            .enumerate()
+            .map(|(idx, role)| crate::model::types::Message {
+                id: None,
+                idx: idx as i64,
+                role: role.clone(),
+                author: None,
+                created_at: Some(1_700_000_000_010 + idx as i64 * 10),
+                content: format!("threesitesterm{idx}xyz body text"),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            })
+            .collect();
+        let conv = crate::model::types::Conversation {
+            id: None,
+            agent_slug: "claude_code".into(),
+            workspace: None,
+            external_id: Some("three-sites-conv".into()),
+            title: Some("three sites fixture".into()),
+            source_path: PathBuf::from("/tmp/three-sites-conv.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages,
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+        storage.insert_conversation_tree(agent_id, None, &conv).unwrap();
+
+        type LexRow = (i64, String, String, String, String, String);
+        let snapshot = |storage: &SqliteStorage| -> std::collections::BTreeMap<i64, (String, String, String, String, String)> {
+            storage
+                .conn
+                .query_all_map(
+                    "SELECT doc_id, content, title, agent, workspace, source_path FROM lex_docs ORDER BY doc_id",
+                    fparams![],
+                    |row| -> Result<LexRow, StorageError> {
+                        Ok((
+                            row.get_typed(0)?,
+                            row.get_typed(1)?,
+                            row.get_typed(2)?,
+                            row.get_typed(3)?,
+                            row.get_typed(4)?,
+                            row.get_typed(5)?,
+                        ))
+                    },
+                )
+                .unwrap()
+                .into_iter()
+                .map(|(doc_id, content, title, agent, workspace, source_path)| {
+                    (doc_id, (content, title, agent, workspace, source_path))
+                })
+                .collect()
+        };
+
+        // Site 1: incremental (already synced at insert time above).
+        let incremental_snapshot = snapshot(&storage);
+
+        // Site 3: `lexical_eligible` applied directly to the raw messages.
+        let raw_rows: Vec<(i64, String, String)> = storage
+            .conn
+            .query_all_map("SELECT id, role, content FROM messages", fparams![], |row| {
+                Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?))
+            })
+            .unwrap();
+        let eligible_doc_ids: std::collections::BTreeSet<i64> = raw_rows
+            .iter()
+            .filter(|(_, role, content)| crate::search::eligibility::lexical_eligible(role, content))
+            .map(|(id, _, _)| *id)
+            .collect();
+
+        // Ground-truth check independent of the two DB-backed sites'
+        // cross-comparison below: the reasoning-role message's doc_id
+        // (fixture idx 2) must never be eligible, full stop. Unlike the
+        // incremental-vs-rebuild-vs-eligible-set comparisons (which would
+        // all shift together and still "agree" if `lexical_eligible` itself
+        // were mutated to permit reasoning, since every site delegates to
+        // that one function), this literal assertion is what actually
+        // reddens under that mutation.
+        let reasoning_doc_id: i64 = raw_rows
+            .iter()
+            .find(|(_, role, _)| role == "reasoning")
+            .map(|(id, _, _)| *id)
+            .expect("fixture must contain the reasoning-role message");
+        assert!(
+            !eligible_doc_ids.contains(&reasoning_doc_id),
+            "reasoning role must never be lexically eligible -- mutation target for \
+             \"lexical_eligible 临时放行 reasoning\""
+        );
+
+        let incremental_doc_ids: std::collections::BTreeSet<i64> = incremental_snapshot.keys().copied().collect();
+        assert_eq!(
+            incremental_doc_ids, eligible_doc_ids,
+            "incremental sync's doc_id set must exactly equal lexical_eligible's derived set"
+        );
+
+        // Site 2: full rebuild -- drop and recompute lex_docs from scratch.
+        crate::storage::schema::recreate_lex_domain_tables(&storage.conn).unwrap();
+        storage.rebuild_lex_domain_from_db(None).unwrap();
+        let rebuild_snapshot = snapshot(&storage);
+        let rebuild_doc_ids: std::collections::BTreeSet<i64> = rebuild_snapshot.keys().copied().collect();
+        assert_eq!(rebuild_doc_ids, eligible_doc_ids, "full rebuild's doc_id set must exactly equal lexical_eligible's derived set");
+
+        assert_eq!(
+            incremental_snapshot, rebuild_snapshot,
+            "incremental sync and full rebuild must agree byte-for-byte on all five projected columns, not just doc_id set membership"
+        );
+    }
+
+    /// T5 Step 1: `rebuild_lex_domain_from_db` must process a conversation
+    /// whose message count spans multiple internal sync pages (`PAGE_SIZE`
+    /// = 500 in `sync_lexical_domain_for_conversation_in_tx`) correctly end
+    /// to end, without materializing the whole conversation as one
+    /// `Vec<Message>`. `#[ignore]`d here: this fixture (1200 synthetic
+    /// messages) exercises the multi-page *correctness* path cheaply, but
+    /// the actual memory-bound streaming *proof* (peak RSS independent of
+    /// corpus size) needs T10's large real fixture-3751-scale DB to be
+    /// meaningful -- run manually with `cargo test --lib -- --ignored
+    /// lexical_rebuild_is_streaming` once that fixture exists.
+    #[test]
+    #[ignore]
+    fn lexical_rebuild_is_streaming() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&crate::model::types::Agent {
+                id: None,
+                slug: "claude_code".into(),
+                name: "Claude Code".into(),
+                version: None,
+                kind: crate::model::types::AgentKind::Cli,
+            })
+            .unwrap();
+
+        const MESSAGE_COUNT: i64 = 1_200; // > 2x LEXICAL_SYNC_BATCH_ROWS/PAGE_SIZE (500)
+        let messages = (0..MESSAGE_COUNT)
+            .map(|idx| crate::model::types::Message {
+                id: None,
+                idx,
+                role: crate::model::types::MessageRole::User,
+                author: None,
+                created_at: Some(1_700_000_000_000 + idx),
+                content: format!("streamingfixtureterm{idx}xyz"),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            })
+            .collect();
+        let conv = crate::model::types::Conversation {
+            id: None,
+            agent_slug: "claude_code".into(),
+            workspace: None,
+            external_id: Some("streaming-conv".into()),
+            title: Some("streaming fixture".into()),
+            source_path: PathBuf::from("/tmp/streaming-conv.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_000 + MESSAGE_COUNT),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages,
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+        storage.insert_conversation_tree(agent_id, None, &conv).unwrap();
+
+        crate::storage::schema::recreate_lex_domain_tables(&storage.conn).unwrap();
+        let stats = storage.rebuild_lex_domain_from_db(None).unwrap();
+        assert_eq!(stats.lex_docs_count, MESSAGE_COUNT as usize, "every message across all sync pages must be indexed");
+    }
 
 
 
@@ -22023,7 +22219,7 @@ mod tests {
     }
 
     #[test]
-    fn fetch_messages_for_lexical_rebuild_skips_extra_json() {
+    fn fetch_messages_for_conversation_skips_extra_json() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test.db");
         let storage = SqliteStorage::open(&db_path).unwrap();
@@ -22075,7 +22271,7 @@ mod tests {
         assert!(!stored[0].extra_json.is_null());
 
         let lexical = storage
-            .fetch_messages_for_lexical_rebuild(conversation_id)
+            .fetch_messages_for_conversation(conversation_id)
             .unwrap();
         assert_eq!(lexical.len(), 1);
         assert_eq!(lexical[0].content, "indexed text");
@@ -22178,7 +22374,7 @@ mod tests {
         // agree — it shares the same `role_from_str` call, but assert it
         // directly since it used to be an independently hand-rolled parser.
         let lexical = storage
-            .fetch_messages_for_lexical_rebuild_uncapped(conversation_id)
+            .fetch_messages_for_conversation(conversation_id)
             .unwrap();
         assert_eq!(lexical.len(), 3);
         assert_eq!(role_as_str(&lexical[1].role), "assistant");
@@ -22285,7 +22481,7 @@ mod tests {
     }
 
     #[test]
-    fn fetch_messages_for_lexical_rebuild_batch_groups_and_orders_messages() {
+    fn fetch_messages_for_conversations_batch_groups_and_orders_messages() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test.db");
         let storage = SqliteStorage::open(&db_path).unwrap();
@@ -22391,7 +22587,7 @@ mod tests {
             .conversation_id;
 
         let lexical = storage
-            .fetch_messages_for_lexical_rebuild_batch(&[third_id, first_id], None, None)
+            .fetch_messages_for_conversations_batch(&[third_id, first_id])
             .unwrap();
 
         let first_messages = lexical.get(&first_id).expect("first conversation");
@@ -22415,73 +22611,13 @@ mod tests {
         assert!(third_messages[0].extra_json.is_null());
     }
 
-    #[test]
-    fn fetch_messages_for_lexical_rebuild_batch_enforces_content_byte_guardrail() {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test.db");
-        let storage = SqliteStorage::open(&db_path).unwrap();
-
-        let agent = Agent {
-            id: None,
-            slug: "codex".into(),
-            name: "Codex".into(),
-            version: Some("0.2.3".into()),
-            kind: AgentKind::Cli,
-        };
-        let agent_id = storage.ensure_agent(&agent).unwrap();
-
-        let conversation = Conversation {
-            id: None,
-            agent_slug: "codex".into(),
-            workspace: Some(PathBuf::from("/tmp/workspace")),
-            external_id: Some("lexical-batch-guard".into()),
-            title: Some("Lexical batch guard".into()),
-            source_path: PathBuf::from("/tmp/lexical-batch-guard.jsonl"),
-            started_at: Some(1_700_000_000_000),
-            ended_at: Some(1_700_000_000_100),
-            approx_tokens: Some(42),
-            metadata_json: serde_json::Value::Null,
-            messages: vec![
-                Message {
-                    id: None,
-                    idx: 0,
-                    role: MessageRole::User,
-                    author: Some("user".into()),
-                    created_at: Some(1_700_000_000_010),
-                    content: "123456".into(),
-                    extra_json: serde_json::Value::Null,
-                    snippets: Vec::new(),
-                },
-                Message {
-                    id: None,
-                    idx: 1,
-                    role: MessageRole::Agent,
-                    author: Some("assistant".into()),
-                    created_at: Some(1_700_000_000_020),
-                    content: "abcdef".into(),
-                    extra_json: serde_json::Value::Null,
-                    snippets: Vec::new(),
-                },
-            ],
-            source_id: LOCAL_SOURCE_ID.into(),
-            origin_host: None,
-        };
-
-        let conversation_id = storage
-            .insert_conversation_tree(agent_id, None, &conversation)
-            .unwrap()
-            .conversation_id;
-
-        let error = storage
-            .fetch_messages_for_lexical_rebuild_batch(&[conversation_id], Some(10), Some(8))
-            .expect_err("guardrail should reject oversized batch content");
-
-        let message = format!("{error:#}");
-        assert!(
-            message.contains("content-byte guardrail"),
-            "expected guardrail reason in error, got {message}"
-        );
-    }
+    // T5 (plan v5.1): `fetch_messages_for_lexical_rebuild_batch_enforces_
+    // content_byte_guardrail` retired -- it tested the `max_messages`/
+    // `max_content_bytes` guardrail params, which are deleted along with
+    // `fetch_messages_for_conversations_batch`'s rename (every call site
+    // always passed `None, None`; dead parameters, and their whole premise
+    // -- capping how much lexical content a batch fetch may return --
+    // contradicts T5's "no cap" mandate).
 
     #[test]
     fn fetch_messages_handles_manual_rows_inserted_via_raw_connection() {
@@ -22508,7 +22644,7 @@ mod tests {
         &[])
         .unwrap();
 
-        let lexical = storage.fetch_messages_for_lexical_rebuild(1).unwrap();
+        let lexical = storage.fetch_messages_for_conversation(1).unwrap();
         assert_eq!(lexical.len(), 1);
         assert_eq!(lexical[0].content, "manual body");
 
@@ -25394,17 +25530,17 @@ mod tests {
         );
     }
 
-    /// R1-W3-N5 regression: a v4+ database that lost the three W3
-    /// DB-vector-domain tables (`embedding_generations`/`message_
-    /// embeddings`/`embedding_holes`, `V4_VECTOR_DOMAIN_DDL` in
-    /// `src/storage/schema.rs`) to incomplete restore / derived-index
-    /// corruption had no probe here at all before this fix -- the
-    /// self-heal pass above (which already catches the analogous gap for
-    /// the analytics tables) was blind to this one. Same shape as
+    /// R1-W3-N5 regression: a database that lost the DB-vector-domain
+    /// tables (`embedding_generations`/`message_chunks`/`chunk_holes`/
+    /// `chunk_staging`, `src/storage/schema.rs`) to incomplete restore /
+    /// derived-index corruption had no probe here at all before this fix --
+    /// the self-heal pass above (which already catches the analogous gap
+    /// for the analytics tables) was blind to this one. Same shape as
     /// `franken_storage_open_repairs_missing_analytics_tables_when_
     /// version_markers_lie` above: drop the tables, lie that the schema
     /// version is already current, and confirm a fresh `open()` still
-    /// recreates them.
+    /// recreates them. T11: probes and assertions updated from the retired
+    /// v4 message-granularity tables to the chunk domain that replaced them.
     #[test]
     fn franken_storage_open_repairs_missing_vector_domain_tables_when_version_markers_lie() {
         let dir = TempDir::new().unwrap();
@@ -25417,7 +25553,7 @@ mod tests {
 
         {
             let conn = FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().into_owned())), crate::storage::api::Profile::Production).unwrap();
-            for table in &["embedding_holes", "message_embeddings", "embedding_generations"] {
+            for table in &["chunk_holes", "chunk_staging", "message_chunks", "embedding_generations"] {
                 conn.execute(&format!("DROP TABLE IF EXISTS {table}"), &[])
                     .unwrap();
             }
@@ -25438,16 +25574,17 @@ mod tests {
                  WHERE type='table'
                    AND name IN (
                      'embedding_generations',
-                     'message_embeddings',
-                     'embedding_holes'
+                     'message_chunks',
+                     'chunk_holes',
+                     'chunk_staging'
                    )",
                 &[],
                 |row| row.get_typed(0),
             )
             .unwrap();
         assert_eq!(
-            vector_domain_table_count, 3,
-            "open() should recreate all three missing vector-domain tables even when schema_version already says current"
+            vector_domain_table_count, 4,
+            "open() should recreate all four missing vector-domain tables even when schema_version already says current"
         );
 
         // Not just present -- actually usable: this is the production
@@ -25455,16 +25592,16 @@ mod tests {
         let gen_a = repaired
             .raw()
             .with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
-                crate::storage::schema::create_embedding_generation(tx, "bge-m3", 1024, 1, 1_000)
+                crate::storage::schema::create_embedding_generation(tx, "bge-m3", 1024, 1, 1, b"test-fingerprint", 1_000)
             })
             .expect("the repaired embedding_generations table must accept a real write");
 
         // R2-N1: the repair batch's own `idx_embedding_generations_single_active`
         // unique partial index -- previously missing entirely (silently
-        // drifted from `V4_VECTOR_DOMAIN_DDL`, the fresh-build DDL this
-        // repair batch claims to mirror byte-for-byte). A real single-writer
-        // guard, not just a name check: the second `is_active=1` write below
-        // must be rejected at the DB level.
+        // drifted from the repair batch's own frozen copy, the fresh-build
+        // DDL this repair batch claims to mirror byte-for-byte). A real
+        // single-writer guard, not just a name check: the second
+        // `is_active=1` write below must be rejected at the DB level.
         let index_exists: i64 = repaired
             .raw()
             .query_row_map(
@@ -25475,7 +25612,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             index_exists, 1,
-            "the repair batch must recreate idx_embedding_generations_single_active, not just the three tables"
+            "the repair batch must recreate idx_embedding_generations_single_active, not just the tables"
         );
 
         repaired
@@ -25485,7 +25622,7 @@ mod tests {
         let gen_b = repaired
             .raw()
             .with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
-                crate::storage::schema::create_embedding_generation(tx, "bge-m3-v2", 1024, 1, 2_000)
+                crate::storage::schema::create_embedding_generation(tx, "bge-m3-v2", 1024, 1, 1, b"test-fingerprint-2", 2_000)
             })
             .unwrap();
         let second_active_result = repaired
@@ -25535,12 +25672,12 @@ mod tests {
             let table_count: i64 = conn
                 .query_row_map(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' \
-                     AND name IN ('embedding_generations', 'message_embeddings', 'embedding_holes')",
+                     AND name IN ('embedding_generations', 'message_chunks', 'chunk_holes', 'chunk_staging')",
                     &[],
                     |row| row.get_typed(0),
                 )
                 .unwrap();
-            assert_eq!(table_count, 3, "sanity: all three vector-domain tables must survive untouched");
+            assert_eq!(table_count, 4, "sanity: all four vector-domain tables must survive untouched");
         }
 
         let repaired = FrankenStorage::open(&db_path).unwrap();
@@ -25562,7 +25699,7 @@ mod tests {
         let gen_a = repaired
             .raw()
             .with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
-                crate::storage::schema::create_embedding_generation(tx, "bge-m3", 1024, 1, 1_000)
+                crate::storage::schema::create_embedding_generation(tx, "bge-m3", 1024, 1, 1, b"test-fingerprint-3", 1_000)
             })
             .unwrap();
         repaired
@@ -25572,7 +25709,7 @@ mod tests {
         let gen_b = repaired
             .raw()
             .with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
-                crate::storage::schema::create_embedding_generation(tx, "bge-m3-v2", 1024, 1, 2_000)
+                crate::storage::schema::create_embedding_generation(tx, "bge-m3-v2", 1024, 1, 1, b"test-fingerprint-4", 2_000)
             })
             .unwrap();
         let second_active_result = repaired
@@ -28038,164 +28175,292 @@ mod e5_replace_tests {
         );
     }
 
-    // =====================================================================
-    // w3-3 Step 3/4 (R2-W3-B4/R4-B5, spec 门③): replace 事务的向量域失效接线
-    // + 回滚原子性（w3-d9②）。复用本模块既有的 seed_original/replacement/
-    // open_storage 夹具——replace 生产侧目前唯一的真实调用面就是这个模块自己
-    // 的测试（w3-3 Step3 写入口清单已核实：B类零生产调用点，advisor 裁定失效
-    // 仍须接在原语内部）。
-    // =====================================================================
+    // ---------------------------------------------------------------------
+    // T6 (plan v5.1) judgments (b)/(c): need `pub(crate)` access to
+    // `franken_replace_conversation_messages_in_tx`/`delete_messages_
+    // ordered_in_tx` directly, so they live here (inline, same module as
+    // every other replace-lifecycle test above) rather than in the
+    // external `tests/w4_lifecycle_zero_orphans.rs` file -- the same
+    // file-layout deviation already established for T5, documented in the
+    // T6 terminal report.
+    // ---------------------------------------------------------------------
 
-    fn active_generation_audit_status(storage: &FrankenStorage) -> String {
+    /// Judgment (b), per control-plane ruling: plan T6's "update (content/
+    /// role change on a replace-path message)" has no real same-id
+    /// in-place-UPDATE call site in production code -- a replace always
+    /// deletes the old message ids wholesale and inserts brand new ones.
+    /// So "update" is proven here as the *composition* of delete (old id's
+    /// chunk/vec0/staging/lex_docs must not survive) + insert (new id's
+    /// chunk_holes must equal `expected_chunks`), driven through the real
+    /// replace path in one call, not a separate third primitive.
+    #[test]
+    fn lifecycle_replace_path_moves_chunk_lifecycle_to_new_ids_and_orphans_none() {
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open_storage(&dir);
+        let conv_id = seed_original(&storage, agent_id, "lifecycle-update-conv");
+        let old_rows = message_rows(&storage, conv_id);
+        assert_eq!(old_rows.len(), 3);
+        let old_message_id = old_rows[0].0;
+
+        let generation_id = storage
+            .raw()
+            .with_tx_no_replay(TxMode::Immediate, |tx| {
+                crate::storage::schema::create_embedding_generation(
+                    tx,
+                    "lifecycle-update-embedder",
+                    8,
+                    1,
+                    1,
+                    b"fingerprint-bytes",
+                    1_000,
+                )
+            })
+            .unwrap();
+
+        // Seed an embedded chunk (+ vec0 row) AND a staging row for the old
+        // message, to prove both get cleaned up by the replace path.
         storage
             .raw()
-            .query_row_map(
-                "SELECT audit_status FROM embedding_generations WHERE is_active = 1",
-                fparams![],
-                |row| row.get_typed(0),
-            )
-            .unwrap()
-    }
-
-    fn embedding_row_count(storage: &FrankenStorage, generation_id: i64) -> i64 {
+            .with_tx_no_replay(TxMode::Immediate, |tx| {
+                crate::storage::schema::insert_chunk_row_in_tx(
+                    tx,
+                    &crate::storage::schema::ChunkRow {
+                        generation_id,
+                        message_id: old_message_id,
+                        conversation_id: conv_id,
+                        chunk_idx: 0,
+                        byte_start: 0,
+                        byte_end: 5,
+                        content_hash: "old-hash".into(),
+                        embedding: vec![0.1f32; 8],
+                        norm: 1.0,
+                        created_at_ms: 1_000,
+                    },
+                )
+            })
+            .unwrap();
+        crate::storage::vector_domain::rebuild_vec0_table_for_generation(storage.raw(), generation_id, 8).unwrap();
+        let vec0_before: i64 = storage
+            .raw()
+            .query_row_map(&format!("SELECT COUNT(*) FROM vec_index_gen_{generation_id}"), fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(vec0_before, 1, "sanity: old chunk's vec0 row exists before replace");
         storage
             .raw()
-            .query_row_map(
-                "SELECT COUNT(*) FROM message_embeddings WHERE generation_id = ?1",
-                fparams![generation_id],
-                |row| row.get_typed(0),
-            )
-            .unwrap()
-    }
-
-    fn hole_doc_ids(storage: &FrankenStorage, generation_id: i64) -> Vec<i64> {
-        let mut ids: Vec<i64> = storage
-            .raw()
-            .query_all_map(
-                "SELECT doc_id FROM embedding_holes WHERE generation_id = ?1",
-                fparams![generation_id],
-                |row| row.get_typed(0),
-            )
+            .with_tx_no_replay(TxMode::Immediate, |tx| {
+                crate::storage::schema::stage_chunk_rows_in_tx(
+                    tx,
+                    99,
+                    &[crate::storage::schema::ChunkRow {
+                        generation_id,
+                        message_id: old_message_id,
+                        conversation_id: conv_id,
+                        chunk_idx: 1,
+                        byte_start: 5,
+                        byte_end: 10,
+                        content_hash: "old-hash-2".into(),
+                        embedding: vec![0.2f32; 8],
+                        norm: 1.0,
+                        created_at_ms: 1_000,
+                    }],
+                )
+            })
             .unwrap();
-        ids.sort_unstable();
-        ids
-    }
 
-    /// Creates an active, `audit_status = 'passed'` generation (dim=4) and
-    /// seeds one embedding row per message currently in `conv_id`, so the
-    /// replace below has real "old嵌入" to clear, not an empty domain.
-    fn seed_active_passed_generation_with_embeddings_for(storage: &FrankenStorage, conv_id: i64) -> i64 {
-        let message_ids: Vec<i64> = storage
-            .raw()
-            .query_all_map(
-                "SELECT id FROM messages WHERE conversation_id = ?1 ORDER BY idx",
-                fparams![conv_id],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
+        let new_conv = replacement("lifecycle-update-conv");
+        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
         let tx = storage.raw().transaction().unwrap();
-        let gen_id = crate::storage::schema::create_embedding_generation(&tx, "bge-m3", 4, 1, TS).unwrap();
-        for message_id in &message_ids {
-            crate::storage::schema::insert_message_embedding(
-                &tx,
-                gen_id,
-                *message_id,
-                conv_id,
-                &[1.0, 0.0, 0.0, 0.0],
-                &format!("seed-hash-{message_id}"),
-                None,
-                TS,
+        let outcome =
+            franken_replace_conversation_messages_in_tx(&tx, conv_id, agent_id, None, &new_conv, &pricing).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(outcome.inserted_message_ids.len(), 2, "sanity: replace inserted 2 new messages");
+
+        let vec0_after: i64 = storage
+            .raw()
+            .query_row_map(&format!("SELECT COUNT(*) FROM vec_index_gen_{generation_id}"), fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(vec0_after, 0, "old chunk's vec0 row must not survive the replace");
+        let old_chunks: i64 = storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM message_chunks WHERE message_id = ?1", fparams![old_message_id], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(old_chunks, 0, "old message's message_chunks row must not survive the replace");
+        let old_staging: i64 = storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM chunk_staging WHERE message_id = ?1", fparams![old_message_id], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(old_staging, 0, "old message's chunk_staging row must not survive the replace");
+
+        let new_holes: Vec<(i64, u32)> = storage
+            .raw()
+            .query_all_map(
+                "SELECT message_id, chunk_idx FROM chunk_holes WHERE generation_id = ?1 ORDER BY message_id, chunk_idx",
+                fparams![generation_id],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
             )
             .unwrap();
+        let new_msgs = [("user", "新消息 0"), ("agent", "新消息 1")];
+        let mut expected: Vec<(i64, u32)> = Vec::new();
+        for (&new_id, (role, content)) in outcome.inserted_message_ids.iter().zip(new_msgs.iter()) {
+            for c in crate::search::eligibility::expected_chunks(new_id, conv_id, role, content) {
+                expected.push((c.message_id, c.chunk_idx));
+            }
         }
-        tx.execute(
-            "UPDATE embedding_generations SET is_active = 1, audit_status = 'passed' WHERE id = ?1",
-            fparams![gen_id],
-        )
-        .unwrap();
-        tx.commit().unwrap();
-        gen_id
+        expected.sort_unstable();
+        assert_eq!(new_holes, expected, "new message ids' chunk_holes must equal expected_chunks exactly");
     }
 
+    /// Judgment (c): deleting a single message (not a whole conversation)
+    /// via `delete_messages_ordered_in_tx` directly must leave zero orphans
+    /// for that message across chunks/holes/staging/lex_docs and vec0
+    /// (active + pending + a stale generation, three live `vec0` tables),
+    /// while a sibling message in the same conversation is left completely
+    /// untouched.
     #[test]
-    #[serial]
-    fn w3_3_replace_clears_old_embeddings_registers_holes_and_demotes_readiness_in_the_same_transaction() {
+    fn lifecycle_delete_single_message_leaves_zero_orphans_across_all_generations() {
         let dir = TempDir::new().unwrap();
         let (storage, agent_id) = open_storage(&dir);
-        let conv_id = seed_original(&storage, agent_id, "w3-3-replace-lifecycle");
-        let gen_id = seed_active_passed_generation_with_embeddings_for(&storage, conv_id);
-        assert_eq!(embedding_row_count(&storage, gen_id), 3, "前置：三条旧消息各自有一行旧嵌入");
-        assert_eq!(active_generation_audit_status(&storage), "passed", "前置：代际起始为 passed");
+        let conv_id = seed_original(&storage, agent_id, "lifecycle-single-delete-conv");
+        let rows = message_rows(&storage, conv_id);
+        assert_eq!(rows.len(), 3);
+        let target_id = rows[1].0;
+        let sibling_id = rows[0].0;
 
-        let new_conv = replacement("w3-3-replace-lifecycle");
-        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+        let mut generation_ids = Vec::new();
+        for (label, mark_active, mark_stale) in [("active", true, false), ("pending", false, false), ("stale", false, true)] {
+            let generation_id = storage
+                .raw()
+                .with_tx_no_replay(TxMode::Immediate, |tx| {
+                    crate::storage::schema::create_embedding_generation(
+                        tx,
+                        &format!("lifecycle-single-delete-{label}"),
+                        8,
+                        1,
+                        1,
+                        b"fingerprint-bytes",
+                        1_000,
+                    )
+                })
+                .unwrap();
+            if mark_active {
+                storage
+                    .raw()
+                    .execute(
+                        "UPDATE embedding_generations SET is_active = 1, audit_status = 'passed' WHERE id = ?1",
+                        fparams![generation_id],
+                    )
+                    .unwrap();
+            } else if mark_stale {
+                storage
+                    .raw()
+                    .execute(
+                        "UPDATE embedding_generations SET is_active = 0, audit_status = 'passed' WHERE id = ?1",
+                        fparams![generation_id],
+                    )
+                    .unwrap();
+            }
+            for (message_id, byte_start) in [(target_id, 0usize), (sibling_id, 100usize)] {
+                storage
+                    .raw()
+                    .with_tx_no_replay(TxMode::Immediate, |tx| {
+                        crate::storage::schema::insert_chunk_row_in_tx(
+                            tx,
+                            &crate::storage::schema::ChunkRow {
+                                generation_id,
+                                message_id,
+                                conversation_id: conv_id,
+                                chunk_idx: 0,
+                                byte_start,
+                                byte_end: byte_start + 5,
+                                content_hash: format!("hash-{message_id}"),
+                                embedding: vec![0.1f32; 8],
+                                norm: 1.0,
+                                created_at_ms: 1_000,
+                            },
+                        )
+                    })
+                    .unwrap();
+            }
+            crate::storage::vector_domain::rebuild_vec0_table_for_generation(storage.raw(), generation_id, 8).unwrap();
+            let vec0_before: i64 = storage
+                .raw()
+                .query_row_map(&format!("SELECT COUNT(*) FROM vec_index_gen_{generation_id}"), fparams![], |row| {
+                    row.get_typed(0)
+                })
+                .unwrap();
+            assert_eq!(vec0_before, 2, "sanity: both target and sibling chunks seeded into vec0 for generation {generation_id}");
+            generation_ids.push(generation_id);
+        }
+
         let tx = storage.raw().transaction().unwrap();
-        let outcome =
-            franken_replace_conversation_messages_in_tx(&tx, conv_id, agent_id, None, &new_conv, &pricing).unwrap();
+        let outcome = delete_messages_ordered_in_tx(&tx, &[target_id]).unwrap();
         tx.commit().unwrap();
+        assert_eq!(outcome.messages, 1, "exactly the target message must be deleted");
 
-        assert_eq!(outcome.deleted_message_count, 3, "sanity: replace 删掉了三条旧消息");
-        assert_eq!(outcome.inserted_message_ids.len(), 2, "sanity: replace 插入了两条新消息");
-
-        // 旧嵌入清除：CASCADE 应把三条旧行全部带走，代际里现在应该零行
-        // （新消息还没真实嵌入，只应该有洞账，不应该有嵌入行）。
-        assert_eq!(embedding_row_count(&storage, gen_id), 0, "旧嵌入必须被同事务清除（CASCADE）");
-
-        // 洞账：精确等于两条新消息的 id 集合，不多不少。
-        let mut expected_holes = outcome.inserted_message_ids.clone();
-        expected_holes.sort_unstable();
-        assert_eq!(
-            hole_doc_ids(&storage, gen_id),
-            expected_holes,
-            "洞账必须精确等于本次 replace 新插入的消息 id 集合"
-        );
-
-        // 代际就绪失效：曾经 passed 的代际必须被打回 pending。
-        assert_eq!(active_generation_audit_status(&storage), "pending", "代际就绪必须在同事务内失效");
-    }
-
-    /// w3-d9②：关系事务在失效语句之后回滚，断言 embedding 行/ready 标志/
-    /// 洞账三者全部恢复原态——不是"回滚了大部分"，是恰好一行都不多不少。
-    #[test]
-    #[serial]
-    fn w3_3_replace_rollback_restores_embeddings_ready_flag_and_holes_to_their_original_state() {
-        let dir = TempDir::new().unwrap();
-        let (storage, agent_id) = open_storage(&dir);
-        let conv_id = seed_original(&storage, agent_id, "w3-3-replace-rollback");
-        let gen_id = seed_active_passed_generation_with_embeddings_for(&storage, conv_id);
-        assert_eq!(embedding_row_count(&storage, gen_id), 3);
-        assert!(hole_doc_ids(&storage, gen_id).is_empty(), "前置：起始无洞账");
-        assert_eq!(active_generation_audit_status(&storage), "passed");
-
-        let new_conv = replacement("w3-3-replace-rollback");
-        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
-        let tx = storage.raw().transaction().unwrap();
-        let outcome =
-            franken_replace_conversation_messages_in_tx(&tx, conv_id, agent_id, None, &new_conv, &pricing).unwrap();
-        // 同一事务内可见：证明失效语句确实跑过，不是下面的断言在验证一个空转的 no-op。
-        let in_tx_holes: i64 = tx
-            .query_row_map(
-                "SELECT COUNT(*) FROM embedding_holes WHERE generation_id = ?1",
-                fparams![gen_id],
-                |row| row.get_typed(0),
-            )
+        for generation_id in &generation_ids {
+            let vec0_after: i64 = storage
+                .raw()
+                .query_row_map(&format!("SELECT COUNT(*) FROM vec_index_gen_{generation_id}"), fparams![], |row| {
+                    row.get_typed(0)
+                })
+                .unwrap();
+            assert_eq!(vec0_after, 1, "only the sibling's vec0 row must survive for generation {generation_id}");
+        }
+        let target_chunks: i64 = storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM message_chunks WHERE message_id = ?1", fparams![target_id], |row| {
+                row.get_typed(0)
+            })
             .unwrap();
-        assert_eq!(in_tx_holes, outcome.inserted_message_ids.len() as i64, "事务内应看得到新登记的洞账");
-        let in_tx_embeddings: i64 = tx
-            .query_row_map(
-                "SELECT COUNT(*) FROM message_embeddings WHERE generation_id = ?1",
-                fparams![gen_id],
-                |row| row.get_typed(0),
-            )
+        assert_eq!(target_chunks, 0);
+        let target_holes: i64 = storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM chunk_holes WHERE message_id = ?1", fparams![target_id], |row| {
+                row.get_typed(0)
+            })
             .unwrap();
-        assert_eq!(in_tx_embeddings, 0, "事务内旧嵌入应已被清空");
+        assert_eq!(target_holes, 0);
+        let target_staging: i64 = storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM chunk_staging WHERE message_id = ?1", fparams![target_id], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(target_staging, 0);
+        let target_lex: i64 = storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM lex_docs WHERE doc_id = ?1", fparams![target_id], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(target_lex, 0, "target's lex_docs row must be gone");
 
-        // 模拟"失效语句之后崩溃"：不 commit，直接回滚。
-        tx.rollback().unwrap();
+        let sibling_chunks: i64 = storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM message_chunks WHERE message_id = ?1", fparams![sibling_id], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(sibling_chunks, 3, "sibling's message_chunks rows (one per generation) must survive untouched");
+        let sibling_lex: i64 = storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM lex_docs WHERE doc_id = ?1", fparams![sibling_id], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(sibling_lex, 1, "sibling's lex_docs row must survive untouched");
 
-        // 三者必须**全部**恢复原态，不是部分恢复。
-        assert_eq!(embedding_row_count(&storage, gen_id), 3, "回滚后旧嵌入必须原样恢复");
-        assert!(hole_doc_ids(&storage, gen_id).is_empty(), "回滚后洞账必须恢复成空（新登记的两条必须消失）");
-        assert_eq!(active_generation_audit_status(&storage), "passed", "回滚后代际就绪状态必须恢复成 passed");
+        storage
+            .raw()
+            .execute("INSERT INTO fts_lex(fts_lex, rank) VALUES('integrity-check', 1)", fparams![])
+            .expect("fts_lex integrity-check must pass (no dangling/corrupt shadow rows)");
     }
 }

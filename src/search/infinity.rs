@@ -23,7 +23,8 @@ use serde::Deserialize;
 
 use crate::search::daemon_client::{DaemonClient, DaemonError};
 use crate::search::embedder::{Embedder, EmbedderError, EmbedderResult};
-use crate::search::frankensearch_types::ModelCategory;
+use crate::search::frankensearch_types::{ModelCategory, cosine_similarity};
+use crate::storage::schema::{f32_vector_to_le_blob, le_blob_to_f32_vector};
 
 /// bge-m3 embedding dimension.
 const DIMENSION: usize = 1024;
@@ -41,6 +42,11 @@ pub struct InfinityConfig {
     pub rerank_model: String,
     pub timeout: Duration,
     pub max_batch: usize,
+    /// Expected embedding dimension the served model must report — an
+    /// internal constant ([`DIMENSION`]), not an env override (T7: PR4
+    /// generation-identity discipline requires this be the same fixed
+    /// value everywhere, not independently configurable).
+    pub expected_dim: usize,
 }
 
 impl InfinityConfig {
@@ -59,6 +65,7 @@ impl InfinityConfig {
                 .unwrap_or_else(|| "BAAI/bge-reranker-v2-m3".into()),
             timeout: Duration::from_secs(60),
             max_batch: MAX_BATCH,
+            expected_dim: DIMENSION,
         }
     }
 }
@@ -122,22 +129,60 @@ fn http_embed(
     let parsed: EmbeddingsResponse = resp
         .json()
         .map_err(|e| format!("embeddings decode failed: {e}"))?;
-    if parsed.data.len() != inputs.len() {
+
+    // Protocol validation (T7): `data[].index` must be exactly a
+    // permutation of 0..N-1 (N = inputs.len()) before any vector is
+    // trusted -- catches a missing, duplicated, or out-of-range index.
+    // One pass over the response marks each index seen (immediate Err on
+    // out-of-range or duplicate); a trailing pass over `seen` catches
+    // anything never marked (e.g. a response shorter than N). No vectors
+    // are returned on any violation.
+    // Protocol validation (T7): `data[].index` must be exactly a
+    // permutation of 0..N-1 (N = inputs.len()) before any vector is
+    // trusted -- catches a missing, duplicated, or out-of-range index.
+    // One pass over the response marks each index seen (immediate Err on
+    // out-of-range or duplicate); a trailing pass over `seen` catches
+    // anything never marked (e.g. a response shorter than N). No vectors
+    // are returned on any violation.
+    let n = inputs.len();
+    let mut seen = vec![false; n];
+    for item in &parsed.data {
+        if item.index >= n {
+            return Err(format!(
+                "embed_protocol_violation: index {} out of range for {n} inputs",
+                item.index
+            ));
+        }
+        if seen[item.index] {
+            return Err(format!(
+                "embed_protocol_violation: duplicate index {}",
+                item.index
+            ));
+        }
+        seen[item.index] = true;
+    }
+    if let Some(missing) = seen.iter().position(|&s| !s) {
         return Err(format!(
-            "embeddings count mismatch: expected {}, got {}",
-            inputs.len(),
-            parsed.data.len()
+            "embed_protocol_violation: missing index {missing} (expected permutation of 0..{n})"
         ));
     }
+
     // Sort by index so output aligns with input order regardless of server order.
     let mut items = parsed.data;
     items.sort_by_key(|i| i.index);
     let mut out = Vec::with_capacity(items.len());
-    for (pos, item) in items.into_iter().enumerate() {
+    for item in items {
         if item.embedding.len() != expected_dim {
             return Err(format!(
-                "embedding dim mismatch at {pos}: expected {expected_dim}, got {}",
+                "embed_protocol_violation: dimension mismatch at index {}: expected {expected_dim}, got {}",
+                item.index,
                 item.embedding.len()
+            ));
+        }
+        if item.embedding.iter().any(|x| !x.is_finite()) {
+            return Err(format!(
+                "embed_protocol_violation: non-finite component at index {}",
+                item.index
             ));
         }
         out.push(item.embedding);
@@ -304,8 +349,98 @@ pub fn probe_served_embed_identity(
     if dimension == 0 {
         return Err("infinity identity-probe returned a zero-length embedding".to_string());
     }
+    // T7: the served dimension must match the fixed expected dimension --
+    // a same-prefix "embed_protocol_violation:" Err, per the same
+    // "identity from the actual service, not a literal" discipline this
+    // function's doc comment already commits to (closes the last gap: a
+    // served model with the right id/capability but a drifted dimension).
+    // T7: the served dimension must match the fixed expected dimension --
+    // a same-prefix "embed_protocol_violation:" Err, per the same
+    // "identity from the actual service, not a literal" discipline this
+    // function's doc comment already commits to (closes the last gap: a
+    // served model with the right id/capability but a drifted dimension).
+    if dimension != config.expected_dim {
+        return Err(format!(
+            "embed_protocol_violation: dimension mismatch -- infinity model {model_id:?} reports \
+             dimension {dimension}, expected {} (InfinityConfig::expected_dim)",
+            config.expected_dim
+        ));
+    }
 
     Ok(InfinityServedIdentity { model_id, dimension })
+}
+
+// ---- generation fingerprint (T7, d3-adjacent: "代际身份") -------------------
+
+/// Three fixed sentinel sentences (English / Chinese / code) whose embeddings
+/// form a generation's fingerprint. Frozen wording per plan v5.1 参数冻结
+/// "代际身份" row -- changing any sentence changes what every stored
+/// fingerprint means, so this is not meant to ever be edited casually.
+pub const FINGERPRINT_SENTINELS: [&str; 3] = [
+    "The quick brown fox jumps over the lazy dog.",
+    "今天天气不错，我们去公园散步吧。",
+    "fn main() { println!(\"hello\"); }",
+];
+
+/// Embeds [`FINGERPRINT_SENTINELS`] against the currently served model and
+/// concatenates the three vectors (LE f32 bytes, reusing the same codec the
+/// vector domain already uses) into one fingerprint blob. Talks to the live
+/// service every time -- never cached/assumed -- for the same "identity from
+/// the actual service" discipline as [`probe_served_embed_identity`].
+pub fn compute_generation_fingerprint(config: &InfinityConfig) -> Result<Vec<u8>, String> {
+    let client = build_client(config.timeout)?;
+    let inputs: Vec<&str> = FINGERPRINT_SENTINELS.to_vec();
+    let vectors = http_embed(
+        &client,
+        &config.base_url,
+        &config.embed_model,
+        &inputs,
+        config.expected_dim,
+    )?;
+    let mut out = Vec::with_capacity(vectors.len() * config.expected_dim * 4);
+    for v in &vectors {
+        out.extend_from_slice(&f32_vector_to_le_blob(v));
+    }
+    Ok(out)
+}
+
+/// Whether a `stored` fingerprint still matches a `fresh` one for a served
+/// model of dimension `dim`: both must be exactly `3 * dim * 4` bytes long
+/// (3 sentinels, LE f32), and each of the 3 corresponding sentinel vectors
+/// must cosine-match at `>= 0.9999` (plan v5.1 参数冻结: "逐条 cosine ≥
+/// 0.9999"). A length mismatch or a malformed blob (not decodable as f32s)
+/// is treated as a non-match, not a panic.
+pub fn fingerprint_matches(stored: &[u8], fresh: &[u8], dim: usize) -> bool {
+    let expected_len = 3 * dim * 4;
+    if stored.len() != expected_len || fresh.len() != expected_len {
+        return false;
+    }
+    let segment = dim * 4;
+    for i in 0..3 {
+        let s = &stored[i * segment..(i + 1) * segment];
+        let f = &fresh[i * segment..(i + 1) * segment];
+        let Ok(sv) = le_blob_to_f32_vector(s) else {
+            return false;
+        };
+        let Ok(fv) = le_blob_to_f32_vector(f) else {
+            return false;
+        };
+        if cosine_similarity(&sv, &fv) < 0.9999 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Convenience wrapper: probe the served identity and compute its
+/// generation fingerprint in one call (callers creating a new
+/// `embedding_generations` row need both).
+pub fn probe_identity_and_fingerprint(
+    config: &InfinityConfig,
+) -> Result<(InfinityServedIdentity, Vec<u8>), String> {
+    let identity = probe_served_embed_identity(config)?;
+    let fingerprint = compute_generation_fingerprint(config)?;
+    Ok((identity, fingerprint))
 }
 
 // ---- pure helpers -----------------------------------------------------------
@@ -578,11 +713,11 @@ mod tests {
         }
     }
 
-    fn start_mock_infinity_server(
-        models_json: &'static str,
-        expected_embed_model: &'static str,
-        embed_dim: usize,
-    ) -> MockInfinityServer {
+    /// Shared accept-loop: binds an ephemeral port, spawns a thread that
+    /// dispatches each accepted connection to `handler`, and returns the
+    /// same `MockInfinityServer` handle (base URL + graceful stop-on-drop)
+    /// regardless of which canned-response `handler` is plugged in.
+    fn start_mock_server_with(handler: impl Fn(TcpStream) + Send + 'static) -> MockInfinityServer {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock infinity server");
         listener
             .set_nonblocking(true)
@@ -595,9 +730,7 @@ mod tests {
         let handle = thread::spawn(move || {
             while !stop_flag.load(Ordering::SeqCst) {
                 match listener.accept() {
-                    Ok((stream, _)) => {
-                        handle_mock_infinity_request(stream, models_json, expected_embed_model, embed_dim);
-                    }
+                    Ok((stream, _)) => handler(stream),
                     Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5));
                     }
@@ -613,30 +746,47 @@ mod tests {
         }
     }
 
+    fn start_mock_infinity_server(
+        models_json: &'static str,
+        expected_embed_model: &'static str,
+        embed_dim: usize,
+    ) -> MockInfinityServer {
+        start_mock_server_with(move |stream| {
+            handle_mock_infinity_request(stream, models_json, expected_embed_model, embed_dim)
+        })
+    }
+
+    /// T7: minimal mock that answers *any* `POST /embeddings` with a fixed
+    /// canned JSON body, for exercising `http_embed`'s response-protocol
+    /// validation (permutation / dimension / finiteness) with deliberately
+    /// malformed bodies -- the `/models`-aware [`start_mock_infinity_server`]
+    /// above only ever returns one well-formed single-item response, which
+    /// isn't flexible enough for that.
+    fn start_canned_embeddings_server(canned_body: &'static str) -> MockInfinityServer {
+        start_mock_server_with(move |stream| handle_canned_embeddings_request(stream, canned_body))
+    }
+
     fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         haystack.windows(needle.len()).position(|w| w == needle)
     }
 
-    fn handle_mock_infinity_request(
-        mut stream: TcpStream,
-        models_json: &str,
-        expected_embed_model: &str,
-        embed_dim: usize,
-    ) {
+    /// Reads one HTTP/1.1 request (headers + full body) off `stream`,
+    /// returning `(method, path, body)`. Shared by both mock handlers below.
+    fn read_http_request(stream: &mut TcpStream) -> Option<(String, String, Vec<u8>)> {
         let mut buf = Vec::new();
         let mut chunk = [0_u8; 4096];
         let header_end = loop {
             let n = match stream.read(&mut chunk) {
-                Ok(0) => return,
+                Ok(0) => return None,
                 Ok(n) => n,
-                Err(_) => return,
+                Err(_) => return None,
             };
             buf.extend_from_slice(&chunk[..n]);
             if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
                 break pos + 4;
             }
             if buf.len() > 65536 {
-                return;
+                return None;
             }
         };
         let header_str = String::from_utf8_lossy(&buf[..header_end]).to_string();
@@ -662,7 +812,37 @@ mod tests {
                 Err(_) => break,
             }
         }
-        let body = &buf[header_end..buf.len().min(header_end + content_length)];
+        let body = buf[header_end..buf.len().min(header_end + content_length)].to_vec();
+        Some((method, path, body))
+    }
+
+    fn handle_canned_embeddings_request(mut stream: TcpStream, canned_body: &str) {
+        let Some((method, path, _body)) = read_http_request(&mut stream) else {
+            return;
+        };
+        let response = if method == "POST" && path == "/embeddings" {
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                canned_body.len(),
+                canned_body
+            )
+        } else {
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+        };
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+    }
+
+    fn handle_mock_infinity_request(
+        mut stream: TcpStream,
+        models_json: &str,
+        expected_embed_model: &str,
+        embed_dim: usize,
+    ) {
+        let Some((method, path, body)) = read_http_request(&mut stream) else {
+            return;
+        };
+        let body = &body[..];
 
         let response = if method == "GET" && path == "/models" {
             format!(
@@ -716,6 +896,7 @@ mod tests {
             rerank_model: "unused".to_string(),
             timeout: Duration::from_secs(5),
             max_batch: MAX_BATCH,
+            expected_dim: 4, // matches this mock server's embed_dim
         };
         let identity =
             probe_served_embed_identity(&config).expect("probe must select the env-configured model, not the first listed one");
@@ -739,6 +920,7 @@ mod tests {
             rerank_model: "unused".to_string(),
             timeout: Duration::from_secs(5),
             max_batch: MAX_BATCH,
+            expected_dim: 4, // never reached: probe errors on "not served" first
         };
         let err = probe_served_embed_identity(&config)
             .expect_err("a configured model absent from /models must error, not fall back to a substitute");
@@ -755,6 +937,7 @@ mod tests {
         assert_eq!(def.embed_model, "BAAI/bge-m3");
         assert_eq!(def.rerank_model, "BAAI/bge-reranker-v2-m3");
         assert_eq!(def.max_batch, 64);
+        assert_eq!(def.expected_dim, DIMENSION);
         let ovr = InfinityConfig::from_env_with(|k| match k {
             "CASS_INFINITY_URL" => Some("http://x:9/".into()),
             _ => None,
@@ -795,5 +978,184 @@ mod tests {
         });
         assert!(e.is_err());
         assert_eq!(a2.load(Ordering::SeqCst), 1);
+    }
+
+    // ---- T7: http_embed response-protocol validation -----------------------
+
+    #[test]
+    fn http_embed_rejects_missing_index() {
+        let server = start_canned_embeddings_server(
+            r#"{"data":[{"embedding":[1.0,2.0],"index":0},{"embedding":[3.0,4.0],"index":1}]}"#,
+        );
+        let client = build_client(Duration::from_secs(5)).unwrap();
+        let err = http_embed(&client, &server.base_url, "any-model", &["a", "b", "c"], 2)
+            .expect_err("a response with only 2 of 3 expected indices must be rejected");
+        assert!(
+            err.starts_with("embed_protocol_violation:"),
+            "error must carry the embed_protocol_violation: prefix: {err}"
+        );
+        assert!(err.contains("missing"), "error must say what's wrong: {err}");
+    }
+
+    #[test]
+    fn http_embed_rejects_duplicate_index() {
+        let server = start_canned_embeddings_server(
+            r#"{"data":[{"embedding":[1.0],"index":0},{"embedding":[2.0],"index":0}]}"#,
+        );
+        let client = build_client(Duration::from_secs(5)).unwrap();
+        let err = http_embed(&client, &server.base_url, "any-model", &["a", "b"], 1)
+            .expect_err("a response with a repeated index must be rejected");
+        assert!(err.starts_with("embed_protocol_violation:"), "{err}");
+        assert!(err.contains("duplicate"), "{err}");
+    }
+
+    #[test]
+    fn http_embed_rejects_out_of_range_index() {
+        let server = start_canned_embeddings_server(
+            r#"{"data":[{"embedding":[1.0],"index":0},{"embedding":[2.0],"index":5}]}"#,
+        );
+        let client = build_client(Duration::from_secs(5)).unwrap();
+        let err = http_embed(&client, &server.base_url, "any-model", &["a", "b"], 1)
+            .expect_err("a response with an index >= N must be rejected");
+        assert!(err.starts_with("embed_protocol_violation:"), "{err}");
+        assert!(err.contains("out of range"), "{err}");
+    }
+
+    #[test]
+    fn http_embed_rejects_non_finite_component() {
+        // 1e39 is a finite, in-range f64 JSON literal that saturates to
+        // f32::INFINITY on the `f64 -> f32` narrowing cast serde performs
+        // when decoding into the `Vec<f32>` field -- a deterministic way to
+        // get a non-finite component over the wire without relying on the
+        // JSON parser's own handling of out-of-f64-range exponents.
+        let server =
+            start_canned_embeddings_server(r#"{"data":[{"embedding":[1.0,1e39],"index":0}]}"#);
+        let client = build_client(Duration::from_secs(5)).unwrap();
+        let err = http_embed(&client, &server.base_url, "any-model", &["a"], 2)
+            .expect_err("an embedding component that overflows to infinity must be rejected");
+        assert!(err.starts_with("embed_protocol_violation:"), "{err}");
+        assert!(err.contains("non-finite"), "{err}");
+    }
+
+    #[test]
+    fn http_embed_rejects_wrong_dimension() {
+        let server =
+            start_canned_embeddings_server(r#"{"data":[{"embedding":[1.0,2.0,3.0],"index":0}]}"#);
+        let client = build_client(Duration::from_secs(5)).unwrap();
+        let err = http_embed(&client, &server.base_url, "any-model", &["a"], 4)
+            .expect_err("an embedding whose length doesn't match expected_dim must be rejected");
+        assert!(err.starts_with("embed_protocol_violation:"), "{err}");
+        assert!(err.contains("dimension"), "{err}");
+    }
+
+    #[test]
+    fn probe_identity_rejects_wrong_dimension() {
+        let server = start_mock_infinity_server(
+            r#"{"data":[{"id":"BAAI/bge-m3","capabilities":["embed"]}]}"#,
+            "BAAI/bge-m3",
+            4,
+        );
+        let config = InfinityConfig {
+            base_url: server.base_url.clone(),
+            embed_model: "BAAI/bge-m3".to_string(),
+            rerank_model: "unused".to_string(),
+            timeout: Duration::from_secs(5),
+            max_batch: MAX_BATCH,
+            expected_dim: 8, // mock always serves dim 4 -- deliberate mismatch
+        };
+        let err = probe_served_embed_identity(&config).expect_err(
+            "a served dimension that doesn't match config.expected_dim must be rejected",
+        );
+        assert!(err.starts_with("embed_protocol_violation:"), "{err}");
+        assert!(err.contains("dimension"), "{err}");
+    }
+
+    // ---- T7: generation fingerprint -----------------------------------------
+
+    #[test]
+    fn fingerprint_matches_rejects_length_mismatch_and_low_cosine() {
+        let dim = 2usize;
+        let identical: Vec<f32> = vec![1.0, 0.0];
+        // Segment 0 deliberately sits at cosine ~0.95: below the real 0.9999
+        // threshold (must reject), but above a mutated 0.9 threshold -- the
+        // fixture that makes the T7 cosine-threshold mutation step flip this
+        // assertion to red.
+        let low_stored: Vec<f32> = vec![1.0, 0.0];
+        let low_fresh: Vec<f32> = vec![0.95, 0.312_249_9];
+        let low_cosine = cosine_similarity(&low_stored, &low_fresh);
+        assert!(
+            (0.9..0.9999).contains(&low_cosine),
+            "fixture cosine {low_cosine} must sit strictly between 0.9 and 0.9999 to be mutation-sensitive"
+        );
+
+        let mut stored = Vec::new();
+        stored.extend_from_slice(&f32_vector_to_le_blob(&low_stored));
+        stored.extend_from_slice(&f32_vector_to_le_blob(&identical));
+        stored.extend_from_slice(&f32_vector_to_le_blob(&identical));
+
+        let mut fresh = Vec::new();
+        fresh.extend_from_slice(&f32_vector_to_le_blob(&low_fresh));
+        fresh.extend_from_slice(&f32_vector_to_le_blob(&identical));
+        fresh.extend_from_slice(&f32_vector_to_le_blob(&identical));
+
+        assert!(
+            !fingerprint_matches(&stored, &fresh, dim),
+            "a below-threshold cosine on any one sentinel must fail the whole fingerprint"
+        );
+
+        // Length mismatch (independent of cosine): truncate `fresh` by a byte.
+        let truncated = &fresh[..fresh.len() - 1];
+        assert!(
+            !fingerprint_matches(&stored, truncated, dim),
+            "a length mismatch must fail before any cosine is even computed"
+        );
+    }
+
+    #[test]
+    fn fingerprint_matches_accepts_identical() {
+        let dim = 3usize;
+        let sentinel_vectors: [Vec<f32>; 3] = [
+            vec![1.0, 2.0, 3.0],
+            vec![-0.5, 4.25, 0.0],
+            vec![7.0, -7.0, 0.001],
+        ];
+        let mut blob = Vec::new();
+        for v in &sentinel_vectors {
+            blob.extend_from_slice(&f32_vector_to_le_blob(v));
+        }
+        assert!(
+            fingerprint_matches(&blob, &blob, dim),
+            "byte-identical fingerprints must match (cosine of a vector with itself is 1.0)"
+        );
+    }
+
+    // ---- T7: live Infinity roundtrip (real service, opt-in) -----------------
+
+    /// Real `127.0.0.1:7997` Infinity roundtrip: two independent
+    /// `compute_generation_fingerprint` calls against the live served model
+    /// must match each other. `#[ignore]`d -- run explicitly with
+    /// `--ignored` against a running local Infinity.
+    #[test]
+    #[ignore]
+    fn fingerprint_live_infinity_roundtrip() {
+        let config = InfinityConfig::from_env();
+        let fp1 =
+            compute_generation_fingerprint(&config).expect("first live fingerprint compute");
+        let fp2 =
+            compute_generation_fingerprint(&config).expect("second live fingerprint compute");
+
+        let dim = config.expected_dim;
+        let segment = dim * 4;
+        for i in 0..3 {
+            let s = le_blob_to_f32_vector(&fp1[i * segment..(i + 1) * segment]).unwrap();
+            let f = le_blob_to_f32_vector(&fp2[i * segment..(i + 1) * segment]).unwrap();
+            let cos = cosine_similarity(&s, &f);
+            eprintln!("fingerprint_live_infinity_roundtrip: sentinel[{i}] cosine = {cos}");
+            assert!(cos >= 0.9999, "sentinel[{i}] cosine {cos} below 0.9999 threshold");
+        }
+        assert!(
+            fingerprint_matches(&fp1, &fp2, dim),
+            "two live fingerprint computes of the same served model must match"
+        );
     }
 }

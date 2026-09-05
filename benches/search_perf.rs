@@ -1,5 +1,5 @@
 use coding_agent_search::default_data_dir;
-use coding_agent_search::search::canonicalize::{MAX_EMBED_CHARS, canonicalize_for_embedding};
+use coding_agent_search::search::canonicalize::canonicalize_for_embedding;
 use coding_agent_search::search::embedder::Embedder;
 use coding_agent_search::search::hash_embedder::HashEmbedder;
 use coding_agent_search::search::pack_planner::{
@@ -129,7 +129,10 @@ This has O(log n) time complexity and O(1) space complexity.
 /// Benchmark canonicalization across input sizes.
 fn bench_canonicalize_scaling(c: &mut Criterion) {
     let mut group = c.benchmark_group("canonicalize_scaling");
-    let sizes = [100usize, 1_000, 10_000, MAX_EMBED_CHARS + 500];
+    // v2 (T1, plan v5.1): canonicalize() no longer truncates at 2000 chars
+    // (removed MAX_EMBED_CHARS), so 2500 is just a plain size point now,
+    // not "just past the old cap".
+    let sizes = [100usize, 1_000, 10_000, 2_500];
 
     for size in sizes {
         let text = make_sized_message(size);
@@ -163,6 +166,10 @@ fn make_bench_hit(id: &str, score: f32) -> SearchHit {
         origin_kind: "local".to_string(),
         origin_host: None,
         conversation_id: None,
+        message_id: None,
+        winning_chunk_idx: None,
+        winning_chunk_span: None,
+        winning_chunk_hash: None,
     }
 }
 

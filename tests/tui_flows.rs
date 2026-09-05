@@ -129,6 +129,10 @@ fn search_hit(
         origin_kind: "local".to_string(),
         origin_host: None,
         conversation_id: Some(42),
+        message_id: None,
+        winning_chunk_idx: None,
+        winning_chunk_span: None,
+        winning_chunk_hash: None,
     }
 }
 

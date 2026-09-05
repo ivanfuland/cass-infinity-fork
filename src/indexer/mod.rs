@@ -53,7 +53,6 @@ use crate::model::conversation_packet::{
     ConversationPacketProvenance, ConversationPacketSinkProjections,
 };
 use crate::search::asset_state::{SearchMaintenanceJobKind, SearchMaintenanceMode};
-use crate::search::canonicalize::is_hard_message_noise;
 #[cfg(test)]
 use crate::search::vector_index::{ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_TOOL, ROLE_USER};
 
@@ -3389,10 +3388,6 @@ fn index_run_lock_heartbeat_interval() -> Duration {
     )
 }
 
-fn lexical_rebuild_noise_role(is_tool_role: bool) -> Option<&'static str> {
-    is_tool_role.then_some("tool")
-}
-
 /// Tool-class classification for the canonical-replay live lexical rebuild
 /// path, on `MessageRole` (post Task 2.1 codec) rather than a raw string.
 ///
@@ -5015,30 +5010,41 @@ fn lex_domain_matching_status(
     }
 }
 
-/// Count the tantivy docs a *healthy* live lexical index should hold for the
-/// current canonical data: one per reachable (live-conversation) message that
-/// the authoritative rebuild sink does NOT drop as hard-noise.
+/// Count the `lex_docs`/`fts_lex` rows a *healthy* live lexical index should
+/// hold for the current canonical data: one per reachable (live-conversation)
+/// message the actual write paths (`rebuild_lex_domain_from_db`,
+/// `sync_lexical_docs_for_messages_in_tx`) do NOT drop as ineligible.
 ///
-/// The lexical sink (`prebuilt_docs`) emits no doc for a hard-noise message —
-/// empty content or a tool-ack (`is_hard_message_noise`) — so the true expected
-/// doc count is `reachable_messages - hard_noise`, never the raw
-/// `COUNT(*) FROM messages`. cass#317: comparing the observed doc count against
-/// the raw message count made any corpus carrying tool-ack traffic look
-/// permanently sparse, firing a full authoritative rebuild on every index/watch
-/// run (the run then preserves `last_scan_ts`, so the same rebuild repeats).
+/// The lexical sink emits no doc for an ineligible message (role not in the
+/// whitelist, or hard-noise content) — so the true expected doc count is
+/// `reachable_messages - ineligible`, never the raw `COUNT(*) FROM messages`.
+/// cass#317: comparing the observed doc count against the raw message count
+/// made any corpus carrying tool-ack traffic look permanently sparse, firing
+/// a full authoritative rebuild on every index/watch run (the run then
+/// preserves `last_scan_ts`, so the same rebuild repeats).
+///
+/// Plan v5.1 T5 fix (probe② regression, discovered against fixture-3751):
+/// this used to classify with its own `is_lexical_rebuild_tool_class_message_
+/// role` + `is_hard_message_noise` composition, a *second*, independently
+/// maintained predicate that had drifted from `crate::search::eligibility::
+/// lexical_eligible` -- the one predicate `rebuild_lex_domain_from_db` and
+/// `sync_lexical_docs_for_messages_in_tx` actually write against since T5.
+/// That drift made every incremental `cass index` run see `observed_tantivy_
+/// docs < expected_lexical_docs` against a database that was already
+/// perfectly in sync, re-triggering this exact cass#317 sparse-repair
+/// false-positive on a *healthy* db every single time (measured: 15.5s of
+/// spurious full-rebuild lock time on an 81k-message fixture, dwarfing any
+/// real incremental work). Delegating to the same `lexical_eligible` the
+/// write paths use is what T5's "词法合格性 = lexical_eligible，三处同函数"
+/// mandate already required -- this was the third site, missed in the
+/// original file-scope read because the log/doc text here still called the
+/// sink "tantivy" from before it was migrated to the SQL lex_docs domain.
 ///
 /// Exactness comes from reusing the sink's own inputs rather than a SQL
-/// approximation that could drift from Rust trim semantics:
-///   - iterate live conversations only, via `fetch_messages_for_lexical_rebuild`
-///     — orphaned `messages` rows (no live conversation) are never indexed by
-///     the sink, so they must not inflate the expectation;
-///   - that fetch already applies the #290 per-conversation content cap
-///     (`truncate_lexical_rebuild_conversation_content`), so a conversation whose
-///     trailing body is cleared to empty is classified as hard-noise exactly as
-///     the sink drops it;
-///   - classify with the same `is_hard_message_noise(lexical_rebuild_noise_role(
-///     is_tool_role), content)` predicate and precise tool-role mapping the sink
-///     uses.
+/// approximation that could drift from Rust trim semantics: iterate live
+/// conversations only, via `fetch_messages_for_conversation` — orphaned
+/// `messages` rows (no live conversation) are never indexed by the sink, so
+/// they must not inflate the expectation.
 ///
 /// Content is read one conversation at a time, so peak memory is bounded to a
 /// single conversation regardless of corpus size. Only called on the
@@ -5055,9 +5061,9 @@ fn expected_live_lexical_doc_count(storage: &FrankenStorage) -> Result<usize> {
         .context("listing conversations for the noise-adjusted lexical doc expectation")?;
     let mut expected_docs = 0usize;
     for conversation_id in conversation_ids {
-        for message in storage.fetch_messages_for_lexical_rebuild(conversation_id)? {
-            let is_tool_role = is_lexical_rebuild_tool_class_message_role(&message.role);
-            if !is_hard_message_noise(lexical_rebuild_noise_role(is_tool_role), &message.content) {
+        for message in storage.fetch_messages_for_conversation(conversation_id)? {
+            let role_str = crate::model::types::role_as_str(&message.role);
+            if crate::search::eligibility::lexical_eligible(role_str, &message.content) {
                 expected_docs += 1;
             }
         }
@@ -6288,7 +6294,7 @@ fn rebuild_daily_stats_from_conversation_packets(
                 })
                 .collect::<Result<Vec<_>>>()?;
             let mut grouped_messages = storage
-                .fetch_messages_for_lexical_rebuild_batch(&conversation_ids, None, None)
+                .fetch_messages_for_conversations_batch(&conversation_ids)
                 .with_context(|| {
                     format!(
                         "fetching canonical message batch for packet daily_stats rebuild after id {}",
@@ -8503,9 +8509,30 @@ fn run_semantic_db_vector_catchup(
         )
     })?;
     let batch_size = SemanticIndexer::new("infinity", None)?.batch_size();
+
+    // T8 (plan v5.1, task book #92): `cass index --semantic` drains the
+    // chunk domain (`chunk_holes` -> `message_chunks`) -- the retired v4
+    // message-granularity engine T11 deleted is no longer reachable from
+    // anywhere.
+    let infinity_config = crate::search::infinity::InfinityConfig::from_env();
+    let (identity, fingerprint) = crate::search::infinity::probe_identity_and_fingerprint(&infinity_config)
+        .map_err(|e| anyhow::anyhow!("{caller}: infinity identity+fingerprint probe failed: {e}"))?;
+    let embedder = crate::search::infinity::InfinityEmbedder::new()
+        .map_err(|e| anyhow::anyhow!("{caller}: failed to construct infinity embedder: {e}"))?;
+    let embed_fn = |texts: &[&str]| -> std::result::Result<Vec<Vec<f32>>, String> {
+        use crate::search::embedder::Embedder as _;
+        embedder.embed_batch_sync(texts).map_err(|e| e.to_string())
+    };
+    let ownership_seed = FrankenStorage::now_millis() as u64;
     let report = crate::indexer::db_vector_catchup::run_db_vector_catchup_backfill(
         &storage,
         batch_size,
+        &identity,
+        crate::search::canonicalize::CANONICALIZE_PIPELINE_VERSION,
+        crate::search::chunking::CHUNKING_POLICY_VERSION,
+        &fingerprint,
+        &embed_fn,
+        ownership_seed,
     )
     .map_err(|e| anyhow::anyhow!("{caller}: db vector catchup failed: {e:#}"))?;
     tracing::info!(
@@ -8513,15 +8540,16 @@ fn run_semantic_db_vector_catchup(
         generation_id = report.generation_id,
         reused_existing_generation = report.reused_existing_generation,
         embedder_id = %report.embedder_id,
-        eligible_seeded = report.eligible_seeded,
-        embedded_inserted = report.embedded_inserted,
-        stale_skipped = report.stale_skipped,
-        holes_before = report.holes_before,
+        chunks_embedded = report.chunks_embedded,
+        chunks_pruned = report.chunks_pruned,
+        holes_written_off_beyond_expected = report.holes_written_off_beyond_expected,
+        staging_reused = report.staging_reused,
+        staging_purged = report.staging_purged,
+        messages_loaded = report.messages_loaded,
         holes_after = report.holes_after,
-        holes_written_off_ineligible = report.holes_written_off_ineligible,
-        embeddings_pruned_ineligible = report.embeddings_pruned_ineligible,
+        ownership_seed,
         activated = report.activated,
-        "db vector domain catch-up complete"
+        "db vector domain (v5 chunk) catch-up complete"
     );
     if !report.activated {
         tracing::info!(
@@ -8530,7 +8558,7 @@ fn run_semantic_db_vector_catchup(
             holes_after = report.holes_after,
             "{caller}: db vector domain catch-up did not activate this pass \
              (holes remain, or activation audit has not run yet); rerun the \
-             same command to continue draining embedding_holes"
+             same command to continue draining chunk_holes"
         );
     }
     Ok(SemanticDbVectorCatchupOutcome {
@@ -10630,7 +10658,7 @@ fn should_run_targeted_semantic_watch_once(opts: &IndexOptions) -> bool {
 /// W3-5: replaces the old fsvi rebuild-or-append-then-set-watermark
 /// machinery. `indexed_conversations`/`pre_watch_conversations` no longer
 /// gate a selection query -- the DB-vector-domain catch-up itself decides
-/// what's eligible via `embedding_holes` -- but the zero-conversations
+/// what's eligible via `chunk_holes` -- but the zero-conversations
 /// refusal is kept: publishing a "semantic ready" claim off a watch-once
 /// pass that indexed nothing would be misleading either way.
 ///
@@ -10664,7 +10692,7 @@ fn run_targeted_semantic_watch_once_publish(
         } else {
             "db-vector-domain catch-up ingested but has not activated yet (holes remain or \
              activation audit has not run this pass); rerun to continue draining \
-             embedding_holes (W3-5: fsvi manifest retired)"
+             chunk_holes (W3-5: fsvi manifest retired)"
                 .to_string()
         },
     })
@@ -22689,7 +22717,7 @@ mod tests {
             .next()
             .expect("canonical replay row");
         let mut fetched = storage
-            .fetch_messages_for_lexical_rebuild_batch(&[inserted.conversation_id], None, None)
+            .fetch_messages_for_conversations_batch(&[inserted.conversation_id])
             .unwrap();
         let replay_messages = fetched
             .remove(&inserted.conversation_id)
@@ -28226,10 +28254,16 @@ mod tests {
             "a meta.schema_version above the legacy ceiling must not get the \
              legacy-specific rebuild guidance: {err}"
         );
+        // T5.5 (plan v5.1): T4's schema v5 rewrite replaced ensure()'s old
+        // generic "user_version=0-but-not-empty" text (checked via
+        // "schema::ensure"/"can open in place") with StorageError::
+        // SchemaRebuildRequired{found:0, required:5}'s own Display
+        // (`src/storage/api/error.rs`). Anchor on that Display's own stable
+        // substrings rather than the anyhow context wrapping around it.
         assert!(
-            err.contains("schema::ensure") && err.contains("can open in place"),
-            "diagnostic should be schema::ensure's own generic user_version=0-but-not-empty \
-             rejection, not a legacy-specific one: {err}"
+            err.contains("schema version 0") && err.contains("rebuild-only shape"),
+            "diagnostic should be StorageError::SchemaRebuildRequired's own generic \
+             user_version=0-but-not-empty rejection, not a legacy-specific one: {err}"
         );
         assert!(db_path.exists(), "canonical DB must remain in place");
     }
@@ -29844,21 +29878,46 @@ mod tests {
         run_index(seed_opts, None)?;
 
         // Revert to the real starting condition this bug lived in: a
-        // populated v1-shaped canonical DB with messages but no
-        // lex_docs/fts_lex at all -- exactly the exec25 staging DB's state
-        // when this bug was found (a W1 VACUUM INTO copy never opened by
-        // w2-aware code).
+        // populated canonical DB with messages but no lex_docs/fts_lex at
+        // all -- exactly the exec25 staging DB's state when this bug was
+        // found (a W1 VACUUM INTO copy never opened by w2-aware code).
+        //
+        // T5.5 (plan v5.1): this used to also revert `PRAGMA user_version`
+        // to 1 to match that historical DB's actual shape, but T4's
+        // rebuild-only v5 schema makes `ensure()` reject any `user_version`
+        // in `1..=4` outright (`SchemaRebuildRequired`) -- there is no
+        // in-place migration path left for that scenario, so a v1-shaped
+        // fixture no longer reaches this test's real target (the
+        // `--force-rebuild` dispatch actually opening a writable
+        // connection and rebuilding the lex domain, not a readonly no-op;
+        // see the doc comment above). Dropping only the two lex tables
+        // while leaving `user_version` honestly at CURRENT_SCHEMA_VERSION
+        // reproduces the same "lex domain missing" corruption without
+        // touching the version marker `ensure()` now gates on --
+        // `ensure()` is a no-op for `user_version == CURRENT_SCHEMA_
+        // VERSION` and never re-verifies table presence, so this fixture
+        // still opens cleanly and `recreate_lex_domain_tables` (the
+        // unconditional drop+recreate `--force-rebuild` already runs)
+        // still has real missing tables to repair.
         {
             let corrupt = FrankenStorage::open(&db_path)?;
             corrupt.raw().execute("DROP TABLE IF EXISTS fts_lex", &[])?;
             corrupt.raw().execute("DROP TABLE IF EXISTS lex_docs", &[])?;
-            corrupt.raw().execute("PRAGMA user_version = 1;", &[])?;
             corrupt.close()?;
         }
         let reverted = FrankenStorage::open_readonly(&db_path)?;
         anyhow::ensure!(
-            reverted.schema_version()? == 1,
-            "sanity: DB must be reverted to v1 before the force-rebuild call"
+            reverted.schema_version()? == crate::storage::schema::CURRENT_SCHEMA_VERSION,
+            "sanity: DB must stay at the current schema version (only the lex tables were dropped)"
+        );
+        let lex_tables_present: i64 = reverted.raw().query_row_map(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('fts_lex', 'lex_docs')",
+            &[],
+            |row| row.get_typed(0),
+        )?;
+        anyhow::ensure!(
+            lex_tables_present == 0,
+            "sanity: fts_lex/lex_docs must both be dropped before the force-rebuild call"
         );
         reverted.close_without_checkpoint()?;
 
@@ -34092,7 +34151,7 @@ mod tests {
         assert_eq!(
             crate::semantic_activation_suffix(&activated_false).as_deref(),
             Some(
-                ", semantic index: not activated yet (holes remain; rerun to continue draining embedding_holes)"
+                ", semantic index: not activated yet (holes remain; rerun to continue draining chunk_holes)"
             ),
             "activated=false must not be mistaken for \"no semantic pass ran\""
         );
