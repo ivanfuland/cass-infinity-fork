@@ -377,6 +377,33 @@ fn fetch_hole_keys(
         .context("fetching a page of chunk_holes keys")
 }
 
+/// Task book #98 Step 3: post-drain hard invariant, called exactly once,
+/// immediately after the drain loop in [`run_db_vector_catchup_backfill`]
+/// exits and strictly before reverse reconciliation/activation runs. The
+/// drain loop must never be followed by either of those while
+/// `chunk_holes` rows remain for this generation -- T12's real stall
+/// proved a silent, non-erroring drain-loop exit with holes still
+/// outstanding is possible (475 holes left forever, zero error, zero
+/// event, root cause undetermined); this turns any future recurrence
+/// (however it happens) into an immediate, loud failure instead of
+/// quietly falling through as if the drain had genuinely finished.
+/// Returns the (necessarily zero) remaining count on success so the
+/// caller's `drain_done` event can report it verbatim.
+fn assert_drain_completed_or_bail(storage: &FrankenStorage, generation_id: i64) -> Result<i64> {
+    let holes_remaining: i64 =
+        storage.raw().query_row_map("SELECT COUNT(*) FROM chunk_holes WHERE generation_id = ?1", &params![generation_id], |row| row.get_typed(0))?;
+    if holes_remaining != 0 {
+        let first_remaining: Option<(i64, u32)> = storage.raw().query_opt_map(
+            "SELECT message_id, chunk_idx FROM chunk_holes WHERE generation_id = ?1 ORDER BY message_id, chunk_idx LIMIT 1",
+            &params![generation_id],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+        )?;
+        let (mid, idx) = first_remaining.unwrap_or((-1, 0));
+        bail!("drain loop exited with {holes_remaining} holes remaining (first key {mid},{idx})");
+    }
+    Ok(holes_remaining)
+}
+
 /// Read one message's `(conversation_id, role, content)` fresh. The sole
 /// per-message read the T8 drain loop performs -- callers must cache the
 /// result across every `HoleKey` sharing the same `message_id` within a
@@ -537,6 +564,48 @@ fn ownership_sample_key(seed: u64, chunk_id: i64) -> u64 {
 /// longer resolves to anything.
 fn chunk_content_hash(conn: &Conn, chunk_id: i64) -> Result<Option<String>, StorageError> {
     conn.query_opt_map("SELECT content_hash FROM message_chunks WHERE chunk_id = ?1", &params![chunk_id], |row| row.get_typed(0))
+}
+
+/// Task book #98 Step 3: single emission point for every drain
+/// observability event (`catchup_page` / `catchup_page_slow` /
+/// `drain_done`) -- restricted to this catch-up drain path only, never
+/// `search`/`status`/`doctor` (control plane 2026-09-05 ruling). Prints
+/// unconditionally (not gated on --json/robot-mode: this module has no
+/// access to that CLI flag without threading a new parameter through
+/// call sites in other files, out of this task book's single-file scope,
+/// and the CLI's own stderr tracing layer is pinned to `error` in
+/// robot/json mode regardless -- a `tracing::debug!` here would be
+/// silently dropped exactly when it matters most).
+///
+/// The `#[cfg(test)]` build additionally mirrors every emitted line into
+/// a thread-local buffer so tests can assert on the exact events a real
+/// `run_db_vector_catchup_backfill` call actually emitted (real behavior,
+/// not a reimplementation) instead of scraping process-wide stderr.
+#[cfg(not(test))]
+fn emit_drain_event(event: &serde_json::Value) {
+    eprintln!("{event}");
+}
+
+#[cfg(test)]
+thread_local! {
+    static DRAIN_EVENTS_FOR_TEST: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn emit_drain_event(event: &serde_json::Value) {
+    let line = event.to_string();
+    eprintln!("{line}");
+    DRAIN_EVENTS_FOR_TEST.with(|events| events.borrow_mut().push(line));
+}
+
+#[cfg(test)]
+fn drain_events_for_test() -> Vec<String> {
+    DRAIN_EVENTS_FOR_TEST.with(|events| events.borrow().clone())
+}
+
+#[cfg(test)]
+fn clear_drain_events_for_test() {
+    DRAIN_EVENTS_FOR_TEST.with(|events| events.borrow_mut().clear());
 }
 
 /// Re-derive a fresh generation fingerprint through the injected
@@ -1214,12 +1283,18 @@ pub fn run_db_vector_catchup_backfill(
 
     let mut after: Option<(i64, u32)> = None;
     let mut current: Option<(i64, Vec<ExpectedChunk>)> = None; // (message_id, expected)
+    let mut page_number: u64 = 0;
     loop {
+        let page_started = std::time::Instant::now();
         let keys = fetch_hole_keys(storage, generation_id, after, batch_size)?;
         if keys.is_empty() {
             break;
         }
+        page_number += 1;
         after = keys.last().map(|k| (k.message_id, k.chunk_idx));
+        let page_first_key = keys.first().map(|k| (k.message_id, k.chunk_idx)).expect("keys checked non-empty above");
+        let page_last_key = after.expect("just set from a non-empty keys Vec above");
+        let page_keys_count = keys.len();
 
         let mut batch_rows: Vec<ChunkRow> = Vec::new();
         let mut batch_keys: Vec<(i64, u32)> = Vec::new();
@@ -1343,9 +1418,50 @@ pub fn run_db_vector_catchup_backfill(
             })
             .context("writing a T8 chunk catch-up batch (stage -> move -> vec0 insert -> hole resolve)")?;
 
+        // Task book #98 Step 3 (control plane 2026-09-05 ruling: emit
+        // unconditionally, not gated on --json/robot-mode -- this
+        // function has no access to that CLI flag without threading a new
+        // parameter through call sites in other files, out of this task
+        // book's single-file scope; the CLI's own stderr tracing layer is
+        // pinned to `error` in robot/json mode regardless, so a
+        // `tracing::debug!` here would be silently dropped exactly when
+        // it matters most). T12's real-scale stall left zero trace of
+        // drain progress -- `semantic.err`'s only progress counter was the
+        // unrelated lexical-indexing phase, frozen at "indexing 14/14"
+        // for the entire ≥143-minute stall. This line, and `catchup_page_
+        // slow`/`drain_done` below, are the only signal a future stuck
+        // run has to distinguish "still draining, page N" from "the drain
+        // loop itself hung" -- restricted to this drain path only, never
+        // emitted from `search`/`status`/`doctor`.
+        let page_embedded = batch_rows.len();
+        let page_written_off = resolved_off.len() + off_beyond_expected.len();
         chunks_embedded = chunks_embedded.saturating_add(batch_rows.len() as u64);
         holes_written_off_beyond_expected = holes_written_off_beyond_expected.saturating_add(off_beyond_expected.len() as u64);
+
+        let page_elapsed = page_started.elapsed();
+        emit_drain_event(&serde_json::json!({
+            "event": "catchup_page",
+            "page": page_number,
+            "first_key": [page_first_key.0, page_first_key.1],
+            "last_key": [page_last_key.0, page_last_key.1],
+            "keys": page_keys_count,
+            "embed": page_embedded,
+            "written_off": page_written_off,
+            "ms": page_elapsed.as_millis(),
+        }));
+        if page_elapsed > std::time::Duration::from_secs(60) {
+            emit_drain_event(&serde_json::json!({
+                "event": "catchup_page_slow",
+                "page": page_number,
+                "first_key": [page_first_key.0, page_first_key.1],
+                "last_key": [page_last_key.0, page_last_key.1],
+                "ms": page_elapsed.as_millis(),
+            }));
+        }
     }
+
+    let holes_remaining_after_drain = assert_drain_completed_or_bail(storage, generation_id)?;
+    emit_drain_event(&serde_json::json!({"event": "drain_done", "holes": holes_remaining_after_drain}));
 
     // Reverse reconciliation: every message this run touched (had at least
     // one hole key for) gets its full stored-chunk set pruned against its
@@ -2437,6 +2553,149 @@ mod chunk_catchup_v5_tests {
             reconciliation_elapsed < std::time::Duration::from_secs(2),
             "O(touched) reverse reconciliation must comfortably clear 20,000 touched messages x 60,000 expected chunks in well under 2s; took {reconciliation_elapsed:?}"
         );
+    }
+
+    /// Task book #98 Step 3: every `catchup_page` event the drain loop
+    /// emits must be valid JSON, and the number of pages emitted must
+    /// equal `ceil(holes / batch_size)` -- 250 single-chunk holes,
+    /// `backfill()`'s fixed `batch_size=100` -> pages of 100, 100, 50
+    /// (page 3 partial). Reads the real events `run_db_vector_catchup_
+    /// backfill` actually emitted via [`drain_events_for_test`] (the
+    /// `#[cfg(test)]` mirror of [`emit_drain_event`]'s real call sites),
+    /// not a reimplementation.
+    #[test]
+    fn catchup_page_events_are_parseable_and_page_count_matches_ceil_holes_over_batch() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_storage(&dir.path().join("db.sqlite"));
+        let generation_id = genesis(&storage);
+
+        const N: usize = 250;
+        for i in 0..N {
+            insert_conversation(&storage, &format!("t11-5-page-{i}"), &[format!("distinct single-chunk message number {i} with plenty of real content to embed and chunk").as_str()]);
+        }
+        assert_eq!(chunk_holes_count(&storage, generation_id), N as i64, "sanity: 250 single-chunk messages -> 250 holes");
+
+        clear_drain_events_for_test();
+        let report = backfill(&storage).unwrap();
+        let events = drain_events_for_test();
+
+        assert!(report.activated, "{report:?}");
+        assert_eq!(chunk_holes_count(&storage, generation_id), 0);
+        assert!(!events.is_empty(), "the drain loop must have emitted at least the catchup_page events for a 250-hole run");
+
+        let parsed: Vec<serde_json::Value> = events.iter().map(|line| serde_json::from_str(line).unwrap_or_else(|e| panic!("every emitted drain event line must be valid JSON, got {line:?}: {e}"))).collect();
+        let page_events: Vec<&serde_json::Value> = parsed.iter().filter(|v| v["event"] == "catchup_page").collect();
+        let expected_pages = N.div_ceil(100);
+        assert_eq!(expected_pages, 3, "sanity on the fixture's own arithmetic: ceil(250/100)");
+        assert_eq!(page_events.len(), expected_pages, "page count must equal ceil(holes/batch_size): {parsed:?}");
+
+        let mut total_keys = 0u64;
+        for (i, ev) in page_events.iter().enumerate() {
+            assert_eq!(ev["page"].as_u64().unwrap(), (i + 1) as u64, "page numbers must be 1-indexed and sequential: {parsed:?}");
+            assert!(ev["first_key"].is_array() && ev["first_key"].as_array().unwrap().len() == 2, "{parsed:?}");
+            assert!(ev["last_key"].is_array() && ev["last_key"].as_array().unwrap().len() == 2, "{parsed:?}");
+            total_keys += ev["keys"].as_u64().unwrap();
+        }
+        assert_eq!(total_keys, N as u64, "keys across all pages must sum to the total hole count: {parsed:?}");
+        assert_eq!(page_events[2]["keys"].as_u64().unwrap(), 50, "the last page must be the partial remainder (250 - 2*100): {parsed:?}");
+
+        let drain_done: Vec<&serde_json::Value> = parsed.iter().filter(|v| v["event"] == "drain_done").collect();
+        assert_eq!(drain_done.len(), 1, "exactly one drain_done event must be emitted per run: {parsed:?}");
+        assert_eq!(drain_done[0]["holes"].as_i64().unwrap(), 0);
+    }
+
+    /// Task book #98 Step 3: a rerun against an already fully-drained,
+    /// already-active generation (the realistic "T12 rerun after the fix"
+    /// shape -- nothing left to embed) must still emit exactly one
+    /// `drain_done` event with `holes=0`, even though zero `catchup_page`
+    /// events fire (zero pages). This is the ONLY signal available to
+    /// distinguish "the drain loop ran and correctly found nothing to do"
+    /// from "the drain loop silently never ran at all".
+    #[test]
+    fn drain_done_event_fires_with_zero_pages_on_an_already_drained_rerun() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_storage(&dir.path().join("db.sqlite"));
+        let generation_id = genesis(&storage);
+        insert_conversation(&storage, "t11-5-drain-done", &["a real message with plenty of content to embed and chunk"]);
+        let first = backfill(&storage).unwrap();
+        assert!(first.activated, "{first:?}");
+        assert_eq!(chunk_holes_count(&storage, generation_id), 0);
+
+        clear_drain_events_for_test();
+        let second = backfill(&storage).unwrap();
+        let events = drain_events_for_test();
+        let parsed: Vec<serde_json::Value> = events.iter().map(|line| serde_json::from_str(line).unwrap()).collect();
+
+        assert_eq!(parsed.iter().filter(|v| v["event"] == "catchup_page").count(), 0, "an already-drained rerun must produce zero pages: {parsed:?}");
+        let drain_done: Vec<&serde_json::Value> = parsed.iter().filter(|v| v["event"] == "drain_done").collect();
+        assert_eq!(drain_done.len(), 1, "drain_done must still fire on a zero-page rerun: {parsed:?}");
+        assert_eq!(drain_done[0]["holes"].as_i64().unwrap(), 0);
+        assert!(second.activated, "a rerun of an already-clean generation must still (idempotently) activate: {second:?}");
+    }
+
+    /// Task book #98 Step 3 mutation-testable unit: [`assert_drain_completed_or_bail`]
+    /// is called exactly once per `run_db_vector_catchup_backfill` run, right after
+    /// the drain loop exits and strictly before reconciliation/activation --
+    /// tested directly here (not through a full backfill run) because
+    /// reproducing T12's actual root cause for "the drain loop exits while a
+    /// real hole remains" is explicitly out of this task book's scope (mission
+    /// text: "本棒不猜根因"). A hand-planted ("手工留一条洞") extra `chunk_holes`
+    /// row for an otherwise fully-activated generation exercises the exact
+    /// invariant this function guards, independent of how such a row could
+    /// arise in production.
+    #[test]
+    fn assert_drain_completed_or_bail_detects_a_manually_left_hole() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_storage(&dir.path().join("db.sqlite"));
+        let (generation_id, _a, _b) = clean_two_message_generation(&storage);
+        assert!(assert_drain_completed_or_bail(&storage, generation_id).is_ok(), "a genuinely fully-drained generation must not bail");
+
+        let message_id: i64 = storage.raw().query_row_map("SELECT id FROM messages ORDER BY id LIMIT 1", &[], |row| row.get_typed(0)).unwrap();
+        storage
+            .raw()
+            .execute(
+                "INSERT INTO chunk_holes (generation_id, message_id, chunk_idx, detected_at, reason) VALUES (?1, ?2, 99, ?3, 'manually-left-for-test')",
+                &params![generation_id, message_id, TS],
+            )
+            .unwrap();
+
+        let result = assert_drain_completed_or_bail(&storage, generation_id);
+        assert!(result.is_err(), "a manually left-over chunk_holes row must be caught, not silently ignored");
+        let message = format!("{:#}", result.unwrap_err());
+        assert!(message.contains("drain loop exited with 1 holes remaining"), "error text: {message}");
+        assert!(message.contains(&format!("first key {message_id},99")), "error text must name the first remaining key: {message}");
+    }
+
+    /// Task book #98 Step 4 requirement ④: [`fetch_hole_keys`]'s keyset
+    /// pagination query must resolve via `chunk_holes`' own composite
+    /// `PRIMARY KEY(generation_id, message_id, chunk_idx)` (SQLite creates
+    /// an implicit autoindex for a multi-column PK on a rowid table --
+    /// verified empirically to read `SEARCH chunk_holes USING COVERING
+    /// INDEX sqlite_autoindex_chunk_holes_1 (...)`, not the literal
+    /// substring "USING INDEX" the task book's own prose guessed), never a
+    /// full table `SCAN` -- correctness of `catchup_loads_each_message_
+    /// once_per_run` at real (millions-of-rows) scale depends on this
+    /// being an indexed seek, not a scan re-read on every page.
+    #[test]
+    fn fetch_hole_keys_query_plan_uses_the_composite_primary_key_index() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_storage(&dir.path().join("db.sqlite"));
+        let plan_details: Vec<String> = storage
+            .raw()
+            .query_all_map(
+                "EXPLAIN QUERY PLAN SELECT message_id, chunk_idx FROM chunk_holes \
+                 WHERE generation_id = ?1 AND (message_id > ?2 OR (message_id = ?2 AND chunk_idx > ?3)) \
+                 ORDER BY message_id, chunk_idx LIMIT ?4",
+                &params![1i64, 0i64, 0i64, 100i64],
+                |row| row.get_typed(3),
+            )
+            .unwrap();
+        assert!(plan_details.iter().any(|d| d.contains("chunk_holes")), "sanity: plan must reference chunk_holes at all: {plan_details:?}");
+        assert!(
+            plan_details.iter().any(|d| d.contains("USING") && d.contains("INDEX")),
+            "fetch_hole_keys' keyset pagination must resolve via an index (the composite PRIMARY KEY autoindex), not a full scan: {plan_details:?}"
+        );
+        assert!(!plan_details.iter().any(|d| d.contains("SCAN chunk_holes")), "must not fall back to a chunk_holes table SCAN: {plan_details:?}");
     }
 
     /// Live proof (real Infinity at 127.0.0.1:7997): a real chunk-domain
