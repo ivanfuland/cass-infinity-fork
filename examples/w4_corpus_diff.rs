@@ -37,13 +37,22 @@ struct Cli {
     json: PathBuf,
 }
 
-type SessionKey = (String, Option<String>); // (source_path, external_id)
+type SessionKey = (String, Option<String>); // (agent_slug, external_id)
+
+struct ConvRecord {
+    id: i64,
+    source_path: String,
+}
 
 #[derive(Debug, Serialize, Clone, PartialEq, Eq)]
 struct CorpusDiffReport {
     conversations_missing: i64,
     messages_missing: i64,
     conversations_grown: i64,
+    /// Informational only, not part of the match key: how many matched
+    /// sessions have a different `source_path` between `--old` and `--new`
+    /// (expected whenever a mirror-home materialization pass ran; see T12 3a).
+    source_path_changed: i64,
     old_conversations_total: i64,
     new_conversations_total: i64,
 }
@@ -54,15 +63,15 @@ impl CorpusDiffReport {
     }
 }
 
-fn load_conversations(storage: &FrankenStorage) -> anyhow::Result<HashMap<SessionKey, i64>> {
-    let rows: Vec<(i64, String, Option<String>)> = storage.raw().query_all_map(
-        "SELECT id, source_path, external_id FROM conversations",
+fn load_conversations(storage: &FrankenStorage) -> anyhow::Result<HashMap<SessionKey, ConvRecord>> {
+    let rows: Vec<(i64, String, Option<String>, String)> = storage.raw().query_all_map(
+        "SELECT c.id, a.slug, c.external_id, c.source_path FROM conversations c JOIN agents a ON a.id = c.agent_id",
         &[],
-        |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+        |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?, row.get_typed(3)?)),
     )?;
     let mut map = HashMap::with_capacity(rows.len());
-    for (id, source_path, external_id) in rows {
-        map.insert((source_path, external_id), id);
+    for (id, agent_slug, external_id, source_path) in rows {
+        map.insert((agent_slug, external_id), ConvRecord { id, source_path });
     }
     Ok(map)
 }
@@ -95,21 +104,25 @@ fn compute_diff(old: &FrankenStorage, new: &FrankenStorage) -> anyhow::Result<Co
     let mut conversations_missing = 0i64;
     let mut messages_missing = 0i64;
     let mut conversations_grown = 0i64;
+    let mut source_path_changed = 0i64;
 
-    for (key, &old_conv_id) in &old_convs {
+    for (key, old_rec) in &old_convs {
         match new_convs.get(key) {
             None => {
                 conversations_missing += 1;
-                messages_missing += message_count(old, old_conv_id)?;
+                messages_missing += message_count(old, old_rec.id)?;
             }
-            Some(&new_conv_id) => {
-                let old_count = message_count(old, old_conv_id)?;
-                let new_count = message_count(new, new_conv_id)?;
+            Some(new_rec) => {
+                if old_rec.source_path != new_rec.source_path {
+                    source_path_changed += 1;
+                }
+                let old_count = message_count(old, old_rec.id)?;
+                let new_count = message_count(new, new_rec.id)?;
                 if new_count > old_count {
                     conversations_grown += 1;
                 }
-                let old_ids = message_identity_set(old, old_conv_id)?;
-                let new_ids = message_identity_set(new, new_conv_id)?;
+                let old_ids = message_identity_set(old, old_rec.id)?;
+                let new_ids = message_identity_set(new, new_rec.id)?;
                 messages_missing += old_ids.difference(&new_ids).count() as i64;
             }
         }
@@ -119,6 +132,7 @@ fn compute_diff(old: &FrankenStorage, new: &FrankenStorage) -> anyhow::Result<Co
         conversations_missing,
         messages_missing,
         conversations_grown,
+        source_path_changed,
         old_conversations_total: old_convs.len() as i64,
         new_conversations_total: new_convs.len() as i64,
     })
@@ -148,10 +162,11 @@ fn run(old_path: &std::path::Path, new_path: &std::path::Path) -> (i32, Option<C
             let code = if report.passed() { 0 } else { 1 };
             let msg = format!(
                 "corpus_diff: conversations_missing={} messages_missing={} conversations_grown={} \
-                 old_conversations_total={} new_conversations_total={}",
+                 source_path_changed={} old_conversations_total={} new_conversations_total={}",
                 report.conversations_missing,
                 report.messages_missing,
                 report.conversations_grown,
+                report.source_path_changed,
                 report.old_conversations_total,
                 report.new_conversations_total
             );
@@ -327,6 +342,156 @@ mod tests {
         assert_eq!(report.conversations_missing, 0);
         assert_eq!(report.messages_missing, 0);
         assert_eq!(report.conversations_grown, 1);
+    }
+
+    struct SeedSpec {
+        external_id: &'static str,
+        agent_slug: &'static str,
+        source_path: String,
+        n_messages: usize,
+    }
+
+    /// Like `seed_db`, but lets each conversation carry its own agent slug
+    /// and `source_path` -- needed to reproduce the T12 3a finding, where a
+    /// mirror-home materialization pass rewrites `source_path` to a
+    /// temporary HOME prefix while `(agent_slug, external_id)` stays put.
+    fn seed_db_specs(path: &std::path::Path, specs: &[SeedSpec]) {
+        let storage = FrankenStorage::open(path).unwrap();
+        let mut agent_ids: HashMap<&'static str, i64> = HashMap::new();
+
+        let mut conversations = Vec::new();
+        let mut agent_id_for_conv = Vec::new();
+        for spec in specs {
+            let agent_id = *agent_ids.entry(spec.agent_slug).or_insert_with(|| {
+                let agent = Agent {
+                    id: None,
+                    slug: spec.agent_slug.into(),
+                    name: spec.agent_slug.into(),
+                    version: Some("0.1".into()),
+                    kind: AgentKind::Cli,
+                };
+                storage.ensure_agent(&agent).unwrap()
+            });
+
+            let mut messages = Vec::new();
+            for i in 0..spec.n_messages {
+                messages.push(Message {
+                    id: None,
+                    idx: i as i64,
+                    role: MessageRole::User,
+                    author: Some("user".into()),
+                    created_at: Some(1_700_000_000_000 + i as i64),
+                    content: format!(
+                        "corpus-diff fixture message {}-{i} with enough text to be non-trivial.",
+                        spec.external_id
+                    ),
+                    extra_json: serde_json::json!({}),
+                    snippets: Vec::new(),
+                });
+            }
+            conversations.push(Conversation {
+                id: None,
+                agent_slug: spec.agent_slug.into(),
+                workspace: Some(PathBuf::from("/tmp/workspace")),
+                external_id: Some(spec.external_id.into()),
+                title: Some("Corpus diff fixture".into()),
+                source_path: PathBuf::from(&spec.source_path),
+                started_at: Some(1_700_000_000_000),
+                ended_at: Some(1_700_000_000_000 + spec.n_messages as i64),
+                approx_tokens: Some(64),
+                metadata_json: serde_json::Value::Null,
+                messages,
+                source_id: LOCAL_SOURCE_ID.into(),
+                origin_host: None,
+            });
+            agent_id_for_conv.push(agent_id);
+        }
+        let batch: Vec<(i64, Option<i64>, &Conversation)> = agent_id_for_conv
+            .into_iter()
+            .zip(conversations.iter())
+            .map(|(agent_id, c)| (agent_id, None, c))
+            .collect();
+        storage.insert_conversations_batched(&batch).unwrap();
+    }
+
+    #[test]
+    fn source_path_change_alone_does_not_fail_the_gate() {
+        // T12 3a: a mirror-home materialization pass rewrites `source_path`
+        // to a temporary HOME prefix for a session whose original source
+        // file was rotated away, but `(agent_slug, external_id)` and every
+        // message are unchanged. The gate must not report this as loss.
+        let dir = TempDir::new().unwrap();
+        let old = dir.path().join("old.db");
+        let new = dir.path().join("new.db");
+
+        seed_db_specs(
+            &old,
+            &[SeedSpec {
+                external_id: "sess-1",
+                agent_slug: "codex",
+                source_path: "/home/ivan/.codex/sessions/sess-1.jsonl".into(),
+                n_messages: 10,
+            }],
+        );
+        seed_db_specs(
+            &new,
+            &[SeedSpec {
+                external_id: "sess-1",
+                agent_slug: "codex",
+                source_path: "/tmp/cc-cass-pr4-run/mirror-home/.codex/sessions/sess-1.jsonl".into(),
+                n_messages: 10,
+            }],
+        );
+
+        let (code, report, message) = run(&old, &new);
+        assert_eq!(
+            code, 0,
+            "source_path alone changing (mirror-home materialization) must not fail the gate: {message}"
+        );
+        let report = report.unwrap();
+        assert_eq!(report.conversations_missing, 0);
+        assert_eq!(report.messages_missing, 0);
+        assert_eq!(
+            report.source_path_changed, 1,
+            "the source_path divergence must still be reported (informational, not a match key)"
+        );
+    }
+
+    #[test]
+    fn same_external_id_different_agent_slug_is_a_different_session_and_is_missing() {
+        // Two different agents could in principle mint the same external_id;
+        // they must not be conflated into one session.
+        let dir = TempDir::new().unwrap();
+        let old = dir.path().join("old.db");
+        let new = dir.path().join("new.db");
+
+        seed_db_specs(
+            &old,
+            &[SeedSpec {
+                external_id: "shared-id",
+                agent_slug: "codex",
+                source_path: "/tmp/a.jsonl".into(),
+                n_messages: 4,
+            }],
+        );
+        seed_db_specs(
+            &new,
+            &[SeedSpec {
+                external_id: "shared-id",
+                agent_slug: "claude",
+                source_path: "/tmp/a.jsonl".into(),
+                n_messages: 4,
+            }],
+        );
+
+        let (code, report, message) = run(&old, &new);
+        assert_eq!(
+            code, 1,
+            "same external_id under a different agent slug must count as a missing session: {message}"
+        );
+        let report = report.unwrap();
+        assert_eq!(report.conversations_missing, 1);
+        assert_eq!(report.messages_missing, 4);
     }
 
     #[test]
