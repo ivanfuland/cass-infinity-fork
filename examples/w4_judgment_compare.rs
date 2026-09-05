@@ -1,43 +1,54 @@
-//! T10 (plan v5.1): `w4_judgment_compare` -- per-case, per-channel
+//! T10/T10.5 (plan v5.1): `w4_judgment_compare` -- per-case, per-channel
 //! non-regression gate: for every fixture case, the candidate build's rank
-//! of a specific target message must be at least as good as (`<=`) a frozen
-//! baseline's rank of that same message, across all three search channels
-//! (lexical / semantic / hybrid).
+//! of a specific target document must be at least as good as (`<=`) a
+//! frozen baseline's rank of that same document, across all three search
+//! channels (lexical / semantic / hybrid).
 //!
-//! **Fixture schema note (deviation from the plan text's literal default
-//! path)**: the plan's Interfaces line names `--fixture
-//! tests/fixtures/w2_judgment_cases.jsonl` as the default input, but that
-//! file's existing schema (`case, query, a_conversation_id, a_source_path,
-//! b_conversation_id, b_source_path, ruling`) encodes a *pairwise* A-vs-B
-//! preference at conversation/source_path granularity -- it has no
-//! `message_id` field, and this tool's judgment criterion ("按 message_id
-//! 取 A 的 rank", i.e. unambiguous rank lookup via the message-id field T9
-//! added to search hit JSON, rather than the fragile old source_path
-//! matching) needs exactly that field. Reconciling the two would mean
-//! either adding `message_id` to that frozen fixture (a change to a file
-//! outside T10's authorized file list) or writing a resolver that infers a
-//! message_id from `a_conversation_id`/`a_source_path` against a live db
-//! (underspecified: which message within that conversation is "the" A). To
-//! avoid guessing a fixture-consumption contract that could silently
-//! misjudge a production non-regression gate, this tool's `--fixture`
-//! accepts its own, simpler schema instead: one JSON object per line,
-//! `{case_id, query, message_id}`. Wiring this against the real
-//! `w2_judgment_cases.jsonl` corpus is left as a follow-up needing a
-//! control-plane decision on which of the above resolutions to take (noted
-//! in the T10 deviation list).
+//! **Correlation field: `source_path`, not `conversation_id`/`message_id`**
+//! (T10.5 correction, control-plane 2026-09-05 ruling). The plan's original
+//! design called for ranking by `conversation_id` ("hits carry conversation
+//! id"), but `SearchHit.conversation_id` (`src/search/query.rs:1414`) is
+//! `#[serde(skip_serializing)]` -- `cass search --json` never emits it,
+//! regardless of `--fields`. `message_id` does serialize, but its own doc
+//! comment states lexical-only hits are always `None` for it -- unusable
+//! for the lexical channel, one of the three this tool must cover. Ranking
+//! by `source_path` (which DOES serialize plainly) is the same correlation
+//! field the precedent judgment/parity gates already use and verified
+//! (`tests/w2_lexical_parity.rs`, `tests/w2_judgment_cases.rs`) -- this
+//! tool follows that precedent rather than inventing a new one.
+//! `W4_ARTIFACTS/judgment_baseline.json`'s own `provenance` block does not
+//! record which correlation field its author used to compute each case's
+//! rank; this tool assumes source_path (the only field both the real
+//! fixture and `SearchHit` actually carry) and documents that assumption
+//! here rather than silently guessing without a record of the choice --
+//! T12 gate ⑥ must apply the same correlation field on both sides of any
+//! future re-comparison.
 //!
-//! `--baseline` is a single JSON object (not JSONL): `{case_id: {channel:
-//! rank_or_null}}` for `channel` in `lexical`/`semantic`/`hybrid`, `null`
-//! meaning "not found in the baseline run" (`+infinity` for the comparison).
+//! **Fixture**: real production data, `tests/fixtures/w2_judgment_cases.jsonl`
+//! (one JSON object per line): `{case, query, category, a_conversation_id,
+//! a_source_path, b_conversation_id, b_source_path, ruling, provenance}` --
+//! this tool reads only `case`/`query`/`a_source_path` (the `b_*`/`ruling`
+//! fields encode a *different* judgment concept, W2's pairwise A-vs-B
+//! preference gate, not this tool's baseline-vs-candidate rank comparison).
+//!
+//! **Baseline**: `W4_ARTIFACTS/judgment_baseline.json`, a single JSON
+//! object (not JSONL): `{"results": {case: {lexical, semantic, hybrid}},
+//! "provenance": {...}}`, `null` meaning "not found in the baseline run"
+//! (`+infinity` for the comparison). The report's own top-level keys are
+//! named `case_id` in the plan's Interfaces text; this tool uses the
+//! fixture's own field name `case` for both the lookup key and the output
+//! key, since they're the same string.
 //!
 //! Usage: `CASS_W2_JUDGMENT_BINARY=... CASS_W2_JUDGMENT_DATA_DIR=...
 //! CASS_W2_JUDGMENT_CONFIG_DIR=... cargo run --release
 //! --no-default-features --features qr,encryption,infinity --example
-//! w4_judgment_compare -- --fixture <jsonl> --baseline <json> --json <out>`.
-//! Exit codes: 0 every case/channel has `rank_candidate <= rank_baseline`; 1
-//! at least one case/channel is `ok=false`; 2 precondition error (file
-//! missing/unparseable, a case_id from the fixture absent from baseline
-//! entirely, or the candidate binary/search invocation failed structurally).
+//! w4_judgment_compare -- --fixture tests/fixtures/w2_judgment_cases.jsonl
+//! --baseline W4_ARTIFACTS/judgment_baseline.json --json <out>`. Exit
+//! codes: 0 every case/channel has `rank_candidate <= rank_baseline`; 1 at
+//! least one case/channel is `ok=false`; 2 precondition error (file
+//! missing/unparseable, a case from the fixture absent from baseline
+//! entirely, or the candidate binary/search invocation failed
+//! structurally).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -61,19 +72,19 @@ const CHANNELS: [&str; 3] = ["lexical", "semantic", "hybrid"];
 
 #[derive(Debug, Deserialize, Clone)]
 struct JudgmentCase {
-    case_id: String,
+    case: String,
     query: String,
-    message_id: i64,
+    a_source_path: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct SearchHitMessageId {
-    message_id: Option<i64>,
+struct SearchHitSourcePath {
+    source_path: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct SearchJsonResponse {
-    hits: Vec<SearchHitMessageId>,
+    hits: Vec<SearchHitSourcePath>,
 }
 
 #[derive(Debug, Serialize, Clone, Copy, PartialEq)]
@@ -93,7 +104,7 @@ fn channel_verdict(baseline: Option<usize>, candidate: Option<usize>) -> Channel
 }
 
 trait JudgmentSearch {
-    fn rank_of_message(&self, channel: &str, query: &str, message_id: i64) -> anyhow::Result<Option<usize>>;
+    fn rank_of_source_path(&self, channel: &str, query: &str, source_path: &str) -> anyhow::Result<Option<usize>>;
 }
 
 struct SubprocessJudgmentSearch {
@@ -103,9 +114,18 @@ struct SubprocessJudgmentSearch {
 }
 
 impl JudgmentSearch for SubprocessJudgmentSearch {
-    fn rank_of_message(&self, channel: &str, query: &str, message_id: i64) -> anyhow::Result<Option<usize>> {
-        let mut args: Vec<String> =
-            vec!["search".into(), query.into(), "--mode".into(), channel.into(), "--limit".into(), "5000".into(), "--json".into()];
+    fn rank_of_source_path(&self, channel: &str, query: &str, source_path: &str) -> anyhow::Result<Option<usize>> {
+        let mut args: Vec<String> = vec![
+            "search".into(),
+            query.into(),
+            "--mode".into(),
+            channel.into(),
+            "--limit".into(),
+            "5000".into(),
+            "--json".into(),
+            "--fields".into(),
+            "source_path".into(),
+        ];
         if channel == "semantic" || channel == "hybrid" {
             args.push("--daemon".into());
             args.push("--model".into());
@@ -124,26 +144,28 @@ impl JudgmentSearch for SubprocessJudgmentSearch {
         );
         let response: SearchJsonResponse = serde_json::from_slice(&output.stdout)
             .map_err(|e| anyhow::anyhow!("parsing candidate JSON for channel={channel} query={query:?}: {e}"))?;
-        Ok(response.hits.iter().position(|h| h.message_id == Some(message_id)).map(|i| i + 1))
+        Ok(response.hits.iter().position(|h| h.source_path == source_path).map(|i| i + 1))
     }
 }
 
-type BaselineMap = HashMap<String, HashMap<String, Option<usize>>>;
+#[derive(Debug, Deserialize)]
+struct BaselineFile {
+    results: HashMap<String, HashMap<String, Option<usize>>>,
+}
+
 type Report = HashMap<String, HashMap<String, ChannelVerdict>>;
 
-fn compute_report(cases: &[JudgmentCase], baseline: &BaselineMap, search: &dyn JudgmentSearch) -> anyhow::Result<Report> {
+fn compute_report(cases: &[JudgmentCase], baseline: &BaselineFile, search: &dyn JudgmentSearch) -> anyhow::Result<Report> {
     let mut report = Report::new();
     for case in cases {
-        let baseline_channels = baseline
-            .get(&case.case_id)
-            .ok_or_else(|| anyhow::anyhow!("case_id {:?} missing from baseline", case.case_id))?;
+        let baseline_channels = baseline.results.get(&case.case).ok_or_else(|| anyhow::anyhow!("case {:?} missing from baseline", case.case))?;
         let mut channel_verdicts = HashMap::new();
         for &channel in &CHANNELS {
             let baseline_rank = baseline_channels.get(channel).copied().flatten();
-            let candidate_rank = search.rank_of_message(channel, &case.query, case.message_id)?;
+            let candidate_rank = search.rank_of_source_path(channel, &case.query, &case.a_source_path)?;
             channel_verdicts.insert(channel.to_string(), channel_verdict(baseline_rank, candidate_rank));
         }
-        report.insert(case.case_id.clone(), channel_verdicts);
+        report.insert(case.case.clone(), channel_verdicts);
     }
     Ok(report)
 }
@@ -156,7 +178,7 @@ fn load_fixture(path: &std::path::Path) -> anyhow::Result<Vec<JudgmentCase>> {
         .collect()
 }
 
-fn load_baseline(path: &std::path::Path) -> anyhow::Result<BaselineMap> {
+fn load_baseline(path: &std::path::Path) -> anyhow::Result<BaselineFile> {
     let text = std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
     serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("parsing {}: {e}", path.display()))
 }
@@ -211,7 +233,7 @@ mod tests {
         ranks: HashMap<(String, String), Option<usize>>,
     }
     impl JudgmentSearch for FakeSearch {
-        fn rank_of_message(&self, channel: &str, query: &str, _message_id: i64) -> anyhow::Result<Option<usize>> {
+        fn rank_of_source_path(&self, channel: &str, query: &str, _source_path: &str) -> anyhow::Result<Option<usize>> {
             Ok(self.ranks.get(&(channel.to_string(), query.to_string())).copied().flatten())
         }
     }
@@ -222,19 +244,34 @@ mod tests {
         path
     }
 
+    /// Real-shape fixture line, mirroring `tests/fixtures/w2_judgment_cases.jsonl`'s
+    /// actual fields (only `case`/`query`/`a_source_path` are read; the rest
+    /// are included so this selftest exercises real-shape deserialization,
+    /// not a slimmed-down stand-in).
+    fn fixture_line(case: &str, query: &str, a_source_path: &str) -> String {
+        serde_json::json!({
+            "case": case,
+            "query": query,
+            "category": "selftest",
+            "a_conversation_id": 1,
+            "a_source_path": a_source_path,
+            "b_conversation_id": 2,
+            "b_source_path": "/b.jsonl",
+            "ruling": "A>B",
+            "provenance": "selftest fixture, not a real judgment"
+        })
+        .to_string()
+    }
+
+    fn baseline_file(entries: serde_json::Value) -> String {
+        serde_json::json!({"results": entries, "provenance": {"note": "selftest"}}).to_string()
+    }
+
     #[test]
     fn all_channels_at_or_better_than_baseline_pass() {
         let dir = TempDir::new().unwrap();
-        let fixture = write_file(
-            dir.path(),
-            "fixture.jsonl",
-            &serde_json::json!({"case_id": "c1", "query": "foo", "message_id": 42}).to_string(),
-        );
-        let baseline = write_file(
-            dir.path(),
-            "baseline.json",
-            &serde_json::json!({"c1": {"lexical": 3, "semantic": 5, "hybrid": 2}}).to_string(),
-        );
+        let fixture = write_file(dir.path(), "fixture.jsonl", &fixture_line("c1", "foo", "/a.jsonl"));
+        let baseline = write_file(dir.path(), "baseline.json", &baseline_file(serde_json::json!({"c1": {"lexical": 3, "semantic": 5, "hybrid": 2}})));
         let mut ranks = HashMap::new();
         ranks.insert(("lexical".to_string(), "foo".to_string()), Some(2));
         ranks.insert(("semantic".to_string(), "foo".to_string()), Some(5));
@@ -252,16 +289,8 @@ mod tests {
     #[test]
     fn one_channel_worse_than_baseline_fails_exit_1() {
         let dir = TempDir::new().unwrap();
-        let fixture = write_file(
-            dir.path(),
-            "fixture.jsonl",
-            &serde_json::json!({"case_id": "c1", "query": "foo", "message_id": 42}).to_string(),
-        );
-        let baseline = write_file(
-            dir.path(),
-            "baseline.json",
-            &serde_json::json!({"c1": {"lexical": 3, "semantic": 5, "hybrid": 2}}).to_string(),
-        );
+        let fixture = write_file(dir.path(), "fixture.jsonl", &fixture_line("c1", "foo", "/a.jsonl"));
+        let baseline = write_file(dir.path(), "baseline.json", &baseline_file(serde_json::json!({"c1": {"lexical": 3, "semantic": 5, "hybrid": 2}})));
         let mut ranks = HashMap::new();
         ranks.insert(("lexical".to_string(), "foo".to_string()), Some(2));
         ranks.insert(("semantic".to_string(), "foo".to_string()), Some(9)); // worse than baseline 5
@@ -278,12 +307,8 @@ mod tests {
     #[test]
     fn baseline_null_treated_as_infinity_any_candidate_rank_passes() {
         let dir = TempDir::new().unwrap();
-        let fixture = write_file(
-            dir.path(),
-            "fixture.jsonl",
-            &serde_json::json!({"case_id": "c1", "query": "foo", "message_id": 42}).to_string(),
-        );
-        let baseline = write_file(dir.path(), "baseline.json", &serde_json::json!({"c1": {"lexical": null, "semantic": null, "hybrid": null}}).to_string());
+        let fixture = write_file(dir.path(), "fixture.jsonl", &fixture_line("c1", "foo", "/a.jsonl"));
+        let baseline = write_file(dir.path(), "baseline.json", &baseline_file(serde_json::json!({"c1": {"lexical": null, "semantic": null, "hybrid": null}})));
         let mut ranks = HashMap::new();
         ranks.insert(("lexical".to_string(), "foo".to_string()), None);
         ranks.insert(("semantic".to_string(), "foo".to_string()), Some(100));
@@ -300,12 +325,8 @@ mod tests {
     #[test]
     fn candidate_null_vs_finite_baseline_fails() {
         let dir = TempDir::new().unwrap();
-        let fixture = write_file(
-            dir.path(),
-            "fixture.jsonl",
-            &serde_json::json!({"case_id": "c1", "query": "foo", "message_id": 42}).to_string(),
-        );
-        let baseline = write_file(dir.path(), "baseline.json", &serde_json::json!({"c1": {"lexical": 5, "semantic": 5, "hybrid": 5}}).to_string());
+        let fixture = write_file(dir.path(), "fixture.jsonl", &fixture_line("c1", "foo", "/a.jsonl"));
+        let baseline = write_file(dir.path(), "baseline.json", &baseline_file(serde_json::json!({"c1": {"lexical": 5, "semantic": 5, "hybrid": 5}})));
         let mut ranks = HashMap::new();
         ranks.insert(("lexical".to_string(), "foo".to_string()), None);
         ranks.insert(("semantic".to_string(), "foo".to_string()), Some(3));
@@ -319,18 +340,31 @@ mod tests {
     }
 
     #[test]
-    fn missing_case_id_in_baseline_is_precondition_error_exit_2() {
+    fn missing_case_in_baseline_is_precondition_error_exit_2() {
         let dir = TempDir::new().unwrap();
-        let fixture = write_file(
-            dir.path(),
-            "fixture.jsonl",
-            &serde_json::json!({"case_id": "c1", "query": "foo", "message_id": 42}).to_string(),
-        );
-        let baseline = write_file(dir.path(), "baseline.json", "{}");
+        let fixture = write_file(dir.path(), "fixture.jsonl", &fixture_line("c1", "foo", "/a.jsonl"));
+        let baseline = write_file(dir.path(), "baseline.json", &baseline_file(serde_json::json!({})));
         let search = FakeSearch { ranks: HashMap::new() };
 
         let (code, report, message) = run(&fixture, &baseline, &search);
-        assert_eq!(code, 2, "case_id absent from baseline must be a precondition error: {message}");
+        assert_eq!(code, 2, "case absent from baseline must be a precondition error: {message}");
         assert!(report.is_none());
+    }
+
+    /// Real-shape regression guard: loads the actual `tests/fixtures/
+    /// w2_judgment_cases.jsonl` (5 rows) to prove this tool's `JudgmentCase`
+    /// deserializes the real file without error and extracts the expected
+    /// fields -- catches a field-name drift between this tool and the
+    /// fixture without needing a live candidate binary.
+    #[test]
+    fn real_fixture_file_deserializes() {
+        let cases = load_fixture(std::path::Path::new("tests/fixtures/w2_judgment_cases.jsonl")).expect("real fixture must parse with this tool's JudgmentCase shape");
+        assert_eq!(cases.len(), 5, "real fixture has exactly 5 rows");
+        let case_names: Vec<&str> = cases.iter().map(|c| c.case.as_str()).collect();
+        assert_eq!(case_names, ["indexing", "indexer", "connectors", "duplicate", "触发器"]);
+        for c in &cases {
+            assert!(!c.query.is_empty());
+            assert!(!c.a_source_path.is_empty());
+        }
     }
 }
