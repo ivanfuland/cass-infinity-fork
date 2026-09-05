@@ -1498,6 +1498,27 @@ pub fn run_db_vector_catchup_backfill(
     if holes_after == 0 {
         let audit_report = activate_generation(storage, generation_id, embedder, ownership_seed)
             .context("running the T8 v5 activation audit before activating a chunk-domain generation")?;
+        // Task book #98 Step 1/4: the R1-B8 exact-content-twin tolerance
+        // this task book added to checks ③/⑩ has no other observable
+        // surface (`ActivationAuditReport` itself is discarded once this
+        // function reads `.passed`/`.chunk_count` -- it was never part of
+        // `DbVectorCatchupReport`, and the CLI's own stderr tracing layer
+        // is pinned to `error` in robot/json mode regardless of level).
+        // Routed through the same unconditional `emit_drain_event` channel
+        // Step 3 built, real data straight off the just-computed report
+        // (not a reimplementation), emitted for both a passing and a
+        // failing audit so a refused activation's diagnostics are visible
+        // too.
+        emit_drain_event(&serde_json::json!({
+            "event": "activation_audit",
+            "generation_id": generation_id,
+            "passed": audit_report.passed,
+            "positive_check_tied_twin": audit_report.positive_check_tied_twin,
+            "positive_check_twin_chunk_id": audit_report.positive_check_twin_chunk_id,
+            "ownership_checked": audit_report.ownership_checked,
+            "ownership_failed": audit_report.ownership_failed,
+            "ownership_tied_twins": audit_report.ownership_tied_twins,
+        }));
         if !audit_report.passed {
             bail!(
                 "generation {generation_id} failed T8 activation audit, refusing to activate: {}",
