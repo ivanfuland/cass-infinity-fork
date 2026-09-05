@@ -116,6 +116,14 @@ pub struct DbVectorCatchupReport {
     /// each message once per run" invariant `catchup_loads_each_message_
     /// once_per_run` proves).
     pub messages_loaded: u64,
+    /// T10.5: `chunk_holes` rows seeded for a brand-new generation's ENTIRE
+    /// expected-chunk set, in the same transaction the generation row
+    /// itself was created in (`find_reusable_or_create_generation_v5`'s
+    /// doc comment). `0` for a reused generation (T6's ingest-time hook
+    /// already covers it) and always `0` for a [`run_db_vector_catchup_
+    /// backfill`] (v4) call -- the chunk domain is a [`run_db_vector_
+    /// catchup_backfill_v5`]-only concept.
+    pub holes_seeded: u64,
 }
 
 /// One row of embedding-hole work: the message content/role to embed,
@@ -752,6 +760,7 @@ pub fn run_db_vector_catchup_backfill(
         staging_reused: 0,
         staging_purged: 0,
         messages_loaded: 0,
+        holes_seeded: 0,
     })
 }
 
@@ -1447,6 +1456,48 @@ fn load_message_once(storage: &FrankenStorage, message_id: i64) -> Result<(i64, 
 /// the next priority tier exactly as if the row didn't exist at all.
 /// Same three-tier priority as v4: identity+fingerprint-matching active ->
 /// identity+fingerprint-matching pending -> create new.
+/// T10.5 (exec80, 2026-09-05): a brand-new generation's `chunk_holes` are
+/// now seeded from `all_expected` in the SAME transaction as the
+/// `INSERT INTO embedding_generations` -- fixes a real gap the plan's T8
+/// design left open: T6's ingest-time hole registration only ever fires
+/// against an *already-existing* active-or-pending generation
+/// (`register_chunk_holes_for_message_in_tx`'s own doc comment), so a
+/// brand-new database that ingests all its content BEFORE the first
+/// `index --semantic`/`models backfill` call creates generation 1 gets
+/// zero holes registered anywhere, ever -- the T8 drain loop below then
+/// finds nothing to do and the activation audit fails outright
+/// ("generation N has zero chunk rows") on a corpus that in fact has
+/// plenty of eligible content. `exec77`'s `synth-200-v5` avoided this by
+/// building its generation before inserting messages (T6's hook then
+/// covers it); a real green-field deployment can't rely on that ordering.
+/// Same-transaction atomicity means a crash/error mid-seed leaves NO
+/// generation row at all (verified by `catchup_seed_crash_leaves_no_
+/// generation_row` below), not a generation with a partially-seeded hole
+/// set that would silently under-report `chunk_holes`.
+///
+/// Two accepted, documented gaps (control-plane 2026-09-05 ruling, not
+/// fixed here):
+/// ① `all_expected` is fully materialized in memory by the caller before
+///    this function runs (T8's existing pattern -- this change only moves
+///    an already-existing full-materialization earlier, it does not
+///    introduce a new one). At real corpus scale (~2M chunks x ~100B ~=
+///    200MB) this is a real, measurable term against T12's memory door
+///    (`VmHWM <= startup_rss + 2*max_message_bytes + 256MiB`); if that
+///    door goes red because of this term specifically, the fix is to seed
+///    holes via a streamed/paged `for_each_expected_chunk` callback
+///    instead of collecting the whole `Vec` first -- not attempted here.
+/// ② `all_expected` is computed by the caller *before* this function's own
+///    transaction opens (necessarily -- the seed data must exist before
+///    the seeding statement can run). A message ingested in the window
+///    between that scan and this transaction committing is invisible to
+///    BOTH the T6 ingest hook (no generation exists yet to register
+///    against) and this seed (already past its own scan) -- a real but
+///    narrow race that can leak exactly one missed hole per such message.
+///    Accepted as out of scope: this path only runs once per fresh
+///    database (first-ever generation creation), and T12's rehearsal is
+///    offline (no concurrent ingest). Closing it for good would mean
+///    sharing a write lock between "pull new content" and "create first
+///    generation", not attempted here.
 fn find_reusable_or_create_generation_v5(
     conn: &Conn,
     identity: &InfinityServedIdentity,
@@ -1454,7 +1505,8 @@ fn find_reusable_or_create_generation_v5(
     chunking_policy_version: u32,
     fingerprint: &[u8],
     now_ms: i64,
-) -> Result<(i64, bool)> {
+    all_expected: &[ExpectedChunk],
+) -> Result<(i64, bool, u64)> {
     let dim = i64::try_from(identity.dimension)
         .map_err(|_| anyhow!("infinity dimension {} does not fit in i64", identity.dimension))?;
 
@@ -1468,7 +1520,7 @@ fn find_reusable_or_create_generation_v5(
     .context("looking up an identity-matching active v5 embedding_generations row")?
         && fingerprint_matches(&stored_fingerprint, fingerprint, identity.dimension)
     {
-        return Ok((existing, true));
+        return Ok((existing, true, 0));
     }
 
     if let Some((existing, stored_fingerprint)) = schema::find_reusable_pending_generation_v5(
@@ -1481,12 +1533,12 @@ fn find_reusable_or_create_generation_v5(
     .context("looking up a reusable pending v5 embedding_generations row")?
         && fingerprint_matches(&stored_fingerprint, fingerprint, identity.dimension)
     {
-        return Ok((existing, true));
+        return Ok((existing, true, 0));
     }
 
-    let generation_id = conn
+    let (generation_id, holes_seeded) = conn
         .with_tx(TxMode::Immediate, |tx| {
-            schema::create_embedding_generation_v5(
+            let generation_id = schema::create_embedding_generation_v5(
                 tx,
                 &identity.model_id,
                 dim,
@@ -1494,10 +1546,13 @@ fn find_reusable_or_create_generation_v5(
                 chunking_policy_version,
                 fingerprint,
                 now_ms,
-            )
+            )?;
+            let holes: Vec<(i64, u32)> = all_expected.iter().map(|c| (c.message_id, c.chunk_idx)).collect();
+            let outcome = schema::seed_chunk_holes(tx, generation_id, &holes, now_ms, "generation_seed")?;
+            Ok((generation_id, outcome.rows_inserted))
         })
-        .context("creating a new v5 embedding_generations row")?;
-    Ok((generation_id, false))
+        .context("creating a new v5 embedding_generations row and seeding its chunk_holes")?;
+    Ok((generation_id, false, holes_seeded))
 }
 
 // =============================================================================
@@ -2065,13 +2120,28 @@ pub fn run_db_vector_catchup_backfill_v5(
         .map_err(|_| anyhow!("infinity dimension {} does not fit in i64", identity.dimension))?;
     let now_ms = FrankenStorage::now_millis();
 
-    let (generation_id, reused_existing_generation) = find_reusable_or_create_generation_v5(
+    // T10.5: moved up from immediately after generation resolution (was
+    // "claim/purge stale staging up front" below) so a brand-new
+    // generation can be seeded with holes for the *entire* corpus in the
+    // same transaction it's created in -- see `find_reusable_or_create_
+    // generation_v5`'s doc comment for why (and for the two accepted,
+    // documented gaps this reordering carries). Still computed exactly
+    // once and reused for both purposes (staging reuse/purge below, and
+    // the reverse-reconciliation pass at the end of this function).
+    let mut all_expected: Vec<ExpectedChunk> = Vec::new();
+    for_each_expected_chunk(storage, 200, |c| {
+        all_expected.push(c);
+        Ok(())
+    })?;
+
+    let (generation_id, reused_existing_generation, holes_seeded) = find_reusable_or_create_generation_v5(
         storage.raw(),
         identity,
         canonicalize_version,
         chunking_policy_version,
         fingerprint,
         now_ms,
+        &all_expected,
     )?;
     // Idempotent (`CREATE VIRTUAL TABLE IF NOT EXISTS`): a no-op for a
     // reused generation, and the one place a brand-new generation's vec0
@@ -2086,11 +2156,6 @@ pub fn run_db_vector_catchup_backfill_v5(
     // "reusable" and kept; anything else left over from a prior crashed
     // run is purged, so a re-embed is never skipped for content that has
     // since changed.
-    let mut all_expected: Vec<ExpectedChunk> = Vec::new();
-    for_each_expected_chunk(storage, 200, |c| {
-        all_expected.push(c);
-        Ok(())
-    })?;
     let (reusable_staged_keys, staging_purged) = storage
         .raw()
         .with_tx(TxMode::Immediate, |tx| {
@@ -2310,6 +2375,7 @@ pub fn run_db_vector_catchup_backfill_v5(
         staging_reused,
         staging_purged,
         messages_loaded,
+        holes_seeded,
     })
 }
 
@@ -3062,8 +3128,8 @@ mod chunk_catchup_v5_tests {
             .unwrap();
         storage.raw().execute("UPDATE embedding_generations SET is_active = 1, audit_status = 'passed' WHERE id = ?1", &params![stale_generation_id]).unwrap();
 
-        let (generation_id, reused) =
-            find_reusable_or_create_generation_v5(storage.raw(), &identity, CANONICALIZE_PIPELINE_VERSION, CHUNKING_POLICY_VERSION, &mock_fingerprint(), TS + 1).unwrap();
+        let (generation_id, reused, _holes_seeded) =
+            find_reusable_or_create_generation_v5(storage.raw(), &identity, CANONICALIZE_PIPELINE_VERSION, CHUNKING_POLICY_VERSION, &mock_fingerprint(), TS + 1, &[]).unwrap();
         assert_ne!(generation_id, stale_generation_id, "an active row with a drifted fingerprint must never be reused, even with matching embedder_id/dim/versions");
         assert!(!reused, "a fingerprint mismatch must fall through to creating a new generation: reused={reused}");
     }
@@ -3084,10 +3150,96 @@ mod chunk_catchup_v5_tests {
         // Left is_active=0, audit_status='pending' (the DDL default) --
         // the pending-reuse tier.
 
-        let (generation_id, reused) =
-            find_reusable_or_create_generation_v5(storage.raw(), &identity, CANONICALIZE_PIPELINE_VERSION, CHUNKING_POLICY_VERSION, &mock_fingerprint(), TS + 1).unwrap();
+        let (generation_id, reused, _holes_seeded) =
+            find_reusable_or_create_generation_v5(storage.raw(), &identity, CANONICALIZE_PIPELINE_VERSION, CHUNKING_POLICY_VERSION, &mock_fingerprint(), TS + 1, &[]).unwrap();
         assert_ne!(generation_id, stale_generation_id, "a pending row with a drifted fingerprint must never be reused");
         assert!(!reused);
+    }
+
+    /// T10.5 regression: a brand-new database (NO generation exists at
+    /// all, `genesis()` deliberately not called) that ingests content
+    /// before its first `index --semantic`/`models backfill` call used to
+    /// end up with zero `chunk_holes` ever registered (T6's ingest hook
+    /// only fires against an *already-existing* generation) -- the T8
+    /// drain loop then found nothing to do and activation failed outright
+    /// on a corpus that in fact had eligible content. Two conversations, 3
+    /// messages including one long enough (2400 chars @ 1000/100 chunking)
+    /// to produce 3 chunks, for `holes_seeded` to be a real multi-message,
+    /// multi-chunk sum rather than a degenerate 1.
+    #[test]
+    fn catchup_seeds_holes_for_a_brand_new_generation_on_a_fresh_database() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_storage(&dir.path().join("db.sqlite"));
+
+        insert_conversation(&storage, "t10_5-fresh-a", &["short message one has plenty of real content to embed and chunk"]);
+        let long_content = "x".repeat(1200) + &"y".repeat(1200);
+        insert_conversation(&storage, "t10_5-fresh-b", &["short message two also has plenty of real content to embed and chunk", &long_content]);
+
+        assert_eq!(
+            storage.raw().query_row_map("SELECT COUNT(*) FROM embedding_generations", &[], |row| row.get_typed::<i64>(0)).unwrap(),
+            0,
+            "sanity: no generation must exist before this run -- that's the exact scenario under test"
+        );
+
+        let mut expected_total = 0usize;
+        for_each_expected_chunk(&storage, 200, |_c| {
+            expected_total += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert!(expected_total >= 4, "fixture must produce at least 4 expected chunks (2 single + 1 that splits into >=2): got {expected_total}");
+
+        let report = backfill(&storage).unwrap();
+        assert_eq!(report.holes_seeded, expected_total as u64, "holes_seeded must equal the brand-new generation's ENTIRE expected-chunk set: {report:?}");
+        assert!(!report.reused_existing_generation);
+        assert!(report.activated, "a fresh generation with all its holes seeded and then drained must cleanly activate: {report:?}");
+        assert_eq!(message_chunks_count(&storage, report.generation_id), expected_total as i64);
+        assert_eq!(chunk_holes_count(&storage, report.generation_id), 0, "every seeded hole must have been drained by the same run");
+    }
+
+    /// T10.5: same-transaction atomicity for the new generation-creation +
+    /// hole-seeding pair -- an error partway through seeding (here, a
+    /// `chunk_holes.message_id` foreign-key violation against a message
+    /// that doesn't exist, injected directly into `find_reusable_or_
+    /// create_generation_v5`'s `all_expected` argument rather than through
+    /// `for_each_expected_chunk`, which only ever returns real rows) must
+    /// roll back the WHOLE transaction, including the `INSERT INTO
+    /// embedding_generations` -- never leave a generation row with a
+    /// partially-seeded (and therefore silently under-reported)
+    /// `chunk_holes` set.
+    #[test]
+    fn catchup_seed_crash_leaves_no_generation_row() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_storage(&dir.path().join("db.sqlite"));
+        let identity = mock_identity();
+
+        let real_ids = insert_conversation(&storage, "t10_5-crash", &["a real message with plenty of content to embed and chunk cleanly"]);
+        let mut all_expected = expected_chunks(real_ids[0], 0, "user", "a real message with plenty of content to embed and chunk cleanly");
+        assert_eq!(all_expected.len(), 1, "sanity: fixture message must produce exactly one real expected chunk");
+        // A second "expected chunk" for a message_id that does not exist --
+        // `chunk_holes.message_id REFERENCES messages(id)` rejects it,
+        // failing the seed statement mid-batch.
+        let mut bogus = all_expected[0].clone();
+        bogus.message_id = 999_999;
+        bogus.chunk_idx = 0;
+        all_expected.push(bogus);
+
+        let before: i64 = storage.raw().query_row_map("SELECT COUNT(*) FROM embedding_generations", &[], |row| row.get_typed(0)).unwrap();
+        assert_eq!(before, 0);
+
+        let result = find_reusable_or_create_generation_v5(
+            storage.raw(),
+            &identity,
+            CANONICALIZE_PIPELINE_VERSION,
+            CHUNKING_POLICY_VERSION,
+            &mock_fingerprint(),
+            TS + 1,
+            &all_expected,
+        );
+        assert!(result.is_err(), "a seed-time FK violation must surface as Err, not silently succeed partially");
+
+        let after: i64 = storage.raw().query_row_map("SELECT COUNT(*) FROM embedding_generations", &[], |row| row.get_typed(0)).unwrap();
+        assert_eq!(after, 0, "same-transaction atomicity: a crash mid-seed must leave NO generation row at all, not a half-seeded one");
     }
 
     /// Builds a small, fully-consistent generation (2 single-chunk
