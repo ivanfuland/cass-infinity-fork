@@ -3892,6 +3892,7 @@ impl SearchClient {
             // `messages`/`conversations`/... by id, never the vector
             // table), same as the retired v4 path.
             let candidate_message_ids: Vec<i64> = folded.iter().map(|f| f.message_id).collect();
+            let round1_folded_before_filter = folded.len();
             let (sql, params) = Self::build_db_vector_domain_filter_sql(
                 &candidate_message_ids,
                 filters,
@@ -3905,12 +3906,31 @@ impl SearchClient {
             let round1_unique_messages = filtered.len();
             // Plan v5.1: "窗满 ⟺ first_round_rows == min(k, 该代际 vec0 总行数)".
             let window_full = first_round_rows == k.min(row_count_usize);
+            // T9 part 2 fix (plan v5.1 KNN row, "语料本就少于 limit（窗未满）→
+            // incomplete=false"): when round1's raw KNN window already
+            // covered every row this generation has (`first_round_rows ==
+            // row_count_usize`) *and* the relational filter excluded none of
+            // its folded candidates, round1's result is already the
+            // complete, exhaustive answer for this generation -- a second
+            // exact-scan pass cannot discover a message it had not already
+            // folded (every row was already seen, filter or no), so entering
+            // `KnnExact` for it would be a guaranteed no-op that misreports
+            // "a deeper scan ran" via `CandidateMeta.mode`. This is *not*
+            // the same as "corpus smaller than fetch_limit" in general: a
+            // selective filter that already excluded some of round1's own
+            // candidates (`db_vector_domain_full_scan_retry_matches_vec0_
+            // distance_and_order`) still must enter `KnnExact` even when the
+            // window happened to cover the whole corpus -- the exact-scan
+            // round there is exactly how a filter-passing message that
+            // round1 folded-but-then-filtered-out is confirmed complete.
+            let corpus_exhausted_without_filter_loss = first_round_rows == row_count_usize
+                && round1_unique_messages == round1_folded_before_filter;
 
             let mut mode = CandidateMode::Knn;
             let mut incomplete = false;
             let mut reason: Option<String> = None;
 
-            if window_full && round1_unique_messages < fetch_limit {
+            if window_full && round1_unique_messages < fetch_limit && !corpus_exhausted_without_filter_loss {
                 mode = CandidateMode::KnnExact;
                 let still_needed = fetch_limit - round1_unique_messages;
                 let budget = effective_exact_scan_row_budget();

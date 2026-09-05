@@ -26550,6 +26550,16 @@ fn output_robot_results(
                     "mode_defaulted": search_mode_meta.defaulted,
                     "fallback_tier": search_mode_meta.fallback_tier,
                     "fallback_reason": search_mode_meta.fallback_reason.clone(),
+                    // T9 part 2 fix (plan v5.1 T9 Interfaces: "_meta.
+                    // candidates{…}" 与 "_meta.semantic_degraded（顶层）"):
+                    // this envelope construction never surfaced `SearchResult
+                    // .candidates`/`.semantic_degraded` before -- both fields
+                    // existed on the struct (T9 part 1) but had no JSON/JSONL
+                    // emission path, so `--robot-meta` callers had no way to
+                    // observe chunk-domain candidate diagnostics or a
+                    // hybrid-search lexical fail-open at all.
+                    "candidates": result.candidates,
+                    "semantic_degraded": result.semantic_degraded,
                     "semantic_refinement": search_mode_meta.semantic_refinement(),
                     "refinement_level": search_mode_meta.realized_refinement(),
                     "semantic_fallback_reason": search_mode_meta.semantic_fallback_reason(),
@@ -26693,6 +26703,11 @@ fn output_robot_results(
                         "mode_defaulted": search_mode_meta.defaulted,
                         "fallback_tier": search_mode_meta.fallback_tier,
                         "fallback_reason": search_mode_meta.fallback_reason.clone(),
+                        // T9 part 2 fix -- see the `RobotFormat::Json` arm's
+                        // identical addition above for why these two fields
+                        // had no emission path before this fix.
+                        "candidates": result.candidates,
+                        "semantic_degraded": result.semantic_degraded,
                         "semantic_refinement": search_mode_meta.semantic_refinement(),
                         "refinement_level": search_mode_meta.realized_refinement(),
                         "semantic_fallback_reason": search_mode_meta.semantic_fallback_reason(),
