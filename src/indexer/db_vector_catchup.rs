@@ -16,7 +16,7 @@
 //! [`find_reusable_or_create_generation`]); T8/T10.5 extended the design
 //! to chunk-granularity holes and generation fingerprinting.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result, anyhow, bail};
 
@@ -1109,6 +1109,23 @@ fn switch_guard_in_tx(tx: &Tx, generation_id: i64, pre_audit_chunk_count: i64) -
 /// Infinity dependency; the real CLI call sites probe them once via
 /// [`crate::search::infinity::probe_identity_and_fingerprint`] and pass
 /// the results straight through.
+///
+/// Task book #98 Step 2: `#[cfg(test)]`-only wall-clock hook for the
+/// reverse-reconciliation pass below -- compiled out entirely (zero
+/// runtime cost, no stderr, no production report field) outside `cargo
+/// test`, same idiom as this module's own `#[cfg(test)] mod
+/// chunk_catchup_v5_tests`. Exists so a timed guard test can assert on
+/// that pass's own cost in isolation, without the assertion being
+/// swamped by unrelated per-batch drain-loop transaction overhead (a
+/// pre-existing, unrelated cost this task book did not touch).
+#[cfg(test)]
+static RECONCILIATION_LAST_DURATION_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+fn reconciliation_last_duration_for_test() -> std::time::Duration {
+    std::time::Duration::from_nanos(RECONCILIATION_LAST_DURATION_NANOS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_db_vector_catchup_backfill(
     storage: &FrankenStorage,
@@ -1140,6 +1157,22 @@ pub fn run_db_vector_catchup_backfill(
         all_expected.push(c);
         Ok(())
     })?;
+    // Task book #98 Step 2: index `all_expected` by `message_id` exactly
+    // once here, up front, so the reverse-reconciliation pass below (which
+    // used to do a full `all_expected.iter().filter(...)` linear scan per
+    // touched message -- O(touched_message_ids.len() * all_expected.len()),
+    // multiple minutes/hours at T12's real scale of ~1.35M touched
+    // messages against ~2M expected chunks) is O(touched) instead: one
+    // O(1)-amortized `HashMap` lookup per touched message. Behavior is
+    // unchanged -- same expected set per message_id, same prune/keep
+    // decisions -- only the algorithmic cost of assembling it moves from
+    // per-lookup-linear-scan to a single up-front `O(all_expected.len())`
+    // index build (also reused by nothing else; `find_reusable_or_create_
+    // generation`'s own use of `all_expected` below stays a plain slice).
+    let mut expected_by_message: HashMap<i64, Vec<ExpectedChunk>> = HashMap::new();
+    for c in &all_expected {
+        expected_by_message.entry(c.message_id).or_default().push(c.clone());
+    }
 
     let (generation_id, reused_existing_generation, holes_seeded) = find_reusable_or_create_generation(
         storage.raw(),
@@ -1320,12 +1353,15 @@ pub fn run_db_vector_catchup_backfill(
     // (some of its old chunk rows are no longer expected at all, not just
     // "index beyond expected" for a hole that never existed for them).
     let mut chunks_pruned = 0u64;
+    let no_expected_chunks: Vec<ExpectedChunk> = Vec::new();
+    #[cfg(test)]
+    let __reconciliation_started = std::time::Instant::now();
     for message_id in &touched_message_ids {
-        let expected: Vec<ExpectedChunk> = all_expected.iter().filter(|c| c.message_id == *message_id).cloned().collect();
+        let expected = expected_by_message.get(message_id).unwrap_or(&no_expected_chunks);
         let pruned = storage
             .raw()
             .with_tx(TxMode::Immediate, |tx| {
-                let pruned_chunk_ids = schema::prune_chunks_not_in_expected_in_tx(tx, generation_id, *message_id, &expected)?;
+                let pruned_chunk_ids = schema::prune_chunks_not_in_expected_in_tx(tx, generation_id, *message_id, expected)?;
                 if !pruned_chunk_ids.is_empty() {
                     vector_domain::delete_vec0_rows_in_tx(tx, generation_id, &pruned_chunk_ids)?;
                 }
@@ -1334,6 +1370,8 @@ pub fn run_db_vector_catchup_backfill(
             .context("reverse-reconciling a touched message's stored chunks")?;
         chunks_pruned = chunks_pruned.saturating_add(pruned);
     }
+    #[cfg(test)]
+    RECONCILIATION_LAST_DURATION_NANOS.store(u64::try_from(__reconciliation_started.elapsed().as_nanos()).unwrap_or(u64::MAX), std::sync::atomic::Ordering::Relaxed);
 
     let holes_after: i64 = storage.raw().query_row_map(
         "SELECT COUNT(*) FROM chunk_holes WHERE generation_id = ?1",
@@ -2325,6 +2363,80 @@ mod chunk_catchup_v5_tests {
             .collect();
 
         assert_eq!(stored, independently_computed, "the drain-time (per-message expected_chunks), audit-time (for_each_expected_chunk), and persisted sets must be identical -- no divergent re-derivation");
+    }
+
+    /// Task book #98 Step 2 timed guard: reverse reconciliation used to be
+    /// `all_expected.iter().filter(|c| c.message_id == *message_id)` per
+    /// touched message -- O(touched * all_expected.len()). This fixture is
+    /// the worst case for that shape: `N` messages, 3 hard-cut chunks each
+    /// (`3*N` expected chunks total), and because it's a brand-new
+    /// database every single one of those messages' holes gets drained in
+    /// the same run, so `touched_message_ids` ends up covering all `N`.
+    ///
+    /// **Deviation from the task book's literal "10,000" fixture size**
+    /// (plan v5.1 Global Constraints: test fixture construction is
+    /// "推荐默认", changeable with a documented reason): measured directly
+    /// (mutation test, reverting to the old linear-scan code, discarded
+    /// after measuring) -- at 10,000 messages (30,000 expected chunks) the
+    /// old O(touched*expected) code finishes reconciliation in ~1.46s in
+    /// this debug build, i.e. it does NOT trip a `< 2s` guard at that size
+    /// here (a release build or a machine with a faster allocator could
+    /// go either way, but this repo's own disk/build law mandates debug
+    /// builds for iteration -- `CARGO_PROFILE_DEV_DEBUG=0`, no release
+    /// profile in play -- so the guard must discriminate under the exact
+    /// profile it will actually run under). Doubling to 20,000 messages
+    /// (60,000 expected chunks) gives real separation: old code measured
+    /// ~5.31s (fails), fixed code measured ~0.78s (comfortably passes) --
+    /// consistent with O(N^2) vs O(N) scaling from the 10k measurements
+    /// (old: 1.46s -> ~5.3s at 4x the work, roughly the predicted ~4x;
+    /// fixed: ~0.39s -> ~0.78s, roughly the predicted 2x).
+    ///
+    /// Only [`reconciliation_last_duration_for_test`]'s own window is
+    /// asserted on, not the whole `backfill()` call -- the drain loop's
+    /// ~200 per-batch SQLite transactions and the final activation audit's
+    /// own full-corpus scans are real, pre-existing costs this task book's
+    /// Step 2 was never scoped to touch (confirmed unaffected: this same
+    /// fixture's full `backfill()` wall time is dominated by those, while
+    /// the reconciliation window alone is the ~0.78s above), and bundling
+    /// them in would make this guard fail on a cost it has no way to fix.
+    /// `#[ignore]`d (heavy fixture setup) -- run explicitly with
+    /// `--ignored` to get real numbers; the assertion itself still runs
+    /// and is real, not a stub, whenever it does run.
+    #[test]
+    #[ignore]
+    fn catchup_reverse_reconciliation_is_linear_in_touched_messages_20k() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_storage(&dir.path().join("db.sqlite"));
+        let generation_id = genesis(&storage);
+
+        const N: usize = 20_000;
+        for i in 0..N {
+            // Each message is 2500 unique bytes -> 3 hard-cut chunks
+            // ([0,1000) [900,1900) [1800,2500)), same math as the other
+            // multi-chunk fixtures in this module; the `{i:010}` prefix
+            // guarantees every message's content (and therefore
+            // content_hash) is distinct across all N messages, so this
+            // fixture never exercises Step 1's twin tolerance -- purely a
+            // reverse-reconciliation cost measurement.
+            let content = format!("{i:010}{}", long_unique_filler(2490));
+            insert_conversation(&storage, &format!("t11-5-perf-{i}"), &[content.as_str()]);
+        }
+        assert_eq!(chunk_holes_count(&storage, generation_id), (N * 3) as i64, "sanity: every message's 3 chunks must have registered a hole");
+
+        let report = backfill(&storage).unwrap();
+        let reconciliation_elapsed = reconciliation_last_duration_for_test();
+
+        assert_eq!(report.chunks_embedded, (N * 3) as u64);
+        assert!(report.activated, "{report:?}");
+        assert_eq!(chunk_holes_count(&storage, generation_id), 0);
+        eprintln!(
+            "catchup_reverse_reconciliation_is_linear_in_touched_messages_20k: reverse reconciliation ({N} touched messages x {} expected chunks) took {reconciliation_elapsed:?}",
+            N * 3
+        );
+        assert!(
+            reconciliation_elapsed < std::time::Duration::from_secs(2),
+            "O(touched) reverse reconciliation must comfortably clear 20,000 touched messages x 60,000 expected chunks in well under 2s; took {reconciliation_elapsed:?}"
+        );
     }
 
     /// Live proof (real Infinity at 127.0.0.1:7997): a real chunk-domain
