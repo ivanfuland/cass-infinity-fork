@@ -23,13 +23,101 @@ encodings of the same visual text must canonicalize to the same output.
 ## ② Strip markdown syntax, keep link text **and** URL
 
 Removes markdown syntax markers — bold/italic (`**`, `__`, `*`, `_`),
-inline-code backticks (`` ` ``), headers (`#`), blockquotes (`>`), list
-markers (`- `, `+ `, `1. `) — from regular (non-code-block) text. A markdown
-link `[text](url)` becomes `"text url"` — **v2 change**: v1 dropped the URL
-and kept only the link text.
+backticks (`` ` ``), headers (`#`), blockquotes (`>`), list markers (`- `,
+`+ `, `1. `) — from regular (non-code-block) text. A markdown link
+`[text](url)` becomes `"text url"` — **v2 change**: v1 dropped the URL and
+kept only the link text.
 
 - Input: `"**bold** and [text](http://x.com)"`
 - Output: `"bold and text http://x.com"`
+
+**Backticks are stripped unconditionally, not as paired inline-code
+spans** (T11.7 clarification, 2026-09-05 -- amends the earlier
+"inline-code backticks" framing, which implied pairing): every backtick
+character on a non-code-block line is removed regardless of whether it
+has a matching partner. A line with an odd or unpaired backtick run (e.g.
+a fence marker line the code-block detector below didn't recognize as a
+fence, so it fell through to this stage) still has every `` ` `` in it
+removed.
+
+- Input: `` "text with `one backtick" ``
+- Output: `"text with one backtick"` (not left un-stripped for lack of a pair)
+
+**Code-block fence recognition requires the fence marker at column 0**
+(T11.7 clarification): a line only toggles the code-block state when it
+starts with `` ``` `` with **zero** leading whitespace. A `` ``` `` fence
+indented under a list item or otherwise preceded by any whitespace is
+*not* recognized as a fence — it falls through to the regular
+(non-code-block) per-line stripping above instead (so its backticks are
+removed per the unconditional rule, not kept verbatim as code content).
+**Known divergence from CommonMark** (which tolerates up to 3 spaces of
+fence indentation): this is the ingest pipeline's actual current
+behavior, not a considered design choice.
+
+### Further known divergences (T11.7, 2026-09-05) — not yet aligned in the python oracle
+
+T11.7 ran the full `gates/chunk-oracle.json` diff population (216 messages,
+not just its 50-sample `diff_details`) through both `canonicalize_for_embedding`
+(Rust) and `normalize()` (this oracle) and diffed the two normalized texts.
+The fence/backtick alignment above accounts for 116/216 (53.7%); the
+remaining 100/216 (46.3%) break down into six further, independent
+mechanisms below. These are recorded here as **factual descriptions of the
+ingest pipeline's current behavior**, not endorsements — each is a
+candidate for alignment to CommonMark-like semantics, planned alongside the
+PR6 re-ingest (`canonicalize` v3), not before. Full per-message evidence:
+`W4_ARTIFACTS/t11.7-diag/diff50-classification.md` (60/8/19/10/2/1 = 100,
+zero unclassified).
+
+- **Underscore retention rule** (60/216): Rust's `fs_strip_italic_underscores`
+  keeps a standalone `_` when *both* neighbors are non-alphanumeric (it only
+  drops `_` acting as an opening/closing italic marker, i.e. one alphanumeric
+  neighbor and one non-alphanumeric neighbor); this oracle's
+  `_strip_emphasis_chars` keeps `_`/`*` only when *both* neighbors are
+  alphanumeric, dropping it in every other case. Example ids: 4887, 11453,
+  23699, 81631, 98772 (full list in the classification doc).
+- **List-marker masked by bold, stripping-order mismatch** (8/216): Rust
+  strips `**`/backticks/links character-by-character *before* checking for a
+  line-leading list marker; this oracle checks the line-leading list-marker
+  regex *before* stripping inline markdown. On input like `**1. Heading**`,
+  Rust unmasks the `1. ` (by removing `**` first) and then strips it; this
+  oracle's regex sees `**1.` (not `\d+\.` at the line start) and never
+  recognizes it as a list item, so `1. ` survives. Example ids: 88905, 90183,
+  94389, 160060.
+- **Header-strip doesn't tolerate leading whitespace/characters** (19/216):
+  Rust's `result.trim_start_matches('#').trim_start()` only strips `#`
+  characters that are literally at byte offset 0 of the line; a line like
+  `" ## docs/m7-..."` (one leading space, common where shell command output
+  such as `git status --short --branch`'s `## <branch>` porcelain line is
+  pasted into prose rather than a fence) or one with a non-# character
+  before the `#` run keeps its `#`/`##` intact. This oracle's `_HEADER_RE`
+  (`^(\s*)(#{1,6})(\s+)(.*)$`) tolerates leading whitespace and strips
+  correctly. Same underlying theme as the fence-indentation divergence
+  above, but on headers, not fences. Example ids: 71397, 84619, 86996,
+  90152, 135404.
+- **Asterisk stripped unconditionally, unlike underscore** (10/216): Rust's
+  `*` handling is a blind `result.replace('*', "")` — every `*` is removed
+  regardless of neighboring characters (no alphanumeric-neighbor exception
+  like underscore gets from `fs_strip_italic_underscores`). This oracle
+  applies the *same* alphanumeric-neighbor rule to both `_` and `*`, so a
+  `*` flanked by alphanumerics (including CJK, which Python's `str.isalnum()`
+  treats as alphanumeric) on both sides — shell arithmetic `5*1048576`,
+  `printf` `%0*d`, regex quantifiers `\s*`, Chinese emphasis `*能力*` — is
+  kept by this oracle and dropped by Rust. Example ids: 270431, 289414,
+  361904, 381746, 387529.
+- **Nested/double-bracket link parsing differs** (2/216): Rust's link
+  stripper is a character-level state machine that tracks bracket depth
+  (so it "sees through" a nested `[` inside a link's text span); this
+  oracle's link regex (`` \[([^\]\n]*)\]\(([^)\n]*)\) ``) is a single,
+  non-recursive pattern that closes on the *first* `]` it meets. On
+  adjacent-bracket constructs (an Obsidian-style `[[wikilink]]`, or
+  `foo[](bar)`), the two sides disagree on which `[`/`]` pair up, leaving a
+  different residual bracket count. Example ids: 177547, 361832.
+- **Whitespace-collapse character class differs (Unicode vs. ASCII)**
+  (1/216): Rust's whitespace-collapse step uses `char::is_whitespace()`
+  (full Unicode, including U+00A0 no-break space); this oracle's
+  `_INTRALINE_WS_RE` (`[ \t\r\f\v]+`) is ASCII-only and does not match
+  U+00A0, so a no-break space passes through unchanged here while Rust
+  folds it to a regular space. Example id: 1399007.
 
 ## ③ Whitespace normalization, keeping newlines
 

@@ -130,12 +130,18 @@ def is_hard_noise(role: Optional[str], text: str) -> bool:
 # normalize: canonicalize_for_embedding, stages (1)(2)(3)(5) + stage 4.
 # ---------------------------------------------------------------------------
 
-_FENCE_RE = re.compile(r"^\s*```")
+#
+# T11.7 v5.1 B案 (2026-09-05, pending Ivan's A/B ruling via cass-sql-advisor):
+# `_FENCE_RE` and the inline-code step below are re-aligned to MIRROR Rust's
+# *current* canonicalize.rs behavior (not CommonMark), so this oracle stops
+# flagging that behavior as a "diff" while the ruling is pending. If Ivan
+# picks plan A (fix Rust instead), these two edits get reverted and the
+# corresponding Rust fix lands instead -- see t11.7-diag/ for the analysis.
+_FENCE_RE = re.compile(r"^```")  # column-0 only: mirrors `line.starts_with("```")`
 _HEADER_RE = re.compile(r"^(\s*)(#{1,6})(\s+)(.*)$")
 _BLOCKQUOTE_RE = re.compile(r"^(\s*)>+\s?(.*)$")
 _LIST_RE = re.compile(r"^(\s*)(?:[-+]|\d+\.)\s+(.*)$")
 _LINK_RE = re.compile(r"\[([^\]\n]*)\]\(([^)\n]*)\)")
-_INLINE_CODE_RE = re.compile(r"`([^`\n]+?)`")
 _INTRALINE_WS_RE = re.compile(r"[ \t\r\f\v]+")
 _MULTI_NEWLINE_RE = re.compile(r"\n{3,}")
 
@@ -166,7 +172,9 @@ def _strip_inline_markdown(line: str) -> str:
     # markers), then emphasis chars, then inline code.
     line = _LINK_RE.sub(lambda m: f"{m.group(1)} {m.group(2)}", line)
     line = _strip_emphasis_chars(line)
-    line = _INLINE_CODE_RE.sub(lambda m: m.group(1), line)
+    # B案: unconditional backtick removal (not paired inline-code extraction)
+    # -- mirrors `result.replace('`', "")` (canonicalize.rs fs_strip_markdown_line).
+    line = line.replace("`", "")
     return line
 
 
