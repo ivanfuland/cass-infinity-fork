@@ -1,12 +1,11 @@
 //! T4 (plan v5.1) Step 1: failing-then-green tests for the v5 chunk domain
 //! (`message_chunks`/`chunk_holes`/`chunk_staging`, span-aware
-//! staging/pruning, `_v5` generation primitives, chunk-domain `vec0`
-//! helpers) added at schema version 5. Coexists with the v4 vector domain
-//! (`tests/w3_vector_schema.rs`) -- not wired into any call site (T5/T6/T8
-//! do that).
+//! staging/pruning, generation primitives, chunk-domain `vec0`
+//! helpers) added at schema version 5 and finalized as the sole vector
+//! domain by T11.
 //!
-//! Per the same fixture-fidelity discipline `w3_vector_schema.rs` follows:
-//! connections here are opened via `FrankenStorage::open` (the real
+//! Fixture-fidelity discipline: connections here are opened via
+//! `FrankenStorage::open` (the real
 //! production entry point: `schema::ensure` + the backend's own PRAGMA
 //! enforcement), not a hand-rolled bare connection.
 
@@ -65,7 +64,7 @@ fn insert_message_parent_chain(
     .expect("insert parent message");
 }
 
-fn create_generation_v5(
+fn create_generation(
     storage: &FrankenStorage,
     embedder_id: &str,
     dim: i64,
@@ -75,7 +74,7 @@ fn create_generation_v5(
     storage
         .raw()
         .with_tx_no_replay(TxMode::Immediate, |tx| {
-            schema::create_embedding_generation_v5(
+            schema::create_embedding_generation(
                 tx,
                 embedder_id,
                 dim,
@@ -146,7 +145,7 @@ fn schema_ensure_fresh_on_empty_v0() {
 }
 
 // =============================================================================
-// `_v5` generation primitives.
+// Generation primitives.
 // =============================================================================
 
 #[test]
@@ -156,7 +155,7 @@ fn create_generation_v5_rejects_empty_fingerprint() {
     let err = storage
         .raw()
         .with_tx_no_replay(TxMode::Immediate, |tx| {
-            schema::create_embedding_generation_v5(tx, "bge-m3", 1024, 2, 1, &[], 1_000)
+            schema::create_embedding_generation(tx, "bge-m3", 1024, 2, 1, &[], 1_000)
         })
         .expect_err("empty fingerprint must be rejected");
     assert!(matches!(err, StorageError::Constraint { .. }), "expected Constraint, got {err:?}");
@@ -181,48 +180,17 @@ fn generation_fingerprint_and_policy_not_null() {
 }
 
 #[test]
-fn legacy_wrapper_writes_policy_0_and_is_invisible_to_v5_lookup() {
-    let (_dir, path) = scratch_db_path();
-    let storage = open_storage(&path);
-
-    #[allow(deprecated)]
-    let gen_id = storage
-        .raw()
-        .with_tx_no_replay(TxMode::Immediate, |tx| {
-            schema::create_embedding_generation(tx, "bge-m3", 1024, 2, 1_000)
-        })
-        .expect("create via deprecated legacy wrapper");
-
-    let policy: i64 = storage
-        .raw()
-        .query_row_map(
-            "SELECT chunking_policy_version FROM embedding_generations WHERE id = ?1",
-            fparams![gen_id],
-            |row| row.get_typed(0),
-        )
-        .unwrap();
-    assert_eq!(policy, 0, "legacy wrapper must stamp chunking_policy_version = 0");
-
-    let found = schema::find_reusable_pending_generation_v5(storage.raw(), "bge-m3", 1024, 2, 1)
-        .expect("lookup must not error");
-    assert!(
-        found.is_none(),
-        "a legacy policy-0 generation must be invisible to a real (non-zero) policy v5 lookup, got {found:?}"
-    );
-}
-
-#[test]
 fn find_pending_generation_v5_requires_policy_match() {
     let (_dir, path) = scratch_db_path();
     let storage = open_storage(&path);
-    let gen_id = create_generation_v5(&storage, "bge-m3", 1024, 2, 1);
+    let gen_id = create_generation(&storage, "bge-m3", 1024, 2, 1);
 
-    let found = schema::find_reusable_pending_generation_v5(storage.raw(), "bge-m3", 1024, 2, 1)
+    let found = schema::find_reusable_pending_generation(storage.raw(), "bge-m3", 1024, 2, 1)
         .unwrap()
         .map(|(id, _)| id);
     assert_eq!(found, Some(gen_id), "exact identity + policy match must find the row");
 
-    let not_found = schema::find_reusable_pending_generation_v5(storage.raw(), "bge-m3", 1024, 2, 2)
+    let not_found = schema::find_reusable_pending_generation(storage.raw(), "bge-m3", 1024, 2, 2)
         .unwrap();
     assert!(not_found.is_none(), "a different chunking_policy_version must not match");
 }
@@ -236,7 +204,7 @@ fn seed_chunk_holes_statements_le_1000_rows() {
     let (_dir, path) = scratch_db_path();
     let storage = open_storage(&path);
     insert_message_parent_chain(&storage, 1, 1, 1);
-    let gen_id = create_generation_v5(&storage, "bge-m3", 4, 1, 1);
+    let gen_id = create_generation(&storage, "bge-m3", 4, 1, 1);
 
     let holes: Vec<(i64, u32)> = (0..3_500u32).map(|i| (1_i64, i)).collect();
     let outcome = storage
@@ -255,7 +223,7 @@ fn seed_chunk_holes_60000_rows_beyond_variable_limit() {
     let (_dir, path) = scratch_db_path();
     let storage = open_storage(&path);
     insert_message_parent_chain(&storage, 1, 1, 1);
-    let gen_id = create_generation_v5(&storage, "bge-m3", 4, 1, 1);
+    let gen_id = create_generation(&storage, "bge-m3", 4, 1, 1);
 
     let holes: Vec<(i64, u32)> = (0..60_000u32).map(|i| (1_i64, i)).collect();
     let outcome = storage
@@ -276,7 +244,7 @@ fn seed_chunk_holes_reports_conflicts_not_silently() {
     let (_dir, path) = scratch_db_path();
     let storage = open_storage(&path);
     insert_message_parent_chain(&storage, 1, 1, 1);
-    let gen_id = create_generation_v5(&storage, "bge-m3", 4, 1, 1);
+    let gen_id = create_generation(&storage, "bge-m3", 4, 1, 1);
 
     let first: Vec<(i64, u32)> = (0..10u32).map(|i| (1_i64, i)).collect();
     storage
@@ -332,7 +300,7 @@ fn collect_then_delete_chunks_returns_ids() {
     let (_dir, path) = scratch_db_path();
     let storage = open_storage(&path);
     insert_message_parent_chain(&storage, 1, 1, 1);
-    let gen_id = create_generation_v5(&storage, "bge-m3", 4, 1, 1);
+    let gen_id = create_generation(&storage, "bge-m3", 4, 1, 1);
 
     let row = sample_chunk_row(gen_id, 1, 0);
     let chunk_id = storage
@@ -368,7 +336,7 @@ fn move_staging_by_keys_across_batches() {
     let (_dir, path) = scratch_db_path();
     let storage = open_storage(&path);
     insert_message_parent_chain(&storage, 1, 1, 1);
-    let gen_id = create_generation_v5(&storage, "bge-m3", 4, 1, 1);
+    let gen_id = create_generation(&storage, "bge-m3", 4, 1, 1);
 
     let row0 = sample_chunk_row(gen_id, 1, 0);
     let row1 = sample_chunk_row(gen_id, 1, 1);
@@ -408,7 +376,7 @@ fn find_reusable_staging_requires_hash_and_span() {
     let (_dir, path) = scratch_db_path();
     let storage = open_storage(&path);
     insert_message_parent_chain(&storage, 1, 1, 1);
-    let gen_id = create_generation_v5(&storage, "bge-m3", 4, 1, 1);
+    let gen_id = create_generation(&storage, "bge-m3", 4, 1, 1);
 
     let mut staged = sample_chunk_row(gen_id, 1, 0);
     staged.content_hash = "samehash".to_string();
@@ -463,7 +431,7 @@ fn prune_chunks_drops_span_mismatch() {
     let (_dir, path) = scratch_db_path();
     let storage = open_storage(&path);
     insert_message_parent_chain(&storage, 1, 1, 1);
-    let gen_id = create_generation_v5(&storage, "bge-m3", 4, 1, 1);
+    let gen_id = create_generation(&storage, "bge-m3", 4, 1, 1);
 
     let mut row = sample_chunk_row(gen_id, 1, 0);
     row.content_hash = "h".to_string();
@@ -507,7 +475,7 @@ fn vec0_set_mismatch_uses_chunk_id_both_directions() {
     let (_dir, path) = scratch_db_path();
     let storage = open_storage(&path);
     insert_message_parent_chain(&storage, 1, 1, 1);
-    let gen_id = create_generation_v5(&storage, "bge-m3", 4, 1, 1);
+    let gen_id = create_generation(&storage, "bge-m3", 4, 1, 1);
 
     let row0 = sample_chunk_row(gen_id, 1, 0);
     storage
@@ -515,7 +483,7 @@ fn vec0_set_mismatch_uses_chunk_id_both_directions() {
         .with_tx_no_replay(TxMode::Immediate, |tx| schema::insert_chunk_row_in_tx(tx, &row0))
         .unwrap();
 
-    vector_domain::rebuild_vec0_table_for_generation_v5(storage.raw(), gen_id, 4).unwrap();
+    vector_domain::rebuild_vec0_table_for_generation(storage.raw(), gen_id, 4).unwrap();
     let (missing, extra) =
         vector_domain::count_vec0_chunks_set_mismatch_for_generation(storage.raw(), gen_id).unwrap();
     assert_eq!((missing, extra), (0, 0), "freshly rebuilt vec0 must exactly match message_chunks");

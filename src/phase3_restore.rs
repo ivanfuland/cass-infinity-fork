@@ -8575,20 +8575,19 @@ fn restore_invalidate_embeddings(journal: &RestoreJournal) -> anyhow::Result<()>
     Ok(())
 }
 
-/// DB 向量域侧的显式作废（W3-4 Step2-4，task book #62）。上面两段 fsvi 侧的
-/// 作废在 W3-3..W3-5 共存期间原样保留；这里补的是 exec50 点名的唯一真生产
-/// 自愈路径缺的那一半。第 1 格（db-committed）真正写候选库内容的生产入口
-/// （`franken_replace_conversation_messages_in_tx`/`insert_conversation_tree`）
-/// 已经在同一事务里做过一次"新 doc_id 登记洞账 + 代际就绪失效"（W3-3 Step3
-/// 布线,`register_embedding_hole_for_new_message_in_tx`/
+/// DB 向量域侧的显式作废（W3-4 Step2-4，task book #62；T11 收窄为纯 v5
+/// chunk 域）。上面两段 fsvi 侧的作废在 W3-3..W3-5 共存期间原样保留；这里补
+/// 的是 exec50 点名的唯一真生产自愈路径缺的那一半。第 1 格（db-committed）
+/// 真正写候选库内容的生产入口（`franken_replace_conversation_messages_in_tx`/
+/// `insert_conversation_tree`）已经在同一事务里做过一次"新 doc_id 登记洞账 +
+/// 代际就绪失效"（`register_chunk_holes_for_message_in_tx`/
 /// `demote_active_generation_readiness_in_tx`）——但那是深埋在写路径里的
 /// 副作用,第 3 格自己的"作废"语义不该只靠隐式继承它托底。这里显式再跑一遍
 /// 资格链重扫 + 洞账补种 + 就绪失效,让 DB 向量域的作废是这一格自己站得住
-/// 的动作。全部复用既有生产原语（`scan_eligible_message_ids`/
-/// `seed_embedding_holes`/`demote_active_generation_readiness_in_tx`）,
-/// 零第二定义；`seed_embedding_holes` 本身 `INSERT OR IGNORE` +
-/// `NOT EXISTS`，`demote_active_generation_readiness_in_tx` 本身
-/// no-op-safe,整体重跑幂等。
+/// 的动作。全部复用既有生产原语（`for_each_expected_chunk`/
+/// `register_chunk_holes_for_message_in_tx`/
+/// `demote_active_generation_readiness_in_tx`）,零第二定义；两者都是
+/// `INSERT OR IGNORE`/no-op-safe,整体重跑幂等。
 #[cfg(feature = "infinity")]
 fn restore_invalidate_db_vector_domain(journal: &RestoreJournal) -> anyhow::Result<()> {
     let storage = crate::storage::sqlite::FrankenStorage::open_writer(&journal.db_path)
@@ -8607,47 +8606,32 @@ fn restore_invalidate_db_vector_domain(journal: &RestoreJournal) -> anyhow::Resu
         return Ok(());
     }
 
-    let eligible_ids = crate::indexer::db_vector_catchup::scan_eligible_message_ids(&storage).map_err(|e| {
-        anyhow::anyhow!("re-scanning semantic eligibility for db-vector-domain invalidation: {e}")
-    })?;
-
-    // T6 (plan v5.1): stream every live message's expected v5 chunks too --
-    // restore invalidation must re-seed chunk_holes for the chunk domain
-    // (message_chunks/chunk_holes), not just the legacy message_embeddings
-    // domain's embedding_holes above. for_each_expected_chunk pages through
-    // `messages` (bounded per-page memory at the source, T3), so only its
-    // lightweight ExpectedChunk output is accumulated here -- mirrors
-    // `eligible_ids` above: both reads stay outside the write transaction
-    // below, autocommit-consistent with the existing scan_eligible_
-    // message_ids call.
-    let mut expected_v5_chunks: Vec<crate::search::eligibility::ExpectedChunk> = Vec::new();
+    // Stream every live message's expected v5 chunks -- restore
+    // invalidation must re-seed `chunk_holes` for the chunk domain
+    // (`message_chunks`/`chunk_holes`), the sole vector domain since T11.
+    // `for_each_expected_chunk` pages through `messages` (bounded per-page
+    // memory at the source, T3), so only its lightweight `ExpectedChunk`
+    // output is accumulated here, outside the write transaction below.
+    let mut expected_chunks: Vec<crate::search::eligibility::ExpectedChunk> = Vec::new();
     crate::search::eligibility::for_each_expected_chunk(&storage, 500, |chunk| {
-        expected_v5_chunks.push(chunk);
+        expected_chunks.push(chunk);
         Ok(())
     })
-    .map_err(|e| {
-        anyhow::anyhow!("streaming expected v5 chunks for db-vector-domain invalidation: {e}")
-    })?;
+    .map_err(|e| anyhow::anyhow!("streaming expected chunks for db-vector-domain invalidation: {e}"))?;
 
     let now_ms = crate::storage::sqlite::FrankenStorage::now_millis();
     storage
         .raw()
         .with_tx(crate::storage::api::TxMode::Immediate, |tx| {
-            let generation_id: i64 = tx.query_row_map(
-                "SELECT id FROM embedding_generations WHERE is_active = 1",
-                &[],
-                |row| row.get_typed(0),
-            )?;
-            crate::storage::schema::seed_embedding_holes(tx, generation_id, &eligible_ids, now_ms, "restore-invalidation")?;
             crate::storage::schema::register_chunk_holes_for_message_in_tx(
                 tx,
-                &expected_v5_chunks,
+                &expected_chunks,
                 now_ms,
                 "restore-invalidation",
             )?;
             crate::storage::schema::demote_active_generation_readiness_in_tx(tx)
         })
-        .map_err(|e| anyhow::anyhow!("re-seeding embedding_holes / chunk_holes / demoting readiness after restore: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("re-seeding chunk_holes / demoting readiness after restore: {e}"))?;
     Ok(())
 }
 
@@ -8733,11 +8717,29 @@ mod w3_4_step2_4_db_vector_domain_invalidation_tests {
 
         let gen_id = storage
             .raw()
-            .with_tx_no_replay(TxMode::Immediate, |tx| schema::create_embedding_generation(tx, "BAAI/bge-m3", 4, 1, TS))
+            .with_tx_no_replay(TxMode::Immediate, |tx| {
+                schema::create_embedding_generation(tx, "BAAI/bge-m3", 4, 1, 1, b"test-fingerprint", TS)
+            })
             .unwrap();
         storage
             .raw()
-            .with_tx_no_replay(TxMode::Immediate, |tx| schema::insert_message_embedding(tx, gen_id, doc_a, conv_id, &[1.0, 0.0, 0.0, 0.0], "seed-hash", None, TS))
+            .with_tx_no_replay(TxMode::Immediate, |tx| {
+                schema::insert_chunk_row_in_tx(
+                    tx,
+                    &schema::ChunkRow {
+                        generation_id: gen_id,
+                        message_id: doc_a,
+                        conversation_id: conv_id,
+                        chunk_idx: 0,
+                        byte_start: 0,
+                        byte_end: "already embedded".len(),
+                        content_hash: "seed-hash".into(),
+                        embedding: vec![1.0, 0.0, 0.0, 0.0],
+                        norm: 1.0,
+                        created_at_ms: TS,
+                    },
+                )
+            })
             .unwrap();
         storage.raw().execute("UPDATE embedding_generations SET is_active = 1, audit_status = 'passed' WHERE id = ?1", &params![gen_id]).unwrap();
 
@@ -8761,11 +8763,23 @@ mod w3_4_step2_4_db_vector_domain_invalidation_tests {
         let journal = minimal_journal(db_path.clone());
         restore_invalidate_db_vector_domain(&journal).expect("db-vector-domain invalidation must succeed");
 
-        let hole_doc_ids: Vec<i64> = storage
+        // `register_chunk_holes_for_message_in_tx` registers a hole key for
+        // every live message's expected chunks unconditionally (`ON
+        // CONFLICT DO NOTHING`, no `NOT EXISTS message_chunks` filter --
+        // unlike the retired v4 primitive) -- deduping "already has a
+        // matching chunk row" is the T8 drain loop's job at catch-up time,
+        // not this registration step's. So both doc_a (already chunked)
+        // and doc_b (unhooked) get a `chunk_holes` row here; the real
+        // regression this test guards is doc_b -- the unhooked write --
+        // getting one at all.
+        let mut hole_doc_ids: Vec<i64> = storage
             .raw()
-            .query_all_map("SELECT doc_id FROM embedding_holes WHERE generation_id = ?1", &params![gen_id], |row| row.get_typed(0))
+            .query_all_map("SELECT message_id FROM chunk_holes WHERE generation_id = ?1", &params![gen_id], |row| row.get_typed(0))
             .unwrap();
-        assert_eq!(hole_doc_ids, vec![doc_b], "the unhooked doc_id must get a hole; the already-embedded one must not");
+        hole_doc_ids.sort_unstable();
+        let mut expected = vec![doc_a, doc_b];
+        expected.sort_unstable();
+        assert_eq!(hole_doc_ids, expected, "both the already-chunked and the unhooked doc_id must get a chunk_holes row");
 
         let audit_status: String = storage
             .raw()

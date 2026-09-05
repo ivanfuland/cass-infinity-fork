@@ -3348,7 +3348,7 @@ impl SearchClient {
     /// W3-5: the legacy fsvi vector-index plumbing this used to thread
     /// through (`fs_semantic_index`/`fs_semantic_indexes`/`ann_path`,
     /// cross-checked embedder/dimension per shard) has been retired --
-    /// DB-vector-domain (`embedding_generations`/`message_embeddings`,
+    /// DB-vector-domain (`embedding_generations`/`message_chunks`,
     /// via `search_db_vector_domain`) is the sole candidate-fetch path and
     /// never needed those fields (W3-4 Step2-1 already made them `None`/
     /// empty on every call site; nothing ever read them back out).
@@ -3473,7 +3473,7 @@ impl SearchClient {
         }
     }
 
-    /// R4-B4 (spec §3.1) + w3-d7①/②: the vec0/`message_embeddings`-backed
+    /// R4-B4 (spec §3.1) + w3-d7①/②: the vec0/`message_chunks`-backed
     /// successor to the retired fsvi brute-force scan (W3-5). Reads the
     /// active generation and scans its `vec0`
     /// index inside **one** read transaction (the same-SQLite-snapshot
@@ -3643,25 +3643,20 @@ impl SearchClient {
         (sql, params)
     }
 
-    /// R1-W3-B6/N1/B9's full-scan path: select `(doc_id, embedding)` for
-    /// every row of `generation_id` that passes the same relational
-    /// filters `build_db_vector_domain_filter_sql` applies post-KNN --
-    /// but *before* any distance computation, not after a `vec0` KNN call.
+    /// R1-W3-B6/N1/B9's full-scan path (T9, plan v5.1, chunk-domain
+    /// counterpart of the retired v4 message-granularity full scan):
+    /// streams `(message_id, chunk_id, chunk_idx, byte_start, byte_end,
+    /// content_hash, embedding)` for every `message_chunks` row of
+    /// `generation_id` that passes the same relational filters
+    /// `build_db_vector_domain_filter_sql` applies post-KNN -- but
+    /// *before* any distance computation, not after a `vec0` KNN call.
     /// This is what lets the "widen to full coverage" retry in
     /// `search_db_vector_domain` avoid `vec0`'s hard `k<=4096` ceiling
     /// entirely: it never asks `vec0` for a k at all, it reads the
-    /// authoritative `message_embeddings` table directly and ranks the
-    /// (expected-small, precisely because this path only runs when the
-    /// filter was too selective for the first KNN pass to satisfy)
-    /// filtered subset by an application-layer cosine distance instead.
-    /// T9 (plan v5.1): chunk-domain counterpart of the retired v4
-    /// `message_embeddings`-backed full scan. Streams `(message_id,
-    /// chunk_id, chunk_idx, byte_start, byte_end, content_hash,
-    /// embedding)` for every `message_chunks` row of `generation_id` that
-    /// passes the same relational filters `build_db_vector_domain_filter_sql`
-    /// applies post-KNN -- the exact-scan fallback's source of truth when
-    /// the first `vec0` KNN pass's window was full but the relational
-    /// filter left too few *unique messages* to satisfy `fetch_limit`.
+    /// authoritative `message_chunks` table directly and is the exact-scan
+    /// fallback's source of truth when the first `vec0` KNN pass's window
+    /// was full but the relational filter left too few *unique messages*
+    /// to satisfy `fetch_limit`.
     fn build_chunk_full_scan_sql(
         generation_id: i64,
         filters: &SearchFilters,
@@ -6917,15 +6912,15 @@ mod tests {
         // W3-5: DB-vector-domain (`search_db_vector_domain`) is the sole
         // semantic candidate-fetch path now -- seed an active generation
         // through the same production write path (`create_embedding_
-        // generation_v5` + `insert_chunk_row_in_tx` + `switch_active_
+        // generation` + `insert_chunk_row_in_tx` + `switch_active_
         // generation` + a vec0 rebuild, see `seed_active_generation_with_
         // chunk_vectors`) instead of the retired fsvi `VectorIndex` writer
         // this fixture used to build (previously this also had a
         // `sharded: bool` mode pinning fsvi's multi-shard-index-merge
         // behavior; that had zero real callers even before the fsvi
         // retirement and is dropped along with it). T9 (plan v5.1):
-        // re-pointed from the retired v4 `message_embeddings` domain to
-        // the v5 chunk domain `search_db_vector_domain` now reads --
+        // re-pointed from the retired v4 message-granularity domain to
+        // the chunk domain `search_db_vector_domain` now reads --
         // one chunk per message (`chunk_idx=0`), same as every other
         // fixture in this file re-pointed for T9.
         let db_vectors: Vec<(i64, i64, Vec<f32>)> = message_rows
@@ -16389,7 +16384,7 @@ mod tests {
     }
 
     // =========================================================================
-    // w3 Task W3-3 Step 1/1b: `search_db_vector_domain` (vec0/message_embeddings
+    // w3 Task W3-3 Step 1/1b: `search_db_vector_domain` (vec0/message_chunks
     // read path) -- three-state contract (w3-d7①), R4-B4 same-snapshot,
     // filter-fidelity e2e family (six dimensions + combined).
     // =========================================================================
@@ -16452,7 +16447,7 @@ mod tests {
     /// T9 (plan v5.1): the chunk-domain (v5) counterpart of the retired v4
     /// `seed_active_generation_with_vectors` -- `search_db_vector_domain` now reads
     /// `message_chunks`/its `vec0` table (rowid = `chunk_id`) instead of
-    /// the retired v4 `message_embeddings` domain, so every KNN/full-scan
+    /// the retired v4 message-granularity domain, so every KNN/full-scan
     /// mechanics test below needs a chunk-domain fixture instead. One
     /// chunk per message (`chunk_idx = 0`, a synthetic `[0, 1)` span and a
     /// deterministic-but-unique `content_hash`) -- these tests are about
@@ -16468,7 +16463,7 @@ mod tests {
         let fingerprint = vec![0u8; 3 * usize::try_from(dim).unwrap_or(0) * 4];
         let generation_id = conn
             .with_tx(crate::storage::api::TxMode::Immediate, |tx| {
-                let generation_id = crate::storage::schema::create_embedding_generation_v5(
+                let generation_id = crate::storage::schema::create_embedding_generation(
                     tx, "bge-m3", dim, 1, 1, &fingerprint, 1_000,
                 )?;
                 for (message_id, conversation_id, vector) in vectors {
@@ -16532,7 +16527,7 @@ mod tests {
         let fingerprint = vec![0u8; 3 * usize::try_from(dim).unwrap_or(0) * 4];
         let generation_id = conn
             .with_tx(crate::storage::api::TxMode::Immediate, |tx| {
-                let generation_id = crate::storage::schema::create_embedding_generation_v5(
+                let generation_id = crate::storage::schema::create_embedding_generation(
                     tx, "bge-m3", dim, 1, 1, &fingerprint, 1_000,
                 )?;
                 for (message_id, conversation_id, chunk_idx, vector) in chunks {
@@ -17023,7 +17018,7 @@ mod tests {
         let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
         let conn = storage.raw();
         conn.with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
-            crate::storage::schema::create_embedding_generation(tx, "bge-m3", 2, 1, 1_000)
+            crate::storage::schema::create_embedding_generation(tx, "bge-m3", 2, 1, 1, b"test-fingerprint", 1_000)
         })
         .unwrap();
         // Deliberately never activated.
@@ -17061,7 +17056,7 @@ mod tests {
         );
         let generation_id = conn
             .with_tx(crate::storage::api::TxMode::Immediate, |tx| {
-                let gen_id = crate::storage::schema::create_embedding_generation_v5(
+                let gen_id = crate::storage::schema::create_embedding_generation(
                     tx, "bge-m3", 2, 1, 1, &[0u8; 24], 1_000,
                 )?;
                 crate::storage::schema::insert_chunk_row_in_tx(
@@ -17086,8 +17081,8 @@ mod tests {
         // Deliberately skip building the vec0 table -- the relational
         // (`message_chunks`) row exists and the pointer is active, but the
         // derived vec0 index was never built (w3-d5/w3-d7②: no auto-rebuild
-        // here; T9: re-pointed from v4 `message_embeddings` to the v5
-        // chunk domain `search_db_vector_domain` now reads).
+        // here; T9: re-pointed from the retired v4 message-granularity
+        // domain to the chunk domain `search_db_vector_domain` now reads).
 
         let err = SearchClient::search_db_vector_domain(
             conn,
@@ -17430,7 +17425,7 @@ mod tests {
     }
 
     /// R1-W3-B6/N1/B9: the "widen to full coverage" retry no longer asks
-    /// `vec0` for a bigger `k` -- it filters `message_embeddings` directly
+    /// `vec0` for a bigger `k` -- it filters `message_chunks` directly
     /// via SQL, then ranks the (small, by construction) passing subset by
     /// an application-layer `cosine_distance`. This test forces that retry
     /// path to actually fire (a selective workspace filter that excludes
@@ -18250,7 +18245,7 @@ mod tests {
         let conn_b = storage_b.raw();
         let gen_b = conn_b
             .with_tx(crate::storage::api::TxMode::Immediate, |tx| {
-                let gen_id = crate::storage::schema::create_embedding_generation_v5(
+                let gen_id = crate::storage::schema::create_embedding_generation(
                     tx, "bge-m3", 2, 1, 1, &[0u8; 24], 3_000,
                 )?;
                 crate::storage::schema::insert_chunk_row_in_tx(
@@ -18293,7 +18288,7 @@ mod tests {
         assert!(before[0].score > 0.9, "expected generation A's near-exact match, got score={}", before[0].score);
 
         crate::storage::schema::switch_active_generation(conn_b, gen_b, 4_000, |_tx| Ok(())).unwrap();
-        crate::storage::vector_domain::rebuild_vec0_table_for_generation_v5(conn_b, gen_b, 2).unwrap();
+        crate::storage::vector_domain::rebuild_vec0_table_for_generation(conn_b, gen_b, 2).unwrap();
 
         let (after, _) = SearchClient::search_db_vector_domain(
             storage.raw(),
@@ -18313,133 +18308,5 @@ mod tests {
             after[0].score
         );
         assert_ne!(gen_a, gen_b);
-    }
-
-    /// w3-3 Step1 (task book #61): first real end-to-end light-up of the
-    /// full db-vector-domain loop -- genesis-seed -> Infinity embed ->
-    /// CAS write -> hole resolution -> vec0 rebuild -> activation -> a
-    /// real hit through this file's own `search_db_vector_domain` read
-    /// path. Requires a live Infinity at `CASS_INFINITY_URL`
-    /// (127.0.0.1:7997 by default); run explicitly with `--ignored`.
-    #[test]
-    #[ignore = "requires a live Infinity service at 127.0.0.1:7997 (CASS_INFINITY_URL)"]
-    #[cfg(feature = "infinity")]
-    fn db_vector_catchup_end_to_end_via_live_infinity() {
-        let dir = TempDir::new().unwrap();
-        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
-        let agent_id = storage
-            .ensure_agent(&Agent {
-                id: None,
-                slug: "claude_code".into(),
-                name: "Claude Code".into(),
-                version: Some("1.0".into()),
-                kind: AgentKind::Cli,
-            })
-            .unwrap();
-
-        fn msg(idx: i64, role: MessageRole, content: &str) -> Message {
-            Message {
-                id: None,
-                idx,
-                role,
-                author: None,
-                created_at: Some(1_000 + idx * 1_000),
-                content: content.into(),
-                extra_json: json!(null),
-                snippets: vec![],
-            }
-        }
-
-        // Three conversations, 7 messages each = 21 total. Each
-        // conversation carries one raw-non-empty-but-canonicalize-empty
-        // "noise" message ("ok", in `LOW_SIGNAL_CONTENT`) -- eligible per the packet's weak
-        // `!content.is_empty()` projection but never embeddable, so this
-        // corpus also proves the stricter canonicalize-non-empty genesis
-        // filter (w3-3 Step0 design §2) actually excludes it end-to-end.
-        let mut total_messages = 0usize;
-        let mut noise_messages = 0usize;
-        for c in 0..3i64 {
-            let messages = vec![
-                msg(0, MessageRole::User, &format!("conversation {c} message about rust borrow checker lifetimes")),
-                msg(1, MessageRole::Agent, &format!("conversation {c} reply about ownership and ownership rules")),
-                msg(2, MessageRole::User, "ok"),
-                msg(3, MessageRole::User, &format!("conversation {c} question about async runtime scheduling")),
-                msg(4, MessageRole::Agent, &format!("conversation {c} answer about tokio executor internals")),
-                msg(5, MessageRole::User, &format!("conversation {c} follow-up on garbage collection tradeoffs")),
-                msg(6, MessageRole::Agent, &format!("conversation {c} closing remark on memory safety guarantees")),
-            ];
-            total_messages += messages.len();
-            noise_messages += 1;
-            let conv = Conversation {
-                id: None,
-                agent_slug: "claude_code".into(),
-                workspace: None,
-                external_id: Some(format!("w3-3-step1-e2e-{c}")),
-                title: Some("w3-3 Step1 e2e fixture".into()),
-                source_path: std::path::PathBuf::from(format!("/fixtures/w3-3-step1-e2e-{c}.jsonl")),
-                started_at: Some(1_000),
-                ended_at: Some(8_000),
-                approx_tokens: None,
-                metadata_json: json!(null),
-                messages,
-                source_id: "local".into(),
-                origin_host: None,
-            };
-            storage.insert_conversation_tree(agent_id, None, &conv).expect("seed conversation");
-        }
-        let expected_eligible = (total_messages - noise_messages) as u64;
-
-        let report = crate::indexer::db_vector_catchup::run_db_vector_catchup_backfill(&storage, 8)
-            .expect("first backfill run");
-
-        assert!(report.generation_id > 0);
-        assert!(!report.reused_existing_generation, "first call must create, not reuse");
-        assert_eq!(report.embedder_id, "BAAI/bge-m3");
-        assert_eq!(report.dim, 1024);
-        assert_eq!(report.eligible_seeded, expected_eligible, "genesis seeding must exclude the noise messages");
-        assert_eq!(report.embedded_inserted, expected_eligible);
-        assert_eq!(report.stale_skipped, 0, "no concurrent writer in this test -- nothing should ever go stale");
-        assert_eq!(report.holes_before, expected_eligible);
-        assert_eq!(report.holes_after, 0, "every eligible hole must be resolved by the end of one run");
-        assert_eq!(report.vec0_rows, expected_eligible as usize);
-        assert!(report.activated);
-
-        let active = crate::storage::schema::active_generation_id(storage.raw()).unwrap();
-        assert_eq!(active, Some(report.generation_id));
-
-        // Real read-path light-up: pull back one message's own stored
-        // vector and self-query `search_db_vector_domain` with it -- the
-        // nearest hit must be that same message, at near-1.0 cosine score.
-        let (sample_doc_id, sample_blob): (i64, Vec<u8>) = storage
-            .raw()
-            .query_row_map(
-                "SELECT doc_id, embedding FROM message_embeddings WHERE generation_id = ?1 LIMIT 1",
-                &crate::storage::api::params![report.generation_id],
-                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
-            )
-            .unwrap();
-        let sample_vector = crate::storage::schema::le_blob_to_f32_vector(&sample_blob).unwrap();
-        let (hits, _) = SearchClient::search_db_vector_domain(
-            storage.raw(),
-            &sample_vector,
-            &SearchFilters::default(),
-            None,
-            5,
-        )
-        .expect("db vector domain search must succeed once activated");
-        assert!(!hits.is_empty(), "self-query must return at least one hit");
-        assert_eq!(hits[0].message_id, u64::try_from(sample_doc_id).unwrap());
-        assert!(hits[0].score > 0.99, "self-query must score near-exact, got {}", hits[0].score);
-
-        // Ruling ② (w3-3 Step0 design, approved): a second call with no
-        // new eligible work must resume the same generation by identity
-        // match, not create a fresh one or re-embed anything.
-        let second = crate::indexer::db_vector_catchup::run_db_vector_catchup_backfill(&storage, 8)
-            .expect("second backfill run (resume path)");
-        assert!(second.reused_existing_generation, "second call must find and reuse the pending generation");
-        assert_eq!(second.generation_id, report.generation_id);
-        assert_eq!(second.embedded_inserted, 0, "nothing new to embed on the resume pass");
-        assert_eq!(second.holes_after, 0);
-        assert!(second.activated);
     }
 }

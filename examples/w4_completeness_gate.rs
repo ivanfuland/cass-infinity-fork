@@ -432,7 +432,7 @@ mod tests {
 
         let generation_id = storage
             .raw()
-            .with_tx_no_replay(TxMode::Immediate, |tx| schema::create_embedding_generation_v5(tx, "bge-m3", 4, 1, 1, b"fp", 1_700_000_000_000))
+            .with_tx_no_replay(TxMode::Immediate, |tx| schema::create_embedding_generation(tx, "bge-m3", 4, 1, 1, b"fp", 1_700_000_000_000))
             .unwrap();
         storage
             .raw()
@@ -468,7 +468,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        vector_domain::rebuild_vec0_table_for_generation_v5(storage.raw(), generation_id, 4).unwrap();
+        vector_domain::rebuild_vec0_table_for_generation(storage.raw(), generation_id, 4).unwrap();
 
         // Lexical domain: `insert_conversations_batched` (the production
         // write path used above) already synced `lex_docs`/`fts_lex` for

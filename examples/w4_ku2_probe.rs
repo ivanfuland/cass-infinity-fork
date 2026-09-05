@@ -1,6 +1,6 @@
 //! T10 (plan v5.1): `w4_ku2_probe` -- KU2 latency probe re-pointed at the
 //! chunk-domain `vec0` index (`message_chunks`/`vec_index_gen_<id>`)
-//! instead of the retired v4 `message_embeddings`/`vec_index_gen_<id>`
+//! instead of the retired v4 message-granularity/`vec_index_gen_<id>`
 //! scaffold this replaces (no dedicated W3 scaffold source file was found in
 //! this worktree to literally "re-point" -- this is a from-scratch
 //! reimplementation of the same measurement shape the module doc comment on
@@ -215,7 +215,7 @@ mod tests {
         insert_message_parent_chain(&storage, 1, 1, 1);
         let generation_id = storage
             .raw()
-            .with_tx_no_replay(TxMode::Immediate, |tx| schema::create_embedding_generation_v5(tx, "bge-m3", 4, 1, 1, b"fp", 1))
+            .with_tx_no_replay(TxMode::Immediate, |tx| schema::create_embedding_generation(tx, "bge-m3", 4, 1, 1, b"fp", 1))
             .unwrap();
         storage
             .raw()
@@ -248,7 +248,7 @@ mod tests {
             })
             .unwrap();
 
-        vector_domain::rebuild_vec0_table_for_generation_v5(storage.raw(), generation_id, 4).unwrap();
+        vector_domain::rebuild_vec0_table_for_generation(storage.raw(), generation_id, 4).unwrap();
         generation_id
     }
 

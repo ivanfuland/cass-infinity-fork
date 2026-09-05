@@ -72178,7 +72178,7 @@ mod cli_read_db_tests {
         let gen_id = storage
             .raw()
             .with_tx(TxMode::Immediate, |tx| {
-                schema::create_embedding_generation_v5(
+                schema::create_embedding_generation(
                     tx,
                     "mock-embedder-t8",
                     4,
@@ -85607,7 +85607,7 @@ fn semantic_activation_suffix(stats: &indexer::IndexingStats) -> Option<String> 
         if activated {
             ", semantic index: activated".to_string()
         } else {
-            ", semantic index: not activated yet (holes remain; rerun to continue draining embedding_holes)"
+            ", semantic index: not activated yet (holes remain; rerun to continue draining chunk_holes)"
                 .to_string()
         }
     })
@@ -86323,7 +86323,7 @@ fn run_index_with_data(
                     if activated {
                         "activated"
                     } else {
-                        "not activated yet (holes remain; rerun to continue draining embedding_holes)"
+                        "not activated yet (holes remain; rerun to continue draining chunk_holes)"
                     }
                 );
             }
@@ -97519,7 +97519,7 @@ fn run_models_backfill(
 
     // W3-5: frankensearch/fsvi retired. The infinity-backed quality tier no
     // longer builds a .fsvi file -- it drains the DB vector domain's
-    // `embedding_holes` via the same catch-up `cass index --semantic` uses
+    // `chunk_holes` via the same catch-up `cass index --semantic` uses
     // (ingest-time hooks already register a hole per new message; this
     // drains them + does a genesis-eligibility rescan as a self-healing
     // safety net -- W3-5 task book #63 advisor ruling). hash/fastembed
@@ -97542,8 +97542,8 @@ fn run_models_backfill(
                 .batch_size();
             // T8 (plan v5.1, task book #92): `cass models backfill` drains
             // the chunk domain, matching `index --semantic`'s wiring --
-            // the v4 embedding_holes-driven function stays reachable
-            // (T11 deletes it) but nothing production calls it any more.
+            // the retired v4 message-granularity engine T11 deleted is no
+            // longer reachable from anywhere.
             let infinity_config = crate::search::infinity::InfinityConfig::from_env();
             let (identity, fingerprint) =
                 crate::search::infinity::probe_identity_and_fingerprint(&infinity_config).map_err(|e| CliError {
@@ -97568,7 +97568,7 @@ fn run_models_backfill(
                 embedder.embed_batch_sync(texts).map_err(|e| e.to_string())
             };
             let ownership_seed = FrankenStorage::now_millis() as u64;
-            let report = crate::indexer::db_vector_catchup::run_db_vector_catchup_backfill_v5(
+            let report = crate::indexer::db_vector_catchup::run_db_vector_catchup_backfill(
                 &storage,
                 batch_size,
                 &identity,
@@ -97604,7 +97604,7 @@ fn run_models_backfill(
                         "next_step": if report.activated {
                             "semantic tier is ready"
                         } else {
-                            "rerun the same command to continue draining embedding_holes"
+                            "rerun the same command to continue draining chunk_holes"
                         },
                         "tier": "quality",
                         "embedder_id": report.embedder_id,
@@ -97767,7 +97767,7 @@ mod w3_5_models_backfill_infinity_wiring_tests {
         let embedded_count: i64 = storage
             .raw()
             .query_row_map(
-                "SELECT COUNT(*) FROM message_embeddings WHERE generation_id = ?1",
+                "SELECT COUNT(DISTINCT message_id) FROM message_chunks WHERE generation_id = ?1",
                 &crate::storage::api::params![active.unwrap()],
                 |row| row.get_typed(0),
             )

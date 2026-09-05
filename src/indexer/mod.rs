@@ -8511,10 +8511,9 @@ fn run_semantic_db_vector_catchup(
     let batch_size = SemanticIndexer::new("infinity", None)?.batch_size();
 
     // T8 (plan v5.1, task book #92): `cass index --semantic` drains the
-    // chunk domain (`chunk_holes` -> `message_chunks`), not the retired
-    // v4 `embedding_holes` path -- the v4 function stays reachable (T11
-    // deletes it) but nothing production calls it any more as of this
-    // wiring commit.
+    // chunk domain (`chunk_holes` -> `message_chunks`) -- the retired v4
+    // message-granularity engine T11 deleted is no longer reachable from
+    // anywhere.
     let infinity_config = crate::search::infinity::InfinityConfig::from_env();
     let (identity, fingerprint) = crate::search::infinity::probe_identity_and_fingerprint(&infinity_config)
         .map_err(|e| anyhow::anyhow!("{caller}: infinity identity+fingerprint probe failed: {e}"))?;
@@ -8525,7 +8524,7 @@ fn run_semantic_db_vector_catchup(
         embedder.embed_batch_sync(texts).map_err(|e| e.to_string())
     };
     let ownership_seed = FrankenStorage::now_millis() as u64;
-    let report = crate::indexer::db_vector_catchup::run_db_vector_catchup_backfill_v5(
+    let report = crate::indexer::db_vector_catchup::run_db_vector_catchup_backfill(
         &storage,
         batch_size,
         &identity,
@@ -10659,7 +10658,7 @@ fn should_run_targeted_semantic_watch_once(opts: &IndexOptions) -> bool {
 /// W3-5: replaces the old fsvi rebuild-or-append-then-set-watermark
 /// machinery. `indexed_conversations`/`pre_watch_conversations` no longer
 /// gate a selection query -- the DB-vector-domain catch-up itself decides
-/// what's eligible via `embedding_holes` -- but the zero-conversations
+/// what's eligible via `chunk_holes` -- but the zero-conversations
 /// refusal is kept: publishing a "semantic ready" claim off a watch-once
 /// pass that indexed nothing would be misleading either way.
 ///
@@ -10693,7 +10692,7 @@ fn run_targeted_semantic_watch_once_publish(
         } else {
             "db-vector-domain catch-up ingested but has not activated yet (holes remain or \
              activation audit has not run this pass); rerun to continue draining \
-             embedding_holes (W3-5: fsvi manifest retired)"
+             chunk_holes (W3-5: fsvi manifest retired)"
                 .to_string()
         },
     })
@@ -34152,7 +34151,7 @@ mod tests {
         assert_eq!(
             crate::semantic_activation_suffix(&activated_false).as_deref(),
             Some(
-                ", semantic index: not activated yet (holes remain; rerun to continue draining embedding_holes)"
+                ", semantic index: not activated yet (holes remain; rerun to continue draining chunk_holes)"
             ),
             "activated=false must not be mistaken for \"no semantic pass ran\""
         );

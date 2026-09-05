@@ -113,7 +113,7 @@ fn create_generation(storage: &FrankenStorage, embedder_id: &str) -> i64 {
     storage
         .raw()
         .with_tx_no_replay(TxMode::Immediate, |tx| {
-            schema::create_embedding_generation_v5(tx, embedder_id, DIM, 1, 1, b"fingerprint-bytes", 1_000)
+            schema::create_embedding_generation(tx, embedder_id, DIM, 1, 1, b"fingerprint-bytes", 1_000)
         })
         .expect("create v5 embedding generation")
 }
@@ -167,7 +167,7 @@ fn seed_embedded_chunk(storage: &FrankenStorage, generation_id: i64, message_id:
             )
         })
         .expect("insert chunk row");
-    vector_domain::rebuild_vec0_table_for_generation_v5(storage.raw(), generation_id, DIM)
+    vector_domain::rebuild_vec0_table_for_generation(storage.raw(), generation_id, DIM)
         .expect("rebuild vec0 table");
     chunk_id
 }

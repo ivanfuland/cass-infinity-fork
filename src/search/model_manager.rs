@@ -453,8 +453,15 @@ pub(crate) fn probe_db_vector_domain_status(db_path: &Path) -> Option<DbVectorDo
         Err(err) => return Some(error_status(&err)),
     };
     if let Some((generation_id, embedder_id, dim, audit_status, chunking_policy_version)) = active {
+        // T11: `embedded_count` historically counted the retired v4
+        // message-granularity table's rows (one row per embedded message).
+        // Repointed to `message_chunks`, but `COUNT(DISTINCT message_id)`
+        // -- not `COUNT(*)` -- to preserve the field's semantics ("how many
+        // messages are embedded", not "how many chunks exist"; a message
+        // can own more than one chunk, and `chunk_count` below already
+        // reports the raw chunk-row count).
         let embedded_count: i64 = match conn.query_row_map(
-            "SELECT COUNT(*) FROM message_embeddings WHERE generation_id = ?1",
+            "SELECT COUNT(DISTINCT message_id) FROM message_chunks WHERE generation_id = ?1",
             &params![generation_id],
             |row| row.get_typed(0),
         ) {
@@ -581,7 +588,7 @@ pub fn load_hash_semantic_context(data_dir: &Path, _db_path: &Path) -> SemanticS
 /// daemon path (Infinity) at search time; this in-proc embedder supplies
 /// the matching id/dimension.
 ///
-/// W3-5: DB-vector-domain (`embedding_generations`/`message_embeddings`) is
+/// W3-5: DB-vector-domain (`embedding_generations`/`message_chunks`) is
 /// the sole substrate now -- the legacy fsvi-file path this used to fall
 /// back to (behind `CASS_SEMANTIC_USE_FSVI`) is retired along with the
 /// escape hatch itself, for the same builder-without-reader reason as
@@ -1030,7 +1037,7 @@ mod tests {
         let storage = FrankenStorage::open(&db_path).expect("open production storage");
         let gen_id = storage
             .raw()
-            .with_tx_no_replay(TxMode::Immediate, |tx| schema::create_embedding_generation(tx, "BAAI/bge-m3", 1024, 1, 0))
+            .with_tx_no_replay(TxMode::Immediate, |tx| schema::create_embedding_generation(tx, "BAAI/bge-m3", 1024, 1, 1, b"test-fingerprint", 0))
             .expect("create embedding generation");
         storage
             .raw()
@@ -1092,12 +1099,13 @@ mod tests {
     }
 
     /// T8 (plan v5.1): active v5 generation with one drained `message_chunks`
-    /// row -- a legacy-shaped fixture like `db_with_active_pending_generation`
-    /// above (v4 `create_embedding_generation`) always reads back
-    /// `chunk_count=Some(0)`/`chunking_policy_version=Some(0)` (`message_chunks`
-    /// is a base-schema table, always queryable, just empty for a v4-only
-    /// generation), so this fixture must go through the real v5 write shape
-    /// to prove a *populated* chunk_count/a real (non-legacy) policy version.
+    /// row -- `db_with_active_pending_generation` above creates a generation
+    /// but never inserts any chunk rows, so it always reads back
+    /// `chunk_count=Some(0)` (`message_chunks` is a base-schema table,
+    /// always queryable, just empty). This fixture goes through the real
+    /// production write path (ingest a message, drain it into a chunk row)
+    /// to prove a *populated* chunk_count and the real chunking policy
+    /// version.
     fn db_with_active_v5_generation_and_one_chunk(dir: &std::path::Path) -> PathBuf {
         use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
 
@@ -1107,7 +1115,7 @@ mod tests {
         let gen_id = storage
             .raw()
             .with_tx(TxMode::Immediate, |tx| {
-                schema::create_embedding_generation_v5(tx, "mock-embedder-t8", 4, crate::search::canonicalize::CANONICALIZE_PIPELINE_VERSION, crate::search::chunking::CHUNKING_POLICY_VERSION, &fingerprint, 0)
+                schema::create_embedding_generation(tx, "mock-embedder-t8", 4, crate::search::canonicalize::CANONICALIZE_PIPELINE_VERSION, crate::search::chunking::CHUNKING_POLICY_VERSION, &fingerprint, 0)
             })
             .expect("create v5 embedding generation");
 

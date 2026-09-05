@@ -2,8 +2,8 @@
 //! (`conversations`, `messages`, and their `PRAGMA foreign_key_list`
 //! ancestor tables) from a v4-or-v5 source database into a freshly built v5
 //! target database. Derived tables (`lex_docs`/`fts_lex`/`message_chunks`/
-//! `chunk_holes`/`chunk_staging`/`embedding_generations`/vec0 tables/legacy
-//! `message_embeddings`/`embedding_holes`) are never touched -- the target
+//! `chunk_holes`/`chunk_staging`/`embedding_generations`/vec0 tables) are
+//! never touched -- the target
 //! is meant to be re-indexed from scratch by the caller (T10's
 //! `w4_corpus_diff` compares a `--from` copy like this one against a
 //! freshly-reingested new v5 db to prove no content was lost across a

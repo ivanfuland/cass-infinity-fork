@@ -8,7 +8,7 @@
 //! still needed to read `.fsvi`, and hash being the "always-on" fallback
 //! embedder) both no longer hold: W3-2 itself was cancelled, and the hash
 //! embedder's own write path was retired in 4064e8fc. The DB-vector-domain
-//! (`message_embeddings` + sqlite-vec) engine is the sole vector search
+//! (`message_chunks` + sqlite-vec) engine is the sole vector search
 //! path now. This module keeps the still-live cass-specific helpers (doc_id
 //! encoding, role codes, portable-SIMD dot product) in one place.
 

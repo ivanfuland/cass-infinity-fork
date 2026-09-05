@@ -99,7 +99,7 @@ fn build_fixture(data_dir: &Path) {
     let generation_id = conn
         .with_tx(TxMode::Immediate, |tx| {
             let generation_id =
-                schema::create_embedding_generation_v5(tx, "bge-m3", DIM, 1, 1, &fingerprint, 1_000)?;
+                schema::create_embedding_generation(tx, "bge-m3", DIM, 1, 1, &fingerprint, 1_000)?;
             let norm = schema::l2_norm(&vector) as f32;
             schema::insert_chunk_row_in_tx(
                 tx,
