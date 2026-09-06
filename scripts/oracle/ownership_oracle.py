@@ -37,8 +37,19 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from normalize_v2 import canonical_role, chunk_normalized, normalize  # noqa: E402
 
+# T11.8: a message with N chunks sends N request lines sharing the same
+# (role, content) -- without this cache, `normalize`+`chunk_normalized` ran
+# once per chunk (N times) instead of once per message. Single-slot: only
+# the immediately preceding (role, content) is remembered, matching the
+# Rust side's own one-message-at-a-time cache and this script's protocol
+# (a strict per-line stream, never reordered or replayed).
+_cache_key: tuple[str, str] | None = None
+_cache_normalized: str = ""
+_cache_spans: list[tuple[int, int]] = []
+
 
 def process_line(line: str) -> dict:
+    global _cache_key, _cache_normalized, _cache_spans
     record = json.loads(line)
     correlation_id = record["correlation_id"]
     role = record["role"]
@@ -48,11 +59,18 @@ def process_line(line: str) -> dict:
     if canonical_role(role) is None:
         return {"correlation_id": correlation_id, "ok": False, "error": "non_whitelist_role"}
 
-    normalized = normalize(content)
+    cache_key = (role, content)
+    if cache_key == _cache_key:
+        normalized = _cache_normalized
+        spans = _cache_spans
+    else:
+        normalized = normalize(content)
+        spans = chunk_normalized(normalized) if normalized != "" else []
+        _cache_key, _cache_normalized, _cache_spans = cache_key, normalized, spans
+
     if normalized == "":
         return {"correlation_id": correlation_id, "ok": False, "error": "canonicalize_empty"}
 
-    spans = chunk_normalized(normalized)
     if chunk_idx < 0 or chunk_idx >= len(spans):
         return {"correlation_id": correlation_id, "ok": False, "error": "chunk_idx_out_of_range"}
 
