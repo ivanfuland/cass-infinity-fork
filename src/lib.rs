@@ -23410,7 +23410,10 @@ fn run_cli_search(
             search_sparse_threshold,
             field_mask,
         ) {
-            Ok(result) => result,
+            Ok(result) => {
+                sync_search_mode_meta_after_hybrid(&mut mode_meta, &result);
+                result
+            }
             Err(e) => {
                 let err_str = e.to_string();
                 if hybrid_fail_open
@@ -25640,6 +25643,25 @@ impl SearchModeMeta {
         self.fallback_reason
             .as_deref()
             .map(crate::search::search_mode_metadata::classify_fallback_reason)
+    }
+}
+
+/// R1-B3 (exec92): a hybrid search whose semantic leg fails open
+/// (`SearchResult.semantic_degraded=true`, e.g. Infinity dropping the
+/// connection after a successful readiness check) still returns `Ok` --
+/// unlike the `Err` branch right above this call site, this path never
+/// synced `mode_meta`, so `_meta` reported `search_mode=hybrid` /
+/// `semantic_refinement=true` / `refinement_level=fully_hybrid_refined`
+/// (all still tracking the *requested* mode) in the same envelope as the
+/// new `semantic_degraded=true` field disclosing the exact opposite.
+/// Reuses the same `fall_back_to_lexical` transition the `Err` branch
+/// already takes, so every `_meta` field derived from `mode_meta`
+/// (`realized`, `fallback_tier`, `fallback_reason`, `semantic_refinement()`,
+/// `realized_refinement()`) becomes consistent with the degraded result
+/// through the one shared code path, not a second copy of the sync logic.
+fn sync_search_mode_meta_after_hybrid(mode_meta: &mut SearchModeMeta, result: &crate::search::query::SearchResult) {
+    if result.semantic_degraded {
+        mode_meta.fall_back_to_lexical("hybrid semantic leg degraded (fail-open to lexical-only results)");
     }
 }
 
@@ -99026,6 +99048,46 @@ mod subcommand_robot_output_tests {
         assert_eq!(meta.realized, crate::search::query::SearchMode::Lexical);
         assert_eq!(meta.fallback_tier, Some("lexical"));
         assert!(!meta.semantic_refinement());
+    }
+
+    fn hybrid_search_result_stub(semantic_degraded: bool) -> crate::search::query::SearchResult {
+        crate::search::query::SearchResult {
+            hits: Vec::new(),
+            wildcard_fallback: false,
+            cache_stats: crate::search::query::CacheStats::default(),
+            suggestions: Vec::new(),
+            total_count: None,
+            candidates: None,
+            semantic_degraded,
+        }
+    }
+
+    /// R1-B3: an `Ok` hybrid result whose semantic leg degraded must sync
+    /// `mode_meta` to a lexical realization -- before this fix, `_meta`
+    /// simultaneously reported `semantic_degraded=true` (from the raw
+    /// result) and `search_mode=hybrid`/`semantic_refinement=true` (from
+    /// an un-synced `mode_meta`), a self-contradicting envelope.
+    #[test]
+    fn sync_search_mode_meta_after_hybrid_falls_back_on_degraded_result() {
+        let mut meta = SearchModeMeta::new(crate::search::query::SearchMode::Hybrid, false);
+        sync_search_mode_meta_after_hybrid(&mut meta, &hybrid_search_result_stub(true));
+
+        assert_eq!(meta.realized, crate::search::query::SearchMode::Lexical);
+        assert_eq!(meta.fallback_tier, Some("lexical"));
+        assert!(meta.fallback_reason.is_some());
+        assert!(!meta.semantic_refinement());
+    }
+
+    /// The normal (non-degraded) hybrid path must be left untouched.
+    #[test]
+    fn sync_search_mode_meta_after_hybrid_leaves_normal_result_untouched() {
+        let mut meta = SearchModeMeta::new(crate::search::query::SearchMode::Hybrid, false);
+        sync_search_mode_meta_after_hybrid(&mut meta, &hybrid_search_result_stub(false));
+
+        assert_eq!(meta.realized, crate::search::query::SearchMode::Hybrid);
+        assert_eq!(meta.fallback_tier, None);
+        assert_eq!(meta.fallback_reason, None);
+        assert!(meta.semantic_refinement());
     }
 
     #[test]

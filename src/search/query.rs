@@ -1919,8 +1919,23 @@ pub fn rrf_fuse_hits(
 
     for (idx, hit) in semantic.iter().enumerate() {
         let doc_id = search_hit_doc_id(hit);
+        // R1-N1 (exec92): when the same doc_id was already inserted by the
+        // lexical pass above, keep that lexical hit (its snippet highlights
+        // the query terms) but merge in this semantic hit's chunk-domain
+        // provenance if the lexical hit doesn't already carry its own --
+        // a lexical hit's `winning_chunk_*` fields are always `None`
+        // (`lexical_search_hits_carry_message_id_but_no_winning_chunk_
+        // fields`), so a bare `or_insert_with` here silently drops the
+        // semantic leg's provenance on every doc that both legs hit.
         hit_by_doc_id
             .entry(doc_id.clone())
+            .and_modify(|existing| {
+                if existing.winning_chunk_idx.is_none() {
+                    existing.winning_chunk_idx = hit.winning_chunk_idx;
+                    existing.winning_chunk_span = hit.winning_chunk_span;
+                    existing.winning_chunk_hash = hit.winning_chunk_hash.clone();
+                }
+            })
             .or_insert_with(|| hit.clone());
         semantic_scored.push(FsVectorHit {
             index: u32::try_from(idx).unwrap_or(u32::MAX),
@@ -5045,21 +5060,51 @@ impl SearchClient {
     /// string LIKE also ignored any boolean structure in the raw text). A
     /// trailing bare `*` is stripped per-term, mirroring the existing
     /// single-term path's `raw_query.trim().replace('*', "")`.
+    /// R1-N6 (exec92): the `flat_map` this used to be dropped `NOT`/`OR`
+    /// tokens themselves (correctly -- they aren't terms) but then still
+    /// fed the *next* `Term`/`Phrase` token through the same positive-term
+    /// path regardless of which operator preceded it, since `flat_map`
+    /// processes each token independently with no memory of the previous
+    /// one. For `NOT`, that silently flipped an exclusion into a required
+    /// term: `alpha NOT io` produced `["alpha", "io"]`, ANDed together by
+    /// [`lex_docs_like_candidates_query_multi_term`] -- the fallback then
+    /// selected exactly the rows it was supposed to exclude. `OR` cannot
+    /// be expressed as an AND-of-LIKE list *at all* (there is no
+    /// disjunctive form here), so a query containing one falls all the way
+    /// back to the pre-T11.11 whole-string LIKE path instead of silently
+    /// ANDing its operands together.
     fn ku3_like_fallback_terms(raw_query: &str) -> Vec<String> {
-        fs_cass_parse_boolean_query(raw_query)
-            .into_iter()
-            .flat_map(|token| match token {
-                FsCassQueryToken::Term(t) => normalize_term_parts(&t),
+        let tokens = fs_cass_parse_boolean_query(raw_query);
+        if tokens.iter().any(|t| matches!(t, FsCassQueryToken::Or)) {
+            let trimmed = raw_query.trim();
+            return if trimmed.is_empty() { Vec::new() } else { vec![trimmed.to_string()] };
+        }
+        let mut terms: Vec<String> = Vec::new();
+        let mut skip_next_term = false;
+        for token in tokens {
+            match token {
+                FsCassQueryToken::Not => skip_next_term = true,
+                FsCassQueryToken::And => {}
+                FsCassQueryToken::Or => unreachable!("queries containing OR return above"),
+                FsCassQueryToken::Term(t) => {
+                    if std::mem::take(&mut skip_next_term) {
+                        continue;
+                    }
+                    terms.extend(normalize_term_parts(&t));
+                }
                 FsCassQueryToken::Phrase(p) => {
+                    if std::mem::take(&mut skip_next_term) {
+                        continue;
+                    }
                     let trimmed = p.trim();
-                    if trimmed.is_empty() {
-                        Vec::new()
-                    } else {
-                        vec![trimmed.to_string()]
+                    if !trimmed.is_empty() {
+                        terms.push(trimmed.to_string());
                     }
                 }
-                FsCassQueryToken::And | FsCassQueryToken::Or | FsCassQueryToken::Not => Vec::new(),
-            })
+            }
+        }
+        terms
+            .into_iter()
             .map(|t| t.trim_matches('*').to_string())
             .filter(|t| !t.is_empty())
             .collect()
@@ -7162,20 +7207,21 @@ mod tests {
         assert!(hits[0].winning_chunk_hash.is_none(), "lexical hit has no chunk-domain provenance");
     }
 
-    /// T9 part 2 (mission #93/#93b Step 1): hybrid RRF fusion must not
-    /// clobber a semantic-only hit's provenance fields -- `rrf_fuse_hits`
-    /// clones the whole `SearchHit` it keeps in `hit_by_doc_id`, only ever
-    /// overwriting `score` afterward.
+    /// T9 part 2 (mission #93/#93b Step 1) + R1-N1 (exec92): hybrid RRF
+    /// fusion must not clobber a semantic-only hit's provenance fields.
+    /// This exercises the collision shape specifically -- both the lexical
+    /// and the semantic query match the *same* message ("top semantic
+    /// match"), so `hit_by_doc_id` first inserts the lexical hit (whose
+    /// `winning_chunk_*` fields are always `None`) and then must merge,
+    /// not skip, the semantic leg's provenance for that same doc_id.
+    /// Pre-fix, `or_insert_with` alone left the lexical hit in place
+    /// untouched, silently dropping the semantic leg's chunk provenance
+    /// for every doc both legs hit.
     #[test]
     fn hybrid_preserves_winning_chunk_provenance_after_rrf() -> Result<()> {
         let fixture = build_semantic_test_fixture()?;
-        // A lexical query that matches none of the fixture's 3 messages, so
-        // the semantic leg's hit(s) cannot collide (by doc_id) with a
-        // lexical hit that would otherwise win `rrf_fuse_hits`'s
-        // `hit_by_doc_id` map and paper over the semantic provenance with
-        // a lexical hit's (always-`None`) provenance fields.
         let result = fixture.client.search_hybrid(
-            "zzz_no_lexical_match_zzz",
+            "top semantic match",
             "top semantic match",
             SearchFilters::default(),
             3,
@@ -7186,9 +7232,16 @@ mod tests {
         assert!(!result.semantic_degraded, "the fixture has a live active generation");
         assert!(!result.hits.is_empty());
         let top = &result.hits[0];
+        assert!(!top.snippet.is_empty(), "the lexical hit's snippet must survive the merge");
         assert!(top.message_id.is_some(), "RRF must preserve the semantic hit's message_id");
-        assert!(top.winning_chunk_idx.is_some(), "RRF must preserve the semantic hit's winning_chunk_idx");
-        assert!(top.winning_chunk_hash.is_some(), "RRF must preserve the semantic hit's winning_chunk_hash");
+        assert!(
+            top.winning_chunk_idx.is_some(),
+            "RRF must merge in the semantic hit's winning_chunk_idx even when a lexical hit for the same doc_id was inserted first: {top:?}"
+        );
+        assert!(
+            top.winning_chunk_hash.is_some(),
+            "RRF must merge in the semantic hit's winning_chunk_hash even when a lexical hit for the same doc_id was inserted first: {top:?}"
+        );
         Ok(())
     }
 
@@ -16543,6 +16596,43 @@ mod tests {
         assert!(
             !params.iter().any(|p| format!("{p:?}").contains(&whole_string_pattern)),
             "must not fall back to one whole-string LIKE pattern when terms.len() >= 2"
+        );
+    }
+
+    /// R1-N6 (exec92): `NOT` negates the term immediately following it --
+    /// that term must be dropped, not folded into the AND-of-LIKE list as
+    /// a required positive term (which would select exactly the rows the
+    /// query asked to exclude).
+    #[test]
+    fn ku3_like_fallback_terms_drops_term_after_not() {
+        assert_eq!(
+            SearchClient::ku3_like_fallback_terms("alpha NOT io"),
+            vec!["alpha".to_string()],
+            "the term following NOT must be excluded, not ANDed in as a required term"
+        );
+    }
+
+    /// R1-N6 (exec92): `OR` cannot be expressed as an AND-of-LIKE term
+    /// list, so the whole query must fall back to the single whole-string
+    /// path (the pre-T11.11 behavior for this shape) instead of silently
+    /// dropping the OR and ANDing its operands.
+    #[test]
+    fn ku3_like_fallback_terms_falls_back_to_whole_string_on_or() {
+        assert_eq!(
+            SearchClient::ku3_like_fallback_terms("alpha OR io"),
+            vec!["alpha OR io".to_string()],
+            "a query containing OR must fall back to the single whole-string term, not split+AND its operands"
+        );
+    }
+
+    /// R1-N6 (exec92): a plain multi-word query with no boolean operators
+    /// must be unaffected by the NOT/OR handling above -- every word still
+    /// becomes its own AND'd term.
+    #[test]
+    fn ku3_like_fallback_terms_unaffected_by_boolean_handling_when_no_operators() {
+        assert_eq!(
+            SearchClient::ku3_like_fallback_terms("alpha io"),
+            vec!["alpha".to_string(), "io".to_string()],
         );
     }
 
