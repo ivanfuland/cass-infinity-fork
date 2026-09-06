@@ -62,6 +62,18 @@
 //!      [`EMBED_BATCH`] texts per request, response items aligned strictly
 //!      by their own `index` field (never by response-array position).
 //!
+//! T11.8.1 (found by the same-day rewrite's own regression test running
+//! slow under host contention, control plane's environment): every
+//! request line still re-sent its message's full `content`, so an
+//! N-chunk message sent that content N times over the pipe (this file's
+//! own 5,556-chunk deadlock-regression fixture: 27 GB total; a real
+//! ~0.85 MB/~1,000-chunk production message: ~850 MB). Fixed by a
+//! `same_as_prev` request-line variant (omits `role`/`content` when
+//! identical to the immediately preceding line) that `ownership_oracle
+//! .py`'s own one-slot cache resolves without this process re-sending
+//! anything; a `same_as_prev` line with nothing cached yet is a protocol
+//! error, not a silent no-op.
+//!
 //! Usage: `cargo run --release --no-default-features --features
 //! qr,encryption,infinity --example w4_ownership_oracle -- --db <path>
 //! (--full | --sample <N> --seed <S>) --infinity <url> --json <out>`. Exit
@@ -541,6 +553,19 @@ fn compute_report(
 
     let mut after_chunk_id = 0i64;
     let run_started = Instant::now();
+    // T11.8.1: the `message_id` whose (role, content) was most recently
+    // WRITTEN to ownership_oracle.py's stdin -- persists across pages
+    // (unlike `write_cache`/`check_cache` below, which are per-page DB-
+    // read caches). A page-crossing message run (its last chunk on page
+    // N, more chunks starting page N+1) still gets `same_as_prev: true`
+    // on that first page-N+1 line, since the wire-protocol question
+    // ("did the last line I sent already carry this exact content?") is
+    // independent of this file's own page-batching internals. Two
+    // distinct messages having byte-identical (role, content) would make
+    // this proxy (message_id equality) miss a real same_as_prev
+    // opportunity -- never incorrect, just a vanishingly rare missed
+    // optimization, and far cheaper than comparing owned `String`s.
+    let mut last_written_message_id: Option<i64> = None;
 
     loop {
         let mut page = fetch_chunk_page(storage, generation_id, after_chunk_id, PAGE_ROWS)?;
@@ -569,8 +594,23 @@ fn compute_report(
                 write_cache = Some((c.message_id, role, content));
             }
             let (_, role, content) = write_cache.as_ref().expect("just set above");
-            let line = serde_json::json!({"correlation_id": c.chunk_id, "role": role, "content": content, "chunk_idx": c.chunk_idx});
+            // T11.8.1: omit (role, content) on the wire when this chunk's
+            // message is the same one the last-written line already
+            // carried -- ownership_oracle.py caches (role, content) ->
+            // (normalized, spans) itself and reuses it on `same_as_prev`.
+            // Without this, a long message's chunks each re-send the
+            // ENTIRE message content: a real 0.85 MB message with ~1,000
+            // chunks was 850 MB over the pipe for one message alone, and
+            // this file's own 5 MB/5,556-chunk deadlock-regression
+            // fixture sent 27 GB total -- exactly the kind of load that
+            // makes that fixture's runtime sensitive to host contention.
+            let line = if last_written_message_id == Some(c.message_id) {
+                serde_json::json!({"correlation_id": c.chunk_id, "chunk_idx": c.chunk_idx, "same_as_prev": true})
+            } else {
+                serde_json::json!({"correlation_id": c.chunk_id, "role": role, "content": content, "chunk_idx": c.chunk_idx})
+            };
             writeln!(oracle.stdin, "{line}").context("writing a request line to ownership_oracle.py's stdin")?;
+            last_written_message_id = Some(c.message_id);
         }
         oracle.stdin.flush().context("flushing ownership_oracle.py's stdin")?;
 
@@ -1191,21 +1231,40 @@ mod tests {
         let path_for_thread = path.clone();
         let infinity_url = format!("http://{addr}");
         let (tx, rx) = std::sync::mpsc::channel();
+        let started = Instant::now();
         std::thread::spawn(move || {
             let result = run(&path_for_thread, true, None, None, &infinity_url, None, None);
             let _ = tx.send(result);
         });
 
+        // 180s stays a generous upper bound against a genuine hang (this
+        // test's original purpose); the separate <20s assertion below is
+        // T11.8.1's own regression guard -- without `same_as_prev`, this
+        // fixture's ~5,556 chunks each re-send the whole 5 MB message
+        // (27 GB total over the pipe), which took ~41s locally (unloaded)
+        // and 180.82s/exit 101 under control plane's real host contention
+        // (load ~6) -- 20s is tight enough that even the unloaded ~41s
+        // number trips it (verified: forcing `same_as_prev` permanently
+        // off reproduces a red run under this bound), unlike the 60s this
+        // test originally shipped with.
         let result = rx.recv_timeout(std::time::Duration::from_secs(180));
+        let elapsed = started.elapsed();
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         let (code, report, message) = result.unwrap_or_else(|_| panic!("deadlock: run(--full) over a {chunk_count}-chunk single message did not return within 180s"));
         assert_eq!(code, 0, "{message}");
+        assert!(elapsed < std::time::Duration::from_secs(20), "same_as_prev should keep a {chunk_count}-chunk single-message run well under 20s (took {elapsed:?})");
         let report = report.unwrap();
         assert_eq!(report.checked, chunk_count);
         assert_eq!(report.span_failed, 0);
         assert_eq!(report.cosine_failed, 0);
         assert_eq!(report.vec0_mismatch, 0);
         assert!(report.batches >= 2, "a {chunk_count}-chunk generation must span more than one {PAGE_ROWS}-row page");
+    }
+
+    #[test]
+    fn ownership_oracle_py_selftest_passes() {
+        let status = Command::new("python3").arg(OWNERSHIP_ORACLE_PY).arg("--selftest").status().unwrap();
+        assert!(status.success(), "ownership_oracle.py --selftest failed: {status:?}");
     }
 
     /// T11.8: proves `select_sample_ids` (the rewritten, ids-only
