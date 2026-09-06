@@ -25297,6 +25297,13 @@ fn projected_hit_field_value(
             .workspace_original
             .as_ref()
             .map(|value| serde_json::Value::String(value.clone())),
+        // Chunk-domain provenance (T9/T11.9): omitted entirely when
+        // `None` (lexical-only hits), same as origin_host/
+        // workspace_original above -- never a bare `null`.
+        "message_id" => hit.message_id.and_then(|v| serde_json::to_value(v).ok()),
+        "winning_chunk_idx" => hit.winning_chunk_idx.and_then(|v| serde_json::to_value(v).ok()),
+        "winning_chunk_span" => hit.winning_chunk_span.and_then(|v| serde_json::to_value(v).ok()),
+        "winning_chunk_hash" => hit.winning_chunk_hash.as_ref().map(|value| serde_json::Value::String(value.clone())),
         _ => None,
     }
 }
@@ -25330,6 +25337,11 @@ fn filter_hit_fields(
                 "origin_kind",
                 "origin_host",
                 "workspace_original",
+                // Chunk-domain provenance (T9/T11.9)
+                "message_id",
+                "winning_chunk_idx",
+                "winning_chunk_span",
+                "winning_chunk_hash",
             ];
 
             for field in field_list {
@@ -26066,13 +26078,31 @@ fn output_robot_results(
                 S: Serializer,
             {
                 let hit = self.0;
-                let mut map = serializer.serialize_map(Some(5))?;
+                // Chunk-domain provenance (T9/T11.9): summary is a
+                // deliberately thin projection, so only the two cheap
+                // identity fields join it -- span/hash stay out (mission
+                // #102's own scoping), matching neither being one of this
+                // struct's fixed 5+N fields before this change either.
+                let mut fields = 5usize;
+                if hit.message_id.is_some() {
+                    fields += 1;
+                }
+                if hit.winning_chunk_idx.is_some() {
+                    fields += 1;
+                }
+                let mut map = serializer.serialize_map(Some(fields))?;
                 map.serialize_entry("source_path", &hit.source_path)?;
                 map.serialize_entry("line_number", &hit.line_number)?;
                 map.serialize_entry("agent", &hit.agent)?;
                 map.serialize_entry("title", &hit.title)?;
                 let safe_score = safe_robot_score_value(hit.score);
                 map.serialize_entry("score", &safe_score)?;
+                if let Some(message_id) = hit.message_id {
+                    map.serialize_entry("message_id", &message_id)?;
+                }
+                if let Some(winning_chunk_idx) = hit.winning_chunk_idx {
+                    map.serialize_entry("winning_chunk_idx", &winning_chunk_idx)?;
+                }
                 map.end()
             }
         }
@@ -26186,6 +26216,22 @@ fn output_robot_results(
                 if normalized_origin_host.is_some() {
                     fields += 1;
                 }
+                // Chunk-domain provenance (T9/T11.9): `None` for lexical-
+                // only hits (matches `SearchHit`'s own `skip_serializing_if
+                // = "Option::is_none"` semantics -- omit the key entirely,
+                // don't emit `null`).
+                if hit.message_id.is_some() {
+                    fields += 1;
+                }
+                if hit.winning_chunk_idx.is_some() {
+                    fields += 1;
+                }
+                if hit.winning_chunk_span.is_some() {
+                    fields += 1;
+                }
+                if hit.winning_chunk_hash.is_some() {
+                    fields += 1;
+                }
                 let mut map = serializer.serialize_map(Some(fields))?;
                 map.serialize_entry("title", &hit.title)?;
                 map.serialize_entry("snippet", &hit.snippet)?;
@@ -26206,6 +26252,18 @@ fn output_robot_results(
                 map.serialize_entry("origin_kind", &normalized_origin_kind)?;
                 if let Some(ref origin_host) = normalized_origin_host {
                     map.serialize_entry("origin_host", origin_host)?;
+                }
+                if let Some(message_id) = hit.message_id {
+                    map.serialize_entry("message_id", &message_id)?;
+                }
+                if let Some(winning_chunk_idx) = hit.winning_chunk_idx {
+                    map.serialize_entry("winning_chunk_idx", &winning_chunk_idx)?;
+                }
+                if let Some(winning_chunk_span) = hit.winning_chunk_span {
+                    map.serialize_entry("winning_chunk_span", &winning_chunk_span)?;
+                }
+                if let Some(ref winning_chunk_hash) = hit.winning_chunk_hash {
+                    map.serialize_entry("winning_chunk_hash", winning_chunk_hash)?;
                 }
                 map.end()
             }
