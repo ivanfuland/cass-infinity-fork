@@ -177,42 +177,67 @@ fn copy_content_layer(from: &Path, to: &Path) -> Result<ContentCopyReport> {
         .execute("ATTACH DATABASE ?1 AS src", &[Value::from(from_uri)])
         .context("ATTACH source database read-only as 'src'")?;
 
-    let order = discover_content_tables_topo(&storage, &["conversations", "messages"])?;
+    // R2-#10 (exec94): every table copy below used to run as an
+    // independent autocommit statement -- a failure partway through (e.g.
+    // disk full on a later table) left the target with some tables
+    // populated and others not, and a retry couldn't tell "empty target,
+    // start fresh" from "half-copied target, resume" (the empty-target
+    // check above rejects both the same way). Wrapping the whole copy loop
+    // plus its verification reads in one transaction makes a failure
+    // atomic: `ROLLBACK` puts the target back to the empty state the
+    // caller can retry from. ATTACH stays outside the transaction (SQLite
+    // allows ATTACH inside `BEGIN IMMEDIATE`, but DETACH of a database
+    // used within the transaction fails with "database src is locked"
+    // until that transaction has committed or rolled back), so DETACH
+    // below always runs after the COMMIT/ROLLBACK decision, not before.
+    storage.raw().execute("BEGIN IMMEDIATE;", &[]).context("BEGIN IMMEDIATE for content copy")?;
+    let copy_result: Result<ContentCopyReport> = (|| {
+        let order = discover_content_tables_topo(&storage, &["conversations", "messages"])?;
 
-    let mut tables_report = Vec::with_capacity(order.len());
-    for table in &order {
-        let target_cols: HashSet<String> = table_columns(&storage, "", table)?.into_iter().collect();
-        let src_cols: HashSet<String> = table_columns(&storage, "src", table)?.into_iter().collect();
-        let mut shared: Vec<String> = target_cols.intersection(&src_cols).cloned().collect();
-        shared.sort();
-        anyhow::ensure!(!shared.is_empty(), "table {table:?} has zero shared columns between src and target");
-        let col_list = shared.join(", ");
-        // R1-B5 (exec92): `OR IGNORE` must stay scoped to `sources` -- a
-        // fresh v5 target built by `schema::ensure` already seeds that
-        // table's well-known `local` row, and the source db (built the
-        // same way) carries an identical seed row that would otherwise
-        // collide on `INSERT` with a `UNIQUE`/primary-key violation before
-        // any real content copies. Applying `OR IGNORE` to every table
-        // (the pre-fix behavior) silently discarded any *real* content-row
-        // conflict too -- with the empty-target check above in place this
-        // is no longer reachable for a fresh target, but a plain `INSERT`
-        // on every non-seed table still fails loudly (a real defect,
-        // rather than a silently-dropped row) if that invariant is ever
-        // violated by a future caller.
-        let ignore_clause = if table == "sources" { " OR IGNORE" } else { "" };
-        let sql = format!("INSERT{ignore_clause} INTO main.{table} ({col_list}) SELECT {col_list} FROM src.{table}");
-        let rows_copied = storage.raw().execute(&sql, &[]).with_context(|| format!("copying content-layer table {table:?}"))?;
-        tables_report.push(TableCopyReport { table: table.clone(), rows_copied: rows_copied as i64 });
+        let mut tables_report = Vec::with_capacity(order.len());
+        for table in &order {
+            let target_cols: HashSet<String> = table_columns(&storage, "", table)?.into_iter().collect();
+            let src_cols: HashSet<String> = table_columns(&storage, "src", table)?.into_iter().collect();
+            let mut shared: Vec<String> = target_cols.intersection(&src_cols).cloned().collect();
+            shared.sort();
+            anyhow::ensure!(!shared.is_empty(), "table {table:?} has zero shared columns between src and target");
+            let col_list = shared.join(", ");
+            // R1-B5 (exec92): the `sources` copy must stay scoped
+            // separately from every other table -- a fresh v5 target built
+            // by `schema::ensure` already seeds that table's well-known
+            // `local` row, and the source db (built the same way) carries
+            // a real `sources['local']` row of its own (potentially with
+            // `machine_id`/`platform`/`config_json` populated) that would
+            // otherwise collide on `INSERT` with a `UNIQUE`/primary-key
+            // violation before any real content copies.
+            //
+            // R2-#4 (exec94): `OR IGNORE` (the pre-fix behavior) kept the
+            // target's empty seed row and silently discarded the source's
+            // real one on that PK collision -- this "copy" is meant to be
+            // a byte-faithful content snapshot, so the source's row must
+            // win. `OR REPLACE` on `sources` only (every other table stays
+            // a plain `INSERT`, which still fails loudly on any other
+            // future PK collision, same as before).
+            let ignore_clause = if table == "sources" { " OR REPLACE" } else { "" };
+            let sql = format!("INSERT{ignore_clause} INTO main.{table} ({col_list}) SELECT {col_list} FROM src.{table}");
+            let rows_copied = storage.raw().execute(&sql, &[]).with_context(|| format!("copying content-layer table {table:?}"))?;
+            tables_report.push(TableCopyReport { table: table.clone(), rows_copied: rows_copied as i64 });
+        }
+
+        let src_messages: i64 =
+            storage.raw().query_row_map("SELECT COUNT(*) FROM src.messages", &[], |row| row.get_typed(0))?;
+        let dst_messages: i64 =
+            storage.raw().query_row_map("SELECT COUNT(*) FROM main.messages", &[], |row| row.get_typed(0))?;
+
+        storage.raw().execute("COMMIT;", &[]).context("COMMIT content copy")?;
+        Ok(ContentCopyReport { tables: tables_report, src_messages, dst_messages })
+    })();
+    if copy_result.is_err() {
+        let _ = storage.raw().execute("ROLLBACK;", &[]);
     }
-
-    let src_messages: i64 =
-        storage.raw().query_row_map("SELECT COUNT(*) FROM src.messages", &[], |row| row.get_typed(0))?;
-    let dst_messages: i64 =
-        storage.raw().query_row_map("SELECT COUNT(*) FROM main.messages", &[], |row| row.get_typed(0))?;
-
     storage.raw().execute_batch("DETACH DATABASE src").context("DETACH src")?;
 
-    Ok(ContentCopyReport { tables: tables_report, src_messages, dst_messages })
+    copy_result
 }
 
 /// Runs the copy and returns the process exit code (0/1/2) plus the report
@@ -327,6 +352,74 @@ mod tests {
         let dst_conversations: i64 =
             target.raw().query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| row.get_typed(0)).unwrap();
         assert_eq!(dst_conversations, 5);
+    }
+
+    /// R2-#4 (exec94): the source db's real `sources['local']` row (with
+    /// `machine_id` populated) must win over the fresh target's empty seed
+    /// row -- pre-fix `INSERT OR IGNORE` kept the target's empty seed row
+    /// on the primary-key collision and silently discarded the source's
+    /// real metadata.
+    #[test]
+    fn sources_row_is_replaced_not_ignored_on_copy() {
+        let dir = TempDir::new().unwrap();
+        let from = seed_source_db(dir.path(), 1, 1);
+
+        let writer = FrankenStorage::open_writer(&from).unwrap();
+        writer
+            .upsert_source(&coding_agent_search::sources::provenance::Source {
+                machine_id: Some("m1".into()),
+                ..coding_agent_search::sources::provenance::Source::local()
+            })
+            .unwrap();
+        drop(writer);
+
+        let to = dir.path().join("target").join("fresh.db");
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+        let (code, message) = run(&from, &to);
+        assert_eq!(code, 0, "copy must still succeed: {message}");
+
+        let target = FrankenStorage::open_readonly(&to).unwrap();
+        let machine_id: Option<String> = target
+            .raw()
+            .query_row_map("SELECT machine_id FROM sources WHERE id = ?1", &[Value::from(LOCAL_SOURCE_ID)], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(
+            machine_id.as_deref(),
+            Some("m1"),
+            "source's real sources.local row must win over the target's empty seed row"
+        );
+    }
+
+    /// R2-#10 (exec94): a failure partway through the copy loop (here,
+    /// `messages` -- a child table in FK order, so `conversations` and its
+    /// other ancestors have already been INSERTed by the time this fails --
+    /// is missing from the source) must not leave the target half-
+    /// populated. The whole copy runs in one transaction now, so the
+    /// already-copied `conversations` rows must roll back too.
+    #[test]
+    fn partial_copy_failure_rolls_back_already_copied_tables() {
+        let dir = TempDir::new().unwrap();
+        let from = seed_source_db(dir.path(), 3, 5);
+
+        let writer = FrankenStorage::open_writer(&from).unwrap();
+        writer.raw().execute_batch("DROP TABLE messages;").unwrap();
+        drop(writer);
+
+        let to = dir.path().join("target").join("fresh.db");
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+
+        let (code, message) = run(&from, &to);
+        assert_eq!(code, 2, "a mid-copy failure must be a precondition error, not report success: {message}");
+
+        let target = FrankenStorage::open_readonly(&to).unwrap();
+        let dst_conversations: i64 =
+            target.raw().query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| row.get_typed(0)).unwrap();
+        assert_eq!(
+            dst_conversations, 0,
+            "a failed copy must roll back already-copied tables, not leave a half-populated target: got {dst_conversations}"
+        );
     }
 
     #[test]

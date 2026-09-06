@@ -184,10 +184,33 @@ fn compute_report(cases: &[JudgmentCase], baseline: &BaselineFile, search: &dyn 
 
 fn load_fixture(path: &std::path::Path) -> anyhow::Result<Vec<JudgmentCase>> {
     let text = std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
-    text.lines()
+    let cases: Vec<JudgmentCase> = text
+        .lines()
         .filter(|l| !l.trim().is_empty())
         .map(|l| serde_json::from_str(l).map_err(|e| anyhow::anyhow!("parsing {}: {e}: line={l:?}", path.display())))
-        .collect()
+        .collect::<anyhow::Result<Vec<JudgmentCase>>>()?;
+    // R2-#5 (exec94): a zero-case fixture (e.g. truncated to empty, or all
+    // blank lines) makes `compute_report` return an empty `Report`, which
+    // `run()`'s `any_fail = report.values().any(...)` reports as "0 case(s),
+    // all channels non-regressed" (exit 0) -- indistinguishable from a real
+    // all-pass run. Zero cases means the gate never actually searched
+    // anything; that is a precondition error, not a pass.
+    anyhow::ensure!(!cases.is_empty(), "fixture {} contains zero cases", path.display());
+    // R2-#6 (exec94): a duplicate `case` id silently overwrites the
+    // earlier case's verdicts in `compute_report`'s `report.insert` (last
+    // write wins) -- a real regression recorded under an earlier
+    // occurrence of a duplicated id can be masked by a later, passing
+    // occurrence of the same id.
+    let mut seen_ids = std::collections::HashSet::new();
+    for case in &cases {
+        anyhow::ensure!(
+            seen_ids.insert(case.case.clone()),
+            "fixture {} has duplicate case id {:?}",
+            path.display(),
+            case.case
+        );
+    }
+    Ok(cases)
 }
 
 fn load_baseline(path: &std::path::Path) -> anyhow::Result<BaselineFile> {
@@ -386,6 +409,56 @@ mod tests {
         assert_eq!(code, 2, "a channel missing from the baseline case's object must be a precondition error, not a silent pass: {message}");
         assert!(report.is_none());
         assert!(message.contains("semantic"), "the error should name the missing channel: {message}");
+    }
+
+    /// R2-#6 (exec94): a duplicate `case` id in the fixture must be a
+    /// precondition error, not silently let the later occurrence's
+    /// verdicts overwrite (and mask) the earlier occurrence's.
+    #[test]
+    fn duplicate_case_id_in_fixture_is_precondition_error_exit_2() {
+        let dir = TempDir::new().unwrap();
+        // Two rows both claim case="c1": the first would regress (rank 9
+        // vs baseline rank 2 on every channel), the second would pass
+        // (rank 1) -- if duplicates were allowed, `report.insert` would let
+        // the passing second row silently overwrite the failing first row.
+        let fixture_text =
+            format!("{}\n{}\n", fixture_line("c1", "foo", "/a.jsonl"), fixture_line("c1", "bar", "/a.jsonl"));
+        let fixture = write_file(dir.path(), "fixture.jsonl", &fixture_text);
+        let baseline = write_file(
+            dir.path(),
+            "baseline.json",
+            &baseline_file(serde_json::json!({"c1": {"lexical": 2, "semantic": 2, "hybrid": 2}})),
+        );
+        let mut ranks = HashMap::new();
+        ranks.insert(("lexical".to_string(), "foo".to_string()), Some(9));
+        ranks.insert(("semantic".to_string(), "foo".to_string()), Some(9));
+        ranks.insert(("hybrid".to_string(), "foo".to_string()), Some(9));
+        ranks.insert(("lexical".to_string(), "bar".to_string()), Some(1));
+        ranks.insert(("semantic".to_string(), "bar".to_string()), Some(1));
+        ranks.insert(("hybrid".to_string(), "bar".to_string()), Some(1));
+        let search = FakeSearch { ranks };
+
+        let (code, report, message) = run(&fixture, &baseline, &search);
+        assert_eq!(code, 2, "a duplicate case id must be a precondition error, not let a later row mask an earlier regression: {message}");
+        assert!(report.is_none());
+        assert!(message.contains("c1"), "the error should name the duplicated case id: {message}");
+    }
+
+    /// R2-#5 (exec94): a fixture with zero cases (truncated to empty, or
+    /// all blank lines) must be a precondition error -- `run()`'s
+    /// `any_fail` over an empty report is vacuously `false`, which would
+    /// otherwise report "all channels non-regressed" without having
+    /// searched anything.
+    #[test]
+    fn empty_fixture_is_precondition_error_exit_2() {
+        let dir = TempDir::new().unwrap();
+        let fixture = write_file(dir.path(), "fixture.jsonl", "\n\n   \n");
+        let baseline = write_file(dir.path(), "baseline.json", &baseline_file(serde_json::json!({})));
+        let search = FakeSearch { ranks: HashMap::new() };
+
+        let (code, report, message) = run(&fixture, &baseline, &search);
+        assert_eq!(code, 2, "a zero-case fixture must be a precondition error, not a vacuous pass: {message}");
+        assert!(report.is_none());
     }
 
     /// Real-shape regression guard: loads the actual `tests/fixtures/

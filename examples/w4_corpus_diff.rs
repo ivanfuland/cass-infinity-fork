@@ -43,7 +43,29 @@ struct Cli {
 // one `sources` row) into a single map entry, so an entire missing session
 // can go undetected whenever the surviving source happens to share the
 // same (agent_slug, external_id).
-type SessionKey = (String, String, Option<String>); // (source_id, agent_slug, external_id)
+//
+// R2-#3 (exec94): `external_id` can be NULL (a session with no external
+// id), and Rust's `HashMap` treats every `None` as the same key value --
+// so two distinct local sessions sharing `(source_id, agent_slug, None)`
+// but different `source_path` still collapsed into one map entry even
+// after the source_id fix above. When `external_id` is `None`,
+// `source_path` is the only remaining discriminator (it is *not* part of
+// the key when `external_id` is present, since a real materialization
+// pass is allowed to change `source_path` for the same external session --
+// see `source_path_changed` below -- but a session with no external id has
+// no other stable identity to fall back on).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum SessionKey {
+    ByExternalId(String, String, String),
+    ByPath(String, String, String),
+}
+
+fn session_key(source_id: &str, agent_slug: &str, external_id: Option<&str>, source_path: &str) -> SessionKey {
+    match external_id {
+        Some(id) => SessionKey::ByExternalId(source_id.to_string(), agent_slug.to_string(), id.to_string()),
+        None => SessionKey::ByPath(source_id.to_string(), agent_slug.to_string(), source_path.to_string()),
+    }
+}
 
 struct ConvRecord {
     id: i64,
@@ -77,7 +99,8 @@ fn load_conversations(storage: &FrankenStorage) -> anyhow::Result<HashMap<Sessio
     )?;
     let mut map = HashMap::with_capacity(rows.len());
     for (id, source_id, agent_slug, external_id, source_path) in rows {
-        map.insert((source_id, agent_slug, external_id), ConvRecord { id, source_path });
+        let key = session_key(&source_id, &agent_slug, external_id.as_deref(), &source_path);
+        map.insert(key, ConvRecord { id, source_path });
     }
     Ok(map)
 }
@@ -384,6 +407,72 @@ mod tests {
             report.conversations_missing, 1,
             "the deleted work-laptop session must be counted, not masked by the surviving local session sharing the same (agent, external_id): {report:?}"
         );
+    }
+
+    /// R2-#3 (exec94): two sessions with no external id at all
+    /// (`external_id: None`, a real shape -- e.g. a session materialized
+    /// without one) sharing `(source_id, agent_slug)` but at different
+    /// `source_path`s must not collapse into one `HashMap` entry. Rust's
+    /// `HashMap` treats every `None` as equal, so before this fix both
+    /// mapped to the same key regardless of `source_path`.
+    fn seed_null_external_id_pair(path: &std::path::Path) {
+        let storage = FrankenStorage::open(path).unwrap();
+        let agent = Agent { id: None, slug: "codex".into(), name: "Codex".into(), version: Some("0.1".into()), kind: AgentKind::Cli };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        let make = |path_suffix: &str| Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: None,
+            title: Some("null-external-id fixture".into()),
+            source_path: PathBuf::from(format!("/tmp/{path_suffix}.jsonl")),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_005),
+            approx_tokens: Some(64),
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: Some("user".into()),
+                created_at: Some(1_700_000_000_000),
+                content: format!("null-external-id fixture message for {path_suffix}"),
+                extra_json: serde_json::json!({}),
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+        let conversations = vec![make("local-a"), make("local-b")];
+        let batch: Vec<(i64, Option<i64>, &Conversation)> = conversations.iter().map(|c| (agent_id, None, c)).collect();
+        storage.insert_conversations_batched(&batch).unwrap();
+    }
+
+    #[test]
+    fn null_external_id_sessions_with_different_source_paths_are_distinct() {
+        let dir = TempDir::new().unwrap();
+        let old = dir.path().join("old.db");
+        let new = dir.path().join("new.db");
+        seed_null_external_id_pair(&old);
+        seed_null_external_id_pair(&new);
+
+        // Delete "local-b" entirely from the new corpus. Under the old
+        // (source_id, agent_slug, external_id)-only key, both null-
+        // external-id sessions collapsed to a single `HashMap` entry (same
+        // source_id, same agent_slug, both external_id=None), so this
+        // deletion produced `conversations_missing=0`.
+        let writer = FrankenStorage::open_writer(&new).unwrap();
+        writer.raw().execute("DELETE FROM conversations WHERE source_path LIKE '%local-b%'", &[]).unwrap();
+        drop(writer);
+
+        let (code, report, message) = run(&old, &new);
+        assert_eq!(code, 1, "a whole null-external-id session lost behind a source_path collision must fail the gate: {message}");
+        let report = report.unwrap();
+        assert_eq!(
+            report.conversations_missing, 1,
+            "the deleted local-b session must be counted, not masked by the surviving local-a session sharing (source_id, agent_slug, None): {report:?}"
+        );
+        assert_eq!(report.old_conversations_total, 2, "both null-external-id sessions must be distinct map entries on the old side: {report:?}");
     }
 
     #[test]
