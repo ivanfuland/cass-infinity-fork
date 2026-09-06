@@ -477,6 +477,18 @@ fn load_message_once(storage: &FrankenStorage, message_id: i64) -> Result<(i64, 
 ///    offline (no concurrent ingest). Closing it for good would mean
 ///    sharing a write lock between "pull new content" and "create first
 ///    generation", not attempted here.
+///
+/// The distinct *reused-generation* race this gap analysis did not cover
+/// (R1-B1, exec92): a message touched by this run's drain but missing from
+/// its `all_expected` snapshot (concurrently ingested/backfilled after the
+/// scan, against an already-existing generation `models backfill` shares no
+/// lock with) is no longer treated as "expected = []" by the reverse-
+/// reconciliation pass -- see [`reconcile_touched_messages`]'s doc comment.
+/// That fallback (recompute from current content) is the accepted mitigation
+/// for this window; `models backfill` itself still takes no exclusion lock
+/// against a concurrent `cass index` drain (unlike `index --semantic`,
+/// which is serialized by `run_index`'s exclusive lock) -- out of scope for
+/// this fix.
 fn find_reusable_or_create_generation(
     conn: &Conn,
     identity: &InfinityServedIdentity,
@@ -1140,7 +1152,9 @@ pub fn run_activation_audit(
                     if be > normalized.len() || bs > be {
                         bail!("chunk span [{bs},{be}) out of bounds for message {message_id}'s normalized text (len {})", normalized.len());
                     }
-                    let text = &normalized[bs..be];
+                    let text = normalized.get(bs..be).ok_or_else(|| {
+                        anyhow!("chunk span [{bs},{be}) is not on char boundaries of message {message_id}'s normalized text")
+                    })?;
                     let stored_vec = schema::le_blob_to_f32_vector(&stored_blob)?;
                     let fresh = embed_fn(&[text]).map_err(|e| anyhow!("re-embed failed: {e}"))?;
                     let fresh_vec = fresh.first().ok_or_else(|| anyhow!("re-embed returned no vector"))?;
@@ -1324,6 +1338,64 @@ static RECONCILIATION_LAST_DURATION_NANOS: std::sync::atomic::AtomicU64 = std::s
 #[cfg(test)]
 fn reconciliation_last_duration_for_test() -> std::time::Duration {
     std::time::Duration::from_nanos(RECONCILIATION_LAST_DURATION_NANOS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Reverse-reconciliation for every message this run touched: prune the
+/// message's stored `message_chunks` (and matching `vec0` rows) against its
+/// expected set. `expected_by_message` is the run's up-front snapshot
+/// (`all_expected`, indexed by `message_id`, taken once before the drain
+/// loop) -- a message missing from it does NOT mean the message has zero
+/// expected chunks, it means the message was touched by this run (or a
+/// concurrent one, e.g. `models backfill` racing this run's drain) after
+/// the snapshot was already taken (R1-B1). Treating a snapshot-miss as
+/// "expected = []" pruned every chunk just embedded for that message, and a
+/// subsequent rerun reuses the same generation and re-seeds zero holes for
+/// it (its own snapshot is equally stale), so the loss was permanent. This
+/// recomputes the expected set from current content for exactly that case
+/// -- same load-and-classify logic as the per-key expected-set load in the
+/// drain loop above (`load_message_once` + `canonical_role`-gated
+/// `expected_chunks`) -- instead of assuming an empty set.
+fn reconcile_touched_messages(
+    storage: &FrankenStorage,
+    generation_id: i64,
+    touched_message_ids: &HashSet<i64>,
+    expected_by_message: &HashMap<i64, Vec<ExpectedChunk>>,
+) -> Result<(u64, u64)> {
+    let mut chunks_pruned = 0u64;
+    let mut expected_recomputed = 0u64;
+    for message_id in touched_message_ids {
+        let expected: std::borrow::Cow<'_, [ExpectedChunk]> = match expected_by_message.get(message_id) {
+            Some(expected) => std::borrow::Cow::Borrowed(expected.as_slice()),
+            None => {
+                expected_recomputed += 1;
+                let (conversation_id, role, content) = load_message_once(storage, *message_id)?;
+                let computed = if canonical_role(&role).is_none() {
+                    Vec::new()
+                } else {
+                    expected_chunks(*message_id, conversation_id, &role, &content)
+                };
+                std::borrow::Cow::Owned(computed)
+            }
+        };
+        let pruned = storage
+            .raw()
+            .with_tx(TxMode::Immediate, |tx| {
+                let pruned_chunk_ids = schema::prune_chunks_not_in_expected_in_tx(tx, generation_id, *message_id, &expected)?;
+                if !pruned_chunk_ids.is_empty() {
+                    vector_domain::delete_vec0_rows_in_tx(tx, generation_id, &pruned_chunk_ids)?;
+                }
+                Ok(pruned_chunk_ids.len() as u64)
+            })
+            .context("reverse-reconciling a touched message's stored chunks")?;
+        chunks_pruned = chunks_pruned.saturating_add(pruned);
+    }
+    if expected_recomputed != 0 {
+        tracing::info!(
+            expected_recomputed,
+            "reverse-reconciliation recomputed the expected chunk set for {expected_recomputed} touched message(s) missing from this run's up-front snapshot (concurrent ingest/backfill race)"
+        );
+    }
+    Ok((chunks_pruned, expected_recomputed))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1599,24 +1671,10 @@ pub fn run_db_vector_catchup_backfill(
     // current expected set -- catches a message whose chunk count shrank
     // (some of its old chunk rows are no longer expected at all, not just
     // "index beyond expected" for a hole that never existed for them).
-    let mut chunks_pruned = 0u64;
-    let no_expected_chunks: Vec<ExpectedChunk> = Vec::new();
     #[cfg(test)]
     let __reconciliation_started = std::time::Instant::now();
-    for message_id in &touched_message_ids {
-        let expected = expected_by_message.get(message_id).unwrap_or(&no_expected_chunks);
-        let pruned = storage
-            .raw()
-            .with_tx(TxMode::Immediate, |tx| {
-                let pruned_chunk_ids = schema::prune_chunks_not_in_expected_in_tx(tx, generation_id, *message_id, expected)?;
-                if !pruned_chunk_ids.is_empty() {
-                    vector_domain::delete_vec0_rows_in_tx(tx, generation_id, &pruned_chunk_ids)?;
-                }
-                Ok(pruned_chunk_ids.len() as u64)
-            })
-            .context("reverse-reconciling a touched message's stored chunks")?;
-        chunks_pruned = chunks_pruned.saturating_add(pruned);
-    }
+    let (chunks_pruned, _expected_recomputed) =
+        reconcile_touched_messages(storage, generation_id, &touched_message_ids, &expected_by_message)?;
     #[cfg(test)]
     RECONCILIATION_LAST_DURATION_NANOS.store(u64::try_from(__reconciliation_started.elapsed().as_nanos()).unwrap_or(u64::MAX), std::sync::atomic::Ordering::Relaxed);
 
@@ -2523,6 +2581,46 @@ mod chunk_catchup_v5_tests {
         assert_eq!(after.conversation_id_mismatch, 1, "⑨ conversation_id: {after:?}");
     }
 
+    /// R1-B2 (exec92): a stored chunk span that is stale/corrupted so its
+    /// `byte_start` no longer sits on a UTF-8 char boundary of the
+    /// message's normalized text must be reported as an audit failure, not
+    /// crash the whole process via a byte-misaligned `&str` slice --
+    /// release builds run `panic="abort"`, so this previously took down
+    /// the entire activation audit (and, in `models backfill`'s case, the
+    /// whole CLI invocation) over a single bad chunk. CJK content is
+    /// required to reproduce this: every ASCII byte offset is trivially a
+    /// char boundary, which is why `audit_9_detects_span_mismatch` above
+    /// (an ASCII fixture) corrupts the same field without ever panicking.
+    #[test]
+    fn audit_10_reports_non_char_boundary_span_instead_of_panicking() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_storage(&dir.path().join("db.sqlite"));
+        let generation_id = genesis(&storage);
+        const CJK_TEXT: &str = "你好世界这是一段真实的中文测试内容";
+        let ids = insert_conversation(&storage, "t8-b2-cjk", &[CJK_TEXT]);
+        let message_id = ids[0];
+        let report = backfill(&storage).unwrap();
+        assert!(report.activated, "fixture setup must cleanly activate: {report:?}");
+        assert_eq!(message_chunks_count(&storage, generation_id), 1);
+
+        // Corrupt the chunk's stored byte_start from 0 to 1 -- byte offset
+        // 1 lands inside the first (multi-byte) CJK character, not on a
+        // char boundary; byte_end is left untouched (still a legal,
+        // in-range offset), so only the char-boundary check -- not the
+        // numeric-range check right above it -- is what must catch this.
+        storage
+            .raw()
+            .execute("UPDATE message_chunks SET byte_start = 1 WHERE generation_id = ?1 AND message_id = ?2", &params![generation_id, message_id])
+            .unwrap();
+
+        let after = run_activation_audit(&storage, generation_id, 10, None, Some(&mock_embed), 10, 1).unwrap();
+        assert!(!after.passed, "a non-char-boundary span must fail the audit: {after:?}");
+        assert!(
+            after.failure_reasons.iter().any(|r| r.contains("char boundaries")),
+            "⑩'s ownership resample must report the span as a bailed failure via the char-boundary check, not silently pass (or panic): {after:?}"
+        );
+    }
+
     #[test]
     fn audit_10_detects_swapped_vectors() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -2698,6 +2796,45 @@ mod chunk_catchup_v5_tests {
         assert_eq!(report.holes_written_off_beyond_expected, 0);
         assert!(report.activated);
         let _ = generation_id;
+    }
+
+    /// R1-B1 (exec92): `reconcile_touched_messages` must not treat a
+    /// message missing from the run's up-front `expected_by_message`
+    /// snapshot as if it now has zero expected chunks -- that snapshot
+    /// only reflects content that existed before the drain loop started.
+    /// A message this run (or a concurrent one) touched mid-run is real,
+    /// current content; defaulting its expected set to empty prunes its
+    /// just-embedded chunk (and vec0 row) with no way to recover it on a
+    /// rerun, since the rerun reuses the same generation and re-seeds zero
+    /// holes for a message that already has its chunk stored.
+    #[test]
+    fn reconcile_recomputes_expected_set_for_message_missing_from_snapshot() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_storage(&dir.path().join("db.sqlite"));
+        let generation_id = genesis(&storage);
+        let ids = insert_conversation(&storage, "t8-b1-late-message", &["a message with plenty of real content for the prune-vs-recompute test"]);
+        let message_id = ids[0];
+        let report = backfill(&storage).unwrap();
+        assert!(report.activated, "fixture setup must cleanly activate with the message's chunk embedded and zero holes remaining: {report:?}");
+        let chunks_before = message_chunks_count(&storage, generation_id);
+        assert_eq!(chunks_before, 1);
+        let vec0_before = vector_domain::count_vec0_rows_for_generation(storage.raw(), generation_id).unwrap();
+        assert_eq!(vec0_before, 1);
+
+        // Simulate this message being invisible to the run's up-front
+        // `all_expected` snapshot (concurrently ingested/touched after the
+        // scan, exactly R1-B1's race) by reconciling against an empty
+        // `expected_by_message` map -- a stale/missing entry for
+        // `message_id` looks identical to this from the pruning code's
+        // point of view.
+        let touched: HashSet<i64> = std::iter::once(message_id).collect();
+        let stale_snapshot: HashMap<i64, Vec<ExpectedChunk>> = HashMap::new();
+        let (pruned, recomputed) = reconcile_touched_messages(&storage, generation_id, &touched, &stale_snapshot).unwrap();
+
+        assert_eq!(recomputed, 1, "the one snapshot-missing message must be recomputed from its current content, not defaulted to zero expected chunks");
+        assert_eq!(pruned, 0, "nothing should be pruned: the message's real, current content still expects exactly the one chunk that is already stored");
+        assert_eq!(message_chunks_count(&storage, generation_id), chunks_before, "the message's already-embedded chunk must survive reconciliation against its recomputed (not snapshot) expected set");
+        assert_eq!(vector_domain::count_vec0_rows_for_generation(storage.raw(), generation_id).unwrap(), vec0_before);
     }
 
     /// plan v5.1 Global Constraints "三处同函数 + 独立 oracle": the drain
