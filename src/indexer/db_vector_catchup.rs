@@ -1368,13 +1368,40 @@ fn reconcile_touched_messages(
             Some(expected) => std::borrow::Cow::Borrowed(expected.as_slice()),
             None => {
                 expected_recomputed += 1;
-                let (conversation_id, role, content) = load_message_once(storage, *message_id)?;
-                let computed = if canonical_role(&role).is_none() {
-                    Vec::new()
-                } else {
-                    expected_chunks(*message_id, conversation_id, &role, &content)
-                };
-                std::borrow::Cow::Owned(computed)
+                // R3-F4 (mission #110): a message touched by this run's
+                // drain loop can be cascade-deleted (`messages` row gone,
+                // `ON DELETE CASCADE` on `message_chunks`/`chunk_holes`)
+                // by a concurrent ingest before reconciliation runs.
+                // Baseline treated a missing row the same as "no expected
+                // chunks" and just pruned nothing further; propagating
+                // `load_message_once`'s error via `?` here would instead
+                // abort the whole run after all of this run's embedding
+                // work was already committed. Only the exact "no such
+                // row" shape is tolerated (mapped to expected = [], same
+                // as baseline) -- any other error (I/O, corruption,
+                // connection loss) still aborts the run via `?` below.
+                match load_message_once(storage, *message_id) {
+                    Ok((conversation_id, role, content)) => {
+                        let computed = if canonical_role(&role).is_none() {
+                            Vec::new()
+                        } else {
+                            expected_chunks(*message_id, conversation_id, &role, &content)
+                        };
+                        std::borrow::Cow::Owned(computed)
+                    }
+                    Err(err)
+                        if err.chain().any(|cause| {
+                            matches!(
+                                cause.downcast_ref::<StorageError>(),
+                                Some(StorageError::Other { code: None, detail })
+                                    if detail == crate::storage::api::NO_ROWS_DETAIL
+                            )
+                        }) =>
+                    {
+                        std::borrow::Cow::Owned(Vec::new())
+                    }
+                    Err(err) => return Err(err),
+                }
             }
         };
         let pruned = storage
@@ -1392,7 +1419,7 @@ fn reconcile_touched_messages(
     if expected_recomputed != 0 {
         tracing::info!(
             expected_recomputed,
-            "reverse-reconciliation recomputed the expected chunk set for {expected_recomputed} touched message(s) missing from this run's up-front snapshot (concurrent ingest/backfill race)"
+            "reverse-reconciliation recomputed the expected chunk set for {expected_recomputed} touched message(s) absent from this run's up-front snapshot (zero expected chunks, or ingested after the scan)"
         );
     }
     Ok((chunks_pruned, expected_recomputed))
@@ -2835,6 +2862,36 @@ mod chunk_catchup_v5_tests {
         assert_eq!(pruned, 0, "nothing should be pruned: the message's real, current content still expects exactly the one chunk that is already stored");
         assert_eq!(message_chunks_count(&storage, generation_id), chunks_before, "the message's already-embedded chunk must survive reconciliation against its recomputed (not snapshot) expected set");
         assert_eq!(vector_domain::count_vec0_rows_for_generation(storage.raw(), generation_id).unwrap(), vec0_before);
+    }
+
+    /// R3-F4 (mission #110): a message touched by this run's drain but then
+    /// cascade-deleted by a concurrent ingest (`messages` row gone,
+    /// `message_chunks`/`chunk_holes` cascade with it via `ON DELETE
+    /// CASCADE`) before reconciliation reaches it must not abort the whole
+    /// run -- `load_message_once`'s "no such row" error must be tolerated
+    /// (mapped to expected = [], same as baseline's old
+    /// `unwrap_or(&no_expected_chunks)` behavior), not propagated via `?`.
+    #[test]
+    fn reconcile_tolerates_message_deleted_concurrently_after_being_touched() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_storage(&dir.path().join("db.sqlite"));
+        let generation_id = genesis(&storage);
+        let ids = insert_conversation(&storage, "t8-f4-concurrent-delete", &["a message with plenty of real content for the concurrent-delete test"]);
+        let message_id = ids[0];
+        let report = backfill(&storage).unwrap();
+        assert!(report.activated, "fixture setup must cleanly activate with the message's chunk embedded and zero holes remaining: {report:?}");
+
+        // Simulate a concurrent ingest cascade-deleting the message after
+        // this run touched it but before reconciliation runs.
+        storage.raw().execute("DELETE FROM messages WHERE id = ?1", &params![message_id]).unwrap();
+
+        let touched: HashSet<i64> = std::iter::once(message_id).collect();
+        let empty_snapshot: HashMap<i64, Vec<ExpectedChunk>> = HashMap::new();
+        let result = reconcile_touched_messages(&storage, generation_id, &touched, &empty_snapshot);
+
+        assert!(result.is_ok(), "a concurrently-deleted touched message must not abort reconciliation: {result:?}");
+        let (_pruned, recomputed) = result.unwrap();
+        assert_eq!(recomputed, 1, "the deleted message must still count as a snapshot-miss handled this run");
     }
 
     /// plan v5.1 Global Constraints "三处同函数 + 独立 oracle": the drain

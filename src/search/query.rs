@@ -5015,16 +5015,32 @@ impl SearchClient {
     /// messages, which quote every LC query verbatim in a table). This
     /// builds one `LIKE '%term%'` clause per normalized term and `AND`s
     /// them together, mirroring FTS5's own implicit-AND-of-terms semantics
-    /// instead of degrading past it. `terms` must be non-empty (callers
-    /// fall back to [`lex_docs_like_candidates_query`] on the untouched raw
-    /// query when term extraction yields nothing usable).
+    /// instead of degrading past it. `terms.positive` must be non-empty
+    /// (callers fall back to [`lex_docs_like_candidates_query`] whenever
+    /// term extraction yields no positive terms -- see the routing
+    /// comment above this function's only call site).
+    ///
+    /// R3-F1/F2 (mission #110): `terms.negative` is intentionally *not*
+    /// rendered into the generated SQL. This fallback only triggers on a
+    /// short (<3 codepoint) subterm, so any negative term here is always a
+    /// short substring; excluding on it (`content NOT LIKE '%io%'`) drops
+    /// every document containing that substring anywhere -- "function",
+    /// "version", "conversation" for `io` -- which in a coding-session
+    /// corpus is close to the entire corpus. That is a subset degrade
+    /// (true matches silently disappear, with no downstream rerank able
+    /// to recover them), strictly worse than the superset degrade the
+    /// positive-term substring match already accepts. `negative` stays on
+    /// `Ku3LikeTerms` purely as extraction/routing state -- it still
+    /// decides whether the caller falls back to the whole-string path --
+    /// but is never turned into a WHERE predicate.
     fn lex_docs_like_candidates_query_multi_term(
         terms: &Ku3LikeTerms,
         cap: usize,
     ) -> (String, Vec<ParamValue>) {
         debug_assert!(
-            !terms.positive.is_empty() || !terms.negative.is_empty(),
-            "caller must not pass an empty term list"
+            !terms.positive.is_empty(),
+            "caller must not pass an empty positive-term list -- the routing decision above \
+             this function's only call site must fall back to the whole-string path instead"
         );
         let total_terms = terms.positive.len() + terms.negative.len();
         let mut params: Vec<ParamValue> = Vec::with_capacity(total_terms * 2 + 1);
@@ -5058,29 +5074,19 @@ impl SearchClient {
             params.push(ParamValue::from(like_substring_pattern(term)));
         }
         // R2-#8 (exec94): `or_only` means the positive terms are joined by
-        // OR, not AND (e.g. `alpha OR io`) -- wrapped in parens so a
-        // trailing `AND content NOT LIKE ...` exclusion below binds to the
-        // whole disjunction, not just its last operand.
+        // OR, not AND (e.g. `alpha OR io`).
         let positive_clause = if terms.or_only {
             format!("({})", positive_where_parts.join(" OR "))
         } else {
             positive_where_parts.join(" AND ")
         };
-        let mut where_parts: Vec<String> = vec![positive_clause];
-        // Each negative term only excludes on `content` -- narrower than
-        // the positive OR-of-5-columns match on purpose (R2-#8 review
-        // scope; not widened to the other 4 columns).
-        for term in &terms.negative {
-            let pattern_idx = idx + 1;
-            idx += 1;
-            where_parts.push(format!("content NOT LIKE ?{pattern_idx} ESCAPE '\\'"));
-            params.push(ParamValue::from(like_substring_pattern(term)));
-        }
+        // R3-F1/F2 (mission #110): `terms.negative` is deliberately not
+        // rendered here -- see this function's doc comment.
         let cap_idx = idx + 1;
         let sql = format!(
             "SELECT doc_id, ({}) AS occurrence_score FROM lex_docs WHERE {} LIMIT ?{}",
             score_parts.join(" + "),
-            where_parts.join(" AND "),
+            positive_clause,
             cap_idx,
         );
         params.push(ParamValue::from(cap as i64));
@@ -5417,11 +5423,28 @@ impl SearchClient {
             // whole-string path unconditionally. Otherwise route to the
             // multi-term path whenever there is a negative term to exclude
             // (a single-term-with-NOT query, e.g. `alpha NOT io`, still
-            // needs its `NOT` honored) or 2+ positive terms; a lone
-            // positive term with no exclusion has nothing to AND/OR
-            // against and goes through the old single-term path unchanged.
+            // needs a positive term to search for once `NOT` is dropped)
+            // or 2+ positive terms; a lone positive term with no exclusion
+            // has nothing to AND/OR against and goes through the old
+            // single-term path unchanged.
+            //
+            // R3-F1/F2 (mission #110): negative terms in this fallback are
+            // always short substrings (that is what trips the KU3 degrade
+            // in the first place), so `content NOT LIKE '%io%'` excludes
+            // almost the entire corpus (F2) -- a subset degrade with no
+            // rerank to recover from, strictly worse than not excluding at
+            // all. They are now ignored inside the LIKE fallback (superset
+            // degrade, same doctrine as the positive substring match) --
+            // see `lex_docs_like_candidates_query_multi_term`. A query
+            // with zero positive terms (`-io`, `NOT io`) therefore has
+            // nothing left to build a multi-term query from and must
+            // route to the whole-string path instead of the multi-term
+            // builder, which used to receive an empty positive list and
+            // emit a WHERE clause with no predicate at all -- malformed
+            // SQL, search() returned Err (F1).
             let like_terms = Self::ku3_like_fallback_terms(raw_query);
             if like_terms.mixed_operators
+                || like_terms.positive.is_empty()
                 || (like_terms.negative.is_empty() && like_terms.positive.len() < 2)
             {
                 let like_term = raw_query.trim().replace('*', "");
@@ -16787,12 +16810,14 @@ mod tests {
         );
     }
 
-    /// R2-#8 (exec94), test ①: `alpha NOT io` end-to-end -- a document
-    /// containing the positive term without the excluded one must hit; one
-    /// containing both must not (proving the exclusion is actually wired
-    /// into the generated SQL, not just extracted and discarded).
+    /// R3-F1/F2 (mission #110), superseding the old "must exclude" test of
+    /// the same fixture: `alpha NOT io` end-to-end -- negative terms are
+    /// now ignored in the LIKE fallback (superset degrade, see
+    /// `lex_docs_like_candidates_query_multi_term`'s doc comment), so a
+    /// document containing *both* `alpha` and `io` must still hit, not be
+    /// excluded.
     #[test]
-    fn search_ku3_fallback_not_excludes_matching_term() {
+    fn search_ku3_fallback_ignores_not_term_superset() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("cass.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
@@ -16807,17 +16832,22 @@ mod tests {
         let client = SearchClient::open(&missing_index_path, Some(&db_path)).unwrap().expect("sqlite-only client should still open");
         assert!(query_has_short_subterm_after_normalization("alpha NOT io"));
 
-        let hits = client.search("alpha NOT io", SearchFilters::default(), 10, 0, FieldMask::FULL).unwrap();
+        let mut hits = client.search("alpha NOT io", SearchFilters::default(), 10, 0, FieldMask::FULL).unwrap();
+        hits.sort_by(|a, b| a.title.cmp(&b.title));
         let titles: Vec<&str> = hits.iter().map(|h| h.title.as_str()).collect();
-        assert_eq!(titles, vec!["has-alpha-no-io"], "must exclude the doc containing io: got {titles:?}");
+        assert_eq!(
+            titles,
+            vec!["has-alpha-and-io", "has-alpha-no-io"],
+            "NOT is ignored (superset degrade): both alpha-containing docs must hit regardless of io: got {titles:?}"
+        );
     }
 
-    /// R2-#8 (exec94), test ②: `alpha beta NOT io` end-to-end -- three
-    /// buckets: both positives present without io (hit), both positives
-    /// with io (excluded), and only one positive present (must still miss
-    /// -- proving the positive terms stay AND'd, not loosened).
+    /// R3-F1/F2 (mission #110), superseding the old "must exclude" test of
+    /// the same fixture: `alpha beta NOT io` end-to-end -- the positive
+    /// terms must stay AND'd (only-alpha still misses), but `NOT io` is
+    /// ignored, so the doc containing all three terms must now hit too.
     #[test]
-    fn search_ku3_fallback_not_excludes_with_multiple_positive_terms() {
+    fn search_ku3_fallback_ignores_not_term_keeps_positive_and_superset() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("cass.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
@@ -16832,9 +16862,72 @@ mod tests {
         let missing_index_path = dir.path().join("no-such-index");
         let client = SearchClient::open(&missing_index_path, Some(&db_path)).unwrap().expect("sqlite-only client should still open");
 
-        let hits = client.search("alpha beta NOT io", SearchFilters::default(), 10, 0, FieldMask::FULL).unwrap();
+        let mut hits = client.search("alpha beta NOT io", SearchFilters::default(), 10, 0, FieldMask::FULL).unwrap();
+        hits.sort_by(|a, b| a.title.cmp(&b.title));
         let titles: Vec<&str> = hits.iter().map(|h| h.title.as_str()).collect();
-        assert_eq!(titles, vec!["both-positive-no-io"], "positives must stay AND'd and io must be excluded: got {titles:?}");
+        assert_eq!(
+            titles,
+            vec!["both-positive-and-io", "both-positive-no-io"],
+            "positives must stay AND'd (only-alpha still misses) but NOT io must no longer exclude: got {titles:?}"
+        );
+    }
+
+    /// R3-F1 (mission #110): a query whose only extracted term is negated
+    /// (`NOT io`, `-io`) used to route into the multi-term builder with an
+    /// empty positive list, producing a WHERE clause with no predicate at
+    /// all -- malformed SQL, search() returned Err. It must now fall back
+    /// to the whole-string LIKE path and return Ok, same as any other
+    /// single-term query.
+    #[test]
+    fn search_ku3_fallback_negative_only_query_does_not_error() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent { id: None, slug: "codex".into(), name: "Codex".into(), version: None, kind: AgentKind::Cli })
+            .unwrap();
+        // Titles/content deliberately avoid any accidental "-io" substring
+        // outside the one each fixture is meant to prove (e.g. a hyphenated
+        // title like "literal-not-io" itself contains "-io" and would
+        // pollute the dash-query assertion below).
+        insert_v2_lex_message(&storage, agent_id, "hasNotIoPhrase", "the exact text NOT io appears here");
+        insert_v2_lex_message(&storage, agent_id, "hasDashIoPhrase", "the exact text -io appears here");
+        insert_v2_lex_message(&storage, agent_id, "unrelated", "gamma appears here alone");
+        storage.close().unwrap();
+
+        let missing_index_path = dir.path().join("no-such-index");
+        let client = SearchClient::open(&missing_index_path, Some(&db_path)).unwrap().expect("sqlite-only client should still open");
+
+        for query in ["NOT io", "-io", "-中文"] {
+            let terms = SearchClient::ku3_like_fallback_terms(query);
+            assert!(terms.positive.is_empty(), "query {query:?} must extract zero positive terms: {terms:?}");
+        }
+
+        let hits = client.search("NOT io", SearchFilters::default(), 10, 0, FieldMask::FULL);
+        assert!(hits.is_ok(), "a negative-only query must not error: {hits:?}");
+        let titles: Vec<String> = hits.unwrap().iter().map(|h| h.title.clone()).collect();
+        assert_eq!(titles, vec!["hasNotIoPhrase"], "must fall back to whole-string literal-substring matching: got {titles:?}");
+
+        let dash_hits = client.search("-io", SearchFilters::default(), 10, 0, FieldMask::FULL);
+        assert!(dash_hits.is_ok(), "a negative-only dash query must not error: {dash_hits:?}");
+        let dash_titles: Vec<String> = dash_hits.unwrap().iter().map(|h| h.title.clone()).collect();
+        assert_eq!(dash_titles, vec!["hasDashIoPhrase"], "must fall back to whole-string literal-substring matching: got {dash_titles:?}");
+
+        let cjk_hits = client.search("-中文", SearchFilters::default(), 10, 0, FieldMask::FULL);
+        assert!(cjk_hits.is_ok(), "a negative-only CJK query must not error: {cjk_hits:?}");
+    }
+
+    /// R3-F1/F2 (mission #110): the generated multi-term SQL must never
+    /// contain a `NOT LIKE` clause -- negative terms are extracted (for
+    /// routing/logging) but never rendered into the WHERE clause.
+    #[test]
+    fn lex_docs_like_candidates_query_multi_term_never_emits_not_like() {
+        let terms = SearchClient::ku3_like_fallback_terms("alpha beta NOT io");
+        assert_eq!(terms.positive, vec!["alpha".to_string(), "beta".to_string()]);
+        assert_eq!(terms.negative, vec!["io".to_string()]);
+
+        let (sql, _params) = SearchClient::lex_docs_like_candidates_query_multi_term(&terms, 10_000);
+        assert!(!sql.contains("NOT LIKE"), "negative terms must never be rendered into the LIKE fallback SQL, got sql: {sql}");
     }
 
     /// R2-#8 (exec94), test ③: `alpha OR io` end-to-end -- a document
