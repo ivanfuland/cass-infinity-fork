@@ -566,6 +566,48 @@ fn chunk_content_hash(conn: &Conn, chunk_id: i64) -> Result<Option<String>, Stor
     conn.query_opt_map("SELECT content_hash FROM message_chunks WHERE chunk_id = ?1", &params![chunk_id], |row| row.get_typed(0))
 }
 
+/// Fresh (not cached) `embedding` BLOB lookup for `chunk_id` from
+/// `message_chunks`, used only by task book #103's same-vector twin
+/// tolerance in checks ③/⑩: a differing `content_hash` does not by
+/// itself prove a KNN tie is real drift -- an embedder's tokenization can
+/// collapse a real, hash-visible input difference (e.g. a trailing
+/// newline) into byte-identical output vectors for two genuinely
+/// different chunks (real T12 corpus evidence: chunk_id=471055 vs
+/// 388263). `Ok(None)` if the row is gone (concurrent write / already
+/// pruned).
+fn chunk_embedding_blob(conn: &Conn, chunk_id: i64) -> Result<Option<Vec<u8>>, StorageError> {
+    conn.query_opt_map("SELECT embedding FROM message_chunks WHERE chunk_id = ?1", &params![chunk_id], |row| row.get_typed(0))
+}
+
+/// Direct point read of `generation_id`'s `vec0` table for `chunk_id`
+/// (`rowid`) -- task book #103's actual correctness invariant for ③/⑩.
+/// KNN (and therefore the tied-twin tolerances above) is only ever an
+/// indirect proxy for "this chunk's own vec0 row still holds its own
+/// vector": when two genuinely different chunks embed to the identical
+/// vector, KNN cannot distinguish that from "this chunk's own row was
+/// overwritten with an unrelated vector that happens to have a
+/// same-vector twin elsewhere" -- both look identical from the query
+/// side. Reading the row directly by `rowid` and comparing it, byte for
+/// byte, against `message_chunks.embedding` is the only check that
+/// actually pins down which case applies. `generation_id` is validated
+/// non-negative before being spliced into the table name (DDL/virtual
+/// table names cannot be bound parameters), mirroring
+/// [`vector_domain`]'s own `validate_generation_id_for_ddl` discipline.
+/// `Ok(None)` if the row is gone.
+fn vec0_row_embedding_blob(conn: &Conn, generation_id: i64, chunk_id: i64) -> Result<Option<Vec<u8>>, StorageError> {
+    if generation_id < 0 {
+        return Err(StorageError::Other {
+            code: None,
+            detail: format!("generation_id {generation_id} is negative; refusing to splice into vec0 point-read SQL"),
+        });
+    }
+    conn.query_opt_map(
+        &format!("SELECT embedding FROM vec_index_gen_{generation_id} WHERE rowid = ?1"),
+        &params![chunk_id],
+        |row| row.get_typed(0),
+    )
+}
+
 /// Task book #98 Step 3: single emission point for every drain
 /// observability event (`catchup_page` / `catchup_page_slow` /
 /// `drain_done`) -- restricted to this catch-up drain path only, never
@@ -634,6 +676,29 @@ fn compute_fresh_fingerprint_via(
     Ok(out)
 }
 
+/// Task book #103: distinguishes which invariant tolerated an audit
+/// ③/⑩ KNN tie against a chunk that isn't the query's own row -- an
+/// identical `content_hash` (task book #98's original R1-B8 tolerance: a
+/// verbatim-duplicated message) or a byte-identical `embedding` BLOB
+/// despite *different* hashes (task book #103: real T12 corpus evidence
+/// -- an embedder's tokenization collapses an input difference invisible
+/// to it, e.g. a trailing newline, so two genuinely different chunks
+/// embed to the exact same vector).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TiedTwinKind {
+    SameHash,
+    SameVector,
+}
+
+impl TiedTwinKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            TiedTwinKind::SameHash => "same_hash",
+            TiedTwinKind::SameVector => "same_vector",
+        }
+    }
+}
+
 /// Verdict + evidence from [`run_activation_audit`]. `passed` is the
 /// single verdict every other field explains. Checks ①②③⑤⑥ carry over
 /// the original W3-4 activation-audit design, scoped to `message_chunks`/
@@ -657,13 +722,18 @@ pub struct ActivationAuditReport {
     pub positive_check_top_hit_chunk_id: i64,
     pub positive_check_distance: f64,
     /// R1-B8 (task book #98): `true` iff ③'s top-1 hit was not the anchor
-    /// chunk's own row but was tolerated as an exact-content twin
-    /// (`distance <= 1e-6` AND the two chunks' stored `content_hash` are
-    /// equal) rather than flagged as a self-hit failure.
+    /// chunk's own row but was tolerated as a twin (`distance <= 1e-6`
+    /// AND either the two chunks' stored `content_hash` are equal, or
+    /// their `embedding` BLOBs are byte-identical despite differing
+    /// hashes -- task book #103) rather than flagged as a self-hit
+    /// failure.
     pub positive_check_tied_twin: bool,
     /// The sibling chunk_id ③'s self-hit tied with, set iff
     /// `positive_check_tied_twin` is `true`.
     pub positive_check_twin_chunk_id: Option<i64>,
+    /// Which invariant tolerated the tie, set iff `positive_check_tied_twin`
+    /// is `true` (task book #103).
+    pub positive_check_tied_twin_kind: Option<TiedTwinKind>,
     /// ④ bidirectional anti-join, element = `(message_id, chunk_idx)`.
     pub eligible_not_embedded_count: usize,
     pub embedded_not_eligible_count: usize,
@@ -697,10 +767,12 @@ pub struct ActivationAuditReport {
     /// "clean" activation verdict.
     pub ownership_checked: u64,
     pub ownership_failed: u64,
-    /// Same R1-B8 tolerance as ③'s `positive_check_tied_twin`, applied
-    /// per-sample: count of sampled chunks whose vec0 top-1 hit was an
-    /// exact-content twin (not itself) rather than a real ownership drift.
-    pub ownership_tied_twins: u64,
+    /// Same tolerance as ③'s `positive_check_tied_twin`, applied
+    /// per-sample and split by [`TiedTwinKind`] (task book #103): counts
+    /// of sampled chunks whose vec0 top-1 hit was a tolerated twin (not
+    /// itself) rather than a real ownership drift.
+    pub ownership_tied_twins_same_hash: u64,
+    pub ownership_tied_twins_same_vector: u64,
     pub ownership_seed: u64,
     pub ownership_skipped: bool,
     /// ⑪ generation fingerprint re-verification.
@@ -809,36 +881,58 @@ pub fn run_activation_audit(
     })();
     let mut positive_check_errored = false;
     let mut positive_check_tied_twin = false;
+    let mut positive_check_tied_twin_kind: Option<TiedTwinKind> = None;
     let mut positive_check_twin_chunk_id: Option<i64> = None;
+    let mut anchor_embedding_blob: Option<Vec<u8>> = None;
     let (anchor_message_id, anchor_chunk_id, top_hit_chunk_id, distance) = match anchor {
-        Ok((message_id, chunk_id, blob, anchor_hash)) => match schema::le_blob_to_f32_vector(&blob)
-            .map_err(anyhow::Error::from)
-            .and_then(|v| vector_domain::vec0_knn(conn, generation_id, &v, 1).map_err(anyhow::Error::from))
-        {
-            Ok(hits) => {
-                let (top_hit, distance) = hits.first().copied().unwrap_or((-1, f64::INFINITY));
-                if top_hit != chunk_id && distance <= 1e-6 {
-                    // R1-B8 (task book #98): vec0's own KNN tie-break among
-                    // byte-identical vectors is not guaranteed to prefer a
-                    // chunk's own row -- before flagging this as a self-hit
-                    // failure, check whether the tie is a genuine
-                    // exact-content twin (same `content_hash`, read fresh
-                    // from `message_chunks` -- vec0 itself carries no hash).
-                    if let Ok(Some(top_hash)) = chunk_content_hash(conn, top_hit) {
-                        if top_hash == anchor_hash {
-                            positive_check_tied_twin = true;
-                            positive_check_twin_chunk_id = Some(top_hit);
+        Ok((message_id, chunk_id, blob, anchor_hash)) => {
+            anchor_embedding_blob = Some(blob.clone());
+            match schema::le_blob_to_f32_vector(&blob)
+                .map_err(anyhow::Error::from)
+                .and_then(|v| vector_domain::vec0_knn(conn, generation_id, &v, 1).map_err(anyhow::Error::from))
+            {
+                Ok(hits) => {
+                    let (top_hit, distance) = hits.first().copied().unwrap_or((-1, f64::INFINITY));
+                    if top_hit != chunk_id && distance <= 1e-6 {
+                        // R1-B8 (task book #98) + task book #103: vec0's own
+                        // KNN tie-break among byte-identical vectors is not
+                        // guaranteed to prefer a chunk's own row -- before
+                        // flagging this as a self-hit failure, check whether
+                        // the tie is a genuine twin: same `content_hash`
+                        // (#98's original tolerance, read fresh from
+                        // `message_chunks` -- vec0 itself carries no hash),
+                        // or, failing that, a byte-identical `embedding` BLOB
+                        // despite a *different* hash (#103: a
+                        // tokenizer-invisible input difference, e.g. a
+                        // trailing newline, still collapses to the same
+                        // vector for genuinely different content -- real T12
+                        // corpus evidence, chunk_id=471055 vs 388263).
+                        match chunk_content_hash(conn, top_hit) {
+                            Ok(Some(top_hash)) if top_hash == anchor_hash => {
+                                positive_check_tied_twin = true;
+                                positive_check_tied_twin_kind = Some(TiedTwinKind::SameHash);
+                                positive_check_twin_chunk_id = Some(top_hit);
+                            }
+                            _ => {
+                                if let Ok(Some(top_blob)) = chunk_embedding_blob(conn, top_hit) {
+                                    if top_blob == blob {
+                                        positive_check_tied_twin = true;
+                                        positive_check_tied_twin_kind = Some(TiedTwinKind::SameVector);
+                                        positive_check_twin_chunk_id = Some(top_hit);
+                                    }
+                                }
+                            }
                         }
                     }
+                    (message_id, chunk_id, top_hit, distance)
                 }
-                (message_id, chunk_id, top_hit, distance)
+                Err(e) => {
+                    positive_check_errored = true;
+                    failures.push(format!("③ positive content check errored on message_id={message_id} chunk_id={chunk_id}: {e}"));
+                    (message_id, chunk_id, -1, f64::INFINITY)
+                }
             }
-            Err(e) => {
-                positive_check_errored = true;
-                failures.push(format!("③ positive content check errored on message_id={message_id} chunk_id={chunk_id}: {e}"));
-                (message_id, chunk_id, -1, f64::INFINITY)
-            }
-        },
+        }
         Err(e) => {
             positive_check_errored = true;
             failures.push(format!("③ positive content check anchor lookup failed: {e}"));
@@ -849,6 +943,22 @@ pub fn run_activation_audit(
         failures.push(format!(
             "③ positive content check failed: anchor chunk_id={anchor_chunk_id} (message_id={anchor_message_id}) top vec0 hit={top_hit_chunk_id} distance={distance}"
         ));
+    }
+    // Task book #103's direct point-read invariant: this holds
+    // unconditionally, independent of whether ③ tolerated a tie above --
+    // see [`vec0_row_embedding_blob`]'s doc comment for why KNN alone
+    // cannot be trusted to catch the anchor's own vec0 row having drifted.
+    if let Some(anchor_blob) = anchor_embedding_blob.as_ref() {
+        match vec0_row_embedding_blob(conn, generation_id, anchor_chunk_id) {
+            Ok(Some(vec0_blob)) if &vec0_blob == anchor_blob => {}
+            Ok(Some(_)) => failures.push(format!(
+                "③ vec0 self-row verification failed: chunk_id={anchor_chunk_id}'s vec0 row does not byte-match its own message_chunks.embedding"
+            )),
+            Ok(None) => failures.push(format!(
+                "③ vec0 self-row verification failed: chunk_id={anchor_chunk_id} has no row in vec_index_gen_{generation_id}"
+            )),
+            Err(e) => failures.push(format!("③ vec0 self-row verification errored for chunk_id={anchor_chunk_id}: {e}")),
+        }
     }
 
     // ④ bidirectional anti-join, element = (message_id, chunk_idx).
@@ -989,7 +1099,8 @@ pub fn run_activation_audit(
     // `embedder` being `Some` (plan v5.1: `None` => passed=false).
     let mut ownership_checked = 0u64;
     let mut ownership_failed = 0u64;
-    let mut ownership_tied_twins = 0u64;
+    let mut ownership_tied_twins_same_hash = 0u64;
+    let mut ownership_tied_twins_same_vector = 0u64;
     let mut ownership_skipped = false;
     let mut fingerprint_ok = false;
     match embedder {
@@ -1019,9 +1130,10 @@ pub fn run_activation_audit(
                     failures.push(format!("⑩ chunk_id={chunk_id} disappeared mid-audit (concurrent write)"));
                     continue;
                 };
-                // `Ok(true)` = tolerated as an exact-content twin (R1-B8,
-                // task book #98); `Ok(false)` = ordinary clean pass.
-                let ownership_result: Result<bool> = (|| {
+                // `Ok(Some(kind))` = tolerated as a twin of the given
+                // [`TiedTwinKind`] (task book #98/#103); `Ok(None)` =
+                // ordinary clean pass.
+                let ownership_result: Result<Option<TiedTwinKind>> = (|| {
                     let (_conv_id, role, content) = load_message_once(storage, message_id)?;
                     let normalized = crate::search::eligibility::normalized_for_chunks(&content);
                     let (bs, be) = (usize::try_from(byte_start)?, usize::try_from(byte_end)?);
@@ -1036,21 +1148,38 @@ pub fn run_activation_audit(
                     if cos < 0.999 {
                         bail!("fresh-vs-stored cosine {cos} < 0.999 (role={role})");
                     }
+                    // Task book #103's direct point-read invariant, checked
+                    // unconditionally before the KNN-based tie logic below:
+                    // see [`vec0_row_embedding_blob`]'s doc comment for why
+                    // KNN alone cannot catch this chunk's own vec0 row
+                    // having drifted to an unrelated vector that happens to
+                    // have a same-vector twin elsewhere.
+                    match vec0_row_embedding_blob(conn, generation_id, *chunk_id)? {
+                        Some(vec0_blob) if vec0_blob == stored_blob => {}
+                        Some(_) => bail!("vec0 row for chunk_id={chunk_id} does not byte-match message_chunks.embedding (direct point read)"),
+                        None => bail!("vec0 row for chunk_id={chunk_id} is missing (direct point read)"),
+                    }
                     let hits = vector_domain::vec0_knn(conn, generation_id, &stored_vec, 1)?;
                     let (top_hit, distance) = hits.first().copied().unwrap_or((-1, f64::INFINITY));
                     if top_hit != *chunk_id {
-                        if distance <= 1e-6 && chunk_content_hash(conn, top_hit)?.as_deref() == Some(stored_hash.as_str()) {
-                            return Ok(true);
+                        if distance <= 1e-6 {
+                            if chunk_content_hash(conn, top_hit)?.as_deref() == Some(stored_hash.as_str()) {
+                                return Ok(Some(TiedTwinKind::SameHash));
+                            }
+                            if chunk_embedding_blob(conn, top_hit)?.as_deref() == Some(stored_blob.as_slice()) {
+                                return Ok(Some(TiedTwinKind::SameVector));
+                            }
                         }
                         bail!("vec0 row for chunk_id={chunk_id} does not match message_chunks' own BLOB (vec0 top hit={top_hit}, distance={distance})");
                     } else if !(distance <= 1e-6) {
                         bail!("vec0 row for chunk_id={chunk_id} does not match message_chunks' own BLOB (vec0 top hit={top_hit}, distance={distance})");
                     }
-                    Ok(false)
+                    Ok(None)
                 })();
                 match ownership_result {
-                    Ok(true) => ownership_tied_twins += 1,
-                    Ok(false) => {}
+                    Ok(Some(TiedTwinKind::SameHash)) => ownership_tied_twins_same_hash += 1,
+                    Ok(Some(TiedTwinKind::SameVector)) => ownership_tied_twins_same_vector += 1,
+                    Ok(None) => {}
                     Err(e) => {
                         ownership_failed += 1;
                         failures.push(format!("⑩ ownership check failed for chunk_id={chunk_id}: {e}"));
@@ -1089,6 +1218,7 @@ pub fn run_activation_audit(
         positive_check_distance: distance,
         positive_check_tied_twin,
         positive_check_twin_chunk_id,
+        positive_check_tied_twin_kind,
         eligible_not_embedded_count,
         embedded_not_eligible_count,
         canonicalize_version_expected: CANONICALIZE_PIPELINE_VERSION,
@@ -1106,7 +1236,8 @@ pub fn run_activation_audit(
         chunk_holes_remaining,
         ownership_checked,
         ownership_failed,
-        ownership_tied_twins,
+        ownership_tied_twins_same_hash,
+        ownership_tied_twins_same_vector,
         ownership_seed,
         ownership_skipped,
         fingerprint_ok,
@@ -1515,9 +1646,11 @@ pub fn run_db_vector_catchup_backfill(
             "passed": audit_report.passed,
             "positive_check_tied_twin": audit_report.positive_check_tied_twin,
             "positive_check_twin_chunk_id": audit_report.positive_check_twin_chunk_id,
+            "positive_check_tied_twin_kind": audit_report.positive_check_tied_twin_kind.map(TiedTwinKind::as_str),
             "ownership_checked": audit_report.ownership_checked,
             "ownership_failed": audit_report.ownership_failed,
-            "ownership_tied_twins": audit_report.ownership_tied_twins,
+            "ownership_tied_twins_same_hash": audit_report.ownership_tied_twins_same_hash,
+            "ownership_tied_twins_same_vector": audit_report.ownership_tied_twins_same_vector,
         }));
         if !audit_report.passed {
             bail!(
@@ -2104,6 +2237,58 @@ mod chunk_catchup_v5_tests {
         (generation_id, ids_a[0], chunk_id_a, ids_b[0], chunk_id_b)
     }
 
+    /// Task book #103: an embedder closure that deliberately collapses
+    /// two known, genuinely different input texts to the identical
+    /// output vector -- simulating a real embedder's tokenization
+    /// swallowing a hash-visible input difference (e.g. a trailing
+    /// newline) invisible to it, real T12 corpus evidence (chunk_id
+    /// 471055 vs 388263). Every other input (in particular the
+    /// fingerprint sentinels) still goes through the ordinary
+    /// [`deterministic_vector`], so this is a drop-in replacement for
+    /// [`mock_embed`] anywhere a test needs a genuine same-vector twin
+    /// reproduced through the real production pipeline rather than by
+    /// hand-patching `message_chunks`/vec0 rows after the fact.
+    fn collapsing_embed<'a>(text_a: &'a str, text_b: &'a str) -> impl Fn(&[&str]) -> std::result::Result<Vec<Vec<f32>>, String> + 'a {
+        let collapsed = deterministic_vector("t103-tokenizer-collapsed-vector", DIM);
+        move |texts: &[&str]| {
+            Ok(texts
+                .iter()
+                .map(|t| if *t == text_a || *t == text_b { collapsed.clone() } else { deterministic_vector(t, DIM) })
+                .collect())
+        }
+    }
+
+    /// Task book #103: a genuine "same-vector" twin -- two chunks under
+    /// two different messages with genuinely different content (hence
+    /// genuinely different `content_hash`), embedded through `embed`
+    /// (typically [`collapsing_embed`]) so both chunks' `message_chunks`
+    /// rows AND their own vec0 rows independently, consistently end up
+    /// holding the identical vector -- exactly how a real embedder
+    /// collision looks in production, as opposed to
+    /// [`twin_two_message_generation`]'s byte-identical-content same-hash
+    /// twin.
+    fn vector_twin_two_message_generation(
+        storage: &FrankenStorage,
+        text_a: &str,
+        text_b: &str,
+        embed: &dyn Fn(&[&str]) -> std::result::Result<Vec<Vec<f32>>, String>,
+    ) -> (i64, i64, i64, i64, i64) {
+        let generation_id = genesis(storage);
+        let ids_a = insert_conversation(storage, "t103-vector-twin-a", &[text_a]);
+        let ids_b = insert_conversation(storage, "t103-vector-twin-b", &[text_b]);
+        let _ = run_db_vector_catchup_backfill(storage, 100, &mock_identity(), CANONICALIZE_PIPELINE_VERSION, CHUNKING_POLICY_VERSION, &mock_fingerprint(), embed, 42);
+        assert_eq!(message_chunks_count(storage, generation_id), 2, "both twin chunks must be embedded and moved out of staging regardless of whether the automatic post-drain activation itself passed");
+        let chunk_id_a: i64 = storage
+            .raw()
+            .query_row_map("SELECT chunk_id FROM message_chunks WHERE generation_id = ?1 AND message_id = ?2", &params![generation_id, ids_a[0]], |row| row.get_typed(0))
+            .unwrap();
+        let chunk_id_b: i64 = storage
+            .raw()
+            .query_row_map("SELECT chunk_id FROM message_chunks WHERE generation_id = ?1 AND message_id = ?2", &params![generation_id, ids_b[0]], |row| row.get_typed(0))
+            .unwrap();
+        (generation_id, ids_a[0], chunk_id_a, ids_b[0], chunk_id_b)
+    }
+
     /// R1-B8 (task book #98, Step 1): a genuine content twin -- two chunks
     /// under two different messages, byte-identical content, hence
     /// byte-identical `content_hash` and embedding -- must not fail ③'s
@@ -2125,12 +2310,14 @@ mod chunk_catchup_v5_tests {
         let report = run_activation_audit(&storage, generation_id, 10, Some(message_id_a), Some(&mock_embed), 10, 1).unwrap();
         assert!(report.passed, "an exact-content twin tie must not fail the audit: {report:?}");
         assert!(report.positive_check_tied_twin, "③ must record that the self-hit was tolerated as a tied twin, not a plain pass: {report:?}");
+        assert_eq!(report.positive_check_tied_twin_kind, Some(TiedTwinKind::SameHash), "a byte-identical message must tie via content_hash, not the fallback same-vector path: {report:?}");
         assert_eq!(report.positive_check_twin_chunk_id, Some(chunk_id_b), "the recorded twin must be the sibling chunk vec0 actually returned: {report:?}");
         assert_eq!(report.positive_check_top_hit_chunk_id, chunk_id_b);
         assert_eq!(report.positive_check_distance, 0.0);
         assert_eq!(report.ownership_checked, 2);
         assert_eq!(report.ownership_failed, 0, "⑩ must not count the tied-twin sample as a failure: {report:?}");
-        assert_eq!(report.ownership_tied_twins, 1, "exactly the one sampled chunk whose own KNN query ties onto its twin must be counted: {report:?}");
+        assert_eq!(report.ownership_tied_twins_same_hash, 1, "exactly the one sampled chunk whose own KNN query ties onto its twin must be counted: {report:?}");
+        assert_eq!(report.ownership_tied_twins_same_vector, 0);
         assert!(report.failure_reasons.is_empty(), "a clean twin tie must leave zero failure reasons: {report:?}");
 
         // Anchor on the other twin, whose own query resolves to itself
@@ -2141,50 +2328,98 @@ mod chunk_catchup_v5_tests {
         assert_eq!(report_b.positive_check_twin_chunk_id, None);
     }
 
-    /// R1-B8's tolerance must not swallow a genuine anomaly: two chunks
-    /// whose *embeddings* happen to collide at distance 0 (forced here by
-    /// directly overwriting one chunk's stored embedding+vec0 row with the
-    /// other's) but whose real, independently-recomputable `content_hash`
-    /// still differ (their underlying message content is NOT the same)
-    /// must stay a hard ③/⑩ failure -- an embedding-space collision
-    /// between genuinely different content is exactly the kind of drift
-    /// the audit exists to catch, and is not the benign "verbatim-repeated
-    /// short message" case ③'s twin tolerance is scoped to.
+    /// Task book #103: two chunks under two different messages with
+    /// genuinely different content (hence genuinely different
+    /// `content_hash`), whose embeddings nonetheless collide at distance
+    /// 0 because the embedder itself collapses them to the identical
+    /// vector ([`collapsing_embed`]) -- real T12 corpus shape,
+    /// chunk_id=471055 vs 388263, where a trailing newline invisible to
+    /// the tokenizer made two different tool-result messages embed
+    /// identically. Both chunks' own vec0 rows are independently,
+    /// consistently populated by the real production drain -- no
+    /// storage-layer corruption anywhere -- so this must now be
+    /// tolerated as a `SameVector` twin, where #98's hash-only tolerance
+    /// wrongly refused to activate over it.
     #[test]
-    fn audit_3_and_10_still_flag_real_drift_despite_zero_distance() {
+    fn audit_3_and_10_tolerate_same_vector_twins_despite_differing_hash() {
         let dir = tempfile::TempDir::new().unwrap();
         let storage = open_storage(&dir.path().join("db.sqlite"));
-        let (generation_id, chunk_id_a, chunk_id_b) = clean_two_message_generation(&storage);
-        let message_id_a: i64 = storage.raw().query_row_map("SELECT message_id FROM message_chunks WHERE chunk_id = ?1", &params![chunk_id_a], |row| row.get_typed(0)).unwrap();
-        let (embedding_a, norm_a): (Vec<u8>, f64) =
-            storage.raw().query_row_map("SELECT embedding, norm FROM message_chunks WHERE chunk_id = ?1", &params![chunk_id_a], |row| Ok((row.get_typed(0)?, row.get_typed(1)?))).unwrap();
-        // Force chunk_id_b's stored embedding (message_chunks AND its own
-        // vec0 row) to be byte-identical to chunk_id_a's, WITHOUT touching
-        // either chunk's `content_hash` -- the two chunks' real content
-        // (and therefore their genuinely different, self-consistent
-        // hashes) is left alone, isolating an embedding-space collision
-        // from a real content twin.
-        storage.raw().execute("UPDATE message_chunks SET embedding = ?1, norm = ?2 WHERE chunk_id = ?3", &params![embedding_a.clone(), norm_a, chunk_id_b]).unwrap();
+        const TEXT_A: &str = "distinct real tool-result content for message A, same-vector twin test";
+        const TEXT_B: &str = "distinct real tool-result content for message B, same-vector twin test";
+        let embed = collapsing_embed(TEXT_A, TEXT_B);
+        let (generation_id, message_id_a, chunk_id_a, _message_id_b, chunk_id_b) = vector_twin_two_message_generation(&storage, TEXT_A, TEXT_B, &embed);
+        assert_ne!(chunk_id_a, chunk_id_b);
+        let hash_a: String = storage.raw().query_row_map("SELECT content_hash FROM message_chunks WHERE chunk_id = ?1", &params![chunk_id_a], |row| row.get_typed(0)).unwrap();
+        let hash_b: String = storage.raw().query_row_map("SELECT content_hash FROM message_chunks WHERE chunk_id = ?1", &params![chunk_id_b], |row| row.get_typed(0)).unwrap();
+        assert_ne!(hash_a, hash_b, "the two messages' real content must genuinely differ -- this is a same-vector twin, not a same-hash twin");
+
+        let report = run_activation_audit(&storage, generation_id, 10, Some(message_id_a), Some(&embed), 10, 1).unwrap();
+        assert!(report.passed, "a same-vector twin whose own vec0 row is internally consistent must not fail the audit: {report:?}");
+        assert!(report.positive_check_tied_twin, "③ must tolerate the tie via the same-vector fallback: {report:?}");
+        assert_eq!(report.positive_check_tied_twin_kind, Some(TiedTwinKind::SameVector), "content_hash differs, so the tolerance must attribute to same-vector, not same-hash: {report:?}");
+        assert_eq!(report.positive_check_twin_chunk_id, Some(chunk_id_b));
+        assert_eq!(report.positive_check_top_hit_chunk_id, chunk_id_b);
+        assert!(report.positive_check_distance <= 1e-6, "distance must be within the tie tolerance (float rounding on an exact vector match is not guaranteed to be bit-exact 0.0): {report:?}");
+        assert_eq!(report.ownership_tied_twins_same_hash, 0, "no sampled chunk in this fixture shares a content_hash: {report:?}");
+        assert_eq!(report.ownership_tied_twins_same_vector, 1, "exactly the one sampled chunk whose own KNN query ties onto its same-vector twin must be counted: {report:?}");
+        assert!(report.failure_reasons.is_empty(), "a same-vector twin tie with internally-consistent vec0 rows must leave zero failure reasons: {report:?}");
+    }
+
+    /// Task book #103's direct point-read invariant is the thing that
+    /// actually catches real corruption: an anchor whose *own* vec0 row
+    /// was overwritten with an unrelated third vector must still fail the
+    /// audit even though a legitimate same-vector twin exists elsewhere
+    /// that would otherwise let the KNN-based tolerance above wrongly
+    /// pass the tie. Without the direct `SELECT ... WHERE rowid =
+    /// anchor_chunk_id` check, KNN alone cannot distinguish "the anchor's
+    /// row still holds its own vector" from "the anchor's row was
+    /// swapped, and happens to have an unrelated twin nearby" -- both
+    /// look identical from the query side (the query vector always comes
+    /// from `message_chunks`, never from vec0 itself). Starts from the
+    /// exact clean same-vector-twin fixture the test above proves must
+    /// pass, then corrupts *only* chunk_id_a's own vec0 row (never its
+    /// `message_chunks` row) -- isolating the direct-check regression
+    /// from the twin tolerance itself.
+    #[test]
+    fn audit_3_and_10_still_flag_vec0_row_corruption_despite_available_twin() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_storage(&dir.path().join("db.sqlite"));
+        const TEXT_A: &str = "distinct real tool-result content for message A, corruption-despite-twin test";
+        const TEXT_B: &str = "distinct real tool-result content for message B, corruption-despite-twin test";
+        let embed = collapsing_embed(TEXT_A, TEXT_B);
+        let (generation_id, message_id_a, chunk_id_a, _message_id_b, _chunk_id_b) = vector_twin_two_message_generation(&storage, TEXT_A, TEXT_B, &embed);
+        let corrupted_vector = deterministic_vector("t103-unrelated-corruption-vector", DIM);
+        let corrupted_blob = schema::f32_vector_to_le_blob(&corrupted_vector);
+        // Corrupt chunk_id_a's OWN vec0 row to an unrelated third vector
+        // that matches neither twin's `message_chunks.embedding` --
+        // WITHOUT touching chunk_id_a's `message_chunks` row, so the KNN
+        // query vector (always read from `message_chunks`) is still
+        // chunk_id_a's real, unmodified embedding. KNN over vec0 then
+        // finds chunk_id_b (distance 0, the legitimate same-vector twin
+        // of the query) while chunk_id_a's own row sits far away in
+        // vector space -- the exact "corrupted row masked by an available
+        // twin" shape the direct point-read exists to catch.
         storage
             .raw()
             .with_tx(TxMode::Immediate, |tx| {
-                vector_domain::delete_vec0_rows_in_tx(tx, generation_id, &[chunk_id_b])?;
-                vector_domain::insert_vec0_rows_in_tx(tx, generation_id, &[(chunk_id_b, embedding_a.as_slice())])?;
+                vector_domain::delete_vec0_rows_in_tx(tx, generation_id, &[chunk_id_a])?;
+                vector_domain::insert_vec0_rows_in_tx(tx, generation_id, &[(chunk_id_a, corrupted_blob.as_slice())])?;
                 Ok(())
             })
             .unwrap();
 
-        let report = run_activation_audit(&storage, generation_id, 10, Some(message_id_a), Some(&mock_embed), 10, 1).unwrap();
-        assert!(!report.passed, "an embedding collision between chunks with genuinely different content_hash must still fail: {report:?}");
-        assert!(!report.positive_check_tied_twin, "different content_hash must never be tolerated as a tied twin: {report:?}");
-        assert_eq!(report.positive_check_twin_chunk_id, None);
-        assert_eq!(report.positive_check_top_hit_chunk_id, chunk_id_b);
-        assert_eq!(report.positive_check_distance, 0.0);
+        let report = run_activation_audit(&storage, generation_id, 10, Some(message_id_a), Some(&embed), 10, 1).unwrap();
+        assert!(!report.passed, "the anchor's own vec0 row being swapped away from its own embedding must fail the audit even when an unrelated twin ties at distance 0: {report:?}");
         assert!(
-            report.failure_reasons.iter().any(|r| r.contains("③ positive content check failed") && r.contains(&format!("top vec0 hit={chunk_id_b} distance=0"))),
-            "③ must still report the mismatch verbatim when the tie is not a genuine content twin: {report:?}"
+            report.failure_reasons.iter().any(|r| r.contains("③ vec0 self-row verification failed") && r.contains(&chunk_id_a.to_string())),
+            "③'s direct point-read check must be the one that catches this, not the KNN tie logic: {report:?}"
         );
-        assert_eq!(report.ownership_tied_twins, 0, "no sampled chunk in this fixture is a genuine content twin: {report:?}");
+        assert!(
+            report.failure_reasons.iter().any(|r| r.contains("⑩ ownership check failed") && r.contains("direct point read")),
+            "⑩'s direct point-read check must independently catch the same corruption on its own sampled pass: {report:?}"
+        );
+        assert_eq!(report.ownership_checked, 2);
+        assert_eq!(report.ownership_failed, 1, "only chunk_id_a's own sample must fail (its row is corrupted); chunk_id_b's own row is internally consistent: {report:?}");
     }
 
     #[test]
